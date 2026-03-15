@@ -104,7 +104,7 @@ Magi 重构了底层的 `FileExecutor`，这是系统能够在高并发多 Agent
 
 抛弃了存在隐私风险和数据滞后问题的第三方云端向量库（如传统的 ACE），Magi 打造了**所见即所得**的全本地知识基建：
 
-### 6.1 三位一体极速检索 (`codebase_retrieval`)
+### 6.1 三位一体极速检索 (`code_search_semantic`)
 在编排者或 Worker 进行局部寻路时，系统会并联调用三大底层引擎：
 1. **语义结构层**：基于 `Inverted Index` 和本地生成的抽象语法树（AST / Symbol Index），精准定位函数和类定义。
 2. **文本暴力层**：底层集成极速的正则搜索引擎 `Ripgrep`。
@@ -135,8 +135,8 @@ Magi 是一个开放的执行枢纽，其强大的能力可以通过底层插件
 
 Magi 的引擎层硬编码了一套专门为复杂工程调度设计的高可靠工具栈：
 - **代码修缮组**：`file_view` / `file_create` / `file_edit` / `file_insert` / `remove_files`。
-- **环境探索组**：`grep_search` (精确正则) / `codebase_retrieval` (语义及语法树)。
-- **编排控制组**：`dispatch_task` (创建与下发子任务) / `wait_for_workers` (阻塞与结果回收) / `get_todos` / `update_todo` (局部任务链自演化)。
+- **环境探索组**：`code_search_regex` (精确正则) / `code_search_semantic` (语义及语法树)。
+- **编排控制组**：`worker_dispatch` (创建与下发子任务) / `worker_wait` (阻塞与结果回收) / `todo_list` / `todo_update` (局部任务链自演化)。
 
 ### 8.2 动态技能库与指令注入 (Skills Manager)
 Magi 的行为不仅被写死在源码里，它实现了一套强大的**动态能力挂载系统**：

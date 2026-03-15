@@ -17,12 +17,12 @@
 
 ```mermaid
 flowchart TB
-    U[用户/Agent 请求] --> E[codebase_retrieval Executor]
+    U[用户/Agent 请求] --> E[code_search_semantic Executor]
     E --> S[CodebaseRetrievalService\n并行融合层]
 
     S --> L1[L1: PKB.search\n语义+结构召回]
-    S --> L2[L2: grep_search\n关键词精确匹配]
-    S --> L3[L3: lsp_query workspaceSymbols\n符号定义检索]
+    S --> L2[L2: code_search_regex\n关键词精确匹配]
+    S --> L3[L3: code_intel_query workspaceSymbols\n符号定义检索]
 
     L1 --> P[ProjectKnowledgeBase]
     P --> SE[LocalSearchEngine]
@@ -50,11 +50,11 @@ sequenceDiagram
     participant Service as CodebaseRetrievalService
     participant PKB as ProjectKnowledgeBase
     participant Engine as LocalSearchEngine
-    participant Grep as grep_search
-    participant LSP as lsp_query
+    participant Grep as code_search_regex
+    participant LSP as code_intel_query
     participant LLM as QueryExpander/SemanticReranker
 
-    Caller->>Exec: codebase_retrieval(query, scope_paths)
+    Caller->>Exec: code_search_semantic(query, scope_paths)
     Exec->>Service: search(query, maxResults, scopePaths)
 
     Service->>PKB: search(...)
@@ -65,7 +65,7 @@ sequenceDiagram
       Engine-->>PKB: SearchResult[]
       PKB-->>Service: PKB results
     and L2
-      Service->>Grep: grep_search(keywords)
+      Service->>Grep: code_search_regex(keywords)
       Grep-->>Service: grep text
     and L3
       Service->>LSP: workspaceSymbols(keywords)

@@ -25,22 +25,22 @@ export const BUILTIN_TOOL_NAMES = [
   'file_create',
   'file_edit',
   'file_insert',
-  'file_bulk_edit',
   'file_remove',
-  'grep_search',
+  'code_search_regex',
   'web_search',
   'web_fetch',
   'mermaid_diagram',
-  'codebase_retrieval',
-  'dispatch_task',
-  'send_worker_message',
-  'wait_for_workers',
-  'split_todo',
-  'get_todos',
-  'update_todo',
-  'apply_skill',
-  'fetch_project_guidelines',
-  'claim_next_todo',
+  'code_search_semantic',
+  'worker_dispatch',
+  'worker_send_message',
+  'worker_wait',
+  'todo_split',
+  'todo_list',
+  'todo_update',
+  'context_compact',
+  'skill_apply',
+  'project_knowledge_query',
+  'todo_claim_next',
 ] as const;
 
 /** 内置工具名称的联合类型 */
@@ -140,7 +140,7 @@ export interface SkillDefinition {
 }
 
 /**
- * launch-process 选项
+ * process_launch 选项
  */
 export interface LaunchProcessOptions {
   command: string;
@@ -173,7 +173,7 @@ export type ProcessPhase =
   | 'timeout';
 
 /**
- * launch-process 结果
+ * process_launch 结果
  */
 export interface LaunchProcessResult {
   terminal_id: number;
@@ -194,7 +194,7 @@ export interface LaunchProcessResult {
 }
 
 /**
- * read-process 结果
+ * process_read 结果
  */
 export interface ReadProcessResult {
   terminal_id: number;
@@ -215,7 +215,7 @@ export interface ReadProcessResult {
 }
 
 /**
- * write-process 结果
+ * process_write 结果
  */
 export interface WriteProcessResult {
   accepted: boolean;
@@ -226,7 +226,7 @@ export interface WriteProcessResult {
 }
 
 /**
- * kill-process 结果
+ * process_kill 结果
  */
 export interface KillProcessResult {
   killed: boolean;

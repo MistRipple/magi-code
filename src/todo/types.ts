@@ -59,6 +59,16 @@ export type TodoStatus =
  */
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
 
+/**
+ * Todo 来源 - 标识该 Todo 由哪条产品链路创建
+ */
+export type TodoSource =
+  | 'planner_macro'           // 编排层创建的一级 Todo
+  | 'worker_split'            // Worker 执行期拆分出的子 Todo
+  | 'orchestrator_adjustment' // 编排者运行中追加/调整出的 Todo
+  | 'review_fix'              // 验收或复审阶段生成的修复 Todo
+  | 'system_repair';          // 系统治理链路生成的修复 Todo
+
 // ============================================================================
 // 核心接口
 // ============================================================================
@@ -78,6 +88,8 @@ export interface UnifiedTodo {
   assignmentId: string;
   /** 父 Todo ID（动态拆分时指向宏观 Todo） */
   parentId?: string;
+  /** Todo 来源 */
+  source: TodoSource;
 
   // ===== 内容 =====
   /** 任务描述 */
@@ -192,6 +204,7 @@ export interface CreateTodoParams {
   missionId: string;
   assignmentId: string;
   parentId?: string;
+  source?: TodoSource;
   content: string;
   reasoning: string;
   type: TodoType;

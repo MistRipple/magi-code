@@ -1,7 +1,7 @@
 /**
  * 代码库检索执行器
  *
- * 工具: codebase_retrieval
+ * 工具: code_search_semantic
  * 实现路径: 本地检索基础设施（PKB + Grep + LSP）
  */
 
@@ -22,7 +22,7 @@ export class CodebaseRetrievalExecutor implements ToolExecutor {
 
   getToolDefinition(): ExtendedToolDefinition {
     return {
-      name: 'codebase_retrieval',
+      name: 'code_search_semantic',
       description: `Search and retrieve relevant code from the local codebase using semantic and structural retrieval.
 
 This tool combines:
@@ -70,7 +70,7 @@ Use this when:
   }
 
   async isAvailable(toolName: string): Promise<boolean> {
-    if (toolName !== 'codebase_retrieval') return false;
+    if (toolName !== 'code_search_semantic') return false;
     return !!this.service?.isAvailable;
   }
 

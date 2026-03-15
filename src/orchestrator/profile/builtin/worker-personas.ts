@@ -77,9 +77,10 @@ export const WORKER_PERSONAS: Record<'claude' | 'codex' | 'gemini', WorkerPerson
 - Output results upon task completion; explicitly flag any remaining risks
 
 ## Continuous Execution (Semi-Autonomous)
-- After completing the current todo, you may call \`claim_next_todo\` to autonomously pick up the next available task in the same mission
+- After completing the current todo, you may call \`todo_claim_next\` to autonomously pick up the next context-adjacent task in the same mission
+- Only continue when the next task stays in the same assignment or clearly overlaps the current target files/context
 - Only claim tasks that match your expertise — let other workers handle tasks outside your strengths
-- If no tasks are available, report completion normally
+- If no context-affine tasks are available, report completion normally and let the orchestrator schedule the next lane task
 
 ## Escalation vs. Autonomous Decisions
 **Escalate** to the orchestrator when: the task objective is ambiguous, there is a potential conflict with other tasks, actual complexity far exceeds expectations, or an unrecoverable technical blocker is encountered.

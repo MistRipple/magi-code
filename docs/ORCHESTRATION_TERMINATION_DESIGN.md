@@ -365,7 +365,7 @@ risk_score =
 
 1. **单源估计**
    - `A_files` / `A_modules`：分析 Worker 输出的候选文件与模块集合。
-   - `B_files` / `B_modules`：静态检索（codebase_retrieval + 依赖图扩散）得到的集合。
+   - `B_files` / `B_modules`：静态检索（code_search_semantic + 依赖图扩散）得到的集合。
    - `C_files` / `C_modules`：PKB 相似任务历史集合。
 
 2. **融合估计**
@@ -724,7 +724,7 @@ sequenceDiagram
 
 4. D 阶段重放重复派发根因：
    - `idempotencyKey` 仅在内存协议态存在，进程重启后无法识别历史派发，可能重复执行。
-   - 已修复为：新增 `DispatchIdempotencyStore` 本地持久化账本；`dispatch_task` 支持显式/隐式幂等键并在调度入口进行重放判定。
+   - 已修复为：新增 `DispatchIdempotencyStore` 本地持久化账本；`worker_dispatch` 支持显式/隐式幂等键并在调度入口进行重放判定。
 
 5. E 阶段发布闸门首次落地根因：
    - 严格 `release:termination-gate` 依赖 baseline 文件和最小样本，首次接入时会因“无基线/样本不足”直接阻断。
@@ -763,8 +763,8 @@ sequenceDiagram
    - 已修复为：改为门禁降级告警（写入 `executionWarnings`），不再直接抛错中断执行链路。
 
 14. D 阶段工具判错语义偏差根因：
-   - `read-process` 作为“读取终端状态/输出”的观测工具，却沿用了“被观测进程失败=工具失败”的判定，导致“工具返回了有效结果但 UI 显示 failed”，并放大终止门禁噪声。
-   - 已修复为：`read-process` 成功读取即返回 `isError=false`；标准化层按工具类型判定，`read-process` 在读取成功时强制归类为 `success`（参数错误仍为 `rejected`）。
+   - `process_read` 作为“读取终端状态/输出”的观测工具，却沿用了“被观测进程失败=工具失败”的判定，导致“工具返回了有效结果但 UI 显示 failed”，并放大终止门禁噪声。
+   - 已修复为：`process_read` 成功读取即返回 `isError=false`；标准化层按工具类型判定，`process_read` 在读取成功时强制归类为 `success`（参数错误仍为 `rejected`）。
 
 15. B 阶段“多工具通用提前收口”根因：
    - 编排终止策略在 `requiredTotal=0`（未进入 Todo 任务流）时，采用“只要 assistant 有文本就 completed”规则；该规则会覆盖 MCP 工具、内置检索工具等所有非 Todo 场景，表现为“工具一用就停”。

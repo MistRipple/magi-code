@@ -11,7 +11,15 @@
 
 import { EventEmitter } from 'events';
 import { AgentType, AgentRole, LLMConfig, TokenUsage } from '../../types/agent-types';
-import { LLMClient, LLMMessageParams, LLMRetryRuntimeEvent, ToolCall, ToolResult, StandardizedToolResult } from '../types';
+import {
+  LLMClient,
+  LLMMessageParams,
+  LLMRetryRuntimeEvent,
+  ToolCall,
+  ToolResult,
+  StandardizedToolResult,
+  DecisionHookEvent,
+} from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager, type ToolExecutionContext } from '../../tools/tool-manager';
 import { MessageHub } from '../../orchestrator/core/message-hub';
@@ -84,13 +92,13 @@ export abstract class BaseLLMAdapter extends EventEmitter {
    * 用于将流式输出绑定到 UI 占位消息。取代已废弃的全局 requestContext。
    */
   protected currentRequestId: string | undefined;
+  /**
+   * 当前请求的工具执行上下文覆盖（实例级，非全局）。
+   * ⚠️ 工程约束：新增写工具或执行入口必须复用该链路透传 worktreePath，禁止旁路。
+   */
+  protected currentToolExecutionContext: Partial<ToolExecutionContext> | undefined;
 
-  protected decisionHook?: (event: {
-    type: 'thinking' | 'tool_call' | 'tool_result';
-    toolName?: string;
-    toolArgs?: any;
-    toolResult?: string;
-  }) => string[];
+  protected decisionHook?: (event: DecisionHookEvent) => string[];
 
   protected async buildToolSourceMap(): Promise<Map<string, StandardizedToolResult['source']>> {
     const sourceMap = new Map<string, StandardizedToolResult['source']>();
@@ -253,11 +261,11 @@ export abstract class BaseLLMAdapter extends EventEmitter {
 
   protected isTerminalProcessTool(toolName: string): boolean {
     return toolName === 'shell'
-      || toolName === 'launch-process'
-      || toolName === 'read-process'
-      || toolName === 'write-process'
-      || toolName === 'kill-process'
-      || toolName === 'list-processes';
+      || toolName === 'process_launch'
+      || toolName === 'process_read'
+      || toolName === 'process_write'
+      || toolName === 'process_kill'
+      || toolName === 'process_list';
   }
 
   protected isHardToolFailure(result: { isError?: boolean; standardized?: { status?: string } }): boolean {
@@ -443,7 +451,7 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     executionContext: ToolExecutionContext,
     signal?: AbortSignal,
   ): Promise<void> {
-    if (result.isError || (toolCall.name !== 'launch-process' && toolCall.name !== 'shell')) {
+    if (result.isError || (toolCall.name !== 'process_launch' && toolCall.name !== 'shell')) {
       return;
     }
 
@@ -509,7 +517,7 @@ export abstract class BaseLLMAdapter extends EventEmitter {
         try {
           const readResult = await this.toolManager.executeInternalTool({
             id: `${toolCall.id}::final-read`,
-            name: 'read-process',
+            name: 'process_read',
             arguments: { terminal_id: terminalId, wait: false, max_wait_seconds: 1 },
           }, undefined, executionContext);
           if (typeof readResult.content === 'string' && readResult.content.trim()) {
@@ -699,12 +707,7 @@ export abstract class BaseLLMAdapter extends EventEmitter {
   /**
    * 设置决策点回调
    */
-  setDecisionHook(hook?: (event: {
-    type: 'thinking' | 'tool_call' | 'tool_result';
-    toolName?: string;
-    toolArgs?: any;
-    toolResult?: string;
-  }) => string[]): void {
+  setDecisionHook(hook?: (event: DecisionHookEvent) => string[]): void {
     this.decisionHook = hook;
   }
 
@@ -714,6 +717,27 @@ export abstract class BaseLLMAdapter extends EventEmitter {
    */
   setCurrentRequestId(requestId: string | undefined): void {
     this.currentRequestId = requestId;
+  }
+
+  /**
+   * 设置当前请求的工具执行上下文覆盖（由 AdapterFactory 注入）。
+   */
+  setCurrentToolExecutionContext(context: Partial<ToolExecutionContext> | undefined): void {
+    this.currentToolExecutionContext = context;
+  }
+
+  /**
+   * 合并当前请求的工具执行上下文覆盖。
+   */
+  protected resolveToolExecutionContext(base: ToolExecutionContext): ToolExecutionContext {
+    if (!this.currentToolExecutionContext) {
+      return base;
+    }
+    return {
+      workerId: this.currentToolExecutionContext.workerId ?? base.workerId,
+      role: this.currentToolExecutionContext.role ?? base.role,
+      worktreePath: this.currentToolExecutionContext.worktreePath ?? base.worktreePath,
+    };
   }
 
   /**

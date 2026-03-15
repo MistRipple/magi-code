@@ -102,7 +102,7 @@ export interface ToolCall {
   endTime?: number;
 }
 
-// wait_for_workers 返回结构
+// worker_wait 返回结构
 export interface WaitForWorkersResultItem {
   task_id: string;
   worker: string;
@@ -190,6 +190,7 @@ export interface AssignmentTodo {
   id: string;
   assignmentId: string;
   parentId?: string;
+  source?: string;
   content: string;
   reasoning?: string;
   expectedOutput?: string;
@@ -269,6 +270,63 @@ export interface WorkerSessionState {
   isResumed: boolean;
   /** 已完成的 Todo 数 */
   completedTodos: number;
+}
+
+export interface OrchestratorRuntimeDecisionGateState {
+  noProgressStreak: number;
+  budgetBreachStreak: number;
+  externalWaitBreachStreak: number;
+  consecutiveUpstreamModelErrors: number;
+}
+
+export interface OrchestratorRuntimeDecisionTraceEntry {
+  round: number;
+  phase: 'no_tool' | 'tool' | 'handoff' | 'finalize';
+  action: 'continue' | 'continue_with_prompt' | 'terminate' | 'handoff' | 'fallback';
+  requiredTotal: number;
+  reason?: string;
+  candidates?: string[];
+  gateState?: OrchestratorRuntimeDecisionGateState;
+  note?: string;
+  timestamp: number;
+}
+
+export interface OrchestratorRuntimeSnapshot {
+  progressVector?: {
+    terminalRequiredTodos?: number;
+    acceptedCriteria?: number;
+    criticalPathResolved?: number;
+    unresolvedBlockers?: number;
+  };
+  reviewState?: {
+    accepted?: number;
+    total?: number;
+  };
+  blockerState?: {
+    open?: number;
+    score?: number;
+    externalWaitOpen?: number;
+    maxExternalWaitAgeMs?: number;
+  };
+  budgetState?: {
+    elapsedMs?: number;
+    tokenUsed?: number;
+    errorRate?: number;
+  };
+  requiredTotal?: number;
+  failedRequired?: number;
+  runningOrPendingRequired?: number;
+  sourceEventIds?: string[];
+}
+
+export interface OrchestratorRuntimeDiagnostics {
+  sessionId?: string;
+  requestId?: string;
+  runtimeReason: string;
+  finalStatus: 'completed' | 'failed' | 'cancelled' | 'paused';
+  runtimeSnapshot?: OrchestratorRuntimeSnapshot | null;
+  runtimeDecisionTrace?: OrchestratorRuntimeDecisionTraceEntry[];
+  updatedAt: number;
 }
 
 // 单条消息
@@ -400,6 +458,7 @@ export interface SubTaskItem {
   title?: string;
   assignedWorker: string;
   assignmentId: string;
+  source?: string;
   status: SubTaskStatus;
   progress: number;
   priority: number;
@@ -556,4 +615,5 @@ export interface WebviewPersistedState {
   scrollAnchors?: ScrollAnchors;
   autoScrollEnabled: AutoScrollConfig;
   notificationBuckets?: Record<string, PersistedNotification[]>;
+  orchestratorRuntimeDiagnostics?: OrchestratorRuntimeDiagnostics | null;
 }

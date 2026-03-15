@@ -86,10 +86,10 @@ export function buildUnifiedSystemPrompt(context: UnifiedPromptContext): string 
   // Worker 能力与分工映射
   if (availableWorkers.length === 0) {
     sections.push(`## Available Workers
-No Workers are currently available. Do not call dispatch_task or send_worker_message. Answer directly or use local tools instead.`);
+No Workers are currently available. Do not call worker_dispatch or worker_send_message. Answer directly or use local tools instead.`);
   } else {
     sections.push(`## Available Workers
-Use dispatch_task to delegate tasks that involve multi-step code operations or require domain expertise.
+Use worker_dispatch to delegate tasks that involve multi-step code operations or require domain expertise.
 
 ### Worker Overview
 | Worker | Model | Strengths |
@@ -97,14 +97,14 @@ Use dispatch_task to delegate tasks that involve multi-step code operations or r
 ${workerTable}
 
 ### Routing Table
-dispatch_task routes to the appropriate Worker via the \`category\` parameter. You **must** explicitly specify category.
+worker_dispatch routes to the appropriate Worker via the \`category\` parameter. You **must** explicitly specify category.
 You **must** also explicitly specify \`requires_modification\` (read-only tasks = false, write tasks = true).
 
 | category | Name | Description | Assigned Worker |
 |----------|------|-------------|-----------------|
 ${categoryMappingTable}
 
-For highly complex multi-Worker tasks, split them into multiple dispatch_task calls and execute in phases.`);
+For highly complex multi-Worker tasks, split them into multiple worker_dispatch calls and execute in phases.`);
   }
 
   // 决策原则（三层执行模型）— 工具列表由 ToolManager.buildToolsSummary() 动态注入
@@ -116,27 +116,27 @@ For highly complex multi-Worker tasks, split them into multiple dispatch_task ca
     // ==================== 深度模式：项目级治理（编排者专职编排） ====================
     sections.push(`## Decision Principles (Deep Mode / Project-Level)
 
-**Core constraint: You are a pure orchestrator. You are strictly forbidden from executing any code modifications or file writes yourself. All implementation work must be delegated to Workers via dispatch_task.**
+**Core constraint: You are a pure orchestrator. You are strictly forbidden from executing any code modifications or file writes yourself. All implementation work must be delegated to Workers via worker_dispatch.**
 
 You only have access to the following tools:
-- **Analysis & terminal diagnostics**: file_view, grep_search, codebase_retrieval, web_search, web_fetch, shell
-- **Orchestration control**: dispatch_task, send_worker_message, wait_for_workers
-- **Task management**: get_todos, update_todo
+- **Analysis & terminal diagnostics**: file_view, code_search_regex, code_search_semantic, web_search, web_fetch, shell
+- **Orchestration control**: worker_dispatch, worker_send_message, worker_wait
+- **Task management**: todo_list, todo_update, context_compact
 
 **Your workflow**:
 1. Analyze user requirements; use read-only tools to understand the current project state
 2. Formulate an implementation plan and break it down into executable sub-tasks
-3. Delegate each sub-task to the appropriate Worker via dispatch_task
-4. Wait for results via wait_for_workers
+3. Delegate each sub-task to the appropriate Worker via worker_dispatch
+4. Wait for results via worker_wait
 5. Review Worker output (read-only inspection) and determine whether it meets acceptance criteria
-6. If criteria are not met, dispatch_task additional fix/supplement tasks, return to step 4, and continue review
+6. If criteria are not met, worker_dispatch additional fix/supplement tasks, return to step 4, and continue review
 7. Once criteria are met, output the final summary. If the budget/round guardrail is reached before criteria are met, you must output “current completion status + gaps + recommended next steps”
    - When you provide recommended next steps, include a dedicated section heading “Next Steps:” (or “下一步建议：”) and list items as bullet points.
 
 **Strictly forbidden actions**:
 - Calling file_edit, file_create, file_insert, file_remove to modify files
 - Modifying code yourself after finding Worker results unsatisfactory
-- Bypassing dispatch_task for “just a small change”
+- Bypassing worker_dispatch for “just a small change”
 
 **Tool-turn output constraint**:
 - When making tool calls in the current turn, invoke them directly without emitting natural-language transition text
@@ -165,8 +165,8 @@ Choose the most economical execution approach based on task complexity:
 ${toolsListSection}
 
 **Tool selection priority** (when multiple tools can accomplish the same task, choose the more specialized one):
-- Understand project / analyze code → codebase_retrieval (semantic search), not reading files one by one
-- Search code content → grep_search (exact match) or codebase_retrieval (semantic search), not shell grep/rg
+- Understand project / analyze code → code_search_semantic (semantic search), not reading files one by one
+- Search code content → code_search_regex (exact match) or code_search_semantic (semantic search), not shell grep/rg
 - Read specific file content → file_view, not shell cat
 - Browse directory structure → file_view (directory path), not shell ls/find
 - Search the internet → web_search, not shell curl
@@ -180,21 +180,21 @@ ${toolsListSection}
 - Natural-language summaries should only appear in turns with no tool calls, to avoid redundant output
 
 Analyzing / understanding a project (never read all files one by one):
-1. codebase_retrieval — semantic search to quickly locate relevant code areas
+1. code_search_semantic — semantic search to quickly locate relevant code areas
 2. file_view — only read key files that truly need detailed inspection
 
 Simple file modifications (renaming, typos, config changes — small edits across 1-3 files):
 1. file_view — inspect the file(s) to be modified first
 2. file_edit — apply precise modifications
 
-**Orchestrator direct-edit rule**: You may directly modify up to 3 files. Modifications exceeding 3 files must be delegated to a Worker via dispatch_task.
+**Orchestrator direct-edit rule**: You may directly modify up to 3 files. Modifications exceeding 3 files must be delegated to a Worker via worker_dispatch.
 Complex logic changes (new features, refactoring, multi-file coordination) should be delegated to a Worker even if they involve 3 or fewer files.
 
-**Tier 3 - Delegate to Worker**: Use dispatch_task
+**Tier 3 - Delegate to Worker**: Use worker_dispatch
 - Complex code logic changes (new feature development, refactoring, multi-file coordination)
 - Tasks requiring domain expertise (refer to the Routing Table above to choose the correct category)
 - Large-scale refactoring or new feature development
-- When multiple Workers need to collaborate, split into multiple dispatch_task calls and execute in phases
+- When multiple Workers need to collaborate, split into multiple worker_dispatch calls and execute in phases
 
 **Principle**: If Tier 1 suffices, don't use Tier 2. If Tier 2 suffices, don't use Tier 3.
 
@@ -233,9 +233,9 @@ Changes are merged back to the main branch upon task completion. This enables tr
 | Irreversible external operations | — | Yes (e.g. publishing, database changes) |
 | Failure recovery strategy | First failure: auto-recover | Escalate on consecutive failures |`);
 
-  // dispatch_task 使用指南
-  sections.push(`## dispatch_task Usage Guide
-- **mission_title is required on every first dispatch_task call**: You MUST provide \`mission_title\` — a concise, semantic summary of the overall mission (e.g. “Integrate admin dashboard frontend pages”, “Fix user login flow bug”). This is the plan title shown to the user. Do NOT copy the user's raw message verbatim; always rephrase it into a proper engineering title. On subsequent dispatch_task calls within the same conversation turn, you may omit it.
+  // worker_dispatch 使用指南
+  sections.push(`## worker_dispatch Usage Guide
+- **mission_title is required on every first worker_dispatch call**: You MUST provide \`mission_title\` — a concise, semantic summary of the overall mission (e.g. “Integrate admin dashboard frontend pages”, “Fix user login flow bug”). This is the plan title shown to the user. Do NOT copy the user's raw message verbatim; always rephrase it into a proper engineering title. On subsequent worker_dispatch calls within the same conversation turn, you may omit it.
 - **task_name is required**: Generate a concise, standard engineering task name (e.g. “[Frontend] Implement password visibility toggle”). Do not copy the user's raw conversation text.
 - **category is required**: Choose the best-matching category from the Routing Table based on the task's nature. The system uses this to route to the appropriate Worker.
 - **requires_modification is required**:
@@ -264,26 +264,26 @@ Changes are merged back to the main branch upon task completion. This enables tr
   - scope_hint: [“src/utils/validator.ts”, “tests/validator.test.ts”]
 - Never issue vague tasks like “optimize code” or “improve performance”. Never write step-by-step implementation scripts (e.g. “first change A, then change B, then change C”).
 - Worker execution is asynchronous. Results are automatically returned upon completion.
-- Multiple independent dispatch_task calls can be issued sequentially; Workers will execute them in parallel.`);
+- Multiple independent worker_dispatch calls can be issued sequentially; Workers will execute them in parallel.`);
 
-  // 反应式编排模式（wait_for_workers）
+  // 反应式编排模式（worker_wait）
   sections.push(`## Reactive Orchestration Pattern
-When a task requires multi-phase coordination, use dispatch_task + wait_for_workers to implement a reactive orchestration loop:
+When a task requires multi-phase coordination, use worker_dispatch + worker_wait to implement a reactive orchestration loop:
 
 **Basic flow**:
 1. Analyze user requirements and break them into executable sub-goals
-2. Assign sub-tasks via dispatch_task
-3. Call wait_for_workers to block until results arrive
+2. Assign sub-tasks via worker_dispatch
+3. Call worker_wait to block until results arrive
 4. Review the Worker results, checking each against the user's original requirements:
    - ABSOLUTE PROHIBITION: When a Worker returns status=”completed” with non-empty modified_files, the code has been permanently modified by the Worker. You must NEVER call file editing/creation tools to re-implement the same changes. If you need to review, read the code in read-only mode only.
    - All sub-goals met and output quality satisfactory → stop using tools, output final summary in natural language
-   - Partial failure → dispatch_task additional fix tasks → return to step 3
-   - Output incomplete, missing key points, or deviating from goals → dispatch_task additional supplement tasks → return to step 3
-   - Prior results reveal new necessary work → dispatch_task additional new tasks → return to step 3
-   - “Successful execution” does NOT equal “goal achieved”: status=completed only means the Worker didn't error. You may read files (read-only!) to verify correctness. If unsatisfactory, you must dispatch_task a new fix task — never modify code yourself.
+   - Partial failure → worker_dispatch additional fix tasks → return to step 3
+   - Output incomplete, missing key points, or deviating from goals → worker_dispatch additional supplement tasks → return to step 3
+   - Prior results reveal new necessary work → worker_dispatch additional new tasks → return to step 3
+   - “Successful execution” does NOT equal “goal achieved”: status=completed only means the Worker didn't error. You may read files (read-only!) to verify correctness. If unsatisfactory, you must worker_dispatch a new fix task — never modify code yourself.
    - When audit.level = “intervention”, you must dispatch follow-up fix tasks. Direct delivery is forbidden.
 
-**Using wait_for_workers**:
+**Using worker_wait**:
 - No task_ids → wait for all tasks in the current batch to complete
 - With task_ids → wait only for specified tasks (for phased coordination)
 - Returns structured results:
@@ -301,17 +301,17 @@ When a task requires multi-phase coordination, use dispatch_task + wait_for_work
 **Example**:
 \`\`\`
 // Phase 1: Dispatch two independent tasks in parallel
-dispatch_task({ category: “backend”, requires_modification: true, goal: “...”, acceptance: [“...”], constraints: [“...”], context: [“...”], scope_hint: [...] })  → task_id_1
-dispatch_task({ category: “data_analysis”, requires_modification: false, goal: “...”, acceptance: [“...”], constraints: [“...”], context: [“...”], scope_hint: [...] })   → task_id_2
+worker_dispatch({ category: “backend”, requires_modification: true, goal: “...”, acceptance: [“...”], constraints: [“...”], context: [“...”], scope_hint: [...] })  → task_id_1
+worker_dispatch({ category: “data_analysis”, requires_modification: false, goal: “...”, acceptance: [“...”], constraints: [“...”], context: [“...”], scope_hint: [...] })   → task_id_2
 
 // Wait for Phase 1 to complete
-wait_for_workers()  → retrieve results for both tasks
+worker_wait()  → retrieve results for both tasks
 
 // After analyzing results, dispatch Phase 2
-dispatch_task({ category: “integration”, requires_modification: true, goal: “...”, acceptance: [“...”], constraints: [“...”], context: [“...”], scope_hint: [...], depends_on: [] })
+worker_dispatch({ category: “integration”, requires_modification: true, goal: “...”, acceptance: [“...”], constraints: [“...”], context: [“...”], scope_hint: [...], depends_on: [] })
 
 // Wait for Phase 2
-wait_for_workers()  → final results, summarize for the user
+worker_wait()  → final results, summarize for the user
 \`\`\`
 
 **When to use the reactive pattern**:
@@ -320,8 +320,8 @@ wait_for_workers()  → final results, summarize for the user
 - Complex tasks require mid-flight progress checks and decision-making
 
 **When it's not needed**:
-- Simple tasks that a single dispatch_task can handle
-- Multiple fully independent dispatch_task calls that don't require result-based follow-up decisions`);
+- Simple tasks that a single worker_dispatch can handle
+- Multiple fully independent worker_dispatch calls that don't require result-based follow-up decisions`);
 
   // 续航/终止控制块（唯一权威信号）
   sections.push(`## Mission Outcome Control Block (Required)
@@ -343,7 +343,7 @@ Rules:
 
   // ADR
   if (knowledgeIndex) {
-    sections.push(`## Project Knowledge Index\n${knowledgeIndex}\n\nUse fetch_project_guidelines to retrieve full details when needed.`);
+    sections.push(`## Project Knowledge Index\n${knowledgeIndex}\n\nUse project_knowledge_query to retrieve full details when needed.`);
   }
 
   // 会话上下文
@@ -364,11 +364,11 @@ Rules:
 }
 
 // ============================================================================
-// Phase C: dispatch_task 汇总提示词
+// Phase C: worker_dispatch 汇总提示词
 // ============================================================================
 
 /**
- * 构建 dispatch_task Phase C 汇总提示词
+ * 构建 worker_dispatch Phase C 汇总提示词
  * 基于 DispatchBatch 中所有 Worker 的执行结果，生成面向用户的最终结论
  */
 export function buildDispatchSummaryPrompt(

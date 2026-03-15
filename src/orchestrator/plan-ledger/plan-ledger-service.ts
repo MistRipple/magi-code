@@ -20,6 +20,7 @@ import type {
   PlanItem,
   PlanItemStatus,
   PlanLedgerSnapshot,
+  PlanMutationOptions,
   PlanRecord,
   PlanRuntimeReplanState,
   PlanRuntimeReviewState,
@@ -67,6 +68,15 @@ interface PlanLedgerEventRecord {
   timeoutAttempts: number;
 }
 
+interface SchemaVersionResolution {
+  sourceVersion: number;
+  targetVersion: number;
+  supported: boolean;
+  shouldMigrate: boolean;
+  sourceDeclared: boolean;
+  reason?: 'too_old' | 'too_new';
+}
+
 export interface PlanLedgerUpdateEvent {
   sessionId: string;
   planId: string;
@@ -98,8 +108,41 @@ const ATTEMPT_TRANSITIONS: Record<PlanAttemptStatus, PlanAttemptStatus[]> = {
   cancelled: [],
 };
 
+const PLAN_STATUS_TRANSITIONS: Record<PlanStatus, PlanStatus[]> = {
+  draft: ['awaiting_confirmation', 'approved', 'executing', 'rejected', 'failed', 'cancelled', 'superseded', 'completed'],
+  awaiting_confirmation: ['approved', 'rejected', 'executing', 'failed', 'cancelled', 'superseded', 'completed'],
+  approved: ['executing', 'failed', 'cancelled', 'superseded', 'completed'],
+  rejected: [],
+  executing: ['partially_completed', 'completed', 'failed', 'cancelled'],
+  partially_completed: ['completed', 'failed', 'cancelled'],
+  completed: [],
+  failed: [],
+  cancelled: [],
+  superseded: [],
+};
+
+const RUNTIME_REVIEW_TRANSITIONS: Record<PlanRuntimeReviewState['state'], PlanRuntimeReviewState['state'][]> = {
+  idle: ['running', 'accepted', 'rejected'],
+  running: ['idle', 'accepted', 'rejected'],
+  accepted: ['idle', 'running'],
+  rejected: ['idle', 'running'],
+};
+
+const RUNTIME_REPLAN_TRANSITIONS: Record<PlanRuntimeReplanState['state'], PlanRuntimeReplanState['state'][]> = {
+  none: ['required', 'awaiting_confirmation', 'applied'],
+  required: ['none', 'awaiting_confirmation', 'applied'],
+  awaiting_confirmation: ['none', 'required', 'applied'],
+  applied: ['none', 'required', 'awaiting_confirmation'],
+};
+
+const RUNTIME_WAIT_TRANSITIONS: Record<PlanRuntimeWaitState['state'], PlanRuntimeWaitState['state'][]> = {
+  none: ['external_waiting'],
+  external_waiting: ['none'],
+};
+
 export class PlanLedgerService extends EventEmitter {
   private static readonly CURRENT_SCHEMA_VERSION = 2;
+  private static readonly MIN_SUPPORTED_SCHEMA_VERSION = 1;
   private readonly writeQueues = new Map<string, Promise<void>>();
   private readonly indexCache = new Map<string, PlanIndexEntry[]>();
   private readonly planCache = new Map<string, Map<string, PlanRecord>>();
@@ -169,13 +212,23 @@ export class PlanLedgerService extends EventEmitter {
     });
   }
 
-  async markAwaitingConfirmation(sessionId: string, planId: string, formattedPlan?: string): Promise<PlanRecord | null> {
+  async markAwaitingConfirmation(
+    sessionId: string,
+    planId: string,
+    formattedPlan?: string,
+    options?: PlanMutationOptions,
+  ): Promise<PlanRecord | null> {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);
       if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
         return null;
       }
-      record.status = 'awaiting_confirmation';
+      if (!this.canMutateWithExpectedRevision(record, options, 'markAwaitingConfirmation')) {
+        return null;
+      }
+      if (!this.tryTransitionPlanStatus(record, 'awaiting_confirmation', 'markAwaitingConfirmation', options?.auditReason)) {
+        return null;
+      }
       if (formattedPlan && formattedPlan.trim()) {
         record.formattedPlan = formattedPlan.trim();
       }
@@ -186,13 +239,24 @@ export class PlanLedgerService extends EventEmitter {
     });
   }
 
-  async approve(sessionId: string, planId: string, reviewer = 'system:auto', reason?: string): Promise<PlanRecord | null> {
+  async approve(
+    sessionId: string,
+    planId: string,
+    reviewer = 'system:auto',
+    reason?: string,
+    options?: PlanMutationOptions,
+  ): Promise<PlanRecord | null> {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);
       if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
         return null;
       }
-      record.status = 'approved';
+      if (!this.canMutateWithExpectedRevision(record, options, 'approve')) {
+        return null;
+      }
+      if (!this.tryTransitionPlanStatus(record, 'approved', 'approve', options?.auditReason)) {
+        return null;
+      }
       record.review = {
         status: 'approved',
         reviewer,
@@ -206,13 +270,24 @@ export class PlanLedgerService extends EventEmitter {
     });
   }
 
-  async reject(sessionId: string, planId: string, reviewer = 'user', reason?: string): Promise<PlanRecord | null> {
+  async reject(
+    sessionId: string,
+    planId: string,
+    reviewer = 'user',
+    reason?: string,
+    options?: PlanMutationOptions,
+  ): Promise<PlanRecord | null> {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);
       if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
         return null;
       }
-      record.status = 'rejected';
+      if (!this.canMutateWithExpectedRevision(record, options, 'reject')) {
+        return null;
+      }
+      if (!this.tryTransitionPlanStatus(record, 'rejected', 'reject', options?.auditReason)) {
+        return null;
+      }
       record.review = {
         status: 'rejected',
         reviewer,
@@ -226,13 +301,18 @@ export class PlanLedgerService extends EventEmitter {
     });
   }
 
-  async markExecuting(sessionId: string, planId: string): Promise<PlanRecord | null> {
+  async markExecuting(sessionId: string, planId: string, options?: PlanMutationOptions): Promise<PlanRecord | null> {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);
       if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
         return null;
       }
-      record.status = 'executing';
+      if (!this.canMutateWithExpectedRevision(record, options, 'markExecuting')) {
+        return null;
+      }
+      if (!this.tryTransitionPlanStatus(record, 'executing', 'markExecuting', options?.auditReason)) {
+        return null;
+      }
       record.updatedAt = Date.now();
       this.persistPlan(record);
       this.emitUpdated(record, 'executing');
@@ -240,10 +320,18 @@ export class PlanLedgerService extends EventEmitter {
     });
   }
 
-  async bindMission(sessionId: string, planId: string, missionId: string): Promise<PlanRecord | null> {
+  async bindMission(
+    sessionId: string,
+    planId: string,
+    missionId: string,
+    options?: PlanMutationOptions,
+  ): Promise<PlanRecord | null> {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);
       if (!record) {
+        return null;
+      }
+      if (!this.canMutateWithExpectedRevision(record, options, 'bindMission')) {
         return null;
       }
       record.missionId = missionId;
@@ -255,9 +343,14 @@ export class PlanLedgerService extends EventEmitter {
   }
 
   /**
-   * 更新计划摘要（由编排者在首次 dispatch_task 时通过 mission_title 提供语义化标题）
+   * 更新计划摘要（由编排者在首次 worker_dispatch 时通过 mission_title 提供语义化标题）
    */
-  async updateSummary(sessionId: string, planId: string, summary: string): Promise<PlanRecord | null> {
+  async updateSummary(
+    sessionId: string,
+    planId: string,
+    summary: string,
+    options?: PlanMutationOptions,
+  ): Promise<PlanRecord | null> {
     const trimmed = summary.trim();
     if (!trimmed) {
       return null;
@@ -265,6 +358,9 @@ export class PlanLedgerService extends EventEmitter {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);
       if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
+        return null;
+      }
+      if (!this.canMutateWithExpectedRevision(record, options, 'updateSummary')) {
         return null;
       }
       record.summary = trimmed;
@@ -275,10 +371,18 @@ export class PlanLedgerService extends EventEmitter {
     });
   }
 
-  async startAttempt(sessionId: string, planId: string, input: PlanAttemptStartInput): Promise<PlanRecord | null> {
+  async startAttempt(
+    sessionId: string,
+    planId: string,
+    input: PlanAttemptStartInput,
+    options?: PlanMutationOptions,
+  ): Promise<PlanRecord | null> {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);
       if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
+        return null;
+      }
+      if (!this.canMutateWithExpectedRevision(record, options, 'startAttempt')) {
         return null;
       }
 
@@ -335,10 +439,18 @@ export class PlanLedgerService extends EventEmitter {
     });
   }
 
-  async completeLatestAttempt(sessionId: string, planId: string, input: PlanAttemptCompleteInput): Promise<PlanRecord | null> {
+  async completeLatestAttempt(
+    sessionId: string,
+    planId: string,
+    input: PlanAttemptCompleteInput,
+    options?: PlanMutationOptions,
+  ): Promise<PlanRecord | null> {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);
       if (!record) {
+        return null;
+      }
+      if (!this.canMutateWithExpectedRevision(record, options, 'completeLatestAttempt')) {
         return null;
       }
 
@@ -430,10 +542,18 @@ export class PlanLedgerService extends EventEmitter {
     });
   }
 
-  async upsertDispatchItem(sessionId: string, planId: string, input: DispatchPlanItemInput): Promise<PlanRecord | null> {
+  async upsertDispatchItem(
+    sessionId: string,
+    planId: string,
+    input: DispatchPlanItemInput,
+    options?: PlanMutationOptions,
+  ): Promise<PlanRecord | null> {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);
       if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
+        return null;
+      }
+      if (!this.canMutateWithExpectedRevision(record, options, 'upsertDispatchItem')) {
         return null;
       }
 
@@ -480,8 +600,8 @@ export class PlanLedgerService extends EventEmitter {
 
       this.addUnique(record.links.assignmentIds, normalizedItemId);
       record.updatedAt = now;
-      if (record.status === 'draft') {
-        record.status = 'approved';
+      if (record.status === 'draft' && !this.tryTransitionPlanStatus(record, 'approved', 'upsertDispatchItem:auto-approve', options?.auditReason)) {
+        return null;
       }
       this.persistPlan(record);
       this.emitUpdated(record, 'dispatch-item-upserted');
@@ -489,10 +609,19 @@ export class PlanLedgerService extends EventEmitter {
     });
   }
 
-  async bindAssignmentTodos(sessionId: string, planId: string, assignmentId: string, todos: UnifiedTodo[]): Promise<PlanRecord | null> {
+  async bindAssignmentTodos(
+    sessionId: string,
+    planId: string,
+    assignmentId: string,
+    todos: UnifiedTodo[],
+    options?: PlanMutationOptions,
+  ): Promise<PlanRecord | null> {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);
       if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
+        return null;
+      }
+      if (!this.canMutateWithExpectedRevision(record, options, 'bindAssignmentTodos')) {
         return null;
       }
 
@@ -529,10 +658,14 @@ export class PlanLedgerService extends EventEmitter {
     planId: string,
     assignmentId: string,
     status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled',
+    options?: PlanMutationOptions,
   ): Promise<PlanRecord | null> {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);
       if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
+        return null;
+      }
+      if (!this.canMutateWithExpectedRevision(record, options, 'updateAssignmentStatus')) {
         return null;
       }
 
@@ -554,7 +687,10 @@ export class PlanLedgerService extends EventEmitter {
       }
       item.updatedAt = Date.now();
       record.updatedAt = item.updatedAt;
-      record.status = this.computePlanStatus(record, record.status === 'executing' ? 'executing' : undefined);
+      const nextPlanStatus = this.computePlanStatus(record, record.status === 'executing' ? 'executing' : undefined);
+      if (!this.tryTransitionPlanStatus(record, nextPlanStatus, 'updateAssignmentStatus:computePlanStatus', options?.auditReason)) {
+        return null;
+      }
       this.persistPlan(record);
       this.emitUpdated(record, 'assignment-status-updated');
       return record;
@@ -567,10 +703,14 @@ export class PlanLedgerService extends EventEmitter {
     assignmentId: string,
     todoId: string,
     status: PlanTodoStatus,
+    options?: PlanMutationOptions,
   ): Promise<PlanRecord | null> {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);
       if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
+        return null;
+      }
+      if (!this.canMutateWithExpectedRevision(record, options, 'updateTodoStatus')) {
         return null;
       }
 
@@ -597,21 +737,33 @@ export class PlanLedgerService extends EventEmitter {
       item.updatedAt = Date.now();
 
       record.updatedAt = item.updatedAt;
-      if (record.status === 'approved' || record.status === 'awaiting_confirmation') {
-        record.status = 'executing';
+      if ((record.status === 'approved' || record.status === 'awaiting_confirmation')
+        && !this.tryTransitionPlanStatus(record, 'executing', 'updateTodoStatus:auto-executing', options?.auditReason)) {
+        return null;
       }
-      record.status = this.computePlanStatus(record, record.status);
+      const nextPlanStatus = this.computePlanStatus(record, record.status);
+      if (!this.tryTransitionPlanStatus(record, nextPlanStatus, 'updateTodoStatus:computePlanStatus', options?.auditReason)) {
+        return null;
+      }
       this.persistPlan(record);
       this.emitUpdated(record, 'todo-status-updated');
       return record;
     });
   }
 
-  async finalize(sessionId: string, planId: string, status: 'completed' | 'failed' | 'cancelled'): Promise<PlanRecord | null> {
+  async finalize(
+    sessionId: string,
+    planId: string,
+    status: 'completed' | 'failed' | 'cancelled',
+    options?: PlanMutationOptions,
+  ): Promise<PlanRecord | null> {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);
       if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
         return record;
+      }
+      if (!this.canMutateWithExpectedRevision(record, options, 'finalize')) {
+        return null;
       }
       // 填充 termination runtime 状态
       record.runtime.termination = {
@@ -645,18 +797,26 @@ export class PlanLedgerService extends EventEmitter {
       replan?: Partial<PlanRuntimeReplanState>;
       wait?: Partial<PlanRuntimeWaitState>;
       termination?: Partial<PlanRuntimeTerminationState>;
-      acceptance?: { summary?: PlanAcceptanceSummary };
-    }
+      acceptance?: { summary?: PlanAcceptanceSummary; criteria?: AcceptanceCriterion[] };
+    },
+    options?: PlanMutationOptions,
   ): Promise<PlanRecord | null> {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);
       if (!record) {
         return null;
       }
+      if (!this.canMutateWithExpectedRevision(record, options, 'updateRuntimeState')) {
+        return null;
+      }
 
       const now = Date.now();
 
       if (patch.review) {
+        if (patch.review.state
+          && !this.canTransitionRuntimeReview(record.runtime.review.state, patch.review.state, record, options?.auditReason)) {
+          return null;
+        }
         record.runtime.review = {
           ...record.runtime.review,
           ...patch.review,
@@ -667,6 +827,10 @@ export class PlanLedgerService extends EventEmitter {
       }
 
       if (patch.replan) {
+        if (patch.replan.state
+          && !this.canTransitionRuntimeReplan(record.runtime.replan.state, patch.replan.state, record, options?.auditReason)) {
+          return null;
+        }
         const nextReplan: PlanRuntimeReplanState = {
           ...record.runtime.replan,
           ...patch.replan,
@@ -679,6 +843,10 @@ export class PlanLedgerService extends EventEmitter {
       }
 
       if (patch.wait) {
+        if (patch.wait.state
+          && !this.canTransitionRuntimeWait(record.runtime.wait.state, patch.wait.state, record, options?.auditReason)) {
+          return null;
+        }
         const nextWait: PlanRuntimeWaitState = {
           ...record.runtime.wait,
           ...patch.wait,
@@ -698,9 +866,21 @@ export class PlanLedgerService extends EventEmitter {
         };
       }
 
-      if (patch.acceptance?.summary) {
-        record.runtime.acceptance.summary = patch.acceptance.summary;
-        record.runtime.acceptance.updatedAt = now;
+      if (patch.acceptance) {
+        let acceptanceTouched = false;
+        if (Array.isArray(patch.acceptance.criteria)) {
+          record.runtime.acceptance.criteria = this.normalizeAcceptanceCriteria(patch.acceptance.criteria);
+          acceptanceTouched = true;
+        }
+        if (patch.acceptance.summary) {
+          record.runtime.acceptance.summary = patch.acceptance.summary;
+          acceptanceTouched = true;
+        } else if (acceptanceTouched) {
+          record.runtime.acceptance.summary = this.computeAcceptanceSummary(record.runtime.acceptance.criteria);
+        }
+        if (acceptanceTouched) {
+          record.runtime.acceptance.updatedAt = now;
+        }
       }
 
       record.updatedAt = now;
@@ -810,6 +990,35 @@ export class PlanLedgerService extends EventEmitter {
     return this.loadPlan(sessionId, latest.planId);
   }
 
+  getLatestPlanByMission(
+    sessionId: string,
+    missionId: string,
+    options?: { includeTerminal?: boolean },
+  ): PlanRecord | null {
+    const normalizedMissionId = missionId.trim();
+    if (!normalizedMissionId) {
+      return null;
+    }
+    const includeTerminal = options?.includeTerminal === true;
+    const index = this.loadIndex(sessionId)
+      .filter((entry) => (entry.missionId || '').trim() === normalizedMissionId)
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+    for (const entry of index) {
+      if (!includeTerminal && TERMINAL_PLAN_STATUSES.has(entry.status)) {
+        continue;
+      }
+      const plan = this.loadPlan(sessionId, entry.planId);
+      if (!plan) {
+        continue;
+      }
+      if (!includeTerminal && TERMINAL_PLAN_STATUSES.has(plan.status)) {
+        continue;
+      }
+      return plan;
+    }
+    return null;
+  }
+
   getSnapshot(sessionId: string, limit = 20): PlanLedgerSnapshot {
     return {
       activePlan: this.getActivePlan(sessionId),
@@ -917,7 +1126,9 @@ export class PlanLedgerService extends EventEmitter {
     if (!attemptTerminated && nextStatus === record.status) {
       return false;
     }
-    record.status = nextStatus;
+    if (!this.tryTransitionPlanStatus(record, nextStatus, updateReason, 'mission-terminal-sync')) {
+      return false;
+    }
     record.updatedAt = Date.now();
     this.persistPlan(record);
     this.emitUpdated(record, updateReason);
@@ -1362,9 +1573,32 @@ export class PlanLedgerService extends EventEmitter {
     try {
       const raw = fs.readFileSync(filePath, 'utf-8');
       const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const schemaResolution = this.resolveSchemaVersion(parsed?.schemaVersion);
+      if (!schemaResolution.supported) {
+        logger.warn('计划账本.schema.版本不受支持', {
+          sessionId,
+          planId,
+          schemaVersion: schemaResolution.sourceVersion,
+          minSupportedSchemaVersion: PlanLedgerService.MIN_SUPPORTED_SCHEMA_VERSION,
+          currentSchemaVersion: PlanLedgerService.CURRENT_SCHEMA_VERSION,
+          reason: schemaResolution.reason,
+        }, LogCategory.ORCHESTRATOR);
+        return null;
+      }
       const normalized = this.normalizePlanRecord(parsed);
       if (JSON.stringify(parsed) !== JSON.stringify(normalized)) {
         this.persistPlan(normalized, { preserveRevision: true });
+        if (schemaResolution.shouldMigrate) {
+          const migrationReason = `schema-migrated:${schemaResolution.sourceVersion}->${schemaResolution.targetVersion}`;
+          this.appendEventRecord(normalized, migrationReason);
+          logger.info('计划账本.schema.在线迁移完成', {
+            sessionId,
+            planId,
+            fromSchemaVersion: schemaResolution.sourceVersion,
+            toSchemaVersion: schemaResolution.targetVersion,
+            sourceDeclared: schemaResolution.sourceDeclared,
+          }, LogCategory.ORCHESTRATOR);
+        }
       }
       this.touchSessionCache(sessionId);
       this.setPlanCacheRecord(sessionPlanCache, planId, this.clonePlanRecord(normalized));
@@ -1385,10 +1619,154 @@ export class PlanLedgerService extends EventEmitter {
     if (!existing || TERMINAL_PLAN_STATUSES.has(existing.status)) {
       return;
     }
-    existing.status = 'superseded';
+    if (!this.tryTransitionPlanStatus(existing, 'superseded', 'markSuperseded', 'supersede-previous-plan')) {
+      return;
+    }
     existing.updatedAt = Date.now();
     this.persistPlan(existing);
     this.emitUpdated(existing, 'superseded');
+  }
+
+  private canMutateWithExpectedRevision(
+    record: PlanRecord,
+    options: PlanMutationOptions | undefined,
+    op: string,
+  ): boolean {
+    const expectedRevision = this.normalizePositiveInteger(options?.expectedRevision);
+    if (expectedRevision === undefined) {
+      return true;
+    }
+    if (record.revision === expectedRevision) {
+      return true;
+    }
+    this.recordAudit(record, 'revision_conflict', {
+      op,
+      expectedRevision,
+      actualRevision: record.revision,
+      auditReason: options?.auditReason,
+    });
+    logger.warn('计划账本.CAS.修订号冲突', {
+      sessionId: record.sessionId,
+      planId: record.planId,
+      op,
+      expectedRevision,
+      actualRevision: record.revision,
+      auditReason: options?.auditReason,
+    }, LogCategory.ORCHESTRATOR);
+    return false;
+  }
+
+  private tryTransitionPlanStatus(
+    record: PlanRecord,
+    nextStatus: PlanStatus,
+    op: string,
+    auditReason?: string,
+  ): boolean {
+    const current = record.status;
+    if (current === nextStatus) {
+      return true;
+    }
+    const allowed = PLAN_STATUS_TRANSITIONS[current] || [];
+    if (allowed.includes(nextStatus)) {
+      record.status = nextStatus;
+      return true;
+    }
+    this.recordAudit(record, 'invalid_plan_status_transition', {
+      op,
+      from: current,
+      to: nextStatus,
+      auditReason,
+    });
+    logger.warn('计划账本.非法计划状态迁移', {
+      sessionId: record.sessionId,
+      planId: record.planId,
+      op,
+      from: current,
+      to: nextStatus,
+      auditReason,
+    }, LogCategory.ORCHESTRATOR);
+    return false;
+  }
+
+  private canTransitionRuntimeReview(
+    from: PlanRuntimeReviewState['state'],
+    to: PlanRuntimeReviewState['state'],
+    record: PlanRecord,
+    auditReason?: string,
+  ): boolean {
+    if (from === to) {
+      return true;
+    }
+    const allowed = RUNTIME_REVIEW_TRANSITIONS[from] || [];
+    if (allowed.includes(to)) {
+      return true;
+    }
+    this.recordAudit(record, 'invalid_runtime_review_transition', { from, to, auditReason });
+    logger.warn('计划账本.非法runtime.review迁移', {
+      sessionId: record.sessionId,
+      planId: record.planId,
+      from,
+      to,
+      auditReason,
+    }, LogCategory.ORCHESTRATOR);
+    return false;
+  }
+
+  private canTransitionRuntimeReplan(
+    from: PlanRuntimeReplanState['state'],
+    to: PlanRuntimeReplanState['state'],
+    record: PlanRecord,
+    auditReason?: string,
+  ): boolean {
+    if (from === to) {
+      return true;
+    }
+    const allowed = RUNTIME_REPLAN_TRANSITIONS[from] || [];
+    if (allowed.includes(to)) {
+      return true;
+    }
+    this.recordAudit(record, 'invalid_runtime_replan_transition', { from, to, auditReason });
+    logger.warn('计划账本.非法runtime.replan迁移', {
+      sessionId: record.sessionId,
+      planId: record.planId,
+      from,
+      to,
+      auditReason,
+    }, LogCategory.ORCHESTRATOR);
+    return false;
+  }
+
+  private canTransitionRuntimeWait(
+    from: PlanRuntimeWaitState['state'],
+    to: PlanRuntimeWaitState['state'],
+    record: PlanRecord,
+    auditReason?: string,
+  ): boolean {
+    if (from === to) {
+      return true;
+    }
+    const allowed = RUNTIME_WAIT_TRANSITIONS[from] || [];
+    if (allowed.includes(to)) {
+      return true;
+    }
+    this.recordAudit(record, 'invalid_runtime_wait_transition', { from, to, auditReason });
+    logger.warn('计划账本.非法runtime.wait迁移', {
+      sessionId: record.sessionId,
+      planId: record.planId,
+      from,
+      to,
+      auditReason,
+    }, LogCategory.ORCHESTRATOR);
+    return false;
+  }
+
+  private recordAudit(
+    record: PlanRecord,
+    code: string,
+    payload?: Record<string, unknown>,
+  ): void {
+    const payloadText = payload ? JSON.stringify(payload) : '';
+    this.appendEventRecord(record, payloadText ? `audit:${code}:${payloadText}` : `audit:${code}`);
   }
 
   private normalizePlanRecord(record: Record<string, unknown>): PlanRecord {
@@ -1472,6 +1850,7 @@ export class PlanLedgerService extends EventEmitter {
       ?? (sourceRecord.review ? 1 : 0);
     const reviewUpdatedAt = this.normalizeTimestamp(sourceRecord.runtime?.review?.lastReviewedAt)
       ?? this.normalizeTimestamp(sourceRecord.review?.reviewedAt);
+    const schemaResolution = this.resolveSchemaVersion(sourceRecord.schemaVersion);
     const now = Date.now();
 
     return {
@@ -1480,7 +1859,9 @@ export class PlanLedgerService extends EventEmitter {
       sessionId: this.normalizeIdentifier(sourceRecord.sessionId) || 'unknown-session',
       missionId: this.normalizeIdentifier(sourceRecord.missionId) || undefined,
       turnId: this.normalizeIdentifier(sourceRecord.turnId) || 'unknown-turn',
-      schemaVersion: this.normalizePositiveInteger(sourceRecord.schemaVersion) || PlanLedgerService.CURRENT_SCHEMA_VERSION,
+      schemaVersion: schemaResolution.supported
+        ? schemaResolution.targetVersion
+        : PlanLedgerService.CURRENT_SCHEMA_VERSION,
       runtimeVersion,
       revision: this.normalizeRevision(sourceRecord.revision),
       version: this.normalizePositiveInteger(sourceRecord.version) || 1,
@@ -1651,13 +2032,24 @@ export class PlanLedgerService extends EventEmitter {
 
     const seen = new Set<string>();
     return normalized.filter((entry) => {
-      const key = entry.description.trim().toLowerCase();
+      const key = this.buildAcceptanceCriterionDedupKey(entry);
       if (!key || seen.has(key)) {
         return false;
       }
       seen.add(key);
       return true;
     });
+  }
+
+  private buildAcceptanceCriterionDedupKey(entry: AcceptanceCriterion): string {
+    const normalizedId = this.normalizeIdentifier(entry.id);
+    if (normalizedId) {
+      return `id:${normalizedId}`;
+    }
+    const description = entry.description.trim().toLowerCase();
+    const scope = typeof entry.scope === 'string' ? entry.scope.trim().toLowerCase() : '';
+    const owner = typeof entry.owner === 'string' ? entry.owner.trim().toLowerCase() : '';
+    return `tuple:${description}::${scope}::${owner}`;
   }
 
   private normalizeAcceptanceCriterion(input: unknown, index: number): AcceptanceCriterion | null {
@@ -1682,6 +2074,14 @@ export class PlanLedgerService extends EventEmitter {
         ? candidate.verificationMethod
         : 'auto',
       status: candidate.status === 'passed' || candidate.status === 'failed' ? candidate.status : 'pending',
+      evidence: this.normalizeAcceptanceEvidence(candidate.evidence),
+      owner: this.normalizeAcceptanceOwner(candidate.owner),
+      scope: typeof candidate.scope === 'string' && candidate.scope.trim().length > 0
+        ? candidate.scope.trim()
+        : undefined,
+      lastBatchId: this.normalizeIdentifier(candidate.lastBatchId),
+      lastWorkerId: this.normalizeAcceptanceOwner(candidate.lastWorkerId),
+      reviewHistory: this.normalizeAcceptanceReviewHistory(candidate.reviewHistory),
       verificationSpec: candidate.verificationSpec,
     };
   }
@@ -1698,6 +2098,72 @@ export class PlanLedgerService extends EventEmitter {
       verificationMethod: 'auto',
       status: 'pending',
     };
+  }
+
+  private normalizeAcceptanceEvidence(evidence: unknown): string[] | undefined {
+    const normalized = this.normalizeStringArray(
+      Array.isArray(evidence) ? evidence.filter((item): item is string => typeof item === 'string') : undefined,
+    );
+    return normalized.length > 0 ? normalized : undefined;
+  }
+
+  private normalizeAcceptanceOwner(value: unknown): AcceptanceCriterion['owner'] | undefined {
+    const normalized = typeof value === 'string' ? value.trim() : '';
+    if (normalized === 'claude' || normalized === 'codex' || normalized === 'gemini' || normalized === 'orchestrator') {
+      return normalized;
+    }
+    return undefined;
+  }
+
+  private normalizeAcceptanceReviewHistory(
+    input: unknown,
+  ): AcceptanceCriterion['reviewHistory'] | undefined {
+    if (!Array.isArray(input)) {
+      return undefined;
+    }
+    const normalized = input
+      .map((entry) => {
+        if (!entry || typeof entry !== 'object') {
+          return null;
+        }
+        const candidate = entry as {
+          status?: string;
+          reviewer?: string;
+          detail?: string;
+          reviewedAt?: unknown;
+          round?: unknown;
+          batchId?: unknown;
+          workerId?: unknown;
+        };
+        const status: 'pending' | 'passed' | 'failed' =
+          candidate.status === 'passed' || candidate.status === 'failed' || candidate.status === 'pending'
+          ? candidate.status
+          : 'pending';
+        const reviewer = typeof candidate.reviewer === 'string' && candidate.reviewer.trim().length > 0
+          ? candidate.reviewer.trim()
+          : 'system';
+        const reviewedAt = this.normalizeTimestamp(candidate.reviewedAt);
+        if (reviewedAt === undefined) {
+          return null;
+        }
+        const detail = typeof candidate.detail === 'string' && candidate.detail.trim().length > 0
+          ? candidate.detail.trim()
+          : undefined;
+        const round = this.normalizePositiveInteger(candidate.round);
+        const batchId = this.normalizeIdentifier(candidate.batchId);
+        const workerId = this.normalizeAcceptanceOwner(candidate.workerId);
+        return {
+          status,
+          reviewer,
+          detail,
+          reviewedAt,
+          round,
+          batchId,
+          workerId,
+        };
+      })
+      .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
+    return normalized.length > 0 ? normalized : undefined;
   }
 
   private createInitialRuntimeState(
@@ -1758,6 +2224,46 @@ export class PlanLedgerService extends EventEmitter {
 
   private resolveRuntimeVersion(mode: 'standard' | 'deep'): PlanRuntimeVersion {
     return mode === 'deep' ? 'deep_v1' : 'classic';
+  }
+
+  private resolveSchemaVersion(input: unknown): SchemaVersionResolution {
+    const declared = this.normalizePositiveInteger(input);
+    if (declared === undefined) {
+      return {
+        sourceVersion: PlanLedgerService.MIN_SUPPORTED_SCHEMA_VERSION,
+        targetVersion: PlanLedgerService.CURRENT_SCHEMA_VERSION,
+        supported: true,
+        shouldMigrate: true,
+        sourceDeclared: false,
+      };
+    }
+    if (declared < PlanLedgerService.MIN_SUPPORTED_SCHEMA_VERSION) {
+      return {
+        sourceVersion: declared,
+        targetVersion: declared,
+        supported: false,
+        shouldMigrate: false,
+        sourceDeclared: true,
+        reason: 'too_old',
+      };
+    }
+    if (declared > PlanLedgerService.CURRENT_SCHEMA_VERSION) {
+      return {
+        sourceVersion: declared,
+        targetVersion: declared,
+        supported: false,
+        shouldMigrate: false,
+        sourceDeclared: true,
+        reason: 'too_new',
+      };
+    }
+    return {
+      sourceVersion: declared,
+      targetVersion: PlanLedgerService.CURRENT_SCHEMA_VERSION,
+      supported: true,
+      shouldMigrate: declared !== PlanLedgerService.CURRENT_SCHEMA_VERSION,
+      sourceDeclared: true,
+    };
   }
 
   private normalizeRuntimeVersion(input: unknown, mode: unknown): PlanRuntimeVersion {
@@ -1923,7 +2429,13 @@ export class PlanLedgerService extends EventEmitter {
           ...record.runtime.acceptance,
           criteria: record.runtime.acceptance.criteria.map((criterion) => ({
             ...criterion,
+            evidence: Array.isArray(criterion.evidence)
+              ? [...criterion.evidence]
+              : undefined,
             verificationSpec: criterion.verificationSpec ? { ...criterion.verificationSpec } : undefined,
+            reviewHistory: Array.isArray(criterion.reviewHistory)
+              ? criterion.reviewHistory.map((entry) => ({ ...entry }))
+              : undefined,
           })),
         },
         review: { ...record.runtime.review },

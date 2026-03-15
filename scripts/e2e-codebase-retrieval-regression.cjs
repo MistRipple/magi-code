@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * codebase_retrieval 本地检索链路回归脚本
+ * code_search_semantic 本地检索链路回归脚本
  *
  * 目标：
- * 1. 验证 codebase_retrieval 在无外部检索配置情况下可直接执行
+ * 1. 验证 code_search_semantic 在无外部检索配置情况下可直接执行
  * 2. 验证 scope_paths 参数可被正确接收
  * 3. 验证输出为本地检索语义（PKB + Grep + LSP）
  */
@@ -127,7 +127,7 @@ async function main() {
   const retrievalService = new CodebaseRetrievalService({
     getKnowledgeBase: () => undefined,
     executeTool: async (toolCall) => {
-      if (toolCall.name === 'lsp_query') {
+      if (toolCall.name === 'code_intel_query') {
         return toolManager.getLspExecutor().execute(toolCall);
       }
       return toolManager.execute(toolCall);
@@ -140,16 +140,16 @@ async function main() {
 
   const fullSearchResult = await toolManager.execute({
     id: 'retrieval-full',
-    name: 'codebase_retrieval',
+    name: 'code_search_semantic',
     arguments: {
-      query: 'ToolManager executeBuiltinTool codebase_retrieval',
+      query: 'ToolManager executeBuiltinTool code_search_semantic',
       max_results: 5,
     },
   });
 
   const scopedSearchResult = await toolManager.execute({
     id: 'retrieval-scoped',
-    name: 'codebase_retrieval',
+    name: 'code_search_semantic',
     arguments: {
       query: 'WebviewProvider injectCodebaseRetrievalService',
       scope_paths: ['src/ui', 'src/tools'],
@@ -169,7 +169,7 @@ async function main() {
     && fullContentValid
     && scopedContentValid;
 
-  console.log('\n=== codebase_retrieval 回归结果 ===');
+  console.log('\n=== code_search_semantic 回归结果 ===');
   console.log(JSON.stringify({
       fullSearchError: !!fullSearchResult.isError,
       fullSearchPreview: fullContent.slice(0, 220),
@@ -182,6 +182,6 @@ async function main() {
 }
 
 main().catch(error => {
-  console.error('codebase_retrieval 回归失败:', error?.stack || error);
+  console.error('code_search_semantic 回归失败:', error?.stack || error);
   process.exitCode = 1;
 });

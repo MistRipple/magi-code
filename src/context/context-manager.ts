@@ -10,10 +10,11 @@
  */
 
 import { logger, LogCategory } from '../logging';
+import * as fs from 'fs';
 import * as path from 'path';
 import { estimateTokenCount } from '../utils/token-estimator';
 import { MemoryDocument } from './memory-document';
-import { ContextAuxiliary, type AuxiliaryAdapter } from './context-auxiliary';
+import { ContextAuxiliary, type AuxiliaryAdapter, type CompressionStats } from './context-auxiliary';
 import { TruncationUtils } from './truncation-utils';
 import {
   ContextMessage,
@@ -48,6 +49,23 @@ import {
 type AssembledContextFormatOptions = {
   excludePartTypes?: ContextPartType[];
 };
+
+type MemoryCompactionReason = 'auto' | 'manual';
+
+export interface ContextCompactionResult {
+  success: boolean;
+  compressed: boolean;
+  reason: MemoryCompactionReason;
+  force: boolean;
+  beforeTokens: number;
+  afterTokens: number;
+  method?: CompressionStats['method'];
+  truncationApplied?: boolean;
+  archived: boolean;
+  archivePath?: string;
+  note?: string;
+  error?: string;
+}
 
 export class ContextManager {
   private config: ContextManagerConfig;
@@ -713,21 +731,182 @@ export class ContextManager {
     return this.auxiliary;
   }
 
-  private async compressMemoryIfNeeded(): Promise<void> {
-    if (!this.sessionMemory) {
-      return;
+  /**
+   * 执行 Memory 压缩并写入归档事件
+   *
+   * - auto: 由 saveMemory 在达到阈值时自动触发
+   * - manual: 由编排工具 context_compact 显式触发
+   */
+  async compactMemory(options?: {
+    force?: boolean;
+    reason?: MemoryCompactionReason;
+    note?: string;
+  }): Promise<ContextCompactionResult> {
+    const sessionMemory = this.sessionMemory;
+    const reason = options?.reason === 'manual' ? 'manual' : 'auto';
+    const force = options?.force === true;
+    const note = typeof options?.note === 'string' && options.note.trim().length > 0
+      ? options.note.trim()
+      : undefined;
+
+    if (!sessionMemory) {
+      return {
+        success: false,
+        compressed: false,
+        reason,
+        force,
+        beforeTokens: 0,
+        afterTokens: 0,
+        archived: false,
+        error: 'session memory not initialized',
+        note,
+      };
+    }
+
+    const beforeTokens = sessionMemory.estimateTokens();
+    if (!force && !sessionMemory.needsCompression(this.config.compression.tokenLimit, this.config.compression.lineLimit)) {
+      return {
+        success: true,
+        compressed: false,
+        reason,
+        force,
+        beforeTokens,
+        afterTokens: beforeTokens,
+        archived: false,
+        note,
+      };
     }
 
     const auxiliary = this.getAuxiliary();
     try {
-      const success = await auxiliary.compress(this.sessionMemory);
-      if (success) {
-        const stats = auxiliary.getLastStats();
-        logger.info('上下文.压缩.完成', stats, LogCategory.SESSION);
+      const success = await auxiliary.compress(sessionMemory);
+      if (!success) {
+        return {
+          success: false,
+          compressed: false,
+          reason,
+          force,
+          beforeTokens,
+          afterTokens: sessionMemory.estimateTokens(),
+          archived: false,
+          error: 'auxiliary compression returned false',
+          note,
+        };
       }
+
+      const afterTokens = sessionMemory.estimateTokens();
+      const stats = auxiliary.getLastStats();
+      const archival = this.appendCompactionArchive({
+        reason,
+        force,
+        beforeTokens,
+        afterTokens,
+        stats,
+        note,
+      });
+
+      logger.info('上下文.压缩.完成', {
+        reason,
+        force,
+        beforeTokens,
+        afterTokens,
+        method: stats?.method,
+        archived: archival.archived,
+      }, LogCategory.SESSION);
+
+      return {
+        success: true,
+        compressed: true,
+        reason,
+        force,
+        beforeTokens,
+        afterTokens,
+        method: stats?.method,
+        truncationApplied: stats?.truncationApplied,
+        archived: archival.archived,
+        archivePath: archival.archivePath,
+        note,
+      };
     } catch (error) {
       logger.error('上下文.压缩.失败', error, LogCategory.SESSION);
+      return {
+        success: false,
+        compressed: false,
+        reason,
+        force,
+        beforeTokens,
+        afterTokens: sessionMemory.estimateTokens(),
+        archived: false,
+        error: error instanceof Error ? error.message : String(error),
+        note,
+      };
     }
+  }
+
+  /**
+   * 手动触发 compact（用于编排阶段显式治理）
+   */
+  async manualCompactMemory(options?: { force?: boolean; note?: string }): Promise<ContextCompactionResult> {
+    return this.compactMemory({
+      reason: 'manual',
+      force: options?.force === true,
+      note: options?.note,
+    });
+  }
+
+  private appendCompactionArchive(input: {
+    reason: MemoryCompactionReason;
+    force: boolean;
+    beforeTokens: number;
+    afterTokens: number;
+    stats: CompressionStats | null;
+    note?: string;
+  }): { archived: boolean; archivePath?: string } {
+    const sessionMemory = this.sessionMemory;
+    const sessionId = this.currentSessionId || sessionMemory?.getContent().sessionId;
+    if (!sessionMemory || !sessionId) {
+      return { archived: false };
+    }
+
+    const archiveDir = path.join(this.workspacePath, this.config.storagePath, sessionId);
+    const archivePath = path.join(archiveDir, 'memory-archival.jsonl');
+    const content = sessionMemory.getContent();
+    const now = Date.now();
+    const linePayload = {
+      timestamp: now,
+      reason: input.reason,
+      force: input.force,
+      beforeTokens: input.beforeTokens,
+      afterTokens: input.afterTokens,
+      compressionRatio: input.beforeTokens > 0 ? Number((input.afterTokens / input.beforeTokens).toFixed(4)) : 1,
+      method: input.stats?.method || 'unknown',
+      truncationApplied: input.stats?.truncationApplied === true,
+      note: input.note,
+      summary: {
+        sessionId,
+        currentTasks: content.currentTasks.length,
+        completedTasks: content.completedTasks.length,
+        nextSteps: content.nextSteps.length,
+        pendingIssues: content.pendingIssues.length,
+        importantContext: content.importantContext.length,
+      },
+    };
+
+    try {
+      fs.mkdirSync(archiveDir, { recursive: true });
+      fs.appendFileSync(archivePath, `${JSON.stringify(linePayload)}\n`, 'utf-8');
+      return { archived: true, archivePath };
+    } catch (error) {
+      logger.warn('上下文.压缩归档.写入失败', {
+        archivePath,
+        error: error instanceof Error ? error.message : String(error),
+      }, LogCategory.SESSION);
+      return { archived: false };
+    }
+  }
+
+  private async compressMemoryIfNeeded(): Promise<void> {
+    await this.compactMemory({ reason: 'auto' });
   }
 
   /**

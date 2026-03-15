@@ -103,6 +103,7 @@ export interface TodoItemView {
   status: SubTaskViewStatus; // 映射自 TodoStatus
   progress: number;         // = UnifiedTodo.progress
   priority: number;         // = UnifiedTodo.priority
+  source: UnifiedTodo['source'];
 
   // 文件跟踪
   targetFiles: string[];    // = UnifiedTodo.targetFiles
@@ -181,6 +182,7 @@ export function todoToTodoItemView(todo: UnifiedTodo, missionId: string): TodoIt
     status: mapTodoStatusToSubTaskViewStatus(todo.status),
     progress: todo.progress,
     priority: todo.priority,
+    source: todo.source,
     targetFiles: todo.targetFiles || [],
     modifiedFiles: todo.modifiedFiles,
     output: todo.output ? [todo.output.summary] : [],

@@ -260,7 +260,7 @@ export class ConfigCommandHandler implements CommandHandler {
       const { clearClientCache } = await import('../../llm/clients/client-factory');
       clearClientCache();
       try {
-        // #7 根修复：Worker enabled 变化后，立即重建 dispatch_task/send_worker_message 的 worker enum
+        // #7 根修复：Worker enabled 变化后，立即重建 worker_dispatch/worker_send_message 的 worker enum
         await ctx.getOrchestratorEngine().reloadProfiles();
       } catch (reloadError) {
         const reloadMsg = reloadError instanceof Error ? reloadError.message : String(reloadError);

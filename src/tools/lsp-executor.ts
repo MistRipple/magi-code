@@ -2,7 +2,7 @@
  * LSP 执行器
  * 提供基于 VSCode Language Server 的代码智能能力
  *
- * 工具: lsp_query
+ * 工具: code_intel_query
  */
 
 import * as path from 'path';
@@ -70,7 +70,7 @@ export class LspExecutor implements ToolExecutor {
 
   getToolDefinition(): ExtendedToolDefinition {
     return {
-      name: 'lsp_query',
+      name: 'code_intel_query',
       description: `Query VSCode LSP-backed code intelligence for TS/JS and Python.
 
 Actions:
@@ -137,7 +137,7 @@ Actions:
   }
 
   async isAvailable(toolName: string): Promise<boolean> {
-    return toolName === 'lsp_query';
+    return toolName === 'code_intel_query';
   }
 
   async execute(toolCall: ToolCall): Promise<ToolResult> {

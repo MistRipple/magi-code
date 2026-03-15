@@ -66,6 +66,8 @@ import {
 } from '../../context';
 import { classifyModelOriginIssue, toModelOriginUserMessage } from '../../errors/model-origin';
 import { trackModelOriginEvent } from '../../errors/model-origin-observability';
+import type { DecisionHookEvent } from '../../llm/types';
+import { createTodoAttentionGuard } from './todo-attention-guard';
 
 /**
  * 文件读取结果
@@ -200,6 +202,8 @@ export class AutonomousWorker extends EventEmitter {
    * 说明：blocking question 可能触发一次系统侧编排 LLM 调用，5s 在真实场景下过短。
    */
   private static readonly DEFAULT_BLOCKING_QUESTION_TIMEOUT_MS = 180_000;
+  private static readonly DEFAULT_IDLE_CLAIM_TIMEOUT_MS = 5_000;
+  private static readonly DEFAULT_IDLE_CLAIM_POLL_INTERVAL_MS = 500;
 
   private todoManager: TodoManager;
   private recoveryHandler: ProfileAwareRecoveryHandler;
@@ -398,6 +402,7 @@ export class AutonomousWorker extends EventEmitter {
 
     this.emit('assignmentStarted', {
       assignmentId: assignment.id,
+      missionId: assignment.missionId,
       sessionId: session.id,
       isResuming,
     });
@@ -421,6 +426,7 @@ export class AutonomousWorker extends EventEmitter {
     const emitHeartbeat = () => {
       this.emit('assignmentHeartbeat', {
         assignmentId: assignment.id,
+        missionId: assignment.missionId,
         sessionId: session.id,
         timestamp: Date.now(),
         todoId: heartbeatTodoId,
@@ -674,6 +680,16 @@ export class AutonomousWorker extends EventEmitter {
         currentTodo = this.getNextExecutableTodo(assignment);
         heartbeatTodoId = currentTodo?.id;
 
+        if (!currentTodo && !aborted) {
+          const claimedTodo = await this.pollAndClaimTodoWhileIdle(assignment, options);
+          if (claimedTodo) {
+            await this.refreshAssignmentTodos(assignment);
+            this.syncTodoCollections(assignment, completedTodos, failedTodos, skippedTodos);
+            currentTodo = this.getNextExecutableTodo(assignment);
+            heartbeatTodoId = currentTodo?.id;
+          }
+        }
+
         // 验收检查：当所有 todo 执行完毕，对照验收标准检查已完成工作
         if (!currentTodo && !aborted && reviewRound < maxReviewRounds
           && completedTodos.length > 0 && failedTodos.length === 0
@@ -818,6 +834,7 @@ export class AutonomousWorker extends EventEmitter {
       }
       this.emit('assignmentCompleted', {
         assignmentId: assignment.id,
+        missionId: assignment.missionId,
         success: qualityCheckedResult.success,
         summary: qualityCheckedResult.summary,
         result: qualityCheckedResult,
@@ -833,6 +850,80 @@ export class AutonomousWorker extends EventEmitter {
     } finally {
       clearInterval(heartbeatTimer);
     }
+  }
+
+  /**
+   * Worker 空闲驻留轮询：在“本 Assignment 已无可执行 Todo”时，短时间轮询并原子认领同 Assignment 新 Todo。
+   *
+   * 目的：
+   * - 形成有边界的 idle -> poll -> claim -> work 生命周期，减少“刚空闲即退出”导致的调度抖动。
+   * - 不跨 Assignment 抢占，避免引入第二条任务事实路径。
+   */
+  private async pollAndClaimTodoWhileIdle(
+    assignment: Assignment,
+    options: TodoExecuteOptions,
+  ): Promise<UnifiedTodo | null> {
+    if (!this.isIdleClaimEnabled()) {
+      return null;
+    }
+    const timeoutMs = this.resolveIdleClaimTimeoutMs();
+    if (timeoutMs <= 0) {
+      return null;
+    }
+    const pollIntervalMs = this.resolveIdleClaimPollIntervalMs();
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      if (options.cancellationToken?.isCancelled) {
+        return null;
+      }
+      const claimable = await this.todoManager.findClaimable(assignment.missionId, assignment.workerId);
+      const candidate = claimable.find((todo) => todo.assignmentId === assignment.id);
+      if (candidate) {
+        const claimed = await this.todoManager.tryClaim(candidate.id, assignment.workerId);
+        if (claimed && claimed.assignmentId === assignment.id) {
+          logger.info('Worker.空闲轮询.认领成功', {
+            assignmentId: assignment.id,
+            missionId: assignment.missionId,
+            todoId: claimed.id,
+            workerId: assignment.workerId,
+          }, LogCategory.ORCHESTRATOR);
+          return claimed;
+        }
+      }
+
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(pollIntervalMs, remainingMs)));
+    }
+
+    return null;
+  }
+
+  private isIdleClaimEnabled(): boolean {
+    const raw = (process.env.MAGI_WORKER_IDLE_CLAIM_ENABLE || '').trim().toLowerCase();
+    if (!raw) {
+      return true;
+    }
+    return raw !== '0' && raw !== 'false' && raw !== 'off';
+  }
+
+  private resolveIdleClaimTimeoutMs(): number {
+    const raw = Number(process.env.MAGI_WORKER_IDLE_CLAIM_TIMEOUT_MS);
+    if (!Number.isFinite(raw) || raw < 0) {
+      return AutonomousWorker.DEFAULT_IDLE_CLAIM_TIMEOUT_MS;
+    }
+    return Math.min(120_000, Math.floor(raw));
+  }
+
+  private resolveIdleClaimPollIntervalMs(): number {
+    const raw = Number(process.env.MAGI_WORKER_IDLE_CLAIM_POLL_INTERVAL_MS);
+    if (!Number.isFinite(raw) || raw <= 0) {
+      return AutonomousWorker.DEFAULT_IDLE_CLAIM_POLL_INTERVAL_MS;
+    }
+    return Math.max(100, Math.min(5_000, Math.floor(raw)));
   }
 
   /**
@@ -1026,6 +1117,7 @@ If any criterion is not satisfied:
       const todo = await this.todoManager.create({
         missionId: assignment.missionId,
         assignmentId: assignment.id,
+        source: 'review_fix',
         content: gap.fix,
         type: 'fix',
         reasoning: `Acceptance verification round ${round + 1}: ${gap.criterion} — ${gap.reason}`,
@@ -1206,6 +1298,7 @@ If any criterion is not satisfied:
           stepContent,
           'Added by orchestrator adjustment',
           'implementation',
+          'orchestrator_adjustment',
           parentTodo?.id
         );
         assignment.todos.push(todo);
@@ -1459,6 +1552,7 @@ If any criterion is not satisfied:
 
     this.emit('todoStarted', {
       assignmentId: assignment.id,
+      missionId: assignment.missionId,
       todoId: currentTodo.id,
       content: currentTodo.content,
     });
@@ -1507,7 +1601,7 @@ If any criterion is not satisfied:
       );
       const modifiedFiles = toolManager?.getTodoModifiedFiles(assignment.workerId, currentTodo.id) || [];
 
-      // 检查执行过程中是否调用了 split_todo（数据驱动，无模式标志）
+      // 检查执行过程中是否调用了 todo_split（数据驱动，无模式标志）
       await this.refreshAssignmentTodos(assignment);
       currentTodo = this.getAssignmentTodoOrThrow(assignment, currentTodo.id);
       const hasChildren = assignment.todos.some(t => t.parentId === currentTodo.id);
@@ -1551,6 +1645,7 @@ If any criterion is not satisfied:
       try {
         this.emit('todoCompleted', {
           assignmentId: assignment.id,
+          missionId: assignment.missionId,
           todoId: currentTodo.id,
           content: currentTodo.content,
           output: currentTodo.output,
@@ -1598,6 +1693,7 @@ If any criterion is not satisfied:
       try {
         this.emit('todoFailed', {
           assignmentId: assignment.id,
+          missionId: assignment.missionId,
           todoId: currentTodo.id,
           content: currentTodo.content,
           error: userMessage,
@@ -1685,8 +1781,10 @@ If any criterion is not satisfied:
     const hasGrandparent = todo.parentId && assignment.todos.find(t => t.id === todo.parentId)?.parentId;
     if (!hasGrandparent) {
       sections.push(`## Task Splitting
-If the current task involves multiple independently completable and verifiable sub-goals, you may use split_todo to break it into sub-steps.
+If the current task involves multiple independently completable and verifiable sub-goals, you may use todo_split to break it into sub-steps.
 Applicable: The task contains multiple independent sub-goals where each sub-step can be completed and verified individually.
+When using todo_split, each child step must include a concrete expected_output. If the likely target files are already known, include target_files as well.
+Do not split into more than 8 steps, and do not mechanically break one continuous action into many tiny steps.
 Not applicable: The task itself is a single goal — execute it directly.`);
     }
 
@@ -1723,17 +1821,30 @@ Not applicable: The task itself is a single goal — execute it directly.`);
 
     // 组合执行 prompt 和自检引导
     const fullPrompt = `${executionPrompt}\n\n## Self-Check Checklist\n${selfCheckGuidance}`;
+    const hasGrandparent = todo.parentId && assignment.todos.find((item) => item.id === todo.parentId)?.parentId;
+    const todoAttentionGuard = createTodoAttentionGuard({
+      todoContent: todo.content,
+      expectedOutput: todo.expectedOutput,
+      targetPaths: assignment.scope.targetPaths,
+      allowSplitTodo: !hasGrandparent,
+    });
 
     try {
-      const decisionHook = options.getSupplementaryInstructions
-        ? () => {
-            const instructions = options.getSupplementaryInstructions?.() || [];
-            if (instructions.length > 0) {
-              this.appendSupplementaryInstructions(assignment, instructions);
-            }
-            return instructions;
+      const decisionHook = (event: DecisionHookEvent) => {
+        const instructions: string[] = [];
+        if (options.getSupplementaryInstructions) {
+          const supplementary = options.getSupplementaryInstructions() || [];
+          if (supplementary.length > 0) {
+            this.appendSupplementaryInstructions(assignment, supplementary);
+            instructions.push(...supplementary);
           }
-        : undefined;
+        }
+        const attentionReminders = todoAttentionGuard(event);
+        if (attentionReminders.length > 0) {
+          instructions.push(...attentionReminders);
+        }
+        return instructions;
+      };
 
       const response = await options.adapterFactory.sendMessage(
         this.workerType,
@@ -1743,6 +1854,14 @@ Not applicable: The task itself is a single goal — execute it directly.`);
           source: 'worker',
           adapterRole: 'worker',
           ...options.adapterScope,
+          // ⚠️ 产品级约束：写任务隔离路径必须仅经 toolExecutionContext/worktreePath 透传。
+          // 后续新增写工具或执行入口必须复用这条链路，严禁旁路（如在工具内部另行推导 cwd）。
+          toolExecutionContext: {
+            ...(options.adapterScope?.toolExecutionContext || {}),
+            workerId: this.workerType,
+            role: 'worker',
+            worktreePath: options.workingDirectory,
+          },
           decisionHook,
         }
       );
@@ -2483,18 +2602,23 @@ Not applicable: The task itself is a single goal — execute it directly.`);
 
   /**
    * 动态添加 Todo
+   *
+   * 仅用于运行期受控新增（如编排调整）；Todo 来源必须显式传入，
+   * 禁止新增一条“默认来源”旁路，避免后续无法区分任务增长原因。
    */
   async addDynamicTodo(
     assignment: Assignment,
     content: string,
     reasoning: string,
     type: UnifiedTodo['type'],
+    source: UnifiedTodo['source'],
     parentId?: string
   ): Promise<UnifiedTodo> {
     const todo = await this.todoManager.create({
       missionId: assignment.missionId,
       assignmentId: assignment.id,
       parentId,
+      source,
       content,
       reasoning,
       type,
@@ -2503,6 +2627,7 @@ Not applicable: The task itself is a single goal — execute it directly.`);
 
     this.emit('dynamicTodoAdded', {
       assignmentId: assignment.id,
+      missionId: assignment.missionId,
       todo,
     });
 
@@ -2515,6 +2640,7 @@ Not applicable: The task itself is a single goal — execute it directly.`);
   requestApproval(todo: UnifiedTodo, reason: string): void {
     this.emit('approvalRequested', {
       todoId: todo.id,
+      missionId: this.currentMissionId,
       content: todo.content,
       reason,
     });
@@ -2983,6 +3109,7 @@ Not applicable: The task itself is a single goal — execute it directly.`);
       if (insight.importance === 'critical' || insight.importance === 'high') {
         this.emit('insightGenerated', {
           workerId: this.workerType,
+          missionId: this.currentMissionId,
           type: insight.type,
           content: insight.content,
           importance: insight.importance,

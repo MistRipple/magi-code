@@ -52,8 +52,6 @@ export interface EnvironmentPromptOptions {
   includeTools?: boolean;
   /** 是否注入 Prompts/Skills 清单 */
   includePrompts?: boolean;
-  /** Prompts 中是否展开 Skill 指令正文（默认 true，仅调试/特殊场景建议开启） */
-  includeSkillInstructionContent?: boolean;
   /** 是否注入用户规则 */
   includeUserRules?: boolean;
 }
@@ -134,7 +132,6 @@ export class EnvironmentContextProvider {
       includeIDEState: options?.includeIDEState ?? true,
       includeTools: options?.includeTools ?? true,
       includePrompts: options?.includePrompts ?? true,
-      includeSkillInstructionContent: options?.includeSkillInstructionContent ?? true,
       includeUserRules: options?.includeUserRules ?? true,
     };
 
@@ -155,9 +152,7 @@ export class EnvironmentContextProvider {
 
     // 3. 提示词/指令（MCP Prompts + Instruction Skills）
     if (resolved.includePrompts) {
-      const promptsSection = this.getPromptsPrompt({
-        includeSkillInstructionContent: resolved.includeSkillInstructionContent,
-      });
+      const promptsSection = this.getPromptsPrompt();
       if (promptsSection) {
         sections.push(promptsSection);
       }
@@ -248,12 +243,11 @@ export class EnvironmentContextProvider {
    * 获取提示词/指令提示（从缓存）
    * 统一展示 MCP Prompts 和 Instruction Skills
    */
-  getPromptsPrompt(options?: { includeSkillInstructionContent?: boolean }): string {
+  getPromptsPrompt(): string {
     if (this.cachedPrompts.length === 0) {
       return '';
     }
 
-    const includeSkillInstructionContent = options?.includeSkillInstructionContent ?? true;
     const mcpPrompts = this.cachedPrompts.filter(p => p.source === 'mcp');
     const skillPrompts = this.cachedPrompts.filter(p => p.source === 'skill');
 
@@ -289,23 +283,8 @@ export class EnvironmentContextProvider {
       }
       blocks.push('');
 
-      // 自动调用 Skill 的详细指令
-      if (autoSkills.length > 0 && includeSkillInstructionContent) {
-        blocks.push('### Skill 指令（可自动调用）');
-        const maxChars = 6000;
-        let usedChars = 0;
-
-        for (const skill of autoSkills) {
-          const contentBlock = this.formatSkillInstruction(skill);
-          if (usedChars + contentBlock.length > maxChars) {
-            blocks.push(`- **${skill.name}**: 指令内容过长，需在 /${skill.name} 调用时加载`);
-            continue;
-          }
-          blocks.push(contentBlock);
-          usedChars += contentBlock.length;
-        }
-        blocks.push('');
-      } else if (autoSkills.length > 0) {
+      // 自动调用 Skill 仅暴露索引，正文必须通过 /skill-name 显式触发。
+      if (autoSkills.length > 0) {
         blocks.push('### Skill 指令（可自动调用）');
         blocks.push('- 当前为精简模式，未展开 Skill 指令正文；需要时请用 `/skill-name` 显式触发。');
         blocks.push('');
@@ -326,24 +305,6 @@ export class EnvironmentContextProvider {
     }, LogCategory.TOOLS);
 
     return blocks.join('\n');
-  }
-
-  /**
-   * 格式化单个 Skill 指令
-   */
-  private formatSkillInstruction(skill: UnifiedPromptInfo): string {
-    const toolHint = Array.isArray(skill.allowedTools) && skill.allowedTools.length > 0
-      ? `允许使用的工具: ${skill.allowedTools.join(', ')}`
-      : '';
-    const argHint = skill.argumentHint ? `参数提示: ${skill.argumentHint}` : '';
-    const hints = [toolHint, argHint].filter(Boolean).join(' | ');
-
-    return [
-      `\n**[${skill.name}]**`,
-      skill.description ? `描述: ${skill.description}` : '',
-      hints ? `提示: ${hints}` : '',
-      skill.content ? `指令:\n${skill.content}` : '',
-    ].filter(Boolean).join('\n');
   }
 
   /**

@@ -172,7 +172,7 @@ IMPORTANT:
 * This is the primary tool for reading files and browsing directories
 * Use on a directory path to explore project structure (e.g. path: "." or path: "src")
 * Use on a file path to read file contents
-* DO NOT use launch-process with ls/find/cat to explore files - use this tool instead
+* DO NOT use process_launch with ls/find/cat to explore files - use this tool instead
 * Read a file before editing it; if the same file has already been fully read in current context, do not repeatedly read it again`,
       input_schema: {
         type: 'object',

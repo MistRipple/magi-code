@@ -107,10 +107,10 @@ async function main() {
 
   const deepDispatchRestriction = checkRestrictionDeep.call(deepAdapter, {
     id: 'deep-dispatch',
-    name: 'dispatch_task',
+    name: 'worker_dispatch',
     arguments: { category: 'general' },
   });
-  assert(deepDispatchRestriction === null, `深度模式 dispatch_task 不应被拦截: ${deepDispatchRestriction}`);
+  assert(deepDispatchRestriction === null, `深度模式 worker_dispatch 不应被拦截: ${deepDispatchRestriction}`);
 
   const deepTerminalTools = [
     'shell',

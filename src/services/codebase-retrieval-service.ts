@@ -237,7 +237,7 @@ export class CodebaseRetrievalService {
         const escapedKeyword = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         return this.deps.executeTool({
           id: `retrieval-grep-${Date.now()}-${keyword}`,
-          name: 'grep_search',
+          name: 'code_search_regex',
           arguments: {
             pattern: escapedKeyword,
             path: scopePath,
@@ -277,7 +277,7 @@ export class CodebaseRetrievalService {
       symbolKeywords.map(keyword =>
         this.deps.executeTool({
           id: `retrieval-lsp-${Date.now()}-${keyword}`,
-          name: 'lsp_query',
+          name: 'code_intel_query',
           arguments: { action: 'workspaceSymbols', query: keyword },
         }).then(result => ({ keyword, result }))
       )

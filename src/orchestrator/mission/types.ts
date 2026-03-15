@@ -264,6 +264,19 @@ export interface VerificationSpec {
 }
 
 /**
+ * 验收标准评审记录
+ */
+export interface AcceptanceCriterionReviewRecord {
+  status: 'pending' | 'passed' | 'failed';
+  reviewer: string;
+  detail?: string;
+  reviewedAt: number;
+  round?: number;
+  batchId?: string;
+  workerId?: WorkerSlot | 'orchestrator';
+}
+
+/**
  * 验收标准
  */
 export interface AcceptanceCriterion {
@@ -274,6 +287,18 @@ export interface AcceptanceCriterion {
   status: 'pending' | 'passed' | 'failed';
   /** 结构化验证规格（优先于 description 解析） */
   verificationSpec?: VerificationSpec;
+  /** 验收证据（日志片段、检查结论、事件 ID 等） */
+  evidence?: string[];
+  /** 当前责任归属 */
+  owner?: WorkerSlot | 'orchestrator';
+  /** 作用域标签（mission/assignment/todo/batch 等） */
+  scope?: string;
+  /** 最近一次评审关联 batch */
+  lastBatchId?: string;
+  /** 最近一次评审关联 worker */
+  lastWorkerId?: WorkerSlot | 'orchestrator';
+  /** 评审历史 */
+  reviewHistory?: AcceptanceCriterionReviewRecord[];
 }
 
 // ============================================================================

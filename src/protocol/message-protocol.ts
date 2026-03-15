@@ -132,6 +132,7 @@ export type DataMessageType =
   | 'modelListFetched'
   | 'orchestratorConfigLoaded'
   | 'orchestratorConnectionTestResult'
+  | 'orchestratorRuntimeDiagnostics'
   | 'profileConfig'
   | 'profileConfigReset'
   | 'profileConfigSaved'

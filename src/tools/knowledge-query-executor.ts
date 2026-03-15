@@ -1,7 +1,7 @@
 /**
  * 知识库查询执行器
  *
- * 提供 fetch_project_guidelines 工具，让 Worker/Orchestrator
+ * 提供 project_knowledge_query 工具，让 Worker/Orchestrator
  * 按需拉取项目知识库中的 ADR、FAQ、经验记录等内容。
  *
  * 设计原则（对标 Claude Code s05）：
@@ -31,7 +31,7 @@ export class KnowledgeQueryExecutor implements ToolExecutor {
    */
   getToolDefinition(): ExtendedToolDefinition {
     return {
-      name: 'fetch_project_guidelines',
+      name: 'project_knowledge_query',
       description:
         'Fetch project guidelines, architectural decisions (ADRs), FAQs, or past learnings from the project knowledge base. ' +
         'Use this when you need to understand project conventions, past decisions, or specific guidelines before making changes.',
@@ -78,7 +78,7 @@ export class KnowledgeQueryExecutor implements ToolExecutor {
    * 检查工具是否可用
    */
   async isAvailable(toolName: string): Promise<boolean> {
-    return toolName === 'fetch_project_guidelines';
+    return toolName === 'project_knowledge_query';
   }
 
   /**
@@ -131,7 +131,7 @@ export class KnowledgeQueryExecutor implements ToolExecutor {
     } catch (error: any) {
       return {
         toolCallId: toolCall.id,
-        content: `Error fetching project guidelines: ${error.message}`,
+        content: `Error querying project knowledge: ${error.message}`,
         isError: true,
       };
     }
@@ -324,7 +324,7 @@ export class KnowledgeQueryExecutor implements ToolExecutor {
 
     return {
       toolCallId,
-      content: `# Project Knowledge Base Index\n\nUse fetch_project_guidelines with a specific ID to get full details.\n\n${sections.join('\n\n')}`,
+      content: `# Project Knowledge Base Index\n\nUse project_knowledge_query with a specific ID to get full details.\n\n${sections.join('\n\n')}`,
     };
   }
 
@@ -381,4 +381,3 @@ export class KnowledgeQueryExecutor implements ToolExecutor {
     ].join('\n');
   }
 }
-

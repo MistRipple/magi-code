@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * dispatch_task 缺失 scope_hint 回归脚本
+ * worker_dispatch 缺失 scope_hint 回归脚本
  *
  * 目标：
  * 1) 并行批次下缺失 scope_hint 不再 hard-fail

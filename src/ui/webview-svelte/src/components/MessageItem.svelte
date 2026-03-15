@@ -94,6 +94,44 @@
   // 非主角色仅在消息最终确定形态（非流式、非占位）且为纯内容时才 inline，
   // 避免流式过程中 blocks 类型变化导致 DOM 分支切换闪烁。
   const useInlineMode = $derived(isNativeSource || (!isStreaming && !isPlaceholder && isContentOnly));
+  const messagePhase = $derived.by(() => (
+    typeof message.metadata?.phase === 'string' ? message.metadata.phase.trim() : ''
+  ));
+  const systemSectionType = $derived.by(() => {
+    const extra = message.metadata?.extra as { type?: unknown } | undefined;
+    return typeof extra?.type === 'string' ? extra.type.trim() : '';
+  });
+  const isSystemSection = $derived.by(() => (
+    displayContext === 'thread'
+    && message.source === 'orchestrator'
+    && messagePhase === 'system_section'
+    && !isStreaming
+    && !isPlaceholder
+  ));
+  const systemSectionSummary = $derived.by(() => {
+    if (!isSystemSection || typeof message.content !== 'string') {
+      return '';
+    }
+    const firstLine = message.content
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line.length > 0) || '';
+    return firstLine.replace(/^\[system\]\s*/i, '').trim();
+  });
+  const shouldCollapseSystemSection = $derived.by(() => {
+    if (!isSystemSection || typeof message.content !== 'string') {
+      return false;
+    }
+    const normalized = message.content.trim();
+    if (!normalized) {
+      return false;
+    }
+    const nonEmptyLines = normalized
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0).length;
+    return nonEmptyLines >= 3 || normalized.length >= 140;
+  });
 
   // 格式化时间戳
   function formatTime(timestamp: number): string {
@@ -395,13 +433,24 @@
           </div>
         {/if}
 
-        {#if safeBlocks.length > 0}
-            {#each safeBlocks as block, i (`${message.id}-block-${i}-${block.type}`)}
-              <BlockRenderer {block} {isStreaming} {readOnly} />
-            {/each}
-          {:else if message.content}
-            <MarkdownContent content={message.content} {isStreaming} />
-          {/if}
+        {#if shouldCollapseSystemSection && safeBlocks.length === 0 && message.content}
+          <details class="system-section-fold" data-system-section-type={systemSectionType || undefined}>
+            <summary class="system-section-summary">
+              <span class="system-section-badge">{i18n.t('messageItem.systemSectionBadge')}</span>
+              <span class="system-section-title">{systemSectionSummary || i18n.t('messageItem.systemSectionTitleFallback')}</span>
+              <span class="system-section-hint">{i18n.t('messageItem.systemSectionExpandHint')}</span>
+            </summary>
+            <div class="system-section-content">
+              <MarkdownContent content={message.content} isStreaming={false} />
+            </div>
+          </details>
+        {:else if safeBlocks.length > 0}
+          {#each safeBlocks as block, i (`${message.id}-block-${i}-${block.type}`)}
+            <BlockRenderer {block} {isStreaming} {readOnly} />
+          {/each}
+        {:else if message.content}
+          <MarkdownContent content={message.content} {isStreaming} />
+        {/if}
 
           <!-- 只要处于流式接收状态，就应该在最底部渲染跳动的加载点，不论是否有内容 -->
           {#if isStreaming && showStreamingIndicator}
@@ -483,13 +532,24 @@
           </div>
         {/if}
 
-        {#if safeBlocks.length > 0}
-            {#each safeBlocks as block, i (`${message.id}-block-${i}-${block.type}`)}
-              <BlockRenderer {block} {isStreaming} {readOnly} />
-            {/each}
-          {:else if message.content}
-            <MarkdownContent content={message.content} {isStreaming} />
-          {/if}
+        {#if shouldCollapseSystemSection && safeBlocks.length === 0 && message.content}
+          <details class="system-section-fold" data-system-section-type={systemSectionType || undefined}>
+            <summary class="system-section-summary">
+              <span class="system-section-badge">{i18n.t('messageItem.systemSectionBadge')}</span>
+              <span class="system-section-title">{systemSectionSummary || i18n.t('messageItem.systemSectionTitleFallback')}</span>
+              <span class="system-section-hint">{i18n.t('messageItem.systemSectionExpandHint')}</span>
+            </summary>
+            <div class="system-section-content">
+              <MarkdownContent content={message.content} isStreaming={false} />
+            </div>
+          </details>
+        {:else if safeBlocks.length > 0}
+          {#each safeBlocks as block, i (`${message.id}-block-${i}-${block.type}`)}
+            <BlockRenderer {block} {isStreaming} {readOnly} />
+          {/each}
+        {:else if message.content}
+          <MarkdownContent content={message.content} {isStreaming} />
+        {/if}
 
           <!-- 与主角色消息保持一致：处于流式接收时在底部展示统一三点动画 -->
           {#if isStreaming && showStreamingIndicator}
@@ -676,6 +736,54 @@
     border: 1px solid color-mix(in srgb, var(--info) 40%, transparent);
     font-size: var(--text-sm);
     color: var(--foreground);
+  }
+  .system-section-fold {
+    margin: var(--space-1) 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--surface) 88%, var(--foreground) 12%);
+    overflow: hidden;
+  }
+  .system-section-summary {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+    font-size: var(--text-sm);
+  }
+  .system-section-summary::-webkit-details-marker {
+    display: none;
+  }
+  .system-section-badge {
+    flex-shrink: 0;
+    font-size: 11px;
+    line-height: 1;
+    color: var(--info);
+    border: 1px solid color-mix(in srgb, var(--info) 45%, transparent);
+    border-radius: 999px;
+    padding: 3px 8px;
+  }
+  .system-section-title {
+    flex: 1;
+    min-width: 0;
+    color: var(--foreground);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .system-section-hint {
+    flex-shrink: 0;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+  }
+  .system-section-fold[open] .system-section-summary {
+    border-bottom: 1px solid var(--border);
+  }
+  .system-section-content {
+    padding: var(--space-2) var(--space-3) var(--space-3);
   }
   /* 流式时不再变更边框颜色，避免 streaming 状态快速切换导致边框线闪烁 */
 

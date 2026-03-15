@@ -199,6 +199,7 @@ export class TodoManager extends EventEmitter {
       missionId: params.missionId,
       assignmentId: params.assignmentId,
       parentId: params.parentId,
+      source: params.source ?? 'planner_macro',
       content: params.content,
       reasoning: params.reasoning,
       expectedOutput: params.expectedOutput,
@@ -701,7 +702,7 @@ export class TodoManager extends EventEmitter {
    *
    * 设计原则（对标 Claude Code s11 半自治模式）：
    * - 仅返回 status=ready 且 dependsOn 全部满足的 Todo
-   * - 按 Worker 能力匹配排序（workerId 匹配的优先）
+   * - 仅返回与当前 Worker 匹配的 Todo，禁止跨 Worker 认领
    * - 排除已被其他 Worker 认领正在运行的 Todo
    *
    * @param missionId 当前 Mission ID
@@ -717,7 +718,10 @@ export class TodoManager extends EventEmitter {
     // 过滤：仅保留依赖已满足的 Todo
     const claimable: UnifiedTodo[] = [];
     for (const todo of todos) {
-      // 跳过已分配给特定 Worker 且不匹配的（保留未指定 Worker 的通用任务）
+      if (workerId && todo.workerId !== workerId) {
+        continue;
+      }
+      // 半自治 claim 只能消费显式归属当前 Worker 的 Todo，不能借“通用任务”旁路跨上下文续领
       if (todo.status === 'pending') {
         // pending 状态需要检查是否应该变为 ready
         const depMet = await this.checkDependencies(todo);
@@ -730,15 +734,8 @@ export class TodoManager extends EventEmitter {
       claimable.push(todo);
     }
 
-    // 排序：workerId 匹配的优先，然后按 priority（低值高优先）
+    // 排序：在已完成 Worker 边界过滤后，仅按 priority（低值高优先）
     claimable.sort((a, b) => {
-      // Worker 匹配优先
-      if (workerId) {
-        const aMatch = a.workerId === workerId ? 0 : 1;
-        const bMatch = b.workerId === workerId ? 0 : 1;
-        if (aMatch !== bMatch) return aMatch - bMatch;
-      }
-      // 然后按优先级
       return a.priority - b.priority;
     });
 

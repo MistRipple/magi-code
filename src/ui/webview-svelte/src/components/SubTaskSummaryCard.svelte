@@ -189,7 +189,7 @@
   // 是否有 Evidence 信息
   const hasEvidence = $derived(card.evidence !== undefined);
 
-  // wait_for_workers 结果展示
+  // worker_wait 结果展示
   const waitData = $derived(waitResult || null);
   const waitIsComplete = $derived(Boolean(waitData && waitData.wait_status === 'completed' && !waitData.timed_out));
   const completedDuration = $derived.by(() => {

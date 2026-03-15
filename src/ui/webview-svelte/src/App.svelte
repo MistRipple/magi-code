@@ -45,6 +45,9 @@
       ? pendingDeliveryRepair.maxRounds
       : i18n.t('common.unlimited')
   );
+  const isReplanFollowUpRequest = $derived(
+    pendingDeliveryRepair?.requestType === 'replan_followup'
+  );
 
   function handleTabChange(tab: TopTabType) {
     setCurrentTopTab(tab);
@@ -188,10 +191,13 @@
     <div class="modal-overlay" role="presentation">
       <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
         <div class="modal-header">
-          <h3>{i18n.t('app.deliveryRepairTitle')}</h3>
+          <h3>{i18n.t(isReplanFollowUpRequest ? 'app.replanFollowUpTitle' : 'app.deliveryRepairTitle')}</h3>
         </div>
         <div class="modal-body">
-          <p>{i18n.t('app.deliveryRepairMessage', { round: pendingDeliveryRepair.round, maxRounds: deliveryRepairMaxRoundsLabel })}</p>
+          <p>{i18n.t(
+            isReplanFollowUpRequest ? 'app.replanFollowUpMessage' : 'app.deliveryRepairMessage',
+            { round: pendingDeliveryRepair.round, maxRounds: deliveryRepairMaxRoundsLabel },
+          )}</p>
           {#if pendingDeliveryRepair.summary}
             <div class="modal-context">{pendingDeliveryRepair.summary}</div>
           {/if}
@@ -200,8 +206,12 @@
           {/if}
         </div>
         <div class="modal-footer">
-          <button class="modal-btn secondary" onclick={() => confirmDeliveryRepair('stop')}>{i18n.t('app.deliveryRepairStop')}</button>
-          <button class="modal-btn primary" onclick={() => confirmDeliveryRepair('repair')}>{i18n.t('app.deliveryRepairConfirm')}</button>
+          <button class="modal-btn secondary" onclick={() => confirmDeliveryRepair('stop')}>
+            {i18n.t(isReplanFollowUpRequest ? 'app.replanFollowUpStop' : 'app.deliveryRepairStop')}
+          </button>
+          <button class="modal-btn primary" onclick={() => confirmDeliveryRepair('repair')}>
+            {i18n.t(isReplanFollowUpRequest ? 'app.replanFollowUpConfirm' : 'app.deliveryRepairConfirm')}
+          </button>
         </div>
       </div>
     </div>

@@ -3,9 +3,9 @@
  * Shell adapter 短命 task 收口竞态回归脚本
  *
  * 目标：
- * 1) 模拟 launch-process 返回后、adapter 挂监听前 task 已结束
+ * 1) 模拟 process_launch 返回后、adapter 挂监听前 task 已结束
  * 2) 验证 autoPreviewProcessOutput 仍能通过初始同步 readProcess 发出 frame/completed
- * 3) 验证 result.content 被 final-read 替换为终态 read-process 快照
+ * 3) 验证 result.content 被 final-read 替换为终态 process_read 快照
  */
 
 const fs = require('fs');
@@ -103,7 +103,7 @@ async function main() {
   const executionContext = { workerId: 'orchestrator', role: 'orchestrator' };
   const toolCall = {
     id: 'shell-race-launch',
-    name: 'launch-process',
+    name: 'process_launch',
     arguments: {
       command: `sleep 0.2; echo ${MARKER}`,
       run_mode: 'task',
@@ -114,13 +114,13 @@ async function main() {
 
   try {
     const launchResult = await toolManager.executeInternalTool(toolCall, undefined, executionContext);
-    assert(launchResult.isError !== true, `launch-process 执行失败: ${launchResult.content}`);
+    assert(launchResult.isError !== true, `process_launch 执行失败: ${launchResult.content}`);
 
     const launchJson = JSON.parse(launchResult.content);
-    assert(Number.isInteger(launchJson.terminal_id), 'launch-process 未返回 terminal_id');
+    assert(Number.isInteger(launchJson.terminal_id), 'process_launch 未返回 terminal_id');
     assert(
       launchJson.status === 'running' || launchJson.status === 'starting' || launchJson.status === 'queued',
-      `launch-process 未快返运行态，实际=${launchJson.status}`,
+      `process_launch 未快返运行态，实际=${launchJson.status}`,
     );
 
     await sleep(600);

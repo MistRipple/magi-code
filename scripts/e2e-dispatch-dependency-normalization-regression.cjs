@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * dispatch_task depends_on 归一化回归脚本
+ * worker_dispatch depends_on 归一化回归脚本
  *
  * 覆盖目标：
  * 1) 依赖历史已完成任务：自动视为满足，不再 hard-fail

@@ -55,7 +55,7 @@ async function main() {
     getTools: async () => [],
     requiresUserAuthorization: () => false,
     execute: async (toolCall) => {
-      if (toolCall?.name === 'get_todos') {
+      if (toolCall?.name === 'todo_list') {
         return {
           toolCallId: toolCall.id,
           content: '[]',

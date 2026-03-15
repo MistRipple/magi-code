@@ -22,8 +22,8 @@ function loadCompiledModule(relPath) {
 
 function testSourceGuardrails() {
   const source = fs.readFileSync(path.join(ROOT, 'src', 'orchestrator', 'core', 'dispatch-manager.ts'), 'utf8');
-  assert(source.includes("await todoManager.resetToPending(update.todoId, { force: forceReset });"), 'update_todo 未委托 TodoManager.resetToPending');
-  assert(source.includes('await todoManager.skip(update.todoId);'), 'update_todo 未委托 TodoManager.skip');
+  assert(source.includes("await todoManager.resetToPending(update.todoId, { force: forceReset });"), 'todo_update 未委托 TodoManager.resetToPending');
+  assert(source.includes('await todoManager.skip(update.todoId);'), 'todo_update 未委托 TodoManager.skip');
   assert(!source.includes('pendingAllowedSource'), '仍残留 pendingAllowedSource 第二状态机');
   assert(!source.includes('skippedAllowedSource'), '仍残留 skippedAllowedSource 第二状态机');
 }
@@ -94,8 +94,8 @@ async function main() {
   await testSkippedDelegatesSkip(DispatchManager);
   await testForceResetInterruptsRunningWorker(DispatchManager);
   await testInvalidTransitionDelegatedToTodoManager(DispatchManager);
-  console.log('\n=== dispatch update_todo regression ===');
+  console.log('\n=== dispatch todo_update regression ===');
   console.log(JSON.stringify({ pass: true, checks: ['pending_delegates_reset', 'skipped_delegates_skip', 'running_force_reset_interrupts', 'invalid_transition_delegated_to_todo_manager'] }, null, 2));
 }
 
-main().catch((error) => { console.error('dispatch update_todo 回归失败:', error?.stack || error); process.exit(1); });
+main().catch((error) => { console.error('dispatch todo_update 回归失败:', error?.stack || error); process.exit(1); });

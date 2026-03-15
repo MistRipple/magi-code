@@ -462,6 +462,9 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     if (typeof (adapter as any).setCurrentRequestId === 'function') {
       (adapter as any).setCurrentRequestId(shouldBindRequest ? options?.requestId : undefined);
     }
+    if (typeof (adapter as any).setCurrentToolExecutionContext === 'function') {
+      (adapter as any).setCurrentToolExecutionContext(options?.toolExecutionContext);
+    }
 
     // 为 orchestrator 适配器应用临时配置
     if (agent === 'orchestrator' && adapter instanceof OrchestratorLLMAdapter) {
@@ -483,6 +486,12 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       const surfaced = this.toSurfacedModelError(normalized);
       if (typeof (adapter as any).setDecisionHook === 'function') {
         (adapter as any).setDecisionHook(undefined);
+      }
+      if (typeof (adapter as any).setCurrentRequestId === 'function') {
+        (adapter as any).setCurrentRequestId(undefined);
+      }
+      if (typeof (adapter as any).setCurrentToolExecutionContext === 'function') {
+        (adapter as any).setCurrentToolExecutionContext(undefined);
       }
       return {
         content: '',
@@ -655,6 +664,9 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       }
       if (typeof (adapter as any).setCurrentRequestId === 'function') {
         (adapter as any).setCurrentRequestId(undefined);
+      }
+      if (typeof (adapter as any).setCurrentToolExecutionContext === 'function') {
+        (adapter as any).setCurrentToolExecutionContext(undefined);
       }
     }
   }

@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 /**
- * apply_skill 端到端回归脚本
+ * skill_apply 端到端回归脚本
  *
  * 验证：
- * 1. apply_skill 工具注册到 getBuiltinTools()
+ * 1. skill_apply 工具注册到 getBuiltinTools()
  * 2. buildToolsSummary() 在有 Instruction Skill 时输出目录段
  * 3. buildToolsSummary() 在无 Instruction Skill 时不输出目录段
- * 4. execute('apply_skill') 正确返回 Skill 指令内容
- * 5. execute('apply_skill') Skill 不存在时返回错误及可用列表
- * 6. execute('apply_skill') 缺少参数时返回错误
- * 7. 别名 'apply-skill' 正确映射到 'apply_skill'
+ * 4. execute('skill_apply') 正确返回 Skill 指令内容
+ * 5. execute('skill_apply') Skill 不存在时返回错误及可用列表
+ * 6. execute('skill_apply') 缺少参数时返回错误
+ * 7. 别名 'skill-apply' 正确映射到 'skill_apply'
  */
 
 const path = require('path');
@@ -100,12 +100,12 @@ async function main() {
   const skillsManager = new SkillsManager({ customTools: [], instructionSkills: mockSkills });
   toolManager.registerSkillExecutor(skillsManager);
 
-  console.log('\n=== apply_skill 端到端回归测试 ===\n');
+  console.log('\n=== skill_apply 端到端回归测试 ===\n');
 
-  // ── Test 1: apply_skill 出现在 getBuiltinTools ──
+  // ── Test 1: skill_apply 出现在 getBuiltinTools ──
   const allTools = await toolManager.getTools();
-  const applySkillTool = allTools.find(t => t.name === 'apply_skill');
-  assert('T1: apply_skill 工具已注册', !!applySkillTool);
+  const applySkillTool = allTools.find(t => t.name === 'skill_apply');
+  assert('T1: skill_apply 工具已注册', !!applySkillTool);
   assert('T1.1: input_schema 包含 skill_name', applySkillTool?.input_schema?.properties?.skill_name?.type === 'string');
   assert('T1.2: skill_name 是必需参数', applySkillTool?.input_schema?.required?.includes('skill_name'));
 
@@ -114,7 +114,7 @@ async function main() {
   assert('T2: buildToolsSummary 包含 Instruction Skill 目录段', summary.includes('Installed Skill Instructions'));
   assert('T2.1: 目录包含 [auto] code-review', summary.includes('[auto] code-review'));
   assert('T2.2: 目录包含 [manual] deploy-guide', summary.includes('[manual] deploy-guide'));
-  assert('T2.3: 目录包含 apply_skill 引导', summary.includes('apply_skill(skill_name)'));
+  assert('T2.3: 目录包含 skill_apply 引导', summary.includes('skill_apply(skill_name)'));
 
   // ── Test 3: 无 Skill 时不显示目录 ──
   toolManager.unregisterSkillExecutor();
@@ -122,25 +122,25 @@ async function main() {
   assert('T3: 无 Skill 时不包含 Instruction Skill 目录', !summaryNoSkill.includes('Installed Skill Instructions'));
   toolManager.registerSkillExecutor(skillsManager); // 恢复
 
-  // ── Test 4: 正常执行 apply_skill ──
-  const r4 = await toolManager.execute({ id: 't4', name: 'apply_skill', arguments: { skill_name: 'code-review' } });
-  assert('T4: apply_skill 成功返回', !r4.isError);
+  // ── Test 4: 正常执行 skill_apply ──
+  const r4 = await toolManager.execute({ id: 't4', name: 'skill_apply', arguments: { skill_name: 'code-review' } });
+  assert('T4: skill_apply 成功返回', !r4.isError);
   assert('T4.1: 返回内容包含 Skill 标题', String(r4.content).includes('Skill Instructions: code-review'));
   assert('T4.2: 返回内容包含指令正文', String(r4.content).includes('安全性'));
 
   // ── Test 5: Skill 不存在时返回错误 ──
-  const r5 = await toolManager.execute({ id: 't5', name: 'apply_skill', arguments: { skill_name: 'nonexistent' } });
+  const r5 = await toolManager.execute({ id: 't5', name: 'skill_apply', arguments: { skill_name: 'nonexistent' } });
   assert('T5: 不存在的 Skill 返回错误', !!r5.isError);
   assert('T5.1: 错误信息列出可用 Skill', String(r5.content).includes('code-review') && String(r5.content).includes('deploy-guide'));
 
   // ── Test 6: 缺少参数时返回错误 ──
-  const r6 = await toolManager.execute({ id: 't6', name: 'apply_skill', arguments: {} });
+  const r6 = await toolManager.execute({ id: 't6', name: 'skill_apply', arguments: {} });
   assert('T6: 缺少 skill_name 返回错误', !!r6.isError);
   assert('T6.1: 错误信息提示缺少参数', String(r6.content).includes('skill_name'));
 
   // ── Test 7: 别名映射 ──
-  const r7 = await toolManager.execute({ id: 't7', name: 'apply-skill', arguments: { skill_name: 'code-review' } });
-  assert('T7: 别名 apply-skill 正确映射', !r7.isError);
+  const r7 = await toolManager.execute({ id: 't7', name: 'skill-apply', arguments: { skill_name: 'code-review' } });
+  assert('T7: 别名 skill-apply 正确映射', !r7.isError);
   assert('T7.1: 别名执行结果与原名一致', String(r7.content).includes('Skill Instructions: code-review'));
 
   // ── 汇总 ──
@@ -156,7 +156,6 @@ async function main() {
 }
 
 main().catch(error => {
-  console.error('apply_skill 回归失败:', error?.stack || error);
+  console.error('skill_apply 回归失败:', error?.stack || error);
   process.exitCode = 1;
 });
-

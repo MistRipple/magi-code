@@ -3,7 +3,7 @@
  * 基于 Node.js child_process 的 IShellExecutor 实现
  *
  * 纯命令执行模型（非交互式）：
- * - 每次 launch-process 直接 spawn(shell, shellArgs)
+ * - 每次 process_launch 直接 spawn(shell, shellArgs)
  * - 通过 stdout/stderr pipe 事件驱动捕获输出
  * - 不依赖 script 命令、pgrep、ANSI marker 或任何 PTY 能力
  * - 不依赖 VSCode 的任何 API
@@ -156,7 +156,7 @@ function resolveShellLaunchSpec(command: string): ShellLaunchSpec {
  * 基于 Node.js child_process 的 Shell 执行器
  *
  * 核心设计：
- * - 每次 launch-process 直接 spawn 一个一次性子进程（严格进程隔离）
+ * - 每次 process_launch 直接 spawn 一个一次性子进程（严格进程隔离）
  * - stdout/stderr pipe 事件驱动，输出实时推送
  * - task 模式：等待子进程退出
  * - service 模式：后台运行，通过 ready pattern 检测启动成功
@@ -227,10 +227,10 @@ export class NodeShellExecutor implements IShellExecutor {
   async launchProcess(options: LaunchProcessOptions, signal?: AbortSignal): Promise<LaunchProcessResult> {
     const agentName = (options.name || '').trim();
     if (!agentName) {
-      throw new Error('launch-process 必须提供 agent 终端名称（orchestrator、worker-claude、worker-gemini、worker-codex）');
+      throw new Error('process_launch 必须提供 agent 终端名称（orchestrator、worker-claude、worker-gemini、worker-codex）');
     }
     if (!ALLOWED_AGENT_TERMINAL_NAMES.has(agentName)) {
-      throw new Error('launch-process name 仅支持 orchestrator、worker-claude、worker-gemini、worker-codex');
+      throw new Error('process_launch name 仅支持 orchestrator、worker-claude、worker-gemini、worker-codex');
     }
 
     const runMode: ProcessRunMode = options.runMode ?? (options.wait ? 'task' : 'service');
@@ -362,7 +362,7 @@ export class NodeShellExecutor implements IShellExecutor {
     }
 
     const hadLock = proc.serviceLocked;
-    await this.forceStopProcess(proc, 'killed', 'kill-process');
+    await this.forceStopProcess(proc, 'killed', 'process_kill');
 
     return {
       killed: true,
@@ -578,7 +578,7 @@ export class NodeShellExecutor implements IShellExecutor {
   }
 
   /**
-   * 等待进程输出进展（read-process wait=true）
+   * 等待进程输出进展（process_read wait=true）
    */
   private async waitForProgress(
     processId: number,

@@ -45,8 +45,9 @@ import {
   setRetryRuntime,
   clearRetryRuntime,
   sealAllStreamingMessages,
+  setOrchestratorRuntimeDiagnostics,
 } from '../stores/messages.svelte';
-import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, SubTaskItem, Edit, ModelStatusMap, ActivePlanState, PlanLedgerRecord, PlanLedgerAttempt, QueuedMessage, RetryRuntimeState, AgentType, WaitForWorkersResult, WaitForWorkersResultItem } from '../types/message';
+import type { Message, AppState, Session, ContentBlock, ToolCall, ThinkingBlock, MissionPlan, AssignmentPlan, AssignmentTodo, WorkerSessionState, Task, SubTaskItem, Edit, ModelStatusMap, ActivePlanState, PlanLedgerRecord, PlanLedgerAttempt, QueuedMessage, RetryRuntimeState, AgentType, WaitForWorkersResult, WaitForWorkersResultItem, OrchestratorRuntimeDiagnostics } from '../types/message';
 import type { StandardMessage, StreamUpdate, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
 import { MessageType, MessageCategory } from '../../../../protocol/message-protocol';
 import { routeStandardMessage, getMessageTarget, clearMessageTargets, clearMessageTarget, setMessageTarget } from './message-router';
@@ -193,7 +194,7 @@ function extractWaitForWorkersPayloadFromMessage(message: Message): WaitForWorke
   if (blocks.length === 0) return null;
   for (const block of blocks as any[]) {
     if (block.type !== 'tool_call' || !block.toolCall) continue;
-    if (block.toolCall.name !== 'wait_for_workers') continue;
+    if (block.toolCall.name !== 'worker_wait') continue;
     const rawPayload = block.toolCall.result ?? block.toolCall.standardized?.data;
     const parsed = parseWaitForWorkersPayload(rawPayload, message.timestamp || Date.now());
     if (parsed) {
@@ -729,6 +730,7 @@ function handleStateUpdate(message: WebviewMessage) {
           title: typeof st.title === 'string' ? st.title : undefined,
           assignedWorker: String(st.assignedWorker || ''),
           assignmentId: String(st.assignmentId || ''),
+          source: typeof st.source === 'string' ? st.source : undefined,
           status: String(st.status || 'pending') as SubTaskItem['status'],
           progress: typeof st.progress === 'number' ? st.progress : 0,
           priority: typeof st.priority === 'number' ? st.priority : 3,
@@ -909,7 +911,7 @@ function rebuildSessionMessageTargets(
 /**
  * 会话恢复时从已有消息重建 workerWaitResults。
  * workerWaitResults 是运行时状态（不持久化），恢复后需要从 task_card 消息和
- * 包含 wait_for_workers 结果的消息中重建，否则卡片完成态丢失。
+ * 包含 worker_wait 结果的消息中重建，否则卡片完成态丢失。
  */
 function rebuildWorkerWaitResultsFromMessages(
   threadMessages: Message[],
@@ -922,7 +924,7 @@ function rebuildWorkerWaitResultsFromMessages(
     ...workerMessages.gemini,
   ];
   for (const message of allMessages) {
-    if (message.type === 'task_card' || ensureArray(message.blocks).some((b: any) => b?.toolCall?.name === 'wait_for_workers')) {
+    if (message.type === 'task_card' || ensureArray(message.blocks).some((b: any) => b?.toolCall?.name === 'worker_wait')) {
       syncWorkerWaitResultsFromMessage(message);
     }
   }
@@ -2075,6 +2077,9 @@ function handleUnifiedData(standard: StandardMessage) {
     case 'deliveryRepairRequest':
       handleDeliveryRepairRequest(asMessage(payload));
       break;
+    case 'orchestratorRuntimeDiagnostics':
+      handleOrchestratorRuntimeDiagnostics(asMessage(payload));
+      break;
 
     case 'clarificationRequest':
       handleClarificationRequest(asMessage(payload));
@@ -2411,8 +2416,14 @@ function handleRecoveryRequest(message: WebviewMessage) {
 
 function handleDeliveryRepairRequest(message: WebviewMessage) {
   const store = getState();
+  const requestType = message.requestType === 'replan_followup'
+    ? 'replan_followup'
+    : 'delivery_repair';
   if (store.appState?.interactionMode === 'auto') {
-    addToast('info', i18n.t('messageHandler.autoDeliveryRepair'), undefined, {
+    const toastKey = requestType === 'replan_followup'
+      ? 'messageHandler.autoReplanFollowUp'
+      : 'messageHandler.autoDeliveryRepair';
+    addToast('info', i18n.t(toastKey), undefined, {
       category: 'audit',
       source: 'delivery-repair',
       countUnread: false,
@@ -2427,9 +2438,49 @@ function handleDeliveryRepairRequest(message: WebviewMessage) {
     details: typeof message.details === 'string' ? message.details : undefined,
     round: typeof message.round === 'number' ? message.round : 1,
     maxRounds: typeof message.maxRounds === 'number' ? message.maxRounds : 1,
+    requestType,
   };
   settleProcessingForManualInteraction();
   sealAllStreamingMessages();
+}
+
+function handleOrchestratorRuntimeDiagnostics(message: WebviewMessage) {
+  const store = getState();
+  const runtimeReason = typeof message.runtimeReason === 'string' ? message.runtimeReason.trim() : '';
+  const finalStatus = message.finalStatus === 'completed'
+    || message.finalStatus === 'failed'
+    || message.finalStatus === 'cancelled'
+    || message.finalStatus === 'paused'
+    ? message.finalStatus
+    : null;
+  if (!runtimeReason || !finalStatus) {
+    return;
+  }
+  const sessionId = typeof message.sessionId === 'string' && message.sessionId.trim().length > 0
+    ? message.sessionId.trim()
+    : undefined;
+  const currentSessionId = store.currentSessionId?.trim() || '';
+  if (sessionId && currentSessionId && sessionId !== currentSessionId) {
+    return;
+  }
+  const diagnostics: OrchestratorRuntimeDiagnostics = {
+    runtimeReason,
+    finalStatus,
+    ...(sessionId ? { sessionId } : {}),
+    ...(typeof message.requestId === 'string' && message.requestId.trim().length > 0
+      ? { requestId: message.requestId.trim() }
+      : {}),
+    runtimeSnapshot: message.runtimeSnapshot && typeof message.runtimeSnapshot === 'object'
+      ? (message.runtimeSnapshot as OrchestratorRuntimeDiagnostics['runtimeSnapshot'])
+      : null,
+    runtimeDecisionTrace: Array.isArray(message.runtimeDecisionTrace)
+      ? (message.runtimeDecisionTrace as OrchestratorRuntimeDiagnostics['runtimeDecisionTrace'])
+      : [],
+    updatedAt: typeof message.updatedAt === 'number' && Number.isFinite(message.updatedAt)
+      ? message.updatedAt
+      : Date.now(),
+  };
+  setOrchestratorRuntimeDiagnostics(diagnostics);
 }
 
 function handleClarificationRequest(message: WebviewMessage) {
@@ -2555,6 +2606,7 @@ function handleMissionPlanned(message: WebviewMessage) {
             id: todoId,
             assignmentId,
             parentId: todo.parentId,
+            source: todo.source,
             content: todo.content || '',
             reasoning: todo.reasoning,
             expectedOutput: todo.expectedOutput,
@@ -2602,6 +2654,7 @@ function handleAssignmentPlanned(message: WebviewMessage) {
         id: todoId,
         assignmentId,
         parentId: todo.parentId,
+        source: todo.source,
         content: todo.content || '',
         reasoning: todo.reasoning,
         expectedOutput: todo.expectedOutput,
@@ -2708,6 +2761,7 @@ function handleDynamicTodoAdded(message: WebviewMessage) {
     id: todoId,
     assignmentId,
     parentId: todo?.parentId,
+    source: todo?.source,
     content: todo?.content || '',
     reasoning: todo?.reasoning,
     expectedOutput: todo?.expectedOutput,

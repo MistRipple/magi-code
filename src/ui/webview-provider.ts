@@ -65,10 +65,16 @@ import { WorkspaceFolderInfo, WorkspaceRoots } from '../workspace/workspace-root
 type WebviewMessagePriority = 'high' | 'normal';
 
 type OrchestratorRuntimeReason = ReturnType<MissionDrivenEngine['getLastExecutionStatus']>['runtimeReason'];
+type OrchestratorRuntimeSnapshot = ReturnType<MissionDrivenEngine['getLastExecutionStatus']>['runtimeSnapshot'];
+type OrchestratorRuntimeDecisionTrace = ReturnType<MissionDrivenEngine['getLastExecutionStatus']>['runtimeDecisionTrace'];
+type OrchestratorFinalStatus = ReturnType<MissionDrivenEngine['getLastExecutionStatus']>['finalStatus'];
 type OrchestratorExecutionResult = {
   success: boolean;
   taskId: string;
   runtimeReason: OrchestratorRuntimeReason;
+  finalStatus: OrchestratorFinalStatus;
+  runtimeSnapshot: OrchestratorRuntimeSnapshot;
+  runtimeDecisionTrace: OrchestratorRuntimeDecisionTrace;
   errors: string[];
   recoverable: boolean;
   error?: string;
@@ -342,7 +348,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       getConversationHistory: (maxRounds) => this.sessionManager.formatConversationHistory(maxRounds),
     });
 
-    // 先注入 codebase_retrieval 基础服务，消除启动空窗：
+    // 先注入 code_search_semantic 基础服务，消除启动空窗：
     // 即使 PKB 还在初始化，也可先走本地回退检索（grep/lsp）。
     this.injectCodebaseRetrievalService();
 
@@ -482,7 +488,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 设置文件监听器，支持搜索引擎增量更新
       this.setupFileSystemWatcher();
 
-      // 注入代码库检索基础设施（codebase_retrieval 的唯一实现）
+      // 注入代码库检索基础设施（code_search_semantic 的唯一实现）
       this.injectCodebaseRetrievalService();
 
       const codeIndex = this.projectKnowledgeBase.getCodeIndex();
@@ -655,7 +661,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * 注入 CodebaseRetrievalService 到 codebase_retrieval 执行器
+   * 注入 CodebaseRetrievalService 到 code_search_semantic 执行器
    * 使用惰性引用，解决 PKB 初始化时序问题
    */
   private injectCodebaseRetrievalService(): void {
@@ -1952,6 +1958,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
             success: false,
             taskId: '',
             runtimeReason: 'failed',
+            finalStatus: 'failed',
+            runtimeSnapshot: null,
+            runtimeDecisionTrace: [],
             errors: [errorMsg],
             recoverable: false,
             error: errorMsg,
@@ -1974,6 +1983,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         success: false,
         taskId: '',
         runtimeReason: 'cancelled',
+        finalStatus: 'cancelled',
+        runtimeSnapshot: null,
+        runtimeDecisionTrace: [],
         errors: [reason],
         recoverable: false,
         error: reason,
@@ -2351,6 +2363,26 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       return t('provider.taskAborted');
     }
     return normalizedError || t('provider.executionFailed');
+  }
+
+  private publishOrchestratorRuntimeDiagnostics(input: {
+    sessionId: string;
+    requestId?: string;
+    result: OrchestratorExecutionResult;
+  }): void {
+    const sessionId = input.sessionId.trim();
+    if (!sessionId) {
+      return;
+    }
+    this.sendData('orchestratorRuntimeDiagnostics', {
+      sessionId,
+      requestId: input.requestId || undefined,
+      runtimeReason: input.result.runtimeReason,
+      finalStatus: input.result.finalStatus,
+      runtimeSnapshot: input.result.runtimeSnapshot || null,
+      runtimeDecisionTrace: input.result.runtimeDecisionTrace || [],
+      updatedAt: Date.now(),
+    });
   }
 
   private setPendingRecoveryFromExecution(input: {
@@ -2893,6 +2925,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           }
         }
         if (executionResult) {
+          this.publishOrchestratorRuntimeDiagnostics({
+            sessionId: executionSessionId,
+            requestId: requestKey,
+            result: executionResult,
+          });
+        }
+        if (executionResult) {
           this.setPendingRecoveryFromExecution({
             result: executionResult,
             prompt: promptForRecovery,
@@ -3033,6 +3072,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const runtimeReason = thrown && executionStatus.success
       ? 'failed'
       : executionStatus.runtimeReason;
+    const finalStatus = thrown && executionStatus.success
+      ? 'failed'
+      : executionStatus.finalStatus;
     const success = !thrown && executionStatus.success;
     const errors = success
       ? []
@@ -3053,6 +3095,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       error: failureReason,
       taskId,
       runtimeReason,
+      finalStatus,
+      runtimeSnapshot: executionStatus.runtimeSnapshot,
+      runtimeDecisionTrace: executionStatus.runtimeDecisionTrace,
       errors,
       recoverable: this.isRecoverableRuntimeReason(runtimeReason),
     };

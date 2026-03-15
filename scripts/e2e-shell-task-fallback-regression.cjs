@@ -3,9 +3,9 @@
  * Shell task 基本能力回归脚本
  *
  * 目标：
- * 1. 验证 launch-process(run_mode=task, wait=true) 能执行并捕获输出
- * 2. 验证 read-process 能读取已完成的 task 输出
- * 3. 验证 kill-process 可终止运行中的 task 子进程
+ * 1. 验证 process_launch(run_mode=task, wait=true) 能执行并捕获输出
+ * 2. 验证 process_read 能读取已完成的 task 输出
+ * 3. 验证 process_kill 可终止运行中的 task 子进程
  */
 
 const fs = require('fs');
@@ -50,7 +50,7 @@ async function main() {
     // 场景 2：读取已完成 task 的输出
     const readFastTask = await executor.readProcess(fastTask.terminal_id, false, 1);
     assert(readFastTask.status === 'completed',
-      `read-process 应返回 completed，实际=${readFastTask.status}`);
+      `process_read 应返回 completed，实际=${readFastTask.status}`);
 
     // 场景 3：启动长时间 task 并 kill
     const longTask = await executor.launchProcess({
@@ -66,7 +66,7 @@ async function main() {
 
     await new Promise((resolve) => setTimeout(resolve, 200));
     const killed = await executor.killProcess(longTask.terminal_id);
-    assert(killed.killed === true, 'kill-process 未返回 killed=true');
+    assert(killed.killed === true, 'process_kill 未返回 killed=true');
 
     const readKilled = await executor.readProcess(longTask.terminal_id, false, 1);
     assert(readKilled.status === 'killed' || readKilled.status === 'failed',

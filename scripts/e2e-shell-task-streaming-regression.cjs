@@ -3,8 +3,8 @@
  * Shell task 流式增量回归脚本
  *
  * 目标：
- * 1) 验证 launch-process(run_mode=task) 快速返回 running/starting
- * 2) 验证 read-process(from_cursor) 在任务执行期间能拿到多次 delta 增量
+ * 1) 验证 process_launch(run_mode=task) 快速返回 running/starting
+ * 2) 验证 process_read(from_cursor) 在任务执行期间能拿到多次 delta 增量
  * 3) 验证 task 模式不应出现 startup handshake 超时语义（startup_status/message）
  */
 
@@ -60,18 +60,18 @@ async function main() {
       const read = await executor.readProcess(launch.terminal_id, readWait, 2, cursor);
       assert(
         read.terminal_id === launch.terminal_id,
-        `[${label}] read-process terminal_id 不匹配，预期=${launch.terminal_id} 实际=${read.terminal_id}`,
+        `[${label}] process_read terminal_id 不匹配，预期=${launch.terminal_id} 实际=${read.terminal_id}`,
       );
 
       // task 模式不应携带 service 启动握手语义
       assert(
         read.run_mode === 'task',
-        `[${label}] read-process run_mode 预期 task，实际=${read.run_mode}`,
+        `[${label}] process_read run_mode 预期 task，实际=${read.run_mode}`,
       );
 
       if (typeof read.startup_status !== 'undefined' || typeof read.startup_message !== 'undefined') {
         throw new Error(
-          `[${label}] task read-process 不应包含 startup 字段, startup_status=${read.startup_status}, startup_message=${read.startup_message}`,
+          `[${label}] task process_read 不应包含 startup 字段, startup_status=${read.startup_status}, startup_message=${read.startup_message}`,
         );
       }
 

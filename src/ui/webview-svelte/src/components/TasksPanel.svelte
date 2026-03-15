@@ -114,6 +114,23 @@
     gemini: 'var(--color-gemini)',
   };
 
+  function getTodoSourceLabel(source?: string): string | null {
+    switch (source) {
+      case 'planner_macro':
+        return i18n.t('tasks.todoSource.plannerMacro');
+      case 'worker_split':
+        return i18n.t('tasks.todoSource.workerSplit');
+      case 'orchestrator_adjustment':
+        return i18n.t('tasks.todoSource.orchestratorAdjustment');
+      case 'review_fix':
+        return i18n.t('tasks.todoSource.reviewFix');
+      case 'system_repair':
+        return i18n.t('tasks.todoSource.systemRepair');
+      default:
+        return null;
+    }
+  }
+
   function toggleExpand(taskId: string) {
     const next = new Set(expandedTasks);
     if (next.has(taskId)) next.delete(taskId);
@@ -538,6 +555,11 @@
                       {/if}
                     </span>
                     <span class="todo-text">{todo.description || i18n.t('tasks.subtask.unnamed')}</span>
+                    {#if getTodoSourceLabel(todo.source)}
+                      <span class="todo-source" title={getTodoSourceLabel(todo.source) || undefined}>
+                        {getTodoSourceLabel(todo.source)}
+                      </span>
+                    {/if}
                     {#if task.workerGroups.length <= 1 && group.workerId}
                       <span class="todo-worker" style="color: {workerColors[group.workerId] || 'var(--foreground-muted)'}">{group.workerId}</span>
                     {/if}
@@ -1173,6 +1195,17 @@
     font-size: var(--text-2xs);
     flex-shrink: 0;
     font-weight: var(--font-medium);
+  }
+
+  .todo-source {
+    flex-shrink: 0;
+    font-size: var(--text-2xs);
+    line-height: 1;
+    color: var(--foreground-muted);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 3px 6px;
   }
 
 </style>

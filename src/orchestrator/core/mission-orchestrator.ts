@@ -233,28 +233,53 @@ export class MissionOrchestrator extends EventEmitter {
         });
       });
 
+      const resolveMissionId = (missionId: unknown): string | null => {
+        const normalized = typeof missionId === 'string' ? missionId.trim() : '';
+        return normalized || this.currentMissionId;
+      };
+
       worker.on('assignmentHeartbeat', (data: {
         assignmentId: string;
         timestamp: number;
+        missionId?: string | null;
         todoId?: string;
         sessionId?: string;
       }) => {
         this.emit('workerHeartbeat', {
           ...data,
-          missionId: this.currentMissionId,
+          missionId: resolveMissionId(data.missionId),
           workerId: workerSlot,
         });
       });
 
       // 转发 Todo 事件，确保 UI 能实时更新子任务状态
-      worker.on('todoStarted', (data) => this.emit('todoStarted', { ...data, missionId: this.currentMissionId }));
-      worker.on('todoCompleted', (data) => this.emit('todoCompleted', { ...data, missionId: this.currentMissionId }));
-      worker.on('todoFailed', (data) => this.emit('todoFailed', { ...data, missionId: this.currentMissionId }));
-      worker.on('dynamicTodoAdded', (data) => this.emit('dynamicTodoAdded', { ...data, missionId: this.currentMissionId }));
-      worker.on('insightGenerated', (data) => this.emit('insightGenerated', { ...data, missionId: this.currentMissionId }));
+      worker.on('todoStarted', (data) => this.emit('todoStarted', {
+        ...data,
+        missionId: resolveMissionId((data as { missionId?: string | null }).missionId),
+      }));
+      worker.on('todoCompleted', (data) => this.emit('todoCompleted', {
+        ...data,
+        missionId: resolveMissionId((data as { missionId?: string | null }).missionId),
+      }));
+      worker.on('todoFailed', (data) => this.emit('todoFailed', {
+        ...data,
+        missionId: resolveMissionId((data as { missionId?: string | null }).missionId),
+      }));
+      worker.on('dynamicTodoAdded', (data) => this.emit('dynamicTodoAdded', {
+        ...data,
+        missionId: resolveMissionId((data as { missionId?: string | null }).missionId),
+      }));
+      worker.on('insightGenerated', (data) => this.emit('insightGenerated', {
+        ...data,
+        missionId: resolveMissionId((data as { missionId?: string | null }).missionId),
+      }));
 
       // 转发 Assignment 生命周期 + 审批事件
-      worker.on('assignmentStarted', (data) => this.emit('assignmentStarted', { ...data, missionId: this.currentMissionId, workerId: workerSlot }));
+      worker.on('assignmentStarted', (data) => this.emit('assignmentStarted', {
+        ...data,
+        missionId: resolveMissionId((data as { missionId?: string | null }).missionId),
+        workerId: workerSlot,
+      }));
       worker.on('assignmentCompleted', (data: any) => {
         const assignmentId = typeof data?.assignmentId === 'string'
           ? data.assignmentId.trim()
@@ -269,10 +294,13 @@ export class MissionOrchestrator extends EventEmitter {
         this.emit('assignmentCompleted', {
           ...data,
           assignmentId,
-          missionId: this.currentMissionId,
+          missionId: resolveMissionId(data?.missionId),
         });
       });
-      worker.on('approvalRequested', (data) => this.emit('approvalRequested', { ...data, missionId: this.currentMissionId }));
+      worker.on('approvalRequested', (data) => this.emit('approvalRequested', {
+        ...data,
+        missionId: resolveMissionId((data as { missionId?: string | null }).missionId),
+      }));
 
       logger.info('编排器.Worker.创建', { workerSlot }, LogCategory.ORCHESTRATOR);
     }
@@ -297,7 +325,7 @@ export class MissionOrchestrator extends EventEmitter {
   }
 
   /**
-   * 确保 Worker 存在（公开接口，供 dispatch_task 使用）
+   * 确保 Worker 存在（公开接口，供 worker_dispatch 使用）
    */
   async ensureWorkerForDispatch(workerSlot: WorkerSlot): Promise<AutonomousWorker> {
     return this.ensureWorker(workerSlot);

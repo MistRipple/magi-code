@@ -3,7 +3,7 @@
  * Shell 进程隔离回归脚本
  *
  * 目标：
- * 1) 相同 agent 连续两次 launch-process(task) 必须分配不同终端会话
+ * 1) 相同 agent 连续两次 process_launch(task) 必须分配不同终端会话
  * 2) 两个进程输出互不污染
  */
 
@@ -81,12 +81,12 @@ async function main() {
 
     assert(first.status === 'completed', `first 进程状态异常: ${first.status}`);
     assert(second.status === 'completed', `second 进程状态异常: ${second.status}`);
-    assert(launch1.terminal_id !== launch2.terminal_id, '连续两次 launch-process 得到了相同 terminal_id');
+    assert(launch1.terminal_id !== launch2.terminal_id, '连续两次 process_launch 得到了相同 terminal_id');
     assert(
       typeof launch1.terminal_name === 'string'
       && typeof launch2.terminal_name === 'string'
       && launch1.terminal_name !== launch2.terminal_name,
-      `连续两次 launch-process 终端名称未隔离: ${launch1.terminal_name} vs ${launch2.terminal_name}`,
+      `连续两次 process_launch 终端名称未隔离: ${launch1.terminal_name} vs ${launch2.terminal_name}`,
     );
     assert(first.output.includes('MAGI_ISO_FIRST'), 'first 输出缺少 MAGI_ISO_FIRST');
     assert(second.output.includes('MAGI_ISO_SECOND'), 'second 输出缺少 MAGI_ISO_SECOND');

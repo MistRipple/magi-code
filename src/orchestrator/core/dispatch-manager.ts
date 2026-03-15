@@ -3,7 +3,7 @@
  *
  * L3 统一架构重构后的唯一 Worker 调度器。
  * 职责：
- * - 编排工具回调注册（dispatch_task / send_worker_message）
+ * - 编排工具回调注册（worker_dispatch / worker_send_message）
  * - DispatchBatch 创建与事件处理
  * - 通过 WorkerPipeline 执行统一管道（含可配置治理）
  * - Worker 隔离策略调度（同类型串行、不同类型并行）
@@ -45,6 +45,9 @@ import type {
 import { buildDispatchSummaryPrompt } from '../prompts/orchestrator-prompts';
 import { MessageType } from '../../protocol/message-protocol';
 import { PlanningExecutor } from './executors/planning-executor';
+import {
+  selectClaimNextTodoCandidate,
+} from './claim-next-todo-affinity';
 import { WorkerPipeline } from './worker-pipeline';
 import type { SnapshotManager } from '../../snapshot-manager';
 import type { SupplementaryInstructionQueue } from './supplementary-instruction-queue';
@@ -168,6 +171,10 @@ export class DispatchManager {
   private static readonly PHASE_B_PLUS_MIN_INTERVAL = 30_000;
   /** 同轮 dispatch 的短窗口合并调度，减少 Worker 指令卡片抖动 */
   private static readonly DISPATCH_COALESCE_MS = 120;
+  /** Worker lane 驻留轮询默认超时（跨 assignment 连续执行窗口） */
+  private static readonly DEFAULT_WORKER_LANE_RESIDENT_TIMEOUT_MS = 8_000;
+  /** Worker lane 驻留轮询默认间隔 */
+  private static readonly DEFAULT_WORKER_LANE_RESIDENT_POLL_INTERVAL_MS = 250;
 
   private pipeline = new WorkerPipeline();
   private activeBatch: DispatchBatch | null = null;
@@ -175,7 +182,7 @@ export class DispatchManager {
 
   // 反应式编排：Worker 完成结果队列 + 等待唤醒机制
   private completionQueue = new DispatchCompletionQueue();
-  /** 标记编排者是否调用了 wait_for_workers（决定是否跳过自动 Phase C） */
+  /** 标记编排者是否调用了 worker_wait（决定是否跳过自动 Phase C） */
   private reactiveMode = false;
   /** 反应式 Batch 是否仍等待主对话区最终汇总 */
   private reactiveBatchAwaitingSummary = new Set<string>();
@@ -185,7 +192,7 @@ export class DispatchManager {
   private readonly resumeContextStore: DispatchResumeContextStore;
   /** dispatch 幂等账本（跨进程重放去重） */
   private readonly dispatchIdempotencyStore: DispatchIdempotencyStore;
-  /** 活跃的 Assignment 映射（Worker 执行期间可查，供 split_todo handler 使用） */
+  /** 活跃的 Assignment 映射（Worker 执行期间可查，供 todo_split handler 使用） */
   private activeAssignments = new Map<string, Assignment>();
   /** Worker Lane 运行态：同一 Worker 同一时刻仅允许一个执行链 */
   private activeWorkerLanes = new Set<WorkerSlot>();
@@ -360,6 +367,24 @@ export class DispatchManager {
     return this.routingService.resolveDispatchRouting(goal, explicitCategory);
   }
 
+  /**
+   * 写任务前置校验（fail-fast）：
+   * 在 dispatch 注册阶段阻断非 Git 工作区写任务，避免进入 Worker 并发后批量失败。
+   */
+  private checkWriteTaskPreconditions(): string | null {
+    if (this.worktreeManager.isGitRepository()) {
+      return null;
+    }
+    const errorMessage = t('dispatch.errors.writeTaskRequiresGitWorkspace', {
+      workspaceRoot: this.deps.workspaceRoot,
+    });
+    logger.warn('编排工具.worker_dispatch.写任务前置校验失败_非Git仓库', {
+      workspaceRoot: this.deps.workspaceRoot,
+    }, LogCategory.ORCHESTRATOR);
+    this.deps.messageHub.notify(errorMessage, 'warning');
+    return errorMessage;
+  }
+
   private resolveExecutionWorker(
     preferredWorker: WorkerSlot,
     options?: {
@@ -411,7 +436,7 @@ export class DispatchManager {
   }
 
   /**
-   * 注入编排工具（dispatch_task / send_worker_message）的回调处理器
+   * 注入编排工具（worker_dispatch / worker_send_message）的回调处理器
    */
   setupOrchestrationToolHandlers(): void {
     const toolManager = this.deps.adapterFactory.getToolManager();
@@ -428,7 +453,7 @@ export class DispatchManager {
     );
 
     // 注入 Category → Worker 映射到工具定义，
-    // 使 dispatch_task 的 category 参数拥有精确的 enum 枚举和分工描述
+    // 使 worker_dispatch 的 category 参数拥有精确的 enum 枚举和分工描述
     const categoryMap = this.deps.profileLoader.getAssignmentLoader().getCategoryMap();
     const allCategories = this.deps.profileLoader.getAllCategories();
     orchestrationExecutor.setCategoryWorkerMap(
@@ -451,6 +476,16 @@ export class DispatchManager {
             status: 'failed' as const,
             error: t('dispatch.errors.requiresModificationBoolean'),
           };
+        }
+        if (requiresModification) {
+          const writeTaskPreconditionError = this.checkWriteTaskPreconditions();
+          if (writeTaskPreconditionError) {
+            return {
+              task_id: '',
+              status: 'failed' as const,
+              error: writeTaskPreconditionError,
+            };
+          }
         }
         const taskName = typeof task_name === 'string' ? task_name.trim() : '';
         const goalText = typeof goal === 'string' ? goal.trim() : '';
@@ -491,7 +526,7 @@ export class DispatchManager {
         const normalizedFiles = filesValues && filesValues.length > 0 ? filesValues : undefined;
         const normalizedDependsOn = dependsOnValues && dependsOnValues.length > 0 ? dependsOnValues : undefined;
         const collaborationContracts = this.normalizeCollaborationContracts(contracts);
-        logger.info('编排工具.dispatch_task.开始', {
+        logger.info('编排工具.worker_dispatch.开始', {
           category,
           requiresModification,
           scopeHintCount: normalizedScopeHint?.length || 0,
@@ -511,7 +546,7 @@ export class DispatchManager {
           };
         }
         const { decision } = routingResult;
-        logger.info('编排工具.dispatch_task.路由决策', {
+        logger.info('编排工具.worker_dispatch.路由决策', {
           selectedWorker: decision.selectedWorker,
           category: decision.category,
           categorySource: decision.categorySource,
@@ -617,7 +652,7 @@ export class DispatchManager {
           const userError = lockTimeout
             ? 'dispatch 幂等账本锁竞争超时，当前任务已拒绝派发。请稍后重试。'
             : `dispatch 幂等占位失败：${rawError}`;
-          logger.warn('编排工具.dispatch_task.幂等占位失败', {
+          logger.warn('编排工具.worker_dispatch.幂等占位失败', {
             idempotencyKey: effectiveIdempotencyKey,
             sessionId: sessionScopeForIdempotency,
             missionId,
@@ -636,7 +671,7 @@ export class DispatchManager {
           const inCurrentBatch = this.activeBatch?.getEntry(existingIdempotent.taskId);
           if (!inCurrentBatch) {
             const blockedReason = `idempotency_key 命中历史派发(${existingIdempotent.taskId})，但当前批次不可恢复该任务，已阻止重复派发`;
-            logger.warn('编排工具.dispatch_task.幂等重放阻断', {
+            logger.warn('编排工具.worker_dispatch.幂等重放阻断', {
               idempotencyKey: effectiveIdempotencyKey,
               existingTaskId: existingIdempotent.taskId,
               existingStatus: existingIdempotent.status,
@@ -654,7 +689,7 @@ export class DispatchManager {
             };
           }
 
-          logger.info('编排工具.dispatch_task.幂等复用', {
+          logger.info('编排工具.worker_dispatch.幂等复用', {
             idempotencyKey: effectiveIdempotencyKey,
             taskId: existingIdempotent.taskId,
             status: existingIdempotent.status,
@@ -677,7 +712,7 @@ export class DispatchManager {
             taskId,
             count: scopeHintPlan.addedDependencies.length,
           }), 'warning');
-          logger.info('编排工具.dispatch_task.scope_hint缺失自动串行', {
+          logger.info('编排工具.worker_dispatch.scope_hint缺失自动串行', {
             taskId,
             worker: decision.selectedWorker,
             addedDependencies: scopeHintPlan.addedDependencies,
@@ -735,7 +770,7 @@ export class DispatchManager {
               missionTitle: missionTitle || undefined,
             });
           } catch (ledgerError) {
-            logger.warn('编排工具.dispatch_task.计划账本回写失败', {
+            logger.warn('编排工具.worker_dispatch.计划账本回写失败', {
               taskId,
               missionId,
               error: ledgerError instanceof Error ? ledgerError.message : String(ledgerError),
@@ -776,14 +811,14 @@ export class DispatchManager {
 
       sendMessage: async (params) => {
         const { worker, message } = params;
-        logger.info('编排工具.send_worker_message', {
+        logger.info('编排工具.worker_send_message', {
           worker, messagePreview: message.substring(0, 80),
         }, LogCategory.ORCHESTRATOR);
 
         const queue = this.deps.getSupplementaryQueue();
         const delivered = queue ? queue.inject(message, true, worker) : false;
         if (!delivered) {
-          logger.warn('编排工具.send_worker_message.运行时注入失败', {
+          logger.warn('编排工具.worker_send_message.运行时注入失败', {
             worker,
             messagePreview: message.substring(0, 80),
           }, LogCategory.ORCHESTRATOR);
@@ -811,7 +846,7 @@ export class DispatchManager {
       },
 
       waitForWorkers: async (params) => {
-        logger.info('编排工具.wait_for_workers.开始', {
+        logger.info('编排工具.worker_wait.开始', {
           taskIds: params.task_ids || 'all',
         }, LogCategory.ORCHESTRATOR);
 
@@ -822,7 +857,7 @@ export class DispatchManager {
         if (sessionId && planId && planLedger) {
           try {
             await planLedger.updateRuntimeState(sessionId, planId, {
-              wait: { state: 'external_waiting', reasonCode: 'wait_for_workers' },
+              wait: { state: 'external_waiting', reasonCode: 'worker_wait' },
             });
           } catch (error) {
             logger.warn('Dispatch.PlanRuntime.wait状态更新失败', {
@@ -893,6 +928,9 @@ export class DispatchManager {
         }
 
         const childTodoIds: string[] = [];
+        const inheritedTargetFiles = Array.isArray(currentTodo?.targetFiles)
+          ? currentTodo.targetFiles.filter(Boolean)
+          : [];
         const currentSessionId = this.deps.getCurrentSessionId()?.trim();
         if (!currentSessionId) {
           return {
@@ -907,8 +945,13 @@ export class DispatchManager {
             missionId: callerContext.missionId,
             assignmentId: callerContext.assignmentId,
             parentId: callerContext.todoId,
+            source: 'worker_split',
             content: subtask.content,
             reasoning: subtask.reasoning,
+            expectedOutput: subtask.expectedOutput,
+            targetFiles: subtask.targetFiles && subtask.targetFiles.length > 0
+              ? subtask.targetFiles
+              : inheritedTargetFiles,
             type: subtask.type,
             workerId: callerContext.workerId as WorkerSlot,
           });
@@ -916,7 +959,7 @@ export class DispatchManager {
           childTodoIds.push(child.id);
         }
 
-        logger.info('编排工具.split_todo.完成', {
+        logger.info('编排工具.todo_split.完成', {
           parentTodoId: callerContext.todoId,
           childCount: childTodoIds.length,
           workerId: callerContext.workerId,
@@ -1058,13 +1101,13 @@ export class DispatchManager {
                 if (todo.status === 'running') {
                   const activeAssignment = todo.assignmentId ? this.activeAssignments.get(todo.assignmentId) : undefined;
                   if (!activeAssignment) {
-                    logger.warn('编排工具.update_todo.强制重置运行中Todo但Assignment未激活', {
+                    logger.warn('编排工具.todo_update.强制重置运行中Todo但Assignment未激活', {
                       todoId: update.todoId,
                       assignmentId: todo.assignmentId,
                       workerId: todo.workerId,
                     }, LogCategory.ORCHESTRATOR);
                   } else if (activeAssignment.workerId !== todo.workerId) {
-                    logger.warn('编排工具.update_todo.强制重置Todo但Worker不匹配', {
+                    logger.warn('编排工具.todo_update.强制重置Todo但Worker不匹配', {
                       todoId: update.todoId,
                       assignmentId: todo.assignmentId,
                       workerId: todo.workerId,
@@ -1073,7 +1116,7 @@ export class DispatchManager {
                   }
                   if (todo.workerId) {
                     await this.deps.adapterFactory.interrupt(todo.workerId).catch((error: any) => {
-                      logger.warn('编排工具.update_todo.强制中断Worker失败', {
+                      logger.warn('编排工具.todo_update.强制中断Worker失败', {
                         todoId: update.todoId,
                         workerId: todo.workerId,
                         error: error?.message || String(error),
@@ -1093,6 +1136,23 @@ export class DispatchManager {
         }
       },
 
+      compactContext: async (params) => {
+        const contextManager = this.deps.getContextManager();
+        if (!contextManager) {
+          return {
+            success: false,
+            compressed: false,
+            error: 'ContextManager not initialized',
+          };
+        }
+        const result = await contextManager.manualCompactMemory({
+          force: params.force === true,
+          note: typeof params.reason === 'string' ? params.reason : undefined,
+        });
+        await contextManager.flushMemorySave();
+        return result;
+      },
+
       claimNextTodo: async (params) => {
         let todoManager = this.deps.getTodoManager();
         if (!todoManager) {
@@ -1104,6 +1164,22 @@ export class DispatchManager {
         }
 
         try {
+          const assignment = this.activeAssignments.get(params.callerContext.assignmentId);
+          if (!assignment) {
+            return {
+              claimed: false,
+              remaining: 0,
+              reason: `当前 Assignment ${params.callerContext.assignmentId} 未处于激活态，禁止 todo_claim_next 跨上下文续领`,
+            };
+          }
+          const currentTodo = assignment.todos.find((todo) => todo.id === params.callerContext.todoId);
+          if (!currentTodo) {
+            return {
+              claimed: false,
+              remaining: 0,
+              reason: `当前 Todo ${params.callerContext.todoId} 未在激活 Assignment 中找到，禁止 todo_claim_next 旁路续领`,
+            };
+          }
           const claimable = await todoManager.findClaimable(
             params.missionId,
             params.workerId as any
@@ -1113,8 +1189,21 @@ export class DispatchManager {
             return { claimed: false, remaining: 0 };
           }
 
-          // 尝试认领第一个可用的 Todo
-          const target = claimable[0];
+          const selection = selectClaimNextTodoCandidate(claimable, {
+            currentAssignmentId: params.callerContext.assignmentId,
+            currentTodoId: params.callerContext.todoId,
+            currentTargetFiles: currentTodo.targetFiles && currentTodo.targetFiles.length > 0
+              ? currentTodo.targetFiles
+              : assignment.scope.targetPaths,
+          });
+          const target = selection.selected;
+          if (!target) {
+            return {
+              claimed: false,
+              remaining: claimable.length,
+              reason: selection.affinity.reason,
+            };
+          }
           const claimed = await todoManager.tryClaim(target.id, params.workerId as any);
 
           if (!claimed) {
@@ -1128,10 +1217,15 @@ export class DispatchManager {
               id: claimed.id,
               content: claimed.content,
               type: claimed.type,
+              source: claimed.source,
               priority: claimed.priority,
               expectedOutput: claimed.expectedOutput,
               targetFiles: claimed.targetFiles,
               dependsOn: claimed.dependsOn,
+            },
+            affinity: {
+              level: selection.affinity.level,
+              reason: selection.affinity.reason,
             },
             remaining: claimable.length - 1,
           };
@@ -1429,7 +1523,7 @@ export class DispatchManager {
       singleResult.set(taskId, result);
       this.deps.recordWorkerTokenUsage(singleResult);
 
-      logger.info('编排工具.dispatch_task.Worker完成', {
+      logger.info('编排工具.worker_dispatch.Worker完成', {
         worker: effectiveWorker, taskId, success: result.success, summary,
       }, LogCategory.ORCHESTRATOR);
     } catch (error: any) {
@@ -1454,7 +1548,7 @@ export class DispatchManager {
             summary: error.message,
           });
         }
-        logger.info('编排工具.dispatch_task.Worker取消', {
+        logger.info('编排工具.worker_dispatch.Worker取消', {
           worker: effectiveWorker, taskId, reason: error.message,
         }, LogCategory.ORCHESTRATOR);
         return;
@@ -1518,7 +1612,7 @@ export class DispatchManager {
         workerInstance?.clearAllSessions();
       } catch { /* 清理失败不阻塞 */ }
 
-      logger.error('编排工具.dispatch_task.Worker失败', {
+      logger.error('编排工具.worker_dispatch.Worker失败', {
         worker: effectiveWorker,
         taskId,
         error: rawErrorMsg,
@@ -1538,6 +1632,41 @@ export class DispatchManager {
       }
     }
     return null;
+  }
+
+  private resolveWorkerLaneResidentTimeoutMs(): number {
+    const raw = Number(process.env.MAGI_WORKER_LANE_RESIDENT_TIMEOUT_MS);
+    if (!Number.isFinite(raw) || raw < 0) {
+      return DispatchManager.DEFAULT_WORKER_LANE_RESIDENT_TIMEOUT_MS;
+    }
+    return Math.min(120_000, Math.floor(raw));
+  }
+
+  private resolveWorkerLaneResidentPollIntervalMs(): number {
+    const raw = Number(process.env.MAGI_WORKER_LANE_RESIDENT_POLL_INTERVAL_MS);
+    if (!Number.isFinite(raw) || raw <= 0) {
+      return DispatchManager.DEFAULT_WORKER_LANE_RESIDENT_POLL_INTERVAL_MS;
+    }
+    return Math.max(100, Math.min(5_000, Math.floor(raw)));
+  }
+
+  private async waitForReadyTaskWhileResident(
+    batch: DispatchBatch,
+    worker: WorkerSlot,
+    residentDeadlineAt: number,
+  ): Promise<boolean> {
+    const pollIntervalMs = this.resolveWorkerLaneResidentPollIntervalMs();
+    while (batch.status === 'active') {
+      if (this.getNextReadyTaskForWorker(batch, worker)) {
+        return true;
+      }
+      const remainingMs = residentDeadlineAt - Date.now();
+      if (remainingMs <= 0) {
+        return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(pollIntervalMs, remainingMs)));
+    }
+    return false;
   }
 
   /**
@@ -1741,22 +1870,35 @@ export class DispatchManager {
       return;
     }
 
+    const residentTimeoutMs = this.resolveWorkerLaneResidentTimeoutMs();
     this.activeWorkerLanes.add(worker);
     logger.info('DispatchBatch.WorkerLane.启动', {
       batchId: batch.id,
       worker,
+      residentTimeoutMs,
     }, LogCategory.ORCHESTRATOR);
 
     void (async () => {
       let executedCount = 0;
+      let idlePollRounds = 0;
+      let residentDeadlineAt = Date.now() + residentTimeoutMs;
       try {
         while (batch.status === 'active') {
           const nextEntry = this.getNextReadyTaskForWorker(batch, worker);
-          if (!nextEntry) {
+          if (nextEntry) {
+            executedCount += 1;
+            residentDeadlineAt = Date.now() + residentTimeoutMs;
+            await this.executeDispatchEntry(nextEntry, { emitWorkerInstruction: true });
+            continue;
+          }
+          if (residentTimeoutMs <= 0) {
             break;
           }
-          executedCount += 1;
-          await this.executeDispatchEntry(nextEntry, { emitWorkerInstruction: true });
+          const keepResident = await this.waitForReadyTaskWhileResident(batch, worker, residentDeadlineAt);
+          if (!keepResident) {
+            break;
+          }
+          idlePollRounds += 1;
         }
       } finally {
         this.activeWorkerLanes.delete(worker);
@@ -1764,6 +1906,8 @@ export class DispatchManager {
           batchId: batch.id,
           worker,
           executedCount,
+          idlePollRounds,
+          residentTimeoutMs,
           batchStatus: batch.status,
         }, LogCategory.ORCHESTRATOR);
 
@@ -1815,7 +1959,7 @@ export class DispatchManager {
       const auditOutcome = this.ensureBatchAuditOutcome(batch, entries);
 
       if (this.reactiveMode) {
-        // 反应式模式：编排者通过 wait_for_workers 接收结果并自行汇总
+        // 反应式模式：编排者通过 worker_wait 接收结果并自行汇总
         // 标记等待主对话区最终汇总，直接归档，不触发 Phase C 汇总 LLM
         this.reactiveBatchAwaitingSummary.add(batchId);
         if (auditOutcome.level === 'intervention') {
@@ -2875,7 +3019,7 @@ export class DispatchManager {
       categories: [input.category],
       needsTooling: true,
       requiresModification: input.requiresModification,
-      reason: input.routingReason.trim() || `dispatch_task 分类为 ${input.category}`,
+      reason: input.routingReason.trim() || `worker_dispatch 分类为 ${input.category}`,
     };
 
     return {

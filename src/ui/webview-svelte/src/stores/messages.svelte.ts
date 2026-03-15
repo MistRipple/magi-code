@@ -26,6 +26,7 @@ import type {
   Task,
   QueuedMessage,
   WaitForWorkersResult,
+  OrchestratorRuntimeDiagnostics,
 } from '../types/message';
 import { vscode } from '../lib/vscode-bridge';
 import { ensureArray } from '../lib/utils';
@@ -76,6 +77,7 @@ export const messagesState = $state({
 
   // 后端下发的完整状态
   appState: null as AppState | null,
+  orchestratorRuntimeDiagnostics: null as OrchestratorRuntimeDiagnostics | null,
 
   // 滚动状态
   scrollPositions: {
@@ -393,10 +395,61 @@ function normalizeMissionPlan(plan: MissionPlan | null): MissionPlan | null {
   return { ...plan, missionId: plan.missionId || '', assignments };
 }
 
+function normalizeOrchestratorRuntimeDiagnostics(
+  input: OrchestratorRuntimeDiagnostics | null | undefined,
+): OrchestratorRuntimeDiagnostics | null {
+  if (!input || typeof input !== 'object') return null;
+  const runtimeReason = typeof input.runtimeReason === 'string' && input.runtimeReason.trim().length > 0
+    ? input.runtimeReason.trim()
+    : '';
+  const finalStatus = input.finalStatus === 'completed'
+    || input.finalStatus === 'failed'
+    || input.finalStatus === 'cancelled'
+    || input.finalStatus === 'paused'
+    ? input.finalStatus
+    : null;
+  if (!runtimeReason || !finalStatus) {
+    return null;
+  }
+  const updatedAt = typeof input.updatedAt === 'number' && Number.isFinite(input.updatedAt)
+    ? input.updatedAt
+    : Date.now();
+  const sessionId = typeof input.sessionId === 'string' && input.sessionId.trim().length > 0
+    ? input.sessionId.trim()
+    : undefined;
+  const requestId = typeof input.requestId === 'string' && input.requestId.trim().length > 0
+    ? input.requestId.trim()
+    : undefined;
+  const runtimeSnapshot = input.runtimeSnapshot && typeof input.runtimeSnapshot === 'object'
+    ? JSON.parse(JSON.stringify(input.runtimeSnapshot))
+    : null;
+  const runtimeDecisionTrace = Array.isArray(input.runtimeDecisionTrace)
+    ? input.runtimeDecisionTrace
+      .filter((entry) => entry && typeof entry === 'object')
+      .map((entry) => JSON.parse(JSON.stringify(entry)))
+    : [];
+  return {
+    runtimeReason,
+    finalStatus,
+    updatedAt,
+    ...(sessionId ? { sessionId } : {}),
+    ...(requestId ? { requestId } : {}),
+    runtimeSnapshot,
+    runtimeDecisionTrace,
+  };
+}
+
 // 交互请求状态
 let pendingConfirmation = $state<{ plan: unknown; formattedPlan?: string; forceManual?: boolean } | null>(null);
 let pendingRecovery = $state<{ taskId: string; error: unknown; canRetry: boolean; canRollback: boolean } | null>(null);
-let pendingDeliveryRepair = $state<{ missionId: string; summary: string; details?: string; round: number; maxRounds: number } | null>(null);
+let pendingDeliveryRepair = $state<{
+  missionId: string;
+  summary: string;
+  details?: string;
+  round: number;
+  maxRounds: number;
+  requestType?: 'delivery_repair' | 'replan_followup';
+} | null>(null);
 let pendingClarification = $state<{ questions: string[]; context?: string; ambiguityScore?: number; originalPrompt?: string } | null>(null);
 let pendingWorkerQuestion = $state<{ workerId: string; question: string; context?: string; options?: unknown } | null>(null);
 let pendingToolAuthorization = $state<{ requestId: string; toolName: string; toolArgs: unknown } | null>(null);
@@ -488,6 +541,10 @@ export function getEdits() {
 
 export function getWorkerWaitResults() {
   return workerWaitResults;
+}
+
+export function getOrchestratorRuntimeDiagnostics() {
+  return messagesState.orchestratorRuntimeDiagnostics;
 }
 
 export function getToasts() {
@@ -653,6 +710,8 @@ export function getState() {
     set edits(v) { edits = v; },
     get workerWaitResults() { return workerWaitResults; },
     set workerWaitResults(v) { workerWaitResults = v; },
+    get orchestratorRuntimeDiagnostics() { return messagesState.orchestratorRuntimeDiagnostics; },
+    set orchestratorRuntimeDiagnostics(v) { messagesState.orchestratorRuntimeDiagnostics = normalizeOrchestratorRuntimeDiagnostics(v); },
     get toasts() { return toasts; },
     set toasts(v) { toasts = v; },
     get notifications() { return notifications; },
@@ -724,8 +783,14 @@ function saveWebviewState() {
     scrollAnchors: messagesState.scrollAnchors,
     autoScrollEnabled: messagesState.autoScrollEnabled,
     notificationBuckets,
+    orchestratorRuntimeDiagnostics: messagesState.orchestratorRuntimeDiagnostics,
   };
   vscode.setState(state);
+}
+
+export function setOrchestratorRuntimeDiagnostics(input: OrchestratorRuntimeDiagnostics | null): void {
+  messagesState.orchestratorRuntimeDiagnostics = normalizeOrchestratorRuntimeDiagnostics(input);
+  saveWebviewState();
 }
 
 export function updatePanelScrollState(
@@ -1413,6 +1478,7 @@ export function clearAllMessages() {
     gemini: [],
   };
   workerWaitResults = {};
+  messagesState.orchestratorRuntimeDiagnostics = null;
   messagesState.queuedMessages = [];
   messagesState.messageJump = {
     messageId: null,
@@ -1490,6 +1556,7 @@ export function initializeState() {
     } : createDefaultScrollAnchors();
     messagesState.autoScrollEnabled = persisted.autoScrollEnabled || { thread: true, claude: true, codex: true, gemini: true };
     notificationBuckets = normalizeNotificationBuckets(persisted.notificationBuckets);
+    messagesState.orchestratorRuntimeDiagnostics = normalizeOrchestratorRuntimeDiagnostics(persisted.orchestratorRuntimeDiagnostics);
     syncNotificationsFromBucket(messagesState.currentSessionId);
 
     // 启动恢复：持久化状态只保留历史展示，不继承运行态。

@@ -22,7 +22,7 @@
     issues: Array<{ task_id: string; level: string; dimension: string; detail: string }>;
   }
 
-  /** wait_for_workers 返回结构 */
+  /** worker_wait 返回结构 */
   interface WaitResult {
     results: WorkerResult[];
     wait_status: 'completed' | 'timeout';

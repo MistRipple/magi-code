@@ -1,7 +1,7 @@
 /**
- * DispatchBatch - dispatch_task 生命周期追踪器
+ * DispatchBatch - worker_dispatch 生命周期追踪器
  *
- * 管理一次 orchestrator LLM 调用中发出的所有 dispatch_task 的状态、
+ * 管理一次 orchestrator LLM 调用中发出的所有 worker_dispatch 的状态、
  * 依赖关系和生命周期，为 Phase C 汇总和依赖链编排提供基础设施。
  *
  * 生命周期：创建 → 注册任务 → 追加任务 → 完成检测 → 汇总触发 → 归档
@@ -93,7 +93,7 @@ export class CancellationError extends Error {
 // 类型定义
 // ============================================================================
 
-/** dispatch_task 状态 */
+/** worker_dispatch 状态 */
 export type DispatchStatus = 'pending' | 'waiting_deps' | 'running' | 'completed' | 'failed' | 'skipped' | 'cancelled';
 
 /** 终端状态判断（completed/failed/skipped/cancelled） */
@@ -119,7 +119,7 @@ export interface DispatchResult {
 }
 
 /**
- * 协作契约数据（dispatch_task -> Worker Assignment 贯通）
+ * 协作契约数据（worker_dispatch -> Worker Assignment 贯通）
  */
 export interface DispatchCollaborationContracts {
   producerContracts: string[];

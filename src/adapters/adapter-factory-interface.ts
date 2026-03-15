@@ -5,8 +5,9 @@
 
 import { EventEmitter } from 'events';
 import { AgentType } from '../types/agent-types';
-import type { ToolManager } from '../tools/tool-manager';
+import type { ToolManager, ToolExecutionContext } from '../tools/tool-manager';
 import type { MCPToolExecutor } from '../tools/mcp-executor';
+import type { DecisionHookEvent } from '../llm/types';
 
 /**
  * 适配器输出范围配置
@@ -37,12 +38,7 @@ export interface AdapterOutputScope {
    * 决策点回调（工具调用前/后/思考阶段）
    * 返回需要注入的补充指令列表
    */
-  decisionHook?: (event: {
-    type: 'thinking' | 'tool_call' | 'tool_result';
-    toolName?: string;
-    toolArgs?: any;
-    toolResult?: string;
-  }) => string[];
+  decisionHook?: (event: DecisionHookEvent) => string[];
 
   /**
    * 临时系统提示词（可选）
@@ -56,6 +52,16 @@ export interface AdapterOutputScope {
    * 取代已废弃的全局 requestContext，从架构源头消除并发竞态。
    */
   requestId?: string;
+
+  /**
+   * 工具执行上下文（可选）
+   * 用于将本次请求绑定到特定的执行作用域（如 worktree 隔离目录）。
+   *
+   * 工程约束（必须遵守）：
+   * - 后续新增写工具或执行入口时，必须复用同一 toolExecutionContext/worktreePath 链路。
+   * - 严禁在工具层自行拼接或绕过该链路注入路径（禁止旁路），否则会破坏写隔离与冲突控制。
+   */
+  toolExecutionContext?: Partial<ToolExecutionContext>;
 }
 
 /**

@@ -1,7 +1,7 @@
 /**
  * Skill 安装与指令构建
  *
- * 注意：内置工具（launch-process 等终端工具, file_view/file_create/file_edit/file_insert/file_remove, grep_search 等）由 ToolManager 直接管理
+ * 注意：内置工具（process_launch 等终端工具, file_view/file_create/file_edit/file_insert/file_remove, code_search_regex 等）由 ToolManager 直接管理
  * 此模块仅处理指令型 Skills 和自定义工具的安装
  */
 

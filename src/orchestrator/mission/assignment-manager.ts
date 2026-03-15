@@ -145,8 +145,14 @@ export class AssignmentManager {
       constraints: mission.constraints.map(constraint => ({ ...constraint })),
       acceptanceCriteria: mission.acceptanceCriteria.map(criterion => ({
         ...criterion,
+        evidence: Array.isArray(criterion.evidence)
+          ? [...criterion.evidence]
+          : undefined,
         verificationSpec: criterion.verificationSpec
           ? { ...criterion.verificationSpec }
+          : undefined,
+        reviewHistory: Array.isArray(criterion.reviewHistory)
+          ? criterion.reviewHistory.map((entry) => ({ ...entry }))
           : undefined,
       })),
       scope,

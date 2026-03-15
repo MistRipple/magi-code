@@ -27,7 +27,7 @@ import { LspEnforcer } from '../lsp/lsp-enforcer';
 import { logger, LogCategory } from '../../logging';
 import type { AssembledContext } from '../../context/context-assembler';
 import { t } from '../../i18n';
-import type { WorktreeManager, WorktreeMergeResult } from '../../workspace/worktree-manager';
+import type { WorktreeAllocation, WorktreeManager, WorktreeMergeResult } from '../../workspace/worktree-manager';
 
 // ============================================================================
 // 配置与结果类型
@@ -97,11 +97,55 @@ export class WorkerPipeline {
     const missionId = config.missionId || 'dispatch';
 
     // ========== 0. [可选] Worktree 隔离 ==========
-    // 当任务需要写操作且 worktreeManager 可用时，分配独立 worktree
+    // 当任务需要写操作时，必须分配独立 worktree（fail-closed，禁止回退共享目录）
     const requiresWrite = assignment.scope?.requiresModification ?? false;
-    const worktreeAllocation = requiresWrite && worktreeManager
-      ? worktreeManager.acquire(assignment.id)
-      : null;
+    let worktreeAllocation: WorktreeAllocation | null = null;
+    if (requiresWrite) {
+      if (!worktreeManager) {
+        const isolationError = t('pipeline.errors.worktreeIsolationManagerMissing');
+        logger.error('WorkerPipeline.Worktree.隔离失败_缺少管理器', {
+          assignmentId: assignment.id,
+          worker: assignment.workerId,
+          requiresWrite,
+        }, LogCategory.ORCHESTRATOR);
+        return {
+          executionResult: this.buildWorktreeIsolationFailureResult(assignment, isolationError),
+          lspNewErrors: [],
+          targetChangeDetected: false,
+        };
+      }
+      const isGitRepository = worktreeManager.isGitRepository();
+      if (!isGitRepository) {
+        const isolationError = t('pipeline.errors.worktreeIsolationGitRequired');
+        logger.error('WorkerPipeline.Worktree.隔离失败_非Git仓库', {
+          assignmentId: assignment.id,
+          worker: assignment.workerId,
+          requiresWrite,
+          workspaceRoot,
+        }, LogCategory.ORCHESTRATOR);
+        return {
+          executionResult: this.buildWorktreeIsolationFailureResult(assignment, isolationError),
+          lspNewErrors: [],
+          targetChangeDetected: false,
+        };
+      }
+      worktreeAllocation = worktreeManager.acquire(assignment.id);
+      if (!worktreeAllocation) {
+        const isolationError = t('pipeline.errors.worktreeIsolationAcquireFailed');
+        logger.error('WorkerPipeline.Worktree.隔离失败_分配失败', {
+          assignmentId: assignment.id,
+          worker: assignment.workerId,
+          requiresWrite,
+          isGitRepository,
+          workspaceRoot,
+        }, LogCategory.ORCHESTRATOR);
+        return {
+          executionResult: this.buildWorktreeIsolationFailureResult(assignment, isolationError),
+          lspNewErrors: [],
+          targetChangeDetected: false,
+        };
+      }
+    }
     // Worker 的有效工作目录：worktree 路径 > 原始 workspaceRoot
     const effectiveWorkspaceRoot = worktreeAllocation?.worktreePath ?? workspaceRoot;
 
@@ -314,6 +358,17 @@ export class WorkerPipeline {
             result.errors.push(t('pipeline.errors.worktreeMergeConflict', {
               files: worktreeMerge.conflictFiles.join(', '),
             }));
+            if (worktreeMerge.conflictSummary) {
+              result.errors.push(worktreeMerge.conflictSummary);
+            }
+            if (Array.isArray(worktreeMerge.conflictHints) && worktreeMerge.conflictHints.length > 0) {
+              result.errors.push(...worktreeMerge.conflictHints);
+            }
+            await this.createWorktreeConflictRepairTodo({
+              assignment,
+              todoManager,
+              worktreeMerge,
+            });
           }
         } else {
           logger.info('WorkerPipeline.Worktree.跳过合并_任务失败', {
@@ -577,5 +632,76 @@ export class WorkerPipeline {
     }
 
     await contextManager.saveMemory();
+  }
+
+  private async createWorktreeConflictRepairTodo(input: {
+    assignment: Assignment;
+    todoManager?: import('../../todo').TodoManager | null;
+    worktreeMerge: WorktreeMergeResult;
+  }): Promise<void> {
+    const { assignment, todoManager, worktreeMerge } = input;
+    if (!todoManager || !worktreeMerge.hasConflicts) {
+      return;
+    }
+    const marker = `[worktree-conflict:${assignment.id}]`;
+    if (assignment.todos.some((todo) => typeof todo.content === 'string' && todo.content.includes(marker))) {
+      return;
+    }
+    const conflictFiles = Array.isArray(worktreeMerge.conflictFiles)
+      ? worktreeMerge.conflictFiles.filter(Boolean)
+      : [];
+    const filesLabel = conflictFiles.length > 0
+      ? conflictFiles.join(', ')
+      : '未识别文件';
+    try {
+      const repairTodo = await todoManager.create({
+        missionId: assignment.missionId,
+        assignmentId: assignment.id,
+        source: 'system_repair',
+        content: `${marker} 处理 worktree 合并冲突并完成冲突消解：${filesLabel}`,
+        reasoning: `并发变更在 merge 阶段发生冲突，需先完成冲突消解再继续交付。${worktreeMerge.conflictSummary || ''}`.trim(),
+        type: 'fix',
+        workerId: assignment.workerId,
+        targetFiles: conflictFiles.length > 0 ? conflictFiles : undefined,
+      });
+      assignment.todos.push(repairTodo);
+      logger.info('WorkerPipeline.Worktree.冲突修复Todo已创建', {
+        assignmentId: assignment.id,
+        todoId: repairTodo.id,
+        conflictFiles,
+      }, LogCategory.ORCHESTRATOR);
+    } catch (error: any) {
+      logger.warn('WorkerPipeline.Worktree.冲突修复Todo创建失败', {
+        assignmentId: assignment.id,
+        conflictFiles,
+        error: error?.message || String(error),
+      }, LogCategory.ORCHESTRATOR);
+    }
+  }
+
+  private buildWorktreeIsolationFailureResult(
+    assignment: Assignment,
+    errorMessage: string,
+  ): AutonomousExecutionResult {
+    return {
+      assignment,
+      success: false,
+      completedTodos: [],
+      failedTodos: [],
+      skippedTodos: [],
+      dynamicTodos: [],
+      recoveredTodos: [],
+      totalDuration: 0,
+      errors: [errorMessage],
+      recoveryAttempts: 0,
+      summary: errorMessage,
+      hasPendingApprovals: false,
+      verification: {
+        attempted: false,
+        degraded: false,
+        warnings: [],
+        rounds: 0,
+      },
+    };
   }
 }

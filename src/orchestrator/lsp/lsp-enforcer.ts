@@ -248,7 +248,7 @@ export class LspEnforcer {
   private async queryLsp(action: string, filePath: string): Promise<{ ok: boolean; data?: any; error?: string }> {
     const toolCall: ToolCall = {
       id: `lsp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      name: 'lsp_query',
+      name: 'code_intel_query',
       arguments: {
         action,
         filePath

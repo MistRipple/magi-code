@@ -98,15 +98,28 @@
       'file_create': 'file-plus',
       'file_edit': 'pencil',
       'file_insert': 'plus',
-      'grep_search': 'search',
+      'code_search_regex': 'search',
       'file_remove': 'trash',
       'web_search': 'search',
       'web_fetch': 'globe',
       'mermaid_diagram': 'git-branch',
-      'codebase_retrieval': 'search',
-      'dispatch_task': 'tools',
-      'send_worker_message': 'send',
-      'wait_for_workers': 'hourglass',
+      'code_search_semantic': 'search',
+      'worker_dispatch': 'tools',
+      'worker_send_message': 'send',
+      'worker_wait': 'hourglass',
+      'todo_split': 'tools',
+      'todo_list': 'document',
+      'todo_update': 'edit',
+      'todo_claim_next': 'skip-forward',
+      'context_compact': 'minimize',
+      'skill_apply': 'skill',
+      'project_knowledge_query': 'question',
+      'process_launch': 'terminal',
+      'process_read': 'terminal',
+      'process_write': 'terminal',
+      'process_kill': 'stop',
+      'process_list': 'terminal',
+      'code_intel_query': 'search',
     };
 
     if (iconMap[toolName]) {
@@ -114,12 +127,14 @@
     }
 
     const lowerName = toolName.toLowerCase();
-    if (lowerName.includes('search') || lowerName.includes('retrieval')) return 'search';
+    if (lowerName.includes('search') || lowerName.includes('semantic') || lowerName.includes('query')) return 'search';
     if (lowerName.includes('read') || lowerName.includes('view')) return 'file-text';
     if (lowerName.includes('write') || lowerName.includes('edit')) return 'file-edit';
     if (lowerName.includes('delete') || lowerName.includes('remove')) return 'file-minus';
+    if (lowerName.includes('process')) return 'terminal';
     if (lowerName.includes('web') || lowerName.includes('fetch') || lowerName.includes('browser')) return 'globe';
     if (lowerName.includes('mermaid')) return 'git-branch';
+    if (lowerName.includes('todo')) return 'document';
     if (lowerName.includes('mcp')) return 'plug';
     return 'tool';
   }
@@ -146,8 +161,8 @@
   const isHeaderOpenableTool = $derived(name === 'file_view' || name === 'view');
 
   // 检查是否有内容
-  const hasInput = $derived(!!input && !!formatContent(input) && name !== 'wait_for_workers');
-  const hasOutput = $derived(!!output && !!formatContent(output) && name !== 'wait_for_workers');
+  const hasInput = $derived(!!input && !!formatContent(input) && name !== 'worker_wait');
+  const hasOutput = $derived(!!output && !!formatContent(output) && name !== 'worker_wait');
   const hasError = $derived(!!error && !!error.trim());
 
   // 检查是否为 Mermaid 工具输出
@@ -169,7 +184,7 @@
     return null;
   });
 
-  const isWaitForWorkersTool = $derived(name === 'wait_for_workers');
+  const isWaitForWorkersTool = $derived(name === 'worker_wait');
   const hasContent = $derived(hasInput || hasOutput || hasError);
   const shouldCompactWaitForWorkers = $derived(isWaitForWorkersTool && !hasContent);
   const waitForWorkersStatusLabel = $derived.by(() => {
@@ -190,15 +205,28 @@
       'file_create': i18n.t('toolCall.displayName.fileCreate'),
       'file_edit': i18n.t('toolCall.displayName.fileEdit'),
       'file_insert': i18n.t('toolCall.displayName.fileInsert'),
-      'grep_search': i18n.t('toolCall.displayName.grepSearch'),
+      'code_search_regex': i18n.t('toolCall.displayName.grepSearch'),
       'file_remove': i18n.t('toolCall.displayName.fileRemove'),
       'web_search': i18n.t('toolCall.displayName.webSearch'),
       'web_fetch': i18n.t('toolCall.displayName.webFetch'),
       'mermaid_diagram': i18n.t('toolCall.displayName.mermaidDiagram'),
-      'codebase_retrieval': i18n.t('toolCall.displayName.codebaseRetrieval'),
-      'dispatch_task': i18n.t('toolCall.displayName.dispatchTask'),
-      'send_worker_message': i18n.t('toolCall.displayName.sendWorkerMessage'),
-      'wait_for_workers': i18n.t('toolCall.displayName.waitForWorkers'),
+      'code_search_semantic': i18n.t('toolCall.displayName.codebaseRetrieval'),
+      'worker_dispatch': i18n.t('toolCall.displayName.dispatchTask'),
+      'worker_send_message': i18n.t('toolCall.displayName.sendWorkerMessage'),
+      'worker_wait': i18n.t('toolCall.displayName.waitForWorkers'),
+      'todo_split': 'todo_split',
+      'todo_list': 'todo_list',
+      'todo_update': 'todo_update',
+      'todo_claim_next': 'todo_claim_next',
+      'context_compact': 'context_compact',
+      'skill_apply': 'skill_apply',
+      'project_knowledge_query': 'project_knowledge_query',
+      'process_launch': 'process_launch',
+      'process_read': 'process_read',
+      'process_write': 'process_write',
+      'process_kill': 'process_kill',
+      'process_list': 'process_list',
+      'code_intel_query': 'code_intel_query',
       'list_files': i18n.t('toolCall.displayName.listFiles'),
     };
 
@@ -220,8 +248,39 @@
         const p = typeof args.path === 'string' ? args.path : '';
         return p;
       }
-      case 'grep_search':
+      case 'code_search_regex':
         return typeof args.pattern === 'string' ? args.pattern : '';
+      case 'code_search_semantic':
+      case 'project_knowledge_query':
+        return typeof args.query === 'string' ? args.query : '';
+      case 'worker_dispatch':
+        return (typeof args.task_name === 'string' ? args.task_name : '')
+          || (typeof args.goal === 'string' ? args.goal : '');
+      case 'worker_send_message':
+        return (typeof args.task_id === 'string' ? args.task_id : '')
+          || (typeof args.message === 'string' ? args.message : '');
+      case 'todo_list':
+        return (typeof args.mission_id === 'string' ? args.mission_id : '')
+          || (typeof args.session_id === 'string' ? args.session_id : '');
+      case 'todo_update': {
+        const updates = Array.isArray(args.updates) ? args.updates : [];
+        if (updates.length === 0) return '';
+        const firstUpdate = updates[0] as Record<string, unknown>;
+        const firstTodoId = typeof firstUpdate?.todo_id === 'string' ? firstUpdate.todo_id : '';
+        return updates.length === 1 ? firstTodoId : `${firstTodoId || 'todo'} +${updates.length - 1}`;
+      }
+      case 'todo_split': {
+        const childTodos = Array.isArray(args.child_todos) ? args.child_todos : [];
+        if (childTodos.length === 0) return '';
+        const firstChild = childTodos[0] as Record<string, unknown>;
+        return typeof firstChild?.content === 'string' ? firstChild.content : '';
+      }
+      case 'todo_claim_next':
+        return typeof args.assignment_id === 'string' ? args.assignment_id : '';
+      case 'context_compact':
+        return typeof args.mode === 'string' ? args.mode : '';
+      case 'skill_apply':
+        return typeof args.skill_name === 'string' ? args.skill_name : '';
       case 'read_file':
       case 'write_file':
       case 'edit_file':
@@ -240,11 +299,19 @@
         return typeof args.query === 'string' ? args.query : '';
       case 'mermaid_diagram':
         return typeof args.title === 'string' ? args.title : '';
-      case 'lsp_query': {
+      case 'code_intel_query': {
         const action = typeof args.action === 'string' ? args.action : '';
         const fp = typeof args.filePath === 'string' ? args.filePath : '';
         return action && fp ? `${action} ${fp}` : action || fp;
       }
+      case 'process_launch':
+        return typeof args.command === 'string' ? args.command : '';
+      case 'process_read':
+      case 'process_write':
+      case 'process_kill':
+        return typeof args.terminal_id === 'number' ? String(args.terminal_id) : '';
+      case 'process_list':
+        return typeof args.agent === 'string' ? args.agent : '';
       default:
         // MCP 或其他未知工具：尝试提取常见字段
         return (typeof args.command === 'string' ? args.command : '')
@@ -325,13 +392,13 @@
       };
     }
 
-    // 编排者角色约束（dispatch_task 引导）— 与用户权限无关，是系统架构层面的职责划分
+    // 编排者角色约束（worker_dispatch 引导）— 与用户权限无关，是系统架构层面的职责划分
     if (matches(
       'orchestrator',
-      'dispatch_task delegation',
+      'worker_dispatch delegation',
       'orchestrator cannot execute tools in deep mode',
       '深度模式下编排者不可直接执行',
-      '请通过 dispatch_task 委派给 worker',
+      '请通过 worker_dispatch 委派给 worker',
     )) {
       return {
         category: 'role_constraint',

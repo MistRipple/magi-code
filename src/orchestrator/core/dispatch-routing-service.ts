@@ -234,7 +234,7 @@ export class DispatchRoutingService {
     }
     return {
       ok: false,
-      error: `dispatch_task 缺少 category 参数。可选分类: ${this.getKnownCategoryNames().join(', ')}`,
+      error: `worker_dispatch 缺少 category 参数。可选分类: ${this.getKnownCategoryNames().join(', ')}`,
     };
   }
 

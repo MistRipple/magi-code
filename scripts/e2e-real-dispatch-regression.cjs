@@ -180,12 +180,12 @@ async function main() {
     const session = sessionManager.createSession(`real-dispatch-regression-${Date.now()}`);
     const prompt = [
       '请严格执行以下流程，并且只执行一轮：',
-      '1) 连续调用 3 次 dispatch_task，且每次都必须包含 requires_modification 参数：',
+      '1) 连续调用 3 次 worker_dispatch，且每次都必须包含 requires_modification 参数：',
       '- category=architecture, requires_modification=false：分析 src/orchestrator 编排链路，输出 2 条风险。',
-      '- category=general, requires_modification=false：阅读 src/orchestrator/core/dispatch-manager.ts，输出 dispatch_task 路由链路的 3 点摘要。',
+      '- category=general, requires_modification=false：阅读 src/orchestrator/core/dispatch-manager.ts，输出 worker_dispatch 路由链路的 3 点摘要。',
       '- category=data_analysis, requires_modification=false：统计 src/orchestrator 下 .ts 文件数量并给结论。',
-      '2) 调用一次 wait_for_workers 等待上述任务完成。',
-      '3) 最后输出汇总结论，不要再追加任何 dispatch_task。',
+      '2) 调用一次 worker_wait 等待上述任务完成。',
+      '3) 最后输出汇总结论，不要再追加任何 worker_dispatch。',
       '硬性约束：禁止修改文件、禁止执行命令、禁止联网。',
     ].join('\n');
 

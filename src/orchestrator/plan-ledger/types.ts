@@ -234,6 +234,18 @@ export interface PlanAttemptCompleteInput extends PlanAttemptStartInput {
   evidenceIds?: string[];
 }
 
+export interface PlanMutationOptions {
+  /**
+   * 可选的 CAS 语义：仅当当前 revision 与 expectedRevision 一致时才允许写入。
+   * 用于避免跨调用方并发写覆盖。
+   */
+  expectedRevision?: number;
+  /**
+   * 审计上下文：记录该次写入的调用来源，便于定位冲突或非法迁移。
+   */
+  auditReason?: string;
+}
+
 export interface PlanLedgerSnapshot {
   activePlan: PlanRecord | null;
   plans: PlanRecord[];

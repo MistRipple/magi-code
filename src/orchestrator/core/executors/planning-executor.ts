@@ -7,7 +7,7 @@
  *
  * 设计原则：
  * - 一级 Todo 由编排层创建，无 parentId
- * - Worker 执行过程中通过 addDynamicTodo 创建二级 Todo（parentId 指向一级）
+ * - 执行期新增 Todo 仅允许走受控链路（如 todo_split / adjustment / review fix），并且必须显式标记 source
  */
 
 import { Assignment } from '../../mission';
@@ -40,6 +40,7 @@ export class PlanningExecutor {
       sessionId,
       missionId,
       assignmentId: assignment.id,
+      source: 'planner_macro',
       content,
       reasoning: assignment.delegationBriefing || assignment.responsibility,
       type: macroTodoType,

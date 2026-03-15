@@ -12,6 +12,7 @@ import { logger, LogCategory } from '../logging';
 import {
   UnifiedTodo,
   TodoStatus,
+  TodoSource,
   TodoType,
   TodoQuery,
   TodoStats,
@@ -58,6 +59,29 @@ export interface TodoRepository {
   // ===== 维护 =====
   cleanup(olderThan: number): Promise<number>;
   getStats(): Promise<TodoStats>;
+}
+
+const TODO_SOURCES = new Set<TodoSource>([
+  'planner_macro',
+  'worker_split',
+  'orchestrator_adjustment',
+  'review_fix',
+  'system_repair',
+]);
+
+function normalizeTodoSource(rawTodo: Record<string, unknown>): TodoSource {
+  const explicitSource = typeof rawTodo.source === 'string' ? rawTodo.source.trim() : '';
+  if (TODO_SOURCES.has(explicitSource as TodoSource)) {
+    return explicitSource as TodoSource;
+  }
+  // 历史数据升级：旧版本没有 source 字段，只能按层级和类型做一次性归一化推断。
+  if (typeof rawTodo.parentId === 'string' && rawTodo.parentId.trim()) {
+    return 'worker_split';
+  }
+  if (rawTodo.type === 'fix') {
+    return 'review_fix';
+  }
+  return 'planner_macro';
 }
 
 // ============================================================================
@@ -149,6 +173,7 @@ export class FileTodoRepository implements TodoRepository {
             }
             const todo = {
               ...(rawTodo as Omit<UnifiedTodo, 'sessionId'>),
+              source: normalizeTodoSource(rawTodo as Record<string, unknown>),
               sessionId: typeof (rawTodo as { sessionId?: unknown }).sessionId === 'string'
                 ? (rawTodo as { sessionId: string }).sessionId.trim() || sessionId
                 : sessionId,
@@ -198,6 +223,7 @@ export class FileTodoRepository implements TodoRepository {
     const sessionId = this.normalizeSessionId(todo.sessionId);
     const normalizedTodo: UnifiedTodo = {
       ...todo,
+      source: normalizeTodoSource(todo as unknown as Record<string, unknown>),
       sessionId,
     };
     this.cache.set(normalizedTodo.id, normalizedTodo);
@@ -210,6 +236,7 @@ export class FileTodoRepository implements TodoRepository {
       const sessionId = this.normalizeSessionId(todo.sessionId);
       const normalizedTodo: UnifiedTodo = {
         ...todo,
+        source: normalizeTodoSource(todo as unknown as Record<string, unknown>),
         sessionId,
       };
       this.cache.set(normalizedTodo.id, normalizedTodo);

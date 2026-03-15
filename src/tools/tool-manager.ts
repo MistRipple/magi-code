@@ -5,17 +5,18 @@
  * 内置工具 (source: 'builtin'):
  * - shell: 终端命令执行（统一外显入口）
  * - file_view/file_create/file_edit/file_insert: 文件操作
- * - grep_search: 代码搜索
+ * - code_search_regex: 代码正则搜索
  * - file_remove: 文件删除
  * - web_search: 网络搜索
  * - web_fetch: URL 内容获取
  * - mermaid_diagram: Mermaid 图表渲染
- * - codebase_retrieval: 代码库语义检索（本地基础设施）
- * - dispatch_task: 将子任务分配给专业 Worker
- * - send_worker_message: 向 Worker 面板发送消息
- * - wait_for_workers: 等待 Worker 完成并获取结果（反应式编排）
- * - get_todos: 获取当前任务的 todo 列表
- * - update_todo: 更新 todo 状态
+ * - code_search_semantic: 代码库语义检索（本地基础设施）
+ * - worker_dispatch: 将子任务分配给专业 Worker
+ * - worker_send_message: 向 Worker 面板发送消息
+ * - worker_wait: 等待 Worker 完成并获取结果（反应式编排）
+ * - todo_list: 获取当前任务的 todo 列表
+ * - todo_update: 更新 todo 状态
+ * - context_compact: 手动触发上下文压缩与归档
  */
 
 import { EventEmitter } from 'events';
@@ -262,7 +263,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
   /**
    * 注入项目知识库引用（由 MissionDrivenEngine 在启动时调用）
-   * 使 fetch_project_guidelines 工具能按需查询 ADR、FAQ、经验记录等
+   * 使 project_knowledge_query 工具能按需查询 ADR、FAQ、经验记录等
    */
   setProjectKnowledgeBase(getter: () => import('../knowledge/project-knowledge-base').ProjectKnowledgeBase | undefined): void {
     this.knowledgeQueryExecutor = new KnowledgeQueryExecutor(getter);
@@ -702,22 +703,28 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     ['file-create', 'file_create'],
     ['file-edit', 'file_edit'],
     ['file-insert', 'file_insert'],
-    ['file-bulk-edit', 'file_bulk_edit'],
     ['file-remove', 'file_remove'],
-    ['grep-search', 'grep_search'],
+    ['code-search-regex', 'code_search_regex'],
     ['web-search', 'web_search'],
     ['web-fetch', 'web_fetch'],
     ['mermaid-diagram', 'mermaid_diagram'],
-    ['codebase-retrieval', 'codebase_retrieval'],
-    ['dispatch-task', 'dispatch_task'],
-    ['send-worker-message', 'send_worker_message'],
-    ['wait-for-workers', 'wait_for_workers'],
-    ['split-todo', 'split_todo'],
-    ['get-todos', 'get_todos'],
-    ['update-todo', 'update_todo'],
-    ['apply-skill', 'apply_skill'],
-    ['fetch-project-guidelines', 'fetch_project_guidelines'],
-    ['claim-next-todo', 'claim_next_todo'],
+    ['code-search-semantic', 'code_search_semantic'],
+    ['worker-dispatch', 'worker_dispatch'],
+    ['worker-send-message', 'worker_send_message'],
+    ['worker-wait', 'worker_wait'],
+    ['todo-split', 'todo_split'],
+    ['todo-list', 'todo_list'],
+    ['todo-update', 'todo_update'],
+    ['context-compact', 'context_compact'],
+    ['skill-apply', 'skill_apply'],
+    ['project-knowledge-query', 'project_knowledge_query'],
+    ['todo-claim-next', 'todo_claim_next'],
+    ['process-launch', 'process_launch'],
+    ['process-read', 'process_read'],
+    ['process-write', 'process_write'],
+    ['process-kill', 'process_kill'],
+    ['process-list', 'process_list'],
+    ['code-intel-query', 'code_intel_query'],
   ]);
 
   /**
@@ -729,7 +736,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     'file_create',
     'file_edit',
     'file_insert',
-    'file_bulk_edit',
     'file_remove',
   ]);
 
@@ -871,7 +877,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   /**
    * 执行内部工具调用（系统级调用入口）
    * - 统一通过 ToolManager 入口，避免外部直接操作具体 executor
-   * - 支持内部专用工具（如 lsp_query）在不暴露给模型的前提下复用
+   * - 支持内部专用工具（如 code_intel_query）在不暴露给模型的前提下复用
    */
   async executeInternalTool(
     toolCall: ToolCall,
@@ -884,37 +890,37 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         ? toolCall
         : { ...toolCall, name: normalizedName };
 
-      if (normalizedToolCall.name === 'lsp_query') {
+      if (normalizedToolCall.name === 'code_intel_query') {
         return this.lspExecutor.execute(normalizedToolCall);
       }
 
       // process 原语仅在内部调用路径可达，不暴露为模型工具
       switch (normalizedToolCall.name) {
-        case 'launch-process':
+        case 'process_launch':
           return this.standardizeToolResult(
             normalizedToolCall,
             await this.executeLaunchProcessTool(normalizedToolCall, signal),
             'builtin'
           );
-        case 'read-process':
+        case 'process_read':
           return this.standardizeToolResult(
             normalizedToolCall,
             await this.executeReadProcessTool(normalizedToolCall, signal),
             'builtin'
           );
-        case 'write-process':
+        case 'process_write':
           return this.standardizeToolResult(
             normalizedToolCall,
             await this.executeWriteProcessTool(normalizedToolCall),
             'builtin'
           );
-        case 'kill-process':
+        case 'process_kill':
           return this.standardizeToolResult(
             normalizedToolCall,
             await this.executeKillProcessTool(normalizedToolCall),
             'builtin'
           );
-        case 'list-processes':
+        case 'process_list':
           return this.standardizeToolResult(
             normalizedToolCall,
             await this.executeListProcessesTool(normalizedToolCall),
@@ -989,9 +995,9 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       : undefined;
     const parsedStatus = typeof parsed?.status === 'string' ? parsed.status.toLowerCase() : '';
 
-    // read-process 的职责是“读取终端状态/输出”，不是执行业务命令。
+    // process_read 的职责是“读取终端状态/输出”，不是执行业务命令。
     // 只要读取动作本身成功，就不应因被观察进程的失败状态而将工具结果标记为 error。
-    if (toolCall.name === 'read-process' && !raw.isError) {
+    if (toolCall.name === 'process_read' && !raw.isError) {
       return 'success';
     }
 
@@ -1001,9 +1007,9 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     if (content.startsWith('Command rejected:')) {
       return 'rejected';
     }
-    if (content.startsWith('read-process rejected:')
-      || content.startsWith('write-process rejected:')
-      || content.startsWith('kill-process rejected:')) {
+    if (content.startsWith('process_read rejected:')
+      || content.startsWith('process_write rejected:')
+      || content.startsWith('process_kill rejected:')) {
       return 'rejected';
     }
     if (parsedStatus === 'blocked') {
@@ -1111,12 +1117,11 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       case 'file_view':
       case 'file_create':
       case 'file_edit':
-      case 'file_insert':
-      case 'file_bulk_edit': {
+      case 'file_insert': {
         if (name === 'file_edit' || name === 'file_insert') {
           const staleError = this.validateFileContextFreshnessBeforeEdit(toolCall);
           if (staleError) {
-            // 自动刷新而非报错：并发 Worker 场景下，其他 Worker 的 launch-process
+            // 自动刷新而非报错：并发 Worker 场景下，其他 Worker 的 process_launch
             // 会递增全局 epoch 导致当前 Worker 的文件上下文被误判为过期。
             // 此处自动执行一次内部 file_view 刷新 epoch，避免 LLM 处理底层并发竞态。
             const absPath = this.resolveFileToolPath(toolCall, true);
@@ -1134,7 +1139,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         return result;
       }
 
-      case 'grep_search':
+      case 'code_search_regex':
         return await this.searchExecutor.execute(toolCall);
 
       case 'file_remove':
@@ -1147,18 +1152,19 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       case 'mermaid_diagram':
         return await this.mermaidExecutor.execute(toolCall);
 
-      case 'codebase_retrieval':
+      case 'code_search_semantic':
         return await this.codebaseRetrievalExecutor.execute(toolCall, signal);
 
-      case 'dispatch_task':
-      case 'send_worker_message':
-      case 'wait_for_workers':
+      case 'worker_dispatch':
+      case 'worker_send_message':
+      case 'worker_wait':
+      case 'context_compact':
         return await this.orchestrationExecutor.execute(toolCall);
 
-      case 'get_todos':
-      case 'update_todo':
-      case 'split_todo':
-      case 'claim_next_todo': {
+      case 'todo_list':
+      case 'todo_update':
+      case 'todo_split':
+      case 'todo_claim_next': {
         // 编排层 todo 工具需要调用方上下文（标识当前 worker/assignment/todo）
         const execCtx = this.executionContextStorage.getStore();
         const callerContext = execCtx?.workerId
@@ -1167,10 +1173,10 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         return await this.orchestrationExecutor.execute(toolCall, callerContext);
       }
 
-      case 'apply_skill':
+      case 'skill_apply':
         return await this.executeApplySkillTool(toolCall);
 
-      case 'fetch_project_guidelines':
+      case 'project_knowledge_query':
         return await this.knowledgeQueryExecutor.execute(toolCall);
 
       default:
@@ -1183,7 +1189,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   }
 
   /**
-   * 执行 apply_skill 内置工具：按需加载 Instruction Skill 的完整指令内容
+   * 执行 skill_apply 内置工具：按需加载 Instruction Skill 的完整指令内容
    */
   private async executeApplySkillTool(toolCall: ToolCall): Promise<ToolResult> {
     const skillName = toolCall.arguments?.skill_name as string | undefined;
@@ -1223,7 +1229,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       };
     }
 
-    logger.info('apply_skill: loaded instruction skill', {
+    logger.info('skill_apply: loaded instruction skill', {
       skillName,
       contentLength: skill.content.length,
       disableModelInvocation: skill.disableModelInvocation,
@@ -1280,7 +1286,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       toolName === 'file_create'
       || toolName === 'file_edit'
       || toolName === 'file_insert'
-      || toolName === 'file_bulk_edit'
       || toolName === 'file_remove'
     ) {
       if (!this.permissions.allowEdit) {
@@ -1375,8 +1380,8 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       return '';
     }
 
-    const orchestrationToolNames = ['dispatch_task', 'send_worker_message', 'wait_for_workers'];
-    const workerOnlyToolNames = ['split_todo', 'claim_next_todo'];
+    const orchestrationToolNames = ['worker_dispatch', 'worker_send_message', 'worker_wait', 'context_compact'];
+    const workerOnlyToolNames = ['todo_split', 'todo_claim_next'];
     const hideOrchestrationTools = role === 'worker' && excludeOrch;
     const hideWorkerOnlyTools = role === 'orchestrator';
     const builtinTools = tools.filter(t =>
@@ -1393,18 +1398,19 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       'file_edit': { category: 'File Operations', desc: 'Precisely replace text in a file' },
       'file_insert': { category: 'File Operations', desc: 'Insert text at a specific line' },
       'file_remove': { category: 'File Operations', desc: 'Delete a file' },
-      'grep_search': { category: 'File Operations', desc: 'Regex search through code content' },
+      'code_search_regex': { category: 'File Operations', desc: 'Regex search through code content' },
       'shell': { category: 'Terminal Commands', desc: 'Run a shell command with live output streaming in a single tool call' },
       'web_search': { category: 'Web Tools', desc: 'Search the internet for information' },
       'web_fetch': { category: 'Web Tools', desc: 'Fetch URL page content' },
-      'codebase_retrieval': { category: 'Code Intelligence', desc: 'Local semantic search across the codebase' },
+      'code_search_semantic': { category: 'Code Intelligence', desc: 'Local semantic search across the codebase' },
       'mermaid_diagram': { category: 'Visualization', desc: 'Generate Mermaid diagrams' },
-      'split_todo': { category: 'Task Management', desc: 'Split the current task into multiple sub-steps' },
-      'get_todos': { category: 'Task Management', desc: 'View the todo list for the current task' },
-      'update_todo': { category: 'Task Management', desc: 'Update todo status or content' },
-      'apply_skill': { category: 'Code Intelligence', desc: 'Load and apply an installed instruction skill by name' },
-      'fetch_project_guidelines': { category: 'Code Intelligence', desc: 'Fetch ADRs, FAQs, or learnings from the project knowledge base' },
-      'claim_next_todo': { category: 'Task Management', desc: 'Autonomously claim the next available todo from the current mission' },
+      'todo_split': { category: 'Task Management', desc: 'Split the current task into multiple sub-steps' },
+      'todo_list': { category: 'Task Management', desc: 'View the todo list for the current task' },
+      'todo_update': { category: 'Task Management', desc: 'Update todo status or content' },
+      'context_compact': { category: 'Task Management', desc: 'Manually compact and archive current session context' },
+      'skill_apply': { category: 'Code Intelligence', desc: 'Load and apply an installed instruction skill by name' },
+      'project_knowledge_query': { category: 'Code Intelligence', desc: 'Fetch ADRs, FAQs, or learnings from the project knowledge base' },
+      'todo_claim_next': { category: 'Task Management', desc: 'Autonomously claim the next context-affine todo from the current mission' },
     };
 
     // 编排者专用的附加说明
@@ -1467,7 +1473,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     if (instructionSkills.length > 0) {
       lines.push('');
       lines.push('Installed Skill Instructions (user-installed capability enhancements):');
-      lines.push('When the user task scenario matches an [auto] skill, call apply_skill(skill_name) to load its instructions.');
+      lines.push('When the user task scenario matches an [auto] skill, call skill_apply(skill_name) to load its instructions.');
       lines.push('[manual] skills are only activated when the user explicitly triggers them via /skill-name.');
       for (const skill of instructionSkills) {
         const type = skill.disableModelInvocation ? 'manual' : 'auto';
@@ -1505,7 +1511,7 @@ Tool selection guidance:
 - Single-file precise edits: prefer file_edit/file_insert.
 - Batch/repetitive multi-file edits: shell is allowed.
 - Read files/directories: use file_view, not cat/ls/find.
-- Search code: use grep_search or codebase_retrieval.
+- Search code: use code_search_regex or code_search_semantic.
 
 Only set may_modify_files=true when the command directly writes source files.`,
         input_schema: {
@@ -1543,7 +1549,7 @@ Only set may_modify_files=true when the command directly writes source files.`,
     // 6. 文件操作工具 (file_view, file_create, file_edit, file_insert)
     tools.push(...this.fileExecutor.getToolDefinitions());
 
-    // 7. grep_search (代码搜索)
+    // 7. code_search_regex (代码搜索)
     tools.push(this.searchExecutor.getToolDefinition());
 
     // 8. file_remove (文件删除)
@@ -1555,15 +1561,15 @@ Only set may_modify_files=true when the command directly writes source files.`,
     // 11. mermaid_diagram (Mermaid 图表)
     tools.push(this.mermaidExecutor.getToolDefinition());
 
-    // 12. codebase_retrieval (本地代码检索基础设施)
+    // 12. code_search_semantic (本地代码检索基础设施)
     tools.push(this.codebaseRetrievalExecutor.getToolDefinition());
 
-    // 13-15. 编排工具 (dispatch_task, send_worker_message, wait_for_workers)
+    // 13-15. 编排工具 (worker_dispatch, worker_send_message, worker_wait)
     tools.push(...this.orchestrationExecutor.getToolDefinitions());
 
-    // 16. apply_skill（按需加载 Instruction Skill 指令）
+    // 16. skill_apply（按需加载 Instruction Skill 指令）
     tools.push({
-      name: 'apply_skill',
+      name: 'skill_apply',
       description: 'Load and apply an installed instruction skill. Call this when the user\'s task matches a skill scenario listed in Installed Skill Instructions.',
       input_schema: {
         type: 'object',
@@ -1582,7 +1588,7 @@ Only set may_modify_files=true when the command directly writes source files.`,
       },
     });
 
-    // 17. fetch_project_guidelines（按需拉取项目知识库）
+    // 17. project_knowledge_query（按需拉取项目知识库）
     tools.push(this.knowledgeQueryExecutor.getToolDefinition());
 
     return tools;
@@ -1830,7 +1836,7 @@ Only set may_modify_files=true when the command directly writes source files.`,
     return resolved.terminalName;
   }
 
-  private resolveTerminalOwnershipError(action: 'read-process' | 'write-process' | 'kill-process', terminalId: number): string | null {
+  private resolveTerminalOwnershipError(action: 'process_read' | 'process_write' | 'process_kill', terminalId: number): string | null {
     const owner = this.terminalOwnershipById.get(terminalId);
     if (!owner) {
       return null;
@@ -2039,7 +2045,7 @@ Only set may_modify_files=true when the command directly writes source files.`,
   private async executeShellTool(toolCall: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     const launchCall: ToolCall = {
       ...toolCall,
-      name: 'launch-process',
+      name: 'process_launch',
     };
     return this.executeLaunchProcessTool(launchCall, signal);
   }
@@ -2141,7 +2147,7 @@ Only set may_modify_files=true when the command directly writes source files.`,
     }
 
     const resolvedCwd = cwdResolution.absolutePath;
-    logger.debug('launch-process cwd resolved', {
+    logger.debug('process_launch cwd resolved', {
       rawCwd,
       normalizedCwd: normalized.cwd,
       resolvedCwd,
@@ -2156,14 +2162,14 @@ Only set may_modify_files=true when the command directly writes source files.`,
       ? rawRunMode
       : (wait && !inferredServiceMode ? 'task' : 'service');
     if (inferredServiceMode) {
-      logger.info('launch-process 自动推断为 service 模式（长驻命令）', {
+      logger.info('process_launch 自动推断为 service 模式（长驻命令）', {
         command: normalized.command,
       }, LogCategory.TOOLS);
     }
     // 终端命令执行前等待文件写锁释放，避免读到未落盘的改动
     await this.fileMutex.waitForAll();
 
-    // task 模式统一快返，由适配器通过 read-process 自动轮询推送增量输出
+    // task 模式统一快返，由适配器通过 process_read 自动轮询推送增量输出
     const effectiveWait = runMode === 'service' ? wait : false;
     const result = await this.terminalExecutor.launchProcess({
       command: normalized.command,
@@ -2189,14 +2195,14 @@ Only set may_modify_files=true when the command directly writes source files.`,
     const readOnlyCommand = this.isLikelyReadOnlyCommand(normalized.command);
     const likelyMutatesFiles = !readOnlyCommand && (explicitMayModify || heuristicMayModify || scriptDrivenMayModify);
     if (likelyMutatesFiles) {
-      this.markWorkspacePossiblyMutated('launch-process', normalized.command);
+      this.markWorkspacePossiblyMutated('process_launch', normalized.command);
       if (scriptDrivenMayModify && !explicitMayModify && !heuristicMayModify) {
-        logger.info('launch-process script-driven mutation detected by fallback heuristic', {
+        logger.info('process_launch script-driven mutation detected by fallback heuristic', {
           command: normalized.command,
         }, LogCategory.TOOLS);
       }
     } else if (explicitMayModify && readOnlyCommand) {
-      logger.info('launch-process may_modify_files=true ignored for read-only command', {
+      logger.info('process_launch may_modify_files=true ignored for read-only command', {
         command: normalized.command,
       }, LogCategory.TOOLS);
     }
@@ -2215,14 +2221,14 @@ Only set may_modify_files=true when the command directly writes source files.`,
     if (terminal_id === undefined || typeof terminal_id !== 'number') {
       return {
         toolCallId: toolCall.id,
-        content: 'read-process rejected: terminal_id parameter missing or type error, must be a number',
+        content: 'process_read rejected: terminal_id parameter missing or type error, must be a number',
         isError: true,
       };
     }
     if (args.wait !== undefined && typeof args.wait !== 'boolean') {
       return {
         toolCallId: toolCall.id,
-        content: 'read-process rejected: wait parameter type error, must be a boolean',
+        content: 'process_read rejected: wait parameter type error, must be a boolean',
         isError: true,
       };
     }
@@ -2232,18 +2238,18 @@ Only set may_modify_files=true when the command directly writes source files.`,
     ) {
       return {
         toolCallId: toolCall.id,
-        content: 'read-process rejected: max_wait_seconds parameter type error, must be a number',
+        content: 'process_read rejected: max_wait_seconds parameter type error, must be a number',
         isError: true,
       };
     }
     if (from_cursor !== undefined && (!Number.isInteger(from_cursor) || from_cursor < 0)) {
       return {
         toolCallId: toolCall.id,
-        content: 'read-process rejected: from_cursor parameter type error, must be an integer >= 0',
+        content: 'process_read rejected: from_cursor parameter type error, must be an integer >= 0',
         isError: true,
       };
     }
-    const ownershipError = this.resolveTerminalOwnershipError('read-process', terminal_id);
+    const ownershipError = this.resolveTerminalOwnershipError('process_read', terminal_id);
     if (ownershipError) {
       return {
         toolCallId: toolCall.id,
@@ -2259,7 +2265,7 @@ Only set may_modify_files=true when the command directly writes source files.`,
     return {
       toolCallId: toolCall.id,
       content: JSON.stringify(result),
-      // read-process 成功返回了读取结果，不因被观察进程状态而将本次工具调用判错。
+      // process_read 成功返回了读取结果，不因被观察进程状态而将本次工具调用判错。
       isError: false,
     };
   }
@@ -2271,18 +2277,18 @@ Only set may_modify_files=true when the command directly writes source files.`,
     if (terminal_id === undefined || typeof terminal_id !== 'number') {
       return {
         toolCallId: toolCall.id,
-        content: 'write-process rejected: terminal_id parameter missing or type error, must be a number',
+        content: 'process_write rejected: terminal_id parameter missing or type error, must be a number',
         isError: true,
       };
     }
     if (input_text === undefined || typeof input_text !== 'string') {
       return {
         toolCallId: toolCall.id,
-        content: 'write-process rejected: input_text parameter missing or type error, must be a string',
+        content: 'process_write rejected: input_text parameter missing or type error, must be a string',
         isError: true,
       };
     }
-    const ownershipError = this.resolveTerminalOwnershipError('write-process', terminal_id);
+    const ownershipError = this.resolveTerminalOwnershipError('process_write', terminal_id);
     if (ownershipError) {
       return {
         toolCallId: toolCall.id,
@@ -2306,11 +2312,11 @@ Only set may_modify_files=true when the command directly writes source files.`,
     if (terminal_id === undefined || typeof terminal_id !== 'number') {
       return {
         toolCallId: toolCall.id,
-        content: 'kill-process rejected: terminal_id parameter missing or type error, must be a number',
+        content: 'process_kill rejected: terminal_id parameter missing or type error, must be a number',
         isError: true,
       };
     }
-    const ownershipError = this.resolveTerminalOwnershipError('kill-process', terminal_id);
+    const ownershipError = this.resolveTerminalOwnershipError('process_kill', terminal_id);
     if (ownershipError) {
       return {
         toolCallId: toolCall.id,

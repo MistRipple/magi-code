@@ -81,6 +81,27 @@ export interface ToolResult {
   fileChange?: FileChangeMetadata;
 }
 
+/**
+ * 决策点回调事件
+ *
+ * 用于在 Worker LLM 循环的关键节点向上层注入轻量治理信号。
+ * 事件应保持“单轮可解释”，避免把复杂运行态直接耦合进 Prompt 层。
+ */
+export interface DecisionHookEvent {
+  type: 'thinking' | 'tool_call' | 'tool_result';
+  toolName?: string;
+  toolArgs?: any;
+  toolResult?: string;
+  /** 当前工具轮涉及的工具名（仅 tool_result 事件） */
+  toolNames?: string[];
+  /** 当前工具轮是否全部为只读工具（仅 tool_result 事件） */
+  allReadOnly?: boolean;
+  /** 当前工具轮是否包含写/执行类推进动作（仅 tool_result 事件） */
+  hadWriteTool?: boolean;
+  /** 当前工具轮是否仍未产出实质文本（仅 tool_result 事件） */
+  noSubstantiveOutput?: boolean;
+}
+
 // ============================================================================
 // LLM 消息相关类型
 // ============================================================================

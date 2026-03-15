@@ -280,19 +280,20 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
    */
   private static readonly DEEP_MODE_ALLOWED_TOOLS = new Set([
     // 编排工具（核心）
-    'dispatch_task',
-    'send_worker_message',
-    'wait_for_workers',
+    'worker_dispatch',
+    'worker_send_message',
+    'worker_wait',
+    'context_compact',
     // 只读分析工具（辅助规划）
     'file_view',
-    'grep_search',
-    'codebase_retrieval',
+    'code_search_regex',
+    'code_search_semantic',
     'web_search',
     'web_fetch',
     'shell',
     // 任务管理工具
-    'get_todos',
-    'update_todo',
+    'todo_list',
+    'todo_update',
   ]);
 
   private systemPrompt: string;
@@ -759,7 +760,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
    * Micro-Compact：压缩旧轮次的 tool_result
    *
    * 对超过 preserveRecentRounds 之前的消息，将大型 tool_result
-   * （尤其是 wait_for_workers 返回）折叠为简短占位符。
+   * （尤其是 worker_wait 返回）折叠为简短占位符。
    * 在截断丢弃之前执行，显著缩减 token 消耗并保留语义指针。
    */
   private compactOldToolResults(): void {
@@ -824,23 +825,23 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
 
   /**
    * 压缩单个 tool_result 的内容
-   * 识别 wait_for_workers / dispatch_task 的 JSON 返回并提取关键信息
+   * 识别 worker_wait / worker_dispatch 的 JSON 返回并提取关键信息
    */
   private compactToolResultContent(content: string): string | null {
-    // 尝试解析为 wait_for_workers 结果
+    // 尝试解析为 worker_wait 结果
     try {
       const parsed = JSON.parse(content);
 
-      // wait_for_workers 结果：包含 results 数组和 wait_status
+      // worker_wait 结果：包含 results 数组和 wait_status
       if (parsed.results && Array.isArray(parsed.results) && 'wait_status' in parsed) {
         return this.compactWaitForWorkersResult(parsed);
       }
 
-      // dispatch_task 结果：包含 task_id 和 worker
+      // worker_dispatch 结果：包含 task_id 和 worker
       if (parsed.task_id && parsed.worker) {
-        // dispatch_task 结果通常较短，但如果有大量上下文也压缩
+        // worker_dispatch 结果通常较短，但如果有大量上下文也压缩
         if (content.length > 800) {
-          return `[已折叠: dispatch_task 结果] task_id=${parsed.task_id}, worker=${parsed.worker}, status=${parsed.status || 'dispatched'}`;
+          return `[已折叠: worker_dispatch 结果] task_id=${parsed.task_id}, worker=${parsed.worker}, status=${parsed.status || 'dispatched'}`;
         }
         return null; // 不需要压缩
       }
@@ -859,12 +860,12 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   }
 
   /**
-   * 压缩 wait_for_workers 返回结果
+   * 压缩 worker_wait 返回结果
    * 保留：任务 ID、Worker、状态、修改文件列表
    * 移除：完整 summary 文本、详细 audit 内容
    */
   private compactWaitForWorkersResult(result: any): string {
-    const lines: string[] = ['[已折叠: wait_for_workers 历史结果，关键信息已提取至 PlanLedger]'];
+    const lines: string[] = ['[已折叠: worker_wait 历史结果，关键信息已提取至 PlanLedger]'];
 
     lines.push(`wait_status: ${result.wait_status}`);
     if (result.timed_out) {
@@ -1010,7 +1011,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     // 添加用户消息到历史
     history.push(this.buildUserMessage(message, images));
 
-    const ORCHESTRATOR_HIDDEN_TOOLS = ['split_todo'];
+    const ORCHESTRATOR_HIDDEN_TOOLS = ['todo_split'];
     const allTools = await this.toolManager.getTools();
     const toolDefinitions = allTools
       .filter(tool => {
@@ -1867,7 +1868,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     if (snapshot.requiredTotal === 0) {
       return [
         '[System] 当前尚未建立 required todos，请先创建/推进任务再判断终止。',
-        '- 建议优先 dispatch_task 创建可执行子任务，或使用 update_todo 明确 required 项。',
+        '- 建议优先 worker_dispatch 创建可执行子任务，或使用 todo_update 明确 required 项。',
       ].join('\n');
     }
     const remain = Math.max(0, snapshot.requiredTotal - p.terminalRequiredTodos);
@@ -1953,7 +1954,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       `[System] 你已在未建立 Todo 轨道下连续执行 ${noTodoToolRoundStreak} 轮工具调用（重复模式 ${repeatedSignatureStreak} 轮）。`,
       '- 下一轮已强制禁用工具，请直接二选一：',
       '  1) 给出最终结论与证据；',
-      '  2) 立即调用 dispatch_task / update_todo 建立 required todo 轨道后再继续。',
+      '  2) 立即调用 worker_dispatch / todo_update 建立 required todo 轨道后再继续。',
       '- 不要继续重复检索。',
     ].join('\n');
   }
@@ -2146,8 +2147,8 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         return [];
       }
       const toolCall: ToolCall = {
-        id: `internal_get_todos_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        name: 'get_todos',
+        id: `internal_todo_list_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        name: 'todo_list',
         arguments: { mission_id: scopedMissionId },
       };
       const result = await this.toolManager.execute(
@@ -2454,7 +2455,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
    * 编排者工具调用限制检查（第二道防线）
    *
    * 深度模式：内置工具必须在白名单内，否则拒绝（用 BUILTIN_TOOL_NAMES 明确判断来源）。
-   * 常规模式：文件写入超限时拒绝并引导 dispatch_task。
+   * 常规模式：文件写入超限时拒绝并引导 worker_dispatch。
    *
    * 返回 null 表示允许，返回字符串表示拒绝原因。
    */
@@ -2465,7 +2466,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     if (this.deepTask
       && (BUILTIN_TOOL_NAMES as readonly string[]).includes(name)
       && !OrchestratorLLMAdapter.DEEP_MODE_ALLOWED_TOOLS.has(name)) {
-      return `深度模式下编排者不可直接执行 ${name}，请通过 dispatch_task 委派给 Worker。`;
+      return `深度模式下编排者不可直接执行 ${name}，请通过 worker_dispatch 委派给 Worker。`;
     }
 
     // 常规模式：文件写入数量限制
@@ -2473,7 +2474,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       const filePath = (args?.path || args?.file_path || '') as string;
       this.editedFiles.add(filePath);
       if (this.editedFiles.size > OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES) {
-        return `编排者已修改 ${this.editedFiles.size} 个文件（超过 ${OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES} 个），请通过 dispatch_task 委派给 Worker。`;
+        return `编排者已修改 ${this.editedFiles.size} 个文件（超过 ${OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES} 个），请通过 worker_dispatch 委派给 Worker。`;
       }
     }
 

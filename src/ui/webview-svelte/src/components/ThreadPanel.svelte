@@ -8,6 +8,7 @@
   import InputArea from './InputArea.svelte';
   import BottomTabs from './BottomTabs.svelte';
   import AgentTab from './AgentTab.svelte';
+  import RuntimeDiagnosticsPanel from './RuntimeDiagnosticsPanel.svelte';
   import { ensureArray } from '../lib/utils';
 
   interface Props {
@@ -34,9 +35,11 @@
       gemini: ensureArray(outputs?.gemini) as Message[],
     };
   });
+  const runtimeDiagnostics = $derived(messagesState.orchestratorRuntimeDiagnostics);
 </script>
 
 <div class="thread-panel">
+  <RuntimeDiagnosticsPanel diagnostics={runtimeDiagnostics} />
   <!-- 消息内容区域：四个面板同时存在，CSS 控制显隐 -->
   <!-- 每个 Worker 拥有独立的 MessageList 实例和计时器状态 -->
   <div class="main-content">

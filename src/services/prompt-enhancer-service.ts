@@ -110,7 +110,7 @@ export class PromptEnhancerService {
 
   /**
    * 收集代码上下文
-   * 统一通过 codebase_retrieval 获取（本地检索基础设施）
+   * 统一通过 code_search_semantic 获取（本地检索基础设施）
    */
   private async collectCodeContext(projectRoot: string, prompt: string): Promise<string> {
     const contextParts: string[] = [];
@@ -118,12 +118,12 @@ export class PromptEnhancerService {
     let currentLength = 0;
 
     try {
-      // 1. 通过 codebase_retrieval 获取代码上下文
+      // 1. 通过 code_search_semantic 获取代码上下文
       const toolManager = this.deps.getToolManager();
       if (toolManager) {
         const toolCall = {
           id: `enhance-retrieval-${Date.now()}`,
-          name: 'codebase_retrieval',
+          name: 'code_search_semantic',
           arguments: {
             query: prompt,
             ensure_indexed: false,

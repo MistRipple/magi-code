@@ -11,12 +11,13 @@ import {
   LLMMessageParams,
   LLMMessage,
   ToolCall,
+  DecisionHookEvent,
   isSummaryHijackText,
   sanitizeSummaryHijackMessages,
   sanitizeToolOrder,
 } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
-import { ToolManager } from '../../tools/tool-manager';
+import { ToolManager, type ToolExecutionContext } from '../../tools/tool-manager';
 import { MessageHub } from '../../orchestrator/core/message-hub';
 import { BaseLLMAdapter, AdapterState } from './base-adapter';
 import { logger, LogCategory } from '../../logging';
@@ -185,21 +186,20 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   private static readonly READ_ONLY_DEDUP_TTL_MS = 10 * 60 * 1000;
   private static readonly READ_ONLY_TOOL_NAMES = new Set<string>([
     'file_view',
-    'grep_search',
+    'code_search_regex',
     'web_search',
     'web_fetch',
     'mermaid_diagram',
-    'codebase_retrieval',
-    'read-process',
-    'list-processes',
-    'get_todos',
+    'code_search_semantic',
+    'process_read',
+    'process_list',
+    'todo_list',
   ]);
   private static readonly WRITE_DEDUP_TOOL_NAMES = new Set<string>([
     'shell',
     'file_create',
     'file_edit',
     'file_insert',
-    'file_bulk_edit',
     'file_remove',
   ]);
   /** 只读工具调用去重缓存（参数指纹） */
@@ -370,7 +370,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     }
 
     // 获取工具定义（Worker 过滤掉编排者专用调度工具）
-    const ORCHESTRATION_TOOLS = ['dispatch_task', 'send_worker_message', 'wait_for_workers'];
+    const ORCHESTRATION_TOOLS = ['worker_dispatch', 'worker_send_message', 'worker_wait', 'context_compact'];
     const tools = await this.toolManager.getTools();
     const toolDefinitions = tools
       .filter((tool) => !ORCHESTRATION_TOOLS.includes(tool.name))
@@ -576,7 +576,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
           this.roundDedupHits = 0;
           this.roundWriteInterceptCount = 0;
-          const toolResults = await this.executeToolCalls(toolCalls);
+          const toolExecutionContext = this.getWorkerToolExecutionContext();
+          const toolResults = await this.executeToolCalls(toolCalls, toolExecutionContext);
 
           // 中断检查：工具执行完成后立即检测 abort，跳过后续处理直接退出循环
           if (this.abortController?.signal.aborted) {
@@ -589,7 +590,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
             toolCalls,
             toolResults,
             preAnnouncedToolCallIds,
-            executionContext: { workerId: this.workerSlot, role: 'worker' },
+            executionContext: toolExecutionContext,
             signal: this.abortController?.signal,
           });
 
@@ -651,10 +652,12 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
             consecutiveFailures = 0;
           }
 
+          const allReadOnlyRound = toolCalls.length > 0 && toolCalls.every(tc => this.isReadOnlyToolCall(tc));
+          const hadWriteToolRound = toolCalls.some(tc => !this.isReadOnlyToolCall(tc));
+
           // 智能空转检测：基于空转分数区分"有目的的代码探索"和"无意义的搜索循环"
           if (!allFailed) {
-            const allReadOnly = toolCalls.every(tc => this.isReadOnlyToolCall(tc));
-            if (allReadOnly) {
+            if (allReadOnlyRound) {
               readOnlyConsecutiveRounds++;
 
               // 提取本轮访问的文件路径，用于计算探索度
@@ -763,7 +766,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           // 无实质文本输出检测：Worker 不断调用工具但不给用户产出可见内容
           // （与只读空转检测互补，覆盖 execute+search 混合循环的场景）
           const SUBSTANTIVE_TEXT_THRESHOLD = 20;
-          if (accumulatedText.trim().length < SUBSTANTIVE_TEXT_THRESHOLD) {
+          const noSubstantiveOutputRound = accumulatedText.trim().length < SUBSTANTIVE_TEXT_THRESHOLD;
+          if (noSubstantiveOutputRound) {
             noSubstantiveOutputRounds++;
 
             if (noSubstantiveOutputRounds >= sc.noOutputAbort && lastNoOutputWarnLevel < 3) {
@@ -795,7 +799,13 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
             lastNoOutputWarnLevel = 0;
           }
 
-          this.applyDecisionHook({ type: 'tool_result' });
+          this.applyDecisionHook({
+            type: 'tool_result',
+            toolNames: toolCalls.map((toolCall) => toolCall.name),
+            allReadOnly: allReadOnlyRound,
+            hadWriteTool: hadWriteToolRound,
+            noSubstantiveOutput: noSubstantiveOutputRound,
+          });
 
           // 当轮 stream 结束，下一轮开启新 stream
           this.normalizer.endStream(streamId);
@@ -904,6 +914,15 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     logger.debug(`${this.agent} system prompt updated`, undefined, LogCategory.LLM);
   }
 
+  /**
+   * 注入决策点补充指令回调（按请求粒度由 AdapterFactory 设置）
+   */
+  setDecisionHook(
+    decisionHook: ((event: DecisionHookEvent) => string[]) | undefined,
+  ): void {
+    this.decisionHook = decisionHook;
+  }
+
   private buildRoundStreamRecoveryPrompt(input: {
     hasAccumulatedText: boolean;
     interruptedAfterToolSignal: boolean;
@@ -953,7 +972,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   /**
    * 决策点补充指令注入
    */
-  private applyDecisionHook(event: { type: 'thinking' | 'tool_call' | 'tool_result'; toolName?: string; toolArgs?: any; toolResult?: string }): void {
+  private applyDecisionHook(event: DecisionHookEvent): void {
     if (!this.decisionHook) {
       return;
     }
@@ -961,7 +980,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     if (instructions.length === 0) {
       return;
     }
-    const content = `[System] 用户补充指令：\n${instructions.map(i => `- ${i}`).join('\n')}`;
+    const content = `[System] 用户补充指令：\n${instructions.map((i: string) => `- ${i}`).join('\n')}`;
     this.conversationHistory.push({
       role: 'user',
       content,
@@ -969,9 +988,21 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   }
 
   /**
-   * 执行工具调用
+   * 统一工具执行上下文入口（含 worktreePath）。
+   * ⚠️ 产品级约束：后续新增写工具或执行入口必须复用该 executionContext，
+   * 禁止绕过为默认 cwd 或自行设置路径（禁止旁路）。
    */
-  private async executeToolCalls(toolCalls: ToolCall[]) {
+  private getWorkerToolExecutionContext(): ToolExecutionContext {
+    return this.resolveToolExecutionContext({
+      workerId: this.workerSlot,
+      role: 'worker',
+    });
+  }
+
+  private async executeToolCalls(
+    toolCalls: ToolCall[],
+    executionContext: ToolExecutionContext,
+  ) {
     const results = [];
     const maxToolResultChars = 20000;
     const toolSourceMap = await this.buildToolSourceMap();
@@ -1062,7 +1093,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         const rawResult = await this.toolManager.execute(
           toolCall,
           this.abortController?.signal,
-          { workerId: this.workerSlot, role: 'worker' },
+          executionContext,
         );
         this.truncateToolResultContent(toolCall, rawResult, maxToolResultChars);
         const result = this.ensureStandardizedToolResult(toolCall, rawResult, toolSourceMap);
@@ -1240,7 +1271,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   /**
    * Micro-Compact：压缩旧轮次的 tool_result
    *
-   * Worker 的对话历史中 file_view、grep_search 等工具返回的内容
+   * Worker 的对话历史中 file_view、code_search_regex 等工具返回的内容
    * 在旧轮次中不再需要完整保留，折叠为简短摘要即可。
    */
   private compactOldToolResults(): void {
@@ -1396,8 +1427,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    *
    * 提取逻辑：
    * - file_view → arguments.path
-   * - grep_search → arguments.path（搜索路径）
-   * - codebase_retrieval → arguments.query（搜索关键词作为伪路径）
+   * - code_search_regex → arguments.path（搜索路径）
+   * - code_search_semantic → arguments.query（搜索关键词作为伪路径）
    * - MCP 工具 → 尝试从 arguments 中提取 path/file/filepath 等字段
    */
   private extractAccessedPaths(toolCalls: ToolCall[]): string[] {
@@ -1410,7 +1441,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         paths.push(path.trim());
         continue;
       }
-      // codebase_retrieval 等搜索工具：用 query 作为伪路径标识
+      // code_search_semantic 等搜索工具：用 query 作为伪路径标识
       const query = args.query || args.pattern || args.search;
       if (typeof query === 'string' && query.trim()) {
         paths.push(`__query:${query.trim()}`);
@@ -1633,7 +1664,6 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     if (toolCall.name === 'file_edit'
       || toolCall.name === 'file_create'
       || toolCall.name === 'file_insert'
-      || toolCall.name === 'file_bulk_edit'
       || toolCall.name === 'file_remove') {
       return this.buildContentAwareWriteKey(toolCall);
     }

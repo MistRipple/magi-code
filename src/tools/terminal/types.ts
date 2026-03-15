@@ -23,7 +23,7 @@ export type ProcessState =
 /**
  * 终端进程信息
  *
- * 纯命令执行模型：每次 launch-process 启动一个独立子进程（spawn），
+ * 纯命令执行模型：每次 process_launch 启动一个独立子进程（spawn），
  * 通过 stdout/stderr pipe 捕获输出，不依赖交互式 shell 或 PTY。
  */
 export interface TerminalProcess {

@@ -2,7 +2,7 @@
  * 搜索执行器
  * 提供代码搜索功能
  *
- * 工具: grep_search
+ * 工具: code_search_regex
  */
 
 import * as fs from 'fs/promises';
@@ -46,7 +46,7 @@ export class SearchExecutor implements ToolExecutor {
    */
   getToolDefinition(): ExtendedToolDefinition {
     return {
-      name: 'grep_search',
+      name: 'code_search_regex',
       description: 'Search for text or regex in the codebase. Returns matching files, line numbers, and surrounding context. Respects .gitignore by default.',
       input_schema: {
         type: 'object',
@@ -97,7 +97,7 @@ export class SearchExecutor implements ToolExecutor {
    * 检查工具是否可用
    */
   async isAvailable(toolName: string): Promise<boolean> {
-    return toolName === 'grep_search';
+    return toolName === 'code_search_regex';
   }
 
   /**
