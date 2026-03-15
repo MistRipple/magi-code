@@ -307,7 +307,9 @@ export class WorkerPipeline {
               assignmentId: assignment.id,
               conflictFiles: worktreeMerge.conflictFiles,
             }, LogCategory.ORCHESTRATOR);
-            // 将冲突信息注入执行结果
+            // 合并冲突意味着 Worker 的变更无法安全地合入主工作区，
+            // 必须将任务标记为失败，否则下游 batch/card 终态会误判为成功
+            result.success = false;
             if (!result.errors) { result.errors = []; }
             result.errors.push(t('pipeline.errors.worktreeMergeConflict', {
               files: worktreeMerge.conflictFiles.join(', '),

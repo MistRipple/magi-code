@@ -124,6 +124,9 @@ export interface DispatchManagerDeps {
   recordWorkerTokenUsage: (results: Map<string, import('../worker').AutonomousExecutionResult>) => void;
   // 补充指令队列（反应式编排：运行时注入 Worker 指令）
   getSupplementaryQueue: () => SupplementaryInstructionQueue | null;
+  // Plan Ledger runtime 状态更新
+  getPlanLedger: () => import('../plan-ledger/plan-ledger-service').PlanLedgerService | null;
+  getCurrentPlanId: () => string | null;
   // Plan Ledger 回写（dispatch 注册时落账）
   onDispatchTaskRegistered?: (payload: {
     sessionId: string;
@@ -152,7 +155,8 @@ export class DispatchManager {
   };
   private static readonly RUNTIME_UNAVAILABLE_COOLDOWN_MS = 60_000;
   private static readonly MAX_MISSION_SESSION_RECORDS = 100;
-  private static readonly ACK_TIMEOUT_MS = 60_000;
+  // ACK 采用 fail-fast 策略：超时后立即回收任务并回传编排层，避免 Worker 接单阶段长时间僵持。
+  private static readonly ACK_TIMEOUT_MS = 20_000;
   private static readonly HEARTBEAT_INTERVAL_MS = 10_000;
   private static readonly LEASE_TTL_MS = 120_000;
   private static readonly LEASE_WATCH_INTERVAL_MS = 2_000;
@@ -811,7 +815,44 @@ export class DispatchManager {
           taskIds: params.task_ids || 'all',
         }, LogCategory.ORCHESTRATOR);
 
-        return this.waitForWorkers(params.task_ids);
+        // 推进 runtime.wait → external_waiting
+        const sessionId = this.deps.getCurrentSessionId()?.trim();
+        const planId = this.deps.getCurrentPlanId();
+        const planLedger = this.deps.getPlanLedger();
+        if (sessionId && planId && planLedger) {
+          try {
+            await planLedger.updateRuntimeState(sessionId, planId, {
+              wait: { state: 'external_waiting', reasonCode: 'wait_for_workers' },
+            });
+          } catch (error) {
+            logger.warn('Dispatch.PlanRuntime.wait状态更新失败', {
+              sessionId,
+              planId,
+              state: 'external_waiting',
+              error: error instanceof Error ? error.message : String(error),
+            }, LogCategory.ORCHESTRATOR);
+          }
+        }
+
+        const result = await this.waitForWorkers(params.task_ids);
+
+        // 等待结束 → runtime.wait = none
+        if (sessionId && planId && planLedger) {
+          try {
+            await planLedger.updateRuntimeState(sessionId, planId, {
+              wait: { state: 'none' },
+            });
+          } catch (error) {
+            logger.warn('Dispatch.PlanRuntime.wait状态更新失败', {
+              sessionId,
+              planId,
+              state: 'none',
+              error: error instanceof Error ? error.message : String(error),
+            }, LogCategory.ORCHESTRATOR);
+          }
+        }
+
+        return result;
       },
 
       splitTodo: async (params) => {

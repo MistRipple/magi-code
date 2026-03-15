@@ -111,6 +111,14 @@ export interface PlanRuntimeTerminationState {
   updatedAt?: number;
 }
 
+/**
+ * 执行计划的细粒度运行态（三层状态架构的第 2 层）
+ *
+ * 与 Mission.status（宏观阶段）互补，记录执行过程中的微观状态。
+ * 由 PlanLedgerService.updateRuntimeState() 在关键链路推进。
+ *
+ * @see mission/types.ts 中的「三层状态架构说明」
+ */
 export interface PlanRuntimeState {
   acceptance: PlanRuntimeAcceptance;
   review: PlanRuntimeReviewState;

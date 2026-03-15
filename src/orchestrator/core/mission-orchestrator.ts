@@ -322,6 +322,11 @@ export class MissionOrchestrator extends EventEmitter {
    * 销毁编排器（清理资源）
    */
   dispose(): void {
+    if (this.todoManager) {
+      this.todoManager.destroy();
+      this.todoManager = undefined;
+    }
+    this.todoManagerInitPromise = undefined;
     for (const worker of this.workers.values()) {
       worker.dispose();
     }

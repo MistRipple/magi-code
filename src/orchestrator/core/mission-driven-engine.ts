@@ -355,6 +355,8 @@ export class MissionDrivenEngine extends EventEmitter {
       getContextManager: () => this.contextManager ?? null,
       getTodoManager: () => this.missionOrchestrator.getTodoManager() ?? null,
       getSupplementaryQueue: () => this.supplementaryQueue,
+      getPlanLedger: () => this.planLedger ?? null,
+      getCurrentPlanId: () => this.currentPlanId ?? null,
       onDispatchTaskRegistered: (payload) => this.handleDispatchTaskRegistered(payload),
     });
 
@@ -1717,6 +1719,9 @@ export class MissionDrivenEngine extends EventEmitter {
         try {
           governanceAssessment = await this.evaluatePlanGovernance(resolvedSessionId, draftPlan, trimmedPrompt);
         } catch (error) {
+          // 【错误边界】治理评估依赖外部模型调用，异常时降级到安全侧默认值（人工确认）。
+          // 这不是"兼容性回退"——治理评估失败不应阻塞整个任务流程，
+          // 而应降级到最安全的策略（要求人工确认），确保用户有机会审查计划。
           logger.warn('编排器.治理评估.降级到人工确认', {
             sessionId: resolvedSessionId,
             planId: draftPlan.planId,
@@ -1996,9 +2001,53 @@ export class MissionDrivenEngine extends EventEmitter {
           }
 
           if (currentBatch) {
+            const planIdForRuntime = this.currentPlanId;
+            const planForRuntime = planIdForRuntime
+              ? this.planLedger.getPlan(resolvedSessionId, planIdForRuntime)
+              : null;
+            const reviewRoundForRuntime = Math.max(1, (planForRuntime?.runtime.review.round || 0) + 1);
+            const acceptanceCriteriaForRuntime = planForRuntime?.runtime.acceptance.criteria;
+
+            // Phase transition: executing → reviewing
+            if (this.lastMissionId) {
+              try {
+                await this.missionStorage.transitionStatus(this.lastMissionId, 'reviewing');
+              } catch (error) {
+                logger.warn('编排器.Mission.状态迁移失败', {
+                  missionId: this.lastMissionId,
+                  from: 'executing',
+                  to: 'reviewing',
+                  error: error instanceof Error ? error.message : String(error),
+                }, LogCategory.ORCHESTRATOR);
+              }
+            }
+            if (planIdForRuntime) {
+              try {
+                await this.planLedger.updateRuntimeState(resolvedSessionId, planIdForRuntime, {
+                  review: { state: 'running', round: reviewRoundForRuntime },
+                });
+              } catch (error) {
+                logger.warn('编排器.PlanRuntime.评审状态推进失败', {
+                  sessionId: resolvedSessionId,
+                  planId: planIdForRuntime,
+                  state: 'running',
+                  round: reviewRoundForRuntime,
+                  error: error instanceof Error ? error.message : String(error),
+                }, LogCategory.ORCHESTRATOR);
+              }
+            }
+
             let outcome: DeliveryVerificationOutcome;
             try {
-              outcome = await runPostDispatchVerification(currentBatch, this.verificationRunner, this.messageHub);
+              outcome = await runPostDispatchVerification(
+                currentBatch,
+                this.verificationRunner,
+                this.messageHub,
+                {
+                  workspaceRoot: this.workspaceRoot,
+                  acceptanceCriteria: acceptanceCriteriaForRuntime,
+                },
+              );
             } catch (verificationError) {
               const verificationMessage = verificationError instanceof Error
                 ? verificationError.message
@@ -2011,6 +2060,42 @@ export class MissionDrivenEngine extends EventEmitter {
                 status: 'failed',
                 summary: `验收异常：${verificationMessage}`,
               };
+            }
+            if (planIdForRuntime) {
+              try {
+                if (outcome.status === 'failed') {
+                  await this.planLedger.updateRuntimeState(resolvedSessionId, planIdForRuntime, {
+                    review: { state: 'rejected', round: reviewRoundForRuntime },
+                    acceptance: { summary: 'failed' },
+                    replan: { state: 'required', reason: outcome.summary },
+                  });
+                } else if (outcome.status === 'passed') {
+                  await this.planLedger.updateRuntimeState(resolvedSessionId, planIdForRuntime, {
+                    review: { state: 'accepted', round: reviewRoundForRuntime },
+                    acceptance: { summary: 'passed' },
+                    replan: { state: 'none' },
+                  });
+                } else if (outcome.skippedReason === 'execution_failed') {
+                  await this.planLedger.updateRuntimeState(resolvedSessionId, planIdForRuntime, {
+                    review: { state: 'rejected', round: reviewRoundForRuntime },
+                    acceptance: { summary: 'failed' },
+                    replan: { state: 'required', reason: outcome.summary },
+                  });
+                } else {
+                  await this.planLedger.updateRuntimeState(resolvedSessionId, planIdForRuntime, {
+                    review: { state: 'idle', round: reviewRoundForRuntime },
+                    replan: { state: 'none' },
+                  });
+                }
+              } catch (error) {
+                logger.warn('编排器.PlanRuntime.评审结果回写失败', {
+                  sessionId: resolvedSessionId,
+                  planId: planIdForRuntime,
+                  status: outcome.status,
+                  skippedReason: outcome.skippedReason,
+                  error: error instanceof Error ? error.message : String(error),
+                }, LogCategory.ORCHESTRATOR);
+              }
             }
 
             if (outcome.status === 'failed') {
@@ -2217,6 +2302,31 @@ export class MissionDrivenEngine extends EventEmitter {
             && !isGovernancePaused;
 
           if (shouldAutoRepair) {
+            if (this.lastMissionId) {
+              try {
+                await this.missionStorage.transitionStatus(this.lastMissionId, 'executing');
+              } catch (error) {
+                logger.warn('编排器.Mission.自动修复前状态恢复失败', {
+                  missionId: this.lastMissionId,
+                  to: 'executing',
+                  error: error instanceof Error ? error.message : String(error),
+                }, LogCategory.ORCHESTRATOR);
+              }
+            }
+            if (this.currentPlanId) {
+              try {
+                await this.planLedger.updateRuntimeState(resolvedSessionId, this.currentPlanId, {
+                  review: { state: 'idle' },
+                  replan: { state: 'applied', reason: 'auto_repair_triggered' },
+                });
+              } catch (error) {
+                logger.warn('编排器.PlanRuntime.自动修复状态回写失败', {
+                  sessionId: resolvedSessionId,
+                  planId: this.currentPlanId,
+                  error: error instanceof Error ? error.message : String(error),
+                }, LogCategory.ORCHESTRATOR);
+              }
+            }
             autoRepairAttempt += 1;
             const autoRepairPrompt = this.buildAutoRepairPrompt({
               originalPrompt: trimmedPrompt,
@@ -2288,7 +2398,10 @@ export class MissionDrivenEngine extends EventEmitter {
             continue;
           }
 
-          const resolvedFollowUpSteps = this.resolveFollowUpSteps(response.orchestratorRuntime?.nextSteps);
+          const resolvedFollowUpSteps = this.resolveFollowUpSteps(
+            response.orchestratorRuntime?.nextSteps,
+            response.content,
+          );
           const { actionable: followUpSteps, blocked: blockedFollowUpSteps } = this.classifyFollowUpSteps(resolvedFollowUpSteps);
           const blockedFollowUpOnly = followUpSteps.length === 0 && blockedFollowUpSteps.length > 0;
           const pendingRequiredTodos = this.extractPendingRequiredCount(orchestratorRuntimeSnapshot);
@@ -2339,6 +2452,17 @@ export class MissionDrivenEngine extends EventEmitter {
           }
 
           if (shouldAutoFollowUp) {
+            if (this.lastMissionId) {
+              try {
+                await this.missionStorage.transitionStatus(this.lastMissionId, 'executing');
+              } catch (error) {
+                logger.warn('编排器.Mission.自动续跑前状态恢复失败', {
+                  missionId: this.lastMissionId,
+                  to: 'executing',
+                  error: error instanceof Error ? error.message : String(error),
+                }, LogCategory.ORCHESTRATOR);
+              }
+            }
             autoFollowUpAttempt += 1;
             lastFollowUpSignature = followUpSignature;
             autoFollowUpHistory.push(`第${autoFollowUpAttempt}轮：${followUpSteps.join('；')}`);
@@ -2692,6 +2816,7 @@ export class MissionDrivenEngine extends EventEmitter {
         throw new Error(t('engine.errors.turnSwitchedMissionInvalid'));
       }
 
+      await this.missionStorage.transitionStatus(mission.id, 'planning');
       await this.missionStorage.transitionStatus(mission.id, 'executing');
 
       this.lastMissionId = mission.id;
@@ -2991,11 +3116,58 @@ export class MissionDrivenEngine extends EventEmitter {
     }
   }
 
-  private resolveFollowUpSteps(runtimeSteps?: string[]): string[] {
-    if (!Array.isArray(runtimeSteps)) {
+  private resolveFollowUpSteps(runtimeSteps?: string[], responseContent?: string): string[] {
+    if (Array.isArray(runtimeSteps)) {
+      const normalized = normalizeNextSteps(runtimeSteps);
+      if (normalized.length > 0) {
+        return normalized;
+      }
+    }
+
+    if (typeof responseContent !== 'string' || !responseContent.trim()) {
       return [];
     }
-    return normalizeNextSteps(runtimeSteps);
+
+    const lines = responseContent
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(line => line.length > 0);
+    const bulletPattern = /^(?:[-*•]\s+|\d+\.\s+)(.+)$/;
+    const headingPattern = /(下一步建议|next steps?)/i;
+    const candidates: string[] = [];
+
+    let headingIndex = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (headingPattern.test(lines[i])) {
+        headingIndex = i;
+        break;
+      }
+    }
+
+    if (headingIndex >= 0) {
+      for (let i = headingIndex + 1; i < lines.length; i++) {
+        const line = lines[i];
+        const match = line.match(bulletPattern);
+        if (match) {
+          candidates.push(match[1].trim());
+          continue;
+        }
+        if (candidates.length > 0) {
+          break;
+        }
+      }
+    }
+
+    if (candidates.length === 0) {
+      for (const line of lines) {
+        const match = line.match(bulletPattern);
+        if (match) {
+          candidates.push(match[1].trim());
+        }
+      }
+    }
+
+    return normalizeNextSteps(candidates);
   }
 
   private classifyFollowUpSteps(steps: string[]): { actionable: string[]; blocked: string[] } {

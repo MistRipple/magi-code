@@ -12,6 +12,26 @@ import { UnifiedTodo, TodoType, TodoStatus } from '../../todo/types';
 
 // ============================================================================
 // 状态枚举
+//
+// 【三层状态架构说明】
+// 系统运行态分布在三个层级，各自服务不同目的，通过事件在关键转换点保持同步：
+//
+// 1. Mission.status (本文件) — 任务生命周期的事实源
+//    职责：记录任务从 draft → planning → executing → reviewing → completed 的宏观阶段
+//    消费者：UI 展示、任务列表查询、状态机转换约束
+//
+// 2. PlanRecord.runtime (plan-ledger/types.ts) — 执行计划的细粒度运行态
+//    职责：记录 acceptance/review/replan/wait/termination 等执行细节
+//    消费者：恢复/审计场景、执行计划回溯、运行时治理决策
+//
+// 3. Orchestrator 瞬态变量 (mission-driven-engine.ts) — 当前执行轮次的工作记忆
+//    职责：跟踪 currentPlanId/lastMissionId/orchestratorRuntimeRounds 等瞬态上下文
+//    消费者：仅限当前执行轮次内的流程控制
+//
+// 同步保证：
+// - Mission.status 与 PlanRecord.status 通过 setupPlanLedgerEventBindings 同步
+// - PlanRecord.runtime 通过 updateRuntimeState 在关键链路推进
+// - 瞬态变量在每轮执行开始时初始化，不持久化
 // ============================================================================
 
 /**

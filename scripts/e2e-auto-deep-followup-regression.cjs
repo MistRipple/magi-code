@@ -159,16 +159,20 @@ async function runScenario(label, responses, expectations) {
   });
 
   await engine.initialize();
-  const session = sessionManager.createSession(`auto-deep-followup-${Date.now()}`);
-  const result = await engine.execute('自动续跑回归验证', '', session.id);
+  try {
+    const session = sessionManager.createSession(`auto-deep-followup-${Date.now()}`);
+    const result = await engine.execute('自动续跑回归验证', '', session.id);
 
-  expectations(adapterFactory, result);
-  console.log(`\n=== auto deep follow-up regression (${label}) ===`);
-  console.log(JSON.stringify({
-    pass: true,
-    attempts: adapterFactory.attempts,
-    preview: String(result || '').replace(/\s+/g, ' ').slice(0, 180),
-  }, null, 2));
+    expectations(adapterFactory, result);
+    console.log(`\n=== auto deep follow-up regression (${label}) ===`);
+    console.log(JSON.stringify({
+      pass: true,
+      attempts: adapterFactory.attempts,
+      preview: String(result || '').replace(/\s+/g, ' ').slice(0, 180),
+    }, null, 2));
+  } finally {
+    engine.dispose();
+  }
 }
 
 async function main() {
@@ -207,6 +211,8 @@ async function main() {
   });
 
   Module._load = originalModuleLoad;
+  // 显式退出，避免全局单例（日志/事件总线）残留句柄导致回归脚本悬挂。
+  process.exit(0);
 }
 
 main().catch((error) => {

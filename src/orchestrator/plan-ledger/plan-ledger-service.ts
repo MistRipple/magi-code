@@ -21,8 +21,12 @@ import type {
   PlanItemStatus,
   PlanLedgerSnapshot,
   PlanRecord,
+  PlanRuntimeReplanState,
+  PlanRuntimeReviewState,
   PlanRuntimeState,
+  PlanRuntimeTerminationState,
   PlanRuntimeVersion,
+  PlanRuntimeWaitState,
   PlanStatus,
   PlanTodoStatus,
 } from './types';
@@ -609,7 +613,99 @@ export class PlanLedgerService extends EventEmitter {
       if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
         return record;
       }
+      // 填充 termination runtime 状态
+      record.runtime.termination = {
+        reason: `plan-finalized:${status}`,
+        updatedAt: Date.now(),
+      };
+      // 同步更新 acceptance summary
+      if (status === 'completed') {
+        record.runtime.acceptance.summary = 'passed';
+        record.runtime.acceptance.updatedAt = Date.now();
+      } else if (status === 'failed') {
+        record.runtime.acceptance.summary = 'failed';
+        record.runtime.acceptance.updatedAt = Date.now();
+      }
       this.applyMissionTerminalStatus(record, status, `plan-finalized:${status}`, 'finalized');
+      return record;
+    });
+  }
+
+  /**
+   * 更新 PlanRuntimeState 的子字段
+   *
+   * 用于在主执行链路的关键节点推进 runtime 状态，
+   * 确保 review/wait/replan/termination 字段反映实际运行时状态。
+   */
+  async updateRuntimeState(
+    sessionId: string,
+    planId: string,
+    patch: {
+      review?: Partial<PlanRuntimeReviewState>;
+      replan?: Partial<PlanRuntimeReplanState>;
+      wait?: Partial<PlanRuntimeWaitState>;
+      termination?: Partial<PlanRuntimeTerminationState>;
+      acceptance?: { summary?: PlanAcceptanceSummary };
+    }
+  ): Promise<PlanRecord | null> {
+    return this.runWithSessionQueue(sessionId, async () => {
+      const record = this.loadPlan(sessionId, planId);
+      if (!record) {
+        return null;
+      }
+
+      const now = Date.now();
+
+      if (patch.review) {
+        record.runtime.review = {
+          ...record.runtime.review,
+          ...patch.review,
+          lastReviewedAt: patch.review.state === 'running' || patch.review.state === 'accepted' || patch.review.state === 'rejected'
+            ? now
+            : record.runtime.review.lastReviewedAt,
+        };
+      }
+
+      if (patch.replan) {
+        const nextReplan: PlanRuntimeReplanState = {
+          ...record.runtime.replan,
+          ...patch.replan,
+          updatedAt: now,
+        };
+        if (patch.replan.state === 'none' && patch.replan.reason === undefined) {
+          nextReplan.reason = undefined;
+        }
+        record.runtime.replan = nextReplan;
+      }
+
+      if (patch.wait) {
+        const nextWait: PlanRuntimeWaitState = {
+          ...record.runtime.wait,
+          ...patch.wait,
+          updatedAt: now,
+        };
+        if (patch.wait.state === 'none' && patch.wait.reasonCode === undefined) {
+          nextWait.reasonCode = undefined;
+        }
+        record.runtime.wait = nextWait;
+      }
+
+      if (patch.termination) {
+        record.runtime.termination = {
+          ...record.runtime.termination,
+          ...patch.termination,
+          updatedAt: now,
+        };
+      }
+
+      if (patch.acceptance?.summary) {
+        record.runtime.acceptance.summary = patch.acceptance.summary;
+        record.runtime.acceptance.updatedAt = now;
+      }
+
+      record.updatedAt = now;
+      this.persistPlan(record);
+      this.emitUpdated(record, 'runtime-state-updated');
       return record;
     });
   }

@@ -909,8 +909,7 @@ export class AutonomousWorker extends EventEmitter {
     round: number,
   ): Promise<UnifiedTodo[]> {
     const acceptance = assignment.acceptanceCriteria
-      .map(criterion => criterion.description.trim())
-      .filter(description => description.length > 0);
+      .filter(criterion => criterion.description.trim().length > 0);
     if (acceptance.length === 0) return [];
 
     // 2. 构建验收 prompt
@@ -920,7 +919,24 @@ export class AutonomousWorker extends EventEmitter {
       .join('\n');
 
     const criteriaList = acceptance
-      .map((c, i) => `${i + 1}. ${c}`)
+      .map((c, i) => {
+        let line = `${i + 1}. ${c.description.trim()}`;
+        // 注入结构化验证规格，指导 Worker 进行精确验证
+        if (c.verificationSpec) {
+          const spec = c.verificationSpec;
+          const specParts: string[] = [`[verification: ${spec.type}`];
+          if (spec.targetPath) specParts.push(`path="${spec.targetPath}"`);
+          if (spec.testCommand) specParts.push(`cmd="${spec.testCommand}"`);
+          if (spec.expectedContent) specParts.push(`expect="${spec.expectedContent.substring(0, 100)}"`);
+          if (spec.contentMatchMode) specParts.push(`match=${spec.contentMatchMode}`);
+          specParts.push(']');
+          line += ` ${specParts.join(' ')}`;
+        }
+        if (c.verificationMethod && c.verificationMethod !== 'manual') {
+          line += ` (method: ${c.verificationMethod})`;
+        }
+        return line;
+      })
       .join('\n');
 
     const prompt = `## Acceptance Verification (Round ${round + 1})
