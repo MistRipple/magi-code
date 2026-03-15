@@ -675,11 +675,6 @@
     border: 1px solid var(--border);
   }
 
-  .result-summary {
-    font-size: var(--text-sm);
-    color: var(--foreground);
-  }
-
   .result-meta {
     display: flex;
     flex-wrap: wrap;

@@ -441,16 +441,6 @@
     font-weight: 500;
   }
 
-  .item-summary {
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    line-height: 1.4;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-  }
-
   .item-meta {
     display: flex;
     align-items: center;
