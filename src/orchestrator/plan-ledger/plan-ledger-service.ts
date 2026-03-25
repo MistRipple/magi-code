@@ -2,7 +2,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { EventEmitter } from 'events';
 import { logger, LogCategory } from '../../logging';
-import { atomicWriteFileSync } from '../../utils/atomic-write';
+import { atomicWriteFile } from '../../utils/atomic-write';
+import { CoalescedAsyncTaskQueue, SerialAsyncTaskQueue } from '../../utils/async-task-queue';
 import type { UnifiedSessionManager } from '../../session/unified-session-manager';
 import type { UnifiedTodo } from '../../todo/types';
 import type { AcceptanceCriterion } from '../mission/types';
@@ -144,10 +145,22 @@ const RUNTIME_WAIT_TRANSITIONS: Record<PlanRuntimeWaitState['state'], PlanRuntim
 export class PlanLedgerService extends EventEmitter {
   private static readonly CURRENT_SCHEMA_VERSION = 2;
   private static readonly MIN_SUPPORTED_SCHEMA_VERSION = 1;
-  private readonly writeQueues = new Map<string, Promise<void>>();
+  private readonly sessionMutationQueues = new Map<string, Promise<void>>();
   private readonly indexCache = new Map<string, PlanIndexEntry[]>();
   private readonly planCache = new Map<string, Map<string, PlanRecord>>();
   private readonly sessionCacheAccessOrder = new Map<string, number>();
+  private readonly snapshotPersistQueue = new CoalescedAsyncTaskQueue((targetPath, error) => {
+    logger.warn('计划账本.异步快照写入失败', {
+      targetPath,
+      error: error instanceof Error ? error.message : String(error),
+    }, LogCategory.ORCHESTRATOR);
+  });
+  private readonly eventAppendQueue = new SerialAsyncTaskQueue((targetPath, error) => {
+    logger.warn('计划账本.events.异步追加失败', {
+      targetPath,
+      error: error instanceof Error ? error.message : String(error),
+    }, LogCategory.ORCHESTRATOR);
+  });
   private static readonly EVENTS_ROTATE_MAX_BYTES = 5 * 1024 * 1024;
   private static readonly EVENTS_ROTATE_KEEP_FILES = 5;
   private static readonly CACHE_MAX_SESSION_COUNT = 32;
@@ -1559,7 +1572,6 @@ export class PlanLedgerService extends EventEmitter {
     }
     this.ensurePlansDir(record.sessionId);
     const planFile = this.getPlanFilePath(record.sessionId, record.planId);
-    atomicWriteFileSync(planFile, JSON.stringify(record, null, 2));
 
     const index = this.loadIndex(record.sessionId);
     const entry = this.toIndexEntry(record);
@@ -1570,12 +1582,22 @@ export class PlanLedgerService extends EventEmitter {
       index.push(entry);
     }
     index.sort((a, b) => b.updatedAt - a.updatedAt);
-    atomicWriteFileSync(this.getIndexPath(record.sessionId), JSON.stringify(index, null, 2));
     this.touchSessionCache(record.sessionId);
     this.indexCache.set(record.sessionId, this.cloneIndexEntries(index));
     const sessionPlanCache = this.getPlanCacheForSession(record.sessionId);
     this.setPlanCacheRecord(sessionPlanCache, record.planId, this.clonePlanRecord(record));
     this.prunePlanCacheForSession(sessionPlanCache);
+
+    const planPayload = JSON.stringify(record, null, 2);
+    const indexPayload = JSON.stringify(index, null, 2);
+    const planFilePath = planFile;
+    const indexPath = this.getIndexPath(record.sessionId);
+    this.snapshotPersistQueue.schedule(planFilePath, async () => {
+      await atomicWriteFile(planFilePath, planPayload);
+    });
+    this.snapshotPersistQueue.schedule(indexPath, async () => {
+      await atomicWriteFile(indexPath, indexPayload);
+    });
   }
 
   private loadPlan(sessionId: string, planId: string): PlanRecord | null {
@@ -2417,7 +2439,6 @@ export class PlanLedgerService extends EventEmitter {
 
   private appendEventRecord(record: PlanRecord, reason: string): void {
     try {
-      this.rotateEventsFileIfNeeded(record.sessionId, record.planId);
       const event: PlanLedgerEventRecord = {
         timestamp: Date.now(),
         reason,
@@ -2437,7 +2458,13 @@ export class PlanLedgerService extends EventEmitter {
         failedAttempts: record.attempts.filter((attempt) => attempt.status === 'failed' || attempt.status === 'cancelled').length,
         timeoutAttempts: record.attempts.filter((attempt) => attempt.status === 'timeout').length,
       };
-      fs.appendFileSync(this.getEventsFilePath(record.sessionId, record.planId), `${JSON.stringify(event)}\n`, 'utf-8');
+      const eventsFilePath = this.getEventsFilePath(record.sessionId, record.planId);
+      const line = `${JSON.stringify(event)}\n`;
+      this.eventAppendQueue.enqueue(eventsFilePath, async () => {
+        await this.rotateEventsFileIfNeededAsync(record.sessionId, record.planId);
+        await fs.promises.mkdir(path.dirname(eventsFilePath), { recursive: true });
+        await fs.promises.appendFile(eventsFilePath, line, 'utf-8');
+      });
     } catch (error) {
       logger.warn('计划账本.events.追加失败', {
         sessionId: record.sessionId,
@@ -2552,36 +2579,40 @@ export class PlanLedgerService extends EventEmitter {
       this.sessionCacheAccessOrder.delete(oldestSessionId);
       this.indexCache.delete(oldestSessionId);
       this.planCache.delete(oldestSessionId);
-      this.writeQueues.delete(oldestSessionId);
+      this.sessionMutationQueues.delete(oldestSessionId);
     }
   }
 
-  private rotateEventsFileIfNeeded(sessionId: string, planId: string): void {
+  private async rotateEventsFileIfNeededAsync(sessionId: string, planId: string): Promise<void> {
     const eventsFilePath = this.getEventsFilePath(sessionId, planId);
-    if (!fs.existsSync(eventsFilePath)) {
+    try {
+      await fs.promises.access(eventsFilePath, fs.constants.F_OK);
+    } catch {
       return;
     }
 
-    const stats = fs.statSync(eventsFilePath);
+    const stats = await fs.promises.stat(eventsFilePath);
     if (stats.size < PlanLedgerService.EVENTS_ROTATE_MAX_BYTES) {
       return;
     }
 
     const rotateSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const rotatedFilePath = path.join(this.getPlansDir(sessionId), `${planId}.events.${rotateSuffix}.jsonl`);
-    fs.renameSync(eventsFilePath, rotatedFilePath);
-    this.pruneRotatedEventFiles(sessionId, planId);
+    await fs.promises.rename(eventsFilePath, rotatedFilePath);
+    await this.pruneRotatedEventFilesAsync(sessionId, planId);
   }
 
-  private pruneRotatedEventFiles(sessionId: string, planId: string): void {
+  private async pruneRotatedEventFilesAsync(sessionId: string, planId: string): Promise<void> {
     const plansDir = this.getPlansDir(sessionId);
-    if (!fs.existsSync(plansDir)) {
+    try {
+      await fs.promises.access(plansDir, fs.constants.F_OK);
+    } catch {
       return;
     }
 
     const prefix = `${planId}.events.`;
     const suffix = '.jsonl';
-    const rotatedFiles = fs.readdirSync(plansDir)
+    const rotatedFiles = (await fs.promises.readdir(plansDir))
       .map((fileName) => {
         if (!fileName.startsWith(prefix) || !fileName.endsWith(suffix)) {
           return null;
@@ -2603,7 +2634,7 @@ export class PlanLedgerService extends EventEmitter {
     const staleFiles = rotatedFiles.slice(PlanLedgerService.EVENTS_ROTATE_KEEP_FILES);
     for (const staleFile of staleFiles) {
       try {
-        fs.unlinkSync(path.join(plansDir, staleFile.fileName));
+        await fs.promises.unlink(path.join(plansDir, staleFile.fileName));
       } catch (error) {
         logger.warn('计划账本.events.历史轮转文件清理失败', {
           sessionId,
@@ -2615,21 +2646,28 @@ export class PlanLedgerService extends EventEmitter {
     }
   }
 
+  async flushPendingWrites(): Promise<void> {
+    await Promise.all([
+      this.snapshotPersistQueue.flushAll(),
+      this.eventAppendQueue.flushAll(),
+    ]);
+  }
+
   private runWithSessionQueue<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
     this.touchSessionCache(sessionId);
-    const previous = this.writeQueues.get(sessionId) || Promise.resolve();
+    const previous = this.sessionMutationQueues.get(sessionId) || Promise.resolve();
     const next = previous.then(operation, operation);
     const queueTail = next.then(
       () => undefined,
       () => undefined,
     );
-    this.writeQueues.set(
+    this.sessionMutationQueues.set(
       sessionId,
       queueTail,
     );
     void next.finally(() => {
-      if (this.writeQueues.get(sessionId) === queueTail) {
-        this.writeQueues.delete(sessionId);
+      if (this.sessionMutationQueues.get(sessionId) === queueTail) {
+        this.sessionMutationQueues.delete(sessionId);
       }
     });
     return next;

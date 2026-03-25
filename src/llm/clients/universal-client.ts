@@ -12,6 +12,7 @@ import {
   LLMRetryRuntimeEvent,
   LLMResponse,
   LLMStreamChunk,
+  normalizeLLMMessageParams,
 } from '../types';
 import { logger, LogCategory } from '../../logging';
 import { fetchWithRetry, isRetryableNetworkError, toErrorMessage } from '../../tools/network-utils';
@@ -21,7 +22,7 @@ import { OpenAIResponsesProtocolAdapter } from '../protocol/adapters/openai-resp
 import { OpenAIChatCompletionsProtocolAdapter } from '../protocol/adapters/openai-chat-completions-adapter';
 import { AnthropicMessagesProtocolAdapter } from '../protocol/adapters/anthropic-messages-adapter';
 import { resolveProtocolId } from '../protocol/capability-registry';
-import { resolveModelsBaseUrl, resolveSdkBaseUrl } from '../url-mode';
+import { resolveModelsBaseUrl, resolveSdkBaseUrl, inferProtocolFromFullUrl } from '../url-mode';
 
 class NonRetryableError extends Error {
   constructor(message: string, public originalError?: unknown) {
@@ -134,7 +135,18 @@ export class UniversalLLMClient extends BaseLLMClient {
       throw new Error('OpenAI client not initialized');
     }
 
-    const protocolId = resolveProtocolId(this.config.provider, this.config.openaiProtocol);
+    // full 模式下，URL 是权威真相 — 从 URL 末尾推断协议，覆盖用户配置
+    const urlInferred = inferProtocolFromFullUrl(this.config.baseUrl, this.config.urlMode);
+    const protocolId = urlInferred ?? resolveProtocolId(this.config.provider, this.config.openaiProtocol);
+
+    if (urlInferred && urlInferred !== resolveProtocolId(this.config.provider, this.config.openaiProtocol)) {
+      logger.info('Full URL mode: protocol inferred from URL, overriding config', {
+        configProtocol: this.config.openaiProtocol,
+        inferredProtocol: urlInferred,
+        baseUrl: this.config.baseUrl,
+      }, LogCategory.LLM);
+    }
+
     if (protocolId === 'openai.chat-completions') {
       return new OpenAIChatCompletionsProtocolAdapter(this.config, this.openaiClient);
     }
@@ -216,12 +228,13 @@ export class UniversalLLMClient extends BaseLLMClient {
   }
 
   async sendMessage(params: LLMMessageParams): Promise<LLMResponse> {
-    this.logRequest(params);
+    const normalizedParams = normalizeLLMMessageParams(params);
+    this.logRequest(normalizedParams);
 
     return this.withRetry(async () => {
       try {
         const adapter = this.getProtocolAdapter();
-        const response = await this.withRequestTimeout(params, (effectiveParams) => adapter.send(effectiveParams));
+        const response = await this.withRequestTimeout(normalizedParams, (effectiveParams) => adapter.send(effectiveParams));
         this.conformanceValidator.validateResponse(response, adapter.protocol);
         this.logResponse(response);
         return response;
@@ -236,7 +249,8 @@ export class UniversalLLMClient extends BaseLLMClient {
     params: LLMMessageParams,
     onChunk: (chunk: LLMStreamChunk) => void,
   ): Promise<LLMResponse> {
-    this.logRequest({ ...params, stream: true });
+    const normalizedParams = normalizeLLMMessageParams(params);
+    this.logRequest({ ...normalizedParams, stream: true });
 
     let hasReceivedData = false;
     const adapter = this.getProtocolAdapter();
@@ -244,7 +258,7 @@ export class UniversalLLMClient extends BaseLLMClient {
     return this.withRetry(async () => {
       try {
         const response = await this.withStreamTimeout(
-          params,
+          normalizedParams,
           (effectiveParams, notifyActivity) => adapter.stream(effectiveParams, (chunk) => {
             notifyActivity();
             this.conformanceValidator.validateStreamChunk(chunk, adapter.protocol);

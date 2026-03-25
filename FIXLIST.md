@@ -1,7 +1,7 @@
 # Magi 稳定性验收清单
 
 更新时间：2026-03-06
-范围：Plan Ledger 稳定性增益（缓存治理 + 事件轮转 + 回归脚本）
+范围：Plan Ledger 稳定性增益（缓存治理 + 事件轮转）
 
 ## P0 已完成（代码层）
 
@@ -11,28 +11,17 @@
 - [x] `events` 轮转命名增强：使用 `timestamp-random`，规避同毫秒轮转命名冲突。
 - [x] `events` 轮转筛选修复：仅将带时间戳后缀的历史文件纳入清理，避免误把当前活跃 `*.events.jsonl` 当作轮转文件。
 
-## P0 已完成（回归能力）
+## P0 已完成（验收约束）
 
-- [x] 新增 `verify:e2e:plan-ledger-events-rotate`，验证：
-- [x] 达阈值后触发轮转。
-- [x] 历史轮转文件数量受 `keep` 上限约束。
-- [x] 轮转后当前 `events` 文件仍持续可写。
+- [x] 轮转阈值、历史数量约束、持续可写性已纳入发布前人工验收关注点。
+- [x] 历史 `verify` / `e2e` 脚本入口已从仓库中清理，避免继续污染主链。
 
-## 回归命令（可直接执行）
+## 验收方式
 
-```bash /Users/xie/code/magi
-npm run -s compile
-npm run -s build:extension
-npm run -s build:webview
-npm run -s verify:e2e:plan-ledger-lifecycle
-npm run -s verify:e2e:plan-ledger-session-isolation
-npm run -s verify:e2e:plan-ledger-reconcile
-npm run -s verify:e2e:plan-ledger-events-rotate
-```
+- 以常规构建产物、真实会话操作和发布前人工验收为准，不再保留临时 `verify` / `e2e` 命令入口。
 
 ## 人工验收建议（发布前）
 
 - [ ] 连续切换 20+ 会话，观察任务面板计划账本加载是否稳定，无跨会话污染。
 - [ ] 长会话压测（持续 30~60 分钟）观察内存曲线，确认无明显持续上升趋势。
 - [ ] 高并发任务执行期间检查计划账本状态流转：`draft -> awaiting_confirmation -> approved -> executing -> completed/failed` 无逆序或跳变。
-

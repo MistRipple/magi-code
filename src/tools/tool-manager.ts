@@ -55,6 +55,8 @@ import { LLMConfigLoader } from '../llm/config';
 import { createLLMClient } from '../llm/clients/client-factory';
 import { runIntentDrivenFileEdit } from '../llm/utils/intent-file-editor';
 import { KnowledgeQueryExecutor } from './knowledge-query-executor';
+import type { GovernedKnowledgeAuditMetadata } from '../knowledge/governed-knowledge-context-service';
+import type { HostCapabilities } from '../host';
 
 /**
  * 快照执行上下文（标识当前正在执行的 mission/assignment/worker）
@@ -109,6 +111,7 @@ export interface ToolManagerOptions {
   workspaceRoot?: string;
   workspaceFolders?: WorkspaceFolderInfo[];
   permissions?: PermissionMatrix;
+  hostCapabilities?: HostCapabilities;
 }
 
 /**
@@ -167,6 +170,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   private fileContextEpochByPath: Map<string, number> = new Map();
   /** terminal_id 所属执行主体（orchestrator / worker-*） */
   private terminalOwnershipById: Map<number, string> = new Map();
+  private readonly hostCapabilities?: HostCapabilities;
 
   constructor(options: ToolManagerOptions = {}) {
     super();
@@ -177,6 +181,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
     this.workspaceRoots = new WorkspaceRoots(folders);
     this.workspaceRoot = this.workspaceRoots.getPrimaryFolder().path;
+    this.hostCapabilities = options.hostCapabilities;
 
     // 初始化所有内置执行器（共享 fileMutex 保证文件读写与终端命令的并发安全）
     this.terminalExecutor = new NodeShellExecutor();
@@ -189,7 +194,10 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     this.lspExecutor = new LspExecutor(this.workspaceRoot);
     this.orchestrationExecutor = new OrchestrationExecutor();
     // 知识库查询工具（knowledgeBase getter 稍后通过 setProjectKnowledgeBase 注入）
-    this.knowledgeQueryExecutor = new KnowledgeQueryExecutor(() => undefined);
+    this.knowledgeQueryExecutor = new KnowledgeQueryExecutor(
+      () => undefined,
+      () => this.getKnowledgeAuditMetadata(),
+    );
 
     this.permissions = options.permissions || {
       allowEdit: true,
@@ -212,6 +220,10 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     this.removeFilesExecutor.setEffectiveRootsGetter(worktreeRootsGetter);
 
     this.registerDefaultLlmEditHandler();
+  }
+
+  getHostCapabilities(): HostCapabilities | undefined {
+    return this.hostCapabilities;
   }
 
   /**
@@ -266,7 +278,10 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    * 使 project_knowledge_query 工具能按需查询 ADR、FAQ、经验记录等
    */
   setProjectKnowledgeBase(getter: () => import('../knowledge/project-knowledge-base').ProjectKnowledgeBase | undefined): void {
-    this.knowledgeQueryExecutor = new KnowledgeQueryExecutor(getter);
+    this.knowledgeQueryExecutor = new KnowledgeQueryExecutor(
+      getter,
+      () => this.getKnowledgeAuditMetadata(),
+    );
     logger.info('ToolManager: ProjectKnowledgeBase 已注入', undefined, LogCategory.TOOLS);
   }
 
@@ -365,6 +380,22 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       contextWorkers: Array.from(this.snapshotContextMap.keys()),
     }, LogCategory.TOOLS);
     return undefined;
+  }
+
+  private getKnowledgeAuditMetadata(): GovernedKnowledgeAuditMetadata {
+    const executionContext = this.executionContextStorage.getStore();
+    const snapshotContext = this.getActiveSnapshotContext();
+    return {
+      purpose: 'tool_query',
+      consumer: 'tool_manager',
+      sessionId: snapshotContext?.sessionId,
+      requestId: snapshotContext?.requestId,
+      missionId: snapshotContext?.missionId,
+      assignmentId: snapshotContext?.assignmentId,
+      todoId: snapshotContext?.todoId,
+      agentId: executionContext?.workerId || executionContext?.role,
+      workerId: snapshotContext?.workerId || executionContext?.workerId,
+    };
   }
 
   private buildTodoModifiedFilesKey(workerId: string, todoId: string): string {
@@ -1068,6 +1099,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     content: string,
     parsedData: unknown,
   ): string {
+    const normalizedContent = content.toLowerCase();
     const parsed = parsedData && typeof parsedData === 'object'
       ? parsedData as Record<string, unknown>
       : undefined;
@@ -1093,6 +1125,21 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     }
     if (content.includes('[FILE_CONTEXT_STALE]')) {
       return 'file_context_stale';
+    }
+    if (normalizedContent.startsWith('worker_wait failed:')) {
+      if (
+        normalizedContent.includes('there is no active assignment batch to wait for')
+        || normalizedContent.includes('当前没有可等待的活跃 assignment 批次')
+      ) {
+        return 'orchestration_worker_wait_without_active_batch';
+      }
+      if (
+        normalizedContent.includes('worker_wait task_ids are not part of the current active batch')
+        || normalizedContent.includes('worker_wait 指定的 task_ids 不在当前活跃批次中')
+      ) {
+        return 'orchestration_worker_wait_unknown_tasks';
+      }
+      return 'orchestration_worker_wait_failed';
     }
 
     if (content.startsWith('MCP tool execution failed:')) {

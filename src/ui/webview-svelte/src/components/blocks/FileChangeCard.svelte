@@ -29,9 +29,9 @@
   const changeLabel = $derived.by(() => {
     if (!change) return '';
     switch (change.changeType) {
-      case 'create': return 'create';
-      case 'delete': return 'delete';
-      default: return 'edit';
+      case 'create': return i18n.t('fileChangeCard.label.create');
+      case 'delete': return i18n.t('fileChangeCard.label.delete');
+      default: return i18n.t('fileChangeCard.label.edit');
     }
   });
 

@@ -139,7 +139,6 @@ export function getMessagePriority(uiMessage: OrchestratorUIMessage): number {
     summary: 90,
     plan_ready: 80,
     direct_response: 70,
-    confirmationRequest: 60,
     progress_update: 50,
   };
 

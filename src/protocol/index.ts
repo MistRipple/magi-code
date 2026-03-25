@@ -14,6 +14,8 @@ export {
   // 类型
   type MessageSource,
   type NotifyLevel,
+  type NotifyDisplayMode,
+  type NotifyCategory,
   type DataMessageType,
   type TextBlock,
   type CodeBlock,
@@ -28,6 +30,7 @@ export {
   type MessageMetadata,
   type StreamUpdate,
   type ControlPayload,
+  type NotifyPresentation,
   type NotifyPayload,
   type DataPayload,
 

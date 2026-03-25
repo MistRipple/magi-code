@@ -424,10 +424,20 @@ export interface UIState {
   interactionModeUpdatedAt?: number;
   /** 当前编排器阶段 */
   orchestratorPhase?: string;
+  /** 当前会话处理态快照（刷新/切会话恢复的唯一运行态来源） */
+  processingState?: UIProcessingState | null;
   /** 状态更新时间戳（用于前端时序防护） */
   stateUpdatedAt?: number;
   /** 是否为恢复收敛后的状态更新 */
   recovered?: boolean;
+}
+
+export interface UIProcessingState {
+  isProcessing: boolean;
+  source: import('./protocol/message-protocol').MessageSource | null;
+  agent: string | null;
+  startedAt: number | null;
+  pendingRequestIds: string[];
 }
 
 /** Worker 状态（基于 LLM 适配器） */
@@ -460,7 +470,6 @@ export type WebviewToExtensionMessage =
   | { type: 'deleteTask'; taskId: string }
   | { type: 'login'; apiKey: string; provider?: string; remember?: boolean }
   | { type: 'logout' }
-  | { type: 'getStatus' }
   | { type: 'pauseTask'; taskId: string }
   | { type: 'resumeTask'; taskId: string }
   | { type: 'appendMessage'; taskId: string; content: string }
@@ -471,35 +480,33 @@ export type WebviewToExtensionMessage =
   | { type: 'approveAllChanges' }
   | { type: 'revertAllChanges' }
   | { type: 'revertMission'; missionId: string }
-  | { type: 'newSession'; currentMessages?: any[] }
-  | { type: 'saveCurrentSession'; messages: any[] }
-  | { type: 'switchSession'; sessionId: string; currentMessages?: any[] }
+  | { type: 'newSession' }
+  | { type: 'saveCurrentSession' }
+  | { type: 'switchSession'; sessionId: string }
   | { type: 'renameSession'; sessionId: string; name: string }
   | { type: 'closeSession'; sessionId: string }
   | { type: 'deleteSession'; sessionId: string; requireConfirm?: boolean }
+  | { type: 'markAllNotificationsRead' }
+  | { type: 'clearAllNotifications' }
+  | { type: 'removeNotification'; notificationId: string }
   | { type: 'selectWorker'; worker: WorkerSlot | null }
   | { type: 'updateSetting'; key: string; value: unknown }
   | { type: 'viewDiff'; filePath: string }
   | { type: 'openFile'; filepath?: string; filePath?: string }
   | { type: 'openLink'; url: string }
-  | { type: 'confirmPlan'; confirmed: boolean }
   | { type: 'getState' }
   | { type: 'requestState' }
   | { type: 'webviewReady' }
   // 新增：交互模式相关
   | { type: 'setInteractionMode'; mode: InteractionMode }
   | { type: 'confirmRecovery'; decision: 'retry' | 'rollback' | 'continue' }
-  | { type: 'confirmDeliveryRepair'; decision: 'repair' | 'stop' }
 
   | { type: 'requestExecutionStats' }
   | { type: 'resetExecutionStats' }
 
-  | { type: 'checkWorkerStatus'; force?: boolean }
+  | { type: 'loadSettingsBootstrap'; force?: boolean }
 
   | { type: 'clearAllTasks' }
-
-  // 深度任务模式状态请求
-  | { type: 'getDeepTaskState' }
 
   // UI 错误上报
   | { type: 'uiError'; component: string; detail: string; stack?: string }
@@ -509,6 +516,11 @@ export type WebviewToExtensionMessage =
   | { type: 'interactionResponse'; requestId: string; response: string }
   // Mermaid 图表面板
   | { type: 'openMermaidPanel'; code: string; title?: string }
+  // 局域网访问信息
+  | { type: 'getLanAccessInfo' }
+  | { type: 'getTunnelStatus' }
+  | { type: 'startTunnel' }
+  | { type: 'stopTunnel' }
 
   | { type: 'enhancePrompt'; prompt: string }
   // 新增：需求澄清回答
@@ -516,22 +528,17 @@ export type WebviewToExtensionMessage =
   // 新增：Worker 问题回答
   | { type: 'answerWorkerQuestion'; answer: string | null }
   // 新增：画像配置
-  | { type: 'getProfileConfig' }
   | { type: 'saveProfileConfig'; data: { assignments: Record<string, string>; userRules?: string } }
   | { type: 'resetProfileConfig' }
   // 新增：LLM 配置相关
-  | { type: 'loadAllWorkerConfigs' }
   | { type: 'saveWorkerConfig'; worker: WorkerSlot; config: any }
   | { type: 'testWorkerConnection'; worker: WorkerSlot; config: any }
-  | { type: 'loadOrchestratorConfig' }
   | { type: 'saveOrchestratorConfig'; config: any }
   | { type: 'testOrchestratorConnection'; config: any }
-  | { type: 'loadAuxiliaryConfig' }
   | { type: 'saveAuxiliaryConfig'; config: any }
   | { type: 'testAuxiliaryConnection'; config: any }
   | { type: 'fetchModelList'; config: any; target: string }
   // 新增：MCP 配置相关
-  | { type: 'loadMCPServers' }
   | { type: 'addMCPServer'; server: any }
   | { type: 'updateMCPServer'; serverId: string; updates: any }
   | { type: 'deleteMCPServer'; serverId: string }
@@ -540,7 +547,6 @@ export type WebviewToExtensionMessage =
   | { type: 'refreshMCPTools'; serverId: string }
   | { type: 'getMCPServerTools'; serverId: string }
   // 新增：Skills 配置相关
-  | { type: 'loadSkillsConfig' }
   | { type: 'saveSkillsConfig'; config: any }
   | { type: 'toggleBuiltInTool'; tool: string; enabled: boolean }
   | { type: 'addCustomTool'; tool: any }
@@ -551,7 +557,6 @@ export type WebviewToExtensionMessage =
   | { type: 'updateSkill'; skillName: string }
   | { type: 'updateAllSkills' }
   // Skills 仓库相关
-  | { type: 'loadRepositories' }
   | { type: 'addRepository'; url: string }
   | { type: 'updateRepository'; repositoryId: string; updates: any }
   | { type: 'deleteRepository'; repositoryId: string }
@@ -559,9 +564,6 @@ export type WebviewToExtensionMessage =
   | { type: 'loadSkillLibrary' }
   // 新增：项目知识相关
   | { type: 'getProjectKnowledge' }
-  | { type: 'getADRs'; filter?: { status?: string } }
-  | { type: 'getFAQs'; filter?: { category?: string } }
-  | { type: 'searchFAQs'; keyword: string }
   | { type: 'addADR'; adr: any }
   | { type: 'updateADR'; id: string; updates: any }
   | { type: 'deleteADR'; id: string }
@@ -575,7 +577,10 @@ export type WebviewToExtensionMessage =
   | { type: 'toolAuthorizationResponse'; requestId: string; allowed: boolean }
   | { type: 'interactionResponse'; requestId: string; response: any }
   // 新增：Mermaid 图表
-  | { type: 'openMermaidPanel'; code: string; title?: string };
+  | { type: 'openMermaidPanel'; code: string; title?: string }
+  | { type: 'getLanAccessInfo' }
+  // 执行链操作
+  | { type: 'abandonChain'; chainId: string };
 
 // Extension 发送到 Webview 的消息
 // source 字段用于区分消息来源：'orchestrator' = 编排者, 'worker' = 执行代理

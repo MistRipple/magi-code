@@ -209,42 +209,6 @@ function tryExtractJsonAt(content: string, startIndex: number): { jsonText: stri
 }
 
 /**
- * 判断是否应该渲染为代码块
- * 🔧 修复：避免误判 Markdown 有序列表
- */
-export function shouldRenderAsCodeBlock(content: string): boolean {
-  if (!content) return false;
-  const trimmed = content.trim();
-  if (!trimmed) return false;
-  // 已经是代码块围栏格式
-  if (trimmed.startsWith('```')) return false;
-  // JSON 格式
-  if (trimmed.startsWith('{') || trimmed.startsWith('[')) return true;
-  // 单行内容不作为代码块
-  if (!content.includes('\n')) return false;
-
-  // 🔧 检测带行号的特殊输出格式（Agent 工具输出）
-  // 注意：避免误判 Markdown 有序列表
-
-  // 特殊行号格式：数字→（如 "1→ code"）
-  if (/^\s*\d+→/m.test(content)) return true;
-  // 行号格式：数字: 或 数字> （如 "1: code" 或 "1> code"）
-  if (/^\s*\d+\s*[:>]/m.test(content)) return true;
-
-  // 🔧 移除误判有序列表的检测
-  // 之前的规则 /^\s*\d+\.\s+/m 会错误匹配 "1. 列表项"
-  // 之前的规则 /^\s*\d+\)\s+/m 也会错误匹配括号式列表
-  // 之前的规则 /^\s*\d+\s*-\s+/m 也可能误判
-
-  // 只检测明确的缩进代码（2+ 空格或制表符开头）
-  // 且要求多行都有缩进，避免单行缩进误判
-  const lines = content.split('\n');
-  const indentedLines = lines.filter(l => /^\s{2,}|^\t/.test(l) && l.trim());
-  // 至少 3 行有缩进才认为是代码块
-  return indentedLines.length >= 3;
-}
-
-/**
  * 检测内容是否包含 Markdown 语法
  */
 export function hasMarkdownSyntax(content: string): boolean {
@@ -347,7 +311,7 @@ export function extractCodeBlocks(content: string): Array<{
     }
 
     blocks.push({
-      lang: match[1] || 'text',
+      lang: match[1] || '',
       filepath: candidateFilepath,
       code: codeContent,
       startIndex: match.index,
@@ -442,7 +406,7 @@ export function parseContentToBlocks(
       }
 
       // 代码块本身
-      const lang = codeBlock.lang || 'text';
+      const lang = codeBlock.lang || '';
 
       // 🔧 新增：尝试解析规划 JSON，返回 PlanBlock 而不是 CodeBlock
       if (lang === 'json') {
@@ -533,16 +497,8 @@ function parseTextContent(text: string): ContentBlock[] {
     } as ContentBlock];
   }
 
-  // 应该渲染为代码块的内容（如带行号的输出）
-  if (shouldRenderAsCodeBlock(trimmed)) {
-    return [{
-      type: 'code',
-      content: trimmed,
-      language: 'text',
-    } as ContentBlock];
-  }
-
-  // 普通文本
+  // 普通文本不再自动升级为 code(language=text) 卡片；
+  // 只有显式 fenced code 或纯 JSON 才进入代码块语义。
   const normalizedText = normalizePlainText(trimmed);
   return [{
     type: 'text',

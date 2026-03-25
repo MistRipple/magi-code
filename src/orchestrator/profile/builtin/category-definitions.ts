@@ -57,9 +57,9 @@ export const CATEGORY_DEFINITIONS: Record<string, CategoryDefinition> = {
     displayName: 'Data Analysis',
     description: 'Data processing, scripting, statistics, visualization',
     keywords: [
-      '数据|分析|统计|可视化',
-      '脚本|ETL|清洗',
-      '报表|指标|图表',
+      '数据分析|统计分析|指标分析|报表分析|analytics',
+      '可视化|报表|指标|图表|dashboard',
+      'etl|数据清洗|清洗脚本',
     ],
     guidance: {
       focus: ['Data accuracy', 'Clear visualizations', 'Well-defined conclusions'],

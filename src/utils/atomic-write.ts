@@ -53,3 +53,32 @@ export function atomicWriteFileSync(
     throw error;
   }
 }
+
+export async function atomicWriteFile(
+  filePath: string,
+  data: string | Buffer,
+  encoding: BufferEncoding = 'utf-8',
+): Promise<void> {
+  const dir = path.dirname(filePath);
+  await fs.promises.mkdir(dir, { recursive: true });
+
+  const basename = path.basename(filePath);
+  const tmpName = `.${basename}.${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`;
+  const tmpPath = path.join(dir, tmpName);
+
+  try {
+    if (typeof data === 'string') {
+      await fs.promises.writeFile(tmpPath, data, encoding);
+    } else {
+      await fs.promises.writeFile(tmpPath, data);
+    }
+    await fs.promises.rename(tmpPath, filePath);
+  } catch (error) {
+    try {
+      await fs.promises.rm(tmpPath, { force: true });
+    } catch {
+      // 清理失败不阻塞主错误抛出
+    }
+    throw error;
+  }
+}

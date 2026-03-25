@@ -5,6 +5,7 @@
   import { ensureArray } from '../lib/utils';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { getState } from '../stores/messages.svelte';
 
   // 知识类型定义
   interface CodeIndex {
@@ -41,8 +42,11 @@
   }
 
   // 状态
+  const appState = getState();
+  const isKnowledgeActive = $derived(appState.currentTopTab === 'knowledge');
   let currentTab = $state<'overview' | 'adr' | 'faq' | 'learning'>('overview');
-  let isLoading = $state(true);
+  let isLoading = $state(false);
+  let hasRequestedKnowledge = $state(false);
   let codeIndex = $state<CodeIndex | null>(null);
   let adrs = $state<ADR[]>([]);
   let faqs = $state<FAQ[]>([]);
@@ -109,6 +113,7 @@
   }
 
   function refresh() {
+    hasRequestedKnowledge = true;
     isLoading = true;
     vscode.postMessage({ type: 'getProjectKnowledge' });
   }
@@ -165,6 +170,15 @@
     return status ? (map[status] || status) : '';
   }
 
+  $effect(() => {
+    if (!isKnowledgeActive || hasRequestedKnowledge) {
+      return;
+    }
+    hasRequestedKnowledge = true;
+    isLoading = true;
+    vscode.postMessage({ type: 'getProjectKnowledge' });
+  });
+
   // 监听来自扩展的消息
   $effect(() => {
     const unsubscribe = vscode.onMessage((msg) => {
@@ -187,9 +201,6 @@
       learnings = ensureArray(payload?.learnings);
       isLoading = false;
     });
-
-    // 初始化时请求数据
-    vscode.postMessage({ type: 'getProjectKnowledge' });
 
     return () => unsubscribe();
   });

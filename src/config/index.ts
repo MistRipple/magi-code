@@ -70,8 +70,6 @@ export interface OrchestratorGovernanceThresholdsConfig {
 }
 
 export interface OrchestratorConfig {
-  /** 计划确认阈值 */
-  planConfirmationThreshold: 'low' | 'medium' | 'high';
   /** 最大重试次数 */
   maxRetries: number;
   /** 默认超时 (ms) */
@@ -116,7 +114,6 @@ export const DEFAULT_CONFIG: MagiConfig = {
     lockTimeout: 60000,
   },
   orchestrator: {
-    planConfirmationThreshold: 'medium',
     maxRetries: 3,
     defaultTimeout: 300000,
     governanceThresholds: {

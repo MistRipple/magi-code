@@ -9,16 +9,19 @@
 
 import { WorkerSlot } from '../../types';
 import { UnifiedTodo, TodoType, TodoStatus } from '../../todo/types';
+import type { OrchestrationTraceLinks } from '../trace/types';
 
 // ============================================================================
 // 状态枚举
 //
-// 【三层状态架构说明】
-// 系统运行态分布在三个层级，各自服务不同目的，通过事件在关键转换点保持同步：
+// 【运行时真相源契约说明】
+// 统一口径见：src/orchestrator/runtime/runtime-truth-contract.ts
 //
-// 1. Mission.status (本文件) — 任务生命周期的事实源
-//    职责：记录任务从 draft → planning → executing → reviewing → completed 的宏观阶段
-//    消费者：UI 展示、任务列表查询、状态机转换约束
+// 当前系统运行态分布在三个持久化/瞬态层级，各自服务不同目的，通过事件在关键转换点保持同步：
+//
+// 1. Mission.status / deliveryStatus (本文件) — 业务任务投影层
+//    职责：记录任务生命周期、交付状态与任务列表展示所需信息
+//    消费者：UI 任务列表、任务详情、状态机转换约束
 //
 // 2. PlanRecord.runtime (plan-ledger/types.ts) — 执行计划的细粒度运行态
 //    职责：记录 acceptance/review/replan/wait/termination 等执行细节
@@ -40,8 +43,6 @@ import { UnifiedTodo, TodoType, TodoStatus } from '../../todo/types';
 export type MissionStatus =
   | 'draft'            // 草稿
   | 'planning'         // 规划中
-  | 'pending_review'   // 等待审查
-  | 'pending_approval' // 等待用户确认
   | 'executing'        // 执行中
   | 'paused'           // 暂停
   | 'reviewing'        // 验收中
@@ -64,7 +65,6 @@ export type MissionDeliveryStatus =
  */
 export type MissionContinuationPolicy =
   | 'auto'  // 自动修复
-  | 'ask'   // 请求用户确认
   | 'stop'; // 停止推进
 
 /**
@@ -76,7 +76,6 @@ export type MissionPhase =
   | 'contract_definition'      // 定义契约
   | 'responsibility_assignment' // 分配职责
   | 'worker_planning'          // Worker 规划
-  | 'plan_review'              // 规划审查
   | 'execution'                // 执行
   | 'verification'             // 验收
   | 'summary';                 // 总结
@@ -263,6 +262,48 @@ export interface VerificationSpec {
   customValidator?: string;
 }
 
+export type AcceptanceExecutionStatus = 'skipped' | 'passed' | 'failed';
+
+export type AcceptanceExecutionSkippedReason =
+  | 'no_runner'
+  | 'no_entries'
+  | 'execution_failed'
+  | 'no_changes';
+
+export interface AcceptanceBaseVerificationReport {
+  status: 'not_run' | 'passed' | 'failed';
+  summary: string;
+  details?: string;
+  warnings?: string[];
+}
+
+export interface AcceptanceCriterionExecutionReport {
+  criterionId: string;
+  type: VerificationSpecType;
+  status: 'passed' | 'failed';
+  detail: string;
+  executorId: string;
+}
+
+export interface AcceptanceCriteriaExecutionSummary {
+  total: number;
+  passed: number;
+  failed: number;
+}
+
+export interface AcceptanceExecutionReport {
+  status: AcceptanceExecutionStatus;
+  summary: string;
+  details?: string;
+  warnings?: string[];
+  skippedReason?: AcceptanceExecutionSkippedReason;
+  modifiedFiles?: string[];
+  baseVerification?: AcceptanceBaseVerificationReport;
+  criteriaResults?: AcceptanceCriterionExecutionReport[];
+  criteriaSummary?: AcceptanceCriteriaExecutionSummary;
+  trace?: OrchestrationTraceLinks;
+}
+
 /**
  * 验收标准评审记录
  */
@@ -414,6 +455,8 @@ export interface ContractResolution {
 export interface Assignment {
   id: string;
   missionId: string;
+  /** 运行链路追踪上下文 */
+  trace?: OrchestrationTraceLinks;
 
   // ===== Worker 分配 =====
   workerId: WorkerSlot;

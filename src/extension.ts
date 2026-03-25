@@ -9,9 +9,11 @@ import { MermaidPanel } from './ui/mermaid-panel';
 import { globalEventBus } from './events';
 import { t, setLocale as setExtensionLocale } from './i18n';
 import { ConfigManager } from './config';
+import { LocalAgentManager } from './agent/client/local-agent-manager';
 
 let webviewProvider: WebviewProvider | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
+let localAgentManager: LocalAgentManager | undefined;
 
 /**
  * 扩展激活
@@ -31,14 +33,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return;
   }
 
-  // 创建 Webview Provider
+  // 启动门闩：先确定 Agent 后台是否可用，再决定 WebviewProvider 运行模式
+  localAgentManager = new LocalAgentManager(context.extensionPath);
+  let agentBaseUrl = '';
+  try {
+    await localAgentManager.ensureStarted();
+    agentBaseUrl = localAgentManager.getBaseUrl();
+    logger.info('扩展.Agent.已就绪', { baseUrl: agentBaseUrl }, LogCategory.SYSTEM);
+  } catch (error) {
+    logger.warn('扩展.Agent.启动失败.回退宿主运行时', { error: error instanceof Error ? error.message : String(error) }, LogCategory.SYSTEM);
+    // Agent 不可用：WebviewProvider 将以完整 runtime 模式运行
+  }
+
+  // 创建 WebviewProvider：Agent 可用时为壳模式，不可用时为完整 runtime 模式
   webviewProvider = new WebviewProvider(
     context.extensionUri,
     context,
-    workspaceFolders
+    workspaceFolders,
+    agentBaseUrl,
   );
 
-  // 注册 Webview Provider
+  // 注册 Webview Provider（壳）
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
       WebviewProvider.viewType,
@@ -185,6 +200,52 @@ function registerCommands(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('magi.openWebClient', async () => {
+      if (!localAgentManager) {
+        vscode.window.showWarningMessage('Local Agent 尚未初始化');
+        return;
+      }
+      try {
+        await localAgentManager.openWebClient();
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(`打开 Web 客户端失败：${msg}`);
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('magi.restartAgent', async () => {
+      if (!localAgentManager) {
+        vscode.window.showWarningMessage('Local Agent 尚未初始化');
+        return;
+      }
+      try {
+        await localAgentManager.restart();
+        vscode.window.showInformationMessage('Local Agent 已重启');
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(`重启 Local Agent 失败：${msg}`);
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('magi.showAgentStatus', async () => {
+      if (!localAgentManager) {
+        vscode.window.showWarningMessage('Local Agent 尚未初始化');
+        return;
+      }
+      const healthy = await localAgentManager.isHealthy();
+      vscode.window.showInformationMessage(
+        healthy
+          ? `Local Agent 已连接：${localAgentManager.getBaseUrl()}`
+          : 'Local Agent 当前未运行'
+      );
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand('magi.interruptTask', () => {
       globalEventBus.emitEvent('task:cancelled', {});
       vscode.window.showInformationMessage(t('extension.cancelingTask'));
@@ -224,6 +285,12 @@ export async function deactivate(): Promise<void> {
       statusBarItem.dispose();
       statusBarItem = undefined;
       logger.info('扩展.停用.状态栏.已清理', undefined, LogCategory.SYSTEM);
+    }
+
+    if (localAgentManager) {
+      await localAgentManager.dispose();
+      localAgentManager = undefined;
+      logger.info('扩展.停用.Agent.租约已释放', undefined, LogCategory.SYSTEM);
     }
 
     logger.info('扩展.停用.完成', undefined, LogCategory.SYSTEM);

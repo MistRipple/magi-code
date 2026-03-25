@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Message, PlaceholderState, Task } from '../types/message';
+  import type { Message, PlaceholderState } from '../types/message';
   import type { IconName } from '../lib/icons';
   import MarkdownContent from './MarkdownContent.svelte';
   import WorkerBadge from './WorkerBadge.svelte';
@@ -8,11 +8,9 @@
   import Icon from './Icon.svelte';
   import RetryRuntimeIndicator from './RetryRuntimeIndicator.svelte';
   import ErrorDetailPopover from './ErrorDetailPopover.svelte';
+  import { deriveWorkerLifecycleCardViewModel } from '../lib/worker-lifecycle-card';
   import { i18n } from '../stores/i18n.svelte';
   import { getState, retryRuntimeState } from '../stores/messages.svelte';
-  import { normalizeWorkerSlot } from '../lib/message-classifier';
-  import { buildWaitResultFromTaskCardMessage, resolveTaskCardKeyFromMetadata } from '../lib/task-card-runtime';
-  import { ensureArray } from '../lib/utils';
 
   // Props
   interface Props {
@@ -32,15 +30,11 @@
     showStreamingIndicator = true,
     streamingElapsedSeconds = 0,
   }: Props = $props();
-
   const appState = getState();
-  const tasks = $derived(ensureArray(appState.tasks) as Task[]);
-  const workerRuntimeMap = $derived(appState.workerRuntime);
-  const workerWaitResults = $derived(appState.workerWaitResults);
 
   // 派生状态
   const isUser = $derived(message.type === 'user_input');
-  const isNotice = $derived(message.type === 'system-notice' || message.type === 'error');
+  const isNotice = $derived(message.type === 'system-notice');
   const interactionMeta = $derived(message.metadata?.interaction as { prompt?: string; type?: string } | undefined);
   const isInteraction = $derived(Boolean(interactionMeta));
   const isStreaming = $derived(message.isStreaming);
@@ -83,18 +77,6 @@
     return false;
   });
 
-  // 纯内容消息判断：只含 text/code blocks 的消息使用 inline 模式渲染，
-  // 不需要卡片包裹——它们是模型输出的自然语言内容和代码片段，
-  // 只有 tool_call / thinking / plan / file_change 等过程性内容才需要卡片。
-  const isContentOnly = $derived.by(() => {
-    if (safeBlocks.length === 0) return Boolean(message.content);
-    return safeBlocks.every(b => b.type === 'text' || b.type === 'code');
-  });
-
-  // 最终是否使用 inline 模式：主角色始终 inline；
-  // 非主角色仅在消息最终确定形态（非流式、非占位）且为纯内容时才 inline，
-  // 避免流式过程中 blocks 类型变化导致 DOM 分支切换闪烁。
-  const useInlineMode = $derived(isNativeSource || (!isStreaming && !isPlaceholder && isContentOnly));
   const messagePhase = $derived.by(() => (
     typeof message.metadata?.phase === 'string' ? message.metadata.phase.trim() : ''
   ));
@@ -134,6 +116,36 @@
     return nonEmptyLines >= 3 || normalized.length >= 140;
   });
 
+  function resolveBlockRenderKey(
+    block: import('../types/message').ContentBlock,
+    index: number,
+  ): string {
+    const candidate = block as Record<string, unknown>;
+    const explicitBlockId = typeof candidate.blockId === 'string' && candidate.blockId.trim().length > 0
+      ? candidate.blockId.trim()
+      : (typeof candidate.id === 'string' && candidate.id.trim().length > 0 ? candidate.id.trim() : '');
+    if (explicitBlockId) {
+      return `${message.id}:${block.type}:${explicitBlockId}`;
+    }
+    if (block.type === 'tool_call') {
+      const toolId = typeof candidate.toolId === 'string' && candidate.toolId.trim().length > 0
+        ? candidate.toolId.trim()
+        : '';
+      if (toolId) {
+        return `${message.id}:tool_call:${toolId}`;
+      }
+    }
+    if (block.type === 'file_change') {
+      const filePath = typeof candidate.filePath === 'string' && candidate.filePath.trim().length > 0
+        ? candidate.filePath.trim()
+        : '';
+      if (filePath) {
+        return `${message.id}:file_change:${filePath}`;
+      }
+    }
+    return `${message.id}:${block.type}:slot-${index}`;
+  }
+
   // 格式化时间戳
   function formatTime(timestamp: number): string {
     const date = new Date(timestamp);
@@ -155,144 +167,14 @@
   const badgeWorker = $derived(worker || (message.source === 'orchestrator' ? 'orchestrator' : message.source));
 
   // 子任务卡片消息，作为独立消息存在
-  const isSubTaskCardOnly = $derived(message.type === 'task_card');
-  const isWorkerSingleCard = $derived(isSubTaskCardOnly || message.type === 'instruction');
-
-  type CardWorkerStatus = 'pending' | 'running' | 'completed' | 'failed' | 'stopped' | 'skipped';
-
-  const subTaskId = $derived.by(() => {
-    const metaId = typeof message.metadata?.subTaskId === 'string' ? message.metadata?.subTaskId : '';
-    if (metaId) return metaId;
-    const cardId = typeof (message.metadata?.subTaskCard as { id?: unknown } | undefined)?.id === 'string'
-      ? (message.metadata?.subTaskCard as { id: string }).id
-      : '';
-    return cardId || null;
-  });
-
-  const subTaskFromTasks = $derived.by(() => {
-    if (!subTaskId) return null;
-    for (const task of tasks) {
-      const found = (task.subTasks || []).find((st) => st.id === subTaskId);
-      if (found) return found;
-    }
-    return null;
-  });
-
-  function mapSubTaskStatusToCard(status?: string): CardWorkerStatus | undefined {
-    if (!status) return undefined;
-    switch (status) {
-      case 'running':
-        return 'running';
-      case 'in_progress':
-        return 'running';
-      case 'completed':
-        return 'completed';
-      case 'failed':
-        return 'failed';
-      case 'skipped':
-        return 'skipped';
-      case 'cancelled':
-        return 'stopped';
-      case 'blocked':
-      case 'paused':
-      case 'pending':
-        return 'pending';
-      default:
-        return undefined;
-    }
-  }
-
-  const subTaskStatusOverride = $derived.by(() => mapSubTaskStatusToCard(subTaskFromTasks?.status));
-  const subTaskStartedAtOverride = $derived.by(() => subTaskFromTasks?.startedAt);
-
-  const instructionWorkerName = $derived(normalizeWorkerSlot(message.metadata?.worker || message.metadata?.agent));
-
-  // 任务说明消息（编排者派发给 Worker）
-  const isInstruction = $derived(message.type === 'instruction');
-  const instructionTargetWorker = $derived(
-    (message.metadata?.worker || message.metadata?.agent) as string | undefined
-  );
-  const instructionCardPayload = $derived.by(() => ({
-    title: message.content || '',
-    description: typeof message.metadata?.description === 'string' ? message.metadata?.description : undefined,
-    worker: instructionTargetWorker || (message.metadata?.assignedWorker as string | undefined),
+  const workerRuntimeMap = $derived(appState.workerRuntime);
+  const workerWaitResults = $derived(appState.workerWaitResults);
+  const workerLifecycleCard = $derived.by(() => deriveWorkerLifecycleCardViewModel({
+    message,
+    workerRuntimeMap,
+    workerWaitResults,
   }));
-
-  const cardWorker = $derived.by(() => {
-    const rawWorker = (message.metadata?.subTaskCard as { worker?: unknown } | undefined)?.worker
-      || message.metadata?.assignedWorker
-      || instructionWorkerName
-      || message.metadata?.worker;
-    return normalizeWorkerSlot(rawWorker);
-  });
-
-  const workerRuntime = $derived.by(() => (cardWorker ? workerRuntimeMap[cardWorker] : null));
-  const cardKey = $derived.by(() => {
-    return resolveTaskCardKeyFromMetadata(message.metadata as Record<string, unknown> | undefined);
-  });
-  const persistedTaskCardWaitResult = $derived.by(() => buildWaitResultFromTaskCardMessage(message)?.result || null);
-  const workerWaitResult = $derived.by(() => {
-    if (cardKey && workerWaitResults?.[cardKey]) {
-      return workerWaitResults[cardKey];
-    }
-    return persistedTaskCardWaitResult;
-  });
-
-  function mapRuntimeStatusToCard(status?: string | null): CardWorkerStatus | undefined {
-    if (!status) return undefined;
-    switch (status) {
-      case 'running':
-        return 'running';
-      case 'blocked':
-        return 'pending';
-      case 'failed':
-        return 'failed';
-      case 'completed':
-        return 'completed';
-      default:
-        return undefined;
-    }
-  }
-
-  const runtimeStatusOverride = $derived.by(() => mapRuntimeStatusToCard(workerRuntime?.status));
-  function mapWaitResultStatus(status?: string): CardWorkerStatus | undefined {
-    switch (status) {
-      case 'completed':
-        return 'completed';
-      case 'failed':
-        return 'failed';
-      case 'skipped':
-        return 'skipped';
-      case 'cancelled':
-        return 'stopped';
-      default:
-        return undefined;
-    }
-  }
-
-  const waitResultStatusOverride = $derived.by(() => {
-    if (!workerWaitResult || !workerWaitResult.results || workerWaitResult.results.length === 0) return undefined;
-    return mapWaitResultStatus(workerWaitResult.results[0]?.status);
-  });
-
-  // 消息自身携带的 subTaskCard.status — 后端 emitSubTaskCard 写入，随消息持久化
-  // 作为比 runtimeStatusOverride 更优先的保护层，防止 Worker 级别的全局状态穿透已完成的旧卡片
-  const metadataCardStatus = $derived.by(() => {
-    const cardData = message.metadata?.subTaskCard as { status?: string, wait_status?: string } | undefined;
-    // 如果已经固化了 wait_status，则优先返回 wait_status 对应的卡片状态
-    if (cardData?.wait_status) {
-      return mapWaitResultStatus(cardData.wait_status);
-    }
-    return mapSubTaskStatusToCard(cardData?.status);
-  });
-
-  const cardStatusOverride = $derived.by(() => {
-    // 3 层优先级：subTask(tasks数组) > waitResult(全局缓存) > metadata(消息自身) > runtime(Worker级)
-    return subTaskStatusOverride || waitResultStatusOverride || metadataCardStatus || runtimeStatusOverride;
-  });
-  const cardStartedAtOverride = $derived.by(() =>
-    subTaskStartedAtOverride ?? (isInstruction ? message.timestamp : undefined)
-  );
+  const isWorkerSingleCard = $derived(Boolean(workerLifecycleCard));
 
   // 通知类型和对应的图标/颜色（使用 Message 类型中的 noticeType）
   const noticeType = $derived(message.noticeType || 'info');
@@ -331,19 +213,10 @@
     previewImageUrl = '';
   }
 
-  // 复制内容
-  async function handleCopy() {
-    if (!message.content) return;
-    try {
-      await navigator.clipboard.writeText(message.content);
-    } catch (e) {
-      console.error('复制失败:', e);
-    }
-  }
 </script>
 
-<!-- 系统通知消息：居中显示 -->
-{#if isNotice}
+<!-- 系统通知消息：居中显示（必须有实际文本内容才渲染） -->
+{#if isNotice && message.content && message.content.trim()}
   <div class="system-notice {noticeType}">
     <span class="notice-icon" style="color: {noticeColors[noticeType] || noticeColors.info}">
       <Icon name={noticeIcons[noticeType] || 'info'} size={14} />
@@ -376,132 +249,34 @@
 {:else if isWorkerSingleCard}
   <div class="message-item subtask-card-only" data-message-id={message.id} data-source={message.source}>
     <SubTaskSummaryCard
-      card={(isSubTaskCardOnly ? (message.metadata?.subTaskCard as any) : instructionCardPayload) as any}
+      card={workerLifecycleCard!.card}
       {readOnly}
       messageTimestamp={message.timestamp}
-      statusOverride={cardStatusOverride}
-      startedAtOverride={cardStartedAtOverride}
-      runtimeStatus={workerRuntime?.status}
-      waitResult={workerWaitResult}
+      startedAtOverride={workerLifecycleCard!.startedAtOverride}
+      runtimeStatus={workerLifecycleCard!.runtimeStatus}
+      waitResult={workerLifecycleCard!.waitResult}
+      showWaitReport={workerLifecycleCard!.showWaitReport}
     />
   </div>
-<!-- 助手消息：纯文本内容使用 inline 模式，结构化内容使用 card 模式 -->
-{:else if useInlineMode}
-  <!-- inline 模式：无卡片边框和 header，自然融入对话流 -->
+<!-- 助手消息：单一纯流式渲染路径，收到什么立即展示，不做模式切换 -->
+{:else}
   <div
-    class="message-item assistant native"
+    class="message-item assistant"
+    class:native={isNativeSource}
     class:inline-guest={!isNativeSource}
     class:streaming={isStreaming}
     class:placeholder={isPlaceholder}
     class:was-placeholder={wasPlaceholder}
+    class:no-visible-content={!hasVisibleContent && !isNativeSource}
     data-message-id={message.id}
     data-source={message.source}
     data-interaction={isInteraction ? 'true' : 'false'}
     data-placeholder-state={isPlaceholder ? placeholderState : undefined}
   >
-    <div class="message-content">
-      {#if isPlaceholder}
-        <div class="placeholder-content">
-          {#if showStreamingIndicator}
-            <div class="streaming-indicator-bottom">
-              <span class="streaming-dot"></span>
-              <span class="streaming-dot"></span>
-              <span class="streaming-dot"></span>
-              <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
-            </div>
-          {/if}
-        </div>
-      {:else}
-        <!-- 非主角色的纯文本消息：在内容前显示来源标识 -->
-        {#if !isNativeSource}
-          <div class="inline-source-tag">
-            <WorkerBadge worker={badgeWorker} size="sm" />
-          </div>
-        {/if}
-
-        {#if isInteraction && interactionMeta?.prompt}
-          <div class="interaction-inline">
-            <Icon name="sparkles" size={14} />
-            <span>{interactionMeta.prompt}</span>
-          </div>
-        {/if}
-
-        {#if shouldCollapseSystemSection && safeBlocks.length === 0 && message.content}
-          <details class="system-section-fold" data-system-section-type={systemSectionType || undefined}>
-            <summary class="system-section-summary">
-              <span class="system-section-badge">{i18n.t('messageItem.systemSectionBadge')}</span>
-              <span class="system-section-title">{systemSectionSummary || i18n.t('messageItem.systemSectionTitleFallback')}</span>
-              <span class="system-section-hint">{i18n.t('messageItem.systemSectionExpandHint')}</span>
-            </summary>
-            <div class="system-section-content">
-              <MarkdownContent content={message.content} isStreaming={false} />
-            </div>
-          </details>
-        {:else if safeBlocks.length > 0}
-          {#each safeBlocks as block, i (`${message.id}-block-${i}-${block.type}`)}
-            <BlockRenderer {block} {isStreaming} {readOnly} />
-          {/each}
-        {:else if message.content}
-          <MarkdownContent content={message.content} {isStreaming} />
-        {/if}
-
-          <!-- 只要处于流式接收状态，就应该在最底部渲染跳动的加载点，不论是否有内容 -->
-          {#if isStreaming && showStreamingIndicator}
-            <div class="streaming-indicator-bottom fallback" class:has-content={hasVisibleContent}>
-              <span class="streaming-dot"></span>
-              <span class="streaming-dot"></span>
-              <span class="streaming-dot"></span>
-              <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
-            </div>
-          {/if}
-
-          {#if retryRuntime}
-            <RetryRuntimeIndicator runtime={retryRuntime} />
-          {/if}
-
-      {/if}
-    </div>
-  </div>
-{:else}
-  <!-- card 模式：含结构化内容（tool_call/thinking/code/plan 等）的消息，有卡片边框和 header -->
-  <div
-    class="message-item assistant"
-    class:streaming={isStreaming}
-    class:placeholder={isPlaceholder}
-    class:was-placeholder={wasPlaceholder}
-    class:no-visible-content={!hasVisibleContent}
-    data-message-id={message.id}
-    data-source={message.source}
-    data-interaction={isInteraction ? 'true' : 'false'}
-    data-placeholder-state={isPlaceholder ? placeholderState : undefined}
-  >
-    <!-- 当真正有内容时才展开 header，或者不处于 streaming 状态 -->
-    {#if hasVisibleContent || !isStreaming || isPlaceholder}
-      <div class="message-header" class:fade-in={hasVisibleContent && isStreaming}>
-        <div class="message-source">
-          <WorkerBadge worker={badgeWorker} size="sm" />
-          {#if isPlaceholder}
-            <span class="placeholder-status">
-              {#if placeholderState === 'pending'}
-                {i18n.t('messageItem.placeholder.pending')}
-              {:else if placeholderState === 'received'}
-                {i18n.t('messageItem.placeholder.received')}
-              {:else if placeholderState === 'thinking'}
-                {i18n.t('messageItem.placeholder.thinking')}
-              {:else}
-                {i18n.t('messageItem.placeholder.processing')}
-              {/if}
-            </span>
-          {/if}
-        </div>
-        <div class="message-meta">
-          <span class="message-time">{formatTime(message.timestamp)}</span>
-          {#if !isStreaming && !isPlaceholder}
-            <button class="copy-btn" onclick={handleCopy} title={i18n.t('messageItem.copyTitle')}>
-              <Icon name="copy" size={12} />
-            </button>
-          {/if}
-        </div>
+    <!-- 非主角色：在内容前显示来源标识 -->
+    {#if !isNativeSource && !isPlaceholder}
+      <div class="inline-source-tag">
+        <WorkerBadge worker={badgeWorker} size="sm" />
       </div>
     {/if}
 
@@ -537,26 +312,29 @@
             </div>
           </details>
         {:else if safeBlocks.length > 0}
-          {#each safeBlocks as block, i (`${message.id}-block-${i}-${block.type}`)}
-            <BlockRenderer {block} {isStreaming} {readOnly} />
+          {#each safeBlocks as block, i (resolveBlockRenderKey(block, i))}
+            {@const blockIsStreaming = block.type === 'thinking'
+              ? (isStreaming && i === safeBlocks.length - 1)
+              : isStreaming}
+            <BlockRenderer {block} isStreaming={blockIsStreaming} {readOnly} />
           {/each}
         {:else if message.content}
           <MarkdownContent content={message.content} {isStreaming} />
         {/if}
 
-          <!-- 与主角色消息保持一致：处于流式接收时在底部展示统一三点动画 -->
-          {#if isStreaming && showStreamingIndicator}
-            <div class="streaming-indicator-bottom fallback" class:has-content={hasVisibleContent}>
-              <span class="streaming-dot"></span>
-              <span class="streaming-dot"></span>
-              <span class="streaming-dot"></span>
-              <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
-            </div>
-          {/if}
+        {#if isStreaming && showStreamingIndicator}
+          <div class="streaming-indicator-bottom fallback" class:has-content={hasVisibleContent}>
+            <span class="streaming-dot"></span>
+            <span class="streaming-dot"></span>
+            <span class="streaming-dot"></span>
+            <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
+          </div>
+        {/if}
 
-          {#if retryRuntime}
-            <RetryRuntimeIndicator runtime={retryRuntime} />
-          {/if}
+        {#if retryRuntime}
+          <RetryRuntimeIndicator runtime={retryRuntime} />
+        {/if}
+
       {/if}
     </div>
   </div>
@@ -713,11 +491,6 @@
     padding-top: var(--space-2);
   }
 
-  /* 渐入动画，用于内容首次出现时平滑展开 Header */
-  .message-header.fade-in {
-    animation: contentFadeIn 0.3s ease-out;
-  }
-
   .interaction-inline {
     display: flex;
     align-items: center;
@@ -780,48 +553,6 @@
   }
   /* 流式时不再变更边框颜色，避免 streaming 状态快速切换导致边框线闪烁 */
 
-  .message-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: var(--space-3);
-    font-size: var(--text-sm);
-  }
-  .message-source {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-  }
-  .message-meta {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    margin-left: auto;  /* 确保始终右对齐 */
-  }
-  .message-time {
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-  }
-  .copy-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 22px;
-    height: 22px;
-    padding: 0;
-    background: transparent;
-    border: none;
-    border-radius: var(--radius-sm);
-    color: var(--foreground-muted);
-    cursor: pointer;
-    opacity: 0;
-    transition: all var(--transition-fast);
-  }
-  .message-item:hover .copy-btn { opacity: 1; }
-  .copy-btn:hover {
-    background: var(--surface-hover);
-    color: var(--foreground);
-  }
   .message-content {
     line-height: var(--leading-relaxed);
     word-wrap: break-word;
@@ -905,12 +636,6 @@
   /* ===== 占位消息样式（统一在 assistant 卡片内） ===== */
   .message-item.assistant.placeholder {
     border-left: 3px solid var(--info);
-  }
-
-  .placeholder-status {
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    font-style: italic;
   }
 
   .placeholder-content {
@@ -1007,4 +732,5 @@
     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
     pointer-events: auto;
   }
+
 </style>

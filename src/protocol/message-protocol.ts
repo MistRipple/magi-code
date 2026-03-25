@@ -97,43 +97,39 @@ export enum ControlMessageType {
  * 通知消息级别（NotifyLevel）
  */
 export type NotifyLevel = 'info' | 'success' | 'warning' | 'error';
+export type NotifyDisplayMode = 'auto' | 'toast' | 'notification_center' | 'silent';
+export type NotifyCategory = 'incident' | 'audit' | 'feedback';
 
 /**
  * 数据消息类型（DataMessageType）
  */
 export type DataMessageType =
-  | 'allWorkerConfigsLoaded'
   | 'assignmentCompleted'
   | 'assignmentPlanned'
   | 'assignmentStarted'
   | 'clarificationRequest'
-  | 'auxiliaryConfigLoaded'
   | 'auxiliaryConnectionTestResult'
-  | 'confirmationRequest'
-  | 'deliveryRepairRequest'
   | 'customToolAdded'
   | 'customToolRemoved'
-  | 'deepTaskChanged'
   | 'dynamicTodoAdded'
   | 'executionTokenRuntime'
   | 'executionStatsUpdate'
   | 'instructionSkillRemoved'
   | 'interactionModeChanged'
+  | 'lanAccessInfo'
+  | 'tunnelState'
   | 'llmRetryRuntime'
   | 'mcpServerAdded'
   | 'mcpServerDeleted'
   | 'mcpServerTools'
   | 'mcpServerUpdated'
-  | 'mcpServersLoaded'
   | 'mcpToolsRefreshed'
   | 'missionExecutionFailed'
   | 'missionFailed'
   | 'missionPlanned'
   | 'modelListFetched'
-  | 'orchestratorConfigLoaded'
   | 'orchestratorConnectionTestResult'
   | 'orchestratorRuntimeDiagnostics'
-  | 'profileConfig'
   | 'profileConfigReset'
   | 'profileConfigSaved'
   | 'projectKnowledgeLoaded'
@@ -143,36 +139,31 @@ export type DataMessageType =
   | 'planLedgerUpdated'
   | 'promptEnhanced'
   | 'recoveryRequest'
-  | 'repositoriesLoaded'
   | 'repositoryAdded'
   | 'repositoryAddFailed'
   | 'repositoryDeleted'
   | 'repositoryRefreshed'
-  | 'sessionCreated'
-  | 'sessionLoaded'
-  | 'sessionMessagesLoaded'
-  | 'sessionSwitched'
+  | 'settingsBootstrapLoaded'
+  | 'sessionBootstrapLoaded'
+  | 'timelineProjectionUpdated'
+  | 'sessionNotificationsLoaded'
   | 'sessionsUpdated'
   | 'skillInstalled'
   | 'skillInstallFailed'
   | 'skillUpdated'
   | 'allSkillsUpdated'
   | 'skillLibraryLoaded'
-  | 'skillsConfigLoaded'
   | 'stateUpdate'
   | 'todoApprovalRequested'
   | 'todoCompleted'
   | 'todoFailed'
   | 'todoStarted'
-  | 'terminalStreamStarted'
-  | 'terminalStreamFrame'
-  | 'terminalStreamCompleted'
   | 'toolAuthorizationRequest'
   | 'workerConnectionTestResult'
   | 'workerQuestionRequest'
   | 'workerSessionCreated'
   | 'workerSessionResumed'
-  | 'workerStatusUpdate';
+  | 'executionChainInterrupted';
 
 /**
  * 消息生命周期状态
@@ -397,7 +388,24 @@ export interface ControlPayload {
 /**
  * NOTIFY 类别专属字段
  */
-export interface NotifyPayload {
+export interface NotifyPresentation {
+  /** 显示策略：toast / 仅通知中心 / 静默 / 自动决策 */
+  displayMode?: NotifyDisplayMode;
+  /** 通知归类：决定通知中心的分组与默认打断级别 */
+  category?: NotifyCategory;
+  /** 运行时来源：用于前端归档策略 */
+  source?: string;
+  /** 是否需要用户关注或后续处理 */
+  actionRequired?: boolean;
+  /** 是否持久化到通知中心 */
+  persistToCenter?: boolean;
+  /** 是否计入未读数 */
+  countUnread?: boolean;
+  /** 可选标题 */
+  title?: string;
+}
+
+export interface NotifyPayload extends NotifyPresentation {
   /** 通知级别 */
   level: NotifyLevel;
   /** 显示时长（毫秒），默认 3000 */
@@ -543,10 +551,12 @@ export interface MessageMetadata {
   worker?: string;
   /** 是否派发给 Worker 的指令消息 */
   dispatchToWorker?: boolean;
+  /** Worker 生命周期所属的 dispatch wave 标识 */
+  dispatchWaveId?: string;
   /** Worker lane 标识（同一 batch+worker 执行链） */
   laneId?: string;
-  /** Worker lane 指令卡片 ID（用于卡片聚合更新） */
-  laneCardId?: string;
+  /** Worker 生命周期卡片 ID（同一 wave + lane 的稳定卡片实体） */
+  workerCardId?: string;
   /** Worker lane 当前任务序号（从 1 开始） */
   laneIndex?: number;
   /** Worker lane 任务总数 */
@@ -563,6 +573,21 @@ export interface MessageMetadata {
     dependsOn?: string[];
     isCurrent?: boolean;
   }>;
+  /** Worker lane 内每个任务的聚合卡片快照（用于同一 worker 同轮多任务摘要聚合） */
+  laneTaskCards?: Array<{
+    taskId: string;
+    title: string;
+    worker?: string;
+    status: 'pending' | 'waiting_deps' | 'running' | 'completed' | 'failed' | 'skipped' | 'cancelled';
+    summary?: string;
+    fullSummary?: string;
+    error?: string;
+    failureCode?: string;
+    recoverable?: boolean;
+    modifiedFiles?: string[];
+    createdFiles?: string[];
+    duration?: number;
+  }>;
   /** 子任务数据（主对话区 TASK_CARD 消息携带的完整数据） */
   subTaskCard?: unknown;
   /** 扩展数据 */
@@ -577,6 +602,8 @@ export interface MessageMetadata {
   reason?: string;
   /** 请求 ID（用于占位/响应绑定） */
   requestId?: string;
+  /** 时间轴锚点时间（用于按派发语义而非到达时机排序） */
+  timelineAnchorTimestamp?: number;
   /** 对话轮次 ID（用于计划账本/快照/对话回溯的同轮对齐） */
   turnId?: string;
   /** 卡片实体 ID（流式更新必须绑定同一 cardId） */
@@ -834,13 +861,14 @@ export function createControlMessage(
 }
 
 /**
- * 创建通知消息（Toast）
+ * 创建通知消息
  */
 export function createNotifyMessage(
   content: string,
   level: NotifyLevel,
   traceId: string,
   duration?: number,
+  presentation?: NotifyPresentation,
   options?: Partial<StandardMessage>
 ): StandardMessage {
   return createStandardMessage({
@@ -852,7 +880,7 @@ export function createNotifyMessage(
     lifecycle: MessageLifecycle.COMPLETED,
     blocks: [{ type: 'text', content }],
     metadata: {},
-    notify: { level, duration },
+    notify: { level, duration, ...(presentation || {}) },
     ...options,
   });
 }

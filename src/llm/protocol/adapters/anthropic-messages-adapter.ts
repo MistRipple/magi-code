@@ -36,11 +36,12 @@ export class AnthropicMessagesProtocolAdapter implements ProviderProtocolAdapter
     const { messages, systemPrompt } = this.convertToAnthropicFormat(request);
     const sanitizedTools = this.sanitizeToolsForAnthropic(request.tools);
     const supportsThinking = this.shouldEnableThinking();
+    const thinkingParams = supportsThinking ? this.resolveThinkingParams() : undefined;
 
     const requestParams: any = {
       model: this.config.model,
-      max_tokens: supportsThinking
-        ? Math.max(request.maxTokens || 16000, 16000)
+      max_tokens: thinkingParams
+        ? Math.max(request.maxTokens || thinkingParams.maxTokens, thinkingParams.maxTokens)
         : (request.maxTokens || 4096),
       temperature: request.temperature,
       system: systemPrompt,
@@ -53,10 +54,10 @@ export class AnthropicMessagesProtocolAdapter implements ProviderProtocolAdapter
       requestParams.tool_choice = anthropicToolChoice;
     }
 
-    if (supportsThinking) {
+    if (thinkingParams) {
       requestParams.thinking = {
         type: 'enabled',
-        budget_tokens: 10000,
+        budget_tokens: thinkingParams.budgetTokens,
       };
       delete requestParams.temperature;
     }
@@ -74,11 +75,12 @@ export class AnthropicMessagesProtocolAdapter implements ProviderProtocolAdapter
     const { messages, systemPrompt } = this.convertToAnthropicFormat(request);
     const sanitizedTools = this.sanitizeToolsForAnthropic(request.tools);
     const supportsThinking = this.shouldEnableThinking();
+    const thinkingParams = supportsThinking ? this.resolveThinkingParams() : undefined;
 
     const requestParams: any = {
       model: this.config.model,
-      max_tokens: supportsThinking
-        ? Math.max(request.maxTokens || 16000, 16000)
+      max_tokens: thinkingParams
+        ? Math.max(request.maxTokens || thinkingParams.maxTokens, thinkingParams.maxTokens)
         : (request.maxTokens || 4096),
       temperature: request.temperature,
       system: systemPrompt,
@@ -92,15 +94,16 @@ export class AnthropicMessagesProtocolAdapter implements ProviderProtocolAdapter
       requestParams.tool_choice = anthropicToolChoice;
     }
 
-    if (supportsThinking) {
+    if (thinkingParams) {
       requestParams.thinking = {
         type: 'enabled',
-        budget_tokens: 10000,
+        budget_tokens: thinkingParams.budgetTokens,
       };
       delete requestParams.temperature;
       logger.debug('Anthropic thinking enabled', {
         model: this.config.model,
-        budgetTokens: 10000,
+        reasoningEffort: this.config.reasoningEffort || 'high',
+        budgetTokens: thinkingParams.budgetTokens,
       }, LogCategory.LLM);
     }
 
@@ -331,6 +334,25 @@ export class AnthropicMessagesProtocolAdapter implements ProviderProtocolAdapter
     return this.config.enableThinking === true;
   }
 
+  /**
+   * 根据 reasoningEffort 映射 Anthropic thinking 参数。
+   * budget_tokens 必须 < max_tokens，这里同时返回两者。
+   */
+  private resolveThinkingParams(): { maxTokens: number; budgetTokens: number } {
+    switch (this.config.reasoningEffort) {
+      case 'low':
+        return { maxTokens: 8000, budgetTokens: 2000 };
+      case 'medium':
+        return { maxTokens: 12000, budgetTokens: 5000 };
+      case 'xhigh':
+        return { maxTokens: 32000, budgetTokens: 20000 };
+      case 'high':
+      default:
+        // high 或未设置时保持原有默认值
+        return { maxTokens: 16000, budgetTokens: 10000 };
+    }
+  }
+
   private convertToAnthropicFormat(params: LLMMessageParams): {
     messages: Anthropic.MessageParam[];
     systemPrompt?: string;
@@ -386,7 +408,9 @@ export class AnthropicMessagesProtocolAdapter implements ProviderProtocolAdapter
     let content = '';
     const toolCalls: ToolCall[] = [];
 
-    for (const block of response.content) {
+    // 外部 API（尤其是中转站）可能返回 content 为 null/undefined/string
+    const contentBlocks = Array.isArray(response.content) ? response.content : [];
+    for (const block of contentBlocks) {
       if (block.type === 'text') {
         content += block.text;
       } else if (block.type === 'tool_use') {

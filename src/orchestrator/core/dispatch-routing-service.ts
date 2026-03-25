@@ -2,10 +2,12 @@ import type { WorkerSlot } from '../../types';
 import type { ProfileLoader } from '../profile/profile-loader';
 import { LLMConfigLoader } from '../../llm/config';
 
+export type DispatchRoutingCategorySource = 'explicit_param' | 'ownership_inferred';
+
 export interface DispatchRoutingDecision {
   selectedWorker: WorkerSlot;
   category: string;
-  categorySource: 'explicit_param';
+  categorySource: DispatchRoutingCategorySource;
   degraded: boolean;
   routingReason: string;
 }
@@ -17,7 +19,7 @@ export interface WorkerAvailabilitySnapshot {
 
 interface DispatchCategoryResolution {
   category: string;
-  source: 'explicit_param';
+  source: DispatchRoutingCategorySource;
 }
 
 interface ResolveExecutionOptions {
@@ -86,6 +88,7 @@ export class DispatchRoutingService {
   resolveDispatchRouting(
     goal: string,
     explicitCategory?: string,
+    explicitSource: DispatchRoutingCategorySource = 'explicit_param',
   ): { ok: true; decision: DispatchRoutingDecision } | { ok: false; error: string } {
     try {
       // 每次 dispatch 前刷新分工配置，确保外部改动立即生效
@@ -96,7 +99,7 @@ export class DispatchRoutingService {
         error: `读取分工配置失败: ${error?.message || String(error)}`,
       };
     }
-    const categoryResolution = this.resolveDispatchCategoryWithSource(goal, explicitCategory);
+    const categoryResolution = this.resolveDispatchCategoryWithSource(goal, explicitCategory, explicitSource);
     if (!categoryResolution.ok) {
       return {
         ok: false,
@@ -228,6 +231,7 @@ export class DispatchRoutingService {
   private resolveDispatchCategoryWithSource(
     _goal: string,
     explicitCategory?: string,
+    explicitSource: DispatchRoutingCategorySource = 'explicit_param',
   ): { ok: true; value: DispatchCategoryResolution } | { ok: false; error: string } {
     const explicit = explicitCategory?.trim();
     if (explicit) {
@@ -240,7 +244,7 @@ export class DispatchRoutingService {
         ok: true,
         value: {
           category: normalized,
-          source: 'explicit_param',
+          source: explicitSource,
         },
       };
     }

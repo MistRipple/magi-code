@@ -40,6 +40,7 @@ export class PlanningExecutor {
       sessionId,
       missionId,
       assignmentId: assignment.id,
+      trace: assignment.trace,
       source: 'planner_macro',
       content,
       reasoning: assignment.delegationBriefing || assignment.responsibility,

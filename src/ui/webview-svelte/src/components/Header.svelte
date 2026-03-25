@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { messagesState } from '../stores/messages.svelte';
+  import { getState, messagesState, setCurrentSessionId } from '../stores/messages.svelte';
   import { ensureArray } from '../lib/utils';
   import { vscode } from '../lib/vscode-bridge';
   import Icon from './Icon.svelte';
   import NotificationCenter from './NotificationCenter.svelte';
+  import LanAccessPanel from './LanAccessPanel.svelte';
   import type { Session } from '../types/message';
   import { i18n } from '../stores/i18n.svelte';
 
@@ -12,9 +13,13 @@
   }
 
   let { onOpenSettings }: Props = $props();
+  const appState = getState();
 
   // 下拉菜单状态
   let dropdownOpen = $state(false);
+
+  // 局域网访问面板状态
+  let showLanPanel = $state(false);
 
   // 删除确认对话框状态
   let showDeleteConfirm = $state(false);
@@ -39,7 +44,7 @@
 
   // 当前会话是否为空（无消息），为空时禁止创建新会话
   const isCurrentSessionEmpty = $derived(
-    ensureArray(messagesState.threadMessages).length === 0
+    ensureArray(appState.threadMessages).length === 0
   );
 
   // 切换下拉菜单
@@ -63,8 +68,8 @@
   // 确认切换会话
   function confirmSwitch() {
     if (pendingSwitchSessionId) {
-      const currentMessages = collectCurrentSessionSnapshot();
-      vscode.postMessage({ type: 'switchSession', sessionId: pendingSwitchSessionId, currentMessages });
+      setCurrentSessionId(pendingSwitchSessionId);
+      vscode.postMessage({ type: 'switchSession', sessionId: pendingSwitchSessionId });
     }
     closeSwitchConfirm();
     dropdownOpen = false;
@@ -79,8 +84,7 @@
 
   // 新建会话
   function newSession() {
-    const currentMessages = collectCurrentSessionSnapshot();
-    vscode.postMessage({ type: 'newSession', currentMessages });
+    vscode.postMessage({ type: 'newSession' });
     dropdownOpen = false;
   }
 
@@ -124,46 +128,6 @@
     });
   }
 
-  type PersistableMessage = Record<string, unknown> & {
-    id?: string;
-    timestamp?: number;
-  };
-
-  function collectCurrentSessionSnapshot(): PersistableMessage[] {
-    if (!messagesState.currentSessionId) return [];
-
-    const merged: PersistableMessage[] = [];
-    const seen = new Set<string>();
-
-    for (const message of ensureArray<PersistableMessage>(messagesState.threadMessages as unknown as PersistableMessage[])) {
-      const id = typeof message?.id === 'string' ? message.id.trim() : '';
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      merged.push(message);
-    }
-
-    const workers = ['claude', 'codex', 'gemini'] as const;
-    for (const worker of workers) {
-      for (const message of ensureArray<PersistableMessage>(messagesState.agentOutputs[worker] as unknown as PersistableMessage[])) {
-        const id = typeof message?.id === 'string' ? message.id.trim() : '';
-        if (!id || seen.has(id)) continue;
-        seen.add(id);
-        merged.push({
-          ...message,
-          agent: worker,
-          source: worker,
-        });
-      }
-    }
-
-    merged.sort((a, b) => {
-      const ta = typeof a?.timestamp === 'number' ? a.timestamp : 0;
-      const tb = typeof b?.timestamp === 'number' ? b.timestamp : 0;
-      return ta - tb;
-    });
-
-    return merged;
-  }
 </script>
 
 <header class="header-bar">
@@ -230,6 +194,17 @@
     <button class="btn-icon btn-icon--sm" onclick={newSession} title={isCurrentSessionEmpty ? i18n.t('header.currentSessionEmpty') : i18n.t('header.newSession')} disabled={isCurrentSessionEmpty}>
       <Icon name="plus" size={14} />
     </button>
+    <div class="lan-access-wrapper">
+      <button
+        class="btn-icon btn-icon--sm lan-access-trigger"
+        class:active={showLanPanel}
+        onclick={() => { showLanPanel = !showLanPanel; }}
+        title={i18n.t('lanAccess.title')}
+      >
+        <Icon name="qrcode" size={14} />
+      </button>
+      <LanAccessPanel visible={showLanPanel} onClose={() => { showLanPanel = false; }} />
+    </div>
     <NotificationCenter />
     <button class="btn-icon btn-icon--sm" onclick={openSettings} title={i18n.t('header.settings')}>
       <Icon name="settings" size={14} />
@@ -329,7 +304,7 @@
     margin-top: var(--space-2);
     min-width: 220px;
     max-width: 320px;
-    background: var(--vscode-dropdown-background, #3c3c3c);
+    background: var(--dropdown-bg);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     box-shadow: var(--shadow-lg);
@@ -454,6 +429,14 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
+  }
+
+  .lan-access-wrapper {
+    position: relative;
+  }
+
+  .lan-access-trigger.active {
+    color: var(--accent, var(--vscode-textLink-foreground, #3794ff));
   }
 
   /* 下拉菜单背景遮罩 - 点击外部区域关闭 */

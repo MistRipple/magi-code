@@ -10,7 +10,7 @@
   // Toast 列表
   const toasts = $derived(ensureArray(appState.toasts) as Toast[]);
 
-  // 自动关闭定时器（5秒）
+  // 自动关闭定时器（默认 5 秒，可被单条 toast 覆盖）
   const AUTO_DISMISS_MS = 5000;
 
   // 跟踪已设置定时器的 toast ID
@@ -35,10 +35,13 @@
     // 为新 toast 设置定时器
     for (const toast of currentToasts) {
       if (!activeTimers.has(toast.id)) {
+        const dismissAfter = typeof toast.duration === 'number' && Number.isFinite(toast.duration) && toast.duration > 0
+          ? toast.duration
+          : AUTO_DISMISS_MS;
         const timer = setTimeout(() => {
           activeTimers.delete(toast.id);
           appState.toasts = (ensureArray(appState.toasts) as Toast[]).filter(t => t.id !== toast.id);
-        }, AUTO_DISMISS_MS);
+        }, dismissAfter);
         activeTimers.set(toast.id, timer);
       }
     }
@@ -142,12 +145,22 @@
     font-weight: var(--font-semibold);
     color: var(--foreground);
     margin-bottom: var(--space-1);
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-word;
   }
 
   .toast-message {
     font-size: var(--text-sm);
     color: var(--foreground-muted);
     line-height: var(--leading-normal);
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-word;
   }
 
   .toast-close {

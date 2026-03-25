@@ -8,6 +8,8 @@ export interface OrchestratorExecutionBudget {
   maxDurationMs: number;
   maxTokenUsage: number;
   maxErrorRate: number;
+  /** 工具循环最大轮次硬限——条件收敛失败时的最后防线 */
+  maxRounds: number;
 }
 
 export interface OrchestratorDecisionPolicy {

@@ -731,6 +731,12 @@ export class OpenAIResponsesProtocolAdapter implements ProviderProtocolAdapter {
         continue;
       }
 
+      // 外部消息的 content 可能是 null/undefined/number，统一安全处理
+      if (!Array.isArray(msg.content)) {
+        input.push({ type: 'message', role, content: String(msg.content ?? '') });
+        continue;
+      }
+
       const messageContent: any[] = [];
       const flushMessageContent = () => {
         if (messageContent.length === 0) return;

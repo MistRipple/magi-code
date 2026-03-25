@@ -3,6 +3,8 @@
  */
 
 import type { LocaleCode } from '../../../../i18n/types';
+import type { OrchestrationRuntimeOpsView } from '../../../../orchestrator/runtime/orchestration-runtime-diagnostics-types';
+import type { UIProcessingState } from '../../../../types';
 
 // 消息角色
 export type MessageRole = 'user' | 'assistant' | 'system';
@@ -156,16 +158,16 @@ export interface ThinkingBlock {
   content: string;
   isComplete: boolean;
   summary?: string;
+  blockId?: string;
 }
 
 // 消息内容块
 export interface ContentBlock {
   id?: string;                // 唯一标识符，用于 #each 循环的 key
-  type: 'text' | 'code' | 'thinking' | 'tool_call' | 'tool_result' | 'file_change' | 'plan' | 'terminal_session';
+  type: 'text' | 'code' | 'thinking' | 'tool_call' | 'tool_result' | 'file_change' | 'plan';
   content: string;
   language?: string;        // 代码块语言
   toolCall?: ToolCall;      // 工具调用信息
-  terminalSession?: TerminalSessionBlock;
   thinking?: ThinkingBlock; // 思考块信息
   fileChange?: {
     filePath: string;
@@ -258,20 +260,6 @@ export interface WaveState {
   status: 'idle' | 'executing' | 'completed';
 }
 
-// Worker Session 状态（提案 4.1）
-export interface WorkerSessionState {
-  /** Session ID */
-  sessionId: string;
-  /** Assignment ID */
-  assignmentId: string;
-  /** Worker ID */
-  workerId: string;
-  /** 是否为恢复的 Session */
-  isResumed: boolean;
-  /** 已完成的 Todo 数 */
-  completedTodos: number;
-}
-
 export interface OrchestratorRuntimeDecisionGateState {
   noProgressStreak: number;
   budgetBreachStreak: number;
@@ -328,6 +316,7 @@ export interface OrchestratorRuntimeDiagnostics {
   errors?: string[];
   runtimeSnapshot?: OrchestratorRuntimeSnapshot | null;
   runtimeDecisionTrace?: OrchestratorRuntimeDecisionTraceEntry[];
+  opsView?: OrchestrationRuntimeOpsView | null;
   updatedAt: number;
 }
 
@@ -339,6 +328,7 @@ export interface Message {
   content: string;            // 完整内容（用于 Markdown 渲染）
   blocks?: ContentBlock[];    // 结构化内容块
   timestamp: number;
+  updatedAt?: number;
   isStreaming: boolean;       // 是否正在流式输出
   isComplete: boolean;        // 是否已完成
   type?: MessageType;         // 消息类型（notice = 系统通知）
@@ -356,6 +346,9 @@ export interface Message {
     placeholderState?: PlaceholderState; // 占位消息状态
     requestId?: string;               // 关联的请求 ID
     turnId?: string;                  // 对话轮次 ID（用于计划账本回溯定位）
+    dispatchWaveId?: string;          // Worker 生命周期所属的 dispatch wave
+    laneId?: string;                  // Worker lane 语义键（wave + lane）
+    workerCardId?: string;            // Worker 生命周期卡片稳定 ID
     wasPlaceholder?: boolean;         // 是否从占位消息转换而来（用于过渡动画）
     justCompleted?: boolean;          // 是否刚完成（用于完成动画）
     sendingAnimation?: boolean;       // 用户消息发送动画
@@ -382,6 +375,95 @@ export interface AgentOutputs {
   gemini: Message[];
 }
 
+export type TimelineNodeKind = 'message' | 'tool' | 'worker_lifecycle';
+
+export interface TimelineLaneOrder {
+  thread?: number;
+  workers?: Partial<Record<AgentType, number>>;
+}
+
+export interface TimelineNode {
+  nodeId: string;
+  kind: TimelineNodeKind;
+  displayOrder?: number;
+  laneOrder?: TimelineLaneOrder;
+  artifactVersion?: number;
+  anchorEventSeq: number;
+  latestEventSeq: number;
+  cardStreamSeq: number;
+  timestamp: number;
+  cardId?: string;
+  lifecycleKey?: string;
+  dispatchWaveId?: string;
+  laneId?: string;
+  workerCardId?: string;
+  worker?: AgentType;
+  visibleInThread: boolean;
+  workerTabs: AgentType[];
+  messageIds: string[];
+  message: Message;
+  executionItems?: TimelineExecutionItem[];
+}
+
+export type TimelineProjectionArtifactKind = 'message' | 'tool' | 'worker_lifecycle';
+
+export interface TimelineExecutionItem {
+  itemId: string;
+  itemOrder: number;
+  anchorEventSeq: number;
+  latestEventSeq: number;
+  cardStreamSeq: number;
+  timestamp: number;
+  worker?: AgentType;
+  threadVisible: boolean;
+  workerTabs: AgentType[];
+  messageIds: string[];
+  message: Message;
+}
+
+export interface TimelineProjectionArtifact {
+  artifactId: string;
+  kind: TimelineProjectionArtifactKind;
+  displayOrder: number;
+  artifactVersion?: number;
+  anchorEventSeq: number;
+  latestEventSeq: number;
+  cardStreamSeq: number;
+  timestamp: number;
+  cardId?: string;
+  lifecycleKey?: string;
+  dispatchWaveId?: string;
+  laneId?: string;
+  workerCardId?: string;
+  worker?: AgentType;
+  threadVisible: boolean;
+  workerTabs: AgentType[];
+  messageIds: string[];
+  message: Message;
+  executionItems?: TimelineExecutionItem[];
+}
+
+export interface TimelineProjectionRenderEntry {
+  entryId: string;
+  artifactId: string;
+  executionItemId?: string;
+}
+
+export interface TimelineRenderItem {
+  key: string;
+  message: Message;
+}
+
+export interface SessionTimelineProjection {
+  schemaVersion: 'session-timeline-projection.v2';
+  sessionId: string;
+  updatedAt: number;
+  lastAppliedEventSeq: number;
+  artifacts: TimelineProjectionArtifact[];
+  threadRenderEntries: TimelineProjectionRenderEntry[];
+  workerRenderEntries: Record<'claude' | 'codex' | 'gemini', TimelineProjectionRenderEntry[]>;
+}
+
 // 会话信息
 export interface Session {
   id: string;
@@ -391,6 +473,10 @@ export interface Session {
   messageCount?: number;
   preview?: string;  // 会话预览
   messages?: { id: string; role: string; content: string }[];
+  notifications?: {
+    lastUpdatedAt: number;
+    records: SessionNotificationRecord[];
+  };
 }
 
 export interface QueuedMessage {
@@ -439,11 +525,11 @@ export interface ScrollAnchors {
 // 任务状态
 export type TaskStatus = 'pending' | 'paused' | 'running' | 'completed' | 'failed' | 'cancelled';
 export type DeliveryStatus = 'pending' | 'passed' | 'failed' | 'blocked' | 'skipped';
-export type ContinuationPolicy = 'auto' | 'ask' | 'stop';
 
 // 子任务状态（对齐后端 SubTaskViewStatus）
 export type SubTaskStatus =
   | 'pending'
+  | 'waiting_deps'
   | 'running'
   | 'paused'
   | 'completed'
@@ -482,8 +568,6 @@ export interface Task {
   deliverySummary?: string;
   deliveryDetails?: string;
   deliveryWarnings?: string[];
-  continuationPolicy?: ContinuationPolicy;
-  continuationReason?: string;
   subTasks: SubTaskItem[];
   progress: number;
   missionId: string;
@@ -572,6 +656,7 @@ export interface Toast {
   type: ToastType;
   title?: string;
   message: string;
+  duration?: number;
 }
 
 export interface PersistedNotification {
@@ -586,11 +671,28 @@ export interface PersistedNotification {
   read: boolean;
 }
 
+export interface SessionNotificationRecord {
+  notificationId: string;
+  kind: 'toast' | 'center' | 'incident' | 'audit';
+  level: string;
+  title?: string;
+  message: string;
+  source?: string;
+  createdAt: number;
+  read: boolean;
+  persistToCenter: boolean;
+  actionRequired: boolean;
+  countUnread: boolean;
+  displayMode?: 'auto' | 'toast' | 'notification_center' | 'silent';
+  duration?: number;
+}
+
 // 应用状态（后端下发的完整状态）
 export interface AppState {
   sessions?: Session[];
   currentSession?: Session;
   isProcessing?: boolean;
+  processingState?: UIProcessingState | null;
   pendingChanges?: unknown[];
   tasks?: Task[];
   locale?: LocaleCode;
@@ -609,13 +711,19 @@ export interface AppState {
 export interface WebviewPersistedState {
   currentTopTab: TabType;
   currentBottomTab: TabType;
-  threadMessages: Message[];
-  agentOutputs: AgentOutputs;
   sessions: Session[];
   currentSessionId: string | null;
+  currentTimelineProjection?: SessionTimelineProjection | null;
   scrollPositions?: ScrollPositions;
   scrollAnchors?: ScrollAnchors;
   autoScrollEnabled?: AutoScrollConfig;
-  notificationBuckets?: Record<string, PersistedNotification[]>;
-  orchestratorRuntimeDiagnostics?: OrchestratorRuntimeDiagnostics | null;
+  sessionViewStateBySession?: Record<string, PersistedSessionViewState>;
+}
+
+export interface PersistedSessionViewState {
+  sessionId: string;
+  timelineProjection: SessionTimelineProjection;
+  scrollPositions?: ScrollPositions;
+  scrollAnchors?: ScrollAnchors;
+  autoScrollEnabled?: AutoScrollConfig;
 }

@@ -99,7 +99,7 @@ export class PromptBuilder {
 1. **Locate** (1-2 rounds): Find the target code via semantic search or text matching
 2. **Inspect** (1 round): Read the target file and confirm what needs to be changed
 3. **Modify** (N rounds): Apply precise replacements for each change
-4. **Complete**: Output a brief summary of modifications (which files were changed and what was done)
+4. **Complete**: Output a brief task-level summary of what was accomplished and why — do NOT list individual file changes (the system automatically generates structured file-change cards for each modified file)
 
 ### Search Efficiency
 - Search for any given content only once — do not rephrase and re-search; the system will intercept duplicate queries
@@ -110,7 +110,8 @@ export class PromptBuilder {
 - Do not use terminal commands for file reading, directory browsing, or content searching — use the dedicated tools instead
 - Do not output code blocks that were not executed through tools (all modifications must go through file-editing tools)
 - Do not precede each tool call with lengthy "Next I will..." planning narratives
-- When calling a tool in the current turn: issue the tool call directly without natural-language transition sentences; natural-language explanations are only for turns with no tool calls`);
+- When calling a tool in the current turn: issue the tool call directly without natural-language transition sentences; natural-language explanations are only for turns with no tool calls
+- Do not output per-file change summaries (e.g. "📦 create file.ts", "✏️ edit file.ts") — the system renders structured file-change panels automatically`);
 
     return sections.join('\n\n');
   }

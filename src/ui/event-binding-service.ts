@@ -24,6 +24,8 @@ import {
   NotifyLevel,
   InteractionType,
   MessageCategory,
+  MessageLifecycle,
+  MessageType,
   createInteractionMessage,
 } from '../protocol/message-protocol';
 import { ADAPTER_EVENTS, PROCESSING_EVENTS, WEBVIEW_MESSAGE_TYPES } from '../protocol/event-names';
@@ -34,6 +36,9 @@ import type { MessageHub } from '../orchestrator/core/message-hub';
 import type { MissionOrchestrator } from '../orchestrator/core';
 import { normalizeTodos, generateEntityId } from '../orchestrator/mission/data-normalizer';
 import { isModelOriginIssue, toModelOriginUserMessage } from '../errors/model-origin';
+import { resolveStandardMessageSessionBinding } from '../session/standard-message-session-binding';
+import type { SessionTimelineProjection } from '../session/session-timeline-projection';
+import { messageHasRenderableTimelineContent } from '../shared/timeline-presentation';
 
 // ============================================================================
 // 上下文接口 - EventBindingService 对 WVP 的依赖声明
@@ -68,6 +73,11 @@ export interface EventBindingContext {
   clearRequestTimeout(requestId: string): void;
   interruptCurrentTask(options?: { silent?: boolean }): Promise<void>;
   tryResumePendingRecovery(): void;
+  getMessageSnapshot(messageId: string): StandardMessage | null;
+  getLiveSessionTimelineProjection(sessionId: string): SessionTimelineProjection | null;
+
+  // 持久化
+  persistStandardMessageToSession(sessionId: string, message: StandardMessage): void;
 }
 
 // ============================================================================
@@ -87,6 +97,10 @@ export class EventBindingService {
   private readonly pendingUpdateTimers = new Map<string, NodeJS.Timeout>();
   private readonly MAX_PENDING_UPDATES_PER_MESSAGE = 200;
   private readonly PENDING_UPDATE_TIMEOUT_MS = 30000;
+  private readonly liveSnapshotPersistTimers = new Map<string, NodeJS.Timeout>();
+  private readonly pendingProjectionBroadcastTimers = new Map<string, NodeJS.Timeout>();
+  private static readonly PROJECTION_BROADCAST_DEBOUNCE_MS = 200;
+  private readonly LIVE_SNAPSHOT_PERSIST_DEBOUNCE_MS = 120;
   private lastAdapterErrorSignature = '';
   private lastAdapterErrorAt = 0;
   private readonly adapterErrorDedupWindowMs = 5000;
@@ -141,6 +155,7 @@ export class EventBindingService {
         missionId: data.missionId,
         assignmentId: data.assignmentId,
         workerId: data.workerId,
+        trace: data.trace,
         sessionId: this.ctx.getActiveSessionId(),
       });
       this.ctx.sendStateUpdate();
@@ -154,6 +169,7 @@ export class EventBindingService {
         assignmentId,
         todos,
         warnings: data.warnings,
+        trace: data.trace,
         sessionId: this.ctx.getActiveSessionId(),
       });
       this.ctx.sendStateUpdate();
@@ -164,6 +180,7 @@ export class EventBindingService {
         missionId: data.missionId,
         assignmentId: data.assignmentId,
         success: data.success,
+        trace: data.trace,
         sessionId: this.ctx.getActiveSessionId(),
       });
       this.ctx.sendStateUpdate();
@@ -175,6 +192,7 @@ export class EventBindingService {
         sessionId: data.sessionId,
         assignmentId: data.assignmentId,
         workerId: data.workerId,
+        trace: (data as { trace?: unknown }).trace,
       });
     });
 
@@ -184,10 +202,15 @@ export class EventBindingService {
         assignmentId: data.assignmentId,
         workerId: data.workerId,
         completedTodos: data.completedTodos,
+        trace: (data as { trace?: unknown }).trace,
       });
+      const activeConversationSessionId = this.ctx.getActiveSessionId();
       messageHub.systemNotice(t('eventBinding.sessionResumed', { completedTodos: data.completedTodos }), {
-        sessionId: data.sessionId,
+        ...(activeConversationSessionId ? { sessionId: activeConversationSessionId } : {}),
         worker: data.workerId,
+        extra: {
+          workerSessionId: data.sessionId,
+        },
       });
     });
 
@@ -197,6 +220,7 @@ export class EventBindingService {
         missionId: data.missionId,
         assignmentId: data.assignmentId,
         todoId: data.todoId,
+        trace: data.trace,
         sessionId: this.ctx.getActiveSessionId(),
       });
       this.ctx.sendStateUpdate();
@@ -208,6 +232,7 @@ export class EventBindingService {
         assignmentId: data.assignmentId,
         todoId: data.todoId,
         output: data.output,
+        trace: data.trace,
         sessionId: this.ctx.getActiveSessionId(),
       });
       this.ctx.sendStateUpdate();
@@ -219,6 +244,7 @@ export class EventBindingService {
         assignmentId: data.assignmentId,
         todoId: data.todoId,
         error: data.error,
+        trace: data.trace,
         sessionId: this.ctx.getActiveSessionId(),
       });
       this.ctx.sendStateUpdate();
@@ -236,6 +262,7 @@ export class EventBindingService {
         missionId: data.missionId,
         assignmentId,
         todo: normalizedTodo,
+        trace: data.trace,
         sessionId: this.ctx.getActiveSessionId(),
       });
       this.ctx.sendStateUpdate();
@@ -244,6 +271,7 @@ export class EventBindingService {
     // 审批请求
     mo.on('approvalRequested', (data) => {
       const traceId = messageHub.getTraceId();
+      const activeSessionId = this.ctx.getActiveSessionId();
       const interactionMsg = createInteractionMessage(
         {
           type: InteractionType.PERMISSION,
@@ -253,7 +281,10 @@ export class EventBindingService {
         },
         'orchestrator',
         'orchestrator',
-        traceId
+        traceId,
+        {
+          metadata: activeSessionId ? { sessionId: activeSessionId } : {},
+        }
       );
       messageHub.sendMessage(interactionMsg);
 
@@ -261,6 +292,7 @@ export class EventBindingService {
         missionId: data.missionId,
         todoId: data.todoId,
         reason: data.reason,
+        trace: data.trace,
         sessionId: this.ctx.getActiveSessionId(),
       });
     });
@@ -308,6 +340,21 @@ export class EventBindingService {
 
   /** 清理所有待处理工具授权（dispose 时调用） */
   disposeToolAuthorization(): void {
+    this.resetSessionRuntimeState();
+  }
+
+  flushLiveMessageSnapshots(options: { silent?: boolean } = {}): void {
+    for (const messageId of Array.from(this.liveSnapshotPersistTimers.keys())) {
+      const sessionId = this.messageSessionByMessageId.get(messageId);
+      this.clearLiveMessageSnapshotPersist(messageId);
+      if (!sessionId) {
+        continue;
+      }
+      this.persistLiveMessageSnapshot(messageId, sessionId, options);
+    }
+  }
+
+  resetSessionRuntimeState(): void {
     this.clearActiveToolAuthorizationTimer();
     this.activeToolAuthorizationRequestId = null;
     this.toolAuthorizationQueue = [];
@@ -320,6 +367,10 @@ export class EventBindingService {
     }
     this.pendingUpdateTimers.clear();
     this.pendingUpdatesByMessageId.clear();
+    for (const timer of this.liveSnapshotPersistTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.liveSnapshotPersistTimers.clear();
     this.messageSessionByMessageId.clear();
   }
 
@@ -364,8 +415,13 @@ export class EventBindingService {
         logger.warn('界面.消息.丢弃_缺少会话标识', { messageId: message.id }, LogCategory.UI);
         return;
       }
+      const isLifecycleCard = message.type === MessageType.TASK_CARD || message.type === MessageType.INSTRUCTION;
+      if (this.shouldPersistTimelineAnchorMessage(message)) {
+        this.persistTimelineMessage(messageSessionId, message, {
+          sendStateUpdate: isLifecycleCard,
+        });
+      }
       this.rememberMessageSession(message.id, messageSessionId);
-      this.flushPendingUpdatesForMessage(message.id, messageSessionId);
       this.ctx.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.UNIFIED_MESSAGE,
         message,
@@ -373,6 +429,9 @@ export class EventBindingService {
       });
       this.ctx.logMessageFlow('messageHub.standardMessage [SENT]', message);
       this.ctx.resolveRequestTimeoutFromMessage(message);
+      // 先发送 message 锚点，再回放缓冲 update，确保前端严格遵守
+      // “首次落位 -> 原位更新”的统一时间轴约束。
+      this.flushPendingUpdatesForMessage(message.id, messageSessionId);
     });
 
     messageHub.on('unified:update', (update) => {
@@ -391,6 +450,7 @@ export class EventBindingService {
       if (reqId) {
         this.ctx.clearRequestTimeout(reqId);
       }
+      this.scheduleLiveMessageSnapshotPersist(update.messageId, updateSessionId);
     });
 
     messageHub.on('unified:complete', (message) => {
@@ -400,7 +460,6 @@ export class EventBindingService {
         return;
       }
       this.rememberMessageSession(message.id, completeSessionId);
-      this.flushPendingUpdatesForMessage(message.id, completeSessionId);
       this.ctx.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.UNIFIED_COMPLETE,
         message,
@@ -408,15 +467,34 @@ export class EventBindingService {
       });
       this.ctx.logMessageFlow('messageHub.standardComplete [SENT]', message);
       this.ctx.resolveRequestTimeoutFromMessage(message);
+      // 终态消息携带最终聚合内容；此前因缺少 session 归属而缓存的 update
+      // 一旦走到 complete，就只应视为过期增量并直接清理。
+      this.clearPendingUpdatesForMessage(message.id);
+      this.clearLiveMessageSnapshotPersist(message.id);
+
+      // 消息完成时统一收口到 session 持久化：
+      // - timeline 内容进入会话时间轴
+      // - notify 进入通知快照
+      // - control/data 不持久化为主线程历史
+      // 注意：lifecycle 消息（TASK_CARD/INSTRUCTION）已在 unified:message handler 中持久化，
+      // 此处跳过，避免同一语义节点被重复写入 session.timeline。
+      const isLifecycleCard = message.type === MessageType.TASK_CARD || message.type === MessageType.INSTRUCTION;
+      if (!isLifecycleCard && message.id) {
+        this.persistTimelineMessage(completeSessionId, message, {
+          sendStateUpdate: Array.isArray(message.blocks) && message.blocks.length > 0,
+        });
+      }
     });
 
     messageHub.on(PROCESSING_EVENTS.STATE_CHANGED, (state) => {
-      this.ctx.sendData('processingStateChanged', {
-        isProcessing: state.isProcessing,
-        source: state.source,
-        agent: state.agent,
-        startedAt: state.startedAt,
-        transitionKind: state.transitionKind,
+      queueMicrotask(() => {
+        this.ctx.sendData('processingStateChanged', {
+          isProcessing: state.isProcessing,
+          source: state.source,
+          agent: state.agent,
+          startedAt: state.startedAt,
+          transitionKind: state.transitionKind,
+        });
       });
     });
   }
@@ -525,52 +603,18 @@ export class EventBindingService {
   }
 
   private resolveMessageSessionId(message: StandardMessage): string | null {
-    const metadataSessionId = typeof message.metadata?.sessionId === 'string'
-      ? message.metadata.sessionId.trim()
-      : '';
-    if (metadataSessionId) {
-      return metadataSessionId;
+    const binding = resolveStandardMessageSessionBinding(message);
+    if (binding.hasConflict) {
+      logger.warn('界面.消息.会话标识冲突_采用显式归属', {
+        messageId: message.id,
+        source: binding.source,
+        metadataSessionId: binding.metadataSessionId,
+        traceSessionId: binding.traceSessionId,
+        dataPayloadSessionId: binding.dataPayloadSessionId,
+        dataType: message.data?.dataType,
+      }, LogCategory.UI);
     }
-    const traceId = typeof message.traceId === 'string' ? message.traceId.trim() : '';
-    if (traceId) {
-      const dataPayloadSessionId = this.resolveDataPayloadSessionId(message);
-      if (dataPayloadSessionId && dataPayloadSessionId !== traceId) {
-        logger.warn('界面.消息.会话标识冲突_已回退traceId', {
-          messageId: message.id,
-          traceId,
-          payloadSessionId: dataPayloadSessionId,
-          dataType: message.data?.dataType,
-        }, LogCategory.UI);
-      }
-      return traceId;
-    }
-    const dataPayloadSessionId = this.resolveDataPayloadSessionId(message);
-    if (dataPayloadSessionId) {
-      return dataPayloadSessionId;
-    }
-    return null;
-  }
-
-  private resolveDataPayloadSessionId(message: StandardMessage): string | null {
-    if (message.category !== MessageCategory.DATA || !message.data?.payload) {
-      return null;
-    }
-    const payload = message.data.payload as Record<string, unknown>;
-    const payloadSessionId = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : '';
-    if (payloadSessionId) {
-      return payloadSessionId;
-    }
-    const state = payload.state as Record<string, unknown> | undefined;
-    const stateSessionId = typeof state?.currentSessionId === 'string' ? state.currentSessionId.trim() : '';
-    if (stateSessionId) {
-      return stateSessionId;
-    }
-    const payloadSession = payload.session as Record<string, unknown> | undefined;
-    const nestedSessionId = typeof payloadSession?.id === 'string' ? payloadSession.id.trim() : '';
-    if (nestedSessionId) {
-      return nestedSessionId;
-    }
-    return null;
+    return binding.sessionId;
   }
 
   private rememberMessageSession(messageId: string, sessionId: string): void {
@@ -618,12 +662,7 @@ export class EventBindingService {
     if (!updates || updates.length === 0) {
       return;
     }
-    this.pendingUpdatesByMessageId.delete(messageId);
-    const timer = this.pendingUpdateTimers.get(messageId);
-    if (timer) {
-      clearTimeout(timer);
-      this.pendingUpdateTimers.delete(messageId);
-    }
+    this.clearPendingUpdatesForMessage(messageId);
     for (const update of updates) {
       this.ctx.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.UNIFIED_UPDATE,
@@ -638,12 +677,138 @@ export class EventBindingService {
     }
   }
 
+  private clearPendingUpdatesForMessage(messageId: string): void {
+    this.pendingUpdatesByMessageId.delete(messageId);
+    const timer = this.pendingUpdateTimers.get(messageId);
+    if (timer) {
+      clearTimeout(timer);
+      this.pendingUpdateTimers.delete(messageId);
+    }
+  }
+
+  private scheduleLiveMessageSnapshotPersist(messageId: string, sessionId: string): void {
+    this.clearLiveMessageSnapshotPersist(messageId);
+    const timer = setTimeout(() => {
+      this.liveSnapshotPersistTimers.delete(messageId);
+      this.persistLiveMessageSnapshot(messageId, sessionId);
+    }, this.LIVE_SNAPSHOT_PERSIST_DEBOUNCE_MS);
+    this.liveSnapshotPersistTimers.set(messageId, timer);
+  }
+
+  private clearLiveMessageSnapshotPersist(messageId: string): void {
+    const timer = this.liveSnapshotPersistTimers.get(messageId);
+    if (!timer) {
+      return;
+    }
+    clearTimeout(timer);
+    this.liveSnapshotPersistTimers.delete(messageId);
+  }
+
+  private persistLiveMessageSnapshot(
+    messageId: string,
+    sessionId: string,
+    options: { silent?: boolean } = {},
+  ): void {
+    const snapshot = this.ctx.getMessageSnapshot(messageId);
+    if (!snapshot) {
+      return;
+    }
+    const snapshotSessionId = this.resolveMessageSessionId(snapshot) || sessionId;
+    if (!snapshotSessionId) {
+      return;
+    }
+    this.persistTimelineMessage(snapshotSessionId, snapshot, {
+      sendStateUpdate: options.silent !== true && Array.isArray(snapshot.blocks) && snapshot.blocks.length > 0,
+      // 流式期间的 live snapshot 只做持久化，不触发全量 projection broadcast。
+      // 流式内容走 unifiedUpdate 增量通道，projection 只在 message complete 时广播。
+      skipProjectionBroadcast: true,
+    });
+  }
+
+  private shouldPersistTimelineAnchorMessage(message: StandardMessage): boolean {
+    if (message.category !== MessageCategory.CONTENT) {
+      return false;
+    }
+    if (message.type === MessageType.USER_INPUT) {
+      return true;
+    }
+    if (message.type === MessageType.TASK_CARD || message.type === MessageType.INSTRUCTION) {
+      return true;
+    }
+    if (message.metadata?.isPlaceholder === true) {
+      return true;
+    }
+    const isStreamingAnchor = (
+      message.lifecycle === MessageLifecycle.STARTED
+      || message.lifecycle === MessageLifecycle.STREAMING
+    );
+    if (!isStreamingAnchor) {
+      return false;
+    }
+    return messageHasRenderableTimelineContent({
+      type: message.type,
+      source: message.source,
+      content: '',
+      blocks: message.blocks,
+      isStreaming: true,
+      metadata: message.metadata as Record<string, unknown> | undefined,
+    });
+  }
+
+  private persistTimelineMessage(
+    sessionId: string,
+    message: StandardMessage,
+    options: { sendStateUpdate?: boolean; skipProjectionBroadcast?: boolean } = {},
+  ): void {
+    try {
+      this.ctx.persistStandardMessageToSession(sessionId, message);
+      if (!options.skipProjectionBroadcast) {
+        this.scheduleTimelineProjectionBroadcast(sessionId);
+      }
+      if (options.sendStateUpdate === true) {
+        this.ctx.sendStateUpdate();
+      }
+    } catch (error: any) {
+      logger.warn('界面.时间轴消息.持久化失败', {
+        messageId: message.id,
+        messageType: message.type,
+        sessionId,
+        error: error?.message || String(error),
+      }, LogCategory.UI);
+    }
+  }
+
+  private scheduleTimelineProjectionBroadcast(sessionId: string): void {
+    const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+    if (!normalizedSessionId) {
+      return;
+    }
+    // debounce：同一 session 的多次调用合并为一次，避免高频 structuredClone 导致 CPU 飙高
+    const existing = this.pendingProjectionBroadcastTimers.get(normalizedSessionId);
+    if (existing) {
+      clearTimeout(existing);
+    }
+    const timer = setTimeout(() => {
+      this.pendingProjectionBroadcastTimers.delete(normalizedSessionId);
+      const projection = this.ctx.getLiveSessionTimelineProjection(normalizedSessionId);
+      if (!projection) {
+        return;
+      }
+      this.ctx.sendData('timelineProjectionUpdated', {
+        sessionId: normalizedSessionId,
+        timelineProjection: projection,
+      });
+    }, EventBindingService.PROJECTION_BROADCAST_DEBOUNCE_MS);
+    this.pendingProjectionBroadcastTimers.set(normalizedSessionId, timer);
+  }
+
   private pumpToolAuthorizationQueue(): void {
     if (this.activeToolAuthorizationRequestId) return;
     const next = this.toolAuthorizationQueue.shift();
     if (!next) return;
 
     const messageHub = this.ctx.getMessageHub();
+    const activeSessionId = this.ctx.getActiveSessionId();
     this.activeToolAuthorizationRequestId = next.requestId;
 
     const interactionMsg = createInteractionMessage(
@@ -656,6 +821,9 @@ export class EventBindingService {
       'orchestrator',
       'orchestrator',
       next.requestId,
+      {
+        metadata: activeSessionId ? { sessionId: activeSessionId } : {},
+      }
     );
     messageHub.sendMessage(interactionMsg);
 

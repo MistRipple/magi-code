@@ -24,6 +24,7 @@ import { logger, LogCategory } from '../../logging';
 import { TodoManager } from '../../todo';
 import type { SnapshotManager } from '../../snapshot-manager';
 import type { UnifiedTodo } from '../../todo/types';
+import type { OrchestrationTraceLinks } from '../trace/types';
 
 // ============================================================================
 // MissionOrchestrator 类型安全事件合约
@@ -44,8 +45,8 @@ export interface MissionOrchestratorEventMap {
   missionPhaseChanged: (data: { mission: Mission; oldPhase: string; newPhase: string }) => void;
   missionDeliveryChanged: (data: { mission: Mission; oldStatus: string; newStatus: string }) => void;
   // ---- Worker Session ----
-  workerSessionCreated: (data: { sessionId: string; assignmentId: string; workerId: WorkerSlot }) => void;
-  workerSessionResumed: (data: { sessionId: string; assignmentId: string; workerId: WorkerSlot; completedTodos: number }) => void;
+  workerSessionCreated: (data: { sessionId: string; assignmentId: string; workerId: WorkerSlot; trace?: OrchestrationTraceLinks }) => void;
+  workerSessionResumed: (data: { sessionId: string; assignmentId: string; workerId: WorkerSlot; completedTodos: number; trace?: OrchestrationTraceLinks }) => void;
   workerHeartbeat: (data: {
     assignmentId: string;
     workerId: WorkerSlot;
@@ -53,20 +54,21 @@ export interface MissionOrchestratorEventMap {
     timestamp: number;
     todoId?: string;
     sessionId?: string;
+    trace?: OrchestrationTraceLinks;
   }) => void;
   // ---- Todo 进度 (Worker 转发) ----
-  todoStarted: (data: { assignmentId: string; todoId: string; content: string; missionId: string | null }) => void;
-  todoCompleted: (data: { assignmentId: string; todoId: string; content: string; output: any; missionId: string | null }) => void;
-  todoFailed: (data: { assignmentId: string; todoId: string; content: string; error: string; missionId: string | null }) => void;
-  dynamicTodoAdded: (data: { assignmentId: string; todo: UnifiedTodo; missionId: string | null }) => void;
+  todoStarted: (data: { assignmentId: string; todoId: string; content: string; missionId: string | null; trace?: OrchestrationTraceLinks }) => void;
+  todoCompleted: (data: { assignmentId: string; todoId: string; content: string; output: any; missionId: string | null; trace?: OrchestrationTraceLinks }) => void;
+  todoFailed: (data: { assignmentId: string; todoId: string; content: string; error: string; missionId: string | null; trace?: OrchestrationTraceLinks }) => void;
+  dynamicTodoAdded: (data: { assignmentId: string; todo: UnifiedTodo; missionId: string | null; trace?: OrchestrationTraceLinks }) => void;
   insightGenerated: (data: { workerId: string; type: string; content: string; importance: string; missionId: string | null }) => void;
   // ---- Assignment (公开方法触发，禁止外部直接 emit) ----
-  assignmentPlanned: (data: { missionId: string; assignmentId: string; todos: UnifiedTodo[]; warnings?: string[] }) => void;
+  assignmentPlanned: (data: { missionId: string; assignmentId: string; todos: UnifiedTodo[]; warnings?: string[]; trace?: OrchestrationTraceLinks }) => void;
   // ---- Assignment 生命周期 (Worker 转发) ----
-  assignmentStarted: (data: { assignmentId: string; missionId: string | null; workerId?: WorkerSlot }) => void;
-  assignmentCompleted: (data: { assignmentId: string; missionId: string | null; success: boolean; summary?: string }) => void;
+  assignmentStarted: (data: { assignmentId: string; missionId: string | null; workerId?: WorkerSlot; trace?: OrchestrationTraceLinks }) => void;
+  assignmentCompleted: (data: { assignmentId: string; missionId: string | null; success: boolean; summary?: string; trace?: OrchestrationTraceLinks }) => void;
   // ---- 审批 (Worker 转发) ----
-  approvalRequested: (data: { todoId: string; content: string; reason: string; missionId: string | null }) => void;
+  approvalRequested: (data: { todoId: string; content: string; reason: string; missionId: string | null; trace?: OrchestrationTraceLinks }) => void;
 }
 
 /** 类型安全的 on/emit 声明合并 */

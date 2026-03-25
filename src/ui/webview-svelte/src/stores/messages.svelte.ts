@@ -7,19 +7,22 @@ import type {
   Message,
   AgentOutputs,
   AgentType,
+  TimelineExecutionItem,
+  TimelineNode,
+  TimelineNodeKind,
   MissionPlan,
+  SessionTimelineProjection,
   Session,
   TabType,
   ProcessingActor,
-  ContentBlock,
   ScrollPositions,
   ScrollAnchors,
   ScrollAnchor,
   AutoScrollConfig,
   AppState,
   WebviewPersistedState,
+  PersistedSessionViewState,
   WaveState,
-  WorkerSessionState,
   RequestResponseBinding,
   RetryRuntimeState,
   ModelStatusMap,
@@ -27,12 +30,43 @@ import type {
   QueuedMessage,
   WaitForWorkersResult,
   OrchestratorRuntimeDiagnostics,
+  SessionNotificationRecord,
 } from '../types/message';
 import { vscode } from '../lib/vscode-bridge';
 import { ensureArray } from '../lib/utils';
 import { i18n } from './i18n.svelte';
-import { terminalSessions } from './terminal-sessions.svelte';
 import { deriveWorkerRuntimeMap } from '../lib/worker-panel-state';
+import { normalizeWorkerSlot } from '../lib/message-classifier';
+import {
+  buildTimelineNodeLookup,
+  buildTimelinePanelMessages,
+  buildTimelineRenderItems,
+} from '../lib/timeline-render-items';
+import {
+  compareTimelineSemanticOrder,
+  resolveTimelineBlockSeqFromMetadata,
+  resolveTimelineCardStreamSeqFromMetadata,
+  resolveTimelineEventSeqFromMetadata,
+  resolveStableTimelinePlacementTimestamp,
+  resolveTimelineSortTimestamp,
+  resolveTimelineVersionFromMetadata,
+} from '../../../../shared/timeline-ordering';
+import {
+  isTimelineWorkerLifecycleMessageType,
+  messageHasRenderableTimelineContent,
+  resolveTimelinePrimaryToolCallName,
+  resolveTimelinePresentationKind,
+  resolveTimelineWorkerVisibility as resolveSharedTimelineWorkerVisibility,
+} from '../../../../shared/timeline-presentation';
+import { resolveTimelineWorkerLifecycleKey } from '../../../../shared/timeline-worker-lifecycle';
+import {
+  expandRenderableTimelineMessages,
+  type TimelineFragmentMessage,
+} from '../../../../shared/timeline-message-fragmentation';
+import {
+  normalizeMessagePayload,
+  sanitizeMessagePatch,
+} from '../lib/message-payload';
 
 // ============ 状态定义 ============
 // 🔧 修复：使用对象属性模式确保跨模块响应式正常工作
@@ -52,12 +86,8 @@ export const messagesState = $state({
   },
 
   // 消息状态
-  threadMessages: [] as Message[],
-  agentOutputs: {
-    claude: [],
-    codex: [],
-    gemini: [],
-  } as AgentOutputs,
+  timelineNodes: [] as TimelineNode[],
+  timelineProjection: null as SessionTimelineProjection | null,
 
   // 会话状态
   sessions: [] as Session[],
@@ -101,8 +131,7 @@ export const messagesState = $state({
 });
 
 // 消息列表限制
-const MAX_THREAD_MESSAGES = 500;
-const MAX_AGENT_MESSAGES = 200;
+const MAX_TIMELINE_NODES = 1000;
 
 const MAX_PERSISTED_ARRAY_LENGTH = 10000;
 const WEBVIEW_STATE_SAVE_DEBOUNCE_MS = 120;
@@ -138,6 +167,147 @@ function createDefaultAutoScrollConfig(): AutoScrollConfig {
   };
 }
 
+function normalizeSessionId(value: string | null | undefined): string | null {
+  const sessionId = typeof value === 'string' ? value.trim() : '';
+  return sessionId || null;
+}
+
+function normalizePersistedScrollPositions(value: unknown): ScrollPositions {
+  const defaults = createDefaultScrollPositions();
+  if (!value || typeof value !== 'object') {
+    return defaults;
+  }
+  const source = value as Partial<Record<ScrollPanelKey, unknown>>;
+  return {
+    thread: normalizeScrollTop(typeof source.thread === 'number' ? source.thread : 0),
+    claude: normalizeScrollTop(typeof source.claude === 'number' ? source.claude : 0),
+    codex: normalizeScrollTop(typeof source.codex === 'number' ? source.codex : 0),
+    gemini: normalizeScrollTop(typeof source.gemini === 'number' ? source.gemini : 0),
+  };
+}
+
+function normalizePersistedScrollAnchors(value: unknown): ScrollAnchors {
+  const defaults = createDefaultScrollAnchors();
+  if (!value || typeof value !== 'object') {
+    return defaults;
+  }
+  const source = value as Partial<Record<ScrollPanelKey, unknown>>;
+  return {
+    thread: normalizeScrollAnchor(source.thread as ScrollAnchor | null | undefined),
+    claude: normalizeScrollAnchor(source.claude as ScrollAnchor | null | undefined),
+    codex: normalizeScrollAnchor(source.codex as ScrollAnchor | null | undefined),
+    gemini: normalizeScrollAnchor(source.gemini as ScrollAnchor | null | undefined),
+  };
+}
+
+function normalizePersistedAutoScrollConfig(value: unknown): AutoScrollConfig {
+  const defaults = createDefaultAutoScrollConfig();
+  if (!value || typeof value !== 'object') {
+    return defaults;
+  }
+  const source = value as Partial<Record<ScrollPanelKey, unknown>>;
+  return {
+    thread: typeof source.thread === 'boolean' ? source.thread : defaults.thread,
+    claude: typeof source.claude === 'boolean' ? source.claude : defaults.claude,
+    codex: typeof source.codex === 'boolean' ? source.codex : defaults.codex,
+    gemini: typeof source.gemini === 'boolean' ? source.gemini : defaults.gemini,
+  };
+}
+
+function normalizePersistedTimelineProjection(
+  value: unknown,
+  expectedSessionId: string | null,
+): SessionTimelineProjection | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  if (record.schemaVersion !== 'session-timeline-projection.v2') {
+    return null;
+  }
+  const sessionId = typeof record.sessionId === 'string' ? record.sessionId.trim() : '';
+  if (!sessionId) {
+    return null;
+  }
+  if (expectedSessionId && sessionId !== expectedSessionId) {
+    return null;
+  }
+  if (!Array.isArray(record.artifacts) || !Array.isArray(record.threadRenderEntries)) {
+    return null;
+  }
+  if (!record.workerRenderEntries || typeof record.workerRenderEntries !== 'object' || Array.isArray(record.workerRenderEntries)) {
+    return null;
+  }
+  for (const worker of ['claude', 'codex', 'gemini'] as const) {
+    if (!Array.isArray((record.workerRenderEntries as Record<string, unknown>)[worker])) {
+      return null;
+    }
+  }
+  return record as unknown as SessionTimelineProjection;
+}
+
+function normalizePersistedSessionViewState(
+  sessionId: string,
+  value: unknown,
+): PersistedSessionViewState | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const normalizedSessionId = normalizeSessionId(typeof record.sessionId === 'string' ? record.sessionId : sessionId);
+  if (!normalizedSessionId || normalizedSessionId !== sessionId) {
+    return null;
+  }
+  const timelineProjection = normalizePersistedTimelineProjection(record.timelineProjection, normalizedSessionId);
+  if (!timelineProjection) {
+    return null;
+  }
+  return {
+    sessionId: normalizedSessionId,
+    timelineProjection,
+    scrollPositions: normalizePersistedScrollPositions(record.scrollPositions),
+    scrollAnchors: normalizePersistedScrollAnchors(record.scrollAnchors),
+    autoScrollEnabled: normalizePersistedAutoScrollConfig(record.autoScrollEnabled),
+  };
+}
+
+function normalizePersistedSessionViewStateMap(
+  value: unknown,
+): Record<string, PersistedSessionViewState> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  const normalized: Record<string, PersistedSessionViewState> = {};
+  let count = 0;
+  for (const [rawSessionId, rawViewState] of Object.entries(value as Record<string, unknown>)) {
+    if (count >= MAX_PERSISTED_ARRAY_LENGTH) {
+      break;
+    }
+    const sessionId = normalizeSessionId(rawSessionId);
+    if (!sessionId) {
+      continue;
+    }
+    const next = normalizePersistedSessionViewState(sessionId, rawViewState);
+    if (!next) {
+      continue;
+    }
+    normalized[sessionId] = next;
+    count += 1;
+  }
+  return normalized;
+}
+
+function clonePersistablePayload<T>(value: T): T | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  try {
+    return JSON.parse(JSON.stringify(value)) as T;
+  } catch {
+    return null;
+  }
+}
+
 function resetPanelScrollRuntimeState(): void {
   messagesState.scrollPositions = createDefaultScrollPositions();
   messagesState.scrollAnchors = createDefaultScrollAnchors();
@@ -145,8 +315,15 @@ function resetPanelScrollRuntimeState(): void {
 }
 
 let deferredWebviewStateSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let sessionViewStateBySession = $state<Record<string, PersistedSessionViewState>>({});
+let webviewStateBatchDepth = 0;
+let webviewStateBatchPending = false;
 
 function scheduleSaveWebviewState(): void {
+  if (webviewStateBatchDepth > 0) {
+    webviewStateBatchPending = true;
+    return;
+  }
   if (deferredWebviewStateSaveTimer) {
     clearTimeout(deferredWebviewStateSaveTimer);
   }
@@ -184,16 +361,6 @@ function isValidPersistedArray(value: unknown, max: number): value is unknown[] 
   return true;
 }
 
-function isValidMessageSource(message: Message | null | undefined): boolean {
-  if (!message || typeof message !== 'object') return false;
-  const source = (message as Message).source;
-  return typeof source === 'string' && source.length > 0;
-}
-
-function hasInvalidMessageSource(messages: Message[]): boolean {
-  return messages.some((msg) => !isValidMessageSource(msg));
-}
-
 // 新增状态：任务、变更、阶段、Toast、模型状态
 let tasks = $state<Task[]>([]);
 let edits = $state<Array<{ filePath: string; snapshotId?: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string; missionId?: string }>>([]);
@@ -202,15 +369,32 @@ export type WorkerWaitResultMap = Record<string, WorkerWaitResult | null>;
 
 let workerWaitResults = $state<WorkerWaitResultMap>({});
 
+const timelineNodeLookup = $derived.by(() => buildTimelineNodeLookup(messagesState.timelineNodes));
+
 // 统一 Worker 运行态（唯一权威来源）
+const messageProjection = $derived.by(() => ({
+  thread: buildTimelinePanelMessages(timelineNodeLookup, messagesState.timelineProjection, 'thread'),
+  workers: {
+    claude: buildTimelinePanelMessages(timelineNodeLookup, messagesState.timelineProjection, 'worker', 'claude'),
+    codex: buildTimelinePanelMessages(timelineNodeLookup, messagesState.timelineProjection, 'worker', 'codex'),
+    gemini: buildTimelinePanelMessages(timelineNodeLookup, messagesState.timelineProjection, 'worker', 'gemini'),
+  },
+}));
+
 const workerRuntime = $derived.by(() => deriveWorkerRuntimeMap({
-  messagesByWorker: messagesState.agentOutputs,
+  messagesByWorker: {
+    claude: messageProjection.workers.claude,
+    codex: messageProjection.workers.codex,
+    gemini: messageProjection.workers.gemini,
+  },
   pendingRequestIds: messagesState.pendingRequests,
   tasks,
+  runtimeDiagnostics: messagesState.orchestratorRuntimeDiagnostics,
 }));
 
 export type ToastCategory = 'incident' | 'audit' | 'feedback';
 export type NotificationCategory = 'incident' | 'audit';
+export type ToastDisplayMode = 'toast' | 'notification_center' | 'silent';
 
 export interface ToastOptions {
   category?: ToastCategory;
@@ -218,6 +402,8 @@ export interface ToastOptions {
   actionRequired?: boolean;
   persistToCenter?: boolean;
   countUnread?: boolean;
+  displayMode?: ToastDisplayMode;
+  duration?: number;
 }
 
 interface ToastRecord {
@@ -228,6 +414,7 @@ interface ToastRecord {
   category: ToastCategory;
   source?: string;
   actionRequired?: boolean;
+  duration?: number;
 }
 
 let toasts = $state<ToastRecord[]>([]);
@@ -244,13 +431,11 @@ export interface Notification {
   timestamp: number;
   read: boolean;
 }
-const GLOBAL_NOTIFICATION_BUCKET = '__global__';
 const MAX_NOTIFICATIONS_PER_SESSION = 200;
-const NOTIFICATION_ARCHIVE_RUNTIME_SOURCES = new Set(['model-runtime', 'task-runtime', 'tool-runtime']);
 
 let notifications = $state<Notification[]>([]);
 let unreadNotificationCount = $state(0);
-let notificationBuckets = $state<Record<string, Notification[]>>({});
+let notificationsBySession = $state<Record<string, Notification[]>>({});
 
 let modelStatus = $state<ModelStatusMap>({
   claude: { status: 'checking' },
@@ -264,66 +449,51 @@ let requestedInteractionMode = $state<'ask' | 'auto' | null>(null);
 let interactionModeUpdatedAt = $state<number>(0);
 const INTERACTION_MODE_SYNC_TIMEOUT_MS = 10000;
 let interactionModeSyncTimer: ReturnType<typeof setTimeout> | null = null;
+const timelineNodeIdByMessageId = new Map<string, string>();
+const timelineNodeIdByCardId = new Map<string, string>();
+const timelineNodeIdByLifecycleKey = new Map<string, string>();
+const timelineExecutionItemTargetByMessageId = new Map<string, { nodeId: string; itemId: string }>();
 
-function sanitizeMessageBlocks(blocks: unknown): ContentBlock[] {
-  const list = ensureArray(blocks);
-  const invalid = list.filter(
-    (block) => !block || typeof block !== 'object' || !('type' in (block as Record<string, unknown>))
+function resolveMessageMetadataRecord(message: Pick<Message, 'metadata'> | undefined): Record<string, unknown> | undefined {
+  return message?.metadata && typeof message.metadata === 'object'
+    ? message.metadata as Record<string, unknown>
+    : undefined;
+}
+
+function resolveMessageSortTimestamp(message: Pick<Message, 'timestamp' | 'metadata' | 'type'>): number {
+  return resolveTimelineSortTimestamp(message.timestamp, resolveMessageMetadataRecord(message));
+}
+
+function mergeTimelineSortTimestamp(
+  currentTimestamp: number | undefined,
+  message: Pick<Message, 'timestamp' | 'metadata' | 'type'>,
+): number {
+  return resolveStableTimelinePlacementTimestamp(
+    currentTimestamp,
+    resolveMessageSortTimestamp(message),
   );
-  if (invalid.length > 0) {
-    throw new Error('[MessagesStore] 消息块无效');
-  }
-  return list as ContentBlock[];
 }
 
-function normalizePersistedMessages(messages: Message[] | undefined): Message[] {
-  const seen = new Set<string>();
-  const normalized: Message[] = [];
-  for (const msg of ensureArray<Message>(messages)) {
-    if (!msg || typeof msg !== 'object') {
-      throw new Error('[MessagesStore] 持久化消息包含无效对象');
-    }
-    const id = typeof msg.id === 'string' && msg.id.trim().length > 0 ? msg.id.trim() : '';
-    if (!id) {
-      throw new Error('[MessagesStore] 持久化消息缺少 id');
-    }
-    if (seen.has(id)) {
-      throw new Error(`[MessagesStore] 持久化消息 id 重复: ${id}`);
-    }
-    seen.add(id);
-    const blocks = sanitizeMessageBlocks(msg.blocks);
-    const metadata = msg.metadata && typeof msg.metadata === 'object'
-      ? {
-        ...msg.metadata,
-        isPlaceholder: false,
-        placeholderState: undefined,
-      }
-      : undefined;
-    normalized.push({
-      ...msg,
-      id,
-      blocks: blocks.length > 0 ? blocks : undefined,
-      // Webview 重新进入时，持久化消息一律视为历史完成态，防止残留流式动画。
-      isStreaming: false,
-      isComplete: true,
-      metadata,
-    });
-  }
-  return normalized;
+function normalizeProjectionRestoredMessage(message: Message): Message {
+  return normalizeMessagePayload(message, '[MessagesStore] 投影消息');
 }
 
-function normalizePersistedNotification(raw: unknown): Notification | null {
+function normalizeSessionNotificationRecord(raw: unknown): Notification | null {
   if (!raw || typeof raw !== 'object') return null;
   const item = raw as Record<string, unknown>;
-  const id = typeof item.id === 'string' ? item.id.trim() : '';
+  const id = typeof item.notificationId === 'string' ? item.notificationId.trim() : '';
   if (!id) return null;
-  const type = typeof item.type === 'string' ? item.type : 'info';
+  const type = typeof item.level === 'string' ? item.level : 'info';
   const message = typeof item.message === 'string' ? item.message : '';
   if (!message) return null;
-  const category = item.category === 'incident' ? 'incident' : item.category === 'audit' ? 'audit' : null;
+  const category = item.kind === 'incident' ? 'incident' : item.kind === 'audit' || item.kind === 'center' ? 'audit' : null;
   if (!category) return null;
-  const timestamp = typeof item.timestamp === 'number' && Number.isFinite(item.timestamp)
-    ? item.timestamp
+  const persistToCenter = item.persistToCenter !== false;
+  if (!persistToCenter) {
+    return null;
+  }
+  const timestamp = typeof item.createdAt === 'number' && Number.isFinite(item.createdAt)
+    ? item.createdAt
     : Date.now();
   const read = Boolean(item.read);
   const title = typeof item.title === 'string' ? item.title : undefined;
@@ -342,48 +512,915 @@ function normalizePersistedNotification(raw: unknown): Notification | null {
   };
 }
 
-function normalizeNotificationBuckets(raw: unknown): Record<string, Notification[]> {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return {};
+function normalizeSessionNotificationList(raw: unknown): Notification[] {
+  if (!isValidPersistedArray(raw, MAX_PERSISTED_ARRAY_LENGTH)) {
+    return [];
   }
-  const result: Record<string, Notification[]> = {};
-  for (const [bucketId, list] of Object.entries(raw as Record<string, unknown>)) {
-    if (typeof bucketId !== 'string' || bucketId.length === 0) {
+  const seen = new Set<string>();
+  const normalized: Notification[] = [];
+  for (const item of raw) {
+    const next = normalizeSessionNotificationRecord(item);
+    if (!next || seen.has(next.id)) {
       continue;
     }
-    if (!isValidPersistedArray(list, MAX_PERSISTED_ARRAY_LENGTH)) {
-      continue;
-    }
-    const seen = new Set<string>();
-    const normalized: Notification[] = [];
-    for (const item of list) {
-      const next = normalizePersistedNotification(item);
-      if (!next || seen.has(next.id)) {
-        continue;
-      }
-      seen.add(next.id);
-      normalized.push(next);
-      if (normalized.length >= MAX_NOTIFICATIONS_PER_SESSION) {
-        break;
-      }
-    }
-    if (normalized.length > 0) {
-      result[bucketId] = normalized;
+    seen.add(next.id);
+    normalized.push(next);
+    if (normalized.length >= MAX_NOTIFICATIONS_PER_SESSION) {
+      break;
     }
   }
-  return result;
+  return normalized;
 }
 
 function normalizeIncomingMessage(message: Message): Message {
-  if (!message || typeof message !== 'object') {
-    throw new Error('[MessagesStore] 输入消息无效');
+  return normalizeMessagePayload(message, '[MessagesStore] 输入消息');
+}
+
+function isTimelineContainerOnlyMessage(message: Pick<Message, 'metadata'> | undefined): boolean {
+  return resolveMessageMetadataRecord(message)?.timelineContainerOnly === true;
+}
+
+function setTimelineContainerFlag(message: Message, containerOnly: boolean): Message {
+  const metadata = {
+    ...(resolveMessageMetadataRecord(message) || {}),
+  };
+  if (containerOnly) {
+    metadata.timelineContainerOnly = true;
+  } else {
+    delete metadata.timelineContainerOnly;
   }
-  const id = typeof message.id === 'string' && message.id.trim().length > 0 ? message.id.trim() : '';
-  if (!id) {
-    throw new Error('[MessagesStore] 输入消息缺少 id');
+  return normalizeIncomingMessage({
+    ...message,
+    ...(Object.keys(metadata).length > 0 ? { metadata } : { metadata: undefined }),
+  });
+}
+
+function resolveTimelineFragmentMessages(message: Message): Message[] {
+  const fragmentSource = setTimelineContainerFlag(message, false);
+  const fragments = expandRenderableTimelineMessages(fragmentSource as unknown as TimelineFragmentMessage) as unknown as Message[];
+  if (fragments.length <= 1) {
+    return [];
   }
-  const blocks = sanitizeMessageBlocks(message.blocks);
-  return { ...message, id, blocks: blocks.length > 0 ? blocks : undefined };
+  return fragments.map((fragment, index) => normalizeIncomingMessage({
+    ...fragment,
+    isStreaming: fragmentSource.isStreaming === true && index === fragments.length - 1,
+  }));
+}
+
+function normalizeWorkerTabList(workerTabs: AgentType[] | undefined): AgentType[] {
+  if (!Array.isArray(workerTabs)) return [];
+  const next = new Set<AgentType>();
+  for (const worker of workerTabs) {
+    if (worker === 'claude' || worker === 'codex' || worker === 'gemini') {
+      next.add(worker);
+    }
+  }
+  return Array.from(next);
+}
+
+function normalizeTimelineLaneOrder(
+  laneOrder: TimelineNode['laneOrder'] | undefined,
+): TimelineNode['laneOrder'] | undefined {
+  if (!laneOrder || typeof laneOrder !== 'object') {
+    return undefined;
+  }
+  const normalizedThread = typeof laneOrder.thread === 'number' && Number.isFinite(laneOrder.thread)
+    ? Math.max(1, Math.floor(laneOrder.thread))
+    : undefined;
+  const nextWorkers: Partial<Record<AgentType, number>> = {};
+  const rawWorkers = laneOrder.workers;
+  if (rawWorkers && typeof rawWorkers === 'object') {
+    for (const worker of ['claude', 'codex', 'gemini'] as AgentType[]) {
+      const rawOrder = rawWorkers[worker];
+      if (typeof rawOrder === 'number' && Number.isFinite(rawOrder)) {
+        nextWorkers[worker] = Math.max(1, Math.floor(rawOrder));
+      }
+    }
+  }
+  if (normalizedThread === undefined && Object.keys(nextWorkers).length === 0) {
+    return undefined;
+  }
+  return {
+    ...(normalizedThread !== undefined ? { thread: normalizedThread } : {}),
+    ...(Object.keys(nextWorkers).length > 0 ? { workers: nextWorkers } : {}),
+  };
+}
+
+function resolveTimelineCardId(message: Message): string | undefined {
+  const rawCardId = typeof message.metadata?.cardId === 'string' ? message.metadata.cardId.trim() : '';
+  if (rawCardId) {
+    return rawCardId;
+  }
+  if (!isTimelineWorkerLifecycleMessageType(message.type)) {
+    return undefined;
+  }
+  const rawWorkerCardId = typeof message.metadata?.workerCardId === 'string'
+    ? message.metadata.workerCardId.trim()
+    : '';
+  return rawWorkerCardId || undefined;
+}
+
+function resolveTimelineLifecycleKey(message: Message): string | undefined {
+  if (!isTimelineWorkerLifecycleMessageType(message.type)) {
+    return undefined;
+  }
+  const metadata = message.metadata && typeof message.metadata === 'object'
+    ? message.metadata as Record<string, unknown>
+    : undefined;
+  const resolved = resolveTimelineWorkerLifecycleKey(metadata, {
+    fallbackWorker: message.source,
+  });
+  if (resolved) return resolved;
+  return resolveTimelineCardId(message);
+}
+
+function resolveProjectionTaskKey(message: Pick<Message, 'metadata'>): string | undefined {
+  const metadata = message.metadata && typeof message.metadata === 'object'
+    ? message.metadata as Record<string, unknown>
+    : undefined;
+  const resolved = resolveTimelineWorkerLifecycleKey(metadata);
+  return resolved || undefined;
+}
+
+function isWorkerLifecycleAttachmentMessage(message: Pick<Message, 'type' | 'source' | 'role' | 'metadata'>): boolean {
+  void message;
+  // 生命周期卡片只承载任务说明与任务总结。
+  // 普通 worker 模型输出、thinking、tool_call、result 必须保持独立时间线节点，
+  // 不能再被包进任务卡片，否则会破坏时间轴顺序与语义边界。
+  return false;
+}
+
+function resolveTimelineWorker(message: Message): AgentType | undefined {
+  const worker = normalizeWorkerSlot(
+    message.metadata?.worker
+      || message.metadata?.assignedWorker
+      || message.metadata?.agent
+      || message.source
+  );
+  return worker || undefined;
+}
+
+function resolveWorkerVisibility(message: Message): {
+  threadVisible: boolean;
+  workerTabs: AgentType[];
+} {
+  const worker = resolveTimelineWorker(message);
+  const visibility = resolveSharedTimelineWorkerVisibility({
+    hasWorker: Boolean(worker),
+    type: message.type,
+    source: message.source,
+  });
+  return {
+    threadVisible: visibility.threadVisible,
+    workerTabs: visibility.includeWorkerTab && worker ? [worker] : [],
+  };
+}
+
+function resolveTimelineNodeKind(message: Message): TimelineNodeKind {
+  return resolveTimelinePresentationKind(message);
+}
+
+function resolveTimelineNodeId(message: Message): string {
+  const lifecycleKey = resolveTimelineLifecycleKey(message);
+  if (lifecycleKey) {
+    return `lifecycle:${lifecycleKey}`;
+  }
+  return message.id;
+}
+
+function resolveTimelineAliasId(rawId: string | undefined): string {
+  const normalized = typeof rawId === 'string' ? rawId.trim() : '';
+  if (!normalized) return '';
+  return timelineNodeIdByMessageId.get(normalized) || normalized;
+}
+
+function messageHasRenderableContent(message: Message): boolean {
+  return messageHasRenderableTimelineContent(message);
+}
+
+function mergeLifecycleTimelineMessage(existing: Message, incoming: Message, stableId: string): Message {
+  const existingMetadata = (existing.metadata || {}) as Record<string, unknown>;
+  const incomingMetadata = (incoming.metadata || {}) as Record<string, unknown>;
+  const existingSubTaskCard = existingMetadata.subTaskCard && typeof existingMetadata.subTaskCard === 'object'
+    ? existingMetadata.subTaskCard as Record<string, unknown>
+    : undefined;
+  const incomingSubTaskCard = incomingMetadata.subTaskCard && typeof incomingMetadata.subTaskCard === 'object'
+    ? incomingMetadata.subTaskCard as Record<string, unknown>
+    : undefined;
+  const shouldMergeSubTaskCard = existing.type !== 'task_card' || incoming.type !== 'task_card';
+  const mergedSubTaskCard = shouldMergeSubTaskCard
+    ? ((existingSubTaskCard || incomingSubTaskCard)
+        ? {
+            ...(existingSubTaskCard || {}),
+            ...(incomingSubTaskCard || {}),
+          }
+        : undefined)
+    : (incomingSubTaskCard || existingSubTaskCard);
+  const mergedMetadata: Record<string, unknown> = {
+    ...existingMetadata,
+    ...incomingMetadata,
+    ...(mergedSubTaskCard ? { subTaskCard: mergedSubTaskCard } : {}),
+    lifecycleCardMode: 'instruction_with_summary',
+  };
+  const mergedCardId = typeof mergedMetadata.cardId === 'string' && mergedMetadata.cardId.trim()
+    ? mergedMetadata.cardId.trim()
+    : stableId;
+  mergedMetadata.cardId = mergedCardId;
+
+  if (existing.type === 'instruction' && incoming.type === 'task_card') {
+    const existingHasRenderableContent = messageHasRenderableContent(existing);
+    return {
+      ...existing,
+      id: stableId,
+      isStreaming: false,
+      isComplete: incoming.isComplete,
+      ...(existingHasRenderableContent ? {} : { content: incoming.content, blocks: incoming.blocks }),
+      metadata: mergedMetadata,
+    };
+  }
+
+  if (existing.type === 'task_card' && incoming.type === 'instruction') {
+    return {
+      ...incoming,
+      id: stableId,
+      timestamp: existing.timestamp || incoming.timestamp,
+      metadata: mergedMetadata,
+    };
+  }
+
+  return {
+    ...existing,
+    ...incoming,
+    id: stableId,
+    timestamp: existing.timestamp || incoming.timestamp,
+    metadata: mergedMetadata,
+  };
+}
+
+function getMessageBlockSeq(message: Pick<Message, 'metadata'> | undefined): number {
+  return resolveTimelineBlockSeqFromMetadata(resolveMessageMetadataRecord(message));
+}
+
+function normalizeTimelineExecutionItem(item: TimelineExecutionItem): TimelineExecutionItem {
+  const normalizedMessage = normalizeIncomingMessage(item.message);
+  const messageEventSeq = getMessageEventSeq(normalizedMessage) ?? 0;
+  const anchorEventSeq = typeof item.anchorEventSeq === 'number' && Number.isFinite(item.anchorEventSeq)
+    ? Math.max(0, Math.floor(item.anchorEventSeq))
+    : messageEventSeq;
+  const latestEventSeq = typeof item.latestEventSeq === 'number' && Number.isFinite(item.latestEventSeq)
+    ? Math.max(anchorEventSeq, Math.floor(item.latestEventSeq))
+    : messageEventSeq;
+  const cardStreamSeq = typeof item.cardStreamSeq === 'number' && Number.isFinite(item.cardStreamSeq)
+    ? Math.max(0, Math.floor(item.cardStreamSeq))
+    : getMessageCardStreamSeq(normalizedMessage);
+  const workerTabs = normalizeWorkerTabList(item.workerTabs);
+  const itemId = typeof item.itemId === 'string' && item.itemId.trim()
+    ? item.itemId.trim()
+    : normalizedMessage.id;
+  return {
+    itemId,
+    itemOrder: typeof item.itemOrder === 'number' && Number.isFinite(item.itemOrder)
+      ? Math.max(1, Math.floor(item.itemOrder))
+      : 1,
+    anchorEventSeq,
+    latestEventSeq,
+    cardStreamSeq,
+    timestamp: mergeTimelineSortTimestamp(item.timestamp, normalizedMessage),
+    worker: resolveTimelineWorker(normalizedMessage) || item.worker,
+    threadVisible: item.threadVisible !== false,
+    workerTabs,
+    messageIds: Array.from(new Set([
+      itemId,
+      normalizedMessage.id,
+      ...ensureArray<string>(item.messageIds),
+    ])),
+    message: normalizedMessage,
+  };
+}
+
+function compareTimelineExecutionItemOrder(left: TimelineExecutionItem, right: TimelineExecutionItem): number {
+  return compareTimelineSemanticOrder(
+    {
+      timestamp: left.timestamp,
+      stableId: left.itemId,
+      itemOrder: left.itemOrder,
+      messageType: left.message?.type,
+      primaryToolCallName: resolveTimelinePrimaryToolCallName(left.message?.blocks),
+      anchorEventSeq: left.anchorEventSeq,
+      blockSeq: getMessageBlockSeq(left.message),
+      cardStreamSeq: left.cardStreamSeq,
+    },
+    {
+      timestamp: right.timestamp,
+      stableId: right.itemId,
+      itemOrder: right.itemOrder,
+      messageType: right.message?.type,
+      primaryToolCallName: resolveTimelinePrimaryToolCallName(right.message?.blocks),
+      anchorEventSeq: right.anchorEventSeq,
+      blockSeq: getMessageBlockSeq(right.message),
+      cardStreamSeq: right.cardStreamSeq,
+    },
+  );
+}
+
+function buildFragmentExecutionItems(
+  messages: Message[],
+  visibility: { thread?: boolean; workerTabs?: AgentType[] },
+): TimelineExecutionItem[] {
+  return messages
+    .map((message) => buildExecutionItemFromMessage(message, visibility))
+    .sort(compareTimelineExecutionItemOrder)
+    .map((item, index) => normalizeTimelineExecutionItem({
+      ...item,
+      itemOrder: index + 1,
+    }));
+}
+
+function normalizeTimelineNode(node: TimelineNode): TimelineNode {
+  const normalizedMessage = normalizeIncomingMessage(node.message);
+  const stableNodeId = typeof node.nodeId === 'string' && node.nodeId.trim()
+    ? node.nodeId.trim()
+    : resolveTimelineNodeId(normalizedMessage);
+  const stableMessage = {
+    ...normalizedMessage,
+    id: stableNodeId,
+  };
+  const messageEventSeq = getMessageEventSeq(stableMessage);
+  const explicitAnchorEventSeq = typeof node.anchorEventSeq === 'number' && Number.isFinite(node.anchorEventSeq)
+    ? Math.floor(node.anchorEventSeq)
+    : 0;
+  const explicitLatestEventSeq = typeof node.latestEventSeq === 'number' && Number.isFinite(node.latestEventSeq)
+    ? Math.floor(node.latestEventSeq)
+    : 0;
+  const anchorEventSeq = explicitAnchorEventSeq > 0
+    ? explicitAnchorEventSeq
+    : (messageEventSeq ?? 0);
+  const latestEventSeq = Math.max(anchorEventSeq, explicitLatestEventSeq, messageEventSeq ?? 0);
+  const cardStreamSeq = getMessageCardStreamSeq(stableMessage)
+    || (typeof node.cardStreamSeq === 'number' && Number.isFinite(node.cardStreamSeq) ? Math.floor(node.cardStreamSeq) : 0);
+  const lifecycleKey = resolveTimelineLifecycleKey(stableMessage);
+  const cardId = resolveTimelineCardId(stableMessage);
+  const dispatchWaveId = typeof stableMessage.metadata?.dispatchWaveId === 'string'
+    ? stableMessage.metadata.dispatchWaveId.trim()
+    : (typeof node.dispatchWaveId === 'string' ? node.dispatchWaveId.trim() : '');
+  const laneId = typeof stableMessage.metadata?.laneId === 'string'
+    ? stableMessage.metadata.laneId.trim()
+    : (typeof node.laneId === 'string' ? node.laneId.trim() : '');
+  const workerCardId = typeof stableMessage.metadata?.workerCardId === 'string'
+    ? stableMessage.metadata.workerCardId.trim()
+    : (typeof node.workerCardId === 'string' ? node.workerCardId.trim() : '');
+  const worker = resolveTimelineWorker(stableMessage) || node.worker;
+  const workerTabs = normalizeWorkerTabList(node.workerTabs);
+  const messageIds = Array.from(new Set([
+    stableNodeId,
+    ...ensureArray<string>(node.messageIds),
+  ]));
+  const executionItems = ensureArray<TimelineExecutionItem>(node.executionItems)
+    .map((item) => normalizeTimelineExecutionItem(item))
+    .sort(compareTimelineExecutionItemOrder);
+  const laneOrder = normalizeTimelineLaneOrder(node.laneOrder);
+  return {
+    nodeId: stableNodeId,
+    kind: node.kind || resolveTimelineNodeKind(stableMessage),
+    displayOrder: typeof node.displayOrder === 'number' && Number.isFinite(node.displayOrder)
+      ? Math.max(0, Math.floor(node.displayOrder))
+      : undefined,
+    ...(laneOrder ? { laneOrder } : {}),
+    artifactVersion: typeof node.artifactVersion === 'number' && Number.isFinite(node.artifactVersion)
+      ? Math.max(0, Math.floor(node.artifactVersion))
+      : resolveTimelineVersionFromMetadata(resolveMessageMetadataRecord(stableMessage)),
+    anchorEventSeq,
+    latestEventSeq,
+    cardStreamSeq,
+    timestamp: mergeTimelineSortTimestamp(node.timestamp, stableMessage),
+    ...(cardId ? { cardId } : {}),
+    ...(lifecycleKey ? { lifecycleKey } : {}),
+    ...(dispatchWaveId ? { dispatchWaveId } : {}),
+    ...(laneId ? { laneId } : {}),
+    ...(workerCardId ? { workerCardId } : {}),
+    ...(worker ? { worker } : {}),
+    visibleInThread: node.visibleInThread !== false,
+    workerTabs,
+    messageIds,
+    message: stableMessage,
+    executionItems,
+  };
+}
+
+function rebuildTimelineIndexes(): void {
+  timelineNodeIdByMessageId.clear();
+  timelineNodeIdByCardId.clear();
+  timelineNodeIdByLifecycleKey.clear();
+  timelineExecutionItemTargetByMessageId.clear();
+  for (const node of messagesState.timelineNodes) {
+    timelineNodeIdByMessageId.set(node.nodeId, node.nodeId);
+    for (const messageId of node.messageIds) {
+      if (typeof messageId === 'string' && messageId.trim()) {
+        timelineNodeIdByMessageId.set(messageId.trim(), node.nodeId);
+      }
+    }
+    if (node.cardId) {
+      timelineNodeIdByCardId.set(node.cardId, node.nodeId);
+    }
+    if (node.lifecycleKey) {
+      timelineNodeIdByLifecycleKey.set(node.lifecycleKey, node.nodeId);
+    }
+    for (const item of ensureArray<TimelineExecutionItem>(node.executionItems)) {
+      timelineNodeIdByMessageId.set(item.itemId, node.nodeId);
+      timelineExecutionItemTargetByMessageId.set(item.itemId, { nodeId: node.nodeId, itemId: item.itemId });
+      for (const messageId of item.messageIds) {
+        if (typeof messageId === 'string' && messageId.trim()) {
+          const normalizedId = messageId.trim();
+          timelineNodeIdByMessageId.set(normalizedId, node.nodeId);
+          timelineExecutionItemTargetByMessageId.set(normalizedId, { nodeId: node.nodeId, itemId: item.itemId });
+        }
+      }
+    }
+  }
+}
+
+function compareTimelineNodeOrder(left: TimelineNode, right: TimelineNode): number {
+  return compareTimelineSemanticOrder(
+    {
+      timestamp: left.timestamp,
+      stableId: left.nodeId,
+      displayOrder: left.displayOrder,
+      messageType: left.message?.type,
+      primaryToolCallName: resolveTimelinePrimaryToolCallName(left.message?.blocks),
+      anchorEventSeq: left.anchorEventSeq,
+      blockSeq: getMessageBlockSeq(left.message),
+      cardStreamSeq: left.cardStreamSeq,
+    },
+    {
+      timestamp: right.timestamp,
+      stableId: right.nodeId,
+      displayOrder: right.displayOrder,
+      messageType: right.message?.type,
+      primaryToolCallName: resolveTimelinePrimaryToolCallName(right.message?.blocks),
+      anchorEventSeq: right.anchorEventSeq,
+      blockSeq: getMessageBlockSeq(right.message),
+      cardStreamSeq: right.cardStreamSeq,
+    },
+  );
+}
+
+function sortAndSyncTimelineNodes(nextNodes: TimelineNode[]): void {
+  const normalized = nextNodes.map((node) => normalizeTimelineNode(node));
+  normalized.sort(compareTimelineNodeOrder);
+  messagesState.timelineNodes = normalized;
+  rebuildTimelineIndexes();
+}
+
+function replaceTimelineNodes(nextNodes: TimelineNode[]): void {
+  sortAndSyncTimelineNodes(nextNodes);
+}
+
+function setTimelineProjectionNodes(nextNodes: TimelineNode[]): void {
+  replaceTimelineNodes(nextNodes);
+}
+
+function mutateTimelineNodes(mutator: (nodes: TimelineNode[]) => TimelineNode[]): void {
+  replaceTimelineNodes(mutator([...messagesState.timelineNodes]));
+}
+
+function mergeTimelineNodeAliases(
+  existingNode: TimelineNode,
+  nextMessage: Message,
+  visibility: { thread?: boolean; workerTabs?: AgentType[] },
+  options: { replaceMessageId?: string; displayOrder?: number } = {},
+): TimelineNode {
+  const lifecycleKey = resolveTimelineLifecycleKey(nextMessage);
+  const cardId = resolveTimelineCardId(nextMessage);
+  const nextWorkerTabs = normalizeWorkerTabList(visibility.workerTabs);
+  return normalizeTimelineNode({
+    ...existingNode,
+    displayOrder: existingNode.displayOrder ?? options.displayOrder,
+    cardId: cardId || existingNode.cardId,
+    lifecycleKey: lifecycleKey || existingNode.lifecycleKey,
+    worker: existingNode.worker || resolveTimelineWorker(nextMessage),
+    visibleInThread: existingNode.visibleInThread || visibility.thread !== false,
+    workerTabs: [
+      ...existingNode.workerTabs,
+      ...nextWorkerTabs,
+    ],
+    messageIds: Array.from(new Set([
+      ...existingNode.messageIds,
+      existingNode.nodeId,
+      nextMessage.id,
+      ...(options.replaceMessageId ? [options.replaceMessageId] : []),
+    ])),
+  });
+}
+
+function buildExecutionItemFromMessage(
+  message: Message,
+  visibility: { thread?: boolean; workerTabs?: AgentType[] },
+  options: { replaceMessageId?: string } = {},
+): TimelineExecutionItem {
+  const nextWorkerTabs = normalizeWorkerTabList(visibility.workerTabs);
+  const eventSeq = getMessageEventSeq(message) ?? 0;
+  return normalizeTimelineExecutionItem({
+    itemId: message.id,
+    itemOrder: 1,
+    anchorEventSeq: eventSeq,
+    latestEventSeq: eventSeq,
+    cardStreamSeq: getMessageCardStreamSeq(message),
+    timestamp: resolveMessageSortTimestamp(message),
+    worker: resolveTimelineWorker(message),
+    threadVisible: visibility.thread === true,
+    workerTabs: nextWorkerTabs,
+    messageIds: Array.from(new Set([
+      message.id,
+      ...(options.replaceMessageId ? [options.replaceMessageId] : []),
+    ])),
+    message,
+  });
+}
+
+function mergeExecutionItemWithMessage(
+  existingItem: TimelineExecutionItem,
+  message: Message,
+  visibility: { thread?: boolean; workerTabs?: AgentType[] },
+  options: { replaceMessageId?: string } = {},
+): TimelineExecutionItem {
+  const nextWorkerTabs = normalizeWorkerTabList(visibility.workerTabs);
+  return normalizeTimelineExecutionItem({
+    ...existingItem,
+    latestEventSeq: Math.max(existingItem.latestEventSeq, getMessageEventSeq(message) ?? existingItem.latestEventSeq),
+    cardStreamSeq: Math.max(existingItem.cardStreamSeq, getMessageCardStreamSeq(message)),
+    timestamp: mergeTimelineSortTimestamp(existingItem.timestamp, message),
+    worker: resolveTimelineWorker(message) || existingItem.worker,
+    threadVisible: existingItem.threadVisible || visibility.thread === true,
+    workerTabs: [
+      ...existingItem.workerTabs,
+      ...nextWorkerTabs,
+    ],
+    messageIds: Array.from(new Set([
+      ...existingItem.messageIds,
+      message.id,
+      ...(options.replaceMessageId ? [options.replaceMessageId] : []),
+    ])),
+    message,
+  });
+}
+
+function extractExecutionItemFromNode(node: TimelineNode): TimelineExecutionItem | null {
+  if (!isWorkerLifecycleAttachmentMessage(node.message)) {
+    return null;
+  }
+  return normalizeTimelineExecutionItem({
+    itemId: node.message.id,
+    itemOrder: 1,
+    anchorEventSeq: node.anchorEventSeq,
+    latestEventSeq: node.latestEventSeq,
+    cardStreamSeq: node.cardStreamSeq,
+    timestamp: node.timestamp,
+    worker: node.worker,
+    threadVisible: node.visibleInThread,
+    workerTabs: node.workerTabs,
+    messageIds: node.messageIds,
+    message: node.message,
+  });
+}
+
+function upsertTimelineNode(
+  message: Message,
+  visibility: { thread?: boolean; workerTabs?: AgentType[] },
+  options: { replaceMessageId?: string; displayOrder?: number } = {},
+): Message {
+  const normalizedMessage = normalizeIncomingMessage(message);
+  const lifecycleKey = resolveTimelineLifecycleKey(normalizedMessage);
+  const attachmentLifecycleKey = resolveProjectionTaskKey(normalizedMessage);
+  const cardId = resolveTimelineCardId(normalizedMessage);
+  const lifecycleHostNodeId = attachmentLifecycleKey
+    ? timelineNodeIdByLifecycleKey.get(attachmentLifecycleKey)
+    : undefined;
+  const shouldAttachToLifecycle = Boolean(
+    lifecycleHostNodeId
+    && attachmentLifecycleKey
+    && isWorkerLifecycleAttachmentMessage(normalizedMessage),
+  );
+  const explicitNodeId = shouldAttachToLifecycle
+    ? lifecycleHostNodeId!
+    : resolveTimelineNodeId(normalizedMessage);
+  const existingNodeId = shouldAttachToLifecycle
+    ? lifecycleHostNodeId
+    : ((lifecycleKey ? timelineNodeIdByLifecycleKey.get(lifecycleKey) : undefined)
+      || timelineNodeIdByMessageId.get(normalizedMessage.id)
+      || (cardId ? timelineNodeIdByCardId.get(cardId) : undefined)
+      || undefined);
+  const stableNodeId = existingNodeId || explicitNodeId;
+  const stableMessage: Message = shouldAttachToLifecycle
+    ? normalizedMessage
+    : {
+        ...normalizedMessage,
+        id: stableNodeId,
+      };
+  const fragmentMessages = shouldAttachToLifecycle ? [] : resolveTimelineFragmentMessages(stableMessage);
+  const usesFragmentExecutionItems = fragmentMessages.length > 1;
+  const hostMessage = usesFragmentExecutionItems
+    ? setTimelineContainerFlag(stableMessage, true)
+    : setTimelineContainerFlag(stableMessage, false);
+  const nextWorkerTabs = normalizeWorkerTabList(visibility.workerTabs);
+  const existingNode = existingNodeId
+    ? messagesState.timelineNodes.find((node) => node.nodeId === existingNodeId)
+    : undefined;
+
+  if (shouldAttachToLifecycle && existingNode) {
+    const existingExecutionItems = ensureArray<TimelineExecutionItem>(existingNode.executionItems);
+    const existingItemIndex = existingExecutionItems.findIndex((item) => (
+      item.itemId === normalizedMessage.id
+      || item.messageIds.includes(normalizedMessage.id)
+      || (options.replaceMessageId ? item.messageIds.includes(options.replaceMessageId) : false)
+    ));
+    const nextExecutionItems = [...existingExecutionItems];
+    if (existingItemIndex >= 0) {
+      nextExecutionItems[existingItemIndex] = mergeExecutionItemWithMessage(
+        nextExecutionItems[existingItemIndex],
+        stableMessage,
+        visibility,
+        options,
+      );
+    } else {
+      nextExecutionItems.push(buildExecutionItemFromMessage(stableMessage, visibility, options));
+    }
+    const mergedNode = normalizeTimelineNode({
+      ...existingNode,
+      latestEventSeq: Math.max(existingNode.latestEventSeq, getMessageEventSeq(stableMessage) ?? existingNode.latestEventSeq),
+      cardStreamSeq: Math.max(existingNode.cardStreamSeq, getMessageCardStreamSeq(stableMessage)),
+      workerTabs: [
+        ...existingNode.workerTabs,
+        ...nextWorkerTabs,
+      ],
+      executionItems: nextExecutionItems,
+      messageIds: Array.from(new Set([
+        ...existingNode.messageIds,
+        normalizedMessage.id,
+        ...(options.replaceMessageId ? [options.replaceMessageId] : []),
+      ])),
+    });
+    mutateTimelineNodes((nodes) => nodes.map((node) => (
+      node.nodeId === stableNodeId ? mergedNode : node
+    )));
+    return nextExecutionItems[existingItemIndex >= 0 ? existingItemIndex : nextExecutionItems.length - 1].message;
+  }
+
+  const nextAnchorEventSeq = getMessageEventSeq(stableMessage)
+    ?? (existingNode?.anchorEventSeq || 0);
+  const nextLatestEventSeq = getMessageEventSeq(stableMessage)
+    ?? (existingNode?.latestEventSeq || nextAnchorEventSeq);
+  const nextCardStreamSeq = getMessageCardStreamSeq(stableMessage) || (existingNode?.cardStreamSeq || 0);
+  if (existingNode && compareIncomingMessageVersion(existingNode, stableMessage) < 0) {
+    const aliasedNode = mergeTimelineNodeAliases(existingNode, stableMessage, visibility, options);
+    mutateTimelineNodes((nodes) => nodes.map((node) => (
+      node.nodeId === stableNodeId ? aliasedNode : node
+    )));
+    return aliasedNode.message;
+  }
+  const mergedMessage = existingNode?.kind === 'worker_lifecycle'
+    ? mergeLifecycleTimelineMessage(existingNode.message, hostMessage, stableNodeId)
+    : hostMessage;
+  const absorbedExecutionNodes = lifecycleKey
+    ? messagesState.timelineNodes.filter((node) => (
+        node.nodeId !== stableNodeId
+        && node.kind !== 'worker_lifecycle'
+        && resolveProjectionTaskKey(node.message) === lifecycleKey
+        && isWorkerLifecycleAttachmentMessage(node.message)
+      ))
+    : [];
+  const absorbedExecutionItems = absorbedExecutionNodes
+    .map((node) => extractExecutionItemFromNode(node))
+    .filter((item): item is TimelineExecutionItem => Boolean(item));
+  const executionItems = (() => {
+    if (usesFragmentExecutionItems) {
+      return buildFragmentExecutionItems(fragmentMessages, visibility);
+    }
+    const merged = [...(existingNode?.executionItems || [])];
+    for (const item of absorbedExecutionItems) {
+      const existingIndex = merged.findIndex((current) => (
+        current.itemId === item.itemId
+        || current.messageIds.some((messageId) => item.messageIds.includes(messageId))
+      ));
+      if (existingIndex >= 0) {
+        merged[existingIndex] = normalizeTimelineExecutionItem({
+          ...merged[existingIndex],
+          latestEventSeq: Math.max(merged[existingIndex].latestEventSeq, item.latestEventSeq),
+          cardStreamSeq: Math.max(merged[existingIndex].cardStreamSeq, item.cardStreamSeq),
+          timestamp: Math.min(merged[existingIndex].timestamp, item.timestamp),
+          worker: merged[existingIndex].worker || item.worker,
+          threadVisible: merged[existingIndex].threadVisible || item.threadVisible,
+          workerTabs: [
+            ...merged[existingIndex].workerTabs,
+            ...item.workerTabs,
+          ],
+          messageIds: Array.from(new Set([
+            ...merged[existingIndex].messageIds,
+            ...item.messageIds,
+          ])),
+          message: item.message,
+        });
+      } else {
+        merged.push(item);
+      }
+    }
+    return merged;
+  })();
+  const nextNode: TimelineNode = normalizeTimelineNode({
+    nodeId: stableNodeId,
+    kind: existingNode?.kind || resolveTimelineNodeKind(mergedMessage),
+    displayOrder: existingNode?.displayOrder ?? options.displayOrder,
+    laneOrder: existingNode?.laneOrder,
+    artifactVersion: existingNode?.artifactVersion,
+    anchorEventSeq: existingNode?.anchorEventSeq || nextAnchorEventSeq,
+    latestEventSeq: Math.max(existingNode?.latestEventSeq || 0, nextLatestEventSeq),
+    cardStreamSeq: Math.max(existingNode?.cardStreamSeq || 0, nextCardStreamSeq),
+    timestamp: mergeTimelineSortTimestamp(existingNode?.timestamp, mergedMessage),
+    cardId: cardId || existingNode?.cardId,
+    lifecycleKey: lifecycleKey || existingNode?.lifecycleKey,
+    worker: resolveTimelineWorker(mergedMessage) || existingNode?.worker,
+    visibleInThread: existingNode?.visibleInThread || visibility.thread !== false,
+    workerTabs: [
+      ...(existingNode?.workerTabs || []),
+      ...nextWorkerTabs,
+    ],
+    messageIds: Array.from(new Set([
+      ...(existingNode?.messageIds || []),
+      stableNodeId,
+      normalizedMessage.id,
+      ...absorbedExecutionNodes.flatMap((node) => node.messageIds),
+      ...(options.replaceMessageId ? [options.replaceMessageId] : []),
+    ])),
+    message: mergedMessage,
+    executionItems,
+  });
+
+  mutateTimelineNodes((nodes) => {
+    const filteredNodes = lifecycleKey
+      ? nodes.filter((node) => !absorbedExecutionNodes.some((absorbed) => absorbed.nodeId === node.nodeId))
+      : nodes;
+    const index = filteredNodes.findIndex((node) => node.nodeId === stableNodeId);
+    if (index >= 0) {
+      const next = [...filteredNodes];
+      next[index] = nextNode;
+      return next;
+    }
+    return [...filteredNodes, nextNode];
+  });
+
+  return nextNode.message;
+}
+
+function findTimelineNodeByAlias(messageId: string): TimelineNode | undefined {
+  const stableId = resolveTimelineAliasId(messageId);
+  return messagesState.timelineNodes.find((node) => node.nodeId === stableId);
+}
+
+interface TimelineMessageTarget {
+  node: TimelineNode;
+  executionItemIndex: number | null;
+  executionItem: TimelineExecutionItem | null;
+  flushKey: string;
+}
+
+function findTimelineMessageTargetByAlias(messageId: string): TimelineMessageTarget | undefined {
+  const normalizedId = typeof messageId === 'string' ? messageId.trim() : '';
+  if (!normalizedId) {
+    return undefined;
+  }
+  const executionTarget = timelineExecutionItemTargetByMessageId.get(normalizedId);
+  if (executionTarget) {
+    const node = messagesState.timelineNodes.find((item) => item.nodeId === executionTarget.nodeId);
+    if (!node) {
+      return undefined;
+    }
+    const executionItems = ensureArray<TimelineExecutionItem>(node.executionItems);
+    const executionItemIndex = executionItems.findIndex((item) => item.itemId === executionTarget.itemId);
+    if (executionItemIndex < 0) {
+      return undefined;
+    }
+    return {
+      node,
+      executionItemIndex,
+      executionItem: executionItems[executionItemIndex],
+      flushKey: `item:${node.nodeId}:${executionTarget.itemId}`,
+    };
+  }
+
+  const node = findTimelineNodeByAlias(normalizedId);
+  if (!node) {
+    return undefined;
+  }
+  return {
+    node,
+    executionItemIndex: null,
+    executionItem: null,
+    flushKey: `node:${node.nodeId}`,
+  };
+}
+
+function updateTimelineNodeByAlias(messageId: string, updates: Partial<Message>): Message | undefined {
+  const target = findTimelineMessageTargetByAlias(messageId);
+  if (!target) {
+    return undefined;
+  }
+  const stableId = target.node.nodeId;
+  const currentNode = target.node;
+
+  if (target.executionItem && target.executionItemIndex !== null) {
+    if (compareIncomingMessageVersion(target.executionItem, updates as Pick<Message, 'metadata'>) < 0) {
+      return target.executionItem.message;
+    }
+    const nextMessage = normalizeIncomingMessage({
+      ...target.executionItem.message,
+      ...updates,
+      id: target.executionItem.itemId,
+    });
+    const executionVisibility = resolveWorkerVisibility(nextMessage);
+    const nextExecutionItem = normalizeTimelineExecutionItem({
+      ...target.executionItem,
+      latestEventSeq: Math.max(
+        target.executionItem.latestEventSeq,
+        getMessageEventSeq(nextMessage) ?? target.executionItem.latestEventSeq,
+      ),
+      cardStreamSeq: Math.max(
+        target.executionItem.cardStreamSeq,
+        getMessageCardStreamSeq(nextMessage) || target.executionItem.cardStreamSeq,
+      ),
+      worker: resolveTimelineWorker(nextMessage) || target.executionItem.worker,
+      threadVisible: target.executionItem.threadVisible || executionVisibility.threadVisible,
+      workerTabs: [
+        ...target.executionItem.workerTabs,
+        ...executionVisibility.workerTabs,
+      ],
+      messageIds: Array.from(new Set([
+        ...target.executionItem.messageIds,
+        messageId,
+        nextMessage.id,
+      ])),
+      timestamp: mergeTimelineSortTimestamp(target.executionItem.timestamp, nextMessage),
+      message: nextMessage,
+    });
+    const nextExecutionItems = [...ensureArray<TimelineExecutionItem>(currentNode.executionItems)];
+    nextExecutionItems[target.executionItemIndex] = nextExecutionItem;
+    const nextNode = normalizeTimelineNode({
+      ...currentNode,
+      latestEventSeq: Math.max(currentNode.latestEventSeq, nextExecutionItem.latestEventSeq),
+      cardStreamSeq: Math.max(currentNode.cardStreamSeq, nextExecutionItem.cardStreamSeq),
+      workerTabs: [
+        ...currentNode.workerTabs,
+        ...nextExecutionItem.workerTabs,
+      ],
+      executionItems: nextExecutionItems,
+    });
+    mutateTimelineNodes((nodes) => nodes.map((node) => (
+      node.nodeId === stableId ? nextNode : node
+    )));
+    return nextExecutionItem.message;
+  }
+
+  if (compareIncomingMessageVersion(currentNode, updates as Pick<Message, 'metadata'>) < 0) {
+    return currentNode.message;
+  }
+  const nextMessage = normalizeIncomingMessage({
+    ...currentNode.message,
+    ...updates,
+    id: stableId,
+  });
+  const fragmentMessages = currentNode.kind === 'worker_lifecycle'
+    ? []
+    : resolveTimelineFragmentMessages(nextMessage);
+  const usesFragmentExecutionItems = fragmentMessages.length > 1;
+  const nextVisibleMessage = usesFragmentExecutionItems
+    ? setTimelineContainerFlag(nextMessage, true)
+    : setTimelineContainerFlag(nextMessage, false);
+  const nextNode = normalizeTimelineNode({
+    ...currentNode,
+    latestEventSeq: Math.max(
+      currentNode.latestEventSeq,
+      getMessageEventSeq(nextMessage) ?? currentNode.latestEventSeq,
+    ),
+    cardStreamSeq: Math.max(
+      currentNode.cardStreamSeq,
+      getMessageCardStreamSeq(nextMessage) || currentNode.cardStreamSeq,
+    ),
+    worker: resolveTimelineWorker(nextMessage) || currentNode.worker,
+    cardId: resolveTimelineCardId(nextMessage) || currentNode.cardId,
+    lifecycleKey: resolveTimelineLifecycleKey(nextMessage) || currentNode.lifecycleKey,
+    workerTabs: currentNode.workerTabs,
+    messageIds: currentNode.messageIds,
+    timestamp: mergeTimelineSortTimestamp(currentNode.timestamp, nextMessage),
+    message: nextVisibleMessage,
+    executionItems: usesFragmentExecutionItems
+      ? buildFragmentExecutionItems(fragmentMessages, {
+          thread: currentNode.visibleInThread,
+          workerTabs: currentNode.workerTabs,
+        })
+      : (isTimelineContainerOnlyMessage(currentNode.message) ? [] : currentNode.executionItems),
+  });
+  mutateTimelineNodes((nodes) => nodes.map((node) => (
+    node.nodeId === stableId ? nextNode : node
+  )));
+  return nextNode.message;
 }
 
 function normalizeMissionPlan(plan: MissionPlan | null): MissionPlan | null {
@@ -460,6 +1497,9 @@ function normalizeOrchestratorRuntimeDiagnostics(
       .filter((entry) => entry && typeof entry === 'object')
       .map((entry) => JSON.parse(JSON.stringify(entry)))
     : [];
+  const opsView = input.opsView && typeof input.opsView === 'object'
+    ? JSON.parse(JSON.stringify(input.opsView))
+    : null;
   return {
     runtimeReason,
     finalStatus,
@@ -470,20 +1510,86 @@ function normalizeOrchestratorRuntimeDiagnostics(
     ...(errors.length > 0 ? { errors } : {}),
     runtimeSnapshot,
     runtimeDecisionTrace,
+    ...(opsView ? { opsView } : {}),
   };
 }
 
+function normalizeProcessingStateSnapshot(
+  input: AppState['processingState'],
+): AppState['processingState'] {
+  if (!input || typeof input !== 'object') {
+    return null;
+  }
+  const pendingRequestIds = Array.isArray(input.pendingRequestIds)
+    ? Array.from(new Set(
+        input.pendingRequestIds
+          .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+          .map((item) => item.trim()),
+      ))
+    : [];
+  const source = typeof input.source === 'string' && input.source.trim().length > 0
+    ? (() => {
+        const normalized = input.source.trim();
+        return normalized === 'orchestrator' || normalized === 'worker'
+          ? normalized as NonNullable<AppState['processingState']>['source']
+          : null;
+      })()
+    : null;
+  const agent = typeof input.agent === 'string' && input.agent.trim().length > 0
+    ? input.agent.trim()
+    : null;
+  const startedAt = typeof input.startedAt === 'number' && Number.isFinite(input.startedAt) && input.startedAt > 0
+    ? Math.floor(input.startedAt)
+    : null;
+  return {
+    isProcessing: input.isProcessing === true,
+    source,
+    agent,
+    startedAt,
+    pendingRequestIds,
+  };
+}
+
+function shouldReplaceOrchestratorRuntimeDiagnostics(
+  next: OrchestratorRuntimeDiagnostics | null,
+): boolean {
+  if (!next) {
+    return true;
+  }
+  const current = messagesState.orchestratorRuntimeDiagnostics;
+  if (!current) {
+    return true;
+  }
+  return next.updatedAt >= current.updatedAt;
+}
+
+export function applyAuthoritativeProcessingState(input: AppState['processingState']): void {
+  const snapshot = normalizeProcessingStateSnapshot(input);
+  if (!snapshot) {
+    return;
+  }
+  const pendingRequestIds = new Set(snapshot.pendingRequestIds);
+  const nextIsProcessing = snapshot.isProcessing
+    || messagesState.activeMessageIds.size > 0
+    || pendingRequestIds.size > 0;
+
+  messagesState.backendProcessing = snapshot.isProcessing;
+  messagesState.pendingRequests = pendingRequestIds;
+  if (snapshot.source) {
+    setProcessingActor(snapshot.source, snapshot.agent || undefined);
+  }
+  if (nextIsProcessing) {
+    messagesState.thinkingStartAt = snapshot.startedAt
+      || messagesState.thinkingStartAt
+      || Date.now();
+  } else {
+    messagesState.thinkingStartAt = null;
+  }
+  messagesState.isProcessing = nextIsProcessing;
+}
+
 // 交互请求状态
-let pendingConfirmation = $state<{ plan: unknown; formattedPlan?: string; forceManual?: boolean } | null>(null);
 let pendingRecovery = $state<{ taskId: string; error: unknown; canRetry: boolean; canRollback: boolean } | null>(null);
-let pendingDeliveryRepair = $state<{
-  missionId: string;
-  summary: string;
-  details?: string;
-  round: number;
-  maxRounds: number;
-  requestType?: 'delivery_repair' | 'replan_followup';
-} | null>(null);
 let pendingClarification = $state<{ questions: string[]; context?: string; ambiguityScore?: number; originalPrompt?: string } | null>(null);
 let pendingWorkerQuestion = $state<{ workerId: string; question: string; context?: string; options?: unknown } | null>(null);
 let pendingToolAuthorization = $state<{ requestId: string; toolName: string; toolArgs: unknown } | null>(null);
@@ -491,9 +1597,6 @@ let missionPlan = $state<Map<string, MissionPlan>>(new Map());
 
 // Wave 执行状态（提案 4.6）
 let waveState = $state<WaveState | null>(null);
-
-// Worker Session 状态（提案 4.1）
-let workerSessions = $state<Map<string, WorkerSessionState>>(new Map());
 
 // 请求-响应绑定状态（消息响应流设计）
 let requestBindings = $state<Map<string, RequestResponseBinding>>(new Map());
@@ -510,11 +1613,15 @@ export const retryRuntimeState = $state({
 // Svelte 5 官方推荐：导出对象属性读取，确保响应式追踪正常
 
 export function getThreadMessages() {
-  return messagesState.threadMessages;
+  return messageProjection.thread;
 }
 
 export function getAgentOutputs() {
-  return messagesState.agentOutputs;
+  return {
+    claude: messageProjection.workers.claude,
+    codex: messageProjection.workers.codex,
+    gemini: messageProjection.workers.gemini,
+  } as AgentOutputs;
 }
 
 export function getCurrentBottomTab() {
@@ -654,10 +1761,6 @@ export function setInteractionMode(mode: 'ask' | 'auto', updatedAt?: number) {
   }
 }
 
-export function getPendingConfirmation() {
-  return pendingConfirmation;
-}
-
 export function getPendingRecovery() {
   return pendingRecovery;
 }
@@ -682,8 +1785,31 @@ export function getWaveState() {
   return waveState;
 }
 
-export function getWorkerSessions() {
-  return workerSessions;
+function mergeWorkerWaitResultPayload(
+  currentPayload: WaitForWorkersResult | null | undefined,
+  incomingPayload: WaitForWorkersResult,
+): WaitForWorkersResult {
+  const mergedResultsByTaskId = new Map<string, WaitForWorkersResult['results'][number]>();
+  for (const result of currentPayload?.results || []) {
+    if (typeof result?.task_id === 'string' && result.task_id.trim()) {
+      mergedResultsByTaskId.set(result.task_id.trim(), result);
+    }
+  }
+  for (const result of incomingPayload.results || []) {
+    if (typeof result?.task_id === 'string' && result.task_id.trim()) {
+      mergedResultsByTaskId.set(result.task_id.trim(), result);
+    }
+  }
+
+  return {
+    ...(currentPayload || {}),
+    ...incomingPayload,
+    results: Array.from(mergedResultsByTaskId.values()),
+    pending_task_ids: Array.isArray(incomingPayload.pending_task_ids)
+      ? incomingPayload.pending_task_ids
+      : (currentPayload?.pending_task_ids || []),
+    audit: incomingPayload.audit ?? currentPayload?.audit,
+  };
 }
 
 export function updateWorkerWaitResults(next: Partial<Record<string, WaitForWorkersResult | null>>) {
@@ -708,9 +1834,10 @@ export function updateWorkerWaitResults(next: Partial<Record<string, WaitForWork
         && incomingAt >= currentAt
     );
     if (incomingAt >= currentAt) {
+      const mergedPayload = mergeWorkerWaitResultPayload(currentPayload, payload);
       merged[key] = shouldPreserveCompletedAt
-        ? { ...payload, updatedAt: currentAt }
-        : payload;
+        ? { ...mergedPayload, updatedAt: currentAt }
+        : mergedPayload;
     }
   }
   workerWaitResults = merged;
@@ -725,8 +1852,15 @@ export function getState() {
     get currentTopTab() { return messagesState.currentTopTab; },
     get currentBottomTab() { return messagesState.currentBottomTab; },
     get messageJump() { return messagesState.messageJump; },
-    get threadMessages() { return messagesState.threadMessages; },
-    get agentOutputs() { return messagesState.agentOutputs; },
+    get timelineNodes() { return messagesState.timelineNodes; },
+    get threadMessages() { return messageProjection.thread; },
+    get agentOutputs() {
+      return {
+        claude: messageProjection.workers.claude,
+        codex: messageProjection.workers.codex,
+        gemini: messageProjection.workers.gemini,
+      } as AgentOutputs;
+    },
     get sessions() { return messagesState.sessions; },
     get currentSessionId() { return messagesState.currentSessionId; },
     get queuedMessages() { return messagesState.queuedMessages; },
@@ -745,7 +1879,7 @@ export function getState() {
     get workerWaitResults() { return workerWaitResults; },
     set workerWaitResults(v) { workerWaitResults = v; },
     get orchestratorRuntimeDiagnostics() { return messagesState.orchestratorRuntimeDiagnostics; },
-    set orchestratorRuntimeDiagnostics(v) { messagesState.orchestratorRuntimeDiagnostics = normalizeOrchestratorRuntimeDiagnostics(v); },
+    set orchestratorRuntimeDiagnostics(v) { setOrchestratorRuntimeDiagnostics(v); },
     get toasts() { return toasts; },
     set toasts(v) { toasts = v; },
     get notifications() { return notifications; },
@@ -757,12 +1891,8 @@ export function getState() {
       const nextMode = v === 'ask' ? 'ask' : 'auto';
       setInteractionMode(nextMode);
     },
-    get pendingConfirmation() { return pendingConfirmation; },
-    set pendingConfirmation(v) { pendingConfirmation = v; },
     get pendingRecovery() { return pendingRecovery; },
     set pendingRecovery(v) { pendingRecovery = v; },
-    get pendingDeliveryRepair() { return pendingDeliveryRepair; },
-    set pendingDeliveryRepair(v) { pendingDeliveryRepair = v; },
     get pendingClarification() { return pendingClarification; },
     set pendingClarification(v) { pendingClarification = v; },
     get pendingWorkerQuestion() { return pendingWorkerQuestion; },
@@ -774,54 +1904,160 @@ export function getState() {
     // Wave 状态（提案 4.6）
     get waveState() { return waveState; },
     set waveState(v) { waveState = v; },
-    // Worker Session 状态（提案 4.1）
-    get workerSessions() { return workerSessions; },
-    set workerSessions(v) { workerSessions = v; },
     // Worker 运行态（统一入口）
     get workerRuntime() { return workerRuntime; },
+    getThreadRenderItems() {
+      return buildTimelineRenderItems(timelineNodeLookup, messagesState.timelineProjection, 'thread');
+    },
+    getWorkerRenderItems(worker: AgentType) {
+      return buildTimelineRenderItems(timelineNodeLookup, messagesState.timelineProjection, 'worker', worker);
+    },
   };
 }
 
 // ============ 状态更新函数 ============
 
-// 裁剪消息列表
-function trimMessageLists() {
-  if (messagesState.threadMessages.length > MAX_THREAD_MESSAGES) {
-    messagesState.threadMessages = messagesState.threadMessages.slice(-MAX_THREAD_MESSAGES);
+function trimTimelineNodes() {
+  if (messagesState.timelineNodes.length <= MAX_TIMELINE_NODES) {
+    return;
   }
-  (['claude', 'codex', 'gemini'] as const).forEach((agent) => {
-    if (messagesState.agentOutputs[agent].length > MAX_AGENT_MESSAGES) {
-      messagesState.agentOutputs = {
-        ...messagesState.agentOutputs,
-        [agent]: messagesState.agentOutputs[agent].slice(-MAX_AGENT_MESSAGES),
-      };
+  replaceTimelineNodes(messagesState.timelineNodes.slice(-MAX_TIMELINE_NODES));
+}
+
+function createSessionViewStateSnapshot(sessionId: string | null | undefined): PersistedSessionViewState | null {
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  const projection = messagesState.timelineProjection;
+  if (!normalizedSessionId || !projection || projection.sessionId !== normalizedSessionId) {
+    return null;
+  }
+  const clonedProjection = normalizePersistedTimelineProjection(
+    clonePersistablePayload(projection),
+    normalizedSessionId,
+  );
+  if (!clonedProjection) {
+    return null;
+  }
+  return {
+    sessionId: normalizedSessionId,
+    timelineProjection: clonedProjection,
+    scrollPositions: normalizePersistedScrollPositions(clonePersistablePayload(messagesState.scrollPositions)),
+    scrollAnchors: normalizePersistedScrollAnchors(clonePersistablePayload(messagesState.scrollAnchors)),
+    autoScrollEnabled: normalizePersistedAutoScrollConfig(clonePersistablePayload(messagesState.autoScrollEnabled)),
+  };
+}
+
+function upsertSessionViewStateSnapshot(snapshot: PersistedSessionViewState | null): void {
+  if (!snapshot) {
+    return;
+  }
+  sessionViewStateBySession = {
+    ...sessionViewStateBySession,
+    [snapshot.sessionId]: snapshot,
+  };
+}
+
+function captureCurrentSessionViewState(): void {
+  upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(messagesState.currentSessionId));
+}
+
+function getSessionViewState(sessionId: string | null | undefined): PersistedSessionViewState | null {
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  if (!normalizedSessionId) {
+    return null;
+  }
+  return sessionViewStateBySession[normalizedSessionId] || null;
+}
+
+function pruneSessionViewStateByKnownSessions(): void {
+  const knownSessionIds = new Set<string>();
+  for (const session of messagesState.sessions) {
+    const sessionId = normalizeSessionId(session?.id);
+    if (sessionId) {
+      knownSessionIds.add(sessionId);
     }
-  });
+  }
+  const currentSessionId = normalizeSessionId(messagesState.currentSessionId);
+  if (currentSessionId) {
+    knownSessionIds.add(currentSessionId);
+  }
+  if (knownSessionIds.size === 0) {
+    return;
+  }
+  const nextEntries = Object.entries(sessionViewStateBySession)
+    .filter(([sessionId]) => knownSessionIds.has(sessionId));
+  if (nextEntries.length === Object.keys(sessionViewStateBySession).length) {
+    return;
+  }
+  sessionViewStateBySession = Object.fromEntries(nextEntries);
+}
+
+function applySessionViewState(sessionId: string | null | undefined): boolean {
+  const snapshot = getSessionViewState(sessionId);
+  if (!snapshot) {
+    return false;
+  }
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  const normalizedSnapshot = normalizedSessionId
+    ? normalizePersistedSessionViewState(normalizedSessionId, clonePersistablePayload(snapshot))
+    : null;
+  if (!normalizedSnapshot) {
+    return false;
+  }
+  messagesState.timelineProjection = normalizedSnapshot.timelineProjection;
+  setTimelineProjectionNodes(buildTimelineNodesFromProjection(normalizedSnapshot.timelineProjection));
+  messagesState.scrollPositions = normalizePersistedScrollPositions(normalizedSnapshot.scrollPositions);
+  messagesState.scrollAnchors = normalizePersistedScrollAnchors(normalizedSnapshot.scrollAnchors);
+  messagesState.autoScrollEnabled = normalizePersistedAutoScrollConfig(normalizedSnapshot.autoScrollEnabled);
+  workerWaitResults = {};
+  return true;
 }
 
 // 保存状态到 VS Code
 function saveWebviewState() {
+  if (webviewStateBatchDepth > 0) {
+    webviewStateBatchPending = true;
+    return;
+  }
   if (deferredWebviewStateSaveTimer) {
     clearTimeout(deferredWebviewStateSaveTimer);
     deferredWebviewStateSaveTimer = null;
   }
-  trimMessageLists();
+  trimTimelineNodes();
+  captureCurrentSessionViewState();
+  pruneSessionViewStateByKnownSessions();
   const state: WebviewPersistedState = {
     currentTopTab: messagesState.currentTopTab,
     currentBottomTab: messagesState.currentBottomTab,
-    threadMessages: messagesState.threadMessages,
-    agentOutputs: messagesState.agentOutputs,
     sessions: messagesState.sessions,
     currentSessionId: messagesState.currentSessionId,
-    notificationBuckets,
-    orchestratorRuntimeDiagnostics: messagesState.orchestratorRuntimeDiagnostics,
+    currentTimelineProjection: messagesState.timelineProjection,
+    scrollPositions: messagesState.scrollPositions,
+    scrollAnchors: messagesState.scrollAnchors,
+    autoScrollEnabled: messagesState.autoScrollEnabled,
+    sessionViewStateBySession,
   };
   vscode.setState(state);
 }
 
+export function batchWebviewStatePersistence(mutator: () => void): void {
+  webviewStateBatchDepth += 1;
+  try {
+    mutator();
+  } finally {
+    webviewStateBatchDepth = Math.max(0, webviewStateBatchDepth - 1);
+    if (webviewStateBatchDepth === 0 && webviewStateBatchPending) {
+      webviewStateBatchPending = false;
+      saveWebviewState();
+    }
+  }
+}
+
 export function setOrchestratorRuntimeDiagnostics(input: OrchestratorRuntimeDiagnostics | null): void {
-  messagesState.orchestratorRuntimeDiagnostics = normalizeOrchestratorRuntimeDiagnostics(input);
-  saveWebviewState();
+  const next = normalizeOrchestratorRuntimeDiagnostics(input);
+  if (!shouldReplaceOrchestratorRuntimeDiagnostics(next)) {
+    return;
+  }
+  messagesState.orchestratorRuntimeDiagnostics = next;
 }
 
 export function updatePanelScrollState(
@@ -897,12 +2133,27 @@ export function clearMessageJump(): void {
 
 // 会话操作
 export function setCurrentSessionId(id: string | null) {
-  const hasChanged = messagesState.currentSessionId !== id;
-  messagesState.currentSessionId = id;
+  const nextSessionId = normalizeSessionId(id);
+  const previousSessionId = normalizeSessionId(messagesState.currentSessionId);
+  const hasChanged = previousSessionId !== nextSessionId;
+  let restoredSessionView = false;
   if (hasChanged) {
-    resetPanelScrollRuntimeState();
+    captureCurrentSessionViewState();
   }
-  syncNotificationsFromBucket(id);
+  messagesState.currentSessionId = nextSessionId;
+  if (hasChanged) {
+    // 底部 worker 面板是“当前会话内的执行细节视图”，不能跨会话继承。
+    // 否则用户从上一会话停留在 worker tab，新会话会直接落到 worker 面板，
+    // 造成“主线/worker 边界混淆”的产品错觉。
+    messagesState.currentBottomTab = 'thread';
+    restoredSessionView = applySessionViewState(nextSessionId);
+    if (!restoredSessionView) {
+      replaceTimelineNodes([]);
+      messagesState.timelineProjection = null;
+      resetPanelScrollRuntimeState();
+    }
+  }
+  syncNotificationsFromSession(nextSessionId);
   saveWebviewState();
 }
 
@@ -915,6 +2166,7 @@ export function updateSessions(newSessions: Session[]) {
       seen.add(session.id);
       return true;
     });
+  pruneSessionViewStateByKnownSessions();
   saveWebviewState();
 }
 
@@ -1055,42 +2307,122 @@ export function settleProcessingForManualInteraction() {
  */
 
 // 终结 instruction 消息中残留的 running lane tasks
-function sealRunningLaneTasks() {
-  const agents: AgentType[] = ['claude', 'codex', 'gemini'];
-  for (const agent of agents) {
-    const list = messagesState.agentOutputs[agent];
-    let changed = false;
-    const sealed: Message[] = [];
-    for (const m of list) {
-      if (m.type !== 'instruction' || !Array.isArray(m.metadata?.laneTasks)) {
-        sealed.push(m);
-        continue;
-      }
-      const laneTasks = m.metadata!.laneTasks as Array<Record<string, unknown>>;
-      const hasRunning = laneTasks.some(t => t.status === 'running');
-      if (!hasRunning) {
-        sealed.push(m);
-        continue;
+function sealRunningLaneTasks(): boolean {
+  let changed = false;
+  mutateTimelineNodes((nodes) => nodes.map((node) => {
+    const message = node.message;
+    if (message.type !== 'instruction' || !Array.isArray(message.metadata?.laneTasks)) {
+      return node;
+    }
+    const laneTasks = message.metadata.laneTasks as Array<Record<string, unknown>>;
+    const hasRunning = laneTasks.some((task) => task.status === 'running');
+    if (!hasRunning) {
+      return node;
+    }
+    changed = true;
+    return normalizeTimelineNode({
+      ...node,
+      message: {
+        ...message,
+        metadata: {
+          ...message.metadata,
+          laneTasks: laneTasks.map((task) => (
+            task.status === 'running' ? { ...task, status: 'cancelled' } : task
+          )),
+        },
+      },
+    });
+  }));
+  return changed;
+}
+
+function sealRunningTaskCardsInList(list: Message[]): { changed: boolean; messages: Message[] } {
+  let changed = false;
+  const messages = list.map((message) => {
+    if (message.type !== 'task_card') {
+      return message;
+    }
+    const subTaskCard = message.metadata?.subTaskCard;
+    if (!subTaskCard || typeof subTaskCard !== 'object') {
+      return message;
+    }
+    const currentStatus = typeof (subTaskCard as { status?: unknown }).status === 'string'
+      ? ((subTaskCard as { status: string }).status || '').trim()
+      : '';
+    const currentWaitStatus = typeof (subTaskCard as { wait_status?: unknown }).wait_status === 'string'
+      ? (((subTaskCard as { wait_status: string }).wait_status) || '').trim()
+      : '';
+    const hasRunningStatus = currentStatus === 'running' || currentStatus === 'in_progress';
+    const hasRunningWaitStatus = currentWaitStatus === 'running' || currentWaitStatus === 'in_progress';
+    if (!hasRunningStatus && !hasRunningWaitStatus) {
+      return message;
+    }
+    changed = true;
+    return {
+      ...message,
+      metadata: {
+        ...(message.metadata || {}),
+        subTaskCard: {
+          ...subTaskCard,
+          ...(hasRunningStatus ? { status: 'cancelled' } : {}),
+          ...(hasRunningWaitStatus ? { wait_status: 'cancelled' } : {}),
+        },
+      },
+    };
+  });
+  return { changed, messages };
+}
+
+function sealRunningTaskCards(): boolean {
+  let changed = false;
+  mutateTimelineNodes((nodes) => nodes.map((node) => {
+    const sealed = sealRunningTaskCardsInList([node.message]);
+    if (!sealed.changed) {
+      return node;
+    }
+    changed = true;
+    return normalizeTimelineNode({
+      ...node,
+      message: sealed.messages[0],
+    });
+  }));
+  return changed;
+}
+
+function sealRunningTasksStore(): boolean {
+  let changed = false;
+  const nextTasks = tasks.map((task) => {
+    const nextSubTasks = (task.subTasks || []).map((subTask) => {
+      if (subTask.status !== 'running' && subTask.status !== 'in_progress') {
+        return subTask;
       }
       changed = true;
-      sealed.push({
-        ...m,
-        metadata: {
-          ...m.metadata,
-          laneTasks: laneTasks.map(t =>
-            t.status === 'running' ? { ...t, status: 'cancelled' } : t,
-          ),
-        },
-      });
+      return {
+        ...subTask,
+        status: 'cancelled' as const,
+      };
+    });
+    const shouldSealTask = task.status === 'running';
+    if (!shouldSealTask && nextSubTasks.every((subTask, index) => subTask === (task.subTasks || [])[index])) {
+      return task;
     }
-    if (changed) {
-      messagesState.agentOutputs = { ...messagesState.agentOutputs, [agent]: sealed };
+    if (shouldSealTask) {
+      changed = true;
     }
+    return {
+      ...task,
+      status: shouldSealTask ? 'cancelled' as const : task.status,
+      subTasks: nextSubTasks,
+    };
+  });
+  if (changed) {
+    tasks = nextTasks;
   }
+  return changed;
 }
 
 // 终结 mission plan 中残留的 running assignment/todo
-function sealRunningMissionAssignments() {
+function sealRunningMissionAssignments(): boolean {
   let changed = false;
   const next = new Map(missionPlan);
   for (const [missionId, plan] of next) {
@@ -1115,9 +2447,13 @@ function sealRunningMissionAssignments() {
   if (changed) {
     missionPlan = next;
   }
+  return changed;
 }
 
 export function sealAllStreamingMessages() {
+  // 先刷新所有 RAF 合并队列，确保封口前状态是最新的
+  flushAllStreamUpdates();
+
   let threadChanged = false;
   let agentChanged = false;
 
@@ -1128,7 +2464,9 @@ export function sealAllStreamingMessages() {
       return m.blocks.some(b => {
         if (!b || typeof b !== 'object') return false;
         if ('content' in b && typeof b.content === 'string' && b.content.trim().length > 0) return true;
+        if (b.type === 'thinking' && b.thinking?.content && b.thinking.content.trim().length > 0) return true;
         if (b.type === 'tool_call') return true;
+        if (b.type === 'plan' || b.type === 'file_change') return true;
         return false;
       });
     }
@@ -1159,54 +2497,39 @@ export function sealAllStreamingMessages() {
     };
   };
 
-  // 处理 threadMessages
-  const sealedThread: Message[] = [];
-  for (const m of messagesState.threadMessages) {
-    const result = sealMessage(m);
-    if (result === null) {
-      threadChanged = true; // 消息被移除
-    } else if (result !== m) {
-      sealedThread.push(result);
-      threadChanged = true; // 消息被更新
-    } else {
-      sealedThread.push(m);
-    }
-  }
-  if (threadChanged) {
-    messagesState.threadMessages = sealedThread;
-  }
-
-  // 处理 agentOutputs
-  const agents: AgentType[] = ['claude', 'codex', 'gemini'];
-  for (const agent of agents) {
-    const list = messagesState.agentOutputs[agent];
-    const sealedList: Message[] = [];
-    let changed = false;
-    for (const m of list) {
-      const result = sealMessage(m);
+  mutateTimelineNodes((nodes) => {
+    const next: TimelineNode[] = [];
+    for (const node of nodes) {
+      const result = sealMessage(node.message);
       if (result === null) {
-        changed = true;
-      } else if (result !== m) {
-        sealedList.push(result);
-        changed = true;
-      } else {
-        sealedList.push(m);
+        threadChanged = true;
+        agentChanged = true;
+        continue;
       }
+      if (result !== node.message) {
+        threadChanged = true;
+        agentChanged = true;
+        next.push(normalizeTimelineNode({
+          ...node,
+          message: result,
+        }));
+        continue;
+      }
+      next.push(node);
     }
-    if (changed) {
-      messagesState.agentOutputs = { ...messagesState.agentOutputs, [agent]: sealedList };
-      agentChanged = true;
-    }
-  }
-
-  if (threadChanged || agentChanged) {
-    saveWebviewState();
-  }
+    return next;
+  });
 
   // 终结 instruction 消息中残留的 running lane tasks 和 mission plan 中 running 的 assignment，
   // 避免插件重启/强制停止后 Worker 圆点持续显示"执行中"动画。
-  sealRunningLaneTasks();
-  sealRunningMissionAssignments();
+  const laneTasksChanged = sealRunningLaneTasks();
+  const taskCardsChanged = sealRunningTaskCards();
+  const tasksChanged = sealRunningTasksStore();
+  const missionChanged = sealRunningMissionAssignments();
+
+  if (threadChanged || agentChanged || laneTasksChanged || taskCardsChanged || tasksChanged || missionChanged) {
+    saveWebviewState();
+  }
 }
 
 /** 获取后端处理状态（用于时序判断） */
@@ -1215,7 +2538,6 @@ export function getBackendProcessing(): boolean {
 }
 
 export function clearPendingInteractions() {
-  pendingConfirmation = null;
   pendingRecovery = null;
   pendingClarification = null;
   pendingWorkerQuestion = null;
@@ -1226,13 +2548,13 @@ function recomputeUnreadNotificationCount() {
   unreadNotificationCount = notifications.filter((n) => !n.read).length;
 }
 
-function resolveNotificationBucketId(sessionId: string | null | undefined): string {
+function resolveNotificationSessionId(sessionId: string | null | undefined): string {
   const normalized = typeof sessionId === 'string' ? sessionId.trim() : '';
-  return normalized || GLOBAL_NOTIFICATION_BUCKET;
+  return normalized;
 }
 
-function getCurrentNotificationBucketId(): string {
-  return resolveNotificationBucketId(messagesState.currentSessionId);
+function getCurrentNotificationSessionId(): string {
+  return resolveNotificationSessionId(messagesState.currentSessionId);
 }
 
 function applyNotificationList(nextList: Notification[]): Notification[] {
@@ -1242,35 +2564,36 @@ function applyNotificationList(nextList: Notification[]): Notification[] {
   return trimmed;
 }
 
-function syncNotificationsFromBucket(sessionId: string | null | undefined): void {
-  const bucketId = resolveNotificationBucketId(sessionId);
-  const list = ensureArray<Notification>(notificationBuckets[bucketId]);
+function syncNotificationsFromSession(sessionId: string | null | undefined): void {
+  const resolvedSessionId = resolveNotificationSessionId(sessionId);
+  const list = resolvedSessionId ? ensureArray<Notification>(notificationsBySession[resolvedSessionId]) : [];
   applyNotificationList(list);
 }
 
-function updateCurrentBucketNotifications(updater: (current: Notification[]) => Notification[]): void {
-  const bucketId = getCurrentNotificationBucketId();
-  const current = ensureArray<Notification>(notificationBuckets[bucketId]);
-  const next = applyNotificationList(updater(current));
-  notificationBuckets = {
-    ...notificationBuckets,
-    [bucketId]: next,
+function replaceSessionNotificationList(sessionId: string, nextList: Notification[]): void {
+  const normalizedSessionId = resolveNotificationSessionId(sessionId);
+  if (!normalizedSessionId) {
+    return;
+  }
+  const next = nextList.slice(0, MAX_NOTIFICATIONS_PER_SESSION);
+  notificationsBySession = {
+    ...notificationsBySession,
+    [normalizedSessionId]: next,
   };
-  saveWebviewState();
 }
 
-function shouldArchiveToastToNotificationCenter(policy: {
-  category: ToastCategory;
-  persistToCenter: boolean;
-  source?: string;
-}): boolean {
-  if (!policy.persistToCenter || policy.category === 'feedback') {
-    return false;
+function updateCurrentSessionNotifications(updater: (current: Notification[]) => Notification[]): void {
+  const sessionId = getCurrentNotificationSessionId();
+  if (!sessionId) {
+    applyNotificationList([]);
+    return;
   }
-  if (!policy.source || !NOTIFICATION_ARCHIVE_RUNTIME_SOURCES.has(policy.source)) {
-    return false;
-  }
-  return true;
+  const current = ensureArray<Notification>(notificationsBySession[sessionId]);
+  const next = applyNotificationList(updater(current));
+  notificationsBySession = {
+    ...notificationsBySession,
+    [sessionId]: next,
+  };
 }
 
 function resolveToastPolicy(options?: ToastOptions): {
@@ -1279,37 +2602,58 @@ function resolveToastPolicy(options?: ToastOptions): {
   countUnread: boolean;
   source?: string;
   actionRequired?: boolean;
+  displayMode: ToastDisplayMode;
+  duration?: number;
 } {
   const category = options?.category ?? 'feedback';
-  const defaultPersistToCenter = category !== 'feedback';
+  const defaultPersistToCenter = false;
   const persistToCenter = options?.persistToCenter ?? defaultPersistToCenter;
   const defaultCountUnread = category === 'incident';
   const countUnread = persistToCenter ? (options?.countUnread ?? defaultCountUnread) : false;
   const actionRequired = options?.actionRequired ?? (category === 'incident');
+  const displayMode = options?.displayMode ?? 'toast';
   return {
     category,
     persistToCenter,
     countUnread,
     source: options?.source,
     actionRequired,
+    displayMode,
+    duration: options?.duration,
   };
 }
+
+// 右下角同时可见的 toast 上限，防止密集通知堆积遮挡主阅读区
+const MAX_VISIBLE_TOASTS = 5;
 
 export function addToast(type: string, message: string, title?: string, options?: ToastOptions) {
   const policy = resolveToastPolicy(options);
   const id = `toast_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-  const toast: ToastRecord = {
-    id,
-    type,
-    title,
-    message,
-    category: policy.category,
-    source: policy.source,
-    actionRequired: policy.actionRequired,
-  };
-  toasts = [...toasts, toast];
+  if (policy.displayMode === 'toast') {
+    const toast: ToastRecord = {
+      id,
+      type,
+      title,
+      message,
+      category: policy.category,
+      source: policy.source,
+      actionRequired: policy.actionRequired,
+      duration: policy.duration,
+    };
+    // 超过上限时丢弃最旧的非 actionRequired toast
+    let nextToasts = [...toasts, toast];
+    while (nextToasts.length > MAX_VISIBLE_TOASTS) {
+      const discardIndex = nextToasts.findIndex((t) => !t.actionRequired);
+      if (discardIndex >= 0) {
+        nextToasts.splice(discardIndex, 1);
+      } else {
+        break; // 全部都是 actionRequired，不丢弃
+      }
+    }
+    toasts = nextToasts;
+  }
 
-  if (!shouldArchiveToastToNotificationCenter(policy)) {
+  if (policy.displayMode === 'silent' || !policy.persistToCenter || policy.category === 'feedback') {
     return;
   }
 
@@ -1326,7 +2670,7 @@ export function addToast(type: string, message: string, title?: string, options?
     timestamp: Date.now(),
     read: !policy.countUnread,
   };
-  updateCurrentBucketNotifications((current) => [notification, ...current]);
+  updateCurrentSessionNotifications((current) => [notification, ...current]);
 }
 
 export function getNotifications() {
@@ -1338,188 +2682,216 @@ export function getUnreadNotificationCount() {
 }
 
 export function markAllNotificationsRead() {
-  updateCurrentBucketNotifications((current) => current.map((n) => ({ ...n, read: true })));
+  updateCurrentSessionNotifications((current) => current.map((n) => ({ ...n, read: true })));
+  vscode.postMessage({ type: 'markAllNotificationsRead' });
 }
 
 export function clearAllNotifications() {
-  updateCurrentBucketNotifications(() => []);
+  updateCurrentSessionNotifications(() => []);
+  vscode.postMessage({ type: 'clearAllNotifications' });
 }
 
 export function removeNotification(id: string) {
-  updateCurrentBucketNotifications((current) => current.filter((n) => n.id !== id));
+  updateCurrentSessionNotifications((current) => current.filter((n) => n.id !== id));
+  vscode.postMessage({ type: 'removeNotification', notificationId: id });
+}
+
+export function applySessionNotifications(
+  sessionId: string,
+  rawNotifications: { records?: SessionNotificationRecord[] } | SessionNotificationRecord[] | unknown,
+): void {
+  const normalizedSessionId = resolveNotificationSessionId(sessionId);
+  if (!normalizedSessionId) {
+    return;
+  }
+  const normalized = normalizeSessionNotificationList(
+    rawNotifications && typeof rawNotifications === 'object'
+      ? (rawNotifications as { records?: unknown }).records
+      : rawNotifications,
+  );
+  replaceSessionNotificationList(normalizedSessionId, normalized);
+  if (normalizedSessionId === getCurrentNotificationSessionId()) {
+    applyNotificationList(normalized);
+  }
 }
 
 export function getActiveInteractionType(): string | null {
   if (pendingRecovery) return 'recovery';
-  if (pendingConfirmation) return 'confirmation';
   if (pendingToolAuthorization) return 'toolAuthorization';
   if (pendingClarification) return 'clarification';
   if (pendingWorkerQuestion) return 'workerQuestion';
   return null;
 }
-// 消息操作
-export function addThreadMessage(message: Message) {
-  const safeMessage = JSON.parse(JSON.stringify(normalizeIncomingMessage(message))) as Message;
 
-  if (messagesState.threadMessages.some((m) => m.id === safeMessage.id)) {
-    return;
-  }
-  messagesState.threadMessages = [...messagesState.threadMessages, safeMessage];
-  
-  saveWebviewState();
+function getMessageEventSeq(message: Message | undefined): number | null {
+  if (!message) return null;
+  const normalized = resolveTimelineEventSeqFromMetadata(resolveMessageMetadataRecord(message));
+  return normalized > 0 ? normalized : null;
 }
 
-export function updateThreadMessage(messageId: string, updates: Partial<Message>) {
-  const index = messagesState.threadMessages.findIndex((m) => m.id === messageId);
-  if (index !== -1) {
-    // 必须完全重建数组，不能直接修改索引
-    // 使用 JSON 序列化确保脱离 Svelte 5 $state 响应式代理
-    // structuredClone 无法克隆 Proxy 对象，改用 JSON 往返
-    const normalizedUpdates: Partial<Message> = JSON.parse(JSON.stringify(updates));
-    if ('blocks' in normalizedUpdates) {
-      const blocks = sanitizeMessageBlocks(normalizedUpdates.blocks);
-      normalizedUpdates.blocks = blocks.length > 0 ? blocks : undefined;
-    }
-    const newMessages = messagesState.threadMessages.map((msg, i) => {
-      if (i === index) {
-        return { ...msg, ...normalizedUpdates };
-      }
-      return msg;
-    });
-    messagesState.threadMessages = newMessages;
-    // 不触发保存，由流式管理器批量保存
-  }
+function getMessageCardStreamSeq(message: Pick<Message, 'metadata'> | undefined): number {
+  return resolveTimelineCardStreamSeqFromMetadata(resolveMessageMetadataRecord(message));
 }
 
-export function replaceThreadMessage(oldMessageId: string, message: Message) {
-  const safeMessage = JSON.parse(JSON.stringify(normalizeIncomingMessage(message))) as Message;
-
-  const index = messagesState.threadMessages.findIndex((m) => m.id === oldMessageId);
-  if (index === -1) {
-    addThreadMessage(safeMessage);
-    return;
-  }
-  const conflictIndex = messagesState.threadMessages.findIndex((m, i) => m.id === safeMessage.id && i !== index);
-  if (conflictIndex !== -1) {
-    // 占位消息被真实消息原地替换时，前端可能已因提前到达的流更新创建了同 id 的 synthetic 实体。
-    // replace 语义必须收敛为单一节点，而不是静默放弃替换，否则后续更新会继续打到旧位置。
-    const filtered = messagesState.threadMessages.filter((_, i) => i !== conflictIndex);
-    const replacementIndex = conflictIndex < index ? index - 1 : index;
-    filtered[replacementIndex] = safeMessage;
-    messagesState.threadMessages = filtered;
-    saveWebviewState();
-    return;
-  }
-  const next = [...messagesState.threadMessages];
-  next[index] = safeMessage;
-  messagesState.threadMessages = next;
-  
-  saveWebviewState();
-}
-
-export function removeThreadMessage(messageId: string) {
-  if (!messagesState.threadMessages.length) return;
-  messagesState.threadMessages = messagesState.threadMessages.filter((m) => m.id !== messageId);
-  saveWebviewState();
-}
-
-export function clearThreadMessages() {
-  messagesState.threadMessages = [];
-  saveWebviewState();
-}
-
-export function addAgentMessage(agent: AgentType, message: Message) {
-  const safeMessage = JSON.parse(JSON.stringify(normalizeIncomingMessage(message))) as Message;
-  if (messagesState.agentOutputs[agent].some((m) => m.id === safeMessage.id)) {
-    console.warn(`[MessagesStore] 跳过重复的 agent message: ${safeMessage.id}`);
-    return;
-  }
-
-  // 🔧 调试日志：追踪 Worker 消息添加
-  console.log('[DEBUG] addAgentMessage:', {
-    agent,
-    messageId: safeMessage.id,
-    contentPreview: safeMessage.content?.substring(0, 100),
-    currentCount: messagesState.agentOutputs[agent]?.length || 0,
+function compareIncomingMessageVersion(
+  current: Pick<TimelineNode, 'latestEventSeq' | 'cardStreamSeq'>,
+  incoming: Pick<Message, 'metadata'>,
+): number {
+  const currentEventSeq = typeof current.latestEventSeq === 'number' && Number.isFinite(current.latestEventSeq)
+    ? Math.max(0, Math.floor(current.latestEventSeq))
+    : 0;
+  const currentCardStreamSeq = typeof current.cardStreamSeq === 'number' && Number.isFinite(current.cardStreamSeq)
+    ? Math.max(0, Math.floor(current.cardStreamSeq))
+    : 0;
+  const currentVersion = resolveTimelineVersionFromMetadata({
+    eventSeq: currentEventSeq,
+    cardStreamSeq: currentCardStreamSeq,
   });
+  const incomingVersion = resolveTimelineVersionFromMetadata(resolveMessageMetadataRecord(incoming));
 
-  messagesState.agentOutputs = {
-    ...messagesState.agentOutputs,
-    [agent]: [...messagesState.agentOutputs[agent], safeMessage],
-  };
+  if (currentVersion > 0 && incomingVersion > 0 && incomingVersion !== currentVersion) {
+    return incomingVersion > currentVersion ? 1 : -1;
+  }
 
-  console.log('[DEBUG] addAgentMessage 完成:', {
-    agent,
-    newCount: messagesState.agentOutputs[agent]?.length || 0,
-  });
+  if (currentVersion === 0 && incomingVersion > 0) {
+    return 1;
+  }
 
-  saveWebviewState();
+  return 0;
 }
 
-export function updateAgentMessage(agent: AgentType, messageId: string, updates: Partial<Message>) {
-  const list = messagesState.agentOutputs[agent];
-  const index = list.findIndex((m) => m.id === messageId);
-  if (index !== -1) {
-    // 使用 JSON 序列化确保脱离 Svelte 5 $state 响应式代理
-    const normalizedUpdates: Partial<Message> = JSON.parse(JSON.stringify(updates));
-    if ('blocks' in normalizedUpdates) {
-      const blocks = sanitizeMessageBlocks(normalizedUpdates.blocks);
-      normalizedUpdates.blocks = blocks.length > 0 ? blocks : undefined;
+// ============ 流式更新 RAF 合并层 ============
+// 在同一个动画帧内的多次 append delta 会被合并为一次 Svelte 状态更新，
+// 消除逐 token 触发的 .map() + 数组重建风暴。
+
+interface PendingStreamFlush {
+  messageId: string;
+  updates: Partial<Message>;
+  /** 合并次数（调试用） */
+  mergedCount: number;
+}
+
+const pendingTimelineFlushes = new Map<string, PendingStreamFlush>();
+let streamFlushRAF: number | undefined;
+
+function scheduleStreamFlush(): void {
+  if (streamFlushRAF !== undefined) return;
+  streamFlushRAF = requestAnimationFrame(flushAllStreamUpdates);
+}
+
+function flushAllStreamUpdates(): void {
+  streamFlushRAF = undefined;
+  if (pendingTimelineFlushes.size > 0) {
+    const entries = Array.from(pendingTimelineFlushes.entries());
+    pendingTimelineFlushes.clear();
+    for (const [, flush] of entries) {
+      updateTimelineNodeByAlias(flush.messageId, flush.updates);
     }
-    const next = list.map((msg, i) => (i === index ? { ...msg, ...normalizedUpdates } : msg));
-    messagesState.agentOutputs = { ...messagesState.agentOutputs, [agent]: next };
-    // 不触发保存，由流式管理器批量保存
   }
 }
 
-export function replaceAgentMessage(agent: AgentType, oldMessageId: string, message: Message) {
-  const safeMessage = JSON.parse(JSON.stringify(normalizeIncomingMessage(message))) as Message;
-  const index = messagesState.agentOutputs[agent].findIndex((m) => m.id === oldMessageId);
-  if (index === -1) {
-    addAgentMessage(agent, safeMessage);
-    return;
+/**
+ * 将流式增量更新排入 RAF 合并队列。
+ * 同一消息在同一帧内的多个 updates 会被 Object.assign 合并。
+ * 对于 content 和 blocks 这类追加型字段，调用方（applyStreamUpdate）已经
+ * 计算好了累积值，所以这里直接覆盖即可。
+ */
+function enqueueTimelineStreamUpdate(messageId: string, updates: Partial<Message>): void {
+  const target = findTimelineMessageTargetByAlias(messageId);
+  const flushKey = target?.flushKey || messageId;
+  const existing = pendingTimelineFlushes.get(flushKey);
+  if (existing) {
+    Object.assign(existing.updates, updates);
+    existing.mergedCount++;
+  } else {
+    pendingTimelineFlushes.set(flushKey, { messageId, updates: { ...updates }, mergedCount: 1 });
   }
-  if (messagesState.agentOutputs[agent].some((m, i) => m.id === safeMessage.id && i !== index)) {
-    console.warn(`[MessagesStore] 替换 agent message id 冲突: ${safeMessage.id}`);
-    return;
+  scheduleStreamFlush();
+}
+
+function normalizeMessageUpdates(updates: Partial<Message>): Partial<Message> {
+  return sanitizeMessagePatch(updates, '[MessagesStore] 消息更新');
+}
+
+function getEffectiveTimelineMessage(messageId: string): Message | undefined {
+  const target = findTimelineMessageTargetByAlias(messageId);
+  if (!target) return undefined;
+  const baseMessage = target.executionItem?.message || target.node.message;
+  const pending = pendingTimelineFlushes.get(target.flushKey);
+  if (!pending) return baseMessage;
+  return { ...baseMessage, ...pending.updates };
+}
+
+function patchTimelineMessageByAlias(messageId: string, updates: Partial<Message>): Message | undefined {
+  const target = findTimelineMessageTargetByAlias(messageId);
+  if (!target) {
+    return undefined;
   }
-  const next = [...messagesState.agentOutputs[agent]];
-  next[index] = safeMessage;
-  messagesState.agentOutputs = { ...messagesState.agentOutputs, [agent]: next };
-  saveWebviewState();
+  const normalizedUpdates = normalizeMessageUpdates(updates);
+  const baseMessage = target.executionItem?.message || target.node.message;
+  const effectiveMessage = getEffectiveTimelineMessage(messageId) || baseMessage;
+  if (compareIncomingMessageVersion(
+    {
+      latestEventSeq: getMessageEventSeq(effectiveMessage) ?? (target.executionItem?.latestEventSeq || target.node.latestEventSeq),
+      cardStreamSeq: getMessageCardStreamSeq(effectiveMessage) || (target.executionItem?.cardStreamSeq || target.node.cardStreamSeq),
+    },
+    normalizedUpdates as Pick<Message, 'metadata'>,
+  ) < 0) {
+    return effectiveMessage;
+  }
+  const isStreamingAppend = baseMessage.isStreaming
+    && !('isComplete' in normalizedUpdates && normalizedUpdates.isComplete)
+    && !('isStreaming' in normalizedUpdates && normalizedUpdates.isStreaming === false);
+
+  if (isStreamingAppend) {
+    enqueueTimelineStreamUpdate(messageId, normalizedUpdates);
+    return getEffectiveTimelineMessage(messageId);
+  }
+
+  pendingTimelineFlushes.delete(target.flushKey);
+  return updateTimelineNodeByAlias(messageId, normalizedUpdates);
 }
 
-export function removeAgentMessage(agent: AgentType, messageId: string) {
-  const list = messagesState.agentOutputs[agent];
-  if (!list.length) return;
-  const next = list.filter((m) => m.id !== messageId);
-  if (next.length === list.length) return;
-  messagesState.agentOutputs = { ...messagesState.agentOutputs, [agent]: next };
-  saveWebviewState();
+export function patchThreadPlaceholderMessage(messageId: string, updates: Partial<Message>) {
+  const target = findTimelineMessageTargetByAlias(messageId);
+  if (target?.node.visibleInThread) {
+    // 仅允许请求占位消息在后端 projection 快照到达前做局部状态补丁。
+    patchTimelineMessageByAlias(messageId, updates);
+  }
 }
 
-export function clearAgentMessages(agent: AgentType) {
-  messagesState.agentOutputs = { ...messagesState.agentOutputs, [agent]: [] };
-  saveWebviewState();
+/**
+ * 应用流式增量更新到时间线消息。
+ * 由 message-handler 的 handleStandardUpdate 调用，
+ * 将后端 unifiedUpdate 中的 append/replace/block_update 补丁应用到对应的时间线节点。
+ */
+export function applyTimelineStreamPatch(messageId: string, updates: Partial<Message>): void {
+  patchTimelineMessageByAlias(messageId, updates);
 }
 
-export function clearAgentOutputs() {
-  messagesState.agentOutputs = {
-    claude: [],
-    codex: [],
-    gemini: [],
-  };
-  saveWebviewState();
+/**
+ * 根据 messageId 获取当前时间线中的消息（包含 RAF 队列中的 pending 更新）。
+ */
+export function getTimelineMessageById(messageId: string): Message | undefined {
+  return getEffectiveTimelineMessage(messageId);
 }
 
 // 清空所有消息（用于会话切换/新建）
-export function clearAllMessages() {
-  messagesState.threadMessages = [];
-  messagesState.agentOutputs = {
-    claude: [],
-    codex: [],
-    gemini: [],
-  };
+export function clearAllMessages(options: {
+  persist?: boolean;
+  resetTimelineView?: boolean;
+  resetPanelState?: boolean;
+} = {}) {
+  captureCurrentSessionViewState();
+  pendingTimelineFlushes.clear();
+  if (streamFlushRAF !== undefined) {
+    cancelAnimationFrame(streamFlushRAF);
+    streamFlushRAF = undefined;
+  }
+  if (options.resetTimelineView !== false) {
+    replaceTimelineNodes([]);
+    messagesState.timelineProjection = null;
+  }
   workerWaitResults = {};
   messagesState.orchestratorRuntimeDiagnostics = null;
   messagesState.queuedMessages = [];
@@ -1529,26 +2901,78 @@ export function clearAllMessages() {
   };
   clearPendingInteractions();
   clearProcessingState();
-  terminalSessions.clear();
-  resetPanelScrollRuntimeState();
-  saveWebviewState();
+  // 会话级运行时状态：会话切换时必须清理，避免旧数据泄漏到新会话
+  waveState = null;
+  missionPlan = new Map();
+  if (options.resetPanelState !== false) {
+    resetPanelScrollRuntimeState();
+  }
+  if (options.persist !== false) {
+    saveWebviewState();
+  }
 }
 
-// 设置完整的消息列表（用于会话切换时加载历史）
-export function setThreadMessages(messages: Message[]) {
-  messagesState.threadMessages = normalizePersistedMessages(messages).map(m => JSON.parse(JSON.stringify(m)) as Message);
+function buildTimelineNodesFromProjection(projection: SessionTimelineProjection): TimelineNode[] {
+  const isProjectionArtifact = (
+    artifact: unknown,
+  ): artifact is SessionTimelineProjection['artifacts'][number] => (
+    Boolean(
+      artifact
+      && typeof artifact === 'object'
+      && typeof (artifact as SessionTimelineProjection['artifacts'][number]).artifactId === 'string'
+      && typeof (artifact as SessionTimelineProjection['artifacts'][number]).displayOrder === 'number'
+      && (artifact as SessionTimelineProjection['artifacts'][number]).message
+    )
+  );
+  const nextNodes = ensureArray(projection.artifacts)
+    .filter(isProjectionArtifact)
+    .map((artifact) => {
+      const message = normalizeProjectionRestoredMessage(artifact.message);
+      const worker = resolveTimelineWorker(message) || artifact.worker;
+      const executionItems = ensureArray<TimelineExecutionItem>(artifact.executionItems)
+        .map((item) => normalizeTimelineExecutionItem({
+          ...item,
+          message: normalizeProjectionRestoredMessage(item.message),
+        }));
+      return normalizeTimelineNode({
+        nodeId: artifact.artifactId,
+        kind: artifact.kind || resolveTimelineNodeKind(message),
+        displayOrder: artifact.displayOrder,
+        artifactVersion: typeof artifact.artifactVersion === 'number' ? artifact.artifactVersion : undefined,
+        anchorEventSeq: typeof artifact.anchorEventSeq === 'number' ? artifact.anchorEventSeq : (getMessageEventSeq(message) ?? 0),
+        latestEventSeq: typeof artifact.latestEventSeq === 'number' ? artifact.latestEventSeq : (getMessageEventSeq(message) ?? 0),
+        cardStreamSeq: typeof artifact.cardStreamSeq === 'number'
+          ? artifact.cardStreamSeq
+          : getMessageCardStreamSeq(message),
+        timestamp: typeof artifact.timestamp === 'number' ? artifact.timestamp : resolveMessageSortTimestamp(message),
+        cardId: artifact.cardId || resolveTimelineCardId(message),
+        lifecycleKey: artifact.lifecycleKey || resolveTimelineLifecycleKey(message),
+        dispatchWaveId: artifact.dispatchWaveId,
+        laneId: artifact.laneId,
+        workerCardId: artifact.workerCardId,
+        worker,
+        visibleInThread: artifact.threadVisible !== false,
+        workerTabs: normalizeWorkerTabList(artifact.workerTabs),
+        messageIds: Array.from(new Set([
+          artifact.artifactId,
+          ...ensureArray<string>(artifact.messageIds),
+        ])),
+        message: {
+          ...message,
+          id: artifact.artifactId,
+        },
+        executionItems,
+      });
+    });
+  return nextNodes;
+}
+
+export function setTimelineProjection(projection: SessionTimelineProjection) {
+  const nextNodes = buildTimelineNodesFromProjection(projection);
+  messagesState.timelineProjection = projection;
+  setTimelineProjectionNodes(nextNodes);
   workerWaitResults = {};
-  terminalSessions.clear();
-  saveWebviewState();
-}
-
-// 设置完整的 agent 消息列表（用于会话切换时加载历史）
-export function setAgentOutputs(outputs: AgentOutputs) {
-  messagesState.agentOutputs = {
-    claude: normalizePersistedMessages(outputs.claude).map(m => JSON.parse(JSON.stringify(m)) as Message),
-    codex: normalizePersistedMessages(outputs.codex).map(m => JSON.parse(JSON.stringify(m)) as Message),
-    gemini: normalizePersistedMessages(outputs.gemini).map(m => JSON.parse(JSON.stringify(m)) as Message),
-  };
+  upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(projection.sessionId));
   saveWebviewState();
 }
 
@@ -1556,33 +2980,33 @@ export function setAgentOutputs(outputs: AgentOutputs) {
 export function initializeState() {
   clearAllRetryRuntime();
   resetPanelScrollRuntimeState();
+  sessionViewStateBySession = {};
   const persisted = vscode.getState<WebviewPersistedState>();
   if (persisted) {
-    const validThread = isValidPersistedArray(persisted.threadMessages, MAX_PERSISTED_ARRAY_LENGTH);
-    const validClaude = isValidPersistedArray(persisted.agentOutputs?.claude, MAX_PERSISTED_ARRAY_LENGTH);
-    const validCodex = isValidPersistedArray(persisted.agentOutputs?.codex, MAX_PERSISTED_ARRAY_LENGTH);
-    const validGemini = isValidPersistedArray(persisted.agentOutputs?.gemini, MAX_PERSISTED_ARRAY_LENGTH);
+    const requestedSessionId = typeof messagesState.currentSessionId === 'string'
+      ? messagesState.currentSessionId.trim()
+      : '';
+    const persistedSessionId = typeof persisted.currentSessionId === 'string'
+      ? persisted.currentSessionId.trim()
+      : '';
+    const shouldRestoreSessionScopedState = !requestedSessionId || !persistedSessionId || requestedSessionId === persistedSessionId;
     const validSessions = isValidPersistedArray(persisted.sessions, MAX_PERSISTED_ARRAY_LENGTH);
-    if (!validThread || !validClaude || !validCodex || !validGemini || !validSessions) {
-      throw new Error('[MessagesStore] 持久化数据结构无效');
+    if (!validSessions) {
+      replaceTimelineNodes([]);
+      messagesState.sessions = [];
+      messagesState.currentSessionId = messagesState.currentSessionId || null;
+      notificationsBySession = {};
+      messagesState.orchestratorRuntimeDiagnostics = null;
+      clearPendingInteractions();
+      clearProcessingState();
+      saveWebviewState();
+      return;
     }
     // Tab 状态不持久化，每次打开都默认显示主对话 tab
     messagesState.currentTopTab = 'thread';
     messagesState.currentBottomTab = 'thread';
-    messagesState.threadMessages = normalizePersistedMessages(persisted.threadMessages);
-    messagesState.agentOutputs = {
-      claude: normalizePersistedMessages(persisted.agentOutputs?.claude),
-      codex: normalizePersistedMessages(persisted.agentOutputs?.codex),
-      gemini: normalizePersistedMessages(persisted.agentOutputs?.gemini),
-    };
-    if (
-      hasInvalidMessageSource(messagesState.threadMessages) ||
-      hasInvalidMessageSource(messagesState.agentOutputs.claude) ||
-      hasInvalidMessageSource(messagesState.agentOutputs.codex) ||
-      hasInvalidMessageSource(messagesState.agentOutputs.gemini)
-    ) {
-      throw new Error('[MessagesStore] 持久化消息来源无效');
-    }
+    replaceTimelineNodes([]);
+    sessionViewStateBySession = normalizePersistedSessionViewStateMap(persisted.sessionViewStateBySession);
     const sessionSeen = new Set<string>();
     messagesState.sessions = ensureArray<Session>(persisted.sessions)
       .filter((session) => !!session && typeof session.id === 'string' && session.id.trim().length > 0)
@@ -1591,12 +3015,32 @@ export function initializeState() {
         sessionSeen.add(session.id);
         return true;
     });
-    messagesState.currentSessionId = persisted.currentSessionId || null;
-    notificationBuckets = normalizeNotificationBuckets(persisted.notificationBuckets);
-    messagesState.orchestratorRuntimeDiagnostics = normalizeOrchestratorRuntimeDiagnostics(persisted.orchestratorRuntimeDiagnostics);
-    syncNotificationsFromBucket(messagesState.currentSessionId);
+    messagesState.currentSessionId = shouldRestoreSessionScopedState
+      ? (persisted.currentSessionId || messagesState.currentSessionId || null)
+      : (messagesState.currentSessionId || null);
+    const restoredSessionViewState = shouldRestoreSessionScopedState
+      ? applySessionViewState(messagesState.currentSessionId)
+      : false;
+    if (shouldRestoreSessionScopedState && !restoredSessionViewState) {
+      messagesState.scrollPositions = normalizePersistedScrollPositions(persisted.scrollPositions);
+      messagesState.scrollAnchors = normalizePersistedScrollAnchors(persisted.scrollAnchors);
+      messagesState.autoScrollEnabled = normalizePersistedAutoScrollConfig(persisted.autoScrollEnabled);
+    }
+    notificationsBySession = {};
+    messagesState.orchestratorRuntimeDiagnostics = null;
+    syncNotificationsFromSession(messagesState.currentSessionId);
 
-    // 启动恢复：持久化状态只保留历史展示，不继承运行态。
+    const persistedProjection = shouldRestoreSessionScopedState
+      ? normalizePersistedTimelineProjection(
+          persisted.currentTimelineProjection,
+          messagesState.currentSessionId,
+        )
+      : null;
+    if (!restoredSessionViewState && persistedProjection) {
+      setTimelineProjection(persistedProjection);
+    }
+
+    // 启动恢复：历史展示可先从本地恢复，但运行态必须以后端快照为唯一真相源。
     clearPendingInteractions();
     clearProcessingState();
     saveWebviewState();
@@ -1621,33 +3065,6 @@ export function updateWaveProgress(waveIndex: number, status: WaveState['status'
 
 export function clearWaveState() {
   waveState = null;
-}
-
-// ============ Worker Session 状态操作（提案 4.1） ============
-
-export function addWorkerSession(session: WorkerSessionState) {
-  const newSessions = new Map(workerSessions);
-  newSessions.set(session.sessionId, session);
-  workerSessions = newSessions;
-}
-
-export function updateWorkerSession(sessionId: string, updates: Partial<WorkerSessionState>) {
-  const existing = workerSessions.get(sessionId);
-  if (existing) {
-    const newSessions = new Map(workerSessions);
-    newSessions.set(sessionId, { ...existing, ...updates });
-    workerSessions = newSessions;
-  }
-}
-
-export function removeWorkerSession(sessionId: string) {
-  const newSessions = new Map(workerSessions);
-  newSessions.delete(sessionId);
-  workerSessions = newSessions;
-}
-
-export function clearWorkerSessions() {
-  workerSessions = new Map();
 }
 
 // ============ 请求-响应绑定操作（消息响应流设计） ============

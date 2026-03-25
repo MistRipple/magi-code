@@ -13,7 +13,7 @@ import { t } from '../../i18n';
 type Msg<T extends string> = Extract<WebviewToExtensionMessage, { type: T }>;
 
 const SUPPORTED = new Set([
-  'loadMCPServers', 'addMCPServer', 'updateMCPServer', 'deleteMCPServer',
+  'addMCPServer', 'updateMCPServer', 'deleteMCPServer',
   'connectMCPServer', 'disconnectMCPServer', 'refreshMCPTools', 'getMCPServerTools',
 ]);
 
@@ -22,9 +22,6 @@ export class McpCommandHandler implements CommandHandler {
 
   async handle(message: WebviewToExtensionMessage, ctx: CommandHandlerContext): Promise<void> {
     switch (message.type) {
-      case 'loadMCPServers':
-        await this.handleLoadMCPServers(ctx);
-        break;
       case 'addMCPServer':
         await this.handleAddMCPServer(message as Msg<'addMCPServer'>, ctx);
         break;
@@ -57,54 +54,6 @@ export class McpCommandHandler implements CommandHandler {
     return (executor as any).getMCPManager();
   }
 
-  private async handleLoadMCPServers(ctx: CommandHandlerContext): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../../llm/config');
-      const servers = LLMConfigLoader.loadMCPConfig();
-      for (const server of servers) {
-        if (!server || typeof server !== 'object') throw new Error('Invalid MCP server entry');
-        if (!server.id || typeof server.id !== 'string' || !server.id.trim()) throw new Error('MCP server missing id');
-        if (!server.name || typeof server.name !== 'string' || !server.name.trim()) throw new Error(`MCP server ${server.id || '<unknown>'} missing name`);
-      }
-
-      let manager: any = null;
-      try {
-        manager = await this.getMCPManager(ctx);
-      } catch {
-        // MCP 执行器可能尚未初始化，降级回仅配置态
-      }
-
-      const statusMap = new Map<string, any>();
-      if (manager && typeof manager.getAllServerStatuses === 'function') {
-        for (const status of manager.getAllServerStatuses()) {
-          if (status?.id) {
-            statusMap.set(status.id, status);
-          }
-        }
-      }
-
-      const mergedServers = servers.map((server: any) => {
-        const status = statusMap.get(server.id);
-        return {
-          ...server,
-          connected: status?.connected === true,
-          health: status?.health || (status?.connected ? 'connected' : 'disconnected'),
-          error: typeof status?.error === 'string' ? status.error : undefined,
-          toolCount: Number.isFinite(status?.toolCount) ? status.toolCount : 0,
-          reconnectAttempts: Number.isFinite(status?.reconnectAttempts) ? status.reconnectAttempts : 0,
-          lastCheckedAt: Number.isFinite(status?.lastCheckedAt) ? status.lastCheckedAt : undefined,
-          lastReconnectAt: Number.isFinite(status?.lastReconnectAt) ? status.lastReconnectAt : undefined,
-          lastReconnectSuccessfulAt: Number.isFinite(status?.lastReconnectSuccessfulAt) ? status.lastReconnectSuccessfulAt : undefined,
-        };
-      });
-
-      ctx.sendData('mcpServersLoaded', { servers: mergedServers });
-    } catch (error: any) {
-      logger.error('加载 MCP 服务器列表失败', { error: error.message }, LogCategory.TOOLS);
-      ctx.sendToast(t('mcp.toast.loadFailed', { error: error.message }), 'error');
-    }
-  }
-
   private async handleAddMCPServer(message: Msg<'addMCPServer'>, ctx: CommandHandlerContext): Promise<void> {
     try {
       const { LLMConfigLoader } = await import('../../llm/config');
@@ -119,6 +68,7 @@ export class McpCommandHandler implements CommandHandler {
       ctx.sendToast(t('mcp.toast.serverAdded', { name: server.name }), 'success');
 
       await ctx.getAdapterFactory().reloadMCP();
+      await ctx.refreshSettingsBootstrap();
       logger.info('MCP 服务器已添加', { id: server.id, name: server.name }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('添加 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
@@ -133,6 +83,7 @@ export class McpCommandHandler implements CommandHandler {
       ctx.sendData('mcpServerUpdated', { serverId: message.serverId });
       ctx.sendToast(t('mcp.toast.serverUpdated'), 'success');
       await ctx.getAdapterFactory().reloadMCP();
+      await ctx.refreshSettingsBootstrap();
       logger.info('MCP 服务器已更新', { id: message.serverId }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('更新 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
@@ -149,6 +100,7 @@ export class McpCommandHandler implements CommandHandler {
       ctx.sendData('mcpServerDeleted', { serverId: message.serverId });
       ctx.sendToast(t('mcp.toast.serverDeleted'), 'success');
       await ctx.getAdapterFactory().reloadMCP();
+      await ctx.refreshSettingsBootstrap();
       logger.info('MCP 服务器已删除', { id: message.serverId }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('删除 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
@@ -168,7 +120,7 @@ export class McpCommandHandler implements CommandHandler {
       await manager.connectServer(server);
       const tools = manager.getServerTools(message.serverId);
       ctx.sendToast(t('mcp.toast.serverConnected', { name: server.name, count: tools.length }), 'success');
-      await this.handleLoadMCPServers(ctx);
+      await ctx.refreshSettingsBootstrap();
       logger.info('MCP 服务器已连接', { id: message.serverId, toolCount: tools.length }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('连接 MCP 服务器失败', { serverId: message.serverId, error: error.message }, LogCategory.TOOLS);
@@ -181,7 +133,7 @@ export class McpCommandHandler implements CommandHandler {
       const manager = await this.getMCPManager(ctx);
       await manager.disconnectServer(message.serverId);
       ctx.sendToast(t('mcp.toast.serverDisconnected'), 'success');
-      await this.handleLoadMCPServers(ctx);
+      await ctx.refreshSettingsBootstrap();
       logger.info('MCP 服务器已断开', { id: message.serverId }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('断开 MCP 服务器失败', { error: error.message }, LogCategory.TOOLS);
@@ -194,8 +146,8 @@ export class McpCommandHandler implements CommandHandler {
       const manager = await this.getMCPManager(ctx);
       const tools = await manager.refreshServerTools(message.serverId);
       ctx.sendData('mcpToolsRefreshed', { serverId: message.serverId, tools });
-      await this.handleLoadMCPServers(ctx);
       ctx.sendToast(t('mcp.toast.toolsRefreshed', { count: tools.length }), 'success');
+      await ctx.refreshSettingsBootstrap();
       logger.info('MCP 工具列表已刷新', { serverId: message.serverId, toolCount: tools.length }, LogCategory.TOOLS);
     } catch (error: any) {
       logger.error('刷新 MCP 工具列表失败', { error: error.message }, LogCategory.TOOLS);

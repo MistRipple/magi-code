@@ -139,6 +139,93 @@ export interface LLMMessage {
   content: string | ContentBlock[];
 }
 
+function toSafeString(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (value == null) {
+    return '';
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function normalizeContentBlock(block: unknown): ContentBlock | null {
+  if (!block || typeof block !== 'object') {
+    return null;
+  }
+
+  const candidate = block as Record<string, any>;
+  switch (candidate.type) {
+    case 'text':
+      return {
+        type: 'text',
+        text: toSafeString(candidate.text),
+      };
+    case 'image':
+      return {
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: typeof candidate.source?.media_type === 'string'
+            ? candidate.source.media_type
+            : 'image/png',
+          data: toSafeString(candidate.source?.data),
+        },
+      };
+    case 'tool_use':
+      return {
+        type: 'tool_use',
+        id: toSafeString(candidate.id),
+        name: toSafeString(candidate.name),
+        input: candidate.input && typeof candidate.input === 'object' && !Array.isArray(candidate.input)
+          ? candidate.input
+          : {},
+      };
+    case 'tool_result':
+      return {
+        type: 'tool_result',
+        tool_use_id: toSafeString(candidate.tool_use_id),
+        content: toSafeString(candidate.content),
+        is_error: candidate.is_error === true,
+      };
+    default:
+      return null;
+  }
+}
+
+export function normalizeLLMMessageContent(content: unknown): string | ContentBlock[] {
+  if (typeof content === 'string') {
+    return content;
+  }
+
+  if (Array.isArray(content)) {
+    const normalizedBlocks = content
+      .map((block) => normalizeContentBlock(block))
+      .filter((block): block is ContentBlock => block !== null);
+    return normalizedBlocks;
+  }
+
+  return toSafeString(content);
+}
+
+export function normalizeLLMMessages(messages: LLMMessage[]): LLMMessage[] {
+  return messages.map((message) => ({
+    ...message,
+    content: normalizeLLMMessageContent(message.content),
+  }));
+}
+
+export function normalizeLLMMessageParams(params: LLMMessageParams): LLMMessageParams {
+  return {
+    ...params,
+    messages: normalizeLLMMessages(params.messages),
+  };
+}
+
 /**
  * LLM 请求参数
  */

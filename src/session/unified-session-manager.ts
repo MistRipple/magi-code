@@ -4,7 +4,7 @@
  * 
  * 目录结构：
  * .magi/sessions/{sessionId}/
- * ├── session.json          # 会话主数据
+ * ├── session.json          # 会话唯一权威快照
  * ├── plans/                # 计划文件
  * ├── tasks.json            # 子任务状态
  * ├── snapshots/            # 快照文件
@@ -16,10 +16,43 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { FileSnapshot } from '../types';
 import { AgentType, WorkerSlot } from '../types/agent-types';
-import type { ContentBlock as StandardContentBlock } from '../protocol/message-protocol';
+import type {
+  ContentBlock as StandardContentBlock,
+  InteractionRequest,
+  MessageCategory,
+  MessageVisibility,
+  StandardMessage,
+} from '../protocol/message-protocol';
 import { globalEventBus } from '../events';
 import { estimateTokenCount } from '../utils/token-estimator';
-import { atomicWriteFileSync } from '../utils/atomic-write';
+import { atomicWriteFile } from '../utils/atomic-write';
+import { CoalescedAsyncTaskQueue } from '../utils/async-task-queue';
+import {
+  buildSessionTimelineProjection,
+  isSessionTimelineProjection,
+  type SessionTimelineProjection,
+  type SessionTimelineProjectionMessage,
+} from './session-timeline-projection';
+import type {
+  SessionRuntimeNotificationState,
+  SessionRuntimeTimelineState,
+  TimelineRecord,
+} from './timeline-record';
+import {
+  buildNotificationRecordFromStandardMessage,
+  resolveSessionPersistenceTarget,
+  buildTimelineRecordsFromMessageLike,
+  mergeTimelineRecord,
+} from './timeline-classifier';
+import {
+  materializeProjectionSourceMessagesFromTimelineRecords,
+  materializeSessionMessagesFromTimelineRecords,
+  sortTimelineRecordsBySemanticOrder,
+} from './timeline-record-adapter';
+import {
+  buildPersistedStandardMessagePayload,
+  sanitizePersistedMessageMetadata,
+} from './standard-message-session-persistence';
 
 /** 会话消息 */
 export interface SessionMessage {
@@ -29,6 +62,7 @@ export interface SessionMessage {
   agent?: AgentType;
   source?: 'orchestrator' | 'worker' | 'system' | WorkerSlot;
   timestamp: number;
+  updatedAt?: number;
   attachments?: { name: string; path: string; mimeType?: string }[];
   /** 用户上传的图片（base64 Data URL 格式） */
   images?: Array<{ dataUrl: string }>;
@@ -36,14 +70,21 @@ export interface SessionMessage {
   blocks?: StandardContentBlock[];
   /** UI 消息类型（text/tool_call/...） */
   type?: string;
+  /** 协议层消息类别 */
+  category?: MessageCategory;
+  /** 用户可见性 */
+  visibility?: MessageVisibility;
   /** 系统通知级别 */
   noticeType?: string;
   /** 消息流式状态（恢复时会在前端归一为历史完成态） */
   isStreaming?: boolean;
   isComplete?: boolean;
+  interaction?: InteractionRequest;
   /** 扩展元数据（cardId/eventSeq/standardized 等） */
   metadata?: Record<string, unknown>;
 }
+
+type SessionMessageSource = 'orchestrator' | 'worker' | 'system' | WorkerSlot;
 
 /** 文件快照元数据 */
 export interface FileSnapshotMeta {
@@ -85,15 +126,42 @@ export interface SessionSummary {
  * 使用 MissionDrivenEngine.listTaskViews() 获取任务列表
  */
 export interface UnifiedSession {
+  schemaVersion?: 'session-runtime.v2';
   id: string;
   name?: string;
   status: SessionStatus;
   createdAt: number;
   updatedAt: number;
-  /** 聊天消息 */
+  /** 由 timeline.records 派生的消息缓存 */
   messages: SessionMessage[];
+  /** 会话唯一持久化语义快照 */
+  timeline: SessionRuntimeTimelineState;
+  /** 会话级通知快照 */
+  notifications: SessionRuntimeNotificationState;
   /** 快照元数据 */
   snapshots: FileSnapshotMeta[];
+  /** 主线与 Worker 面板统一恢复投影 */
+  timelineProjection: SessionTimelineProjection;
+  /** 执行链持久化数据（由 MDE 注入，session 层透传） */
+  executionChains?: unknown;
+  /** 恢复快照持久化数据（由 MDE 注入，session 层透传） */
+  resumeSnapshots?: unknown;
+}
+
+interface PersistedUnifiedSessionRecord {
+  schemaVersion: 'session-runtime.v2';
+  id: string;
+  name?: string;
+  status: SessionStatus;
+  createdAt: number;
+  updatedAt: number;
+  timeline: SessionRuntimeTimelineState;
+  notifications: SessionRuntimeNotificationState;
+  snapshots: FileSnapshotMeta[];
+  /** 执行链持久化数据（由 MDE 写入，session 层透传） */
+  executionChains?: unknown;
+  /** 恢复快照持久化数据（由 MDE 写入，session 层透传） */
+  resumeSnapshots?: unknown;
 }
 
 /** 会话元数据（用于列表显示） */
@@ -109,7 +177,17 @@ export interface SessionMeta {
 interface SessionMessageAppendOptions {
   id?: string;
   type?: string;
+  category?: MessageCategory;
+  visibility?: MessageVisibility;
+  updatedAt?: number;
+  interaction?: InteractionRequest;
   metadata?: Record<string, unknown>;
+  /** 结构化内容块（tool_call/file_change/thinking 等），用于会话恢复时还原工具卡片 */
+  blocks?: StandardContentBlock[];
+}
+
+interface SessionMessageUpsertOptions extends SessionMessageAppendOptions {
+  timestamp?: number;
 }
 
 /** 生成唯一 ID */
@@ -122,6 +200,58 @@ function generateMessageId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
 }
 
+function createEmptyTimelineState(): SessionRuntimeTimelineState {
+  return {
+    lastEventSeq: 0,
+    records: [],
+  };
+}
+
+function createEmptyNotificationState(updatedAt: number): SessionRuntimeNotificationState {
+  return {
+    lastUpdatedAt: updatedAt,
+    records: [],
+  };
+}
+
+function isPersistedSessionRecord(value: unknown): value is PersistedUnifiedSessionRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  if (record.schemaVersion !== 'session-runtime.v2') {
+    return false;
+  }
+  if (typeof record.id !== 'string' || !record.id.trim()) {
+    return false;
+  }
+  if (record.status !== 'active' && record.status !== 'completed') {
+    return false;
+  }
+  if (typeof record.createdAt !== 'number' || !Number.isFinite(record.createdAt)) {
+    return false;
+  }
+  if (typeof record.updatedAt !== 'number' || !Number.isFinite(record.updatedAt)) {
+    return false;
+  }
+  if (!Array.isArray(record.snapshots)) {
+    return false;
+  }
+  if (!record.timeline || typeof record.timeline !== 'object' || Array.isArray(record.timeline)) {
+    return false;
+  }
+  if (!Array.isArray((record.timeline as { records?: unknown[] }).records)) {
+    return false;
+  }
+  if (!record.notifications || typeof record.notifications !== 'object' || Array.isArray(record.notifications)) {
+    return false;
+  }
+  if (!Array.isArray((record.notifications as { records?: unknown[] }).records)) {
+    return false;
+  }
+  return true;
+}
+
 /**
  * 统一会话管理器
  */
@@ -131,6 +261,14 @@ export class UnifiedSessionManager {
   private currentSessionId: string | null = null;
   private workspaceRoot: string;
   private baseDir: string;
+  private readonly sessionPersistQueue = new CoalescedAsyncTaskQueue((sessionId, error) => {
+    logger.error('会话.保存.异步落盘失败', { sessionId, error }, LogCategory.SESSION);
+  });
+
+  /** 保存前回调：允许外部模块（如 MDE）在持久化前注入数据到 session */
+  private beforeSaveHook: ((session: UnifiedSession) => void) | null = null;
+  /** 加载后回调：允许外部模块（如 MDE）在恢复时提取数据 */
+  private afterLoadHook: ((session: UnifiedSession) => void) | null = null;
 
   // 内存管理配置
   private readonly MAX_SESSIONS_IN_MEMORY = 50;  // 最大内存中会话数
@@ -149,6 +287,26 @@ export class UnifiedSessionManager {
     if (!fs.existsSync(this.baseDir)) {
       fs.mkdirSync(this.baseDir, { recursive: true });
     }
+  }
+
+  /**
+   * 注册保存前回调
+   *
+   * 在每次 saveSession 执行序列化之前调用，允许外部模块（如 MDE）
+   * 将执行链数据注入到 session 对象上。
+   */
+  setBeforeSaveHook(hook: (session: UnifiedSession) => void): void {
+    this.beforeSaveHook = hook;
+  }
+
+  /**
+   * 注册加载后回调
+   *
+   * 在 session 从磁盘恢复并 hydrate 后调用，允许外部模块（如 MDE）
+   * 从 session 对象中提取执行链数据并恢复到内存态存储。
+   */
+  setAfterLoadHook(hook: (session: UnifiedSession) => void): void {
+    this.afterLoadHook = hook;
   }
 
   /** 获取会话目录路径 */
@@ -178,22 +336,33 @@ export class UnifiedSessionManager {
 
   /** 创建新会话 */
   createSession(name?: string, sessionId?: string): UnifiedSession {
-    if (sessionId && this.sessions.has(sessionId)) {
-      this.currentSessionId = sessionId;
-      return this.sessions.get(sessionId)!;
+    if (sessionId) {
+      const existing = this.getSession(sessionId);
+      if (existing) {
+        this.currentSessionId = sessionId;
+        return existing;
+      }
     }
 
     const now = Date.now();
     const id = sessionId ?? generateId();
 
     const session: UnifiedSession = {
+      schemaVersion: 'session-runtime.v2',
       id,
       name: name || undefined,
       status: 'active',
       createdAt: now,
       updatedAt: now,
       messages: [],
+      timeline: createEmptyTimelineState(),
+      notifications: createEmptyNotificationState(now),
       snapshots: [],
+      timelineProjection: buildSessionTimelineProjection({
+        id,
+        updatedAt: now,
+        messages: [],
+      }),
     };
 
     this.ensureSessionDir(id);
@@ -213,7 +382,7 @@ export class UnifiedSessionManager {
   /** 获取当前会话 */
   getCurrentSession(): UnifiedSession | null {
     if (!this.currentSessionId) return null;
-    return this.sessions.get(this.currentSessionId) ?? null;
+    return this.getSession(this.currentSessionId);
   }
 
   /** 获取或创建当前会话 */
@@ -249,6 +418,403 @@ export class UnifiedSessionManager {
       .sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
+  getSessionTimelineProjection(sessionId: string): SessionTimelineProjection | null {
+    return this.getSession(sessionId)?.timelineProjection ?? null;
+  }
+
+  private ensureSessionRuntimeState(session: UnifiedSession): void {
+    if (!session.timeline || typeof session.timeline !== 'object') {
+      session.timeline = createEmptyTimelineState();
+    }
+    if (!Array.isArray(session.timeline.records)) {
+      session.timeline.records = [];
+    }
+    if (typeof session.timeline.lastEventSeq !== 'number' || !Number.isFinite(session.timeline.lastEventSeq)) {
+      session.timeline.lastEventSeq = 0;
+    }
+    if (!session.notifications || typeof session.notifications !== 'object') {
+      session.notifications = createEmptyNotificationState(session.updatedAt);
+    }
+    if (!Array.isArray(session.notifications.records)) {
+      session.notifications.records = [];
+    }
+    if (typeof session.notifications.lastUpdatedAt !== 'number' || !Number.isFinite(session.notifications.lastUpdatedAt)) {
+      session.notifications.lastUpdatedAt = session.updatedAt;
+    }
+  }
+
+  private normalizeTimelineRecordRole(record: TimelineRecord): TimelineRecord {
+    if (record.messageType === 'user_input' && record.role !== 'user') {
+      return { ...record, role: 'user' };
+    }
+    if (record.messageType === 'system-notice' && record.role !== 'system') {
+      return { ...record, role: 'system' };
+    }
+    return record;
+  }
+
+  private normalizeTimelineSnapshot(session: UnifiedSession): boolean {
+    this.ensureSessionRuntimeState(session);
+    const currentRecords = Array.isArray(session.timeline.records) ? session.timeline.records : [];
+    const normalizedByStableKey = new Map<string, TimelineRecord>();
+    const orderedStableKeys: string[] = [];
+    for (const record of currentRecords.map((item) => this.normalizeTimelineRecordRole(item))) {
+      const stableKey = typeof record.stableKey === 'string' ? record.stableKey.trim() : '';
+      if (!stableKey) {
+        continue;
+      }
+      const existing = normalizedByStableKey.get(stableKey);
+      if (!existing) {
+        orderedStableKeys.push(stableKey);
+        normalizedByStableKey.set(stableKey, record);
+        continue;
+      }
+      normalizedByStableKey.set(stableKey, mergeTimelineRecord(existing, record));
+    }
+    const normalizedRecords = sortTimelineRecordsBySemanticOrder(
+      orderedStableKeys
+        .map((stableKey) => normalizedByStableKey.get(stableKey))
+        .filter((record): record is TimelineRecord => Boolean(record)),
+    );
+    const nextLastEventSeq = normalizedRecords.reduce(
+      (maxSeq, record) => Math.max(maxSeq, record.anchorEventSeq),
+      0,
+    );
+    const timelineChanged = !this.areTimelineRecordsEquivalent(currentRecords, normalizedRecords)
+      || session.timeline.lastEventSeq !== nextLastEventSeq;
+    session.timeline = {
+      lastEventSeq: nextLastEventSeq,
+      records: normalizedRecords,
+    };
+    return timelineChanged;
+  }
+
+  private syncSessionMessagesFromTimeline(session: UnifiedSession): boolean {
+    this.ensureSessionRuntimeState(session);
+    const currentMessages = Array.isArray(session.messages) ? session.messages : [];
+    const nextMessages = this.deduplicateSessionMessages(
+      materializeSessionMessagesFromTimelineRecords(session.timeline.records),
+    );
+    const messagesChanged = !this.areSessionMessagesEquivalent(currentMessages, nextMessages);
+    session.messages = nextMessages;
+    return messagesChanged;
+  }
+
+  private reconcileSessionMessagesAndTimeline(session: UnifiedSession): {
+    messagesChanged: boolean;
+    timelineChanged: boolean;
+  } {
+    this.ensureSessionRuntimeState(session);
+    const timelineChanged = this.normalizeTimelineSnapshot(session);
+    const messagesChanged = this.syncSessionMessagesFromTimeline(session);
+    return {
+      messagesChanged,
+      timelineChanged,
+    };
+  }
+
+  private resolveProjectionSourceMessages(session: UnifiedSession): SessionTimelineProjectionMessage[] {
+    this.ensureSessionRuntimeState(session);
+    return materializeProjectionSourceMessagesFromTimelineRecords(session.timeline.records);
+  }
+
+  private resolveMessageRevisionTimestamp(message: SessionMessage): number {
+    if (typeof message.updatedAt === 'number' && Number.isFinite(message.updatedAt)) {
+      return Math.floor(message.updatedAt);
+    }
+    if (typeof message.timestamp === 'number' && Number.isFinite(message.timestamp)) {
+      return Math.floor(message.timestamp);
+    }
+    return 0;
+  }
+
+  private resolveMessageCompletenessScore(message: SessionMessage): number {
+    let score = 0;
+    const content = typeof message.content === 'string' ? message.content.trim() : '';
+    if (content) {
+      score += content.length;
+    }
+    if (Array.isArray(message.blocks) && message.blocks.length > 0) {
+      score += message.blocks.length * 100;
+    }
+    if (Array.isArray(message.attachments) && message.attachments.length > 0) {
+      score += message.attachments.length * 10;
+    }
+    if (Array.isArray(message.images) && message.images.length > 0) {
+      score += message.images.length * 10;
+    }
+    if (message.metadata && typeof message.metadata === 'object' && !Array.isArray(message.metadata)) {
+      score += Object.keys(message.metadata).length * 5;
+    }
+    return score;
+  }
+
+  private shouldPreferIncomingSessionMessage(existing: SessionMessage, incoming: SessionMessage): boolean {
+    const existingRevision = this.resolveMessageRevisionTimestamp(existing);
+    const incomingRevision = this.resolveMessageRevisionTimestamp(incoming);
+    if (incomingRevision !== existingRevision) {
+      return incomingRevision > existingRevision;
+    }
+
+    const existingScore = this.resolveMessageCompletenessScore(existing);
+    const incomingScore = this.resolveMessageCompletenessScore(incoming);
+    if (incomingScore !== existingScore) {
+      return incomingScore > existingScore;
+    }
+
+    return incoming.timestamp >= existing.timestamp;
+  }
+
+  private mergeDuplicateSessionMessage(existing: SessionMessage, incoming: SessionMessage): SessionMessage {
+    const existingMetadata = existing.metadata && typeof existing.metadata === 'object' && !Array.isArray(existing.metadata)
+      ? existing.metadata
+      : undefined;
+    const incomingMetadata = incoming.metadata && typeof incoming.metadata === 'object' && !Array.isArray(incoming.metadata)
+      ? incoming.metadata
+      : undefined;
+    const preferIncoming = this.shouldPreferIncomingSessionMessage(existing, incoming);
+    const primary = preferIncoming ? incoming : existing;
+    const secondary = preferIncoming ? existing : incoming;
+    const primaryMetadata = preferIncoming ? incomingMetadata : existingMetadata;
+    const secondaryMetadata = preferIncoming ? existingMetadata : incomingMetadata;
+    const merged = this.normalizeMessageRole({
+      ...secondary,
+      ...primary,
+      id: existing.id,
+      role: primary.role || secondary.role,
+      content: primary.content?.trim() ? primary.content : secondary.content,
+      timestamp: Math.min(existing.timestamp, incoming.timestamp),
+      updatedAt: Math.max(
+        this.resolveMessageRevisionTimestamp(existing),
+        this.resolveMessageRevisionTimestamp(incoming),
+      ),
+      attachments: Array.isArray(primary.attachments) && primary.attachments.length > 0
+        ? primary.attachments
+        : secondary.attachments,
+      images: Array.isArray(primary.images) && primary.images.length > 0
+        ? primary.images
+        : secondary.images,
+      blocks: Array.isArray(primary.blocks) && primary.blocks.length > 0
+        ? primary.blocks
+        : secondary.blocks,
+      metadata: sanitizePersistedMessageMetadata({
+        role: primary.role || secondary.role,
+        type: primary.type || secondary.type,
+        content: primary.content?.trim() ? primary.content : secondary.content,
+        blocks: Array.isArray(primary.blocks) && primary.blocks.length > 0
+          ? primary.blocks
+          : secondary.blocks,
+        metadata: {
+          ...(secondaryMetadata || {}),
+          ...(primaryMetadata || {}),
+        },
+      }),
+    });
+    return merged;
+  }
+
+  private deduplicateSessionMessages(messages: SessionMessage[]): SessionMessage[] {
+    const orderedIds: string[] = [];
+    const dedupedById = new Map<string, SessionMessage>();
+
+    for (const message of messages) {
+      const messageId = typeof message?.id === 'string' ? message.id.trim() : '';
+      if (!messageId) {
+        continue;
+      }
+      const normalizedMessage = this.normalizeMessageRole({
+        ...message,
+        id: messageId,
+      });
+      const sanitizedMessage = this.sanitizeSessionMessageMetadata(normalizedMessage);
+      const existing = dedupedById.get(messageId);
+      if (!existing) {
+        orderedIds.push(messageId);
+        dedupedById.set(messageId, sanitizedMessage);
+        continue;
+      }
+      dedupedById.set(messageId, this.mergeDuplicateSessionMessage(existing, sanitizedMessage));
+    }
+
+    return orderedIds.map((messageId) => dedupedById.get(messageId)!);
+  }
+
+  private upsertTimelineRecordInSession(session: UnifiedSession, record: TimelineRecord): void {
+    this.ensureSessionRuntimeState(session);
+    const existingIndex = session.timeline.records.findIndex((item) => item.stableKey === record.stableKey);
+    if (existingIndex < 0) {
+      session.timeline.records.push(record);
+    } else {
+      session.timeline.records[existingIndex] = mergeTimelineRecord(session.timeline.records[existingIndex], record);
+    }
+    session.timeline.lastEventSeq = Math.max(session.timeline.lastEventSeq, record.anchorEventSeq);
+  }
+
+  private resolveTimelineSourceMessageId(record: TimelineRecord): string {
+    const metadata = record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)
+      ? record.metadata
+      : undefined;
+    const originMessageId = typeof metadata?.originMessageId === 'string' ? metadata.originMessageId.trim() : '';
+    return originMessageId || record.messageId;
+  }
+
+  private syncTimelineSnapshotFromMessage(
+    session: UnifiedSession,
+    message: SessionMessage,
+  ): void {
+    const records = buildTimelineRecordsFromMessageLike(message);
+    const sourceMessageId = typeof message.id === 'string' ? message.id.trim() : '';
+    const nextStableKeys = new Set(records.map((record) => record.stableKey));
+    if (sourceMessageId) {
+      const existingSourceRecords = session.timeline.records.filter((record) => (
+        this.resolveTimelineSourceMessageId(record) === sourceMessageId
+      ));
+      session.timeline.records = session.timeline.records.filter((record) => (
+        this.resolveTimelineSourceMessageId(record) !== sourceMessageId
+        || nextStableKeys.has(record.stableKey)
+      ));
+      session.timeline.lastEventSeq = session.timeline.records.reduce(
+        (maxSeq, record) => Math.max(maxSeq, record.anchorEventSeq),
+        0,
+      );
+    }
+    if (records.length === 0) {
+      return;
+    }
+    for (const record of records) {
+      this.upsertTimelineRecordInSession(session, record);
+    }
+  }
+
+  private rebuildTimelineSnapshotFromMessages(messages: SessionMessage[]): SessionRuntimeTimelineState {
+    const state = createEmptyTimelineState();
+    for (const message of messages) {
+      for (const record of buildTimelineRecordsFromMessageLike(message)) {
+        const existingIndex = state.records.findIndex((item) => item.stableKey === record.stableKey);
+        if (existingIndex < 0) {
+          state.records.push(record);
+        } else {
+          state.records[existingIndex] = mergeTimelineRecord(state.records[existingIndex], record);
+        }
+        state.lastEventSeq = Math.max(state.lastEventSeq, record.anchorEventSeq);
+      }
+    }
+    state.records.sort((left, right) => (
+      (left.anchorEventSeq - right.anchorEventSeq)
+      || (left.anchorTimestamp - right.anchorTimestamp)
+      || left.stableKey.localeCompare(right.stableKey)
+    ));
+    return state;
+  }
+
+  appendNotificationToSession(sessionId: string, record: SessionRuntimeNotificationState['records'][number]): void {
+    const session = this.getSession(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+    this.ensureSessionRuntimeState(session);
+    const existingIndex = session.notifications.records.findIndex((item) => item.notificationId === record.notificationId);
+    if (existingIndex < 0) {
+      session.notifications.records.push(record);
+    } else {
+      session.notifications.records[existingIndex] = {
+        ...session.notifications.records[existingIndex],
+        ...record,
+      };
+    }
+    session.notifications.lastUpdatedAt = Math.max(session.notifications.lastUpdatedAt, record.createdAt);
+    session.updatedAt = Date.now();
+    this.saveSession(session);
+  }
+
+  getSessionNotifications(sessionId: string): SessionRuntimeNotificationState | null {
+    const session = this.getSession(sessionId);
+    if (!session) {
+      return null;
+    }
+    this.ensureSessionRuntimeState(session);
+    return structuredClone(session.notifications);
+  }
+
+  markAllSessionNotificationsRead(sessionId: string): SessionRuntimeNotificationState | null {
+    const session = this.getSession(sessionId);
+    if (!session) {
+      return null;
+    }
+    this.ensureSessionRuntimeState(session);
+    const updatedAt = Date.now();
+    session.notifications.records = session.notifications.records.map((record) => ({
+      ...record,
+      read: true,
+    }));
+    session.notifications.lastUpdatedAt = updatedAt;
+    session.updatedAt = updatedAt;
+    this.saveSession(session);
+    return structuredClone(session.notifications);
+  }
+
+  clearSessionNotifications(sessionId: string): SessionRuntimeNotificationState | null {
+    const session = this.getSession(sessionId);
+    if (!session) {
+      return null;
+    }
+    this.ensureSessionRuntimeState(session);
+    const updatedAt = Date.now();
+    session.notifications.records = [];
+    session.notifications.lastUpdatedAt = updatedAt;
+    session.updatedAt = updatedAt;
+    this.saveSession(session);
+    return structuredClone(session.notifications);
+  }
+
+  removeSessionNotification(sessionId: string, notificationId: string): SessionRuntimeNotificationState | null {
+    const session = this.getSession(sessionId);
+    if (!session) {
+      return null;
+    }
+    this.ensureSessionRuntimeState(session);
+    const updatedAt = Date.now();
+    session.notifications.records = session.notifications.records.filter((record) => record.notificationId !== notificationId);
+    session.notifications.lastUpdatedAt = updatedAt;
+    session.updatedAt = updatedAt;
+    this.saveSession(session);
+    return structuredClone(session.notifications);
+  }
+
+  persistStandardMessageToSession(sessionId: string, message: StandardMessage): void {
+    const target = resolveSessionPersistenceTarget(message);
+    if (target === 'ignore') {
+      return;
+    }
+    if (target === 'notification') {
+      const notification = buildNotificationRecordFromStandardMessage(message);
+      if (notification) {
+        this.appendNotificationToSession(sessionId, notification);
+      }
+      return;
+    }
+    const persistedPayload = buildPersistedStandardMessagePayload(message);
+    this.upsertMessageToSession(
+      sessionId,
+      persistedPayload.role,
+      persistedPayload.content,
+      persistedPayload.agent,
+      persistedPayload.source,
+      undefined,
+      {
+        id: message.id,
+        type: persistedPayload.type,
+        category: persistedPayload.category,
+        visibility: persistedPayload.visibility,
+        timestamp: persistedPayload.timestamp,
+        updatedAt: persistedPayload.updatedAt,
+        interaction: persistedPayload.interaction,
+        metadata: persistedPayload.metadata,
+        blocks: persistedPayload.blocks,
+      },
+    );
+  }
+
   private buildSessionMeta(session: UnifiedSession): SessionMeta {
     return {
       id: session.id,
@@ -273,6 +839,19 @@ export class UnifiedSessionManager {
       return { ...message, role: 'system' };
     }
     return message;
+  }
+
+  private sanitizeSessionMessageMetadata(message: SessionMessage): SessionMessage {
+    return {
+      ...message,
+      metadata: sanitizePersistedMessageMetadata({
+        role: message.role,
+        type: message.type,
+        content: message.content,
+        blocks: Array.isArray(message.blocks) ? message.blocks : undefined,
+        metadata: message.metadata,
+      }),
+    };
   }
 
   /** 判断是否为用户消息（统一以语义为准：role 或 type） */
@@ -305,10 +884,10 @@ export class UnifiedSessionManager {
 
   /** 添加消息到当前会话 */
   addMessage(
-    role: 'user' | 'assistant',
+    role: 'user' | 'assistant' | 'system',
     content: string,
     agent?: AgentType,  // ✅ 使用 AgentType
-    source?: 'orchestrator' | 'worker' | 'system',
+    source?: SessionMessageSource,
     images?: Array<{ dataUrl: string }>  // 🔧 新增：用户上传的图片
   ): SessionMessage {
     const session = this.getOrCreateCurrentSession();
@@ -318,10 +897,10 @@ export class UnifiedSessionManager {
   /** 添加消息到指定会话（强一致会话写入，避免跨会话污染） */
   addMessageToSession(
     sessionId: string,
-    role: 'user' | 'assistant',
+    role: 'user' | 'assistant' | 'system',
     content: string,
     agent?: AgentType,
-    source?: 'orchestrator' | 'worker' | 'system',
+    source?: SessionMessageSource,
     images?: Array<{ dataUrl: string }>,
     options?: SessionMessageAppendOptions
   ): SessionMessage {
@@ -332,18 +911,92 @@ export class UnifiedSessionManager {
     return this.appendMessageToSession(session, role, content, agent, source, images, options);
   }
 
-  private appendMessageToSession(
-    session: UnifiedSession,
-    role: 'user' | 'assistant',
+  upsertMessageToSession(
+    sessionId: string,
+    role: 'user' | 'assistant' | 'system',
     content: string,
     agent?: AgentType,
-    source?: 'orchestrator' | 'worker' | 'system',
+    source?: SessionMessageSource,
+    images?: Array<{ dataUrl: string }>,
+    options?: SessionMessageUpsertOptions,
+  ): SessionMessage {
+    const session = this.getSession(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+
+    const messageId = options?.id?.trim();
+    if (!messageId) {
+      return this.appendMessageToSession(session, role, content, agent, source, images, options);
+    }
+
+    const existingIndex = session.messages.findIndex((message) => message.id === messageId);
+    if (existingIndex < 0) {
+      return this.appendMessageToSession(session, role, content, agent, source, images, options);
+    }
+
+    const metadata = options?.metadata && typeof options.metadata === 'object' && !Array.isArray(options.metadata)
+      ? { ...options.metadata }
+      : undefined;
+    const existingMetadata = session.messages[existingIndex].metadata && typeof session.messages[existingIndex].metadata === 'object'
+      && !Array.isArray(session.messages[existingIndex].metadata)
+      ? session.messages[existingIndex].metadata
+      : undefined;
+    const nextBlocks = (Array.isArray(options?.blocks) && options!.blocks.length > 0)
+      ? options!.blocks
+      : session.messages[existingIndex].blocks;
+    const nextMessage: SessionMessage = {
+      ...session.messages[existingIndex],
+      id: messageId,
+      role,
+      content,
+      agent,
+      source,
+      timestamp: typeof options?.timestamp === 'number' && Number.isFinite(options.timestamp)
+        ? Math.min(session.messages[existingIndex].timestamp, options.timestamp)
+        : session.messages[existingIndex].timestamp,
+      updatedAt: typeof options?.updatedAt === 'number' && Number.isFinite(options.updatedAt)
+        ? Math.max(session.messages[existingIndex].updatedAt || session.messages[existingIndex].timestamp, options.updatedAt)
+        : Date.now(),
+      images: images && images.length > 0 ? images : undefined,
+      // blocks：优先使用新传入的，否则保留已有的（避免后续 upsert 覆盖丢失）
+      blocks: nextBlocks,
+      type: options?.type,
+      category: options?.category,
+      visibility: options?.visibility,
+      interaction: options?.interaction,
+      metadata: sanitizePersistedMessageMetadata({
+        role,
+        type: options?.type,
+        content,
+        blocks: nextBlocks,
+        metadata: {
+          ...(existingMetadata || {}),
+          ...(metadata || {}),
+        },
+      }),
+    };
+
+    session.messages[existingIndex] = nextMessage;
+    this.syncTimelineSnapshotFromMessage(session, nextMessage);
+    session.updatedAt = Date.now();
+    this.saveSession(session);
+    return nextMessage;
+  }
+
+  private appendMessageToSession(
+    session: UnifiedSession,
+    role: 'user' | 'assistant' | 'system',
+    content: string,
+    agent?: AgentType,
+    source?: SessionMessageSource,
     images?: Array<{ dataUrl: string }>,
     options?: SessionMessageAppendOptions
   ): SessionMessage {
     const metadata = options?.metadata && typeof options.metadata === 'object' && !Array.isArray(options.metadata)
       ? { ...options.metadata }
       : undefined;
+    const blocks = Array.isArray(options?.blocks) && options!.blocks.length > 0 ? options!.blocks : undefined;
 
     const message: SessionMessage = {
       id: options?.id || generateMessageId(),
@@ -351,13 +1004,30 @@ export class UnifiedSessionManager {
       content,
       agent,
       source,
-      timestamp: Date.now(),
+      timestamp: typeof (options as SessionMessageUpsertOptions | undefined)?.timestamp === 'number'
+        && Number.isFinite((options as SessionMessageUpsertOptions | undefined)?.timestamp)
+        ? Math.floor((options as SessionMessageUpsertOptions).timestamp!)
+        : Date.now(),
+      updatedAt: typeof options?.updatedAt === 'number' && Number.isFinite(options.updatedAt)
+        ? options.updatedAt
+        : Date.now(),
       images: images && images.length > 0 ? images : undefined,
+      blocks,
       type: options?.type,
-      metadata,
+      category: options?.category,
+      visibility: options?.visibility,
+      interaction: options?.interaction,
+      metadata: sanitizePersistedMessageMetadata({
+        role,
+        type: options?.type,
+        content,
+        blocks,
+        metadata,
+      }),
     };
 
     session.messages.push(message);
+    this.syncTimelineSnapshotFromMessage(session, message);
     session.updatedAt = Date.now();
 
     // 自动生成会话标题
@@ -409,6 +1079,7 @@ export class UnifiedSessionManager {
         }
         normalizedMessages.push(normalized);
       }
+      const dedupedMessages = this.deduplicateSessionMessages(normalizedMessages);
 
       if (normalizedRoleCount > 0) {
         logger.warn('会话.更新.role归一化', {
@@ -417,7 +1088,7 @@ export class UnifiedSessionManager {
         }, LogCategory.SESSION);
       }
 
-      for (const msg of normalizedMessages) {
+      for (const msg of dedupedMessages) {
         if (!msg.id || typeof msg.id !== 'string' || !msg.id.trim()) {
           throw new Error('Session message missing id');
         }
@@ -449,7 +1120,8 @@ export class UnifiedSessionManager {
         }
       }
 
-      session.messages = normalizedMessages;
+      session.messages = dedupedMessages;
+      session.timeline = this.rebuildTimelineSnapshotFromMessages(dedupedMessages);
       // ✅ 移除 cliOutputs 更新逻辑
       session.updatedAt = Date.now();
       this.saveSession(session);
@@ -476,6 +1148,8 @@ export class UnifiedSessionManager {
     const session = this.getCurrentSession();
     if (session) {
       session.messages = [];
+      session.timeline = createEmptyTimelineState();
+      session.notifications = createEmptyNotificationState(Date.now());
       session.updatedAt = Date.now();
       this.saveSession(session);
     }
@@ -791,6 +1465,21 @@ export class UnifiedSessionManager {
       return false;
     }
 
+    if (!session.timeline || typeof session.timeline !== 'object' || !Array.isArray(session.timeline.records)) {
+      logger.error('会话.验证.时间轴快照_非法', undefined, LogCategory.SESSION);
+      return false;
+    }
+
+    if (!session.notifications || typeof session.notifications !== 'object' || !Array.isArray(session.notifications.records)) {
+      logger.error('会话.验证.通知快照_非法', undefined, LogCategory.SESSION);
+      return false;
+    }
+
+    if (!session.timelineProjection || !isSessionTimelineProjection(session.timelineProjection)) {
+      logger.error('会话.验证.时间轴投影_非法', undefined, LogCategory.SESSION);
+      return false;
+    }
+
     // 消息数据验证
     for (const msg of session.messages) {
       if (!msg.id || typeof msg.id !== 'string' || !msg.id.trim()) {
@@ -908,6 +1597,7 @@ export class UnifiedSessionManager {
     );
 
     session.messages = session.messages.slice(-toKeep);
+    session.timeline = this.rebuildTimelineSnapshotFromMessages(session.messages);
   }
 
   // ============================================================================
@@ -916,15 +1606,45 @@ export class UnifiedSessionManager {
 
   /** 保存会话 */
   saveSession(session: UnifiedSession): void {
-    this.ensureSessionDir(session.id);
     const filePath = this.getSessionFilePath(session.id);
     try {
-      atomicWriteFileSync(filePath, JSON.stringify(session, null, 2));
+      this.ensureSessionRuntimeState(session);
+      this.reconcileSessionMessagesAndTimeline(session);
+      // 保存前回调：允许外部模块注入执行链等数据
+      if (this.beforeSaveHook) {
+        try {
+          this.beforeSaveHook(session);
+        } catch (hookError) {
+          logger.warn('会话.保存.beforeSaveHook异常', {
+            sessionId: session.id,
+            error: hookError instanceof Error ? hookError.message : String(hookError),
+          }, LogCategory.SESSION);
+        }
+      }
+      const projectionSourceMessages = this.resolveProjectionSourceMessages(session);
+      session.timelineProjection = buildSessionTimelineProjection({
+        id: session.id,
+        updatedAt: session.updatedAt,
+        messages: projectionSourceMessages,
+      });
+      const sessionId = session.id;
       this.refreshSessionMeta(session);
+      this.sessionPersistQueue.schedule(sessionId, async () => {
+        if (!this.sessionMetas.has(sessionId)) {
+          return;
+        }
+        const latestSession = this.sessions.get(sessionId) ?? session;
+        const payload = JSON.stringify(this.serializeSessionForDisk(latestSession), null, 2);
+        await atomicWriteFile(filePath, payload);
+      });
     } catch (error) {
       logger.error('会话.保存.失败', { sessionId: session.id, error }, LogCategory.SESSION);
       throw new Error(`Failed to save session: ${error}`);
     }
+  }
+
+  async flushPendingPersistence(): Promise<void> {
+    await this.sessionPersistQueue.flushAll();
   }
 
   /** 保存当前会话 */
@@ -943,7 +1663,13 @@ export class UnifiedSessionManager {
     }
     try {
       const data = fs.readFileSync(filePath, 'utf-8');
-      const session = JSON.parse(data) as UnifiedSession;
+      const persisted = JSON.parse(data) as unknown;
+      if (!isPersistedSessionRecord(persisted)) {
+        logger.error('会话.元数据加载.持久化结构_非法', { sessionId }, LogCategory.SESSION);
+        this.backupCorruptedSession(sessionId, filePath);
+        return null;
+      }
+      const session = this.hydrateSessionRecord(persisted);
       if (!this.validateSessionData(session)) {
         logger.error('会话.元数据加载.校验_失败', { sessionId }, LogCategory.SESSION);
         this.backupCorruptedSession(sessionId, filePath);
@@ -965,7 +1691,13 @@ export class UnifiedSessionManager {
     if (fs.existsSync(filePath)) {
       try {
         const data = fs.readFileSync(filePath, 'utf-8');
-        let session = JSON.parse(data) as UnifiedSession;
+        const persisted = JSON.parse(data) as unknown;
+        if (!isPersistedSessionRecord(persisted)) {
+          logger.error('会话.加载.持久化结构_非法', { sessionId }, LogCategory.SESSION);
+          this.backupCorruptedSession(sessionId, filePath);
+          return null;
+        }
+        const session = this.hydrateSessionRecord(persisted);
 
         // 数据完整性验证
         if (!this.validateSessionData(session)) {
@@ -974,14 +1706,19 @@ export class UnifiedSessionManager {
           return null;
         }
 
-        // 数据迁移：修复 role 被前端覆写为 'assistant' 但 type 为 'user_input' 的用户消息
-        const migrated = this.migrateMessageRoles(session);
-        if (migrated) {
-          this.saveSession(session);
-        }
-
         this.sessions.set(session.id, session);
         this.refreshSessionMeta(session);
+        // 加载后回调：允许外部模块恢复执行链等数据
+        if (this.afterLoadHook) {
+          try {
+            this.afterLoadHook(session);
+          } catch (hookError) {
+            logger.warn('会话.加载.afterLoadHook异常', {
+              sessionId: session.id,
+              error: hookError instanceof Error ? hookError.message : String(hookError),
+            }, LogCategory.SESSION);
+          }
+        }
         return session;
       } catch (e) {
         logger.error('会话.加载.失败', { sessionId, error: e }, LogCategory.SESSION);
@@ -992,30 +1729,61 @@ export class UnifiedSessionManager {
     return null;
   }
 
-  /**
-   * 迁移消息 role：修复历史脏数据（type 与 role 不一致）
-   * 根因：前端历史版本在某些链路将用户消息 role 覆写为 assistant，随后回写磁盘。
-   * @returns 是否有消息被修正
-   */
-  private migrateMessageRoles(session: UnifiedSession): boolean {
-    const normalizedMessages: SessionMessage[] = [];
-    let fixed = 0;
+  private serializeSessionForDisk(session: UnifiedSession): PersistedUnifiedSessionRecord {
+    return {
+      schemaVersion: 'session-runtime.v2',
+      id: session.id,
+      ...(session.name ? { name: session.name } : {}),
+      status: session.status,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      timeline: session.timeline,
+      notifications: session.notifications,
+      snapshots: session.snapshots,
+      ...(session.executionChains ? { executionChains: session.executionChains } : {}),
+      ...(session.resumeSnapshots ? { resumeSnapshots: session.resumeSnapshots } : {}),
+    };
+  }
 
-    for (const msg of session.messages) {
-      const normalized = this.normalizeMessageRole(msg);
-      if (normalized.role !== msg.role) {
-        fixed++;
-      }
-      normalizedMessages.push(normalized);
-    }
+  private hydrateSessionRecord(record: PersistedUnifiedSessionRecord): UnifiedSession {
+    const timeline = {
+      lastEventSeq: typeof record.timeline.lastEventSeq === 'number' && Number.isFinite(record.timeline.lastEventSeq)
+        ? Math.floor(record.timeline.lastEventSeq)
+        : 0,
+      records: sortTimelineRecordsBySemanticOrder(record.timeline.records),
+    };
+    const notifications = record.notifications;
+    const materializedMessages = this.deduplicateSessionMessages(
+      materializeSessionMessagesFromTimelineRecords(timeline.records),
+    );
+    const rebuiltProjection = buildSessionTimelineProjection({
+      id: record.id,
+      updatedAt: record.updatedAt,
+      messages: materializeProjectionSourceMessagesFromTimelineRecords(timeline.records),
+    });
+    return {
+      schemaVersion: 'session-runtime.v2',
+      id: record.id,
+      name: record.name,
+      status: record.status,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+      messages: materializedMessages,
+      timeline,
+      notifications,
+      snapshots: Array.isArray(record.snapshots) ? record.snapshots : [],
+      timelineProjection: rebuiltProjection,
+      ...(record.executionChains ? { executionChains: record.executionChains } : {}),
+      ...(record.resumeSnapshots ? { resumeSnapshots: record.resumeSnapshots } : {}),
+    };
+  }
 
-    if (fixed > 0) {
-      session.messages = normalizedMessages;
-      logger.info('会话.迁移.role修正', { sessionId: session.id, fixed }, LogCategory.SESSION);
-      return true;
-    }
+  private areSessionMessagesEquivalent(left: SessionMessage[], right: SessionMessage[]): boolean {
+    return JSON.stringify(left) === JSON.stringify(right);
+  }
 
-    return false;
+  private areTimelineRecordsEquivalent(left: TimelineRecord[], right: TimelineRecord[]): boolean {
+    return JSON.stringify(left) === JSON.stringify(right);
   }
 
   /** 加载所有会话 */
@@ -1039,11 +1807,6 @@ export class UnifiedSessionManager {
     if (metas.length > 0) {
       metas.sort((a, b) => b.updatedAt - a.updatedAt);
       this.currentSessionId = metas[0].id;
-      // 预加载最近的会话，避免首次切换卡顿
-      const preloadCount = Math.min(this.MAX_SESSIONS_IN_MEMORY, metas.length);
-      for (let i = 0; i < preloadCount; i += 1) {
-        this.loadSession(metas[i].id);
-      }
     }
   }
 
@@ -1080,7 +1843,7 @@ export class UnifiedSessionManager {
    * 调用方应使用 MissionDrivenEngine.listTaskViews() 获取完整任务列表
    */
   getSessionSummary(sessionId?: string): SessionSummary | null {
-    const session = sessionId ? this.sessions.get(sessionId) : this.getCurrentSession();
+    const session = sessionId ? this.getSession(sessionId) : this.getCurrentSession();
     if (!session) return null;
 
     // 任务信息已迁移到 Mission 系统，这里返回空数组

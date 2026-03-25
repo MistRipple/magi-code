@@ -11,6 +11,7 @@
  */
 
 import { WorkerSlot } from '../types';
+import type { OrchestrationTraceLinks } from '../orchestrator/trace/types';
 
 // ============================================================================
 // 状态枚举
@@ -90,6 +91,8 @@ export interface UnifiedTodo {
   parentId?: string;
   /** Todo 来源 */
   source: TodoSource;
+  /** 运行链路追踪上下文 */
+  trace?: OrchestrationTraceLinks;
 
   // ===== 内容 =====
   /** 任务描述 */
@@ -203,6 +206,7 @@ export interface CreateTodoParams {
   sessionId?: string;
   missionId: string;
   assignmentId: string;
+  trace?: OrchestrationTraceLinks;
   parentId?: string;
   source?: TodoSource;
   content: string;

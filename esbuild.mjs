@@ -12,7 +12,7 @@ if (existsSync(tiktokenWasm)) {
   copyFileSync(tiktokenWasm, outWasm);
 }
 
-await esbuild.build({
+const result = await esbuild.build({
   entryPoints: ['src/extension.ts'],
   bundle: true,
   outfile: 'dist/extension.js',
@@ -25,13 +25,17 @@ await esbuild.build({
   sourcemap: production ? false : true,
   minify: production,
   treeShaking: true,
-  // WASM 文件作为文件资源处理
+  metafile: true,
   loader: {
     '.wasm': 'file',
   },
-  // 确保 __dirname 在 bundle 中正确工作
   define: {
     'process.env.NODE_ENV': production ? '"production"' : '"development"',
   },
-  logLevel: 'info',
+  logLevel: 'warning',
 });
+
+const fmt = (bytes) => bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)}kb` : `${(bytes / 1024 / 1024).toFixed(1)}mb`;
+for (const [file, info] of Object.entries(result.metafile.outputs)) {
+  console.log(`  ${file}  ${fmt(info.bytes)}`);
+}

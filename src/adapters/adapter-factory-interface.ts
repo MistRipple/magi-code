@@ -4,21 +4,40 @@
  */
 
 import { EventEmitter } from 'events';
-import { AgentType } from '../types/agent-types';
+import { AgentType, ModelAutonomyCapability } from '../types/agent-types';
 import type { ToolManager, ToolExecutionContext } from '../tools/tool-manager';
 import type { MCPToolExecutor } from '../tools/mcp-executor';
 import type { DecisionHookEvent } from '../llm/types';
+import type { PlanMode } from '../orchestrator/plan-ledger';
+import type { MessageMetadata } from '../protocol/message-protocol';
 
 /**
  * 适配器输出范围配置
  * 控制 LLM 响应的输出行为
  */
 export interface AdapterOutputScope {
+  /** 本轮显式生效的规划模式 */
+  planningMode?: PlanMode;
+
   /** 是否包含思考内容（thinking blocks） */
   includeThinking?: boolean;
 
+  /**
+   * 历史模式
+   * - 'session': 复用当前编排会话历史（默认）
+   * - 'isolated': 仅使用当前轮输入，避免项目/编排历史污染简单问答
+   */
+  historyMode?: 'session' | 'isolated';
+
   /** 是否包含工具调用信息 */
   includeToolCalls?: boolean;
+
+  /**
+   * 临时允许的工具白名单（仅对当前请求生效）
+   * - 未提供：沿用适配器默认工具面
+   * - 提供空数组：等价于不允许任何工具
+   */
+  allowedToolNames?: string[];
 
   /** 消息来源标识 */
   source?: 'orchestrator' | 'worker' | 'user';
@@ -52,6 +71,24 @@ export interface AdapterOutputScope {
    * 取代已废弃的全局 requestContext，从架构源头消除并发竞态。
    */
   requestId?: string;
+
+  /**
+   * 当前输出流的显式归属元数据。
+   * Worker 普通流式输出必须通过该字段绑定 assignment/request，
+   * 前端禁止再依赖消息类型或到达位置猜测归属。
+   */
+  messageMetadata?: Pick<
+    MessageMetadata,
+    | 'assignmentId'
+    | 'missionId'
+    | 'requestId'
+    | 'worker'
+    | 'sessionId'
+    | 'turnId'
+    | 'dispatchWaveId'
+    | 'laneId'
+    | 'workerCardId'
+  >;
 
   /**
    * 工具执行上下文（可选）
@@ -257,4 +294,14 @@ export interface IAdapterFactory extends EventEmitter {
    * 查询当前是否处于深度任务模式
    */
   isDeepTask(): boolean;
+
+  /**
+   * 获取当前用户请求的规划模式
+   */
+  getRequestedPlanningMode(): PlanMode;
+
+  /**
+   * 获取编排模型的自治能力
+   */
+  getOrchestratorModelCapability?(): ModelAutonomyCapability;
 }

@@ -26,11 +26,12 @@ export interface CommandHandlerContext {
   getAdapterFactory(): IAdapterFactory;
   getOrchestratorEngine(): MissionDrivenEngine;
   getProjectKnowledgeBase(): ProjectKnowledgeBase | undefined;
+  ensureProjectKnowledgeBaseReady(): Promise<ProjectKnowledgeBase | undefined>;
   getWorkspaceRoot(): string;
   getPromptEnhancer(): PromptEnhancerService;
   getExtensionUri(): vscode.Uri;
-  /** 配置变更后刷新模型状态（清除缓存 + 强制重新检测） */
-  refreshWorkerStatus(): void;
+  /** 配置变更后统一回刷 settingsBootstrapLoaded 单快照。 */
+  refreshSettingsBootstrap(force?: boolean): Promise<void>;
 }
 
 /**

@@ -22,6 +22,7 @@ import { WorkerSlot } from '../../types';
 import { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import { AdapterOutputScope } from '../../adapters/adapter-factory-interface';
 import { TokenUsage } from '../../types/agent-types';
+import type { GovernedKnowledgeAuditMetadata } from '../../knowledge/governed-knowledge-context-service';
 import { ProfileLoader } from '../profile/profile-loader';
 import type { SnapshotManager } from '../../snapshot-manager';
 import { GuidanceInjector } from '../profile/guidance-injector';
@@ -164,6 +165,8 @@ export interface AutonomousExecutionResult {
   recoveryAttempts: number;
   /** 结构化执行总结（成功/失败均有），由 buildStructuredSummary 生成 */
   summary: string;
+  /** 完整执行总结（用于详情展示与持久化恢复） */
+  fullSummary: string;
   /** Token 使用统计 */
   tokenUsage?: TokenUsage;
   /** Session ID（用于后续恢复） - 提案 4.1 */
@@ -185,6 +188,7 @@ type AssignmentAbortSource = 'external';
  * AutonomousWorker - 自主 Worker
  */
 export class AutonomousWorker extends EventEmitter {
+  private static readonly WORKER_SUMMARY_PREVIEW_MAX_CHARS = 180;
   private static readonly LOW_SIGNAL_COMPLETION_SUMMARIES = new Set([
     '工具执行已完成，但模型未输出文本结论。请查看上方工具结果。',
     'Execution completed',
@@ -299,8 +303,8 @@ export class AutonomousWorker extends EventEmitter {
     mode: 'feature' | 'project';
     maxReviewRounds: number;
   } {
-    const deepTaskEnabled = options.adapterFactory?.isDeepTask() ?? false;
-    if (deepTaskEnabled) {
+    const planningMode = options.adapterScope?.planningMode ?? 'standard';
+    if (planningMode === 'deep') {
       return {
         mode: 'project',
         maxReviewRounds: 8,
@@ -343,7 +347,15 @@ export class AutonomousWorker extends EventEmitter {
     // 优先使用 Pipeline 预组装的结果，避免重复调用 contextAssembler.assemble()
     const sharedContext = options.preAssembledContext ?? await this.assembleSharedContext(
       assignment.missionId,
-      assignment.scope.includes || []
+      assignment.scope.includes || [],
+      {
+        consumer: 'autonomous_worker',
+        sessionId: options.sessionId,
+        missionId: assignment.missionId,
+        assignmentId: assignment.id,
+        agentId: this.workerType,
+        workerId: this.workerType,
+      },
     );
 
     // Session 管理 - 提案 4.1
@@ -374,6 +386,7 @@ export class AutonomousWorker extends EventEmitter {
           sessionId: session.id,
           assignmentId: assignment.id,
           completedTodos: session.completedTodos.length,
+          trace: assignment.trace,
         });
       } else {
         logger.warn('Worker.Session.恢复失败.不存在', {
@@ -398,6 +411,7 @@ export class AutonomousWorker extends EventEmitter {
       this.emit('sessionCreated', {
         sessionId: session.id,
         assignmentId: assignment.id,
+        trace: assignment.trace,
       });
     }
 
@@ -410,6 +424,7 @@ export class AutonomousWorker extends EventEmitter {
       missionId: assignment.missionId,
       sessionId: session.id,
       isResuming,
+      trace: assignment.trace,
     });
     logger.info('Worker.Assignment.开始', {
       assignmentId: assignment.id,
@@ -435,6 +450,7 @@ export class AutonomousWorker extends EventEmitter {
         sessionId: session.id,
         timestamp: Date.now(),
         todoId: heartbeatTodoId,
+        trace: assignment.trace,
       });
     };
     const heartbeatTimer = setInterval(emitHeartbeat, heartbeatIntervalMs);
@@ -775,6 +791,7 @@ export class AutonomousWorker extends EventEmitter {
         errors: resultErrors,
         recoveryAttempts: session?.stateSnapshot.retryCount || 0,
         summary: '', // 占位，qualityGate 后由 buildStructuredSummary 填充
+        fullSummary: '', // 占位，qualityGate 后由 buildStructuredSummary(detail=full) 填充
         tokenUsage: totalTokenUsage,
         sessionId: session?.id,
         hasPendingApprovals, // 返回 pendingApproval 状态
@@ -786,7 +803,8 @@ export class AutonomousWorker extends EventEmitter {
         },
       };
       const qualityCheckedResult = this.applyQualityGate(assignment, result, sharedContext, startTime);
-      qualityCheckedResult.summary = this.buildStructuredSummary(qualityCheckedResult);
+      qualityCheckedResult.summary = this.buildStructuredSummary(qualityCheckedResult, 'preview');
+      qualityCheckedResult.fullSummary = this.buildStructuredSummary(qualityCheckedResult, 'full');
 
       // 清理当前 Session 引用
       this.currentSession = null;
@@ -815,6 +833,7 @@ export class AutonomousWorker extends EventEmitter {
           ])],
           createdFiles: [],
           summary: qualityCheckedResult.summary,
+          fullSummary: qualityCheckedResult.fullSummary,
           totalDuration: qualityCheckedResult.totalDuration,
           tokenUsage: totalTokenUsage.inputTokens > 0 ? {
             inputTokens: totalTokenUsage.inputTokens,
@@ -843,6 +862,7 @@ export class AutonomousWorker extends EventEmitter {
         success: qualityCheckedResult.success,
         summary: qualityCheckedResult.summary,
         result: qualityCheckedResult,
+        trace: assignment.trace,
       });
       logger.info('Worker.Assignment.完成', {
         assignmentId: assignment.id,
@@ -935,15 +955,19 @@ export class AutonomousWorker extends EventEmitter {
    * 生成结构化 Worker 总结
    *
    * 从 AutonomousExecutionResult 中提取关键信息，无论成功或失败都输出有意义的总结。
-   * 用于 WorkerResult.summary → Orchestrator Phase C 汇总。
+   * - preview: 卡片/汇总使用的紧凑摘要
+   * - full: 详情弹层/持久化恢复使用的完整总结
    */
-  private buildStructuredSummary(result: AutonomousExecutionResult): string {
+  private buildStructuredSummary(
+    result: AutonomousExecutionResult,
+    detailLevel: 'preview' | 'full' = 'preview',
+  ): string {
     const sections: string[] = [];
 
     // 1. 完成的工作
     if (result.completedTodos.length > 0) {
       const completedLines = result.completedTodos.map(t => {
-        const action = this.buildTodoDisplaySummary(t);
+        const action = this.buildTodoDisplaySummary(t, undefined, detailLevel);
         return `- ${action}`;
       });
       sections.push(`Completed ${result.completedTodos.length} step(s):\n${completedLines.join('\n')}`);
@@ -952,9 +976,8 @@ export class AutonomousWorker extends EventEmitter {
     // 2. 失败的工作
     if (result.failedTodos.length > 0) {
       const failedLines = result.failedTodos.map(t => {
-        const reason = this.buildTodoDisplaySummary(t, t.blockedReason || 'Unknown reason');
-        const shortReason = reason.length > 80 ? reason.substring(0, 80) + '...' : reason;
-        return `- ${t.content}: ${shortReason}`;
+        const reason = this.buildTodoDisplaySummary(t, t.blockedReason || 'Unknown reason', detailLevel);
+        return `- ${t.content}: ${reason}`;
       });
       sections.push(`Failed ${result.failedTodos.length} step(s):\n${failedLines.join('\n')}`);
     }
@@ -1120,6 +1143,7 @@ If any criterion is not satisfied:
       const todo = await this.todoManager.create({
         missionId: assignment.missionId,
         assignmentId: assignment.id,
+        trace: assignment.trace,
         source: 'review_fix',
         content: gap.fix,
         type: 'fix',
@@ -1364,10 +1388,17 @@ If any criterion is not satisfied:
     return content.trim().replace(/\s+/g, ' ').toLowerCase();
   }
 
-  private buildTodoDisplaySummary(todo: UnifiedTodo, fallback?: string): string {
+  private buildTodoDisplaySummary(
+    todo: UnifiedTodo,
+    fallback?: string,
+    detailLevel: 'preview' | 'full' = 'preview',
+  ): string {
     const rawSummary = typeof todo.output?.summary === 'string' ? todo.output.summary.trim() : '';
     if (rawSummary && !this.isLowSignalTodoSummary(rawSummary) && !this.isPureAcceptanceJson(rawSummary)) {
-      return rawSummary.length > 120 ? `${rawSummary.substring(0, 120)}...` : rawSummary;
+      if (detailLevel === 'full') {
+        return rawSummary;
+      }
+      return this.buildTodoPreviewSummary(rawSummary);
     }
 
     const modifiedFiles = Array.from(new Set((todo.output?.modifiedFiles || []).filter(Boolean)));
@@ -1378,6 +1409,49 @@ If any criterion is not satisfied:
     }
 
     return fallback || todo.content;
+  }
+
+  private buildTodoPreviewSummary(summary: string): string {
+    const meaningfulLines = summary
+      .split(/\r?\n/)
+      .map((line) => this.normalizePreviewLine(line))
+      .filter((line) => this.isMeaningfulPreviewLine(line));
+
+    const preferredLine = meaningfulLines[0]
+      || this.normalizePreviewLine(summary.replace(/\s+/g, ' '));
+
+    return this.truncatePreviewText(preferredLine);
+  }
+
+  private normalizePreviewLine(line: string): string {
+    return line
+      .replace(/^#{1,6}\s+/, '')
+      .replace(/^[-*+]\s+/, '')
+      .replace(/^\d+\.\s+/, '')
+      .replace(/^>\s+/, '')
+      .replace(/`+/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private isMeaningfulPreviewLine(line: string): boolean {
+    if (!line) {
+      return false;
+    }
+    if (line === '```') {
+      return false;
+    }
+    if (/^[-|:\s]+$/.test(line)) {
+      return false;
+    }
+    return true;
+  }
+
+  private truncatePreviewText(value: string): string {
+    if (value.length <= AutonomousWorker.WORKER_SUMMARY_PREVIEW_MAX_CHARS) {
+      return value;
+    }
+    return `${value.slice(0, AutonomousWorker.WORKER_SUMMARY_PREVIEW_MAX_CHARS - 3).trimEnd()}...`;
   }
 
   private isLowSignalTodoSummary(summary: string): boolean {
@@ -1451,9 +1525,11 @@ If any criterion is not satisfied:
       try {
         this.emit('todoFailed', {
           assignmentId: assignment.id,
+          missionId: assignment.missionId,
           todoId: updated.id,
           content: updated.content,
           error: reason,
+          trace: updated.trace,
         });
       } catch (emitError) {
         logger.warn('Worker.Todo.强制终止事件发送失败（忽略）', {
@@ -1594,6 +1670,7 @@ If any criterion is not satisfied:
       missionId: assignment.missionId,
       todoId: currentTodo.id,
       content: currentTodo.content,
+      trace: currentTodo.trace,
     });
 
     try {
@@ -1688,6 +1765,7 @@ If any criterion is not satisfied:
           todoId: currentTodo.id,
           content: currentTodo.content,
           output: currentTodo.output,
+          trace: currentTodo.trace,
         });
       } catch (emitError) {
         logger.warn('Worker.Todo.完成事件发送失败（忽略）', {
@@ -1736,6 +1814,7 @@ If any criterion is not satisfied:
           todoId: currentTodo.id,
           content: currentTodo.content,
           error: userMessage,
+          trace: currentTodo.trace,
         });
       } catch (emitError) {
         logger.warn('Worker.Todo.失败事件发送失败（忽略）', {
@@ -1823,6 +1902,8 @@ If any criterion is not satisfied:
 If the current task involves multiple independently completable and verifiable sub-goals, you may use todo_split to break it into sub-steps.
 Applicable: The task contains multiple independent sub-goals where each sub-step can be completed and verified individually.
 When using todo_split, each child step must include a concrete expected_output. If the likely target files are already known, include target_files as well.
+todo_split only refines execution inside the current Assignment. Do not use it to re-route work across ownership boundaries such as splitting one step into separate frontend/backend implementation tracks.
+If you discover the work actually belongs to another ownership domain, report the mismatch instead of trying to repair it through child Todos.
 Do not split into more than 8 steps, and do not mechanically break one continuous action into many tiny steps.
 Not applicable: The task itself is a single goal — execute it directly.`);
     }
@@ -2656,6 +2737,7 @@ Not applicable: The task itself is a single goal — execute it directly.`);
     const todo = await this.todoManager.create({
       missionId: assignment.missionId,
       assignmentId: assignment.id,
+      trace: assignment.trace,
       parentId,
       source,
       content,
@@ -2668,6 +2750,7 @@ Not applicable: The task itself is a single goal — execute it directly.`);
       assignmentId: assignment.id,
       missionId: assignment.missionId,
       todo,
+      trace: todo.trace,
     });
 
     return todo;
@@ -2682,6 +2765,7 @@ Not applicable: The task itself is a single goal — execute it directly.`);
       missionId: this.currentMissionId,
       content: todo.content,
       reason,
+      trace: todo.trace,
     });
   }
 
@@ -2802,7 +2886,15 @@ Not applicable: The task itself is a single goal — execute it directly.`);
           const recoveryTags = targetAssignment.scope.includes || [];
           const recoverySharedContext = await this.assembleSharedContext(
             targetAssignment.missionId,
-            recoveryTags
+            recoveryTags,
+            {
+              consumer: 'autonomous_worker_recovery',
+              sessionId: this.currentSession?.id,
+              missionId: targetAssignment.missionId,
+              assignmentId: targetAssignment.id,
+              agentId: this.workerType,
+              workerId: this.workerType,
+            },
           );
           const executeResult = await this.executeTodo(
             targetTodo,
@@ -3071,7 +3163,8 @@ Not applicable: The task itself is a single goal — execute it directly.`);
    */
   async assembleSharedContext(
     missionId: string,
-    tags: string[] = []
+    tags: string[] = [],
+    knowledgeAudit: GovernedKnowledgeAuditMetadata = {},
   ): Promise<AssembledContext | null> {
     try {
       // 强制依赖已保证 contextAssembler 可用
@@ -3088,6 +3181,10 @@ Not applicable: The task itself is a single goal — execute it directly.`);
           contractsRatio: 0.15,
           localWindowRatio: 0.40,
           longTermMemoryRatio: 0.10,
+        },
+        knowledgeAudit: {
+          purpose: 'project_context',
+          ...knowledgeAudit,
         },
       });
 

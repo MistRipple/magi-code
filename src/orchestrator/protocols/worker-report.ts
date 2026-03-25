@@ -94,6 +94,9 @@ export interface WorkerResult {
   /** 执行摘要 */
   summary: string;
 
+  /** 完整执行总结（用于详情展示） */
+  fullSummary?: string;
+
   /** 总耗时(ms) */
   totalDuration: number;
 
@@ -377,6 +380,7 @@ export function createFailedReport(
       modifiedFiles: result.modifiedFiles || [],
       createdFiles: result.createdFiles || [],
       summary: result.summary || '',
+      fullSummary: result.fullSummary || '',
       totalDuration: result.totalDuration || 0,
     } : undefined,
   };

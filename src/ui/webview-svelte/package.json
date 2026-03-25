@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:web": "vite --config vite.web.config.ts",
     "build": "vite build",
+    "build:web": "vite build --config vite.web.config.ts",
     "build:watch": "vite build --watch",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json"
@@ -20,8 +22,10 @@
     "vite": "^6.3.5"
   },
   "dependencies": {
+    "@types/qrcode": "^1.5.6",
     "highlight.js": "^11.11.1",
     "marked": "^17.0.1",
-    "mermaid": "^11.12.2"
+    "mermaid": "^11.12.2",
+    "qrcode": "^1.5.4"
   }
 }

@@ -5,10 +5,11 @@
 
 import { logger, LogCategory } from '../logging';
 import { spawn } from 'child_process';
-import * as vscode from 'vscode';
 import { globalEventBus } from '../events';
 import * as fs from 'fs';
 import * as path from 'path';
+import type { DiagnosticsHost } from '../host';
+import type { WorkspaceFolderInfo } from '../workspace/workspace-roots';
 
 /** 验证配置 */
 export interface VerificationConfig {
@@ -77,15 +78,36 @@ const DEFAULT_CONFIG: VerificationConfig = {
   timeout: 60000,
 };
 
+const NON_BLOCKING_WARNING_PATTERNS: RegExp[] = [
+  /自动跳过编译检查/i,
+  /未找到可用编译命令（缺少 scripts\.compile\/scripts\.typecheck 与 tsconfig\.json）/i,
+  /missing scripts\.compile\/scripts\.typecheck.*tsconfig\.json/i,
+];
+
+export function isNonBlockingVerificationWarning(warning: string): boolean {
+  const normalized = typeof warning === 'string' ? warning.trim() : '';
+  if (!normalized) return false;
+  return NON_BLOCKING_WARNING_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
 /**
  * 验证执行器
  */
 export class VerificationRunner {
   private config: VerificationConfig;
   private workspaceRoot: string;
+  private readonly diagnosticsHost?: DiagnosticsHost;
+  private readonly workspaceFolders: WorkspaceFolderInfo[];
 
-  constructor(workspaceRoot: string, config?: Partial<VerificationConfig>) {
+  constructor(
+    workspaceRoot: string,
+    diagnosticsHost?: DiagnosticsHost,
+    config?: Partial<VerificationConfig>,
+    workspaceFolders: WorkspaceFolderInfo[] = [],
+  ) {
     this.workspaceRoot = workspaceRoot;
+    this.diagnosticsHost = diagnosticsHost;
+    this.workspaceFolders = [...workspaceFolders];
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
 
@@ -123,7 +145,10 @@ export class VerificationRunner {
       }
       if (result.compileResult.warnings && result.compileResult.warnings.length > 0) {
         result.warnings?.push(...result.compileResult.warnings);
-        summaryParts.push(`编译告警: ${result.compileResult.warnings.join('；')}`);
+        const userFacingWarnings = result.compileResult.warnings.filter((item) => !isNonBlockingVerificationWarning(item));
+        if (userFacingWarnings.length > 0) {
+          summaryParts.push(`编译告警: ${userFacingWarnings.join('；')}`);
+        }
       }
     }
 
@@ -236,38 +261,31 @@ export class VerificationRunner {
     };
 
     try {
-      // 获取所有诊断信息
-      const allDiagnostics = vscode.languages.getDiagnostics();
+      const diagnostics = this.diagnosticsHost
+        ? await this.diagnosticsHost.getDiagnostics()
+        : [];
 
-      for (const [uri, diagnostics] of allDiagnostics) {
-        // 如果指定了修改的文件，只检查这些文件
+      for (const diagnostic of diagnostics) {
         if (modifiedFiles && modifiedFiles.length > 0) {
-          const filePath = uri.fsPath;
-          const isModified = modifiedFiles.some(f =>
-            filePath.endsWith(f) || filePath.includes(f)
-          );
-          if (!isModified) continue;
-        }
-
-        for (const diagnostic of diagnostics) {
-          if (diagnostic.severity === vscode.DiagnosticSeverity.Error) {
-            result.errors++;
-            result.details.push({
-              file: uri.fsPath,
-              line: diagnostic.range.start.line + 1,
-              message: diagnostic.message,
-              severity: 'error',
-            });
-          } else if (diagnostic.severity === vscode.DiagnosticSeverity.Warning) {
-            result.warnings++;
-            result.details.push({
-              file: uri.fsPath,
-              line: diagnostic.range.start.line + 1,
-              message: diagnostic.message,
-              severity: 'warning',
-            });
+          const isModified = modifiedFiles.some((file) =>
+            diagnostic.file.endsWith(file) || diagnostic.file.includes(file));
+          if (!isModified) {
+            continue;
           }
         }
+
+        if (diagnostic.severity === 'error') {
+          result.errors++;
+        } else if (diagnostic.severity === 'warning') {
+          result.warnings++;
+        }
+
+        result.details.push({
+          file: diagnostic.file,
+          line: diagnostic.line,
+          message: diagnostic.message,
+          severity: diagnostic.severity,
+        });
       }
 
       result.success = result.errors === 0;
@@ -349,7 +367,7 @@ export class VerificationRunner {
       projectRoots,
       name: '编译',
       resolveCommand: (root) => this.resolveCompileCommand(root),
-      missingCommandMessage: '未找到可用编译命令（缺少 scripts.compile/scripts.typecheck 与 tsconfig.json）',
+      missingCommandMessage: '自动跳过编译检查：未检测到 scripts.compile/scripts.typecheck 与 tsconfig.json（不阻断执行）',
       missingCommandPolicy: this.config.compileMissingCommandPolicy,
     });
   }
@@ -435,19 +453,19 @@ export class VerificationRunner {
       return path.resolve(trimmed);
     }
 
-    const workspaceFolders = vscode.workspace.workspaceFolders || [];
+    const workspaceFolders = this.workspaceFolders;
     const separatorIndex = trimmed.indexOf('/');
     if (separatorIndex > 0) {
       const workspaceName = trimmed.slice(0, separatorIndex);
       const relativePath = trimmed.slice(separatorIndex + 1);
-      const matchedFolder = workspaceFolders.find(folder => folder.name === workspaceName);
+      const matchedFolder = workspaceFolders.find((folder) => folder.name === workspaceName);
       if (matchedFolder) {
-        return path.resolve(matchedFolder.uri.fsPath, relativePath);
+        return path.resolve(matchedFolder.path, relativePath);
       }
     }
 
     for (const folder of workspaceFolders) {
-      const candidate = path.resolve(folder.uri.fsPath, trimmed);
+      const candidate = path.resolve(folder.path, trimmed);
       if (fs.existsSync(candidate)) {
         return candidate;
       }
@@ -495,13 +513,77 @@ export class VerificationRunner {
     const scripts = this.readPackageScripts(cwd);
     if (scripts.compile) return 'npm run compile';
     if (scripts.typecheck) return 'npm run typecheck';
+    if (scripts.check) return 'npm run check';
 
     const tsconfigPath = path.join(cwd, 'tsconfig.json');
     if (fs.existsSync(tsconfigPath)) {
       return `npx tsc --noEmit -p \"${tsconfigPath}\"`;
     }
 
+    // 自动处理：未定义 compile/typecheck，但存在 build 时直接复用 build 验证
+    if (scripts.build) return 'npm run build';
+
+    // 自动处理：TypeScript 项目缺少 tsconfig/scripts 时，使用临时类型检查命令继续推进
+    const transientTypecheck = this.resolveTransientTypecheckCommand(cwd);
+    if (transientTypecheck) {
+      return transientTypecheck;
+    }
+
     return null;
+  }
+
+  private resolveTransientTypecheckCommand(cwd: string): string | null {
+    if (!this.hasTypeScriptSource(cwd)) {
+      return null;
+    }
+    // 不修改用户工程文件：通过 npx 临时拉起 tsc 做 noEmit 校验
+    return 'npx --yes -p typescript tsc --noEmit --skipLibCheck --pretty false --jsx preserve';
+  }
+
+  private hasTypeScriptSource(cwd: string): boolean {
+    const maxVisitedDirs = 800;
+    const skipDirs = new Set([
+      'node_modules',
+      '.git',
+      '.hg',
+      '.svn',
+      'dist',
+      'build',
+      'out',
+      '.next',
+      '.nuxt',
+      '.cache',
+      'coverage',
+    ]);
+    const tsExtensions = ['.ts', '.tsx', '.mts', '.cts'];
+    const queue: string[] = [cwd];
+    let visited = 0;
+
+    while (queue.length > 0 && visited < maxVisitedDirs) {
+      const current = queue.pop() as string;
+      visited += 1;
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(current, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+
+      for (const entry of entries) {
+        const entryPath = path.join(current, entry.name);
+        if (entry.isDirectory()) {
+          if (skipDirs.has(entry.name)) continue;
+          queue.push(entryPath);
+          continue;
+        }
+        if (!entry.isFile()) continue;
+        const lower = entry.name.toLowerCase();
+        if (tsExtensions.some((ext) => lower.endsWith(ext))) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   private resolveLintCommand(cwd: string): string | null {

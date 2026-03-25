@@ -54,22 +54,35 @@ export interface NormalizerEvents {
 export interface ParseContext {
   messageId: string;
   traceId: string;
+  metadata: Record<string, unknown>;
   rawBuffer: string;
   blocks: ContentBlock[];
   pendingText: string;
   hasAssistantText: boolean;
   pendingThinking: string | null;
   thinkingBlockId?: string;
+  thinkingBlockSeq: number;
   activeToolCalls: Map<string, ToolCallBlock>;
   interaction: InteractionRequest | null;
-  startTime: number;
+  durationStartAt: number;
   visibility?: 'user' | 'system' | 'debug';
+}
+
+function normalizePositiveTimestamp(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return undefined;
+  }
+  const normalized = Math.floor(value);
+  return normalized > 0 ? normalized : undefined;
 }
 
 /**
  * LLM Normalizer 抽象基类
  */
 export abstract class BaseNormalizer extends EventEmitter {
+  private static readonly USER_HIDDEN_TOOL_NAMES = new Set<string>([
+    'context_compact',
+  ]);
   protected config: NormalizerConfig;
   protected activeContexts: Map<string, ParseContext> = new Map();
 
@@ -82,7 +95,24 @@ export abstract class BaseNormalizer extends EventEmitter {
     return this.config.agent;
   }
 
-  startStream(traceId: string, source?: MessageSource, messageIdOverride?: string, visibility?: 'user' | 'system' | 'debug'): string {
+  private buildCanonicalMetadata(metadata: Record<string, unknown> | undefined, durationStartAt: number): Record<string, unknown> {
+    return {
+      ...(metadata ? { ...metadata } : {}),
+      // 时间轴锚点必须在 stream 创建时一次性确定。
+      // 后续 UPDATE / COMPLETE 只能复用，禁止再次发明另一套排序事实。
+      timelineAnchorTimestamp: normalizePositiveTimestamp(metadata?.timelineAnchorTimestamp) || durationStartAt,
+    };
+  }
+
+  private buildFinalMetadata(context: ParseContext, error?: string): Record<string, unknown> {
+    return {
+      ...context.metadata,
+      duration: Date.now() - context.durationStartAt,
+      error,
+    };
+  }
+
+  startStream(traceId: string, source?: MessageSource, messageIdOverride?: string, visibility?: 'user' | 'system' | 'debug', metadata?: Record<string, unknown>): string {
     const normalizedId = typeof messageIdOverride === 'string' && messageIdOverride.trim()
       ? messageIdOverride.trim()
       : undefined;
@@ -90,18 +120,22 @@ export abstract class BaseNormalizer extends EventEmitter {
     if (this.activeContexts.has(messageId)) {
       throw new Error(`[${this.agent}] Stream messageId already active: ${messageId}`);
     }
+    const durationStartAt = Date.now();
+    const canonicalMetadata = this.buildCanonicalMetadata(metadata, durationStartAt);
     const context: ParseContext = {
       messageId,
       traceId,
+      metadata: canonicalMetadata,
       rawBuffer: '',
       blocks: [],
       pendingText: '',
       hasAssistantText: false,
       pendingThinking: null,
       thinkingBlockId: undefined,
+      thinkingBlockSeq: 0,
       activeToolCalls: new Map(),
       interaction: null,
-      startTime: Date.now(),
+      durationStartAt,
       visibility,
     };
 
@@ -109,9 +143,15 @@ export abstract class BaseNormalizer extends EventEmitter {
 
     const message = createStreamingMessage(
       source || this.config.defaultSource,
-      this.config.agent,  // ✅ 使用 agent
+      this.config.agent,
       traceId,
-      { id: messageId, visibility: visibility || 'user' }
+      {
+        id: messageId,
+        visibility: visibility || 'user',
+        // started message 必须携带 canonical metadata，
+        // 让 live / restore / complete 共用同一事件事实源。
+        metadata: canonicalMetadata,
+      }
     );
 
     this.emit(MESSAGE_EVENTS.MESSAGE, message);
@@ -147,6 +187,7 @@ export abstract class BaseNormalizer extends EventEmitter {
       return;
     }
     if (!delta) return;
+    this.flushPendingThinkingToBlocks(context, 'processTextDelta');
     context.pendingText += delta;
     context.hasAssistantText = true;
     const update = this.createUpdate(messageId, 'append', { appendText: delta });
@@ -171,7 +212,7 @@ export abstract class BaseNormalizer extends EventEmitter {
 
     // 生成 thinking block ID（如果还没有）
     if (!context.thinkingBlockId) {
-      context.thinkingBlockId = `${messageId}-thinking`;
+      context.thinkingBlockId = this.allocateThinkingBlockId(context);
     }
 
     // 发送 thinking 更新
@@ -255,27 +296,16 @@ export abstract class BaseNormalizer extends EventEmitter {
 
   // 辅助方法
   protected buildFinalMessage(context: ParseContext, error?: string): StandardMessage {
+    this.flushPendingTextToBlocks(context);
+    this.flushPendingThinkingToBlocks(context, 'buildFinalMessage');
     const blocks = this.sanitizeBlocks([...context.blocks], 'buildFinalMessage');
 
-    if (context.pendingText.trim()) {
-      const parsedBlocks = parseContentToBlocks(context.pendingText.trim());
-
-      if (parsedBlocks.length > 0) {
-        blocks.push(...this.sanitizeBlocks(parsedBlocks, 'buildFinalMessage.pendingText'));
-      }
-    }
-
-    if (context.pendingThinking) {
-      blocks.push({ type: 'thinking', content: context.pendingThinking } as ThinkingBlock);
-    }
-
     for (const toolCall of context.activeToolCalls.values()) {
+      if (!this.isUserVisibleToolBlock(toolCall, context.visibility)) {
+        continue;
+      }
       blocks.push(toolCall);
     }
-
-    // 按语义顺序排序：thinking → text → plan → tool_call
-    const typeOrder: Record<string, number> = { thinking: 0, text: 1, plan: 2, tool_call: 3 };
-    blocks.sort((a, b) => (typeOrder[a.type] ?? 1) - (typeOrder[b.type] ?? 1));
 
     let messageType = MessageType.TEXT;
     if (error) {
@@ -304,7 +334,7 @@ export abstract class BaseNormalizer extends EventEmitter {
       blocks: safeBlocks,
       interaction: context.interaction || undefined,
       visibility: context.visibility || 'user',
-      metadata: { duration: Date.now() - context.startTime, error },
+      metadata: this.buildFinalMetadata(context, error),
     });
   }
 
@@ -333,6 +363,34 @@ export abstract class BaseNormalizer extends EventEmitter {
     }
   }
 
+  protected flushPendingTextToBlocks(context: ParseContext, reason = 'flushPendingTextToBlocks'): void {
+    if (!context.pendingText.trim()) {
+      return;
+    }
+
+    const parsedBlocks = parseContentToBlocks(context.pendingText.trim());
+    if (parsedBlocks.length > 0) {
+      context.blocks.push(...this.sanitizeBlocks(parsedBlocks, `${reason}.pendingText`));
+    }
+    context.pendingText = '';
+  }
+
+  protected allocateThinkingBlockId(context: ParseContext): string {
+    context.thinkingBlockSeq += 1;
+    return `${context.messageId}-thinking-${context.thinkingBlockSeq}`;
+  }
+
+  protected flushPendingThinkingToBlocks(context: ParseContext, reason = 'flushPendingThinkingToBlocks'): void {
+    if (!context.pendingThinking?.trim()) {
+      return;
+    }
+
+    this.addThinkingBlock(context, context.pendingThinking, undefined, context.thinkingBlockId);
+    context.pendingThinking = null;
+    context.thinkingBlockId = undefined;
+    this.debug(`[${this.agent}] thinking 段已固化: ${reason}`);
+  }
+
   protected addThinkingBlock(context: ParseContext, content: string, summary?: string, blockId?: string): void {
     if (content.trim()) {
       context.blocks.push({ type: 'thinking', content: content.trim(), summary, blockId } as ThinkingBlock);
@@ -340,6 +398,10 @@ export abstract class BaseNormalizer extends EventEmitter {
   }
 
   protected upsertToolCall(context: ParseContext, toolCall: ToolCallBlock): void {
+    // 保持最终消息与流式 UI 一致：工具调用开始前，先把已有文本正式落块，
+    // 避免 buildFinalMessage 时按完成时机把工具卡“挪到底部”。
+    this.flushPendingThinkingToBlocks(context, 'upsertToolCall');
+    this.flushPendingTextToBlocks(context, 'upsertToolCall');
     context.activeToolCalls.set(toolCall.toolId, toolCall);
   }
 
@@ -354,6 +416,9 @@ export abstract class BaseNormalizer extends EventEmitter {
       return;
     }
     this.upsertToolCall(context, toolCall);
+    if (!this.isUserVisibleToolBlock(toolCall, context.visibility)) {
+      return;
+    }
     // 发送更新通知
     const update = this.createUpdate(messageId, 'block_update', { blocks: [toolCall] });
     this.emit(MESSAGE_EVENTS.UPDATE, update);
@@ -384,9 +449,20 @@ export abstract class BaseNormalizer extends EventEmitter {
     const input = originalTool?.input;
 
     const normalizedOutcome = this.normalizeToolCompletionOutcome(output, error, standardized);
-    this.completeToolCall(context, toolId, normalizedOutcome.output, normalizedOutcome.error, standardized);
+    const isUserVisibleTool = this.isUserVisibleToolName(toolName, context.visibility);
+    this.completeToolCall(
+      context,
+      toolId,
+      normalizedOutcome.output,
+      normalizedOutcome.error,
+      standardized,
+      isUserVisibleTool,
+    );
 
     // 发送 UPDATE 事件，通知前端工具执行完成状态（保留原始 toolName 和 input，避免 mergeBlocks 覆盖）
+    if (!isUserVisibleTool) {
+      return;
+    }
     const update = this.createUpdate(messageId, 'block_update', {
       blocks: [{
         type: 'tool_call',
@@ -403,6 +479,48 @@ export abstract class BaseNormalizer extends EventEmitter {
 
     // 文件变更工具执行成功后，自动附加 file_change block 供前端展示差异化面板
     if (!error && fileChange) {
+      this.addFileChangeBlock(messageId, fileChange.filePath, fileChange.changeType, fileChange.additions, fileChange.deletions, fileChange.diff);
+    }
+  }
+
+  public settleToolCallBlock(
+    messageId: string,
+    toolCall: ToolCallBlock,
+    fileChange?: FileChangeMetadata,
+  ): void {
+    const context = this.activeContexts.get(messageId);
+    if (!context) {
+      this.debug(`[${this.agent}] settleToolCallBlock: 未找到消息上下文: ${messageId}`);
+      return;
+    }
+
+    const originalTool = context.activeToolCalls.get(toolCall.toolId);
+    const finalizedToolCall: ToolCallBlock = {
+      ...(originalTool || {
+        type: 'tool_call',
+        toolName: toolCall.toolName,
+        toolId: toolCall.toolId,
+        status: toolCall.status,
+      }),
+      ...toolCall,
+      input: toolCall.input ?? originalTool?.input,
+      output: toolCall.output ?? originalTool?.output,
+      error: toolCall.error ?? originalTool?.error,
+      standardized: toolCall.standardized ?? originalTool?.standardized,
+    };
+    const isUserVisibleTool = this.isUserVisibleToolBlock(finalizedToolCall, context.visibility);
+
+    if (isUserVisibleTool) {
+      context.blocks.push(finalizedToolCall);
+      const update = this.createUpdate(messageId, 'block_update', {
+        blocks: [finalizedToolCall],
+      });
+      this.emit(MESSAGE_EVENTS.UPDATE, update);
+    }
+
+    context.activeToolCalls.delete(toolCall.toolId);
+
+    if (!finalizedToolCall.error && fileChange) {
       this.addFileChangeBlock(messageId, fileChange.filePath, fileChange.changeType, fileChange.additions, fileChange.deletions, fileChange.diff);
     }
   }
@@ -434,6 +552,8 @@ export abstract class BaseNormalizer extends EventEmitter {
       diff,
     } as ContentBlock;
 
+    this.flushPendingThinkingToBlocks(context, 'addFileChangeBlock');
+    this.flushPendingTextToBlocks(context, 'addFileChangeBlock');
     context.blocks.push(block);
 
     const update = this.createUpdate(messageId, 'block_update', { blocks: [block] });
@@ -446,6 +566,7 @@ export abstract class BaseNormalizer extends EventEmitter {
     output?: string,
     error?: string,
     standardized?: StandardizedToolResultPayload,
+    shouldExposeToUser = true,
   ): void {
     const toolCall = context.activeToolCalls.get(toolId);
     if (toolCall) {
@@ -454,9 +575,31 @@ export abstract class BaseNormalizer extends EventEmitter {
       toolCall.output = normalizedOutcome.output;
       toolCall.error = normalizedOutcome.error;
       toolCall.standardized = standardized;
-      context.blocks.push(toolCall);
+      if (shouldExposeToUser) {
+        context.blocks.push(toolCall);
+      }
       context.activeToolCalls.delete(toolId);
     }
+  }
+
+  protected isUserVisibleToolName(
+    toolName: string,
+    visibility?: 'user' | 'system' | 'debug',
+  ): boolean {
+    if (visibility === 'debug') {
+      return true;
+    }
+    if (visibility === 'system') {
+      return false;
+    }
+    return !BaseNormalizer.USER_HIDDEN_TOOL_NAMES.has((toolName || '').trim());
+  }
+
+  protected isUserVisibleToolBlock(
+    toolCall: ToolCallBlock,
+    visibility?: 'user' | 'system' | 'debug',
+  ): boolean {
+    return this.isUserVisibleToolName(toolCall.toolName, visibility);
   }
 
   private normalizeToolCompletionOutcome(

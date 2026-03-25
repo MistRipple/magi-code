@@ -5,9 +5,10 @@
  */
 
 import { logger, LogCategory } from '../logging';
-import * as vscode from 'vscode';
+import * as fs from 'fs';
 import { globalEventBus } from '../events';
 import { WorkerSlot } from '../types';
+import { atomicWriteFileSync } from '../utils/atomic-write';
 
 /** 执行阶段类型 */
 export type ExecutionPhase = 'planning' | 'execution' | 'verification' | 'integration';
@@ -65,14 +66,14 @@ export interface StatsConfig {
   maxRecords: number;  // 最大记录数
   recentWindow: number;  // 最近窗口大小
   healthThreshold: number;  // 健康阈值（成功率）
-  persistKey: string;  // 持久化键名
+  storagePath: string;  // 持久化文件路径
 }
 
 const DEFAULT_CONFIG: StatsConfig = {
   maxRecords: 1000,
   recentWindow: 10,
   healthThreshold: 0.7,
-  persistKey: 'magi.executionStats',
+  storagePath: '',
 };
 
 /**
@@ -81,21 +82,19 @@ const DEFAULT_CONFIG: StatsConfig = {
 export class ExecutionStats {
   private records: ExecutionRecord[] = [];
   private config: StatsConfig;
-  private context?: vscode.ExtensionContext;
 
   constructor(config?: Partial<StatsConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.loadFromStorage();
   }
 
   /** 更新统计配置 */
   configure(config: Partial<StatsConfig>): void {
+    const previousStoragePath = this.config.storagePath;
     this.config = { ...this.config, ...config };
-  }
-
-  /** 设置扩展上下文（用于持久化） */
-  setContext(context: vscode.ExtensionContext): void {
-    this.context = context;
-    this.loadFromStorage();
+    if (config.storagePath && config.storagePath !== previousStoragePath) {
+      this.loadFromStorage();
+    }
   }
 
   /** 记录一次执行 */
@@ -327,37 +326,51 @@ export class ExecutionStats {
 
   /** 从存储加载数据 */
   private loadFromStorage(): void {
-    if (!this.context) return;
+    const storagePath = this.config.storagePath.trim();
+    if (!storagePath || !fs.existsSync(storagePath)) {
+      return;
+    }
 
     try {
-      const raw = this.context.globalState.get<any>(this.config.persistKey);
+      const raw = JSON.parse(fs.readFileSync(storagePath, 'utf8')) as {
+        records?: ExecutionRecord[];
+      };
       if (raw && typeof raw === 'object' && Array.isArray(raw.records)) {
         this.records = raw.records;
         logger.info('编排器.执行_统计.加载.完成', { count: this.records.length }, LogCategory.ORCHESTRATOR);
       }
     } catch (error) {
-      logger.warn('编排器.执行_统计.加载.失败', error, LogCategory.ORCHESTRATOR);
+      logger.warn('编排器.执行_统计.加载.失败', {
+        storagePath,
+        error: error instanceof Error ? error.message : String(error),
+      }, LogCategory.ORCHESTRATOR);
     }
   }
 
   /** 保存数据到存储 */
-  private async saveToStorage(): Promise<void> {
-    if (!this.context) return;
+  private saveToStorage(): void {
+    const storagePath = this.config.storagePath.trim();
+    if (!storagePath) {
+      return;
+    }
 
     try {
-      await this.context.globalState.update(this.config.persistKey, {
+      atomicWriteFileSync(storagePath, JSON.stringify({
         version: 1,
         records: this.records,
-      });
+      }, null, 2));
     } catch (error) {
-      logger.warn('编排器.执行_统计.保存.失败', error, LogCategory.ORCHESTRATOR);
+      logger.warn('编排器.执行_统计.保存.失败', {
+        storagePath,
+        error: error instanceof Error ? error.message : String(error),
+      }, LogCategory.ORCHESTRATOR);
     }
   }
 
   /** 清除所有统计数据 */
   async clearStats(): Promise<void> {
     this.records = [];
-    await this.saveToStorage();
+    this.saveToStorage();
     logger.info('编排器.执行_统计.已清理', undefined, LogCategory.ORCHESTRATOR);
     globalEventBus.emitEvent('execution:stats_updated', {});
   }

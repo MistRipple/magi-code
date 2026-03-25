@@ -27,8 +27,6 @@ export class CodexNormalizer extends BaseNormalizer {
   private inCodeBlock: boolean = false;
   private codeBlockLang: string = '';
   private jsonBuffer: string = '';
-  private static readonly THINKING_BLOCK_ID = 'codex-thinking';
-
   constructor(config?: Partial<NormalizerConfig>) {
     super({
       agent: 'codex',
@@ -95,6 +93,7 @@ export class CodexNormalizer extends BaseNormalizer {
 
     const text = this.extractText(event);
     if (text) {
+      this.flushPendingThinkingToBlocks(context, 'codex.event_text');
       context.pendingText += text;
       context.hasAssistantText = true;
       updates.push(this.createUpdate(context.messageId, 'append', { appendText: text }));
@@ -109,16 +108,20 @@ export class CodexNormalizer extends BaseNormalizer {
           context.pendingThinking = '';
         }
         context.pendingThinking += itemText;
+        if (!context.thinkingBlockId) {
+          context.thinkingBlockId = this.allocateThinkingBlockId(context);
+        }
         updates.push(this.createUpdate(context.messageId, 'block_update', {
           blocks: [{
             type: 'thinking',
             content: context.pendingThinking,
-            blockId: CodexNormalizer.THINKING_BLOCK_ID,
+            blockId: context.thinkingBlockId,
           }],
         }));
         return updates;
       }
       if (itemText) {
+        this.flushPendingThinkingToBlocks(context, 'codex.item_text');
         context.pendingText += itemText;
         context.hasAssistantText = true;
         updates.push(this.createUpdate(context.messageId, 'append', { appendText: itemText }));
@@ -128,6 +131,7 @@ export class CodexNormalizer extends BaseNormalizer {
     // 处理 item delta 结构
     const delta = (event as { delta?: Record<string, unknown> }).delta;
     if (delta && typeof delta.text === 'string') {
+      this.flushPendingThinkingToBlocks(context, 'codex.delta_text');
       context.pendingText += delta.text;
       context.hasAssistantText = true;
       updates.push(this.createUpdate(context.messageId, 'append', { appendText: delta.text }));
@@ -143,6 +147,7 @@ export class CodexNormalizer extends BaseNormalizer {
     // 前端 MarkdownContent 已具备强大的流式解析能力（包括自动补全未闭合代码块）
     // 直接传输可以让用户实时看到代码生成过程，而不是等待代码块结束
     
+    this.flushPendingThinkingToBlocks(context, 'codex.text_chunk');
     context.pendingText += chunk;
     updates.push(this.createUpdate(context.messageId, 'append', { appendText: chunk }));
     

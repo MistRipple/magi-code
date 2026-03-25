@@ -17,6 +17,7 @@
 
 import { EventEmitter } from 'events';
 import { logger, LogCategory } from '../logging';
+import { mergeOrchestrationTraceLinks } from '../orchestrator/trace/types';
 import { WorkerSlot } from '../types';
 import {
   UnifiedTodo,
@@ -193,11 +194,19 @@ export class TodoManager extends EventEmitter {
   async create(params: CreateTodoParams): Promise<UnifiedTodo> {
     const now = Date.now();
     const sessionId = await this.resolveSessionIdForCreate(params);
+    const todoId = `todo_${now}_${Math.random().toString(36).substring(2, 11)}`;
     const todo: UnifiedTodo = {
-      id: `todo_${now}_${Math.random().toString(36).substring(2, 11)}`,
+      id: todoId,
       sessionId,
       missionId: params.missionId,
       assignmentId: params.assignmentId,
+      trace: mergeOrchestrationTraceLinks(params.trace, {
+        sessionId,
+        missionId: params.missionId,
+        assignmentId: params.assignmentId,
+        todoId,
+        workerId: params.workerId,
+      }),
       parentId: params.parentId,
       source: params.source ?? 'planner_macro',
       content: params.content,

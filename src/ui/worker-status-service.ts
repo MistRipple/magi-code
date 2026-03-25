@@ -5,22 +5,23 @@
  * 职责：
  * - 检查所有 Worker / Orchestrator / Auxiliary 模型连接状态
  * - 维护状态缓存（TTL + soft TTL）
- * - 向前端推送 workerStatusUpdate 数据事件
  */
 
 import { logger, LogCategory } from '../logging';
 import { t } from '../i18n';
 import type { WorkerSlot } from '../types';
 import type { AgentType } from '../types/agent-types';
-import type { DataMessageType } from '../protocol/message-protocol';
 import type { IAdapterFactory } from '../adapters/adapter-factory-interface';
+import {
+  cloneSettingsWorkerStatusMap,
+  type SettingsWorkerStatusMap,
+} from '../shared/settings-bootstrap';
 
 // ============================================================================
 // 上下文接口 - WorkerStatusService 对 WVP 的依赖声明
 // ============================================================================
 
 export interface WorkerStatusContext {
-  sendData(dataType: DataMessageType, payload: Record<string, unknown>): void;
   getAdapterFactory(): IAdapterFactory;
 }
 
@@ -29,9 +30,9 @@ export interface WorkerStatusContext {
 // ============================================================================
 
 export class WorkerStatusService {
-  private workerStatusCache: Record<string, { status: string; model?: string; error?: string }> | null = null;
+  private workerStatusCache: SettingsWorkerStatusMap | null = null;
   private workerStatusCacheAt = 0;
-  private workerStatusInFlight: Promise<void> | null = null;
+  private workerStatusInFlight: Promise<SettingsWorkerStatusMap> | null = null;
   private readonly workerStatusCacheTtlMs = 30000;
   private readonly workerStatusSoftTtlMs = 120000;
 
@@ -46,37 +47,126 @@ export class WorkerStatusService {
     this.workerStatusCacheAt = 0;
   }
 
-  async sendWorkerStatus(force: boolean = false): Promise<void> {
+  async getWorkerStatusSnapshot(force: boolean = false): Promise<SettingsWorkerStatusMap> {
     try {
       const now = Date.now();
       if (!force && this.workerStatusCache && (now - this.workerStatusCacheAt) < this.workerStatusCacheTtlMs) {
-        this.ctx.sendData('workerStatusUpdate', { statuses: this.workerStatusCache });
-        return;
+        return cloneSettingsWorkerStatusMap(this.workerStatusCache);
       }
 
       if (this.workerStatusInFlight) {
         if (!force) {
-          return;
+          return this.workerStatusInFlight;
         }
         await this.workerStatusInFlight;
       }
 
+      if (!force) {
+        const quickSnapshot = await this.buildQuickWorkerStatusSnapshot();
+        this.workerStatusCache = quickSnapshot;
+        this.workerStatusCacheAt = now;
+        return cloneSettingsWorkerStatusMap(quickSnapshot);
+      }
+
       const runCheck = this.performWorkerStatusCheck(force);
       this.workerStatusInFlight = runCheck;
-      await runCheck;
+      return await runCheck;
     } catch (error: any) {
       logger.error('界面.模型状态.检查_失败', { error: error.message }, LogCategory.UI);
+      return cloneSettingsWorkerStatusMap(this.workerStatusCache || {});
     } finally {
       this.workerStatusInFlight = null;
     }
   }
 
-  private async performWorkerStatusCheck(force: boolean): Promise<void> {
+  private async buildQuickWorkerStatusSnapshot(): Promise<SettingsWorkerStatusMap> {
+    const { LLMConfigLoader } = await import('../llm/config');
+
+    const config = LLMConfigLoader.loadFullConfig();
+    const statuses: SettingsWorkerStatusMap = {};
+    const now = Date.now();
+    const adapterFactory = this.ctx.getAdapterFactory();
+    const priorityModels: Array<'orchestrator' | 'auxiliary'> = ['orchestrator', 'auxiliary'];
+    const workerModels: WorkerSlot[] = ['claude', 'codex', 'gemini'];
+    const modelIds = [...priorityModels, ...workerModels];
+    const formatModelLabel = (modelConfig: any): string | undefined => {
+      if (!modelConfig?.provider || !modelConfig?.model) return undefined;
+      return `${modelConfig.provider} - ${modelConfig.model}`;
+    };
+    const orchestratorLabel = formatModelLabel(config.orchestrator);
+    const auxiliaryFallbackLabel = orchestratorLabel
+      ? t('workerStatus.orchestratorModelLabel', { label: orchestratorLabel })
+      : t('workerStatus.orchestratorModelFallback');
+    const setAuxiliaryFallback = (reason: string) => {
+      statuses.auxiliary = { status: 'orchestrator', model: auxiliaryFallbackLabel, error: reason };
+    };
+
+    const getCachedStatus = (name: string) => {
+      if (!this.workerStatusCache) return null;
+      if ((now - this.workerStatusCacheAt) > this.workerStatusSoftTtlMs) return null;
+      return this.workerStatusCache[name] || null;
+    };
+
+    modelIds.forEach(name => {
+      const modelConfig = name === 'orchestrator'
+        ? config.orchestrator
+        : name === 'auxiliary'
+          ? config.auxiliary
+          : config.workers[name as WorkerSlot];
+
+      if (name === 'auxiliary' && (!modelConfig?.enabled || !modelConfig?.apiKey || !modelConfig?.model)) {
+        setAuxiliaryFallback(!modelConfig?.enabled ? t('workerStatus.auxiliaryNotEnabled') : t('workerStatus.auxiliaryNotConfigured'));
+        return;
+      }
+
+      if (!modelConfig?.enabled) {
+        statuses[name] = { status: 'disabled', model: t('workerStatus.disabled') };
+        return;
+      }
+
+      if (!modelConfig?.apiKey || !modelConfig?.model) {
+        statuses[name] = {
+          status: 'not_configured',
+          model: name === 'orchestrator' || name === 'auxiliary'
+            ? t('workerStatus.notConfiguredRequired')
+            : t('workerStatus.notConfigured'),
+        };
+        return;
+      }
+
+      const modelLabel = formatModelLabel(modelConfig) || t('workerStatus.notConfigured');
+      const isConnected = name !== 'auxiliary' && adapterFactory.isConnected(name as AgentType);
+      if (isConnected) {
+        statuses[name] = { status: 'available', model: modelLabel };
+        return;
+      }
+
+      const cached = getCachedStatus(name);
+      if (cached) {
+        statuses[name] = {
+          status: cached.status,
+          model: cached.model || modelLabel,
+          error: cached.error,
+        };
+        return;
+      }
+
+      statuses[name] = { status: 'checking', model: modelLabel };
+    });
+
+    logger.info('Model connection status snapshot prepared without probing', {
+      results: Object.entries(statuses).map(([name, status]) => `${name}: ${status.status}`),
+    }, LogCategory.LLM);
+
+    return statuses;
+  }
+
+  private async performWorkerStatusCheck(force: boolean): Promise<SettingsWorkerStatusMap> {
     const { LLMConfigLoader } = await import('../llm/config');
     const { getOrCreateLLMClient } = await import('../llm/clients/client-factory');
 
     const config = LLMConfigLoader.loadFullConfig();
-    const statuses: Record<string, { status: string; model?: string; error?: string }> = {};
+    const statuses: SettingsWorkerStatusMap = {};
     const now = Date.now();
     const priorityModels: Array<'orchestrator' | 'auxiliary'> = ['orchestrator', 'auxiliary'];
     const workerModels: WorkerSlot[] = ['claude', 'codex', 'gemini'];
@@ -252,8 +342,6 @@ export class WorkerStatusService {
       statuses[name] = { status: 'checking', model: modelLabel };
     });
 
-    this.ctx.sendData('workerStatusUpdate', { statuses });
-
     // 所有模型并行检测（不再串行）
     await Promise.all([
       testModel('orchestrator', config.orchestrator, true),
@@ -263,12 +351,11 @@ export class WorkerStatusService {
 
     this.workerStatusCache = statuses;
     this.workerStatusCacheAt = Date.now();
-
-    this.ctx.sendData('workerStatusUpdate', { statuses });
-
     logger.info('Model connection status check completed', {
       results: Object.entries(statuses).map(([name, s]) => `${name}: ${s.status}`),
       mode: force ? 'hard' : 'soft'
     }, LogCategory.LLM);
+
+    return cloneSettingsWorkerStatusMap(statuses);
   }
 }

@@ -18,6 +18,9 @@ export * from './review';
 // 画像感知恢复
 export * from './recovery';
 
+// 运行时读模型与真相源契约
+export * from './runtime';
+
 // 协议类型
 export * from './protocols';
 

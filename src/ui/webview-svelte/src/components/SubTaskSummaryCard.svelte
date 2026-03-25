@@ -1,43 +1,13 @@
 <script lang="ts">
   import { setCurrentBottomTab } from '../stores/messages.svelte';
   import Icon from './Icon.svelte';
+  import MarkdownDetailPopover from './MarkdownDetailPopover.svelte';
   import { formatDuration } from '../lib/utils';
   import type { IconName } from '../lib/icons';
   import type { WaitForWorkersResult } from '../types/message';
   import type { WorkerRuntimeStatus } from '../lib/worker-panel-state';
+  import type { CardWorkerStatus as WorkerStatus, WorkerTaskCardData } from '../lib/worker-lifecycle-card';
   import { i18n } from '../stores/i18n.svelte';
-
-  // Worker 状态类型（与 MessageHub subTaskCard 状态值对齐）
-  type WorkerStatus = 'pending' | 'running' | 'completed' | 'failed' | 'stopped' | 'skipped';
-
-  interface SummaryCard {
-    title?: string;
-    status?: WorkerStatus;
-    description?: string;
-    executor?: string;
-    agent?: string;
-    worker?: string;
-    duration?: number | string;
-    startedAt?: number;
-    changes?: string[];
-    verification?: string[];
-    error?: string;
-    failureCode?: string;
-    recoverable?: boolean;
-    toolCount?: number;
-    // 新增：Session 相关（提案 4.1）
-    sessionId?: string;
-    isResumed?: boolean;
-    // 新增：Evidence 相关（提案 4.2）
-    evidence?: {
-      commandsRun?: number;
-      testsPassed?: boolean;
-      typeCheckPassed?: boolean;
-      filesChanged?: number;
-    };
-    // 新增：Wave 相关（提案 4.6）
-    waveIndex?: number;
-  }
 
   // 状态徽章配置：颜色变量、图标、标签、是否旋转
   interface StatusBadgeConfig {
@@ -52,24 +22,34 @@
     running: { colorVar: '--info', icon: 'loader', labelKey: 'subTaskSummaryCard.status.running', spinning: true },
     completed: { colorVar: '--success', icon: 'check', labelKey: 'subTaskSummaryCard.status.completed' },
     failed: { colorVar: '--error', icon: 'x', labelKey: 'subTaskSummaryCard.status.failed' },
-    stopped: { colorVar: '--warning', icon: 'stop', labelKey: 'subTaskSummaryCard.status.stopped' },
+    cancelled: { colorVar: '--warning', icon: 'stop', labelKey: 'subTaskSummaryCard.status.cancelled' },
     skipped: { colorVar: '--foreground-muted', icon: 'skip-forward', labelKey: 'subTaskSummaryCard.status.skipped' },
   };
 
   interface Props {
-    card: SummaryCard;
+    card: WorkerTaskCardData;
     readOnly?: boolean;
     messageTimestamp?: number;
-    statusOverride?: WorkerStatus;
     startedAtOverride?: number;
     runtimeStatus?: WorkerRuntimeStatus;
     waitResult?: WaitForWorkersResult | null;
+    showWaitReport?: boolean;
   }
 
-  let { card, readOnly = false, messageTimestamp, statusOverride, startedAtOverride, runtimeStatus, waitResult }: Props = $props();
+  let {
+    card,
+    readOnly = false,
+    messageTimestamp,
+    startedAtOverride,
+    runtimeStatus,
+    waitResult,
+    showWaitReport = true,
+  }: Props = $props();
 
   // 展开/收起状态
   let isExpanded = $state(false);
+  let summaryPreviewEl = $state<HTMLDivElement | null>(null);
+  let summaryOverflowing = $state(false);
 
   function mapRuntimeStatusToCard(status?: WorkerRuntimeStatus): WorkerStatus | undefined {
     if (!status) return undefined;
@@ -84,14 +64,16 @@
         return 'failed';
       case 'completed':
         return 'completed';
+      case 'cancelled':
+        return 'cancelled';
       default:
         return undefined;
     }
   }
 
-  // 获取当前状态的徽章配置（任务状态优先，其次 runtime）
+  // 获取当前状态的徽章配置：card.status 是持久化真相源，runtime 仅覆盖仍在执行的卡片
   const runtimeStatusOverride = $derived(mapRuntimeStatusToCard(runtimeStatus));
-  const currentStatus = $derived((statusOverride || card.status || runtimeStatusOverride || 'pending') as WorkerStatus);
+  const currentStatus = $derived((card.status || runtimeStatusOverride || 'pending') as WorkerStatus);
   const statusConfig = $derived(statusBadgeMap[currentStatus] || statusBadgeMap.completed);
 
   // 优化 executor 显示：支持更多来源字段，并统一使用中文
@@ -142,10 +124,11 @@
   });
 
   $effect(() => {
-    if (currentStatus === 'running' && runningStartAt) {
-      runningElapsedMs = Math.max(0, Date.now() - runningStartAt);
+    const activeRunningStartAt = runningStartAt;
+    if (currentStatus === 'running' && activeRunningStartAt) {
+      runningElapsedMs = Math.max(0, Date.now() - activeRunningStartAt);
       runningTimer = setInterval(() => {
-        runningElapsedMs = Math.max(0, Date.now() - runningStartAt);
+        runningElapsedMs = Math.max(0, Date.now() - activeRunningStartAt);
       }, 1000);
     } else {
       runningElapsedMs = 0;
@@ -164,6 +147,9 @@
     if ((e.target as HTMLElement).closest('.expand-btn')) {
       return;
     }
+    if ((e.target as HTMLElement).closest('button, a, input, textarea, select, summary, .tool-call, .code-block, .markdown-detail-popover')) {
+      return;
+    }
     // 只有 Worker 类型可以跳转，编排者和默认类型不跳转
     if (workerType !== 'default' && workerType !== 'orchestrator') {
       setCurrentBottomTab(workerType);
@@ -179,9 +165,211 @@
   // 是否可点击跳转
   const isClickable = $derived(workerType !== 'default' && workerType !== 'orchestrator');
 
+  const effectiveChanges = $derived.by(() => {
+    const explicit = Array.isArray(card.changes)
+      ? card.changes.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : [];
+    if (explicit.length > 0) return explicit;
+    const modified = Array.isArray(card.modifiedFiles)
+      ? card.modifiedFiles.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : [];
+    if (modified.length > 0) return modified;
+    const created = Array.isArray(card.createdFiles)
+      ? card.createdFiles.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : [];
+    return created;
+  });
+
+  function normalizeCardText(value: unknown): string {
+    if (typeof value !== 'string') return '';
+    return value.replace(/^#{1,6}\s+/gm, '').trim();
+  }
+
+  // 预览文本的安全上限，防止超长 summary 创建过多 DOM 节点
+  const SUMMARY_PREVIEW_MAX_CHARS = 600;
+  const SUMMARY_PREVIEW_MAX_LINES = 12;
+
+  function buildSummaryPreviewText(summary: string): string {
+    const lines = summary.split('\n');
+    const previewLines: string[] = [];
+    let insideCodeBlock = false;
+    let totalChars = 0;
+
+    for (const rawLine of lines) {
+      if (previewLines.length >= SUMMARY_PREVIEW_MAX_LINES || totalChars >= SUMMARY_PREVIEW_MAX_CHARS) {
+        break;
+      }
+      const trimmed = rawLine.trim();
+
+      if (trimmed.startsWith('```')) {
+        insideCodeBlock = !insideCodeBlock;
+        continue;
+      }
+      if (insideCodeBlock) {
+        continue;
+      }
+      if (!trimmed) {
+        if (previewLines.length > 0 && previewLines[previewLines.length - 1] !== '') {
+          previewLines.push('');
+        }
+        continue;
+      }
+      if (/^\|?(?:\s*:?-{3,}:?\s*\|)+\s*$/.test(trimmed) || /^\|.*\|$/.test(trimmed)) {
+        continue;
+      }
+
+      const normalized = trimmed
+        .replace(/^[-*+]\s+/, '')
+        .replace(/^\d+\.\s+/, '')
+        .replace(/^>\s+/, '')
+        .replace(/^#{1,6}\s+/, '')
+        .replace(/\*\*/g, '')
+        .replace(/`+/g, '')
+        .trim();
+
+      if (!normalized || /^[-|:\s]+$/.test(normalized)) {
+        continue;
+      }
+
+      previewLines.push(normalized);
+      totalChars += normalized.length;
+    }
+
+    return previewLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  const bodyInstruction = $derived.by(() => normalizeCardText(
+    card.instruction
+    || card.description
+    || card.title
+    || '',
+  ));
+  const bodySummary = $derived.by(() => {
+    if (currentStatus === 'pending' || currentStatus === 'running') {
+      return '';
+    }
+    const summary = normalizeCardText(card.summary || '');
+    if (!summary) return '';
+    if (summary === bodyInstruction) return '';
+    return summary;
+  });
+  const bodyFullSummary = $derived.by(() => {
+    if (currentStatus === 'pending' || currentStatus === 'running') {
+      return '';
+    }
+    const summary = normalizeCardText(card.fullSummary || card.summary || '');
+    if (!summary) return '';
+    if (summary === bodyInstruction) return '';
+    return summary;
+  });
+  const hasExpandedSummaryDetail = $derived(Boolean(
+    bodyFullSummary
+    && bodySummary
+    && bodyFullSummary !== bodySummary
+  ));
+  const summaryDetailContent = $derived(bodyFullSummary || bodySummary);
+  const summaryPreviewText = $derived.by(() => buildSummaryPreviewText(bodySummary));
+  const shouldShowSummaryDetail = $derived(Boolean(
+    summaryDetailContent
+    && (summaryOverflowing || hasExpandedSummaryDetail)
+  ));
+
+  function updateSummaryOverflowState() {
+    if (!summaryPreviewEl || !summaryPreviewText) {
+      summaryOverflowing = false;
+      return;
+    }
+    summaryOverflowing = summaryPreviewEl.scrollHeight > (summaryPreviewEl.clientHeight + 2)
+      || summaryPreviewEl.scrollWidth > (summaryPreviewEl.clientWidth + 2);
+  }
+
+  $effect(() => {
+    const summary = summaryPreviewText;
+    const preview = summaryPreviewEl;
+    if (!summary || !preview) {
+      summaryOverflowing = false;
+      return;
+    }
+
+    let rafId = 0;
+    const scheduleOverflowCheck = () => {
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+      }
+      rafId = requestAnimationFrame(() => {
+        rafId = 0;
+        updateSummaryOverflowState();
+      });
+    };
+
+    scheduleOverflowCheck();
+
+    const observer = new MutationObserver(() => {
+      scheduleOverflowCheck();
+    });
+    observer.observe(preview, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+
+    const resizeObserver = new ResizeObserver(() => {
+      scheduleOverflowCheck();
+    });
+    resizeObserver.observe(preview);
+
+    const handleResize = () => {
+      scheduleOverflowCheck();
+    };
+    window.addEventListener('resize', handleResize);
+
+    return () => {
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+      }
+      observer.disconnect();
+      resizeObserver.disconnect();
+      window.removeEventListener('resize', handleResize);
+    };
+  });
+
+  function mapLaneTaskStatus(status: string): WorkerStatus {
+    switch (status) {
+      case 'running':
+        return 'running';
+      case 'completed':
+        return 'completed';
+      case 'failed':
+        return 'failed';
+      case 'skipped':
+        return 'skipped';
+      case 'cancelled':
+        return 'cancelled';
+      case 'waiting_deps':
+      case 'pending':
+      default:
+        return 'pending';
+    }
+  }
+
+  const laneTasks = $derived(
+    Array.isArray(card.laneTasks)
+      ? card.laneTasks.filter((task): task is NonNullable<WorkerTaskCardData['laneTasks']>[number] => Boolean(task))
+      : []
+  );
+  const showLaneTasks = $derived(laneTasks.length > 0);
+  const laneProgressText = $derived.by(() => {
+    const laneIndex = typeof card.laneIndex === 'number' ? card.laneIndex : 0;
+    const laneTotal = typeof card.laneTotal === 'number' ? card.laneTotal : laneTasks.length;
+    if (laneIndex > 0 && laneTotal > 0) {
+      return i18n.t('subTaskSummaryCard.laneProgress', { current: laneIndex, total: laneTotal });
+    }
+    return '';
+  });
+
   // 是否有详情可展开
   const hasDetails = $derived(
-    (card.changes && card.changes.length > 0) ||
+    effectiveChanges.length > 0 ||
     (card.verification && card.verification.length > 0) ||
     card.evidence !== undefined
   );
@@ -192,6 +380,19 @@
   // worker_wait 结果展示
   const waitData = $derived(waitResult || null);
   const waitIsComplete = $derived(Boolean(waitData && waitData.wait_status === 'completed' && !waitData.timed_out));
+  const shouldRenderWaitReport = $derived(Boolean(
+    showWaitReport
+    && waitData?.results
+    && waitData.results.length > 0
+    && !bodySummary,
+  ));
+  const waitReportData = $derived(shouldRenderWaitReport ? waitData : null);
+  const waitPendingTaskIds = $derived(waitReportData?.pending_task_ids ?? []);
+  const shouldRenderWaitHint = $derived(Boolean(
+    showWaitReport
+    && !shouldRenderWaitReport
+    && runtimeStatus === 'running',
+  ));
   const completedDuration = $derived.by(() => {
     if (!waitData) return '';
     const startedAt = typeof startedAtOverride === 'number'
@@ -220,21 +421,41 @@
     return '';
   });
 
+  const showErrorBlock = $derived.by(() => {
+    const error = normalizeCardText(card.error || '');
+    if (!error) return false;
+    if (error === bodySummary) return false;
+    return true;
+  });
+
 </script>
 
-<button
+<div
   class="worker-progress-card"
   class:pending={currentStatus === 'pending'}
   class:running={currentStatus === 'running'}
   class:completed={currentStatus === 'completed'}
   class:failed={currentStatus === 'failed'}
-  class:stopped={currentStatus === 'stopped'}
+  class:cancelled={currentStatus === 'cancelled'}
   class:skipped={currentStatus === 'skipped'}
   class:clickable={isClickable}
   class:expanded={isExpanded}
   style="--worker-color: var({workerConfig.colorVar}); --status-color: var({statusConfig.colorVar})"
+  data-worker-card="true"
+  data-worker={workerType}
+  data-worker-status={currentStatus}
   onclick={handleCardClick}
+  onkeydown={(e) => {
+    if (!isClickable) return;
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      handleCardClick(e as unknown as MouseEvent);
+    }
+  }}
   title={isClickable ? i18n.t('subTaskSummaryCard.clickToView', { workerLabel: workerConfig.label }) : ''}
+  role="button"
+  aria-disabled={!isClickable}
+  tabindex={isClickable ? 0 : -1}
 >
   <!-- 卡片头部：worker 图标 + 标题 + 状态 -->
   <div class="card-header">
@@ -259,7 +480,7 @@
         class:running={currentStatus === 'running'}
         class:completed={currentStatus === 'completed'}
         class:failed={currentStatus === 'failed'}
-        class:stopped={currentStatus === 'stopped'}
+        class:cancelled={currentStatus === 'cancelled'}
         class:skipped={currentStatus === 'skipped'}
       >
         <span class="status-icon" class:spinning={statusConfig.spinning}>
@@ -288,9 +509,60 @@
   </div>
 
   <!-- 任务描述 -->
-  {#if card.title || card.description}
-    <div class="card-body" title={card.title || card.description}>
-      {(card.title || card.description || '').replace(/^#{1,6}\s+/gm, '').trim()}
+  {#if bodyInstruction}
+    <div class="card-section">
+      <div class="card-section-label">{i18n.t('subTaskSummaryCard.section.instruction')}</div>
+      <div class="card-body" title={bodyInstruction}>
+        {bodyInstruction}
+      </div>
+    </div>
+  {/if}
+  {#if bodySummary}
+    <div class="card-section summary">
+      <div class="card-section-header">
+        <div class="card-section-label">{i18n.t('subTaskSummaryCard.section.summary')}</div>
+        {#if shouldShowSummaryDetail}
+          <MarkdownDetailPopover
+            content={summaryDetailContent}
+            title={i18n.t('subTaskSummaryCard.summary.fullTitle')}
+            triggerLabel={i18n.t('subTaskSummaryCard.summary.more')}
+            triggerTitle={i18n.t('subTaskSummaryCard.summary.moreTitle')}
+          />
+        {/if}
+      </div>
+      <div class="card-summary" bind:this={summaryPreviewEl}>
+        <div class="card-summary-text">{summaryPreviewText}</div>
+      </div>
+    </div>
+  {/if}
+  {#if showLaneTasks}
+    <div class="card-section lane-tasks">
+      <div class="card-section-header">
+        <div class="card-section-label">{i18n.t('subTaskSummaryCard.section.taskQueue')}</div>
+        {#if laneProgressText}
+          <div class="lane-progress">{laneProgressText}</div>
+        {/if}
+      </div>
+      <div class="lane-task-list">
+        {#each laneTasks as task, i (task.taskId || i)}
+          {@const laneTaskStatus = mapLaneTaskStatus(task.status)}
+          {@const laneTaskBadge = statusBadgeMap[laneTaskStatus]}
+          <div class="lane-task-item" class:current={task.isCurrent === true}>
+            <span class="lane-task-badge" data-status={laneTaskStatus}>
+              <Icon name={laneTaskBadge.icon} size={11} />
+            </span>
+            <div class="lane-task-content">
+              <div class="lane-task-title-row">
+                <span class="lane-task-title">{task.title}</span>
+                <span class="lane-task-status">{i18n.t(laneTaskBadge.labelKey)}</span>
+              </div>
+              {#if task.dependsOn && task.dependsOn.length > 0}
+                <div class="lane-task-deps">{i18n.t('subTaskSummaryCard.dependsOn', { dependsOn: task.dependsOn.join(', ') })}</div>
+              {/if}
+            </div>
+          </div>
+        {/each}
+      </div>
     </div>
   {/if}
 
@@ -302,25 +574,28 @@
         {i18n.t('subTaskSummaryCard.toolCallCount', { count: card.toolCount })}
       </span>
     {/if}
-    {#if card.changes && card.changes.length > 0}
+    {#if effectiveChanges.length > 0}
       <span class="stat-item">
         <Icon name="file" size={12} />
-        {i18n.t('subTaskSummaryCard.fileChangeCount', { count: card.changes.length })}
+        {i18n.t('subTaskSummaryCard.fileChangeCount', { count: effectiveChanges.length })}
       </span>
     {/if}
   </div>
 
   <!-- 统一的任务报告渲染区域（取代 WaitResultCard） -->
-  {#if waitData?.results && waitData.results.length > 0}
-    <div class="wait-result" class:waiting={!waitIsComplete} class:timeout={waitData.timed_out}>
+  {#if waitReportData}
+    <div class="wait-result" class:waiting={!waitIsComplete} class:timeout={waitReportData.timed_out}>
       <div class="wait-result-header">
         <span class="wait-title">
           {i18n.t('waitResultCard.reportTitle')}
         </span>
       </div>
       <div class="wait-result-list">
-        {#each waitData.results as result, i (result.task_id || i)}
+        {#each waitReportData.results as result, i (result.task_id || i)}
           <div class="wait-result-item">
+            {#if result.summary}
+              <div class="result-summary">{result.summary}</div>
+            {/if}
             <div class="result-meta">
               {#if result.modified_files && result.modified_files.length > 0}
                 <span class="meta-tag"><Icon name="file" size={11} />{i18n.t('waitResultCard.fileChangeCount', { count: result.modified_files.length })}</span>
@@ -332,14 +607,14 @@
           </div>
         {/each}
       </div>
-      {#if waitData.pending_task_ids && waitData.pending_task_ids.length > 0}
+      {#if waitPendingTaskIds.length > 0}
         <div class="wait-pending">
           <Icon name="hourglass" size={12} />
-          <span>{i18n.t('waitResultCard.pendingTasks', { count: waitData.pending_task_ids.length })}</span>
+          <span>{i18n.t('waitResultCard.pendingTasks', { count: waitPendingTaskIds.length })}</span>
         </div>
       {/if}
     </div>
-  {:else if runtimeStatus === 'running'}
+  {:else if shouldRenderWaitHint}
     <div class="wait-result waiting-only">
       <span class="wait-hint">{i18n.t('waitResultCard.waitingHint')}</span>
     </div>
@@ -348,14 +623,14 @@
   <!-- 展开的详情面板 -->
   {#if isExpanded && hasDetails}
     <div class="card-details">
-      {#if card.changes && card.changes.length > 0}
+      {#if effectiveChanges.length > 0}
         <div class="detail-section">
           <div class="detail-title">
             <Icon name="file" size={12} />
             {i18n.t('subTaskSummaryCard.detail.fileChanges')}
           </div>
           <ul class="file-list">
-            {#each card.changes as file, i (file || i)}
+            {#each effectiveChanges as file, i (file || i)}
               <li class="file-item">{file}</li>
             {/each}
           </ul>
@@ -416,7 +691,7 @@
   {/if}
 
   <!-- 错误信息（如果有） -->
-  {#if card.error}
+  {#if showErrorBlock}
     <div class="card-error">
       <Icon name="x-circle" size={14} />
       {card.error}
@@ -425,7 +700,7 @@
       {/if}
     </div>
   {/if}
-</button>
+</div>
 
 <style>
   /* Worker 进度卡片 - 使用 worker 颜色作为边框和微色背景 */
@@ -463,7 +738,7 @@
     --worker-color: var(--error);
   }
 
-  .worker-progress-card.stopped {
+  .worker-progress-card.cancelled {
     --worker-color: var(--warning);
   }
 
@@ -555,7 +830,7 @@
     border-color: color-mix(in srgb, var(--error) 30%, transparent);
   }
 
-  .status-badge.stopped {
+  .status-badge.cancelled {
     background: color-mix(in srgb, var(--warning) 15%, transparent);
     color: var(--warning);
     border-color: color-mix(in srgb, var(--warning) 30%, transparent);
@@ -603,16 +878,147 @@
   }
 
   /* 卡片内容 */
+  .card-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .card-section.summary {
+    padding-top: var(--space-1);
+    border-top: 1px solid color-mix(in srgb, var(--worker-color) 16%, transparent);
+  }
+
+  .card-section-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: color-mix(in srgb, var(--worker-color) 65%, var(--foreground-muted));
+  }
+
   .card-body {
     font-size: var(--text-sm);
     color: var(--foreground);
     line-height: 1.5;
-    line-clamp: 2;
+    line-clamp: 3;
     display: -webkit-box;
-    -webkit-line-clamp: 2;
+    -webkit-line-clamp: 3;
     -webkit-box-orient: vertical;
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .card-summary {
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    line-height: 1.45;
+    word-break: break-word;
+    overflow: hidden;
+  }
+
+  .card-summary-text {
+    display: -webkit-box;
+    -webkit-line-clamp: 5;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: pre-wrap;
+  }
+
+  .card-section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+
+  .lane-progress {
+    font-size: 11px;
+    color: var(--foreground-muted);
+  }
+
+  .lane-task-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .lane-task-item {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-2);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--worker-color) 5%, transparent);
+  }
+
+  .lane-task-item.current {
+    background: color-mix(in srgb, var(--worker-color) 12%, var(--surface-1));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--worker-color) 28%, transparent);
+  }
+
+  .lane-task-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 999px;
+    color: var(--foreground-muted);
+    background: color-mix(in srgb, var(--surface-2) 78%, transparent);
+    flex: 0 0 auto;
+  }
+
+  .lane-task-badge[data-status='running'] {
+    color: var(--info);
+    background: color-mix(in srgb, var(--info) 12%, var(--surface-1));
+  }
+
+  .lane-task-badge[data-status='completed'] {
+    color: var(--success);
+    background: color-mix(in srgb, var(--success) 12%, var(--surface-1));
+  }
+
+  .lane-task-badge[data-status='failed'] {
+    color: var(--error);
+    background: color-mix(in srgb, var(--error) 12%, var(--surface-1));
+  }
+
+  .lane-task-badge[data-status='pending'],
+  .lane-task-badge[data-status='cancelled'],
+  .lane-task-badge[data-status='skipped'] {
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 12%, var(--surface-1));
+  }
+
+  .lane-task-content {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .lane-task-title-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+
+  .lane-task-title {
+    font-size: var(--text-sm);
+    color: var(--foreground);
+    word-break: break-word;
+  }
+
+  .lane-task-status,
+  .lane-task-deps {
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    word-break: break-word;
   }
 
   /* 统计信息 */
@@ -673,6 +1079,14 @@
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--surface-1) 85%, transparent);
     border: 1px solid var(--border);
+  }
+
+  .result-summary {
+    font-size: var(--text-xs);
+    color: var(--foreground);
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
 
   .result-meta {

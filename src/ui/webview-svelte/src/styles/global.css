@@ -9,22 +9,51 @@
      🔧 支持浅色/深色主题自动适配
      ========================================== */
 
+  /* Web 回退主题变量：当不在 VS Code Webview 内运行时，仍然提供完整主题令牌 */
+  --vscode-sideBar-background: #15181f;
+  --vscode-sideBar-secondaryBackground: #11161d;
+  --vscode-editor-background: #0f141b;
+  --vscode-editor-foreground: #e5e7eb;
+  --vscode-descriptionForeground: #98a2b3;
+  --vscode-panel-border: #273142;
+  --vscode-widget-border: #273142;
+  --vscode-editorWidget-background: #171d26;
+  --vscode-editorWidget-border: #273142;
+  --vscode-dropdown-background: #171d26;
+  --vscode-foreground: #e5e7eb;
+  --vscode-textLink-foreground: #60a5fa;
+  --vscode-progressBar-background: #2563eb;
+  --vscode-editorError-foreground: #f87171;
+  --vscode-editorWarning-foreground: #f59e0b;
+  --vscode-inputOption-activeBackground: rgba(59, 130, 246, 0.18);
+  --vscode-list-hoverBackground: rgba(255, 255, 255, 0.06);
+  --vscode-button-background: #2563eb;
+  --vscode-button-hoverBackground: #1d4ed8;
+  --vscode-button-secondaryBackground: #1f2937;
+  --vscode-button-secondaryHoverBackground: #273449;
+  --vscode-textCodeBlock-background: #111827;
+  --vscode-input-background: #111827;
+  --vscode-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --vscode-editor-font-family: 'SFMono-Regular', 'Cascadia Code', Consolas, 'Liberation Mono', monospace;
+
   /* 基础颜色 - VS Code 主题适配 (自动适配浅色/深色) */
-  --background: var(--vscode-sideBar-secondaryBackground, var(--vscode-sideBar-background));
-  --foreground: var(--vscode-editor-foreground);
-  --foreground-muted: var(--vscode-descriptionForeground);
-  --border: var(--vscode-panel-border, var(--vscode-widget-border));
+  --background: var(--vscode-sideBar-secondaryBackground, var(--vscode-sideBar-background, #11161d));
+  --foreground: var(--vscode-editor-foreground, #e5e7eb);
+  --foreground-muted: var(--vscode-descriptionForeground, #98a2b3);
+  --border: var(--vscode-panel-border, var(--vscode-widget-border, #273142));
 
   /* 消息颜色 */
-  --user-message-bg: var(--vscode-inputOption-activeBackground, var(--vscode-list-hoverBackground));
-  --assistant-message-bg: var(--vscode-editor-background);
+  --user-message-bg: var(--vscode-inputOption-activeBackground, var(--vscode-list-hoverBackground, rgba(59, 130, 246, 0.18)));
+  --assistant-message-bg: var(--vscode-editor-background, #0f141b);
 
   /* 交互颜色 */
-  --primary: var(--vscode-button-background);
-  --primary-hover: var(--vscode-button-hoverBackground);
+  --primary: var(--vscode-button-background, #2563eb);
+  --primary-hover: var(--vscode-button-hoverBackground, #1d4ed8);
+  --primary-rgb: 37, 99, 235;
+  --primary-foreground: #ffffff;
   --primary-muted: rgba(14, 99, 156, 0.15);
-  --secondary: var(--vscode-button-secondaryBackground);
-  --secondary-hover: var(--vscode-button-secondaryHoverBackground);
+  --secondary: var(--vscode-button-secondaryBackground, #1f2937);
+  --secondary-hover: var(--vscode-button-secondaryHoverBackground, #273449);
 
   /* 状态颜色 */
   --success: #10b981;
@@ -53,8 +82,16 @@
   --overlay-heavy: rgba(0, 0, 0, 0.7);
 
   /* 代码块 */
-  --code-bg: var(--vscode-textCodeBlock-background);
-  --code-border: var(--vscode-panel-border, var(--vscode-widget-border));
+  --code-bg: var(--vscode-textCodeBlock-background, #111827);
+  --code-border: var(--vscode-panel-border, var(--vscode-widget-border, #273142));
+  --code-header-bg: var(--surface-2);
+  --code-copy-hover-bg: var(--surface-hover);
+  --code-line-number-bg: color-mix(in srgb, var(--foreground) 3%, transparent);
+  --dropdown-bg: var(--vscode-dropdown-background, #171d26);
+
+  /* 滚动条 */
+  --scrollbar-thumb: rgba(255, 255, 255, 0.15);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.25);
 
   /* 默认表面颜色（深色主题） */
   --border-subtle: rgba(255, 255, 255, 0.06);
@@ -217,7 +254,32 @@
 /* ==========================================
    浅色主题覆盖 - 表面颜色使用黑色透明度
    ========================================== */
-body.vscode-light {
+body.vscode-light,
+body.theme-light,
+:root.theme-light {
+  --vscode-sideBar-background: #f5f7fb;
+  --vscode-sideBar-secondaryBackground: #ffffff;
+  --vscode-editor-background: #ffffff;
+  --vscode-editor-foreground: #1f2937;
+  --vscode-descriptionForeground: #667085;
+  --vscode-panel-border: #d7dce5;
+  --vscode-widget-border: #d7dce5;
+  --vscode-editorWidget-background: #ffffff;
+  --vscode-editorWidget-border: #d7dce5;
+  --vscode-dropdown-background: #ffffff;
+  --vscode-foreground: #1f2937;
+  --vscode-textLink-foreground: #2563eb;
+  --vscode-progressBar-background: #2563eb;
+  --vscode-editorError-foreground: #dc2626;
+  --vscode-editorWarning-foreground: #d97706;
+  --vscode-inputOption-activeBackground: rgba(37, 99, 235, 0.12);
+  --vscode-list-hoverBackground: rgba(15, 23, 42, 0.04);
+  --vscode-button-background: #2563eb;
+  --vscode-button-hoverBackground: #1d4ed8;
+  --vscode-button-secondaryBackground: #eef2f7;
+  --vscode-button-secondaryHoverBackground: #e2e8f0;
+  --vscode-textCodeBlock-background: #f3f4f6;
+  --vscode-input-background: #ffffff;
   --border-subtle: rgba(0, 0, 0, 0.08);
   --surface-1: rgba(0, 0, 0, 0.02);
   --surface-2: rgba(0, 0, 0, 0.04);
@@ -225,6 +287,16 @@ body.vscode-light {
   --surface-hover: rgba(0, 0, 0, 0.06);
   --surface-active: rgba(0, 0, 0, 0.10);
   --surface-selected: rgba(59, 130, 246, 0.15);
+  --scrollbar-thumb: rgba(15, 23, 42, 0.12);
+  --scrollbar-thumb-hover: rgba(15, 23, 42, 0.20);
+  --code-line-number-bg: rgba(15, 23, 42, 0.03);
+}
+
+body.theme-dark,
+body.vscode-dark,
+:root.theme-dark {
+  --scrollbar-thumb: rgba(255, 255, 255, 0.15);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.25);
 }
 
 /* 基础重置 */
@@ -241,12 +313,25 @@ body {
   height: 100%;
   width: 100%;
   overflow: hidden;
+  color-scheme: dark;
   font-family: var(--font-family);
   font-size: var(--font-size);
   color: var(--foreground);
   background: var(--background);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+body.vscode-light,
+body.theme-light,
+:root.theme-light {
+  color-scheme: light;
+}
+
+body.vscode-dark,
+body.theme-dark,
+:root.theme-dark {
+  color-scheme: dark;
 }
 
 #app {
@@ -876,6 +961,11 @@ pre code {
 /* 小尺寸模态框 */
 .modal-dialog--sm {
   width: 400px;
+}
+
+/* 中等尺寸模态框（文件选择器等） */
+.modal-dialog--md {
+  width: 560px;
 }
 
 /* ------------------------------------------

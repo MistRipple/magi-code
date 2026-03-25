@@ -271,6 +271,27 @@ export class MessagePipeline {
     return stats ? this.toRequestSummary(stats) : undefined;
   }
 
+  getMessageSnapshot(messageId: string): StandardMessage | null {
+    const state = this.messageStates.get(messageId);
+    if (!state?.message) {
+      return null;
+    }
+    return structuredClone(this.materializeMessageStateSnapshot(state));
+  }
+
+  getActiveMessageSnapshots(): StandardMessage[] {
+    const snapshots: StandardMessage[] = [];
+    for (const state of this.messageStates.values()) {
+      if (state.completed || !state.message) {
+        continue;
+      }
+      // materializeMessageStateSnapshot 已通过展开运算符 + ensureContentBlocksFromBuffer 生成浅拷贝，
+      // 调用方（getLiveSessionTimelineProjection）会在外层做 structuredClone，此处无需再深拷贝。
+      snapshots.push(this.materializeMessageStateSnapshot(state));
+    }
+    return snapshots;
+  }
+
   finalizeRequestContext(requestId: string): RequestMessageSummary | undefined {
     const stats = this.requestMessageStats.get(requestId);
     if (!stats) return undefined;
@@ -367,6 +388,7 @@ export class MessagePipeline {
     if (typeof effectiveUpdate.cardStreamSeq === 'number') {
       state.lastCardStreamSeq = Math.max(state.lastCardStreamSeq, effectiveUpdate.cardStreamSeq);
     }
+    this.applyUpdateToMessageState(state, effectiveUpdate);
     this.safeEmit('unified:update', effectiveUpdate);
     return true;
   }
@@ -469,7 +491,7 @@ export class MessagePipeline {
           },
         };
         this.markMessageComplete(id, completedMessage, now);
-        this.safeEmit('unified:complete', completedMessage);
+        this.safeEmit('unified:complete', { ...completedMessage, eventSeq: this.nextEventSeq() });
         this.checkAndUpdateProcessingState();
       }
       return true;
@@ -532,7 +554,7 @@ export class MessagePipeline {
       this.markMessageComplete(id, completedMessage, now);
       this.recordRequestMessage(completedMessage);
       this.emitByCategory(completedMessage);
-      this.safeEmit('unified:complete', completedMessage);
+      this.safeEmit('unified:complete', { ...completedMessage, eventSeq: this.nextEventSeq() });
       this.checkAndUpdateProcessingState();
       return true;
     }
@@ -557,9 +579,10 @@ export class MessagePipeline {
       case MessageCategory.CONTENT: {
         const isPlaceholder = message.metadata?.isPlaceholder === true;
         const isStreaming = message.lifecycle === MessageLifecycle.STARTED || message.lifecycle === MessageLifecycle.STREAMING;
+        const isTerminal = this.isTerminalLifecycle(message.lifecycle);
         const isUserInput = message.type === MessageType.USER_INPUT;
         const hasBlocks = Array.isArray(message.blocks) && message.blocks.length > 0;
-        if (!hasBlocks && !isPlaceholder && !isStreaming && !isUserInput) {
+        if (!hasBlocks && !isPlaceholder && !isStreaming && !isUserInput && !isTerminal) {
           logger.warn('MessagePipeline: Content message missing blocks, 跳过', { id: message.id, type: message.type, lifecycle: message.lifecycle }, LogCategory.SYSTEM);
           return false;
         }
@@ -686,7 +709,7 @@ export class MessagePipeline {
             this.markMessageComplete(id, completedMessage, now);
             this.recordRequestMessage(completedMessage);
             this.emitByCategory(completedMessage);
-            this.safeEmit('unified:complete', completedMessage);
+            this.safeEmit('unified:complete', { ...completedMessage, eventSeq: this.nextEventSeq() });
           } else {
             state.completed = true;
             state.lastSentAt = now;
@@ -721,6 +744,155 @@ export class MessagePipeline {
   }
 
   private debugLog(action: string, messageId: string): void { if (this.config.debug) logger.debug('MessagePipeline.' + action, { messageId }, LogCategory.SYSTEM); }
+
+  private materializeMessageStateSnapshot(state: MessageState): StandardMessage {
+    return this.ensureContentBlocksFromBuffer({
+      ...state.message!,
+      metadata: {
+        ...(state.message?.metadata || {}),
+        cardId: state.cardId,
+        cardStreamSeq: Math.max(
+          typeof state.message?.metadata?.cardStreamSeq === 'number' ? state.message.metadata.cardStreamSeq : 0,
+          state.lastCardStreamSeq,
+        ),
+      },
+    });
+  }
+
+  private applyUpdateToMessageState(state: MessageState, update: StreamUpdate): void {
+    if (!state.message) {
+      return;
+    }
+
+    let nextMessage: StandardMessage = {
+      ...state.message,
+      ...(update.eventId ? { eventId: update.eventId } : {}),
+      ...(typeof update.eventSeq === 'number' ? { eventSeq: update.eventSeq } : {}),
+      ...(typeof update.timestamp === 'number' && Number.isFinite(update.timestamp)
+        ? { updatedAt: Math.floor(update.timestamp) }
+        : {}),
+      metadata: {
+        ...(state.message.metadata || {}),
+        cardId: update.cardId || state.cardId,
+        ...(typeof update.cardStreamSeq === 'number' ? { cardStreamSeq: update.cardStreamSeq } : {}),
+      },
+    };
+
+    if (update.updateType === 'append' && update.appendText) {
+      const nextBlocks = this.cloneContentBlockArray(nextMessage.blocks);
+      const lastIndex = nextBlocks.length - 1;
+      const lastBlock = lastIndex >= 0 ? nextBlocks[lastIndex] : undefined;
+      if (lastBlock?.type === 'text') {
+        nextBlocks[lastIndex] = {
+          ...lastBlock,
+          content: `${lastBlock.content || ''}${update.appendText}`,
+        };
+      } else {
+        nextBlocks.push({
+          type: 'text',
+          content: update.appendText,
+          isMarkdown: true,
+        });
+      }
+      nextMessage = {
+        ...nextMessage,
+        blocks: nextBlocks,
+      };
+    } else if (update.updateType === 'replace' && Array.isArray(update.blocks)) {
+      nextMessage = {
+        ...nextMessage,
+        blocks: this.cloneContentBlocksDeep(update.blocks),
+      };
+    } else if (update.updateType === 'block_update' && Array.isArray(update.blocks)) {
+      nextMessage = {
+        ...nextMessage,
+        blocks: this.mergeContentBlocks(nextMessage.blocks || [], update.blocks),
+      };
+    } else if (update.updateType === 'lifecycle_change' && update.lifecycle) {
+      nextMessage = {
+        ...nextMessage,
+        lifecycle: update.lifecycle,
+      };
+    }
+
+    state.message = this.ensureContentBlocksFromBuffer(nextMessage);
+  }
+
+  private cloneContentBlockArray(blocks: ContentBlock[] | undefined): ContentBlock[] {
+    return Array.isArray(blocks) ? [...blocks] : [];
+  }
+
+  private cloneContentBlockDeep<T extends ContentBlock>(block: T): T {
+    return structuredClone(block);
+  }
+
+  private cloneContentBlocksDeep(blocks: ContentBlock[] | undefined): ContentBlock[] {
+    return Array.isArray(blocks) ? blocks.map((block) => this.cloneContentBlockDeep(block)) : [];
+  }
+
+  private mergeContentBlocks(existing: ContentBlock[], incoming: ContentBlock[]): ContentBlock[] {
+    const next = this.cloneContentBlockArray(existing);
+    for (const block of incoming) {
+      if (!block || typeof block !== 'object') {
+        continue;
+      }
+
+      if (block.type === 'tool_call' && block.toolId) {
+        const index = next.findIndex((item) => item.type === 'tool_call' && item.toolId === block.toolId);
+        if (index >= 0) {
+          const previous = next[index];
+          next[index] = {
+            ...previous,
+            ...block,
+            input: block.input ?? (previous.type === 'tool_call' ? previous.input : undefined),
+            output: block.output ?? (previous.type === 'tool_call' ? previous.output : undefined),
+            error: block.error ?? (previous.type === 'tool_call' ? previous.error : undefined),
+            standardized: block.standardized ?? (previous.type === 'tool_call' ? previous.standardized : undefined),
+          };
+        } else {
+          next.push(this.cloneContentBlockDeep(block));
+        }
+        continue;
+      }
+
+      if (block.type === 'thinking') {
+        const blockId = block.blockId?.trim();
+        const index = blockId
+          ? next.findIndex((item) => item.type === 'thinking' && item.blockId?.trim() === blockId)
+          : -1;
+        if (index >= 0) {
+          const previous = next[index];
+          next[index] = {
+            ...previous,
+            ...block,
+            content: block.content || (previous.type === 'thinking' ? previous.content : ''),
+            summary: block.summary ?? (previous.type === 'thinking' ? previous.summary : undefined),
+            blockId: blockId || (previous.type === 'thinking' ? previous.blockId : undefined),
+          };
+        } else {
+          next.push(this.cloneContentBlockDeep(block));
+        }
+        continue;
+      }
+
+      if (block.type === 'text') {
+        const lastIndex = next.length - 1;
+        const lastBlock = lastIndex >= 0 ? next[lastIndex] : undefined;
+        if (lastBlock?.type === 'text') {
+          next[lastIndex] = {
+            ...lastBlock,
+            content: `${lastBlock.content || ''}${block.content || ''}`,
+          };
+        } else {
+          next.push(this.cloneContentBlockDeep(block));
+        }
+        continue;
+      }
+
+      next.push(this.cloneContentBlockDeep(block));
+    }
+    return next;
+  }
 
   private extractTextFromBlocks(blocks?: ContentBlock[]): string {
     if (!Array.isArray(blocks) || blocks.length === 0) return '';

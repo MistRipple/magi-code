@@ -522,6 +522,8 @@
       class:file-mutation={isCompactMutation}
       class:compact-readonly={isCompactReadOnlyTool}
       data-status={statusInfo.class}
+      data-tool-name={name}
+      data-tool-call-id={id || undefined}
     >
       {#if isExpandable}
         <button class="tool-header" onclick={toggle}>

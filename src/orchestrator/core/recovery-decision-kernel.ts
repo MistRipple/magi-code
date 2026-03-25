@@ -1,6 +1,4 @@
 import type { OrchestratorTerminationReason } from '../../llm/adapters/orchestrator-termination';
-import type { InteractionMode } from '../../types';
-import type { PlanMode } from '../plan-ledger';
 
 type ResolvedOrchestratorTerminationReason = Exclude<OrchestratorTerminationReason, 'unknown'>;
 
@@ -53,26 +51,18 @@ export type RecoveryDecisionAction =
   | 'auto_repair'
   | 'auto_repair_stalled_notice'
   | 'auto_governance_resume'
-  | 'ask_followup_confirmation'
-  | 'auto_followup'
   | 'pause';
 
-export interface RecoveryDecisionInput {
-  currentPlanMode: PlanMode;
-  interactionMode: InteractionMode;
+interface BaseRecoveryDecisionInput {
+  allowAutoGovernanceResume: boolean;
   isGovernancePaused: boolean;
   governanceReason?: ResolvedOrchestratorTerminationReason;
   governanceRecoveryAttempt: number;
   governanceRecoveryMaxRounds: number;
   deliveryFailed: boolean;
-  continuationPolicy?: 'auto' | 'ask' | 'stop';
+  continuationPolicy?: 'auto' | 'stop';
   canAutoRepairByRounds: boolean;
   autoRepairStalled: boolean;
-  hasFollowUpPending: boolean;
-  followUpSignatureChanged: boolean;
-  followUpStallStreak: number;
-  blockedFollowUpOnly: boolean;
-  signals: ReplanGateSignals;
 }
 
 export interface RecoveryDecisionResult {
@@ -148,29 +138,7 @@ export function deriveReplanGateSignals(input: {
   };
 }
 
-function selectReplanSource(input: {
-  hasFollowUpPending: boolean;
-  signals: ReplanGateSignals;
-}): ReplanSource {
-  if (input.hasFollowUpPending) {
-    return 'ask_followup_pending';
-  }
-  if (input.signals.budgetPressure) {
-    return 'budget_pressure';
-  }
-  if (input.signals.scopeExpansion) {
-    return 'scope_expansion';
-  }
-  if (input.signals.acceptanceFailure) {
-    return 'acceptance_failure';
-  }
-  if (input.signals.blockerPressure) {
-    return 'blocker_pressure';
-  }
-  return 'progress_stalled';
-}
-
-export function decideRecoveryAction(input: RecoveryDecisionInput): RecoveryDecisionResult {
+function decideRecoveryAction(input: BaseRecoveryDecisionInput): RecoveryDecisionResult {
   const rationale: string[] = [];
 
   if (
@@ -195,52 +163,12 @@ export function decideRecoveryAction(input: RecoveryDecisionInput): RecoveryDeci
 
   if (
     input.isGovernancePaused
-    && input.interactionMode === 'auto'
-    && input.currentPlanMode === 'deep'
+    && input.allowAutoGovernanceResume
     && isGovernanceAutoRecoverReason(input.governanceReason)
     && input.governanceRecoveryAttempt < input.governanceRecoveryMaxRounds
   ) {
     rationale.push('governance:auto_resume');
     return { action: 'auto_governance_resume', rationale };
-  }
-
-  const shouldAutoFollowUp = input.hasFollowUpPending
-    && input.currentPlanMode === 'deep'
-    && input.interactionMode === 'auto'
-    && input.followUpSignatureChanged
-    && input.followUpStallStreak < 2
-    && !input.isGovernancePaused
-    && !input.blockedFollowUpOnly;
-
-  if (shouldAutoFollowUp) {
-    rationale.push('followup:auto_continue');
-    return { action: 'auto_followup', rationale };
-  }
-
-  const hasGovernanceTrigger = input.signals.budgetPressure
-    || input.signals.scopeExpansion
-    || input.signals.acceptanceFailure
-    || input.signals.blockerPressure
-    || input.signals.progressStalled;
-
-  const shouldAskFollowUpConfirmation = input.currentPlanMode === 'deep'
-    && input.interactionMode === 'ask'
-    && !input.blockedFollowUpOnly
-    && !shouldAutoFollowUp
-    && (input.hasFollowUpPending || hasGovernanceTrigger)
-    && (!input.isGovernancePaused || input.hasFollowUpPending || hasGovernanceTrigger);
-
-  if (shouldAskFollowUpConfirmation) {
-    const replanSource = selectReplanSource({
-      hasFollowUpPending: input.hasFollowUpPending,
-      signals: input.signals,
-    });
-    rationale.push(`followup:ask_confirmation:${replanSource}`);
-    return {
-      action: 'ask_followup_confirmation',
-      replanSource,
-      rationale,
-    };
   }
 
   if (input.isGovernancePaused) {
@@ -249,4 +177,24 @@ export function decideRecoveryAction(input: RecoveryDecisionInput): RecoveryDeci
   }
 
   return { action: 'none', rationale };
+}
+
+// ---- 阶段化入口 ----
+// 外层循环 3 次调用 decideRecoveryAction 的职责不同，
+// 以下入口函数显式约束每个阶段的参数边界，替代调用侧的硬编码遮蔽。
+
+/** 阶段①：交付修复决策——只关心 delivery repair 和 governance pause */
+export interface DeliveryRecoveryInput extends BaseRecoveryDecisionInput {
+}
+export function decideDeliveryRecovery(input: DeliveryRecoveryInput): RecoveryDecisionResult {
+  return decideRecoveryAction(input);
+}
+
+/** 阶段②：治理恢复决策——只关心 governance resume */
+export type GovernanceRecoveryInput = Omit<BaseRecoveryDecisionInput, 'deliveryFailed'>;
+export function decideGovernanceRecovery(input: GovernanceRecoveryInput): RecoveryDecisionResult {
+  return decideRecoveryAction({
+    ...input,
+    deliveryFailed: false,
+  });
 }

@@ -16,7 +16,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { atomicWriteFileSync } from '../utils/atomic-write';
-import { LLMConfig, LLMProvider, WorkerSlot, UrlMode } from '../types/agent-types';
+import { LLMConfig, LLMProvider, WorkerSlot, UrlMode, ModelAutonomyCapability } from '../types/agent-types';
 import { FullLLMConfig, WorkerLLMConfig } from './types';
 import { logger, LogCategory } from '../logging';
 import { normalizeUrlMode } from './url-mode';
@@ -28,6 +28,7 @@ export class LLMConfigLoader {
   private static readonly CONFIG_DIR = path.join(os.homedir(), '.magi');
   private static readonly LLM_CONFIG_FILE = path.join(this.CONFIG_DIR, 'llm.json');
   private static readonly VALID_REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh']);
+  private static readonly VALID_AUTONOMY_CAPABILITIES = new Set(['C0', 'C1', 'C2', 'C3']);
 
   private static normalizePersistedConfig(config: any): { config: any; changed: boolean } {
     const next = config && typeof config === 'object'
@@ -223,6 +224,7 @@ export class LLMConfigLoader {
       enabled: true,
       enableThinking: orchestratorConfig.enableThinking ?? defaults.enableThinking,
       reasoningEffort: this.normalizeReasoningEffort(orchestratorConfig.reasoningEffort, defaultReasoningEffort),
+      autonomyCapability: this.normalizeAutonomyCapability(orchestratorConfig.autonomyCapability),
     };
   }
 
@@ -260,6 +262,7 @@ export class LLMConfigLoader {
       enabled: workerConfig.enabled !== false,
       enableThinking: workerConfig.enableThinking ?? defaults.enableThinking,
       reasoningEffort: this.normalizeReasoningEffort(workerConfig.reasoningEffort, defaultReasoningEffort),
+      autonomyCapability: this.normalizeAutonomyCapability(workerConfig.autonomyCapability),
     };
   }
 
@@ -436,6 +439,9 @@ export class LLMConfigLoader {
       enabled: config.enabled !== false,
       enableThinking: config.enableThinking === true,
       ...(config.reasoningEffort ? { reasoningEffort: this.normalizeReasoningEffort(config.reasoningEffort, 'medium') } : {}),
+      ...(this.normalizeAutonomyCapability(config.autonomyCapability)
+        ? { autonomyCapability: this.normalizeAutonomyCapability(config.autonomyCapability) }
+        : {}),
     };
 
     this.saveFullConfig(fullConfig);
@@ -458,6 +464,9 @@ export class LLMConfigLoader {
       enabled: true,
       enableThinking: config.enableThinking === true,
       ...(config.reasoningEffort ? { reasoningEffort: this.normalizeReasoningEffort(config.reasoningEffort, 'medium') } : {}),
+      ...(this.normalizeAutonomyCapability(config.autonomyCapability)
+        ? { autonomyCapability: this.normalizeAutonomyCapability(config.autonomyCapability) }
+        : {}),
     };
 
     this.saveFullConfig(fullConfig);
@@ -502,7 +511,17 @@ export class LLMConfigLoader {
       model: auxiliaryConfig.model || defaults.model,
       provider: auxiliaryConfig.provider || defaults.provider,
       openaiProtocol: this.normalizeOpenAIProtocol(auxiliaryConfig.openaiProtocol, defaults.openaiProtocol),
+      autonomyCapability: this.normalizeAutonomyCapability(auxiliaryConfig.autonomyCapability),
     };
+  }
+
+  private static normalizeAutonomyCapability(value: unknown): ModelAutonomyCapability | undefined {
+    if (typeof value !== 'string') {
+      return undefined;
+    }
+    return this.VALID_AUTONOMY_CAPABILITIES.has(value)
+      ? value as ModelAutonomyCapability
+      : undefined;
   }
 
   /**

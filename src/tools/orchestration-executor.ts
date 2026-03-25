@@ -26,6 +26,11 @@ export interface CategoryWorkerEntry {
   worker: WorkerSlot;
 }
 
+const DISPATCH_CATEGORY_PRIORITY = ['frontend', 'backend', 'integration', 'test', 'document', 'data_analysis'] as const;
+const DISPATCH_CATEGORY_PRIORITY_INDEX = new Map<string, number>(
+  DISPATCH_CATEGORY_PRIORITY.map((category, index) => [category, index]),
+);
+
 /**
  * worker_dispatch 任务合同（结构化）
  */
@@ -340,7 +345,14 @@ export class OrchestrationExecutor {
    * 用于 worker_dispatch 工具 schema 的 category enum 和描述
    */
   setCategoryWorkerMap(map: CategoryWorkerEntry[]): void {
-    this.categoryWorkerMap = map;
+    this.categoryWorkerMap = [...map].sort((left, right) => {
+      const leftPriority = DISPATCH_CATEGORY_PRIORITY_INDEX.get(left.category) ?? Number.MAX_SAFE_INTEGER;
+      const rightPriority = DISPATCH_CATEGORY_PRIORITY_INDEX.get(right.category) ?? Number.MAX_SAFE_INTEGER;
+      if (leftPriority !== rightPriority) {
+        return leftPriority - rightPriority;
+      }
+      return left.category.localeCompare(right.category);
+    });
   }
 
   private getWorkerEnum(): string[] {
@@ -470,7 +482,7 @@ export class OrchestrationExecutor {
       category: {
         type: 'string',
         ...(categoryEnum.length > 0 ? { enum: categoryEnum } : {}),
-        description: `任务分类（决定执行 Worker 的唯一依据）。分工映射：${mappingDesc || '未配置'}`,
+        description: `任务分类（决定 Assignment ownership 与执行 Worker 的唯一依据）。优先使用 frontend/backend/integration/test/document/data_analysis 这类 ownership 分类；若任务只是 review/debug/refactor/architecture 等任务风格，也必须在 task_name/goal/context 中明确其单一 ownership 领域，系统会据此归一化路由。若一个功能同时涉及 frontend/backend 等多个职责域，必须先拆成多个任务，再分别设置 category。分工映射：${mappingDesc || '未配置'}`,
       },
       goal: {
         type: 'string',
@@ -544,7 +556,7 @@ export class OrchestrationExecutor {
 
     return {
       name: 'worker_dispatch',
-      description: '向一个或多个专业 AI Worker 派发任务。支持一次性派发多个任务以实现并行处理。通过 category 参数指定任务分类，系统自动路由到对应 Worker。',
+      description: '向一个或多个专业 AI Worker 派发任务。支持一次性派发多个任务以实现并行处理。category 参数必须服务于 ownership 路由；若使用 review/debug/refactor/architecture 等任务风格分类，任务文本仍必须明确单一 ownership 领域，系统会先归一化 ownership 再路由 Worker。若一个功能同时涉及 frontend/backend 等多个职责域，必须先拆成多个任务，不能用单个泛化任务整包派发。',
       input_schema: {
         type: 'object',
         properties: {
@@ -554,7 +566,7 @@ export class OrchestrationExecutor {
           },
           tasks: {
             type: 'array',
-            description: '待派发的任务列表（至少 1 个）。每个任务将独立路由到对应 Worker 并行执行。',
+            description: '待派发的任务列表（至少 1 个）。每个任务将独立路由到对应 Worker 并行执行。每个任务应尽量保持单一 ownership；跨职责域功能应先拆分为多个任务。',
             items: {
               type: 'object',
               properties: taskItemProperties,
@@ -992,7 +1004,7 @@ export class OrchestrationExecutor {
   private getSplitTodoDefinition(): ExtendedToolDefinition {
     return {
       name: 'todo_split',
-      description: '将当前任务拆分为多个子步骤。当任务包含多个可独立完成和验证的子目标时使用。每个子步骤都必须给出明确的预期产出；若已知目标文件，也必须写清。拆分后每个子步骤将依次执行，全部完成后父任务自动标记完成。',
+      description: '将当前任务拆分为多个子步骤。当任务包含多个可独立完成和验证的子目标时使用。每个子步骤都必须给出明确的预期产出；若已知目标文件，也必须写清。todo_split 只能细化当前 Assignment 内的执行步骤，不能借此把任务重新拆到其他 ownership 域或替代 orchestrator 级的跨 Worker Assignment 拆分。拆分后每个子步骤将依次执行，全部完成后父任务自动标记完成。',
       input_schema: {
         type: 'object',
         properties: {
@@ -1028,7 +1040,7 @@ export class OrchestrationExecutor {
               },
               required: ['content', 'reasoning', 'expected_output', 'type'],
             },
-            description: '子步骤列表（2-8 个）。禁止把连续动作机械切碎；只拆分真正可独立完成和验证的子目标。',
+            description: '子步骤列表（2-8 个）。禁止把连续动作机械切碎；只拆分真正可独立完成和验证的子目标。子步骤必须继续服务当前 Assignment 的同一 ownership，不得把前端/后端等跨域工作混入子步骤。',
           },
         },
         required: ['subtasks'],

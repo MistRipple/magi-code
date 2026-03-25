@@ -1,22 +1,29 @@
-import * as fs from 'fs';
-import * as path from 'path';
 import { logger, LogCategory } from '../../logging';
 import type { MessageHub } from './message-hub';
-import type { VerificationRunner } from '../verification-runner';
+import { isNonBlockingVerificationWarning, type VerificationRunner } from '../verification-runner';
 import type { DispatchBatch } from './dispatch-batch';
-import type { AcceptanceCriterion, VerificationSpec } from '../mission/types';
+import type {
+  AcceptanceBaseVerificationReport,
+  AcceptanceCriteriaExecutionSummary,
+  AcceptanceCriterion,
+  AcceptanceExecutionReport,
+  AcceptanceExecutionSkippedReason,
+} from '../mission/types';
+import {
+  createDefaultValidatorRegistry,
+  createProcessVerificationCommandRunner,
+  type VerificationCustomValidator,
+  type ValidatorRegistry,
+} from './validator-registry';
+import {
+  buildVerificationId,
+  mergeOrchestrationTraceLinks,
+} from '../trace/types';
 
-export type DeliveryVerificationStatus = 'skipped' | 'passed' | 'failed';
+const defaultValidatorRegistry = createDefaultValidatorRegistry();
+const defaultVerificationCommandRunner = createProcessVerificationCommandRunner();
 
-export interface DeliveryVerificationOutcome {
-  status: DeliveryVerificationStatus;
-  summary: string;
-  details?: string;
-  warnings?: string[];
-  skippedReason?: 'no_runner' | 'no_entries' | 'execution_failed' | 'no_changes';
-  /** 结构化验收标准的程序化验证结果 */
-  specResults?: Array<{ criterionId: string; passed: boolean; detail: string }>;
-}
+export type DeliveryVerificationOutcome = AcceptanceExecutionReport;
 
 function collectBatchModifiedFiles(batch: DispatchBatch): string[] {
   const modifiedFiles = new Set<string>();
@@ -31,6 +38,56 @@ function collectBatchModifiedFiles(batch: DispatchBatch): string[] {
   return Array.from(modifiedFiles);
 }
 
+function compactDetails(text?: string, limit: number = 3000): string | undefined {
+  const normalized = typeof text === 'string' ? text.trim() : '';
+  if (!normalized) {
+    return undefined;
+  }
+  return normalized.length > limit ? `${normalized.slice(0, limit)}\n...(错误详情已截断)` : normalized;
+}
+
+function buildCriteriaSummary(
+  criteriaResults: NonNullable<AcceptanceExecutionReport['criteriaResults']>,
+): AcceptanceCriteriaExecutionSummary | undefined {
+  if (criteriaResults.length === 0) {
+    return undefined;
+  }
+
+  const passed = criteriaResults.filter((result) => result.status === 'passed').length;
+  return {
+    total: criteriaResults.length,
+    passed,
+    failed: criteriaResults.length - passed,
+  };
+}
+
+function buildNotRunBaseVerificationReport(summary: string): AcceptanceBaseVerificationReport {
+  return {
+    status: 'not_run',
+    summary,
+  };
+}
+
+function buildBaseVerificationReport(input: {
+  verificationRunner: VerificationRunner;
+  verificationResult: Awaited<ReturnType<VerificationRunner['runVerification']>>;
+  warnings: string[];
+}): AcceptanceBaseVerificationReport {
+  const baseSummary = input.verificationResult.success
+    ? (input.verificationResult.summary || '基础验收通过')
+    : (input.verificationResult.summary || '基础验收失败');
+  const baseDetails = input.verificationResult.success
+    ? undefined
+    : compactDetails(input.verificationRunner.getErrorDetails(input.verificationResult).trim());
+
+  return {
+    status: input.verificationResult.success ? 'passed' : 'failed',
+    summary: baseSummary,
+    details: baseDetails,
+    warnings: input.warnings.length > 0 ? input.warnings : undefined,
+  };
+}
+
 export async function runPostDispatchVerification(
   batch: DispatchBatch,
   verificationRunner: VerificationRunner | undefined,
@@ -38,13 +95,33 @@ export async function runPostDispatchVerification(
   options?: {
     workspaceRoot?: string;
     acceptanceCriteria?: AcceptanceCriterion[];
+    validatorRegistry?: ValidatorRegistry;
+    customValidators?: Record<string, VerificationCustomValidator>;
   },
 ): Promise<DeliveryVerificationOutcome> {
+  const verificationTrace = mergeOrchestrationTraceLinks(batch.trace, {
+    verificationId: buildVerificationId(batch.id),
+  });
+  const verificationMessageMetadata = verificationTrace
+    ? {
+      requestId: verificationTrace.requestId,
+      missionId: verificationTrace.missionId,
+      turnId: verificationTrace.turnId,
+      sessionId: verificationTrace.sessionId,
+      extra: {
+        batchId: verificationTrace.batchId,
+        verificationId: verificationTrace.verificationId,
+        planId: verificationTrace.planId,
+      },
+    }
+    : undefined;
   if (!verificationRunner) {
     return {
       status: 'skipped',
       summary: '未配置验收执行器',
       skippedReason: 'no_runner',
+      baseVerification: buildNotRunBaseVerificationReport('未配置验收执行器'),
+      trace: verificationTrace,
     };
   }
 
@@ -54,6 +131,8 @@ export async function runPostDispatchVerification(
       status: 'skipped',
       summary: '未发现可验收的任务',
       skippedReason: 'no_entries',
+      baseVerification: buildNotRunBaseVerificationReport('未发现可验收的任务'),
+      trace: verificationTrace,
     };
   }
 
@@ -69,6 +148,8 @@ export async function runPostDispatchVerification(
       status: 'skipped',
       summary: '子任务失败或取消，跳过验收',
       skippedReason: 'execution_failed',
+      baseVerification: buildNotRunBaseVerificationReport('子任务失败或取消，跳过验收'),
+      trace: verificationTrace,
     };
   }
 
@@ -82,48 +163,62 @@ export async function runPostDispatchVerification(
       status: 'skipped',
       summary: '未检测到文件修改，跳过验收',
       skippedReason: 'no_changes',
+      modifiedFiles,
+      baseVerification: buildNotRunBaseVerificationReport('未检测到文件修改，跳过验收'),
+      trace: verificationTrace,
     };
   }
 
-  messageHub.progress('Verification', `正在执行验收检查（${modifiedFiles.length} 个修改文件）...`);
+  messageHub.progress('Verification', `正在执行验收检查（${modifiedFiles.length} 个修改文件）...`, {
+    metadata: verificationMessageMetadata,
+  });
   const verificationResult = await verificationRunner.runVerification(batch.id, modifiedFiles);
 
   // 程序化验证：对含有 verificationSpec 的 AcceptanceCriterion 进行结构化检查
-  const specResults = options?.workspaceRoot && options?.acceptanceCriteria
-    ? runSpecVerifications(options.acceptanceCriteria, options.workspaceRoot)
+  const criteriaResults = options?.workspaceRoot && options?.acceptanceCriteria
+    ? await (options.validatorRegistry || defaultValidatorRegistry).executeCriteria(options.acceptanceCriteria, {
+      workspaceRoot: options.workspaceRoot,
+      batch,
+      modifiedFiles,
+      verificationRunner,
+      runCommand: defaultVerificationCommandRunner,
+      customValidators: options.customValidators,
+    })
     : [];
-  const specFailures = specResults.filter(r => !r.passed);
-  const allWarnings = [...(verificationResult.warnings || [])];
+  const criteriaFailures = criteriaResults.filter((result) => result.status === 'failed');
+  const criteriaSummary = buildCriteriaSummary(criteriaResults);
+  const allWarnings = [...(verificationResult.warnings || [])]
+    .filter((warning) => !isNonBlockingVerificationWarning(warning));
+  const baseVerification = buildBaseVerificationReport({
+    verificationRunner,
+    verificationResult,
+    warnings: allWarnings,
+  });
 
-  if (specFailures.length > 0) {
-    const baseSummary = verificationResult.success
-      ? (verificationResult.summary || '基础验收通过')
-      : (verificationResult.summary || '基础验收失败');
-    const baseDetailsRaw = verificationResult.success
-      ? ''
-      : verificationRunner.getErrorDetails(verificationResult).trim();
-    const baseDetails = baseDetailsRaw.length > 0
-      ? (baseDetailsRaw.length > 3000 ? `${baseDetailsRaw.slice(0, 3000)}\n...(错误详情已截断)` : baseDetailsRaw)
-      : '';
+  if (criteriaFailures.length > 0) {
     const mergedDetails = [
-      `基础验收结论：${baseSummary}`,
-      baseDetails ? `基础验收详情：\n${baseDetails}` : '',
-      `结构化验收缺口：\n${specFailures.map(f => `- [${f.criterionId}] ${f.detail}`).join('\n')}`,
+      `基础验收结论：${baseVerification.summary}`,
+      baseVerification.details ? `基础验收详情：\n${baseVerification.details}` : '',
+      `结构化验收缺口：\n${criteriaFailures.map((result) => `- [${result.criterionId}] ${result.detail}`).join('\n')}`,
     ].filter(item => item.trim().length > 0).join('\n\n');
-    const compactMergedDetails = mergedDetails.length > 3000
-      ? `${mergedDetails.slice(0, 3000)}\n...(错误详情已截断)`
-      : mergedDetails;
-    allWarnings.push(...specFailures.map(f => `[${f.criterionId}] ${f.detail}`));
-    messageHub.progress('Verification', `❌ 验收失败：结构化验收未通过（${specFailures.length} 项）`);
+    const compactMergedDetails = compactDetails(mergedDetails);
+    allWarnings.push(...criteriaFailures.map((result) => `[${result.criterionId}] ${result.detail}`));
+    messageHub.progress('Verification', `❌ 验收失败：结构化验收未通过（${criteriaFailures.length} 项）`, {
+      metadata: verificationMessageMetadata,
+    });
     if (allWarnings.length > 0) {
       messageHub.notify(`验收告警：${allWarnings.join('；')}`, 'warning');
     }
     return {
       status: 'failed',
-      summary: `验收失败：结构化验收未通过（${specFailures.length} 项）`,
+      summary: `验收失败：结构化验收未通过（${criteriaFailures.length} 项）`,
       details: compactMergedDetails,
       warnings: allWarnings.length > 0 ? allWarnings : undefined,
-      specResults,
+      modifiedFiles,
+      baseVerification,
+      criteriaResults: criteriaResults.length > 0 ? criteriaResults : undefined,
+      criteriaSummary,
+      trace: verificationTrace,
     };
   }
 
@@ -132,111 +227,35 @@ export async function runPostDispatchVerification(
     if (allWarnings.length > 0) {
       messageHub.notify(`验收告警：${allWarnings.join('；')}`, 'warning');
     }
-    messageHub.progress('Verification', `✅ ${passedSummary}`);
+    messageHub.progress('Verification', `✅ ${passedSummary}`, {
+      metadata: verificationMessageMetadata,
+    });
     return {
       status: 'passed',
       summary: passedSummary,
       warnings: allWarnings.length > 0 ? allWarnings : undefined,
-      specResults: specResults.length > 0 ? specResults : undefined,
+      modifiedFiles,
+      baseVerification,
+      criteriaResults: criteriaResults.length > 0 ? criteriaResults : undefined,
+      criteriaSummary,
+      trace: verificationTrace,
     };
   }
 
   const summary = verificationResult.summary || '验证失败';
-  const details = verificationRunner.getErrorDetails(verificationResult).trim();
-  const compactDetails = details.length > 3000 ? `${details.slice(0, 3000)}\n...(错误详情已截断)` : details;
-  messageHub.progress('Verification', `❌ 验收失败：${summary}`);
+  const details = compactDetails(verificationRunner.getErrorDetails(verificationResult).trim());
+  messageHub.progress('Verification', `❌ 验收失败：${summary}`, {
+    metadata: verificationMessageMetadata,
+  });
   return {
     status: 'failed',
     summary: `验收失败：${summary}`,
-    details: compactDetails || undefined,
-    specResults: specResults.length > 0 ? specResults : undefined,
+    details,
+    warnings: allWarnings.length > 0 ? allWarnings : undefined,
+    modifiedFiles,
+    baseVerification,
+    criteriaResults: criteriaResults.length > 0 ? criteriaResults : undefined,
+    criteriaSummary,
+    trace: verificationTrace,
   };
-}
-
-/**
- * 对含有 verificationSpec 的 AcceptanceCriterion 进行程序化验证
- */
-function runSpecVerifications(
-  criteria: AcceptanceCriterion[],
-  workspaceRoot: string,
-): Array<{ criterionId: string; passed: boolean; detail: string }> {
-  const results: Array<{ criterionId: string; passed: boolean; detail: string }> = [];
-
-  for (const criterion of criteria) {
-    if (!criterion.verifiable || !criterion.verificationSpec) {
-      continue;
-    }
-    const result = verifySpec(criterion.id, criterion.verificationSpec, workspaceRoot);
-    results.push(result);
-  }
-
-  return results;
-}
-
-/**
- * 执行单个 VerificationSpec 的程序化检查
- */
-function verifySpec(
-  criterionId: string,
-  spec: VerificationSpec,
-  workspaceRoot: string,
-): { criterionId: string; passed: boolean; detail: string } {
-  try {
-    switch (spec.type) {
-      case 'file_exists': {
-        if (!spec.targetPath) {
-          return { criterionId, passed: false, detail: 'file_exists: targetPath 未指定' };
-        }
-        const fullPath = path.resolve(workspaceRoot, spec.targetPath);
-        const exists = fs.existsSync(fullPath);
-        return {
-          criterionId,
-          passed: exists,
-          detail: exists ? `文件存在: ${spec.targetPath}` : `文件不存在: ${spec.targetPath}`,
-        };
-      }
-
-      case 'file_content': {
-        if (!spec.targetPath || !spec.expectedContent) {
-          return { criterionId, passed: false, detail: 'file_content: targetPath 或 expectedContent 未指定' };
-        }
-        const filePath = path.resolve(workspaceRoot, spec.targetPath);
-        if (!fs.existsSync(filePath)) {
-          return { criterionId, passed: false, detail: `文件不存在: ${spec.targetPath}` };
-        }
-        const content = fs.readFileSync(filePath, 'utf-8');
-        const mode = spec.contentMatchMode || 'contains';
-        let matched = false;
-        if (mode === 'exact') {
-          matched = content === spec.expectedContent;
-        } else if (mode === 'contains') {
-          matched = content.includes(spec.expectedContent);
-        } else if (mode === 'regex') {
-          matched = new RegExp(spec.expectedContent).test(content);
-        }
-        return {
-          criterionId,
-          passed: matched,
-          detail: matched
-            ? `文件内容匹配(${mode}): ${spec.targetPath}`
-            : `文件内容不匹配(${mode}): ${spec.targetPath}`,
-        };
-      }
-
-      case 'test_pass':
-      case 'task_completed':
-      case 'custom':
-        // 外部执行器尚未接入时，不能将该标准视为通过，避免“未验证即通过”。
-        return {
-          criterionId,
-          passed: false,
-          detail: `${spec.type}: 需要外部验证器，当前未接入`,
-        };
-
-      default:
-        return { criterionId, passed: false, detail: `未知验证类型: ${spec.type}` };
-    }
-  } catch (error: any) {
-    return { criterionId, passed: false, detail: `验证异常: ${error.message}` };
-  }
 }

@@ -15,11 +15,11 @@ import { resolveModelsBaseUrl } from '../../llm/url-mode';
 type Msg<T extends string> = Extract<WebviewToExtensionMessage, { type: T }>;
 
 const SUPPORTED = new Set([
-  'getProfileConfig', 'saveProfileConfig', 'resetProfileConfig',
+  'saveProfileConfig', 'resetProfileConfig',
   'enhancePrompt',
-  'loadAllWorkerConfigs', 'saveWorkerConfig', 'testWorkerConnection',
-  'loadOrchestratorConfig', 'saveOrchestratorConfig', 'testOrchestratorConnection',
-  'loadAuxiliaryConfig', 'saveAuxiliaryConfig', 'testAuxiliaryConnection',
+  'saveWorkerConfig', 'testWorkerConnection',
+  'saveOrchestratorConfig', 'testOrchestratorConnection',
+  'saveAuxiliaryConfig', 'testAuxiliaryConnection',
   'fetchModelList',
 ]);
 
@@ -28,9 +28,6 @@ export class ConfigCommandHandler implements CommandHandler {
 
   async handle(message: WebviewToExtensionMessage, ctx: CommandHandlerContext): Promise<void> {
     switch (message.type) {
-      case 'getProfileConfig':
-        await this.sendProfileConfig(ctx);
-        break;
       case 'saveProfileConfig':
         await this.handleSaveProfileConfig(message as Msg<'saveProfileConfig'>, ctx);
         break;
@@ -42,26 +39,17 @@ export class ConfigCommandHandler implements CommandHandler {
         ctx.sendData('promptEnhanced', { enhancedPrompt: result.enhancedPrompt, error: result.error || '' });
         break;
       }
-      case 'loadAllWorkerConfigs':
-        await this.handleLoadAllWorkerConfigs(ctx);
-        break;
       case 'saveWorkerConfig':
         await this.handleSaveWorkerConfig(message as Msg<'saveWorkerConfig'>, ctx);
         break;
       case 'testWorkerConnection':
         await this.handleTestWorkerConnection(message as Msg<'testWorkerConnection'>, ctx);
         break;
-      case 'loadOrchestratorConfig':
-        await this.handleLoadOrchestratorConfig(ctx);
-        break;
       case 'saveOrchestratorConfig':
         await this.handleSaveOrchestratorConfig(message as Msg<'saveOrchestratorConfig'>, ctx);
         break;
       case 'testOrchestratorConnection':
         await this.handleTestOrchestratorConnection(message as Msg<'testOrchestratorConnection'>, ctx);
-        break;
-      case 'loadAuxiliaryConfig':
-        await this.handleLoadAuxiliaryConfig(ctx);
         break;
       case 'saveAuxiliaryConfig':
         await this.handleSaveAuxiliaryConfig(message as Msg<'saveAuxiliaryConfig'>, ctx);
@@ -73,53 +61,6 @@ export class ConfigCommandHandler implements CommandHandler {
         await this.handleFetchModelList(message as Msg<'fetchModelList'>, ctx);
         break;
     }
-  }
-
-  // ============================================================================
-  // Profile 配置
-  // ============================================================================
-
-  private async sendProfileConfig(ctx: CommandHandlerContext): Promise<void> {
-    const { WorkerAssignmentStorage, CATEGORY_DEFINITIONS, CATEGORY_RULES } = await import('../../orchestrator/profile');
-    const assignments = WorkerAssignmentStorage.ensureDefaults();
-    const assignmentMap: Record<string, string> = {};
-
-    for (const [worker, categories] of Object.entries(assignments.assignments)) {
-      for (const category of categories) {
-        assignmentMap[category] = worker;
-      }
-    }
-
-    const categoryGuidance: Record<string, any> = {};
-    for (const [category, definition] of Object.entries(CATEGORY_DEFINITIONS)) {
-      categoryGuidance[category] = {
-        displayName: definition.displayName,
-        description: definition.description,
-        guidance: {
-          focus: definition.guidance?.focus || [],
-          constraints: definition.guidance?.constraints || [],
-        },
-        priority: definition.priority,
-        riskLevel: definition.riskLevel,
-      };
-    }
-
-    const uiConfig: any = {
-      assignments: assignmentMap,
-      categoryGuidance,
-      categoryPriority: CATEGORY_RULES.categoryPriority,
-      configPath: WorkerAssignmentStorage.getConfigPath(),
-    };
-
-    try {
-      const { LLMConfigLoader } = await import('../../llm/config');
-      const userRules = LLMConfigLoader.loadUserRules();
-      uiConfig.userRules = userRules.content || '';
-    } catch (error) {
-      logger.warn('加载用户规则失败', { error }, LogCategory.LLM);
-    }
-
-    ctx.sendData('profileConfig', { config: uiConfig });
   }
 
   private async handleSaveProfileConfig(message: Msg<'saveProfileConfig'>, ctx: CommandHandlerContext): Promise<void> {
@@ -169,7 +110,7 @@ export class ConfigCommandHandler implements CommandHandler {
         ctx.sendToast(t('config.toast.profileReloadFailed', { error: reloadMsg }), 'warning');
       }
 
-      await this.sendProfileConfig(ctx);
+      await ctx.refreshSettingsBootstrap();
       logger.info('界面.画像.配置.已保存', { path: WorkerAssignmentStorage.getConfigPath() }, LogCategory.UI);
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
@@ -201,7 +142,7 @@ export class ConfigCommandHandler implements CommandHandler {
 
       ctx.sendToast(t('config.toast.profileResetDone'), 'success');
       ctx.sendData('profileConfigReset', { success: true });
-      await this.sendProfileConfig(ctx);
+      await ctx.refreshSettingsBootstrap();
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       ctx.sendData('profileConfigReset', { success: false, error: errorMsg });
@@ -212,17 +153,6 @@ export class ConfigCommandHandler implements CommandHandler {
   // ============================================================================
   // LLM 配置管理
   // ============================================================================
-
-  private async handleLoadAllWorkerConfigs(ctx: CommandHandlerContext): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../../llm/config');
-      const fullConfig = LLMConfigLoader.loadFullConfig();
-      ctx.sendData('allWorkerConfigsLoaded', { configs: fullConfig.workers });
-    } catch (error: any) {
-      logger.error('加载 Worker 配置失败', { error: error.message }, LogCategory.LLM);
-      ctx.sendToast(t('config.toast.loadConfigFailed', { error: error.message }), 'error');
-    }
-  }
 
   private async handleSaveWorkerConfig(message: Msg<'saveWorkerConfig'>, ctx: CommandHandlerContext): Promise<void> {
     try {
@@ -239,7 +169,7 @@ export class ConfigCommandHandler implements CommandHandler {
         ctx.sendToast(t('config.toast.workerRefreshFailed', { error: reloadMsg }), 'warning');
       }
       ctx.sendToast(t('config.toast.workerConfigSaved', { worker: message.worker }), 'success');
-      ctx.refreshWorkerStatus();
+      await ctx.refreshSettingsBootstrap(true);
       logger.info('Worker 配置已保存', { worker: message.worker }, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存 Worker 配置失败', { worker: message.worker, error: error.message }, LogCategory.LLM);
@@ -276,17 +206,6 @@ export class ConfigCommandHandler implements CommandHandler {
     }
   }
 
-  private async handleLoadOrchestratorConfig(ctx: CommandHandlerContext): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../../llm/config');
-      const config = LLMConfigLoader.loadOrchestratorConfig();
-      ctx.sendData('orchestratorConfigLoaded', { config });
-    } catch (error: any) {
-      logger.error('加载编排者配置失败', { error: error.message }, LogCategory.LLM);
-      ctx.sendToast(t('config.toast.loadConfigFailed', { error: error.message }), 'error');
-    }
-  }
-
   private async handleSaveOrchestratorConfig(message: Msg<'saveOrchestratorConfig'>, ctx: CommandHandlerContext): Promise<void> {
     try {
       const { LLMConfigLoader } = await import('../../llm/config');
@@ -295,7 +214,7 @@ export class ConfigCommandHandler implements CommandHandler {
       const { clearClientCache } = await import('../../llm/clients/client-factory');
       clearClientCache();
       ctx.sendToast(t('config.toast.orchestratorSaved'), 'success');
-      ctx.refreshWorkerStatus();
+      await ctx.refreshSettingsBootstrap(true);
       logger.info('编排者配置已保存', undefined, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存编排者配置失败', { error: error.message }, LogCategory.LLM);
@@ -332,17 +251,6 @@ export class ConfigCommandHandler implements CommandHandler {
     }
   }
 
-  private async handleLoadAuxiliaryConfig(ctx: CommandHandlerContext): Promise<void> {
-    try {
-      const { LLMConfigLoader } = await import('../../llm/config');
-      const config = LLMConfigLoader.loadAuxiliaryConfig();
-      ctx.sendData('auxiliaryConfigLoaded', { config });
-    } catch (error: any) {
-      logger.error('加载辅助模型配置失败', { error: error.message }, LogCategory.LLM);
-      ctx.sendToast(t('config.toast.loadConfigFailed', { error: error.message }), 'error');
-    }
-  }
-
   private async handleSaveAuxiliaryConfig(message: Msg<'saveAuxiliaryConfig'>, ctx: CommandHandlerContext): Promise<void> {
     try {
       const { LLMConfigLoader } = await import('../../llm/config');
@@ -351,7 +259,7 @@ export class ConfigCommandHandler implements CommandHandler {
       clearClientCache();
       await ctx.getOrchestratorEngine().reloadCompressionAdapter();
       ctx.sendToast(t('config.toast.auxiliarySaved'), 'success');
-      ctx.refreshWorkerStatus();
+      await ctx.refreshSettingsBootstrap(true);
       logger.info('辅助模型配置已保存', undefined, LogCategory.LLM);
     } catch (error: any) {
       logger.error('保存辅助模型配置失败', { error: error.message }, LogCategory.LLM);

@@ -10,6 +10,8 @@ import * as path from 'path';
 import * as os from 'os';
 import { t, setLocale as setExtensionLocale, type LocaleCode } from '../i18n';
 import { ConfigManager } from '../config';
+import { resolveConfiguredAgentBaseUrl, resolveConfiguredAgentPort } from '../agent/runtime-state';
+import { buildLanAccessInfo } from '../agent/lan-access';
 import {
   UIState,
   WebviewToExtensionMessage,
@@ -21,13 +23,13 @@ import {
   WorkerStatus,
   WorkerSlot,
 } from '../types';
+import { GovernedKnowledgeContextService } from '../knowledge/governed-knowledge-context-service';
 import {
   StandardMessage,
   MessageLifecycle,
   MessageType,
   MessageCategory,
   ContentBlock,
-  StandardizedToolResultPayload,
   DataMessageType,
   NotifyLevel,
   ControlMessageType,
@@ -36,7 +38,8 @@ import {
   createStreamingMessage,
   createErrorMessage,
 } from '../protocol/message-protocol';
-import { UnifiedSessionManager, type SessionMessage } from '../session';
+import { UnifiedSessionManager } from '../session';
+import { resolveStandardMessageSessionBinding } from '../session/standard-message-session-binding';
 import { TaskView } from '../task/task-view-adapter';
 import { SnapshotManager } from '../snapshot-manager';
 import { DiffGenerator } from '../diff-generator';
@@ -54,9 +57,24 @@ import { ConfigCommandHandler, McpCommandHandler, SkillsCommandHandler, Knowledg
 import { isAbortError } from '../errors';
 import { isModelOriginIssue, toModelOriginUserMessage } from '../errors/model-origin';
 import { trackModelOriginEvent } from '../errors/model-origin-observability';
+import { buildExecutionStatsPayload, buildModelCatalogFromLLMConfig } from '../shared/execution-stats-payload';
+import {
+  buildSessionBootstrapTimelineProjection,
+  type SessionBootstrapSnapshot,
+} from '../shared/session-bootstrap';
+import type { SessionTimelineProjection } from '../session/session-timeline-projection';
+import { materializeProjectionSourceMessagesFromTimelineRecords } from '../session/timeline-record-adapter';
+import {
+  buildSettingsBootstrapSnapshot,
+  type SettingsBootstrapSnapshot,
+  type SettingsRuntimeSnapshot,
+} from '../shared/settings-bootstrap';
+import { buildSettingsBootstrapPayload } from './settings-bootstrap-builder';
 import { EventBindingService } from './event-binding-service';
 import { WorkerStatusService } from './worker-status-service';
 import { PromptEnhancerService } from '../services/prompt-enhancer-service';
+import { OrchestrationRuntimeQueryService } from '../orchestrator/runtime/orchestration-runtime-query-service';
+import { createRuntimeHostContext, type RuntimeHostContext } from '../host';
 import {
   MissionOrchestrator,
 } from '../orchestrator/core';
@@ -167,9 +185,11 @@ class WebviewMessageBus {
           this.normalQueue.length = 0;
           break;
         }
+        // unifiedMessage / unifiedUpdate / unifiedComplete 的 eventSeq 是唯一权威顺序。
+        // 这里必须严格串行投递到 Webview，禁止再以“谁先到达”重新定义 live 时间轴。
         try {
           await view.webview.postMessage(next);
-        } catch (postError) {
+        } catch (postError: unknown) {
           logger.warn('界面.消息.发送失败', {
             messageId: 'message' in next ? (next.message as StandardMessage)?.id : undefined,
             error: String(postError),
@@ -196,6 +216,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private readonly workspaceRoots: WorkspaceRoots;
 
   private _view?: vscode.WebviewView;
+ private agentBaseUrl = '';
   private sessionManager: UnifiedSessionManager;
   private snapshotManager: SnapshotManager;
   private diffGenerator: DiffGenerator;
@@ -231,19 +252,25 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
   // Worker 状态检查服务
   private workerStatusService: WorkerStatusService;
+  private settingsBootstrapInFlight: Promise<void> | null = null;
+  private sessionBootstrapInFlight: Promise<SessionBootstrapSnapshot | null> | null = null;
+  private sessionBootstrapInFlightSessionId: string | null = null;
   private interactionModeUpdatedAt = 0;
 
 
   private activeSessionId: string | null = null;
   private logs: LogEntry[] = [];
   private logFlushTimer: NodeJS.Timeout | null = null;
+  private readonly runtimeQueryService = new OrchestrationRuntimeQueryService();
+  private readonly runtimeHost: RuntimeHostContext;
 
 
   private readonly authSecretKey = 'magi.apiKey';
   private readonly authStatusKey = 'magi.loggedIn';
   private loginInFlight = false;
   private startupRecoveryPromise: Promise<void> | null = null;
-  private runtimeInitializationPromise: Promise<void>;
+  private projectKnowledgeBaseInitPromise: Promise<void> | null = null;
+  private runtimeInitializationPromise: Promise<void> | null = null;
   private runtimeInitializationError: string | null = null;
   private locale: LocaleCode;
 
@@ -254,7 +281,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   constructor(
     private readonly extensionUri: vscode.Uri,
     private readonly context: vscode.ExtensionContext,
-    workspaceFolders: WorkspaceFolderInfo[]
+   workspaceFolders: WorkspaceFolderInfo[],
+   agentBaseUrl = '',
   ) {
     const normalizedFolders = workspaceFolders
       .filter(folder => folder && folder.path)
@@ -275,7 +303,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       COALESCE_MESSAGE_TYPES
     );
 
-    // MessageHub 由 MissionDrivenEngine 创建，初始化后再绑定监听
+   // Agent 可用时：壳模式 —— 前端走 Agent HTTP/SSE，宿主不承载业务 runtime
+   this.agentBaseUrl = agentBaseUrl;
+   if (agentBaseUrl) {
+     logger.info('界面.WebviewProvider.壳模式', { agentBaseUrl }, LogCategory.UI);
+     return;
+   }
+
+   // Agent 不可用时：完整 runtime 模式 —— 宿主自持编排引擎
 
     // 初始化统一会话管理器
     this.sessionManager = new UnifiedSessionManager(this.workspaceRoot);
@@ -292,20 +327,22 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const maxTimeout = config.get<number>('maxTimeout') ?? 900000;
     const permissions = this.normalizePermissions(config.get<Partial<PermissionMatrix>>('permissions'));
     const strategy = this.normalizeStrategy(config.get<Partial<StrategyConfig>>('strategy'));
+    this.runtimeHost = createRuntimeHostContext({
+      workspaceRoot: this.workspaceRoot,
+      workspaceFolders: this.workspaceFolders,
+      sessionManager: this.sessionManager,
+      snapshotManager: this.snapshotManager,
+      getCurrentSessionId: () => this.activeSessionId || this.sessionManager.getCurrentSession()?.id || null,
+    });
 
     // 初始化 LLM 适配器工厂
-    this.adapterFactory = new LLMAdapterFactory({
-      cwd: this.workspaceRoot,
-      workspaceFolders: this.workspaceFolders,
-    });
+    this.adapterFactory = new LLMAdapterFactory(this.runtimeHost);
 
     // 初始化编排引擎
     this.orchestratorEngine = new MissionDrivenEngine(
       this.adapterFactory,
       { timeout, maxRetries: 3, permissions, strategy },
-      this.workspaceRoot,
-      this.snapshotManager,
-      this.sessionManager
+      this.runtimeHost
     );
     this.messageHub = this.orchestratorEngine.getMessageHub();
 
@@ -313,34 +350,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // MessageHub 从 orchestratorEngine 获取后，立即注入给 AdapterFactory
     // 这样 Adapter 可以直接通过 MessageHub 发送消息
     (this.adapterFactory as LLMAdapterFactory).setMessageHub(this.messageHub);
-    this.syncMessageHubTrace(this.activeSessionId);
+    this.syncMessageHubSessionContext(this.activeSessionId);
 
     // 注入 SnapshotManager 到 ToolManager（确保工具级文件写入自动创建快照）
     (this.adapterFactory as LLMAdapterFactory).getToolManager().setSnapshotManager(this.snapshotManager);
 
-    // 异步初始化运行时（AdapterFactory + OrchestratorEngine）并建立统一门闩
-    const adapterFactoryInit = (this.adapterFactory as LLMAdapterFactory).initialize().catch(err => {
-      logger.error('Failed to initialize LLM adapter factory', { error: err.message }, LogCategory.LLM);
-      throw err;
-    });
-    const orchestratorEngineInit = this.orchestratorEngine.initialize().catch(err => {
-      logger.error('Failed to initialize orchestrator engine', { error: err.message }, LogCategory.ORCHESTRATOR);
-      throw err;
-    });
-    this.runtimeInitializationPromise = Promise.all([adapterFactoryInit, orchestratorEngineInit])
-      .then(() => {
-        this.runtimeInitializationError = null;
-      })
-      .catch((error) => {
-        this.runtimeInitializationError = error instanceof Error ? error.message : String(error);
-      });
-
     this.interactionModeUpdatedAt = Date.now();
-
-    this.orchestratorEngine.setExtensionContext(this.context);
-
-    // 初始化项目知识库
-    this.initializeProjectKnowledgeBase();
 
     // 初始化提示词增强服务
     this.promptEnhancer = new PromptEnhancerService({
@@ -361,14 +376,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       getAdapterFactory: () => this.adapterFactory,
       getOrchestratorEngine: () => this.orchestratorEngine,
       getProjectKnowledgeBase: () => this.projectKnowledgeBase,
+      ensureProjectKnowledgeBaseReady: async () => this.ensureProjectKnowledgeBaseReady(),
       getWorkspaceRoot: () => this.workspaceRoot,
       getPromptEnhancer: () => this.promptEnhancer,
       getExtensionUri: () => this.extensionUri,
-      refreshWorkerStatus: () => {
-        this.workerStatusService.invalidateCache();
-        void this.workerStatusService.sendWorkerStatus(true).catch((error) => {
-          logger.warn('界面.配置变更.模型状态刷新_失败', { error: String(error) }, LogCategory.UI);
-        });
+      refreshSettingsBootstrap: async (force = false) => {
+        if (force) {
+          this.workerStatusService.invalidateCache();
+        }
+        await this.sendSettingsBootstrapToWebview(force);
       },
     };
     this.commandHandlers = [
@@ -380,7 +396,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     // 初始化 Worker 状态检查服务
     this.workerStatusService = new WorkerStatusService({
-      sendData: (dataType, payload) => this.sendData(dataType, payload),
       getAdapterFactory: () => this.adapterFactory,
     });
 
@@ -404,6 +419,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       clearRequestTimeout: (requestId) => this.clearRequestTimeout(requestId),
       interruptCurrentTask: (options) => this.interruptCurrentTask(options),
       tryResumePendingRecovery: () => { void this.tryResumePendingRecovery(); },
+      getMessageSnapshot: (messageId) => this.messageHub.getMessageSnapshot(messageId),
+      getLiveSessionTimelineProjection: (sessionId) => this.getLiveSessionTimelineProjection(sessionId),
+      persistStandardMessageToSession: (sessionId, message) => this.persistStandardMessageToSession(sessionId, message),
     });
     this.eventBindingService.bindAll();
     this.configureToolAuthorizationBridge();
@@ -472,16 +490,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
    */
   private async initializeProjectKnowledgeBase(): Promise<void> {
     try {
-      this.projectKnowledgeBase = new ProjectKnowledgeBase({
+      const knowledgeBase = new ProjectKnowledgeBase({
         projectRoot: this.workspaceRoot
       });
-      await this.projectKnowledgeBase.initialize();
+      await knowledgeBase.initialize();
 
       // 设置辅助模型客户端（用于知识提取 + 查询扩展）
+      this.projectKnowledgeBase = knowledgeBase;
       await this.setupKnowledgeExtractionClient();
 
       // 注入知识库到编排器
-      this.orchestratorEngine.setKnowledgeBase(this.projectKnowledgeBase);
+      this.orchestratorEngine.setKnowledgeBase(knowledgeBase);
 
       // 监听任务完成事件，自动提取知识
       this.setupAutoKnowledgeExtraction();
@@ -492,7 +511,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       // 注入代码库检索基础设施（code_search_semantic 的唯一实现）
       this.injectCodebaseRetrievalService();
 
-      const codeIndex = this.projectKnowledgeBase.getCodeIndex();
+      const codeIndex = knowledgeBase.getCodeIndex();
       logger.info('项目知识库.已初始化', {
         files: codeIndex ? codeIndex.files.length : 0
       }, LogCategory.SESSION);
@@ -501,14 +520,28 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async ensureProjectKnowledgeBaseReady(): Promise<ProjectKnowledgeBase | undefined> {
+    if (this.projectKnowledgeBase) {
+      return this.projectKnowledgeBase;
+    }
+    if (!this.projectKnowledgeBaseInitPromise) {
+      this.projectKnowledgeBaseInitPromise = this.initializeProjectKnowledgeBase()
+        .finally(() => {
+          this.projectKnowledgeBaseInitPromise = null;
+        });
+    }
+    await this.projectKnowledgeBaseInitPromise;
+    return this.projectKnowledgeBase;
+  }
+
   /** 向 Webview 推送最新的知识库数据 */
   private sendProjectKnowledgeToWebview(): void {
     if (!this.projectKnowledgeBase) { return; }
-    const codeIndex = this.projectKnowledgeBase.getCodeIndex();
-    const adrs = this.projectKnowledgeBase.getADRs();
-    const faqs = this.projectKnowledgeBase.getFAQs();
-    const learnings = this.projectKnowledgeBase.getLearnings();
-    this.sendData('projectKnowledgeLoaded', { codeIndex, adrs, faqs, learnings });
+    const payload = new GovernedKnowledgeContextService(this.projectKnowledgeBase).buildKnowledgeSnapshot({
+      purpose: 'ui_panel',
+      consumer: 'webview_provider',
+    });
+    this.sendData('projectKnowledgeLoaded', payload as unknown as Record<string, unknown>);
   }
 
   /**
@@ -802,19 +835,24 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     userMessageId: string;
     placeholderMessageId: string;
   } {
+    const sessionId = this.activeSessionId?.trim();
+    if (!sessionId) {
+      throw new Error('[WebviewProvider] emitUserAndPlaceholder 缺少 activeSessionId');
+    }
     const traceId = this.messageHub.getTraceId();
     // 图片已通过缩略图展示，不再在文本中附加 [附件: X 张图片]
     const displayContent = prompt;
+    const worker = typeof targetWorker === 'string' ? targetWorker.trim() : '';
 
     const userMessage = createUserInputMessage(displayContent, traceId, {
       metadata: {
         requestId,
         turnId,
         sendingAnimation: true,
+        sessionId,
         // 附带图片数据供前端展示
         images: images && images.length > 0 ? images : undefined,
-        // 指定 Worker 直接对话时，标记目标 Worker，前端据此在 Worker 面板展示用户消息
-        ...(targetWorker ? { targetWorker } : {}),
+        ...(worker ? { worker } : {}),
       },
     });
 
@@ -824,6 +862,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         placeholderState: 'pending',
         requestId,
         userMessageId: userMessage.id,
+        sessionId,
       },
     });
 
@@ -876,6 +915,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
       }
     }
+  }
+
+  private clearRequestTracking(): void {
+    for (const timeout of this.requestTimeouts.values()) {
+      clearTimeout(timeout);
+    }
+    this.requestTimeouts.clear();
+    this.messageIdToRequestId.clear();
   }
 
   private resolveRequestTimeoutFromMessage(message: StandardMessage): void {
@@ -1000,7 +1047,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       for (const task of runningTasks) {
         await this.orchestratorEngine.cancelTaskById(task.id);
 
-        // 🔧 P1-4: 发送停止状态卡片，确保 UI 视觉反馈
+        // 🔧 P1-4: 发送取消状态卡片，确保 UI 视觉反馈
         // 遍历该任务下的所有子任务，更新其状态
         if (task.subTasks && task.subTasks.length > 0) {
           for (const subTask of task.subTasks) {
@@ -1009,9 +1056,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
               this.messageHub.subTaskCard({
                 id: subTask.assignmentId || subTask.id, // 优先使用 assignmentId 以匹配 Mission 体系
                 title: subTask.title || subTask.description || t('provider.subTaskFallbackTitle'),
-                status: 'stopped',
+                status: 'cancelled',
                 worker: subTask.assignedWorker,
                 summary: t('provider.userAborted'),
+                sessionId: this.activeSessionId || this.sessionManager.getCurrentSession()?.id || undefined,
               });
             }
           }
@@ -1031,8 +1079,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     // 清理编排者流式输出缓存，避免跨任务串流
     this.streamMessageIds.clear();
-    // 发送 task_failed 控制消息，确保前端 clearProcessingState() 被触发
-    // 前端只响应 task_completed/task_failed 来清除处理态，processingStateChanged(false) 会被忽略
+    // 发送 task_failed 控制消息，仅用于请求级终态通知；
+    // 真正的全局处理态收口由 forceProcessingState(false) -> processingStateChanged(false, forced) 负责。
     this.messageHub.sendControl(ControlMessageType.TASK_FAILED, {
       error: t('provider.userCancelled'),
       cancelled: true,
@@ -1041,6 +1089,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // 同步清理后端管道的处理态
     this.cancelProcessingResetFallback();
     this.messageHub.forceProcessingState(false);
+    this.eventBindingService.flushLiveMessageSnapshots({ silent: true });
+    this.clearRequestTracking();
 
     if (hasRunningTask && !options?.silent) {
       const interruptionSummary = this.buildInterruptionSummary(runningTasks);
@@ -1058,6 +1108,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         messageType: 'text',
         metadata: { phase: 'interrupted' },
       });
+    }
+
+    // 5. 通知前端当前执行链可恢复
+    const activeChainId = this.orchestratorEngine.getActiveChainId();
+    if (activeChainId) {
+      const chainQuery = this.orchestratorEngine.getExecutionChainQuery();
+      if (chainQuery.isChainRecoverable(activeChainId)) {
+        this.sendData('executionChainInterrupted', {
+          chainId: activeChainId,
+          recoverable: true,
+        });
+      }
     }
 
     this.sendStateUpdate();
@@ -1118,6 +1180,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       metadata: {
         taskId,
         isStatusMessage: true, // 标记为状态消息，区别于 LLM 对话响应
+        ...(this.activeSessionId ? { sessionId: this.activeSessionId } : {}),
         ...metadata,
       },
     });
@@ -1160,25 +1223,37 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       this.context.subscriptions
     );
 
-    // Webview 初始化时强制中断可能残留的任务，避免重启后状态错乱。
-    // 使用启动恢复栅栏，确保 getState/requestState 不会读到残留 running 状态。
-    this.startupRecoveryPromise = this.interruptCurrentTask({ silent: true })
+    this.startupRecoveryPromise = this.recoverStartupRuntimeState()
       .catch((error) => {
-        logger.warn('界面.启动.残留任务清理_失败', { error: String(error) }, LogCategory.UI);
+        logger.warn('界面.启动.运行态收敛_失败', { error: String(error) }, LogCategory.UI);
       })
       .finally(() => {
         this.startupRecoveryPromise = null;
       });
 
-    // 🔧 启动时进行真正的 LLM 连接测试（替代浅层检查）
-    // 使用 sendWorkerStatus(true) 强制检测所有模型连接状态
-    // 这会发送 workerStatusUpdate 消息，前端能正确处理并更新 BottomTabs 状态
-    void this.workerStatusService.sendWorkerStatus(true).catch((error) => {
-      logger.warn('界面.启动.模型状态检测_失败', { error: String(error) }, LogCategory.UI);
-    });
-
     // 发送执行统计数据
     this.sendExecutionStats();
+  }
+
+  private async recoverStartupRuntimeState(): Promise<void> {
+    if (this.orchestratorEngine.running) {
+      return;
+    }
+    const sessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id;
+    if (!sessionId) {
+      return;
+    }
+    const chainQuery = this.orchestratorEngine.getExecutionChainQuery();
+    if (!chainQuery.getRunningChain(sessionId)) {
+      return;
+    }
+
+    const recovery = await this.orchestratorEngine.getTaskViewService().recoverRunningState({
+      sessionId,
+    });
+    if (recovery.recovered) {
+      this.recoveredSinceLastUpdate = true;
+    }
   }
 
 
@@ -1219,26 +1294,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
     switch (message.type) {
       case 'getState':
-        this.sendStateUpdate();
         await this.sendCurrentSessionToWebview();
-        this.syncWorkerStatusToWebview(false, 'getState');
         break;
 
       case 'requestState':
-        this.sendStateUpdate();
         await this.sendCurrentSessionToWebview();
-        this.syncWorkerStatusToWebview(false, 'requestState');
         break;
 
       case 'webviewReady':
         // Webview 就绪后立即推送完整系统数据（任务、变更、会话等）
         // 这些数据不在 vscode.getState() 持久化范围内，必须由后端主动推送
         logger.info('界面.Webview.就绪', undefined, LogCategory.UI);
-        this.sendStateUpdate();
         await this.sendCurrentSessionToWebview();
-        // 启动期的 workerStatusUpdate 可能早于 Webview ready 发出并被丢弃，
-        // ready 后必须补发一次缓存/最新状态，确保底部 Worker Tab 自恢复。
-        this.syncWorkerStatusToWebview(false, 'webviewReady');
         break;
 
       case 'login':
@@ -1247,10 +1314,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       case 'logout':
         await this.handleLogoutMessage();
-        break;
-
-      case 'getStatus':
-        await this.handleGetStatusMessage();
         break;
 
       case 'uiError': {
@@ -1281,7 +1344,12 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
               'orchestrator',
               'orchestrator',
               traceId,
-              { metadata: { requestId: execRequestId } }
+              {
+                metadata: {
+                  requestId: execRequestId,
+                  ...(this.activeSessionId ? { sessionId: this.activeSessionId } : {}),
+                },
+              }
             );
             this.messageHub.sendMessage(errorMessage);
           }
@@ -1307,6 +1375,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         await this.interruptCurrentTask({ silent: Boolean(message.silent) });
         break;
 
+      case 'continueTask':
+        logger.info('界面.任务.继续.消息', { taskId: message.taskId }, LogCategory.UI);
+        await this.handleContinueTask(message.prompt, message.taskId);
+        break;
+
       case 'startTask':
         await this.handleStartTask(message.taskId);
         break;
@@ -1325,6 +1398,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
         logger.info('界面.任务.恢复.消息', { taskId: message.taskId }, LogCategory.UI);
         await this.handleResumeTask(message.taskId);
+        break;
+
+      case 'abandonChain':
+        logger.info('界面.执行链.放弃', { chainId: message.chainId }, LogCategory.UI);
+        if (typeof message.chainId === 'string' && message.chainId.trim()) {
+          const abandoned = this.orchestratorEngine.abandonChain(message.chainId);
+          if (abandoned) {
+            this.sendToast('执行链已放弃', 'info');
+          }
+          this.sendStateUpdate();
+        }
         break;
 
       case 'appendMessage':
@@ -1419,37 +1503,23 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         }
         break;
 
-      case 'confirmPlan': {
-        const accepted = this.orchestratorEngine.resolvePlanConfirmation(Boolean(message.confirmed));
-        if (!accepted) {
-          logger.warn('界面.计划确认.无待处理请求', undefined, LogCategory.UI);
-        }
-        break;
-      }
-
       case 'newSession':
-        if (Array.isArray(message.currentMessages)) {
-          this.saveCurrentSessionData(message.currentMessages);
-        }
+        this.sessionManager.saveCurrentSession();
         await this.handleNewSession();
         break;
 
       case 'saveCurrentSession':
-        // 保存当前会话的消息
-        this.saveCurrentSessionData(message.messages);
+        this.sessionManager.saveCurrentSession();
         break;
 
       case 'switchSession':
-        if (Array.isArray(message.currentMessages)) {
-          this.saveCurrentSessionData(message.currentMessages);
-        }
+        this.sessionManager.saveCurrentSession();
 
         if (this.activeSessionId !== message.sessionId) {
           await this.interruptCurrentTask({ silent: true });
         }
         // 切换会话
         await this.switchToSession(message.sessionId);
-        this.sendStateUpdate();
         break;
 
       case 'renameSession':
@@ -1487,6 +1557,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         break;
       }
 
+      case 'markAllNotificationsRead':
+        this.handleMarkAllNotificationsRead();
+        break;
+
+      case 'clearAllNotifications':
+        this.handleClearAllNotifications();
+        break;
+
+      case 'removeNotification':
+        this.handleRemoveNotification(message.notificationId);
+        break;
+
       case 'toolAuthorizationResponse':
         // 用户响应工具授权请求
         this.eventBindingService.handleToolAuthorizationResponse(message.requestId, message.allowed);
@@ -1512,14 +1594,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         await this.handleRecoveryConfirmation(message.decision);
         break;
 
-      case 'confirmDeliveryRepair': {
-        const decision = message.decision === 'repair' ? 'repair' : 'stop';
-        const accepted = this.orchestratorEngine.resolveDeliveryRepairConfirmation(decision);
-        if (!accepted) {
-          logger.warn('界面.交付修复确认.无待处理请求', undefined, LogCategory.UI);
-        }
+      case 'answerClarification':
+        await this.handleClarificationAnswer(message.answers, message.additionalInfo);
         break;
-      }
+
+      case 'answerWorkerQuestion':
+        await this.handleWorkerQuestionAnswer(message.answer);
+        break;
 
       case 'requestExecutionStats':
 
@@ -1529,20 +1610,36 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         await this.handleResetExecutionStats();
         break;
 
-      case 'checkWorkerStatus':
-        this.workerStatusService.sendWorkerStatus(Boolean(message.force));
+      case 'loadSettingsBootstrap':
+        if (message.force) {
+          await this.ensureRuntimeInitialized();
+        }
+        await this.sendSettingsBootstrapToWebview(Boolean(message.force));
         break;
-
 
       case 'clearAllTasks':
 
         this.handleClearAllTasks();
         break;
 
-      case 'getDeepTaskState': {
-        // 推送当前深度任务模式状态到前端
-        const deepTaskValue = vscode.workspace.getConfiguration('magi').get<boolean>('deepTask', false);
-        this.sendData('deepTaskChanged', { enabled: deepTaskValue });
+      case 'getLanAccessInfo': {
+        const lanInfo = this.buildLanAccessInfo();
+        this.sendData('lanAccessInfo', lanInfo);
+        break;
+      }
+
+      case 'getTunnelStatus': {
+        await this.sendTunnelStateFromAgent();
+        break;
+      }
+
+      case 'startTunnel': {
+        await this.sendTunnelCommandToAgent('/api/tunnel/start');
+        break;
+      }
+
+      case 'stopTunnel': {
+        await this.sendTunnelCommandToAgent('/api/tunnel/stop');
         break;
       }
 
@@ -1560,37 +1657,142 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       case 'webviewReady':
       case 'login':
       case 'logout':
-      case 'getStatus':
       case 'uiError':
       case 'openFile':
       case 'openLink':
       case 'saveCurrentSession':
-      case 'getDeepTaskState':
+      case 'loadSettingsBootstrap':
+      case 'getLanAccessInfo':
+      case 'getTunnelStatus':
+      case 'startTunnel':
+      case 'stopTunnel':
         return false;
       default:
         return true;
     }
   }
 
+  private scheduleRuntimeInitialization(): Promise<void> {
+    if (this.runtimeInitializationPromise) {
+      return this.runtimeInitializationPromise;
+    }
+
+    const adapterFactoryInit = (this.adapterFactory as LLMAdapterFactory).initialize().catch(err => {
+      logger.error('Failed to initialize LLM adapter factory', { error: err.message }, LogCategory.LLM);
+      throw err;
+    });
+    const orchestratorEngineInit = this.orchestratorEngine.initialize().catch(err => {
+      logger.error('Failed to initialize orchestrator engine', { error: err.message }, LogCategory.ORCHESTRATOR);
+      throw err;
+    });
+
+    this.runtimeInitializationPromise = Promise.all([adapterFactoryInit, orchestratorEngineInit])
+      .then(() => {
+        this.runtimeInitializationError = null;
+      })
+      .catch((error) => {
+        this.runtimeInitializationError = error instanceof Error ? error.message : String(error);
+        throw error;
+      });
+
+    return this.runtimeInitializationPromise;
+  }
+
   private async ensureRuntimeInitialized(): Promise<void> {
-    await this.runtimeInitializationPromise;
+    await Promise.all([
+      this.scheduleRuntimeInitialization(),
+      this.ensureProjectKnowledgeBaseReady(),
+    ]);
     if (this.runtimeInitializationError) {
       throw new Error(this.runtimeInitializationError);
     }
   }
 
-  /**
-   * Worker 状态必须在 Webview ready / 刷新恢复后主动重放。
-   * 底部 Worker Tab 不应依赖 SettingsPanel 的 onMount 才获得正确状态。
-   */
-  private syncWorkerStatusToWebview(force: boolean, reason: string): void {
-    void this.workerStatusService.sendWorkerStatus(force).catch((error) => {
-      logger.warn('界面.Worker状态.同步_失败', {
-        reason,
-        force,
-        error: String(error),
-      }, LogCategory.UI);
+  private buildRuntimeSettingsSnapshot(): SettingsRuntimeSnapshot {
+    return {
+      locale: this.locale,
+      deepTask: vscode.workspace.getConfiguration('magi').get<boolean>('deepTask', false),
+    };
+  }
+
+  private async buildSettingsMcpServersSnapshot(): Promise<unknown[]> {
+    const { LLMConfigLoader } = await import('../llm/config');
+    const servers = LLMConfigLoader.loadMCPConfig();
+    for (const server of servers) {
+      if (!server || typeof server !== 'object') {
+        throw new Error('Invalid MCP server entry');
+      }
+      if (!server.id || typeof server.id !== 'string' || !server.id.trim()) {
+        throw new Error('MCP server missing id');
+      }
+      if (!server.name || typeof server.name !== 'string' || !server.name.trim()) {
+        throw new Error(`MCP server ${server.id || '<unknown>'} missing name`);
+      }
+    }
+
+    let manager: any = null;
+    try {
+      const executor = this.adapterFactory.getMCPExecutor();
+      if (executor && typeof (executor as any).getMCPManager === 'function') {
+        manager = await (executor as any).getMCPManager();
+      }
+    } catch {
+      manager = null;
+    }
+
+    const statusMap = new Map<string, any>();
+    if (manager && typeof manager.getAllServerStatuses === 'function') {
+      for (const status of manager.getAllServerStatuses()) {
+        if (status?.id) {
+          statusMap.set(status.id, status);
+        }
+      }
+    }
+
+    return servers.map((server: any) => {
+      const status = statusMap.get(server.id);
+      return {
+        ...server,
+        connected: status?.connected === true,
+        health: status?.health || (status?.connected ? 'connected' : 'disconnected'),
+        error: typeof status?.error === 'string' ? status.error : undefined,
+        toolCount: Number.isFinite(status?.toolCount) ? status.toolCount : 0,
+        reconnectAttempts: Number.isFinite(status?.reconnectAttempts) ? status.reconnectAttempts : 0,
+        lastCheckedAt: Number.isFinite(status?.lastCheckedAt) ? status.lastCheckedAt : undefined,
+        lastReconnectAt: Number.isFinite(status?.lastReconnectAt) ? status.lastReconnectAt : undefined,
+        lastReconnectSuccessfulAt: Number.isFinite(status?.lastReconnectSuccessfulAt) ? status.lastReconnectSuccessfulAt : undefined,
+      };
     });
+  }
+
+  private async sendSettingsBootstrapToWebview(force: boolean = false): Promise<void> {
+    if (!force && this.settingsBootstrapInFlight) {
+      return this.settingsBootstrapInFlight;
+    }
+    if (force && this.settingsBootstrapInFlight) {
+      await this.settingsBootstrapInFlight;
+    }
+
+    const doDispatch = async (): Promise<void> => {
+      const [workerStatuses, mcpServers] = await Promise.all([
+        this.workerStatusService.getWorkerStatusSnapshot(force),
+        this.buildSettingsMcpServersSnapshot(),
+      ]);
+      const payload = await buildSettingsBootstrapPayload({
+        mcpServers,
+        workerStatuses,
+      });
+      const snapshot: SettingsBootstrapSnapshot = buildSettingsBootstrapSnapshot(
+        payload,
+        this.buildRuntimeSettingsSnapshot(),
+      );
+      this.sendData('settingsBootstrapLoaded', snapshot as unknown as Record<string, unknown>);
+    };
+
+    this.settingsBootstrapInFlight = doDispatch().finally(() => {
+      this.settingsBootstrapInFlight = null;
+    });
+    return this.settingsBootstrapInFlight;
   }
 
   /** 处理登录消息 */
@@ -1643,16 +1845,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /** 处理状态查询消息 */
-  private async handleGetStatusMessage(): Promise<void> {
-    try {
-      const loggedIn = await this.isLoggedIn();
-      // auth 状态仅记录本地
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      // 获取状态失败，不向前端发送未消费事件
-    }
-  }
-
   /** 保存 API Key 到安全存储 */
   private async storeApiKey(apiKey: string): Promise<void> {
     await this.context.secrets.store(this.authSecretKey, apiKey);
@@ -1688,6 +1880,47 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * 获取局域网访问信息（IP + 端口 + 绑定当前工作区/会话的 Web URL）
+   */
+  private buildLanAccessInfo(): { url: string; ip: string; port: number; workspacePath: string | null; workspaceId: string | null; sessionId: string | null } {
+    const sessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id || null;
+    return buildLanAccessInfo({
+      workspacePath: this.workspaceRoot,
+      workspaceId: null,
+      sessionId,
+    }, resolveConfiguredAgentPort());
+  }
+
+  private buildTunnelBinding(): { workspacePath: string | null; workspaceId: string | null; sessionId: string | null } {
+    return {
+      workspacePath: this.workspaceRoot,
+      workspaceId: null,
+      sessionId: this.activeSessionId || this.sessionManager.getCurrentSession()?.id || null,
+    };
+  }
+
+  private async sendTunnelStateFromAgent(): Promise<void> {
+    const query = new URLSearchParams();
+    const binding = this.buildTunnelBinding();
+    if (binding.workspacePath) query.set('workspacePath', binding.workspacePath);
+    if (binding.workspaceId) query.set('workspaceId', binding.workspaceId);
+    if (binding.sessionId) query.set('sessionId', binding.sessionId);
+    const response = await fetch(`${resolveConfiguredAgentBaseUrl()}/api/tunnel/status?${query.toString()}`);
+    const payload = await response.json() as Record<string, unknown>;
+    this.sendData('tunnelState', payload);
+  }
+
+  private async sendTunnelCommandToAgent(pathname: '/api/tunnel/start' | '/api/tunnel/stop'): Promise<void> {
+    const response = await fetch(`${resolveConfiguredAgentBaseUrl()}${pathname}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(this.buildTunnelBinding()),
+    });
+    const payload = await response.json() as Record<string, unknown>;
+    this.sendData('tunnelState', payload);
+  }
+
+  /**
    * 在新标签页打开 Mermaid 图表
    */
   private handleOpenMermaidPanel(code: string, title?: string): void {
@@ -1713,77 +1946,16 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const modelCatalog = this.buildModelCatalog();
-    const catalogMap = new Map(modelCatalog.map(entry => [entry.id, entry]));
-    const modelIds = modelCatalog.map(entry => entry.id);
-    const normalizeProvider = (provider?: string): 'openai' | 'anthropic' | 'unknown' => {
-      if (provider === 'openai' || provider === 'anthropic') {
-        return provider;
-      }
-      return 'unknown';
-    };
-
-    const stats = executionStats.getAllStats(modelIds).map(workerStats => ({
-      worker: workerStats.worker,
-      provider: normalizeProvider(catalogMap.get(workerStats.worker)?.provider),
-      totalExecutions: workerStats.totalExecutions,
-      successCount: workerStats.successCount,
-      failureCount: workerStats.failureCount,
-      successRate: workerStats.successRate,
-      avgDuration: workerStats.avgDuration,
-      isHealthy: workerStats.isHealthy,
-      healthScore: workerStats.healthScore,
-      lastError: workerStats.lastError,
-      lastExecutionTime: workerStats.lastExecutionTime,
-      totalInputTokens: workerStats.totalInputTokens,
-      totalOutputTokens: workerStats.totalOutputTokens,
-    }));
-
-    const orchestratorStats = {
-      totalTasks: stats.reduce((sum, s) => sum + s.totalExecutions, 0),
-      totalSuccess: stats.reduce((sum, s) => sum + s.successCount, 0),
-      totalFailed: stats.reduce((sum, s) => sum + s.failureCount, 0),
-      totalInputTokens: stats.reduce((sum, s) => sum + (s.totalInputTokens || 0), 0),
-      totalOutputTokens: stats.reduce((sum, s) => sum + (s.totalOutputTokens || 0), 0),
-      totalTokens: stats.reduce((sum, s) => sum + (s.totalInputTokens || 0) + (s.totalOutputTokens || 0), 0),
-    };
-
-    this.sendData('executionStatsUpdate', { stats, orchestratorStats, modelCatalog });
+    this.sendData(
+      'executionStatsUpdate',
+      buildExecutionStatsPayload(executionStats, this.buildModelCatalog()) as unknown as Record<string, unknown>,
+    );
   }
 
-  private buildModelCatalog(): { id: string; label: string; model?: string; provider?: string; enabled?: boolean; role?: 'worker' | 'orchestrator' | 'auxiliary' | 'unknown' }[] {
+  private buildModelCatalog() {
     try {
       const { LLMConfigLoader } = require('../llm/config');
-      const fullConfig = LLMConfigLoader.loadFullConfig();
-      const entries: { id: string; label: string; model?: string; provider?: string; enabled?: boolean; role?: 'worker' | 'orchestrator' | 'auxiliary' | 'unknown' }[] = [];
-
-      const toLabel = (id: string) => id.charAt(0).toUpperCase() + id.slice(1);
-      const addEntry = (id: string, label: string, config: any, role: 'worker' | 'orchestrator' | 'auxiliary') => {
-        entries.push({
-          id,
-          label,
-          model: config?.model,
-          provider: config?.provider,
-          enabled: config?.enabled !== false,
-          role,
-        });
-      };
-
-      if (fullConfig?.workers) {
-        for (const [workerId, workerConfig] of Object.entries(fullConfig.workers)) {
-          addEntry(workerId, toLabel(workerId), workerConfig, 'worker');
-        }
-      }
-
-      if (fullConfig?.orchestrator) {
-        addEntry('orchestrator', 'Orchestrator', fullConfig.orchestrator, 'orchestrator');
-      }
-
-      if (fullConfig?.auxiliary) {
-        addEntry('auxiliary', 'Auxiliary', fullConfig.auxiliary, 'auxiliary');
-      }
-
-      return entries;
+      return buildModelCatalogFromLLMConfig(LLMConfigLoader.loadFullConfig());
     } catch (error) {
       logger.warn('界面.模型目录.加载失败', { error: (error as Error).message }, LogCategory.UI);
       return [];
@@ -1939,6 +2111,41 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.pendingRecoveryPrompt = null;
     logger.info('界面.编排器.恢复.重试_触发', undefined, LogCategory.UI);
     await this.resumeInterruptedTask({ extraInstruction: prompt });
+  }
+
+  private async handleClarificationAnswer(
+    answers: Record<string, string> | null,
+    additionalInfo?: string,
+  ): Promise<void> {
+    const content = this.buildClarificationAnswerText(answers, additionalInfo);
+    if (!content) {
+      this.sendToast(t('toast.supplementEmpty'), 'warning');
+      return;
+    }
+    const sessionId = this.resolveActiveSessionId();
+    if (!sessionId) {
+      this.sendToast(t('toast.noActiveSession'), 'warning');
+      return;
+    }
+    this.enqueueQueuedMessage(sessionId, content);
+    this.sendQueuedMessagesUpdate(sessionId);
+    void this.drainQueuedMessagesIfIdle();
+  }
+
+  private async handleWorkerQuestionAnswer(answer: string | null): Promise<void> {
+    const content = this.buildWorkerQuestionAnswerText(answer);
+    if (!content) {
+      this.sendToast(t('toast.supplementEmpty'), 'warning');
+      return;
+    }
+    const sessionId = this.resolveActiveSessionId();
+    if (!sessionId) {
+      this.sendToast(t('toast.noActiveSession'), 'warning');
+      return;
+    }
+    this.enqueueQueuedMessage(sessionId, content);
+    this.sendQueuedMessagesUpdate(sessionId);
+    void this.drainQueuedMessagesIfIdle();
   }
 
   private enqueueOrchestratorExecution(
@@ -2475,26 +2682,37 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     return normalizedError || t('provider.executionFailed');
   }
 
-  private publishOrchestratorRuntimeDiagnostics(input: {
+  private async publishOrchestratorRuntimeDiagnostics(input: {
     sessionId: string;
     requestId?: string;
     result: OrchestratorExecutionResult;
-  }): void {
+  }): Promise<void> {
     const sessionId = input.sessionId.trim();
     if (!sessionId) {
       return;
     }
-    this.sendData('orchestratorRuntimeDiagnostics', {
-      sessionId,
-      requestId: input.requestId || undefined,
-      runtimeReason: input.result.runtimeReason,
-      finalStatus: input.result.finalStatus,
-      failureReason: input.result.failureReason || undefined,
-      errors: input.result.errors,
-      runtimeSnapshot: input.result.runtimeSnapshot || null,
-      runtimeDecisionTrace: input.result.runtimeDecisionTrace || [],
-      updatedAt: Date.now(),
-    });
+    try {
+      const diagnostics = await this.orchestratorEngine.queryRuntimeDiagnostics({
+        sessionId,
+        requestId: input.requestId,
+      });
+      if (diagnostics) {
+        this.sendData('orchestratorRuntimeDiagnostics', diagnostics as unknown as Record<string, unknown>);
+      } else {
+        logger.warn('界面.运行态诊断缺失', {
+          sessionId,
+          requestId: input.requestId,
+          runtimeReason: input.result.runtimeReason,
+          finalStatus: input.result.finalStatus,
+        }, LogCategory.UI);
+      }
+    } catch (error) {
+      logger.warn('界面.运行态诊断.查询失败', {
+        sessionId,
+        requestId: input.requestId,
+        error: error instanceof Error ? error.message : String(error),
+      }, LogCategory.UI);
+    }
   }
 
   private setPendingRecoveryFromExecution(input: {
@@ -2564,6 +2782,35 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       t('provider.resumePrompt.originalRequest', { prompt: originalPrompt }),
       t('provider.resumePrompt.generatedChanges', { changes: changeList }) + extra,
     ].join('\n\n');
+  }
+
+  private buildClarificationAnswerText(
+    answers: Record<string, string> | null,
+    additionalInfo?: string | null,
+  ): string {
+    const normalizedPairs = Object.entries(answers || {})
+      .map(([question, answer]) => [question.trim(), String(answer || '').trim()] as const)
+      .filter(([, answer]) => answer.length > 0);
+    const normalizedAdditionalInfo = additionalInfo?.trim() || '';
+    const parts: string[] = [];
+    if (normalizedPairs.length > 0) {
+      parts.push('以下是澄清答复：');
+      for (const [question, answer] of normalizedPairs) {
+        parts.push(`- ${question}: ${answer}`);
+      }
+    }
+    if (normalizedAdditionalInfo) {
+      parts.push(`补充说明：${normalizedAdditionalInfo}`);
+    }
+    return parts.join('\n').trim();
+  }
+
+  private buildWorkerQuestionAnswerText(answer: string | null): string {
+    const normalizedAnswer = answer?.trim() || '';
+    if (!normalizedAnswer) {
+      return '';
+    }
+    return `针对 Worker 提问的回复：${normalizedAnswer}`;
   }
 
   /**
@@ -2654,6 +2901,58 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /**
+   * 处理用户「继续」操作
+   *
+   * 优先走执行链恢复路径：
+   *   1. 检查当前 session 是否存在可恢复的执行链
+   *   2. 如果有，通过 prepareChainResume 恢复执行链，复用原 Mission
+   *   3. 如果没有，走旧的 executeTask 路径（兼容用户手动发"继续"的新任务场景）
+   */
+  private async handleContinueTask(prompt?: string, taskId?: string): Promise<void> {
+    const sessionId = this.resolveActiveSessionId();
+    if (!sessionId) {
+      this.sendToast(t('toast.noActiveSession'), 'warning');
+      return;
+    }
+
+    // 优先检查执行链级别的恢复
+    const chainResume = this.orchestratorEngine.prepareChainResume(sessionId);
+    if (chainResume) {
+      logger.info('界面.任务.继续.执行链恢复', {
+        chainId: chainResume.chainId,
+        missionId: chainResume.missionId,
+      }, LogCategory.UI);
+
+      const resumePrompt = prompt?.trim() || t('provider.resumePrompt.defaultRetry');
+      this.sendOrchestratorMessage({
+        content: t('provider.resumingTask'),
+        messageType: 'progress',
+        metadata: { phase: 'resuming', chainId: chainResume.chainId },
+      });
+      await this.executeTask(resumePrompt, undefined, [], undefined, undefined, {
+        resumeMissionId: chainResume.missionId,
+        resumeInstruction: resumePrompt,
+        recoveryBasePrompt: resumePrompt,
+        reuseMission: true,
+      });
+      return;
+    }
+
+    // 回退到旧的恢复路径（pendingRecoveryContext）
+    if (taskId) {
+      await this.resumeInterruptedTask({ taskId, extraInstruction: prompt?.trim() });
+      return;
+    }
+
+    // 最后回退：作为新任务执行
+    if (!prompt?.trim()) {
+      this.sendToast(t('engine.input.emptyPrompt'), 'warning');
+      return;
+    }
+    await this.executeTask(prompt);
+  }
+
   /** 恢复被打断的任务 */
   private async resumeInterruptedTask(options?: { taskId?: string; extraInstruction?: string }): Promise<void> {
     if (this.orchestratorEngine.running) {
@@ -2734,6 +3033,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       setExtensionLocale(locale);
       ConfigManager.getInstance().set('locale', locale);
       ConfigManager.getInstance().save();
+      await this.sendSettingsBootstrapToWebview(false);
       return; // 语言切换即时生效，不显示通用“设置已保存”提示
     }
     // 处理其他配置
@@ -2746,8 +3046,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     else if (key === 'deepTask') {
       const enabled = Boolean(value);
       config.update('deepTask', enabled, vscode.ConfigurationTarget.Global);
-      // 回推确认状态给前端
-      this.sendData('deepTaskChanged', { enabled });
+      await this.sendSettingsBootstrapToWebview(false);
       logger.info('界面.设置.深度任务', { enabled }, LogCategory.UI);
       return; // deepTask 切换不需要通用 toast（前端已有 toast）
     }
@@ -2801,7 +3100,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
           traceId,
           {
             id: boundMessageId,
-            metadata: { requestId: requestKey },
+            metadata: {
+              requestId: requestKey,
+              ...(this.activeSessionId ? { sessionId: this.activeSessionId } : {}),
+            },
           }
         );
         this.messageHub.sendMessage(errorMessage);
@@ -2852,7 +3154,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         return;
       }
       this.activeSessionId = executionSessionId;
-      this.syncMessageHubTrace(executionSessionId);
+      this.syncMessageHubSessionContext(executionSessionId);
 
       // 统一消息通道：由后端发送用户消息与占位消息
       const promptForDisplay = displayPrompt?.trim() || prompt;
@@ -2980,8 +3282,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
       if (started) {
         // 判断是否为中断导致的失败——中断场景不应发送错误消息
+        // 扩展检测：除 runtimeReason 外，也检查 finalStatus='cancelled' 和 failureReason 的 abort 关键词，
+        // 避免中断期间非 AbortError 异常（如超时）绕过 isAbort 判定导致误发错误消息。
         const runtimeReason = executionResult?.runtimeReason;
-        const isAbort = !success && (this.isAbortLikeRuntimeReason(runtimeReason) || (failureReason ? isAbortError(failureReason) : false));
+        const isAbort = !success && (
+          this.isAbortLikeRuntimeReason(runtimeReason)
+          || executionResult?.finalStatus === 'cancelled'
+          || (failureReason ? isAbortError(failureReason) : false)
+        );
         const normalizedFailureReason = (failureReason || t('provider.executionFailed')).trim();
         const modelOriginIssue = runtimeReason === 'upstream_model_error'
           || this.isLikelyModelOriginIssue(normalizedFailureReason);
@@ -3030,14 +3338,19 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
                 'orchestrator',
                 'orchestrator',
                 traceId,
-                { metadata: { requestId: requestKey } }
+                {
+                  metadata: {
+                    requestId: requestKey,
+                    ...(this.activeSessionId ? { sessionId: this.activeSessionId } : {}),
+                  },
+                }
               );
               this.messageHub.sendMessage(errorMessage);
             }
           }
         }
         if (executionResult) {
-          this.publishOrchestratorRuntimeDiagnostics({
+          void this.publishOrchestratorRuntimeDiagnostics({
             sessionId: executionSessionId,
             requestId: requestKey,
             result: executionResult,
@@ -3068,6 +3381,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
             id: boundMessageId,
             metadata: {
               requestId: requestKey,
+              ...(this.activeSessionId ? { sessionId: this.activeSessionId } : {}),
               ...(modelOriginIssue ? { phase: 'model_origin_issue', recoverable: true } : {}),
             },
           }
@@ -3158,17 +3472,16 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
 
       logger.info('界面.任务.完成', { hasResult: !!result?.trim(), resultLength: result?.length || 0 }, LogCategory.UI);
 
-      // 保存消息历史
-      this.saveMessageToSession(prompt, result, undefined, 'orchestrator', sessionId);
+      // normalizer 的流式消息已通过 unified:complete 路径持久化（含完整 blocks + metadata），
+      // 不再额外调用 saveMessageToSession 创建重复的纯文本消息。
+      // 仅保留 recordContextMessage 用于编排器上下文记忆。
+      if (result?.trim()) {
+        void this.orchestratorEngine.recordContextMessage('assistant', result, sessionId);
+      }
+      this.sendStateUpdate();
 
-      // 🔧 移除误判的安全检查
-      // 原因：LLM 流式输出通过 Normalizer -> MessageHub 直接发送到前端
-      // 统计机制依赖 requestId 注入，但流式消息可能在 requestId 设置前就开始发送
-      // 导致 assistantThreadContent 统计为 0，误触发强制补发，产生重复消息
-      //
-      // 正确的行为：
-      // - 如果 LLM 有输出（result 非空），消息已经通过流式通道发送
-      // - 如果 LLM 无输出（result 为空），应该在 engine 层面处理，而非此处补发
+      // LLM 输出通过 Normalizer → MessageHub → unified:complete 路径直接发送到前端并持久化，
+      // 此处不做额外的消息补发——避免与流式通道产生重复。
     } catch (error) {
       thrown = true;
       // 中断导致的 abort 错误静默处理，不向前端发送错误消息
@@ -3235,6 +3548,106 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /** 执行会话删除逻辑（供 deleteSession 消息使用） */
+  private getActiveSessionBootstrapLiveMessages(sessionId: string): StandardMessage[] {
+    return this.messageHub.getActiveMessageSnapshots().filter((message) => {
+      const binding = resolveStandardMessageSessionBinding(message);
+      return binding.sessionId === sessionId;
+    });
+  }
+
+  private getLiveSessionTimelineProjection(sessionId: string): SessionTimelineProjection | null {
+    const session = this.sessionManager.getSession(sessionId);
+    if (!session) {
+      return null;
+    }
+    return this.cloneSerializable(buildSessionBootstrapTimelineProjection({
+      session: {
+        id: session.id,
+        updatedAt: session.updatedAt,
+        projectionMessages: materializeProjectionSourceMessagesFromTimelineRecords(session.timeline.records),
+      },
+      liveMessages: this.getActiveSessionBootstrapLiveMessages(sessionId),
+    }));
+  }
+
+  private async buildSessionBootstrapSnapshot(sessionId: string): Promise<SessionBootstrapSnapshot | null> {
+    this.eventBindingService.flushLiveMessageSnapshots({ silent: true });
+    const session = this.sessionManager.getSession(sessionId);
+    if (!session) {
+      return null;
+    }
+
+    await this.orchestratorEngine.reconcilePlanLedgerForSession(sessionId);
+    const timelineProjection = this.cloneSerializable(buildSessionBootstrapTimelineProjection({
+      session: {
+        id: session.id,
+        updatedAt: session.updatedAt,
+        projectionMessages: materializeProjectionSourceMessagesFromTimelineRecords(session.timeline.records),
+      },
+      liveMessages: this.getActiveSessionBootstrapLiveMessages(sessionId),
+    }));
+    const notifications = this.cloneSerializable(
+      this.sessionManager.getSessionNotifications(sessionId) || session.notifications,
+    );
+    const queuedMessages = this.getQueuedMessages(sessionId, false).map((item) => ({
+      id: item.id,
+      content: item.content,
+      createdAt: item.createdAt,
+    }));
+    const [state, diagnostics] = await Promise.all([
+      this.buildUIState(),
+      this.orchestratorEngine.queryRuntimeDiagnostics({ sessionId }),
+    ]);
+
+    return {
+      sessionId,
+      sessions: this.cloneSerializable(this.sessionManager.getSessionMetas()),
+      state: this.cloneSerializable(state),
+      timelineProjection,
+      notifications: {
+        sessionId,
+        notifications,
+      },
+      queuedMessages,
+      orchestratorRuntimeDiagnostics: this.cloneSerializable(diagnostics),
+      executionChainSummary: this.orchestratorEngine.buildExecutionChainSummary(sessionId),
+    };
+  }
+
+  private getSessionBootstrapSnapshot(sessionId: string): Promise<SessionBootstrapSnapshot | null> {
+    if (this.sessionBootstrapInFlight && this.sessionBootstrapInFlightSessionId === sessionId) {
+      return this.sessionBootstrapInFlight;
+    }
+
+    const bootstrapPromise = this.buildSessionBootstrapSnapshot(sessionId)
+      .finally(() => {
+        if (this.sessionBootstrapInFlight === bootstrapPromise) {
+          this.sessionBootstrapInFlight = null;
+          this.sessionBootstrapInFlightSessionId = null;
+        }
+      });
+    this.sessionBootstrapInFlight = bootstrapPromise;
+    this.sessionBootstrapInFlightSessionId = sessionId;
+    return bootstrapPromise;
+  }
+
+  private async sendSessionBootstrap(sessionId: string): Promise<void> {
+    const snapshot = await this.getSessionBootstrapSnapshot(sessionId);
+    if (!snapshot) {
+      return;
+    }
+    this.sendData('sessionBootstrapLoaded', snapshot as unknown as Record<string, unknown>);
+    logger.info('界面.会话.bootstrap.已发送', {
+      sessionId,
+      artifactCount: snapshot.timelineProjection.artifacts.length,
+      threadCount: snapshot.timelineProjection.threadRenderEntries.length,
+      claudeCount: snapshot.timelineProjection.workerRenderEntries.claude.length,
+      codexCount: snapshot.timelineProjection.workerRenderEntries.codex.length,
+      geminiCount: snapshot.timelineProjection.workerRenderEntries.gemini.length,
+      queuedMessageCount: snapshot.queuedMessages.length,
+    }, LogCategory.UI);
+  }
+
   private async performSessionDelete(sessionId: string): Promise<void> {
     const isDeletingCurrentSession = sessionId === this.activeSessionId;
     this.queuedMessagesBySession.delete(sessionId);
@@ -3245,23 +3658,27 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
 
     const remainingSessions = this.sessionManager.getSessionMetas();
+    let sentBootstrap = false;
 
     if (remainingSessions.length === 0) {
       // 没有剩余会话，创建新会话
       const newSession = this.sessionManager.createSession();
       this.activeSessionId = newSession.id;
-      this.syncMessageHubTrace(this.activeSessionId);
-      this.sendData('sessionCreated', { sessionId: newSession.id, session: newSession });
-      this.sendQueuedMessagesUpdate(newSession.id);
+      this.syncMessageHubSessionContext(this.activeSessionId);
+      await this.sendSessionBootstrap(newSession.id);
+      sentBootstrap = true;
     } else if (isDeletingCurrentSession) {
       // 删除的是当前活跃会话，切换到 sessionManager 自动选择的下一个会话
       const nextSessionId = this.sessionManager.getCurrentSession()?.id ?? remainingSessions[0].id;
       await this.switchToSession(nextSessionId);
+      sentBootstrap = true;
     }
 
-    this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() });
     this.sendToast(t('toast.sessionDeleted'), 'info');
-    this.sendStateUpdate();
+    if (!sentBootstrap) {
+      this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() });
+      this.sendStateUpdate();
+    }
   }
 
   private async sendCurrentSessionToWebview(): Promise<void> {
@@ -3269,16 +3686,45 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     if (!session) {
       return;
     }
-    this.sendData('sessionLoaded', { sessionId: session.id, session: session });
-    await this.orchestratorEngine.reconcilePlanLedgerForSession(session.id);
-    const planSnapshot = this.orchestratorEngine.getPlanLedgerSnapshot(session.id);
-    this.sendData('planLedgerLoaded', {
-      sessionId: session.id,
-      activePlan: planSnapshot.activePlan,
-      plans: planSnapshot.plans,
-    });
-    this.sendQueuedMessagesUpdate(session.id);
+    await this.sendSessionBootstrap(session.id);
     void this.drainQueuedMessagesIfIdle();
+  }
+
+  private handleMarkAllNotificationsRead(): void {
+    const sessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id;
+    if (!sessionId) {
+      return;
+    }
+    if (!this.sessionManager.markAllSessionNotificationsRead(sessionId)) {
+      return;
+    }
+    this.sendSessionNotificationsToWebview(sessionId);
+    this.sendStateUpdate();
+  }
+
+  private handleClearAllNotifications(): void {
+    const sessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id;
+    if (!sessionId) {
+      return;
+    }
+    if (!this.sessionManager.clearSessionNotifications(sessionId)) {
+      return;
+    }
+    this.sendSessionNotificationsToWebview(sessionId);
+    this.sendStateUpdate();
+  }
+
+  private handleRemoveNotification(notificationId: unknown): void {
+    const sessionId = this.activeSessionId || this.sessionManager.getCurrentSession()?.id;
+    const normalizedNotificationId = typeof notificationId === 'string' ? notificationId.trim() : '';
+    if (!sessionId || !normalizedNotificationId) {
+      return;
+    }
+    if (!this.sessionManager.removeSessionNotification(sessionId, normalizedNotificationId)) {
+      return;
+    }
+    this.sendSessionNotificationsToWebview(sessionId);
+    this.sendStateUpdate();
   }
 
   /** 创建并切换到新会话（对齐任务/对话会话） */
@@ -3295,16 +3741,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     await this.adapterFactory.shutdown();
     this.cancelProcessingResetFallback();
     this.messageHub.forceProcessingState(false);
+    this.clearRequestTracking();
+    this.eventBindingService.resetSessionRuntimeState();
     const newSession = this.sessionManager.createSession();
     // 更新活跃会话ID
     this.activeSessionId = newSession.id;
-    this.syncMessageHubTrace(this.activeSessionId);
+    this.syncMessageHubSessionContext(this.activeSessionId);
     logger.info('界面.会话.已创建', { sessionId: this.activeSessionId }, LogCategory.UI);
-    // 通知 webview 新会话已创建
-    this.sendData('sessionCreated', { sessionId: newSession.id, session: newSession });
-    this.sendData('sessionsUpdated', { sessions: this.sessionManager.getSessionMetas() });
-    this.sendQueuedMessagesUpdate(newSession.id);
-    this.sendStateUpdate();
+    await this.sendSessionBootstrap(newSession.id);
   }
 
   /** 切换到指定会话 */
@@ -3313,97 +3757,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     await this.adapterFactory.shutdown();
     this.cancelProcessingResetFallback();
     this.messageHub.forceProcessingState(false);
+    this.clearRequestTracking();
+    this.eventBindingService.resetSessionRuntimeState();
     this.activeSessionId = sessionId;
     this.ensureSessionExists(sessionId);
-    this.syncMessageHubTrace(sessionId);
+    this.syncMessageHubSessionContext(sessionId);
 
-    // 获取会话完整数据
-    const session = this.sessionManager.getSession(sessionId);
-    if (session) {
-      // 先广播会话已切换，再下发消息历史，避免前端跨会话过滤误拦截历史数据
-      this.sendData('sessionSwitched', {
-        sessionId,
-        session,
-      });
-
-      // 分类消息：主对话 vs Worker 消息
-      const threadMessages: any[] = [];
-      const workerMessages: { claude: any[]; codex: any[]; gemini: any[] } = {
-        claude: [],
-        codex: [],
-        gemini: [],
-      };
-
-      for (const m of session.messages) {
-        if (!m?.id || typeof m.id !== 'string' || !m.id.trim()) {
-          throw new Error('Session message missing id');
-        }
-        if (m.role !== 'user' && m.role !== 'assistant' && m.role !== 'system') {
-          throw new Error(`Session message role invalid: ${String(m.role)}`);
-        }
-        if (typeof m.content !== 'string') {
-          throw new Error('Session message content invalid');
-        }
-        if (typeof m.timestamp !== 'number') {
-          throw new Error('Session message timestamp invalid');
-        }
-        const normalizedSource = this.normalizeSessionMessageSource(m.source, m.agent, m.metadata);
-        const formatted = {
-          id: m.id,
-          role: m.role,
-          content: m.content,
-          source: normalizedSource.source === 'worker'
-            ? (normalizedSource.agent || 'worker')
-            : normalizedSource.source,
-          timestamp: m.timestamp,
-          agent: normalizedSource.agent || m.agent,
-          images: Array.isArray(m.images) ? this.cloneSerializable(m.images) : undefined,
-          blocks: Array.isArray(m.blocks) ? this.cloneSerializable(m.blocks) : undefined,
-          type: typeof m.type === 'string' ? m.type : undefined,
-          noticeType: typeof m.noticeType === 'string' ? m.noticeType : undefined,
-          isStreaming: typeof m.isStreaming === 'boolean' ? m.isStreaming : undefined,
-          isComplete: typeof m.isComplete === 'boolean' ? m.isComplete : undefined,
-          metadata: m.metadata && typeof m.metadata === 'object' && !Array.isArray(m.metadata)
-            ? this.cloneSerializable(m.metadata)
-            : undefined,
-        };
-
-        // 根据 source 和 agent 分类
-        if (normalizedSource.source === 'worker' && normalizedSource.agent) {
-          const agentKey = normalizedSource.agent;
-          if (workerMessages[agentKey]) {
-            workerMessages[agentKey].push(formatted);
-          }
-        } else {
-          // 主对话消息（orchestrator/system/user）
-          threadMessages.push(formatted);
-        }
-      }
-
-      // 发送完整的会话消息历史给前端（包括 worker 消息）
-      this.sendData('sessionMessagesLoaded', {
-        sessionId,
-        messages: threadMessages,
-        workerMessages,
-      });
-
-      await this.orchestratorEngine.reconcilePlanLedgerForSession(sessionId);
-      const planSnapshot = this.orchestratorEngine.getPlanLedgerSnapshot(sessionId);
-      this.sendData('planLedgerLoaded', {
-        sessionId,
-        activePlan: planSnapshot.activePlan,
-        plans: planSnapshot.plans,
-      });
-      this.sendQueuedMessagesUpdate(sessionId);
-
-      logger.info('界面.会话.消息.已加载', {
-        sessionId,
-        threadCount: threadMessages.length,
-        claudeCount: workerMessages.claude.length,
-        codexCount: workerMessages.codex.length,
-        geminiCount: workerMessages.gemini.length,
-      }, LogCategory.UI);
-    }
+    await this.sendSessionBootstrap(sessionId);
   }
 
   /** 确保任务会话存在并已切换 */
@@ -3428,8 +3788,8 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.activeSessionId = newSession.id;
   }
 
-  /** 将 MessageHub trace 与当前会话对齐，确保消息不会跨会话串流 */
-  private syncMessageHubTrace(sessionId?: string | null): void {
+  /** 将 MessageHub 会话上下文与当前会话对齐，确保消息不会跨会话串流 */
+  private syncMessageHubSessionContext(sessionId?: string | null): void {
     const resolvedSessionId = (sessionId && sessionId.trim())
       || this.activeSessionId
       || this.sessionManager.getCurrentSession()?.id
@@ -3437,11 +3797,67 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     if (!resolvedSessionId) {
       return;
     }
-    if (this.messageHub.getTraceId() === resolvedSessionId) {
+    const traceAligned = this.messageHub.getTraceId() === resolvedSessionId;
+    const sessionAligned = this.messageHub.getSessionId() === resolvedSessionId;
+    if (traceAligned && sessionAligned) {
       return;
     }
-    this.messageHub.setTraceId(resolvedSessionId);
-    logger.debug('界面.消息.Trace.同步', { traceId: resolvedSessionId }, LogCategory.UI);
+    if (!sessionAligned) {
+      this.messageHub.setSessionId(resolvedSessionId);
+    }
+    if (!traceAligned) {
+      this.messageHub.setTraceId(resolvedSessionId);
+    }
+    logger.debug('界面.消息.会话上下文同步', {
+      sessionId: resolvedSessionId,
+      traceId: this.messageHub.getTraceId(),
+    }, LogCategory.UI);
+  }
+
+  /** 将标准消息按时间轴/通知语义持久化到 session */
+  private persistStandardMessageToSession(sessionId: string, message: StandardMessage): void {
+    if (!message?.id) {
+      return;
+    }
+    const binding = resolveStandardMessageSessionBinding(message);
+    const incomingSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+    if (!binding.sessionId) {
+      logger.warn('界面.会话.持久化跳过_缺少显式归属', {
+        messageId: message.id,
+        messageType: message.type,
+        incomingSessionId,
+        bindingSource: binding.source,
+      }, LogCategory.UI);
+      return;
+    }
+    if (!incomingSessionId) {
+      logger.warn('界面.会话.持久化跳过_调用方缺少目标会话', {
+        messageId: message.id,
+        messageType: message.type,
+        resolvedSessionId: binding.sessionId,
+      }, LogCategory.UI);
+      return;
+    }
+    if (binding.sessionId !== incomingSessionId) {
+      logger.warn('界面.会话.持久化跳过_归属冲突', {
+        messageId: message.id,
+        messageType: message.type,
+        incomingSessionId,
+        metadataSessionId: binding.sessionId,
+        bindingSource: binding.source,
+      }, LogCategory.UI);
+      return;
+    }
+    const session = this.sessionManager.getSession(binding.sessionId);
+    if (!session) {
+      logger.warn('界面.会话.持久化跳过_目标会话不存在', {
+        messageId: message.id,
+        messageType: message.type,
+        resolvedSessionId: binding.sessionId,
+      }, LogCategory.UI);
+      return;
+    }
+    this.sessionManager.persistStandardMessageToSession(binding.sessionId, message);
   }
 
   /** 保存消息到当前会话 */
@@ -3476,345 +3892,6 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     this.sendStateUpdate();
   }
 
-  /** 保存当前会话的完整数据（从前端同步） */
-  private saveCurrentSessionData(messages: any[]): void {
-    const currentSession = this.sessionManager.getCurrentSession();
-    if (!currentSession) {
-      logger.info('界面.会话.保存.跳过', { reason: 'no_current_session' }, LogCategory.UI);
-      return;
-    }
-
-    const incomingMessages = Array.isArray(messages) ? messages : [];
-
-    // 空数据保护：如果传入消息为空但后端已有消息，拒绝覆写以防止数据丢失
-    // 典型场景：webview 刚加载尚未从后端同步消息时，用户立即切换会话
-    if (incomingMessages.length === 0 && currentSession.messages.length > 0) {
-      logger.warn('界面.会话.保存.拒绝_空覆写', {
-        sessionId: currentSession.id,
-        existingCount: currentSession.messages.length,
-      }, LogCategory.UI);
-      return;
-    }
-
-    const seen = new Set<string>();
-    let normalizedRoleCount = 0;
-    const sessionMessages: SessionMessage[] = incomingMessages.map((m) => {
-      const id = typeof m?.id === 'string' && m.id.trim() ? m.id.trim() : '';
-      if (!id) {
-        throw new Error(t('provider.errors.sessionMessageMissingId'));
-      }
-      if (seen.has(id)) {
-        throw new Error(t('provider.errors.sessionMessageDuplicateId', { id }));
-      }
-      seen.add(id);
-
-      const role = this.resolveSessionMessageRole(m);
-      if (role !== m?.role) {
-        normalizedRoleCount++;
-      }
-
-      if (typeof m?.content !== 'string') {
-        throw new Error(t('provider.errors.sessionMessageContentNotString'));
-      }
-      if (typeof m?.timestamp !== 'number') {
-        throw new Error(t('provider.errors.sessionMessageInvalidTimestamp'));
-      }
-      const normalizedSource = this.normalizeSessionMessageSource(m.source, m.agent, m.metadata);
-      return {
-        id,
-        role,
-        content: m.content,
-        agent: normalizedSource.agent || (typeof m?.agent === 'string' ? m.agent : undefined),
-        timestamp: m.timestamp,
-        images: Array.isArray(m?.images) ? this.cloneSerializable(m.images) : undefined,
-        source: normalizedSource.source,
-        blocks: this.normalizeSessionBlocks(m?.blocks),
-        type: typeof m?.type === 'string' ? m.type : undefined,
-        noticeType: typeof m?.noticeType === 'string' ? m.noticeType : undefined,
-        isStreaming: typeof m?.isStreaming === 'boolean' ? m.isStreaming : undefined,
-        isComplete: typeof m?.isComplete === 'boolean' ? m.isComplete : undefined,
-        metadata: m?.metadata && typeof m.metadata === 'object' && !Array.isArray(m.metadata)
-          ? this.cloneSerializable(m.metadata)
-          : undefined,
-      };
-    });
-
-    if (normalizedRoleCount > 0) {
-      logger.warn('界面.会话.保存.role归一化', {
-        sessionId: currentSession.id,
-        normalizedRoleCount,
-      }, LogCategory.UI);
-    }
-
-    // 使用新的 API 保存会话数据
-    this.sessionManager.updateSessionData(currentSession.id, sessionMessages);  // ✅ 移除 cliOutputs 参数
-    logger.info('界面.会话.保存.完成', { messageCount: sessionMessages.length }, LogCategory.UI);
-  }
-
-  private resolveSessionMessageRole(message: any): 'user' | 'assistant' | 'system' {
-    if (message?.type === 'user_input') {
-      return 'user';
-    }
-    if (message?.type === 'system-notice') {
-      return 'system';
-    }
-
-    const role = message?.role;
-    if (role === 'user' || role === 'assistant' || role === 'system') {
-      return role;
-    }
-
-    throw new Error(
-      t('provider.errors.sessionMessageInvalidRoleType', {
-        role: String(role),
-        type: String(message?.type),
-      })
-    );
-  }
-
-  private normalizeSessionBlocks(rawBlocks: unknown): ContentBlock[] | undefined {
-    if (rawBlocks === undefined) {
-      return undefined;
-    }
-    if (!Array.isArray(rawBlocks)) {
-      throw new Error(t('provider.errors.sessionMessageBlocksNotArray'));
-    }
-    if (rawBlocks.length === 0) {
-      return undefined;
-    }
-    return rawBlocks.map((rawBlock, index) => this.normalizeSessionBlock(rawBlock, index));
-  }
-
-  private normalizeSessionBlock(rawBlock: unknown, index: number): ContentBlock {
-    if (!rawBlock || typeof rawBlock !== 'object' || Array.isArray(rawBlock)) {
-      throw new Error(t('provider.errors.sessionBlockInvalid', { index }));
-    }
-    const block = rawBlock as Record<string, unknown>;
-    const blockType = block.type;
-    if (typeof blockType !== 'string' || blockType.length === 0) {
-      throw new Error(t('provider.errors.sessionBlockMissingType', { index }));
-    }
-
-    switch (blockType) {
-      case 'text':
-        return {
-          type: 'text',
-          content: typeof block.content === 'string' ? block.content : '',
-        };
-      case 'code':
-        return {
-          type: 'code',
-          content: typeof block.content === 'string' ? block.content : '',
-          language: typeof block.language === 'string' && block.language.trim().length > 0
-            ? block.language
-            : 'text',
-        };
-      case 'thinking': {
-        const thinking = block.thinking;
-        const thinkingObj = thinking && typeof thinking === 'object' && !Array.isArray(thinking)
-          ? thinking as Record<string, unknown>
-          : undefined;
-        const content = typeof thinkingObj?.content === 'string'
-          ? thinkingObj.content
-          : (typeof block.content === 'string' ? block.content : '');
-        const summary = typeof thinkingObj?.summary === 'string'
-          ? thinkingObj.summary
-          : undefined;
-        return {
-          type: 'thinking',
-          content,
-          ...(summary ? { summary } : {}),
-        };
-      }
-      case 'tool_call': {
-        const toolCallRaw = block.toolCall;
-        if (!toolCallRaw || typeof toolCallRaw !== 'object' || Array.isArray(toolCallRaw)) {
-          throw new Error(t('provider.errors.toolCallMissingObject', { index }));
-        }
-        const toolCall = toolCallRaw as Record<string, unknown>;
-        const toolId = typeof toolCall.id === 'string' ? toolCall.id.trim() : '';
-        const toolName = typeof toolCall.name === 'string' ? toolCall.name.trim() : '';
-        if (!toolId || !toolName) {
-          throw new Error(t('provider.errors.toolCallMissingIdOrName', { index }));
-        }
-        const standardized = this.normalizeStandardizedToolResult(toolCall.standardized, index);
-        return {
-          type: 'tool_call',
-          toolId,
-          toolName,
-          status: this.normalizeToolCallStatus(toolCall.status, index),
-          input: this.serializeToolArguments(toolCall.arguments, index),
-          output: typeof toolCall.result === 'string' ? toolCall.result : undefined,
-          error: typeof toolCall.error === 'string' ? toolCall.error : undefined,
-          standardized,
-        };
-      }
-      case 'file_change': {
-        const fileChangeRaw = block.fileChange;
-        if (!fileChangeRaw || typeof fileChangeRaw !== 'object' || Array.isArray(fileChangeRaw)) {
-          throw new Error(t('provider.errors.fileChangeMissingObject', { index }));
-        }
-        const fileChange = fileChangeRaw as Record<string, unknown>;
-        const filePath = typeof fileChange.filePath === 'string' ? fileChange.filePath : '';
-        const changeType = fileChange.changeType;
-        if (typeof filePath !== 'string' || filePath.trim().length === 0) {
-          throw new Error(t('provider.errors.fileChangeMissingPath', { index }));
-        }
-        if (changeType !== 'create' && changeType !== 'modify' && changeType !== 'delete') {
-          throw new Error(t('provider.errors.fileChangeInvalidType', { index }));
-        }
-        return {
-          type: 'file_change',
-          filePath,
-          changeType,
-          additions: typeof fileChange.additions === 'number' ? fileChange.additions : undefined,
-          deletions: typeof fileChange.deletions === 'number' ? fileChange.deletions : undefined,
-          diff: typeof fileChange.diff === 'string' ? fileChange.diff : undefined,
-        };
-      }
-      case 'plan': {
-        const planRaw = block.plan;
-        if (!planRaw || typeof planRaw !== 'object' || Array.isArray(planRaw)) {
-          throw new Error(t('provider.errors.planMissingObject', { index }));
-        }
-        const plan = planRaw as Record<string, unknown>;
-        const goal = typeof plan.goal === 'string' ? plan.goal : '';
-        if (goal.trim().length === 0) {
-          throw new Error(t('provider.errors.planMissingGoal', { index }));
-        }
-        return {
-          type: 'plan',
-          goal,
-          analysis: typeof plan.analysis === 'string' ? plan.analysis : undefined,
-          constraints: this.normalizeStringArray(plan.constraints),
-          acceptanceCriteria: this.normalizeStringArray(plan.acceptanceCriteria),
-          riskLevel: plan.riskLevel === 'low' || plan.riskLevel === 'medium' || plan.riskLevel === 'high'
-            ? plan.riskLevel
-            : undefined,
-          riskFactors: this.normalizeStringArray(plan.riskFactors),
-          rawJson: typeof plan.rawJson === 'string' ? plan.rawJson : undefined,
-        };
-      }
-      default:
-        throw new Error(t('provider.errors.sessionBlockUnsupportedType', { blockType }));
-    }
-  }
-
-  private normalizeToolCallStatus(status: unknown, index: number): 'pending' | 'running' | 'completed' | 'failed' {
-    if (status === 'pending' || status === 'running' || status === 'completed' || status === 'failed') {
-      return status;
-    }
-    if (status === 'success') {
-      return 'completed';
-    }
-    if (status === 'error') {
-      return 'failed';
-    }
-    throw new Error(t('provider.errors.toolCallInvalidStatus', { index }));
-  }
-
-  private serializeToolArguments(argumentsValue: unknown, index: number): string | undefined {
-    if (argumentsValue === undefined) {
-      return undefined;
-    }
-    try {
-      return JSON.stringify(argumentsValue);
-    } catch {
-      throw new Error(t('provider.errors.toolCallArgumentsNotSerializable', { index }));
-    }
-  }
-
-  private normalizeStringArray(value: unknown): string[] | undefined {
-    if (!Array.isArray(value)) {
-      return undefined;
-    }
-    const normalized = value.filter((item): item is string => typeof item === 'string');
-    return normalized.length > 0 ? normalized : undefined;
-  }
-
-  private normalizeStandardizedToolResult(value: unknown, index: number): StandardizedToolResultPayload | undefined {
-    if (value === undefined) {
-      return undefined;
-    }
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      throw new Error(t('provider.errors.standardizedInvalid', { index }));
-    }
-    const payload = value as Record<string, unknown>;
-    if (payload.schemaVersion !== 'tool-result.v1') {
-      throw new Error(t('provider.errors.standardizedInvalidSchemaVersion', { index }));
-    }
-    const source = payload.source;
-    if (source !== 'builtin' && source !== 'mcp' && source !== 'skill') {
-      throw new Error(t('provider.errors.standardizedInvalidSource', { index }));
-    }
-    const toolName = payload.toolName;
-    if (typeof toolName !== 'string' || toolName.trim().length === 0) {
-      throw new Error(t('provider.errors.standardizedInvalidToolName', { index }));
-    }
-    const toolCallId = payload.toolCallId;
-    if (typeof toolCallId !== 'string' || toolCallId.trim().length === 0) {
-      throw new Error(t('provider.errors.standardizedInvalidToolCallId', { index }));
-    }
-    const status = payload.status;
-    if (
-      status !== 'success'
-      && status !== 'error'
-      && status !== 'timeout'
-      && status !== 'killed'
-      && status !== 'blocked'
-      && status !== 'rejected'
-      && status !== 'aborted'
-    ) {
-      throw new Error(t('provider.errors.standardizedInvalidStatus', { index }));
-    }
-    const message = payload.message;
-    if (typeof message !== 'string') {
-      throw new Error(t('provider.errors.standardizedInvalidMessage', { index }));
-    }
-
-    const normalized: StandardizedToolResultPayload = {
-      schemaVersion: 'tool-result.v1',
-      source,
-      toolName,
-      toolCallId,
-      status,
-      message,
-      ...(payload.data !== undefined ? { data: this.cloneSerializable(payload.data) } : {}),
-      ...(typeof payload.errorCode === 'string' ? { errorCode: payload.errorCode } : {}),
-      ...(typeof payload.sourceId === 'string' ? { sourceId: payload.sourceId } : {}),
-    };
-    return normalized;
-  }
-
-  private isWorkerSlot(value: unknown): value is WorkerSlot {
-    return value === 'claude' || value === 'codex' || value === 'gemini';
-  }
-
-  private normalizeSessionMessageSource(
-    source: unknown,
-    agent: unknown,
-    metadata: unknown
-  ): { source: 'orchestrator' | 'worker' | 'system'; agent?: WorkerSlot } {
-    const explicitAgent = this.isWorkerSlot(agent) ? agent : undefined;
-    const sourceAgent = this.isWorkerSlot(source) ? source : undefined;
-    const metadataWorker = metadata && typeof metadata === 'object' && !Array.isArray(metadata)
-      ? (metadata as Record<string, unknown>).worker
-      : undefined;
-    const metadataAgent = this.isWorkerSlot(metadataWorker) ? metadataWorker : undefined;
-    const resolvedAgent = explicitAgent || sourceAgent || metadataAgent;
-
-    if (resolvedAgent) {
-      return { source: 'worker', agent: resolvedAgent };
-    }
-    if (source === 'system') {
-      return { source: 'system' };
-    }
-    if (source === 'worker') {
-      return { source: 'worker' };
-    }
-    return { source: 'orchestrator' };
-  }
-
   private cloneSerializable<T>(value: T): T {
     try {
       return structuredClone(value);
@@ -3823,51 +3900,33 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private sendSessionNotificationsToWebview(sessionId: string): void {
+    const notifications = this.cloneSerializable(
+      this.sessionManager.getSessionNotifications(sessionId)
+      || this.sessionManager.getSession(sessionId)?.notifications
+      || { lastUpdatedAt: Date.now(), records: [] },
+    );
+    this.sendData('sessionNotificationsLoaded', {
+      sessionId,
+      notifications,
+    });
+  }
+
   /** 构建 UI 状态（统一使用 Mission + TaskView） */
   private async buildUIState(): Promise<UIState> {
     const currentSession = this.sessionManager.getCurrentSession();
     const sessionId = this.activeSessionId || currentSession?.id;
+    // stateUpdate 只同步非时间轴、非 diagnostics 的运行态快照；
+    // 时间轴与运行诊断都通过独立链路恢复，避免 fan-out 与状态竞争。
 
-    // 统一 Todo 系统：从 Mission 获取 TaskView 列表
-    let tasks: any[] = [];
+    let taskViews: TaskView[] = [];
     if (sessionId) {
-      const taskViews = await this.getTaskViews();
-      // 将 TaskView 转换为 UI Task 格式
-      tasks = taskViews.map(tv => ({
-        id: tv.id,
-        name: tv.title || tv.goal || tv.prompt,
-        prompt: tv.prompt,
-        description: tv.goal,
-        status: tv.status,
-        priority: tv.priority,
-        deliveryStatus: tv.deliveryStatus,
-        deliverySummary: tv.deliverySummary,
-        deliveryDetails: tv.deliveryDetails,
-        deliveryWarnings: tv.deliveryWarnings,
-        continuationPolicy: tv.continuationPolicy,
-        continuationReason: tv.continuationReason,
-        subTasks: tv.subTasks,
-        createdAt: tv.createdAt,
-        startedAt: tv.startedAt,
-        completedAt: tv.completedAt,
-        progress: tv.progress,
-        missionId: tv.missionId,
-        failureReason: tv.failureReason,
-      }));
+      taskViews = await this.getTaskViews();
     }
+    this.assertValidArray<TaskView>(taskViews, 'uiState.taskViews');
 
     const engineRunning = this.orchestratorEngine.running;
-    const sortedTasks = [...tasks].sort((a, b) => {
-      const aTs = Number(a?.startedAt || a?.createdAt || 0);
-      const bTs = Number(b?.startedAt || b?.createdAt || 0);
-      return bTs - aTs;
-    });
-    const displayTasks = sortedTasks;
-
-    this.assertValidArray<any>(displayTasks, 'uiState.tasks');
-    const currentTask = displayTasks.find(t => t?.status === 'running') ?? displayTasks[0];
-
-    // 使用轻量级的会话元数据（而不是完整会话数据）
+    const processingState = this.messageHub.getProcessingState();
     const sessionMetas = this.sessionManager.getSessionMetas();
     this.assertValidArray<any>(sessionMetas, 'uiState.sessions');
 
@@ -3896,11 +3955,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     const stateUpdatedAt = Date.now();
     const recovered = this.recoveredSinceLastUpdate;
     this.recoveredSinceLastUpdate = false;
-    return {
-      currentSessionId: this.activeSessionId ?? currentSession?.id,
+    return this.runtimeQueryService.queryState({
+      sessionId: this.activeSessionId ?? currentSession?.id,
       sessions: sessionMetas,
-      currentTask,
-      tasks: displayTasks,
+      taskViews,
       locale: this.locale,
       workerStatuses,
       pendingChanges,
@@ -3909,11 +3967,18 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       interactionMode: this.orchestratorEngine.getInteractionMode(),
       interactionModeUpdatedAt: this.interactionModeUpdatedAt,
       orchestratorPhase: this.orchestratorEngine.phase,
-      activePlan,
+      processingState: {
+        isProcessing: processingState.isProcessing,
+        source: processingState.source,
+        agent: processingState.agent,
+        startedAt: processingState.startedAt,
+        pendingRequestIds: Array.from(this.requestTimeouts.keys()),
+      },
+      activePlan: activePlan ?? undefined,
       planHistory,
       stateUpdatedAt,
       recovered,
-    };
+    });
   }
 
   private appendLog(entry: LogEntry): void {
@@ -3968,7 +4033,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   private sendToast(message: string, level: NotifyLevel = 'info', duration?: number): void {
-    this.messageHub.notify(message, level, duration);
+    this.messageHub.notify(message, level, duration, {
+      displayMode: 'toast',
+      category: 'feedback',
+      source: 'ui-feedback',
+    });
   }
 
   /** 发送消息到 Webview（统一消息总线，优先级调度） */
@@ -4009,13 +4078,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     html = html.replace(/\.css"/g, `.css?v=${cacheBuster}"`);
 
     // 注入 CSP meta 标签（VS Code webview 安全策略）
-    const cspMeta = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src ${webview.cspSource}; font-src ${webview.cspSource}; img-src ${webview.cspSource} https: data:;">`;
+   // 放行 Agent localhost 地址，让 webview 前端能够连接 Agent HTTP/SSE
+   const agentConnectSrc = this.agentBaseUrl ? ` ${this.agentBaseUrl}` : '';
+   const cspMeta = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src ${webview.cspSource}; font-src ${webview.cspSource}; img-src ${webview.cspSource} https: data:; connect-src ${webview.cspSource}${agentConnectSrc};">`;
     html = html.replace('<head>', `<head>\n    ${cspMeta}`);
 
-    // 注入初始 sessionId 与 locale
+   // 注入初始 sessionId、locale、Agent baseUrl
     const initialSessionId = this.activeSessionId || '';
     const initialLocale = this.locale;
-    const bootstrapScript = `<script>window.__INITIAL_SESSION_ID__ = ${JSON.stringify(initialSessionId)}; window.__INITIAL_LOCALE__ = ${JSON.stringify(initialLocale)};</script>`;
+   const bootstrapScript = `<script>window.__INITIAL_SESSION_ID__ = ${JSON.stringify(initialSessionId)}; window.__INITIAL_LOCALE__ = ${JSON.stringify(initialLocale)}; window.__AGENT_BASE_URL__ = ${JSON.stringify(this.agentBaseUrl)};</script>`;
     html = html.replace('</head>', `${bootstrapScript}\n  </head>`);
 
     logger.debug('界面.Svelte.已加载', { sessionId: initialSessionId, locale: initialLocale }, LogCategory.UI);

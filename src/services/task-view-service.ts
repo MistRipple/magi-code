@@ -8,6 +8,7 @@
 import { globalEventBus } from '../events';
 import { logger, LogCategory } from '../logging';
 import type { Mission, MissionStorageManager } from '../orchestrator/mission';
+import type { OrchestrationReadModelService } from '../orchestrator/runtime';
 import type { TaskView } from '../task/task-view-adapter';
 import type { UnifiedTodo } from '../todo';
 
@@ -17,32 +18,53 @@ export class TaskViewService {
   constructor(
     private missionStorage: MissionStorageManager,
     private workspaceRoot: string,
+    private readonly readModelService: OrchestrationReadModelService,
+    private readonly getTodoManager?: () => import('../todo').TodoManager | null | undefined,
   ) {}
 
   /**
-   * 获取会话的所有任务视图
+   * 获取可用的 TodoManager 实例。
+   * 优先复用外部注入的持久化单例；仅在不可用时才创建临时实例。
    */
+  private async resolveTodoManager(): Promise<import('../todo').TodoManager | null> {
+    const injected = this.getTodoManager?.();
+    if (injected) {
+      return injected;
+    }
+    // 回退：创建临时实例（仅在引擎尚未初始化时发生）
+    try {
+      const { TodoManager } = await import('../todo');
+      const temp = new TodoManager(this.workspaceRoot);
+      await temp.initialize();
+      return temp;
+    } catch (error) {
+      logger.warn('任务视图.TodoManager.临时实例创建失败', {
+        error: error instanceof Error ? error.message : String(error),
+      }, LogCategory.ORCHESTRATOR);
+      return null;
+    }
+  }
+
   async listTaskViews(sessionId: string): Promise<TaskView[]> {
     const { missionToTaskView } = await import('../task/task-view-adapter');
-    const { TodoManager } = await import('../todo');
 
     const missions = await this.missionStorage.listBySession(sessionId);
     const taskViews: TaskView[] = [];
 
     const todosByMission = new Map<string, UnifiedTodo[]>();
 
-    try {
-      const todoManager = new TodoManager(this.workspaceRoot);
-      await todoManager.initialize();
-
-      for (const mission of missions) {
-        const todos = await todoManager.getByMission(mission.id);
-        todosByMission.set(mission.id, todos);
+    const todoManager = await this.resolveTodoManager();
+    if (todoManager) {
+      try {
+        for (const mission of missions) {
+          const todos = await todoManager.getByMission(mission.id);
+          todosByMission.set(mission.id, todos);
+        }
+      } catch (error) {
+        logger.warn('任务视图.TodoManager.查询失败', {
+          error: error instanceof Error ? error.message : String(error),
+        }, LogCategory.ORCHESTRATOR);
       }
-    } catch (error) {
-      logger.warn('任务视图.TodoManager.初始化失败', {
-        error: error instanceof Error ? error.message : String(error),
-      }, LogCategory.ORCHESTRATOR);
     }
 
     const duplicateArtifactMissionIds = this.collectDuplicateArtifactMissionIds(missions, todosByMission);
@@ -52,7 +74,7 @@ export class TaskViewService {
         continue;
       }
       const todos = todosByMission.get(mission.id) || [];
-      taskViews.push(missionToTaskView(mission, todos));
+      taskViews.push(missionToTaskView(this.readModelService.toMissionProjection(mission), todos));
     }
 
     return taskViews;
@@ -163,7 +185,7 @@ export class TaskViewService {
       context: '',
     });
 
-    return missionToTaskView(mission, []);
+    return missionToTaskView(this.readModelService.toMissionProjection(mission), []);
   }
 
   /**
@@ -249,7 +271,6 @@ export class TaskViewService {
     missionId?: string;
   }): Promise<{ recovered: boolean; cancelledMissionIds: string[]; cancelledTodoIds: string[] }>
   {
-    const { TodoManager } = await import('../todo');
     const { sessionId, missionId } = input;
     const cancelledMissionIds: string[] = [];
     const cancelledTodoIds: string[] = [];
@@ -262,21 +283,22 @@ export class TaskViewService {
       cancelledMissionIds.push(mission.id);
     }
 
-    try {
-      const todoManager = new TodoManager(this.workspaceRoot);
-      await todoManager.initialize();
-      const cancelledTodos = await todoManager.cancelByQuery({
-        sessionId,
-        missionId,
-        status: ['running'],
-      }, '任务中断，状态收敛');
-      cancelledTodoIds.push(...cancelledTodos);
-    } catch (error) {
-      logger.warn('任务视图.收敛.TodoManager.失败', {
-        error: error instanceof Error ? error.message : String(error),
-        sessionId,
-        missionId,
-      }, LogCategory.ORCHESTRATOR);
+    const todoManager = await this.resolveTodoManager();
+    if (todoManager) {
+      try {
+        const cancelledTodos = await todoManager.cancelByQuery({
+          sessionId,
+          missionId,
+          status: ['running'],
+        }, '任务中断，状态收敛');
+        cancelledTodoIds.push(...cancelledTodos);
+      } catch (error) {
+        logger.warn('任务视图.收敛.TodoManager.失败', {
+          error: error instanceof Error ? error.message : String(error),
+          sessionId,
+          missionId,
+        }, LogCategory.ORCHESTRATOR);
+      }
     }
 
     const recovered = cancelledMissionIds.length > 0 || cancelledTodoIds.length > 0;

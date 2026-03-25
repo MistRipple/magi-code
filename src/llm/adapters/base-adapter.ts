@@ -25,6 +25,11 @@ import { ToolManager, type ToolExecutionContext } from '../../tools/tool-manager
 import { MessageHub } from '../../orchestrator/core/message-hub';
 import { logger, LogCategory } from '../../logging';
 import { MESSAGE_EVENTS, ADAPTER_EVENTS } from '../../protocol/event-names';
+import type {
+  MessageMetadata,
+  ToolCallBlock,
+  StandardizedToolResultPayload,
+} from '../../protocol/message-protocol';
 
 /**
  * 适配器状态
@@ -61,7 +66,33 @@ interface ToolResultRenderParams {
 interface TerminalPreviewEntry {
   streamId: string;
   ownStream: boolean;
+  toolCall: ToolCall;
   result: ToolResult;
+}
+
+interface TerminalPreviewSnapshot {
+  terminal_id: number;
+  status: string;
+  run_mode?: 'task' | 'service';
+  phase?: string;
+  terminal_name?: string;
+  cwd?: string;
+  command?: string;
+  output: string;
+  output_cursor?: number;
+  output_start_cursor?: number;
+  from_cursor?: number;
+  next_cursor?: number;
+  delta?: boolean;
+  truncated?: boolean;
+  startup_status?: string;
+  startup_message?: string;
+  locked?: boolean;
+  return_code?: number | null;
+  accepted?: boolean;
+  killed?: boolean;
+  released_lock?: boolean;
+  error?: string;
 }
 
 /**
@@ -97,6 +128,11 @@ export abstract class BaseLLMAdapter extends EventEmitter {
    * ⚠️ 工程约束：新增写工具或执行入口必须复用该链路透传 worktreePath，禁止旁路。
    */
   protected currentToolExecutionContext: Partial<ToolExecutionContext> | undefined;
+  /**
+   * 当前输出流的显式消息归属元数据。
+   * 用于把 Worker 普通流式输出绑定到 assignment 生命周期卡片。
+   */
+  protected currentMessageMetadata: Partial<MessageMetadata> | undefined;
 
   protected decisionHook?: (event: DecisionHookEvent) => string[];
 
@@ -259,6 +295,183 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     }
   }
 
+  private computeTerminalOutputOverlap(previous: string, incoming: string): number {
+    const maxOverlap = Math.min(previous.length, incoming.length);
+    for (let length = maxOverlap; length > 0; length -= 1) {
+      if (previous.slice(previous.length - length) === incoming.slice(0, length)) {
+        return length;
+      }
+    }
+    return 0;
+  }
+
+  private reconcileTerminalOutputSnapshot(previous: string, incoming: string): string {
+    if (!incoming) return previous;
+    if (!previous) return incoming;
+    if (incoming === previous) return previous;
+    if (incoming.startsWith(previous)) return incoming;
+    if (previous.startsWith(incoming)) return previous;
+    if (previous.includes(incoming)) return previous;
+    if (incoming.includes(previous)) return incoming;
+    const overlap = this.computeTerminalOutputOverlap(previous, incoming);
+    if (overlap > 0) {
+      return previous + incoming.slice(overlap);
+    }
+    return incoming;
+  }
+
+  private mergeTerminalDeltaOutput(previous: TerminalPreviewSnapshot, patch: Partial<TerminalPreviewSnapshot>): string {
+    const currentOutput = previous.output || '';
+    const chunk = typeof patch.output === 'string' ? patch.output : '';
+    if (!chunk) {
+      return currentOutput;
+    }
+
+    const fromCursor = typeof patch.from_cursor === 'number' ? patch.from_cursor : undefined;
+    const previousNextCursor = typeof previous.next_cursor === 'number'
+      ? previous.next_cursor
+      : (typeof previous.output_cursor === 'number' ? previous.output_cursor : undefined);
+
+    if (fromCursor === undefined || previousNextCursor === undefined) {
+      if (currentOutput.endsWith(chunk)) {
+        return currentOutput;
+      }
+      return currentOutput + chunk;
+    }
+
+    if (fromCursor === previousNextCursor) {
+      return currentOutput + chunk;
+    }
+
+    if (fromCursor < previousNextCursor) {
+      const drop = previousNextCursor - fromCursor;
+      if (drop >= chunk.length) {
+        return currentOutput;
+      }
+      return currentOutput + chunk.slice(drop);
+    }
+
+    return currentOutput + chunk;
+  }
+
+  private applyTerminalPreviewPatch(
+    previous: TerminalPreviewSnapshot,
+    patch: Partial<TerminalPreviewSnapshot>,
+  ): TerminalPreviewSnapshot {
+    const nextOutput = typeof patch.output === 'string'
+      ? (patch.delta
+        ? this.mergeTerminalDeltaOutput(previous, patch)
+        : this.reconcileTerminalOutputSnapshot(previous.output || '', patch.output))
+      : previous.output;
+
+    return {
+      ...previous,
+      ...patch,
+      output: nextOutput,
+      status: typeof patch.status === 'string' && patch.status.trim() ? patch.status : previous.status,
+      run_mode: patch.run_mode ?? previous.run_mode,
+      phase: patch.phase ?? previous.phase,
+      terminal_name: patch.terminal_name ?? previous.terminal_name,
+      cwd: patch.cwd ?? previous.cwd,
+      command: patch.command ?? previous.command,
+      output_cursor: patch.output_cursor ?? previous.output_cursor,
+      output_start_cursor: patch.output_start_cursor ?? previous.output_start_cursor,
+      from_cursor: patch.from_cursor ?? previous.from_cursor,
+      next_cursor: patch.next_cursor ?? previous.next_cursor,
+      delta: patch.delta ?? previous.delta,
+      truncated: patch.truncated ?? previous.truncated,
+      startup_status: patch.startup_status ?? previous.startup_status,
+      startup_message: patch.startup_message ?? previous.startup_message,
+      locked: patch.locked ?? previous.locked,
+      return_code: patch.return_code ?? previous.return_code,
+      accepted: patch.accepted ?? previous.accepted,
+      killed: patch.killed ?? previous.killed,
+      released_lock: patch.released_lock ?? previous.released_lock,
+      error: patch.error ?? previous.error,
+    };
+  }
+
+  protected updateTerminalPreviewStandardized(
+    toolCall: ToolCall,
+    result: ToolResult,
+    status: StandardizedToolResult['status'],
+    message?: string,
+  ): void {
+    const toolCallId = result.toolCallId || toolCall.id;
+    const content = typeof result.content === 'string' ? result.content : String(result.content ?? '');
+    const normalizedMessage = typeof message === 'string' && message.trim()
+      ? message.trim()
+      : content;
+    const existing = result.standardized;
+
+    result.standardized = existing
+      ? {
+          ...existing,
+          source: this.resolveToolSource(toolCall.name, undefined, existing.source),
+          toolName: existing.toolName || toolCall.name,
+          toolCallId,
+          status,
+          message: normalizedMessage,
+        }
+      : {
+          schemaVersion: 'tool-result.v1',
+          source: this.resolveToolSource(toolCall.name),
+          toolName: toolCall.name,
+          toolCallId,
+          status,
+          message: normalizedMessage,
+        };
+    result.isError = status !== 'success';
+  }
+
+  protected resolveTerminalCompletionStatus(state: string): StandardizedToolResult['status'] {
+    switch ((state || '').trim()) {
+      case 'completed':
+      case 'success':
+      case 'ready':
+        return 'success';
+      case 'timeout':
+        return 'timeout';
+      case 'killed':
+        return 'killed';
+      default:
+        return 'error';
+    }
+  }
+
+  protected buildTerminalFailureMessage(snapshot: TerminalPreviewSnapshot): string {
+    if (typeof snapshot.error === 'string' && snapshot.error.trim()) {
+      return snapshot.error.trim();
+    }
+    if (typeof snapshot.status === 'string' && snapshot.status.trim()) {
+      return `Terminal process ${snapshot.status.trim()}`;
+    }
+    return 'Terminal process failed';
+  }
+
+  protected emitTerminalToolPreview(
+    streamId: string,
+    toolCall: ToolCall,
+    result: ToolResult,
+    snapshot: TerminalPreviewSnapshot,
+    status: ToolCallBlock['status'] = 'running',
+    error?: string,
+    standardized?: StandardizedToolResultPayload,
+  ): void {
+    const serialized = JSON.stringify(snapshot);
+    result.content = serialized;
+    this.normalizer.addToolCall(streamId, {
+      type: 'tool_call',
+      toolName: toolCall.name,
+      toolId: result.toolCallId || toolCall.id,
+      status,
+      input: JSON.stringify(toolCall.arguments, null, 2),
+      output: serialized,
+      ...(error ? { error } : {}),
+      ...(standardized ? { standardized } : {}),
+    });
+  }
+
   protected isTerminalProcessTool(toolName: string): boolean {
     return toolName === 'shell'
       || toolName === 'process_launch'
@@ -332,7 +545,7 @@ export abstract class BaseLLMAdapter extends EventEmitter {
   }
 
   private startDetachedToolStream(): string {
-    const traceId = this.currentTraceId || this.syncTraceFromMessageHub();
+    const traceId = this.syncTraceFromMessageHub();
     return this.normalizer.startStream(traceId);
   }
 
@@ -374,6 +587,7 @@ export abstract class BaseLLMAdapter extends EventEmitter {
         terminalPreviewEntries.push({
           streamId: targetStreamId,
           ownStream: !isPreAnnounced,
+          toolCall,
           result,
         });
 
@@ -430,13 +644,27 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     await Promise.all(terminalPreviewPromises);
     for (const entry of terminalPreviewEntries) {
       const hardError = this.isHardToolFailure(entry.result);
-      this.normalizer.finishToolCall(
+      const output = typeof entry.result.content === 'string' ? entry.result.content : String(entry.result.content ?? '');
+      const error = hardError
+        ? (() => {
+            const parsed = this.parseToolResultJson(entry.result);
+            const snapshotError = typeof parsed?.error === 'string' ? parsed.error : undefined;
+            return snapshotError || entry.result.standardized?.message || output || 'Terminal process failed';
+          })()
+        : undefined;
+      this.normalizer.settleToolCallBlock(
         entry.streamId,
-        entry.result.toolCallId,
-        hardError ? undefined : entry.result.content,
-        hardError ? entry.result.content : undefined,
+        {
+          type: 'tool_call',
+          toolName: entry.toolCall.name,
+          toolId: entry.result.toolCallId,
+          status: hardError ? 'failed' : 'completed',
+          input: JSON.stringify(entry.toolCall.arguments, null, 2),
+          output,
+          ...(error ? { error } : {}),
+          ...(entry.result.standardized ? { standardized: entry.result.standardized } : {}),
+        },
         entry.result.fileChange,
-        entry.result.standardized
       );
       if (entry.ownStream) {
         this.normalizer.endStream(entry.streamId);
@@ -459,10 +687,11 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     const terminalId = typeof launchResult?.terminal_id === 'number' ? launchResult.terminal_id : undefined;
     const status = typeof launchResult?.status === 'string' ? launchResult.status : '';
     const runMode = launchResult?.run_mode;
-    const isTaskMode = runMode === 'task';
+    const normalizedRunMode = runMode === 'service' || runMode === 'task' ? runMode : undefined;
+    const isTaskMode = normalizedRunMode === 'task';
     const shouldStream = Boolean(
       terminalId
-      && (runMode === 'service' || runMode === 'task')
+      && normalizedRunMode
       && status !== 'completed'
       && status !== 'failed'
       && status !== 'killed'
@@ -473,32 +702,32 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     }
 
     const maxPreviewMs = isTaskMode ? 600_000 : 10_000; // task 最大 10 分钟，service 最大 10 秒
-    const sessionId = this.syncTraceFromMessageHub();
-    let frameSeq = 0;
-
-    // 发送 terminalStreamStarted
-    this.messageHub.data('terminalStreamStarted', {
-      sessionId,
-      traceId: sessionId,
-      toolCallId: result.toolCallId,
-      toolName: toolCall.name,
-      workerId: executionContext.workerId,
-      workerRole: executionContext.role,
-      terminalId,
-      frameSeq,
-      status,
-      runMode,
+    let previewSnapshot: TerminalPreviewSnapshot = {
+      terminal_id: terminalId,
+      status: status || 'running',
+      run_mode: normalizedRunMode,
       phase: typeof launchResult?.phase === 'string' ? launchResult.phase : undefined,
+      terminal_name: typeof launchResult?.terminal_name === 'string' ? launchResult.terminal_name : undefined,
       cwd: typeof launchResult?.cwd === 'string' ? launchResult.cwd : undefined,
       command: typeof toolCall.arguments?.command === 'string' ? toolCall.arguments.command : undefined,
-      terminalName: typeof launchResult?.terminal_name === 'string' ? launchResult.terminal_name : undefined,
       output: typeof launchResult?.output === 'string' ? launchResult.output : '',
-      outputCursor: typeof launchResult?.output_cursor === 'number' ? launchResult.output_cursor : 0,
-      outputStartCursor: typeof launchResult?.output_start_cursor === 'number' ? launchResult.output_start_cursor : 0,
-      nextCursor: typeof launchResult?.output_cursor === 'number' ? launchResult.output_cursor : 0,
+      output_cursor: typeof launchResult?.output_cursor === 'number' ? launchResult.output_cursor : 0,
+      output_start_cursor: typeof launchResult?.output_start_cursor === 'number' ? launchResult.output_start_cursor : 0,
+      next_cursor: typeof launchResult?.output_cursor === 'number' ? launchResult.output_cursor : 0,
       delta: false,
-      timestamp: Date.now(),
-    });
+      truncated: typeof launchResult?.truncated === 'boolean' ? launchResult.truncated : undefined,
+      startup_status: typeof launchResult?.startup_status === 'string' ? launchResult.startup_status : undefined,
+      startup_message: typeof launchResult?.startup_message === 'string' ? launchResult.startup_message : undefined,
+      locked: typeof launchResult?.locked === 'boolean' ? launchResult.locked : undefined,
+      return_code: typeof launchResult?.return_code === 'number'
+        ? launchResult.return_code
+        : (launchResult?.return_code === null ? null : undefined),
+      accepted: typeof launchResult?.accepted === 'boolean' ? launchResult.accepted : undefined,
+      killed: typeof launchResult?.killed === 'boolean' ? launchResult.killed : undefined,
+      released_lock: typeof launchResult?.released_lock === 'boolean' ? launchResult.released_lock : undefined,
+      error: typeof launchResult?.error === 'string' ? launchResult.error : undefined,
+    };
+    this.emitTerminalToolPreview(streamId, toolCall, result, previewSnapshot, 'running');
 
     // 事件驱动流式推送
     const executor = this.toolManager.getShellExecutor();
@@ -548,26 +777,17 @@ export abstract class BaseLLMAdapter extends EventEmitter {
         if (signal?.aborted) { cleanup(); return; }
         if (Date.now() - startAt >= maxPreviewMs) { cleanup(); return; }
 
-        frameSeq += 1;
-        this.messageHub.data('terminalStreamFrame', {
-          sessionId,
-          traceId: sessionId,
-          toolCallId: result.toolCallId,
-          toolName: toolCall.name,
-          workerId: executionContext.workerId,
-          workerRole: executionContext.role,
-          terminalId,
-          frameSeq,
+        previewSnapshot = this.applyTerminalPreviewPatch(previewSnapshot, {
           status: 'running',
-          runMode,
+          run_mode: normalizedRunMode,
           command: typeof toolCall.arguments?.command === 'string' ? toolCall.arguments.command : undefined,
           output: event.output,
-          fromCursor: event.fromCursor,
-          outputCursor: event.cursor,
-          nextCursor: event.cursor,
+          from_cursor: event.fromCursor,
+          output_cursor: event.cursor,
+          next_cursor: event.cursor,
           delta: true,
-          timestamp: Date.now(),
         });
+        this.emitTerminalToolPreview(streamId, toolCall, result, previewSnapshot, 'running');
       };
 
       const onCompleted = (event: {
@@ -578,27 +798,30 @@ export abstract class BaseLLMAdapter extends EventEmitter {
         cursor: number;
       }) => {
         if (event.processId !== terminalId) return;
-
-        frameSeq += 1;
-        this.messageHub.data('terminalStreamCompleted', {
-          sessionId,
-          traceId: sessionId,
-          toolCallId: result.toolCallId,
-          toolName: toolCall.name,
-          workerId: executionContext.workerId,
-          workerRole: executionContext.role,
-          terminalId,
-          frameSeq,
+        previewSnapshot = this.applyTerminalPreviewPatch(previewSnapshot, {
           status: event.state,
-          runMode,
+          run_mode: normalizedRunMode,
           command: typeof toolCall.arguments?.command === 'string' ? toolCall.arguments.command : undefined,
-          returnCode: event.exitCode,
           output: event.output,
-          outputCursor: event.cursor,
-          nextCursor: event.cursor,
+          output_cursor: event.cursor,
+          next_cursor: event.cursor,
           delta: false,
-          timestamp: Date.now(),
+          return_code: event.exitCode,
+          killed: event.state === 'killed' ? true : previewSnapshot.killed,
         });
+        const completionStatus = this.resolveTerminalCompletionStatus(event.state);
+        if (completionStatus !== 'success') {
+          previewSnapshot = this.applyTerminalPreviewPatch(previewSnapshot, {
+            error: this.buildTerminalFailureMessage(previewSnapshot),
+          });
+        }
+        result.content = JSON.stringify(previewSnapshot);
+        this.updateTerminalPreviewStandardized(
+          toolCall,
+          result,
+          completionStatus,
+          completionStatus === 'success' ? result.content : this.buildTerminalFailureMessage(previewSnapshot),
+        );
 
         // task 终态：用最终输出替换 launch 快返内容
         if (isTaskMode) {
@@ -617,53 +840,50 @@ export abstract class BaseLLMAdapter extends EventEmitter {
         if (signal?.aborted) { cleanup(); return; }
 
         if (typeof snapshot.output === 'string' && snapshot.output.length > 0) {
-          frameSeq += 1;
-          this.messageHub.data('terminalStreamFrame', {
-            sessionId,
-            traceId: sessionId,
-            toolCallId: result.toolCallId,
-            toolName: toolCall.name,
-            workerId: executionContext.workerId,
-            workerRole: executionContext.role,
-            terminalId,
-            frameSeq,
-            status: snapshot.status,
-            runMode,
+          previewSnapshot = this.applyTerminalPreviewPatch(previewSnapshot, {
+            status: typeof snapshot.status === 'string' ? snapshot.status : previewSnapshot.status,
+            run_mode: normalizedRunMode,
             command: typeof toolCall.arguments?.command === 'string' ? toolCall.arguments.command : undefined,
             output: snapshot.output,
-            fromCursor: snapshot.from_cursor,
-            outputCursor: snapshot.output_cursor,
-            outputStartCursor: snapshot.output_start_cursor,
-            nextCursor: snapshot.next_cursor,
+            from_cursor: typeof snapshot.from_cursor === 'number' ? snapshot.from_cursor : undefined,
+            output_cursor: typeof snapshot.output_cursor === 'number' ? snapshot.output_cursor : undefined,
+            output_start_cursor: typeof snapshot.output_start_cursor === 'number' ? snapshot.output_start_cursor : undefined,
+            next_cursor: typeof snapshot.next_cursor === 'number' ? snapshot.next_cursor : undefined,
             delta: true,
-            truncated: snapshot.truncated,
-            timestamp: Date.now(),
+            truncated: typeof snapshot.truncated === 'boolean' ? snapshot.truncated : undefined,
           });
+          this.emitTerminalToolPreview(streamId, toolCall, result, previewSnapshot, 'running');
         }
 
         if (snapshot.status === 'completed' || snapshot.status === 'failed' || snapshot.status === 'killed' || snapshot.status === 'timeout') {
-          frameSeq += 1;
-          this.messageHub.data('terminalStreamCompleted', {
-            sessionId,
-            traceId: sessionId,
-            toolCallId: result.toolCallId,
-            toolName: toolCall.name,
-            workerId: executionContext.workerId,
-            workerRole: executionContext.role,
-            terminalId,
-            frameSeq,
+          previewSnapshot = this.applyTerminalPreviewPatch(previewSnapshot, {
             status: snapshot.status,
-            runMode,
+            run_mode: normalizedRunMode,
             command: typeof toolCall.arguments?.command === 'string' ? toolCall.arguments.command : undefined,
-            returnCode: snapshot.return_code,
-            output: snapshot.output,
-            outputCursor: snapshot.output_cursor,
-            outputStartCursor: snapshot.output_start_cursor,
-            nextCursor: snapshot.next_cursor,
+            output: typeof snapshot.output === 'string' ? snapshot.output : previewSnapshot.output,
+            output_cursor: typeof snapshot.output_cursor === 'number' ? snapshot.output_cursor : undefined,
+            output_start_cursor: typeof snapshot.output_start_cursor === 'number' ? snapshot.output_start_cursor : undefined,
+            next_cursor: typeof snapshot.next_cursor === 'number' ? snapshot.next_cursor : undefined,
             delta: false,
-            truncated: snapshot.truncated,
-            timestamp: Date.now(),
+            truncated: typeof snapshot.truncated === 'boolean' ? snapshot.truncated : undefined,
+            return_code: typeof snapshot.return_code === 'number'
+              ? snapshot.return_code
+              : (snapshot.return_code === null ? null : undefined),
+            killed: snapshot.status === 'killed' ? true : previewSnapshot.killed,
           });
+          const completionStatus = this.resolveTerminalCompletionStatus(snapshot.status);
+          if (completionStatus !== 'success') {
+            previewSnapshot = this.applyTerminalPreviewPatch(previewSnapshot, {
+              error: this.buildTerminalFailureMessage(previewSnapshot),
+            });
+          }
+          result.content = JSON.stringify(previewSnapshot);
+          this.updateTerminalPreviewStandardized(
+            toolCall,
+            result,
+            completionStatus,
+            completionStatus === 'success' ? result.content : this.buildTerminalFailureMessage(previewSnapshot),
+          );
           await finalizeTaskResult(snapshot.status);
           cleanup();
         }
@@ -727,6 +947,17 @@ export abstract class BaseLLMAdapter extends EventEmitter {
   }
 
   /**
+   * 设置当前请求的消息归属元数据（实例级，非全局）。
+   */
+  setCurrentMessageMetadata(metadata: Partial<MessageMetadata> | undefined): void {
+    this.currentMessageMetadata = metadata;
+    const boundSessionId = this.resolveBoundSessionId();
+    if (boundSessionId) {
+      this.currentTraceId = boundSessionId;
+    }
+  }
+
+  /**
    * 合并当前请求的工具执行上下文覆盖。
    */
   protected resolveToolExecutionContext(base: ToolExecutionContext): ToolExecutionContext {
@@ -750,7 +981,16 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     const requestId = this.currentRequestId;
     const boundMessageId = requestId ? this.messageHub.getRequestMessageId(requestId) : undefined;
 
-    return this.normalizer.startStream(traceId, undefined, boundMessageId, visibility);
+    // 将 requestId 注入流式消息 metadata，确保前端语义锚点
+    // 能通过 scope ID 将 worker_dispatch/task_card/worker_wait 关联到同一请求。
+    const streamMetadata: Record<string, unknown> = {
+      ...(this.currentMessageMetadata || {}),
+    };
+    if (requestId) {
+      streamMetadata.requestId = requestId;
+    }
+
+    return this.normalizer.startStream(traceId, undefined, boundMessageId, visibility, streamMetadata);
   }
 
   protected createRetryRuntimeHook(messageId?: string): LLMMessageParams['retryRuntimeHook'] | undefined {
@@ -769,7 +1009,9 @@ export abstract class BaseLLMAdapter extends EventEmitter {
     }
 
     const traceId = this.syncTraceFromMessageHub();
+    const sessionId = this.resolveMessageSessionId();
     this.messageHub.data('llmRetryRuntime', {
+      sessionId,
       traceId,
       messageId,
       agent: this.agent,
@@ -781,10 +1023,16 @@ export abstract class BaseLLMAdapter extends EventEmitter {
   }
 
   /**
-   * 将适配器当前 trace 与 MessageHub 保持一致。
-   * MessageHub trace 已与会话绑定，消息 trace 必须沿用它，避免跨会话误过滤。
+   * 将适配器当前链路 trace 与 MessageHub 保持一致。
+   * 会话归属始终来自 metadata.sessionId，trace 仅用于链路追踪。
    */
   protected syncTraceFromMessageHub(): string {
+    const boundSessionId = this.resolveBoundSessionId();
+    if (boundSessionId) {
+      this.currentTraceId = boundSessionId;
+      return this.currentTraceId;
+    }
+
     const hubTraceId = this.messageHub.getTraceId();
     if (typeof hubTraceId === 'string' && hubTraceId.trim()) {
       this.currentTraceId = hubTraceId.trim();
@@ -795,6 +1043,23 @@ export abstract class BaseLLMAdapter extends EventEmitter {
       this.currentTraceId = this.generateTraceId();
     }
     return this.currentTraceId;
+  }
+
+  protected resolveBoundSessionId(): string | undefined {
+    const sessionId = this.currentMessageMetadata?.sessionId;
+    if (typeof sessionId !== 'string') {
+      return undefined;
+    }
+    const normalized = sessionId.trim();
+    return normalized || undefined;
+  }
+
+  protected resolveMessageSessionId(): string {
+    const boundSessionId = this.resolveBoundSessionId() || this.messageHub.getSessionId();
+    if (typeof boundSessionId === 'string' && boundSessionId.trim()) {
+      return boundSessionId.trim();
+    }
+    return this.currentMessageMetadata?.sessionId?.trim() || '';
   }
 
   // 节流定时器
@@ -824,8 +1089,12 @@ export abstract class BaseLLMAdapter extends EventEmitter {
 
   private emitTokenUpdate(): void {
     if (!this.messageHub) return;
-    
+
+    const traceId = this.syncTraceFromMessageHub();
+    const sessionId = this.resolveMessageSessionId();
     this.messageHub.data('executionTokenRuntime', {
+      sessionId,
+      traceId,
       worker: this.agent,
       provider: this.config.provider,
       model: this.config.model,

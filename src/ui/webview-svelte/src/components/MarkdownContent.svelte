@@ -14,8 +14,8 @@
 
   // 内容段落类型
   type ContentSegment =
-    | { type: 'markdown'; html: string }
-    | { type: 'code'; code: string; language: string };
+    | { type: 'markdown'; key: string; html: string }
+    | { type: 'code'; key: string; code: string; language: string };
 
   // 解析后的内容段落
   let segments = $state<ContentSegment[]>([]);
@@ -24,9 +24,17 @@
   // 字符串是值传递，对象是引用传递。定时器读取 contentRef.val 永远是新的。
   const contentRef = { val: '' };
 
-  // 节流控制
-  let lastRenderTime = 0;
-  let renderTimer: ReturnType<typeof setTimeout> | undefined;
+  // 单模式流式渲染：始终走 markdown 解析，只把调度收敛为逐帧刷新。
+  let renderFrame: number | undefined;
+  const streamState = {
+    lastRaw: '',
+    stableRaw: '',
+    tailRaw: '',
+    stableSegments: [] as ContentSegment[],
+  };
+  const MIN_STREAMING_BOUNDARY = 32;
+  const TARGET_TAIL_LENGTH = 96;
+  const MIN_TAIL_REMAINDER = 16;
 
   // 参考 Augment 的自定义 renderer 方案：
   // 通过 marked.use() 配置自定义 renderer，控制链接、图片等元素的 HTML 输出
@@ -72,12 +80,171 @@
     containerEl?.addEventListener('click', handleLinkClick);
 
     return () => {
-      if (renderTimer) clearTimeout(renderTimer);
+      if (renderFrame !== undefined) cancelAnimationFrame(renderFrame);
       containerEl?.removeEventListener('click', handleLinkClick);
     };
   });
 
-  function doRender() {
+  function resetStreamingState() {
+    streamState.lastRaw = '';
+    streamState.stableRaw = '';
+    streamState.tailRaw = '';
+    streamState.stableSegments = [];
+  }
+
+  function parseContentSegments(text: string, streamingParse: boolean, keyPrefix: string, keyStart = 0): ContentSegment[] {
+    if (!text) {
+      return [];
+    }
+
+    const contentToParse = preprocessMarkdown(text, streamingParse);
+    const tokens = marked.lexer(contentToParse);
+    const result: ContentSegment[] = [];
+    let pendingTokens: Token[] = [];
+    let segmentIndex = keyStart;
+
+    function flushPendingTokens() {
+      if (pendingTokens.length > 0) {
+        const html = marked.parser(pendingTokens as Token[]);
+        if (html.trim()) {
+          result.push({ type: 'markdown', key: `${keyPrefix}-md-${segmentIndex}`, html });
+          segmentIndex += 1;
+        }
+        pendingTokens = [];
+      }
+    }
+
+    for (const token of tokens) {
+      if (token.type === 'code') {
+        const codeToken = token as Tokens.Code;
+        const isFenced = /^ {0,3}(`{3,}|~{3,})/.test(token.raw);
+
+        if (isFenced) {
+          const lang = (codeToken.lang || '').toLowerCase();
+          flushPendingTokens();
+          result.push({
+            type: 'code',
+            key: `${keyPrefix}-code-${segmentIndex}`,
+            code: codeToken.text,
+            language: lang,
+          });
+          segmentIndex += 1;
+        } else {
+          pendingTokens.push(token);
+        }
+      } else {
+        pendingTokens.push(token);
+      }
+    }
+
+    flushPendingTokens();
+    return result;
+  }
+
+  function findSafeStreamingBoundary(text: string): number {
+    if (!text) {
+      return 0;
+    }
+
+    const lines = text.split('\n');
+    let offset = 0;
+    let inFence = false;
+    let fenceMarker = '';
+    let safeBoundary = 0;
+    let softBoundary = 0;
+
+    for (const line of lines) {
+      const lineStart = offset;
+      const lineWithNewlineLength = line.length + 1;
+      const lineEnd = Math.min(text.length, lineStart + lineWithNewlineLength);
+      const trimmed = line.trim();
+      const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})/);
+
+      if (fenceMatch) {
+        const marker = fenceMatch[1];
+        const markerChar = marker[0];
+        if (!inFence) {
+          inFence = true;
+          fenceMarker = markerChar;
+        } else if (fenceMarker === markerChar) {
+          inFence = false;
+          fenceMarker = '';
+          safeBoundary = lineEnd;
+        }
+      }
+
+      if (!inFence) {
+        if (trimmed.length === 0) {
+          safeBoundary = lineEnd;
+        } else {
+          const punctuationMatches = Array.from(line.matchAll(/[。！？.!?](?=(?:["'”’」』）》】\]\)]|\s|$))/g));
+          if (punctuationMatches.length > 0) {
+            const lastMatch = punctuationMatches[punctuationMatches.length - 1];
+            safeBoundary = lineStart + lastMatch.index + lastMatch[0].length;
+          }
+          const softMatches = Array.from(line.matchAll(/(?:\s+|[，,、；;：:])(?=\S|$)/g));
+          if (softMatches.length > 0) {
+            const lastSoftMatch = softMatches[softMatches.length - 1];
+            softBoundary = lineStart + lastSoftMatch.index + lastSoftMatch[0].length;
+          }
+        }
+      }
+
+      offset = lineEnd;
+    }
+
+    if (!inFence) {
+      const preferredBoundaryLimit = text.length - MIN_TAIL_REMAINDER;
+      const stableBoundaryTooFarBehind = safeBoundary > 0 && (text.length - safeBoundary) > TARGET_TAIL_LENGTH;
+      if ((safeBoundary === 0 || stableBoundaryTooFarBehind)
+        && softBoundary >= MIN_STREAMING_BOUNDARY
+        && softBoundary <= preferredBoundaryLimit) {
+        safeBoundary = softBoundary;
+      }
+    }
+
+    return Math.max(0, Math.min(safeBoundary, text.length));
+  }
+
+  function renderStreamingMarkdown() {
+    const raw = contentRef.val;
+    if (!raw) {
+      resetStreamingState();
+      segments = [];
+      return;
+    }
+
+    const isAppendOnly = streamState.lastRaw && raw.startsWith(streamState.lastRaw);
+    if (!isAppendOnly) {
+      resetStreamingState();
+      streamState.tailRaw = raw;
+    } else {
+      streamState.tailRaw += raw.slice(streamState.lastRaw.length);
+    }
+
+    streamState.lastRaw = raw;
+
+    const safeBoundary = findSafeStreamingBoundary(streamState.tailRaw);
+    if (safeBoundary > 0) {
+      const stableChunk = streamState.tailRaw.slice(0, safeBoundary);
+      const stableChunkSegments = parseContentSegments(
+        stableChunk,
+        false,
+        'stable',
+        streamState.stableSegments.length,
+      );
+      if (stableChunkSegments.length > 0) {
+        streamState.stableSegments = streamState.stableSegments.concat(stableChunkSegments);
+      }
+      streamState.stableRaw += stableChunk;
+      streamState.tailRaw = streamState.tailRaw.slice(safeBoundary);
+    }
+
+    const tailSegments = parseContentSegments(streamState.tailRaw, true, 'tail');
+    segments = streamState.stableSegments.concat(tailSegments);
+  }
+
+  function renderMarkdown() {
     const text = contentRef.val;
     if (!text) {
       segments = [];
@@ -85,47 +252,11 @@
     }
 
     try {
-      const contentToParse = preprocessMarkdown(text, isStreaming);
-      const tokens = marked.lexer(contentToParse);
-      const result: ContentSegment[] = [];
-      let pendingTokens: Token[] = [];
-
-      function flushPendingTokens() {
-        if (pendingTokens.length > 0) {
-          const html = marked.parser(pendingTokens as Token[]);
-          if (html.trim()) {
-            result.push({ type: 'markdown', html });
-          }
-          pendingTokens = [];
-        }
-      }
-
-      for (const token of tokens) {
-        if (token.type === 'code') {
-          const codeToken = token as Tokens.Code;
-          const isFenced = /^ {0,3}(`{3,}|~{3,})/.test(token.raw);
-
-          if (isFenced) {
-            const lang = (codeToken.lang || '').toLowerCase();
-            flushPendingTokens();
-            result.push({
-              type: 'code',
-              code: codeToken.text,
-              language: lang,
-            });
-          } else {
-            pendingTokens.push(token);
-          }
-        } else {
-          pendingTokens.push(token);
-        }
-      }
-
-      flushPendingTokens();
-      segments = result;
+      resetStreamingState();
+      segments = parseContentSegments(text, false, 'full');
     } catch (error) {
       console.error('[MarkdownContent] 解析错误:', error);
-      segments = [{ type: 'markdown', html: `<p>${text}</p>` }];
+      segments = [{ type: 'markdown', key: 'fallback-md-0', html: `<p>${escapeAttr(text)}</p>` }];
     }
   }
 
@@ -136,40 +267,25 @@
 
     // 2. 决策渲染时机
     if (!isStreaming || !contentRef.val) {
-      // 非流式或空内容：立即渲染
-      if (renderTimer) {
-        clearTimeout(renderTimer);
-        renderTimer = undefined;
+      if (renderFrame !== undefined) {
+        cancelAnimationFrame(renderFrame);
+        renderFrame = undefined;
       }
-      doRender();
+      renderMarkdown();
       return;
     }
 
-    // 流式：节流控制
-    const now = Date.now();
-    const dynamicDelay = Math.min(100, 32 + Math.floor(contentRef.val.length / 500) * 5);
-
-    // 如果已经有定时器在跑，说明已经安排了下一次渲染，无需操作
-    // 定时器执行时会读取 contentRef.val 的最新值
-    if (!renderTimer) {
-      if (now - lastRenderTime >= dynamicDelay) {
-        // 距离上次渲染已够久，立即执行
-        doRender();
-        lastRenderTime = now;
-      } else {
-        // 还没到时间，安排延后执行
-        renderTimer = setTimeout(() => {
-          doRender();
-          lastRenderTime = Date.now();
-          renderTimer = undefined;
-        }, dynamicDelay - (now - lastRenderTime));
-      }
+    if (renderFrame === undefined) {
+      renderFrame = requestAnimationFrame(() => {
+        renderStreamingMarkdown();
+        renderFrame = undefined;
+      });
     }
   });
 </script>
 
 <div class="markdown-content" class:streaming={isStreaming} bind:this={containerEl}>
-  {#each segments as segment, i (`segment-${i}-${segment.type}`)}
+  {#each segments as segment (segment.key)}
     {#if segment.type === 'markdown'}
       {@html segment.html}
     {:else if segment.type === 'code'}

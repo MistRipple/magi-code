@@ -1,43 +1,27 @@
 import type { Message, WaitForWorkersResult } from '../types/message';
+import {
+  buildTimelineAssignmentTaskKey,
+  resolveTimelineTaskCardScopeId,
+  resolveTimelineWorkerLifecycleKey,
+} from '../../../../shared/timeline-worker-lifecycle';
 import { normalizeWorkerSlot } from './message-classifier';
 
-function normalizeTaskCardKey(raw: unknown): string {
-  if (typeof raw !== 'string') return '';
-  const trimmed = raw.trim();
-  return trimmed.length > 0 ? trimmed : '';
-}
-
 export function resolveTaskCardScopeId(meta: Record<string, unknown> | undefined): string {
-  const requestId = typeof meta?.requestId === 'string' ? meta.requestId.trim() : '';
-  if (requestId) return requestId;
-  const missionId = typeof meta?.missionId === 'string' ? meta.missionId.trim() : '';
-  return missionId || '';
+  return resolveTimelineTaskCardScopeId(meta);
 }
 
 export function buildAssignmentTaskCardKey(assignmentKey: string, scopeId?: string): string {
-  const normalizedAssignment = assignmentKey.trim();
-  if (!normalizedAssignment) return '';
-  const normalizedScope = typeof scopeId === 'string' ? scopeId.trim() : '';
-  return normalizedScope ? `assign:${normalizedAssignment}@${normalizedScope}` : `assign:${normalizedAssignment}`;
+  return buildTimelineAssignmentTaskKey(assignmentKey, scopeId);
 }
 
 export function resolveTaskCardKeyFromMetadata(meta: Record<string, unknown> | undefined): string {
-  const scopeId = resolveTaskCardScopeId(meta);
-  const rawAssignmentId = normalizeTaskCardKey(meta?.assignmentId);
-  if (rawAssignmentId) return buildAssignmentTaskCardKey(rawAssignmentId, scopeId);
-  const rawSubTaskId = normalizeTaskCardKey(meta?.subTaskId);
-  if (rawSubTaskId) return buildAssignmentTaskCardKey(rawSubTaskId, scopeId);
-  const rawSubTaskCardId = normalizeTaskCardKey((meta?.subTaskCard as { id?: unknown } | undefined)?.id);
-  if (rawSubTaskCardId) return buildAssignmentTaskCardKey(rawSubTaskCardId, scopeId);
-  const rawCardId = normalizeTaskCardKey(meta?.cardId);
-  if (rawCardId) return rawCardId;
-  return '';
+  return resolveTimelineWorkerLifecycleKey(meta);
 }
 
 export function buildWaitResultFromTaskCardMessage(
   message: Pick<Message, 'id' | 'type' | 'timestamp' | 'metadata'>,
 ): { cardKey: string; result: WaitForWorkersResult } | null {
-  if (message.type !== 'task_card') return null;
+  if (message.type !== 'task_card' && message.type !== 'instruction') return null;
   const meta = message.metadata as Record<string, unknown> | undefined;
   const subTaskCard = (meta?.subTaskCard || {}) as Record<string, unknown>;
   const rawWorker = (subTaskCard.worker as string | undefined) || (meta?.assignedWorker as string | undefined);
@@ -51,7 +35,7 @@ export function buildWaitResultFromTaskCardMessage(
     completed: 'completed',
     failed: 'failed',
     skipped: 'skipped',
-    stopped: 'cancelled',
+    cancelled: 'cancelled',
   } as const;
   const mappedStatus = statusMap[statusRaw as keyof typeof statusMap];
   if (!mappedStatus) return null;

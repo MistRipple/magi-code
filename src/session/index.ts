@@ -11,3 +11,19 @@ export {
   type SessionStatus,
 } from './unified-session-manager';
 
+export {
+  type TimelineRecord,
+  type TimelineRecordKind,
+  type SessionNotificationRecord,
+  type SessionRuntimeTimelineState,
+  type SessionRuntimeNotificationState,
+} from './timeline-record';
+
+export {
+  buildSessionTimelineProjection,
+  isSessionTimelineProjection,
+  type SessionTimelineProjection,
+  type SessionTimelineProjectionArtifact,
+  type SessionTimelineProjectionExecutionItem,
+  type SessionTimelineProjectionMessage,
+} from './session-timeline-projection';

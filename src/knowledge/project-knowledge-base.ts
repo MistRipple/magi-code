@@ -796,6 +796,10 @@ export class ProjectKnowledgeBase {
     return this.localSearchEngine;
   }
 
+  getProjectRoot(): string {
+    return this.projectRoot;
+  }
+
   /**
    * 获取项目上下文（用于注入到 LLM）
    */
@@ -830,7 +834,7 @@ export class ProjectKnowledgeBase {
     // 相关 FAQ（最多2个）
     if (this.faqs.length > 0) {
       parts.push('**相关 FAQ**:');
-      const topFAQs = this.faqs
+      const topFAQs = [...this.faqs]
         .sort((a, b) => b.useCount - a.useCount)
         .slice(0, 2);
       topFAQs.forEach(faq => {

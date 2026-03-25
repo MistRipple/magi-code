@@ -1,0 +1,376 @@
+*** Begin Patch
+*** Add File: /Users/xie/code/magi/src/orchestrator/core/request-classifier.ts
++import type { PlanMode } from '../plan-ledger';
++
++export type RequestKind = 'direct_response' | 'analysis' | 'task_execution';
++
++export interface RequestClassification {
++  requestKind: RequestKind;
++  hasReadOnlyIntent: boolean;
++  hasWriteIntent: boolean;
++  hasHighImpactIntent: boolean;
++  hasWorkspaceScopedIntent: boolean;
++  hasAssistantMetaIntent: boolean;
++  hasConversationalIntent: boolean;
++  isShortConversationalTurn: boolean;
++  needsWorker: boolean;
++  needsTooling: boolean;
++  requiresModification: boolean;
++  reason: string;
++}
++
++const READ_ONLY_KEYWORDS = ['分析', '解释', '总结', '查看', '审查', 'review', 'summarize', 'read only'];
++const WRITE_KEYWORDS = ['修改', '实现', '修复', '新增', '重构', '删除', '更新', '编写', 'patch'];
++const HIGH_IMPACT_KEYWORDS = [
++  '架构',
++  '迁移',
++  '并发',
++  'schema',
++  'ledger',
++  '状态机',
++  '依赖',
++  '数据库',
++  '权限',
++  '认证',
++  '安全',
++  'deploy',
++  '生产',
++];
++const WORKSPACE_SCOPED_KEYWORDS = [
++  '当前项目',
++  '这个项目',
++  '当前代码',
++  '代码库',
++  '仓库',
++  '工作区',
++  '模块',
++  '文件',
++  '目录',
++  '技术栈',
++  'adr',
++  'faq',
++  'repo',
++  'workspace',
++  'codebase',
++  'project',
++  'module',
++  'file',
++  'session',
++];
++const ASSISTANT_META_KEYWORDS = [
++  '你是谁',
++  '你是什么',
++  '你能做什么',
++  '你可以做什么',
++  '介绍一下你自己',
++  '介绍下你自己',
++  '自我介绍',
++  '你的能力',
++  '你的职责',
++  '怎么用',
++  '如何使用',
++  '使用方式',
++  '模式区别',
++  'magi 是什么',
++  '你和 claude',
++  '你和 codex',
++  '你和 gemini',
++  'who are you',
++  'what are you',
++  'what can you do',
++  'how to use',
++  'capabilities',
++  'your role',
++];
++const CONVERSATIONAL_KEYWORDS = [
++  '你好',
++  'hello',
++  'hi',
++  'thanks',
++  'thank you',
++  '谢谢',
++  '早上好',
++  '晚上好',
++];
++
++function includesAny(prompt: string, keywords: string[]): boolean {
++  return keywords.some((keyword) => prompt.includes(keyword));
++}
++
++export function classifyRequest(prompt: string, mode: PlanMode): RequestClassification {
++  const normalizedPrompt = prompt.toLowerCase();
++  const hasReadOnlyIntent = includesAny(normalizedPrompt, READ_ONLY_KEYWORDS);
++  const hasWriteIntent = includesAny(normalizedPrompt, WRITE_KEYWORDS);
++  const hasHighImpactIntent = includesAny(normalizedPrompt, HIGH_IMPACT_KEYWORDS);
++  const hasWorkspaceScopedIntent = includesAny(normalizedPrompt, WORKSPACE_SCOPED_KEYWORDS);
++  const hasAssistantMetaIntent = includesAny(normalizedPrompt, ASSISTANT_META_KEYWORDS);
++  const hasConversationalIntent = includesAny(normalizedPrompt, CONVERSATIONAL_KEYWORDS)
++    || /[?？吗么]/.test(prompt);
++  const isShortConversationalTurn = prompt.trim().length <= 120;
++  const requiresModification = hasWriteIntent || hasHighImpactIntent;
++
++  const requestKind: RequestKind = !requiresModification
++    && !hasWorkspaceScopedIntent
++    && isShortConversationalTurn
++    && (hasAssistantMetaIntent || hasConversationalIntent)
++    ? 'direct_response'
++    : !requiresModification && hasReadOnlyIntent
++    ? 'analysis'
++    : 'task_execution';
++
++  const needsWorker = requestKind === 'direct_response'
++    ? false
++    : mode === 'deep' || requiresModification || !hasReadOnlyIntent;
++  const needsTooling = requestKind === 'direct_response'
++    ? false
++    : mode === 'deep' || requiresModification;
++
++  return {
++    requestKind,
++    hasReadOnlyIntent,
++    hasWriteIntent,
++    hasHighImpactIntent,
++    hasWorkspaceScopedIntent,
++    hasAssistantMetaIntent,
++    hasConversationalIntent,
++    isShortConversationalTurn,
++    needsWorker,
++    needsTooling,
++    requiresModification,
++    reason: requestKind === 'direct_response'
++      ? '请求属于非任务型直接问答，应走轻量直答路径，避免编排历史、项目上下文和内部工具污染主线'
++      : requestKind === 'analysis'
++      ? '请求以只读分析为主，可优先保持轻量分析链路，不触发写入型任务编排'
++      : '请求已进入任务执行语义，需要继续完成计划生成与后续调度决策',
++  };
++}
+*** Update File: /Users/xie/code/magi/src/orchestrator/protocols/types.ts
+@@
+ export interface RequirementAnalysis {
+@@
+   /** 任务分类（决定哪些 Worker 参与） */
+   categories?: string[];
++  /** 请求类型（决定是否进入任务编排主链） */
++  requestKind?: 'direct_response' | 'analysis' | 'task_execution';
+   /** 任务委派说明（每个 Worker 的职责） */
+   delegationBriefings?: string[];
+*** Update File: /Users/xie/code/magi/src/orchestrator/prompts/orchestrator-prompts.ts
+@@
+ export function buildDirectResponseSystemPrompt(context: DirectResponsePromptContext = {}): string {
+   const workspaceRoot = context.workspaceRoot?.trim() || 'unknown';
+   return [
+-    'You are Magi, a programming assistant and multi-worker orchestrator.',
++    'You are Magi, a programming assistant.',
+     '',
+     'This request has been classified as a direct-response turn, not a task-execution turn.',
+     '',
+     'Rules:',
+-    '- Answer directly and briefly in the user\'s language.',
++    '- Answer directly and briefly in the user\'s language.',
++    '- Keep the answer short by default. Prefer one concise paragraph unless the user explicitly asks for detail.',
+     '- Do not create plans, phases, todos, or worker delegations.',
+     '- Do not mention worker_dispatch, worker_wait, context_compact, runtime governance, or other internal machinery unless the user explicitly asks about them.',
+     '- Do not treat the current workspace as task context by default.',
+     `- Current workspace root is ${workspaceRoot}; only mention it when the user explicitly asks about the current project/workspace.`,
+     '- Provide product-level identity/capability explanations only; avoid dumping full worker tables or internal operating rules unless explicitly requested.',
+   ].join('\n');
+ }
+*** Update File: /Users/xie/code/magi/src/orchestrator/core/mission-driven-engine.ts
+@@
+ import {
+   decideDeliveryRecovery,
+   decideGovernanceRecovery,
+   decideRuntimeRecovery,
+@@
+ } from './recovery-decision-kernel';
+ import { resolveEffectiveMode } from './effective-mode-resolver';
++import { classifyRequest } from './request-classifier';
+@@
+   private analyzeRequirementExecutionIntent(
+     prompt: string,
+     mode: PlanMode,
+   ): {
++    requestKind: 'direct_response' | 'analysis' | 'task_execution';
+     isDirectResponse: boolean;
+     hasReadOnlyIntent: boolean;
+     hasWriteIntent: boolean;
+@@
+     needsTooling: boolean;
+     requiresModification: boolean;
+     reason: string;
+   } {
+-    const normalizedPrompt = prompt.toLowerCase();
+-    const readOnlyKeywords = ['分析', '解释', '总结', '查看', '审查', 'review', 'summarize', 'read only'];
+-    const writeKeywords = ['修改', '实现', '修复', '新增', '重构', '删除', '更新', '编写', 'patch'];
+-    const highImpactKeywords = [
+-      '架构',
+-      '迁移',
+-      '并发',
+-      'schema',
+-      'ledger',
+-      '状态机',
+-      '依赖',
+-      '数据库',
+-      '权限',
+-      '认证',
+-      '安全',
+-      'deploy',
+-      '生产',
+-    ];
+-    const workspaceScopedKeywords = [
+-      '当前项目',
+-      '这个项目',
+-      '当前代码',
+-      '代码库',
+-      '仓库',
+-      '工作区',
+-      '模块',
+-      '文件',
+-      '目录',
+-      '技术栈',
+-      'adr',
+-      'faq',
+-      'repo',
+-      'workspace',
+-      'codebase',
+-      'project',
+-      'module',
+-      'file',
+-      'session',
+-    ];
+-    const assistantMetaKeywords = [
+-      '你是谁',
+-      '你是什么',
+-      '你能做什么',
+-      '你可以做什么',
+-      '介绍一下你自己',
+-      '介绍下你自己',
+-      '自我介绍',
+-      '你的能力',
+-      '你的职责',
+-      '怎么用',
+-      '如何使用',
+-      '使用方式',
+-      '模式区别',
+-      'magi 是什么',
+-      '你和 claude',
+-      '你和 codex',
+-      '你和 gemini',
+-      'who are you',
+-      'what are you',
+-      'what can you do',
+-      'how to use',
+-      'capabilities',
+-      'your role',
+-    ];
+-    const conversationalKeywords = [
+-      '你好',
+-      'hello',
+-      'hi',
+-      'thanks',
+-      'thank you',
+-      '谢谢',
+-      '早上好',
+-      '晚上好',
+-    ];
+-    const hasReadOnlyIntent = readOnlyKeywords.some(keyword => normalizedPrompt.includes(keyword));
+-    const hasWriteIntent = writeKeywords.some(keyword => normalizedPrompt.includes(keyword));
+-    const hasHighImpactIntent = highImpactKeywords.some(keyword => normalizedPrompt.includes(keyword));
+-    const hasWorkspaceScopedIntent = workspaceScopedKeywords.some(keyword => normalizedPrompt.includes(keyword));
+-    const hasAssistantMetaIntent = assistantMetaKeywords.some(keyword => normalizedPrompt.includes(keyword));
+-    const hasConversationalIntent = conversationalKeywords.some(keyword => normalizedPrompt.includes(keyword))
+-      || /[?？吗么]/.test(prompt);
+-    const isShortConversationalTurn = prompt.trim().length <= 120;
+-    const requiresModification = hasWriteIntent || hasHighImpactIntent;
+-    const isDirectResponse = !requiresModification
+-      && !hasWorkspaceScopedIntent
+-      && isShortConversationalTurn
+-      && (hasAssistantMetaIntent || hasConversationalIntent);
+-    const needsWorker = isDirectResponse
+-      ? false
+-      : mode === 'deep' || requiresModification || !hasReadOnlyIntent;
+-    const needsTooling = isDirectResponse
+-      ? false
+-      : mode === 'deep' || requiresModification;
+-
++    const classification = classifyRequest(prompt, mode);
+     return {
+-      isDirectResponse,
+-      hasReadOnlyIntent,
+-      hasWriteIntent,
+-      hasHighImpactIntent,
+-      needsWorker,
+-      needsTooling,
+-      requiresModification,
+-      reason: isDirectResponse
+-        ? '需求属于非任务型直接问答，应走轻量直答路径，避免项目编排和内部工具污染主线'
+-        : needsWorker
+-        ? '需求已进入结构化编排主链，需要继续完成计划生成与后续调度决策'
+-        : '需求以只读分析为主，当前可优先保留编排器直接响应路径',
++      requestKind: classification.requestKind,
++      isDirectResponse: classification.requestKind === 'direct_response',
++      hasReadOnlyIntent: classification.hasReadOnlyIntent,
++      hasWriteIntent: classification.hasWriteIntent,
++      hasHighImpactIntent: classification.hasHighImpactIntent,
++      needsWorker: classification.needsWorker,
++      needsTooling: classification.needsTooling,
++      requiresModification: classification.requiresModification,
++      reason: classification.reason,
+     };
+   }
+@@
+       riskLevel: riskAssessment.riskLevel,
+       riskFactors: riskAssessment.riskFactors,
++      requestKind: executionIntent.requestKind,
+       needsWorker: executionIntent.needsWorker,
+       directResponse: executionIntent.isDirectResponse ? 'direct_response' : undefined,
+       executionMode: executionIntent.isDirectResponse ? 'direct' : undefined,
+@@
+   private shouldUseDirectResponsePath(requirementAnalysis: RequirementAnalysis): boolean {
+-    return requirementAnalysis.executionMode === 'direct'
++    return requirementAnalysis.requestKind === 'direct_response'
++      && requirementAnalysis.executionMode === 'direct'
+       && requirementAnalysis.needsWorker === false
+       && requirementAnalysis.needsTooling === false
+       && requirementAnalysis.requiresModification !== true;
+   }
+*** Update File: /Users/xie/code/magi/scripts/e2e-direct-response-short-circuit-regression.cjs
+@@
+   const result = await engine.execute('你是谁', 'direct-response-task', 'session-direct-response');
+@@
+   assert(
+     typeof call.options?.systemPrompt === 'string'
+       && call.options.systemPrompt.includes('direct-response turn'),
+     '直答路径未注入轻量直答系统提示词',
+   );
++
++  let nonDirectCreateDraftCalled = false;
++  engine.planLedger.createDraft = async () => {
++    nonDirectCreateDraftCalled = true;
++    return {
++      planId: 'draft-analysis',
++      revision: 1,
++      mode: 'standard',
++      summary: '分析当前项目结构',
++      analysis: 'test',
++      constraints: [],
++      runtime: { acceptance: { criteria: [] }, phase: { state: 'idle', remainingPhases: [] } },
++      formattedPlan: 'draft',
++    };
++  };
++
++  await engine.execute('帮我分析当前项目结构', 'analysis-task', 'session-analysis');
++  assert(nonDirectCreateDraftCalled, '工作区分析请求不应被误判为轻量直答');
+ 
+   console.log('\n=== direct response short-circuit regression ===');
+   console.log(JSON.stringify({
+     pass: true,
+     checks: [
+       'simple_prompt_short_circuits_before_draft_plan',
++      'workspace_scoped_analysis_does_not_short_circuit',
+       'direct_response_disables_tool_calls_and_thinking',
+       'direct_response_uses_isolated_history_mode',
+     ],
+   }, null, 2));
+ }
+*** End Patch

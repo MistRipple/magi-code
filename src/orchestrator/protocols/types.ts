@@ -20,10 +20,6 @@ export interface ExecutionPlan {
   id: string;
   analysis: string;
   isSimpleTask?: boolean;
-  /** 是否需要 Worker 执行（false 表示编排者直接回答） */
-  needsWorker?: boolean;
-  /** 编排者直接回答的内容（当 needsWorker=false 时使用） */
-  directResponse?: string;
   /** 是否需要用户补充信息 */
   needsUserInput?: boolean;
   /** 需要用户回答的问题列表 */
@@ -224,20 +220,26 @@ export interface RequirementAnalysis {
   riskFactors?: string[];
 
   // ---- 路由决策 ----
-  /** 是否需要 Worker 执行 */
-  needsWorker: boolean;
-  /** needsWorker=false 时的直接回答 */
-  directResponse?: string;
   /** 任务分类（决定哪些 Worker 参与） */
   categories?: string[];
+  /** 执行入口路径 */
+  entryPath?: 'direct_response' | 'lightweight_analysis' | 'task_execution';
   /** 任务委派说明（每个 Worker 的职责） */
   delegationBriefings?: string[];
   /** 执行模式 */
-  executionMode?: 'direct' | 'sequential' | 'parallel' | 'dependency_chain';
-  /** 是否需要工具调用 */
-  needsTooling?: boolean;
+  executionMode?: 'direct' | 'analysis' | 'sequential' | 'parallel' | 'dependency_chain';
+  /** 本轮是否展示 thinking */
+  includeThinking?: boolean;
+  /** 本轮是否允许工具调用 */
+  includeToolCalls?: boolean;
+  /** 本轮允许的工具白名单 */
+  allowedToolNames?: string[];
+  /** 本轮历史注入策略 */
+  historyMode?: 'session' | 'isolated';
   /** 是否需要修改文件 */
   requiresModification?: boolean;
+  /** 分类决策因子（供审计/校准使用） */
+  decisionFactors?: string[];
   /** 决策理由（用户可见） */
   reason: string;
 }

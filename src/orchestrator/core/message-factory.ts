@@ -5,28 +5,63 @@
 
 import { logger, LogCategory } from '../../logging';
 import type { WorkerSlot, AgentType } from '../../types/agent-types';
-import type { StandardMessage, MessageMetadata, ContentBlock, MessageSource, NotifyLevel, DataMessageType } from '../../protocol/message-protocol';
+import type { StandardMessage, MessageMetadata, ContentBlock, MessageSource, NotifyLevel, DataMessageType, NotifyPresentation } from '../../protocol/message-protocol';
 import { MessageType, MessageLifecycle, MessageCategory, ControlMessageType, createStandardMessage, createControlMessage, createNotifyMessage, createDataMessage, createStreamingMessage } from '../../protocol/message-protocol';
 import { classifyModelOriginIssue, toModelOriginUserMessage } from '../../errors/model-origin';
 import { trackModelOriginEvent } from '../../errors/model-origin-observability';
 
-/** 子任务卡片载荷 - 用于 SubTaskCard 消息 */
-export interface SubTaskCardPayload {
-  id: string;
+interface WorkerLaneTaskCardSnapshot {
+  taskId: string;
   title: string;
-  status: 'pending' | 'running' | 'completed' | 'failed' | 'stopped' | 'skipped';
-  worker: WorkerSlot;
+  worker?: WorkerSlot;
+  status: 'pending' | 'waiting_deps' | 'running' | 'completed' | 'failed' | 'skipped' | 'cancelled';
   summary?: string;
+  fullSummary?: string;
   error?: string;
   failureCode?: string;
   recoverable?: boolean;
   modifiedFiles?: string[];
   createdFiles?: string[];
   duration?: number;
+}
+
+/** 子任务卡片载荷 - 用于 SubTaskCard 消息 */
+export interface SubTaskCardPayload {
+  id: string;
+  title: string;
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'skipped';
+  worker: WorkerSlot;
+  summary?: string;
+  fullSummary?: string;
+  error?: string;
+  failureCode?: string;
+  recoverable?: boolean;
+  modifiedFiles?: string[];
+  createdFiles?: string[];
+  duration?: number;
+  /** 主会话 ID，必须用于固定 lifecycle 卡片归属，禁止依赖全局 trace 猜测 */
+  sessionId?: string;
   missionId?: string;
   turnId?: string;
   /** 显式 requestId（避免依赖全局 requestContext，防止 Worker 并行执行期间竞态丢失） */
   requestId?: string;
+  /** 生命周期卡片在时间轴中的语义锚点时间 */
+  timelineAnchorTimestamp?: number;
+  dispatchWaveId?: string;
+  laneId?: string;
+  workerCardId?: string;
+  laneIndex?: number;
+  laneTotal?: number;
+  laneTaskIds?: string[];
+  laneCurrentTaskId?: string;
+  laneTasks?: Array<{
+    taskId: string;
+    title: string;
+    status: 'pending' | 'waiting_deps' | 'running' | 'completed' | 'failed' | 'skipped' | 'cancelled';
+    dependsOn?: string[];
+    isCurrent?: boolean;
+  }>;
+  laneTaskCards?: WorkerLaneTaskCardSnapshot[];
 }
 
 /** Worker 指令卡片元数据（用于 lane 聚合与可追踪性） */
@@ -39,14 +74,22 @@ export interface WorkerInstructionMetadata {
     dependsOn?: string[];
     isCurrent?: boolean;
   }>;
+  laneTaskCards?: WorkerLaneTaskCardSnapshot[];
   assignmentId?: string;
+  /** 主会话 ID，必须用于固定 worker lane 卡片归属 */
+  sessionId?: string;
   missionId?: string;
+  /** 编排器轮次 ID，用于确定 lifecycle 卡片在时间轴中的排序位置 */
+  turnId?: string;
+  dispatchWaveId?: string;
   laneId?: string;
-  laneCardId?: string;
+  workerCardId?: string;
   laneIndex?: number;
   laneTotal?: number;
   laneTaskIds?: string[];
   requestId?: string;
+  /** 生命周期卡片在时间轴中的语义锚点时间 */
+  timelineAnchorTimestamp?: number;
 }
 
 /** MessagePipeline 接口（协议层） */
@@ -59,17 +102,21 @@ export interface IMessagePipeline {
 export class MessageFactory {
   private pipeline: IMessagePipeline;
   private traceId: string;
+  private sessionId: string | null;
   private requestId?: string;
 
   constructor(pipeline: IMessagePipeline, traceId?: string) {
     this.pipeline = pipeline;
-    this.traceId = traceId || this.generateTraceId();
+    this.traceId = this.normalizeIdentifier(traceId) || this.generateTraceId();
+    this.sessionId = this.normalizeIdentifier(traceId) || null;
   }
 
   // Trace 和 Request 上下文管理
   setTraceId(traceId: string): void { this.traceId = traceId; }
   getTraceId(): string { return this.traceId; }
   newTrace(): string { this.traceId = this.generateTraceId(); return this.traceId; }
+  setSessionId(sessionId?: string | null): void { this.sessionId = this.normalizeIdentifier(sessionId) || null; }
+  getSessionId(): string | null { return this.sessionId; }
 
 
   /** 发送进度消息 - 显示在主对话区 */
@@ -92,7 +139,7 @@ export class MessageFactory {
       return;
     }
     const message = createStandardMessage({
-      traceId: this.traceId,
+      traceId: this.resolveTraceIdFromMetadata(options?.metadata || {}),
       category: MessageCategory.CONTENT,
       type: MessageType.RESULT,
       source: 'orchestrator',
@@ -137,22 +184,34 @@ export class MessageFactory {
       completed: normalizedSubTask.summary ? `${w} 已完成：${normalizedSubTask.summary}` : `${w} 完成了任务`,
       failed: `${w} 执行遇到问题：${normalizedSubTask.summary || '执行失败'}`,
       pending: `${w} 排队中（等待前置任务）：${normalizedSubTask.title}`,
-      stopped: `${w} 已停止：${normalizedSubTask.title}`,
+      cancelled: `${w} 已取消：${normalizedSubTask.title}`,
       skipped: `${w} 已跳过：${normalizedSubTask.title}`,
       running: `${w} 正在处理：${normalizedSubTask.title}`,
     };
     const content = statusContentMap[normalizedSubTask.status] || statusContentMap.running;
     const rawMissionId = typeof normalizedSubTask.missionId === 'string' ? normalizedSubTask.missionId.trim() : '';
     const rawTurnId = typeof normalizedSubTask.turnId === 'string' ? normalizedSubTask.turnId.trim() : '';
+    const rawDispatchWaveId = typeof normalizedSubTask.dispatchWaveId === 'string'
+      ? normalizedSubTask.dispatchWaveId.trim()
+      : '';
+    const rawLaneId = typeof normalizedSubTask.laneId === 'string' ? normalizedSubTask.laneId.trim() : '';
+    const rawWorkerCardId = typeof normalizedSubTask.workerCardId === 'string'
+      ? normalizedSubTask.workerCardId.trim()
+      : '';
+    const timelineAnchorTimestamp = typeof normalizedSubTask.timelineAnchorTimestamp === 'number'
+      && Number.isFinite(normalizedSubTask.timelineAnchorTimestamp)
+      && normalizedSubTask.timelineAnchorTimestamp > 0
+      ? Math.floor(normalizedSubTask.timelineAnchorTimestamp)
+      : undefined;
 
     // scope 优先级：requestId > missionId。
     // 注意：task card 的生命周期必然跨越多个 turn（从派发 pending 到最终 completed 往往经过多轮交互），
     // 绝对不能将 turnId 作为卡片唯一 ID 的一部分，否则在 task 跨回合完成时会导致重复渲染多张卡片。
     const explicitRequestId = typeof normalizedSubTask.requestId === 'string' ? normalizedSubTask.requestId.trim() : '';
     const scopeId = explicitRequestId || rawMissionId;
-    const stableMessageId = scopeId
+    const stableMessageId = rawWorkerCardId || (scopeId
       ? `subtask-card-${normalizedSubTask.id}-${scopeId}`
-      : `subtask-card-${normalizedSubTask.id}`;
+      : `subtask-card-${normalizedSubTask.id}`);
     const isFailed = normalizedSubTask.status === 'failed';
     const failureCode = typeof normalizedSubTask.failureCode === 'string' ? normalizedSubTask.failureCode.trim() : '';
     const modelOriginExtra = normalizedFailure?.isModelOrigin ? {
@@ -167,6 +226,64 @@ export class MessageFactory {
     } : {};
 
     this.pipeline.clearMessageState?.(stableMessageId);
+    const normalizedLaneTaskCards = normalizeWorkerLaneTaskCards(normalizedSubTask.laneTaskCards);
+    const subTaskMetadata = this.enrichMetadata({
+      subTaskId: normalizedSubTask.id,
+      assignmentId: normalizedSubTask.id,
+      assignedWorker: normalizedSubTask.worker,
+      isStatusMessage: true,
+      ...(typeof normalizedSubTask.sessionId === 'string' && normalizedSubTask.sessionId.trim()
+        ? { sessionId: normalizedSubTask.sessionId.trim() }
+        : {}),
+      ...(rawMissionId ? { missionId: rawMissionId } : {}),
+      ...(rawTurnId ? { turnId: rawTurnId } : {}),
+      ...(rawDispatchWaveId ? { dispatchWaveId: rawDispatchWaveId } : {}),
+      ...(rawLaneId ? { laneId: rawLaneId } : {}),
+      ...(rawWorkerCardId ? { workerCardId: rawWorkerCardId, cardId: rawWorkerCardId } : {}),
+      ...(typeof normalizedSubTask.laneIndex === 'number' && Number.isFinite(normalizedSubTask.laneIndex)
+        ? { laneIndex: Math.max(1, Math.floor(normalizedSubTask.laneIndex)) }
+        : {}),
+      ...(typeof normalizedSubTask.laneTotal === 'number' && Number.isFinite(normalizedSubTask.laneTotal)
+        ? { laneTotal: Math.max(1, Math.floor(normalizedSubTask.laneTotal)) }
+        : {}),
+      ...(Array.isArray(normalizedSubTask.laneTaskIds) && normalizedSubTask.laneTaskIds.length > 0
+        ? {
+            laneTaskIds: normalizedSubTask.laneTaskIds
+              .filter((taskId): taskId is string => typeof taskId === 'string' && taskId.trim().length > 0)
+              .map((taskId) => taskId.trim()),
+          }
+        : {}),
+      ...(typeof normalizedSubTask.laneCurrentTaskId === 'string' && normalizedSubTask.laneCurrentTaskId.trim()
+        ? { laneCurrentTaskId: normalizedSubTask.laneCurrentTaskId.trim() }
+        : {}),
+      ...(Array.isArray(normalizedSubTask.laneTasks) && normalizedSubTask.laneTasks.length > 0
+        ? {
+            laneTasks: normalizedSubTask.laneTasks
+              .filter((task): task is NonNullable<SubTaskCardPayload['laneTasks']>[number] => Boolean(task && typeof task === 'object'))
+              .map((task) => ({
+                taskId: task.taskId.trim(),
+                title: task.title,
+                status: task.status,
+                ...(Array.isArray(task.dependsOn) ? { dependsOn: task.dependsOn } : {}),
+                ...(typeof task.isCurrent === 'boolean' ? { isCurrent: task.isCurrent } : {}),
+              }))
+              .filter((task) => task.taskId.length > 0),
+          }
+        : {}),
+      ...(normalizedLaneTaskCards.length > 0
+        ? { laneTaskCards: normalizedLaneTaskCards }
+        : {}),
+      ...(timelineAnchorTimestamp ? { timelineAnchorTimestamp } : {}),
+      subTaskCard: normalizedSubTask,
+      ...(isFailed && failureCode ? { reason: failureCode } : {}),
+      ...(isFailed ? { recoverable: normalizedSubTask.recoverable ?? true } : {}),
+      ...((normalizedFailure?.isModelOrigin || failureCode) ? {
+        extra: {
+          ...modelOriginExtra,
+          ...dispatchFailureExtra,
+        },
+      } : {}),
+    });
     this.pipeline.process(createStandardMessage({
       id: stableMessageId,
       type: MessageType.TASK_CARD,
@@ -174,24 +291,8 @@ export class MessageFactory {
       agent: 'orchestrator',
       lifecycle: MessageLifecycle.COMPLETED,
       blocks: [{ type: 'text', content, isMarkdown: true }],
-      metadata: this.enrichMetadata({
-        subTaskId: normalizedSubTask.id,
-        assignmentId: normalizedSubTask.id,
-        assignedWorker: normalizedSubTask.worker,
-        isStatusMessage: true,
-        ...(rawMissionId ? { missionId: rawMissionId } : {}),
-        ...(rawTurnId ? { turnId: rawTurnId } : {}),
-        subTaskCard: normalizedSubTask,
-        ...(isFailed && failureCode ? { reason: failureCode } : {}),
-        ...(isFailed ? { recoverable: normalizedSubTask.recoverable ?? true } : {}),
-        ...((normalizedFailure?.isModelOrigin || failureCode) ? {
-          extra: {
-            ...modelOriginExtra,
-            ...dispatchFailureExtra,
-          },
-        } : {}),
-      }),
-      traceId: this.traceId,
+      metadata: subTaskMetadata,
+      traceId: this.resolveTraceIdFromMetadata(subTaskMetadata),
       category: MessageCategory.CONTENT,
     }));
   }
@@ -314,26 +415,37 @@ export class MessageFactory {
   /** 发送任务说明到 Worker Tab */
   workerInstruction(worker: WorkerSlot, content: string, metadata?: WorkerInstructionMetadata): void {
     if (!content?.trim()) return;
-    const laneCardId = metadata?.laneCardId?.trim();
-    const stableMessageId = laneCardId || undefined;
+    const workerCardId = metadata?.workerCardId?.trim();
+    const stableMessageId = workerCardId || undefined;
     if (stableMessageId) {
       this.pipeline.clearMessageState?.(stableMessageId);
     }
+    const normalizedLaneTaskCards = normalizeWorkerLaneTaskCards(metadata?.laneTaskCards);
+    const instructionMetadata = this.enrichMetadata({
+      ...metadata,
+      ...(normalizedLaneTaskCards.length > 0 ? { laneTaskCards: normalizedLaneTaskCards } : {}),
+      dispatchToWorker: true,
+      worker,
+      ...(typeof metadata?.sessionId === 'string' && metadata.sessionId.trim()
+        ? { sessionId: metadata.sessionId.trim() }
+        : {}),
+      ...(typeof metadata?.timelineAnchorTimestamp === 'number'
+        && Number.isFinite(metadata.timelineAnchorTimestamp)
+        && metadata.timelineAnchorTimestamp > 0
+        ? { timelineAnchorTimestamp: Math.floor(metadata.timelineAnchorTimestamp) }
+        : {}),
+      ...(workerCardId ? { cardId: workerCardId } : {}),
+    });
     this.pipeline.process(createStandardMessage({
       id: stableMessageId,
-      traceId: this.traceId,
+      traceId: this.resolveTraceIdFromMetadata(instructionMetadata),
       category: MessageCategory.CONTENT,
       type: MessageType.INSTRUCTION,
       source: 'orchestrator',
       agent: worker as AgentType,
       lifecycle: MessageLifecycle.COMPLETED,
       blocks: [{ type: 'text', content, isMarkdown: true }],
-      metadata: this.enrichMetadata({
-        ...metadata,
-        dispatchToWorker: true,
-        worker,
-        ...(laneCardId ? { cardId: laneCardId } : {}),
-      }),
+      metadata: instructionMetadata,
     }));
   }
 
@@ -388,16 +500,30 @@ export class MessageFactory {
 
   // 控制消息 API
   sendControl(controlType: ControlMessageType, payload: Record<string, unknown>): void {
-    this.pipeline.process(createControlMessage(controlType, payload, this.traceId));
+    const sessionId = this.resolveCanonicalSessionId();
+    this.pipeline.process(createControlMessage(controlType, payload, this.traceId, {
+      metadata: sessionId ? { sessionId } : {},
+    }));
   }
 
-  notify(content: string, level: NotifyLevel = 'info', duration?: number): void {
+  notify(
+    content: string,
+    level: NotifyLevel = 'info',
+    duration?: number,
+    presentation?: NotifyPresentation,
+  ): void {
     if (!content?.trim()) return;
-    this.pipeline.process(createNotifyMessage(content, level, this.traceId, duration));
+    const sessionId = this.resolveCanonicalSessionId();
+    this.pipeline.process(createNotifyMessage(content, level, this.traceId, duration, presentation, {
+      metadata: sessionId ? { sessionId } : {},
+    }));
   }
 
   data(dataType: DataMessageType, payload: Record<string, unknown>): void {
-    this.pipeline.process(createDataMessage(dataType, payload, this.traceId));
+    const sessionId = this.resolveSessionIdFromPayload(payload);
+    this.pipeline.process(createDataMessage(dataType, payload, this.resolveTraceIdFromPayload(payload), {
+      metadata: sessionId ? { sessionId } : {},
+    }));
   }
 
   // 便捷控制消息 API
@@ -436,16 +562,67 @@ export class MessageFactory {
     metadata: MessageMetadata;
     category?: MessageCategory;
   }): StandardMessage {
+    const metadata = this.enrichMetadata(params.metadata);
     return createStandardMessage({
       ...params,
-      traceId: this.traceId,
+      traceId: this.resolveTraceIdFromMetadata(metadata),
       category: params.category || MessageCategory.CONTENT,
-      metadata: this.enrichMetadata(params.metadata),
+      metadata,
     });
   }
 
   private enrichMetadata(metadata: MessageMetadata): MessageMetadata {
-    return metadata;
+    const sessionId = this.resolveCanonicalSessionId(metadata);
+    if (!sessionId) {
+      return metadata;
+    }
+    if (metadata.sessionId === sessionId) {
+      return metadata;
+    }
+    return {
+      ...metadata,
+      sessionId,
+    };
+  }
+
+  private resolveTraceIdFromMetadata(metadata?: MessageMetadata): string {
+    return this.resolveCanonicalSessionId(metadata) || this.traceId;
+  }
+
+  private resolveTraceIdFromPayload(payload?: Record<string, unknown>): string {
+    const sessionId = this.normalizeIdentifier(payload?.sessionId);
+    if (sessionId) {
+      return sessionId;
+    }
+    const traceId = this.normalizeIdentifier(payload?.traceId);
+    return traceId || this.traceId;
+  }
+
+  private resolveSessionIdFromPayload(payload?: Record<string, unknown>): string | undefined {
+    const sessionId = this.normalizeIdentifier(payload?.sessionId);
+    if (sessionId) {
+      return sessionId;
+    }
+    return this.resolveCanonicalSessionId();
+  }
+
+  private resolveCanonicalSessionId(metadata?: MessageMetadata): string | undefined {
+    const metadataSessionId = this.normalizeIdentifier(metadata?.sessionId);
+    if (metadataSessionId) {
+      return metadataSessionId;
+    }
+    if (this.sessionId) {
+      return this.sessionId;
+    }
+    return this.normalizeIdentifier(this.traceId);
+  }
+
+  private normalizeIdentifier(value: unknown): string | undefined {
+    if (typeof value !== 'string') {
+      return undefined;
+    }
+    const normalized = value.trim();
+    return normalized.length > 0 ? normalized : undefined;
   }
 
   private normalizeFailureReason(reason: string): {
@@ -498,4 +675,63 @@ export class MessageFactory {
   private generateTraceId(): string {
     return `trace_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
   }
+}
+
+function normalizeWorkerLaneTaskCards(
+  value: WorkerLaneTaskCardSnapshot[] | undefined,
+): WorkerLaneTaskCardSnapshot[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((item): item is WorkerLaneTaskCardSnapshot => Boolean(item && typeof item === 'object'))
+    .map((item) => {
+      const taskId = typeof item.taskId === 'string' ? item.taskId.trim() : '';
+      const title = typeof item.title === 'string' ? item.title.trim() : '';
+      const status = typeof item.status === 'string' ? item.status.trim() : '';
+      if (!taskId || !title || !status) {
+        return null;
+      }
+      return {
+        taskId,
+        title,
+        status: status as WorkerLaneTaskCardSnapshot['status'],
+        ...(typeof item.worker === 'string' && item.worker.trim()
+          ? { worker: item.worker.trim() as WorkerSlot }
+          : {}),
+        ...(typeof item.summary === 'string' && item.summary.trim()
+          ? { summary: item.summary }
+          : {}),
+        ...(typeof item.fullSummary === 'string' && item.fullSummary.trim()
+          ? { fullSummary: item.fullSummary }
+          : {}),
+        ...(typeof item.error === 'string' && item.error.trim()
+          ? { error: item.error }
+          : {}),
+        ...(typeof item.failureCode === 'string' && item.failureCode.trim()
+          ? { failureCode: item.failureCode.trim() }
+          : {}),
+        ...(typeof item.recoverable === 'boolean'
+          ? { recoverable: item.recoverable }
+          : {}),
+        ...(Array.isArray(item.modifiedFiles) && item.modifiedFiles.length > 0
+          ? {
+              modifiedFiles: item.modifiedFiles
+                .filter((file): file is string => typeof file === 'string' && file.trim().length > 0)
+                .map((file) => file.trim()),
+            }
+          : {}),
+        ...(Array.isArray(item.createdFiles) && item.createdFiles.length > 0
+          ? {
+              createdFiles: item.createdFiles
+                .filter((file): file is string => typeof file === 'string' && file.trim().length > 0)
+                .map((file) => file.trim()),
+            }
+          : {}),
+        ...(typeof item.duration === 'number' && Number.isFinite(item.duration) && item.duration >= 0
+          ? { duration: Math.floor(item.duration) }
+          : {}),
+      };
+    })
+    .filter((item): item is WorkerLaneTaskCardSnapshot => Boolean(item));
 }

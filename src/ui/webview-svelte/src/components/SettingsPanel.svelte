@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { vscode } from '../lib/vscode-bridge';
+  import { getClientKind, vscode } from '../lib/vscode-bridge';
   import { onMount } from 'svelte';
   import type { StandardMessage } from '../../../../protocol/message-protocol';
   import { MessageCategory } from '../../../../protocol/message-protocol';
@@ -15,6 +15,7 @@
   }
 
   let { onClose }: Props = $props();
+  const clientKind = getClientKind();
 
   // 当前激活的 Tab
   let activeTab = $state<'stats' | 'model' | 'profile' | 'tools'>('stats');
@@ -405,6 +406,7 @@
   const statusTexts: Record<string, () => string> = {
     available: () => i18n.t('settings.status.connected'),
     connected: () => i18n.t('settings.status.connected'),
+    configured: () => i18n.t('settings.status.connected'),
     disabled: () => i18n.t('settings.status.disabled'),
     not_configured: () => i18n.t('settings.status.notConfigured'),
     checking: () => i18n.t('settings.status.checking'),
@@ -418,7 +420,7 @@
   };
 
   function getStatusClass(status: string): string {
-    if (status === 'available' || status === 'connected') return 'success';
+    if (status === 'available' || status === 'connected' || status === 'configured') return 'success';
     if (status === 'checking') return 'checking';
     if (status === 'orchestrator') return 'warning';
     if (status === 'disabled' || status === 'not_configured') return 'disabled';
@@ -593,6 +595,10 @@
     return String(tokens);
   }
 
+  function requestSettingsBootstrap(force = false) {
+    vscode.postMessage({ type: 'loadSettingsBootstrap', force });
+  }
+
   function refreshConnections() {
     if (isRefreshing) return;
     isRefreshing = true;
@@ -604,7 +610,7 @@
       orchestrator: { status: 'checking' },
       auxiliary: { status: 'checking' }
     };
-    vscode.postMessage({ type: 'checkWorkerStatus', force: true });
+    requestSettingsBootstrap(true);
     // 30秒超时保护，防止状态卡住
     setTimeout(() => { isRefreshing = false; }, 30000);
   }
@@ -969,7 +975,6 @@
       saveStatus.mcp = 'saved';
       saveStatus = { ...saveStatus };
       resetSaveStatus('mcp');
-      vscode.postMessage({ type: 'loadMCPServers' });
       closeMCPDialog();
     } else {
       // 保存失败
@@ -1038,8 +1043,7 @@
   function openRepoDialog() {
     showRepoDialogState = true;
     repoAddUrl = '';
-    repositoriesLoading = true; // 设置加载状态
-    vscode.postMessage({ type: 'loadRepositories' });
+    repositoriesLoading = false;
   }
 
   function closeRepoDialog() {
@@ -1174,6 +1178,148 @@
     totalOutputTokens: number;
   }>>([]);
 
+  function applyWorkerStatuses(statuses: Record<string, { status: string }> | undefined): void {
+    if (!statuses) {
+      return;
+    }
+    const allSettled = Object.values(statuses).every((status) => status.status !== 'checking');
+    if (allSettled) {
+      isRefreshing = false;
+    }
+  }
+
+  function applyProfileConfig(config: any): void {
+    if (!config) {
+      return;
+    }
+    if (config.assignments) {
+      taskCategories = { ...taskCategories, ...config.assignments };
+    }
+    if (config.categoryGuidance) {
+      categoryGuidance = config.categoryGuidance;
+    }
+    if (Array.isArray(config.categoryPriority)) {
+      categoryPriority = config.categoryPriority;
+    }
+    if (typeof config.userRules === 'string') {
+      userRules = config.userRules;
+    }
+  }
+
+  function applyWorkerConfigs(configs: Record<string, any> | undefined): void {
+    if (!configs) {
+      return;
+    }
+    for (const [worker, config] of Object.entries(configs)) {
+      if (config && workerConfigs[worker]) {
+        workerConfigs[worker] = createWorkerConfig(config.provider || 'anthropic', {
+          baseUrl: config.baseUrl || '',
+          urlMode: normalizeUrlMode(config.urlMode),
+          apiKey: config.apiKey || '',
+          model: config.model || '',
+          provider: config.provider || 'anthropic',
+          openaiProtocol: config.openaiProtocol || 'responses',
+          enabled: config.enabled !== false,
+          thinking: config.enableThinking === true,
+          reasoningEffort: config.reasoningEffort || 'medium'
+        });
+      }
+    }
+  }
+
+  function applyOrchestratorConfig(config: any): void {
+    if (!config) {
+      return;
+    }
+    orchConfig = createInteractiveConfig(config.provider || 'anthropic', {
+      baseUrl: config.baseUrl || '',
+      urlMode: normalizeUrlMode(config.urlMode),
+      apiKey: config.apiKey || '',
+      model: config.model || '',
+      provider: config.provider || 'anthropic',
+      openaiProtocol: config.openaiProtocol || 'responses',
+      thinking: config.enableThinking === true,
+      reasoningEffort: config.reasoningEffort || 'medium'
+    });
+  }
+
+  function applyAuxiliaryConfig(config: any): void {
+    if (!config) {
+      return;
+    }
+    compConfig = createAuxiliaryConfig({
+      baseUrl: config.baseUrl || '',
+      urlMode: normalizeUrlMode(config.urlMode),
+      apiKey: config.apiKey || '',
+      model: config.model || '',
+      provider: config.provider || 'anthropic',
+      openaiProtocol: config.openaiProtocol || 'responses'
+    });
+  }
+
+  function applyMcpServersPayload(serversPayload: unknown): void {
+    const servers = ensureArray<any>(serversPayload);
+    mcpServers = servers.map((s: any) => {
+      const id = typeof s?.id === 'string' && s.id.trim() ? s.id.trim() : '';
+      if (!id) {
+        throw new Error('[SettingsPanel] MCP server 缺少 id');
+      }
+      const name = typeof s?.name === 'string' && s.name.trim() ? s.name.trim() : '';
+      if (!name) {
+        throw new Error(`[SettingsPanel] MCP server ${id} 缺少 name`);
+      }
+      return {
+        id,
+        name,
+        type: s.type || 'stdio',
+        command: s.command || '',
+        args: s.args || [],
+        env: s.env || {},
+        url: s.url || '',
+        headers: s.headers || {},
+        enabled: s.enabled !== false,
+        connected: s.connected === true,
+        health: s.health === 'connected' || s.health === 'degraded' || s.health === 'disconnected'
+          ? s.health
+          : (s.connected === true ? 'connected' : 'disconnected'),
+        error: typeof s.error === 'string' ? s.error : undefined,
+        toolCount: Number.isFinite(s.toolCount) ? Number(s.toolCount) : 0,
+        reconnectAttempts: Number.isFinite(s.reconnectAttempts) ? Number(s.reconnectAttempts) : 0,
+        lastCheckedAt: Number.isFinite(s.lastCheckedAt) ? Number(s.lastCheckedAt) : undefined,
+        lastReconnectAt: Number.isFinite(s.lastReconnectAt) ? Number(s.lastReconnectAt) : undefined,
+        lastReconnectSuccessfulAt: Number.isFinite(s.lastReconnectSuccessfulAt) ? Number(s.lastReconnectSuccessfulAt) : undefined
+      };
+    });
+  }
+
+  function applySkillsConfig(config: any): void {
+    const skillList: SkillItem[] = [];
+    if (Array.isArray(config?.customTools)) {
+      for (const tool of config.customTools) {
+        skillList.push({ name: tool.name, description: tool.description || '', source: 'custom' });
+      }
+    }
+    if (Array.isArray(config?.instructionSkills)) {
+      for (const skill of config.instructionSkills) {
+        skillList.push({ name: skill.name, description: skill.description || '', source: 'instruction' });
+      }
+    }
+    skills = skillList;
+  }
+
+  function applyRepositoriesPayload(repositoriesPayload: unknown): void {
+    const repoList = ensureArray<any>(repositoriesPayload);
+    repositories = repoList.map((repository: any) => ({
+      id: repository.id,
+      url: repository.url,
+      name: repository.name || repository.url,
+      skillCount: repository.skillCount || 0,
+      lastUpdated: repository.lastUpdated
+    }));
+    repoAddLoading = false;
+    repositoriesLoading = false;
+  }
+
   // 监听来自扩展的状态更新
   $effect(() => {
     const unsubscribe = vscode.onMessage((msg) => {
@@ -1182,17 +1328,15 @@
       if (!standard || standard.category !== MessageCategory.DATA || !standard.data) return;
       const { dataType, payload } = standard.data as { dataType: string; payload: any };
 
-      // Worker 状态更新 (模型连接状态)
-      // 注意：状态现在由 message-handler.ts 统一更新到全局 store
-      // 当所有模型检测完成（无 checking 状态）时重置 isRefreshing
-      if (dataType === 'workerStatusUpdate') {
-        const statuses = payload?.statuses as Record<string, { status: string }> | undefined;
-        if (statuses) {
-          const allSettled = Object.values(statuses).every(s => s.status !== 'checking');
-          if (allSettled) {
-            isRefreshing = false;
-          }
-        }
+      if (dataType === 'settingsBootstrapLoaded') {
+        applyWorkerStatuses(payload?.workerStatuses as Record<string, { status: string }> | undefined);
+        applyProfileConfig(payload?.profileConfig);
+        applyWorkerConfigs(payload?.workerConfigs);
+        applyOrchestratorConfig(payload?.orchestratorConfig);
+        applyAuxiliaryConfig(payload?.auxiliaryConfig);
+        applyMcpServersPayload(payload?.mcpServers);
+        applySkillsConfig(payload?.skillsConfig);
+        applyRepositoriesPayload(payload?.repositories);
       }
       // 执行统计更新
       else if (dataType === 'executionStatsUpdate') {
@@ -1218,22 +1362,6 @@
         upsertRuntimeTokenCounter(worker, payload?.usage);
         recomputeTokenStatsSummary();
       }
-      // 画像配置加载
-      else if (dataType === 'profileConfig') {
-        const config = payload?.config;
-        if (config?.assignments) {
-          taskCategories = { ...taskCategories, ...config.assignments };
-        }
-        if (config?.categoryGuidance) {
-          categoryGuidance = config.categoryGuidance;
-        }
-        if (Array.isArray(config?.categoryPriority)) {
-          categoryPriority = config.categoryPriority;
-        }
-        if (typeof config?.userRules === 'string') {
-          userRules = config.userRules;
-        }
-      }
       // 画像保存结果
       else if (dataType === 'profileConfigSaved') {
         if (payload?.success) {
@@ -1251,56 +1379,6 @@
           profileResetStatus = 'error';
         }
         resetProfileStatus('reset');
-      }
-      // Worker 配置加载
-      else if (dataType === 'allWorkerConfigsLoaded') {
-        if (payload?.configs) {
-          // 将后端配置格式转换为前端格式
-          const configs = payload.configs;
-          for (const [worker, config] of Object.entries(configs) as [string, any][]) {
-            if (config && workerConfigs[worker]) {
-              workerConfigs[worker] = createWorkerConfig(config.provider || 'anthropic', {
-                baseUrl: config.baseUrl || '',
-                urlMode: normalizeUrlMode(config.urlMode),
-                apiKey: config.apiKey || '',
-                model: config.model || '',
-                provider: config.provider || 'anthropic',
-                openaiProtocol: config.openaiProtocol || 'responses',
-                enabled: config.enabled !== false,
-                thinking: config.enableThinking === true,
-                reasoningEffort: config.reasoningEffort || 'medium'
-              });
-            }
-          }
-        }
-      }
-      // 编排者配置加载
-      else if (dataType === 'orchestratorConfigLoaded') {
-        if (payload?.config) {
-          orchConfig = createInteractiveConfig(payload.config.provider || 'anthropic', {
-            baseUrl: payload.config.baseUrl || '',
-            urlMode: normalizeUrlMode(payload.config.urlMode),
-            apiKey: payload.config.apiKey || '',
-            model: payload.config.model || '',
-            provider: payload.config.provider || 'anthropic',
-            openaiProtocol: payload.config.openaiProtocol || 'responses',
-            thinking: payload.config.enableThinking === true,
-            reasoningEffort: payload.config.reasoningEffort || 'medium'
-          });
-        }
-      }
-      // 辅助模型配置加载
-      else if (dataType === 'auxiliaryConfigLoaded') {
-        if (payload?.config) {
-          compConfig = createAuxiliaryConfig({
-            baseUrl: payload.config.baseUrl || '',
-            urlMode: normalizeUrlMode(payload.config.urlMode),
-            apiKey: payload.config.apiKey || '',
-            model: payload.config.model || '',
-            provider: payload.config.provider || 'anthropic',
-            openaiProtocol: payload.config.openaiProtocol || 'responses'
-          });
-        }
       }
       // Worker 连接测试结果 - modelStatus 已由全局 message-handler 更新，此处仅维护按钮状态
       else if (dataType === 'workerConnectionTestResult') {
@@ -1340,53 +1418,6 @@
           }
         }
       }
-      // MCP 服务器列表加载
-      else if (dataType === 'mcpServersLoaded') {
-        const servers = ensureArray<any>(payload?.servers);
-        mcpServers = servers.map((s: any) => {
-          const id = typeof s?.id === 'string' && s.id.trim() ? s.id.trim() : '';
-          if (!id) {
-            throw new Error('[SettingsPanel] MCP server 缺少 id');
-          }
-          const name = typeof s?.name === 'string' && s.name.trim() ? s.name.trim() : '';
-          if (!name) {
-            throw new Error(`[SettingsPanel] MCP server ${id} 缺少 name`);
-          }
-          return {
-            id,
-            name,
-            type: s.type || 'stdio',
-            command: s.command || '',
-            args: s.args || [],
-            env: s.env || {},
-            url: s.url || '',
-            headers: s.headers || {},
-            enabled: s.enabled !== false,
-            connected: s.connected === true,
-            health: s.health === 'connected' || s.health === 'degraded' || s.health === 'disconnected'
-              ? s.health
-              : (s.connected === true ? 'connected' : 'disconnected'),
-            error: typeof s.error === 'string' ? s.error : undefined,
-            toolCount: Number.isFinite(s.toolCount) ? Number(s.toolCount) : 0,
-            reconnectAttempts: Number.isFinite(s.reconnectAttempts) ? Number(s.reconnectAttempts) : 0,
-            lastCheckedAt: Number.isFinite(s.lastCheckedAt) ? Number(s.lastCheckedAt) : undefined,
-            lastReconnectAt: Number.isFinite(s.lastReconnectAt) ? Number(s.lastReconnectAt) : undefined,
-            lastReconnectSuccessfulAt: Number.isFinite(s.lastReconnectSuccessfulAt) ? Number(s.lastReconnectSuccessfulAt) : undefined
-          };
-        });
-      }
-      // MCP 服务器添加成功
-      else if (dataType === 'mcpServerAdded') {
-        vscode.postMessage({ type: 'loadMCPServers' });
-      }
-      // MCP 服务器更新成功
-      else if (dataType === 'mcpServerUpdated') {
-        vscode.postMessage({ type: 'loadMCPServers' });
-      }
-      // MCP 服务器删除成功
-      else if (dataType === 'mcpServerDeleted') {
-        mcpServers = mcpServers.filter(s => s.id !== payload?.serverId);
-      }
       // MCP 工具列表加载（首次获取）
       else if (dataType === 'mcpServerTools') {
         if (payload?.serverId) {
@@ -1409,54 +1440,14 @@
           mcpRefreshingServers = newSet;
         }
       }
-      // Skills 配置加载
-      else if (dataType === 'skillsConfigLoaded') {
-        const skillList: SkillItem[] = [];
-        // 内置工具已迁移到 ToolManager，不再通过 skills.json 配置
-        // 自定义工具
-        if (Array.isArray(payload?.config?.customTools)) {
-          for (const tool of payload.config.customTools) {
-            skillList.push({ name: tool.name, description: tool.description || '', source: 'custom' });
-          }
-        }
-        // Instruction Skills
-        if (Array.isArray(payload?.config?.instructionSkills)) {
-          for (const skill of payload.config.instructionSkills) {
-            skillList.push({ name: skill.name, description: skill.description || '', source: 'instruction' });
-          }
-        }
-        skills = skillList;
-      }
-      // 仓库列表加载
-      else if (dataType === 'repositoriesLoaded') {
-        const repoList = ensureArray<any>(payload?.repositories);
-        repositories = repoList.map((r: any) => ({
-          id: r.id,
-          url: r.url,
-          name: r.name || r.url,
-          skillCount: r.skillCount || 0,
-          lastUpdated: r.lastUpdated
-        }));
-        repoAddLoading = false;
-        repositoriesLoading = false; // 清除加载状态
-      }
       // 仓库添加成功
       else if (dataType === 'repositoryAdded') {
-        vscode.postMessage({ type: 'loadRepositories' });
         repoAddLoading = false;
         repoAddUrl = '';
       }
       // 仓库添加失败
       else if (dataType === 'repositoryAddFailed') {
         repoAddLoading = false;
-      }
-      // 仓库删除成功
-      else if (dataType === 'repositoryDeleted') {
-        repositories = repositories.filter(r => r.id !== payload?.repositoryId);
-      }
-      // 仓库刷新成功
-      else if (dataType === 'repositoryRefreshed') {
-        vscode.postMessage({ type: 'loadRepositories' });
       }
       // Skill 库加载
       else if (dataType === 'skillLibraryLoaded') {
@@ -1490,7 +1481,6 @@
           installingSkills = new Set(installingSkills);
         }
         localSkillInstalling = false;
-        vscode.postMessage({ type: 'loadSkillsConfig' });
         vscode.postMessage({ type: 'loadSkillLibrary' });
         showSkillLibraryDialogState = false;
       }
@@ -1502,43 +1492,22 @@
         }
         localSkillInstalling = false;
       }
-      // 自定义工具添加成功
-      else if (dataType === 'customToolAdded') {
-        vscode.postMessage({ type: 'loadSkillsConfig' });
-      }
-      // 自定义工具删除成功
-      else if (dataType === 'customToolRemoved') {
-        vscode.postMessage({ type: 'loadSkillsConfig' });
-      }
-      // Instruction Skill 删除成功
-      else if (dataType === 'instructionSkillRemoved') {
-        vscode.postMessage({ type: 'loadSkillsConfig' });
-      }
       // Skill 更新成功
       else if (dataType === 'skillUpdated') {
         if (payload?.skillName) {
           updatingSkills.delete(payload.skillName);
           updatingSkills = new Set(updatingSkills);
         }
-        vscode.postMessage({ type: 'loadSkillsConfig' });
       }
       // 所有 Skill 更新完成
       else if (dataType === 'allSkillsUpdated') {
         updatingAllSkills = false;
-        vscode.postMessage({ type: 'loadSkillsConfig' });
       }
     });
 
     // 初始化请求数据
-    vscode.postMessage({ type: 'checkWorkerStatus', force: false });
+    requestSettingsBootstrap(true);
     vscode.postMessage({ type: 'requestExecutionStats' });
-    vscode.postMessage({ type: 'getProfileConfig' });
-    vscode.postMessage({ type: 'loadAllWorkerConfigs' });
-    vscode.postMessage({ type: 'loadOrchestratorConfig' });
-    vscode.postMessage({ type: 'loadAuxiliaryConfig' });
-    vscode.postMessage({ type: 'loadMCPServers' });
-    vscode.postMessage({ type: 'loadSkillsConfig' });
-    vscode.postMessage({ type: 'loadRepositories' });
 
     return () => unsubscribe();
   });
@@ -1551,7 +1520,7 @@
   <div class="settings-panel" onclick={() => closeGuidancePopover()}>
     <div class="settings-header">
       <span class="settings-title">{i18n.t('settings.title')}</span>
-      {#if userInfo}
+      {#if userInfo && clientKind === 'vscode'}
         <div class="logout-section">
           <span class="user-info-text">{userInfo}</span>
           <button class="settings-btn secondary logout-btn" onclick={logout}>{i18n.t('settings.logout')}</button>
@@ -2457,24 +2426,6 @@
             {/if}
           </div>
         </div>
-
-        <!-- 终端工具 -->
-        <div class="settings-section">
-          <div class="settings-section-title">{i18n.t('settings.tools.terminalTools')}</div>
-          <div class="settings-section-desc">{i18n.t('settings.tools.terminalDesc')}</div>
-          <div class="builtin-tool-list">
-            <div class="builtin-tool-item">
-              <div class="builtin-tool-icon">
-                <Icon name="tools" size={20} />
-              </div>
-              <div class="builtin-tool-info">
-                <div class="builtin-tool-name">{i18n.t('settings.tools.vscodeTerminal')}</div>
-                <div class="builtin-tool-desc">{i18n.t('settings.tools.vscodeTerminalDesc')}</div>
-              </div>
-              <div class="builtin-tool-badge enabled">{i18n.t('settings.tools.enabledBadge')}</div>
-            </div>
-          </div>
-        </div>
       {/if}
     </div>
   </div>
@@ -2889,8 +2840,8 @@
   }
   .settings-tab-content::-webkit-scrollbar { width: 6px; }
   .settings-tab-content::-webkit-scrollbar-track { background: transparent; }
-  .settings-tab-content::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.15); border-radius: 3px; }
-  .settings-tab-content::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.25); }
+  .settings-tab-content::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+  .settings-tab-content::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
 
   /* 动画 */
   @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
@@ -3744,17 +3695,6 @@
     opacity: 0.5;
     cursor: not-allowed;
   }
-
-  /* 内置工具列表 */
-  .builtin-tool-list { display: flex; flex-direction: column; gap: var(--space-2); }
-  .builtin-tool-item { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-4); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-md); }
-  .builtin-tool-icon { display: flex; align-items: center; justify-content: center; width: var(--avatar-lg); height: var(--avatar-lg); background: var(--primary-muted); border-radius: var(--radius-md); color: var(--primary); flex-shrink: 0; }
-  .builtin-tool-info { flex: 1; min-width: 0; }
-  .builtin-tool-name { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); }
-  .builtin-tool-desc { font-size: var(--text-sm); color: var(--foreground-muted); margin-top: 2px; }
-  .builtin-tool-badge { height: var(--btn-height-xs); padding: 0 var(--space-3); font-size: var(--text-xs); border-radius: var(--radius-full); display: flex; align-items: center; }
-  .builtin-tool-badge.enabled { background: var(--success-muted); color: var(--success); }
-
   /* 空状态 */
   .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: var(--space-8); color: var(--foreground-muted); text-align: center; }
   .empty-state p { margin: var(--space-2) 0 0 0; }
@@ -3853,8 +3793,8 @@
   }
   .modal-body::-webkit-scrollbar { width: 6px; }
   .modal-body::-webkit-scrollbar-track { background: transparent; }
-  .modal-body::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.15); border-radius: 3px; }
-  .modal-body::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.25); }
+  .modal-body::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+  .modal-body::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
 
   .modal-footer {
     display: flex;
@@ -3911,8 +3851,8 @@
   .repo-manage-list { display: flex; flex-direction: column; gap: var(--space-2); max-height: 320px; overflow-y: auto; }
   .repo-manage-list::-webkit-scrollbar { width: 6px; }
   .repo-manage-list::-webkit-scrollbar-track { background: transparent; }
-  .repo-manage-list::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.15); border-radius: 3px; }
-  .repo-manage-list::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.25); }
+  .repo-manage-list::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+  .repo-manage-list::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
   .repo-item {
     display: grid;
     grid-template-columns: 1fr auto;
@@ -3993,8 +3933,8 @@
   .skill-library-list { flex: 1; min-height: 0; overflow-y: auto; }
   .skill-library-list::-webkit-scrollbar { width: 6px; }
   .skill-library-list::-webkit-scrollbar-track { background: transparent; }
-  .skill-library-list::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.15); border-radius: 3px; }
-  .skill-library-list::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.25); }
+  .skill-library-list::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+  .skill-library-list::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
   .skill-repo-group { margin-bottom: var(--space-5); }
   .skill-repo-group:last-child { margin-bottom: 0; }
   .skill-repo-title {
@@ -4039,4 +3979,118 @@
   .skill-library-meta { display: flex; gap: var(--space-3); margin-top: var(--space-2); flex-wrap: wrap; }
   .skill-library-meta-item { font-size: var(--text-xs); color: var(--foreground-muted); }
   .skill-library-actions { flex-shrink: 0; align-self: center; }
+
+  @media (max-width: 720px) {
+    .settings-overlay {
+      align-items: stretch;
+      justify-content: stretch;
+      background: var(--overlay-heavy);
+    }
+
+    .settings-panel {
+      width: 100vw;
+      max-width: 100vw;
+      height: 100vh;
+      max-height: 100vh;
+      border-radius: 0;
+      border-left: none;
+      border-right: none;
+      border-top: none;
+      box-shadow: none;
+    }
+
+    .settings-header,
+    .modal-header {
+      padding: var(--space-3) var(--space-4);
+      flex-wrap: wrap;
+      gap: var(--space-2);
+    }
+
+    .settings-title {
+      font-size: var(--text-lg);
+    }
+
+    .settings-tabs {
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+
+    .settings-tabs::-webkit-scrollbar {
+      display: none;
+    }
+
+    .settings-tab {
+      flex: 0 0 auto;
+      min-width: 88px;
+      padding: var(--space-3);
+    }
+
+    .settings-tab-content,
+    .modal-body,
+    .modal-footer {
+      padding-left: var(--space-4);
+      padding-right: var(--space-4);
+    }
+
+    .settings-tab-content {
+      gap: var(--space-3);
+    }
+
+    .settings-section {
+      padding: var(--space-4);
+    }
+
+    .settings-section-header,
+    .settings-section-actions,
+    .settings-btn-group,
+    .worker-tabs,
+    .worker-model-tabs,
+    .profile-save-footer,
+    .profile-save-actions,
+    .stats-action-buttons,
+    .modal-footer {
+      flex-wrap: wrap;
+    }
+
+    .model-connection-item {
+      gap: var(--space-2);
+    }
+
+    .model-connection-header,
+    .mcp-server-header,
+    .skill-item,
+    .skill-library-item {
+      grid-template-columns: 1fr;
+    }
+
+    .mcp-server-actions,
+    .skill-actions,
+    .skill-library-actions {
+      align-self: stretch;
+    }
+
+    .llm-config-field-row,
+    .llm-config-field-row.has-thinking,
+    .llm-config-field-row.has-thinking.has-level,
+    .llm-config-field-row.url-mode-row,
+    .llm-config-field-row.worker-url-mode-row,
+    .profile-categories-grid,
+    .profile-two-columns,
+    .profile-guidance-columns {
+      grid-template-columns: 1fr;
+    }
+
+    .modal-dialog,
+    .modal-dialog-lg,
+    .modal-dialog--sm {
+      width: 100vw;
+      max-width: 100vw;
+      min-height: 100vh;
+      max-height: 100vh;
+      border-radius: 0;
+      border-left: none;
+      border-right: none;
+      border-top: none;
+    }
+  }
 </style>

@@ -20,6 +20,7 @@ import type { WorkerSlot } from '../../types';
 import type { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import type { AutonomousWorker, AutonomousExecutionResult } from '../worker';
 import type { Assignment } from '../mission';
+import type { PlanMode } from '../plan-ledger';
 import type { SnapshotManager } from '../../snapshot-manager';
 import type { ReportCallback } from '../protocols/worker-report';
 import type { CancellationToken } from './dispatch-batch';
@@ -27,7 +28,8 @@ import { LspEnforcer } from '../lsp/lsp-enforcer';
 import { logger, LogCategory } from '../../logging';
 import type { AssembledContext } from '../../context/context-assembler';
 import { t } from '../../i18n';
-import type { WorktreeAllocation, WorktreeManager, WorktreeMergeResult } from '../../workspace/worktree-manager';
+import type { GitHost } from '../../host';
+import type { WorktreeAllocation, WorktreeMergeResult } from '../../workspace/worktree-manager';
 
 type WorkspaceWriteIsolationMode = 'git_worktree' | 'workspace_serial';
 
@@ -53,6 +55,7 @@ export interface PipelineConfig {
   sessionId?: string;
   resumeSessionId?: string;
   resumePrompt?: string;
+  planningMode?: PlanMode;
 
   // 治理开关（由 DispatchManager 根据 governance 参数计算）
   enableSnapshot: boolean;
@@ -64,8 +67,8 @@ export interface PipelineConfig {
   snapshotManager?: SnapshotManager | null;
   contextManager?: import('../../context/context-manager').ContextManager | null;
   todoManager?: import('../../todo').TodoManager | null;
-  /** Worktree 管理器（当任务需要写操作且 workspace 是 git 仓库时注入） */
-  worktreeManager?: WorktreeManager | null;
+  /** Git 隔离宿主（当任务需要写操作时注入） */
+  gitHost?: GitHost | null;
 
   // 反应式编排：补充指令回调（由 DispatchManager 从 SupplementaryInstructionQueue 注入）
   getSupplementaryInstructions?: () => string[];
@@ -94,9 +97,40 @@ export class WorkerPipeline {
       enableSnapshot, enableLSP, enableTargetEnforce, enableContextUpdate,
       snapshotManager, contextManager, todoManager,
       getSupplementaryInstructions,
-      worktreeManager,
+      gitHost,
     } = config;
     const missionId = config.missionId || 'dispatch';
+    const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+    const normalizedRequestId = typeof config.requestId === 'string' && config.requestId.trim().length > 0
+      ? config.requestId.trim()
+      : (typeof assignment.trace?.requestId === 'string' && assignment.trace.requestId.trim().length > 0
+          ? assignment.trace.requestId.trim()
+          : undefined);
+    const normalizedTurnId = typeof assignment.trace?.turnId === 'string' && assignment.trace.turnId.trim().length > 0
+      ? assignment.trace.turnId.trim()
+      : undefined;
+    const messageSessionId = normalizedSessionId
+      || (typeof assignment.trace?.sessionId === 'string' && assignment.trace.sessionId.trim().length > 0
+        ? assignment.trace.sessionId.trim()
+        : undefined);
+    const dispatchWaveId = typeof assignment.trace?.batchId === 'string' && assignment.trace.batchId.trim().length > 0
+      ? assignment.trace.batchId.trim()
+      : undefined;
+    const laneId = dispatchWaveId ? `${dispatchWaveId}:${assignment.workerId}` : undefined;
+    const workerCardId = dispatchWaveId
+      ? `worker-lane-instruction-${dispatchWaveId}-${assignment.workerId}`
+      : undefined;
+    const adapterMessageMetadata = {
+      assignmentId: assignment.id,
+      missionId,
+      ...(normalizedRequestId ? { requestId: normalizedRequestId } : {}),
+      worker: assignment.workerId,
+      ...(messageSessionId ? { sessionId: messageSessionId } : {}),
+      ...(normalizedTurnId ? { turnId: normalizedTurnId } : {}),
+      ...(dispatchWaveId ? { dispatchWaveId } : {}),
+      ...(laneId ? { laneId } : {}),
+      ...(workerCardId ? { workerCardId } : {}),
+    };
 
     // ========== 0. [可选] 写隔离 ==========
     // Git 仓库：使用 worktree 物理隔离；非 Git 工作区：自动降级为主工作区串行写模式。
@@ -104,7 +138,7 @@ export class WorkerPipeline {
     let worktreeAllocation: WorktreeAllocation | null = null;
     let writeIsolationMode: WorkspaceWriteIsolationMode | null = null;
     if (requiresWrite) {
-      if (!worktreeManager) {
+      if (!gitHost) {
         const isolationError = t('pipeline.errors.worktreeIsolationManagerMissing');
         logger.error('WorkerPipeline.Worktree.隔离失败_缺少管理器', {
           assignmentId: assignment.id,
@@ -117,11 +151,14 @@ export class WorkerPipeline {
           targetChangeDetected: false,
         };
       }
-      writeIsolationMode = worktreeManager.isGitRepository()
+      writeIsolationMode = gitHost.isGitRepository(workspaceRoot)
         ? 'git_worktree'
         : 'workspace_serial';
       if (writeIsolationMode === 'git_worktree') {
-        worktreeAllocation = worktreeManager.acquire(assignment.id);
+        worktreeAllocation = gitHost.acquireWorktree({
+          workspacePath: workspaceRoot,
+          taskId: assignment.id,
+        });
         if (!worktreeAllocation) {
           const isolationError = t('pipeline.errors.worktreeIsolationAcquireFailed');
           logger.error('WorkerPipeline.Worktree.隔离失败_分配失败', {
@@ -162,7 +199,6 @@ export class WorkerPipeline {
     );
 
     // ========== 1. [可选] 快照创建 ==========
-    const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
     if (enableSnapshot && snapshotManager) {
       await this.createSnapshots(snapshotManager, missionId, assignment, normalizedSessionId);
     }
@@ -173,7 +209,7 @@ export class WorkerPipeline {
       toolManager.setSnapshotContext({
         sessionId: normalizedSessionId,
         missionId,
-        requestId: config.requestId,
+        requestId: normalizedRequestId,
         assignmentId: assignment.id,
         todoId: assignment.id,
         workerId: assignment.workerId,
@@ -239,6 +275,10 @@ export class WorkerPipeline {
       result = await workerInstance.executeAssignment(assignment, {
         workingDirectory: effectiveWorkspaceRoot,
         adapterFactory,
+        adapterScope: {
+          ...(config.planningMode ? { planningMode: config.planningMode } : {}),
+          messageMetadata: adapterMessageMetadata,
+        },
         projectContext,
         onReport,
         heartbeatIntervalMs,
@@ -273,6 +313,10 @@ export class WorkerPipeline {
           result = await workerInstance.executeAssignment(assignment, {
             workingDirectory: effectiveWorkspaceRoot,
             adapterFactory,
+            adapterScope: {
+              ...(config.planningMode ? { planningMode: config.planningMode } : {}),
+              messageMetadata: adapterMessageMetadata,
+            },
             projectContext,
             onReport,
             cancellationToken,
@@ -342,10 +386,13 @@ export class WorkerPipeline {
 
     // ========== 10. [可选] Worktree merge + release ==========
     let worktreeMerge: WorktreeMergeResult | undefined;
-    if (worktreeAllocation && worktreeManager) {
+    if (worktreeAllocation && gitHost) {
       try {
         if (result.success) {
-          worktreeMerge = worktreeManager.merge(assignment.id);
+          worktreeMerge = gitHost.mergeWorktree({
+            workspacePath: workspaceRoot,
+            taskId: assignment.id,
+          });
           if (worktreeMerge.hasConflicts) {
             logger.warn('WorkerPipeline.Worktree.合并冲突', {
               assignmentId: assignment.id,
@@ -376,7 +423,10 @@ export class WorkerPipeline {
           }, LogCategory.ORCHESTRATOR);
         }
       } finally {
-        worktreeManager.release(assignment.id);
+        gitHost.releaseWorktree({
+          workspacePath: workspaceRoot,
+          taskId: assignment.id,
+        });
       }
     }
 
@@ -657,6 +707,7 @@ export class WorkerPipeline {
       const repairTodo = await todoManager.create({
         missionId: assignment.missionId,
         assignmentId: assignment.id,
+        trace: assignment.trace,
         source: 'system_repair',
         content: `${marker} 处理 worktree 合并冲突并完成冲突消解：${filesLabel}`,
         reasoning: `并发变更在 merge 阶段发生冲突，需先完成冲突消解再继续交付。${worktreeMerge.conflictSummary || ''}`.trim(),
@@ -695,6 +746,7 @@ export class WorkerPipeline {
       errors: [errorMessage],
       recoveryAttempts: 0,
       summary: errorMessage,
+      fullSummary: errorMessage,
       hasPendingApprovals: false,
       verification: {
         attempted: false,

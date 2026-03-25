@@ -15,6 +15,8 @@ import { logger, LogCategory } from '../logging';
 import { estimateTokenCount } from '../utils/token-estimator';
 import { MemoryDocument } from './memory-document';
 import { ProjectKnowledgeBase } from '../knowledge/project-knowledge-base';
+import { GovernedKnowledgeContextService } from '../knowledge/governed-knowledge-context-service';
+import type { GovernedKnowledgeAuditMetadata } from '../knowledge/governed-knowledge-context-service';
 import { ContextSource, FileSummary } from './file-summary-cache';
 import {
   SharedContextEntry,
@@ -98,6 +100,9 @@ export interface ContextAssemblyOptions {
 
   /** 排除当前轮用户输入，避免同轮重复注入 */
   excludeCurrentUserPrompt?: string;
+
+  /** 项目知识治理审计元数据 */
+  knowledgeAudit?: GovernedKnowledgeAuditMetadata;
 }
 
 /**
@@ -258,7 +263,17 @@ export class ContextAssembler {
 
     // 1. 项目知识库 (L0) - 10%
     const pkbBudget = Math.floor(budget.total * budget.projectKnowledgeRatio);
-    const pkbPart = await this.assembleProjectKnowledge(pkbBudget);
+    const pkbPart = await this.assembleProjectKnowledge(pkbBudget, {
+      purpose: 'project_context',
+      consumer: options.knowledgeAudit?.consumer || 'context_assembler',
+      sessionId: options.knowledgeAudit?.sessionId,
+      requestId: options.knowledgeAudit?.requestId,
+      missionId,
+      assignmentId: options.knowledgeAudit?.assignmentId,
+      todoId: options.knowledgeAudit?.todoId,
+      agentId: options.knowledgeAudit?.agentId || subscription.agentId,
+      workerId: options.knowledgeAudit?.workerId,
+    });
     if (pkbPart) {
       parts.push(pkbPart);
       usedTokens += pkbPart.tokens;
@@ -330,13 +345,17 @@ export class ContextAssembler {
   /**
    * 组装项目知识库上下文 (L0)
    */
-  private async assembleProjectKnowledge(maxTokens: number): Promise<ContextPart | null> {
+  private async assembleProjectKnowledge(
+    maxTokens: number,
+    audit: GovernedKnowledgeAuditMetadata,
+  ): Promise<ContextPart | null> {
     if (!this.projectKnowledgeBase || maxTokens <= 0) {
       return null;
     }
 
     try {
-      const content = this.projectKnowledgeBase.getProjectContext(maxTokens);
+      const governedKnowledge = new GovernedKnowledgeContextService(this.projectKnowledgeBase);
+      const { content } = governedKnowledge.buildProjectContext(maxTokens, audit);
       if (!content) {
         return null;
       }

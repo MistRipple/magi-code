@@ -1143,6 +1143,13 @@ export class ContextManager {
       minImportance,
       localTurns: DEFAULT_LOCAL_TURNS,
       excludeCurrentUserPrompt,
+      knowledgeAudit: {
+        purpose: 'project_context',
+        consumer: 'context_manager',
+        sessionId: this.currentSessionId || undefined,
+        missionId,
+        agentId,
+      },
     };
   }
 

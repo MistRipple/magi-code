@@ -84,7 +84,7 @@
  */
 
 import type { WorkerSlot } from '../../types';
-import type { StandardMessage, MessageMetadata, ContentBlock, StreamUpdate, NotifyLevel, DataMessageType } from '../../protocol/message-protocol';
+import type { StandardMessage, MessageMetadata, ContentBlock, StreamUpdate, NotifyLevel, DataMessageType, NotifyPresentation } from '../../protocol/message-protocol';
 import { MessageType, ControlMessageType } from '../../protocol/message-protocol';
 
 // 导入三层组件
@@ -164,6 +164,14 @@ export class MessageHub {
     return this.factory.getTraceId();
   }
 
+  setSessionId(sessionId?: string | null): void {
+    this.factory.setSessionId(sessionId);
+  }
+
+  getSessionId(): string | null {
+    return this.factory.getSessionId();
+  }
+
   newTrace(): string {
     return this.factory.newTrace();
   }
@@ -183,6 +191,14 @@ export class MessageHub {
 
   getRequestMessageId(requestId: string): string | undefined {
     return this.pipeline.getRequestMessageId(requestId);
+  }
+
+  getMessageSnapshot(messageId: string): StandardMessage | null {
+    return this.pipeline.getMessageSnapshot(messageId);
+  }
+
+  getActiveMessageSnapshots(): StandardMessage[] {
+    return this.pipeline.getActiveMessageSnapshots();
   }
 
   getDeadLetterCount(): number {
@@ -273,8 +289,13 @@ export class MessageHub {
     this.factory.sendControl(controlType, payload);
   }
 
-  notify(content: string, level: NotifyLevel = 'info', duration?: number): void {
-    this.factory.notify(content, level, duration);
+  notify(
+    content: string,
+    level: NotifyLevel = 'info',
+    duration?: number,
+    presentation?: NotifyPresentation,
+  ): void {
+    this.factory.notify(content, level, duration, presentation);
   }
 
   data(dataType: DataMessageType, payload: Record<string, unknown>): void {

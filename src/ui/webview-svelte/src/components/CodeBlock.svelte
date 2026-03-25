@@ -19,7 +19,7 @@
     filepath = '',
     showLineNumbers = false,
     showCopyButton = true,
-    isStreaming = false
+    isStreaming = false,
   }: Props = $props();
 
   // 检测是否是 Mermaid 代码
@@ -28,8 +28,6 @@
   // 状态
   let collapsed = $state(false);
   let copied = $state(false);
-  // 移除直接 DOM 引用，改用数据驱动
-  // let codeRef: HTMLElement | null = $state(null);
 
   // 语言名称映射
   const LANG_NAMES: Record<string, string> = {
@@ -74,23 +72,24 @@
       // 流式期间：只转义，不高亮。保证内容绝对可见且流畅。
       highlightedHtml = safeEscape(trimmedCode);
     } else {
-      // 非流式：尝试高亮
+      const codeToHighlight = trimmedCode;
+
       // 超长代码块跳过高亮，避免主线程阻塞
-      if (trimmedCode.length > 50000) {
-        highlightedHtml = safeEscape(trimmedCode);
+      if (codeToHighlight.length > 50000) {
+        highlightedHtml = safeEscape(codeToHighlight);
         return;
       }
       // 使用 setTimeout 宏任务，避免阻塞主线程（虽然 hljs 是同步的）
       const timer = setTimeout(() => {
         try {
           if (language && hljs.getLanguage(language)) {
-            highlightedHtml = hljs.highlight(trimmedCode, { language }).value;
+            highlightedHtml = hljs.highlight(codeToHighlight, { language }).value;
           } else {
-            highlightedHtml = safeEscape(trimmedCode);
+            highlightedHtml = safeEscape(codeToHighlight);
           }
         } catch (e) {
           console.warn('[CodeBlock] 高亮失败:', e);
-          highlightedHtml = safeEscape(trimmedCode);
+          highlightedHtml = safeEscape(codeToHighlight);
         }
       }, 0);
       return () => clearTimeout(timer);
@@ -196,7 +195,7 @@
     justify-content: space-between;
     height: var(--header-height);
     padding: 0 var(--spacing-sm);
-    background: var(--code-header-bg, rgba(255, 255, 255, 0.03));
+    background: var(--code-header-bg);
     border-bottom: 1px solid var(--code-border);
     user-select: none;
   }
@@ -291,7 +290,7 @@
   }
 
   .copy-btn:hover {
-    background: rgba(255, 255, 255, 0.1);
+    background: var(--code-copy-hover-bg);
     color: var(--foreground);
   }
 
@@ -328,7 +327,7 @@
     border-right: 1px solid var(--border);
     text-align: right;
     user-select: none;
-    background: rgba(0, 0, 0, 0.02);
+    background: var(--code-line-number-bg);
     flex-shrink: 0;
     
     /* 强制继承父级排版 */
@@ -375,4 +374,5 @@
     0%, 100% { opacity: 1; }
     50% { opacity: 0.6; }
   }
+
 </style>

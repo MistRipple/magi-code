@@ -2,7 +2,7 @@
  * Task View Adapter - 任务视图适配器
  *
  * 职责：
- * - 将 Mission + UnifiedTodo 转换为 UI 需要的 TaskView + TodoItemView 格式
+ * - 将 MissionProjection + UnifiedTodo 转换为 UI 需要的 TaskView + TodoItemView 格式
  * - 纯函数，无状态，不持久化
  *
  * 设计目标：
@@ -11,7 +11,8 @@
  * - UI 层通过视图适配器获取展示数据
  */
 
-import { Mission, Assignment, MissionStatus, MissionDeliveryStatus, MissionContinuationPolicy } from '../orchestrator/mission/types';
+import { MissionStatus, MissionDeliveryStatus } from '../orchestrator/mission/types';
+import type { MissionProjection } from '../orchestrator/runtime';
 import { UnifiedTodo, TodoStatus } from '../todo/types';
 import type { WorkerSlot } from '../types/agent-types';
 
@@ -64,8 +65,6 @@ export interface TaskView {
   deliverySummary?: string;
   deliveryDetails?: string;
   deliveryWarnings?: string[];
-  continuationPolicy: MissionContinuationPolicy;
-  continuationReason?: string;
 
   // 子任务
   subTasks: TodoItemView[];  // 从 UnifiedTodo 聚合
@@ -133,8 +132,6 @@ export function mapMissionStatusToTaskViewStatus(status: MissionStatus): TaskVie
   const mapping: Record<MissionStatus, TaskViewStatus> = {
     draft: 'pending',
     planning: 'running',
-    pending_review: 'paused',
-    pending_approval: 'paused',
     executing: 'running',
     paused: 'paused',
     reviewing: 'running',
@@ -195,10 +192,10 @@ export function todoToTodoItemView(todo: UnifiedTodo, missionId: string): TodoIt
 }
 
 /**
- * 将 Mission + UnifiedTodo[] 转换为 TaskView
+ * 将 MissionProjection + UnifiedTodo[] 转换为 TaskView
  */
-export function missionToTaskView(mission: Mission, todos: UnifiedTodo[]): TaskView {
-  const subTasks = todos.map(todo => todoToTodoItemView(todo, mission.id));
+export function missionToTaskView(mission: MissionProjection, todos: UnifiedTodo[]): TaskView {
+  const subTasks = todos.map(todo => todoToTodoItemView(todo, mission.missionId));
 
   // 计算进度
   const completedCount = subTasks.filter(
@@ -209,10 +206,10 @@ export function missionToTaskView(mission: Mission, todos: UnifiedTodo[]): TaskV
     : 0;
 
   return {
-    id: mission.id,
+    id: mission.missionId,
     sessionId: mission.sessionId,
     title: mission.title || '',
-    prompt: mission.userPrompt,
+    prompt: mission.prompt,
     goal: mission.goal,
     status: mapMissionStatusToTaskViewStatus(mission.status),
     priority: 5, // 默认优先级
@@ -220,31 +217,29 @@ export function missionToTaskView(mission: Mission, todos: UnifiedTodo[]): TaskV
     deliverySummary: mission.deliverySummary,
     deliveryDetails: mission.deliveryDetails,
     deliveryWarnings: mission.deliveryWarnings,
-    continuationPolicy: mission.continuationPolicy,
-    continuationReason: mission.continuationReason,
     subTasks,
     createdAt: mission.createdAt,
     startedAt: mission.startedAt,
     completedAt: mission.completedAt,
     cancelledAt: mission.status === 'cancelled' ? mission.updatedAt : undefined,
     progress,
-    missionId: mission.id,
+    missionId: mission.missionId,
     failureReason: mission.failureReason,
   };
 }
 
 /**
- * 批量转换 Mission 列表为 TaskView 列表
+ * 批量转换 MissionProjection 列表为 TaskView 列表
  *
- * @param missions Mission 列表
+ * @param missions MissionProjection 列表
  * @param todosByMission 按 missionId 分组的 Todo 映射
  */
 export function missionsToTaskViews(
-  missions: Mission[],
+  missions: MissionProjection[],
   todosByMission: Map<string, UnifiedTodo[]>
 ): TaskView[] {
   return missions.map(mission => {
-    const todos = todosByMission.get(mission.id) || [];
+    const todos = todosByMission.get(mission.missionId) || [];
     return missionToTaskView(mission, todos);
   });
 }

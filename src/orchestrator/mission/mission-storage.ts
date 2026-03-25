@@ -74,9 +74,14 @@ function normalizeMissionDeliveryStatus(status: MissionDeliveryStatus | undefine
 }
 
 function normalizeMissionContinuationPolicy(policy: MissionContinuationPolicy | undefined): MissionContinuationPolicy {
-  return policy === 'auto' || policy === 'ask' || policy === 'stop'
-    ? policy
-    : 'auto';
+  if (policy === 'auto' || policy === 'stop') {
+    return policy;
+  }
+  // 兼容旧持久化数据：历史上 ask 表示“等待用户下一条消息”，新模型统一收敛为 stop。
+  if (policy === 'ask') {
+    return 'stop';
+  }
+  return 'auto';
 }
 
 function normalizeMissionDeliveryWarnings(warnings: string[] | undefined): string[] {
@@ -85,11 +90,25 @@ function normalizeMissionDeliveryWarnings(warnings: string[] | undefined): strin
 
 const TERMINAL_MISSION_STATUSES = new Set<MissionStatus>(['completed', 'failed', 'cancelled']);
 
+function normalizeMissionStatus(status: MissionStatus | string | undefined): MissionStatus {
+  if (status === 'pending_review' || status === 'pending_approval') {
+    return 'planning';
+  }
+  return status === 'draft'
+    || status === 'planning'
+    || status === 'executing'
+    || status === 'paused'
+    || status === 'reviewing'
+    || status === 'completed'
+    || status === 'failed'
+    || status === 'cancelled'
+    ? status
+    : 'draft';
+}
+
 const MISSION_STATUS_TO_PHASE: Record<MissionStatus, MissionPhase> = {
   draft: 'goal_understanding',
   planning: 'worker_planning',
-  pending_review: 'plan_review',
-  pending_approval: 'plan_review',
   executing: 'execution',
   paused: 'execution',
   reviewing: 'verification',
@@ -107,8 +126,11 @@ function deriveMissionPhase(status: MissionStatus): MissionPhase {
 }
 
 function normalizeMissionPhase(mission: Mission): Mission {
-  const phase = deriveMissionPhase(mission.status);
-  return mission.phase === phase ? mission : { ...mission, phase };
+  const status = normalizeMissionStatus(mission.status);
+  const phase = deriveMissionPhase(status);
+  return mission.phase === phase && mission.status === status
+    ? mission
+    : { ...mission, status, phase };
 }
 
 function normalizeMissionDelivery(mission: Mission): Mission {
@@ -128,10 +150,8 @@ function normalizeMissionDelivery(mission: Mission): Mission {
 }
 
 const ALLOWED_MISSION_STATUS_TRANSITIONS: Record<MissionStatus, MissionStatus[]> = {
-  draft: ['planning', 'pending_review', 'pending_approval', 'executing', 'cancelled'],
-  planning: ['pending_review', 'pending_approval', 'executing', 'failed', 'cancelled'],
-  pending_review: ['planning', 'pending_approval', 'executing', 'failed', 'cancelled'],
-  pending_approval: ['planning', 'executing', 'cancelled'],
+  draft: ['planning', 'executing', 'cancelled'],
+  planning: ['executing', 'failed', 'cancelled'],
   executing: ['paused', 'reviewing', 'completed', 'failed', 'cancelled'],
   paused: ['executing', 'failed', 'cancelled'],
   reviewing: ['executing', 'completed', 'failed', 'cancelled'],

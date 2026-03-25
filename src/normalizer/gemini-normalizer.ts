@@ -25,7 +25,6 @@ import { MESSAGE_EVENTS } from '../protocol/event-names';
  */
 export class GeminiNormalizer extends BaseNormalizer {
   private jsonBuffer: string = '';
-  private static readonly THINKING_BLOCK_ID = 'gemini-thinking';
 
   constructor(config?: Partial<NormalizerConfig>) {
     super({
@@ -78,6 +77,7 @@ export class GeminiNormalizer extends BaseNormalizer {
 
     // 处理 Gemini 的 JSON 响应格式
     if (data.type === 'text' && typeof data.content === 'string') {
+      this.flushPendingThinkingToBlocks(context, 'gemini.json_text');
       context.pendingText += data.content;
       updates.push(this.createUpdate(context.messageId, 'append', { appendText: data.content }));
     } else if (data.type === 'thinking' || data.type === 'reasoning') {
@@ -88,11 +88,14 @@ export class GeminiNormalizer extends BaseNormalizer {
           context.pendingThinking = '';
         }
         context.pendingThinking += thinkingContent;
+        if (!context.thinkingBlockId) {
+          context.thinkingBlockId = this.allocateThinkingBlockId(context);
+        }
         updates.push(this.createUpdate(context.messageId, 'block_update', {
           blocks: [{
             type: 'thinking',
             content: context.pendingThinking,
-            blockId: GeminiNormalizer.THINKING_BLOCK_ID,
+            blockId: context.thinkingBlockId,
           }],
         }));
       }
@@ -127,6 +130,7 @@ export class GeminiNormalizer extends BaseNormalizer {
     // 前端已具备强大的流式 Markdown 解析能力（包括自动补全未闭合代码块），
     // 直接传输可以让用户实时看到代码生成过程，而不是等待代码块结束。
     
+    this.flushPendingThinkingToBlocks(context, 'gemini.text_chunk');
     context.pendingText += chunk;
     updates.push(this.createUpdate(context.messageId, 'append', { appendText: chunk }));
     

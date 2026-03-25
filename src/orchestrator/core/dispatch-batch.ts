@@ -12,6 +12,10 @@ import type { WorkerSlot } from '../../types';
 import { logger, LogCategory } from '../../logging';
 import { t } from '../../i18n';
 import type { RequirementAnalysis } from '../protocols/types';
+import {
+  mergeOrchestrationTraceLinks,
+  type OrchestrationTraceLinks,
+} from '../trace/types';
 
 // ============================================================================
 // CancellationToken
@@ -105,6 +109,7 @@ export function isTerminalStatus(status: DispatchStatus): boolean {
 export interface DispatchResult {
   success: boolean;
   summary: string;
+  fullSummary?: string;
   modifiedFiles?: string[];
   errors?: string[];
   quality?: {
@@ -131,6 +136,7 @@ export interface DispatchCollaborationContracts {
 export interface DispatchTaskContract {
   taskTitle: string;
   category: string;
+  declaredCategory?: string;
   requirementAnalysis: RequirementAnalysis;
   context: string[];
   scopeHint: string[];
@@ -143,6 +149,7 @@ export interface DispatchTaskContract {
 export interface DispatchEntry {
   taskId: string;
   requestId?: string; // Explicit request ID for this entry
+  trace?: OrchestrationTraceLinks;
   worker: WorkerSlot;
   taskContract: DispatchTaskContract;
   status: DispatchStatus;
@@ -217,6 +224,8 @@ export interface DispatchBatchEvents {
 export class DispatchBatch extends EventEmitter {
   readonly id: string;
   readonly requestId: string;
+  readonly trace: OrchestrationTraceLinks;
+  readonly timelineAnchorTimestamp?: number;
   private entries: Map<string, DispatchEntry> = new Map();
   private _phase: BatchPhase = 'active';
   private readonly createdAt: number;
@@ -233,10 +242,37 @@ export class DispatchBatch extends EventEmitter {
   /** Phase C 程序化审计结果 */
   private _auditOutcome?: DispatchAuditOutcome;
 
-  constructor(batchId?: string) {
+  constructor(input?: string | {
+    batchId?: string;
+    requestId?: string;
+    trace?: Partial<OrchestrationTraceLinks> | null;
+    timelineAnchorTimestamp?: number;
+  }) {
     super();
+    const batchId = typeof input === 'string' ? input : input?.batchId;
+    const explicitRequestId = typeof input === 'object'
+      ? (typeof input.requestId === 'string' ? input.requestId.trim() : '')
+      : '';
+    const rawTimelineAnchorTimestamp = typeof input === 'object'
+      ? input.timelineAnchorTimestamp
+      : undefined;
     this.id = batchId || `batch-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-    this.requestId = `req-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+    this.requestId = explicitRequestId || `req-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+    this.trace = mergeOrchestrationTraceLinks(
+      typeof input === 'object' ? input.trace : undefined,
+      {
+        batchId: this.id,
+        requestId: this.requestId,
+      },
+    ) || {
+      batchId: this.id,
+      requestId: this.requestId,
+    };
+    this.timelineAnchorTimestamp = typeof rawTimelineAnchorTimestamp === 'number'
+      && Number.isFinite(rawTimelineAnchorTimestamp)
+      && rawTimelineAnchorTimestamp > 0
+      ? Math.floor(rawTimelineAnchorTimestamp)
+      : undefined;
     this.createdAt = Date.now();
     this._lastActivityAt = Date.now();
   }
@@ -352,6 +388,10 @@ export class DispatchBatch extends EventEmitter {
     const entry: DispatchEntry = {
       taskId: params.taskId,
       requestId: this.requestId,
+      trace: mergeOrchestrationTraceLinks(this.trace, {
+        assignmentId: params.taskId,
+        workerId: params.worker,
+      }),
       worker: params.worker,
       taskContract,
       status: dependencyState.status,

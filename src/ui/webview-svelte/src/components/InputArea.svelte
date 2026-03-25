@@ -294,8 +294,6 @@
       skillSearchQuery = '';
       return;
     }
-    // 打开时请求加载技能列表
-    vscode.postMessage({ type: 'loadSkillsConfig' });
     skillDropdownOpen = true;
     skillSearchQuery = '';
   }
@@ -402,22 +400,18 @@
         }
       }
 
-      // 技能配置加载响应
-      if (standard.data.dataType === 'skillsConfigLoaded') {
-        const payload = standard.data.payload as { config?: any };
-        skillsConfig = payload?.config || null;
-      }
-
-      // 深度任务状态同步
-      if (standard.data.dataType === 'deepTaskChanged') {
-        const payload = standard.data.payload as { enabled?: boolean };
-        if (typeof payload?.enabled === 'boolean') {
-          deepTaskEnabled = payload.enabled;
+      if (standard.data.dataType === 'settingsBootstrapLoaded') {
+        const payload = standard.data.payload as {
+          skillsConfig?: any;
+          runtimeSettings?: { deepTask?: boolean };
+        };
+        skillsConfig = payload?.skillsConfig || null;
+        if (typeof payload?.runtimeSettings?.deepTask === 'boolean') {
+          deepTaskEnabled = payload.runtimeSettings.deepTask;
         }
       }
     });
-    // 初始化时请求 deepTask 状态
-    vscode.postMessage({ type: 'getDeepTaskState' });
+    vscode.postMessage({ type: 'loadSettingsBootstrap', force: false });
     return () => {
       unsubscribe();
       window.removeEventListener('resize', handleViewportChanged);
@@ -480,6 +474,7 @@
       bind:value={inputValue}
       bind:this={inputTextareaEl}
       class="ia-textarea"
+      data-testid="input-textarea"
       class:has-images={selectedImages.length > 0}
       class:has-badge={!!selectedSkill}
       placeholder={selectedSkill
@@ -605,6 +600,7 @@
           <!-- 有内容：显示发送按钮 -->
           <button
             class="ia-send ready"
+            data-testid="input-send-button"
             onclick={sendMessage}
             disabled={isInteractionBlocking || isModeSyncing}
             title={isModeSyncing ? i18n.t('input.modeSwitchingShort') : (isSending ? i18n.t('input.sendSupplementary') : i18n.t('input.send'))}
@@ -613,7 +609,7 @@
           </button>
         {:else if isSending}
           <!-- 无内容 + 运行中：显示停止按钮 -->
-          <button class="ia-send stop" onclick={stopTask} title={i18n.t('input.stop')}>
+          <button class="ia-send stop" data-testid="input-stop-button" onclick={stopTask} title={i18n.t('input.stop')}>
             <Icon name="stop" size={14} />
           </button>
         {:else}

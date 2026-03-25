@@ -1,6 +1,6 @@
 <script lang="ts">
-  import type { AgentType } from '../types/message';
   import { getState } from '../stores/messages.svelte';
+  import { isWorkerExecutingStatus, selectWorkerRuntimeStatus } from '../lib/worker-panel-state';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
 
@@ -16,11 +16,17 @@
   // 模型连接状态（使用全局统一的 modelStatus）
   const modelStatus = $derived(appState.modelStatus);
   const workerRuntimeMap = $derived(appState.workerRuntime);
+  const claudeRuntimeStatus = $derived.by(() => selectWorkerRuntimeStatus(workerRuntimeMap, 'claude'));
+  const codexRuntimeStatus = $derived.by(() => selectWorkerRuntimeStatus(workerRuntimeMap, 'codex'));
+  const geminiRuntimeStatus = $derived.by(() => selectWorkerRuntimeStatus(workerRuntimeMap, 'gemini'));
+  const claudeIsExecuting = $derived(isWorkerExecutingStatus(claudeRuntimeStatus));
+  const codexIsExecuting = $derived(isWorkerExecutingStatus(codexRuntimeStatus));
+  const geminiIsExecuting = $derived(isWorkerExecutingStatus(geminiRuntimeStatus));
 
   // 判断模型是否可用（available 或 connected 都表示可用）
   function isModelAvailable(worker: string): boolean {
     const status = modelStatus[worker]?.status;
-    return status === 'available' || status === 'connected';
+    return status === 'available' || status === 'connected' || status === 'configured';
   }
 
   // Worker 颜色映射
@@ -29,16 +35,13 @@
     codex: 'var(--color-codex)',
     gemini: 'var(--color-gemini)',
   };
-
-  function isExecuting(worker: AgentType): boolean {
-    return workerRuntimeMap[worker]?.isExecuting ?? false;
-  }
 </script>
 
 <div class="bt-bar">
   <button
     class="bt-tab"
     class:active={activeTab === 'thread'}
+    data-tab-id="thread"
     onclick={() => onTabChange('thread')}
   >
     <Icon name="chat" size={12} />
@@ -47,12 +50,13 @@
   <button
     class="bt-tab bt-worker"
     class:active={activeTab === 'claude'}
-    class:is-executing={isExecuting('claude')}
+    class:is-executing={claudeIsExecuting}
     style="--w-color: {workerColors.claude}"
+    data-tab-id="claude"
     onclick={() => onTabChange('claude')}
   >
     <span class="bt-dot-wrap">
-      {#if isExecuting('claude')}
+      {#if claudeIsExecuting}
         <span class="bt-dot on executing"></span>
       {:else}
         <span class="bt-dot" class:on={isModelAvailable('claude')}></span>
@@ -63,12 +67,13 @@
   <button
     class="bt-tab bt-worker"
     class:active={activeTab === 'codex'}
-    class:is-executing={isExecuting('codex')}
+    class:is-executing={codexIsExecuting}
     style="--w-color: {workerColors.codex}"
+    data-tab-id="codex"
     onclick={() => onTabChange('codex')}
   >
     <span class="bt-dot-wrap">
-      {#if isExecuting('codex')}
+      {#if codexIsExecuting}
         <span class="bt-dot on executing"></span>
       {:else}
         <span class="bt-dot" class:on={isModelAvailable('codex')}></span>
@@ -79,12 +84,13 @@
   <button
     class="bt-tab bt-worker"
     class:active={activeTab === 'gemini'}
-    class:is-executing={isExecuting('gemini')}
+    class:is-executing={geminiIsExecuting}
     style="--w-color: {workerColors.gemini}"
+    data-tab-id="gemini"
     onclick={() => onTabChange('gemini')}
   >
     <span class="bt-dot-wrap">
-      {#if isExecuting('gemini')}
+      {#if geminiIsExecuting}
         <span class="bt-dot on executing"></span>
       {:else}
         <span class="bt-dot" class:on={isModelAvailable('gemini')}></span>

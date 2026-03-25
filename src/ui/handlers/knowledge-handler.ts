@@ -10,6 +10,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { logger, LogCategory } from '../../logging';
 import type { WebviewToExtensionMessage } from '../../types';
+import { GovernedKnowledgeContextService } from '../../knowledge/governed-knowledge-context-service';
 import type { CommandHandler, CommandHandlerContext } from './types';
 import { t } from '../../i18n';
 
@@ -17,7 +18,6 @@ type Msg<T extends string> = Extract<WebviewToExtensionMessage, { type: T }>;
 
 const SUPPORTED = new Set([
   'getProjectKnowledge', 'clearProjectKnowledge',
-  'getADRs', 'getFAQs', 'searchFAQs',
   'deleteADR', 'deleteFAQ', 'deleteLearning',
   'addADR', 'updateADR', 'addFAQ', 'updateFAQ',
 ]);
@@ -32,15 +32,6 @@ export class KnowledgeCommandHandler implements CommandHandler {
         break;
       case 'clearProjectKnowledge':
         await this.handleClearProjectKnowledge(ctx);
-        break;
-      case 'getADRs':
-        await this.handleGetADRs(message as Msg<'getADRs'>, ctx);
-        break;
-      case 'getFAQs':
-        await this.handleGetFAQs(message as Msg<'getFAQs'>, ctx);
-        break;
-      case 'searchFAQs':
-        await this.handleSearchFAQs(message as Msg<'searchFAQs'>, ctx);
         break;
       case 'deleteADR':
         await this.handleDeleteADR(message as Msg<'deleteADR'>, ctx);
@@ -66,25 +57,34 @@ export class KnowledgeCommandHandler implements CommandHandler {
     }
   }
 
+  private async resolveKnowledgeBase(ctx: CommandHandlerContext) {
+    await ctx.ensureProjectKnowledgeBaseReady();
+    const kb = ctx.getProjectKnowledgeBase();
+    if (!kb) {
+      ctx.sendToast(t('knowledge.toast.notInitialized'), 'warning');
+      return undefined;
+    }
+    return kb;
+  }
+
   private async handleGetProjectKnowledge(ctx: CommandHandlerContext): Promise<void> {
     try {
-      const kb = ctx.getProjectKnowledgeBase();
+      const kb = await this.resolveKnowledgeBase(ctx);
       if (!kb) {
-        ctx.sendToast(t('knowledge.toast.notInitialized'), 'warning');
         return;
       }
 
-      const codeIndex = kb.getCodeIndex();
-      const adrs = kb.getADRs();
-      const faqs = kb.getFAQs();
-      const learnings = kb.getLearnings();
+      const payload = new GovernedKnowledgeContextService(kb).buildKnowledgeSnapshot({
+        purpose: 'ui_panel',
+        consumer: 'knowledge_handler',
+      });
 
-      ctx.sendData('projectKnowledgeLoaded', { codeIndex, adrs, faqs, learnings });
+      ctx.sendData('projectKnowledgeLoaded', payload as unknown as Record<string, unknown>);
       logger.info('项目知识.已加载', {
-        files: codeIndex ? codeIndex.files.length : 0,
-        adrs: adrs.length,
-        faqs: faqs.length,
-        learnings: learnings.length,
+        files: payload.codeIndex ? payload.codeIndex.files.length : 0,
+        adrs: payload.adrs.length,
+        faqs: payload.faqs.length,
+        learnings: payload.learnings.length,
       }, LogCategory.SESSION);
     } catch (error: any) {
       logger.error('项目知识.加载失败', { error: error.message }, LogCategory.SESSION);
@@ -94,11 +94,8 @@ export class KnowledgeCommandHandler implements CommandHandler {
 
   private async handleClearProjectKnowledge(ctx: CommandHandlerContext): Promise<void> {
     try {
-      const kb = ctx.getProjectKnowledgeBase();
-      if (!kb) {
-        ctx.sendToast(t('knowledge.toast.notInitialized'), 'warning');
-        return;
-      }
+      const kb = await this.resolveKnowledgeBase(ctx);
+      if (!kb) return;
 
       const counts = kb.clearAll();
       const total = counts.adrs + counts.faqs + counts.learnings;
@@ -111,49 +108,10 @@ export class KnowledgeCommandHandler implements CommandHandler {
     }
   }
 
-  private async handleGetADRs(message: Msg<'getADRs'>, ctx: CommandHandlerContext): Promise<void> {
-    try {
-      const kb = ctx.getProjectKnowledgeBase();
-      if (!kb) { ctx.sendToast(t('knowledge.toast.notInitialized'), 'warning'); return; }
-      const adrs = kb.getADRs(message.filter as any);
-      logger.info('ADR.已加载', { count: adrs.length, filter: message.filter }, LogCategory.SESSION);
-      await this.handleGetProjectKnowledge(ctx);
-    } catch (error: any) {
-      logger.error('ADR.加载失败', { error: error.message }, LogCategory.SESSION);
-      ctx.sendToast(t('knowledge.toast.loadAdrFailed', { error: error.message }), 'error');
-    }
-  }
-
-  private async handleGetFAQs(message: Msg<'getFAQs'>, ctx: CommandHandlerContext): Promise<void> {
-    try {
-      const kb = ctx.getProjectKnowledgeBase();
-      if (!kb) { ctx.sendToast(t('knowledge.toast.notInitialized'), 'warning'); return; }
-      const faqs = kb.getFAQs(message.filter);
-      logger.info('FAQ.已加载', { count: faqs.length, filter: message.filter }, LogCategory.SESSION);
-      await this.handleGetProjectKnowledge(ctx);
-    } catch (error: any) {
-      logger.error('FAQ.加载失败', { error: error.message }, LogCategory.SESSION);
-      ctx.sendToast(t('knowledge.toast.loadFaqFailed', { error: error.message }), 'error');
-    }
-  }
-
-  private async handleSearchFAQs(message: Msg<'searchFAQs'>, ctx: CommandHandlerContext): Promise<void> {
-    try {
-      const kb = ctx.getProjectKnowledgeBase();
-      if (!kb) { ctx.sendToast(t('knowledge.toast.notInitialized'), 'warning'); return; }
-      const results = kb.searchFAQs(message.keyword);
-      logger.info('FAQ.搜索完成', { keyword: message.keyword, count: results.length }, LogCategory.SESSION);
-      await this.handleGetProjectKnowledge(ctx);
-    } catch (error: any) {
-      logger.error('FAQ.搜索失败', { error: error.message }, LogCategory.SESSION);
-      ctx.sendToast(t('knowledge.toast.searchFaqFailed', { error: error.message }), 'error');
-    }
-  }
-
   private async handleDeleteADR(message: Msg<'deleteADR'>, ctx: CommandHandlerContext): Promise<void> {
     try {
-      const kb = ctx.getProjectKnowledgeBase();
-      if (!kb) { ctx.sendToast(t('knowledge.toast.notInitialized'), 'warning'); return; }
+      const kb = await this.resolveKnowledgeBase(ctx);
+      if (!kb) return;
       const success = kb.deleteADR(message.id);
       if (success) {
         ctx.sendToast(t('knowledge.toast.adrDeleted'), 'success');
@@ -170,8 +128,8 @@ export class KnowledgeCommandHandler implements CommandHandler {
 
   private async handleDeleteFAQ(message: Msg<'deleteFAQ'>, ctx: CommandHandlerContext): Promise<void> {
     try {
-      const kb = ctx.getProjectKnowledgeBase();
-      if (!kb) { ctx.sendToast(t('knowledge.toast.notInitialized'), 'warning'); return; }
+      const kb = await this.resolveKnowledgeBase(ctx);
+      if (!kb) return;
       const success = kb.deleteFAQ(message.id);
       if (success) {
         ctx.sendToast(t('knowledge.toast.faqDeleted'), 'success');
@@ -188,8 +146,8 @@ export class KnowledgeCommandHandler implements CommandHandler {
 
   private async handleDeleteLearning(message: Msg<'deleteLearning'>, ctx: CommandHandlerContext): Promise<void> {
     try {
-      const kb = ctx.getProjectKnowledgeBase();
-      if (!kb) { ctx.sendToast(t('knowledge.toast.notInitialized'), 'warning'); return; }
+      const kb = await this.resolveKnowledgeBase(ctx);
+      if (!kb) return;
       const success = kb.deleteLearning(message.id);
       if (success) {
         ctx.sendToast(t('knowledge.toast.learningDeleted'), 'success');
@@ -206,8 +164,8 @@ export class KnowledgeCommandHandler implements CommandHandler {
 
   private async handleAddADR(message: Msg<'addADR'>, ctx: CommandHandlerContext): Promise<void> {
     try {
-      const kb = ctx.getProjectKnowledgeBase();
-      if (!kb) { ctx.sendToast(t('knowledge.toast.notInitialized'), 'warning'); return; }
+      const kb = await this.resolveKnowledgeBase(ctx);
+      if (!kb) return;
       kb.addADR(message.adr);
       ctx.sendToast(t('knowledge.toast.adrAdded'), 'success');
       logger.info('ADR.已添加', { id: message.adr.id, title: message.adr.title }, LogCategory.SESSION);
@@ -220,8 +178,8 @@ export class KnowledgeCommandHandler implements CommandHandler {
 
   private async handleUpdateADR(message: Msg<'updateADR'>, ctx: CommandHandlerContext): Promise<void> {
     try {
-      const kb = ctx.getProjectKnowledgeBase();
-      if (!kb) { ctx.sendToast(t('knowledge.toast.notInitialized'), 'warning'); return; }
+      const kb = await this.resolveKnowledgeBase(ctx);
+      if (!kb) return;
       const success = kb.updateADR(message.id, message.updates);
       if (success) {
         ctx.sendToast(t('knowledge.toast.adrUpdated'), 'success');
@@ -238,8 +196,8 @@ export class KnowledgeCommandHandler implements CommandHandler {
 
   private async handleAddFAQ(message: Msg<'addFAQ'>, ctx: CommandHandlerContext): Promise<void> {
     try {
-      const kb = ctx.getProjectKnowledgeBase();
-      if (!kb) { ctx.sendToast(t('knowledge.toast.notInitialized'), 'warning'); return; }
+      const kb = await this.resolveKnowledgeBase(ctx);
+      if (!kb) return;
       kb.addFAQ(message.faq);
       ctx.sendToast(t('knowledge.toast.faqAdded'), 'success');
       logger.info('FAQ.已添加', { id: message.faq.id, question: message.faq.question }, LogCategory.SESSION);
@@ -252,8 +210,8 @@ export class KnowledgeCommandHandler implements CommandHandler {
 
   private async handleUpdateFAQ(message: Msg<'updateFAQ'>, ctx: CommandHandlerContext): Promise<void> {
     try {
-      const kb = ctx.getProjectKnowledgeBase();
-      if (!kb) { ctx.sendToast(t('knowledge.toast.notInitialized'), 'warning'); return; }
+      const kb = await this.resolveKnowledgeBase(ctx);
+      if (!kb) return;
       const success = kb.updateFAQ(message.id, message.updates);
       if (success) {
         ctx.sendToast(t('knowledge.toast.faqUpdated'), 'success');

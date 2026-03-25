@@ -286,22 +286,28 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   }
 
   /**
-   * 静默发送消息：直接用底层 client 非流式调用，不触发 normalizer/emit/UI 推送。
+   * 静默发送消息：使用底层 client 流式调用并在本地聚合，不触发 normalizer/emit/UI 推送。
    * 适用于验收检查等内部自检场景。
    * 注意：静默调用必须与用户可见对话历史隔离，严禁把内部 JSON 结果写回正式会话。
+   * 之所以强制走流式，是因为部分上游（如 Anthropic 长请求）要求耗时操作必须使用 streaming。
    */
   async sendSilentMessage(message: string): Promise<string> {
     const silentHistory = [...this.conversationHistory, { role: 'user' as const, content: message }];
+    let aggregated = '';
 
-    const response = await this.client.sendMessage({
+    const response = await this.client.streamMessage({
       messages: silentHistory,
       systemPrompt: this.systemPrompt,
       maxTokens: 4096,
       temperature: 0.7,
-      stream: false,
+      stream: true,
+    }, (chunk) => {
+      if (chunk.type === 'content_delta' && chunk.content) {
+        aggregated += chunk.content;
+      }
     });
 
-    const content = response.content || '';
+    const content = aggregated || response.content || '';
     this.recordTokenUsage(response.usage);
 
     return content;
@@ -425,6 +431,13 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           return;
         }
         this.normalizer.endStream(persistentVisibleStreamId, errorMessage);
+        persistentVisibleStreamFinished = true;
+      };
+      const interruptVisibleStream = (): void => {
+        if (persistentVisibleStreamFinished) {
+          return;
+        }
+        this.normalizer.interruptStream(persistentVisibleStreamId);
         persistentVisibleStreamFinished = true;
       };
       const finishPersistentVisibleStream = (): void => {
@@ -835,6 +848,10 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           round++;
         } catch (error: any) {
           const errorMessage = toErrorMessage(error);
+          if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
+            interruptVisibleStream();
+            break;
+          }
           const hasAccumulatedText = accumulatedText.trim().length > 0;
           const interruptedAfterToolSignal = sawToolCallSignal && toolCalls.length === 0;
           const canAutoRecoverInterruptedRound = !this.abortController?.signal.aborted
@@ -876,14 +893,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           }
 
           endVisibleStreamWithError(errorMessage || 'Request failed');
-          // abort 中断不视为异常，优雅退出循环
-          if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
-            break;
-          }
           throw error;
         }
       }
-      finishPersistentVisibleStream();
+      if (this.abortController?.signal.aborted) {
+        interruptVisibleStream();
+      } else {
+        finishPersistentVisibleStream();
+      }
 
       this.setState(AdapterState.CONNECTED);
 
@@ -984,6 +1001,7 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
     this.messageHub.workerOutput(this.workerSlot, content, {
       metadata: {
+        ...(this.currentMessageMetadata || {}),
         requestId: this.currentRequestId,
         role: 'system',
         extra: {

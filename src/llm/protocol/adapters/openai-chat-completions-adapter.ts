@@ -59,6 +59,12 @@ export class OpenAIChatCompletionsProtocolAdapter implements ProviderProtocolAda
       }
     }
 
+    // 部分 OpenAI 兼容端点（如 DeepSeek、中转站）支持 reasoning_effort
+    if (this.config.reasoningEffort) {
+      requestParams.reasoning_effort = this.config.reasoningEffort;
+      delete requestParams.temperature;
+    }
+
     let response;
     try {
       response = await this.openaiClient.chat.completions.create(requestParams, { signal: request.signal });
@@ -98,6 +104,12 @@ export class OpenAIChatCompletionsProtocolAdapter implements ProviderProtocolAda
       if (toolChoice) {
         requestParams.tool_choice = toolChoice;
       }
+    }
+
+    // 部分 OpenAI 兼容端点支持 reasoning_effort
+    if (this.config.reasoningEffort) {
+      requestParams.reasoning_effort = this.config.reasoningEffort;
+      delete requestParams.temperature;
     }
 
     let stream;
@@ -295,6 +307,12 @@ export class OpenAIChatCompletionsProtocolAdapter implements ProviderProtocolAda
 
       if (typeof msg.content === 'string') {
         messages.push({ role: msg.role, content: msg.content });
+        continue;
+      }
+
+      // 外部消息的 content 可能是 null/undefined/number，统一安全处理
+      if (!Array.isArray(msg.content)) {
+        messages.push({ role: msg.role, content: String(msg.content ?? '') });
         continue;
       }
 

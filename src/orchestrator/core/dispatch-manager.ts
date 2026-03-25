@@ -13,12 +13,18 @@
 
 import { logger, LogCategory } from '../../logging';
 import { t } from '../../i18n';
+import { GovernedKnowledgeContextService } from '../../knowledge/governed-knowledge-context-service';
+import { resolveTimelineAnchorTimestampFromMetadata } from '../../shared/timeline-ordering';
 import { raceWithTimeout } from '../../utils/race-with-timeout';
 import type { WorkerSlot } from '../../types';
 import type { TokenUsage } from '../../types/agent-types';
 import type { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import type { ProfileLoader } from '../profile/profile-loader';
-import type { MessageHub, SubTaskCardPayload } from './message-hub';
+import {
+  OwnershipGuard,
+  type DispatchOwnershipAdvisory,
+} from '../profile/ownership-guard';
+import type { MessageHub } from './message-hub';
 import type { MissionOrchestrator } from './mission-orchestrator';
 import type { Assignment, AcceptanceCriterion, Constraint } from '../mission';
 import type { WorkerReport, OrchestratorResponse } from '../protocols/worker-report';
@@ -51,9 +57,21 @@ import {
 import { WorkerPipeline } from './worker-pipeline';
 import type { SnapshotManager } from '../../snapshot-manager';
 import type { SupplementaryInstructionQueue } from './supplementary-instruction-queue';
-import { DispatchCompletionQueue } from './dispatch-completion-queue';
-import { DispatchRoutingService, type DispatchRoutingDecision } from './dispatch-routing-service';
+import {
+  DispatchRoutingService,
+  type DispatchRoutingDecision,
+  type DispatchRoutingCategorySource,
+} from './dispatch-routing-service';
 import { DispatchResumeContextStore } from './dispatch-resume-context-store';
+import {
+  DispatchProtocolManager,
+  type DispatchProtocolTimeoutPayload,
+} from './dispatch-protocol-manager';
+import { DispatchScheduler } from './dispatch-scheduler';
+import { DispatchBatchCoordinator } from './dispatch-batch-coordinator';
+import { DispatchReactiveWaitCoordinator } from './dispatch-reactive-wait-coordinator';
+import { DispatchPresentationAdapter } from './dispatch-presentation-adapter';
+import type { PlanMode } from '../plan-ledger';
 import {
   DispatchIdempotencyStore,
   type DispatchIdempotencyStatus,
@@ -61,25 +79,12 @@ import {
 import { isModelOriginIssue, toModelOriginUserMessage } from '../../errors/model-origin';
 import { trackModelOriginEvent } from '../../errors/model-origin-observability';
 import { createHash } from 'crypto';
-import { WorktreeManager } from '../../workspace/worktree-manager';
-
-type DispatchAckState = 'pending' | 'acked' | 'nacked';
-
-interface DispatchExecutionProtocolState {
-  taskId: string;
-  batchId: string;
-  worker: WorkerSlot;
-  dispatchAttemptId: string;
-  idempotencyKey: string;
-  leaseId: string;
-  leaseExpireAt: number;
-  heartbeatAt: number;
-  ackState: DispatchAckState;
-  createdAt: number;
-  ackAt?: number;
-  nackReason?: string;
-  timeoutTriggered: boolean;
-}
+import {
+  mergeOrchestrationTraceLinks,
+  type OrchestrationTraceLinks,
+} from '../trace/types';
+import type { GitHost } from '../../host';
+import { hasHardReadOnlyIntent } from './request-classifier';
 
 interface DispatchFailureSemantic {
   failureCode: string;
@@ -99,6 +104,7 @@ interface DispatchDependencyResolution {
 }
 
 type WorkspaceWriteIsolationMode = 'git_worktree' | 'workspace_serial';
+const CURRENT_PHASE_FEATURE_CATEGORIES = new Set(['frontend', 'backend', 'implement', 'general', 'simple']);
 
 /**
  * DispatchManager 依赖接口
@@ -109,10 +115,13 @@ export interface DispatchManagerDeps {
   messageHub: MessageHub;
   missionOrchestrator: MissionOrchestrator;
   workspaceRoot: string;
+  gitHost: GitHost;
   // 动态状态访问
   getActiveUserPrompt: () => string;
   getActiveImagePaths: () => string[] | undefined;
   getCurrentSessionId: () => string | undefined;
+  /** 当前执行轮次 requestId（用于统一 task_card 与工具消息的时间轴锚点） */
+  getActiveRoundRequestId?: () => string | undefined;
   getMissionIdsBySession: (sessionId: string) => Promise<string[]>;
   ensureMissionForDispatch: () => Promise<string>;
   /** 获取当前对话轮次唯一标识（用于快照 missionId 分组） */
@@ -145,6 +154,10 @@ export interface DispatchManagerDeps {
     files?: string[];
     requiresModification: boolean;
     missionTitle?: string;
+  }) => Promise<void> | void;
+  onDispatchBatchCreated?: (payload: {
+    trace: OrchestrationTraceLinks;
+    userPrompt: string;
   }) => Promise<void> | void;
 }
 
@@ -181,13 +194,6 @@ export class DispatchManager {
   private pipeline = new WorkerPipeline();
   private activeBatch: DispatchBatch | null = null;
   private _planningExecutor: PlanningExecutor | null = null;
-
-  // 反应式编排：Worker 完成结果队列 + 等待唤醒机制
-  private completionQueue = new DispatchCompletionQueue();
-  /** 标记编排者是否调用了 worker_wait（决定是否跳过自动 Phase C） */
-  private reactiveMode = false;
-  /** 反应式 Batch 是否仍等待主对话区最终汇总 */
-  private reactiveBatchAwaitingSummary = new Set<string>();
   /** Worker 路由与可用性判定服务 */
   private readonly routingService: DispatchRoutingService;
   /** Resume 上下文存储 */
@@ -196,17 +202,44 @@ export class DispatchManager {
   private readonly dispatchIdempotencyStore: DispatchIdempotencyStore;
   /** 活跃的 Assignment 映射（Worker 执行期间可查，供 todo_split handler 使用） */
   private activeAssignments = new Map<string, Assignment>();
+  /** ownership 守门器：统一处理 dispatch 与 todo_split 的职责域校验 */
+  private readonly ownershipGuard = new OwnershipGuard();
   /** Worker Lane 运行态：同一 Worker 同一时刻仅允许一个执行链 */
   private activeWorkerLanes = new Set<WorkerSlot>();
-  /** Batch 级调度合并定时器 */
-  private dispatchScheduleTimers = new Map<string, NodeJS.Timeout>();
-  /** 执行协议状态（ack/nack + lease + heartbeat） */
-  private executionProtocolStates = new Map<string, DispatchExecutionProtocolState>();
-  private leaseWatcherTimer?: NodeJS.Timeout;
-  /** Git worktree 沙盒管理器（文件系统级并行隔离） */
-  private readonly worktreeManager: WorktreeManager;
+  /** 执行协议状态管理器（ack/nack + lease + heartbeat） */
+  private readonly protocolManager: DispatchProtocolManager;
+  /** Batch 级调度器 */
+  private readonly scheduler: DispatchScheduler;
+  /** Batch 生命周期协调器 */
+  private readonly batchCoordinator: DispatchBatchCoordinator;
+  /** 反应式 wait 协调器 */
+  private readonly reactiveWaitCoordinator: DispatchReactiveWaitCoordinator;
+  /** 展示适配器 */
+  private readonly presentationAdapter: DispatchPresentationAdapter;
   /** 非 Git 工作区写任务串行降级提示，单轮只提示一次 */
   private nonGitWriteSerializationNoticeShown = false;
+
+  private resolveActiveRoundTimelineAnchorTimestamp(): number | undefined {
+    const requestId = this.deps.getActiveRoundRequestId?.()?.trim();
+    if (!requestId) {
+      return undefined;
+    }
+    const requestMessageId = this.deps.messageHub.getRequestMessageId(requestId);
+    if (!requestMessageId) {
+      return undefined;
+    }
+    const requestMessage = this.deps.messageHub.getMessageSnapshot(requestMessageId);
+    const metadata = requestMessage?.metadata as Record<string, unknown> | undefined;
+    const metadataAnchorTimestamp = resolveTimelineAnchorTimestampFromMetadata(metadata);
+    if (metadataAnchorTimestamp !== null) {
+      return metadataAnchorTimestamp;
+    }
+    return typeof requestMessage?.timestamp === 'number'
+      && Number.isFinite(requestMessage.timestamp)
+      && requestMessage.timestamp > 0
+      ? Math.floor(requestMessage.timestamp)
+      : undefined;
+  }
 
   constructor(private deps: DispatchManagerDeps) {
     this.routingService = new DispatchRoutingService(
@@ -219,36 +252,130 @@ export class DispatchManager {
       DispatchManager.MAX_MISSION_SESSION_RECORDS,
     );
     this.dispatchIdempotencyStore = new DispatchIdempotencyStore(this.deps.workspaceRoot);
-    this.worktreeManager = new WorktreeManager(this.deps.workspaceRoot);
+    this.protocolManager = new DispatchProtocolManager({
+      ackTimeoutMs: DispatchManager.ACK_TIMEOUT_MS,
+      leaseTtlMs: DispatchManager.LEASE_TTL_MS,
+      leaseWatchIntervalMs: DispatchManager.LEASE_WATCH_INTERVAL_MS,
+      onProtocolTimeout: (payload) => this.handleDispatchProtocolTimeout(payload),
+      touchBatchActivity: (batchId) => {
+        if (this.activeBatch?.id === batchId) {
+          this.activeBatch.touchActivity();
+        }
+      },
+    });
+    this.presentationAdapter = new DispatchPresentationAdapter({
+      messageHub: this.deps.messageHub,
+      getActiveBatch: () => this.activeBatch,
+      getCurrentTurnId: () => this.deps.getCurrentTurnId(),
+      getActiveRoundRequestId: this.deps.getActiveRoundRequestId,
+    });
+    this.scheduler = new DispatchScheduler({
+      coalesceMs: DispatchManager.DISPATCH_COALESCE_MS,
+      getWorkerLaneResidentTimeoutMs: () => this.resolveWorkerLaneResidentTimeoutMs(),
+      getWorkerLaneResidentPollIntervalMs: () => this.resolveWorkerLaneResidentPollIntervalMs(),
+      getActiveWorkerLanes: () => this.activeWorkerLanes.values(),
+      tryActivateWorkerLane: (worker) => {
+        if (this.activeWorkerLanes.has(worker)) {
+          return false;
+        }
+        this.activeWorkerLanes.add(worker);
+        return true;
+      },
+      releaseWorkerLane: (worker) => {
+        this.activeWorkerLanes.delete(worker);
+      },
+      resolveExecutionWorker: (preferredWorker, options) => this.resolveExecutionWorker(preferredWorker, options),
+      executeDispatchEntry: (entry, options) => this.executeDispatchEntry(entry, options),
+      emitWorkerLaneInstructionCard: (entry, worker, batch, preferredTaskId) => {
+        this.presentationAdapter.emitWorkerLaneInstructionCard(entry, worker, batch, preferredTaskId);
+      },
+      notifyWorkerRoutingAdjusted: ({ batchId, taskId, fromWorker, toWorker, routingReason }) => {
+        this.deps.messageHub.notify(
+          t('dispatch.notify.schedulingRoutingAdjusted', {
+            taskId,
+            fromWorker,
+            toWorker,
+            routingReason,
+          }),
+          'warning',
+        );
+        logger.warn('Dispatch.WorkerLane.忙碌改派', {
+          batchId,
+          taskId,
+          from: fromWorker,
+          to: toWorker,
+          reason: routingReason,
+        }, LogCategory.ORCHESTRATOR);
+      },
+    });
+    this.reactiveWaitCoordinator = new DispatchReactiveWaitCoordinator({
+      messageHub: this.deps.messageHub,
+      getIdleTimeoutMs: () => this.getIdleTimeoutMs(),
+    });
+    this.batchCoordinator = new DispatchBatchCoordinator({
+      messageHub: this.deps.messageHub,
+      emitWorkerLaneInstructionCard: (entry, worker, batch, preferredTaskId) => {
+        this.presentationAdapter.emitWorkerLaneInstructionCard(entry, worker, batch, preferredTaskId);
+      },
+      scheduleReadyTasks: (batch, options) => this.scheduler.scheduleReadyTasks(batch, options),
+      clearProtocolState: (taskId) => this.protocolManager.clear(taskId),
+      clearProtocolStatesByBatch: (batchId) => this.protocolManager.clearByBatch(batchId),
+      clearActiveWorkerLanes: () => {
+        this.activeWorkerLanes.clear();
+      },
+      clearDispatchScheduleTimers: (batchId) => this.scheduler.clearScheduleTimers(batchId),
+      clearResumeContext: () => this.clearResumeContext(),
+      updateDispatchStatus: (taskId, status) => this.dispatchIdempotencyStore.updateStatusByTaskId(taskId, status),
+      pushCompletionEntry: (entry) => {
+        this.reactiveWaitCoordinator.pushCompletionEntry(entry);
+      },
+      isReactiveMode: () => this.reactiveWaitCoordinator.isReactiveMode(),
+      markReactiveBatchAwaitingSummary: (batchId) => {
+        this.reactiveWaitCoordinator.markBatchAwaitingSummary(batchId);
+      },
+      clearReactiveBatchAwaitingSummary: (batchId) => {
+        this.reactiveWaitCoordinator.clearBatchAwaitingSummary(batchId);
+      },
+      clearPhaseBPlusTimestamp: (batchId) => {
+        this.phaseBPlusTimestamps.delete(batchId);
+      },
+      ensureBatchAuditOutcome: (batch, entries) => this.ensureBatchAuditOutcome(batch, entries),
+      buildInterventionReport: (auditOutcome, entries) => this.buildInterventionReport(auditOutcome, entries),
+      triggerPhaseCSummary: (batch, entries, auditOutcome) => this.triggerPhaseCSummary(batch, entries, auditOutcome),
+    });
     this.reportIdempotencyDeploymentDiagnostic();
     this.setupMissionEventListeners();
-    this.startLeaseWatcher();
   }
 
   /**
    * 订阅 MissionOrchestrator 的 Todo/Insight 事件，
-   * 将进度信息直接通过 MessageHub 发送到前端 SubTaskCard
+   * 将进度信息直接通过 MessageHub 发送到前端 SubTaskCard。
+   *
+   * 进度 summary 采用累积构建模式：从 assignment.todos 中读取已完成/已失败/正在执行的
+   * todo 列表，拼接出完整的进度视图，而不是只展示最新一条 todo 的内容。
    */
   private setupMissionEventListeners(): void {
     const mo = this.deps.missionOrchestrator;
 
     mo.on('todoStarted', ({ assignmentId, content }: { assignmentId: string; content: string }) => {
-      this.reportTodoProgress(assignmentId, t('dispatch.todo.started', { content }));
+      const summary = this.buildAccumulatedTodoSummary(assignmentId, { currentTodo: content });
+      this.presentationAdapter.reportTodoProgress(assignmentId, summary);
     });
 
-    mo.on('todoCompleted', ({ assignmentId, content }: { assignmentId: string; content: string }) => {
-      this.reportTodoProgress(assignmentId, t('dispatch.todo.completed', { content }));
+    mo.on('todoCompleted', ({ assignmentId }: { assignmentId: string; content: string }) => {
+      const summary = this.buildAccumulatedTodoSummary(assignmentId);
+      this.presentationAdapter.reportTodoProgress(assignmentId, summary);
     });
 
     mo.on('todoFailed', ({ assignmentId, content, error }: { assignmentId: string; content: string; error?: string }) => {
-      this.reportTodoProgress(assignmentId, t('dispatch.todo.failed', {
-        content,
-        error: error || t('dispatch.common.unknownError'),
-      }));
+      const summary = this.buildAccumulatedTodoSummary(assignmentId, {
+        failedTodo: { content, error: error || t('dispatch.common.unknownError') },
+      });
+      this.presentationAdapter.reportTodoProgress(assignmentId, summary);
     });
 
     mo.on('assignmentStarted', ({ assignmentId, workerId }: { assignmentId: string; workerId?: WorkerSlot }) => {
-      this.markProtocolAck(assignmentId, workerId);
+      this.protocolManager.markAck(assignmentId, workerId);
     });
 
     mo.on('workerHeartbeat', ({
@@ -262,7 +389,7 @@ export class DispatchManager {
       todoId?: string;
       sessionId?: string;
     }) => {
-      this.updateProtocolHeartbeat(assignmentId, workerId, timestamp);
+      this.protocolManager.updateHeartbeat(assignmentId, workerId, timestamp);
     });
 
     mo.on('insightGenerated', ({ workerId, type, content, importance }: { workerId: string; type: string; content: string; importance: string }) => {
@@ -279,34 +406,90 @@ export class DispatchManager {
   }
 
   /**
-   * 报告 Todo 进度：从 activeBatch 查找 entry 并更新 subTaskCard
+   * 从 assignment.todos 构建累积进度 summary。
+   *
+   * 产出格式示例（中文 locale）：
+   *   已完成 2/5:
+   *   - ✅ 实现用户认证模块
+   *   - ✅ 添加单元测试
+   *   正在执行: 更新 API 文档
+   *
+   * 如果拿不到 assignment（极端边界），回退到单条文案。
    */
-  private reportTodoProgress(assignmentId: string, summary: string): void {
-    const entry = this.activeBatch?.getEntry(assignmentId);
-    if (entry && entry.status === 'running') {
-      this.emitSubTaskCard({
-        id: assignmentId,
-        title: entry.taskContract.taskTitle,
-        status: 'running',
-        worker: entry.worker,
-        summary,
-      });
+  private buildAccumulatedTodoSummary(
+    assignmentId: string,
+    context?: {
+      currentTodo?: string;
+      failedTodo?: { content: string; error: string };
+    },
+  ): string {
+    const assignment = this.activeAssignments.get(assignmentId);
+    if (!assignment || !assignment.todos || assignment.todos.length === 0) {
+      // 兜底：拿不到 assignment 时退回单条模式
+      if (context?.failedTodo) {
+        return t('dispatch.todo.failed', context.failedTodo);
+      }
+      if (context?.currentTodo) {
+        return t('dispatch.todo.started', { content: context.currentTodo });
+      }
+      return '';
     }
+
+    // 只统计一级 todo（排除被拆分的子步骤，避免计数膨胀）
+    const topLevelTodos = assignment.todos.filter(todo => !todo.parentId);
+    const total = topLevelTodos.length;
+    const completedTodos = topLevelTodos.filter(todo => todo.status === 'completed');
+    const failedTodos = topLevelTodos.filter(todo => todo.status === 'failed');
+    const skippedTodos = topLevelTodos.filter(todo => todo.status === 'skipped');
+    const finishedCount = completedTodos.length + failedTodos.length + skippedTodos.length;
+
+    const lines: string[] = [];
+
+    // 进度头
+    if (finishedCount > 0) {
+      lines.push(t('dispatch.todo.progressHeader', { finished: finishedCount, total }));
+    }
+
+    // 已完成列表（限制数量防止过长）
+    const MAX_DISPLAY_ITEMS = 8;
+    for (const todo of completedTodos.slice(-MAX_DISPLAY_ITEMS)) {
+      lines.push(t('dispatch.todo.itemCompleted', { content: this.truncateTodoContent(todo.content) }));
+    }
+    if (completedTodos.length > MAX_DISPLAY_ITEMS) {
+      lines.push(t('dispatch.todo.itemsOmitted', { count: completedTodos.length - MAX_DISPLAY_ITEMS }));
+    }
+
+    // 已失败列表
+    for (const todo of failedTodos) {
+      const errorText = todo.error || todo.output?.error || '';
+      lines.push(t('dispatch.todo.itemFailed', {
+        content: this.truncateTodoContent(todo.content),
+        error: errorText ? ` - ${this.truncateTodoContent(errorText, 80)}` : '',
+      }));
+    }
+
+    // 当前正在执行的 todo
+    const runningTodo = topLevelTodos.find(todo => todo.status === 'running');
+    if (runningTodo) {
+      lines.push(t('dispatch.todo.currentRunning', { content: this.truncateTodoContent(runningTodo.content) }));
+    } else if (context?.currentTodo) {
+      lines.push(t('dispatch.todo.currentRunning', { content: this.truncateTodoContent(context.currentTodo) }));
+    }
+
+    // 刚失败的 todo（来自事件回调，可能还未写入 assignment.todos）
+    if (context?.failedTodo && !failedTodos.some(todo => todo.content === context.failedTodo!.content)) {
+      lines.push(t('dispatch.todo.itemFailed', {
+        content: this.truncateTodoContent(context.failedTodo.content),
+        error: ` - ${this.truncateTodoContent(context.failedTodo.error, 80)}`,
+      }));
+    }
+
+    return lines.join('\n');
   }
 
-  private emitSubTaskCard(payload: SubTaskCardPayload): void {
-    const rawMissionId = typeof payload.missionId === 'string' ? payload.missionId.trim() : '';
-    const rawTurnId = typeof payload.turnId === 'string' ? payload.turnId.trim() : '';
-    const rawRequestId = typeof payload.requestId === 'string' ? payload.requestId.trim() : '';
-    const missionId = rawMissionId || this.activeBatch?.id || this.deps.getCurrentTurnId() || undefined;
-    const turnId = rawTurnId || this.deps.getCurrentTurnId() || undefined;
-    const requestId = rawRequestId || this.activeBatch?.requestId || undefined;
-    this.deps.messageHub.subTaskCard({
-      ...payload,
-      ...(missionId ? { missionId } : {}),
-      ...(turnId ? { turnId } : {}),
-      ...(requestId ? { requestId } : {}),
-    });
+  private truncateTodoContent(text: string, maxLen: number = 120): string {
+    const cleaned = text.replace(/\n/g, ' ').trim();
+    return cleaned.length > maxLen ? cleaned.substring(0, maxLen - 1) + '…' : cleaned;
   }
 
   /**
@@ -348,17 +531,12 @@ export class DispatchManager {
       this.activeBatch.cancelAll(t('dispatch.batch.resetCancelReason'));
     }
 
-    if (this.activeBatch) {
-      this.reactiveBatchAwaitingSummary.delete(this.activeBatch.id);
-    }
-
+    this.reactiveWaitCoordinator.resetForNewExecutionCycle(this.activeBatch);
     this.activeBatch = null;
-    this.reactiveMode = false;
     this.phaseBPlusTimestamps.clear();
-    this.completionQueue.reset();
     this.activeWorkerLanes.clear();
-    this.clearAllProtocolStates();
-    this.clearDispatchScheduleTimers();
+    this.protocolManager.clearAll();
+    this.scheduler.clearScheduleTimers();
     this.clearResumeContext();
     this.nonGitWriteSerializationNoticeShown = false;
     // 清空 dispatch 文件写入追踪表，避免跨执行周期的误判
@@ -368,15 +546,16 @@ export class DispatchManager {
   private resolveDispatchRouting(
     goal: string,
     explicitCategory?: string,
+    categorySource: DispatchRoutingCategorySource = 'explicit_param',
   ): { ok: true; decision: DispatchRoutingDecision } | { ok: false; error: string } {
-    return this.routingService.resolveDispatchRouting(goal, explicitCategory);
+    return this.routingService.resolveDispatchRouting(goal, explicitCategory, categorySource);
   }
 
   private resolveWorkspaceWriteIsolationMode(requiresModification: boolean): WorkspaceWriteIsolationMode | null {
     if (!requiresModification) {
       return null;
     }
-    return this.worktreeManager.isGitRepository()
+    return this.deps.gitHost.isGitRepository(this.deps.workspaceRoot)
       ? 'git_worktree'
       : 'workspace_serial';
   }
@@ -522,6 +701,14 @@ export class DispatchManager {
         const normalizedScopeHint = scopeHintValues && scopeHintValues.length > 0 ? scopeHintValues : undefined;
         const normalizedFiles = filesValues && filesValues.length > 0 ? filesValues : undefined;
         const normalizedDependsOn = dependsOnValues && dependsOnValues.length > 0 ? dependsOnValues : undefined;
+        const activeUserPrompt = this.deps.getActiveUserPrompt()?.trim() || '';
+        if (requiresModification && activeUserPrompt && hasHardReadOnlyIntent(activeUserPrompt)) {
+          return {
+            task_id: '',
+            status: 'failed' as const,
+            error: t('dispatch.errors.readOnlyPromptRejectsModification'),
+          };
+        }
         const collaborationContracts = this.normalizeCollaborationContracts(contracts);
         logger.info('编排工具.worker_dispatch.开始', {
           category,
@@ -534,7 +721,36 @@ export class DispatchManager {
           dependsOn: normalizedDependsOn,
         }, LogCategory.ORCHESTRATOR);
 
-        const routingResult = this.resolveDispatchRouting(taskTitle, category);
+        const ownershipAdvisory = this.ownershipGuard.evaluateDispatchAdvisory({
+          category,
+          taskTitle,
+          goal: goalText || taskTitle,
+          acceptance: normalizedAcceptance,
+          constraints: normalizedConstraints,
+          context: normalizedContext,
+          dependsOn: normalizedDependsOn,
+          userPrompt: activeUserPrompt,
+        });
+        if (ownershipAdvisory.rejectionError) {
+          logger.warn('编排工具.worker_dispatch.ownership拒绝派发', {
+            category,
+            taskTitle,
+            error: ownershipAdvisory.rejectionError,
+          }, LogCategory.ORCHESTRATOR);
+          return {
+            task_id: '',
+            status: 'failed' as const,
+            error: ownershipAdvisory.rejectionError,
+          };
+        }
+
+        const normalizedRequestedCategory = category.trim().toLowerCase().replace(/[\s-]+/g, '_');
+        const resolvedDispatchCategory = ownershipAdvisory.resolvedCategory || normalizedRequestedCategory;
+        const routingResult = this.resolveDispatchRouting(
+          taskTitle,
+          resolvedDispatchCategory,
+          resolvedDispatchCategory === normalizedRequestedCategory ? 'explicit_param' : 'ownership_inferred',
+        );
         if (!routingResult.ok) {
           return {
             task_id: '',
@@ -542,21 +758,35 @@ export class DispatchManager {
             error: routingResult.error,
           };
         }
-        const { decision } = routingResult;
+        const decision = routingResult.decision;
+
+        if (resolvedDispatchCategory !== normalizedRequestedCategory) {
+          logger.info('编排工具.worker_dispatch.ownership自动改写分类', {
+            fromCategory: normalizedRequestedCategory,
+            toCategory: decision.category,
+            taskTitle,
+          }, LogCategory.ORCHESTRATOR);
+        }
         logger.info('编排工具.worker_dispatch.路由决策', {
           selectedWorker: decision.selectedWorker,
           category: decision.category,
           categorySource: decision.categorySource,
-          degraded: decision.degraded,
+          degraded: decision.degraded || ownershipAdvisory.degraded,
           requiresModification,
-          reason: decision.routingReason,
+          reason: [
+            decision.routingReason,
+            ownershipAdvisory.routingReasonPatch,
+          ].filter(Boolean).join('; '),
         }, LogCategory.ORCHESTRATOR);
-        if (decision.degraded) {
+        if (decision.degraded || ownershipAdvisory.degraded) {
           this.deps.messageHub.notify(
             t('dispatch.notify.routingAdjusted', {
               category: decision.category,
               selectedWorker: decision.selectedWorker,
-              routingReason: decision.routingReason,
+              routingReason: [
+                decision.routingReason,
+                ownershipAdvisory.routingReasonPatch,
+              ].filter(Boolean).join('; '),
             }),
             'warning'
           );
@@ -573,32 +803,89 @@ export class DispatchManager {
           };
         }
 
-        // 确保 DispatchBatch 存在（一次 orchestrator LLM 调用共享一个 Batch）
-        if (!this.activeBatch || this.activeBatch.status !== 'active') {
-          if (this.activeBatch?.status === 'archived') {
-            this.reactiveBatchAwaitingSummary.delete(this.activeBatch.id);
-          }
-          // 使用 Mission ID 作为 Batch ID，确保 Todo 关联到正确的 Mission
-          this.activeBatch = new DispatchBatch(missionId);
-          this.activeBatch.userPrompt = this.deps.getActiveUserPrompt();
-          this.setupBatchEventHandlers(this.activeBatch);
-          // reactiveMode 是执行级状态，仅由 resetForNewExecutionCycle() 重置
-          this.completionQueue.reset();
-        }
         const resolvedSessionId = this.deps.getCurrentSessionId()?.trim() || '';
         const sessionScopeForIdempotency = resolvedSessionId || 'unknown-session';
+
+        // 确保 DispatchBatch 存在（一次 orchestrator LLM 调用共享一个 Dispatch Wave）
+        if (!this.activeBatch || this.activeBatch.status !== 'active') {
+          if (this.activeBatch?.status === 'archived') {
+            this.reactiveWaitCoordinator.clearBatchAwaitingSummary(this.activeBatch.id);
+          }
+          const dispatchWaveId = `wave_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+          const batchTrace = mergeOrchestrationTraceLinks({
+            sessionId: resolvedSessionId || undefined,
+            turnId: this.deps.getCurrentTurnId() || undefined,
+            planId: this.deps.getCurrentPlanId() || undefined,
+            missionId,
+            requestId: this.deps.getActiveRoundRequestId?.() || undefined,
+          }, {
+            batchId: dispatchWaveId,
+          });
+          this.activeBatch = new DispatchBatch({
+            batchId: dispatchWaveId,
+            requestId: batchTrace?.requestId,
+            trace: batchTrace,
+            timelineAnchorTimestamp: this.resolveActiveRoundTimelineAnchorTimestamp(),
+          });
+          this.activeBatch.userPrompt = this.deps.getActiveUserPrompt();
+          this.batchCoordinator.setupBatchEventHandlers(this.activeBatch);
+          // reactiveMode 是执行级状态，仅由 resetForNewExecutionCycle() 重置
+          this.reactiveWaitCoordinator.resetForNextBatch();
+          if (this.deps.onDispatchBatchCreated) {
+            void Promise.resolve(this.deps.onDispatchBatchCreated({
+              trace: this.activeBatch.trace,
+              userPrompt: this.activeBatch.userPrompt,
+            })).catch((error) => {
+              logger.warn('编排工具.worker_dispatch.batch观测回写失败', {
+                batchId: this.activeBatch?.id,
+                error: error instanceof Error ? error.message : String(error),
+              }, LogCategory.ORCHESTRATOR);
+            });
+          }
+        }
 
         const dependencyResolution = this.resolveDispatchDependencies({
           batch: this.activeBatch,
           dependsOn: normalizedDependsOn,
           sessionId: sessionScopeForIdempotency,
         });
+        const phaseAdvisory = this.ownershipGuard.evaluateResolvedDispatchPhaseAdvisory({
+          category: decision.category,
+          taskTitle,
+          goal: goalText || taskTitle,
+          acceptance: normalizedAcceptance,
+          constraints: normalizedConstraints,
+          context: normalizedContext,
+          userPrompt: activeUserPrompt,
+          hasResolvedHistoricalDependencies: dependencyResolution.resolvedHistoricalCompleted.length > 0,
+          hasInBatchDependencies: (dependencyResolution.dependsOn?.length || 0) > 0,
+          hasActiveFeatureDomainEntriesInBatch: this.hasActiveFeatureDomainEntriesInBatch(this.activeBatch),
+        });
+        if (phaseAdvisory?.rejectionError) {
+          logger.warn('编排工具.worker_dispatch.phase门禁拒绝派发', {
+            category: decision.category,
+            taskTitle,
+            error: phaseAdvisory.rejectionError,
+            hasResolvedHistoricalDependencies: dependencyResolution.resolvedHistoricalCompleted.length > 0,
+            hasInBatchDependencies: (dependencyResolution.dependsOn?.length || 0) > 0,
+          }, LogCategory.ORCHESTRATOR);
+          return {
+            task_id: '',
+            status: 'failed' as const,
+            error: phaseAdvisory.rejectionError,
+          };
+        }
+        const routingReasonWithOwnership = [
+          decision.routingReason,
+          ownershipAdvisory.routingReasonPatch,
+          phaseAdvisory?.routingReasonPatch,
+        ].filter(Boolean).join('; ');
         const scopeHintPlan = this.resolveParallelScopeHintPolicy({
           batch: this.activeBatch,
           scopeHint: normalizedScopeHint,
           dependsOn: dependencyResolution.dependsOn,
-          routingReason: decision.routingReason,
-          degraded: decision.degraded,
+          routingReason: routingReasonWithOwnership,
+          degraded: decision.degraded || ownershipAdvisory.degraded,
         });
         const workspaceWriteIsolationMode = this.resolveWorkspaceWriteIsolationMode(requiresModification);
         const baseRoutingReason = [
@@ -620,6 +907,9 @@ export class DispatchManager {
         const taskContract = this.buildDispatchTaskContract({
           taskTitle,
           category: decision.category,
+          ...(normalizedRequestedCategory !== decision.category
+            ? { declaredCategory: normalizedRequestedCategory }
+            : {}),
           goal: goalText || taskTitle,
           acceptance: normalizedAcceptance,
           constraints: normalizedConstraints,
@@ -714,6 +1004,18 @@ export class DispatchManager {
           };
         }
         this.notifyDispatchDependencyResolution(taskId, dependencyResolution);
+        if (ownershipAdvisory.warningDetail) {
+          this.deps.messageHub.notify(t('dispatch.notify.ownershipCategoryWarning', {
+            taskId,
+            category: decision.category,
+            details: ownershipAdvisory.warningDetail,
+          }), 'warning');
+          logger.warn('编排工具.worker_dispatch.ownership警告', {
+            taskId,
+            category: decision.category,
+            details: ownershipAdvisory.warningDetail,
+          }, LogCategory.ORCHESTRATOR);
+        }
 
         if (scopeHintPlan.addedDependencies.length > 0) {
           this.deps.messageHub.notify(t('dispatch.notify.parallelScopeHintMissingSerialized', {
@@ -771,10 +1073,19 @@ export class DispatchManager {
 
         // 发送 subTaskCard（状态基于注册后的真实 DispatchStatus）
         const entry = this.activeBatch.getEntry(taskId);
+        const activeRoundRequestId = typeof this.deps.getActiveRoundRequestId === 'function'
+          ? (this.deps.getActiveRoundRequestId()?.trim() || '')
+          : '';
+        if (entry && activeRoundRequestId) {
+          entry.requestId = activeRoundRequestId;
+          entry.trace = mergeOrchestrationTraceLinks(entry.trace, {
+            requestId: activeRoundRequestId,
+          });
+        }
         const entryStatus = entry
           ? entry.status
           : (effectiveDependsOn && effectiveDependsOn.length > 0 ? 'waiting_deps' : 'pending');
-        const cardStatus = this.mapDispatchStatusToInitialCardStatus(entryStatus);
+        const cardStatus = this.presentationAdapter.mapDispatchStatusToInitialCardStatus(entryStatus);
 
         if (resolvedSessionId && this.deps.onDispatchTaskRegistered) {
           try {
@@ -803,20 +1114,23 @@ export class DispatchManager {
           this.dispatchIdempotencyStore.updateStatusByTaskId(taskId, 'cancelled');
         }
 
-        this.emitSubTaskCard({
+        this.presentationAdapter.emitSubTaskCard({
           id: taskId,
           title: taskTitle,
           status: cardStatus,
           worker: decision.selectedWorker,
-          requestId: this.activeBatch.requestId,
+          requestId: entry?.requestId || this.activeBatch.requestId,
           ...(entryStatus === 'skipped' && entry?.result?.summary
-            ? { summary: entry.result.summary }
+            ? {
+                summary: entry.result.summary,
+                ...(entry.result.fullSummary ? { fullSummary: entry.result.fullSummary } : {}),
+              }
             : {}),
         });
 
         // 通过隔离策略决定是否立即启动（约束 5）
         if (entryStatus === 'pending') {
-          this.scheduleDispatchReadyTasks(this.activeBatch, { reason: 'dispatch-registered' });
+          this.scheduler.scheduleReadyTasks(this.activeBatch, { reason: 'dispatch-registered' });
         }
         // 有依赖的任务由 DispatchBatch 的 task:ready 事件触发
 
@@ -846,7 +1160,7 @@ export class DispatchManager {
           }, LogCategory.ORCHESTRATOR);
         }
 
-        // Find current worker's taskId to get missionId and optional laneCardId
+        // Find current worker's taskId to get missionId and current worker lifecycle context
         let missionId: string | undefined;
         if (this.activeBatch) {
           const entry = Array.from(this.activeBatch.getEntries()).find(e => e.worker === worker && e.status === 'running');
@@ -860,9 +1174,12 @@ export class DispatchManager {
 
         const requestId = this.activeBatch?.requestId;
 
+        const sessionId = this.activeBatch?.trace?.sessionId;
         this.deps.messageHub.workerInstruction(worker, message, {
-           ...(missionId ? { missionId } : {}),
-           ...(requestId ? { requestId } : {}),
+          ...(sessionId ? { sessionId } : {}),
+          ...(missionId ? { missionId } : {}),
+          ...(requestId ? { requestId } : {}),
+          turnId: this.deps.getCurrentTurnId() || undefined,
         });
         return { delivered };
       },
@@ -891,25 +1208,25 @@ export class DispatchManager {
           }
         }
 
-        const result = await this.waitForWorkers(params.task_ids);
-
-        // 等待结束 → runtime.wait = none
-        if (sessionId && planId && planLedger) {
-          try {
-            await planLedger.updateRuntimeState(sessionId, planId, {
-              wait: { state: 'none' },
-            });
-          } catch (error) {
-            logger.warn('Dispatch.PlanRuntime.wait状态更新失败', {
-              sessionId,
-              planId,
-              state: 'none',
-              error: error instanceof Error ? error.message : String(error),
-            }, LogCategory.ORCHESTRATOR);
+        try {
+          return await this.waitForWorkers(params.task_ids);
+        } finally {
+          // worker_wait 参数/协议错误也必须回收 external_waiting，避免计划账本残留假等待态。
+          if (sessionId && planId && planLedger) {
+            try {
+              await planLedger.updateRuntimeState(sessionId, planId, {
+                wait: { state: 'none' },
+              });
+            } catch (error) {
+              logger.warn('Dispatch.PlanRuntime.wait状态更新失败', {
+                sessionId,
+                planId,
+                state: 'none',
+                error: error instanceof Error ? error.message : String(error),
+              }, LogCategory.ORCHESTRATOR);
+            }
           }
         }
-
-        return result;
       },
 
       splitTodo: async (params) => {
@@ -934,6 +1251,18 @@ export class DispatchManager {
               error: t('dispatch.errors.splitDepthExceeded'),
             };
           }
+        }
+
+        const splitOwnershipError = this.ownershipGuard.evaluateSplitTodoOwnership({
+          assignmentCategory: assignment.assignmentReason.profileMatch.category,
+          subtasks,
+        });
+        if (splitOwnershipError) {
+          return {
+            success: false,
+            childTodoIds: [],
+            error: splitOwnershipError,
+          };
         }
 
         let todoManager = this.deps.getTodoManager();
@@ -966,6 +1295,7 @@ export class DispatchManager {
             sessionId: currentSessionId,
             missionId: callerContext.missionId,
             assignmentId: callerContext.assignmentId,
+            trace: currentTodo?.trace || assignment.trace,
             parentId: callerContext.todoId,
             source: 'worker_split',
             content: subtask.content,
@@ -1292,17 +1622,28 @@ export class DispatchManager {
     const constraints = requirementAnalysis.constraints || [];
     const requiresModification = requirementAnalysis.requiresModification === true;
     const batch = this.activeBatch;
+    const subTaskRequestId = (() => {
+      const rawRoundRequestId = typeof this.deps.getActiveRoundRequestId === 'function'
+        ? (this.deps.getActiveRoundRequestId()?.trim() || '')
+        : '';
+      const rawEntryRequestId = typeof entry.requestId === 'string' ? entry.requestId.trim() : '';
+      if (rawEntryRequestId) return rawEntryRequestId;
+      if (rawRoundRequestId) return rawRoundRequestId;
+      const rawBatchRequestId = typeof batch?.requestId === 'string' ? batch.requestId.trim() : '';
+      return rawBatchRequestId || undefined;
+    })();
     const executionRouting = this.resolveExecutionWorker(preferredWorker);
     if (!executionRouting.ok) {
       const errorMsg = executionRouting.error;
       batch?.markFailed(taskId, { success: false, summary: errorMsg, errors: [errorMsg] });
-      this.emitSubTaskCard({
+      this.presentationAdapter.emitSubTaskCard({
         id: taskId,
         title: taskTitle,
         status: 'failed',
         worker: preferredWorker,
         summary: errorMsg,
         error: errorMsg,
+        ...(subTaskRequestId ? { requestId: subTaskRequestId } : {}),
       });
       return;
     }
@@ -1332,28 +1673,36 @@ export class DispatchManager {
 
     // 标记开始运行
     batch?.markRunning(taskId);
-    this.emitSubTaskCard({
+    this.presentationAdapter.emitSubTaskCard({
       id: taskId,
       title: taskTitle,
       status: 'running',
       worker: effectiveWorker,
+      ...(subTaskRequestId ? { requestId: subTaskRequestId } : {}),
     });
 
     if (emitWorkerInstruction && !batch) {
       // 同一 worker 的多个任务通过 lane 级稳定卡片聚合，避免重复派发多张指令卡。
-      this.emitWorkerLaneInstructionCard(entry, effectiveWorker, batch);
+      this.presentationAdapter.emitWorkerLaneInstructionCard(entry, effectiveWorker, batch);
     }
 
     let lastDispatchAttemptId: string | undefined;
     const reservedFailoverWorkers = new Set<WorkerSlot>();
     try {
       // 构建轻量 Assignment
-      const missionId = batch?.id || 'dispatch';
+      const missionId = batch?.trace?.missionId || entry.trace?.missionId || 'dispatch';
       const assignmentAcceptanceCriteria = this.buildAssignmentAcceptanceCriteria(acceptance);
       const assignmentConstraints = this.buildAssignmentConstraints(constraints);
+      const assignmentTrace = mergeOrchestrationTraceLinks(entry.trace || batch?.trace, {
+        sessionId: this.deps.getCurrentSessionId() || undefined,
+        missionId,
+        assignmentId: taskId,
+        workerId: effectiveWorker,
+      });
       const assignment: Assignment = {
         id: taskId,
         missionId,
+        trace: assignmentTrace,
         workerId: effectiveWorker,
         shortTitle: taskTitle,
         responsibility: taskTitle,
@@ -1387,24 +1736,35 @@ export class DispatchManager {
         createdAt: Date.now(),
       };
 
+      const currentSessionId = this.deps.getCurrentSessionId()?.trim();
+
       // 获取项目上下文
       const knowledgeBase = this.deps.getProjectKnowledgeBase();
       const projectContext = knowledgeBase
-        ? knowledgeBase.getProjectContext(600)
+        ? new GovernedKnowledgeContextService(knowledgeBase).buildProjectContext(600, {
+          purpose: 'project_context',
+          consumer: 'dispatch_manager',
+          sessionId: currentSessionId || undefined,
+          requestId: subTaskRequestId || undefined,
+          missionId,
+          assignmentId: taskId,
+          agentId: effectiveWorker,
+          workerId: effectiveWorker,
+        }).content
         : undefined;
 
-      const currentSessionId = this.deps.getCurrentSessionId()?.trim();
       if (!currentSessionId) {
-        this.markProtocolNack(taskId, 'missing-session-context');
+        this.protocolManager.markNack(taskId, 'missing-session-context');
         const errorMsg = t('dispatch.errors.currentSessionMissingCannotCreateTodo');
         batch?.markFailed(taskId, { success: false, summary: errorMsg, errors: [errorMsg] });
-        this.emitSubTaskCard({
+        this.presentationAdapter.emitSubTaskCard({
           id: taskId,
           title: taskTitle,
           status: 'failed',
           worker: effectiveWorker,
           summary: errorMsg,
           error: errorMsg,
+          ...(subTaskRequestId ? { requestId: subTaskRequestId } : {}),
         });
         return;
       }
@@ -1418,6 +1778,7 @@ export class DispatchManager {
         missionId,
         assignmentId: taskId,
         todos: assignment.todos || [],
+        trace: assignment.trace,
       });
 
       // 计算治理开关（governance = 'auto'）
@@ -1434,6 +1795,9 @@ export class DispatchManager {
       while (true) {
         attemptedWorkers.add(effectiveWorker);
         assignment.workerId = effectiveWorker;
+        assignment.trace = mergeOrchestrationTraceLinks(assignment.trace, {
+          workerId: effectiveWorker,
+        });
         assignment.assignmentReason = {
           ...assignment.assignmentReason,
           explanation: currentRoutingReason,
@@ -1441,10 +1805,13 @@ export class DispatchManager {
         const batchEntry = batch?.getEntry(taskId);
         if (batchEntry) {
           batchEntry.worker = effectiveWorker;
+          batchEntry.trace = mergeOrchestrationTraceLinks(batchEntry.trace, {
+            workerId: effectiveWorker,
+          });
         }
 
         const { resumeSessionId, resumePrompt } = this.getResumeContextForWorker(effectiveWorker);
-        const protocolState = this.registerProtocolState(taskId, batch?.id, effectiveWorker);
+        const protocolState = this.protocolManager.register(taskId, batch?.id, effectiveWorker);
         lastDispatchAttemptId = protocolState.dispatchAttemptId;
 
         try {
@@ -1457,10 +1824,11 @@ export class DispatchManager {
               workerInstance,
               adapterFactory: this.deps.adapterFactory,
               workspaceRoot: this.deps.workspaceRoot,
+              planningMode: this.resolveCurrentPlanningMode(),
               projectContext,
               // 与 Todo/Assignment 使用同一真实 missionId，避免终止快照作用域错位。
               missionId,
-              requestId: batch?.requestId,
+              requestId: assignment.trace?.requestId || batch?.requestId,
               sessionId: currentSessionId,
               onReport: (report) => this.handleDispatchWorkerReport(report, batch),
               cancellationToken: batch?.cancellationToken,
@@ -1481,7 +1849,7 @@ export class DispatchManager {
               snapshotManager,
               contextManager,
               todoManager: this.deps.getTodoManager(),
-              worktreeManager: this.worktreeManager,
+              gitHost: this.deps.gitHost,
             });
           } finally {
             this.activeAssignments.delete(taskId);
@@ -1491,7 +1859,7 @@ export class DispatchManager {
           break;
         } catch (error: any) {
           if (error instanceof CancellationError || error?.isCancellation) {
-            this.markProtocolNack(taskId, error.message || 'cancelled');
+            this.protocolManager.markNack(taskId, error.message || 'cancelled');
             const currentEntry = batch?.getEntry(taskId);
             const shouldUpdateCard = !currentEntry || !isTerminalStatus(currentEntry.status);
             if (!shouldUpdateCard && currentEntry) {
@@ -1502,12 +1870,13 @@ export class DispatchManager {
               }, LogCategory.ORCHESTRATOR);
             }
             if (shouldUpdateCard) {
-              this.emitSubTaskCard({
+              this.presentationAdapter.emitSubTaskCard({
                 id: taskId,
                 title: taskTitle,
-                status: 'stopped',
+                status: 'cancelled',
                 worker: effectiveWorker,
                 summary: error.message,
+                ...(subTaskRequestId ? { requestId: subTaskRequestId } : {}),
               });
             }
             logger.info('编排工具.worker_dispatch.Worker取消', {
@@ -1518,7 +1887,7 @@ export class DispatchManager {
 
           const rawErrorMsg = error?.message || String(error);
           const userErrorMsg = toModelOriginUserMessage(rawErrorMsg).trim() || rawErrorMsg;
-          this.markProtocolNack(taskId, userErrorMsg);
+          this.protocolManager.markNack(taskId, userErrorMsg);
           if (isModelOriginIssue(rawErrorMsg) || isModelOriginIssue(userErrorMsg)) {
             trackModelOriginEvent('surfaced', 'dispatch:worker-failed', rawErrorMsg, {
               worker: effectiveWorker,
@@ -1571,11 +1940,12 @@ export class DispatchManager {
                 }),
                 'warning',
               );
-              this.emitSubTaskCard({
+              this.presentationAdapter.emitSubTaskCard({
                 id: taskId,
                 title: taskTitle,
                 status: 'running',
                 worker: effectiveWorker,
+                ...(subTaskRequestId ? { requestId: subTaskRequestId } : {}),
               });
               logger.warn('Dispatch.Worker.运行中自动改派', {
                 taskId,
@@ -1599,18 +1969,29 @@ export class DispatchManager {
           }
           if (shouldUpdateCard) {
             batch?.markFailed(taskId, { success: false, summary: userErrorMsg, errors: [userErrorMsg] });
-            this.emitSubTaskCard({
+            this.presentationAdapter.emitSubTaskCard({
               id: taskId,
               title: taskTitle,
               status: 'failed',
               worker: effectiveWorker,
               summary: userErrorMsg,
               error: userErrorMsg,
+              ...(subTaskRequestId ? { requestId: subTaskRequestId } : {}),
             });
 
             this.deps.messageHub.workerError(
               effectiveWorker,
               userErrorMsg,
+              {
+                metadata: {
+                  assignmentId: taskId,
+                  missionId,
+                  worker: effectiveWorker,
+                  ...(assignment.trace?.sessionId ? { sessionId: assignment.trace.sessionId } : {}),
+                  ...(assignment.trace?.turnId ? { turnId: assignment.trace.turnId } : {}),
+                  ...(subTaskRequestId ? { requestId: subTaskRequestId } : {}),
+                },
+              },
             );
           }
 
@@ -1637,6 +2018,7 @@ export class DispatchManager {
         ? (result.verification.warnings.length > 0 ? result.verification.warnings : [t('dispatch.verification.degradedFallbackWarning')])
         : [];
       const summary = result.summary;
+      const fullSummary = result.fullSummary;
       const modifiedFiles = [...new Set([
         ...result.completedTodos.flatMap(t => t.output?.modifiedFiles || []),
         ...result.failedTodos.flatMap(t => t.output?.modifiedFiles || []),
@@ -1649,19 +2031,22 @@ export class DispatchManager {
         );
       }
 
-      const entry = batch?.getEntry(taskId);
-      const shouldUpdateCard = !entry || !isTerminalStatus(entry.status);
-      if (!shouldUpdateCard && entry) {
+      const currentBatchEntry = batch?.getEntry(taskId);
+      const shouldUpdateCard = !currentBatchEntry || !isTerminalStatus(currentBatchEntry.status);
+      if (!shouldUpdateCard && currentBatchEntry) {
         logger.warn('Dispatch.Worker.终态已存在_跳过卡片更新', {
           taskId,
           worker: effectiveWorker,
-          status: entry.status,
+          status: currentBatchEntry.status,
         }, LogCategory.ORCHESTRATOR);
       }
 
       // 更新 DispatchBatch 状态（含 tokenUsage 传递，供 archive 日志统计）
       const dispatchResult: DispatchResult = {
-        success: result.success, summary, modifiedFiles,
+        success: result.success,
+        summary,
+        ...(fullSummary ? { fullSummary } : {}),
+        modifiedFiles,
         quality: {
           verificationDegraded: result.verification.degraded,
           warnings: verificationWarnings,
@@ -1684,15 +2069,17 @@ export class DispatchManager {
           ? updatedEntry.completedAt - updatedEntry.startedAt
           : undefined;
 
-        this.emitSubTaskCard({
+        this.presentationAdapter.emitSubTaskCard({
           id: taskId,
           title: taskTitle,
           status: result.success ? 'completed' : 'failed',
           worker: effectiveWorker,
           summary,
+          ...(fullSummary ? { fullSummary } : {}),
           modifiedFiles,
           ...(durationMs !== undefined ? { duration: durationMs } : {}),
           ...(!result.success && { error: result.errors?.[0] || summary }),
+          ...(subTaskRequestId ? { requestId: subTaskRequestId } : {}),
         });
       }
 
@@ -1708,7 +2095,7 @@ export class DispatchManager {
       for (const reservedWorker of reservedFailoverWorkers) {
         this.activeWorkerLanes.delete(reservedWorker);
       }
-      this.clearProtocolState(taskId);
+      this.protocolManager.clear(taskId);
     }
   }
 
@@ -1744,16 +2131,6 @@ export class DispatchManager {
     }
   }
 
-  private getNextReadyTaskForWorker(batch: DispatchBatch, worker: WorkerSlot): DispatchEntry | null {
-    const ready = batch.getReadyTasks();
-    for (const entry of ready) {
-      if (entry.worker === worker) {
-        return entry;
-      }
-    }
-    return null;
-  }
-
   private resolveWorkerLaneResidentTimeoutMs(): number {
     const raw = Number(process.env.MAGI_WORKER_LANE_RESIDENT_TIMEOUT_MS);
     if (!Number.isFinite(raw) || raw < 0) {
@@ -1768,424 +2145,6 @@ export class DispatchManager {
       return DispatchManager.DEFAULT_WORKER_LANE_RESIDENT_POLL_INTERVAL_MS;
     }
     return Math.max(100, Math.min(5_000, Math.floor(raw)));
-  }
-
-  private async waitForReadyTaskWhileResident(
-    batch: DispatchBatch,
-    worker: WorkerSlot,
-    residentDeadlineAt: number,
-  ): Promise<boolean> {
-    const pollIntervalMs = this.resolveWorkerLaneResidentPollIntervalMs();
-    while (batch.status === 'active') {
-      if (this.getNextReadyTaskForWorker(batch, worker)) {
-        return true;
-      }
-      const remainingMs = residentDeadlineAt - Date.now();
-      if (remainingMs <= 0) {
-        return false;
-      }
-      await new Promise((resolve) => setTimeout(resolve, Math.min(pollIntervalMs, remainingMs)));
-    }
-    return false;
-  }
-
-  /**
-   * 合并同一 Batch 的连续调度触发，减少 Worker 指令卡片短时间抖动。
-   */
-  private scheduleDispatchReadyTasks(
-    batch: DispatchBatch,
-    options?: { immediate?: boolean; reason?: string },
-  ): void {
-    if (batch.status !== 'active') {
-      return;
-    }
-
-    const existing = this.dispatchScheduleTimers.get(batch.id);
-    if (existing) {
-      clearTimeout(existing);
-      this.dispatchScheduleTimers.delete(batch.id);
-    }
-
-    const delay = options?.immediate ? 0 : DispatchManager.DISPATCH_COALESCE_MS;
-    const timer = setTimeout(() => {
-      this.dispatchScheduleTimers.delete(batch.id);
-      if (batch.status !== 'active') {
-        return;
-      }
-      this.dispatchReadyTasksWithIsolation(batch);
-    }, delay);
-
-    this.dispatchScheduleTimers.set(batch.id, timer);
-  }
-
-  private clearDispatchScheduleTimers(batchId?: string): void {
-    if (batchId) {
-      const timer = this.dispatchScheduleTimers.get(batchId);
-      if (timer) {
-        clearTimeout(timer);
-        this.dispatchScheduleTimers.delete(batchId);
-      }
-      return;
-    }
-
-    for (const timer of this.dispatchScheduleTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.dispatchScheduleTimers.clear();
-  }
-
-  private emitWorkerLaneInstructionCard(
-    entry: DispatchEntry,
-    worker: WorkerSlot,
-    batch: DispatchBatch | null,
-    preferredTaskId?: string,
-  ): void {
-    if (!batch) {
-      this.deps.messageHub.workerInstruction(worker, entry.taskContract.taskTitle, {
-        assignmentId: entry.taskId,
-        requestId: entry.requestId,
-      });
-      return;
-    }
-
-    const laneEntries = this.getWorkerLaneEntries(batch, worker);
-    const laneTaskIds = laneEntries.map(item => item.taskId);
-    const focusTaskId = this.resolveWorkerLaneFocusTaskId(laneEntries, preferredTaskId || entry.taskId);
-    const focusEntry = laneEntries.find(item => item.taskId === focusTaskId) || entry;
-    const currentLaneIndex = laneTaskIds.indexOf(focusTaskId);
-    const laneTotal = Math.max(1, laneEntries.length);
-    const laneIndex = currentLaneIndex >= 0 ? currentLaneIndex + 1 : laneTotal;
-    const laneCardId = this.getWorkerLaneInstructionCardId(batch.id, worker);
-    const laneId = `${batch.id}:${worker}`;
-
-    this.deps.messageHub.workerInstruction(
-      worker,
-      this.buildWorkerLaneInstructionContent(laneEntries, focusTaskId),
-      {
-        assignmentId: focusEntry.taskId,
-        missionId: batch.id,
-        requestId: batch.requestId,
-        laneId,
-        laneCardId,
-        laneIndex,
-        laneTotal,
-        laneTaskIds,
-        laneCurrentTaskId: focusTaskId,
-        laneTasks: laneEntries.map(item => ({
-          taskId: item.taskId,
-          title: item.taskContract.taskTitle,
-          status: item.status,
-          dependsOn: item.taskContract.dependsOn,
-          isCurrent: item.taskId === focusTaskId,
-        })),
-      },
-    );
-  }
-
-  private resolveWorkerLaneFocusTaskId(entries: DispatchEntry[], preferredTaskId?: string): string {
-    const runningEntry = entries.find(item => item.status === 'running');
-    if (runningEntry) {
-      return runningEntry.taskId;
-    }
-
-    if (preferredTaskId && entries.some(item => item.taskId === preferredTaskId)) {
-      return preferredTaskId;
-    }
-
-    const nextPendingEntry = entries.find(item => item.status === 'pending' || item.status === 'waiting_deps');
-    if (nextPendingEntry) {
-      return nextPendingEntry.taskId;
-    }
-
-    return entries[entries.length - 1]?.taskId || preferredTaskId || '';
-  }
-
-  private getWorkerLaneEntries(batch: DispatchBatch, worker: WorkerSlot): DispatchEntry[] {
-    return batch
-      .getEntries()
-      .filter(entry => entry.worker === worker)
-      .sort((a, b) => a.createdAt - b.createdAt);
-  }
-
-  private getWorkerLaneInstructionCardId(batchId: string, worker: WorkerSlot): string {
-    return `worker-lane-instruction-${batchId}-${worker}`;
-  }
-
-  private mapDispatchStatusToInitialCardStatus(status: DispatchStatus): 'pending' | 'running' | 'completed' | 'failed' | 'stopped' | 'skipped' {
-    switch (status) {
-      case 'waiting_deps':
-        return 'pending';
-      case 'completed':
-        return 'completed';
-      case 'failed':
-        return 'failed';
-      case 'skipped':
-        return 'skipped';
-      case 'cancelled':
-        return 'stopped';
-      case 'running':
-      case 'pending':
-      default:
-        return 'running';
-    }
-  }
-
-  private buildWorkerLaneInstructionContent(entries: DispatchEntry[], currentTaskId: string): string {
-    const current = entries.find(entry => entry.taskId === currentTaskId);
-    const currentIndex = entries.findIndex(entry => entry.taskId === currentTaskId);
-    const laneIndex = currentIndex >= 0 ? currentIndex + 1 : Math.max(entries.length, 1);
-    const laneTotal = Math.max(entries.length, 1);
-    const list = entries.length > 0 ? entries.map(item => ({
-      taskId: item.taskId,
-      taskTitle: item.taskContract.taskTitle,
-      status: item.status,
-      dependsOn: item.taskContract.dependsOn,
-    })) : [{
-      taskId: currentTaskId,
-      taskTitle: current?.taskContract.taskTitle || t('dispatch.lane.unknownTask'),
-      status: 'running' as const,
-      dependsOn: [] as string[],
-    }];
-
-    const lines = [
-      t('dispatch.lane.header'),
-      t('dispatch.lane.currentTask', { task: current?.taskContract.taskTitle || t('dispatch.lane.unknownTask') }),
-      t('dispatch.lane.progress', { laneIndex, laneTotal }),
-      t('dispatch.lane.description'),
-      '',
-      t('dispatch.lane.taskList'),
-      ...list.map((item, index) => {
-        const dependsText = item.dependsOn.length > 0
-          ? t('dispatch.lane.dependsOn', { dependsOn: item.dependsOn.join(', ') })
-          : '';
-        return `${index + 1}. [${this.getWorkerLaneTaskStatusLabel(item.status)}] ${item.taskTitle}${dependsText}`;
-      }),
-    ];
-
-    return lines.join('\n');
-  }
-
-  private getWorkerLaneTaskStatusLabel(status: DispatchStatus): string {
-    switch (status) {
-      case 'completed':
-        return t('dispatch.lane.status.completed');
-      case 'failed':
-        return t('dispatch.lane.status.failed');
-      case 'skipped':
-        return t('dispatch.lane.status.skipped');
-      case 'cancelled':
-        return t('dispatch.lane.status.cancelled');
-      case 'waiting_deps':
-        return t('dispatch.lane.status.waitingDeps');
-      case 'running':
-        return t('dispatch.lane.status.running');
-      case 'pending':
-      default:
-        return t('dispatch.lane.status.pending');
-    }
-  }
-
-  private launchWorkerLane(batch: DispatchBatch, worker: WorkerSlot): void {
-    if (this.activeWorkerLanes.has(worker)) {
-      return;
-    }
-
-    const residentTimeoutMs = this.resolveWorkerLaneResidentTimeoutMs();
-    this.activeWorkerLanes.add(worker);
-    logger.info('DispatchBatch.WorkerLane.启动', {
-      batchId: batch.id,
-      worker,
-      residentTimeoutMs,
-    }, LogCategory.ORCHESTRATOR);
-
-    void (async () => {
-      let executedCount = 0;
-      let idlePollRounds = 0;
-      let residentDeadlineAt = Date.now() + residentTimeoutMs;
-      try {
-        while (batch.status === 'active') {
-          const nextEntry = this.getNextReadyTaskForWorker(batch, worker);
-          if (nextEntry) {
-            executedCount += 1;
-            residentDeadlineAt = Date.now() + residentTimeoutMs;
-            await this.executeDispatchEntry(nextEntry, { emitWorkerInstruction: true });
-            continue;
-          }
-          if (residentTimeoutMs <= 0) {
-            break;
-          }
-          const keepResident = await this.waitForReadyTaskWhileResident(batch, worker, residentDeadlineAt);
-          if (!keepResident) {
-            break;
-          }
-          idlePollRounds += 1;
-        }
-      } finally {
-        this.activeWorkerLanes.delete(worker);
-        logger.info('DispatchBatch.WorkerLane.结束', {
-          batchId: batch.id,
-          worker,
-          executedCount,
-          idlePollRounds,
-          residentTimeoutMs,
-          batchStatus: batch.status,
-        }, LogCategory.ORCHESTRATOR);
-
-        if (batch.status === 'active') {
-          this.scheduleDispatchReadyTasks(batch, { immediate: true, reason: 'lane-finished' });
-        }
-      }
-    })();
-  }
-
-  /**
-   * 配置 DispatchBatch 事件处理
-   */
-  private setupBatchEventHandlers(batch: DispatchBatch): void {
-    // 依赖就绪 → 通过隔离策略筛选后启动 Worker
-    batch.on('task:ready', (taskId: string, entry: DispatchEntry) => {
-      this.emitWorkerLaneInstructionCard(entry, entry.worker, batch, taskId);
-      this.scheduleDispatchReadyTasks(batch, { reason: 'task-ready' });
-    });
-
-    // Worker 完成后重新检查是否有同类型排队任务可启动
-    batch.on('task:statusChanged', (_taskId: string, status: DispatchStatus) => {
-      const entry = batch.getEntry(_taskId);
-      if (entry) {
-        this.emitWorkerLaneInstructionCard(entry, entry.worker, batch, _taskId);
-      }
-      if (isTerminalStatus(status)) {
-        this.clearProtocolState(_taskId);
-        const mappedStatus = status === 'completed'
-          ? 'completed'
-          : status === 'failed'
-            ? 'failed'
-            : 'cancelled';
-        this.dispatchIdempotencyStore.updateStatusByTaskId(_taskId, mappedStatus);
-        this.scheduleDispatchReadyTasks(batch, { reason: 'task-terminal' });
-
-        // 反应式编排：将完成结果推入队列，唤醒 waitForWorkers
-        const entry = batch.getEntry(_taskId);
-        if (entry) {
-          this.completionQueue.push(entry);
-        }
-      }
-    });
-
-    // 全部完成 → 根据编排模式决定后续行为
-    batch.on('batch:allCompleted', (batchId: string, entries: DispatchEntry[]) => {
-      const summary = batch.getSummary();
-      logger.info('DispatchBatch.全部完成', { batchId, ...summary, reactiveMode: this.reactiveMode }, LogCategory.ORCHESTRATOR);
-      const auditOutcome = this.ensureBatchAuditOutcome(batch, entries);
-
-      if (this.reactiveMode) {
-        // 反应式模式：编排者通过 worker_wait 接收结果并自行汇总
-        // 标记等待主对话区最终汇总，直接归档，不触发 Phase C 汇总 LLM
-        this.reactiveBatchAwaitingSummary.add(batchId);
-        if (auditOutcome.level === 'intervention') {
-          const blockedReport = this.buildInterventionReport(auditOutcome, entries);
-          this.deps.messageHub.notify(t('dispatch.audit.reactiveInterventionBlocked'), 'error');
-          this.deps.messageHub.orchestratorMessage(blockedReport, { type: MessageType.RESULT });
-          logger.warn('Reactive Phase 审计阻断交付', {
-            batchId,
-            auditOutcome,
-          }, LogCategory.ORCHESTRATOR);
-        }
-        batch.archive();
-      } else {
-        this.reactiveBatchAwaitingSummary.delete(batchId);
-        // 传统模式：自动触发 Phase C 汇总
-        void this.triggerPhaseCSummary(batch, entries, auditOutcome);
-      }
-    });
-
-    // Batch 被取消 → 不触发 Phase C，直接通知用户
-    batch.on('batch:cancelled', (batchId: string, reason: string) => {
-      this.reactiveBatchAwaitingSummary.delete(batchId);
-      this.phaseBPlusTimestamps.delete(batchId);
-      this.clearProtocolStatesByBatch(batchId);
-      this.activeWorkerLanes.clear();
-      this.clearDispatchScheduleTimers(batchId);
-      logger.info('DispatchBatch.已取消', { batchId, reason }, LogCategory.ORCHESTRATOR);
-      this.deps.messageHub.orchestratorMessage(t('dispatch.notify.taskCancelledWithReason', { reason }));
-    });
-
-    batch.on('phase:changed', (_batchId: string, phase) => {
-      if (phase === 'archived') {
-        this.phaseBPlusTimestamps.delete(batch.id);
-        this.clearProtocolStatesByBatch(batch.id);
-        this.activeWorkerLanes.clear();
-        this.clearDispatchScheduleTimers(batch.id);
-        this.clearResumeContext();
-      }
-    });
-  }
-
-  /**
-   * 通过 Worker 隔离策略调度就绪任务
-   */
-  private dispatchReadyTasksWithIsolation(batch: DispatchBatch): void {
-    if (batch.status !== 'active') {
-      return;
-    }
-
-    const readyTasks = batch.getReadyTasks();
-    if (readyTasks.length === 0) {
-      return;
-    }
-
-    const busyWorkers = new Set<WorkerSlot>(this.activeWorkerLanes);
-    const selectedWorkers = new Set<WorkerSlot>();
-
-    for (const entry of readyTasks) {
-      const routing = this.resolveExecutionWorker(entry.worker, {
-        busyWorkers,
-        excludedWorkers: selectedWorkers,
-        allowBusyFallback: true,
-      });
-      if (!routing.ok) {
-        logger.debug('Dispatch.WorkerLane.就绪任务暂不可执行', {
-          batchId: batch.id,
-          taskId: entry.taskId,
-          worker: entry.worker,
-          reason: routing.error,
-        }, LogCategory.ORCHESTRATOR);
-        continue;
-      }
-
-      const selectedWorker = routing.selectedWorker;
-      if (busyWorkers.has(selectedWorker) || selectedWorkers.has(selectedWorker)) {
-        continue;
-      }
-
-      if (selectedWorker !== entry.worker) {
-        const previousWorker = entry.worker;
-        entry.worker = selectedWorker;
-        this.deps.messageHub.notify(
-          t('dispatch.notify.schedulingRoutingAdjusted', {
-            taskId: entry.taskId,
-            fromWorker: previousWorker,
-            toWorker: selectedWorker,
-            routingReason: routing.routingReason,
-          }),
-          'warning',
-        );
-        logger.warn('Dispatch.WorkerLane.忙碌改派', {
-          batchId: batch.id,
-          taskId: entry.taskId,
-          from: previousWorker,
-          to: selectedWorker,
-          reason: routing.routingReason,
-        }, LogCategory.ORCHESTRATOR);
-      }
-
-      selectedWorkers.add(selectedWorker);
-      busyWorkers.add(selectedWorker);
-    }
-
-    for (const worker of selectedWorkers) {
-      this.launchWorkerLane(batch, worker);
-    }
   }
 
   /**
@@ -2220,6 +2179,7 @@ export class DispatchManager {
       }
 
       const summaryPrompt = `${buildDispatchSummaryPrompt(userPrompt, entries)}\n\n${this.buildAuditPromptAppendix(finalAuditOutcome)}`;
+      const planningMode = this.resolveCurrentPlanningMode();
 
       const PHASE_C_TIMEOUT = 2 * 60 * 1000; // 2 分钟
       const response = await raceWithTimeout(
@@ -2228,9 +2188,11 @@ export class DispatchManager {
           summaryPrompt,
           undefined,
           {
+            planningMode,
             source: 'orchestrator',
             adapterRole: 'orchestrator',
             visibility: 'system',
+            messageMetadata: { sessionId: this.deps.getCurrentSessionId() },
           }
         ),
         PHASE_C_TIMEOUT,
@@ -2269,14 +2231,14 @@ export class DispatchManager {
    * 判断指定 Batch 是否处于“反应式模式且等待最终汇总”状态
    */
   isReactiveBatchAwaitingSummary(batchId: string): boolean {
-    return this.reactiveBatchAwaitingSummary.has(batchId);
+    return this.reactiveWaitCoordinator.isBatchAwaitingSummary(batchId);
   }
 
   /**
    * 标记反应式 Batch 已完成最终汇总
    */
   markReactiveBatchSummarized(batchId: string): void {
-    this.reactiveBatchAwaitingSummary.delete(batchId);
+    this.reactiveWaitCoordinator.markBatchSummarized(batchId);
   }
 
   /**
@@ -2285,50 +2247,7 @@ export class DispatchManager {
    * 用于编排者未输出最终结论时，保证主对话区仍有可读结论。
    */
   buildReactiveBatchFallbackSummary(batch: DispatchBatch): string {
-    const entries = batch.getEntries();
-    const summary = batch.getSummary();
-    const modifiedFiles = Array.from(new Set(entries.flatMap(e => e.result?.modifiedFiles || [])));
-
-    const statusLabel = (status: DispatchStatus): string => {
-      switch (status) {
-        case 'completed': return t('dispatch.reactiveSummary.status.completed');
-        case 'failed': return t('dispatch.reactiveSummary.status.failed');
-        case 'skipped': return t('dispatch.reactiveSummary.status.skipped');
-        case 'cancelled': return t('dispatch.reactiveSummary.status.cancelled');
-        case 'running': return t('dispatch.reactiveSummary.status.running');
-        case 'pending':
-        case 'waiting_deps':
-          return t('dispatch.reactiveSummary.status.waiting');
-        default:
-          return status;
-      }
-    };
-
-    const taskLines = entries.map((entry, index) =>
-      t('dispatch.reactiveSummary.taskLine', {
-        index: index + 1,
-        worker: entry.worker,
-        task: entry.taskContract.taskTitle,
-        status: statusLabel(entry.status),
-        summary: entry.result?.summary || t('dispatch.reactiveSummary.noResultSummary'),
-      })
-    );
-
-    const lines = [
-      t('dispatch.reactiveSummary.header', {
-        total: summary.total,
-        completed: summary.completed,
-        failed: summary.failed,
-        skipped: summary.skipped,
-        cancelled: summary.cancelled,
-      }),
-      ...taskLines,
-      modifiedFiles.length > 0
-        ? t('dispatch.reactiveSummary.modifiedFiles', { files: modifiedFiles.join('，') })
-        : t('dispatch.reactiveSummary.modifiedFilesNone'),
-    ];
-
-    return lines.join('\n');
+    return this.reactiveWaitCoordinator.buildFallbackSummary(batch);
   }
 
   /**
@@ -2364,13 +2283,13 @@ export class DispatchManager {
         }, LogCategory.ORCHESTRATOR);
         return defaultResponse;
       }
-      this.emitSubTaskCard({
+      this.presentationAdapter.emitSubTaskCard({
         id: report.assignmentId,
         title: report.progress.currentStep || '',
         status: 'running',
         worker: report.workerId,
         summary: `${report.progress.percentage}% - ${report.progress.currentStep}`,
-        requestId: batch?.requestId,
+        requestId: entry.requestId || batch?.requestId,
       });
       return defaultResponse;
     }
@@ -2401,16 +2320,19 @@ export class DispatchManager {
           batchStatus: JSON.stringify(batchStatus),
           userPrompt: this.deps.getActiveUserPrompt(),
         });
+        const planningMode = this.resolveCurrentPlanningMode();
 
         const response = await this.deps.adapterFactory.sendMessage(
           'orchestrator',
           prompt,
           undefined,
           {
+            planningMode,
             source: 'orchestrator',
             adapterRole: 'orchestrator',
             includeToolCalls: true,
             visibility: 'system',
+            messageMetadata: { sessionId: this.deps.getCurrentSessionId() },
           }
         );
 
@@ -2480,204 +2402,36 @@ export class DispatchManager {
    * 挂起直到 Worker 完成结果到达，然后基于结果决策下一步。
    */
   async waitForWorkers(taskIds?: string[]): Promise<WaitForWorkersResult> {
-    this.reactiveMode = true;
-    const batch = this.activeBatch;
-    if (!batch) {
-      return {
-        results: [],
-        wait_status: 'completed',
-        timed_out: false,
-        pending_task_ids: [],
-        waited_ms: 0,
-      };
-    }
-
-    const waitResult = await this.completionQueue.waitFor(batch, taskIds, {
-      idleTimeoutMs: this.getIdleTimeoutMs(),
-      wakeupTimeoutMs: 30_000,
-      onTimeout: (pendingTaskIds, elapsedMs) => {
-        this.deps.messageHub.notify(
-          t('dispatch.waitForWorkers.timeout', {
-            seconds: Math.round(elapsedMs / 1000),
-            pendingCount: pendingTaskIds.length,
-          }),
-          'warning',
-        );
-      },
-    });
-
-    // 全量完成时回传程序化审计结果，供编排者在反应式模式下据此决策
-    if (!waitResult.timed_out && waitResult.pending_task_ids.length === 0) {
-      const auditOutcome = batch.getAuditOutcome();
-      if (auditOutcome) {
-        return {
-          ...waitResult,
-          audit: {
-            level: auditOutcome.level,
-            summary: auditOutcome.summary,
-            issues: auditOutcome.issues.map(issue => ({
-              task_id: issue.taskId,
-              level: issue.level,
-              dimension: issue.dimension,
-              detail: issue.detail,
-            })),
-          },
-        };
-      }
-    }
-
-    return waitResult;
+    return this.reactiveWaitCoordinator.waitForWorkers(this.activeBatch, taskIds);
   }
 
   getIdleTimeoutMs(): number {
-    return this.deps.adapterFactory.isDeepTask()
+    return this.resolveCurrentPlanningMode() === 'deep'
       ? DispatchManager.DEEP_IDLE_TIMEOUT_MS
       : DispatchManager.STANDARD_IDLE_TIMEOUT_MS;
   }
 
-  private startLeaseWatcher(): void {
-    if (this.leaseWatcherTimer) {
-      return;
-    }
-    this.leaseWatcherTimer = setInterval(() => {
-      this.checkProtocolLeases();
-    }, DispatchManager.LEASE_WATCH_INTERVAL_MS);
-  }
-
-  private stopLeaseWatcher(): void {
-    if (!this.leaseWatcherTimer) {
-      return;
-    }
-    clearInterval(this.leaseWatcherTimer);
-    this.leaseWatcherTimer = undefined;
-  }
-
-  private registerProtocolState(
-    taskId: string,
-    batchId: string | undefined,
-    worker: WorkerSlot,
-  ): DispatchExecutionProtocolState {
-    const now = Date.now();
-    const dispatchAttemptId = `dispatch-attempt-${taskId}-${now}-${Math.random().toString(36).slice(2, 8)}`;
-    const state: DispatchExecutionProtocolState = {
-      taskId,
-      batchId: batchId || 'unknown-batch',
-      worker,
-      dispatchAttemptId,
-      idempotencyKey: dispatchAttemptId,
-      leaseId: `lease-${taskId}-${now}-${Math.random().toString(36).slice(2, 8)}`,
-      leaseExpireAt: now + DispatchManager.LEASE_TTL_MS,
-      heartbeatAt: now,
-      ackState: 'pending',
-      createdAt: now,
-      timeoutTriggered: false,
-    };
-    this.executionProtocolStates.set(taskId, state);
-    return state;
-  }
-
-  private markProtocolAck(taskId: string, workerId?: WorkerSlot): void {
-    const normalizedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
-    if (!normalizedTaskId) {
-      return;
-    }
-    const state = this.executionProtocolStates.get(normalizedTaskId);
-    if (!state) {
-      return;
-    }
-    if (workerId && state.worker !== workerId) {
-      logger.warn('Dispatch.Protocol.ACK.Worker不一致', {
-        taskId: normalizedTaskId,
-        expectedWorker: state.worker,
-        actualWorker: workerId,
-      }, LogCategory.ORCHESTRATOR);
-    }
-    const now = Date.now();
-    state.ackState = 'acked';
-    state.ackAt = now;
-    state.heartbeatAt = now;
-    state.leaseExpireAt = now + DispatchManager.LEASE_TTL_MS;
-  }
-
-  private markProtocolNack(taskId: string, reason: string): void {
-    const normalizedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
-    if (!normalizedTaskId) {
-      return;
-    }
-    const state = this.executionProtocolStates.get(normalizedTaskId);
-    if (!state) {
-      return;
-    }
-    state.ackState = 'nacked';
-    state.nackReason = reason;
-    state.leaseExpireAt = Date.now();
-  }
-
-  private updateProtocolHeartbeat(taskId: string, workerId: WorkerSlot, timestamp: number): void {
-    const normalizedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
-    if (!normalizedTaskId) {
-      return;
-    }
-    const state = this.executionProtocolStates.get(normalizedTaskId);
-    if (!state) {
-      return;
-    }
-    const hbAt = Number.isFinite(timestamp) ? Math.floor(timestamp) : Date.now();
-    if (state.worker !== workerId) {
-      logger.warn('Dispatch.Protocol.Heartbeat.Worker不一致', {
-        taskId: normalizedTaskId,
-        expectedWorker: state.worker,
-        actualWorker: workerId,
-      }, LogCategory.ORCHESTRATOR);
-      return;
-    }
-    if (state.ackState === 'pending') {
-      state.ackState = 'acked';
-      state.ackAt = hbAt;
-    }
-    state.heartbeatAt = hbAt;
-    state.leaseExpireAt = hbAt + DispatchManager.LEASE_TTL_MS;
-    if (this.activeBatch?.id === state.batchId) {
-      this.activeBatch.touchActivity();
-    }
-  }
-
-  private checkProtocolLeases(): void {
-    if (this.executionProtocolStates.size === 0) {
-      return;
-    }
-    const now = Date.now();
-    for (const state of this.executionProtocolStates.values()) {
-      if (state.timeoutTriggered) {
-        continue;
+  private resolveCurrentPlanningMode(): PlanMode {
+    const sessionId = this.deps.getCurrentSessionId()?.trim();
+    const planId = this.deps.getCurrentPlanId();
+    const planLedger = this.deps.getPlanLedger();
+    if (sessionId && planId && planLedger) {
+      const currentPlan = planLedger.getPlan(sessionId, planId);
+      if (currentPlan?.mode === 'deep') {
+        return 'deep';
       }
-      if (state.ackState === 'pending' && now - state.createdAt > DispatchManager.ACK_TIMEOUT_MS) {
-        this.failByProtocolTimeout(state, 'ack-timeout');
-        continue;
-      }
-      if (state.ackState === 'nacked') {
-        this.failByProtocolTimeout(state, `nack:${state.nackReason || 'unknown'}`);
-        continue;
-      }
-      if (state.ackState !== 'acked') {
-        continue;
-      }
-      if (state.leaseExpireAt <= now) {
-        this.failByProtocolTimeout(state, 'lease-expired');
+      if (currentPlan?.mode === 'standard') {
+        return 'standard';
       }
     }
+    return 'standard';
   }
 
-  private failByProtocolTimeout(state: DispatchExecutionProtocolState, reasonCode: string): void {
-    if (state.timeoutTriggered) {
-      return;
-    }
-    state.timeoutTriggered = true;
-
+  private handleDispatchProtocolTimeout(payload: DispatchProtocolTimeoutPayload): void {
+    const { state, reasonCode } = payload;
     const batch = this.activeBatch?.id === state.batchId ? this.activeBatch : null;
     const entry = batch?.getEntry(state.taskId);
     if (!batch || !entry || isTerminalStatus(entry.status)) {
-      this.clearProtocolState(state.taskId);
       return;
     }
 
@@ -2688,7 +2442,7 @@ export class DispatchManager {
       summary: timeoutMessage,
       errors: [`[${semantic.failureCode}] ${timeoutMessage}`],
     });
-    this.emitSubTaskCard({
+    this.presentationAdapter.emitSubTaskCard({
       id: state.taskId,
       title: entry.taskContract.taskTitle,
       status: 'failed',
@@ -2697,9 +2451,20 @@ export class DispatchManager {
       error: timeoutMessage,
       failureCode: semantic.failureCode,
       recoverable: semantic.recoverable,
+      requestId: entry.requestId || batch.requestId,
     });
     this.deps.messageHub.workerError(state.worker, timeoutMessage, {
       metadata: {
+        assignmentId: state.taskId,
+        missionId: entry.trace?.missionId || batch.trace?.missionId,
+        worker: state.worker,
+        ...(entry.trace?.sessionId || batch.trace?.sessionId
+          ? { sessionId: entry.trace?.sessionId || batch.trace?.sessionId }
+          : {}),
+        ...(entry.trace?.turnId || batch.trace?.turnId
+          ? { turnId: entry.trace?.turnId || batch.trace?.turnId }
+          : {}),
+        ...(entry.requestId || batch.requestId ? { requestId: entry.requestId || batch.requestId } : {}),
         reason: semantic.failureCode,
         recoverable: semantic.recoverable,
         extra: {
@@ -2725,27 +2490,6 @@ export class DispatchManager {
       dispatchAttemptId: state.dispatchAttemptId,
       leaseId: state.leaseId,
     }, LogCategory.ORCHESTRATOR);
-    this.clearProtocolState(state.taskId);
-  }
-
-  private clearProtocolState(taskId: string): void {
-    const normalizedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
-    if (!normalizedTaskId) {
-      return;
-    }
-    this.executionProtocolStates.delete(normalizedTaskId);
-  }
-
-  private clearProtocolStatesByBatch(batchId: string): void {
-    for (const [taskId, state] of this.executionProtocolStates.entries()) {
-      if (state.batchId === batchId) {
-        this.executionProtocolStates.delete(taskId);
-      }
-    }
-  }
-
-  private clearAllProtocolStates(): void {
-    this.executionProtocolStates.clear();
   }
 
   private reportIdempotencyDeploymentDiagnostic(): void {
@@ -2815,6 +2559,14 @@ export class DispatchManager {
       t('dispatch.delegation.constraints', { constraints: constraints.map(item => `- ${item}`).join('\n') }),
       t('dispatch.delegation.context', { context: taskContract.context.map(item => `- ${item}`).join('\n') }),
     ];
+
+    if (taskContract.declaredCategory && taskContract.declaredCategory !== taskContract.category) {
+      lines.unshift([
+        '## Routing Semantics',
+        `- Ownership routing category: ${taskContract.category}`,
+        `- Declared task style/category: ${taskContract.declaredCategory}`,
+      ].join('\n'));
+    }
 
     if (predecessorContext) {
       lines.push(predecessorContext);
@@ -3021,6 +2773,13 @@ export class DispatchManager {
     return preview.join(', ');
   }
 
+  private hasActiveFeatureDomainEntriesInBatch(batch: DispatchBatch): boolean {
+    return batch.getEntries().some((entry) =>
+      !isTerminalStatus(entry.status)
+      && CURRENT_PHASE_FEATURE_CATEGORIES.has(entry.taskContract.category),
+    );
+  }
+
   private shouldWarnMissingScopeHintForParallelTask(batch: DispatchBatch, dependsOn?: string[]): boolean {
     const dependencySet = new Set(dependsOn || []);
     return batch.getEntries().some(entry =>
@@ -3179,6 +2938,7 @@ export class DispatchManager {
   private buildDispatchTaskContract(input: {
     taskTitle: string;
     category: string;
+    declaredCategory?: string;
     goal: string;
     acceptance: string[];
     constraints: string[];
@@ -3195,9 +2955,16 @@ export class DispatchManager {
       analysis: input.taskTitle,
       constraints: input.constraints.length > 0 ? [...input.constraints] : undefined,
       acceptanceCriteria: input.acceptance.length > 0 ? [...input.acceptance] : undefined,
-      needsWorker: true,
-      categories: [input.category],
-      needsTooling: true,
+      categories: Array.from(new Set([
+        input.category,
+        ...(typeof input.declaredCategory === 'string' && input.declaredCategory.trim()
+          ? [input.declaredCategory.trim()]
+          : []),
+      ])),
+      entryPath: 'task_execution',
+      includeThinking: true,
+      includeToolCalls: true,
+      historyMode: 'session',
       requiresModification: input.requiresModification,
       reason: input.routingReason.trim() || `worker_dispatch 分类为 ${input.category}`,
     };
@@ -3205,6 +2972,9 @@ export class DispatchManager {
     return {
       taskTitle: input.taskTitle,
       category: input.category,
+      ...(typeof input.declaredCategory === 'string' && input.declaredCategory.trim()
+        ? { declaredCategory: input.declaredCategory.trim() }
+        : {}),
       requirementAnalysis,
       context: [...input.context],
       scopeHint: input.scopeHint ? [...input.scopeHint] : [],
@@ -3485,6 +3255,9 @@ export class DispatchManager {
 
     const payload = {
       category: taskContract.category,
+      declaredCategory: typeof taskContract.declaredCategory === 'string'
+        ? taskContract.declaredCategory.trim()
+        : '',
       taskTitle: taskContract.taskTitle.trim(),
       goal: requirementAnalysis.goal.trim(),
       analysis: requirementAnalysis.analysis.trim(),
@@ -3535,17 +3308,14 @@ export class DispatchManager {
   dispose(): void {
     this.activeBatch = null;
     this._planningExecutor = null;
-    this.completionQueue.reset();
-    this.reactiveMode = false;
-    this.reactiveBatchAwaitingSummary.clear();
+    this.reactiveWaitCoordinator.dispose();
     this.nonGitWriteSerializationNoticeShown = false;
     this.resumeContextStore.dispose();
     this.routingService.clearAllRuntimeUnavailable();
     this.activeWorkerLanes.clear();
-    this.stopLeaseWatcher();
-    this.clearAllProtocolStates();
-    this.clearDispatchScheduleTimers();
+    this.protocolManager.dispose();
+    this.scheduler.dispose();
     // 释放所有未完成的 worktree（崩溃/中断恢复）
-    this.worktreeManager.releaseAll();
+    this.deps.gitHost.releaseAllWorktrees?.(this.deps.workspaceRoot);
   }
 }

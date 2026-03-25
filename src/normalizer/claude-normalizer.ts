@@ -183,6 +183,7 @@ export class ClaudeNormalizer extends BaseNormalizer {
       case 'content_block_delta':
         if (event.delta) {
           if (event.delta.type === 'text_delta' && event.delta.text) {
+            this.flushPendingThinkingToBlocks(context, 'claude.text_delta');
             context.pendingText += event.delta.text;
             context.hasAssistantText = true;
             updates.push(this.createUpdate(context.messageId, 'append', { appendText: event.delta.text }));
@@ -192,7 +193,7 @@ export class ClaudeNormalizer extends BaseNormalizer {
             }
             context.pendingThinking += event.delta.thinking;
             if (!context.thinkingBlockId) {
-              context.thinkingBlockId = `${context.messageId}-thinking`;
+              context.thinkingBlockId = this.allocateThinkingBlockId(context);
             }
             updates.push(this.createUpdate(context.messageId, 'block_update', {
               blocks: [{
@@ -212,8 +213,7 @@ export class ClaudeNormalizer extends BaseNormalizer {
       case 'content_block_stop':
         // 内容块结束
         if (this.currentBlockType === 'thinking' && context.pendingThinking) {
-          this.addThinkingBlock(context, context.pendingThinking, undefined, context.thinkingBlockId);
-          context.pendingThinking = null;
+          this.flushPendingThinkingToBlocks(context, 'claude.content_block_stop');
         }
         // 工具调用结束 - 使用累积的 JSON 更新工具输入
         if (this.currentBlockType === 'tool_use' && this.pendingToolInputJson) {
@@ -294,8 +294,7 @@ export class ClaudeNormalizer extends BaseNormalizer {
     
     // 处理剩余的思考内容
     if (context.pendingThinking) {
-      this.addThinkingBlock(context, context.pendingThinking);
-      context.pendingThinking = null;
+      this.flushPendingThinkingToBlocks(context, 'claude.finalizeContext');
     }
   }
 

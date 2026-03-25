@@ -25,6 +25,15 @@ export type AgentType = 'orchestrator' | WorkerSlot;
 export type LLMProvider = 'openai' | 'anthropic';
 
 /**
+ * 模型自治能力等级
+ * - C0: 仅支持 ask + standard
+ * - C1: 最高支持 ask + deep
+ * - C2: 最高支持 auto + standard
+ * - C3: 支持 auto + deep
+ */
+export type ModelAutonomyCapability = 'C0' | 'C1' | 'C2' | 'C3';
+
+/**
  * URL 路径模式
  * - standard: 使用官方/标准代理路径规则，由系统做 /v1 级别的适配
  * - full: 用户提供完整路径，系统不再追加或裁剪版本段
@@ -78,6 +87,11 @@ export interface LLMConfig {
    * - 'xhigh': 超高推理强度（适用于支持扩展档位的 OpenAI 兼容端点）
    */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
+  /**
+   * 模型自治能力（可选）
+   * - 未配置时由系统根据模型/推理强度做保守推断
+   */
+  autonomyCapability?: ModelAutonomyCapability;
 }
 
 /**

@@ -1,6 +1,4 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { initializeState } from './stores/messages.svelte';
   import Header from './components/Header.svelte';
   import TopTabs from './components/TopTabs.svelte';
   import ThreadPanel from './components/ThreadPanel.svelte';
@@ -9,7 +7,6 @@
   import KnowledgePanel from './components/KnowledgePanel.svelte';
   import SettingsPanel from './components/SettingsPanel.svelte';
   import ToastContainer from './components/ToastContainer.svelte';
-  import MarkdownContent from './components/MarkdownContent.svelte';
   import { vscode } from './lib/vscode-bridge';
   import { getState, setCurrentTopTab, setIsProcessing } from './stores/messages.svelte';
   import { i18n } from './stores/i18n.svelte';
@@ -33,21 +30,11 @@
   let clarificationAnswer = $state('');
   let workerQuestionAnswer = $state('');
 
-  const pendingConfirmation = $derived(appState.pendingConfirmation);
   const pendingRecovery = $derived(appState.pendingRecovery);
-  const pendingDeliveryRepair = $derived(appState.pendingDeliveryRepair);
   const pendingClarification = $derived(appState.pendingClarification);
   const pendingWorkerQuestion = $derived(appState.pendingWorkerQuestion);
   const pendingToolAuthorization = $derived(appState.pendingToolAuthorization);
   const interactionMode = $derived(appState.appState?.interactionMode || 'auto');
-  const deliveryRepairMaxRoundsLabel = $derived(
-    pendingDeliveryRepair && pendingDeliveryRepair.maxRounds > 0
-      ? pendingDeliveryRepair.maxRounds
-      : i18n.t('common.unlimited')
-  );
-  const isReplanFollowUpRequest = $derived(
-    pendingDeliveryRepair?.requestType === 'replan_followup'
-  );
 
   function handleTabChange(tab: TopTabType) {
     setCurrentTopTab(tab);
@@ -61,22 +48,10 @@
     settingsOpen = false;
   }
 
-  function confirmPlan(confirmed: boolean) {
-    vscode.postMessage({ type: 'confirmPlan', confirmed });
-    appState.pendingConfirmation = null;
-    if (confirmed) setIsProcessing(true);
-  }
-
   function confirmRecovery(decision: 'retry' | 'rollback' | 'continue') {
     vscode.postMessage({ type: 'confirmRecovery', decision });
     appState.pendingRecovery = null;
     setIsProcessing(true);
-  }
-
-  function confirmDeliveryRepair(decision: 'repair' | 'stop') {
-    vscode.postMessage({ type: 'confirmDeliveryRepair', decision });
-    appState.pendingDeliveryRepair = null;
-    if (decision === 'repair') setIsProcessing(true);
   }
 
   function submitClarification(cancelled = false) {
@@ -110,11 +85,6 @@
     if (allowed) setIsProcessing(true);
   }
 
-  // 初始化状态
-  onMount(() => {
-    initializeState();
-    console.log('[App] Svelte webview 已初始化');
-  });
 </script>
 
 <div class="app-container">
@@ -124,46 +94,31 @@
   <!-- 顶部 Tab 栏：对话/任务/变更/知识 -->
   <TopTabs activeTopTab={currentTopTab} onTabChange={handleTabChange} />
 
-  <!-- Tab 内容区域：所有面板同时存在，CSS 控制显隐，避免切换 Tab 时组件销毁导致状态丢失 -->
+  <!-- Tab 内容区域：主对话面板常驻以保留输入草稿，其余非主线面板仅在激活时挂载 -->
   <div class="tab-content-wrapper">
     <div class="top-tab-pane" class:active={currentTopTab === 'thread'}>
       <ThreadPanel isTopActive={currentTopTab === 'thread'} />
     </div>
     <div class="top-tab-pane" class:active={currentTopTab === 'tasks'}>
-      <TasksPanel />
+      {#if currentTopTab === 'tasks'}
+        <TasksPanel />
+      {/if}
     </div>
     <div class="top-tab-pane" class:active={currentTopTab === 'edits'}>
-      <EditsPanel />
+      {#if currentTopTab === 'edits'}
+        <EditsPanel />
+      {/if}
     </div>
     <div class="top-tab-pane" class:active={currentTopTab === 'knowledge'}>
-      <KnowledgePanel />
+      {#if currentTopTab === 'knowledge'}
+        <KnowledgePanel />
+      {/if}
     </div>
   </div>
 
   <!-- 设置面板（覆盖层） -->
   {#if settingsOpen}
     <SettingsPanel onClose={closeSettings} />
-  {/if}
-
-  {#if pendingConfirmation && interactionMode === 'ask'}
-    <div class="modal-overlay" role="presentation">
-      <div class="modal-dialog plan-confirm-dialog" role="dialog" aria-modal="true" tabindex="-1">
-        <div class="modal-header">
-          <h3>{i18n.t('app.planConfirmTitle')}</h3>
-        </div>
-        <div class="modal-body">
-          {#if pendingConfirmation.formattedPlan}
-            <MarkdownContent content={pendingConfirmation.formattedPlan} />
-          {:else}
-            <p>{i18n.t('app.planConfirmDefault')}</p>
-          {/if}
-        </div>
-        <div class="modal-footer">
-          <button class="modal-btn secondary" onclick={() => confirmPlan(false)}>{i18n.t('app.planCancel')}</button>
-          <button class="modal-btn primary" onclick={() => confirmPlan(true)}>{i18n.t('app.planConfirm')}</button>
-        </div>
-      </div>
-    </div>
   {/if}
 
   {#if pendingRecovery && interactionMode === 'ask'}
@@ -182,36 +137,6 @@
           <button class="modal-btn secondary" onclick={() => confirmRecovery('continue')}>{i18n.t('app.recoveryContinue')}</button>
           <button class="modal-btn secondary" disabled={!pendingRecovery.canRollback} onclick={() => confirmRecovery('rollback')}>{i18n.t('app.recoveryRollback')}</button>
           <button class="modal-btn primary" disabled={!pendingRecovery.canRetry} onclick={() => confirmRecovery('retry')}>{i18n.t('app.recoveryRetry')}</button>
-        </div>
-      </div>
-    </div>
-  {/if}
-
-  {#if pendingDeliveryRepair && interactionMode === 'ask'}
-    <div class="modal-overlay" role="presentation">
-      <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
-        <div class="modal-header">
-          <h3>{i18n.t(isReplanFollowUpRequest ? 'app.replanFollowUpTitle' : 'app.deliveryRepairTitle')}</h3>
-        </div>
-        <div class="modal-body">
-          <p>{i18n.t(
-            isReplanFollowUpRequest ? 'app.replanFollowUpMessage' : 'app.deliveryRepairMessage',
-            { round: pendingDeliveryRepair.round, maxRounds: deliveryRepairMaxRoundsLabel },
-          )}</p>
-          {#if pendingDeliveryRepair.summary}
-            <div class="modal-context">{pendingDeliveryRepair.summary}</div>
-          {/if}
-          {#if pendingDeliveryRepair.details}
-            <pre class="modal-pre">{pendingDeliveryRepair.details}</pre>
-          {/if}
-        </div>
-        <div class="modal-footer">
-          <button class="modal-btn secondary" onclick={() => confirmDeliveryRepair('stop')}>
-            {i18n.t(isReplanFollowUpRequest ? 'app.replanFollowUpStop' : 'app.deliveryRepairStop')}
-          </button>
-          <button class="modal-btn primary" onclick={() => confirmDeliveryRepair('repair')}>
-            {i18n.t(isReplanFollowUpRequest ? 'app.replanFollowUpConfirm' : 'app.deliveryRepairConfirm')}
-          </button>
         </div>
       </div>
     </div>
@@ -333,10 +258,6 @@
     display: flex;
     flex-direction: column;
     box-shadow: var(--shadow-xl);
-  }
-
-  .plan-confirm-dialog {
-    width: 720px;
   }
 
   .modal-header {

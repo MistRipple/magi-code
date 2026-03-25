@@ -17,7 +17,7 @@
 
 import { EventEmitter } from 'events';
 import * as vscode from 'vscode';
-import { AgentType, LLMConfig, WorkerSlot, TokenUsage } from '../types/agent-types';
+import { AgentType, LLMConfig, WorkerSlot, TokenUsage, ModelAutonomyCapability } from '../types/agent-types';
 import { BaseLLMAdapter } from './adapters/base-adapter';
 import { WorkerLLMAdapter, WorkerAdapterConfig, getStallDetectionPreset } from './adapters/worker-adapter';
 import { OrchestratorLLMAdapter, OrchestratorAdapterConfig } from './adapters/orchestrator-adapter';
@@ -36,6 +36,9 @@ import { EnvironmentContextProvider } from '../context/environment-context-provi
 import { WorkspaceFolderInfo } from '../workspace/workspace-roots';
 import { isModelOriginIssue, toSurfacedModelCauseError } from '../errors/model-origin';
 import { trackModelOriginEvent } from '../errors/model-origin-observability';
+import { resolveModelAutonomyCapability } from '../orchestrator/core/effective-mode-resolver';
+import type { PlanMode } from '../orchestrator/plan-ledger';
+import type { RuntimeHostContext } from '../host';
 
 /**
  * LLM 适配器工厂
@@ -76,11 +79,12 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
    * 必须在创建 Adapter 之前通过 setMessageHub() 设置
    */
   private messageHub: MessageHub | null = null;
-  constructor(options: { cwd: string; workspaceFolders?: WorkspaceFolderInfo[] }) {
+  constructor(host: RuntimeHostContext) {
     super();
     this.toolManager = new ToolManager({
-      workspaceRoot: options.cwd,
-      workspaceFolders: options.workspaceFolders,
+      workspaceRoot: host.workspaceRoot,
+      workspaceFolders: host.workspaceFolders,
+      hostCapabilities: host.capabilities,
     });
     this.profileLoader = ProfileLoader.getInstance();
 
@@ -90,7 +94,7 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     });
     this.environmentContextProvider.setToolManager(this.toolManager);
 
-    logger.info('LLM Adapter Factory initialized', { cwd: options.cwd }, LogCategory.LLM);
+    logger.info('LLM Adapter Factory initialized', { cwd: host.workspaceRoot }, LogCategory.LLM);
   }
 
   /**
@@ -465,14 +469,29 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     if (typeof (adapter as any).setCurrentToolExecutionContext === 'function') {
       (adapter as any).setCurrentToolExecutionContext(options?.toolExecutionContext);
     }
+    if (typeof (adapter as any).setCurrentMessageMetadata === 'function') {
+      (adapter as any).setCurrentMessageMetadata(options?.messageMetadata);
+    }
 
     // 为 orchestrator 适配器应用临时配置
     if (agent === 'orchestrator' && adapter instanceof OrchestratorLLMAdapter) {
+      if (options?.planningMode) {
+        adapter.setTempPlanningMode(options.planningMode);
+      }
       if (options?.systemPrompt) {
         adapter.setTempSystemPrompt(options.systemPrompt);
       }
+      if (typeof options?.includeThinking === 'boolean') {
+        adapter.setTempIncludeThinking(options.includeThinking);
+      }
       if (typeof options?.includeToolCalls === 'boolean') {
         adapter.setTempEnableToolCalls(options.includeToolCalls);
+      }
+      if (Array.isArray(options?.allowedToolNames)) {
+        adapter.setTempAllowedToolNames(options.allowedToolNames);
+      }
+      if (options?.historyMode) {
+        adapter.setTempHistoryMode(options.historyMode);
       }
       if (options?.visibility) {
         adapter.setTempVisibility(options.visibility);
@@ -492,6 +511,9 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       }
       if (typeof (adapter as any).setCurrentToolExecutionContext === 'function') {
         (adapter as any).setCurrentToolExecutionContext(undefined);
+      }
+      if (typeof (adapter as any).setCurrentMessageMetadata === 'function') {
+        (adapter as any).setCurrentMessageMetadata(undefined);
       }
       return {
         content: '',
@@ -667,6 +689,9 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       }
       if (typeof (adapter as any).setCurrentToolExecutionContext === 'function') {
         (adapter as any).setCurrentToolExecutionContext(undefined);
+      }
+      if (typeof (adapter as any).setCurrentMessageMetadata === 'function') {
+        (adapter as any).setCurrentMessageMetadata(undefined);
       }
     }
   }
@@ -970,6 +995,15 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
    */
   isDeepTask(): boolean {
     return vscode.workspace.getConfiguration('magi').get<boolean>('deepTask', false);
+  }
+
+  getRequestedPlanningMode(): PlanMode {
+    return this.isDeepTask() ? 'deep' : 'standard';
+  }
+
+  getOrchestratorModelCapability(): ModelAutonomyCapability {
+    const config = LLMConfigLoader.loadFullConfig();
+    return resolveModelAutonomyCapability(config.orchestrator);
   }
 
   /**

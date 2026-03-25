@@ -13,6 +13,9 @@
 
   let { diagnostics }: Props = $props();
 
+  type KnowledgeAuditEntry =
+    NonNullable<NonNullable<OrchestratorRuntimeDiagnostics['opsView']>['knowledgeAudit']>['recentEntries'][number];
+
   const recentTrace = $derived.by(() => {
     const trace = diagnostics?.runtimeDecisionTrace;
     if (!Array.isArray(trace) || trace.length === 0) {
@@ -35,6 +38,82 @@
       .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
       .map((item) => item.trim())
       .filter((item, index, arr) => arr.indexOf(item) === index);
+  });
+
+  const opsView = $derived.by(() => diagnostics?.opsView || null);
+  const knowledgeAudit = $derived.by(() => opsView?.knowledgeAudit || null);
+
+  const scopeEntries = $derived.by(() => {
+    const scope = opsView?.scope;
+    if (!scope) {
+      return [] as Array<{ label: string; value: string }>;
+    }
+    const entries: Array<{ label: string; value: string }> = [];
+    if (scope.sessionId) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.scope.session'), value: scope.sessionId });
+    }
+    if (scope.requestId) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.scope.request'), value: scope.requestId });
+    }
+    if (scope.missionId) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.scope.mission'), value: scope.missionId });
+    }
+    if (scope.planId) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.scope.plan'), value: scope.planId });
+    }
+    if (scope.batchId) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.scope.batch'), value: scope.batchId });
+    }
+    return entries;
+  });
+
+  const knowledgeAuditEntries = $derived.by(() => (
+    Array.isArray(knowledgeAudit?.recentEntries) ? knowledgeAudit.recentEntries : []
+  ));
+
+  const knowledgeAuditSummaryEntries = $derived.by(() => {
+    if (!knowledgeAudit) {
+      return [] as Array<{ label: string; value: string }>;
+    }
+    return [
+      { label: i18n.t('runtimeDiagnostics.auditPath'), value: knowledgeAudit.auditPath },
+      { label: i18n.t('runtimeDiagnostics.auditEvents'), value: String(knowledgeAudit.eventCount || 0) },
+    ];
+  });
+
+  const recentTimeline = $derived.by(() => Array.isArray(opsView?.recentTimeline) ? opsView.recentTimeline : []);
+  const recentStateDiffs = $derived.by(() => Array.isArray(opsView?.recentStateDiffs) ? opsView.recentStateDiffs : []);
+  const assignmentSummaries = $derived.by(() => Array.isArray(opsView?.assignments) ? opsView.assignments : []);
+  const failureRootCause = $derived.by(() => opsView?.failureRootCause || null);
+
+  const recoveryEntries = $derived.by(() => {
+    const recovery = opsView?.recovery;
+    if (!recovery) {
+      return [] as Array<{ label: string; value: string }>;
+    }
+    const entries: Array<{ label: string; value: string }> = [];
+    if (recovery.continuationPolicy) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.continuationPolicy'), value: recovery.continuationPolicy });
+    }
+    if (recovery.continuationReason) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.continuationReason'), value: recovery.continuationReason });
+    }
+    if (recovery.waitState) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.waitState'), value: recovery.waitState });
+    }
+    if (recovery.replanState) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.replanState'), value: recovery.replanState });
+    }
+    if (recovery.terminationReason) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.terminationReason'), value: recovery.terminationReason });
+    }
+    if (recovery.acceptanceSummary) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.acceptanceSummary'), value: recovery.acceptanceSummary });
+    }
+    if (recovery.reviewState) {
+      entries.push({ label: i18n.t('runtimeDiagnostics.recovery.reviewState'), value: recovery.reviewState });
+    }
+    return entries;
   });
 
   // 状态图标
@@ -87,6 +166,11 @@
     return new Date(timestamp).toLocaleTimeString();
   }
 
+  function formatDateTime(timestamp: number): string {
+    if (!Number.isFinite(timestamp)) return '--';
+    return new Date(timestamp).toLocaleString();
+  }
+
   function formatDuration(ms: number | undefined): string {
     if (!ms || !Number.isFinite(ms)) return '--';
     if (ms < 1000) return `${ms}ms`;
@@ -134,6 +218,67 @@
       case 'fallback': return 'action--fallback';
       default: return '';
     }
+  }
+
+  function formatTodoStats(item: {
+    completedTodos: number;
+    todoTotal: number;
+    runningTodos: number;
+    failedTodos: number;
+  }): string {
+    return i18n.t('runtimeDiagnostics.todoStats', {
+      completed: item.completedTodos,
+      total: item.todoTotal,
+      running: item.runningTodos,
+      failed: item.failedTodos,
+    });
+  }
+
+  function formatChangedKeys(keys: string[]): string {
+    if (!Array.isArray(keys) || keys.length === 0) {
+      return '--';
+    }
+    return keys.join(', ');
+  }
+
+  function formatKnowledgePurpose(purpose: string): string {
+    switch (purpose) {
+      case 'project_context':
+        return i18n.t('runtimeDiagnostics.knowledgePurpose.projectContext');
+      case 'knowledge_index':
+        return i18n.t('runtimeDiagnostics.knowledgePurpose.knowledgeIndex');
+      case 'tool_query':
+        return i18n.t('runtimeDiagnostics.knowledgePurpose.toolQuery');
+      case 'knowledge_api':
+        return i18n.t('runtimeDiagnostics.knowledgePurpose.knowledgeApi');
+      case 'ui_panel':
+        return i18n.t('runtimeDiagnostics.knowledgePurpose.uiPanel');
+      default:
+        return purpose;
+    }
+  }
+
+  function formatKnowledgeAuditScope(entry: KnowledgeAuditEntry): string {
+    const scopes: string[] = [];
+    if (entry.requestId) {
+      scopes.push(`${i18n.t('runtimeDiagnostics.scope.request')}: ${entry.requestId}`);
+    }
+    if (entry.missionId) {
+      scopes.push(`${i18n.t('runtimeDiagnostics.scope.mission')}: ${entry.missionId}`);
+    }
+    if (entry.assignmentId) {
+      scopes.push(`${i18n.t('runtimeDiagnostics.scope.assignment')}: ${entry.assignmentId}`);
+    }
+    if (entry.todoId) {
+      scopes.push(`${i18n.t('runtimeDiagnostics.scope.todo')}: ${entry.todoId}`);
+    }
+    if (entry.workerId) {
+      scopes.push(`${i18n.t('runtimeDiagnostics.scope.worker')}: ${entry.workerId}`);
+    }
+    if (scopes.length === 0 && entry.sessionId) {
+      scopes.push(`${i18n.t('runtimeDiagnostics.scope.session')}: ${entry.sessionId}`);
+    }
+    return scopes.length > 0 ? scopes.join(' · ') : '--';
   }
 </script>
 
@@ -239,6 +384,158 @@
         </div>
       {/if}
 
+      {#if scopeEntries.length > 0}
+        <div class="runtime-diagnostics__block">
+          <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.scopeTitle')}</div>
+          <div class="runtime-diagnostics__kv-grid">
+            {#each scopeEntries as item}
+              <div class="runtime-diagnostics__kv-item">
+                <div class="runtime-diagnostics__kv-label">{item.label}</div>
+                <div class="runtime-diagnostics__kv-value">{item.value}</div>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+      <div class="runtime-diagnostics__block">
+        <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.knowledgeAuditTitle')}</div>
+        {#if knowledgeAuditSummaryEntries.length > 0}
+          <div class="runtime-diagnostics__kv-grid">
+            {#each knowledgeAuditSummaryEntries as item}
+              <div class="runtime-diagnostics__kv-item">
+                <div class="runtime-diagnostics__kv-label">{item.label}</div>
+                <div class="runtime-diagnostics__kv-value">{item.value}</div>
+              </div>
+            {/each}
+          </div>
+          {#if knowledgeAuditEntries.length > 0}
+            <div class="runtime-diagnostics__ops-list">
+              {#each knowledgeAuditEntries as item}
+                <div class="runtime-diagnostics__ops-item">
+                  <div class="runtime-diagnostics__ops-title-row">
+                    <span class="runtime-diagnostics__ops-title">{formatKnowledgePurpose(item.purpose)}</span>
+                    <span class="runtime-diagnostics__ops-time">{formatTimestamp(item.timestamp)}</span>
+                  </div>
+                  <div class="runtime-diagnostics__ops-sub">
+                    {i18n.t('runtimeDiagnostics.consumer')}: {item.consumer || '--'}
+                    · {i18n.t('runtimeDiagnostics.resultKind')}: {item.resultKind}
+                    · {i18n.t('runtimeDiagnostics.references')}: {item.referenceCount}
+                  </div>
+                  <div class="runtime-diagnostics__ops-sub">{formatKnowledgeAuditScope(item)}</div>
+                </div>
+              {/each}
+            </div>
+          {:else}
+            <div class="runtime-diagnostics__empty">{i18n.t('runtimeDiagnostics.noKnowledgeAudit')}</div>
+          {/if}
+        {:else}
+          <div class="runtime-diagnostics__empty">{i18n.t('runtimeDiagnostics.noKnowledgeAudit')}</div>
+        {/if}
+      </div>
+
+      {#if failureRootCause}
+        <div class="runtime-diagnostics__block runtime-diagnostics__block--failure">
+          <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.failureRootCauseTitle')}</div>
+          <div class="runtime-diagnostics__failure-reason">{failureRootCause.summary}</div>
+          <div class="runtime-diagnostics__meta-line">
+            {formatDateTime(failureRootCause.occurredAt)}
+            {#if failureRootCause.eventType}
+              · {failureRootCause.eventType}
+            {/if}
+            {#if failureRootCause.assignmentId}
+              · {failureRootCause.assignmentId}
+            {/if}
+            {#if failureRootCause.todoId}
+              · {failureRootCause.todoId}
+            {/if}
+          </div>
+        </div>
+      {/if}
+
+      {#if recoveryEntries.length > 0}
+        <div class="runtime-diagnostics__block">
+          <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.recoveryTitle')}</div>
+          <div class="runtime-diagnostics__kv-grid">
+            {#each recoveryEntries as item}
+              <div class="runtime-diagnostics__kv-item">
+                <div class="runtime-diagnostics__kv-label">{item.label}</div>
+                <div class="runtime-diagnostics__kv-value">{item.value}</div>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+      <div class="runtime-diagnostics__block">
+        <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.assignmentTitle')}</div>
+        {#if assignmentSummaries.length > 0}
+          <div class="runtime-diagnostics__ops-list">
+            {#each assignmentSummaries as item}
+              <div class="runtime-diagnostics__ops-item">
+                <div class="runtime-diagnostics__ops-title-row">
+                  <span class="runtime-diagnostics__ops-title">{item.title}</span>
+                  <span class="runtime-diagnostics__ops-time">{item.workerId || '--'} · {item.status}</span>
+                </div>
+                <div class="runtime-diagnostics__ops-sub">{formatTodoStats(item)}</div>
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <div class="runtime-diagnostics__empty">{i18n.t('runtimeDiagnostics.noAssignments')}</div>
+        {/if}
+      </div>
+
+      <div class="runtime-diagnostics__block">
+        <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.timelineTitle')}</div>
+        {#if recentTimeline.length > 0}
+          <div class="runtime-diagnostics__ops-list">
+            {#each recentTimeline as item}
+              <div class="runtime-diagnostics__ops-item">
+                <div class="runtime-diagnostics__ops-title-row">
+                  <span class="runtime-diagnostics__ops-title">{item.summary}</span>
+                  <span class="runtime-diagnostics__ops-time">{formatTimestamp(item.timestamp)}</span>
+                </div>
+                <div class="runtime-diagnostics__ops-sub">
+                  {item.type}
+                  {#if item.diffCount > 0}
+                    · Δ{item.diffCount}
+                  {/if}
+                </div>
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <div class="runtime-diagnostics__empty">{i18n.t('runtimeDiagnostics.noTimeline')}</div>
+        {/if}
+      </div>
+
+      <div class="runtime-diagnostics__block">
+        <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.stateDiffTitle')}</div>
+        {#if recentStateDiffs.length > 0}
+          <div class="runtime-diagnostics__ops-list">
+            {#each recentStateDiffs as item}
+              <div class="runtime-diagnostics__ops-item">
+                <div class="runtime-diagnostics__ops-title-row">
+                  <span class="runtime-diagnostics__ops-title">{item.entityType}:{item.entityId}</span>
+                  <span class="runtime-diagnostics__ops-time">{formatTimestamp(item.timestamp)}</span>
+                </div>
+                <div class="runtime-diagnostics__ops-sub">
+                  {i18n.t('runtimeDiagnostics.changedKeys')}: {formatChangedKeys(item.changedKeys)}
+                </div>
+                {#if item.beforeSummary || item.afterSummary}
+                  <div class="runtime-diagnostics__ops-sub">
+                    {item.beforeSummary || '--'} -> {item.afterSummary || '--'}
+                  </div>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <div class="runtime-diagnostics__empty">{i18n.t('runtimeDiagnostics.noStateDiffs')}</div>
+        {/if}
+      </div>
+
       <div class="runtime-diagnostics__block">
         <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.decisionTrace')}</div>
         {#if recentTrace.length > 0}
@@ -269,21 +566,21 @@
 <style>
   .runtime-diagnostics {
     margin: 8px 12px 0;
-    border: 1px solid var(--vscode-editorWidget-border, #3c3c3c);
+    border: 1px solid var(--vscode-editorWidget-border, var(--border));
     border-radius: 8px;
-    background: var(--vscode-editorWidget-background, #252526);
-    color: var(--vscode-foreground, #ccc);
+    background: var(--vscode-editorWidget-background, var(--surface-2));
+    color: var(--vscode-foreground, var(--foreground));
     overflow: visible;
-    border-left: 3px solid var(--vscode-editorWidget-border, #3c3c3c);
+    border-left: 3px solid var(--vscode-editorWidget-border, var(--border));
     position: relative;
   }
 
   /* 卡片左边框根据终态着色 */
   .runtime-diagnostics--completed { border-left-color: #4ec995; }
-  .runtime-diagnostics--failed    { border-left-color: var(--vscode-editorError-foreground, #f48771); }
-  .runtime-diagnostics--cancelled { border-left-color: var(--vscode-editorWidget-border, #6c6c6c); }
-  .runtime-diagnostics--paused    { border-left-color: var(--vscode-editorWarning-foreground, #cca700); }
-  .runtime-diagnostics--pending   { border-left-color: var(--vscode-progressBar-background, #0e70c0); }
+  .runtime-diagnostics--failed    { border-left-color: var(--vscode-editorError-foreground, var(--error)); }
+  .runtime-diagnostics--cancelled { border-left-color: var(--vscode-editorWidget-border, var(--border)); }
+  .runtime-diagnostics--paused    { border-left-color: var(--vscode-editorWarning-foreground, var(--warning)); }
+  .runtime-diagnostics--pending   { border-left-color: var(--vscode-progressBar-background, var(--info)); }
 
   .runtime-diagnostics > summary {
     cursor: pointer;
@@ -317,7 +614,7 @@
   }
   .summary__badge--failed {
     background: rgba(244, 135, 113, 0.18);
-    color: var(--vscode-editorError-foreground, #f48771);
+    color: var(--vscode-editorError-foreground, var(--error));
   }
   .summary__badge--cancelled {
     background: rgba(140, 140, 140, 0.18);
@@ -325,11 +622,11 @@
   }
   .summary__badge--paused {
     background: rgba(204, 167, 0, 0.18);
-    color: var(--vscode-editorWarning-foreground, #cca700);
+    color: var(--vscode-editorWarning-foreground, var(--warning));
   }
   .summary__badge--pending {
     background: rgba(14, 112, 192, 0.18);
-    color: var(--vscode-textLink-foreground, #3794ff);
+    color: var(--vscode-textLink-foreground, var(--info));
   }
 
   .summary__time {
@@ -345,16 +642,16 @@
     left: -1px;
     right: -1px;
     z-index: 20;
-    border: 1px solid var(--vscode-editorWidget-border, #3c3c3c);
-    border-top: 1px solid var(--vscode-editorWidget-border, #3c3c3c);
+    border: 1px solid var(--vscode-editorWidget-border, var(--border));
+    border-top: 1px solid var(--vscode-editorWidget-border, var(--border));
     border-radius: 0 0 8px 8px;
-    background: var(--vscode-editorWidget-background, #252526);
+    background: var(--vscode-editorWidget-background, var(--surface-2));
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
     padding: 8px 10px;
     display: flex;
     flex-direction: column;
     gap: 10px;
-    max-height: 320px;
+    max-height: 440px;
     overflow-y: auto;
   }
 
@@ -367,7 +664,7 @@
   .metric-card {
     padding: 8px;
     border-radius: 6px;
-    background: var(--vscode-editor-background, #1e1e1e);
+    background: var(--vscode-editor-background, var(--assistant-message-bg));
     display: flex;
     flex-direction: column;
     gap: 4px;
@@ -396,7 +693,7 @@
   }
 
   .metric-card__value--warn {
-    color: var(--vscode-editorWarning-foreground, #cca700);
+    color: var(--vscode-editorWarning-foreground, var(--warning));
   }
 
   .metric-card__sub {
@@ -410,14 +707,14 @@
   }
 
   .metric-card__sub--warn {
-    color: var(--vscode-editorWarning-foreground, #cca700);
+    color: var(--vscode-editorWarning-foreground, var(--warning));
     opacity: 1;
   }
 
   .progress-bar {
     height: 4px;
     border-radius: 2px;
-    background: var(--vscode-editorWidget-border, #3c3c3c);
+    background: var(--vscode-editorWidget-border, var(--border));
     overflow: hidden;
   }
 
@@ -438,7 +735,7 @@
     border: 1px solid color-mix(in srgb, var(--vscode-editorError-foreground, #f48771) 28%, transparent);
     border-radius: 8px;
     padding: 10px 12px;
-    background: color-mix(in srgb, var(--vscode-editorError-foreground, #f48771) 8%, transparent);
+    background: color-mix(in srgb, var(--vscode-editorError-foreground, var(--error)) 8%, transparent);
   }
 
   .runtime-diagnostics__label {
@@ -450,7 +747,7 @@
   .runtime-diagnostics__failure-reason {
     font-size: 13px;
     line-height: 1.5;
-    color: var(--vscode-foreground, #ddd);
+    color: var(--vscode-foreground, var(--foreground));
     word-break: break-word;
   }
 
@@ -463,6 +760,81 @@
     color: var(--vscode-descriptionForeground, #b0b0b0);
     font-size: 12px;
     line-height: 1.5;
+  }
+
+  .runtime-diagnostics__meta-line {
+    font-size: 11px;
+    opacity: 0.75;
+    line-height: 1.5;
+  }
+
+  .runtime-diagnostics__kv-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 8px;
+  }
+
+  .runtime-diagnostics__kv-item {
+    padding: 8px;
+    border-radius: 6px;
+    background: var(--vscode-editor-background, var(--assistant-message-bg));
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .runtime-diagnostics__kv-label {
+    font-size: 11px;
+    opacity: 0.75;
+  }
+
+  .runtime-diagnostics__kv-value {
+    font-size: 12px;
+    font-family: var(--vscode-editor-font-family, monospace);
+    word-break: break-all;
+  }
+
+  .runtime-diagnostics__ops-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .runtime-diagnostics__ops-item {
+    padding: 8px;
+    border-radius: 6px;
+    background: var(--vscode-editor-background, var(--assistant-message-bg));
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .runtime-diagnostics__ops-title-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .runtime-diagnostics__ops-title {
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 1.4;
+    word-break: break-word;
+  }
+
+  .runtime-diagnostics__ops-time {
+    font-size: 11px;
+    opacity: 0.7;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .runtime-diagnostics__ops-sub {
+    font-size: 11px;
+    opacity: 0.78;
+    line-height: 1.5;
+    word-break: break-word;
   }
 
   .trace-list {

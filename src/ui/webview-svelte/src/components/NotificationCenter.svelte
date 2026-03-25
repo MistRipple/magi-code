@@ -170,7 +170,7 @@
     margin-top: var(--space-2, 4px);
     width: 320px;
     max-height: 400px;
-    background: var(--vscode-dropdown-background, #3c3c3c);
+    background: var(--dropdown-bg);
     border: 1px solid var(--border, #454545);
     border-radius: var(--radius-md, 6px);
     box-shadow: var(--shadow-lg, 0 8px 24px rgba(0,0,0,0.3));
@@ -214,7 +214,7 @@
 
   .filter-btn {
     border: 1px solid var(--border, #454545);
-    background: var(--surface, rgba(255,255,255,0.03));
+    background: var(--surface-2);
     color: var(--foreground-muted, #999);
     border-radius: 999px;
     font-size: var(--text-xs, 11px);
@@ -230,7 +230,7 @@
 
   .filter-btn.active {
     color: var(--foreground, #ddd);
-    background: var(--surface-hover, rgba(255,255,255,0.08));
+    background: var(--surface-hover);
     border-color: var(--foreground-muted, #999);
   }
 
@@ -246,7 +246,7 @@
   }
 
   .btn-text:hover {
-    background: var(--surface-hover, rgba(255,255,255,0.06));
+    background: var(--surface-hover);
     color: var(--foreground, #ccc);
   }
 

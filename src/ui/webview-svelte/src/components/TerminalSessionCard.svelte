@@ -2,9 +2,8 @@
   import { untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import { getTerminalToolDisplayName, parseLeadingJson } from '../lib/terminal-utils';
-  import { terminalSessions } from '../stores/terminal-sessions.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import type { ToolCall } from '../types/message';
+  import type { ToolCall, TerminalSessionBlock } from '../types/message';
 
   interface Props {
     toolCall?: ToolCall;
@@ -36,6 +35,23 @@
     return content;
   }
 
+  function readInt(value: unknown): number | undefined {
+    return Number.isInteger(value) ? value as number : undefined;
+  }
+
+  function readNullableInt(value: unknown): number | null | undefined {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    return value === null ? null : undefined;
+  }
+
+  function readBool(value: unknown): boolean | undefined {
+    return typeof value === 'boolean' ? value : undefined;
+  }
+
+  function readString(value: unknown): string | undefined {
+    return typeof value === 'string' ? value : undefined;
+  }
+
 
   function toggle(): void {
     collapsed = !collapsed;
@@ -43,51 +59,66 @@
   }
 
   const parsedResult = $derived(parseJson(toolCall?.result));
-  const terminalId = $derived.by(() => {
-    const fromResult = parsedResult?.terminal_id;
-    if (Number.isInteger(fromResult)) return fromResult as number;
-    const fromArgs = toolCall?.arguments?.terminal_id;
-    if (Number.isInteger(fromArgs)) return fromArgs as number;
-    return undefined;
-  });
-
-  $effect(() => {
-    if (toolCall) {
-      terminalSessions.ingestToolCall(toolCall);
+  const terminal = $derived.by((): Partial<TerminalSessionBlock> | undefined => {
+    if (!parsedResult && !toolCall) {
+      return undefined;
     }
+    const rawMode = parsedResult?.run_mode;
+    const runMode = rawMode === 'service' || rawMode === 'task' ? rawMode : undefined;
+    return {
+      terminalId: readInt(parsedResult?.terminal_id) ?? readInt(toolCall?.arguments?.terminal_id),
+      status: readString(parsedResult?.status) || undefined,
+      phase: readString(parsedResult?.phase),
+      runMode,
+      terminalName: readString(parsedResult?.terminal_name),
+      cwd: readString(parsedResult?.cwd),
+      command: readString(parsedResult?.command)
+        ?? (typeof toolCall?.arguments?.command === 'string' ? toolCall.arguments.command : undefined),
+      output: readString(parsedResult?.output) || readString(parsedResult?.final_output) || undefined,
+      outputCursor: readInt(parsedResult?.output_cursor),
+      outputStartCursor: readInt(parsedResult?.output_start_cursor),
+      fromCursor: readInt(parsedResult?.from_cursor),
+      nextCursor: readInt(parsedResult?.next_cursor),
+      delta: readBool(parsedResult?.delta),
+      truncated: readBool(parsedResult?.truncated),
+      startupStatus: parsedResult?.startup_status === 'pending'
+        || parsedResult?.startup_status === 'confirmed'
+        || parsedResult?.startup_status === 'timeout'
+        || parsedResult?.startup_status === 'failed'
+        || parsedResult?.startup_status === 'skipped'
+        ? parsedResult.startup_status as TerminalSessionBlock['startupStatus']
+        : undefined,
+      startupMessage: readString(parsedResult?.startup_message),
+      locked: readBool(parsedResult?.locked),
+      returnCode: readNullableInt(parsedResult?.return_code),
+      accepted: readBool(parsedResult?.accepted),
+      killed: readBool(parsedResult?.killed),
+      releasedLock: readBool(parsedResult?.released_lock),
+      error: readString(parsedResult?.error),
+    };
   });
-
-  const session = $derived.by(() => {
-    if (terminalId) {
-      return terminalSessions.getById(terminalId);
+  const terminalId = $derived(terminal?.terminalId);
+  const displayStatus = $derived(terminal?.status || status || toolCall?.status || 'running');
+  const displayPhase = $derived(terminal?.phase || '');
+  const displayMode = $derived(terminal?.runMode || '');
+  const displayCommand = $derived(terminal?.command || '');
+  const displayCwd = $derived(terminal?.cwd || '');
+  const displayOutput = $derived.by(() => {
+    const fromTerminal = terminal?.output;
+    if (typeof fromTerminal === 'string' && fromTerminal.length > 0) {
+      return formatOutput(fromTerminal);
     }
-    return terminalSessions.getByToolCallId(toolCall?.id);
+    const raw = typeof toolCall?.result === 'string' ? toolCall.result : '';
+    return formatOutput(raw);
   });
-
-  const displayStatus = $derived(session?.status || status || toolCall?.status || 'running');
-  const displayPhase = $derived(session?.phase || (typeof parsedResult?.phase === 'string' ? parsedResult.phase : ''));
-  const displayMode = $derived.by(() => {
-    if (session?.runMode) return session.runMode;
-    const raw = parsedResult?.run_mode;
-    if (raw === 'service' || raw === 'task') return raw;
-    return '';
-  });
-  const displayCommand = $derived(session?.command || (typeof toolCall?.arguments?.command === 'string' ? toolCall.arguments.command : ''));
-  const displayCwd = $derived(session?.cwd || (typeof parsedResult?.cwd === 'string' ? parsedResult.cwd : ''));
-  const fallbackOutput = $derived.by(() => {
-    if (typeof parsedResult?.output === 'string') return parsedResult.output;
-    if (typeof parsedResult?.final_output === 'string') return parsedResult.final_output;
-    return '';
-  });
-  const displayOutput = $derived(formatOutput(session?.output || fallbackOutput || ''));
-  const outputCursor = $derived(session?.outputCursor);
-  const returnCode = $derived(session?.returnCode);
-  const locked = $derived(Boolean(session?.locked));
-  const startupMessage = $derived(session?.startupMessage || '');
-  const errorText = $derived(session?.error || toolCall?.error || '');
-  const accepted = $derived(session?.accepted);
-  const killed = $derived(session?.killed);
-  const releasedLock = $derived(session?.releasedLock);
+  const outputCursor = $derived(terminal?.outputCursor);
+  const returnCode = $derived(terminal?.returnCode);
+  const locked = $derived(Boolean(terminal?.locked));
+  const startupMessage = $derived(terminal?.startupMessage || '');
+  const errorText = $derived(terminal?.error || toolCall?.error || '');
+  const accepted = $derived(terminal?.accepted);
+  const killed = $derived(terminal?.killed);
+  const releasedLock = $derived(terminal?.releasedLock);
   const showOutput = $derived(displayOutput.trim().length > 0);
 
   const normalizedStatus = $derived(String(displayStatus || '').toLowerCase());
@@ -151,7 +182,13 @@
 </script>
 
 {#if isExpandable}
-  <div class="tool-call terminal-call" class:collapsed={collapsed} data-status={statusClass}>
+  <div
+    class="tool-call terminal-call"
+    class:collapsed={collapsed}
+    data-status={statusClass}
+    data-tool-name={toolCall?.name || ''}
+    data-terminal-id={typeof terminalId === 'number' ? String(terminalId) : undefined}
+  >
     <button class="tool-header" onclick={toggle}>
       <span class="chevron">
         <Icon name="chevron-right" size={12} />
@@ -231,7 +268,12 @@
     {/if}
   </div>
 {:else}
-  <div class="tool-call terminal-call" data-status={statusClass}>
+  <div
+    class="tool-call terminal-call"
+    data-status={statusClass}
+    data-tool-name={toolCall?.name || ''}
+    data-terminal-id={typeof terminalId === 'number' ? String(terminalId) : undefined}
+  >
     <div class="tool-header terminal-header-flat">
       <span class="tool-icon"><Icon name="terminal" size={14} /></span>
       <span class="tool-title">
