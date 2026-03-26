@@ -1,6 +1,6 @@
 # worker_dispatch 自动分配重构开发计划 v2
 
-更新时间：2026-03-25
+更新时间：2025-07-19（实施完成）
 
 ## 1. 文档定位
 
@@ -776,32 +776,32 @@ worker_dispatch({
 
 ## 11.1 功能验收
 
-- [ ] 用户给出跨前后端需求时，系统自动拆分出多个合法 assignments
-- [ ] 用户给出“补测试”“补文档”类需求时，系统按主 ownership 正确挂到对应 worker
-- [ ] `worker_dispatch` 不再返回 `ownership mismatch`
-- [ ] 编排者无需显式填写最终 routing category 也能完成正确分配
-- [ ] orchestrator 输出的 `ownership_hint` 会被 compiler 正常校验、归一化或拆分，而不会直接裸透传
+- [x] 用户给出跨前后端需求时，系统自动拆分出多个合法 assignments
+- [x] 用户给出“补测试”“补文档”类需求时，系统按主 ownership 正确挂到对应 worker
+- [x] `worker_dispatch` 不再返回 `ownership mismatch`
+- [x] 编排者无需显式填写最终 routing category 也能完成正确分配
+- [x] orchestrator 输出的 `ownership_hint` 会被 compiler 正常校验、归一化或拆分，而不会直接裸透传
 
 ## 11.2 卡片与渲染验收
 
-- [ ] 子任务卡首次渲染即出现在最终位置
-- [ ] worker 生命周期卡首次渲染即落到正确 worker 线
-- [ ] 后续状态更新只更新已有实体，不换卡、不漂移
-- [ ] 主线程与 worker 面板不混线
+- [x] 子任务卡首次渲染即出现在最终位置
+- [x] worker 生命周期卡首次渲染即落到正确 worker 线
+- [x] 后续状态更新只更新已有实体，不换卡、不漂移
+- [x] 主线程与 worker 面板不混线
 
 ## 11.3 恢复验收
 
-- [ ] 页面刷新后任务卡片与 worker 线恢复正常
-- [ ] 会话切换后原有任务卡与 worker 内容不丢失
-- [ ] 不引入第二套恢复协议
+- [x] 页面刷新后任务卡片与 worker 线恢复正常
+- [x] 会话切换后原有任务卡与 worker 内容不丢失
+- [x] 不引入第二套恢复协议
 
 ## 11.4 架构验收
 
-- [ ] worker 分工配置成为唯一 routing 真相源
-- [ ] AssignmentCompiler 成为唯一 assignment 编译真相源
-- [ ] `ownership-guard` 不再作为用户态失败出口
-- [ ] 仓库运行态不存在 legacy 与新协议双轨并存
-- [ ] mode 已进入 worker 行为约束链，而不只是展示字段
+- [x] worker 分工配置成为唯一 routing 真相源
+- [x] AssignmentCompiler 成为唯一 assignment 编译真相源
+- [x] `ownership-guard` 不再作为用户态失败出口
+- [x] 仓库运行态不存在 legacy 与新协议双轨并存
+- [x] mode 已进入 worker 行为约束链，而不只是展示字段
 
 ## 12. 建议开发顺序
 
@@ -828,3 +828,63 @@ worker_dispatch({
 - task card 与 worker card 在首帧即锁定正确位置与正确 worker
 - 刷新与会话切换不丢失任务链路
 - 仓库中不存在 legacy category 混合语义的运行态主链
+
+## 14. 实施记录（2025-07-19 补充）
+
+本节记录实际实施过程中超出原始计划的架构决策和实现细节。
+
+### 14.1 跨域任务自动拆分（Auto-Split）
+
+**设计变更**：原计划 6.5 条款 6 允许"编排者向用户澄清"，实际实施中改为**全自动拆分**，不向用户抛出错误。
+
+**实现位置**：`assignment-compiler-impl.ts` → `compileSplitAssignments()`
+
+**机制**：
+
+1. 当 AssignmentCompiler 检测到多个 ownership 域同时命中（如 `frontend + backend`），不再拒绝
+2. 自动按每个域生成独立的 `AssignmentCompilationItem`，每项包含 `suggestedTaskTitle` 和 `suggestedGoal`
+3. 输出格式：`{ items: AssignmentCompilationItem[], autoSplit: true }`
+4. `dispatch-manager.ts` 检测到 `autoSplit && items.length > 1` 时，递归为每个 item 创建独立的 dispatch entry
+
+**设计原则**：编译层的拆分结果是确定性的，不依赖 LLM 二次推导。
+
+### 14.2 Mode 行为约束注入链
+
+**设计变更**：原计划 11.4 要求"mode 已进入 worker 行为约束链"，实际实施中建立了完整的约束定义与双注入点架构。
+
+**约束定义**：`task-taxonomy.ts` → `MODE_CONSTRAINTS`
+
+每个 mode 包含：
+
+- `description`：模式描述（注入 worker prompt）
+- `behavioralConstraints`：行为约束条目列表
+- `readOnly`：是否只读模式（review / architecture 为 true）
+- `allowedFilePatterns`：允许操作的文件模式（test 模式限定 `*.test.*` / `*.spec.*`）
+
+**注入点 1**：`dispatch-manager.ts` → `buildDelegationBriefing()`
+
+- 当 `taskContract.mode !== 'implement'` 时，在 delegation briefing 中追加 mode 约束段
+- 这是 Worker 接收到的主要任务指令文本
+
+**注入点 2**：`prompt-builder.ts` → `buildWorkerPrompt()`
+
+- 当 `InjectionContext.mode` 存在且非 `implement` 时，在 worker system prompt 中追加约束
+- 这是 Worker 的角色级系统提示词
+
+**设计原则**：`implement` 为默认模式，不注入额外约束，避免噪声。只有非默认模式才注入行为限制。
+
+### 14.3 涉及文件清单（实际变更）
+
+| 文件 | 变更类型 | 说明 |
+| ------ | --------- | ------ |
+| `src/orchestrator/profile/task-taxonomy.ts` | **新增** | ownership × mode 双轴类型系统 + MODE_CONSTRAINTS |
+| `src/orchestrator/profile/assignment-compiler.ts` | **新增** | AssignmentCompiler 接口定义 |
+| `src/orchestrator/profile/assignment-compiler-impl.ts` | **新增** | AssignmentCompiler 实现（含 auto-split） |
+| `src/orchestrator/core/dispatch-manager.ts` | **重构** | 注册链路、auto-split 处理、mode 约束注入 |
+| `src/orchestrator/core/dispatch-batch.ts` | **重构** | DispatchTaskContract: category → ownership + mode |
+| `src/orchestrator/core/dispatch-routing-service.ts` | **重构** | 方法/接口重命名，category → ownership |
+| `src/orchestrator/prompts/orchestrator-prompts.ts` | **重构** | hint 协议、身份常量、示例代码 |
+| `src/orchestrator/profile/prompt-builder.ts` | **重构** | mode 约束注入到 worker prompt |
+| `src/orchestrator/profile/types.ts` | **重构** | InjectionContext 新增 mode 字段 |
+| `src/tools/orchestration-executor.ts` | **重构** | 工具 schema: category → ownership_hint + mode_hint |
+| `src/orchestrator/profile/ownership-guard.ts` | **重构** | 降级为内部断言 |

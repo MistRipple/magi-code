@@ -2,8 +2,8 @@ import { mount, type Component } from 'svelte';
 import App from './App.svelte';
 import './styles/global.css';
 import './styles/messages.css';
-import { initMessageHandler } from './lib/message-handler';
-import { initializeState, setCurrentSessionId } from './stores/messages.svelte';
+import { initMessageHandler, primeEventSeqTracking } from './lib/message-handler';
+import { getState, initializeState, setCurrentSessionId } from './stores/messages.svelte';
 import { i18n } from './stores/i18n.svelte';
 import type { ClientBridge } from '../../shared/bridges/client-bridge';
 import { notifyBridgeReady, setClientBridge } from '../../shared/bridges/bridge-runtime';
@@ -105,6 +105,11 @@ export function bootstrapApp(
   }
 
   initializeState();
+  const restoredState = getState();
+  primeEventSeqTracking(
+    restoredState.currentSessionId,
+    restoredState.timelineProjection?.lastAppliedEventSeq || 0,
+  );
   initMessageHandler(bridge);
   installPasteDeduplication();
   installClipboardShortcuts();

@@ -15,12 +15,8 @@ export function preprocessMarkdown(content: string, isStreaming: boolean): strin
   let processed = content;
 
   // 0. 修复被转义的换行符（字面量 \n → 真正的换行）
-  // 只处理代码块外的文本，避免破坏代码块中的 \n 字面量
-  const parts = processed.split(/```/);
-  processed = parts.map((part, idx) => {
-    if (idx % 2 === 1) return part; // 代码块内部不处理
-    return part.replace(/\\n/g, '\n');
-  }).join('```');
+  // 只处理 fenced code block 之外的文本，避免破坏代码块中的 \n 字面量
+  processed = replaceEscapedNewlinesOutsideFences(processed);
 
   // 1. 特殊标签处理：将 <think> 转换为引用块
   // 防止 marked 将其视为 HTML 块而忽略内部的 Markdown 格式
@@ -42,4 +38,37 @@ export function preprocessMarkdown(content: string, isStreaming: boolean): strin
   }
 
   return processed;
+}
+
+function replaceEscapedNewlinesOutsideFences(input: string): string {
+  const lines = input.split('\n');
+  const output: string[] = [];
+  let inFence = false;
+  let fenceMarker = '';
+
+  for (const line of lines) {
+    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    if (fenceMatch) {
+      const markerToken = fenceMatch[1];
+      const markerChar = markerToken[0];
+      if (!inFence) {
+        const markerLength = Math.max(3, markerToken.length);
+        const rest = line.slice(fenceMatch[0].length);
+        // 同行开闭（```inline```）不改变代码块状态，避免污染后续行。
+        const hasInlineClosingFence = new RegExp(`${markerChar}{${markerLength},}`).test(rest);
+        if (!hasInlineClosingFence) {
+          inFence = true;
+          fenceMarker = markerChar;
+        }
+      } else if (fenceMarker === markerChar) {
+        inFence = false;
+        fenceMarker = '';
+      }
+      output.push(line);
+      continue;
+    }
+    output.push(inFence ? line : line.replace(/\\n/g, '\n'));
+  }
+
+  return output.join('\n');
 }

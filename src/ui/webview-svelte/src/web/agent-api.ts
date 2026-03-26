@@ -1,4 +1,5 @@
 import { getDefaultAgentBaseUrl } from '../../../../shared/agent-shared-config';
+import { getTransport } from '../../../shared/transport';
 
 const AGENT_BASE_URL_STORAGE_KEY = 'magi-agent-base-url';
 const AGENT_PROBE_TIMEOUT_MS = 1500;
@@ -136,6 +137,10 @@ export interface AgentChangeDiffPayload {
   diff: string;
   additions: number;
   deletions: number;
+  originalContent?: string;
+  currentContent?: string;
+  currentAbsolutePath?: string;
+  currentExists?: boolean;
 }
 
 export interface AgentTaskExecutionResult {
@@ -150,18 +155,38 @@ interface AgentBindingContext {
   sessionId: string;
 }
 
+function safeReadLocalStorage(key: string): string {
+  if (typeof window === 'undefined') {
+    return '';
+  }
+  try {
+    return localStorage.getItem(key)?.trim() || '';
+  } catch (error) {
+    console.warn(`[agent-api] localStorage 读取失败(${key})`, error);
+    return '';
+  }
+}
+
+function safeWriteLocalStorage(key: string, value: string): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    localStorage.setItem(key, value);
+  } catch (error) {
+    console.warn(`[agent-api] localStorage 写入失败(${key})`, error);
+  }
+}
+
 function persistAgentBaseUrl(baseUrl: string): void {
   if (typeof window === 'undefined' || !baseUrl.trim()) {
     return;
   }
-  localStorage.setItem(AGENT_BASE_URL_STORAGE_KEY, baseUrl.trim());
+  safeWriteLocalStorage(AGENT_BASE_URL_STORAGE_KEY, baseUrl.trim());
 }
 
 function getStoredAgentBaseUrl(): string {
-  if (typeof window === 'undefined') {
-    return '';
-  }
-  return localStorage.getItem(AGENT_BASE_URL_STORAGE_KEY)?.trim() || '';
+  return safeReadLocalStorage(AGENT_BASE_URL_STORAGE_KEY);
 }
 
 function collectAgentBaseUrlCandidates(): string[] {
@@ -191,7 +216,7 @@ async function isReachableAgentBaseUrl(baseUrl: string): Promise<boolean> {
     ? window.setTimeout(() => controller.abort(), AGENT_PROBE_TIMEOUT_MS)
     : null;
   try {
-    const response = await fetch(`${baseUrl.replace(/\/$/, '')}/health`, {
+    const response = await getTransport().request(`${baseUrl.replace(/\/$/, '')}/health`, {
       cache: 'no-store',
       ...(controller ? { signal: controller.signal } : {}),
     });
@@ -225,18 +250,19 @@ export function dispatchAgentConnectionEvent(detail: AgentConnectionEventDetail)
 
 async function parseAgentJson<T>(response: Response, action: string): Promise<T> {
   if (!response.ok) {
+    let backendError: string | null = null;
     const contentType = response.headers.get('content-type') || '';
     if (contentType.includes('application/json')) {
       try {
         const payload = await response.json() as { error?: string };
-        if (payload?.error) {
-          throw new Error(payload.error);
+        if (typeof payload?.error === 'string' && payload.error.trim()) {
+          backendError = payload.error.trim();
         }
       } catch {
         // ignore malformed error payload and fallback to generic message
       }
     }
-    throw new Error(`${action} failed: ${response.status}`);
+    throw new Error(backendError || `${action} failed: ${response.status}`);
   }
 
   const contentType = response.headers.get('content-type') || '';
@@ -312,15 +338,21 @@ function resolveAgentBindingContext(): AgentBindingContext {
     return { workspaceId: '', workspacePath: '', sessionId: '' };
   }
   const currentUrl = new URL(window.location.href);
+  const bootstrapWindow = window as unknown as {
+    __INITIAL_WORKSPACE_ID__?: string;
+    __INITIAL_WORKSPACE_PATH__?: string;
+  };
   return {
     workspaceId: currentUrl.searchParams.get('workspaceId')?.trim()
-      || localStorage.getItem('magi-workspace-id')
+      || bootstrapWindow.__INITIAL_WORKSPACE_ID__?.trim()
+      || safeReadLocalStorage('magi-workspace-id')
       || '',
     workspacePath: currentUrl.searchParams.get('workspacePath')?.trim()
-      || localStorage.getItem('magi-workspace-path')
+      || bootstrapWindow.__INITIAL_WORKSPACE_PATH__?.trim()
+      || safeReadLocalStorage('magi-workspace-path')
       || '',
     sessionId: currentUrl.searchParams.get('sessionId')?.trim()
-      || localStorage.getItem('magi-session-id')
+      || safeReadLocalStorage('magi-session-id')
       || '',
   };
 }
@@ -340,23 +372,30 @@ function buildBoundQuery(extra: Record<string, string>): string {
 }
 
 async function postBoundJson<T>(pathname: string, payload: Record<string, unknown>, action: string): Promise<T> {
-  const binding = resolveAgentBindingContext();
-  const response = await fetch(agentUrl(pathname), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      workspaceId: binding.workspaceId,
-      workspacePath: binding.workspacePath,
-      sessionId: binding.sessionId,
-      ...payload,
-    }),
-  });
-  return parseAgentJson<T>(response, action);
+  try {
+    const binding = resolveAgentBindingContext();
+    const response = await getTransport().request(agentUrl(pathname), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        workspaceId: binding.workspaceId,
+        workspacePath: binding.workspacePath,
+        sessionId: binding.sessionId,
+        ...payload,
+      }),
+    });
+    return parseAgentJson<T>(response, action);
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error('无法连接 Local Agent。请确认 Agent 已启动，或检查当前访问地址是否正确。');
+    }
+    throw error;
+  }
 }
 
 export async function listAgentWorkspaces(): Promise<AgentWorkspaceSummary[]> {
   try {
-    const response = await fetch(agentUrl('/api/workspaces'));
+    const response = await getTransport().request(agentUrl('/api/workspaces'));
     const payload = await parseAgentJson<{ workspaces?: AgentWorkspaceSummary[] }>(response, 'list workspaces');
     return Array.isArray(payload.workspaces) ? payload.workspaces : [];
   } catch (error) {
@@ -369,7 +408,7 @@ export async function listAgentWorkspaces(): Promise<AgentWorkspaceSummary[]> {
 
 export async function registerAgentWorkspace(rootPath: string, name?: string): Promise<AgentWorkspaceSummary[]> {
   try {
-    const response = await fetch(agentUrl('/api/workspaces/register'), {
+    const response = await getTransport().request(agentUrl('/api/workspaces/register'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -388,7 +427,7 @@ export async function registerAgentWorkspace(rootPath: string, name?: string): P
 
 export async function removeAgentWorkspace(workspaceId: string, workspacePath: string): Promise<AgentWorkspaceSummary[]> {
   try {
-    const response = await fetch(agentUrl('/api/workspaces/remove'), {
+    const response = await getTransport().request(agentUrl('/api/workspaces/remove'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -408,7 +447,7 @@ export async function removeAgentWorkspace(workspaceId: string, workspacePath: s
 
 export async function renameAgentWorkspace(workspaceId: string, workspacePath: string, name: string): Promise<AgentWorkspaceSummary[]> {
   try {
-    const response = await fetch(agentUrl('/api/workspaces/rename'), {
+    const response = await getTransport().request(agentUrl('/api/workspaces/rename'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -429,7 +468,7 @@ export async function renameAgentWorkspace(workspaceId: string, workspacePath: s
 
 export async function pickAgentWorkspace(): Promise<AgentWorkspacePickResult> {
   try {
-    const response = await fetch(agentUrl('/api/workspaces/pick'));
+    const response = await getTransport().request(agentUrl('/api/workspaces/pick'));
     return await parseAgentJson<AgentWorkspacePickResult>(response, 'pick workspace');
   } catch (error) {
     if (error instanceof TypeError) {
@@ -454,7 +493,7 @@ export interface DirectoryListResult {
 
 export async function listAgentDirectory(dirPath?: string): Promise<DirectoryListResult> {
   const params = dirPath ? `?path=${encodeURIComponent(dirPath)}` : '';
-  const response = await fetch(agentUrl(`/api/filesystem/list${params}`));
+  const response = await getTransport().request(agentUrl(`/api/filesystem/list${params}`));
   return await parseAgentJson<DirectoryListResult>(response, 'list directory');
 }
 
@@ -467,7 +506,7 @@ export async function getWorkspaceSessions(
     if (preferredSessionId && preferredSessionId.trim()) {
       query.set('sessionId', preferredSessionId.trim());
     }
-    const response = await fetch(
+    const response = await getTransport().request(
       agentUrl('/api/workspaces/sessions', query.toString())
     );
     return await parseAgentJson<AgentWorkspaceSessionsSnapshot>(response, 'workspace sessions');
@@ -497,7 +536,7 @@ export async function saveAgentCurrentSession(): Promise<AgentBootstrapSnapshot>
 
 export async function getAgentSessionNotifications(): Promise<AgentSessionNotificationsPayload> {
   const query = buildBoundQuery({});
-  const response = await fetch(agentUrl('/api/session/notifications', query));
+  const response = await getTransport().request(agentUrl('/api/session/notifications', query));
   return await parseAgentJson<AgentSessionNotificationsPayload>(response, 'load session notifications');
 }
 
@@ -614,7 +653,7 @@ export async function answerAgentWorkerQuestion(answer: string | null): Promise<
 
 export async function getAgentRuntimeSettings(): Promise<AgentRuntimeSettings> {
   try {
-    const response = await fetch(agentUrl('/api/settings/runtime'));
+    const response = await getTransport().request(agentUrl('/api/settings/runtime'));
     return await parseAgentJson<AgentRuntimeSettings>(response, 'load runtime settings');
   } catch (error) {
     if (error instanceof TypeError) {
@@ -625,14 +664,14 @@ export async function getAgentRuntimeSettings(): Promise<AgentRuntimeSettings> {
 }
 
 export async function getAgentStatus(): Promise<Record<string, unknown>> {
-  const response = await fetch(agentUrl('/api/status'));
+  const response = await getTransport().request(agentUrl('/api/status'));
   return parseAgentJson<Record<string, unknown>>(response, 'get status');
 }
 
 export async function getAgentLanAccessInfo(): Promise<AgentLanAccessInfo> {
   try {
     const query = buildBoundQuery({});
-    const response = await fetch(agentUrl(`/api/lan-access`, query));
+    const response = await getTransport().request(agentUrl(`/api/lan-access`, query));
     return await parseAgentJson<AgentLanAccessInfo>(response, 'lan access');
   } catch (error) {
     if (error instanceof TypeError) {
@@ -651,7 +690,7 @@ export async function stopAgentTunnel(): Promise<AgentTunnelState> {
 }
 
 export async function getAgentTunnelStatus(): Promise<AgentTunnelState> {
-  const response = await fetch(agentUrl('/api/tunnel/status'));
+  const response = await getTransport().request(agentUrl('/api/tunnel/status'));
   return await parseAgentJson<AgentTunnelState>(response, 'tunnel status');
 }
 
@@ -662,7 +701,7 @@ export async function resetAgentExecutionStats(): Promise<Record<string, unknown
 export async function getAgentExecutionStats(): Promise<AgentExecutionStatsPayload> {
   try {
     const query = buildBoundQuery({});
-    const response = await fetch(agentUrl('/api/settings/stats', query));
+    const response = await getTransport().request(agentUrl('/api/settings/stats', query));
     return await parseAgentJson<AgentExecutionStatsPayload>(response, 'load execution stats');
   } catch (error) {
     if (error instanceof TypeError) {
@@ -722,19 +761,19 @@ export async function clearAgentProjectKnowledge(): Promise<AgentKnowledgeMutati
 
 export async function getAgentAdrs(filter?: { status?: string }): Promise<Record<string, unknown>> {
   const query = buildBoundQuery(filter?.status ? { status: filter.status } : {});
-  const response = await fetch(agentUrl(`/api/knowledge/adrs`, query));
+  const response = await getTransport().request(agentUrl(`/api/knowledge/adrs`, query));
   return await parseAgentJson<Record<string, unknown>>(response, 'load adrs');
 }
 
 export async function getAgentFaqs(filter?: { category?: string }): Promise<Record<string, unknown>> {
   const query = buildBoundQuery(filter?.category ? { category: filter.category } : {});
-  const response = await fetch(agentUrl(`/api/knowledge/faqs`, query));
+  const response = await getTransport().request(agentUrl(`/api/knowledge/faqs`, query));
   return await parseAgentJson<Record<string, unknown>>(response, 'load faqs');
 }
 
 export async function searchAgentFaqs(keyword: string): Promise<Record<string, unknown>> {
   const query = buildBoundQuery({ keyword });
-  const response = await fetch(agentUrl(`/api/knowledge/faqs/search`, query));
+  const response = await getTransport().request(agentUrl(`/api/knowledge/faqs/search`, query));
   return await parseAgentJson<Record<string, unknown>>(response, 'search faqs');
 }
 
@@ -767,7 +806,7 @@ export async function deleteAgentLearning(id: string): Promise<AgentKnowledgeMut
 }
 
 export async function loadAgentMcpServers(): Promise<Record<string, unknown>> {
-  const response = await fetch(agentUrl('/api/settings/mcp'));
+  const response = await getTransport().request(agentUrl('/api/settings/mcp'));
   return await parseAgentJson<Record<string, unknown>>(response, 'load mcp servers');
 }
 
@@ -800,7 +839,7 @@ export async function disconnectAgentMcpServer(serverId: string): Promise<Record
 }
 
 export async function loadAgentRepositories(): Promise<Record<string, unknown>> {
-  const response = await fetch(agentUrl('/api/settings/repositories'));
+  const response = await getTransport().request(agentUrl('/api/settings/repositories'));
   return await parseAgentJson<Record<string, unknown>>(response, 'load repositories');
 }
 
@@ -821,7 +860,7 @@ export async function refreshAgentRepository(repositoryId: string): Promise<Reco
 }
 
 export async function loadAgentSkillLibrary(): Promise<Record<string, unknown>> {
-  const response = await fetch(agentUrl('/api/settings/skills/library'));
+  const response = await getTransport().request(agentUrl('/api/settings/skills/library'));
   return await parseAgentJson<Record<string, unknown>>(response, 'load skill library');
 }
 
@@ -860,7 +899,7 @@ export async function updateAllAgentSkills(): Promise<Record<string, unknown>> {
 export async function getAgentChangeDiff(filePath: string): Promise<AgentChangeDiffPayload> {
   try {
     const query = buildBoundQuery({ filePath });
-    const response = await fetch(agentUrl(`/api/changes/diff`, query));
+    const response = await getTransport().request(agentUrl(`/api/changes/diff`, query));
     return await parseAgentJson<AgentChangeDiffPayload>(response, 'load change diff');
   } catch (error) {
     if (error instanceof TypeError) {
@@ -873,7 +912,7 @@ export async function getAgentChangeDiff(filePath: string): Promise<AgentChangeD
 export async function getAgentFilePreview(filePath: string): Promise<AgentFilePreviewPayload> {
   try {
     const query = buildBoundQuery({ filePath });
-    const response = await fetch(agentUrl(`/api/files/content`, query));
+    const response = await getTransport().request(agentUrl(`/api/files/content`, query));
     return await parseAgentJson<AgentFilePreviewPayload>(response, 'load file preview');
   } catch (error) {
     if (error instanceof TypeError) {

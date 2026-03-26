@@ -2,37 +2,42 @@
  * PromptBuilder (single prompt assembly)
  *
  * 工具信息由 ToolManager.buildToolsSummary() 动态注入，
- * 核心能力由 ProfileLoader 从 assignedCategories 推导后通过 persona.strengths 传入，
+ * 核心能力由 ProfileLoader 从 persona.strengths 传入，
  * 不在此处硬编码具体工具名或能力声明。
  */
 
 import { WorkerPersona, InjectionContext } from './types';
-import { CATEGORY_DEFINITIONS } from './builtin/category-definitions';
+import { getModeConstraints, type TaskMode, isValidMode } from './task-taxonomy';
 
 export class PromptBuilder {
   buildWorkerPrompt(persona: WorkerPersona, context: InjectionContext): string {
     const sections: string[] = [];
     sections.push(this.buildRoleSection(persona));
 
-    // 核心能力（从 assignedCategories 推导，由 ProfileLoader 填充到 persona.strengths）
     if (persona.strengths.length > 0) {
       sections.push(`## Core Competencies\n${persona.strengths.map(s => `- ${s}`).join('\n')}`);
     }
 
-    if (context.category) {
-      const categoryDef = CATEGORY_DEFINITIONS[context.category];
-      if (!categoryDef) {
-        throw new Error(`Unknown category: ${context.category}`);
+    // 注入 mode 约束（implement 为默认模式，不注入额外约束，避免噪声）
+    if (context.mode && context.mode !== 'implement' && isValidMode(context.mode)) {
+      const modeConstraints = getModeConstraints(context.mode as TaskMode);
+      sections.push(`## Execution Mode: ${context.mode.toUpperCase()}`);
+      sections.push(modeConstraints.description);
+
+      if (modeConstraints.behavioralConstraints.length > 0) {
+        sections.push(`### Behavioral Constraints\n${modeConstraints.behavioralConstraints.map(c => `- ${c}`).join('\n')}`);
       }
 
-      sections.push(`## Task Category\n${categoryDef.displayName}`);
-
-      if (categoryDef.guidance.focus.length > 0) {
-        sections.push(`## Focus Areas\n${categoryDef.guidance.focus.map(f => `- ${f}`).join('\n')}`);
+      if (modeConstraints.readOnly) {
+        sections.push(`### ⚠️ READ-ONLY MODE\nYou are in read-only mode. Do not modify any files.`);
       }
 
-      if (categoryDef.guidance.constraints.length > 0) {
-        sections.push(`## Behavioral Constraints\n${categoryDef.guidance.constraints.map(c => `- ${c}`).join('\n')}`);
+      if (modeConstraints.allowedFilePatterns && modeConstraints.allowedFilePatterns.length > 0) {
+        sections.push(`### Allowed File Patterns\nYou may only modify files matching these patterns:\n${modeConstraints.allowedFilePatterns.map(p => `- ${p.toString()}`).join('\n')}`);
+      }
+
+      if (modeConstraints.forbiddenTools && modeConstraints.forbiddenTools.length > 0) {
+        sections.push(`### Restricted Tools\nThe following tools are disabled for this mode: ${modeConstraints.forbiddenTools.join(', ')}`);
       }
     }
 

@@ -341,6 +341,7 @@
 
   // 判断输出内容是否包含 markdown 格式（标题、表格、列表等）
   const outputText = $derived(formatContent(output));
+  const isToolOutputStreaming = $derived(status === 'running' || status === 'pending');
   const isMarkdownOutput = $derived.by(() => {
     if (!outputText || outputText.length < 20) return false;
     // JSON 输出不走 Markdown 渲染，避免负数/列表结构被误判
@@ -580,7 +581,7 @@
                 </div>
                 {#if isMarkdownOutput}
                   <div class="markdown-output">
-                    <MarkdownContent content={outputText} />
+                    <MarkdownContent content={outputText} isStreaming={isToolOutputStreaming} />
                   </div>
                 {:else}
                   <pre class="section-content">{outputText}</pre>

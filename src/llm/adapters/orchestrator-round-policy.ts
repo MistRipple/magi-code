@@ -170,14 +170,14 @@ export function evaluateNoTodoToolLoopEscalation(input: {
 export function decideNoTodoPlainResponseAction(input: {
   assistantText: string;
   totalToolResultCount: number;
-  toolDefinitionCount: number;
+  explicitOrchestrationRequest: boolean;
   outcomeStatus?: MissionOutcomeStatus;
   normalizedOutcomeStepCount: number;
   noTodoOutcomeMissingStreak: number;
 }): NoTodoPlainResponseDecision {
   const hasToolEvidence = input.totalToolResultCount > 0;
-  const hasToolCapability = input.toolDefinitionCount > 0 || hasToolEvidence;
   const hasOutcomeSignal = input.normalizedOutcomeStepCount > 0 || Boolean(input.outcomeStatus);
+  const requiresGovernedOutcome = input.explicitOrchestrationRequest || hasToolEvidence;
 
   if (!input.assistantText.trim()) {
     return {
@@ -186,7 +186,7 @@ export function decideNoTodoPlainResponseAction(input: {
     };
   }
 
-  if (!hasToolCapability && !hasOutcomeSignal) {
+  if (!requiresGovernedOutcome && !hasOutcomeSignal) {
     return {
       action: 'terminate_completed',
       nextMissingOutcomeStreak: 0,

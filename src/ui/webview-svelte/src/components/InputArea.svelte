@@ -7,6 +7,7 @@
     getInteractionMode,
     getRequestedInteractionMode,
     getQueuedMessages,
+    getRequestBinding,
     isInteractionModeSyncing,
     requestInteractionMode,
     messagesState,
@@ -103,6 +104,27 @@
   let lastSendTime = $state(0);
   const RATE_LIMIT_IDLE = 300;      // 空闲状态：300ms
   const RATE_LIMIT_PROCESSING = 1000;  // 执行中：1 秒
+  let pendingComposerResetRequestId = $state<string | null>(null);
+
+  function clearComposerState() {
+    inputValue = '';
+    selectedImages = [];
+    selectedSkill = null;
+  }
+
+  $effect(() => {
+    const requestId = pendingComposerResetRequestId;
+    if (!requestId) {
+      return;
+    }
+    const hasBinding = Boolean(getRequestBinding(requestId));
+    const hasPending = messagesState.pendingRequests.has(requestId);
+    if (!hasBinding && !hasPending) {
+      return;
+    }
+    clearComposerState();
+    pendingComposerResetRequestId = null;
+  });
 
   // 发送消息（支持图片附件）
   // 执行中发送输入 = 暂存队列（当前轮结束后 FIFO 自动续跑）
@@ -112,10 +134,11 @@
       return;
     }
 
-    const content = inputValue.trim();
+    const rawContent = inputValue;
+    const normalizedContent = rawContent.trim();
     // 允许只发送图片（无文字）或只发送文字，或只发送已选技能
     // 执行中允许发送，后端将执行"打断并重启"
-    if ((!content && !selectedSkill && selectedImages.length === 0) || isInteractionBlocking) return;
+    if ((!normalizedContent && !selectedSkill && selectedImages.length === 0) || isInteractionBlocking) return;
 
     // P1-1: 限频检查
     const now = Date.now();
@@ -128,8 +151,8 @@
 
     // 拼接技能前缀：将徽章转换为 /skillName 斜杠命令
     const finalPrompt = selectedSkill
-      ? `/${selectedSkill.name} ${content}`.trim()
-      : content;
+      ? (normalizedContent ? `/${selectedSkill.name} ${rawContent}` : `/${selectedSkill.name}`)
+      : rawContent;
 
     if (finalPrompt.length > MAX_INPUT_CHARS) {
       addToast('warning', i18n.t('input.inputTooLong', { length: finalPrompt.length, max: MAX_INPUT_CHARS }));
@@ -149,9 +172,11 @@
         taskId: '',  // 后端自动关联当前任务
         content: finalPrompt,
       });
+      clearComposerState();
     } else {
       // 空闲状态：发送新任务
       const requestId = generateId();
+      pendingComposerResetRequestId = requestId;
       vscode.postMessage({
         type: 'executeTask',
         prompt: finalPrompt || i18n.t('input.analyzeImages'),
@@ -160,11 +185,6 @@
         images: selectedImages.map(img => ({ dataUrl: img.dataUrl })),
       });
     }
-
-    // 清理输入状态
-    inputValue = '';
-    selectedImages = [];
-    selectedSkill = null;
   }
 
   // 处理键盘事件

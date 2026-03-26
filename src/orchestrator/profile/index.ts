@@ -9,7 +9,6 @@ export { WORKER_PERSONAS, CATEGORY_DEFINITIONS, CATEGORY_RULES, DEFAULT_ASSIGNME
 export { ProfileLoader } from './profile-loader';
 export { GuidanceInjector } from './guidance-injector';
 export { PromptBuilder } from './prompt-builder';
-export { CategoryResolver } from './category-resolver';
 export {
   DomainDetector,
   OWNERSHIP_DOMAIN_CATEGORIES,

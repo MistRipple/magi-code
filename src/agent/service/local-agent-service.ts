@@ -354,7 +354,9 @@ export class LocalAgentService {
     }
     ensureAgentStateDir();
     this.server = http.createServer((request, response) => {
-      void this.handleRequest(request, response);
+      void this.handleRequest(request, response).catch((error) => {
+        this.handleRequestFailure(request, response, error);
+      });
     });
     try {
       await new Promise<void>((resolve, reject) => {
@@ -610,7 +612,9 @@ export class LocalAgentService {
         return;
       }
       const requestedSessionId = url.searchParams.get('sessionId');
-      await runtime.bindSession(requestedSessionId);
+      // SSE 是纯订阅行为，不应修改 runtime 全局状态（activeSessionId）。
+      // 消息过滤由 attachEventStream 内部的 targetSessionId 处理。
+      // session 绑定由 executeTask 等业务 API 各自负责。
       this.attachEventStream(response, runtime, requestedSessionId);
       return;
     }
@@ -2307,11 +2311,26 @@ export class LocalAgentService {
     if (!diffResult) {
       return null;
     }
+    const snapshot = resolved.workspace.sessionManager.getSnapshot(resolved.session.id, target.relativePath);
+    const snapshotFile = snapshot
+      ? resolved.workspace.sessionManager.getSnapshotFilePath(resolved.session.id, snapshot.id)
+      : '';
+    const originalContent = snapshotFile && fs.existsSync(snapshotFile)
+      ? fs.readFileSync(snapshotFile, 'utf8')
+      : '';
+    const currentExists = fs.existsSync(target.absolutePath);
+    const currentContent = currentExists
+      ? fs.readFileSync(target.absolutePath, 'utf8')
+      : '';
     return {
       filePath: diffResult.filePath,
       diff: diffGenerator.formatDiff(diffResult),
       additions: diffResult.additions,
       deletions: diffResult.deletions,
+      originalContent,
+      currentContent,
+      currentAbsolutePath: target.absolutePath,
+      currentExists,
     };
   }
 
@@ -3421,6 +3440,36 @@ export class LocalAgentService {
       return null;
     }
     return JSON.parse(raw) as Record<string, unknown>;
+  }
+
+  private handleRequestFailure(
+    request: http.IncomingMessage,
+    response: http.ServerResponse,
+    error: unknown,
+  ): void {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const method = request.method || 'UNKNOWN';
+    const requestUrl = request.url || '/';
+    this.appendLog(`[agent.http] ${method} ${requestUrl} failed: ${errorMessage}`);
+
+    const isInvalidJson = error instanceof SyntaxError;
+    const statusCode = isInvalidJson ? 400 : 500;
+    const payload = {
+      error: isInvalidJson ? 'invalid_json_body' : (errorMessage || 'internal_error'),
+    };
+
+    if (!response.headersSent && !response.writableEnded) {
+      this.sendJson(response, statusCode, payload);
+      return;
+    }
+
+    if (!response.writableEnded) {
+      try {
+        response.end();
+      } catch {
+        // ignore end failure
+      }
+    }
   }
 
   private setCorsHeaders(response: http.ServerResponse): void {

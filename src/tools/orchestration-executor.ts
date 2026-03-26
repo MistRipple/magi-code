@@ -18,20 +18,6 @@ import { repairJSON } from '../llm/protocol/adapters/protocol-utils';
 import type { WorkerSlot } from '../types';
 
 /**
- * Category → Worker 映射条目（由 DispatchManager 从 ProfileLoader 注入）
- */
-export interface CategoryWorkerEntry {
-  category: string;
-  displayName: string;
-  worker: WorkerSlot;
-}
-
-const DISPATCH_CATEGORY_PRIORITY = ['frontend', 'backend', 'integration', 'test', 'document', 'data_analysis'] as const;
-const DISPATCH_CATEGORY_PRIORITY_INDEX = new Map<string, number>(
-  DISPATCH_CATEGORY_PRIORITY.map((category, index) => [category, index]),
-);
-
-/**
  * worker_dispatch 任务合同（结构化）
  */
 export interface DispatchTaskContractInput {
@@ -67,7 +53,10 @@ export interface DispatchTaskCollaborationContracts {
  */
 export type DispatchTaskHandler = (params: {
   worker: 'auto';
-  category: string;
+  /** ownership hint（LLM 提供的归属建议，可为 'auto'） */
+  ownershipHint: string;
+  /** mode hint（LLM 提供的执行模式建议，可为 'auto'） */
+  modeHint: string;
   /** 幂等键：用于跨重试/重放去重，建议由调用方稳定提供 */
   idempotencyKey?: string;
   /** 是否要求子任务对目标文件产生实际修改 */
@@ -98,8 +87,10 @@ export type DispatchTaskHandler = (params: {
   status: 'dispatched' | 'failed';
   /** 实际执行的 Worker（可能与请求值不同） */
   worker?: WorkerSlot;
-  /** 路由分类（用于审计与可解释性） */
-  category?: string;
+  /** 路由归属 */
+  ownership?: string;
+  /** 执行模式 */
+  mode?: string;
   /** 任务简短名称 */
   task_name?: string;
   /** 路由解释（含降级原因） */
@@ -272,8 +263,6 @@ export class OrchestrationExecutor {
 
   /** 动态 Worker 列表（必须由 MissionDrivenEngine 从 ProfileLoader 注入） */
   private availableWorkers: { slot: WorkerSlot; description: string }[] = [];
-  /** Category → Worker 映射（必须由 DispatchManager 从 ProfileLoader 注入） */
-  private categoryWorkerMap: CategoryWorkerEntry[] = [];
   /** 最近一次 todo_list 快照（用于 todo_update 前置校验） */
   private lastTodoSnapshot: {
     ids: Set<string>;
@@ -340,49 +329,11 @@ export class OrchestrationExecutor {
     this.availableWorkers = workers;
   }
 
-  /**
-   * 设置 Category → Worker 映射（由 DispatchManager 从 ProfileLoader 注入）
-   * 用于 worker_dispatch 工具 schema 的 category enum 和描述
-   */
-  setCategoryWorkerMap(map: CategoryWorkerEntry[]): void {
-    this.categoryWorkerMap = [...map].sort((left, right) => {
-      const leftPriority = DISPATCH_CATEGORY_PRIORITY_INDEX.get(left.category) ?? Number.MAX_SAFE_INTEGER;
-      const rightPriority = DISPATCH_CATEGORY_PRIORITY_INDEX.get(right.category) ?? Number.MAX_SAFE_INTEGER;
-      if (leftPriority !== rightPriority) {
-        return leftPriority - rightPriority;
-      }
-      return left.category.localeCompare(right.category);
-    });
-  }
-
   private getWorkerEnum(): string[] {
     if (this.availableWorkers.length === 0) {
       logger.warn('OrchestrationExecutor.getWorkerEnum: Worker 列表未注入，使用空列表', undefined, LogCategory.TOOLS);
     }
     return this.availableWorkers.map(w => w.slot);
-  }
-
-  private getCategoryEnum(): string[] {
-    return this.categoryWorkerMap.map(e => e.category);
-  }
-
-  /**
-   * 构建 category 参数的分工映射描述
-   * 按 Worker 分组，格式：worker: category1(显示名)/category2(显示名)
-   */
-  private getCategoryMappingDescription(): string {
-    const byWorker = new Map<string, CategoryWorkerEntry[]>();
-    for (const entry of this.categoryWorkerMap) {
-      const list = byWorker.get(entry.worker) || [];
-      list.push(entry);
-      byWorker.set(entry.worker, list);
-    }
-    return Array.from(byWorker.entries())
-      .map(([worker, entries]) => {
-        const categories = entries.map(e => `${e.category}(${e.displayName})`).join('/');
-        return `${categories} → ${worker}`;
-      })
-      .join('；');
   }
 
   /**
@@ -471,18 +422,20 @@ export class OrchestrationExecutor {
   // ===========================================================================
 
   private getDispatchTaskDefinition(): ExtendedToolDefinition {
-    const categoryEnum = this.getCategoryEnum();
-    const mappingDesc = this.getCategoryMappingDescription();
-
     const taskItemProperties: Record<string, any> = {
       task_name: {
         type: 'string',
         description: '标准的工程化任务名称，简短概括任务内容（例如：重构用户登录模块，修复导航栏溢出 Bug 等），不要照抄用户原始对话。'
       },
-      category: {
+      ownership_hint: {
         type: 'string',
-        ...(categoryEnum.length > 0 ? { enum: categoryEnum } : {}),
-        description: `任务分类（决定 Assignment ownership 与执行 Worker 的唯一依据）。优先使用 frontend/backend/integration/test/document/data_analysis 这类 ownership 分类；若任务只是 review/debug/refactor/architecture 等任务风格，也必须在 task_name/goal/context 中明确其单一 ownership 领域，系统会据此归一化路由。若一个功能同时涉及 frontend/backend 等多个职责域，必须先拆成多个任务，再分别设置 category。分工映射：${mappingDesc || '未配置'}`,
+        enum: ['frontend', 'backend', 'integration', 'data_analysis', 'general', 'auto'],
+        description: '任务归属域（决定由哪个 Worker 执行）。frontend=前端UI/组件/样式，backend=后端API/数据库/服务端，integration=跨端联调/集成，data_analysis=数据分析/可视化，general=通用任务，auto=由系统从任务文本自动推断。若一个功能同时涉及 frontend/backend 等多个职责域，必须先拆成多个任务再分别派发。',
+      },
+      mode_hint: {
+        type: 'string',
+        enum: ['implement', 'test', 'document', 'review', 'debug', 'refactor', 'architecture', 'auto'],
+        description: '任务执行模式（约束 Worker 的执行行为，不影响路由）。implement=功能实现（默认），test=编写/修复测试，document=编写文档，review=代码审查，debug=调试排查，refactor=重构，architecture=架构设计，auto=由系统从任务文本自动推断。',
       },
       goal: {
         type: 'string',
@@ -556,7 +509,7 @@ export class OrchestrationExecutor {
 
     return {
       name: 'worker_dispatch',
-      description: '向一个或多个专业 AI Worker 派发任务。支持一次性派发多个任务以实现并行处理。category 参数必须服务于 ownership 路由；若使用 review/debug/refactor/architecture 等任务风格分类，任务文本仍必须明确单一 ownership 领域，系统会先归一化 ownership 再路由 Worker。若一个功能同时涉及 frontend/backend 等多个职责域，必须先拆成多个任务，不能用单个泛化任务整包派发。',
+      description: '向一个或多个专业 AI Worker 派发任务。每个任务通过 ownership_hint 指定归属域（frontend/backend/integration 等，决定哪个 Worker 执行），通过 mode_hint 指定执行模式（implement/test/debug 等，约束 Worker 行为）。若一个功能同时涉及 frontend/backend 等多个职责域，必须先拆成多个任务，不能用单个泛化任务整包派发。',
       input_schema: {
         type: 'object',
         properties: {
@@ -566,11 +519,11 @@ export class OrchestrationExecutor {
           },
           tasks: {
             type: 'array',
-            description: '待派发的任务列表（至少 1 个）。每个任务将独立路由到对应 Worker 并行执行。每个任务应尽量保持单一 ownership；跨职责域功能应先拆分为多个任务。',
+            description: '待派发的任务列表（至少 1 个）。每个任务将独立路由到对应 Worker 并行执行。每个任务应尽量保持单一归属域；跨职责域功能应先拆分为多个任务。',
             items: {
               type: 'object',
               properties: taskItemProperties,
-              required: ['task_name', 'category', 'goal', 'acceptance', 'constraints', 'context', 'requires_modification'],
+              required: ['task_name', 'ownership_hint', 'mode_hint', 'goal', 'acceptance', 'constraints', 'context', 'requires_modification'],
             },
           },
         },
@@ -597,10 +550,20 @@ export class OrchestrationExecutor {
     if (!task.task_name || typeof task.task_name !== 'string' || !task.task_name.trim()) {
       return { ok: false, error: `${prefix}: task_name 是必填参数` };
     }
-    if (!task.category || typeof task.category !== 'string' || !task.category.trim()) {
-      const validCategories = this.getCategoryEnum();
-      return { ok: false, error: `${prefix}: category 是必填参数。可选值: ${validCategories.join(', ')}` };
+
+    // ownership_hint + mode_hint 验证（兼容旧 category 字段）
+    let ownershipHint = typeof task.ownership_hint === 'string' ? task.ownership_hint.trim() : '';
+    let modeHint = typeof task.mode_hint === 'string' ? task.mode_hint.trim() : '';
+
+    // 向后兼容：如果 LLM 仍产出旧 category 字段且新字段缺失，从 category 推导
+    if (!ownershipHint && typeof task.category === 'string' && task.category.trim()) {
+      ownershipHint = task.category.trim();
+      if (!modeHint) modeHint = 'auto';
     }
+
+    if (!ownershipHint) ownershipHint = 'auto';
+    if (!modeHint) modeHint = 'auto';
+
     if (!task.goal || typeof task.goal !== 'string' || !task.goal.trim()) {
       return { ok: false, error: `${prefix}: goal 是必填参数` };
     }
@@ -632,17 +595,12 @@ export class OrchestrationExecutor {
     const rawIdempotencyKey = typeof task.idempotency_key === 'string' ? task.idempotency_key.trim() : '';
     const idempotencyKey = rawIdempotencyKey || fallbackIdempotencyKey;
 
-    const category = task.category.trim();
-    const validCategories = this.getCategoryEnum();
-    if (validCategories.length > 0 && !validCategories.includes(category)) {
-      return { ok: false, error: `${prefix}: 未知分类 "${category}"。可选值: ${validCategories.join(', ')}` };
-    }
-
     return {
       ok: true,
       params: {
         worker: 'auto',
-        category,
+        ownershipHint,
+        modeHint,
         idempotencyKey,
         requiresModification: task.requires_modification,
         task_name: task.task_name.trim(),
@@ -695,7 +653,8 @@ export class OrchestrationExecutor {
 
     logger.info('worker_dispatch 开始批量派发', {
       taskCount: validatedParams.length,
-      categories: validatedParams.map(p => p.category),
+      ownerships: validatedParams.map(p => p.ownershipHint),
+      modes: validatedParams.map(p => p.modeHint),
       taskNames: validatedParams.map(p => p.task_name),
       missionTitle: missionTitle || undefined,
     }, LogCategory.TOOLS);

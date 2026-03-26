@@ -220,15 +220,15 @@ export class AgentWorkspaceRuntime {
 
   async executeTask(prompt: string, sessionId?: string, requestId?: string): Promise<RuntimeExecutionResult> {
     await this.bindSession(sessionId);
-    const trimmedPrompt = prompt.trim();
-    if (!trimmedPrompt) {
+    const effectivePrompt = typeof prompt === 'string' ? prompt : '';
+    if (!effectivePrompt.trim()) {
       return { success: false, error: t('provider.errors.emptyPrompt') };
     }
     const effectiveRequestId = requestId?.trim() || `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const turnId = `turn:${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-    const { userMessageId } = this.emitUserAndPlaceholder(effectiveRequestId, trimmedPrompt, turnId);
+    const { userMessageId } = this.emitUserAndPlaceholder(effectiveRequestId, effectivePrompt, turnId);
 
-    this.sessionManager.addMessageToSession(this.activeSessionId!, 'user', trimmedPrompt, undefined, 'orchestrator', undefined, {
+    this.sessionManager.addMessageToSession(this.activeSessionId!, 'user', effectivePrompt, undefined, 'orchestrator', undefined, {
       id: userMessageId,
       type: 'user_input',
       metadata: {
@@ -236,7 +236,7 @@ export class AgentWorkspaceRuntime {
         requestId: effectiveRequestId,
       },
     });
-    void this.orchestratorEngine.recordContextMessage('user', trimmedPrompt, this.activeSessionId!);
+    void this.orchestratorEngine.recordContextMessage('user', effectivePrompt, this.activeSessionId!);
     await this.sendStateUpdate();
 
     const messageHub = this.orchestratorEngine.getMessageHub();
@@ -249,7 +249,7 @@ export class AgentWorkspaceRuntime {
 
     try {
       taskContext = await this.orchestratorEngine.executeWithTaskContext(
-        trimmedPrompt,
+        effectivePrompt,
         this.activeSessionId!,
         [],
         turnId,
@@ -294,7 +294,7 @@ export class AgentWorkspaceRuntime {
             failureReason: effectiveFailureReason,
             recoverable,
           },
-          prompt: trimmedPrompt,
+          prompt: effectivePrompt,
           sessionId: this.activeSessionId || '',
         });
         await this.sendStateUpdate();
@@ -376,7 +376,7 @@ export class AgentWorkspaceRuntime {
           failureReason: effectiveFailureReason,
           recoverable,
         },
-        prompt: trimmedPrompt,
+        prompt: effectivePrompt,
         sessionId: this.activeSessionId || '',
       });
       await this.sendStateUpdate();
@@ -475,8 +475,8 @@ export class AgentWorkspaceRuntime {
 
   async appendMessage(_taskId: string, content: string): Promise<{ queued: boolean; queueId?: string }> {
     await this.ensureInitialized();
-    const trimmedContent = content.trim();
-    if (!trimmedContent) {
+    const effectiveContent = typeof content === 'string' ? content : '';
+    if (!effectiveContent.trim()) {
       this.sendToast(t('toast.supplementEmpty'), 'warning');
       return { queued: false };
     }
@@ -486,12 +486,12 @@ export class AgentWorkspaceRuntime {
     }
     const shouldQueue = this.orchestratorEngine.running || this.queuedMessagesDrainRunning;
     if (shouldQueue) {
-      const queued = this.enqueueQueuedMessage(sessionId, trimmedContent);
+      const queued = this.enqueueQueuedMessage(sessionId, effectiveContent);
       this.sendQueuedMessagesUpdate(sessionId);
       return { queued: true, queueId: queued.id };
     }
     const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const result = await this.executeTask(trimmedContent, sessionId, requestId);
+    const result = await this.executeTask(effectiveContent, sessionId, requestId);
     if (!result.success) {
       this.sendToast(t('toast.supplementFailed'), 'error');
     }
@@ -501,11 +501,11 @@ export class AgentWorkspaceRuntime {
   async updateQueuedMessage(queueId: string, content: string): Promise<boolean> {
     await this.ensureInitialized();
     const id = queueId.trim();
-    const trimmedContent = content.trim();
+    const effectiveContent = typeof content === 'string' ? content : '';
     if (!id) {
       return false;
     }
-    if (!trimmedContent) {
+    if (!effectiveContent.trim()) {
       this.sendToast(t('toast.supplementEmpty'), 'warning');
       return false;
     }
@@ -518,7 +518,7 @@ export class AgentWorkspaceRuntime {
     if (!target) {
       return false;
     }
-    target.content = trimmedContent;
+    target.content = effectiveContent;
     this.sendQueuedMessagesUpdate(sessionId);
     void this.drainQueuedMessagesIfIdle();
     return true;

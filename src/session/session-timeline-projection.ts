@@ -2,6 +2,7 @@ import type { ContentBlock as StandardContentBlock } from '../protocol/message-p
 import type { AgentType, WorkerSlot } from '../types/agent-types';
 import {
   compareTimelineSemanticOrder,
+  resolveTimelineAnchorTimestampFromMetadata,
   resolveTimelineBlockSeqFromMetadata,
   resolveTimelineCardStreamSeqFromMetadata,
   resolveTimelineDetailedVersionFromMetadata,
@@ -287,6 +288,59 @@ function resolveMessageMetadata(message: Pick<SessionTimelineProjectionMessage, 
   return message.metadata && typeof message.metadata === 'object' && !Array.isArray(message.metadata)
     ? message.metadata
     : undefined;
+}
+
+function resolveMessageRequestId(
+  message: Pick<SessionTimelineProjectionMessage, 'metadata'>,
+): string {
+  const metadata = resolveMessageMetadata(message);
+  return typeof metadata?.requestId === 'string' ? metadata.requestId.trim() : '';
+}
+
+function backfillUserRequestAnchorTimestamps(
+  messages: SessionTimelineProjectionMessage[],
+): SessionTimelineProjectionMessage[] {
+  const earliestAnchorByRequestId = new Map<string, number>();
+  for (const message of messages) {
+    const requestId = resolveMessageRequestId(message);
+    if (!requestId) {
+      continue;
+    }
+    const anchorTimestamp = resolveTimelineAnchorTimestampFromMetadata(resolveMessageMetadata(message));
+    if (anchorTimestamp === null) {
+      continue;
+    }
+    const known = earliestAnchorByRequestId.get(requestId) || 0;
+    earliestAnchorByRequestId.set(
+      requestId,
+      known > 0 ? Math.min(known, anchorTimestamp) : anchorTimestamp,
+    );
+  }
+
+  return messages.map((message) => {
+    if (message.type !== 'user_input') {
+      return message;
+    }
+    const metadata = resolveMessageMetadata(message);
+    if (resolveTimelineAnchorTimestampFromMetadata(metadata) !== null) {
+      return message;
+    }
+    const requestId = resolveMessageRequestId(message);
+    if (!requestId) {
+      return message;
+    }
+    const requestAnchorTimestamp = earliestAnchorByRequestId.get(requestId) || 0;
+    if (requestAnchorTimestamp <= 0) {
+      return message;
+    }
+    return {
+      ...message,
+      metadata: {
+        ...(metadata || {}),
+        timelineAnchorTimestamp: requestAnchorTimestamp,
+      },
+    };
+  });
 }
 
 function resolveMessageSortTimestamp(message: Pick<SessionTimelineProjectionMessage, 'timestamp' | 'metadata' | 'type'>): number {
@@ -885,7 +939,7 @@ function collectLifecycleArtifactKeys(
 }
 
 export function buildSessionTimelineProjection(session: ProjectionSourceSession): SessionTimelineProjection {
-  const orderedMessages = session.messages
+  const sourceMessages = session.messages
     .filter((message) => (
       message
       && typeof message.id === 'string'
@@ -896,13 +950,14 @@ export function buildSessionTimelineProjection(session: ProjectionSourceSession)
       && Number.isFinite(message.timestamp)
       && !isInternalControlTimelineMessage(message)
       && messageHasRenderableContent(message)
-    ))
+    ));
+  const normalizedMessages = backfillUserRequestAnchorTimestamps(sourceMessages)
     .map((message) => normalizeProjectionMessage(message))
     .sort(compareProjectionMessages);
 
-  const lifecycleArtifactKeys = collectLifecycleArtifactKeys(orderedMessages);
+  const lifecycleArtifactKeys = collectLifecycleArtifactKeys(normalizedMessages);
   const artifactsById = new Map<string, ProjectionArtifactAccumulator>();
-  for (const message of orderedMessages) {
+  for (const message of normalizedMessages) {
     const fragmentMessages = resolveTimelineFragmentMessages(message);
     const usesFragmentExecutionItems = fragmentMessages.length > 1;
     const artifactMessage = usesFragmentExecutionItems

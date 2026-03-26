@@ -8,6 +8,8 @@ import type {
   AgentOutputs,
   AgentType,
   TimelineExecutionItem,
+  TimelineProjectionArtifact,
+  TimelineProjectionRenderEntry,
   TimelineNode,
   TimelineNodeKind,
   MissionPlan,
@@ -131,10 +133,14 @@ export const messagesState = $state({
 });
 
 // 消息列表限制
-const MAX_TIMELINE_NODES = 1000;
+const IS_HOSTED_WEBVIEW = (
+  typeof globalThis !== 'undefined'
+  && typeof (globalThis as { acquireVsCodeApi?: unknown }).acquireVsCodeApi === 'function'
+);
+const MAX_TIMELINE_NODES = IS_HOSTED_WEBVIEW ? 1000 : 500;
 
 const MAX_PERSISTED_ARRAY_LENGTH = 10000;
-const WEBVIEW_STATE_SAVE_DEBOUNCE_MS = 120;
+const WEBVIEW_STATE_SAVE_DEBOUNCE_MS = IS_HOSTED_WEBVIEW ? 120 : 900;
 
 type ScrollPanelKey = keyof ScrollPositions;
 
@@ -333,6 +339,21 @@ function scheduleSaveWebviewState(): void {
   }, WEBVIEW_STATE_SAVE_DEBOUNCE_MS);
 }
 
+function compareTimelineProjectionFreshness(
+  left: Pick<SessionTimelineProjection, 'lastAppliedEventSeq' | 'updatedAt' | 'artifacts'> | null | undefined,
+  right: Pick<SessionTimelineProjection, 'lastAppliedEventSeq' | 'updatedAt' | 'artifacts'> | null | undefined,
+): number {
+  const leftEventSeq = typeof left?.lastAppliedEventSeq === 'number' ? left.lastAppliedEventSeq : 0;
+  const rightEventSeq = typeof right?.lastAppliedEventSeq === 'number' ? right.lastAppliedEventSeq : 0;
+  if (leftEventSeq !== rightEventSeq) {
+    return leftEventSeq - rightEventSeq;
+  }
+
+  const leftArtifactCount = Array.isArray(left?.artifacts) ? left.artifacts.length : 0;
+  const rightArtifactCount = Array.isArray(right?.artifacts) ? right.artifacts.length : 0;
+  return leftArtifactCount - rightArtifactCount;
+}
+
 function normalizeScrollTop(value: number): number {
   if (!Number.isFinite(value) || value <= 0) {
     return 0;
@@ -368,6 +389,7 @@ export type WorkerWaitResult = WaitForWorkersResult;
 export type WorkerWaitResultMap = Record<string, WorkerWaitResult | null>;
 
 let workerWaitResults = $state<WorkerWaitResultMap>({});
+let timelineProjectionDirty = false;
 
 const timelineNodeLookup = $derived.by(() => buildTimelineNodeLookup(messagesState.timelineNodes));
 
@@ -964,6 +986,384 @@ function compareTimelineNodeOrder(left: TimelineNode, right: TimelineNode): numb
   );
 }
 
+interface LocalProjectionFlatRenderEntry {
+  entryId: string;
+  artifactId: string;
+  executionItemId?: string;
+  groupId: string;
+  message: Message;
+  timestamp: number;
+  displayOrder?: number;
+  itemOrder?: number;
+  anchorEventSeq: number;
+  blockSeq: number;
+  cardStreamSeq: number;
+}
+
+function shouldRenderTimelineNodeHost(
+  node: Pick<TimelineNode, 'kind' | 'message' | 'executionItems'>,
+): boolean {
+  if (node.kind !== 'worker_lifecycle' && ensureArray(node.executionItems).length > 0) {
+    return false;
+  }
+  return !isTimelineContainerOnlyMessage(node.message);
+}
+
+function compareLocalProjectionRenderEntry(
+  left: LocalProjectionFlatRenderEntry,
+  right: LocalProjectionFlatRenderEntry,
+): number {
+  const sameGroup = left.groupId === right.groupId;
+  return compareTimelineSemanticOrder(
+    {
+      timestamp: left.timestamp,
+      stableId: left.entryId,
+      displayOrder: sameGroup ? left.displayOrder : undefined,
+      itemOrder: sameGroup ? left.itemOrder : undefined,
+      messageType: left.message?.type,
+      primaryToolCallName: resolveTimelinePrimaryToolCallName(left.message?.blocks),
+      anchorEventSeq: left.anchorEventSeq,
+      blockSeq: sameGroup ? left.blockSeq : undefined,
+      cardStreamSeq: left.cardStreamSeq,
+    },
+    {
+      timestamp: right.timestamp,
+      stableId: right.entryId,
+      displayOrder: sameGroup ? right.displayOrder : undefined,
+      itemOrder: sameGroup ? right.itemOrder : undefined,
+      messageType: right.message?.type,
+      primaryToolCallName: resolveTimelinePrimaryToolCallName(right.message?.blocks),
+      anchorEventSeq: right.anchorEventSeq,
+      blockSeq: sameGroup ? right.blockSeq : undefined,
+      cardStreamSeq: right.cardStreamSeq,
+    },
+  );
+}
+
+function buildProjectionRenderEntriesFromArtifacts(
+  artifacts: TimelineProjectionArtifact[],
+  displayContext: 'thread' | 'worker',
+  worker?: AgentType,
+): TimelineProjectionRenderEntry[] {
+  const flatEntries: LocalProjectionFlatRenderEntry[] = [];
+
+  for (const artifact of artifacts) {
+    const artifactVisible = displayContext === 'thread'
+      ? artifact.threadVisible
+      : Boolean(worker && artifact.workerTabs.includes(worker));
+    if (artifactVisible && shouldRenderTimelineNodeHost({
+      kind: artifact.kind as TimelineNodeKind,
+      message: artifact.message,
+      executionItems: artifact.executionItems,
+    })) {
+      flatEntries.push({
+        entryId: `artifact:${artifact.artifactId}`,
+        artifactId: artifact.artifactId,
+        groupId: artifact.artifactId,
+        message: artifact.message,
+        timestamp: artifact.timestamp,
+        displayOrder: artifact.displayOrder,
+        anchorEventSeq: artifact.anchorEventSeq,
+        blockSeq: getMessageBlockSeq(artifact.message),
+        cardStreamSeq: artifact.cardStreamSeq,
+      });
+    }
+
+    for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
+      const itemVisible = displayContext === 'thread'
+        ? item.threadVisible
+        : Boolean(worker && item.workerTabs.includes(worker));
+      if (!itemVisible) {
+        continue;
+      }
+      flatEntries.push({
+        entryId: `item:${artifact.artifactId}:${item.itemId}`,
+        artifactId: artifact.artifactId,
+        executionItemId: item.itemId,
+        groupId: artifact.artifactId,
+        message: item.message,
+        timestamp: item.timestamp,
+        displayOrder: artifact.displayOrder,
+        itemOrder: item.itemOrder,
+        anchorEventSeq: item.anchorEventSeq,
+        blockSeq: getMessageBlockSeq(item.message),
+        cardStreamSeq: item.cardStreamSeq,
+      });
+    }
+  }
+
+  return flatEntries
+    .sort(compareLocalProjectionRenderEntry)
+    .map((entry) => ({
+      entryId: entry.entryId,
+      artifactId: entry.artifactId,
+      ...(entry.executionItemId ? { executionItemId: entry.executionItemId } : {}),
+    }));
+}
+
+function isProjectionArtifact(
+  artifact: unknown,
+): artifact is SessionTimelineProjection['artifacts'][number] {
+  return Boolean(
+    artifact
+    && typeof artifact === 'object'
+    && typeof (artifact as SessionTimelineProjection['artifacts'][number]).artifactId === 'string'
+    && (artifact as SessionTimelineProjection['artifacts'][number]).message,
+  );
+}
+
+function compareProjectionExecutionItemCanonicalOrder(
+  left: TimelineExecutionItem,
+  right: TimelineExecutionItem,
+): number {
+  return compareTimelineSemanticOrder(
+    {
+      timestamp: left.timestamp,
+      stableId: left.itemId,
+      messageType: left.message?.type,
+      primaryToolCallName: resolveTimelinePrimaryToolCallName(left.message?.blocks),
+      anchorEventSeq: left.anchorEventSeq,
+      blockSeq: getMessageBlockSeq(left.message),
+      cardStreamSeq: left.cardStreamSeq,
+    },
+    {
+      timestamp: right.timestamp,
+      stableId: right.itemId,
+      messageType: right.message?.type,
+      primaryToolCallName: resolveTimelinePrimaryToolCallName(right.message?.blocks),
+      anchorEventSeq: right.anchorEventSeq,
+      blockSeq: getMessageBlockSeq(right.message),
+      cardStreamSeq: right.cardStreamSeq,
+    },
+  );
+}
+
+function compareProjectionArtifactCanonicalOrder(
+  left: TimelineProjectionArtifact,
+  right: TimelineProjectionArtifact,
+): number {
+  return compareTimelineSemanticOrder(
+    {
+      timestamp: left.timestamp,
+      stableId: left.artifactId,
+      messageType: left.message?.type,
+      primaryToolCallName: resolveTimelinePrimaryToolCallName(left.message?.blocks),
+      anchorEventSeq: left.anchorEventSeq,
+      blockSeq: getMessageBlockSeq(left.message),
+      cardStreamSeq: left.cardStreamSeq,
+    },
+    {
+      timestamp: right.timestamp,
+      stableId: right.artifactId,
+      messageType: right.message?.type,
+      primaryToolCallName: resolveTimelinePrimaryToolCallName(right.message?.blocks),
+      anchorEventSeq: right.anchorEventSeq,
+      blockSeq: getMessageBlockSeq(right.message),
+      cardStreamSeq: right.cardStreamSeq,
+    },
+  );
+}
+
+function canonicalizeProjectionExecutionItems(
+  executionItems: TimelineExecutionItem[] | undefined,
+): TimelineExecutionItem[] {
+  return ensureArray<TimelineExecutionItem>(executionItems)
+    .map((item) => normalizeTimelineExecutionItem({
+      ...item,
+      message: normalizeProjectionRestoredMessage(item.message),
+    }))
+    .sort(compareProjectionExecutionItemCanonicalOrder)
+    .map((item, index) => normalizeTimelineExecutionItem({
+      ...item,
+      itemOrder: index + 1,
+    }));
+}
+
+function canonicalizeTimelineProjection(
+  projection: SessionTimelineProjection,
+): SessionTimelineProjection {
+  const artifacts = ensureArray(projection.artifacts)
+    .filter(isProjectionArtifact)
+    .map((artifact) => {
+      const message = normalizeProjectionRestoredMessage(artifact.message);
+      const executionItems = canonicalizeProjectionExecutionItems(artifact.executionItems);
+      const artifactMessageId = typeof artifact.artifactId === 'string' && artifact.artifactId.trim()
+        ? artifact.artifactId.trim()
+        : message.id;
+      return {
+        artifactId: artifactMessageId,
+        kind: artifact.kind || resolveTimelineNodeKind(message),
+        displayOrder: typeof artifact.displayOrder === 'number' && Number.isFinite(artifact.displayOrder)
+          ? Math.max(0, Math.floor(artifact.displayOrder))
+          : 0,
+        artifactVersion: typeof artifact.artifactVersion === 'number' && Number.isFinite(artifact.artifactVersion)
+          ? Math.max(0, Math.floor(artifact.artifactVersion))
+          : resolveTimelineVersionFromMetadata(resolveMessageMetadataRecord(message)),
+        anchorEventSeq: typeof artifact.anchorEventSeq === 'number' && Number.isFinite(artifact.anchorEventSeq)
+          ? Math.max(0, Math.floor(artifact.anchorEventSeq))
+          : (getMessageEventSeq(message) ?? 0),
+        latestEventSeq: typeof artifact.latestEventSeq === 'number' && Number.isFinite(artifact.latestEventSeq)
+          ? Math.max(0, Math.floor(artifact.latestEventSeq))
+          : (getMessageEventSeq(message) ?? 0),
+        cardStreamSeq: typeof artifact.cardStreamSeq === 'number' && Number.isFinite(artifact.cardStreamSeq)
+          ? Math.max(0, Math.floor(artifact.cardStreamSeq))
+          : getMessageCardStreamSeq(message),
+        timestamp: typeof artifact.timestamp === 'number' && Number.isFinite(artifact.timestamp)
+          ? Math.floor(artifact.timestamp)
+          : resolveMessageSortTimestamp(message),
+        cardId: artifact.cardId || resolveTimelineCardId(message),
+        lifecycleKey: artifact.lifecycleKey || resolveTimelineLifecycleKey(message),
+        dispatchWaveId: artifact.dispatchWaveId,
+        laneId: artifact.laneId,
+        workerCardId: artifact.workerCardId,
+        worker: resolveTimelineWorker(message) || artifact.worker,
+        threadVisible: artifact.threadVisible !== false,
+        workerTabs: normalizeWorkerTabList(artifact.workerTabs),
+        messageIds: Array.from(new Set([
+          artifactMessageId,
+          ...ensureArray<string>(artifact.messageIds),
+        ])),
+        message: {
+          ...message,
+          id: artifactMessageId,
+        },
+        executionItems,
+      } satisfies TimelineProjectionArtifact;
+    })
+    .sort(compareProjectionArtifactCanonicalOrder)
+    .map((artifact, index) => ({
+      ...artifact,
+      displayOrder: index + 1,
+    }));
+
+  return {
+    ...projection,
+    sessionId: normalizeSessionId(projection.sessionId) || projection.sessionId,
+    artifacts,
+    threadRenderEntries: buildProjectionRenderEntriesFromArtifacts(artifacts, 'thread'),
+    workerRenderEntries: {
+      claude: buildProjectionRenderEntriesFromArtifacts(artifacts, 'worker', 'claude'),
+      codex: buildProjectionRenderEntriesFromArtifacts(artifacts, 'worker', 'codex'),
+      gemini: buildProjectionRenderEntriesFromArtifacts(artifacts, 'worker', 'gemini'),
+    },
+  };
+}
+
+function buildLiveTimelineProjection(
+  sessionId: string,
+  sourceNodes: TimelineNode[],
+  seed: SessionTimelineProjection | null,
+): SessionTimelineProjection {
+  const normalizedNodes = sourceNodes
+    .map((node) => normalizeTimelineNode(node))
+    .sort(compareTimelineNodeOrder);
+
+  const artifacts: TimelineProjectionArtifact[] = normalizedNodes.map((node, index) => {
+    const executionItems = ensureArray<TimelineExecutionItem>(node.executionItems)
+      .map((item) => normalizeTimelineExecutionItem(item))
+      .sort(compareTimelineExecutionItemOrder)
+      .map((item, itemIndex) => normalizeTimelineExecutionItem({
+        ...item,
+        itemOrder: item.itemOrder || (itemIndex + 1),
+      }));
+
+    return {
+      artifactId: node.nodeId,
+      kind: node.kind,
+      displayOrder: index + 1,
+      artifactVersion: node.artifactVersion,
+      anchorEventSeq: node.anchorEventSeq,
+      latestEventSeq: node.latestEventSeq,
+      cardStreamSeq: node.cardStreamSeq,
+      timestamp: node.timestamp,
+      cardId: node.cardId,
+      lifecycleKey: node.lifecycleKey,
+      dispatchWaveId: node.dispatchWaveId,
+      laneId: node.laneId,
+      workerCardId: node.workerCardId,
+      worker: node.worker,
+      threadVisible: node.visibleInThread,
+      workerTabs: normalizeWorkerTabList(node.workerTabs),
+      messageIds: Array.from(new Set(node.messageIds)),
+      message: normalizeIncomingMessage(node.message),
+      executionItems,
+    };
+  });
+
+  const threadRenderEntries = buildProjectionRenderEntriesFromArtifacts(artifacts, 'thread');
+  const workerRenderEntries = {
+    claude: buildProjectionRenderEntriesFromArtifacts(artifacts, 'worker', 'claude'),
+    codex: buildProjectionRenderEntriesFromArtifacts(artifacts, 'worker', 'codex'),
+    gemini: buildProjectionRenderEntriesFromArtifacts(artifacts, 'worker', 'gemini'),
+  };
+
+  const lastAppliedEventSeq = artifacts.reduce((maxSeq, artifact) => {
+    const itemMax = ensureArray<TimelineExecutionItem>(artifact.executionItems)
+      .reduce((currentMax, item) => Math.max(currentMax, item.latestEventSeq), 0);
+    return Math.max(maxSeq, artifact.latestEventSeq, itemMax);
+  }, seed?.lastAppliedEventSeq || 0);
+
+  const updatedAt = artifacts.reduce((maxTimestamp, artifact) => {
+    const artifactUpdatedAt = Math.max(
+      artifact.message.updatedAt || 0,
+      artifact.message.timestamp || 0,
+      artifact.timestamp,
+    );
+    const itemUpdatedAt = ensureArray<TimelineExecutionItem>(artifact.executionItems)
+      .reduce((currentMax, item) => Math.max(
+        currentMax,
+        item.message.updatedAt || 0,
+        item.message.timestamp || 0,
+        item.timestamp,
+      ), 0);
+    return Math.max(maxTimestamp, artifactUpdatedAt, itemUpdatedAt);
+  }, seed?.updatedAt || 0);
+
+  return {
+    schemaVersion: 'session-timeline-projection.v2',
+    sessionId,
+    updatedAt: updatedAt > 0 ? updatedAt : (seed?.updatedAt || Date.now()),
+    lastAppliedEventSeq,
+    artifacts,
+    threadRenderEntries,
+    workerRenderEntries,
+  };
+}
+
+function syncTimelineProjectionFromNodes(
+  sessionId: string | null | undefined,
+  options: { persist?: boolean } = {},
+): void {
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  if (!normalizedSessionId) {
+    return;
+  }
+  messagesState.timelineProjection = buildLiveTimelineProjection(
+    normalizedSessionId,
+    messagesState.timelineNodes,
+    messagesState.timelineProjection,
+  );
+  timelineProjectionDirty = false;
+  upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(normalizedSessionId));
+  if (options.persist !== false) {
+    scheduleSaveWebviewState();
+  }
+}
+
+function ensureTimelineProjectionSnapshotCurrent(
+  sessionId: string | null | undefined,
+): SessionTimelineProjection | null {
+  if (!timelineProjectionDirty) {
+    return messagesState.timelineProjection;
+  }
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  if (!normalizedSessionId) {
+    return messagesState.timelineProjection;
+  }
+  syncTimelineProjectionFromNodes(normalizedSessionId, { persist: false });
+  return messagesState.timelineProjection;
+}
+
 function sortAndSyncTimelineNodes(nextNodes: TimelineNode[]): void {
   const normalized = nextNodes.map((node) => normalizeTimelineNode(node));
   normalized.sort(compareTimelineNodeOrder);
@@ -981,6 +1381,8 @@ function setTimelineProjectionNodes(nextNodes: TimelineNode[]): void {
 
 function mutateTimelineNodes(mutator: (nodes: TimelineNode[]) => TimelineNode[]): void {
   replaceTimelineNodes(mutator([...messagesState.timelineNodes]));
+  syncTimelineProjectionFromNodes(messagesState.currentSessionId, { persist: false });
+  scheduleSaveWebviewState();
 }
 
 function mergeTimelineNodeAliases(
@@ -1083,7 +1485,7 @@ function extractExecutionItemFromNode(node: TimelineNode): TimelineExecutionItem
   });
 }
 
-function upsertTimelineNode(
+export function upsertTimelineNode(
   message: Message,
   visibility: { thread?: boolean; workerTabs?: AgentType[] },
   options: { replaceMessageId?: string; displayOrder?: number } = {},
@@ -1103,9 +1505,13 @@ function upsertTimelineNode(
   const explicitNodeId = shouldAttachToLifecycle
     ? lifecycleHostNodeId!
     : resolveTimelineNodeId(normalizedMessage);
+  const replaceNodeId = !shouldAttachToLifecycle && options.replaceMessageId
+    ? resolveTimelineAliasId(options.replaceMessageId)
+    : undefined;
   const existingNodeId = shouldAttachToLifecycle
     ? lifecycleHostNodeId
-    : ((lifecycleKey ? timelineNodeIdByLifecycleKey.get(lifecycleKey) : undefined)
+    : (replaceNodeId
+      || (lifecycleKey ? timelineNodeIdByLifecycleKey.get(lifecycleKey) : undefined)
       || timelineNodeIdByMessageId.get(normalizedMessage.id)
       || (cardId ? timelineNodeIdByCardId.get(cardId) : undefined)
       || undefined);
@@ -1269,7 +1675,6 @@ function upsertTimelineNode(
 
   return nextNode.message;
 }
-
 function findTimelineNodeByAlias(messageId: string): TimelineNode | undefined {
   const stableId = resolveTimelineAliasId(messageId);
   return messagesState.timelineNodes.find((node) => node.nodeId === stableId);
@@ -1853,6 +2258,7 @@ export function getState() {
     get currentBottomTab() { return messagesState.currentBottomTab; },
     get messageJump() { return messagesState.messageJump; },
     get timelineNodes() { return messagesState.timelineNodes; },
+    get timelineProjection() { return messagesState.timelineProjection; },
     get threadMessages() { return messageProjection.thread; },
     get agentOutputs() {
       return {
@@ -1922,9 +2328,13 @@ function trimTimelineNodes() {
     return;
   }
   replaceTimelineNodes(messagesState.timelineNodes.slice(-MAX_TIMELINE_NODES));
+  syncTimelineProjectionFromNodes(messagesState.currentSessionId, { persist: false });
 }
 
 function createSessionViewStateSnapshot(sessionId: string | null | undefined): PersistedSessionViewState | null {
+  if (!IS_HOSTED_WEBVIEW) {
+    return null;
+  }
   const normalizedSessionId = normalizeSessionId(sessionId);
   const projection = messagesState.timelineProjection;
   if (!normalizedSessionId || !projection || projection.sessionId !== normalizedSessionId) {
@@ -1957,6 +2367,10 @@ function upsertSessionViewStateSnapshot(snapshot: PersistedSessionViewState | nu
 }
 
 function captureCurrentSessionViewState(): void {
+  if (!IS_HOSTED_WEBVIEW) {
+    return;
+  }
+  ensureTimelineProjectionSnapshotCurrent(messagesState.currentSessionId);
   upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(messagesState.currentSessionId));
 }
 
@@ -2003,8 +2417,10 @@ function applySessionViewState(sessionId: string | null | undefined): boolean {
   if (!normalizedSnapshot) {
     return false;
   }
-  messagesState.timelineProjection = normalizedSnapshot.timelineProjection;
-  setTimelineProjectionNodes(buildTimelineNodesFromProjection(normalizedSnapshot.timelineProjection));
+  const canonicalProjection = canonicalizeTimelineProjection(normalizedSnapshot.timelineProjection);
+  messagesState.timelineProjection = canonicalProjection;
+  setTimelineProjectionNodes(buildTimelineNodesFromProjection(canonicalProjection));
+  timelineProjectionDirty = false;
   messagesState.scrollPositions = normalizePersistedScrollPositions(normalizedSnapshot.scrollPositions);
   messagesState.scrollAnchors = normalizePersistedScrollAnchors(normalizedSnapshot.scrollAnchors);
   messagesState.autoScrollEnabled = normalizePersistedAutoScrollConfig(normalizedSnapshot.autoScrollEnabled);
@@ -2022,21 +2438,32 @@ function saveWebviewState() {
     clearTimeout(deferredWebviewStateSaveTimer);
     deferredWebviewStateSaveTimer = null;
   }
-  trimTimelineNodes();
-  captureCurrentSessionViewState();
-  pruneSessionViewStateByKnownSessions();
-  const state: WebviewPersistedState = {
-    currentTopTab: messagesState.currentTopTab,
-    currentBottomTab: messagesState.currentBottomTab,
-    sessions: messagesState.sessions,
-    currentSessionId: messagesState.currentSessionId,
-    currentTimelineProjection: messagesState.timelineProjection,
-    scrollPositions: messagesState.scrollPositions,
-    scrollAnchors: messagesState.scrollAnchors,
-    autoScrollEnabled: messagesState.autoScrollEnabled,
-    sessionViewStateBySession,
-  };
-  vscode.setState(state);
+  try {
+    if (IS_HOSTED_WEBVIEW) {
+      trimTimelineNodes();
+      ensureTimelineProjectionSnapshotCurrent(messagesState.currentSessionId);
+      captureCurrentSessionViewState();
+      pruneSessionViewStateByKnownSessions();
+    }
+    const state: WebviewPersistedState = {
+      currentTopTab: messagesState.currentTopTab,
+      currentBottomTab: messagesState.currentBottomTab,
+      sessions: messagesState.sessions,
+      currentSessionId: messagesState.currentSessionId,
+      scrollPositions: messagesState.scrollPositions,
+      scrollAnchors: messagesState.scrollAnchors,
+      autoScrollEnabled: messagesState.autoScrollEnabled,
+      ...(IS_HOSTED_WEBVIEW
+        ? {
+            currentTimelineProjection: messagesState.timelineProjection,
+            sessionViewStateBySession,
+          }
+        : {}),
+    };
+    vscode.setState(state);
+  } catch (error) {
+    console.warn('[MessagesStore] Webview 状态持久化失败，已降级继续运行', error);
+  }
 }
 
 export function batchWebviewStatePersistence(mutator: () => void): void {
@@ -2150,6 +2577,7 @@ export function setCurrentSessionId(id: string | null) {
     if (!restoredSessionView) {
       replaceTimelineNodes([]);
       messagesState.timelineProjection = null;
+      timelineProjectionDirty = false;
       resetPanelScrollRuntimeState();
     }
   }
@@ -2891,6 +3319,7 @@ export function clearAllMessages(options: {
   if (options.resetTimelineView !== false) {
     replaceTimelineNodes([]);
     messagesState.timelineProjection = null;
+    timelineProjectionDirty = false;
   }
   workerWaitResults = {};
   messagesState.orchestratorRuntimeDiagnostics = null;
@@ -2913,18 +3342,8 @@ export function clearAllMessages(options: {
 }
 
 function buildTimelineNodesFromProjection(projection: SessionTimelineProjection): TimelineNode[] {
-  const isProjectionArtifact = (
-    artifact: unknown,
-  ): artifact is SessionTimelineProjection['artifacts'][number] => (
-    Boolean(
-      artifact
-      && typeof artifact === 'object'
-      && typeof (artifact as SessionTimelineProjection['artifacts'][number]).artifactId === 'string'
-      && typeof (artifact as SessionTimelineProjection['artifacts'][number]).displayOrder === 'number'
-      && (artifact as SessionTimelineProjection['artifacts'][number]).message
-    )
-  );
-  const nextNodes = ensureArray(projection.artifacts)
+  const canonicalProjection = canonicalizeTimelineProjection(projection);
+  const nextNodes = ensureArray(canonicalProjection.artifacts)
     .filter(isProjectionArtifact)
     .map((artifact) => {
       const message = normalizeProjectionRestoredMessage(artifact.message);
@@ -2968,12 +3387,33 @@ function buildTimelineNodesFromProjection(projection: SessionTimelineProjection)
 }
 
 export function setTimelineProjection(projection: SessionTimelineProjection) {
-  const nextNodes = buildTimelineNodesFromProjection(projection);
-  messagesState.timelineProjection = projection;
+  const canonicalProjection = canonicalizeTimelineProjection(projection);
+  const nextNodes = buildTimelineNodesFromProjection(canonicalProjection);
+  messagesState.timelineProjection = canonicalProjection;
   setTimelineProjectionNodes(nextNodes);
+  timelineProjectionDirty = false;
   workerWaitResults = {};
-  upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(projection.sessionId));
+  upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(canonicalProjection.sessionId));
   saveWebviewState();
+}
+
+export function restoreTimelineProjectionIfNewer(
+  projection: SessionTimelineProjection,
+): boolean {
+  const normalizedSessionId = normalizeSessionId(projection.sessionId);
+  if (!normalizedSessionId) {
+    return false;
+  }
+  const currentSessionId = normalizeSessionId(messagesState.currentSessionId);
+  if (currentSessionId && currentSessionId !== normalizedSessionId) {
+    return false;
+  }
+  const currentProjection = ensureTimelineProjectionSnapshotCurrent(normalizedSessionId);
+  if (compareTimelineProjectionFreshness(projection, currentProjection) <= 0) {
+    return false;
+  }
+  setTimelineProjection(projection);
+  return true;
 }
 
 // 导出状态初始化

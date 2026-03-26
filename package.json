@@ -266,6 +266,7 @@
     "dev:web": "cd src/ui/webview-svelte && npm run dev:web",
     "dev:agent": "npm run -s build:agent && node dist/agent.js",
     "lint": "eslint src --ext ts",
+    "verify:streaming-render": "node scripts/streaming-render-regression.cjs",
     "metrics:termination-seed": "node scripts/seed-termination-metrics.cjs",
     "metrics:termination-baseline:init": "node scripts/init-termination-baseline.cjs",
     "metrics:termination-dashboard": "node scripts/termination-dashboard.cjs"

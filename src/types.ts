@@ -580,7 +580,12 @@ export type WebviewToExtensionMessage =
   | { type: 'openMermaidPanel'; code: string; title?: string }
   | { type: 'getLanAccessInfo' }
   // 执行链操作
-  | { type: 'abandonChain'; chainId: string };
+  | { type: 'abandonChain'; chainId: string }
+  // 宿主 API 代理：WebView 无法直接访问 localhost，所有 Agent API 请求通过宿主代理转发
+  | { type: 'agentApiProxy'; requestId: string; method: string; url: string; body?: string; headers?: Record<string, string> }
+  // 宿主 SSE 事件流控制
+  | { type: 'agentSseSubscribe'; queryString: string; subscriptionId: string }
+  | { type: 'agentSseUnsubscribe'; subscriptionId: string };
 
 // Extension 发送到 Webview 的消息
 // source 字段用于区分消息来源：'orchestrator' = 编排者, 'worker' = 执行代理
@@ -589,7 +594,13 @@ export type MessageSource = 'orchestrator' | 'worker' | 'system';
 export type ExtensionToWebviewMessage =
   | { type: 'unifiedMessage'; message: StandardMessage; sessionId?: string | null }
   | { type: 'unifiedUpdate'; update: StreamUpdate; sessionId?: string | null }
-  | { type: 'unifiedComplete'; message: StandardMessage; sessionId?: string | null };
+  | { type: 'unifiedComplete'; message: StandardMessage; sessionId?: string | null }
+  // 宿主 API 代理响应
+  | { type: 'agentApiProxyResponse'; requestId: string; status: number; body: string; headers: Record<string, string> }
+  // 宿主 SSE 事件转发
+  | { type: 'agentSseEvent'; data: string; subscriptionId: string }
+  // 宿主 SSE 连接状态
+  | { type: 'agentSseStatus'; status: 'open' | 'error'; subscriptionId: string };
 
 /** Worker 执行统计数据（用于 UI 显示） */
 export interface WorkerExecutionStats {

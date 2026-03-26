@@ -447,10 +447,24 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     };
 
     try {
+      // ── 统一历史准备（无论是否启用 tool calls，此处为唯一入口） ──
+      const useIsolatedHistory = silent || historyMode === 'isolated';
+      let preparedHistory: LLMMessage[];
+
+      if (useIsolatedHistory) {
+        // system 可见性 / isolated 历史模式：纯空白上下文，不污染编排会话历史
+        preparedHistory = [this.buildUserMessage(message, images)];
+      } else {
+        // session 模式：使用并追加到共享会话历史
+        this.conversationHistory = this.normalizeHistoryForTools(this.conversationHistory);
+        this.truncateHistoryIfNeeded();
+        this.conversationHistory.push(this.buildUserMessage(message, images));
+        preparedHistory = this.conversationHistory;
+      }
+
       if (enableToolCalls) {
         const content = await this.sendMessageWithTools(
-          message,
-          images,
+          preparedHistory,
           effectiveSystemPrompt,
           silent ? 'system' : undefined,
           includeThinking,
@@ -461,21 +475,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         return content;
       }
 
-      let messagesToSend: LLMMessage[];
-      if (silent || historyMode === 'isolated') {
-        // system 可见性调用仅用于内部决策，不污染编排对话历史
-        // isolated 历史模式用于简单问答直答，避免项目/编排历史污染当前回答。
-        messagesToSend = [this.buildUserMessage(message, images)];
-      } else {
-        // 准备消息历史（自动截断以控制 token 消耗）
-        this.conversationHistory = this.normalizeHistoryForTools(this.conversationHistory);
-        this.truncateHistoryIfNeeded();
-
-        // 添加用户消息
-        const userMessage = this.buildUserMessage(message, images);
-        this.conversationHistory.push(userMessage);
-        messagesToSend = this.conversationHistory;
-      }
+      const messagesToSend = preparedHistory;
 
       // 创建 AbortController，供 interrupt() 中断 LLM 请求
       this.abortController = new AbortController();
@@ -1049,6 +1049,20 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     return parts.join(' ').trim().replace(/\s+/g, ' ');
   }
 
+  private extractLatestUserMessage(history: LLMMessage[]): string {
+    for (let i = history.length - 1; i >= 0; i -= 1) {
+      const candidate = history[i];
+      if (!candidate || candidate.role !== 'user') {
+        continue;
+      }
+      const text = this.extractMessageText(candidate);
+      if (text) {
+        return text;
+      }
+    }
+    return '';
+  }
+
   /**
    * 添加系统消息
    */
@@ -1076,31 +1090,17 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
    * 整个循环共享一个 streamId，确保用户只看到一条流式消息。
    */
   private async sendMessageWithTools(
-    message: string,
-    images: string[] | undefined,
+    history: LLMMessage[],
     systemPrompt: string,
-    visibility?: 'user' | 'system' | 'debug',
-    includeThinking = true,
-    allowedToolNames?: string[],
-    planningMode: PlanMode = 'standard',
+    visibility: 'user' | 'system' | 'debug' | undefined,
+    includeThinking: boolean,
+    allowedToolNames: string[] | undefined,
+    planningMode: PlanMode,
   ): Promise<string> {
     this.syncTraceFromMessageHub();
     const isTransientSystemCall = visibility === 'system';
     const effectiveDeepTask = planningMode === 'deep';
     const decisionEngine = this.getDecisionEngineForPlanningMode(planningMode);
-
-    // system 可见性调用使用临时历史，避免污染编排上下文
-    let history = isTransientSystemCall
-      ? [...this.conversationHistory]
-      : this.conversationHistory;
-
-    history = this.normalizeHistoryForTools(history);
-    if (!isTransientSystemCall) {
-      this.conversationHistory = history;
-    }
-
-    // 添加用户消息到历史
-    history.push(this.buildUserMessage(message, images));
 
     const ORCHESTRATOR_HIDDEN_TOOLS = ['todo_split'];
     const allowedToolNameSet = Array.isArray(allowedToolNames)
@@ -1125,6 +1125,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     const budget: OrchestratorExecutionBudget = effectiveDeepTask
       ? OrchestratorLLMAdapter.DEEP_BUDGET
       : OrchestratorLLMAdapter.STANDARD_BUDGET;
+    const initiatingUserMessage = this.extractLatestUserMessage(history);
 
     try {
       let finalText = '';
@@ -1161,6 +1162,8 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       const loopStartTokenUsage = this.getTotalTokenUsage();
       const loopStartTokenUsed = (loopStartTokenUsage.inputTokens || 0) + (loopStartTokenUsage.outputTokens || 0);
       let pendingTerminalSynthesisRetry = 0;
+      let pendingOutcomeBlockOnly = false;
+      let pendingOutcomeBlockText = '';
 
       // 创建 AbortController，供 interrupt() 中断 LLM 请求
       this.abortController = new AbortController();
@@ -1222,14 +1225,15 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         }
 
         // 长任务 history 裁剪：每轮 LLM 调用前检查并截断，防止 context window 溢出
-        if (!isTransientSystemCall) {
-          this.truncateHistoryIfNeeded();
-        }
+        this.truncateHistoryIfNeeded();
 
         const streamId = visibility === 'system'
           ? this.normalizer.startStream(this.currentTraceId!, undefined, undefined, 'system')
           : persistentVisibleStreamId!;
 
+        const suppressVisibleText = pendingOutcomeBlockOnly
+          && pendingOutcomeBlockText.trim().length > 0
+          && usesPersistentVisibleStream;
         const params: LLMMessageParams = {
           messages: history,
           systemPrompt,
@@ -1263,6 +1267,9 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                 return;
               }
               accumulatedText += delta;
+              if (suppressVisibleText) {
+                return;
+              }
               // 续跑去重：缓冲前 200 字符后一次性裁剪重叠
               if (preRecoveryTextLoop && accumulatedText.length <= 200) {
                 return;
@@ -1321,6 +1328,9 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               missionOutcome = extracted.outcome || tail.outcome;
             }
           }
+          if (suppressVisibleText && preRecoveryTextLoop) {
+            preRecoveryTextLoop = '';
+          }
           const normalizedOutcomeSteps = normalizeNextSteps(missionOutcome?.next_steps || []);
           const outcomeStatus = missionOutcome?.status;
           latestOutcomeSteps = normalizedOutcomeSteps;
@@ -1348,14 +1358,15 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           }
 
           summaryHijackRounds = 0;
-          if (assistantText.trim()) {
+          const assistantTextForNoTool = suppressVisibleText ? pendingOutcomeBlockText : assistantText;
+          if (assistantText.trim() && !suppressVisibleText) {
             lastNonEmptyAssistantText = assistantText;
             // 文本一旦进入当轮流式管道（含 fallback 的 processTextDelta），
             // 就应视为“已交付”。否则在工具轮触发终止（如 stalled/budget）时，
             // 循环外 finalText fallback 会把同段文本再次回灌，造成重复输出。
             finalTextDelivered = true;
           }
-          if (assistantText && !hasStreamedTextDelta) {
+          if (assistantText && !hasStreamedTextDelta && !suppressVisibleText) {
             // 兜底：部分 provider 可能仅在最终响应体返回文本，未逐块回调 content_delta。
             this.normalizer.processTextDelta(streamId, assistantText);
           }
@@ -1363,13 +1374,13 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           // 无工具调用 → 收敛
           if (toolCalls.length === 0) {
             forceNoToolsNextRound = false;
-            if (assistantText && !hasStreamedTextDelta) {
-              this.emit('message', assistantText);
+            if (assistantTextForNoTool && !hasStreamedTextDelta && !suppressVisibleText) {
+              this.emit('message', assistantTextForNoTool);
             }
-            if (assistantText.trim()) {
+            if (assistantTextForNoTool.trim() && !suppressVisibleText) {
               finalTextDelivered = true;
             }
-            history.push({ role: 'assistant', content: assistantText });
+            history.push({ role: 'assistant', content: assistantTextForNoTool });
 
             const progressState = await this.buildTerminationSnapshot({
               round: loopRounds,
@@ -1397,13 +1408,13 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               current: { budgetBreachStreak, externalWaitBreachStreak },
             }));
 
-            const explicitOrchestrationRequest = this.userExplicitlyRequestsOrchestration(message);
+            const explicitOrchestrationRequest = this.userExplicitlyRequestsOrchestration(initiatingUserMessage);
             if (
               progressState.snapshot.requiredTotal === 0
               && totalToolResultCount === 0
               && toolDefinitions.length > 0
               && explicitOrchestrationRequest
-              && !assistantText.trim()
+              && !assistantTextForNoTool.trim()
               && thinkingOnlyOrchestrationRecoveryCount < 1
             ) {
               thinkingOnlyOrchestrationRecoveryCount += 1;
@@ -1421,7 +1432,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               continue;
             }
 
-            const pseudoToolNarrationDetected = this.detectPseudoOrchestrationToolNarration(assistantText);
+            const pseudoToolNarrationDetected = this.detectPseudoOrchestrationToolNarration(assistantTextForNoTool);
             if (
               progressState.snapshot.requiredTotal === 0
               && totalToolResultCount === 0
@@ -1438,7 +1449,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               logger.warn('orchestrator 检测到正文伪工具调用描述，触发纠偏', {
                 round,
                 pseudoToolCallRecoveryCount,
-                mentionCount: this.countOrchestrationToolMentions(assistantText),
+                mentionCount: this.countOrchestrationToolMentions(assistantTextForNoTool),
               }, LogCategory.LLM);
               endIntermediateRoundStream(streamId);
               round++;
@@ -1514,14 +1525,14 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             }
 
             const candidates: TerminationCandidate[] = [];
-            if (progressState.snapshot.requiredTotal === 0 && assistantText.trim()) {
+            if (progressState.snapshot.requiredTotal === 0 && assistantTextForNoTool.trim()) {
               noTodoToolRoundStreak = 0;
               repeatedNoTodoToolSignatureStreak = 0;
               lastNoTodoToolSignature = '';
               const noTodoDecision = decideNoTodoPlainResponseAction({
-                assistantText,
+                assistantText: assistantTextForNoTool,
                 totalToolResultCount,
-                toolDefinitionCount: toolDefinitions.length,
+                explicitOrchestrationRequest,
                 outcomeStatus,
                 normalizedOutcomeStepCount: normalizedOutcomeSteps.length,
                 noTodoOutcomeMissingStreak,
@@ -1541,6 +1552,8 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                   : 'no_outcome_block';
                 candidates.push(this.createTerminationCandidate('failed', label));
               } else if (noTodoDecision.action === 'continue_with_prompt') {
+                pendingOutcomeBlockOnly = false;
+                pendingOutcomeBlockText = '';
                 history.push({
                   role: 'user',
                   content: buildContinuePrompt(progressState.snapshot),
@@ -1549,6 +1562,10 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                 round++;
                 continue;
               } else if (noTodoDecision.action === 'request_outcome_block') {
+                if (assistantTextForNoTool.trim()) {
+                  pendingOutcomeBlockOnly = true;
+                  pendingOutcomeBlockText = assistantTextForNoTool;
+                }
                 history.push({
                   role: 'user',
                   content: buildOutcomeBlockRequestPrompt(),
@@ -1605,9 +1622,9 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                 budgetBreachStreak,
                 externalWaitBreachStreak,
                 primaryReason: terminationReason,
-                assistantText,
+                assistantText: assistantTextForNoTool,
               });
-              finalText = assistantText.trim() ? assistantText : (finalText || lastNonEmptyAssistantText);
+              finalText = assistantTextForNoTool.trim() ? assistantTextForNoTool : (finalText || lastNonEmptyAssistantText);
               endIntermediateRoundStream(streamId);
               break;
             }
@@ -1619,6 +1636,11 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             endIntermediateRoundStream(streamId);
             round++;
             continue;
+          }
+
+          if (pendingOutcomeBlockOnly && toolCalls.length > 0) {
+            pendingOutcomeBlockOnly = false;
+            pendingOutcomeBlockText = '';
           }
 
           // 有工具调用 → 只对无需授权的工具即时渲染卡片
@@ -1752,7 +1774,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           const protocolViolationRecovery = this.resolveProtocolViolationRecovery({
             toolResults,
             snapshot: progressState.snapshot,
-            userMessage: message,
+            userMessage: initiatingUserMessage,
             recoveryCount: workerWaitProtocolRecoveryCount,
           });
           if (protocolViolationRecovery) {

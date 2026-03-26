@@ -719,9 +719,6 @@ export class EventBindingService {
     }
     this.persistTimelineMessage(snapshotSessionId, snapshot, {
       sendStateUpdate: options.silent !== true && Array.isArray(snapshot.blocks) && snapshot.blocks.length > 0,
-      // 流式期间的 live snapshot 只做持久化，不触发全量 projection broadcast。
-      // 流式内容走 unifiedUpdate 增量通道，projection 只在 message complete 时广播。
-      skipProjectionBroadcast: true,
     });
   }
 

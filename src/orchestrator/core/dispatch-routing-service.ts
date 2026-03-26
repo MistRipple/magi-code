@@ -2,24 +2,9 @@ import type { WorkerSlot } from '../../types';
 import type { ProfileLoader } from '../profile/profile-loader';
 import { LLMConfigLoader } from '../../llm/config';
 
-export type DispatchRoutingCategorySource = 'explicit_param' | 'ownership_inferred';
-
-export interface DispatchRoutingDecision {
-  selectedWorker: WorkerSlot;
-  category: string;
-  categorySource: DispatchRoutingCategorySource;
-  degraded: boolean;
-  routingReason: string;
-}
-
 export interface WorkerAvailabilitySnapshot {
   availableWorkers: Set<WorkerSlot>;
   unavailableReasons: Map<WorkerSlot, string>;
-}
-
-interface DispatchCategoryResolution {
-  category: string;
-  source: DispatchRoutingCategorySource;
 }
 
 interface ResolveExecutionOptions {
@@ -85,76 +70,6 @@ export class DispatchRoutingService {
     return transientInfraErrorPattern.test(normalized);
   }
 
-  resolveDispatchRouting(
-    goal: string,
-    explicitCategory?: string,
-    explicitSource: DispatchRoutingCategorySource = 'explicit_param',
-  ): { ok: true; decision: DispatchRoutingDecision } | { ok: false; error: string } {
-    try {
-      // 每次 dispatch 前刷新分工配置，确保外部改动立即生效
-      this.profileLoader.getAssignmentLoader().reload();
-    } catch (error: any) {
-      return {
-        ok: false,
-        error: `读取分工配置失败: ${error?.message || String(error)}`,
-      };
-    }
-    const categoryResolution = this.resolveDispatchCategoryWithSource(goal, explicitCategory, explicitSource);
-    if (!categoryResolution.ok) {
-      return {
-        ok: false,
-        error: categoryResolution.error,
-      };
-    }
-    const { category, source } = categoryResolution.value;
-    let ownerWorker: WorkerSlot;
-    try {
-      ownerWorker = this.profileLoader.getWorkerForCategory(category);
-    } catch (error: any) {
-      return {
-        ok: false,
-        error: `任务分类 ${category} 未找到有效归属 Worker: ${error?.message || String(error)}`,
-      };
-    }
-    const availability = this.getWorkerAvailabilitySnapshot();
-
-    if (availability.availableWorkers.has(ownerWorker)) {
-      return {
-        ok: true,
-        decision: {
-          selectedWorker: ownerWorker,
-          category,
-          categorySource: source,
-          degraded: false,
-          routingReason: `自动路由命中分类 ${category}，归属 Worker ${ownerWorker}`,
-        },
-      };
-    }
-
-    const ownerUnavailableReason = availability.unavailableReasons.get(ownerWorker) || '当前不可用';
-    const fallbackWorker = this.pickFallbackWorker(ownerWorker, availability.availableWorkers);
-    if (!fallbackWorker) {
-      const reasonText = this.workerSlots
-        .map(worker => `${worker}:${availability.unavailableReasons.get(worker) || '不可用'}`)
-        .join('；');
-      return {
-        ok: false,
-        error: `分类 ${category} 的归属 Worker ${ownerWorker} 不可用（${ownerUnavailableReason}），且无可用降级 Worker。当前状态：${reasonText}`,
-      };
-    }
-
-    return {
-      ok: true,
-      decision: {
-        selectedWorker: fallbackWorker,
-        category,
-        categorySource: source,
-        degraded: true,
-        routingReason: `分类 ${category} 归属 ${ownerWorker}，但其不可用（${ownerUnavailableReason}），已降级到 ${fallbackWorker}`,
-      },
-    };
-  }
-
   resolveExecutionWorker(
     preferredWorker: WorkerSlot,
     options: ResolveExecutionOptions = {},
@@ -207,50 +122,6 @@ export class DispatchRoutingService {
       selectedWorker: fallbackWorker,
       degraded: true,
       routingReason: `目标 Worker ${preferredWorker} 当前不可执行（${preferredReason}），执行时降级到 ${fallbackWorker}`,
-    };
-  }
-
-  private normalizeCategoryName(raw: string): string {
-    return raw.trim().toLowerCase().replace(/[\s-]+/g, '_');
-  }
-
-  private getKnownCategoryNames(): string[] {
-    return Array.from(this.profileLoader.getAllCategories().keys()).sort();
-  }
-
-  private assertCategoryExists(category: string): { ok: true } | { ok: false; error: string } {
-    if (this.profileLoader.getCategory(category)) {
-      return { ok: true };
-    }
-    return {
-      ok: false,
-      error: `未知任务分类 "${category}"。可选分类: ${this.getKnownCategoryNames().join(', ')}`,
-    };
-  }
-
-  private resolveDispatchCategoryWithSource(
-    _goal: string,
-    explicitCategory?: string,
-    explicitSource: DispatchRoutingCategorySource = 'explicit_param',
-  ): { ok: true; value: DispatchCategoryResolution } | { ok: false; error: string } {
-    const explicit = explicitCategory?.trim();
-    if (explicit) {
-      const normalized = this.normalizeCategoryName(explicit);
-      const check = this.assertCategoryExists(normalized);
-      if (!check.ok) {
-        return { ok: false, error: check.error };
-      }
-      return {
-        ok: true,
-        value: {
-          category: normalized,
-          source: explicitSource,
-        },
-      };
-    }
-    return {
-      ok: false,
-      error: `worker_dispatch 缺少 category 参数。可选分类: ${this.getKnownCategoryNames().join(', ')}`,
     };
   }
 

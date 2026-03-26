@@ -12,6 +12,7 @@ import type { WorkerSlot } from '../../types';
 import { logger, LogCategory } from '../../logging';
 import { t } from '../../i18n';
 import type { RequirementAnalysis } from '../protocols/types';
+import type { TaskOwnership, TaskMode } from '../profile/task-taxonomy';
 import {
   mergeOrchestrationTraceLinks,
   type OrchestrationTraceLinks,
@@ -135,8 +136,10 @@ export interface DispatchCollaborationContracts {
 
 export interface DispatchTaskContract {
   taskTitle: string;
-  category: string;
-  declaredCategory?: string;
+  /** 任务归属域（决定 Worker 路由） */
+  ownership: TaskOwnership;
+  /** 任务执行模式（约束执行行为） */
+  mode: TaskMode;
   requirementAnalysis: RequirementAnalysis;
   context: string[];
   scopeHint: string[];

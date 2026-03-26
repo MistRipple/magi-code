@@ -109,8 +109,10 @@ export interface InjectionContext {
   featureContract?: string;
   /** 协作者列表 */
   collaborators?: WorkerSlot[];
-  /** 任务分类 */
+  /** 任务归属域（决定 Worker 路由） */
   category?: string;
+  /** 任务执行模式（约束执行行为） */
+  mode?: string;
   /** 是否主导者 */
   isLeader?: boolean;
   /** 动态可用工具摘要（内置 + MCP + Skill，由 ToolManager.buildToolsSummary() 生成） */

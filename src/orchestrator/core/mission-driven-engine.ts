@@ -21,7 +21,6 @@ import { PermissionMatrix, StrategyConfig, WorkerSlot, InteractionMode, INTERACT
 import { TokenUsage } from '../../types/agent-types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
-import { CategoryResolver } from '../profile/category-resolver';
 import { OrchestratorState, RequirementAnalysis } from '../protocols/types';
 import type { WorkerReport } from '../protocols/worker-report';
 import { VerificationRunner, VerificationConfig } from '../verification-runner';
@@ -180,7 +179,6 @@ export class MissionDrivenEngine extends EventEmitter {
   private readonly planTimelineStateCache = new Map<string, Record<string, unknown>>();
   private profileLoader: ProfileLoader;
   private guidanceInjector: GuidanceInjector;
-  private categoryResolver = new CategoryResolver();
   private readonly terminationMetricsRepository: TerminationMetricsRepository;
   private readonly requestClassificationCalibrationStore: RequestClassificationCalibrationStore;
 
@@ -1284,7 +1282,8 @@ export class MissionDrivenEngine extends EventEmitter {
     taskId: string;
     worker: WorkerSlot;
     title: string;
-    category: string;
+    ownership: string;
+    mode: string;
     dependsOn?: string[];
     scopeHint?: string[];
     files?: string[];
@@ -1306,7 +1305,7 @@ export class MissionDrivenEngine extends EventEmitter {
       itemId: payload.taskId,
       title: payload.title,
       worker: payload.worker,
-      category: payload.category,
+      category: payload.ownership,
       dependsOn: payload.dependsOn,
       scopeHints: payload.scopeHint,
       targetFiles: payload.files,

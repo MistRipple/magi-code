@@ -606,6 +606,10 @@ export interface MessageMetadata {
   timelineAnchorTimestamp?: number;
   /** 对话轮次 ID（用于计划账本/快照/对话回溯的同轮对齐） */
   turnId?: string;
+  /** 事件唯一标识（用于事件流排障） */
+  eventId?: string;
+  /** 事件顺序号（会话内单调递增） */
+  eventSeq?: number;
   /** 卡片实体 ID（流式更新必须绑定同一 cardId） */
   cardId?: string;
   /** 父卡片 ID（补遗卡片或衍生卡片回溯来源） */
@@ -750,7 +754,7 @@ export function createUserInputMessage(
   traceId: string,
   options?: Partial<StandardMessage>
 ): StandardMessage {
-  return createStandardMessage({
+  const message = createStandardMessage({
     category: MessageCategory.CONTENT,
     type: MessageType.USER_INPUT,
     source: 'orchestrator',  // 用户消息通过编排者中转
@@ -761,6 +765,24 @@ export function createUserInputMessage(
     metadata: {},
     ...options,
   });
+  const metadata = message.metadata && typeof message.metadata === 'object'
+    ? message.metadata as Record<string, unknown>
+    : {};
+  const existingAnchorTimestamp = typeof metadata.timelineAnchorTimestamp === 'number'
+    && Number.isFinite(metadata.timelineAnchorTimestamp)
+    && metadata.timelineAnchorTimestamp > 0
+    ? Math.floor(metadata.timelineAnchorTimestamp)
+    : 0;
+  if (existingAnchorTimestamp > 0) {
+    return message;
+  }
+  return {
+    ...message,
+    metadata: {
+      ...metadata,
+      timelineAnchorTimestamp: message.timestamp,
+    },
+  };
 }
 
 /**

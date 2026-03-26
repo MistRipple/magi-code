@@ -460,6 +460,19 @@ export function deriveWorkerLifecycleCardViewModel({
   const cardWorker = normalizeWorkerSlot(rawWorker);
   const runtimeState = cardWorker ? selectWorkerRuntime(workerRuntimeMap, cardWorker) : null;
   const runtimeStatus = cardWorker ? selectWorkerRuntimeStatus(workerRuntimeMap, cardWorker) : undefined;
+  const runtimeLifecycleMessageId = runtimeState?.activeLifecycleMessageId || null;
+  const runtimeSourceMessageIds = Array.isArray(metadata.sourceMessageIds)
+    ? metadata.sourceMessageIds.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    : [];
+  const isRuntimeTarget = Boolean(
+    runtimeLifecycleMessageId
+    && (
+      runtimeLifecycleMessageId === message.id
+      || runtimeSourceMessageIds.includes(runtimeLifecycleMessageId)
+    )
+  );
+  const effectiveRuntimeState = isRuntimeTarget ? runtimeState : null;
+  const effectiveRuntimeStatus = isRuntimeTarget ? runtimeStatus : undefined;
   const cardKey = resolveTaskCardKeyFromMetadata(metadata);
   const persistedTaskCardWaitResult = buildWaitResultFromTaskCardMessage(message)?.result || null;
   const waitResult = (cardKey && workerWaitResults?.[cardKey]) || persistedTaskCardWaitResult;
@@ -474,6 +487,17 @@ export function deriveWorkerLifecycleCardViewModel({
       && mergedSubTaskCard.timelineAnchorTimestamp > 0
       ? Math.floor(mergedSubTaskCard.timelineAnchorTimestamp)
       : undefined);
+  const persistedStartedAt = message.type === 'instruction'
+    ? (timelineAnchorTimestamp || message.timestamp)
+    : undefined;
+  const runtimeStartedAt = typeof effectiveRuntimeState?.timerStartAt === 'number'
+    && Number.isFinite(effectiveRuntimeState.timerStartAt)
+    && effectiveRuntimeState.timerStartAt > 0
+    ? Math.floor(effectiveRuntimeState.timerStartAt)
+    : undefined;
+  const stableStartedAt = runtimeStartedAt && persistedStartedAt
+    ? Math.min(runtimeStartedAt, persistedStartedAt)
+    : (runtimeStartedAt || persistedStartedAt);
 
   // 卡片状态只保留两层语义：
   // 1) 持久化状态：消息自身携带的结构化快照（instruction 的 laneTasks / task_card 的 subTaskCard.status）
@@ -482,11 +506,12 @@ export function deriveWorkerLifecycleCardViewModel({
     ? resolveLaneOverallStatus(metadata)
     : undefined;
   const persistedCardStatus = laneOverallStatus || metadataCardStatus;
-  const runtimeCardStatus = mapRuntimeStatusToCard(runtimeStatus);
+  const runtimeCardStatus = mapRuntimeStatusToCard(effectiveRuntimeStatus);
   const activeRuntimeCard = Boolean(
     runtimeCardStatus
+    && isRuntimeTarget
     && !isTerminalCardStatus(persistedCardStatus)
-    && (runtimeStatus === 'running' || runtimeStatus === 'pending' || runtimeStatus === 'blocked')
+    && (effectiveRuntimeStatus === 'running' || effectiveRuntimeStatus === 'pending' || effectiveRuntimeStatus === 'blocked')
   );
 
   return {
@@ -497,9 +522,8 @@ export function deriveWorkerLifecycleCardViewModel({
       error: activeRuntimeCard ? undefined : card.error,
       failureCode: activeRuntimeCard ? undefined : card.failureCode,
     },
-    startedAtOverride: runtimeState?.timerStartAt
-      || (message.type === 'instruction' ? (timelineAnchorTimestamp || message.timestamp) : undefined),
-    runtimeStatus,
+    startedAtOverride: stableStartedAt,
+    runtimeStatus: effectiveRuntimeStatus,
     waitResult,
     showWaitReport: message.type === 'instruction',
   };

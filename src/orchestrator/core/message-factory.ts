@@ -347,6 +347,7 @@ export class MessageFactory {
         placeholderState: 'pending',
         requestId: normalizedRequestId,
         userMessageId: starterMessage.id,
+        timelineAnchorTimestamp: starterMessage.timestamp,
         extra: {
           syntheticRequest: true,
           ...((metadata?.extra && typeof metadata.extra === 'object') ? metadata.extra : {}),

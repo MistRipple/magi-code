@@ -139,6 +139,12 @@ export function compareTimelineSemanticOrder(
     return left.timestamp - right.timestamp;
   }
 
+  const leftStage = resolveMessageSemanticStage(left.messageType, left.primaryToolCallName || '');
+  const rightStage = resolveMessageSemanticStage(right.messageType, right.primaryToolCallName || '');
+  if (leftStage !== rightStage) {
+    return leftStage - rightStage;
+  }
+
   const leftAnchorEventSeq = normalizePositiveInteger(left.anchorEventSeq);
   const rightAnchorEventSeq = normalizePositiveInteger(right.anchorEventSeq);
   if (
@@ -153,12 +159,6 @@ export function compareTimelineSemanticOrder(
   const rightBlockSeq = normalizeNonNegativeInteger(right.blockSeq) || 0;
   if (leftBlockSeq !== rightBlockSeq) {
     return leftBlockSeq - rightBlockSeq;
-  }
-
-  const leftStage = resolveMessageSemanticStage(left.messageType, left.primaryToolCallName || '');
-  const rightStage = resolveMessageSemanticStage(right.messageType, right.primaryToolCallName || '');
-  if (leftStage !== rightStage) {
-    return leftStage - rightStage;
   }
 
   const leftCardStreamSeq = normalizeNonNegativeInteger(left.cardStreamSeq) || 0;

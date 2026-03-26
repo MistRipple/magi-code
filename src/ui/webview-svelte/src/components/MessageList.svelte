@@ -2,7 +2,7 @@
   import type { Message, ScrollPositions, TimelineRenderItem } from '../types/message';
   import MessageItem from './MessageItem.svelte';
   import Icon from './Icon.svelte';
-  import { tick } from 'svelte';
+  import { tick, onDestroy } from 'svelte';
   import { clearMessageJump, getState, messagesState, updatePanelScrollState } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import {
@@ -37,13 +37,29 @@
 
   const safeRenderMessages = $derived.by(() => safeRenderItems.map((item) => item.message));
 
+  function resolveStreamingMessageVersion(message: Message): string {
+    const metadata = (message.metadata && typeof message.metadata === 'object')
+      ? (message.metadata as Record<string, unknown>)
+      : {};
+    const eventSeq = typeof metadata.eventSeq === 'number' && Number.isFinite(metadata.eventSeq)
+      ? Math.max(0, Math.floor(metadata.eventSeq))
+      : 0;
+    const cardStreamSeq = typeof metadata.cardStreamSeq === 'number' && Number.isFinite(metadata.cardStreamSeq)
+      ? Math.max(0, Math.floor(metadata.cardStreamSeq))
+      : 0;
+    const updatedAt = typeof message.updatedAt === 'number' && Number.isFinite(message.updatedAt)
+      ? Math.max(0, Math.floor(message.updatedAt))
+      : 0;
+    return `${eventSeq}:${cardStreamSeq}:${updatedAt}:${(message.content || '').length}:${(message.blocks || []).length}`;
+  }
+
   /* 🔧 计算流式消息的内容签名，用于触发滚动
      当任何流式消息的内容变化时，需要重新滚动到底部 */
   const streamingContentSignature = $derived.by(() => {
     const streamingMsgs = safeRenderMessages.filter(m => m.isStreaming);
     if (streamingMsgs.length === 0) return '';
-    // 使用内容长度作为签名，避免频繁的字符串比较
-    return streamingMsgs.map(m => `${m.id}:${(m.content || '').length}:${(m.blocks || []).length}`).join('|');
+    // 用 event/card 序号 + 更新时间作为流式版本签名，避免 tool_call 高度变化漏触发自动滚动
+    return streamingMsgs.map(m => `${m.id}:${resolveStreamingMessageVersion(m)}`).join('|');
   });
 
   // 对话级处理指示器
@@ -208,9 +224,44 @@
   const showScrollBtn = $derived(!shouldAutoScroll && safeRenderMessages.length > 0);
   let wasActive = $state(false);
   let lastObservedScrollTop = $state(0);
+  let activationRestoreNonce = 0;
+  let restoreAttemptTimers: Array<ReturnType<typeof setTimeout>> = [];
+  let programmaticScrollDepth = 0;
+
+  function clearRestoreAttemptTimers() {
+    if (restoreAttemptTimers.length === 0) return;
+    for (const timer of restoreAttemptTimers) {
+      clearTimeout(timer);
+    }
+    restoreAttemptTimers = [];
+  }
+
+  function scheduleActivationScrollRestore() {
+    const restoreNonce = ++activationRestoreNonce;
+    clearRestoreAttemptTimers();
+
+    const attemptRestore = () => {
+      if (restoreNonce !== activationRestoreNonce) return;
+      if (!containerRef || !isActive) return;
+      restorePanelScrollPosition(false);
+    };
+
+    // 多阶段恢复：覆盖 tab 切换后异步布局变化（代码高亮/卡片内容扩展）导致的位置漂移。
+    tick().then(() => {
+      attemptRestore();
+      requestAnimationFrame(() => {
+        attemptRestore();
+      });
+      restoreAttemptTimers = [
+        setTimeout(() => attemptRestore(), 96),
+        setTimeout(() => attemptRestore(), 220),
+      ];
+    });
+  }
 
   function setContainerScrollPosition(nextTop: number) {
     if (!containerRef) return;
+    programmaticScrollDepth += 1;
     const maxScrollTop = Math.max(0, containerRef.scrollHeight - containerRef.clientHeight);
     const clampedTop = Math.max(0, Math.min(nextTop, maxScrollTop));
     containerRef.style.scrollBehavior = 'auto';
@@ -220,6 +271,7 @@
       if (containerRef) {
         containerRef.style.scrollBehavior = '';
       }
+      programmaticScrollDepth = Math.max(0, programmaticScrollDepth - 1);
     });
   }
 
@@ -305,10 +357,7 @@
   $effect(() => {
     const active = isActive;
     if (active && !wasActive && containerRef) {
-      tick().then(() => {
-        if (!containerRef || !isActive) return;
-        restorePanelScrollPosition(false);
-      });
+      scheduleActivationScrollRestore();
     }
     wasActive = active;
   });
@@ -363,6 +412,10 @@
     } else if (userScrolledUp) {
       nextAutoScroll = false;
     }
+    if (programmaticScrollDepth === 0) {
+      activationRestoreNonce += 1;
+      clearRestoreAttemptTimers();
+    }
     lastObservedScrollTop = scrollTop;
     syncPanelScrollState(scrollTop, nextAutoScroll);
   }
@@ -370,11 +423,17 @@
   // 滚动到底部
   function scrollToBottom() {
     updatePanelScrollState(panelKey, { autoScrollEnabled: true }, { persist: false });
-    if (containerRef) {
-      const maxScrollTop = Math.max(0, containerRef.scrollHeight - containerRef.clientHeight);
-      containerRef.scrollTo({ top: maxScrollTop, behavior: 'smooth' });
-    }
+    scrollPanelToBottom(false);
   }
+
+  onDestroy(() => {
+    activationRestoreNonce += 1;
+    clearRestoreAttemptTimers();
+    if (!containerRef) {
+      return;
+    }
+    syncPanelScrollState(containerRef.scrollTop, shouldAutoScroll);
+  });
 </script>
 
 <div class="message-list-wrapper">

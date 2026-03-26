@@ -4,6 +4,7 @@ import {
   probeReachableAgentBaseUrl,
   resolveAgentBaseUrl,
 } from '../../webview-svelte/src/web/agent-api';
+import { getHostApi, getTransport, initTransport } from '../transport';
 import {
   getAgentLanAccessInfo,
   getAgentTunnelStatus,
@@ -84,6 +85,7 @@ import {
 } from '../../webview-svelte/src/web/agent-api';
 import type { ClientBridge, ClientBridgeMessage, SupportedLocale } from './client-bridge';
 import {
+  createNotifyMessage,
   MessageCategory,
   MessageLifecycle,
   MessageType,
@@ -97,6 +99,7 @@ import type {
   SettingsRuntimeSnapshot,
 } from '../../../shared/settings-bootstrap';
 import { buildSettingsBootstrapSnapshot } from '../../../shared/settings-bootstrap';
+import type { SseConnection } from '../transport';
 
 type BootstrapPayload = SessionBootstrapSnapshot & {
  agent?: {
@@ -117,7 +120,8 @@ let currentSessionId = '';
 let currentRuntimeEpoch = '';
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
 let cachedRuntimeSettings: SettingsRuntimeSnapshot | null = null;
-let activeEventStream: EventSource | null = null;
+/** 传输层维护的 SSE 连接句柄（统一管理 Web EventSource 和宿主代理两种模式） */
+let activeSseConnection: SseConnection | null = null;
 let activeEventStreamKey = '';
 let bridgeRecovering = false;
 // fetchBootstrap 防重入：同一时刻只允许一个 bootstrap 请求在飞行中，
@@ -130,6 +134,156 @@ let recoveryInFlight: Promise<void> | null = null;
 
 const RECOVERY_BASE_DELAY_MS = 1000;
 const RECOVERY_MAX_DELAY_MS = 10_000;
+const EVENT_STREAM_PARSE_ERROR_DEBOUNCE_MS = 5000;
+const WEBVIEW_STATE_STORAGE_KEY = 'webview-state';
+const WEBVIEW_STATE_WRITE_INTERVAL_MS = 1200;
+const WEBVIEW_STATE_MAX_BYTES = 1_500_000;
+let lastEventStreamParseErrorAt = 0;
+let lastWebviewStateWriteAt = 0;
+let webviewStateWriteTimer: number | null = null;
+let webviewStatePersistenceDisabled = false;
+let webviewStatePersistenceWarningLogged = false;
+let pendingWebviewState: unknown = null;
+let cachedWebviewState: unknown = null;
+const storageWarningSignatures = new Set<string>();
+
+function normalizeStorageErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message.trim();
+  }
+  if (typeof error === 'string' && error.trim()) {
+    return error.trim();
+  }
+  return 'unknown_storage_error';
+}
+
+function warnStorageFailure(action: string, key: string, error: unknown): void {
+  const signature = `${action}:${key}:${normalizeStorageErrorMessage(error)}`;
+  if (storageWarningSignatures.has(signature)) {
+    return;
+  }
+  storageWarningSignatures.add(signature);
+  console.warn(`[web-client-bridge] localStorage ${action} 失败(${key})，已降级处理`, error);
+}
+
+function safeLocalStorageGetItem(key: string): string {
+  if (typeof window === 'undefined') {
+    return '';
+  }
+  try {
+    return localStorage.getItem(key) || '';
+  } catch (error) {
+    warnStorageFailure('读取', key, error);
+    return '';
+  }
+}
+
+function safeLocalStorageSetItem(key: string, value: string): boolean {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+  try {
+    localStorage.setItem(key, value);
+    return true;
+  } catch (error) {
+    warnStorageFailure('写入', key, error);
+    return false;
+  }
+}
+
+function safeLocalStorageRemoveItem(key: string): boolean {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+  try {
+    localStorage.removeItem(key);
+    return true;
+  } catch (error) {
+    warnStorageFailure('删除', key, error);
+    return false;
+  }
+}
+
+function flushPersistedWebviewState(): void {
+  if (webviewStateWriteTimer !== null) {
+    window.clearTimeout(webviewStateWriteTimer);
+    webviewStateWriteTimer = null;
+  }
+  if (webviewStatePersistenceDisabled || pendingWebviewState === null) {
+    return;
+  }
+  let serialized = '';
+  try {
+    serialized = JSON.stringify(pendingWebviewState);
+  } catch (error) {
+    warnStorageFailure('序列化', WEBVIEW_STATE_STORAGE_KEY, error);
+    webviewStatePersistenceDisabled = true;
+    pendingWebviewState = null;
+    return;
+  }
+  pendingWebviewState = null;
+
+  if (serialized.length > WEBVIEW_STATE_MAX_BYTES) {
+    webviewStatePersistenceDisabled = true;
+    safeLocalStorageRemoveItem(WEBVIEW_STATE_STORAGE_KEY);
+    if (!webviewStatePersistenceWarningLogged) {
+      webviewStatePersistenceWarningLogged = true;
+      console.warn('[web-client-bridge] webview 状态体积过大，已切换为内存态持久化模式', {
+        bytes: serialized.length,
+        maxBytes: WEBVIEW_STATE_MAX_BYTES,
+      });
+    }
+    return;
+  }
+
+  if (safeLocalStorageSetItem(WEBVIEW_STATE_STORAGE_KEY, serialized)) {
+    lastWebviewStateWriteAt = Date.now();
+    return;
+  }
+
+  webviewStatePersistenceDisabled = true;
+  safeLocalStorageRemoveItem(WEBVIEW_STATE_STORAGE_KEY);
+  if (!webviewStatePersistenceWarningLogged) {
+    webviewStatePersistenceWarningLogged = true;
+    console.warn('[web-client-bridge] webview 状态写入失败，已切换为内存态持久化模式');
+  }
+}
+
+function schedulePersistedWebviewState(): void {
+  if (typeof window === 'undefined' || webviewStatePersistenceDisabled) {
+    return;
+  }
+  if (webviewStateWriteTimer !== null) {
+    return;
+  }
+  const elapsed = Date.now() - lastWebviewStateWriteAt;
+  const delay = elapsed >= WEBVIEW_STATE_WRITE_INTERVAL_MS
+    ? 0
+    : WEBVIEW_STATE_WRITE_INTERVAL_MS - elapsed;
+  webviewStateWriteTimer = window.setTimeout(() => {
+    flushPersistedWebviewState();
+  }, delay);
+}
+
+function sanitizeVsCodeMessage(message: ClientBridgeMessage): ClientBridgeMessage {
+  try {
+    if (typeof structuredClone === 'function') {
+      return structuredClone(message);
+    }
+  } catch {
+    // fall through to JSON clone
+  }
+  return JSON.parse(JSON.stringify(message)) as ClientBridgeMessage;
+}
+
+function forwardToVsCodeHost(message: ClientBridgeMessage): boolean {
+  const api = getHostApi();
+  if (!api) {
+    return false;
+  }
+  api.postMessage(sanitizeVsCodeMessage(message));
+  return true;
+}
 
 function normalizeErrorMessage(error: unknown): string | undefined {
   if (error instanceof Error) {
@@ -139,6 +293,18 @@ function normalizeErrorMessage(error: unknown): string | undefined {
     return error.trim();
   }
   return undefined;
+}
+
+function emitForcedProcessingIdle(reason: string, extra?: Record<string, unknown>): void {
+  emitDataMessage('processingStateChanged', {
+    isProcessing: false,
+    transitionKind: 'forced',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    reason,
+    timestamp: Date.now(),
+    ...(extra || {}),
+  });
 }
 
 function emitRecoveringState(reason: string, error?: unknown): void {
@@ -173,8 +339,18 @@ function ensureWindowListener(): void {
     return;
   }
   bridgeListenerRegistered = true;
+
   window.addEventListener('message', (event) => {
     const message = event.data as ClientBridgeMessage;
+    if (!message || typeof message !== 'object' || !message.type) return;
+    // 传输层内部消息（agentApiProxyResponse / agentSseEvent / agentSseStatus）
+    // 已由 transport.ts 的 window message 监听器处理，此处跳过
+    if (message.type === 'agentApiProxyResponse'
+      || message.type === 'agentSseEvent'
+      || message.type === 'agentSseStatus') {
+      return;
+    }
+    syncBindingFromBridgeMessage(message);
     emitMessage(message);
   });
   window.addEventListener('storage', (event) => {
@@ -185,10 +361,52 @@ function ensureWindowListener(): void {
     scheduleRecovery('agent_base_url_changed', undefined, true);
   });
   window.addEventListener('focus', () => {
-    if (!activeEventStream && (currentWorkspaceId || currentWorkspacePath || currentSessionId)) {
+    if (!activeSseConnection && (currentWorkspaceId || currentWorkspacePath || currentSessionId)) {
       scheduleRecovery('window_focus', undefined, true);
     }
   });
+}
+
+function extractSessionBootstrapBinding(
+  message: ClientBridgeMessage,
+): { sessionId: string; workspaceId: string; workspacePath: string } {
+  if (message.type !== 'unifiedMessage') {
+    return { sessionId: '', workspaceId: '', workspacePath: '' };
+  }
+  const standard = message.message as StandardMessage | undefined;
+  if (!standard || standard.category !== MessageCategory.DATA) {
+    return { sessionId: '', workspaceId: '', workspacePath: '' };
+  }
+  if (standard.data?.dataType !== 'sessionBootstrapLoaded') {
+    return { sessionId: '', workspaceId: '', workspacePath: '' };
+  }
+  const payload = standard.data?.payload;
+  if (!payload || typeof payload !== 'object') {
+    return { sessionId: '', workspaceId: '', workspacePath: '' };
+  }
+  const payloadRecord = payload as Record<string, unknown>;
+  const workspaceRecord = payloadRecord.workspace && typeof payloadRecord.workspace === 'object'
+    ? payloadRecord.workspace as Record<string, unknown>
+    : undefined;
+  return {
+    sessionId: typeof payloadRecord.sessionId === 'string' ? payloadRecord.sessionId.trim() : '',
+    workspaceId: typeof workspaceRecord?.workspaceId === 'string' ? workspaceRecord.workspaceId.trim() : '',
+    workspacePath: typeof workspaceRecord?.rootPath === 'string' ? workspaceRecord.rootPath.trim() : '',
+  };
+}
+
+function syncBindingFromBridgeMessage(message: ClientBridgeMessage): void {
+  const binding = extractSessionBootstrapBinding(message);
+  const nextSessionId = binding.sessionId;
+  if (!nextSessionId || nextSessionId === currentSessionId) {
+    return;
+  }
+  persistWorkspaceBinding(
+    binding.workspaceId || currentWorkspaceId,
+    binding.workspacePath || currentWorkspacePath,
+    nextSessionId,
+  );
+  ensureEventStream();
 }
 
 function emitMessage(message: ClientBridgeMessage): void {
@@ -241,6 +459,53 @@ function emitDataMessage(dataType: DataMessageType, payload: Record<string, unkn
   emitMessage({ type: 'unifiedMessage', message });
 }
 
+function emitBridgeErrorToast(action: string, error: unknown): void {
+  const normalizedAction = action.trim() || '请求';
+  const detail = normalizeErrorMessage(error);
+  const content = detail ? `${normalizedAction}失败：${detail}` : `${normalizedAction}失败`;
+  const now = Date.now();
+  const message = createNotifyMessage(
+    content,
+    'error',
+    `web-bridge:${normalizedAction}`,
+    undefined,
+    {
+      title: '请求失败',
+      displayMode: 'toast',
+      category: 'incident',
+      source: 'bridge-runtime',
+      actionRequired: true,
+      persistToCenter: true,
+      countUnread: true,
+    },
+    {
+      id: `web-bridge-error-${now}`,
+      timestamp: now,
+      updatedAt: now,
+    },
+  );
+  emitMessage({ type: 'unifiedMessage', message });
+}
+
+function logBridgeOperationFailure(action: string, logLabel: string, error: unknown): void {
+  console.error(logLabel, error);
+  emitBridgeErrorToast(action, error);
+}
+
+function handleEventStreamParseFailure(data: string, error: unknown): void {
+  console.error('[web-client-bridge] 事件流消息解析失败:', {
+    error,
+    preview: data.slice(0, 240),
+  });
+  const now = Date.now();
+  if (now - lastEventStreamParseErrorAt >= EVENT_STREAM_PARSE_ERROR_DEBOUNCE_MS) {
+    lastEventStreamParseErrorAt = now;
+    emitBridgeErrorToast('事件流解析', error);
+  }
+  closeEventStream();
+  scheduleRecovery('event_stream_parse_error', error, true);
+}
+
 function getCurrentUrl(): URL | null {
   if (typeof window === 'undefined') {
     return null;
@@ -248,11 +513,35 @@ function getCurrentUrl(): URL | null {
   return new URL(window.location.href);
 }
 
+function resolveInjectedWorkspaceBinding(): { workspaceId: string; workspacePath: string } {
+  if (typeof window === 'undefined') {
+    return { workspaceId: '', workspacePath: '' };
+  }
+  const bootstrapWindow = window as unknown as {
+    __INITIAL_WORKSPACE_ID__?: string;
+    __INITIAL_WORKSPACE_PATH__?: string;
+  };
+  return {
+    workspaceId: bootstrapWindow.__INITIAL_WORKSPACE_ID__?.trim() || '',
+    workspacePath: bootstrapWindow.__INITIAL_WORKSPACE_PATH__?.trim() || '',
+  };
+}
+
 function resolveWorkspaceQuery(): { workspaceId: string; workspacePath: string; sessionId: string } {
   const currentUrl = getCurrentUrl();
-  const workspaceId = currentUrl?.searchParams.get('workspaceId')?.trim() || localStorage.getItem('magi-workspace-id') || '';
-  const workspacePath = currentUrl?.searchParams.get('workspacePath')?.trim() || localStorage.getItem('magi-workspace-path') || '';
-  const sessionId = currentUrl?.searchParams.get('sessionId')?.trim() || localStorage.getItem('magi-session-id') || '';
+  const injectedBinding = resolveInjectedWorkspaceBinding();
+  const injectedSessionId = typeof window !== 'undefined'
+    ? (window as unknown as { __INITIAL_SESSION_ID__?: string }).__INITIAL_SESSION_ID__?.trim() || ''
+    : '';
+  const workspaceId = currentUrl?.searchParams.get('workspaceId')?.trim()
+    || injectedBinding.workspaceId
+    || safeLocalStorageGetItem('magi-workspace-id')
+    || '';
+  const workspacePath = currentUrl?.searchParams.get('workspacePath')?.trim()
+    || injectedBinding.workspacePath
+    || safeLocalStorageGetItem('magi-workspace-path')
+    || '';
+  const sessionId = currentUrl?.searchParams.get('sessionId')?.trim() || injectedSessionId || safeLocalStorageGetItem('magi-session-id') || '';
   return { workspaceId, workspacePath, sessionId };
 }
 
@@ -261,15 +550,15 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
   currentWorkspacePath = workspacePath;
   currentSessionId = sessionId;
   if (workspaceId) {
-    localStorage.setItem('magi-workspace-id', workspaceId);
+    safeLocalStorageSetItem('magi-workspace-id', workspaceId);
   }
   if (workspacePath) {
-    localStorage.setItem('magi-workspace-path', workspacePath);
+    safeLocalStorageSetItem('magi-workspace-path', workspacePath);
   }
   if (sessionId) {
-    localStorage.setItem('magi-session-id', sessionId);
+    safeLocalStorageSetItem('magi-session-id', sessionId);
   } else {
-    localStorage.removeItem('magi-session-id');
+    safeLocalStorageRemoveItem('magi-session-id');
   }
 
   const currentUrl = getCurrentUrl();
@@ -298,8 +587,10 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
 }
 
 function closeEventStream(): void {
-  activeEventStream?.close();
-  activeEventStream = null;
+  if (activeSseConnection) {
+    activeSseConnection.close();
+    activeSseConnection = null;
+  }
   activeEventStreamKey = '';
 }
 
@@ -366,38 +657,35 @@ function ensureEventStream(): void {
     closeEventStream();
     return;
   }
-  if (activeEventStream && activeEventStreamKey === nextKey) {
+  if (activeSseConnection && activeEventStreamKey === nextKey) {
     return;
   }
   closeEventStream();
-  const stream = new EventSource(agentUrl('/api/events', nextKey));
-  stream.onopen = () => {
-    if (activeEventStream !== stream) {
-      return;
-    }
-    if (bridgeRecovering && !recoveryInFlight) {
-      void restoreBridgeState('event_stream_open', true).catch((error) => {
-        scheduleRecovery('event_stream_open', error);
-      });
-    }
-  };
-  stream.onmessage = (event) => {
-    try {
-      emitMessage(JSON.parse(event.data) as ClientBridgeMessage);
-    } catch (error) {
-      console.error('[web-client-bridge] 事件流消息解析失败:', error);
-    }
-  };
-  stream.onerror = () => {
-    stream.close();
-    if (activeEventStream === stream) {
-      activeEventStream = null;
-      activeEventStreamKey = '';
-      scheduleRecovery('event_stream_error');
-    }
-  };
-  activeEventStream = stream;
   activeEventStreamKey = nextKey;
+  activeSseConnection = getTransport().connectEventStream(
+    agentUrl('/api/events', nextKey),
+    {
+      onOpen() {
+        if (bridgeRecovering && !recoveryInFlight) {
+          void restoreBridgeState('event_stream_open', true).catch((error) => {
+            scheduleRecovery('event_stream_open', error);
+          });
+        }
+      },
+      onMessage(data: string) {
+        try {
+          emitMessage(JSON.parse(data) as ClientBridgeMessage);
+        } catch (error) {
+          handleEventStreamParseFailure(data, error);
+        }
+      },
+      onError() {
+        activeSseConnection = null;
+        activeEventStreamKey = '';
+        scheduleRecovery('event_stream_error');
+      },
+    },
+  );
 }
 
 function dispatchBootstrap(payload: BootstrapPayload): void {
@@ -434,7 +722,7 @@ async function fetchBootstrap(): Promise<void> {
     if (sessionId) {
       query.set('sessionId', sessionId);
     }
-    const response = await fetch(agentUrl('/api/bootstrap', query.toString()));
+    const response = await getTransport().request(agentUrl('/api/bootstrap', query.toString()));
     if (!response.ok) {
       throw new Error(`bootstrap failed: ${response.status}`);
     }
@@ -451,7 +739,7 @@ async function fetchSettingsBootstrap(force = false): Promise<SettingsBootstrapP
   if (!force && cachedSettingsBootstrap) {
     return cachedSettingsBootstrap;
   }
-  const response = await fetch(agentUrl('/api/settings/bootstrap'));
+  const response = await getTransport().request(agentUrl('/api/settings/bootstrap'));
   if (!response.ok) {
     throw new Error(`settings bootstrap failed: ${response.status}`);
   }
@@ -502,7 +790,7 @@ async function dispatchProjectKnowledge(): Promise<void> {
   if (currentWorkspacePath) {
     query.set('workspacePath', currentWorkspacePath);
   }
-  const response = await fetch(agentUrl('/api/knowledge', query.toString()));
+  const response = await getTransport().request(agentUrl('/api/knowledge', query.toString()));
   if (!response.ok) {
     throw new Error(`project knowledge failed: ${response.status}`);
   }
@@ -515,7 +803,7 @@ async function emitKnowledgePayload(): Promise<void> {
 }
 
 async function createSession(): Promise<void> {
-  const response = await fetch(agentUrl('/api/session/new'), {
+  const response = await getTransport().request(agentUrl('/api/session/new'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -530,7 +818,7 @@ async function createSession(): Promise<void> {
 }
 
 async function switchSession(sessionId: string): Promise<void> {
-  const response = await fetch(agentUrl('/api/session/switch'), {
+  const response = await getTransport().request(agentUrl('/api/session/switch'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -569,8 +857,19 @@ async function executeTask(prompt: string, requestId?: string): Promise<void> {
   await executeAgentTask(prompt, requestId);
 }
 
-async function interruptTask(): Promise<void> {
-  await interruptAgentTask();
+async function interruptTask(trigger: 'user_stop' | 'pause_task' = 'user_stop'): Promise<void> {
+  // 无论后端是否可达/报错，先在前端立即收敛到 idle，避免停止按钮卡死。
+  emitForcedProcessingIdle('user_interrupt_requested', { trigger });
+  try {
+    await interruptAgentTask();
+  } catch (error) {
+    console.error('[web-client-bridge] 中断任务失败（已执行前端强制停止）:', error);
+    emitBridgeErrorToast('停止任务', error);
+    emitForcedProcessingIdle('user_interrupt_failed', {
+      trigger,
+      error: normalizeErrorMessage(error),
+    });
+  }
 }
 
 async function clearAllTasks(): Promise<void> {
@@ -697,7 +996,7 @@ async function updateSetting(key: string, value: unknown): Promise<void> {
     deepTask: payload.deepTask,
   };
   if (key === 'locale') {
-    localStorage.setItem('magi-locale', payload.locale);
+    safeLocalStorageSetItem('magi-locale', payload.locale);
   }
   await dispatchSettingsBootstrap(true);
 }
@@ -929,6 +1228,8 @@ async function deleteLearning(id: string): Promise<void> {
 }
 
 export function createWebClientBridge(): ClientBridge {
+  // 初始化传输层（自动检测 VS Code / Web 环境，选择对应策略）
+  initTransport();
   ensureWindowListener();
 
   return {
@@ -939,206 +1240,206 @@ export function createWebClientBridge(): ClientBridge {
         case 'getState':
         case 'requestState':
           void restoreBridgeState('request_state').catch((error) => {
-            console.error('[web-client-bridge] bootstrap 失败:', error);
+            logBridgeOperationFailure('bootstrap ', '[web-client-bridge] bootstrap 失败:', error);
             scheduleRecovery('request_state', error);
           });
           return;
         case 'loadSettingsBootstrap':
           void dispatchSettingsBootstrap(Boolean(message.force)).catch((error) => {
-            console.error('[web-client-bridge] settings 配置加载失败:', error);
+            logBridgeOperationFailure('settings 配置加载', '[web-client-bridge] settings 配置加载失败:', error);
           });
           return;
         case 'saveProfileConfig':
           if (message.data && typeof message.data === 'object') {
             void saveProfileConfig(message.data as Record<string, unknown>).catch((error) => {
-              console.error('[web-client-bridge] 保存画像配置失败:', error);
+              logBridgeOperationFailure('保存画像配置', '[web-client-bridge] 保存画像配置失败:', error);
             });
           }
           return;
         case 'resetProfileConfig':
           void resetProfileConfig().catch((error) => {
-            console.error('[web-client-bridge] 重置画像配置失败:', error);
+            logBridgeOperationFailure('重置画像配置', '[web-client-bridge] 重置画像配置失败:', error);
           });
           return;
         case 'saveWorkerConfig':
           if (typeof message.worker === 'string' && message.config && typeof message.config === 'object') {
             void saveWorkerConfig(message.worker, message.config as Record<string, unknown>).catch((error) => {
-              console.error('[web-client-bridge] 保存 worker 配置失败:', error);
+              logBridgeOperationFailure('保存 worker 配置', '[web-client-bridge] 保存 worker 配置失败:', error);
             });
           }
           return;
         case 'saveOrchestratorConfig':
           if (message.config && typeof message.config === 'object') {
             void saveOrchestratorConfig(message.config as Record<string, unknown>).catch((error) => {
-              console.error('[web-client-bridge] 保存编排模型配置失败:', error);
+              logBridgeOperationFailure('保存编排模型配置', '[web-client-bridge] 保存编排模型配置失败:', error);
             });
           }
           return;
         case 'saveAuxiliaryConfig':
           if (message.config && typeof message.config === 'object') {
             void saveAuxiliaryConfig(message.config as Record<string, unknown>).catch((error) => {
-              console.error('[web-client-bridge] 保存辅助模型配置失败:', error);
+              logBridgeOperationFailure('保存辅助模型配置', '[web-client-bridge] 保存辅助模型配置失败:', error);
             });
           }
           return;
         case 'testWorkerConnection':
           if (typeof message.worker === 'string' && message.config && typeof message.config === 'object') {
             void testWorkerConnection(message.worker, message.config as Record<string, unknown>).catch((error) => {
-              console.error('[web-client-bridge] 测试 worker 连接失败:', error);
+              logBridgeOperationFailure('测试 worker 连接', '[web-client-bridge] 测试 worker 连接失败:', error);
             });
           }
           return;
         case 'testOrchestratorConnection':
           if (message.config && typeof message.config === 'object') {
             void testOrchestratorConnection(message.config as Record<string, unknown>).catch((error) => {
-              console.error('[web-client-bridge] 测试编排模型连接失败:', error);
+              logBridgeOperationFailure('测试编排模型连接', '[web-client-bridge] 测试编排模型连接失败:', error);
             });
           }
           return;
         case 'testAuxiliaryConnection':
           if (message.config && typeof message.config === 'object') {
             void testAuxiliaryConnection(message.config as Record<string, unknown>).catch((error) => {
-              console.error('[web-client-bridge] 测试辅助模型连接失败:', error);
+              logBridgeOperationFailure('测试辅助模型连接', '[web-client-bridge] 测试辅助模型连接失败:', error);
             });
           }
           return;
         case 'fetchModelList':
           if (message.config && typeof message.config === 'object' && typeof message.target === 'string') {
             void fetchModelList(message.config as Record<string, unknown>, message.target).catch((error) => {
-              console.error('[web-client-bridge] 获取模型列表失败:', error);
+              logBridgeOperationFailure('获取模型列表', '[web-client-bridge] 获取模型列表失败:', error);
             });
           }
           return;
         case 'addMCPServer':
           if (message.server && typeof message.server === 'object') {
             void addMcpServer(message.server as Record<string, unknown>).catch((error) => {
-              console.error('[web-client-bridge] 添加 MCP 服务器失败:', error);
+              logBridgeOperationFailure('添加 MCP 服务器', '[web-client-bridge] 添加 MCP 服务器失败:', error);
             });
           }
           return;
         case 'updateMCPServer':
           if (typeof message.serverId === 'string' && message.updates && typeof message.updates === 'object') {
             void updateMcpServer(message.serverId, message.updates as Record<string, unknown>).catch((error) => {
-              console.error('[web-client-bridge] 更新 MCP 服务器失败:', error);
+              logBridgeOperationFailure('更新 MCP 服务器', '[web-client-bridge] 更新 MCP 服务器失败:', error);
             });
           }
           return;
         case 'deleteMCPServer':
           if (typeof message.serverId === 'string' && message.serverId.trim()) {
             void deleteMcpServer(message.serverId).catch((error) => {
-              console.error('[web-client-bridge] 删除 MCP 服务器失败:', error);
+              logBridgeOperationFailure('删除 MCP 服务器', '[web-client-bridge] 删除 MCP 服务器失败:', error);
             });
           }
           return;
         case 'getMCPServerTools':
           if (typeof message.serverId === 'string' && message.serverId.trim()) {
             void getMcpServerTools(message.serverId).catch((error) => {
-              console.error('[web-client-bridge] 获取 MCP 工具失败:', error);
+              logBridgeOperationFailure('获取 MCP 工具', '[web-client-bridge] 获取 MCP 工具失败:', error);
             });
           }
           return;
         case 'refreshMCPTools':
           if (typeof message.serverId === 'string' && message.serverId.trim()) {
             void refreshMcpTools(message.serverId).catch((error) => {
-              console.error('[web-client-bridge] 刷新 MCP 工具失败:', error);
+              logBridgeOperationFailure('刷新 MCP 工具', '[web-client-bridge] 刷新 MCP 工具失败:', error);
             });
           }
           return;
         case 'addRepository':
           if (typeof message.url === 'string' && message.url.trim()) {
             void addRepository(message.url).catch((error) => {
-              console.error('[web-client-bridge] 添加仓库失败:', error);
+              logBridgeOperationFailure('添加仓库', '[web-client-bridge] 添加仓库失败:', error);
             });
           }
           return;
         case 'updateRepository':
           if (typeof message.repositoryId === 'string' && message.updates && typeof message.updates === 'object') {
             void updateRepository(message.repositoryId, message.updates as Record<string, unknown>).catch((error) => {
-              console.error('[web-client-bridge] 更新仓库失败:', error);
+              logBridgeOperationFailure('更新仓库', '[web-client-bridge] 更新仓库失败:', error);
             });
           }
           return;
         case 'deleteRepository':
           if (typeof message.repositoryId === 'string' && message.repositoryId.trim()) {
             void deleteRepository(message.repositoryId).catch((error) => {
-              console.error('[web-client-bridge] 删除仓库失败:', error);
+              logBridgeOperationFailure('删除仓库', '[web-client-bridge] 删除仓库失败:', error);
             });
           }
           return;
         case 'refreshRepository':
           if (typeof message.repositoryId === 'string' && message.repositoryId.trim()) {
             void refreshRepository(message.repositoryId).catch((error) => {
-              console.error('[web-client-bridge] 刷新仓库失败:', error);
+              logBridgeOperationFailure('刷新仓库', '[web-client-bridge] 刷新仓库失败:', error);
             });
           }
           return;
         case 'loadSkillLibrary':
           void loadSkillLibrary().catch((error) => {
-            console.error('[web-client-bridge] 加载技能库失败:', error);
+            logBridgeOperationFailure('加载技能库', '[web-client-bridge] 加载技能库失败:', error);
           });
           return;
         case 'installSkill':
           if (typeof message.skillId === 'string' && message.skillId.trim()) {
             void installSkill(message.skillId).catch((error) => {
-              console.error('[web-client-bridge] 安装技能失败:', error);
+              logBridgeOperationFailure('安装技能', '[web-client-bridge] 安装技能失败:', error);
             });
           }
           return;
         case 'installLocalSkill':
           void installLocalSkill().catch((error) => {
-            console.error('[web-client-bridge] 安装本地技能失败:', error);
+            logBridgeOperationFailure('安装本地技能', '[web-client-bridge] 安装本地技能失败:', error);
           });
           return;
         case 'removeCustomTool':
           if (typeof message.toolName === 'string' && message.toolName.trim()) {
             void removeCustomTool(message.toolName).catch((error) => {
-              console.error('[web-client-bridge] 删除自定义工具失败:', error);
+              logBridgeOperationFailure('删除自定义工具', '[web-client-bridge] 删除自定义工具失败:', error);
             });
           }
           return;
         case 'removeInstructionSkill':
           if (typeof message.skillName === 'string' && message.skillName.trim()) {
             void removeInstructionSkill(message.skillName).catch((error) => {
-              console.error('[web-client-bridge] 删除指令技能失败:', error);
+              logBridgeOperationFailure('删除指令技能', '[web-client-bridge] 删除指令技能失败:', error);
             });
           }
           return;
         case 'updateSkill':
           if (typeof message.skillName === 'string' && message.skillName.trim()) {
             void updateSkill(message.skillName).catch((error) => {
-              console.error('[web-client-bridge] 更新技能失败:', error);
+              logBridgeOperationFailure('更新技能', '[web-client-bridge] 更新技能失败:', error);
             });
           }
           return;
         case 'updateAllSkills':
           void updateAllSkills().catch((error) => {
-            console.error('[web-client-bridge] 更新全部技能失败:', error);
+            logBridgeOperationFailure('更新全部技能', '[web-client-bridge] 更新全部技能失败:', error);
           });
           return;
         case 'newSession':
           void createSession().catch((error) => {
-            console.error('[web-client-bridge] 新建会话失败:', error);
+            logBridgeOperationFailure('新建会话', '[web-client-bridge] 新建会话失败:', error);
           });
           return;
         case 'saveCurrentSession':
           void saveCurrentSession().catch((error) => {
-            console.error('[web-client-bridge] 保存当前会话失败:', error);
+            logBridgeOperationFailure('保存会话', '[web-client-bridge] 保存当前会话失败:', error);
           });
           return;
         case 'markAllNotificationsRead':
           void markAllNotificationsRead().catch((error) => {
-            console.error('[web-client-bridge] 标记通知已读失败:', error);
+            logBridgeOperationFailure('标记通知已读', '[web-client-bridge] 标记通知已读失败:', error);
           });
           return;
         case 'clearAllNotifications':
           void clearAllNotifications().catch((error) => {
-            console.error('[web-client-bridge] 清空通知失败:', error);
+            logBridgeOperationFailure('清空通知', '[web-client-bridge] 清空通知失败:', error);
           });
           return;
         case 'removeNotification':
           if (typeof message.notificationId === 'string' && message.notificationId.trim()) {
             void removeNotification(message.notificationId).catch((error) => {
-              console.error('[web-client-bridge] 删除通知失败:', error);
+              logBridgeOperationFailure('删除通知', '[web-client-bridge] 删除通知失败:', error);
             });
           }
           return;
@@ -1148,7 +1449,7 @@ export function createWebClientBridge(): ClientBridge {
               message.prompt,
               typeof message.requestId === 'string' ? message.requestId : undefined,
             ).catch((error) => {
-              console.error('[web-client-bridge] 执行任务失败:', error);
+              logBridgeOperationFailure('发送消息', '[web-client-bridge] 执行任务失败:', error);
             });
           }
           return;
@@ -1158,7 +1459,7 @@ export function createWebClientBridge(): ClientBridge {
               typeof message.taskId === 'string' ? message.taskId : '',
               message.content,
             ).catch((error) => {
-              console.error('[web-client-bridge] 追加消息失败:', error);
+              logBridgeOperationFailure('追加消息', '[web-client-bridge] 追加消息失败:', error);
             });
           }
           return;
@@ -1168,71 +1469,67 @@ export function createWebClientBridge(): ClientBridge {
             && typeof message.content === 'string'
           ) {
             void updateQueuedTaskMessage(message.queueId, message.content).catch((error) => {
-              console.error('[web-client-bridge] 更新暂存消息失败:', error);
+              logBridgeOperationFailure('更新暂存消息', '[web-client-bridge] 更新暂存消息失败:', error);
             });
           }
           return;
         case 'deleteQueuedMessage':
           if (typeof message.queueId === 'string' && message.queueId.trim()) {
             void deleteQueuedTaskMessage(message.queueId).catch((error) => {
-              console.error('[web-client-bridge] 删除暂存消息失败:', error);
+              logBridgeOperationFailure('删除暂存消息', '[web-client-bridge] 删除暂存消息失败:', error);
             });
           }
           return;
         case 'interruptTask':
-          void interruptTask().catch((error) => {
-            console.error('[web-client-bridge] 中断任务失败:', error);
-          });
+          void interruptTask('user_stop');
           return;
         case 'continueTask':
           if (typeof message.prompt === 'string' && message.prompt.trim()) {
             void executeTask(message.prompt).catch((error) => {
-              console.error('[web-client-bridge] 继续任务失败:', error);
+              logBridgeOperationFailure('继续任务', '[web-client-bridge] 继续任务失败:', error);
             });
           }
           return;
         case 'pauseTask':
-          void interruptTask().catch((error) => {
-            console.error('[web-client-bridge] 暂停任务失败:', error);
-          });
+          void interruptTask('pause_task');
           return;
         case 'startTask':
           if (typeof message.taskId === 'string' && message.taskId.trim()) {
             void startTask(message.taskId).catch((error) => {
-              console.error('[web-client-bridge] 启动任务失败:', error);
+              logBridgeOperationFailure('启动任务', '[web-client-bridge] 启动任务失败:', error);
             });
           }
           return;
         case 'resumeTask':
           if (typeof message.taskId === 'string' && message.taskId.trim()) {
             void resumeTask(message.taskId).catch((error) => {
-              console.error('[web-client-bridge] 恢复任务失败:', error);
+              logBridgeOperationFailure('恢复任务', '[web-client-bridge] 恢复任务失败:', error);
             });
           }
           return;
         case 'deleteTask':
           if (typeof message.taskId === 'string' && message.taskId.trim()) {
             void deleteTask(message.taskId).catch((error) => {
-              console.error('[web-client-bridge] 删除任务失败:', error);
+              logBridgeOperationFailure('删除任务', '[web-client-bridge] 删除任务失败:', error);
             });
           }
           return;
         case 'abandonChain':
           if (typeof message.chainId === 'string' && message.chainId.trim()) {
             void abandonAgentChain(message.chainId).catch((error) => {
-              console.error('[web-client-bridge] 放弃执行链失败:', error);
+              logBridgeOperationFailure('放弃执行链', '[web-client-bridge] 放弃执行链失败:', error);
             });
           }
           return;
         case 'clearAllTasks':
           void clearAllTasks().catch((error) => {
-            console.error('[web-client-bridge] 清空任务失败:', error);
+            logBridgeOperationFailure('清空任务', '[web-client-bridge] 清空任务失败:', error);
           });
           return;
         case 'switchSession':
           if (typeof message.sessionId === 'string' && message.sessionId.trim()) {
             void switchSession(message.sessionId).catch((error) => {
-              console.error('[web-client-bridge] 切换会话失败:', error);
+              logBridgeOperationFailure('切换会话', '[web-client-bridge] 切换会话失败:', error);
             });
           }
           return;
@@ -1242,53 +1539,53 @@ export function createWebClientBridge(): ClientBridge {
             && typeof message.name === 'string' && message.name.trim()
           ) {
             void renameSession(message.sessionId, message.name).catch((error) => {
-              console.error('[web-client-bridge] 重命名会话失败:', error);
+              logBridgeOperationFailure('重命名会话', '[web-client-bridge] 重命名会话失败:', error);
             });
           }
           return;
         case 'closeSession':
           if (typeof message.sessionId === 'string' && message.sessionId.trim()) {
             void closeSession(message.sessionId).catch((error) => {
-              console.error('[web-client-bridge] 关闭会话失败:', error);
+              logBridgeOperationFailure('关闭会话', '[web-client-bridge] 关闭会话失败:', error);
             });
           }
           return;
         case 'deleteSession':
           if (typeof message.sessionId === 'string' && message.sessionId.trim()) {
             void deleteSession(message.sessionId).catch((error) => {
-              console.error('[web-client-bridge] 删除会话失败:', error);
+              logBridgeOperationFailure('删除会话', '[web-client-bridge] 删除会话失败:', error);
             });
           }
           return;
         case 'updateSetting':
           if (typeof message.key === 'string' && (message.key === 'locale' || message.key === 'deepTask')) {
             void updateSetting(message.key, message.value).catch((error) => {
-              console.error('[web-client-bridge] 更新设置失败:', error);
+              logBridgeOperationFailure('更新设置', '[web-client-bridge] 更新设置失败:', error);
             });
           }
           return;
         case 'setInteractionMode':
           if (typeof message.mode === 'string' && message.mode.trim()) {
             void setInteractionMode(message.mode).catch((error) => {
-              console.error('[web-client-bridge] 更新交互模式失败:', error);
+              logBridgeOperationFailure('更新交互模式', '[web-client-bridge] 更新交互模式失败:', error);
             });
           }
           return;
         case 'requestExecutionStats':
           void dispatchExecutionStats().catch((error) => {
-            console.error('[web-client-bridge] 执行统计加载失败:', error);
+            logBridgeOperationFailure('执行统计加载', '[web-client-bridge] 执行统计加载失败:', error);
           });
           return;
         case 'resetExecutionStats':
           void resetExecutionStats().catch((error) => {
-            console.error('[web-client-bridge] 重置执行统计失败:', error);
+            logBridgeOperationFailure('重置执行统计', '[web-client-bridge] 重置执行统计失败:', error);
           });
           return;
         case 'getLanAccessInfo': {
           void getAgentLanAccessInfo().then((payload) => {
             emitDataMessage('lanAccessInfo', { ...payload });
           }).catch((error) => {
-            console.error('[web-client-bridge] 局域网地址加载失败:', error);
+            logBridgeOperationFailure('局域网地址加载', '[web-client-bridge] 局域网地址加载失败:', error);
           });
           return;
         }
@@ -1296,7 +1593,7 @@ export function createWebClientBridge(): ClientBridge {
           void getAgentTunnelStatus().then((payload) => {
             emitDataMessage('tunnelState', { ...payload });
           }).catch((error) => {
-            console.error('[web-client-bridge] 隧道状态加载失败:', error);
+            logBridgeOperationFailure('隧道状态加载', '[web-client-bridge] 隧道状态加载失败:', error);
           });
           return;
         }
@@ -1304,7 +1601,7 @@ export function createWebClientBridge(): ClientBridge {
           void startAgentTunnel().then((payload) => {
             emitDataMessage('tunnelState', { ...payload });
           }).catch((error) => {
-            console.error('[web-client-bridge] 启动隧道失败:', error);
+            logBridgeOperationFailure('启动隧道', '[web-client-bridge] 启动隧道失败:', error);
           });
           return;
         }
@@ -1312,161 +1609,173 @@ export function createWebClientBridge(): ClientBridge {
           void stopAgentTunnel().then((payload) => {
             emitDataMessage('tunnelState', { ...payload });
           }).catch((error) => {
-            console.error('[web-client-bridge] 停止隧道失败:', error);
+            logBridgeOperationFailure('停止隧道', '[web-client-bridge] 停止隧道失败:', error);
           });
           return;
         }
         case 'openLink':
+          if (forwardToVsCodeHost(message)) {
+            return;
+          }
           if (typeof message.url === 'string' && message.url.trim()) {
             window.open(message.url, '_blank', 'noopener,noreferrer');
           }
           return;
         case 'openMermaidPanel':
+          if (forwardToVsCodeHost(message)) {
+            return;
+          }
           if (typeof message.code === 'string' && message.code.trim()) {
             openMermaidPreview(message.code, typeof message.title === 'string' ? message.title : undefined);
           }
           return;
         case 'openFile':
+          if (forwardToVsCodeHost(message)) {
+            return;
+          }
           {
             const filePath = typeof message.filepath === 'string' && message.filepath.trim()
               ? message.filepath
               : (typeof message.filePath === 'string' ? message.filePath : '');
             if (filePath.trim()) {
               void openFilePreview(filePath).catch((error) => {
-                console.error('[web-client-bridge] 打开文件预览失败:', error);
+                logBridgeOperationFailure('打开文件预览', '[web-client-bridge] 打开文件预览失败:', error);
               });
             }
           }
           return;
         case 'viewDiff':
+          if (forwardToVsCodeHost(message)) {
+            return;
+          }
           if (typeof message.filePath === 'string' && message.filePath.trim()) {
             void openDiffPreview(message.filePath).catch((error) => {
-              console.error('[web-client-bridge] 打开差异预览失败:', error);
+              logBridgeOperationFailure('打开差异预览', '[web-client-bridge] 打开差异预览失败:', error);
             });
           }
           return;
         case 'approveChange':
           if (typeof message.filePath === 'string' && message.filePath.trim()) {
             void approveAgentChange(message.filePath).then(() => fetchBootstrap()).catch((error) => {
-              console.error('[web-client-bridge] 批准变更失败:', error);
+              logBridgeOperationFailure('批准变更', '[web-client-bridge] 批准变更失败:', error);
             });
           }
           return;
         case 'revertChange':
           if (typeof message.filePath === 'string' && message.filePath.trim()) {
             void revertAgentChange(message.filePath).then(() => fetchBootstrap()).catch((error) => {
-              console.error('[web-client-bridge] 还原变更失败:', error);
+              logBridgeOperationFailure('还原变更', '[web-client-bridge] 还原变更失败:', error);
             });
           }
           return;
         case 'approveAllChanges':
           void approveAllAgentChanges().then(() => fetchBootstrap()).catch((error) => {
-            console.error('[web-client-bridge] 批准全部变更失败:', error);
+            logBridgeOperationFailure('批准全部变更', '[web-client-bridge] 批准全部变更失败:', error);
           });
           return;
         case 'revertAllChanges':
           void revertAllAgentChanges().then(() => fetchBootstrap()).catch((error) => {
-            console.error('[web-client-bridge] 还原全部变更失败:', error);
+            logBridgeOperationFailure('还原全部变更', '[web-client-bridge] 还原全部变更失败:', error);
           });
           return;
         case 'revertMission':
           if (typeof message.missionId === 'string' && message.missionId.trim()) {
             void revertAgentMissionChanges(message.missionId).then(() => fetchBootstrap()).catch((error) => {
-              console.error('[web-client-bridge] 还原轮次变更失败:', error);
+              logBridgeOperationFailure('还原轮次变更', '[web-client-bridge] 还原轮次变更失败:', error);
             });
           }
           return;
         case 'getProjectKnowledge':
           void dispatchProjectKnowledge().catch((error) => {
-            console.error('[web-client-bridge] 项目知识加载失败:', error);
+            logBridgeOperationFailure('项目知识加载', '[web-client-bridge] 项目知识加载失败:', error);
           });
           return;
         case 'addADR':
           if (message.adr && typeof message.adr === 'object') {
             void addAgentAdr(message.adr as Record<string, unknown>).then(() => emitKnowledgePayload()).catch((error) => {
-              console.error('[web-client-bridge] 添加 ADR 失败:', error);
+              logBridgeOperationFailure('添加 ADR ', '[web-client-bridge] 添加 ADR 失败:', error);
             });
           }
           return;
         case 'updateADR':
           if (typeof message.id === 'string' && message.updates && typeof message.updates === 'object') {
             void updateAgentAdr(message.id, message.updates as Record<string, unknown>).then(() => emitKnowledgePayload()).catch((error) => {
-              console.error('[web-client-bridge] 更新 ADR 失败:', error);
+              logBridgeOperationFailure('更新 ADR ', '[web-client-bridge] 更新 ADR 失败:', error);
             });
           }
           return;
         case 'addFAQ':
           if (message.faq && typeof message.faq === 'object') {
             void addAgentFaq(message.faq as Record<string, unknown>).then(() => emitKnowledgePayload()).catch((error) => {
-              console.error('[web-client-bridge] 添加 FAQ 失败:', error);
+              logBridgeOperationFailure('添加 FAQ ', '[web-client-bridge] 添加 FAQ 失败:', error);
             });
           }
           return;
         case 'updateFAQ':
           if (typeof message.id === 'string' && message.updates && typeof message.updates === 'object') {
             void updateAgentFaq(message.id, message.updates as Record<string, unknown>).then(() => emitKnowledgePayload()).catch((error) => {
-              console.error('[web-client-bridge] 更新 FAQ 失败:', error);
+              logBridgeOperationFailure('更新 FAQ ', '[web-client-bridge] 更新 FAQ 失败:', error);
             });
           }
           return;
         case 'clearProjectKnowledge':
           void clearProjectKnowledge().catch((error) => {
-            console.error('[web-client-bridge] 清空项目知识失败:', error);
+            logBridgeOperationFailure('清空项目知识', '[web-client-bridge] 清空项目知识失败:', error);
           });
           return;
         case 'deleteADR':
           if (typeof message.id === 'string' && message.id.trim()) {
             void deleteAdr(message.id).catch((error) => {
-              console.error('[web-client-bridge] 删除 ADR 失败:', error);
+              logBridgeOperationFailure('删除 ADR ', '[web-client-bridge] 删除 ADR 失败:', error);
             });
           }
           return;
         case 'deleteFAQ':
           if (typeof message.id === 'string' && message.id.trim()) {
             void deleteFaq(message.id).catch((error) => {
-              console.error('[web-client-bridge] 删除 FAQ 失败:', error);
+              logBridgeOperationFailure('删除 FAQ ', '[web-client-bridge] 删除 FAQ 失败:', error);
             });
           }
           return;
         case 'deleteLearning':
           if (typeof message.id === 'string' && message.id.trim()) {
             void deleteLearning(message.id).catch((error) => {
-              console.error('[web-client-bridge] 删除经验失败:', error);
+              logBridgeOperationFailure('删除经验', '[web-client-bridge] 删除经验失败:', error);
             });
           }
           return;
         case 'connectMCPServer':
           if (typeof message.serverId === 'string' && message.serverId.trim()) {
             void connectMcpServer(message.serverId).catch((error) => {
-              console.error('[web-client-bridge] 连接 MCP 服务器失败:', error);
+              logBridgeOperationFailure('连接 MCP 服务器', '[web-client-bridge] 连接 MCP 服务器失败:', error);
             });
           }
           return;
         case 'disconnectMCPServer':
           if (typeof message.serverId === 'string' && message.serverId.trim()) {
             void disconnectMcpServer(message.serverId).catch((error) => {
-              console.error('[web-client-bridge] 断开 MCP 服务器失败:', error);
+              logBridgeOperationFailure('断开 MCP 服务器', '[web-client-bridge] 断开 MCP 服务器失败:', error);
             });
           }
           return;
         case 'saveSkillsConfig':
           if (message.config && typeof message.config === 'object') {
             void saveSkillsConfig(message.config as Record<string, unknown>).catch((error) => {
-              console.error('[web-client-bridge] 保存技能配置失败:', error);
+              logBridgeOperationFailure('保存技能配置', '[web-client-bridge] 保存技能配置失败:', error);
             });
           }
           return;
         case 'addCustomTool':
           if (message.tool && typeof message.tool === 'object') {
             void addCustomTool(message.tool as Record<string, unknown>).catch((error) => {
-              console.error('[web-client-bridge] 添加自定义工具失败:', error);
+              logBridgeOperationFailure('添加自定义工具', '[web-client-bridge] 添加自定义工具失败:', error);
             });
           }
           return;
         case 'enhancePrompt':
           if (typeof message.prompt === 'string' && message.prompt.trim()) {
             void enhancePrompt(message.prompt).catch((error) => {
-              console.error('[web-client-bridge] 增强提示词失败:', error);
+              logBridgeOperationFailure('增强提示词', '[web-client-bridge] 增强提示词失败:', error);
             });
           }
           return;
@@ -1494,7 +1803,7 @@ export function createWebClientBridge(): ClientBridge {
             || message.decision === 'continue'
           ) {
             void confirmRecovery(message.decision).catch((error) => {
-              console.error('[web-client-bridge] 恢复确认失败:', error);
+              logBridgeOperationFailure('恢复确认', '[web-client-bridge] 恢复确认失败:', error);
             });
           }
           return;
@@ -1505,27 +1814,27 @@ export function createWebClientBridge(): ClientBridge {
               : null,
             typeof message.additionalInfo === 'string' ? message.additionalInfo : null,
           ).catch((error) => {
-            console.error('[web-client-bridge] 澄清回答提交失败:', error);
+            logBridgeOperationFailure('澄清回答提交', '[web-client-bridge] 澄清回答提交失败:', error);
           });
           return;
         case 'answerWorkerQuestion':
           void submitWorkerQuestionAnswer(
             typeof message.answer === 'string' ? message.answer : null,
           ).catch((error) => {
-            console.error('[web-client-bridge] Worker 问答提交失败:', error);
+            logBridgeOperationFailure('Worker 问答提交', '[web-client-bridge] Worker 问答提交失败:', error);
           });
           return;
         case 'toolAuthorizationResponse':
           if (typeof message.requestId === 'string' && message.requestId.trim()) {
             void respondToolAuthorization(message.requestId, Boolean(message.allowed)).catch((error) => {
-              console.error('[web-client-bridge] 工具授权响应失败:', error);
+              logBridgeOperationFailure('工具授权响应', '[web-client-bridge] 工具授权响应失败:', error);
             });
           }
           return;
         case 'interactionResponse':
           if (typeof message.requestId === 'string' && message.requestId.trim()) {
             void respondInteraction(message.requestId, message.response).catch((error) => {
-              console.error('[web-client-bridge] 交互响应失败:', error);
+              logBridgeOperationFailure('交互响应', '[web-client-bridge] 交互响应失败:', error);
             });
           }
           return;
@@ -1538,18 +1847,34 @@ export function createWebClientBridge(): ClientBridge {
       return () => listeners.delete(listener);
     },
     getState<T>(): T | undefined {
-      const stored = localStorage.getItem('webview-state');
-      return stored ? JSON.parse(stored) as T : undefined;
+      if (cachedWebviewState !== null) {
+        return cachedWebviewState as T;
+      }
+      const stored = safeLocalStorageGetItem(WEBVIEW_STATE_STORAGE_KEY);
+      if (!stored) {
+        return undefined;
+      }
+      try {
+        const parsed = JSON.parse(stored) as T;
+        cachedWebviewState = parsed;
+        return parsed;
+      } catch (error) {
+        warnStorageFailure('解析', WEBVIEW_STATE_STORAGE_KEY, error);
+        safeLocalStorageRemoveItem(WEBVIEW_STATE_STORAGE_KEY);
+        return undefined;
+      }
     },
     setState<T>(state: T): void {
-      localStorage.setItem('webview-state', JSON.stringify(state));
+      cachedWebviewState = state;
+      pendingWebviewState = state;
+      schedulePersistedWebviewState();
     },
     getInitialSessionId(): string {
       return resolveWorkspaceQuery().sessionId;
     },
     getInitialLocale(): SupportedLocale {
       if (typeof window !== 'undefined') {
-        const storedLocale = localStorage.getItem('magi-locale');
+        const storedLocale = safeLocalStorageGetItem('magi-locale');
         if (storedLocale === 'zh-CN' || storedLocale === 'en-US') {
           return storedLocale;
         }
@@ -1562,7 +1887,7 @@ export function createWebClientBridge(): ClientBridge {
     },
     notifyReady(): void {
       void restoreBridgeState('notify_ready').catch((error) => {
-        console.error('[web-client-bridge] Web 入口初始化失败:', error);
+        logBridgeOperationFailure('入口初始化', '[web-client-bridge] Web 入口初始化失败:', error);
         scheduleRecovery('notify_ready', error);
       });
     },

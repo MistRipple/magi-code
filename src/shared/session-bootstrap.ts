@@ -1,4 +1,5 @@
 import type { StandardMessage } from '../protocol/message-protocol';
+import { canBindRequestPlaceholder } from './request-placeholder-binding';
 import {
   buildSessionTimelineProjection,
   type SessionTimelineProjection,
@@ -54,6 +55,55 @@ function resolveMessageSessionId(message: Pick<StandardMessage, 'metadata'>): st
   return typeof metadata?.sessionId === 'string' ? metadata.sessionId.trim() : '';
 }
 
+function resolveRequestId(
+  message: Pick<SessionTimelineProjectionMessage, 'metadata'>,
+): string {
+  const metadata = message.metadata && typeof message.metadata === 'object' && !Array.isArray(message.metadata)
+    ? message.metadata as Record<string, unknown>
+    : undefined;
+  return typeof metadata?.requestId === 'string' ? metadata.requestId.trim() : '';
+}
+
+function isPlaceholderMessage(
+  message: Pick<SessionTimelineProjectionMessage, 'metadata'>,
+): boolean {
+  const metadata = message.metadata && typeof message.metadata === 'object' && !Array.isArray(message.metadata)
+    ? message.metadata as Record<string, unknown>
+    : undefined;
+  return metadata?.isPlaceholder === true;
+}
+
+function collapseResolvedRequestPlaceholders(
+  messages: SessionTimelineProjectionMessage[],
+): SessionTimelineProjectionMessage[] {
+  const resolvedRequestIds = new Set<string>();
+  for (const message of messages) {
+    const requestId = resolveRequestId(message);
+    if (!requestId) {
+      continue;
+    }
+    if (canBindRequestPlaceholder({
+      type: message.type,
+      source: message.source,
+      metadata: message.metadata,
+    })) {
+      resolvedRequestIds.add(requestId);
+    }
+  }
+
+  if (resolvedRequestIds.size === 0) {
+    return messages;
+  }
+
+  return messages.filter((message) => {
+    const requestId = resolveRequestId(message);
+    if (!requestId || !resolvedRequestIds.has(requestId)) {
+      return true;
+    }
+    return !isPlaceholderMessage(message);
+  });
+}
+
 export function buildSessionBootstrapTimelineProjection(input: {
   session: SessionBootstrapSourceSession;
   liveMessages?: readonly StandardMessage[];
@@ -93,6 +143,6 @@ export function buildSessionBootstrapTimelineProjection(input: {
   return buildSessionTimelineProjection({
     id: input.session.id,
     updatedAt,
-    messages: Array.from(mergedMessages.values()),
+    messages: collapseResolvedRequestPlaceholders(Array.from(mergedMessages.values())),
   });
 }

@@ -239,7 +239,9 @@
         {/each}
       </div>
     {/if}
-    <div class="user-content">{message.content}</div>
+    <div class="user-content">
+      <MarkdownContent content={message.content || ''} isStreaming={false} />
+    </div>
     <div class="user-time">
       {#if isSupplementary}<span class="supplementary-tag">{i18n.t('messageItem.supplementaryTag')}</span>{/if}
       {formatTime(message.timestamp)}
@@ -406,6 +408,24 @@
     font-size: var(--text-base);
     line-height: var(--leading-relaxed);
     word-wrap: break-word;
+  }
+  .user-content :global(.markdown-content) {
+    color: inherit;
+  }
+  .user-content :global(a.md-link) {
+    color: rgba(255, 255, 255, 0.92);
+    text-decoration: underline;
+  }
+  .user-content :global(blockquote) {
+    border-left-color: rgba(255, 255, 255, 0.45);
+    background: rgba(255, 255, 255, 0.12);
+  }
+  .user-content :global(:not(pre) > code) {
+    background: rgba(255, 255, 255, 0.2);
+  }
+  .user-content :global(th),
+  .user-content :global(td) {
+    border-color: rgba(255, 255, 255, 0.35);
   }
   .user-time {
     font-size: var(--text-xs);

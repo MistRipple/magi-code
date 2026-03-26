@@ -4,14 +4,14 @@ import { CATEGORY_DEFINITIONS } from './builtin/category-definitions';
 
 export interface DispatchOwnershipAdvisory {
   degraded: boolean;
-  resolvedCategory?: string;
+  resolvedOwnership?: string;
   routingReasonPatch?: string;
   warningDetail?: string;
   rejectionError?: string;
 }
 
 export interface DispatchOwnershipAdvisoryInput {
-  category: string;
+  ownership: string;
   taskTitle: string;
   goal: string;
   acceptance: string[];
@@ -22,7 +22,7 @@ export interface DispatchOwnershipAdvisoryInput {
 }
 
 export interface ResolvedDispatchPhaseAdvisoryInput {
-  category: string;
+  ownership: string;
   taskTitle: string;
   goal: string;
   acceptance: string[];
@@ -35,7 +35,7 @@ export interface ResolvedDispatchPhaseAdvisoryInput {
 }
 
 export interface SplitTodoOwnershipInput {
-  assignmentCategory: string;
+  assignmentOwnership: string;
   subtasks: Array<{
     content: string;
     reasoning: string;
@@ -81,7 +81,7 @@ export class OwnershipGuard {
       : { matchedDomains: [], splitBoundaryDomains: [] };
 
     const explicitCategoryAdvisory = this.evaluateExplicitCategoryConsistency(
-      input.category,
+      input.ownership,
       taskTextParts,
       taskDetection,
       promptDetection,
@@ -92,13 +92,13 @@ export class OwnershipGuard {
       return explicitCategoryAdvisory;
     }
 
-    const explicitOwnershipCategory = OWNERSHIP_CATEGORY_SET.has(input.category as OwnershipDomain)
-      ? input.category as OwnershipDomain
+    const explicitOwnershipCategory = OWNERSHIP_CATEGORY_SET.has(input.ownership as OwnershipDomain)
+      ? input.ownership as OwnershipDomain
       : null;
     if (explicitOwnershipCategory) {
       return {
         degraded: explicitCategoryAdvisory?.degraded === true,
-        resolvedCategory: explicitOwnershipCategory,
+        resolvedOwnership: explicitOwnershipCategory,
         ...(explicitCategoryAdvisory?.routingReasonPatch
           ? { routingReasonPatch: explicitCategoryAdvisory.routingReasonPatch }
           : {}),
@@ -109,7 +109,7 @@ export class OwnershipGuard {
     }
 
     const inferredOwnershipAdvisory = this.evaluateInferredOwnershipCategory({
-      category: input.category,
+      category: input.ownership,
       taskDetection,
       promptDetection,
     });
@@ -119,7 +119,7 @@ export class OwnershipGuard {
 
     return {
       degraded: explicitCategoryAdvisory?.degraded === true,
-      resolvedCategory: input.category,
+      resolvedOwnership: input.ownership,
       ...(explicitCategoryAdvisory?.routingReasonPatch
         ? { routingReasonPatch: explicitCategoryAdvisory.routingReasonPatch }
         : {}),
@@ -132,7 +132,7 @@ export class OwnershipGuard {
   evaluateResolvedDispatchPhaseAdvisory(
     input: ResolvedDispatchPhaseAdvisoryInput,
   ): DispatchOwnershipAdvisory | undefined {
-    if (input.category !== 'integration') {
+    if (input.ownership !== 'integration') {
       return undefined;
     }
 
@@ -342,7 +342,7 @@ export class OwnershipGuard {
   ): DispatchOwnershipAdvisory {
     return {
       degraded: true,
-      resolvedCategory: toCategory,
+      resolvedOwnership: toCategory,
       routingReasonPatch: t('dispatch.notify.ownershipInferredSingleDomainAutoAdjustReason', {
         fromCategory,
         toCategory,
@@ -446,12 +446,12 @@ export class OwnershipGuard {
   }
 
   evaluateSplitTodoOwnership(input: SplitTodoOwnershipInput): string | undefined {
-    if (!TODO_SPLIT_STRICT_OWNERSHIP_CATEGORIES.has(input.assignmentCategory as 'frontend' | 'backend')) {
+    if (!TODO_SPLIT_STRICT_OWNERSHIP_CATEGORIES.has(input.assignmentOwnership as 'frontend' | 'backend')) {
       return undefined;
     }
 
-    const assignmentCategory = input.assignmentCategory as 'frontend' | 'backend';
-    const conflictingDomain = assignmentCategory === 'frontend' ? 'backend' : 'frontend';
+    const assignmentOwnership = input.assignmentOwnership as 'frontend' | 'backend';
+    const conflictingDomain = assignmentOwnership === 'frontend' ? 'backend' : 'frontend';
     const violatingIndexes: number[] = [];
 
     input.subtasks.forEach((subtask, index) => {
@@ -473,7 +473,7 @@ export class OwnershipGuard {
     }
 
     return t('dispatch.errors.splitTodoOwnershipViolation', {
-      assignmentCategory,
+      assignmentCategory: assignmentOwnership,
       conflictingDomain,
       subtaskIndexes: violatingIndexes.join(', '),
     });

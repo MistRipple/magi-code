@@ -1,6 +1,9 @@
 /**
  * Category resolver (single algorithm)
  *
+ * @deprecated 将在 Phase 5 移除。ownership 推断已迁移到 AssignmentCompiler + DomainDetector。
+ * 现有调用点（assignment-manager, policy-engine）应在过渡期后改用 AssignmentCompiler.compile()。
+ *
  * 设计：
  * - 启动时预编译所有关键词正则，编译失败则立即报错（不做运行时回退）
  * - resolveFromText 是唯一的公开 API

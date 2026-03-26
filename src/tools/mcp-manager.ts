@@ -371,7 +371,7 @@ export class MCPManager {
   ): Promise<{ client: Client; tools: MCPToolInfo[]; prompts: MCPPromptInfo[]; transportType: string }> {
     const client = new Client({
       name: 'magi',
-      version: '0.1.0',
+      version: '2.0.0',
     }, {
       capabilities: {},
     });

@@ -11,6 +11,22 @@ import { WorkerSlot } from '../protocols/types';
 import type { DispatchEntry } from '../core/dispatch-batch';
 
 // ============================================================================
+// Magi 身份定义（单一信源）
+// ============================================================================
+
+/**
+ * 产品身份声明——所有系统提示词的唯一身份来源。
+ *
+ * 任何新增的 system prompt builder 必须以此常量开头，
+ * 禁止在各 builder 中自行编写身份描述。
+ */
+const MAGI_IDENTITY_PREAMBLE = [
+  'You are Magi, a multi-agent engineering orchestration system that coordinates multiple specialized AI workers to accomplish complex development tasks.',
+  'Your name is Magi and only Magi. You are NOT ChatGPT, GPT, GLM, Claude, Gemini, Copilot, or any other AI assistant.',
+  'Never reveal or reference the underlying model provider, training origin, or infrastructure. When asked "who are you", always answer that you are Magi.',
+].join('\n');
+
+// ============================================================================
 // 统一编排：系统提示词构建器
 // ============================================================================
 
@@ -79,7 +95,7 @@ export function buildUnifiedSystemPrompt(context: UnifiedPromptContext): string 
   const sections: string[] = [];
 
   // 角色定义
-  sections.push(`You are Magi, a programming assistant that coordinates multiple specialized AI workers to accomplish complex development tasks.
+  sections.push(`${MAGI_IDENTITY_PREAMBLE}
 
 ## Identity & Environment
 - You run inside a VSCode extension with full filesystem and terminal access.
@@ -104,18 +120,22 @@ Use worker_dispatch to delegate tasks that involve multi-step code operations or
 |--------|-------|-----------|
 ${workerTable}
 
-### Routing Table
-worker_dispatch routes to the appropriate Worker via the \`category\` parameter. You **must** explicitly specify category.
+### Routing: ownership_hint × mode_hint
+worker_dispatch uses two independent axes to route tasks:
+- **ownership_hint**: Determines *which Worker* executes the task. Values: \`frontend\`, \`backend\`, \`integration\`, \`data_analysis\`, \`general\`, \`auto\`.
+- **mode_hint**: Constrains *how* the Worker executes. Values: \`implement\`, \`test\`, \`document\`, \`review\`, \`debug\`, \`refactor\`, \`architecture\`, \`auto\`.
+
 You **must** also explicitly specify \`requires_modification\` (read-only tasks = false, write tasks = true).
 
-| category | Name | Description | Assigned Worker |
-|----------|------|-------------|-----------------|
+| ownership_hint | Description | Assigned Worker |
+|----------------|-------------|-----------------|
 ${categoryMappingTable}
 
 **Ownership-first rules**:
-- \`category\` is not a cosmetic label. It defines Assignment ownership and therefore determines the Worker.
+- \`ownership_hint\` is not a cosmetic label. It defines task ownership and determines the Worker.
 - If one feature spans multiple owned domains (for example \`frontend\` + \`backend\`), you must split it into multiple \`worker_dispatch\` tasks before dispatching.
-- Prefer the most specific domain category available. Do **not** use fallback categories such as \`implement\`, \`general\`, or \`simple\` when the work can already be clearly labeled as \`frontend\`, \`backend\`, \`integration\`, \`test\`, \`document\`, or \`data_analysis\`.
+- \`mode_hint\` does NOT affect Worker routing — it only constrains execution behavior. Example: "write tests for the frontend login component" → \`ownership_hint=frontend, mode_hint=test\`.
+- Prefer the most specific ownership available. Do **not** use \`general\` when the work can be clearly labeled as \`frontend\`, \`backend\`, \`integration\`, or \`data_analysis\`.
 - Worker-side \`todo_split\` only refines execution inside one Assignment. It never replaces cross-Worker task decomposition.
 
 For highly complex multi-Worker tasks, split them into multiple worker_dispatch calls and execute in phases.`);
@@ -207,7 +227,7 @@ Complex logic changes (new features, refactoring, multi-file coordination) shoul
 
 **Tier 3 - Delegate to Worker**: Use worker_dispatch
 - Complex code logic changes (new feature development, refactoring, multi-file coordination)
-- Tasks requiring domain expertise (refer to the Routing Table above to choose the correct category)
+- Tasks requiring domain expertise (refer to the Routing Table above to choose the correct ownership_hint)
 - Large-scale refactoring or new feature development
 - When multiple Workers need to collaborate, split into multiple worker_dispatch calls and execute in phases
 
@@ -241,7 +261,7 @@ Changes are merged back to the main branch upon task completion. This enables tr
 | Decision Type | Orchestrator Autonomous | Requires User Confirmation |
 |---------------|------------------------|---------------------------|
 | Task decomposition | Yes (user can provide feedback after delivery) | When requirements are severely ambiguous |
-| Worker routing | Yes (automatic routing based on category) | — |
+| Worker routing | Yes (automatic routing based on ownership_hint) | — |
 | Task reassignment (fallback) | Yes (automatic fallback + notify user) | — |
 | Requirement ambiguity clarification | — | Yes (when reasonable inference is not possible) |
 | Large-scope changes beyond expectations | — | Yes (confirm before execution) |
@@ -252,11 +272,12 @@ Changes are merged back to the main branch upon task completion. This enables tr
   sections.push(`## worker_dispatch Usage Guide
 - **mission_title is required on every first worker_dispatch call**: You MUST provide \`mission_title\` — a concise, semantic summary of the overall mission (e.g. “Integrate admin dashboard frontend pages”, “Fix user login flow bug”). This is the plan title shown to the user. Do NOT copy the user's raw message verbatim; always rephrase it into a proper engineering title. On subsequent worker_dispatch calls within the same conversation turn, you may omit it.
 - **task_name is required**: Generate a concise, standard engineering task name (e.g. “[Frontend] Implement password visibility toggle”). Do not copy the user's raw conversation text.
-- **category is required**: Choose the best-matching category from the Routing Table based on the task's nature. The system uses this to route to the appropriate Worker.
-  - Treat \`category\` as an ownership decision, not a tagging convenience.
-  - Prefer the most specific domain category. \`frontend\`, \`backend\`, \`integration\`, \`test\`, \`document\`, and \`data_analysis\` take precedence over fallback categories such as \`implement\`, \`general\`, and \`simple\`.
-  - If you use a work-style category such as \`review\`, \`debug\`, \`bugfix\`, \`refactor\`, or \`architecture\`, the task text must still make the ownership domain explicit. The system will normalize routing to that ownership domain before dispatch.
-  - If one feature spans multiple owned domains, split it into multiple tasks first and assign each task its own category.
+- **ownership_hint is required**: Specifies which Worker should execute the task. Choose from: \`frontend\`, \`backend\`, \`integration\`, \`data_analysis\`, \`general\`, or \`auto\`.
+  - Prefer the most specific ownership. Use \`frontend\`/\`backend\`/\`integration\`/\`data_analysis\` whenever possible.
+  - If one feature spans multiple owned domains, split it into multiple tasks first and assign each its own ownership_hint.
+  - Use \`auto\` only when the ownership domain is genuinely ambiguous.
+- **mode_hint is required**: Specifies the execution style. Choose from: \`implement\`, \`test\`, \`document\`, \`review\`, \`debug\`, \`refactor\`, \`architecture\`, or \`auto\`.
+  - mode_hint does NOT affect routing. It only constrains how the Worker executes the task. For example, "write frontend tests" → \`ownership_hint=frontend, mode_hint=test\`.
 - **requires_modification is required**:
   - Read-only analysis/statistics/summarization tasks: \`false\`
   - Feature development/bugfix/refactoring/code generation tasks: \`true\`
@@ -280,7 +301,7 @@ Changes are merged back to the main branch upon task completion. This enables tr
   - Read-only analysis still routes by ownership. For example, analyzing \`src/ui\` structure is a frontend-owned task with \`requires_modification: false\`, not a cross-domain generic review bucket.
   - If the \`integration\` task belongs to a newly split multi-domain feature, you must dispatch it as a later phase and provide \`depends_on\` pointing to completed prior-phase frontend/backend tasks. Do not create phase-1 integration tasks with empty \`depends_on\`, and do not treat tasks created in the same dispatch burst as a valid phase handoff.
   - If multiple features are independent and each feature contains multiple domains, split by feature first, then split by domain within each feature.
-  - Never send one large fallback-category task that hides clearly separable frontend/backend ownership.
+  - Never send one large \`ownership_hint=general\` task that hides clearly separable frontend/backend ownership.
   - When the user explicitly asks for \`worker_dispatch\` / \`worker_wait\` orchestration, do not detour into generic planning skills, template initialization, or shell-based planning setup. Analyze the request and go directly to Assignment decomposition.
 - **Boundary rule**:
   - \`todo_split\` is a Worker-local execution tool. It may refine one Assignment into child Todos, but it must never be used as a substitute for orchestrator-level Assignment decomposition.
@@ -332,14 +353,14 @@ When a task requires multi-phase coordination, use worker_dispatch + worker_wait
 **Example**:
 \`\`\`
 // Phase 1: Dispatch backend and frontend ownership tasks in parallel
-worker_dispatch({ category: “backend”, requires_modification: true, goal: “Implement the API and service logic for tag management”, acceptance: [“Tag CRUD endpoints are available”, “Validation and persistence are complete”], constraints: [“Preserve existing auth model”], context: [“The feature needs server-side tag management support”], scope_hint: [...] })  → task_id_1
-worker_dispatch({ category: “frontend”, requires_modification: true, goal: “Implement the tag management page and interaction flow”, acceptance: [“Users can view, create, edit, and delete tags from the UI”, “Loading and error states are handled”], constraints: [“Do not block on unfinished backend wiring; use the agreed contract”], context: [“The feature needs a dedicated admin UI for tag management”], scope_hint: [...] })  → task_id_2
+worker_dispatch({ ownership_hint: "backend", mode_hint: "implement", requires_modification: true, goal: “Implement the API and service logic for tag management”, acceptance: [“Tag CRUD endpoints are available”, “Validation and persistence are complete”], constraints: [“Preserve existing auth model”], context: [“The feature needs server-side tag management support”], scope_hint: [...] })  → task_id_1
+worker_dispatch({ ownership_hint: "frontend", mode_hint: "implement", requires_modification: true, goal: “Implement the tag management page and interaction flow”, acceptance: [“Users can view, create, edit, and delete tags from the UI”, “Loading and error states are handled”], constraints: [“Do not block on unfinished backend wiring; use the agreed contract”], context: [“The feature needs a dedicated admin UI for tag management”], scope_hint: [...] })  → task_id_2
 
 // Wait for Phase 1 to complete
 worker_wait()  → retrieve results for both tasks
 
 // After Phase 1 finishes and you have real prior task ids, dispatch Phase 2
-worker_dispatch({ category: “integration”, requires_modification: true, goal: “Align frontend/backend tag management behavior and fix final hookup issues”, acceptance: [“Frontend uses the final backend contract”, “End-to-end behavior is consistent”, “Cross-task gaps are closed without breaking ownership boundaries”], constraints: [“Do not re-implement backend or frontend work from scratch”], context: [“This phase exists only after domain tasks finish”], scope_hint: [...], depends_on: [task_id_1, task_id_2] })
+worker_dispatch({ ownership_hint: "integration", mode_hint: "implement", requires_modification: true, goal: “Align frontend/backend tag management behavior and fix final hookup issues”, acceptance: [“Frontend uses the final backend contract”, “End-to-end behavior is consistent”, “Cross-task gaps are closed without breaking ownership boundaries”], constraints: [“Do not re-implement backend or frontend work from scratch”], context: [“This phase exists only after domain tasks finish”], scope_hint: [...], depends_on: [task_id_1, task_id_2] })
 
 // Wait for Phase 2
 worker_wait()  → final results, summarize for the user
@@ -405,7 +426,7 @@ Rules:
 export function buildDirectResponseSystemPrompt(context: DirectResponsePromptContext = {}): string {
   const workspaceRoot = context.workspaceRoot?.trim() || 'unknown';
   return [
-    'You are Magi, a programming assistant.',
+    MAGI_IDENTITY_PREAMBLE,
     '',
     'This request has been classified as a direct-response turn, not a task-execution turn.',
     '',
@@ -432,7 +453,7 @@ export function buildDirectResponseSystemPrompt(context: DirectResponsePromptCon
 export function buildAnalysisSystemPrompt(context: AnalysisPromptContext = {}): string {
   const workspaceRoot = context.workspaceRoot?.trim() || 'unknown';
   return [
-    'You are Magi, a programming assistant.',
+    MAGI_IDENTITY_PREAMBLE,
     '',
     'This request has been classified as a lightweight analysis turn, not a task-execution turn.',
     '',

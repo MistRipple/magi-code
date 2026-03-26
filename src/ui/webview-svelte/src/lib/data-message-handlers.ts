@@ -3,7 +3,7 @@
  * Extracted mechanically from message-handler.ts.
  */
 
-import { flushPendingStreamUpdates } from './message-handler';
+import type { ClientBridgeMessage } from '../../../shared/bridges/client-bridge';
 import { postBridgeMessage } from '../../../shared/bridges/bridge-runtime';
 import {
   getState,
@@ -20,6 +20,7 @@ import {
   clearPendingInteractions,
   clearAllMessages,
   setTimelineProjection,
+  restoreTimelineProjectionIfNewer,
   addToast,
   clearPendingRequest,
   setProcessingActor,
@@ -567,6 +568,8 @@ export function handleUnifiedData(standard: StandardMessage) {
         setIsProcessing(true);
       } else if (isProcessing === false && transitionKind === 'forced') {
         clearProcessingState();
+        // forced idle 代表“全局终态已确认”，需要同步封口残留流式内容，避免 UI 仍显示执行中动画。
+        sealAllStreamingMessages();
       }
       const source = payload.source as string | undefined;
       const agent = payload.agent as string | undefined;
@@ -804,8 +807,6 @@ function applyTimelineProjectionSnapshot(
   }
   setTimelineProjection(timelineProjection);
   rebuildWorkerWaitResultsFromMessages(getState().threadMessages, getState().agentOutputs);
-  // Projection 已创建/更新时间线节点，回放之前因节点不存在而缓冲的增量 stream updates
-  flushPendingStreamUpdates();
 }
 
 function handleTimelineProjectionUpdated(message: ClientBridgeMessage) {
@@ -814,7 +815,9 @@ function handleTimelineProjectionUpdated(message: ClientBridgeMessage) {
   if (!sessionId || !timelineProjection) {
     return;
   }
-  applyTimelineProjectionSnapshot(sessionId, timelineProjection);
+  if (restoreTimelineProjectionIfNewer(timelineProjection)) {
+    rebuildWorkerWaitResultsFromMessages(getState().threadMessages, getState().agentOutputs);
+  }
 }
 
 function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
@@ -829,8 +832,8 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
   const currentSessionId = getState().currentSessionId || '';
   const isSameSession = currentSessionId === sessionId;
 
-  // 同 session 恢复（SSE 重连 / 后端重启）：不清除已有时间线内容，
-  // 只同步运行态数据，避免流式输出期间因 SSE 断连恢复而导致界面"刷新"。
+  // 同 session 恢复（SSE 重连 / 后端重启）：优先保留当前 live 时间线。
+  // 仅当后端 bootstrap projection 明确比本地更新时，才允许用快照接管并修复断连期间丢失的节点。
   if (isSameSession) {
     batchWebviewStatePersistence(() => {
       const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;
@@ -854,6 +857,8 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         applySessionNotifications(sessionId, snapshot.notifications.notifications);
       }
       setQueuedMessages(ensureArray<QueuedMessage>(snapshot.queuedMessages));
+      restoreTimelineProjectionIfNewer(timelineProjection);
+      rebuildWorkerWaitResultsFromMessages(getState().threadMessages, getState().agentOutputs);
     });
     return;
   }

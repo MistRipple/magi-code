@@ -155,16 +155,20 @@ export class MessagePipeline {
     const cardStreamSeq = typeof metadata.cardStreamSeq === 'number' && Number.isFinite(metadata.cardStreamSeq)
       ? metadata.cardStreamSeq
       : this.nextCardStreamSeq(cardId);
+    const eventId = message.eventId || this.generateEventId('evt');
+    const eventSeq = this.resolveEventSeq(message.eventSeq);
     const knownCardSeq = this.cardStreamSeqCounters.get(cardId) || 0;
     if (cardStreamSeq > knownCardSeq) {
       this.cardStreamSeqCounters.set(cardId, cardStreamSeq);
     }
     return {
       ...message,
-      eventId: message.eventId || this.generateEventId('evt'),
-      eventSeq: this.resolveEventSeq(message.eventSeq),
+      eventId,
+      eventSeq,
       metadata: {
         ...metadata,
+        eventId,
+        eventSeq,
         cardId,
         cardStreamSeq,
       },
@@ -746,8 +750,11 @@ export class MessagePipeline {
   private debugLog(action: string, messageId: string): void { if (this.config.debug) logger.debug('MessagePipeline.' + action, { messageId }, LogCategory.SYSTEM); }
 
   private materializeMessageStateSnapshot(state: MessageState): StandardMessage {
+    const isActive = !state.completed;
     return this.ensureContentBlocksFromBuffer({
       ...state.message!,
+      // 活跃消息标记为流式状态，确保 projection 构建时不被过滤
+      ...(isActive ? { isStreaming: true } : {}),
       metadata: {
         ...(state.message?.metadata || {}),
         cardId: state.cardId,

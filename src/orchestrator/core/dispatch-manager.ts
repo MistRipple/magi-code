@@ -22,8 +22,10 @@ import type { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import type { ProfileLoader } from '../profile/profile-loader';
 import {
   OwnershipGuard,
-  type DispatchOwnershipAdvisory,
 } from '../profile/ownership-guard';
+import type { IAssignmentCompiler } from '../profile/assignment-compiler';
+import { AssignmentCompilerImpl, type OwnershipWorkerMapping } from '../profile/assignment-compiler-impl';
+import { type TaskOwnership, type TaskMode, getModeConstraints } from '../profile/task-taxonomy';
 import type { MessageHub } from './message-hub';
 import type { MissionOrchestrator } from './mission-orchestrator';
 import type { Assignment, AcceptanceCriterion, Constraint } from '../mission';
@@ -36,7 +38,6 @@ import {
   type DispatchEntry,
   type DispatchTaskContract,
   type DispatchResult,
-  type DispatchStatus,
   type DispatchCollaborationContracts,
   type DispatchAuditOutcome,
   type DispatchAuditIssue,
@@ -44,6 +45,7 @@ import {
 } from './dispatch-batch';
 import type { RequirementAnalysis } from '../protocols/types';
 import type {
+  DispatchTaskHandler,
   WaitForWorkersResult,
   DispatchTaskCollaborationContracts,
   UpdateTodoStatus,
@@ -59,8 +61,6 @@ import type { SnapshotManager } from '../../snapshot-manager';
 import type { SupplementaryInstructionQueue } from './supplementary-instruction-queue';
 import {
   DispatchRoutingService,
-  type DispatchRoutingDecision,
-  type DispatchRoutingCategorySource,
 } from './dispatch-routing-service';
 import { DispatchResumeContextStore } from './dispatch-resume-context-store';
 import {
@@ -148,7 +148,8 @@ export interface DispatchManagerDeps {
     taskId: string;
     worker: WorkerSlot;
     title: string;
-    category: string;
+    ownership: string;
+    mode: string;
     dependsOn?: string[];
     scopeHint?: string[];
     files?: string[];
@@ -204,6 +205,8 @@ export class DispatchManager {
   private activeAssignments = new Map<string, Assignment>();
   /** ownership 守门器：统一处理 dispatch 与 todo_split 的职责域校验 */
   private readonly ownershipGuard = new OwnershipGuard();
+  /** 任务编译器：ownership × mode → worker */
+  private assignmentCompiler: IAssignmentCompiler | null = null;
   /** Worker Lane 运行态：同一 Worker 同一时刻仅允许一个执行链 */
   private activeWorkerLanes = new Set<WorkerSlot>();
   /** 执行协议状态管理器（ack/nack + lease + heartbeat） */
@@ -543,14 +546,6 @@ export class DispatchManager {
     this.deps.adapterFactory.getToolManager().clearDispatchFileWriteTracker();
   }
 
-  private resolveDispatchRouting(
-    goal: string,
-    explicitCategory?: string,
-    categorySource: DispatchRoutingCategorySource = 'explicit_param',
-  ): { ok: true; decision: DispatchRoutingDecision } | { ok: false; error: string } {
-    return this.routingService.resolveDispatchRouting(goal, explicitCategory, categorySource);
-  }
-
   private resolveWorkspaceWriteIsolationMode(requiresModification: boolean): WorkspaceWriteIsolationMode | null {
     if (!requiresModification) {
       return null;
@@ -638,24 +633,36 @@ export class DispatchManager {
       }))
     );
 
-    // 注入 Category → Worker 映射到工具定义，
-    // 使 worker_dispatch 的 category 参数拥有精确的 enum 枚举和分工描述
+    // 构建 ownership → worker 映射，初始化 AssignmentCompiler
     const categoryMap = this.deps.profileLoader.getAssignmentLoader().getCategoryMap();
-    const allCategories = this.deps.profileLoader.getAllCategories();
-    orchestrationExecutor.setCategoryWorkerMap(
-      Object.entries(categoryMap).map(([category, worker]) => ({
-        category,
-        displayName: allCategories.get(category)?.displayName || category,
-        worker,
-      }))
+
+    // 从 category 映射推导 ownership → worker 映射
+    const ownershipWorkerMap = new Map<string, WorkerSlot[]>();
+    for (const [category, worker] of Object.entries(categoryMap)) {
+      // 只取 ownership 类的 category 建立映射
+      if (['frontend', 'backend', 'integration', 'data_analysis', 'general', 'implement', 'simple'].includes(category)) {
+        const ownership = ['frontend', 'backend', 'integration', 'data_analysis'].includes(category)
+          ? category
+          : 'general';
+        const workers = ownershipWorkerMap.get(ownership) || [];
+        if (!workers.includes(worker)) workers.push(worker);
+        ownershipWorkerMap.set(ownership, workers);
+      }
+    }
+    const ownershipMappings: OwnershipWorkerMapping[] = Array.from(ownershipWorkerMap.entries())
+      .map(([ownership, workers]) => ({ ownership: ownership as any, workers }));
+
+    const availableWorkerSet = new Set<WorkerSlot>(
+      Array.from(enabledProfiles.keys()),
     );
+    const fallbackWorker: WorkerSlot = availableWorkerSet.has('codex') ? 'codex' : 'claude';
+    this.assignmentCompiler = new AssignmentCompilerImpl(ownershipMappings, fallbackWorker, availableWorkerSet);
 
     // Worker 可用列表变化后立即失效工具缓存，确保 schema 与运行时一致
     toolManager.refreshToolSchemas();
 
-    orchestrationExecutor.setHandlers({
-      dispatch: async (params) => {
-        const { task_name, goal, acceptance, constraints, context, files, scopeHint, dependsOn, category, requiresModification, contracts, idempotencyKey, missionTitle } = params;
+    const dispatchHandler: DispatchTaskHandler = async (params) => {
+        const { task_name, goal, acceptance, constraints, context, files, scopeHint, dependsOn, ownershipHint, modeHint, requiresModification, contracts, idempotencyKey, missionTitle } = params;
         if (typeof requiresModification !== 'boolean') {
           return {
             task_id: '',
@@ -711,7 +718,8 @@ export class DispatchManager {
         }
         const collaborationContracts = this.normalizeCollaborationContracts(contracts);
         logger.info('编排工具.worker_dispatch.开始', {
-          category,
+          ownershipHint,
+          modeHint,
           requiresModification,
           scopeHintCount: normalizedScopeHint?.length || 0,
           goalPreview: taskTitle.substring(0, 80),
@@ -721,72 +729,113 @@ export class DispatchManager {
           dependsOn: normalizedDependsOn,
         }, LogCategory.ORCHESTRATOR);
 
-        const ownershipAdvisory = this.ownershipGuard.evaluateDispatchAdvisory({
-          category,
+        // ── AssignmentCompiler 一次编译：ownership × mode → worker ──
+        if (!this.assignmentCompiler) {
+          return {
+            task_id: '',
+            status: 'failed' as const,
+            error: 'AssignmentCompiler 未初始化',
+          };
+        }
+        const compilationResult = this.assignmentCompiler.compile({
+          ownershipHint,
+          modeHint,
           taskTitle,
           goal: goalText || taskTitle,
-          acceptance: normalizedAcceptance,
-          constraints: normalizedConstraints,
           context: normalizedContext,
-          dependsOn: normalizedDependsOn,
-          userPrompt: activeUserPrompt,
+          constraints: normalizedConstraints,
         });
-        if (ownershipAdvisory.rejectionError) {
-          logger.warn('编排工具.worker_dispatch.ownership拒绝派发', {
-            category,
+        if (!compilationResult.ok) {
+          logger.warn('编排工具.worker_dispatch.编译拒绝', {
+            ownershipHint,
+            modeHint,
             taskTitle,
-            error: ownershipAdvisory.rejectionError,
+            rejectionCode: compilationResult.rejectionCode,
+            error: compilationResult.error,
           }, LogCategory.ORCHESTRATOR);
           return {
             task_id: '',
             status: 'failed' as const,
-            error: ownershipAdvisory.rejectionError,
+            error: compilationResult.error,
           };
         }
 
-        const normalizedRequestedCategory = category.trim().toLowerCase().replace(/[\s-]+/g, '_');
-        const resolvedDispatchCategory = ownershipAdvisory.resolvedCategory || normalizedRequestedCategory;
-        const routingResult = this.resolveDispatchRouting(
-          taskTitle,
-          resolvedDispatchCategory,
-          resolvedDispatchCategory === normalizedRequestedCategory ? 'explicit_param' : 'ownership_inferred',
-        );
-        if (!routingResult.ok) {
+        // 检查是否发生了自动拆分
+        if (compilationResult.autoSplit && compilationResult.items.length > 1) {
+          // 自动拆分：为每个 item 创建一个 dispatch
+          logger.info('编排工具.worker_dispatch.自动拆分', {
+            originalTaskTitle: taskTitle,
+            splitCount: compilationResult.items.length,
+            domains: compilationResult.items.map(i => i.classification.ownership).join(', '),
+          }, LogCategory.ORCHESTRATOR);
+
+          // 递归调用 worker_dispatch 为每个子任务创建 dispatch
+          const dispatchPromises = compilationResult.items.map(async (item, index) => {
+            const subTaskName = item.suggestedTaskTitle || `${taskTitle} (${item.classification.ownership})`;
+            const subGoal = item.suggestedGoal || goalText || taskTitle;
+
+            // 创建子任务的 dispatch
+            return dispatchHandler({
+              worker: 'auto',
+              task_name: subTaskName,
+              ownershipHint: item.classification.ownership,
+              modeHint: item.classification.mode,
+              goal: subGoal,
+              acceptance: normalizedAcceptance,
+              constraints: normalizedConstraints,
+              context: normalizedContext,
+              scopeHint: normalizedScopeHint,
+              files: normalizedFiles,
+              dependsOn: normalizedDependsOn,
+              requiresModification,
+              contracts,
+              idempotencyKey: idempotencyKey ? `${idempotencyKey}-${item.classification.ownership}-${index}` : undefined,
+              missionTitle: index === 0 ? missionTitle : undefined,
+            });
+          });
+
+          const results = await Promise.all(dispatchPromises);
+          const taskIds = results.map((result) => result.task_id).filter(Boolean);
+
+          return {
+            task_id: taskIds[0] || '', // 主 task_id
+            status: 'dispatched' as const,
+            worker: compilationResult.items[0]?.selectedWorker || 'worker1',
+            ownership: compilationResult.items[0]?.classification.ownership || 'general',
+            mode: compilationResult.items[0]?.classification.mode || 'implement',
+            routing_reason: `auto-split into ${compilationResult.items.length} tasks: ${compilationResult.items.map(i => i.classification.ownership).join(', ')}`,
+            degraded: false,
+            split_task_ids: taskIds, // 返回所有拆分后的 task_id
+          };
+        }
+
+        // 单任务编译
+        const firstItem = compilationResult.items[0];
+        if (!firstItem) {
           return {
             task_id: '',
             status: 'failed' as const,
-            error: routingResult.error,
+            error: 'AssignmentCompiler 未产出可派发任务',
           };
         }
-        const decision = routingResult.decision;
+        const { classification, selectedWorker: compiledWorker, routingReason: compiledRoutingReason } = firstItem;
+        const compiledDegraded = compilationResult.hintOverridden;
 
-        if (resolvedDispatchCategory !== normalizedRequestedCategory) {
-          logger.info('编排工具.worker_dispatch.ownership自动改写分类', {
-            fromCategory: normalizedRequestedCategory,
-            toCategory: decision.category,
-            taskTitle,
-          }, LogCategory.ORCHESTRATOR);
-        }
         logger.info('编排工具.worker_dispatch.路由决策', {
-          selectedWorker: decision.selectedWorker,
-          category: decision.category,
-          categorySource: decision.categorySource,
-          degraded: decision.degraded || ownershipAdvisory.degraded,
+          selectedWorker: compiledWorker,
+          ownership: classification.ownership,
+          mode: classification.mode,
+          degraded: compiledDegraded,
           requiresModification,
-          reason: [
-            decision.routingReason,
-            ownershipAdvisory.routingReasonPatch,
-          ].filter(Boolean).join('; '),
+          reason: compiledRoutingReason,
         }, LogCategory.ORCHESTRATOR);
-        if (decision.degraded || ownershipAdvisory.degraded) {
+
+        if (compiledDegraded) {
           this.deps.messageHub.notify(
             t('dispatch.notify.routingAdjusted', {
-              category: decision.category,
-              selectedWorker: decision.selectedWorker,
-              routingReason: [
-                decision.routingReason,
-                ownershipAdvisory.routingReasonPatch,
-              ].filter(Boolean).join('; '),
+              category: classification.ownership,
+              selectedWorker: compiledWorker,
+              routingReason: compiledRoutingReason,
             }),
             'warning'
           );
@@ -850,7 +899,7 @@ export class DispatchManager {
           sessionId: sessionScopeForIdempotency,
         });
         const phaseAdvisory = this.ownershipGuard.evaluateResolvedDispatchPhaseAdvisory({
-          category: decision.category,
+          ownership: classification.ownership,
           taskTitle,
           goal: goalText || taskTitle,
           acceptance: normalizedAcceptance,
@@ -863,7 +912,7 @@ export class DispatchManager {
         });
         if (phaseAdvisory?.rejectionError) {
           logger.warn('编排工具.worker_dispatch.phase门禁拒绝派发', {
-            category: decision.category,
+            ownership: classification.ownership,
             taskTitle,
             error: phaseAdvisory.rejectionError,
             hasResolvedHistoricalDependencies: dependencyResolution.resolvedHistoricalCompleted.length > 0,
@@ -876,8 +925,7 @@ export class DispatchManager {
           };
         }
         const routingReasonWithOwnership = [
-          decision.routingReason,
-          ownershipAdvisory.routingReasonPatch,
+          compiledRoutingReason,
           phaseAdvisory?.routingReasonPatch,
         ].filter(Boolean).join('; ');
         const scopeHintPlan = this.resolveParallelScopeHintPolicy({
@@ -885,14 +933,14 @@ export class DispatchManager {
           scopeHint: normalizedScopeHint,
           dependsOn: dependencyResolution.dependsOn,
           routingReason: routingReasonWithOwnership,
-          degraded: decision.degraded || ownershipAdvisory.degraded,
+          degraded: compiledDegraded,
         });
         const workspaceWriteIsolationMode = this.resolveWorkspaceWriteIsolationMode(requiresModification);
         const baseRoutingReason = [
           scopeHintPlan.routingReason,
           ...dependencyResolution.routingReasonPatches,
         ].filter(Boolean).join('; ');
-        const baseDegraded = scopeHintPlan.degraded || dependencyResolution.degraded;
+        const baseDegraded = scopeHintPlan.degraded || dependencyResolution.degraded || compiledDegraded;
         const writeIsolationPlan = this.resolveWriteIsolationPolicy({
           batch: this.activeBatch,
           dependsOn: scopeHintPlan.dependsOn,
@@ -906,10 +954,8 @@ export class DispatchManager {
         const effectiveDegraded = writeIsolationPlan.degraded;
         const taskContract = this.buildDispatchTaskContract({
           taskTitle,
-          category: decision.category,
-          ...(normalizedRequestedCategory !== decision.category
-            ? { declaredCategory: normalizedRequestedCategory }
-            : {}),
+          ownership: classification.ownership,
+          mode: classification.mode,
           goal: goalText || taskTitle,
           acceptance: normalizedAcceptance,
           constraints: normalizedConstraints,
@@ -928,7 +974,7 @@ export class DispatchManager {
           taskContract,
         });
         // 先生成候选 taskId，再通过 claimOrGet 做原子幂等占位，避免跨实例 TOCTOU 竞争。
-        const taskId = `dispatch-${Date.now()}-${decision.selectedWorker}-${Math.random().toString(36).substring(2, 5)}`;
+        const taskId = `dispatch-${Date.now()}-${compiledWorker}-${Math.random().toString(36).substring(2, 5)}`;
         let idempotencyClaim: ReturnType<DispatchIdempotencyStore['claimOrGet']>;
         try {
           idempotencyClaim = this.dispatchIdempotencyStore.claimOrGet({
@@ -936,8 +982,9 @@ export class DispatchManager {
             sessionId: sessionScopeForIdempotency,
             missionId,
             taskId,
-            worker: decision.selectedWorker,
-            category: decision.category,
+            worker: compiledWorker,
+            ownership: classification.ownership,
+            mode: classification.mode,
             taskName: taskTitle,
             routingReason: effectiveRoutingReason,
             degraded: effectiveDegraded,
@@ -980,7 +1027,8 @@ export class DispatchManager {
               task_id: existingIdempotent.taskId,
               status: 'failed' as const,
               worker: existingIdempotent.worker,
-              category: existingIdempotent.category,
+              ownership: existingIdempotent.ownership,
+              mode: existingIdempotent.mode,
               routing_reason: existingIdempotent.routingReason,
               degraded: existingIdempotent.degraded,
               error: blockedReason,
@@ -998,22 +1046,23 @@ export class DispatchManager {
             task_id: existingIdempotent.taskId,
             status: 'dispatched' as const,
             worker: existingIdempotent.worker,
-            category: existingIdempotent.category,
+            ownership: existingIdempotent.ownership,
+            mode: existingIdempotent.mode,
             routing_reason: `${existingIdempotent.routingReason} [idempotency_reused]`,
             degraded: existingIdempotent.degraded,
           };
         }
         this.notifyDispatchDependencyResolution(taskId, dependencyResolution);
-        if (ownershipAdvisory.warningDetail) {
+        if (compilationResult.hintOverridden && compilationResult.overrideDetail) {
           this.deps.messageHub.notify(t('dispatch.notify.ownershipCategoryWarning', {
             taskId,
-            category: decision.category,
-            details: ownershipAdvisory.warningDetail,
+            category: classification.ownership,
+            details: compilationResult.overrideDetail,
           }), 'warning');
-          logger.warn('编排工具.worker_dispatch.ownership警告', {
+          logger.warn('编排工具.worker_dispatch.hint覆盖警告', {
             taskId,
-            category: decision.category,
-            details: ownershipAdvisory.warningDetail,
+            ownership: classification.ownership,
+            details: compilationResult.overrideDetail,
           }, LogCategory.ORCHESTRATOR);
         }
 
@@ -1024,7 +1073,7 @@ export class DispatchManager {
           }), 'warning');
           logger.info('编排工具.worker_dispatch.scope_hint缺失自动串行', {
             taskId,
-            worker: decision.selectedWorker,
+            worker: compiledWorker,
             addedDependencies: scopeHintPlan.addedDependencies,
             existingDependsOn: normalizedDependsOn || [],
           }, LogCategory.ORCHESTRATOR);
@@ -1039,7 +1088,7 @@ export class DispatchManager {
           }
           logger.info('编排工具.worker_dispatch.非Git写任务.串行依赖已注入', {
             taskId,
-            worker: decision.selectedWorker,
+            worker: compiledWorker,
             addedDependencies: writeIsolationPlan.addedDependencies,
             existingDependsOn: normalizedDependsOn || [],
           }, LogCategory.ORCHESTRATOR);
@@ -1049,7 +1098,7 @@ export class DispatchManager {
         try {
           this.activeBatch.register({
             taskId,
-            worker: decision.selectedWorker,
+            worker: compiledWorker,
             taskContract,
           });
 
@@ -1063,8 +1112,9 @@ export class DispatchManager {
           return {
             task_id: taskId,
             status: 'failed' as const,
-            worker: decision.selectedWorker,
-            category: decision.category,
+            worker: compiledWorker,
+            ownership: classification.ownership,
+            mode: classification.mode,
             routing_reason: effectiveRoutingReason,
             degraded: effectiveDegraded,
             error: regError.message,
@@ -1093,9 +1143,10 @@ export class DispatchManager {
               sessionId: resolvedSessionId,
               missionId,
               taskId,
-              worker: decision.selectedWorker,
+              worker: compiledWorker,
               title: taskContract.taskTitle,
-              category: taskContract.category,
+              ownership: taskContract.ownership,
+              mode: taskContract.mode,
               dependsOn: taskContract.dependsOn.length > 0 ? taskContract.dependsOn : undefined,
               scopeHint: taskContract.scopeHint.length > 0 ? taskContract.scopeHint : undefined,
               files: taskContract.files.length > 0 ? taskContract.files : undefined,
@@ -1118,7 +1169,7 @@ export class DispatchManager {
           id: taskId,
           title: taskTitle,
           status: cardStatus,
-          worker: decision.selectedWorker,
+          worker: compiledWorker,
           requestId: entry?.requestId || this.activeBatch.requestId,
           ...(entryStatus === 'skipped' && entry?.result?.summary
             ? {
@@ -1138,12 +1189,16 @@ export class DispatchManager {
         return {
           task_id: taskId,
           status: 'dispatched' as const,
-          worker: decision.selectedWorker,
-          category: decision.category,
+          worker: compiledWorker,
+          ownership: classification.ownership,
+          mode: classification.mode,
           routing_reason: effectiveRoutingReason,
           degraded: effectiveDegraded,
         };
-      },
+      };
+
+    orchestrationExecutor.setHandlers({
+      dispatch: dispatchHandler,
 
       sendMessage: async (params) => {
         const { worker, message } = params;
@@ -1254,7 +1309,7 @@ export class DispatchManager {
         }
 
         const splitOwnershipError = this.ownershipGuard.evaluateSplitTodoOwnership({
-          assignmentCategory: assignment.assignmentReason.profileMatch.category,
+          assignmentOwnership: assignment.assignmentReason.profileMatch.category,
           subtasks,
         });
         if (splitOwnershipError) {
@@ -1610,14 +1665,12 @@ export class DispatchManager {
     const preferredWorker = worker;
     const {
       taskTitle,
-      category,
       requirementAnalysis,
       context,
       scopeHint,
       files,
       collaborationContracts,
     } = taskContract;
-    const goal = requirementAnalysis.goal;
     const acceptance = requirementAnalysis.acceptanceCriteria || [];
     const constraints = requirementAnalysis.constraints || [];
     const requiresModification = requirementAnalysis.requiresModification === true;
@@ -1714,7 +1767,7 @@ export class DispatchManager {
         constraints: assignmentConstraints,
         acceptanceCriteria: assignmentAcceptanceCriteria,
         assignmentReason: {
-          profileMatch: { category, score: 100, matchedKeywords: [] },
+          profileMatch: { category: taskContract.ownership, score: 100, matchedKeywords: [] },
           contractRole: 'none' as const,
           explanation: executionRouting.routingReason,
           alternatives: [],
@@ -2560,12 +2613,22 @@ export class DispatchManager {
       t('dispatch.delegation.context', { context: taskContract.context.map(item => `- ${item}`).join('\n') }),
     ];
 
-    if (taskContract.declaredCategory && taskContract.declaredCategory !== taskContract.category) {
-      lines.unshift([
-        '## Routing Semantics',
-        `- Ownership routing category: ${taskContract.category}`,
-        `- Declared task style/category: ${taskContract.declaredCategory}`,
-      ].join('\n'));
+    // 注入 mode 行为约束
+    if (taskContract.mode && taskContract.mode !== 'implement') {
+      const modeConstraints = getModeConstraints(taskContract.mode);
+      const modeLines: string[] = [
+        `**Execution Mode: ${taskContract.mode.toUpperCase()}** — ${modeConstraints.description}`,
+      ];
+      if (modeConstraints.behavioralConstraints.length > 0) {
+        modeLines.push(...modeConstraints.behavioralConstraints.map(c => `- ${c}`));
+      }
+      if (modeConstraints.readOnly) {
+        modeLines.push('- ⚠️ READ-ONLY: Do not modify any files');
+      }
+      if (modeConstraints.allowedFilePatterns && modeConstraints.allowedFilePatterns.length > 0) {
+        modeLines.push(`- Allowed file patterns: ${modeConstraints.allowedFilePatterns.map(p => p.source).join(', ')}`);
+      }
+      lines.push(modeLines.join('\n'));
     }
 
     if (predecessorContext) {
@@ -2776,7 +2839,7 @@ export class DispatchManager {
   private hasActiveFeatureDomainEntriesInBatch(batch: DispatchBatch): boolean {
     return batch.getEntries().some((entry) =>
       !isTerminalStatus(entry.status)
-      && CURRENT_PHASE_FEATURE_CATEGORIES.has(entry.taskContract.category),
+      && CURRENT_PHASE_FEATURE_CATEGORIES.has(entry.taskContract.ownership),
     );
   }
 
@@ -2937,8 +3000,8 @@ export class DispatchManager {
 
   private buildDispatchTaskContract(input: {
     taskTitle: string;
-    category: string;
-    declaredCategory?: string;
+    ownership: TaskOwnership;
+    mode: TaskMode;
     goal: string;
     acceptance: string[];
     constraints: string[];
@@ -2955,26 +3018,19 @@ export class DispatchManager {
       analysis: input.taskTitle,
       constraints: input.constraints.length > 0 ? [...input.constraints] : undefined,
       acceptanceCriteria: input.acceptance.length > 0 ? [...input.acceptance] : undefined,
-      categories: Array.from(new Set([
-        input.category,
-        ...(typeof input.declaredCategory === 'string' && input.declaredCategory.trim()
-          ? [input.declaredCategory.trim()]
-          : []),
-      ])),
+      categories: [input.ownership],
       entryPath: 'task_execution',
       includeThinking: true,
       includeToolCalls: true,
       historyMode: 'session',
       requiresModification: input.requiresModification,
-      reason: input.routingReason.trim() || `worker_dispatch 分类为 ${input.category}`,
+      reason: input.routingReason.trim() || `worker_dispatch ownership=${input.ownership} mode=${input.mode}`,
     };
 
     return {
       taskTitle: input.taskTitle,
-      category: input.category,
-      ...(typeof input.declaredCategory === 'string' && input.declaredCategory.trim()
-        ? { declaredCategory: input.declaredCategory.trim() }
-        : {}),
+      ownership: input.ownership,
+      mode: input.mode,
       requirementAnalysis,
       context: [...input.context],
       scopeHint: input.scopeHint ? [...input.scopeHint] : [],
@@ -3254,10 +3310,8 @@ export class DispatchManager {
     const { requirementAnalysis } = taskContract;
 
     const payload = {
-      category: taskContract.category,
-      declaredCategory: typeof taskContract.declaredCategory === 'string'
-        ? taskContract.declaredCategory.trim()
-        : '',
+      ownership: taskContract.ownership,
+      mode: taskContract.mode,
       taskTitle: taskContract.taskTitle.trim(),
       goal: requirementAnalysis.goal.trim(),
       analysis: requirementAnalysis.analysis.trim(),

@@ -39,6 +39,40 @@
   let renameWorkspaceValue = $state('');
   let workspaceDialogError = $state('');
 
+  function safeStorageGet(key: string): string {
+    if (typeof window === 'undefined') {
+      return '';
+    }
+    try {
+      return localStorage.getItem(key) || '';
+    } catch (error) {
+      console.warn(`[WebWorkbenchShell] localStorage 读取失败(${key})`, error);
+      return '';
+    }
+  }
+
+  function safeStorageSet(key: string, value: string): void {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    try {
+      localStorage.setItem(key, value);
+    } catch (error) {
+      console.warn(`[WebWorkbenchShell] localStorage 写入失败(${key})`, error);
+    }
+  }
+
+  function safeStorageRemove(key: string): void {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    try {
+      localStorage.removeItem(key);
+    } catch (error) {
+      console.warn(`[WebWorkbenchShell] localStorage 删除失败(${key})`, error);
+    }
+  }
+
   const INTERNAL_SESSION_NAME_PATTERNS = [
     /^auto-deep-followup-\d+$/i,
     /^replan-gate-ask-\d+$/i,
@@ -179,9 +213,9 @@
     const nextUrl = new URL(window.location.href);
 
     if (!normalizedWorkspaceId || !normalizedWorkspacePath) {
-      localStorage.removeItem('magi-workspace-id');
-      localStorage.removeItem('magi-workspace-path');
-      localStorage.removeItem('magi-session-id');
+      safeStorageRemove('magi-workspace-id');
+      safeStorageRemove('magi-workspace-path');
+      safeStorageRemove('magi-session-id');
       nextUrl.searchParams.delete('workspaceId');
       nextUrl.searchParams.delete('workspacePath');
       nextUrl.searchParams.delete('sessionId');
@@ -191,16 +225,16 @@
       return;
     }
 
-    localStorage.setItem('magi-workspace-id', normalizedWorkspaceId);
-    localStorage.setItem('magi-workspace-path', normalizedWorkspacePath);
+    safeStorageSet('magi-workspace-id', normalizedWorkspaceId);
+    safeStorageSet('magi-workspace-path', normalizedWorkspacePath);
     nextUrl.searchParams.set('workspaceId', normalizedWorkspaceId);
     nextUrl.searchParams.set('workspacePath', normalizedWorkspacePath);
 
     if (normalizedSessionId) {
-      localStorage.setItem('magi-session-id', normalizedSessionId);
+      safeStorageSet('magi-session-id', normalizedSessionId);
       nextUrl.searchParams.set('sessionId', normalizedSessionId);
     } else {
-      localStorage.removeItem('magi-session-id');
+      safeStorageRemove('magi-session-id');
       nextUrl.searchParams.delete('sessionId');
     }
 
@@ -222,9 +256,9 @@
       return querySessionId;
     }
 
-    const storedWorkspaceId = localStorage.getItem('magi-workspace-id') || '';
-    const storedWorkspacePath = localStorage.getItem('magi-workspace-path') || '';
-    const storedSessionId = localStorage.getItem('magi-session-id') || '';
+    const storedWorkspaceId = safeStorageGet('magi-workspace-id');
+    const storedWorkspacePath = safeStorageGet('magi-workspace-path');
+    const storedSessionId = safeStorageGet('magi-session-id');
     if (storedSessionId && (storedWorkspaceId === workspaceId || storedWorkspacePath === workspacePath)) {
       return storedSessionId;
     }
@@ -305,7 +339,7 @@
         }
         return false;
       }) ?? null;
-      const storedWorkspaceId = localStorage.getItem('magi-workspace-id') || '';
+      const storedWorkspaceId = safeStorageGet('magi-workspace-id');
       if (queryMatchedWorkspace) {
         selectedWorkspaceId = queryMatchedWorkspace.workspaceId;
       } else if (storedWorkspaceId && next.some((workspace) => workspace.workspaceId === storedWorkspaceId)) {

@@ -33,7 +33,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return;
   }
 
-  // 启动门闩：先确定 Agent 后台是否可用，再决定 WebviewProvider 运行模式
+  // 启动门闩：Magi 仅支持 Agent 单链，必须先确保 Local Agent 后台可用。
   localAgentManager = new LocalAgentManager(context.extensionPath);
   let agentBaseUrl = '';
   try {
@@ -41,11 +41,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     agentBaseUrl = localAgentManager.getBaseUrl();
     logger.info('扩展.Agent.已就绪', { baseUrl: agentBaseUrl }, LogCategory.SYSTEM);
   } catch (error) {
-    logger.warn('扩展.Agent.启动失败.回退宿主运行时', { error: error instanceof Error ? error.message : String(error) }, LogCategory.SYSTEM);
-    // Agent 不可用：WebviewProvider 将以完整 runtime 模式运行
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error('扩展.Agent.启动失败', { error: message }, LogCategory.SYSTEM);
+    await localAgentManager.dispose().catch((disposeError) => {
+      logger.warn('扩展.Agent.失败后清理异常', {
+        error: disposeError instanceof Error ? disposeError.message : String(disposeError),
+      }, LogCategory.SYSTEM);
+    });
+    localAgentManager = undefined;
+    vscode.window.showErrorMessage(`Local Agent 启动失败，Magi 仅支持 Agent 模式：${message}`);
+    throw new Error(`Local Agent 启动失败，无法进入 Agent-only 单链模式：${message}`);
   }
 
-  // 创建 WebviewProvider：Agent 可用时为壳模式，不可用时为完整 runtime 模式
+  // 创建 WebviewProvider：插件面板仅作为 Agent Web 客户端壳层。
   webviewProvider = new WebviewProvider(
     context.extensionUri,
     context,
@@ -222,6 +230,9 @@ function registerCommands(context: vscode.ExtensionContext): void {
       }
       try {
         await localAgentManager.restart();
+        if (webviewProvider) {
+          await webviewProvider.refreshAgentBaseUrl(localAgentManager.getBaseUrl());
+        }
         vscode.window.showInformationMessage('Local Agent 已重启');
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);

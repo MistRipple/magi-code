@@ -14,12 +14,16 @@ import {
   markMessageComplete,
   addPendingRequest,
   clearPendingRequest,
+  addToast,
   getRequestBinding,
   createRequestBinding,
   updateRequestBinding,
   clearRequestBinding,
+  settleProcessingForManualInteraction,
+  sealAllStreamingMessages,
   applyTimelineStreamPatch,
   getTimelineMessageById,
+  upsertTimelineNode,
 } from '../stores/messages.svelte';
 import type { Message, ContentBlock, SessionTimelineProjection } from '../types/message';
 import type { StandardMessage, StreamUpdate } from '../../../../protocol/message-protocol';
@@ -31,6 +35,7 @@ import { i18n } from '../stores/i18n.svelte';
 import { canBindRequestPlaceholder } from '../../../../shared/request-placeholder-binding';
 import {
   messageHasRenderableTimelineContent,
+  resolveTimelineWorkerVisibility as resolveSharedTimelineWorkerVisibility,
 } from '../../../../shared/timeline-presentation';
 import {
   handleUnifiedControlMessage,
@@ -41,7 +46,9 @@ import {
   type WorkerSlot,
   mapStandardBlocks,
   formatPlanBlock,
+  syncWorkerWaitResultsFromMessage,
 } from './message-utils';
+import { mergeCompleteBlocksForFinalization } from './streaming-complete-merge';
 
 // Re-export for external consumers
 export {
@@ -106,6 +113,22 @@ function requiresWorkerLane(standard: StandardMessage): boolean {
     || standard.type === MessageType.TASK_CARD;
 }
 
+function resolveTimelineVisibilityForStandard(standard: StandardMessage): {
+  thread: boolean;
+  workerTabs?: WorkerSlot[];
+} {
+  const workerSlot = resolveLaneWorkerSlot(standard);
+  const visibility = resolveSharedTimelineWorkerVisibility({
+    hasWorker: Boolean(workerSlot),
+    type: standard.type,
+    source: standard.source,
+  });
+  return {
+    thread: visibility.threadVisible,
+    workerTabs: visibility.includeWorkerTab && workerSlot ? [workerSlot] : undefined,
+  };
+}
+
 
 
 
@@ -133,17 +156,34 @@ export function initMessageHandler(bridge: ClientBridge = getClientBridge()) {
 }
 
 let lastAppliedEventSeq = 0;
+let eventSeqSessionId = '';
 const processedEventKeys = new Set<string>();
 const processedEventKeyQueue: string[] = [];
 const MAX_TRACKED_EVENT_KEYS = 4000;
+const UNHANDLED_MESSAGE_TOAST_WINDOW_MS = 3000;
+let lastUnhandledMessageErrorSignature = '';
+let lastUnhandledMessageErrorAt = 0;
 
-function resetEventSeqTracking(seed: number = 0): void {
+function resetEventSeqTracking(seed: number = 0, sessionId?: string): void {
   lastAppliedEventSeq = seed > 0 ? Math.floor(seed) : 0;
+  eventSeqSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
   processedEventKeys.clear();
   processedEventKeyQueue.length = 0;
 }
 
+export function primeEventSeqTracking(
+  sessionId: string | null | undefined,
+  seed: number = 0,
+): void {
+  const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+  resetEventSeqTracking(seed, normalizedSessionId);
+}
+
 function syncEventSeqTrackingFromProjection(message: ClientBridgeMessage): void {
+  const incomingSessionId = resolveEventTrackingSessionId(message);
+  if (incomingSessionId && incomingSessionId !== eventSeqSessionId) {
+    resetEventSeqTracking(0, incomingSessionId);
+  }
   const projection = message.timelineProjection as SessionTimelineProjection | undefined;
   const seed = typeof projection?.lastAppliedEventSeq === 'number' && Number.isFinite(projection.lastAppliedEventSeq)
     ? Math.max(0, Math.floor(projection.lastAppliedEventSeq))
@@ -153,7 +193,38 @@ function syncEventSeqTrackingFromProjection(message: ClientBridgeMessage): void 
   if (seed > lastAppliedEventSeq) {
     lastAppliedEventSeq = seed;
   }
+  if (incomingSessionId) {
+    eventSeqSessionId = incomingSessionId;
+  }
   // 不清除 processedEventKeys：同 session 的重复 bootstrap 不应丢弃去重记忆
+}
+
+function resolveEventTrackingSessionId(
+  message: ClientBridgeMessage,
+  options: { allowCurrentSessionFallback?: boolean } = {},
+): string {
+  if (typeof message.sessionId === 'string' && message.sessionId.trim()) {
+    return message.sessionId.trim();
+  }
+  if (message.type === 'unifiedMessage' || message.type === 'unifiedComplete') {
+    const standard = message.message as StandardMessage | undefined;
+    const metadata = standard?.metadata && typeof standard.metadata === 'object'
+      ? standard.metadata as Record<string, unknown>
+      : undefined;
+    if (typeof metadata?.sessionId === 'string' && metadata.sessionId.trim()) {
+      return metadata.sessionId.trim();
+    }
+    const payload = standard?.data?.payload;
+    if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+      const payloadSessionId = (payload as Record<string, unknown>).sessionId;
+      if (typeof payloadSessionId === 'string' && payloadSessionId.trim()) {
+        return payloadSessionId.trim();
+      }
+    }
+  }
+  return options.allowCurrentSessionFallback === true
+    ? (getState().currentSessionId?.trim() || '')
+    : '';
 }
 
 function syncEventSeqTrackingFromBootstrap(standard: StandardMessage): void {
@@ -162,12 +233,14 @@ function syncEventSeqTrackingFromBootstrap(standard: StandardMessage): void {
     return;
   }
   const incomingSessionId = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : '';
-  const currentSessionId = getState().currentSessionId?.trim() || '';
-  if (incomingSessionId && currentSessionId && incomingSessionId !== currentSessionId) {
-    resetEventSeqTracking();
+  if (incomingSessionId && incomingSessionId !== eventSeqSessionId) {
+    resetEventSeqTracking(0, incomingSessionId);
+  } else if (incomingSessionId) {
+    eventSeqSessionId = incomingSessionId;
   }
   syncEventSeqTrackingFromProjection({
     type: 'sessionBootstrapLoaded',
+    sessionId: incomingSessionId,
     timelineProjection: payload.timelineProjection,
   });
 }
@@ -214,7 +287,25 @@ function resolveEventSeqAndKey(message: ClientBridgeMessage): { eventSeq?: numbe
 }
 
 function shouldProcessByEventSeq(message: ClientBridgeMessage): boolean {
+  const incomingSessionId = resolveEventTrackingSessionId(message);
+  // 会话切换时：无条件重置 eventSeq 追踪状态
+  // 这确保后端重启或新会话时，eventSeq 从 0 开始不会被误判为逆序
+  if (incomingSessionId && incomingSessionId !== eventSeqSessionId) {
+    resetEventSeqTracking(0, incomingSessionId);
+  } else if (!eventSeqSessionId && incomingSessionId) {
+    eventSeqSessionId = incomingSessionId;
+  }
   const { eventSeq, eventKey } = resolveEventSeqAndKey(message);
+  // SSE 单连接语义下，不应出现严格递减序号。
+  // 一旦出现，通常意味着后端 runtime 重启后序号重新起算，必须重置基线。
+  if (eventSeq !== undefined && eventSeq < lastAppliedEventSeq) {
+    console.warn('[MessageHandler] 检测到 eventSeq 回退，重置追踪基线', {
+      eventSeq,
+      lastAppliedEventSeq,
+      type: message.type,
+    });
+    resetEventSeqTracking(eventSeq - 1, incomingSessionId || eventSeqSessionId);
+  }
   if (eventSeq === undefined) {
     return true;
   }
@@ -307,6 +398,76 @@ function hasVisibleUserContent(message: Message): boolean {
   });
 }
 
+function resolveBoundUserAnchorTimestamp(userMessageId: string | undefined): number | null {
+  if (!userMessageId) {
+    return null;
+  }
+  const userMessage = getTimelineMessageById(userMessageId);
+  if (!userMessage) {
+    return null;
+  }
+  const metadata = userMessage.metadata && typeof userMessage.metadata === 'object'
+    ? userMessage.metadata as Record<string, unknown>
+    : undefined;
+  const metadataAnchor = typeof metadata?.timelineAnchorTimestamp === 'number'
+    && Number.isFinite(metadata.timelineAnchorTimestamp)
+    && metadata.timelineAnchorTimestamp > 0
+    ? Math.floor(metadata.timelineAnchorTimestamp)
+    : 0;
+  if (metadataAnchor > 0) {
+    return metadataAnchor;
+  }
+  return typeof userMessage.timestamp === 'number' && Number.isFinite(userMessage.timestamp) && userMessage.timestamp > 0
+    ? Math.floor(userMessage.timestamp)
+    : null;
+}
+
+function bindMessageToUserAnchor(
+  message: Message,
+  userMessageId: string | undefined,
+): Message {
+  const anchorTimestamp = resolveBoundUserAnchorTimestamp(userMessageId);
+  if (!anchorTimestamp) {
+    return message;
+  }
+  const metadata = message.metadata && typeof message.metadata === 'object'
+    ? message.metadata as Record<string, unknown>
+    : undefined;
+  if (metadata?.timelineAnchorTimestamp === anchorTimestamp) {
+    return message;
+  }
+  return {
+    ...message,
+    metadata: {
+      ...(metadata || {}),
+      timelineAnchorTimestamp: anchorTimestamp,
+    },
+  };
+}
+
+function buildPlaceholderTakeoverMessage(
+  baseMessage: Message,
+  placeholderMessage: Message | undefined,
+  requestId: string,
+): Message {
+  const placeholderMetadata = placeholderMessage?.metadata && typeof placeholderMessage.metadata === 'object'
+    ? placeholderMessage.metadata as Record<string, unknown>
+    : undefined;
+  const baseMetadata = baseMessage.metadata && typeof baseMessage.metadata === 'object'
+    ? baseMessage.metadata as Record<string, unknown>
+    : undefined;
+  const keepPlaceholderVisible = !hasVisibleUserContent(baseMessage);
+  return {
+    ...baseMessage,
+    metadata: buildRequestPlaceholderMetadata(
+      placeholderMetadata,
+      baseMetadata,
+      requestId,
+      keepPlaceholderVisible,
+    ),
+  };
+}
+
 const SESSION_LIFECYCLE_DATA_TYPES = new Set<string>([
   'sessionBootstrapLoaded',
 ]);
@@ -341,7 +502,7 @@ function shouldIgnoreCrossSessionUnifiedMessage(message: ClientBridgeMessage): b
     return false;
   }
 
-  const incomingSessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
+  const incomingSessionId = resolveEventTrackingSessionId(message);
   if (!incomingSessionId) {
     return false;
   }
@@ -359,27 +520,50 @@ function shouldIgnoreCrossSessionUnifiedMessage(message: ClientBridgeMessage): b
   return true;
 }
 
+function handleUnhandledMessageError(error: unknown, message: ClientBridgeMessage): void {
+  console.error('[MessageHandler] 处理消息时发生未捕获异常:', error, message);
+  // 统一降级策略：消息处理崩溃后立即收敛前端运行态，避免用户看到“持续执行但无输出”假象。
+  sealAllStreamingMessages();
+  settleProcessingForManualInteraction();
+
+  const detail = error instanceof Error ? error.message.trim() : String(error || '').trim();
+  const signature = `${message.type}:${detail || 'unknown'}`;
+  const now = Date.now();
+  const withinDedupWindow = (
+    signature === lastUnhandledMessageErrorSignature
+    && now - lastUnhandledMessageErrorAt < UNHANDLED_MESSAGE_TOAST_WINDOW_MS
+  );
+  if (withinDedupWindow) {
+    return;
+  }
+  lastUnhandledMessageErrorSignature = signature;
+  lastUnhandledMessageErrorAt = now;
+  addToast(
+    'error',
+    detail
+      ? `消息同步异常，已终止当前执行态：${detail}`
+      : '消息同步异常，已终止当前执行态，请重试。',
+    undefined,
+    {
+      category: 'incident',
+      source: 'message-handler',
+      actionRequired: true,
+      persistToCenter: true,
+    },
+  );
+}
+
 /**
  * 处理来自扩展的消息
  */
 function handleMessage(message: ClientBridgeMessage) {
   const { type } = message;
 
-  if (type === 'unifiedUpdate') {
-    console.log('[STREAM_DEBUG] handleMessage 收到 unifiedUpdate');
-  }
-
   if (shouldIgnoreCrossSessionUnifiedMessage(message)) {
-    if (type === 'unifiedUpdate') {
-      console.warn('[STREAM_DEBUG] unifiedUpdate 被跨会话过滤器丢弃');
-    }
     return;
   }
 
   if (!shouldProcessByEventSeq(message)) {
-    if (type === 'unifiedUpdate') {
-      console.warn('[STREAM_DEBUG] unifiedUpdate 被 eventSeq 过滤器丢弃');
-    }
     return;
   }
 
@@ -402,7 +586,7 @@ function handleMessage(message: ClientBridgeMessage) {
         break;
     }
   } catch (error) {
-    console.error('[MessageHandler] 处理消息时发生未捕获异常:', error, message);
+    handleUnhandledMessageError(error, message);
   }
 }
 
@@ -443,12 +627,14 @@ function handleContentMessage(standard: StandardMessage) {
     return;
   }
   const uiMessage = mapStandardMessage(standard);
+  const visibility = resolveTimelineVisibilityForStandard(standard);
   const meta = standard.metadata as Record<string, unknown> | undefined;
   const requestId = meta?.requestId as string | undefined;
   const isPlaceholder = Boolean(meta?.isPlaceholder);
   const isUserMessage = standard.type === MessageType.USER_INPUT;
 
-  // === 占位消息：先展示 thinking 卡片，等后续真实消息替换 ===
+  // === 占位消息：先展示 thinking 卡片，等后续真实消息接管同一时间轴位置 ===
+  // 占位消息也需要创建 timeline node 锚点，确保后续真实消息能够原位接管。
   if (isPlaceholder) {
     if (!requestId) {
       throw new Error('[MessageHandler] 占位消息缺少 requestId');
@@ -469,13 +655,20 @@ function handleContentMessage(standard: StandardMessage) {
       updateRequestBinding(requestId, { placeholderMessageId: standard.id, userMessageId });
     }
     addPendingRequest(requestId);
-    if (uiMessage.isStreaming) {
-      markMessageActive(uiMessage.id);
+    const anchoredPlaceholder = bindMessageToUserAnchor(uiMessage, userMessageId);
+    if (!getTimelineMessageById(anchoredPlaceholder.id)) {
+      upsertTimelineNode(anchoredPlaceholder, visibility);
+    }
+    if (anchoredPlaceholder.isStreaming) {
+      markMessageActive(anchoredPlaceholder.id);
     }
     return;
   }
 
   // === 用户消息 ===
+  // 用户消息也应该在 unifiedMessage 首次到达时立即创建 timeline node 锚点，
+  // 与 assistant streaming 走同一条建链路径，消除双真相竞争。
+  // 注意：user_input 通常不是 streaming 的（isStreaming=false），但仍然需要建节点。
   if (isUserMessage) {
     if (requestId) {
       const placeholderMessageId = meta?.placeholderMessageId as string | undefined;
@@ -491,89 +684,66 @@ function handleContentMessage(standard: StandardMessage) {
         updateRequestBinding(requestId, { userMessageId: standard.id });
       }
     }
+    if (!getTimelineMessageById(uiMessage.id)) {
+      upsertTimelineNode(uiMessage, visibility);
+    }
     return;
   }
 
-  // === 检查是否有对应的占位消息需要替换 ===
-  if (requestId && canStandardMessageTakeOverRequestPlaceholder(standard)) {
-    const binding = getRequestBinding(requestId);
-    if (binding && !binding.realMessageId) {
-      if (binding.timeoutId) {
-        clearTimeout(binding.timeoutId);
-      }
-      updateRequestBinding(requestId, {
-        realMessageId: standard.id,
-        placeholderMessageId: standard.id,
-        timeoutId: undefined,
-      });
+  const requestBinding = requestId ? getRequestBinding(requestId) : undefined;
+  const replaceMessageId = (
+    requestId
+    && canStandardMessageTakeOverRequestPlaceholder(standard)
+    && requestBinding?.placeholderMessageId
+    && requestBinding.placeholderMessageId !== standard.id
+  )
+    ? requestBinding.placeholderMessageId
+    : undefined;
+  const placeholderMessage = replaceMessageId
+    ? getTimelineMessageById(replaceMessageId)
+    : undefined;
+  const effectiveMessageBase = (requestId && replaceMessageId)
+    ? buildPlaceholderTakeoverMessage(uiMessage, placeholderMessage, requestId)
+    : uiMessage;
+  const boundUserMessageId = requestBinding?.userMessageId
+    || (typeof meta?.userMessageId === 'string' ? meta.userMessageId : undefined);
+  const effectiveMessage = (requestId && visibility.thread)
+    ? bindMessageToUserAnchor(effectiveMessageBase, boundUserMessageId)
+    : effectiveMessageBase;
+
+  if (requestId && canStandardMessageTakeOverRequestPlaceholder(standard) && requestBinding) {
+    if (requestBinding.timeoutId) {
+      clearTimeout(requestBinding.timeoutId);
     }
+    updateRequestBinding(requestId, {
+      realMessageId: standard.id,
+      timeoutId: undefined,
+    });
+  }
+  if (replaceMessageId) {
+    markMessageComplete(replaceMessageId);
   }
 
-  if (uiMessage.isStreaming) {
-    markMessageActive(uiMessage.id);
+  const hasExistingTimelineMessage = Boolean(getTimelineMessageById(effectiveMessage.id));
+  if (
+    effectiveMessage.isStreaming
+    || hasRenderableContent(effectiveMessage)
+    || Boolean(replaceMessageId)
+    || hasExistingTimelineMessage
+  ) {
+    const timelineMessage = upsertTimelineNode(
+      effectiveMessage,
+      visibility,
+      replaceMessageId ? { replaceMessageId } : {},
+    );
+    syncWorkerWaitResultsFromMessage(timelineMessage);
+  }
+
+  if (effectiveMessage.isStreaming) {
+    markMessageActive(effectiveMessage.id);
   }
 }
 
-
-// 缓冲队列：当 unifiedUpdate 到达时如果 timeline 中尚无对应消息节点
-// （例如 projection broadcast 还在 200ms debounce 中），先缓存 update，
-// 等 projection 创建节点后自动回放。
-const pendingStreamUpdates = new Map<string, StreamUpdate[]>();
-const PENDING_UPDATE_MAX_AGE_MS = 10_000;
-const PENDING_UPDATE_MAX_PER_MESSAGE = 500;
-
-function bufferPendingStreamUpdate(messageId: string, update: StreamUpdate): void {
-  let queue = pendingStreamUpdates.get(messageId);
-  if (!queue) {
-    queue = [];
-    pendingStreamUpdates.set(messageId, queue);
-  }
-  if (queue.length < PENDING_UPDATE_MAX_PER_MESSAGE) {
-    queue.push(update);
-  }
-}
-
-/**
- * 回放缓冲的 stream updates。
- * 在 timelineProjectionUpdated / sessionBootstrapLoaded 完成后调用，
- * 此时 timeline 中已有对应的消息节点，可以安全地应用增量补丁。
- */
-export function flushPendingStreamUpdates(): void {
-  if (pendingStreamUpdates.size === 0) return;
-  console.log('[STREAM_DEBUG] flushPendingStreamUpdates', {
-    pendingCount: pendingStreamUpdates.size,
-    messageIds: Array.from(pendingStreamUpdates.keys()),
-  });
-  const now = Date.now();
-  const keysToDelete: string[] = [];
-  for (const [messageId, queue] of pendingStreamUpdates) {
-    // 过期清理
-    if (queue.length > 0 && queue[0].timestamp && now - queue[0].timestamp > PENDING_UPDATE_MAX_AGE_MS) {
-      console.log('[STREAM_DEBUG] 过期清理', { messageId, age: now - queue[0].timestamp! });
-      keysToDelete.push(messageId);
-      continue;
-    }
-    const existingMessage = getTimelineMessageById(messageId);
-    if (!existingMessage) {
-      console.log('[STREAM_DEBUG] flush 时消息仍未找到', { messageId });
-      continue;
-    }
-    console.log('[STREAM_DEBUG] flush 回放', { messageId, queueLength: queue.length });
-    // 逐条回放
-    let currentMessage = existingMessage;
-    for (const update of queue) {
-      const patch = applyStreamUpdate(currentMessage, update);
-      if (Object.keys(patch).length > 0) {
-        applyTimelineStreamPatch(messageId, patch);
-        currentMessage = { ...currentMessage, ...patch };
-      }
-    }
-    keysToDelete.push(messageId);
-  }
-  for (const key of keysToDelete) {
-    pendingStreamUpdates.delete(key);
-  }
-}
 
 function handleStandardUpdate(message: ClientBridgeMessage) {
   const rawUpdate = message.update as StreamUpdate;
@@ -581,13 +751,6 @@ function handleStandardUpdate(message: ClientBridgeMessage) {
     throw new Error('[MessageHandler] 流式更新缺少 messageId');
   }
   const update = rawUpdate;
-
-  console.log('[STREAM_DEBUG] handleStandardUpdate', {
-    messageId: update.messageId,
-    updateType: update.updateType,
-    appendText: update.appendText?.substring(0, 40),
-    lifecycle: update.lifecycle,
-  });
 
   // 处理 lifecycle 变更
   if (typeof update.lifecycle === 'string' && update.lifecycle === 'completed') {
@@ -597,26 +760,33 @@ function handleStandardUpdate(message: ClientBridgeMessage) {
   // 应用增量内容更新（append/replace/block_update/lifecycle_change）
   if (update.updateType) {
     const existingMessage = getTimelineMessageById(update.messageId);
-    if (existingMessage) {
-      console.log('[STREAM_DEBUG] 找到消息，应用 patch', {
-        messageId: update.messageId,
-        existingContent: existingMessage.content?.substring(0, 40),
-        isStreaming: existingMessage.isStreaming,
-      });
-      const patch = applyStreamUpdate(existingMessage, update);
-      if (Object.keys(patch).length > 0) {
-        applyTimelineStreamPatch(update.messageId, patch);
-        console.log('[STREAM_DEBUG] patch 已应用', {
-          patchKeys: Object.keys(patch),
-          newContent: (patch.content as string)?.substring(0, 60),
-        });
-      } else {
-        console.warn('[STREAM_DEBUG] patch 为空！');
+    if (!existingMessage) {
+      console.error('[MessageHandler] 流式更新缺少时间轴锚点，拒绝静默丢弃:', update.messageId, update);
+      return;
+    }
+    const patch = applyStreamUpdate(existingMessage, update);
+    if (existingMessage.metadata?.isPlaceholder === true) {
+      const requestIdFromMessage = typeof existingMessage.metadata.requestId === 'string'
+        ? existingMessage.metadata.requestId
+        : '';
+      if (requestIdFromMessage) {
+        patch.metadata = buildRequestPlaceholderMetadata(
+          existingMessage.metadata as Record<string, unknown>,
+          patch.metadata && typeof patch.metadata === 'object'
+            ? patch.metadata as Record<string, unknown>
+            : undefined,
+          requestIdFromMessage,
+          !hasVisibleUserContent({
+            ...existingMessage,
+            ...patch,
+            content: patch.content ?? existingMessage.content,
+            blocks: patch.blocks ?? existingMessage.blocks,
+          }),
+        );
       }
-    } else {
-      // 时间线中尚无此消息（projection 还未到达），缓存等待回放
-      console.log('[STREAM_DEBUG] 消息未找到，缓存 update', { messageId: update.messageId });
-      bufferPendingStreamUpdate(update.messageId, update);
+    }
+    if (Object.keys(patch).length > 0) {
+      applyTimelineStreamPatch(update.messageId, patch);
     }
   }
 }
@@ -637,10 +807,63 @@ function handleStandardComplete(message: ClientBridgeMessage) {
 
   const requestId = (standard.metadata as Record<string, unknown> | undefined)?.requestId as string | undefined;
   const actualMessageId = standard.id;
+  const uiMessage = mapStandardMessage(standard);
+  const visibility = resolveTimelineVisibilityForStandard(standard);
+  const requestBinding = requestId ? getRequestBinding(requestId) : undefined;
+  const replaceMessageId = (
+    requestId
+    && canStandardMessageTakeOverRequestPlaceholder(standard)
+    && requestBinding?.placeholderMessageId
+    && requestBinding.placeholderMessageId !== standard.id
+  )
+    ? requestBinding.placeholderMessageId
+    : undefined;
+  const placeholderMessage = replaceMessageId
+    ? getTimelineMessageById(replaceMessageId)
+    : undefined;
+  const existingMessage = getTimelineMessageById(actualMessageId) || placeholderMessage;
+  const mergedBlocks = mergeCompleteBlocksForFinalization(
+    existingMessage?.blocks,
+    uiMessage.blocks,
+    uiMessage.blocks,
+  );
+  const completedMessageBase: Message = {
+    ...uiMessage,
+    isStreaming: false,
+    isComplete: true,
+    ...(mergedBlocks ? {
+      blocks: mergedBlocks,
+      content: blocksToContent(mergedBlocks),
+    } : {}),
+  };
+  const completedMessageBaseWithPlaceholder = (requestId && replaceMessageId)
+    ? buildPlaceholderTakeoverMessage(completedMessageBase, placeholderMessage, requestId)
+    : completedMessageBase;
+  const boundUserMessageId = requestBinding?.userMessageId
+    || (typeof (standard.metadata as Record<string, unknown> | undefined)?.userMessageId === 'string'
+      ? (standard.metadata as Record<string, unknown>).userMessageId as string
+      : undefined);
+  const completedMessage = (requestId && visibility.thread)
+    ? bindMessageToUserAnchor(completedMessageBaseWithPlaceholder, boundUserMessageId)
+    : completedMessageBaseWithPlaceholder;
+
+  if (replaceMessageId) {
+    markMessageComplete(replaceMessageId);
+  }
+  if (
+    hasRenderableContent(completedMessage)
+    || getTimelineMessageById(actualMessageId)
+    || placeholderMessage
+  ) {
+    const timelineMessage = upsertTimelineNode(
+      completedMessage,
+      visibility,
+      replaceMessageId ? { replaceMessageId } : {},
+    );
+    syncWorkerWaitResultsFromMessage(timelineMessage);
+  }
 
   markMessageComplete(actualMessageId);
-  // 消息已完成，清理可能残留的缓冲增量更新
-  pendingStreamUpdates.delete(actualMessageId);
 
   // 清理请求绑定
   if (requestId) {
@@ -648,6 +871,12 @@ function handleStandardComplete(message: ClientBridgeMessage) {
     const binding = getRequestBinding(requestId);
     if (binding?.timeoutId) {
       clearTimeout(binding.timeoutId);
+    }
+    if (binding) {
+      updateRequestBinding(requestId, {
+        realMessageId: actualMessageId,
+        timeoutId: undefined,
+      });
     }
     setTimeout(() => {
       clearRequestBinding(requestId);
@@ -732,56 +961,6 @@ function hasRenderableContent(message: Message): boolean {
 }
 
 
-
-function mergeCompleteBlocks(
-  existingBlocks: ContentBlock[] | undefined,
-  completeBlocks: ContentBlock[] | undefined,
-  baseBlocks: ContentBlock[] | undefined,
-): ContentBlock[] | undefined {
-  const safeExisting = ensureArray(existingBlocks).filter((block): block is ContentBlock => !!block && typeof block === 'object' && 'type' in block);
-  const safeComplete = ensureArray(completeBlocks).filter((block): block is ContentBlock => !!block && typeof block === 'object' && 'type' in block);
-
-  if (safeExisting.length > 0 && safeComplete.length > 0) {
-    // 流式已有内容时，complete 仅补充 existing 中不存在的结构化块（tool_call/thinking）。
-    // 不调用 mergeBlocks 避免 text 追加导致内容翻倍。
-    const existingToolIds = new Set(
-      safeExisting
-        .filter(b => b.type === 'tool_call' && b.toolCall?.id)
-        .map(b => b.toolCall!.id),
-    );
-    const existingThinkingIds = new Set(
-      safeExisting
-        .filter(b => b.type === 'thinking' && (b.id || b.thinking?.blockId))
-        .map(b => b.id || b.thinking!.blockId),
-    );
-
-    const supplements: ContentBlock[] = [];
-    for (const block of safeComplete) {
-      if (block.type === 'tool_call' && block.toolCall?.id) {
-        if (!existingToolIds.has(block.toolCall.id)) {
-          supplements.push(block);
-        }
-      } else if (block.type === 'thinking') {
-        const blockId = block.id || block.thinking?.blockId;
-        if (blockId && !existingThinkingIds.has(blockId)) {
-          supplements.push(block);
-        }
-      }
-      // text/code 等块不补充，流式已累积完整
-    }
-
-    return supplements.length > 0 ? [...safeExisting, ...supplements] : safeExisting;
-  }
-  if (safeExisting.length > 0) {
-    return safeExisting;
-  }
-  if (safeComplete.length > 0) {
-    return safeComplete;
-  }
-
-  const safeBase = ensureArray(baseBlocks).filter((block): block is ContentBlock => !!block && typeof block === 'object' && 'type' in block);
-  return safeBase.length > 0 ? safeBase : undefined;
-}
 
 function applyStreamUpdate(message: Message, update: StreamUpdate): Partial<Message> {
   const updates: Partial<Message> = {};

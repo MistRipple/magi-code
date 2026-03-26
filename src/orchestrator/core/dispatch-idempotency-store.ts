@@ -11,7 +11,8 @@ export interface DispatchIdempotencyRecord {
   missionId: string;
   taskId: string;
   worker: WorkerSlot;
-  category: string;
+  ownership: string;
+  mode: string;
   taskName: string;
   routingReason: string;
   degraded: boolean;
@@ -50,7 +51,8 @@ export interface DispatchIdempotencyClaimInput {
   missionId: string;
   taskId: string;
   worker: WorkerSlot;
-  category: string;
+  ownership: string;
+  mode: string;
   taskName: string;
   routingReason: string;
   degraded: boolean;
@@ -180,7 +182,8 @@ export class DispatchIdempotencyStore {
         missionId: input.missionId.trim(),
         taskId: input.taskId.trim(),
         worker: input.worker,
-        category: input.category.trim(),
+        ownership: this.normalizeOwnership(input.ownership),
+        mode: this.normalizeMode(input.mode),
         taskName: input.taskName.trim(),
         routingReason: input.routingReason.trim(),
         degraded: input.degraded === true,
@@ -282,28 +285,30 @@ export class DispatchIdempotencyStore {
     try {
       const raw = fs.readFileSync(this.filePath, 'utf-8');
       const parsed = JSON.parse(raw) as DispatchIdempotencyStoreFile;
-      const records = Array.isArray(parsed?.records) ? parsed.records : [];
+      const records = Array.isArray(parsed?.records) ? (parsed.records as unknown[]) : [];
       const now = Date.now();
       for (const item of records) {
         if (!item || typeof item !== 'object') {
           continue;
         }
-        if (!item.key || !item.taskId || !item.sessionId || !item.missionId) {
+        const rawRecord = item as Record<string, unknown>;
+        if (!rawRecord.key || !rawRecord.taskId || !rawRecord.sessionId || !rawRecord.missionId) {
           continue;
         }
         const record: DispatchIdempotencyRecord = {
-          key: String(item.key).trim(),
-          sessionId: String(item.sessionId).trim(),
-          missionId: String(item.missionId).trim(),
-          taskId: String(item.taskId).trim(),
-          worker: item.worker as WorkerSlot,
-          category: String(item.category || '').trim(),
-          taskName: String(item.taskName || '').trim(),
-          routingReason: String(item.routingReason || '').trim(),
-          degraded: item.degraded === true,
-          status: this.normalizeStatus(item.status),
-          createdAt: Number.isFinite(item.createdAt) ? Math.floor(item.createdAt) : now,
-          updatedAt: Number.isFinite(item.updatedAt) ? Math.floor(item.updatedAt) : now,
+          key: String(rawRecord.key).trim(),
+          sessionId: String(rawRecord.sessionId).trim(),
+          missionId: String(rawRecord.missionId).trim(),
+          taskId: String(rawRecord.taskId).trim(),
+          worker: rawRecord.worker as WorkerSlot,
+          ownership: this.normalizeOwnership(rawRecord.ownership, rawRecord.category),
+          mode: this.normalizeMode(rawRecord.mode),
+          taskName: String(rawRecord.taskName || '').trim(),
+          routingReason: String(rawRecord.routingReason || '').trim(),
+          degraded: rawRecord.degraded === true,
+          status: this.normalizeStatus(rawRecord.status),
+          createdAt: Number.isFinite(rawRecord.createdAt) ? Math.floor(Number(rawRecord.createdAt)) : now,
+          updatedAt: Number.isFinite(rawRecord.updatedAt) ? Math.floor(Number(rawRecord.updatedAt)) : now,
         };
         if (!record.key || !record.taskId || this.isExpired(record, now)) {
           continue;
@@ -326,6 +331,27 @@ export class DispatchIdempotencyStore {
       return input;
     }
     return 'dispatched';
+  }
+
+  private normalizeOwnership(input: unknown, legacyCategory?: unknown): string {
+    const normalized = typeof input === 'string' ? input.trim().toLowerCase() : '';
+    if (normalized) {
+      return normalized;
+    }
+    const legacy = typeof legacyCategory === 'string' ? legacyCategory.trim().toLowerCase() : '';
+    if (legacy === 'frontend'
+      || legacy === 'backend'
+      || legacy === 'integration'
+      || legacy === 'data_analysis'
+      || legacy === 'general') {
+      return legacy;
+    }
+    return 'general';
+  }
+
+  private normalizeMode(input: unknown): string {
+    const normalized = typeof input === 'string' ? input.trim().toLowerCase() : '';
+    return normalized || 'implement';
   }
 
   private isExpired(record: DispatchIdempotencyRecord, now: number): boolean {
