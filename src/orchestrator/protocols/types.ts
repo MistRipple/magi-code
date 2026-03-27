@@ -6,7 +6,7 @@
  * - Worker Agents：专职执行，向编排者汇报进度和结果
  */
 
-import { WorkerSlot, SubTask, PermissionMatrix, StrategyConfig } from '../../types';
+import { WorkerSlot, SubTask, StrategyConfig } from '../../types';
 
 // 重新导出统一类型
 export { SubTask, WorkerSlot };
@@ -77,8 +77,8 @@ export type OrchestratorState =
   | 'failed';
 
 
-/** 编排者配置 */
-export interface OrchestratorConfig {
+/** 编排者运行时配置（执行超时、验证、集成等） */
+export interface OrchestratorRuntimeConfig {
   /** 超时时间（毫秒） */
   timeout: number;
   /** 空闲超时时间（毫秒） */
@@ -122,8 +122,6 @@ export interface OrchestratorConfig {
     maxRounds?: number;
     worker?: WorkerSlot;
   };
-  /** 权限矩阵 */
-  permissions?: PermissionMatrix;
   /** 策略开关 */
   strategy?: StrategyConfig;
   /** 上下文注入配置 */
@@ -211,8 +209,6 @@ export interface RequirementAnalysis {
   includeThinking?: boolean;
   /** 本轮是否允许工具调用 */
   includeToolCalls?: boolean;
-  /** 本轮允许的工具白名单 */
-  allowedToolNames?: string[];
   /** 本轮历史注入策略 */
   historyMode?: 'session' | 'isolated';
   /** 是否需要修改文件 */

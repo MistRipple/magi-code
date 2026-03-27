@@ -111,9 +111,9 @@ export interface WorkerConfig {
 }
 
 /**
- * 编排者配置
+ * 编排者 LLM 配置（LLM 连接 + 推理参数）
  */
-export interface OrchestratorConfig {
+export interface OrchestratorLLMConfig {
   /** LLM 配置 */
   llm: LLMConfig;
   /** 最大 Token 数 */

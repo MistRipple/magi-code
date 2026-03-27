@@ -8,15 +8,15 @@
  */
 
 import { EventEmitter } from 'events';
-import type { WorkerSlot } from '../../types';
-import { logger, LogCategory } from '../../logging';
-import { t } from '../../i18n';
-import type { RequirementAnalysis } from '../protocols/types';
-import type { TaskOwnership, TaskMode } from '../profile/task-taxonomy';
+import type { WorkerSlot } from '../../../types';
+import { logger, LogCategory } from '../../../logging';
+import { t } from '../../../i18n';
+import type { RequirementAnalysis } from '../../protocols/types';
+import type { TaskOwnership, TaskMode } from '../../profile/task-taxonomy';
 import {
   mergeOrchestrationTraceLinks,
   type OrchestrationTraceLinks,
-} from '../trace/types';
+} from '../../trace/types';
 
 // ============================================================================
 // CancellationToken

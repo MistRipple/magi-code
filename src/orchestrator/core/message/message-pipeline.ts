@@ -6,9 +6,9 @@
  */
 
 import { EventEmitter } from 'events';
-import { logger, LogCategory } from '../../logging';
-import type { StandardMessage, ContentBlock, StreamUpdate, MessageSource } from '../../protocol/message-protocol';
-import { MessageType, MessageLifecycle, MessageCategory, createStandardMessage } from '../../protocol/message-protocol';
+import { logger, LogCategory } from '../../../logging';
+import type { StandardMessage, ContentBlock, StreamUpdate, MessageSource } from '../../../protocol/message-protocol';
+import { MessageType, MessageLifecycle, MessageCategory, createStandardMessage } from '../../../protocol/message-protocol';
 
 /** Pipeline 配置 */
 export interface PipelineConfig {

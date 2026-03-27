@@ -32,11 +32,7 @@ export interface AdapterOutputScope {
   /** 是否包含工具调用信息 */
   includeToolCalls?: boolean;
 
-  /**
-   * 临时允许的工具白名单（仅对当前请求生效）
-   * - 未提供：沿用适配器默认工具面
-   * - 提供空数组：等价于不允许任何工具
-   */
+  /** 显式限制本轮可调用的工具集合（留空表示由提示词决定） */
   allowedToolNames?: string[];
 
   /** 消息来源标识 */

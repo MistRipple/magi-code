@@ -1,4 +1,5 @@
 import type { LocaleCode } from '../i18n/types';
+import type { SafeguardConfig } from '../types';
 
 export type SettingsWorkerStatusSnapshot = Record<string, {
   status: string;
@@ -14,6 +15,7 @@ export interface SettingsBootstrapPayload {
   auxiliaryConfig: Record<string, unknown>;
   profileConfig: Record<string, unknown>;
   skillsConfig: Record<string, unknown>;
+  safeguardConfig: SafeguardConfig;
   repositories: unknown[];
   mcpServers: unknown[];
   workerStatuses: SettingsWorkerStatusSnapshot;

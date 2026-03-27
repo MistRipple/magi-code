@@ -11,26 +11,26 @@
  * - Phase C 汇总
  */
 
-import { logger, LogCategory } from '../../logging';
-import { t } from '../../i18n';
-import { GovernedKnowledgeContextService } from '../../knowledge/governed-knowledge-context-service';
-import { resolveTimelineAnchorTimestampFromMetadata } from '../../shared/timeline-ordering';
-import { raceWithTimeout } from '../../utils/race-with-timeout';
-import type { WorkerSlot } from '../../types';
-import type { TokenUsage } from '../../types/agent-types';
-import type { IAdapterFactory } from '../../adapters/adapter-factory-interface';
-import type { ProfileLoader } from '../profile/profile-loader';
+import { logger, LogCategory } from '../../../logging';
+import { t } from '../../../i18n';
+import { GovernedKnowledgeContextService } from '../../../knowledge/governed-knowledge-context-service';
+import { resolveTimelineAnchorTimestampFromMetadata } from '../../../shared/timeline-ordering';
+import { raceWithTimeout } from '../../../utils/race-with-timeout';
+import type { WorkerSlot } from '../../../types';
+import type { TokenUsage } from '../../../types/agent-types';
+import type { IAdapterFactory } from '../../../adapters/adapter-factory-interface';
+import type { ProfileLoader } from '../../profile/profile-loader';
 import {
   OwnershipGuard,
-} from '../profile/ownership-guard';
-import type { IAssignmentCompiler } from '../profile/assignment-compiler';
-import { AssignmentCompilerImpl, type OwnershipWorkerMapping } from '../profile/assignment-compiler-impl';
-import { type TaskOwnership, type TaskMode, getModeConstraints } from '../profile/task-taxonomy';
-import type { MessageHub } from './message-hub';
-import type { MissionOrchestrator } from './mission-orchestrator';
-import type { Assignment, AcceptanceCriterion, Constraint } from '../mission';
-import type { WorkerReport, OrchestratorResponse } from '../protocols/worker-report';
-import { createAdjustResponse } from '../protocols/worker-report';
+} from '../../profile/ownership-guard';
+import type { IAssignmentCompiler } from '../../profile/assignment-compiler';
+import { AssignmentCompilerImpl, type OwnershipWorkerMapping } from '../../profile/assignment-compiler-impl';
+import { type TaskOwnership, type TaskMode, getModeConstraints } from '../../profile/task-taxonomy';
+import type { MessageHub } from '../message/message-hub';
+import type { MissionOrchestrator } from '../mission-orchestrator';
+import type { Assignment, AcceptanceCriterion, Constraint } from '../../mission';
+import type { WorkerReport, OrchestratorResponse } from '../../protocols/worker-report';
+import { createAdjustResponse } from '../../protocols/worker-report';
 import {
   DispatchBatch,
   CancellationError,
@@ -43,22 +43,22 @@ import {
   type DispatchAuditIssue,
   type DispatchAuditLevel,
 } from './dispatch-batch';
-import type { RequirementAnalysis } from '../protocols/types';
+import type { RequirementAnalysis } from '../../protocols/types';
 import type {
   DispatchTaskHandler,
   WaitForWorkersResult,
   DispatchTaskCollaborationContracts,
   UpdateTodoStatus,
-} from '../../tools/orchestration-executor';
-import { buildDispatchSummaryPrompt } from '../prompts/orchestrator-prompts';
-import { MessageType } from '../../protocol/message-protocol';
-import { PlanningExecutor } from './executors/planning-executor';
+} from '../../../tools/orchestration-executor';
+import { buildDispatchSummaryPrompt } from '../../prompts/orchestrator-prompts';
+import { MessageType } from '../../../protocol/message-protocol';
+import { PlanningExecutor } from '../executors/planning-executor';
 import {
   selectClaimNextTodoCandidate,
-} from './claim-next-todo-affinity';
+} from '../claim-next-todo-affinity';
 import { WorkerPipeline } from './worker-pipeline';
-import type { SnapshotManager } from '../../snapshot-manager';
-import type { SupplementaryInstructionQueue } from './supplementary-instruction-queue';
+import type { SnapshotManager } from '../../../snapshot-manager';
+import type { SupplementaryInstructionQueue } from '../supplementary-instruction-queue';
 import {
   DispatchRoutingService,
 } from './dispatch-routing-service';
@@ -71,20 +71,21 @@ import { DispatchScheduler } from './dispatch-scheduler';
 import { DispatchBatchCoordinator } from './dispatch-batch-coordinator';
 import { DispatchReactiveWaitCoordinator } from './dispatch-reactive-wait-coordinator';
 import { DispatchPresentationAdapter } from './dispatch-presentation-adapter';
-import type { PlanMode } from '../plan-ledger';
+import type { PlanMode } from '../../plan-ledger';
 import {
   DispatchIdempotencyStore,
   type DispatchIdempotencyStatus,
 } from './dispatch-idempotency-store';
-import { isModelOriginIssue, toModelOriginUserMessage } from '../../errors/model-origin';
-import { trackModelOriginEvent } from '../../errors/model-origin-observability';
+import { isModelOriginIssue, toModelOriginUserMessage } from '../../../errors/model-origin';
+import { trackModelOriginEvent } from '../../../errors/model-origin-observability';
 import { createHash } from 'crypto';
 import {
   mergeOrchestrationTraceLinks,
   type OrchestrationTraceLinks,
-} from '../trace/types';
-import type { GitHost } from '../../host';
-import { hasHardReadOnlyIntent } from './request-classifier';
+} from '../../trace/types';
+import type { GitHost } from '../../../host';
+import { hasHardReadOnlyIntent } from '../request-classifier';
+import { DispatchCorrelationPlanner } from './dispatch-correlation-planner';
 
 interface DispatchFailureSemantic {
   failureCode: string;
@@ -126,20 +127,20 @@ export interface DispatchManagerDeps {
   ensureMissionForDispatch: () => Promise<string>;
   /** 获取当前对话轮次唯一标识（用于快照 missionId 分组） */
   getCurrentTurnId: () => string | null;
-  getProjectKnowledgeBase: () => import('../../knowledge/project-knowledge-base').ProjectKnowledgeBase | undefined;
+  getProjectKnowledgeBase: () => import('../../../knowledge/project-knowledge-base').ProjectKnowledgeBase | undefined;
   /** Worker 终态报告的 Wisdom 提取与持久化入口（由 MissionDrivenEngine 注入） */
   processWorkerWisdom: (report: WorkerReport) => void;
   // 治理依赖（WorkerPipeline 使用）
   getSnapshotManager: () => SnapshotManager | null;
-  getContextManager: () => import('../../context/context-manager').ContextManager | null;
-  getTodoManager: () => import('../../todo').TodoManager | null;
+  getContextManager: () => import('../../../context/context-manager').ContextManager | null;
+  getTodoManager: () => import('../../../todo').TodoManager | null;
   // Token 统计
   recordOrchestratorTokens: (usage?: TokenUsage, phase?: 'planning' | 'verification') => void;
-  recordWorkerTokenUsage: (results: Map<string, import('../worker').AutonomousExecutionResult>) => void;
+  recordWorkerTokenUsage: (results: Map<string, import('../../worker').AutonomousExecutionResult>) => void;
   // 补充指令队列（反应式编排：运行时注入 Worker 指令）
   getSupplementaryQueue: () => SupplementaryInstructionQueue | null;
   // Plan Ledger runtime 状态更新
-  getPlanLedger: () => import('../plan-ledger/plan-ledger-service').PlanLedgerService | null;
+  getPlanLedger: () => import('../../plan-ledger/plan-ledger-service').PlanLedgerService | null;
   getCurrentPlanId: () => string | null;
   // Plan Ledger 回写（dispatch 注册时落账）
   onDispatchTaskRegistered?: (payload: {
@@ -948,6 +949,9 @@ export class DispatchManager {
           degraded: baseDegraded,
           requiresModification,
           isolationMode: workspaceWriteIsolationMode,
+          files: normalizedFiles,
+          scopeHint: normalizedScopeHint,
+          collaborationContracts,
         });
         const effectiveDependsOn = writeIsolationPlan.dependsOn;
         const effectiveRoutingReason = writeIsolationPlan.routingReason;
@@ -2137,7 +2141,7 @@ export class DispatchManager {
       }
 
       // 记录 Worker Token 使用到 executionStats
-      const singleResult = new Map<string, import('../worker').AutonomousExecutionResult>();
+      const singleResult = new Map<string, import('../../worker').AutonomousExecutionResult>();
       singleResult.set(taskId, result);
       this.deps.recordWorkerTokenUsage(singleResult);
 
@@ -2948,11 +2952,15 @@ export class DispatchManager {
     degraded: boolean;
     requiresModification: boolean;
     isolationMode: WorkspaceWriteIsolationMode | null;
+    files?: string[];
+    scopeHint?: string[];
+    collaborationContracts: DispatchCollaborationContracts;
   }): {
     dependsOn?: string[];
     routingReason: string;
     degraded: boolean;
     addedDependencies: string[];
+    correlationReasons: string[];
   } {
     const normalizedDependsOn = input.dependsOn && input.dependsOn.length > 0
       ? [...new Set(input.dependsOn)]
@@ -2964,24 +2972,49 @@ export class DispatchManager {
         routingReason: input.routingReason,
         degraded: input.degraded,
         addedDependencies: [],
+        correlationReasons: [],
       };
     }
 
-    const serializedDependsOn = this.buildAutoSerializationDependenciesForWorkspaceSerialWrites(
-      input.batch,
-      normalizedDependsOn,
-    );
-    const addedDependencies = serializedDependsOn.filter(taskId =>
-      !(normalizedDependsOn || []).includes(taskId)
-    );
+    // 使用关联性规划器进行判定，而非全串行
+    const correlationPlanner = new DispatchCorrelationPlanner();
+    const correlationResult = correlationPlanner.plan({
+      batch: input.batch,
+      dependsOn: normalizedDependsOn,
+      files: input.files,
+      scopeHint: input.scopeHint,
+      collaborationContracts: input.collaborationContracts,
+    });
+
+    const addedDependencies = correlationResult.addedDependencies;
+    const correlationReasons = correlationResult.reasons;
     const baseReason = input.routingReason?.trim() || 'routing';
-    const downgradeReason = t('dispatch.notify.nonGitWriteSerializedReason');
+
+    if (addedDependencies.length === 0) {
+      // 无关联依赖，可并行执行
+      return {
+        dependsOn: normalizedDependsOn,
+        routingReason: baseReason,
+        degraded: input.degraded,
+        addedDependencies: [],
+        correlationReasons: [],
+      };
+    }
+
+    // 有关联依赖，注入串行依赖
+    const downgradeReason = correlationReasons.length > 0
+      ? t('dispatch.notify.nonGitCorrelationSerializedReason', {
+          count: addedDependencies.length,
+          reasons: correlationReasons.join(', '),
+        })
+      : t('dispatch.notify.nonGitWriteSerializedReason');
 
     return {
-      dependsOn: serializedDependsOn.length > 0 ? serializedDependsOn : undefined,
+      dependsOn: correlationResult.dependsOn,
       routingReason: `${baseReason}; ${downgradeReason}`,
       degraded: true,
       addedDependencies,
+      correlationReasons,
     };
   }
 

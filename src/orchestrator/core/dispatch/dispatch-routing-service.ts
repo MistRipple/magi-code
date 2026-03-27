@@ -1,6 +1,6 @@
-import type { WorkerSlot } from '../../types';
-import type { ProfileLoader } from '../profile/profile-loader';
-import { LLMConfigLoader } from '../../llm/config';
+import type { WorkerSlot } from '../../../types';
+import type { ProfileLoader } from '../../profile/profile-loader';
+import { LLMConfigLoader } from '../../../llm/config';
 
 interface WorkerAvailabilitySnapshot {
   availableWorkers: Set<WorkerSlot>;

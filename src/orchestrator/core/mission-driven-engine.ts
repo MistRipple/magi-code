@@ -17,7 +17,8 @@ import { SnapshotManager } from '../../snapshot-manager';
 import { ContextManager } from '../../context/context-manager';
 import { GovernedKnowledgeContextService } from '../../knowledge/governed-knowledge-context-service';
 import { logger, LogCategory } from '../../logging';
-import { PermissionMatrix, StrategyConfig, WorkerSlot, InteractionMode, INTERACTION_MODE_CONFIGS, InteractionModeConfig } from '../../types';
+import { LLMConfigLoader } from '../../llm/config';
+import { StrategyConfig, WorkerSlot, InteractionMode, INTERACTION_MODE_CONFIGS, InteractionModeConfig } from '../../types';
 import { TokenUsage } from '../../types/agent-types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
@@ -35,13 +36,13 @@ import {
   MissionContinuationPolicy,
 } from '../mission';
 import { ExecutionStats } from '../execution-stats';
-import { MessageHub } from './message-hub';
+import { MessageHub } from './message/message-hub';
 import { WisdomManager } from '../wisdom';
 import { buildAnalysisSystemPrompt, buildDirectResponseSystemPrompt, buildUnifiedSystemPrompt } from '../prompts/orchestrator-prompts';
 import { isAbortError } from '../../errors';
 import { ConfigManager, type OrchestratorGovernanceThresholdsConfig } from '../../config';
 import { SupplementaryInstructionQueue } from './supplementary-instruction-queue';
-import { DispatchManager } from './dispatch-manager';
+import { DispatchManager } from './dispatch/dispatch-manager';
 import { configureResilientAuxiliary } from './resilient-auxiliary-adapter';
 import {
   FileTerminationMetricsRepository,
@@ -75,9 +76,9 @@ import { resolveEffectiveMode, type EffectiveModeResolution } from './effective-
 import { classifyRequest } from './request-classifier';
 import {
   OrchestrationReadModelService,
-  OrchestrationRuntimeDiagnosticsService,
-  type OrchestrationRuntimeDiagnosticsQuery,
-  type OrchestrationRuntimeDiagnosticsSnapshot,
+  OrchestrationRuntimeStateService,
+  type OrchestrationRuntimeStateQuery,
+  type OrchestrationRuntimeStateSnapshot,
   OrchestrationTimelineStore,
   type MissionPlanScope,
   type OrchestrationStateDiff,
@@ -88,22 +89,22 @@ import {
 } from '../runtime';
 import type { ExecutionChainSessionSnapshot } from '../runtime/execution-chain-store';
 import type { ResumeSnapshot } from '../runtime/resume-snapshot-types';
-import { resolveOrchestrationEntry } from './orchestration-entry-router';
+import { resolveOrchestrationEntry } from './orchestration/orchestration-entry-router';
 import {
   OrchestrationPlanController,
   type OrchestrationPlanControllerDependencies,
-} from './orchestration-plan-controller';
+} from './orchestration/orchestration-plan-controller';
 import {
   OrchestrationRuntimeLoopController,
   type OrchestrationRuntimeLoopControllerDependencies,
-} from './orchestration-runtime-loop-controller';
+} from './orchestration/orchestration-runtime-loop-controller';
 import type {
   PlanGovernanceAssessment,
   ResolvedOrchestratorTerminationReason,
   RuntimeTerminationDecisionTraceEntry,
   RuntimeTerminationShadow,
   RuntimeTerminationSnapshot,
-} from './orchestration-control-plane-types';
+} from './orchestration/orchestration-control-plane-types';
 import {
   mergeOrchestrationTraceLinks,
   type OrchestrationTraceLinks,
@@ -136,7 +137,6 @@ export interface MissionDrivenEngineConfig {
     maxRounds?: number;
     worker?: WorkerSlot;
   };
-  permissions?: PermissionMatrix;
   strategy?: StrategyConfig;
 }
 
@@ -175,7 +175,7 @@ export class MissionDrivenEngine extends EventEmitter {
   private readonly planLedger: PlanLedgerService;
   private readonly readModelService: OrchestrationReadModelService;
   private readonly timelineStore: OrchestrationTimelineStore;
-  private readonly runtimeDiagnosticsService: OrchestrationRuntimeDiagnosticsService;
+  private readonly runtimeStateService: OrchestrationRuntimeStateService;
   private readonly planTimelineStateCache = new Map<string, Record<string, unknown>>();
   private profileLoader: ProfileLoader;
   private guidanceInjector: GuidanceInjector;
@@ -362,11 +362,12 @@ export class MissionDrivenEngine extends EventEmitter {
       }
     });
 
-    this.runtimeDiagnosticsService = new OrchestrationRuntimeDiagnosticsService(
+    this.runtimeStateService = new OrchestrationRuntimeStateService(
       this.missionStorage,
       this.planLedger,
       this.readModelService,
       this.timelineStore,
+      this.executionChainStore,
       this.workspaceRoot,
     );
     this.taskViewService = new TaskViewService(
@@ -2158,7 +2159,10 @@ export class MissionDrivenEngine extends EventEmitter {
   async initialize(): Promise<void> {
     // 加载画像配置
     await this.profileLoader.load();
-    this.applyToolPermissions();
+
+    // 加载安全防护配置
+    const safeguardConfig = LLMConfigLoader.loadSafeguardConfig();
+    this.adapterFactory.getToolManager().setSafeguardConfig(safeguardConfig);
 
     // 初始化 VerificationRunner
     if (this.config.strategy?.enableVerification) {
@@ -2179,20 +2183,6 @@ export class MissionDrivenEngine extends EventEmitter {
     this.dispatchManager.setupOrchestrationToolHandlers();
 
     logger.info('编排器.任务引擎.初始化.完成', undefined, LogCategory.ORCHESTRATOR);
-  }
-
-  /**
-   * 将引擎权限配置同步到 ToolManager（默认全开）
-   */
-  private applyToolPermissions(): void {
-    const permissions: PermissionMatrix = {
-      allowEdit: this.config.permissions?.allowEdit ?? true,
-      allowBash: this.config.permissions?.allowBash ?? true,
-      allowWeb: this.config.permissions?.allowWeb ?? true,
-    };
-
-    this.adapterFactory.getToolManager().setPermissions(permissions);
-    logger.info('编排器.工具权限.已同步', permissions, LogCategory.ORCHESTRATOR);
   }
 
   /**
@@ -2331,6 +2321,12 @@ export class MissionDrivenEngine extends EventEmitter {
             before: { status: 'idle' },
             after: { status: 'running' },
           }],
+        });
+        // 运行上下文在这里首次稳定：session/request/chain 已全部绑定完成。
+        // 由上层在这个时点发布 runtime state，确保前端面板在执行开始时即可出现。
+        this.emit('runtimeStateReady', {
+          sessionId: resolvedSessionId,
+          requestId: rootRequestId,
         });
         this.syncMessageHubSessionContext(resolvedSessionId);
         this.dispatchManager.resetForNewExecutionCycle();
@@ -2992,23 +2988,24 @@ export class MissionDrivenEngine extends EventEmitter {
     };
   }
 
-  async queryRuntimeDiagnostics(
-    input: Omit<OrchestrationRuntimeDiagnosticsQuery, 'liveRuntimeReason' | 'liveFinalStatus' | 'liveFailureReason' | 'liveErrors' | 'liveRuntimeSnapshot' | 'liveRuntimeDecisionTrace'>,
-  ): Promise<OrchestrationRuntimeDiagnosticsSnapshot | null> {
+  async queryRuntimeState(
+    input: Omit<OrchestrationRuntimeStateQuery, 'liveRuntimeReason' | 'liveFailureReason' | 'liveErrors' | 'liveRuntimeSnapshot' | 'liveRuntimeDecisionTrace' | 'livePhase' | 'liveProcessingState'>,
+  ): Promise<OrchestrationRuntimeStateSnapshot | null> {
     const sessionId = typeof input.sessionId === 'string' ? input.sessionId.trim() : '';
     if (!sessionId) {
       return null;
     }
     const shouldAttachLiveExecution = sessionId === (this.currentSessionId?.trim() || '');
-    return this.runtimeDiagnosticsService.query({
+    return this.runtimeStateService.query({
       ...input,
+      chainId: shouldAttachLiveExecution ? (this.activeChainId || undefined) : input.chainId,
       liveRuntimeReason: shouldAttachLiveExecution ? this.lastExecutionRuntimeReason : undefined,
-      liveFinalStatus: shouldAttachLiveExecution ? this.lastExecutionFinalStatus : undefined,
       liveFailureReason: shouldAttachLiveExecution ? this.lastExecutionErrors[0] : undefined,
       liveErrors: shouldAttachLiveExecution ? this.lastExecutionErrors : undefined,
       liveRuntimeSnapshot: shouldAttachLiveExecution ? this.lastExecutionRuntimeSnapshot : undefined,
       liveRuntimeDecisionTrace: shouldAttachLiveExecution ? this.lastExecutionRuntimeDecisionTrace : undefined,
-      updatedAt: Date.now(),
+      livePhase: shouldAttachLiveExecution ? this.phase : undefined,
+      liveProcessingState: shouldAttachLiveExecution ? this.messageHub.getProcessingState() : undefined,
     });
   }
 
@@ -4057,7 +4054,6 @@ export class MissionDrivenEngine extends EventEmitter {
         requestId: input.requestId,
         includeThinking: input.requirementAnalysis.includeThinking ?? false,
         includeToolCalls: input.requirementAnalysis.includeToolCalls ?? false,
-        allowedToolNames: input.requirementAnalysis.allowedToolNames,
         historyMode: input.requirementAnalysis.historyMode ?? 'isolated',
         systemPrompt,
         messageMetadata: { sessionId: this.currentSessionId },

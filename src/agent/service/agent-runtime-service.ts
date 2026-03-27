@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import type { WorkerSlot, UIState, WorkerStatus, PermissionMatrix, StrategyConfig } from '../../types';
+import type { WorkerSlot, UIState, WorkerStatus, StrategyConfig } from '../../types';
 import { UnifiedSessionManager, type SessionRuntimeNotificationState } from '../../session';
 import { resolveStandardMessageSessionBinding } from '../../session/standard-message-session-binding';
 import { SnapshotManager } from '../../snapshot-manager';
@@ -57,6 +57,33 @@ type RuntimeExecutionResult = {
   recoverable?: boolean;
 };
 
+type RuntimeTaskSubmissionResult = {
+  success: boolean;
+  accepted: boolean;
+  requestId?: string;
+  sessionId?: string;
+  taskId?: string;
+  queued?: boolean;
+  error?: string;
+};
+
+type PreparedTaskExecutionResult =
+  | {
+    success: false;
+    error: string;
+  }
+  | {
+    success: true;
+    prepared: PreparedTaskExecution;
+  };
+
+type PreparedTaskExecution = {
+  prompt: string;
+  requestId: string;
+  sessionId: string;
+  turnId: string;
+};
+
 type AgentRuntimeReason = ReturnType<MissionDrivenEngine['getLastExecutionStatus']>['runtimeReason'];
 
 type PendingRecoveryContext = {
@@ -102,11 +129,13 @@ export class AgentWorkspaceRuntime {
   private readonly queuedMessagesBySession = new Map<string, QueuedUserTurn[]>();
   private readonly runtimeQueryService = new OrchestrationRuntimeQueryService();
   private readonly runtimeHost: RuntimeHostContext;
+  private readonly inflightOperations = new Map<string, Promise<unknown>>();
   private runtimeInitializationPromise: Promise<void>;
   private activeSessionId: string | null = null;
   private interactionModeUpdatedAt = Date.now();
   private queuedMessagesDrainRunning = false;
   private pendingRecoveryContext: PendingRecoveryContext | null = null;
+  private submissionQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly options: AgentRuntimeOptions) {
     this.workspace = options.workspace;
@@ -126,11 +155,6 @@ export class AgentWorkspaceRuntime {
       }],
     });
     this.adapterFactory = new LLMAdapterFactory(this.runtimeHost);
-    const permissions: PermissionMatrix = {
-      allowEdit: true,
-      allowBash: true,
-      allowWeb: true,
-    };
     const strategy: StrategyConfig = {
       enableVerification: true,
       enableRecovery: true,
@@ -138,7 +162,7 @@ export class AgentWorkspaceRuntime {
     };
     this.orchestratorEngine = new MissionDrivenEngine(
       this.adapterFactory,
-      { timeout: 300000, maxRetries: 3, permissions, strategy },
+      { timeout: 300000, maxRetries: 3, strategy },
       this.runtimeHost,
     );
     const messageHub = this.orchestratorEngine.getMessageHub();
@@ -157,6 +181,9 @@ export class AgentWorkspaceRuntime {
       getMessageIdToRequestId: () => this.messageIdToRequestId,
       sendStateUpdate: () => {
         void this.sendStateUpdate();
+      },
+      sendRuntimeStateUpdate: (requestId?: string) => {
+        void this.sendRuntimeStateUpdate({ requestId });
       },
       sendData: (dataType, payload) => this.sendData(dataType, payload),
       sendToast: (msg, level, duration) => this.sendToast(msg, level, duration),
@@ -219,16 +246,53 @@ export class AgentWorkspaceRuntime {
   }
 
   async executeTask(prompt: string, sessionId?: string, requestId?: string): Promise<RuntimeExecutionResult> {
+    const preparation = await this.withSubmissionLock(() => this.prepareTaskExecution(prompt, sessionId, requestId));
+    if (!preparation.success) {
+      return { success: false, error: preparation.error };
+    }
+    return await this.runPreparedTaskExecution(preparation.prepared);
+  }
+
+  async submitTask(prompt: string, sessionId?: string, requestId?: string): Promise<RuntimeTaskSubmissionResult> {
+    const preparation = await this.withSubmissionLock(() => this.prepareTaskExecution(prompt, sessionId, requestId));
+    if (!preparation.success) {
+      return { success: false, accepted: false, error: preparation.error };
+    }
+    const { prepared } = preparation;
+    this.launchDetachedOperation(
+      `request:${prepared.requestId}`,
+      'Agent 异步提交任务',
+      async () => {
+        await this.runPreparedTaskExecution(prepared);
+      },
+    );
+    return {
+      success: true,
+      accepted: true,
+      requestId: prepared.requestId,
+      sessionId: prepared.sessionId,
+    };
+  }
+
+  private async prepareTaskExecution(
+    prompt: string,
+    sessionId?: string,
+    requestId?: string,
+  ): Promise<PreparedTaskExecutionResult> {
     await this.bindSession(sessionId);
     const effectivePrompt = typeof prompt === 'string' ? prompt : '';
     if (!effectivePrompt.trim()) {
       return { success: false, error: t('provider.errors.emptyPrompt') };
     }
+    const resolvedSessionId = this.activeSessionId?.trim() || this.sessionManager.getCurrentSession()?.id?.trim() || '';
+    if (!resolvedSessionId) {
+      return { success: false, error: '[AgentRuntimeService] prepareTaskExecution 缺少 activeSessionId' };
+    }
     const effectiveRequestId = requestId?.trim() || `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const turnId = `turn:${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
     const { userMessageId } = this.emitUserAndPlaceholder(effectiveRequestId, effectivePrompt, turnId);
 
-    this.sessionManager.addMessageToSession(this.activeSessionId!, 'user', effectivePrompt, undefined, 'orchestrator', undefined, {
+    this.sessionManager.addMessageToSession(resolvedSessionId, 'user', effectivePrompt, undefined, 'orchestrator', undefined, {
       id: userMessageId,
       type: 'user_input',
       metadata: {
@@ -236,29 +300,50 @@ export class AgentWorkspaceRuntime {
         requestId: effectiveRequestId,
       },
     });
-    void this.orchestratorEngine.recordContextMessage('user', effectivePrompt, this.activeSessionId!);
-    await this.sendStateUpdate();
-
+    void this.orchestratorEngine.recordContextMessage('user', effectivePrompt, resolvedSessionId);
     const messageHub = this.orchestratorEngine.getMessageHub();
-    let taskContext: { taskId: string; result: string } | null = null;
     messageHub.taskAccepted(effectiveRequestId);
     messageHub.sendControl(ControlMessageType.TASK_STARTED, {
       requestId: effectiveRequestId,
       timestamp: Date.now(),
     });
+    messageHub.forceProcessingState(true);
+    await this.sendStateUpdate();
+    await this.sendRuntimeStateUpdate({
+      sessionId: resolvedSessionId,
+      requestId: effectiveRequestId,
+    });
+
+    return {
+      success: true,
+      prepared: {
+        prompt: effectivePrompt,
+        requestId: effectiveRequestId,
+        sessionId: resolvedSessionId,
+        turnId,
+      },
+    };
+  }
+
+  private async runPreparedTaskExecution(
+    prepared: PreparedTaskExecution,
+  ): Promise<RuntimeExecutionResult> {
+    const { prompt, requestId, sessionId, turnId } = prepared;
+    const messageHub = this.orchestratorEngine.getMessageHub();
+    let taskContext: { taskId: string; result: string } | null = null;
 
     try {
       taskContext = await this.orchestratorEngine.executeWithTaskContext(
-        effectivePrompt,
-        this.activeSessionId!,
+        prompt,
+        sessionId,
         [],
         turnId,
-        effectiveRequestId,
+        requestId,
       );
       // normalizer 的流式消息已通过 unified:complete 路径持久化（含完整 blocks + metadata），
       // 不再额外调用 saveAssistantMessage，仅通过 recordContextMessage 记录上下文记忆。
       if (taskContext.result?.trim()) {
-        void this.orchestratorEngine.recordContextMessage('assistant', taskContext.result, this.activeSessionId!);
+        void this.orchestratorEngine.recordContextMessage('assistant', taskContext.result, sessionId);
       }
       const executionStatus = this.orchestratorEngine.getLastExecutionStatus();
       if (executionStatus.finalStatus !== 'completed') {
@@ -270,20 +355,10 @@ export class AgentWorkspaceRuntime {
         const recoverable = this.isRecoverableRuntimeReason(runtimeReason);
 
         messageHub.sendControl(ControlMessageType.TASK_FAILED, {
-          requestId: effectiveRequestId,
+          requestId,
           error: effectiveFailureReason,
           cancelled: runtimeReason === 'cancelled' || runtimeReason === 'external_abort',
           timestamp: Date.now(),
-        });
-        await this.publishOrchestratorRuntimeDiagnostics({
-          sessionId: this.activeSessionId || '',
-          requestId: effectiveRequestId,
-          runtimeReason,
-          finalStatus: executionStatus.finalStatus,
-          errors,
-          failureReason: effectiveFailureReason,
-          runtimeSnapshot: executionStatus.runtimeSnapshot,
-          runtimeDecisionTrace: executionStatus.runtimeDecisionTrace,
         });
         this.setPendingRecoveryFromExecution({
           result: {
@@ -294,10 +369,11 @@ export class AgentWorkspaceRuntime {
             failureReason: effectiveFailureReason,
             recoverable,
           },
-          prompt: effectivePrompt,
-          sessionId: this.activeSessionId || '',
+          prompt,
+          sessionId,
         });
         await this.sendStateUpdate();
+        await this.sendRuntimeStateUpdate({ sessionId, requestId });
         logger.warn('Agent 执行主链未完成即返回', {
           runtimeReason,
           finalStatus: executionStatus.finalStatus,
@@ -316,10 +392,11 @@ export class AgentWorkspaceRuntime {
       }
       this.clearPendingRecoveryState();
       messageHub.sendControl(ControlMessageType.TASK_COMPLETED, {
-        requestId: effectiveRequestId,
+        requestId,
         timestamp: Date.now(),
       });
       await this.sendStateUpdate();
+      await this.sendRuntimeStateUpdate({ sessionId, requestId });
       return {
         success: true,
         taskId: taskContext.taskId,
@@ -339,7 +416,7 @@ export class AgentWorkspaceRuntime {
       const recoverable = this.isRecoverableRuntimeReason(runtimeReason);
 
       messageHub.sendControl(ControlMessageType.TASK_FAILED, {
-        requestId: effectiveRequestId,
+        requestId,
         error: failureReason,
         timestamp: Date.now(),
       });
@@ -351,22 +428,12 @@ export class AgentWorkspaceRuntime {
         traceId,
         {
           metadata: {
-            requestId: effectiveRequestId,
-            ...(this.activeSessionId ? { sessionId: this.activeSessionId } : {}),
+            requestId,
+            ...(sessionId ? { sessionId } : {}),
           },
         },
       );
       messageHub.sendMessage(errorMessage);
-      await this.publishOrchestratorRuntimeDiagnostics({
-        sessionId: this.activeSessionId || '',
-        requestId: effectiveRequestId,
-        runtimeReason,
-        finalStatus: executionStatus.finalStatus,
-        errors,
-        failureReason: effectiveFailureReason,
-        runtimeSnapshot: executionStatus.runtimeSnapshot,
-        runtimeDecisionTrace: executionStatus.runtimeDecisionTrace,
-      });
       this.setPendingRecoveryFromExecution({
         result: {
           taskId: taskContext?.taskId || '',
@@ -376,10 +443,11 @@ export class AgentWorkspaceRuntime {
           failureReason: effectiveFailureReason,
           recoverable,
         },
-        prompt: effectivePrompt,
-        sessionId: this.activeSessionId || '',
+        prompt,
+        sessionId,
       });
       await this.sendStateUpdate();
+      await this.sendRuntimeStateUpdate({ sessionId, requestId });
       logger.error('Agent 执行主链失败', { error: failureReason }, LogCategory.AGENT);
       return {
         success: false,
@@ -392,7 +460,7 @@ export class AgentWorkspaceRuntime {
         recoverable,
       };
     } finally {
-      messageHub.finalizeRequestContext(effectiveRequestId);
+      messageHub.finalizeRequestContext(requestId);
       messageHub.forceProcessingState(false);
     }
   }
@@ -444,12 +512,31 @@ export class AgentWorkspaceRuntime {
       }
     }
     await this.sendStateUpdate();
+    await this.sendRuntimeStateUpdate();
   }
 
-  async startTask(taskId: string): Promise<void> {
+  async startTask(taskId: string): Promise<RuntimeTaskSubmissionResult> {
     await this.ensureInitialized();
-    await this.orchestratorEngine.startTaskById(taskId);
+    const normalizedTaskId = taskId.trim();
+    if (!normalizedTaskId) {
+      return { success: false, accepted: false, error: 'task_start_failed' };
+    }
+    this.launchDetachedOperation(
+      `task:start:${normalizedTaskId}`,
+      'Agent 异步启动任务',
+      async () => {
+        await this.orchestratorEngine.startTaskById(normalizedTaskId);
+        await this.sendStateUpdate();
+      },
+      async (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.error('Agent 启动任务失败', { taskId: normalizedTaskId, error: message }, LogCategory.AGENT);
+        this.sendToast(t('toast.taskStartFailed', { error: message }), 'error');
+        await this.sendStateUpdate();
+      },
+    );
     await this.sendStateUpdate();
+    return { success: true, accepted: true, taskId: normalizedTaskId };
   }
 
   async deleteTask(taskId: string): Promise<void> {
@@ -458,10 +545,28 @@ export class AgentWorkspaceRuntime {
     await this.sendStateUpdate();
   }
 
-  async resumeTask(taskId: string): Promise<void> {
+  async resumeTask(taskId: string): Promise<RuntimeTaskSubmissionResult> {
     await this.ensureInitialized();
-    await this.orchestratorEngine.startTaskById(taskId);
+    const normalizedTaskId = taskId.trim();
+    if (!normalizedTaskId) {
+      return { success: false, accepted: false, error: 'task_resume_failed' };
+    }
+    this.launchDetachedOperation(
+      `task:resume:${normalizedTaskId}`,
+      'Agent 异步恢复任务',
+      async () => {
+        await this.orchestratorEngine.startTaskById(normalizedTaskId);
+        await this.sendStateUpdate();
+      },
+      async (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.error('Agent 恢复任务失败', { taskId: normalizedTaskId, error: message }, LogCategory.AGENT);
+        this.sendToast(t('toast.taskResumeFailed', { error: message }), 'error');
+        await this.sendStateUpdate();
+      },
+    );
     await this.sendStateUpdate();
+    return { success: true, accepted: true, taskId: normalizedTaskId };
   }
 
   async abandonChain(chainId: string): Promise<{ abandoned: boolean }> {
@@ -491,8 +596,8 @@ export class AgentWorkspaceRuntime {
       return { queued: true, queueId: queued.id };
     }
     const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const result = await this.executeTask(effectiveContent, sessionId, requestId);
-    if (!result.success) {
+    const result = await this.submitTask(effectiveContent, sessionId, requestId);
+    if (!result.success || !result.accepted) {
       this.sendToast(t('toast.supplementFailed'), 'error');
     }
     return { queued: false };
@@ -871,6 +976,10 @@ export class AgentWorkspaceRuntime {
       interactionMode: this.orchestratorEngine.getInteractionMode(),
       interactionModeUpdatedAt: this.interactionModeUpdatedAt,
       orchestratorPhase: this.orchestratorEngine.phase,
+      processingState: {
+        ...this.orchestratorEngine.getMessageHub().getProcessingState(),
+        pendingRequestIds: [],
+      },
       activePlan: activePlan ?? undefined,
       planHistory,
       stateUpdatedAt: Date.now(),
@@ -912,6 +1021,41 @@ export class AgentWorkspaceRuntime {
     this.activeSessionId = traceId;
     this.orchestratorEngine.getMessageHub().setSessionId(traceId);
     this.orchestratorEngine.getMessageHub().setTraceId(traceId);
+  }
+
+  private withSubmissionLock<T>(runner: () => Promise<T>): Promise<T> {
+    const next = this.submissionQueue.then(runner, runner);
+    this.submissionQueue = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
+  private launchDetachedOperation(
+    key: string,
+    label: string,
+    runner: () => Promise<void>,
+    onError?: (error: unknown) => Promise<void> | void,
+  ): void {
+    if (this.inflightOperations.has(key)) {
+      return;
+    }
+    const operation = runner()
+      .catch(async (error) => {
+        if (onError) {
+          await onError(error);
+          return;
+        }
+        logger.error(label, {
+          error: error instanceof Error ? error.message : String(error),
+          key,
+        }, LogCategory.AGENT);
+      })
+      .finally(() => {
+        this.inflightOperations.delete(key);
+      });
+    this.inflightOperations.set(key, operation);
   }
 
   private emit(message: ClientBridgeMessage): void {
@@ -971,13 +1115,13 @@ export class AgentWorkspaceRuntime {
       });
   }
 
-  async getRuntimeDiagnostics(sessionId?: string): Promise<Record<string, unknown> | null> {
+  async getRuntimeState(sessionId?: string): Promise<Record<string, unknown> | null> {
     const resolvedSessionId = this.resolveTargetSessionId(sessionId);
     if (!resolvedSessionId) {
       return null;
     }
-    const diagnostics = await this.orchestratorEngine.queryRuntimeDiagnostics({ sessionId: resolvedSessionId });
-    return diagnostics as unknown as Record<string, unknown> | null;
+    const runtimeState = await this.orchestratorEngine.queryRuntimeState({ sessionId: resolvedSessionId });
+    return runtimeState as unknown as Record<string, unknown> | null;
   }
 
   buildExecutionChainSummary(sessionId?: string): ExecutionChainBootstrapSummary | undefined {
@@ -1136,6 +1280,25 @@ export class AgentWorkspaceRuntime {
     this.sendData('stateUpdate', { state });
   }
 
+  private async sendRuntimeStateUpdate(options: {
+    sessionId?: string;
+    requestId?: string;
+  } = {}): Promise<void> {
+    const sessionId = (options.sessionId || this.activeSessionId || this.sessionManager.getCurrentSession()?.id || '').trim();
+    if (!sessionId) {
+      return;
+    }
+    const runtimeState = await this.orchestratorEngine.queryRuntimeState({
+      sessionId,
+      ...(typeof options.requestId === 'string' && options.requestId.trim().length > 0
+        ? { requestId: options.requestId.trim() }
+        : {}),
+    });
+    if (runtimeState) {
+      this.sendData('orchestratorRuntimeState', runtimeState as unknown as Record<string, unknown>);
+    }
+  }
+
   private clearPendingRecoveryState(): void {
     this.pendingRecoveryContext = null;
   }
@@ -1156,36 +1319,6 @@ export class AgentWorkspaceRuntime {
         return t('provider.userCancelled');
       default:
         return normalizedError || t('provider.executionFailed');
-    }
-  }
-
-  private async publishOrchestratorRuntimeDiagnostics(input: {
-    sessionId: string;
-    requestId?: string;
-    runtimeReason: AgentRuntimeReason;
-    finalStatus: ReturnType<MissionDrivenEngine['getLastExecutionStatus']>['finalStatus'];
-    errors: string[];
-    failureReason?: string;
-    runtimeSnapshot: ReturnType<MissionDrivenEngine['getLastExecutionStatus']>['runtimeSnapshot'];
-    runtimeDecisionTrace: ReturnType<MissionDrivenEngine['getLastExecutionStatus']>['runtimeDecisionTrace'];
-  }): Promise<void> {
-    const sessionId = input.sessionId.trim();
-    if (!sessionId) {
-      return;
-    }
-    const diagnostics = await this.orchestratorEngine.queryRuntimeDiagnostics({
-      sessionId,
-      requestId: input.requestId,
-    });
-    if (diagnostics) {
-      this.sendData('orchestratorRuntimeDiagnostics', diagnostics as unknown as Record<string, unknown>);
-    } else {
-      logger.warn('AgentRuntime.运行态诊断缺失', {
-        sessionId,
-        requestId: input.requestId,
-        runtimeReason: input.runtimeReason,
-        finalStatus: input.finalStatus,
-      }, LogCategory.AGENT);
     }
   }
 

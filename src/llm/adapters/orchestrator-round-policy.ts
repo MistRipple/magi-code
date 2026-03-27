@@ -179,6 +179,19 @@ export function decideNoTodoPlainResponseAction(input: {
   const hasOutcomeSignal = input.normalizedOutcomeStepCount > 0 || Boolean(input.outcomeStatus);
   const requiresGovernedOutcome = input.explicitOrchestrationRequest || hasToolEvidence;
 
+  if (input.explicitOrchestrationRequest && !hasToolEvidence) {
+    const nextMissingOutcomeStreak = input.noTodoOutcomeMissingStreak + 1;
+    return nextMissingOutcomeStreak >= 2
+      ? {
+          action: 'terminate_failed',
+          nextMissingOutcomeStreak,
+        }
+      : {
+          action: 'continue_with_prompt',
+          nextMissingOutcomeStreak,
+        };
+  }
+
   if (!input.assistantText.trim()) {
     return {
       action: 'request_outcome_block',

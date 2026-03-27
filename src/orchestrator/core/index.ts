@@ -21,14 +21,14 @@ export {
   type OrchestrationPlanControllerDependencies,
   type ResolveExecutionPlanInput,
   type ResolveExecutionPlanResult,
-} from './orchestration-plan-controller';
+} from './orchestration/orchestration-plan-controller';
 
 export {
   OrchestrationRuntimeLoopController,
   type OrchestrationRuntimeLoopControllerDependencies,
   type RuntimeLoopInput,
   type RuntimeLoopResult,
-} from './orchestration-runtime-loop-controller';
+} from './orchestration/orchestration-runtime-loop-controller';
 
 export {
   OrchestrationDeliveryController,
@@ -36,7 +36,7 @@ export {
   type DeliveryRoundResult,
   type DeliveryRoundState,
   type OrchestrationDeliveryControllerDependencies,
-} from './orchestration-delivery-controller';
+} from './orchestration/orchestration-delivery-controller';
 
 export {
   OrchestrationRecoveryCoordinator,
@@ -44,7 +44,7 @@ export {
   type RecoveryCoordinationInput,
   type RecoveryCoordinationResult,
   type RecoveryLoopState,
-} from './orchestration-recovery-coordinator';
+} from './orchestration/orchestration-recovery-coordinator';
 
 export {
   DispatchProtocolManager,
@@ -52,28 +52,28 @@ export {
   type DispatchExecutionProtocolState,
   type DispatchProtocolManagerDeps,
   type DispatchProtocolTimeoutPayload,
-} from './dispatch-protocol-manager';
+} from './dispatch/dispatch-protocol-manager';
 
 export {
   DispatchScheduler,
   type DispatchExecutionWorkerResolution,
   type DispatchSchedulerDeps,
-} from './dispatch-scheduler';
+} from './dispatch/dispatch-scheduler';
 
 export {
   DispatchBatchCoordinator,
   type DispatchBatchCoordinatorDeps,
-} from './dispatch-batch-coordinator';
+} from './dispatch/dispatch-batch-coordinator';
 
 export {
   DispatchReactiveWaitCoordinator,
   type DispatchReactiveWaitCoordinatorDeps,
-} from './dispatch-reactive-wait-coordinator';
+} from './dispatch/dispatch-reactive-wait-coordinator';
 
 export {
   DispatchPresentationAdapter,
   type DispatchPresentationAdapterDeps,
-} from './dispatch-presentation-adapter';
+} from './dispatch/dispatch-presentation-adapter';
 
 export {
   FileRequestClassificationCalibrationStore,
@@ -106,7 +106,7 @@ export {
   type RuntimeTerminationDecisionTraceEntry,
   type RuntimeTerminationShadow,
   type RuntimeTerminationSnapshot,
-} from './orchestration-control-plane-types';
+} from './orchestration/orchestration-control-plane-types';
 
 // 统一消息出口
 export {
@@ -114,4 +114,4 @@ export {
   globalMessageHub,
   type SubTaskCardPayload,
   type MessageHubEvents,
-} from './message-hub';
+} from './message/message-hub';

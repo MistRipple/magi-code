@@ -1,6 +1,6 @@
 <script lang="ts">
   import type {
-    OrchestratorRuntimeDiagnostics,
+    OrchestratorRuntimeState,
     OrchestratorRuntimeDecisionTraceEntry,
   } from '../types/message';
   import Icon from './Icon.svelte';
@@ -8,16 +8,16 @@
   import { i18n } from '../stores/i18n.svelte';
 
   interface Props {
-    diagnostics: OrchestratorRuntimeDiagnostics | null;
+    runtimeState: OrchestratorRuntimeState | null;
   }
 
-  let { diagnostics }: Props = $props();
+  let { runtimeState }: Props = $props();
 
   type KnowledgeAuditEntry =
-    NonNullable<NonNullable<OrchestratorRuntimeDiagnostics['opsView']>['knowledgeAudit']>['recentEntries'][number];
+    NonNullable<NonNullable<OrchestratorRuntimeState['opsView']>['knowledgeAudit']>['recentEntries'][number];
 
   const recentTrace = $derived.by(() => {
-    const trace = diagnostics?.runtimeDecisionTrace;
+    const trace = runtimeState?.runtimeDecisionTrace;
     if (!Array.isArray(trace) || trace.length === 0) {
       return [] as OrchestratorRuntimeDecisionTraceEntry[];
     }
@@ -25,12 +25,12 @@
   });
 
   const failureReason = $derived.by(() => {
-    const raw = diagnostics?.failureReason;
+    const raw = runtimeState?.failureReason;
     return typeof raw === 'string' && raw.trim().length > 0 ? raw.trim() : '';
   });
 
   const failureErrors = $derived.by(() => {
-    const errors = diagnostics?.errors;
+    const errors = runtimeState?.errors;
     if (!Array.isArray(errors)) {
       return [] as string[];
     }
@@ -40,7 +40,7 @@
       .filter((item, index, arr) => arr.indexOf(item) === index);
   });
 
-  const opsView = $derived.by(() => diagnostics?.opsView || null);
+  const opsView = $derived.by(() => runtimeState?.opsView || null);
   const knowledgeAudit = $derived.by(() => opsView?.knowledgeAudit || null);
 
   const scopeEntries = $derived.by(() => {
@@ -83,8 +83,34 @@
 
   const recentTimeline = $derived.by(() => Array.isArray(opsView?.recentTimeline) ? opsView.recentTimeline : []);
   const recentStateDiffs = $derived.by(() => Array.isArray(opsView?.recentStateDiffs) ? opsView.recentStateDiffs : []);
-  const assignmentSummaries = $derived.by(() => Array.isArray(opsView?.assignments) ? opsView.assignments : []);
+  const assignmentSummaries = $derived.by(() => Array.isArray(runtimeState?.assignments) ? runtimeState.assignments : []);
   const failureRootCause = $derived.by(() => opsView?.failureRootCause || null);
+
+  const summaryEntries = $derived.by(() => {
+    if (!runtimeState) {
+      return [] as Array<{ label: string; value: string }>;
+    }
+    const entries: Array<{ label: string; value: string }> = [
+      { label: i18n.t('runtimeState.summary.phase'), value: runtimeState.phase },
+      { label: i18n.t('runtimeState.summary.lastEventAt'), value: formatDateTime(runtimeState.lastEventAt) },
+    ];
+    if (runtimeState.startedAt) {
+      entries.push({ label: i18n.t('runtimeState.summary.startedAt'), value: formatDateTime(runtimeState.startedAt) });
+    }
+    if (runtimeState.statusReason) {
+      entries.push({ label: i18n.t('runtimeState.summary.reason'), value: runtimeState.statusReason });
+    }
+    if (runtimeState.chain?.chainId) {
+      entries.push({
+        label: i18n.t('runtimeState.summary.chain'),
+        value: `${runtimeState.chain.chainId} · ${runtimeState.chain.status}`,
+      });
+    }
+    if (runtimeState.canResume) {
+      entries.push({ label: i18n.t('runtimeState.summary.resume'), value: i18n.t('runtimeState.resume.ready') });
+    }
+    return entries;
+  });
 
   const recoveryEntries = $derived.by(() => {
     const recovery = opsView?.recovery;
@@ -118,40 +144,49 @@
 
   // 状态图标
   const statusIcon = $derived.by((): IconName => {
-    switch (diagnostics?.finalStatus) {
+    switch (runtimeState?.status) {
+      case 'idle': return 'circle';
+      case 'running': return 'loader';
+      case 'waiting': return 'clock';
+      case 'paused': return 'taskPending';
       case 'completed': return 'taskComplete';
       case 'failed': return 'taskFailed';
       case 'cancelled': return 'stop';
-      case 'paused': return 'taskPending';
       default: return 'loader';
     }
   });
 
   // 状态翻译文本
   const statusLabel = $derived.by(() => {
-    switch (diagnostics?.finalStatus) {
-      case 'completed': return i18n.t('runtimeDiagnostics.status.completed');
-      case 'failed': return i18n.t('runtimeDiagnostics.status.failed');
-      case 'cancelled': return i18n.t('runtimeDiagnostics.status.cancelled');
-      case 'paused': return i18n.t('runtimeDiagnostics.status.paused');
-      default: return i18n.t('runtimeDiagnostics.status.pending');
+    switch (runtimeState?.status) {
+      case 'idle': return i18n.t('runtimeState.status.idle');
+      case 'running': return i18n.t('runtimeState.status.running');
+      case 'waiting': return i18n.t('runtimeState.status.waiting');
+      case 'paused': return i18n.t('runtimeState.status.paused');
+      case 'completed': return i18n.t('runtimeState.status.completed');
+      case 'failed': return i18n.t('runtimeState.status.failed');
+      case 'cancelled': return i18n.t('runtimeState.status.cancelled');
+      default: return i18n.t('runtimeState.status.idle');
     }
   });
 
   // 状态对应的 CSS modifier
   const statusModifier = $derived.by(() => {
-    switch (diagnostics?.finalStatus) {
+    switch (runtimeState?.status) {
+      case 'idle': return 'idle';
+      case 'running': return 'running';
+      case 'waiting': return 'waiting';
+      case 'paused': return 'paused';
       case 'completed': return 'completed';
       case 'failed': return 'failed';
       case 'cancelled': return 'cancelled';
-      case 'paused': return 'paused';
-      default: return 'pending';
+      default: return 'idle';
     }
   });
 
   // 任务进度计算
   const taskProgress = $derived.by(() => {
-    const snap = diagnostics?.runtimeSnapshot;
+    const snap = runtimeState?.runtimeSnapshot;
     if (!snap) return null;
     const total = snap.requiredTotal ?? 0;
     const failed = snap.failedRequired ?? 0;
@@ -282,17 +317,32 @@
   }
 </script>
 
-{#if diagnostics}
+{#if runtimeState}
   <details class="runtime-diagnostics runtime-diagnostics--{statusModifier}">
     <summary>
       <Icon name={statusIcon} size={13} class="summary__icon" />
-      <span class="summary__title">{i18n.t('runtimeDiagnostics.title')}</span>
+      <span class="summary__title">{i18n.t('runtimeState.title')}</span>
       <span class="summary__badge summary__badge--{statusModifier}">{statusLabel}</span>
-      <span class="summary__time">{formatTimestamp(diagnostics.updatedAt)}</span>
+      <span class="summary__phase">{runtimeState.phase}</span>
+      <span class="summary__time">{formatTimestamp(runtimeState.lastEventAt)}</span>
     </summary>
     <div class="runtime-diagnostics__content">
-      {#if diagnostics.runtimeSnapshot}
-        {@const snap = diagnostics.runtimeSnapshot}
+      {#if summaryEntries.length > 0}
+        <div class="runtime-diagnostics__block">
+          <div class="runtime-diagnostics__label">{i18n.t('runtimeState.summary.title')}</div>
+          <div class="runtime-diagnostics__kv-grid">
+            {#each summaryEntries as item}
+              <div class="runtime-diagnostics__kv-item">
+                <div class="runtime-diagnostics__kv-label">{item.label}</div>
+                <div class="runtime-diagnostics__kv-value">{item.value}</div>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+      {#if runtimeState.runtimeSnapshot}
+        {@const snap = runtimeState.runtimeSnapshot}
         <div class="metrics-grid">
           {#if taskProgress && taskProgress.total > 0}
             <div class="metric-card">
@@ -368,7 +418,7 @@
         </div>
       {/if}
 
-      {#if diagnostics.finalStatus === 'failed' && (failureReason || failureErrors.length > 0)}
+      {#if runtimeState.status === 'failed' && (failureReason || failureErrors.length > 0)}
         <div class="runtime-diagnostics__block runtime-diagnostics__block--failure">
           <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.failureTitle')}</div>
           {#if failureReason}
@@ -579,8 +629,10 @@
   .runtime-diagnostics--completed { border-left-color: #4ec995; }
   .runtime-diagnostics--failed    { border-left-color: var(--vscode-editorError-foreground, var(--error)); }
   .runtime-diagnostics--cancelled { border-left-color: var(--vscode-editorWidget-border, var(--border)); }
+  .runtime-diagnostics--idle      { border-left-color: var(--vscode-editorWidget-border, var(--border)); }
+  .runtime-diagnostics--running   { border-left-color: var(--vscode-progressBar-background, var(--info)); }
+  .runtime-diagnostics--waiting   { border-left-color: var(--vscode-editorWarning-foreground, var(--warning)); }
   .runtime-diagnostics--paused    { border-left-color: var(--vscode-editorWarning-foreground, var(--warning)); }
-  .runtime-diagnostics--pending   { border-left-color: var(--vscode-progressBar-background, var(--info)); }
 
   .runtime-diagnostics > summary {
     cursor: pointer;
@@ -612,6 +664,18 @@
     background: rgba(78, 201, 149, 0.18);
     color: #4ec995;
   }
+  .summary__badge--idle {
+    background: rgba(140, 140, 140, 0.18);
+    color: #999;
+  }
+  .summary__badge--running {
+    background: rgba(14, 112, 192, 0.18);
+    color: var(--vscode-textLink-foreground, var(--info));
+  }
+  .summary__badge--waiting {
+    background: rgba(204, 167, 0, 0.18);
+    color: var(--vscode-editorWarning-foreground, var(--warning));
+  }
   .summary__badge--failed {
     background: rgba(244, 135, 113, 0.18);
     color: var(--vscode-editorError-foreground, var(--error));
@@ -624,9 +688,11 @@
     background: rgba(204, 167, 0, 0.18);
     color: var(--vscode-editorWarning-foreground, var(--warning));
   }
-  .summary__badge--pending {
-    background: rgba(14, 112, 192, 0.18);
-    color: var(--vscode-textLink-foreground, var(--info));
+
+  .summary__phase {
+    font-size: 11px;
+    opacity: 0.65;
+    font-family: var(--vscode-editor-font-family, monospace);
   }
 
   .summary__time {

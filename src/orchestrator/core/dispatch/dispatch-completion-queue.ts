@@ -1,5 +1,5 @@
-import { logger, LogCategory } from '../../logging';
-import type { WorkerCompletionResult, WaitForWorkersResult } from '../../tools/orchestration-executor';
+import { logger, LogCategory } from '../../../logging';
+import type { WorkerCompletionResult, WaitForWorkersResult } from '../../../tools/orchestration-executor';
 import type { DispatchBatch, DispatchEntry, DispatchStatus } from './dispatch-batch';
 import { isTerminalStatus } from './dispatch-batch';
 

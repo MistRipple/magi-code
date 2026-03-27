@@ -1,6 +1,6 @@
-import { logger, LogCategory } from '../../logging';
-import type { MessageHub } from './message-hub';
-import { isNonBlockingVerificationWarning, type VerificationRunner } from '../verification-runner';
+import { logger, LogCategory } from '../../../logging';
+import type { MessageHub } from '../message/message-hub';
+import { isNonBlockingVerificationWarning, type VerificationRunner } from '../../verification-runner';
 import type { DispatchBatch } from './dispatch-batch';
 import type {
   AcceptanceBaseVerificationReport,
@@ -8,17 +8,17 @@ import type {
   AcceptanceCriterion,
   AcceptanceExecutionReport,
   AcceptanceExecutionSkippedReason,
-} from '../mission/types';
+} from '../../mission/types';
 import {
   createDefaultValidatorRegistry,
   createProcessVerificationCommandRunner,
   type VerificationCustomValidator,
   type ValidatorRegistry,
-} from './validator-registry';
+} from '../validator-registry';
 import {
   buildVerificationId,
   mergeOrchestrationTraceLinks,
-} from '../trace/types';
+} from '../../trace/types';
 
 const defaultValidatorRegistry = createDefaultValidatorRegistry();
 const defaultVerificationCommandRunner = createProcessVerificationCommandRunner();

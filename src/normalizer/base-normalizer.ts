@@ -194,6 +194,19 @@ export abstract class BaseNormalizer extends EventEmitter {
     this.emit(MESSAGE_EVENTS.UPDATE, update);
   }
 
+  sanitizePendingText(messageId: string, sanitizer: (text: string) => string): void {
+    const context = this.activeContexts.get(messageId);
+    if (!context) {
+      this.debug(`[${this.agent}] 未找到消息上下文: ${messageId}`);
+      return;
+    }
+    const next = sanitizer(context.pendingText);
+    if (typeof next !== 'string' || next === context.pendingText) {
+      return;
+    }
+    context.pendingText = next;
+  }
+
   /**
    * 处理 thinking 内容（用于流式 thinking 输出）
    */

@@ -129,7 +129,7 @@ export type DataMessageType =
   | 'missionPlanned'
   | 'modelListFetched'
   | 'orchestratorConnectionTestResult'
-  | 'orchestratorRuntimeDiagnostics'
+  | 'orchestratorRuntimeState'
   | 'profileConfigReset'
   | 'profileConfigSaved'
   | 'projectKnowledgeLoaded'

@@ -32,7 +32,7 @@ import { ADAPTER_EVENTS, PROCESSING_EVENTS, WEBVIEW_MESSAGE_TYPES } from '../pro
 import { globalEventBus } from '../events';
 import type { IAdapterFactory } from '../adapters/adapter-factory-interface';
 import type { MissionDrivenEngine } from '../orchestrator/core';
-import type { MessageHub } from '../orchestrator/core/message-hub';
+import type { MessageHub } from '../orchestrator/core/message/message-hub';
 import type { MissionOrchestrator } from '../orchestrator/core';
 import { normalizeTodos, generateEntityId } from '../orchestrator/mission/data-normalizer';
 import { isModelOriginIssue, toModelOriginUserMessage } from '../errors/model-origin';
@@ -55,6 +55,7 @@ export interface EventBindingContext {
 
   // UI 方法
   sendStateUpdate(): void;
+  sendRuntimeStateUpdate(requestId?: string): void;
   sendData(dataType: DataMessageType, payload: Record<string, unknown>): void;
   sendToast(message: string, level: NotifyLevel, duration?: number): void;
   sendExecutionStats(): void;
@@ -124,10 +125,12 @@ export class EventBindingService {
     // Mission 生命周期
     mo.on('missionCreated', () => {
       this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
     });
 
     mo.on('missionDeleted', () => {
       this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
     });
 
     mo.on('missionStatusChanged', (data) => {
@@ -140,6 +143,7 @@ export class EventBindingService {
         });
       }
       this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
       if (newStatus === 'completed' || newStatus === 'failed' || newStatus === 'cancelled') {
         this.ctx.tryResumePendingRecovery();
       }
@@ -147,6 +151,7 @@ export class EventBindingService {
 
     mo.on('missionDeliveryChanged', () => {
       this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
     });
 
     // Assignment 事件
@@ -159,6 +164,7 @@ export class EventBindingService {
         sessionId: this.ctx.getActiveSessionId(),
       });
       this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
     });
 
     mo.on('assignmentPlanned', (data) => {
@@ -173,6 +179,7 @@ export class EventBindingService {
         sessionId: this.ctx.getActiveSessionId(),
       });
       this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
     });
 
     mo.on('assignmentCompleted', (data) => {
@@ -184,6 +191,7 @@ export class EventBindingService {
         sessionId: this.ctx.getActiveSessionId(),
       });
       this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
     });
 
     // Worker Session 事件
@@ -224,6 +232,7 @@ export class EventBindingService {
         sessionId: this.ctx.getActiveSessionId(),
       });
       this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
     });
 
     mo.on('todoCompleted', (data) => {
@@ -236,6 +245,7 @@ export class EventBindingService {
         sessionId: this.ctx.getActiveSessionId(),
       });
       this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
     });
 
     mo.on('todoFailed', (data) => {
@@ -248,6 +258,7 @@ export class EventBindingService {
         sessionId: this.ctx.getActiveSessionId(),
       });
       this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
     });
 
     // 动态 Todo
@@ -266,6 +277,7 @@ export class EventBindingService {
         sessionId: this.ctx.getActiveSessionId(),
       });
       this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
     });
 
     // 审批请求
@@ -509,6 +521,7 @@ export class EventBindingService {
           startedAt: state.startedAt,
           transitionKind: state.transitionKind,
         });
+        this.ctx.sendRuntimeStateUpdate();
       });
     });
   }
@@ -517,18 +530,46 @@ export class EventBindingService {
     const messageHub = this.ctx.getMessageHub();
     const engine = this.ctx.getOrchestratorEngine();
 
+    engine.on('runtimeStateReady', (event: unknown) => {
+      const payload = event && typeof event === 'object'
+        ? event as { requestId?: string }
+        : {};
+      this.ctx.sendRuntimeStateUpdate(
+        typeof payload.requestId === 'string' && payload.requestId.trim().length > 0
+          ? payload.requestId.trim()
+          : undefined,
+      );
+    });
+
     // 任务事件
-    globalEventBus.on('task:created', () => this.ctx.sendStateUpdate());
-    globalEventBus.on('task:state_changed', () => this.ctx.sendStateUpdate());
-    globalEventBus.on('task:started', () => this.ctx.sendStateUpdate());
-    globalEventBus.on('task:completed', () => this.ctx.sendStateUpdate());
+    globalEventBus.on('task:created', () => {
+      this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
+    });
+    globalEventBus.on('task:state_changed', () => {
+      this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
+    });
+    globalEventBus.on('task:started', () => {
+      this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
+    });
+    globalEventBus.on('task:completed', () => {
+      this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
+    });
     globalEventBus.on('task:failed', () => {
       this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
     });
-    globalEventBus.on('task:paused', () => this.ctx.sendStateUpdate());
+    globalEventBus.on('task:paused', () => {
+      this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
+    });
 
     globalEventBus.on('task:cancelled', () => {
       this.ctx.sendStateUpdate();
+      this.ctx.sendRuntimeStateUpdate();
       this.ctx.interruptCurrentTask();
     });
 
@@ -543,6 +584,7 @@ export class EventBindingService {
           event.taskId || ''
         );
       }
+      this.ctx.sendRuntimeStateUpdate();
     });
 
     globalEventBus.on('orchestrator:dependency_analysis', (event) => {

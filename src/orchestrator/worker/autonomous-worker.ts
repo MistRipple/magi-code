@@ -53,7 +53,7 @@ import {
   WorkerSession,
 } from './worker-session';
 import { logger, LogCategory } from '../../logging';
-import type { CancellationToken } from '../core/dispatch-batch';
+import type { CancellationToken } from '../core/dispatch/dispatch-batch';
 // 共享上下文与文件摘要缓存模块
 import {
   ContextAssembler,

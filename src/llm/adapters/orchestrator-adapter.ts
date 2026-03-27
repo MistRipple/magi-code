@@ -19,12 +19,13 @@ import {
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager } from '../../tools/tool-manager';
 import { BUILTIN_TOOL_NAMES } from '../../tools/types';
-import { MessageHub } from '../../orchestrator/core/message-hub';
+import { MessageHub } from '../../orchestrator/core/message/message-hub';
 import type { PlanMode } from '../../orchestrator/plan-ledger';
 import { BaseLLMAdapter, AdapterState } from './base-adapter';
 import { logger, LogCategory } from '../../logging';
 import { t } from '../../i18n';
 import { isModelOriginIssue } from '../../errors/model-origin';
+import { hasExplicitWorkerDispatchIntent } from '../../orchestrator/core/request-classifier';
 import { normalizeNextSteps } from '../../utils/content-parser';
 import { isRetryableNetworkError, toErrorMessage, buildStreamRecoveryPrompt, deduplicateResumption } from '../../tools/network-utils';
 import {
@@ -217,6 +218,59 @@ class MissionOutcomeExtractor {
   }
 }
 
+const MISSION_OUTCOME_PARTIAL_MARKERS = Array.from(new Set(
+  [MISSION_OUTCOME_START, MISSION_OUTCOME_END].flatMap((marker) => {
+    const fragments: string[] = [];
+    for (let len = marker.length - 1; len > 0; len -= 1) {
+      fragments.push(marker.slice(0, len));
+    }
+    return fragments;
+  }),
+)).sort((left, right) => right.length - left.length);
+
+function sanitizeMissionOutcomeProtocolText(text: string): string {
+  if (!text) {
+    return '';
+  }
+
+  let sanitized = text;
+  while (sanitized.includes(MISSION_OUTCOME_START) || sanitized.includes(MISSION_OUTCOME_END)) {
+    const extractor = new MissionOutcomeExtractor();
+    const extracted = extractor.consume(sanitized);
+    const tail = extractor.finalize();
+    const next = `${extracted.text}${tail.text}`;
+    if (next === sanitized) {
+      break;
+    }
+    sanitized = next;
+  }
+
+  sanitized = sanitized
+    .replaceAll(MISSION_OUTCOME_START, '')
+    .replaceAll(MISSION_OUTCOME_END, '');
+
+  for (const fragment of MISSION_OUTCOME_PARTIAL_MARKERS) {
+    if (sanitized.endsWith(fragment)) {
+      return sanitized.slice(0, -fragment.length);
+    }
+  }
+
+  return sanitized;
+}
+
+function extractMissionOutcomePayload(text: string): { text: string; outcome?: MissionOutcomeBlock } {
+  if (!text) {
+    return { text: '' };
+  }
+  const extractor = new MissionOutcomeExtractor();
+  const extracted = extractor.consume(text);
+  const tail = extractor.finalize();
+  return {
+    text: sanitizeMissionOutcomeProtocolText(`${extracted.text}${tail.text}`),
+    outcome: tail.outcome || extracted.outcome,
+  };
+}
+
 interface OrchestratorTodoSummary {
   id: string;
   missionId?: string;
@@ -246,8 +300,6 @@ interface CriticalPathBaseline {
  * Orchestrator LLM 适配器
  */
 export class OrchestratorLLMAdapter extends BaseLLMAdapter {
-  /** 编排者单次会话中允许直接修改的最大文件数（常规模式） */
-  private static readonly MAX_ORCHESTRATOR_EDIT_FILES = 3;
   /** 滚动摘要最大长度（字符） */
   private static readonly MAX_ROLLING_SUMMARY_CHARS = 2000;
   /** 终止治理：无进展窗口 */
@@ -301,31 +353,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   /** 流式中断自动续跑预算（按一次 sendMessageWithTools 计） */
   private static readonly STREAM_INTERRUPTION_RECOVERY_MAX = 2;
 
-  /**
-   * 深度模式下编排者可用工具白名单（强制约束）
-   *
-   * 设计原则：编排者专职"分析、规划、监控、汇总"，所有代码变更必须通过 Worker 执行。
-   * 白名单允许终端工具用于验证/排障，但文件写入工具仍全部排除。
-   * MCP 工具不在白名单中但单独放行（无法自动判断读写性，且多数为只读查询）。
-   */
-  private static readonly DEEP_MODE_ALLOWED_TOOLS = new Set([
-    // 编排工具（核心）
-    'worker_dispatch',
-    'worker_send_message',
-    'worker_wait',
-    'context_compact',
-    // 只读分析工具（辅助规划）
-    'file_view',
-    'code_search_regex',
-    'code_search_semantic',
-    'web_search',
-    'web_fetch',
-    'shell',
-    // 任务管理工具
-    'todo_list',
-    'todo_update',
-  ]);
-
   private systemPrompt: string;
   private conversationHistory: LLMMessage[] = [];
   private abortController?: AbortController;
@@ -336,9 +363,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   /** 统一终止/门禁决策引擎（按规划模式区分） */
   private readonly standardDecisionEngine: OrchestratorDecisionEngine;
   private readonly deepDecisionEngine: OrchestratorDecisionEngine;
-
-  /** 当前会话中编排者已修改的文件路径集合（用于规模限制） */
-  private editedFiles = new Set<string>();
 
   /**
    * 临时配置（仅对下一次请求生效）
@@ -428,9 +452,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     const effectiveSystemPrompt = this.tempSystemPrompt ?? this.systemPrompt;
     const includeThinking = this.tempIncludeThinking ?? true;
     const enableToolCalls = this.tempEnableToolCalls ?? false;
-    const allowedToolNames = Array.isArray(this.tempAllowedToolNames)
-      ? [...this.tempAllowedToolNames]
-      : undefined;
     const historyMode = this.tempHistoryMode ?? 'session';
     const silent = this.tempVisibility === 'system';
     const planningMode = this.resolvePlanningModeForCurrentRequest();
@@ -468,7 +489,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           effectiveSystemPrompt,
           silent ? 'system' : undefined,
           includeThinking,
-          allowedToolNames,
           planningMode,
         );
         this.setState(AdapterState.CONNECTED);
@@ -505,13 +525,19 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             : this.normalizer.startStream(this.currentTraceId!);
         messageId = streamId;
         params.retryRuntimeHook = silent ? undefined : this.createRetryRuntimeHook(streamId);
+        const outcomeExtractor = new MissionOutcomeExtractor();
         let streamedResponse = '';
+        let hasStreamedTextDelta = false;
 
         try {
           // 流式调用 LLM
           const response = await this.client.streamMessage(params, (chunk) => {
             if (chunk.type === 'content_delta' && chunk.content) {
-              let delta = chunk.content;
+              const filtered = outcomeExtractor.consume(chunk.content);
+              const delta = filtered.text;
+              if (!delta) {
+                return;
+              }
               streamedResponse += delta;
               if (preRecoveryText && streamedResponse.length <= 200) {
                 return;
@@ -523,17 +549,33 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
                   this.normalizer.processTextDelta(streamId, deduped);
                   this.emit('message', deduped);
                 }
+                hasStreamedTextDelta = true;
                 return;
               }
               this.normalizer.processTextDelta(streamId, delta);
               this.emit('message', delta);
+              hasStreamedTextDelta = true;
             } else if (includeThinking && chunk.type === 'thinking' && chunk.thinking) {
               this.normalizer.processThinking(streamId, chunk.thinking);
               this.emit('thinking', chunk.thinking);
             }
           });
           this.recordTokenUsage(response.usage);
-          finalResponse = streamedResponse || response.content || '';
+          const flushed = outcomeExtractor.finalize();
+          if (flushed.text) {
+            const finalDelta = sanitizeMissionOutcomeProtocolText(flushed.text);
+            if (finalDelta) {
+              streamedResponse += finalDelta;
+              if (hasStreamedTextDelta) {
+                this.normalizer.processTextDelta(streamId, finalDelta);
+                this.emit('message', finalDelta);
+              }
+            }
+          }
+          finalResponse = sanitizeMissionOutcomeProtocolText(streamedResponse);
+          if (!finalResponse && response.content) {
+            finalResponse = extractMissionOutcomePayload(response.content).text;
+          }
           if (isSummaryHijackText(finalResponse)) {
             logger.warn('Orchestrator.检测到摘要劫持输出_已降级为不中断', {
               model: this.config.model,
@@ -543,11 +585,12 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             finalResponse = '[System] 检测到异常摘要模板输出，已自动忽略。请继续当前任务。';
           }
 
-          if (finalResponse && !streamedResponse) {
-            // 兜底：部分 provider 仅在最终响应体返回文本，未逐块回调 content_delta。
+          if (finalResponse && !hasStreamedTextDelta) {
+            // 兜底：部分 provider 仅在最终响应体返回文本，或续跑裁剪后尚未实际下发可见文本。
             this.normalizer.processTextDelta(streamId, finalResponse);
             this.emit('message', finalResponse);
           }
+          this.normalizer.sanitizePendingText(streamId, sanitizeMissionOutcomeProtocolText);
           this.normalizer.endStream(streamId);
           break;
         } catch (error: any) {
@@ -558,7 +601,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             && streamedResponse.trim().length > 0;
           if (canAutoRecoverInterruptedRound) {
             streamInterruptionRecoveryCount += 1;
-            preRecoveryText = streamedResponse;
+            preRecoveryText = sanitizeMissionOutcomeProtocolText(streamedResponse);
             messagesToSend.push({ role: 'assistant', content: streamedResponse });
             messagesToSend.push({
               role: 'user',
@@ -569,10 +612,12 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               hasAccumulatedText: streamedResponse.trim().length > 0,
               error: errorMessage.substring(0, 300),
             }, LogCategory.LLM);
+            this.normalizer.sanitizePendingText(streamId, sanitizeMissionOutcomeProtocolText);
             this.normalizer.endStream(streamId);
             round++;
             continue;
           }
+          this.normalizer.sanitizePendingText(streamId, sanitizeMissionOutcomeProtocolText);
           this.normalizer.endStream(streamId, errorMessage || 'Request failed');
           messageId = null;
           throw error;
@@ -602,6 +647,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       // abort 中断不视为错误
       if (error?.name === 'AbortError' || this.abortController?.signal.aborted) {
         if (messageId) {
+          this.normalizer.sanitizePendingText(messageId, sanitizeMissionOutcomeProtocolText);
           this.normalizer.interruptStream(messageId);
         }
         this.setState(AdapterState.CONNECTED);
@@ -612,6 +658,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         return '任务已中断';
       }
       if (messageId) {
+        this.normalizer.sanitizePendingText(messageId, sanitizeMissionOutcomeProtocolText);
         this.normalizer.endStream(messageId, error?.message || 'Request failed');
       }
       this.setState(AdapterState.ERROR);
@@ -691,7 +738,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   clearHistory(): void {
     this.conversationHistory = [];
     this.rollingContextSummary = null;
-    this.editedFiles.clear();
     logger.debug('Orchestrator conversation history cleared', undefined, LogCategory.LLM);
   }
 
@@ -1094,7 +1140,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     systemPrompt: string,
     visibility: 'user' | 'system' | 'debug' | undefined,
     includeThinking: boolean,
-    allowedToolNames: string[] | undefined,
     planningMode: PlanMode,
   ): Promise<string> {
     this.syncTraceFromMessageHub();
@@ -1103,18 +1148,11 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     const decisionEngine = this.getDecisionEngineForPlanningMode(planningMode);
 
     const ORCHESTRATOR_HIDDEN_TOOLS = ['todo_split'];
-    const allowedToolNameSet = Array.isArray(allowedToolNames)
-      ? new Set(allowedToolNames)
-      : null;
     const allTools = await this.toolManager.getTools();
     const toolDefinitions = allTools
       .filter(tool => {
-        if (allowedToolNameSet && !allowedToolNameSet.has(tool.name)) return false;
         if (ORCHESTRATOR_HIDDEN_TOOLS.includes(tool.name)) return false;
-        if (!effectiveDeepTask) return true;
-        // 深度模式：非内置工具（MCP/Skill）放行，内置工具仅白名单可见
-        if (tool.metadata?.source !== 'builtin') return true;
-        return OrchestratorLLMAdapter.DEEP_MODE_ALLOWED_TOOLS.has(tool.name);
+        return true;
       })
       .map(tool => ({
         name: tool.name,
@@ -1172,12 +1210,20 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         ? this.startStreamWithContext()
         : undefined;
       let persistentVisibleStreamFinished = false;
+      const sanitizeVisibleStream = (streamId: string | undefined): void => {
+        if (!streamId) {
+          return;
+        }
+        this.normalizer.sanitizePendingText(streamId, sanitizeMissionOutcomeProtocolText);
+      };
       const endIntermediateRoundStream = (streamId: string): void => {
+        sanitizeVisibleStream(streamId);
         if (!usesPersistentVisibleStream) {
           this.normalizer.endStream(streamId);
         }
       };
       const endVisibleStreamWithError = (streamId: string, errorMessage: string): void => {
+        sanitizeVisibleStream(usesPersistentVisibleStream ? persistentVisibleStreamId : streamId);
         if (usesPersistentVisibleStream) {
           if (!persistentVisibleStreamFinished && persistentVisibleStreamId) {
             this.normalizer.endStream(persistentVisibleStreamId, errorMessage);
@@ -1188,6 +1234,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         this.normalizer.endStream(streamId, errorMessage);
       };
       const interruptVisibleStream = (streamId: string): void => {
+        sanitizeVisibleStream(usesPersistentVisibleStream ? persistentVisibleStreamId : streamId);
         if (usesPersistentVisibleStream) {
           if (!persistentVisibleStreamFinished && persistentVisibleStreamId) {
             this.normalizer.interruptStream(persistentVisibleStreamId);
@@ -1201,6 +1248,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         if (!usesPersistentVisibleStream || persistentVisibleStreamFinished || !persistentVisibleStreamId) {
           return;
         }
+        sanitizeVisibleStream(persistentVisibleStreamId);
         this.normalizer.endStream(persistentVisibleStreamId);
         persistentVisibleStreamFinished = true;
       };
@@ -1308,9 +1356,12 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             missionOutcome = flushed.outcome;
           }
           if (flushed.text) {
-            accumulatedText += flushed.text;
-            if (hasStreamedTextDelta) {
-              this.normalizer.processTextDelta(streamId, flushed.text);
+            const flushedText = sanitizeMissionOutcomeProtocolText(flushed.text);
+            if (flushedText) {
+              accumulatedText += flushedText;
+              if (hasStreamedTextDelta) {
+                this.normalizer.processTextDelta(streamId, flushedText);
+              }
             }
           }
 
@@ -1318,14 +1369,12 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
             toolCalls = response.toolCalls;
           }
 
-          let assistantText = accumulatedText || response.content || '';
+          let assistantText = sanitizeMissionOutcomeProtocolText(accumulatedText);
           if (!accumulatedText && response.content) {
-            const fallbackExtractor = new MissionOutcomeExtractor();
-            const extracted = fallbackExtractor.consume(response.content);
-            const tail = fallbackExtractor.finalize();
-            assistantText = `${extracted.text}${tail.text}`;
-            if (extracted.outcome || tail.outcome) {
-              missionOutcome = extracted.outcome || tail.outcome;
+            const fallback = extractMissionOutcomePayload(response.content);
+            assistantText = fallback.text;
+            if (fallback.outcome) {
+              missionOutcome = fallback.outcome;
             }
           }
           if (suppressVisibleText && preRecoveryTextLoop) {
@@ -1648,7 +1697,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           const preAnnouncedToolCallIds = this.preAnnounceToolCalls(streamId, toolCalls);
           history.push({ role: 'assistant', content: this.buildAssistantToolUseBlocks(toolCalls) });
 
-          const toolResults = await this.executeToolCalls(toolCalls, allowedToolNameSet, planningMode);
+          const toolResults = await this.executeToolCalls(toolCalls);
           totalToolResultCount += toolResults.length;
 
           // 中断检查：工具执行完成后立即检测 abort，跳过后续处理直接退出循环
@@ -1923,6 +1972,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       }
       if (terminationReason === 'external_abort') {
         if (usesPersistentVisibleStream && !persistentVisibleStreamFinished && persistentVisibleStreamId) {
+          sanitizeVisibleStream(persistentVisibleStreamId);
           this.normalizer.interruptStream(persistentVisibleStreamId);
           persistentVisibleStreamFinished = true;
         }
@@ -1949,6 +1999,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           throw new Error(`LLM 响应为空：流式传输完成但未收到有效内容 [orchestrator/${this.config.model}/${this.config.provider}]`);
         }
       }
+      finalText = sanitizeMissionOutcomeProtocolText(finalText);
       if (!runtimeShadow && this.isTerminationShadowEnabled()) {
         runtimeShadow = {
           enabled: true,
@@ -2254,7 +2305,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     if (!normalized) {
       return false;
     }
-    return /worker_dispatch|worker_wait|任务编排|编排|派发任务|assignment/i.test(normalized);
+    return hasExplicitWorkerDispatchIntent(normalized);
   }
 
   private userForbidsWorkerDispatchRetry(userMessage: string): boolean {
@@ -2702,8 +2753,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
    */
   private async executeToolCalls(
     toolCalls: ToolCall[],
-    allowedToolNameSet?: Set<string> | null,
-    planningMode: PlanMode = 'standard',
   ) {
     const results = [];
     const maxToolResultChars = 20000;
@@ -2737,28 +2786,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         continue;
       }
 
-      if (allowedToolNameSet && !allowedToolNameSet.has(toolCall.name)) {
-        results.push(this.createSyntheticToolResult(
-          toolCall,
-          `工具 ${toolCall.name} 不在当前请求允许的工具范围内。请改用当前轮次允许的分析/编排工具完成任务，不要绕行无关 skill、shell 或直接编辑操作。`,
-          'blocked',
-          toolSourceMap,
-        ));
-        continue;
-      }
-
-      // 编排者角色约束：禁止文件写入操作
-      const blocked = this.checkOrchestratorToolRestriction(toolCall, planningMode);
-      if (blocked) {
-        results.push(this.createSyntheticToolResult(
-          toolCall,
-          blocked,
-          'blocked',
-          toolSourceMap,
-        ));
-        continue;
-      }
-
       try {
         const rawResult = await this.toolManager.execute(
           toolCall,
@@ -2782,34 +2809,4 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     return results;
   }
 
-  /**
-   * 编排者工具调用限制检查（第二道防线）
-   *
-   * 深度模式：内置工具必须在白名单内，否则拒绝（用 BUILTIN_TOOL_NAMES 明确判断来源）。
-   * 常规模式：文件写入超限时拒绝并引导 worker_dispatch。
-   *
-   * 返回 null 表示允许，返回字符串表示拒绝原因。
-   */
-  private checkOrchestratorToolRestriction(toolCall: ToolCall, planningMode: PlanMode): string | null {
-    const { name, arguments: args } = toolCall;
-    const effectiveDeepTask = planningMode === 'deep';
-
-    // 深度模式兜底：内置工具必须在白名单内（MCP/Skill 不在 BUILTIN_TOOL_NAMES 中，自动放行）
-    if (effectiveDeepTask
-      && (BUILTIN_TOOL_NAMES as readonly string[]).includes(name)
-      && !OrchestratorLLMAdapter.DEEP_MODE_ALLOWED_TOOLS.has(name)) {
-      return `深度模式下编排者不可直接执行 ${name}，请通过 worker_dispatch 委派给 Worker。`;
-    }
-
-    // 常规模式：文件写入数量限制
-    if (name === 'file_edit' || name === 'file_create' || name === 'file_insert' || name === 'file_remove') {
-      const filePath = (args?.path || args?.file_path || '') as string;
-      this.editedFiles.add(filePath);
-      if (this.editedFiles.size > OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES) {
-        return `编排者已修改 ${this.editedFiles.size} 个文件（超过 ${OrchestratorLLMAdapter.MAX_ORCHESTRATOR_EDIT_FILES} 个），请通过 worker_dispatch 委派给 Worker。`;
-      }
-    }
-
-    return null;
-  }
 }

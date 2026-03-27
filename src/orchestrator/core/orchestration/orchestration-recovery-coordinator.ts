@@ -1,18 +1,18 @@
-import { t } from '../../i18n';
-import { logger, LogCategory } from '../../logging';
-import { hasPhaseContinuationPending } from './phase-continuation';
-import { decideDeliveryRecovery, decideGovernanceRecovery } from './recovery-decision-kernel';
-import { decideContinuationAction } from './continuation-decision-kernel';
-import type { MessageHub } from './message-hub';
-import type { EffectiveModeResolution } from './effective-mode-resolver';
-import { publishInternalControlNotice } from './internal-control-notice';
+import { t } from '../../../i18n';
+import { logger, LogCategory } from '../../../logging';
+import { hasPhaseContinuationPending } from '../phase-continuation';
+import { decideDeliveryRecovery, decideGovernanceRecovery } from '../recovery-decision-kernel';
+import { decideContinuationAction } from '../continuation-decision-kernel';
+import type { MessageHub } from '../message/message-hub';
+import type { EffectiveModeResolution } from '../effective-mode-resolver';
+import { publishInternalControlNotice } from '../internal-control-notice';
 import type {
   ResolvedOrchestratorTerminationReason,
   RuntimeTerminationSnapshot,
 } from './orchestration-control-plane-types';
-import type { RequirementAnalysis } from '../protocols/types';
-import type { MissionStorageManager } from '../mission';
-import { PlanLedgerService, type PlanRuntimePhaseState } from '../plan-ledger';
+import type { RequirementAnalysis } from '../../protocols/types';
+import type { MissionStorageManager } from '../../mission';
+import { PlanLedgerService, type PlanRuntimePhaseState } from '../../plan-ledger';
 import type { DeliveryRoundState } from './orchestration-delivery-controller';
 
 export interface RecoveryLoopState {
@@ -582,7 +582,7 @@ export class OrchestrationRecoveryCoordinator {
     return input.finalExecutionStatus === 'failed'
       && input.hasStructuredExecutionContext === false
       && input.requirementAnalysis.entryPath === 'task_execution'
-      && decisionFactors.includes('signal:orchestration_intent');
+      && decisionFactors.includes('signal:explicit_worker_dispatch_intent');
   }
 
   private async resetPhaseContinuation(sessionId: string): Promise<void> {

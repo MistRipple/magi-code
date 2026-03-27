@@ -22,7 +22,7 @@ import {
 } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager, type ToolExecutionContext } from '../../tools/tool-manager';
-import { MessageHub } from '../../orchestrator/core/message-hub';
+import { MessageHub } from '../../orchestrator/core/message/message-hub';
 import { logger, LogCategory } from '../../logging';
 import { MESSAGE_EVENTS, ADAPTER_EVENTS } from '../../protocol/event-names';
 import type {
@@ -513,11 +513,6 @@ export abstract class BaseLLMAdapter extends EventEmitter {
   protected preAnnounceToolCalls(streamId: string, toolCalls: ToolCall[]): Set<string> {
     const preAnnouncedToolCallIds = new Set<string>();
     for (const toolCall of toolCalls) {
-      const requiresAuthorization = this.toolManager.requiresUserAuthorization(toolCall.name);
-      // shell/process 工具即使需要授权也要先渲染卡片，避免执行期无可视反馈
-      if (requiresAuthorization && !this.isTerminalProcessTool(toolCall.name)) {
-        continue;
-      }
       preAnnouncedToolCallIds.add(toolCall.id);
       this.normalizer.addToolCall(streamId, {
         type: 'tool_call',

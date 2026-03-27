@@ -8,6 +8,7 @@
  * - gemini.json           - Gemini Worker 画像
  * - categories.json       - 任务分类配置
  * - mcp.json              - MCP 服务器配置
+ * - safeguard.json        - 安全防护配置
  * - skills.json           - 自定义技能配置
  * - config.json           - 全局配置
  */
@@ -20,6 +21,7 @@ import { LLMConfig, LLMProvider, WorkerSlot, UrlMode, ModelAutonomyCapability } 
 import { FullLLMConfig, WorkerLLMConfig } from './types';
 import { logger, LogCategory } from '../logging';
 import { normalizeUrlMode } from './url-mode';
+import type { SafeguardConfig } from '../types';
 
 /**
  * LLM 配置加载器（从 ~/.magi/ 加载）
@@ -843,5 +845,68 @@ export class LLMConfigLoader {
    */
   private static getDefaultRepositories(): any[] {
     return [];
+  }
+
+  // ============================================================================
+  // 安全防护配置管理
+  // ============================================================================
+
+  private static readonly SAFEGUARD_CONFIG_FILE = path.join(this.CONFIG_DIR, 'safeguard.json');
+
+  /**
+   * 内部默认安全防护规则（避免从 types.ts 值导入触发 vite 打包问题）
+   */
+  private static buildDefaultSafeguardConfig(): SafeguardConfig {
+    return {
+      rules: [
+        { pattern: 'git commit', enabled: true, category: 'git_history' },
+        { pattern: 'git push', enabled: true, category: 'git_history' },
+        { pattern: 'git push --force', enabled: true, category: 'git_history' },
+        { pattern: 'git restore', enabled: true, category: 'git_discard' },
+        { pattern: 'git reset --hard', enabled: true, category: 'git_discard' },
+        { pattern: 'git clean', enabled: true, category: 'git_discard' },
+        { pattern: 'npm publish', enabled: true, category: 'package_publish' },
+        { pattern: 'yarn publish', enabled: true, category: 'package_publish' },
+        { pattern: 'pnpm publish', enabled: true, category: 'package_publish' },
+        { pattern: 'cargo publish', enabled: true, category: 'package_publish' },
+        { pattern: 'rm -rf', enabled: true, category: 'bulk_delete' },
+        { pattern: 'rm -r', enabled: true, category: 'bulk_delete' },
+      ],
+    };
+  }
+
+  /**
+   * 加载安全防护配置
+   */
+  static loadSafeguardConfig(): SafeguardConfig {
+    if (!fs.existsSync(this.SAFEGUARD_CONFIG_FILE)) {
+      return this.buildDefaultSafeguardConfig();
+    }
+    try {
+      const content = fs.readFileSync(this.SAFEGUARD_CONFIG_FILE, 'utf-8');
+      const config = JSON.parse(content) as SafeguardConfig;
+      if (!Array.isArray(config.rules)) {
+        return this.buildDefaultSafeguardConfig();
+      }
+      return config;
+    } catch {
+      logger.warn('安全防护配置加载失败，使用默认值', undefined, LogCategory.LLM);
+      return this.buildDefaultSafeguardConfig();
+    }
+  }
+
+  /**
+   * 保存安全防护配置
+   */
+  static saveSafeguardConfig(config: SafeguardConfig): void {
+    try {
+      if (!fs.existsSync(this.CONFIG_DIR)) {
+        fs.mkdirSync(this.CONFIG_DIR, { recursive: true });
+      }
+      atomicWriteFileSync(this.SAFEGUARD_CONFIG_FILE, JSON.stringify(config, null, 2));
+      logger.info('安全防护配置已保存', { ruleCount: config.rules.length }, LogCategory.LLM);
+    } catch (error) {
+      logger.error('安全防护配置保存失败', { error }, LogCategory.LLM);
+    }
   }
 }

@@ -275,6 +275,13 @@
   let updatingSkills = $state<Set<string>>(new Set());
   let updatingAllSkills = $state(false);
 
+  // 安全防护
+  type SafeguardCategory = 'git_history' | 'git_discard' | 'package_publish' | 'bulk_delete' | 'custom';
+  interface SafeguardRule { pattern: string; enabled: boolean; category: SafeguardCategory; }
+  const SAFEGUARD_CATEGORIES: SafeguardCategory[] = ['git_history', 'git_discard', 'package_publish', 'bulk_delete', 'custom'];
+  let safeguardRules = $state<SafeguardRule[]>([]);
+  let newCustomRule = $state('');
+
   // 模型配置表单
   let orchConfig = $state<InteractiveModelFormConfig>(createInteractiveConfig('anthropic'));
   let compConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
@@ -1320,6 +1327,49 @@
     repositoriesLoading = false;
   }
 
+  function applySafeguardConfig(config: any): void {
+    if (config && Array.isArray(config.rules)) {
+      safeguardRules = config.rules.map((r: any) => ({
+        pattern: String(r.pattern || ''),
+        enabled: r.enabled !== false,
+        category: r.category || 'custom',
+      }));
+    }
+  }
+
+  function saveSafeguardRules(): void {
+    vscode.postMessage({
+      type: 'saveSafeguardConfig',
+      config: { rules: safeguardRules.map(r => ({ ...r })) },
+    } as any);
+  }
+
+  function toggleSafeguardRule(index: number): void {
+    safeguardRules[index] = { ...safeguardRules[index], enabled: !safeguardRules[index].enabled };
+    safeguardRules = [...safeguardRules];
+    saveSafeguardRules();
+  }
+
+  function removeCustomRule(index: number): void {
+    safeguardRules = safeguardRules.filter((_, i) => i !== index);
+    saveSafeguardRules();
+  }
+
+  function addCustomRule(): void {
+    const pattern = newCustomRule.trim();
+    if (!pattern) return;
+    if (safeguardRules.some(r => r.pattern === pattern)) return;
+    safeguardRules = [...safeguardRules, { pattern, enabled: true, category: 'custom' as SafeguardCategory }];
+    newCustomRule = '';
+    saveSafeguardRules();
+  }
+
+  function getRulesForCategory(category: SafeguardCategory): { rule: SafeguardRule; index: number }[] {
+    return safeguardRules
+      .map((rule, index) => ({ rule, index }))
+      .filter(({ rule }) => rule.category === category);
+  }
+
   // 监听来自扩展的状态更新
   $effect(() => {
     const unsubscribe = vscode.onMessage((msg) => {
@@ -1337,6 +1387,7 @@
         applyMcpServersPayload(payload?.mcpServers);
         applySkillsConfig(payload?.skillsConfig);
         applyRepositoriesPayload(payload?.repositories);
+        applySafeguardConfig(payload?.safeguardConfig);
       }
       // 执行统计更新
       else if (dataType === 'executionStatsUpdate') {
@@ -2424,6 +2475,57 @@
                 </div>
               {/each}
             {/if}
+          </div>
+        </div>
+
+        <!-- 安全防护 section -->
+        <div class="settings-section">
+          <div class="settings-section-header">
+            <div class="settings-section-title">{i18n.t('settings.safeguard.title')}</div>
+          </div>
+          <div class="settings-section-desc">{i18n.t('settings.safeguard.desc')}</div>
+          <div class="safeguard-categories">
+            {#each SAFEGUARD_CATEGORIES as category}
+              {@const categoryRules = getRulesForCategory(category)}
+              {#if categoryRules.length > 0 || category === 'custom'}
+                <div class="safeguard-category">
+                  <div class="safeguard-category-label">{i18n.t(`settings.safeguard.category.${category}`)}</div>
+                  <div class="safeguard-badges">
+                    {#each categoryRules as { rule, index } (rule.pattern)}
+                      <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+                      <span
+                        class="safeguard-badge"
+                        class:enabled={rule.enabled}
+                        class:disabled={!rule.enabled}
+                        onclick={() => toggleSafeguardRule(index)}
+                        title={rule.enabled ? i18n.t('settings.tools.clickToDisable') : i18n.t('settings.tools.clickToEnable')}
+                      >
+                        <span class="safeguard-badge-text">{rule.pattern}</span>
+                        {#if category === 'custom'}
+                          <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+                          <span class="safeguard-badge-remove" onclick={(e) => { e.stopPropagation(); removeCustomRule(index); }} title={i18n.t('settings.tools.delete')}>×</span>
+                        {/if}
+                      </span>
+                    {/each}
+                  </div>
+                  {#if category === 'custom'}
+                    <div class="safeguard-add-row">
+                      <input
+                        type="text"
+                        class="safeguard-add-input"
+                        bind:value={newCustomRule}
+                        placeholder={i18n.t('settings.safeguard.addPlaceholder')}
+                        onkeydown={(e) => e.key === 'Enter' && addCustomRule()}
+                      />
+                      <button class="settings-btn primary safeguard-add-btn" onclick={addCustomRule}>
+                        <Icon name="plus" size={14} />
+                        {i18n.t('settings.safeguard.add')}
+                      </button>
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+            {/each}
           </div>
         </div>
       {/if}
@@ -4092,5 +4194,111 @@
       border-right: none;
       border-top: none;
     }
+  }
+
+  /* ── 安全防护 ── */
+  .safeguard-categories {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-top: 8px;
+  }
+
+  .safeguard-category-label {
+    font-size: 12px;
+    font-weight: var(--font-semibold);
+    color: var(--text-secondary);
+    margin-bottom: 6px;
+  }
+
+  .safeguard-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .safeguard-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-family: var(--font-mono, monospace);
+    cursor: pointer;
+    user-select: none;
+    transition: all 0.15s ease;
+    border: 1px solid transparent;
+  }
+
+  .safeguard-badge.enabled {
+    background: var(--primary);
+    color: #fff;
+    border-color: var(--primary);
+  }
+
+  .safeguard-badge.enabled:hover {
+    opacity: 0.85;
+  }
+
+  .safeguard-badge.disabled {
+    background: transparent;
+    color: var(--text-tertiary);
+    border-color: var(--border);
+  }
+
+  .safeguard-badge.disabled:hover {
+    border-color: var(--text-secondary);
+    color: var(--text-secondary);
+  }
+
+  .safeguard-badge-remove {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    font-size: 11px;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0.7;
+  }
+
+  .safeguard-badge-remove:hover {
+    opacity: 1;
+    background: rgba(255, 255, 255, 0.2);
+  }
+
+  .safeguard-badge.disabled .safeguard-badge-remove:hover {
+    background: var(--hover);
+  }
+
+  .safeguard-add-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+  }
+
+  .safeguard-add-input {
+    flex: 1;
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--input-bg);
+    color: var(--text-primary);
+    font-size: 12px;
+    font-family: var(--font-mono, monospace);
+    outline: none;
+  }
+
+  .safeguard-add-input:focus {
+    border-color: var(--primary);
+  }
+
+  .safeguard-add-btn {
+    flex-shrink: 0;
+    padding: 4px 12px;
+    font-size: 12px;
   }
 </style>

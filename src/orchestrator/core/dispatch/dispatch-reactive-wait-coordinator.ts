@@ -1,6 +1,6 @@
-import { t } from '../../i18n';
-import type { WaitForWorkersResult } from '../../tools/orchestration-executor';
-import type { MessageHub } from './message-hub';
+import { t } from '../../../i18n';
+import type { WaitForWorkersResult } from '../../../tools/orchestration-executor';
+import type { MessageHub } from '../message/message-hub';
 import { DispatchCompletionQueue } from './dispatch-completion-queue';
 import { DispatchBatch, type DispatchEntry, type DispatchStatus } from './dispatch-batch';
 

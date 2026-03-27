@@ -1066,12 +1066,12 @@ export class LocalAgentService {
         this.sendJson(response, 404, { error: 'workspace_not_found' });
         return;
       }
-      const result = await runtime.executeTask(
+      const result = await runtime.submitTask(
         typeof body?.prompt === 'string' ? body.prompt : '',
         typeof body?.sessionId === 'string' ? body.sessionId : undefined,
         typeof body?.requestId === 'string' ? body.requestId : undefined,
       );
-      this.sendJson(response, result.success ? 200 : 400, result);
+      this.sendJson(response, result.success ? 202 : 400, result);
       return;
     }
 
@@ -1153,8 +1153,8 @@ export class LocalAgentService {
         this.sendJson(response, 400, { error: 'task_start_failed' });
         return;
       }
-      await runtime.startTask(body.taskId);
-      this.sendJson(response, 200, { success: true });
+      const result = await runtime.startTask(body.taskId);
+      this.sendJson(response, result.success ? 202 : 400, result);
       return;
     }
 
@@ -1168,8 +1168,8 @@ export class LocalAgentService {
         this.sendJson(response, 400, { error: 'task_resume_failed' });
         return;
       }
-      await runtime.resumeTask(body.taskId);
-      this.sendJson(response, 200, { success: true });
+      const result = await runtime.resumeTask(body.taskId);
+      this.sendJson(response, result.success ? 202 : 400, result);
       return;
     }
 
@@ -1654,8 +1654,8 @@ export class LocalAgentService {
       : await this.buildWorkspaceUIState(workspace, session);
     const liveMessages = runtime ? runtime.getActiveMessageSnapshots(session.id) : [];
     const queuedMessages = runtime ? runtime.getQueuedMessagesSnapshot(session.id) : [];
-    const orchestratorRuntimeDiagnostics = runtime
-      ? await runtime.getRuntimeDiagnostics(session.id)
+    const orchestratorRuntimeState = runtime
+      ? await runtime.getRuntimeState(session.id)
       : null;
     const timelineProjection = buildSessionBootstrapTimelineProjection({
       session: {
@@ -1688,7 +1688,7 @@ export class LocalAgentService {
       state,
       timelineProjection,
       queuedMessages,
-      orchestratorRuntimeDiagnostics,
+      orchestratorRuntimeState,
       ...(runtime ? { executionChainSummary: runtime.buildExecutionChainSummary(session.id) } : {}),
     };
   }

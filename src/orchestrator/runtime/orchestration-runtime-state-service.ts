@@ -1,6 +1,6 @@
 import type { Mission, MissionStorageManager } from '../mission';
 import type { PlanLedgerService, PlanRecord, PlanStatus } from '../plan-ledger';
-import type { RuntimeTerminationDecisionTraceEntry, RuntimeTerminationSnapshot } from '../core/orchestration-control-plane-types';
+import type { RuntimeTerminationDecisionTraceEntry, RuntimeTerminationSnapshot } from '../core/orchestration/orchestration-control-plane-types';
 import {
   FileKnowledgeGovernanceAuditStore,
   type KnowledgeGovernanceAuditQuery,
@@ -11,10 +11,11 @@ import {
   OrchestrationTimelineStore,
   type OrchestrationTimelineEvent,
 } from './orchestration-timeline-store';
+import type { ExecutionChainRecord } from './execution-chain-types';
+import type { ExecutionChainStore } from './execution-chain-store';
 import type {
   OrchestrationRuntimeAssignmentSummary,
-  OrchestrationRuntimeDiagnosticsQuery,
-  OrchestrationRuntimeDiagnosticsSnapshot,
+  OrchestrationRuntimeChainSummary,
   OrchestrationRuntimeFailureRootCause,
   OrchestrationRuntimeKnowledgeAuditEntry,
   OrchestrationRuntimeKnowledgeAuditView,
@@ -23,8 +24,11 @@ import type {
   OrchestrationRuntimePlanSummary,
   OrchestrationRuntimeRecoverySummary,
   OrchestrationRuntimeStateDiffEntry,
+  OrchestrationRuntimeStateQuery,
+  OrchestrationRuntimeStateSnapshot,
+  OrchestrationRuntimeStateStatus,
   OrchestrationRuntimeTimelineEntry,
-} from './orchestration-runtime-diagnostics-types';
+} from './orchestration-runtime-state-types';
 
 function normalizeString(value: unknown): string | undefined {
   if (typeof value !== 'string') {
@@ -54,7 +58,7 @@ function normalizeStringArray(value: unknown): string[] {
   return normalized;
 }
 
-export class OrchestrationRuntimeDiagnosticsService {
+export class OrchestrationRuntimeStateService {
   private readonly knowledgeAuditStore: FileKnowledgeGovernanceAuditStore;
 
   constructor(
@@ -62,33 +66,44 @@ export class OrchestrationRuntimeDiagnosticsService {
     private readonly planLedger: PlanLedgerService,
     private readonly readModelService: OrchestrationReadModelService,
     private readonly timelineStore: OrchestrationTimelineStore,
+    private readonly executionChainStore: ExecutionChainStore,
     workspaceRoot: string,
   ) {
     this.knowledgeAuditStore = new FileKnowledgeGovernanceAuditStore(workspaceRoot);
   }
 
-  async query(input: OrchestrationRuntimeDiagnosticsQuery): Promise<OrchestrationRuntimeDiagnosticsSnapshot | null> {
+  async query(input: OrchestrationRuntimeStateQuery): Promise<OrchestrationRuntimeStateSnapshot | null> {
     const sessionId = normalizeString(input.sessionId);
     if (!sessionId) {
       return null;
     }
 
     const sessionEvents = this.timelineStore.replay({ sessionId });
+    const chain = this.resolveRelevantChain(sessionId, {
+      chainId: normalizeString(input.chainId),
+      requestId: normalizeString(input.requestId),
+    });
+    const requestId = normalizeString(input.requestId)
+      || chain?.requestId
+      || this.resolveLatestRequestId(sessionEvents, {
+        missionId: normalizeString(input.missionId) || chain?.currentMissionId,
+        planId: normalizeString(input.planId) || chain?.currentPlanId,
+      });
     const missionId = normalizeString(input.missionId)
+      || chain?.currentMissionId
       || this.resolveLatestMissionId(sessionEvents, {
-        requestId: normalizeString(input.requestId),
-        planId: normalizeString(input.planId),
+        requestId,
+        planId: normalizeString(input.planId) || chain?.currentPlanId,
       });
     const mission = await this.resolveMission(sessionId, missionId);
     const missionProjection = mission
       ? this.readModelService.toMissionProjection(mission)
       : null;
-    const plan = this.resolvePlan(sessionId, normalizeString(input.planId), missionProjection?.missionId);
-    const requestId = normalizeString(input.requestId)
-      || this.resolveLatestRequestId(sessionEvents, {
-        missionId: missionProjection?.missionId,
-        planId: plan?.planId,
-      });
+    const plan = this.resolvePlan(
+      sessionId,
+      normalizeString(input.planId) || chain?.currentPlanId,
+      missionProjection?.missionId || chain?.currentMissionId,
+    );
     const batchId = normalizeString(input.batchId)
       || this.resolveLatestBatchId(sessionEvents, {
         requestId,
@@ -102,14 +117,15 @@ export class OrchestrationRuntimeDiagnosticsService {
       batchId,
     });
 
+    const liveProcessing = input.liveProcessingState?.isProcessing === true;
     const runtimeReason = normalizeString(input.liveRuntimeReason)
       || this.resolveRuntimeReason(scopedEvents)
       || normalizeString(plan?.runtime.termination.reason)
-      || (this.hasFailureSignal(scopedEvents, missionProjection?.failureReason) ? 'failed' : 'completed');
-    const finalStatus = this.resolveFinalStatus({
-      explicit: input.liveFinalStatus,
-      events: scopedEvents,
-      planStatus: plan?.status,
+      || undefined;
+    const status = this.resolveRuntimeStatus({
+      chain,
+      plan,
+      liveProcessing,
       runtimeReason,
     });
     const failureRootCause = this.resolveFailureRootCause(scopedEvents, mission, plan);
@@ -118,17 +134,10 @@ export class OrchestrationRuntimeDiagnosticsService {
       ? liveErrors
       : this.resolveErrorsFromFailure(failureRootCause, missionProjection?.failureReason);
     const failureReason = normalizeString(input.liveFailureReason)
-      || (finalStatus === 'failed'
+      || (status === 'failed'
         ? failureRootCause?.summary || missionProjection?.failureReason || normalizeString(plan?.runtime.replan.reason)
         : undefined);
-    const updatedAt = this.resolveUpdatedAt({
-      events: scopedEvents,
-      plan,
-      mission,
-      explicitUpdatedAt: input.updatedAt,
-    });
-
-    if (!missionProjection && !plan && scopedEvents.length === 0 && !input.liveRuntimeReason && !input.liveFinalStatus) {
+    if (!missionProjection && !plan && scopedEvents.length === 0 && !liveProcessing && !chain) {
       return null;
     }
 
@@ -161,22 +170,56 @@ export class OrchestrationRuntimeDiagnosticsService {
       ...(plan ? { plan: this.mapPlanSummary(plan) } : {}),
       recentTimeline,
       recentStateDiffs,
-      assignments,
       ...(failureRootCause ? { failureRootCause } : {}),
       recovery: this.buildRecoverySummary(mission, plan),
       knowledgeAudit,
     };
+    const lastEventAt = this.resolveLastEventAt({
+      events: scopedEvents,
+      plan,
+      mission,
+      chain,
+      processingStartedAt: input.liveProcessingState?.startedAt,
+    });
+    const startedAt = this.resolveStartedAt(chain, input.liveProcessingState?.startedAt);
+    const statusChangedAt = this.resolveStatusChangedAt({
+      status,
+      chain,
+      plan,
+      startedAt,
+      lastEventAt,
+    });
+    const phase = this.resolvePhase({
+      livePhase: input.livePhase,
+      plan,
+      chain,
+      status,
+    });
+    const statusReason = this.resolveStatusReason({
+      status,
+      chain,
+      plan,
+      runtimeReason,
+    });
 
     return {
       sessionId,
       ...(requestId ? { requestId } : {}),
-      runtimeReason,
-      finalStatus,
+      ...(chain ? { chain: this.mapChainSummary(chain) } : {}),
+      status,
+      phase,
+      ...(statusReason ? { statusReason } : {}),
+      ...(chain?.status === 'interrupted' && chain.recoverable ? { canResume: true } : {}),
+      ...(runtimeReason ? { runtimeReason } : {}),
       ...(failureReason ? { failureReason } : {}),
       errors,
+      ...(startedAt ? { startedAt } : {}),
+      statusChangedAt,
+      lastEventAt,
+      ...((status === 'completed' || status === 'failed' || status === 'cancelled') ? { endedAt: statusChangedAt } : {}),
       runtimeSnapshot: this.cloneRuntimeSnapshot(input.liveRuntimeSnapshot),
       runtimeDecisionTrace: this.cloneDecisionTrace(input.liveRuntimeDecisionTrace),
-      updatedAt,
+      assignments,
       opsView,
     };
   }
@@ -199,6 +242,37 @@ export class OrchestrationRuntimeDiagnosticsService {
       return this.planLedger.getLatestPlanByMission(sessionId, normalizedMissionId, { includeTerminal: true });
     }
     return this.planLedger.getLatestPlan(sessionId);
+  }
+
+  private resolveRelevantChain(
+    sessionId: string,
+    scope: { chainId?: string; requestId?: string },
+  ): ExecutionChainRecord | null {
+    const chains = this.executionChainStore.getChainsBySession(sessionId);
+    if (chains.length === 0) {
+      return null;
+    }
+    if (scope.chainId) {
+      const matched = chains.find((chain) => chain.id === scope.chainId);
+      if (matched) {
+        return matched;
+      }
+    }
+    if (scope.requestId) {
+      const matched = chains
+        .filter((chain) => chain.requestId === scope.requestId)
+        .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+      if (matched) {
+        return matched;
+      }
+    }
+    const running = chains
+      .filter((chain) => chain.status === 'running' || chain.status === 'resuming')
+      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+    if (running) {
+      return running;
+    }
+    return chains.sort((left, right) => right.updatedAt - left.updatedAt)[0] ?? null;
   }
 
   private resolveLatestMissionId(
@@ -306,26 +380,42 @@ export class OrchestrationRuntimeDiagnosticsService {
     });
   }
 
-  private resolveFinalStatus(input: {
-    explicit?: 'completed' | 'failed' | 'cancelled' | 'paused';
-    events: OrchestrationTimelineEvent[];
-    planStatus?: PlanStatus;
+  private resolveRuntimeStatus(input: {
+    chain: ExecutionChainRecord | null;
+    plan: PlanRecord | null;
+    liveProcessing: boolean;
     runtimeReason?: string;
-  }): 'completed' | 'failed' | 'cancelled' | 'paused' {
-    if (input.explicit) {
-      return input.explicit;
-    }
-    for (let index = input.events.length - 1; index >= 0; index -= 1) {
-      const payload = input.events[index].payload || {};
-      const finalStatus = payload.finalStatus;
-      if (finalStatus === 'completed' || finalStatus === 'failed' || finalStatus === 'cancelled' || finalStatus === 'paused') {
-        return finalStatus;
+  }): OrchestrationRuntimeStateStatus {
+    const waitState = input.plan?.runtime.wait.state;
+    const awaitingConfirmation = input.plan?.status === 'awaiting_confirmation'
+      || input.plan?.runtime.replan.state === 'awaiting_confirmation';
+    const isWaiting = waitState === 'external_waiting' || awaitingConfirmation;
+
+    if (input.chain) {
+      switch (input.chain.status) {
+        case 'running':
+        case 'resuming':
+          return isWaiting ? 'waiting' : 'running';
+        case 'paused':
+        case 'interrupted':
+          return 'paused';
+        case 'completed':
+          return 'completed';
+        case 'failed':
+          return 'failed';
+        case 'cancelled':
+          return 'cancelled';
       }
     }
 
-    // 运行终止原因比计划状态更接近“本次请求已如何结束”的事实。
-    // 若 runtimeReason 已明确收敛到终态，不应再被 executing/awaiting_confirmation 之类的计划快照覆盖。
-    if (input.runtimeReason === 'interrupted' || input.runtimeReason === 'cancelled' || input.runtimeReason === 'external_abort') {
+    if (input.liveProcessing) {
+      return isWaiting ? 'waiting' : 'running';
+    }
+
+    if (input.runtimeReason === 'interrupted') {
+      return 'paused';
+    }
+    if (input.runtimeReason === 'cancelled' || input.runtimeReason === 'external_abort') {
       return 'cancelled';
     }
     if (input.runtimeReason === 'stalled' || input.runtimeReason === 'budget_exceeded' || input.runtimeReason === 'external_wait_timeout' || input.runtimeReason === 'upstream_model_error') {
@@ -338,19 +428,22 @@ export class OrchestrationRuntimeDiagnosticsService {
       return 'completed';
     }
 
-    switch (input.planStatus) {
+    switch (input.plan?.status) {
+      case 'draft':
+      case 'approved':
+      case 'executing':
+      case 'partially_completed':
+        return isWaiting ? 'waiting' : 'running';
+      case 'awaiting_confirmation':
+        return 'waiting';
       case 'completed':
         return 'completed';
       case 'failed':
         return 'failed';
       case 'cancelled':
         return 'cancelled';
-      case 'executing':
-      case 'partially_completed':
-      case 'awaiting_confirmation':
-        return 'paused';
       default:
-        return 'completed';
+        return 'idle';
     }
   }
 
@@ -404,19 +497,145 @@ export class OrchestrationRuntimeDiagnosticsService {
     return fallback ? [fallback] : [];
   }
 
-  private resolveUpdatedAt(input: {
+  private resolveLastEventAt(input: {
     events: OrchestrationTimelineEvent[];
     plan: PlanRecord | null;
     mission: Mission | null;
-    explicitUpdatedAt?: number;
+    chain: ExecutionChainRecord | null;
+    processingStartedAt?: number | null;
   }): number {
-    const explicit = typeof input.explicitUpdatedAt === 'number' && Number.isFinite(input.explicitUpdatedAt)
-      ? input.explicitUpdatedAt
-      : 0;
     const eventUpdatedAt = input.events.length > 0 ? input.events[input.events.length - 1].timestamp : 0;
     const planUpdatedAt = typeof input.plan?.updatedAt === 'number' ? input.plan.updatedAt : 0;
     const missionUpdatedAt = typeof input.mission?.updatedAt === 'number' ? input.mission.updatedAt : 0;
-    return Math.max(explicit, eventUpdatedAt, planUpdatedAt, missionUpdatedAt, Date.now());
+    const chainUpdatedAt = typeof input.chain?.updatedAt === 'number' ? input.chain.updatedAt : 0;
+    const phaseUpdatedAt = typeof input.plan?.runtime.phase.updatedAt === 'number' ? input.plan.runtime.phase.updatedAt : 0;
+    const waitUpdatedAt = typeof input.plan?.runtime.wait.updatedAt === 'number' ? input.plan.runtime.wait.updatedAt : 0;
+    const processingStartedAt = typeof input.processingStartedAt === 'number' ? input.processingStartedAt : 0;
+    return Math.max(eventUpdatedAt, planUpdatedAt, missionUpdatedAt, chainUpdatedAt, phaseUpdatedAt, waitUpdatedAt, processingStartedAt);
+  }
+
+  private resolveStartedAt(
+    chain: ExecutionChainRecord | null,
+    processingStartedAt?: number | null,
+  ): number | undefined {
+    if (chain?.createdAt) {
+      return chain.createdAt;
+    }
+    return typeof processingStartedAt === 'number' && Number.isFinite(processingStartedAt) && processingStartedAt > 0
+      ? processingStartedAt
+      : undefined;
+  }
+
+  private resolveStatusChangedAt(input: {
+    status: OrchestrationRuntimeStateStatus;
+    chain: ExecutionChainRecord | null;
+    plan: PlanRecord | null;
+    startedAt?: number;
+    lastEventAt: number;
+  }): number {
+    const chainUpdatedAt = typeof input.chain?.updatedAt === 'number' ? input.chain.updatedAt : 0;
+    const waitUpdatedAt = typeof input.plan?.runtime.wait.updatedAt === 'number' ? input.plan.runtime.wait.updatedAt : 0;
+    const replanUpdatedAt = typeof input.plan?.runtime.replan.updatedAt === 'number' ? input.plan.runtime.replan.updatedAt : 0;
+    const terminationUpdatedAt = typeof input.plan?.runtime.termination.updatedAt === 'number' ? input.plan.runtime.termination.updatedAt : 0;
+    switch (input.status) {
+      case 'running':
+        if (input.chain?.status === 'resuming') {
+          return Math.max(chainUpdatedAt, input.startedAt || 0, input.lastEventAt);
+        }
+        return Math.max(input.startedAt || 0, chainUpdatedAt, input.lastEventAt);
+      case 'waiting':
+        return Math.max(chainUpdatedAt, waitUpdatedAt, replanUpdatedAt, input.lastEventAt);
+      case 'paused':
+      case 'completed':
+      case 'failed':
+      case 'cancelled':
+        return Math.max(chainUpdatedAt, terminationUpdatedAt, input.lastEventAt);
+      case 'idle':
+      default:
+        return Math.max(input.startedAt || 0, input.lastEventAt);
+    }
+  }
+
+  private resolvePhase(input: {
+    livePhase?: string;
+    plan: PlanRecord | null;
+    chain: ExecutionChainRecord | null;
+    status: OrchestrationRuntimeStateStatus;
+  }): string {
+    const isTerminalStatus = input.status === 'completed'
+      || input.status === 'failed'
+      || input.status === 'cancelled';
+    const normalizeTerminalPhase = (value?: string): string | null => {
+      const normalized = normalizeString(value);
+      if (!normalized) {
+        return null;
+      }
+      if (!isTerminalStatus) {
+        return normalized;
+      }
+      switch (normalized) {
+        case 'running':
+        case 'waiting':
+        case 'paused':
+        case 'idle':
+        case 'resuming':
+          return input.status;
+        default:
+          return normalized;
+      }
+    };
+
+    const livePhase = normalizeTerminalPhase(input.livePhase);
+    if (livePhase && livePhase !== 'idle') {
+      return livePhase;
+    }
+    const currentTitle = normalizeTerminalPhase(input.plan?.runtime.phase.currentTitle);
+    if (currentTitle) {
+      return currentTitle;
+    }
+    const phaseState = normalizeTerminalPhase(input.plan?.runtime.phase.state);
+    if (phaseState && phaseState !== 'idle') {
+      return phaseState;
+    }
+    if (input.chain?.status === 'resuming') {
+      return 'resuming';
+    }
+    return input.status;
+  }
+
+  private resolveStatusReason(input: {
+    status: OrchestrationRuntimeStateStatus;
+    chain: ExecutionChainRecord | null;
+    plan: PlanRecord | null;
+    runtimeReason?: string;
+  }): string | undefined {
+    if (input.status === 'waiting') {
+      if (input.plan?.runtime.wait.reasonCode) {
+        return input.plan.runtime.wait.reasonCode;
+      }
+      if (input.plan?.status === 'awaiting_confirmation') {
+        return 'awaiting_confirmation';
+      }
+      if (input.plan?.runtime.replan.state === 'awaiting_confirmation') {
+        return 'replan_awaiting_confirmation';
+      }
+    }
+    if (input.status === 'paused' && input.chain?.interruptedReason) {
+      return input.chain.interruptedReason;
+    }
+    return normalizeString(input.runtimeReason);
+  }
+
+  private mapChainSummary(chain: ExecutionChainRecord): OrchestrationRuntimeChainSummary {
+    return {
+      chainId: chain.id,
+      status: chain.status,
+      recoverable: chain.recoverable,
+      attempt: chain.attempt,
+      createdAt: chain.createdAt,
+      updatedAt: chain.updatedAt,
+      ...(chain.interruptedReason ? { interruptedReason: chain.interruptedReason } : {}),
+    };
   }
 
   private mapMissionSummary(mission: Awaited<ReturnType<OrchestrationReadModelService['getMissionProjection']>> extends infer T ? Exclude<T, null> : never): OrchestrationRuntimeMissionSummary {

@@ -1,21 +1,21 @@
-import { t } from '../../i18n';
-import { logger, LogCategory } from '../../logging';
-import type { DispatchBatch } from './dispatch-batch';
-import { runPostDispatchVerification, type DeliveryVerificationOutcome } from './post-dispatch-verifier';
-import type { MessageHub } from './message-hub';
-import type { DispatchManager } from './dispatch-manager';
-import type { EffectiveModeResolution } from './effective-mode-resolver';
-import type { WorkerSlot } from '../../types';
-import type { VerificationRunner } from '../verification-runner';
+import { t } from '../../../i18n';
+import { logger, LogCategory } from '../../../logging';
+import type { DispatchBatch } from '../dispatch/dispatch-batch';
+import { runPostDispatchVerification, type DeliveryVerificationOutcome } from '../dispatch/post-dispatch-verifier';
+import type { MessageHub } from '../message/message-hub';
+import type { DispatchManager } from '../dispatch/dispatch-manager';
+import type { EffectiveModeResolution } from '../effective-mode-resolver';
+import type { WorkerSlot } from '../../../types';
+import type { VerificationRunner } from '../../verification-runner';
 import type {
   AcceptanceCriterion,
   AcceptanceExecutionReport,
   MissionContinuationPolicy,
   MissionDeliveryStatus,
   MissionStorageManager,
-} from '../mission';
-import { PlanLedgerService } from '../plan-ledger';
-import type { OrchestrationTraceLinks } from '../trace/types';
+} from '../../mission';
+import { PlanLedgerService } from '../../plan-ledger';
+import type { OrchestrationTraceLinks } from '../../trace/types';
 
 export interface DeliveryRoundState {
   deliveryStatusForMission: MissionDeliveryStatus | null;

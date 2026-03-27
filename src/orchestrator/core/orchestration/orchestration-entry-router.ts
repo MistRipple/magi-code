@@ -1,10 +1,10 @@
-import type { InteractionMode } from '../../types';
-import type { ModelAutonomyCapability } from '../../types/agent-types';
-import type { RequirementAnalysis } from '../protocols/types';
-import type { PlanMode } from '../plan-ledger';
-import { extractPrimaryIntent, extractUserConstraints } from './mission-driven-engine-helpers';
-import { resolveEffectiveMode, type EffectiveModeResolution } from './effective-mode-resolver';
-import { classifyRequest, type RequestClassification } from './request-classifier';
+import type { InteractionMode } from '../../../types';
+import type { ModelAutonomyCapability } from '../../../types/agent-types';
+import type { RequirementAnalysis } from '../../protocols/types';
+import type { PlanMode } from '../../plan-ledger';
+import { extractPrimaryIntent, extractUserConstraints } from '../mission-driven-engine-helpers';
+import { resolveEffectiveMode, type EffectiveModeResolution } from '../effective-mode-resolver';
+import { classifyRequest, type RequestClassification } from '../request-classifier';
 
 export interface EntryRoutingDecision {
   requiresModification: boolean;
@@ -135,7 +135,6 @@ export function buildRequirementAnalysis(
         : undefined,
     includeThinking: resolvedClassification.entryPolicy.includeThinking,
     includeToolCalls: resolvedClassification.entryPolicy.includeToolCalls,
-    allowedToolNames: resolvedClassification.entryPolicy.allowedToolNames,
     historyMode: resolvedClassification.entryPolicy.historyMode,
     requiresModification: resolvedClassification.requiresModification,
     decisionFactors: [...resolvedClassification.decisionFactors],

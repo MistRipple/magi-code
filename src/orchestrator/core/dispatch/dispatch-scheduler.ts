@@ -1,5 +1,5 @@
-import { logger, LogCategory } from '../../logging';
-import type { WorkerSlot } from '../../types';
+import { logger, LogCategory } from '../../../logging';
+import type { WorkerSlot } from '../../../types';
 import { DispatchBatch, type DispatchEntry } from './dispatch-batch';
 
 export interface DispatchExecutionWorkerResolution {

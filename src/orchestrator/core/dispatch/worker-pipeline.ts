@@ -16,20 +16,20 @@
 
 import fs from 'fs';
 import path from 'path';
-import type { WorkerSlot } from '../../types';
-import type { IAdapterFactory } from '../../adapters/adapter-factory-interface';
-import type { AutonomousWorker, AutonomousExecutionResult } from '../worker';
-import type { Assignment } from '../mission';
-import type { PlanMode } from '../plan-ledger';
-import type { SnapshotManager } from '../../snapshot-manager';
-import type { ReportCallback } from '../protocols/worker-report';
+import type { WorkerSlot } from '../../../types';
+import type { IAdapterFactory } from '../../../adapters/adapter-factory-interface';
+import type { AutonomousWorker, AutonomousExecutionResult } from '../../worker';
+import type { Assignment } from '../../mission';
+import type { PlanMode } from '../../plan-ledger';
+import type { SnapshotManager } from '../../../snapshot-manager';
+import type { ReportCallback } from '../../protocols/worker-report';
 import type { CancellationToken } from './dispatch-batch';
-import { LspEnforcer } from '../lsp/lsp-enforcer';
-import { logger, LogCategory } from '../../logging';
-import type { AssembledContext } from '../../context/context-assembler';
-import { t } from '../../i18n';
-import type { GitHost } from '../../host';
-import type { WorktreeAllocation, WorktreeMergeResult } from '../../workspace/worktree-manager';
+import { LspEnforcer } from '../../lsp/lsp-enforcer';
+import { logger, LogCategory } from '../../../logging';
+import type { AssembledContext } from '../../../context/context-assembler';
+import { t } from '../../../i18n';
+import type { GitHost } from '../../../host';
+import type { WorktreeAllocation, WorktreeMergeResult } from '../../../workspace/worktree-manager';
 
 type WorkspaceWriteIsolationMode = 'git_worktree' | 'workspace_serial';
 
@@ -65,8 +65,8 @@ export interface PipelineConfig {
 
   // 外部依赖（可选注入）
   snapshotManager?: SnapshotManager | null;
-  contextManager?: import('../../context/context-manager').ContextManager | null;
-  todoManager?: import('../../todo').TodoManager | null;
+  contextManager?: import('../../../context/context-manager').ContextManager | null;
+  todoManager?: import('../../../todo').TodoManager | null;
   /** Git 隔离宿主（当任务需要写操作时注入） */
   gitHost?: GitHost | null;
 
@@ -474,7 +474,7 @@ export class WorkerPipeline {
   private async generateAssembledContext(
     missionId: string,
     workerId: WorkerSlot,
-    contextManager: import('../../context/context-manager').ContextManager,
+    contextManager: import('../../../context/context-manager').ContextManager,
   ): Promise<AssembledContext | undefined> {
     const options = contextManager.buildAssemblyOptions(missionId, workerId, 8000);
     const assembled = await contextManager.getAssembledContext(options);
@@ -573,7 +573,7 @@ export class WorkerPipeline {
    */
   private async resetTodosForRetry(
     assignment: Assignment,
-    todoManager?: import('../../todo').TodoManager | null,
+    todoManager?: import('../../../todo').TodoManager | null,
   ): Promise<void> {
     for (const todo of assignment.todos) {
       if (todo.status === 'completed' || todo.status === 'failed') {
@@ -607,7 +607,7 @@ export class WorkerPipeline {
   private async updateContextManager(
     assignment: Assignment,
     result: AutonomousExecutionResult,
-    contextManager: import('../../context/context-manager').ContextManager,
+    contextManager: import('../../../context/context-manager').ContextManager,
   ): Promise<void> {
     if (result.success) {
       if (result.hasPendingApprovals) {
@@ -686,7 +686,7 @@ export class WorkerPipeline {
 
   private async createWorktreeConflictRepairTodo(input: {
     assignment: Assignment;
-    todoManager?: import('../../todo').TodoManager | null;
+    todoManager?: import('../../../todo').TodoManager | null;
     worktreeMerge: WorktreeMergeResult;
   }): Promise<void> {
     const { assignment, todoManager, worktreeMerge } = input;

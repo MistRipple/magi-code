@@ -83,9 +83,9 @@
  * ```
  */
 
-import type { WorkerSlot } from '../../types';
-import type { StandardMessage, MessageMetadata, ContentBlock, StreamUpdate, NotifyLevel, DataMessageType, NotifyPresentation } from '../../protocol/message-protocol';
-import { MessageType, ControlMessageType } from '../../protocol/message-protocol';
+import type { WorkerSlot } from '../../../types';
+import type { StandardMessage, MessageMetadata, ContentBlock, StreamUpdate, NotifyLevel, DataMessageType, NotifyPresentation } from '../../../protocol/message-protocol';
+import { MessageType, ControlMessageType } from '../../../protocol/message-protocol';
 
 // 导入三层组件
 import { MessageBus, type ProcessingState, type BroadcastData } from './message-bus';

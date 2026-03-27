@@ -1,6 +1,6 @@
-import { t } from '../../i18n';
-import type { WorkerSlot } from '../../types';
-import type { MessageHub, SubTaskCardPayload } from './message-hub';
+import { t } from '../../../i18n';
+import type { WorkerSlot } from '../../../types';
+import type { MessageHub, SubTaskCardPayload } from '../message/message-hub';
 import { DispatchBatch, type DispatchEntry, type DispatchStatus } from './dispatch-batch';
 
 export interface DispatchPresentationAdapterDeps {

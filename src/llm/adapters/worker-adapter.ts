@@ -18,7 +18,7 @@ import {
 } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager, type ToolExecutionContext } from '../../tools/tool-manager';
-import { MessageHub } from '../../orchestrator/core/message-hub';
+import { MessageHub } from '../../orchestrator/core/message/message-hub';
 import { BaseLLMAdapter, AdapterState } from './base-adapter';
 import { logger, LogCategory } from '../../logging';
 import { t } from '../../i18n';

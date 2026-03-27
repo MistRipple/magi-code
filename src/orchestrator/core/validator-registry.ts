@@ -7,7 +7,7 @@ import type {
   VerificationSpecType,
 } from '../mission/types';
 import type { CommandResult, VerificationRunner } from '../verification-runner';
-import type { DispatchBatch } from './dispatch-batch';
+import type { DispatchBatch } from './dispatch/dispatch-batch';
 
 export interface VerificationCommandOptions {
   cwd?: string;

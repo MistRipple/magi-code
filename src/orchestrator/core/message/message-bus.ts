@@ -8,9 +8,9 @@
  */
 
 import { EventEmitter } from 'events';
-import { logger, LogCategory } from '../../logging';
-import type { StandardMessage, StreamUpdate, MessageSource } from '../../protocol/message-protocol';
-import { MessageLifecycle } from '../../protocol/message-protocol';
+import { logger, LogCategory } from '../../../logging';
+import type { StandardMessage, StreamUpdate, MessageSource } from '../../../protocol/message-protocol';
+import { MessageLifecycle } from '../../../protocol/message-protocol';
 
 /** 处理状态 */
 export interface ProcessingState {

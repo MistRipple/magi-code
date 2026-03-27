@@ -1,40 +1,14 @@
 import type { PlanMode } from '../plan-ledger';
 
 export type RequestEntryPath = 'direct_response' | 'lightweight_analysis' | 'task_execution';
-export const REQUEST_CLASSIFIER_VERSION = 'heuristic_v3';
-
-export const READ_ONLY_ANALYSIS_TOOL_NAMES = [
-  'file_view',
-  'code_search_regex',
-  'code_search_semantic',
-  'web_search',
-  'web_fetch',
-  'project_knowledge_query',
-  'mermaid_diagram',
-] as const;
-
-export const EXPLICIT_ORCHESTRATION_TOOL_NAMES = [
-  'worker_dispatch',
-  'worker_send_message',
-  'worker_wait',
-  'context_compact',
-  'todo_list',
-  'todo_update',
-  'file_view',
-  'code_search_regex',
-  'code_search_semantic',
-  'web_search',
-  'web_fetch',
-  'project_knowledge_query',
-  'mermaid_diagram',
-] as const;
+export const REQUEST_CLASSIFIER_VERSION = 'heuristic_v4';
 
 export interface RequestEntryPolicy {
   entryPath: RequestEntryPath;
   includeThinking: boolean;
   includeToolCalls: boolean;
-  historyMode: 'session' | 'isolated';
   allowedToolNames?: string[];
+  historyMode: 'session' | 'isolated';
 }
 
 export interface RequestClassification {
@@ -131,6 +105,7 @@ const CODE_REFERENCE_PATTERN = /(?:\b[A-Za-z_][A-Za-z0-9_]*\.(?:[A-Za-z_][A-Za-z
 const READ_ONLY_PATTERN = /(?:分析|解释|总结|梳理|审查|review|summarize|analy[sz]e|explain|read[\s-]?only)/i;
 const HARD_READ_ONLY_PATTERN = /(?:(?:只做|仅做|只需|仅需|只进行|仅进行)(?:[^。\n；;]{0,18})(?:分析|梳理|评估|任务编排|编排|规划|拆分|review|summarize|analysis)|(?:不(?:要)?修改|不改|勿修改|禁止修改|不触碰)(?:[^。\n；;]{0,12})(?:代码|文件|项目|仓库|源码|页面)?|只读(?:分析|编排)?)/i;
 const ORCHESTRATION_PATTERN = /(?:worker_dispatch|worker_wait|任务编排|任务派发|派发任务|任务拆分|assignment|todo_split|编排|派发)/i;
+const EXPLICIT_WORKER_DISPATCH_PATTERN = /(?:worker_dispatch|worker_wait|(?:必须|需要|应当|应该|请|先|再|立即|直接|继续|使用|采用|安排|分配|调度|分派|派发|调用).{0,20}(?:worker|多\s*worker|多个\s*worker)|(?:worker|多\s*worker|多个\s*worker).{0,20}(?:分别|协作|执行|处理|审查|分析|分工|编排|调度|分派|派发|调用|wait|dispatch|review|analy[sz]e|implement))/i;
 const ASSISTANT_META_PATTERN = /(?:你(?:是|能|可)?做什么|你是谁|你是什么|介绍.*你自己|你的(?:能力|职责)|怎么用|如何使用|模式区别|magi(?:\s+|是|是什么)|who are you|what are you|what can you do|how to use|your role|capabilities)/i;
 
 function includesAny(prompt: string, keywords: string[]): boolean {
@@ -145,12 +120,17 @@ export function hasOrchestrationIntent(prompt: string): boolean {
   return ORCHESTRATION_PATTERN.test(prompt);
 }
 
+export function hasExplicitWorkerDispatchIntent(prompt: string): boolean {
+  return EXPLICIT_WORKER_DISPATCH_PATTERN.test(prompt);
+}
+
 export function classifyRequest(prompt: string, mode: PlanMode): RequestClassification {
   const normalizedPrompt = prompt.toLowerCase();
   const readOnlyKeywordHit = includesAny(normalizedPrompt, READ_ONLY_KEYWORDS);
   const readOnlyPatternHit = READ_ONLY_PATTERN.test(prompt);
   const hardReadOnlyOverrideHit = hasHardReadOnlyIntent(prompt);
   const orchestrationIntentHit = hasOrchestrationIntent(prompt);
+  const explicitWorkerDispatchHit = hasExplicitWorkerDispatchIntent(prompt);
   const writeKeywordHit = includesAny(normalizedPrompt, WRITE_KEYWORDS);
   const highImpactKeywordHit = includesAny(normalizedPrompt, HIGH_IMPACT_KEYWORDS);
   const workspaceKeywordHit = includesAny(normalizedPrompt, WORKSPACE_SCOPED_KEYWORDS);
@@ -169,7 +149,7 @@ export function classifyRequest(prompt: string, mode: PlanMode): RequestClassifi
   const hasConversationalIntent = conversationalKeywordHit || questionLikeHit;
   const isShortConversationalTurn = prompt.trim().length <= 120;
   const requiresModification = !hardReadOnlyOverrideHit && (hasWriteIntent || hasHighImpactIntent);
-  const readOnlyOrchestration = hardReadOnlyOverrideHit && orchestrationIntentHit;
+  const readOnlyOrchestration = explicitWorkerDispatchHit && !requiresModification;
   const isReadOnlyAnalysis = !readOnlyOrchestration
     && !requiresModification
     && (hasReadOnlyIntent || hasWorkspaceScopedIntent || hardReadOnlyOverrideHit);
@@ -179,7 +159,7 @@ export function classifyRequest(prompt: string, mode: PlanMode): RequestClassifi
     && isShortConversationalTurn
     && (hasAssistantMetaIntent || hasConversationalIntent)
     ? 'direct_response'
-    : readOnlyOrchestration
+    : explicitWorkerDispatchHit
       ? 'task_execution'
     : isReadOnlyAnalysis
       ? 'lightweight_analysis'
@@ -198,16 +178,12 @@ export function classifyRequest(prompt: string, mode: PlanMode): RequestClassifi
           includeThinking: false,
           includeToolCalls: true,
           historyMode: 'isolated',
-          allowedToolNames: [...READ_ONLY_ANALYSIS_TOOL_NAMES],
         }
       : {
           entryPath,
           includeThinking: true,
           includeToolCalls: mode === 'deep' || requiresModification || readOnlyOrchestration,
           historyMode: 'session',
-          allowedToolNames: orchestrationIntentHit
-            ? [...EXPLICIT_ORCHESTRATION_TOOL_NAMES]
-            : undefined,
         };
 
   const decisionFactors = Array.from(new Set([
@@ -215,6 +191,7 @@ export function classifyRequest(prompt: string, mode: PlanMode): RequestClassifi
     readOnlyPatternHit ? 'signal:read_only_pattern' : '',
     hardReadOnlyOverrideHit ? 'signal:hard_read_only_override' : '',
     orchestrationIntentHit ? 'signal:orchestration_intent' : '',
+    explicitWorkerDispatchHit ? 'signal:explicit_worker_dispatch_intent' : '',
     writeKeywordHit ? 'signal:write_keyword' : '',
     highImpactKeywordHit ? 'signal:high_impact_keyword' : '',
     workspaceKeywordHit ? 'signal:workspace_keyword' : '',
@@ -245,8 +222,8 @@ export function classifyRequest(prompt: string, mode: PlanMode): RequestClassifi
     entryPolicy,
     reason: entryPath === 'direct_response'
       ? '请求属于非任务型直接问答，应走轻量直答路径，避免编排历史、项目上下文和内部工具污染主线'
-      : readOnlyOrchestration
-        ? '请求属于只读编排语义，应允许编排工具继续生成 Assignment，但保持 requires_modification=false，禁止把本轮扩展为修改型执行'
+      : explicitWorkerDispatchHit
+        ? '请求已明确要求 Worker 编排/派发，应进入唯一任务执行链并开放编排工具；即使当前目标是只读任务，也不能降级到轻量分析链'
       : entryPath === 'lightweight_analysis'
         ? '请求属于只读分析语义，应走轻量分析链路，允许按需使用只读工具，但不进入任务计划、Worker 调度和续跑主链'
         : '请求已进入任务执行语义，需要继续完成计划生成与后续调度决策',

@@ -27,7 +27,7 @@ import { createNormalizer } from '../normalizer';
 import { ToolManager } from '../tools/tool-manager';
 import { SkillsManager } from '../tools/skills-manager';
 import { MCPToolExecutor } from '../tools/mcp-executor';
-import { MessageHub } from '../orchestrator/core/message-hub';
+import { MessageHub } from '../orchestrator/core/message/message-hub';
 import { logger, LogCategory } from '../logging';
 import { IAdapterFactory, AdapterOutputScope, AdapterResponse } from '../adapters/adapter-factory-interface';
 import { ProfileLoader } from '../orchestrator/profile/profile-loader';
@@ -486,9 +486,6 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
       }
       if (typeof options?.includeToolCalls === 'boolean') {
         adapter.setTempEnableToolCalls(options.includeToolCalls);
-      }
-      if (Array.isArray(options?.allowedToolNames)) {
-        adapter.setTempAllowedToolNames(options.allowedToolNames);
       }
       if (options?.historyMode) {
         adapter.setTempHistoryMode(options.historyMode);

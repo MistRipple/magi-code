@@ -1,4 +1,4 @@
-import type { WorkerSlot } from '../../types';
+import type { WorkerSlot } from '../../../types';
 
 interface ResumeExecutionContext {
   sessionId: string;

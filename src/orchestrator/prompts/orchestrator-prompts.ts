@@ -8,7 +8,7 @@
  */
 
 import { WorkerSlot } from '../protocols/types';
-import type { DispatchEntry } from '../core/dispatch-batch';
+import type { DispatchEntry } from '../core/dispatch/dispatch-batch';
 
 // ============================================================================
 // Magi 身份定义（单一信源）
@@ -113,7 +113,7 @@ export function buildUnifiedSystemPrompt(context: UnifiedPromptContext): string 
 No Workers are currently available. Do not call worker_dispatch or worker_send_message. Answer directly or use local tools instead.`);
   } else {
     sections.push(`## Available Workers
-Use worker_dispatch to delegate tasks that involve multi-step code operations or require domain expertise.
+**Workers are your primary execution capability for substantial code tasks.** When Workers are available, actively evaluate whether incoming tasks should be delegated rather than defaulting to doing everything yourself. Do NOT wait for the user to explicitly ask you to "use workers" — recognize appropriate tasks and dispatch autonomously.
 
 ### Worker Overview
 | Worker | Model | Strengths |
@@ -190,7 +190,7 @@ Determine the task level based on the **structural characteristics** of the user
   } else {
     // ==================== 常规模式：功能级治理（三层执行模型） ====================
     sections.push(`## Decision Principles (Normal Mode / Feature-Level)
-Choose the most economical execution approach based on task complexity:
+Choose the execution approach based on task nature and complexity:
 
 **Tier 1 - Direct Response**: No tool calls needed
 - Greetings, knowledge Q&A, code explanations, solution recommendations
@@ -222,16 +222,24 @@ Simple file modifications (renaming, typos, config changes — small edits acros
 1. file_view — inspect the file(s) to be modified first
 2. file_edit — apply precise modifications
 
-**Orchestrator direct-edit rule**: You may directly modify up to 3 files. Modifications exceeding 3 files must be delegated to a Worker via worker_dispatch.
-Complex logic changes (new features, refactoring, multi-file coordination) should be delegated to a Worker even if they involve 3 or fewer files.
+**Orchestrator direct-edit rule**: You may directly modify up to 3 files for localized, single-concern changes where the fix is clear and obvious.
+However, before choosing to edit directly, you must actively evaluate whether the task warrants Worker delegation:
+- Does the task require designing new abstractions or making architectural decisions? → worker_dispatch
+- Does it span multiple modules or require cross-file coordination beyond simple edits? → worker_dispatch
+- Could the task be parallelized across domains (e.g. frontend + backend)? → worker_dispatch
+- Is it a substantial new feature or a multi-step implementation rather than a targeted fix? → worker_dispatch
+- Does it require deep debugging, analysis, or iterative exploration? → worker_dispatch
+If any of the above apply, delegate via worker_dispatch even if the file count is small.
 
 **Tier 3 - Delegate to Worker**: Use worker_dispatch
-- Complex code logic changes (new feature development, refactoring, multi-file coordination)
+- New feature development, substantial refactoring, multi-module coordination
 - Tasks requiring domain expertise (refer to the Routing Table above to choose the correct ownership_hint)
+- Parallel-ready tasks spanning multiple domains
+- Tasks requiring deep debugging, analysis, or design decisions
 - Large-scale refactoring or new feature development
 - When multiple Workers need to collaborate, split into multiple worker_dispatch calls and execute in phases
 
-**Principle**: If Tier 1 suffices, don't use Tier 2. If Tier 2 suffices, don't use Tier 3.
+**Principle**: If Tier 1 suffices, don't use Tier 2. Between Tier 2 and Tier 3, actively consider delegation — Workers are a core capability, not a last resort. Do not default to "doing it yourself" when the task would benefit from Worker expertise, isolation, or parallelism.
 
 **Task grading criteria**:
 Determine the task level based on the **structural characteristics** of the user's request (not implementation complexity — that can only be determined after Worker analysis):

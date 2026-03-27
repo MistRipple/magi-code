@@ -1,29 +1,29 @@
-import { t } from '../../i18n';
-import { logger, LogCategory } from '../../logging';
-import { resolveTimelineAnchorTimestampFromMetadata } from '../../shared/timeline-ordering';
-import type { WorkerSlot } from '../../types';
-import type { TokenUsage } from '../../types/agent-types';
-import type { MessageHub } from './message-hub';
-import type { DispatchManager } from './dispatch-manager';
-import type { EffectiveModeResolution } from './effective-mode-resolver';
+import { t } from '../../../i18n';
+import { logger, LogCategory } from '../../../logging';
+import { resolveTimelineAnchorTimestampFromMetadata } from '../../../shared/timeline-ordering';
+import type { WorkerSlot } from '../../../types';
+import type { TokenUsage } from '../../../types/agent-types';
+import type { MessageHub } from '../message/message-hub';
+import type { DispatchManager } from '../dispatch/dispatch-manager';
+import type { EffectiveModeResolution } from '../effective-mode-resolver';
 import type {
   ResolvedOrchestratorTerminationReason,
   RuntimeTerminationDecisionTraceEntry,
   RuntimeTerminationShadow,
   RuntimeTerminationSnapshot,
 } from './orchestration-control-plane-types';
-import type { RequirementAnalysis } from '../protocols/types';
-import type { VerificationRunner } from '../verification-runner';
+import type { RequirementAnalysis } from '../../protocols/types';
+import type { VerificationRunner } from '../../verification-runner';
 import type {
   AcceptanceCriterion,
   AcceptanceExecutionReport,
   MissionContinuationPolicy,
   MissionDeliveryStatus,
   MissionStorageManager,
-} from '../mission';
-import { PlanLedgerService, type PlanRuntimePhaseState } from '../plan-ledger';
-import type { IAdapterFactory } from '../../adapters/adapter-factory-interface';
-import type { TerminationCandidate } from '../../llm/adapters/orchestrator-termination';
+} from '../../mission';
+import { PlanLedgerService, type PlanRuntimePhaseState } from '../../plan-ledger';
+import type { IAdapterFactory } from '../../../adapters/adapter-factory-interface';
+import type { TerminationCandidate } from '../../../llm/adapters/orchestrator-termination';
 import {
   OrchestrationDeliveryController,
   type DeliveryRoundState,
@@ -34,7 +34,7 @@ import {
   type OrchestrationRecoveryCoordinatorDependencies,
   type RecoveryLoopState,
 } from './orchestration-recovery-coordinator';
-import { publishInternalControlNotice } from './internal-control-notice';
+import { publishInternalControlNotice } from '../internal-control-notice';
 
 export interface RuntimeLoopInput {
   sessionId: string;
@@ -245,7 +245,7 @@ export class OrchestrationRuntimeLoopController {
   async run(input: RuntimeLoopInput): Promise<RuntimeLoopResult> {
     const requiresOrchestrationArtifacts = input.requirementAnalysis.entryPath === 'task_execution'
       && Array.isArray(input.requirementAnalysis.decisionFactors)
-      && input.requirementAnalysis.decisionFactors.includes('signal:orchestration_intent');
+      && input.requirementAnalysis.decisionFactors.includes('signal:explicit_worker_dispatch_intent');
     let recoveryState: RecoveryLoopState = {
       autoRepairAttempt: 0,
       autoContinuationAttempt: 0,
@@ -262,7 +262,6 @@ export class OrchestrationRuntimeLoopController {
     let orchestratorRuntimeShadow: RuntimeTerminationShadow | undefined;
     let orchestratorRuntimeDecisionTrace: RuntimeTerminationDecisionTraceEntry[] | undefined;
     let runtimeTokenUsage: TokenUsage | undefined;
-
     let deliveryStatusForMission: MissionDeliveryStatus | null = null;
     let deliverySummaryForMission: string | undefined;
     let deliveryDetailsForMission: string | undefined;
@@ -271,7 +270,7 @@ export class OrchestrationRuntimeLoopController {
     let continuationPolicyForMission: MissionContinuationPolicy | undefined;
     let continuationReasonForMission: string | undefined;
 
-    while (true) {
+    for (;;) {
       this.deps.helpers.setActiveRoundRequestId(currentRoundRequestId);
       if (currentRoundRequestId !== input.rootRequestId) {
         this.deps.dispatchManager.resetForNewExecutionCycle();
@@ -318,7 +317,6 @@ export class OrchestrationRuntimeLoopController {
           systemPrompt: input.systemPrompt,
           includeThinking: input.requirementAnalysis.includeThinking ?? false,
           includeToolCalls: input.requirementAnalysis.includeToolCalls ?? false,
-          allowedToolNames: input.requirementAnalysis.allowedToolNames,
           historyMode: input.requirementAnalysis.historyMode ?? 'isolated',
           requestId: currentRoundRequestId,
           messageMetadata: {

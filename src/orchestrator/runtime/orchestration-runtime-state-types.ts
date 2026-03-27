@@ -4,24 +4,41 @@ import type {
   ResolvedOrchestratorTerminationReason,
   RuntimeTerminationDecisionTraceEntry,
   RuntimeTerminationSnapshot,
-} from '../core/orchestration-control-plane-types';
+} from '../core/orchestration/orchestration-control-plane-types';
 import type { OrchestrationTraceLinks } from '../trace/types';
+import type { ExecutionChainStatus, InterruptedReason } from './execution-chain-types';
 
-export interface OrchestrationRuntimeDiagnosticsQuery {
+export type OrchestrationRuntimeStateStatus =
+  | 'idle'
+  | 'running'
+  | 'waiting'
+  | 'paused'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export interface OrchestrationRuntimeStateQuery {
   sessionId: string;
   requestId?: string;
   missionId?: string;
   planId?: string;
   batchId?: string;
+  chainId?: string;
   maxTimelineEvents?: number;
   maxStateDiffs?: number;
   maxKnowledgeAuditEntries?: number;
   liveRuntimeReason?: ResolvedOrchestratorTerminationReason;
-  liveFinalStatus?: 'completed' | 'failed' | 'cancelled' | 'paused';
   liveFailureReason?: string;
   liveErrors?: string[];
   liveRuntimeSnapshot?: RuntimeTerminationSnapshot | null;
   liveRuntimeDecisionTrace?: RuntimeTerminationDecisionTraceEntry[];
+  livePhase?: string;
+  liveProcessingState?: {
+    isProcessing: boolean;
+    startedAt?: number | null;
+    source?: string | null;
+    agent?: string | null;
+  };
   updatedAt?: number;
 }
 
@@ -88,6 +105,16 @@ export interface OrchestrationRuntimeAssignmentSummary {
   trace?: OrchestrationTraceLinks;
 }
 
+export interface OrchestrationRuntimeChainSummary {
+  chainId: string;
+  status: ExecutionChainStatus;
+  recoverable: boolean;
+  attempt: number;
+  createdAt: number;
+  updatedAt: number;
+  interruptedReason?: InterruptedReason;
+}
+
 export interface OrchestrationRuntimeFailureRootCause {
   summary: string;
   eventType?: string;
@@ -141,21 +168,28 @@ export interface OrchestrationRuntimeOpsView {
   plan?: OrchestrationRuntimePlanSummary;
   recentTimeline: OrchestrationRuntimeTimelineEntry[];
   recentStateDiffs: OrchestrationRuntimeStateDiffEntry[];
-  assignments: OrchestrationRuntimeAssignmentSummary[];
   failureRootCause?: OrchestrationRuntimeFailureRootCause;
   recovery?: OrchestrationRuntimeRecoverySummary;
   knowledgeAudit?: OrchestrationRuntimeKnowledgeAuditView;
 }
 
-export interface OrchestrationRuntimeDiagnosticsSnapshot {
+export interface OrchestrationRuntimeStateSnapshot {
   sessionId: string;
   requestId?: string;
-  runtimeReason: string;
-  finalStatus: 'completed' | 'failed' | 'cancelled' | 'paused';
+  chain?: OrchestrationRuntimeChainSummary;
+  status: OrchestrationRuntimeStateStatus;
+  phase: string;
+  statusReason?: string;
+  canResume?: boolean;
+  runtimeReason?: string;
   failureReason?: string;
   errors: string[];
+  startedAt?: number;
+  statusChangedAt: number;
+  lastEventAt: number;
+  endedAt?: number;
   runtimeSnapshot?: RuntimeTerminationSnapshot | null;
   runtimeDecisionTrace?: RuntimeTerminationDecisionTraceEntry[];
-  updatedAt: number;
+  assignments: OrchestrationRuntimeAssignmentSummary[];
   opsView?: OrchestrationRuntimeOpsView | null;
 }

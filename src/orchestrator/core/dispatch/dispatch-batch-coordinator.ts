@@ -1,8 +1,8 @@
-import { logger, LogCategory } from '../../logging';
-import { t } from '../../i18n';
-import { MessageType } from '../../protocol/message-protocol';
-import type { WorkerSlot } from '../../types';
-import type { MessageHub } from './message-hub';
+import { logger, LogCategory } from '../../../logging';
+import { t } from '../../../i18n';
+import { MessageType } from '../../../protocol/message-protocol';
+import type { WorkerSlot } from '../../../types';
+import type { MessageHub } from '../message/message-hub';
 import {
   DispatchBatch,
   isTerminalStatus,

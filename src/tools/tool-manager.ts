@@ -42,7 +42,7 @@ import { CodebaseRetrievalExecutor } from './codebase-retrieval-executor';
 import { LspExecutor } from './lsp-executor';
 import { OrchestrationExecutor } from './orchestration-executor';
 import { logger, LogCategory } from '../logging';
-import { PermissionMatrix } from '../types';
+import { SafeguardConfig, SafeguardRule, DEFAULT_SAFEGUARD_CONFIG, DEFAULT_SAFEGUARD_RULES } from '../types';
 import { LLMConfig, WorkerSlot } from '../types/agent-types';
 import { globalEventBus } from '../events';
 import type { SnapshotManager } from '../snapshot-manager';
@@ -110,7 +110,6 @@ export interface UnifiedPromptInfo {
 export interface ToolManagerOptions {
   workspaceRoot?: string;
   workspaceFolders?: WorkspaceFolderInfo[];
-  permissions?: PermissionMatrix;
   hostCapabilities?: HostCapabilities;
 }
 
@@ -148,10 +147,12 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   private mcpExecutors: Map<string, ToolExecutor> = new Map();
   private skillExecutor: ToolExecutor | null = null;
 
-  // 缓存和权限
+  // 缓存
   private toolCache: Map<string, ExtendedToolDefinition> = new Map();
-  private permissions: PermissionMatrix;
-  private authorizationCallback: (toolName: string, toolArgs: any) => Promise<boolean>;
+
+  // 安全防护
+  private safeguardConfig: SafeguardConfig;
+  private dangerousCommandConfirmCallback?: (command: string, matchedRule: string) => Promise<boolean>;
 
   // 快照系统
   private snapshotManager?: SnapshotManager;
@@ -199,12 +200,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       () => this.getKnowledgeAuditMetadata(),
     );
 
-    this.permissions = options.permissions || {
-      allowEdit: true,
-      allowBash: true,
-      allowWeb: true,
-    };
-    this.authorizationCallback = this.createDefaultAuthorizationCallback();
+    this.safeguardConfig = { ...DEFAULT_SAFEGUARD_CONFIG, rules: [...DEFAULT_SAFEGUARD_RULES] };
 
     // 注册并行写入冲突检测（不依赖 snapshotManager，始终生效）
     this.fileExecutor.setParallelWriteCheckCallback((filePath) => this.checkParallelFileWriteConflict(filePath));
@@ -534,24 +530,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   }
 
   /**
-   * 设置工具授权回调
-   */
-  setAuthorizationCallback(callback?: (toolName: string, toolArgs: any) => Promise<boolean>): void {
-    this.authorizationCallback = callback ?? this.createDefaultAuthorizationCallback();
-    logger.info('Tool authorization callback updated', {
-      hasExternalCallback: !!callback
-    }, LogCategory.TOOLS);
-  }
-
-  /**
-   * 默认授权回调：
-   * 在 UI 授权桥接未注入前显式拒绝高风险工具，避免初始化空窗报错。
-   */
-  private createDefaultAuthorizationCallback(): (toolName: string, toolArgs: any) => Promise<boolean> {
-    return async () => false;
-  }
-
-  /**
    * 注册由外部提供的大模型文件编辑回调
    * 透传给 FileExecutor（FileExecutor 实例不再重建，回调持久有效）
    */
@@ -669,21 +647,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   }
 
   /**
-   * 设置权限矩阵
-   */
-  setPermissions(permissions: PermissionMatrix): void {
-    this.permissions = permissions;
-    logger.info('Tool permissions updated', permissions, LogCategory.TOOLS);
-  }
-
-  /**
-   * 获取当前权限
-   */
-  getPermissions(): PermissionMatrix {
-    return { ...this.permissions };
-  }
-
-  /**
    * 注册 MCP 执行器
    */
   registerMCPExecutor(serverId: string, executor: ToolExecutor): void {
@@ -758,28 +721,80 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     ['code-intel-query', 'code_intel_query'],
   ]);
 
-  /**
-   * 仅对高风险（会产生副作用）的工具进行用户授权。
-   * 只读查询类工具默认不弹授权，减少 Ask 模式噪音。
-   */
-  private readonly authorizationRequiredToolNames = new Set<string>([
-    'shell',
-    'file_create',
-    'file_edit',
-    'file_insert',
-    'file_remove',
-  ]);
-
   private normalizeToolName(name: string): string {
     return this.builtinToolAliases.get(name) || name;
   }
 
+  // ============================================================
+  // 安全防护（Safeguard）
+  // ============================================================
+
   /**
-   * 判断工具是否属于高风险副作用操作（需要用户授权）
+   * 更新安全防护配置
    */
-  requiresUserAuthorization(toolName: string): boolean {
-    const normalized = this.normalizeToolName(toolName);
-    return this.authorizationRequiredToolNames.has(normalized);
+  setSafeguardConfig(config: SafeguardConfig): void {
+    this.safeguardConfig = config;
+    logger.info('安全防护配置已更新', { ruleCount: config.rules.length }, LogCategory.TOOLS);
+  }
+
+  /**
+   * 获取当前安全防护配置
+   */
+  getSafeguardConfig(): SafeguardConfig {
+    return { rules: this.safeguardConfig.rules.map(r => ({ ...r })) };
+  }
+
+  /**
+   * 注入危险命令确认回调（由 EventBindingService 注入前端弹窗实现）
+   */
+  setDangerousCommandConfirmCallback(callback: (command: string, matchedRule: string) => Promise<boolean>): void {
+    this.dangerousCommandConfirmCallback = callback;
+  }
+
+  /**
+   * 检查 shell 命令是否命中安全防护规则。
+   * 返回 null 表示放行，返回 ToolResult 表示被拦截或用户拒绝。
+   */
+  private async checkSafeguardRules(toolCall: ToolCall, toolCallId: string): Promise<ToolResult | null> {
+    const command = typeof toolCall.arguments?.command === 'string'
+      ? toolCall.arguments.command
+      : '';
+    if (!command) return null;
+
+    // 从长到短排序，优先匹配最具体的规则（如 "git push --force" 优先于 "git push"）
+    const enabledRules = this.safeguardConfig.rules
+      .filter(r => r.enabled)
+      .sort((a, b) => b.pattern.length - a.pattern.length);
+
+    const matched = enabledRules.find(r => command.includes(r.pattern));
+    if (!matched) return null;
+
+    // 没有确认回调 → 默认拒绝（安全优先）
+    if (!this.dangerousCommandConfirmCallback) {
+      return {
+        toolCallId,
+        content: `命令包含危险操作「${matched.pattern}」，但确认机制未就绪，已阻止执行。`,
+        isError: true,
+      };
+    }
+
+    try {
+      const allowed = await this.dangerousCommandConfirmCallback(command, matched.pattern);
+      if (!allowed) {
+        return {
+          toolCallId,
+          content: `用户拒绝执行包含「${matched.pattern}」的命令。`,
+          isError: true,
+        };
+      }
+      return null; // 用户确认 → 放行
+    } catch {
+      return {
+        toolCallId,
+        content: `危险命令确认请求失败，已阻止执行。`,
+        isError: true,
+      };
+    }
   }
 
   /**
@@ -819,18 +834,12 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
           });
         }
 
-        // 检查授权（包括权限和用户授权）
-        const authCheck = await this.checkAuthorization(normalizedToolCall);
-        if (!authCheck.allowed) {
-          logger.warn('Tool execution blocked', {
-            toolName: normalizedToolCall.name,
-            reason: authCheck.reason,
-          }, LogCategory.TOOLS);
-          return finalize({
-            toolCallId: toolCall.id,
-            content: `Tool blocked: ${authCheck.reason}`,
-            isError: true,
-          });
+        // 安全防护：shell 命令危险操作确认
+        if (normalizedToolCall.name === 'shell') {
+          const safeguardResult = await this.checkSafeguardRules(normalizedToolCall, toolCall.id);
+          if (safeguardResult) {
+            return finalize(safeguardResult);
+          }
         }
 
         // 检查是否是内置工具
@@ -1286,71 +1295,6 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       toolCallId: toolCall.id,
       content: `## Skill Instructions: ${skill.name}\n\n${skill.content}`,
     };
-  }
-
-  /**
-   * 检查工具授权（包括权限和用户授权）
-   */
-  private async checkAuthorization(toolCall: ToolCall): Promise<{ allowed: boolean; reason?: string }> {
-    // 1. 先检查基础权限
-    const permissionCheck = this.checkPermission(toolCall.name);
-    if (!permissionCheck.allowed) {
-      return permissionCheck;
-    }
-
-    // 2. 仅高风险工具需要用户授权（只读工具不需要）
-    const requiresAuthorization = this.requiresUserAuthorization(toolCall.name);
-    if (!requiresAuthorization) {
-      return { allowed: true };
-    }
-
-    // 3. 请求用户授权（Ask 模式下会弹窗，Auto 模式由回调直接放行）
-    try {
-      const allowed = await this.authorizationCallback(toolCall.name, toolCall.arguments);
-      if (!allowed) {
-        return { allowed: false, reason: 'User denied tool authorization' };
-      }
-      return { allowed: true };
-    } catch (error) {
-      return { allowed: false, reason: 'Authorization request failed' };
-    }
-  }
-
-  /**
-   * 检查工具权限
-   */
-  private checkPermission(toolName: string): { allowed: boolean; reason?: string } {
-    // 终端命令工具需要 allowBash 权限
-    if (toolName === 'shell') {
-      if (!this.permissions.allowBash) {
-        return { allowed: false, reason: 'Terminal command execution is disabled' };
-      }
-      return { allowed: true };
-    }
-
-    // 文件写入工具需要 allowEdit 权限
-    if (
-      toolName === 'file_create'
-      || toolName === 'file_edit'
-      || toolName === 'file_insert'
-      || toolName === 'file_remove'
-    ) {
-      if (!this.permissions.allowEdit) {
-        return { allowed: false, reason: 'File editing is disabled' };
-      }
-      return { allowed: true };
-    }
-
-    // Web 工具需要 allowWeb 权限（精确匹配，避免误拦名字含 'web' 的 MCP 工具）
-    if (toolName === 'web_search' || toolName === 'web_fetch') {
-      if (!this.permissions.allowWeb) {
-        return { allowed: false, reason: 'Web access is disabled' };
-      }
-      return { allowed: true };
-    }
-
-    // 其他工具默认允许（只读工具、编排工具、MCP 工具等）
-    return { allowed: true };
   }
 
   /**

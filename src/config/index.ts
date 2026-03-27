@@ -69,7 +69,7 @@ export interface OrchestratorGovernanceThresholdsConfig {
   R_high: number;
 }
 
-export interface OrchestratorConfig {
+export interface OrchestratorGovernanceConfig {
   /** 最大重试次数 */
   maxRetries: number;
   /** 默认超时 (ms) */
@@ -87,7 +87,7 @@ export interface MagiConfig {
   context: ContextConfig;
   task: TaskConfig;
   snapshot: SnapshotConfig;
-  orchestrator: OrchestratorConfig;
+  orchestrator: OrchestratorGovernanceConfig;
 }
 
 /**
@@ -231,7 +231,7 @@ export class ConfigManager {
   private mergeConfig(base: MagiConfig, override: Partial<MagiConfig>): MagiConfig {
     const overrideOrchestrator = override.orchestrator;
     const overrideGovernanceThresholds = overrideOrchestrator
-      ? (overrideOrchestrator as Partial<OrchestratorConfig>).governanceThresholds
+      ? (overrideOrchestrator as Partial<OrchestratorGovernanceConfig>).governanceThresholds
       : undefined;
 
     return {

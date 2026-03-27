@@ -138,6 +138,59 @@ export interface PermissionMatrix {
   allowWeb: boolean;
 }
 
+// ============================================
+// 安全防护
+// ============================================
+
+/**
+ * 安全防护规则类别
+ */
+export type SafeguardCategory =
+  | 'git_history'       // Git 历史变更
+  | 'git_discard'       // Git 丢弃修改
+  | 'package_publish'   // 包发布
+  | 'bulk_delete'       // 批量删除
+  | 'custom';           // 自定义
+
+export interface SafeguardRule {
+  /** 匹配关键词（子串匹配） */
+  pattern: string;
+  /** 是否启用 */
+  enabled: boolean;
+  /** 所属类别 */
+  category: SafeguardCategory;
+}
+
+export interface SafeguardConfig {
+  rules: SafeguardRule[];
+}
+
+/**
+ * 预置安全防护规则（默认全部启用）
+ */
+export const DEFAULT_SAFEGUARD_RULES: SafeguardRule[] = [
+  // Git 历史变更
+  { pattern: 'git commit', enabled: true, category: 'git_history' },
+  { pattern: 'git push', enabled: true, category: 'git_history' },
+  { pattern: 'git push --force', enabled: true, category: 'git_history' },
+  // Git 丢弃修改
+  { pattern: 'git restore', enabled: true, category: 'git_discard' },
+  { pattern: 'git reset --hard', enabled: true, category: 'git_discard' },
+  { pattern: 'git clean', enabled: true, category: 'git_discard' },
+  // 包发布
+  { pattern: 'npm publish', enabled: true, category: 'package_publish' },
+  { pattern: 'yarn publish', enabled: true, category: 'package_publish' },
+  { pattern: 'pnpm publish', enabled: true, category: 'package_publish' },
+  { pattern: 'cargo publish', enabled: true, category: 'package_publish' },
+  // 批量删除
+  { pattern: 'rm -rf', enabled: true, category: 'bulk_delete' },
+  { pattern: 'rm -r', enabled: true, category: 'bulk_delete' },
+];
+
+export const DEFAULT_SAFEGUARD_CONFIG: SafeguardConfig = {
+  rules: [...DEFAULT_SAFEGUARD_RULES],
+};
+
 export interface StrategyConfig {
   enableVerification: boolean;
   enableRecovery: boolean;
@@ -436,6 +489,8 @@ export type WebviewToExtensionMessage =
   | { type: 'clearProjectKnowledge' }
   // 新增：前端错误上报
   | { type: 'uiError'; component: string; detail?: unknown; stack?: string }
+  // 安全防护配置
+  | { type: 'saveSafeguardConfig'; config: import('./types').SafeguardConfig }
   | { type: 'toolAuthorizationResponse'; requestId: string; allowed: boolean }
   | { type: 'interactionResponse'; requestId: string; response: any }
   // 新增：Mermaid 图表

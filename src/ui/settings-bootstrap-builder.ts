@@ -58,6 +58,7 @@ export async function buildSettingsBootstrapPayload(input: {
     profileConfig: await buildProfileConfigSnapshot(),
     skillsConfig: (LLMConfigLoader.loadSkillsConfig()
       || { customTools: [], instructionSkills: [], repositories: [] }) as Record<string, unknown>,
+    safeguardConfig: LLMConfigLoader.loadSafeguardConfig(),
     repositories: LLMConfigLoader.loadRepositories(),
     mcpServers: input.mcpServers,
     workerStatuses: input.workerStatuses,

@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
-import type { WorkerSlot } from '../../types';
-import { logger, LogCategory } from '../../logging';
+import type { WorkerSlot } from '../../../types';
+import { logger, LogCategory } from '../../../logging';
 
 export type DispatchIdempotencyStatus = 'dispatched' | 'completed' | 'failed' | 'cancelled';
 
