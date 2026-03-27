@@ -14,22 +14,6 @@ import type { LocaleCode } from './i18n/types';
 export type { AgentType, WorkerSlot, AgentRole };
 
 
-// 任务类型（用于任务分类和 Worker 分配）
-export type TaskCategory =
-  | 'architecture'  // 架构设计
-  | 'implement'     // 功能实现
-  | 'refactor'      // 代码重构
-  | 'bugfix'        // Bug 修复
-  | 'debug'         // 问题排查
-  | 'data_analysis' // 数据处理/分析
-  | 'frontend'      // 前端开发
-  | 'backend'       // 后端开发
-  | 'test'          // 测试编写
-  | 'document'      // 文档生成
-  | 'review'        // 代码审查
-  | 'simple'        // 简单任务
-  | 'general';      // 通用任务
-
 // ============================================
 // 统一任务类型（从新架构导出）
 // ============================================
@@ -123,97 +107,6 @@ export interface PendingChange {
   contributors?: string[];
 }
 
-// ============================================
-// Worker 角色系统
-// ============================================
-
-// Worker 角色定义
-export interface WorkerRole {
-  type: WorkerSlot;
-  name: string;
-  strengths: string[];
-  taskAffinity: TaskCategory[];
-  keywords: string[];
-  priority: number;  // 1 最高，用于替代选择
-}
-
-
-// 预设角色配置
-export const WORKER_ROLES: Record<WorkerSlot, WorkerRole> = {
-  claude: {
-    type: 'claude',
-    name: '架构师/编排者',
-    strengths: ['整体架构搭建', '系统设计', '任务分解', '代码审查', '重构规划'],
-    taskAffinity: ['architecture', 'refactor', 'review', 'general'],
-    keywords: ['架构', '设计', '重构', '模块', '结构', 'refactor', 'design', 'architecture'],
-    priority: 1
-  },
-  codex: {
-    type: 'codex',
-    name: '修复专家',
-    strengths: ['Bug 修复', '问题排查', '性能调优', '错误处理', '代码调试'],
-    taskAffinity: ['bugfix', 'debug', 'implement'],
-    keywords: ['修复', 'bug', '报错', 'error', 'fix', '调试', 'debug', '性能', 'performance'],
-    priority: 2
-  },
-  gemini: {
-    type: 'gemini',
-    name: '前端专家',
-    strengths: ['前端 UI/UX', '组件开发', '样式处理', '交互逻辑', '响应式设计'],
-    taskAffinity: ['frontend', 'implement', 'test'],
-    keywords: ['前端', 'UI', '组件', '样式', 'CSS', 'React', 'Vue', 'component', 'frontend'],
-    priority: 3
-  }
-};
-
-
-// ============================================
-// Worker 状态系统 (更细粒度)
-// ============================================
-
-// Worker 详细状态枚举
-export enum WorkerStatusCode {
-  AVAILABLE = 'AVAILABLE',           // 可用
-  NOT_CONFIGURED = 'NOT_CONFIGURED', // 未配置
-  AUTH_FAILED = 'AUTH_FAILED',       // 认证失败
-  QUOTA_EXCEEDED = 'QUOTA_EXCEEDED', // 配额耗尽
-  TIMEOUT = 'TIMEOUT',               // 响应超时
-  RUNTIME_ERROR = 'RUNTIME_ERROR',   // 运行时错误
-  NETWORK_ERROR = 'NETWORK_ERROR'    // 网络问题
-}
-
-
-// Worker 详细状态
-export interface WorkerDetailedStatus {
-  type: WorkerSlot;
-  code: WorkerStatusCode;
-  available: boolean;
-  model?: string;
-  provider?: string;
-  error?: string;
-  lastChecked?: Date;
-}
-
-
-// 运行模式等级
-export enum OperationModeLevel {
-  FULL = 3,           // 全功能：Claude + Codex + Gemini
-  DUAL = 2,           // 双 Agent：Claude + 任一
-  SINGLE_CLAUDE = 1,  // 单 Agent：仅 Claude (智能模式)
-  SINGLE_OTHER = 0.5, // 单 Agent：仅 Codex 或 Gemini (简单模式)
-  NONE = 0            // 无可用模型
-}
-
-// 韧性策略结果
-export interface ResilienceStrategy {
-  level: OperationModeLevel;
-  availableWorkers: WorkerSlot[];
-  missingWorkers: WorkerSlot[];
-  hasOrchestrator: boolean;  // Claude 是否可用作编排者
-  recommendation: string;
-  canProceed: boolean;
-  alternativeMap: Partial<Record<WorkerSlot, WorkerSlot>>;  // 替代映射
-}
 
 // Diff 块
 export interface DiffHunk {
@@ -226,16 +119,7 @@ export interface DiffHunk {
   source: AgentType;  // ✅ 使用 AgentType
 }
 
-// 冲突信息
-export interface ConflictInfo {
-  filePath: string;
-  hunks: DiffHunk[];
-  sources: AgentType[];  // ✅ 使用 AgentType
-  description: string;
-}
 
-// 执行模式（Worker 层）
-export type ExecutionMode = 'auto' | 'parallel' | 'sequential';
 
 // ============================================
 // 用户交互模式（Orchestrator 层）
@@ -306,28 +190,6 @@ export const INTERACTION_MODE_CONFIGS: Record<InteractionMode, InteractionModeCo
     maxFilesToModify: 0,  // 可由用户配置
   },
 };
-
-// Worker 配置
-export interface WorkerConfig {
-  workerSlot: WorkerSlot;
-  timeout: number;
-  workingDirectory: string;
-  sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
-}
-
-// Orchestrator 配置
-export interface OrchestratorConfig {
-  mode: ExecutionMode;
-  workers: WorkerConfig[];
-  maxParallel: number;
-  conflictResolution: 'ask' | 'auto-merge' | 'first-wins';
-  permissions?: PermissionMatrix;
-  strategy?: StrategyConfig;
-  workerSelection?: {
-    enabled?: boolean;
-    healthThreshold?: number;
-  };
-}
 
 // ============================================
 // 事件系统

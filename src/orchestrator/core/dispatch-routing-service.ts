@@ -2,7 +2,7 @@ import type { WorkerSlot } from '../../types';
 import type { ProfileLoader } from '../profile/profile-loader';
 import { LLMConfigLoader } from '../../llm/config';
 
-export interface WorkerAvailabilitySnapshot {
+interface WorkerAvailabilitySnapshot {
   availableWorkers: Set<WorkerSlot>;
   unavailableReasons: Map<WorkerSlot, string>;
 }

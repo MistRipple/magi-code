@@ -76,8 +76,6 @@ export type OrchestratorState =
   | 'completed'
   | 'failed';
 
-/** 用户问题回调类型 */
-export type QuestionCallback = (questions: string[], plan: ExecutionPlan) => Promise<string | null>;
 
 /** 编排者配置 */
 export interface OrchestratorConfig {
@@ -139,26 +137,7 @@ export interface OrchestratorConfig {
   };
 }
 
-/** 任务上下文 */
-export interface TaskContext {
-  taskId: string;
-  sessionId?: string;
-  userPrompt: string;
-  plan?: ExecutionPlan;
-  results: ExecutionResult[];
-  risk?: {
-    level: 'low' | 'medium' | 'high';
-    path: 'light' | 'standard' | 'full';
-    hardStop: boolean;
-    verification: 'none' | 'basic' | 'full';
-    score: number;
-    signals: string[];
-  };
-  startTime: number;
-  endTime?: number;
-}
 
-/** 编排者向用户发送的消息类型 */
 export type OrchestratorMessageType =
   | 'plan_ready'
   | 'progress_update'

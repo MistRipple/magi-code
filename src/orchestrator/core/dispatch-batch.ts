@@ -183,7 +183,7 @@ export interface DispatchAuditOutcome {
 }
 
 /** Token 消耗统计 */
-export interface TokenConsumption {
+interface TokenConsumption {
   /** 已消耗的输入 token */
   inputTokens: number;
   /** 已消耗的输出 token */
@@ -192,12 +192,12 @@ export interface TokenConsumption {
   totalTokens: number;
 }
 
-export interface DispatchBatchMetrics {
+interface DispatchBatchMetrics {
   cancellationCallbackErrors: number;
 }
 
 /** DispatchBatch 阶段（显式状态机） */
-export type BatchPhase = 'active' | 'summarizing' | 'archived';
+type BatchPhase = 'active' | 'summarizing' | 'archived';
 
 /** 合法的阶段转换路径 */
 const ALLOWED_PHASE_TRANSITIONS: Record<BatchPhase, BatchPhase[]> = {
@@ -206,19 +206,6 @@ const ALLOWED_PHASE_TRANSITIONS: Record<BatchPhase, BatchPhase[]> = {
   archived: [],                            // 终态，不可转换
 };
 
-/** DispatchBatch 事件 */
-export interface DispatchBatchEvents {
-  /** 单个任务状态变化 */
-  'task:statusChanged': (taskId: string, status: DispatchStatus, result?: DispatchResult) => void;
-  /** 所有任务完成（进入 summarizing 阶段，触发 Phase C） */
-  'batch:allCompleted': (batchId: string, entries: DispatchEntry[]) => void;
-  /** 阶段转换 */
-  'phase:changed': (batchId: string, phase: BatchPhase) => void;
-  /** 任务就绪可执行（依赖已满足） */
-  'task:ready': (taskId: string, entry: DispatchEntry) => void;
-  /** Batch 被取消 */
-  'batch:cancelled': (batchId: string, reason: string, entries: DispatchEntry[]) => void;
-}
 
 // ============================================================================
 // DispatchBatch 实现

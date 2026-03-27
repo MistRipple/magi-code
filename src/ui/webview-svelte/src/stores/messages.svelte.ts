@@ -3304,6 +3304,22 @@ export function getTimelineMessageById(messageId: string): Message | undefined {
   return getEffectiveTimelineMessage(messageId);
 }
 
+/**
+ * 根据 cardId 获取当前时间线中的宿主消息。
+ * 用于处理 update.messageId 与锚点 messageId 不一致，但 cardId 一致的流式场景。
+ */
+export function getTimelineMessageByCardId(cardId: string): Message | undefined {
+  const normalizedCardId = typeof cardId === 'string' ? cardId.trim() : '';
+  if (!normalizedCardId) {
+    return undefined;
+  }
+  const nodeId = timelineNodeIdByCardId.get(normalizedCardId);
+  if (!nodeId) {
+    return undefined;
+  }
+  return getEffectiveTimelineMessage(nodeId);
+}
+
 // 清空所有消息（用于会话切换/新建）
 export function clearAllMessages(options: {
   persist?: boolean;

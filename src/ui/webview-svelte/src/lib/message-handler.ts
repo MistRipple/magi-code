@@ -23,6 +23,7 @@ import {
   sealAllStreamingMessages,
   applyTimelineStreamPatch,
   getTimelineMessageById,
+  getTimelineMessageByCardId,
   upsertTimelineNode,
 } from '../stores/messages.svelte';
 import type { Message, ContentBlock, SessionTimelineProjection } from '../types/message';
@@ -751,17 +752,33 @@ function handleStandardUpdate(message: ClientBridgeMessage) {
     throw new Error('[MessageHandler] 流式更新缺少 messageId');
   }
   const update = rawUpdate;
+  const normalizedCardId = typeof update.cardId === 'string' ? update.cardId.trim() : '';
+  const anchorByMessageId = getTimelineMessageById(update.messageId);
+  const anchorByCardId = !anchorByMessageId && normalizedCardId
+    ? getTimelineMessageByCardId(normalizedCardId)
+    : undefined;
+  const existingMessage = anchorByMessageId || anchorByCardId;
+  const updateAnchorId = anchorByMessageId
+    ? update.messageId
+    : (anchorByCardId?.id || update.messageId);
 
   // 处理 lifecycle 变更
   if (typeof update.lifecycle === 'string' && update.lifecycle === 'completed') {
-    markMessageComplete(update.messageId);
+    markMessageComplete(updateAnchorId);
+    if (updateAnchorId !== update.messageId) {
+      markMessageComplete(update.messageId);
+    }
   }
 
   // 应用增量内容更新（append/replace/block_update/lifecycle_change）
   if (update.updateType) {
-    const existingMessage = getTimelineMessageById(update.messageId);
     if (!existingMessage) {
-      console.error('[MessageHandler] 流式更新缺少时间轴锚点，拒绝静默丢弃:', update.messageId, update);
+      console.error('[MessageHandler] 流式更新缺少时间轴锚点，拒绝静默丢弃:', {
+        messageId: update.messageId,
+        cardId: normalizedCardId || undefined,
+        updateType: update.updateType,
+        eventSeq: update.eventSeq,
+      });
       return;
     }
     const patch = applyStreamUpdate(existingMessage, update);
@@ -786,7 +803,7 @@ function handleStandardUpdate(message: ClientBridgeMessage) {
       }
     }
     if (Object.keys(patch).length > 0) {
-      applyTimelineStreamPatch(update.messageId, patch);
+      applyTimelineStreamPatch(updateAnchorId, patch);
     }
   }
 }

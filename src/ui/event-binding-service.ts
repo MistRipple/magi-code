@@ -415,13 +415,14 @@ export class EventBindingService {
         logger.warn('界面.消息.丢弃_缺少会话标识', { messageId: message.id }, LogCategory.UI);
         return;
       }
+      const messageAliasIds = this.resolveMessageAliasIds(message);
       const isLifecycleCard = message.type === MessageType.TASK_CARD || message.type === MessageType.INSTRUCTION;
       if (this.shouldPersistTimelineAnchorMessage(message)) {
         this.persistTimelineMessage(messageSessionId, message, {
           sendStateUpdate: isLifecycleCard,
         });
       }
-      this.rememberMessageSession(message.id, messageSessionId);
+      this.rememberMessageSessionAliases(messageAliasIds, messageSessionId);
       this.ctx.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.UNIFIED_MESSAGE,
         message,
@@ -431,15 +432,21 @@ export class EventBindingService {
       this.ctx.resolveRequestTimeoutFromMessage(message);
       // 先发送 message 锚点，再回放缓冲 update，确保前端严格遵守
       // “首次落位 -> 原位更新”的统一时间轴约束。
-      this.flushPendingUpdatesForMessage(message.id, messageSessionId);
+      for (const aliasId of messageAliasIds) {
+        this.flushPendingUpdatesForMessage(aliasId, messageSessionId);
+      }
     });
 
     messageHub.on('unified:update', (update) => {
-      const updateSessionId = this.messageSessionByMessageId.get(update.messageId);
+      const updateSessionId = this.resolveUpdateSessionId(update);
       if (!updateSessionId) {
-        this.bufferPendingUpdate(update);
+        const pendingAnchorId = this.resolvePendingUpdateAnchorId(update);
+        if (pendingAnchorId) {
+          this.bufferPendingUpdate(pendingAnchorId, update);
+        }
         return;
       }
+      this.rememberMessageSessionAliases(this.resolveUpdateAliasIds(update), updateSessionId);
       this.ctx.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.UNIFIED_UPDATE,
         update,
@@ -454,12 +461,17 @@ export class EventBindingService {
     });
 
     messageHub.on('unified:complete', (message) => {
-      const completeSessionId = this.resolveMessageSessionId(message) || this.messageSessionByMessageId.get(message.id);
+      const completeAliasIds = this.resolveMessageAliasIds(message);
+      const completeSessionId = this.resolveMessageSessionId(message)
+        || completeAliasIds
+          .map((aliasId) => this.messageSessionByMessageId.get(aliasId))
+          .find((sessionId): sessionId is string => Boolean(sessionId))
+        || null;
       if (!completeSessionId) {
         logger.warn('界面.消息.完成丢弃_缺少会话标识', { messageId: message.id }, LogCategory.UI);
         return;
       }
-      this.rememberMessageSession(message.id, completeSessionId);
+      this.rememberMessageSessionAliases(completeAliasIds, completeSessionId);
       this.ctx.postMessage({
         type: WEBVIEW_MESSAGE_TYPES.UNIFIED_COMPLETE,
         message,
@@ -469,8 +481,10 @@ export class EventBindingService {
       this.ctx.resolveRequestTimeoutFromMessage(message);
       // 终态消息携带最终聚合内容；此前因缺少 session 归属而缓存的 update
       // 一旦走到 complete，就只应视为过期增量并直接清理。
-      this.clearPendingUpdatesForMessage(message.id);
-      this.clearLiveMessageSnapshotPersist(message.id);
+      for (const aliasId of completeAliasIds) {
+        this.clearPendingUpdatesForMessage(aliasId);
+        this.clearLiveMessageSnapshotPersist(aliasId);
+      }
 
       // 消息完成时统一收口到 session 持久化：
       // - timeline 内容进入会话时间轴
@@ -617,11 +631,78 @@ export class EventBindingService {
     return binding.sessionId;
   }
 
+  private normalizeEntityId(raw: unknown): string {
+    return typeof raw === 'string' ? raw.trim() : '';
+  }
+
+  private resolveMessageAliasIds(message: StandardMessage): string[] {
+    const aliases = new Set<string>();
+    const addAlias = (value: unknown): void => {
+      const normalized = this.normalizeEntityId(value);
+      if (normalized) {
+        aliases.add(normalized);
+      }
+    };
+
+    const metadata = message.metadata && typeof message.metadata === 'object'
+      ? message.metadata as Record<string, unknown>
+      : undefined;
+    const subTaskCard = metadata?.subTaskCard && typeof metadata.subTaskCard === 'object'
+      ? metadata.subTaskCard as Record<string, unknown>
+      : undefined;
+
+    addAlias(message.id);
+    addAlias(metadata?.cardId);
+    addAlias(metadata?.workerCardId);
+    addAlias(subTaskCard?.workerCardId);
+
+    return Array.from(aliases);
+  }
+
+  private resolveUpdateAliasIds(update: StreamUpdate): string[] {
+    const aliases = new Set<string>();
+    const messageId = this.normalizeEntityId(update.messageId);
+    const cardId = this.normalizeEntityId(update.cardId);
+    if (messageId) {
+      aliases.add(messageId);
+    }
+    if (cardId) {
+      aliases.add(cardId);
+    }
+    return Array.from(aliases);
+  }
+
+  private resolvePendingUpdateAnchorId(update: StreamUpdate): string {
+    const cardId = this.normalizeEntityId(update.cardId);
+    if (cardId) {
+      return cardId;
+    }
+    return this.normalizeEntityId(update.messageId);
+  }
+
+  private resolveUpdateSessionId(update: StreamUpdate): string | null {
+    for (const aliasId of this.resolveUpdateAliasIds(update)) {
+      const sessionId = this.messageSessionByMessageId.get(aliasId);
+      if (sessionId) {
+        return sessionId;
+      }
+    }
+    return null;
+  }
+
+  private rememberMessageSessionAliases(messageIds: string[], sessionId: string): void {
+    for (const messageId of messageIds) {
+      this.rememberMessageSession(messageId, sessionId);
+    }
+  }
+
   private rememberMessageSession(messageId: string, sessionId: string): void {
-    if (!messageId || !sessionId) {
+    const normalizedMessageId = this.normalizeEntityId(messageId);
+    const normalizedSessionId = this.normalizeEntityId(sessionId);
+    if (!normalizedMessageId || !normalizedSessionId) {
       return;
     }
-    this.messageSessionByMessageId.set(messageId, sessionId);
+    this.messageSessionByMessageId.set(normalizedMessageId, normalizedSessionId);
     if (this.messageSessionByMessageId.size <= this.MAX_MESSAGE_SESSION_ENTRIES) {
       return;
     }
@@ -631,29 +712,29 @@ export class EventBindingService {
     }
   }
 
-  private bufferPendingUpdate(update: StreamUpdate): void {
-    const messageId = update.messageId;
-    if (!messageId) {
+  private bufferPendingUpdate(messageId: string, update: StreamUpdate): void {
+    const normalizedMessageId = this.normalizeEntityId(messageId);
+    if (!normalizedMessageId) {
       return;
     }
-    const list = this.pendingUpdatesByMessageId.get(messageId) || [];
+    const list = this.pendingUpdatesByMessageId.get(normalizedMessageId) || [];
     if (list.length >= this.MAX_PENDING_UPDATES_PER_MESSAGE) {
       list.shift();
     }
     list.push(update);
-    this.pendingUpdatesByMessageId.set(messageId, list);
+    this.pendingUpdatesByMessageId.set(normalizedMessageId, list);
 
-    if (!this.pendingUpdateTimers.has(messageId)) {
+    if (!this.pendingUpdateTimers.has(normalizedMessageId)) {
       const timer = setTimeout(() => {
-        const dropped = this.pendingUpdatesByMessageId.get(messageId)?.length || 0;
-        this.pendingUpdatesByMessageId.delete(messageId);
-        this.pendingUpdateTimers.delete(messageId);
+        const dropped = this.pendingUpdatesByMessageId.get(normalizedMessageId)?.length || 0;
+        this.pendingUpdatesByMessageId.delete(normalizedMessageId);
+        this.pendingUpdateTimers.delete(normalizedMessageId);
         logger.warn('界面.消息.流式更新超时清理', {
-          messageId,
+          messageId: normalizedMessageId,
           dropped,
         }, LogCategory.UI);
       }, this.PENDING_UPDATE_TIMEOUT_MS);
-      this.pendingUpdateTimers.set(messageId, timer);
+      this.pendingUpdateTimers.set(normalizedMessageId, timer);
     }
   }
 
