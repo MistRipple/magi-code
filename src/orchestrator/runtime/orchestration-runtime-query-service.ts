@@ -2,7 +2,6 @@ import type { SessionMeta } from '../../session';
 import type { TaskView } from '../../task/task-view-adapter';
 import type { LocaleCode } from '../../i18n/types';
 import type {
-  InteractionMode,
   LogEntry,
   PendingChange,
   UIProcessingState,
@@ -18,8 +17,6 @@ export interface OrchestrationRuntimeStateQueryInput {
   pendingChanges: PendingChange[];
   isRunning: boolean;
   logs: LogEntry[];
-  interactionMode: InteractionMode;
-  interactionModeUpdatedAt?: number;
   orchestratorPhase?: string;
   activePlan?: UIState['activePlan'];
   planHistory?: UIState['planHistory'];
@@ -57,8 +54,6 @@ export class OrchestrationRuntimeQueryService {
       pendingChanges: [...input.pendingChanges],
       isRunning: input.isRunning,
       logs: [...input.logs],
-      interactionMode: input.interactionMode,
-      interactionModeUpdatedAt: input.interactionModeUpdatedAt,
       orchestratorPhase: input.orchestratorPhase,
       processingState: input.processingState
         ? {

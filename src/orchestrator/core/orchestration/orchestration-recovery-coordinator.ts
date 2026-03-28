@@ -361,8 +361,16 @@ export class OrchestrationRecoveryCoordinator {
       };
     }
 
+    // ── 续航信号解析 ──
+    // runtimeNextSteps 来自 MISSION_OUTCOME.next_steps（唯一权威续航信号）。
+    // undefined = 协议块缺失（内层未输出 MISSION_OUTCOME），此时回退到正则提取。
+    // []        = 协议块存在但无后续步骤，直接按"无续航"处理。
     const resolvedFollowUpSteps = this.deps.helpers.resolveFollowUpSteps(input.runtimeNextSteps);
-    const renderedFollowUpSteps = this.deps.helpers.extractStructuredContinuationStepsFromContent(finalContent);
+    const hasAuthoritativeOutcome = input.runtimeNextSteps !== undefined;
+    // 仅当协议块完全缺失时才回退到正则提取
+    const renderedFollowUpSteps = hasAuthoritativeOutcome
+      ? []
+      : this.deps.helpers.extractStructuredContinuationStepsFromContent(finalContent);
     const structuredFollowUpSteps = resolvedFollowUpSteps.length > 0
       ? resolvedFollowUpSteps
       : renderedFollowUpSteps;

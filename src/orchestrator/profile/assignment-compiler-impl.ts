@@ -106,26 +106,30 @@ function inferModeFromText(text: string): TaskMode {
 }
 
 // ============================================================================
-// Worker 选择
-// ============================================================================
-
-export interface OwnershipWorkerMapping {
-  ownership: TaskOwnership;
-  workers: WorkerSlot[];
-}
-
-// ============================================================================
 // AssignmentCompiler 实现
 // ============================================================================
 
 export class AssignmentCompilerImpl implements IAssignmentCompiler {
   private readonly domainDetector = new DomainDetector();
+  /**
+   * category → worker 路由表（直接来自用户配置的 worker-assignments.json）
+   *
+   * 这是唯一的路由真相来源。LLM 产出的 ownershipHint / modeHint
+   * 本质上就是 category 名称，直接查表即可得到目标 worker。
+   *
+   * 例如：用户配置 codex → [bugfix, debug, review]
+   *       → categoryMap: { debug: codex, review: codex, bugfix: codex }
+   *       → LLM 发出 modeHint='debug' → 查表 → codex
+   */
+  private readonly categoryMap: ReadonlyMap<string, WorkerSlot>;
 
   constructor(
-    private readonly ownershipWorkerMappings: OwnershipWorkerMapping[],
     private readonly fallbackWorker: WorkerSlot,
     private readonly availableWorkers: ReadonlySet<WorkerSlot>,
-  ) {}
+    categoryWorkerMap: ReadonlyMap<string, WorkerSlot>,
+  ) {
+    this.categoryMap = categoryWorkerMap;
+  }
 
   compile(input: AssignmentCompilerInput): AssignmentCompilationResult {
     // ── Step 1: 归一化 hint ──
@@ -173,8 +177,8 @@ export class AssignmentCompilerImpl implements IAssignmentCompiler {
       mode = inferModeFromText([input.taskTitle, input.goal].join(' '));
     }
 
-    // ── Step 5: 选择 worker ──
-    const selectedWorker = this.selectWorker(ownership);
+    // ── Step 5: 选择 worker（mode 亲和性优先） ──
+    const selectedWorker = this.selectWorker(ownership, mode);
     if (!selectedWorker) {
       return {
         ok: false,
@@ -226,29 +230,72 @@ export class AssignmentCompilerImpl implements IAssignmentCompiler {
     return DOMAIN_TO_OWNERSHIP[detection.matchedDomains[0]] || DEFAULT_OWNERSHIP;
   }
 
-  private selectWorker(ownership: TaskOwnership): WorkerSlot | null {
-    // 从映射中找到 ownership 对应的 workers
-    for (const mapping of this.ownershipWorkerMappings) {
-      if (mapping.ownership === ownership) {
-        // 找到第一个可用的 worker
-        for (const worker of mapping.workers) {
-          if (this.availableWorkers.has(worker)) {
-            return worker;
-          }
-        }
-      }
+  /**
+   * 从 categoryMap 直接查表选择 worker
+   *
+   * 优先级链：
+   * 1. 专用 ownership 精确匹配（frontend/backend/integration/data_analysis）
+   *    —— 这些域有明确的职责归属，ownership 是最强路由信号
+   * 2. mode 精确匹配（debug/review/test/implement 等）
+   *    —— 当 ownership 为 general（通用域）时，mode 是更精确的路由信号
+   * 3. fallback → general category
+   * 4. fallback worker
+   * 5. 任意可用 worker
+   *
+   * 设计逻辑：
+   * - ownership=frontend 的任务，即使 mode=implement → 也走 gemini（因为 frontend 是专用域）
+   * - ownership=general + mode=debug 的任务 → 走 codex（因为 general 是通用域，mode 更精确）
+   * - ownership=general + mode=implement 的任务 → 走 claude（implement → claude）
+   *
+   * categoryMap 就是用户配置的 worker-assignments 的直接映射，
+   * 不做任何中间抽象——配什么就查什么。
+   */
+  private static readonly SPECIFIC_OWNERSHIPS = new Set<string>(['frontend', 'backend', 'integration', 'data_analysis']);
+
+  private selectWorker(ownership: TaskOwnership, mode?: TaskMode): WorkerSlot | null {
+    // 1. 专用 ownership 精确查表（非 general 的具体域）
+    if (AssignmentCompilerImpl.SPECIFIC_OWNERSHIPS.has(ownership)) {
+      const ownershipWorker = this.lookupAvailableWorker(ownership);
+      if (ownershipWorker) return ownershipWorker;
     }
 
-    // fallback
+    // 2. mode 精确查表（ownership 为 general 或专用域未命中时）
+    if (mode) {
+      const modeWorker = this.lookupAvailableWorker(mode);
+      if (modeWorker) return modeWorker;
+    }
+
+    // 3. ownership 查表（含 general 兜底）
+    const ownershipWorker = this.lookupAvailableWorker(ownership);
+    if (ownershipWorker) return ownershipWorker;
+
+    // 4. fallback → general category
+    if (ownership !== 'general') {
+      const generalWorker = this.lookupAvailableWorker('general');
+      if (generalWorker) return generalWorker;
+    }
+
+    // 5. fallback worker
     if (this.availableWorkers.has(this.fallbackWorker)) {
       return this.fallbackWorker;
     }
 
-    // 任意可用 worker
+    // 6. 任意可用 worker
     for (const worker of this.availableWorkers) {
       return worker;
     }
 
+    return null;
+  }
+
+  /**
+   * 在 categoryMap 中查找 category 对应的 worker，仅返回当前可用的
+   */
+  private lookupAvailableWorker(category: string): WorkerSlot | null {
+    const worker = this.categoryMap.get(category);
+    if (worker && this.availableWorkers.has(worker)) {
+      return worker;
+    }
     return null;
   }
 
@@ -268,11 +315,11 @@ export class AssignmentCompilerImpl implements IAssignmentCompiler {
       const ownership = DOMAIN_TO_OWNERSHIP[domain];
       if (!isValidOwnership(ownership)) continue;
 
-      const selectedWorker = this.selectWorker(ownership);
-      if (!selectedWorker) continue;
-
       // 推断 mode
       const mode = this.inferModeForSplitTask(input, ownership);
+
+      const selectedWorker = this.selectWorker(ownership, mode);
+      if (!selectedWorker) continue;
 
       // 生成子任务建议
       const suggestedTaskTitle = this.generateSplitTaskTitle(input.taskTitle, ownership);

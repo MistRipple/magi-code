@@ -1193,7 +1193,8 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       let baseline: CriticalPathBaseline | null = null;
       let latestSnapshot: TerminationSnapshot | undefined;
       let lastSnapshot: TerminationSnapshot | null = null;
-      let latestOutcomeSteps: string[] = [];
+      // undefined = 协议块缺失；[] = 有协议块但无后续步骤
+      let latestOutcomeSteps: string[] | undefined;
       let terminationReason: Exclude<OrchestratorTerminationReason, 'unknown'> = 'completed';
       let runtimeShadow: OrchestratorRuntimeState['shadow'];
       const loopStartAt = Date.now();
@@ -1382,7 +1383,10 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           }
           const normalizedOutcomeSteps = normalizeNextSteps(missionOutcome?.next_steps || []);
           const outcomeStatus = missionOutcome?.status;
-          latestOutcomeSteps = normalizedOutcomeSteps;
+          // 仅在协议块存在时更新——undefined 表示本轮未输出协议块
+          if (missionOutcome) {
+            latestOutcomeSteps = normalizedOutcomeSteps;
+          }
           const isSummaryHijack = isSummaryHijackText(assistantText);
           if (isSummaryHijack) {
             summaryHijackRounds++;

@@ -18,7 +18,7 @@ import { ContextManager } from '../../context/context-manager';
 import { GovernedKnowledgeContextService } from '../../knowledge/governed-knowledge-context-service';
 import { logger, LogCategory } from '../../logging';
 import { LLMConfigLoader } from '../../llm/config';
-import { StrategyConfig, WorkerSlot, InteractionMode, INTERACTION_MODE_CONFIGS, InteractionModeConfig } from '../../types';
+import { StrategyConfig, WorkerSlot } from '../../types';
 import { TokenUsage } from '../../types/agent-types';
 import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
@@ -248,9 +248,6 @@ export class MissionDrivenEngine extends EventEmitter {
   // 当前执行的用户原始图片路径（Worker dispatch 传递）
   private activeImagePaths?: string[];
 
-  // 交互模式
-  private interactionMode: InteractionMode = 'auto';
-  private modeConfig: InteractionModeConfig = INTERACTION_MODE_CONFIGS.auto;
   private workspaceFileIndexCache?: { builtAt: number; files: string[]; modules: string[] };
   private workspaceFileIndexPromise?: Promise<{ files: string[]; modules: string[] }>;
   // 运行状态
@@ -549,29 +546,6 @@ export class MissionDrivenEngine extends EventEmitter {
     return this.isRunning;
   }
 
-  /**
-   * 设置交互模式
-   */
-  setInteractionMode(mode: InteractionMode): void {
-    this.interactionMode = mode;
-    this.modeConfig = INTERACTION_MODE_CONFIGS[mode];
-    logger.info('引擎.交互_模式.变更', { mode }, LogCategory.ORCHESTRATOR);
-  }
-
-  /**
-   * 获取当前交互模式
-   */
-  getInteractionMode(): InteractionMode {
-    return this.interactionMode;
-  }
-
-  /**
-   * 获取交互模式配置
-   */
-  getModeConfig(): InteractionModeConfig {
-    return this.modeConfig;
-  }
-
   getPlanLedgerSnapshot(sessionId: string) {
     return this.planLedger.getSnapshot(sessionId);
   }
@@ -769,7 +743,6 @@ export class MissionDrivenEngine extends EventEmitter {
 
   private resolveCurrentEffectiveMode(planningMode: PlanMode) {
     return resolveEffectiveMode({
-      interactionMode: this.interactionMode,
       planningMode,
       modelCapability: this.adapterFactory.getOrchestratorModelCapability?.(),
     });
@@ -2336,7 +2309,6 @@ export class MissionDrivenEngine extends EventEmitter {
         const entryResolution = resolveOrchestrationEntry({
           prompt: trimmedPrompt,
           requestedPlanningMode: adapterPlanMode,
-          interactionMode: this.interactionMode,
           modelCapability: this.adapterFactory.getOrchestratorModelCapability?.(),
         });
         currentPlanMode = entryResolution.requestedPlanningMode;
@@ -3275,8 +3247,6 @@ export class MissionDrivenEngine extends EventEmitter {
         prompt: input.prompt,
         requestedPlanningMode: input.requestedPlanningMode,
         effectivePlanningMode: input.effectiveMode.planningMode,
-        requestedInteractionMode: input.effectiveMode.requestedInteractionMode,
-        effectiveInteractionMode: input.effectiveMode.interactionMode,
         modelCapability: input.effectiveMode.modelCapability,
         classification: input.classification,
       });

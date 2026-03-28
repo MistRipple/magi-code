@@ -133,52 +133,36 @@ export class WorkerPipeline {
     };
 
     // ========== 0. [可选] 写隔离 ==========
-    // Git 仓库：使用 worktree 物理隔离；非 Git 工作区：自动降级为主工作区串行写模式。
+    // Git 仓库：优先使用 worktree 物理隔离；分配失败或非 Git 工作区：自动降级为主工作区串行写模式。
     const requiresWrite = assignment.scope?.requiresModification ?? false;
     let worktreeAllocation: WorktreeAllocation | null = null;
     let writeIsolationMode: WorkspaceWriteIsolationMode | null = null;
     if (requiresWrite) {
-      if (!gitHost) {
-        const isolationError = t('pipeline.errors.worktreeIsolationManagerMissing');
-        logger.error('WorkerPipeline.Worktree.隔离失败_缺少管理器', {
-          assignmentId: assignment.id,
-          worker: assignment.workerId,
-          requiresWrite,
-        }, LogCategory.ORCHESTRATOR);
-        return {
-          executionResult: this.buildWorktreeIsolationFailureResult(assignment, isolationError),
-          lspNewErrors: [],
-          targetChangeDetected: false,
-        };
-      }
-      writeIsolationMode = gitHost.isGitRepository(workspaceRoot)
-        ? 'git_worktree'
-        : 'workspace_serial';
-      if (writeIsolationMode === 'git_worktree') {
+      if (gitHost && gitHost.isGitRepository(workspaceRoot)) {
         worktreeAllocation = gitHost.acquireWorktree({
           workspacePath: workspaceRoot,
           taskId: assignment.id,
         });
-        if (!worktreeAllocation) {
-          const isolationError = t('pipeline.errors.worktreeIsolationAcquireFailed');
-          logger.error('WorkerPipeline.Worktree.隔离失败_分配失败', {
+        if (worktreeAllocation) {
+          writeIsolationMode = 'git_worktree';
+        } else {
+          // worktree 分配失败——降级到串行写模式继续执行
+          writeIsolationMode = 'workspace_serial';
+          logger.warn('WorkerPipeline.Worktree.分配失败_降级串行写模式', {
             assignmentId: assignment.id,
             worker: assignment.workerId,
-            requiresWrite,
             workspaceRoot,
           }, LogCategory.ORCHESTRATOR);
-          return {
-            executionResult: this.buildWorktreeIsolationFailureResult(assignment, isolationError),
-            lspNewErrors: [],
-            targetChangeDetected: false,
-          };
         }
       } else {
+        // 无 Git 环境或非 Git 仓库——使用串行写模式
+        writeIsolationMode = 'workspace_serial';
         logger.info('WorkerPipeline.Worktree.降级_非Git工作区串行写模式', {
           assignmentId: assignment.id,
           worker: assignment.workerId,
           requiresWrite,
           workspaceRoot,
+          reason: !gitHost ? 'gitHost不可用' : '非Git仓库',
         }, LogCategory.ORCHESTRATOR);
       }
     }
@@ -728,32 +712,5 @@ export class WorkerPipeline {
         error: error?.message || String(error),
       }, LogCategory.ORCHESTRATOR);
     }
-  }
-
-  private buildWorktreeIsolationFailureResult(
-    assignment: Assignment,
-    errorMessage: string,
-  ): AutonomousExecutionResult {
-    return {
-      assignment,
-      success: false,
-      completedTodos: [],
-      failedTodos: [],
-      skippedTodos: [],
-      dynamicTodos: [],
-      recoveredTodos: [],
-      totalDuration: 0,
-      errors: [errorMessage],
-      recoveryAttempts: 0,
-      summary: errorMessage,
-      fullSummary: errorMessage,
-      hasPendingApprovals: false,
-      verification: {
-        attempted: false,
-        degraded: false,
-        warnings: [],
-        rounds: 0,
-      },
-    };
   }
 }

@@ -1,17 +1,13 @@
-import type { InteractionMode } from '../../types';
 import type { PlanMode } from '../plan-ledger';
 import type { LLMConfig, ModelAutonomyCapability } from '../../types/agent-types';
 
 export interface EffectiveModeInput {
-  interactionMode: InteractionMode;
   planningMode: PlanMode;
   modelCapability?: ModelAutonomyCapability;
 }
 
 export interface EffectiveModeResolution {
-  interactionMode: InteractionMode;
   planningMode: PlanMode;
-  requestedInteractionMode: InteractionMode;
   requestedPlanningMode: PlanMode;
   modelCapability: ModelAutonomyCapability;
   allowDeepContinuation: boolean;
@@ -78,22 +74,16 @@ export function resolveModelAutonomyCapability(
 
 export function resolveEffectiveMode(input: EffectiveModeInput): EffectiveModeResolution {
   const modelCapability = input.modelCapability ?? 'C3';
-  const allowsAutoInteraction = modelCapability === 'C2' || modelCapability === 'C3';
   const allowsDeepPlanning = modelCapability === 'C1' || modelCapability === 'C3';
-  const interactionMode: InteractionMode = input.interactionMode === 'auto' && allowsAutoInteraction
-    ? 'auto'
-    : 'ask';
   const planningMode: PlanMode = input.planningMode === 'deep' && allowsDeepPlanning
     ? 'deep'
     : 'standard';
 
   return {
-    interactionMode,
     planningMode,
-    requestedInteractionMode: input.interactionMode,
     requestedPlanningMode: input.planningMode,
     modelCapability,
     allowDeepContinuation: planningMode === 'deep',
-    allowAutoGovernanceResume: interactionMode === 'auto',
+    allowAutoGovernanceResume: true,
   };
 }

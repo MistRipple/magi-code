@@ -1,4 +1,3 @@
-import type { InteractionMode } from '../../../types';
 import type { ModelAutonomyCapability } from '../../../types/agent-types';
 import type { RequirementAnalysis } from '../../protocols/types';
 import type { PlanMode } from '../../plan-ledger';
@@ -145,11 +144,9 @@ export function buildRequirementAnalysis(
 export function resolveOrchestrationEntry(input: {
   prompt: string;
   requestedPlanningMode: PlanMode;
-  interactionMode: InteractionMode;
   modelCapability?: ModelAutonomyCapability;
 }): OrchestrationEntryResolution {
   const effectiveMode = resolveEffectiveMode({
-    interactionMode: input.interactionMode,
     planningMode: input.requestedPlanningMode,
     modelCapability: input.modelCapability,
   });

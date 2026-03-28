@@ -24,7 +24,7 @@ import {
   OwnershipGuard,
 } from '../../profile/ownership-guard';
 import type { IAssignmentCompiler } from '../../profile/assignment-compiler';
-import { AssignmentCompilerImpl, type OwnershipWorkerMapping } from '../../profile/assignment-compiler-impl';
+import { AssignmentCompilerImpl } from '../../profile/assignment-compiler-impl';
 import { type TaskOwnership, type TaskMode, getModeConstraints } from '../../profile/task-taxonomy';
 import type { MessageHub } from '../message/message-hub';
 import type { MissionOrchestrator } from '../mission-orchestrator';
@@ -634,30 +634,17 @@ export class DispatchManager {
       }))
     );
 
-    // 构建 ownership → worker 映射，初始化 AssignmentCompiler
+    // 初始化 AssignmentCompiler：直接传入 categoryMap 作为路由表
+    // categoryMap 是 worker-assignments.json 的直接映射（category → worker），
+    // 是路由的唯一数据源——不做中间抽象，配什么就查什么
     const categoryMap = this.deps.profileLoader.getAssignmentLoader().getCategoryMap();
-
-    // 从 category 映射推导 ownership → worker 映射
-    const ownershipWorkerMap = new Map<string, WorkerSlot[]>();
-    for (const [category, worker] of Object.entries(categoryMap)) {
-      // 只取 ownership 类的 category 建立映射
-      if (['frontend', 'backend', 'integration', 'data_analysis', 'general', 'implement', 'simple'].includes(category)) {
-        const ownership = ['frontend', 'backend', 'integration', 'data_analysis'].includes(category)
-          ? category
-          : 'general';
-        const workers = ownershipWorkerMap.get(ownership) || [];
-        if (!workers.includes(worker)) workers.push(worker);
-        ownershipWorkerMap.set(ownership, workers);
-      }
-    }
-    const ownershipMappings: OwnershipWorkerMapping[] = Array.from(ownershipWorkerMap.entries())
-      .map(([ownership, workers]) => ({ ownership: ownership as any, workers }));
+    const categoryWorkerMap = new Map<string, WorkerSlot>(Object.entries(categoryMap) as [string, WorkerSlot][]);
 
     const availableWorkerSet = new Set<WorkerSlot>(
       Array.from(enabledProfiles.keys()),
     );
     const fallbackWorker: WorkerSlot = availableWorkerSet.has('codex') ? 'codex' : 'claude';
-    this.assignmentCompiler = new AssignmentCompilerImpl(ownershipMappings, fallbackWorker, availableWorkerSet);
+    this.assignmentCompiler = new AssignmentCompilerImpl(fallbackWorker, availableWorkerSet, categoryWorkerMap);
 
     // Worker 可用列表变化后立即失效工具缓存，确保 schema 与运行时一致
     toolManager.refreshToolSchemas();

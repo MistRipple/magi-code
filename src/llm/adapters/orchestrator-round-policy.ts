@@ -11,8 +11,12 @@ export function buildContinuePrompt(snapshot: TerminationSnapshot): string {
   const p = snapshot.progressVector;
   if (snapshot.requiredTotal === 0) {
     return [
-      '[System] 当前尚未建立 required todos，请先创建/推进任务再判断终止。',
-      '- 建议优先 worker_dispatch 创建可执行子任务，或使用 todo_update 明确 required 项。',
+      '[System] 当前没有结构化的 required todos。',
+      '- 如果你已完成用户请求，请在输出末尾追加控制块：',
+      MISSION_OUTCOME_START,
+      '{"status":"completed","next_steps":[]}',
+      MISSION_OUTCOME_END,
+      '- 如果还需继续工作，请先通过 worker_dispatch 或 todo_update 建立任务轨道。',
     ].join('\n');
   }
   const remain = Math.max(0, snapshot.requiredTotal - p.terminalRequiredTodos);
@@ -167,6 +171,14 @@ export function evaluateNoTodoToolLoopEscalation(input: {
   };
 }
 
+/**
+ * 无 required-todo 轨道时的纯文本响应终止策略。
+ *
+ * MISSION_OUTCOME 协议块是唯一权威续航信号：
+ * 有协议块时信任模型的语义声明直接终止内层，由外层决定是否续航；
+ * 协议缺失时引导模型输出，有限重试后兜底终止。
+ * continue_with_prompt 仅用于引导输出协议块，不驱动任务推进。
+ */
 export function decideNoTodoPlainResponseAction(input: {
   assistantText: string;
   totalToolResultCount: number;
@@ -179,19 +191,15 @@ export function decideNoTodoPlainResponseAction(input: {
   const hasOutcomeSignal = input.normalizedOutcomeStepCount > 0 || Boolean(input.outcomeStatus);
   const requiresGovernedOutcome = input.explicitOrchestrationRequest || hasToolEvidence;
 
+  // 显式编排请求但无工具执行——给一次纠偏机会，否则终止
   if (input.explicitOrchestrationRequest && !hasToolEvidence) {
-    const nextMissingOutcomeStreak = input.noTodoOutcomeMissingStreak + 1;
-    return nextMissingOutcomeStreak >= 2
-      ? {
-          action: 'terminate_failed',
-          nextMissingOutcomeStreak,
-        }
-      : {
-          action: 'continue_with_prompt',
-          nextMissingOutcomeStreak,
-        };
+    const nextStreak = input.noTodoOutcomeMissingStreak + 1;
+    return nextStreak >= 2
+      ? { action: 'terminate_failed', nextMissingOutcomeStreak: nextStreak }
+      : { action: 'continue_with_prompt', nextMissingOutcomeStreak: nextStreak };
   }
 
+  // 空文本——要求输出协议块
   if (!input.assistantText.trim()) {
     return {
       action: 'request_outcome_block',
@@ -199,37 +207,32 @@ export function decideNoTodoPlainResponseAction(input: {
     };
   }
 
+  // 无治理需求（无工具执行、非显式编排）且无协议块——简单对话直接终止
   if (!requiresGovernedOutcome && !hasOutcomeSignal) {
-    return {
-      action: 'terminate_completed',
-      nextMissingOutcomeStreak: 0,
-    };
+    return { action: 'terminate_completed', nextMissingOutcomeStreak: 0 };
   }
 
-  if (hasToolEvidence) {
-    return {
-      action: 'continue_with_prompt',
-      nextMissingOutcomeStreak: 0,
-    };
+  // 有协议块——信任模型的语义声明
+  if (hasOutcomeSignal) {
+    if (input.outcomeStatus === 'failed') {
+      return { action: 'terminate_failed', nextMissingOutcomeStreak: 0 };
+    }
+    // 声称 running 但没给 next_steps——要求补充
+    if (input.outcomeStatus === 'running' && input.normalizedOutcomeStepCount === 0) {
+      const nextStreak = input.noTodoOutcomeMissingStreak + 1;
+      return nextStreak >= 2
+        ? { action: 'terminate_completed', nextMissingOutcomeStreak: nextStreak }
+        : { action: 'request_outcome_block', nextMissingOutcomeStreak: nextStreak };
+    }
+    // completed 或 running+有steps——终止内层，外层根据 next_steps 决定续航
+    return { action: 'terminate_completed', nextMissingOutcomeStreak: 0 };
   }
 
-  if (!hasOutcomeSignal) {
-    const nextMissingOutcomeStreak = input.noTodoOutcomeMissingStreak + 1;
-    return nextMissingOutcomeStreak >= 2
-      ? {
-          action: 'terminate_failed',
-          nextMissingOutcomeStreak,
-        }
-      : {
-          action: 'request_outcome_block',
-          nextMissingOutcomeStreak,
-        };
-  }
-
-  return {
-    action: input.outcomeStatus === 'failed' ? 'terminate_failed' : 'terminate_completed',
-    nextMissingOutcomeStreak: 0,
-  };
+  // 协议缺失——引导输出协议块，有限重试后兜底终止
+  const nextStreak = input.noTodoOutcomeMissingStreak + 1;
+  return nextStreak >= 2
+    ? { action: 'terminate_completed', nextMissingOutcomeStreak: nextStreak }
+    : { action: 'request_outcome_block', nextMissingOutcomeStreak: nextStreak };
 }
 
 export function shouldRequestTerminalSynthesisAfterToolRound(

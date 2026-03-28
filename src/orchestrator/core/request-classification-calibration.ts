@@ -1,7 +1,6 @@
 import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import type { InteractionMode } from '../../types';
 import type { ModelAutonomyCapability } from '../../types/agent-types';
 import { logger, LogCategory } from '../../logging';
 import type { PlanMode } from '../plan-ledger';
@@ -23,8 +22,6 @@ export interface RequestClassificationDecisionRecord {
   prompt_hash: string;
   requested_planning_mode: PlanMode;
   effective_planning_mode: PlanMode;
-  requested_interaction_mode: InteractionMode;
-  effective_interaction_mode: InteractionMode;
   model_capability: ModelAutonomyCapability;
   classifier_version: string;
   entry_path: RequestEntryPath;
@@ -95,8 +92,6 @@ export function buildRequestClassificationDecisionRecord(input: {
   prompt: string;
   requestedPlanningMode: PlanMode;
   effectivePlanningMode: PlanMode;
-  requestedInteractionMode: InteractionMode;
-  effectiveInteractionMode: InteractionMode;
   modelCapability: ModelAutonomyCapability;
   classification: RequestClassification;
 }): RequestClassificationDecisionRecord {
@@ -115,8 +110,6 @@ export function buildRequestClassificationDecisionRecord(input: {
     prompt_hash: promptHash,
     requested_planning_mode: input.requestedPlanningMode,
     effective_planning_mode: input.effectivePlanningMode,
-    requested_interaction_mode: input.requestedInteractionMode,
-    effective_interaction_mode: input.effectiveInteractionMode,
     model_capability: input.modelCapability,
     classifier_version: input.classification.classifierVersion,
     entry_path: input.classification.entryPolicy.entryPath,

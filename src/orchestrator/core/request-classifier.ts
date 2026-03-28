@@ -182,7 +182,9 @@ export function classifyRequest(prompt: string, mode: PlanMode): RequestClassifi
       : {
           entryPath,
           includeThinking: true,
-          includeToolCalls: mode === 'deep' || requiresModification || readOnlyOrchestration,
+          // task_execution 路径必须启用工具：编排器的核心价值是通过 worker_dispatch 等工具调度任务，
+          // 不注入工具则 LLM 只能以纯文本"叙述"工具调用，导致编排失败
+          includeToolCalls: true,
           historyMode: 'session',
         };
 
