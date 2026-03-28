@@ -143,10 +143,25 @@ export interface AgentChangeDiffPayload {
   currentExists?: boolean;
 }
 
-export interface AgentTaskExecutionResult {
+export interface AgentTaskSubmissionResult {
   success: boolean;
+  accepted: boolean;
+  requestId?: string;
+  sessionId?: string;
   taskId?: string;
   error?: string;
+}
+
+export class AgentApiError extends Error {
+  readonly status: number;
+  readonly action: string;
+
+  constructor(status: number, message: string, action: string) {
+    super(message);
+    this.name = 'AgentApiError';
+    this.status = status;
+    this.action = action;
+  }
 }
 
 interface AgentBindingContext {
@@ -262,7 +277,11 @@ async function parseAgentJson<T>(response: Response, action: string): Promise<T>
         // ignore malformed error payload and fallback to generic message
       }
     }
-    throw new Error(backendError || `${action} failed: ${response.status}`);
+    throw new AgentApiError(
+      response.status,
+      backendError || `${action} failed: ${response.status}`,
+      action,
+    );
   }
 
   const contentType = response.headers.get('content-type') || '';
@@ -564,8 +583,8 @@ export async function removeAgentNotification(notificationId: string): Promise<A
   );
 }
 
-export async function executeAgentTask(prompt: string, requestId?: string): Promise<AgentTaskExecutionResult> {
-  return await postBoundJson<AgentTaskExecutionResult>('/api/task/execute', { prompt, requestId }, 'execute task');
+export async function executeAgentTask(prompt: string, requestId?: string): Promise<AgentTaskSubmissionResult> {
+  return await postBoundJson<AgentTaskSubmissionResult>('/api/task/execute', { prompt, requestId }, 'execute task');
 }
 
 export async function appendAgentTaskMessage(taskId: string, content: string): Promise<Record<string, unknown>> {
@@ -604,23 +623,11 @@ export async function abandonAgentChain(chainId: string): Promise<Record<string,
   return await postBoundJson<Record<string, unknown>>('/api/chain/abandon', { chainId }, 'abandon chain');
 }
 
-export async function setAgentInteractionMode(mode: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/interaction-mode', { mode }, 'set interaction mode');
-}
-
 export async function confirmAgentRecovery(decision: 'retry' | 'rollback' | 'continue'): Promise<Record<string, unknown>> {
   return await postBoundJson<Record<string, unknown>>(
     '/api/interaction/confirm-recovery',
     { decision },
     'confirm recovery',
-  );
-}
-
-export async function respondAgentToolAuthorization(requestId: string, allowed: boolean): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>(
-    '/api/interaction/tool-authorization',
-    { requestId, allowed },
-    'tool authorization response',
   );
 }
 
@@ -874,6 +881,10 @@ export async function installAgentLocalSkill(): Promise<Record<string, unknown>>
 
 export async function saveAgentSkillsConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
   return await postBoundJson<Record<string, unknown>>('/api/settings/skills/config/save', { config }, 'save skills config');
+}
+
+export async function saveAgentSafeguardConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return await postBoundJson<Record<string, unknown>>('/api/settings/safeguard/save', { config }, 'save safeguard config');
 }
 
 export async function addAgentCustomTool(tool: Record<string, unknown>): Promise<Record<string, unknown>> {

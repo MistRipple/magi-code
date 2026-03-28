@@ -1,4 +1,5 @@
 import {
+  AgentApiError,
   agentUrl,
   dispatchAgentConnectionEvent,
   probeReachableAgentBaseUrl,
@@ -24,7 +25,6 @@ import {
   confirmAgentRecovery,
   closeAgentSession,
   respondAgentInteraction,
-  respondAgentToolAuthorization,
   connectAgentMcpServer,
   deleteAgentTask,
   deleteAgentQueuedTaskMessage,
@@ -60,6 +60,7 @@ import {
   saveAgentAuxiliaryConfig,
   saveAgentOrchestratorConfig,
   saveAgentProfileConfig,
+  saveAgentSafeguardConfig,
   saveAgentSkillsConfig,
     saveAgentWorkerConfig,
     revertAgentChange,
@@ -70,7 +71,6 @@ import {
   testAgentAuxiliaryConnection,
   testAgentOrchestratorConnection,
   testAgentWorkerConnection,
-  setAgentInteractionMode,
   startAgentTunnel,
   startAgentTask,
   stopAgentTunnel,
@@ -295,6 +295,13 @@ function normalizeErrorMessage(error: unknown): string | undefined {
   return undefined;
 }
 
+function shouldRecoverFromBridgeError(error: unknown): boolean {
+  if (error instanceof AgentApiError) {
+    return error.status >= 500;
+  }
+  return true;
+}
+
 function emitForcedProcessingIdle(reason: string, extra?: Record<string, unknown>): void {
   emitDataMessage('processingStateChanged', {
     isProcessing: false,
@@ -315,6 +322,8 @@ function emitRecoveringState(reason: string, error?: unknown): void {
     error: normalizeErrorMessage(error),
     baseUrl: resolveAgentBaseUrl(),
   });
+  // 连接恢复中 → 强制收口执行态，避免 UI 卡在"执行中"
+  emitForcedProcessingIdle('connection_recovering', { reason });
 }
 
 function emitConnectedState(reason: string, recovered: boolean): void {
@@ -854,7 +863,20 @@ async function saveCurrentSession(): Promise<void> {
 }
 
 async function executeTask(prompt: string, requestId?: string): Promise<void> {
-  await executeAgentTask(prompt, requestId);
+  try {
+    await executeAgentTask(prompt, requestId);
+  } catch (error) {
+    console.error('[web-client-bridge] 执行任务失败:', error);
+    emitBridgeErrorToast('发送消息', error);
+    emitForcedProcessingIdle('execute_task_failed', {
+      error: normalizeErrorMessage(error),
+      requestId,
+    });
+    if (shouldRecoverFromBridgeError(error)) {
+      closeEventStream();
+      scheduleRecovery('execute_task_failed', error, true);
+    }
+  }
 }
 
 async function interruptTask(trigger: 'user_stop' | 'pause_task' = 'user_stop'): Promise<void> {
@@ -877,19 +899,41 @@ async function clearAllTasks(): Promise<void> {
 }
 
 async function startTask(taskId: string): Promise<void> {
-  await startAgentTask(taskId);
+  try {
+    await startAgentTask(taskId);
+  } catch (error) {
+    console.error('[web-client-bridge] 启动任务失败:', error);
+    emitBridgeErrorToast('启动任务', error);
+    emitForcedProcessingIdle('start_task_failed', {
+      error: normalizeErrorMessage(error),
+      taskId,
+    });
+    if (shouldRecoverFromBridgeError(error)) {
+      closeEventStream();
+      scheduleRecovery('start_task_failed', error, true);
+    }
+  }
 }
 
 async function resumeTask(taskId: string): Promise<void> {
-  await resumeAgentTask(taskId);
+  try {
+    await resumeAgentTask(taskId);
+  } catch (error) {
+    console.error('[web-client-bridge] 恢复任务失败:', error);
+    emitBridgeErrorToast('恢复任务', error);
+    emitForcedProcessingIdle('resume_task_failed', {
+      error: normalizeErrorMessage(error),
+      taskId,
+    });
+    if (shouldRecoverFromBridgeError(error)) {
+      closeEventStream();
+      scheduleRecovery('resume_task_failed', error, true);
+    }
+  }
 }
 
 async function deleteTask(taskId: string): Promise<void> {
   await deleteAgentTask(taskId);
-}
-
-async function setInteractionMode(mode: string): Promise<void> {
-  await setAgentInteractionMode(mode);
 }
 
 async function appendTaskMessage(taskId: string, content: string): Promise<void> {
@@ -906,10 +950,6 @@ async function deleteQueuedTaskMessage(queueId: string): Promise<void> {
 
 async function confirmRecovery(decision: 'retry' | 'rollback' | 'continue'): Promise<void> {
   await confirmAgentRecovery(decision);
-}
-
-async function respondToolAuthorization(requestId: string, allowed: boolean): Promise<void> {
-  await respondAgentToolAuthorization(requestId, allowed);
 }
 
 async function respondInteraction(requestId: string, response: unknown): Promise<void> {
@@ -1052,6 +1092,12 @@ async function saveOrchestratorConfig(config: Record<string, unknown>): Promise<
 
 async function saveAuxiliaryConfig(config: Record<string, unknown>): Promise<void> {
   await saveAgentAuxiliaryConfig(config);
+  cachedSettingsBootstrap = null;
+  await dispatchSettingsBootstrap(true);
+}
+
+async function saveSafeguardConfig(config: Record<string, unknown>): Promise<void> {
+  await saveAgentSafeguardConfig(config);
   cachedSettingsBootstrap = null;
   await dispatchSettingsBootstrap(true);
 }
@@ -1282,6 +1328,13 @@ export function createWebClientBridge(): ClientBridge {
             });
           }
           return;
+        case 'saveSafeguardConfig':
+          if (message.config && typeof message.config === 'object') {
+            void saveSafeguardConfig(message.config as any).catch((error) => {
+              logBridgeOperationFailure('保存安全防护配置', '[web-client-bridge] 保存安全防护配置失败:', error);
+            });
+          }
+          return;
         case 'testWorkerConnection':
           if (typeof message.worker === 'string' && message.config && typeof message.config === 'object') {
             void testWorkerConnection(message.worker, message.config as Record<string, unknown>).catch((error) => {
@@ -1448,9 +1501,7 @@ export function createWebClientBridge(): ClientBridge {
             void executeTask(
               message.prompt,
               typeof message.requestId === 'string' ? message.requestId : undefined,
-            ).catch((error) => {
-              logBridgeOperationFailure('发送消息', '[web-client-bridge] 执行任务失败:', error);
-            });
+            );
           }
           return;
         case 'appendMessage':
@@ -1485,9 +1536,7 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'continueTask':
           if (typeof message.prompt === 'string' && message.prompt.trim()) {
-            void executeTask(message.prompt).catch((error) => {
-              logBridgeOperationFailure('继续任务', '[web-client-bridge] 继续任务失败:', error);
-            });
+            void executeTask(message.prompt);
           }
           return;
         case 'pauseTask':
@@ -1495,16 +1544,12 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'startTask':
           if (typeof message.taskId === 'string' && message.taskId.trim()) {
-            void startTask(message.taskId).catch((error) => {
-              logBridgeOperationFailure('启动任务', '[web-client-bridge] 启动任务失败:', error);
-            });
+            void startTask(message.taskId);
           }
           return;
         case 'resumeTask':
           if (typeof message.taskId === 'string' && message.taskId.trim()) {
-            void resumeTask(message.taskId).catch((error) => {
-              logBridgeOperationFailure('恢复任务', '[web-client-bridge] 恢复任务失败:', error);
-            });
+            void resumeTask(message.taskId);
           }
           return;
         case 'deleteTask':
@@ -1561,13 +1606,6 @@ export function createWebClientBridge(): ClientBridge {
           if (typeof message.key === 'string' && (message.key === 'locale' || message.key === 'deepTask')) {
             void updateSetting(message.key, message.value).catch((error) => {
               logBridgeOperationFailure('更新设置', '[web-client-bridge] 更新设置失败:', error);
-            });
-          }
-          return;
-        case 'setInteractionMode':
-          if (typeof message.mode === 'string' && message.mode.trim()) {
-            void setInteractionMode(message.mode).catch((error) => {
-              logBridgeOperationFailure('更新交互模式', '[web-client-bridge] 更新交互模式失败:', error);
             });
           }
           return;
@@ -1823,13 +1861,6 @@ export function createWebClientBridge(): ClientBridge {
           ).catch((error) => {
             logBridgeOperationFailure('Worker 问答提交', '[web-client-bridge] Worker 问答提交失败:', error);
           });
-          return;
-        case 'toolAuthorizationResponse':
-          if (typeof message.requestId === 'string' && message.requestId.trim()) {
-            void respondToolAuthorization(message.requestId, Boolean(message.allowed)).catch((error) => {
-              logBridgeOperationFailure('工具授权响应', '[web-client-bridge] 工具授权响应失败:', error);
-            });
-          }
           return;
         case 'interactionResponse':
           if (typeof message.requestId === 'string' && message.requestId.trim()) {

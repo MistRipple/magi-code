@@ -22,7 +22,7 @@ export interface SessionBootstrapSnapshot {
     notifications: unknown;
   };
   queuedMessages: BootstrapQueuedMessage[];
-  orchestratorRuntimeDiagnostics?: unknown;
+  orchestratorRuntimeState?: unknown;
   /** 当前 session 的执行链摘要（停止/继续/放弃按钮状态） */
   executionChainSummary?: ExecutionChainBootstrapSummary;
 }

@@ -33,8 +33,6 @@
   const pendingRecovery = $derived(appState.pendingRecovery);
   const pendingClarification = $derived(appState.pendingClarification);
   const pendingWorkerQuestion = $derived(appState.pendingWorkerQuestion);
-  const pendingToolAuthorization = $derived(appState.pendingToolAuthorization);
-  const interactionMode = $derived(appState.appState?.interactionMode || 'auto');
 
   function handleTabChange(tab: TopTabType) {
     setCurrentTopTab(tab);
@@ -74,17 +72,6 @@
     if (!cancelled) setIsProcessing(true);
   }
 
-  function respondToolAuthorization(allowed: boolean) {
-    const requestId = appState.pendingToolAuthorization?.requestId;
-    if (!requestId) {
-      appState.pendingToolAuthorization = null;
-      return;
-    }
-    vscode.postMessage({ type: 'toolAuthorizationResponse', requestId, allowed });
-    appState.pendingToolAuthorization = null;
-    if (allowed) setIsProcessing(true);
-  }
-
 </script>
 
 <div class="app-container">
@@ -121,7 +108,7 @@
     <SettingsPanel onClose={closeSettings} />
   {/if}
 
-  {#if pendingRecovery && interactionMode === 'ask'}
+  {#if pendingRecovery}
     <div class="modal-overlay" role="presentation">
       <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
         <div class="modal-header">
@@ -142,7 +129,7 @@
     </div>
   {/if}
 
-  {#if pendingClarification && interactionMode === 'ask'}
+  {#if pendingClarification}
     <div class="modal-overlay" role="presentation">
       <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
         <div class="modal-header">
@@ -167,7 +154,7 @@
     </div>
   {/if}
 
-  {#if pendingWorkerQuestion && interactionMode === 'ask'}
+  {#if pendingWorkerQuestion}
     <div class="modal-overlay" role="presentation">
       <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
         <div class="modal-header">
@@ -180,24 +167,6 @@
         <div class="modal-footer">
           <button class="modal-btn secondary" onclick={() => submitWorkerQuestion(true)}>{i18n.t('app.workerQuestionCancel')}</button>
           <button class="modal-btn primary" onclick={() => submitWorkerQuestion(false)}>{i18n.t('app.workerQuestionSubmit')}</button>
-        </div>
-      </div>
-    </div>
-  {/if}
-
-  {#if pendingToolAuthorization && interactionMode === 'ask'}
-    <div class="modal-overlay" role="presentation">
-      <div class="modal-dialog" role="dialog" aria-modal="true" tabindex="-1">
-        <div class="modal-header">
-          <h3>{i18n.t('app.toolAuthTitle')}</h3>
-        </div>
-        <div class="modal-body">
-          <p>{i18n.t('app.toolAuthToolLabel')}<strong>{pendingToolAuthorization.toolName}</strong></p>
-          <pre class="modal-pre">{JSON.stringify(pendingToolAuthorization.toolArgs, null, 2)}</pre>
-        </div>
-        <div class="modal-footer">
-          <button class="modal-btn secondary" onclick={() => respondToolAuthorization(false)}>{i18n.t('app.toolAuthDeny')}</button>
-          <button class="modal-btn primary" onclick={() => respondToolAuthorization(true)}>{i18n.t('app.toolAuthAllow')}</button>
         </div>
       </div>
     </div>

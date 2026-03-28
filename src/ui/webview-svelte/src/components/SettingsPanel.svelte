@@ -1472,6 +1472,9 @@
       // MCP 工具列表加载（首次获取）
       else if (dataType === 'mcpServerTools') {
         if (payload?.serverId) {
+          if (payload?.servers) {
+            applyMcpServersPayload(payload.servers);
+          }
           const tools = ensureArray(payload.tools);
           mcpServerTools = { ...mcpServerTools, [payload.serverId]: tools };
           // 清除刷新状态
@@ -1483,6 +1486,9 @@
       // MCP 工具列表刷新
       else if (dataType === 'mcpToolsRefreshed') {
         if (payload?.serverId) {
+          if (payload?.servers) {
+            applyMcpServersPayload(payload.servers);
+          }
           const tools = ensureArray(payload.tools);
           mcpServerTools = { ...mcpServerTools, [payload.serverId]: tools };
           // 清除刷新状态

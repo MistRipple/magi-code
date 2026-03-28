@@ -4,13 +4,10 @@
   import {
     addToast,
     getActiveInteractionType,
-    getInteractionMode,
-    getRequestedInteractionMode,
     getQueuedMessages,
     getRequestBinding,
-    isInteractionModeSyncing,
-    requestInteractionMode,
     messagesState,
+    setIsProcessing,
   } from '../stores/messages.svelte';
   import type { StandardMessage } from '../../../../protocol/message-protocol';
   import { MessageCategory } from '../../../../protocol/message-protocol';
@@ -34,11 +31,6 @@
 
   // 输入内容
   let inputValue = $state('');
-
-  // 模式选择
-  const interactionMode = $derived.by(() => getInteractionMode());
-  const requestedInteractionMode = $derived.by(() => getRequestedInteractionMode());
-  const isModeSyncing = $derived.by(() => isInteractionModeSyncing());
 
   // 技能下拉列表状态
   let skillDropdownOpen = $state(false);
@@ -129,11 +121,6 @@
   // 发送消息（支持图片附件）
   // 执行中发送输入 = 暂存队列（当前轮结束后 FIFO 自动续跑）
   function sendMessage() {
-    if (isModeSyncing) {
-      addToast('warning', i18n.t('input.modeSyncNotReady'));
-      return;
-    }
-
     const rawContent = inputValue;
     const normalizedContent = rawContent.trim();
     // 允许只发送图片（无文字）或只发送文字，或只发送已选技能
@@ -180,10 +167,14 @@
       vscode.postMessage({
         type: 'executeTask',
         prompt: finalPrompt || i18n.t('input.analyzeImages'),
-        mode: interactionMode,
         requestId,
         images: selectedImages.map(img => ({ dataUrl: img.dataUrl })),
       });
+      // 乐观更新：立即标记为处理中 + 清空输入，
+      // 防止快速连续发送时后续消息也走 executeTask 路径而非排队路径。
+      // 后端 SSE 推送 processingState 后会覆盖此值；请求失败时 bridge 层会回退到 idle。
+      setIsProcessing(true);
+      clearComposerState();
     }
   }
 
@@ -267,15 +258,6 @@
     if (!content || isEnhancing) return;
     isEnhancing = true;
     vscode.postMessage({ type: 'enhancePrompt', prompt: content });
-  }
-
-  // 切换模式
-  function setMode(mode: 'ask' | 'auto') {
-    if (isModeSyncing && requestedInteractionMode === mode) {
-      return;
-    }
-    requestInteractionMode(mode);
-    vscode.postMessage({ type: 'setInteractionMode', mode });
   }
 
   // 切换深度任务模式
@@ -569,24 +551,6 @@
           {/if}
         </div>
 
-        <!-- 模式开关（滑块 Toggle） -->
-        <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-        <div
-          class="ia-toggle"
-          class:auto={interactionMode === 'auto'}
-          class:syncing={isModeSyncing}
-          role="switch"
-          aria-checked={interactionMode === 'auto'}
-          tabindex="0"
-          onclick={() => setMode(interactionMode === 'ask' ? 'auto' : 'ask')}
-          onkeydown={(e) => e.key === 'Enter' && setMode(interactionMode === 'ask' ? 'auto' : 'ask')}
-          title={isModeSyncing ? i18n.t('input.modeSwitching') : (interactionMode === 'ask' ? i18n.t('input.currentAskMode') : i18n.t('input.currentAutoMode'))}
-        >
-          <span class="ia-toggle-label ask" class:active={interactionMode === 'ask'}>{i18n.t('input.mode.ask')}</span>
-          <span class="ia-toggle-label auto" class:active={interactionMode === 'auto'}>{i18n.t('input.mode.auto')}</span>
-          <span class="ia-toggle-thumb" class:syncing={isModeSyncing}></span>
-        </div>
-
         <!-- 深度任务模式开关 -->
         <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
         <button
@@ -622,8 +586,8 @@
             class="ia-send ready"
             data-testid="input-send-button"
             onclick={sendMessage}
-            disabled={isInteractionBlocking || isModeSyncing}
-            title={isModeSyncing ? i18n.t('input.modeSwitchingShort') : (isSending ? i18n.t('input.sendSupplementary') : i18n.t('input.send'))}
+            disabled={isInteractionBlocking}
+            title={isSending ? i18n.t('input.sendSupplementary') : i18n.t('input.send')}
           >
             <Icon name="send" size={14} />
           </button>
@@ -924,67 +888,6 @@
     text-align: center;
     color: var(--foreground-muted);
     font-size: 11px;
-  }
-
-  /* 模式开关（滑块 Toggle） */
-  .ia-toggle {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
-    width: 72px;
-    height: 24px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-full);
-    cursor: pointer;
-    user-select: none;
-    flex-shrink: 0;
-    transition: border-color var(--transition-fast);
-  }
-
-  .ia-toggle:hover { border-color: var(--foreground-muted); }
-  .ia-toggle.syncing { border-color: var(--warning); }
-
-  .ia-toggle-label {
-    position: relative;
-    z-index: 1;
-    flex: 1;
-    text-align: center;
-    font-size: 10px;
-    font-weight: var(--font-semibold);
-    letter-spacing: 0.02em;
-    color: var(--foreground-muted);
-    transition: color var(--transition-fast);
-    pointer-events: none;
-    line-height: 22px;
-  }
-
-  .ia-toggle-label.active { color: white; }
-
-  .ia-toggle-thumb {
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    width: calc(50% - 3px);
-    height: calc(100% - 4px);
-    background: var(--primary);
-    border-radius: var(--radius-full);
-    transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-    pointer-events: none;
-  }
-
-  .ia-toggle.auto .ia-toggle-thumb {
-    transform: translateX(calc(100% + 2px));
-  }
-
-  .ia-toggle-thumb.syncing {
-    background: var(--warning);
-    animation: ia-thumb-pulse 0.8s ease-in-out infinite;
-  }
-
-  @keyframes ia-thumb-pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
   }
 
   /* 深度任务模式按钮 */

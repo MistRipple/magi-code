@@ -86,12 +86,6 @@ export interface EventBindingContext {
 // ============================================================================
 
 export class EventBindingService {
-  // 工具授权状态（从 WVP 迁移）
-  private toolAuthorizationCallbacks = new Map<string, (allowed: boolean) => void>();
-  private toolAuthorizationQueue: Array<{ requestId: string; toolName: string; toolArgs: any }> = [];
-  private activeToolAuthorizationRequestId: string | null = null;
-  private activeToolAuthorizationTimer: NodeJS.Timeout | null = null;
-  private readonly toolAuthorizationTimeoutMs = 60000;
   private readonly messageSessionByMessageId = new Map<string, string>();
   private readonly MAX_MESSAGE_SESSION_ENTRIES = 10000;
   private readonly pendingUpdatesByMessageId = new Map<string, StreamUpdate[]>();
@@ -310,51 +304,6 @@ export class EventBindingService {
     });
   }
 
-  // ============================================================================
-  // 工具授权（从 WVP 迁移的完整状态管理）
-  // ============================================================================
-
-  requestToolAuthorization(toolName: string, toolArgs: unknown): Promise<boolean> {
-    const requestId = `tool-auth-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    return new Promise<boolean>((resolve) => {
-      this.toolAuthorizationCallbacks.set(requestId, resolve);
-      this.toolAuthorizationQueue.push({
-        requestId,
-        toolName,
-        toolArgs,
-      });
-      this.pumpToolAuthorizationQueue();
-    });
-  }
-
-  handleToolAuthorizationResponse(requestId: string | undefined, allowed: boolean): void {
-    if (!requestId) {
-      logger.warn('界面.工具授权.响应缺少请求ID', undefined, LogCategory.UI);
-      this.ctx.sendToast(t('eventBinding.toolAuthMissingRequestId'), 'warning');
-      return;
-    }
-
-    const callback = this.toolAuthorizationCallbacks.get(requestId);
-    if (!callback) {
-      logger.warn('界面.工具授权.回调不存在', { requestId }, LogCategory.UI);
-      return;
-    }
-
-    this.toolAuthorizationCallbacks.delete(requestId);
-    if (this.activeToolAuthorizationRequestId === requestId) {
-      this.activeToolAuthorizationRequestId = null;
-      this.clearActiveToolAuthorizationTimer();
-    }
-
-    callback(allowed);
-    this.pumpToolAuthorizationQueue();
-  }
-
-  /** 清理所有待处理工具授权（dispose 时调用） */
-  disposeToolAuthorization(): void {
-    this.resetSessionRuntimeState();
-  }
-
   flushLiveMessageSnapshots(options: { silent?: boolean } = {}): void {
     for (const messageId of Array.from(this.liveSnapshotPersistTimers.keys())) {
       const sessionId = this.messageSessionByMessageId.get(messageId);
@@ -367,13 +316,6 @@ export class EventBindingService {
   }
 
   resetSessionRuntimeState(): void {
-    this.clearActiveToolAuthorizationTimer();
-    this.activeToolAuthorizationRequestId = null;
-    this.toolAuthorizationQueue = [];
-    for (const callback of this.toolAuthorizationCallbacks.values()) {
-      callback(false);
-    }
-    this.toolAuthorizationCallbacks.clear();
     for (const timer of this.pendingUpdateTimers.values()) {
       clearTimeout(timer);
     }
@@ -651,13 +593,6 @@ export class EventBindingService {
     this.bindMissionEvents();
   }
 
-  private clearActiveToolAuthorizationTimer(): void {
-    if (this.activeToolAuthorizationTimer) {
-      clearTimeout(this.activeToolAuthorizationTimer);
-      this.activeToolAuthorizationTimer = null;
-    }
-  }
-
   private resolveMessageSessionId(message: StandardMessage): string | null {
     const binding = resolveStandardMessageSessionBinding(message);
     if (binding.hasConflict) {
@@ -920,52 +855,5 @@ export class EventBindingService {
       });
     }, EventBindingService.PROJECTION_BROADCAST_DEBOUNCE_MS);
     this.pendingProjectionBroadcastTimers.set(normalizedSessionId, timer);
-  }
-
-  private pumpToolAuthorizationQueue(): void {
-    if (this.activeToolAuthorizationRequestId) return;
-    const next = this.toolAuthorizationQueue.shift();
-    if (!next) return;
-
-    const messageHub = this.ctx.getMessageHub();
-    const activeSessionId = this.ctx.getActiveSessionId();
-    this.activeToolAuthorizationRequestId = next.requestId;
-
-    const interactionMsg = createInteractionMessage(
-      {
-        type: InteractionType.PERMISSION,
-        requestId: next.requestId,
-        prompt: t('eventBinding.toolAuthRequest', { toolName: next.toolName }),
-        required: true,
-      },
-      'orchestrator',
-      'orchestrator',
-      next.requestId,
-      {
-        metadata: activeSessionId ? { sessionId: activeSessionId } : {},
-      }
-    );
-    messageHub.sendMessage(interactionMsg);
-
-    this.ctx.sendData('toolAuthorizationRequest', {
-      requestId: next.requestId,
-      toolName: next.toolName,
-      toolArgs: next.toolArgs,
-    });
-
-    this.clearActiveToolAuthorizationTimer();
-    this.activeToolAuthorizationTimer = setTimeout(() => {
-      const requestId = this.activeToolAuthorizationRequestId;
-      if (!requestId) return;
-      const callback = this.toolAuthorizationCallbacks.get(requestId);
-      if (callback) {
-        logger.warn('界面.工具授权.响应超时', { requestId }, LogCategory.UI);
-        this.toolAuthorizationCallbacks.delete(requestId);
-        callback(false);
-      }
-      this.activeToolAuthorizationRequestId = null;
-      this.activeToolAuthorizationTimer = null;
-      this.pumpToolAuthorizationQueue();
-    }, this.toolAuthorizationTimeoutMs);
   }
 }

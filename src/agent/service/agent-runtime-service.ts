@@ -132,7 +132,6 @@ export class AgentWorkspaceRuntime {
   private readonly inflightOperations = new Map<string, Promise<unknown>>();
   private runtimeInitializationPromise: Promise<void>;
   private activeSessionId: string | null = null;
-  private interactionModeUpdatedAt = Date.now();
   private queuedMessagesDrainRunning = false;
   private pendingRecoveryContext: PendingRecoveryContext | null = null;
   private submissionQueue: Promise<void> = Promise.resolve();
@@ -462,6 +461,8 @@ export class AgentWorkspaceRuntime {
     } finally {
       messageHub.finalizeRequestContext(requestId);
       messageHub.forceProcessingState(false);
+      // 任务执行完毕后，自动推进排队中的下一条消息
+      void this.drainQueuedMessagesIfIdle();
     }
   }
 
@@ -657,16 +658,6 @@ export class AgentWorkspaceRuntime {
     return true;
   }
 
-  async handleToolAuthorizationResponse(requestId: string | undefined, allowed: boolean): Promise<boolean> {
-    await this.ensureInitialized();
-    if (!requestId?.trim()) {
-      return false;
-    }
-    this.eventBindingService.handleToolAuthorizationResponse(requestId, allowed);
-    await this.sendStateUpdate();
-    return true;
-  }
-
   async handleInteractionResponse(requestId: string, response: unknown): Promise<boolean> {
     await this.ensureInitialized();
     const normalizedRequestId = requestId.trim();
@@ -797,17 +788,6 @@ export class AgentWorkspaceRuntime {
     this.sendQueuedMessagesUpdate(sessionId);
     void this.drainQueuedMessagesIfIdle();
     return true;
-  }
-
-  async setInteractionMode(mode: string): Promise<void> {
-    await this.ensureInitialized();
-    this.orchestratorEngine.setInteractionMode(mode as UIState['interactionMode']);
-    this.interactionModeUpdatedAt = Date.now();
-    this.sendData('interactionModeChanged', {
-      mode,
-      updatedAt: this.interactionModeUpdatedAt,
-    });
-    await this.sendStateUpdate();
   }
 
   async clearAllTasks(): Promise<void> {
@@ -973,8 +953,6 @@ export class AgentWorkspaceRuntime {
       pendingChanges,
       isRunning: this.orchestratorEngine.running,
       logs: [...this.logs],
-      interactionMode: this.orchestratorEngine.getInteractionMode(),
-      interactionModeUpdatedAt: this.interactionModeUpdatedAt,
       orchestratorPhase: this.orchestratorEngine.phase,
       processingState: {
         ...this.orchestratorEngine.getMessageHub().getProcessingState(),

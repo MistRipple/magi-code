@@ -1218,21 +1218,6 @@ export class LocalAgentService {
       return;
     }
 
-    if (request.method === 'POST' && url.pathname === '/api/interaction-mode') {
-      const body = await this.readJsonBody(request);
-      const runtime = await this.resolveRuntime(
-        typeof body?.workspaceId === 'string' ? body.workspaceId : undefined,
-        typeof body?.workspacePath === 'string' ? body.workspacePath : undefined,
-      );
-      if (!runtime || typeof body?.mode !== 'string' || !body.mode.trim()) {
-        this.sendJson(response, 400, { error: 'interaction_mode_update_failed' });
-        return;
-      }
-      await runtime.setInteractionMode(body.mode);
-      this.sendJson(response, 200, { success: true, mode: body.mode });
-      return;
-    }
-
     if (request.method === 'POST' && url.pathname === '/api/interaction/confirm-recovery') {
       const body = await this.readJsonBody(request);
       const runtime = await this.resolveRuntime(
@@ -1250,25 +1235,6 @@ export class LocalAgentService {
           : 'retry';
       const success = await runtime.confirmRecovery(decision);
       this.sendJson(response, success ? 200 : 400, { success, decision });
-      return;
-    }
-
-    if (request.method === 'POST' && url.pathname === '/api/interaction/tool-authorization') {
-      const body = await this.readJsonBody(request);
-      const runtime = await this.resolveRuntime(
-        typeof body?.workspaceId === 'string' ? body.workspaceId : undefined,
-        typeof body?.workspacePath === 'string' ? body.workspacePath : undefined,
-      );
-      if (!runtime || typeof body?.requestId !== 'string' || !body.requestId.trim()) {
-        this.sendJson(response, 400, { error: 'tool_authorization_response_failed' });
-        return;
-      }
-      const success = await runtime.handleToolAuthorizationResponse(body.requestId, Boolean(body?.allowed));
-      this.sendJson(response, success ? 200 : 400, {
-        success,
-        requestId: body.requestId,
-        allowed: Boolean(body?.allowed),
-      });
       return;
     }
 
@@ -1401,6 +1367,16 @@ export class LocalAgentService {
       if (!ok) {
         this.sendJson(response, 400, { error: 'save_auxiliary_config_failed' });
         return;
+      }
+      this.sendJson(response, 200, await this.buildSettingsBootstrapPayload());
+      return;
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/settings/safeguard/save') {
+      const body = await this.readJsonBody(request);
+      if (body?.config && typeof body.config === 'object') {
+        const { LLMConfigLoader } = await import('../../llm/config');
+        LLMConfigLoader.saveSafeguardConfig(body.config as any);
       }
       this.sendJson(response, 200, await this.buildSettingsBootstrapPayload());
       return;
@@ -1879,8 +1855,6 @@ export class LocalAgentService {
       pendingChanges,
       isRunning: taskViews.some((task) => task.status === 'running'),
       logs: [],
-      interactionMode: 'auto',
-      interactionModeUpdatedAt: stateUpdatedAt,
       orchestratorPhase: 'idle',
       stateUpdatedAt,
       recovered: false,
@@ -2410,13 +2384,7 @@ export class LocalAgentService {
   private async buildSettingsBootstrapPayload(): Promise<SettingsBootstrapPayload> {
     const { LLMConfigLoader } = await import('../../llm/config');
     const fullConfig = LLMConfigLoader.loadFullConfig();
-    const mcpServers = LLMConfigLoader.loadMCPConfig().map((server: Record<string, unknown>) => ({
-      ...server,
-      connected: false,
-      health: 'disconnected',
-      toolCount: 0,
-      reconnectAttempts: 0,
-    }));
+    const mcpServers = await this.loadMcpServers();
 
     return buildSharedSettingsBootstrapPayload({
       mcpServers,
@@ -2725,7 +2693,7 @@ export class LocalAgentService {
     await executor.initialize();
     const manager = executor.getMCPManager();
     const tools = manager.getServerTools(serverId);
-    return { success: true, serverId, tools };
+    return { success: true, serverId, tools, servers: await this.loadMcpServers() };
   }
 
   private async refreshMcpServerTools(serverId: string): Promise<Record<string, unknown>> {
@@ -2737,7 +2705,7 @@ export class LocalAgentService {
     await executor.initialize();
     const manager = executor.getMCPManager();
     const tools = await manager.refreshServerTools(serverId);
-    return { success: true, serverId, tools };
+    return { success: true, serverId, tools, servers: await this.loadMcpServers() };
   }
 
   private async connectMcpServer(serverId: string): Promise<Record<string, unknown>> {

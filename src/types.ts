@@ -122,23 +122,6 @@ export interface DiffHunk {
 
 
 // ============================================
-// 用户交互模式（Orchestrator 层）
-// ============================================
-
-/**
- * 用户交互模式
- * - ask: 对话模式，可以调用工具，但每次都需要用户授权
- * - auto: 自动模式，完全自动执行，不需要确认
- */
-export type InteractionMode = 'ask' | 'auto';
-
-export interface PermissionMatrix {
-  allowEdit: boolean;
-  allowBash: boolean;
-  allowWeb: boolean;
-}
-
-// ============================================
 // 安全防护
 // ============================================
 
@@ -196,53 +179,6 @@ export interface StrategyConfig {
   enableRecovery: boolean;
   autoRollbackOnFailure: boolean;
 }
-
-/**
- * 交互模式配置
- */
-export interface InteractionModeConfig {
-  mode: InteractionMode;
-  /** 是否允许文件修改 */
-  allowFileModification: boolean;
-  /** 是否允许命令执行 */
-  allowCommandExecution: boolean;
-  /** 是否需要工具授权 */
-  requireToolAuthorization: boolean;
-  /** 是否需要 Phase 2 确认 */
-  requirePlanConfirmation: boolean;
-  /** 是否需要 Phase 5 恢复确认 */
-  requireRecoveryConfirmation: boolean;
-  /** 验证失败时是否自动回滚 */
-  autoRollbackOnFailure: boolean;
-  /** 最大修改文件数限制（0 表示无限制） */
-  maxFilesToModify: number;
-}
-
-/**
- * 预设交互模式配置
- */
-export const INTERACTION_MODE_CONFIGS: Record<InteractionMode, InteractionModeConfig> = {
-  ask: {
-    mode: 'ask',
-    allowFileModification: true,
-    allowCommandExecution: true,
-    requireToolAuthorization: true,   // ✅ 需要工具授权
-    requirePlanConfirmation: false,
-    requireRecoveryConfirmation: false,
-    autoRollbackOnFailure: true,
-    maxFilesToModify: 0,
-  },
-  auto: {
-    mode: 'auto',
-    allowFileModification: true,
-    allowCommandExecution: true,
-    requireToolAuthorization: false,  // ❌ 不需要工具授权
-    requirePlanConfirmation: false,
-    requireRecoveryConfirmation: false,
-    autoRollbackOnFailure: true,
-    maxFilesToModify: 0,  // 可由用户配置
-  },
-};
 
 // ============================================
 // 事件系统
@@ -333,10 +269,6 @@ export interface UIState {
   pendingChanges: PendingChange[];
   isRunning: boolean;
   logs: LogEntry[];
-  /** 当前交互模式 */
-  interactionMode: InteractionMode;
-  /** 交互模式更新时间戳（用于前端时序防护） */
-  interactionModeUpdatedAt?: number;
   /** 当前编排器阶段 */
   orchestratorPhase?: string;
   /** 当前会话处理态快照（刷新/切会话恢复的唯一运行态来源） */
@@ -412,8 +344,6 @@ export type WebviewToExtensionMessage =
   | { type: 'getState' }
   | { type: 'requestState' }
   | { type: 'webviewReady' }
-  // 新增：交互模式相关
-  | { type: 'setInteractionMode'; mode: InteractionMode }
   | { type: 'confirmRecovery'; decision: 'retry' | 'rollback' | 'continue' }
 
   | { type: 'requestExecutionStats' }
@@ -425,8 +355,6 @@ export type WebviewToExtensionMessage =
 
   // UI 错误上报
   | { type: 'uiError'; component: string; detail: string; stack?: string }
-  // 工具授权响应
-  | { type: 'toolAuthorizationResponse'; requestId?: string; allowed: boolean }
   // 交互响应（动态审批等）
   | { type: 'interactionResponse'; requestId: string; response: string }
   // Mermaid 图表面板
@@ -491,7 +419,6 @@ export type WebviewToExtensionMessage =
   | { type: 'uiError'; component: string; detail?: unknown; stack?: string }
   // 安全防护配置
   | { type: 'saveSafeguardConfig'; config: import('./types').SafeguardConfig }
-  | { type: 'toolAuthorizationResponse'; requestId: string; allowed: boolean }
   | { type: 'interactionResponse'; requestId: string; response: any }
   // 新增：Mermaid 图表
   | { type: 'openMermaidPanel'; code: string; title?: string }
