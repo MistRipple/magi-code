@@ -3,7 +3,12 @@
  */
 
 import type { LocaleCode } from '../../../../i18n/types';
-import type { OrchestrationRuntimeOpsView } from '../../../../orchestrator/runtime/orchestration-runtime-diagnostics-types';
+import type {
+  OrchestrationRuntimeAssignmentSummary,
+  OrchestrationRuntimeChainSummary,
+  OrchestrationRuntimeOpsView,
+  OrchestrationRuntimeStateStatus,
+} from '../../../../orchestrator/runtime/orchestration-runtime-state-types';
 import type { UIProcessingState } from '../../../../types';
 
 // 消息角色
@@ -307,17 +312,25 @@ export interface OrchestratorRuntimeSnapshot {
   sourceEventIds?: string[];
 }
 
-export interface OrchestratorRuntimeDiagnostics {
+export interface OrchestratorRuntimeState {
   sessionId?: string;
   requestId?: string;
-  runtimeReason: string;
-  finalStatus: 'completed' | 'failed' | 'cancelled' | 'paused';
+  chain?: OrchestrationRuntimeChainSummary;
+  status: OrchestrationRuntimeStateStatus;
+  phase: string;
+  statusReason?: string;
+  canResume?: boolean;
+  runtimeReason?: string;
   failureReason?: string;
-  errors?: string[];
+  errors: string[];
+  startedAt?: number;
+  statusChangedAt: number;
+  lastEventAt: number;
+  endedAt?: number;
   runtimeSnapshot?: OrchestratorRuntimeSnapshot | null;
   runtimeDecisionTrace?: OrchestratorRuntimeDecisionTraceEntry[];
+  assignments: OrchestrationRuntimeAssignmentSummary[];
   opsView?: OrchestrationRuntimeOpsView | null;
-  updatedAt: number;
 }
 
 // 单条消息
@@ -700,8 +713,6 @@ export interface AppState {
   planHistory?: PlanLedgerRecord[];
   edits?: Edit[];
   toasts?: Toast[];
-  interactionMode?: 'ask' | 'auto';
-  interactionModeUpdatedAt?: number;
   stateUpdatedAt?: number;
   recovered?: boolean;
   [key: string]: unknown;

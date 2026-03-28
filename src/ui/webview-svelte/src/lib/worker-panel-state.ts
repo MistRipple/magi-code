@@ -1,4 +1,4 @@
-import type { AgentType, Message, OrchestratorRuntimeDiagnostics, Task } from '../types/message';
+import type { AgentType, Message, OrchestratorRuntimeState, Task } from '../types/message';
 
 export type WorkerRuntimeStatus = 'idle' | 'pending' | 'running' | 'blocked' | 'failed' | 'completed' | 'cancelled';
 export type WorkerRuntimeSource = 'tasks' | 'none';
@@ -22,7 +22,7 @@ interface DeriveWorkerPanelStateParams {
   workerName?: AgentType;
   pendingRequestIds: Iterable<string>;
   tasks?: Task[];
-  runtimeDiagnostics?: OrchestratorRuntimeDiagnostics | null;
+  runtimeState?: OrchestratorRuntimeState | null;
 }
 
 function normalizeWorkerName(workerName: unknown): AgentType | null {
@@ -336,13 +336,13 @@ function createEmptyWorkerAssignmentSnapshot(): WorkerAssignmentSnapshot {
 }
 
 function snapshotRuntimeAssignments(
-  runtimeDiagnostics: OrchestratorRuntimeDiagnostics | null | undefined,
+  runtimeState: OrchestratorRuntimeState | null | undefined,
   workerName?: AgentType,
 ): WorkerAssignmentSnapshot {
   const snapshot = createEmptyWorkerAssignmentSnapshot();
   if (!workerName) return snapshot;
-  const assignments = Array.isArray(runtimeDiagnostics?.opsView?.assignments)
-    ? runtimeDiagnostics.opsView.assignments
+  const assignments = Array.isArray(runtimeState?.assignments)
+    ? runtimeState.assignments
     : [];
   for (const assignment of assignments) {
     if (!assignment || typeof assignment !== 'object') {
@@ -493,7 +493,7 @@ export function deriveWorkerRuntimeState(
   const worker = normalizeWorkerName(params.workerName || '');
   const tasksSnapshot = snapshotWorkerTasks(params.tasks || [], worker || undefined);
   const instructionSnapshot = snapshotInstructionLaneTasks(context.latestInstructionMessage);
-  const assignmentSnapshot = snapshotRuntimeAssignments(params.runtimeDiagnostics, worker || undefined);
+  const assignmentSnapshot = snapshotRuntimeAssignments(params.runtimeState, worker || undefined);
   const liveRuntimeSnapshot = mergeRuntimeSnapshots(tasksSnapshot, instructionSnapshot, assignmentSnapshot);
   const liveTaskStatus = resolveLiveTaskSnapshotStatus(liveRuntimeSnapshot);
   const hasStreaming = context.hasAnyStreamingMessage;
@@ -568,9 +568,9 @@ export function deriveWorkerRuntimeMap(params: {
   pendingRequestIds: Iterable<string>;
   tasks?: Task[];
   messagesByWorker: Record<AgentType, Message[]>;
-  runtimeDiagnostics?: OrchestratorRuntimeDiagnostics | null;
+  runtimeState?: OrchestratorRuntimeState | null;
 }): WorkerRuntimeMap {
-  const { pendingRequestIds, tasks = [], messagesByWorker, runtimeDiagnostics = null } = params;
+  const { pendingRequestIds, tasks = [], messagesByWorker, runtimeState = null } = params;
   return {
     claude: deriveWorkerRuntimeState(
       {
@@ -578,7 +578,7 @@ export function deriveWorkerRuntimeMap(params: {
         workerName: 'claude',
         pendingRequestIds,
         tasks,
-        runtimeDiagnostics,
+        runtimeState,
       },
       deriveWorkerMessageContext({
         messages: messagesByWorker.claude,
@@ -592,7 +592,7 @@ export function deriveWorkerRuntimeMap(params: {
         workerName: 'codex',
         pendingRequestIds,
         tasks,
-        runtimeDiagnostics,
+        runtimeState,
       },
       deriveWorkerMessageContext({
         messages: messagesByWorker.codex,
@@ -606,7 +606,7 @@ export function deriveWorkerRuntimeMap(params: {
         workerName: 'gemini',
         pendingRequestIds,
         tasks,
-        runtimeDiagnostics,
+        runtimeState,
       },
       deriveWorkerMessageContext({
         messages: messagesByWorker.gemini,

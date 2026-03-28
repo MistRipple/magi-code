@@ -31,7 +31,7 @@ import type {
   Task,
   QueuedMessage,
   WaitForWorkersResult,
-  OrchestratorRuntimeDiagnostics,
+  OrchestratorRuntimeState,
   SessionNotificationRecord,
 } from '../types/message';
 import { vscode } from '../lib/vscode-bridge';
@@ -102,6 +102,8 @@ export const messagesState = $state({
   activeMessageIds: new Set<string>(),
   pendingRequests: new Set<string>(),
   thinkingStartAt: null as number | null,
+  // 防回抬保护：记录最后一次强制 idle 的时间戳
+  lastForcedIdleAt: null as number | null,
   processingActor: {
     source: 'orchestrator',
     agent: 'claude',
@@ -109,7 +111,7 @@ export const messagesState = $state({
 
   // 后端下发的完整状态
   appState: null as AppState | null,
-  orchestratorRuntimeDiagnostics: null as OrchestratorRuntimeDiagnostics | null,
+  orchestratorRuntimeState: null as OrchestratorRuntimeState | null,
 
   // 滚动状态
   scrollPositions: {
@@ -411,7 +413,7 @@ const workerRuntime = $derived.by(() => deriveWorkerRuntimeMap({
   },
   pendingRequestIds: messagesState.pendingRequests,
   tasks,
-  runtimeDiagnostics: messagesState.orchestratorRuntimeDiagnostics,
+  runtimeState: messagesState.orchestratorRuntimeState,
 }));
 
 export type ToastCategory = 'incident' | 'audit' | 'feedback';
@@ -466,11 +468,6 @@ let modelStatus = $state<ModelStatusMap>({
   orchestrator: { status: 'checking' },
   auxiliary: { status: 'checking' },
 });
-let interactionMode = $state<'ask' | 'auto'>('auto');
-let requestedInteractionMode = $state<'ask' | 'auto' | null>(null);
-let interactionModeUpdatedAt = $state<number>(0);
-const INTERACTION_MODE_SYNC_TIMEOUT_MS = 10000;
-let interactionModeSyncTimer: ReturnType<typeof setTimeout> | null = null;
 const timelineNodeIdByMessageId = new Map<string, string>();
 const timelineNodeIdByCardId = new Map<string, string>();
 const timelineNodeIdByLifecycleKey = new Map<string, string>();
@@ -1861,30 +1858,43 @@ function normalizeMissionPlan(plan: MissionPlan | null): MissionPlan | null {
   return { ...plan, missionId: plan.missionId || '', assignments };
 }
 
-function normalizeOrchestratorRuntimeDiagnostics(
-  input: OrchestratorRuntimeDiagnostics | null | undefined,
-): OrchestratorRuntimeDiagnostics | null {
+function normalizeOrchestratorRuntimeState(
+  input: OrchestratorRuntimeState | null | undefined,
+): OrchestratorRuntimeState | null {
   if (!input || typeof input !== 'object') return null;
-  const runtimeReason = typeof input.runtimeReason === 'string' && input.runtimeReason.trim().length > 0
-    ? input.runtimeReason.trim()
-    : '';
-  const finalStatus = input.finalStatus === 'completed'
-    || input.finalStatus === 'failed'
-    || input.finalStatus === 'cancelled'
-    || input.finalStatus === 'paused'
-    ? input.finalStatus
+  const status = input.status === 'idle'
+    || input.status === 'running'
+    || input.status === 'waiting'
+    || input.status === 'paused'
+    || input.status === 'completed'
+    || input.status === 'failed'
+    || input.status === 'cancelled'
+    ? input.status
     : null;
-  if (!runtimeReason || !finalStatus) {
+  const phase = typeof input.phase === 'string' && input.phase.trim().length > 0
+    ? input.phase.trim()
+    : '';
+  const statusChangedAt = typeof input.statusChangedAt === 'number' && Number.isFinite(input.statusChangedAt) && input.statusChangedAt > 0
+    ? Math.floor(input.statusChangedAt)
+    : null;
+  const lastEventAt = typeof input.lastEventAt === 'number' && Number.isFinite(input.lastEventAt) && input.lastEventAt > 0
+    ? Math.floor(input.lastEventAt)
+    : null;
+  if (!status || !phase || statusChangedAt === null || lastEventAt === null) {
     return null;
   }
-  const updatedAt = typeof input.updatedAt === 'number' && Number.isFinite(input.updatedAt)
-    ? input.updatedAt
-    : Date.now();
   const sessionId = typeof input.sessionId === 'string' && input.sessionId.trim().length > 0
     ? input.sessionId.trim()
     : undefined;
   const requestId = typeof input.requestId === 'string' && input.requestId.trim().length > 0
     ? input.requestId.trim()
+    : undefined;
+  const statusReason = typeof input.statusReason === 'string' && input.statusReason.trim().length > 0
+    ? input.statusReason.trim()
+    : undefined;
+  const canResume = input.canResume === true ? true : undefined;
+  const runtimeReason = typeof input.runtimeReason === 'string' && input.runtimeReason.trim().length > 0
+    ? input.runtimeReason.trim()
     : undefined;
   const failureReason = typeof input.failureReason === 'string' && input.failureReason.trim().length > 0
     ? input.failureReason.trim()
@@ -1902,17 +1912,39 @@ function normalizeOrchestratorRuntimeDiagnostics(
       .filter((entry) => entry && typeof entry === 'object')
       .map((entry) => JSON.parse(JSON.stringify(entry)))
     : [];
+  const assignments = Array.isArray(input.assignments)
+    ? input.assignments
+      .filter((entry) => entry && typeof entry === 'object')
+      .map((entry) => JSON.parse(JSON.stringify(entry)))
+    : [];
+  const chain = input.chain && typeof input.chain === 'object'
+    ? JSON.parse(JSON.stringify(input.chain))
+    : undefined;
+  const startedAt = typeof input.startedAt === 'number' && Number.isFinite(input.startedAt) && input.startedAt > 0
+    ? Math.floor(input.startedAt)
+    : undefined;
+  const endedAt = typeof input.endedAt === 'number' && Number.isFinite(input.endedAt) && input.endedAt > 0
+    ? Math.floor(input.endedAt)
+    : undefined;
   const opsView = input.opsView && typeof input.opsView === 'object'
     ? JSON.parse(JSON.stringify(input.opsView))
     : null;
   return {
-    runtimeReason,
-    finalStatus,
-    updatedAt,
+    status,
+    phase,
+    errors,
+    statusChangedAt,
+    lastEventAt,
+    assignments,
     ...(sessionId ? { sessionId } : {}),
     ...(requestId ? { requestId } : {}),
+    ...(chain ? { chain } : {}),
+    ...(statusReason ? { statusReason } : {}),
+    ...(canResume ? { canResume } : {}),
+    ...(runtimeReason ? { runtimeReason } : {}),
     ...(failureReason ? { failureReason } : {}),
-    ...(errors.length > 0 ? { errors } : {}),
+    ...(startedAt ? { startedAt } : {}),
+    ...(endedAt ? { endedAt } : {}),
     runtimeSnapshot,
     runtimeDecisionTrace,
     ...(opsView ? { opsView } : {}),
@@ -1955,22 +1987,50 @@ function normalizeProcessingStateSnapshot(
   };
 }
 
-function shouldReplaceOrchestratorRuntimeDiagnostics(
-  next: OrchestratorRuntimeDiagnostics | null,
+function resolveOrchestratorRuntimeStateVersion(
+  snapshot: OrchestratorRuntimeState,
+): number {
+  return Math.max(
+    snapshot.lastEventAt,
+    snapshot.statusChangedAt,
+    snapshot.startedAt ?? 0,
+    snapshot.endedAt ?? 0,
+  );
+}
+
+function shouldReplaceOrchestratorRuntimeState(
+  next: OrchestratorRuntimeState | null,
 ): boolean {
   if (!next) {
     return true;
   }
-  const current = messagesState.orchestratorRuntimeDiagnostics;
+  const current = messagesState.orchestratorRuntimeState;
   if (!current) {
     return true;
   }
-  return next.updatedAt >= current.updatedAt;
+  const nextVersion = resolveOrchestratorRuntimeStateVersion(next);
+  const currentVersion = resolveOrchestratorRuntimeStateVersion(current);
+  if (nextVersion !== currentVersion) {
+    return nextVersion > currentVersion;
+  }
+  if (next.statusChangedAt !== current.statusChangedAt) {
+    return next.statusChangedAt > current.statusChangedAt;
+  }
+  return true;
 }
 
 export function applyAuthoritativeProcessingState(input: AppState['processingState']): void {
   const snapshot = normalizeProcessingStateSnapshot(input);
   if (!snapshot) {
+    return;
+  }
+  // 防回抬保护：如果在 forced idle 冷却期内，拒绝后端权威状态覆盖
+  const lastForcedIdleAt = messagesState.lastForcedIdleAt;
+  if (lastForcedIdleAt !== null && (Date.now() - lastForcedIdleAt) < ANTI_LIFT_BACK_COOLDOWN_MS) {
+    // 冷却期内只同步 actor，不改变 processing 状态
+    if (snapshot.source) {
+      setProcessingActor(snapshot.source, snapshot.agent || undefined);
+    }
     return;
   }
   const pendingRequestIds = new Set(snapshot.pendingRequestIds);
@@ -1997,7 +2057,6 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
 let pendingRecovery = $state<{ taskId: string; error: unknown; canRetry: boolean; canRollback: boolean } | null>(null);
 let pendingClarification = $state<{ questions: string[]; context?: string; ambiguityScore?: number; originalPrompt?: string } | null>(null);
 let pendingWorkerQuestion = $state<{ workerId: string; question: string; context?: string; options?: unknown } | null>(null);
-let pendingToolAuthorization = $state<{ requestId: string; toolName: string; toolArgs: unknown } | null>(null);
 let missionPlan = $state<Map<string, MissionPlan>>(new Map());
 
 // Wave 执行状态（提案 4.6）
@@ -2089,8 +2148,8 @@ export function getWorkerWaitResults() {
   return workerWaitResults;
 }
 
-export function getOrchestratorRuntimeDiagnostics() {
-  return messagesState.orchestratorRuntimeDiagnostics;
+export function getOrchestratorRuntimeState() {
+  return messagesState.orchestratorRuntimeState;
 }
 
 export function getToasts() {
@@ -2099,71 +2158,6 @@ export function getToasts() {
 
 export function getModelStatus() {
   return modelStatus;
-}
-
-export function getInteractionMode() {
-  return interactionMode;
-}
-
-export function getRequestedInteractionMode() {
-  return requestedInteractionMode;
-}
-
-export function isInteractionModeSyncing() {
-  return requestedInteractionMode !== null && requestedInteractionMode !== interactionMode;
-}
-
-export function getInteractionModeUpdatedAt() {
-  return interactionModeUpdatedAt;
-}
-
-function clearInteractionModeSyncTimer() {
-  if (interactionModeSyncTimer) {
-    clearTimeout(interactionModeSyncTimer);
-    interactionModeSyncTimer = null;
-  }
-}
-
-function scheduleInteractionModeSyncTimeout(expectedMode: 'ask' | 'auto') {
-  clearInteractionModeSyncTimer();
-  interactionModeSyncTimer = setTimeout(() => {
-    if (requestedInteractionMode === expectedMode) {
-      requestedInteractionMode = null;
-      addToast('warning', i18n.t('messageHandler.interactionModeSyncTimeout'), undefined, {
-        category: 'audit',
-        source: 'interaction-mode',
-        countUnread: false,
-      });
-    }
-    interactionModeSyncTimer = null;
-  }, INTERACTION_MODE_SYNC_TIMEOUT_MS);
-}
-
-export function requestInteractionMode(mode: 'ask' | 'auto') {
-  requestedInteractionMode = mode;
-  scheduleInteractionModeSyncTimeout(mode);
-}
-
-export function clearRequestedInteractionMode() {
-  requestedInteractionMode = null;
-  clearInteractionModeSyncTimer();
-}
-
-export function setInteractionMode(mode: 'ask' | 'auto', updatedAt?: number) {
-  const nextUpdatedAt = typeof updatedAt === 'number' ? updatedAt : Date.now();
-  interactionMode = mode;
-  interactionModeUpdatedAt = nextUpdatedAt;
-  if (messagesState.appState) {
-    messagesState.appState = {
-      ...messagesState.appState,
-      interactionMode: mode,
-      interactionModeUpdatedAt: nextUpdatedAt,
-    };
-  }
-  if (requestedInteractionMode === mode) {
-    requestedInteractionMode = null;
-    clearInteractionModeSyncTimer();
-  }
 }
 
 export function getPendingRecovery() {
@@ -2176,10 +2170,6 @@ export function getPendingClarification() {
 
 export function getPendingWorkerQuestion() {
   return pendingWorkerQuestion;
-}
-
-export function getPendingToolAuthorization() {
-  return pendingToolAuthorization;
 }
 
 export function getMissionPlan(): Map<string, MissionPlan> {
@@ -2284,27 +2274,20 @@ export function getState() {
     set edits(v) { edits = v; },
     get workerWaitResults() { return workerWaitResults; },
     set workerWaitResults(v) { workerWaitResults = v; },
-    get orchestratorRuntimeDiagnostics() { return messagesState.orchestratorRuntimeDiagnostics; },
-    set orchestratorRuntimeDiagnostics(v) { setOrchestratorRuntimeDiagnostics(v); },
+    get orchestratorRuntimeState() { return messagesState.orchestratorRuntimeState; },
+    set orchestratorRuntimeState(v) { setOrchestratorRuntimeState(v); },
     get toasts() { return toasts; },
     set toasts(v) { toasts = v; },
     get notifications() { return notifications; },
     get unreadNotificationCount() { return unreadNotificationCount; },
     get modelStatus() { return modelStatus; },
     set modelStatus(v) { modelStatus = v; },
-    get interactionMode() { return interactionMode; },
-    set interactionMode(v) {
-      const nextMode = v === 'ask' ? 'ask' : 'auto';
-      setInteractionMode(nextMode);
-    },
     get pendingRecovery() { return pendingRecovery; },
     set pendingRecovery(v) { pendingRecovery = v; },
     get pendingClarification() { return pendingClarification; },
     set pendingClarification(v) { pendingClarification = v; },
     get pendingWorkerQuestion() { return pendingWorkerQuestion; },
     set pendingWorkerQuestion(v) { pendingWorkerQuestion = v; },
-    get pendingToolAuthorization() { return pendingToolAuthorization; },
-    set pendingToolAuthorization(v) { pendingToolAuthorization = v; },
     get missionPlan() { return missionPlan; },
     set missionPlan(v) { missionPlan = v; },
     // Wave 状态（提案 4.6）
@@ -2479,12 +2462,12 @@ export function batchWebviewStatePersistence(mutator: () => void): void {
   }
 }
 
-export function setOrchestratorRuntimeDiagnostics(input: OrchestratorRuntimeDiagnostics | null): void {
-  const next = normalizeOrchestratorRuntimeDiagnostics(input);
-  if (!shouldReplaceOrchestratorRuntimeDiagnostics(next)) {
+export function setOrchestratorRuntimeState(input: OrchestratorRuntimeState | null): void {
+  const next = normalizeOrchestratorRuntimeState(input);
+  if (!shouldReplaceOrchestratorRuntimeState(next)) {
     return;
   }
-  messagesState.orchestratorRuntimeDiagnostics = next;
+  messagesState.orchestratorRuntimeState = next;
 }
 
 export function updatePanelScrollState(
@@ -2651,13 +2634,22 @@ export function setMissionPlan(plan: MissionPlan | null) {
   missionPlan = next;
 }
 
+// 防回抬冷却期（ms）：forced idle 后的短暂窗口内，拒绝任何来源的 processing=true
+const ANTI_LIFT_BACK_COOLDOWN_MS = 2000;
+
 // Worker 执行状态操作
 function updateProcessingState() {
   const nextIsProcessing = messagesState.backendProcessing
     || messagesState.activeMessageIds.size > 0
     || messagesState.pendingRequests.size > 0;
 
+  // 防回抬保护：forced idle 冷却期内，拒绝从 false 被抬回 true
   if (nextIsProcessing && !messagesState.isProcessing) {
+    const lastForcedIdleAt = messagesState.lastForcedIdleAt;
+    if (lastForcedIdleAt !== null && (Date.now() - lastForcedIdleAt) < ANTI_LIFT_BACK_COOLDOWN_MS) {
+      // 冷却期内，拒绝抬回 — 保持 idle
+      return;
+    }
     messagesState.thinkingStartAt = Date.now();
   } else if (!nextIsProcessing && messagesState.isProcessing) {
     messagesState.thinkingStartAt = null;
@@ -2712,6 +2704,8 @@ export function clearProcessingState() {
   messagesState.activeMessageIds = new Set();
   messagesState.pendingRequests = new Set();
   clearAllRetryRuntime();
+  // 记录强制 idle 时间戳，用于防回抬保护
+  messagesState.lastForcedIdleAt = Date.now();
   updateProcessingState();
 }
 
@@ -2969,7 +2963,6 @@ export function clearPendingInteractions() {
   pendingRecovery = null;
   pendingClarification = null;
   pendingWorkerQuestion = null;
-  pendingToolAuthorization = null;
 }
 
 function recomputeUnreadNotificationCount() {
@@ -3145,7 +3138,6 @@ export function applySessionNotifications(
 
 export function getActiveInteractionType(): string | null {
   if (pendingRecovery) return 'recovery';
-  if (pendingToolAuthorization) return 'toolAuthorization';
   if (pendingClarification) return 'clarification';
   if (pendingWorkerQuestion) return 'workerQuestion';
   return null;
@@ -3338,7 +3330,7 @@ export function clearAllMessages(options: {
     timelineProjectionDirty = false;
   }
   workerWaitResults = {};
-  messagesState.orchestratorRuntimeDiagnostics = null;
+  messagesState.orchestratorRuntimeState = null;
   messagesState.queuedMessages = [];
   messagesState.messageJump = {
     messageId: null,
@@ -3452,7 +3444,7 @@ export function initializeState() {
       messagesState.sessions = [];
       messagesState.currentSessionId = messagesState.currentSessionId || null;
       notificationsBySession = {};
-      messagesState.orchestratorRuntimeDiagnostics = null;
+      messagesState.orchestratorRuntimeState = null;
       clearPendingInteractions();
       clearProcessingState();
       saveWebviewState();
@@ -3483,7 +3475,7 @@ export function initializeState() {
       messagesState.autoScrollEnabled = normalizePersistedAutoScrollConfig(persisted.autoScrollEnabled);
     }
     notificationsBySession = {};
-    messagesState.orchestratorRuntimeDiagnostics = null;
+    messagesState.orchestratorRuntimeState = null;
     syncNotificationsFromSession(messagesState.currentSessionId);
 
     const persistedProjection = shouldRestoreSessionScopedState

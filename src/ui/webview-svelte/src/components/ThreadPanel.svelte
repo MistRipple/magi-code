@@ -9,6 +9,7 @@
   import InputArea from './InputArea.svelte';
   import BottomTabs from './BottomTabs.svelte';
   import AgentTab from './AgentTab.svelte';
+  import RuntimeStatePanel from './RuntimeStatePanel.svelte';
 
   interface Props {
     isTopActive?: boolean;
@@ -38,9 +39,11 @@
       ? (appState.getWorkerRenderItems(activeWorkerTab) as TimelineRenderItem[])
       : []
   ));
+  const runtimeState = $derived(appState.orchestratorRuntimeState);
 </script>
 
 <div class="thread-panel">
+  <RuntimeStatePanel {runtimeState} />
   <div class="main-content">
     {#if activeBottomTab === 'thread'}
       <MessageList renderItems={threadRenderItems} isActive={isTopActive && activeBottomTab === 'thread'} />

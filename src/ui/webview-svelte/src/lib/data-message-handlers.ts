@@ -14,9 +14,6 @@ import {
   setQueuedMessages,
   setAppState,
   setMissionPlan,
-  setInteractionMode,
-  getRequestedInteractionMode,
-  clearRequestedInteractionMode,
   clearPendingInteractions,
   clearAllMessages,
   setTimelineProjection,
@@ -31,7 +28,7 @@ import {
   clearProcessingState,
   settleProcessingForManualInteraction,
   sealAllStreamingMessages,
-  setOrchestratorRuntimeDiagnostics,
+  setOrchestratorRuntimeState,
   applyAuthoritativeProcessingState,
   markMessageComplete,
   getActiveInteractionType,
@@ -42,7 +39,7 @@ import type {
   AppState, Session, MissionPlan, AssignmentPlan,
   AssignmentTodo, Task, SubTaskItem, Edit,
   ModelStatusMap, ActivePlanState, PlanLedgerRecord, PlanLedgerAttempt,
-  QueuedMessage, OrchestratorRuntimeDiagnostics, SessionTimelineProjection,
+  QueuedMessage, OrchestratorRuntimeState, SessionTimelineProjection,
 } from '../types/message';
 import type { StandardMessage, ContentBlock as StandardContentBlock } from '../../../../protocol/message-protocol';
 import type { SessionBootstrapSnapshot } from '../../../../shared/session-bootstrap';
@@ -55,136 +52,9 @@ import {
 } from './message-utils';
 
 
-function resolveInteractionMode(raw: unknown): 'ask' | 'auto' | null {
-  if (raw === 'ask' || raw === 'auto') {
-    return raw;
-  }
-  return null;
-}
-
-function isEffectiveAutoMode(): boolean {
-  const store = getState();
-  const requestedMode = resolveInteractionMode(getRequestedInteractionMode());
-  if (requestedMode === 'auto') {
-    return true;
-  }
-  const backendMode = resolveInteractionMode(store.appState?.interactionMode);
-  if (backendMode === 'auto') {
-    return true;
-  }
-  const localMode = resolveInteractionMode(store.interactionMode);
-  return backendMode === null && localMode === 'auto';
-}
-
-function resolvePendingInteractionsOnAutoMode(options?: { showToast?: boolean }): void {
-  const store = getState();
-  const showToast = options?.showToast === true;
-  const hasAutoResolvablePending = Boolean(
-    store.pendingToolAuthorization
-    || store.pendingRecovery
-    || store.pendingClarification
-    || store.pendingWorkerQuestion
-  );
-  if (!hasAutoResolvablePending) {
-    return;
-  }
-
-  const pendingToolAuth = store.pendingToolAuthorization;
-  if (pendingToolAuth?.requestId) {
-    postBridgeMessage({ type: 'toolAuthorizationResponse', requestId: pendingToolAuth.requestId, allowed: true });
-  }
-
-  if (store.pendingRecovery) {
-    const decision: 'retry' | 'continue' = store.pendingRecovery.canRetry
-      ? 'retry'
-      : 'continue';
-    postBridgeMessage({ type: 'confirmRecovery', decision });
-  }
-
-  if (store.pendingClarification) {
-    postBridgeMessage({
-      type: 'answerClarification',
-      answers: null,
-      additionalInfo: null,
-      autoSkipped: true,
-    });
-  }
-
-  if (store.pendingWorkerQuestion) {
-    postBridgeMessage({ type: 'answerWorkerQuestion', answer: null });
-  }
-
-  // auto 模式下所有交互请求都可自动闭环。
-  store.pendingToolAuthorization = null;
-  store.pendingRecovery = null;
-  store.pendingClarification = null;
-  store.pendingWorkerQuestion = null;
-  clearRequestedInteractionMode();
-  setIsProcessing(true);
-  if (showToast) {
-    addToast('info', i18n.t('messageHandler.autoModePendingResolved'), undefined, {
-      category: 'audit',
-      source: 'interaction-mode',
-      countUnread: false,
-    });
-  }
-}
-
-function applyInteractionModeFromPayload(
-  rawMode: unknown,
-  source: string,
-  rawUpdatedAt?: unknown,
-  previousModeRaw?: unknown,
-): void {
-  const resolved = resolveInteractionMode(rawMode);
-  if (!resolved) {
-    console.error(`[MessageHandler] ${source} 收到非法 interactionMode:`, rawMode);
-    addToast('error', i18n.t('messageHandler.invalidInteractionMode'), undefined, {
-      category: 'incident',
-      source: 'interaction-mode',
-      actionRequired: true,
-    });
-    return;
-  }
-  const previousMode = resolveInteractionMode(previousModeRaw)
-    || resolveInteractionMode(getState().appState?.interactionMode)
-    || 'auto';
-  const requestedModeBeforeApply = getRequestedInteractionMode();
-  const updatedAt = typeof rawUpdatedAt === 'number' ? rawUpdatedAt : undefined;
-  setInteractionMode(resolved, updatedAt);
-  const switchedToAuto = resolved === 'auto' && previousMode !== 'auto';
-  const userRequestedAuto = requestedModeBeforeApply === 'auto';
-  if (resolved === 'auto' && (switchedToAuto || userRequestedAuto)) {
-    resolvePendingInteractionsOnAutoMode({
-      showToast: switchedToAuto,
-    });
-  }
-}
-
-function isStaleInteractionModeUpdate(payload: Record<string, unknown>, source: string): boolean {
-  const incomingUpdatedAt = typeof payload.updatedAt === 'number' ? payload.updatedAt : undefined;
-  if (incomingUpdatedAt === undefined) return false;
-
-  const currentUpdatedAt = typeof getState().appState?.interactionModeUpdatedAt === 'number'
-    ? (getState().appState?.interactionModeUpdatedAt as number)
-    : undefined;
-
-  if (currentUpdatedAt === undefined) return false;
-  const stale = incomingUpdatedAt < currentUpdatedAt;
-  if (stale) {
-    console.warn(`[MessageHandler] 忽略过期 interactionMode 更新(${source})`, {
-      incomingUpdatedAt,
-      currentUpdatedAt,
-      mode: payload.mode,
-    });
-  }
-  return stale;
-}
-
 function handleStateUpdate(message: ClientBridgeMessage) {
   const state = message.state as AppState;
   if (!state) return;
-  const previousModeRaw = getState().appState?.interactionMode;
   const incomingStateUpdatedAt = typeof state.stateUpdatedAt === 'number' ? state.stateUpdatedAt : undefined;
   const currentStateUpdatedAt = typeof getState().appState?.stateUpdatedAt === 'number'
     ? (getState().appState?.stateUpdatedAt as number)
@@ -194,20 +64,6 @@ function handleStateUpdate(message: ClientBridgeMessage) {
     console.warn('[MessageHandler] 忽略过期 stateUpdate', {
       incomingUpdatedAt: incomingStateUpdatedAt,
       currentUpdatedAt: currentStateUpdatedAt,
-    });
-    return;
-  }
-
-  const nextUpdatedAt = typeof state.interactionModeUpdatedAt === 'number' ? state.interactionModeUpdatedAt : undefined;
-  const currentUpdatedAt = typeof getState().appState?.interactionModeUpdatedAt === 'number'
-    ? (getState().appState?.interactionModeUpdatedAt as number)
-    : undefined;
-
-  if (nextUpdatedAt !== undefined && currentUpdatedAt !== undefined && nextUpdatedAt < currentUpdatedAt) {
-    console.warn('[MessageHandler] 忽略过期 stateUpdate.interactionMode', {
-      incomingUpdatedAt: nextUpdatedAt,
-      currentUpdatedAt,
-      mode: state.interactionMode,
     });
     return;
   }
@@ -226,11 +82,11 @@ function handleStateUpdate(message: ClientBridgeMessage) {
   // 不能由常规 stateUpdate 反向覆盖当前浏览器查看的会话。
   // 否则会出现侧边栏 active、URL、主内容三者分裂，破坏 live/restore 单一真相源。
 
-  // timelineProjection / diagnostics 不再通过 stateUpdate 覆盖。
+  // timelineProjection / runtime state 不再通过 stateUpdate 覆盖。
   // 当前统一约束：
   // 1. sessionBootstrapLoaded 负责 restore / switch 的原子恢复；
   // 2. 活跃会话的实时内容只由 unified message/update/complete 驱动；
-  // 3. stateUpdate 只同步非时间轴、非 diagnostics 的运行态。
+  // 3. stateUpdate 只同步非时间轴、非 runtime state 的运行态。
 
   const store = getState();
   const taskSeen = new Set<string>();
@@ -326,15 +182,6 @@ function handleStateUpdate(message: ClientBridgeMessage) {
 
   if (state.recovered === true) {
     sealAllStreamingMessages();
-  }
-
-  if (typeof state.interactionMode === 'string') {
-    applyInteractionModeFromPayload(
-      state.interactionMode,
-      'stateUpdate',
-      state.interactionModeUpdatedAt,
-      previousModeRaw,
-    );
   }
 }
 
@@ -601,7 +448,7 @@ export function handleUnifiedData(standard: StandardMessage) {
         timelineProjection: payload.timelineProjection,
         notifications: payload.notifications,
         queuedMessages: payload.queuedMessages,
-        orchestratorRuntimeDiagnostics: payload.orchestratorRuntimeDiagnostics,
+        orchestratorRuntimeState: payload.orchestratorRuntimeState,
       }));
       break;
 
@@ -628,8 +475,8 @@ export function handleUnifiedData(standard: StandardMessage) {
       handleRecoveryRequest(asMessage(payload));
       break;
 
-    case 'orchestratorRuntimeDiagnostics':
-      handleOrchestratorRuntimeDiagnostics(asMessage(payload));
+    case 'orchestratorRuntimeState':
+      handleOrchestratorRuntimeState(asMessage(payload));
       break;
 
     case 'clarificationRequest':
@@ -638,10 +485,6 @@ export function handleUnifiedData(standard: StandardMessage) {
 
     case 'workerQuestionRequest':
       handleWorkerQuestionRequest(asMessage(payload));
-      break;
-
-    case 'toolAuthorizationRequest':
-      handleToolAuthorizationRequest(asMessage(payload));
       break;
 
     case 'missionPlanned':
@@ -702,18 +545,6 @@ export function handleUnifiedData(standard: StandardMessage) {
 
     case 'auxiliaryConnectionTestResult':
       handleConnectionTestResult({ ...asMessage(payload), _target: 'auxiliary' });
-      break;
-
-    case 'interactionModeChanged':
-      if (isStaleInteractionModeUpdate(payload, 'interactionModeChanged')) {
-        break;
-      }
-      applyInteractionModeFromPayload(
-        payload.mode,
-        'interactionModeChanged',
-        payload.updatedAt,
-        getState().appState?.interactionMode,
-      );
       break;
 
     case 'missionExecutionFailed':
@@ -841,7 +672,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       if (sessions.length > 0) {
         updateSessions(sessions);
       }
-      // 运行态同步：tasks、interactionMode 等非时间轴数据
+      // 运行态同步：tasks 等非时间轴数据
       handleStateUpdate({
         ...message,
         state: {
@@ -850,8 +681,8 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
           sessions: sessions.length > 0 ? sessions : state.sessions,
         },
       });
-      setOrchestratorRuntimeDiagnostics(
-        (snapshot.orchestratorRuntimeDiagnostics as OrchestratorRuntimeDiagnostics | null | undefined) ?? null,
+      setOrchestratorRuntimeState(
+        (snapshot.orchestratorRuntimeState as OrchestratorRuntimeState | null | undefined) ?? null,
       );
       if (snapshot.notifications) {
         applySessionNotifications(sessionId, snapshot.notifications.notifications);
@@ -890,8 +721,8 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         sessions: sessions.length > 0 ? sessions : state.sessions,
       },
     });
-    setOrchestratorRuntimeDiagnostics(
-      (snapshot.orchestratorRuntimeDiagnostics as OrchestratorRuntimeDiagnostics | null | undefined) ?? null,
+    setOrchestratorRuntimeState(
+      (snapshot.orchestratorRuntimeState as OrchestratorRuntimeState | null | undefined) ?? null,
     );
     if (snapshot.notifications) {
       applySessionNotifications(sessionId, snapshot.notifications.notifications);
@@ -910,41 +741,38 @@ function handleSessionNotificationsLoaded(message: ClientBridgeMessage) {
 
 
 function handleRecoveryRequest(message: ClientBridgeMessage) {
-  const store = getState();
-  if (store.appState?.interactionMode === 'auto') {
-    const canRetry = Boolean(message.canRetry);
-    const decision: 'retry' | 'continue' = canRetry
-      ? 'retry'
-      : 'continue';
-    addToast('info', i18n.t('messageHandler.autoRecovery', { decision: i18n.t(decision === 'retry' ? 'messageHandler.autoRecoveryRetry' : 'messageHandler.autoRecoveryContinue') }), undefined, {
-      category: 'audit',
-      source: 'recovery',
-      countUnread: false,
-    });
-    postBridgeMessage({ type: 'confirmRecovery', decision });
-    setIsProcessing(true);
-    return;
-  }
-  store.pendingRecovery = {
-    taskId: (message.taskId as string) || '',
-    error: message.error,
-    canRetry: Boolean(message.canRetry),
-    canRollback: Boolean(message.canRollback),
-  };
-  settleProcessingForManualInteraction();
-  sealAllStreamingMessages();
+  const canRetry = Boolean(message.canRetry);
+  const decision: 'retry' | 'continue' = canRetry
+    ? 'retry'
+    : 'continue';
+  addToast('info', i18n.t('messageHandler.autoRecovery', { decision: i18n.t(decision === 'retry' ? 'messageHandler.autoRecoveryRetry' : 'messageHandler.autoRecoveryContinue') }), undefined, {
+    category: 'audit',
+    source: 'recovery',
+    countUnread: false,
+  });
+  postBridgeMessage({ type: 'confirmRecovery', decision });
+  setIsProcessing(true);
 }
 
-function handleOrchestratorRuntimeDiagnostics(message: ClientBridgeMessage) {
+function handleOrchestratorRuntimeState(message: ClientBridgeMessage) {
   const store = getState();
-  const runtimeReason = typeof message.runtimeReason === 'string' ? message.runtimeReason.trim() : '';
-  const finalStatus = message.finalStatus === 'completed'
-    || message.finalStatus === 'failed'
-    || message.finalStatus === 'cancelled'
-    || message.finalStatus === 'paused'
-    ? message.finalStatus
+  const status = message.status === 'idle'
+    || message.status === 'running'
+    || message.status === 'waiting'
+    || message.status === 'paused'
+    || message.status === 'completed'
+    || message.status === 'failed'
+    || message.status === 'cancelled'
+    ? message.status
     : null;
-  if (!runtimeReason || !finalStatus) {
+  const phase = typeof message.phase === 'string' ? message.phase.trim() : '';
+  const statusChangedAt = typeof message.statusChangedAt === 'number' && Number.isFinite(message.statusChangedAt)
+    ? Math.floor(message.statusChangedAt)
+    : null;
+  const lastEventAt = typeof message.lastEventAt === 'number' && Number.isFinite(message.lastEventAt)
+    ? Math.floor(message.lastEventAt)
+    : null;
+  if (!status || !phase || statusChangedAt === null || lastEventAt === null) {
     return;
   }
   const sessionId = typeof message.sessionId === 'string' && message.sessionId.trim().length > 0
@@ -954,127 +782,72 @@ function handleOrchestratorRuntimeDiagnostics(message: ClientBridgeMessage) {
   if (sessionId && currentSessionId && sessionId !== currentSessionId) {
     return;
   }
-  const diagnostics: OrchestratorRuntimeDiagnostics = {
-    runtimeReason,
-    finalStatus,
+  const runtimeState: OrchestratorRuntimeState = {
+    status,
+    phase,
+    errors: Array.isArray(message.errors)
+      ? message.errors
+        .filter((item: unknown): item is string => typeof item === 'string' && item.trim().length > 0)
+        .map((item: string) => item.trim())
+      : [],
+    statusChangedAt,
+    lastEventAt,
+    assignments: Array.isArray(message.assignments)
+      ? (message.assignments as OrchestratorRuntimeState['assignments'])
+      : [],
     ...(sessionId ? { sessionId } : {}),
     ...(typeof message.requestId === 'string' && message.requestId.trim().length > 0
       ? { requestId: message.requestId.trim() }
       : {}),
+    ...(message.chain && typeof message.chain === 'object'
+      ? { chain: message.chain as OrchestratorRuntimeState['chain'] }
+      : {}),
+    ...(typeof message.statusReason === 'string' && message.statusReason.trim().length > 0
+      ? { statusReason: message.statusReason.trim() }
+      : {}),
+    ...(message.canResume === true ? { canResume: true } : {}),
+    ...(typeof message.runtimeReason === 'string' && message.runtimeReason.trim().length > 0
+      ? { runtimeReason: message.runtimeReason.trim() }
+      : {}),
     ...(typeof message.failureReason === 'string' && message.failureReason.trim().length > 0
       ? { failureReason: message.failureReason.trim() }
       : {}),
-    ...(Array.isArray(message.errors)
-      ? {
-          errors: message.errors
-            .filter((item: unknown): item is string => typeof item === 'string' && item.trim().length > 0)
-            .map((item: string) => item.trim()),
-        }
+    ...(typeof message.startedAt === 'number' && Number.isFinite(message.startedAt) && message.startedAt > 0
+      ? { startedAt: Math.floor(message.startedAt) }
+      : {}),
+    ...(typeof message.endedAt === 'number' && Number.isFinite(message.endedAt) && message.endedAt > 0
+      ? { endedAt: Math.floor(message.endedAt) }
       : {}),
     runtimeSnapshot: message.runtimeSnapshot && typeof message.runtimeSnapshot === 'object'
-      ? (message.runtimeSnapshot as OrchestratorRuntimeDiagnostics['runtimeSnapshot'])
+      ? (message.runtimeSnapshot as OrchestratorRuntimeState['runtimeSnapshot'])
       : null,
     runtimeDecisionTrace: Array.isArray(message.runtimeDecisionTrace)
-      ? (message.runtimeDecisionTrace as OrchestratorRuntimeDiagnostics['runtimeDecisionTrace'])
+      ? (message.runtimeDecisionTrace as OrchestratorRuntimeState['runtimeDecisionTrace'])
       : [],
     opsView: message.opsView && typeof message.opsView === 'object'
-      ? (message.opsView as OrchestratorRuntimeDiagnostics['opsView'])
+      ? (message.opsView as OrchestratorRuntimeState['opsView'])
       : null,
-    updatedAt: typeof message.updatedAt === 'number' && Number.isFinite(message.updatedAt)
-      ? message.updatedAt
-      : Date.now(),
   };
-  setOrchestratorRuntimeDiagnostics(diagnostics);
+  setOrchestratorRuntimeState(runtimeState);
 }
 
 function handleClarificationRequest(message: ClientBridgeMessage) {
-  const store = getState();
-  if (store.appState?.interactionMode === 'auto') {
-    addToast('info', i18n.t('messageHandler.autoSkipClarification'));
-    postBridgeMessage({
-      type: 'answerClarification',
-      answers: null,
-      additionalInfo: null,
-      autoSkipped: true,  // 标记为自动跳过
-    });
-    setIsProcessing(true);
-    return;
-  }
-  store.pendingClarification = {
-    questions: ensureArray<string>(message.questions),
-    context: message.context as string | undefined,
-    ambiguityScore: message.ambiguityScore as number | undefined,
-    originalPrompt: message.originalPrompt as string | undefined,
-  };
-  settleProcessingForManualInteraction();
-  sealAllStreamingMessages();
+  addToast('info', i18n.t('messageHandler.autoSkipClarification'));
+  postBridgeMessage({
+    type: 'answerClarification',
+    answers: null,
+    additionalInfo: null,
+    autoSkipped: true,
+  });
+  setIsProcessing(true);
 }
 
 function handleWorkerQuestionRequest(message: ClientBridgeMessage) {
-  const store = getState();
-  if (store.appState?.interactionMode === 'auto') {
-    addToast('info', i18n.t('messageHandler.autoAnswerWorkerQuestion'));
-    postBridgeMessage({ type: 'answerWorkerQuestion', answer: null });
-    setIsProcessing(true);
-    return;
-  }
-  store.pendingWorkerQuestion = {
-    workerId: (message.workerId as string) || '',
-    question: (message.question as string) || '',
-    context: message.context as string | undefined,
-    options: message.options,
-  };
-  settleProcessingForManualInteraction();
-  sealAllStreamingMessages();
+  addToast('info', i18n.t('messageHandler.autoAnswerWorkerQuestion'));
+  postBridgeMessage({ type: 'answerWorkerQuestion', answer: null });
+  setIsProcessing(true);
 }
 
-function handleToolAuthorizationRequest(message: ClientBridgeMessage) {
-  const store = getState();
-  const requestId = typeof message.requestId === 'string' && message.requestId.trim().length > 0
-    ? message.requestId.trim()
-    : '';
-  if (!requestId) {
-    console.error('[MessageHandler] toolAuthorizationRequest 缺少 requestId:', message);
-    addToast('error', i18n.t('messageHandler.toolAuthMissingRequestId'), undefined, {
-      category: 'incident',
-      source: 'tool-auth',
-      actionRequired: true,
-    });
-    return;
-  }
-
-  if (store.appState?.interactionMode === 'auto') {
-    addToast('info', i18n.t('messageHandler.autoToolAuthorization'));
-    postBridgeMessage({ type: 'toolAuthorizationResponse', requestId, allowed: true });
-    clearRequestedInteractionMode();
-    setIsProcessing(true);
-    return;
-  }
-
-  // ask 模式下若已有交互弹窗，按规范拒绝并提示，避免覆盖当前待处理请求
-  if (getActiveInteractionType()) {
-    console.warn('[MessageHandler] toolAuthorizationRequest 与现有交互冲突，自动拒绝:', {
-      requestId,
-      activeInteraction: getActiveInteractionType(),
-    });
-    postBridgeMessage({ type: 'toolAuthorizationResponse', requestId, allowed: false });
-    addToast('warning', i18n.t('messageHandler.toolAuthConflict'), undefined, {
-      category: 'incident',
-      source: 'tool-auth',
-      actionRequired: true,
-    });
-    return;
-  }
-
-  clearPendingInteractions();
-  store.pendingToolAuthorization = {
-    requestId,
-    toolName: (message.toolName as string) || '',
-    toolArgs: message.toolArgs,
-  };
-  settleProcessingForManualInteraction();
-  sealAllStreamingMessages();
-}
 
 
 function handleMissionPlanned(message: ClientBridgeMessage) {
@@ -1297,25 +1070,16 @@ function handleTodoApprovalRequested(message: ClientBridgeMessage) {
     throw new Error('[MessageHandler] TodoApprovalRequested 缺少 reason');
   }
   const store = getState();
-  if (store.appState?.interactionMode === 'auto') {
-    updateTodo(assignmentId, todoId, (todo) => ({
-      ...todo,
-      approvalStatus: 'approved',
-      approvalNote: reason,
-    }));
-    postBridgeMessage({
-      type: 'interactionResponse',
-      requestId: `approval-${todoId}`,
-      response: 'approved',
-    });
-    return;
-  }
-
   updateTodo(assignmentId, todoId, (todo) => ({
     ...todo,
-    approvalStatus: 'pending',
+    approvalStatus: 'approved',
     approvalNote: reason,
   }));
+  postBridgeMessage({
+    type: 'interactionResponse',
+    requestId: `approval-${todoId}`,
+    response: 'approved',
+  });
 }
 
 
@@ -1489,4 +1253,4 @@ function handleWorkerSessionResumed(message: ClientBridgeMessage) {
 
 
 // Named exports
-export { handleStateUpdate, isEffectiveAutoMode, applyInteractionModeFromPayload, isStaleInteractionModeUpdate, handleSessionsUpdated, handleSessionBootstrapLoaded, handleRecoveryRequest, handleOrchestratorRuntimeDiagnostics, handleClarificationRequest, handleWorkerQuestionRequest, handleToolAuthorizationRequest, handleMissionPlanned, handleAssignmentPlanned, handleAssignmentStarted, handleAssignmentCompleted, handleTodoStarted, handleTodoCompleted, handleTodoFailed, handleDynamicTodoAdded, handleTodoApprovalRequested, handleWorkerStatusUpdate, handleConnectionTestResult, handleWorkerSessionCreated, handleWorkerSessionResumed, updateAssignmentPlan, updateTodo };
+export { handleStateUpdate, handleSessionsUpdated, handleSessionBootstrapLoaded, handleRecoveryRequest, handleOrchestratorRuntimeState, handleClarificationRequest, handleWorkerQuestionRequest, handleMissionPlanned, handleAssignmentPlanned, handleAssignmentStarted, handleAssignmentCompleted, handleTodoStarted, handleTodoCompleted, handleTodoFailed, handleDynamicTodoAdded, handleTodoApprovalRequested, handleWorkerStatusUpdate, handleConnectionTestResult, handleWorkerSessionCreated, handleWorkerSessionResumed, updateAssignmentPlan, updateTodo };
