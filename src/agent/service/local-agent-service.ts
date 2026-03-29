@@ -441,7 +441,7 @@ export class LocalAgentService {
   }
 
   private async handleRequest(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
-    this.setCorsHeaders(response);
+    this.setCorsHeaders(response, request);
     if (request.method === 'OPTIONS') {
       response.writeHead(204);
       response.end();
@@ -3539,10 +3539,21 @@ export class LocalAgentService {
     return true;
   }
 
+  /** 请求体大小上限（10MB），防止恶意超大请求导致 OOM */
+  private static readonly MAX_REQUEST_BODY_SIZE = 10 * 1024 * 1024;
+
   private async readJsonBody(request: http.IncomingMessage): Promise<Record<string, unknown> | null> {
     const chunks: Buffer[] = [];
+    let totalSize = 0;
     for await (const chunk of request) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalSize += buf.length;
+      if (totalSize > LocalAgentService.MAX_REQUEST_BODY_SIZE) {
+        // 销毁流以中止后续数据读取
+        request.destroy();
+        throw new Error(`request body exceeds ${LocalAgentService.MAX_REQUEST_BODY_SIZE} bytes limit`);
+      }
+      chunks.push(buf);
     }
     if (chunks.length === 0) {
       return null;
@@ -3584,10 +3595,57 @@ export class LocalAgentService {
     }
   }
 
-  private setCorsHeaders(response: http.ServerResponse): void {
-    response.setHeader('Access-Control-Allow-Origin', '*');
+  private setCorsHeaders(response: http.ServerResponse, request?: http.IncomingMessage): void {
+    const origin = request?.headers.origin || '';
+    const allowedOrigin = this.isAllowedOrigin(origin) ? origin : '';
+    if (allowedOrigin) {
+      response.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+      response.setHeader('Vary', 'Origin');
+    }
     response.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
     response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
+
+  /**
+   * CORS Origin 白名单校验。
+   * 允许的来源：
+   * - 同源（Agent 自身托管的 Web 页面）
+   * - localhost / 127.0.0.1 的任意端口（VS Code webview、本地开发）
+   * - 局域网 IP 的任意端口（手机通过 LAN 访问）
+   * - Cloudflare Tunnel 公网域名（已有 tunnel_token 做二次校验）
+   */
+  private isAllowedOrigin(origin: string): boolean {
+    if (!origin) {
+      // 非跨域请求（同源 fetch、curl 等）直接放行
+      return true;
+    }
+    try {
+      const url = new URL(origin);
+      const hostname = url.hostname;
+      // 本机回环
+      if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1') {
+        return true;
+      }
+      // Agent 自身地址
+      if (hostname === DEFAULT_AGENT_HOST && url.port === String(this.port)) {
+        return true;
+      }
+      // 局域网私有 IP 段：10.x / 172.16-31.x / 192.168.x
+      if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(hostname)) {
+        return true;
+      }
+      // Cloudflare Tunnel 域名（tunnel_token 在 API 层做二次校验）
+      if (hostname.endsWith('.trycloudflare.com')) {
+        return true;
+      }
+      // VS Code webview 协议
+      if (url.protocol === 'vscode-webview:' || url.protocol === 'vscode-webview-resource:') {
+        return true;
+      }
+    } catch {
+      // URL 解析失败，拒绝
+    }
+    return false;
   }
 
   private sendJson(response: http.ServerResponse, statusCode: number, payload: unknown): void {
