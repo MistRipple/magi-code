@@ -534,16 +534,22 @@ function logBridgeOperationFailure(
   options: { suppressToast?: boolean; suppressConsole?: boolean } = {},
 ): void {
   if (!options.suppressConsole) {
-  console.error(logLabel, error);
+    console.error(logLabel, error);
   }
   if (!options.suppressToast) {
     emitBridgeErrorToast(action, error);
   }
 }
 
+function isBridgeRecoveringOrUnavailable(): boolean {
+  return bridgeRecovering
+    || recoveryInFlight !== null
+    || recoveryTimer !== null
+    || activeEventStreamState !== 'open';
+}
+
 function reportExpectedRecoveryFailure(action: string, logLabel: string, error: unknown): void {
-  if (bridgeRecovering && isExpectedRecoveryBridgeFailure(error)) {
-    console.debug(`${logLabel} 已进入恢复链，跳过错误提示`, error);
+  if (isBridgeRecoveringOrUnavailable() && isExpectedRecoveryBridgeFailure(error)) {
     return;
   }
   logBridgeOperationFailure(action, logLabel, error);
