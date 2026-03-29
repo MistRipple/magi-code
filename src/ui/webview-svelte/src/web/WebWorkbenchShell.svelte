@@ -403,6 +403,9 @@
   }
 
   function openAddWorkspaceDialog(): void {
+    if (workspaceActionPending || loadError) {
+      return;
+    }
     workspaceDialogError = '';
     showAddWorkspaceDialog = true;
   }
@@ -587,7 +590,15 @@
 
   onMount(() => {
     applyViewportMode();
-    const handleResize = () => applyViewportMode();
+    // 节流 resize：手机虚拟键盘弹出/收起会短时间内触发大量 resize 事件
+    let resizeRaf: number | null = null;
+    const handleResize = () => {
+      if (resizeRaf !== null) return;
+      resizeRaf = requestAnimationFrame(() => {
+        resizeRaf = null;
+        applyViewportMode();
+      });
+    };
     const handleAgentConnection = (event: Event) => {
       const detail = (event as CustomEvent<AgentConnectionEventDetail>).detail;
       const previousAgentBaseUrl = agentBaseUrl;
@@ -613,6 +624,9 @@
     return () => {
       window.removeEventListener('resize', handleResize);
       window.removeEventListener(AGENT_CONNECTION_EVENT, handleAgentConnection as EventListener);
+      if (resizeRaf !== null) {
+        cancelAnimationFrame(resizeRaf);
+      }
     };
   });
 </script>
@@ -642,7 +656,7 @@
         <button class="sidebar-refresh" type="button" data-testid="sidebar-refresh" onclick={() => void refreshWorkspaces()}>
           {i18n.t('common.refresh')}
         </button>
-        <button class="sidebar-refresh" type="button" onclick={openAddWorkspaceDialog} disabled={workspaceActionPending}>
+        <button class="sidebar-refresh" type="button" onclick={openAddWorkspaceDialog} disabled={workspaceActionPending || !!loadError}>
           选择文件夹
         </button>
       </div>
@@ -802,9 +816,9 @@
         <div class="modal-title" id="workspace-picker-title">选择工作区目录</div>
         <button class="modal-close" type="button" onclick={closeAddWorkspaceDialog}>×</button>
       </div>
-      <div class="modal-body" style="padding: 0;">
+      <div class="modal-body workspace-picker-modal-body">
         {#if workspaceDialogError}
-          <div class="workspace-dialog-error" style="margin: var(--space-3, 12px);">{workspaceDialogError}</div>
+          <div class="workspace-dialog-error workspace-dialog-error--banner">{workspaceDialogError}</div>
         {/if}
         <WebFolderPicker
           onSelect={(path, name) => void handleFolderSelected(path, name)}
@@ -1305,6 +1319,14 @@
     background: color-mix(in srgb, var(--error) 8%, var(--surface-1));
     color: var(--foreground);
     font-size: var(--text-sm);
+  }
+
+  .workspace-dialog-error--banner {
+    margin: 12px 16px 0;
+  }
+
+  .workspace-picker-modal-body {
+    padding: 0;
   }
 
   @media (max-width: 1120px) {
