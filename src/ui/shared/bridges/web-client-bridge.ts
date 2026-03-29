@@ -124,6 +124,12 @@ let cachedRuntimeSettings: SettingsRuntimeSnapshot | null = null;
 /** 传输层维护的 SSE 连接句柄（统一管理 Web EventSource 和宿主代理两种模式） */
 let activeSseConnection: SseConnection | null = null;
 let activeEventStreamKey = '';
+let activeEventStreamState: 'idle' | 'connecting' | 'open' = 'idle';
+let activeEventStreamOpenPromise: Promise<void> | null = null;
+let activeEventStreamOpenTimeout: number | null = null;
+let activeEventStreamToken = 0;
+let activeEventStreamOpenResolve: (() => void) | null = null;
+let activeEventStreamOpenReject: ((error: Error) => void) | null = null;
 let bridgeRecovering = false;
 // fetchBootstrap 防重入：同一时刻只允许一个 bootstrap 请求在飞行中，
 // 后续调用复用同一 Promise，避免重复 dispatchBootstrap 打乱 eventSeq 追踪。
@@ -136,6 +142,7 @@ let recoveryInFlight: Promise<void> | null = null;
 const RECOVERY_BASE_DELAY_MS = 1000;
 const RECOVERY_MAX_DELAY_MS = 10_000;
 const EVENT_STREAM_PARSE_ERROR_DEBOUNCE_MS = 5000;
+const EVENT_STREAM_OPEN_TIMEOUT_MS = 4000;
 const WEBVIEW_STATE_STORAGE_KEY = 'webview-state';
 const WEBVIEW_STATE_WRITE_INTERVAL_MS = 1200;
 const WEBVIEW_STATE_MAX_BYTES = 1_500_000;
@@ -303,6 +310,22 @@ function shouldRecoverFromBridgeError(error: unknown): boolean {
   return true;
 }
 
+function isExpectedRecoveryBridgeFailure(error: unknown): boolean {
+  if (error instanceof AgentApiError) {
+    return error.status >= 500;
+  }
+  const detail = normalizeErrorMessage(error)?.toLowerCase() || '';
+  if (!detail) {
+    return false;
+  }
+  return detail.includes('failed to fetch')
+    || detail.includes('fetch failed')
+    || detail.includes('networkerror')
+    || detail.includes('network error')
+    || detail.includes('connection refused')
+    || detail.includes('local agent');
+}
+
 function emitForcedProcessingIdle(reason: string, extra?: Record<string, unknown>): void {
   emitDataMessage('processingStateChanged', {
     isProcessing: false,
@@ -344,6 +367,13 @@ function clearRecoveryTimer(): void {
   }
 }
 
+function clearEventStreamOpenTimeout(): void {
+  if (activeEventStreamOpenTimeout !== null) {
+    window.clearTimeout(activeEventStreamOpenTimeout);
+    activeEventStreamOpenTimeout = null;
+  }
+}
+
 function ensureWindowListener(): void {
   if (bridgeListenerRegistered || typeof window === 'undefined') {
     return;
@@ -371,7 +401,7 @@ function ensureWindowListener(): void {
     scheduleRecovery('agent_base_url_changed', undefined, true);
   });
   window.addEventListener('focus', () => {
-    if (!activeSseConnection && (currentWorkspaceId || currentWorkspacePath || currentSessionId)) {
+    if (activeEventStreamState !== 'open' && (currentWorkspaceId || currentWorkspacePath || currentSessionId)) {
       scheduleRecovery('window_focus', undefined, true);
     }
   });
@@ -497,9 +527,26 @@ function emitBridgeErrorToast(action: string, error: unknown): void {
   emitMessage({ type: 'unifiedMessage', message });
 }
 
-function logBridgeOperationFailure(action: string, logLabel: string, error: unknown): void {
+function logBridgeOperationFailure(
+  action: string,
+  logLabel: string,
+  error: unknown,
+  options: { suppressToast?: boolean; suppressConsole?: boolean } = {},
+): void {
+  if (!options.suppressConsole) {
   console.error(logLabel, error);
-  emitBridgeErrorToast(action, error);
+  }
+  if (!options.suppressToast) {
+    emitBridgeErrorToast(action, error);
+  }
+}
+
+function reportExpectedRecoveryFailure(action: string, logLabel: string, error: unknown): void {
+  if (bridgeRecovering && isExpectedRecoveryBridgeFailure(error)) {
+    console.debug(`${logLabel} 已进入恢复链，跳过错误提示`, error);
+    return;
+  }
+  logBridgeOperationFailure(action, logLabel, error);
 }
 
 function handleEventStreamParseFailure(data: string, error: unknown): void {
@@ -597,11 +644,16 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
 }
 
 function closeEventStream(): void {
+  clearEventStreamOpenTimeout();
   if (activeSseConnection) {
     activeSseConnection.close();
     activeSseConnection = null;
   }
   activeEventStreamKey = '';
+  activeEventStreamState = 'idle';
+  activeEventStreamOpenResolve = null;
+  activeEventStreamOpenReject = null;
+  activeEventStreamOpenPromise = null;
 }
 
 async function restoreBridgeState(reason: string, force = false): Promise<void> {
@@ -619,7 +671,7 @@ async function restoreBridgeState(reason: string, force = false): Promise<void> 
       cachedRuntimeSettings = null;
     }
     await Promise.all([
-      fetchBootstrap(),
+      fetchBootstrap({ forceEventStreamReconnect: true }),
       dispatchSettingsBootstrap(force),
     ]);
     clearRecoveryTimer();
@@ -648,7 +700,54 @@ function scheduleRecovery(reason: string, error?: unknown, immediate = false): v
   }, delay);
 }
 
-function ensureEventStream(): void {
+function createEventStreamOpenPromise(token: number): Promise<void> {
+  const openPromise = new Promise<void>((resolve, reject) => {
+    activeEventStreamOpenResolve = () => {
+      if (token !== activeEventStreamToken) {
+        return;
+      }
+      clearEventStreamOpenTimeout();
+      activeEventStreamOpenResolve = null;
+      activeEventStreamOpenReject = null;
+      resolve();
+    };
+    activeEventStreamOpenReject = (error: Error) => {
+      if (token !== activeEventStreamToken) {
+        return;
+      }
+      clearEventStreamOpenTimeout();
+      activeEventStreamOpenResolve = null;
+      activeEventStreamOpenReject = null;
+      reject(error);
+    };
+    clearEventStreamOpenTimeout();
+    activeEventStreamOpenTimeout = window.setTimeout(() => {
+      if (token !== activeEventStreamToken || activeEventStreamState === 'open') {
+        return;
+      }
+      closeEventStream();
+      reject(new Error('事件流连接超时'));
+      scheduleRecovery('event_stream_open_timeout');
+    }, EVENT_STREAM_OPEN_TIMEOUT_MS);
+  });
+  activeEventStreamOpenPromise = openPromise;
+  activeEventStreamOpenPromise.catch(() => undefined);
+  return openPromise;
+}
+
+function resolveEventStreamOpen(): void {
+  activeEventStreamOpenResolve?.();
+  activeEventStreamOpenPromise = Promise.resolve();
+}
+
+function rejectEventStreamOpen(error?: Error): void {
+  activeEventStreamOpenReject?.(error ?? new Error('事件流连接失败'));
+  activeEventStreamOpenPromise = null;
+}
+
+async function ensureEventStream(
+  options: { forceReconnect?: boolean; waitUntilOpen?: boolean } = {},
+): Promise<void> {
   if (typeof window === 'undefined') {
     return;
   }
@@ -667,22 +766,31 @@ function ensureEventStream(): void {
     closeEventStream();
     return;
   }
-  if (activeSseConnection && activeEventStreamKey === nextKey) {
+  if (!options.forceReconnect && activeSseConnection && activeEventStreamKey === nextKey) {
+    if (options.waitUntilOpen && activeEventStreamState !== 'open' && activeEventStreamOpenPromise) {
+      await activeEventStreamOpenPromise;
+    }
     return;
   }
   closeEventStream();
   activeEventStreamKey = nextKey;
+  activeEventStreamState = 'connecting';
+  const streamToken = ++activeEventStreamToken;
+  const openPromise = createEventStreamOpenPromise(streamToken);
   activeSseConnection = getTransport().connectEventStream(
     agentUrl('/api/events', nextKey),
     {
       onOpen() {
-        if (bridgeRecovering && !recoveryInFlight) {
-          void restoreBridgeState('event_stream_open', true).catch((error) => {
-            scheduleRecovery('event_stream_open', error);
-          });
+        if (streamToken !== activeEventStreamToken) {
+          return;
         }
+        activeEventStreamState = 'open';
+        resolveEventStreamOpen();
       },
       onMessage(data: string) {
+        if (streamToken !== activeEventStreamToken) {
+          return;
+        }
         try {
           emitMessage(JSON.parse(data) as ClientBridgeMessage);
         } catch (error) {
@@ -690,15 +798,29 @@ function ensureEventStream(): void {
         }
       },
       onError() {
+        if (streamToken !== activeEventStreamToken) {
+          return;
+        }
+        const openFailed = activeEventStreamState !== 'open';
+        rejectEventStreamOpen(openFailed ? new Error('事件流连接失败') : undefined);
+        clearEventStreamOpenTimeout();
         activeSseConnection = null;
         activeEventStreamKey = '';
+        activeEventStreamState = 'idle';
+        activeEventStreamOpenPromise = null;
         scheduleRecovery('event_stream_error');
       },
     },
   );
+  if (options.waitUntilOpen) {
+    await openPromise;
+  }
 }
 
-function dispatchBootstrap(payload: BootstrapPayload): void {
+async function dispatchBootstrap(
+  payload: BootstrapPayload,
+  options: { forceEventStreamReconnect?: boolean } = {},
+): Promise<void> {
  // 检测 runtimeEpoch 代际变化：后端重启后执行无刷新状态重建，不允许整页刷新打断用户会话。
  const incomingEpoch = payload.agent?.runtimeEpoch || '';
  if (incomingEpoch && currentRuntimeEpoch && incomingEpoch !== currentRuntimeEpoch) {
@@ -711,11 +833,16 @@ function dispatchBootstrap(payload: BootstrapPayload): void {
    currentRuntimeEpoch = incomingEpoch;
  }
   persistWorkspaceBinding(payload.workspace.workspaceId, payload.workspace.rootPath, payload.sessionId);
-  ensureEventStream();
+  await ensureEventStream({
+    forceReconnect: options.forceEventStreamReconnect === true,
+    waitUntilOpen: true,
+  });
   emitDataMessage('sessionBootstrapLoaded', payload as unknown as Record<string, unknown>);
 }
 
-async function fetchBootstrap(): Promise<void> {
+async function fetchBootstrap(
+  options: { forceEventStreamReconnect?: boolean } = {},
+): Promise<void> {
   // 防重入：如果已有 bootstrap 请求在飞行中，直接复用
   if (bootstrapInFlight) {
     return bootstrapInFlight;
@@ -737,7 +864,7 @@ async function fetchBootstrap(): Promise<void> {
       throw new Error(`bootstrap failed: ${response.status}`);
     }
     const payload = await response.json() as BootstrapPayload;
-    dispatchBootstrap(payload);
+    await dispatchBootstrap(payload, options);
   };
   bootstrapInFlight = doFetch().finally(() => {
     bootstrapInFlight = null;
@@ -824,7 +951,7 @@ async function createSession(): Promise<void> {
   if (!response.ok) {
     throw new Error(`create session failed: ${response.status}`);
   }
-  dispatchBootstrap(await response.json() as BootstrapPayload);
+  await dispatchBootstrap(await response.json() as BootstrapPayload);
 }
 
 async function switchSession(sessionId: string): Promise<void> {
@@ -840,31 +967,70 @@ async function switchSession(sessionId: string): Promise<void> {
   if (!response.ok) {
     throw new Error(`switch session failed: ${response.status}`);
   }
-  dispatchBootstrap(await response.json() as BootstrapPayload);
+  await dispatchBootstrap(await response.json() as BootstrapPayload);
 }
 
 async function deleteSession(sessionId: string): Promise<void> {
   const payload = await deleteAgentSession(sessionId);
-  dispatchBootstrap(payload as unknown as BootstrapPayload);
+  await dispatchBootstrap(payload as unknown as BootstrapPayload);
 }
 
 async function renameSession(sessionId: string, name: string): Promise<void> {
   const payload = await renameAgentSession(sessionId, name);
-  dispatchBootstrap(payload as unknown as BootstrapPayload);
+  await dispatchBootstrap(payload as unknown as BootstrapPayload);
 }
 
 async function closeSession(sessionId: string): Promise<void> {
   const payload = await closeAgentSession(sessionId);
-  dispatchBootstrap(payload as unknown as BootstrapPayload);
+  await dispatchBootstrap(payload as unknown as BootstrapPayload);
 }
 
 async function saveCurrentSession(): Promise<void> {
   const payload = await saveAgentCurrentSession();
-  dispatchBootstrap(payload as unknown as BootstrapPayload);
+  await dispatchBootstrap(payload as unknown as BootstrapPayload);
+}
+
+async function ensureLiveBridgeReady(reason: string): Promise<void> {
+  const hasBinding = Boolean(currentWorkspaceId || currentWorkspacePath || currentSessionId);
+  if (!hasBinding) {
+    await restoreBridgeState(reason, true);
+    return;
+  }
+  if (
+    bridgeRecovering
+    || recoveryInFlight
+    || !activeSseConnection
+    || activeEventStreamState !== 'open'
+  ) {
+    await restoreBridgeState(reason, true);
+    return;
+  }
+}
+
+async function ensureFreshLiveBridge(reason: string): Promise<void> {
+  const hasBinding = Boolean(currentWorkspaceId || currentWorkspacePath || currentSessionId);
+  if (!hasBinding) {
+    await restoreBridgeState(reason, true);
+    return;
+  }
+  if (
+    bridgeRecovering
+    || recoveryInFlight
+    || !activeSseConnection
+    || activeEventStreamState !== 'open'
+  ) {
+    await restoreBridgeState(reason, true);
+    return;
+  }
+  await ensureEventStream({
+    forceReconnect: true,
+    waitUntilOpen: true,
+  });
 }
 
 async function executeTask(prompt: string, requestId?: string): Promise<void> {
   try {
+    await ensureFreshLiveBridge('execute_task_preflight');
     await executeAgentTask(prompt, requestId);
   } catch (error) {
     console.error('[web-client-bridge] 执行任务失败:', error);
@@ -901,6 +1067,7 @@ async function clearAllTasks(): Promise<void> {
 
 async function startTask(taskId: string): Promise<void> {
   try {
+    await ensureFreshLiveBridge('start_task_preflight');
     await startAgentTask(taskId);
   } catch (error) {
     console.error('[web-client-bridge] 启动任务失败:', error);
@@ -918,6 +1085,7 @@ async function startTask(taskId: string): Promise<void> {
 
 async function resumeTask(taskId: string): Promise<void> {
   try {
+    await ensureFreshLiveBridge('resume_task_preflight');
     await resumeAgentTask(taskId);
   } catch (error) {
     console.error('[web-client-bridge] 恢复任务失败:', error);
@@ -938,14 +1106,17 @@ async function deleteTask(taskId: string): Promise<void> {
 }
 
 async function appendTaskMessage(taskId: string, content: string): Promise<void> {
+  await ensureLiveBridgeReady('append_task_message_preflight');
   await appendAgentTaskMessage(taskId, content);
 }
 
 async function updateQueuedTaskMessage(queueId: string, content: string): Promise<void> {
+  await ensureLiveBridgeReady('update_queued_message_preflight');
   await updateAgentQueuedTaskMessage(queueId, content);
 }
 
 async function deleteQueuedTaskMessage(queueId: string): Promise<void> {
+  await ensureLiveBridgeReady('delete_queued_message_preflight');
   await deleteAgentQueuedTaskMessage(queueId);
 }
 
@@ -1020,12 +1191,20 @@ function logUnsupportedInteraction(messageType: string): void {
   console.warn(`[web-client-bridge] 当前 Agent 运行时尚未接入交互消息: ${messageType}`);
 }
 
-async function openFilePreview(filePath: string): Promise<void> {
+async function openFilePreview(filePath: string, previewContent?: string): Promise<void> {
+  if (typeof previewContent === 'string') {
+    openPreviewWindow(filePath, '文件预览', previewContent, 'file');
+    return;
+  }
   const payload = await getAgentFilePreview(filePath);
   openPreviewWindow(payload.filePath, '文件预览', payload.content || '', 'file');
 }
 
-async function openDiffPreview(filePath: string): Promise<void> {
+async function openDiffPreview(filePath: string, diffContent?: string): Promise<void> {
+  if (typeof diffContent === 'string') {
+    openPreviewWindow(filePath, '差异预览', diffContent, 'diff');
+    return;
+  }
   const payload = await getAgentChangeDiff(filePath);
   openPreviewWindow(payload.filePath, '差异预览', payload.diff || '', 'diff');
 }
@@ -1205,9 +1384,16 @@ async function installSkill(skillId: string): Promise<void> {
   }
 }
 
-async function installLocalSkill(): Promise<void> {
+async function installLocalSkill(directoryPath?: string): Promise<void> {
   try {
-    const payload = await installAgentLocalSkill();
+    const payload = await installAgentLocalSkill(directoryPath);
+    if (payload.canceled === true) {
+      emitDataMessage('skillInstallFailed', {
+        canceled: true,
+        source: 'local',
+      });
+      return;
+    }
     emitDataMessage('skillInstalled', payload);
     await dispatchSettingsBootstrap(true);
     await loadSkillLibrary();
@@ -1287,13 +1473,13 @@ export function createWebClientBridge(): ClientBridge {
         case 'getState':
         case 'requestState':
           void restoreBridgeState('request_state').catch((error) => {
-            logBridgeOperationFailure('bootstrap ', '[web-client-bridge] bootstrap 失败:', error);
+            reportExpectedRecoveryFailure('bootstrap ', '[web-client-bridge] bootstrap 失败:', error);
             scheduleRecovery('request_state', error);
           });
           return;
         case 'loadSettingsBootstrap':
           void dispatchSettingsBootstrap(Boolean(message.force)).catch((error) => {
-            logBridgeOperationFailure('settings 配置加载', '[web-client-bridge] settings 配置加载失败:', error);
+            reportExpectedRecoveryFailure('settings 配置加载', '[web-client-bridge] settings 配置加载失败:', error);
           });
           return;
         case 'saveProfileConfig':
@@ -1440,7 +1626,7 @@ export function createWebClientBridge(): ClientBridge {
           }
           return;
         case 'installLocalSkill':
-          void installLocalSkill().catch((error) => {
+          void installLocalSkill(typeof message.directoryPath === 'string' ? message.directoryPath : undefined).catch((error) => {
             logBridgeOperationFailure('安装本地技能', '[web-client-bridge] 安装本地技能失败:', error);
           });
           return;
@@ -1684,7 +1870,10 @@ export function createWebClientBridge(): ClientBridge {
               ? message.filepath
               : (typeof message.filePath === 'string' ? message.filePath : '');
             if (filePath.trim()) {
-              void openFilePreview(filePath).catch((error) => {
+              const previewContent = typeof message.previewContent === 'string'
+                ? message.previewContent
+                : undefined;
+              void openFilePreview(filePath, previewContent).catch((error) => {
                 logBridgeOperationFailure('打开文件预览', '[web-client-bridge] 打开文件预览失败:', error);
               });
             }
@@ -1695,7 +1884,8 @@ export function createWebClientBridge(): ClientBridge {
             return;
           }
           if (typeof message.filePath === 'string' && message.filePath.trim()) {
-            void openDiffPreview(message.filePath).catch((error) => {
+            const diffContent = typeof message.diff === 'string' ? message.diff : undefined;
+            void openDiffPreview(message.filePath, diffContent).catch((error) => {
               logBridgeOperationFailure('打开差异预览', '[web-client-bridge] 打开差异预览失败:', error);
             });
           }
@@ -1926,7 +2116,7 @@ export function createWebClientBridge(): ClientBridge {
     },
     notifyReady(): void {
       void restoreBridgeState('notify_ready').catch((error) => {
-        logBridgeOperationFailure('入口初始化', '[web-client-bridge] Web 入口初始化失败:', error);
+        reportExpectedRecoveryFailure('入口初始化', '[web-client-bridge] Web 入口初始化失败:', error);
         scheduleRecovery('notify_ready', error);
       });
     },

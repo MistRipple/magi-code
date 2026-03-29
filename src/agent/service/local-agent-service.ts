@@ -147,6 +147,20 @@ function execFileAsync(command: string, args: string[]): Promise<string> {
   });
 }
 
+const LOCAL_SKILL_ENTRY_FILE = 'SKILL.md';
+const LOCAL_SKILL_SCAN_SKIP_DIRS = new Set([
+  '.git',
+  '.hg',
+  '.svn',
+  '.next',
+  '.turbo',
+  'node_modules',
+  'dist',
+  'build',
+  'out',
+  'coverage',
+]);
+
 function defaultAgentUiSettings(): AgentUiSettings {
   return {
     locale: ConfigManager.getInstance().get('locale'),
@@ -560,7 +574,8 @@ export class LocalAgentService {
     if (request.method === 'GET' && url.pathname === '/api/filesystem/list') {
       try {
         const dirPath = url.searchParams.get('path') || os.homedir();
-        const entries = await this.listDirectoryEntries(dirPath);
+        const showHidden = url.searchParams.get('showHidden') === '1';
+        const entries = await this.listDirectoryEntries(dirPath, showHidden);
         this.sendJson(response, 200, {
           path: path.resolve(dirPath),
           parent: path.dirname(path.resolve(dirPath)),
@@ -1536,8 +1551,10 @@ export class LocalAgentService {
     }
 
     if (request.method === 'POST' && url.pathname === '/api/settings/skills/install-local') {
-      const result = await this.installLocalSkill();
-      this.sendJson(response, result.success ? 200 : 400, result);
+      const body = await this.readJsonBody(request);
+      const directoryPath = typeof body?.directoryPath === 'string' ? body.directoryPath.trim() : '';
+      const result = await this.installLocalSkill(directoryPath || undefined);
+      this.sendJson(response, result.success || result.canceled ? 200 : 400, result);
       return;
     }
 
@@ -2295,26 +2312,26 @@ export class LocalAgentService {
     if (!target) {
       return null;
     }
-    const { DiffGenerator } = await import('../../diff-generator');
-    const diffGenerator = new DiffGenerator(resolved.workspace.sessionManager, resolved.workspace.rootPath);
-    const diffResult = diffGenerator.generateDiff(target.relativePath);
-    if (!diffResult) {
+    const snapshot = resolved.workspace.sessionManager.getSnapshot(resolved.session.id, target.relativePath);
+    if (!snapshot) {
       return null;
     }
-    const snapshot = resolved.workspace.sessionManager.getSnapshot(resolved.session.id, target.relativePath);
-    const snapshotFile = snapshot
-      ? resolved.workspace.sessionManager.getSnapshotFilePath(resolved.session.id, snapshot.id)
-      : '';
-    const originalContent = snapshotFile && fs.existsSync(snapshotFile)
+    const snapshotFile = resolved.workspace.sessionManager.getSnapshotFilePath(resolved.session.id, snapshot.id);
+    const originalContent = fs.existsSync(snapshotFile)
       ? fs.readFileSync(snapshotFile, 'utf8')
       : '';
     const currentExists = fs.existsSync(target.absolutePath);
     const currentContent = currentExists
       ? fs.readFileSync(target.absolutePath, 'utf8')
       : '';
+    const { buildUnifiedFileDiff } = await import('../../utils/unified-file-diff');
+    const diffResult = buildUnifiedFileDiff(originalContent, currentContent, target.relativePath);
+    if (!diffResult.diff) {
+      return null;
+    }
     return {
-      filePath: diffResult.filePath,
-      diff: diffGenerator.formatDiff(diffResult),
+      filePath: target.relativePath,
+      diff: diffResult.diff,
       additions: diffResult.additions,
       deletions: diffResult.deletions,
       originalContent,
@@ -2575,13 +2592,12 @@ export class LocalAgentService {
    * 列出指定目录下的子目录条目（仅目录，不暴露文件内容）。
    * 供 Web 文件选择器使用，让远程用户也能浏览 Agent 所在机器的目录结构。
    */
-  private async listDirectoryEntries(dirPath: string): Promise<{ name: string; path: string; hasChildren: boolean }[]> {
+  private async listDirectoryEntries(dirPath: string, showHidden = false): Promise<{ name: string; path: string; hasChildren: boolean }[]> {
     const resolved = path.resolve(dirPath);
     const dirents = await fs.promises.readdir(resolved, { withFileTypes: true });
     const results: { name: string; path: string; hasChildren: boolean }[] = [];
     for (const dirent of dirents) {
-      // 跳过隐藏目录（以 . 开头）和常见不可访问目录
-      if (dirent.name.startsWith('.') || dirent.name === 'node_modules') {
+      if (!showHidden && (dirent.name.startsWith('.') || dirent.name === 'node_modules')) {
         continue;
       }
       if (!dirent.isDirectory()) {
@@ -2591,7 +2607,7 @@ export class LocalAgentService {
       let hasChildren = false;
       try {
         const children = await fs.promises.readdir(fullPath, { withFileTypes: true });
-        hasChildren = children.some(child => child.isDirectory() && !child.name.startsWith('.'));
+        hasChildren = children.some(child => child.isDirectory() && (showHidden || !child.name.startsWith('.')));
       } catch {
         // 无权限读取子目录，标记为无子节点
       }
@@ -2601,15 +2617,15 @@ export class LocalAgentService {
     return results;
   }
 
-  private async pickLocalSkillPath(): Promise<string | null> {
+  private async pickLocalSkillDirectory(): Promise<string | null> {
     if (process.platform === 'darwin') {
       const output = await execFileAsync('osascript', [
         '-e',
         'try',
         '-e',
-        'set selectedFile to POSIX path of (choose file with prompt "选择要导入的本地 Skill" of type {"md"})',
+        'set selectedFolder to POSIX path of (choose folder with prompt "选择要导入的本地 Skill 目录")',
         '-e',
-        'return selectedFile',
+        'return selectedFolder',
         '-e',
         'on error number -128',
         '-e',
@@ -2617,8 +2633,8 @@ export class LocalAgentService {
         '-e',
         'end try',
       ]);
-      const filePath = output.trim();
-      return filePath || null;
+      const directoryPath = output.trim();
+      return directoryPath || null;
     }
 
     if (process.platform === 'win32') {
@@ -2628,20 +2644,20 @@ export class LocalAgentService {
         '-Command',
         [
           'Add-Type -AssemblyName System.Windows.Forms;',
-          '$dialog = New-Object System.Windows.Forms.OpenFileDialog;',
-          '$dialog.Title = "选择要导入的本地 Skill";',
-          '$dialog.Filter = "Markdown Files (*.md)|*.md";',
+          '$dialog = New-Object System.Windows.Forms.FolderBrowserDialog;',
+          '$dialog.Description = "选择要导入的本地 Skill 目录";',
+          '$dialog.ShowNewFolderButton = $false;',
           'if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {',
           '  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;',
-          '  Write-Output $dialog.FileName',
+          '  Write-Output $dialog.SelectedPath',
           '}',
         ].join(' '),
       ]);
-      const filePath = output.trim();
-      return filePath || null;
+      const directoryPath = output.trim();
+      return directoryPath || null;
     }
 
-    throw new Error(`当前平台暂不支持文件选择器: ${process.platform}`);
+    throw new Error(`当前平台暂不支持目录选择器: ${process.platform}`);
   }
 
   private async loadMcpServers(): Promise<unknown[]> {
@@ -2930,47 +2946,159 @@ export class LocalAgentService {
     return 'Local instruction skill';
   }
 
-  private async installLocalSkill(): Promise<Record<string, unknown>> {
-    const filePath = await this.pickLocalSkillPath();
-    if (!filePath) {
+  private collectLocalSkillDefinitionFiles(rootPath: string): string[] {
+    const normalizedRoot = path.resolve(rootPath);
+    const pendingDirectories: string[] = [normalizedRoot];
+    const visitedDirectories = new Set<string>();
+    const skillFiles: string[] = [];
+
+    while (pendingDirectories.length > 0) {
+      const currentDirectory = pendingDirectories.pop();
+      if (!currentDirectory) {
+        continue;
+      }
+
+      let resolvedDirectory = currentDirectory;
+      try {
+        resolvedDirectory = fs.realpathSync(currentDirectory);
+      } catch {
+        continue;
+      }
+
+      if (visitedDirectories.has(resolvedDirectory)) {
+        continue;
+      }
+      visitedDirectories.add(resolvedDirectory);
+
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(currentDirectory, { withFileTypes: true });
+      } catch (error) {
+        throw new Error(`读取目录失败: ${currentDirectory} (${error instanceof Error ? error.message : String(error)})`);
+      }
+
+      for (const entry of entries) {
+        if (entry.isFile() && entry.name === LOCAL_SKILL_ENTRY_FILE) {
+          skillFiles.push(path.join(currentDirectory, entry.name));
+          continue;
+        }
+        if (!entry.isDirectory()) {
+          continue;
+        }
+        if (LOCAL_SKILL_SCAN_SKIP_DIRS.has(entry.name)) {
+          continue;
+        }
+        pendingDirectories.push(path.join(currentDirectory, entry.name));
+      }
+    }
+
+    skillFiles.sort((left, right) => left.localeCompare(right));
+    return skillFiles;
+  }
+
+  private buildLocalSkillDefinitionFromFile(filePath: string): Record<string, unknown> {
+    const content = fs.readFileSync(filePath, 'utf8');
+    const { meta, body } = this.parseLocalSkillMarkdown(content);
+    const instruction = body.trim();
+    if (!instruction) {
+      throw new Error(`${filePath} 内容为空`);
+    }
+
+    const fallbackName = path.basename(path.dirname(filePath)) || 'local-skill';
+    const rawName = String(meta.name || fallbackName);
+    const slug = this.normalizeLocalSkillSlug(rawName);
+    if (!slug) {
+      throw new Error(`${filePath} 缺少有效的 Skill 名称`);
+    }
+
+    return {
+      id: `local/${slug}`,
+      name: `local/${slug}`,
+      fullName: `local/${slug}`,
+      description: String(meta.description || this.extractLocalSkillDescription(instruction)),
+      version: meta.version ? String(meta.version) : undefined,
+      repositoryId: 'local',
+      repositoryName: 'Local Skills',
+      skillType: 'instruction' as const,
+      instruction,
+      userInvocable: true,
+      sourcePath: filePath,
+    };
+  }
+
+  private assertLocalSkillBatchIsValid(skills: Array<Record<string, unknown>>): void {
+    const seen = new Map<string, string>();
+    for (const skill of skills) {
+      const skillName = typeof skill.fullName === 'string' ? skill.fullName : '';
+      const sourcePath = typeof skill.sourcePath === 'string' ? skill.sourcePath : '';
+      if (!skillName || !sourcePath) {
+        throw new Error('本地 Skill 批量导入数据不完整');
+      }
+      const previousSource = seen.get(skillName);
+      if (previousSource) {
+        throw new Error(`批量导入中存在重复 Skill 名称: ${skillName} (${previousSource}, ${sourcePath})`);
+      }
+      seen.set(skillName, sourcePath);
+    }
+  }
+
+  private async installLocalSkill(preselectedPath?: string): Promise<Record<string, unknown>> {
+    const directoryPath = preselectedPath || await this.pickLocalSkillDirectory();
+    if (!directoryPath) {
       return { success: false, canceled: true };
     }
     try {
-      const content = fs.readFileSync(filePath, 'utf8');
-      const { meta, body } = this.parseLocalSkillMarkdown(content);
-      const instruction = body.trim();
-      if (!instruction) {
-        return { success: false, error: 'SKILL.md 内容为空' };
+      const normalizedDirectoryPath = path.resolve(directoryPath);
+      if (!fs.existsSync(normalizedDirectoryPath) || !fs.statSync(normalizedDirectoryPath).isDirectory()) {
+        return { success: false, source: 'local', directoryPath: normalizedDirectoryPath, error: '所选路径不是目录' };
       }
-      const fileBaseName = path.basename(filePath, path.extname(filePath));
-      const rawName = String(meta.name || fileBaseName || 'local-skill');
-      const slug = this.normalizeLocalSkillSlug(rawName);
-      const normalizedName = `local/${slug || 'skill'}`;
-      const description = String(meta.description || this.extractLocalSkillDescription(instruction));
-      const localSkill = {
-        id: normalizedName,
-        name: normalizedName,
-        fullName: normalizedName,
-        description,
-        version: meta.version ? String(meta.version) : undefined,
-        repositoryId: 'local',
-        repositoryName: 'Local Skills',
-        skillType: 'instruction' as const,
-        instruction,
-        userInvocable: true,
-      };
+
+      const skillFiles = this.collectLocalSkillDefinitionFiles(normalizedDirectoryPath);
+      if (skillFiles.length === 0) {
+        return {
+          success: false,
+          source: 'local',
+          directoryPath: normalizedDirectoryPath,
+          error: `所选目录下未找到 ${LOCAL_SKILL_ENTRY_FILE}`,
+        };
+      }
+
+      const localSkills = skillFiles.map((filePath) => this.buildLocalSkillDefinitionFromFile(filePath));
+      this.assertLocalSkillBatchIsValid(localSkills);
+
       const [{ LLMConfigLoader }, { applySkillInstall }] = await Promise.all([
         import('../../llm/config'),
         import('../../tools/skill-installation'),
       ]);
       const repositories = LLMConfigLoader.loadRepositories();
-      const config = LLMConfigLoader.loadSkillsConfig() || { customTools: [], instructionSkills: [], repositories };
-      const updatedConfig = applySkillInstall(config, localSkill as any);
-      Object.assign(config, updatedConfig);
+      let config = LLMConfigLoader.loadSkillsConfig() || { customTools: [], instructionSkills: [], repositories };
+      for (const localSkill of localSkills) {
+        config = applySkillInstall(config, localSkill as any);
+      }
       LLMConfigLoader.saveSkillsConfig(config);
-      return { success: true, source: 'local', skillId: normalizedName, skill: localSkill };
+
+      return {
+        success: true,
+        source: 'local',
+        directoryPath: normalizedDirectoryPath,
+        importedCount: localSkills.length,
+        skillIds: localSkills
+          .map((skill) => (typeof skill.fullName === 'string' ? skill.fullName : ''))
+          .filter((skillName) => skillName.length > 0),
+        skills: localSkills.map((skill) => ({
+          name: skill.fullName,
+          description: skill.description,
+          version: skill.version,
+          sourcePath: skill.sourcePath,
+        })),
+      };
     } catch (error) {
-      return { success: false, source: 'local', filePath, error: error instanceof Error ? error.message : String(error) };
+      return {
+        success: false,
+        source: 'local',
+        directoryPath,
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 

@@ -8,6 +8,10 @@
   import Toggle from './Toggle.svelte';
   import { getState } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { isWebAgentMode } from '../web/agent-api';
+  import WebFolderPicker from '../web/WebFolderPicker.svelte';
+
+  const isWebMode = isWebAgentMode();
 
 
   interface Props {
@@ -379,6 +383,8 @@
   let skillLibraryLoading = $state(false); // Skill 库加载状态
   let localSkillInstalling = $state(false);
   let skillLibraryFailedRepositories = $state<Array<{ repositoryId: string; url?: string; error?: string }>>([]);
+  let localSkillInstallError = $state('');
+  let showLocalSkillFolderPicker = $state(false);
 
   // 通用确认对话框状态
   let showConfirmDialog = $state(false);
@@ -1088,6 +1094,7 @@
     skillSearchQuery = '';
     skillLibraryLoading = true; // 设置加载状态
     skillLibraryFailedRepositories = [];
+    localSkillInstallError = '';
     vscode.postMessage({ type: 'loadSkillLibrary' });
   }
 
@@ -1097,6 +1104,7 @@
     skillLibraryLoading = false;
     localSkillInstalling = false;
     skillLibraryFailedRepositories = [];
+    localSkillInstallError = '';
   }
 
   function installSkill(skillFullName: string) {
@@ -1112,8 +1120,29 @@
     if (localSkillInstalling) {
       return;
     }
+    localSkillInstallError = '';
+    if (isWebMode) {
+      // Web 模式：弹出自定义目录选择器
+      showLocalSkillFolderPicker = true;
+    } else {
+      // 插件模式：走系统原生文件对话框
+      localSkillInstalling = true;
+      vscode.postMessage({ type: 'installLocalSkill' });
+    }
+  }
+
+  function handleLocalSkillFolderSelected(path: string): void {
+    showLocalSkillFolderPicker = false;
+    if (!path) {
+      return;
+    }
     localSkillInstalling = true;
-    vscode.postMessage({ type: 'installLocalSkill' });
+    localSkillInstallError = '';
+    vscode.postMessage({ type: 'installLocalSkill', directoryPath: path });
+  }
+
+  function cancelLocalSkillFolderPicker(): void {
+    showLocalSkillFolderPicker = false;
   }
 
   // 删除 Skill
@@ -1538,6 +1567,7 @@
           installingSkills = new Set(installingSkills);
         }
         localSkillInstalling = false;
+        localSkillInstallError = '';
         vscode.postMessage({ type: 'loadSkillLibrary' });
         showSkillLibraryDialogState = false;
       }
@@ -1548,6 +1578,13 @@
           installingSkills = new Set(installingSkills);
         }
         localSkillInstalling = false;
+        if (payload?.canceled === true) {
+          localSkillInstallError = '';
+        } else {
+          localSkillInstallError = typeof payload?.error === 'string' && payload.error.trim()
+            ? payload.error.trim()
+            : i18n.t('settings.skillLibrary.localImportFailed');
+        }
       }
       // Skill 更新成功
       else if (dataType === 'skillUpdated') {
@@ -2696,6 +2733,11 @@
           </div>
         </div>
         <div class="skill-library-list">
+          {#if localSkillInstallError}
+            <div class="skill-library-warning skill-library-error">
+              <div class="skill-library-warning-title">{localSkillInstallError}</div>
+            </div>
+          {/if}
           {#if skillLibraryFailedRepositories.length > 0}
             <div class="skill-library-warning">
               <div class="skill-library-warning-title">
@@ -2771,6 +2813,37 @@
       </div>
       <div class="modal-footer">
         <button class="settings-btn secondary" onclick={closeSkillLibraryDialog}>{i18n.t('settings.skillLibrary.close')}</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if showLocalSkillFolderPicker}
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+  <div class="modal-overlay modal-overlay--top" role="presentation" onclick={cancelLocalSkillFolderPicker}>
+    <div
+      class="modal-dialog modal-dialog--md"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="local-skill-picker-title"
+      tabindex="-1"
+      onclick={(event) => event.stopPropagation()}
+      onkeydown={(event) => {
+        if (event.key === 'Escape') {
+          cancelLocalSkillFolderPicker();
+        }
+      }}
+    >
+      <div class="modal-header">
+        <div class="modal-title" id="local-skill-picker-title">选择本地 Skill 目录</div>
+        <button class="modal-close" type="button" onclick={cancelLocalSkillFolderPicker}>×</button>
+      </div>
+      <div class="modal-body" style="padding: 0;">
+        <WebFolderPicker
+          onSelect={(path) => handleLocalSkillFolderSelected(path)}
+          onCancel={cancelLocalSkillFolderPicker}
+          disabled={localSkillInstalling}
+        />
       </div>
     </div>
   </div>
@@ -4021,6 +4094,14 @@
     border: 1px solid var(--warning);
     background: color-mix(in srgb, var(--warning) 10%, var(--surface-1));
     border-radius: var(--radius-md);
+  }
+  .skill-library-error {
+    border-color: var(--error);
+    background: color-mix(in srgb, var(--error) 10%, var(--surface-1));
+  }
+  .skill-library-error .skill-library-warning-title {
+    color: var(--error);
+    margin-bottom: 0;
   }
   .skill-library-warning-title {
     font-size: var(--text-sm);

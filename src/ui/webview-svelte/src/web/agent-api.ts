@@ -510,10 +510,33 @@ export interface DirectoryListResult {
   error?: string;
 }
 
-export async function listAgentDirectory(dirPath?: string): Promise<DirectoryListResult> {
-  const params = dirPath ? `?path=${encodeURIComponent(dirPath)}` : '';
-  const response = await getTransport().request(agentUrl(`/api/filesystem/list${params}`));
-  return await parseAgentJson<DirectoryListResult>(response, 'list directory');
+export async function listAgentDirectory(dirPath?: string, showHidden?: boolean): Promise<DirectoryListResult> {
+  try {
+    const query = new URLSearchParams();
+    if (dirPath) {
+      query.set('path', dirPath);
+    }
+    if (showHidden) {
+      query.set('showHidden', '1');
+    }
+    const qs = query.toString();
+    const response = await getTransport().request(agentUrl(`/api/filesystem/list${qs ? `?${qs}` : ''}`));
+    return await parseAgentJson<DirectoryListResult>(response, 'list directory');
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error('无法连接 Local Agent。请确认 Agent 已启动，或检查当前访问地址是否正确。');
+    }
+    if (error instanceof AgentApiError) {
+      const message = error.message.trim();
+      if (message.includes('ENOENT')) {
+        throw new Error('目标目录不存在，可能已被移动或删除。');
+      }
+      if (message.includes('EACCES') || message.includes('EPERM')) {
+        throw new Error('当前目录无访问权限，请切换到其他目录。');
+      }
+    }
+    throw error;
+  }
 }
 
 export async function getWorkspaceSessions(
@@ -879,8 +902,12 @@ export async function installAgentSkill(skillId: string): Promise<Record<string,
   return await postBoundJson<Record<string, unknown>>('/api/settings/skills/install', { skillId }, 'install skill');
 }
 
-export async function installAgentLocalSkill(): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/skills/install-local', {}, 'install local skill');
+export async function installAgentLocalSkill(directoryPath?: string): Promise<Record<string, unknown>> {
+  const payload: Record<string, unknown> = {};
+  if (directoryPath) {
+    payload.directoryPath = directoryPath;
+  }
+  return await postBoundJson<Record<string, unknown>>('/api/settings/skills/install-local', payload, 'install local skill');
 }
 
 export async function saveAgentSkillsConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {

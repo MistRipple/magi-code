@@ -816,9 +816,6 @@ function handleStandardComplete(message: ClientBridgeMessage) {
   const standard = assertStandardMessageId(rawStandard);
 
   if (standard.category !== MessageCategory.CONTENT || shouldHideFromUser(standard)) {
-    if (standard.category !== MessageCategory.CONTENT) {
-      console.debug('[MessageHandler] 跳过非时间轴消息的 complete 消息:', standard.category, standard.id);
-    }
     return;
   }
 

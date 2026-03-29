@@ -98,6 +98,11 @@ export interface PendingChange {
   additions: number;
   deletions: number;
   status: 'pending' | 'approved' | 'reverted';
+  diff?: string;
+  originalContent?: string;
+  previewContent?: string;
+  previewAbsolutePath?: string;
+  previewCanOpenWorkspaceFile?: boolean;
 
   // Mission 架构字段
   missionId: string;
@@ -338,8 +343,25 @@ export type WebviewToExtensionMessage =
   | { type: 'removeNotification'; notificationId: string }
   | { type: 'selectWorker'; worker: WorkerSlot | null }
   | { type: 'updateSetting'; key: string; value: unknown }
-  | { type: 'viewDiff'; filePath: string }
-  | { type: 'openFile'; filepath?: string; filePath?: string }
+  | {
+      type: 'viewDiff';
+      filePath: string;
+      sessionId?: string;
+      diff?: string;
+      originalContent?: string;
+      previewContent?: string;
+      previewAbsolutePath?: string;
+      previewCanOpenWorkspaceFile?: boolean;
+    }
+  | {
+      type: 'openFile';
+      filepath?: string;
+      filePath?: string;
+      sessionId?: string;
+      previewContent?: string;
+      previewAbsolutePath?: string;
+      previewCanOpenWorkspaceFile?: boolean;
+    }
   | { type: 'openLink'; url: string }
   | { type: 'getState' }
   | { type: 'requestState' }
@@ -396,7 +418,7 @@ export type WebviewToExtensionMessage =
   | { type: 'removeCustomTool'; toolName: string }
   | { type: 'removeInstructionSkill'; skillName: string }
   | { type: 'installSkill'; skillId: string }
-  | { type: 'installLocalSkill' }
+  | { type: 'installLocalSkill'; directoryPath?: string }
   | { type: 'updateSkill'; skillName: string }
   | { type: 'updateAllSkills' }
   // Skills 仓库相关
