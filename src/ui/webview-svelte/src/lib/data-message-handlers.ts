@@ -714,14 +714,17 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
 
   // 跨 session 切换：完整重建
   batchWebviewStatePersistence(() => {
+    // skipAntiLiftBack: 跨 session 切换后紧接着 applyAuthoritativeProcessingState
+    // 恢复新会话的权威状态，不能让防回抬保护阻断新会话的 processing 写入
     clearAllMessages({
       persist: false,
       resetTimelineView: false,
       resetPanelState: false,
+      skipAntiLiftBack: true,
     });
     clearAllRequestBindings();
     clearPendingInteractions();
-    clearProcessingState();
+    clearProcessingState({ skipAntiLiftBack: true });
 
     const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;
     const sessions = ensureArray(snapshot.sessions) as Session[];

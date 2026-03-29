@@ -2711,13 +2711,23 @@ export function clearPendingRequest(id: string) {
   }
 }
 
-export function clearProcessingState() {
+export function clearProcessingState(options?: {
+  /** 跳过防回抬保护（会话切换场景使用）。
+   *  会话切换后紧接着 applyAuthoritativeProcessingState 恢复新会话的权威状态，
+   *  不能让旧的 lastForcedIdleAt 阻断新状态写入。 */
+  skipAntiLiftBack?: boolean;
+}) {
   messagesState.backendProcessing = false;
   messagesState.activeMessageIds = new Set();
   messagesState.pendingRequests = new Set();
   clearAllRetryRuntime();
-  // 记录强制 idle 时间戳，用于防回抬保护
-  messagesState.lastForcedIdleAt = Date.now();
+  if (options?.skipAntiLiftBack) {
+    // 会话切换：清除防回抬标记，允许新会话的权威状态正常写入
+    messagesState.lastForcedIdleAt = null;
+  } else {
+    // 用户手动中断/强制 idle：设置防回抬，阻止后端残留事件抬回 processing
+    messagesState.lastForcedIdleAt = Date.now();
+  }
   updateProcessingState();
 }
 
@@ -3329,6 +3339,8 @@ export function clearAllMessages(options: {
   persist?: boolean;
   resetTimelineView?: boolean;
   resetPanelState?: boolean;
+  /** 跨 session 切换时设为 true，跳过防回抬保护 */
+  skipAntiLiftBack?: boolean;
 } = {}) {
   captureCurrentSessionViewState();
   pendingTimelineFlushes.clear();
@@ -3349,7 +3361,7 @@ export function clearAllMessages(options: {
     nonce: messagesState.messageJump.nonce,
   };
   clearPendingInteractions();
-  clearProcessingState();
+  clearProcessingState({ skipAntiLiftBack: options.skipAntiLiftBack });
   // 会话级运行时状态：会话切换时必须清理，避免旧数据泄漏到新会话
   waveState = null;
   missionPlan = new Map();
