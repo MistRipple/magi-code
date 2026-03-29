@@ -11,6 +11,7 @@ import {
   LLMMessageParams,
   LLMMessage,
   ToolCall,
+  ToolResult,
   DecisionHookEvent,
   isSummaryHijackText,
   sanitizeSummaryHijackMessages,
@@ -18,6 +19,7 @@ import {
 } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager, type ToolExecutionContext } from '../../tools/tool-manager';
+import { mergeToolPolicies, type EffectiveToolPolicy } from '../../tools/tool-policy';
 import { MessageHub } from '../../orchestrator/core/message/message-hub';
 import { BaseLLMAdapter, AdapterState } from './base-adapter';
 import { logger, LogCategory } from '../../logging';
@@ -177,8 +179,6 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   };
   private seenThinking = false;
   private decisionHookAppliedForThinking = false;
-  /** 工具摘要是否已注入到 systemPrompt（lazy init，仅执行一次） */
-  private toolsSummaryInjected = false;
   /** 写操作拦截缓存 TTL（避免环境修复后仍被旧记录阻断） */
   private static readonly FAILED_WRITE_CACHE_TTL_MS = 10 * 60 * 1000;
   private static readonly SUCCESS_WRITE_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -334,12 +334,6 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     // （autonomous-worker 每个 Todo 触发一次 sendMessage，清空会导致去重完全失效）
     // 去重状态在 clearHistory() 中随对话历史一起重置
 
-    // 首次调用时异步注入动态工具摘要到 systemPrompt
-    if (!this.toolsSummaryInjected) {
-      this.toolsSummaryInjected = true;
-      await this.injectToolsSummary();
-    }
-
     // 自动截断历史以控制 token 消耗
     this.truncateHistoryIfNeeded();
     // 清理可能破坏工具调用链路的历史片段
@@ -374,16 +368,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
       }
     }
 
-    // 获取工具定义（Worker 过滤掉编排者专用调度工具）
-    const ORCHESTRATION_TOOLS = ['worker_dispatch', 'worker_send_message', 'worker_wait', 'context_compact'];
-    const tools = await this.toolManager.getTools();
-    const toolDefinitions = tools
-      .filter((tool) => !ORCHESTRATION_TOOLS.includes(tool.name))
-      .map((tool) => ({
-        name: tool.name,
-        description: tool.description,
-        input_schema: tool.input_schema,
-      }));
+    let effectiveToolPolicy = this.getWorkerToolExecutionContext().toolPolicy;
+    let effectiveSystemPrompt = await this.resolveSystemPromptForPolicy(effectiveToolPolicy);
 
     // 每轮 LLM 调用独立一个 stream，确保时间轴正确：
     // 当轮 stream 内包含 thinking + text + tool_call + tool_result，
@@ -397,6 +383,8 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
     try {
       let finalText = '';
+      let lastNonEmptyAssistantText = '';
+      let totalToolResultCount = 0;
       let consecutiveFailures = 0;
       let totalFailures = 0;
       // 智能空转检测状态
@@ -475,10 +463,22 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
         this.decisionHookAppliedForThinking = false;
 
         const streamId = persistentVisibleStreamId;
+        const visibleTools = forceNoToolsNextRound
+          ? []
+          : await this.toolManager.getVisibleTools({
+            role: 'worker',
+            excludeOrchestrationTools: true,
+            toolPolicy: effectiveToolPolicy,
+          });
+        const toolDefinitions = visibleTools.map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          input_schema: tool.input_schema,
+        }));
 
         const params: LLMMessageParams = {
           messages: this.conversationHistory,
-          systemPrompt: this.systemPrompt,
+          systemPrompt: effectiveSystemPrompt,
           tools: forceNoToolsNextRound ? undefined : (toolDefinitions.length > 0 ? toolDefinitions : undefined),
           stream: true,
           maxTokens: 4096,
@@ -548,6 +548,9 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
           }
 
           const assistantText = accumulatedText || response.content || '';
+          if (assistantText.trim()) {
+            lastNonEmptyAssistantText = assistantText;
+          }
           const isSummaryHijack = isSummaryHijackText(assistantText);
           if (isSummaryHijack) {
             summaryHijackRounds++;
@@ -612,8 +615,9 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
           this.roundDedupHits = 0;
           this.roundWriteInterceptCount = 0;
-          const toolExecutionContext = this.getWorkerToolExecutionContext();
+          const toolExecutionContext = this.getWorkerToolExecutionContext(effectiveToolPolicy);
           const toolResults = await this.executeToolCalls(toolCalls, toolExecutionContext);
+          totalToolResultCount += toolResults.length;
 
           // 中断检查：工具执行完成后立即检测 abort，跳过后续处理直接退出循环
           if (this.abortController?.signal.aborted) {
@@ -640,6 +644,11 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
               standardized: result.standardized,
             })),
           });
+          effectiveToolPolicy = mergeToolPolicies([
+            effectiveToolPolicy,
+            ...toolResults.map((result) => this.extractToolPolicyFromResult(result)),
+          ]);
+          effectiveSystemPrompt = await this.resolveSystemPromptForPolicy(effectiveToolPolicy);
           if (forceNoToolsNextRound && toolCalls.length > 0) {
             forceNoToolsNextRound = false;
           }
@@ -906,7 +915,19 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
 
       // abort 中断时不要求必须有内容
       if (!finalText.trim() && !this.abortController?.signal.aborted) {
-        throw new Error(`LLM 响应为空：流式传输完成但未收到有效内容 [${this.agent}/${this.config.model}/${this.config.provider}]`);
+        if (lastNonEmptyAssistantText.trim()) {
+          finalText = lastNonEmptyAssistantText;
+          logger.warn(`${this.agent} 最终轮空文本，回退到最近有效输出`, {
+            totalToolResultCount,
+          }, LogCategory.LLM);
+        } else if (totalToolResultCount > 0) {
+          finalText = '工具执行已完成，但模型未返回最终文本总结。请查看上方工具执行结果。';
+          logger.warn(`${this.agent} 无最终文本，使用工具结果降级总结`, {
+            totalToolResultCount,
+          }, LogCategory.LLM);
+        } else {
+          throw new Error(`LLM 响应为空：流式传输完成但未收到有效内容 [${this.agent}/${this.config.model}/${this.config.provider}]`);
+        }
       }
 
       return finalText || '任务已中断';
@@ -1068,10 +1089,11 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
    * ⚠️ 产品级约束：后续新增写工具或执行入口必须复用该 executionContext，
    * 禁止绕过为默认 cwd 或自行设置路径（禁止旁路）。
    */
-  private getWorkerToolExecutionContext(): ToolExecutionContext {
+  private getWorkerToolExecutionContext(toolPolicy?: EffectiveToolPolicy): ToolExecutionContext {
     return this.resolveToolExecutionContext({
       workerId: this.workerSlot,
       role: 'worker',
+      toolPolicy,
     });
   }
 
@@ -1229,31 +1251,43 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
     return guidancePrompt;
   }
 
+  private extractToolPolicyFromResult(result: ToolResult): EffectiveToolPolicy | undefined {
+    const data = result.standardized?.data;
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return undefined;
+    }
+    const maybePolicy = (data as Record<string, unknown>).toolPolicy;
+    if (!maybePolicy || typeof maybePolicy !== 'object' || Array.isArray(maybePolicy)) {
+      return undefined;
+    }
+    return maybePolicy as EffectiveToolPolicy;
+  }
+
   /**
-   * 异步注入动态工具摘要到 systemPrompt（首次 sendMessage 时执行一次）
-   *
-   * 从 ToolManager.buildToolsSummary() 获取完整工具列表（内置 + MCP + Skill），
-   * 重新构建包含工具信息的 systemPrompt。
+   * 基于当前策略动态构建 Worker 系统提示。
+   * 这是 Worker 工具可见性的唯一提示词入口，禁止一次性缓存旧工具摘要。
    */
-  private async injectToolsSummary(): Promise<void> {
+  private async resolveSystemPromptForPolicy(toolPolicy?: EffectiveToolPolicy): Promise<string> {
     try {
-      const toolsSummary = await this.toolManager.buildToolsSummary({ role: 'worker' });
+      const toolsSummary = await this.toolManager.buildToolsSummary({
+        role: 'worker',
+        toolPolicy,
+      });
       if (toolsSummary) {
-        // 重建包含工具摘要的 systemPrompt，保留已拼接的环境上下文
         const basePrompt = this.buildSystemPrompt(toolsSummary);
-        // 保留 adapter-factory 在创建后追加的环境上下文部分
         const currentPrompt = this.systemPrompt;
         const oldBasePrompt = this.buildSystemPrompt();
         if (currentPrompt.startsWith(oldBasePrompt)) {
           const suffix = currentPrompt.slice(oldBasePrompt.length);
-          this.systemPrompt = basePrompt + suffix;
+          return basePrompt + suffix;
         } else {
-          this.systemPrompt = basePrompt;
+          return basePrompt;
         }
       }
     } catch (error) {
-      logger.warn(`${this.agent} 工具摘要注入失败，使用无工具列表的系统提示`, { error }, LogCategory.LLM);
+      logger.warn(`${this.agent} 动态工具摘要构建失败，回退到当前系统提示`, { error }, LogCategory.LLM);
     }
+    return this.systemPrompt;
   }
 
   /**
@@ -1485,14 +1519,14 @@ export class WorkerLLMAdapter extends BaseLLMAdapter {
   }
 
   /**
-   * 判断工具调用是否为只读操作（白名单）
+   * 判断工具调用是否为只读操作（固定只读工具集合）
    */
   private isReadOnlyToolCall(toolCall: ToolCall): boolean {
     return WorkerLLMAdapter.READ_ONLY_TOOL_NAMES.has(toolCall.name);
   }
 
   /**
-   * 判断工具调用是否允许写入去重（白名单）
+   * 判断工具调用是否参与写入去重（固定写工具集合）
    */
   private isWriteDedupToolCall(toolCall: ToolCall): boolean {
     return WorkerLLMAdapter.WRITE_DEDUP_TOOL_NAMES.has(toolCall.name);

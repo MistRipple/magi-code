@@ -7,11 +7,12 @@
   import { vscode } from '../lib/vscode-bridge';
   import { extractLeadingJson } from '../lib/terminal-utils';
   import type { IconName } from '../lib/icons';
-  import type { StandardizedToolResult } from '../types/message';
+  import type { StandardizedToolResult, ToolPolicyPayload } from '../types/message';
   import { i18n } from '../stores/i18n.svelte';
+  import { getCurrentSessionId } from '../stores/messages.svelte';
 
   interface ErrorDiagnosis {
-    category: 'model_input' | 'context_stale' | 'permission' | 'role_constraint' | 'runtime';
+    category: 'model_input' | 'context_stale' | 'permission' | 'role_constraint' | 'policy' | 'model_output' | 'workspace_write' | 'runtime';
     categoryLabel: string;
     ownerLabel: string;
     hint: string;
@@ -49,6 +50,41 @@
   // 折叠状态 - Mermaid 卡片默认展开，其他由 initialExpanded 控制
   let collapsed = $state(untrack(() => !initialExpanded && status !== 'error' && name !== 'mermaid_diagram'));
   let copySuccess = $state(false);
+
+  interface ParsedToolIdentity {
+    source: 'builtin' | 'mcp';
+    baseName: string;
+    qualifier?: string;
+    displayName: string;
+  }
+
+  function parseToolIdentity(toolName: string): ParsedToolIdentity {
+    if (typeof toolName !== 'string') {
+      return {
+        source: 'builtin',
+        baseName: '',
+        displayName: '',
+      };
+    }
+
+    const parts = toolName.split('__');
+    if (parts.length >= 3 && parts[0] === 'mcp') {
+      const qualifier = parts[1] || 'mcp';
+      const baseName = parts.slice(2).join('__') || toolName;
+      return {
+        source: 'mcp',
+        baseName,
+        qualifier,
+        displayName: `${baseName} · ${qualifier}`,
+      };
+    }
+
+    return {
+      source: 'builtin',
+      baseName: toolName,
+      displayName: toolName,
+    };
+  }
 
   // 格式化内容
   function formatContent(content: unknown): string {
@@ -91,6 +127,12 @@
       throw new Error('ToolCall: invalid toolName');
     }
 
+    const parsedTool = parseToolIdentity(toolName);
+    if (parsedTool.source === 'mcp') {
+      return 'plug';
+    }
+    const baseToolName = parsedTool.baseName;
+
     const iconMap: Record<string, IconName> = {
       // ToolManager 内置工具
       'shell': 'terminal',
@@ -122,11 +164,11 @@
       'code_intel_query': 'search',
     };
 
-    if (iconMap[toolName]) {
-      return iconMap[toolName];
+    if (iconMap[baseToolName]) {
+      return iconMap[baseToolName];
     }
 
-    const lowerName = toolName.toLowerCase();
+    const lowerName = baseToolName.toLowerCase();
     if (lowerName.includes('search') || lowerName.includes('semantic') || lowerName.includes('query')) return 'search';
     if (lowerName.includes('read') || lowerName.includes('view')) return 'file-text';
     if (lowerName.includes('write') || lowerName.includes('edit')) return 'file-edit';
@@ -185,6 +227,14 @@
   });
 
   const isWaitForWorkersTool = $derived(name === 'worker_wait');
+  const skillApplyPolicy = $derived.by(() => {
+    if (name !== 'skill_apply') return null;
+    const data = standardized?.data;
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+    const toolPolicy = (data as Record<string, unknown>).toolPolicy;
+    if (!toolPolicy || typeof toolPolicy !== 'object' || Array.isArray(toolPolicy)) return null;
+    return toolPolicy as ToolPolicyPayload;
+  });
   const hasContent = $derived(hasInput || hasOutput || hasError);
   const shouldCompactWaitForWorkers = $derived(isWaitForWorkersTool && !hasContent);
   const waitForWorkersStatusLabel = $derived.by(() => {
@@ -197,6 +247,11 @@
   // 获取工具显示名
   function getToolDisplayName(toolName: string): string {
     if (!toolName || typeof toolName !== 'string') return i18n.t('toolCall.displayName.default');
+    const parsedTool = parseToolIdentity(toolName);
+    if (parsedTool.source === 'mcp') {
+      return parsedTool.displayName;
+    }
+    const baseToolName = parsedTool.baseName;
 
     // 文件操作工具直接使用语义化显示名
     const displayNameMap: Record<string, string> = {
@@ -230,7 +285,7 @@
       'list_files': i18n.t('toolCall.displayName.listFiles'),
     };
 
-    return displayNameMap[toolName] ?? toolName;
+    return displayNameMap[baseToolName] ?? baseToolName;
   }
 
   // 从工具参数中提取语义摘要
@@ -375,6 +430,59 @@
     }
 
     if (matches(
+      'tool_policy_not_allowed',
+      'tool_policy_external_not_allowed',
+      'tool_policy_read_only',
+      'tool_policy_shell_write_disallowed',
+      'tool_policy_missing_path',
+      'tool_policy_path_not_allowed',
+      'tool_policy_path_forbidden',
+    )) {
+      return {
+        category: 'policy',
+        categoryLabel: i18n.t('toolCall.errorDiagnosis.policy.categoryLabel'),
+        ownerLabel: i18n.t('toolCall.errorDiagnosis.policy.ownerLabel'),
+        hint: i18n.t('toolCall.errorDiagnosis.policy.hint'),
+      };
+    }
+
+    if (matches(
+      'file_edit_model_output_invalid',
+      'file_edit_model_output_truncated',
+      'file_edit_model_empty_response',
+      'file_edit_model_timeout',
+      'file_edit_model_service_error',
+      'file_edit_generation_failed',
+    )) {
+      return {
+        category: 'model_output',
+        categoryLabel: i18n.t('toolCall.errorDiagnosis.modelOutput.categoryLabel'),
+        ownerLabel: i18n.t('toolCall.errorDiagnosis.modelOutput.ownerLabel'),
+        hint: i18n.t('toolCall.errorDiagnosis.modelOutput.hint'),
+      };
+    }
+
+    if (matches(
+      'file_write_apply_failed',
+      'file_write_save_failed',
+      'file_edit_write_failed',
+      'file_remove_apply_failed',
+    )) {
+      return {
+        category: 'workspace_write',
+        categoryLabel: i18n.t('toolCall.errorDiagnosis.workspaceWrite.categoryLabel'),
+        ownerLabel: i18n.t('toolCall.errorDiagnosis.workspaceWrite.ownerLabel'),
+        hint: i18n.t('toolCall.errorDiagnosis.workspaceWrite.hint'),
+      };
+    }
+
+    if (matches(
+      'file_create_invalid_args',
+      'file_edit_invalid_args',
+      'file_insert_invalid_args',
+      'file_remove_invalid_args',
+      'file_path_required',
+      'file_path_outside_workspace',
       'tool_rejected',
       'command rejected',
       'argument parse failed',
@@ -473,7 +581,8 @@
         // 后备：直接发消息给 VSCode 桥
         vscode.postMessage({
           type: 'openFile',
-          filepath: toolFilepath
+          filepath: toolFilepath,
+          sessionId: getCurrentSessionId() || undefined,
         });
       }
     }
@@ -587,6 +696,48 @@
                   <pre class="section-content">{outputText}</pre>
                 {/if}
               {/if}
+            </div>
+          {/if}
+
+          {#if skillApplyPolicy}
+            <div class="tool-section">
+              <div class="section-header">
+                <span class="section-label">Policy</span>
+              </div>
+              <div class="policy-card">
+                {#if skillApplyPolicy.activeInstructionSkillName}
+                  <div class="policy-row">
+                    <span class="policy-key">Skill</span>
+                    <span class="policy-value">{skillApplyPolicy.activeInstructionSkillName}</span>
+                  </div>
+                {/if}
+                {#if skillApplyPolicy.allowedToolNames && skillApplyPolicy.allowedToolNames.length > 0}
+                  <div class="policy-row policy-column">
+                    <span class="policy-key">Allowed Tools</span>
+                    <span class="policy-value policy-wrap">{skillApplyPolicy.allowedToolNames.join(', ')}</span>
+                  </div>
+                {/if}
+                {#if skillApplyPolicy.readOnly}
+                  <div class="policy-row">
+                    <span class="policy-key">Mode</span>
+                    <span class="policy-value">read-only</span>
+                  </div>
+                {/if}
+                {#if skillApplyPolicy.allowedFilePatternGroups && skillApplyPolicy.allowedFilePatternGroups.length > 0}
+                  <div class="policy-row policy-column">
+                    <span class="policy-key">Allowed Paths</span>
+                    <span class="policy-value policy-wrap">
+                      {skillApplyPolicy.allowedFilePatternGroups.map((group) => group.join(' | ')).join(' ; ')}
+                    </span>
+                  </div>
+                {/if}
+                {#if skillApplyPolicy.forbiddenFilePatterns && skillApplyPolicy.forbiddenFilePatterns.length > 0}
+                  <div class="policy-row policy-column">
+                    <span class="policy-key">Blocked Paths</span>
+                    <span class="policy-value policy-wrap">{skillApplyPolicy.forbiddenFilePatterns.join(', ')}</span>
+                  </div>
+                {/if}
+              </div>
             </div>
           {/if}
 
@@ -750,6 +901,24 @@
     background: rgba(139, 92, 246, 0.12);
   }
 
+  .error-policy {
+    color: var(--warning);
+    border-color: rgba(249, 115, 22, 0.45);
+    background: rgba(249, 115, 22, 0.12);
+  }
+
+  .error-model_output {
+    color: var(--warning);
+    border-color: rgba(14, 165, 233, 0.45);
+    background: rgba(14, 165, 233, 0.12);
+  }
+
+  .error-workspace_write {
+    color: var(--error);
+    border-color: rgba(220, 38, 38, 0.45);
+    background: rgba(220, 38, 38, 0.12);
+  }
+
   .error-runtime {
     color: var(--error);
     border-color: rgba(239, 68, 68, 0.45);
@@ -811,6 +980,46 @@
     color: var(--foreground-muted);
     text-transform: uppercase;
     letter-spacing: 0.5px;
+  }
+
+  .policy-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-1);
+  }
+
+  .policy-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+  }
+
+  .policy-row.policy-column {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-1);
+  }
+
+  .policy-key {
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    flex-shrink: 0;
+  }
+
+  .policy-value {
+    font-size: var(--text-sm);
+    color: var(--foreground);
+  }
+
+  .policy-wrap {
+    white-space: pre-wrap;
+    word-break: break-word;
   }
 
   .copy-btn {

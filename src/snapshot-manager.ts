@@ -13,6 +13,7 @@ import { AgentType } from './types/agent-types';
 import { UnifiedSessionManager, FileSnapshotMeta } from './session';
 import { globalEventBus } from './events';
 import { atomicWriteFileSync } from './utils/atomic-write';
+import { buildUnifiedFileDiff } from './utils/unified-file-diff';
 
 /** 生成唯一 ID */
 function generateId(): string {
@@ -672,6 +673,7 @@ export class SnapshotManager {
 
     type FilePendingContext = {
       filePath: string;
+      absolutePath: string;
       sortedSnapshots: FileSnapshotMeta[];
       currentContent: string;
       snapshotContentById: Map<string, string>;
@@ -704,6 +706,7 @@ export class SnapshotManager {
 
       contexts.push({
         filePath,
+        absolutePath,
         sortedSnapshots,
         currentContent,
         snapshotContentById,
@@ -726,7 +729,7 @@ export class SnapshotManager {
     const changes: Array<PendingChange & { timestamp: number }> = [];
 
     for (const context of contexts) {
-      const { filePath, sortedSnapshots, currentContent, snapshotContentById } = context;
+      const { filePath, absolutePath, sortedSnapshots, currentContent, snapshotContentById } = context;
       const latestMissionSnapshots = sortedSnapshots.filter(
         snapshot => snapshot.missionId === latestMissionId
           && snapshotContentById.get(snapshot.id) !== currentContent,
@@ -737,7 +740,8 @@ export class SnapshotManager {
         const latestRoundStart = latestMissionSnapshots[0];
         const latestRoundEnd = latestMissionSnapshots[latestMissionSnapshots.length - 1];
         baselineBeforeLatest = snapshotContentById.get(latestRoundStart.id) ?? currentContent;
-        const { additions, deletions } = this.countChanges(baselineBeforeLatest, currentContent);
+        const diffResult = buildUnifiedFileDiff(baselineBeforeLatest, currentContent, filePath);
+        const { additions, deletions, diff } = diffResult;
         const contributors = new Set<string>();
         for (const snapshot of latestMissionSnapshots) {
           for (const contributor of snapshot.contributors ?? [snapshot.workerId]) {
@@ -755,6 +759,11 @@ export class SnapshotManager {
             contributors: Array.from(contributors),
             additions,
             deletions,
+            diff,
+            originalContent: baselineBeforeLatest,
+            previewContent: currentContent,
+            previewAbsolutePath: absolutePath,
+            previewCanOpenWorkspaceFile: fs.existsSync(absolutePath),
             status: 'pending',
             timestamp: latestRoundEnd.timestamp ?? 0,
           });
@@ -772,7 +781,8 @@ export class SnapshotManager {
       const stagedStart = stagedSnapshots[0];
       const stagedEnd = stagedSnapshots[stagedSnapshots.length - 1];
       const stagedBaseline = snapshotContentById.get(stagedStart.id) ?? '';
-      const { additions, deletions } = this.countChanges(stagedBaseline, baselineBeforeLatest);
+      const diffResult = buildUnifiedFileDiff(stagedBaseline, baselineBeforeLatest, filePath);
+      const { additions, deletions, diff } = diffResult;
       if (additions === 0 && deletions === 0) {
         continue;
       }
@@ -792,6 +802,11 @@ export class SnapshotManager {
         contributors: Array.from(stagedContributors),
         additions,
         deletions,
+        diff,
+        originalContent: stagedBaseline,
+        previewContent: baselineBeforeLatest,
+        previewAbsolutePath: absolutePath,
+        previewCanOpenWorkspaceFile: false,
         status: 'pending',
         timestamp: stagedEnd.timestamp ?? 0,
       });

@@ -375,7 +375,7 @@
       closeQueueMenu();
     };
     window.addEventListener('resize', handleViewportChanged);
-    window.addEventListener('scroll', handleViewportChanged, true);
+    window.addEventListener('scroll', handleViewportChanged, { capture: true, passive: true });
     const unsubscribe = vscode.onMessage((msg) => {
       if (msg.type !== 'unifiedMessage') return;
       const standard = msg.message as StandardMessage;

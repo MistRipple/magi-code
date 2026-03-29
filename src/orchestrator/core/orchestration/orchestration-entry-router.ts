@@ -12,6 +12,7 @@ export interface EntryRoutingDecision {
   historyMode: RequirementAnalysis['historyMode'];
   includeThinking: RequirementAnalysis['includeThinking'];
   includeToolCalls: RequirementAnalysis['includeToolCalls'];
+  toolPolicy: RequirementAnalysis['toolPolicy'];
   decisionFactors?: string[];
   reason: RequirementAnalysis['reason'];
 }
@@ -134,6 +135,7 @@ export function buildRequirementAnalysis(
         : undefined,
     includeThinking: resolvedClassification.entryPolicy.includeThinking,
     includeToolCalls: resolvedClassification.entryPolicy.includeToolCalls,
+    toolPolicy: resolvedClassification.entryPolicy.toolPolicy,
     historyMode: resolvedClassification.entryPolicy.historyMode,
     requiresModification: resolvedClassification.requiresModification,
     decisionFactors: [...resolvedClassification.decisionFactors],
@@ -164,6 +166,7 @@ export function resolveOrchestrationEntry(input: {
       historyMode: requirementAnalysis.historyMode,
       includeThinking: requirementAnalysis.includeThinking ?? false,
       includeToolCalls: requirementAnalysis.includeToolCalls ?? false,
+      toolPolicy: requirementAnalysis.toolPolicy,
       decisionFactors: requirementAnalysis.decisionFactors,
       reason: requirementAnalysis.reason,
     },

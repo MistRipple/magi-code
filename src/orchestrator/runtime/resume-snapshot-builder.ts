@@ -63,6 +63,7 @@ export class ResumeSnapshotBuilder {
       attempt: input.chain.attempt,
       checkpointSeq,
       mainline: {
+        userPrompt: input.mainline.userPrompt,
         currentMissionId: input.mainline.currentMissionId,
         currentPlanId: input.mainline.currentPlanId,
         runtimePhase: input.mainline.runtimePhase,
@@ -84,6 +85,7 @@ export class ResumeSnapshotBuilder {
         workerSlot: wb.workerSlot,
         assignmentGroupId: wb.assignmentGroupId,
         workerSessionId: wb.workerSessionId,
+        workerSessionSnapshot: wb.workerSessionSnapshot,
         currentTodoId: wb.currentTodoId,
         completedTodoIds: [...wb.completedTodoIds],
         pendingTodoIds: [...wb.pendingTodoIds],

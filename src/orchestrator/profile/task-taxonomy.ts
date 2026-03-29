@@ -166,6 +166,7 @@ export const MODE_CONSTRAINTS: Record<TaskMode, ModeConstraints> = {
   },
   architecture: {
     description: '架构设计模式',
+    readOnly: true,
     behavioralConstraints: [
       '关注系统整体架构',
       '考虑可扩展性和可维护性',
@@ -204,4 +205,3 @@ export function isValidOwnership(value: string): value is TaskOwnership {
 export function isValidMode(value: string): value is TaskMode {
   return MODE_SET.has(value);
 }
-

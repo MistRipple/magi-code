@@ -551,14 +551,12 @@ export class OrchestrationExecutor {
       return { ok: false, error: `${prefix}: task_name 是必填参数` };
     }
 
-    // ownership_hint + mode_hint 验证（兼容旧 category 字段）
+    // ownership_hint + mode_hint 验证：只接受新协议字段
     let ownershipHint = typeof task.ownership_hint === 'string' ? task.ownership_hint.trim() : '';
     let modeHint = typeof task.mode_hint === 'string' ? task.mode_hint.trim() : '';
 
-    // 向后兼容：如果 LLM 仍产出旧 category 字段且新字段缺失，从 category 推导
-    if (!ownershipHint && typeof task.category === 'string' && task.category.trim()) {
-      ownershipHint = task.category.trim();
-      if (!modeHint) modeHint = 'auto';
+    if (typeof task.category === 'string' && task.category.trim()) {
+      return { ok: false, error: `${prefix}: category 已废弃，必须改用 ownership_hint + mode_hint` };
     }
 
     if (!ownershipHint) ownershipHint = 'auto';

@@ -18,6 +18,7 @@ import { ProfileLoader } from '../profile/profile-loader';
 import { GuidanceInjector } from '../profile/guidance-injector';
 import { MissionStorageManager, Mission } from '../mission';
 import { AutonomousWorker } from '../worker';
+import type { WorkerSessionSnapshot } from '../worker/worker-session';
 import type { IAdapterFactory } from '../../adapters/adapter-factory-interface';
 import { ContextManager } from '../../context/context-manager';
 import { logger, LogCategory } from '../../logging';
@@ -346,6 +347,34 @@ export class MissionOrchestrator extends EventEmitter {
    */
   setCurrentMissionId(missionId: string | null): void {
     this.currentMissionId = missionId;
+  }
+
+  /**
+   * 按 assignmentId 导出 Worker Session Snapshot（checkpoint 真相源）
+   *
+   * 在 captureResumeSnapshot() 时由 MDE 调用，
+   * 为每个 worker 分支采集真实 checkpoint。
+   */
+  exportWorkerSessionSnapshotByAssignment(
+    workerSlot: WorkerSlot,
+    assignmentId: string,
+  ): WorkerSessionSnapshot | null {
+    const worker = this.workers.get(workerSlot);
+    if (!worker) return null;
+    const session = worker.getSessionByAssignment(assignmentId);
+    if (!session) return null;
+    return worker.getSessionManager().exportSnapshot(session.id);
+  }
+
+  /**
+   * 导出所有活跃 Worker 的 Session Snapshot
+   */
+  exportAllWorkerSessionSnapshots(): WorkerSessionSnapshot[] {
+    const snapshots: WorkerSessionSnapshot[] = [];
+    for (const worker of this.workers.values()) {
+      snapshots.push(...worker.getSessionManager().exportSnapshots());
+    }
+    return snapshots;
   }
 
   /**

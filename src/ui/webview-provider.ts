@@ -68,6 +68,10 @@ interface AgentChangeDiffPayload {
   currentExists?: boolean;
 }
 
+interface AgentConnectionController {
+  ensureReadyBaseUrl(): Promise<string>;
+}
+
 export class WebviewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'magi.mainView';
 
@@ -82,12 +86,14 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   private readonly tempFiles = new Set<string>();
   private activeSseRequest: http.ClientRequest | null = null;
   private activeSseSubscriptionId: string | null = null;
+  private currentSessionId = '';
 
   constructor(
     private readonly extensionUri: vscode.Uri,
     private readonly context: vscode.ExtensionContext,
     workspaceFolders: WorkspaceFolderInfo[],
     private agentBaseUrl: string,
+    private readonly agentController: AgentConnectionController,
   ) {
     const normalizedFolders = workspaceFolders
       .filter((folder) => folder && folder.path)
@@ -165,6 +171,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }),
     });
 
+    this.currentSessionId = payload.sessionId?.trim() || '';
     this.sendData('sessionBootstrapLoaded', payload as unknown as Record<string, unknown>, payload.sessionId);
     logger.info('界面.会话.Agent新建完成', {
       sessionId: payload.sessionId,
@@ -174,26 +181,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   public async refreshAgentBaseUrl(nextBaseUrl: string): Promise<void> {
-    const normalized = nextBaseUrl.trim();
-    if (!normalized) {
-      throw new Error('[WebviewProvider] refreshAgentBaseUrl 缺少有效地址');
+    this.updateAgentBaseUrl(nextBaseUrl);
+    if (this._view) {
+      this._view.webview.html = this.getHtmlContent(this._view.webview);
     }
-    if (normalized === this.agentBaseUrl) {
-      return;
-    }
-
-    this.agentBaseUrl = normalized;
-    logger.info('界面.Webview.Agent地址已刷新', {
-      workspaceRoot: this.workspaceRoot,
-      workspaceId: this.workspaceId,
-      agentBaseUrl: this.agentBaseUrl,
-    }, LogCategory.UI);
-
-    if (!this._view) {
-      return;
-    }
-
-    this._view.webview.html = this.getHtmlContent(this._view.webview);
   }
 
   public async dispose(): Promise<void> {
@@ -215,7 +206,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         await this.handleOpenFile(message);
         return;
       case 'viewDiff':
-        await this.openVscodeDiff(message.filePath);
+        await this.openVscodeDiff(message);
         return;
       case 'openLink':
         await this.handleOpenLink(message.url);
@@ -227,7 +218,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         void this.handleAgentApiProxy(message);
         return;
       case 'agentSseSubscribe':
-        this.startSseForwarding(message.queryString, message.subscriptionId);
+        void this.startSseForwarding(message.queryString, message.subscriptionId).catch((error) => {
+          logger.error('界面.SSE代理.建立失败', {
+            error: error instanceof Error ? error.message : String(error),
+            subscriptionId: message.subscriptionId,
+          }, LogCategory.UI);
+          this.postMessage({
+            type: 'agentSseStatus',
+            status: 'error',
+            subscriptionId: message.subscriptionId,
+          } as ExtensionToWebviewMessage);
+        });
         return;
       case 'agentSseUnsubscribe':
         this.closeSseForwarding(message.subscriptionId);
@@ -248,7 +249,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     try {
       // 将前端发来的完整 URL 中的 agentBaseUrl 部分替换为宿主侧的实际地址
       // 前端拼接的 URL 可能是 http://localhost:46231/api/...，宿主侧直接用 agentBaseUrl
-      const agentBaseUrlObj = new URL(this.agentBaseUrl);
+      const agentBaseUrlObj = new URL(await this.resolveActiveAgentBaseUrl());
       const requestUrl = new URL(url);
       requestUrl.protocol = agentBaseUrlObj.protocol;
       requestUrl.host = agentBaseUrlObj.host;
@@ -288,10 +289,10 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   // SSE 事件转发：宿主 http.get → Agent /api/events → postMessage → WebView
   // ============================================
 
-  private startSseForwarding(queryString: string, subscriptionId: string): void {
+  private async startSseForwarding(queryString: string, subscriptionId: string): Promise<void> {
     this.closeSseForwarding();
     this.activeSseSubscriptionId = subscriptionId;
-    const sseUrl = `${this.agentBaseUrl}/api/events?${queryString}`;
+    const sseUrl = `${await this.resolveActiveAgentBaseUrl()}/api/events?${queryString}`;
     logger.info('界面.SSE代理.建立连接', { url: sseUrl, subscriptionId }, LogCategory.UI);
 
     const parsedUrl = new URL(sseUrl);
@@ -406,6 +407,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       workspaceId: this.workspaceId,
       workspacePath: this.workspaceRoot,
     });
+    if (this.currentSessionId) {
+      query.set('sessionId', this.currentSessionId);
+    }
     for (const [key, value] of Object.entries(extra ?? {})) {
       const normalized = value.trim();
       if (normalized) {
@@ -416,11 +420,32 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
   }
 
   private async fetchAgentJson<T>(pathname: string, init?: RequestInit): Promise<T> {
-    const response = await fetch(`${this.agentBaseUrl}${pathname}`, init);
+    const response = await fetch(`${await this.resolveActiveAgentBaseUrl()}${pathname}`, init);
     if (!response.ok) {
       throw new Error(`${pathname} failed: ${response.status}`);
     }
     return await response.json() as T;
+  }
+
+  private updateAgentBaseUrl(nextBaseUrl: string): void {
+    const normalized = nextBaseUrl.trim();
+    if (!normalized) {
+      throw new Error('[WebviewProvider] Agent 地址为空');
+    }
+    if (normalized === this.agentBaseUrl) {
+      return;
+    }
+    this.agentBaseUrl = normalized;
+    logger.info('界面.Webview.Agent地址已刷新', {
+      workspaceRoot: this.workspaceRoot,
+      workspaceId: this.workspaceId,
+      agentBaseUrl: this.agentBaseUrl,
+    }, LogCategory.UI);
+  }
+
+  private async resolveActiveAgentBaseUrl(): Promise<string> {
+    this.updateAgentBaseUrl(await this.agentController.ensureReadyBaseUrl());
+    return this.agentBaseUrl;
   }
 
   private sendData(
@@ -486,7 +511,19 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    this.syncCurrentSessionId(message.sessionId);
+
     try {
+      const previewAbsolutePath = this.resolvePreviewAbsolutePath(
+        message.previewAbsolutePath,
+        message.previewCanOpenWorkspaceFile,
+      );
+      if (previewAbsolutePath) {
+        const document = await vscode.workspace.openTextDocument(vscode.Uri.file(previewAbsolutePath));
+        await vscode.window.showTextDocument(document, { preview: false, preserveFocus: false });
+        return;
+      }
+
       const directTarget = this.workspaceRoots.resolvePath(targetPath, { mustExist: false });
       if (directTarget?.absolutePath && fs.existsSync(directTarget.absolutePath)) {
         const stat = fs.statSync(directTarget.absolutePath);
@@ -504,7 +541,17 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
 
     try {
-      const query = this.buildAgentQuery({ filePath: targetPath });
+      if (typeof message.previewContent === 'string') {
+        const previewPath = await this.createTempPreviewFile('file-preview', targetPath, message.previewContent);
+        const document = await vscode.workspace.openTextDocument(vscode.Uri.file(previewPath));
+        await vscode.window.showTextDocument(document, { preview: false, preserveFocus: false });
+        return;
+      }
+
+      const query = this.buildAgentQuery({
+        filePath: targetPath,
+        sessionId: this.resolveRequestedSessionId(message.sessionId),
+      });
       const payload = await this.fetchAgentJson<AgentFilePreviewPayload>(`/api/files/content?${query}`);
       if (payload.exists && payload.absolutePath && fs.existsSync(payload.absolutePath)) {
         const document = await vscode.workspace.openTextDocument(vscode.Uri.file(payload.absolutePath));
@@ -557,32 +604,62 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async openVscodeDiff(filePath: string): Promise<void> {
-    const normalizedFilePath = filePath.trim();
+  private async openVscodeDiff(
+    message: Extract<WebviewToExtensionMessage, { type: 'viewDiff' }>,
+  ): Promise<void> {
+    const normalizedFilePath = message.filePath.trim();
     if (!normalizedFilePath) {
       this.sendToast(t('toast.snapshotNotFound'), 'warning');
       return;
     }
 
-    try {
-      const query = this.buildAgentQuery({ filePath: normalizedFilePath });
-      const payload = await this.fetchAgentJson<AgentChangeDiffPayload>(`/api/changes/diff?${query}`);
+    this.syncCurrentSessionId(message.sessionId);
 
-      const originalUri = vscode.Uri.file(
-        await this.createTempPreviewFile('diff-original', payload.filePath, payload.originalContent || ''),
+    try {
+      const inlineOriginalContent = typeof message.originalContent === 'string' ? message.originalContent : '';
+      const inlineCurrentContent = typeof message.previewContent === 'string' ? message.previewContent : '';
+      const inlineCurrentAbsolutePath = this.resolvePreviewAbsolutePath(
+        message.previewAbsolutePath,
+        message.previewCanOpenWorkspaceFile,
       );
 
-      const currentAbsolutePath = typeof payload.currentAbsolutePath === 'string'
-        ? payload.currentAbsolutePath.trim()
-        : '';
-      const currentExists = payload.currentExists === true && currentAbsolutePath && fs.existsSync(currentAbsolutePath);
-      const currentUri = currentExists
-        ? vscode.Uri.file(currentAbsolutePath)
-        : vscode.Uri.file(
-          await this.createTempPreviewFile('diff-current', payload.filePath, payload.currentContent || ''),
-        );
+      let payloadFilePath = normalizedFilePath;
+      let originalContent = inlineOriginalContent;
+      let currentContent = inlineCurrentContent;
+      let currentUri: vscode.Uri | null = inlineCurrentAbsolutePath
+        ? vscode.Uri.file(inlineCurrentAbsolutePath)
+        : null;
 
-      const title = t('provider.diffTitle', { fileName: path.basename(payload.filePath) });
+      if (!originalContent && !currentUri && !currentContent) {
+        const query = this.buildAgentQuery({
+          filePath: normalizedFilePath,
+          sessionId: this.resolveRequestedSessionId(message.sessionId),
+        });
+        const payload = await this.fetchAgentJson<AgentChangeDiffPayload>(`/api/changes/diff?${query}`);
+        payloadFilePath = payload.filePath;
+        originalContent = payload.originalContent || '';
+        currentContent = payload.currentContent || '';
+
+        const currentAbsolutePath = typeof payload.currentAbsolutePath === 'string'
+          ? payload.currentAbsolutePath.trim()
+          : '';
+        const currentExists = payload.currentExists === true && currentAbsolutePath && fs.existsSync(currentAbsolutePath);
+        currentUri = currentExists
+          ? vscode.Uri.file(currentAbsolutePath)
+          : null;
+      }
+
+      const originalUri = vscode.Uri.file(
+        await this.createTempPreviewFile('diff-original', payloadFilePath, originalContent),
+      );
+
+      if (!currentUri) {
+        currentUri = vscode.Uri.file(
+          await this.createTempPreviewFile('diff-current', payloadFilePath, currentContent),
+        );
+      }
+
+      const title = t('provider.diffTitle', { fileName: path.basename(payloadFilePath) });
       await vscode.commands.executeCommand('vscode.diff', originalUri, currentUri, title);
     } catch (error) {
       logger.error('界面.差异.打开_失败', {
@@ -615,6 +692,40 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
       }
     }
     return null;
+  }
+
+  private syncCurrentSessionId(sessionId?: string): void {
+    if (typeof sessionId !== 'string') {
+      return;
+    }
+    const normalized = sessionId.trim();
+    if (normalized) {
+      this.currentSessionId = normalized;
+    }
+  }
+
+  private resolveRequestedSessionId(sessionId?: string): string {
+    if (typeof sessionId === 'string' && sessionId.trim()) {
+      return sessionId.trim();
+    }
+    return this.currentSessionId;
+  }
+
+  private resolvePreviewAbsolutePath(
+    previewAbsolutePath?: string,
+    previewCanOpenWorkspaceFile?: boolean,
+  ): string | null {
+    if (previewCanOpenWorkspaceFile !== true) {
+      return null;
+    }
+    if (typeof previewAbsolutePath !== 'string') {
+      return null;
+    }
+    const normalized = previewAbsolutePath.trim();
+    if (!normalized || !fs.existsSync(normalized)) {
+      return null;
+    }
+    return normalized;
   }
 
   private getHtmlContent(webview: vscode.Webview): string {

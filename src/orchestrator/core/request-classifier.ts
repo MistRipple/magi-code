@@ -1,4 +1,5 @@
 import type { PlanMode } from '../plan-ledger';
+import { buildAllowedToolsOnlyPolicy, type EffectiveToolPolicy } from '../../tools/tool-policy';
 
 export type RequestEntryPath = 'direct_response' | 'lightweight_analysis' | 'task_execution';
 export const REQUEST_CLASSIFIER_VERSION = 'heuristic_v4';
@@ -7,9 +8,18 @@ export interface RequestEntryPolicy {
   entryPath: RequestEntryPath;
   includeThinking: boolean;
   includeToolCalls: boolean;
-  allowedToolNames?: string[];
+  toolPolicy?: EffectiveToolPolicy;
   historyMode: 'session' | 'isolated';
 }
+
+const LIGHTWEIGHT_ANALYSIS_ALLOWED_TOOL_NAMES = [
+  'file_view',
+  'code_search_regex',
+  'code_search_semantic',
+  'web_search',
+  'web_fetch',
+  'project_knowledge_query',
+] as const;
 
 export interface RequestClassification {
   hasReadOnlyIntent: boolean;
@@ -177,6 +187,7 @@ export function classifyRequest(prompt: string, mode: PlanMode): RequestClassifi
           entryPath,
           includeThinking: false,
           includeToolCalls: true,
+          toolPolicy: buildAllowedToolsOnlyPolicy([...LIGHTWEIGHT_ANALYSIS_ALLOWED_TOOL_NAMES]),
           historyMode: 'isolated',
         }
       : {

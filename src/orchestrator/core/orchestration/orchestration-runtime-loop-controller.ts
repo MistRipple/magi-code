@@ -317,6 +317,7 @@ export class OrchestrationRuntimeLoopController {
           systemPrompt: input.systemPrompt,
           includeThinking: input.requirementAnalysis.includeThinking ?? false,
           includeToolCalls: input.requirementAnalysis.includeToolCalls ?? false,
+          toolPolicy: input.requirementAnalysis.toolPolicy,
           historyMode: input.requirementAnalysis.historyMode ?? 'isolated',
           requestId: currentRoundRequestId,
           messageMetadata: {

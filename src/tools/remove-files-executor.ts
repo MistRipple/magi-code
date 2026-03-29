@@ -7,6 +7,7 @@
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import * as vscode from 'vscode';
 import { ToolExecutor, ExtendedToolDefinition } from './types';
 import { ToolCall, ToolResult } from '../llm/types';
 import { logger, LogCategory } from '../logging';
@@ -107,11 +108,19 @@ IMPORTANT:
     const args = toolCall.arguments as { paths: string[] };
 
     if (!args.paths || !Array.isArray(args.paths) || args.paths.length === 0) {
-      return {
-        toolCallId: toolCall.id,
-        content: 'Error: paths array is required and must not be empty',
-        isError: true
-      };
+      return this.buildStandardizedErrorResult(
+        toolCall.id,
+        'paths array is required and must not be empty',
+        'file_remove_invalid_args',
+      );
+    }
+    const invalidPathIndex = args.paths.findIndex((value) => typeof value !== 'string' || !value.trim());
+    if (invalidPathIndex >= 0) {
+      return this.buildStandardizedErrorResult(
+        toolCall.id,
+        `paths[${invalidPathIndex}] must be a non-empty string`,
+        'file_remove_invalid_args',
+      );
     }
 
     logger.debug('RemoveFilesExecutor executing', { paths: args.paths }, LogCategory.TOOLS);
@@ -119,6 +128,7 @@ IMPORTANT:
     const results: string[] = [];
     let successCount = 0;
     let errorCount = 0;
+    let primaryErrorCode: string | undefined;
 
     for (const filePath of args.paths) {
       const resolvedResult = this.resolveWorkspacePath(filePath);
@@ -127,6 +137,7 @@ IMPORTANT:
       if (!resolved) {
         results.push(`✗ ${filePath}: ${resolvedResult.error || 'path is outside workspace'}`);
         errorCount++;
+        primaryErrorCode ||= 'file_path_outside_workspace';
         continue;
       }
 
@@ -137,6 +148,7 @@ IMPORTANT:
         if (stat.isDirectory()) {
           results.push(`✗ ${filePath}: is a directory (use recursive delete for directories)`);
           errorCount++;
+          primaryErrorCode ||= 'file_remove_directory_unsupported';
           continue;
         }
 
@@ -147,8 +159,14 @@ IMPORTANT:
         // 快照回调（在删除前通知快照系统保存原始内容）
         this.onBeforeWrite?.(resolved);
 
-        // 删除文件
-        await fs.unlink(resolved);
+        // 通过 WorkspaceEdit 删除文件，保持与其他文件工具一致的 VSCode 写入链
+        const uri = vscode.Uri.file(resolved);
+        const edit = new vscode.WorkspaceEdit();
+        edit.deleteFile(uri, { recursive: false, ignoreIfNotExists: false });
+        const applied = await vscode.workspace.applyEdit(edit);
+        if (!applied) {
+          throw new Error('VSCode WorkspaceEdit 删除文件失败');
+        }
         this.onAfterWrite?.(resolved);
 
         results.push(`✓ ${filePath}: deleted`);
@@ -158,8 +176,12 @@ IMPORTANT:
       } catch (error: any) {
         if (error.code === 'ENOENT') {
           results.push(`✗ ${filePath}: file not found`);
+          primaryErrorCode ||= 'file_remove_not_found';
         } else {
           results.push(`✗ ${filePath}: ${error.message}`);
+          primaryErrorCode ||= error?.message?.includes('WorkspaceEdit')
+            ? 'file_remove_apply_failed'
+            : 'file_remove_execution_failed';
         }
         errorCount++;
       }
@@ -168,11 +190,23 @@ IMPORTANT:
     const summary = `\nDeleted: ${successCount}, Errors: ${errorCount}`;
     const content = results.join('\n') + summary;
 
-    return {
+    const result: ToolResult = {
       toolCallId: toolCall.id,
       content,
       isError: errorCount > 0 && successCount === 0
     };
+    if (result.isError && primaryErrorCode) {
+      result.standardized = {
+        schemaVersion: 'tool-result.v1',
+        source: 'builtin',
+        toolName: 'file_remove',
+        toolCallId: toolCall.id,
+        status: 'error',
+        message: content,
+        errorCode: primaryErrorCode,
+      };
+    }
+    return result;
   }
 
   /**
@@ -223,5 +257,27 @@ IMPORTANT:
     } catch (error: any) {
       return { absolutePath: null, error: error.message };
     }
+  }
+
+  private buildStandardizedErrorResult(
+    toolCallId: string,
+    message: string,
+    errorCode: string,
+  ): ToolResult {
+    const normalizedMessage = message.startsWith('Error') ? message : `Error: ${message}`;
+    return {
+      toolCallId,
+      content: normalizedMessage,
+      isError: true,
+      standardized: {
+        schemaVersion: 'tool-result.v1',
+        source: 'builtin',
+        toolName: 'file_remove',
+        toolCallId,
+        status: 'error',
+        message: normalizedMessage,
+        errorCode,
+      },
+    };
   }
 }

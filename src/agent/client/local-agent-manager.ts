@@ -44,7 +44,7 @@ export class LocalAgentManager {
   private readonly extensionRoot: string;
   private readonly agentPort: number;
   private readonly clientId: string;
-  private startPromise: Promise<void> | null = null;
+  private startPromise: Promise<string> | null = null;
   private started = false;
   private clientHeartbeat: ReturnType<typeof setInterval> | null = null;
   private disposed = false;
@@ -60,19 +60,27 @@ export class LocalAgentManager {
   }
 
   async ensureStarted(): Promise<void> {
+    await this.ensureReadyBaseUrl();
+  }
+
+  async ensureReadyBaseUrl(): Promise<string> {
     this.ensureClientLease();
-    // 已成功启动过，不重复走完整流程（健康检查 + registerWorkspaces）
     if (this.started) {
-      return;
+      const healthyBaseUrl = await this.resolveHealthyBaseUrl();
+      if (healthyBaseUrl) {
+        return healthyBaseUrl;
+      }
+      this.started = false;
     }
     if (!this.startPromise) {
-      this.startPromise = this.ensureStartedInternal().then(() => {
+      this.startPromise = this.ensureStartedInternal().then((baseUrl) => {
         this.started = true;
+        return baseUrl;
       }).finally(() => {
         this.startPromise = null;
       });
     }
-    await this.startPromise;
+    return await this.startPromise;
   }
 
   async restart(): Promise<void> {
@@ -85,6 +93,7 @@ export class LocalAgentManager {
       await this.startDetached(port);
       const baseUrl = await this.waitForHealthy(port);
       await this.registerWorkspaces(baseUrl);
+      this.started = true;
     } finally {
       releaseLock();
     }
@@ -114,7 +123,7 @@ export class LocalAgentManager {
   async openWebClient(): Promise<void> {
     this.ensureClientLease();
     const firstWorkspace = getWorkspaceRegistrations()[0];
-    const baseUrl = await this.resolveHealthyBaseUrl() || this.getBaseUrl();
+    const baseUrl = await this.ensureReadyBaseUrl();
    // 显式传递所有绑定参数，确保 Web 前端直接落到正确工作区
     const url = buildAgentWebClientUrl(baseUrl, {
       workspacePath: firstWorkspace?.rootPath ?? null,
@@ -160,23 +169,24 @@ export class LocalAgentManager {
     this.clientHeartbeat = null;
   }
 
-  private async ensureStartedInternal(): Promise<void> {
+  private async ensureStartedInternal(): Promise<string> {
     const existingBaseUrl = await this.resolveHealthyBaseUrl();
     if (existingBaseUrl) {
       await this.registerWorkspaces(existingBaseUrl);
-      return;
+      return existingBaseUrl;
     }
     const releaseLock = await this.acquireLaunchLock();
     try {
       const recheckedBaseUrl = await this.resolveHealthyBaseUrl();
       if (recheckedBaseUrl) {
         await this.registerWorkspaces(recheckedBaseUrl);
-        return;
+        return recheckedBaseUrl;
       }
       const port = await this.resolveLaunchPort();
       await this.startDetached(port);
       const baseUrl = await this.waitForHealthy(port);
       await this.registerWorkspaces(baseUrl);
+      return baseUrl;
     } finally {
       releaseLock();
     }

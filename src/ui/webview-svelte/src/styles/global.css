@@ -320,6 +320,19 @@ body {
   background: var(--background);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* 移动端触摸优化：消除 300ms 点击延迟 + 去除点击高亮闪烁 */
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* 移动端触摸优化：所有可交互元素消除 300ms 双击缩放消歧义延迟 */
+button,
+a,
+input,
+textarea,
+select,
+[role="button"],
+[tabindex] {
+  touch-action: manipulation;
 }
 
 body.vscode-light,
@@ -462,7 +475,7 @@ pre code {
   border-radius: var(--radius-sm);
   color: var(--foreground-muted);
   cursor: pointer;
-  transition: all var(--transition-fast);
+  transition: background var(--transition-fast), color var(--transition-fast);
   flex-shrink: 0;
 }
 
@@ -514,7 +527,7 @@ pre code {
   border-radius: var(--radius-sm);
   border: none;
   cursor: pointer;
-  transition: all var(--transition-fast);
+  transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
   white-space: nowrap;
 }
 
@@ -589,7 +602,7 @@ pre code {
   background: transparent;
   border: none;
   cursor: pointer;
-  transition: all var(--transition-fast);
+  transition: color var(--transition-fast), background var(--transition-fast);
   position: relative;
 }
 
@@ -754,7 +767,7 @@ pre code {
   background: var(--surface-1);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
-  transition: all var(--transition-fast);
+  transition: background var(--transition-fast), border-color var(--transition-fast);
 }
 
 .list-item:hover {
@@ -894,7 +907,7 @@ pre code {
   cursor: pointer;
   font-size: var(--text-sm);
   font-weight: var(--font-medium);
-  transition: all var(--transition-fast);
+  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast), opacity var(--transition-fast);
 }
 
 .modal-btn:hover {
@@ -950,7 +963,7 @@ pre code {
   color: var(--foreground-muted);
   font-size: 18px;
   cursor: pointer;
-  transition: all var(--transition-fast);
+  transition: background var(--transition-fast), color var(--transition-fast);
 }
 
 .modal-close:hover {

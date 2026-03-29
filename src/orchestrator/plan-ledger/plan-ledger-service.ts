@@ -318,16 +318,29 @@ export class PlanLedgerService extends EventEmitter {
   async markExecuting(sessionId: string, planId: string, options?: PlanMutationOptions): Promise<PlanRecord | null> {
     return this.runWithSessionQueue(sessionId, async () => {
       const record = this.loadPlan(sessionId, planId);
-      if (!record || TERMINAL_PLAN_STATUSES.has(record.status)) {
+      if (!record) {
+        return null;
+      }
+      // 恢复场景：plan 处于终态但 recoveryProtected=true，允许回退到 executing
+      const isRecoveryResume = record.recoveryProtected && TERMINAL_PLAN_STATUSES.has(record.status);
+      if (!isRecoveryResume && TERMINAL_PLAN_STATUSES.has(record.status)) {
         return null;
       }
       if (!this.canMutateWithExpectedRevision(record, options, 'markExecuting')) {
         return null;
       }
-      if (!this.tryTransitionPlanStatus(record, 'executing', 'markExecuting', options?.auditReason)) {
+      if (isRecoveryResume) {
+        // 恢复场景下直接强制迁移，绕过正常状态机
+        logger.info('计划账本.恢复回退', {
+          planId,
+          from: record.status,
+          to: 'executing',
+        }, LogCategory.ORCHESTRATOR);
+        record.status = 'executing';
+      } else if (!this.tryTransitionPlanStatus(record, 'executing', 'markExecuting', options?.auditReason)) {
         return null;
       }
-      // 进入执行态时解除恢复保护（resume 场景）
+      // 进入执行态时解除恢复保护
       if (record.recoveryProtected) {
         record.recoveryProtected = false;
       }

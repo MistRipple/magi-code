@@ -80,6 +80,26 @@ export class ExecutionChainStore {
     return record;
   }
 
+  /**
+   * 废弃同 session 下所有旧的 interrupted+recoverable 链。
+   * 由 MDE 在非 resume 路径的新请求入口调用，确保"继续"语义仅对最近一轮有效。
+   */
+  expireRecoverableChains(sessionId: string): number {
+    const sessionMap = this.chains.get(sessionId);
+    if (!sessionMap) return 0;
+    const now = Date.now();
+    let expired = 0;
+    for (const chain of sessionMap.values()) {
+      if (chain.status === 'interrupted' && chain.recoverable) {
+        chain.status = 'cancelled';
+        chain.recoverable = false;
+        chain.updatedAt = now;
+        expired++;
+      }
+    }
+    return expired;
+  }
+
   getChain(chainId: string): ExecutionChainRecord | undefined {
     for (const sessionMap of this.chains.values()) {
       const record = sessionMap.get(chainId);

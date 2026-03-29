@@ -54,6 +54,10 @@ export interface ToolMetadata {
   sourceId?: string; // MCP server ID 或 Skill ID
   category?: string;
   tags?: string[];
+  /** 用户可见的友好名（如 MCP 原始工具名） */
+  displayName?: string;
+  /** 来源标签（如 MCP serverName） */
+  sourceLabel?: string;
 }
 
 /**

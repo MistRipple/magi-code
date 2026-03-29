@@ -365,6 +365,7 @@ export class AgentWorkspaceRuntime {
     const { prompt, requestId, sessionId, turnId } = prepared;
     const messageHub = this.orchestratorEngine.getMessageHub();
     let taskContext: { taskId: string; result: string } | null = null;
+    let shouldDrainQueuedMessagesAfterCompletion = false;
 
     try {
       taskContext = await this.orchestratorEngine.executeWithTaskContext(
@@ -431,6 +432,7 @@ export class AgentWorkspaceRuntime {
       });
       await this.sendStateUpdate();
       await this.sendRuntimeStateUpdate({ sessionId, requestId });
+      shouldDrainQueuedMessagesAfterCompletion = true;
       return {
         success: true,
         taskId: taskContext.taskId,
@@ -496,6 +498,9 @@ export class AgentWorkspaceRuntime {
     } finally {
       messageHub.finalizeRequestContext(requestId);
       messageHub.forceProcessingState(false);
+      if (shouldDrainQueuedMessagesAfterCompletion) {
+        void this.drainQueuedMessagesIfIdle();
+      }
     }
   }
 
@@ -611,6 +616,12 @@ export class AgentWorkspaceRuntime {
     if (!prepared) {
       return { success: false, error: '未找到可恢复的执行链' };
     }
+
+    // 1.5. 从 ResumeSnapshot 重建 Worker Session 映射和数据
+    // 覆盖两种场景：
+    //   a) 同进程中断-恢复：映射可能已通过 captureResumeSnapshot 回填，此处为保险
+    //   b) 崩溃重启后恢复：内存中的映射和 session 数据均已丢失，必须从 snapshot 重建
+    await this.orchestratorEngine.restoreWorkerSessionsForResume(prepared.chainId);
 
     // 2. 构建 resume prompt
     // 从恢复快照中读取 dispatch 状态，告诉 LLM 哪些 worker 已完成、哪些被取消，

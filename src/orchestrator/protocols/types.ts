@@ -7,6 +7,7 @@
  */
 
 import { WorkerSlot, SubTask, StrategyConfig } from '../../types';
+import type { EffectiveToolPolicy } from '../../tools/tool-policy';
 
 // 重新导出统一类型
 export { SubTask, WorkerSlot };
@@ -209,6 +210,8 @@ export interface RequirementAnalysis {
   includeThinking?: boolean;
   /** 本轮是否允许工具调用 */
   includeToolCalls?: boolean;
+  /** 当前请求唯一生效的工具策略 */
+  toolPolicy?: EffectiveToolPolicy;
   /** 本轮历史注入策略 */
   historyMode?: 'session' | 'isolated';
   /** 是否需要修改文件 */

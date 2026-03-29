@@ -7,8 +7,8 @@
  *
  * 工具:
  * - file_view: 查看文件内容或目录结构
- * - file_create: 创建或写入完整文件内容
- * - file_edit: 基于意图的文件修改（LLM 委托） / 撤销
+ * - file_create: 创建新文件或显式覆写完整文件内容
+ * - file_edit: 基于意图的文件修改（LLM 委托）
  * - file_insert: 在指定行插入文本
  */
 
@@ -20,8 +20,10 @@ import { ToolCall, ToolResult, FileChangeMetadata } from '../llm/types';
 import { logger, LogCategory } from '../logging';
 import { WorkspaceRoots } from '../workspace/workspace-roots';
 import { FileMutex } from '../utils/file-mutex';
-import { toModelOriginUserMessage } from '../errors/model-origin';
+import { buildUnifiedFileDiff, DEFAULT_MAX_UNIFIED_DIFF_LINES } from '../utils/unified-file-diff';
+import { classifyModelOriginIssue } from '../errors/model-origin';
 import { trackModelOriginEvent } from '../errors/model-origin-observability';
+import { IntentFileEditError } from '../llm/utils/intent-file-editor';
 
 
 
@@ -31,8 +33,15 @@ const POST_WRITE_SETTLE_MAX_ATTEMPTS = 6;
 /** 写入后每轮重读间隔（ms） */
 const POST_WRITE_SETTLE_DELAY_MS = 120;
 
-/** fileChange.diff 最大行数（防止超大差异导致消息/渲染抖动） */
-const MAX_DIFF_LINES = 1200;
+class FileExecutorOperationError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'FileExecutorOperationError';
+  }
+}
 
 
 
@@ -48,7 +57,6 @@ interface InsertEntry {
  */
 export class FileExecutor implements ToolExecutor {
   private workspaceRoots: WorkspaceRoots;
-  private undoStack: Map<string, string> = new Map();
   private fileMutex: FileMutex;
   private llmEditHandler?: (filePath: string, fileContent: string, summary: string, detailedDesc: string) => Promise<string>;
 
@@ -91,11 +99,9 @@ export class FileExecutor implements ToolExecutor {
 
   /**
    * 原地更新工作区根目录（避免重建实例导致 handler/回调丢失）
-   * 仅清除与旧路径绑定的撤销历史
    */
   updateWorkspaceRoots(workspaceRoots: WorkspaceRoots): void {
     this.workspaceRoots = workspaceRoots;
-    this.undoStack.clear();
   }
 
   /**
@@ -223,17 +229,13 @@ IMPORTANT:
   private getFileCreateDefinition(): ExtendedToolDefinition {
     return {
       name: 'file_create',
-      description: `Save a new file. Use this tool to write new files with the attached content.
-Generate \`instructions_reminder\` first to remind yourself to limit the file content to at most 150 lines.
-It CANNOT modify existing files. Do NOT use this tool to edit an existing file by overwriting it entirely.
-Use the file_edit tool to edit existing files instead.`,
+      description: `Write complete file contents in one call.
+
+Use this tool when you need to create a new file or intentionally replace the entire contents of a file.
+Keep each call within about 150 lines of content. For localized edits to an existing file, prefer file_edit or file_insert instead.`,
       input_schema: {
         type: 'object',
         properties: {
-          instructions_reminder: {
-            type: 'string',
-            description: "Should be exactly this string: 'LIMIT THE FILE CONTENT TO AT MOST 150 LINES. IF MORE CONTENT NEEDS TO BE ADDED USE THE file_edit TOOL TO EDIT THE FILE AFTER IT HAS BEEN CREATED.'"
-          },
           path: {
             type: 'string',
             description: 'The path of the file to save'
@@ -247,7 +249,7 @@ Use the file_edit tool to edit existing files instead.`,
             description: 'Whether to add a newline at the end of the file (default: true)'
           }
         },
-        required: ['instructions_reminder', 'path', 'file_content']
+        required: ['path', 'file_content']
       },
       metadata: {
         source: 'builtin',
@@ -269,7 +271,6 @@ Notes for text replacement:
 * Use file_view to read the file before editing. If the same file is already fresh in current context, do not repeat file_view.
 * Provide a brief edit_summary and a detailed_edit_description.
 * detailed_edit_description should contain the exact intention, the logic to change, and if necessary, search/replace snippets to help the agent locate the exact place.
-* Set undo to true to revert the last edit.
 
 IMPORTANT:
 * For creating new files or full rewrites, use file_create instead
@@ -288,13 +289,9 @@ IMPORTANT:
           detailed_edit_description: {
             type: 'string',
             description: 'A detailed and precise description of the edit. Can include natural language, context, and code snippets.'
-          },
-          undo: {
-            type: 'boolean',
-            description: 'Set to true to undo the last edit to this file'
           }
         },
-        required: ['path']
+        required: ['path', 'edit_summary', 'detailed_edit_description']
       },
       metadata: {
         source: 'builtin',
@@ -318,6 +315,7 @@ Notes for using this tool:
 * The \`insert_line_1\` parameter is 1-based line number
 * To insert at the very beginning of the file, use \`insert_line_1: 0\`
 * To make multiple insertions in one tool call add multiple sets of insertion parameters. For example, \`insert_line_1\` and \`new_str_1\` properties for the first insertion, \`insert_line_2\` and \`new_str_2\` for the second insertion, etc.
+* Keep each inserted chunk reasonably small (about 150 lines or fewer)
 
 IMPORTANT:
 * Use file_view before inserting into an existing file. If this is a new file path, file_insert can create it directly.
@@ -325,10 +323,6 @@ IMPORTANT:
       input_schema: {
         type: 'object',
         properties: {
-          instruction_reminder: {
-            type: 'string',
-            description: "Reminder to limit edits to at most 150 lines. Should be exactly this string: 'ALWAYS BREAK DOWN EDITS INTO SMALLER CHUNKS OF AT MOST 150 LINES EACH.'"
-          },
           path: {
             type: 'string',
             description: 'File path relative to workspace root'
@@ -342,7 +336,7 @@ IMPORTANT:
             description: 'The string to insert.'
           }
         },
-        required: ['path']
+        required: ['path', 'insert_line_1', 'new_str_1']
       },
       metadata: {
         source: 'builtin',
@@ -375,11 +369,12 @@ IMPORTANT:
     const filePath = (toolCall.arguments as any)?.path as string;
 
     if (!filePath) {
-      return {
-        toolCallId: toolCall.id,
-        content: 'Error: path is required',
-        isError: true
-      };
+      return this.buildStandardizedErrorResult(
+        toolCall.id,
+        toolCall.name,
+        'path is required',
+        'file_path_required',
+      );
     }
 
     // file_view + 多工作区 + 通用路径（如 "."）：列出所有工作区目录结构
@@ -395,11 +390,12 @@ IMPORTANT:
       this.shouldRequireExistingPath(toolCall.name, toolCall.arguments)
     );
     if (!pathResolution.absolutePath) {
-      return {
-        toolCallId: toolCall.id,
-        content: pathResolution.error || `Error: path is outside workspace: ${filePath}`,
-        isError: true
-      };
+      return this.buildStandardizedErrorResult(
+        toolCall.id,
+        toolCall.name,
+        pathResolution.error || `path is outside workspace: ${filePath}`,
+        'file_path_outside_workspace',
+      );
     }
     const resolved = pathResolution.absolutePath;
 
@@ -424,20 +420,23 @@ IMPORTANT:
       }
     } catch (error: any) {
       logger.error('FileExecutor error', { tool: toolCall.name, error: error.message }, LogCategory.TOOLS);
-      return {
-        toolCallId: toolCall.id,
-        content: `Error: ${error.message}`,
-        isError: true
-      };
+      return this.buildStandardizedErrorResult(
+        toolCall.id,
+        toolCall.name,
+        error?.message || String(error),
+        error instanceof FileExecutorOperationError
+          ? error.code
+          : `${toolCall.name}_execution_failed`,
+      );
     }
   }
 
-  private shouldRequireExistingPath(toolName: string, args: Record<string, any>): boolean {
+  private shouldRequireExistingPath(toolName: string, _args: Record<string, any>): boolean {
     if (toolName === 'file_view') {
       return true;
     }
     if (toolName === 'file_edit') {
-      return args?.undo !== true;
+      return true;
     }
     return false;
   }
@@ -803,7 +802,24 @@ IMPORTANT:
     filePath: string,
     args: Record<string, any>
   ): Promise<ToolResult> {
-    const fileContent: string = args.file_content ?? '';
+    if (typeof args.file_content !== 'string') {
+      return this.buildStandardizedErrorResult(
+        toolCallId,
+        'file_create',
+        'file_content is required and must be a string.',
+        'file_create_invalid_args',
+      );
+    }
+    if (args.add_last_line_newline !== undefined && typeof args.add_last_line_newline !== 'boolean') {
+      return this.buildStandardizedErrorResult(
+        toolCallId,
+        'file_create',
+        'add_last_line_newline must be a boolean when provided.',
+        'file_create_invalid_args',
+      );
+    }
+
+    const fileContent: string = args.file_content;
     const addLastLineNewline: boolean = args.add_last_line_newline ?? true;
     const finalContent = fileContent + (addLastLineNewline ? '\n' : '');
 
@@ -821,14 +837,15 @@ IMPORTANT:
         const conflict = this.onParallelWriteCheck(filePath);
         if (conflict) {
           const displayPath = this.getEffectiveRoots().toDisplayPath(filePath);
-          return {
+          return this.buildStandardizedErrorResult(
             toolCallId,
-            content: `Error: ${displayPath} has been modified by parallel task(s) [${conflict.conflictTasks.join(', ')}]. ` +
+            'file_create',
+            `${displayPath} has been modified by parallel task(s) [${conflict.conflictTasks.join(', ')}]. ` +
               `Using file_create would overwrite their changes. ` +
               `Please use file_edit with edit_summary and detailed_edit_description instead — ` +
               `it reads the latest file content inside a lock and applies your changes incrementally, preserving all parallel modifications.`,
-            isError: true,
-          };
+            'file_create_parallel_conflict',
+          );
         }
       }
 
@@ -839,12 +856,12 @@ IMPORTANT:
       await this.createFileViaWorkspaceEdit(filePath, finalContent);
       const settledContent = await this.readSettledFileContent(filePath, finalContent);
 
-      logger.info('File created via file_create', { path: filePath }, LogCategory.TOOLS);
+      logger.info('File saved via file_create', { path: filePath }, LogCategory.TOOLS);
 
       const changeType = originalContent ? 'modify' as const : 'create' as const;
       return {
         toolCallId,
-        content: `OK: file created at ${this.getEffectiveRoots().toDisplayPath(filePath)}`,
+        content: `OK: file saved at ${this.getEffectiveRoots().toDisplayPath(filePath)}`,
         isError: false,
         fileChange: this.buildFileChangeMetadata(originalContent, settledContent, filePath, changeType),
       };
@@ -859,20 +876,25 @@ IMPORTANT:
     filePath: string,
     args: Record<string, any>
   ): Promise<ToolResult> {
-    // 模式 1：撤销（同样需要加锁，防止与同文件的并发写操作冲突）
-    if (args.undo === true) {
-      return await this.fileMutex.runExclusive(filePath, () => this.executeUndo(toolCallId, filePath));
-    }
-
     const editSummary = args.edit_summary as string | undefined;
     const detailedEditDesc = args.detailed_edit_description as string | undefined;
 
-    if (!editSummary || !detailedEditDesc) {
-      return {
+    if (typeof editSummary !== 'string' || !editSummary.trim()) {
+      return this.buildStandardizedErrorResult(
         toolCallId,
-        content: 'Error: edit_summary and detailed_edit_description are required for file editing.',
-        isError: true
-      };
+        'file_edit',
+        'edit_summary is required and must be a non-empty string.',
+        'file_edit_invalid_args',
+      );
+    }
+
+    if (typeof detailedEditDesc !== 'string' || !detailedEditDesc.trim()) {
+      return this.buildStandardizedErrorResult(
+        toolCallId,
+        'file_edit',
+        'detailed_edit_description is required and must be a non-empty string.',
+        'file_edit_invalid_args',
+      );
     }
 
     return await this.fileMutex.runExclusive(filePath, () =>
@@ -895,11 +917,12 @@ IMPORTANT:
       try {
         baseContent = await this.readFileContent(filePath);
       } catch (error: any) {
-        return {
+        return this.buildStandardizedErrorResult(
           toolCallId,
-          content: `Error: Cannot read file ${this.getEffectiveRoots().toDisplayPath(filePath)} for editing: ${error.message}`,
-          isError: true
-        };
+          'file_edit',
+          `Cannot read file ${this.getEffectiveRoots().toDisplayPath(filePath)} for editing: ${error.message}`,
+          'file_edit_read_failed',
+        );
       }
     }
 
@@ -910,26 +933,27 @@ IMPORTANT:
       const generated = await this.llmEditHandler!(filePath, baseContent, editSummary, detailedEditDesc);
       if (typeof generated !== 'string') {
         const rawReason = 'Error during LLM edit generation: model returned non-string content';
-        const userReason = toModelOriginUserMessage(rawReason);
         trackModelOriginEvent('surfaced', 'tool:file_edit', rawReason, { filePath: this.getEffectiveRoots().toDisplayPath(filePath) });
-        return {
+        return this.buildStandardizedErrorResult(
           toolCallId,
-          content: userReason || '模型输出异常：未返回可写入文本。',
-          isError: true
-        };
+          'file_edit',
+          'file_edit 专用模型未返回可写入的完整文件内容。',
+          'file_edit_model_output_invalid',
+        );
       }
       newContent = generated;
     } catch (error: any) {
       const rawReason = `Error during LLM edit generation: ${error?.message || String(error)}`;
-      const userReason = toModelOriginUserMessage(rawReason);
       trackModelOriginEvent('surfaced', 'tool:file_edit', rawReason, {
         filePath: this.getEffectiveRoots().toDisplayPath(filePath),
       });
-      return {
+      const failure = this.resolveFileEditGenerationFailure(error);
+      return this.buildStandardizedErrorResult(
         toolCallId,
-        content: userReason || `Error during LLM edit generation: ${error.message}`,
-        isError: true
-      };
+        'file_edit',
+        failure.message,
+        failure.errorCode,
+      );
     }
 
     if (newContent === baseContent) {
@@ -940,15 +964,23 @@ IMPORTANT:
       };
     }
 
-    // 保存旧版本用于撤销
-    this.undoStack.set(filePath, baseContent);
-
     // 写前快照回调
     await this.onBeforeWrite?.(filePath);
 
-    // 写入文件
-    await this.createFileViaWorkspaceEdit(filePath, newContent);
-    const settledContent = await this.readSettledFileContent(filePath, newContent);
+    let settledContent: string;
+    try {
+      await this.createFileViaWorkspaceEdit(filePath, newContent);
+      settledContent = await this.readSettledFileContent(filePath, newContent);
+    } catch (error: any) {
+      return this.buildStandardizedErrorResult(
+        toolCallId,
+        'file_edit',
+        error?.message || String(error),
+        error instanceof FileExecutorOperationError
+          ? error.code
+          : 'file_edit_write_failed',
+      );
+    }
 
     return {
       toolCallId,
@@ -1057,7 +1089,12 @@ IMPORTANT:
     const entries = this.extractInsertEntries(args);
     const validationError = this.validateInsertEntries(entries);
     if (validationError) {
-      return { toolCallId, content: `Error: ${validationError}`, isError: true };
+      return this.buildStandardizedErrorResult(
+        toolCallId,
+        'file_insert',
+        validationError,
+        'file_insert_invalid_args',
+      );
     }
 
     return await this.fileMutex.runExclusive(filePath, async () => {
@@ -1140,20 +1177,18 @@ IMPORTANT:
       // 6. 检查是否有任何错误条目
       const errors = results.filter(r => r.isError);
       if (errors.length === entries.length) {
-        return {
+        return this.buildStandardizedErrorResult(
           toolCallId,
-          content: errors.map(e => `Error (index ${e.index}): ${e.message}`).join('\n'),
-          isError: true
-        };
+          'file_insert',
+          errors.map(e => `Error (index ${e.index}): ${e.message}`).join('\n'),
+          'file_insert_invalid_args',
+        );
       }
 
-      // 7. 保存撤销信息
-      this.undoStack.set(filePath, content);
-
-      // 8. 快照回调
+      // 7. 快照回调
       await this.onBeforeWrite?.(filePath);
 
-      // 9. 通过 WorkspaceEdit 写入
+      // 8. 通过 WorkspaceEdit 写入
       if (isNewFile) {
         await this.createFileViaWorkspaceEdit(filePath, currentContent);
       } else {
@@ -1168,7 +1203,7 @@ IMPORTANT:
         changedAfterWrite: finalContent !== currentContent,
       }, LogCategory.TOOLS);
 
-      // 10. 构建响应（包含代码片段）
+      // 9. 构建响应（包含代码片段）
       const finalLines = finalContent.split('\n');
       const successResults = results.filter(r => !r.isError);
       let responseMsg = successResults.map(r => r.message).join('\n');
@@ -1206,36 +1241,6 @@ IMPORTANT:
   }
 
   /**
-   * 撤销编辑
-   * 通过 WorkspaceEdit 恢复到上一个状态
-   */
-  private async executeUndo(toolCallId: string, filePath: string): Promise<ToolResult> {
-    if (!this.undoStack.has(filePath)) {
-      return {
-        toolCallId,
-        content: 'Error: no undo history for this file',
-        isError: true
-      };
-    }
-
-    const previous = this.undoStack.get(filePath)!;
-
-    // 快照回调（undo 也是文件变更，需要在写入前记录原始状态）
-    await this.onBeforeWrite?.(filePath);
-
-    await this.writeFileViaWorkspaceEdit(filePath, previous);
-    this.undoStack.delete(filePath);
-
-    logger.info('File undo applied', { path: filePath }, LogCategory.TOOLS);
-
-    return {
-      toolCallId,
-      content: 'OK: undo applied',
-      isError: false
-    };
-  }
-
-  /**
    * 解析工作区相对路径
    */
   private resolveWorkspacePath(inputPath: string, mustExist: boolean): { absolutePath: string | null; error?: string } {
@@ -1259,7 +1264,12 @@ IMPORTANT:
     changeType: 'create' | 'modify' | 'delete'
   ): FileChangeMetadata {
     const displayPath = this.getEffectiveRoots().toDisplayPath(filePath);
-    const { additions, deletions, diff } = this.generateUnifiedDiff(originalContent, newContent, displayPath);
+    const { additions, deletions, diff } = buildUnifiedFileDiff(
+      originalContent,
+      newContent,
+      displayPath,
+      DEFAULT_MAX_UNIFIED_DIFF_LINES,
+    );
 
     return {
       filePath: displayPath,
@@ -1268,88 +1278,6 @@ IMPORTANT:
       deletions,
       diff,
     };
-  }
-
-  /**
-   * 生成统一 diff，并统计增删行数
-   * 注意：仅统计 hunk 行，避免将 diff 头部（---/+++）计入变更。
-   */
-  private generateUnifiedDiff(
-    originalContent: string,
-    newContent: string,
-    displayPath: string
-  ): { additions: number; deletions: number; diff: string } {
-    if (originalContent === newContent) {
-      return { additions: 0, deletions: 0, diff: '' };
-    }
-
-    const diffLib = require('diff') as {
-      structuredPatch: (
-        oldFileName: string,
-        newFileName: string,
-        oldStr: string,
-        newStr: string,
-        oldHeader?: string,
-        newHeader?: string,
-        options?: { context?: number }
-      ) => {
-        hunks?: Array<{
-          oldStart: number;
-          oldLines: number;
-          newStart: number;
-          newLines: number;
-          lines: string[];
-        }>;
-      };
-    };
-
-    const patch = diffLib.structuredPatch(
-      displayPath,
-      displayPath,
-      originalContent,
-      newContent,
-      '',
-      '',
-      { context: 3 }
-    );
-    const hunks = Array.isArray(patch.hunks) ? patch.hunks : [];
-
-    let additions = 0;
-    let deletions = 0;
-    const diffLines: string[] = [`--- ${displayPath}`, `+++ ${displayPath}`];
-
-    for (const hunk of hunks) {
-      diffLines.push(`@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@`);
-      for (const line of hunk.lines) {
-        diffLines.push(line);
-        if (line.startsWith('+')) additions += 1;
-        if (line.startsWith('-')) deletions += 1;
-      }
-    }
-
-    if (hunks.length === 0) {
-      return { additions: 0, deletions: 0, diff: '' };
-    }
-
-    const maxDiffLines = MAX_DIFF_LINES;
-    if (diffLines.length <= maxDiffLines) {
-      return { additions, deletions, diff: diffLines.join('\n') };
-    }
-
-    const truncated = [
-      ...diffLines.slice(0, maxDiffLines),
-      `... (diff truncated: ${diffLines.length - maxDiffLines} more lines)`,
-    ];
-
-    logger.warn('fileChange diff truncated due to size limit', {
-      filePath: displayPath,
-      totalDiffLines: diffLines.length,
-      maxDiffLines,
-      additions,
-      deletions,
-    }, LogCategory.TOOLS);
-
-    return { additions, deletions, diff: truncated.join('\n') };
   }
 
   /**
@@ -1397,13 +1325,13 @@ IMPORTANT:
 
     const success = await vscode.workspace.applyEdit(edit);
     if (!success) {
-      throw new Error('VSCode WorkspaceEdit 应用失败');
+      throw new FileExecutorOperationError('file_write_apply_failed', 'VSCode WorkspaceEdit 应用失败');
     }
 
     // 持久化到磁盘（必须成功）
     const saved = await doc.save();
     if (!saved) {
-      throw new Error('VSCode 文档保存失败（writeFileViaWorkspaceEdit）');
+      throw new FileExecutorOperationError('file_write_save_failed', 'VSCode 文档保存失败（writeFileViaWorkspaceEdit）');
     }
     this.onAfterWrite?.(filePath);
   }
@@ -1442,16 +1370,94 @@ IMPORTANT:
 
     const success = await vscode.workspace.applyEdit(edit);
     if (!success) {
-      throw new Error('VSCode WorkspaceEdit 创建文件失败');
+      throw new FileExecutorOperationError('file_write_apply_failed', 'VSCode WorkspaceEdit 创建文件失败');
     }
 
     // 持久化到磁盘（必须成功）
     const doc = await vscode.workspace.openTextDocument(uri);
     const saved = await doc.save();
     if (!saved) {
-      throw new Error('VSCode 文档保存失败（createFileViaWorkspaceEdit）');
+      throw new FileExecutorOperationError('file_write_save_failed', 'VSCode 文档保存失败（createFileViaWorkspaceEdit）');
     }
     this.onAfterWrite?.(filePath);
+  }
+
+  private buildStandardizedErrorResult(
+    toolCallId: string,
+    toolName: string,
+    message: string,
+    errorCode: string,
+  ): ToolResult {
+    const normalizedMessage = message.startsWith('Error') ? message : `Error: ${message}`;
+    return {
+      toolCallId,
+      content: normalizedMessage,
+      isError: true,
+      standardized: {
+        schemaVersion: 'tool-result.v1',
+        source: 'builtin',
+        toolName,
+        toolCallId,
+        status: 'error',
+        message: normalizedMessage,
+        errorCode,
+      },
+    };
+  }
+
+  private resolveFileEditGenerationFailure(error: unknown): { message: string; errorCode: string } {
+    if (error instanceof IntentFileEditError) {
+      switch (error.code) {
+        case 'intent_file_edit_empty_response':
+          return {
+            message: 'file_edit 专用模型返回空结果，未生成任何可应用内容。',
+            errorCode: 'file_edit_model_empty_response',
+          };
+        case 'intent_file_edit_truncated_output':
+          return {
+            message: 'file_edit 专用模型输出被截断，未返回完整文件内容。请缩小编辑范围后重试。',
+            errorCode: 'file_edit_model_output_truncated',
+          };
+        case 'intent_file_edit_meta_output':
+          return {
+            message: 'file_edit 专用模型未按协议返回完整文件内容，而是返回了说明或分析文本。',
+            errorCode: 'file_edit_model_output_invalid',
+          };
+      }
+    }
+
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    const modelIssue = classifyModelOriginIssue(rawMessage);
+    if (modelIssue.isModelCause) {
+      if (modelIssue.kind === 'timeout') {
+        return {
+          message: modelIssue.message,
+          errorCode: 'file_edit_model_timeout',
+        };
+      }
+      if (
+        modelIssue.kind === 'auth'
+        || modelIssue.kind === 'quota'
+        || modelIssue.kind === 'rate_limit'
+        || modelIssue.kind === 'context_limit'
+        || modelIssue.kind === 'model_unavailable'
+        || modelIssue.kind === 'network'
+      ) {
+        return {
+          message: modelIssue.message,
+          errorCode: 'file_edit_model_service_error',
+        };
+      }
+      return {
+        message: 'file_edit 专用模型未按协议返回完整文件内容，请补充更明确的编辑锚点后重试。',
+        errorCode: 'file_edit_model_output_invalid',
+      };
+    }
+
+    return {
+      message: `Error during LLM edit generation: ${rawMessage}`,
+      errorCode: 'file_edit_generation_failed',
+    };
   }
 
   /**

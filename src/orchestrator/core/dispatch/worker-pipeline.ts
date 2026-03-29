@@ -21,6 +21,7 @@ import type { IAdapterFactory } from '../../../adapters/adapter-factory-interfac
 import type { AutonomousWorker, AutonomousExecutionResult } from '../../worker';
 import type { Assignment } from '../../mission';
 import type { PlanMode } from '../../plan-ledger';
+import type { TaskMode } from '../../profile/task-taxonomy';
 import type { SnapshotManager } from '../../../snapshot-manager';
 import type { ReportCallback } from '../../protocols/worker-report';
 import type { CancellationToken } from './dispatch-batch';
@@ -30,6 +31,7 @@ import type { AssembledContext } from '../../../context/context-assembler';
 import { t } from '../../../i18n';
 import type { GitHost } from '../../../host';
 import type { WorktreeAllocation, WorktreeMergeResult } from '../../../workspace/worktree-manager';
+import { buildModeToolPolicy } from '../../../tools/tool-policy';
 
 type WorkspaceWriteIsolationMode = 'git_worktree' | 'workspace_serial';
 
@@ -56,6 +58,7 @@ export interface PipelineConfig {
   resumeSessionId?: string;
   resumePrompt?: string;
   planningMode?: PlanMode;
+  taskMode?: TaskMode;
 
   // 治理开关（由 DispatchManager 根据 governance 参数计算）
   enableSnapshot: boolean;
@@ -131,6 +134,7 @@ export class WorkerPipeline {
       ...(laneId ? { laneId } : {}),
       ...(workerCardId ? { workerCardId } : {}),
     };
+    const workerToolPolicy = config.taskMode ? buildModeToolPolicy(config.taskMode) : undefined;
 
     // ========== 0. [可选] 写隔离 ==========
     // Git 仓库：优先使用 worktree 物理隔离；分配失败或非 Git 工作区：自动降级为主工作区串行写模式。
@@ -262,6 +266,7 @@ export class WorkerPipeline {
         adapterScope: {
           ...(config.planningMode ? { planningMode: config.planningMode } : {}),
           messageMetadata: adapterMessageMetadata,
+          ...(workerToolPolicy ? { toolPolicy: workerToolPolicy } : {}),
         },
         projectContext,
         onReport,
@@ -300,6 +305,7 @@ export class WorkerPipeline {
             adapterScope: {
               ...(config.planningMode ? { planningMode: config.planningMode } : {}),
               messageMetadata: adapterMessageMetadata,
+              ...(workerToolPolicy ? { toolPolicy: workerToolPolicy } : {}),
             },
             projectContext,
             onReport,

@@ -18,7 +18,7 @@ import {
 } from '../types';
 import { BaseNormalizer } from '../../normalizer/base-normalizer';
 import { ToolManager } from '../../tools/tool-manager';
-import { BUILTIN_TOOL_NAMES } from '../../tools/types';
+import { mergeToolPolicies, type EffectiveToolPolicy } from '../../tools/tool-policy';
 import { MessageHub } from '../../orchestrator/core/message/message-hub';
 import type { PlanMode } from '../../orchestrator/plan-ledger';
 import { BaseLLMAdapter, AdapterState } from './base-adapter';
@@ -370,7 +370,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   private tempSystemPrompt?: string;
   private tempIncludeThinking?: boolean;
   private tempEnableToolCalls?: boolean;
-  private tempAllowedToolNames?: string[];
   private tempHistoryMode?: 'session' | 'isolated';
   private tempVisibility?: 'user' | 'system' | 'debug';
   private tempPlanningMode?: PlanMode;
@@ -452,13 +451,13 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     const effectiveSystemPrompt = this.tempSystemPrompt ?? this.systemPrompt;
     const includeThinking = this.tempIncludeThinking ?? true;
     const enableToolCalls = this.tempEnableToolCalls ?? false;
+    let effectiveToolPolicy = this.currentToolExecutionContext?.toolPolicy;
     const historyMode = this.tempHistoryMode ?? 'session';
     const silent = this.tempVisibility === 'system';
     const planningMode = this.resolvePlanningModeForCurrentRequest();
     this.tempSystemPrompt = undefined;
     this.tempIncludeThinking = undefined;
     this.tempEnableToolCalls = undefined;
-    this.tempAllowedToolNames = undefined;
     this.tempHistoryMode = undefined;
     this.tempVisibility = undefined;
     this.tempPlanningMode = undefined;
@@ -490,6 +489,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
           silent ? 'system' : undefined,
           includeThinking,
           planningMode,
+          effectiveToolPolicy,
         );
         this.setState(AdapterState.CONNECTED);
         return content;
@@ -770,12 +770,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
    */
   setTempEnableToolCalls(enabled: boolean): void {
     this.tempEnableToolCalls = enabled;
-  }
-  /**
-   * 设置临时允许工具白名单（仅对下一次请求生效）
-   */
-  setTempAllowedToolNames(toolNames: string[]): void {
-    this.tempAllowedToolNames = [...toolNames];
   }
   /**
    * 设置临时历史模式（仅对下一次请求生效）
@@ -1141,24 +1135,13 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     visibility: 'user' | 'system' | 'debug' | undefined,
     includeThinking: boolean,
     planningMode: PlanMode,
+    initialToolPolicy?: EffectiveToolPolicy,
   ): Promise<string> {
     this.syncTraceFromMessageHub();
     const isTransientSystemCall = visibility === 'system';
     const effectiveDeepTask = planningMode === 'deep';
     const decisionEngine = this.getDecisionEngineForPlanningMode(planningMode);
-
-    const ORCHESTRATOR_HIDDEN_TOOLS = ['todo_split'];
-    const allTools = await this.toolManager.getTools();
-    const toolDefinitions = allTools
-      .filter(tool => {
-        if (ORCHESTRATOR_HIDDEN_TOOLS.includes(tool.name)) return false;
-        return true;
-      })
-      .map(tool => ({
-        name: tool.name,
-        description: tool.description,
-        input_schema: tool.input_schema,
-      }));
+    let effectiveToolPolicy = initialToolPolicy;
 
     const budget: OrchestratorExecutionBudget = effectiveDeepTask
       ? OrchestratorLLMAdapter.DEEP_BUDGET
@@ -1283,6 +1266,17 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
         const suppressVisibleText = pendingOutcomeBlockOnly
           && pendingOutcomeBlockText.trim().length > 0
           && usesPersistentVisibleStream;
+        const visibleTools = forceNoToolsNextRound
+          ? []
+          : await this.toolManager.getVisibleTools({
+            role: 'orchestrator',
+            toolPolicy: effectiveToolPolicy,
+          });
+        const toolDefinitions = visibleTools.map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          input_schema: tool.input_schema,
+        }));
         const params: LLMMessageParams = {
           messages: history,
           systemPrompt,
@@ -1730,6 +1724,10 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
               standardized: result.standardized,
             })),
           });
+          effectiveToolPolicy = mergeToolPolicies([
+            effectiveToolPolicy,
+            ...toolResults.map((result) => this.extractToolPolicyFromResult(result)),
+          ]);
           if (forceNoToolsNextRound && toolCalls.length > 0) {
             forceNoToolsNextRound = false;
           }
@@ -2755,9 +2753,19 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   /**
    * 执行工具调用
    */
-  private async executeToolCalls(
-    toolCalls: ToolCall[],
-  ) {
+  private extractToolPolicyFromResult(result: ToolResult): EffectiveToolPolicy | undefined {
+    const data = result.standardized?.data;
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return undefined;
+    }
+    const maybePolicy = (data as Record<string, unknown>).toolPolicy;
+    if (!maybePolicy || typeof maybePolicy !== 'object' || Array.isArray(maybePolicy)) {
+      return undefined;
+    }
+    return maybePolicy as EffectiveToolPolicy;
+  }
+
+  private async executeToolCalls(toolCalls: ToolCall[]) {
     const results = [];
     const maxToolResultChars = 20000;
     const toolSourceMap = await this.buildToolSourceMap();
@@ -2791,10 +2799,14 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       }
 
       try {
+        const executionContext = this.resolveToolExecutionContext({
+          workerId: 'orchestrator',
+          role: 'orchestrator',
+        });
         const rawResult = await this.toolManager.execute(
           toolCall,
           this.abortController?.signal,
-          { workerId: 'orchestrator', role: 'orchestrator' },
+          executionContext,
         );
         this.truncateToolResultContent(toolCall, rawResult, maxToolResultChars);
         const result = this.ensureStandardizedToolResult(toolCall, rawResult, toolSourceMap);

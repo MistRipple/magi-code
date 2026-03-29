@@ -3,17 +3,24 @@
  * 将 MCPManager 封装为 ToolExecutor 接口
  */
 
+import { createHash } from 'crypto';
 import { logger, LogCategory } from '../logging';
 import { ToolExecutor, ExtendedToolDefinition, MCPServerConfig } from './types';
 import { ToolCall, ToolResult } from '../llm/types';
 import { MCPManager, MCPToolInfo, MCPPromptInfo } from './mcp-manager';
 import { LLMConfigLoader } from '../llm/config';
 
+interface CanonicalMCPToolInfo extends MCPToolInfo {
+  canonicalName: string;
+  originalName: string;
+}
+
 /**
  * MCP 工具执行器
  * 封装 MCPManager 并实现 ToolExecutor 接口
  */
 export class MCPToolExecutor implements ToolExecutor {
+  private static readonly MAX_TOOL_NAME_LENGTH = 64;
   private mcpManager: MCPManager;
   private initialized: boolean = false;
   private initPromise: Promise<void> | null = null;
@@ -87,9 +94,8 @@ export class MCPToolExecutor implements ToolExecutor {
       };
     }
 
-    // 查找工具所属的服务器
-    const allTools = this.mcpManager.getAllTools();
-    const tool = allTools.find(t => t.name === toolCall.name);
+    // 查找 canonical 名称对应的真实 MCP 工具
+    const tool = this.getCanonicalTools().find((item) => item.canonicalName === toolCall.name);
 
     if (!tool) {
       return {
@@ -102,7 +108,7 @@ export class MCPToolExecutor implements ToolExecutor {
     try {
       const result = await this.mcpManager.callTool(
         tool.serverId,
-        toolCall.name,
+        tool.originalName,
         toolCall.arguments,
         signal
       );
@@ -135,7 +141,8 @@ export class MCPToolExecutor implements ToolExecutor {
       };
     } catch (error: any) {
       logger.error('MCP 工具执行失败', {
-        toolName: toolCall.name,
+        toolName: tool.originalName,
+        canonicalToolName: toolCall.name,
         serverId: tool.serverId,
         error: error.message,
       }, LogCategory.TOOLS);
@@ -157,10 +164,8 @@ export class MCPToolExecutor implements ToolExecutor {
       await this.initialize();
     }
 
-    const allTools = this.mcpManager.getAllTools();
-
-    return allTools.map((tool: MCPToolInfo) => ({
-      name: tool.name,
+    return this.getCanonicalTools().map((tool) => ({
+      name: tool.canonicalName,
       description: tool.description,
       input_schema: tool.inputSchema,
       metadata: {
@@ -168,6 +173,8 @@ export class MCPToolExecutor implements ToolExecutor {
         sourceId: tool.serverId,
         category: 'mcp',
         tags: ['mcp', tool.serverName],
+        displayName: tool.originalName,
+        sourceLabel: tool.serverName,
       },
     }));
   }
@@ -176,16 +183,16 @@ export class MCPToolExecutor implements ToolExecutor {
    * 🔧 同步获取已缓存的 MCP 工具信息
    * 用于构建系统提示时避免异步调用
    */
-  getCachedTools(): Array<{ name: string; description: string; serverId: string; serverName: string }> {
+  getCachedTools(): Array<{ name: string; description: string; serverId: string; serverName: string; displayName: string }> {
     if (!this.initialized) {
       return [];
     }
-    const allTools = this.mcpManager.getAllTools();
-    return allTools.map((tool: MCPToolInfo) => ({
-      name: tool.name,
+    return this.getCanonicalTools().map((tool) => ({
+      name: tool.canonicalName,
       description: tool.description,
       serverId: tool.serverId,
       serverName: tool.serverName,
+      displayName: tool.originalName,
     }));
   }
 
@@ -207,8 +214,7 @@ export class MCPToolExecutor implements ToolExecutor {
       await this.initialize();
     }
 
-    const allTools = this.mcpManager.getAllTools();
-    return allTools.some(t => t.name === toolName);
+    return this.getCanonicalTools().some((tool) => tool.canonicalName === toolName);
   }
 
   /**
@@ -253,5 +259,46 @@ export class MCPToolExecutor implements ToolExecutor {
     }
     this.initialized = false;
     this.initPromise = null;
+  }
+
+  private getCanonicalTools(): CanonicalMCPToolInfo[] {
+    return this.mcpManager.getAllTools().map((tool) => this.toCanonicalToolInfo(tool));
+  }
+
+  private toCanonicalToolInfo(tool: MCPToolInfo): CanonicalMCPToolInfo {
+    return {
+      ...tool,
+      originalName: tool.name,
+      canonicalName: this.buildCanonicalToolName(tool.serverId, tool.name),
+    };
+  }
+
+  private buildCanonicalToolName(serverId: string, originalName: string): string {
+    const normalizedServerId = this.sanitizeNameSegment(serverId);
+    const normalizedToolName = this.sanitizeNameSegment(originalName);
+    const directName = `mcp__${normalizedServerId}__${normalizedToolName}`;
+    if (directName.length <= MCPToolExecutor.MAX_TOOL_NAME_LENGTH) {
+      return directName;
+    }
+
+    const serverHash = createHash('sha1').update(serverId).digest('hex').slice(0, 8);
+    const toolHash = createHash('sha1').update(originalName).digest('hex').slice(0, 8);
+    const shortenedServerId = normalizedServerId.slice(0, 12) || 'server';
+    const maxToolSegmentLength = Math.max(
+      8,
+      MCPToolExecutor.MAX_TOOL_NAME_LENGTH - `mcp__${shortenedServerId}_${serverHash}__`.length - 9,
+    );
+    const shortenedToolName = normalizedToolName.slice(0, maxToolSegmentLength) || 'tool';
+    return `mcp__${shortenedServerId}_${serverHash}__${shortenedToolName}_${toolHash}`;
+  }
+
+  private sanitizeNameSegment(input: string): string {
+    const normalized = input
+      .trim()
+      .replace(/[^a-zA-Z0-9_-]+/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .toLowerCase();
+    return normalized || 'unnamed';
   }
 }

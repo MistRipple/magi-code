@@ -10,6 +10,7 @@ import type { MCPToolExecutor } from '../tools/mcp-executor';
 import type { DecisionHookEvent } from '../llm/types';
 import type { PlanMode } from '../orchestrator/plan-ledger';
 import type { MessageMetadata } from '../protocol/message-protocol';
+import type { EffectiveToolPolicy } from '../tools/tool-policy';
 
 /**
  * 适配器输出范围配置
@@ -32,8 +33,8 @@ export interface AdapterOutputScope {
   /** 是否包含工具调用信息 */
   includeToolCalls?: boolean;
 
-  /** 显式限制本轮可调用的工具集合（留空表示由提示词决定） */
-  allowedToolNames?: string[];
+  /** 当前请求唯一生效的工具策略 */
+  toolPolicy?: EffectiveToolPolicy;
 
   /** 消息来源标识 */
   source?: 'orchestrator' | 'worker' | 'user';

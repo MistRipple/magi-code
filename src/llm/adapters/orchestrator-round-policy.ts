@@ -67,7 +67,9 @@ export function buildPseudoToolCallRecoveryPrompt(): string {
   return [
     '[System] 你刚才在正文里描述了“调用 worker_dispatch / worker_wait”，但没有真正输出工具调用。',
     '- 不要再用自然语言重复“调用 worker_dispatch”“稍后 worker_wait”这类描述。',
-    '- 如果你决定派发任务，现在立刻输出真实的 worker_dispatch tool_call，并带完整参数。',
+    '- 如果你决定派发任务，现在立刻输出真实的 worker_dispatch tool_call，并使用唯一合法形状：{ mission_title?: string, tasks: [...] }。',
+    '- 每个 tasks[*] 必须包含 task_name、ownership_hint、mode_hint、goal、acceptance、constraints、context、requires_modification。',
+    '- 禁止使用 legacy 字段 category、description，禁止把 ownership_hint/mode_hint/goal 放到顶层。',
     '- 如果当前不应该派发任务，请直接说明原因并停止提及工具名。',
   ].join('\n');
 }
@@ -76,7 +78,9 @@ export function buildThinkingOnlyOrchestrationRecoveryPrompt(): string {
   return [
     '[System] 你刚才只输出了 thinking，没有正文，也没有任何真实的 worker_dispatch / worker_wait 工具调用。',
     '- 不要只在 thinking 里规划任务。',
-    '- 如果本轮需要任务编排，现在立刻输出真实的 worker_dispatch tool_call，并带完整参数。',
+    '- 如果本轮需要任务编排，现在立刻输出真实的 worker_dispatch tool_call，并使用唯一合法形状：{ mission_title?: string, tasks: [...] }。',
+    '- 每个 tasks[*] 必须包含 task_name、ownership_hint、mode_hint、goal、acceptance、constraints、context、requires_modification。',
+    '- 禁止使用 legacy 字段 category、description，禁止把 ownership_hint/mode_hint/goal 放到顶层。',
     '- 如果你判断当前无法形成有效 Assignment，请直接用正文说明原因。',
   ].join('\n');
 }

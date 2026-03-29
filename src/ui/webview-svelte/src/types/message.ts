@@ -96,6 +96,18 @@ export interface StandardizedToolResult {
   sourceId?: string;
 }
 
+export interface ToolPolicyPayload {
+  schemaVersion: 'tool-policy.v1';
+  source: 'request' | 'mode' | 'skill' | 'composed';
+  allowedToolNames?: string[];
+  forbiddenToolNames?: string[];
+  readOnly?: boolean;
+  allowedFilePatternGroups?: string[][];
+  forbiddenFilePatterns?: string[];
+  restrictUnknownExternalTools?: boolean;
+  activeInstructionSkillName?: string;
+}
+
 // 工具调用
 export interface ToolCall {
   id: string;
@@ -656,6 +668,11 @@ export interface Edit {
   type?: EditType;
   additions?: number;
   deletions?: number;
+  diff?: string;
+  originalContent?: string;
+  previewContent?: string;
+  previewAbsolutePath?: string;
+  previewCanOpenWorkspaceFile?: boolean;
   contributors?: string[];
   workerId?: string;
   missionId?: string;

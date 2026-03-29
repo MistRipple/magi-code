@@ -57,6 +57,14 @@ import { runIntentDrivenFileEdit } from '../llm/utils/intent-file-editor';
 import { KnowledgeQueryExecutor } from './knowledge-query-executor';
 import type { GovernedKnowledgeAuditMetadata } from '../knowledge/governed-knowledge-context-service';
 import type { HostCapabilities } from '../host';
+import {
+  buildInstructionSkillToolPolicy,
+  hasFileScopeRestrictions,
+  isBuiltinWriteToolCall,
+  isOrchestrationToolName,
+  isToolBlockedByPolicy,
+  type EffectiveToolPolicy,
+} from './tool-policy';
 
 /**
  * 快照执行上下文（标识当前正在执行的 mission/assignment/worker）
@@ -84,6 +92,8 @@ export interface ToolExecutionContext {
    * 应重定向到此路径，而非主 workspaceRoot。
    */
   worktreePath?: string;
+  /** 当前请求唯一生效的工具策略 */
+  toolPolicy?: EffectiveToolPolicy;
 }
 
 /**
@@ -725,6 +735,231 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     return this.builtinToolAliases.get(name) || name;
   }
 
+  private getActiveToolPolicy(executionContext?: ToolExecutionContext): EffectiveToolPolicy | undefined {
+    const activeContext = executionContext || this.executionContextStorage.getStore();
+    return activeContext?.toolPolicy;
+  }
+
+  private compilePolicyPattern(patternSource: string): RegExp | null {
+    try {
+      return new RegExp(patternSource);
+    } catch (error) {
+      logger.warn('Tool policy pattern compile failed', {
+        patternSource,
+        error: error instanceof Error ? error.message : String(error),
+      }, LogCategory.TOOLS);
+      return null;
+    }
+  }
+
+  private matchesAllowedFileGroups(displayPath: string, policy: EffectiveToolPolicy): boolean {
+    const groups = policy.allowedFilePatternGroups;
+    if (!groups?.length) {
+      return true;
+    }
+    return groups.every((group) => group.some((patternSource) => {
+      const pattern = this.compilePolicyPattern(patternSource);
+      return pattern ? pattern.test(displayPath) : false;
+    }));
+  }
+
+  private matchesForbiddenFilePatterns(displayPath: string, policy: EffectiveToolPolicy): boolean {
+    const patterns = policy.forbiddenFilePatterns;
+    if (!patterns?.length) {
+      return false;
+    }
+    return patterns.some((patternSource) => {
+      const pattern = this.compilePolicyPattern(patternSource);
+      return pattern ? pattern.test(displayPath) : false;
+    });
+  }
+
+  private isVisibleUnderPolicy(
+    tool: ExtendedToolDefinition,
+    policy?: EffectiveToolPolicy,
+  ): boolean {
+    if (!policy) {
+      return true;
+    }
+    if (isToolBlockedByPolicy(tool.name, policy)) {
+      return false;
+    }
+    if (tool.metadata.source !== 'builtin') {
+      if (policy.readOnly || hasFileScopeRestrictions(policy)) {
+        return false;
+      }
+      if (policy.restrictUnknownExternalTools) {
+        return Boolean(policy.allowedToolNames?.includes(tool.name));
+      }
+      return true;
+    }
+    if (!policy.readOnly) {
+      return true;
+    }
+    if (tool.name === 'shell') {
+      return true;
+    }
+    return !isBuiltinWriteToolCall({ name: tool.name, arguments: {} });
+  }
+
+  private resolveToolCallDefinition(
+    toolCall: ToolCall,
+    toolDef?: ExtendedToolDefinition,
+  ): ExtendedToolDefinition {
+    if (toolDef) {
+      return toolDef;
+    }
+    return {
+      name: toolCall.name,
+      description: '',
+      input_schema: {
+        type: 'object',
+        properties: {},
+      },
+      metadata: {
+        source: 'builtin',
+      },
+    };
+  }
+
+  private isToolCallPotentiallyFileMutating(
+    toolCall: ToolCall,
+    toolDef: ExtendedToolDefinition,
+  ): boolean {
+    if (toolDef.metadata.source !== 'builtin') {
+      return true;
+    }
+    if (isBuiltinWriteToolCall(toolCall)) {
+      return true;
+    }
+    if (toolCall.name !== 'shell') {
+      return false;
+    }
+    const command = typeof toolCall.arguments?.command === 'string'
+      ? toolCall.arguments.command.trim()
+      : '';
+    if (!command) {
+      return false;
+    }
+    if (this.isLikelyReadOnlyCommand(command)) {
+      return false;
+    }
+    return this.isLikelyFileMutatingCommand(command) || this.isLikelyScriptDrivenMutation(command);
+  }
+
+  private resolveToolCallDisplayPath(toolCall: ToolCall): string | null {
+    const absPath = this.resolveFileToolPath(toolCall, false);
+    if (!absPath) {
+      return null;
+    }
+    return this.getEffectiveWorkspaceRoots().toDisplayPath(absPath);
+  }
+
+  private rejectToolCall(
+    toolCall: ToolCall,
+    message: string,
+    status: StandardizedToolResult['status'] = 'rejected',
+    errorCode?: string,
+  ): ToolResult {
+    return {
+      toolCallId: toolCall.id,
+      content: message,
+      isError: true,
+      standardized: {
+        schemaVersion: 'tool-result.v1',
+        source: 'builtin',
+        toolName: toolCall.name,
+        toolCallId: toolCall.id,
+        status,
+        message,
+        ...(errorCode ? { errorCode } : {}),
+      },
+    };
+  }
+
+  private enforceToolPolicy(
+    toolCall: ToolCall,
+    toolDef: ExtendedToolDefinition,
+    policy?: EffectiveToolPolicy,
+  ): ToolResult | null {
+    if (!policy) {
+      return null;
+    }
+
+    if (isToolBlockedByPolicy(toolCall.name, policy)) {
+      return this.rejectToolCall(
+        toolCall,
+        `工具 ${toolCall.name} 不在当前请求允许的工具范围内。请改用当前轮次允许的分析/编排工具完成任务。`,
+        'rejected',
+        'tool_policy_not_allowed',
+      );
+    }
+
+    if (toolDef.metadata.source !== 'builtin' && policy.restrictUnknownExternalTools) {
+      if (!policy.allowedToolNames?.includes(toolCall.name)) {
+        return this.rejectToolCall(
+          toolCall,
+          `工具 ${toolCall.name} 当前未被策略显式放行。受限模式下禁止调用未知副作用的外部工具。`,
+          'rejected',
+          'tool_policy_external_not_allowed',
+        );
+      }
+    }
+
+    const mutatesFiles = this.isToolCallPotentiallyFileMutating(toolCall, toolDef);
+    if (policy.readOnly && mutatesFiles) {
+      return this.rejectToolCall(
+        toolCall,
+        `工具 ${toolCall.name} 被当前只读执行合同拒绝。请改用只读工具完成当前任务。`,
+        'rejected',
+        'tool_policy_read_only',
+      );
+    }
+
+    if (!mutatesFiles || !hasFileScopeRestrictions(policy)) {
+      return null;
+    }
+
+    if (toolCall.name === 'shell') {
+      return this.rejectToolCall(
+        toolCall,
+        `工具 ${toolCall.name} 在受限路径模式下不能承担写操作。请改用显式文件工具在允许范围内修改文件。`,
+        'rejected',
+        'tool_policy_shell_write_disallowed',
+      );
+    }
+
+    const displayPath = this.resolveToolCallDisplayPath(toolCall);
+    if (!displayPath) {
+      return this.rejectToolCall(
+        toolCall,
+        `工具 ${toolCall.name} 缺少可校验的目标路径，无法通过当前文件范围约束。`,
+        'rejected',
+        'tool_policy_missing_path',
+      );
+    }
+
+    if (!this.matchesAllowedFileGroups(displayPath, policy)) {
+      return this.rejectToolCall(
+        toolCall,
+        `目标路径 ${displayPath} 不在当前执行模式允许的文件范围内。`,
+        'rejected',
+        'tool_policy_path_not_allowed',
+      );
+    }
+
+    if (this.matchesForbiddenFilePatterns(displayPath, policy)) {
+      return this.rejectToolCall(
+        toolCall,
+        `目标路径 ${displayPath} 命中了当前执行模式禁止修改的文件范围。`,
+        'rejected',
+        'tool_policy_path_forbidden',
+      );
+    }
+
+    return null;
+  }
+
   // ============================================================
   // 安全防护（Safeguard）
   // ============================================================
@@ -802,6 +1037,8 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
    */
   async execute(toolCall: ToolCall, signal?: AbortSignal, executionContext?: ToolExecutionContext): Promise<ToolResult> {
     const run = async (): Promise<ToolResult> => {
+      const runtimeContext = this.executionContextStorage.getStore() || executionContext;
+      const activePolicy = this.getActiveToolPolicy(runtimeContext);
       const normalizedName = this.normalizeToolName(toolCall.name);
       const normalizedToolCall = normalizedName === toolCall.name
         ? toolCall
@@ -845,28 +1082,62 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
         // 检查是否是内置工具
         if (this.builtinToolNames.includes(normalizedToolCall.name)) {
           resolvedSource = 'builtin';
+          const builtinDef = this.resolveToolCallDefinition(normalizedToolCall);
+          const policyRejection = this.enforceToolPolicy(normalizedToolCall, builtinDef, activePolicy);
+          if (policyRejection) {
+            return finalize(policyRejection);
+          }
           return finalize(await this.executeBuiltinTool(normalizedToolCall, signal));
         }
 
         // 查找 MCP 工具
         const toolDef = await this.findTool(normalizedToolCall.name);
         if (!toolDef) {
-          const available = this.builtinToolNames.join(', ');
+          const availableTools = await this.getVisibleTools({
+            role: runtimeContext?.role === 'orchestrator' ? 'orchestrator' : 'worker',
+            excludeOrchestrationTools: runtimeContext?.role !== 'orchestrator',
+            toolPolicy: activePolicy,
+          });
+          const normalizedRequested = normalizedToolCall.name.trim().toLowerCase();
+          const suggestedToolNames = availableTools
+            .filter((tool) => {
+              const canonicalName = tool.name.trim().toLowerCase();
+              const displayName = (tool.metadata.displayName || '').trim().toLowerCase();
+              return canonicalName === normalizedRequested
+                || displayName === normalizedRequested
+                || canonicalName.endsWith(`__${normalizedRequested}`)
+                || (displayName.length > 0 && displayName.includes(normalizedRequested));
+            })
+            .map((tool) => tool.name);
+          const uniqueSuggestions = Array.from(new Set(suggestedToolNames)).slice(0, 5);
+          const available = availableTools.map((tool) => tool.name);
+          const availablePreview = available.slice(0, 20).join(', ');
+          const suggestionText = uniqueSuggestions.length > 0
+            ? ` Matching available tools: ${uniqueSuggestions.join(', ')}.`
+            : '';
+          const availableText = availablePreview
+            ? ` Available tools: ${availablePreview}${available.length > 20 ? ', ...' : ''}.`
+            : '';
           return finalize({
             toolCallId: toolCall.id,
-            content: `Tool '${toolCall.name}' does not exist. You may only use the following tools: ${available}. Please use the available tools directly to complete the task.`,
+            content: `Tool '${toolCall.name}' does not exist. Use one of the registered tool names.${suggestionText}${availableText}`,
             isError: true,
           });
         }
         resolvedSource = toolDef.metadata.source;
         resolvedSourceId = toolDef.metadata.sourceId;
 
+        const policyRejection = this.enforceToolPolicy(normalizedToolCall, toolDef, activePolicy);
+        if (policyRejection) {
+          return finalize(policyRejection);
+        }
+
         // 执行 MCP 工具
         if (toolDef.metadata.source === 'mcp') {
           return finalize(await this.executeMCPTool(normalizedToolCall, toolDef, signal));
         }
 
-        // 执行内置工具（按定义来源兜底分发，避免白名单漂移导致误判）
+        // 执行内置工具（按定义来源兜底分发，避免策略过滤后的来源误判）
         if (toolDef.metadata.source === 'builtin') {
           const builtinCall = toolDef.name === normalizedToolCall.name
             ? normalizedToolCall
@@ -988,18 +1259,19 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   ): ToolResult {
     const message = typeof raw.content === 'string' ? raw.content : String(raw.content ?? '');
     const parsedData = this.tryParseToolResultData(message);
-    const status = this.inferToolResultStatus(toolCall, raw, message, parsedData);
+    const existing = raw.standardized;
+    const status = existing?.status || this.inferToolResultStatus(toolCall, raw, message, parsedData);
     const isError = status !== 'success';
     const standardized: StandardizedToolResult = {
       schemaVersion: 'tool-result.v1',
-      source,
-      sourceId,
-      toolName: toolCall.name,
+      source: existing?.source || source,
+      sourceId: existing?.sourceId || sourceId,
+      toolName: existing?.toolName || toolCall.name,
       toolCallId: raw.toolCallId || toolCall.id,
       status,
       message,
-      data: parsedData,
-      errorCode: status === 'success' ? undefined : this.inferToolErrorCode(status, message, parsedData),
+      data: existing?.data !== undefined ? existing.data : parsedData,
+      errorCode: existing?.errorCode || (status === 'success' ? undefined : this.inferToolErrorCode(status, message, parsedData)),
     };
 
     return {
@@ -1285,6 +1557,19 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       };
     }
 
+    if (skill.disableModelInvocation) {
+      return {
+        toolCallId: toolCall.id,
+        content: `Skill "${skillName}" 禁止由模型通过 skill_apply 自动激活。请仅在用户显式触发时使用该 Skill。`,
+        isError: true,
+      };
+    }
+
+    const toolPolicy = buildInstructionSkillToolPolicy(skill);
+    const allowedToolsLine = toolPolicy.allowedToolNames?.length
+      ? `\n\nActive Tool Policy:\n- Allowed tools: ${toolPolicy.allowedToolNames.join(', ')}`
+      : '';
+
     logger.info('skill_apply: loaded instruction skill', {
       skillName,
       contentLength: skill.content.length,
@@ -1293,7 +1578,20 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
     return {
       toolCallId: toolCall.id,
-      content: `## Skill Instructions: ${skill.name}\n\n${skill.content}`,
+      content: `## Skill Instructions: ${skill.name}\n\n${skill.content}${allowedToolsLine}`,
+      standardized: {
+        schemaVersion: 'tool-result.v1',
+        source: 'builtin',
+        toolName: toolCall.name,
+        toolCallId: toolCall.id,
+        status: 'success',
+        message: `Skill "${skill.name}" loaded`,
+        data: {
+          skillName: skill.name,
+          instructions: skill.content,
+          toolPolicy,
+        },
+      },
     };
   }
 
@@ -1313,12 +1611,13 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     tools.push(...builtinTools);
 
     // 收集所有 MCP 工具
-    for (const [serverId, executor] of this.mcpExecutors) {
+    const uniqueMcpExecutors = this.getUniqueMCPExecutors();
+    for (const executor of uniqueMcpExecutors) {
       try {
         const mcpTools = await executor.getTools();
         tools.push(...mcpTools);
       } catch (error: any) {
-        logger.error(`Failed to get tools from MCP server: ${serverId}`, {
+        logger.error('Failed to get tools from MCP executor', {
           error: error.message,
         }, LogCategory.TOOLS);
       }
@@ -1336,6 +1635,8 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       }
     }
 
+    this.assertUniqueToolNames(tools);
+
     // 更新缓存
     for (const tool of tools) {
       this.toolCache.set(tool.name, tool);
@@ -1343,11 +1644,33 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
 
     logger.info(`Loaded ${tools.length} tools`, {
       builtin: builtinTools.length,
-      mcp: this.mcpExecutors.size,
+      mcpServers: this.mcpExecutors.size,
+      mcpExecutors: uniqueMcpExecutors.length,
       skill: this.skillExecutor ? 1 : 0,
     }, LogCategory.TOOLS);
 
     return tools;
+  }
+
+  async getVisibleTools(options?: {
+    role?: 'orchestrator' | 'worker';
+    excludeOrchestrationTools?: boolean;
+    toolPolicy?: EffectiveToolPolicy;
+  }): Promise<ExtendedToolDefinition[]> {
+    const role = options?.role ?? 'worker';
+    const excludeOrchestrationTools = options?.excludeOrchestrationTools ?? (role === 'worker');
+    const tools = await this.getTools();
+    const hideWorkerOnlyTools = role === 'orchestrator';
+
+    return tools.filter((tool) => {
+      if (excludeOrchestrationTools && isOrchestrationToolName(tool.name)) {
+        return false;
+      }
+      if (hideWorkerOnlyTools && (tool.name === 'todo_split' || tool.name === 'todo_claim_next')) {
+        return false;
+      }
+      return this.isVisibleUnderPolicy(tool, options?.toolPolicy);
+    });
   }
 
   /**
@@ -1362,24 +1685,20 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
   async buildToolsSummary(options?: {
     role?: 'orchestrator' | 'worker';
     excludeOrchestrationTools?: boolean;
+    toolPolicy?: EffectiveToolPolicy;
   }): Promise<string> {
     const role = options?.role ?? 'worker';
-    const excludeOrch = options?.excludeOrchestrationTools ?? true;
-
-    const tools = await this.getTools();
+    const excludeOrch = options?.excludeOrchestrationTools ?? (role === 'worker');
+    const tools = await this.getVisibleTools({
+      role,
+      excludeOrchestrationTools: excludeOrch,
+      toolPolicy: options?.toolPolicy,
+    });
     if (tools.length === 0) {
       return '';
     }
 
-    const orchestrationToolNames = ['worker_dispatch', 'worker_send_message', 'worker_wait', 'context_compact'];
-    const workerOnlyToolNames = ['todo_split', 'todo_claim_next'];
-    const hideOrchestrationTools = role === 'worker' && excludeOrch;
-    const hideWorkerOnlyTools = role === 'orchestrator';
-    const builtinTools = tools.filter(t =>
-      t.metadata?.source === 'builtin' &&
-      (!hideOrchestrationTools || !orchestrationToolNames.includes(t.name)) &&
-      (!hideWorkerOnlyTools || !workerOnlyToolNames.includes(t.name))
-    );
+    const builtinTools = tools.filter(t => t.metadata?.source === 'builtin');
     const visibleBuiltinToolNames = new Set(builtinTools.map(t => t.name));
 
     // 内置工具描述映射（中文用途说明）
@@ -1415,25 +1734,27 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     const lines: string[] = [];
 
     // 内置工具：按类别分组
-    lines.push('Built-in Tools:');
-    const categoryOrder = ['File Operations', 'Terminal Commands', 'Web Tools', 'Code Intelligence', 'Visualization', 'Task Management'];
-    for (const category of categoryOrder) {
-      const categoryTools = Object.entries(builtinToolDescriptions)
-        .filter(([name, v]) => v.category === category && visibleBuiltinToolNames.has(name));
-      if (categoryTools.length > 0) {
-        const toolList = categoryTools.map(([name, v]) => {
-          const note = role === 'orchestrator' ? (orchestratorNotes[name] || '') : '';
-          return `${name} (${v.desc}${note})`;
-        }).join(', ');
-        lines.push(`- ${category}: ${toolList}`);
+    if (builtinTools.length > 0) {
+      lines.push('Built-in Tools:');
+      const categoryOrder = ['File Operations', 'Terminal Commands', 'Web Tools', 'Code Intelligence', 'Visualization', 'Task Management'];
+      for (const category of categoryOrder) {
+        const categoryTools = Object.entries(builtinToolDescriptions)
+          .filter(([name, v]) => v.category === category && visibleBuiltinToolNames.has(name));
+        if (categoryTools.length > 0) {
+          const toolList = categoryTools.map(([name, v]) => {
+            const note = role === 'orchestrator' ? (orchestratorNotes[name] || '') : '';
+            return `${name} (${v.desc}${note})`;
+          }).join(', ');
+          lines.push(`- ${category}: ${toolList}`);
+        }
       }
-    }
 
-    // 动态发现新增的未映射内置工具
-    const unmappedTools = builtinTools.filter(t => !builtinToolDescriptions[t.name]);
-    for (const tool of unmappedTools) {
-      const desc = tool.description ? tool.description.split(/[.\n]/)[0].substring(0, 60) : '';
-      lines.push(`- Other: ${tool.name} (${desc})`);
+      // 动态发现新增的未映射内置工具
+      const unmappedTools = builtinTools.filter(t => !builtinToolDescriptions[t.name]);
+      for (const tool of unmappedTools) {
+        const desc = tool.description ? tool.description.split(/[.\n]/)[0].substring(0, 60) : '';
+        lines.push(`- Other: ${tool.name} (${desc})`);
+      }
     }
 
     // MCP 工具
@@ -1442,8 +1763,10 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
       lines.push('');
       lines.push('MCP Extension Tools (installed by user, can be called directly):');
       for (const tool of mcpTools) {
+        const displayName = tool.metadata?.displayName || tool.name;
+        const sourceLabel = tool.metadata?.sourceLabel || tool.metadata?.sourceId || 'unknown';
         const desc = tool.description ? ` - ${tool.description.substring(0, 80)}` : '';
-        lines.push(`- ${tool.name}${desc}`);
+        lines.push(`- ${tool.name} (server: ${sourceLabel}, original: ${displayName})${desc}`);
       }
     }
 
@@ -1461,7 +1784,7 @@ export class ToolManager extends EventEmitter implements ToolExecutor {
     // Instruction Skills 目录（让 LLM 知道有哪些增强能力可用）
     const prompts = this.getPrompts();
     const instructionSkills = prompts.filter(p => p.source === 'skill');
-    if (instructionSkills.length > 0) {
+    if (instructionSkills.length > 0 && visibleBuiltinToolNames.has('skill_apply')) {
       lines.push('');
       lines.push('Installed Skill Instructions (user-installed capability enhancements):');
       lines.push('When the user task scenario matches an [auto] skill, call skill_apply(skill_name) to load its instructions.');
@@ -2461,7 +2784,7 @@ Only set may_modify_files=true when the command directly writes source files.`,
     const prompts: UnifiedPromptInfo[] = [];
 
     // 1. 收集 MCP Prompts
-    for (const [serverId, executor] of this.mcpExecutors) {
+    for (const executor of this.getUniqueMCPExecutors()) {
       // 检查是否是 MCPToolExecutor
       const mcpExecutor = executor as MCPToolExecutor;
       if (typeof mcpExecutor.getPrompts === 'function') {
@@ -2506,6 +2829,43 @@ Only set may_modify_files=true when the command directly writes source files.`,
     }, LogCategory.TOOLS);
 
     return prompts;
+  }
+
+  private getUniqueMCPExecutors(): ToolExecutor[] {
+    const uniqueExecutors: ToolExecutor[] = [];
+    const seen = new Set<ToolExecutor>();
+    for (const executor of this.mcpExecutors.values()) {
+      if (seen.has(executor)) {
+        continue;
+      }
+      seen.add(executor);
+      uniqueExecutors.push(executor);
+    }
+    return uniqueExecutors;
+  }
+
+  private assertUniqueToolNames(tools: ExtendedToolDefinition[]): void {
+    const ownersByName = new Map<string, string[]>();
+
+    for (const tool of tools) {
+      const source = tool.metadata?.source || 'unknown';
+      const ownerLabel = tool.metadata?.sourceLabel
+        || tool.metadata?.sourceId
+        || tool.metadata?.displayName
+        || tool.name;
+      const owner = `${source}:${ownerLabel}`;
+      const owners = ownersByName.get(tool.name) || [];
+      owners.push(owner);
+      ownersByName.set(tool.name, owners);
+    }
+
+    const conflicts = Array.from(ownersByName.entries())
+      .filter(([, owners]) => owners.length > 1)
+      .map(([name, owners]) => `${name} -> ${owners.join(', ')}`);
+
+    if (conflicts.length > 0) {
+      throw new Error(`Detected duplicate tool names: ${conflicts.join(' | ')}`);
+    }
   }
 
   /**

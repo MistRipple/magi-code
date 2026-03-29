@@ -50,9 +50,6 @@ export interface SessionStateSnapshot {
   lastExecutionAt?: number;
 }
 
-/**
- * Worker Session
- */
 export interface WorkerSession {
   /** Session ID */
   id: string;
@@ -88,6 +85,24 @@ export interface WorkerSession {
   isResumed?: boolean;
 
   /** 恢复提示（用于恢复执行时的额外指令） */
+  resumePrompt?: string;
+}
+
+/**
+ * Worker Session 可序列化快照
+ */
+export interface WorkerSessionSnapshot {
+  id: string;
+  assignmentId: string;
+  workerId: WorkerSlot;
+  conversationHistory: ConversationMessage[];
+  readFiles: Array<{ path: string; entry: FileCacheEntry }>;
+  completedTodos: string[];
+  completedTodoFingerprints: string[];
+  stateSnapshot: SessionStateSnapshot;
+  createdAt: number;
+  updatedAt: number;
+  isResumed?: boolean;
   resumePrompt?: string;
 }
 
@@ -309,6 +324,68 @@ export class WorkerSessionManager {
     return true;
   }
 
+  exportSnapshot(sessionId: string): WorkerSessionSnapshot | null {
+    const session = this.get(sessionId);
+    if (!session) {
+      return null;
+    }
+    return this.toSnapshot(session);
+  }
+
+  exportSnapshots(): WorkerSessionSnapshot[] {
+    const snapshots: WorkerSessionSnapshot[] = [];
+    for (const session of this.sessions.values()) {
+      if (!this.isExpired(session)) {
+        snapshots.push(this.toSnapshot(session));
+      }
+    }
+    return snapshots;
+  }
+
+  importSnapshots(snapshots: WorkerSessionSnapshot[]): void {
+    for (const snapshot of snapshots) {
+      const session = this.fromSnapshot(snapshot);
+      this.sessions.set(session.id, session);
+    }
+  }
+
+  private toSnapshot(session: WorkerSession): WorkerSessionSnapshot {
+    return {
+      id: session.id,
+      assignmentId: session.assignmentId,
+      workerId: session.workerId,
+      conversationHistory: session.conversationHistory.map((message) => ({ ...message })),
+      readFiles: Array.from(session.readFiles.entries()).map(([path, entry]) => ({
+        path,
+        entry: { ...entry },
+      })),
+      completedTodos: [...session.completedTodos],
+      completedTodoFingerprints: [...session.completedTodoFingerprints],
+      stateSnapshot: { ...session.stateSnapshot },
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      isResumed: session.isResumed,
+      resumePrompt: session.resumePrompt,
+    };
+  }
+
+  private fromSnapshot(snapshot: WorkerSessionSnapshot): WorkerSession {
+    return {
+      id: snapshot.id,
+      assignmentId: snapshot.assignmentId,
+      workerId: snapshot.workerId,
+      conversationHistory: snapshot.conversationHistory.map((message) => ({ ...message })),
+      readFiles: new Map(snapshot.readFiles.map(({ path, entry }) => [path, { ...entry }])),
+      completedTodos: [...snapshot.completedTodos],
+      completedTodoFingerprints: [...snapshot.completedTodoFingerprints],
+      stateSnapshot: { ...snapshot.stateSnapshot },
+      createdAt: snapshot.createdAt,
+      updatedAt: snapshot.updatedAt,
+      isResumed: snapshot.isResumed,
+      resumePrompt: snapshot.resumePrompt,
+    };
+  }
+
   /**
    * 删除 Session
    */
@@ -330,9 +407,6 @@ export class WorkerSessionManager {
     return Date.now() - session.updatedAt > this.SESSION_TTL_MS;
   }
 
-  /**
-   * 清理过期 Session
-   */
   cleanup(): number {
     let cleanedCount = 0;
 

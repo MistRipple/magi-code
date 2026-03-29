@@ -1,17 +1,13 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getState } from '../stores/messages.svelte';
+  import { getCurrentSessionId, getState } from '../stores/messages.svelte';
   import { vscode } from '../lib/vscode-bridge';
   import { ensureArray } from '../lib/utils';
   import type { Edit } from '../types/message';
   import Icon from './Icon.svelte';
   import WorkerBadge from './WorkerBadge.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import {
-    getAgentChangeDiff,
-    getAgentFilePreview,
-    isWebAgentMode,
-  } from '../web/agent-api';
+  import { isWebAgentMode } from '../web/agent-api';
 
   const appState = getState();
   const isWebMode = isWebAgentMode();
@@ -121,50 +117,62 @@
   }
 
   async function openFile(filePath: string) {
+    const edit = edits.find((candidate) => candidate.filePath === filePath) ?? null;
+    const resolvedPreviewContent = resolveEditPreviewContent(edit);
+    const resolvedPreviewLanguage = inferPreviewLanguage(filePath);
+
     if (!isWebMode) {
-      vscode.postMessage({ type: 'openFile', filepath: filePath });
+      vscode.postMessage({
+        type: 'openFile',
+        filepath: filePath,
+        sessionId: getCurrentSessionId() || undefined,
+        previewContent: resolvedPreviewContent,
+        previewAbsolutePath: edit?.previewAbsolutePath,
+        previewCanOpenWorkspaceFile: edit?.previewCanOpenWorkspaceFile,
+      });
       return;
     }
     selectedPreviewFilePath = filePath;
     previewOpen = !useDockedPreview;
     previewMode = 'file';
     previewTitle = filePath;
-    previewContent = '';
-    previewLanguage = 'text';
+    previewContent = resolvedPreviewContent;
+    previewLanguage = resolvedPreviewLanguage;
     previewError = '';
-    previewLoading = true;
-    try {
-      const payload = await getAgentFilePreview(filePath);
-      previewContent = payload.content || '';
-      previewLanguage = payload.language || 'text';
-    } catch (error) {
-      previewError = error instanceof Error ? error.message : String(error);
-    } finally {
-      previewLoading = false;
+    previewLoading = false;
+    if (!resolvedPreviewContent) {
+      previewError = i18n.t('edits.preview.empty');
     }
   }
   function approveChange(filePath: string) { vscode.postMessage({ type: 'approveChange', filePath }); }
   function revertChange(filePath: string) { vscode.postMessage({ type: 'revertChange', filePath }); }
   async function viewDiff(filePath: string) {
+    const edit = edits.find((candidate) => candidate.filePath === filePath) ?? null;
+    const diff = edit?.diff || '';
+
     if (!isWebMode) {
-      vscode.postMessage({ type: 'viewDiff', filePath });
+      vscode.postMessage({
+        type: 'viewDiff',
+        filePath,
+        sessionId: getCurrentSessionId() || undefined,
+        diff,
+        originalContent: edit?.originalContent,
+        previewContent: resolveEditPreviewContent(edit),
+        previewAbsolutePath: edit?.previewAbsolutePath,
+        previewCanOpenWorkspaceFile: edit?.previewCanOpenWorkspaceFile,
+      });
       return;
     }
     selectedPreviewFilePath = filePath;
     previewOpen = !useDockedPreview;
     previewMode = 'diff';
     previewTitle = filePath;
-    previewContent = '';
+    previewContent = diff;
     previewLanguage = 'diff';
     previewError = '';
-    previewLoading = true;
-    try {
-      const payload = await getAgentChangeDiff(filePath);
-      previewContent = payload.diff || '';
-    } catch (error) {
-      previewError = error instanceof Error ? error.message : String(error);
-    } finally {
-      previewLoading = false;
+    previewLoading = false;
+    if (!diff) {
+      previewError = i18n.t('fileChangeCard.noDiffDetail');
     }
   }
   function approveAllChanges() { vscode.postMessage({ type: 'approveAllChanges' }); }
@@ -189,6 +197,43 @@
     if (line.startsWith('+')) return 'add';
     if (line.startsWith('-')) return 'del';
     return 'context';
+  }
+
+  function resolveEditPreviewContent(edit: Edit | null): string {
+    if (!edit) {
+      return '';
+    }
+    if (typeof edit.previewContent === 'string' && edit.previewContent.length > 0) {
+      return edit.previewContent;
+    }
+    if (typeof edit.originalContent === 'string' && edit.originalContent.length > 0) {
+      return edit.originalContent;
+    }
+    return '';
+  }
+
+  function inferPreviewLanguage(filePath: string): string {
+    const ext = filePath.split('.').pop()?.toLowerCase() || '';
+    const languageMap: Record<string, string> = {
+      ts: 'typescript',
+      tsx: 'typescript',
+      js: 'javascript',
+      jsx: 'javascript',
+      json: 'json',
+      md: 'markdown',
+      css: 'css',
+      scss: 'scss',
+      html: 'html',
+      vue: 'vue',
+      svelte: 'svelte',
+      py: 'python',
+      go: 'go',
+      java: 'java',
+      sh: 'bash',
+      yml: 'yaml',
+      yaml: 'yaml',
+    };
+    return languageMap[ext] || 'text';
   }
 </script>
 

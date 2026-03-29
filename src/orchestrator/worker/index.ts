@@ -18,6 +18,7 @@ export {
 
 export {
   WorkerSession,
+  WorkerSessionSnapshot,
   WorkerSessionManager,
   SessionCreateOptions,
   SessionUpdateOptions,

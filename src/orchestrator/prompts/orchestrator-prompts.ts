@@ -280,6 +280,9 @@ Changes are merged back to the main branch upon task completion. This enables tr
   sections.push(`## worker_dispatch Usage Guide
 - **mission_title is required on every first worker_dispatch call**: You MUST provide \`mission_title\` — a concise, semantic summary of the overall mission (e.g. “Integrate admin dashboard frontend pages”, “Fix user login flow bug”). This is the plan title shown to the user. Do NOT copy the user's raw message verbatim; always rephrase it into a proper engineering title. On subsequent worker_dispatch calls within the same conversation turn, you may omit it.
 - **task_name is required**: Generate a concise, standard engineering task name (e.g. “[Frontend] Implement password visibility toggle”). Do not copy the user's raw conversation text.
+- **Top-level shape is required**: \`worker_dispatch\` must receive an object shaped as \`{ mission_title?: string, tasks: [...] }\`.
+  - All task semantics belong inside \`tasks[*]\`.
+  - Never place \`ownership_hint\`, \`mode_hint\`, \`goal\`, \`acceptance\`, \`constraints\`, \`context\`, or \`requires_modification\` at the top level.
 - **ownership_hint is required**: Specifies which Worker should execute the task. Choose from: \`frontend\`, \`backend\`, \`integration\`, \`data_analysis\`, \`general\`, or \`auto\`.
   - Prefer the most specific ownership. Use \`frontend\`/\`backend\`/\`integration\`/\`data_analysis\` whenever possible.
   - If one feature spans multiple owned domains, split it into multiple tasks first and assign each its own ownership_hint.
@@ -303,6 +306,9 @@ Changes are merged back to the main branch upon task completion. This enables tr
   - \`interface_contracts\`: Declare interface agreement text
   - \`freeze_files\`: Frozen files (this task is forbidden from modifying them)
 - files parameter (optional): Only provide when strictly scoping target files is necessary. Do not use files as a routine micro-management mechanism.
+- **Legacy protocol is forbidden**:
+  - Do not use legacy fields such as \`category\`, \`description\`, or a top-level single-task payload.
+  - Do not invent \`worker\` routing fields in \`worker_dispatch\`; routing is derived from \`ownership_hint\`.
 - Never narrate tool usage in plain text. Do not write sentences like \`调用 worker_dispatch\`, \`I will call worker_dispatch\`, or \`接下来 worker_wait\`. When you decide to use a tool, emit the actual tool call immediately instead of describing it in prose.
 - **Decomposition rules**:
   - If a feature contains both frontend and backend work, dispatch separate tasks such as \`[Backend] ...\` and \`[Frontend] ...\`, then add an \`integration\` task only when cross-task hookup or validation is needed.
@@ -360,15 +366,55 @@ When a task requires multi-phase coordination, use worker_dispatch + worker_wait
 
 **Example**:
 \`\`\`
-// Phase 1: Dispatch backend and frontend ownership tasks in parallel
-worker_dispatch({ ownership_hint: "backend", mode_hint: "implement", requires_modification: true, goal: “Implement the API and service logic for tag management”, acceptance: [“Tag CRUD endpoints are available”, “Validation and persistence are complete”], constraints: [“Preserve existing auth model”], context: [“The feature needs server-side tag management support”], scope_hint: [...] })  → task_id_1
-worker_dispatch({ ownership_hint: "frontend", mode_hint: "implement", requires_modification: true, goal: “Implement the tag management page and interaction flow”, acceptance: [“Users can view, create, edit, and delete tags from the UI”, “Loading and error states are handled”], constraints: [“Do not block on unfinished backend wiring; use the agreed contract”], context: [“The feature needs a dedicated admin UI for tag management”], scope_hint: [...] })  → task_id_2
+// Phase 1: Dispatch backend and frontend ownership tasks in one canonical batch
+worker_dispatch({
+  mission_title: "Implement tag management feature",
+  tasks: [
+    {
+      task_name: "[Backend] Implement tag management API",
+      ownership_hint: "backend",
+      mode_hint: "implement",
+      requires_modification: true,
+      goal: "Implement the API and service logic for tag management",
+      acceptance: ["Tag CRUD endpoints are available", "Validation and persistence are complete"],
+      constraints: ["Preserve existing auth model"],
+      context: ["The feature needs server-side tag management support"],
+      scope_hint: [...]
+    },
+    {
+      task_name: "[Frontend] Implement tag management UI",
+      ownership_hint: "frontend",
+      mode_hint: "implement",
+      requires_modification: true,
+      goal: "Implement the tag management page and interaction flow",
+      acceptance: ["Users can view, create, edit, and delete tags from the UI", "Loading and error states are handled"],
+      constraints: ["Do not block on unfinished backend wiring; use the agreed contract"],
+      context: ["The feature needs a dedicated admin UI for tag management"],
+      scope_hint: [...]
+    }
+  ]
+})  → [task_id_1, task_id_2]
 
 // Wait for Phase 1 to complete
 worker_wait()  → retrieve results for both tasks
 
 // After Phase 1 finishes and you have real prior task ids, dispatch Phase 2
-worker_dispatch({ ownership_hint: "integration", mode_hint: "implement", requires_modification: true, goal: “Align frontend/backend tag management behavior and fix final hookup issues”, acceptance: [“Frontend uses the final backend contract”, “End-to-end behavior is consistent”, “Cross-task gaps are closed without breaking ownership boundaries”], constraints: [“Do not re-implement backend or frontend work from scratch”], context: [“This phase exists only after domain tasks finish”], scope_hint: [...], depends_on: [task_id_1, task_id_2] })
+worker_dispatch({
+  tasks: [
+    {
+      task_name: "[Integration] Finalize tag management hookup",
+      ownership_hint: "integration",
+      mode_hint: "implement",
+      requires_modification: true,
+      goal: "Align frontend/backend tag management behavior and fix final hookup issues",
+      acceptance: ["Frontend uses the final backend contract", "End-to-end behavior is consistent", "Cross-task gaps are closed without breaking ownership boundaries"],
+      constraints: ["Do not re-implement backend or frontend work from scratch"],
+      context: ["This phase exists only after domain tasks finish"],
+      scope_hint: [...],
+      depends_on: [task_id_1, task_id_2]
+    }
+  ]
+})
 
 // Wait for Phase 2
 worker_wait()  → final results, summarize for the user

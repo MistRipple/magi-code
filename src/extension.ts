@@ -37,8 +37,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   localAgentManager = new LocalAgentManager(context.extensionPath);
   let agentBaseUrl = '';
   try {
-    await localAgentManager.ensureStarted();
-    agentBaseUrl = localAgentManager.getBaseUrl();
+    agentBaseUrl = await localAgentManager.ensureReadyBaseUrl();
     logger.info('扩展.Agent.已就绪', { baseUrl: agentBaseUrl }, LogCategory.SYSTEM);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -59,6 +58,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     context,
     workspaceFolders,
     agentBaseUrl,
+    localAgentManager,
   );
 
   // 注册 Webview Provider（壳）
@@ -231,7 +231,7 @@ function registerCommands(context: vscode.ExtensionContext): void {
       try {
         await localAgentManager.restart();
         if (webviewProvider) {
-          await webviewProvider.refreshAgentBaseUrl(localAgentManager.getBaseUrl());
+          await webviewProvider.refreshAgentBaseUrl(await localAgentManager.ensureReadyBaseUrl());
         }
         vscode.window.showInformationMessage('Local Agent 已重启');
       } catch (error) {

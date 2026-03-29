@@ -7,6 +7,8 @@
  * 设计依据：execution-resume-architecture.md §6.4
  */
 
+import type { WorkerSessionSnapshot } from '../worker';
+
 /**
  * 恢复快照
  *
@@ -106,6 +108,8 @@ export interface ResumeWorkerBranchContext {
   assignmentGroupId: string;
   /** Worker 会话 ID（用于沿用原 Worker session） */
   workerSessionId?: string;
+  /** Worker 会话快照（checkpoint 真相源） */
+  workerSessionSnapshot?: WorkerSessionSnapshot;
   /** 当前正在执行的 todo ID */
   currentTodoId?: string;
   /** 已完成的 todo ID 列表 */

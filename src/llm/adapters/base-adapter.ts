@@ -25,6 +25,7 @@ import { ToolManager, type ToolExecutionContext } from '../../tools/tool-manager
 import { MessageHub } from '../../orchestrator/core/message/message-hub';
 import { logger, LogCategory } from '../../logging';
 import { MESSAGE_EVENTS, ADAPTER_EVENTS } from '../../protocol/event-names';
+import { mergeToolPolicies } from '../../tools/tool-policy';
 import type {
   MessageMetadata,
   ToolCallBlock,
@@ -963,6 +964,10 @@ export abstract class BaseLLMAdapter extends EventEmitter {
       workerId: this.currentToolExecutionContext.workerId ?? base.workerId,
       role: this.currentToolExecutionContext.role ?? base.role,
       worktreePath: this.currentToolExecutionContext.worktreePath ?? base.worktreePath,
+      toolPolicy: mergeToolPolicies([
+        base.toolPolicy,
+        this.currentToolExecutionContext.toolPolicy,
+      ]),
     };
   }
 

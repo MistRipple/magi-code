@@ -317,6 +317,21 @@ export class MissionDrivenEngine extends EventEmitter {
       const snapshot = this.executionChainStore.exportSession(session.id);
       if (snapshot) {
         session.executionChains = snapshot;
+
+        // 增量快照：当存在 running 链且尚无快照时，自动采集 ResumeSnapshot。
+        // 这确保程序崩溃（非优雅中断）后 convergeOnStartup 能找到快照从而标记为 recoverable。
+        if (this.activeChainId) {
+          const activeChain = snapshot.chains.find(c => c.id === this.activeChainId);
+          if (activeChain && activeChain.status === 'running') {
+            const existingSnapshot = this.resumeSnapshotStore.getLatest(this.activeChainId);
+            if (!existingSnapshot) {
+              try {
+                this.captureResumeSnapshot(this.activeChainId);
+              } catch { /* 采集失败不阻塞保存 */ }
+            }
+          }
+        }
+
         const chainIds = snapshot.chains.map(c => c.id);
         const resumeSnapshots = this.resumeSnapshotStore.exportByChainIds(chainIds);
         if (resumeSnapshots.length > 0) {
@@ -2127,6 +2142,67 @@ export class MissionDrivenEngine extends EventEmitter {
   }
 
   /**
+   * 从 ResumeSnapshot 重建 Worker Session 恢复上下文
+   *
+   * 解决两个断层：
+   * 1. 进程重启后 DispatchResumeContextStore.missionWorkerSessions 映射丢失
+   * 2. 进程重启后 WorkerSessionManager.sessions 数据丢失
+   *
+   * 在 resumeChain() 中 prepareChainResume() 之后调用。
+   */
+  async restoreWorkerSessionsForResume(chainId: string): Promise<void> {
+    const snapshot = this.resumeSnapshotStore.getLatest(chainId);
+    if (!snapshot) return;
+
+    const missionId = snapshot.mainline.currentMissionId;
+    if (!missionId) return;
+
+    let restoredMappings = 0;
+    let restoredSessions = 0;
+
+    for (const wb of snapshot.workerBranches) {
+      if (!wb.workerSessionId || !wb.workerSlot) continue;
+
+      // 1. 重建 missionWorkerSessions 映射（同进程/跨进程通用）
+      this.dispatchManager.recordWorkerSessionForResume(
+        missionId, wb.workerSlot as WorkerSlot, wb.workerSessionId,
+      );
+      restoredMappings++;
+
+      // 2. 从 snapshot 恢复 WorkerSession 数据到 SessionManager
+      if (wb.workerSessionSnapshot) {
+        try {
+          const worker = await this.missionOrchestrator.ensureWorkerForDispatch(
+            wb.workerSlot as WorkerSlot,
+          );
+          // 仅在 session 不存在时导入（避免覆盖同进程中仍存活的 session）
+          const existingSession = worker.getSessionManager().get(wb.workerSessionId);
+          if (!existingSession) {
+            worker.getSessionManager().importSnapshots([wb.workerSessionSnapshot]);
+            restoredSessions++;
+          }
+        } catch (error) {
+          logger.warn('编排器.WorkerSession.恢复导入失败', {
+            workerSlot: wb.workerSlot,
+            sessionId: wb.workerSessionId,
+            error: error instanceof Error ? error.message : String(error),
+          }, LogCategory.ORCHESTRATOR);
+        }
+      }
+    }
+
+    if (restoredMappings > 0 || restoredSessions > 0) {
+      logger.info('编排器.WorkerSession.恢复完成', {
+        chainId,
+        missionId,
+        restoredMappings,
+        restoredSessions,
+        totalBranches: snapshot.workerBranches.length,
+      }, LogCategory.ORCHESTRATOR);
+    }
+  }
+
+  /**
    * 初始化引擎
    */
   async initialize(): Promise<void> {
@@ -2266,6 +2342,10 @@ export class MissionDrivenEngine extends EventEmitter {
           attempt: existingChain.attempt,
         }, LogCategory.ORCHESTRATOR);
       } else {
+        // 非 resume 路径（新请求）：废弃同 session 所有旧的 interrupted 链。
+        // 用户发送任何新消息（无论走 direct_response / task_execution / lightweight_analysis），
+        // 都意味着之前中断的任务不再需要恢复——"继续"语义仅对"最近一轮"有效。
+        this.executionChainStore.expireRecoverableChains(resolvedSession);
         // 新任务路径：创建新链
         const chain = this.executionChainStore.createChain({
           sessionId: resolvedSession,
@@ -2319,7 +2399,10 @@ export class MissionDrivenEngine extends EventEmitter {
           requestId: rootRequestId,
         });
         this.syncMessageHubSessionContext(resolvedSessionId);
-        this.dispatchManager.resetForNewExecutionCycle();
+        // checkpoint resume 时保留 worker session resume context，避免恢复信息被清空
+        this.dispatchManager.resetForNewExecutionCycle(
+          isResumingChain ? { preserveResumeContext: true } : undefined
+        );
         await this.ensureContextReady(resolvedSessionId);
 
         const adapterPlanMode: PlanMode = this.resolveRequestedPlanningMode();
@@ -2480,7 +2563,7 @@ export class MissionDrivenEngine extends EventEmitter {
             strengths: p.persona.strengths,
             assignedCategories: p.assignedCategories,
           }));
-        const availableToolsSummary = await this.getAvailableToolsSummary();
+        const availableToolsSummary = await this.getAvailableToolsSummary(requirementAnalysis.toolPolicy);
 
         // 获取分类定义（用于系统提示词的分工映射表）
         const allCategories = this.profileLoader.getAllCategories();
@@ -3060,10 +3143,10 @@ export class MissionDrivenEngine extends EventEmitter {
    * 获取可用工具摘要（供统一系统提示词使用）
    * 委托 ToolManager.buildToolsSummary() 生成，保持单一 source of truth
    */
-  private async getAvailableToolsSummary(): Promise<string> {
+  private async getAvailableToolsSummary(toolPolicy?: import('../../tools/tool-policy').EffectiveToolPolicy): Promise<string> {
     try {
       const toolManager = this.adapterFactory.getToolManager();
-      return await toolManager.buildToolsSummary({ role: 'orchestrator' });
+      return await toolManager.buildToolsSummary({ role: 'orchestrator', toolPolicy });
     } catch (error) {
       logger.warn('获取工具摘要失败', { error }, LogCategory.ORCHESTRATOR);
       return '';
@@ -4367,21 +4450,33 @@ export class MissionDrivenEngine extends EventEmitter {
           summary: e.result!.summary || '',
         }));
 
-      // 收集 worker 分支信息
+      // 收集 worker 分支信息（从真实 worker session 采集 checkpoint）
       const workerBranches = this.executionChainQuery
         .getChainBranches(chainId)
         .filter(b => b.kind === 'worker')
-        .map(branch => ({
-          branchId: branch.id,
-          workerSlot: branch.workerSlot || 'unknown',
-          assignmentGroupId: branch.assignmentGroupId || '',
-          workerSessionId: undefined as string | undefined,
-          currentTodoId: undefined as string | undefined,
-          completedTodoIds: [] as string[],
-          pendingTodoIds: [] as string[],
-          contextDigest: [] as string[],
-          latestSummary: undefined as string | undefined,
-        }));
+        .map(branch => {
+          const workerSlot = branch.workerSlot || 'unknown';
+          // 通过 dispatch entries 找到对应的 taskId（即 assignmentId）
+          const matchingEntry = entries.find(e => e.worker === workerSlot);
+          const taskId = matchingEntry?.taskId;
+          // 从真实 worker session 导出 checkpoint
+          const sessionSnapshot = taskId
+            ? this.missionOrchestrator.exportWorkerSessionSnapshotByAssignment(
+                workerSlot as WorkerSlot, taskId)
+            : null;
+          return {
+            branchId: branch.id,
+            workerSlot,
+            assignmentGroupId: branch.assignmentGroupId || '',
+            workerSessionId: sessionSnapshot?.id,
+            workerSessionSnapshot: sessionSnapshot ?? undefined,
+            currentTodoId: undefined as string | undefined,
+            completedTodoIds: sessionSnapshot?.completedTodos ?? [],
+            pendingTodoIds: [] as string[],
+            contextDigest: [] as string[],
+            latestSummary: matchingEntry?.result?.summary,
+          };
+        });
 
       this.resumeSnapshotBuilder.build({
         chain,
@@ -4416,6 +4511,18 @@ export class MissionDrivenEngine extends EventEmitter {
         missionId: this.lastMissionId,
         planId: this.currentPlanId,
       }, LogCategory.ORCHESTRATOR);
+
+      // 将 worker session 映射回填到 DispatchResumeContextStore，
+      // 确保同进程中断-恢复时 activateResumeContext 能找到 worker session
+      if (this.lastMissionId) {
+        for (const wb of workerBranches) {
+          if (wb.workerSessionId && wb.workerSlot) {
+            this.dispatchManager.recordWorkerSessionForResume(
+              this.lastMissionId, wb.workerSlot as WorkerSlot, wb.workerSessionId,
+            );
+          }
+        }
+      }
     } catch (error) {
       logger.warn('编排器.恢复快照.构建失败', {
         chainId,
@@ -4467,7 +4574,7 @@ export class MissionDrivenEngine extends EventEmitter {
       : null;
 
     return {
-      hasRecoverableChain: recoverableChain !== null,
+      hasRecoverableChain: recoverableChain != null,
       recoverableChainId: recoverableChain?.id,
       recoverableChainTitle: recoverableChain?.currentMissionId,
       lastChainStatus: lastChain?.status,

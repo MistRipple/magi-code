@@ -530,7 +530,7 @@ export class DispatchManager {
    * 目的：彻底切断上一轮归档 batch、完成队列与反应式标记，
    * 避免“无 dispatch 的新一轮”被误判为存在历史 dispatch。
    */
-  resetForNewExecutionCycle(): void {
+  resetForNewExecutionCycle(options?: { preserveResumeContext?: boolean }): void {
     if (this.activeBatch?.status === 'active') {
       this.activeBatch.cancelAll(t('dispatch.batch.resetCancelReason'));
     }
@@ -541,7 +541,10 @@ export class DispatchManager {
     this.activeWorkerLanes.clear();
     this.protocolManager.clearAll();
     this.scheduler.clearScheduleTimers();
-    this.clearResumeContext();
+    // checkpoint resume 时保留 resume context，避免 worker session 恢复信息被清空
+    if (!options?.preserveResumeContext) {
+      this.clearResumeContext();
+    }
     this.nonGitWriteSerializationNoticeShown = false;
     // 清空 dispatch 文件写入追踪表，避免跨执行周期的误判
     this.deps.adapterFactory.getToolManager().clearDispatchFileWriteTracker();
@@ -615,6 +618,20 @@ export class DispatchManager {
     workerSessionId: string,
   ): void {
     this.resumeContextStore.recordWorkerSession(missionId, worker, workerSessionId);
+  }
+
+  /**
+   * 回填 worker session 映射（用于中断快照采集后补录）
+   *
+   * captureResumeSnapshot 采集到 workerBranch 的 sessionId 后调用，
+   * 确保同进程恢复时 activateResumeContext 能找到 worker session。
+   */
+  recordWorkerSessionForResume(
+    missionId: string,
+    worker: WorkerSlot,
+    workerSessionId: string,
+  ): void {
+    this.recordMissionWorkerSession(missionId, worker, workerSessionId);
   }
 
   /**
@@ -1869,6 +1886,7 @@ export class DispatchManager {
               adapterFactory: this.deps.adapterFactory,
               workspaceRoot: this.deps.workspaceRoot,
               planningMode: this.resolveCurrentPlanningMode(),
+              taskMode: taskContract.mode,
               projectContext,
               // 与 Todo/Assignment 使用同一真实 missionId，避免终止快照作用域错位。
               missionId,
