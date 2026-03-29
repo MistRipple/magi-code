@@ -2425,6 +2425,17 @@ export class MissionDrivenEngine extends EventEmitter {
           classification: entryResolution.classification,
         });
 
+        // 模式降级通知：用户请求 Deep 但模型能力不支持，已静默降级为 Standard
+        if (effectiveMode.degraded && effectiveMode.degradedReason) {
+          this.messageHub.notify(effectiveMode.degradedReason, 'warning');
+          logger.warn('编排器.模式降级', {
+            requestedMode: effectiveMode.requestedPlanningMode,
+            effectiveMode: effectiveMode.planningMode,
+            modelCapability: effectiveMode.modelCapability,
+            reason: effectiveMode.degradedReason,
+          }, LogCategory.ORCHESTRATOR);
+        }
+
         const resumeMissionIdForExecution = this.resumeMissionId?.trim();
 
         // Resume 短路：恢复中断任务时，强制走 task_execution 路径。

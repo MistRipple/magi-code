@@ -26,6 +26,7 @@ import { logger, LogCategory } from '../../logging';
 import { t } from '../../i18n';
 import { isModelOriginIssue } from '../../errors/model-origin';
 import { hasExplicitWorkerDispatchIntent } from '../../orchestrator/core/request-classifier';
+import { resolveOrchestratorBudget, resolveNoProgressStreakThreshold } from '../../orchestrator/core/governance-profile';
 import { normalizeNextSteps } from '../../utils/content-parser';
 import { isRetryableNetworkError, toErrorMessage, buildStreamRecoveryPrompt, deduplicateResumption } from '../../tools/network-utils';
 import {
@@ -81,8 +82,6 @@ export interface OrchestratorAdapterConfig {
   messageHub: MessageHub;  // 🔧 统一消息通道：替代 messageBus
   systemPrompt?: string;
   historyConfig?: OrchestratorHistoryConfig;
-  /** 深度任务模式（项目级）：提高总轮次预算 */
-  deepTask?: boolean;
 }
 
 export interface OrchestratorRuntimeState {
@@ -306,10 +305,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   private static readonly STALLED_WINDOW_SIZE = 5;
   /** 终止治理：外部等待超时（毫秒） */
   private static readonly EXTERNAL_WAIT_SLA_MS = 180_000;
-  /** 终止治理：预算门禁要求连续无进展轮次（标准模式） */
-  private static readonly BUDGET_NO_PROGRESS_STREAK_THRESHOLD = 2;
-  /** 终止治理：预算门禁要求连续无进展轮次（深度模式） */
-  private static readonly DEEP_BUDGET_NO_PROGRESS_STREAK_THRESHOLD = 3;
+  // 无进展容忍轮次已提取至 governance-profile.ts，通过 resolveNoProgressStreakThreshold(mode) 获取
   /** 终止治理：关键路径重基线阈值 */
   private static readonly CP_REBASE_THRESHOLD = 0.10;
   /** 终止治理：上游模型连续错误阈值 */
@@ -324,20 +320,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   private static readonly BUDGET_HARD_LIMIT_FACTOR = 1.2;
   /** 终止治理：外部等待硬阈值放大系数（超过即立即终止，无需去抖） */
   private static readonly EXTERNAL_WAIT_HARD_LIMIT_FACTOR = 1.5;
-  /** 终止治理：标准模式预算 */
-  private static readonly STANDARD_BUDGET = {
-    maxDurationMs: 420_000,
-    maxTokenUsage: 120_000,
-    maxErrorRate: 0.7,
-    maxRounds: 30,
-  };
-  /** 终止治理：深度模式预算 */
-  private static readonly DEEP_BUDGET = {
-    maxDurationMs: 900_000,
-    maxTokenUsage: 280_000,
-    maxErrorRate: 0.8,
-    maxRounds: 80,
-  };
+  // 编排者预算已提取至 governance-profile.ts，通过 resolveOrchestratorBudget(mode) 获取
   /** 网络韧性：编排者单次请求超时 */
   private static readonly REQUEST_TIMEOUT_MS = 90_000;
   /** 网络韧性：编排者请求重试策略 */
@@ -358,9 +341,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   private abortController?: AbortController;
   private historyConfig: Required<OrchestratorHistoryConfig>;
   private rollingContextSummary: string | null = null;
-  /** 深度任务模式（项目级）：提高总轮次预算 */
-  private readonly deepTask: boolean;
-  /** 统一终止/门禁决策引擎（按规划模式区分） */
+  /** 统一终止/门禁决策引擎（按规划模式区分，运行时通过 planningMode 选择） */
   private readonly standardDecisionEngine: OrchestratorDecisionEngine;
   private readonly deepDecisionEngine: OrchestratorDecisionEngine;
 
@@ -387,7 +368,6 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
       adapterConfig.messageHub  // 🔧 统一消息通道：使用 messageHub
     );
     this.systemPrompt = adapterConfig.systemPrompt ?? '';
-    this.deepTask = adapterConfig.deepTask ?? false;
     this.standardDecisionEngine = this.createDecisionEngine(false);
     this.deepDecisionEngine = this.createDecisionEngine(true);
     this.historyConfig = {
@@ -398,14 +378,13 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
   }
 
   private createDecisionEngine(deepTask: boolean): OrchestratorDecisionEngine {
+    const mode: PlanMode = deepTask ? 'deep' : 'standard';
     return new OrchestratorDecisionEngine({
       stalledWindowSize: OrchestratorLLMAdapter.STALLED_WINDOW_SIZE,
       externalWaitSlaMs: OrchestratorLLMAdapter.EXTERNAL_WAIT_SLA_MS,
       upstreamModelErrorStreak: OrchestratorLLMAdapter.UPSTREAM_MODEL_ERROR_STREAK,
       errorRateMinSamples: OrchestratorLLMAdapter.ERROR_RATE_MIN_SAMPLES,
-      budgetNoProgressStreakThreshold: deepTask
-        ? OrchestratorLLMAdapter.DEEP_BUDGET_NO_PROGRESS_STREAK_THRESHOLD
-        : OrchestratorLLMAdapter.BUDGET_NO_PROGRESS_STREAK_THRESHOLD,
+      budgetNoProgressStreakThreshold: resolveNoProgressStreakThreshold(mode),
       budgetBreachStreakThreshold: OrchestratorLLMAdapter.BUDGET_BREACH_STREAK_THRESHOLD,
       externalWaitBreachStreakThreshold: OrchestratorLLMAdapter.EXTERNAL_WAIT_BREACH_STREAK_THRESHOLD,
       budgetHardLimitFactor: OrchestratorLLMAdapter.BUDGET_HARD_LIMIT_FACTOR,
@@ -1143,9 +1122,7 @@ export class OrchestratorLLMAdapter extends BaseLLMAdapter {
     const decisionEngine = this.getDecisionEngineForPlanningMode(planningMode);
     let effectiveToolPolicy = initialToolPolicy;
 
-    const budget: OrchestratorExecutionBudget = effectiveDeepTask
-      ? OrchestratorLLMAdapter.DEEP_BUDGET
-      : OrchestratorLLMAdapter.STANDARD_BUDGET;
+    const budget: OrchestratorExecutionBudget = resolveOrchestratorBudget(planningMode);
     const initiatingUserMessage = this.extractLatestUserMessage(history);
 
     try {

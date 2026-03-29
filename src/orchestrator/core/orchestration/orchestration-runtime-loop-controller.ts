@@ -252,6 +252,7 @@ export class OrchestrationRuntimeLoopController {
       lastAutoRepairSignature: '',
       autoRepairStallStreak: 0,
       governanceRecoveryAttempt: 0,
+      totalRecoveryRounds: 0,
     };
     let promptForRound = input.prompt;
     let currentRoundRequestId = input.rootRequestId;

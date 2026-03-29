@@ -21,6 +21,7 @@ import { AgentType, LLMConfig, WorkerSlot, TokenUsage, ModelAutonomyCapability }
 import { BaseLLMAdapter } from './adapters/base-adapter';
 import { WorkerLLMAdapter, WorkerAdapterConfig, getStallDetectionPreset } from './adapters/worker-adapter';
 import { OrchestratorLLMAdapter, OrchestratorAdapterConfig } from './adapters/orchestrator-adapter';
+import { resolveGovernanceProfile } from '../orchestrator/core/governance-profile';
 import { LLMConfigLoader } from './config';
 import { createLLMClient } from './clients/client-factory';
 import { createNormalizer } from '../normalizer';
@@ -281,13 +282,15 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     const normalizer = createNormalizer(workerSlot, 'worker', false);
 
     // 创建适配器（注入 MessageHub）
-    const deepTask = this.isDeepTask();
+    const planningMode = this.getRequestedPlanningMode();
     const stallConfig = getStallDetectionPreset(workerSlot);
-    if (deepTask) {
-      // 深度任务模式（项目级）：提高轮次预算（约 3 倍），但仍保持硬上限避免失控循环
+    // Worker 轮次预算：通过 GovernanceProfile 的倍率系数计算，而非硬编码
+    // 使用 'complex' 作为保守基准（创建 Worker 时尚不知道具体请求的 complexity）
+    const governance = resolveGovernanceProfile(planningMode, 'complex');
+    if (governance.workerRoundsMultiplier > 1) {
       stallConfig.maxTotalRounds = Math.max(
         stallConfig.maxTotalRounds + 20,
-        Math.ceil(stallConfig.maxTotalRounds * 3)
+        Math.ceil(stallConfig.maxTotalRounds * governance.workerRoundsMultiplier)
       );
     }
     const adapterConfig: WorkerAdapterConfig = {
@@ -365,14 +368,12 @@ export class LLMAdapterFactory extends EventEmitter implements IAdapterFactory {
     const normalizer = createNormalizer('claude', 'orchestrator', false, 'orchestrator');
 
     // 创建适配器（注入 MessageHub）
-    const deepTask = this.isDeepTask();
     const adapterConfig: OrchestratorAdapterConfig = {
       client,
       normalizer,
       toolManager: this.toolManager,
       config: orchestratorConfig,
       messageHub: this.getMessageHub(),  // 🔧 统一消息通道：使用 messageHub
-      deepTask,
     };
 
     const adapter = new OrchestratorLLMAdapter(adapterConfig);

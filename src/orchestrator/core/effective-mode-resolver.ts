@@ -12,6 +12,10 @@ export interface EffectiveModeResolution {
   modelCapability: ModelAutonomyCapability;
   allowDeepContinuation: boolean;
   allowAutoGovernanceResume: boolean;
+  /** 是否发生了模式降级（用户请求 deep 但实际降级为 standard） */
+  degraded: boolean;
+  /** 降级原因（仅当 degraded 为 true 时有值） */
+  degradedReason?: string;
 }
 
 function isCapability(value: unknown): value is ModelAutonomyCapability {
@@ -75,9 +79,11 @@ export function resolveModelAutonomyCapability(
 export function resolveEffectiveMode(input: EffectiveModeInput): EffectiveModeResolution {
   const modelCapability = input.modelCapability ?? 'C3';
   const allowsDeepPlanning = modelCapability === 'C1' || modelCapability === 'C3';
-  const planningMode: PlanMode = input.planningMode === 'deep' && allowsDeepPlanning
+  const requestedDeep = input.planningMode === 'deep';
+  const planningMode: PlanMode = requestedDeep && allowsDeepPlanning
     ? 'deep'
     : 'standard';
+  const degraded = requestedDeep && !allowsDeepPlanning;
 
   return {
     planningMode,
@@ -85,5 +91,9 @@ export function resolveEffectiveMode(input: EffectiveModeInput): EffectiveModeRe
     modelCapability,
     allowDeepContinuation: planningMode === 'deep',
     allowAutoGovernanceResume: true,
+    degraded,
+    degradedReason: degraded
+      ? `当前模型自治能力为 ${modelCapability}，Deep 模式要求 C1 或 C3，已自动降级为 Standard 模式`
+      : undefined,
   };
 }

@@ -15,12 +15,16 @@ import type { MissionStorageManager } from '../../mission';
 import { PlanLedgerService, type PlanRuntimePhaseState } from '../../plan-ledger';
 import type { DeliveryRoundState } from './orchestration-delivery-controller';
 
+import { resolveGovernanceProfile } from '../governance-profile';
+
 export interface RecoveryLoopState {
   autoRepairAttempt: number;
   autoContinuationAttempt: number;
   lastAutoRepairSignature: string;
   autoRepairStallStreak: number;
   governanceRecoveryAttempt: number;
+  /** 累计恢复轮次（跨 auto_repair / auto_continuation / governance_resume） */
+  totalRecoveryRounds: number;
 }
 
 export interface RecoveryCoordinationInput {
@@ -151,12 +155,17 @@ export interface OrchestrationRecoveryCoordinatorDependencies {
 export class OrchestrationRecoveryCoordinator {
   private static readonly AUTO_REPAIR_STALL_THRESHOLD = 3;
   private static readonly GOVERNANCE_RECOVERY_DELAYS = [10000, 20000, 30000, 40000, 50000];
+  // 总恢复轮次上限已提取至 governance-profile.ts，按 mode × complexity 动态获取
 
   constructor(
     private readonly deps: OrchestrationRecoveryCoordinatorDependencies,
   ) {}
 
   async coordinate(input: RecoveryCoordinationInput): Promise<RecoveryCoordinationResult> {
+    // 基于当前 mode 动态获取恢复轮次上限（而非硬编码常量）
+    const governanceForRecovery = resolveGovernanceProfile(input.effectiveMode.planningMode, 'complex');
+    const totalRecoveryRoundsLimit = governanceForRecovery.totalRecoveryRoundsLimit;
+
     const autoRepairMaxRounds = this.resolveAutoRepairMaxRounds();
     const autoRepairMaxRoundsLabel = autoRepairMaxRounds > 0
       ? autoRepairMaxRounds
@@ -197,6 +206,8 @@ export class OrchestrationRecoveryCoordinator {
     }
 
     const canAutoRepairByRounds = autoRepairMaxRounds === 0 || state.autoRepairAttempt < autoRepairMaxRounds;
+    // 总恢复轮次门控：超过硬上限时禁止任何恢复循环
+    const totalRecoveryExhausted = state.totalRecoveryRounds >= totalRecoveryRoundsLimit;
     const structuredRequiredTotal = this.deps.helpers.resolveRequiredTotal(input.runtimeSnapshot) ?? 0;
     const hasStructuredExecutionContext = structuredRequiredTotal > 0;
     const shouldFinalizeOrchestrationContractFailure =
@@ -214,7 +225,7 @@ export class OrchestrationRecoveryCoordinator {
       governanceRecoveryMaxRounds,
       deliveryFailed: input.deliveryState.deliveryStatusForMission === 'failed',
       continuationPolicy: input.deliveryState.continuationPolicyForMission,
-      canAutoRepairByRounds: canAutoRepairByRounds && hasStructuredExecutionContext,
+      canAutoRepairByRounds: canAutoRepairByRounds && hasStructuredExecutionContext && !totalRecoveryExhausted,
       autoRepairStalled,
     });
 
@@ -249,6 +260,7 @@ export class OrchestrationRecoveryCoordinator {
       }
 
       state.autoRepairAttempt += 1;
+      state.totalRecoveryRounds += 1;
       const nextPrompt = this.deps.helpers.buildAutoRepairPrompt({
         originalPrompt: input.prompt,
         goal: input.requirementAnalysis.goal,
@@ -308,7 +320,7 @@ export class OrchestrationRecoveryCoordinator {
     }
 
     const governanceRecoveryDecision = decideGovernanceRecovery({
-      allowAutoGovernanceResume: input.effectiveMode.allowAutoGovernanceResume,
+      allowAutoGovernanceResume: input.effectiveMode.allowAutoGovernanceResume && !totalRecoveryExhausted,
       isGovernancePaused: isGovernancePaused === true,
       governanceReason: normalizedRuntimeReason,
       governanceRecoveryAttempt: state.governanceRecoveryAttempt,
@@ -319,6 +331,7 @@ export class OrchestrationRecoveryCoordinator {
     });
     if (governanceRecoveryDecision.action === 'auto_governance_resume') {
       state.governanceRecoveryAttempt += 1;
+      state.totalRecoveryRounds += 1;
       const delayMs = OrchestrationRecoveryCoordinator.GOVERNANCE_RECOVERY_DELAYS[state.governanceRecoveryAttempt - 1] ?? 0;
       const reasonLabel = this.deps.helpers.formatGovernanceReason(normalizedRuntimeReason);
       const waitSeconds = Math.max(1, Math.round(delayMs / 1000));
@@ -447,7 +460,7 @@ export class OrchestrationRecoveryCoordinator {
     }
 
     const continuationDecision = decideContinuationAction({
-      allowDeepContinuation: input.effectiveMode.allowDeepContinuation,
+      allowDeepContinuation: input.effectiveMode.allowDeepContinuation && !totalRecoveryExhausted,
       isGovernancePaused: isGovernancePaused === true,
       phaseRuntime: phaseRuntimeForDecision,
     });
@@ -466,6 +479,7 @@ export class OrchestrationRecoveryCoordinator {
       }
 
       state.autoContinuationAttempt += 1;
+      state.totalRecoveryRounds += 1;
       await this.deps.helpers.markPhaseRuntimeRunning({
         sessionId: input.sessionId,
         followUpSteps: effectiveFollowUpSteps,
