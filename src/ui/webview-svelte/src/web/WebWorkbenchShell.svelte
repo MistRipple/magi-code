@@ -201,6 +201,9 @@
     });
   }
 
+  // 缓存的可见工作区列表（避免模板中每次渲染都重新过滤）
+  const visibleWorkspaces = $derived(getVisibleWorkspaces());
+
   function syncBrowserSessionBinding(workspaceId: string, workspacePath: string, sessionId: string | null): void {
     if (typeof window === 'undefined') {
       return;
@@ -694,13 +697,13 @@
           <div class="sidebar-error-title">工作区列表不可用</div>
           <div>{loadError}</div>
         </div>
-      {:else if getVisibleWorkspaces().length === 0}
+      {:else if visibleWorkspaces.length === 0}
         <div class="sidebar-empty">未找到匹配的工作区或会话</div>
       {:else if workspaces.length === 0}
         <div class="sidebar-empty">暂无已注册工作区</div>
       {:else}
         <div class="workspace-tree">
-          {#each getVisibleWorkspaces() as workspace (workspace.workspaceId)}
+          {#each visibleWorkspaces as workspace (workspace.workspaceId)}
             <div class="workspace-node">
               <button
                 type="button"
@@ -1132,6 +1135,7 @@
     cursor: pointer;
     text-align: left;
     transition: background var(--transition-fast), border-color var(--transition-fast);
+    touch-action: manipulation;
     min-width: 0;
     overflow: hidden;
   }
