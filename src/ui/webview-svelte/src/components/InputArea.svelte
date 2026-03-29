@@ -7,7 +7,6 @@
     getQueuedMessages,
     getRequestBinding,
     messagesState,
-    setIsProcessing,
   } from '../stores/messages.svelte';
   import type { StandardMessage } from '../../../../protocol/message-protocol';
   import { MessageCategory } from '../../../../protocol/message-protocol';
@@ -170,11 +169,6 @@
         requestId,
         images: selectedImages.map(img => ({ dataUrl: img.dataUrl })),
       });
-      // 乐观更新：立即标记为处理中 + 清空输入，
-      // 防止快速连续发送时后续消息也走 executeTask 路径而非排队路径。
-      // 后端 SSE 推送 processingState 后会覆盖此值；请求失败时 bridge 层会回退到 idle。
-      setIsProcessing(true);
-      clearComposerState();
     }
   }
 

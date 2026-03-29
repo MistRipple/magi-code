@@ -67,6 +67,7 @@ import {
   revertAgentMissionChanges,
   revertAllAgentChanges,
   resumeAgentTask,
+  resumeAgentChain,
   abandonAgentChain,
   testAgentAuxiliaryConnection,
   testAgentOrchestratorConnection,
@@ -1556,6 +1557,13 @@ export function createWebClientBridge(): ClientBridge {
           if (typeof message.taskId === 'string' && message.taskId.trim()) {
             void deleteTask(message.taskId).catch((error) => {
               logBridgeOperationFailure('删除任务', '[web-client-bridge] 删除任务失败:', error);
+            });
+          }
+          return;
+        case 'resumeChain':
+          if (typeof message.sessionId === 'string' && message.sessionId.trim()) {
+            void resumeAgentChain(message.sessionId).catch((error) => {
+              logBridgeOperationFailure('恢复执行链', '[web-client-bridge] 恢复执行链失败:', error);
             });
           }
           return;

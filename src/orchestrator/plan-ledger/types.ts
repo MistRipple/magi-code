@@ -186,6 +186,10 @@ export interface PlanRecord {
   items: PlanItem[];
   attempts: PlanAttemptRecord[];
   links: PlanLinks;
+  /** 恢复保护标记：当 plan 关联的 execution chain 被中断（interrupted）时置 true，
+   *  阻止任何路径（finalize、computePlanStatus、reconcile 等）将 plan 推入终态。
+   *  resume 时解除。 */
+  recoveryProtected?: boolean;
   createdAt: number;
   updatedAt: number;
 }

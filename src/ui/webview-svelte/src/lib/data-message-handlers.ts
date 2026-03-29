@@ -34,6 +34,7 @@ import {
   getActiveInteractionType,
   applySessionNotifications,
   batchWebviewStatePersistence,
+  setInterruptedChain,
 } from '../stores/messages.svelte';
 import type {
   AppState, Session, MissionPlan, AssignmentPlan,
@@ -209,6 +210,8 @@ export function handleUnifiedControlMessage(standard: StandardMessage) {
       break;
 
     case 'task_accepted': {
+      // 任务被接受：清除中断链状态（resume 或新任务开始）
+      setInterruptedChain(null);
       // 防御性检查：backendProcessing 仍为 false 时先设置处理状态
       const requestId = payload?.requestId as string | undefined;
       if (requestId) {
@@ -478,6 +481,16 @@ export function handleUnifiedData(standard: StandardMessage) {
     case 'orchestratorRuntimeState':
       handleOrchestratorRuntimeState(asMessage(payload));
       break;
+
+    case 'executionChainInterrupted': {
+      const chainPayload = payload as Record<string, unknown>;
+      const chainId = typeof chainPayload.chainId === 'string' ? chainPayload.chainId : '';
+      const recoverable = chainPayload.recoverable === true;
+      if (chainId) {
+        setInterruptedChain({ chainId, recoverable });
+      }
+      break;
+    }
 
     case 'clarificationRequest':
       handleClarificationRequest(asMessage(payload));

@@ -116,7 +116,7 @@ const PLAN_STATUS_TRANSITIONS: Record<PlanStatus, PlanStatus[]> = {
   approved: ['executing', 'failed', 'cancelled', 'superseded', 'completed'],
   rejected: [],
   executing: ['partially_completed', 'completed', 'failed', 'cancelled'],
-  partially_completed: ['completed', 'failed', 'cancelled'],
+  partially_completed: ['executing', 'completed', 'failed', 'cancelled'],
   completed: [],
   failed: [],
   cancelled: [],
@@ -327,9 +327,44 @@ export class PlanLedgerService extends EventEmitter {
       if (!this.tryTransitionPlanStatus(record, 'executing', 'markExecuting', options?.auditReason)) {
         return null;
       }
+      // 进入执行态时解除恢复保护（resume 场景）
+      if (record.recoveryProtected) {
+        record.recoveryProtected = false;
+      }
       record.updatedAt = Date.now();
       this.persistPlan(record);
       this.emitUpdated(record, 'executing');
+      return record;
+    });
+  }
+
+  /**
+   * 设置/解除恢复保护。
+   *
+   * 保护期间 tryTransitionPlanStatus 会拒绝一切终态迁移，
+   * 保证 plan 在中断后不会被异步事件推入终态。
+   */
+  async setRecoveryProtection(
+    sessionId: string,
+    planId: string,
+    protect: boolean,
+  ): Promise<PlanRecord | null> {
+    return this.runWithSessionQueue(sessionId, async () => {
+      const record = this.loadPlan(sessionId, planId);
+      if (!record) {
+        return null;
+      }
+      if (record.recoveryProtected === protect) {
+        return record;
+      }
+      record.recoveryProtected = protect;
+      record.updatedAt = Date.now();
+      this.persistPlan(record);
+      logger.info('计划账本.恢复保护', {
+        planId,
+        protect,
+        currentStatus: record.status,
+      }, LogCategory.ORCHESTRATOR);
       return record;
     });
   }
@@ -1711,6 +1746,16 @@ export class PlanLedgerService extends EventEmitter {
     }
     const allowed = PLAN_STATUS_TRANSITIONS[current] || [];
     if (allowed.includes(nextStatus)) {
+      // 恢复保护：阻止任何路径将受保护的 plan 推入终态
+      if (record.recoveryProtected && TERMINAL_PLAN_STATUSES.has(nextStatus)) {
+        logger.info('计划账本.恢复保护.拒绝终态迁移', {
+          planId: record.planId,
+          from: current,
+          to: nextStatus,
+          op,
+        }, LogCategory.ORCHESTRATOR);
+        return false;
+      }
       record.status = nextStatus;
       return true;
     }

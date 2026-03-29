@@ -74,6 +74,10 @@ export class ResumeSnapshotBuilder {
         pendingTaskIds: [...input.dispatch.pendingTaskIds],
         runningTaskIds: [...input.dispatch.runningTaskIds],
         completedTaskIds: [...input.dispatch.completedTaskIds],
+        cancelledTaskIds: input.dispatch.cancelledTaskIds ? [...input.dispatch.cancelledTaskIds] : [],
+        completedWorkerSummaries: input.dispatch.completedWorkerSummaries
+          ? input.dispatch.completedWorkerSummaries.map(s => ({ ...s }))
+          : [],
       },
       workerBranches: input.workerBranches.map((wb) => ({
         branchId: wb.branchId,

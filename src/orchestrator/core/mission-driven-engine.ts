@@ -2249,19 +2249,36 @@ export class MissionDrivenEngine extends EventEmitter {
         : `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       this.activeRoundRequestId = rootRequestId;
 
-      // 创建执行链记录
+      // 创建执行链记录（resume 时复用已有链）
       const resolvedSession = sessionId || this.sessionManager.getCurrentSession()?.id || taskId;
-      const chain = this.executionChainStore.createChain({
-        sessionId: resolvedSession,
-        userMessageId: this.currentTurnId,
-        requestId: rootRequestId,
-      });
-      this.activeChainId = chain.id;
-      // 创建主线分支
-      this.executionChainStore.createBranch({
-        chainId: chain.id,
-        kind: 'mainline',
-      });
+      const isResumingChain = this.activeChainId && (() => {
+        const existingChain = this.executionChainStore.getChain(this.activeChainId!);
+        return existingChain?.status === 'resuming';
+      })();
+
+      if (isResumingChain) {
+        // resume 路径：activeChainId 已由 prepareChainResume() 设置，
+        // chain 状态为 resuming，递增 attempt，不创建新链
+        const existingChain = this.executionChainStore.getChain(this.activeChainId!)!;
+        this.executionChainStore.transitionChainStatus(this.activeChainId!, 'running');
+        logger.info('编排器.执行链.恢复执行', {
+          chainId: this.activeChainId,
+          attempt: existingChain.attempt,
+        }, LogCategory.ORCHESTRATOR);
+      } else {
+        // 新任务路径：创建新链
+        const chain = this.executionChainStore.createChain({
+          sessionId: resolvedSession,
+          userMessageId: this.currentTurnId,
+          requestId: rootRequestId,
+        });
+        this.activeChainId = chain.id;
+        // 创建主线分支
+        this.executionChainStore.createBranch({
+          chainId: chain.id,
+          kind: 'mainline',
+        });
+      }
 
       try {
         const resolvedSessionId = sessionId || this.sessionManager.getCurrentSession()?.id || taskId;
@@ -2326,6 +2343,28 @@ export class MissionDrivenEngine extends EventEmitter {
         });
 
         const resumeMissionIdForExecution = this.resumeMissionId?.trim();
+
+        // Resume 短路：恢复中断任务时，强制走 task_execution 路径。
+        // resume prompt 可能被分类器误分为 lightweight_analysis / direct_response
+        // （因为 "继续执行之前中断的任务" 不含写关键词），导致 resumeMissionId 不被消费。
+        // 恢复中断任务本身就意味着要执行任务，必须进入编排循环。
+        if (resumeMissionIdForExecution && requirementAnalysis.entryPath !== 'task_execution') {
+          logger.info('编排器.Resume短路.强制task_execution', {
+            originalEntryPath: requirementAnalysis.entryPath,
+            resumeMissionId: resumeMissionIdForExecution,
+            sessionId: resolvedSessionId,
+            requestId: rootRequestId,
+          }, LogCategory.ORCHESTRATOR);
+          requirementAnalysis = {
+            ...requirementAnalysis,
+            entryPath: 'task_execution',
+            includeToolCalls: true,
+            includeThinking: true,
+            historyMode: 'session',
+          };
+          this.currentRequirementAnalysis = requirementAnalysis;
+        }
+
         if (requirementAnalysis.entryPath === 'direct_response') {
           logger.info('编排器.执行入口.命中轻量直答分流', {
             sessionId: resolvedSessionId,
@@ -2660,6 +2699,8 @@ export class MissionDrivenEngine extends EventEmitter {
             }, LogCategory.ORCHESTRATOR);
           }
         }
+        // plan 的终态保护已由 PlanLedger.recoveryProtected 在状态机层面统一拦截，
+        // 此处无需额外的 skipPlanFinalize 检查。
         if (finalSessionId && finalPlanId && finalExecutionStatus && finalExecutionStatus !== 'paused') {
           try {
             await this.planLedger.finalize(finalSessionId, finalPlanId, finalExecutionStatus);
@@ -2735,8 +2776,19 @@ export class MissionDrivenEngine extends EventEmitter {
               // 未调用 worker_dispatch → 不属于任务维度，删除空 Mission
               await this.missionStorage.delete(this.lastMissionId);
             } else {
+              // 检查 chain 是否被标记为可恢复中断
+              // chain 可恢复 → mission 标记为 paused（保留恢复资格），而非跟随 finalExecutionStatus 进入终态
+              const activeChainForMission = this.activeChainId
+                ? this.executionChainStore.getChain(this.activeChainId)
+                : null;
+              const isRecoverableInterrupt = activeChainForMission?.status === 'interrupted'
+                && activeChainForMission.recoverable;
+
               // 更新 Mission 终态
-              if (finalExecutionStatus === 'completed') {
+              if (isRecoverableInterrupt) {
+                // chain 可恢复 → mission 暂停（与 chain 语义对齐，保留 resume 资格）
+                await this.taskViewService.pauseTaskById(this.lastMissionId, 'user_stop');
+              } else if (finalExecutionStatus === 'completed') {
                 await this.taskViewService.completeTaskById(this.lastMissionId);
               } else if (finalExecutionStatus === 'failed') {
                 await this.taskViewService.failTaskById(this.lastMissionId, this.lastExecutionErrors[0]);
@@ -2816,57 +2868,66 @@ export class MissionDrivenEngine extends EventEmitter {
       if (resumeMissionId) {
         const missionProjection = await this.readModelService.getMissionProjection(resumeMissionId);
         this.resumeMissionId = null;
-        if (!missionProjection) {
-          throw new Error(t('engine.errors.taskNotFound', { taskId: resumeMissionId }));
-        }
-        if (missionProjection.status !== 'paused') {
-          throw new Error(t('engine.errors.taskNotPaused', { taskId: resumeMissionId }));
-        }
-        await this.missionStorage.transitionStatus(missionProjection.missionId, 'executing');
-        this.lastMissionId = missionProjection.missionId;
-        this.missionOrchestrator.setCurrentMissionId(missionProjection.missionId);
-        // 绑定 mission 到执行链
-        if (this.activeChainId) {
-          this.executionChainStore.updateChainBindings(this.activeChainId, {
-            currentMissionId: missionProjection.missionId,
-          });
-        }
 
-        if (this.currentPlanId) {
-          const planForBinding = await this.loadRecoveryPlanRecord({
-            missionId: missionProjection.missionId,
-            preferredSessionId: sessionId,
-            preferredPlanId: this.currentPlanId,
-          });
-          if (!planForBinding) {
-            throw new Error(`恢复任务 ${missionProjection.missionId} 时找不到计划 ${this.currentPlanId}`);
+        // mission 存在且处于 paused 状态 → 正常恢复路径
+        if (missionProjection && missionProjection.status === 'paused') {
+          await this.missionStorage.transitionStatus(missionProjection.missionId, 'executing');
+          this.lastMissionId = missionProjection.missionId;
+          this.missionOrchestrator.setCurrentMissionId(missionProjection.missionId);
+          // 绑定 mission 到执行链
+          if (this.activeChainId) {
+            this.executionChainStore.updateChainBindings(this.activeChainId, {
+              currentMissionId: missionProjection.missionId,
+            });
           }
-          this.requirePlanMutation(
-            await this.planLedger.bindMission(sessionId, this.currentPlanId, missionProjection.missionId, {
-              expectedRevision: planForBinding.revision,
-              auditReason: 'ensure-mission:bind-resume-mission',
-            }),
-            {
-              op: 'bind-resume-mission',
-              sessionId,
-              planId: this.currentPlanId,
+
+          if (this.currentPlanId) {
+            const planForBinding = await this.loadRecoveryPlanRecord({
               missionId: missionProjection.missionId,
-            },
-          );
+              preferredSessionId: sessionId,
+              preferredPlanId: this.currentPlanId,
+            });
+            if (!planForBinding) {
+              throw new Error(`恢复任务 ${missionProjection.missionId} 时找不到计划 ${this.currentPlanId}`);
+            }
+            this.requirePlanMutation(
+              await this.planLedger.bindMission(sessionId, this.currentPlanId, missionProjection.missionId, {
+                expectedRevision: planForBinding.revision,
+                auditReason: 'ensure-mission:bind-resume-mission',
+              }),
+              {
+                op: 'bind-resume-mission',
+                sessionId,
+                planId: this.currentPlanId,
+                missionId: missionProjection.missionId,
+              },
+            );
+          }
+
+          const orchestratorToolManager = this.adapterFactory.getToolManager();
+          const orchestratorAssignmentId = `orchestrator-${missionProjection.missionId}`;
+          const normalizedSessionId = sessionId.trim();
+          orchestratorToolManager.setSnapshotContext({
+            sessionId: normalizedSessionId,
+            missionId: missionProjection.missionId,
+            assignmentId: orchestratorAssignmentId,
+            todoId: orchestratorAssignmentId,
+            workerId: 'orchestrator',
+          });
+
+          const normalizedResumePrompt = this.activeUserPrompt?.trim() || undefined;
+          this.activateWorkerSessionResume(missionProjection.missionId, normalizedResumePrompt);
+
+          return missionProjection.missionId;
         }
 
-        const orchestratorToolManager = this.adapterFactory.getToolManager();
-        const orchestratorAssignmentId = `orchestrator-${missionProjection.missionId}`;
-        const normalizedSessionId = sessionId.trim();
-        orchestratorToolManager.setSnapshotContext({
-          sessionId: normalizedSessionId,
-          missionId: missionProjection.missionId,
-          assignmentId: orchestratorAssignmentId,
-          todoId: orchestratorAssignmentId,
-          workerId: 'orchestrator',
-        });
-
-        return missionProjection.missionId;
+        // mission 不存在或不可恢复（cancelled/completed/failed）→ 降级为创建新 mission
+        logger.info('编排器.Mission.恢复降级.创建新任务', {
+          resumeMissionId,
+          status: missionProjection?.status ?? '未找到',
+          reason: !missionProjection ? 'mission不存在' : `状态为${missionProjection.status}，不可恢复`,
+        }, LogCategory.ORCHESTRATOR);
+        // fallthrough 到下方新建 mission 路径
       }
 
       const mission = await this.missionStorage.createMission({
@@ -4191,6 +4252,21 @@ export class MissionDrivenEngine extends EventEmitter {
    * 真正的取消（不可恢复）由上层显式调用 abandonChain() 完成。
    */
   async cancel(): Promise<void> {
+    // 第一步：立即对 plan 启用恢复保护——必须在 cancelAll 之前，
+    // 因为 cancelAll 会同步触发事件链（task:statusChanged → assignmentCompleted →
+    // updateTodoStatus → computePlanStatus），如果保护设置太晚，
+    // 异步的 computePlanStatus 会在保护生效前就将 plan 推入终态。
+    if (this.currentPlanId && this.currentSessionId) {
+      try {
+        await this.planLedger.setRecoveryProtection(this.currentSessionId, this.currentPlanId, true);
+      } catch (error) {
+        logger.warn('编排器.恢复保护设置失败', {
+          planId: this.currentPlanId,
+          error: error instanceof Error ? error.message : String(error),
+        }, LogCategory.ORCHESTRATOR);
+      }
+    }
+
     // C-09: 取消活跃的 DispatchBatch，信号链传递到所有 Worker
     const activeBatch = this.dispatchManager.getActiveBatch();
     if (activeBatch && activeBatch.status === 'active') {
@@ -4215,6 +4291,8 @@ export class MissionDrivenEngine extends EventEmitter {
           interruptedReason: 'user_stop',
           recoverable: true,
         });
+        // 构建恢复快照，记录当前执行状态
+        this.captureResumeSnapshot(this.activeChainId);
       } catch (error) {
         logger.warn('编排器.执行链.中断状态转换失败', {
           chainId: this.activeChainId,
@@ -4253,6 +4331,94 @@ export class MissionDrivenEngine extends EventEmitter {
       logger.warn('编排器.执行链.终态同步失败', {
         chainId: this.activeChainId,
         targetStatus,
+        error: error instanceof Error ? error.message : String(error),
+      }, LogCategory.ORCHESTRATOR);
+    }
+  }
+
+  // ===== 恢复快照构建 =====
+
+  /**
+   * 在中断点捕获恢复快照
+   *
+   * 收集当前主线、dispatch、worker 分支、工作区的运行时状态，
+   * 构建 ResumeSnapshot 并持久化到 ResumeSnapshotStore。
+   */
+  private captureResumeSnapshot(chainId: string): void {
+    const chain = this.executionChainStore.getChain(chainId);
+    if (!chain) return;
+
+    try {
+      // 收集 dispatch 状态
+      const activeBatch = this.dispatchManager.getActiveBatch();
+      const entries = activeBatch?.getEntries() ?? [];
+      const pendingTaskIds = entries.filter(e => e.status === 'pending').map(e => e.taskId);
+      const runningTaskIds = entries.filter(e => e.status === 'running').map(e => e.taskId);
+      const completedTaskIds = entries.filter(e => e.status === 'completed').map(e => e.taskId);
+      const cancelledTaskIds = entries.filter(e => e.status === 'cancelled').map(e => e.taskId);
+
+      // 保存已完成 Worker 的结果摘要（resume 时嵌入 prompt，避免 LLM 重做已完成工作）
+      const completedWorkerSummaries = entries
+        .filter(e => e.status === 'completed' && e.result)
+        .map(e => ({
+          taskId: e.taskId,
+          worker: e.worker,
+          taskTitle: e.taskContract?.taskTitle || e.taskId,
+          summary: e.result!.summary || '',
+        }));
+
+      // 收集 worker 分支信息
+      const workerBranches = this.executionChainQuery
+        .getChainBranches(chainId)
+        .filter(b => b.kind === 'worker')
+        .map(branch => ({
+          branchId: branch.id,
+          workerSlot: branch.workerSlot || 'unknown',
+          assignmentGroupId: branch.assignmentGroupId || '',
+          workerSessionId: undefined as string | undefined,
+          currentTodoId: undefined as string | undefined,
+          completedTodoIds: [] as string[],
+          pendingTodoIds: [] as string[],
+          contextDigest: [] as string[],
+          latestSummary: undefined as string | undefined,
+        }));
+
+      this.resumeSnapshotBuilder.build({
+        chain,
+        mainline: {
+          userPrompt: this.activeUserPrompt || undefined,
+          currentMissionId: this.lastMissionId || undefined,
+          currentPlanId: this.currentPlanId || undefined,
+          runtimePhase: this._state,
+          pendingSupplementaryInputs: [],
+          contextDigest: [],
+        },
+        dispatch: {
+          assignmentGroupId: chain.activeAssignmentGroupId,
+          pendingTaskIds,
+          runningTaskIds,
+          completedTaskIds,
+          cancelledTaskIds,
+          completedWorkerSummaries,
+        },
+        workerBranches,
+        workspace: {
+          dirtyFiles: [],
+          pendingChangesSummary: [],
+        },
+        timelineCursor: {
+          lastVisibleNodeSeq: 0,
+        },
+      });
+
+      logger.info('编排器.恢复快照.已构建', {
+        chainId,
+        missionId: this.lastMissionId,
+        planId: this.currentPlanId,
+      }, LogCategory.ORCHESTRATOR);
+    } catch (error) {
+      logger.warn('编排器.恢复快照.构建失败', {
+        chainId,
         error: error instanceof Error ? error.message : String(error),
       }, LogCategory.ORCHESTRATOR);
     }
@@ -4363,6 +4529,7 @@ export class MissionDrivenEngine extends EventEmitter {
   async listTaskViews(sessionId: string) { return this.taskViewService.listTaskViews(sessionId); }
   async createTaskFromPrompt(sessionId: string, prompt: string) { return this.taskViewService.createTaskFromPrompt(sessionId, prompt); }
   async cancelTaskById(taskId: string) { return this.taskViewService.cancelTaskById(taskId); }
+  async pauseTaskById(taskId: string, reason?: string) { return this.taskViewService.pauseTaskById(taskId, reason); }
   async deleteTaskById(taskId: string) { return this.taskViewService.deleteTaskById(taskId); }
   async failTaskById(taskId: string, error: string) { return this.taskViewService.failTaskById(taskId, error); }
   async completeTaskById(taskId: string) { return this.taskViewService.completeTaskById(taskId); }

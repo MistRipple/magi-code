@@ -146,7 +146,7 @@ export class OrchestrationDeliveryController {
     const acceptanceCriteriaForRuntime = planForRuntime?.runtime.acceptance.criteria;
     const lastMissionId = this.deps.helpers.getLastMissionId();
 
-    if (lastMissionId) {
+    if (lastMissionId && input.batch.status !== 'archived') {
       try {
         await this.deps.missionStorage.transitionStatus(lastMissionId, 'reviewing');
       } catch (error) {

@@ -53,6 +53,8 @@ export interface ResumeSnapshot {
  * 恢复时不重新立项、不重新生成 chainId、不重新全量读上下文。
  */
 export interface ResumeMainlineContext {
+  /** 中断时的原始用户 prompt */
+  userPrompt?: string;
   /** 当前 Mission ID */
   currentMissionId?: string;
   /** 当前 Plan ID */
@@ -79,6 +81,15 @@ export interface ResumeDispatchContext {
   runningTaskIds: string[];
   /** 已完成的任务 ID */
   completedTaskIds: string[];
+  /** 被取消的任务 ID */
+  cancelledTaskIds?: string[];
+  /** 已完成 Worker 的结果摘要（resume 时嵌入 prompt，避免 LLM 重做已完成工作） */
+  completedWorkerSummaries?: Array<{
+    taskId: string;
+    worker: string;
+    taskTitle: string;
+    summary: string;
+  }>;
 }
 
 /**

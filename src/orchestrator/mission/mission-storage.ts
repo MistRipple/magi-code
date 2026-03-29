@@ -154,7 +154,7 @@ const ALLOWED_MISSION_STATUS_TRANSITIONS: Record<MissionStatus, MissionStatus[]>
   planning: ['executing', 'failed', 'cancelled'],
   executing: ['paused', 'reviewing', 'completed', 'failed', 'cancelled'],
   paused: ['executing', 'failed', 'cancelled'],
-  reviewing: ['executing', 'completed', 'failed', 'cancelled'],
+  reviewing: ['executing', 'paused', 'completed', 'failed', 'cancelled'],
   completed: [],
   failed: [],
   cancelled: [],

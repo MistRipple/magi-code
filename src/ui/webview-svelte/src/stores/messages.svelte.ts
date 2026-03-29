@@ -2057,6 +2057,10 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
 let pendingRecovery = $state<{ taskId: string; error: unknown; canRetry: boolean; canRollback: boolean } | null>(null);
 let pendingClarification = $state<{ questions: string[]; context?: string; ambiguityScore?: number; originalPrompt?: string } | null>(null);
 let pendingWorkerQuestion = $state<{ workerId: string; question: string; context?: string; options?: unknown } | null>(null);
+
+// 执行链中断状态（可恢复）
+let interruptedChain = $state<{ chainId: string; recoverable: boolean } | null>(null);
+
 let missionPlan = $state<Map<string, MissionPlan>>(new Map());
 
 // Wave 执行状态（提案 4.6）
@@ -2162,6 +2166,14 @@ export function getModelStatus() {
 
 export function getPendingRecovery() {
   return pendingRecovery;
+}
+
+export function getInterruptedChain() {
+  return interruptedChain;
+}
+
+export function setInterruptedChain(value: { chainId: string; recoverable: boolean } | null) {
+  interruptedChain = value;
 }
 
 export function getPendingClarification() {

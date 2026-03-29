@@ -253,6 +253,41 @@ export class AgentWorkspaceRuntime {
   }
 
   async submitTask(prompt: string, sessionId?: string, requestId?: string): Promise<RuntimeTaskSubmissionResult> {
+    // 自然语言恢复拦截：当存在中断的执行链且用户意图为"继续"时，
+    // 自动路由到 resumeChain，而非创建新任务。
+    if (this.isResumeIntent(prompt)) {
+      await this.ensureInitialized();
+      await this.bindSession(sessionId);
+      const resolvedSessionId = this.activeSessionId?.trim() || '';
+      if (resolvedSessionId) {
+        const chainQuery = this.orchestratorEngine.getExecutionChainQuery();
+        const recoverableChain = chainQuery.findLatestRecoverableChain(resolvedSessionId);
+        if (recoverableChain) {
+          logger.info('Agent.自然语言恢复拦截', {
+            prompt: prompt.slice(0, 50),
+            chainId: recoverableChain.id,
+            sessionId: resolvedSessionId,
+          }, LogCategory.AGENT);
+          // 异步执行 resumeChain，立即返回（与 submitTask 一致的异步语义）
+          const resumeRequestId = requestId?.trim()
+            || `req_resume_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+          this.launchDetachedOperation(
+            `request:${resumeRequestId}`,
+            'Agent 自然语言恢复执行链',
+            async () => {
+              await this.resumeChain(resolvedSessionId, prompt);
+            },
+          );
+          return {
+            success: true,
+            accepted: true,
+            requestId: resumeRequestId,
+            sessionId: resolvedSessionId,
+          };
+        }
+      }
+    }
+
     const preparation = await this.withSubmissionLock(() => this.prepareTaskExecution(prompt, sessionId, requestId));
     if (!preparation.success) {
       return { success: false, accepted: false, error: preparation.error };
@@ -461,8 +496,6 @@ export class AgentWorkspaceRuntime {
     } finally {
       messageHub.finalizeRequestContext(requestId);
       messageHub.forceProcessingState(false);
-      // 任务执行完毕后，自动推进排队中的下一条消息
-      void this.drainQueuedMessagesIfIdle();
     }
   }
 
@@ -492,25 +525,31 @@ export class AgentWorkspaceRuntime {
       await this.orchestratorEngine.interrupt();
     }
     await this.adapterFactory.interruptAll();
+    // 检查 chain 可恢复性：可恢复时 mission 标记为 paused（保留 resume 资格），
+    // 不可恢复时才标记为 cancelled（终态）。
+    const activeChainId = this.orchestratorEngine.getActiveChainId();
+    const chainQuery = this.orchestratorEngine.getExecutionChainQuery();
+    const isChainRecoverable = activeChainId ? chainQuery.isChainRecoverable(activeChainId) : false;
     const tasks = await this.getTaskViews();
     for (const task of tasks.filter((item) => item.status === 'running')) {
-      await this.orchestratorEngine.cancelTaskById(task.id);
+      if (isChainRecoverable) {
+        // chain 可恢复 → mission 暂停（与 chain interrupted+recoverable 语义对齐）
+        await this.orchestratorEngine.pauseTaskById(task.id, 'user_stop');
+      } else {
+        await this.orchestratorEngine.cancelTaskById(task.id);
+      }
     }
     this.orchestratorEngine.getMessageHub().sendControl(ControlMessageType.TASK_FAILED, {
       error: t('provider.userCancelled'),
       cancelled: true,
       timestamp: Date.now(),
     });
-    // 通知前端当前执行链可恢复
-    const activeChainId = this.orchestratorEngine.getActiveChainId();
-    if (activeChainId) {
-      const chainQuery = this.orchestratorEngine.getExecutionChainQuery();
-      if (chainQuery.isChainRecoverable(activeChainId)) {
-        this.sendData('executionChainInterrupted', {
-          chainId: activeChainId,
-          recoverable: true,
-        });
-      }
+    // 通知前端当前执行链可恢复（复用已有的 activeChainId/chainQuery）
+    if (activeChainId && isChainRecoverable) {
+      this.sendData('executionChainInterrupted', {
+        chainId: activeChainId,
+        recoverable: true,
+      });
     }
     await this.sendStateUpdate();
     await this.sendRuntimeStateUpdate();
@@ -546,6 +585,85 @@ export class AgentWorkspaceRuntime {
     await this.sendStateUpdate();
   }
 
+  /**
+   * 基于执行链恢复执行
+   *
+   * 1. 通过 `prepareChainResume` 找到可恢复链、设置 `activeChainId` 和 `resumeMissionId`
+   * 2. 直接将用户意图作为 prompt 传给 executeTask（技术恢复靠 plan 状态机，LLM 恢复靠对话历史）
+   * 3. 在原链上续跑（不创建新链）
+   *
+   * 也由 submitTask 的自然语言恢复拦截自动调用（用户输入"继续"等）。
+   */
+  async resumeChain(sessionId: string, userPrompt?: string): Promise<{ success: boolean; chainId?: string; error?: string }> {
+    await this.ensureInitialized();
+
+    if (this.orchestratorEngine.running) {
+      return { success: false, error: '引擎正在运行中，无法恢复' };
+    }
+
+    const resolvedSessionId = sessionId?.trim() || this.activeSessionId?.trim() || '';
+    if (!resolvedSessionId) {
+      return { success: false, error: '缺少 sessionId' };
+    }
+
+    // 1. 准备链恢复（设置 activeChainId、将链标记为 resuming、设置 resumeMissionId）
+    const prepared = this.orchestratorEngine.prepareChainResume(resolvedSessionId);
+    if (!prepared) {
+      return { success: false, error: '未找到可恢复的执行链' };
+    }
+
+    // 2. 构建 resume prompt
+    // 从恢复快照中读取 dispatch 状态，告诉 LLM 哪些 worker 已完成、哪些被取消，
+    // 避免 LLM 盲目调用 worker_wait（上轮 batch 已归档）或完全重新 dispatch。
+    const snapshot = this.orchestratorEngine.getResumeSnapshotStore().getLatest(prepared.chainId);
+    const dispatchContext = snapshot?.dispatch;
+    const basePrompt = userPrompt?.trim() || '继续执行之前中断的任务';
+
+    let resumePrompt: string;
+    if (dispatchContext?.completedWorkerSummaries?.length || dispatchContext?.cancelledTaskIds?.length) {
+      const parts: string[] = [basePrompt, ''];
+
+      // 已完成的 Worker（不需要重做）
+      if (dispatchContext.completedWorkerSummaries?.length) {
+        parts.push('以下 Worker 在中断前已完成，无需重复执行：');
+        for (const ws of dispatchContext.completedWorkerSummaries) {
+          parts.push(`- [${ws.worker}] ${ws.taskTitle}: ${ws.summary.slice(0, 200)}`);
+        }
+        parts.push('');
+      }
+
+      // 被取消的任务（需要重新 dispatch）
+      const cancelledCount = (dispatchContext.cancelledTaskIds?.length ?? 0)
+        + (dispatchContext.runningTaskIds?.length ?? 0);
+      if (cancelledCount > 0) {
+        parts.push(`有 ${cancelledCount} 个 Worker 任务因中断被取消，需要重新 dispatch 这些未完成的任务。`);
+        parts.push('注意：上一轮的 dispatch batch 已归档，不要调用 worker_wait，直接用 worker_dispatch 发起新的任务分发。');
+      }
+
+      resumePrompt = parts.join('\n');
+    } else {
+      resumePrompt = basePrompt;
+    }
+
+    logger.info('Agent.恢复执行链', {
+      chainId: prepared.chainId,
+      missionId: prepared.missionId,
+      prompt: resumePrompt.slice(0, 80),
+    }, LogCategory.AGENT);
+
+    // 3. 清除旧恢复上下文
+    this.clearPendingRecoveryState();
+
+    // 4. 通过 executeTask 执行恢复（MDE 检测 activeChainId 已设置，复用原链）
+    const requestId = `req_resume_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const result = await this.executeTask(resumePrompt, resolvedSessionId, requestId);
+    return {
+      success: result.success,
+      chainId: prepared.chainId,
+      error: result.error,
+    };
+  }
+
   async resumeTask(taskId: string): Promise<RuntimeTaskSubmissionResult> {
     await this.ensureInitialized();
     const normalizedTaskId = taskId.trim();
@@ -574,7 +692,12 @@ export class AgentWorkspaceRuntime {
     await this.ensureInitialized();
     const abandoned = this.orchestratorEngine.abandonChain(chainId);
     if (abandoned) {
+      // 清除关联的恢复上下文
+      this.clearPendingRecoveryState();
       await this.sendStateUpdate();
+      await this.sendRuntimeStateUpdate();
+      // 放弃后引擎空闲，推进排队消息
+      void this.drainQueuedMessagesIfIdle();
     }
     return { abandoned };
   }
@@ -1283,6 +1406,34 @@ export class AgentWorkspaceRuntime {
 
   private isRecoverableRuntimeReason(runtimeReason: AgentRuntimeReason): boolean {
     return runtimeReason === 'interrupted' || runtimeReason === 'upstream_model_error';
+  }
+
+  /**
+   * 判断用户 prompt 是否表达了"恢复/继续"的意图
+   *
+   * 当存在被中断的执行链时，匹配此意图的 prompt 将路由到 resumeChain
+   * 而非创建新任务。支持中英文恢复语义。
+   */
+  private isResumeIntent(prompt: string): boolean {
+    const normalized = prompt.trim();
+    if (!normalized) return false;
+    // 完全匹配的恢复关键词（短指令）
+    const exactKeywords = [
+      '继续', '接着', '接着做', '接着干', '继续吧', '继续做',
+      '继续执行', '恢复执行', '恢复任务', '接着执行',
+      'continue', 'resume', 'go on', 'keep going', 'carry on',
+    ];
+    const lower = normalized.toLowerCase();
+    if (exactKeywords.includes(lower)) return true;
+    // 前缀匹配：以恢复语义词开头的较长 prompt（如"继续执行之前的任务，重点关注性能"）
+    const prefixPatterns = [
+      '继续执行', '接着执行', '恢复执行', '接着做', '接着干',
+      '继续之前', '接着之前', '继续刚才', '接着刚才',
+    ];
+    for (const prefix of prefixPatterns) {
+      if (lower.startsWith(prefix)) return true;
+    }
+    return false;
   }
 
   private buildExecutionFailureReason(runtimeReason: AgentRuntimeReason, errors: string[], fallback?: string): string {

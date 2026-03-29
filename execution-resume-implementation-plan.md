@@ -1,6 +1,6 @@
 # 执行链中断 / 恢复重构实施方案
 
-更新时间：2026-03-24
+更新时间：2025-03-29（基于 2025-03-24 初稿修订）
 
 ## 1. 文档定位
 
@@ -89,6 +89,26 @@
 
 ## 3. 当前结构评估
 
+> **⚠️ 近期代码变更记录（2025-03-29 补充）**
+>
+> 以下变更发生在本文档初稿（2025-03-24）之后，影响文档中部分模块的当前状态：
+>
+> 1. **`interactionMode` / `ask` 模式完整删除**（17 个文件，~500 行）
+>    - 删除类型：`InteractionMode`、`InteractionModeConfig`、`INTERACTION_MODE_CONFIGS`、`PermissionMatrix`
+>    - 删除后端方法：`MDE.setInteractionMode/getInteractionMode/getModeConfig`、`AgentRuntime.setInteractionMode`
+>    - 删除 API：`/api/interaction-mode`、`/api/interaction/tool-authorization`
+>    - 删除协议：`interactionModeChanged`、`toolAuthorizationRequest`
+>    - 删除前端弹窗：toolAuthorization 模态框、ask/auto 切换按钮
+>    - 影响：`effective-mode-resolver` 移除 interactionMode 维度；recovery/clarification/workerQuestion 交互请求始终自动解决
+>
+> 2. **`request-classifier.ts` 工具链修复**
+>    - `task_execution` 路径的 `includeToolCalls` 从条件计算改为无条件 `true`
+>    - 原因：standard 模式下用户输入不含写关键词时 `includeToolCalls=false`，导致模型以纯文本叙述工具调用
+>
+> 3. **排队消息机制修复**（两处独立 bug）
+>    - 前端 `InputArea.svelte`：`executeTask` 路径发送后立即 `setIsProcessing(true)` 乐观更新 + `clearComposerState()`，防止快速连续发送时后续消息走 `executeTask` 而非 `appendMessage`
+>    - 后端 `agent-runtime-service.ts`：`runPreparedTaskExecution` 的 `finally` 增加 `void this.drainQueuedMessagesIfIdle()`，任务完成后自动推进排队消息
+
 ## 3.1 已有可复用基础
 
 ### A. 时间轴投影基础已经存在
@@ -96,7 +116,6 @@
 可复用文件：
 
 - `src/session/session-timeline-projection.ts`
-- `src/session/session-timeline-recovery.ts`
 - `src/shared/timeline-ordering.ts`
 - `src/shared/timeline-presentation.ts`
 - `src/shared/timeline-worker-lifecycle.ts`
@@ -118,7 +137,7 @@
 
 可复用文件：
 
-- `src/orchestrator/core/dispatch-presentation-adapter.ts`
+- `src/orchestrator/core/dispatch/dispatch-presentation-adapter.ts`
 - `src/ui/webview-svelte/src/lib/worker-lifecycle-card.ts`
 
 当前已经有：
@@ -140,7 +159,7 @@
 
 - `src/ui/webview-provider.ts`
 - `src/services/task-view-service.ts`
-- `src/orchestrator/core/dispatch-resume-context-store.ts`
+- `src/orchestrator/core/dispatch/dispatch-resume-context-store.ts`
 - `src/orchestrator/worker/worker-session.ts`
 
 当前问题不是完全没有恢复能力，而是：
@@ -237,11 +256,11 @@
 
 3. 停止时把未完成 worker / todo 直接写成 `cancelled`
    - 文件：`src/orchestrator/core/mission-driven-engine.ts`
-   - 文件：`src/orchestrator/core/dispatch-batch.ts`
+   - 文件：`src/orchestrator/core/dispatch/dispatch-batch.ts`
    - 文件：`src/agent/service/agent-runtime-service.ts`
 
 4. `DispatchResumeContextStore` 只做 mission -> workerSession 的内存映射
-   - 文件：`src/orchestrator/core/dispatch-resume-context-store.ts`
+   - 文件：`src/orchestrator/core/dispatch/dispatch-resume-context-store.ts`
 
 5. 前端 restore 明确清空运行态，不承接 recoverable 执行链
    - 文件：`src/ui/webview-svelte/src/stores/messages.svelte.ts`
@@ -359,12 +378,21 @@
 - 不允许不同层对同一终止动作使用 `cancelled` / `interrupted` 等不同词汇
 - `aborted` / `killed` / `timeout` 这类底层原因，不再直接冒充业务主状态
 
-### 6.5 需要删除的旧路径
+### 6.5 `pendingRecoveryContext` 渐进替换策略
 
-- `continueTask` 直接新开执行
-- `pendingRecoveryContext` 作为恢复唯一真相源
-- 启动恢复把执行态直接清成 `cancelled`
-- 用词汇映射补丁在 UI 层临时兜底 stop / cancel / interrupted 分歧
+`pendingRecoveryContext` 当前同时承担三个语义：
+
+| 语义 | 当前实现 | 改造方向 |
+|---|---|---|
+| `retry` | 重新构建 prompt + 全新 `executeTask` | 由 ExecutionChain `interrupted → resuming → running` 接管 |
+| `rollback` | 调用 `snapshotManager.revertMission()` 回滚文件变更 | **保留**——rollback 独立于 resume，用户仍需回滚文件能力 |
+| `continue` | 清除恢复状态，放弃恢复 | 由 `abandon` 语义接管（chain → `cancelled`） |
+
+本阶段要求：
+- `retry` 语义迁移到 `ExecutionChain.resume()`，不再通过 `buildResumePrompt + executeTask` 实现
+- `continue` 语义迁移到 `abandonChain()`
+- `rollback` 能力从 `pendingRecoveryContext` 剥离为独立函数，不依赖恢复上下文
+- `pendingRecoveryContext` 本体在上述迁移完成后删除，不允许提前删除导致 rollback 断链
 
 ### 6.6 阶段二完成标准
 
@@ -383,10 +411,10 @@
 
 ### 7.2 重点改造文件
 
-- `src/orchestrator/core/dispatch-manager.ts`
-- `src/orchestrator/core/dispatch-batch.ts`
-- `src/orchestrator/core/dispatch-presentation-adapter.ts`
-- `src/orchestrator/core/dispatch-resume-context-store.ts`
+- `src/orchestrator/core/dispatch/dispatch-manager.ts`
+- `src/orchestrator/core/dispatch/dispatch-batch.ts`
+- `src/orchestrator/core/dispatch/dispatch-presentation-adapter.ts`
+- `src/orchestrator/core/dispatch/dispatch-resume-context-store.ts`
 - `src/orchestrator/worker/autonomous-worker.ts`
 - `src/orchestrator/worker/worker-session.ts`
 - `src/shared/timeline-worker-lifecycle.ts`
@@ -441,7 +469,7 @@
 
 - `src/session/unified-session-manager.ts`
 - `src/session/session-timeline-projection.ts`
-- `src/session/session-timeline-recovery.ts`
+- `src/orchestrator/core/orchestration/orchestration-recovery-coordinator.ts`
 - `src/session/timeline-record-adapter.ts`
 - `src/agent/service/agent-runtime-service.ts`
 - `src/agent/service/local-agent-service.ts`
@@ -478,6 +506,37 @@ session 加载时必须做到：
 
 - 刷新后仍能准确知道哪条链可继续
 - refresh / session switch 前后时间轴与可恢复状态一致
+
+---
+
+### 8.6 排队消息（Queued Messages）与 resume 的交互设计
+
+> **补充于 2025-03-29**
+>
+> 排队消息机制（`drainQueuedMessagesIfIdle`）与 resume 存在时序交互，必须在本阶段明确规则。
+
+#### 场景定义
+
+用户停止任务时，排队区可能存在 1~N 条待执行消息。后续用户可能选择：
+
+1. **resume**（继续中断的执行链）
+2. **abandon**（放弃执行链）
+3. **不操作**（排队消息一直停留）
+
+#### 规则
+
+| 用户动作 | 排队消息处理 | 理由 |
+| --- | --- | --- |
+| resume | 先 resume 原任务，resume 完成后按 FIFO 消费排队消息 | 排队消息是"追加到当前任务之后"的语义，原任务优先 |
+| abandon | 排队消息保留，立即通过 `drainQueuedMessagesIfIdle` 开始消费 | 放弃后引擎空闲，排队消息作为新任务执行 |
+| 发送新消息（未 resume/abandon） | 新消息排入队尾，排队面板累加显示 | 引擎仍处于 `interrupted` 状态，不自动消费 |
+
+#### 实现要点
+
+- `drainQueuedMessagesIfIdle` 已有 `this.orchestratorEngine.running` 检查，resume 过程中不会重入
+- resume 完成后 `runPreparedTaskExecution.finally` 中的 `drainQueuedMessagesIfIdle()` 会自动接续排队消息
+- `abandonChain` 需在清除链状态后显式调用 `void this.drainQueuedMessagesIfIdle()` 来推进排队消息
+- 前端 `isProcessing` 在 resume/abandon 过程中必须正确更新，避免排队面板闪烁
 
 ---
 
@@ -564,7 +623,7 @@ toast、诊断、控制消息不进入主时间轴。
 
 ### 10.2 必须删除 / 收敛的旧逻辑
 
-- `pendingRecoveryContext` 临时恢复路径
+- `pendingRecoveryContext` 中的 `retry` / `continue` 语义（rollback 已独立剥离）
 - `continueTask` 直接 `executeTask`
 - `recoverRunningState()` 中“执行态收敛为 cancelled”的旧语义
 - 任何仅存在于前端 store 的恢复判断
@@ -573,7 +632,22 @@ toast、诊断、控制消息不进入主时间轴。
 - `subTaskCard.status` / `wait_status` / `waitResult.results[].status` / `workerRuntime.status` 并列抢占卡片主状态的旧实现
 - `cancelled` / `paused` / `interrupted` / `aborted` / `killed` 在不同层并行表达主状态的旧实现（`stopped` 已删除）
 
-### 10.3 e2e 验证矩阵
+### 10.3 前端适配工作量清单
+
+> **补充于 2025-03-29**
+>
+> 前端并非"仅消费新 data message"，以下是完整的适配清单：
+
+| 工作项 | 当前状态 | 改造内容 |
+| --- | --- | --- |
+| `executionChainInterrupted` 消费 | 后端已发出（`agent-runtime-service.ts:509`），前端 UI 层零消费者 | `data-message-handlers.ts` 新增 case，更新 store 状态 |
+| resume / abandon 按钮 UI | 不存在 | InputArea 或运行态面板中新增操作按钮 |
+| 运行态面板状态扩展 | 仅有 `running / completed / paused` 显示 | 增加 `interrupted`（可恢复）/ `resuming`（恢复中）状态显示 |
+| 排队面板与 resume/abandon 交互 | 未定义 | 按 §8.6 规则实现：resume 优先原任务，abandon 后自动消费排队 |
+| bridge 层 resume/abandon 命令 | `web-client-bridge.ts` 无 resume/abandon case | 新增 `resumeChain` / `abandonChain` 消息类型和 HTTP 调用 |
+| `isProcessing` 在 resume 过程中的正确性 | resume 时 `isProcessing` 未被管理 | resume 开始时设 true，完成/失败时由 `forceProcessingState` 回退 |
+
+### 10.4 e2e 验证矩阵
 
 必须覆盖真实 LLM 端到端：
 
@@ -590,8 +664,13 @@ toast、诊断、控制消息不进入主时间轴。
    - 超出显示 `...`
    - 点击查看更多弹出完整内容
 10. 主线总结不得显示到 Worker 卡片中
+11. 执行中快速连续发送 3 条消息 → 第 1 条走 executeTask，第 2/3 条排队 → 排队面板显示 → 依次消费
+12. 停止时有排队消息 → resume → 原任务完成后自动推进排队消息
+13. 停止时有排队消息 → abandon → 排队消息立即开始消费
+14. 连续多次 stop / resume 循环，排队消息不丢失不重复
+15. resume 失败（LLM 错误）→ 排队消息保留，进入错误恢复流程
 
-### 10.4 阶段六完成标准
+### 10.5 阶段六完成标准
 
 - 旧路径已删除
 - 真实 e2e 全通过

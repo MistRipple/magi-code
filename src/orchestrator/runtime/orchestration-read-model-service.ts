@@ -90,7 +90,9 @@ export class OrchestrationReadModelService {
       return { scope: null, reason: 'missing_session' };
     }
 
-    const plan = this.planLedger.getLatestPlanByMission(sessionId, missionId);
+    // 恢复场景需要找到被中断的 plan，即使它已被标记为终态（cancelled/failed）。
+    // 传 includeTerminal: true 确保即使 plan 状态为终态也能找到。
+    const plan = this.planLedger.getLatestPlanByMission(sessionId, missionId, { includeTerminal: true });
     if (!plan) {
       return { scope: null, reason: 'missing_plan' };
     }

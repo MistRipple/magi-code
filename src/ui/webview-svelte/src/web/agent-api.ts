@@ -619,6 +619,10 @@ export async function deleteAgentTask(taskId: string): Promise<Record<string, un
   return await postBoundJson<Record<string, unknown>>('/api/task/delete', { taskId }, 'delete task');
 }
 
+export async function resumeAgentChain(sessionId: string): Promise<Record<string, unknown>> {
+  return await postBoundJson<Record<string, unknown>>('/api/chain/resume', { sessionId }, 'resume chain');
+}
+
 export async function abandonAgentChain(chainId: string): Promise<Record<string, unknown>> {
   return await postBoundJson<Record<string, unknown>>('/api/chain/abandon', { chainId }, 'abandon chain');
 }

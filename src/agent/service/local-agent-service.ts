@@ -1188,6 +1188,22 @@ export class LocalAgentService {
       return;
     }
 
+    if (request.method === 'POST' && url.pathname === '/api/chain/resume') {
+      const body = await this.readJsonBody(request);
+      const runtime = await this.resolveRuntime(
+        typeof body?.workspaceId === 'string' ? body.workspaceId : undefined,
+        typeof body?.workspacePath === 'string' ? body.workspacePath : undefined,
+      );
+      if (!runtime) {
+        this.sendJson(response, 404, { error: 'workspace_not_found' });
+        return;
+      }
+      const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
+      const result = await runtime.resumeChain(sessionId);
+      this.sendJson(response, result.success ? 200 : 400, result);
+      return;
+    }
+
     if (request.method === 'POST' && url.pathname === '/api/chain/abandon') {
       const body = await this.readJsonBody(request);
       const runtime = await this.resolveRuntime(
