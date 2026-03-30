@@ -1028,8 +1028,17 @@ async function ensureFreshLiveBridge(reason: string): Promise<void> {
     await restoreBridgeState(reason, true);
     return;
   }
+  // 检查当前 SSE 连接的 key 是否与预期 binding 匹配。
+  // 匹配（sessionId 一致）→ 直接复用，避免不必要的断连重建；
+  // 不匹配（sessionId 已变但 SSE 还是旧的）→ 重连确保订阅正确的会话。
+  const query = new URLSearchParams();
+  if (currentWorkspaceId) query.set('workspaceId', currentWorkspaceId);
+  if (currentWorkspacePath) query.set('workspacePath', currentWorkspacePath);
+  if (currentSessionId) query.set('sessionId', currentSessionId);
+  const expectedKey = query.toString();
+  const needsReconnect = activeEventStreamKey !== expectedKey;
   await ensureEventStream({
-    forceReconnect: true,
+    forceReconnect: needsReconnect,
     waitUntilOpen: true,
   });
 }
