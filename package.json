@@ -2,7 +2,7 @@
   "name": "magi",
   "displayName": "Magi",
   "description": "多智能体工程编排 system — 意图分析、任务拆解、异构专家协作",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "icon": "resources/magi-icon.png",
   "license": "GPL-3.0-or-later",
   "author": "MistRipple",

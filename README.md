@@ -9,7 +9,7 @@
 *意图洞察 · 深度拆解 · 异构协作*
 
 [![VSCode Extension](https://img.shields.io/badge/VSCode-Extension-007ACC?style=flat-square&logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
-[![Version](https://img.shields.io/badge/version-1.0.1-blue?style=flat-square)]()
+[![Version](https://img.shields.io/badge/version-2.0.1-blue?style=flat-square)]()
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later-red?style=flat-square)](LICENSE)
 
 <br/>
@@ -20,8 +20,14 @@
 
 **Magi 不是另一个 ChatBot，而是你的 AI 研发团队。**
 
-它运行在 VSCode 中，将复杂工程任务转化为可执行的任务合同，调度多个异构 Worker 并行协作，
+它既可以作为 VSCode 插件运行，也可以由 Local Agent 提供独立 Web 客户端，
+将复杂工程任务转化为可执行的任务合同，调度多个异构 Worker 并行协作，
 从意图理解、任务拆解、执行修复到验收沉淀形成完整闭环。
+
+当前支持两种入口：
+
+- **插件模式**：在 VSCode 中使用，扩展自动拉起 Local Agent。
+- **Web 模式**：不依赖 VSCode 插件，直接启动 Local Agent 后通过浏览器访问。
 
 [核心特性](#核心特性) • [工作原理](#工作原理) • [快速开始](#快速开始) • [联系](#联系)
 
@@ -145,35 +151,103 @@
 
 ### 环境要求
 
-- **VSCode**：`>= 1.93.0`
+- **VSCode**：插件模式需要 `>= 1.93.0`
 - **Node.js**：建议 `>= 18`
 - **可用 CLI**：至少配置一个（Claude / Codex / Gemini）
 - **网络**：如需联网检索或外部模型调用，请确保网络可用
 
-### 1. 安装扩展
+### 使用方式
+
+### 1. 插件模式
+
+#### 安装扩展
+
 在 VSCode 扩展市场搜索 **Magi** 并安装，或通过 `.vsix` 本地安装。
 
-### 2. 配置模型 CLI
+#### 配置模型 CLI
+
 在 VSCode 设置中搜索 `magi`，配置编排与 Worker 使用的 CLI 路径：
+
 - `magi.claude.path`
 - `magi.codex.path`
 - `magi.gemini.path`
 
-### 3. 选择治理模式
+#### 选择治理模式
+
 - `magi.deepTask = false`：常规模式（默认）
 - `magi.deepTask = true`：深度模式（项目级治理）
 
-### 4. 开始协作
+#### 开始协作
+
 - 打开面板：`Ctrl+Shift+A`（Mac: `Cmd+Shift+A`）
 - 启动任务：`Ctrl+Shift+Enter`（Mac: `Cmd+Shift+Enter`）
 - 新建会话：`Ctrl+Alt+N`（Mac: `Cmd+Alt+N`）
 - 停止任务：`Ctrl+Shift+Backspace`（Mac: `Cmd+Shift+Backspace`）
+- 打开 Web 客户端：命令面板执行 `Magi: 打开 Web 客户端`
 
-### 5. 最小可运行验证（1 分钟）
+### 2. Web 模式
 
-- 在新会话输入：`请读取 README.md 并总结当前版本号`。
-- 观察是否成功触发任务、出现执行状态与最终回复。
-- 若失败，优先检查 CLI 路径与 API Key 配置。
+Web 模式不依赖 VSCode 插件，但需要你自己启动 Local Agent。当前提供两种启动方式：
+
+#### 生产方式：Agent 直接托管 Web 前端
+
+先构建：
+
+```bash
+npm install
+npm run build:agent
+npm run build:web
+```
+
+再启动后端：
+
+```bash
+MAGI_AGENT_WORKSPACES='[{"rootPath":"/absolute/path/to/your/project","name":"your-project"}]' node dist/agent.js
+```
+
+启动完成后，浏览器访问：
+
+```text
+http://127.0.0.1:46231/web.html?workspacePath=/absolute/path/to/your/project
+```
+
+说明：
+
+- `Local Agent` 默认监听 `127.0.0.1:46231`
+- `workspacePath` 建议传绝对路径，前端会据此自动绑定工作区
+- 这种方式下，后端会直接托管 `dist/web`，因此只需要起一个服务
+
+#### 开发方式：Web 前后端分开启动
+
+终端 1 启动后端：
+
+```bash
+MAGI_AGENT_WORKSPACES='[{"rootPath":"/absolute/path/to/your/project","name":"your-project"}]' npm run dev:agent
+```
+
+终端 2 启动前端：
+
+```bash
+npm run dev:web
+```
+
+浏览器访问：
+
+```text
+http://127.0.0.1:3000/web.html?workspacePath=/absolute/path/to/your/project
+```
+
+说明：
+
+- `npm run dev:web` 会启动 Vite 开发服务器，默认端口 `3000`
+- 前端 `/api` 与 `/api/events` 会自动代理到 `http://127.0.0.1:46231`
+- 适合调试 Web UI 或前后端联调
+
+### 3. 最小可运行验证（1 分钟）
+
+- 在新会话输入：`请读取 README.md 并总结当前版本号`
+- 观察是否成功触发任务、出现执行状态与最终回复
+- 若失败，优先检查 CLI 路径、API Key、`MAGI_AGENT_WORKSPACES` 与工作区路径是否正确
 
 ![设置面板](image/setting-board.png)
 
@@ -184,7 +258,7 @@
 | 层次 | 技术 |
 |:---|:---|
 | 语言 | TypeScript |
-| 宿主 | VSCode Extension API |
+| 宿主 | VSCode Extension API / Local Agent Web Host |
 | 前端 UI | Svelte |
 | 构建 | esbuild |
 | AI 协议 | OpenAI API, Anthropic API, Gemini API（统一客户端） |

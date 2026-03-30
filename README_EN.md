@@ -9,7 +9,7 @@
 *Intent Analysis · Deep Decomposition · Heterogeneous Collaboration*
 
 [![VSCode Extension](https://img.shields.io/badge/VSCode-Extension-007ACC?style=flat-square&logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
-[![Version](https://img.shields.io/badge/version-1.0.1-blue?style=flat-square)]()
+[![Version](https://img.shields.io/badge/version-2.0.1-blue?style=flat-square)]()
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later-red?style=flat-square)](LICENSE)
 
 <br/>
@@ -20,9 +20,15 @@
 
 **Magi is not another ChatBot — it's your AI engineering team.**
 
-It runs inside VSCode, transforms complex engineering tasks into executable task contracts,
-dispatches multiple heterogeneous Workers for parallel collaboration,
-forming a complete closed loop from intent understanding, task decomposition, execution & repair to acceptance & knowledge retention.
+It can run either as a VSCode extension or as a standalone Web client served by the Local Agent,
+transforming complex engineering tasks into executable task contracts,
+dispatching multiple heterogeneous Workers for parallel collaboration,
+and forming a complete closed loop from intent understanding, task decomposition, execution & repair to acceptance & knowledge retention.
+
+Magi currently supports two entry modes:
+
+- **Extension mode**: Use Magi inside VSCode. The extension starts the Local Agent automatically.
+- **Web mode**: No VSCode extension required. Start the Local Agent yourself and access Magi from the browser.
 
 [Core Features](#core-features) • [How It Works](#how-it-works) • [Quick Start](#quick-start) • [Contact](#contact)
 
@@ -147,35 +153,103 @@ You're no longer a prompt engineer — you're the tech lead of an AI team.
 
 ### Requirements
 
-- **VSCode**: `>= 1.93.0`
+- **VSCode**: `>= 1.93.0` for extension mode
 - **Node.js**: `>= 18` recommended
 - **Available CLI**: At least one configured (Claude / Codex / Gemini)
 - **Network**: Required for online search or external model calls
 
-### 1. Install the Extension
-Search for **Magi** in the VSCode Extension Marketplace and install, or install locally via `.vsix`.
+### Usage Modes
 
-### 2. Configure Model CLI
+### 1. Extension Mode
+
+#### Install the extension
+
+Search for **Magi** in the VSCode Extension Marketplace and install it, or install locally via `.vsix`.
+
+#### Configure model CLI
+
 Search `magi` in VSCode Settings and configure the CLI paths for orchestration and Workers:
+
 - `magi.claude.path`
 - `magi.codex.path`
 - `magi.gemini.path`
 
-### 3. Choose Governance Mode
+#### Choose governance mode
+
 - `magi.deepTask = false`: Standard mode (default)
 - `magi.deepTask = true`: Deep mode (project-level governance)
 
-### 4. Start Collaborating
+#### Start collaborating
+
 - Open panel: `Ctrl+Shift+A` (Mac: `Cmd+Shift+A`)
 - Launch task: `Ctrl+Shift+Enter` (Mac: `Cmd+Shift+Enter`)
 - New session: `Ctrl+Alt+N` (Mac: `Cmd+Alt+N`)
 - Stop task: `Ctrl+Shift+Backspace` (Mac: `Cmd+Shift+Backspace`)
+- Open Web client: run `Magi: 打开 Web 客户端` from the command palette
 
-### 5. Minimal Verification (1 minute)
+### 2. Web Mode
 
-- In a new session, type: `Please read README.md and summarize the current version number`.
-- Observe whether a task is triggered, execution status appears, and a final reply is returned.
-- If it fails, check CLI paths and API key configuration first.
+Web mode does not require the VSCode extension, but you must start the Local Agent yourself. Two startup paths are available:
+
+#### Production mode: Agent serves the Web frontend directly
+
+Build first:
+
+```bash
+npm install
+npm run build:agent
+npm run build:web
+```
+
+Start the backend:
+
+```bash
+MAGI_AGENT_WORKSPACES='[{"rootPath":"/absolute/path/to/your/project","name":"your-project"}]' node dist/agent.js
+```
+
+Then open:
+
+```text
+http://127.0.0.1:46231/web.html?workspacePath=/absolute/path/to/your/project
+```
+
+Notes:
+
+- `Local Agent` listens on `127.0.0.1:46231` by default
+- It is recommended to pass an absolute `workspacePath`
+- In this mode, the backend serves `dist/web` directly, so only one service is required
+
+#### Development mode: frontend and backend started separately
+
+Terminal 1 starts the backend:
+
+```bash
+MAGI_AGENT_WORKSPACES='[{"rootPath":"/absolute/path/to/your/project","name":"your-project"}]' npm run dev:agent
+```
+
+Terminal 2 starts the frontend:
+
+```bash
+npm run dev:web
+```
+
+Then open:
+
+```text
+http://127.0.0.1:3000/web.html?workspacePath=/absolute/path/to/your/project
+```
+
+Notes:
+
+- `npm run dev:web` starts the Vite dev server on port `3000`
+- `/api` and `/api/events` are proxied to `http://127.0.0.1:46231`
+- This mode is intended for Web UI development and frontend/backend debugging
+
+### 3. Minimal Verification (1 minute)
+
+- In a new session, type: `Please read README.md and summarize the current version number`
+- Confirm that a task is triggered, execution status appears, and a final answer is returned
+- If it fails, first check CLI paths, API keys, `MAGI_AGENT_WORKSPACES`, and the workspace path binding
 
 ![Settings Panel](image/setting-board.png)
 
@@ -186,7 +260,7 @@ Search `magi` in VSCode Settings and configure the CLI paths for orchestration a
 | Layer | Technology |
 |:---|:---|
 | Language | TypeScript |
-| Host | VSCode Extension API |
+| Host | VSCode Extension API / Local Agent Web Host |
 | Frontend UI | Svelte |
 | Build | esbuild |
 | AI Protocols | OpenAI API, Anthropic API, Gemini API (unified client) |
