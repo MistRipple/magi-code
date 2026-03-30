@@ -150,8 +150,8 @@
     font-weight: var(--font-bold, 700);
     line-height: 14px;
     text-align: center;
-    color: #fff;
-    background: var(--error, #e45454);
+    color: var(--primary-foreground);
+    background: var(--error);
     border-radius: 7px;
     pointer-events: none;
   }
@@ -171,7 +171,7 @@
     width: 320px;
     max-height: 400px;
     background: var(--dropdown-bg);
-    border: 1px solid var(--border, #454545);
+    border: 1px solid var(--border);
     border-radius: var(--radius-md, 6px);
     box-shadow: var(--shadow-lg, 0 8px 24px rgba(0,0,0,0.3));
     z-index: var(--z-dropdown, 100);
@@ -185,14 +185,14 @@
     justify-content: space-between;
     align-items: center;
     padding: var(--space-3, 8px) var(--space-4, 12px);
-    border-bottom: 1px solid var(--border, #454545);
+    border-bottom: 1px solid var(--border);
     flex-shrink: 0;
   }
 
   .panel-title {
     font-size: var(--text-xs, 11px);
     font-weight: var(--font-semibold, 600);
-    color: var(--foreground-muted, #999);
+    color: var(--foreground-muted);
     text-transform: uppercase;
     letter-spacing: 0.5px;
   }
@@ -208,14 +208,14 @@
     align-items: center;
     gap: var(--space-2, 4px);
     padding: var(--space-2, 6px) var(--space-3, 8px);
-    border-bottom: 1px solid var(--border, #454545);
+    border-bottom: 1px solid var(--border);
     flex-shrink: 0;
   }
 
   .filter-btn {
-    border: 1px solid var(--border, #454545);
+    border: 1px solid var(--border);
     background: var(--surface-2);
-    color: var(--foreground-muted, #999);
+    color: var(--foreground-muted);
     border-radius: 999px;
     font-size: var(--text-xs, 11px);
     padding: 3px 8px;
@@ -224,20 +224,20 @@
   }
 
   .filter-btn:hover {
-    color: var(--foreground, #ccc);
-    border-color: var(--foreground-muted, #999);
+    color: var(--foreground);
+    border-color: var(--foreground-muted);
   }
 
   .filter-btn.active {
-    color: var(--foreground, #ddd);
+    color: var(--foreground);
     background: var(--surface-hover);
-    border-color: var(--foreground-muted, #999);
+    border-color: var(--foreground-muted);
   }
 
   .btn-text {
     background: transparent;
     border: none;
-    color: var(--foreground-muted, #999);
+    color: var(--foreground-muted);
     font-size: var(--text-xs, 11px);
     cursor: pointer;
     padding: 2px 6px;
@@ -247,7 +247,7 @@
 
   .btn-text:hover {
     background: var(--surface-hover);
-    color: var(--foreground, #ccc);
+    color: var(--foreground);
   }
 
   .notification-list {
@@ -262,7 +262,7 @@
     align-items: center;
     gap: var(--space-3, 8px);
     padding: var(--space-6, 24px);
-    color: var(--foreground-muted, #999);
+    color: var(--foreground-muted);
     font-size: var(--text-sm, 13px);
   }
 
@@ -276,7 +276,7 @@
   }
 
   .notification-item:hover {
-    background: var(--surface-hover, rgba(255,255,255,0.06));
+    background: var(--surface-hover);
   }
 
   .notif-icon {
@@ -302,14 +302,14 @@
   .notif-title {
     font-size: var(--text-sm, 13px);
     font-weight: var(--font-semibold, 600);
-    color: var(--foreground, #ccc);
+    color: var(--foreground);
     margin-bottom: 2px;
     word-break: break-word;
   }
 
   .notif-message {
     font-size: var(--text-sm, 13px);
-    color: var(--foreground-muted, #999);
+    color: var(--foreground-muted);
     line-height: var(--leading-normal, 1.5);
     word-break: break-word;
   }
@@ -323,8 +323,8 @@
 
   .notif-category {
     font-size: 10px;
-    color: var(--foreground-muted, #999);
-    border: 1px solid var(--border, #454545);
+    color: var(--foreground-muted);
+    border: 1px solid var(--border);
     border-radius: 999px;
     padding: 1px 6px;
     text-transform: uppercase;
@@ -333,7 +333,7 @@
 
   .notif-time {
     font-size: var(--text-xs, 11px);
-    color: var(--foreground-muted, #777);
+    color: var(--foreground-muted);
   }
 
   .notif-remove {
@@ -343,7 +343,7 @@
     padding: 0;
     background: transparent;
     border: none;
-    color: var(--foreground-muted, #999);
+    color: var(--foreground-muted);
     cursor: pointer;
     border-radius: var(--radius-sm, 4px);
     display: flex;
@@ -358,7 +358,7 @@
   }
 
   .notif-remove:hover {
-    background: var(--surface-hover, rgba(255,255,255,0.06));
-    color: var(--foreground, #ccc);
+    background: var(--surface-hover);
+    color: var(--foreground);
   }
 </style>

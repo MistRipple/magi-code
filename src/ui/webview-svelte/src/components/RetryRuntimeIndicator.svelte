@@ -52,19 +52,19 @@
     margin-top: 10px;
     padding: 10px 12px;
     border-radius: 10px;
-    border: 1px solid var(--border-color, rgba(128, 128, 128, 0.2));
-    background: var(--surface-secondary, rgba(128, 128, 128, 0.08));
+    border: 1px solid var(--border);
+    background: var(--surface-2);
   }
 
   .retry-runtime-title {
     font-size: 12px;
     font-weight: 600;
-    color: var(--text-primary);
+    color: var(--foreground);
   }
 
   .retry-runtime-wait {
     margin-top: 4px;
     font-size: 12px;
-    color: var(--text-secondary);
+    color: var(--foreground-muted);
   }
 </style>

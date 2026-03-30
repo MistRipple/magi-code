@@ -185,7 +185,7 @@
   }
 
   .markdown-detail-trigger:hover {
-    color: color-mix(in srgb, var(--primary) 82%, white);
+    color: var(--primary-hover);
   }
 
   .markdown-detail-trigger:focus-visible {
@@ -211,7 +211,7 @@
   .markdown-detail-popover {
     position: fixed;
     z-index: var(--z-popover);
-    background: var(--vscode-editor-background, #1e1e1e);
+    background: var(--background);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);

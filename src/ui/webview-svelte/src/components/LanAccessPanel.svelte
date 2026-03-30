@@ -184,36 +184,36 @@
 {/if}
 
 <style>
-  .lan-access-panel { position: absolute; top: calc(100% + 4px); right: 0; width: 300px; max-height: 80vh; overflow-y: auto; background: var(--vscode-editor-background, #1e1e1e); border: 1px solid var(--vscode-panel-border, #454545); border-radius: var(--radius-lg, 8px); box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45); z-index: var(--z-popover, 100); animation: panelSlideIn 0.15s ease-out; }
+  .lan-access-panel { position: absolute; top: calc(100% + 4px); right: 0; width: 300px; max-height: 80vh; overflow-y: auto; background: var(--background); border: 1px solid var(--border); border-radius: var(--radius-lg, 8px); box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45); z-index: var(--z-popover, 100); animation: panelSlideIn 0.15s ease-out; }
   @keyframes panelSlideIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
-  .panel-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid var(--border, #333); }
-  .panel-title { font-size: var(--text-sm, 13px); font-weight: 600; color: var(--foreground, #ccc); }
-  .panel-close { display: flex; align-items: center; justify-content: center; width: 22px; height: 22px; background: transparent; border: none; border-radius: var(--radius-sm, 4px); color: var(--foreground-muted, #888); cursor: pointer; transition: all 0.15s; }
-  .panel-close:hover { background: var(--surface-hover, rgba(255,255,255,0.08)); color: var(--foreground, #ccc); }
+  .panel-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .panel-title { font-size: var(--text-sm, 13px); font-weight: 600; color: var(--foreground); }
+  .panel-close { display: flex; align-items: center; justify-content: center; width: 22px; height: 22px; background: transparent; border: none; border-radius: var(--radius-sm, 4px); color: var(--foreground-muted); cursor: pointer; transition: all 0.15s; }
+  .panel-close:hover { background: var(--surface-hover); color: var(--foreground); }
   .section { padding: 0; }
-  .section-label { display: flex; align-items: center; gap: 8px; padding: 8px 12px 4px; font-size: var(--text-xs, 11px); font-weight: 600; color: var(--foreground-muted, #888); text-transform: uppercase; letter-spacing: 0.5px; }
-  .tunnel-section { border-top: 1px solid var(--border, #333); }
-  .tunnel-status { font-weight: 400; text-transform: none; letter-spacing: 0; font-size: var(--text-xs, 11px); color: var(--foreground-muted, #888); }
-  .tunnel-status.running { color: var(--vscode-terminal-ansiGreen, #4ec9b0); }
-  .tunnel-status.error { color: var(--vscode-errorForeground, #f44747); }
+  .section-label { display: flex; align-items: center; gap: 8px; padding: 8px 12px 4px; font-size: var(--text-xs, 11px); font-weight: 600; color: var(--foreground-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .tunnel-section { border-top: 1px solid var(--border); }
+  .tunnel-status { font-weight: 400; text-transform: none; letter-spacing: 0; font-size: var(--text-xs, 11px); color: var(--foreground-muted); }
+  .tunnel-status.running { color: var(--success); }
+  .tunnel-status.error { color: var(--error); }
   .panel-body { padding: 6px 12px 10px; }
-  .panel-desc { font-size: var(--text-xs, 11px); color: var(--foreground-muted, #888); margin: 0 0 8px 0; line-height: 1.5; text-align: center; }
+  .panel-desc { font-size: var(--text-xs, 11px); color: var(--foreground-muted); margin: 0 0 8px 0; line-height: 1.5; text-align: center; }
   .qr-container { display: flex; align-items: center; justify-content: center; aspect-ratio: 1; margin: 4px 12px; padding: 16px; background: #ffffff; border-radius: var(--radius-lg, 8px); }
   .qr-container :global(svg) { width: 100%; height: 100%; }
-  .qr-placeholder { display: flex; align-items: center; justify-content: center; gap: 6px; aspect-ratio: 1; margin: 4px 12px; background: var(--surface-2, rgba(255,255,255,0.04)); border-radius: var(--radius-lg, 8px); }
-  .qr-error { display: flex; align-items: center; justify-content: center; aspect-ratio: 1; margin: 4px 12px; padding: 12px; border-radius: var(--radius-lg, 8px); border: 1px dashed var(--vscode-panel-border, #454545); background: var(--vscode-editorWidget-background, #252526); color: var(--foreground-muted, #888); font-size: var(--text-xs, 11px); line-height: 1.6; text-align: center; }
-  .loading-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--foreground-muted, #888); animation: dotPulse 1.2s ease-in-out infinite; }
+  .qr-placeholder { display: flex; align-items: center; justify-content: center; gap: 6px; aspect-ratio: 1; margin: 4px 12px; background: var(--surface-2); border-radius: var(--radius-lg, 8px); }
+  .qr-error { display: flex; align-items: center; justify-content: center; aspect-ratio: 1; margin: 4px 12px; padding: 12px; border-radius: var(--radius-lg, 8px); border: 1px dashed var(--border); background: var(--surface-2); color: var(--foreground-muted); font-size: var(--text-xs, 11px); line-height: 1.6; text-align: center; }
+  .loading-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--foreground-muted); animation: dotPulse 1.2s ease-in-out infinite; }
   .loading-dot:nth-child(2) { animation-delay: 0.15s; }
   .loading-dot:nth-child(3) { animation-delay: 0.3s; }
   @keyframes dotPulse { 0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); } 40% { opacity: 1; transform: scale(1); } }
   .url-row { display: flex; gap: 6px; }
-  .url-input { flex: 1; min-width: 0; padding: 6px 8px; font-size: var(--text-xs, 11px); font-family: var(--font-mono, monospace); color: var(--foreground, #ccc); background: var(--surface-2, rgba(255,255,255,0.04)); border: 1px solid var(--border, #333); border-radius: var(--radius-sm, 4px); outline: none; }
-  .url-input:focus { border-color: var(--accent, var(--vscode-focusBorder, #007fd4)); }
-  .copy-btn { display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; flex-shrink: 0; background: var(--accent, var(--vscode-button-background, #0078d4)); border: none; border-radius: var(--radius-sm, 4px); color: var(--accent-fg, var(--vscode-button-foreground, #fff)); cursor: pointer; transition: opacity 0.15s; }
+  .url-input { flex: 1; min-width: 0; padding: 6px 8px; font-size: var(--text-xs, 11px); font-family: var(--font-mono, monospace); color: var(--foreground); background: var(--vscode-input-background, var(--surface-2)); border: 1px solid var(--border); border-radius: var(--radius-sm, 4px); outline: none; }
+  .url-input:focus { border-color: var(--primary); }
+  .copy-btn { display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; flex-shrink: 0; background: var(--primary); border: none; border-radius: var(--radius-sm, 4px); color: var(--primary-foreground); cursor: pointer; transition: opacity 0.15s; }
   .copy-btn:hover { opacity: 0.85; }
-  .tunnel-toggle-btn { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; padding: 6px 12px; font-size: var(--text-xs, 12px); font-weight: 500; color: var(--accent-fg, var(--vscode-button-foreground, #fff)); background: var(--accent, var(--vscode-button-background, #0078d4)); border: none; border-radius: var(--radius-sm, 4px); cursor: pointer; transition: opacity 0.15s; }
+  .tunnel-toggle-btn { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; padding: 6px 12px; font-size: var(--text-xs, 12px); font-weight: 500; color: var(--primary-foreground); background: var(--primary); border: none; border-radius: var(--radius-sm, 4px); cursor: pointer; transition: opacity 0.15s; }
   .tunnel-toggle-btn:hover:not(:disabled) { opacity: 0.85; }
   .tunnel-toggle-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .tunnel-hint { font-size: 10px; color: var(--foreground-muted, #666); margin: 6px 0 0 0; text-align: center; line-height: 1.4; }
-  .tunnel-error { padding: 4px 12px; margin: 0; font-size: var(--text-xs, 11px); color: var(--vscode-errorForeground, #f44747); line-height: 1.4; }
+  .tunnel-hint { font-size: 10px; color: var(--foreground-muted); margin: 6px 0 0 0; text-align: center; line-height: 1.4; }
+  .tunnel-error { padding: 4px 12px; margin: 0; font-size: var(--text-xs, 11px); color: var(--error); line-height: 1.4; }
 </style>

@@ -1,5 +1,6 @@
 import { createWebClientBridge } from '../../shared/bridges/web-client-bridge';
 import { bootstrapApp } from './bootstrap-app';
+import { installHostTheme } from './web/theme';
 
 const agentBaseUrl = typeof window !== 'undefined'
   ? (window as unknown as { __AGENT_BASE_URL__?: string }).__AGENT_BASE_URL__?.trim() || ''
@@ -17,5 +18,7 @@ if (!workspacePath) {
 }
 
 const bridge = createWebClientBridge();
+
+installHostTheme();
 
 export default bootstrapApp(bridge);

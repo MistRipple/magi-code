@@ -22,6 +22,7 @@
   let translateX = $state(0);
   let translateY = $state(0);
   let lastRenderedCode = $state('');
+  let activeThemeMode = $state<'light' | 'dark'>('dark');
 
   // 生成唯一 ID
   const getUniqueId = () => `mermaid-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
@@ -108,55 +109,119 @@
     return key ? i18n.t(key) : 'Mermaid';
   });
 
-  onMount(() => {
-    console.log('[MermaidRenderer] mounted, code:', code?.substring(0, 50));
+  function resolveThemeMode(): 'light' | 'dark' {
+    if (typeof document === 'undefined') {
+      return 'dark';
+    }
+    const classNames = [
+      ...Array.from(document.documentElement.classList),
+      ...(document.body ? Array.from(document.body.classList) : []),
+    ];
+    if (classNames.includes('theme-light') || classNames.includes('vscode-light')) {
+      return 'light';
+    }
+    return 'dark';
+  }
 
-    if (!mermaidInitialized) {
-      mermaid.initialize({
-        startOnLoad: false,
-        theme: 'dark',
-        securityLevel: 'loose',
-        fontFamily: 'ui-sans-serif, system-ui, sans-serif',
-        themeVariables: {
-          darkMode: true,
-          background: '#1e1e1e',
-          primaryColor: '#4a9eff',
-          primaryTextColor: '#ffffff',
-          primaryBorderColor: '#4a9eff',
-          lineColor: '#888888',
-          secondaryColor: '#2d5a8a',
-          tertiaryColor: '#1a3a5c',
-          textColor: '#e0e0e0',
-          mainBkg: '#2d2d2d',
-          nodeBorder: '#4a9eff',
-          clusterBkg: '#1a1a1a',
-          clusterBorder: '#4a9eff',
-          titleColor: '#ffffff',
-          edgeLabelBackground: '#2d2d2d',
-        },
-        flowchart: {
-          htmlLabels: true,
-          curve: 'basis',
-          nodeSpacing: 50,
-          rankSpacing: 50,
-        },
-        sequence: {
-          diagramMarginX: 20,
-          diagramMarginY: 20,
-          actorMargin: 50,
-          width: 150,
-          height: 65,
-        },
+  function readThemeToken(name: string, fallback: string): string {
+    if (typeof window === 'undefined') {
+      return fallback;
+    }
+    const rootStyles = window.getComputedStyle(document.documentElement);
+    const bodyStyles = document.body ? window.getComputedStyle(document.body) : null;
+    return bodyStyles?.getPropertyValue(name).trim()
+      || rootStyles.getPropertyValue(name).trim()
+      || fallback;
+  }
+
+  function initializeMermaid(mode: 'light' | 'dark'): void {
+    const background = readThemeToken('--background', mode === 'light' ? '#ffffff' : '#11161d');
+    const surface1 = readThemeToken('--surface-1', mode === 'light' ? 'rgba(0, 0, 0, 0.02)' : 'rgba(255, 255, 255, 0.02)');
+    const surface2 = readThemeToken('--surface-2', mode === 'light' ? 'rgba(0, 0, 0, 0.04)' : 'rgba(255, 255, 255, 0.04)');
+    const foreground = readThemeToken('--foreground', mode === 'light' ? '#1f2937' : '#e5e7eb');
+    const foregroundMuted = readThemeToken('--foreground-muted', mode === 'light' ? '#667085' : '#98a2b3');
+    const primary = readThemeToken('--primary', '#2563eb');
+
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'base',
+      securityLevel: 'loose',
+      fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+      themeVariables: {
+        darkMode: mode === 'dark',
+        background,
+        primaryColor: surface2,
+        primaryTextColor: foreground,
+        primaryBorderColor: primary,
+        lineColor: foregroundMuted,
+        secondaryColor: surface2,
+        tertiaryColor: surface1,
+        textColor: foreground,
+        mainBkg: surface2,
+        nodeBorder: primary,
+        clusterBkg: surface1,
+        clusterBorder: primary,
+        titleColor: foreground,
+        edgeLabelBackground: background,
+        actorBkg: surface2,
+        actorBorder: primary,
+        actorTextColor: foreground,
+        noteBkgColor: surface2,
+        noteBorderColor: primary,
+        noteTextColor: foreground,
+        labelBoxBkgColor: surface2,
+        labelBoxBorderColor: primary,
+        signalColor: foregroundMuted,
+        signalTextColor: foreground,
+      },
+      flowchart: {
+        htmlLabels: true,
+        curve: 'basis',
+        nodeSpacing: 50,
+        rankSpacing: 50,
+      },
+      sequence: {
+        diagramMarginX: 20,
+        diagramMarginY: 20,
+        actorMargin: 50,
+        width: 150,
+        height: 65,
+      },
+    });
+    mermaidInitialized = true;
+    activeThemeMode = mode;
+  }
+
+  onMount(() => {
+    initializeMermaid(resolveThemeMode());
+    void doRender();
+
+    const observer = new MutationObserver(() => {
+      const nextMode = resolveThemeMode();
+      if (nextMode === activeThemeMode) {
+        return;
+      }
+      initializeMermaid(nextMode);
+      void doRender();
+    });
+
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['class', 'style', 'data-vscode-theme-id'],
+    });
+
+    if (document.body) {
+      observer.observe(document.body, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-vscode-theme-id'],
       });
-      mermaidInitialized = true;
     }
 
-    doRender();
+    return () => observer.disconnect();
   });
 
   // 渲染图表
   async function doRender() {
-    console.log('[MermaidRenderer] doRender called, code length:', code?.length);
     if (!code) {
       error = i18n.t('mermaidRenderer.noCode');
       isRendering = false;
@@ -168,9 +233,7 @@
       error = '';
 
       const diagramId = getUniqueId();
-      console.log('[MermaidRenderer] calling mermaid.render with id:', diagramId);
       const { svg } = await mermaid.render(diagramId, code.trim());
-      console.log('[MermaidRenderer] render success, svg length:', svg?.length);
       svgContent = svg;
       lastRenderedCode = code;
     } catch (e) {
@@ -325,7 +388,13 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     overflow: hidden;
-    background: var(--surface-1, rgba(255,255,255,0.02));
+    --mermaid-node-bg: var(--surface-2);
+    --mermaid-node-border: var(--primary);
+    --mermaid-text: var(--foreground);
+    --mermaid-line: var(--foreground-muted);
+    --mermaid-cluster-bg: var(--surface-1);
+    --mermaid-edge-label-bg: var(--background);
+    background: var(--surface-1);
     margin: var(--space-2, 8px) 0;
   }
 
@@ -338,7 +407,7 @@
     align-items: center;
     justify-content: space-between;
     padding: var(--space-2, 8px) var(--space-3, 12px);
-    background: var(--surface-2, rgba(0,0,0,0.1));
+    background: var(--surface-2);
     border-bottom: 1px solid var(--border);
   }
 
@@ -399,7 +468,7 @@
     align-items: center;
     justify-content: center;
     padding: var(--space-4, 16px);
-    background: var(--code-bg, rgba(0,0,0,0.2));
+    background: var(--code-bg);
     cursor: grab;
   }
 
@@ -429,36 +498,36 @@
   .svg-wrapper :global(.node ellipse),
   .svg-wrapper :global(.node polygon),
   .svg-wrapper :global(.node path) {
-    fill: #2d2d2d;
-    stroke: #4a9eff;
+    fill: var(--mermaid-node-bg) !important;
+    stroke: var(--mermaid-node-border) !important;
   }
 
   .svg-wrapper :global(.node .label),
   .svg-wrapper :global(.nodeLabel),
   .svg-wrapper :global(.label text),
   .svg-wrapper :global(text) {
-    fill: #e0e0e0 !important;
-    color: #e0e0e0 !important;
+    fill: var(--mermaid-text) !important;
+    color: var(--mermaid-text) !important;
   }
 
   .svg-wrapper :global(.edgePath path),
   .svg-wrapper :global(.flowchart-link) {
-    stroke: #888888;
+    stroke: var(--mermaid-line) !important;
   }
 
   .svg-wrapper :global(.edgeLabel),
   .svg-wrapper :global(.edgeLabel text) {
-    fill: #e0e0e0;
-    background-color: #2d2d2d;
+    fill: var(--mermaid-text) !important;
+    background-color: var(--mermaid-edge-label-bg) !important;
   }
 
   .svg-wrapper :global(.cluster rect) {
-    fill: #1a1a1a;
-    stroke: #4a9eff;
+    fill: var(--mermaid-cluster-bg) !important;
+    stroke: var(--mermaid-node-border) !important;
   }
 
   .svg-wrapper :global(marker path) {
-    fill: #888888;
+    fill: var(--mermaid-line) !important;
   }
 
   /* 浮动控制按钮（Augment 风格，左下角垂直排列） */
@@ -477,7 +546,7 @@
     justify-content: center;
     width: 28px;
     height: 28px;
-    background: var(--surface-2, rgba(0,0,0,0.4));
+    background: var(--surface-2);
     backdrop-filter: blur(8px);
     border: 1px solid var(--border);
     color: var(--foreground-muted);

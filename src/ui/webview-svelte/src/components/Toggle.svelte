@@ -64,8 +64,8 @@
     left: 0;
     right: 0;
     bottom: 0;
-    background: var(--surface-3, #3c3c3c);
-    border: 1px solid var(--border, #454545);
+    background: var(--surface-3);
+    border: 1px solid var(--border);
     border-radius: var(--radius-full, 9999px);
     transition: all var(--transition-fast, 0.15s ease);
   }
@@ -77,31 +77,30 @@
     left: 2px;
     width: 14px;
     height: 14px;
-    background: var(--foreground-muted, #999);
+    background: var(--foreground-muted);
     border-radius: var(--radius-full, 9999px);
     transition: all var(--transition-fast, 0.15s ease);
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
   }
 
   .toggle:hover .toggle-slider {
-    border-color: var(--primary-muted, #4a9eff66);
+    border-color: var(--primary-muted);
   }
 
   /* 选中状态 */
   .toggle input:checked + .toggle-slider {
-    background: var(--success, #3fb950);
-    border-color: var(--success, #3fb950);
+    background: var(--success);
+    border-color: var(--success);
   }
 
   .toggle input:checked + .toggle-slider::after {
     left: 18px;
-    background: #fff;
+    background: var(--primary-foreground);
   }
 
   /* 焦点状态（键盘导航可访问性） */
   .toggle input:focus-visible + .toggle-slider {
-    outline: 2px solid var(--primary, #4a9eff);
+    outline: 2px solid var(--primary);
     outline-offset: 2px;
   }
 </style>
-

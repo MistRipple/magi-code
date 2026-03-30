@@ -37,20 +37,20 @@
   --vscode-editor-font-family: 'SFMono-Regular', 'Cascadia Code', Consolas, 'Liberation Mono', monospace;
 
   /* 基础颜色 - VS Code 主题适配 (自动适配浅色/深色) */
-  --background: var(--vscode-sideBar-secondaryBackground, var(--vscode-sideBar-background, #11161d));
-  --foreground: var(--vscode-editor-foreground, #e5e7eb);
+  --background: var(--vscode-sideBar-secondaryBackground, var(--vscode-editorWidget-background, var(--vscode-editor-background, var(--vscode-input-background, var(--vscode-sideBar-background, #11161d)))));
+  --foreground: var(--vscode-editor-foreground, var(--vscode-foreground, #e5e7eb));
   --foreground-muted: var(--vscode-descriptionForeground, #98a2b3);
   --border: var(--vscode-panel-border, var(--vscode-widget-border, #273142));
 
   /* 消息颜色 */
   --user-message-bg: var(--vscode-inputOption-activeBackground, var(--vscode-list-hoverBackground, rgba(59, 130, 246, 0.18)));
-  --assistant-message-bg: var(--vscode-editor-background, #0f141b);
+  --assistant-message-bg: var(--vscode-editorWidget-background, var(--vscode-editor-background, var(--surface-1)));
 
   /* 交互颜色 */
   --primary: var(--vscode-button-background, #2563eb);
   --primary-hover: var(--vscode-button-hoverBackground, #1d4ed8);
   --primary-rgb: 37, 99, 235;
-  --primary-foreground: #ffffff;
+  --primary-foreground: var(--vscode-button-foreground, #ffffff);
   --primary-muted: rgba(14, 99, 156, 0.15);
   --secondary: var(--vscode-button-secondaryBackground, #1f2937);
   --secondary-hover: var(--vscode-button-secondaryHoverBackground, #273449);
@@ -533,7 +533,7 @@ pre code {
 
 .btn--primary {
   background: var(--primary);
-  color: white;
+  color: var(--primary-foreground);
 }
 
 .btn--primary:hover {
@@ -649,7 +649,7 @@ pre code {
   padding: 0 var(--space-2);
   font-size: var(--text-xs);
   font-weight: var(--font-semibold);
-  color: white;
+  color: var(--primary-foreground);
   background: var(--primary);
   border-radius: var(--radius-full);
   line-height: 1;
@@ -661,7 +661,7 @@ pre code {
 
 .badge--warning {
   background: var(--warning);
-  color: var(--vscode-button-foreground, white);
+  color: var(--primary-foreground);
 }
 
 .badge--error {
@@ -917,7 +917,7 @@ pre code {
 .modal-btn.primary {
   background: var(--primary);
   border-color: var(--primary);
-  color: white;
+  color: var(--primary-foreground);
 }
 
 .modal-btn.primary:hover {
@@ -937,7 +937,7 @@ pre code {
 .modal-btn.danger {
   background: var(--error);
   border-color: var(--error);
-  color: white;
+  color: var(--primary-foreground);
 }
 
 .modal-btn.danger:hover {

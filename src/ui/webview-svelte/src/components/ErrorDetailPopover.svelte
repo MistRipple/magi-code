@@ -116,11 +116,11 @@
   .error-more-btn, .error-popover-btn { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; cursor: pointer; transition: all var(--transition-fast); }
   .error-more-btn { padding: 0; border: none; background: transparent; color: var(--primary); font-size: inherit; line-height: 1.4; text-decoration: underline; text-underline-offset: 2px; }
   .error-popover-btn { width: 24px; height: 24px; }
-  .error-more-btn:hover { color: color-mix(in srgb, var(--primary) 82%, white); }
+  .error-more-btn:hover { color: var(--primary-hover); }
   .error-more-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-radius: var(--radius-xs); }
   .error-popover-btn { border: 1px solid var(--border); background: var(--surface-2); color: var(--foreground-muted); border-radius: var(--radius-sm); }
   .error-popover-btn:hover { background: var(--surface-hover); color: var(--foreground); }
-  .error-popover { position: fixed; z-index: var(--z-popover); background: var(--vscode-editor-background, #1e1e1e); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35); padding: var(--space-3); display: flex; flex-direction: column; gap: var(--space-3); }
+  .error-popover { position: fixed; z-index: var(--z-popover); background: var(--background); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35); padding: var(--space-3); display: flex; flex-direction: column; gap: var(--space-3); }
   .error-popover-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
   .error-popover-title { font-size: var(--text-sm); font-weight: var(--font-semibold); color: var(--foreground); }
   .error-popover-actions { display: flex; align-items: center; gap: var(--space-2); }

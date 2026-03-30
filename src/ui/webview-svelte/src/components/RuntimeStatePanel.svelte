@@ -626,7 +626,7 @@
   }
 
   /* 卡片左边框根据终态着色 */
-  .runtime-diagnostics--completed { border-left-color: #4ec995; }
+  .runtime-diagnostics--completed { border-left-color: var(--success); }
   .runtime-diagnostics--failed    { border-left-color: var(--vscode-editorError-foreground, var(--error)); }
   .runtime-diagnostics--cancelled { border-left-color: var(--vscode-editorWidget-border, var(--border)); }
   .runtime-diagnostics--idle      { border-left-color: var(--vscode-editorWidget-border, var(--border)); }
@@ -661,32 +661,32 @@
   }
 
   .summary__badge--completed {
-    background: rgba(78, 201, 149, 0.18);
-    color: #4ec995;
+    background: color-mix(in srgb, var(--success) 18%, transparent);
+    color: var(--success);
   }
   .summary__badge--idle {
-    background: rgba(140, 140, 140, 0.18);
-    color: #999;
+    background: color-mix(in srgb, var(--foreground-muted) 18%, transparent);
+    color: var(--foreground-muted);
   }
   .summary__badge--running {
-    background: rgba(14, 112, 192, 0.18);
-    color: var(--vscode-textLink-foreground, var(--info));
+    background: color-mix(in srgb, var(--info) 18%, transparent);
+    color: var(--info);
   }
   .summary__badge--waiting {
-    background: rgba(204, 167, 0, 0.18);
-    color: var(--vscode-editorWarning-foreground, var(--warning));
+    background: color-mix(in srgb, var(--warning) 18%, transparent);
+    color: var(--warning);
   }
   .summary__badge--failed {
-    background: rgba(244, 135, 113, 0.18);
-    color: var(--vscode-editorError-foreground, var(--error));
+    background: color-mix(in srgb, var(--error) 18%, transparent);
+    color: var(--error);
   }
   .summary__badge--cancelled {
-    background: rgba(140, 140, 140, 0.18);
-    color: #999;
+    background: color-mix(in srgb, var(--foreground-muted) 18%, transparent);
+    color: var(--foreground-muted);
   }
   .summary__badge--paused {
-    background: rgba(204, 167, 0, 0.18);
-    color: var(--vscode-editorWarning-foreground, var(--warning));
+    background: color-mix(in srgb, var(--warning) 18%, transparent);
+    color: var(--warning);
   }
 
   .summary__phase {
@@ -768,7 +768,7 @@
   }
 
   .metric-card__sub--ok {
-    color: #4ec995;
+    color: var(--success);
     opacity: 1;
   }
 
@@ -787,7 +787,7 @@
   .progress-bar__fill {
     height: 100%;
     border-radius: 2px;
-    background: var(--vscode-progressBar-background, #0e70c0);
+    background: var(--info);
     transition: width 0.3s ease;
   }
 
@@ -798,7 +798,7 @@
   }
 
   .runtime-diagnostics__block--failure {
-    border: 1px solid color-mix(in srgb, var(--vscode-editorError-foreground, #f48771) 28%, transparent);
+    border: 1px solid color-mix(in srgb, var(--error) 28%, transparent);
     border-radius: 8px;
     padding: 10px 12px;
     background: color-mix(in srgb, var(--vscode-editorError-foreground, var(--error)) 8%, transparent);
@@ -823,7 +823,7 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
-    color: var(--vscode-descriptionForeground, #b0b0b0);
+    color: var(--foreground-muted);
     font-size: 12px;
     line-height: 1.5;
   }
@@ -935,20 +935,20 @@
   }
 
   .phase--tool {
-    background: rgba(14, 112, 192, 0.12);
-    color: var(--vscode-textLink-foreground, #3794ff);
+    background: color-mix(in srgb, var(--info) 12%, transparent);
+    color: var(--info);
   }
   .phase--handoff {
-    background: rgba(204, 167, 0, 0.12);
-    color: var(--vscode-editorWarning-foreground, #cca700);
+    background: color-mix(in srgb, var(--warning) 12%, transparent);
+    color: var(--warning);
   }
   .phase--finalize {
-    background: rgba(78, 201, 149, 0.12);
-    color: #4ec995;
+    background: color-mix(in srgb, var(--success) 12%, transparent);
+    color: var(--success);
   }
   .phase--idle {
-    background: rgba(140, 140, 140, 0.12);
-    color: #999;
+    background: color-mix(in srgb, var(--foreground-muted) 12%, transparent);
+    color: var(--foreground-muted);
   }
 
   .trace-item__arrow {
@@ -964,23 +964,23 @@
   }
 
   .action--continue {
-    background: rgba(14, 112, 192, 0.2);
-    color: var(--vscode-textLink-foreground, #3794ff);
+    background: color-mix(in srgb, var(--info) 20%, transparent);
+    color: var(--info);
   }
 
   .action--handoff {
-    background: rgba(204, 167, 0, 0.15);
-    color: var(--vscode-editorWarning-foreground, #cca700);
+    background: color-mix(in srgb, var(--warning) 15%, transparent);
+    color: var(--warning);
   }
 
   .action--terminate {
-    background: rgba(51, 153, 102, 0.2);
-    color: #4ec995;
+    background: color-mix(in srgb, var(--success) 20%, transparent);
+    color: var(--success);
   }
 
   .action--fallback {
-    background: rgba(204, 51, 51, 0.15);
-    color: var(--vscode-editorError-foreground, #f48771);
+    background: color-mix(in srgb, var(--error) 15%, transparent);
+    color: var(--error);
   }
 
   .trace-item__meta {

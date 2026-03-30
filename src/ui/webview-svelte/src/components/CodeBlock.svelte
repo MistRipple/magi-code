@@ -228,7 +228,7 @@
     width: 16px;
     height: 16px;
     transition: transform var(--transition-fast);
-    color: var(--foreground-muted, #888);
+    color: var(--foreground-muted);
   }
 
   .code-block.collapsed .chevron {
@@ -257,7 +257,7 @@
 
   .lang-name {
     font-weight: 600;
-    color: var(--accent-color, #646cff);
+    color: var(--primary);
     text-transform: uppercase;
   }
 
@@ -268,8 +268,8 @@
 
   .streaming-badge {
     font-size: 10px;
-    background: var(--accent-color);
-    color: white;
+    background: var(--primary);
+    color: var(--primary-foreground);
     padding: 0 4px;
     border-radius: 4px;
     animation: pulse 1.5s infinite;
@@ -295,9 +295,9 @@
   }
 
   .copy-btn.copied {
-    color: var(--success-color, #4caf50);
-    border-color: var(--success-color);
-    background: rgba(76, 175, 80, 0.1);
+    color: var(--success);
+    border-color: var(--success);
+    background: color-mix(in srgb, var(--success) 10%, transparent);
   }
 
   /* 
