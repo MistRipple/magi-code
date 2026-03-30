@@ -25,7 +25,7 @@ import type {
 
 const VALID_TRANSITIONS: Record<ExecutionChainStatus, ExecutionChainStatus[]> = {
   running:     ['paused', 'interrupted', 'completed', 'failed', 'cancelled'],
-  paused:      ['running', 'interrupted', 'cancelled'],
+  paused:      ['running', 'resuming', 'interrupted', 'cancelled'],
   interrupted: ['resuming', 'cancelled'],
   resuming:    ['running', 'failed', 'interrupted'],
   completed:   [],
@@ -81,7 +81,7 @@ export class ExecutionChainStore {
   }
 
   /**
-   * 废弃同 session 下所有旧的 interrupted+recoverable 链。
+   * 废弃同 session 下所有旧的可恢复链（interrupted+recoverable 及 paused）。
    * 由 MDE 在非 resume 路径的新请求入口调用，确保"继续"语义仅对最近一轮有效。
    */
   expireRecoverableChains(sessionId: string): number {
@@ -90,7 +90,7 @@ export class ExecutionChainStore {
     const now = Date.now();
     let expired = 0;
     for (const chain of sessionMap.values()) {
-      if (chain.status === 'interrupted' && chain.recoverable) {
+      if ((chain.status === 'interrupted' && chain.recoverable) || chain.status === 'paused') {
         chain.status = 'cancelled';
         chain.recoverable = false;
         chain.updatedAt = now;
@@ -312,7 +312,7 @@ export class ExecutionChainStore {
     if (!sessionMap) return { converged };
 
     for (const record of sessionMap.values()) {
-      if (record.status === 'running' || record.status === 'resuming') {
+      if (record.status === 'running' || record.status === 'resuming' || record.status === 'paused') {
         const canRecover = hasSnapshot
           ? hasSnapshot(record.id)
           : Boolean(record.latestSnapshotId);

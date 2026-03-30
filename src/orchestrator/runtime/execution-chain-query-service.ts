@@ -49,14 +49,15 @@ export class ExecutionChainQueryService {
    * 查找最近一条可恢复的被中断执行链
    *
    * 规则：
-   *   - status === 'interrupted' && recoverable === true
+   *   - status === 'interrupted' && recoverable === true（正常中断路径）
+   *   - status === 'paused'（governance 暂停：上游错误/预算超限等，防御性兼容旧数据）
    *   - 按 updatedAt 降序取最近一条
    *   - 不跨 session 查找
    */
   findLatestRecoverableChain(sessionId: string): ExecutionChainRecord | undefined {
     const chains = this.store.getChainsBySession(sessionId);
     return chains
-      .filter((chain) => chain.status === 'interrupted' && chain.recoverable)
+      .filter((chain) => (chain.status === 'interrupted' && chain.recoverable) || chain.status === 'paused')
       .sort((a, b) => b.updatedAt - a.updatedAt)[0];
   }
 
@@ -65,7 +66,9 @@ export class ExecutionChainQueryService {
    */
   isChainRecoverable(chainId: string): boolean {
     const chain = this.store.getChain(chainId);
-    return chain?.status === 'interrupted' && chain.recoverable === true;
+    if (!chain) return false;
+    return (chain.status === 'interrupted' && chain.recoverable === true)
+      || chain.status === 'paused';
   }
 
   /**

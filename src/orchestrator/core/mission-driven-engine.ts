@@ -4418,13 +4418,30 @@ export class MissionDrivenEngine extends EventEmitter {
     // （cancel 走 interrupted 路径，execute 方法的 isAbortError catch 会设 cancelled，
     //  但 interrupted 状态保留恢复资格，优先级更高）
     if (chain.status === 'interrupted') return;
-    const targetStatus = finalStatus === 'paused' ? 'paused' as const : finalStatus;
+    // governance 暂停（upstream_model_error / budget_exceeded / stalled 等）
+    // 语义上等同于"未完成，可恢复"，映射为 interrupted + recoverable=true，
+    // 确保用户发"继续"时 findLatestRecoverableChain 能匹配到。
+    if (finalStatus === 'paused') {
+      try {
+        this.executionChainStore.transitionChainStatus(this.activeChainId, 'interrupted', {
+          interruptedReason: 'governance_pause',
+          recoverable: true,
+        });
+        this.captureResumeSnapshot(this.activeChainId);
+      } catch (error) {
+        logger.warn('编排器.执行链.governance暂停状态转换失败', {
+          chainId: this.activeChainId,
+          error: error instanceof Error ? error.message : String(error),
+        }, LogCategory.ORCHESTRATOR);
+      }
+      return;
+    }
     try {
-      this.executionChainStore.transitionChainStatus(this.activeChainId, targetStatus);
+      this.executionChainStore.transitionChainStatus(this.activeChainId, finalStatus);
     } catch (error) {
       logger.warn('编排器.执行链.终态同步失败', {
         chainId: this.activeChainId,
-        targetStatus,
+        targetStatus: finalStatus,
         error: error instanceof Error ? error.message : String(error),
       }, LogCategory.ORCHESTRATOR);
     }

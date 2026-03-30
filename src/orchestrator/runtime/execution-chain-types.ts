@@ -48,7 +48,8 @@ export type InterruptedReason =
   | 'user_stop'          // 用户主动停止
   | 'process_exit'       // 进程退出/崩溃
   | 'extension_reload'   // 插件重载
-  | 'external_abort';    // 外部中断（超时、治理等）
+  | 'external_abort'     // 外部中断（超时等）
+  | 'governance_pause';  // 治理暂停（上游错误、预算超限等）
 
 // ============================================================================
 // 分支类型
