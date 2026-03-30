@@ -3,6 +3,8 @@
   "common.refresh": "刷新",
   "common.workspace": "工作区",
   "common.unlimited": "不限",
+  "app.bootstrapConnecting": "正在连接服务...",
+  "app.bootstrapConnectingHint": "正在初始化后台服务，请稍候",
   "app.recoveryTitle": "恢复策略确认",
   "app.recoveryMessage": "任务执行失败，需要选择恢复策略：",
   "app.recoveryContinue": "继续",

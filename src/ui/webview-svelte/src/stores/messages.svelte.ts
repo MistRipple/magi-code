@@ -79,6 +79,9 @@ import {
  * 使用对象属性模式确保跨模块响应式追踪
  */
 export const messagesState = $state({
+  // 启动状态：后端 bootstrap 数据是否已就绪
+  bootstrapped: false,
+
   // Tab 状态
   currentTopTab: 'thread' as TabType,
   currentBottomTab: 'thread' as TabType,
@@ -2636,6 +2639,9 @@ export function setProcessingActor(source: string, agent?: string) {
 
 export function setAppState(nextState: AppState | null) {
   messagesState.appState = nextState;
+  if (nextState) {
+    messagesState.bootstrapped = true;
+  }
 }
 
 export function setMissionPlan(plan: MissionPlan | null) {
