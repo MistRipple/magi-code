@@ -1,11 +1,19 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import App from '../App.svelte';
+  import Icon from '../components/Icon.svelte';
+  import type { IconName } from '../lib/icons';
   import { messagesState } from '../stores/messages.svelte';
   import { getClientBridge } from '../../../shared/bridges/bridge-runtime';
   import { i18n } from '../stores/i18n.svelte';
   import type { Session } from '../types/message';
   import WebFolderPicker from './WebFolderPicker.svelte';
+  import {
+    cycleWebThemePreference,
+    subscribeWebTheme,
+    type WebThemeMode,
+    type WebThemePreference,
+  } from './theme';
   import {
     AGENT_CONNECTION_EVENT,
     getWorkspaceSessions,
@@ -38,6 +46,8 @@
   let pendingRenameWorkspace = $state<AgentWorkspaceSummary | null>(null);
   let renameWorkspaceValue = $state('');
   let workspaceDialogError = $state('');
+  let webThemePreference = $state<WebThemePreference>('system');
+  let webThemeMode = $state<WebThemeMode>('dark');
 
   function safeStorageGet(key: string): string {
     if (typeof window === 'undefined') {
@@ -203,6 +213,55 @@
 
   // 缓存的可见工作区列表（避免模板中每次渲染都重新过滤）
   const visibleWorkspaces = $derived(getVisibleWorkspaces());
+
+  function getThemePreferenceLabel(preference: WebThemePreference): string {
+    switch (preference) {
+      case 'light':
+        return '浅色';
+      case 'dark':
+        return '深色';
+      default:
+        return '跟随系统';
+    }
+  }
+
+  function getThemeModeLabel(mode: WebThemeMode): string {
+    return mode === 'light' ? '浅色' : '深色';
+  }
+
+  function getThemeIconName(preference: WebThemePreference): IconName {
+    switch (preference) {
+      case 'light':
+        return 'sun';
+      case 'dark':
+        return 'moon';
+      default:
+        return 'monitor';
+    }
+  }
+
+  function getNextThemePreference(preference: WebThemePreference): WebThemePreference {
+    switch (preference) {
+      case 'system':
+        return 'light';
+      case 'light':
+        return 'dark';
+      default:
+        return 'system';
+    }
+  }
+
+  const themeIconName = $derived.by(() => getThemeIconName(webThemePreference));
+  const themeToggleTitle = $derived.by(() => {
+    const currentLabel = getThemePreferenceLabel(webThemePreference);
+    const actualLabel = webThemePreference === 'system' ? `（当前 ${getThemeModeLabel(webThemeMode)}）` : '';
+    const nextLabel = getThemePreferenceLabel(getNextThemePreference(webThemePreference));
+    return `主题：${currentLabel}${actualLabel}，点击切换到${nextLabel}`;
+  });
+
+  function toggleWebTheme(): void {
+    cycleWebThemePreference();
+  }
 
   function syncBrowserSessionBinding(workspaceId: string, workspacePath: string, sessionId: string | null): void {
     if (typeof window === 'undefined') {
@@ -632,6 +691,13 @@
       }
     };
   });
+
+  onMount(() => {
+    return subscribeWebTheme((snapshot) => {
+      webThemePreference = snapshot.preference;
+      webThemeMode = snapshot.mode;
+    });
+  });
 </script>
 
 <div
@@ -656,6 +722,17 @@
         <div class="sidebar-subtitle">{i18n.t('header.sessionHistory')}</div>
       </div>
       <div class="sidebar-header-actions">
+        <button
+          class="theme-toggle-btn"
+          type="button"
+          title={themeToggleTitle}
+          aria-label={themeToggleTitle}
+          data-theme-preference={webThemePreference}
+          data-theme-mode={webThemeMode}
+          onclick={toggleWebTheme}
+        >
+          <Icon name={themeIconName} size={16} />
+        </button>
         <button class="sidebar-refresh" type="button" data-testid="sidebar-refresh" onclick={() => void refreshWorkspaces()}>
           {i18n.t('common.refresh')}
         </button>
@@ -793,6 +870,19 @@
         <div class="mobile-toolbar-meta">
           <div class="mobile-toolbar-title">{selectedWorkspace?.name || '未选择工作区'}</div>
           <div class="mobile-toolbar-subtitle">{currentSession?.name || i18n.t('header.unnamedSession')}</div>
+        </div>
+        <div class="mobile-toolbar-actions">
+          <button
+            type="button"
+            class="theme-toggle-btn theme-toggle-btn--mobile"
+            title={themeToggleTitle}
+            aria-label={themeToggleTitle}
+            data-theme-preference={webThemePreference}
+            data-theme-mode={webThemeMode}
+            onclick={toggleWebTheme}
+          >
+            <Icon name={themeIconName} size={16} />
+          </button>
         </div>
       </div>
     {/if}
@@ -977,6 +1067,39 @@
     cursor: pointer;
     white-space: nowrap;
     word-break: keep-all;
+  }
+
+  .theme-toggle-btn {
+    width: 34px;
+    height: 34px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--foreground);
+    cursor: pointer;
+    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+    flex-shrink: 0;
+  }
+
+  .theme-toggle-btn:hover {
+    background: var(--surface-hover);
+    border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+    color: var(--primary);
+  }
+
+  .theme-toggle-btn[data-theme-preference='light'],
+  .theme-toggle-btn[data-theme-preference='dark'] {
+    border-color: color-mix(in srgb, var(--primary) 38%, var(--border));
+    background: color-mix(in srgb, var(--primary) 10%, var(--surface-2));
+    color: var(--primary);
+  }
+
+  .theme-toggle-btn:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
   }
 
   .sidebar-section {
@@ -1285,6 +1408,13 @@
     display: none;
   }
 
+  .mobile-toolbar-actions {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
   .workspace-dialog-text {
     margin: 0;
     color: var(--foreground);
@@ -1432,6 +1562,11 @@
       flex-shrink: 0;
     }
 
+    .theme-toggle-btn--mobile {
+      width: 36px;
+      height: 36px;
+    }
+
     .mobile-toolbar-meta {
       min-width: 0;
       display: flex;
@@ -1475,7 +1610,7 @@
     .sidebar-header-actions {
       width: 100%;
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: 42px repeat(2, minmax(0, 1fr));
       gap: var(--space-2);
     }
 
@@ -1487,6 +1622,12 @@
       font-size: var(--text-base);
       text-align: center;
       background: var(--surface-2);
+    }
+
+    .theme-toggle-btn {
+      width: 42px;
+      height: 42px;
+      justify-self: stretch;
     }
 
     .sidebar-header,
