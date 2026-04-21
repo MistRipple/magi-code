@@ -1,0 +1,29 @@
+{
+  "name": "magi-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --config vite.web.config.ts",
+    "dev:rust": "VITE_AGENT_BASE_URL=http://127.0.0.1:38123 VITE_AGENT_PROXY_TARGET=http://127.0.0.1:38123 vite --config vite.web.config.ts",
+    "build": "vite build --config vite.web.config.ts",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^5.0.3",
+    "@tsconfig/svelte": "^5.0.4",
+    "svelte": "^5.33.0",
+    "svelte-check": "^4.2.1",
+    "tslib": "^2.8.1",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  },
+  "dependencies": {
+    "@humanspeak/svelte-markdown": "^1.2.0",
+    "@types/qrcode": "^1.5.6",
+    "highlight.js": "^11.11.1",
+    "mermaid": "^11.12.2",
+    "qrcode": "^1.5.4"
+  }
+}

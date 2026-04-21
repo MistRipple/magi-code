@@ -1,0 +1,830 @@
+/* ============================================
+   Settings Panel - 公共样式
+   仅包含各 Tab 子组件共享的基础样式。
+   组件特有样式在各自 <style> 块中定义。
+   ============================================ */
+
+  /* Tab 内容区域 */
+  .settings-tab-content {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  /* 每个 Tab 的根容器自动撑满内容区域 */
+  .settings-tab-content > :global(*) {
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+  /* 普通 Tab：由子内容区承担滚动；特殊 Tab 可在组件内覆盖 */
+  .settings-tab-inner {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+  }
+  .settings-tab-inner::-webkit-scrollbar { width: 0; }
+  .settings-tab-inner { scrollbar-width: none; }
+  
+  /* Apple 风格基础容器 */
+  .apple-manager {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
+  }
+  .apple-scroller-proxy {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    padding: 0 4px 12px 4px;
+    scrollbar-width: none;
+  }
+  .apple-scroller-proxy::-webkit-scrollbar { width: 0; }
+  
+  /* Apple 风格卡片/面板 */
+  .apple-glass-panel {
+    background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 0.85);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(var(--foreground-rgb), 0.3);
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.1),
+      0 2px 8px rgba(0,0,0,0.1);
+    border-radius: 12px;
+    transition: all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1);
+  }
+  .apple-glass-panel:hover {
+    border-color: rgba(var(--primary-rgb, 0, 122, 255), 0.6);
+    background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 1);
+    box-shadow: 0 8px 20px rgba(0,0,0,0.08);
+  }
+
+
+  .apple-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 12px;
+    padding-bottom: 6px;
+  }
+
+  .apple-tile {
+    background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 0.85);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(var(--foreground-rgb), 0.3);
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.1),
+      0 2px 8px rgba(0,0,0,0.1);
+    border-radius: 12px;
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    box-sizing: border-box;
+    transition: all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1);
+  }
+
+  .apple-tile:hover {
+    border-color: rgba(var(--primary-rgb, 0, 122, 255), 0.6);
+    background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 1);
+    box-shadow: 0 8px 20px rgba(0,0,0,0.08);
+  }
+
+  body.theme-dark .apple-glass-panel,
+  body.vscode-dark .apple-glass-panel,
+  :root.theme-dark .apple-glass-panel {
+    background: color-mix(in srgb, var(--background) 92%, var(--surface-2) 8%);
+    border-color: color-mix(in srgb, var(--border) 78%, var(--foreground) 22%);
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--surface-3) 72%, transparent),
+      0 2px 8px rgba(0,0,0,0.05);
+  }
+
+  body.theme-dark .apple-glass-panel:hover,
+  body.vscode-dark .apple-glass-panel:hover,
+  :root.theme-dark .apple-glass-panel:hover {
+    border-color: color-mix(in srgb, var(--primary) 45%, var(--border));
+    background: color-mix(in srgb, var(--background) 96%, var(--surface-hover) 4%);
+  }
+
+  body.theme-dark .apple-tile,
+  body.vscode-dark .apple-tile,
+  :root.theme-dark .apple-tile {
+    background: color-mix(in srgb, var(--background) 92%, var(--surface-2) 8%);
+    border-color: color-mix(in srgb, var(--border) 72%, var(--foreground) 28%);
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--surface-3) 72%, transparent),
+      0 2px 8px rgba(0,0,0,0.05);
+  }
+
+  body.theme-dark .apple-tile:hover,
+  body.vscode-dark .apple-tile:hover,
+  :root.theme-dark .apple-tile:hover {
+    border-color: color-mix(in srgb, var(--primary) 55%, var(--border));
+    background: color-mix(in srgb, var(--background) 96%, var(--surface-hover) 4%);
+  }
+  
+  .tile-row {
+    display: flex;
+    align-items: center;
+    width: 100%;
+  }
+  
+  .tile-header {
+    justify-content: space-between;
+    height: 24px;
+    flex-shrink: 0;
+  }
+  
+  .tile-body {
+    flex-shrink: 0;
+  }
+  
+  .tile-footer {
+    justify-content: space-between;
+    height: 24px;
+    margin-top: auto;
+    flex-shrink: 0;
+  }
+  
+  .avatar-squircle {
+    width: 24px;
+    height: 24px;
+    border-radius: 7px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  
+  .apple-indicator {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  
+  .apple-indicator.success { background: var(--success, #34c759); box-shadow: 0 0 6px rgba(52, 199, 89, 0.6); }
+  .apple-indicator.checking { background: var(--info, #007aff); animation: apple-indicator-pulse 2s infinite; }
+  .apple-indicator.warning { background: var(--warning, #ff9500); }
+  .apple-indicator.disabled { background: var(--foreground-muted, #8e8e93); }
+  .apple-indicator.error { background: var(--error, #ff3b30); box-shadow: 0 0 6px rgba(255, 59, 48, 0.6); }
+  
+  @keyframes apple-indicator-pulse {
+    0% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(1.1); }
+    100% { opacity: 1; transform: scale(1); }
+  }
+
+  @media (max-width: 580px) {
+    .apple-grid { grid-template-columns: 1fr; }
+  }
+
+  /* Apple Action Button (Global) */
+  .apple-action-btn {
+    background: rgba(var(--primary-rgb, 0, 122, 255), 0.08);
+    color: var(--primary, #007aff);
+    border: 1px solid rgba(var(--primary-rgb, 0, 122, 255), 0.1);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 11.5px;
+    font-weight: 500;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    transition: all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1);
+  }
+
+  .apple-action-btn:hover:not(:disabled) {
+    background: rgba(var(--primary-rgb, 0, 122, 255), 0.15);
+  }
+
+  .apple-action-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    filter: grayscale(1);
+  }
+
+  .apple-action-btn.secondary {
+    background: rgba(var(--foreground-rgb, 100, 100, 100), 0.05);
+    color: var(--foreground-muted);
+    border-color: rgba(var(--foreground-rgb, 100, 100, 100), 0.1);
+  }
+
+  .apple-action-btn.secondary:hover:not(:disabled) {
+    background: rgba(var(--foreground-rgb, 100, 100, 100), 0.1);
+    color: var(--foreground);
+  }
+
+  .apple-action-btn.danger {
+    background: rgba(var(--error-rgb, 255, 59, 48), 0.08);
+    color: var(--error, #ff3b30);
+    border-color: rgba(var(--error-rgb, 255, 59, 48), 0.1);
+  }
+
+  .apple-action-btn.danger:hover:not(:disabled) {
+    background: rgba(var(--error-rgb, 255, 59, 48), 0.15);
+  }
+
+  /* Apple Style Modal Form Fields */
+  .form-field input[type="text"],
+  .form-field textarea {
+    width: 100%;
+    background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 0.9);
+    border: 1px solid rgba(var(--foreground-rgb), 0.22);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 13px;
+    color: var(--foreground);
+    transition: all 0.2s ease;
+    box-sizing: border-box;
+    font-family: var(--font-sans);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.04);
+  }
+
+  .form-field input[type="text"]:focus,
+  .form-field textarea:focus {
+    outline: none;
+    border-color: rgba(var(--primary-rgb, 0, 122, 255), 0.55);
+    box-shadow: 0 0 0 2px rgba(var(--primary-rgb, 0, 122, 255), 0.12);
+    background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 1);
+  }
+
+  body.theme-dark .form-field input[type="text"],
+  body.theme-dark .form-field textarea,
+  body.vscode-dark .form-field input[type="text"],
+  body.vscode-dark .form-field textarea,
+  :root.theme-dark .form-field input[type="text"],
+  :root.theme-dark .form-field textarea {
+    background: color-mix(in srgb, var(--surface-2) 78%, var(--background) 22%);
+    border-color: color-mix(in srgb, var(--border) 70%, var(--foreground) 30%);
+  }
+
+  body.theme-dark .form-field input[type="text"]:focus,
+  body.theme-dark .form-field textarea:focus,
+  body.vscode-dark .form-field input[type="text"]:focus,
+  body.vscode-dark .form-field textarea:focus,
+  :root.theme-dark .form-field input[type="text"]:focus,
+  :root.theme-dark .form-field textarea:focus {
+    border-color: color-mix(in srgb, var(--primary) 60%, var(--border));
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 18%, transparent);
+    background: color-mix(in srgb, var(--background) 94%, var(--surface-hover) 6%);
+  }
+
+  .form-field label {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--foreground);
+    margin-bottom: 6px;
+    display: block;
+  }
+
+  .repo-add-form {
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
+  }
+
+  /* Apple 风格表单控件 */
+  .llm-config-input, .llm-config-select, .profile-textarea, .safeguard-add-input, .apple-input {
+    background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 0.9) !important;
+    border: 1px solid rgba(var(--foreground-rgb), 0.22) !important;
+    border-radius: 8px !important;
+    color: var(--foreground) !important;
+    transition: all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1) !important;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.04) !important;
+  }
+  .llm-config-input:focus, .llm-config-select:focus, .profile-textarea:focus, .safeguard-add-input:focus, .apple-input:focus {
+    border-color: rgba(var(--primary-rgb, 0, 122, 255), 0.55) !important;
+    background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 1) !important;
+    box-shadow: 0 0 0 3px rgba(var(--primary-rgb, 0, 122, 255), 0.12), inset 0 1px 3px rgba(0,0,0,0.02) !important;
+    outline: none !important;
+  }
+
+  body.theme-dark .llm-config-input,
+  body.theme-dark .llm-config-select,
+  body.theme-dark .profile-textarea,
+  body.theme-dark .safeguard-add-input,
+  body.theme-dark .apple-input,
+  body.vscode-dark .llm-config-input,
+  body.vscode-dark .llm-config-select,
+  body.vscode-dark .profile-textarea,
+  body.vscode-dark .safeguard-add-input,
+  body.vscode-dark .apple-input,
+  :root.theme-dark .llm-config-input,
+  :root.theme-dark .llm-config-select,
+  :root.theme-dark .profile-textarea,
+  :root.theme-dark .safeguard-add-input,
+  :root.theme-dark .apple-input {
+    background: color-mix(in srgb, var(--surface-2) 78%, var(--background) 22%) !important;
+    border-color: color-mix(in srgb, var(--border) 70%, var(--foreground) 30%) !important;
+  }
+  body.theme-dark .llm-config-input:focus,
+  body.theme-dark .llm-config-select:focus,
+  body.theme-dark .profile-textarea:focus,
+  body.theme-dark .safeguard-add-input:focus,
+  body.theme-dark .apple-input:focus,
+  body.vscode-dark .llm-config-input:focus,
+  body.vscode-dark .llm-config-select:focus,
+  body.vscode-dark .profile-textarea:focus,
+  body.vscode-dark .safeguard-add-input:focus,
+  body.vscode-dark .apple-input:focus,
+  :root.theme-dark .llm-config-input:focus,
+  :root.theme-dark .llm-config-select:focus,
+  :root.theme-dark .profile-textarea:focus,
+  :root.theme-dark .safeguard-add-input:focus,
+  :root.theme-dark .apple-input:focus {
+    border-color: color-mix(in srgb, var(--primary) 60%, var(--border)) !important;
+    background: color-mix(in srgb, var(--background) 94%, var(--surface-hover) 6%) !important;
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 18%, transparent), inset 0 1px 3px rgba(0,0,0,0.02) !important;
+  }
+
+  /* 动画 */
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes slideUp { from { opacity: 0; transform: translateY(20px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+  /* Section 容器 - 无背景，内容融入面板 */
+  .settings-section {
+    padding: var(--space-4) var(--space-5);
+    border-bottom: 1px solid var(--border);
+  }
+  .settings-section:last-child {
+    border-bottom: none;
+  }
+
+  .settings-section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: var(--space-4);
+    gap: var(--space-3);
+  }
+  .settings-section-header .settings-section-desc {
+    flex: 1;
+    min-width: 0;
+  }
+  .settings-section-header .settings-section-actions {
+    flex-shrink: 0;
+  }
+
+  .settings-section-title {
+    font-size: var(--text-base);
+    font-weight: var(--font-bold);
+    color: var(--foreground);
+  }
+
+  .settings-section-desc {
+    font-size: var(--text-sm);
+    color: var(--foreground-muted);
+    line-height: 1.5;
+  }
+  /* desc 在 header 外独立存在时保留间距 */
+  .settings-section > .settings-section-desc {
+    margin-bottom: var(--space-4);
+  }
+
+  .settings-section-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .settings-hint {
+    margin-top: var(--space-2);
+    font-size: var(--text-xs);
+    line-height: 1.4;
+    color: var(--foreground-muted);
+  }
+  .settings-hint.warning { color: var(--warning); }
+  .settings-hint.error { color: var(--error); }
+  .settings-hint.success { color: var(--success); }
+
+  .settings-btn-group {
+    display: flex;
+    gap: var(--space-2);
+  }
+
+  /* 统一按钮样式 */
+  .settings-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    height: var(--btn-height-md);
+    padding: 0 var(--space-4);
+    font-size: var(--text-sm);
+    font-weight: var(--font-medium);
+    background: var(--primary);
+    border: none;
+    border-radius: var(--radius-sm);
+    color: var(--primary-foreground);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+    white-space: nowrap;
+  }
+
+  .settings-btn:hover:not(:disabled) {
+    background: var(--primary-hover);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(var(--primary-rgb, 99, 102, 241), 0.3);
+  }
+  .settings-btn:active:not(:disabled) {
+    transform: translateY(0);
+  }
+  .settings-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .settings-btn.secondary {
+    background: var(--surface-3);
+    color: var(--foreground);
+    border: 1px solid var(--border);
+  }
+  .settings-btn.secondary:hover:not(:disabled) {
+    background: var(--surface-hover);
+    border-color: var(--primary-muted);
+    transform: translateY(-1px);
+    box-shadow: none;
+  }
+
+  /* settings-btn 状态样式 */
+  .settings-btn.saving, .settings-btn.testing {
+    background: var(--warning-muted);
+    color: var(--warning);
+    border-color: var(--warning-muted);
+  }
+  .settings-btn.saving :global(svg), .settings-btn.testing :global(svg) { animation: spin 1s linear infinite; }
+  .settings-btn.saved, .settings-btn.success {
+    background: var(--success-muted);
+    color: var(--success);
+    border-color: var(--success-muted);
+  }
+  .settings-btn.secondary.testing :global(svg) { animation: spin 1s linear infinite; }
+  .settings-btn.secondary.success { background: var(--success-muted); color: var(--success); border-color: var(--success-muted); }
+  .settings-btn.secondary.error { background: var(--error-muted); color: var(--error); border-color: var(--error-muted); }
+
+
+  /* 统计 Tab 覆盖 */
+  .stats-section { padding: var(--space-4); }
+
+
+  /* Model Tab 独有公共样式（不在 scoped 中的）*/
+
+  .llm-config-field-row { display: grid; grid-template-columns: 1fr auto; gap: var(--space-3); }
+  .llm-config-field-row.has-thinking { grid-template-columns: 1fr auto 72px; }
+  .llm-config-field-row.has-level { grid-template-columns: 1fr auto auto auto; }
+
+  .llm-config-toggle-label { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-sm); cursor: pointer; }
+  .llm-config-toggle-btn {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    height: var(--btn-height-md);
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: var(--foreground);
+    font-size: var(--text-sm);
+    cursor: pointer;
+    justify-content: flex-start;
+    width: 100%;
+  }
+  .inline-toggle { display: flex; flex-direction: column; gap: var(--space-2); align-items: flex-start; }
+  .toggle-switch { width: 32px; height: 18px; background: var(--secondary); border-radius: var(--radius-full); position: relative; transition: background var(--transition-fast); cursor: pointer; flex-shrink: 0; }
+  .toggle-switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; background: var(--primary-foreground); border-radius: var(--radius-full); transition: transform var(--transition-fast); }
+  .toggle-switch.active { background: var(--primary); }
+  .toggle-switch.active::after { transform: translateX(14px); }
+
+  /* Profile 编辑器 - 公共部分（组件特有部分在 scoped 中）*/
+  .profile-field-header { display: flex; justify-content: space-between; align-items: center; }
+  .profile-field-label { font-size: var(--text-sm); font-weight: var(--font-semibold); color: var(--foreground); }
+
+  .profile-two-columns { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
+  .profile-column { min-width: 0; }
+
+  .profile-add-btn { display: flex; align-items: center; justify-content: center; width: var(--btn-height-xs); height: var(--btn-height-xs); padding: 0; background: var(--primary); border: none; border-radius: var(--radius-sm); color: var(--primary-foreground); cursor: pointer; transition: all var(--transition-fast); }
+  .profile-add-btn:hover { background: var(--primary-hover); }
+
+  .profile-tags { display: flex; flex-wrap: wrap; gap: var(--space-2); min-height: var(--btn-height-lg); padding: var(--space-3); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+  .profile-tag { display: inline-flex; align-items: center; gap: var(--space-2); height: var(--btn-height-xs); padding: 0 var(--space-3); font-size: var(--text-sm); background: var(--primary); border-radius: var(--radius-full); color: var(--primary-foreground); }
+  .profile-tag-remove { display: flex; align-items: center; justify-content: center; width: 14px; height: 14px; padding: 0; background: color-mix(in srgb, var(--primary-foreground) 18%, transparent); border: none; border-radius: var(--radius-full); color: var(--primary-foreground); cursor: pointer; transition: background var(--transition-fast); }
+  .profile-tag-remove:hover { background: color-mix(in srgb, var(--primary-foreground) 30%, transparent); }
+  .profile-tags-empty { font-size: var(--text-sm); color: var(--foreground-muted); font-style: italic; }
+
+  .profile-save-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin-top: 5px;
+    padding: var(--space-3) var(--space-4);
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .profile-save-hint {
+    font-size: var(--text-sm);
+    color: var(--foreground-muted);
+  }
+  .profile-save-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  /* 通用操作按钮 */
+  .btn-icon {
+    display: flex; align-items: center; justify-content: center;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); color: var(--foreground-muted);
+    cursor: pointer; transition: all var(--transition-fast);
+  }
+  .btn-icon:hover { background: var(--surface-hover); border-color: var(--primary); color: var(--foreground); }
+  .btn-icon--danger:hover { background: var(--error-muted); border-color: var(--error); color: var(--error); }
+  .btn-icon:disabled { opacity: 0.6; cursor: not-allowed; }
+  .btn-icon.refreshing :global(svg) { animation: spin 1s linear infinite; }
+
+  /* Skill 操作按钮 */
+  .skill-actions .btn-icon--danger:hover { background: var(--error-muted); border-color: var(--error); color: var(--error); }
+  .skill-actions .btn-icon:not(.btn-icon--danger) { background: transparent; border: 1px solid var(--border); color: var(--foreground-muted); }
+  .skill-actions .btn-icon:not(.btn-icon--danger):hover:not(:disabled) { background: var(--primary-muted); border-color: var(--primary); color: var(--primary); }
+  .skill-actions .btn-icon:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* 空状态 */
+  .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: var(--space-8); color: var(--foreground-muted); text-align: center; width: 100%; flex: 1; margin: auto; box-sizing: border-box; }
+  .apple-grid > .empty-state { grid-column: 1 / -1; margin: 0; }
+  .empty-state p { margin: var(--space-2) 0 0 0; }
+  .empty-state-hint { font-size: var(--text-sm); opacity: 0.7; }
+  .empty-state-sm { padding: var(--space-6); text-align: center; color: var(--foreground-muted); font-size: var(--text-sm); width: 100%; box-sizing: border-box; }
+
+  /* 加载状态 */
+  .loading-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: var(--space-8);
+    color: var(--foreground-muted);
+    gap: var(--space-3);
+  }
+  .loading-state :global(svg) {
+    animation: spin 1s linear infinite;
+  }
+  .loading-state span {
+    font-size: var(--text-sm);
+  }
+
+  /* Modal 对话框 */
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: calc(var(--z-modal) + 10);
+    animation: fadeIn var(--duration-fast) var(--ease-out);
+  }
+
+  .modal-dialog {
+    width: 480px;
+    max-width: 90vw;
+    max-height: 80vh;
+    background: var(--background);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xl);
+    box-shadow:
+      0 25px 50px -12px rgba(0, 0, 0, 0.25),
+      0 0 0 1px rgba(255, 255, 255, 0.05);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    animation: slideUp var(--duration-normal) var(--ease-out);
+  }
+
+  .modal-dialog-lg { width: 600px; max-height: 70vh; }
+  .modal-dialog--sm { width: 360px; }
+  .modal-overlay--top { z-index: calc(var(--z-modal) + 20); }
+
+  .modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: var(--space-4) var(--space-5);
+    border-bottom: 1px solid var(--border);
+    background: var(--surface-2);
+  }
+  .modal-header h3 {
+    font-size: var(--text-lg);
+    font-weight: var(--font-semibold);
+    color: var(--foreground);
+    margin: 0;
+  }
+  .modal-close {
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    color: var(--foreground-muted);
+    font-size: 20px;
+    cursor: pointer;
+    transition: all var(--transition-fast);
+  }
+  .modal-close:hover {
+    background: var(--surface-hover);
+    border-color: var(--border);
+    color: var(--foreground);
+  }
+  .modal-body {
+    flex: 1;
+    min-height: 0;
+    padding: var(--space-5);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .modal-body::-webkit-scrollbar { width: 6px; }
+  .modal-body::-webkit-scrollbar-track { background: transparent; }
+  .modal-body::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+  .modal-body::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
+
+  .modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-3);
+    padding: var(--space-4) var(--space-5);
+    border-top: 1px solid var(--border);
+    background: var(--surface-2);
+  }
+
+  /* Responsive 布局覆盖 */
+  @media (max-width: 720px) {
+    .modal-header {
+      padding: var(--space-3) var(--space-4);
+      flex-wrap: wrap;
+      gap: var(--space-2);
+    }
+
+    .settings-tab-content,
+    .modal-body,
+    .modal-footer {
+      padding-left: var(--space-4);
+      padding-right: var(--space-4);
+    }
+
+    .settings-tab-content {
+      gap: var(--space-3);
+    }
+
+    .settings-section {
+      padding: var(--space-4);
+    }
+
+    .settings-section-header,
+    .settings-section-actions,
+    .settings-btn-group,
+    .profile-save-footer,
+    .profile-save-actions,
+    .modal-footer {
+      flex-wrap: wrap;
+    }
+
+    .llm-config-field-row,
+    .llm-config-field-row.has-thinking,
+    .llm-config-field-row.has-thinking.has-level,
+    .llm-config-field-row.url-mode-row,
+    .llm-config-field-row.worker-url-mode-row,
+    .profile-categories-grid,
+    .profile-two-columns,
+    .profile-guidance-columns {
+      grid-template-columns: 1fr;
+    }
+
+    .modal-dialog,
+    .modal-dialog-lg,
+    .modal-dialog--sm {
+      width: 100vw;
+      max-width: 100vw;
+      min-height: 100vh;
+      max-height: 100vh;
+      border-radius: 0;
+      border-left: none;
+      border-right: none;
+      border-top: none;
+    }
+  }
+
+  /* 安全防护 - 新增规则输入行（其余在 SettingsRulesTab scoped 中）*/
+  .safeguard-add-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+  }
+
+  .safeguard-add-input {
+    flex: 1;
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--vscode-input-background, var(--surface-2));
+    color: var(--foreground);
+    font-size: 12px;
+    font-family: var(--font-mono, monospace);
+    outline: none;
+  }
+
+  .safeguard-add-input:focus {
+    border-color: var(--primary);
+  }
+
+  .safeguard-add-btn {
+    flex-shrink: 0;
+    padding: 4px 12px;
+    font-size: 12px;
+  }
+
+  /* 引擎管理 */
+  .engine-empty-hint {
+    display: flex; flex-direction: column; align-items: center; gap: var(--space-3);
+    padding: var(--space-6) var(--space-4);
+    color: var(--foreground-muted); font-size: var(--text-sm); text-align: center;
+  }
+  .engine-list { display: flex; flex-direction: column; gap: var(--space-2); }
+  .engine-card {
+    display: flex; flex-direction: column; gap: var(--space-2);
+    padding: var(--space-3); border: 1px solid var(--border);
+    border-radius: var(--radius-md); background: var(--surface);
+    transition: border-color var(--transition-fast);
+  }
+  .engine-card:hover { border-color: var(--border-hover, var(--primary)); }
+  .engine-card.disabled { opacity: 0.55; }
+  .engine-card-header { display: flex; justify-content: space-between; align-items: center; gap: var(--space-3); }
+  .engine-card-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .engine-card-name { font-size: var(--text-sm); font-weight: 500; color: var(--foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .engine-card-meta { font-size: var(--text-xs); color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .engine-ref-count { margin-left: var(--space-2); padding: 1px 6px; background: var(--surface-hover); border-radius: var(--radius-sm); font-size: 10px; }
+  .engine-card-actions { display: flex; align-items: center; gap: var(--space-1); flex-shrink: 0; }
+  .engine-card-toggle { display: flex; align-items: center; }
+  .engine-select {
+    height: var(--btn-height-sm); padding: 0 var(--space-2); font-size: var(--text-xs);
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    color: var(--foreground); cursor: pointer; min-width: 100px; max-width: 160px;
+  }
+
+  /* 角色模板选择器 */
+  .role-template-list { display: flex; flex-direction: column; gap: var(--space-1); }
+  .role-template-item {
+    display: flex; justify-content: space-between; align-items: center;
+    gap: var(--space-3); padding: var(--space-3);
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    background: var(--surface); cursor: pointer; text-align: left; width: 100%;
+    transition: background var(--transition-fast), border-color var(--transition-fast);
+  }
+  .role-template-item:hover:not(:disabled) { background: var(--surface-hover); border-color: var(--primary); }
+  .role-template-item:disabled { opacity: 0.45; cursor: not-allowed; }
+  .role-template-item-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .role-template-item-name { font-size: var(--text-sm); font-weight: 500; color: var(--foreground); }
+  .role-template-item-desc { font-size: var(--text-xs); color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .role-template-item-badge { font-size: 10px; padding: 1px 6px; background: var(--surface-hover); border-radius: var(--radius-sm); color: var(--foreground-muted); flex-shrink: 0; }
+
+  /* 通用对话框 */
+  .dialog-overlay {
+    position: fixed; inset: 0; z-index: 9999;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex; justify-content: center; align-items: center;
+  }
+  .dialog-content {
+    background: var(--background); border: 1px solid var(--border);
+    border-radius: var(--radius-lg); width: 90%; max-width: 480px; max-height: 80vh;
+    display: flex; flex-direction: column; overflow: hidden;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  }
+  .dialog-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: var(--space-3) var(--space-4);
+    border-bottom: 1px solid var(--border);
+  }
+  .dialog-title { font-size: var(--text-base); font-weight: 600; color: var(--foreground); }
+  .dialog-body { padding: var(--space-4); overflow-y: auto; }
+  .dialog-footer {
+    display: flex; justify-content: flex-end; gap: var(--space-2);
+    padding: var(--space-3) var(--space-4);
+    border-top: 1px solid var(--border);
+  }
+  .dialog-error {
+    margin-bottom: var(--space-3); padding: var(--space-2) var(--space-3);
+    background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3);
+    border-radius: var(--radius-sm); color: #ef4444; font-size: var(--text-xs);
+  }

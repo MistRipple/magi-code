@@ -1,0 +1,146 @@
+export const SYSTEM_AGENT_SET = new Set(['orchestrator', 'auxiliary', 'system']);
+
+function normalizeNonEmptyString(value: unknown): string {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : '';
+}
+
+/**
+ * 归一化 worker 标识
+ * 动态架构下：任何非系统 agent 的非空字符串都是合法的 worker id
+ *
+ * 此函数为唯一规范实现，所有模块（前端/后端）统一导入。
+ * 返回空字符串表示非 worker 标识。
+ */
+export function normalizeWorkerSlot(value: unknown): string {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  const normalized = value.trim();
+  if (!normalized || SYSTEM_AGENT_SET.has(normalized.toLowerCase())) {
+    return '';
+  }
+  return normalized;
+}
+
+function resolveSubTaskCardMetadata(
+  metadata: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  const subTaskCard = metadata?.subTaskCard;
+  return subTaskCard && typeof subTaskCard === 'object' && !Array.isArray(subTaskCard)
+    ? subTaskCard as Record<string, unknown>
+    : undefined;
+}
+
+export function resolveTimelineWorkerId(
+  metadata: Record<string, unknown> | undefined,
+  options: { fallbacks?: unknown[] } = {},
+): string {
+  const subTaskCard = resolveSubTaskCardMetadata(metadata);
+  const candidates: unknown[] = [
+    metadata?.worker,
+    metadata?.assignedWorker,
+    metadata?.agent,
+    subTaskCard?.worker,
+    ...(Array.isArray(options.fallbacks) ? options.fallbacks : []),
+  ];
+  for (const candidate of candidates) {
+    const worker = normalizeWorkerSlot(candidate);
+    if (worker) {
+      return worker;
+    }
+  }
+  return '';
+}
+
+export function resolveTimelineDispatchWaveId(
+  metadata: Record<string, unknown> | undefined,
+): string {
+  const explicitDispatchWaveId = normalizeNonEmptyString(metadata?.dispatchWaveId);
+  if (explicitDispatchWaveId) {
+    return explicitDispatchWaveId;
+  }
+  const subTaskCard = resolveSubTaskCardMetadata(metadata);
+  const nestedDispatchWaveId = normalizeNonEmptyString(subTaskCard?.dispatchWaveId);
+  if (nestedDispatchWaveId) {
+    return nestedDispatchWaveId;
+  }
+  return normalizeNonEmptyString(metadata?.missionId) || normalizeNonEmptyString(subTaskCard?.missionId);
+}
+
+export function resolveTimelineTaskCardScopeId(
+  metadata: Record<string, unknown> | undefined,
+): string {
+  const requestId = normalizeNonEmptyString(metadata?.requestId);
+  if (requestId) {
+    return requestId;
+  }
+  const subTaskCard = resolveSubTaskCardMetadata(metadata);
+  const subTaskRequestId = normalizeNonEmptyString(subTaskCard?.requestId);
+  if (subTaskRequestId) {
+    return subTaskRequestId;
+  }
+  return normalizeNonEmptyString(metadata?.missionId);
+}
+
+export function buildTimelineAssignmentTaskKey(
+  assignmentKey: string,
+  scopeId?: string,
+): string {
+  const normalizedAssignment = normalizeNonEmptyString(assignmentKey);
+  if (!normalizedAssignment) {
+    return '';
+  }
+  const normalizedScope = normalizeNonEmptyString(scopeId);
+  return normalizedScope
+    ? `assign:${normalizedAssignment}@${normalizedScope}`
+    : `assign:${normalizedAssignment}`;
+}
+
+export function resolveTimelineTaskResultKey(
+  metadata: Record<string, unknown> | undefined,
+): string {
+  const scopeId = resolveTimelineTaskCardScopeId(metadata);
+  const assignmentId = normalizeNonEmptyString(metadata?.assignmentId);
+  if (assignmentId) {
+    return buildTimelineAssignmentTaskKey(assignmentId, scopeId);
+  }
+  const subTaskId = normalizeNonEmptyString(metadata?.subTaskId);
+  if (subTaskId) {
+    return buildTimelineAssignmentTaskKey(subTaskId, scopeId);
+  }
+  const subTaskCard = resolveSubTaskCardMetadata(metadata);
+  const subTaskCardId = normalizeNonEmptyString(subTaskCard?.id);
+  if (subTaskCardId) {
+    return buildTimelineAssignmentTaskKey(subTaskCardId, scopeId);
+  }
+  return normalizeNonEmptyString(metadata?.cardId);
+}
+
+export function resolveTimelineWorkerLaneId(
+  metadata: Record<string, unknown> | undefined,
+  fallbackWorker?: unknown,
+): string {
+  const explicitLaneId = normalizeNonEmptyString(metadata?.laneId);
+  if (explicitLaneId) {
+    return explicitLaneId;
+  }
+
+  const subTaskCard = resolveSubTaskCardMetadata(metadata);
+  const nestedLaneId = normalizeNonEmptyString(subTaskCard?.laneId);
+  if (nestedLaneId) {
+    return nestedLaneId;
+  }
+  const dispatchWaveId = resolveTimelineDispatchWaveId(metadata);
+  const worker = resolveTimelineWorkerId(metadata, { fallbacks: [fallbackWorker] });
+
+  if (dispatchWaveId && worker) {
+    return `${dispatchWaveId}:${worker}`;
+  }
+
+  return '';
+}
+
