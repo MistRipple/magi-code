@@ -1,0 +1,215 @@
+use crate::{
+    CodeIndexIngestion, CodeIndexSource, CodeIndexSymbol, CodeSymbolKind, KnowledgeAuditLink,
+    KnowledgeGovernanceLink, KnowledgeGovernanceOutcome, KnowledgeKind, KnowledgeQuery,
+    KnowledgeRecord, KnowledgeStore,
+};
+use magi_core::UtcMillis;
+
+#[test]
+fn list_uses_deterministic_tie_breaker() {
+    let store = KnowledgeStore::new();
+    let updated_at = UtcMillis(42);
+
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "kb-b".to_string(),
+        kind: KnowledgeKind::Faq,
+        title: "B".to_string(),
+        content: "content".to_string(),
+        tags: vec!["tag".to_string()],
+        source_ref: Some("ref-b".to_string()),
+        updated_at,
+    });
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "kb-a".to_string(),
+        kind: KnowledgeKind::Faq,
+        title: "A".to_string(),
+        content: "content".to_string(),
+        tags: vec!["tag".to_string()],
+        source_ref: Some("ref-a".to_string()),
+        updated_at,
+    });
+
+    let knowledge_ids = store
+        .list()
+        .into_iter()
+        .map(|record| record.knowledge_id)
+        .collect::<Vec<_>>();
+
+    assert_eq!(knowledge_ids, vec!["kb-a".to_string(), "kb-b".to_string()]);
+}
+
+#[test]
+fn code_index_ingestion_persists_source_and_governance_sidecars() {
+    let store = KnowledgeStore::new();
+    store.ingest_code_index(sample_code_index("kb-code-1"));
+
+    let record = store
+        .get("kb-code-1")
+        .expect("code index record should be stored");
+    assert_eq!(record.kind, KnowledgeKind::CodeIndex);
+    assert_eq!(record.tags, vec!["rust".to_string(), "search".to_string()]);
+    assert_eq!(record.source_ref.as_deref(), Some("src/query.rs#execute"));
+
+    let indexed_terms = store.indexed_terms("kb-code-1");
+    assert!(indexed_terms.contains(&"execute".to_string()));
+    assert!(indexed_terms.contains(&"query".to_string()));
+    assert!(indexed_terms.contains(&"abc123".to_string()));
+    assert!(indexed_terms.contains(&"allowed".to_string()));
+    assert!(indexed_terms.contains(&"read".to_string()));
+
+    let source = store
+        .code_source("kb-code-1")
+        .expect("code index source should be retained");
+    assert_eq!(source.path, "crates/magi-knowledge-store/src/query.rs");
+    assert_eq!(source.symbol.as_ref().map(|symbol| symbol.name.as_str()), Some("execute"));
+
+    let audit = store
+        .audit_link("kb-code-1")
+        .expect("audit link should be retained");
+    assert_eq!(audit.audit_event_id, "audit-knowledge-index-1");
+    assert_eq!(audit.sequence, Some(17));
+
+    let governance = store
+        .governance_link("kb-code-1")
+        .expect("governance link should be retained");
+    assert_eq!(governance.outcome, KnowledgeGovernanceOutcome::Allowed);
+    assert_eq!(
+        governance.policy_refs,
+        vec![
+            "governance.safe_read".to_string(),
+            "knowledge.code_index".to_string()
+        ]
+    );
+}
+
+#[test]
+fn query_and_governed_output_close_the_code_index_loop() {
+    let store = KnowledgeStore::new();
+    store.ingest_code_index(sample_code_index("kb-code-1"));
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "kb-faq-1".to_string(),
+        kind: KnowledgeKind::Faq,
+        title: "FAQ".to_string(),
+        content: "Human guidance without source metadata".to_string(),
+        tags: vec!["faq".to_string()],
+        source_ref: None,
+        updated_at: UtcMillis(50),
+    });
+
+    let query = KnowledgeQuery {
+        kind: Some(KnowledgeKind::CodeIndex),
+        text: Some("execute query.rs safe_read".to_string()),
+        tags: vec![],
+        limit: 10,
+    };
+
+    let result = store.query(&query);
+    assert_eq!(result.total_matches, 1);
+    assert_eq!(result.matches[0].record.knowledge_id, "kb-code-1");
+    assert!(result.matches[0].matched_terms.contains(&"execute".to_string()));
+    assert!(result.matches[0].matched_terms.contains(&"query".to_string()));
+    assert!(result.matches[0].matched_terms.contains(&"safe".to_string()));
+
+    let governed = store.governed_output(&query);
+    assert_eq!(governed.len(), 1);
+
+    let record = &governed[0];
+    assert_eq!(record.knowledge_id, "kb-code-1");
+    assert_eq!(record.source_ref.as_deref(), Some("src/query.rs#execute"));
+    assert_eq!(
+        record.code_source.as_ref().map(|source| source.path.as_str()),
+        Some("crates/magi-knowledge-store/src/query.rs")
+    );
+    assert_eq!(
+        record
+            .code_source
+            .as_ref()
+            .and_then(|source| source.symbol.as_ref())
+            .map(|symbol| symbol.kind.clone()),
+        Some(CodeSymbolKind::Function)
+    );
+    assert_eq!(
+        record.audit_link.as_ref().map(|audit| audit.audit_event_id.as_str()),
+        Some("audit-knowledge-index-1")
+    );
+    assert_eq!(
+        record
+            .governance_link
+            .as_ref()
+            .map(|governance| governance.outcome.clone()),
+        Some(KnowledgeGovernanceOutcome::Allowed)
+    );
+}
+
+#[test]
+fn plain_upsert_overwrites_old_code_index_sidecars() {
+    let store = KnowledgeStore::new();
+    store.ingest_code_index(sample_code_index("kb-shared"));
+
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "kb-shared".to_string(),
+        kind: KnowledgeKind::Faq,
+        title: "Shared FAQ".to_string(),
+        content: "Fallback human-authored note".to_string(),
+        tags: vec!["faq".to_string()],
+        source_ref: None,
+        updated_at: UtcMillis(200),
+    });
+
+    assert!(store.code_source("kb-shared").is_none());
+    assert!(store.audit_link("kb-shared").is_none());
+    assert!(store.governance_link("kb-shared").is_none());
+
+    let outputs = store.governed_output(&KnowledgeQuery {
+        kind: None,
+        text: Some("fallback".to_string()),
+        tags: vec![],
+        limit: 10,
+    });
+    let overwritten = outputs
+        .into_iter()
+        .find(|record| record.knowledge_id == "kb-shared")
+        .expect("overwritten record should still be queryable");
+    assert!(overwritten.code_source.is_none());
+    assert!(overwritten.audit_link.is_none());
+    assert!(overwritten.governance_link.is_none());
+}
+
+fn sample_code_index(knowledge_id: &str) -> CodeIndexIngestion {
+    CodeIndexIngestion {
+        knowledge_id: knowledge_id.to_string(),
+        title: "Lookup helper".to_string(),
+        content: "Ranks candidates for knowledge retrieval.".to_string(),
+        tags: vec!["Search".to_string(), "Rust".to_string()],
+        source_ref: Some("src/query.rs#execute".to_string()),
+        updated_at: UtcMillis(100),
+        source: CodeIndexSource {
+            path: "crates/magi-knowledge-store/src/query.rs".to_string(),
+            language: Some("Rust".to_string()),
+            repo_ref: Some("magi-rust-rewrite".to_string()),
+            commit_ref: Some("abc123".to_string()),
+            start_line: Some(8),
+            end_line: Some(77),
+            symbol: Some(CodeIndexSymbol {
+                name: "execute".to_string(),
+                kind: CodeSymbolKind::Function,
+                container: Some("KnowledgeQueryService".to_string()),
+                signature: Some("execute(entries, index_terms, query)".to_string()),
+            }),
+        },
+        audit: Some(KnowledgeAuditLink {
+            audit_event_id: "audit-knowledge-index-1".to_string(),
+            trail_ref: Some("knowledge.ingest".to_string()),
+            sequence: Some(17),
+        }),
+        governance: Some(KnowledgeGovernanceLink {
+            outcome: KnowledgeGovernanceOutcome::Allowed,
+            policy_refs: vec![
+                "knowledge.code_index".to_string(),
+                "governance.safe_read".to_string(),
+            ],
+            rationale: Some("Repository-derived symbol summary".to_string()),
+            audit_event_id: Some("audit-knowledge-index-1".to_string()),
+        }),
+    }
+}

@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+  "apps/daemon",
+  "crates/magi-core",
+  "crates/magi-daemon",
+  "crates/magi-api",
+  "crates/magi-session-store",
+  "crates/magi-workspace",
+  "crates/magi-governance",
+  "crates/magi-event-bus",
+  "crates/magi-tool-runtime",
+  "crates/magi-orchestrator",
+  "crates/magi-worker-runtime",
+  "crates/magi-knowledge-store",
+  "crates/magi-memory-store",
+  "crates/magi-context-runtime",
+  "crates/magi-skill-runtime",
+  "crates/magi-bridge-client",
+  "crates/magi-todo",
+  "crates/magi-usage-authority",
+  "crates/magi-normalizer",
+  "crates/magi-agent",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+axum = { version = "0.8.6", features = ["json", "tokio", "http1"] }
+futures-util = "0.3.31"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "net", "sync"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }

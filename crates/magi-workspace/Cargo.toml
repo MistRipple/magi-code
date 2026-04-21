@@ -1,0 +1,9 @@
+[package]
+name = "magi-workspace"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+magi-core = { path = "../magi-core" }

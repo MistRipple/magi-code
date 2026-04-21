@@ -1,0 +1,12 @@
+[package]
+name = "magi-context-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+magi-core = { path = "../magi-core" }
+magi-knowledge-store = { path = "../magi-knowledge-store" }
+magi-memory-store = { path = "../magi-memory-store" }
+magi-session-store = { path = "../magi-session-store" }
