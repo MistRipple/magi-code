@@ -1,0 +1,51 @@
+# --- Rust ---
+/target
+# Cargo.lock is usually committed for applications/workspaces
+# Cargo.lock 
+
+# --- Node.js (Web) ---
+node_modules/
+web/node_modules/
+web/dist/
+web/.svelte-kit/
+web/.vercel/
+web/.env
+web/.env.*
+!web/.env.example
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# --- Project Specific ---
+/tmp/
+*.log
+.magi-host-loopback-*
+
+# --- IDEs & Tools ---
+.gemini/
+.mcp.json
+launchctl
+.claude/
+.ace-tool/
+.augment-temp/
+.history/
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.env
+.env.local
+.env.*.local
+
+# --- OS Specific ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
