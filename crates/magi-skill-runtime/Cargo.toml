@@ -1,0 +1,12 @@
+[package]
+name = "magi-skill-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+magi-core = { path = "../magi-core" }
+magi-governance = { path = "../magi-governance" }
+magi-bridge-client = { path = "../magi-bridge-client" }
+magi-tool-runtime = { path = "../magi-tool-runtime" }
+magi-event-bus = { path = "../magi-event-bus" }

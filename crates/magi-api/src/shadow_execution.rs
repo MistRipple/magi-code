@@ -1,0 +1,857 @@
+
+use magi_bridge_client::ModelInvocationRequest;
+use magi_core::{
+    AssignmentId, DomainError, ExecutionOwnership, ExecutorBinding, MissionId, Task,
+    TaskId, TaskKind, TaskStatus, UtcMillis, WorkerId,
+};
+#[cfg(test)]
+use magi_core::SessionId;
+use magi_event_bus::{EventContext, task_events};
+use magi_orchestrator::{
+    ExecutionWritebackPlans, OrchestratorCommand, OrchestratorCommandResult,
+};
+
+use crate::{
+    dto::RecoveryResumeRequestDto,
+    errors::ApiError,
+    state::ApiState,
+    task_execution::{DispatchSubmissionRequest, ShadowTaskExecutionPlan},
+};
+#[cfg(test)]
+use crate::dto::SessionActionRequestDto;
+use magi_workspace::RecoveryStatus;
+
+pub(crate) struct ShadowTaskGraphSubmission {
+    pub root_task_id: TaskId,
+    pub action_task_id: TaskId,
+}
+
+pub(crate) fn run_shadow_dispatch_submission(
+    state: &ApiState,
+    request: &DispatchSubmissionRequest,
+) -> Result<ShadowTaskGraphSubmission, ApiError> {
+    let pipeline = state.shadow_execution_pipeline().ok_or_else(|| {
+        ApiError::internal_assembly("执行 shadow dispatch 失败", "shadow execution pipeline 未配置")
+    })?;
+    let task_store = state
+        .task_store()
+        .ok_or_else(|| ApiError::internal_assembly("执行 shadow dispatch 失败", "task_store 未配置"))?;
+
+    let accepted_at = request.accepted_at;
+    let session_id = &request.session_id;
+    let entry_id = request.entry_id.as_str();
+    let trimmed_text = request.trimmed_text.as_deref();
+
+    let mission_id = MissionId::new(format!("mission-session-action-{}", accepted_at.0));
+    let assignment_id = AssignmentId::new(format!("assignment-session-action-{}", accepted_at.0));
+    let task_id = TaskId::new(format!("task-session-action-{}", accepted_at.0));
+    let worker_id = WorkerId::new(format!("worker-session-action-{}", accepted_at.0));
+
+    let control = pipeline.orchestrator.control_plane();
+    control
+        .execute(OrchestratorCommand::CreateMission {
+            mission_id: mission_id.clone(),
+            title: request.mission_title.clone(),
+        })
+        .map_err(|error| {
+            ApiError::internal_assembly("创建 shadow mission 失败", format!("{error:?}"))
+        })?;
+    control
+        .execute(OrchestratorCommand::AddAssignment {
+            mission_id: mission_id.clone(),
+            assignment_id: assignment_id.clone(),
+            title: request
+                .skill_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("skill/{value}"))
+                .unwrap_or_else(|| "session.action".to_string()),
+        })
+        .map_err(|error| {
+            ApiError::internal_assembly("创建 shadow assignment 失败", format!("{error:?}"))
+        })?;
+    control
+        .execute(OrchestratorCommand::CreateTask {
+            mission_id: mission_id.clone(),
+            assignment_id: assignment_id.clone(),
+            task_id: task_id.clone(),
+            title: request.task_title.clone(),
+        })
+        .map_err(|error| ApiError::internal_assembly("创建 shadow task 失败", format!("{error:?}")))?;
+
+    let obj_task_id = TaskId::new(format!("task-obj-{}", accepted_at.0));
+    let act_task_id = TaskId::new(format!("task-act-{}", accepted_at.0));
+
+    let now = UtcMillis::now();
+    let objective = make_shadow_task(
+        obj_task_id.clone(),
+        mission_id.clone(),
+        obj_task_id.clone(),
+        None,
+        TaskKind::Objective,
+        request.mission_title.clone(),
+        trimmed_text.unwrap_or("").to_string(),
+        TaskStatus::Running,
+        now,
+        Some("architect"),
+    );
+    task_store.insert_task(objective);
+
+    let action_goal = trimmed_text.unwrap_or("").to_string();
+    let action = make_shadow_task(
+        act_task_id.clone(),
+        mission_id.clone(),
+        obj_task_id.clone(),
+        Some(obj_task_id.clone()),
+        TaskKind::Action,
+        request.mission_title.clone(),
+        action_goal,
+        TaskStatus::Ready,
+        now,
+        Some(
+            request
+                .target_role
+                .as_deref()
+                .unwrap_or_else(|| infer_dispatch_task_role(request.skill_name.as_deref())),
+        ),
+    );
+    task_store.insert_task(action);
+
+    let mut total_task_count = 2usize;
+    let mut sub_task_ids: Vec<TaskId> = Vec::new();
+    if request.deep_task {
+        if let Some(sub_actions) = decompose_mission(state, trimmed_text, &now) {
+            for (i, sub_title) in sub_actions.iter().enumerate() {
+                let sub_task_id = TaskId::new(format!("task-sub-{}-{}", accepted_at.0, i));
+                let sub_action = make_shadow_task(
+                    sub_task_id.clone(),
+                    mission_id.clone(),
+                    obj_task_id.clone(),
+                    Some(obj_task_id.clone()),
+                    TaskKind::Action,
+                    sub_title.clone(),
+                    sub_title.clone(),
+                    TaskStatus::Ready,
+                    now,
+                    Some("integration-dev"),
+                );
+                task_store.insert_task(sub_action);
+                sub_task_ids.push(sub_task_id);
+                total_task_count += 1;
+            }
+        }
+    }
+
+    let event = task_events::task_graph_created_event(
+        mission_id.as_str(),
+        obj_task_id.as_str(),
+        total_task_count,
+    )
+    .with_context(EventContext {
+        mission_id: Some(mission_id.clone()),
+        task_id: Some(obj_task_id.clone()),
+        ..EventContext::default()
+    });
+    let _ = state.event_bus.publish(event);
+
+    let dispatch = match control
+        .execute(OrchestratorCommand::DispatchNextTask {
+            mission_id: mission_id.clone(),
+        })
+        .map_err(|error| {
+            ApiError::internal_assembly("创建 shadow dispatch 失败", format!("{error:?}"))
+        })? {
+        OrchestratorCommandResult::TaskDispatchPlanned { decision } => decision,
+        other => {
+            return Err(ApiError::internal_assembly(
+                "创建 shadow dispatch 失败",
+                format!("unexpected result: {other:?}"),
+            ));
+        }
+    };
+
+    let workspace_id = state
+        .session_store
+        .execution_ownership(session_id)
+        .and_then(|ownership| ownership.workspace_id)
+        .or_else(|| state.workspace_registry.active_workspace_id());
+    let ownership = ExecutionOwnership {
+        session_id: Some(session_id.clone()),
+        workspace_id: workspace_id.clone(),
+        mission_id: Some(mission_id.clone()),
+        task_id: Some(task_id),
+        worker_id: Some(worker_id.clone()),
+        execution_chain_ref: Some(format!("session-action-chain-{}", accepted_at.0)),
+        ..ExecutionOwnership::default()
+    };
+    state.shadow_task_execution_registry().insert(
+        act_task_id.clone(),
+        ShadowTaskExecutionPlan::Dispatch {
+            dispatch: dispatch.clone(),
+            worker_id: worker_id.clone(),
+            session_id: session_id.clone(),
+            workspace_id: workspace_id.clone(),
+            ownership: ownership.clone(),
+            writebacks: ExecutionWritebackPlans::from_session_action_input(
+                magi_orchestrator::DispatchMemoryExtractionInput {
+                    accepted_at,
+                    session_id: session_id,
+                    timeline_entry_id: entry_id,
+                    text: trimmed_text,
+                    skill_name: request.skill_name.as_deref(),
+                    deep_task: request.deep_task,
+                },
+            ),
+            use_tools: request.deep_task,
+            skill_name: request.skill_name.clone(),
+        },
+    );
+
+    for sub_task_id in &sub_task_ids {
+        let sub_ownership = ExecutionOwnership {
+            session_id: Some(request.session_id.clone()),
+            workspace_id: workspace_id.clone(),
+            mission_id: Some(mission_id.clone()),
+            task_id: Some(TaskId::new(sub_task_id.as_str())),
+            worker_id: Some(worker_id.clone()),
+            ..ExecutionOwnership::default()
+        };
+        state.shadow_task_execution_registry().insert(
+            sub_task_id.clone(),
+            ShadowTaskExecutionPlan::Dispatch {
+                dispatch: dispatch.clone(),
+                worker_id: worker_id.clone(),
+                session_id: request.session_id.clone(),
+                workspace_id: workspace_id.clone(),
+                ownership: sub_ownership,
+                writebacks: ExecutionWritebackPlans::default(),
+                use_tools: true,
+                skill_name: request.skill_name.clone(),
+            },
+        );
+    }
+
+    Ok(ShadowTaskGraphSubmission {
+        root_task_id: obj_task_id,
+        action_task_id: act_task_id,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn run_shadow_session_action(
+    state: &ApiState,
+    request: &SessionActionRequestDto,
+    accepted_at: UtcMillis,
+    session_id: &SessionId,
+    entry_id: &str,
+    trimmed_text: Option<&str>,
+) -> Result<ShadowTaskGraphSubmission, ApiError> {
+    run_shadow_dispatch_submission(
+        state,
+        &DispatchSubmissionRequest {
+            accepted_at,
+            session_id: session_id.clone(),
+            entry_id: entry_id.to_string(),
+            created_session: false,
+            mission_title: trimmed_text
+                .map(str::to_string)
+                .unwrap_or_else(|| request.fallback_session_title(trimmed_text)),
+            task_title: request.timeline_message(trimmed_text),
+            trimmed_text: trimmed_text.map(str::to_string),
+            deep_task: request.deep_task,
+            skill_name: request.skill_name.clone(),
+            target_role: None,
+        },
+    )
+}
+
+pub(crate) fn run_shadow_recovery_resume(
+    state: &ApiState,
+    request: &RecoveryResumeRequestDto,
+) -> Result<ShadowTaskGraphSubmission, ApiError> {
+    let _pipeline = state.shadow_execution_pipeline().ok_or_else(|| {
+        ApiError::internal_assembly("执行 shadow recovery 失败", "shadow execution pipeline 未配置")
+    })?;
+    let task_store = state
+        .task_store()
+        .ok_or_else(|| ApiError::internal_assembly("执行 shadow recovery 失败", "task_store 未配置"))?;
+
+    let recovery_id = request
+        .requested_recovery_id()
+        .ok_or_else(|| ApiError::InvalidInput("recovery_id 不能为空".to_string()))?;
+    validate_recovery_resume_target(state, &recovery_id)?;
+    let input = state
+        .workspace_registry
+        .build_recovery_resume_input(&recovery_id)
+        .map_err(|error| map_recovery_input_error(&recovery_id, error))?;
+    let worker_id = request
+        .requested_worker_id()
+        .or_else(|| input.ownership.worker_id.clone())
+        .ok_or_else(|| ApiError::InvalidInput("recovery 输入缺少 worker_id".to_string()))?;
+
+    // ── Task Graph creation (shadow, optional) ───────────────────────────
+    let mission_id = MissionId::new(format!("mission-recovery-{recovery_id}"));
+    let obj_task_id = TaskId::new(format!("task-obj-recovery-{recovery_id}"));
+    let act_task_id = TaskId::new(format!("task-act-recovery-{recovery_id}"));
+    let now = UtcMillis::now();
+    let objective = make_shadow_task(
+        obj_task_id.clone(),
+        mission_id.clone(),
+        obj_task_id.clone(),
+        None,
+        TaskKind::Objective,
+        format!("Recovery resume {recovery_id}"),
+        format!("Execute recovery resume for {recovery_id}"),
+        TaskStatus::Running,
+        now,
+        Some("architect"),
+    );
+    task_store.insert_task(objective);
+
+    let action = make_shadow_task(
+        act_task_id.clone(),
+        mission_id.clone(),
+        obj_task_id.clone(),
+        Some(obj_task_id.clone()),
+        TaskKind::Action,
+        "Execute recovery dispatch".to_string(),
+        "Execute the dispatched recovery resume action".to_string(),
+        TaskStatus::Ready,
+        now,
+        Some("debugger"),
+    );
+    task_store.insert_task(action);
+
+    let event = task_events::task_graph_created_event(mission_id.as_str(), obj_task_id.as_str(), 2)
+        .with_context(EventContext {
+            mission_id: Some(mission_id.clone()),
+            task_id: Some(obj_task_id.clone()),
+            ..EventContext::default()
+        });
+    let _ = state.event_bus.publish(event);
+
+    state.shadow_task_execution_registry().insert(
+        act_task_id.clone(),
+        ShadowTaskExecutionPlan::RecoveryResume {
+            input: input.clone(),
+            worker_id,
+            writebacks: ExecutionWritebackPlans::from_recovery_resume_input(&input),
+        },
+    );
+
+    Ok(ShadowTaskGraphSubmission {
+        root_task_id: obj_task_id,
+        action_task_id: act_task_id,
+    })
+}
+
+fn decompose_mission(
+    state: &ApiState,
+    prompt: Option<&str>,
+    _now: &UtcMillis,
+) -> Option<Vec<String>> {
+    let prompt_text = prompt.filter(|s| !s.is_empty())?;
+    let client = state.model_bridge_client()?;
+    let request = ModelInvocationRequest {
+        provider: "default".to_string(),
+        prompt: format!(
+            "请将以下任务分解为 2-5 个具体的子任务。每行一个子任务标题，不要编号，不要额外说明。\n\n任务：{}",
+            prompt_text
+        ),
+        messages: None,
+        tools: None,
+    };
+    let response = client.invoke(request).ok()?;
+    if !response.ok {
+        return None;
+    }
+    let sub_tasks: Vec<String> = response
+        .payload
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .take(5)
+        .collect();
+    if sub_tasks.is_empty() {
+        None
+    } else {
+        Some(sub_tasks)
+    }
+}
+
+fn validate_recovery_resume_target(state: &ApiState, recovery_id: &str) -> Result<(), ApiError> {
+    let export = state
+        .workspace_registry
+        .recovery_sidecar_export(recovery_id)
+        .ok_or_else(|| ApiError::recovery_not_found(recovery_id))?;
+    match export.current_status {
+        RecoveryStatus::Ready => Ok(()),
+        RecoveryStatus::Prepared => Err(ApiError::InvalidInput(format!(
+            "恢复入口 {} 当前状态为 prepared，必须先进入 ready 才能恢复",
+            recovery_id
+        ))),
+        RecoveryStatus::Consumed => Err(ApiError::InvalidInput(format!(
+            "恢复入口 {} 已被消费，不能重复恢复",
+            recovery_id
+        ))),
+    }
+}
+
+fn map_recovery_input_error(recovery_id: &str, error: DomainError) -> ApiError {
+    match error {
+        DomainError::NotFound { .. } => ApiError::recovery_not_found(recovery_id),
+        DomainError::InvalidState { message } | DomainError::Validation { message } => {
+            ApiError::InvalidInput(message)
+        }
+        other => ApiError::internal_assembly("构建 recovery resume 输入失败", other),
+    }
+}
+
+/// Build a Task with sensible defaults for shadow execution entries.
+fn make_shadow_task(
+    task_id: TaskId,
+    mission_id: MissionId,
+    root_task_id: TaskId,
+    parent_task_id: Option<TaskId>,
+    kind: TaskKind,
+    title: String,
+    goal: String,
+    status: TaskStatus,
+    now: UtcMillis,
+    target_role: Option<&str>,
+) -> Task {
+    Task {
+        task_id,
+        mission_id,
+        root_task_id,
+        parent_task_id,
+        kind,
+        title,
+        goal,
+        status,
+        dependency_ids: Vec::new(),
+        required_children: Vec::new(),
+        policy_snapshot: None,
+        executor_binding: target_role.map(|role| ExecutorBinding {
+            target_role: role.to_string(),
+            capability_requirements: Vec::new(),
+            parallelism_group: None,
+            exclusive_scope: None,
+            worker_selector: None,
+        }),
+        context_refs: Vec::new(),
+        knowledge_refs: Vec::new(),
+        workspace_scope: None,
+        write_scope: None,
+        input_refs: Vec::new(),
+        output_refs: Vec::new(),
+        evidence_refs: Vec::new(),
+        retry_count: 0,
+        repair_count: 0,
+        decision_payload: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn infer_dispatch_task_role(skill_name: Option<&str>) -> &'static str {
+    let Some(skill_name) = skill_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return "integration-dev";
+    };
+
+    let skill = skill_name.to_ascii_lowercase();
+    if skill.contains("front") || skill.contains("ui") {
+        "frontend-dev"
+    } else if skill.contains("back") || skill.contains("api") || skill.contains("server") {
+        "backend-dev"
+    } else if skill.contains("review") || skill.contains("audit") {
+        "reviewer"
+    } else if skill.contains("test") || skill.contains("qa") || skill.contains("verify") {
+        "test-engineer"
+    } else if skill.contains("doc") || skill.contains("write") {
+        "doc-writer"
+    } else if skill.contains("debug") || skill.contains("fix") || skill.contains("bug") {
+        "debugger"
+    } else if skill.contains("data") || skill.contains("etl") || skill.contains("metric") {
+        "data-engineer"
+    } else if skill.contains("devops") || skill.contains("infra") || skill.contains("deploy") {
+        "devops-engineer"
+    } else if skill.contains("security") || skill.contains("auth") || skill.contains("sec") {
+        "security-analyst"
+    } else if skill.contains("arch") || skill.contains("design") {
+        "architect"
+    } else {
+        "integration-dev"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ApiState;
+    use magi_core::SessionId;
+    use magi_event_bus::InMemoryEventBus;
+    use magi_governance::GovernanceService;
+    use magi_memory_store::MemoryStore;
+    use magi_orchestrator::{OrchestratorService, task_store::TaskStore};
+    use magi_session_store::SessionStore;
+    use magi_skill_runtime::SkillDispatchRuntime;
+    use magi_tool_runtime::ToolRegistry;
+    use magi_worker_runtime::WorkerRuntime;
+    use magi_workspace::WorkspaceStore;
+    use std::sync::Arc;
+
+    use crate::dto::{RecoveryResumeRequestDto, SessionActionRequestDto};
+    use magi_core::{AbsolutePath, WorkspaceId};
+
+    /// Build a minimal ApiState with a shadow execution pipeline and task store.
+    fn build_test_state() -> (ApiState, Arc<TaskStore>) {
+        let event_bus = Arc::new(InMemoryEventBus::new(64));
+        let governance = Arc::new(GovernanceService::default());
+        let orchestrator =
+            OrchestratorService::with_governance(Arc::clone(&event_bus), Arc::clone(&governance));
+        let session_store = Arc::new(SessionStore::new());
+        let workspace_store = Arc::new(WorkspaceStore::new());
+        let memory_store = MemoryStore::new();
+
+        let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
+        tool_registry.register_default_builtins();
+        let execution_runtime = orchestrator.execution_runtime(
+            WorkerRuntime::new_compare(Arc::clone(&event_bus)),
+            tool_registry.clone(),
+            SkillDispatchRuntime::new(
+                tool_registry,
+                magi_bridge_client::BridgeDispatchRuntime::new(),
+            ),
+        );
+
+        let task_store = Arc::new(TaskStore::new());
+
+        let state = ApiState::new(
+            "test-shadow",
+            Arc::clone(&event_bus),
+            Arc::clone(&session_store),
+            Arc::clone(&workspace_store),
+            governance,
+        )
+        .with_shadow_execution_pipeline(orchestrator, execution_runtime, memory_store)
+        .with_task_store(Arc::clone(&task_store));
+
+        (state, task_store)
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 1: Session action creates Task Graph entries when TaskStore is configured
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn session_action_creates_task_graph_entries() {
+        let (state, task_store) = build_test_state();
+
+        let session_id = SessionId::new("session-task-graph-test");
+        state
+            .session_store
+            .create_session(session_id.clone(), "test session")
+            .expect("session should be creatable");
+
+        let accepted_at = UtcMillis::now();
+        let request = SessionActionRequestDto {
+            session_id: None,
+            text: Some("Hello world".to_string()),
+            skill_name: None,
+            deep_task: false,
+            images: Vec::new(),
+        };
+
+        let result = run_shadow_session_action(
+            &state,
+            &request,
+            accepted_at,
+            &session_id,
+            "entry-1",
+            Some("Hello world"),
+        )
+        .expect("shadow session action should create task graph");
+
+        // Verify Objective task was created
+        let obj_task_id = result.root_task_id;
+        let obj = task_store.get_task(&obj_task_id);
+        assert!(obj.is_some(), "Objective task should exist in TaskStore");
+        let obj = obj.unwrap();
+        assert_eq!(obj.kind, TaskKind::Objective);
+        assert_eq!(obj.title, "Hello world");
+        assert_eq!(obj.status, TaskStatus::Running);
+
+        // Verify Action task was created
+        let act_task_id = result.action_task_id;
+        let act = task_store.get_task(&act_task_id);
+        assert!(act.is_some(), "Action task should exist in TaskStore");
+        let act = act.unwrap();
+        assert_eq!(act.kind, TaskKind::Action);
+        assert_eq!(act.title, "Hello world");
+        assert_eq!(act.goal, "Hello world");
+        assert_eq!(act.parent_task_id, Some(obj_task_id.clone()));
+        assert_eq!(act.root_task_id, obj_task_id.clone());
+        assert_eq!(act.status, TaskStatus::Ready);
+
+        let children = task_store.get_children(&obj_task_id);
+        assert_eq!(children.len(), 1);
+        let child_ids: Vec<&str> = children.iter().map(|t| t.task_id.as_str()).collect();
+        assert!(child_ids.contains(&act_task_id.as_str()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 2: Task status reflects dispatch outcome (failure path)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn session_action_registers_shadow_execution_plan() {
+        let (state, task_store) = build_test_state();
+
+        let session_id = SessionId::new("session-task-status-test");
+        state
+            .session_store
+            .create_session(session_id.clone(), "test session")
+            .expect("session should be creatable");
+
+        let accepted_at = UtcMillis::now();
+        let request = SessionActionRequestDto {
+            session_id: None,
+            text: Some("Run a failing action".to_string()),
+            skill_name: None,
+            deep_task: false,
+            images: Vec::new(),
+        };
+
+        let submission = run_shadow_session_action(
+            &state,
+            &request,
+            accepted_at,
+            &session_id,
+            "entry-2",
+            Some("Run a failing action"),
+        )
+        .expect("shadow session action should register a task execution plan");
+
+        let obj = task_store
+            .get_task(&submission.root_task_id)
+            .expect("objective task should exist");
+        let act = task_store
+            .get_task(&submission.action_task_id)
+            .expect("action task should exist");
+
+        assert_eq!(obj.status, TaskStatus::Running);
+        assert_eq!(act.status, TaskStatus::Ready);
+        assert!(
+            state
+                .shadow_task_execution_registry()
+                .remove(&submission.action_task_id)
+                .is_some(),
+            "action task should have a registered execution plan",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 3: No TaskStore configured — behavior unchanged (backward compat)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn no_task_store_is_rejected() {
+        let event_bus = Arc::new(InMemoryEventBus::new(64));
+        let governance = Arc::new(GovernanceService::default());
+        let orchestrator =
+            OrchestratorService::with_governance(Arc::clone(&event_bus), Arc::clone(&governance));
+        let session_store = Arc::new(SessionStore::new());
+        let workspace_store = Arc::new(WorkspaceStore::new());
+        let memory_store = MemoryStore::new();
+
+        let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
+        tool_registry.register_default_builtins();
+        let execution_runtime = orchestrator.execution_runtime(
+            WorkerRuntime::new_compare(Arc::clone(&event_bus)),
+            tool_registry.clone(),
+            SkillDispatchRuntime::new(
+                tool_registry,
+                magi_bridge_client::BridgeDispatchRuntime::new(),
+            ),
+        );
+
+        // No with_task_store — TaskStore is None
+        let state = ApiState::new(
+            "test-no-task-store",
+            Arc::clone(&event_bus),
+            Arc::clone(&session_store),
+            Arc::clone(&workspace_store),
+            governance,
+        )
+        .with_shadow_execution_pipeline(orchestrator, execution_runtime, memory_store);
+
+        assert!(state.task_store().is_none());
+
+        let session_id = SessionId::new("session-no-store");
+        state
+            .session_store
+            .create_session(session_id.clone(), "test session")
+            .expect("session should be creatable");
+
+        let accepted_at = UtcMillis::now();
+        let request = SessionActionRequestDto {
+            session_id: None,
+            text: Some("test".to_string()),
+            skill_name: None,
+            deep_task: false,
+            images: Vec::new(),
+        };
+
+        let result = run_shadow_session_action(
+            &state,
+            &request,
+            accepted_at,
+            &session_id,
+            "entry-3",
+            Some("test"),
+        );
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 4: Recovery resume creates Task Graph entries and execution plan
+    // -----------------------------------------------------------------------
+
+    /// Build an ApiState with recovery support and a task store.
+    fn build_recovery_test_state() -> (ApiState, Arc<TaskStore>) {
+        let event_bus = Arc::new(InMemoryEventBus::new(64));
+        let governance = Arc::new(GovernanceService::default());
+        let orchestrator =
+            OrchestratorService::with_governance(Arc::clone(&event_bus), Arc::clone(&governance));
+        let session_store = Arc::new(SessionStore::new());
+        let workspace_store = Arc::new(WorkspaceStore::new());
+        let memory_store = MemoryStore::new();
+
+        let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
+        tool_registry.register_default_builtins();
+        let execution_runtime = orchestrator.execution_runtime_with_recovery_support(
+            WorkerRuntime::new_compare(Arc::clone(&event_bus)),
+            tool_registry.clone(),
+            SkillDispatchRuntime::new(
+                tool_registry,
+                magi_bridge_client::BridgeDispatchRuntime::new(),
+            ),
+            Arc::clone(&session_store),
+            Arc::clone(&workspace_store),
+        );
+
+        let task_store = Arc::new(TaskStore::new());
+
+        let state = ApiState::new(
+            "test-shadow-recovery",
+            Arc::clone(&event_bus),
+            Arc::clone(&session_store),
+            Arc::clone(&workspace_store),
+            governance,
+        )
+        .with_shadow_execution_pipeline(orchestrator, execution_runtime, memory_store)
+        .with_task_store(Arc::clone(&task_store));
+
+        (state, task_store)
+    }
+
+    #[test]
+    fn recovery_resume_creates_task_graph_entries() {
+        let (state, task_store) = build_recovery_test_state();
+
+        // Set up workspace
+        let workspace_id = WorkspaceId::new("workspace-recovery-test");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-recovery-test"),
+            )
+            .expect("workspace should register");
+        state
+            .workspace_registry
+            .activate(&workspace_id)
+            .expect("workspace should activate");
+
+        // Set up session + ownership
+        let session_id = SessionId::new("session-recovery-test");
+        state
+            .session_store
+            .create_session(session_id.clone(), "recovery test session")
+            .expect("session should be creatable");
+        let ownership = ExecutionOwnership {
+            session_id: Some(session_id.clone()),
+            workspace_id: Some(workspace_id.clone()),
+            worker_id: Some(WorkerId::new("worker-recovery-test")),
+            execution_chain_ref: Some("recovery-test-chain".to_string()),
+            ..ExecutionOwnership::default()
+        };
+        state
+            .session_store
+            .bind_execution_ownership(session_id.clone(), ownership.clone());
+
+        // Set up snapshot + recovery entry
+        let snapshot = state.workspace_registry.append_execution_snapshot(
+            workspace_id.clone(),
+            ownership.clone(),
+            "snapshot-recovery-test",
+            "Recovery test snapshot",
+        );
+        let recovery = state.workspace_registry.prepare_recovery_entry(
+            workspace_id,
+            ownership,
+            snapshot.snapshot_id,
+            "recovery-test-1",
+            Some("test recovery diagnostic".to_string()),
+        );
+        state
+            .workspace_registry
+            .mark_recovery_ready(&recovery.recovery_id)
+            .expect("recovery should become ready");
+
+        let request = RecoveryResumeRequestDto {
+            recovery_id: "recovery-test-1".to_string(),
+            worker_id: Some("worker-recovery-test".to_string()),
+        };
+
+        let submission = run_shadow_recovery_resume(&state, &request)
+            .expect("shadow recovery resume should register a task execution plan");
+
+        // Verify Objective task was created
+        let obj_task_id = submission.root_task_id;
+        let obj = task_store.get_task(&obj_task_id);
+        assert!(obj.is_some(), "Objective task should exist in TaskStore");
+        let obj = obj.unwrap();
+        assert_eq!(obj.kind, TaskKind::Objective);
+        assert_eq!(obj.title, "Recovery resume recovery-test-1");
+        assert_eq!(obj.status, TaskStatus::Running);
+
+        // Verify Action task was created
+        let act_task_id = submission.action_task_id;
+        let act = task_store.get_task(&act_task_id);
+        assert!(act.is_some(), "Action task should exist in TaskStore");
+        let act = act.unwrap();
+        assert_eq!(act.kind, TaskKind::Action);
+        assert_eq!(act.title, "Execute recovery dispatch");
+        assert_eq!(act.parent_task_id, Some(obj_task_id.clone()));
+        assert_eq!(act.root_task_id, obj_task_id.clone());
+        assert_eq!(act.status, TaskStatus::Ready);
+
+        // Verify children relationship
+        let children = task_store.get_children(&obj_task_id);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].task_id.as_str(), act_task_id.as_str());
+        assert!(
+            state
+                .shadow_task_execution_registry()
+                .remove(&act_task_id)
+                .is_some(),
+            "recovery action task should have a registered execution plan",
+        );
+    }
+}

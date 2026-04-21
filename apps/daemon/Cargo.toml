@@ -1,0 +1,10 @@
+[package]
+name = "magi-daemon-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+magi-daemon = { path = "../../crates/magi-daemon" }

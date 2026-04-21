@@ -1,0 +1,14 @@
+[package]
+name = "magi-tool-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+magi-core = { path = "../magi-core" }
+magi-event-bus = { path = "../magi-event-bus" }
+magi-governance = { path = "../magi-governance" }
+reqwest = { workspace = true, features = ["blocking"] }
+regex = "1"
+urlencoding = "2"

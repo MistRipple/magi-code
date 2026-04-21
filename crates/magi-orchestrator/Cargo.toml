@@ -1,0 +1,23 @@
+[package]
+name = "magi-orchestrator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+magi-event-bus = { path = "../magi-event-bus" }
+magi-core = { path = "../magi-core" }
+magi-worker-runtime = { path = "../magi-worker-runtime" }
+magi-tool-runtime = { path = "../magi-tool-runtime" }
+magi-skill-runtime = { path = "../magi-skill-runtime" }
+magi-context-runtime = { path = "../magi-context-runtime" }
+magi-knowledge-store = { path = "../magi-knowledge-store" }
+magi-memory-store = { path = "../magi-memory-store" }
+magi-bridge-client = { path = "../magi-bridge-client" }
+magi-governance = { path = "../magi-governance" }
+magi-session-store = { path = "../magi-session-store" }
+magi-workspace = { path = "../magi-workspace" }
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
