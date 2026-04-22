@@ -8,6 +8,7 @@ import type {
   SessionNotificationItemDto,
   SessionNotificationSnapshotDto,
   SessionNotificationsResponseDto,
+  MessagesResponseDto,
 } from '../shared/rust-backend-types';
 import { i18n } from '../stores/i18n.svelte';
 
@@ -312,11 +313,7 @@ function getStoredAgentBaseUrl(): string {
   return safeReadLocalStorage(AGENT_BASE_URL_STORAGE_KEY);
 }
 
-function deriveWorkspaceName(rootPath: string, workspaceId: string, rawName?: string | null): string {
-  const explicitName = rawName?.trim() || '';
-  if (explicitName) {
-    return explicitName;
-  }
+function deriveWorkspaceName(rootPath: string, workspaceId: string): string {
   const fallbackName = rootPath
     .split(/[\\/]/)
     .map((part) => part.trim())
@@ -331,7 +328,7 @@ function normalizeWorkspaceSummary(raw: RawAgentWorkspaceSummary): AgentWorkspac
   return {
     workspaceId,
     rootPath,
-    name: deriveWorkspaceName(rootPath, workspaceId, raw.name),
+    name: deriveWorkspaceName(rootPath, workspaceId),
   };
 }
 
@@ -625,14 +622,13 @@ export async function listAgentWorkspaces(): Promise<AgentWorkspaceSummary[]> {
   }
 }
 
-export async function registerAgentWorkspace(rootPath: string, name?: string): Promise<AgentWorkspaceSummary[]> {
+export async function registerAgentWorkspace(rootPath: string): Promise<AgentWorkspaceSummary[]> {
   try {
     const response = await getTransport().request(agentUrl('/api/workspaces/register'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         path: rootPath,
-        name,
       }),
     });
     const payload = await parseAgentJson<{ workspaces?: RawAgentWorkspaceSummary[]; workspaceId?: string; registered?: boolean }>(response, 'register workspace');
@@ -666,33 +662,6 @@ export async function removeAgentWorkspace(workspaceId: string, workspacePath: s
       return cacheWorkspaceSummaries(payload.workspaces.map((workspace) => normalizeWorkspaceSummary(workspace)));
     }
     if (payload.removed) {
-      return await listAgentWorkspaces();
-    }
-    return [];
-  } catch (error) {
-    if (error instanceof TypeError) {
-      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
-    }
-    throw error;
-  }
-}
-
-export async function renameAgentWorkspace(workspaceId: string, workspacePath: string, name: string): Promise<AgentWorkspaceSummary[]> {
-  try {
-    const response = await getTransport().request(agentUrl('/api/workspaces/rename'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        workspaceId,
-        workspacePath,
-        name,
-      }),
-    });
-    const payload = await parseAgentJson<{ workspaces?: RawAgentWorkspaceSummary[]; renamed?: boolean }>(response, 'rename workspace');
-    if (Array.isArray(payload.workspaces)) {
-      return cacheWorkspaceSummaries(payload.workspaces.map((workspace) => normalizeWorkspaceSummary(workspace)));
-    }
-    if (payload.renamed) {
       return await listAgentWorkspaces();
     }
     return [];
@@ -828,6 +797,28 @@ export async function getWorkspaceSessions(
       sessionId: payload.sessionId?.trim() || preferredSessionId?.trim() || sessions[0]?.id || '',
       sessions,
     };
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
+    }
+    throw error;
+  }
+}
+
+export async function loadAgentSessionTimelinePage(
+  sessionId: string,
+  options: { limit?: number; beforeCursor?: string } = {},
+): Promise<MessagesResponseDto> {
+  try {
+    const query = new URLSearchParams({
+      sessionId: sessionId.trim(),
+      limit: String(options.limit ?? 50),
+    });
+    if (options.beforeCursor?.trim()) {
+      query.set('beforeCursor', options.beforeCursor.trim());
+    }
+    const response = await getTransport().request(agentUrl('/api/messages', query.toString()));
+    return await parseAgentJson<MessagesResponseDto>(response, 'load session timeline');
   } catch (error) {
     if (error instanceof TypeError) {
       throw new Error('` + i18n.t("bridge.agentUnreachable") + `');

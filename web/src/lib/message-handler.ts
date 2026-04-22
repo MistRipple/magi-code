@@ -14,11 +14,11 @@ import {
   markMessageComplete,
   addPendingRequest,
   clearPendingRequest,
+  settleProcessingAfterResponseCompletion,
   addToast,
   getRequestBinding,
   createRequestBinding,
   updateRequestBinding,
-  clearRequestBinding,
   settleProcessingForManualInteraction,
   sealAllStreamingMessages,
   applyTimelineStreamPatch,
@@ -910,6 +910,9 @@ function handleStandardComplete(message: ClientBridgeMessage) {
   const uiMessage = mapStandardMessage(standard);
   const visibility = resolveTimelineVisibilityForStandard(standard);
   const requestBinding = requestId ? getRequestBinding(requestId) : undefined;
+  const responseDurationMs = requestBinding?.createdAt
+    ? Math.max(0, (standard.timestamp || Date.now()) - requestBinding.createdAt)
+    : undefined;
   const replaceMessageId = (
     requestId
     && shouldTakeOverRequestPlaceholder(standard, requestBinding)
@@ -930,6 +933,10 @@ function handleStandardComplete(message: ClientBridgeMessage) {
     ...uiMessage,
     isStreaming: false,
     isComplete: true,
+    metadata: {
+      ...(uiMessage.metadata || {}),
+      ...(typeof responseDurationMs === 'number' ? { responseDurationMs } : {}),
+    },
     ...(mergedBlocks ? {
       blocks: mergedBlocks,
       content: blocksToContent(mergedBlocks),
@@ -976,10 +983,8 @@ function handleStandardComplete(message: ClientBridgeMessage) {
         timeoutId: undefined,
       });
     }
-    setTimeout(() => {
-      clearRequestBinding(requestId);
-    }, 1000);
   }
+  settleProcessingAfterResponseCompletion();
 }
 
 

@@ -178,11 +178,13 @@ import { collectWorkerTabIds, resolveWorkerDisplayName, resolveWorkerRoleSource 
 <style>
   /* ============================================
      BottomTabs - Agent 切换栏
-     设计参考: Cursor 底部 worker 状态栏
+     设计参考: Apple HIG 次级导航栏
      ============================================ */
   .bt-bar {
     display: flex;
-    background: var(--background);
+    background: var(--glass-bg);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
     border-top: 1px solid var(--border);
     flex-shrink: 0;
     width: 100%;
@@ -191,9 +193,9 @@ import { collectWorkerTabIds, resolveWorkerDisplayName, resolveWorkerRoleSource 
 
   .fixed-thread-tab {
     position: relative;
-    padding-left: var(--space-3) !important;
+    padding-left: var(--space-4) !important;
     z-index: 10;
-    box-shadow: 4px 0 8px -4px rgba(0,0,0,0.08); /* 凸显主线固定区域与滚动区的层级 */
+    box-shadow: 2px 0 6px -4px rgba(0,0,0,0.08);
   }
 
   /* 适配不同主题的边框线分隔 */
@@ -231,9 +233,10 @@ import { collectWorkerTabIds, resolveWorkerDisplayName, resolveWorkerRoleSource 
     background: transparent;
     border: none;
     cursor: pointer;
-    transition: color var(--transition-fast);
+    transition: color var(--transition-fast), background var(--transition-fast);
     white-space: nowrap;
     flex-shrink: 0;
+    border-radius: var(--radius-sm);
   }
 
   .bt-tab.active::after {
@@ -248,11 +251,13 @@ import { collectWorkerTabIds, resolveWorkerDisplayName, resolveWorkerRoleSource 
   }
 
   .bt-tab:hover {
+    background: color-mix(in srgb, var(--surface-hover) 55%, transparent);
     color: var(--foreground);
   }
 
   .bt-tab.active {
     color: var(--foreground);
+    background: color-mix(in srgb, var(--surface-active) 42%, transparent);
   }
 
   /* Worker Tab 激活时使用品牌色 */

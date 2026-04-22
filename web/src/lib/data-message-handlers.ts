@@ -22,20 +22,25 @@ import {
   getBackendProcessing,
   getRequestBinding,
   clearRequestBinding,
+  listRequestBindings,
   clearAllRequestBindings,
   clearProcessingState,
   sealAllStreamingMessages,
   setOrchestratorRuntimeState,
   applyAuthoritativeProcessingState,
   markMessageComplete,
+  updateRequestBinding,
+  applyTimelineStreamPatch,
+  settleProcessingAfterResponseCompletion,
   applySessionNotifications,
   batchWebviewStatePersistence,
   setInterruptedChain,
   setEnabledAgents,
   getTimelineProjectionSource,
+  setSessionHistoryState,
 } from '../stores/messages.svelte';
 import type {
-  AppState, Session,
+  AppState, Message, Session,
   Edit,
   ModelStatusMap, ActivePlanState, PlanLedgerRecord, PlanLedgerAttempt,
   QueuedMessage, OrchestratorRuntimeState, SessionTimelineProjection,
@@ -723,6 +728,72 @@ function applyTimelineProjectionSnapshot(
   setTimelineProjection(timelineProjection, options);
 }
 
+function hasRenderableAssistantContent(message: Message): boolean {
+  if (typeof message?.content === 'string' && message.content.trim().length > 0) {
+    return true;
+  }
+  return Array.isArray(message?.blocks) && message.blocks.length > 0;
+}
+
+function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): void {
+  const currentSessionId = getState().currentSessionId || '';
+  if (!sessionId || !currentSessionId || currentSessionId !== sessionId) {
+    return;
+  }
+
+  const threadMessages = getState().threadMessages;
+  if (!Array.isArray(threadMessages) || threadMessages.length === 0) {
+    return;
+  }
+
+  for (const binding of listRequestBindings()) {
+    const userMessage = threadMessages.find((message) => message.id === binding.userMessageId);
+    const lowerBoundTimestamp = typeof userMessage?.timestamp === 'number'
+      ? userMessage.timestamp
+      : binding.createdAt;
+    const matchedAssistant = (
+      (binding.realMessageId
+        ? threadMessages.find((message) => message.id === binding.realMessageId)
+        : undefined)
+      || [...threadMessages].reverse().find((message) => (
+        message.role === 'assistant'
+        && message.source === 'orchestrator'
+        && message.metadata?.isPlaceholder !== true
+        && message.isStreaming !== true
+        && typeof message.timestamp === 'number'
+        && message.timestamp >= lowerBoundTimestamp
+        && hasRenderableAssistantContent(message)
+      ))
+    );
+
+    if (!matchedAssistant) {
+      continue;
+    }
+
+    const responseDurationMs = Math.max(0, matchedAssistant.timestamp - binding.createdAt);
+    const existingMetadata = matchedAssistant.metadata && typeof matchedAssistant.metadata === 'object'
+      ? matchedAssistant.metadata
+      : {};
+    applyTimelineStreamPatch(matchedAssistant.id, {
+      metadata: {
+        ...existingMetadata,
+        responseDurationMs,
+      },
+    });
+    markMessageComplete(binding.placeholderMessageId);
+    clearPendingRequest(binding.requestId);
+    updateRequestBinding(binding.requestId, {
+      realMessageId: matchedAssistant.id,
+      timeoutId: undefined,
+    });
+    if (binding.timeoutId) {
+      clearTimeout(binding.timeoutId);
+    }
+  }
+
+  settleProcessingAfterResponseCompletion();
+}
+
 function handleTimelineProjectionUpdated(message: ClientBridgeMessage) {
   const sessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
   const timelineProjection = message.timelineProjection as SessionTimelineProjection | undefined;
@@ -742,12 +813,17 @@ function handleTimelineProjectionUpdated(message: ClientBridgeMessage) {
     return;
   }
   restoreTimelineProjectionIfNewer(timelineProjection, { source: 'authoritative' });
+  reconcileRequestBindingsFromAuthoritativeThread(sessionId);
 }
 
 function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
   const sessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
   const timelineProjection = message.timelineProjection as SessionTimelineProjection | undefined;
   const state = message.state as AppState | undefined;
+  const hasMoreBefore = message.hasMoreBefore === true;
+  const beforeCursor = typeof message.beforeCursor === 'string' && message.beforeCursor.trim()
+    ? message.beforeCursor.trim()
+    : null;
 
   if (!sessionId || !timelineProjection || !state) {
     return;
@@ -782,6 +858,11 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         applySessionNotifications(sessionId, snapshot.notifications.notifications);
       }
       setQueuedMessages(ensureArray<QueuedMessage>(snapshot.queuedMessages));
+      setSessionHistoryState(sessionId, {
+        hasMoreBefore,
+        beforeCursor,
+        isLoadingBefore: false,
+      });
       const hydrationInput = {
         currentSessionId: liveState.currentSessionId,
         incomingSessionId: sessionId,
@@ -791,9 +872,11 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         incomingTimelineProjection: timelineProjection,
       };
       if (!shouldAcceptAuthoritativeTimelineProjection(hydrationInput)) {
+        reconcileRequestBindingsFromAuthoritativeThread(sessionId);
         return;
       }
       restoreTimelineProjectionIfNewer(timelineProjection, { source: 'authoritative' });
+      reconcileRequestBindingsFromAuthoritativeThread(sessionId);
     });
     return;
   }
@@ -835,6 +918,12 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       applySessionNotifications(sessionId, snapshot.notifications.notifications);
     }
     setQueuedMessages(ensureArray<QueuedMessage>(snapshot.queuedMessages));
+    setSessionHistoryState(sessionId, {
+      hasMoreBefore,
+      beforeCursor,
+      isLoadingBefore: false,
+    });
+    reconcileRequestBindingsFromAuthoritativeThread(sessionId);
   });
 }
 
@@ -948,7 +1037,7 @@ function handleWorkerQuestionRequest(_message: ClientBridgeMessage) {
 
 // handleMissionPlanned, handleAssignmentPlanned, handleAssignmentStarted,
 // handleAssignmentCompleted, updateAssignmentPlan — removed.
-// Old Mission/Assignment/Todo incremental handlers superseded by Task Graph model.
+// Old Mission/Assignment incremental handlers superseded by Task Graph model.
 
 /**
  * 处理 Worker 状态更新消息

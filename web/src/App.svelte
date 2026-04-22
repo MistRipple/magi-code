@@ -44,11 +44,10 @@
 </script>
 
 <div class="app-container">
-  <!-- 顶部标题栏 -->
-  <Header onOpenSettings={openSettings} />
-
-  <!-- 顶部 Tab 栏：对话/任务/变更/知识 -->
-  <TopTabs activeTopTab={currentTopTab} onTabChange={handleTabChange} />
+  <!-- 顶部标题栏 + 导航栏 -->
+  <Header onOpenSettings={openSettings}>
+    <TopTabs activeTopTab={currentTopTab} onTabChange={handleTabChange} />
+  </Header>
 
   <!-- Tab 内容区域：主对话面板常驻以保留输入草稿，其余非主线面板仅在激活时挂载 -->
   <div class="tab-content-wrapper">

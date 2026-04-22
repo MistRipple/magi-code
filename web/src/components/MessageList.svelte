@@ -1,15 +1,33 @@
 <script lang="ts">
-  import type { Message, ScrollPositions, TimelineRenderItem } from '../types/message';
+  import type {
+    Message,
+    ScrollPositions,
+    SessionTimelineProjection,
+    TimelineRenderItem,
+  } from '../types/message';
   import MessageItem from './MessageItem.svelte';
   import Icon from './Icon.svelte';
   import { tick, onDestroy } from 'svelte';
-  import { clearMessageJump, getState, messagesState, updatePanelScrollState } from '../stores/messages.svelte';
+  import {
+    clearMessageJump,
+    getState,
+    messagesState,
+    prependTimelineProjectionPage,
+    setSessionHistoryState,
+    updatePanelScrollState,
+  } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import {
     getMessageRequestId,
     isWorkerExecutingStatus,
     selectWorkerRuntime,
   } from '../lib/worker-panel-state';
+  import { loadAgentSessionTimelinePage } from '../web/agent-api';
+  import { readStoredBrowserWorkspaceBinding } from '../shared/bridges/browser-workspace-binding';
+  import {
+    normalizeRustBootstrapPayload,
+    readRustTimelinePageMeta,
+  } from '../shared/bridges/rust-daemon-contract';
 
   // Props - Svelte 5 语法
   interface Props {
@@ -219,6 +237,7 @@
   const persistedScrollTop = $derived(messagesState.scrollPositions[panelKey] || 0);
   const persistedScrollAnchor = $derived(messagesState.scrollAnchors[panelKey]);
   const shouldAutoScroll = $derived(messagesState.autoScrollEnabled[panelKey]);
+  const sessionHistory = $derived(messagesState.sessionHistory);
 
   // 容器引用
   let containerRef: HTMLDivElement | null = $state(null);
@@ -228,6 +247,14 @@
   let activationRestoreNonce = 0;
   let restoreAttemptTimers: Array<ReturnType<typeof setTimeout>> = [];
   let programmaticScrollDepth = 0;
+  let pendingHistoryRestore = $state<{
+    sessionId: string;
+    previousScrollTop: number;
+    previousScrollHeight: number;
+  } | null>(null);
+
+  const HISTORY_LOAD_THRESHOLD_PX = 120;
+  const HISTORY_PAGE_SIZE = 50;
 
   function clearRestoreAttemptTimers() {
     if (restoreAttemptTimers.length === 0) return;
@@ -400,6 +427,91 @@
     });
   });
 
+  $effect(() => {
+    const pending = pendingHistoryRestore;
+    const loading = sessionHistory.isLoadingBefore;
+    const _len = safeRenderMessages.length;
+    void _len;
+    if (!pending || loading || !containerRef) {
+      return;
+    }
+    if ((messagesState.currentSessionId || '') !== pending.sessionId) {
+      pendingHistoryRestore = null;
+      return;
+    }
+    tick().then(() => {
+      if (!containerRef || !pendingHistoryRestore) {
+        return;
+      }
+      const latestPending = pendingHistoryRestore;
+      if ((messagesState.currentSessionId || '') !== latestPending.sessionId) {
+        pendingHistoryRestore = null;
+        return;
+      }
+      const delta = containerRef.scrollHeight - latestPending.previousScrollHeight;
+      setContainerScrollPosition(latestPending.previousScrollTop + delta);
+      syncPanelScrollState(containerRef.scrollTop, false, false);
+      pendingHistoryRestore = null;
+    });
+  });
+
+  async function loadOlderHistory(): Promise<void> {
+    if (!containerRef || displayContext !== 'thread' || !isActive) {
+      return;
+    }
+    const sessionId = (messagesState.currentSessionId || '').trim();
+    const historyState = messagesState.sessionHistory;
+    if (
+      !sessionId
+      || historyState.sessionId !== sessionId
+      || !historyState.hasMoreBefore
+      || !historyState.beforeCursor
+      || historyState.isLoadingBefore
+    ) {
+      return;
+    }
+    const previousScrollTop = containerRef.scrollTop;
+    const previousScrollHeight = containerRef.scrollHeight;
+    setSessionHistoryState(sessionId, { isLoadingBefore: true });
+    try {
+      const rawPayload = await loadAgentSessionTimelinePage(sessionId, {
+        limit: HISTORY_PAGE_SIZE,
+        beforeCursor: historyState.beforeCursor,
+      });
+      if ((messagesState.currentSessionId || '').trim() !== sessionId) {
+        return;
+      }
+      const binding = readStoredBrowserWorkspaceBinding();
+      const payload = normalizeRustBootstrapPayload(rawPayload, {
+        workspaceId: binding.workspaceId,
+        workspacePath: binding.workspacePath,
+        sessionId,
+      });
+      const pageMeta = readRustTimelinePageMeta(rawPayload);
+      const merged = prependTimelineProjectionPage(
+        sessionId,
+        payload.timelineProjection as unknown as SessionTimelineProjection,
+      );
+      setSessionHistoryState(sessionId, {
+        hasMoreBefore: pageMeta.hasMoreBefore,
+        beforeCursor: pageMeta.beforeCursor,
+        isLoadingBefore: false,
+      });
+      if (merged) {
+        pendingHistoryRestore = {
+          sessionId,
+          previousScrollTop,
+          previousScrollHeight,
+        };
+      }
+    } catch (error) {
+      console.error('[MessageList] 加载更早会话历史失败:', error);
+      if ((messagesState.currentSessionId || '').trim() === sessionId) {
+        setSessionHistoryState(sessionId, { isLoadingBefore: false });
+      }
+    }
+  }
+
   // 检测用户是否手动滚动
   function handleScroll(event: Event) {
     const target = event.target as HTMLDivElement;
@@ -419,6 +531,9 @@
     }
     lastObservedScrollTop = scrollTop;
     syncPanelScrollState(scrollTop, nextAutoScroll);
+    if (displayContext === 'thread' && scrollTop <= HISTORY_LOAD_THRESHOLD_PX) {
+      void loadOlderHistory();
+    }
   }
 
   // 滚动到底部
@@ -521,8 +636,6 @@
     text-align: center;
     color: var(--foreground-muted);
     padding: var(--space-8);
-    width: 100%;
-    box-sizing: border-box;
   }
 
   .empty-icon {

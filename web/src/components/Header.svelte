@@ -5,17 +5,23 @@
   import Icon from './Icon.svelte';
   import Modal from './Modal.svelte';
   import NotificationCenter from './NotificationCenter.svelte';
+  import LanAccessPanel from './LanAccessPanel.svelte';
   import type { Session } from '../types/message';
   import { i18n } from '../stores/i18n.svelte';
 
+  import type { Snippet } from 'svelte';
   interface Props {
     onOpenSettings?: () => void;
+    children?: Snippet;
   }
 
-  let { onOpenSettings }: Props = $props();
+  let { onOpenSettings, children }: Props = $props();
   const appState = getState();
   // 下拉菜单状态
   let dropdownOpen = $state(false);
+
+  // 远程访问面板状态
+  let showLanPanel = $state(false);
 
   // 删除确认对话框状态
   let showDeleteConfirm = $state(false);
@@ -208,11 +214,26 @@
     {/if}
   </div>
 
+  <div class="header-center">
+    {@render children?.()}
+  </div>
+
   <!-- 右侧操作按钮 -->
   <div class="header-actions">
     <button class="btn-icon btn-icon--sm" onclick={newSession} title={isCurrentSessionEmpty ? i18n.t('header.currentSessionEmpty') : i18n.t('header.newSession')} disabled={isCurrentSessionEmpty}>
       <Icon name="plus" size={14} />
     </button>
+    <div class="lan-access-wrapper">
+      <button
+        class="btn-icon btn-icon--sm lan-access-trigger"
+        class:active={showLanPanel}
+        onclick={() => { showLanPanel = !showLanPanel; }}
+        title={i18n.t('lanAccess.title')}
+      >
+        <Icon name="qrcode" size={14} />
+      </button>
+      <LanAccessPanel visible={showLanPanel} onClose={() => { showLanPanel = false; }} />
+    </div>
     <NotificationCenter />
     <button class="btn-icon btn-icon--sm" onclick={openSettings} title={i18n.t('header.settings')}>
       <Icon name="settings" size={14} />
@@ -259,33 +280,105 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
-    height: 40px;
+    height: 48px;
     padding: 0 var(--space-4);
-    border-bottom: 1px solid var(--border);
-    background: var(--background);
+    background: var(--glass-bg);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
     flex-shrink: 0;
+    position: sticky;
+    top: 0;
+    z-index: var(--z-modal);
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+  }
+
+  .header-center {
+    display: flex;
+    flex: 1;
+    justify-content: center;
   }
 
   .session-selector {
     position: relative;
+    flex-shrink: 0;
+    display: flex;
+    justify-content: flex-start;
+  }
+
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-shrink: 0;
+    justify-content: flex-end;
+  }
+
+  /* 移动端：Header 变两行 */
+  @media (max-width: 768px) {
+    .header-bar {
+      flex-wrap: wrap;
+      height: auto;
+      padding: var(--space-2) var(--space-3);
+      gap: var(--space-1);
+    }
+
+    /* 第一行：左侧会话 + 右侧按钮 */
+    .session-selector {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .header-actions {
+      flex: 0;
+    }
+
+    /* 第二行：Tab 栏占满整行 */
+    .header-center {
+      flex-basis: 100%;
+      order: 3;
+      justify-content: flex-start;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+    }
+
+    .header-center::-webkit-scrollbar {
+      display: none;
+    }
+
+    .session-selector-name {
+      max-width: 120px;
+    }
+  }
+
+  .lan-access-wrapper {
+    position: relative;
+  }
+
+  .lan-access-trigger.active {
+    color: var(--primary);
   }
 
   .session-selector-btn {
     display: flex;
     align-items: center;
     gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
+    padding: 4px 10px;
     background: transparent;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    color: var(--foreground);
+    border: none;
+    border-radius: var(--radius-md);
+    color: color-mix(in srgb, var(--foreground) 92%, var(--foreground-muted));
     cursor: pointer;
-    transition: all var(--transition-fast);
+    transition: background var(--transition-fast), color var(--transition-fast);
   }
 
   .session-selector-btn:hover {
-    background: var(--surface-hover);
-    border-color: var(--border);
+    background: color-mix(in srgb, var(--surface-hover) 72%, transparent);
+    color: var(--foreground);
+  }
+
+  .session-selector-btn:focus-visible {
+    outline-offset: 0;
   }
 
   .session-selector-name {
@@ -301,14 +394,16 @@
     position: absolute;
     top: 100%;
     left: 0;
-    margin-top: var(--space-2);
-    min-width: 220px;
+    margin-top: 6px;
+    min-width: 240px;
     max-width: 320px;
-    background: var(--dropdown-bg);
+    background: color-mix(in srgb, var(--background) 92%, var(--surface-1));
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
     border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+    border-radius: calc(var(--radius-lg) + 2px);
     box-shadow: var(--shadow-lg);
-    z-index: var(--z-dropdown);
+    z-index: var(--z-popover);
     overflow: hidden;
   }
 
@@ -329,9 +424,12 @@
   }
 
   .session-list {
-    max-height: 200px;
+    max-height: 280px;
     overflow-y: auto;
-    padding: var(--space-2) 0;
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
 
   .session-item {
@@ -339,23 +437,24 @@
     justify-content: space-between;
     align-items: center;
     width: 100%;
-    padding: var(--space-3) var(--space-4);
+    padding: 10px 12px;
     text-align: left;
     font-size: var(--text-sm);
     color: var(--foreground);
     background: transparent;
     border: none;
+    border-radius: var(--radius-md);
     cursor: pointer;
-    transition: background var(--transition-fast);
+    transition: background var(--transition-fast), color var(--transition-fast);
   }
 
   .session-item:hover {
-    background: var(--surface-hover);
+    background: color-mix(in srgb, var(--surface-hover) 82%, transparent);
   }
 
   .session-item.active {
-    background: var(--surface-selected);
-    color: var(--primary);
+    background: color-mix(in srgb, var(--surface-selected) 82%, transparent);
+    color: var(--foreground);
   }
 
   .session-info {
@@ -372,6 +471,10 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  .session-item.active .session-name {
+    font-weight: var(--font-semibold);
   }
 
   .session-meta {
@@ -402,13 +505,17 @@
     color: var(--foreground-muted);
     cursor: pointer;
     border-radius: var(--radius-sm);
-    opacity: 0.5;
+    opacity: 0.42;
     transition: all var(--transition-fast);
     flex-shrink: 0;
   }
 
   .session-item:hover .delete-btn {
     opacity: 1;
+  }
+
+  .session-item.active .delete-btn {
+    opacity: 0.78;
   }
 
   .delete-btn:hover {
@@ -425,17 +532,11 @@
     color: var(--foreground-muted);
   }
 
-  .header-actions {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-  }
-
   /* 下拉菜单背景遮罩 - 点击外部区域关闭 */
   .dropdown-backdrop {
     position: fixed;
     inset: 0;
-    z-index: calc(var(--z-dropdown) - 1);
+    z-index: calc(var(--z-popover) - 1);
     background: transparent;
   }
 

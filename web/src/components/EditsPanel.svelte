@@ -321,7 +321,7 @@
   </div>
 {/snippet}
 
-<div class="edits-panel" class:web-mode={isWebMode} class:compact-web={isWebMode && isCompactViewport}>
+<div class="panel-content-scrollable edits-panel" class:web-mode={isWebMode} class:compact-web={isWebMode && isCompactViewport}>
   {#if edits.length === 0}
     <div class="empty-state">
       <Icon name="file-edit" size={32} />
@@ -331,30 +331,29 @@
   {:else}
     <div class="edits-shell" class:has-docked-preview={useDockedPreview}>
       <div class="edits-main">
-        <!-- 顶部统计条 -->
+        <!-- 顶部统计与操作条 -->
         <div class="summary-bar">
           <div class="summary-left">
             <span class="summary-count">{i18n.t('edits.summary.fileCount', { count: edits.length })}</span>
             {#if addedCount > 0}<span class="summary-chip add">{i18n.t('edits.summary.added', { count: addedCount })}</span>{/if}
             {#if modifiedCount > 0}<span class="summary-chip modify">{i18n.t('edits.summary.modified', { count: modifiedCount })}</span>{/if}
             {#if deletedCount > 0}<span class="summary-chip del">{i18n.t('edits.summary.deleted', { count: deletedCount })}</span>{/if}
-          </div>
-          <div class="summary-right">
-            <span class="stat-add">+{totalAdditions}</span>
-            <span class="stat-del">-{totalDeletions}</span>
-          </div>
-        </div>
 
-        <!-- 批量操作 -->
-        <div class="bulk-actions">
-          <button class="bulk-btn approve" onclick={approveAllChanges} title={i18n.t('edits.actions.approveAllTitle')}>
-            <Icon name="check-circle" size={13} />
-            <span>{i18n.t('edits.actions.approveAll')}</span>
-          </button>
-          <button class="bulk-btn revert" onclick={revertAllChanges} title={i18n.t('edits.actions.revertAllTitle')}>
-            <Icon name="undo" size={13} />
-            <span>{i18n.t('edits.actions.revertAll')}</span>
-          </button>
+            <div class="summary-stats-inline">
+              <span class="stat-add">+{totalAdditions}</span>
+              <span class="stat-del">-{totalDeletions}</span>
+            </div>
+          </div>
+          <div class="summary-right bulk-actions">
+            <button class="bulk-btn approve" onclick={approveAllChanges} title={i18n.t('edits.actions.approveAllTitle')}>
+              <Icon name="check-circle" size={13} />
+              <span>{i18n.t('edits.actions.approveAll')}</span>
+            </button>
+            <button class="bulk-btn revert" onclick={revertAllChanges} title={i18n.t('edits.actions.revertAllTitle')}>
+              <Icon name="undo" size={13} />
+              <span>{i18n.t('edits.actions.revertAll')}</span>
+            </button>
+          </div>
         </div>
 
         {#if hasGroups}
@@ -588,13 +587,8 @@
     --edits-header-bg: color-mix(in srgb, var(--surface-1) 76%, var(--background));
     --edits-line-number-bg: color-mix(in srgb, var(--surface-2) 78%, transparent);
     --edits-overlay-bg: rgba(10, 16, 28, 0.52);
-    height: 100%;
-    min-height: 0; /* flex 布局防溢出 */
-    overflow-y: auto;
-    padding: var(--space-3);
+    /* panel-content-scrollable 已经包含了基础布局属性 */
     background: transparent;
-    scrollbar-width: thin;
-    scrollbar-color: var(--scrollbar-thumb) transparent;
   }
 
   :global(.theme-light) .edits-panel,
@@ -699,21 +693,22 @@
     opacity: 0.6;
   }
 
-  /* 统计条 */
+  /* 统计条 & 批量操作 (Sticky Header) */
   .summary-bar {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: var(--space-2) var(--space-3);
-    margin-bottom: var(--space-2);
+    padding: var(--space-3) var(--space-4);
+    margin-bottom: var(--space-3);
     position: sticky;
-    top: 0;
-    z-index: 2;
-    background: var(--edits-card-bg);
-    backdrop-filter: blur(10px);
+    top: -16px; /* 匹配面板 padding */
+    z-index: var(--z-sticky);
+    background: var(--glass-bg);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
     border-radius: var(--radius-lg);
-    border: 1px solid var(--edits-card-border);
-    box-shadow: var(--edits-card-shadow);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow-md);
   }
 
   .summary-left {
@@ -740,12 +735,15 @@
   .summary-chip.modify { color: var(--warning); background: var(--warning-muted); }
   .summary-chip.del { color: var(--error); background: var(--error-muted); }
 
-  .summary-right {
+  .summary-stats-inline {
     display: flex;
     gap: var(--space-2);
     font-size: var(--text-xs);
     font-weight: var(--font-semibold);
     font-variant-numeric: tabular-nums;
+    margin-left: var(--space-2);
+    border-left: 1px solid var(--border);
+    padding-left: var(--space-3);
   }
 
   .stat-add { color: var(--success); }
@@ -755,7 +753,6 @@
   .bulk-actions {
     display: flex;
     gap: var(--space-2);
-    margin-bottom: var(--space-2);
     flex-wrap: wrap;
   }
 

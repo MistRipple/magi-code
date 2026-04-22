@@ -40,32 +40,32 @@ export interface RustEventEnvelope {
 }
 
 interface RustBootstrapSessionRecord {
-  session_id?: string;
+  sessionId?: string;
   title?: string | null;
-  created_at?: number;
-  updated_at?: number;
+  createdAt?: number;
+  updatedAt?: number;
 }
 
 interface RustBootstrapWorkspaceRecord {
-  workspace_id?: string;
-  root_path?: string;
+  workspaceId?: string;
+  rootPath?: string;
 }
 
 interface RustNotificationRecord {
-  notification_id?: string;
-  session_id?: string;
+  notificationId?: string;
+  sessionId?: string;
   kind?: string;
   message?: string;
-  created_at?: number;
+  createdAt?: number;
   handled?: boolean;
 }
 
 interface RustTimelineEntry {
-  entry_id?: string;
-  session_id?: string;
+  entryId?: string;
+  sessionId?: string;
   kind?: string;
   message?: string;
-  occurred_at?: number;
+  occurredAt?: number;
 }
 
 interface RustMissionRuntimeSummary {
@@ -140,17 +140,23 @@ interface RustRuntimeReadModelDto {
 }
 
 interface RustBootstrapDto {
-  generated_at?: number;
-  current_session?: RustBootstrapSessionRecord | null;
+  generatedAt?: number;
+  currentSession?: RustBootstrapSessionRecord | null;
   sessions?: RustBootstrapSessionRecord[];
   timeline?: RustTimelineEntry[];
   workspaces?: RustBootstrapWorkspaceRecord[];
-  runtime_read_model?: RustRuntimeReadModelDto;
+  runtimeReadModel?: RustRuntimeReadModelDto;
   notifications?: RustNotificationRecord[];
-  recent_events?: RustEventEnvelope[];
+  recentEvents?: RustEventEnvelope[];
   agent?: {
     runtimeEpoch?: string;
   };
+}
+
+interface RustTimelinePageDto {
+  sessionId?: string;
+  hasMoreBefore?: boolean;
+  beforeCursor?: string | null;
 }
 
 interface NormalizedNotificationEntry {
@@ -211,13 +217,7 @@ function normalizeAssignmentRuntimeEntries(
 function normalizeTaskRuntimeEntries(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
 ): RustTaskRuntimeSummary[] {
-  const taskEntries = getRuntimeDetailEntries(runtimeReadModel, 'tasks');
-  const legacyTaskEntries = taskEntries.length > 0 ? [] : getRuntimeDetailEntries(
-    runtimeReadModel,
-    'todos',
-  );
-  const sourceEntries = taskEntries.length > 0 ? taskEntries : legacyTaskEntries;
-  return sourceEntries
+  return getRuntimeDetailEntries(runtimeReadModel, 'tasks')
     .map((entry) => normalizeObjectRecord(entry))
     .filter((entry): entry is Record<string, unknown> => entry !== null)
     .map((entry) => ({
@@ -287,12 +287,12 @@ function normalizeRustSessions(
   }
   const sessions: Session[] = [];
   for (const session of payload.sessions) {
-    const sessionId = normalizeString(session.session_id);
+    const sessionId = normalizeString(session.sessionId);
     if (!sessionId) {
       continue;
     }
-    const createdAt = normalizeNumber(session.created_at, generatedAt);
-    const updatedAt = normalizeNumber(session.updated_at, createdAt);
+    const createdAt = normalizeNumber(session.createdAt, generatedAt);
+    const updatedAt = normalizeNumber(session.updatedAt, createdAt);
     sessions.push({
       id: sessionId,
       name: normalizeString(session.title) || undefined,
@@ -319,11 +319,11 @@ function resolveSelectedWorkspace(
   const requestedWorkspaceId = normalizeString(options.workspaceId);
   const requestedWorkspacePath = normalizeString(options.workspacePath);
   const workspaces = Array.isArray(payload.workspaces) ? payload.workspaces : [];
-  const selectedWorkspace = workspaces.find((workspace) => normalizeString(workspace.workspace_id) === requestedWorkspaceId)
+  const selectedWorkspace = workspaces.find((workspace) => normalizeString(workspace.workspaceId) === requestedWorkspaceId)
     || workspaces[0]
     || null;
-  const workspaceId = requestedWorkspaceId || normalizeString(selectedWorkspace?.workspace_id);
-  const rootPath = requestedWorkspacePath || normalizeString(selectedWorkspace?.root_path);
+  const workspaceId = requestedWorkspaceId || normalizeString(selectedWorkspace?.workspaceId);
+  const rootPath = requestedWorkspacePath || normalizeString(selectedWorkspace?.rootPath);
   return {
     workspaceId,
     rootPath,
@@ -498,11 +498,13 @@ function buildAssignmentsFromRuntime(
 
 function deriveProcessingState(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
-  generatedAt: number,
+  sessionId: string,
 ): AppState['processingState'] {
-  const runningMissionIds = normalizeStringArray(runtimeReadModel?.operations?.work_queues?.running_mission_ids);
-  const runningTaskIds = normalizeStringArray(runtimeReadModel?.operations?.work_queues?.running_task_ids);
-  const pendingRecoveryIds = normalizeStringArray(runtimeReadModel?.operations?.work_queues?.pending_recovery_ids);
+  const activeSession = normalizeSessionRuntimeEntries(runtimeReadModel)
+    .find((entry) => normalizeString(entry.session_id) === sessionId);
+  const runningMissionIds = activeSession?.active_mission_ids || [];
+  const runningTaskIds = activeSession?.active_task_ids || [];
+  const pendingRecoveryIds = activeSession?.recovery_ids || [];
   const isProcessing = runningMissionIds.length > 0 || runningTaskIds.length > 0 || pendingRecoveryIds.length > 0;
 
   if (!isProcessing) {
@@ -513,7 +515,7 @@ function deriveProcessingState(
     isProcessing: true,
     source: 'orchestrator',
     agent: 'orchestrator',
-    startedAt: generatedAt,
+    startedAt: 0,
     pendingRequestIds: [],
   };
 }
@@ -586,8 +588,8 @@ function normalizeNotifications(
   }
   const normalized: NormalizedNotificationEntry[] = [];
   for (const notification of notifications) {
-    const notificationId = normalizeString(notification.notification_id);
-    const sessionId = normalizeString(notification.session_id);
+    const notificationId = normalizeString(notification.notificationId);
+    const sessionId = normalizeString(notification.sessionId);
     const message = normalizeString(notification.message);
     if (!notificationId || !sessionId || !message) {
       continue;
@@ -599,7 +601,7 @@ function normalizeNotifications(
         kind: normalizeNotificationKind(normalizeString(notification.kind)),
         level: 'info',
         message,
-        createdAt: normalizeNumber(notification.created_at, Date.now()),
+        createdAt: normalizeNumber(notification.createdAt, Date.now()),
         read: Boolean(notification.handled),
         persistToCenter: true,
         actionRequired: false,
@@ -693,14 +695,14 @@ function buildTimelineEntryArtifacts(
     return [];
   }
   const artifacts: TimelineProjectionArtifact[] = [];
-  const sessionTimeline = timeline.filter((entry) => normalizeString(entry.session_id) === sessionId);
+  const sessionTimeline = timeline.filter((entry) => normalizeString(entry.sessionId) === sessionId);
   for (const [index, entry] of sessionTimeline.entries()) {
-    const entryId = normalizeString(entry.entry_id);
+    const entryId = normalizeString(entry.entryId);
     const message = normalizeString(entry.message);
     if (!entryId || !message) {
       continue;
     }
-    const timestamp = normalizeNumber(entry.occurred_at, Date.now());
+    const timestamp = normalizeNumber(entry.occurredAt, Date.now());
     const kind = normalizeString(entry.kind);
     let role: 'user' | 'assistant' | 'system' = 'system';
     let type: 'user_input' | 'text' | 'system-notice' = 'system-notice';
@@ -745,8 +747,6 @@ function summarizeRustEvent(event: RustEventEnvelope): string {
   switch (eventType) {
     case 'session.action.accepted':
       return text || '已提交会话消息';
-    case 'task.execute.accepted':
-      return text || '已提交任务执行请求';
     case 'recovery.resume.executed':
       return '已执行恢复流程';
     case 'mission.created':
@@ -754,16 +754,12 @@ function summarizeRustEvent(event: RustEventEnvelope): string {
     case 'assignment.created':
       return '已创建执行分配';
     case 'task.created':
-    case 'todo.created':
       return '已创建任务';
     case 'task.dispatched':
-    case 'todo.dispatched':
       return '任务开始执行';
     case 'task.completed':
-    case 'todo.completed':
       return '任务已完成';
     case 'task.failed':
-    case 'todo.failed':
       return '任务执行失败';
     case 'mission.execution.overview':
       return '执行概览已更新';
@@ -813,7 +809,7 @@ function buildEventArtifacts(
 
       const eventType = normalizeString(event.event_type);
       const suppressedTypes = [
-        'session.action.accepted', 'task.execute.accepted',
+        'session.action.accepted',
         'tool.invoked', 'tool.usage.recorded',
         'task.llm.started', 'task.llm.completed',
         'task.tool.invoked',
@@ -863,15 +859,15 @@ function buildTimelineProjection(
   generatedAt: number,
   payload: RustBootstrapDto,
 ): SessionTimelineProjection {
-  const recentEvents = Array.isArray(payload.recent_events)
-    ? payload.recent_events.map((event) => normalizeEventEnvelope(event)).filter((event): event is RustEventEnvelope => event !== null)
+  const recentEvents = Array.isArray(payload.recentEvents)
+    ? payload.recentEvents.map((event) => normalizeEventEnvelope(event)).filter((event): event is RustEventEnvelope => event !== null)
     : [];
   const timelineArtifacts = buildTimelineEntryArtifacts(sessionId, payload.timeline);
-  const eventArtifacts = buildEventArtifacts(sessionId, payload.runtime_read_model, recentEvents);
+  const eventArtifacts = buildEventArtifacts(sessionId, payload.runtimeReadModel, recentEvents);
   const artifacts = [...timelineArtifacts, ...eventArtifacts];
   const maxEventSeq = recentEvents.reduce((max, event) => Math.max(max, normalizeNumber(event.sequence, 0)), 0);
   const latestSequence = Math.max(
-    normalizeNumber(payload.runtime_read_model?.meta?.latest_sequence, 0),
+    normalizeNumber(payload.runtimeReadModel?.meta?.latest_sequence, 0),
     maxEventSeq,
   );
 
@@ -903,19 +899,22 @@ export function normalizeRustBootstrapPayload(
   options: { workspaceId?: string; workspacePath?: string; sessionId?: string } = {},
 ): BootstrapPayload {
   const payload = (rawPayload ?? {}) as RustBootstrapDto;
-  const generatedAt = normalizeNumber(payload.generated_at, Date.now());
+  const generatedAt = normalizeNumber(payload.generatedAt, Date.now());
   const sessions = normalizeRustSessions(payload, generatedAt);
   const selectedSessionId = normalizeString(options.sessionId)
-    || normalizeString(payload.current_session?.session_id)
+    || normalizeString(payload.currentSession?.sessionId)
     || sessions[0]?.id
     || '';
   const currentSession = sessions.find((session) => session.id === selectedSessionId) ?? sessions[0];
   const workspace = resolveSelectedWorkspace(payload, options);
-  const normalizedEvents = Array.isArray(payload.recent_events)
-    ? payload.recent_events.map((event) => normalizeEventEnvelope(event)).filter((event): event is RustEventEnvelope => event !== null)
+  const normalizedEvents = Array.isArray(payload.recentEvents)
+    ? payload.recentEvents.map((event) => normalizeEventEnvelope(event)).filter((event): event is RustEventEnvelope => event !== null)
     : [];
-  const assignments = buildAssignmentsFromRuntime(payload.runtime_read_model, normalizedEvents);
-  const processingState = deriveProcessingState(payload.runtime_read_model, generatedAt);
+  const assignments = buildAssignmentsFromRuntime(payload.runtimeReadModel, normalizedEvents);
+  const processingState = deriveProcessingState(
+    payload.runtimeReadModel,
+    currentSession?.id || '',
+  );
   const state: AppState = {
     ...buildEmptyWorkspaceAppState(generatedAt),
     sessions,
@@ -951,10 +950,23 @@ export function normalizeRustBootstrapPayload(
       : undefined,
     queuedMessages: [],
     orchestratorRuntimeState: deriveRuntimeState(
-      payload.runtime_read_model,
+      payload.runtimeReadModel,
       assignments,
       currentSession?.id || '',
       generatedAt,
     ),
+  };
+}
+
+export function readRustTimelinePageMeta(rawPayload: unknown): {
+  sessionId: string;
+  hasMoreBefore: boolean;
+  beforeCursor: string | null;
+} {
+  const payload = (rawPayload ?? {}) as RustTimelinePageDto;
+  return {
+    sessionId: normalizeString(payload.sessionId),
+    hasMoreBefore: payload.hasMoreBefore === true,
+    beforeCursor: normalizeString(payload.beforeCursor) || null,
   };
 }

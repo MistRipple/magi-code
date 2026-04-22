@@ -692,7 +692,7 @@ import { getAgentColor } from '../lib/agent-colors';
     }
 
     .settings-sidebar {
-      width: 240px;
+      width: 140px;
       background: var(--vscode-sideBar-background, rgba(0, 0, 0, 0.02));
       border-right: 1px solid var(--vscode-widget-border, rgba(0, 0, 0, 0.08));
       display: flex;

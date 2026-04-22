@@ -284,7 +284,7 @@
   });
 </script>
 
-<div class="knowledge-panel">
+<div class="panel-content-scrollable knowledge-panel">
   <!-- 头部：Tab 栏 -->
   <div class="kp-tabs-bar">
     <button class="kp-tab" class:active={currentTab === 'overview'} onclick={() => switchTab('overview')}>
@@ -649,62 +649,70 @@
      ============================================ */
 
   .knowledge-panel {
-    display: flex;
-    flex-direction: column;
-    height: 100%;
-    min-height: 0; /* flex 布局防溢出 */
-    overflow: hidden;
+    /* panel-content-scrollable 已经包含了 padding, flex, overflow */
+    background: transparent;
+    padding-top: 0;
   }
 
-  /* ---- Tab 栏（下划线风格） ---- */
+  /* ---- Tab 栏（Apple HIG 分段式胶囊风格） ---- */
   .kp-tabs-bar {
     display: flex;
     align-items: center;
     gap: var(--space-1);
-    padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--border);
-    background: var(--surface-1);
+    padding: var(--space-3) 0;
+    border-bottom: none;
+    position: sticky;
+    top: 0;
+    background: var(--glass-bg);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    z-index: var(--z-sticky);
+    margin-bottom: var(--space-2);
   }
 
   .kp-tab {
     display: inline-flex;
     align-items: center;
-    gap: var(--space-1);
-    padding: var(--space-2) var(--space-3);
+    gap: var(--space-2);
+    padding: 6px 12px;
     font-size: var(--text-sm);
     color: var(--foreground-muted);
     background: transparent;
     border: none;
-    border-bottom: 2px solid transparent;
+    border-radius: var(--radius-full);
     cursor: pointer;
     transition: all var(--transition-fast);
     white-space: nowrap;
+    height: 28px;
   }
 
   .kp-tab:hover {
     color: var(--foreground);
+    background: var(--surface-hover);
   }
 
   .kp-tab.active {
     color: var(--foreground);
-    border-bottom-color: var(--primary);
+    background: var(--surface-active);
+    font-weight: var(--font-semibold);
   }
 
   .kp-tab-count {
     font-size: 10px;
-    min-width: 16px;
-    height: 16px;
-    line-height: 16px;
+    font-weight: var(--font-medium);
+    min-width: 18px;
+    height: 18px;
+    line-height: 18px;
     text-align: center;
-    padding: 0 4px;
-    background: var(--surface-3);
+    padding: 0 5px;
+    background: color-mix(in srgb, var(--foreground) 10%, transparent);
     color: var(--foreground-muted);
     border-radius: var(--radius-full);
   }
 
   .kp-tab.active .kp-tab-count {
-    background: var(--primary);
-    color: white;
+    background: var(--foreground);
+    color: var(--background);
   }
 
   .kp-tab-actions {
@@ -1010,6 +1018,7 @@
   }
 
   .kp-empty {
+    /* 复用全局 .empty-state 模式，这里只保留特有调整 */
     display: flex;
     flex-direction: column;
     align-items: center;

@@ -112,6 +112,12 @@ export const messagesState = $state({
   // 会话状态
   sessions: [] as Session[],
   currentSessionId: null as string | null,
+  sessionHistory: {
+    sessionId: null as string | null,
+    hasMoreBefore: false,
+    beforeCursor: null as string | null,
+    isLoadingBefore: false,
+  },
   queuedMessages: [] as QueuedMessage[],
 
   // 处理状态
@@ -1933,6 +1939,7 @@ export function getState() {
     },
     get sessions() { return messagesState.sessions; },
     get currentSessionId() { return messagesState.currentSessionId; },
+    get sessionHistory() { return messagesState.sessionHistory; },
     get queuedMessages() { return messagesState.queuedMessages; },
     set queuedMessages(v) { messagesState.queuedMessages = ensureArray<QueuedMessage>(v) as QueuedMessage[]; },
     get isProcessing() { return messagesState.isProcessing; },
@@ -2219,6 +2226,14 @@ export function setCurrentSessionId(id: string | null) {
   }
   messagesState.currentSessionId = nextSessionId;
   if (hasChanged) {
+    messagesState.sessionHistory = {
+      sessionId: nextSessionId,
+      hasMoreBefore: false,
+      beforeCursor: null,
+      isLoadingBefore: false,
+    };
+  }
+  if (hasChanged) {
     // 底部 worker 面板是“当前会话内的执行细节视图”，不能跨会话继承。
     // 否则用户从上一会话停留在 worker tab，新会话会直接落到 worker 面板，
     // 造成“主线/worker 边界混淆”的产品错觉。
@@ -2374,6 +2389,15 @@ export function clearPendingRequest(id: string) {
     messagesState.pendingRequests = next;
     updateProcessingState();
   }
+}
+
+export function settleProcessingAfterResponseCompletion() {
+  if (messagesState.pendingRequests.size > 0 || messagesState.activeMessageIds.size > 0) {
+    return;
+  }
+  messagesState.backendProcessing = false;
+  messagesState.lastForcedIdleAt = Date.now();
+  updateProcessingState();
 }
 
 export function clearProcessingState(options?: {
@@ -2890,6 +2914,12 @@ export function clearAllMessages(options: {
     timelineDisplayOrderCounter = 0;
   }
   messagesState.orchestratorRuntimeState = null;
+  messagesState.sessionHistory = {
+    sessionId: messagesState.currentSessionId,
+    hasMoreBefore: false,
+    beforeCursor: null,
+    isLoadingBefore: false,
+  };
   messagesState.queuedMessages = [];
   messagesState.messageJump = {
     messageId: null,
@@ -2905,6 +2935,88 @@ export function clearAllMessages(options: {
   if (options.persist !== false) {
     saveWebviewState();
   }
+}
+
+export function setSessionHistoryState(
+  sessionId: string | null | undefined,
+  input: {
+    hasMoreBefore?: boolean;
+    beforeCursor?: string | null;
+    isLoadingBefore?: boolean;
+  },
+): void {
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  if (!normalizedSessionId) {
+    messagesState.sessionHistory = {
+      sessionId: null,
+      hasMoreBefore: false,
+      beforeCursor: null,
+      isLoadingBefore: false,
+    };
+    return;
+  }
+  const current = messagesState.sessionHistory;
+  if (current.sessionId && current.sessionId !== normalizedSessionId) {
+    messagesState.sessionHistory = {
+      sessionId: normalizedSessionId,
+      hasMoreBefore: input.hasMoreBefore === true,
+      beforeCursor: typeof input.beforeCursor === 'string' && input.beforeCursor.trim()
+        ? input.beforeCursor.trim()
+        : null,
+      isLoadingBefore: input.isLoadingBefore === true,
+    };
+    return;
+  }
+  messagesState.sessionHistory = {
+    sessionId: normalizedSessionId,
+    hasMoreBefore: input.hasMoreBefore ?? current.hasMoreBefore,
+    beforeCursor: input.beforeCursor !== undefined
+      ? (typeof input.beforeCursor === 'string' && input.beforeCursor.trim() ? input.beforeCursor.trim() : null)
+      : current.beforeCursor,
+    isLoadingBefore: input.isLoadingBefore ?? current.isLoadingBefore,
+  };
+}
+
+export function prependTimelineProjectionPage(
+  sessionId: string,
+  projection: SessionTimelineProjection,
+): boolean {
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  if (!normalizedSessionId) {
+    return false;
+  }
+  const currentSessionId = normalizeSessionId(messagesState.currentSessionId);
+  if (!currentSessionId || currentSessionId !== normalizedSessionId) {
+    return false;
+  }
+  const currentProjection = messagesState.timelineProjection;
+  if (!currentProjection || normalizeSessionId(currentProjection.sessionId) !== normalizedSessionId) {
+    setTimelineProjection(projection, { source: 'authoritative' });
+    return true;
+  }
+  const incomingProjection = canonicalizeTimelineProjection(projection);
+  if (incomingProjection.artifacts.length === 0) {
+    return false;
+  }
+  const mergedArtifacts = [
+    ...incomingProjection.artifacts,
+    ...currentProjection.artifacts,
+  ];
+  const artifactById = new Map<string, TimelineProjectionArtifact>();
+  for (const artifact of mergedArtifacts) {
+    artifactById.set(artifact.artifactId, artifact);
+  }
+  setTimelineProjection({
+    ...currentProjection,
+    sessionId: normalizedSessionId,
+    updatedAt: Math.max(currentProjection.updatedAt, incomingProjection.updatedAt),
+    lastAppliedEventSeq: Math.max(
+      currentProjection.lastAppliedEventSeq,
+      incomingProjection.lastAppliedEventSeq,
+    ),
+    artifacts: [...artifactById.values()],
+  }, { source: 'authoritative' });
+  return true;
 }
 
 function buildTimelineNodesFromProjection(projection: SessionTimelineProjection): TimelineNode[] {
@@ -3117,6 +3229,10 @@ export function clearAllRetryRuntime(): void {
  */
 export function getRequestBinding(requestId: string): RequestResponseBinding | undefined {
   return requestBindings.get(requestId);
+}
+
+export function listRequestBindings(): RequestResponseBinding[] {
+  return Array.from(requestBindings.values());
 }
 
 /**

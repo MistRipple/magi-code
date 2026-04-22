@@ -2,7 +2,6 @@
  * 工具可见性分级 — 统一判定工具调用在 Thread/Worker Tab 中的可见性
  *
  * 设计原则（架构方案）：
- * - runtime_internal：编排器内部协议工具（worker_dispatch/wait/send_message/todo 等），
  * - runtime_internal：编排器内部协议工具（worker_dispatch/wait/send_message/task 等），
  *   不应出现在任何 UI 面板
  * - worker_sidechain：Worker 自身调用的工具（shell/edit/search 等），

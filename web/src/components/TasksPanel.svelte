@@ -400,7 +400,7 @@
   }
 </script>
 
-<div class="tasks-panel">
+<div class="panel-content-scrollable tasks-panel">
   <!-- ═══ Runner Controls Bar ═══ -->
   {#if hasTaskProjection && rootTaskId}
     <div class="runner-bar">
@@ -679,23 +679,19 @@
 <style>
   /* ========== 面板容器 ========== */
   .tasks-panel {
-    height: 100%;
-    min-height: 0; /* flex 布局防溢出 */
-    overflow-y: auto;
-    padding: var(--space-4);
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-3);
+    /* panel-content-scrollable 已经包含了 padding, flex, overflow */
+    gap: var(--space-4);
   }
 
   .plan-ledger-card {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
-    padding: var(--space-2);
+    gap: var(--space-3);
+    padding: var(--space-4);
     border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-lg);
     background: var(--surface-1);
+    box-shadow: var(--shadow-sm);
   }
 
   .plan-ledger-toggle {
@@ -1180,15 +1176,15 @@
   }
 
   .tg-wp-card {
-    border: 1px solid var(--border);
+    border: none;
     border-radius: var(--radius-md);
-    background: var(--surface-1);
+    background: transparent;
     overflow: hidden;
-    transition: border-color var(--transition-fast);
+    transition: background var(--transition-fast);
   }
 
   .tg-wp-card:hover {
-    border-color: color-mix(in srgb, var(--foreground) 20%, var(--border));
+    background: var(--surface-1);
   }
 
   .tg-wp--running {

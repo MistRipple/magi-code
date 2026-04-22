@@ -448,7 +448,7 @@ export interface OrchestratorRuntimeDecisionTraceEntry {
 
 export interface OrchestratorRuntimeSnapshot {
   progressVector?: {
-    terminalRequiredTodos?: number;
+    terminalRequiredTaskCount?: number;
     acceptedCriteria?: number;
     criticalPathResolved?: number;
     unresolvedBlockers?: number;
@@ -726,7 +726,7 @@ export type SubTaskStatus =
   | 'cancelled'
   | 'in_progress'; // 增量事件可能发送此值
 
-// 子任务（对齐后端 TodoItemView）
+// 子任务（对齐后端 TaskItemView）
 export interface SubTaskItem {
   id: string;
   description: string;

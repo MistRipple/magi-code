@@ -21,7 +21,6 @@
     getWorkspaceSessions,
     listAgentWorkspaces,
     registerAgentWorkspace,
-    renameAgentWorkspace,
     removeAgentWorkspace,
     resolveAgentBaseUrl,
     type AgentConnectionEventDetail,
@@ -39,6 +38,7 @@
   let workspaces = $state<AgentWorkspaceSummary[]>([]);
   let selectedWorkspaceId = $state('');
   let currentSessionId = $state<string | null>(null);
+  let pendingSessionSwitchId = $state<string | null>(null);
   let sessionsByWorkspace = $state<Record<string, Session[]>>({});
   let loadingWorkspaceIds = $state<Record<string, boolean>>({});
   let expandedWorkspaceIds = $state<Record<string, boolean>>({});
@@ -48,13 +48,11 @@
   let workspaceActionPending = $state(false);
   let showAddWorkspaceDialog = $state(false);
   let showRemoveWorkspaceDialog = $state(false);
-  let showRenameWorkspaceDialog = $state(false);
   let pendingRemoveWorkspace = $state<AgentWorkspaceSummary | null>(null);
-  let pendingRenameWorkspace = $state<AgentWorkspaceSummary | null>(null);
-  let renameWorkspaceValue = $state('');
   let workspaceDialogError = $state('');
   let webThemePreference = $state<WebThemePreference>('system');
   let webThemeMode = $state<WebThemeMode>('dark');
+  let pendingSessionSwitchTimer: ReturnType<typeof setTimeout> | null = null;
 
   const INTERNAL_SESSION_NAME_PATTERNS = [
     /^auto-deep-followup-\d+$/i,
@@ -113,6 +111,13 @@
     }
 
     currentSessionId = bootstrapSessionId;
+    if (pendingSessionSwitchId === bootstrapSessionId) {
+      if (pendingSessionSwitchTimer) {
+        clearTimeout(pendingSessionSwitchTimer);
+        pendingSessionSwitchTimer = null;
+      }
+      pendingSessionSwitchId = null;
+    }
     const workspace = workspaces.find((item) => item.workspaceId === selectedWorkspaceId) ?? null;
     if (workspace) {
       syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, bootstrapSessionId);
@@ -198,10 +203,6 @@
     }
   }
 
-  function getThemeModeLabel(mode: WebThemeMode): string {
-    return mode === 'light' ? i18n.t('web.themeLight') : i18n.t('web.themeDark');
-  }
-
   function getThemeIconName(preference: WebThemePreference): IconName {
     switch (preference) {
       case 'light':
@@ -227,9 +228,8 @@
   const themeIconName = $derived.by(() => getThemeIconName(webThemePreference));
   const themeToggleTitle = $derived.by(() => {
     const currentLabel = getThemePreferenceLabel(webThemePreference);
-    const actualLabel = webThemePreference === 'system' ? ` (${i18n.t('common.current', { val: getThemeModeLabel(webThemeMode) })})` : '';
     const nextLabel = getThemePreferenceLabel(getNextThemePreference(webThemePreference));
-    return i18n.t('web.themeToggleTitle', { current: currentLabel, actual: actualLabel, next: nextLabel });
+    return i18n.t('web.themeToggleTitle', { current: currentLabel, next: nextLabel });
   });
 
   function toggleWebTheme(): void {
@@ -408,7 +408,7 @@
     }
   }
 
-  async function handleFolderSelected(rootPath: string, name: string): Promise<void> {
+  async function handleFolderSelected(rootPath: string, _name: string): Promise<void> {
     if (workspaceActionPending) {
       return;
     }
@@ -421,7 +421,7 @@
     workspaceActionPending = true;
     try {
       const next = await runActionWithFeedback(
-        () => registerAgentWorkspace(normalizedRootPath, name?.trim() || undefined),
+        () => registerAgentWorkspace(normalizedRootPath),
         {
           actionLabel: '添加工作区',
           successMessage: '工作区已添加',
@@ -479,28 +479,6 @@
     showRemoveWorkspaceDialog = true;
   }
 
-  function openRenameWorkspaceDialog(workspace: AgentWorkspaceSummary): void {
-    if (workspaceActionPending) {
-      return;
-    }
-    workspaceDialogError = '';
-    pendingRenameWorkspace = workspace;
-    renameWorkspaceValue = workspace.name;
-    
-    showRenameWorkspaceDialog = true;
-  }
-
-  function closeRenameWorkspaceDialog(options: { force?: boolean } = {}): void {
-    if (workspaceActionPending && options.force !== true) {
-      return;
-    }
-    workspaceDialogError = '';
-    pendingRenameWorkspace = null;
-    renameWorkspaceValue = '';
-    
-    showRenameWorkspaceDialog = false;
-  }
-
   function closeRemoveWorkspaceDialog(options: { force?: boolean } = {}): void {
     if (workspaceActionPending && options.force !== true) {
       return;
@@ -509,39 +487,6 @@
     pendingRemoveWorkspace = null;
     
     showRemoveWorkspaceDialog = false;
-  }
-
-  async function renameWorkspace(): Promise<void> {
-    if (workspaceActionPending || !pendingRenameWorkspace) {
-      return;
-    }
-    const workspace = pendingRenameWorkspace;
-    const nextName = renameWorkspaceValue.trim();
-    if (!nextName) {
-      workspaceDialogError = i18n.t('web.workspaceNameEmpty');
-      return;
-    }
-    closeRenameWorkspaceDialog({ force: true });
-    workspaceActionPending = true;
-    try {
-      const next = await runActionWithFeedback(
-        () => renameAgentWorkspace(
-          workspace.workspaceId,
-          workspace.rootPath,
-          nextName,
-        ),
-        {
-          actionLabel: '重命名工作区',
-          successMessage: '工作区名称已更新',
-        },
-      );
-      if (!next) {
-        return;
-      }
-      workspaces = next;
-    } finally {
-      workspaceActionPending = false;
-    }
   }
 
   async function removeWorkspace(): Promise<void> {
@@ -624,11 +569,38 @@
   }
 
   function switchSession(sessionId: string): void {
-    if (!sessionId || sessionId === currentSessionId) {
+    if (!sessionId || sessionId === currentSessionId || pendingSessionSwitchId) {
+      return;
+    }
+    const workspace = workspaces.find((item) => item.workspaceId === selectedWorkspaceId) ?? null;
+    if (!workspace) {
       return;
     }
     const nextSession = (sessionsByWorkspace[selectedWorkspaceId] ?? []).find((session) => session.id === sessionId);
     const nextSessionName = nextSession?.name || '未命名会话';
+    const fallbackSessionId = typeof currentSessionId === 'string' ? currentSessionId : null;
+    currentSessionId = sessionId;
+    pendingSessionSwitchId = sessionId;
+    syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, sessionId);
+    if (pendingSessionSwitchTimer) {
+      clearTimeout(pendingSessionSwitchTimer);
+    }
+    pendingSessionSwitchTimer = setTimeout(() => {
+      if (pendingSessionSwitchId !== sessionId) {
+        return;
+      }
+      pendingSessionSwitchId = null;
+      pendingSessionSwitchTimer = null;
+      const confirmedSessionId = typeof messagesState.currentSessionId === 'string'
+        ? messagesState.currentSessionId.trim()
+        : '';
+      currentSessionId = confirmedSessionId || fallbackSessionId;
+      syncBrowserSessionBinding(
+        workspace.workspaceId,
+        workspace.rootPath,
+        currentSessionId,
+      );
+    }, 6000);
     addToast('info', `正在切换到会话“${nextSessionName}”...`, undefined, {
       category: 'feedback',
       source: 'session-action',
@@ -637,7 +609,12 @@
       displayMode: 'toast',
       duration: 1800,
     });
-    getClientBridge().postMessage({ type: 'switchSession', sessionId });
+    getClientBridge().postMessage({
+      type: 'switchSession',
+      sessionId,
+      workspaceId: workspace.workspaceId,
+      workspacePath: workspace.rootPath,
+    });
     if (isMobileViewport) {
       sidebarOpen = false;
     }
@@ -739,46 +716,29 @@
 
   <aside class="sidebar" class:sidebar--mobile-open={isMobileViewport && sidebarOpen}>
     <div class="sidebar-header">
-      <div>
-        <div class="sidebar-title">Magi Workbench</div>
-        <div class="sidebar-subtitle">{i18n.t('header.sessionHistory')}</div>
-      </div>
-      <div class="sidebar-header-actions">
-        <button
-          class="theme-toggle-btn"
-          type="button"
-          title={themeToggleTitle}
-          aria-label={themeToggleTitle}
-          data-theme-preference={webThemePreference}
-          data-theme-mode={webThemeMode}
-          onclick={toggleWebTheme}
-        >
-          <Icon name={themeIconName} size={16} />
-        </button>
-        <button class="sidebar-refresh" type="button" data-testid="sidebar-refresh" onclick={() => void refreshWorkspaces()}>
-          {i18n.t('common.refresh')}
-        </button>
-        <button class="sidebar-refresh" type="button" onclick={openAddWorkspaceDialog} disabled={workspaceActionPending || !!loadError}>
-          {i18n.t('web.selectFolder')}
-        </button>
+      <div class="sidebar-brand">
+        <div class="sidebar-title">Magi</div>
+        <div class="sidebar-header-tools">
+          <button
+            class="theme-toggle-btn"
+            type="button"
+            data-tooltip={themeToggleTitle}
+            aria-label={themeToggleTitle}
+            data-theme-preference={webThemePreference}
+            data-theme-mode={webThemeMode}
+            onclick={toggleWebTheme}
+          >
+            <Icon name={themeIconName} size={14} />
+          </button>
+          <button class="sidebar-icon-btn" type="button" data-testid="sidebar-refresh" onclick={() => void refreshWorkspaces()} data-tooltip={i18n.t('common.refresh')}>
+            <Icon name="refresh" size={14} />
+          </button>
+          <button class="sidebar-icon-btn" type="button" onclick={openAddWorkspaceDialog} disabled={workspaceActionPending || !!loadError} data-tooltip={i18n.t('web.selectFolder')}>
+            <Icon name="folder" size={14} />
+          </button>
+        </div>
       </div>
     </div>
-
-    <section class="sidebar-section">
-      <div class="section-title">Agent</div>
-      <div class="agent-card" class:agent-card--error={!!loadError}>
-        <div class="agent-card-row">
-          <span class="agent-status-dot" class:agent-status-dot--error={!!loadError}></span>
-          <span class="agent-status-text">{loadError ? i18n.t('web.agentNotConnected') : i18n.t('web.agentConfigured')}</span>
-        </div>
-        <div class="agent-base-url">{agentBaseUrl || i18n.t('web.agentNoUrl')}</div>
-        {#if loadError}
-          <div class="agent-help">
-            {i18n.t('web.agentHelp')}
-          </div>
-        {/if}
-      </div>
-    </section>
 
     <section class="sidebar-section sidebar-section--workspaces">
       <div class="section-title">{i18n.t('common.workspace')}</div>
@@ -825,18 +785,6 @@
               <div class="workspace-actions">
                 <button
                   type="button"
-                  class="workspace-action-btn"
-                  title="重命名工作区"
-                  aria-label={`重命名工作区 ${workspace.name}`}
-                  onclick={(event) => {
-                    event.stopPropagation();
-                    openRenameWorkspaceDialog(workspace);
-                  }}
-                >
-                  ✎
-                </button>
-                <button
-                  type="button"
                   class="workspace-action-btn workspace-action-btn--danger"
                   title="从 Magi 中移除工作区"
                   aria-label={`移除工作区 ${workspace.name}`}
@@ -861,7 +809,9 @@
                           type="button"
                           class="session-item"
                           class:active={session.id === currentSessionId}
+                          class:pending={session.id === pendingSessionSwitchId}
                           data-session-id={session.id}
+                          disabled={pendingSessionSwitchId !== null}
                           onclick={() => switchSession(session.id)}
                         >
                           <span class="session-name">{session.name || i18n.t('header.unnamedSession')}</span>
@@ -954,34 +904,6 @@
   </Modal>
 {/if}
 
-{#if showRenameWorkspaceDialog && pendingRenameWorkspace}
-  <Modal
-    title="重命名工作区"
-    onClose={closeRenameWorkspaceDialog}
-    closeOnBackdrop={true}
-    size="sm"
-  >
-    <label class="workspace-dialog-label" for="workspace-rename-input">工作区名称</label>
-    <input
-      id="workspace-rename-input"
-      class="workspace-dialog-input"
-      type="text"
-      bind:value={renameWorkspaceValue}
-      placeholder="请输入新的工作区名称"
-    />
-    {#if workspaceDialogError}
-      <div class="workspace-dialog-error">{workspaceDialogError}</div>
-    {/if}
-
-    {#snippet footer()}
-      <button class="modal-btn secondary" type="button" onclick={() => closeRenameWorkspaceDialog()} disabled={workspaceActionPending}>取消</button>
-      <button class="modal-btn primary" type="button" onclick={() => void renameWorkspace()} disabled={workspaceActionPending}>
-        {workspaceActionPending ? '正在保存...' : '保存名称'}
-      </button>
-    {/snippet}
-  </Modal>
-{/if}
-
 <style>
   .web-workbench-shell {
     display: grid;
@@ -997,7 +919,7 @@
   .sidebar {
     display: flex;
     flex-direction: column;
-    gap: var(--space-4);
+    gap: var(--space-3);
     padding: var(--space-4);
     border-right: 1px solid var(--border);
     background: var(--surface-1);
@@ -1010,71 +932,118 @@
 
   .sidebar-header {
     display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
+    flex-direction: column;
     gap: var(--space-3);
   }
 
-  .sidebar-header-actions {
+  .sidebar-brand {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: var(--space-2);
+  }
+
+  .sidebar-header-tools {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+  }
+
+  .sidebar-icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: var(--radius-md);
+    border: none;
+    background: transparent;
+    color: var(--foreground-muted);
+    cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast);
+    flex-shrink: 0;
+    position: relative;
+  }
+
+  .sidebar-icon-btn:hover {
+    background: var(--surface-hover);
+    color: var(--foreground);
+  }
+
+  .sidebar-icon-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  /* 自定义 tooltip（图标按钮通用） */
+  .sidebar-icon-btn::after,
+  .theme-toggle-btn::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 4px 8px;
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium);
+    color: var(--foreground);
+    background: var(--glass-bg);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity var(--transition-fast);
+    z-index: var(--z-tooltip);
+  }
+
+  .sidebar-icon-btn:hover::after,
+  .theme-toggle-btn:hover::after {
+    opacity: 1;
+  }
+
+  .sidebar-icon-btn:disabled::after {
+    display: none;
   }
 
   .sidebar-title {
     font-size: var(--text-lg);
-    font-weight: var(--font-semibold);
+    font-weight: var(--font-bold);
     line-height: 1.15;
-    letter-spacing: -0.01em;
+    letter-spacing: -0.02em;
   }
 
-  .sidebar-subtitle,
   .workspace-path,
   .session-meta,
-  .sidebar-empty,
-  .agent-base-url,
-  .agent-help {
+  .sidebar-empty {
     color: var(--foreground-muted);
-    font-size: var(--text-base);
-  }
-
-  .sidebar-refresh {
-    height: var(--btn-height-sm);
-    padding: 0 var(--space-3);
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border);
-    background: var(--surface-2);
-    color: var(--foreground);
-    cursor: pointer;
-    white-space: nowrap;
-    word-break: keep-all;
+    font-size: var(--text-sm);
   }
 
   .theme-toggle-btn {
-    width: 34px;
-    height: 34px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    width: 28px;
+    height: 28px;
     border-radius: var(--radius-md);
-    border: 1px solid var(--border);
-    background: var(--surface-2);
-    color: var(--foreground);
+    border: none;
+    background: transparent;
+    color: var(--foreground-muted);
     cursor: pointer;
-    transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+    transition: background var(--transition-fast), color var(--transition-fast);
     flex-shrink: 0;
   }
 
   .theme-toggle-btn:hover {
     background: var(--surface-hover);
-    border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
-    color: var(--primary);
+    color: var(--foreground);
   }
 
   .theme-toggle-btn[data-theme-preference='light'],
   .theme-toggle-btn[data-theme-preference='dark'] {
-    border-color: color-mix(in srgb, var(--primary) 38%, var(--border));
-    background: color-mix(in srgb, var(--primary) 10%, var(--surface-2));
     color: var(--primary);
   }
 
@@ -1095,48 +1064,14 @@
     overflow: hidden;
   }
 
-  .agent-card {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    padding: var(--space-3);
-    border-radius: var(--radius-lg);
-    border: 1px solid var(--border);
-    background: var(--surface-1);
-  }
-
-  .agent-card--error {
-    border-color: color-mix(in srgb, var(--error) 40%, var(--border));
-    background: color-mix(in srgb, var(--error) 7%, var(--surface-1));
-  }
-
-  .agent-card-row {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-  }
-
-  .agent-status-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: var(--radius-full);
-    background: var(--success);
-    flex-shrink: 0;
-  }
-
-  .agent-status-dot--error {
-    background: var(--error);
-  }
-
-  .agent-status-text,
   .sidebar-error-title {
-    font-size: var(--text-base);
+    font-size: var(--text-sm);
     font-weight: var(--font-semibold);
     color: var(--foreground);
   }
 
   .section-title {
-    font-size: var(--text-base);
+    font-size: var(--text-sm);
     font-weight: var(--font-semibold);
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -1191,7 +1126,7 @@
   .sidebar-search {
     width: 100%;
     min-width: 0;
-    height: 44px;
+    height: 42px;
     padding: 0 var(--space-4);
     border-radius: var(--radius-md);
     background: var(--vscode-input-background, var(--surface-2));
@@ -1201,8 +1136,7 @@
     line-height: 1.2;
   }
 
-  .sidebar-search:focus,
-  .workspace-dialog-input:focus {
+  .sidebar-search:focus {
     outline: none;
     border-color: var(--info);
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--info) 55%, transparent);
@@ -1245,19 +1179,19 @@
   }
 
   .workspace-item {
-    padding-right: calc(var(--space-3) + 76px);
+    padding-right: calc(var(--space-3) + 42px);
   }
 
   .workspace-item:hover,
   .session-item:hover {
-    background: var(--surface-hover);
+    background: color-mix(in srgb, var(--surface-hover) 78%, transparent);
   }
 
   .workspace-item.active,
   .session-item.active {
     border-color: var(--info);
-    background: var(--surface-selected);
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--info) 28%, transparent);
+    background: color-mix(in srgb, var(--surface-selected) 80%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--info) 18%, transparent);
   }
 
   .workspace-header {
@@ -1284,7 +1218,7 @@
   .session-name {
     font-size: var(--text-md);
     font-weight: var(--font-medium);
-    line-height: var(--leading-tight);
+    line-height: 1.3;
     display: -webkit-box;
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
@@ -1326,14 +1260,14 @@
 
   .workspace-action-btn:hover {
     color: var(--foreground);
-    border-color: color-mix(in srgb, var(--foreground) 25%, transparent);
-    background: color-mix(in srgb, var(--foreground) 8%, transparent);
+    border-color: color-mix(in srgb, var(--foreground) 20%, transparent);
+    background: color-mix(in srgb, var(--foreground) 6%, transparent);
   }
 
   .workspace-action-btn--danger:hover {
     color: var(--error);
-    border-color: color-mix(in srgb, var(--error) 25%, transparent);
-    background: color-mix(in srgb, var(--error) 8%, transparent);
+    border-color: color-mix(in srgb, var(--error) 22%, transparent);
+    background: color-mix(in srgb, var(--error) 6%, transparent);
   }
 
   .session-list--nested {
@@ -1342,6 +1276,7 @@
 
   .session-item {
     position: relative;
+    width: calc(100% - 10px);
     margin-left: var(--space-2);
     min-height: 58px;
     justify-content: center;
@@ -1355,6 +1290,14 @@
     width: calc(var(--space-4) - var(--space-2));
     border-top: 1px solid var(--border-subtle);
     transform: translateY(-50%);
+  }
+
+  .session-item:disabled {
+    cursor: default;
+  }
+
+  .session-item.pending {
+    opacity: 0.78;
   }
 
   .sidebar-empty--nested {
@@ -1405,25 +1348,6 @@
   .workspace-dialog-text--muted {
     color: var(--foreground-muted);
     font-size: var(--text-sm);
-  }
-
-  .workspace-dialog-label {
-    display: block;
-    margin-bottom: var(--space-2);
-    color: var(--foreground);
-    font-size: var(--text-sm);
-    font-weight: var(--font-medium);
-  }
-
-  .workspace-dialog-input {
-    width: 100%;
-    min-width: 0;
-    height: var(--btn-height-md);
-    padding: 0 var(--space-3);
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border);
-    background: var(--surface-2);
-    color: var(--foreground);
   }
 
   .workspace-dialog-error {
@@ -1582,38 +1506,12 @@
       gap: var(--space-3);
     }
 
-    .sidebar-header {
-      align-items: stretch;
-      flex-direction: column;
-      gap: var(--space-3);
-    }
-
-    .sidebar-header-actions {
-      width: 100%;
-      display: grid;
-      grid-template-columns: 42px repeat(2, minmax(0, 1fr));
-      gap: var(--space-2);
-    }
-
-    .sidebar-refresh {
-      width: 100%;
-      min-width: 0;
-      min-height: 42px;
-      padding: 0 var(--space-2);
-      font-size: var(--text-base);
-      text-align: center;
-      background: var(--surface-2);
-    }
-
-    .theme-toggle-btn {
-      width: 42px;
-      height: 42px;
-      justify-self: stretch;
+    .sidebar-brand {
+      flex-wrap: wrap;
     }
 
     .sidebar-header,
     .sidebar-section,
-    .agent-card,
     .workspace-item,
     .session-item,
     .sidebar-search {
@@ -1632,7 +1530,7 @@
     }
 
     .workspace-item {
-      padding-right: calc(var(--space-3) + 84px);
+      padding-right: calc(var(--space-3) + 48px);
     }
 
     .workspace-name,
@@ -1678,16 +1576,8 @@
       font-size: var(--text-lg);
     }
 
-    .sidebar-subtitle {
-      font-size: var(--text-base);
-    }
-
     .sidebar-header {
       gap: var(--space-2);
-    }
-
-    .sidebar-refresh {
-      min-height: 44px;
     }
 
     .workspace-item,
@@ -1696,7 +1586,7 @@
     }
 
     .workspace-item {
-      padding-right: calc(var(--space-3) + 84px);
+      padding-right: calc(var(--space-3) + 48px);
     }
   }
 

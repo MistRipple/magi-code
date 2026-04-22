@@ -561,8 +561,10 @@
     flex-direction: column;
     gap: var(--space-2);
     flex-shrink: 0;
-    padding: var(--space-2) var(--space-3);
-    background: var(--background);
+    padding: var(--space-3) var(--space-4) var(--space-4) var(--space-4);
+    background: var(--glass-bg);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
     position: relative;
   }
 
@@ -571,15 +573,16 @@
     flex-direction: column;
     max-height: 50vh;
     background: var(--vscode-input-background);
-    border: 1px solid var(--vscode-input-border, var(--border));
-    border-radius: var(--radius-lg);
+    border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+    border-radius: var(--radius-xl);
+    box-shadow: var(--shadow-sm);
     transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
     /* 不使用 overflow:hidden — 允许模型下拉菜单溢出显示 */
   }
 
   .ia-wrapper:focus-within {
     border-color: var(--primary);
-    box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary) 15%, transparent);
+    box-shadow: 0 0 0 3px var(--primary-muted);
   }
 
   /* 拖拽调整：视觉 2px 指示器，交互区域 10px */
@@ -642,12 +645,12 @@
     align-items: center;
     gap: 4px;
     padding: 2px 4px 2px 6px;
-    background: color-mix(in srgb, var(--primary) 12%, transparent);
-    border: 1px solid color-mix(in srgb, var(--primary) 25%, transparent);
-    border-radius: var(--radius-sm);
+    background: var(--surface-1);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-full);
     font-size: 11px;
     font-weight: var(--font-medium);
-    color: var(--primary);
+    color: var(--foreground);
     line-height: 1;
     max-width: 100%;
   }
@@ -668,13 +671,12 @@
     background: transparent;
     border: none;
     border-radius: var(--radius-full);
-    color: var(--primary);
+    color: var(--foreground-muted);
     cursor: pointer;
-    opacity: 0.6;
     transition: opacity var(--transition-fast), background var(--transition-fast);
     flex-shrink: 0;
   }
-  .ia-skill-badge-remove:hover { opacity: 1; background: color-mix(in srgb, var(--primary) 15%, transparent); }
+  .ia-skill-badge-remove:hover { color: var(--error); background: var(--error-muted); }
 
   /* 操作栏 */
   .ia-actions {
@@ -730,15 +732,17 @@
 
   .ia-skill-menu {
     position: absolute;
-    bottom: calc(100% + 4px);
+    bottom: calc(100% + 8px);
     left: 0;
-    width: 240px;
-    max-height: 280px;
-    background: var(--vscode-input-background, var(--surface-1));
+    width: 260px;
+    max-height: 320px;
+    background: var(--glass-bg);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
     border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-lg);
-    z-index: 51;
+    border-radius: var(--radius-xl);
+    box-shadow: var(--shadow-xl);
+    z-index: var(--z-dropdown);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -775,11 +779,11 @@
   .ia-skill-item {
     display: flex;
     flex-direction: column;
-    gap: 1px;
-    padding: 6px 8px;
+    gap: 2px;
+    padding: 8px 10px;
     background: transparent;
     border: none;
-    border-radius: var(--radius-sm);
+    border-radius: var(--radius-md);
     cursor: pointer;
     text-align: left;
     color: var(--foreground);

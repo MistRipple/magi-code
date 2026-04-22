@@ -46,8 +46,40 @@
 <style>
   /* ============================================
      TopTabs - 顶部导航栏
-     设计参考: Cursor/Linear 极简下划线 Tab
+     设计参考: Apple HIG 胶囊切换器 (Segmented Control)
      ============================================ */
+  .tab-bar.tab-bar--top {
+    border-bottom: none;
+    background: transparent;
+    padding: 6px 16px;
+    gap: 3px;
+    justify-content: center;
+  }
+
+  .tab-item {
+    padding: 6px 13px;
+    border-radius: var(--radius-full);
+    height: 28px;
+    background: transparent;
+    transition: background var(--transition-fast), color var(--transition-fast), box-shadow var(--transition-fast);
+  }
+
+  .tab-item::after {
+    display: none; /* 移除旧版下划线 */
+  }
+
+  .tab-item:hover {
+    background: color-mix(in srgb, var(--surface-hover) 72%, transparent);
+    color: var(--foreground);
+  }
+
+  .tab-item.active {
+    background: color-mix(in srgb, var(--surface-active) 55%, transparent);
+    color: var(--foreground);
+    font-weight: var(--font-semibold);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border) 72%, transparent);
+  }
+
   .badge--muted {
     background: var(--surface-3);
     color: var(--foreground-muted);
@@ -56,5 +88,20 @@
   .badge--primary {
     background: var(--primary);
     color: var(--primary-foreground);
+  }
+
+  @media (max-width: 768px) {
+    .tab-bar.tab-bar--top {
+      padding: 2px 0;
+      justify-content: flex-start;
+      flex-wrap: nowrap;
+    }
+
+    .tab-item {
+      padding: 5px 10px;
+      font-size: var(--text-xs);
+      height: 26px;
+      flex-shrink: 0;
+    }
   }
 </style>

@@ -51,8 +51,6 @@ import type {
   RemoveWorkspaceRequestDto,
   RemoveWorkspaceResponseDto,
   RemovedResponseDto,
-  RenameWorkspaceRequestDto,
-  RenameWorkspaceResponseDto,
   RepositoriesResponseDto,
   RepositoryIdRequestDto,
   RepositoryRefreshResponseDto,
@@ -73,7 +71,6 @@ import type {
   RunnerStopResponseDto,
   RuntimeReadModelDto,
   SavedResponseDto,
-  SendMessageResponseDto,
   SessionActionRequestDto,
   SessionActionResponseDto,
   SessionCloseRequestDto,
@@ -275,12 +272,6 @@ export class RustDaemonClient {
     request: RemoveWorkspaceRequestDto,
   ): Promise<RemoveWorkspaceResponseDto> {
     return this.postJson<RemoveWorkspaceResponseDto>('/api/workspaces/remove', request);
-  }
-
-  public async renameWorkspace(
-    request: RenameWorkspaceRequestDto,
-  ): Promise<RenameWorkspaceResponseDto> {
-    return this.postJson<RenameWorkspaceResponseDto>('/api/workspaces/rename', request);
   }
 
   public async pickWorkspace(): Promise<WorkspacePickResponseDto> {
@@ -662,18 +653,6 @@ export class RustDaemonClient {
     if (limit !== undefined) params.set('limit', String(limit));
     const qs = params.toString();
     return this.getJson<MessagesResponseDto>(`/api/messages${qs ? `?${qs}` : ''}`);
-  }
-
-  public async sendMessage(
-    text: string,
-    sessionId?: string,
-    deepTask?: boolean,
-  ): Promise<SendMessageResponseDto> {
-    return this.postJson<SendMessageResponseDto>('/api/messages/send', {
-      text,
-      sessionId,
-      deepTask: deepTask ?? false,
-    });
   }
 
   // ─── Task Graph ────────────────────────────────────────────────────

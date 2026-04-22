@@ -234,16 +234,18 @@
                       </select>
                     </div>
                     {/if}
-                    <div class="llm-config-field inline-toggle" style="align-items: center; flex-direction: row; gap: 8px;">
-                      <label class="llm-config-label" style="margin: 0;">{i18n.t('settings.model.field.thinking')}</label>
-                      <Toggle
-                        size="small"
-                        checked={orchConfig.thinking}
-                        title={orchConfig.thinking ? i18n.t('settings.model.disableThinking') : i18n.t('settings.model.enableThinking')}
-                        onchange={() => {
-                          orchConfig.thinking = !orchConfig.thinking;
-                        }}
-                      />
+                    <div class="llm-config-field">
+                      <label class="llm-config-label">{i18n.t('settings.model.field.thinking')}</label>
+                      <div style="height: 28px; display: flex; align-items: center;">
+                        <Toggle
+                          size="small"
+                          checked={orchConfig.thinking}
+                          title={orchConfig.thinking ? i18n.t('settings.model.disableThinking') : i18n.t('settings.model.enableThinking')}
+                          onchange={() => {
+                            orchConfig.thinking = !orchConfig.thinking;
+                          }}
+                        />
+                      </div>
                     </div>
                   </div>
                   <div class="apple-dashboard-bar" style="display: flex; justify-content: space-between; align-items: center; margin-top: 24px;">
@@ -510,13 +512,15 @@
                     </div>
                   {/if}
                 </div>
-                <div class="llm-config-field inline-toggle" style="align-items: center; flex-direction: row; gap: 8px;">
-                  <label class="llm-config-label" style="margin: 0;">{i18n.t('settings.model.enable')}</label>
-                  <Toggle
-                    size="small"
-                    checked={workerConfigs[workerModelTab].enabled}
-                    onchange={() => handleWorkerEnabledToggle(workerModelTab, !workerConfigs[workerModelTab].enabled)}
-                  />
+                <div class="llm-config-field">
+                  <label class="llm-config-label">{i18n.t('settings.model.enable')}</label>
+                  <div style="height: 28px; display: flex; align-items: center;">
+                    <Toggle
+                      size="small"
+                      checked={workerConfigs[workerModelTab].enabled}
+                      onchange={() => handleWorkerEnabledToggle(workerModelTab, !workerConfigs[workerModelTab].enabled)}
+                    />
+                  </div>
                 </div>
               </div>
               <div class="llm-config-field">
@@ -586,16 +590,18 @@
                   </select>
                 </div>
                 {/if}
-                <div class="llm-config-field inline-toggle" style="align-items: center; flex-direction: row; gap: 8px;">
-                  <label class="llm-config-label" style="margin: 0;">{i18n.t('settings.model.field.thinking')}</label>
-                  <Toggle
-                    size="small"
-                    checked={workerConfigs[workerModelTab].thinking}
-                    title={workerConfigs[workerModelTab].thinking ? i18n.t('settings.model.disableThinking') : i18n.t('settings.model.enableThinking')}
-                    onchange={() => {
-                      workerConfigs[workerModelTab].thinking = !workerConfigs[workerModelTab].thinking;
-                    }}
-                  />
+                <div class="llm-config-field">
+                  <label class="llm-config-label">{i18n.t('settings.model.field.thinking')}</label>
+                  <div style="height: 28px; display: flex; align-items: center;">
+                    <Toggle
+                      size="small"
+                      checked={workerConfigs[workerModelTab].thinking}
+                      title={workerConfigs[workerModelTab].thinking ? i18n.t('settings.model.disableThinking') : i18n.t('settings.model.enableThinking')}
+                      onchange={() => {
+                        workerConfigs[workerModelTab].thinking = !workerConfigs[workerModelTab].thinking;
+                      }}
+                    />
+                  </div>
                 </div>
               </div>
               <div class="apple-dashboard-bar" style="display: flex; justify-content: flex-end; align-items: center; margin-top: 24px;">

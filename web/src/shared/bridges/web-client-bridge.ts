@@ -3,6 +3,7 @@ import {
   agentUrl,
   dispatchAgentConnectionEvent,
   getAgentSettingsBootstrap,
+  loadAgentSessionTimelinePage,
   probeReachableAgentBaseUrl,
   resolveAgentBaseUrl,
 } from '../../web/agent-api';
@@ -99,6 +100,7 @@ import { buildEmptyWorkspaceAppState } from './empty-workspace-state';
 import {
   normalizeRustBootstrapPayload,
   parseRustEventEnvelope,
+  readRustTimelinePageMeta,
   type BootstrapPayload,
   type RustEventEnvelope,
 } from './rust-daemon-contract';
@@ -141,6 +143,7 @@ const RECOVERY_BASE_DELAY_MS = 1000;
 const RECOVERY_MAX_DELAY_MS = 10_000;
 const EVENT_STREAM_PARSE_ERROR_DEBOUNCE_MS = 5000;
 const EVENT_STREAM_OPEN_TIMEOUT_MS = 4000;
+const SESSION_TIMELINE_PAGE_SIZE = 50;
 const WEBVIEW_STATE_STORAGE_KEY = 'webview-state';
 const WEBVIEW_STATE_WRITE_INTERVAL_MS = 1200;
 const WEBVIEW_STATE_MAX_BYTES = 1_500_000;
@@ -332,7 +335,7 @@ function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload
   const activeMissionIds = new Set<string>();
   let rootTaskId = '';
 
-  const rawRuntimeReadModel = asBridgeRecord(rawBootstrap?.runtime_read_model);
+  const rawRuntimeReadModel = asBridgeRecord(rawBootstrap?.runtimeReadModel);
   const runtimeDetails = asBridgeRecord(rawRuntimeReadModel?.details);
   const runtimeSessions = Array.isArray(runtimeDetails?.sessions)
     ? runtimeDetails.sessions
@@ -353,8 +356,8 @@ function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload
     activeMissionIds.add(missionId);
   }
 
-  const recentEvents = Array.isArray(rawBootstrap?.recent_events)
-    ? rawBootstrap.recent_events
+  const recentEvents = Array.isArray(rawBootstrap?.recentEvents)
+    ? rawBootstrap.recentEvents
       .map((entry) => asBridgeRecord(entry))
       .filter((entry): entry is Record<string, unknown> => entry !== null)
     : [];
@@ -1227,6 +1230,59 @@ async function emitKnowledgePayload(): Promise<void> {
   await dispatchProjectKnowledge();
 }
 
+async function dispatchSessionSnapshot(
+  rawPayload: unknown,
+  options: {
+    sessionId: string;
+    workspaceId?: string;
+    workspacePath?: string;
+    forceEventStreamReconnect?: boolean;
+  },
+): Promise<void> {
+  const payload = normalizeBootstrapResponse(rawPayload, {
+    sessionId: options.sessionId,
+    workspaceId: options.workspaceId,
+    workspacePath: options.workspacePath,
+  });
+  const pageMeta = readRustTimelinePageMeta(rawPayload);
+  persistWorkspaceBinding(payload.workspace.workspaceId, payload.workspace.rootPath, payload.sessionId);
+  emitDataMessage('sessionBootstrapLoaded', {
+    ...payload,
+    hasMoreBefore: pageMeta.hasMoreBefore,
+    beforeCursor: pageMeta.beforeCursor,
+  } as Record<string, unknown>);
+  void ensureEventStream({
+    forceReconnect: options.forceEventStreamReconnect === true,
+    waitUntilOpen: false,
+  }).catch((error) => {
+    reportExpectedRecoveryFailure('事件流连接', '[web-client-bridge] 会话快照后事件流连接失败:', error);
+    scheduleRecovery('session_snapshot_event_stream_connect', error, true);
+  });
+}
+
+async function loadLatestSessionSnapshot(
+  sessionId: string,
+  options: { workspaceId?: string; workspacePath?: string } = {},
+): Promise<void> {
+  const rawPayload = await loadAgentSessionTimelinePage(sessionId, {
+    limit: SESSION_TIMELINE_PAGE_SIZE,
+  });
+  const targetWorkspaceId = typeof options.workspaceId === 'string' && options.workspaceId.trim()
+    ? options.workspaceId.trim()
+    : currentWorkspaceId;
+  const targetWorkspacePath = typeof options.workspacePath === 'string' && options.workspacePath.trim()
+    ? options.workspacePath.trim()
+    : currentWorkspacePath;
+  const forceEventStreamReconnect = targetWorkspaceId !== currentWorkspaceId
+    || targetWorkspacePath !== currentWorkspacePath;
+  await dispatchSessionSnapshot(rawPayload, {
+    sessionId,
+    workspaceId: targetWorkspaceId,
+    workspacePath: targetWorkspacePath,
+    forceEventStreamReconnect,
+  });
+}
+
 async function createSession(): Promise<void> {
   const response = await getTransport().request(agentUrl('/api/session/new'), {
     method: 'POST',
@@ -1239,27 +1295,48 @@ async function createSession(): Promise<void> {
   if (!response.ok) {
     throw new Error(`create session failed: ${response.status}`);
   }
-  const rawPayload = await response.json();
-  await dispatchBootstrap(normalizeBootstrapResponse(rawPayload), { rawPayload });
+  const rawPayload = await response.json() as Record<string, unknown>;
+  const createdSessionId = typeof rawPayload.sessionId === 'string' ? rawPayload.sessionId.trim() : '';
+  const sessionId = createdSessionId
+    ? createdSessionId
+    : '';
+  if (!sessionId) {
+    throw new Error('create session failed: missing session id');
+  }
+  await loadLatestSessionSnapshot(sessionId, {
+    workspaceId: currentWorkspaceId,
+    workspacePath: currentWorkspacePath,
+  });
   emitBridgeSuccessToast('新建会话', '新会话已创建');
 }
 
-async function switchSession(sessionId: string): Promise<void> {
+async function switchSession(
+  sessionId: string,
+  options: { workspaceId?: string; workspacePath?: string } = {},
+): Promise<void> {
+  const targetWorkspaceId = typeof options.workspaceId === 'string' && options.workspaceId.trim()
+    ? options.workspaceId.trim()
+    : currentWorkspaceId;
+  const targetWorkspacePath = typeof options.workspacePath === 'string' && options.workspacePath.trim()
+    ? options.workspacePath.trim()
+    : currentWorkspacePath;
   const response = await getTransport().request(agentUrl('/api/session/switch'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      workspaceId: currentWorkspaceId,
-      workspacePath: currentWorkspacePath,
+      workspaceId: targetWorkspaceId,
+      workspacePath: targetWorkspacePath,
       sessionId,
     }),
   });
   if (!response.ok) {
     throw new Error(`switch session failed: ${response.status}`);
   }
-  const rawPayload = await response.json();
-  await dispatchBootstrap(normalizeBootstrapResponse(rawPayload, { sessionId }), { rawPayload });
-  emitBridgeSuccessToast('切换会话', '会话已切换', { displayMode: 'notification_center' });
+  await response.json();
+  await loadLatestSessionSnapshot(sessionId, {
+    workspaceId: targetWorkspaceId,
+    workspacePath: targetWorkspacePath,
+  });
 }
 
 async function deleteSession(sessionId: string): Promise<void> {
@@ -1481,10 +1558,6 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
     if (rootTaskId) {
       initTaskTracking(rootTaskId);
     }
-
-    emitForcedProcessingIdle('execute_task_completed', {
-      requestId,
-    });
 
     void fetchBootstrap().catch((error) => {
       reportExpectedRecoveryFailure('提交后同步', '[web-client-bridge] 任务提交后 bootstrap 同步失败:', error);
@@ -2201,7 +2274,10 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'switchSession':
           if (typeof message.sessionId === 'string' && message.sessionId.trim()) {
-            void switchSession(message.sessionId).catch((error) => {
+            void switchSession(message.sessionId, {
+              workspaceId: typeof message.workspaceId === 'string' ? message.workspaceId : undefined,
+              workspacePath: typeof message.workspacePath === 'string' ? message.workspacePath : undefined,
+            }).catch((error) => {
               logBridgeOperationFailure('切换会话', '[web-client-bridge] 切换会话失败:', error);
             });
           }

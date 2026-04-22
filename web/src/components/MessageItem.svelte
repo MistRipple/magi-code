@@ -182,9 +182,29 @@
     return `${m}m ${s}s`;
   }
 
+  function formatDurationMs(durationMs: number): string {
+    const normalizedMs = Math.max(0, durationMs);
+    const totalSeconds = Math.max(1, Math.round(normalizedMs / 1000));
+    return formatElapsed(totalSeconds);
+  }
+
   // 获取 worker 信息（如果有）
   const worker = $derived(message.metadata?.worker || null);
   const badgeWorker = $derived(worker || (message.source === 'orchestrator' ? 'orchestrator' : message.source));
+  const responseDurationMs = $derived.by(() => {
+    const value = message.metadata?.responseDurationMs;
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0
+      ? value
+      : null;
+  });
+  const showResponseDuration = $derived.by(() => (
+    displayContext === 'thread'
+    && message.source === 'orchestrator'
+    && !isStreaming
+    && !isPlaceholder
+    && !isSystemSection
+    && responseDurationMs !== null
+  ));
 
   // 子任务卡片消息，作为独立消息存在
   // 通知类型和对应的图标/颜色（使用 Message 类型中的 noticeType）
@@ -340,6 +360,13 @@
           <RetryRuntimeIndicator runtime={retryRuntime} />
         {/if}
 
+        {#if showResponseDuration}
+          <div class="message-runtime-summary">
+            <span class="message-runtime-summary__label">{i18n.t('messageItem.responseDurationLabel')}</span>
+            <span class="message-runtime-summary__value">{formatDurationMs(responseDurationMs ?? 0)}</span>
+          </div>
+        {/if}
+
       {/if}
     </div>
   </div>
@@ -430,6 +457,7 @@
   .user-content :global(td) {
     border-color: rgba(255, 255, 255, 0.35);
   }
+
   .user-time {
     font-size: var(--text-xs);
     color: var(--foreground-muted);
@@ -671,6 +699,30 @@
     font-size: var(--text-xs);
     color: var(--foreground-muted);
     font-variant-numeric: tabular-nums;
+  }
+
+  .message-runtime-summary {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: var(--space-2);
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--surface-2) 88%, transparent);
+    border: 1px solid color-mix(in srgb, var(--border) 92%, transparent);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .message-runtime-summary__label {
+    color: var(--foreground-muted);
+  }
+
+  .message-runtime-summary__value {
+    color: var(--foreground);
+    font-weight: var(--font-medium);
   }
 
   @keyframes streamingPulse {

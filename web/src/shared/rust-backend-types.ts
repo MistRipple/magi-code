@@ -6,14 +6,14 @@ export type EventCategory = 'Domain' | 'Audit' | 'Usage' | 'Projection' | 'Syste
 
 export interface HealthDto {
   status: string;
-  service_name: string;
-  api_version: string;
+  serviceName: string;
+  apiVersion: string;
 }
 
 export interface VersionHandshakeDto {
-  api_version: string;
-  min_supported_ui_version: string;
-  host_scope: string[];
+  apiVersion: string;
+  minSupportedUiVersion: string;
+  hostScope: string[];
 }
 
 export interface SessionActionImageDto {
@@ -46,61 +46,72 @@ export interface TaskInterruptResponseDto {
 }
 
 export interface ServiceInfoDto {
-  service_name: string;
-  api_version: string;
+  serviceName: string;
+  apiVersion: string;
 }
 
 export interface SessionDto {
-  session_id: string;
+  sessionId: string;
   title: string;
   status: string;
-  created_at: number;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface TimelineEntryDto {
-  entry_id: string;
-  session_id: string;
+  entryId: string;
+  sessionId: string;
   kind: string;
   message: string;
-  occurred_at: number;
+  occurredAt: number;
 }
 
 export interface WorkspaceDto {
-  workspace_id: string;
-  root_path: string;
-  worktree_root?: string | null;
+  workspaceId: string;
+  name?: string | null;
+  rootPath: string;
+  worktreeRoot?: string | null;
   status: string;
-  created_at: number;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface NotificationDto {
-  notification_id: string;
-  session_id: string;
+  notificationId: string;
+  sessionId: string;
   kind: string;
-  created_at: number;
+  message: string;
+  createdAt: number;
   handled: boolean;
 }
 
-export interface SnapshotDto {
-  snapshot_id: string;
-  workspace_id: string;
+export interface ExecutionOwnershipDto {
   session_id?: string | null;
+  workspace_id?: string | null;
   mission_id?: string | null;
+  task_id?: string | null;
+  worker_id?: string | null;
   execution_chain_ref?: string | null;
+}
+
+export interface SnapshotDto {
+  snapshotId: string;
+  workspaceId: string;
+  ownership: ExecutionOwnershipDto;
   label: string;
-  created_at: number;
+  createdAt: number;
 }
 
 export interface RecoveryHandleDto {
-  recovery_id: string;
-  workspace_id: string;
-  session_id?: string | null;
-  mission_id?: string | null;
-  snapshot_id: string;
-  execution_chain_ref?: string | null;
-  diagnostic_summary?: string | null;
+  recoveryId: string;
+  workspaceId: string;
+  ownership: ExecutionOwnershipDto;
+  snapshotId: string;
+  diagnosticSummary?: string | null;
   status: string;
-  created_at: number;
+  createdAt: number;
+  updatedAt: number;
+  consumedAt?: number | null;
 }
 
 export interface RecoveryResumeRequestDto {
@@ -662,19 +673,19 @@ export interface AuditUsageLedgerDto {
 
 export interface BootstrapDto {
   service: ServiceInfoDto;
-  generated_at: number;
-  current_session?: SessionDto | null;
+  generatedAt: number;
+  currentSession?: SessionDto | null;
   sessions: SessionDto[];
   timeline: TimelineEntryDto[];
   workspaces: WorkspaceDto[];
   snapshots: SnapshotDto[];
-  recovery_handles: RecoveryHandleDto[];
-  runtime_read_model: RuntimeReadModelDto;
-  audit_usage_ledger: AuditUsageLedgerDto;
-  bridge_services: BridgeServicesSnapshotDto;
-  bridge_preflight: BridgePreflightSnapshotDto;
+  recoveryHandles: RecoveryHandleDto[];
+  runtimeReadModel: RuntimeReadModelDto;
+  auditUsageLedger: AuditUsageLedgerDto;
+  bridgeServices: BridgeServicesSnapshotDto;
+  bridgePreflight: BridgePreflightSnapshotDto;
   notifications: NotificationDto[];
-  recent_events: EventEnvelope[];
+  recentEvents: EventEnvelope[];
 }
 
 // ─── Task lifecycle endpoints ───────────────────────────────────────
@@ -725,16 +736,17 @@ export interface SessionCloseRequestDto {
   sessionId: string;
 }
 
+export interface SessionSelectionResponseDto {
+  sessionId: string;
+  currentSession?: SessionDto | null;
+}
+
 export interface SessionNotificationItemDto {
   notificationId: string;
-  level: string;
   message: string;
   kind: string;
-  read: boolean;
+  handled: boolean;
   createdAt: number;
-  persistToCenter: boolean;
-  actionRequired: boolean;
-  countUnread: boolean;
 }
 
 export interface SessionNotificationSnapshotDto {
@@ -775,7 +787,6 @@ export interface WorkspaceListResponseDto {
 
 export interface RegisterWorkspaceRequestDto {
   path: string;
-  name?: string | null;
 }
 
 export interface RegisterWorkspaceResponseDto {
@@ -789,15 +800,6 @@ export interface RemoveWorkspaceRequestDto {
 
 export interface RemoveWorkspaceResponseDto {
   removed: boolean;
-}
-
-export interface RenameWorkspaceRequestDto {
-  workspaceId: string;
-  name: string;
-}
-
-export interface RenameWorkspaceResponseDto {
-  renamed: boolean;
 }
 
 export interface WorkspacePickResponseDto {
@@ -1072,26 +1074,15 @@ export interface EnhancePromptResponseDto {
   enhancedPrompt: string;
 }
 
-// ─── Messages types ─────────────────────────────────────────────────
-
-export interface MessageDto {
-  entryId: string;
-  sessionId: string;
-  role: 'user' | 'assistant' | 'system';
-  content: string;
-  timestamp: number;
-}
-
 export interface MessagesResponseDto {
-  messages: MessageDto[];
-  sessionId: string | null;
-}
-
-export interface SendMessageResponseDto {
+  generatedAt: number;
+  currentSession?: SessionDto | null;
+  sessions: SessionDto[];
+  timeline: TimelineEntryDto[];
+  notifications: NotificationDto[];
   sessionId: string;
-  entryId: string;
-  rootTaskId: string | null;
-  response: string | null;
+  hasMoreBefore: boolean;
+  beforeCursor?: string | null;
 }
 
 // ─── Task Graph types (magi-core::task) ─────────────────────────────

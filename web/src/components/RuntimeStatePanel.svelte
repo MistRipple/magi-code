@@ -691,7 +691,7 @@
     }
     const taskRuntimeId = resolveTaskRuntimeIdentifier(entry);
     if (taskRuntimeId) {
-      scopes.push(`${i18n.t('runtimeDiagnostics.scope.todo')}: ${taskRuntimeId}`);
+      scopes.push(`${i18n.t('runtimeDiagnostics.scope.task')}: ${taskRuntimeId}`);
     }
     if (entry.workerId) {
       scopes.push(`${i18n.t('runtimeDiagnostics.scope.worker')}: ${entry.workerId}`);
@@ -1096,7 +1096,7 @@
               · {i18n.t('runtimeDiagnostics.scope.assignment')}: {shortenIdentifier(failureRootCause.assignmentId)}
             {/if}
             {#if resolveFailureRootCauseTaskRuntimeIdentifier(failureRootCause)}
-              · {i18n.t('runtimeDiagnostics.scope.todo')}: {shortenIdentifier(resolveFailureRootCauseTaskRuntimeIdentifier(failureRootCause))}
+              · {i18n.t('runtimeDiagnostics.scope.task')}: {shortenIdentifier(resolveFailureRootCauseTaskRuntimeIdentifier(failureRootCause))}
             {/if}
           </div>
         </div>
