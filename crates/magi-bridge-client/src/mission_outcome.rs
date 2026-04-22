@@ -155,7 +155,11 @@ pub fn sanitize_outcome_protocol_text(text: &str) -> String {
 fn start_marker_holdback_len(input: &str) -> usize {
     let max_holdback = input.len().min(MISSION_OUTCOME_START.len() - 1);
     for len in (1..=max_holdback).rev() {
-        if MISSION_OUTCOME_START.starts_with(&input[input.len() - len..]) {
+        let pos = input.len() - len;
+        if !input.is_char_boundary(pos) {
+            continue;
+        }
+        if MISSION_OUTCOME_START.starts_with(&input[pos..]) {
             return len;
         }
     }

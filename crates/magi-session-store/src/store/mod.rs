@@ -94,6 +94,7 @@ impl SessionStore {
             status: SessionLifecycleStatus::Active,
             created_at: now,
             updated_at: now,
+            message_count: None,
         };
         state.sessions.push(session.clone());
         state.current_session_id = Some(session_id.clone());
@@ -204,13 +205,14 @@ impl SessionStore {
         if !state.sessions.iter().any(|session| &session.session_id == session_id) {
             return Err(DomainError::NotFound { entity: "session" });
         }
+        let occurred_at = UtcMillis::now();
         state.current_session_id = Some(session_id.clone());
         state.timeline.push(TimelineEntry {
-            entry_id: format!("timeline-session-switched-{}", session_id),
+            entry_id: format!("timeline-session-switched-{}-{}", session_id, occurred_at.0),
             session_id: session_id.clone(),
             kind: TimelineEntryKind::SessionSwitched,
             message: "当前会话已切换".to_string(),
-            occurred_at: UtcMillis::now(),
+            occurred_at,
         });
         Ok(())
     }

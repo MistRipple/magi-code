@@ -10,7 +10,7 @@ struct NormalizedAttemptSelector {
     scope: PlanAttemptScope,
     target_id: String,
     assignment_id: Option<String>,
-    todo_id: Option<String>,
+    task_id: Option<String>,
     reason: Option<String>,
 }
 
@@ -320,8 +320,8 @@ impl PlanLedgerService {
                 status: PlanItemStatus::Pending,
                 progress: 0.0,
                 assignment_id: Some(item_id.clone()),
-                todo_ids: Vec::new(),
-                todo_statuses: HashMap::new(),
+                task_ids: Vec::new(),
+                task_statuses: HashMap::new(),
                 created_at: now,
                 updated_at: now,
             };
@@ -385,12 +385,12 @@ impl PlanLedgerService {
         Some(result)
     }
 
-    pub fn update_todo_status(
+    pub fn update_task_status(
         &mut self,
         session_id: &str,
         plan_id: &str,
         assignment_id: &str,
-        todo_id: &str,
+        task_id: &str,
         status: &str,
     ) -> Option<PlanRecord> {
         let record = self.load_plan_mut(session_id, plan_id)?;
@@ -398,9 +398,9 @@ impl PlanLedgerService {
             return None;
         }
 
-        let normalized_todo = todo_id.trim().to_string();
+        let normalized_task = task_id.trim().to_string();
         let normalized_assignment = assignment_id.trim().to_string();
-        if normalized_todo.is_empty() || normalized_assignment.is_empty() {
+        if normalized_task.is_empty() || normalized_assignment.is_empty() {
             return Some(record.clone());
         }
 
@@ -409,10 +409,10 @@ impl PlanLedgerService {
                 || i.item_id == normalized_assignment
         })?;
 
-        add_unique(&mut item.todo_ids, &normalized_todo);
-        add_unique(&mut record.links.todo_ids, &normalized_todo);
-        item.todo_statuses
-            .insert(normalized_todo, status.to_string());
+        add_unique(&mut item.task_ids, &normalized_task);
+        add_unique(&mut record.links.task_ids, &normalized_task);
+        item.task_statuses
+            .insert(normalized_task, status.to_string());
         item.progress = compute_item_progress(item);
         item.status = compute_item_status(item);
         item.updated_at = now_millis();
@@ -466,7 +466,7 @@ impl PlanLedgerService {
                 scope: normalized.scope,
                 target_id: normalized.target_id.clone(),
                 assignment_id: normalized.assignment_id.clone(),
-                todo_id: normalized.todo_id.clone(),
+                task_id: normalized.task_id.clone(),
                 sequence,
                 status: PlanAttemptStatus::Created,
                 reason: normalized.reason.clone(),
@@ -528,7 +528,7 @@ impl PlanLedgerService {
                 scope: normalized.scope,
                 target_id: normalized.target_id.clone(),
                 assignment_id: normalized.assignment_id.clone(),
-                todo_id: normalized.todo_id.clone(),
+                task_id: normalized.task_id.clone(),
                 sequence,
                 status: PlanAttemptStatus::Created,
                 reason: normalized.reason.clone(),
@@ -1105,7 +1105,7 @@ fn compute_plan_status(record: &PlanRecord, fallback: Option<PlanStatus>) -> Pla
 }
 
 fn compute_item_progress(item: &PlanItem) -> f64 {
-    if item.todo_ids.is_empty() {
+    if item.task_ids.is_empty() {
         if item.status == PlanItemStatus::Completed {
             return 100.0;
         }
@@ -1119,27 +1119,27 @@ fn compute_item_progress(item: &PlanItem) -> f64 {
     }
     let terminal = ["completed", "failed", "skipped", "cancelled"];
     let done_count = item
-        .todo_ids
+        .task_ids
         .iter()
         .filter(|tid| {
             let s = item
-                .todo_statuses
+                .task_statuses
                 .get(*tid)
                 .map(|s| s.as_str())
                 .unwrap_or("pending");
             terminal.contains(&s)
         })
         .count();
-    let pct = (done_count as f64 / item.todo_ids.len() as f64 * 100.0).round();
+    let pct = (done_count as f64 / item.task_ids.len() as f64 * 100.0).round();
     pct.min(100.0)
 }
 
 fn compute_item_status(item: &PlanItem) -> PlanItemStatus {
     let statuses: Vec<&str> = item
-        .todo_ids
+        .task_ids
         .iter()
         .map(|tid| {
-            item.todo_statuses
+            item.task_statuses
                 .get(tid)
                 .map(|s| s.as_str())
                 .unwrap_or("pending")
@@ -1256,13 +1256,13 @@ fn build_prompt_digest(prompt: &str) -> String {
 
 fn normalize_attempt_input(input: &PlanAttemptStartInput) -> NormalizedAttemptSelector {
     let assignment_id = input.assignment_id.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let todo_id = input.todo_id.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let task_id = input.task_id.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let explicit_target = input.target_id.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
     let target_id = explicit_target
         .or_else(|| {
-            if input.scope == PlanAttemptScope::Todo {
-                todo_id.clone()
+            if input.scope == PlanAttemptScope::Task {
+                task_id.clone()
             } else {
                 None
             }
@@ -1280,20 +1280,20 @@ fn normalize_attempt_input(input: &PlanAttemptStartInput) -> NormalizedAttemptSe
         scope: input.scope,
         target_id,
         assignment_id,
-        todo_id,
+        task_id,
         reason: input.reason.clone(),
     }
 }
 
 fn normalize_attempt_input_from_complete(input: &PlanAttemptCompleteInput) -> NormalizedAttemptSelector {
     let assignment_id = input.assignment_id.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let todo_id = input.todo_id.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let task_id = input.task_id.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let explicit_target = input.target_id.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
     let target_id = explicit_target
         .or_else(|| {
-            if input.scope == PlanAttemptScope::Todo {
-                todo_id.clone()
+            if input.scope == PlanAttemptScope::Task {
+                task_id.clone()
             } else {
                 None
             }
@@ -1311,7 +1311,7 @@ fn normalize_attempt_input_from_complete(input: &PlanAttemptCompleteInput) -> No
         scope: input.scope,
         target_id,
         assignment_id,
-        todo_id,
+        task_id,
         reason: None,
     }
 }
@@ -1334,8 +1334,8 @@ fn find_latest_attempt_mut<'a>(
                 continue;
             }
         }
-        if let Some(tid) = &selector.todo_id {
-            if attempt.todo_id.as_deref() != Some(tid) {
+        if let Some(tid) = &selector.task_id {
+            if attempt.task_id.as_deref() != Some(tid) {
                 continue;
             }
         }
@@ -1371,8 +1371,8 @@ fn next_attempt_sequence(
                 continue;
             }
         }
-        if let Some(tid) = &selector.todo_id {
-            if attempt.todo_id.as_deref() != Some(tid) {
+        if let Some(tid) = &selector.task_id {
+            if attempt.task_id.as_deref() != Some(tid) {
                 continue;
             }
         }

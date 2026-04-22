@@ -1,5 +1,6 @@
 use magi_core::{ExecutionOwnership, SessionId, SessionLifecycleStatus, UtcMillis};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SessionExecutionSidecarStatus {
@@ -11,12 +12,18 @@ pub enum SessionExecutionSidecarStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
+    #[serde(alias = "session_id")]
     pub session_id: SessionId,
     pub title: String,
     pub status: SessionLifecycleStatus,
+    #[serde(alias = "created_at")]
     pub created_at: UtcMillis,
+    #[serde(alias = "updated_at")]
     pub updated_at: UtcMillis,
+    #[serde(default, alias = "message_count", skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -61,7 +68,7 @@ pub enum SessionSidecarFlushReason {
     UpsertRuntimeSidecar,
     BindExecutionOwnership,
     ApplyRecoveryResumeInput,
-    ApplyResumeDispatchDecision,
+    ApplyResumeExecutionTarget,
     AttachRecoveryRef,
     ClearExecutionOwnership,
     DeleteSession,
@@ -154,20 +161,28 @@ pub enum TimelineEntryKind {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TimelineEntry {
+    #[serde(alias = "entry_id")]
     pub entry_id: String,
+    #[serde(alias = "session_id")]
     pub session_id: SessionId,
     pub kind: TimelineEntryKind,
     pub message: String,
+    #[serde(alias = "occurred_at")]
     pub occurred_at: UtcMillis,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NotificationRecord {
+    #[serde(alias = "notification_id")]
     pub notification_id: String,
+    #[serde(alias = "session_id")]
     pub session_id: SessionId,
     pub kind: String,
     pub message: String,
+    #[serde(alias = "created_at")]
     pub created_at: UtcMillis,
     pub handled: bool,
 }
@@ -191,14 +206,33 @@ pub struct SessionDurableState {
 }
 
 impl SessionStoreState {
+    fn normalize_timeline_entry_ids(timeline: &mut [TimelineEntry]) {
+        let mut seen = HashMap::<String, usize>::new();
+        for entry in timeline.iter_mut() {
+            let original = entry.entry_id.clone();
+            let duplicate_index = seen.entry(original.clone()).or_insert(0);
+            if *duplicate_index > 0 {
+                entry.entry_id = format!(
+                    "{}-{}-{}",
+                    original,
+                    entry.occurred_at.0,
+                    duplicate_index
+                );
+            }
+            *duplicate_index += 1;
+        }
+    }
+
     pub fn from_persisted_parts(
         durable_state: SessionDurableState,
         execution_sidecar_store: SessionExecutionSidecarStoreState,
     ) -> Self {
+        let mut timeline = durable_state.timeline;
+        Self::normalize_timeline_entry_ids(&mut timeline);
         Self {
             current_session_id: durable_state.current_session_id,
             sessions: durable_state.sessions,
-            timeline: durable_state.timeline,
+            timeline,
             notifications: durable_state.notifications,
             execution_sidecar_store,
         }

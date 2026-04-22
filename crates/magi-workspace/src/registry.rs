@@ -151,15 +151,6 @@ impl WorkspaceStore {
         workspace_id: WorkspaceId,
         root_path: AbsolutePath,
     ) -> DomainResult<WorkspaceRecord> {
-        self.register_with_name(workspace_id, root_path, None)
-    }
-
-    pub fn register_with_name(
-        &self,
-        workspace_id: WorkspaceId,
-        root_path: AbsolutePath,
-        name: Option<String>,
-    ) -> DomainResult<WorkspaceRecord> {
         let mut state = self.write_state();
         if state
             .workspaces
@@ -172,7 +163,7 @@ impl WorkspaceStore {
         let now = UtcMillis::now();
         let workspace = WorkspaceRecord {
             workspace_id: workspace_id.clone(),
-            name: name.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()),
+            name: None,
             root_path,
             worktree_root: None,
             status: WorkspaceLifecycleStatus::Registered,
@@ -282,17 +273,6 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    pub fn rename(&self, workspace_id: &WorkspaceId, _name: &str) -> DomainResult<()> {
-        let mut state = self.write_state();
-        let workspace = state
-            .workspaces
-            .iter_mut()
-            .find(|w| &w.workspace_id == workspace_id)
-            .ok_or(DomainError::NotFound { entity: "workspace" })?;
-        workspace.name = Some(_name.trim().to_string()).filter(|value| !value.is_empty());
-        workspace.updated_at = UtcMillis::now();
-        Ok(())
-    }
 }
 
 #[cfg(test)]

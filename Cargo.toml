@@ -17,7 +17,6 @@ members = [
   "crates/magi-context-runtime",
   "crates/magi-skill-runtime",
   "crates/magi-bridge-client",
-  "crates/magi-todo",
   "crates/magi-usage-authority",
   "crates/magi-normalizer",
   "crates/magi-agent",
@@ -33,7 +32,7 @@ futures-util = "0.3.31"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 thiserror = "2.0.17"
-tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "net", "sync"] }
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "net", "sync", "process", "io-util"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 tracing = "0.1.41"

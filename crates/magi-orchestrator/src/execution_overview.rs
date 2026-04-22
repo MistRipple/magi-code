@@ -1,9 +1,14 @@
 
 use crate::{
     AssignmentGovernanceSummary, AssignmentSkillDispatchSummary, MissionContextSummary,
-    MissionExecutionOverview, MissionRecord, MissionRuntimeSnapshot, MissionSkillDispatchSummary,
+    MissionExecutionOverview, MissionRuntimeSnapshot, MissionSkillDispatchSummary,
     TaskGovernanceSummary, TaskSkillDispatchSummary,
 };
+#[cfg(test)]
+use crate::MissionRecord;
+use crate::task_store::TaskStore;
+use magi_core::{AssignmentId, MissionId, Task, TaskId, TaskProjection};
+#[cfg(test)]
 use magi_core::TaskStatus;
 use magi_skill_runtime::{SkillDispatchRoute, SkillDispatchStatus};
 use magi_tool_runtime::ToolExecutionSummary;
@@ -13,6 +18,7 @@ use magi_worker_runtime::{
 };
 use std::collections::HashSet;
 
+#[cfg(test)]
 pub(crate) fn build_execution_overview(
     mission: &MissionRecord,
     worker_summary: WorkerRuntimeSummary,
@@ -174,6 +180,7 @@ pub(crate) fn build_execution_overview_payload(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn build_runtime_snapshot(mission: &MissionRecord) -> MissionRuntimeSnapshot {
     let total_assignments = mission.assignments.len();
     let all_tasks = mission
@@ -204,6 +211,230 @@ pub(crate) fn build_runtime_snapshot(mission: &MissionRecord) -> MissionRuntimeS
     }
 }
 
+pub(crate) fn build_runtime_snapshot_from_projection(
+    projection: &TaskProjection,
+    total_assignments: usize,
+) -> MissionRuntimeSnapshot {
+    MissionRuntimeSnapshot {
+        mission_id: projection.root_task.mission_id.clone(),
+        total_assignments,
+        total_tasks: projection.progress_summary.total_tasks as usize,
+        completed_tasks: projection.progress_summary.completed_tasks as usize,
+        failed_tasks: (projection.progress_summary.failed_tasks
+            + projection.progress_summary.blocked_tasks) as usize,
+    }
+}
+
+pub(crate) fn build_execution_overview_from_task_graph(
+    task_store: &TaskStore,
+    root_task_id: &TaskId,
+    _mission_id: &MissionId,
+    worker_summary: WorkerRuntimeSummary,
+    tool_summary: ToolExecutionSummary,
+    skill_dispatch_observations: &[WorkerSkillDispatchObservation],
+    governance_observations: &[WorkerGovernanceObservation],
+    context_summary: Option<MissionContextSummary>,
+) -> Option<MissionExecutionOverview> {
+    let projection = task_store.build_projection(root_task_id)?;
+    let subtree_tasks = collect_subtree_tasks(task_store, root_task_id);
+    let assignment_roots = collect_assignment_roots(task_store, &projection.root_task);
+    let assignment_governance_summaries = build_assignment_governance_summaries_from_tasks(
+        task_store,
+        &projection.root_task,
+        &assignment_roots,
+        governance_observations,
+    );
+    let task_governance_summaries = build_task_governance_summaries_from_tasks(
+        task_store,
+        &projection.root_task,
+        &subtree_tasks,
+        governance_observations,
+    );
+    let assignment_skill_dispatch_summaries = build_assignment_skill_dispatch_summaries_from_tasks(
+        task_store,
+        &projection.root_task,
+        &assignment_roots,
+        skill_dispatch_observations,
+    );
+    let task_skill_dispatch_summaries = build_task_skill_dispatch_summaries_from_tasks(
+        task_store,
+        &projection.root_task,
+        &subtree_tasks,
+        skill_dispatch_observations,
+    );
+
+    Some(MissionExecutionOverview {
+        mission: build_runtime_snapshot_from_projection(&projection, assignment_roots.len()),
+        running_task_ids: projection.running_tasks.clone(),
+        worker_summary,
+        tool_summary,
+        governance_summary: WorkerGovernanceSummary::from_observations(
+            governance_observations.iter(),
+        ),
+        skill_dispatch_summary: build_skill_dispatch_summary(skill_dispatch_observations.iter()),
+        context_summary,
+        assignment_governance_summaries,
+        task_governance_summaries,
+        assignment_skill_dispatch_summaries,
+        task_skill_dispatch_summaries,
+    })
+}
+
+pub(crate) fn assignment_id_for_task(
+    task_store: &TaskStore,
+    root_task_id: &TaskId,
+    task_id: &TaskId,
+) -> Option<AssignmentId> {
+    assignment_root_task(task_store, root_task_id, task_id)
+        .map(|task| AssignmentId::new(task.task_id.as_str()))
+}
+
+pub(crate) fn assignment_title_for_task(
+    task_store: &TaskStore,
+    root_task_id: &TaskId,
+    task_id: &TaskId,
+) -> Option<String> {
+    assignment_root_task(task_store, root_task_id, task_id).map(|task| task.title)
+}
+
+fn collect_subtree_tasks(task_store: &TaskStore, root_task_id: &TaskId) -> Vec<Task> {
+    task_store
+        .collect_subtree_ids(root_task_id)
+        .into_iter()
+        .filter_map(|task_id| task_store.get_task(&task_id))
+        .collect()
+}
+
+fn collect_assignment_roots(task_store: &TaskStore, root_task: &Task) -> Vec<Task> {
+    task_store.get_children(&root_task.task_id)
+}
+
+fn assignment_root_task(
+    task_store: &TaskStore,
+    root_task_id: &TaskId,
+    task_id: &TaskId,
+) -> Option<Task> {
+    let mut current = task_store.get_task(task_id)?;
+    if current.task_id == *root_task_id {
+        return None;
+    }
+    loop {
+        if current.parent_task_id.as_ref() == Some(root_task_id) {
+            return Some(current);
+        }
+        let parent_id = current.parent_task_id.clone()?;
+        current = task_store.get_task(&parent_id)?;
+    }
+}
+
+fn build_assignment_governance_summaries_from_tasks(
+    task_store: &TaskStore,
+    root_task: &Task,
+    assignment_roots: &[Task],
+    observations: &[WorkerGovernanceObservation],
+) -> Vec<AssignmentGovernanceSummary> {
+    assignment_roots
+        .iter()
+        .map(|assignment_root| {
+            let task_ids = task_store
+                .collect_subtree_ids(&assignment_root.task_id)
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let filtered = observations.iter().filter(|observation| {
+                observation
+                    .task_id
+                    .as_ref()
+                    .is_some_and(|task_id| task_ids.contains(task_id))
+            });
+            AssignmentGovernanceSummary {
+                assignment_id: AssignmentId::new(assignment_root.task_id.as_str()),
+                mission_id: root_task.mission_id.clone(),
+                governance_summary: build_governance_summary(filtered),
+            }
+        })
+        .collect()
+}
+
+fn build_task_governance_summaries_from_tasks(
+    task_store: &TaskStore,
+    root_task: &Task,
+    tasks: &[Task],
+    observations: &[WorkerGovernanceObservation],
+) -> Vec<TaskGovernanceSummary> {
+    tasks.iter()
+        .filter(|task| task.task_id != root_task.task_id)
+        .map(|task| {
+            let filtered = observations
+                .iter()
+                .filter(|observation| observation.task_id.as_ref() == Some(&task.task_id));
+            TaskGovernanceSummary {
+                task_id: task.task_id.clone(),
+                mission_id: root_task.mission_id.clone(),
+                assignment_id: assignment_id_for_task(
+                    task_store,
+                    &root_task.task_id,
+                    &task.task_id,
+                )
+                .unwrap_or_else(|| AssignmentId::new(task.task_id.as_str())),
+                governance_summary: build_governance_summary(filtered),
+            }
+        })
+        .collect()
+}
+
+fn build_assignment_skill_dispatch_summaries_from_tasks(
+    task_store: &TaskStore,
+    root_task: &Task,
+    assignment_roots: &[Task],
+    observations: &[WorkerSkillDispatchObservation],
+) -> Vec<AssignmentSkillDispatchSummary> {
+    assignment_roots
+        .iter()
+        .map(|assignment_root| {
+            let task_ids = task_store
+                .collect_subtree_ids(&assignment_root.task_id)
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let filtered = observations
+                .iter()
+                .filter(|observation| task_ids.contains(&observation.task_id));
+            AssignmentSkillDispatchSummary {
+                assignment_id: AssignmentId::new(assignment_root.task_id.as_str()),
+                mission_id: root_task.mission_id.clone(),
+                skill_dispatch_summary: build_skill_dispatch_summary(filtered),
+            }
+        })
+        .collect()
+}
+
+fn build_task_skill_dispatch_summaries_from_tasks(
+    task_store: &TaskStore,
+    root_task: &Task,
+    tasks: &[Task],
+    observations: &[WorkerSkillDispatchObservation],
+) -> Vec<TaskSkillDispatchSummary> {
+    tasks.iter()
+        .filter(|task| task.task_id != root_task.task_id)
+        .map(|task| {
+            let filtered = observations
+                .iter()
+                .filter(|observation| observation.task_id == task.task_id);
+            TaskSkillDispatchSummary {
+                task_id: task.task_id.clone(),
+                mission_id: root_task.mission_id.clone(),
+                assignment_id: assignment_id_for_task(
+                    task_store,
+                    &root_task.task_id,
+                    &task.task_id,
+                )
+                .unwrap_or_else(|| AssignmentId::new(task.task_id.as_str())),
+                skill_dispatch_summary: build_skill_dispatch_summary(filtered),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn build_assignment_skill_dispatch_summaries(
     mission: &MissionRecord,
     observations: &[WorkerSkillDispatchObservation],
@@ -229,6 +460,7 @@ fn build_assignment_skill_dispatch_summaries(
         .collect()
 }
 
+#[cfg(test)]
 fn build_assignment_governance_summaries(
     mission: &MissionRecord,
     observations: &[WorkerGovernanceObservation],
@@ -257,6 +489,7 @@ fn build_assignment_governance_summaries(
         .collect()
 }
 
+#[cfg(test)]
 fn build_task_governance_summaries(
     mission: &MissionRecord,
     observations: &[WorkerGovernanceObservation],
@@ -280,6 +513,7 @@ fn build_task_governance_summaries(
         .collect()
 }
 
+#[cfg(test)]
 fn build_task_skill_dispatch_summaries(
     mission: &MissionRecord,
     observations: &[WorkerSkillDispatchObservation],

@@ -8,7 +8,9 @@ pub mod value_objects;
 #[cfg(test)]
 mod tests;
 
-pub use execution::{ExecutionOwnership, RecoveryResumeInput, ResumeDispatchDecision};
+pub use execution::{
+    ExecutionOwnership, RecoveryResumeInput, ResumeDispatchDecision, TaskExecutionTarget,
+};
 pub use errors::{DomainError, DomainResult};
 pub use ids::{
     AssignmentId, EventId, LeaseId, MissionId, SessionId, TaskId, ToolCallId, WorkerId, WorkspaceId,

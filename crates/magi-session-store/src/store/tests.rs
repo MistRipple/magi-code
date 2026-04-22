@@ -1,8 +1,8 @@
 use super::*;
 use crate::models::{SessionExecutionSidecarStatus, SessionSidecarFlushReason, SessionStoreState};
 use magi_core::{
-    AssignmentId, DispatchReason, ExecutionOwnership, MissionId, RecoveryResumeInput,
-    ResumeDispatchDecision, SessionId, TaskId, UtcMillis, WorkerId, WorkspaceId,
+    ExecutionOwnership, MissionId, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskId,
+    UtcMillis, WorkerId, WorkspaceId,
 };
 use serde_json::json;
 
@@ -186,25 +186,24 @@ fn execution_sidecar_flush_metadata_tracks_recovery_apply_and_resume() {
     assert_eq!(recovery_metadata.next_flush_hint, recovery_metadata.last_dirty_at);
 
     let updated = store
-        .apply_resume_dispatch_decision(
+        .apply_resume_execution_target(
             &session_id,
-            &ResumeDispatchDecision {
+            &TaskExecutionTarget {
                 mission_id: MissionId::new("mission-metadata"),
-                assignment_id: AssignmentId::new("assignment-metadata"),
+                root_task_id: TaskId::new("task-root-metadata"),
                 task_id: TaskId::new("todo-metadata"),
-                worker_id: Some(WorkerId::new("worker-metadata")),
-                dispatch_reason: DispatchReason::ManualResume,
-                recovery_id: "recovery-metadata".to_string(),
+                requested_worker_id: Some(WorkerId::new("worker-metadata")),
+                recovery_id: Some("recovery-metadata".to_string()),
                 execution_chain_ref: Some("chain-metadata".to_string()),
             },
         )
-        .expect("resume dispatch decision should apply");
+        .expect("resume execution target should apply");
     assert_eq!(updated.status, SessionExecutionSidecarStatus::Resumed);
     let resume_metadata = store.execution_sidecar_flush_metadata();
     assert_eq!(resume_metadata.current_version, 3);
     assert_eq!(
         resume_metadata.last_dirty_reason,
-        Some(SessionSidecarFlushReason::ApplyResumeDispatchDecision)
+        Some(SessionSidecarFlushReason::ApplyResumeExecutionTarget)
     );
     assert!(resume_metadata.last_dirty_at.is_some());
     assert_eq!(resume_metadata.next_flush_hint, resume_metadata.last_dirty_at);
@@ -307,19 +306,18 @@ fn full_recovery_lifecycle_bind_resume_input_dispatch_with_consistency_checks() 
     assert_eq!(export.recovery_ref.as_deref(), Some("recovery-full"));
 
     let resumed = store
-        .apply_resume_dispatch_decision(
+        .apply_resume_execution_target(
             &session_id,
-            &ResumeDispatchDecision {
+            &TaskExecutionTarget {
                 mission_id: MissionId::new("mission-full"),
-                assignment_id: AssignmentId::new("assignment-full"),
+                root_task_id: TaskId::new("task-root-full"),
                 task_id: TaskId::new("todo-full"),
-                worker_id: Some(WorkerId::new("worker-full")),
-                dispatch_reason: DispatchReason::ManualResume,
-                recovery_id: "recovery-full".to_string(),
+                requested_worker_id: Some(WorkerId::new("worker-full")),
+                recovery_id: Some("recovery-full".to_string()),
                 execution_chain_ref: Some("chain-recovery-full".to_string()),
             },
         )
-        .expect("resume dispatch decision should apply");
+        .expect("resume execution target should apply");
     assert_eq!(resumed.status, SessionExecutionSidecarStatus::Resumed);
     assert_eq!(resumed.ownership.mission_id, Some(MissionId::new("mission-full")));
     assert_eq!(resumed.ownership.task_id, Some(TaskId::new("todo-full")));
@@ -389,19 +387,18 @@ fn clear_ownership_after_resume_resets_to_recovery_linked_or_detached() {
         )
         .expect("recovery input should apply");
     store
-        .apply_resume_dispatch_decision(
+        .apply_resume_execution_target(
             &session_id,
-            &ResumeDispatchDecision {
+            &TaskExecutionTarget {
                 mission_id: MissionId::new("mission-clear"),
-                assignment_id: AssignmentId::new("assignment-clear"),
+                root_task_id: TaskId::new("task-root-clear"),
                 task_id: TaskId::new("todo-clear"),
-                worker_id: None,
-                dispatch_reason: DispatchReason::ManualResume,
-                recovery_id: "recovery-clear".to_string(),
+                requested_worker_id: None,
+                recovery_id: Some("recovery-clear".to_string()),
                 execution_chain_ref: Some("chain-clear".to_string()),
             },
         )
-        .expect("resume dispatch decision should apply");
+        .expect("resume execution target should apply");
 
     store
         .clear_execution_ownership(&session_id)
@@ -469,19 +466,18 @@ fn recovery_resume_rejects_mismatched_recovery_id() {
     assert!(matches!(err, magi_core::DomainError::InvalidState { .. }));
 
     let err = store
-        .apply_resume_dispatch_decision(
+        .apply_resume_execution_target(
             &session_id,
-            &ResumeDispatchDecision {
+            &TaskExecutionTarget {
                 mission_id: MissionId::new("mission-mismatch"),
-                assignment_id: AssignmentId::new("assignment-mismatch"),
+                root_task_id: TaskId::new("task-root-mismatch"),
                 task_id: TaskId::new("todo-mismatch"),
-                worker_id: None,
-                dispatch_reason: DispatchReason::ManualResume,
-                recovery_id: "recovery-B".to_string(),
+                requested_worker_id: None,
+                recovery_id: Some("recovery-B".to_string()),
                 execution_chain_ref: None,
             },
         )
-        .expect_err("mismatched recovery_id in resume decision should be rejected");
+        .expect_err("mismatched recovery_id in execution target should be rejected");
     assert!(matches!(err, magi_core::DomainError::InvalidState { .. }));
 }
 
@@ -656,19 +652,18 @@ fn sidecar_flush_scheduling_with_intermediate_flushes() {
     assert!(m2.next_flush_hint.is_some());
 
     store
-        .apply_resume_dispatch_decision(
+        .apply_resume_execution_target(
             &session_id,
-            &ResumeDispatchDecision {
+            &TaskExecutionTarget {
                 mission_id: MissionId::new("mission-sched"),
-                assignment_id: AssignmentId::new("assignment-sched"),
+                root_task_id: TaskId::new("task-root-sched"),
                 task_id: TaskId::new("todo-sched"),
-                worker_id: None,
-                dispatch_reason: DispatchReason::ManualResume,
-                recovery_id: "recovery-sched".to_string(),
+                requested_worker_id: None,
+                recovery_id: Some("recovery-sched".to_string()),
                 execution_chain_ref: Some("chain-sched".to_string()),
             },
         )
-        .expect("resume dispatch decision should apply");
+        .expect("resume execution target should apply");
     let m3 = store.execution_sidecar_flush_metadata();
     assert_eq!(m3.current_version, 3);
     assert_eq!(m3.flushed_version, 1);
@@ -730,19 +725,18 @@ fn persisted_parts_restore_after_recovery_and_resume_preserves_all_fields() {
         )
         .expect("recovery input should apply");
     store
-        .apply_resume_dispatch_decision(
+        .apply_resume_execution_target(
             &session_id,
-            &ResumeDispatchDecision {
+            &TaskExecutionTarget {
                 mission_id: MissionId::new("mission-restore"),
-                assignment_id: AssignmentId::new("assignment-restore"),
+                root_task_id: TaskId::new("task-root-restore"),
                 task_id: TaskId::new("todo-restore"),
-                worker_id: Some(WorkerId::new("worker-restore")),
-                dispatch_reason: DispatchReason::ManualResume,
-                recovery_id: "recovery-restore".to_string(),
+                requested_worker_id: Some(WorkerId::new("worker-restore")),
+                recovery_id: Some("recovery-restore".to_string()),
                 execution_chain_ref: Some("chain-restore".to_string()),
             },
         )
-        .expect("resume dispatch should apply");
+        .expect("resume execution target should apply");
 
     let durable_state = store.durable_state();
     let sidecar_store = store.execution_sidecar_store_state();

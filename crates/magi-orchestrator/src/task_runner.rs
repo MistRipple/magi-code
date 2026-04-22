@@ -1,5 +1,6 @@
 use crate::task_store::TaskStore;
 use crate::task_worker_catalog::resolve_task_role;
+use magi_bridge_client::{ModelBridgeClient, ModelInvocationRequest, ChatMessage};
 use magi_core::{
     AssignmentLease, DecisionOption, DecisionTaskPayload, EventId, LeaseId, Task, TaskId, TaskKind,
     TaskResultKind, TaskStatus, UtcMillis, WorkerId,
@@ -8,8 +9,8 @@ use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_skill_runtime::SkillDispatchRuntime;
 use magi_tool_runtime::ToolRegistry;
 use magi_worker_runtime::{
-    WorkerExecutionIntent, WorkerExecutionProfile, WorkerLoopAction, WorkerLoopOutcomeKind,
-    WorkerRuntime,
+    WorkerExecutionFinalReport, WorkerExecutionIntent, WorkerExecutionIntentStep,
+    WorkerExecutionProfile, WorkerLoopAction, WorkerLoopOutcomeKind, WorkerRuntime,
 };
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -293,13 +294,45 @@ impl WorkerExecutionDispatcher {
         task: &Task,
         worker: &WorkerInfo,
     ) -> WorkerExecutionIntent {
+        let prefix = format!("{}-{}", task.mission_id, task.task_id);
+        let mut steps: Vec<WorkerExecutionIntentStep> = Vec::new();
+
+        steps.push(WorkerExecutionIntentStep::BuiltinToolInvocation {
+            tool_call_id: magi_core::ToolCallId::new(format!("{prefix}-inspect")),
+            tool_name: "process_inspect".to_string(),
+            tool_kind: magi_governance::ToolKind::Builtin,
+            input: serde_json::json!({
+                "task_id": task.task_id.to_string(),
+                "mission_id": task.mission_id.to_string(),
+                "kind": format!("{:?}", task.kind),
+                "goal": task.goal,
+                "context_refs": task.context_refs,
+                "knowledge_refs": task.knowledge_refs,
+                "input_refs": task.input_refs,
+                "write_scope": task.write_scope,
+            })
+            .to_string(),
+            approval_requirement: magi_core::ApprovalRequirement::None,
+            risk_level: magi_core::RiskLevel::Low,
+            status: magi_core::ExecutionResultStatus::Succeeded,
+        });
+
+        steps.push(WorkerExecutionIntentStep::FinalReport(
+            WorkerExecutionFinalReport {
+                summary: format!("执行任务: {}", task.title),
+                result_kind: None,
+                termination_reason: None,
+                verification_status: magi_core::VerificationStatus::Pending,
+            },
+        ));
+
         WorkerExecutionIntent {
             worker_id: worker.worker_id.clone(),
             task_id: task.task_id.clone(),
             session_id: None,
             workspace_id: None,
             execution_profile: WorkerExecutionProfile::default(),
-            steps: Vec::new(),
+            steps,
         }
     }
 
@@ -529,6 +562,12 @@ impl TaskRunner {
                     "failed to reset expired-lease task {task_id}: {e}"
                 ));
             }
+        }
+
+        // Step 1.5: Heartbeat all active leases to prevent premature expiry.
+        let active_leases = self.store.collect_active_leases();
+        for (task_id, lease_id) in &active_leases {
+            self.store.heartbeat_lease(task_id, lease_id);
         }
 
         // Step 2: Propagate parent completion.
@@ -1344,6 +1383,217 @@ impl GraphReflector for DefaultGraphReflector {
 }
 
 // ---------------------------------------------------------------------------
+// G10.1: LLM-based GraphReflector (design 9.1)
+// ---------------------------------------------------------------------------
+
+pub struct LlmGraphReflector {
+    client: Arc<dyn ModelBridgeClient>,
+    inner: DefaultGraphReflector,
+}
+
+impl LlmGraphReflector {
+    pub fn new(client: Arc<dyn ModelBridgeClient>) -> Self {
+        Self {
+            client,
+            inner: DefaultGraphReflector,
+        }
+    }
+
+    fn build_replan_prompt(
+        store: &TaskStore,
+        parent_task_id: &TaskId,
+    ) -> Option<String> {
+        let parent = store.get_task(parent_task_id)?;
+        let children = store.get_children(parent_task_id);
+
+        let children_summary: Vec<String> = children
+            .iter()
+            .map(|c| {
+                format!(
+                    "  - {} (kind={:?}, status={:?}, goal={})",
+                    c.task_id, c.kind, c.status, c.goal
+                )
+            })
+            .collect();
+
+        Some(format!(
+            r#"当前任务图需要重规划。请分析以下父任务及其子任务，提出优化建议。
+
+父任务: {} (kind={:?}, goal={})
+当前子任务:
+{}
+
+请以 JSON 对象返回:
+{{
+  "action": "keep" | "replace",
+  "reason": "重规划原因",
+  "new_tasks": [仅当 action=replace 时提供新任务列表，格式同 MissionDecomposer]
+}}
+
+只返回 JSON，不要其他内容。"#,
+            parent.task_id,
+            parent.kind,
+            parent.goal,
+            children_summary.join("\n")
+        ))
+    }
+}
+
+impl GraphReflector for LlmGraphReflector {
+    fn insert_subtree(
+        &self,
+        store: &TaskStore,
+        parent_task_id: &TaskId,
+        new_tasks: Vec<Task>,
+    ) -> Result<Vec<TaskId>, String> {
+        self.inner.insert_subtree(store, parent_task_id, new_tasks)
+    }
+
+    fn remove_subtree(
+        &self,
+        store: &TaskStore,
+        subtree_root_id: &TaskId,
+    ) -> Result<Vec<TaskId>, String> {
+        self.inner.remove_subtree(store, subtree_root_id)
+    }
+}
+
+impl LlmGraphReflector {
+    /// 使用 LLM 分析当前子树并决定是否需要重规划。
+    /// 如果返回 replace，自动移除旧子树并插入新子树。
+    pub fn reflect_and_replan(
+        &self,
+        store: &TaskStore,
+        parent_task_id: &TaskId,
+    ) -> Result<ReplanDecision, String> {
+        let prompt = Self::build_replan_prompt(store, parent_task_id)
+            .ok_or_else(|| format!("parent {} not found", parent_task_id))?;
+
+        let parent = store
+            .get_task(parent_task_id)
+            .ok_or_else(|| format!("parent {} not found", parent_task_id))?;
+
+        let request = ModelInvocationRequest {
+            provider: "openai-compat".to_string(),
+            prompt: String::new(),
+            messages: Some(vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(prompt),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }]),
+            tools: None,
+        };
+
+        let response = self
+            .client
+            .invoke(request)
+            .map_err(|e| format!("LLM 调用失败: {e}"))?;
+        if !response.ok {
+            return Err(format!("LLM 返回错误: {}", response.payload));
+        }
+
+        let payload = response.parse_chat_payload();
+        let text = payload.content.unwrap_or_default();
+        let json_text = text
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        let value: serde_json::Value =
+            serde_json::from_str(json_text).map_err(|e| format!("JSON 解析失败: {e}"))?;
+
+        let action = value["action"].as_str().unwrap_or("keep");
+        let reason = value["reason"]
+            .as_str()
+            .unwrap_or("no reason")
+            .to_string();
+
+        if action == "keep" {
+            return Ok(ReplanDecision {
+                action: ReplanAction::Keep,
+                reason,
+                added_tasks: Vec::new(),
+                removed_tasks: Vec::new(),
+            });
+        }
+
+        let children = store.get_children(parent_task_id);
+        let mut removed_tasks = Vec::new();
+        for child in &children {
+            if !is_terminal(child.status) {
+                let removed = self.inner.remove_subtree(store, &child.task_id)?;
+                removed_tasks.extend(removed);
+            }
+        }
+
+        let new_task_items = value["new_tasks"].as_array().cloned().unwrap_or_default();
+        let mut added_tasks = Vec::new();
+        for item in &new_task_items {
+            let id_suffix = item["id"].as_str().unwrap_or("unknown");
+            let task_id = TaskId::new(format!("{}-replan-{}", parent_task_id, id_suffix));
+            let kind = match item["kind"].as_str().unwrap_or("Action") {
+                "Phase" => TaskKind::Phase,
+                "WorkPackage" => TaskKind::WorkPackage,
+                "Validation" => TaskKind::Validation,
+                _ => TaskKind::Action,
+            };
+            let task = Task {
+                task_id: task_id.clone(),
+                mission_id: parent.mission_id.clone(),
+                root_task_id: parent.root_task_id.clone(),
+                parent_task_id: Some(parent_task_id.clone()),
+                kind,
+                title: item["title"].as_str().unwrap_or("Untitled").to_string(),
+                goal: item["goal"].as_str().unwrap_or("").to_string(),
+                status: TaskStatus::Draft,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: parent.policy_snapshot.clone(),
+                executor_binding: None,
+                context_refs: Vec::new(),
+                knowledge_refs: Vec::new(),
+                workspace_scope: parent.workspace_scope.clone(),
+                write_scope: item["write_scope"].as_str().map(|s| s.to_string()),
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                repair_count: 0,
+                decision_payload: None,
+                created_at: UtcMillis::now(),
+                updated_at: UtcMillis::now(),
+            };
+            store.insert_task(task);
+            added_tasks.push(task_id);
+        }
+
+        Ok(ReplanDecision {
+            action: ReplanAction::Replace,
+            reason,
+            added_tasks,
+            removed_tasks,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ReplanAction {
+    Keep,
+    Replace,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReplanDecision {
+    pub action: ReplanAction,
+    pub reason: String,
+    pub added_tasks: Vec<TaskId>,
+    pub removed_tasks: Vec<TaskId>,
+}
+
+// ---------------------------------------------------------------------------
 // G11: Mission decomposition trait (design 4.2.1)
 // ---------------------------------------------------------------------------
 
@@ -1361,6 +1611,143 @@ pub trait MissionDecomposer: Send + Sync {
         root_task_id: &TaskId,
         goal: &str,
     ) -> Result<Vec<Task>, String>;
+}
+
+// ---------------------------------------------------------------------------
+// G11.1: LLM-based MissionDecomposer (design 4.2.1)
+// ---------------------------------------------------------------------------
+
+pub struct LlmMissionDecomposer {
+    client: Arc<dyn ModelBridgeClient>,
+}
+
+impl LlmMissionDecomposer {
+    pub fn new(client: Arc<dyn ModelBridgeClient>) -> Self {
+        Self { client }
+    }
+
+    fn build_decomposition_prompt(goal: &str) -> String {
+        format!(
+            r#"你是一个任务分解器。请将以下目标分解为可执行的任务图。
+
+目标: {goal}
+
+请以 JSON 数组形式返回任务列表，每个任务包含:
+- "id": 任务编号（如 "phase-1", "wp-1-1", "act-1-1-1"）
+- "kind": 任务类型（"Phase" / "WorkPackage" / "Action" / "Validation"）
+- "parent_id": 父任务编号（根节点留空）
+- "title": 任务标题
+- "goal": 任务目标描述
+- "dependency_ids": 依赖的任务编号数组
+- "write_scope": 文件写入范围（可选）
+
+只返回 JSON 数组，不要其他内容。"#
+        )
+    }
+
+    fn parse_decomposition_response(
+        response_text: &str,
+        mission_id: &magi_core::MissionId,
+        root_task_id: &TaskId,
+    ) -> Result<Vec<Task>, String> {
+        let json_text = response_text
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        let items: Vec<serde_json::Value> =
+            serde_json::from_str(json_text).map_err(|e| format!("JSON 解析失败: {e}"))?;
+
+        if items.is_empty() {
+            return Err("LLM 返回了空任务列表".to_string());
+        }
+
+        let mut tasks = Vec::new();
+        for item in &items {
+            let id_suffix = item["id"].as_str().unwrap_or("unknown");
+            let task_id = TaskId::new(format!("{}-{}", root_task_id, id_suffix));
+            let kind = match item["kind"].as_str().unwrap_or("Action") {
+                "Phase" => TaskKind::Phase,
+                "WorkPackage" => TaskKind::WorkPackage,
+                "Validation" => TaskKind::Validation,
+                _ => TaskKind::Action,
+            };
+            let parent_task_id = item["parent_id"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|pid| TaskId::new(format!("{}-{}", root_task_id, pid)))
+                .or_else(|| Some(root_task_id.clone()));
+            let dependency_ids: Vec<TaskId> = item["dependency_ids"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|did| TaskId::new(format!("{}-{}", root_task_id, did)))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            tasks.push(Task {
+                task_id,
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                parent_task_id,
+                kind,
+                title: item["title"].as_str().unwrap_or("Untitled").to_string(),
+                goal: item["goal"].as_str().unwrap_or("").to_string(),
+                status: TaskStatus::Draft,
+                dependency_ids,
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                context_refs: Vec::new(),
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: item["write_scope"].as_str().map(|s| s.to_string()),
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                repair_count: 0,
+                decision_payload: None,
+                created_at: UtcMillis::now(),
+                updated_at: UtcMillis::now(),
+            });
+        }
+
+        Ok(tasks)
+    }
+}
+
+impl MissionDecomposer for LlmMissionDecomposer {
+    fn decompose(
+        &self,
+        mission_id: &magi_core::MissionId,
+        root_task_id: &TaskId,
+        goal: &str,
+    ) -> Result<Vec<Task>, String> {
+        let prompt = Self::build_decomposition_prompt(goal);
+        let request = ModelInvocationRequest {
+            provider: "openai-compat".to_string(),
+            prompt: String::new(),
+            messages: Some(vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(prompt),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }]),
+            tools: None,
+        };
+        let response = self.client.invoke(request).map_err(|e| format!("LLM 调用失败: {e}"))?;
+        if !response.ok {
+            return Err(format!("LLM 返回错误: {}", response.payload));
+        }
+        let payload = response.parse_chat_payload();
+        let text = payload.content.unwrap_or_default();
+        Self::parse_decomposition_response(&text, mission_id, root_task_id)
+    }
 }
 
 /// A task status is terminal when no further transitions are expected.

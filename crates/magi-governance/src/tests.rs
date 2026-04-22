@@ -10,7 +10,7 @@ fn governance_service_can_distinguish_tool_and_worker_control_paths() {
     let service = GovernanceService::default();
 
     let tool_allowed = service.evaluate_tool_request(&ToolExecutionRequest {
-        tool_name: "file.read".to_string(),
+        tool_name: "file_read".to_string(),
         tool_kind: ToolKind::Builtin,
         risk_level: RiskLevel::Low,
         approval_requirement: ApprovalRequirement::None,
@@ -19,7 +19,7 @@ fn governance_service_can_distinguish_tool_and_worker_control_paths() {
     assert!(tool_allowed.allowed);
 
     let tool_needs_approval = service.evaluate_tool_request(&ToolExecutionRequest {
-        tool_name: "shell.exec".to_string(),
+        tool_name: "shell_exec".to_string(),
         tool_kind: ToolKind::Builtin,
         risk_level: RiskLevel::High,
         approval_requirement: ApprovalRequirement::None,
@@ -84,7 +84,7 @@ fn governance_service_can_emit_tool_decision_trace() {
     let service = GovernanceService::default();
 
     let trace = service.trace_tool_request(&ToolExecutionRequest {
-        tool_name: "shell.exec".to_string(),
+        tool_name: "shell_exec".to_string(),
         tool_kind: ToolKind::Builtin,
         risk_level: RiskLevel::High,
         approval_requirement: ApprovalRequirement::None,
@@ -92,11 +92,11 @@ fn governance_service_can_emit_tool_decision_trace() {
 
     assert_eq!(trace.action, GovernanceAction::RequiresManualApproval);
     assert_eq!(trace.decision.outcome, GovernanceOutcome::NeedsApproval);
-    assert!(trace.summary.contains("tool:shell.exec"));
+    assert!(trace.summary.contains("tool:shell_exec"));
     assert!(trace.summary.contains("needs_approval"));
     match trace.target {
         GovernanceTarget::Tool { tool_name, tool_kind } => {
-            assert_eq!(tool_name, "shell.exec");
+            assert_eq!(tool_name, "shell_exec");
             assert_eq!(tool_kind, ToolKind::Builtin);
         }
         other => panic!("unexpected trace target: {other:?}"),

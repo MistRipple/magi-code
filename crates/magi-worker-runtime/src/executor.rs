@@ -309,7 +309,7 @@ impl DeterministicWorkerExecutor {
             steps: vec![
                 WorkerExecutionIntentStep::BuiltinToolInvocation {
                     tool_call_id: ToolCallId::new(format!("{prefix}-tool-1")),
-                    tool_name: "process.inspect".to_string(),
+                    tool_name: "process_inspect".to_string(),
                     tool_kind: ToolKind::Builtin,
                     input: "{\"mode\":\"shadow\",\"target\":\"todo\"}".to_string(),
                     approval_requirement: ApprovalRequirement::None,
@@ -318,8 +318,8 @@ impl DeterministicWorkerExecutor {
                 },
                 WorkerExecutionIntentStep::SkillDispatch {
                     tool_call_id: ToolCallId::new(format!("{prefix}-skill-1")),
-                    tool_name: "process.inspect".to_string(),
-                    plan: Self::default_skill_plan("process.inspect"),
+                    tool_name: "process_inspect".to_string(),
+                    plan: Self::default_skill_plan("process_inspect"),
                     payload: "{\"mode\":\"shadow-skill\",\"target\":\"todo\"}".to_string(),
                     approval_requirement: ApprovalRequirement::None,
                     risk_level: RiskLevel::Low,

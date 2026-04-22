@@ -4,8 +4,8 @@ use crate::models::{
     SessionSidecarFlushReason,
 };
 use magi_core::{
-    DomainError, DomainResult, ExecutionOwnership, RecoveryResumeInput, ResumeDispatchDecision,
-    SessionId, UtcMillis,
+    DomainError, DomainResult, ExecutionOwnership, RecoveryResumeInput, SessionId,
+    TaskExecutionTarget, UtcMillis,
 };
 
 impl SessionStore {
@@ -133,47 +133,48 @@ impl SessionStore {
         Ok(())
     }
 
-    pub fn apply_resume_dispatch_decision(
+    pub fn apply_resume_execution_target(
         &self,
         session_id: &SessionId,
-        decision: &ResumeDispatchDecision,
+        target: &TaskExecutionTarget,
     ) -> DomainResult<SessionRuntimeSidecar> {
         let existing = self
             .runtime_sidecar(session_id)
             .ok_or(DomainError::NotFound {
                 entity: "session_runtime_sidecar",
             })?;
-        if let Some(recovery_id) = existing.recovery_id.as_deref()
-            && recovery_id != decision.recovery_id.as_str()
+        let recovery_id = target.recovery_id.as_deref();
+        if let Some(existing_recovery_id) = existing.recovery_id.as_deref()
+            && recovery_id.is_some_and(|value| value != existing_recovery_id)
         {
             return Err(DomainError::InvalidState {
                 message: format!(
-                    "session_runtime_sidecar 的 recovery_id 与 resume decision 不一致: {recovery_id} != {}",
-                    decision.recovery_id
+                    "session_runtime_sidecar 的 recovery_id 与恢复目标不一致: {existing_recovery_id} != {}",
+                    recovery_id.unwrap_or_default()
                 ),
             });
         }
         if let Some(execution_chain_ref) = existing.ownership.execution_chain_ref.as_deref()
-            && decision
+            && target
                 .execution_chain_ref
                 .as_deref()
                 .is_some_and(|value| value != execution_chain_ref)
         {
             return Err(DomainError::InvalidState {
                 message: format!(
-                    "session_runtime_sidecar 的 execution_chain_ref 与 resume decision 不一致: {execution_chain_ref} != {}",
-                    decision.execution_chain_ref.as_deref().unwrap_or_default()
+                    "session_runtime_sidecar 的 execution_chain_ref 与恢复目标不一致: {execution_chain_ref} != {}",
+                    target.execution_chain_ref.as_deref().unwrap_or_default()
                 ),
             });
         }
         let execution_chain_ref = match (
             existing.ownership.execution_chain_ref.clone(),
-            decision.execution_chain_ref.clone(),
+            target.execution_chain_ref.clone(),
         ) {
             (Some(left), Some(right)) if left != right => {
                 return Err(DomainError::InvalidState {
                     message: format!(
-                        "session_runtime_sidecar 的 execution_chain_ref 与 resume decision 不一致: {left} != {right}"
+                        "session_runtime_sidecar 的 execution_chain_ref 与恢复目标不一致: {left} != {right}"
                     ),
                 });
             }
@@ -187,18 +188,18 @@ impl SessionStore {
             ownership: ExecutionOwnership {
                 session_id: Some(session_id.clone()),
                 workspace_id: existing.ownership.workspace_id,
-                mission_id: Some(decision.mission_id.clone()),
-                task_id: Some(decision.task_id.clone()),
-                worker_id: decision.worker_id.clone(),
+                mission_id: Some(target.mission_id.clone()),
+                task_id: Some(target.task_id.clone()),
+                worker_id: target.requested_worker_id.clone(),
                 execution_chain_ref,
             },
-            recovery_id: Some(decision.recovery_id.clone()),
+            recovery_id: target.recovery_id.clone(),
             status: SessionExecutionSidecarStatus::Resumed,
             updated_at: UtcMillis::now(),
         };
         self.upsert_runtime_sidecar_with_reason(
             updated.clone(),
-            SessionSidecarFlushReason::ApplyResumeDispatchDecision,
+            SessionSidecarFlushReason::ApplyResumeExecutionTarget,
         );
         Ok(updated)
     }

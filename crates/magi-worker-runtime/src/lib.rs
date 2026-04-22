@@ -1,7 +1,7 @@
 use magi_core::{
     ApprovalRequirement, EventId, ExecutionResultStatus, RecoveryResumeInput,
-    ResumeDispatchDecision, RiskLevel, TaskId, ToolCallId, UtcMillis, VerificationStatus,
-    WorkerId, WorkerLifecycleStatus, WorkspaceId, SessionId,
+    RiskLevel, SessionId, TaskExecutionTarget, TaskId, ToolCallId, UtcMillis,
+    VerificationStatus, WorkerId, WorkerLifecycleStatus, WorkspaceId,
 };
 use magi_governance::{GovernanceDecision, GovernanceOutcome, ToolKind, WorkerControlKind};
 use magi_event_bus::{EventCategory, EventContext, EventEnvelope, InMemoryEventBus};
@@ -466,16 +466,19 @@ impl WorkerRuntime {
         Some(record)
     }
 
-    pub fn resume_from_dispatch_decision(
+    pub fn resume_from_execution_target(
         &self,
-        decision: &ResumeDispatchDecision,
+        target: &TaskExecutionTarget,
         fallback_worker_id: WorkerId,
     ) -> Option<WorkerRecord> {
-        let worker_id = decision.worker_id.clone().unwrap_or(fallback_worker_id);
+        let worker_id = target
+            .requested_worker_id
+            .clone()
+            .unwrap_or(fallback_worker_id);
         self.ensure_worker_registered(&worker_id);
         let record = self.transition(
             &worker_id,
-            Some(decision.task_id.clone()),
+            Some(target.task_id.clone()),
             WorkerLifecycleStatus::Running,
             WorkerStage::Execute,
         )?;
@@ -483,19 +486,16 @@ impl WorkerRuntime {
             "worker.resumed.from_dispatch",
             EventCategory::Domain,
             EventContext {
-                mission_id: Some(decision.mission_id.clone()),
-                assignment_id: Some(decision.assignment_id.clone()),
-                task_id: Some(decision.task_id.clone()),
+                mission_id: Some(target.mission_id.clone()),
+                task_id: Some(target.task_id.clone()),
                 ..EventContext::default()
             },
             serde_json::json!({
                 "worker_id": worker_id.to_string(),
-                "task_id": decision.task_id.to_string(),
-                "assignment_id": decision.assignment_id.to_string(),
-                "mission_id": decision.mission_id.to_string(),
-                "recovery_id": decision.recovery_id,
-                "dispatch_reason": format!("{:?}", decision.dispatch_reason),
-                "execution_chain_ref": decision.execution_chain_ref
+                "task_id": target.task_id.to_string(),
+                "mission_id": target.mission_id.to_string(),
+                "recovery_id": target.recovery_id,
+                "execution_chain_ref": target.execution_chain_ref
             }),
         );
         Some(record)
@@ -800,7 +800,7 @@ mod tests {
             steps: vec![
                 WorkerExecutionIntentStep::BuiltinToolInvocation {
                     tool_call_id: ToolCallId::new("call-intent-1".to_string()),
-                    tool_name: "file.read".to_string(),
+                    tool_name: "file_read".to_string(),
                     tool_kind: ToolKind::Builtin,
                     input: "{\"path\":\"README.md\"}".to_string(),
                     approval_requirement: ApprovalRequirement::None,
@@ -809,8 +809,8 @@ mod tests {
                 },
                 WorkerExecutionIntentStep::SkillDispatch {
                     tool_call_id: ToolCallId::new("call-intent-2".to_string()),
-                    tool_name: "process.inspect".to_string(),
-                    plan: DeterministicWorkerExecutor::default_skill_plan("process.inspect"),
+                    tool_name: "process_inspect".to_string(),
+                    plan: DeterministicWorkerExecutor::default_skill_plan("process_inspect"),
                     payload: "{\"mode\":\"intent-skill\"}".to_string(),
                     approval_requirement: ApprovalRequirement::None,
                     risk_level: RiskLevel::Low,

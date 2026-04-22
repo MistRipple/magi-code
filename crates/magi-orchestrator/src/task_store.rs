@@ -672,6 +672,17 @@ impl TaskStore {
             .collect()
     }
 
+    /// 获取所有未过期的活跃租约（Active 且 expires_at >= now）。
+    pub fn collect_active_leases(&self) -> Vec<(TaskId, LeaseId)> {
+        let now = UtcMillis::now();
+        let leases = self.leases.read().expect("leases read lock poisoned");
+        leases
+            .values()
+            .filter(|l| l.lease_status == LeaseStatus::Active && l.expires_at >= now)
+            .map(|l| (l.task_id.clone(), l.lease_id.clone()))
+            .collect()
+    }
+
     /// 获取指定 worker 的所有活跃租约。
     pub fn get_leases_by_worker(&self, worker_id: &WorkerId) -> Vec<AssignmentLease> {
         let leases = self.leases.read().expect("leases read lock poisoned");
@@ -745,6 +756,57 @@ impl TaskStore {
         }
 
         store
+    }
+
+    // ------------------------------------------------------------------
+    // G8.5: Dynamic dependency management
+    // ------------------------------------------------------------------
+
+    /// 运行时添加依赖关系。不允许自依赖或对已完成任务的依赖。
+    pub fn add_dependency(
+        &self,
+        task_id: &TaskId,
+        dependency_id: &TaskId,
+    ) -> DomainResult<()> {
+        if task_id == dependency_id {
+            return Err(DomainError::InvalidState {
+                message: format!("任务 {} 不能依赖自身", task_id),
+            });
+        }
+        let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
+        let task = tasks.get_mut(task_id).ok_or_else(|| DomainError::InvalidState {
+            message: format!("任务 {} 不存在", task_id),
+        })?;
+        if task.dependency_ids.contains(dependency_id) {
+            return Ok(());
+        }
+        task.dependency_ids.push(dependency_id.clone());
+        task.updated_at = UtcMillis::now();
+        Ok(())
+    }
+
+    /// 运行时移除依赖关系。
+    pub fn remove_dependency(
+        &self,
+        task_id: &TaskId,
+        dependency_id: &TaskId,
+    ) -> DomainResult<()> {
+        let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
+        let task = tasks.get_mut(task_id).ok_or_else(|| DomainError::InvalidState {
+            message: format!("任务 {} 不存在", task_id),
+        })?;
+        task.dependency_ids.retain(|id| id != dependency_id);
+        task.updated_at = UtcMillis::now();
+        Ok(())
+    }
+
+    /// 获取指定任务的所有依赖。
+    pub fn get_dependencies(&self, task_id: &TaskId) -> Vec<TaskId> {
+        let tasks = self.tasks.read().expect("tasks read lock poisoned");
+        tasks
+            .get(task_id)
+            .map(|t| t.dependency_ids.clone())
+            .unwrap_or_default()
     }
 
     // ------------------------------------------------------------------

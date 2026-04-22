@@ -80,7 +80,7 @@ impl PlanItemStatus {
 pub enum PlanAttemptScope {
     Orchestrator,
     Assignment,
-    Todo,
+    Task,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,7 +120,7 @@ pub struct PlanAttemptRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignment_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub todo_id: Option<String>,
+    pub task_id: Option<String>,
     pub sequence: u32,
     pub status: PlanAttemptStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -297,7 +297,7 @@ pub struct PlanRuntimeState {
 #[serde(rename_all = "camelCase")]
 pub struct PlanLinks {
     pub assignment_ids: Vec<String>,
-    pub todo_ids: Vec<String>,
+    pub task_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -321,9 +321,9 @@ pub struct PlanItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignment_id: Option<String>,
     #[serde(default)]
-    pub todo_ids: Vec<String>,
+    pub task_ids: Vec<String>,
     #[serde(default)]
-    pub todo_statuses: HashMap<String, String>,
+    pub task_statuses: HashMap<String, String>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -394,7 +394,7 @@ pub struct PlanAttemptStartInput {
     pub scope: PlanAttemptScope,
     pub target_id: Option<String>,
     pub assignment_id: Option<String>,
-    pub todo_id: Option<String>,
+    pub task_id: Option<String>,
     pub reason: Option<String>,
 }
 
@@ -402,7 +402,7 @@ pub struct PlanAttemptCompleteInput {
     pub scope: PlanAttemptScope,
     pub target_id: Option<String>,
     pub assignment_id: Option<String>,
-    pub todo_id: Option<String>,
+    pub task_id: Option<String>,
     pub status: PlanAttemptStatus,
     pub error: Option<String>,
     pub evidence_ids: Option<Vec<String>>,

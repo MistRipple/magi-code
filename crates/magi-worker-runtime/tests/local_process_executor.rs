@@ -67,7 +67,7 @@ fn local_process_executor_can_run_execute_chain() {
         steps: vec![
             WorkerExecutionIntentStep::BuiltinToolInvocation {
                 tool_call_id: ToolCallId::new("local-tool-1".to_string()),
-                tool_name: "process.inspect".to_string(),
+                tool_name: "process_inspect".to_string(),
                 tool_kind: ToolKind::Builtin,
                 input: "{\"mode\":\"subprocess\"}".to_string(),
                 approval_requirement: ApprovalRequirement::None,
@@ -76,8 +76,8 @@ fn local_process_executor_can_run_execute_chain() {
             },
             WorkerExecutionIntentStep::SkillDispatch {
                 tool_call_id: ToolCallId::new("local-skill-1".to_string()),
-                tool_name: "process.inspect".to_string(),
-                plan: builtin_skill_plan("process.inspect"),
+                tool_name: "process_inspect".to_string(),
+                plan: builtin_skill_plan("process_inspect"),
                 payload: "{\"mode\":\"subprocess-skill\"}".to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
@@ -265,7 +265,7 @@ fn local_process_executor_rejects_missing_step_capability() {
             steps: vec![
                 WorkerExecutionIntentStep::BuiltinToolInvocation {
                     tool_call_id: ToolCallId::new("missing-step-tool-1".to_string()),
-                    tool_name: "process.inspect".to_string(),
+                    tool_name: "process_inspect".to_string(),
                     tool_kind: ToolKind::Builtin,
                     input: "{\"mode\":\"shadow\"}".to_string(),
                     approval_requirement: ApprovalRequirement::None,
@@ -274,8 +274,8 @@ fn local_process_executor_rejects_missing_step_capability() {
                 },
                 WorkerExecutionIntentStep::SkillDispatch {
                     tool_call_id: ToolCallId::new("missing-step-skill-1".to_string()),
-                    tool_name: "process.inspect".to_string(),
-                    plan: builtin_skill_plan("process.inspect"),
+                    tool_name: "process_inspect".to_string(),
+                    plan: builtin_skill_plan("process_inspect"),
                     payload: "{\"mode\":\"shadow-skill\"}".to_string(),
                     approval_requirement: ApprovalRequirement::None,
                     risk_level: RiskLevel::Low,
@@ -324,7 +324,7 @@ fn worker_runtime_loop_rejects_missing_step_capability_before_fallback() {
         steps: vec![
             WorkerExecutionIntentStep::BuiltinToolInvocation {
                 tool_call_id: ToolCallId::new("reject-tool-1".to_string()),
-                tool_name: "process.inspect".to_string(),
+                tool_name: "process_inspect".to_string(),
                 tool_kind: ToolKind::Builtin,
                 input: "{\"mode\":\"reject\"}".to_string(),
                 approval_requirement: ApprovalRequirement::None,
@@ -333,8 +333,8 @@ fn worker_runtime_loop_rejects_missing_step_capability_before_fallback() {
             },
             WorkerExecutionIntentStep::SkillDispatch {
                 tool_call_id: ToolCallId::new("reject-skill-1".to_string()),
-                tool_name: "process.inspect".to_string(),
-                plan: builtin_skill_plan("process.inspect"),
+                tool_name: "process_inspect".to_string(),
+                plan: builtin_skill_plan("process_inspect"),
                 payload: "{\"mode\":\"reject-skill\"}".to_string(),
                 approval_requirement: ApprovalRequirement::None,
                 risk_level: RiskLevel::Low,
@@ -886,7 +886,7 @@ fn local_process_executor_can_run_review_through_subprocess() {
         steps: vec![
             WorkerExecutionIntentStep::BuiltinToolInvocation {
                 tool_call_id: ToolCallId::new("review-tool-1".to_string()),
-                tool_name: "process.inspect".to_string(),
+                tool_name: "process_inspect".to_string(),
                 tool_kind: ToolKind::Builtin,
                 input: "{\"mode\":\"review\"}".to_string(),
                 approval_requirement: ApprovalRequirement::None,
@@ -922,7 +922,7 @@ fn local_process_executor_can_run_verify_through_subprocess() {
         steps: vec![
             WorkerExecutionIntentStep::BuiltinToolInvocation {
                 tool_call_id: ToolCallId::new("verify-tool-1".to_string()),
-                tool_name: "process.inspect".to_string(),
+                tool_name: "process_inspect".to_string(),
                 tool_kind: ToolKind::Builtin,
                 input: "{\"mode\":\"verify\"}".to_string(),
                 approval_requirement: ApprovalRequirement::None,
@@ -959,7 +959,7 @@ fn local_process_executor_can_run_repair_through_subprocess() {
         steps: vec![
             WorkerExecutionIntentStep::BuiltinToolInvocation {
                 tool_call_id: ToolCallId::new("repair-tool-1".to_string()),
-                tool_name: "process.inspect".to_string(),
+                tool_name: "process_inspect".to_string(),
                 tool_kind: ToolKind::Builtin,
                 input: "{\"mode\":\"repair\"}".to_string(),
                 approval_requirement: ApprovalRequirement::None,

@@ -1,9 +1,6 @@
 
-use crate::{MissionRecord, ResumeCommand};
-use magi_core::{
-    AssignmentId, DispatchReason, RecoveryResumeInput, ResumeDispatchDecision,
-    TaskId, TaskStatus,
-};
+use crate::{ResumeCommand, task_store::TaskStore};
+use magi_core::{DispatchReason, RecoveryResumeInput, TaskExecutionTarget, TaskKind, TaskStatus};
 
 pub(crate) fn build_resume_command(input: &RecoveryResumeInput) -> Option<ResumeCommand> {
     let mission_id = input.ownership.mission_id.clone()?;
@@ -16,28 +13,42 @@ pub(crate) fn build_resume_command(input: &RecoveryResumeInput) -> Option<Resume
     })
 }
 
-pub(crate) fn build_resume_dispatch_decision(
-    mission: &MissionRecord,
+pub(crate) fn build_recovery_target(
+    task_store: &TaskStore,
     input: &RecoveryResumeInput,
-) -> Option<ResumeDispatchDecision> {
-    let mission_id = input.ownership.mission_id.as_ref()?;
-    let (assignment_id, task_id) = if let Some(task_id) = input.ownership.task_id.as_ref() {
-        let assignment = mission
-            .assignments
-            .iter()
-            .find(|assignment| assignment.tasks.iter().any(|task| &task.task_id == task_id))?;
-        (assignment.assignment_id.clone(), task_id.clone())
+) -> Option<TaskExecutionTarget> {
+    let mission_id = input.ownership.mission_id.clone()?;
+    let root_task = task_store
+        .get_tasks_by_mission(&mission_id)
+        .into_iter()
+        .find(|task| task.task_id == task.root_task_id)?;
+    let executable_statuses = [TaskStatus::Blocked, TaskStatus::Running, TaskStatus::Ready];
+
+    let task = if let Some(task_id) = input.ownership.task_id.as_ref() {
+        let task = task_store.get_task(task_id)?;
+        if task.root_task_id != root_task.task_id {
+            return None;
+        }
+        if !is_recoverable_status(task.status) || !is_executable_task(&task.kind) {
+            return None;
+        }
+        task
     } else {
-        select_resume_target(mission)?
+        task_store
+            .collect_subtree_ids(&root_task.task_id)
+            .into_iter()
+            .filter_map(|task_id| task_store.get_task(&task_id))
+            .filter(|task| task.task_id != root_task.task_id)
+            .filter(|task| is_executable_task(&task.kind))
+            .find(|task| executable_statuses.contains(&task.status))?
     };
 
-    Some(ResumeDispatchDecision {
-        mission_id: mission_id.clone(),
-        assignment_id,
-        task_id,
-        worker_id: input.ownership.worker_id.clone(),
-        dispatch_reason: DispatchReason::ManualResume,
-        recovery_id: input.recovery_id.clone(),
+    Some(TaskExecutionTarget {
+        mission_id,
+        root_task_id: root_task.task_id,
+        task_id: task.task_id,
+        requested_worker_id: input.ownership.worker_id.clone(),
+        recovery_id: Some(input.recovery_id.clone()),
         execution_chain_ref: input.ownership.execution_chain_ref.clone(),
     })
 }
@@ -52,38 +63,13 @@ pub(crate) fn build_resume_command_payload(command: &ResumeCommand) -> serde_jso
     })
 }
 
-pub(crate) fn build_resume_dispatch_payload(
-    decision: &ResumeDispatchDecision,
-) -> serde_json::Value {
-    serde_json::json!({
-        "mission_id": decision.mission_id.to_string(),
-        "assignment_id": decision.assignment_id.to_string(),
-        "task_id": decision.task_id.to_string(),
-        "worker_id": decision.worker_id.as_ref().map(ToString::to_string),
-        "recovery_id": decision.recovery_id,
-        "dispatch_reason": format!("{:?}", decision.dispatch_reason),
-        "execution_chain_ref": decision.execution_chain_ref
-    })
+fn is_recoverable_status(status: TaskStatus) -> bool {
+    matches!(status, TaskStatus::Blocked | TaskStatus::Running | TaskStatus::Ready)
 }
 
-pub(crate) fn build_resume_outcome_payload(
-    decision: &ResumeDispatchDecision,
-) -> serde_json::Value {
-    build_resume_dispatch_payload(decision)
-}
-
-fn select_resume_target(mission: &MissionRecord) -> Option<(AssignmentId, TaskId)> {
-    let preferred_statuses = [
-        TaskStatus::Blocked,
-        TaskStatus::Running,
-        TaskStatus::Ready,
-    ];
-    for status in preferred_statuses {
-        for assignment in &mission.assignments {
-            if let Some(task) = assignment.tasks.iter().find(|task| task.status == status) {
-                return Some((assignment.assignment_id.clone(), task.task_id.clone()));
-            }
-        }
-    }
-    None
+fn is_executable_task(kind: &TaskKind) -> bool {
+    matches!(
+        kind,
+        TaskKind::Action | TaskKind::Validation | TaskKind::Repair | TaskKind::Decision
+    )
 }

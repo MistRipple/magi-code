@@ -1,4 +1,5 @@
 mod budgeting;
+pub mod context_auxiliary;
 mod execution_context;
 pub mod layered_memory_store;
 pub mod memory_document;
@@ -465,6 +466,7 @@ mod tests {
                 status: magi_core::SessionLifecycleStatus::Active,
                 created_at: timestamp,
                 updated_at: timestamp,
+                message_count: None,
             }],
             timeline: vec![TimelineEntry {
                 entry_id: "timeline-session-1".to_string(),
@@ -633,6 +635,7 @@ mod tests {
                 status: magi_core::SessionLifecycleStatus::Active,
                 created_at: ts(1),
                 updated_at: ts(1),
+                message_count: None,
             }],
             timeline: (1..=3)
                 .map(|i| TimelineEntry {
@@ -794,7 +797,7 @@ mod tests {
             clues: ExecutionContextClues {
                 mission: Some("Stabilize parser cutover".to_string()),
                 assignment: Some("Investigate manifest fallback".to_string()),
-                todo: Some("Finalize parser diagnostics".to_string()),
+                task: Some("Finalize parser diagnostics".to_string()),
             },
             budget: ContextBudget {
                 max_turns: 4,
@@ -875,6 +878,7 @@ mod tests {
                 status: magi_core::SessionLifecycleStatus::Active,
                 created_at: timestamp(1),
                 updated_at: timestamp(1),
+                message_count: None,
             }],
             timeline: vec![TimelineEntry {
                 entry_id: "timeline-exec-1".to_string(),
@@ -936,7 +940,7 @@ mod tests {
             clues: ExecutionContextClues {
                 mission: Some("Stabilize parser cutover".to_string()),
                 assignment: Some("Review fallback path".to_string()),
-                todo: Some("Finalize parser diagnostics".to_string()),
+                task: Some("Finalize parser diagnostics".to_string()),
             },
             budget: ContextBudget {
                 max_turns: 4,
@@ -1387,6 +1391,7 @@ mod tests {
                 status: magi_core::SessionLifecycleStatus::Active,
                 created_at: ts(1),
                 updated_at: ts(1),
+                message_count: None,
             }],
             timeline: vec![
                 TimelineEntry {

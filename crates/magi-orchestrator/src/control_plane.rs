@@ -125,35 +125,6 @@ impl OrchestratorControlPlane {
                     })?;
                 Ok(OrchestratorCommandResult::ResumeCommandBuilt { command })
             }
-            OrchestratorCommand::BuildResumeDispatchDecision { input } => {
-                let decision = self
-                    .service
-                    .build_resume_dispatch_decision(&input)
-                    .ok_or(OrchestratorCommandError::NoResumeTarget {
-                        recovery_id: input.recovery_id.clone(),
-                    })?;
-                Ok(OrchestratorCommandResult::ResumeDispatchDecisionBuilt {
-                    decision,
-                })
-            }
-            OrchestratorCommand::ResumeFromRecovery { input } => {
-                let mission = self
-                    .service
-                    .resume_from_recovery(&input)
-                    .ok_or(OrchestratorCommandError::NoResumeTarget {
-                        recovery_id: input.recovery_id.clone(),
-                    })?;
-                Ok(OrchestratorCommandResult::MissionResumed { mission })
-            }
-            OrchestratorCommand::ResumeFromDispatchDecision { decision } => {
-                let mission = self
-                    .service
-                    .resume_from_dispatch_decision(&decision)
-                    .ok_or(OrchestratorCommandError::MissionNotFound {
-                        mission_id: decision.mission_id.clone(),
-                    })?;
-                Ok(OrchestratorCommandResult::MissionResumed { mission })
-            }
         }
     }
 }

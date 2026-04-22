@@ -14,6 +14,16 @@ pub struct ExecutionOwnership {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskExecutionTarget {
+    pub mission_id: MissionId,
+    pub root_task_id: TaskId,
+    pub task_id: TaskId,
+    pub requested_worker_id: Option<WorkerId>,
+    pub recovery_id: Option<String>,
+    pub execution_chain_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecoveryResumeInput {
     pub recovery_id: String,
     pub snapshot_id: String,

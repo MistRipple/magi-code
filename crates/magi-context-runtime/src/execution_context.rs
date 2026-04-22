@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 pub struct ExecutionContextClues {
     pub mission: Option<String>,
     pub assignment: Option<String>,
-    pub todo: Option<String>,
+    pub task: Option<String>,
 }
 
 impl ExecutionContextClues {
@@ -19,7 +19,7 @@ impl ExecutionContextClues {
         let parts = [
             self.mission.as_deref(),
             self.assignment.as_deref(),
-            self.todo.as_deref(),
+            self.task.as_deref(),
         ]
         .into_iter()
         .flatten()

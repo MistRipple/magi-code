@@ -45,10 +45,10 @@ pub enum BuiltinToolName {
     KnowledgeQuery,
     // ── 编排 ──
     WorkerSendMessage,
-    TodoSplit,
-    TodoList,
-    TodoUpdate,
-    TodoClaimNext,
+    TaskSplit,
+    TaskList,
+    TaskUpdate,
+    TaskClaimNext,
     ContextCompact,
     // ── Skill ──
     SkillApply,
@@ -57,57 +57,57 @@ pub enum BuiltinToolName {
 impl BuiltinToolName {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::FileRead => "file.read",
-            Self::FileWrite => "file.write",
-            Self::FilePatch => "file.patch",
-            Self::FileRemove => "file.remove",
-            Self::FileMkdir => "file.mkdir",
-            Self::FileCopy => "file.copy",
-            Self::FileMove => "file.move",
-            Self::SearchText => "search.text",
-            Self::SearchSemantic => "search.semantic",
-            Self::ShellExec => "shell.exec",
-            Self::ProcessInspect => "process.inspect",
-            Self::DiffPreview => "diff.preview",
-            Self::WebSearch => "web.search",
-            Self::WebFetch => "web.fetch",
-            Self::MermaidDiagram => "mermaid.diagram",
-            Self::KnowledgeQuery => "knowledge.query",
-            Self::WorkerSendMessage => "orchestration.worker_send_message",
-            Self::TodoSplit => "orchestration.todo_split",
-            Self::TodoList => "orchestration.todo_list",
-            Self::TodoUpdate => "orchestration.todo_update",
-            Self::TodoClaimNext => "orchestration.todo_claim_next",
-            Self::ContextCompact => "orchestration.context_compact",
-            Self::SkillApply => "skill.apply",
+            Self::FileRead => "file_read",
+            Self::FileWrite => "file_write",
+            Self::FilePatch => "file_patch",
+            Self::FileRemove => "file_remove",
+            Self::FileMkdir => "file_mkdir",
+            Self::FileCopy => "file_copy",
+            Self::FileMove => "file_move",
+            Self::SearchText => "search_text",
+            Self::SearchSemantic => "search_semantic",
+            Self::ShellExec => "shell_exec",
+            Self::ProcessInspect => "process_inspect",
+            Self::DiffPreview => "diff_preview",
+            Self::WebSearch => "web_search",
+            Self::WebFetch => "web_fetch",
+            Self::MermaidDiagram => "mermaid_diagram",
+            Self::KnowledgeQuery => "knowledge_query",
+            Self::WorkerSendMessage => "worker_send_message",
+            Self::TaskSplit => "task_split",
+            Self::TaskList => "task_list",
+            Self::TaskUpdate => "task_update",
+            Self::TaskClaimNext => "task_claim_next",
+            Self::ContextCompact => "context_compact",
+            Self::SkillApply => "skill_apply",
         }
     }
 
     pub fn from_str(name: &str) -> Option<Self> {
         match name {
-            "file.read" | "file_view" => Some(Self::FileRead),
-            "file.write" | "file_create" => Some(Self::FileWrite),
-            "file.patch" | "file_edit" | "file_insert" => Some(Self::FilePatch),
-            "file.remove" | "file_remove" => Some(Self::FileRemove),
-            "file.mkdir" => Some(Self::FileMkdir),
-            "file.copy" => Some(Self::FileCopy),
-            "file.move" => Some(Self::FileMove),
-            "search.text" | "code_search_regex" => Some(Self::SearchText),
-            "search.semantic" | "code_search_semantic" => Some(Self::SearchSemantic),
-            "shell.exec" | "shell" => Some(Self::ShellExec),
-            "process.inspect" => Some(Self::ProcessInspect),
-            "diff.preview" => Some(Self::DiffPreview),
-            "web.search" | "web_search" => Some(Self::WebSearch),
-            "web.fetch" | "web_fetch" => Some(Self::WebFetch),
-            "mermaid.diagram" | "mermaid_diagram" => Some(Self::MermaidDiagram),
-            "knowledge.query" | "project_knowledge_query" => Some(Self::KnowledgeQuery),
-            "orchestration.worker_send_message" | "worker_send_message" => Some(Self::WorkerSendMessage),
-            "orchestration.todo_split" | "todo_split" => Some(Self::TodoSplit),
-            "orchestration.todo_list" | "todo_list" => Some(Self::TodoList),
-            "orchestration.todo_update" | "todo_update" => Some(Self::TodoUpdate),
-            "orchestration.todo_claim_next" | "todo_claim_next" => Some(Self::TodoClaimNext),
-            "orchestration.context_compact" | "context_compact" => Some(Self::ContextCompact),
-            "skill.apply" | "skill_apply" => Some(Self::SkillApply),
+            "file_read" | "file_view" => Some(Self::FileRead),
+            "file_write" | "file_create" => Some(Self::FileWrite),
+            "file_patch" | "file_edit" | "file_insert" => Some(Self::FilePatch),
+            "file_remove" => Some(Self::FileRemove),
+            "file_mkdir" => Some(Self::FileMkdir),
+            "file_copy" => Some(Self::FileCopy),
+            "file_move" => Some(Self::FileMove),
+            "search_text" | "code_search_regex" => Some(Self::SearchText),
+            "search_semantic" | "code_search_semantic" => Some(Self::SearchSemantic),
+            "shell_exec" | "shell" => Some(Self::ShellExec),
+            "process_inspect" => Some(Self::ProcessInspect),
+            "diff_preview" => Some(Self::DiffPreview),
+            "web_search" => Some(Self::WebSearch),
+            "web_fetch" => Some(Self::WebFetch),
+            "mermaid_diagram" => Some(Self::MermaidDiagram),
+            "knowledge_query" | "project_knowledge_query" => Some(Self::KnowledgeQuery),
+            "worker_send_message" => Some(Self::WorkerSendMessage),
+            "task_split" => Some(Self::TaskSplit),
+            "task_list" => Some(Self::TaskList),
+            "task_update" => Some(Self::TaskUpdate),
+            "task_claim_next" => Some(Self::TaskClaimNext),
+            "context_compact" => Some(Self::ContextCompact),
+            "skill_apply" => Some(Self::SkillApply),
             _ => None,
         }
     }
@@ -116,10 +116,10 @@ impl BuiltinToolName {
         matches!(
             self,
             Self::WorkerSendMessage
-                | Self::TodoSplit
-                | Self::TodoList
-                | Self::TodoUpdate
-                | Self::TodoClaimNext
+                | Self::TaskSplit
+                | Self::TaskList
+                | Self::TaskUpdate
+                | Self::TaskClaimNext
                 | Self::ContextCompact
         )
     }
@@ -299,10 +299,10 @@ impl ToolRegistry {
             (BuiltinToolName::KnowledgeQuery, RiskLevel::Low, ApprovalRequirement::None),
             // 编排
             (BuiltinToolName::WorkerSendMessage, RiskLevel::Medium, ApprovalRequirement::None),
-            (BuiltinToolName::TodoSplit, RiskLevel::Low, ApprovalRequirement::None),
-            (BuiltinToolName::TodoList, RiskLevel::Low, ApprovalRequirement::None),
-            (BuiltinToolName::TodoUpdate, RiskLevel::Low, ApprovalRequirement::None),
-            (BuiltinToolName::TodoClaimNext, RiskLevel::Low, ApprovalRequirement::None),
+            (BuiltinToolName::TaskSplit, RiskLevel::Low, ApprovalRequirement::None),
+            (BuiltinToolName::TaskList, RiskLevel::Low, ApprovalRequirement::None),
+            (BuiltinToolName::TaskUpdate, RiskLevel::Low, ApprovalRequirement::None),
+            (BuiltinToolName::TaskClaimNext, RiskLevel::Low, ApprovalRequirement::None),
             (BuiltinToolName::ContextCompact, RiskLevel::Medium, ApprovalRequirement::None),
             // Skill
             (BuiltinToolName::SkillApply, RiskLevel::Low, ApprovalRequirement::None),
@@ -598,7 +598,7 @@ mod tests {
 
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
-        assert_eq!(payload["tool"], "file.read");
+        assert_eq!(payload["tool"], "file_read");
         assert_eq!(payload["access_mode"], "read_only");
         assert_eq!(payload["mode"], "file");
         assert_eq!(payload["truncated"], false);
@@ -657,7 +657,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!usage_events.is_empty());
         let usage_payload = &usage_events[0].payload;
-        assert_eq!(usage_payload["tool_name"], "file.read");
+        assert_eq!(usage_payload["tool_name"], "file_read");
         assert_eq!(usage_payload["status"], "Failed");
         assert_eq!(usage_payload["risk_level"], "Low");
 
@@ -699,7 +699,7 @@ mod tests {
 
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
-        assert_eq!(payload["tool"], "search.text");
+        assert_eq!(payload["tool"], "search_text");
         assert_eq!(payload["access_mode"], "read_only");
         assert!(payload["returned_matches"].as_u64().expect("returned matches") >= 2);
         assert!(!payload["matches"].as_array().expect("matches").is_empty());
@@ -727,7 +727,7 @@ mod tests {
 
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
-        assert_eq!(payload["tool"], "shell.exec");
+        assert_eq!(payload["tool"], "shell_exec");
         assert_eq!(payload["access_mode"], "maybe_write");
         assert_eq!(payload["stdout"], "hello");
 
@@ -794,7 +794,7 @@ mod tests {
         assert_eq!(blocked.status, ExecutionResultStatus::Rejected);
         let blocked_payload: Value =
             serde_json::from_str(&blocked.payload).expect("blocked payload json");
-        assert_eq!(blocked_payload["tool"], "shell.exec");
+        assert_eq!(blocked_payload["tool"], "shell_exec");
         assert_eq!(blocked_payload["access_mode"], "explicit_write");
         assert!(
             blocked_payload["error"]
@@ -901,7 +901,7 @@ mod tests {
 
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
-        assert_eq!(payload["tool"], "process.inspect");
+        assert_eq!(payload["tool"], "process_inspect");
         assert_eq!(payload["access_mode"], "read_only");
         assert!(payload["matches"].as_array().expect("matches").iter().any(|item| {
             item["pid"]
@@ -937,7 +937,7 @@ mod tests {
 
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
-        assert_eq!(payload["tool"], "diff.preview");
+        assert_eq!(payload["tool"], "diff_preview");
         assert_eq!(payload["access_mode"], "read_only");
         assert!(payload["preview"]
             .as_str()
@@ -978,7 +978,7 @@ mod tests {
         assert_eq!(snapshot.usage_entries.len(), 1);
         assert_eq!(snapshot.usage_entries[0].event_type, "tool.usage.recorded");
         let usage_payload = snapshot.usage_entries[0].payload.clone();
-        assert_eq!(usage_payload["tool_name"], "file.read");
+        assert_eq!(usage_payload["tool_name"], "file_read");
         assert_eq!(usage_payload["status"], "Failed");
         assert_eq!(usage_payload["risk_level"], "Low");
     }
@@ -1830,29 +1830,29 @@ mod tests {
     #[test]
     fn from_str_handles_all_canonical_names() {
         let all_tools = [
-            ("file.read", BuiltinToolName::FileRead),
-            ("file.write", BuiltinToolName::FileWrite),
-            ("file.patch", BuiltinToolName::FilePatch),
-            ("file.remove", BuiltinToolName::FileRemove),
-            ("file.mkdir", BuiltinToolName::FileMkdir),
-            ("file.copy", BuiltinToolName::FileCopy),
-            ("file.move", BuiltinToolName::FileMove),
-            ("search.text", BuiltinToolName::SearchText),
-            ("search.semantic", BuiltinToolName::SearchSemantic),
-            ("shell.exec", BuiltinToolName::ShellExec),
-            ("process.inspect", BuiltinToolName::ProcessInspect),
-            ("diff.preview", BuiltinToolName::DiffPreview),
-            ("web.search", BuiltinToolName::WebSearch),
-            ("web.fetch", BuiltinToolName::WebFetch),
-            ("mermaid.diagram", BuiltinToolName::MermaidDiagram),
-            ("knowledge.query", BuiltinToolName::KnowledgeQuery),
-            ("orchestration.worker_send_message", BuiltinToolName::WorkerSendMessage),
-            ("orchestration.todo_split", BuiltinToolName::TodoSplit),
-            ("orchestration.todo_list", BuiltinToolName::TodoList),
-            ("orchestration.todo_update", BuiltinToolName::TodoUpdate),
-            ("orchestration.todo_claim_next", BuiltinToolName::TodoClaimNext),
-            ("orchestration.context_compact", BuiltinToolName::ContextCompact),
-            ("skill.apply", BuiltinToolName::SkillApply),
+            ("file_read", BuiltinToolName::FileRead),
+            ("file_write", BuiltinToolName::FileWrite),
+            ("file_patch", BuiltinToolName::FilePatch),
+            ("file_remove", BuiltinToolName::FileRemove),
+            ("file_mkdir", BuiltinToolName::FileMkdir),
+            ("file_copy", BuiltinToolName::FileCopy),
+            ("file_move", BuiltinToolName::FileMove),
+            ("search_text", BuiltinToolName::SearchText),
+            ("search_semantic", BuiltinToolName::SearchSemantic),
+            ("shell_exec", BuiltinToolName::ShellExec),
+            ("process_inspect", BuiltinToolName::ProcessInspect),
+            ("diff_preview", BuiltinToolName::DiffPreview),
+            ("web_search", BuiltinToolName::WebSearch),
+            ("web_fetch", BuiltinToolName::WebFetch),
+            ("mermaid_diagram", BuiltinToolName::MermaidDiagram),
+            ("knowledge_query", BuiltinToolName::KnowledgeQuery),
+            ("worker_send_message", BuiltinToolName::WorkerSendMessage),
+            ("task_split", BuiltinToolName::TaskSplit),
+            ("task_list", BuiltinToolName::TaskList),
+            ("task_update", BuiltinToolName::TaskUpdate),
+            ("task_claim_next", BuiltinToolName::TaskClaimNext),
+            ("context_compact", BuiltinToolName::ContextCompact),
+            ("skill_apply", BuiltinToolName::SkillApply),
         ];
         for (name, expected) in &all_tools {
             assert_eq!(
@@ -1880,10 +1880,10 @@ mod tests {
             ("mermaid_diagram", BuiltinToolName::MermaidDiagram),
             ("project_knowledge_query", BuiltinToolName::KnowledgeQuery),
             ("worker_send_message", BuiltinToolName::WorkerSendMessage),
-            ("todo_split", BuiltinToolName::TodoSplit),
-            ("todo_list", BuiltinToolName::TodoList),
-            ("todo_update", BuiltinToolName::TodoUpdate),
-            ("todo_claim_next", BuiltinToolName::TodoClaimNext),
+            ("task_split", BuiltinToolName::TaskSplit),
+            ("task_list", BuiltinToolName::TaskList),
+            ("task_update", BuiltinToolName::TaskUpdate),
+            ("task_claim_next", BuiltinToolName::TaskClaimNext),
             ("context_compact", BuiltinToolName::ContextCompact),
             ("skill_apply", BuiltinToolName::SkillApply),
         ];
@@ -1907,8 +1907,8 @@ mod tests {
             BuiltinToolName::ShellExec, BuiltinToolName::ProcessInspect, BuiltinToolName::DiffPreview,
             BuiltinToolName::WebSearch, BuiltinToolName::WebFetch, BuiltinToolName::MermaidDiagram,
             BuiltinToolName::KnowledgeQuery, BuiltinToolName::WorkerSendMessage,
-            BuiltinToolName::TodoSplit, BuiltinToolName::TodoList, BuiltinToolName::TodoUpdate,
-            BuiltinToolName::TodoClaimNext, BuiltinToolName::ContextCompact, BuiltinToolName::SkillApply,
+            BuiltinToolName::TaskSplit, BuiltinToolName::TaskList, BuiltinToolName::TaskUpdate,
+            BuiltinToolName::TaskClaimNext, BuiltinToolName::ContextCompact, BuiltinToolName::SkillApply,
         ];
         for tool in &all {
             assert_eq!(
@@ -1924,10 +1924,10 @@ mod tests {
     fn is_orchestration_identifies_correct_tools() {
         let orchestration = [
             BuiltinToolName::WorkerSendMessage,
-            BuiltinToolName::TodoSplit,
-            BuiltinToolName::TodoList,
-            BuiltinToolName::TodoUpdate,
-            BuiltinToolName::TodoClaimNext,
+            BuiltinToolName::TaskSplit,
+            BuiltinToolName::TaskList,
+            BuiltinToolName::TaskUpdate,
+            BuiltinToolName::TaskClaimNext,
             BuiltinToolName::ContextCompact,
         ];
         let non_orchestration = [
@@ -2048,10 +2048,10 @@ mod tests {
         let registry = make_registry();
         let orchestration_tools = [
             BuiltinToolName::WorkerSendMessage,
-            BuiltinToolName::TodoSplit,
-            BuiltinToolName::TodoList,
-            BuiltinToolName::TodoUpdate,
-            BuiltinToolName::TodoClaimNext,
+            BuiltinToolName::TaskSplit,
+            BuiltinToolName::TaskList,
+            BuiltinToolName::TaskUpdate,
+            BuiltinToolName::TaskClaimNext,
             BuiltinToolName::ContextCompact,
         ];
         for tool in &orchestration_tools {
@@ -2113,8 +2113,8 @@ mod tests {
             BuiltinToolName::ShellExec, BuiltinToolName::ProcessInspect, BuiltinToolName::DiffPreview,
             BuiltinToolName::WebSearch, BuiltinToolName::WebFetch, BuiltinToolName::MermaidDiagram,
             BuiltinToolName::KnowledgeQuery, BuiltinToolName::WorkerSendMessage,
-            BuiltinToolName::TodoSplit, BuiltinToolName::TodoList, BuiltinToolName::TodoUpdate,
-            BuiltinToolName::TodoClaimNext, BuiltinToolName::ContextCompact, BuiltinToolName::SkillApply,
+            BuiltinToolName::TaskSplit, BuiltinToolName::TaskList, BuiltinToolName::TaskUpdate,
+            BuiltinToolName::TaskClaimNext, BuiltinToolName::ContextCompact, BuiltinToolName::SkillApply,
         ];
         for tool in &all_tools {
             assert!(

@@ -442,7 +442,7 @@ mod tests {
 
     impl BuiltinTool for EchoTool {
         fn name(&self) -> &'static str {
-            "file.read"
+            "file_read"
         }
 
         fn execute(&self, input: &str) -> String {
@@ -507,7 +507,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec!["tag".to_string()],
             },
-            allowed_tools: vec!["file.read".to_string()],
+            allowed_tools: vec!["file_read".to_string()],
             custom_tool_bindings: vec![],
             prompt_priority: 10,
         });
@@ -515,13 +515,13 @@ mod tests {
         let runtime = SkillDispatchRuntime::new(tool_registry, BridgeDispatchRuntime::new());
         let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
             skill_ids: vec!["skill-a".to_string()],
-            requested_tools: vec!["search.text".to_string()],
+            requested_tools: vec!["search_text".to_string()],
         });
         let outcome = runtime.dispatch_observed(
             &plan,
             SkillDispatchInput {
                 tool_call_id: ToolCallId::new("call-1"),
-                tool_name: "search.text".to_string(),
+                tool_name: "search_text".to_string(),
                 binding_id: None,
                 payload: "hello".to_string(),
                 approval_requirement: ApprovalRequirement::None,
@@ -555,7 +555,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec!["tag".to_string()],
             },
-            allowed_tools: vec!["file.read".to_string()],
+            allowed_tools: vec!["file_read".to_string()],
             custom_tool_bindings: vec![],
             prompt_priority: 10,
         });
@@ -563,13 +563,13 @@ mod tests {
         let runtime = SkillDispatchRuntime::new(tool_registry, BridgeDispatchRuntime::new());
         let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
             skill_ids: vec!["skill-a".to_string()],
-            requested_tools: vec!["file.read".to_string()],
+            requested_tools: vec!["file_read".to_string()],
         });
         let outcome = runtime.dispatch_observed(
             &plan,
             SkillDispatchInput {
                 tool_call_id: ToolCallId::new("call-1b"),
-                tool_name: "file.read".to_string(),
+                tool_name: "file_read".to_string(),
                 binding_id: None,
                 payload: "hello".to_string(),
                 approval_requirement: ApprovalRequirement::None,
@@ -796,7 +796,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec![],
             },
-            allowed_tools: vec!["file.read".to_string()],
+            allowed_tools: vec!["file_read".to_string()],
             custom_tool_bindings: vec![],
             prompt_priority: 10,
         });
@@ -804,7 +804,7 @@ mod tests {
         let runtime = SkillDispatchRuntime::new(tool_registry, BridgeDispatchRuntime::new());
         let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
             skill_ids: vec!["skill-unknown".to_string()],
-            requested_tools: vec!["file.read".to_string()],
+            requested_tools: vec!["file_read".to_string()],
         });
 
         // Dispatch a tool name that is NOT in the plan's routing
@@ -996,7 +996,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec![],
             },
-            allowed_tools: vec!["file.read".to_string()],
+            allowed_tools: vec!["file_read".to_string()],
             custom_tool_bindings: vec![],
             prompt_priority: 10,
         });
@@ -1004,7 +1004,7 @@ mod tests {
         let runtime = SkillDispatchRuntime::new(tool_registry, BridgeDispatchRuntime::new());
         let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
             skill_ids: vec!["skill-events".to_string()],
-            requested_tools: vec!["file.read".to_string()],
+            requested_tools: vec!["file_read".to_string()],
         });
 
         let ctx = ToolExecutionContext {
@@ -1018,7 +1018,7 @@ mod tests {
             &plan,
             SkillDispatchInput {
                 tool_call_id: ToolCallId::new("call-events"),
-                tool_name: "file.read".to_string(),
+                tool_name: "file_read".to_string(),
                 binding_id: None,
                 payload: "hello".to_string(),
                 approval_requirement: ApprovalRequirement::None,
@@ -1042,7 +1042,7 @@ mod tests {
             })
             .collect();
         assert_eq!(audit_events.len(), 1, "one audit event");
-        assert_eq!(audit_events[0].payload["tool_name"], "file.read");
+        assert_eq!(audit_events[0].payload["tool_name"], "file_read");
         assert_eq!(audit_events[0].payload["tool_call_id"], "call-events");
         assert_eq!(audit_events[0].payload["worker_id"], "wk-skill");
 
@@ -1055,7 +1055,7 @@ mod tests {
             })
             .collect();
         assert_eq!(usage_events.len(), 1, "one usage event");
-        assert_eq!(usage_events[0].payload["tool_name"], "file.read");
+        assert_eq!(usage_events[0].payload["tool_name"], "file_read");
         assert_eq!(usage_events[0].payload["status"], "Succeeded");
     }
 
@@ -1076,7 +1076,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec![],
             },
-            allowed_tools: vec!["file.read".to_string()],
+            allowed_tools: vec!["file_read".to_string()],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "binding-mixed".to_string(),
                 tool_name: "model.prompt".to_string(),
@@ -1094,11 +1094,11 @@ mod tests {
         );
         let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
             skill_ids: vec!["skill-mixed".to_string()],
-            requested_tools: vec!["file.read".to_string(), "model.prompt".to_string()],
+            requested_tools: vec!["file_read".to_string(), "model.prompt".to_string()],
         });
 
         // Verify routing summary
-        assert!(plan.routing.requested_builtin_tools.contains(&"file.read".to_string()));
+        assert!(plan.routing.requested_builtin_tools.contains(&"file_read".to_string()));
         assert!(plan
             .routing
             .requested_bridge_tool_names
@@ -1109,7 +1109,7 @@ mod tests {
             &plan,
             SkillDispatchInput {
                 tool_call_id: ToolCallId::new("call-mixed-builtin"),
-                tool_name: "file.read".to_string(),
+                tool_name: "file_read".to_string(),
                 binding_id: None,
                 payload: "builtin-payload".to_string(),
                 approval_requirement: ApprovalRequirement::None,
@@ -1207,7 +1207,7 @@ mod tests {
                 category: "general".to_string(),
                 tags: vec![],
             },
-            allowed_tools: vec!["file.read".to_string()],
+            allowed_tools: vec!["file_read".to_string()],
             custom_tool_bindings: vec![CustomToolBinding {
                 binding_id: "binding-obs".to_string(),
                 tool_name: "model.prompt".to_string(),
@@ -1225,7 +1225,7 @@ mod tests {
         );
         let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
             skill_ids: vec!["skill-obs".to_string()],
-            requested_tools: vec!["file.read".to_string(), "model.prompt".to_string()],
+            requested_tools: vec!["file_read".to_string(), "model.prompt".to_string()],
         });
 
         // Builtin observation
@@ -1233,7 +1233,7 @@ mod tests {
             &plan,
             SkillDispatchInput {
                 tool_call_id: ToolCallId::new("obs-builtin"),
-                tool_name: "file.read".to_string(),
+                tool_name: "file_read".to_string(),
                 binding_id: None,
                 payload: "test".to_string(),
                 approval_requirement: ApprovalRequirement::None,
@@ -1244,7 +1244,7 @@ mod tests {
         );
         let obs = &builtin.observation;
         assert_eq!(obs.tool_call_id, ToolCallId::new("obs-builtin"));
-        assert_eq!(obs.tool_name, "file.read");
+        assert_eq!(obs.tool_name, "file_read");
         assert_eq!(obs.route, Some(SkillDispatchRoute::Builtin));
         assert!(obs.binding_id.is_none());
         assert!(obs.bridge_kind.is_none());

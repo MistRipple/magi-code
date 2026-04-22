@@ -5,13 +5,19 @@ use magi_core::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceRecord {
+    #[serde(alias = "workspace_id")]
     pub workspace_id: WorkspaceId,
     pub name: Option<String>,
+    #[serde(alias = "root_path")]
     pub root_path: AbsolutePath,
+    #[serde(alias = "worktree_root")]
     pub worktree_root: Option<AbsolutePath>,
     pub status: WorkspaceLifecycleStatus,
+    #[serde(alias = "created_at")]
     pub created_at: UtcMillis,
+    #[serde(alias = "updated_at")]
     pub updated_at: UtcMillis,
 }
 
@@ -27,11 +33,15 @@ pub struct WorktreeAllocation {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SnapshotRecord {
+    #[serde(alias = "snapshot_id")]
     pub snapshot_id: String,
+    #[serde(alias = "workspace_id")]
     pub workspace_id: WorkspaceId,
     pub ownership: ExecutionOwnership,
     pub label: String,
+    #[serde(alias = "created_at")]
     pub created_at: UtcMillis,
 }
 
@@ -43,15 +53,23 @@ pub enum RecoveryStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecoveryHandle {
+    #[serde(alias = "recovery_id")]
     pub recovery_id: String,
+    #[serde(alias = "workspace_id")]
     pub workspace_id: WorkspaceId,
     pub ownership: ExecutionOwnership,
+    #[serde(alias = "snapshot_id")]
     pub snapshot_id: String,
+    #[serde(alias = "diagnostic_summary")]
     pub diagnostic_summary: Option<String>,
     pub status: RecoveryStatus,
+    #[serde(alias = "created_at")]
     pub created_at: UtcMillis,
+    #[serde(alias = "updated_at")]
     pub updated_at: UtcMillis,
+    #[serde(alias = "consumed_at")]
     pub consumed_at: Option<UtcMillis>,
 }
 

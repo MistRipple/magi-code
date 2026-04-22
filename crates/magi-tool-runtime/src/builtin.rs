@@ -54,10 +54,10 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::MermaidDiagram => execute_mermaid_diagram(input),
             BuiltinToolName::KnowledgeQuery => execute_knowledge_query(input),
             BuiltinToolName::WorkerSendMessage => execute_orchestration_stub(self.name, input),
-            BuiltinToolName::TodoSplit => execute_orchestration_stub(self.name, input),
-            BuiltinToolName::TodoList => execute_orchestration_stub(self.name, input),
-            BuiltinToolName::TodoUpdate => execute_orchestration_stub(self.name, input),
-            BuiltinToolName::TodoClaimNext => execute_orchestration_stub(self.name, input),
+            BuiltinToolName::TaskSplit => execute_orchestration_stub(self.name, input),
+            BuiltinToolName::TaskList => execute_orchestration_stub(self.name, input),
+            BuiltinToolName::TaskUpdate => execute_orchestration_stub(self.name, input),
+            BuiltinToolName::TaskClaimNext => execute_orchestration_stub(self.name, input),
             BuiltinToolName::ContextCompact => execute_orchestration_stub(self.name, input),
             BuiltinToolName::SkillApply => execute_skill_apply_stub(input),
         }
@@ -159,7 +159,7 @@ fn execute_file_read(input: &str) -> String {
         .and_then(|object| field_string(object, &["path", "file_path"]))
         .unwrap_or_else(|| input.trim().to_string());
     if path_input.is_empty() {
-        return builtin_error("file.read", "缺少文件路径");
+        return builtin_error("file_read", "缺少文件路径");
     }
 
     let max_bytes = request
@@ -170,12 +170,12 @@ fn execute_file_read(input: &str) -> String {
 
     let path = match resolve_path(&path_input) {
         Ok(path) => path,
-        Err(error) => return builtin_error("file.read", error),
+        Err(error) => return builtin_error("file_read", error),
     };
 
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) => return builtin_error("file.read", format!("读取元数据失败: {error}")),
+        Err(error) => return builtin_error("file_read", format!("读取元数据失败: {error}")),
     };
 
     if metadata.is_dir() {
@@ -184,11 +184,11 @@ fn execute_file_read(input: &str) -> String {
                 .filter_map(|entry| entry.ok())
                 .map(|entry| entry.file_name().to_string_lossy().to_string())
                 .collect::<Vec<_>>(),
-            Err(error) => return builtin_error("file.read", format!("读取目录失败: {error}")),
+            Err(error) => return builtin_error("file_read", format!("读取目录失败: {error}")),
         };
         entries.sort();
         return serde_json::json!({
-            "tool": "file.read",
+            "tool": "file_read",
             "status": "succeeded",
             "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
             "mode": "directory",
@@ -202,7 +202,7 @@ fn execute_file_read(input: &str) -> String {
 
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(error) => return builtin_error("file.read", format!("读取文件失败: {error}")),
+        Err(error) => return builtin_error("file_read", format!("读取文件失败: {error}")),
     };
     let truncated = bytes.len() > max_bytes;
     let preview_bytes = if truncated {
@@ -213,7 +213,7 @@ fn execute_file_read(input: &str) -> String {
     let content = String::from_utf8_lossy(preview_bytes).to_string();
 
     serde_json::json!({
-        "tool": "file.read",
+        "tool": "file_read",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
         "mode": "file",
@@ -239,7 +239,7 @@ fn execute_search_text(input: &str) -> String {
         .and_then(|object| field_string(object, &["query", "text", "needle"]))
         .unwrap_or_else(|| input.trim().to_string());
     if query.is_empty() {
-        return builtin_error("search.text", "缺少搜索关键词");
+        return builtin_error("search_text", "缺少搜索关键词");
     }
     let root_input = request
         .as_ref()
@@ -247,7 +247,7 @@ fn execute_search_text(input: &str) -> String {
         .unwrap_or_else(|| ".".to_string());
     let root = match resolve_path(&root_input) {
         Ok(path) => path,
-        Err(error) => return builtin_error("search.text", error),
+        Err(error) => return builtin_error("search_text", error),
     };
     let limit = request
         .as_ref()
@@ -271,11 +271,11 @@ fn execute_search_text(input: &str) -> String {
         limit,
     ) {
         Ok(result) => result,
-        Err(error) => return builtin_error("search.text", error),
+        Err(error) => return builtin_error("search_text", error),
     };
 
     serde_json::json!({
-        "tool": "search.text",
+        "tool": "search_text",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
         "root": root.display().to_string(),
@@ -303,7 +303,7 @@ fn execute_shell_exec(input: &str) -> String {
         .and_then(|object| field_string(object, &["command", "script", "line"]))
         .unwrap_or_else(|| input.trim().to_string());
     if command.is_empty() {
-        return builtin_error("shell.exec", "缺少 shell 命令");
+        return builtin_error("shell_exec", "缺少 shell 命令");
     }
     let access_mode = request
         .as_ref()
@@ -318,11 +318,11 @@ fn execute_shell_exec(input: &str) -> String {
     let cwd = match cwd_input {
         Some(value) => match resolve_path(&value) {
             Ok(path) => path,
-            Err(error) => return builtin_error("shell.exec", error),
+            Err(error) => return builtin_error("shell_exec", error),
         },
         None => match std::env::current_dir() {
             Ok(path) => path,
-            Err(error) => return builtin_error("shell.exec", format!("无法解析当前目录: {error}")),
+            Err(error) => return builtin_error("shell_exec", format!("无法解析当前目录: {error}")),
         },
     };
     let shell = request
@@ -337,7 +337,7 @@ fn execute_shell_exec(input: &str) -> String {
         .output()
     {
         Ok(output) => output,
-        Err(error) => return builtin_error("shell.exec", format!("命令执行失败: {error}")),
+        Err(error) => return builtin_error("shell_exec", format!("命令执行失败: {error}")),
     };
 
     let status = if output.status.success() {
@@ -349,7 +349,7 @@ fn execute_shell_exec(input: &str) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
     serde_json::json!({
-        "tool": "shell.exec",
+        "tool": "shell_exec",
         "status": status,
         "command": command,
         "cwd": cwd.display().to_string(),
@@ -403,7 +403,7 @@ fn execute_process_inspect(input: &str) -> String {
             .output()
         {
             Ok(output) => output.stdout,
-            Err(error) => return builtin_error("process.inspect", format!("进程检查失败: {error}")),
+            Err(error) => return builtin_error("process_inspect", format!("进程检查失败: {error}")),
         }
     } else {
         match Command::new("ps")
@@ -411,7 +411,7 @@ fn execute_process_inspect(input: &str) -> String {
             .output()
         {
             Ok(output) => output.stdout,
-            Err(error) => return builtin_error("process.inspect", format!("进程检查失败: {error}")),
+            Err(error) => return builtin_error("process_inspect", format!("进程检查失败: {error}")),
         }
     };
 
@@ -436,7 +436,7 @@ fn execute_process_inspect(input: &str) -> String {
     }
 
     serde_json::json!({
-        "tool": "process.inspect",
+        "tool": "process_inspect",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
         "mode": infer_process_mode(&query),
@@ -498,16 +498,16 @@ fn execute_diff_preview(input: &str) -> String {
     let (before_path, after_path, before, after, before_label, after_label) = parsed;
     let before_text = match read_diff_source(before_path, before) {
         Ok(text) => text,
-        Err(error) => return builtin_error("diff.preview", error),
+        Err(error) => return builtin_error("diff_preview", error),
     };
     let after_text = match read_diff_source(after_path, after) {
         Ok(text) => text,
-        Err(error) => return builtin_error("diff.preview", error),
+        Err(error) => return builtin_error("diff_preview", error),
     };
 
     let diff = build_diff_preview(&before_text, &after_text);
     serde_json::json!({
-        "tool": "diff.preview",
+        "tool": "diff_preview",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
         "before_label": before_label,
@@ -1155,7 +1155,7 @@ fn execute_web_search(input: &str) -> String {
         .and_then(|obj| field_string(obj, &["query", "q", "search"]))
         .unwrap_or_else(|| input.trim().to_string());
     if query.is_empty() {
-        return builtin_error("web.search", "缺少搜索关键词 query");
+        return builtin_error("web_search", "缺少搜索关键词 query");
     }
 
     let encoded = urlencoding::encode(&query);
@@ -1167,27 +1167,27 @@ fn execute_web_search(input: &str) -> String {
         .build()
     {
         Ok(c) => c,
-        Err(e) => return builtin_error("web.search", format!("HTTP 客户端初始化失败: {e}")),
+        Err(e) => return builtin_error("web_search", format!("HTTP 客户端初始化失败: {e}")),
     };
 
     let response = match client.get(&search_url).send() {
         Ok(r) => r,
-        Err(e) => return builtin_error("web.search", format!("搜索请求失败: {e}")),
+        Err(e) => return builtin_error("web_search", format!("搜索请求失败: {e}")),
     };
 
     if !response.status().is_success() {
-        return builtin_error("web.search", format!("搜索返回 HTTP {}", response.status()));
+        return builtin_error("web_search", format!("搜索返回 HTTP {}", response.status()));
     }
 
     let html = match response.text() {
         Ok(t) => t,
-        Err(e) => return builtin_error("web.search", format!("读取响应失败: {e}")),
+        Err(e) => return builtin_error("web_search", format!("读取响应失败: {e}")),
     };
 
     let results = parse_duckduckgo_results(&html);
 
     serde_json::json!({
-        "tool": "web.search",
+        "tool": "web_search",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
         "query": query,
@@ -1268,7 +1268,7 @@ fn execute_web_fetch(input: &str) -> String {
         .and_then(|obj| field_string(obj, &["url", "href", "link"]))
         .unwrap_or_else(|| input.trim().to_string());
     if url.is_empty() {
-        return builtin_error("web.fetch", "缺少 URL");
+        return builtin_error("web_fetch", "缺少 URL");
     }
 
     let prompt = request.as_ref().and_then(|obj| field_string(obj, &["prompt"]));
@@ -1280,16 +1280,16 @@ fn execute_web_fetch(input: &str) -> String {
         .build()
     {
         Ok(c) => c,
-        Err(e) => return builtin_error("web.fetch", format!("HTTP 客户端初始化失败: {e}")),
+        Err(e) => return builtin_error("web_fetch", format!("HTTP 客户端初始化失败: {e}")),
     };
 
     let response = match client.get(&url).send() {
         Ok(r) => r,
-        Err(e) => return builtin_error("web.fetch", format!("请求失败: {e}")),
+        Err(e) => return builtin_error("web_fetch", format!("请求失败: {e}")),
     };
 
     if !response.status().is_success() {
-        return builtin_error("web.fetch", format!("HTTP {}", response.status()));
+        return builtin_error("web_fetch", format!("HTTP {}", response.status()));
     }
 
     let content_type = response
@@ -1301,7 +1301,7 @@ fn execute_web_fetch(input: &str) -> String {
 
     let body = match response.text() {
         Ok(t) => t,
-        Err(e) => return builtin_error("web.fetch", format!("读取响应体失败: {e}")),
+        Err(e) => return builtin_error("web_fetch", format!("读取响应体失败: {e}")),
     };
 
     let content = if content_type.contains("application/json") {
@@ -1320,7 +1320,7 @@ fn execute_web_fetch(input: &str) -> String {
     };
 
     serde_json::json!({
-        "tool": "web.fetch",
+        "tool": "web_fetch",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
         "url": url,
@@ -1394,19 +1394,19 @@ fn extract_main_content(html: &str) -> String {
 fn execute_mermaid_diagram(input: &str) -> String {
     let request = match parse_json_object(input) {
         Some(obj) => obj,
-        None => return builtin_error("mermaid.diagram", "输入必须为 JSON 对象，包含 code 字段"),
+        None => return builtin_error("mermaid_diagram", "输入必须为 JSON 对象，包含 code 字段"),
     };
 
     let code = match field_string(&request, &["code"]) {
         Some(c) => c,
-        None => return builtin_error("mermaid.diagram", "缺少 code 字段"),
+        None => return builtin_error("mermaid_diagram", "缺少 code 字段"),
     };
     let title = field_string(&request, &["title"]);
     let theme = field_string(&request, &["theme"]).unwrap_or_else(|| "default".to_string());
 
     let trimmed = code.trim();
     if trimmed.is_empty() {
-        return builtin_error("mermaid.diagram", "Mermaid 代码为空");
+        return builtin_error("mermaid_diagram", "Mermaid 代码为空");
     }
 
     let diagram_types: &[(&str, &str)] = &[
@@ -1427,13 +1427,13 @@ fn execute_mermaid_diagram(input: &str) -> String {
     let diagram_type = match diagram_type {
         Some(t) => t,
         None => return builtin_error(
-            "mermaid.diagram",
+            "mermaid_diagram",
             "无法识别的 Mermaid 图表类型。代码须以有效声明开头（graph, flowchart, sequenceDiagram, classDiagram 等）"
         ),
     };
 
     serde_json::json!({
-        "tool": "mermaid.diagram",
+        "tool": "mermaid_diagram",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
         "type": "mermaid_diagram",
@@ -1482,7 +1482,7 @@ fn execute_knowledge_query(input: &str) -> String {
         .unwrap_or_else(|| "all".to_string());
 
     serde_json::json!({
-        "tool": "knowledge.query",
+        "tool": "knowledge_query",
         "status": "failed",
         "error": "项目知识库服务暂未初始化。",
         "category": category,
@@ -1516,7 +1516,7 @@ fn execute_skill_apply_stub(input: &str) -> String {
         .and_then(|obj| field_string(obj, &["skill_name", "name"]));
 
     serde_json::json!({
-        "tool": "skill.apply",
+        "tool": "skill_apply",
         "status": "failed",
         "error": "Skill 运行时服务暂未初始化。",
         "skill_name": skill_name,

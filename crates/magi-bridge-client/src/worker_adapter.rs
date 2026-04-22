@@ -7,6 +7,7 @@ use crate::llm_types::{
 use crate::micro_compaction as mc;
 use crate::orchestrator_termination::OrchestratorTerminationReason;
 use crate::types::{BridgeClientError, ModelBridgeClient};
+use crate::worker_duplicate_guard::{ToolCallInfo, WorkerDuplicateGuard};
 
 #[derive(Clone, Debug)]
 pub struct WorkerAdapterConfig {
@@ -14,6 +15,7 @@ pub struct WorkerAdapterConfig {
     pub enable_micro_compaction: bool,
     pub enable_duplicate_guard: bool,
     pub micro_compaction_threshold_tokens: u64,
+    pub max_upstream_error_streak: u32,
 }
 
 impl Default for WorkerAdapterConfig {
@@ -26,6 +28,7 @@ impl Default for WorkerAdapterConfig {
             enable_micro_compaction: true,
             enable_duplicate_guard: true,
             micro_compaction_threshold_tokens: 80_000,
+            max_upstream_error_streak: 3,
         }
     }
 }
@@ -41,6 +44,7 @@ pub struct WorkerAdapterResult {
     pub rounds: Vec<RoundResult>,
     pub micro_compaction_count: u32,
     pub duplicate_guard_blocks: u32,
+    pub tool_error_count: u32,
 }
 
 pub struct WorkerAdapter {
@@ -69,6 +73,15 @@ impl WorkerAdapter {
         let mut total_output_tokens = 0u64;
         let mut all_rounds = Vec::new();
         let mut micro_compaction_count = 0u32;
+        let mut duplicate_guard_blocks = 0u32;
+        let mut tool_error_count = 0u32;
+        let mut error_streak = 0u32;
+
+        let mut dup_guard = if self.config.enable_duplicate_guard {
+            Some(WorkerDuplicateGuard::new())
+        } else {
+            None
+        };
 
         loop {
             if total_rounds >= self.config.adapter.max_rounds {
@@ -85,7 +98,8 @@ impl WorkerAdapter {
                     termination_reason: OrchestratorTerminationReason::Stalled,
                     rounds: all_rounds,
                     micro_compaction_count,
-                    duplicate_guard_blocks: 0,
+                    duplicate_guard_blocks,
+                    tool_error_count,
                 });
             }
 
@@ -99,7 +113,34 @@ impl WorkerAdapter {
             }
 
             total_rounds += 1;
-            let response = self.base.invoke_llm(&params)?;
+            let response = match self.base.invoke_llm(&params) {
+                Ok(r) => {
+                    error_streak = 0;
+                    r
+                }
+                Err(e) => {
+                    error_streak += 1;
+                    if error_streak >= self.config.max_upstream_error_streak {
+                        let final_response = all_rounds
+                            .last()
+                            .map(|r: &RoundResult| r.response.clone())
+                            .unwrap_or_else(default_response);
+                        return Ok(WorkerAdapterResult {
+                            final_response,
+                            total_rounds,
+                            tool_call_count,
+                            total_input_tokens,
+                            total_output_tokens,
+                            termination_reason: OrchestratorTerminationReason::UpstreamModelError,
+                            rounds: all_rounds,
+                            micro_compaction_count,
+                            duplicate_guard_blocks,
+                            tool_error_count,
+                        });
+                    }
+                    return Err(e);
+                }
+            };
 
             total_input_tokens += response.usage.input_tokens;
             total_output_tokens += response.usage.output_tokens;
@@ -125,10 +166,12 @@ impl WorkerAdapter {
                     termination_reason: OrchestratorTerminationReason::Completed,
                     rounds: all_rounds,
                     micro_compaction_count,
-                    duplicate_guard_blocks: 0,
+                    duplicate_guard_blocks,
+                    tool_error_count,
                 });
             }
 
+            // --- Assistant 消息追加 ---
             let mut assistant_blocks = Vec::new();
             if !response.content.is_empty() {
                 assistant_blocks.push(LlmContentBlock::Text {
@@ -147,11 +190,65 @@ impl WorkerAdapter {
                 content: LlmMessageContent::Blocks(assistant_blocks),
             });
 
+            // --- 工具执行（含 duplicate guard）---
+            if let Some(ref mut guard) = dup_guard {
+                guard.reset_round_counts();
+            }
+
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
             let result_blocks: Vec<LlmContentBlock> = response
                 .tool_calls
                 .iter()
                 .map(|tc| {
+                    let tool_info = ToolCallInfo {
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.clone(),
+                    };
+
+                    if let Some(ref mut guard) = dup_guard {
+                        if guard.is_read_only_tool(&tc.name) {
+                            if let Some(reason) = guard.check_read_only_duplicate(&tool_info, now_ms) {
+                                duplicate_guard_blocks += 1;
+                                return LlmContentBlock::ToolResult {
+                                    tool_use_id: tc.id.clone(),
+                                    content: format!("[duplicate guard] 重复只读调用已拦截: {}", reason),
+                                    is_error: false,
+                                };
+                            }
+                        }
+
+                        if guard.is_write_dedup_tool(&tc.name) {
+                            if let Some(reason) = guard.check_failed_write_duplicate(&tool_info, now_ms) {
+                                duplicate_guard_blocks += 1;
+                                return LlmContentBlock::ToolResult {
+                                    tool_use_id: tc.id.clone(),
+                                    content: format!("[duplicate guard] 重复失败写入已拦截: {}", reason),
+                                    is_error: true,
+                                };
+                            }
+                        }
+                    }
+
                     let result = tool_executor.execute(tc);
+
+                    if let Some(ref mut guard) = dup_guard {
+                        if result.is_error {
+                            guard.record_failed_write(&tool_info, &result.content, now_ms);
+                        } else if guard.is_read_only_tool(&tc.name) {
+                            guard.record_read_only_call(&tool_info, now_ms);
+                        } else if guard.is_write_dedup_tool(&tc.name) {
+                            guard.record_success_write(&tool_info, now_ms);
+                        }
+                    }
+
+                    if result.is_error {
+                        tool_error_count += 1;
+                    }
+
                     LlmContentBlock::ToolResult {
                         tool_use_id: result.tool_call_id,
                         content: result.content,

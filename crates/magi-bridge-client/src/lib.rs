@@ -1,4 +1,5 @@
 pub mod auto_compaction;
+pub mod assignment_dispatch;
 pub mod base_adapter;
 mod clients;
 pub mod conversation_compaction;

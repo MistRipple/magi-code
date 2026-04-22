@@ -1,11 +1,21 @@
 #![recursion_limit = "256"]
 
+#[cfg(test)]
 mod control_plane;
 pub mod auto_learning;
-pub mod dispatch;
+#[cfg(test)]
+mod dispatch;
 mod execution_overview;
 mod execution_runtime;
 mod execution_writeback;
+#[cfg(test)]
+mod orchestration;
+#[cfg(test)]
+mod message;
+#[cfg(test)]
+mod mission_engine;
+#[cfg(test)]
+mod orchestration_loop;
 pub mod plan_ledger;
 mod recovery_planner;
 pub mod risk_policy;
@@ -14,44 +24,57 @@ pub mod task_store;
 pub mod task_worker_catalog;
 pub mod verification_policy;
 pub mod verification_runner;
+pub mod turn_diff_tracker;
+#[cfg(test)]
+mod worker_pipeline;
 
 use magi_core::{
-    ApprovalRequirement, AssignmentId, AssignmentLifecycleStatus, DispatchReason, EventId, MissionId,
-    MissionLifecycleStatus, RecoveryResumeInput, ResumeDispatchDecision, TaskResultKind,
-    RiskLevel, SessionId, TaskId, TaskStatus, TerminationReason, ToolCallId, UtcMillis,
-    VerificationStatus,
-    WorkerId, WorkspaceId,
+    AssignmentId, DispatchReason, EventId, MissionId, RecoveryResumeInput,
+    SessionId, TaskExecutionTarget, TaskId, UtcMillis, WorkspaceId,
+};
+#[cfg(test)]
+use magi_core::{
+    ApprovalRequirement, AssignmentLifecycleStatus, MissionLifecycleStatus, RiskLevel,
+    TaskResultKind, TaskStatus, TerminationReason, ToolCallId, VerificationStatus, WorkerId,
 };
 use magi_bridge_client::BridgeBindingDispatchPlan;
 use magi_context_runtime::{ContextAssemblyResult, ContextBudget, ContextRuntime};
 use magi_event_bus::{EventCategory, EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::{
-    GovernanceDecision, GovernanceOutcome, GovernanceService, WorkerControlKind,
-    WorkerControlRequest, ToolKind,
+    GovernanceService,
+};
+#[cfg(test)]
+use magi_governance::{
+    GovernanceDecision, GovernanceOutcome, ToolKind, WorkerControlKind, WorkerControlRequest,
 };
 use magi_session_store::{SessionRuntimeSidecarExport, SessionStore};
 use magi_skill_runtime::{
-    SkillDispatchRoute, SkillDispatchRuntime, SkillDispatchStatus, SkillToolRoutingSummary,
-    SkillToolRuntimePlan,
+    SkillDispatchRuntime, SkillToolRoutingSummary, SkillToolRuntimePlan,
 };
+#[cfg(test)]
+use magi_skill_runtime::{SkillDispatchRoute, SkillDispatchStatus};
 use magi_tool_runtime::{ToolExecutionPolicy, ToolExecutionSummary, ToolRegistry};
 use magi_workspace::{WorkspaceRecoverySidecarExport, WorkspaceStore};
 use magi_worker_runtime::{
-    SkillDispatchSummary, WorkerExecutionFinalReport, WorkerExecutionIntent,
-    WorkerExecutionBindingScope, WorkerExecutionIntentStep, WorkerExecutionProfile,
-    WorkerExecutorRequest,
-    WorkerExecutionReport, WorkerExecutionReusePolicy, WorkerGovernanceObservation,
+    SkillDispatchSummary, WorkerExecutionIntent, WorkerExecutionBindingScope,
+    WorkerExecutionProfile, WorkerExecutorRequest, WorkerExecutionReusePolicy,
     WorkerGovernanceSummary, WorkerLoopOutcome, WorkerRuntime, WorkerRuntimeSummary,
-    WorkerSkillDispatchObservation, WorkerStage,
+};
+#[cfg(test)]
+use magi_worker_runtime::{
+    WorkerExecutionFinalReport, WorkerExecutionIntentStep, WorkerExecutionReport,
+    WorkerGovernanceObservation, WorkerSkillDispatchObservation, WorkerStage,
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
     sync::{Arc, RwLock},
 };
+#[cfg(test)]
+use std::collections::HashMap;
 
 pub use execution_writeback::{DispatchMemoryExtractionInput, ExecutionWritebackPlans};
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub task_id: TaskId,
@@ -59,6 +82,7 @@ pub struct TaskRecord {
     pub status: TaskStatus,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AssignmentRecord {
     pub assignment_id: AssignmentId,
@@ -67,8 +91,9 @@ pub struct AssignmentRecord {
     pub tasks: Vec<TaskRecord>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MissionRecord {
+pub(crate) struct MissionRecord {
     pub mission_id: MissionId,
     pub title: String,
     pub status: MissionLifecycleStatus,
@@ -76,15 +101,17 @@ pub struct MissionRecord {
     pub assignments: Vec<AssignmentRecord>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DispatchDecision {
+pub(crate) struct DispatchDecision {
     pub mission_id: MissionId,
     pub assignment_id: AssignmentId,
     pub task_id: TaskId,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum OrchestratorCommand {
+pub(crate) enum OrchestratorCommand {
     CreateMission {
         mission_id: MissionId,
         title: String,
@@ -123,19 +150,11 @@ pub enum OrchestratorCommand {
     BuildResumeCommand {
         input: RecoveryResumeInput,
     },
-    BuildResumeDispatchDecision {
-        input: RecoveryResumeInput,
-    },
-    ResumeFromRecovery {
-        input: RecoveryResumeInput,
-    },
-    ResumeFromDispatchDecision {
-        decision: ResumeDispatchDecision,
-    },
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum OrchestratorCommandResult {
+pub(crate) enum OrchestratorCommandResult {
     MissionCreated {
         mission: MissionRecord,
     },
@@ -164,12 +183,6 @@ pub enum OrchestratorCommandResult {
     },
     ResumeCommandBuilt {
         command: ResumeCommand,
-    },
-    ResumeDispatchDecisionBuilt {
-        decision: ResumeDispatchDecision,
-    },
-    MissionResumed {
-        mission: MissionRecord,
     },
 }
 
@@ -381,6 +394,7 @@ pub struct ResumeCommand {
     pub execution_chain_ref: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GovernanceDisposition {
     Allowed,
@@ -392,7 +406,8 @@ pub enum GovernanceDisposition {
 
 #[derive(Clone, Debug, Default)]
 pub struct OrchestratorState {
-    pub missions: HashMap<MissionId, MissionRecord>,
+    #[cfg(test)]
+    pub(crate) missions: HashMap<MissionId, MissionRecord>,
 }
 
 #[derive(Clone)]
@@ -403,13 +418,15 @@ pub struct OrchestratorService {
 }
 
 #[derive(Clone)]
-pub struct OrchestratorControlPlane {
+#[cfg(test)]
+pub(crate) struct OrchestratorControlPlane {
     service: OrchestratorService,
 }
 
 #[derive(Clone)]
 pub struct OrchestratedExecutionRuntime {
     service: OrchestratorService,
+    task_store: Arc<task_store::TaskStore>,
     worker_runtime: WorkerRuntime,
     tool_registry: ToolRegistry,
     skill_dispatch_runtime: SkillDispatchRuntime,
@@ -427,7 +444,7 @@ pub struct ExecutionContextConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DispatchExecutionResult {
-    pub decision: DispatchDecision,
+    pub target: TaskExecutionTarget,
     pub intent: WorkerExecutionIntent,
     pub outcome: WorkerLoopOutcome,
     pub overview: MissionExecutionOverview,
@@ -437,7 +454,8 @@ pub struct DispatchExecutionResult {
 pub struct RecoveryExecutionResult {
     pub recovery_input: RecoveryResumeInput,
     pub resume_command: ResumeCommand,
-    pub decision: ResumeDispatchDecision,
+    pub target: TaskExecutionTarget,
+    pub assignment_id: Option<AssignmentId>,
     pub dispatch: DispatchExecutionResult,
     pub session_sidecar: Option<SessionRuntimeSidecarExport>,
     pub workspace_recovery: Option<WorkspaceRecoverySidecarExport>,
@@ -464,7 +482,8 @@ impl OrchestratorService {
         }
     }
 
-    pub fn control_plane(&self) -> OrchestratorControlPlane {
+    #[cfg(test)]
+    pub(crate) fn control_plane(&self) -> OrchestratorControlPlane {
         OrchestratorControlPlane {
             service: self.clone(),
         }
@@ -478,6 +497,7 @@ impl OrchestratorService {
     ) -> OrchestratedExecutionRuntime {
         OrchestratedExecutionRuntime {
             service: self.clone(),
+            task_store: Arc::new(task_store::TaskStore::new()),
             worker_runtime,
             tool_registry,
             skill_dispatch_runtime,
@@ -498,6 +518,7 @@ impl OrchestratorService {
     ) -> OrchestratedExecutionRuntime {
         OrchestratedExecutionRuntime {
             service: self.clone(),
+            task_store: Arc::new(task_store::TaskStore::new()),
             worker_runtime,
             tool_registry,
             skill_dispatch_runtime,
@@ -508,7 +529,12 @@ impl OrchestratorService {
         }
     }
 
-    pub fn create_mission(&self, mission_id: MissionId, title: impl Into<String>) -> MissionRecord {
+    #[cfg(test)]
+    pub(crate) fn create_mission(
+        &self,
+        mission_id: MissionId,
+        title: impl Into<String>,
+    ) -> MissionRecord {
         let mission = MissionRecord {
             mission_id: mission_id.clone(),
             title: title.into(),
@@ -527,7 +553,8 @@ impl OrchestratorService {
         mission
     }
 
-    pub fn add_assignment(
+    #[cfg(test)]
+    pub(crate) fn add_assignment(
         &self,
         mission_id: &MissionId,
         assignment_id: AssignmentId,
@@ -553,7 +580,8 @@ impl OrchestratorService {
         Some(mission)
     }
 
-    pub fn create_task(
+    #[cfg(test)]
+    pub(crate) fn create_task(
         &self,
         mission_id: &MissionId,
         assignment_id: &AssignmentId,
@@ -584,7 +612,8 @@ impl OrchestratorService {
         Some(mission)
     }
 
-    pub fn dispatch_next_task(&self, mission_id: &MissionId) -> Option<DispatchDecision> {
+    #[cfg(test)]
+    pub(crate) fn dispatch_next_task(&self, mission_id: &MissionId) -> Option<DispatchDecision> {
         let mut state = self
             .state
             .write()
@@ -616,7 +645,8 @@ impl OrchestratorService {
         None
     }
 
-    pub fn build_execution_intent(
+    #[cfg(test)]
+    pub(crate) fn build_execution_intent(
         &self,
         decision: &DispatchDecision,
         worker_id: WorkerId,
@@ -637,7 +667,7 @@ impl OrchestratorService {
             "{}-{}-{}",
             decision.mission_id, decision.assignment_id, decision.task_id
         );
-        let skill_plan = skill_plan.unwrap_or_else(|| default_builtin_skill_plan("process.inspect"));
+        let skill_plan = skill_plan.unwrap_or_else(|| default_builtin_skill_plan("process_inspect"));
         let skill_tool_name = resolve_skill_tool_name(&skill_plan);
         let skill_route = if skill_plan.routing.requested_bridge_tool_names.is_empty()
             && skill_plan.bridge_dispatch_plan.bindings.is_empty()
@@ -661,7 +691,7 @@ impl OrchestratorService {
             steps: vec![
                 WorkerExecutionIntentStep::BuiltinToolInvocation {
                     tool_call_id: ToolCallId::new(format!("{prefix}-builtin-1")),
-                    tool_name: "process.inspect".to_string(),
+                    tool_name: "process_inspect".to_string(),
                     tool_kind: ToolKind::Builtin,
                     input: serde_json::json!({
                         "mission_id": decision.mission_id.to_string(),
@@ -700,31 +730,6 @@ impl OrchestratorService {
                     verification_status: VerificationStatus::Passed,
                 }),
             ],
-        })
-    }
-
-    pub(crate) fn dispatch_context_descriptor(
-        &self,
-        decision: &DispatchDecision,
-    ) -> Option<DispatchContextDescriptor> {
-        let state = self
-            .state
-            .read()
-            .expect("orchestrator state read lock poisoned");
-        let mission = state.missions.get(&decision.mission_id)?;
-        let assignment = mission
-            .assignments
-            .iter()
-            .find(|assignment| assignment.assignment_id == decision.assignment_id)?;
-        let task = assignment
-            .tasks
-            .iter()
-            .find(|task| task.task_id == decision.task_id)?;
-
-        Some(DispatchContextDescriptor {
-            mission_title: Some(mission.title.clone()),
-            assignment_title: Some(assignment.title.clone()),
-            task_title: Some(task.title.clone()),
         })
     }
 
@@ -794,7 +799,8 @@ impl OrchestratorService {
         intent.executor_request(WorkerStage::Execute, request_source.to_string())
     }
 
-    pub fn complete_task(
+    #[cfg(test)]
+    pub(crate) fn complete_task(
         &self,
         mission_id: &MissionId,
         assignment_id: &AssignmentId,
@@ -809,7 +815,8 @@ impl OrchestratorService {
         )
     }
 
-    pub fn fail_task(
+    #[cfg(test)]
+    pub(crate) fn fail_task(
         &self,
         mission_id: &MissionId,
         assignment_id: &AssignmentId,
@@ -824,7 +831,8 @@ impl OrchestratorService {
         )
     }
 
-    pub fn missions(&self) -> Vec<MissionRecord> {
+    #[cfg(test)]
+    pub(crate) fn missions(&self) -> Vec<MissionRecord> {
         self.state
             .read()
             .expect("orchestrator state read lock poisoned")
@@ -834,7 +842,8 @@ impl OrchestratorService {
             .collect()
     }
 
-    pub fn mission_runtime_snapshot(
+    #[cfg(test)]
+    pub(crate) fn mission_runtime_snapshot(
         &self,
         mission_id: &MissionId,
     ) -> Option<MissionRuntimeSnapshot> {
@@ -846,7 +855,11 @@ impl OrchestratorService {
         Some(execution_overview::build_runtime_snapshot(mission))
     }
 
-    pub fn apply_worker_report(&self, report: &WorkerExecutionReport) -> Option<MissionRecord> {
+    #[cfg(test)]
+    pub(crate) fn apply_worker_report(
+        &self,
+        report: &WorkerExecutionReport,
+    ) -> Option<MissionRecord> {
         let next_status = match report.termination_reason {
             Some(TerminationReason::Completed) => TaskStatus::Completed,
             Some(TerminationReason::Failed) => TaskStatus::Failed,
@@ -893,7 +906,8 @@ impl OrchestratorService {
         Some(outcome.mission)
     }
 
-    pub fn apply_worker_runtime_summary(
+    #[cfg(test)]
+    pub(crate) fn apply_worker_runtime_summary(
         &self,
         summary: &WorkerRuntimeSummary,
         mission_id: &MissionId,
@@ -927,7 +941,8 @@ impl OrchestratorService {
         Some(snapshot)
     }
 
-    pub fn apply_worker_skill_dispatch_observation(
+    #[cfg(test)]
+    pub(crate) fn apply_worker_skill_dispatch_observation(
         &self,
         observation: &WorkerSkillDispatchObservation,
     ) -> Option<MissionRuntimeSnapshot> {
@@ -957,7 +972,8 @@ impl OrchestratorService {
         Some(snapshot)
     }
 
-    pub fn apply_governance_decision(
+    #[cfg(test)]
+    pub(crate) fn apply_governance_decision(
         &self,
         request: &WorkerControlRequest,
     ) -> Result<(MissionRecord, GovernanceDecision, GovernanceDisposition), OrchestratorCommandError>
@@ -1069,7 +1085,8 @@ impl OrchestratorService {
         Ok((mission, decision, disposition))
     }
 
-    pub fn build_execution_overview(
+    #[cfg(test)]
+    pub(crate) fn build_execution_overview(
         &self,
         mission_id: &MissionId,
         worker_summary: WorkerRuntimeSummary,
@@ -1087,7 +1104,8 @@ impl OrchestratorService {
         )
     }
 
-    pub fn build_execution_overview_with_context(
+    #[cfg(test)]
+    pub(crate) fn build_execution_overview_with_context(
         &self,
         mission_id: &MissionId,
         worker_summary: WorkerRuntimeSummary,
@@ -1139,74 +1157,7 @@ impl OrchestratorService {
         Some(command)
     }
 
-    pub fn build_resume_dispatch_decision(
-        &self,
-        input: &RecoveryResumeInput,
-    ) -> Option<ResumeDispatchDecision> {
-        let mission_id = input.ownership.mission_id.as_ref()?;
-        let state = self
-            .state
-            .read()
-            .expect("orchestrator state read lock poisoned");
-        let mission = state.missions.get(mission_id)?;
-        let decision = recovery_planner::build_resume_dispatch_decision(mission, input)?;
-        drop(state);
-        self.publish_with_category(
-            "mission.resume.dispatch.created",
-            EventCategory::Domain,
-            EventContext {
-                workspace_id: input.ownership.workspace_id.clone(),
-                session_id: input.ownership.session_id.clone(),
-                mission_id: Some(decision.mission_id.clone()),
-                assignment_id: Some(decision.assignment_id.clone()),
-                task_id: Some(decision.task_id.clone()),
-            },
-            recovery_planner::build_resume_dispatch_payload(&decision),
-        );
-        Some(decision)
-    }
-
-    pub fn resume_from_recovery(&self, input: &RecoveryResumeInput) -> Option<MissionRecord> {
-        let decision = self.build_resume_dispatch_decision(input)?;
-        self.resume_from_dispatch_decision(&decision)
-    }
-
-    pub fn resume_from_dispatch_decision(
-        &self,
-        decision: &ResumeDispatchDecision,
-    ) -> Option<MissionRecord> {
-        let mut state = self
-            .state
-            .write()
-            .expect("orchestrator state write lock poisoned");
-        let mission = state.missions.get_mut(&decision.mission_id)?;
-        mission.status = MissionLifecycleStatus::Running;
-        for assignment in &mut mission.assignments {
-            if assignment.assignment_id == decision.assignment_id {
-                assignment.status = AssignmentLifecycleStatus::Running;
-                for task in &mut assignment.tasks {
-                    if task.task_id == decision.task_id {
-                        task.status = TaskStatus::Running;
-                    }
-                }
-            }
-        }
-        let mission_snapshot = mission.clone();
-        drop(state);
-        self.publish_with_category(
-            "mission.resumed.from_recovery",
-            EventCategory::Domain,
-            EventContext {
-                mission_id: Some(mission_snapshot.mission_id.clone()),
-                assignment_id: Some(decision.assignment_id.clone()),
-                task_id: Some(decision.task_id.clone()),
-                ..EventContext::default()
-            },
-            recovery_planner::build_resume_outcome_payload(decision),
-        );
-        Some(mission_snapshot)
-    }
-
+    #[cfg(test)]
     pub(crate) fn mission_exists(&self, mission_id: &MissionId) -> bool {
         self.state
             .read()
@@ -1215,6 +1166,7 @@ impl OrchestratorService {
             .contains_key(mission_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn assignment_exists(
         &self,
         mission_id: &MissionId,
@@ -1233,6 +1185,7 @@ impl OrchestratorService {
             })
     }
 
+    #[cfg(test)]
     fn update_task_status(
         &self,
         mission_id: &MissionId,
@@ -1269,6 +1222,7 @@ impl OrchestratorService {
         Some(mission_snapshot)
     }
 
+    #[cfg(test)]
     fn mark_task_progress(
         &self,
         mission_id: &MissionId,
@@ -1336,6 +1290,7 @@ impl OrchestratorService {
         Some(mission_snapshot)
     }
 
+    #[cfg(test)]
     fn update_task_status_by_task_id(
         &self,
         task_id: &TaskId,
@@ -1409,6 +1364,7 @@ impl OrchestratorService {
         None
     }
 
+    #[cfg(test)]
     fn governance_disposition(
         &self,
         decision: &GovernanceDecision,
@@ -1428,6 +1384,7 @@ impl OrchestratorService {
         }
     }
 
+    #[cfg(test)]
     fn governance_status_label(
         &self,
         decision: &GovernanceDecision,
@@ -1442,6 +1399,7 @@ impl OrchestratorService {
         }
     }
 
+    #[cfg(test)]
     fn find_task_status_outcome(&self, task_id: &TaskId) -> Option<TaskStatusOutcome> {
         let state = self
             .state
@@ -1461,6 +1419,7 @@ impl OrchestratorService {
         None
     }
 
+    #[cfg(test)]
     fn publish(&self, event_type: &str, payload: serde_json::Value) {
         self.publish_with_category(
             event_type,
@@ -1509,6 +1468,11 @@ impl OrchestratorService {
 }
 
 impl OrchestratedExecutionRuntime {
+    pub fn with_task_store(mut self, task_store: Arc<task_store::TaskStore>) -> Self {
+        self.task_store = task_store;
+        self
+    }
+
     pub fn with_context_runtime(
         mut self,
         context_runtime: ContextRuntime,
@@ -1520,6 +1484,7 @@ impl OrchestratedExecutionRuntime {
     }
 }
 
+#[cfg(test)]
 struct TaskStatusOutcome {
     mission_id: MissionId,
     assignment_id: AssignmentId,
@@ -1564,9 +1529,10 @@ fn resolve_skill_tool_name(plan: &SkillToolRuntimePlan) -> String {
                 .map(|binding| binding.tool_name.clone())
         })
         .or_else(|| plan.routing.requested_builtin_tools.first().cloned())
-        .unwrap_or_else(|| "process.inspect".to_string())
+        .unwrap_or_else(|| "process_inspect".to_string())
 }
 
+#[cfg(test)]
 fn synchronize_assignment_status(assignment: &mut AssignmentRecord) {
     assignment.status = if assignment.tasks.iter().all(|task| {
         matches!(
@@ -1593,6 +1559,7 @@ fn synchronize_assignment_status(assignment: &mut AssignmentRecord) {
     };
 }
 
+#[cfg(test)]
 fn synchronize_mission_status(mission: &mut MissionRecord) {
     mission.status = if mission.assignments.iter().all(|assignment| {
         matches!(
