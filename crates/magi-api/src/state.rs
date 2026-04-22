@@ -14,7 +14,7 @@ use crate::routes::settings::{
 use crate::settings_store::SettingsStore;
 use crate::task_execution::ShadowTaskExecutionRegistry;
 use magi_bridge_client::{BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerConfig, ModelBridgeClient, StdioMcpBridgeClient};
-use magi_core::{TaskId, WorkerId};
+use magi_core::{SessionId, TaskId, WorkerId};
 use magi_event_bus::InMemoryEventBus;
 use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
@@ -415,6 +415,7 @@ pub struct ApiState {
     mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
     pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
+    pub tunnel_manager: crate::tunnel::TunnelManager,
 }
 
 #[derive(Clone, Debug)]
@@ -512,6 +513,7 @@ impl ApiState {
             mcp_connections: Arc::new(RwLock::new(HashMap::new())),
             model_bridge_client: None,
             skill_runtime: None,
+            tunnel_manager: crate::tunnel::TunnelManager::new(38123),
         }
     }
 
@@ -581,6 +583,13 @@ impl ApiState {
 
     pub fn bootstrap_dto(&self) -> BootstrapDto {
         BootstrapDto::from_state(self)
+    }
+
+    pub fn bootstrap_dto_for_session(
+        &self,
+        requested_session_id: Option<&SessionId>,
+    ) -> BootstrapDto {
+        BootstrapDto::from_state_with_selected_session(self, requested_session_id)
     }
 
     pub fn runtime_read_model_dto(&self) -> RuntimeReadModelDto {
@@ -1089,11 +1098,16 @@ fn merge_legacy_instruction_skills_into_skills_config(
 #[cfg(test)]
 mod tests {
     use super::ShadowExecutionPipeline;
-    use magi_core::{AbsolutePath, ExecutionOwnership, MissionId, SessionId, TaskId, WorkerId, WorkspaceId};
+    use magi_core::{
+        AbsolutePath, ExecutionOwnership, MissionId, SessionId, TaskId, UtcMillis, WorkerId,
+        WorkspaceId,
+    };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_memory_store::MemoryStore;
-    use magi_orchestrator::{ExecutionWritebackPlans, OrchestratorCommand, OrchestratorService};
+    use magi_orchestrator::{
+        ExecutionWritebackPlans, OrchestratorService, task_store::TaskStore,
+    };
     use magi_session_store::SessionStore;
     use magi_skill_runtime::SkillDispatchRuntime;
     use magi_tool_runtime::ToolRegistry;
@@ -1107,13 +1121,11 @@ mod tests {
         let governance = Arc::new(GovernanceService::default());
         let orchestrator =
             OrchestratorService::with_governance(Arc::clone(&event_bus), Arc::clone(&governance));
-        let control = orchestrator.control_plane();
         let session_store = Arc::new(SessionStore::new());
         let workspace_store = Arc::new(WorkspaceStore::new());
         let memory_store = MemoryStore::new();
 
         let mission_id = MissionId::new("mission-recovery-pipeline");
-        let assignment_id = magi_core::AssignmentId::new("assignment-recovery-pipeline");
         let task_id = TaskId::new("task-recovery-pipeline");
         let session_id = SessionId::new("session-recovery-pipeline");
         let workspace_id = WorkspaceId::new("workspace-recovery-pipeline");
@@ -1155,20 +1167,66 @@ mod tests {
             .mark_recovery_ready(&recovery_handle.recovery_id)
             .expect("recovery should be ready");
 
-        let _ = control.execute(OrchestratorCommand::CreateMission {
+        let task_store = Arc::new(TaskStore::new());
+        let root_task_id = TaskId::new("task-root-recovery-pipeline");
+        let now = UtcMillis::now();
+        task_store.insert_task(magi_core::Task {
+            task_id: root_task_id.clone(),
             mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            parent_task_id: None,
+            kind: magi_core::TaskKind::Objective,
             title: "mission".to_string(),
+            goal: "mission".to_string(),
+            status: magi_core::TaskStatus::Running,
+            dependency_ids: Vec::new(),
+            required_children: vec![task_id.clone()],
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: now,
+            updated_at: now,
         });
-        let _ = control.execute(OrchestratorCommand::AddAssignment {
-            mission_id: mission_id.clone(),
-            assignment_id: assignment_id.clone(),
-            title: "assignment".to_string(),
-        });
-        let _ = control.execute(OrchestratorCommand::CreateTask {
-            mission_id: mission_id.clone(),
-            assignment_id: assignment_id,
+        task_store.insert_task(magi_core::Task {
             task_id: task_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id,
+            parent_task_id: Some(TaskId::new("task-root-recovery-pipeline")),
+            kind: magi_core::TaskKind::Action,
             title: "todo".to_string(),
+            goal: "todo".to_string(),
+            status: magi_core::TaskStatus::Blocked,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: Some(magi_core::ExecutorBinding {
+                target_role: "integration-dev".to_string(),
+                capability_requirements: Vec::new(),
+                parallelism_group: None,
+                exclusive_scope: None,
+                worker_selector: None,
+            }),
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: vec!["seed".to_string()],
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: now,
+            updated_at: now,
         });
 
         let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
@@ -1182,7 +1240,8 @@ mod tests {
             ),
             Arc::clone(&session_store),
             Arc::clone(&workspace_store),
-        );
+        )
+        .with_task_store(Arc::clone(&task_store));
         let pipeline = ShadowExecutionPipeline {
             orchestrator,
             execution_runtime,
@@ -1197,7 +1256,7 @@ mod tests {
             .execute_recovery_with_writebacks(recovery_input, worker_id, writebacks)
             .expect("recovery should execute");
 
-        assert_eq!(result.decision.task_id, task_id);
+        assert_eq!(result.target.task_id, task_id);
         let verification = memory_store
             .verify_extraction_linkage("extract-recovery-recovery-recovery-pipeline")
             .expect("recovery writeback should persist extraction linkage");

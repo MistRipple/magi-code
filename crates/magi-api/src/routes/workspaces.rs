@@ -12,7 +12,6 @@ pub fn routes() -> Router<ApiState> {
         .route("/workspaces", get(list_workspaces))
         .route("/workspaces/register", post(register_workspace))
         .route("/workspaces/remove", post(remove_workspace))
-        .route("/workspaces/rename", post(rename_workspace))
         .route("/workspaces/pick", get(pick_workspace))
         .route("/workspaces/sessions", get(workspace_sessions))
 }
@@ -53,11 +52,9 @@ async fn list_workspaces(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct RegisterWorkspaceRequest {
     path: String,
-    name: Option<String>,
 }
 
 async fn register_workspace(
@@ -71,7 +68,7 @@ async fn register_workspace(
     let path = magi_core::AbsolutePath::new(&request.path);
     state
         .workspace_registry
-        .register_with_name(workspace_id.clone(), path, request.name.clone())
+        .register(workspace_id.clone(), path)
         .map_err(|e| ApiError::internal_assembly("工作区注册失败", e))?;
     state.persist_workspace_durable_state()?;
     Ok(Json(serde_json::json!({
@@ -81,7 +78,6 @@ async fn register_workspace(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct RemoveWorkspaceRequest {
     workspace_id: String,
@@ -100,27 +96,6 @@ async fn remove_workspace(
     Ok(Json(serde_json::json!({ "removed": true })))
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-#[serde(rename_all = "camelCase")]
-struct RenameWorkspaceRequest {
-    workspace_id: String,
-    name: String,
-}
-
-async fn rename_workspace(
-    State(state): State<ApiState>,
-    Json(request): Json<RenameWorkspaceRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = magi_core::WorkspaceId::new(&request.workspace_id);
-    state
-        .workspace_registry
-        .rename(&workspace_id, &request.name)
-        .map_err(|e| ApiError::internal_assembly("工作区重命名失败", e))?;
-    state.persist_workspace_durable_state()?;
-    Ok(Json(serde_json::json!({ "renamed": true })))
-}
-
 async fn pick_workspace(
     State(state): State<ApiState>,
 ) -> Json<serde_json::Value> {
@@ -137,7 +112,6 @@ async fn pick_workspace(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceSessionsQuery {
     workspace_id: Option<String>,

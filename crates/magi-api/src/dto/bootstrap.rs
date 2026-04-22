@@ -14,10 +14,11 @@ use magi_workspace::{
     RecoveryHandle, SnapshotRecord, WorkspaceProjectionInput, WorkspaceRecord,
     WorkspaceRecoverySidecarExport,
 };
-use magi_core::UtcMillis;
+use magi_core::{SessionId, UtcMillis};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BootstrapDto {
     pub service: ServiceInfo,
     pub generated_at: UtcMillis,
@@ -37,9 +38,19 @@ pub struct BootstrapDto {
 
 impl BootstrapDto {
     pub fn from_state(state: &ApiState) -> Self {
+        Self::from_state_with_selected_session(state, None)
+    }
+
+    pub fn from_state_with_selected_session(
+        state: &ApiState,
+        requested_session_id: Option<&SessionId>,
+    ) -> Self {
         Self::from_projection(
             state.service_info.clone(),
-            state.session_store.projection_input(),
+            select_session_projection(
+                state.session_store.projection_input(),
+                requested_session_id,
+            ),
             state.workspace_registry.projection_input(),
             state.session_store.execution_sidecar_exports(),
             state.workspace_registry.recovery_sidecar_exports(),
@@ -95,6 +106,23 @@ impl BootstrapDto {
             recent_events: event_snapshot.recent_events,
         }
     }
+}
+
+fn select_session_projection(
+    mut session_projection: SessionProjectionInput,
+    requested_session_id: Option<&SessionId>,
+) -> SessionProjectionInput {
+    let Some(requested_session_id) = requested_session_id else {
+        return session_projection;
+    };
+    if session_projection
+        .sessions
+        .iter()
+        .any(|session| session.session_id == *requested_session_id)
+    {
+        session_projection.current_session_id = Some(requested_session_id.clone());
+    }
+    session_projection
 }
 
 #[cfg(test)]

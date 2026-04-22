@@ -190,6 +190,45 @@ impl ShadowDaemonRuntime {
         let context_runtime = ContextRuntime::new((*self.knowledge_store).clone(), memory_store.clone());
         let context_runtime_for_dispatcher = Arc::new(context_runtime.clone());
         let tool_registry_for_dispatcher = tool_registry.clone();
+        let task_store_checkpoint_path = self.state_root.join("task-store.json");
+        let event_bus_for_task_store = self.event_bus.clone();
+        let runner_result_receiver = Arc::new(EventBasedResultReceiver::new());
+        let task_store = match TaskStore::restore_from_file(&task_store_checkpoint_path) {
+            Ok(Some(restored)) => {
+                let eb = event_bus_for_task_store.clone();
+                let receiver = runner_result_receiver.clone();
+                restored.set_status_change_callback(Box::new(
+                    move |task_id, new_status, task| {
+                        let event = magi_event_bus::task_events::task_status_changed_event(
+                            &task_id.to_string(),
+                            &task.mission_id.to_string(),
+                            "",
+                            &format!("{:?}", new_status),
+                            &format!("{:?}", task.kind),
+                        );
+                        let _ = eb.publish(event);
+                        push_terminal_task_result(&receiver, task_id, new_status);
+                    },
+                ));
+                Arc::new(restored)
+            }
+            _ => {
+                let receiver = runner_result_receiver.clone();
+                Arc::new(TaskStore::with_status_change_callback(Box::new(
+                    move |task_id, new_status, task| {
+                        let event = magi_event_bus::task_events::task_status_changed_event(
+                            &task_id.to_string(),
+                            &task.mission_id.to_string(),
+                            "",
+                            &format!("{:?}", new_status),
+                            &format!("{:?}", task.kind),
+                        );
+                        let _ = event_bus_for_task_store.publish(event);
+                        push_terminal_task_result(&receiver, task_id, new_status);
+                    },
+                )))
+            }
+        };
         let execution_runtime = orchestrator
             .execution_runtime_with_recovery_support(
                 worker_runtime,
@@ -198,6 +237,7 @@ impl ShadowDaemonRuntime {
                 self.session_store.clone(),
                 self.workspace_store.clone(),
             )
+            .with_task_store(Arc::clone(&task_store))
             .with_context_runtime(
                 context_runtime,
                 ExecutionContextConfig {
@@ -243,51 +283,6 @@ impl ShadowDaemonRuntime {
         .with_bridge_probe_transport(BridgeServerKind::Mcp, mcp_transport)
         .with_shadow_execution_pipeline(orchestrator, execution_runtime, memory_store);
 
-        // Wire TaskStore + RunnerManager for the task runner scheduling API.
-        let task_store_checkpoint_path = self.state_root.join("task-store.json");
-        let event_bus_for_task_store = self.event_bus.clone();
-
-        let runner_result_receiver = Arc::new(EventBasedResultReceiver::new());
-
-        // Try restoring TaskStore from a previous checkpoint, falling back to
-        // a fresh store if the file doesn't exist or is corrupt.
-        let task_store = match TaskStore::restore_from_file(&task_store_checkpoint_path) {
-            Ok(Some(restored)) => {
-                // Re-attach the status-change callback (not serialized).
-                let eb = event_bus_for_task_store.clone();
-                let receiver = runner_result_receiver.clone();
-                restored.set_status_change_callback(Box::new(
-                    move |task_id, new_status, task| {
-                        let event = magi_event_bus::task_events::task_status_changed_event(
-                            &task_id.to_string(),
-                            &task.mission_id.to_string(),
-                            "", // old_status not tracked by TaskStore
-                            &format!("{:?}", new_status),
-                            &format!("{:?}", task.kind),
-                        );
-                        let _ = eb.publish(event);
-                        push_terminal_task_result(&receiver, task_id, new_status);
-                    },
-                ));
-                Arc::new(restored)
-            }
-            _ => {
-                let receiver = runner_result_receiver.clone();
-                Arc::new(TaskStore::with_status_change_callback(Box::new(
-                    move |task_id, new_status, task| {
-                        let event = magi_event_bus::task_events::task_status_changed_event(
-                            &task_id.to_string(),
-                            &task.mission_id.to_string(),
-                            "", // old_status not tracked by TaskStore
-                            &format!("{:?}", new_status),
-                            &format!("{:?}", task.kind),
-                        );
-                        let _ = event_bus_for_task_store.publish(event);
-                        push_terminal_task_result(&receiver, task_id, new_status);
-                    },
-                )))
-            }
-        };
         let state_for_task_workers = state.clone();
         let shadow_task_dispatcher = ShadowTaskDispatcher::new(
             self.event_bus.clone(),
@@ -493,6 +488,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
+    use magi_core::TaskStatus;
     use magi_event_bus::AuditUsageLedgerSnapshot;
     use serde_json::{Value, json};
     use std::{
@@ -736,7 +732,7 @@ mod tests {
         let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
         let runtime = ShadowDaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
-        let (app, _) = runtime.router_with_state_for_tests("shadow-test".to_string());
+        let (app, _state) = runtime.router_with_state_for_tests("shadow-test".to_string());
 
         let (status, first_body) = post_json(
             app.clone(),
@@ -827,7 +823,7 @@ mod tests {
         let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
         let runtime = ShadowDaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
-        let (app, _) = runtime.router_with_state_for_tests("shadow-test".to_string());
+        let (app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
 
         let (status, seed_body) = post_json(
             app.clone(),
@@ -852,6 +848,15 @@ mod tests {
             .workspace_id
             .clone()
             .expect("seed execution ownership should include workspace");
+        let recovery_task_id = ownership
+            .task_id
+            .clone()
+            .expect("seed execution ownership should include task");
+        state
+            .task_store()
+            .expect("task store should be configured")
+            .update_status(&recovery_task_id, TaskStatus::Blocked)
+            .expect("seed task should become recoverable");
         let snapshot = runtime.workspace_store.append_execution_snapshot(
             workspace_id.clone(),
             ownership.clone(),
@@ -2186,13 +2191,13 @@ mod tests {
         let bridge_services = get_json(app.clone(), "/bridges/services").await;
         let bridge_preflight = get_json(app, "/bridges/preflight").await;
 
-        assert_eq!(bootstrap["bridge_services"], bridge_services);
-        assert_eq!(bootstrap["bridge_preflight"], bridge_preflight);
+        assert_eq!(bootstrap["bridgeServices"], bridge_services);
+        assert_eq!(bootstrap["bridgePreflight"], bridge_preflight);
 
-        let services = service_entries_by_kind(&bootstrap["bridge_services"]);
+        let services = service_entries_by_kind(&bootstrap["bridgeServices"]);
         assert_eq!(services.len(), 3, "unexpected bootstrap bridge services: {bootstrap:?}");
 
-        let preflight = service_entries_by_kind(&bootstrap["bridge_preflight"]);
+        let preflight = service_entries_by_kind(&bootstrap["bridgePreflight"]);
         assert_eq!(
             preflight.len(),
             3,

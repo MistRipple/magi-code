@@ -881,7 +881,6 @@ async fn runtime_status(State(state): State<ApiState>) -> Json<serde_json::Value
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct UpdateSettingRequest {
     key: String,

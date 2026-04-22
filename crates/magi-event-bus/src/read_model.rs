@@ -1410,7 +1410,7 @@ impl RuntimeReadModelInput {
                     worker_entry.current_stage = Some(stage);
                 }
             }
-            if event.event_type == "todo.dispatched"
+            if event.event_type == "task.dispatched"
                 || event.event_type == "mission.resume.dispatch.created"
             {
                 dispatch.total_dispatches += 1;
@@ -1754,9 +1754,9 @@ fn infer_mission_status(event: &EventEnvelope) -> Option<String> {
         }
         "mission.resumed.from_recovery" => Some("running".to_string()),
         "mission.execution.overview" => {
-            let total = event.payload.get("total_todos")?.as_u64()?;
-            let completed = event.payload.get("completed_todos")?.as_u64()?;
-            let failed = event.payload.get("failed_todos")?.as_u64()?;
+            let total = event.payload.get("total_tasks")?.as_u64()?;
+            let completed = event.payload.get("completed_tasks")?.as_u64()?;
+            let failed = event.payload.get("failed_tasks")?.as_u64()?;
             if total > 0 && completed == total {
                 Some("succeeded".to_string())
             } else if failed > 0 {
@@ -1969,9 +1969,9 @@ mod tests {
             "mission.execution.overview",
             json!({
                 "mission_id": "mission-1",
-                "total_todos": 1,
-                "completed_todos": 0,
-                "failed_todos": 0,
+                "total_tasks": 1,
+                "completed_tasks": 0,
+                "failed_tasks": 0,
                 "context": {
                     "used_turns": 1,
                     "used_knowledge": 2,
@@ -2077,9 +2077,9 @@ mod tests {
             "mission.execution.overview",
             json!({
                 "mission_id": "mission-1",
-                "total_todos": 2,
-                "completed_todos": 0,
-                "failed_todos": 0,
+                "total_tasks": 2,
+                "completed_tasks": 0,
+                "failed_tasks": 0,
                 "context": {
                     "used_knowledge": 1,
                     "used_memory": 1,
@@ -2096,9 +2096,9 @@ mod tests {
             "mission.execution.overview",
             json!({
                 "mission_id": "mission-1",
-                "total_todos": 2,
-                "completed_todos": 1,
-                "failed_todos": 0
+                "total_tasks": 2,
+                "completed_tasks": 1,
+                "failed_tasks": 0
             }),
         )
         .with_context(mission_context);

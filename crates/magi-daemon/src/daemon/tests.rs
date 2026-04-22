@@ -15,11 +15,10 @@ use axum::{
     http::{Request, StatusCode},
 };
 use magi_core::{
-    AbsolutePath, AssignmentId, ExecutionOwnership, EventId, MissionId, SessionId, TaskId,
-    UtcMillis, WorkerId, WorkspaceId,
+    AbsolutePath, ExecutionOwnership, EventId, MissionId, SessionId, Task, TaskId, TaskKind,
+    TaskStatus, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventEnvelope, InMemoryEventBus, RuntimeLedgerSummary};
-use magi_orchestrator::OrchestratorCommand;
 use magi_session_store::{
     SessionExecutionSidecarStatus, SessionSidecarFlushReason, SessionSidecarFlushMetadata,
     SessionStore,
@@ -444,7 +443,6 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         .expect("daemon runtime should expose shadow execution pipeline");
 
     let mission_id = MissionId::new("mission-router-recovery");
-    let assignment_id = AssignmentId::new("assignment-router-recovery");
     let task_id = TaskId::new("task-router-recovery");
     let session_id = SessionId::new("session-router-recovery");
     let workspace_id = WorkspaceId::new("workspace-router-recovery");
@@ -493,28 +491,61 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         .mark_recovery_ready(&recovery_handle.recovery_id)
         .expect("recovery should be ready");
 
-    let control = pipeline.orchestrator.control_plane();
-    control
-        .execute(OrchestratorCommand::CreateMission {
-            mission_id: mission_id.clone(),
-            title: "recovery mission".to_string(),
-        })
-        .expect("mission should be creatable");
-    control
-        .execute(OrchestratorCommand::AddAssignment {
-            mission_id: mission_id.clone(),
-            assignment_id: assignment_id.clone(),
-            title: "recovery assignment".to_string(),
-        })
-        .expect("assignment should be creatable");
-    control
-        .execute(OrchestratorCommand::CreateTask {
-            mission_id: mission_id.clone(),
-            assignment_id,
-            task_id: task_id.clone(),
-            title: "recovery todo".to_string(),
-        })
-        .expect("todo should be creatable");
+    let task_store = state.task_store().expect("task store should be configured");
+    let root_task_id = TaskId::new("task-root-router-recovery");
+    let now = UtcMillis::now();
+    task_store.insert_task(Task {
+        task_id: root_task_id.clone(),
+        mission_id: mission_id.clone(),
+        root_task_id: root_task_id.clone(),
+        parent_task_id: None,
+        kind: TaskKind::Objective,
+        title: "recovery mission".to_string(),
+        goal: "recovery mission".to_string(),
+        status: TaskStatus::Running,
+        dependency_ids: Vec::new(),
+        required_children: vec![task_id.clone()],
+        policy_snapshot: None,
+        executor_binding: None,
+        context_refs: Vec::new(),
+        knowledge_refs: Vec::new(),
+        workspace_scope: None,
+        write_scope: None,
+        input_refs: Vec::new(),
+        output_refs: Vec::new(),
+        evidence_refs: Vec::new(),
+        retry_count: 0,
+        repair_count: 0,
+        decision_payload: None,
+        created_at: now,
+        updated_at: now,
+    });
+    task_store.insert_task(Task {
+        task_id: task_id.clone(),
+        mission_id: mission_id.clone(),
+        root_task_id: root_task_id,
+        parent_task_id: Some(TaskId::new("task-root-router-recovery")),
+        kind: TaskKind::Action,
+        title: "recovery task".to_string(),
+        goal: "recovery task".to_string(),
+        status: TaskStatus::Blocked,
+        dependency_ids: Vec::new(),
+        required_children: Vec::new(),
+        policy_snapshot: None,
+        executor_binding: None,
+        context_refs: Vec::new(),
+        knowledge_refs: Vec::new(),
+        workspace_scope: None,
+        write_scope: None,
+        input_refs: Vec::new(),
+        output_refs: Vec::new(),
+        evidence_refs: Vec::new(),
+        retry_count: 0,
+        repair_count: 0,
+        decision_payload: None,
+        created_at: now,
+        updated_at: now,
+    });
 
     let expected_extraction_id = format!("extract-recovery-{}", recovery_handle.recovery_id);
     let (status, recovery_body) = post_json(
@@ -557,7 +588,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         .iter()
         .find(|entry| entry["recovery_id"] == "recovery-router-recovery")
         .expect("recovery summary should exist");
-    assert_eq!(recovery_summary["current_status"], "mission_resumed");
+    assert_eq!(recovery_summary["current_status"], "worker_resumed");
     assert_eq!(recovery_summary["diagnostic_summary"], "resume parser after crash");
     let session_summary = first_read_model["details"]["sessions"]
         .as_array()
@@ -671,9 +702,9 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
     let second_mission_id = format!("mission-session-action-{second_accepted_at}");
     let runtime_read_model = get_json(app.clone(), "/runtime/read-model").await;
     let bootstrap = get_json(app.clone(), "/bootstrap").await;
-    assert_eq!(bootstrap["runtime_read_model"], runtime_read_model);
+    assert_eq!(bootstrap["runtimeReadModel"], runtime_read_model);
 
-    let second_mission = bootstrap["runtime_read_model"]["details"]["missions"]
+    let second_mission = bootstrap["runtimeReadModel"]["details"]["missions"]
         .as_array()
         .expect("bootstrap missions should be an array")
         .iter()
@@ -724,6 +755,15 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         .workspace_id
         .clone()
         .expect("seed execution ownership should include workspace");
+    let recovery_task_id = ownership
+        .task_id
+        .clone()
+        .expect("seed execution ownership should include task");
+    state
+        .task_store()
+        .expect("task store should be configured")
+        .update_status(&recovery_task_id, TaskStatus::Blocked)
+        .expect("seed task should become recoverable");
     let snapshot = state.workspace_registry.append_execution_snapshot(
         workspace_id.clone(),
         ownership.clone(),
@@ -763,14 +803,14 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
     let expected_extraction_id = "extract-recovery-recovery-bootstrap-route";
     let after_resume_read_model = get_json(app.clone(), "/runtime/read-model").await;
     let after_resume_bootstrap = get_json(app.clone(), "/bootstrap").await;
-    assert_eq!(after_resume_bootstrap["runtime_read_model"], after_resume_read_model);
-    let recovery_summary = after_resume_bootstrap["runtime_read_model"]["recovery"]["summaries"]
+    assert_eq!(after_resume_bootstrap["runtimeReadModel"], after_resume_read_model);
+    let recovery_summary = after_resume_bootstrap["runtimeReadModel"]["recovery"]["summaries"]
         .as_array()
         .expect("bootstrap recovery summaries should be an array")
         .iter()
         .find(|entry| entry["recovery_id"] == "recovery-bootstrap-route")
         .expect("bootstrap recovery summary should exist");
-    assert_eq!(recovery_summary["current_status"], "mission_resumed");
+    assert_eq!(recovery_summary["current_status"], "worker_resumed");
     assert_eq!(
         recovery_summary["diagnostic_summary"],
         "resume bootstrap route followup"
@@ -800,9 +840,9 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
     let followup_mission_id = format!("mission-session-action-{followup_accepted_at}");
     let runtime_read_model = get_json(app.clone(), "/runtime/read-model").await;
     let bootstrap = get_json(app.clone(), "/bootstrap").await;
-    assert_eq!(bootstrap["runtime_read_model"], runtime_read_model);
+    assert_eq!(bootstrap["runtimeReadModel"], runtime_read_model);
 
-    let followup_mission = bootstrap["runtime_read_model"]["details"]["missions"]
+    let followup_mission = bootstrap["runtimeReadModel"]["details"]["missions"]
         .as_array()
         .expect("bootstrap missions should be an array")
         .iter()
@@ -902,7 +942,7 @@ fn runtime_maintenance_tick_can_refresh_ledger_and_flush_due_sidecars() {
     let _ = event_bus.publish(EventEnvelope::usage(
         EventId::new("usage-maintenance"),
         "tool.used",
-        serde_json::json!({ "tool_name": "shell.exec", "status": "Succeeded" }),
+        serde_json::json!({ "tool_name": "shell_exec", "status": "Succeeded" }),
     ));
     assert!(event_bus.runtime_ledger_summary().pending_flush);
     event_bus.set_audit_usage_ledger_persistence(valid_ledger_path);
@@ -979,7 +1019,7 @@ fn runtime_maintenance_policy_can_skip_disabled_actions() {
     let _ = event_bus.publish(EventEnvelope::usage(
         EventId::new("usage-disabled"),
         "tool.used",
-        serde_json::json!({ "tool_name": "shell.exec", "status": "Succeeded" }),
+        serde_json::json!({ "tool_name": "shell_exec", "status": "Succeeded" }),
     ));
     let maintenance = ShadowRuntimeMaintenance::new(
         ShadowRuntimeMaintenanceConfig {
@@ -1040,7 +1080,7 @@ fn runtime_maintenance_reports_failed_ledger_refresh_when_persistence_is_blocked
     let _ = event_bus.publish(EventEnvelope::usage(
         EventId::new("usage-failed"),
         "tool.used",
-        serde_json::json!({ "tool_name": "shell.exec", "status": "Succeeded" }),
+        serde_json::json!({ "tool_name": "shell_exec", "status": "Succeeded" }),
     ));
 
     let maintenance = ShadowRuntimeMaintenance::new(
@@ -1489,7 +1529,7 @@ fn persistence_long_chain_maintenance_tick_drives_full_restart_recovery_cycle() 
     let _ = event_bus.publish(EventEnvelope::usage(
         EventId::new("usage-mlc"),
         "tool.used",
-        serde_json::json!({ "tool_name": "shell.exec", "status": "Succeeded" }),
+        serde_json::json!({ "tool_name": "shell_exec", "status": "Succeeded" }),
     ));
     event_bus.set_audit_usage_ledger_persistence(repository.audit_usage_ledger_path());
 
@@ -1617,7 +1657,7 @@ fn graceful_shutdown_marks_runtime_status_complete_after_final_tick() {
     let _ = event_bus.publish(EventEnvelope::usage(
         EventId::new("usage-shutdown"),
         "tool.used",
-        serde_json::json!({ "tool_name": "shell.exec", "status": "Succeeded" }),
+        serde_json::json!({ "tool_name": "shell_exec", "status": "Succeeded" }),
     ));
     event_bus.set_audit_usage_ledger_persistence(repository.audit_usage_ledger_path());
 
@@ -1748,48 +1788,6 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
 }
 
 #[tokio::test]
-async fn web_send_message_endpoint_creates_task_and_returns_response() {
-    let state_root = temp_state_root("e2e-web-send-message");
-    let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-    let runtime = ShadowDaemonRuntime::restore(&config)
-        .expect("runtime restore should bootstrap empty state");
-    let (app, _state) = runtime.router_with_state_for_tests("shadow-test".to_string());
-
-    let (status, body) = post_json(
-        app.clone(),
-        "/api/messages/send",
-        json!({
-            "text": "web message test",
-            "deepTask": true,
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "web send should succeed: {body:?}");
-    assert!(body["sessionId"].is_string(), "response should include sessionId");
-    assert!(body["entryId"].is_string(), "response should include entryId");
-    assert!(body["rootTaskId"].is_string(), "response should include rootTaskId");
-    assert!(body["response"].is_string(), "response should include LLM response");
-
-    let session_id = body["sessionId"].as_str().unwrap();
-    let messages = get_json(
-        app,
-        &format!("/api/messages?session_id={session_id}"),
-    )
-    .await;
-    let msg_list = messages["messages"]
-        .as_array()
-        .expect("messages should be an array");
-    assert!(
-        msg_list.iter().any(|m| m["role"] == "user"),
-        "timeline should contain user message after web send"
-    );
-    assert!(
-        msg_list.iter().any(|m| m["role"] == "assistant"),
-        "timeline should contain assistant message after web send"
-    );
-}
-
-#[tokio::test]
 async fn session_action_publishes_domain_event_on_event_bus() {
     let state_root = temp_state_root("e2e-session-action-events");
     let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
@@ -1888,7 +1886,7 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
     let second_mission_id = format!("mission-session-action-{second_accepted_at}");
 
     let bootstrap = get_json(app, "/bootstrap").await;
-    let missions = bootstrap["runtime_read_model"]["details"]["missions"]
+    let missions = bootstrap["runtimeReadModel"]["details"]["missions"]
         .as_array()
         .expect("missions should be an array");
     assert!(

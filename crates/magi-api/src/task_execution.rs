@@ -13,12 +13,12 @@ use magi_bridge_client::{
 };
 use magi_core::{
     ApprovalRequirement, EventId, ExecutionOwnership, LeaseId, RiskLevel, SessionId,
-    TaskId, TaskStatus, ToolCallId, UtcMillis, WorkerId, WorkspaceId,
+    TaskExecutionTarget, TaskId, TaskStatus, ToolCallId, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::ToolKind;
 use magi_orchestrator::{
-    DispatchDecision, ExecutionWritebackPlans, MissionContextSummary, RecoveryExecutionResult,
+    ExecutionWritebackPlans, MissionContextSummary, RecoveryExecutionResult,
     task_runner::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult, WorkerInfo},
 };
 use magi_session_store::SessionStore;
@@ -29,7 +29,7 @@ use std::sync::{Arc, RwLock};
 #[derive(Clone, Debug)]
 pub enum ShadowTaskExecutionPlan {
     Dispatch {
-        dispatch: DispatchDecision,
+        target: TaskExecutionTarget,
         worker_id: WorkerId,
         session_id: SessionId,
         workspace_id: Option<WorkspaceId>,
@@ -375,7 +375,7 @@ impl ShadowTaskDispatcher {
                 clues: ExecutionContextClues {
                     mission: Some(task.title.clone()),
                     assignment: None,
-                    todo: Some(task.goal.clone()),
+                    task: Some(task.goal.clone()),
                 },
                 budget: ContextBudget {
                     max_turns: 3,
@@ -692,7 +692,7 @@ impl TaskDispatcher for ShadowTaskDispatcher {
 
         match plan {
             ShadowTaskExecutionPlan::Dispatch {
-                dispatch: _,
+                target: _,
                 worker_id: _,
                 session_id,
                 workspace_id,
@@ -906,25 +906,25 @@ pub fn take_recovery_resume_result(
 
 fn builtin_tool_description(name: &str) -> String {
     match name {
-        "file.read" => "Read the contents of a file at a given path".to_string(),
-        "search.text" => "Search for text patterns in files within a directory".to_string(),
-        "shell.exec" => "Execute a shell command and return stdout/stderr".to_string(),
-        "process.inspect" => "Inspect running processes by PID or name".to_string(),
-        "diff.preview" => "Generate a unified diff between two text inputs".to_string(),
+        "file_read" => "Read the contents of a file at a given path".to_string(),
+        "search_text" => "Search for text patterns in files within a directory".to_string(),
+        "shell_exec" => "Execute a shell command and return stdout/stderr".to_string(),
+        "process_inspect" => "Inspect running processes by PID or name".to_string(),
+        "diff_preview" => "Generate a unified diff between two text inputs".to_string(),
         _ => format!("Builtin tool: {name}"),
     }
 }
 
 fn builtin_tool_parameters(name: &str) -> serde_json::Value {
     match name {
-        "file.read" => serde_json::json!({
+        "file_read" => serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Absolute path to the file to read" }
             },
             "required": ["path"]
         }),
-        "search.text" => serde_json::json!({
+        "search_text" => serde_json::json!({
             "type": "object",
             "properties": {
                 "root": { "type": "string", "description": "Root directory to search in" },
@@ -933,7 +933,7 @@ fn builtin_tool_parameters(name: &str) -> serde_json::Value {
             },
             "required": ["root", "query"]
         }),
-        "shell.exec" => serde_json::json!({
+        "shell_exec" => serde_json::json!({
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "Shell command to execute" },
@@ -941,14 +941,14 @@ fn builtin_tool_parameters(name: &str) -> serde_json::Value {
             },
             "required": ["command"]
         }),
-        "process.inspect" => serde_json::json!({
+        "process_inspect" => serde_json::json!({
             "type": "object",
             "properties": {
                 "pid": { "type": "string", "description": "Process ID or name to inspect" }
             },
             "required": ["pid"]
         }),
-        "diff.preview" => serde_json::json!({
+        "diff_preview" => serde_json::json!({
             "type": "object",
             "properties": {
                 "before": { "type": "string", "description": "Original text" },

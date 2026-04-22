@@ -4,19 +4,17 @@ use axum::{
     Json, Router,
 };
 use magi_core::{EventId, TaskId, TaskStatus, UtcMillis};
-use magi_event_bus::{EventContext, EventEnvelope};
+use magi_event_bus::EventEnvelope;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
     errors::ApiError,
-    routes::execute_task_execute_submission,
     state::ApiState,
 };
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
-        .route("/task/execute", post(execute_task))
         .route("/task/append", post(append_task))
         .route("/task/start", post(start_task))
         .route("/task/resume", post(resume_task))
@@ -30,61 +28,6 @@ pub fn routes() -> Router<ApiState> {
         .route("/interaction/clarification", post(interaction_clarification))
         .route("/interaction/worker-question", post(worker_question))
         .route("/chain/abandon", post(abandon_chain))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ExecuteTaskRequest {
-    prompt: String,
-    #[allow(dead_code)]
-    request_id: Option<String>,
-}
-
-/// 执行任务：通过 shadow execution pipeline 将请求转发给 orchestrator
-///
-/// 如果 shadow execution pipeline 未配置，返回错误而非假数据。
-/// 执行完成后自动启动 Runner 处理任务图。
-async fn execute_task(
-    State(state): State<ApiState>,
-    Json(request): Json<ExecuteTaskRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let accepted = execute_task_execute_submission(&state, &request.prompt)?;
-
-    // 发布事件
-    let event_id = EventId::new(format!("event-task-execute-{}", accepted.accepted_at.0));
-    let event = EventEnvelope::domain(
-        event_id.clone(),
-        "task.execute.accepted",
-        json!({
-            "session_id": accepted.session_id.to_string(),
-            "entry_id": accepted.entry_id,
-            "text": request.prompt.trim(),
-            "created_session": accepted.created_session,
-            "root_task_id": accepted.root_task_id.to_string(),
-            "action_task_id": accepted.action_task_id.to_string(),
-            "runner_started": accepted.runner_started,
-        }),
-    )
-    .with_context(EventContext {
-        session_id: Some(accepted.session_id.clone()),
-        ..EventContext::default()
-    });
-    state
-        .event_bus
-        .publish(event)
-        .map_err(|err| ApiError::event_publish_failed("事件发布失败", err))?;
-
-    Ok(Json(json!({
-        "taskId": accepted.action_task_id.to_string(),
-        "rootTaskId": accepted.root_task_id.to_string(),
-        "sessionId": accepted.session_id.to_string(),
-        "entryId": accepted.entry_id,
-        "eventId": event_id.to_string(),
-        "acceptedAt": accepted.accepted_at.0,
-        "status": "submitted",
-        "createdSession": accepted.created_session,
-        "runnerStarted": accepted.runner_started,
-    })))
 }
 
 #[derive(Debug, Deserialize)]

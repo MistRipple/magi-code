@@ -10,13 +10,14 @@ mod tasks_runner;
 mod workspaces;
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     routing::{get, post},
     Json, Router,
 };
 use magi_core::{EventId, SessionId, UtcMillis};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::TimelineEntryKind;
+use serde::Deserialize;
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -52,7 +53,6 @@ pub(super) struct SessionActionAccepted {
     accepted_at: UtcMillis,
     created_session: bool,
     root_task_id: magi_core::TaskId,
-    action_task_id: magi_core::TaskId,
     runner_started: bool,
 }
 
@@ -89,8 +89,30 @@ async fn health(State(state): State<ApiState>) -> Json<HealthDto> {
     Json(state.health_dto())
 }
 
-async fn bootstrap(State(state): State<ApiState>) -> Result<Json<BootstrapDto>, ApiError> {
-    Ok(Json(state.bootstrap_dto()))
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BootstrapQuery {
+    session_id: Option<String>,
+}
+
+impl BootstrapQuery {
+    fn requested_session_id(&self) -> Option<SessionId> {
+        self.session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|session_id| !session_id.is_empty())
+            .map(SessionId::new)
+    }
+}
+
+async fn bootstrap(
+    State(state): State<ApiState>,
+    Query(query): Query<BootstrapQuery>,
+) -> Result<Json<BootstrapDto>, ApiError> {
+    let requested_session_id = query.requested_session_id();
+    Ok(Json(
+        state.bootstrap_dto_for_session(requested_session_id.as_ref()),
+    ))
 }
 
 async fn runtime_read_model(State(state): State<ApiState>) -> Json<RuntimeReadModelDto> {
@@ -207,19 +229,19 @@ pub(super) fn execute_recovery_resume(
             "snapshot_id": result.recovery_input.snapshot_id.clone(),
             "session_id": result.recovery_input.ownership.session_id.clone(),
             "workspace_id": result.recovery_input.ownership.workspace_id.clone(),
-            "mission_id": result.decision.mission_id.clone(),
-            "assignment_id": result.decision.assignment_id.clone(),
-            "task_id": result.decision.task_id.clone(),
-            "worker_id": result.decision.worker_id.clone(),
+            "mission_id": result.target.mission_id.clone(),
+            "assignment_id": result.assignment_id.clone(),
+            "task_id": result.target.task_id.clone(),
+            "worker_id": result.target.requested_worker_id.clone(),
             "memory_writeback_applied": memory_writeback_applied,
         }),
     )
     .with_context(EventContext {
         session_id: result.recovery_input.ownership.session_id.clone(),
         workspace_id: result.recovery_input.ownership.workspace_id.clone(),
-        mission_id: Some(result.decision.mission_id.clone()),
-        assignment_id: Some(result.decision.assignment_id.clone()),
-        task_id: Some(result.decision.task_id.clone()),
+        mission_id: Some(result.target.mission_id.clone()),
+        assignment_id: result.assignment_id.clone(),
+        task_id: Some(result.target.task_id.clone()),
     });
     state
         .event_bus
@@ -232,28 +254,6 @@ pub(super) fn execute_recovery_resume(
         resumed_at,
         memory_writeback_applied,
     ))
-}
-
-pub(super) fn execute_task_execute_submission(
-    state: &ApiState,
-    prompt: &str,
-) -> Result<SessionActionAccepted, ApiError> {
-    let trimmed_text = trim_non_empty(Some(prompt));
-    let message = format_dispatch_message(trimmed_text.as_deref(), true);
-    let mission_title = trimmed_text
-        .clone()
-        .unwrap_or_else(|| fallback_session_title(trimmed_text.as_deref()));
-
-    execute_dispatch_submission(
-        state,
-        None,
-        mission_title,
-        message,
-        trimmed_text,
-        true,
-        None,
-        None,
-    )
 }
 
 fn execute_dispatch_submission(
@@ -292,7 +292,6 @@ fn execute_dispatch_submission(
         accepted_at: accepted.accepted_at,
         created_session: accepted.created_session,
         root_task_id: accepted.root_task_id,
-        action_task_id: accepted.action_task_id,
         runner_started: accepted.runner_started,
     })
 }
@@ -379,36 +378,6 @@ fn append_dispatch_assistant_message(state: &ApiState, accepted: &DispatchSubmis
             ..EventContext::default()
         }),
     );
-}
-
-fn trim_non_empty(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string)
-}
-
-fn fallback_session_title(trimmed_text: Option<&str>) -> String {
-    trimmed_text
-        .filter(|value| !value.is_empty())
-        .map(|value| value.chars().take(32).collect::<String>())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "新会话".to_string())
-}
-
-fn format_dispatch_message(trimmed_text: Option<&str>, deep_task: bool) -> String {
-    let mut lines = Vec::new();
-    if let Some(text) = trimmed_text {
-        lines.push(text.to_string());
-    }
-    if deep_task {
-        lines.push("[深度任务]".to_string());
-    }
-    if lines.is_empty() {
-        "[空输入]".to_string()
-    } else {
-        lines.join("\n")
-    }
 }
 
 async fn stream_events(State(state): State<ApiState>) -> impl axum::response::IntoResponse {
@@ -549,6 +518,7 @@ mod tests {
         let worker_runtime = worker_runtime_factory(Arc::clone(&event_bus));
         let context_runtime = ContextRuntime::new(knowledge_store, memory_store.clone());
         let context_runtime_for_dispatcher = Arc::new(context_runtime.clone());
+        let task_store = Arc::new(TaskStore::new());
         let execution_runtime = orchestrator
             .execution_runtime_with_recovery_support(
                 worker_runtime,
@@ -557,6 +527,7 @@ mod tests {
                 Arc::clone(&session_store),
                 Arc::clone(&workspace_store),
             )
+            .with_task_store(Arc::clone(&task_store))
             .with_context_runtime(
                 context_runtime,
                 ExecutionContextConfig {
@@ -571,7 +542,6 @@ mod tests {
                 },
             );
 
-        let task_store = Arc::new(TaskStore::new());
         let mut state = ApiState::new(
             "magi",
             event_bus.clone(),
@@ -675,10 +645,10 @@ mod tests {
         let bridge_services = get_json(app.clone(), "/bridges/services").await;
         let bridge_preflight = get_json(app, "/bridges/preflight").await;
 
-        assert_eq!(bootstrap["runtime_read_model"], runtime_read_model);
-        assert_eq!(bootstrap["audit_usage_ledger"], ledger);
-        assert_eq!(bootstrap["bridge_services"], bridge_services);
-        assert_eq!(bootstrap["bridge_preflight"], bridge_preflight);
+        assert_eq!(bootstrap["runtimeReadModel"], runtime_read_model);
+        assert_eq!(bootstrap["auditUsageLedger"], ledger);
+        assert_eq!(bootstrap["bridgeServices"], bridge_services);
+        assert_eq!(bootstrap["bridgePreflight"], bridge_preflight);
     }
 
     #[tokio::test]
@@ -935,6 +905,14 @@ mod tests {
             .as_ref()
             .map(ToString::to_string)
             .expect("seed dispatch should bind worker");
+        let task_store = state.task_store().expect("task store should be configured");
+        let recovery_task_id = ownership
+            .task_id
+            .clone()
+            .expect("seed dispatch should bind task");
+        task_store
+            .update_status(&recovery_task_id, TaskStatus::Blocked)
+            .expect("seed task should become recoverable");
         let snapshot = state.workspace_registry.append_execution_snapshot(
             workspace_id.clone(),
             ownership.clone(),
@@ -1037,6 +1015,14 @@ mod tests {
             .workspace_id
             .clone()
             .expect("seed dispatch should bind workspace");
+        let task_store = state.task_store().expect("task store should be configured");
+        let recovery_task_id = ownership
+            .task_id
+            .clone()
+            .expect("seed dispatch should bind task");
+        task_store
+            .update_status(&recovery_task_id, TaskStatus::Blocked)
+            .expect("seed task should become recoverable");
         let snapshot = state.workspace_registry.append_execution_snapshot(
             workspace_id.clone(),
             ownership.clone(),
@@ -2296,158 +2282,6 @@ mod tests {
         assert_eq!(
             snapshot["services"][0]["mcp_default_route_gate"]["contract_ok"],
             false
-        );
-    }
-
-    // ─── /api/task/execute calling-party-level verification tests ───
-
-    #[tokio::test]
-    async fn task_execute_route_drives_shadow_dispatch_and_updates_runtime_read_model() {
-        let state = test_state_with_shadow_execution_pipeline();
-        let app = build_router(state.clone());
-
-        let (status, body) = post_json(
-            app,
-            "/api/task/execute",
-            json!({
-                "prompt": "refresh parser route session action",
-                "requestId": "test-req",
-            }),
-        )
-        .await;
-
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "unexpected response body: {body:?}"
-        );
-        assert_eq!(body["status"], "submitted");
-        assert!(
-            body["sessionId"]
-                .as_str()
-                .expect("sessionId should serialize as string")
-                .len()
-                > 0,
-            "sessionId should be non-empty: {body:?}"
-        );
-        assert!(
-            body["entryId"]
-                .as_str()
-                .expect("entryId should serialize as string")
-                .len()
-                > 0,
-            "entryId should be non-empty: {body:?}"
-        );
-
-        let accepted_at = body["acceptedAt"]
-            .as_u64()
-            .expect("acceptedAt should serialize as integer");
-        let root_task_id = TaskId::new(
-            body["rootTaskId"]
-                .as_str()
-                .expect("rootTaskId should serialize as string"),
-        );
-
-        // Verify runtime read-model reflects the new mission/assignment
-        let mission_id = format!("mission-session-action-{accepted_at}");
-        let read_model = state.runtime_read_model_dto();
-        assert_eq!(read_model.details.missions.len(), 1);
-        let mission_entry = read_model
-            .details
-            .missions
-            .iter()
-            .find(|entry| entry.mission_id == mission_id)
-            .expect("mission entry should exist in runtime read-model");
-        assert_eq!(mission_entry.context_used_knowledge_count, 1);
-        let task_store = state.task_store().expect("task store should be configured");
-        let root_task = task_store
-            .get_task(&root_task_id)
-            .expect("root task should exist in task store");
-        assert_eq!(root_task.status, TaskStatus::Completed);
-        let child_tasks = task_store.get_children(&root_task_id);
-        assert_eq!(child_tasks.len(), 1);
-        assert_eq!(child_tasks[0].status, TaskStatus::Completed);
-
-        // Verify memory extraction was persisted
-        let extraction_id = format!("extract-session-action-{accepted_at}");
-        let verification = state
-            .shadow_execution_pipeline()
-            .expect("shadow execution pipeline should exist")
-            .memory_store
-            .verify_extraction_linkage(&extraction_id)
-            .expect("task execute extraction should be persisted");
-        assert!(verification.is_consistent);
-
-        // Verify ownership was bound
-        let session_id_str = body["sessionId"]
-            .as_str()
-            .expect("sessionId should serialize as string");
-        let ownership = state
-            .session_store
-            .execution_ownership(&SessionId::new(session_id_str))
-            .expect("session ownership should be bound after task execute");
-        assert!(ownership.mission_id.is_some());
-        assert!(ownership.task_id.is_some());
-        assert!(ownership.worker_id.is_some());
-    }
-
-    #[tokio::test]
-    async fn task_execute_route_does_not_write_extraction_when_dispatch_fails() {
-        let state = test_state_with_unhealthy_shadow_execution_pipeline();
-        let app = build_router(state.clone());
-
-        let (status, body) = post_json(
-            app,
-            "/api/task/execute",
-            json!({
-                "prompt": "test prompt failure",
-                "requestId": "test-req-fail",
-            }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK, "dispatch failure should still accept the task: {body:?}");
-        assert!(body["sessionId"].is_string());
-        assert!(body["rootTaskId"].is_string());
-        let extraction_history = state
-            .shadow_execution_pipeline()
-            .expect("shadow execution pipeline should exist")
-            .memory_store
-            .extraction_results_for_session(&SessionId::new("session-route-shadow"));
-        assert!(extraction_history.is_empty());
-
-        // Verify ownership was NOT polluted
-        let ownership = state
-            .session_store
-            .execution_ownership(&SessionId::new("session-route-shadow"))
-            .expect("base session ownership should remain present");
-        assert!(ownership.mission_id.is_none());
-        assert!(ownership.task_id.is_none());
-        assert!(ownership.worker_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn task_execute_route_returns_error_when_pipeline_not_configured() {
-        let app = build_router(test_state());
-
-        let (status, body) = post_json(
-            app,
-            "/api/task/execute",
-            json!({
-                "prompt": "test prompt no pipeline",
-                "requestId": "test-req-no-pipeline",
-            }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body["error_code"], "INTERNAL_ASSEMBLY_ERROR");
-        assert!(
-            body["message"]
-                .as_str()
-                .expect("message should serialize as string")
-                .contains("shadow execution pipeline 未配置"),
-            "error message should indicate pipeline not configured: {body:?}"
         );
     }
 

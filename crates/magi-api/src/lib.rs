@@ -7,6 +7,7 @@ pub mod skill_loader;
 mod shadow_execution;
 mod sse;
 mod state;
+pub mod tunnel;
 
 pub use errors::{ApiError, ErrorResponseDto};
 pub use routes::build_router;

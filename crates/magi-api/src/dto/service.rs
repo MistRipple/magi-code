@@ -1,12 +1,14 @@
 use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServiceInfo {
     pub service_name: String,
     pub api_version: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HealthDto {
     pub status: String,
     pub service_name: String,
@@ -24,6 +26,7 @@ impl HealthDto {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VersionHandshakeDto {
     pub api_version: String,
     pub min_supported_ui_version: String,

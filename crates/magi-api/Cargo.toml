@@ -25,6 +25,7 @@ magi-tool-runtime = { path = "../magi-tool-runtime" }
 magi-workspace = { path = "../magi-workspace" }
 magi-skill-runtime = { version = "0.1.0", path = "../magi-skill-runtime" }
 magi-worker-runtime = { path = "../magi-worker-runtime" }
+dirs = "6"
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }

@@ -57,16 +57,6 @@ impl SessionActionRequestDto {
         }
     }
 
-    pub fn from_web_message(text: String, session_id: Option<String>, deep_task: bool) -> Self {
-        Self {
-            session_id,
-            text: Some(text),
-            deep_task,
-            skill_name: None,
-            images: Vec::new(),
-        }
-    }
-
 }
 
 #[derive(Clone, Debug, Serialize)]

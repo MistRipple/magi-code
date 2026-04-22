@@ -1,15 +1,13 @@
 
 use magi_bridge_client::ModelInvocationRequest;
 use magi_core::{
-    AssignmentId, DomainError, ExecutionOwnership, ExecutorBinding, MissionId, Task,
-    TaskId, TaskKind, TaskStatus, UtcMillis, WorkerId,
+    DomainError, ExecutionOwnership, ExecutorBinding, MissionId, Task, TaskExecutionTarget, TaskId,
+    TaskKind, TaskStatus, UtcMillis, WorkerId,
 };
 #[cfg(test)]
 use magi_core::SessionId;
 use magi_event_bus::{EventContext, task_events};
-use magi_orchestrator::{
-    ExecutionWritebackPlans, OrchestratorCommand, OrchestratorCommandResult,
-};
+use magi_orchestrator::ExecutionWritebackPlans;
 
 use crate::{
     dto::RecoveryResumeRequestDto,
@@ -30,7 +28,7 @@ pub(crate) fn run_shadow_dispatch_submission(
     state: &ApiState,
     request: &DispatchSubmissionRequest,
 ) -> Result<ShadowTaskGraphSubmission, ApiError> {
-    let pipeline = state.shadow_execution_pipeline().ok_or_else(|| {
+    let _ = state.shadow_execution_pipeline().ok_or_else(|| {
         ApiError::internal_assembly("执行 shadow dispatch 失败", "shadow execution pipeline 未配置")
     })?;
     let task_store = state
@@ -43,42 +41,7 @@ pub(crate) fn run_shadow_dispatch_submission(
     let trimmed_text = request.trimmed_text.as_deref();
 
     let mission_id = MissionId::new(format!("mission-session-action-{}", accepted_at.0));
-    let assignment_id = AssignmentId::new(format!("assignment-session-action-{}", accepted_at.0));
-    let task_id = TaskId::new(format!("task-session-action-{}", accepted_at.0));
     let worker_id = WorkerId::new(format!("worker-session-action-{}", accepted_at.0));
-
-    let control = pipeline.orchestrator.control_plane();
-    control
-        .execute(OrchestratorCommand::CreateMission {
-            mission_id: mission_id.clone(),
-            title: request.mission_title.clone(),
-        })
-        .map_err(|error| {
-            ApiError::internal_assembly("创建 shadow mission 失败", format!("{error:?}"))
-        })?;
-    control
-        .execute(OrchestratorCommand::AddAssignment {
-            mission_id: mission_id.clone(),
-            assignment_id: assignment_id.clone(),
-            title: request
-                .skill_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| format!("skill/{value}"))
-                .unwrap_or_else(|| "session.action".to_string()),
-        })
-        .map_err(|error| {
-            ApiError::internal_assembly("创建 shadow assignment 失败", format!("{error:?}"))
-        })?;
-    control
-        .execute(OrchestratorCommand::CreateTask {
-            mission_id: mission_id.clone(),
-            assignment_id: assignment_id.clone(),
-            task_id: task_id.clone(),
-            title: request.task_title.clone(),
-        })
-        .map_err(|error| ApiError::internal_assembly("创建 shadow task 失败", format!("{error:?}")))?;
 
     let obj_task_id = TaskId::new(format!("task-obj-{}", accepted_at.0));
     let act_task_id = TaskId::new(format!("task-act-{}", accepted_at.0));
@@ -105,7 +68,7 @@ pub(crate) fn run_shadow_dispatch_submission(
         obj_task_id.clone(),
         Some(obj_task_id.clone()),
         TaskKind::Action,
-        request.mission_title.clone(),
+        request.task_title.clone(),
         action_goal,
         TaskStatus::Ready,
         now,
@@ -155,40 +118,32 @@ pub(crate) fn run_shadow_dispatch_submission(
     });
     let _ = state.event_bus.publish(event);
 
-    let dispatch = match control
-        .execute(OrchestratorCommand::DispatchNextTask {
-            mission_id: mission_id.clone(),
-        })
-        .map_err(|error| {
-            ApiError::internal_assembly("创建 shadow dispatch 失败", format!("{error:?}"))
-        })? {
-        OrchestratorCommandResult::TaskDispatchPlanned { decision } => decision,
-        other => {
-            return Err(ApiError::internal_assembly(
-                "创建 shadow dispatch 失败",
-                format!("unexpected result: {other:?}"),
-            ));
-        }
-    };
-
     let workspace_id = state
         .session_store
         .execution_ownership(session_id)
         .and_then(|ownership| ownership.workspace_id)
         .or_else(|| state.workspace_registry.active_workspace_id());
+    let execution_chain_ref = Some(format!("session-action-chain-{}", accepted_at.0));
     let ownership = ExecutionOwnership {
         session_id: Some(session_id.clone()),
         workspace_id: workspace_id.clone(),
         mission_id: Some(mission_id.clone()),
-        task_id: Some(task_id),
+        task_id: Some(act_task_id.clone()),
         worker_id: Some(worker_id.clone()),
-        execution_chain_ref: Some(format!("session-action-chain-{}", accepted_at.0)),
+        execution_chain_ref: execution_chain_ref.clone(),
         ..ExecutionOwnership::default()
     };
     state.shadow_task_execution_registry().insert(
         act_task_id.clone(),
         ShadowTaskExecutionPlan::Dispatch {
-            dispatch: dispatch.clone(),
+            target: TaskExecutionTarget {
+                mission_id: mission_id.clone(),
+                root_task_id: obj_task_id.clone(),
+                task_id: act_task_id.clone(),
+                requested_worker_id: Some(worker_id.clone()),
+                recovery_id: None,
+                execution_chain_ref: execution_chain_ref.clone(),
+            },
             worker_id: worker_id.clone(),
             session_id: session_id.clone(),
             workspace_id: workspace_id.clone(),
@@ -215,12 +170,20 @@ pub(crate) fn run_shadow_dispatch_submission(
             mission_id: Some(mission_id.clone()),
             task_id: Some(TaskId::new(sub_task_id.as_str())),
             worker_id: Some(worker_id.clone()),
+            execution_chain_ref: execution_chain_ref.clone(),
             ..ExecutionOwnership::default()
         };
         state.shadow_task_execution_registry().insert(
             sub_task_id.clone(),
             ShadowTaskExecutionPlan::Dispatch {
-                dispatch: dispatch.clone(),
+                target: TaskExecutionTarget {
+                    mission_id: mission_id.clone(),
+                    root_task_id: obj_task_id.clone(),
+                    task_id: TaskId::new(sub_task_id.as_str()),
+                    requested_worker_id: Some(worker_id.clone()),
+                    recovery_id: None,
+                    execution_chain_ref: execution_chain_ref.clone(),
+                },
                 worker_id: worker_id.clone(),
                 session_id: request.session_id.clone(),
                 workspace_id: workspace_id.clone(),
@@ -731,6 +694,7 @@ mod tests {
         let session_store = Arc::new(SessionStore::new());
         let workspace_store = Arc::new(WorkspaceStore::new());
         let memory_store = MemoryStore::new();
+        let task_store = Arc::new(TaskStore::new());
 
         let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
         tool_registry.register_default_builtins();
@@ -743,9 +707,8 @@ mod tests {
             ),
             Arc::clone(&session_store),
             Arc::clone(&workspace_store),
-        );
-
-        let task_store = Arc::new(TaskStore::new());
+        )
+        .with_task_store(Arc::clone(&task_store));
 
         let state = ApiState::new(
             "test-shadow-recovery",

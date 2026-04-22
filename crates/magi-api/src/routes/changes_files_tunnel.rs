@@ -228,9 +228,7 @@ async fn revert_mission_changes(
 #[serde(rename_all = "camelCase")]
 struct FileContentQuery {
     file_path: Option<String>,
-    #[allow(dead_code)]
     session_id: Option<String>,
-    #[allow(dead_code)]
     workspace_id: Option<String>,
 }
 
@@ -250,6 +248,7 @@ async fn get_file_content(
     Ok(Json(serde_json::json!({
         "content": content,
         "filePath": query.file_path,
+        "sessionId": query.session_id,
     })))
 }
 
@@ -257,7 +256,6 @@ async fn get_file_content(
 #[serde(rename_all = "camelCase")]
 struct FilesystemListQuery {
     path: Option<String>,
-    #[allow(dead_code)]
     workspace_id: Option<String>,
 }
 
@@ -301,45 +299,154 @@ async fn list_filesystem(
     Ok(Json(serde_json::json!({ "entries": entries })))
 }
 
-// ─── Tunnel (保持 stub) ─────────────────────────────────────────────────────
+// ─── Tunnel ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StartTunnelRequest {
+    workspace_id: Option<String>,
+}
 
 async fn start_tunnel(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
+    Json(request): Json<StartTunnelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    Err(ApiError::InvalidInput(
-        "当前运行模式未接入公网隧道能力".to_string(),
-    ))
+    let ws_id = request.workspace_id.as_deref();
+    let tunnel_state = state.tunnel_manager.start(ws_id).await;
+    Ok(Json(serde_json::to_value(&tunnel_state).unwrap_or_default()))
 }
 
 async fn stop_tunnel(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    Err(ApiError::InvalidInput(
-        "当前运行模式未接入公网隧道能力".to_string(),
-    ))
+    let tunnel_state = state.tunnel_manager.stop().await;
+    Ok(Json(serde_json::to_value(&tunnel_state).unwrap_or_default()))
 }
 
 async fn tunnel_status(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
 ) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "status": "unsupported",
-        "publicUrl": serde_json::Value::Null,
-        "accessUrl": serde_json::Value::Null,
-        "token": serde_json::Value::Null,
-        "error": "当前运行模式未接入公网隧道能力",
-    }))
+    let tunnel_state = state.tunnel_manager.get_state().await;
+    Json(serde_json::to_value(&tunnel_state).unwrap_or_default())
 }
 
 async fn lan_access_status(
     State(_state): State<ApiState>,
-    Query(_query): Query<std::collections::HashMap<String, String>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
+    let ip = resolve_preferred_lan_ipv4();
+    let port = 38123;
+
+    // 从 query 参数或 state 获取 workspaceId/sessionId，构造完整的 web 访问 URL
+    let workspace_id = query.get("workspaceId").cloned().unwrap_or_default();
+    let mut url = format!("http://{}:{}/web.html", ip, port);
+    if !workspace_id.is_empty() {
+        url = format!("{}?workspaceId={}", url, workspace_id);
+    }
+
     Json(serde_json::json!({
-        "enabled": false,
-        "url": serde_json::Value::Null,
-        "error": "当前运行模式未接入局域网访问面板能力",
+        "enabled": true,
+        "url": url,
+        "ip": ip,
+        "port": port,
     }))
+}
+
+/// 获取首选的局域网 IPv4 地址（遍历网卡接口 + 评分）
+fn resolve_preferred_lan_ipv4() -> String {
+    use std::process::Command;
+
+    // 通过 ifconfig (macOS/Linux) 获取所有 IPv4 地址
+    let output = Command::new("ifconfig")
+        .output()
+        .or_else(|_| Command::new("ip").args(["addr", "show"]).output());
+
+    let text = match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(_) => return fallback_udp_ip(),
+    };
+
+    let mut candidates: Vec<(String, i32)> = Vec::new();
+
+    // 解析 ifconfig 输出中的 inet 行
+    let mut current_iface = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // 新接口行（不以空白开头）
+        if !line.starts_with(' ') && !line.starts_with('\t') && line.contains(':') {
+            current_iface = line.split(':').next().unwrap_or("").trim().to_string();
+        }
+        // inet 地址行
+        if let Some(addr) = extract_ipv4_from_line(trimmed) {
+            if addr == "127.0.0.1" || addr == "0.0.0.0" {
+                continue;
+            }
+            let score = score_lan_candidate(&current_iface, &addr);
+            candidates.push((addr, score));
+        }
+    }
+
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.into_iter().next().map(|(ip, _)| ip).unwrap_or_else(fallback_udp_ip)
+}
+
+fn extract_ipv4_from_line(line: &str) -> Option<String> {
+    // 匹配 "inet 192.168.1.100" 或 "inet addr:192.168.1.100"
+    if !line.starts_with("inet ") && !line.contains("inet ") {
+        return None;
+    }
+    for part in line.split_whitespace() {
+        if part.contains('.') && part.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            let segments: Vec<&str> = part.split('.').collect();
+            if segments.len() == 4 && segments.iter().all(|s| s.parse::<u8>().is_ok()) {
+                return Some(part.to_string());
+            }
+        }
+        // "addr:x.x.x.x" 格式
+        if let Some(addr) = part.strip_prefix("addr:") {
+            let segments: Vec<&str> = addr.split('.').collect();
+            if segments.len() == 4 && segments.iter().all(|s| s.parse::<u8>().is_ok()) {
+                return Some(addr.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn score_lan_candidate(iface: &str, addr: &str) -> i32 {
+    let mut score = 0i32;
+    // 优先物理网卡
+    let iface_lower = iface.to_lowercase();
+    if iface_lower.starts_with("en") || iface_lower.starts_with("eth") || iface_lower.starts_with("wlan") || iface_lower.contains("wi-fi") {
+        score += 50;
+    }
+    // 排除虚拟网卡
+    if iface_lower.starts_with("bridge") || iface_lower.starts_with("docker") || iface_lower.starts_with("veth")
+        || iface_lower.starts_with("utun") || iface_lower.starts_with("tun") || iface_lower.starts_with("tap")
+        || iface_lower.starts_with("vmnet") || iface_lower.starts_with("lo") {
+        score -= 100;
+    }
+    // 优先常见私网段
+    if addr.starts_with("192.168.") { score += 30; }
+    else if addr.starts_with("10.") { score += 20; }
+    else if addr.starts_with("172.") { score += 10; } // 简化判断
+    else { score -= 20; }
+    score
+}
+
+fn fallback_udp_ip() -> String {
+    use std::net::UdpSocket;
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                let ip = addr.ip().to_string();
+                if ip != "0.0.0.0" && ip != "127.0.0.1" {
+                    return ip;
+                }
+            }
+        }
+    }
+    "127.0.0.1".to_string()
 }
 
 // ─── Prompt Enhance ─────────────────────────────────────────────────────────

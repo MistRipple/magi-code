@@ -43,8 +43,8 @@ impl RecoveryResumeResponseDto {
         memory_writeback_applied: bool,
     ) -> Self {
         let worker_id = result
-            .decision
-            .worker_id
+            .target
+            .requested_worker_id
             .clone()
             .or_else(|| result.recovery_input.ownership.worker_id.clone())
             .expect("recovery resume response requires worker id");
@@ -63,9 +63,13 @@ impl RecoveryResumeResponseDto {
                 .workspace_id
                 .as_ref()
                 .map(ToString::to_string),
-            mission_id: result.decision.mission_id.to_string(),
-            assignment_id: result.decision.assignment_id.to_string(),
-            task_id: result.decision.task_id.to_string(),
+            mission_id: result.target.mission_id.to_string(),
+            assignment_id: result
+                .assignment_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            task_id: result.target.task_id.to_string(),
             worker_id: worker_id.to_string(),
             event_id: event_id.to_string(),
             resumed_at,

@@ -1,5 +1,6 @@
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, process};
 
+use magi_agent::runtime_state::RuntimeStateManager;
 use magi_daemon::{Daemon, DaemonConfig};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
@@ -42,6 +43,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         read_env("MAGI_STATE_ROOT").unwrap_or_else(|| DEFAULT_STATE_ROOT.to_string()),
     );
 
+    let runtime_state_manager = RuntimeStateManager::new(state_root.join("agent"));
+    let pid = process::id();
+    runtime_state_manager.write_runtime_state(pid, Some(&host), port);
+    runtime_state_manager.write_pid(pid);
+
     let config = DaemonConfig::new(
         host,
         port,
@@ -49,6 +55,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state_root,
     );
     let daemon = Daemon::new(config);
-    daemon.run().await?;
+    let result = daemon.run().await;
+
+    runtime_state_manager.remove_runtime_state();
+    runtime_state_manager.remove_pid();
+
+    result?;
     Ok(())
 }

@@ -4,7 +4,8 @@ use axum::{
     Json, Router,
 };
 use magi_core::{DomainError, SessionId, UtcMillis};
-use serde::Deserialize;
+use magi_session_store::SessionRecord;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     dto::{BootstrapDto, SessionNotificationsResponseDto},
@@ -27,51 +28,71 @@ pub fn routes() -> Router<ApiState> {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct DeleteSessionRequest {
     session_id: String,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct CreateSessionRequest {
+    #[allow(dead_code)]
     workspace_id: Option<String>,
+    #[allow(dead_code)]
     workspace_path: Option<String>,
 }
 
 async fn create_session(
     State(state): State<ApiState>,
     Json(_request): Json<CreateSessionRequest>,
-) -> Result<Json<BootstrapDto>, ApiError> {
+) -> Result<Json<SessionSelectionResponseDto>, ApiError> {
     let session_id = SessionId::new(format!("session-{}", UtcMillis::now().0));
     state
         .session_store
         .create_session(session_id, "新会话")
         .map_err(|e| ApiError::internal_assembly("创建会话失败", e))?;
     state.persist_session_durable_state()?;
-    Ok(Json(state.bootstrap_dto()))
+    let current_session = state.session_store.current_session();
+    Ok(Json(SessionSelectionResponseDto {
+        session_id: current_session
+            .as_ref()
+            .map(|session| session.session_id.to_string())
+            .unwrap_or_default(),
+        current_session,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct SwitchSessionRequest {
     session_id: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionSelectionResponseDto {
+    session_id: String,
+    current_session: Option<SessionRecord>,
+}
+
 async fn switch_session(
     State(state): State<ApiState>,
     Json(request): Json<SwitchSessionRequest>,
-) -> Result<Json<BootstrapDto>, ApiError> {
+) -> Result<Json<SessionSelectionResponseDto>, ApiError> {
     let session_id = SessionId::new(&request.session_id);
     state
         .session_store
         .switch_session(&session_id)
         .map_err(|e| ApiError::internal_assembly("切换会话失败", e))?;
     state.persist_session_durable_state()?;
-    Ok(Json(state.bootstrap_dto()))
+    let current_session = state.session_store.current_session();
+    Ok(Json(SessionSelectionResponseDto {
+        session_id: current_session
+            .as_ref()
+            .map(|session| session.session_id.to_string())
+            .unwrap_or_default(),
+        current_session,
+    }))
 }
 
 async fn delete_session(
@@ -88,7 +109,6 @@ async fn delete_session(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct RenameSessionRequest {
     session_id: String,
@@ -109,7 +129,6 @@ async fn rename_session(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct CloseSessionRequest {
     session_id: String,
@@ -134,7 +153,6 @@ async fn save_session(State(state): State<ApiState>) -> Result<Json<BootstrapDto
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct NotificationsQuery {
     session_id: Option<String>,
@@ -155,7 +173,6 @@ async fn get_notifications(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct NotificationScopeRequest {
     session_id: Option<String>,
@@ -180,7 +197,6 @@ async fn mark_all_notifications_read(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct ClearNotificationsRequest {
     session_id: Option<String>,
@@ -205,7 +221,6 @@ async fn clear_notifications(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct RemoveNotificationRequest {
     session_id: Option<String>,

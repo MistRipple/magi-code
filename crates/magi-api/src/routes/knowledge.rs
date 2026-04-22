@@ -48,10 +48,11 @@ async fn clear_knowledge(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct KnowledgeListQuery {
+    #[allow(dead_code)]
     session_id: Option<String>,
+    #[allow(dead_code)]
     workspace_id: Option<String>,
 }
 
@@ -157,11 +158,12 @@ async fn list_faqs(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct SearchFaqsQuery {
     q: Option<String>,
+    #[allow(dead_code)]
     session_id: Option<String>,
+    #[allow(dead_code)]
     workspace_id: Option<String>,
 }
 
@@ -187,14 +189,12 @@ async fn search_faqs(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct AddAdrRequest {
     adr: AdrInput,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct AdrInput {
     title: String,
@@ -223,7 +223,6 @@ async fn add_adr(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct UpdateKnowledgeRequest {
     id: String,
@@ -231,7 +230,6 @@ struct UpdateKnowledgeRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct KnowledgeUpdates {
     title: Option<String>,
@@ -279,14 +277,12 @@ fn update_knowledge_record(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct AddFaqRequest {
     faq: FaqInput,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct FaqInput {
     title: String,
@@ -315,7 +311,6 @@ async fn add_faq(
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct DeleteKnowledgeRequest {
     id: String,
