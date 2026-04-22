@@ -875,6 +875,7 @@ dependencies = [
 name = "magi-daemon-app"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "magi-agent",
  "magi-daemon",
  "tokio",

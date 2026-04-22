@@ -1,6 +1,6 @@
 
 use crate::{
-    DispatchExecutionResult, ExecutionWritebackPlans, MissionContextSummary,
+    DispatchExecutionResult, ExecutionContextSummary, ExecutionWritebackPlans,
     OrchestratedExecutionRuntime, OrchestratorCommandError, RecoveryExecutionResult,
     default_builtin_skill_plan, execution_overview, recovery_planner, resolve_skill_tool_name,
 };
@@ -295,7 +295,7 @@ impl OrchestratedExecutionRuntime {
             input.ownership.workspace_id.clone(),
             skill_plan,
         )?;
-        let mission_snapshot = dispatch.overview.mission.clone();
+        let runtime_snapshot = dispatch.overview.runtime_snapshot.clone();
         Ok(RecoveryExecutionResult {
             recovery_input: input,
             resume_command,
@@ -304,7 +304,7 @@ impl OrchestratedExecutionRuntime {
             dispatch,
             session_sidecar,
             workspace_recovery,
-            mission_snapshot,
+            runtime_snapshot,
         })
     }
 
@@ -313,7 +313,7 @@ impl OrchestratedExecutionRuntime {
         target: &TaskExecutionTarget,
         session_id: &Option<SessionId>,
         workspace_id: &Option<WorkspaceId>,
-    ) -> Option<MissionContextSummary> {
+    ) -> Option<ExecutionContextSummary> {
         let context_runtime = self.context_runtime.as_ref()?;
         let context_config = self.context_config.as_ref()?;
         let session_id = session_id.clone()?;
@@ -332,7 +332,7 @@ impl OrchestratedExecutionRuntime {
             budget: context_config.budget.clone(),
         };
 
-        Some(MissionContextSummary::from_context_assembly(
+        Some(ExecutionContextSummary::from_context_assembly(
             &context_runtime.assemble_execution_context(&request),
         ))
     }
@@ -447,7 +447,9 @@ impl OrchestratedExecutionRuntime {
         let context_summary =
             self.build_context_summary_for_dispatch(&target, &session_id, &workspace_id);
         let overview = self
-            .build_execution_overview_with_context(
+            .service
+            .build_execution_overview_from_task_graph(
+                &self.task_store,
                 &target,
                 self.worker_runtime.summary(),
                 tool_summary,
@@ -575,36 +577,6 @@ impl OrchestratedExecutionRuntime {
         );
     }
 
-    fn build_execution_overview_with_context(
-        &self,
-        target: &TaskExecutionTarget,
-        worker_summary: magi_worker_runtime::WorkerRuntimeSummary,
-        tool_summary: ToolExecutionSummary,
-        skill_dispatch_observations: &[WorkerSkillDispatchObservation],
-        governance_observations: &[magi_worker_runtime::WorkerGovernanceObservation],
-        context_summary: Option<MissionContextSummary>,
-    ) -> Option<crate::MissionExecutionOverview> {
-        let overview = execution_overview::build_execution_overview_from_task_graph(
-            &self.task_store,
-            &target.root_task_id,
-            &target.mission_id,
-            worker_summary,
-            tool_summary,
-            skill_dispatch_observations,
-            governance_observations,
-            context_summary,
-        )?;
-        self.service.publish_with_category(
-            "mission.execution.overview",
-            EventCategory::Audit,
-            EventContext {
-                mission_id: Some(overview.mission.mission_id.clone()),
-                ..EventContext::default()
-            },
-            execution_overview::build_execution_overview_payload(&overview),
-        );
-        Some(overview)
-    }
 }
 
 fn tool_summary_from_worker_snapshot(snapshot: &TaskExecutionSnapshot) -> ToolExecutionSummary {

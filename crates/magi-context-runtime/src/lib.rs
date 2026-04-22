@@ -467,6 +467,7 @@ mod tests {
                 created_at: timestamp,
                 updated_at: timestamp,
                 message_count: None,
+                workspace_id: None,
             }],
             timeline: vec![TimelineEntry {
                 entry_id: "timeline-session-1".to_string(),
@@ -636,6 +637,7 @@ mod tests {
                 created_at: ts(1),
                 updated_at: ts(1),
                 message_count: None,
+                workspace_id: None,
             }],
             timeline: (1..=3)
                 .map(|i| TimelineEntry {
@@ -879,6 +881,7 @@ mod tests {
                 created_at: timestamp(1),
                 updated_at: timestamp(1),
                 message_count: None,
+                workspace_id: None,
             }],
             timeline: vec![TimelineEntry {
                 entry_id: "timeline-exec-1".to_string(),
@@ -1392,6 +1395,7 @@ mod tests {
                 created_at: ts(1),
                 updated_at: ts(1),
                 message_count: None,
+                workspace_id: None,
             }],
             timeline: vec![
                 TimelineEntry {

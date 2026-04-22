@@ -238,11 +238,11 @@ impl OrchestratorDecisionEngine {
         gate_state: &OrchestratorGateState,
         assistant_text: &str,
     ) -> OrchestratorTerminationReason {
-        let use_todo_track_guards = snapshot.required_total > 0;
+        let use_task_track_guards = snapshot.required_total > 0;
         let running_required = snapshot.running_required.unwrap_or(0);
 
         if snapshot.required_total > 0
-            && snapshot.progress_vector.terminal_required_todos >= snapshot.required_total
+            && snapshot.progress_vector.terminal_required_tasks >= snapshot.required_total
             && snapshot.running_or_pending_required == 0
         {
             return if snapshot.failed_required > 0 {
@@ -252,7 +252,7 @@ impl OrchestratorDecisionEngine {
             };
         }
 
-        if use_todo_track_guards && running_required == 0 {
+        if use_task_track_guards && running_required == 0 {
             if self.is_hard_budget_breach(snapshot, budget)
                 || (self.is_budget_gate_armed(gate_state.no_progress_streak)
                     && gate_state.budget_breach_streak
@@ -268,7 +268,7 @@ impl OrchestratorDecisionEngine {
             }
         }
 
-        if use_todo_track_guards
+        if use_task_track_guards
             && gate_state.consecutive_upstream_model_errors
                 >= self.policy.upstream_model_error_streak
         {

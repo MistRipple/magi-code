@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Message, PlaceholderState, TimelineRenderItem } from '../types/message';
+  import type { Message, PlaceholderState } from '../types/message';
   import type { IconName } from '../lib/icons';
   import MarkdownContent from './MarkdownContent.svelte';
   import WorkerBadge from './WorkerBadge.svelte';
@@ -10,16 +10,14 @@
   import { i18n } from '../stores/i18n.svelte';
   import { retryRuntimeState } from '../stores/messages.svelte';
   import { getAgentColor } from '../lib/agent-colors';
+  import { formatElapsed } from '../lib/utils';
 
   // Props
   interface Props {
     message: Message;
-    renderItem?: TimelineRenderItem;
     readOnly?: boolean;
     /** 显示上下文：thread=主对话区, worker=Worker面板 */
     displayContext?: 'thread' | 'worker';
-    /** Worker 面板中若后续还有执行流，任务卡切紧凑模式，避免遮挡首屏过程内容 */
-    compactWorkerLifecycle?: boolean;
     /** 是否允许渲染底部流式三点（仅最后一条流式消息启用） */
     showStreamingIndicator?: boolean;
     /** 当前面板流式计时（秒） */
@@ -173,13 +171,6 @@
       hour: '2-digit',
       minute: '2-digit'
     });
-  }
-
-  function formatElapsed(seconds: number): string {
-    if (seconds < 60) return `${seconds}s`;
-    const m = Math.floor(seconds / 60);
-    const s = seconds % 60;
-    return `${m}m ${s}s`;
   }
 
   function formatDurationMs(durationMs: number): string {

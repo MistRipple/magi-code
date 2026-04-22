@@ -19,7 +19,10 @@ pub fn routes() -> Router<ApiState> {
         .route("/changes/revert", post(revert_change))
         .route("/changes/approve-all", post(approve_all_changes))
         .route("/changes/revert-all", post(revert_all_changes))
-        .route("/changes/revert-mission", post(revert_mission_changes))
+        .route(
+            "/changes/revert-execution-group",
+            post(revert_execution_group_changes),
+        )
         .route("/files/content", get(get_file_content))
         .route("/filesystem/list", get(list_filesystem))
         .route("/tunnel/start", post(start_tunnel))
@@ -182,21 +185,21 @@ async fn revert_all_changes(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RevertMissionRequest {
-    mission_id: String,
+struct RevertExecutionGroupRequest {
+    execution_group_id: String,
     workspace_id: Option<String>,
 }
 
-async fn revert_mission_changes(
+async fn revert_execution_group_changes(
     State(state): State<ApiState>,
-    Json(request): Json<RevertMissionRequest>,
+    Json(request): Json<RevertExecutionGroupRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let root = resolve_workspace_root(&state, request.workspace_id.as_deref())?;
 
     let task_store = state
         .task_store()
-        .ok_or_else(|| ApiError::internal_assembly("revert mission", "task_store 未配置"))?;
-    let mission_id = magi_core::MissionId::new(&request.mission_id);
+        .ok_or_else(|| ApiError::internal_assembly("revert execution group", "task_store 未配置"))?;
+    let mission_id = magi_core::MissionId::new(&request.execution_group_id);
     let tasks = task_store.get_tasks_by_mission(&mission_id);
 
     let mut reverted_files: Vec<String> = Vec::new();
@@ -217,7 +220,7 @@ async fn revert_mission_changes(
 
     Ok(Json(serde_json::json!({
         "reverted": true,
-        "missionId": request.mission_id,
+        "executionGroupId": request.execution_group_id,
         "revertedFiles": reverted_files,
     })))
 }

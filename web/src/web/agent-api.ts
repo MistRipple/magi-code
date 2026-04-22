@@ -1276,6 +1276,10 @@ export async function revertAllAgentChanges(): Promise<void> {
   await postBoundJson('/api/changes/revert-all', {}, 'revert all changes');
 }
 
-export async function revertAgentMissionChanges(missionId: string): Promise<void> {
-  await postBoundJson('/api/changes/revert-mission', { missionId }, 'revert mission changes');
+export async function revertAgentExecutionGroupChanges(executionGroupId: string): Promise<void> {
+  await postBoundJson(
+    '/api/changes/revert-execution-group',
+    { executionGroupId },
+    'revert execution group changes',
+  );
 }

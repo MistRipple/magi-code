@@ -22,7 +22,6 @@ pub(crate) fn build_recovery_target(
         .get_tasks_by_mission(&mission_id)
         .into_iter()
         .find(|task| task.task_id == task.root_task_id)?;
-    let executable_statuses = [TaskStatus::Blocked, TaskStatus::Running, TaskStatus::Ready];
 
     let task = if let Some(task_id) = input.ownership.task_id.as_ref() {
         let task = task_store.get_task(task_id)?;
@@ -34,13 +33,21 @@ pub(crate) fn build_recovery_target(
         }
         task
     } else {
-        task_store
+        let subtree_tasks = task_store
             .collect_subtree_ids(&root_task.task_id)
             .into_iter()
             .filter_map(|task_id| task_store.get_task(&task_id))
             .filter(|task| task.task_id != root_task.task_id)
             .filter(|task| is_executable_task(&task.kind))
-            .find(|task| executable_statuses.contains(&task.status))?
+            .collect::<Vec<_>>();
+        [TaskStatus::Blocked, TaskStatus::Running, TaskStatus::Ready]
+            .into_iter()
+            .find_map(|status| {
+                subtree_tasks
+                    .iter()
+                    .find(|task| task.status == status)
+                    .cloned()
+            })?
     };
 
     Some(TaskExecutionTarget {

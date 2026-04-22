@@ -1,5 +1,6 @@
 use super::{
-    collect_unique_option_string, AssignmentRuntimeSummaryEntry, MissionRuntimeSummaryEntry,
+    collect_unique_option_string, AssignmentRuntimeSummaryEntry,
+    ExecutionGroupRuntimeSummaryEntry,
     RecoveryActivityStage, RecoveryReadModelInput, RecoveryResumeObservationSummary,
     RuntimeAttentionSummary, RuntimeDiagnosticSummary, RuntimeWorkQueueSummary,
     TaskRuntimeSummaryEntry, ToolRuntimeSummaryEntry, WorkerRuntimeSummaryEntry,
@@ -7,7 +8,7 @@ use super::{
 
 impl RuntimeDiagnosticSummary {
     pub(super) fn from_components(
-        missions: &[MissionRuntimeSummaryEntry],
+        execution_groups: &[ExecutionGroupRuntimeSummaryEntry],
         tasks: &[TaskRuntimeSummaryEntry],
         assignments: &[AssignmentRuntimeSummaryEntry],
         workers: &[WorkerRuntimeSummaryEntry],
@@ -20,19 +21,19 @@ impl RuntimeDiagnosticSummary {
         governance_rejected_count: usize,
     ) -> Self {
         Self {
-            running_mission_count: count_status(
-                missions
+            running_execution_group_count: count_status(
+                execution_groups
                     .iter()
                     .map(|entry| entry.current_status.as_deref()),
                 "running",
             ) + count_status(
-                missions
+                execution_groups
                     .iter()
                     .map(|entry| entry.current_status.as_deref()),
                 "resuming",
             ),
-            failed_mission_count: count_status(
-                missions
+            failed_execution_group_count: count_status(
+                execution_groups
                     .iter()
                     .map(|entry| entry.current_status.as_deref()),
                 "failed",
@@ -102,7 +103,7 @@ impl RuntimeDiagnosticSummary {
                 .iter()
                 .map(|entry| entry.failed_dispatch_count)
                 .sum(),
-            context_mission_count: missions
+            context_execution_group_count: execution_groups
                 .iter()
                 .filter(|entry| {
                     entry.context_used_knowledge_count > 0
@@ -112,19 +113,19 @@ impl RuntimeDiagnosticSummary {
                         || entry.context_used_file_summary_count > 0
                 })
                 .count(),
-            context_used_knowledge_count: missions
+            context_used_knowledge_count: execution_groups
                 .iter()
                 .map(|entry| entry.context_used_knowledge_count)
                 .sum(),
-            context_used_memory_count: missions
+            context_used_memory_count: execution_groups
                 .iter()
                 .map(|entry| entry.context_used_memory_count)
                 .sum(),
-            context_code_index_knowledge_count: missions
+            context_code_index_knowledge_count: execution_groups
                 .iter()
                 .map(|entry| entry.context_code_index_knowledge_count)
                 .sum(),
-            context_extracted_memory_count: missions
+            context_extracted_memory_count: execution_groups
                 .iter()
                 .map(|entry| entry.context_extracted_memory_count)
                 .sum(),
@@ -160,7 +161,7 @@ impl RuntimeDiagnosticSummary {
 
 impl RuntimeAttentionSummary {
     pub(super) fn from_components(
-        missions: &[MissionRuntimeSummaryEntry],
+        execution_groups: &[ExecutionGroupRuntimeSummaryEntry],
         tasks: &[TaskRuntimeSummaryEntry],
         assignments: &[AssignmentRuntimeSummaryEntry],
         workers: &[WorkerRuntimeSummaryEntry],
@@ -174,7 +175,7 @@ impl RuntimeAttentionSummary {
         governance_rejected_worker_ids: &[String],
     ) -> Self {
         Self {
-            failed_mission_ids: missions
+            failed_execution_group_ids: execution_groups
                 .iter()
                 .filter(|entry| entry.current_status.as_deref() == Some("failed"))
                 .map(|entry| entry.mission_id.clone())
@@ -243,14 +244,14 @@ impl RuntimeAttentionSummary {
 
 impl RuntimeWorkQueueSummary {
     pub(super) fn from_components(
-        missions: &[MissionRuntimeSummaryEntry],
+        execution_groups: &[ExecutionGroupRuntimeSummaryEntry],
         tasks: &[TaskRuntimeSummaryEntry],
         assignments: &[AssignmentRuntimeSummaryEntry],
         workers: &[WorkerRuntimeSummaryEntry],
         recovery: &RecoveryReadModelInput,
     ) -> Self {
         Self {
-            running_mission_ids: missions
+            running_execution_group_ids: execution_groups
                 .iter()
                 .filter(|entry| {
                     matches!(
@@ -295,7 +296,7 @@ impl RuntimeWorkQueueSummary {
 
 impl RecoveryResumeObservationSummary {
     pub(super) fn from_recovery(recovery: &RecoveryReadModelInput) -> Self {
-        let mut affected_mission_ids = Vec::new();
+        let mut affected_execution_group_ids = Vec::new();
         let mut affected_worker_ids = Vec::new();
         let mut resume_command_count = 0;
         let mut resume_dispatch_count = 0;
@@ -310,7 +311,7 @@ impl RecoveryResumeObservationSummary {
                 RecoveryActivityStage::WorkerResumed => worker_resumed_count += 1,
             }
             collect_unique_option_string(
-                &mut affected_mission_ids,
+                &mut affected_execution_group_ids,
                 entry.mission_id.as_ref().map(ToString::to_string),
             );
             collect_unique_option_string(&mut affected_worker_ids, entry.worker_id.clone());
@@ -322,7 +323,7 @@ impl RecoveryResumeObservationSummary {
             resume_dispatch_count,
             mission_resumed_count,
             worker_resumed_count,
-            affected_mission_ids,
+            affected_execution_group_ids,
             affected_worker_ids,
         }
     }

@@ -1,15 +1,11 @@
 
 use crate::{
-    AssignmentGovernanceSummary, AssignmentSkillDispatchSummary, MissionContextSummary,
-    MissionExecutionOverview, MissionRuntimeSnapshot, MissionSkillDispatchSummary,
+    AssignmentGovernanceSummary, AssignmentSkillDispatchSummary, ExecutionContextSummary,
+    ExecutionOverview, ExecutionRuntimeSnapshot, ExecutionSkillDispatchSummary,
     TaskGovernanceSummary, TaskSkillDispatchSummary,
 };
-#[cfg(test)]
-use crate::MissionRecord;
 use crate::task_store::TaskStore;
 use magi_core::{AssignmentId, MissionId, Task, TaskId, TaskProjection};
-#[cfg(test)]
-use magi_core::TaskStatus;
 use magi_skill_runtime::{SkillDispatchRoute, SkillDispatchStatus};
 use magi_tool_runtime::ToolExecutionSummary;
 use magi_worker_runtime::{
@@ -18,54 +14,15 @@ use magi_worker_runtime::{
 };
 use std::collections::HashSet;
 
-#[cfg(test)]
-pub(crate) fn build_execution_overview(
-    mission: &MissionRecord,
-    worker_summary: WorkerRuntimeSummary,
-    tool_summary: ToolExecutionSummary,
-    skill_dispatch_observations: &[WorkerSkillDispatchObservation],
-    governance_observations: &[WorkerGovernanceObservation],
-    context_summary: Option<MissionContextSummary>,
-) -> MissionExecutionOverview {
-    MissionExecutionOverview {
-        mission: build_runtime_snapshot(mission),
-        running_task_ids: mission
-            .assignments
-            .iter()
-            .flat_map(|assignment| assignment.tasks.iter())
-            .filter(|task| task.status == TaskStatus::Running)
-            .map(|task| task.task_id.clone())
-            .collect(),
-        worker_summary,
-        tool_summary,
-        governance_summary: WorkerGovernanceSummary::from_observations(
-            governance_observations.iter(),
-        ),
-        skill_dispatch_summary: build_skill_dispatch_summary(skill_dispatch_observations.iter()),
-        context_summary,
-        assignment_governance_summaries: build_assignment_governance_summaries(
-            mission,
-            governance_observations,
-        ),
-        task_governance_summaries: build_task_governance_summaries(mission, governance_observations),
-        assignment_skill_dispatch_summaries: build_assignment_skill_dispatch_summaries(
-            mission,
-            skill_dispatch_observations,
-        ),
-        task_skill_dispatch_summaries: build_task_skill_dispatch_summaries(
-            mission,
-            skill_dispatch_observations,
-        ),
-    }
-}
-
 pub(crate) fn build_execution_overview_payload(
-    overview: &MissionExecutionOverview,
+    overview: &ExecutionOverview,
 ) -> serde_json::Value {
     let context_payload = overview
         .context_summary
         .as_ref()
-        .map(|summary| serde_json::to_value(summary).expect("mission context summary to serialize"))
+        .map(|summary| {
+            serde_json::to_value(summary).expect("execution context summary to serialize")
+        })
         .unwrap_or(serde_json::Value::Null);
     let assignment_governance_payloads = overview
         .assignment_governance_summaries
@@ -135,10 +92,10 @@ pub(crate) fn build_execution_overview_payload(
         .collect::<Vec<_>>();
 
     serde_json::json!({
-        "mission_id": overview.mission.mission_id.to_string(),
-        "total_tasks": overview.mission.total_tasks,
-        "completed_tasks": overview.mission.completed_tasks,
-        "failed_tasks": overview.mission.failed_tasks,
+        "mission_id": overview.runtime_snapshot.mission_id.to_string(),
+        "total_tasks": overview.runtime_snapshot.total_tasks,
+        "completed_tasks": overview.runtime_snapshot.completed_tasks,
+        "failed_tasks": overview.runtime_snapshot.failed_tasks,
         "running_task_ids": overview.running_task_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "worker_total": overview.worker_summary.total_workers,
         "worker_active": overview.worker_summary.active_workers,
@@ -180,42 +137,11 @@ pub(crate) fn build_execution_overview_payload(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn build_runtime_snapshot(mission: &MissionRecord) -> MissionRuntimeSnapshot {
-    let total_assignments = mission.assignments.len();
-    let all_tasks = mission
-        .assignments
-        .iter()
-        .flat_map(|assignment| assignment.tasks.iter());
-    let mut total_tasks = 0;
-    let mut completed_tasks = 0;
-    let mut failed_tasks = 0;
-    for task in all_tasks {
-        total_tasks += 1;
-        if task.status == TaskStatus::Completed {
-            completed_tasks += 1;
-        }
-        if matches!(
-            task.status,
-            TaskStatus::Failed | TaskStatus::Blocked
-        ) {
-            failed_tasks += 1;
-        }
-    }
-    MissionRuntimeSnapshot {
-        mission_id: mission.mission_id.clone(),
-        total_assignments,
-        total_tasks,
-        completed_tasks,
-        failed_tasks,
-    }
-}
-
 pub(crate) fn build_runtime_snapshot_from_projection(
     projection: &TaskProjection,
     total_assignments: usize,
-) -> MissionRuntimeSnapshot {
-    MissionRuntimeSnapshot {
+) -> ExecutionRuntimeSnapshot {
+    ExecutionRuntimeSnapshot {
         mission_id: projection.root_task.mission_id.clone(),
         total_assignments,
         total_tasks: projection.progress_summary.total_tasks as usize,
@@ -233,8 +159,8 @@ pub(crate) fn build_execution_overview_from_task_graph(
     tool_summary: ToolExecutionSummary,
     skill_dispatch_observations: &[WorkerSkillDispatchObservation],
     governance_observations: &[WorkerGovernanceObservation],
-    context_summary: Option<MissionContextSummary>,
-) -> Option<MissionExecutionOverview> {
+    context_summary: Option<ExecutionContextSummary>,
+) -> Option<ExecutionOverview> {
     let projection = task_store.build_projection(root_task_id)?;
     let subtree_tasks = collect_subtree_tasks(task_store, root_task_id);
     let assignment_roots = collect_assignment_roots(task_store, &projection.root_task);
@@ -263,8 +189,8 @@ pub(crate) fn build_execution_overview_from_task_graph(
         skill_dispatch_observations,
     );
 
-    Some(MissionExecutionOverview {
-        mission: build_runtime_snapshot_from_projection(&projection, assignment_roots.len()),
+    Some(ExecutionOverview {
+        runtime_snapshot: build_runtime_snapshot_from_projection(&projection, assignment_roots.len()),
         running_task_ids: projection.running_tasks.clone(),
         worker_summary,
         tool_summary,
@@ -434,114 +360,12 @@ fn build_task_skill_dispatch_summaries_from_tasks(
         .collect()
 }
 
-#[cfg(test)]
-fn build_assignment_skill_dispatch_summaries(
-    mission: &MissionRecord,
-    observations: &[WorkerSkillDispatchObservation],
-) -> Vec<AssignmentSkillDispatchSummary> {
-    mission
-        .assignments
-        .iter()
-        .map(|assignment| {
-            let task_ids = assignment
-                .tasks
-                .iter()
-                .map(|task| task.task_id.clone())
-                .collect::<HashSet<_>>();
-            let filtered = observations
-                .iter()
-                .filter(|observation| task_ids.contains(&observation.task_id));
-            AssignmentSkillDispatchSummary {
-                assignment_id: assignment.assignment_id.clone(),
-                mission_id: mission.mission_id.clone(),
-                skill_dispatch_summary: build_skill_dispatch_summary(filtered),
-            }
-        })
-        .collect()
-}
 
-#[cfg(test)]
-fn build_assignment_governance_summaries(
-    mission: &MissionRecord,
-    observations: &[WorkerGovernanceObservation],
-) -> Vec<AssignmentGovernanceSummary> {
-    mission
-        .assignments
-        .iter()
-        .map(|assignment| {
-            let task_ids = assignment
-                .tasks
-                .iter()
-                .map(|task| task.task_id.clone())
-                .collect::<HashSet<_>>();
-            let filtered = observations.iter().filter(|observation| {
-                observation
-                    .task_id
-                    .as_ref()
-                    .is_some_and(|task_id| task_ids.contains(task_id))
-            });
-            AssignmentGovernanceSummary {
-                assignment_id: assignment.assignment_id.clone(),
-                mission_id: mission.mission_id.clone(),
-                governance_summary: build_governance_summary(filtered),
-            }
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn build_task_governance_summaries(
-    mission: &MissionRecord,
-    observations: &[WorkerGovernanceObservation],
-) -> Vec<TaskGovernanceSummary> {
-    mission
-        .assignments
-        .iter()
-        .flat_map(|assignment| {
-            assignment.tasks.iter().map(move |task| {
-                let filtered = observations
-                    .iter()
-                    .filter(|observation| observation.task_id.as_ref() == Some(&task.task_id));
-                TaskGovernanceSummary {
-                    task_id: task.task_id.clone(),
-                    mission_id: mission.mission_id.clone(),
-                    assignment_id: assignment.assignment_id.clone(),
-                    governance_summary: build_governance_summary(filtered),
-                }
-            })
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn build_task_skill_dispatch_summaries(
-    mission: &MissionRecord,
-    observations: &[WorkerSkillDispatchObservation],
-) -> Vec<TaskSkillDispatchSummary> {
-    mission
-        .assignments
-        .iter()
-        .flat_map(|assignment| {
-            assignment.tasks.iter().map(move |task| {
-                let filtered = observations
-                    .iter()
-                    .filter(|observation| observation.task_id == task.task_id);
-                TaskSkillDispatchSummary {
-                    task_id: task.task_id.clone(),
-                    mission_id: mission.mission_id.clone(),
-                    assignment_id: assignment.assignment_id.clone(),
-                    skill_dispatch_summary: build_skill_dispatch_summary(filtered),
-                }
-            })
-        })
-        .collect()
-}
-
-fn build_skill_dispatch_summary<'a, I>(observations: I) -> MissionSkillDispatchSummary
+fn build_skill_dispatch_summary<'a, I>(observations: I) -> ExecutionSkillDispatchSummary
 where
     I: IntoIterator<Item = &'a WorkerSkillDispatchObservation>,
 {
-    let mut summary = MissionSkillDispatchSummary::default();
+    let mut summary = ExecutionSkillDispatchSummary::default();
     for observation in observations {
         summary.total_dispatches += 1;
         match observation.route {

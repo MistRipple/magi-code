@@ -1,10 +1,13 @@
 use magi_core::{AbsolutePath, ExecutionOwnership, SessionId, WorkspaceId};
 use magi_session_store::SessionStore;
 use magi_workspace::WorkspaceStore;
+use std::path::Path;
 
 pub(super) fn bootstrap_shadow_state(
     session_store: &SessionStore,
     workspace_registry: &WorkspaceStore,
+    bootstrap_workspace_root: &Path,
+    bootstrap_worktree_root: &Path,
 ) {
     if session_store.is_empty() {
         session_store
@@ -30,7 +33,7 @@ pub(super) fn bootstrap_shadow_state(
         workspace_registry
             .register(
                 WorkspaceId::new("shadow-workspace-001"),
-                AbsolutePath::new("/Users/xie/code/magi"),
+                AbsolutePath::new(bootstrap_workspace_root.to_string_lossy().to_string()),
             )
             .expect("bootstrap workspace should be creatable");
         workspace_registry
@@ -40,9 +43,7 @@ pub(super) fn bootstrap_shadow_state(
             .assign_worktree_root_for_execution(
                 &WorkspaceId::new("shadow-workspace-001"),
                 ownership.clone(),
-                AbsolutePath::new(
-                    "/Users/xie/code/magi-rust-rewrite/tmp/worktrees/shadow-worktree-001",
-                ),
+                AbsolutePath::new(bootstrap_worktree_root.to_string_lossy().to_string()),
             )
             .expect("bootstrap worktree should be assignable");
         let snapshot = workspace_registry.append_execution_snapshot(

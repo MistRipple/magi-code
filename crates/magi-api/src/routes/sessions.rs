@@ -36,7 +36,6 @@ struct DeleteSessionRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateSessionRequest {
-    #[allow(dead_code)]
     workspace_id: Option<String>,
     #[allow(dead_code)]
     workspace_path: Option<String>,
@@ -44,12 +43,13 @@ struct CreateSessionRequest {
 
 async fn create_session(
     State(state): State<ApiState>,
-    Json(_request): Json<CreateSessionRequest>,
+    Json(request): Json<CreateSessionRequest>,
 ) -> Result<Json<SessionSelectionResponseDto>, ApiError> {
     let session_id = SessionId::new(format!("session-{}", UtcMillis::now().0));
+    let workspace_id = request.workspace_id.filter(|s| !s.is_empty());
     state
         .session_store
-        .create_session(session_id, "新会话")
+        .create_session_for_workspace(session_id, "新会话", workspace_id)
         .map_err(|e| ApiError::internal_assembly("创建会话失败", e))?;
     state.persist_session_durable_state()?;
     let current_session = state.session_store.current_session();

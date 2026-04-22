@@ -32,13 +32,13 @@ pub struct EventCategoryCounts {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RuntimeActivitySummary {
-    pub mission_event_count: usize,
+    pub execution_group_event_count: usize,
     pub worker_event_count: usize,
     pub tool_event_count: usize,
     pub skill_dispatch_event_count: usize,
     pub executor_event_count: usize,
     pub recovery_event_count: usize,
-    pub active_mission_ids: Vec<String>,
+    pub active_execution_group_ids: Vec<String>,
     pub active_task_ids: Vec<String>,
 }
 
@@ -125,7 +125,7 @@ pub struct RuntimeExecutorSummary {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct MissionRuntimeSummaryEntry {
+pub struct ExecutionGroupRuntimeSummaryEntry {
     pub mission_id: String,
     pub event_count: usize,
     pub audit_event_count: usize,
@@ -153,6 +153,13 @@ pub struct MissionRuntimeSummaryEntry {
     pub context_provenance_linked_memory_count: usize,
     pub latest_event_type: Option<String>,
     pub current_status: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MissionProgressSummary {
+    total_tasks: usize,
+    completed_tasks: usize,
+    failed_tasks: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -255,7 +262,7 @@ pub struct SessionRuntimeSummaryEntry {
     pub tool_event_count: usize,
     pub recovery_event_count: usize,
     pub latest_event_type: Option<String>,
-    pub active_mission_ids: Vec<String>,
+    pub active_execution_group_ids: Vec<String>,
     pub active_task_ids: Vec<String>,
     pub recovery_ids: Vec<String>,
     pub current_status: Option<String>,
@@ -273,7 +280,7 @@ pub struct WorkspaceRuntimeSummaryEntry {
     pub tool_event_count: usize,
     pub recovery_event_count: usize,
     pub latest_event_type: Option<String>,
-    pub active_mission_ids: Vec<String>,
+    pub active_execution_group_ids: Vec<String>,
     pub active_task_ids: Vec<String>,
     pub recovery_ids: Vec<String>,
     pub execution_chain_refs: Vec<String>,
@@ -293,8 +300,8 @@ pub struct DispatchRuntimeSummary {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RuntimeDiagnosticSummary {
-    pub running_mission_count: usize,
-    pub failed_mission_count: usize,
+    pub running_execution_group_count: usize,
+    pub failed_execution_group_count: usize,
     pub running_task_count: usize,
     pub failed_task_count: usize,
     pub running_assignment_count: usize,
@@ -310,7 +317,7 @@ pub struct RuntimeDiagnosticSummary {
     pub governance_rejected_count: usize,
     pub rejected_skill_dispatch_count: usize,
     pub failed_skill_dispatch_count: usize,
-    pub context_mission_count: usize,
+    pub context_execution_group_count: usize,
     pub context_used_knowledge_count: usize,
     pub context_used_memory_count: usize,
     pub context_code_index_knowledge_count: usize,
@@ -330,7 +337,7 @@ pub struct RuntimeOverviewSummary {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RuntimeAttentionSummary {
-    pub failed_mission_ids: Vec<String>,
+    pub failed_execution_group_ids: Vec<String>,
     pub failed_task_ids: Vec<String>,
     pub failed_assignment_ids: Vec<String>,
     pub failed_worker_ids: Vec<String>,
@@ -350,7 +357,7 @@ pub struct RuntimeAttentionSummary {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RuntimeWorkQueueSummary {
-    pub running_mission_ids: Vec<String>,
+    pub running_execution_group_ids: Vec<String>,
     pub running_task_ids: Vec<String>,
     pub running_assignment_ids: Vec<String>,
     pub active_worker_ids: Vec<String>,
@@ -364,7 +371,7 @@ pub struct RecoveryResumeObservationSummary {
     pub resume_dispatch_count: usize,
     pub mission_resumed_count: usize,
     pub worker_resumed_count: usize,
-    pub affected_mission_ids: Vec<String>,
+    pub affected_execution_group_ids: Vec<String>,
     pub affected_worker_ids: Vec<String>,
 }
 
@@ -422,7 +429,7 @@ pub struct RecoveryReadModelInput {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RuntimeDetailsSummary {
-    pub missions: Vec<MissionRuntimeSummaryEntry>,
+    pub execution_groups: Vec<ExecutionGroupRuntimeSummaryEntry>,
     pub tasks: Vec<TaskRuntimeSummaryEntry>,
     pub assignments: Vec<AssignmentRuntimeSummaryEntry>,
     pub workers: Vec<WorkerRuntimeSummaryEntry>,
@@ -896,7 +903,8 @@ impl RuntimeReadModelInput {
         let recent_event_count = events.len();
         let mut category_counts = EventCategoryCounts::default();
         let mut summary = RuntimeActivitySummary::default();
-        let mut mission_map = BTreeMap::<String, MissionRuntimeSummaryEntry>::new();
+        let mut execution_group_map = BTreeMap::<String, ExecutionGroupRuntimeSummaryEntry>::new();
+        let mut mission_progress_map = BTreeMap::<String, MissionProgressSummary>::new();
         let mut task_map = BTreeMap::<String, TaskRuntimeSummaryEntry>::new();
         let mut assignment_map = BTreeMap::<String, AssignmentRuntimeSummaryEntry>::new();
         let mut worker_map = BTreeMap::<String, WorkerRuntimeSummaryEntry>::new();
@@ -924,7 +932,7 @@ impl RuntimeReadModelInput {
                 EventCategory::System => category_counts.system += 1,
             }
             if event.mission_id.is_some() {
-                summary.mission_event_count += 1;
+                summary.execution_group_event_count += 1;
             }
             if event.event_type.starts_with("worker.") {
                 summary.worker_event_count += 1;
@@ -964,7 +972,7 @@ impl RuntimeReadModelInput {
                 }
                 session_entry.latest_event_type = Some(event.event_type.clone());
                 collect_unique_option_string(
-                    &mut session_entry.active_mission_ids,
+                    &mut session_entry.active_execution_group_ids,
                     event.mission_id.as_ref().map(ToString::to_string),
                 );
                 collect_unique_option_string(
@@ -996,7 +1004,7 @@ impl RuntimeReadModelInput {
                 }
                 workspace_entry.latest_event_type = Some(event.event_type.clone());
                 collect_unique_option_string(
-                    &mut workspace_entry.active_mission_ids,
+                    &mut workspace_entry.active_execution_group_ids,
                     event.mission_id.as_ref().map(ToString::to_string),
                 );
                 collect_unique_option_string(
@@ -1016,13 +1024,19 @@ impl RuntimeReadModelInput {
             }
             if let Some(mission_id) = event.mission_id.as_ref() {
                 let mission_id = mission_id.to_string();
-                if !summary.active_mission_ids.iter().any(|id| id == &mission_id) {
-                    summary.active_mission_ids.push(mission_id.clone());
+                if !summary
+                    .active_execution_group_ids
+                    .iter()
+                    .any(|id| id == &mission_id)
+                {
+                    summary.active_execution_group_ids.push(mission_id.clone());
                 }
-                let mission_entry = mission_map.entry(mission_id.clone()).or_insert_with(|| {
-                    MissionRuntimeSummaryEntry {
+                let mission_entry = execution_group_map
+                    .entry(mission_id.clone())
+                    .or_insert_with(|| {
+                    ExecutionGroupRuntimeSummaryEntry {
                         mission_id: mission_id.clone(),
-                        ..MissionRuntimeSummaryEntry::default()
+                        ..ExecutionGroupRuntimeSummaryEntry::default()
                     }
                 });
                 mission_entry.event_count += 1;
@@ -1052,6 +1066,12 @@ impl RuntimeReadModelInput {
                         Some("rejected") => mission_entry.rejected_dispatch_count += 1,
                         Some("failed") => mission_entry.failed_dispatch_count += 1,
                         _ => {}
+                    }
+                }
+                if event.event_type == "mission.execution.overview"
+                {
+                    if let Some(progress) = mission_progress_from_payload(&event.payload) {
+                        mission_progress_map.insert(mission_id.clone(), progress);
                     }
                 }
                 if event.event_type == "mission.execution.overview"
@@ -1091,9 +1111,6 @@ impl RuntimeReadModelInput {
                         nested_usize_field(context, "provenance_linked_memory_count");
                 }
                 mission_entry.latest_event_type = Some(event.event_type.clone());
-                if let Some(status) = infer_mission_status(event) {
-                    mission_entry.current_status = Some(status);
-                }
                 if let Some(task_id) = event.task_id.as_ref() {
                     let task_id = task_id.to_string();
                     if !mission_entry.active_task_ids.iter().any(|id| id == &task_id) {
@@ -1530,16 +1547,23 @@ impl RuntimeReadModelInput {
             }
         }
 
-        let missions = mission_map.into_values().collect::<Vec<_>>();
+        let recovery = RecoveryReadModelInput::from_events(events);
+        refresh_execution_group_statuses(
+            &mut execution_group_map,
+            &task_map,
+            &recovery,
+            &mission_progress_map,
+        );
+
+        let execution_groups = execution_group_map.into_values().collect::<Vec<_>>();
         let tasks = task_map.into_values().collect::<Vec<_>>();
         let assignments = assignment_map.into_values().collect::<Vec<_>>();
         let workers = worker_map.into_values().collect::<Vec<_>>();
         let tools = tool_map.into_values().collect::<Vec<_>>();
         let sessions = session_map.into_values().collect::<Vec<_>>();
         let workspaces = workspace_map.into_values().collect::<Vec<_>>();
-        let recovery = RecoveryReadModelInput::from_events(events);
         let diagnostics = RuntimeDiagnosticSummary::from_components(
-            &missions,
+            &execution_groups,
             &tasks,
             &assignments,
             &workers,
@@ -1552,7 +1576,7 @@ impl RuntimeReadModelInput {
             governance_rejected_count,
         );
         let attention = RuntimeAttentionSummary::from_components(
-            &missions,
+            &execution_groups,
             &tasks,
             &assignments,
             &workers,
@@ -1566,7 +1590,7 @@ impl RuntimeReadModelInput {
             &governance_rejected_worker_ids,
         );
         let work_queues = RuntimeWorkQueueSummary::from_components(
-            &missions,
+            &execution_groups,
             &tasks,
             &assignments,
             &workers,
@@ -1586,7 +1610,7 @@ impl RuntimeReadModelInput {
             diagnostics,
         };
         let details = RuntimeDetailsSummary {
-            missions,
+            execution_groups,
             tasks,
             assignments,
             workers,
@@ -1657,12 +1681,12 @@ impl RuntimeReadModelInput {
     }
 
     fn normalize(mut self) -> Self {
-        sort_string_vec(&mut self.overview.activity.active_mission_ids);
+        sort_string_vec(&mut self.overview.activity.active_execution_group_ids);
         sort_string_vec(&mut self.overview.activity.active_task_ids);
         sort_string_vec(&mut self.meta.executor.supported_step_kinds);
 
         self.details
-            .missions
+            .execution_groups
             .sort_by(|left, right| left.mission_id.cmp(&right.mission_id));
         self.details
             .tasks
@@ -1683,7 +1707,7 @@ impl RuntimeReadModelInput {
             left.workspace_id.cmp(&right.workspace_id)
         });
 
-        for entry in &mut self.details.missions {
+        for entry in &mut self.details.execution_groups {
             sort_string_vec(&mut entry.active_task_ids);
             sort_string_vec(&mut entry.context_truncation_parts);
             sort_string_vec(&mut entry.context_knowledge_ids);
@@ -1701,12 +1725,12 @@ impl RuntimeReadModelInput {
             sort_string_vec(&mut entry.workspace_ids);
         }
         for entry in &mut self.details.sessions {
-            sort_string_vec(&mut entry.active_mission_ids);
+            sort_string_vec(&mut entry.active_execution_group_ids);
             sort_string_vec(&mut entry.active_task_ids);
             sort_string_vec(&mut entry.recovery_ids);
         }
         for entry in &mut self.details.workspaces {
-            sort_string_vec(&mut entry.active_mission_ids);
+            sort_string_vec(&mut entry.active_execution_group_ids);
             sort_string_vec(&mut entry.active_task_ids);
             sort_string_vec(&mut entry.recovery_ids);
             sort_string_vec(&mut entry.execution_chain_refs);
@@ -1717,7 +1741,7 @@ impl RuntimeReadModelInput {
         }
 
         sort_string_vec(&mut self.operations.dispatch.active_assignment_ids);
-        sort_string_vec(&mut self.operations.attention.failed_mission_ids);
+        sort_string_vec(&mut self.operations.attention.failed_execution_group_ids);
         sort_string_vec(&mut self.operations.attention.failed_task_ids);
         sort_string_vec(&mut self.operations.attention.failed_assignment_ids);
         sort_string_vec(&mut self.operations.attention.failed_worker_ids);
@@ -1733,39 +1757,18 @@ impl RuntimeReadModelInput {
         sort_string_vec(&mut self.operations.attention.degraded_executor_worker_ids);
         sort_string_vec(&mut self.operations.attention.unavailable_executor_worker_ids);
         sort_string_vec(&mut self.operations.attention.pending_recovery_ids);
-        sort_string_vec(&mut self.operations.work_queues.running_mission_ids);
+        sort_string_vec(&mut self.operations.work_queues.running_execution_group_ids);
         sort_string_vec(&mut self.operations.work_queues.running_task_ids);
         sort_string_vec(&mut self.operations.work_queues.running_assignment_ids);
         sort_string_vec(&mut self.operations.work_queues.active_worker_ids);
         sort_string_vec(&mut self.operations.work_queues.pending_recovery_ids);
-        sort_string_vec(&mut self.operations.resume_observation.affected_mission_ids);
+        sort_string_vec(
+            &mut self.operations.resume_observation.affected_execution_group_ids,
+        );
         sort_string_vec(&mut self.operations.resume_observation.affected_worker_ids);
 
         self.recovery = self.recovery.normalize();
         self
-    }
-}
-
-fn infer_mission_status(event: &EventEnvelope) -> Option<String> {
-    match event.event_type.as_str() {
-        "mission.created" => Some("pending".to_string()),
-        "mission.resume.command.created" | "mission.resume.dispatch.created" => {
-            Some("resuming".to_string())
-        }
-        "mission.resumed.from_recovery" => Some("running".to_string()),
-        "mission.execution.overview" => {
-            let total = event.payload.get("total_tasks")?.as_u64()?;
-            let completed = event.payload.get("completed_tasks")?.as_u64()?;
-            let failed = event.payload.get("failed_tasks")?.as_u64()?;
-            if total > 0 && completed == total {
-                Some("succeeded".to_string())
-            } else if failed > 0 {
-                Some("failed".to_string())
-            } else {
-                Some("running".to_string())
-            }
-        }
-        _ => None,
     }
 }
 
@@ -1801,6 +1804,118 @@ fn infer_assignment_status(event: &EventEnvelope) -> Option<String> {
         "task.failed" => Some("failed".to_string()),
         _ => None,
     }
+}
+
+fn mission_progress_from_payload(payload: &serde_json::Value) -> Option<MissionProgressSummary> {
+    let total_tasks = payload.get("total_tasks")?.as_u64()? as usize;
+    let completed_tasks = payload
+        .get("completed_tasks")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default() as usize;
+    let failed_tasks = payload
+        .get("failed_tasks")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default() as usize;
+    Some(MissionProgressSummary {
+        total_tasks,
+        completed_tasks,
+        failed_tasks,
+    })
+}
+
+fn refresh_execution_group_statuses(
+    execution_group_map: &mut BTreeMap<String, ExecutionGroupRuntimeSummaryEntry>,
+    task_map: &BTreeMap<String, TaskRuntimeSummaryEntry>,
+    recovery: &RecoveryReadModelInput,
+    mission_progress_map: &BTreeMap<String, MissionProgressSummary>,
+) {
+    for execution_group_entry in execution_group_map.values_mut() {
+        execution_group_entry.current_status = derive_execution_group_status(
+            execution_group_entry,
+            task_map,
+            recovery,
+            mission_progress_map
+                .get(&execution_group_entry.mission_id)
+                .copied(),
+        );
+    }
+}
+
+fn derive_execution_group_status(
+    execution_group_entry: &ExecutionGroupRuntimeSummaryEntry,
+    task_map: &BTreeMap<String, TaskRuntimeSummaryEntry>,
+    recovery: &RecoveryReadModelInput,
+    progress: Option<MissionProgressSummary>,
+) -> Option<String> {
+    if recovery
+        .summaries
+        .iter()
+        .any(|summary| {
+            summary.mission_id.as_ref().map(|mission_id| mission_id.as_str())
+                == Some(execution_group_entry.mission_id.as_str())
+                && summary.current_status == "resuming"
+        })
+    {
+        return Some("resuming".to_string());
+    }
+
+    let task_statuses = task_map
+        .values()
+        .filter(|task| task.mission_id.as_deref() == Some(execution_group_entry.mission_id.as_str()))
+        .filter_map(|task| task.current_status.as_deref())
+        .collect::<Vec<_>>();
+
+    if !task_statuses.is_empty() {
+        if task_statuses
+            .iter()
+            .any(|status| is_running_task_status(status))
+        {
+            return Some("running".to_string());
+        }
+        if task_statuses
+            .iter()
+            .any(|status| is_failed_task_status(status))
+        {
+            return Some("failed".to_string());
+        }
+        if task_statuses
+            .iter()
+            .all(|status| is_terminal_task_status(status))
+        {
+            return Some("succeeded".to_string());
+        }
+        return Some("pending".to_string());
+    }
+
+    progress.and_then(derive_mission_status_from_progress)
+}
+
+fn derive_mission_status_from_progress(progress: MissionProgressSummary) -> Option<String> {
+    if progress.total_tasks == 0 {
+        return None;
+    }
+    if progress.completed_tasks >= progress.total_tasks {
+        return Some("succeeded".to_string());
+    }
+    if progress.failed_tasks > 0 {
+        return Some("failed".to_string());
+    }
+    if progress.completed_tasks > 0 {
+        return Some("running".to_string());
+    }
+    Some("pending".to_string())
+}
+
+fn is_running_task_status(status: &str) -> bool {
+    matches!(status, "running" | "verifying" | "repairing")
+}
+
+fn is_failed_task_status(status: &str) -> bool {
+    matches!(status, "failed" | "blocked")
+}
+
+fn is_terminal_task_status(status: &str) -> bool {
+    matches!(status, "completed" | "succeeded" | "cancelled" | "skipped")
 }
 
 fn infer_worker_status(event: &EventEnvelope) -> Option<String> {
@@ -2001,9 +2116,9 @@ mod tests {
         let read_model = RuntimeReadModelInput::from_events(&[event]);
         let mission = read_model
             .details
-            .missions
+            .execution_groups
             .first()
-            .expect("mission entry to exist");
+            .expect("execution group entry to exist");
 
         assert_eq!(mission.context_used_turn_count, 1);
         assert_eq!(mission.context_used_knowledge_count, 2);
@@ -2036,7 +2151,7 @@ mod tests {
         assert_eq!(mission.context_governed_knowledge_count, 1);
         assert_eq!(mission.context_extracted_memory_count, 2);
         assert_eq!(mission.context_provenance_linked_memory_count, 3);
-        assert_eq!(read_model.overview.diagnostics.context_mission_count, 1);
+        assert_eq!(read_model.overview.diagnostics.context_execution_group_count, 1);
         assert_eq!(read_model.overview.diagnostics.context_used_knowledge_count, 2);
         assert_eq!(read_model.overview.diagnostics.context_used_memory_count, 3);
         assert_eq!(
@@ -2111,9 +2226,9 @@ mod tests {
         ]);
         let mission = read_model
             .details
-            .missions
+            .execution_groups
             .first()
-            .expect("mission entry to exist");
+            .expect("execution group entry to exist");
 
         assert_eq!(mission.event_count, 3);
         assert_eq!(
@@ -2129,6 +2244,6 @@ mod tests {
             mission.context_memory_extraction_refs,
             vec!["extract-a".to_string(), "extract-z".to_string()]
         );
-        assert_eq!(read_model.overview.diagnostics.context_mission_count, 1);
+        assert_eq!(read_model.overview.diagnostics.context_execution_group_count, 1);
     }
 }

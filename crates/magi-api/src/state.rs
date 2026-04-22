@@ -442,7 +442,7 @@ impl RuntimeStatePersistence {
         self.session_path.parent()
     }
 
-    fn save_json<T>(&self, path: &Path, value: &T) -> Result<(), ApiError>
+    pub(crate) fn save_json<T>(&self, path: &Path, value: &T) -> Result<(), ApiError>
     where
         T: serde::Serialize,
     {
@@ -458,10 +458,6 @@ impl RuntimeStatePersistence {
         fs::rename(&temp_path, path)
             .map_err(|error| ApiError::internal_assembly("提交运行态持久化文件失败", error))?;
         Ok(())
-    }
-
-    fn save_session_store(&self, store: &SessionStore) -> Result<(), ApiError> {
-        self.save_json(&self.session_path, &store.durable_state())
     }
 
     fn save_workspace_store(&self, store: &WorkspaceStore) -> Result<(), ApiError> {
@@ -590,6 +586,21 @@ impl ApiState {
         requested_session_id: Option<&SessionId>,
     ) -> BootstrapDto {
         BootstrapDto::from_state_with_selected_session(self, requested_session_id)
+    }
+
+    pub fn bootstrap_dto_for_workspace_session(
+        &self,
+        workspace_id: Option<&str>,
+        requested_session_id: Option<&SessionId>,
+    ) -> BootstrapDto {
+        let mut dto = BootstrapDto::from_state_with_selected_session(self, requested_session_id);
+        // 按 workspace_id 过滤会话列表
+        if let Some(ws_id) = workspace_id {
+            dto.sessions = dto.sessions.into_iter()
+                .filter(|s| s.workspace_id.as_deref() == Some(ws_id))
+                .collect();
+        }
+        dto
     }
 
     pub fn runtime_read_model_dto(&self) -> RuntimeReadModelDto {
@@ -754,7 +765,35 @@ impl ApiState {
         let Some(persistence) = &self.runtime_persistence else {
             return Ok(());
         };
-        persistence.save_session_store(&self.session_store)
+
+        // 按工作区分组保存会话
+        let durable = self.session_store.durable_state();
+        let workspaces = self.workspace_registry.workspaces();
+
+        // 按 workspace_id 分组
+        let mut by_workspace: std::collections::HashMap<String, Vec<magi_session_store::SessionRecord>> = std::collections::HashMap::new();
+
+        for session in &durable.sessions {
+            let ws_id = session.workspace_id.clone().unwrap_or_default();
+            by_workspace.entry(ws_id).or_default().push(session.clone());
+        }
+
+        // 为每个工作区写入各自 .magi/sessions.json
+        for workspace in &workspaces {
+            let ws_id = workspace.workspace_id.to_string();
+            let sessions = by_workspace.remove(&ws_id).unwrap_or_default();
+            let ws_state = magi_session_store::SessionDurableState {
+                sessions,
+                current_session_id: durable.current_session_id.clone(),
+                timeline: durable.timeline.clone(),
+                notifications: durable.notifications.clone(),
+            };
+            let magi_dir = std::path::Path::new(workspace.root_path.as_str()).join(".magi");
+            let session_path = magi_dir.join("sessions.json");
+            persistence.save_json(&session_path, &ws_state)?;
+        }
+
+        Ok(())
     }
 
     pub fn persist_workspace_durable_state(&self) -> Result<(), ApiError> {
@@ -1120,7 +1159,7 @@ mod tests {
         let event_bus = Arc::new(InMemoryEventBus::new(16));
         let governance = Arc::new(GovernanceService::default());
         let orchestrator =
-            OrchestratorService::with_governance(Arc::clone(&event_bus), Arc::clone(&governance));
+            OrchestratorService::new(Arc::clone(&event_bus));
         let session_store = Arc::new(SessionStore::new());
         let workspace_store = Arc::new(WorkspaceStore::new());
         let memory_store = MemoryStore::new();

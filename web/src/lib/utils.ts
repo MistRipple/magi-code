@@ -98,6 +98,16 @@ export function safeJsonParse<T>(str: string, defaultValue: T): T {
 }
 
 /**
+ * 格式化已用秒数（流式指示器专用，轻量格式）
+ */
+export function formatElapsed(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}m ${s}s`;
+}
+
+/**
  * 截断文本
  */
 export function truncate(str: string, maxLength: number): string {

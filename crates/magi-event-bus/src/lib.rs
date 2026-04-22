@@ -16,7 +16,7 @@ pub use read_model::{
     RUNTIME_READ_MODEL_ORDERING_STRATEGY, RUNTIME_READ_MODEL_REQUIRED_VALIDATION_REFS,
     RUNTIME_READ_MODEL_SECTION_ORDERING_RULES,
     AssignmentRuntimeSummaryEntry, DispatchRuntimeSummary, EventCategoryCounts,
-    MissionRuntimeSummaryEntry, RecoveryActivityEntry,
+    ExecutionGroupRuntimeSummaryEntry, RecoveryActivityEntry,
     RecoveryActivityStage, RecoveryDiagnosticSummaryEntry, RecoveryReadModelInput,
     RecoveryResumeObservationSummary, RuntimeActivitySummary, RuntimeAttentionSummary,
     RuntimeContractFreezeClosureSummary,

@@ -68,7 +68,7 @@ interface RustTimelineEntry {
   occurredAt?: number;
 }
 
-interface RustMissionRuntimeSummary {
+interface RustExecutionGroupRuntimeSummary {
   mission_id?: string;
   latest_event_type?: string | null;
   current_status?: string | null;
@@ -96,7 +96,7 @@ interface RustTaskRuntimeSummary {
 
 interface RustSessionRuntimeSummary {
   session_id?: string;
-  active_mission_ids?: string[];
+  active_execution_group_ids?: string[];
   active_task_ids?: string[];
   recovery_ids?: string[];
   latest_event_type?: string | null;
@@ -111,25 +111,25 @@ interface RustRuntimeReadModelDto {
     latest_sequence?: number;
   };
   details?: {
-    missions?: RustMissionRuntimeSummary[];
+    execution_groups?: RustExecutionGroupRuntimeSummary[];
     assignments?: RustAssignmentRuntimeSummary[];
     tasks?: RustTaskRuntimeSummary[];
     sessions?: RustSessionRuntimeSummary[];
   };
   overview?: {
     activity?: {
-      active_mission_ids?: string[];
+      active_execution_group_ids?: string[];
       active_task_ids?: string[];
     };
   };
   operations?: {
     attention?: {
-      failed_mission_ids?: string[];
+      failed_execution_group_ids?: string[];
       failed_task_ids?: string[];
       pending_recovery_ids?: string[];
     };
     work_queues?: {
-      running_mission_ids?: string[];
+      running_execution_group_ids?: string[];
       running_task_ids?: string[];
       pending_recovery_ids?: string[];
     };
@@ -240,7 +240,7 @@ function normalizeSessionRuntimeEntries(
     .filter((entry): entry is Record<string, unknown> => entry !== null)
     .map((entry) => ({
       session_id: normalizeString(entry.session_id) || undefined,
-      active_mission_ids: normalizeStringArray(entry.active_mission_ids),
+      active_execution_group_ids: normalizeStringArray(entry.active_execution_group_ids),
       active_task_ids: normalizeStringArray(entry.active_task_ids),
       recovery_ids: normalizeStringArray(entry.recovery_ids),
       latest_event_type: normalizeString(entry.latest_event_type) || undefined,
@@ -496,16 +496,64 @@ function buildAssignmentsFromRuntime(
   return assignments;
 }
 
+function resolveSessionTaskEntries(
+  runtimeReadModel: RustRuntimeReadModelDto | undefined,
+  sessionId: string,
+): { activeSession: RustSessionRuntimeSummary | undefined; taskEntries: RustTaskRuntimeSummary[] } {
+  const activeSession = normalizeSessionRuntimeEntries(runtimeReadModel)
+    .find((entry) => normalizeString(entry.session_id) === sessionId);
+  const activeTaskIds = new Set(normalizeStringArray(activeSession?.active_task_ids));
+  const taskEntries = normalizeTaskRuntimeEntries(runtimeReadModel)
+    .filter((entry) => activeTaskIds.has(normalizeString(entry.task_id)));
+  return { activeSession, taskEntries };
+}
+
+function buildSessionTaskStatusSummary(
+  runtimeReadModel: RustRuntimeReadModelDto | undefined,
+  sessionId: string,
+): {
+  activeSession: RustSessionRuntimeSummary | undefined;
+  taskEntries: RustTaskRuntimeSummary[];
+  runningTaskIds: string[];
+  failedTaskIds: string[];
+} {
+  const { activeSession, taskEntries } = resolveSessionTaskEntries(runtimeReadModel, sessionId);
+  const runningTaskIds: string[] = [];
+  const failedTaskIds: string[] = [];
+
+  for (const task of taskEntries) {
+    const taskId = normalizeString(task.task_id);
+    if (!taskId) {
+      continue;
+    }
+    const status = normalizeSubTaskStatus(
+      normalizeString(task.current_status),
+      typeof task.failed_dispatch_count === 'number' ? task.failed_dispatch_count : 0,
+    );
+    if (status === 'running') {
+      runningTaskIds.push(taskId);
+      continue;
+    }
+    if (status === 'failed' || status === 'blocked') {
+      failedTaskIds.push(taskId);
+    }
+  }
+
+  return {
+    activeSession,
+    taskEntries,
+    runningTaskIds,
+    failedTaskIds,
+  };
+}
+
 function deriveProcessingState(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
   sessionId: string,
 ): AppState['processingState'] {
-  const activeSession = normalizeSessionRuntimeEntries(runtimeReadModel)
-    .find((entry) => normalizeString(entry.session_id) === sessionId);
-  const runningMissionIds = activeSession?.active_mission_ids || [];
-  const runningTaskIds = activeSession?.active_task_ids || [];
+  const { activeSession, runningTaskIds } = buildSessionTaskStatusSummary(runtimeReadModel, sessionId);
   const pendingRecoveryIds = activeSession?.recovery_ids || [];
-  const isProcessing = runningMissionIds.length > 0 || runningTaskIds.length > 0 || pendingRecoveryIds.length > 0;
+  const isProcessing = runningTaskIds.length > 0 || pendingRecoveryIds.length > 0;
 
   if (!isProcessing) {
     return null;
@@ -530,16 +578,16 @@ function deriveRuntimeState(
     return null;
   }
 
-  const runningMissionIds = normalizeStringArray(runtimeReadModel.operations?.work_queues?.running_mission_ids);
-  const pendingRecoveryIds = normalizeStringArray(runtimeReadModel.operations?.work_queues?.pending_recovery_ids);
-  const failedMissionIds = normalizeStringArray(runtimeReadModel.operations?.attention?.failed_mission_ids);
-  const activeSession = normalizeSessionRuntimeEntries(runtimeReadModel)
-    .find((entry) => normalizeString(entry.session_id) === sessionId);
-  const status = runningMissionIds.length > 0
+  const { activeSession, runningTaskIds, failedTaskIds } = buildSessionTaskStatusSummary(
+    runtimeReadModel,
+    sessionId,
+  );
+  const pendingRecoveryIds = activeSession?.recovery_ids || [];
+  const status = runningTaskIds.length > 0
     ? 'running'
     : pendingRecoveryIds.length > 0
       ? 'waiting'
-      : failedMissionIds.length > 0
+      : failedTaskIds.length > 0
         ? 'failed'
         : activeSession
           ? normalizeTaskStatus(normalizeString(activeSession.current_status)) === 'completed'
@@ -550,8 +598,8 @@ function deriveRuntimeState(
   return {
     sessionId: sessionId || undefined,
     status,
-    phase: runningMissionIds.length > 0 ? 'execute' : (pendingRecoveryIds.length > 0 ? 'recovery' : 'idle'),
-    errors: failedMissionIds.length > 0 ? failedMissionIds.map((id) => `mission_failed:${id}`) : [],
+    phase: runningTaskIds.length > 0 ? 'execute' : (pendingRecoveryIds.length > 0 ? 'recovery' : 'idle'),
+    errors: failedTaskIds.length > 0 ? failedTaskIds.map((id) => `task_failed:${id}`) : [],
     statusChangedAt: normalizeNumber(activeSession?.last_update, generatedAt),
     lastEventAt: normalizeNumber(activeSession?.last_update, generatedAt),
     canResume: pendingRecoveryIds.length > 0,
@@ -779,10 +827,17 @@ function buildEventArtifacts(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
   events: RustEventEnvelope[],
 ): TimelineProjectionArtifact[] {
-  const activeSession = normalizeSessionRuntimeEntries(runtimeReadModel)
-    .find((entry) => normalizeString(entry.session_id) === sessionId);
-  const relevantMissionIds = new Set(normalizeStringArray(activeSession?.active_mission_ids));
-  const relevantTaskIds = new Set(normalizeStringArray(activeSession?.active_task_ids));
+  const { taskEntries } = resolveSessionTaskEntries(runtimeReadModel, sessionId);
+  const relevantTaskIds = new Set(
+    taskEntries
+      .map((entry) => normalizeString(entry.task_id))
+      .filter((taskId) => taskId.length > 0),
+  );
+  const relevantMissionIds = new Set(
+    taskEntries
+      .map((entry) => normalizeString(entry.mission_id))
+      .filter((missionId) => missionId.length > 0),
+  );
 
   return events
     .filter((event) => {

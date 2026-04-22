@@ -22,6 +22,7 @@
     isWorkerExecutingStatus,
     selectWorkerRuntime,
   } from '../lib/worker-panel-state';
+  import { formatElapsed } from '../lib/utils';
   import { loadAgentSessionTimelinePage } from '../web/agent-api';
   import { readStoredBrowserWorkspaceBinding } from '../shared/bridges/browser-workspace-binding';
   import {
@@ -221,13 +222,6 @@
       }
     };
   });
-
-  function formatElapsed(seconds: number): string {
-    if (seconds < 60) return `${seconds}s`;
-    const m = Math.floor(seconds / 60);
-    const s = seconds % 60;
-    return `${m}m ${s}s`;
-  }
 
   // 空状态默认值
   const emptyIcon = $derived((emptyState?.icon || 'chat') as import('../lib/icons').IconName);
@@ -573,10 +567,8 @@
       {#each safeRenderItems as item (item.key)}
         <MessageItem
           message={item.message}
-          renderItem={item}
           {readOnly}
           {displayContext}
-          compactWorkerLifecycle={displayContext === 'worker' && safeRenderItems.length > 1}
           showStreamingIndicator={item.message.id === streamingIndicatorMessageId}
           streamingElapsedSeconds={item.message.id === streamingIndicatorMessageId && shouldRunTimer ? elapsedSeconds : 0}
         />

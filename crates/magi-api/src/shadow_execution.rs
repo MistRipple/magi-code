@@ -475,8 +475,7 @@ mod tests {
     fn build_test_state() -> (ApiState, Arc<TaskStore>) {
         let event_bus = Arc::new(InMemoryEventBus::new(64));
         let governance = Arc::new(GovernanceService::default());
-        let orchestrator =
-            OrchestratorService::with_governance(Arc::clone(&event_bus), Arc::clone(&governance));
+        let orchestrator = OrchestratorService::new(Arc::clone(&event_bus));
         let session_store = Arc::new(SessionStore::new());
         let workspace_store = Arc::new(WorkspaceStore::new());
         let memory_store = MemoryStore::new();
@@ -626,8 +625,7 @@ mod tests {
     fn no_task_store_is_rejected() {
         let event_bus = Arc::new(InMemoryEventBus::new(64));
         let governance = Arc::new(GovernanceService::default());
-        let orchestrator =
-            OrchestratorService::with_governance(Arc::clone(&event_bus), Arc::clone(&governance));
+        let orchestrator = OrchestratorService::new(Arc::clone(&event_bus));
         let session_store = Arc::new(SessionStore::new());
         let workspace_store = Arc::new(WorkspaceStore::new());
         let memory_store = MemoryStore::new();
@@ -689,8 +687,7 @@ mod tests {
     fn build_recovery_test_state() -> (ApiState, Arc<TaskStore>) {
         let event_bus = Arc::new(InMemoryEventBus::new(64));
         let governance = Arc::new(GovernanceService::default());
-        let orchestrator =
-            OrchestratorService::with_governance(Arc::clone(&event_bus), Arc::clone(&governance));
+        let orchestrator = OrchestratorService::new(Arc::clone(&event_bus));
         let session_store = Arc::new(SessionStore::new());
         let workspace_store = Arc::new(WorkspaceStore::new());
         let memory_store = MemoryStore::new();

@@ -49,24 +49,24 @@
   const modifiedCount = $derived(edits.filter(e => e.type === 'modify').length);
   const deletedCount = $derived(edits.filter(e => e.type === 'delete').length);
 
-  // ─── 按轮次（missionId）分组 ───
-  // 最新轮次 missionId：取 edits 列表中最后一个有 missionId 的值（后端已按 timestamp 排序）
-  const latestMissionId = $derived.by(() => {
+  // ─── 按执行分组分组 ───
+  // 最新执行分组 ID：取 edits 列表中最后一个有 executionGroupId 的值（后端已按 timestamp 排序）
+  const latestExecutionGroupId = $derived.by(() => {
     if (edits.length === 0) return null;
     for (let i = edits.length - 1; i >= 0; i--) {
-      if (edits[i].missionId) return edits[i].missionId!;
+      if (edits[i].executionGroupId) return edits[i].executionGroupId!;
     }
     return null;
   });
 
   // 本轮变更
   const currentRoundEdits = $derived(
-    latestMissionId ? edits.filter(e => e.missionId === latestMissionId) : []
+    latestExecutionGroupId ? edits.filter(e => e.executionGroupId === latestExecutionGroupId) : []
   );
 
   // 统一暂存（非本轮）
   const stagedEdits = $derived(
-    latestMissionId ? edits.filter(e => e.missionId !== latestMissionId) : edits
+    latestExecutionGroupId ? edits.filter(e => e.executionGroupId !== latestExecutionGroupId) : edits
   );
 
   // 是否有两组分组（只有同时存在统一暂存和本轮变更才分组显示）
@@ -205,19 +205,21 @@
       vscode.postMessage({ type: 'revertAllChanges' });
     }
   }
-  function revertMission() {
-    if (!latestMissionId) return;
+  function revertExecutionGroup() {
+    if (!latestExecutionGroupId) return;
     if (isWebMode) {
-      fetch(`${resolveAgentBaseUrl()}/api/changes/revert-mission`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ missionId: latestMissionId }),
+      fetch(`${resolveAgentBaseUrl()}/api/changes/revert-execution-group`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ executionGroupId: latestExecutionGroupId }),
       }).catch(console.error);
     } else {
-      vscode.postMessage({ type: 'revertMission', missionId: latestMissionId });
+      vscode.postMessage({ type: 'revertExecutionGroup', executionGroupId: latestExecutionGroupId });
     }
   }
 
   function getEditKey(edit: Edit): string {
-    return `${edit.filePath}::${edit.missionId ?? 'none'}::${edit.snapshotId ?? 'na'}`;
+    return `${edit.filePath}::${edit.executionGroupId ?? 'none'}::${edit.snapshotId ?? 'na'}`;
   }
 
   function getPreviewLines(content: string): string[] {
@@ -379,7 +381,7 @@
               <span class="group-count">{i18n.t('edits.group.currentRoundCount', { count: currentRoundEdits.length })}</span>
               <button
                 class="revert-round-btn"
-                onclick={revertMission}
+                onclick={revertExecutionGroup}
                 disabled={appState.isProcessing}
                 title={appState.isProcessing ? i18n.t('edits.group.revertRoundTitleDisabled') : i18n.t('edits.group.revertRoundTitle')}
               >
@@ -393,7 +395,7 @@
               {/each}
             </div>
           {:else}
-            <!-- 没有 missionId 的情况（兼容旧数据）：全部扁平显示 -->
+            <!-- 没有分组 ID 的情况：全部扁平显示 -->
             <div class="file-list">
               {#each edits as edit (getEditKey(edit))}
                 {@render fileRow(edit)}

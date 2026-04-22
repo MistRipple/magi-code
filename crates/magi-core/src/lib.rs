@@ -9,7 +9,7 @@ pub mod value_objects;
 mod tests;
 
 pub use execution::{
-    ExecutionOwnership, RecoveryResumeInput, ResumeDispatchDecision, TaskExecutionTarget,
+    ExecutionOwnership, RecoveryResumeInput, TaskExecutionTarget,
 };
 pub use errors::{DomainError, DomainResult};
 pub use ids::{

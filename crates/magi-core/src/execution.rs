@@ -1,5 +1,4 @@
-use crate::ids::{AssignmentId, MissionId, SessionId, TaskId, WorkerId, WorkspaceId};
-use crate::status::DispatchReason;
+use crate::ids::{MissionId, SessionId, TaskId, WorkerId, WorkspaceId};
 use crate::value_objects::UtcMillis;
 use serde::{Deserialize, Serialize};
 
@@ -31,15 +30,4 @@ pub struct RecoveryResumeInput {
     pub diagnostic_summary: Option<String>,
     pub created_at: UtcMillis,
     pub updated_at: UtcMillis,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ResumeDispatchDecision {
-    pub mission_id: MissionId,
-    pub assignment_id: AssignmentId,
-    pub task_id: TaskId,
-    pub worker_id: Option<WorkerId>,
-    pub dispatch_reason: DispatchReason,
-    pub recovery_id: String,
-    pub execution_chain_ref: Option<String>,
 }

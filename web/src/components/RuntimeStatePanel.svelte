@@ -67,7 +67,7 @@
 
   const opsView = $derived.by(() => runtimeState?.opsView || null);
   const knowledgeAudit = $derived.by(() => (opsView?.knowledgeAudit || null) as KnowledgeAuditView | null);
-  const missionSummary = $derived.by(() => opsView?.mission || null);
+  const executionGroupSummary = $derived.by(() => opsView?.executionGroup || null);
   const planSummary = $derived.by(() => opsView?.plan || null);
 
   const scopeEntries = $derived.by(() => {
@@ -76,10 +76,10 @@
       return [] as Array<{ label: string; value: string }>;
     }
     const entries: Array<{ label: string; value: string }> = [];
-    if (missionSummary?.title || scope.missionId) {
+    if (executionGroupSummary?.title || scope.executionGroupId) {
       entries.push({
-        label: i18n.t('runtimeState.summary.mission'),
-        value: formatNamedReference(missionSummary?.title, scope.missionId),
+        label: i18n.t('runtimeState.summary.executionGroup'),
+        value: formatNamedReference(executionGroupSummary?.title, scope.executionGroupId),
       });
     }
     if (planSummary?.planId || scope.planId) {
@@ -134,10 +134,10 @@
       { label: i18n.t('runtimeState.summary.phase'), value: formatRuntimePhase(runtimeState.phase) },
       { label: i18n.t('runtimeState.summary.lastEventAt'), value: formatDateTime(runtimeState.lastEventAt) },
     ];
-    if (missionSummary?.title) {
+    if (executionGroupSummary?.title) {
       entries.unshift({
-        label: i18n.t('runtimeState.summary.mission'),
-        value: missionSummary.title,
+        label: i18n.t('runtimeState.summary.executionGroup'),
+        value: executionGroupSummary.title,
       });
     }
     if (planSummary?.planId) {
@@ -683,8 +683,8 @@
     if (entry.requestId) {
       scopes.push(`${i18n.t('runtimeDiagnostics.scope.request')}: ${entry.requestId}`);
     }
-    if (entry.missionId) {
-      scopes.push(`${i18n.t('runtimeDiagnostics.scope.mission')}: ${entry.missionId}`);
+    if (entry.executionGroupId) {
+      scopes.push(`${i18n.t('runtimeDiagnostics.scope.executionGroup')}: ${entry.executionGroupId}`);
     }
     if (entry.assignmentId) {
       scopes.push(`${i18n.t('runtimeDiagnostics.scope.assignment')}: ${entry.assignmentId}`);

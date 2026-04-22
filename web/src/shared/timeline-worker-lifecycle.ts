@@ -68,7 +68,8 @@ export function resolveTimelineDispatchWaveId(
   if (nestedDispatchWaveId) {
     return nestedDispatchWaveId;
   }
-  return normalizeNonEmptyString(metadata?.missionId) || normalizeNonEmptyString(subTaskCard?.missionId);
+  return normalizeNonEmptyString(metadata?.executionGroupId)
+    || normalizeNonEmptyString(subTaskCard?.executionGroupId);
 }
 
 export function resolveTimelineTaskCardScopeId(
@@ -83,7 +84,7 @@ export function resolveTimelineTaskCardScopeId(
   if (subTaskRequestId) {
     return subTaskRequestId;
   }
-  return normalizeNonEmptyString(metadata?.missionId);
+  return normalizeNonEmptyString(metadata?.executionGroupId);
 }
 
 export function buildTimelineAssignmentTaskKey(
@@ -143,4 +144,3 @@ export function resolveTimelineWorkerLaneId(
 
   return '';
 }
-

@@ -108,7 +108,12 @@ function normalizeIncomingEdits(state: AppState): Edit[] {
         previewCanOpenWorkspaceFile: change.previewCanOpenWorkspaceFile,
         contributors: change.contributors,
         workerId: change.workerId,
-        missionId: change.missionId,
+        executionGroupId: (typeof (change as { executionGroupId?: unknown }).executionGroupId === 'string'
+          ? (change as { executionGroupId?: string }).executionGroupId
+          : undefined)
+          || (typeof (change as { missionId?: unknown }).missionId === 'string'
+            ? (change as { missionId?: string }).missionId
+            : undefined),
       };
     });
 }
@@ -696,10 +701,11 @@ function normalizePlanLedgerRecord(plan: unknown): PlanLedgerRecord | null {
   if (!plan || typeof plan !== 'object') {
     return null;
   }
-  const candidate = plan as PlanLedgerRecord;
+  const candidate = plan as PlanLedgerRecord & { missionId?: string; executionGroupId?: string };
   if (typeof candidate.planId !== 'string' || typeof candidate.sessionId !== 'string') {
     return null;
   }
+  const { missionId: _legacyMissionId, ...rest } = candidate;
   const normalizedAttempts = ensureArray((candidate as { attempts?: unknown[] }).attempts)
     .filter((attempt): attempt is PlanLedgerAttempt => {
       if (!attempt || typeof attempt !== 'object') return false;
@@ -711,7 +717,13 @@ function normalizePlanLedgerRecord(plan: unknown): PlanLedgerRecord | null {
         && typeof a.status === 'string';
     });
   return {
-    ...candidate,
+    ...rest,
+    executionGroupId: (typeof candidate.executionGroupId === 'string'
+      ? candidate.executionGroupId
+      : undefined)
+      || (typeof _legacyMissionId === 'string'
+        ? _legacyMissionId
+        : undefined),
     attempts: normalizedAttempts,
   };
 }

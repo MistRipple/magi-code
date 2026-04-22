@@ -331,7 +331,7 @@ export interface DataPayload {
 
 export interface MessageMetadata {
   taskId?: string;
-  missionId?: string;
+  executionGroupId?: string;
   subTaskId?: string;
   assignmentId?: string;
   percentage?: number;

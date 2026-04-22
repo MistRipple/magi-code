@@ -12,7 +12,6 @@ pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/tasks/graph/{root_task_id}", get(get_task_projection))
         .route("/tasks/{task_id}", get(get_task))
-        .route("/tasks/mission/{mission_id}", get(get_tasks_by_mission))
         .route("/tasks/create", post(create_task))
         .route("/tasks/{task_id}/status", post(update_task_status))
         .route("/tasks/{task_id}/lease", get(get_task_lease))
@@ -54,18 +53,6 @@ async fn get_task(
         .ok_or_else(|| ApiError::not_found("任务不存在", &task_id))?;
     let value = serde_json::to_value(&task)
         .map_err(|err| ApiError::internal_assembly("序列化任务失败", err))?;
-    Ok(Json(value))
-}
-
-async fn get_tasks_by_mission(
-    State(state): State<ApiState>,
-    Path(mission_id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = require_task_store(&state)?;
-    let mid = MissionId::new(&mission_id);
-    let tasks = store.get_tasks_by_mission(&mid);
-    let value = serde_json::to_value(&tasks)
-        .map_err(|err| ApiError::internal_assembly("序列化任务列表失败", err))?;
     Ok(Json(value))
 }
 

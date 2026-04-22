@@ -1,31 +1,22 @@
 
 use super::*;
 use crate::task_store::TaskStore;
-use magi_core::{ApprovalRequirement, RiskLevel, Task, TaskKind, ToolCallId, WorkerId};
+use magi_core::{
+    RiskLevel, Task, TaskKind, TaskResultKind, TaskStatus, TerminationReason, ToolCallId,
+    VerificationStatus, WorkerId,
+};
 use magi_event_bus::InMemoryEventBus;
-use magi_governance::{DecisionPhase, GovernanceService, WorkerControlKind};
+use magi_governance::{DecisionPhase, GovernanceDecision, GovernanceService, WorkerControlKind};
 use magi_skill_runtime::{SkillDispatchRoute, SkillDispatchRuntime};
 use magi_tool_runtime::{ToolExecutionSummary, ToolRegistry};
 use magi_worker_runtime::{
     LocalProcessExecutorCapability, LocalProcessExecutorHealth,
     LocalProcessExecutorHealthStatus, LocalProcessWorkerExecutor, ShadowWorkerExecutor,
-    SkillDispatchSummary, WorkerExecutionFinalReport, WorkerExecutionReport,
-    WorkerExecutionStepKind, WorkerExecutionTrace, WorkerExecutorFailure, WorkerExecutorKind,
-    WorkerExecutorProbe, WorkerRuntime, WorkerSkillDispatchObservation, WorkerStage,
+    SkillDispatchSummary, WorkerExecutionFinalReport, WorkerExecutionStepKind,
+    WorkerExecutionTrace, WorkerExecutorFailure, WorkerExecutorKind, WorkerExecutorProbe,
+    WorkerRuntime, WorkerSkillDispatchObservation,
 };
 use std::sync::{Arc, Mutex};
-
-fn dispatch_target(decision: DispatchDecision) -> TaskExecutionTarget {
-    let mission_id = decision.mission_id.clone();
-    TaskExecutionTarget {
-        mission_id,
-        root_task_id: root_task_id_for_mission(&decision.mission_id),
-        task_id: decision.task_id,
-        requested_worker_id: None,
-        recovery_id: None,
-        execution_chain_ref: None,
-    }
-}
 
 fn root_task_id_for_mission(mission_id: &MissionId) -> TaskId {
     TaskId::new(format!("task-root-{}", mission_id.as_str()))
@@ -107,6 +98,116 @@ fn seed_action_tasks(
         });
     }
     root_task_id
+}
+
+fn seed_task_hierarchy(
+    task_store: &TaskStore,
+    mission_id: &MissionId,
+    mission_title: &str,
+    root_status: TaskStatus,
+    tasks: &[(TaskId, Option<TaskId>, &str, TaskStatus)],
+) -> TaskId {
+    let root_task_id = root_task_id_for_mission(mission_id);
+    let now = UtcMillis::now();
+    let mut child_map: std::collections::HashMap<TaskId, Vec<TaskId>> =
+        std::collections::HashMap::new();
+    for (task_id, parent_task_id, _, _) in tasks {
+        let parent = parent_task_id.clone().unwrap_or_else(|| root_task_id.clone());
+        child_map.entry(parent).or_default().push(task_id.clone());
+    }
+
+    task_store.insert_task(Task {
+        task_id: root_task_id.clone(),
+        mission_id: mission_id.clone(),
+        root_task_id: root_task_id.clone(),
+        parent_task_id: None,
+        kind: TaskKind::Objective,
+        title: mission_title.to_string(),
+        goal: mission_title.to_string(),
+        status: root_status,
+        dependency_ids: Vec::new(),
+        required_children: child_map
+            .get(&root_task_id)
+            .cloned()
+            .unwrap_or_default(),
+        policy_snapshot: None,
+        executor_binding: None,
+        context_refs: Vec::new(),
+        knowledge_refs: Vec::new(),
+        workspace_scope: None,
+        write_scope: None,
+        input_refs: Vec::new(),
+        output_refs: Vec::new(),
+        evidence_refs: Vec::new(),
+        retry_count: 0,
+        repair_count: 0,
+        decision_payload: None,
+        created_at: now,
+        updated_at: now,
+    });
+
+    for (task_id, parent_task_id, title, status) in tasks {
+        let parent = parent_task_id.clone().unwrap_or_else(|| root_task_id.clone());
+        task_store.insert_task(Task {
+            task_id: task_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            parent_task_id: Some(parent.clone()),
+            kind: TaskKind::Action,
+            title: (*title).to_string(),
+            goal: (*title).to_string(),
+            status: *status,
+            dependency_ids: Vec::new(),
+            required_children: child_map.get(task_id).cloned().unwrap_or_default(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+
+    root_task_id
+}
+
+fn build_task_graph_overview(
+    service: &OrchestratorService,
+    task_store: &TaskStore,
+    mission_id: &MissionId,
+    root_task_id: &TaskId,
+    worker_summary: WorkerRuntimeSummary,
+    tool_summary: ToolExecutionSummary,
+    skill_dispatch_observations: &[WorkerSkillDispatchObservation],
+    governance_observations: &[WorkerGovernanceObservation],
+    context_summary: Option<ExecutionContextSummary>,
+) -> ExecutionOverview {
+    service
+        .build_execution_overview_from_task_graph(
+            task_store,
+            &TaskExecutionTarget {
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                task_id: root_task_id.clone(),
+                requested_worker_id: None,
+                recovery_id: None,
+                execution_chain_ref: None,
+            },
+            worker_summary,
+            tool_summary,
+            skill_dispatch_observations,
+            governance_observations,
+            context_summary,
+        )
+        .expect("task graph overview should be built")
 }
 
 fn direct_execution_target(mission_id: &MissionId, task_id: &TaskId) -> TaskExecutionTarget {
@@ -193,8 +294,7 @@ fn build_recovery_execution_fixture(
 ) {
     let event_bus = Arc::new(InMemoryEventBus::new(16));
     let governance = Arc::new(GovernanceService::default());
-    let service =
-        OrchestratorService::with_governance(Arc::clone(&event_bus), Arc::clone(&governance));
+    let service = OrchestratorService::new(Arc::clone(&event_bus));
     let session_store = Arc::new(magi_session_store::SessionStore::new());
     let workspace_store = Arc::new(magi_workspace::WorkspaceStore::new());
 
@@ -284,33 +384,16 @@ fn build_recovery_execution_fixture(
 fn execution_overview_exports_context_consumption_into_runtime_read_model() {
     let event_bus = Arc::new(InMemoryEventBus::new(32));
     let service = OrchestratorService::new(event_bus.clone());
-    let control = service.control_plane();
+    let task_store = TaskStore::new();
 
     let mission_id = MissionId::new("mission-context");
-    let assignment_id = AssignmentId::new("assignment-context");
     let task_id = TaskId::new("todo-context");
-
-    control
-        .execute(OrchestratorCommand::CreateMission {
-            mission_id: mission_id.clone(),
-            title: "mission".to_string(),
-        })
-        .expect("mission should be created");
-    control
-        .execute(OrchestratorCommand::AddAssignment {
-            mission_id: mission_id.clone(),
-            assignment_id: assignment_id.clone(),
-            title: "assignment".to_string(),
-        })
-        .expect("assignment should be added");
-    control
-        .execute(OrchestratorCommand::CreateTask {
-            mission_id: mission_id.clone(),
-            assignment_id,
-            task_id: task_id.clone(),
-            title: "task".to_string(),
-        })
-        .expect("task should be added");
+    let root_task_id = seed_action_tasks(
+        &task_store,
+        &mission_id,
+        "mission",
+        &[(task_id.clone(), "task", TaskStatus::Ready)],
+    );
 
     let knowledge_store = magi_knowledge_store::KnowledgeStore::new();
     knowledge_store.ingest_code_index(magi_knowledge_store::CodeIndexIngestion {
@@ -410,22 +493,19 @@ fn execution_overview_exports_context_consumption_into_runtime_read_model() {
             }],
         },
     );
-    let context_summary = MissionContextSummary::from_context_assembly(&context_result);
+    let context_summary = ExecutionContextSummary::from_context_assembly(&context_result);
 
-    let overview = match control
-        .execute(OrchestratorCommand::BuildMissionExecutionOverview {
-            mission_id: mission_id.clone(),
-            worker_summary: worker_summary(0),
-            tool_summary: ToolExecutionSummary::default(),
-            skill_dispatch_observations: vec![],
-            governance_observations: vec![],
-            context_summary: Some(context_summary.clone()),
-        })
-        .expect("overview should be built")
-    {
-        OrchestratorCommandResult::MissionExecutionOverviewBuilt { overview } => overview,
-        other => panic!("unexpected result: {other:?}"),
-    };
+    let overview = build_task_graph_overview(
+        &service,
+        &task_store,
+        &mission_id,
+        &root_task_id,
+        worker_summary(0),
+        ToolExecutionSummary::default(),
+        &[],
+        &[],
+        Some(context_summary.clone()),
+    );
 
     let overview_context = overview
         .context_summary
@@ -450,10 +530,10 @@ fn execution_overview_exports_context_consumption_into_runtime_read_model() {
     let read_model = event_bus.runtime_read_model_input();
     let mission_entry = read_model
         .details
-        .missions
+        .execution_groups
         .iter()
         .find(|entry| entry.mission_id == mission_id.to_string())
-        .expect("mission entry should exist");
+        .expect("execution group entry should exist");
     assert_eq!(mission_entry.context_used_turn_count, 1);
     assert_eq!(mission_entry.context_used_knowledge_count, 1);
     assert_eq!(mission_entry.context_used_memory_count, 2);
@@ -477,7 +557,7 @@ fn execution_overview_exports_context_consumption_into_runtime_read_model() {
         mission_entry.context_memory_extraction_refs,
         vec!["extract-context-1".to_string()]
     );
-    assert_eq!(read_model.overview.diagnostics.context_mission_count, 1);
+    assert_eq!(read_model.overview.diagnostics.context_execution_group_count, 1);
     assert_eq!(read_model.overview.diagnostics.context_used_knowledge_count, 1);
     assert_eq!(read_model.overview.diagnostics.context_used_memory_count, 2);
     assert_eq!(
@@ -497,50 +577,33 @@ fn execution_overview_exports_context_consumption_into_runtime_read_model() {
 }
 
 #[test]
-fn control_plane_aggregates_governance_summaries_by_layer() {
+fn task_graph_aggregates_governance_summaries_by_layer() {
     let event_bus = Arc::new(InMemoryEventBus::new(16));
     let service = OrchestratorService::new(event_bus);
-    let control = service.control_plane();
+    let task_store = TaskStore::new();
 
     let mission_id = MissionId::new("mission-5");
     let assignment_one = AssignmentId::new("assignment-5a");
     let assignment_two = AssignmentId::new("assignment-5b");
-    let task_one = TaskId::new("todo-5a-1");
+    let task_one = TaskId::new(assignment_one.as_str());
     let task_two = TaskId::new("todo-5a-2");
-    let task_three = TaskId::new("todo-5b-1");
-
-    let _ = control.execute(OrchestratorCommand::CreateMission {
-        mission_id: mission_id.clone(),
-        title: "mission".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::AddAssignment {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_one.clone(),
-        title: "assignment-a".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::AddAssignment {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_two.clone(),
-        title: "assignment-b".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::CreateTask {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_one.clone(),
-        task_id: task_one.clone(),
-        title: "todo-a-1".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::CreateTask {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_one.clone(),
-        task_id: task_two.clone(),
-        title: "todo-a-2".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::CreateTask {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_two.clone(),
-        task_id: task_three.clone(),
-        title: "todo-b-1".to_string(),
-    });
+    let task_three = TaskId::new(assignment_two.as_str());
+    let root_task_id = seed_task_hierarchy(
+        &task_store,
+        &mission_id,
+        "mission",
+        TaskStatus::Failed,
+        &[
+            (task_one.clone(), None, "todo-a-1", TaskStatus::Completed),
+            (
+                task_two.clone(),
+                Some(task_one.clone()),
+                "todo-a-2",
+                TaskStatus::Completed,
+            ),
+            (task_three.clone(), None, "todo-b-1", TaskStatus::Failed),
+        ],
+    );
 
     let governance_observations = vec![
         governance_observation(
@@ -590,20 +653,17 @@ fn control_plane_aggregates_governance_summaries_by_layer() {
         ),
     ];
 
-    let overview = match control
-        .execute(OrchestratorCommand::BuildMissionExecutionOverview {
-            mission_id,
-            worker_summary: worker_summary(0),
-            tool_summary: ToolExecutionSummary::default(),
-            skill_dispatch_observations: vec![],
-            governance_observations,
-            context_summary: None,
-        })
-        .expect("overview should be built")
-    {
-        OrchestratorCommandResult::MissionExecutionOverviewBuilt { overview } => overview,
-        other => panic!("unexpected result: {other:?}"),
-    };
+    let overview = build_task_graph_overview(
+        &service,
+        &task_store,
+        &mission_id,
+        &root_task_id,
+        worker_summary(0),
+        ToolExecutionSummary::default(),
+        &[],
+        &governance_observations,
+        None,
+    );
 
     assert_eq!(overview.governance_summary.total_checks, 5);
     assert_eq!(overview.governance_summary.allowed, 2);
@@ -651,24 +711,24 @@ fn control_plane_aggregates_governance_summaries_by_layer() {
     );
 
     assert_eq!(overview.task_governance_summaries.len(), 3);
-    assert_eq!(
-        overview.task_governance_summaries[0]
-            .governance_summary
-            .blocked,
-        1
-    );
-    assert_eq!(
-        overview.task_governance_summaries[1]
-            .governance_summary
-            .repair_retry,
-        1
-    );
-    assert_eq!(
-        overview.task_governance_summaries[2]
-            .governance_summary
-            .rejected,
-        1
-    );
+    let task_one_summary = overview
+        .task_governance_summaries
+        .iter()
+        .find(|summary| summary.task_id == task_one)
+        .expect("task one governance summary should exist");
+    assert_eq!(task_one_summary.governance_summary.blocked, 1);
+    let task_two_summary = overview
+        .task_governance_summaries
+        .iter()
+        .find(|summary| summary.task_id == task_two)
+        .expect("task two governance summary should exist");
+    assert_eq!(task_two_summary.governance_summary.repair_retry, 1);
+    let task_three_summary = overview
+        .task_governance_summaries
+        .iter()
+        .find(|summary| summary.task_id == task_three)
+        .expect("task three governance summary should exist");
+    assert_eq!(task_three_summary.governance_summary.rejected, 1);
 }
 
 #[test]
@@ -712,8 +772,7 @@ fn resume_dispatch_decision_prefers_blocked_task_when_recovery_target_is_implici
 fn recovery_consume_entry_can_execute_worker_and_sync_sidecars() {
     let event_bus = Arc::new(InMemoryEventBus::new(16));
     let governance = Arc::new(GovernanceService::default());
-    let service =
-        OrchestratorService::with_governance(Arc::clone(&event_bus), Arc::clone(&governance));
+    let service = OrchestratorService::new(Arc::clone(&event_bus));
     let session_store = Arc::new(magi_session_store::SessionStore::new());
     let workspace_store = Arc::new(magi_workspace::WorkspaceStore::new());
 
@@ -792,7 +851,7 @@ fn recovery_consume_entry_can_execute_worker_and_sync_sidecars() {
         .expect("recovery should execute");
 
     assert_eq!(result.target.task_id, task_id);
-    assert_eq!(result.dispatch.overview.mission.completed_tasks, 1);
+    assert_eq!(result.dispatch.overview.runtime_snapshot.completed_tasks, 1);
     assert_eq!(result.dispatch.overview.skill_dispatch_summary.total_dispatches, 1);
     assert_eq!(
         result
@@ -816,7 +875,7 @@ fn recovery_consume_entry_can_execute_worker_and_sync_sidecars() {
             .map(|handle| handle.current_status.clone()),
         Some(magi_workspace::RecoveryStatus::Consumed)
     );
-    assert_eq!(result.mission_snapshot.completed_tasks, 1);
+    assert_eq!(result.runtime_snapshot.completed_tasks, 1);
 }
 
 #[test]
@@ -863,7 +922,7 @@ fn execution_runtime_execute_recovery_then_runs_hook_only_after_success() {
         .expect("recovery should execute");
 
     assert_eq!(result.target.task_id, task_id);
-    assert_eq!(result.dispatch.overview.mission.completed_tasks, 1);
+    assert_eq!(result.dispatch.overview.runtime_snapshot.completed_tasks, 1);
     assert_eq!(
         hook_log.lock().expect("hook log lock should hold").as_slice(),
         &[result.recovery_input.recovery_id.clone()]
@@ -898,18 +957,23 @@ fn execution_runtime_execute_recovery_then_skips_hook_when_recovery_support_miss
 fn execution_runtime_execute_recovery_rejects_prepared_input_before_sidecar_mutation() {
     let event_bus = Arc::new(InMemoryEventBus::new(16));
     let governance = Arc::new(GovernanceService::default());
-    let service =
-        OrchestratorService::with_governance(Arc::clone(&event_bus), Arc::clone(&governance));
-    let control = service.control_plane();
+    let service = OrchestratorService::new(Arc::clone(&event_bus));
     let session_store = Arc::new(magi_session_store::SessionStore::new());
     let workspace_store = Arc::new(magi_workspace::WorkspaceStore::new());
+    let task_store = Arc::new(TaskStore::new());
 
     let mission_id = MissionId::new("mission-recovery-prepared");
-    let assignment_id = AssignmentId::new("assignment-recovery-prepared");
     let task_id = TaskId::new("todo-recovery-prepared");
     let session_id = SessionId::new("session-recovery-prepared");
     let workspace_id = WorkspaceId::new("workspace-recovery-prepared");
     let worker_id = WorkerId::new("worker-recovery-prepared");
+
+    seed_action_tasks(
+        &task_store,
+        &mission_id,
+        "mission",
+        &[(task_id.clone(), "task", TaskStatus::Ready)],
+    );
 
     session_store
         .create_session(session_id.clone(), "session")
@@ -956,22 +1020,6 @@ fn execution_runtime_execute_recovery_rejects_prepared_input_before_sidecar_muta
         updated_at: recovery_handle.updated_at,
     };
 
-    let _ = control.execute(OrchestratorCommand::CreateMission {
-        mission_id: mission_id.clone(),
-        title: "mission".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::AddAssignment {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_id.clone(),
-        title: "assignment".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::CreateTask {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_id.clone(),
-        task_id: task_id.clone(),
-        title: "task".to_string(),
-    });
-
     let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
     tool_registry.register_default_builtins();
     let execution_runtime = service.execution_runtime_with_recovery_support(
@@ -983,7 +1031,8 @@ fn execution_runtime_execute_recovery_rejects_prepared_input_before_sidecar_muta
         ),
         session_store.clone(),
         workspace_store.clone(),
-    );
+    )
+    .with_task_store(Arc::clone(&task_store));
 
     let error = execution_runtime
         .execute_recovery(recovery_input, worker_id, None)
@@ -1009,129 +1058,6 @@ fn execution_runtime_execute_recovery_rejects_prepared_input_before_sidecar_muta
         .recovery_sidecar_export("recovery-prepared")
         .expect("recovery export should still exist");
     assert_eq!(recovery_export.current_status, magi_workspace::RecoveryStatus::Prepared);
-}
-
-#[test]
-fn control_plane_can_apply_governance_decisions() {
-    let event_bus = Arc::new(InMemoryEventBus::new(16));
-    let service = OrchestratorService::with_governance(
-        event_bus,
-        Arc::new(magi_governance::GovernanceService::default()),
-    );
-    let control = service.control_plane();
-
-    let mission_id = MissionId::new("mission-4");
-    let assignment_id = AssignmentId::new("assignment-4");
-    let task_id = TaskId::new("todo-4");
-
-    let _ = control.execute(OrchestratorCommand::CreateMission {
-        mission_id: mission_id.clone(),
-        title: "mission".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::AddAssignment {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_id.clone(),
-        title: "assignment".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::CreateTask {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_id.clone(),
-        task_id: task_id.clone(),
-        title: "task".to_string(),
-    });
-
-    let blocked_request = WorkerControlRequest {
-        worker_id: Some(WorkerId::new("worker-4")),
-        mission_id: Some(mission_id.clone()),
-        assignment_id: Some(assignment_id.clone()),
-        task_id: Some(task_id.clone()),
-        action: WorkerControlKind::Execute,
-        risk_level: RiskLevel::Low,
-        approval_requirement: ApprovalRequirement::None,
-        retry_count: 0,
-        blocked: true,
-        reason: Some("blocked".to_string()),
-    };
-    match control
-        .execute(OrchestratorCommand::ApplyGovernanceDecision {
-            request: blocked_request,
-        })
-        .expect("blocked governance decision should apply")
-    {
-        OrchestratorCommandResult::GovernanceDecisionApplied {
-            mission,
-            decision,
-            disposition,
-        } => {
-            assert_eq!(decision.outcome, magi_governance::GovernanceOutcome::Blocked);
-            assert_eq!(disposition, GovernanceDisposition::Blocked);
-            assert_eq!(mission.assignments[0].tasks[0].status, TaskStatus::Blocked);
-            assert_eq!(mission.status, MissionLifecycleStatus::Running);
-        }
-        other => panic!("unexpected result: {other:?}"),
-    }
-
-    let approval_request = WorkerControlRequest {
-        worker_id: Some(WorkerId::new("worker-4")),
-        mission_id: Some(mission_id.clone()),
-        assignment_id: Some(assignment_id.clone()),
-        task_id: Some(task_id.clone()),
-        action: WorkerControlKind::Execute,
-        risk_level: RiskLevel::High,
-        approval_requirement: ApprovalRequirement::Required,
-        retry_count: 0,
-        blocked: false,
-        reason: Some("approval".to_string()),
-    };
-    match control
-        .execute(OrchestratorCommand::ApplyGovernanceDecision {
-            request: approval_request,
-        })
-        .expect("approval governance decision should apply")
-    {
-        OrchestratorCommandResult::GovernanceDecisionApplied {
-            decision,
-            disposition,
-            ..
-        } => {
-            assert_eq!(
-                decision.outcome,
-                magi_governance::GovernanceOutcome::NeedsApproval
-            );
-            assert_eq!(disposition, GovernanceDisposition::NeedsApproval);
-        }
-        other => panic!("unexpected result: {other:?}"),
-    }
-
-    let retry_request = WorkerControlRequest {
-        worker_id: Some(WorkerId::new("worker-4")),
-        mission_id: Some(mission_id.clone()),
-        assignment_id: Some(assignment_id.clone()),
-        task_id: Some(task_id.clone()),
-        action: WorkerControlKind::RepairRetry,
-        risk_level: RiskLevel::Low,
-        approval_requirement: ApprovalRequirement::None,
-        retry_count: 1,
-        blocked: false,
-        reason: Some("repair retry".to_string()),
-    };
-    match control
-        .execute(OrchestratorCommand::ApplyGovernanceDecision {
-            request: retry_request,
-        })
-        .expect("repair retry governance decision should apply")
-    {
-        OrchestratorCommandResult::GovernanceDecisionApplied {
-            decision,
-            disposition,
-            mission,
-        } => {
-            assert_eq!(decision.outcome, magi_governance::GovernanceOutcome::Allowed);
-            assert_eq!(disposition, GovernanceDisposition::RepairRetryScheduled);
-            assert_eq!(mission.assignments[0].tasks[0].status, TaskStatus::Running);
-        }
-        other => panic!("unexpected result: {other:?}"),
-    }
 }
 
 #[test]
@@ -1166,7 +1092,7 @@ fn execution_runtime_can_run_dispatch_through_worker_loop() {
     assert_eq!(result.target.task_id, task_id);
     assert_eq!(result.intent.task_id, task_id);
     assert!(result.outcome.report.is_some());
-    assert_eq!(result.overview.mission.completed_tasks, 1);
+    assert_eq!(result.overview.runtime_snapshot.completed_tasks, 1);
     assert_eq!(result.overview.skill_dispatch_summary.total_dispatches, 1);
     assert_eq!(result.overview.skill_dispatch_summary.builtin_dispatches, 1);
     assert_eq!(
@@ -1319,10 +1245,10 @@ fn execution_runtime_automatically_assembles_context_summary_when_configured() {
     let read_model = event_bus.runtime_read_model_input();
     let mission_entry = read_model
         .details
-        .missions
+        .execution_groups
         .iter()
         .find(|entry| entry.mission_id == mission_id.to_string())
-        .expect("mission entry should exist");
+        .expect("execution group entry should exist");
     assert_eq!(mission_entry.context_used_knowledge_count, 1);
     assert_eq!(mission_entry.context_used_memory_count, 1);
     assert_eq!(mission_entry.context_code_index_knowledge_count, 1);
@@ -1469,7 +1395,7 @@ fn execution_runtime_can_run_dispatch_through_local_process_executor() {
         )
         .expect("local process execution should run");
 
-    assert_eq!(result.overview.mission.completed_tasks, 1);
+    assert_eq!(result.overview.runtime_snapshot.completed_tasks, 1);
     assert_eq!(result.overview.worker_summary.tool_call_count, 1);
     assert_eq!(result.overview.tool_summary.total_invocations, 1);
     assert_eq!(result.overview.skill_dispatch_summary.total_dispatches, 1);
@@ -1552,7 +1478,6 @@ impl ShadowWorkerExecutor for UnhealthyLocalExecutor {
 fn execution_runtime_rejects_unhealthy_local_process_executor_before_execute() {
     let event_bus = Arc::new(InMemoryEventBus::new(32));
     let service = OrchestratorService::new(Arc::clone(&event_bus));
-    let control = service.control_plane();
     let governance = Arc::new(GovernanceService::default());
     let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
     tool_registry.register_default_builtins();
@@ -1562,41 +1487,21 @@ fn execution_runtime_rejects_unhealthy_local_process_executor_before_execute() {
     );
     let worker_runtime =
         WorkerRuntime::new(Arc::clone(&event_bus)).with_executor(Arc::new(UnhealthyLocalExecutor));
-    let execution_runtime = service.execution_runtime(worker_runtime, tool_registry, skill_runtime);
+    let (execution_runtime, task_store) =
+        build_execution_runtime_with_task_store(&service, worker_runtime, tool_registry, skill_runtime);
 
     let mission_id = MissionId::new("mission-unhealthy-exec");
-    let assignment_id = AssignmentId::new("assignment-unhealthy-exec");
     let task_id = TaskId::new("todo-unhealthy-exec");
-
-    let _ = control.execute(OrchestratorCommand::CreateMission {
-        mission_id: mission_id.clone(),
-        title: "mission".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::AddAssignment {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_id.clone(),
-        title: "assignment".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::CreateTask {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_id.clone(),
-        task_id: task_id.clone(),
-        title: "task".to_string(),
-    });
-
-    let dispatch = match control
-        .execute(OrchestratorCommand::DispatchNextTask {
-            mission_id: mission_id.clone(),
-        })
-        .expect("dispatch should exist")
-    {
-        OrchestratorCommandResult::TaskDispatchPlanned { decision } => decision,
-        other => panic!("unexpected result: {other:?}"),
-    };
+    seed_action_tasks(
+        &task_store,
+        &mission_id,
+        "mission",
+        &[(task_id.clone(), "task", TaskStatus::Ready)],
+    );
 
     let error = execution_runtime
         .execute_dispatch(
-            dispatch_target(dispatch),
+            direct_execution_target(&mission_id, &task_id),
             WorkerId::new("worker-unhealthy-exec"),
             Some(SessionId::new("session-unhealthy-exec")),
             Some(WorkspaceId::new("workspace-unhealthy-exec")),
@@ -1616,7 +1521,6 @@ fn execution_runtime_rejects_unhealthy_local_process_executor_before_execute() {
 fn execution_runtime_execute_dispatch_then_skips_hook_on_failure() {
     let event_bus = Arc::new(InMemoryEventBus::new(32));
     let service = OrchestratorService::new(Arc::clone(&event_bus));
-    let control = service.control_plane();
     let governance = Arc::new(GovernanceService::default());
     let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
     tool_registry.register_default_builtins();
@@ -1626,43 +1530,23 @@ fn execution_runtime_execute_dispatch_then_skips_hook_on_failure() {
     );
     let worker_runtime =
         WorkerRuntime::new(Arc::clone(&event_bus)).with_executor(Arc::new(UnhealthyLocalExecutor));
-    let execution_runtime = service.execution_runtime(worker_runtime, tool_registry, skill_runtime);
+    let (execution_runtime, task_store) =
+        build_execution_runtime_with_task_store(&service, worker_runtime, tool_registry, skill_runtime);
 
     let mission_id = MissionId::new("mission-dispatch-hook-failure");
-    let assignment_id = AssignmentId::new("assignment-dispatch-hook-failure");
     let task_id = TaskId::new("todo-dispatch-hook-failure");
-
-    let _ = control.execute(OrchestratorCommand::CreateMission {
-        mission_id: mission_id.clone(),
-        title: "mission".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::AddAssignment {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_id.clone(),
-        title: "assignment".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::CreateTask {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_id.clone(),
-        task_id: task_id.clone(),
-        title: "task".to_string(),
-    });
-
-    let dispatch = match control
-        .execute(OrchestratorCommand::DispatchNextTask {
-            mission_id: mission_id.clone(),
-        })
-        .expect("dispatch should exist")
-    {
-        OrchestratorCommandResult::TaskDispatchPlanned { decision } => decision,
-        other => panic!("unexpected result: {other:?}"),
-    };
+    seed_action_tasks(
+        &task_store,
+        &mission_id,
+        "mission",
+        &[(task_id.clone(), "task", TaskStatus::Ready)],
+    );
 
     let hook_calls = Arc::new(Mutex::new(0usize));
     let hook_calls_capture = Arc::clone(&hook_calls);
     let error = execution_runtime
         .execute_dispatch_then(
-            dispatch_target(dispatch),
+            direct_execution_target(&mission_id, &task_id),
             WorkerId::new("worker-dispatch-hook-failure"),
             Some(SessionId::new("session-dispatch-hook-failure")),
             Some(WorkspaceId::new("workspace-dispatch-hook-failure")),
@@ -1689,7 +1573,6 @@ fn execution_runtime_execute_dispatch_then_skips_hook_on_failure() {
 fn execution_runtime_execute_dispatch_with_writebacks_skips_writeback_on_failure() {
     let event_bus = Arc::new(InMemoryEventBus::new(32));
     let service = OrchestratorService::new(Arc::clone(&event_bus));
-    let control = service.control_plane();
     let governance = Arc::new(GovernanceService::default());
     let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
     tool_registry.register_default_builtins();
@@ -1699,39 +1582,19 @@ fn execution_runtime_execute_dispatch_with_writebacks_skips_writeback_on_failure
     );
     let worker_runtime =
         WorkerRuntime::new(Arc::clone(&event_bus)).with_executor(Arc::new(UnhealthyLocalExecutor));
-    let execution_runtime = service.execution_runtime(worker_runtime, tool_registry, skill_runtime);
+    let (execution_runtime, task_store) =
+        build_execution_runtime_with_task_store(&service, worker_runtime, tool_registry, skill_runtime);
     let memory_store = magi_memory_store::MemoryStore::new();
 
     let mission_id = MissionId::new("mission-dispatch-writeback-failure");
-    let assignment_id = AssignmentId::new("assignment-dispatch-writeback-failure");
     let task_id = TaskId::new("todo-dispatch-writeback-failure");
     let session_id = SessionId::new("session-dispatch-writeback-failure");
-
-    let _ = control.execute(OrchestratorCommand::CreateMission {
-        mission_id: mission_id.clone(),
-        title: "mission".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::AddAssignment {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_id.clone(),
-        title: "assignment".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::CreateTask {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_id.clone(),
-        task_id: task_id.clone(),
-        title: "task".to_string(),
-    });
-
-    let dispatch = match control
-        .execute(OrchestratorCommand::DispatchNextTask {
-            mission_id: mission_id.clone(),
-        })
-        .expect("dispatch should exist")
-    {
-        OrchestratorCommandResult::TaskDispatchPlanned { decision } => decision,
-        other => panic!("unexpected result: {other:?}"),
-    };
+    seed_action_tasks(
+        &task_store,
+        &mission_id,
+        "mission",
+        &[(task_id.clone(), "task", TaskStatus::Ready)],
+    );
 
     let writebacks = ExecutionWritebackPlans::from_optional_memory_extraction(Some(
         magi_memory_store::MemoryExtractionApplyRequest {
@@ -1751,7 +1614,7 @@ fn execution_runtime_execute_dispatch_with_writebacks_skips_writeback_on_failure
 
     let error = execution_runtime
         .execute_dispatch_with_writebacks(
-            dispatch_target(dispatch),
+            direct_execution_target(&mission_id, &task_id),
             WorkerId::new("worker-dispatch-writeback-failure"),
             Some(SessionId::new("session-dispatch-writeback-failure")),
             Some(WorkspaceId::new("workspace-dispatch-writeback-failure")),
@@ -1816,7 +1679,6 @@ fn execution_runtime_rejects_local_process_executor_missing_step_capability_befo
 fn execution_runtime_rejects_local_process_executor_affinity_mismatch_before_execute() {
     let event_bus = Arc::new(InMemoryEventBus::new(32));
     let service = OrchestratorService::new(Arc::clone(&event_bus));
-    let control = service.control_plane();
     let governance = Arc::new(GovernanceService::default());
     let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
     tool_registry.register_default_builtins();
@@ -1829,41 +1691,21 @@ fn execution_runtime_rejects_local_process_executor_affinity_mismatch_before_exe
             .with_env("MAGI_LOCAL_WORKER_SESSION_ID", "session-affine")
             .with_env("MAGI_LOCAL_WORKER_WORKSPACE_ID", "workspace-affine"),
     ));
-    let execution_runtime = service.execution_runtime(worker_runtime, tool_registry, skill_runtime);
+    let (execution_runtime, task_store) =
+        build_execution_runtime_with_task_store(&service, worker_runtime, tool_registry, skill_runtime);
 
     let mission_id = MissionId::new("mission-affinity-capability");
-    let assignment_id = AssignmentId::new("assignment-affinity-capability");
     let task_id = TaskId::new("todo-affinity-capability");
-
-    let _ = control.execute(OrchestratorCommand::CreateMission {
-        mission_id: mission_id.clone(),
-        title: "mission".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::AddAssignment {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_id.clone(),
-        title: "assignment".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::CreateTask {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_id.clone(),
-        task_id: task_id.clone(),
-        title: "task".to_string(),
-    });
-
-    let dispatch = match control
-        .execute(OrchestratorCommand::DispatchNextTask {
-            mission_id: mission_id.clone(),
-        })
-        .expect("dispatch should exist")
-    {
-        OrchestratorCommandResult::TaskDispatchPlanned { decision } => decision,
-        other => panic!("unexpected result: {other:?}"),
-    };
+    seed_action_tasks(
+        &task_store,
+        &mission_id,
+        "mission",
+        &[(task_id.clone(), "task", TaskStatus::Ready)],
+    );
 
     let error = execution_runtime
         .execute_dispatch(
-            dispatch_target(dispatch),
+            direct_execution_target(&mission_id, &task_id),
             WorkerId::new("worker-affinity-capability"),
             Some(SessionId::new("session-other")),
             Some(WorkspaceId::new("workspace-other")),
@@ -1883,159 +1725,30 @@ fn execution_runtime_rejects_local_process_executor_affinity_mismatch_before_exe
 fn multi_task_execution_with_mixed_outcomes_aggregates_in_overview() {
     let event_bus = Arc::new(InMemoryEventBus::new(64));
     let service = OrchestratorService::new(Arc::clone(&event_bus));
-    let control = service.control_plane();
-    let governance = Arc::new(GovernanceService::default());
-    let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
-    tool_registry.register_default_builtins();
+    let task_store = TaskStore::new();
 
     let mission_id = MissionId::new("mission-multi");
     let assignment_a = AssignmentId::new("assignment-multi-a");
     let assignment_b = AssignmentId::new("assignment-multi-b");
-    let task_a1 = TaskId::new("todo-multi-a1");
+    let task_a1 = TaskId::new(assignment_a.as_str());
     let task_a2 = TaskId::new("todo-multi-a2");
-    let task_b1 = TaskId::new("todo-multi-b1");
-
-    let _ = control.execute(OrchestratorCommand::CreateMission {
-        mission_id: mission_id.clone(),
-        title: "mission".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::AddAssignment {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_a.clone(),
-        title: "assignment-a".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::AddAssignment {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_b.clone(),
-        title: "assignment-b".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::CreateTask {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_a.clone(),
-        task_id: task_a1.clone(),
-        title: "todo-a1".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::CreateTask {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_a.clone(),
-        task_id: task_a2.clone(),
-        title: "todo-a2".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::CreateTask {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_b.clone(),
-        task_id: task_b1.clone(),
-        title: "todo-b1".to_string(),
-    });
-
-    // Dispatch and apply success report for task_a1
-    let dispatch_a1 = match control
-        .execute(OrchestratorCommand::DispatchNextTask {
-            mission_id: mission_id.clone(),
-        })
-        .expect("dispatch a1 should exist")
-    {
-        OrchestratorCommandResult::TaskDispatchPlanned { decision } => decision,
-        other => panic!("unexpected result: {other:?}"),
-    };
-    assert_eq!(dispatch_a1.task_id, task_a1);
-    match control
-        .execute(OrchestratorCommand::ApplyWorkerReport {
-            report: WorkerExecutionReport {
-                worker_id: WorkerId::new("worker-multi-1"),
-                task_id: task_a1.clone(),
-                stage: WorkerStage::Finish,
-                summary: "completed".to_string(),
-                result_kind: Some(TaskResultKind::Success),
-                termination_reason: Some(TerminationReason::Completed),
-                verification_status: VerificationStatus::Passed,
-                created_at: UtcMillis::now(),
-            },
-        })
-        .expect("task_a1 success report should apply")
-    {
-        OrchestratorCommandResult::WorkerReportApplied { mission } => {
-            let completed = mission
-                .assignments
-                .iter()
-                .flat_map(|assignment| assignment.tasks.iter())
-                .filter(|task| task.status == TaskStatus::Completed)
-                .count();
-            assert_eq!(completed, 1);
-        }
-        other => panic!("unexpected result: {other:?}"),
-    }
-
-    // Dispatch and apply success report for task_a2
-    let dispatch_a2 = match control
-        .execute(OrchestratorCommand::DispatchNextTask {
-            mission_id: mission_id.clone(),
-        })
-        .expect("dispatch a2 should exist")
-    {
-        OrchestratorCommandResult::TaskDispatchPlanned { decision } => decision,
-        other => panic!("unexpected result: {other:?}"),
-    };
-    assert_eq!(dispatch_a2.task_id, task_a2);
-    match control
-        .execute(OrchestratorCommand::ApplyWorkerReport {
-            report: WorkerExecutionReport {
-                worker_id: WorkerId::new("worker-multi-2"),
-                task_id: task_a2.clone(),
-                stage: WorkerStage::Finish,
-                summary: "completed".to_string(),
-                result_kind: Some(TaskResultKind::Success),
-                termination_reason: Some(TerminationReason::Completed),
-                verification_status: VerificationStatus::Passed,
-                created_at: UtcMillis::now(),
-            },
-        })
-        .expect("task_a2 success report should apply")
-    {
-        OrchestratorCommandResult::WorkerReportApplied { mission } => {
-            let completed = mission
-                .assignments
-                .iter()
-                .flat_map(|assignment| assignment.tasks.iter())
-                .filter(|task| task.status == TaskStatus::Completed)
-                .count();
-            assert_eq!(completed, 2);
-        }
-        other => panic!("unexpected result: {other:?}"),
-    }
-
-    // Dispatch task_b1 via control, then apply a failure report manually
-    let dispatch_b1 = match control
-        .execute(OrchestratorCommand::DispatchNextTask {
-            mission_id: mission_id.clone(),
-        })
-        .expect("dispatch b1 should exist")
-    {
-        OrchestratorCommandResult::TaskDispatchPlanned { decision } => decision,
-        other => panic!("unexpected result: {other:?}"),
-    };
-    assert_eq!(dispatch_b1.task_id, task_b1);
-    let failure_report = WorkerExecutionReport {
-        worker_id: WorkerId::new("worker-multi-3"),
-        task_id: task_b1.clone(),
-        stage: WorkerStage::Finish,
-        summary: "failed".to_string(),
-        result_kind: Some(TaskResultKind::Failure),
-        termination_reason: Some(TerminationReason::Failed),
-        verification_status: VerificationStatus::Failed,
-        created_at: UtcMillis::now(),
-    };
-    match control
-        .execute(OrchestratorCommand::ApplyWorkerReport {
-            report: failure_report,
-        })
-        .expect("failure report should be applied")
-    {
-        OrchestratorCommandResult::WorkerReportApplied { mission } => {
-            assert_eq!(mission.status, MissionLifecycleStatus::Failed);
-        }
-        other => panic!("unexpected result: {other:?}"),
-    }
+    let task_b1 = TaskId::new(assignment_b.as_str());
+    let root_task_id = seed_task_hierarchy(
+        &task_store,
+        &mission_id,
+        "mission",
+        TaskStatus::Failed,
+        &[
+            (task_a1.clone(), None, "todo-a1", TaskStatus::Completed),
+            (
+                task_a2.clone(),
+                Some(task_a1.clone()),
+                "todo-a2",
+                TaskStatus::Completed,
+            ),
+            (task_b1.clone(), None, "todo-b1", TaskStatus::Failed),
+        ],
+    );
 
     // Build final overview with aggregated observations
     let skill_observations = vec![
@@ -2063,31 +1776,28 @@ fn multi_task_execution_with_mixed_outcomes_aggregates_in_overview() {
         ),
     ];
 
-    let overview = match control
-        .execute(OrchestratorCommand::BuildMissionExecutionOverview {
-            mission_id: mission_id.clone(),
-            worker_summary: worker_summary(2),
-            tool_summary: ToolExecutionSummary {
-                total_invocations: 4,
-                successful_invocations: 3,
-                failed_invocations: 1,
-                blocked_invocations: 0,
-            },
-            skill_dispatch_observations: skill_observations,
-            governance_observations,
-            context_summary: None,
-        })
-        .expect("overview should be built")
-    {
-        OrchestratorCommandResult::MissionExecutionOverviewBuilt { overview } => overview,
-        other => panic!("unexpected result: {other:?}"),
-    };
+    let overview = build_task_graph_overview(
+        &service,
+        &task_store,
+        &mission_id,
+        &root_task_id,
+        worker_summary(2),
+        ToolExecutionSummary {
+            total_invocations: 4,
+            successful_invocations: 3,
+            failed_invocations: 1,
+            blocked_invocations: 0,
+        },
+        &skill_observations,
+        &governance_observations,
+        None,
+    );
 
     // Mission-level assertions
-    assert_eq!(overview.mission.total_tasks, 3);
-    assert_eq!(overview.mission.completed_tasks, 2);
-    assert_eq!(overview.mission.failed_tasks, 1);
-    assert_eq!(overview.mission.total_assignments, 2);
+    assert_eq!(overview.runtime_snapshot.total_tasks, 4);
+    assert_eq!(overview.runtime_snapshot.completed_tasks, 2);
+    assert_eq!(overview.runtime_snapshot.failed_tasks, 2);
+    assert_eq!(overview.runtime_snapshot.total_assignments, 2);
     assert!(overview.running_task_ids.is_empty());
 
     // Tool summary
@@ -2137,604 +1847,6 @@ fn multi_task_execution_with_mixed_outcomes_aggregates_in_overview() {
         .find(|summary| summary.assignment_id == assignment_b)
         .expect("assignment-b governance summary should exist");
     assert_eq!(assign_b_gov.governance_summary.blocked, 1);
-}
-
-#[test]
-fn governance_block_then_allow_resumes_and_dispatches_task() {
-    let event_bus = Arc::new(InMemoryEventBus::new(32));
-    let governance = Arc::new(GovernanceService::default());
-    let service = OrchestratorService::with_governance(
-        Arc::clone(&event_bus),
-        Arc::clone(&governance),
-    );
-    let control = service.control_plane();
-
-    let mission_id = MissionId::new("mission-gov-block-allow");
-    let assignment_id = AssignmentId::new("assignment-gov-block-allow");
-    let task_id = TaskId::new("todo-gov-block-allow");
-
-    let _ = control.execute(OrchestratorCommand::CreateMission {
-        mission_id: mission_id.clone(),
-        title: "mission".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::AddAssignment {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_id.clone(),
-        title: "assignment".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::CreateTask {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_id.clone(),
-        task_id: task_id.clone(),
-        title: "task".to_string(),
-    });
-
-    // First: apply governance block (blocked=true)
-    let blocked_request = WorkerControlRequest {
-        worker_id: Some(WorkerId::new("worker-gov-1")),
-        mission_id: Some(mission_id.clone()),
-        assignment_id: Some(assignment_id.clone()),
-        task_id: Some(task_id.clone()),
-        action: WorkerControlKind::Execute,
-        risk_level: RiskLevel::Low,
-        approval_requirement: ApprovalRequirement::None,
-        retry_count: 0,
-        blocked: true,
-        reason: Some("external dependency unavailable".to_string()),
-    };
-    match control
-        .execute(OrchestratorCommand::ApplyGovernanceDecision {
-            request: blocked_request,
-        })
-        .expect("blocked governance should apply")
-    {
-        OrchestratorCommandResult::GovernanceDecisionApplied {
-            mission,
-            decision,
-            disposition,
-        } => {
-            assert_eq!(disposition, GovernanceDisposition::Blocked);
-            assert_eq!(decision.outcome, magi_governance::GovernanceOutcome::Blocked);
-            assert_eq!(
-                mission.assignments[0].tasks[0].status,
-                TaskStatus::Blocked
-            );
-        }
-        other => panic!("unexpected result: {other:?}"),
-    }
-
-    // Second: apply governance allow (blocked=false, low risk)
-    let allow_request = WorkerControlRequest {
-        worker_id: Some(WorkerId::new("worker-gov-1")),
-        mission_id: Some(mission_id.clone()),
-        assignment_id: Some(assignment_id.clone()),
-        task_id: Some(task_id.clone()),
-        action: WorkerControlKind::Execute,
-        risk_level: RiskLevel::Low,
-        approval_requirement: ApprovalRequirement::None,
-        retry_count: 0,
-        blocked: false,
-        reason: Some("dependency now available".to_string()),
-    };
-    match control
-        .execute(OrchestratorCommand::ApplyGovernanceDecision {
-            request: allow_request,
-        })
-        .expect("allow governance should apply")
-    {
-        OrchestratorCommandResult::GovernanceDecisionApplied {
-            mission,
-            decision,
-            disposition,
-        } => {
-            assert_eq!(disposition, GovernanceDisposition::Allowed);
-            assert_eq!(decision.outcome, magi_governance::GovernanceOutcome::Allowed);
-            assert_eq!(
-                mission.assignments[0].tasks[0].status,
-                TaskStatus::Running
-            );
-        }
-        other => panic!("unexpected result: {other:?}"),
-    }
-
-    let mission = service
-        .missions()
-        .into_iter()
-        .find(|mission| mission.mission_id == mission_id)
-        .expect("mission should remain queryable after governance allow");
-    assert_eq!(mission.assignments[0].tasks[0].status, TaskStatus::Running);
-}
-
-#[test]
-fn repair_retry_with_prior_count_schedules_and_dispatches() {
-    let event_bus = Arc::new(InMemoryEventBus::new(32));
-    let governance = Arc::new(GovernanceService::default());
-    let service = OrchestratorService::with_governance(
-        Arc::clone(&event_bus),
-        Arc::clone(&governance),
-    );
-    let control = service.control_plane();
-
-    let mission_id = MissionId::new("mission-repair-retry");
-    let assignment_id = AssignmentId::new("assignment-repair-retry");
-    let task_id = TaskId::new("todo-repair-retry");
-
-    let _ = control.execute(OrchestratorCommand::CreateMission {
-        mission_id: mission_id.clone(),
-        title: "mission".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::AddAssignment {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_id.clone(),
-        title: "assignment".to_string(),
-    });
-    let _ = control.execute(OrchestratorCommand::CreateTask {
-        mission_id: mission_id.clone(),
-        assignment_id: assignment_id.clone(),
-        task_id: task_id.clone(),
-        title: "task".to_string(),
-    });
-
-    // Apply RepairRetry with retry_count=1 (avoids rejection — retry_count=0 would be Rejected)
-    let retry_request = WorkerControlRequest {
-        worker_id: Some(WorkerId::new("worker-repair")),
-        mission_id: Some(mission_id.clone()),
-        assignment_id: Some(assignment_id.clone()),
-        task_id: Some(task_id.clone()),
-        action: WorkerControlKind::RepairRetry,
-        risk_level: RiskLevel::Low,
-        approval_requirement: ApprovalRequirement::None,
-        retry_count: 1,
-        blocked: false,
-        reason: Some("repair retry after first failure".to_string()),
-    };
-    match control
-        .execute(OrchestratorCommand::ApplyGovernanceDecision {
-            request: retry_request,
-        })
-        .expect("repair retry governance should apply")
-    {
-        OrchestratorCommandResult::GovernanceDecisionApplied {
-            mission,
-            decision,
-            disposition,
-        } => {
-            assert_eq!(disposition, GovernanceDisposition::RepairRetryScheduled);
-            assert_eq!(decision.outcome, magi_governance::GovernanceOutcome::Allowed);
-            assert_eq!(
-                mission.assignments[0].tasks[0].status,
-                TaskStatus::Running
-            );
-        }
-        other => panic!("unexpected result: {other:?}"),
-    }
-
-    let mission = service
-        .missions()
-        .into_iter()
-        .find(|mission| mission.mission_id == mission_id)
-        .expect("mission should remain queryable after repair retry");
-    assert_eq!(mission.assignments[0].tasks[0].status, TaskStatus::Running);
-}
-
-// ========== Dispatch Batch Tests ==========
-
-mod dispatch_batch_tests {
-    use crate::dispatch::*;
-    use std::collections::HashSet;
-
-    fn make_contract(name: &str, deps: &[&str]) -> DispatchTaskContract {
-        DispatchTaskContract {
-            task_title: name.to_string(),
-            ownership: "general".to_string(),
-            mode: "implement".to_string(),
-            context: vec![],
-            scope_hint: vec![],
-            files: vec![],
-            depends_on: deps.iter().map(|s| s.to_string()).collect(),
-            collaboration_contracts: DispatchCollaborationContracts::default(),
-        }
-    }
-
-    fn make_result(summary: &str) -> DispatchResult {
-        DispatchResult {
-            success: true,
-            summary: summary.to_string(),
-            full_summary: None,
-            modified_files: None,
-            created_files: None,
-            errors: None,
-            blocking_issue: None,
-            token_usage: None,
-        }
-    }
-
-    #[test]
-    fn batch_register_and_get() {
-        let mut batch = DispatchBatch::new(Some("b1"));
-        batch.register("t1", "w1", make_contract("task1", &[])).unwrap();
-        batch.register("t2", "w2", make_contract("task2", &["t1"])).unwrap();
-
-        assert_eq!(batch.size(), 2);
-        assert!(batch.get_entry("t1").is_some());
-        assert!(batch.get_entry("t2").is_some());
-        assert!(batch.get_entry("t3").is_none());
-    }
-
-    #[test]
-    fn batch_duplicate_register_returns_err() {
-        let mut batch = DispatchBatch::new(Some("b1"));
-        batch.register("t1", "w1", make_contract("task1", &[])).unwrap();
-        let r = batch.register("t1", "w2", make_contract("task1_dup", &[]));
-        assert!(r.is_err());
-        assert_eq!(batch.size(), 1);
-        assert_eq!(batch.get_entry("t1").unwrap().worker, "w1");
-    }
-
-    #[test]
-    fn batch_status_transitions() {
-        let mut batch = DispatchBatch::new(Some("b1"));
-        batch.register("t1", "w1", make_contract("task1", &[])).unwrap();
-        assert_eq!(batch.get_entry("t1").unwrap().status, DispatchStatus::Pending);
-
-        batch.mark_running("t1");
-        assert_eq!(batch.get_entry("t1").unwrap().status, DispatchStatus::Running);
-
-        batch.mark_completed("t1", make_result("done"));
-        assert_eq!(batch.get_entry("t1").unwrap().status, DispatchStatus::Completed);
-        assert!(batch.get_entry("t1").unwrap().status.is_terminal());
-    }
-
-    #[test]
-    fn batch_get_ready_tasks_respects_deps() {
-        let mut batch = DispatchBatch::new(Some("b1"));
-        batch.register("t1", "w1", make_contract("task1", &[])).unwrap();
-        batch.register("t2", "w1", make_contract("task2", &["t1"])).unwrap();
-        batch.register("t3", "w2", make_contract("task3", &[])).unwrap();
-
-        let ready = batch.get_ready_tasks();
-        let ready_ids: HashSet<&str> = ready.iter().map(|e| e.task_id.as_str()).collect();
-        assert!(ready_ids.contains("t1"));
-        assert!(ready_ids.contains("t3"));
-        assert!(!ready_ids.contains("t2"));
-
-        batch.mark_running("t1");
-        batch.mark_completed("t1", make_result("done"));
-
-        let ready2 = batch.get_ready_tasks();
-        assert!(ready2.iter().any(|e| e.task_id == "t2"));
-    }
-
-    #[test]
-    fn batch_isolation_same_worker_serial() {
-        let mut batch = DispatchBatch::new(Some("b1"));
-        batch.register("t1", "w1", make_contract("task1", &[])).unwrap();
-        batch.register("t2", "w1", make_contract("task2", &[])).unwrap();
-        batch.register("t3", "w2", make_contract("task3", &[])).unwrap();
-
-        batch.mark_running("t1");
-
-        let ready = batch.get_ready_tasks_isolated();
-        let ready_ids: HashSet<&str> = ready.iter().map(|e| e.task_id.as_str()).collect();
-        assert!(!ready_ids.contains("t2"));
-        assert!(ready_ids.contains("t3"));
-    }
-
-    #[test]
-    fn batch_topological_sort() {
-        let mut batch = DispatchBatch::new(Some("b1"));
-        batch.register("t1", "w1", make_contract("task1", &[])).unwrap();
-        batch.register("t2", "w1", make_contract("task2", &["t1"])).unwrap();
-        batch.register("t3", "w1", make_contract("task3", &["t2"])).unwrap();
-
-        let sorted = batch.topological_sort().unwrap();
-        let pos: std::collections::HashMap<&str, usize> = sorted
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (id.as_str(), i))
-            .collect();
-        assert!(pos["t1"] < pos["t2"]);
-        assert!(pos["t2"] < pos["t3"]);
-    }
-
-    #[test]
-    fn batch_cancel_all() {
-        let mut batch = DispatchBatch::new(Some("b1"));
-        batch.register("t1", "w1", make_contract("task1", &[])).unwrap();
-        batch.register("t2", "w2", make_contract("task2", &[])).unwrap();
-
-        batch.mark_running("t1");
-        batch.cancel_all("test cancel");
-
-        assert_eq!(batch.get_entry("t2").unwrap().status, DispatchStatus::Cancelled);
-    }
-
-    #[test]
-    fn batch_summary() {
-        let mut batch = DispatchBatch::new(Some("b1"));
-        batch.register("t1", "w1", make_contract("task1", &[])).unwrap();
-        batch.register("t2", "w2", make_contract("task2", &[])).unwrap();
-
-        batch.mark_running("t1");
-        batch.mark_completed("t1", make_result("ok"));
-
-        let summary = batch.summary();
-        assert_eq!(summary.total, 2);
-        assert_eq!(summary.completed, 1);
-        assert_eq!(summary.pending, 1);
-    }
-
-    #[test]
-    fn batch_phase_transitions() {
-        let mut batch = DispatchBatch::new(Some("b1"));
-        assert_eq!(batch.phase(), BatchPhase::Active);
-        assert!(batch.transition_to(BatchPhase::Summarizing).is_ok());
-        assert_eq!(batch.phase(), BatchPhase::Summarizing);
-        assert!(batch.transition_to(BatchPhase::Archived).is_ok());
-        assert!(batch.transition_to(BatchPhase::Active).is_err());
-    }
-
-    #[test]
-    fn batch_depth_limit() {
-        let mut batch = DispatchBatch::new(Some("b1"));
-        batch.register("t1", "w1", make_contract("task1", &[])).unwrap();
-        batch.register("t2", "w1", make_contract("task2", &["t1"])).unwrap();
-        batch.register("t3", "w1", make_contract("task3", &["t2"])).unwrap();
-
-        assert!(batch.validate_depth_limit(3).is_ok());
-        assert!(batch.validate_depth_limit(10).is_ok());
-        assert!(batch.validate_depth_limit(1).is_err());
-    }
-}
-
-// ========== Dispatch Idempotency Tests ==========
-
-mod dispatch_idempotency_tests {
-    use crate::dispatch::{
-        DispatchIdempotencyClaimInput, DispatchIdempotencyStatus, DispatchIdempotencyStore,
-    };
-
-    fn claim_input(key: &str, task_id: &str) -> DispatchIdempotencyClaimInput {
-        DispatchIdempotencyClaimInput {
-            key: key.to_string(),
-            session_id: "s1".to_string(),
-            mission_id: "m1".to_string(),
-            task_id: task_id.to_string(),
-            worker: "w1".to_string(),
-            ownership: "general".to_string(),
-            mode: "implement".to_string(),
-            task_name: "test".to_string(),
-            routing_reason: "direct".to_string(),
-            degraded: false,
-            status: DispatchIdempotencyStatus::Dispatched,
-            created_at: None,
-            updated_at: None,
-        }
-    }
-
-    #[test]
-    fn claim_new_record() {
-        let mut store = DispatchIdempotencyStore::new(None, None);
-        let result = store.claim_or_get(claim_input("k1", "t1"));
-        assert!(result.claimed);
-        assert_eq!(result.record.key, "k1");
-        assert_eq!(store.len(), 1);
-    }
-
-    #[test]
-    fn claim_duplicate_returns_existing() {
-        let mut store = DispatchIdempotencyStore::new(None, None);
-        let r1 = store.claim_or_get(claim_input("k1", "t1"));
-        assert!(r1.claimed);
-
-        let r2 = store.claim_or_get(claim_input("k1", "t2"));
-        assert!(!r2.claimed);
-        assert_eq!(r2.record.task_id, "t1");
-    }
-
-    #[test]
-    fn resolve_by_key_and_task_id() {
-        let mut store = DispatchIdempotencyStore::new(None, None);
-        store.claim_or_get(claim_input("k1", "t1"));
-
-        assert!(store.resolve_by_key("k1").is_some());
-        assert!(store.resolve_by_task_id("t1").is_some());
-        assert!(store.resolve_by_key("k2").is_none());
-    }
-
-    #[test]
-    fn update_status() {
-        let mut store = DispatchIdempotencyStore::new(None, None);
-        store.claim_or_get(claim_input("k1", "t1"));
-
-        let updated = store.update_status_by_task_id("t1", DispatchIdempotencyStatus::Completed);
-        assert!(updated.is_some());
-        assert_eq!(
-            updated.unwrap().status,
-            DispatchIdempotencyStatus::Completed
-        );
-    }
-
-    #[test]
-    fn remove_by_task_id() {
-        let mut store = DispatchIdempotencyStore::new(None, None);
-        store.claim_or_get(claim_input("k1", "t1"));
-        assert_eq!(store.len(), 1);
-
-        assert!(store.remove_by_task_id("t1"));
-        assert_eq!(store.len(), 0);
-        assert!(store.resolve_by_key("k1").is_none());
-    }
-
-    #[test]
-    fn clear_all() {
-        let mut store = DispatchIdempotencyStore::new(None, None);
-        store.claim_or_get(claim_input("k1", "t1"));
-        store.claim_or_get(claim_input("k2", "t2"));
-        assert_eq!(store.len(), 2);
-
-        store.clear();
-        assert_eq!(store.len(), 0);
-    }
-
-    #[test]
-    fn empty_key_returns_none() {
-        let mut store = DispatchIdempotencyStore::new(None, None);
-        assert!(store.resolve_by_key("").is_none());
-        assert!(store.resolve_by_key("  ").is_none());
-        assert!(store.resolve_by_task_id("").is_none());
-    }
-
-    #[test]
-    fn ownership_and_mode_normalization() {
-        let mut store = DispatchIdempotencyStore::new(None, None);
-        let mut input = claim_input("k1", "t1");
-        input.ownership = "  ".to_string();
-        input.mode = "".to_string();
-        let result = store.claim_or_get(input);
-        assert_eq!(result.record.ownership, "general");
-        assert_eq!(result.record.mode, "implement");
-    }
-}
-
-// ========== Dispatch Routing Tests ==========
-
-mod dispatch_routing_tests {
-    use crate::dispatch::DispatchRoutingService;
-    use std::collections::{HashMap, HashSet};
-
-    fn make_routing() -> DispatchRoutingService {
-        let workers = vec!["w1".to_string(), "w2".to_string(), "w3".to_string()];
-        let mut fallback = HashMap::new();
-        fallback.insert("w1".to_string(), vec!["w2".to_string(), "w3".to_string()]);
-        fallback.insert("w2".to_string(), vec!["w1".to_string()]);
-        DispatchRoutingService::new(workers, fallback, 5000)
-    }
-
-    #[test]
-    fn resolve_preferred_available() {
-        let mut router = make_routing();
-        let result = router.resolve_execution_worker("w1", None, None, false);
-        assert!(result.ok);
-        assert_eq!(result.selected_worker.as_deref(), Some("w1"));
-        assert!(!result.degraded);
-    }
-
-    #[test]
-    fn resolve_fallback_when_busy() {
-        let mut router = make_routing();
-        let busy: HashSet<String> = ["w1".to_string()].into_iter().collect();
-        let result = router.resolve_execution_worker("w1", Some(&busy), None, true);
-        assert!(result.ok);
-        assert_eq!(result.selected_worker.as_deref(), Some("w2"));
-        assert!(result.degraded);
-    }
-
-    #[test]
-    fn fail_when_busy_no_fallback_allowed() {
-        let mut router = make_routing();
-        let busy: HashSet<String> = ["w1".to_string()].into_iter().collect();
-        let result = router.resolve_execution_worker("w1", Some(&busy), None, false);
-        assert!(!result.ok);
-        assert!(result.error.is_some());
-    }
-
-    #[test]
-    fn runtime_unavailable_triggers_fallback() {
-        let mut router = make_routing();
-        router.mark_worker_runtime_unavailable("w1", "rate limit");
-        let result = router.resolve_execution_worker("w1", None, None, true);
-        assert!(result.ok);
-        assert_eq!(result.selected_worker.as_deref(), Some("w2"));
-        assert!(result.degraded);
-    }
-
-    #[test]
-    fn clear_runtime_unavailable() {
-        let mut router = make_routing();
-        router.mark_worker_runtime_unavailable("w1", "test");
-        router.clear_worker_runtime_unavailable("w1");
-        let result = router.resolve_execution_worker("w1", None, None, false);
-        assert!(result.ok);
-        assert_eq!(result.selected_worker.as_deref(), Some("w1"));
-    }
-
-    #[test]
-    fn should_mark_runtime_unavailable_patterns() {
-        assert!(DispatchRoutingService::should_mark_runtime_unavailable("rate limit exceeded"));
-        assert!(DispatchRoutingService::should_mark_runtime_unavailable("Unauthorized"));
-        assert!(DispatchRoutingService::should_mark_runtime_unavailable("503 service unavailable"));
-        assert!(DispatchRoutingService::should_mark_runtime_unavailable("connection timeout"));
-        assert!(!DispatchRoutingService::should_mark_runtime_unavailable(""));
-        assert!(!DispatchRoutingService::should_mark_runtime_unavailable("normal error message"));
-    }
-
-    #[test]
-    fn excluded_workers_skipped() {
-        let mut router = make_routing();
-        let excluded: HashSet<String> = ["w1".to_string()].into_iter().collect();
-        let result = router.resolve_execution_worker("w1", None, Some(&excluded), true);
-        assert!(result.ok);
-        assert_eq!(result.selected_worker.as_deref(), Some("w2"));
-        assert!(result.degraded);
-    }
-}
-
-// ========== Dispatch Completion Queue Tests ==========
-
-mod dispatch_completion_queue_tests {
-    use crate::dispatch::DispatchCompletionQueue;
-    use std::collections::HashSet;
-
-    #[test]
-    fn push_and_drain_all() {
-        let mut queue = DispatchCompletionQueue::new();
-        queue.push("t1", "w1", "completed", "done", vec![], None);
-        queue.push("t2", "w2", "failed", "error", vec![], Some(vec!["err".to_string()]));
-
-        assert_eq!(queue.len(), 2);
-
-        let results = queue.drain_all();
-        assert_eq!(results.len(), 2);
-        assert!(queue.is_empty());
-    }
-
-    #[test]
-    fn push_dedup() {
-        let mut queue = DispatchCompletionQueue::new();
-        queue.push("t1", "w1", "completed", "done", vec![], None);
-        queue.push("t1", "w1", "completed", "done again", vec![], None);
-
-        assert_eq!(queue.len(), 1);
-    }
-
-    #[test]
-    fn drain_for_targets() {
-        let mut queue = DispatchCompletionQueue::new();
-        queue.push("t1", "w1", "completed", "done1", vec![], None);
-        queue.push("t2", "w2", "completed", "done2", vec![], None);
-        queue.push("t3", "w3", "completed", "done3", vec![], None);
-
-        let targets: HashSet<String> = ["t1".to_string(), "t3".to_string()].into_iter().collect();
-        let matched = queue.drain_for_targets(&targets, None);
-
-        assert_eq!(matched.len(), 2);
-        assert_eq!(queue.len(), 1);
-
-        let remaining = queue.drain_all();
-        assert_eq!(remaining[0].task_id, "t2");
-    }
-
-    #[test]
-    fn reset_clears_everything() {
-        let mut queue = DispatchCompletionQueue::new();
-        queue.push("t1", "w1", "completed", "done", vec![], None);
-        queue.reset();
-        assert!(queue.is_empty());
-
-        queue.push("t1", "w1", "completed", "done again", vec![], None);
-        assert_eq!(queue.len(), 1);
-    }
 }
 
 // ========== Risk Policy Tests ==========

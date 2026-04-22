@@ -48,13 +48,13 @@ export interface OrchestrationRuntimeChainSummary {
 export interface OrchestrationRuntimeScopeSummary {
   sessionId: string;
   requestId?: string;
-  missionId?: string;
+  executionGroupId?: string;
   planId?: string;
   batchId?: string;
 }
 
-export interface OrchestrationRuntimeMissionSummary {
-  missionId: string;
+export interface OrchestrationRuntimeExecutionGroupSummary {
+  executionGroupId: string;
   title: string;
   status: string;
   phase: string;
@@ -153,7 +153,7 @@ export interface OrchestrationRuntimeOpsView {
   timelinePath: string;
   eventCount: number;
   diffCount: number;
-  mission?: OrchestrationRuntimeMissionSummary;
+  executionGroup?: OrchestrationRuntimeExecutionGroupSummary;
   plan?: OrchestrationRuntimePlanSummary;
   recentTimeline: OrchestrationRuntimeTimelineEntry[];
   recentStateDiffs: OrchestrationRuntimeStateDiffEntry[];
@@ -762,7 +762,7 @@ export interface Task {
   deliveryWarnings?: string[];
   subTasks: SubTaskItem[];
   progress: number;
-  missionId: string;
+  executionGroupId: string;
   failureReason?: string;
 }
 
@@ -794,7 +794,7 @@ export interface PlanLedgerAttempt {
 export interface PlanLedgerRecord {
   planId: string;
   sessionId: string;
-  missionId?: string;
+  executionGroupId?: string;
   turnId: string;
   version: number;
   promptDigest?: string;
@@ -843,7 +843,7 @@ export interface Edit {
   previewCanOpenWorkspaceFile?: boolean;
   contributors?: string[];
   workerId?: string;
-  missionId?: string;
+  executionGroupId?: string;
 }
 
 // Toast 通知

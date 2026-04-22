@@ -78,6 +78,15 @@ impl SessionStore {
         session_id: SessionId,
         title: impl Into<String>,
     ) -> DomainResult<SessionRecord> {
+        self.create_session_for_workspace(session_id, title, None)
+    }
+
+    pub fn create_session_for_workspace(
+        &self,
+        session_id: SessionId,
+        title: impl Into<String>,
+        workspace_id: Option<String>,
+    ) -> DomainResult<SessionRecord> {
         let mut state = self
             .state
             .write()
@@ -95,6 +104,7 @@ impl SessionStore {
             created_at: now,
             updated_at: now,
             message_count: None,
+            workspace_id,
         };
         state.sessions.push(session.clone());
         state.current_session_id = Some(session_id.clone());
@@ -106,6 +116,15 @@ impl SessionStore {
             occurred_at: now,
         });
         Ok(session)
+    }
+
+    /// 按 workspace_id 过滤返回会话列表
+    pub fn sessions_for_workspace(&self, workspace_id: &str) -> Vec<SessionRecord> {
+        let state = self.state.read().expect("session state read lock poisoned");
+        state.sessions.iter()
+            .filter(|s| s.workspace_id.as_deref() == Some(workspace_id))
+            .cloned()
+            .collect()
     }
 
     pub fn rename_session(

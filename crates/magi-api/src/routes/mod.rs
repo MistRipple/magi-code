@@ -93,6 +93,7 @@ async fn health(State(state): State<ApiState>) -> Json<HealthDto> {
 #[serde(rename_all = "camelCase")]
 struct BootstrapQuery {
     session_id: Option<String>,
+    workspace_id: Option<String>,
 }
 
 impl BootstrapQuery {
@@ -103,6 +104,14 @@ impl BootstrapQuery {
             .filter(|session_id| !session_id.is_empty())
             .map(SessionId::new)
     }
+
+    fn requested_workspace_id(&self) -> Option<String> {
+        self.workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(String::from)
+    }
 }
 
 async fn bootstrap(
@@ -110,8 +119,12 @@ async fn bootstrap(
     Query(query): Query<BootstrapQuery>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
     let requested_session_id = query.requested_session_id();
+    let workspace_id = query.requested_workspace_id();
     Ok(Json(
-        state.bootstrap_dto_for_session(requested_session_id.as_ref()),
+        state.bootstrap_dto_for_workspace_session(
+            workspace_id.as_deref(),
+            requested_session_id.as_ref(),
+        ),
     ))
 }
 
@@ -507,8 +520,7 @@ mod tests {
 
         let memory_store = MemoryStore::new();
 
-        let orchestrator =
-            OrchestratorService::with_governance(Arc::clone(&event_bus), Arc::clone(&governance));
+        let orchestrator = OrchestratorService::new(Arc::clone(&event_bus));
         let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
         tool_registry.register_default_builtins();
         let skill_runtime = SkillDispatchRuntime::new(
@@ -680,7 +692,7 @@ mod tests {
             .expect("accepted_at should serialize as integer");
         let first_extraction_id = format!("extract-session-action-{first_accepted_at}");
         let first_read_model = state.runtime_read_model_dto();
-        assert_eq!(first_read_model.details.missions.len(), 1);
+        assert_eq!(first_read_model.details.execution_groups.len(), 1);
         let first_mission_id = format!("mission-session-action-{first_accepted_at}");
         let first_root_task_id = TaskId::new(
             first_body["root_task_id"]
@@ -689,10 +701,10 @@ mod tests {
         );
         let first_mission_entry = first_read_model
             .details
-            .missions
+            .execution_groups
             .iter()
             .find(|entry| entry.mission_id == first_mission_id)
-            .expect("first mission entry should exist");
+            .expect("first execution group entry should exist");
         assert_eq!(first_mission_entry.context_used_knowledge_count, 1);
         assert_eq!(first_mission_entry.context_used_memory_count, 0);
         assert!(first_mission_entry.context_memory_extraction_refs.is_empty());
@@ -748,13 +760,13 @@ mod tests {
                 .expect("root_task_id should serialize as string"),
         );
         let read_model = state.runtime_read_model_dto();
-        assert_eq!(read_model.details.missions.len(), 2);
+        assert_eq!(read_model.details.execution_groups.len(), 2);
         let mission_entry = read_model
             .details
-            .missions
+            .execution_groups
             .iter()
             .find(|entry| entry.mission_id == second_mission_id)
-            .expect("second mission entry should exist");
+            .expect("second execution group entry should exist");
         assert_eq!(mission_entry.context_used_knowledge_count, 1);
         assert_eq!(mission_entry.context_used_memory_count, 1);
         assert_eq!(mission_entry.context_code_index_knowledge_count, 1);
@@ -864,10 +876,10 @@ mod tests {
         let runtime_read_model = state.runtime_read_model_dto();
         let mission_entry = runtime_read_model
             .details
-            .missions
+            .execution_groups
             .iter()
             .find(|entry| entry.mission_id == mission_id)
-            .expect("mission entry should exist");
+            .expect("execution group entry should exist");
         assert_eq!(mission_entry.context_used_memory_count, 0);
         assert!(mission_entry.context_memory_extraction_refs.is_empty());
     }
@@ -2556,32 +2568,6 @@ mod tests {
         // Verify via GET
         let task = get_json(app, "/api/tasks/task-status-1").await;
         assert_eq!(task["status"], "Completed");
-    }
-
-    #[tokio::test]
-    async fn task_graph_get_tasks_by_mission() {
-        let app = build_router(test_state_with_task_store());
-
-        for task_id in ["m-task-1", "m-task-2"] {
-            let (status, _) = post_json(
-                app.clone(),
-                "/api/tasks/create",
-                json!({
-                    "task_id": task_id,
-                    "mission_id": "mission-list",
-                    "root_task_id": "m-task-1",
-                    "kind": "Action",
-                    "title": format!("Task {}", task_id),
-                    "goal": "test goal",
-                }),
-            )
-            .await;
-            assert_eq!(status, StatusCode::OK);
-        }
-
-        let tasks = get_json(app, "/api/tasks/mission/mission-list").await;
-        let tasks_array = tasks.as_array().expect("response should be an array");
-        assert_eq!(tasks_array.len(), 2);
     }
 
     #[tokio::test]

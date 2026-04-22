@@ -62,13 +62,25 @@ pub(crate) struct ShadowDaemonRuntime {
 impl ShadowDaemonRuntime {
     pub(crate) fn restore(config: &DaemonConfig) -> Result<Self, DaemonError> {
         let state_repository = ShadowStateRepository::new(config.state_root.clone());
-        let session_store = Arc::new(SessionStore::from_persisted_parts(
-            state_repository.load_session_durable_state()?,
-            state_repository.load_session_sidecars()?,
-        ));
+
+        // 先加载工作区注册表（需要工作区路径来定位会话文件）
         let workspace_store = Arc::new(WorkspaceStore::from_persisted_parts(
             state_repository.load_workspace_durable_state()?,
             state_repository.load_workspace_recovery_sidecars()?,
+        ));
+
+        // 收集所有工作区的 (workspace_id, root_path)
+        let workspace_roots: Vec<(String, std::path::PathBuf)> = workspace_store
+            .workspaces()
+            .into_iter()
+            .map(|w| (w.workspace_id.to_string(), std::path::PathBuf::from(w.root_path.as_str())))
+            .collect();
+
+        // 从各工作区 .magi/sessions.json 加载会话（含迁移旧全局 sessions.json）
+        let session_durable = state_repository.load_sessions_from_workspaces(&workspace_roots)?;
+        let session_store = Arc::new(SessionStore::from_persisted_parts(
+            session_durable,
+            state_repository.load_session_sidecars()?,
         ));
         let knowledge_store = Arc::new(KnowledgeStore::from_state(
             state_repository.load_knowledge_state()?,
@@ -82,6 +94,7 @@ impl ShadowDaemonRuntime {
 
         Self::restore_ledger(&state_repository, &event_bus)?;
         Self::bootstrap_runtime_state(
+            config,
             &state_repository,
             &runtime_persistence,
             &session_store,
@@ -136,10 +149,7 @@ impl ShadowDaemonRuntime {
         bridge_env: &[(&str, &str)],
         model_bridge_override: Option<Arc<dyn magi_bridge_client::ModelBridgeClient>>,
     ) -> ApiState {
-        let orchestrator = OrchestratorService::with_governance(
-            self.event_bus.clone(),
-            self.governance.clone(),
-        );
+        let orchestrator = OrchestratorService::new(self.event_bus.clone());
         let mut tool_registry = ToolRegistry::new(self.governance.clone(), self.event_bus.clone());
         tool_registry.register_default_builtins();
         let host_transport =
@@ -367,13 +377,35 @@ impl ShadowDaemonRuntime {
     }
 
     fn bootstrap_runtime_state(
+        config: &DaemonConfig,
         state_repository: &ShadowStateRepository,
         runtime_persistence: &ShadowRuntimeSidecarPersistence,
         session_store: &Arc<SessionStore>,
         workspace_store: &Arc<WorkspaceStore>,
     ) -> Result<(), DaemonError> {
-        bootstrap_shadow_state(session_store, workspace_store);
-        state_repository.save_session_durable_state(&session_store.durable_state())?;
+        bootstrap_shadow_state(
+            session_store,
+            workspace_store,
+            &config.bootstrap_workspace_root,
+            &config.bootstrap_worktree_root,
+        );
+        // 会话保存到各工作区的 .magi/sessions.json，不再写全局路径
+        let durable = session_store.durable_state();
+        for workspace in workspace_store.workspaces() {
+            let root = std::path::PathBuf::from(workspace.root_path.as_str());
+            let ws_id = workspace.workspace_id.to_string();
+            let ws_sessions: Vec<_> = durable.sessions.iter()
+                .filter(|s| s.workspace_id.as_deref() == Some(&ws_id))
+                .cloned()
+                .collect();
+            let ws_state = magi_session_store::SessionDurableState {
+                sessions: ws_sessions,
+                current_session_id: durable.current_session_id.clone(),
+                timeline: vec![],
+                notifications: vec![],
+            };
+            state_repository.save_workspace_session_state(&root, &ws_state)?;
+        }
         state_repository.save_workspace_durable_state(&workspace_store.durable_state())?;
         runtime_persistence.flush_runtime_sidecars()?;
         Ok(())
@@ -516,13 +548,15 @@ mod tests {
     fn restore_bootstraps_empty_state_and_persists_runtime_files() {
         let state_root = temp_state_root("bootstrap");
         let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root.clone());
+        let workspace_root = config.bootstrap_workspace_root.clone();
 
         let runtime = ShadowDaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
 
         assert!(runtime.session_store.current_session().is_some());
         assert_eq!(runtime.workspace_store.snapshots().len(), 1);
-        assert!(state_root.join("sessions.json").exists());
+        assert!(workspace_root.join(".magi").join("sessions.json").exists());
+        assert!(!state_root.join("sessions.json").exists());
         assert!(state_root.join("workspaces.json").exists());
         assert!(state_root.join("session-sidecars.json").exists());
         assert!(state_root.join("workspace-recovery-sidecars.json").exists());
@@ -581,6 +615,17 @@ mod tests {
                 .expect("response body should read"),
         )
         .expect("response should be valid json")
+    }
+
+    async fn get_task_projection(app: axum::Router, root_task_id: &str) -> Value {
+        get_json(app, &format!("/api/tasks/graph/{root_task_id}")).await
+    }
+
+    fn assert_completed_two_task_projection(projection: &Value) {
+        assert_eq!(projection["progress_summary"]["total_tasks"], 2);
+        assert_eq!(projection["progress_summary"]["completed_tasks"], 2);
+        assert_eq!(projection["progress_summary"]["failed_tasks"], 0);
+        assert_eq!(projection["root_task"]["status"], "Completed");
     }
 
     fn service_entries_by_kind(snapshot: &Value) -> BTreeMap<String, &Value> {
@@ -752,28 +797,26 @@ mod tests {
             .as_u64()
             .expect("accepted_at should serialize as integer");
         let first_mission_id = format!("mission-session-action-{first_accepted_at}");
+        let first_root_task_id = first_body["root_task_id"]
+            .as_str()
+            .expect("root_task_id should serialize as string");
         let read_model = get_json(app.clone(), "/runtime/read-model").await;
-        let first_mission = read_model["details"]["missions"]
+        let first_execution_group = read_model["details"]["execution_groups"]
             .as_array()
-            .expect("missions should be an array")
+            .expect("execution groups should be an array")
             .iter()
             .find(|entry| entry["mission_id"] == first_mission_id)
-            .expect("first mission should exist");
-        assert_eq!(first_mission["context_used_memory_count"], 0);
+            .expect("first execution group should exist");
+        assert_eq!(first_execution_group["context_used_memory_count"], 0);
         assert_eq!(
-            first_mission["context_memory_extraction_refs"]
+            first_execution_group["context_memory_extraction_refs"]
                 .as_array()
                 .expect("refs should be array")
                 .len(),
             0
         );
-        let first_tasks =
-            get_json(app.clone(), &format!("/api/tasks/mission/{first_mission_id}")).await;
-        let first_tasks = first_tasks
-            .as_array()
-            .expect("mission tasks should serialize as array");
-        assert_eq!(first_tasks.len(), 2);
-        assert!(first_tasks.iter().all(|task| task["status"] == "Completed"));
+        let first_projection = get_task_projection(app.clone(), first_root_task_id).await;
+        assert_completed_two_task_projection(&first_projection);
 
         let (status, second_body) = post_json(
             app.clone(),
@@ -793,28 +836,26 @@ mod tests {
             .as_u64()
             .expect("accepted_at should serialize as integer");
         let second_mission_id = format!("mission-session-action-{second_accepted_at}");
+        let second_root_task_id = second_body["root_task_id"]
+            .as_str()
+            .expect("root_task_id should serialize as string");
         let expected_extraction_id = format!("extract-session-action-{first_accepted_at}");
 
         let read_model = get_json(app.clone(), "/runtime/read-model").await;
-        let second_mission = read_model["details"]["missions"]
+        let second_execution_group = read_model["details"]["execution_groups"]
             .as_array()
-            .expect("missions should be an array")
+            .expect("execution groups should be an array")
             .iter()
             .find(|entry| entry["mission_id"] == second_mission_id)
-            .expect("second mission should exist");
-        assert_eq!(second_mission["context_used_memory_count"], 1);
-        assert_eq!(second_mission["context_extracted_memory_count"], 1);
+            .expect("second execution group should exist");
+        assert_eq!(second_execution_group["context_used_memory_count"], 1);
+        assert_eq!(second_execution_group["context_extracted_memory_count"], 1);
         assert_eq!(
-            second_mission["context_memory_extraction_refs"],
+            second_execution_group["context_memory_extraction_refs"],
             json!([expected_extraction_id])
         );
-        let second_tasks =
-            get_json(app, &format!("/api/tasks/mission/{second_mission_id}")).await;
-        let second_tasks = second_tasks
-            .as_array()
-            .expect("mission tasks should serialize as array");
-        assert_eq!(second_tasks.len(), 2);
-        assert!(second_tasks.iter().all(|task| task["status"] == "Completed"));
+        let second_projection = get_task_projection(app, second_root_task_id).await;
+        assert_completed_two_task_projection(&second_projection);
     }
 
     #[tokio::test]
@@ -918,20 +959,20 @@ mod tests {
             .expect("accepted_at should serialize as integer");
         let followup_mission_id = format!("mission-session-action-{followup_accepted_at}");
         let read_model = get_json(app, "/runtime/read-model").await;
-        let followup_mission = read_model["details"]["missions"]
+        let followup_execution_group = read_model["details"]["execution_groups"]
             .as_array()
-            .expect("missions should be an array")
+            .expect("execution groups should be an array")
             .iter()
             .find(|entry| entry["mission_id"] == followup_mission_id)
-            .expect("followup mission should exist");
-        let extraction_refs = followup_mission["context_memory_extraction_refs"]
+            .expect("followup execution group should exist");
+        let extraction_refs = followup_execution_group["context_memory_extraction_refs"]
             .as_array()
             .expect("refs should be array");
         assert!(
             extraction_refs
                 .iter()
                 .any(|value| value == "extract-recovery-recovery-daemon-route"),
-            "followup mission should consume recovery extraction, got {extraction_refs:?}"
+            "followup execution group should consume recovery extraction, got {extraction_refs:?}"
         );
     }
 

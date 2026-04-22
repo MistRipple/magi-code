@@ -24,10 +24,76 @@ impl ShadowStateRepository {
         Self { state_root }
     }
 
+    #[cfg(test)]
     pub(crate) fn load_session_durable_state(&self) -> Result<SessionDurableState, DaemonError> {
         self.read_json_or_default(self.state_root.join("sessions.json"))
     }
 
+    /// 从指定工作区的 .magi/sessions.json 加载会话
+    pub(crate) fn load_workspace_session_state(
+        &self,
+        workspace_root: &Path,
+    ) -> Result<SessionDurableState, DaemonError> {
+        let path = workspace_root.join(".magi").join("sessions.json");
+        if path.exists() {
+            self.read_json_or_default(path)
+        } else {
+            Ok(SessionDurableState::default())
+        }
+    }
+
+    /// 遍历所有工作区加载会话，合并为统一的 SessionDurableState。
+    /// 如果全局 sessions.json 仍存在（旧数据），执行一次性迁移后删除。
+    pub(crate) fn load_sessions_from_workspaces(
+        &self,
+        workspace_roots: &[(String, PathBuf)],
+    ) -> Result<SessionDurableState, DaemonError> {
+        let global_path = self.state_root.join("sessions.json");
+
+        // 迁移：旧全局文件存在时，按 workspace_id 分发到各工作区目录
+        if global_path.exists() {
+            let legacy: SessionDurableState = self.read_json_or_default(global_path.clone())?;
+            if !legacy.sessions.is_empty() {
+                let default_ws = workspace_roots.first().map(|(id, _)| id.clone());
+                for session in &legacy.sessions {
+                    let ws_id = session.workspace_id.clone()
+                        .or_else(|| default_ws.clone())
+                        .unwrap_or_default();
+                    if let Some((_, root)) = workspace_roots.iter().find(|(id, _)| id == &ws_id) {
+                        let mut ws_state = self.load_workspace_session_state(root)?;
+                        if !ws_state.sessions.iter().any(|s| s.session_id == session.session_id) {
+                            ws_state.sessions.push(session.clone());
+                            self.save_workspace_session_state(root, &ws_state)?;
+                        }
+                    }
+                }
+                let _ = fs::remove_file(&global_path);
+            }
+        }
+
+        // 从各工作区 .magi/sessions.json 合并加载
+        let mut merged = SessionDurableState::default();
+        for (_, root_path) in workspace_roots {
+            let ws_state = self.load_workspace_session_state(root_path)?;
+            merged.sessions.extend(ws_state.sessions);
+            if merged.current_session_id.is_none() {
+                merged.current_session_id = ws_state.current_session_id;
+            }
+        }
+        Ok(merged)
+    }
+
+    /// 保存会话到指定工作区的 .magi/sessions.json
+    pub(crate) fn save_workspace_session_state(
+        &self,
+        workspace_root: &Path,
+        state: &SessionDurableState,
+    ) -> Result<(), DaemonError> {
+        let path = workspace_root.join(".magi").join("sessions.json");
+        self.write_json_atomically(path, state)
+    }
+
+    #[cfg(test)]
     pub(crate) fn save_session_durable_state(
         &self,
         state: &SessionDurableState,
@@ -214,7 +280,15 @@ fn temp_path_for(path: &Path) -> PathBuf {
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "shadow-state.json".to_string());
-    file_name.push_str(".tmp");
+    let unique_suffix = format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    );
+    file_name.push_str(&unique_suffix);
     path.with_file_name(file_name)
 }
 

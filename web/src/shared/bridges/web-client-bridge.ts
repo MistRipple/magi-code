@@ -58,7 +58,7 @@ import {
     saveAgentWorkerConfig,
   submitAgentSessionAction,
     revertAgentChange,
-  revertAgentMissionChanges,
+  revertAgentExecutionGroupChanges,
   revertAllAgentChanges,
   resumeAgentTask,
   testAgentAuxiliaryConnection,
@@ -325,14 +325,14 @@ function normalizeBridgeStringArray(value: unknown): string[] {
 
 interface BootstrapTaskTrackingHints {
   rootTaskId: string;
-  activeMissionIds: string[];
+  activeTaskIds: string[];
 }
 
 function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload: unknown): BootstrapTaskTrackingHints {
   const rawBootstrap = asBridgeRecord(rawPayload);
   const expectedSessionId = trimBridgeString(payload.sessionId);
 
-  const activeMissionIds = new Set<string>();
+  const activeTaskIds = new Set<string>();
   let rootTaskId = '';
 
   const rawRuntimeReadModel = asBridgeRecord(rawBootstrap?.runtimeReadModel);
@@ -349,11 +349,11 @@ function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload
   const overview = asBridgeRecord(rawRuntimeReadModel?.overview);
   const activity = asBridgeRecord(overview?.activity);
 
-  for (const missionId of normalizeBridgeStringArray(activeRuntimeSession?.active_mission_ids)) {
-    activeMissionIds.add(missionId);
+  for (const taskId of normalizeBridgeStringArray(activeRuntimeSession?.active_task_ids)) {
+    activeTaskIds.add(taskId);
   }
-  for (const missionId of normalizeBridgeStringArray(activity?.active_mission_ids)) {
-    activeMissionIds.add(missionId);
+  for (const taskId of normalizeBridgeStringArray(activity?.active_task_ids)) {
+    activeTaskIds.add(taskId);
   }
 
   const recentEvents = Array.isArray(rawBootstrap?.recentEvents)
@@ -376,7 +376,7 @@ function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload
 
   return {
     rootTaskId,
-    activeMissionIds: [...activeMissionIds],
+    activeTaskIds: [...activeTaskIds],
   };
 }
 
@@ -1077,8 +1077,8 @@ async function dispatchBootstrap(
   dispatchRegistryAgents();
 
   const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, options.rawPayload);
-  if (taskTrackingHints.rootTaskId || taskTrackingHints.activeMissionIds.length > 0) {
-    void autoConnectTaskTracking(taskTrackingHints.activeMissionIds, taskTrackingHints.rootTaskId).catch((error) => {
+  if (taskTrackingHints.rootTaskId || taskTrackingHints.activeTaskIds.length > 0) {
+    void autoConnectTaskTracking(taskTrackingHints.activeTaskIds, taskTrackingHints.rootTaskId).catch((error) => {
       console.warn('[web-client-bridge] Auto-connect task tracking on bootstrap failed (non-critical):', error);
     });
   }
@@ -1417,10 +1417,10 @@ function initTaskTracking(rootTaskId: string): void {
 /**
  * Auto-detect active root tasks from session runtime state and start tracking.
  * Called during bootstrap dispatch to reconnect task tracking on session load/switch.
- * Uses active_mission_ids from the bootstrap runtime read model to query for tasks.
+ * Uses active_task_ids from the bootstrap runtime read model to resolve root tasks.
  */
 export async function autoConnectTaskTracking(
-  activeMissionIds: string[],
+  activeTaskIds: string[],
   preferredRootTaskId = '',
 ): Promise<void> {
   const currentState = getTaskGraphState();
@@ -1437,36 +1437,35 @@ export async function autoConnectTaskTracking(
     return;
   }
 
-  if (!activeMissionIds || activeMissionIds.length === 0) {
+  if (!activeTaskIds || activeTaskIds.length === 0) {
     return;
   }
 
   try {
     const client = new RustDaemonClient(resolveAgentBaseUrl());
-    for (const missionId of activeMissionIds) {
-      let tasks;
+    const inspectedRootTaskIds = new Set<string>();
+    for (const taskId of activeTaskIds) {
+      let task;
       try {
-        tasks = await client.getTasksByMission(missionId);
+        task = await client.getTask(taskId);
       } catch {
         continue;
       }
-      const rootTasks = tasks
-        .filter((task) => task.kind === 'Objective' && task.task_id === task.root_task_id)
-        .sort((left, right) => right.created_at - left.created_at);
-      const activeRoot = rootTasks.find(
-        (task) => task.status === 'Running' || task.status === 'Ready' || task.status === 'Blocked',
-      );
-      if (!activeRoot) {
+      const rootTaskId = typeof task.root_task_id === 'string' && task.root_task_id.trim()
+        ? task.root_task_id.trim()
+        : task.task_id;
+      if (!rootTaskId || inspectedRootTaskIds.has(rootTaskId)) {
         continue;
       }
-      if (currentState.rootTaskId === activeRoot.task_id) {
+      inspectedRootTaskIds.add(rootTaskId);
+      if (currentState.rootTaskId === rootTaskId) {
         return;
       }
-      console.info('[web-client-bridge] Auto-connecting task tracking via mission query:', {
-        missionId,
-        rootTaskId: activeRoot.task_id,
+      console.info('[web-client-bridge] Auto-connecting task tracking via active task:', {
+        taskId,
+        rootTaskId,
       });
-      initTaskTracking(activeRoot.task_id);
+      initTaskTracking(rootTaskId);
       return;
     }
   } catch (error) {
@@ -2404,13 +2403,17 @@ export function createWebClientBridge(): ClientBridge {
             logBridgeOperationFailure('还原全部变更', '[web-client-bridge] 还原全部变更失败:', error);
           });
           return;
-        case 'revertMission':
-          if (typeof message.missionId === 'string' && message.missionId.trim()) {
-            void revertAgentMissionChanges(message.missionId).then(async () => {
+        case 'revertExecutionGroup':
+          if (typeof message.executionGroupId === 'string' && message.executionGroupId.trim()) {
+            void revertAgentExecutionGroupChanges(message.executionGroupId).then(async () => {
               await fetchBootstrap();
-              emitBridgeSuccessToast('还原轮次变更', '轮次变更已还原');
+              emitBridgeSuccessToast('还原执行分组变更', '执行分组变更已还原');
             }).catch((error) => {
-              logBridgeOperationFailure('还原轮次变更', '[web-client-bridge] 还原轮次变更失败:', error);
+              logBridgeOperationFailure(
+                '还原执行分组变更',
+                '[web-client-bridge] 还原执行分组变更失败:',
+                error,
+              );
             });
           }
           return;

@@ -252,7 +252,7 @@ impl WorkerRuntimeLoop {
                         action,
                         governance_decision,
                         completed_at,
-                        "worker missing current todo or not registered",
+                        "worker missing current task or not registered",
                     );
                 }
                 let trace = self.execute_intent_with_drivers(&intent).unwrap_or_else(|| {
@@ -313,7 +313,7 @@ impl WorkerRuntimeLoop {
                         action,
                         governance_decision,
                         completed_at,
-                        "worker missing current todo or not registered",
+                        "worker missing current task or not registered",
                     );
                 }
                 let report = self.runtime.append_report(
@@ -387,7 +387,7 @@ impl WorkerRuntimeLoop {
                         action,
                         governance_decision,
                         completed_at,
-                        "worker missing current todo or not registered",
+                        "worker missing current task or not registered",
                     );
                 }
                 let report = self.runtime.record_review_note(&worker_id, summary);
@@ -457,7 +457,7 @@ impl WorkerRuntimeLoop {
                         action,
                         governance_decision,
                         completed_at,
-                        "worker missing current todo or not registered",
+                        "worker missing current task or not registered",
                     );
                 }
                 let report = self
@@ -525,7 +525,7 @@ impl WorkerRuntimeLoop {
                         action,
                         governance_decision,
                         completed_at,
-                        "worker missing current todo or not registered",
+                        "worker missing current task or not registered",
                     );
                 }
                 let report = self.runtime.record_repair_note(&worker_id, summary);
@@ -595,7 +595,7 @@ impl WorkerRuntimeLoop {
                         action,
                         governance_decision,
                         completed_at,
-                        "worker missing current todo or not registered",
+                        "worker missing current task or not registered",
                     );
                 }
                 let report = self
@@ -619,13 +619,13 @@ impl WorkerRuntimeLoop {
                         action,
                         governance_decision,
                         completed_at,
-                        "worker missing current todo or not registered",
+                        "worker missing current task or not registered",
                     );
                 }
                 let task_id = worker
                     .as_ref()
                     .and_then(|record| record.current_task_id.clone())
-                    .expect("finished worker should retain todo id");
+                    .expect("finished worker should retain task id");
                 let report = self
                     .runtime
                     .latest_report_for(&worker_id, &task_id, WorkerStage::Finish);
@@ -647,13 +647,13 @@ impl WorkerRuntimeLoop {
                         action,
                         governance_decision,
                         completed_at,
-                        "worker missing current todo or not registered",
+                        "worker missing current task or not registered",
                     );
                 }
                 let task_id = worker
                     .as_ref()
                     .and_then(|record| record.current_task_id.clone())
-                    .expect("failed worker should retain todo id");
+                    .expect("failed worker should retain task id");
                 let report = self
                     .runtime
                     .latest_report_for(&worker_id, &task_id, WorkerStage::Finish);

@@ -59,8 +59,8 @@ import type {
   RevertAllChangesResponseDto,
   RevertChangeRequestDto,
   RevertChangeResponseDto,
-  RevertMissionChangesRequestDto,
-  RevertMissionChangesResponseDto,
+  RevertExecutionGroupChangesRequestDto,
+  RevertExecutionGroupChangesResponseDto,
   RoleTemplatesResponseDto,
   RunnerCycleRequestDto,
   RunnerCycleResponseDto,
@@ -607,10 +607,13 @@ export class RustDaemonClient {
     return this.postJson<RevertAllChangesResponseDto>('/api/changes/revert-all', {});
   }
 
-  public async revertMissionChanges(
-    request: RevertMissionChangesRequestDto,
-  ): Promise<RevertMissionChangesResponseDto> {
-    return this.postJson<RevertMissionChangesResponseDto>('/api/changes/revert-mission', request);
+  public async revertExecutionGroupChanges(
+    request: RevertExecutionGroupChangesRequestDto,
+  ): Promise<RevertExecutionGroupChangesResponseDto> {
+    return this.postJson<RevertExecutionGroupChangesResponseDto>(
+      '/api/changes/revert-execution-group',
+      request,
+    );
   }
 
   public async fetchFileContent(
@@ -666,12 +669,6 @@ export class RustDaemonClient {
   public async getTask(taskId: string): Promise<TaskDto> {
     return this.getJson<TaskDto>(
       `/api/tasks/${encodeURIComponent(taskId)}`,
-    );
-  }
-
-  public async getTasksByMission(missionId: string): Promise<TaskDto[]> {
-    return this.getJson<TaskDto[]>(
-      `/api/tasks/mission/${encodeURIComponent(missionId)}`,
     );
   }
 

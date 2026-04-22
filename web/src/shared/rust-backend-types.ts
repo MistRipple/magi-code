@@ -398,19 +398,18 @@ export interface EventCategoryCountsDto {
 }
 
 export interface RuntimeActivitySummaryDto {
-  mission_event_count: number;
+  execution_group_event_count: number;
   worker_event_count: number;
   tool_event_count: number;
   skill_dispatch_event_count: number;
   executor_event_count: number;
   recovery_event_count: number;
-  active_mission_ids: string[];
   active_task_ids: string[];
 }
 
 export interface RuntimeDiagnosticSummaryDto {
-  running_mission_count: number;
-  failed_mission_count: number;
+  running_execution_group_count: number;
+  failed_execution_group_count: number;
   running_task_count: number;
   failed_task_count: number;
   running_assignment_count: number;
@@ -426,7 +425,7 @@ export interface RuntimeDiagnosticSummaryDto {
   governance_rejected_count: number;
   rejected_skill_dispatch_count: number;
   failed_skill_dispatch_count: number;
-  context_mission_count: number;
+  context_execution_group_count: number;
   context_used_knowledge_count: number;
   context_used_memory_count: number;
   context_code_index_knowledge_count: number;
@@ -443,7 +442,7 @@ export interface RuntimeOverviewDto {
   diagnostics: RuntimeDiagnosticSummaryDto;
 }
 
-export interface MissionRuntimeSummaryDto {
+export interface ExecutionGroupRuntimeSummaryDto {
   mission_id: string;
   event_count: number;
   audit_event_count: number;
@@ -525,7 +524,6 @@ export interface SessionRuntimeSummaryDto {
   tool_event_count: number;
   recovery_event_count: number;
   latest_event_type?: string | null;
-  active_mission_ids: string[];
   active_task_ids: string[];
   recovery_ids: string[];
   current_status?: string | null;
@@ -542,7 +540,6 @@ export interface WorkspaceRuntimeSummaryDto {
   tool_event_count: number;
   recovery_event_count: number;
   latest_event_type?: string | null;
-  active_mission_ids: string[];
   active_task_ids: string[];
   recovery_ids: string[];
   execution_chain_refs: string[];
@@ -553,7 +550,7 @@ export interface WorkspaceRuntimeSummaryDto {
 }
 
 export interface RuntimeDetailsDto {
-  missions: MissionRuntimeSummaryDto[];
+  execution_groups: ExecutionGroupRuntimeSummaryDto[];
   tasks: TaskRuntimeSummaryDto[];
   assignments: AssignmentRuntimeSummaryDto[];
   workers: WorkerRuntimeSummaryDto[];
@@ -570,7 +567,7 @@ export interface DispatchRuntimeSummaryDto {
 }
 
 export interface RuntimeAttentionSummaryDto {
-  failed_mission_ids: string[];
+  failed_execution_group_ids: string[];
   failed_task_ids: string[];
   failed_assignment_ids: string[];
   failed_worker_ids: string[];
@@ -589,7 +586,7 @@ export interface RuntimeAttentionSummaryDto {
 }
 
 export interface RuntimeWorkQueueSummaryDto {
-  running_mission_ids: string[];
+  running_execution_group_ids: string[];
   running_task_ids: string[];
   running_assignment_ids: string[];
   active_worker_ids: string[];
@@ -602,7 +599,7 @@ export interface RecoveryResumeObservationSummaryDto {
   resume_dispatch_count: number;
   mission_resumed_count: number;
   worker_resumed_count: number;
-  affected_mission_ids: string[];
+  affected_execution_group_ids: string[];
   affected_worker_ids: string[];
 }
 
@@ -1042,13 +1039,13 @@ export interface RevertAllChangesResponseDto {
   reverted: boolean;
 }
 
-export interface RevertMissionChangesRequestDto {
-  missionId: string;
+export interface RevertExecutionGroupChangesRequestDto {
+  executionGroupId: string;
 }
 
-export interface RevertMissionChangesResponseDto {
+export interface RevertExecutionGroupChangesResponseDto {
   reverted: boolean;
-  missionId: string;
+  executionGroupId: string;
 }
 
 export interface FileContentResponseDto {

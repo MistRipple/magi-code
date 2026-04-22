@@ -6,7 +6,12 @@ use magi_daemon::{Daemon, DaemonConfig};
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 38123;
 const DEFAULT_SERVICE_NAME: &str = "magi-shadow-rust-backend";
-const DEFAULT_STATE_ROOT: &str = "/Users/xie/code/magi-rust-rewrite/tmp/state";
+
+fn default_state_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".magi")
+}
 
 fn read_env(name: &str) -> Option<String> {
     let value = env::var(name).ok()?;
@@ -39,9 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = read_port()?;
     let service_name =
         read_env("MAGI_SERVICE_NAME").unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_string());
-    let state_root = PathBuf::from(
-        read_env("MAGI_STATE_ROOT").unwrap_or_else(|| DEFAULT_STATE_ROOT.to_string()),
-    );
+    let state_root = read_env("MAGI_STATE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_state_root);
 
     let runtime_state_manager = RuntimeStateManager::new(state_root.join("agent"));
     let pid = process::id();

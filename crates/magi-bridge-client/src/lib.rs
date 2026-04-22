@@ -13,7 +13,7 @@ mod local_process_protocol;
 mod mcp_client;
 mod mcp_loopback;
 pub mod micro_compaction;
-pub mod mission_outcome;
+pub mod execution_outcome;
 mod model_loopback;
 pub mod orchestrator_adapter;
 pub mod orchestrator_termination;

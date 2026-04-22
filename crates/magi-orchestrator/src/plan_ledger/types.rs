@@ -67,12 +67,6 @@ pub enum PlanItemStatus {
 }
 
 impl PlanItemStatus {
-    pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Completed | Self::Failed | Self::Skipped | Self::Cancelled
-        )
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

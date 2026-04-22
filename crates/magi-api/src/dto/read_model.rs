@@ -66,7 +66,7 @@ fn merge_session_sidecars(
         entry.execution_chain_ref = export.execution_chain_ref.clone();
         entry.recovery_ref = export.recovery_ref.clone();
         push_unique(
-            &mut entry.active_mission_ids,
+            &mut entry.active_execution_group_ids,
             export.ownership.mission_id.as_ref().map(ToString::to_string),
         );
         push_unique(
@@ -81,8 +81,8 @@ fn merge_session_sidecars(
         .sessions
         .sort_by(|left, right| left.session_id.cmp(&right.session_id));
     for entry in &mut runtime_read_model.details.sessions {
-        entry.active_mission_ids.sort();
-        entry.active_mission_ids.dedup();
+        entry.active_execution_group_ids.sort();
+        entry.active_execution_group_ids.dedup();
         entry.active_task_ids.sort();
         entry.active_task_ids.dedup();
         entry.recovery_ids.sort();
@@ -128,7 +128,7 @@ fn merge_workspace_sidecars(
         entry.execution_chain_ref = export.execution_chain_ref.clone();
         entry.recovery_ref = Some(export.recovery_ref.clone());
         push_unique(
-            &mut entry.active_mission_ids,
+            &mut entry.active_execution_group_ids,
             export.ownership.mission_id.as_ref().map(ToString::to_string),
         );
         push_unique(
@@ -220,8 +220,8 @@ fn merge_workspace_sidecars(
     runtime_read_model.recovery.active_recovery_ids.sort();
     runtime_read_model.recovery.active_recovery_ids.dedup();
     for entry in &mut runtime_read_model.details.workspaces {
-        entry.active_mission_ids.sort();
-        entry.active_mission_ids.dedup();
+        entry.active_execution_group_ids.sort();
+        entry.active_execution_group_ids.dedup();
         entry.active_task_ids.sort();
         entry.active_task_ids.dedup();
         entry.recovery_ids.sort();

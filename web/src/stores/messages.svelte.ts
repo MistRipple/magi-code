@@ -364,7 +364,7 @@ function isValidPersistedArray(value: unknown, max: number): value is unknown[] 
 }
 
 // 新增状态：变更、阶段、Toast、模型状态
-let edits = $state<Array<{ filePath: string; snapshotId?: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string; missionId?: string }>>([]);
+let edits = $state<Array<{ filePath: string; snapshotId?: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string; executionGroupId?: string }>>([]);
 let timelineProjectionDirty = false;
 
 const timelineNodeLookup = $derived.by(() => buildTimelineNodeLookup(messagesState.timelineNodes));

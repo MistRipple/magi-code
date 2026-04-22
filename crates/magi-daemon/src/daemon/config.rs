@@ -8,6 +8,8 @@ pub struct DaemonConfig {
     pub port: u16,
     pub service_name: String,
     pub state_root: PathBuf,
+    pub bootstrap_workspace_root: PathBuf,
+    pub bootstrap_worktree_root: PathBuf,
 }
 
 impl DaemonConfig {
@@ -17,11 +19,14 @@ impl DaemonConfig {
         service_name: impl Into<String>,
         state_root: impl Into<PathBuf>,
     ) -> Self {
+        let state_root = state_root.into();
         Self {
             host: host.into(),
             port,
             service_name: service_name.into(),
-            state_root: state_root.into(),
+            bootstrap_workspace_root: state_root.join("bootstrap/workspace"),
+            bootstrap_worktree_root: state_root.join("bootstrap/worktrees/shadow-worktree-001"),
+            state_root,
         }
     }
 

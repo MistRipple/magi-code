@@ -18,7 +18,7 @@ use magi_core::{
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::ToolKind;
 use magi_orchestrator::{
-    ExecutionWritebackPlans, MissionContextSummary, RecoveryExecutionResult,
+    ExecutionContextSummary, ExecutionWritebackPlans, RecoveryExecutionResult,
     task_runner::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult, WorkerInfo},
 };
 use magi_session_store::SessionStore;
@@ -266,7 +266,7 @@ impl ShadowTaskDispatcher {
     fn publish_execution_overview(
         &self,
         task: &magi_core::Task,
-        context_summary: Option<MissionContextSummary>,
+        context_summary: Option<ExecutionContextSummary>,
     ) {
         let context_payload = context_summary
             .as_ref()
@@ -353,7 +353,7 @@ impl ShadowTaskDispatcher {
         task: &magi_core::Task,
         session_id: &SessionId,
         workspace_id: &Option<WorkspaceId>,
-    ) -> (String, Option<MissionContextSummary>) {
+    ) -> (String, Option<ExecutionContextSummary>) {
         let base_prompt = if task.goal.is_empty() {
             task.title.clone()
         } else {
@@ -390,7 +390,7 @@ impl ShadowTaskDispatcher {
             || !result.selected_memory.is_empty()
             || !result.selected_shared_context.is_empty();
 
-        let context_summary = MissionContextSummary::from_context_assembly(&result);
+        let context_summary = ExecutionContextSummary::from_context_assembly(&result);
 
         if !has_context {
             return (base_prompt, Some(context_summary));
@@ -500,7 +500,7 @@ impl ShadowTaskDispatcher {
         workspace_id: &Option<WorkspaceId>,
         use_tools: bool,
         skill_name: Option<String>,
-    ) -> (TaskOutcome, Option<MissionContextSummary>) {
+    ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
         let Some(client) = self.resolve_model_client() else {
             tracing::error!(task_id = %task.task_id, "invoke_llm_with_tools: no model bridge client configured");
             return (

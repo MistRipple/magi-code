@@ -9,7 +9,7 @@ use crate::llm_types::{
     is_summary_hijack_text, sanitize_summary_hijack_messages,
     LlmContentBlock, LlmMessage, LlmMessageContent, LlmMessageParams, LlmResponse, LlmUsage,
 };
-use crate::mission_outcome::{extract_mission_outcome, MissionOutcomeStatus};
+use crate::execution_outcome::{extract_execution_outcome, ExecutionOutcomeStatus};
 use crate::orchestrator_termination::OrchestratorTerminationReason;
 use crate::round_policy::build_summary_hijack_correction;
 use crate::structured_dispatch::{extract_structured_dispatch, StructuredDispatchResult};
@@ -107,7 +107,7 @@ pub struct OrchestratorAdapterResult {
     pub rounds: Vec<RoundResult>,
     pub compaction_count: u32,
     pub decision_trace: Vec<DecisionTraceEntry>,
-    pub mission_status: Option<MissionOutcomeStatus>,
+    pub execution_status: Option<ExecutionOutcomeStatus>,
     pub next_steps: Vec<String>,
     pub structured_dispatches: Vec<StructuredDispatchResult>,
 }
@@ -144,7 +144,7 @@ impl OrchestratorAdapter {
         let mut compaction_count = 0u32;
         let mut last_tool_call_count = 0u32;
         let mut decision_trace = Vec::new();
-        let mut mission_status: Option<MissionOutcomeStatus> = None;
+        let mut execution_status: Option<ExecutionOutcomeStatus> = None;
         let mut next_steps: Vec<String> = Vec::new();
         let mut structured_dispatches: Vec<StructuredDispatchResult> = Vec::new();
         let mut force_no_tools = false;
@@ -164,7 +164,7 @@ impl OrchestratorAdapter {
                     OrchestratorTerminationReason::Stalled,
                     compaction_count,
                     decision_trace,
-                    mission_status,
+                    execution_status,
                     next_steps,
                     structured_dispatches,
                 ));
@@ -184,7 +184,7 @@ impl OrchestratorAdapter {
                     reason,
                     compaction_count,
                     decision_trace,
-                    mission_status,
+                    execution_status,
                     next_steps,
                     structured_dispatches,
                 ));
@@ -228,7 +228,7 @@ impl OrchestratorAdapter {
                             OrchestratorTerminationReason::UpstreamModelError,
                             compaction_count,
                             decision_trace,
-                            mission_status,
+                            execution_status,
                             next_steps,
                             structured_dispatches,
                         ));
@@ -252,12 +252,12 @@ impl OrchestratorAdapter {
             };
             all_rounds.push(round_result);
 
-            // --- MissionOutcome 提取 ---
+            // --- ExecutionOutcome 提取 ---
             if !response.content.is_empty() {
-                let outcome_result = extract_mission_outcome(&response.content);
+                let outcome_result = extract_execution_outcome(&response.content);
                 if let Some(outcome) = &outcome_result.outcome {
                     if let Some(ref status) = outcome.status {
-                        mission_status = Some(status.clone());
+                        execution_status = Some(status.clone());
                     }
                     if !outcome.next_steps.is_empty() {
                         next_steps = outcome.next_steps.clone();
@@ -306,11 +306,11 @@ impl OrchestratorAdapter {
                     progress.consecutive_empty_rounds = 0;
                 }
 
-                let termination_reason = match &mission_status {
-                    Some(MissionOutcomeStatus::Completed) => {
+                let termination_reason = match &execution_status {
+                    Some(ExecutionOutcomeStatus::Completed) => {
                         OrchestratorTerminationReason::Completed
                     }
-                    Some(MissionOutcomeStatus::Failed) => {
+                    Some(ExecutionOutcomeStatus::Failed) => {
                         OrchestratorTerminationReason::Failed
                     }
                     _ => OrchestratorTerminationReason::Completed,
@@ -330,7 +330,7 @@ impl OrchestratorAdapter {
                     termination_reason,
                     compaction_count,
                     decision_trace,
-                    mission_status,
+                    execution_status,
                     next_steps,
                     structured_dispatches,
                 ));
@@ -359,7 +359,7 @@ impl OrchestratorAdapter {
                         OrchestratorTerminationReason::Stalled,
                         compaction_count,
                         decision_trace,
-                        mission_status,
+                        execution_status,
                         next_steps,
                         structured_dispatches,
                     ));
@@ -409,7 +409,7 @@ impl OrchestratorAdapter {
         reason: OrchestratorTerminationReason,
         compaction_count: u32,
         decision_trace: Vec<DecisionTraceEntry>,
-        mission_status: Option<MissionOutcomeStatus>,
+        execution_status: Option<ExecutionOutcomeStatus>,
         next_steps: Vec<String>,
         structured_dispatches: Vec<StructuredDispatchResult>,
     ) -> OrchestratorAdapterResult {
@@ -420,7 +420,7 @@ impl OrchestratorAdapter {
             rounds: rounds.to_vec(),
             compaction_count,
             decision_trace,
-            mission_status,
+            execution_status,
             next_steps,
             structured_dispatches,
         }

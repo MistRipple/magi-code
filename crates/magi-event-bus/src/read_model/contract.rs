@@ -5,7 +5,7 @@ pub const RUNTIME_READ_MODEL_CONTRACT_SECTIONS: [&str; 5] =
     ["meta", "overview", "details", "operations", "recovery"];
 pub const RUNTIME_READ_MODEL_ORDERING_STRATEGY: &str = "deterministic-lexicographic";
 pub const RUNTIME_READ_MODEL_SECTION_ORDERING_RULES: [(&str, &str); 10] = [
-    ("details.missions", "mission_id asc"),
+    ("details.execution_groups", "mission_id asc"),
     ("details.tasks", "task_id asc"),
     ("details.assignments", "assignment_id asc"),
     ("details.workers", "worker_id asc"),
@@ -150,8 +150,8 @@ impl RuntimeReadModelInput {
         }
 
         validate_string_set(
-            &self.overview.activity.active_mission_ids,
-            "overview.activity.active_mission_ids",
+            &self.overview.activity.active_execution_group_ids,
+            "overview.activity.active_execution_group_ids",
             &mut issues,
         );
         validate_string_set(
@@ -161,9 +161,9 @@ impl RuntimeReadModelInput {
         );
 
         validate_sorted_by_key(
-            &self.details.missions,
+            &self.details.execution_groups,
             |entry| entry.mission_id.clone(),
-            "details.missions",
+            "details.execution_groups",
             &mut issues,
         );
         validate_sorted_by_key(
@@ -203,35 +203,35 @@ impl RuntimeReadModelInput {
             &mut issues,
         );
 
-        for entry in &self.details.missions {
+        for entry in &self.details.execution_groups {
             validate_string_set(
                 &entry.active_task_ids,
-                "details.missions[].active_task_ids",
+                "details.execution_groups[].active_task_ids",
                 &mut issues,
             );
             validate_string_set(
                 &entry.context_truncation_parts,
-                "details.missions[].context_truncation_parts",
+                "details.execution_groups[].context_truncation_parts",
                 &mut issues,
             );
             validate_string_set(
                 &entry.context_knowledge_ids,
-                "details.missions[].context_knowledge_ids",
+                "details.execution_groups[].context_knowledge_ids",
                 &mut issues,
             );
             validate_string_set(
                 &entry.context_knowledge_source_paths,
-                "details.missions[].context_knowledge_source_paths",
+                "details.execution_groups[].context_knowledge_source_paths",
                 &mut issues,
             );
             validate_string_set(
                 &entry.context_memory_ids,
-                "details.missions[].context_memory_ids",
+                "details.execution_groups[].context_memory_ids",
                 &mut issues,
             );
             validate_string_set(
                 &entry.context_memory_extraction_refs,
-                "details.missions[].context_memory_extraction_refs",
+                "details.execution_groups[].context_memory_extraction_refs",
                 &mut issues,
             );
         }
@@ -250,8 +250,8 @@ impl RuntimeReadModelInput {
         }
         for entry in &self.details.sessions {
             validate_string_set(
-                &entry.active_mission_ids,
-                "details.sessions[].active_mission_ids",
+                &entry.active_execution_group_ids,
+                "details.sessions[].active_execution_group_ids",
                 &mut issues,
             );
             validate_string_set(
@@ -267,8 +267,8 @@ impl RuntimeReadModelInput {
         }
         for entry in &self.details.workspaces {
             validate_string_set(
-                &entry.active_mission_ids,
-                "details.workspaces[].active_mission_ids",
+                &entry.active_execution_group_ids,
+                "details.workspaces[].active_execution_group_ids",
                 &mut issues,
             );
             validate_string_set(
@@ -306,8 +306,8 @@ impl RuntimeReadModelInput {
             &mut issues,
         );
         validate_string_set(
-            &self.operations.attention.failed_mission_ids,
-            "operations.attention.failed_mission_ids",
+            &self.operations.attention.failed_execution_group_ids,
+            "operations.attention.failed_execution_group_ids",
             &mut issues,
         );
         validate_string_set(
@@ -386,8 +386,8 @@ impl RuntimeReadModelInput {
             &mut issues,
         );
         validate_string_set(
-            &self.operations.work_queues.running_mission_ids,
-            "operations.work_queues.running_mission_ids",
+            &self.operations.work_queues.running_execution_group_ids,
+            "operations.work_queues.running_execution_group_ids",
             &mut issues,
         );
         validate_string_set(
@@ -411,8 +411,8 @@ impl RuntimeReadModelInput {
             &mut issues,
         );
         validate_string_set(
-            &self.operations.resume_observation.affected_mission_ids,
-            "operations.resume_observation.affected_mission_ids",
+            &self.operations.resume_observation.affected_execution_group_ids,
+            "operations.resume_observation.affected_execution_group_ids",
             &mut issues,
         );
         validate_string_set(

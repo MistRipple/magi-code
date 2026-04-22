@@ -21,7 +21,7 @@ pub type KnownTerminationReason = OrchestratorTerminationReason;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProgressVector {
-    pub terminal_required_todos: u32,
+    pub terminal_required_tasks: u32,
     pub accepted_criteria: u32,
     pub critical_path_resolved: u32,
     pub unresolved_blockers: u32,
@@ -181,12 +181,12 @@ pub fn evaluate_progress(
     let p0 = &prev.progress_vector;
     let p1 = &curr.progress_vector;
 
-    let improved = p1.terminal_required_todos > p0.terminal_required_todos
+    let improved = p1.terminal_required_tasks > p0.terminal_required_tasks
         || p1.accepted_criteria > p0.accepted_criteria
         || p1.critical_path_resolved > p0.critical_path_resolved
         || p1.unresolved_blockers < p0.unresolved_blockers;
 
-    let regressed = p1.terminal_required_todos < p0.terminal_required_todos
+    let regressed = p1.terminal_required_tasks < p0.terminal_required_tasks
         || p1.accepted_criteria < p0.accepted_criteria
         || p1.critical_path_resolved < p0.critical_path_resolved
         || p1.unresolved_blockers > p0.unresolved_blockers;

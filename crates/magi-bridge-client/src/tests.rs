@@ -357,7 +357,7 @@ fn progress_evaluation_detects_progress() {
         plan_id: "p1".into(),
         attempt_seq: 1,
         progress_vector: ProgressVector {
-            terminal_required_todos: 2,
+            terminal_required_tasks: 2,
             accepted_criteria: 1,
             critical_path_resolved: 0,
             unresolved_blockers: 3,
@@ -377,7 +377,7 @@ fn progress_evaluation_detects_progress() {
 
     let curr = TerminationSnapshot {
         progress_vector: ProgressVector {
-            terminal_required_todos: 3,
+            terminal_required_tasks: 3,
             accepted_criteria: 2,
             critical_path_resolved: 0,
             unresolved_blockers: 2,
@@ -399,7 +399,7 @@ fn progress_evaluation_detects_regression() {
         plan_id: "p1".into(),
         attempt_seq: 1,
         progress_vector: ProgressVector {
-            terminal_required_todos: 3,
+            terminal_required_tasks: 3,
             accepted_criteria: 2,
             critical_path_resolved: 0,
             unresolved_blockers: 1,
@@ -419,7 +419,7 @@ fn progress_evaluation_detects_regression() {
 
     let curr = TerminationSnapshot {
         progress_vector: ProgressVector {
-            terminal_required_todos: 2,
+            terminal_required_tasks: 2,
             accepted_criteria: 1,
             critical_path_resolved: 0,
             unresolved_blockers: 3,
@@ -514,7 +514,7 @@ fn decision_engine_shadow_reason_completed() {
     let budget = test_budget();
 
     let mut snap = test_snapshot(3);
-    snap.progress_vector.terminal_required_todos = 3;
+    snap.progress_vector.terminal_required_tasks = 3;
     snap.running_or_pending_required = 0;
     let gate = OrchestratorGateState::default();
 
@@ -544,15 +544,15 @@ fn decision_engine_shadow_reason_failed_on_empty_text() {
 fn round_policy_continue_prompt_no_todos() {
     let snap = test_snapshot(0);
     let prompt = crate::round_policy::build_continue_prompt(&snap);
-    assert!(prompt.contains("没有结构化的 required todos"));
+    assert!(prompt.contains("没有结构化的必需任务"));
 }
 
 #[test]
 fn round_policy_continue_prompt_with_todos() {
     let mut snap = test_snapshot(5);
-    snap.progress_vector.terminal_required_todos = 2;
+    snap.progress_vector.terminal_required_tasks = 2;
     let prompt = crate::round_policy::build_continue_prompt(&snap);
-    assert!(prompt.contains("剩余必需 Todo: 3"));
+    assert!(prompt.contains("剩余必需任务: 3"));
 }
 
 #[test]
@@ -566,22 +566,22 @@ fn summary_hijack_correction_rounds() {
 }
 
 #[test]
-fn no_todo_plain_response_simple_text_terminates() {
+fn no_task_plain_response_simple_text_terminates() {
     use crate::round_policy::*;
-    let decision = decide_no_todo_plain_response_action("hello", 0, false, None, 0, 0);
+    let decision = decide_no_task_plain_response_action("hello", 0, false, None, 0, 0);
     assert!(matches!(
         decision,
-        NoTodoPlainResponseDecision::TerminateCompleted { .. }
+        NoTaskPlainResponseDecision::TerminateCompleted { .. }
     ));
 }
 
 #[test]
-fn no_todo_plain_response_empty_text_requests_outcome() {
+fn no_task_plain_response_empty_text_requests_outcome() {
     use crate::round_policy::*;
-    let decision = decide_no_todo_plain_response_action("", 0, false, None, 0, 0);
+    let decision = decide_no_task_plain_response_action("", 0, false, None, 0, 0);
     assert!(matches!(
         decision,
-        NoTodoPlainResponseDecision::RequestOutcomeBlock { .. }
+        NoTaskPlainResponseDecision::RequestOutcomeBlock { .. }
     ));
 }
 

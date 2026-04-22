@@ -9,3 +9,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 magi-agent = { path = "../../crates/magi-agent" }
 magi-daemon = { path = "../../crates/magi-daemon" }
+dirs = "6"

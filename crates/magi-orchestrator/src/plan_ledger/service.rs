@@ -100,32 +100,6 @@ impl PlanLedgerService {
         record
     }
 
-    pub fn mark_awaiting_confirmation(
-        &mut self,
-        session_id: &str,
-        plan_id: &str,
-        formatted_plan: Option<&str>,
-    ) -> Option<PlanRecord> {
-        let record = self.load_plan_mut(session_id, plan_id)?;
-        if record.status.is_terminal() {
-            return None;
-        }
-        if !try_transition_plan_status(record, PlanStatus::AwaitingConfirmation) {
-            return None;
-        }
-        if let Some(fp) = formatted_plan {
-            let trimmed = fp.trim();
-            if !trimmed.is_empty() {
-                record.formatted_plan = Some(trimmed.to_string());
-            }
-        }
-        record.updated_at = now_millis();
-        record.revision += 1;
-        let result = record.clone();
-        self.update_index(&result);
-        Some(result)
-    }
-
     pub fn approve(
         &mut self,
         session_id: &str,
@@ -228,7 +202,7 @@ impl PlanLedgerService {
         Some(record.clone())
     }
 
-    pub fn bind_mission(
+    pub(crate) fn bind_mission(
         &mut self,
         session_id: &str,
         plan_id: &str,
@@ -645,69 +619,6 @@ impl PlanLedgerService {
         Some(record.clone())
     }
 
-    pub fn update_runtime_replan(
-        &mut self,
-        session_id: &str,
-        plan_id: &str,
-        state: ReplanState,
-        reason: Option<&str>,
-    ) -> Option<PlanRecord> {
-        let record = self.load_plan_mut(session_id, plan_id)?;
-        let now = now_millis();
-        record.runtime.replan.state = state;
-        record.runtime.replan.reason = if state == ReplanState::None && reason.is_none() {
-            None
-        } else {
-            reason.map(|s| s.to_string())
-        };
-        record.runtime.replan.updated_at = Some(now);
-        record.updated_at = now;
-        record.revision += 1;
-        Some(record.clone())
-    }
-
-    pub fn update_runtime_wait(
-        &mut self,
-        session_id: &str,
-        plan_id: &str,
-        state: WaitState,
-        reason_code: Option<&str>,
-    ) -> Option<PlanRecord> {
-        let record = self.load_plan_mut(session_id, plan_id)?;
-        let now = now_millis();
-        record.runtime.wait.state = state;
-        record.runtime.wait.reason_code = if state == WaitState::None && reason_code.is_none() {
-            None
-        } else {
-            reason_code.map(|s| s.to_string())
-        };
-        record.runtime.wait.updated_at = Some(now);
-        record.updated_at = now;
-        record.revision += 1;
-        Some(record.clone())
-    }
-
-    pub fn update_runtime_phase(
-        &mut self,
-        session_id: &str,
-        plan_id: &str,
-        phase: PlanRuntimePhaseState,
-    ) -> Option<PlanRecord> {
-        let record = self.load_plan_mut(session_id, plan_id)?;
-        let now = now_millis();
-        let mut phase = phase;
-        phase.updated_at = Some(now);
-        if phase.continuation_intent == ContinuationIntent::Stop {
-            phase.next_index = None;
-            phase.next_title = None;
-            phase.remaining_phases = Vec::new();
-        }
-        record.runtime.phase = phase;
-        record.updated_at = now;
-        record.revision += 1;
-        Some(record.clone())
-    }
-
     pub fn update_runtime_acceptance(
         &mut self,
         session_id: &str,
@@ -772,13 +683,7 @@ impl PlanLedgerService {
         None
     }
 
-    pub fn get_latest_plan(&self, session_id: &str) -> Option<&PlanRecord> {
-        let index = self.index.get(session_id)?;
-        let latest = index.iter().max_by_key(|e| e.updated_at)?;
-        self.plans.get(session_id)?.get(&latest.plan_id)
-    }
-
-    pub fn get_latest_plan_by_mission(
+    pub(crate) fn get_latest_plan_by_mission(
         &self,
         session_id: &str,
         mission_id: &str,
@@ -854,7 +759,7 @@ impl PlanLedgerService {
         lines.join("\n")
     }
 
-    pub fn reconcile_by_missions(
+    pub(crate) fn reconcile_by_missions(
         &mut self,
         session_id: &str,
         missions: &[(&str, &str)],
@@ -936,10 +841,6 @@ impl PlanLedgerService {
             }
         }
         reconciled
-    }
-
-    pub fn plan_count(&self, session_id: &str) -> usize {
-        self.plans.get(session_id).map_or(0, |m| m.len())
     }
 
     fn mark_superseded(&mut self, session_id: &str, plan_id: &str) {

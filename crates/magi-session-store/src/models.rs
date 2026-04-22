@@ -24,6 +24,8 @@ pub struct SessionRecord {
     pub updated_at: UtcMillis,
     #[serde(default, alias = "message_count", skip_serializing_if = "Option::is_none")]
     pub message_count: Option<usize>,
+    #[serde(default, alias = "workspace_id", skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

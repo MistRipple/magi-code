@@ -82,6 +82,17 @@ async fn get_json(app: axum::Router, path: &str) -> Value {
     .expect("response should be valid json")
 }
 
+async fn get_task_projection(app: axum::Router, root_task_id: &str) -> Value {
+    get_json(app, &format!("/api/tasks/graph/{root_task_id}")).await
+}
+
+fn assert_completed_two_task_projection(projection: &Value) {
+    assert_eq!(projection["progress_summary"]["total_tasks"], 2);
+    assert_eq!(projection["progress_summary"]["completed_tasks"], 2);
+    assert_eq!(projection["progress_summary"]["failed_tasks"], 0);
+    assert_eq!(projection["root_task"]["status"], "Completed");
+}
+
 #[test]
 fn legacy_session_file_can_seed_sidecar_file_loading() {
     let state_root = temp_state_root("legacy-session-sidecar");
@@ -629,26 +640,24 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         .as_u64()
         .expect("accepted_at should serialize as integer");
     let followup_mission_id = format!("mission-session-action-{accepted_at}");
+    let followup_root_task_id = followup_body["root_task_id"]
+        .as_str()
+        .expect("root_task_id should serialize as string");
     let followup_read_model = get_json(app.clone(), "/runtime/read-model").await;
-    let followup_mission = followup_read_model["details"]["missions"]
+    let followup_execution_group = followup_read_model["details"]["execution_groups"]
         .as_array()
-        .expect("missions should be an array")
+        .expect("execution groups should be an array")
         .iter()
         .find(|entry| entry["mission_id"] == followup_mission_id)
-        .expect("followup mission should exist");
-    assert_eq!(followup_mission["context_used_memory_count"], 1);
-    assert_eq!(followup_mission["context_extracted_memory_count"], 1);
+        .expect("followup execution group should exist");
+    assert_eq!(followup_execution_group["context_used_memory_count"], 1);
+    assert_eq!(followup_execution_group["context_extracted_memory_count"], 1);
     assert_eq!(
-        followup_mission["context_memory_extraction_refs"],
+        followup_execution_group["context_memory_extraction_refs"],
         json!([expected_extraction_id])
     );
-    let followup_tasks =
-        get_json(app, &format!("/api/tasks/mission/{followup_mission_id}")).await;
-    let followup_tasks = followup_tasks
-        .as_array()
-        .expect("mission tasks should serialize as array");
-    assert_eq!(followup_tasks.len(), 2);
-    assert!(followup_tasks.iter().all(|task| task["status"] == "Completed"));
+    let followup_projection = get_task_projection(app, followup_root_task_id).await;
+    assert_completed_two_task_projection(&followup_projection);
 }
 
 #[tokio::test]
@@ -700,28 +709,26 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         .as_u64()
         .expect("accepted_at should serialize as integer");
     let second_mission_id = format!("mission-session-action-{second_accepted_at}");
+    let second_root_task_id = second_body["root_task_id"]
+        .as_str()
+        .expect("root_task_id should serialize as string");
     let runtime_read_model = get_json(app.clone(), "/runtime/read-model").await;
     let bootstrap = get_json(app.clone(), "/bootstrap").await;
     assert_eq!(bootstrap["runtimeReadModel"], runtime_read_model);
 
-    let second_mission = bootstrap["runtimeReadModel"]["details"]["missions"]
+    let second_execution_group = bootstrap["runtimeReadModel"]["details"]["execution_groups"]
         .as_array()
-        .expect("bootstrap missions should be an array")
+        .expect("bootstrap execution groups should be an array")
         .iter()
         .find(|entry| entry["mission_id"] == second_mission_id)
-        .expect("second mission should exist in bootstrap runtime read model");
+        .expect("second execution group should exist in bootstrap runtime read model");
 
     assert_eq!(
-        second_mission["context_memory_extraction_refs"],
+        second_execution_group["context_memory_extraction_refs"],
         json!([expected_extraction_id])
     );
-    let second_tasks =
-        get_json(app, &format!("/api/tasks/mission/{second_mission_id}")).await;
-    let second_tasks = second_tasks
-        .as_array()
-        .expect("mission tasks should serialize as array");
-    assert_eq!(second_tasks.len(), 2);
-    assert!(second_tasks.iter().all(|task| task["status"] == "Completed"));
+    let second_projection = get_task_projection(app, second_root_task_id).await;
+    assert_completed_two_task_projection(&second_projection);
 }
 
 #[tokio::test]
@@ -838,38 +845,36 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         .as_u64()
         .expect("accepted_at should serialize as integer");
     let followup_mission_id = format!("mission-session-action-{followup_accepted_at}");
+    let followup_root_task_id = followup_body["root_task_id"]
+        .as_str()
+        .expect("root_task_id should serialize as string");
     let runtime_read_model = get_json(app.clone(), "/runtime/read-model").await;
     let bootstrap = get_json(app.clone(), "/bootstrap").await;
     assert_eq!(bootstrap["runtimeReadModel"], runtime_read_model);
 
-    let followup_mission = bootstrap["runtimeReadModel"]["details"]["missions"]
+    let followup_execution_group = bootstrap["runtimeReadModel"]["details"]["execution_groups"]
         .as_array()
-        .expect("bootstrap missions should be an array")
+        .expect("bootstrap execution groups should be an array")
         .iter()
         .find(|entry| entry["mission_id"] == followup_mission_id)
-        .expect("followup mission should exist in bootstrap runtime read model");
+        .expect("followup execution group should exist in bootstrap runtime read model");
     assert!(
-        followup_mission["context_used_memory_count"]
+        followup_execution_group["context_used_memory_count"]
             .as_u64()
             .expect("used memory count should serialize as integer")
             >= 1
     );
-    let extraction_refs = followup_mission["context_memory_extraction_refs"]
+    let extraction_refs = followup_execution_group["context_memory_extraction_refs"]
         .as_array()
         .expect("context memory extraction refs should serialize as array");
     assert!(
         extraction_refs
             .iter()
             .any(|value| value == expected_extraction_id),
-        "bootstrap followup mission should include recovery extraction ref, got {extraction_refs:?}"
+        "bootstrap followup execution group should include recovery extraction ref, got {extraction_refs:?}"
     );
-    let followup_tasks =
-        get_json(app, &format!("/api/tasks/mission/{followup_mission_id}")).await;
-    let followup_tasks = followup_tasks
-        .as_array()
-        .expect("mission tasks should serialize as array");
-    assert_eq!(followup_tasks.len(), 2);
-    assert!(followup_tasks.iter().all(|task| task["status"] == "Completed"));
+    let followup_projection = get_task_projection(app, followup_root_task_id).await;
+    assert_completed_two_task_projection(&followup_projection);
 }
 
 #[test]
@@ -1731,16 +1736,15 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
 
     let session_id = body["session_id"].as_str().unwrap();
     assert_eq!(session_id, "shadow-session-001", "should use bootstrapped session");
-    let accepted_at = body["accepted_at"].as_u64().unwrap();
+    let accepted_at = body["accepted_at"]
+        .as_u64()
+        .expect("accepted_at should serialize as integer");
     let mission_id = format!("mission-session-action-{accepted_at}");
-
-    let tasks = get_json(app.clone(), &format!("/api/tasks/mission/{mission_id}")).await;
-    let tasks = tasks.as_array().expect("tasks should be an array");
-    assert_eq!(tasks.len(), 2, "should have root + action tasks");
-    assert!(
-        tasks.iter().all(|t| t["status"] == "Completed"),
-        "all tasks should be completed: {tasks:?}"
-    );
+    let root_task_id = body["root_task_id"]
+        .as_str()
+        .expect("root_task_id should serialize as string");
+    let projection = get_task_projection(app.clone(), root_task_id).await;
+    assert_completed_two_task_projection(&projection);
 
     let messages = get_json(
         app.clone(),
@@ -1778,12 +1782,12 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
     );
 
     let read_model = get_json(app, "/runtime/read-model").await;
-    let missions = read_model["details"]["missions"]
+    let execution_groups = read_model["details"]["execution_groups"]
         .as_array()
-        .expect("missions should be an array");
+        .expect("execution groups should be an array");
     assert!(
-        missions.iter().any(|m| m["mission_id"] == mission_id),
-        "read model should contain the mission"
+        execution_groups.iter().any(|m| m["mission_id"] == mission_id),
+        "read model should contain the execution group"
     );
 }
 
@@ -1886,15 +1890,15 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
     let second_mission_id = format!("mission-session-action-{second_accepted_at}");
 
     let bootstrap = get_json(app, "/bootstrap").await;
-    let missions = bootstrap["runtimeReadModel"]["details"]["missions"]
+    let execution_groups = bootstrap["runtimeReadModel"]["details"]["execution_groups"]
         .as_array()
-        .expect("missions should be an array");
+        .expect("execution groups should be an array");
     assert!(
-        missions.iter().any(|m| m["mission_id"] == first_mission_id),
-        "bootstrap should contain first mission"
+        execution_groups.iter().any(|m| m["mission_id"] == first_mission_id),
+        "bootstrap should contain first execution group"
     );
     assert!(
-        missions.iter().any(|m| m["mission_id"] == second_mission_id),
-        "bootstrap should contain second mission"
+        execution_groups.iter().any(|m| m["mission_id"] == second_mission_id),
+        "bootstrap should contain second execution group"
     );
 }
