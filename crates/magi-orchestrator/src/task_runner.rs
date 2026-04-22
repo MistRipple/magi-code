@@ -1227,7 +1227,7 @@ impl TaskRunner {
     // G5: Control commands (design 9.x)
     // ------------------------------------------------------------------
 
-    /// Pause a running task and all its running descendants.
+    /// Pause a running task and all its non-terminal可调度 descendants.
     pub fn pause_task(&self, task_id: &TaskId) -> Result<(), String> {
         let task = self.store.get_task(task_id).ok_or("task not found")?;
         if task.status != TaskStatus::Running {
@@ -1235,11 +1235,25 @@ impl TaskRunner {
         }
         self.store.update_status(task_id, TaskStatus::Blocked)
             .map_err(|e| format!("pause failed: {e}"))?;
-        // Also pause running children.
-        let children = self.store.get_children(task_id);
-        for child in &children {
-            if child.status == TaskStatus::Running {
-                let _ = self.store.update_status(&child.task_id, TaskStatus::Blocked);
+        for descendant_id in self.collect_all_task_ids(task_id) {
+            if descendant_id == *task_id {
+                continue;
+            }
+            if self
+                .store
+                .get_task(&descendant_id)
+                .is_some_and(|descendant| {
+                    matches!(
+                        descendant.status,
+                        TaskStatus::Draft
+                            | TaskStatus::Ready
+                            | TaskStatus::Running
+                            | TaskStatus::Verifying
+                            | TaskStatus::Repairing
+                    )
+                })
+            {
+                let _ = self.store.update_status(&descendant_id, TaskStatus::Blocked);
             }
         }
         Ok(())
@@ -1253,10 +1267,16 @@ impl TaskRunner {
         }
         self.store.update_status(task_id, TaskStatus::Running)
             .map_err(|e| format!("resume failed: {e}"))?;
-        let children = self.store.get_children(task_id);
-        for child in &children {
-            if child.status == TaskStatus::Blocked {
-                let _ = self.store.update_status(&child.task_id, TaskStatus::Ready);
+        for descendant_id in self.collect_all_task_ids(task_id) {
+            if descendant_id == *task_id {
+                continue;
+            }
+            if self
+                .store
+                .get_task(&descendant_id)
+                .is_some_and(|descendant| descendant.status == TaskStatus::Blocked)
+            {
+                let _ = self.store.update_status(&descendant_id, TaskStatus::Ready);
             }
         }
         Ok(())
@@ -2689,6 +2709,48 @@ mod tests {
 
         let act = store.get_task(&TaskId::new("act-1")).unwrap();
         assert_eq!(act.status, TaskStatus::Ready, "Manual task should remain Ready");
+    }
+
+    #[test]
+    fn pause_and_resume_task_propagate_recursively_to_worker_branches() {
+        let store = Arc::new(TaskStore::new());
+
+        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
+        let phase = make_task("phase-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Phase, TaskStatus::Running);
+        let wp = make_task("wp-1", "m-1", "obj-1", Some("phase-1"), TaskKind::WorkPackage, TaskStatus::Running);
+        let act = make_task("act-1", "m-1", "obj-1", Some("wp-1"), TaskKind::Action, TaskStatus::Running);
+
+        store.insert_task(root);
+        store.insert_task(phase);
+        store.insert_task(wp);
+        store.insert_task(act);
+
+        let workers = vec![make_worker("w-1", "integration-dev", vec![TaskKind::Action])];
+        let runner = TaskRunner::new(Arc::clone(&store), workers);
+
+        runner
+            .pause_task(&TaskId::new("obj-1"))
+            .expect("pause should block whole subtree");
+        for task_id in ["obj-1", "phase-1", "wp-1", "act-1"] {
+            let task = store
+                .get_task(&TaskId::new(task_id))
+                .expect("task should exist after pause");
+            assert_eq!(task.status, TaskStatus::Blocked, "{task_id} should become Blocked");
+        }
+
+        runner
+            .resume_task(&TaskId::new("obj-1"))
+            .expect("resume should reopen whole subtree");
+        assert_eq!(
+            store.get_task(&TaskId::new("obj-1")).unwrap().status,
+            TaskStatus::Running
+        );
+        for task_id in ["phase-1", "wp-1", "act-1"] {
+            let task = store
+                .get_task(&TaskId::new(task_id))
+                .expect("task should exist after resume");
+            assert_eq!(task.status, TaskStatus::Ready, "{task_id} should become Ready");
+        }
     }
 
     // -----------------------------------------------------------------------

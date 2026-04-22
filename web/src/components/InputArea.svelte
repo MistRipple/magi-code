@@ -4,7 +4,9 @@
   import {
     addToast,
     getActiveInteractionType,
+    getCurrentSessionId,
     getQueuedMessages,
+    getThreadMessages,
     messagesState,
   } from '../stores/messages.svelte';
   import type { StandardMessage } from '../shared/protocol/message-protocol';
@@ -12,6 +14,7 @@
   import Icon from './Icon.svelte';
   import { generateId, ensureArray } from '../lib/utils';
   import { i18n } from '../stores/i18n.svelte';
+  import { getTaskGraphState } from '../stores/task-graph-store.svelte';
 
   // 技能类型
   interface InstructionSkill {
@@ -69,7 +72,31 @@
   const MAX_IMAGE_SIZE = 10 * 1024 * 1024;  // 单张图片最大 10MB
 
   // 🔧 修复响应式：直接访问 messagesState 属性确保正确追踪
-  const isSending = $derived(messagesState.isProcessing);
+  const hasStreamingThreadMessage = $derived.by(() => (
+    getThreadMessages().some((message) => message?.isStreaming === true)
+  ));
+  const hasAuthoritativeSessionProcessing = $derived.by(() => (
+    messagesState.appState?.processingState?.isProcessing === true
+  ));
+  const currentSessionId = $derived.by(() => getCurrentSessionId());
+  const hasActiveSessionTask = $derived.by(() => {
+    const sessionId = currentSessionId;
+    if (!sessionId) {
+      return false;
+    }
+    const taskGraphState = getTaskGraphState(sessionId);
+    if (taskGraphState.loading && taskGraphState.rootTaskId) {
+      return true;
+    }
+    const runningTasks = taskGraphState.projection?.running_tasks ?? [];
+    return runningTasks.length > 0;
+  });
+  const isSending = $derived(
+    messagesState.isProcessing
+    || hasAuthoritativeSessionProcessing
+    || hasStreamingThreadMessage
+    || hasActiveSessionTask
+  );
   const activeInteraction = $derived.by(() => getActiveInteractionType());
   const isInteractionBlocking = $derived.by(() => Boolean(activeInteraction));
   const queuedMessages = $derived.by(() => getQueuedMessages());

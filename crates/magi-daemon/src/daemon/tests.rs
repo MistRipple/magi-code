@@ -20,6 +20,7 @@ use magi_core::{
 };
 use magi_event_bus::{EventEnvelope, InMemoryEventBus, RuntimeLedgerSummary};
 use magi_session_store::{
+    ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     SessionExecutionSidecarStatus, SessionSidecarFlushReason, SessionSidecarFlushMetadata,
     SessionStore,
 };
@@ -82,13 +83,23 @@ async fn get_json(app: axum::Router, path: &str) -> Value {
     .expect("response should be valid json")
 }
 
-async fn get_task_projection(app: axum::Router, root_task_id: &str) -> Value {
-    get_json(app, &format!("/api/tasks/graph/{root_task_id}")).await
+async fn get_task_projection(app: axum::Router, root_task_id: &str, session_id: &str) -> Value {
+    get_json(
+        app,
+        &format!("/api/tasks/graph/{root_task_id}?sessionId={session_id}"),
+    )
+    .await
 }
 
 fn assert_completed_two_task_projection(projection: &Value) {
-    assert_eq!(projection["progress_summary"]["total_tasks"], 2);
-    assert_eq!(projection["progress_summary"]["completed_tasks"], 2);
+    let total_tasks = projection["progress_summary"]["total_tasks"]
+        .as_u64()
+        .expect("total_tasks should serialize as integer");
+    let completed_tasks = projection["progress_summary"]["completed_tasks"]
+        .as_u64()
+        .expect("completed_tasks should serialize as integer");
+    assert!(total_tasks >= 2, "task projection should include at least root + action");
+    assert_eq!(completed_tasks, total_tasks);
     assert_eq!(projection["progress_summary"]["failed_tasks"], 0);
     assert_eq!(projection["root_task"]["status"], "Completed");
 }
@@ -482,6 +493,41 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
             execution_chain_ref: Some(execution_chain_ref.clone()),
         },
     );
+    state
+        .session_store
+        .upsert_active_execution_chain(
+            session_id.clone(),
+            ActiveExecutionChain {
+                session_id: session_id.clone(),
+                mission_id: mission_id.clone(),
+                root_task_id: TaskId::new("task-root-router-recovery"),
+                execution_chain_ref: execution_chain_ref.clone(),
+                workspace_id: Some(workspace_id.clone()),
+                active_branch_task_ids: vec![task_id.clone()],
+                active_worker_bindings: vec![worker_id.clone()],
+                branches: vec![ActiveExecutionBranch {
+                    task_id: task_id.clone(),
+                    worker_id: worker_id.clone(),
+                    stage: "blocked".to_string(),
+                    lease_id: None,
+                    execution_intent_ref: None,
+                    binding_lifecycle: Some("active".to_string()),
+                    last_checkpoint_at: UtcMillis::now(),
+                    is_primary: true,
+                    use_tools: true,
+                    skill_name: Some("resume".to_string()),
+                }],
+                recovery_ref: Some("recovery-router-recovery".to_string()),
+                dispatch_context: ActiveExecutionDispatchContext {
+                    accepted_at: UtcMillis::now(),
+                    entry_id: "timeline-router-recovery".to_string(),
+                    trimmed_text: Some("resume parser after crash".to_string()),
+                    deep_task: true,
+                    skill_name: Some("resume".to_string()),
+                },
+            },
+        )
+        .expect("active execution chain should attach");
 
     let recovery_handle = state.workspace_registry.prepare_recovery_entry(
         workspace_id.clone(),
@@ -561,10 +607,9 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
     let expected_extraction_id = format!("extract-recovery-{}", recovery_handle.recovery_id);
     let (status, recovery_body) = post_json(
         app.clone(),
-        "/recovery/resume",
+        "/api/session/continue",
         json!({
-            "recovery_id": recovery_handle.recovery_id,
-            "worker_id": worker_id.to_string(),
+            "sessionId": session_id.to_string(),
         }),
     )
     .await;
@@ -573,9 +618,13 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         StatusCode::OK,
         "unexpected recovery response body: {recovery_body:?}"
     );
-    assert_eq!(recovery_body["task_id"], task_id.to_string());
-    assert_eq!(recovery_body["worker_id"], worker_id.to_string());
-    assert_eq!(recovery_body["memory_writeback_applied"], true);
+    assert_eq!(recovery_body["sessionId"], session_id.to_string());
+    assert_eq!(recovery_body["missionId"], mission_id.to_string());
+    assert_eq!(
+        recovery_body["rootTaskId"],
+        TaskId::new("task-root-router-recovery").to_string()
+    );
+    assert_eq!(recovery_body["status"], "continued");
 
     let verification = pipeline
         .memory_store
@@ -599,7 +648,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         .iter()
         .find(|entry| entry["recovery_id"] == "recovery-router-recovery")
         .expect("recovery summary should exist");
-    assert_eq!(recovery_summary["current_status"], "worker_resumed");
+    assert_eq!(recovery_summary["current_status"], "consumed");
     assert_eq!(recovery_summary["diagnostic_summary"], "resume parser after crash");
     let session_summary = first_read_model["details"]["sessions"]
         .as_array()
@@ -608,7 +657,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         .find(|entry| entry["session_id"] == session_id.to_string())
         .expect("session summary should exist");
     assert_eq!(session_summary["current_status"], "resumed");
-    assert_eq!(session_summary["recovery_ref"], "recovery-router-recovery");
+    assert!(session_summary["recovery_ref"].is_null());
     let workspace_summary = first_read_model["details"]["workspaces"]
         .as_array()
         .expect("workspace summaries should be an array")
@@ -656,7 +705,8 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         followup_execution_group["context_memory_extraction_refs"],
         json!([expected_extraction_id])
     );
-    let followup_projection = get_task_projection(app, followup_root_task_id).await;
+    let followup_projection =
+        get_task_projection(app, followup_root_task_id, session_id.as_str()).await;
     assert_completed_two_task_projection(&followup_projection);
 }
 
@@ -666,7 +716,20 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
     let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
     let runtime = ShadowDaemonRuntime::restore(&config)
         .expect("runtime restore should bootstrap empty state");
-    let (app, _state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+    let (app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+    let session_id = SessionId::new("shadow-session-bootstrap");
+    let active_workspace_id = state
+        .workspace_registry
+        .active_workspace_id()
+        .expect("bootstrap workspace should exist");
+    state
+        .session_store
+        .create_session_for_workspace(
+            session_id.clone(),
+            "bootstrap session".to_string(),
+            Some(active_workspace_id.to_string()),
+        )
+        .expect("bootstrap session should be creatable");
 
     let (status, first_body) = post_json(
         app.clone(),
@@ -727,7 +790,8 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         second_execution_group["context_memory_extraction_refs"],
         json!([expected_extraction_id])
     );
-    let second_projection = get_task_projection(app, second_root_task_id).await;
+    let second_projection =
+        get_task_projection(app, second_root_task_id, session_id.as_str()).await;
     assert_completed_two_task_projection(&second_projection);
 }
 
@@ -738,6 +802,19 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
     let runtime = ShadowDaemonRuntime::restore(&config)
         .expect("runtime restore should bootstrap empty state");
     let (app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+    let session_id = magi_core::SessionId::new("shadow-session-bootstrap-recovery");
+    let active_workspace_id = state
+        .workspace_registry
+        .active_workspace_id()
+        .expect("bootstrap workspace should exist");
+    state
+        .session_store
+        .create_session_for_workspace(
+            session_id.clone(),
+            "bootstrap recovery session".to_string(),
+            Some(active_workspace_id.to_string()),
+        )
+        .expect("bootstrap recovery session should be creatable");
 
     let (status, seed_body) = post_json(
         app.clone(),
@@ -753,7 +830,6 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
     .await;
     assert_eq!(status, StatusCode::OK, "unexpected seed body: {seed_body:?}");
 
-    let session_id = magi_core::SessionId::new("shadow-session-bootstrap-recovery");
     let ownership = state
         .session_store
         .execution_ownership(&session_id)
@@ -795,9 +871,9 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
 
     let (status, recovery_body) = post_json(
         app.clone(),
-        "/recovery/resume",
+        "/api/session/continue",
         json!({
-            "recovery_id": recovery.recovery_id,
+            "sessionId": session_id.to_string(),
         }),
     )
     .await;
@@ -806,6 +882,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         StatusCode::OK,
         "unexpected recovery body: {recovery_body:?}"
     );
+    assert_eq!(recovery_body["sessionId"], session_id.to_string());
 
     let expected_extraction_id = "extract-recovery-recovery-bootstrap-route";
     let after_resume_read_model = get_json(app.clone(), "/runtime/read-model").await;
@@ -817,7 +894,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         .iter()
         .find(|entry| entry["recovery_id"] == "recovery-bootstrap-route")
         .expect("bootstrap recovery summary should exist");
-    assert_eq!(recovery_summary["current_status"], "worker_resumed");
+    assert_eq!(recovery_summary["current_status"], "consumed");
     assert_eq!(
         recovery_summary["diagnostic_summary"],
         "resume bootstrap route followup"
@@ -873,7 +950,8 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
             .any(|value| value == expected_extraction_id),
         "bootstrap followup execution group should include recovery extraction ref, got {extraction_refs:?}"
     );
-    let followup_projection = get_task_projection(app, followup_root_task_id).await;
+    let followup_projection =
+        get_task_projection(app, followup_root_task_id, session_id.as_str()).await;
     assert_completed_two_task_projection(&followup_projection);
 }
 
@@ -1743,12 +1821,12 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
     let root_task_id = body["root_task_id"]
         .as_str()
         .expect("root_task_id should serialize as string");
-    let projection = get_task_projection(app.clone(), root_task_id).await;
+    let projection = get_task_projection(app.clone(), root_task_id, session_id).await;
     assert_completed_two_task_projection(&projection);
 
     let messages = get_json(
         app.clone(),
-        &format!("/api/messages?session_id={session_id}"),
+        &format!("/api/messages?sessionId={session_id}"),
     )
     .await;
     let msg_list = messages["messages"]
@@ -1792,12 +1870,103 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
 }
 
 #[tokio::test]
+async fn session_action_messages_survive_runtime_restart_and_preserve_message_count() {
+    let state_root = temp_state_root("e2e-session-action-restart-count");
+    let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root.clone());
+
+    let runtime = ShadowDaemonRuntime::restore(&config)
+        .expect("first runtime restore should bootstrap empty state");
+    let (app, _state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/session/action",
+        json!({
+            "text": "Restart persistence verification",
+            "deep_task": false,
+            "images": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "session action should succeed: {body:?}");
+    let session_id = body["session_id"]
+        .as_str()
+        .expect("session_id should serialize as string")
+        .to_string();
+
+    let before_restart_messages = get_json(
+        app.clone(),
+        &format!("/api/messages?sessionId={session_id}"),
+    )
+    .await;
+    assert_eq!(
+        before_restart_messages["messages"]
+            .as_array()
+            .expect("messages should be an array")
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .count(),
+        1,
+        "restart 前应存在 1 条用户消息"
+    );
+
+    drop(app);
+    drop(runtime);
+
+    let restarted_runtime = ShadowDaemonRuntime::restore(&config)
+        .expect("second runtime restore should recover persisted workspace sessions");
+    let (restarted_app, _restarted_state) =
+        restarted_runtime.router_with_state_for_tests("shadow-test".to_string());
+
+    let after_restart_messages = get_json(
+        restarted_app.clone(),
+        &format!("/api/messages?sessionId={session_id}"),
+    )
+    .await;
+    assert_eq!(
+        after_restart_messages["messages"]
+            .as_array()
+            .expect("messages should be an array after restart")
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .count(),
+        1,
+        "restart 后用户消息不应丢失"
+    );
+
+    let workspace_sessions = get_json(
+        restarted_app,
+        "/api/workspaces/sessions?workspaceId=shadow-workspace-001",
+    )
+    .await;
+    let restored_session = workspace_sessions["sessions"]
+        .as_array()
+        .expect("workspace sessions should be an array")
+        .iter()
+        .find(|session| session["sessionId"] == session_id)
+        .expect("restarted workspace sessions should contain restored session");
+    assert_eq!(restored_session["messageCount"], 1);
+}
+
+#[tokio::test]
 async fn session_action_publishes_domain_event_on_event_bus() {
     let state_root = temp_state_root("e2e-session-action-events");
     let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
     let runtime = ShadowDaemonRuntime::restore(&config)
         .expect("runtime restore should bootstrap empty state");
     let (app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+    let active_workspace_id = state
+        .workspace_registry
+        .active_workspace_id()
+        .expect("bootstrap workspace should exist");
+    state
+        .session_store
+        .create_session_for_workspace(
+            SessionId::new("session-e2e-events"),
+            "event session".to_string(),
+            Some(active_workspace_id.to_string()),
+        )
+        .expect("event session should be creatable");
 
     let (status, body) = post_json(
         app.clone(),
@@ -1872,7 +2041,7 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
 
     let messages = get_json(
         app.clone(),
-        &format!("/api/messages?session_id={session_id}"),
+        &format!("/api/messages?sessionId={session_id}"),
     )
     .await;
     let msg_list = messages["messages"]

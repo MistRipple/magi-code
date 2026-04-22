@@ -12,7 +12,8 @@
   let { activeTopTab, onTabChange }: Props = $props();
 
   const appState = getState();
-  const taskGraph = getTaskGraphState();
+  const currentSessionId = $derived(appState.currentSessionId);
+  const taskGraph = $derived(getTaskGraphState(currentSessionId));
 
   // 任务和变更的徽章数量
   const tasksBadge = $derived.by(() => {

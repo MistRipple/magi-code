@@ -138,9 +138,6 @@ export function collectWorkerTabIds(
 ): string[] {
   const workerTabs: string[] = [];
   const seen = new Set<string>();
-  const hasRoleRegistry = enabledAgents.length > 0
-    || Boolean(registrySnapshot?.registryAgents?.length)
-    || Boolean(registrySnapshot?.roleTemplates?.length);
 
   // 当前会话真实参与者：来自主线 projection（dispatch_group lanes）。
   // 内置角色默认可调度，但只有真实参与任务后才进入可视化工作台。
@@ -151,9 +148,6 @@ export function collectWorkerTabIds(
     }
     const matchedRoleSource = resolveWorkerRoleSource(normalizedWorkerId, enabledAgents, registrySnapshot);
     const tabWorkerId = normalizeWorkerId(matchedRoleSource?.templateId) || normalizedWorkerId;
-    if (hasRoleRegistry && !matchedRoleSource) {
-      continue;
-    }
     if (seen.has(tabWorkerId)) {
       continue;
     }

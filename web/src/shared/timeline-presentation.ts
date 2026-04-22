@@ -57,7 +57,7 @@ function resolveTimelineMetadata(message: Pick<TimelinePresentationMessageLike, 
 
 
 function hasToolBlock(blocks: TimelinePresentationBlockLike[] | undefined): boolean {
-  return Array.isArray(blocks) && blocks.some((block) => block?.type === 'tool_call');
+  return Array.isArray(blocks) && blocks.some((block) => block?.type === 'tool_call' || block?.type === 'tool_result');
 }
 
 export function resolveTimelinePrimaryToolCallName(
@@ -65,7 +65,7 @@ export function resolveTimelinePrimaryToolCallName(
 ): string {
   const safeBlocks = Array.isArray(blocks) ? blocks : [];
   for (const block of safeBlocks) {
-    if (!block || block.type !== 'tool_call') {
+    if (!block || (block.type !== 'tool_call' && block.type !== 'tool_result')) {
       continue;
     }
     const rawName = typeof block.toolName === 'string'
@@ -146,7 +146,11 @@ export function messageHasRenderableTimelineContent(
     if (block.type === 'text' || block.type === 'code' || block.type === 'thinking') {
       return Boolean(block.content && block.content.trim());
     }
-    return block.type === 'tool_call' || block.type === 'file_change' || block.type === 'plan' || block.type === 'dispatch_group';
+    return block.type === 'tool_call'
+      || block.type === 'tool_result'
+      || block.type === 'file_change'
+      || block.type === 'plan'
+      || block.type === 'dispatch_group';
   });
 }
 
@@ -155,6 +159,7 @@ export function resolveTimelineWorkerVisibility(
     hasWorker: boolean;
     type?: string;
     source?: string;
+    blocks?: TimelinePresentationBlockLike[];
     metadata?: Record<string, unknown>;
   },
 ): { threadVisible: boolean; includeWorkerTab: boolean } {
@@ -189,6 +194,12 @@ export function resolveTimelineWorkerVisibility(
       return {
         threadVisible: false,
         includeWorkerTab: false,
+      };
+    }
+    if (hasToolBlock(input.blocks)) {
+      return {
+        threadVisible: true,
+        includeWorkerTab: true,
       };
     }
     switch (input.type) {

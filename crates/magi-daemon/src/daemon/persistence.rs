@@ -76,6 +76,8 @@ impl ShadowStateRepository {
         for (_, root_path) in workspace_roots {
             let ws_state = self.load_workspace_session_state(root_path)?;
             merged.sessions.extend(ws_state.sessions);
+            merged.timeline.extend(ws_state.timeline);
+            merged.notifications.extend(ws_state.notifications);
             if merged.current_session_id.is_none() {
                 merged.current_session_id = ws_state.current_session_id;
             }
@@ -299,4 +301,75 @@ fn stale_backup_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|| "shadow-state.json".to_string());
     file_name.push_str(".stale");
     path.with_file_name(file_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magi_core::{SessionId, SessionLifecycleStatus, UtcMillis};
+    use magi_session_store::{NotificationRecord, SessionDurableState, SessionRecord, TimelineEntry, TimelineEntryKind};
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            UtcMillis::now().0
+        ));
+        fs::create_dir_all(&path).expect("temp dir should create");
+        path
+    }
+
+    #[test]
+    fn load_sessions_from_workspaces_merges_timeline_and_notifications() {
+        let state_root = unique_temp_dir("magi-persistence-state");
+        let workspace_root = unique_temp_dir("magi-persistence-workspace");
+        let repository = ShadowStateRepository::new(state_root.clone());
+        let session_id = SessionId::new("session-persisted-timeline");
+        let now = UtcMillis::now();
+        let workspace_state = SessionDurableState {
+            current_session_id: Some(session_id.clone()),
+            sessions: vec![SessionRecord {
+                session_id: session_id.clone(),
+                title: "持久化会话".to_string(),
+                status: SessionLifecycleStatus::Active,
+                created_at: now,
+                updated_at: now,
+                message_count: Some(1),
+                workspace_id: Some("workspace-persisted".to_string()),
+            }],
+            timeline: vec![TimelineEntry {
+                entry_id: "timeline-persisted-user".to_string(),
+                session_id: session_id.clone(),
+                kind: TimelineEntryKind::UserMessage,
+                message: "恢复后的用户消息".to_string(),
+                occurred_at: now,
+            }],
+            notifications: vec![NotificationRecord {
+                notification_id: "notification-persisted".to_string(),
+                session_id: session_id.clone(),
+                kind: "info".to_string(),
+                message: "恢复后的通知".to_string(),
+                created_at: now,
+                handled: false,
+            }],
+        };
+        repository
+            .save_workspace_session_state(&workspace_root, &workspace_state)
+            .expect("workspace session state should save");
+
+        let merged = repository
+            .load_sessions_from_workspaces(&[(
+                "workspace-persisted".to_string(),
+                workspace_root.clone(),
+            )])
+            .expect("workspace session state should load");
+
+        assert_eq!(merged.sessions.len(), 1);
+        assert_eq!(merged.timeline.len(), 1);
+        assert_eq!(merged.notifications.len(), 1);
+        assert_eq!(merged.current_session_id, Some(session_id));
+
+        let _ = fs::remove_dir_all(state_root);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
 }

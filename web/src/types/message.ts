@@ -281,6 +281,7 @@ export interface ToolCall {
   result?: string;
   error?: string;
   standardized?: StandardizedToolResult;
+  durationMs?: number;
   startTime?: number;
   endTime?: number;
 }

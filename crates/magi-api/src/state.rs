@@ -14,7 +14,7 @@ use crate::routes::settings::{
 use crate::settings_store::SettingsStore;
 use crate::task_execution::ShadowTaskExecutionRegistry;
 use magi_bridge_client::{BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerConfig, ModelBridgeClient, StdioMcpBridgeClient};
-use magi_core::{SessionId, TaskId, WorkerId};
+use magi_core::{SessionId, TaskId, UtcMillis, WorkerId};
 use magi_event_bus::InMemoryEventBus;
 use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
@@ -164,6 +164,27 @@ impl RunnerManager {
         (self.worker_catalog)()
     }
 
+    fn build_task_runner(&self) -> TaskRunner {
+        let workers = self.resolved_workers();
+        if let Some(ref dispatcher) = self.dispatcher {
+            TaskRunner::with_dispatcher(
+                Arc::clone(&self.task_store),
+                workers,
+                Arc::clone(dispatcher),
+                Arc::clone(&self.result_receiver) as Arc<dyn TaskResultReceiver>,
+            )
+        } else if let Some(ref event_bus) = self.event_bus {
+            TaskRunner::with_dispatcher(
+                Arc::clone(&self.task_store),
+                workers,
+                Arc::new(EventBasedTaskDispatcher::new(Arc::clone(event_bus))),
+                Arc::clone(&self.result_receiver) as Arc<dyn TaskResultReceiver>,
+            )
+        } else {
+            TaskRunner::new(Arc::clone(&self.task_store), workers)
+        }
+    }
+
     /// Set the file path used for periodic task-store checkpoints.
     pub fn with_checkpoint_path(mut self, path: PathBuf) -> Self {
         self.checkpoint_path = Some(path);
@@ -206,24 +227,7 @@ impl RunnerManager {
         runners.insert(root_task_id.to_string(), Arc::clone(&handle));
 
         // Spawn the background loop.
-        let workers = self.resolved_workers();
-        let task_runner = if let Some(ref dispatcher) = self.dispatcher {
-            TaskRunner::with_dispatcher(
-                Arc::clone(&self.task_store),
-                workers,
-                Arc::clone(dispatcher),
-                Arc::clone(&self.result_receiver) as Arc<dyn TaskResultReceiver>,
-            )
-        } else if let Some(ref event_bus) = self.event_bus {
-            TaskRunner::with_dispatcher(
-                Arc::clone(&self.task_store),
-                workers,
-                Arc::new(EventBasedTaskDispatcher::new(Arc::clone(event_bus))),
-                Arc::clone(&self.result_receiver) as Arc<dyn TaskResultReceiver>,
-            )
-        } else {
-            TaskRunner::new(Arc::clone(&self.task_store), workers)
-        };
+        let task_runner = self.build_task_runner();
         let root_id = tid;
         let bg_handle = Arc::clone(&handle);
         let bg_task_store = Arc::clone(&self.task_store);
@@ -326,25 +330,24 @@ impl RunnerManager {
         self.task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
-        let workers = self.resolved_workers();
-        let task_runner = if let Some(ref dispatcher) = self.dispatcher {
-            TaskRunner::with_dispatcher(
-                Arc::clone(&self.task_store),
-                workers,
-                Arc::clone(dispatcher),
-                Arc::clone(&self.result_receiver) as Arc<dyn TaskResultReceiver>,
-            )
-        } else if let Some(ref event_bus) = self.event_bus {
-            TaskRunner::with_dispatcher(
-                Arc::clone(&self.task_store),
-                workers,
-                Arc::new(EventBasedTaskDispatcher::new(Arc::clone(event_bus))),
-                Arc::clone(&self.result_receiver) as Arc<dyn TaskResultReceiver>,
-            )
-        } else {
-            TaskRunner::new(Arc::clone(&self.task_store), workers)
-        };
+        let task_runner = self.build_task_runner();
         Ok(task_runner.run_cycle(&tid))
+    }
+
+    pub fn pause_tree(&self, root_task_id: &str) -> Result<(), String> {
+        let tid = TaskId::new(root_task_id);
+        self.task_store
+            .get_task(&tid)
+            .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
+        self.build_task_runner().pause_task(&tid)
+    }
+
+    pub fn resume_tree(&self, root_task_id: &str) -> Result<(), String> {
+        let tid = TaskId::new(root_task_id);
+        self.task_store
+            .get_task(&tid)
+            .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
+        self.build_task_runner().resume_task(&tid)
     }
 }
 
@@ -397,6 +400,7 @@ impl ShadowExecutionPipeline {
 #[derive(Clone)]
 pub struct ApiState {
     pub service_info: ServiceInfo,
+    runtime_epoch: String,
     pub event_bus: Arc<InMemoryEventBus>,
     pub session_store: Arc<SessionStore>,
     pub workspace_registry: Arc<WorkspaceStore>,
@@ -491,6 +495,7 @@ impl ApiState {
                 service_name: service_name.into(),
                 api_version: "v0-shadow".to_string(),
             },
+            runtime_epoch: format!("runtime-{}", UtcMillis::now().0),
             event_bus,
             session_store,
             workspace_registry,
@@ -577,6 +582,10 @@ impl ApiState {
         HealthDto::from_service_info(&self.service_info)
     }
 
+    pub fn runtime_epoch(&self) -> &str {
+        &self.runtime_epoch
+    }
+
     pub fn bootstrap_dto(&self) -> BootstrapDto {
         BootstrapDto::from_state(self)
     }
@@ -609,6 +618,7 @@ impl ApiState {
             &self.session_store.execution_sidecar_exports(),
             &self.workspace_registry.recovery_sidecar_exports(),
             self.audit_usage_ledger_dto(),
+            self.task_store(),
         )
     }
 

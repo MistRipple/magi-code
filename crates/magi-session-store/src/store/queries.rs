@@ -1,8 +1,9 @@
 use super::SessionStore;
 use crate::models::{
-    NotificationRecord, SessionDurableState, SessionExecutionSidecarStoreState,
-    SessionProjectionInput, SessionRecord, SessionRuntimeSidecar, SessionRuntimeSidecarExport,
-    SessionSidecarFlushMetadata, TimelineEntry, TimelineEntryKind,
+    ActiveExecutionChain, NotificationRecord, SessionDurableState,
+    SessionExecutionSidecarStoreState, SessionProjectionInput, SessionRecord,
+    SessionRuntimeSidecar, SessionRuntimeSidecarExport, SessionSidecarFlushMetadata,
+    TimelineEntry, TimelineEntryKind,
 };
 use magi_core::{ExecutionOwnership, SessionId};
 
@@ -235,6 +236,11 @@ impl SessionStore {
         session_id: &SessionId,
     ) -> Option<SessionRuntimeSidecarExport> {
         self.runtime_sidecar(session_id).map(|sidecar| sidecar.export_view())
+    }
+
+    pub fn active_execution_chain(&self, session_id: &SessionId) -> Option<ActiveExecutionChain> {
+        self.runtime_sidecar(session_id)
+            .and_then(|sidecar| sidecar.active_execution_chain)
     }
 
     pub fn execution_ownership(&self, session_id: &SessionId) -> Option<ExecutionOwnership> {

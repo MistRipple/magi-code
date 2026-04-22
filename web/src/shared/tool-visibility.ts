@@ -32,7 +32,6 @@ const RUNTIME_INTERNAL_TOOLS = new Set<string>([
   'context_compact',
   'context_window_status',
   'instruction_skill',
-  'mcp_tool',
   'report_progress',
   'task_complete',
   'task_failed',

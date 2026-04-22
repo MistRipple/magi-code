@@ -259,6 +259,8 @@ export interface AgentSessionActionResult {
   createdSession: boolean;
   /** Root task ID when the backend created a task graph for this action. */
   rootTaskId?: string | null;
+  /** 当前轮次实际执行的 action task ID。 */
+  actionTaskId?: string | null;
 }
 
 export class AgentApiError extends Error {
@@ -894,6 +896,7 @@ export async function submitAgentSessionAction(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         session_id: binding.sessionId || null,
+        workspace_id: binding.workspaceId || null,
         text: payload.text ?? null,
         deep_task: payload.deepTask,
         skill_name: payload.skillName ?? null,
@@ -910,6 +913,7 @@ export async function submitAgentSessionAction(
       accepted_at: number;
       created_session: boolean;
       root_task_id?: string | null;
+      action_task_id?: string | null;
     }>(response, 'submit session action');
     return {
       sessionId: raw.session_id,
@@ -918,6 +922,9 @@ export async function submitAgentSessionAction(
       acceptedAt: raw.accepted_at,
       createdSession: raw.created_session,
       rootTaskId: typeof raw.root_task_id === 'string' && raw.root_task_id.trim() ? raw.root_task_id.trim() : null,
+      actionTaskId: typeof raw.action_task_id === 'string' && raw.action_task_id.trim()
+        ? raw.action_task_id.trim()
+        : null,
     };
   } catch (error) {
     if (error instanceof TypeError) {
@@ -927,8 +934,10 @@ export async function submitAgentSessionAction(
   }
 }
 
-export async function interruptAgentTask(): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/task/interrupt', {}, 'interrupt task');
+export async function interruptAgentTask(
+  payload: { taskId: string },
+): Promise<Record<string, unknown>> {
+  return await postBoundJson<Record<string, unknown>>('/api/task/interrupt', payload, 'interrupt task');
 }
 
 export async function clearAgentAllTasks(): Promise<Record<string, unknown>> {
@@ -939,8 +948,14 @@ export async function startAgentTask(taskId: string): Promise<Record<string, unk
   return await postBoundJson<Record<string, unknown>>('/api/task/start', { taskId }, 'start task');
 }
 
-export async function resumeAgentTask(taskId: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/task/resume', { taskId }, 'resume task');
+export async function continueAgentSession(
+  sessionId: string,
+): Promise<Record<string, unknown>> {
+  return await postBoundJson<Record<string, unknown>>(
+    '/api/session/continue',
+    { sessionId },
+    'continue session',
+  );
 }
 
 export async function deleteAgentTask(taskId: string): Promise<Record<string, unknown>> {
@@ -1260,26 +1275,30 @@ export async function getAgentFilePreview(filePath: string): Promise<AgentFilePr
   }
 }
 
-export async function approveAgentChange(filePath: string): Promise<void> {
-  await postBoundJson('/api/changes/approve', { filePath }, 'approve change');
+export async function approveAgentChange(filePath: string, sessionId?: string): Promise<void> {
+  await postBoundJson('/api/changes/approve', { filePath }, 'approve change', { sessionId });
 }
 
-export async function revertAgentChange(filePath: string): Promise<void> {
-  await postBoundJson('/api/changes/revert', { filePath }, 'revert change');
+export async function revertAgentChange(filePath: string, sessionId?: string): Promise<void> {
+  await postBoundJson('/api/changes/revert', { filePath }, 'revert change', { sessionId });
 }
 
-export async function approveAllAgentChanges(): Promise<void> {
-  await postBoundJson('/api/changes/approve-all', {}, 'approve all changes');
+export async function approveAllAgentChanges(sessionId?: string): Promise<void> {
+  await postBoundJson('/api/changes/approve-all', {}, 'approve all changes', { sessionId });
 }
 
-export async function revertAllAgentChanges(): Promise<void> {
-  await postBoundJson('/api/changes/revert-all', {}, 'revert all changes');
+export async function revertAllAgentChanges(sessionId?: string): Promise<void> {
+  await postBoundJson('/api/changes/revert-all', {}, 'revert all changes', { sessionId });
 }
 
-export async function revertAgentExecutionGroupChanges(executionGroupId: string): Promise<void> {
+export async function revertAgentExecutionGroupChanges(
+  executionGroupId: string,
+  sessionId?: string,
+): Promise<void> {
   await postBoundJson(
     '/api/changes/revert-execution-group',
     { executionGroupId },
     'revert execution group changes',
+    { sessionId },
   );
 }

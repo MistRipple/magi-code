@@ -1005,7 +1005,7 @@ async fn save_safeguard_config(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state
         .settings_store
-        .set_section("safeguard", unwrap_settings_section_request(&request));
+        .set_section("safeguardConfig", unwrap_settings_section_request(&request));
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -1251,4 +1251,45 @@ async fn bridge_cutover_smoke_fallback(
     State(state): State<ApiState>,
 ) -> Json<serde_json::Value> {
     Json(serde_json::to_value(state.bridge_cutover_smoke_dto()).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magi_event_bus::InMemoryEventBus;
+    use magi_governance::GovernanceService;
+    use magi_session_store::SessionStore;
+    use magi_workspace::WorkspaceStore;
+    use std::sync::Arc;
+
+    fn test_state() -> ApiState {
+        ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+    }
+
+    #[tokio::test]
+    async fn save_safeguard_config_persists_canonical_section() {
+        let state = test_state();
+        let payload = serde_json::json!({
+            "rules": [
+                {
+                    "pattern": "rm -rf",
+                    "enabled": true,
+                    "category": "custom"
+                }
+            ]
+        });
+
+        let result = save_safeguard_config(State(state.clone()), Json(payload.clone()))
+            .await
+            .expect("save safeguard config should succeed");
+
+        assert_eq!(result.0["saved"], serde_json::json!(true));
+        assert_eq!(state.settings_store.get_section("safeguardConfig"), payload);
+    }
 }

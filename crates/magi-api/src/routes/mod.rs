@@ -14,7 +14,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use magi_core::{EventId, SessionId, UtcMillis};
+use magi_core::{EventId, SessionId, UtcMillis, WorkspaceId};
+use magi_session_store::SessionRecord;
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::TimelineEntryKind;
 use serde::Deserialize;
@@ -22,6 +23,7 @@ use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static ACCEPTED_AT_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn monotonic_accepted_at() -> UtcMillis {
     let now = UtcMillis::now().0;
@@ -31,19 +33,23 @@ fn monotonic_accepted_at() -> UtcMillis {
     UtcMillis(ts)
 }
 
+pub(super) fn new_session_id() -> SessionId {
+    let nonce = SESSION_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    SessionId::new(format!("session-{}-{}", UtcMillis::now().0, nonce))
+}
+
 use crate::{
     dto::{
         AuditUsageLedgerDto, BootstrapDto, BridgeCutoverSmokeSnapshotDto,
         BridgePreflightSnapshotDto, BridgeServicesSnapshotDto, HealthDto, RuntimeReadModelDto,
-        RecoveryResumeRequestDto, RecoveryResumeResponseDto, SessionActionRequestDto,
-        SessionActionResponseDto, VersionHandshakeDto,
+        SessionActionRequestDto, SessionActionResponseDto, VersionHandshakeDto,
     },
     errors::ApiError,
     sse,
     state::ApiState,
     task_execution::{
-        DispatchSubmissionAccepted, DispatchSubmissionRequest,
-        submit_shadow_dispatch_submission, submit_shadow_recovery_resume_submission,
+        DispatchSubmissionAccepted, DispatchSubmissionRequest, drive_shadow_dispatch_submission,
+        submit_shadow_dispatch_submission,
     },
 };
 
@@ -53,7 +59,7 @@ pub(super) struct SessionActionAccepted {
     accepted_at: UtcMillis,
     created_session: bool,
     root_task_id: magi_core::TaskId,
-    runner_started: bool,
+    action_task_id: magi_core::TaskId,
 }
 
 pub fn build_router(state: ApiState) -> Router {
@@ -79,7 +85,6 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/bridges/cutover-smoke", get(bridge_cutover_smoke))
         .route("/events", get(stream_events))
         .route("/version", get(version))
-        .route("/recovery/resume", post(resume_recovery))
         .route("/session/action", post(submit_session_action))
         .nest("/api", api_routes)
         .with_state(state)
@@ -156,32 +161,7 @@ async fn submit_session_action(
     State(state): State<ApiState>,
     Json(request): Json<SessionActionRequestDto>,
 ) -> Result<Json<SessionActionResponseDto>, ApiError> {
-    let accepted = execute_session_action_submission(&state, &request)?;
-
-    let event_id = EventId::new(format!("event-session-action-{}", accepted.accepted_at.0));
-    let event = EventEnvelope::domain(
-        event_id.clone(),
-        "session.action.accepted",
-        json!({
-            "session_id": accepted.session_id.to_string(),
-            "entry_id": accepted.entry_id,
-            "text": request.trimmed_text(),
-            "skill_name": request.skill_name.clone(),
-            "image_count": request.images.len(),
-            "deep_task": request.deep_task,
-            "created_session": accepted.created_session,
-            "root_task_id": accepted.root_task_id.to_string(),
-            "runner_started": accepted.runner_started,
-        }),
-    )
-    .with_context(EventContext {
-        session_id: Some(accepted.session_id.clone()),
-        ..EventContext::default()
-    });
-    state
-        .event_bus
-        .publish(event)
-        .map_err(|err| ApiError::event_publish_failed("事件发布失败", err))?;
+    let (accepted, event_id) = execute_session_action_submission(&state, &request)?;
 
     Ok(Json(SessionActionResponseDto::new(
         accepted.session_id,
@@ -190,144 +170,213 @@ async fn submit_session_action(
         accepted.accepted_at,
         accepted.created_session,
         Some(accepted.root_task_id),
+        Some(accepted.action_task_id),
     )))
 }
 
 pub(super) fn execute_session_action_submission(
     state: &ApiState,
     request: &SessionActionRequestDto,
-) -> Result<SessionActionAccepted, ApiError> {
+) -> Result<(SessionActionAccepted, EventId), ApiError> {
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_message(trimmed_text.as_deref());
-    let mission_title = trimmed_text
-        .clone()
-        .unwrap_or_else(|| request.fallback_session_title(trimmed_text.as_deref()));
+    let mission_title = request.mission_title(trimmed_text.as_deref());
 
     execute_dispatch_submission(
         state,
         request.requested_session_id(),
+        request.requested_workspace_id().map(WorkspaceId::new),
         mission_title,
         message,
         trimmed_text,
         request.deep_task,
         request.skill_name.clone(),
         None,
+        request,
     )
-}
-
-async fn resume_recovery(
-    State(state): State<ApiState>,
-    Json(request): Json<RecoveryResumeRequestDto>,
-) -> Result<Json<RecoveryResumeResponseDto>, ApiError> {
-    Ok(Json(execute_recovery_resume(&state, &request)?))
-}
-
-pub(super) fn execute_recovery_resume(
-    state: &ApiState,
-    request: &RecoveryResumeRequestDto,
-) -> Result<RecoveryResumeResponseDto, ApiError> {
-    let resumed_at = UtcMillis::now();
-    let accepted = submit_shadow_recovery_resume_submission(state, request, resumed_at)?;
-    let result = accepted.result;
-    let memory_writeback_applied = accepted.memory_writeback_applied;
-    let event_id = EventId::new(format!(
-        "event-recovery-resume-{}-{}",
-        result.recovery_input.recovery_id, resumed_at.0
-    ));
-    let event = EventEnvelope::domain(
-        event_id.clone(),
-        "recovery.resume.executed",
-        json!({
-            "recovery_id": result.recovery_input.recovery_id.clone(),
-            "snapshot_id": result.recovery_input.snapshot_id.clone(),
-            "session_id": result.recovery_input.ownership.session_id.clone(),
-            "workspace_id": result.recovery_input.ownership.workspace_id.clone(),
-            "mission_id": result.target.mission_id.clone(),
-            "assignment_id": result.assignment_id.clone(),
-            "task_id": result.target.task_id.clone(),
-            "worker_id": result.target.requested_worker_id.clone(),
-            "memory_writeback_applied": memory_writeback_applied,
-        }),
-    )
-    .with_context(EventContext {
-        session_id: result.recovery_input.ownership.session_id.clone(),
-        workspace_id: result.recovery_input.ownership.workspace_id.clone(),
-        mission_id: Some(result.target.mission_id.clone()),
-        assignment_id: result.assignment_id.clone(),
-        task_id: Some(result.target.task_id.clone()),
-    });
-    state
-        .event_bus
-        .publish(event)
-        .map_err(|err| ApiError::event_publish_failed("事件发布失败", err))?;
-
-    Ok(RecoveryResumeResponseDto::new(
-        &result,
-        event_id,
-        resumed_at,
-        memory_writeback_applied,
-    ))
 }
 
 fn execute_dispatch_submission(
     state: &ApiState,
     requested_session_id: Option<SessionId>,
+    requested_workspace_id: Option<WorkspaceId>,
     mission_title: String,
     message: String,
     trimmed_text: Option<String>,
     deep_task: bool,
     skill_name: Option<String>,
     target_role: Option<String>,
-) -> Result<SessionActionAccepted, ApiError> {
+    request: &SessionActionRequestDto,
+) -> Result<(SessionActionAccepted, EventId), ApiError> {
     let accepted_at = monotonic_accepted_at();
-    let (session_id, created_session) =
-        resolve_dispatch_session(state, requested_session_id, &mission_title, accepted_at)?;
+    let (session_id, created_session, workspace_id) = resolve_dispatch_session(
+        state,
+        requested_session_id,
+        requested_workspace_id,
+        &mission_title,
+        accepted_at,
+    )?;
     append_dispatch_user_message(state, &session_id, accepted_at, &message);
+    let action_task_title = format!("执行: {}", mission_title);
 
     let dispatch = DispatchSubmissionRequest {
         accepted_at,
         session_id: session_id.clone(),
+        workspace_id: workspace_id.clone(),
         entry_id: format!("timeline-{}-{}", session_id, accepted_at.0),
         created_session,
         mission_title,
-        task_title: message,
+        task_title: action_task_title,
         trimmed_text,
         deep_task,
         skill_name,
         target_role,
     };
-    let accepted = submit_shadow_dispatch_submission(state, dispatch)?;
+    let mut accepted = submit_shadow_dispatch_submission(state, dispatch)?;
+    let event_id = publish_session_action_accepted_event(state, request, &accepted)?;
+    drive_shadow_dispatch_submission(state, &mut accepted)?;
     append_dispatch_assistant_message(state, &accepted);
+    state.persist_session_durable_state()?;
 
-    Ok(SessionActionAccepted {
-        session_id: accepted.session_id,
-        entry_id: accepted.entry_id,
-        accepted_at: accepted.accepted_at,
-        created_session: accepted.created_session,
-        root_task_id: accepted.root_task_id,
-        runner_started: accepted.runner_started,
-    })
+    Ok((
+        SessionActionAccepted {
+            session_id: accepted.session_id,
+            entry_id: accepted.entry_id,
+            accepted_at: accepted.accepted_at,
+            created_session: accepted.created_session,
+            root_task_id: accepted.root_task_id,
+            action_task_id: accepted.action_task_id,
+        },
+        event_id,
+    ))
+}
+
+fn publish_session_action_accepted_event(
+    state: &ApiState,
+    request: &SessionActionRequestDto,
+    accepted: &DispatchSubmissionAccepted,
+) -> Result<EventId, ApiError> {
+    let workspace_id = state
+        .session_store
+        .execution_ownership(&accepted.session_id)
+        .and_then(|ownership| ownership.workspace_id)
+        .or_else(|| request.requested_workspace_id().map(WorkspaceId::new));
+    let event_id = EventId::new(format!("event-session-action-{}", accepted.accepted_at.0));
+    let event = EventEnvelope::domain(
+        event_id.clone(),
+        "session.action.accepted",
+        json!({
+            "session_id": accepted.session_id,
+            "entry_id": accepted.entry_id,
+            "workspace_id": request.requested_workspace_id(),
+            "text": request.trimmed_text(),
+            "skill_name": request.skill_name.clone(),
+            "image_count": request.images.len(),
+            "deep_task": request.deep_task,
+            "created_session": accepted.created_session,
+            "root_task_id": accepted.root_task_id.to_string(),
+            "action_task_id": accepted.action_task_id.to_string(),
+            "runner_started": accepted.runner_started,
+        }),
+    )
+    .with_context(EventContext {
+        session_id: Some(accepted.session_id.clone()),
+        workspace_id,
+        ..EventContext::default()
+    });
+    state
+        .event_bus
+        .publish(event)
+        .map_err(|err| ApiError::event_publish_failed("事件发布失败", err))?;
+    Ok(event_id)
 }
 
 fn resolve_dispatch_session(
     state: &ApiState,
     requested_session_id: Option<SessionId>,
+    requested_workspace_id: Option<WorkspaceId>,
     mission_title: &str,
-    accepted_at: UtcMillis,
-) -> Result<(SessionId, bool), ApiError> {
+    _accepted_at: UtcMillis,
+) -> Result<(SessionId, bool, Option<WorkspaceId>), ApiError> {
     if let Some(session_id) = requested_session_id {
-        return Ok((session_id, false));
+        let session = state
+            .session_store
+            .session(&session_id)
+            .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+        let workspace_id = resolve_session_workspace_binding(
+            state,
+            &session,
+            requested_workspace_id.as_ref(),
+        )?;
+        return Ok((session_id, false, workspace_id));
     }
     if let Some(current_session) = state.session_store.current_session() {
-        return Ok((current_session.session_id, false));
+        let current_workspace_id = resolve_session_workspace_binding(
+            state,
+            &current_session,
+            None,
+        )?;
+        if let (Some(requested_workspace_id), Some(bound_workspace_id)) =
+            (requested_workspace_id.as_ref(), current_workspace_id.as_ref())
+            && requested_workspace_id != bound_workspace_id
+        {
+            let session_id = new_session_id();
+            state
+                .session_store
+                .create_session_for_workspace(
+                    session_id.clone(),
+                    mission_title.to_string(),
+                    Some(requested_workspace_id.to_string()),
+                )
+                .map_err(|err| ApiError::internal_assembly("创建会话失败", err))?;
+            return Ok((session_id, true, Some(requested_workspace_id.clone())));
+        }
+        return Ok((
+            current_session.session_id,
+            false,
+            requested_workspace_id.or(current_workspace_id),
+        ));
     }
 
-    let session_id = SessionId::new(format!("session-{}", accepted_at.0));
+    let session_id = new_session_id();
     state
         .session_store
-        .create_session(session_id.clone(), mission_title.to_string())
+        .create_session_for_workspace(
+            session_id.clone(),
+            mission_title.to_string(),
+            requested_workspace_id.as_ref().map(ToString::to_string),
+        )
         .map_err(|err| ApiError::internal_assembly("创建会话失败", err))?;
-    Ok((session_id, true))
+    Ok((session_id, true, requested_workspace_id))
+}
+
+fn resolve_session_workspace_binding(
+    state: &ApiState,
+    session: &SessionRecord,
+    requested_workspace_id: Option<&WorkspaceId>,
+) -> Result<Option<WorkspaceId>, ApiError> {
+    let bound_workspace_id = session
+        .workspace_id
+        .as_deref()
+        .map(WorkspaceId::new)
+        .or_else(|| {
+            state
+                .session_store
+                .execution_ownership(&session.session_id)
+                .and_then(|ownership| ownership.workspace_id)
+        });
+
+    if let (Some(requested_workspace_id), Some(bound_workspace_id)) =
+        (requested_workspace_id, bound_workspace_id.as_ref())
+        && requested_workspace_id != bound_workspace_id
+    {
+        return Err(ApiError::InvalidInput(format!(
+            "会话 {} 不属于 workspace {}",
+            session.session_id, requested_workspace_id
+        )));
+    }
+
+    Ok(requested_workspace_id.cloned().or(bound_workspace_id))
 }
 
 fn append_dispatch_user_message(
@@ -418,7 +467,7 @@ mod tests {
         McpManagerListServersResponse, SHADOW_MCP_SERVER_NAME, SHADOW_MCP_TOOL_NAME,
         SHADOW_MODEL_PROVIDER,
     };
-    use magi_core::{AbsolutePath, EventId, ExecutionOwnership, SessionId, TaskId, TaskStatus, WorkspaceId};
+    use magi_core::{AbsolutePath, EventId, ExecutionOwnership, MissionId, SessionId, TaskId, TaskStatus, WorkspaceId};
     use magi_context_runtime::{ContextBudget, ContextRuntime};
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
@@ -427,7 +476,13 @@ mod tests {
     use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
     use magi_session_store::SessionStore;
     use serde_json::Value;
-    use std::{collections::HashMap, sync::Mutex};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
+    };
     use magi_skill_runtime::SkillDispatchRuntime;
     use magi_tool_runtime::ToolRegistry;
     use magi_worker_runtime::WorkerRuntime;
@@ -458,10 +513,18 @@ mod tests {
         worker_runtime_factory: impl FnOnce(Arc<InMemoryEventBus>) -> WorkerRuntime,
         model_bridge_client: Arc<dyn ModelBridgeClient>,
     ) -> ApiState {
+        build_shadow_execution_state_with_factory(worker_runtime_factory, |_| model_bridge_client)
+    }
+
+    fn build_shadow_execution_state_with_factory(
+        worker_runtime_factory: impl FnOnce(Arc<InMemoryEventBus>) -> WorkerRuntime,
+        model_bridge_client_factory: impl FnOnce(Arc<SessionStore>) -> Arc<dyn ModelBridgeClient>,
+    ) -> ApiState {
         let event_bus = Arc::new(InMemoryEventBus::new(32));
         let governance = Arc::new(GovernanceService::default());
         let session_store = Arc::new(SessionStore::default());
         let workspace_store = Arc::new(WorkspaceStore::default());
+        let model_bridge_client = model_bridge_client_factory(Arc::clone(&session_store));
 
         let session_id = SessionId::new("session-route-shadow");
         session_store
@@ -523,6 +586,7 @@ mod tests {
         let orchestrator = OrchestratorService::new(Arc::clone(&event_bus));
         let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
         tool_registry.register_default_builtins();
+        let tool_registry_for_dispatcher = tool_registry.clone();
         let skill_runtime = SkillDispatchRuntime::new(
             tool_registry.clone(),
             magi_bridge_client::BridgeDispatchRuntime::new(),
@@ -578,7 +642,8 @@ mod tests {
                 runner_result_receiver.clone(),
             )
             .with_model_bridge_client(model_bridge_client)
-            .with_context_runtime(context_runtime_for_dispatcher),
+            .with_context_runtime(context_runtime_for_dispatcher)
+            .with_tool_registry(tool_registry_for_dispatcher),
         );
         let runner_manager = RunnerManager::with_dispatcher_and_worker_catalog(
             task_store,
@@ -647,6 +712,30 @@ mod tests {
         (status, body)
     }
 
+    fn bind_test_session_mission(
+        state: &ApiState,
+        session_id: &str,
+        mission_id: &str,
+        root_task_id: &str,
+    ) {
+        let session_id = SessionId::new(session_id);
+        if state.session_store.session(&session_id).is_none() {
+            state
+                .session_store
+                .create_session(session_id.clone(), format!("Test Session {session_id}"))
+                .expect("test session should be creatable");
+        }
+        state.session_store.bind_execution_ownership(
+            session_id.clone(),
+            ExecutionOwnership {
+                session_id: Some(session_id),
+                mission_id: Some(MissionId::new(mission_id)),
+                task_id: Some(TaskId::new(root_task_id)),
+                ..ExecutionOwnership::default()
+            },
+        );
+    }
+
     #[tokio::test]
     async fn runtime_read_model_ledger_and_bridge_routes_match_bootstrap_exports() {
         let app = build_router(test_state());
@@ -687,6 +776,7 @@ mod tests {
             "unexpected response body: {first_body:?}"
         );
         assert_eq!(first_body["session_id"], "session-route-shadow");
+        assert!(first_body["action_task_id"].is_string());
         let first_accepted_at = first_body["accepted_at"]
             .as_u64()
             .expect("accepted_at should serialize as integer");
@@ -698,6 +788,11 @@ mod tests {
             first_body["root_task_id"]
                 .as_str()
                 .expect("root_task_id should serialize as string"),
+        );
+        let first_action_task_id = TaskId::new(
+            first_body["action_task_id"]
+                .as_str()
+                .expect("action_task_id should serialize as string"),
         );
         let first_mission_entry = first_read_model
             .details
@@ -713,6 +808,10 @@ mod tests {
             .get_task(&first_root_task_id)
             .expect("root task should exist");
         assert_eq!(first_root_task.status, TaskStatus::Completed);
+        let first_action_task = task_store
+            .get_task(&first_action_task_id)
+            .expect("action task should exist");
+        assert_eq!(first_action_task.status, TaskStatus::Completed);
         let first_children = task_store.get_children(&first_root_task_id);
         assert_eq!(first_children.len(), 1);
         assert_eq!(first_children[0].status, TaskStatus::Completed);
@@ -750,6 +849,7 @@ mod tests {
             StatusCode::OK,
             "unexpected response body: {second_body:?}"
         );
+        assert!(second_body["action_task_id"].is_string());
         let second_accepted_at = second_body["accepted_at"]
             .as_u64()
             .expect("accepted_at should serialize as integer");
@@ -805,6 +905,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_action_route_uses_requested_workspace_for_explicit_session() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let app = build_router(state.clone());
+
+        let workspace_id = WorkspaceId::new("workspace-route-alt");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-route-alt"),
+            )
+            .expect("workspace should register");
+
+        let session_id = SessionId::new("session-route-alt");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "alt route session",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+
+        let (status, body) = post_json(
+            app,
+            "/session/action",
+            json!({
+                "session_id": session_id.to_string(),
+                "workspace_id": workspace_id.to_string(),
+                "text": "Use alternate workspace",
+                "deep_task": false,
+                "skill_name": null,
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected response body: {body:?}");
+        let ownership = state
+            .session_store
+            .execution_ownership(&session_id)
+            .expect("session ownership should exist");
+        assert_eq!(ownership.workspace_id, Some(workspace_id.clone()));
+        let session = state
+            .session_store
+            .session(&session_id)
+            .expect("session should still exist");
+        assert_eq!(session.workspace_id.as_deref(), Some(workspace_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn session_action_route_rejects_cross_workspace_session_submission() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let app = build_router(state.clone());
+
+        let alt_workspace_id = WorkspaceId::new("workspace-route-other");
+        state
+            .workspace_registry
+            .register(
+                alt_workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-route-other"),
+            )
+            .expect("workspace should register");
+
+        let (status, body) = post_json(
+            app,
+            "/session/action",
+            json!({
+                "session_id": "session-route-shadow",
+                "workspace_id": alt_workspace_id.to_string(),
+                "text": "cross workspace should fail",
+                "deep_task": false,
+                "skill_name": null,
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error_code"], "INPUT_INVALID");
+        assert_eq!(
+            body["message"],
+            "会话 session-route-shadow 不属于 workspace workspace-route-other"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_action_route_rejects_missing_requested_session() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let app = build_router(state);
+
+        let (status, body) = post_json(
+            app,
+            "/session/action",
+            json!({
+                "session_id": "session-route-missing",
+                "workspace_id": "workspace-route-shadow",
+                "text": "missing session should fail",
+                "deep_task": false,
+                "skill_name": null,
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error_code"], "SESSION_NOT_FOUND");
+        assert_eq!(body["message"], "会话不存在: session-route-missing");
+    }
+
+    #[tokio::test]
+    async fn session_action_tool_and_llm_events_remain_bound_to_owning_session_after_switch() {
+        let switched_session_id = SessionId::new("session-route-shadow-other");
+        let state = build_shadow_execution_state_with_factory(
+            WorkerRuntime::new_compare,
+            |session_store| {
+                Arc::new(SessionSwitchingToolModelBridgeClient {
+                    session_store,
+                    switch_to: switched_session_id.clone(),
+                    invoke_count: AtomicUsize::new(0),
+                })
+            },
+        );
+        state
+            .session_store
+            .create_session(switched_session_id.clone(), "Other Session")
+            .expect("other session should be creatable");
+        let app = build_router(state.clone());
+
+        let (status, body) = post_json(
+            app,
+            "/session/action",
+            json!({
+                "session_id": "session-route-shadow",
+                "text": "读取一个配置文件并总结",
+                "deep_task": true,
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected response body: {body:?}");
+
+        let events = state.event_bus.snapshot().recent_events;
+        let owning_session = Some(SessionId::new("session-route-shadow"));
+        let switched_session = Some(switched_session_id);
+
+        let dispatched_event = events
+            .iter()
+            .find(|event| event.event_type == "task.dispatched")
+            .expect("task.dispatched event should exist");
+        assert_eq!(dispatched_event.session_id, owning_session);
+
+        let llm_started_event = events
+            .iter()
+            .find(|event| event.event_type == "task.llm.started")
+            .expect("task.llm.started event should exist");
+        assert_eq!(llm_started_event.session_id, owning_session);
+
+        let tool_invoked_event = events
+            .iter()
+            .find(|event| event.event_type == "task.tool.invoked")
+            .expect("task.tool.invoked event should exist");
+        assert_eq!(tool_invoked_event.session_id, owning_session);
+
+        let tool_audit_event = events
+            .iter()
+            .find(|event| event.event_type == "tool.invoked")
+            .expect("tool.invoked event should exist");
+        assert_eq!(tool_audit_event.session_id, owning_session);
+        assert_ne!(tool_audit_event.session_id, switched_session);
+
+        let llm_completed_event = events
+            .iter()
+            .find(|event| event.event_type == "task.llm.completed")
+            .expect("task.llm.completed event should exist");
+        assert_eq!(llm_completed_event.session_id, owning_session);
+    }
+
+    #[tokio::test]
     async fn session_action_route_does_not_write_extraction_or_bind_mission_when_dispatch_fails() {
         let state = test_state_with_unhealthy_shadow_execution_pipeline();
         let app = build_router(state.clone());
@@ -825,6 +1105,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "dispatch failure should still accept the task: {body:?}");
         assert!(body["session_id"].is_string());
         assert!(body["root_task_id"].is_string());
+        assert!(body["action_task_id"].is_string());
 
         let extraction_history = state
             .shadow_execution_pipeline()
@@ -837,15 +1118,19 @@ mod tests {
             .session_store
             .execution_ownership(&SessionId::new("session-route-shadow"))
             .expect("base session ownership should remain present");
-        assert!(ownership.mission_id.is_none());
-        assert!(ownership.task_id.is_none());
-        assert!(ownership.worker_id.is_none());
+        assert!(ownership.mission_id.is_some());
+        assert!(ownership.task_id.is_some());
+        assert!(ownership.worker_id.is_some());
     }
 
     #[tokio::test]
     async fn session_action_route_skips_extraction_for_blank_text_inputs() {
         let state = test_state_with_shadow_execution_pipeline();
         let app = build_router(state.clone());
+        state
+            .session_store
+            .create_session(SessionId::new("session-route-blank"), "blank route session")
+            .expect("blank route session should be creatable");
 
         let (status, body) = post_json(
             app,
@@ -861,6 +1146,7 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK, "unexpected response body: {body:?}");
+        assert!(body["action_task_id"].is_string());
 
         let extraction_history = state
             .shadow_execution_pipeline()
@@ -885,7 +1171,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_resume_route_executes_writeback_and_marks_session_resumed() {
+    async fn session_continue_route_executes_recovery_writeback_and_keeps_same_chain() {
         let state = test_state_with_shadow_execution_pipeline();
         let app = build_router(state.clone());
 
@@ -904,6 +1190,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "unexpected response body: {seed_body:?}");
 
         let session_id = SessionId::new("session-route-shadow");
+        let chain = state
+            .session_store
+            .active_execution_chain(&session_id)
+            .expect("active execution chain should exist after seed dispatch");
         let ownership = state
             .session_store
             .execution_ownership(&session_id)
@@ -912,11 +1202,6 @@ mod tests {
             .workspace_id
             .clone()
             .expect("seed dispatch should bind workspace");
-        let expected_worker_id = ownership
-            .worker_id
-            .as_ref()
-            .map(ToString::to_string)
-            .expect("seed dispatch should bind worker");
         let task_store = state.task_store().expect("task store should be configured");
         let recovery_task_id = ownership
             .task_id
@@ -949,24 +1234,22 @@ mod tests {
 
         let (status, body) = post_json(
             app,
-            "/recovery/resume",
+            "/api/session/continue",
             json!({
-                "recovery_id": recovery.recovery_id,
+                "sessionId": session_id.to_string(),
             }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "unexpected response body: {body:?}");
-        assert_eq!(body["recovery_id"], "recovery-route-1");
-        assert_eq!(body["snapshot_id"], "snapshot-route-recovery");
-        assert_eq!(body["session_id"], "session-route-shadow");
-        assert_eq!(body["workspace_id"], "workspace-route-shadow");
-        assert_eq!(body["memory_writeback_applied"], true);
-        assert_eq!(body["worker_id"], expected_worker_id);
+        assert_eq!(body["sessionId"], session_id.to_string());
+        assert_eq!(body["missionId"], chain.mission_id.to_string());
+        assert_eq!(body["rootTaskId"], chain.root_task_id.to_string());
+        assert_eq!(body["executionChainRef"], chain.execution_chain_ref);
         assert!(
-            body["event_id"]
-                .as_str()
-                .expect("event_id should serialize as string")
-                .contains("event-recovery-resume-recovery-route-1-")
+            body["resumedBranchCount"]
+                .as_u64()
+                .expect("resumed_branch_count should be integer")
+                >= 1
         );
 
         let verification = state
@@ -988,21 +1271,34 @@ mod tests {
         );
         assert_eq!(linkage.produced_records[0].content, "resume route followup");
 
-        let sidecar = state
+        let updated_chain = state
             .session_store
-            .execution_sidecar_export(&session_id)
-            .expect("session sidecar should exist");
-        assert_eq!(
-            sidecar.current_status,
-            magi_session_store::SessionExecutionSidecarStatus::Resumed
+            .active_execution_chain(&session_id)
+            .expect("active chain should still exist after continue");
+        assert_eq!(updated_chain.mission_id, chain.mission_id);
+        assert_eq!(updated_chain.root_task_id, chain.root_task_id);
+        assert_eq!(updated_chain.execution_chain_ref, chain.execution_chain_ref);
+        assert!(updated_chain.recovery_ref.is_none());
+        assert!(
+            task_store
+                .get_tasks_by_mission(&MissionId::new("mission-recovery-recovery-route-1"))
+                .is_empty(),
+            "continue 不应再生成 recovery mission"
         );
-        assert_eq!(sidecar.recovery_ref.as_deref(), Some("recovery-route-1"));
     }
 
     #[tokio::test]
-    async fn recovery_resume_route_uses_requested_worker_id_consistently() {
+    async fn session_continue_route_ignores_worker_preferences_for_chain_identity() {
         let state = test_state_with_shadow_execution_pipeline();
         let app = build_router(state.clone());
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-route-shadow-override"),
+                "shadow override session",
+                Some("workspace-route-shadow".to_string()),
+            )
+            .expect("shadow override session should be creatable");
 
         let (status, seed_body) = post_json(
             app.clone(),
@@ -1019,14 +1315,19 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "unexpected response body: {seed_body:?}");
 
         let session_id = SessionId::new("session-route-shadow-override");
+        let chain = state
+            .session_store
+            .active_execution_chain(&session_id)
+            .expect("active execution chain should exist after seed dispatch");
+        let original_workers = chain
+            .branches
+            .iter()
+            .map(|branch| branch.worker_id.to_string())
+            .collect::<Vec<_>>();
         let ownership = state
             .session_store
             .execution_ownership(&session_id)
             .expect("session ownership should exist after seed dispatch");
-        let workspace_id = ownership
-            .workspace_id
-            .clone()
-            .expect("seed dispatch should bind workspace");
         let task_store = state.task_store().expect("task store should be configured");
         let recovery_task_id = ownership
             .task_id
@@ -1035,64 +1336,82 @@ mod tests {
         task_store
             .update_status(&recovery_task_id, TaskStatus::Blocked)
             .expect("seed task should become recoverable");
-        let snapshot = state.workspace_registry.append_execution_snapshot(
-            workspace_id.clone(),
-            ownership.clone(),
-            "snapshot-route-recovery-override",
-            "Route recovery snapshot with worker override",
-        );
-        let recovery = state.workspace_registry.prepare_recovery_entry(
-            workspace_id,
-            ownership,
-            snapshot.snapshot_id,
-            "recovery-route-override",
-            Some("resume route followup".to_string()),
-        );
-        state
-            .workspace_registry
-            .mark_recovery_ready(&recovery.recovery_id)
-            .expect("recovery should become ready");
-        state
-            .session_store
-            .attach_recovery_ref(&session_id, Some(recovery.recovery_id.clone()))
-            .expect("recovery ref should attach to session");
 
         let (status, body) = post_json(
             app,
-            "/recovery/resume",
+            "/api/session/continue",
             json!({
-                "recovery_id": recovery.recovery_id,
-                "worker_id": "worker-route-override",
+                "sessionId": session_id.to_string(),
+                "requestedWorkerIds": ["worker-route-override"],
             }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "unexpected response body: {body:?}");
-        assert_eq!(body["worker_id"], "worker-route-override");
+        assert_eq!(body["executionChainRef"], chain.execution_chain_ref);
 
-        let sidecar = state
+        let updated_chain = state
             .session_store
-            .execution_sidecar_export(&session_id)
-            .expect("session sidecar should exist");
-        assert_eq!(
-            sidecar
-                .ownership
-                .worker_id
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref(),
-            Some("worker-route-override")
-        );
+            .active_execution_chain(&session_id)
+            .expect("active execution chain should remain available");
+        let updated_workers = updated_chain
+            .branches
+            .iter()
+            .map(|branch| branch.worker_id.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(updated_workers, original_workers);
     }
 
     #[tokio::test]
-    async fn recovery_resume_route_returns_not_found_for_unknown_recovery() {
-        let app = build_router(test_state_with_shadow_execution_pipeline());
+    async fn session_continue_route_returns_not_found_for_unknown_recovery() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let app = build_router(state.clone());
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-route-missing-recovery"),
+                "missing recovery session",
+                Some("workspace-route-shadow".to_string()),
+            )
+            .expect("missing recovery session should be creatable");
+
+        let (status, seed_body) = post_json(
+            app.clone(),
+            "/session/action",
+            json!({
+                "session_id": "session-route-missing-recovery",
+                "text": "seed missing recovery state",
+                "deep_task": true,
+                "skill_name": "refactor",
+                "images": [],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "unexpected response body: {seed_body:?}");
+
+        let session_id = SessionId::new("session-route-missing-recovery");
+        let ownership = state
+            .session_store
+            .execution_ownership(&session_id)
+            .expect("session ownership should exist after seed dispatch");
+        let recovery_task_id = ownership
+            .task_id
+            .clone()
+            .expect("seed dispatch should bind task");
+        state
+            .task_store()
+            .expect("task store should be configured")
+            .update_status(&recovery_task_id, TaskStatus::Blocked)
+            .expect("seed task should become recoverable");
+        state
+            .session_store
+            .attach_recovery_ref(&session_id, Some("missing-recovery".to_string()))
+            .expect("recovery ref should attach to session");
 
         let (status, body) = post_json(
             app,
-            "/recovery/resume",
+            "/api/session/continue",
             json!({
-                "recovery_id": "missing-recovery",
+                "sessionId": session_id.to_string(),
             }),
         )
         .await;
@@ -1103,41 +1422,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_resume_route_rejects_prepared_recovery_with_input_error() {
+    async fn session_continue_route_rejects_prepared_recovery_with_input_error() {
         let state = test_state_with_shadow_execution_pipeline();
         let app = build_router(state.clone());
-
-        let session_id = SessionId::new("session-route-prepared");
-        let workspace_id = WorkspaceId::new("workspace-route-prepared");
         state
             .session_store
-            .create_session(session_id.clone(), "prepared recovery session")
-            .expect("session should be creatable");
-        state
-            .workspace_registry
-            .register(
-                workspace_id.clone(),
-                AbsolutePath::new("/Users/xie/code/magi-rust-rewrite"),
+            .create_session_for_workspace(
+                SessionId::new("session-route-prepared"),
+                "prepared recovery session",
+                Some("workspace-route-shadow".to_string()),
             )
-            .expect("workspace should register");
+            .expect("prepared recovery session should be creatable");
+
+        let (status, seed_body) = post_json(
+            app.clone(),
+            "/session/action",
+            json!({
+                "session_id": "session-route-prepared",
+                "text": "seed prepared recovery state",
+                "deep_task": true,
+                "skill_name": "resume",
+                "images": [],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "unexpected response body: {seed_body:?}");
+
+        let session_id = SessionId::new("session-route-prepared");
+        let ownership = state
+            .session_store
+            .execution_ownership(&session_id)
+            .expect("session ownership should exist after seed dispatch");
+        let workspace_id = ownership
+            .workspace_id
+            .clone()
+            .expect("seed dispatch should bind workspace");
+        let recovery_task_id = ownership
+            .task_id
+            .clone()
+            .expect("seed dispatch should bind task");
+        state
+            .task_store()
+            .expect("task store should be configured")
+            .update_status(&recovery_task_id, TaskStatus::Blocked)
+            .expect("seed task should become recoverable");
         let recovery = state.workspace_registry.prepare_recovery_entry(
             workspace_id.clone(),
-            ExecutionOwnership {
-                session_id: Some(session_id),
-                workspace_id: Some(workspace_id),
-                worker_id: Some(magi_core::WorkerId::new("worker-route-prepared")),
-                ..ExecutionOwnership::default()
-            },
+            ownership,
             "snapshot-route-prepared",
             "recovery-route-prepared",
             Some("prepared recovery".to_string()),
         );
+        state
+            .session_store
+            .attach_recovery_ref(&session_id, Some(recovery.recovery_id.clone()))
+            .expect("recovery ref should attach to session");
 
         let (status, body) = post_json(
             app,
-            "/recovery/resume",
+            "/api/session/continue",
             json!({
-                "recovery_id": recovery.recovery_id,
+                "sessionId": session_id.to_string(),
             }),
         )
         .await;
@@ -1146,36 +1491,58 @@ mod tests {
         assert_eq!(body["error_code"], "INPUT_INVALID");
         assert_eq!(
             body["message"],
-            "恢复入口 recovery-route-prepared 当前状态为 prepared，必须先进入 ready 才能恢复"
+            "恢复入口 recovery-route-prepared 当前状态为 prepared，必须先进入 ready 才能继续会话"
         );
     }
 
     #[tokio::test]
-    async fn recovery_resume_route_rejects_consumed_recovery_with_input_error() {
+    async fn session_continue_route_rejects_consumed_recovery_with_input_error() {
         let state = test_state_with_shadow_execution_pipeline();
         let app = build_router(state.clone());
-
-        let session_id = SessionId::new("session-route-consumed");
-        let workspace_id = WorkspaceId::new("workspace-route-consumed");
         state
             .session_store
-            .create_session(session_id.clone(), "consumed recovery session")
-            .expect("session should be creatable");
-        state
-            .workspace_registry
-            .register(
-                workspace_id.clone(),
-                AbsolutePath::new("/Users/xie/code/magi-rust-rewrite"),
+            .create_session_for_workspace(
+                SessionId::new("session-route-consumed"),
+                "consumed recovery session",
+                Some("workspace-route-shadow".to_string()),
             )
-            .expect("workspace should register");
+            .expect("consumed recovery session should be creatable");
+
+        let (status, seed_body) = post_json(
+            app.clone(),
+            "/session/action",
+            json!({
+                "session_id": "session-route-consumed",
+                "text": "seed consumed recovery state",
+                "deep_task": true,
+                "skill_name": "resume",
+                "images": [],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "unexpected response body: {seed_body:?}");
+
+        let session_id = SessionId::new("session-route-consumed");
+        let ownership = state
+            .session_store
+            .execution_ownership(&session_id)
+            .expect("session ownership should exist after seed dispatch");
+        let workspace_id = ownership
+            .workspace_id
+            .clone()
+            .expect("seed dispatch should bind workspace");
+        let recovery_task_id = ownership
+            .task_id
+            .clone()
+            .expect("seed dispatch should bind task");
+        state
+            .task_store()
+            .expect("task store should be configured")
+            .update_status(&recovery_task_id, TaskStatus::Blocked)
+            .expect("seed task should become recoverable");
         let recovery = state.workspace_registry.prepare_recovery_entry(
             workspace_id.clone(),
-            ExecutionOwnership {
-                session_id: Some(session_id),
-                workspace_id: Some(workspace_id),
-                worker_id: Some(magi_core::WorkerId::new("worker-route-consumed")),
-                ..ExecutionOwnership::default()
-            },
+            ownership,
             "snapshot-route-consumed",
             "recovery-route-consumed",
             Some("consumed recovery".to_string()),
@@ -1188,12 +1555,16 @@ mod tests {
             .workspace_registry
             .consume_recovery(&recovery.recovery_id)
             .expect("recovery should become consumed");
+        state
+            .session_store
+            .attach_recovery_ref(&session_id, Some(recovery.recovery_id.clone()))
+            .expect("recovery ref should attach to session");
 
         let (status, body) = post_json(
             app,
-            "/recovery/resume",
+            "/api/session/continue",
             json!({
-                "recovery_id": recovery.recovery_id,
+                "sessionId": session_id.to_string(),
             }),
         )
         .await;
@@ -1202,7 +1573,7 @@ mod tests {
         assert_eq!(body["error_code"], "INPUT_INVALID");
         assert_eq!(
             body["message"],
-            "恢复入口 recovery-route-consumed 已被消费，不能重复恢复"
+            "恢复入口 recovery-route-consumed 已被消费，不能再次继续会话"
         );
     }
 
@@ -1239,6 +1610,12 @@ mod tests {
 
     struct FailingModelBridgeClient;
 
+    struct SessionSwitchingToolModelBridgeClient {
+        session_store: Arc<SessionStore>,
+        switch_to: SessionId,
+        invoke_count: AtomicUsize,
+    }
+
     impl ModelBridgeClient for FailingModelBridgeClient {
         fn invoke(
             &self,
@@ -1248,6 +1625,49 @@ mod tests {
                 layer: magi_bridge_client::BridgeErrorLayer::RemoteBusiness,
                 code: Some(-32099),
                 message: "model bridge unavailable".to_string(),
+            })
+        }
+    }
+
+    impl ModelBridgeClient for SessionSwitchingToolModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            let round = self.invoke_count.fetch_add(1, Ordering::SeqCst);
+            if round == 0 {
+                self.session_store
+                    .switch_session(&self.switch_to)
+                    .expect("test helper should switch current session");
+                return Ok(BridgeResponse {
+                    ok: true,
+                    payload: serde_json::json!({
+                        "content": "先读取当前仓库配置。",
+                        "finish_reason": "tool_calls",
+                        "tool_calls": [{
+                            "id": "call_session_bound_read",
+                            "type": "function",
+                            "function": {
+                                "name": "file_read",
+                                "arguments": serde_json::json!({
+                                    "path": "/Users/xie/code/magi-rust-rewrite/Cargo.toml"
+                                })
+                                .to_string(),
+                            }
+                        }]
+                    })
+                    .to_string(),
+                });
+            }
+
+            Ok(BridgeResponse {
+                ok: true,
+                payload: serde_json::json!({
+                    "content": "读取完成。",
+                    "finish_reason": "stop",
+                    "tool_calls": []
+                })
+                .to_string(),
             })
         }
     }
@@ -2441,6 +2861,68 @@ mod tests {
         assert!(snapshot["services"][0]["service_catalog"].is_object());
     }
 
+    #[tokio::test]
+    async fn task_interrupt_route_requires_structured_task_id_and_cancels_target_task() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let app = build_router(state.clone());
+
+        let (submit_status, submit_body) = post_json(
+            app.clone(),
+            "/session/action",
+            json!({
+                "session_id": "session-route-shadow",
+                "text": "interrupt target task",
+                "deep_task": false,
+                "images": [],
+            }),
+        )
+        .await;
+        assert_eq!(
+            submit_status,
+            StatusCode::OK,
+            "unexpected response body: {submit_body:?}"
+        );
+
+        let action_task_id = submit_body["action_task_id"]
+            .as_str()
+            .expect("action_task_id should serialize as string");
+        let task_store = state.task_store().expect("task store should be configured");
+        task_store
+            .update_status(&TaskId::new(action_task_id), TaskStatus::Running)
+            .expect("action task should become running for interrupt test");
+        let action_task = task_store
+            .get_task(&TaskId::new(action_task_id))
+            .expect("action task should remain queryable");
+        task_store
+            .update_status(&action_task.root_task_id, TaskStatus::Running)
+            .expect("root task should become running for interrupt test");
+        let (interrupt_status, interrupt_body) = post_json(
+            app,
+            "/api/task/interrupt",
+            json!({
+                "sessionId": "session-route-shadow",
+                "taskId": action_task_id,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            interrupt_status,
+            StatusCode::OK,
+            "unexpected response body: {interrupt_body:?}"
+        );
+        assert_eq!(interrupt_body["interrupted"], true);
+
+        let interrupted_task = task_store
+            .get_task(&TaskId::new(action_task_id))
+            .expect("interrupted task should remain queryable");
+        assert_eq!(interrupted_task.status, TaskStatus::Blocked);
+        let root_task = task_store
+            .get_task(&interrupted_task.root_task_id)
+            .expect("root task should remain queryable");
+        assert_eq!(root_task.status, TaskStatus::Blocked);
+    }
+
     // ─── /api/tasks/* task graph routes integration tests ───
 
     fn test_state_with_task_store() -> ApiState {
@@ -2452,7 +2934,8 @@ mod tests {
 
     #[tokio::test]
     async fn task_graph_create_and_get_task() {
-        let app = build_router(test_state_with_task_store());
+        let state = test_state_with_task_store();
+        let app = build_router(state.clone());
 
         let (status, body) = post_json(
             app.clone(),
@@ -2474,7 +2957,9 @@ mod tests {
         assert_eq!(body["kind"], "Objective");
         assert_eq!(body["status"], "Draft");
 
-        let retrieved = get_json(app, "/api/tasks/task-1").await;
+        bind_test_session_mission(&state, "session-task-graph", "mission-1", "task-1");
+
+        let retrieved = get_json(app, "/api/tasks/task-1?sessionId=session-task-graph").await;
         assert_eq!(retrieved["task_id"], "task-1");
         assert_eq!(retrieved["title"], "Root objective");
         assert_eq!(retrieved["mission_id"], "mission-1");
@@ -2482,7 +2967,8 @@ mod tests {
 
     #[tokio::test]
     async fn task_graph_create_graph_and_get_projection() {
-        let app = build_router(test_state_with_task_store());
+        let state = test_state_with_task_store();
+        let app = build_router(state.clone());
 
         // Create a small task tree: Objective -> Phase -> 2 Actions
         for (task_id, parent, kind, status) in [
@@ -2507,7 +2993,9 @@ mod tests {
             assert_eq!(status_code, StatusCode::OK);
         }
 
-        let projection = get_json(app, "/api/tasks/graph/obj-1").await;
+        bind_test_session_mission(&state, "session-task-graph", "mission-proj", "obj-1");
+
+        let projection = get_json(app, "/api/tasks/graph/obj-1?sessionId=session-task-graph").await;
         assert_eq!(projection["root_task"]["task_id"], "obj-1");
         assert_eq!(projection["current_phase"], "Task phase-1");
         assert_eq!(projection["progress_summary"]["total_tasks"], 4);
@@ -2518,7 +3006,8 @@ mod tests {
 
     #[tokio::test]
     async fn task_graph_update_status() {
-        let app = build_router(test_state_with_task_store());
+        let state = test_state_with_task_store();
+        let app = build_router(state.clone());
 
         let (status, _body) = post_json(
             app.clone(),
@@ -2534,6 +3023,13 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+
+        bind_test_session_mission(
+            &state,
+            "session-task-status",
+            "mission-status",
+            "task-status-1",
+        );
 
         // Update Draft -> Ready
         let (status, body) = post_json(
@@ -2566,19 +3062,30 @@ mod tests {
         assert_eq!(body["status"], "Completed");
 
         // Verify via GET
-        let task = get_json(app, "/api/tasks/task-status-1").await;
+        let task = get_json(
+            app,
+            "/api/tasks/task-status-1?sessionId=session-task-status",
+        )
+        .await;
         assert_eq!(task["status"], "Completed");
     }
 
     #[tokio::test]
     async fn task_graph_returns_not_found_for_missing_task() {
-        let app = build_router(test_state_with_task_store());
+        let state = test_state_with_task_store();
+        let app = build_router(state.clone());
+        bind_test_session_mission(
+            &state,
+            "session-task-missing",
+            "mission-missing",
+            "nonexistent-task",
+        );
 
         let response = app
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/api/tasks/nonexistent-task")
+                    .uri("/api/tasks/nonexistent-task?sessionId=session-task-missing")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -2598,9 +3105,21 @@ mod tests {
                     .uri("/api/tasks/some-task")
                     .body(Body::empty())
                     .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
+        )
+        .await
+        .expect("router should respond");
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn generated_session_ids_are_unique() {
+        let mut seen = HashSet::new();
+        for _ in 0..64 {
+            let session_id = new_session_id();
+            assert!(
+                seen.insert(session_id.to_string()),
+                "session id should remain unique"
+            );
+        }
     }
 }

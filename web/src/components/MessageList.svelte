@@ -10,19 +10,13 @@
   import { tick, onDestroy } from 'svelte';
   import {
     clearMessageJump,
-    getState,
     messagesState,
     prependTimelineProjectionPage,
     setSessionHistoryState,
     updatePanelScrollState,
   } from '../stores/messages.svelte';
+  import { getTaskGraphState } from '../stores/task-graph-store.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import {
-    getMessageRequestId,
-    isWorkerExecutingStatus,
-    selectWorkerRuntime,
-  } from '../lib/worker-panel-state';
-  import { formatElapsed } from '../lib/utils';
   import { loadAgentSessionTimelinePage } from '../web/agent-api';
   import { readStoredBrowserWorkspaceBinding } from '../shared/bridges/browser-workspace-binding';
   import {
@@ -48,14 +42,75 @@
     isActive?: boolean;
   }
   let { workerName, renderItems, emptyState, readOnly = false, displayContext = 'thread', isActive = true }: Props = $props();
-  const appState = getState();
 
   const safeRenderItems = $derived(
     (renderItems || [])
       .filter((item): item is TimelineRenderItem => Boolean(item && item.message && item.message.id))
   );
 
-  const safeRenderMessages = $derived.by(() => safeRenderItems.map((item) => item.message));
+  const currentSessionId = $derived.by(() => (
+    typeof messagesState.currentSessionId === 'string' ? messagesState.currentSessionId.trim() : ''
+  ));
+
+  const hasAuthoritativeProcessing = $derived.by(() => (
+    messagesState.appState?.processingState?.isProcessing === true
+  ));
+
+  const hasActiveSessionTask = $derived.by(() => {
+    const sessionId = currentSessionId;
+    if (!sessionId) {
+      return false;
+    }
+    const taskGraphState = getTaskGraphState(sessionId);
+    if (taskGraphState.loading && taskGraphState.rootTaskId) {
+      return true;
+    }
+    return (taskGraphState.projection?.running_tasks?.length ?? 0) > 0;
+  });
+
+  const syntheticStreamingRenderItem = $derived.by((): TimelineRenderItem | null => {
+    if (displayContext !== 'thread') {
+      return null;
+    }
+    if (safeRenderItems.some((item) => item.message.isStreaming)) {
+      return null;
+    }
+    if (!(hasAuthoritativeProcessing || hasActiveSessionTask)) {
+      return null;
+    }
+    const startedAt = messagesState.appState?.processingState?.startedAt;
+    const timestamp = typeof startedAt === 'number' && Number.isFinite(startedAt) && startedAt > 0
+      ? Math.floor(startedAt)
+      : Date.now();
+    const sessionId = currentSessionId || 'session';
+    return {
+      key: `synthetic-processing-placeholder-${sessionId}`,
+      message: {
+        id: `synthetic-processing-placeholder-${sessionId}`,
+        role: 'assistant',
+        source: 'orchestrator',
+        content: '',
+        blocks: [],
+        timestamp,
+        isStreaming: true,
+        isComplete: false,
+        type: 'thinking',
+        metadata: {
+          isPlaceholder: true,
+          placeholderState: 'thinking',
+          syntheticProcessingPlaceholder: true,
+        },
+      },
+    };
+  });
+
+  const effectiveRenderItems = $derived.by(() => (
+    syntheticStreamingRenderItem
+      ? [...safeRenderItems, syntheticStreamingRenderItem]
+      : safeRenderItems
+  ));
+
+  const safeRenderMessages = $derived.by(() => effectiveRenderItems.map((item) => item.message));
 
   function resolveStreamingMessageVersion(message: Message): string {
     const metadata = (message.metadata && typeof message.metadata === 'object')
@@ -82,119 +137,30 @@
     return streamingMsgs.map(m => `${m.id}:${resolveStreamingMessageVersion(m)}`).join('|');
   });
 
-  // 对话级处理指示器
-  // - thread: 全局 isProcessing 驱动，表示「对话仍在进行」
-  // - worker: 当前请求级别（同一次请求内跨多轮不重置）
-  // 仅当「当前无流式消息卡片」时显示，避免与卡片内流式动画重复导致视觉留白
-  const lastMessage = $derived.by(() => safeRenderMessages.length > 0 ? safeRenderMessages[safeRenderMessages.length - 1] : null);
-  const hasBottomStreamingMessage = $derived(Boolean(lastMessage?.isStreaming));
-  const pendingRequestIds = $derived.by(() => Array.from(messagesState.pendingRequests));
-  const pendingRequestIdSet = $derived.by(() => new Set(pendingRequestIds));
-  const workerRuntimeMap = $derived(appState.workerRuntime);
-  const workerRuntimeState = $derived.by(() => selectWorkerRuntime(workerRuntimeMap, workerName));
-  const workerRuntimeStatus = $derived.by(() => workerRuntimeState?.status || 'idle');
-  const workerHasPendingRequest = $derived.by(() => Boolean(workerRuntimeState?.hasPendingRequest));
-  const workerHasStreaming = $derived.by(() => Boolean(workerRuntimeState?.hasStreaming));
-  const workerHasBottomStreamingMessage = $derived.by(() => Boolean(workerRuntimeState?.hasBottomStreamingMessage));
-  const workerTimerStartAt = $derived.by(() => workerRuntimeState?.timerStartAt || 0);
-  const messageById = $derived.by(() => {
-    const map = new Map<string, Message>();
-    for (const message of safeRenderMessages) {
-      map.set(message.id, message);
-    }
-    return map;
-  });
-
-  const latestRoundAnchorMessage = $derived.by(() => {
-    if (displayContext === 'worker') {
-      const anchorMessageId = workerRuntimeState?.latestRoundAnchorMessageId;
-      return anchorMessageId ? (messageById.get(anchorMessageId) || null) : null;
-    }
+  const currentStreamingMessage = $derived.by(() => {
     for (let i = safeRenderMessages.length - 1; i >= 0; i -= 1) {
       const message = safeRenderMessages[i];
-      if (message.type === 'user_input') {
+      if (message.isStreaming) {
         return message;
       }
     }
     return null;
   });
 
-  const latestRoundRequestId = $derived.by(() => getMessageRequestId(latestRoundAnchorMessage || undefined));
-  const panelHasPendingRequest = $derived.by(() => {
-    if (displayContext === 'worker') {
-      return workerHasPendingRequest;
-    }
-    if (!latestRoundRequestId) return false;
-    return pendingRequestIdSet.has(latestRoundRequestId);
-  });
-
-  // Worker 面板是否在处理中：
-  // 仅当当前面板对应的 Worker 正在被激活处理、或本面板仍有当前请求挂起时，才显示处理指示器并计时。
-  // 关键修复：禁止仅凭“最后一条是 instruction”就判定活跃，避免旧轮次导致多面板同步计时。
-  const isExecuting = $derived.by(() => {
-    if (displayContext !== 'worker') return false;
-    return isWorkerExecutingStatus(workerRuntimeStatus);
-  });
   const streamingIndicatorMessageId = $derived.by(() => {
-    if (displayContext === 'worker') {
-      return workerRuntimeState?.bottomStreamingMessageId || null;
-    }
-    if (!hasBottomStreamingMessage || !lastMessage) return null;
-    return lastMessage.id;
+    return currentStreamingMessage?.id || null;
   });
 
-  // 防抖：底部消息的流式状态变 false 后延迟 300ms 再显示底部兜底指示器，
-  // 避免工具调用间隙短暂状态切换导致视觉闪烁。
-  let debouncedNoBottomStreaming = $state(true);
-  let noStreamingTimer: ReturnType<typeof setTimeout> | null = null;
-  $effect(() => {
-    const noStreaming = displayContext === 'worker'
-      ? !workerHasBottomStreamingMessage
-      : !hasBottomStreamingMessage;
-    if (noStreaming) {
-      noStreamingTimer = setTimeout(() => { debouncedNoBottomStreaming = true; }, 300);
-    } else {
-      if (noStreamingTimer) { clearTimeout(noStreamingTimer); noStreamingTimer = null; }
-      debouncedNoBottomStreaming = false;
-    }
-    return () => { if (noStreamingTimer) { clearTimeout(noStreamingTimer); noStreamingTimer = null; } };
-  });
-
-  const showProcessingIndicator = $derived(
-    displayContext === 'worker'
-      ? isExecuting && debouncedNoBottomStreaming
-      : messagesState.isProcessing && safeRenderMessages.length > 0 && debouncedNoBottomStreaming
-  );
-
-  // 计时起点：
-  // - thread: 从最后一条用户消息的时间戳开始
-  // - worker: 从统一 Worker 运行态中的 lifecycle 起点开始
-  //   由统一状态机维护，避免底部计时器和任务卡计时口径不一致
   const timerStartTime = $derived.by(() => {
-    if (displayContext === 'worker') {
-      return workerTimerStartAt;
-    }
-
-    // 主对话区：优先按当前请求的最后一条用户消息计时，确保按轮次重置
-    if (panelHasPendingRequest && latestRoundAnchorMessage) {
-      return latestRoundAnchorMessage.timestamp;
-    }
-
-    // 兜底：没有可匹配请求时，使用处理开始时间
-    if (messagesState.thinkingStartAt) {
-      return messagesState.thinkingStartAt;
+    const timestamp = currentStreamingMessage?.timestamp;
+    if (typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0) {
+      return timestamp;
     }
     return 0;
   });
 
-  // 计时器运行条件与底部三点展示解耦：
-  // 有流式消息时计时也要持续更新，避免只显示三点不显示耗时。
   const shouldRunTimer = $derived.by(() => {
-    if (timerStartTime <= 0) return false;
-    if (displayContext === 'worker') {
-      return isExecuting || workerHasStreaming;
-    }
-    return messagesState.isProcessing || hasBottomStreamingMessage;
+    return Boolean(currentStreamingMessage && timerStartTime > 0);
   });
 
   let elapsedSeconds = $state(0);
@@ -564,26 +530,15 @@
         <p class="empty-hint">{emptyHint}</p>
       </div>
     {:else}
-      {#each safeRenderItems as item (item.key)}
+      {#each effectiveRenderItems as item (item.key)}
         <MessageItem
           message={item.message}
           {readOnly}
           {displayContext}
           showStreamingIndicator={item.message.id === streamingIndicatorMessageId}
-          streamingElapsedSeconds={item.message.id === streamingIndicatorMessageId && shouldRunTimer ? elapsedSeconds : 0}
+          streamingElapsedSeconds={item.message.id === streamingIndicatorMessageId ? elapsedSeconds : 0}
         />
       {/each}
-      <!-- 对话级处理指示器：无流式消息但仍在处理中时显示 -->
-      {#if showProcessingIndicator}
-        <div class="conversation-processing-indicator">
-          <span class="streaming-dot"></span>
-          <span class="streaming-dot"></span>
-          <span class="streaming-dot"></span>
-          {#if timerStartTime > 0}
-            <span class="elapsed-time">{formatElapsed(elapsedSeconds)}</span>
-          {/if}
-        </div>
-      {/if}
     {/if}
   </div>
 
@@ -684,46 +639,4 @@
     transform: translateY(-2px);
   }
 
-  /* 对话级处理指示器 */
-  .conversation-processing-indicator {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    padding: var(--space-2) var(--space-4);
-    /* 防御性：确保在 flex 容器中始终排列在所有消息卡片之后 */
-    order: 9999;
-  }
-
-  .conversation-processing-indicator .streaming-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--info);
-    opacity: 0.6;
-    animation: processingPulse 1.4s ease-in-out infinite;
-  }
-  .conversation-processing-indicator .streaming-dot:nth-child(2) {
-    animation-delay: 0.2s;
-  }
-  .conversation-processing-indicator .streaming-dot:nth-child(3) {
-    animation-delay: 0.4s;
-  }
-
-  .elapsed-time {
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    margin-left: 4px;
-    font-variant-numeric: tabular-nums;
-  }
-
-  @keyframes processingPulse {
-    0%, 80%, 100% {
-      opacity: 0.4;
-      transform: scale(1);
-    }
-    40% {
-      opacity: 1;
-      transform: scale(1.2);
-    }
-  }
 </style>

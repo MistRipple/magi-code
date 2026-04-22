@@ -2,6 +2,7 @@ mod models;
 mod store;
 
 pub use models::{
+    ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     NotificationRecord, SessionDurableState, SessionExecutionSidecarStatus,
     SessionExecutionSidecarStoreState, SessionProjectionInput, SessionRecord,
     SessionRuntimeSidecar, SessionRuntimeSidecarExport, SessionSidecarFlushMetadata,

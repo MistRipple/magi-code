@@ -198,6 +198,21 @@ export interface ToolCallBlock {
   duration?: number;
 }
 
+export interface ToolResultBlock {
+  type: 'tool_result';
+  toolCallId: string;
+  content: string;
+  isError?: boolean;
+  standardized?: StandardizedToolResultPayload;
+  fileChange?: {
+    filePath: string;
+    changeType: 'create' | 'modify' | 'delete';
+    additions?: number;
+    deletions?: number;
+    diff?: string;
+  };
+}
+
 export interface FileChangeBlock {
   type: 'file_change';
   filePath: string;
@@ -272,6 +287,7 @@ export type ContentBlock =
   | CodeBlock
   | ThinkingBlock
   | ToolCallBlock
+  | ToolResultBlock
   | FileChangeBlock
   | PlanBlock
   | DispatchGroupBlock;

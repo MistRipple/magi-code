@@ -1,9 +1,9 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
-use magi_core::{MissionId, TaskId, TaskKind, TaskStatus, UtcMillis};
+use magi_core::{MissionId, SessionId, TaskId, TaskKind, TaskStatus, UtcMillis};
 use serde::Deserialize;
 
 use crate::{errors::ApiError, state::ApiState};
@@ -28,12 +28,54 @@ fn require_task_store(state: &ApiState) -> Result<&magi_orchestrator::task_store
         .ok_or_else(|| ApiError::internal_assembly("任务存储未配置", "task_store is not configured"))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionScopedTaskQuery {
+    session_id: Option<String>,
+}
+
+fn parse_session_id(value: Option<&str>) -> Result<SessionId, ApiError> {
+    let session_id = value
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("sessionId 不能为空".to_string()))?;
+    Ok(SessionId::new(session_id))
+}
+
+fn require_session_task(
+    state: &ApiState,
+    session_id_value: Option<&str>,
+    task_id: &TaskId,
+) -> Result<(), ApiError> {
+    let session_id = parse_session_id(session_id_value)?;
+    let ownership = state
+        .session_store
+        .execution_ownership(&session_id)
+        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+    let mission_id = ownership
+        .mission_id
+        .ok_or_else(|| ApiError::InvalidInput("当前会话没有活跃任务链".to_string()))?;
+    let store = require_task_store(state)?;
+    let task = store
+        .get_task(task_id)
+        .ok_or_else(|| ApiError::not_found("任务不存在", task_id.as_str()))?;
+    if task.mission_id != mission_id {
+        return Err(ApiError::InvalidInput(format!(
+            "任务 {} 不属于当前会话 {}",
+            task_id, session_id
+        )));
+    }
+    Ok(())
+}
+
 async fn get_task_projection(
     State(state): State<ApiState>,
     Path(root_task_id): Path<String>,
+    Query(query): Query<SessionScopedTaskQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = require_task_store(&state)?;
     let root_id = TaskId::new(&root_task_id);
+    require_session_task(&state, query.session_id.as_deref(), &root_id)?;
     let projection = store
         .build_projection(&root_id)
         .ok_or_else(|| ApiError::not_found("任务不存在", &root_task_id))?;
@@ -45,9 +87,11 @@ async fn get_task_projection(
 async fn get_task(
     State(state): State<ApiState>,
     Path(task_id): Path<String>,
+    Query(query): Query<SessionScopedTaskQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = require_task_store(&state)?;
     let id = TaskId::new(&task_id);
+    require_session_task(&state, query.session_id.as_deref(), &id)?;
     let task = store
         .get_task(&id)
         .ok_or_else(|| ApiError::not_found("任务不存在", &task_id))?;
@@ -145,9 +189,11 @@ async fn update_task_status(
 async fn get_task_lease(
     State(state): State<ApiState>,
     Path(task_id): Path<String>,
+    Query(query): Query<SessionScopedTaskQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = require_task_store(&state)?;
     let id = TaskId::new(&task_id);
+    require_session_task(&state, query.session_id.as_deref(), &id)?;
     let lease = store
         .get_active_lease(&id)
         .ok_or_else(|| ApiError::not_found("活跃租约不存在", &task_id))?;

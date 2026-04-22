@@ -31,7 +31,9 @@
     output={block.toolCall?.result}
     error={block.toolCall?.error}
     standardized={block.toolCall?.standardized}
-    duration={block.toolCall?.endTime && block.toolCall?.startTime ? block.toolCall.endTime - block.toolCall.startTime : undefined}
+    duration={typeof block.toolCall?.durationMs === 'number'
+      ? block.toolCall.durationMs
+      : (block.toolCall?.endTime && block.toolCall?.startTime ? block.toolCall.endTime - block.toolCall.startTime : undefined)}
     initialExpanded={toolStatus === 'error'}
   />
 {/if}

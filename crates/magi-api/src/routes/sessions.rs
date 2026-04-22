@@ -3,19 +3,23 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use magi_core::{DomainError, SessionId, UtcMillis};
+use magi_core::{DomainError, EventId, SessionId, UtcMillis, WorkerId};
+use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::SessionRecord;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::{
     dto::{BootstrapDto, SessionNotificationsResponseDto},
     errors::ApiError,
     state::ApiState,
+    task_execution::continue_shadow_execution_chain,
 };
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/session/new", post(create_session))
+        .route("/session/continue", post(continue_session))
         .route("/session/switch", post(switch_session))
         .route("/session/delete", post(delete_session))
         .route("/session/rename", post(rename_session))
@@ -45,7 +49,7 @@ async fn create_session(
     State(state): State<ApiState>,
     Json(request): Json<CreateSessionRequest>,
 ) -> Result<Json<SessionSelectionResponseDto>, ApiError> {
-    let session_id = SessionId::new(format!("session-{}", UtcMillis::now().0));
+    let session_id = super::new_session_id();
     let workspace_id = request.workspace_id.filter(|s| !s.is_empty());
     state
         .session_store
@@ -66,6 +70,28 @@ async fn create_session(
 #[serde(rename_all = "camelCase")]
 struct SwitchSessionRequest {
     session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContinueSessionRequest {
+    session_id: String,
+    #[serde(default)]
+    requested_worker_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContinueSessionResponseDto {
+    session_id: String,
+    mission_id: String,
+    root_task_id: String,
+    execution_chain_ref: String,
+    resumed_branch_count: usize,
+    status: String,
+    runner_started: bool,
+    event_id: String,
+    continued_at: UtcMillis,
 }
 
 #[derive(Debug, Serialize)]
@@ -92,6 +118,57 @@ async fn switch_session(
             .map(|session| session.session_id.to_string())
             .unwrap_or_default(),
         current_session,
+    }))
+}
+
+async fn continue_session(
+    State(state): State<ApiState>,
+    Json(request): Json<ContinueSessionRequest>,
+) -> Result<Json<ContinueSessionResponseDto>, ApiError> {
+    let session_id = SessionId::new(&request.session_id);
+    let requested_worker_ids = request
+        .requested_worker_ids
+        .into_iter()
+        .map(|worker_id| worker_id.trim().to_string())
+        .filter(|worker_id| !worker_id.is_empty())
+        .map(WorkerId::new)
+        .collect::<Vec<_>>();
+    let continued_at = UtcMillis::now();
+    let accepted = continue_shadow_execution_chain(&state, &session_id, &requested_worker_ids)?;
+    state.persist_runtime_durable_state()?;
+    let event_id = EventId::new(format!("event-session-continue-{}", continued_at.0));
+    let event = EventEnvelope::domain(
+        event_id.clone(),
+        "session.continue.executed",
+        json!({
+            "session_id": accepted.session_id.to_string(),
+            "mission_id": accepted.mission_id.to_string(),
+            "root_task_id": accepted.root_task_id.to_string(),
+            "execution_chain_ref": accepted.execution_chain_ref,
+            "resumed_branch_count": accepted.resumed_branch_count,
+            "runner_started": accepted.runner_started,
+        }),
+    )
+    .with_context(EventContext {
+        session_id: Some(accepted.session_id.clone()),
+        mission_id: Some(accepted.mission_id.clone()),
+        task_id: Some(accepted.root_task_id.clone()),
+        ..EventContext::default()
+    });
+    state
+        .event_bus
+        .publish(event)
+        .map_err(|err| ApiError::event_publish_failed("会话继续事件发布失败", err))?;
+    Ok(Json(ContinueSessionResponseDto {
+        session_id: accepted.session_id.to_string(),
+        mission_id: accepted.mission_id.to_string(),
+        root_task_id: accepted.root_task_id.to_string(),
+        execution_chain_ref: accepted.execution_chain_ref,
+        resumed_branch_count: accepted.resumed_branch_count,
+        status: "continued".to_string(),
+        runner_started: accepted.runner_started,
+        event_id: event_id.to_string(),
+        continued_at,
     }))
 }
 

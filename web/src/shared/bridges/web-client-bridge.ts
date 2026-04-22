@@ -35,6 +35,7 @@ import {
   getAgentExecutionStats,
   getAgentChangeDiff,
   getAgentFilePreview,
+  continueAgentSession,
   interruptAgentTask,
   installAgentLocalSkill,
   installAgentSkill,
@@ -60,7 +61,6 @@ import {
     revertAgentChange,
   revertAgentExecutionGroupChanges,
   revertAllAgentChanges,
-  resumeAgentTask,
   testAgentAuxiliaryConnection,
   testAgentOrchestratorConnection,
   testAgentWorkerConnection,
@@ -109,6 +109,7 @@ import {
   fetchTaskProjection,
   startAutoRefresh as startTaskAutoRefresh,
   getTaskGraphState,
+  clearTaskGraph,
 } from '../../stores/task-graph-store.svelte';
 import { RustDaemonClient } from '../rust-daemon-client';
 
@@ -117,6 +118,7 @@ let bridgeListenerRegistered = false;
 let currentWorkspaceId = '';
 let currentWorkspacePath = '';
 let currentSessionId = '';
+let currentInterruptTaskId = '';
 let currentRuntimeEpoch = '';
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
 let cachedSettingsBootstrapScope: 'none' | 'core' | 'full' = 'none';
@@ -328,6 +330,37 @@ interface BootstrapTaskTrackingHints {
   activeTaskIds: string[];
 }
 
+function isTerminalRuntimeTaskStatus(status: unknown): boolean {
+  const normalized = trimBridgeString(status).toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return normalized.includes('succeed')
+    || normalized.includes('complete')
+    || normalized.includes('fail')
+    || normalized.includes('reject')
+    || normalized.includes('abort')
+    || normalized.includes('cancel')
+    || normalized.includes('skip');
+}
+
+function clearCurrentInterruptTaskId(): void {
+  currentInterruptTaskId = '';
+}
+
+function setCurrentInterruptTaskId(taskId: string): void {
+  currentInterruptTaskId = trimBridgeString(taskId);
+}
+
+function reconcileCurrentInterruptTaskId(activeTaskIds: string[]): void {
+  if (!currentInterruptTaskId) {
+    return;
+  }
+  if (!activeTaskIds.includes(currentInterruptTaskId)) {
+    clearCurrentInterruptTaskId();
+  }
+}
+
 function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload: unknown): BootstrapTaskTrackingHints {
   const rawBootstrap = asBridgeRecord(rawPayload);
   const expectedSessionId = trimBridgeString(payload.sessionId);
@@ -337,6 +370,30 @@ function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload
 
   const rawRuntimeReadModel = asBridgeRecord(rawBootstrap?.runtimeReadModel);
   const runtimeDetails = asBridgeRecord(rawRuntimeReadModel?.details);
+  const runtimeTasks = Array.isArray(runtimeDetails?.tasks)
+    ? runtimeDetails.tasks
+      .map((entry) => asBridgeRecord(entry))
+      .filter((entry): entry is Record<string, unknown> => entry !== null)
+    : [];
+  const runtimeTaskMap = new Map<string, Record<string, unknown>>();
+  for (const task of runtimeTasks) {
+    const taskId = trimBridgeString(task.task_id);
+    if (taskId) {
+      runtimeTaskMap.set(taskId, task);
+    }
+  }
+  const runtimeExecutionGroups = Array.isArray(runtimeDetails?.execution_groups)
+    ? runtimeDetails.execution_groups
+      .map((entry) => asBridgeRecord(entry))
+      .filter((entry): entry is Record<string, unknown> => entry !== null)
+    : [];
+  const runtimeExecutionGroupMap = new Map<string, Record<string, unknown>>();
+  for (const group of runtimeExecutionGroups) {
+    const missionId = trimBridgeString(group.mission_id);
+    if (missionId) {
+      runtimeExecutionGroupMap.set(missionId, group);
+    }
+  }
   const runtimeSessions = Array.isArray(runtimeDetails?.sessions)
     ? runtimeDetails.sessions
       .map((entry) => asBridgeRecord(entry))
@@ -348,12 +405,42 @@ function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload
   });
   const overview = asBridgeRecord(rawRuntimeReadModel?.overview);
   const activity = asBridgeRecord(overview?.activity);
+  const sessionTaskIds = normalizeBridgeStringArray(activeRuntimeSession?.active_task_ids);
+  const sessionMissionIds = new Set(normalizeBridgeStringArray(activeRuntimeSession?.active_execution_group_ids));
+  for (const taskId of sessionTaskIds) {
+    const missionId = trimBridgeString(runtimeTaskMap.get(taskId)?.mission_id);
+    if (missionId) {
+      sessionMissionIds.add(missionId);
+    }
+  }
 
-  for (const taskId of normalizeBridgeStringArray(activeRuntimeSession?.active_task_ids)) {
+  const collectActiveTaskId = (taskId: string) => {
+    if (!taskId) {
+      return;
+    }
+    const taskEntry = runtimeTaskMap.get(taskId);
+    if (taskEntry && isTerminalRuntimeTaskStatus(taskEntry.current_status)) {
+      return;
+    }
     activeTaskIds.add(taskId);
+  };
+
+  for (const taskId of sessionTaskIds) {
+    collectActiveTaskId(taskId);
+  }
+  for (const missionId of normalizeBridgeStringArray(activeRuntimeSession?.active_execution_group_ids)) {
+    const group = runtimeExecutionGroupMap.get(missionId);
+    for (const taskId of normalizeBridgeStringArray(group?.active_task_ids)) {
+      collectActiveTaskId(taskId);
+    }
   }
   for (const taskId of normalizeBridgeStringArray(activity?.active_task_ids)) {
-    activeTaskIds.add(taskId);
+    const taskEntry = runtimeTaskMap.get(taskId);
+    const missionId = trimBridgeString(taskEntry?.mission_id);
+    if (sessionMissionIds.size > 0 && !sessionMissionIds.has(missionId)) {
+      continue;
+    }
+    collectActiveTaskId(taskId);
   }
 
   const recentEvents = Array.isArray(rawBootstrap?.recentEvents)
@@ -365,15 +452,21 @@ function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload
     const event = recentEvents[index];
     const eventPayload = asBridgeRecord(event.payload);
     const eventSessionId = trimBridgeString(event.session_id) || trimBridgeString(eventPayload?.session_id);
-    if (expectedSessionId && eventSessionId && eventSessionId !== expectedSessionId) {
-      continue;
+    const eventTaskId = trimBridgeString(event.task_id) || trimBridgeString(eventPayload?.task_id) || trimBridgeString(eventPayload?.taskId);
+    const eventMissionId = trimBridgeString(event.mission_id) || trimBridgeString(eventPayload?.mission_id) || trimBridgeString(eventPayload?.missionId);
+    if (expectedSessionId) {
+      const belongsToExpectedSession = eventSessionId === expectedSessionId
+        || (eventTaskId && sessionTaskIds.includes(eventTaskId))
+        || (eventMissionId && sessionMissionIds.has(eventMissionId));
+      if (!belongsToExpectedSession) {
+        continue;
+      }
     }
     rootTaskId = trimBridgeString(eventPayload?.root_task_id) || trimBridgeString(eventPayload?.rootTaskId);
     if (rootTaskId) {
       break;
     }
   }
-
   return {
     rootTaskId,
     activeTaskIds: [...activeTaskIds],
@@ -404,6 +497,7 @@ function isExpectedRecoveryBridgeFailure(error: unknown): boolean {
 }
 
 function emitForcedProcessingIdle(reason: string, extra?: Record<string, unknown>): void {
+  clearCurrentInterruptTaskId();
   emitDataMessage('processingStateChanged', {
     isProcessing: false,
     transitionKind: 'forced',
@@ -615,11 +709,32 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
   const eventType = trimBridgeString(event.event_type);
+  if (eventType === 'session.action.accepted' && event.payload) {
+    const acceptedSessionId = trimBridgeString(event.payload.session_id) || trimBridgeString(event.session_id);
+    const acceptedActionTaskId = trimBridgeString(event.payload.action_task_id)
+      || trimBridgeString(event.payload.actionTaskId);
+    const acceptedRootTaskId = trimBridgeString(event.payload.root_task_id)
+      || trimBridgeString(event.payload.rootTaskId);
+
+    if (acceptedSessionId) {
+      if (!currentSessionId || currentSessionId === acceptedSessionId) {
+        if (acceptedActionTaskId) {
+          setCurrentInterruptTaskId(acceptedActionTaskId);
+        }
+        if (acceptedRootTaskId) {
+          initTaskTracking(acceptedSessionId, acceptedRootTaskId);
+        }
+      }
+    }
+  }
   scheduleBootstrapRefreshFromRustEvent(eventType || 'rust_event');
 
   // Notify listeners about task-domain SSE events so lightweight stores
   // (e.g. task-graph-store) can react without waiting for a full bootstrap refresh.
-  if (eventType.startsWith('task.')) {
+  const isTaskGraphRelevantEvent = eventType.startsWith('task.')
+    || eventType.startsWith('mission.')
+    || eventType.startsWith('assignment.');
+  if (isTaskGraphRelevantEvent) {
     emitMessage({ type: 'rustTaskEvent', eventType, payload: event.payload ?? {} } as ClientBridgeMessage);
 
     // Emit a data message for task status changes so data-message-handlers
@@ -777,14 +892,17 @@ function resolveWorkspaceQuery(): { workspaceId: string; workspacePath: string; 
     : '';
   const storedBinding = readStoredBrowserWorkspaceBinding();
   const workspaceId = currentUrl?.searchParams.get('workspaceId')?.trim()
+    || currentWorkspaceId
     || injectedBinding.workspaceId
     || storedBinding.workspaceId
     || '';
   const workspacePath = currentUrl?.searchParams.get('workspacePath')?.trim()
+    || currentWorkspacePath
     || injectedBinding.workspacePath
     || storedBinding.workspacePath
     || '';
   const sessionId = currentUrl?.searchParams.get('sessionId')?.trim()
+    || currentSessionId
     || injectedSessionId
     || storedBinding.sessionId
     || '';
@@ -799,13 +917,22 @@ function hydrateCanonicalWorkspaceBinding(): void {
 }
 
 function persistWorkspaceBinding(workspaceId: string, workspacePath: string, sessionId: string): void {
-  currentWorkspaceId = workspaceId;
-  currentWorkspacePath = workspacePath;
-  currentSessionId = sessionId;
+  const normalizedWorkspaceId = workspaceId.trim();
+  const normalizedWorkspacePath = workspacePath.trim();
+  const incomingSessionId = sessionId.trim();
+  const workspaceChanged = (
+    (normalizedWorkspaceId && normalizedWorkspaceId !== currentWorkspaceId)
+    || (normalizedWorkspacePath && normalizedWorkspacePath !== currentWorkspacePath)
+  );
+  const nextSessionId = incomingSessionId || (workspaceChanged ? '' : currentSessionId);
+
+  currentWorkspaceId = normalizedWorkspaceId;
+  currentWorkspacePath = normalizedWorkspacePath;
+  currentSessionId = nextSessionId;
   persistStoredBrowserWorkspaceBinding({
-    workspaceId,
-    workspacePath,
-    sessionId,
+    workspaceId: normalizedWorkspaceId,
+    workspacePath: normalizedWorkspacePath,
+    sessionId: nextSessionId,
   });
 
   const currentUrl = getCurrentUrl();
@@ -813,18 +940,18 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
     return;
   }
   const nextUrl = new URL(currentUrl.toString());
-  if (workspaceId) {
-    nextUrl.searchParams.set('workspaceId', workspaceId);
+  if (normalizedWorkspaceId) {
+    nextUrl.searchParams.set('workspaceId', normalizedWorkspaceId);
   } else {
     nextUrl.searchParams.delete('workspaceId');
   }
-  if (workspacePath) {
-    nextUrl.searchParams.set('workspacePath', workspacePath);
+  if (normalizedWorkspacePath) {
+    nextUrl.searchParams.set('workspacePath', normalizedWorkspacePath);
   } else {
     nextUrl.searchParams.delete('workspacePath');
   }
-  if (sessionId) {
-    nextUrl.searchParams.set('sessionId', sessionId);
+  if (nextSessionId) {
+    nextUrl.searchParams.set('sessionId', nextSessionId);
   } else {
     nextUrl.searchParams.delete('sessionId');
   }
@@ -837,6 +964,8 @@ function clearPersistedWorkspaceBinding(): void {
   currentWorkspaceId = '';
   currentWorkspacePath = '';
   currentSessionId = '';
+  clearCurrentInterruptTaskId();
+  clearTaskGraph();
   persistStoredBrowserWorkspaceBinding({
     workspaceId: '',
     workspacePath: '',
@@ -1053,6 +1182,7 @@ async function dispatchBootstrap(
   payload: BootstrapPayload,
   options: { forceEventStreamReconnect?: boolean; rawPayload?: unknown } = {},
 ): Promise<void> {
+ const previousSessionId = currentSessionId;
  // 检测 runtimeEpoch 代际变化：后端重启后执行无刷新状态重建，不允许整页刷新打断用户会话。
  const incomingEpoch = payload.agent?.runtimeEpoch || '';
  if (incomingEpoch && currentRuntimeEpoch && incomingEpoch !== currentRuntimeEpoch) {
@@ -1065,6 +1195,14 @@ async function dispatchBootstrap(
    currentRuntimeEpoch = incomingEpoch;
  }
   persistWorkspaceBinding(payload.workspace.workspaceId, payload.workspace.rootPath, payload.sessionId);
+  const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, options.rawPayload);
+  if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
+    clearCurrentInterruptTaskId();
+  }
+  reconcileCurrentInterruptTaskId(taskTrackingHints.activeTaskIds);
+  if (!taskTrackingHints.rootTaskId && taskTrackingHints.activeTaskIds.length === 0) {
+    clearTaskGraph(payload.sessionId);
+  }
   emitDataMessage('sessionBootstrapLoaded', payload as unknown as Record<string, unknown>);
   void ensureEventStream({
     forceReconnect: options.forceEventStreamReconnect === true,
@@ -1076,20 +1214,26 @@ async function dispatchBootstrap(
   // 并行加载 Registry agents（fire-and-forget，不阻断 bootstrap）
   dispatchRegistryAgents();
 
-  const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, options.rawPayload);
   if (taskTrackingHints.rootTaskId || taskTrackingHints.activeTaskIds.length > 0) {
-    void autoConnectTaskTracking(taskTrackingHints.activeTaskIds, taskTrackingHints.rootTaskId).catch((error) => {
+    void autoConnectTaskTracking(payload.sessionId, taskTrackingHints.activeTaskIds, taskTrackingHints.rootTaskId).catch((error) => {
       console.warn('[web-client-bridge] Auto-connect task tracking on bootstrap failed (non-critical):', error);
     });
   }
 }
 
 async function fetchBootstrap(
-  options: { forceEventStreamReconnect?: boolean } = {},
+  options: { forceEventStreamReconnect?: boolean; forceFresh?: boolean } = {},
 ): Promise<void> {
   // 防重入：如果已有 bootstrap 请求在飞行中，直接复用
-  if (bootstrapInFlight) {
+  if (bootstrapInFlight && options.forceFresh !== true) {
     return bootstrapInFlight;
+  }
+  if (bootstrapInFlight && options.forceFresh === true) {
+    try {
+      await bootstrapInFlight;
+    } catch {
+      // 强制刷新场景需要忽略上一轮失败，继续拉取最新权威快照。
+    }
   }
   const doFetch = async (): Promise<void> => {
     const { workspaceId, workspacePath, sessionId } = resolveWorkspaceQuery();
@@ -1239,6 +1383,7 @@ async function dispatchSessionSnapshot(
     forceEventStreamReconnect?: boolean;
   },
 ): Promise<void> {
+  const previousSessionId = currentSessionId;
   const payload = normalizeBootstrapResponse(rawPayload, {
     sessionId: options.sessionId,
     workspaceId: options.workspaceId,
@@ -1246,6 +1391,14 @@ async function dispatchSessionSnapshot(
   });
   const pageMeta = readRustTimelinePageMeta(rawPayload);
   persistWorkspaceBinding(payload.workspace.workspaceId, payload.workspace.rootPath, payload.sessionId);
+  const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, rawPayload);
+  if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
+    clearCurrentInterruptTaskId();
+  }
+  reconcileCurrentInterruptTaskId(taskTrackingHints.activeTaskIds);
+  if (!taskTrackingHints.rootTaskId && taskTrackingHints.activeTaskIds.length === 0) {
+    clearTaskGraph(payload.sessionId);
+  }
   emitDataMessage('sessionBootstrapLoaded', {
     ...payload,
     hasMoreBefore: pageMeta.hasMoreBefore,
@@ -1403,9 +1556,13 @@ async function ensureFreshLiveBridge(reason: string): Promise<void> {
  * Fetches the initial projection and starts auto-refresh + SSE subscription.
  * Defensive: logs warnings on failure but never breaks the caller.
  */
-function initTaskTracking(rootTaskId: string): void {
-  console.info('[web-client-bridge] Initializing task tracking for root task:', rootTaskId);
-  fetchTaskProjection(rootTaskId)
+function initTaskTracking(sessionId: string, rootTaskId: string): void {
+  console.info('[web-client-bridge] Initializing task tracking for session/root task:', { sessionId, rootTaskId });
+  const currentState = getTaskGraphState(sessionId);
+  if (currentState.rootTaskId && currentState.rootTaskId !== rootTaskId) {
+    clearTaskGraph(sessionId);
+  }
+  fetchTaskProjection(sessionId, rootTaskId)
     .then(() => {
       startTaskAutoRefresh();
     })
@@ -1420,16 +1577,20 @@ function initTaskTracking(rootTaskId: string): void {
  * Uses active_task_ids from the bootstrap runtime read model to resolve root tasks.
  */
 export async function autoConnectTaskTracking(
+  sessionId: string,
   activeTaskIds: string[],
   preferredRootTaskId = '',
 ): Promise<void> {
-  const currentState = getTaskGraphState();
+  if (!sessionId) {
+    return;
+  }
+  const currentState = getTaskGraphState(sessionId);
   if (preferredRootTaskId) {
     if (currentState.rootTaskId === preferredRootTaskId) {
       return;
     }
     console.info('[web-client-bridge] Auto-connecting task tracking from bootstrap root task:', preferredRootTaskId);
-    initTaskTracking(preferredRootTaskId);
+    initTaskTracking(sessionId, preferredRootTaskId);
     return;
   }
 
@@ -1447,7 +1608,7 @@ export async function autoConnectTaskTracking(
     for (const taskId of activeTaskIds) {
       let task;
       try {
-        task = await client.getTask(taskId);
+        task = await client.getTask(taskId, sessionId);
       } catch {
         continue;
       }
@@ -1462,10 +1623,11 @@ export async function autoConnectTaskTracking(
         return;
       }
       console.info('[web-client-bridge] Auto-connecting task tracking via active task:', {
+        sessionId,
         taskId,
         rootTaskId,
       });
-      initTaskTracking(rootTaskId);
+      initTaskTracking(sessionId, rootTaskId);
       return;
     }
   } catch (error) {
@@ -1551,18 +1713,23 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
       workspacePath: currentWorkspacePath,
       sessionId: currentSessionId,
     });
+    const resolvedSessionId = typeof actionResult.sessionId === 'string' && actionResult.sessionId.trim()
+      ? actionResult.sessionId.trim()
+      : currentSessionId;
+    if (resolvedSessionId) {
+      persistWorkspaceBinding(currentWorkspaceId, currentWorkspacePath, resolvedSessionId);
+    }
     emitBridgeSuccessToast('发送消息', '任务已提交', { displayMode: 'notification_center' });
 
+    setCurrentInterruptTaskId(actionResult.actionTaskId || '');
     const rootTaskId = actionResult.rootTaskId;
-    if (rootTaskId) {
-      initTaskTracking(rootTaskId);
+    if (rootTaskId && resolvedSessionId) {
+      initTaskTracking(resolvedSessionId, rootTaskId);
     }
 
-    void fetchBootstrap().catch((error) => {
-      reportExpectedRecoveryFailure('提交后同步', '[web-client-bridge] 任务提交后 bootstrap 同步失败:', error);
-      scheduleRecovery('execute_task_post_submit_bootstrap_failed', error, true);
-    });
+    await fetchBootstrap({ forceFresh: true });
   } catch (error) {
+    clearCurrentInterruptTaskId();
     console.error('[web-client-bridge] 执行任务失败:', error);
     emitBridgeErrorToast('发送消息', error);
     emitForcedProcessingIdle('execute_task_failed', {
@@ -1577,15 +1744,21 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
 }
 
 async function interruptTask(trigger: 'user_pause' | 'pause_task' = 'user_pause'): Promise<void> {
-  // 无论后端是否可达/报错，先在前端立即收敛到 idle，避免停止按钮卡死。
-  emitForcedProcessingIdle('user_interrupt_requested', { trigger });
+  const taskId = currentInterruptTaskId;
+  if (!taskId) {
+    emitBridgeErrorToast('停止任务', new Error('当前轮次缺少可中断任务 ID，请等待任务初始化完成后再试。'));
+    return;
+  }
+  // 目标 task 已确认后，前端立即收敛到 idle，避免停止按钮卡死。
+  emitForcedProcessingIdle('user_interrupt_requested', { trigger, taskId });
   try {
-    await interruptAgentTask();
+    await interruptAgentTask({ taskId });
   } catch (error) {
     console.error('[web-client-bridge] 中断任务失败（已执行前端强制停止）:', error);
     emitBridgeErrorToast('停止任务', error);
     emitForcedProcessingIdle('user_interrupt_failed', {
       trigger,
+      taskId,
       error: normalizeErrorMessage(error),
     });
   }
@@ -1613,20 +1786,24 @@ async function startTask(taskId: string): Promise<void> {
   }
 }
 
-async function resumeTask(taskId: string): Promise<void> {
+async function continueSessionExecution(): Promise<void> {
+  if (!currentSessionId) {
+    emitBridgeErrorToast('继续会话', new Error('当前没有可继续的会话。'));
+    return;
+  }
   try {
-    await ensureFreshLiveBridge('resume_task_preflight');
-    await resumeAgentTask(taskId);
+    await ensureFreshLiveBridge('continue_session_preflight');
+    await continueAgentSession(currentSessionId);
   } catch (error) {
-    console.error('[web-client-bridge] 恢复任务失败:', error);
-    emitBridgeErrorToast('恢复任务', error);
-    emitForcedProcessingIdle('resume_task_failed', {
+    console.error('[web-client-bridge] 继续会话失败:', error);
+    emitBridgeErrorToast('继续会话', error);
+    emitForcedProcessingIdle('continue_session_failed', {
       error: normalizeErrorMessage(error),
-      taskId,
+      sessionId: currentSessionId,
     });
     if (shouldRecoverFromBridgeError(error)) {
       closeEventStream();
-      scheduleRecovery('resume_task_failed', error, true);
+      scheduleRecovery('continue_session_failed', error, true);
     }
   }
 }
@@ -2237,14 +2414,7 @@ export function createWebClientBridge(): ClientBridge {
           void interruptTask('user_pause');
           return;
         case 'continueTask':
-          if (typeof message.prompt === 'string' && message.prompt.trim()) {
-            void executeTask({
-              text: message.prompt,
-              deepTask: false,
-              skillName: null,
-              images: [],
-            });
-          }
+          void continueSessionExecution();
           return;
         case 'pauseTask':
           void interruptTask('pause_task');
@@ -2252,11 +2422,6 @@ export function createWebClientBridge(): ClientBridge {
         case 'startTask':
           if (typeof message.taskId === 'string' && message.taskId.trim()) {
             void startTask(message.taskId);
-          }
-          return;
-        case 'resumeTask':
-          if (typeof message.taskId === 'string' && message.taskId.trim()) {
-            void resumeTask(message.taskId);
           }
           return;
         case 'deleteTask':
@@ -2369,7 +2534,10 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'approveChange':
           if (typeof message.filePath === 'string' && message.filePath.trim()) {
-            void approveAgentChange(message.filePath).then(async () => {
+            const targetSessionId = typeof message.sessionId === 'string' && message.sessionId.trim()
+              ? message.sessionId.trim()
+              : currentSessionId;
+            void approveAgentChange(message.filePath, targetSessionId).then(async () => {
               await fetchBootstrap();
               emitBridgeSuccessToast('批准变更', '变更已批准');
             }).catch((error) => {
@@ -2379,7 +2547,10 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'revertChange':
           if (typeof message.filePath === 'string' && message.filePath.trim()) {
-            void revertAgentChange(message.filePath).then(async () => {
+            const targetSessionId = typeof message.sessionId === 'string' && message.sessionId.trim()
+              ? message.sessionId.trim()
+              : currentSessionId;
+            void revertAgentChange(message.filePath, targetSessionId).then(async () => {
               await fetchBootstrap();
               emitBridgeSuccessToast('还原变更', '变更已还原');
             }).catch((error) => {
@@ -2388,7 +2559,11 @@ export function createWebClientBridge(): ClientBridge {
           }
           return;
         case 'approveAllChanges':
-          void approveAllAgentChanges().then(async () => {
+          void approveAllAgentChanges(
+            typeof message.sessionId === 'string' && message.sessionId.trim()
+              ? message.sessionId.trim()
+              : currentSessionId,
+          ).then(async () => {
             await fetchBootstrap();
             emitBridgeSuccessToast('批准全部变更', '全部变更已批准');
           }).catch((error) => {
@@ -2396,7 +2571,11 @@ export function createWebClientBridge(): ClientBridge {
           });
           return;
         case 'revertAllChanges':
-          void revertAllAgentChanges().then(async () => {
+          void revertAllAgentChanges(
+            typeof message.sessionId === 'string' && message.sessionId.trim()
+              ? message.sessionId.trim()
+              : currentSessionId,
+          ).then(async () => {
             await fetchBootstrap();
             emitBridgeSuccessToast('还原全部变更', '全部变更已还原');
           }).catch((error) => {
@@ -2405,7 +2584,10 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'revertExecutionGroup':
           if (typeof message.executionGroupId === 'string' && message.executionGroupId.trim()) {
-            void revertAgentExecutionGroupChanges(message.executionGroupId).then(async () => {
+            const targetSessionId = typeof message.sessionId === 'string' && message.sessionId.trim()
+              ? message.sessionId.trim()
+              : currentSessionId;
+            void revertAgentExecutionGroupChanges(message.executionGroupId, targetSessionId).then(async () => {
               await fetchBootstrap();
               emitBridgeSuccessToast('还原执行分组变更', '执行分组变更已还原');
             }).catch((error) => {

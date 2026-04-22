@@ -245,6 +245,7 @@
     // 文件操作工具直接使用语义化显示名
     const displayNameMap: Record<string, string> = {
       'shell': i18n.t('toolCall.displayName.shell'),
+      'tool_result': i18n.t('toolCall.displayName.default'),
       'file_view': i18n.t('toolCall.displayName.fileView'),
       'file_create': i18n.t('toolCall.displayName.fileCreate'),
       'file_edit': i18n.t('toolCall.displayName.fileEdit'),

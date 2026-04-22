@@ -5,6 +5,42 @@ use magi_core::{
     UtcMillis, WorkerId, WorkspaceId,
 };
 use serde_json::json;
+use std::{thread, time::Duration};
+
+#[test]
+fn append_timeline_entry_updates_session_timestamp_and_user_message_count() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-message-count");
+    let created = store
+        .create_session(session_id.clone(), "message count session")
+        .expect("session should be creatable");
+
+    thread::sleep(Duration::from_millis(2));
+    store.append_timeline_entry(
+        session_id.clone(),
+        TimelineEntryKind::UserMessage,
+        "第一条用户消息",
+    );
+    store.append_timeline_entry(
+        session_id.clone(),
+        TimelineEntryKind::AssistantMessage,
+        "这条助手消息不计入用户消息数",
+    );
+    store.append_timeline_entry(
+        session_id.clone(),
+        TimelineEntryKind::UserMessage,
+        "第二条用户消息",
+    );
+
+    let session = store
+        .session(&session_id)
+        .expect("session should still exist after timeline append");
+    assert_eq!(session.message_count, Some(2));
+    assert!(
+        session.updated_at.0 > created.updated_at.0,
+        "追加时间线后应该刷新会话更新时间"
+    );
+}
 
 #[test]
 fn session_sidecar_store_keeps_status_and_recovery_alias() {

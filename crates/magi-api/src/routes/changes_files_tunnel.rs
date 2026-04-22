@@ -3,12 +3,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use magi_core::WorkspaceId;
+use magi_core::{MissionId, SessionId, WorkspaceId};
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use magi_bridge_client::ModelInvocationRequest;
+use magi_bridge_client::{ModelInvocationRequest, SHADOW_MODEL_PROVIDER};
 
 use crate::{errors::ApiError, state::ApiState};
 
@@ -53,6 +54,132 @@ fn resolve_workspace_root(
     Ok(PathBuf::from(workspace.root_path.as_str()))
 }
 
+fn parse_session_id(value: Option<&str>) -> Result<SessionId, ApiError> {
+    let session_id = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("sessionId 不能为空".to_string()))?;
+    Ok(SessionId::new(session_id))
+}
+
+#[derive(Clone)]
+struct SessionScopedChangeSet {
+    session_id: SessionId,
+    workspace_root: PathBuf,
+    mission_id: MissionId,
+    allowed_files: BTreeSet<String>,
+}
+
+fn collect_mission_output_files(
+    state: &ApiState,
+    mission_id: &MissionId,
+) -> Result<BTreeSet<String>, ApiError> {
+    let task_store = state
+        .task_store()
+        .ok_or_else(|| ApiError::internal_assembly("changes scope", "task_store 未配置"))?;
+    let mut files = BTreeSet::new();
+    for task in task_store.get_tasks_by_mission(mission_id) {
+        for output_ref in &task.output_refs {
+            if let Some(rel) = output_ref.strip_prefix("file:")
+                && safe_relative_path(rel).is_ok()
+            {
+                files.insert(rel.to_string());
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn resolve_session_change_scope(
+    state: &ApiState,
+    session_id_value: Option<&str>,
+    workspace_id: Option<&str>,
+    mission_id_override: Option<&str>,
+) -> Result<SessionScopedChangeSet, ApiError> {
+    let session_id = parse_session_id(session_id_value)?;
+    let ownership = state
+        .session_store
+        .execution_ownership(&session_id)
+        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+
+    let ownership_workspace_id = ownership
+        .workspace_id
+        .clone()
+        .ok_or_else(|| ApiError::InvalidInput("当前会话未绑定 workspace，不能执行变更操作".to_string()))?;
+    if let Some(requested_workspace_id) = workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && requested_workspace_id != ownership_workspace_id.as_str()
+    {
+        return Err(ApiError::InvalidInput(format!(
+            "会话 {} 不属于 workspace {}",
+            session_id, requested_workspace_id
+        )));
+    }
+
+    let bound_mission_id = ownership
+        .mission_id
+        .clone()
+        .ok_or_else(|| ApiError::InvalidInput("当前会话没有可归属的执行分组".to_string()))?;
+    let mission_id = match mission_id_override.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(mission_id) => {
+            if mission_id != bound_mission_id.as_str() {
+                return Err(ApiError::InvalidInput(format!(
+                    "执行分组 {} 不属于当前会话 {}",
+                    mission_id, session_id
+                )));
+            }
+            MissionId::new(mission_id)
+        }
+        None => bound_mission_id,
+    };
+    let allowed_files = collect_mission_output_files(state, &mission_id)?;
+    let workspace_root = resolve_workspace_root(state, Some(ownership_workspace_id.as_str()))?;
+
+    Ok(SessionScopedChangeSet {
+        session_id,
+        workspace_root,
+        mission_id,
+        allowed_files,
+    })
+}
+
+fn require_session_scoped_file<'a>(
+    scope: &SessionScopedChangeSet,
+    file_path: &'a str,
+) -> Result<&'a str, ApiError> {
+    let rel = safe_relative_path(file_path)?;
+    if !scope.allowed_files.contains(rel) {
+        return Err(ApiError::InvalidInput(format!(
+            "文件 {} 不属于当前会话 {} 的执行变更集合",
+            rel, scope.session_id
+        )));
+    }
+    Ok(rel)
+}
+
+fn run_git_restore_files(workspace_root: &Path, files: &[String]) -> Result<(), ApiError> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["restore", "--source=HEAD", "--staged", "--worktree", "--"];
+    let file_refs = files.iter().map(|file| file.as_str()).collect::<Vec<_>>();
+    args.extend(file_refs);
+    run_git(workspace_root, &args)?;
+    Ok(())
+}
+
+fn run_git_add_files(workspace_root: &Path, files: &[String]) -> Result<(), ApiError> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["add", "--"];
+    let file_refs = files.iter().map(|file| file.as_str()).collect::<Vec<_>>();
+    args.extend(file_refs);
+    run_git(workspace_root, &args)?;
+    Ok(())
+}
+
 fn safe_relative_path(file_path: &str) -> Result<&str, ApiError> {
     let path = Path::new(file_path);
     for component in path.components() {
@@ -90,22 +217,53 @@ fn run_git(workspace_root: &Path, args: &[&str]) -> Result<String, ApiError> {
 #[serde(rename_all = "camelCase")]
 struct DiffQuery {
     file_path: Option<String>,
-    #[allow(dead_code)]
     session_id: Option<String>,
     workspace_id: Option<String>,
+    execution_group_id: Option<String>,
 }
 
 async fn get_diff(
     State(state): State<ApiState>,
     Query(query): Query<DiffQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let root = resolve_workspace_root(&state, query.workspace_id.as_deref())?;
-    let diff = match query.file_path.as_deref() {
-        Some(fp) => {
-            let rel = safe_relative_path(fp)?;
-            run_git(&root, &["diff", "HEAD", "--", rel])?
+    let diff = if query
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        let scope = resolve_session_change_scope(
+            &state,
+            query.session_id.as_deref(),
+            query.workspace_id.as_deref(),
+            query.execution_group_id.as_deref(),
+        )?;
+        match query.file_path.as_deref() {
+            Some(fp) => {
+                let rel = require_session_scoped_file(&scope, fp)?;
+                run_git(&scope.workspace_root, &["diff", "HEAD", "--", rel])?
+            }
+            None => {
+                let files = scope.allowed_files.iter().map(String::as_str).collect::<Vec<_>>();
+                if files.is_empty() {
+                    String::new()
+                } else {
+                    let mut args = vec!["diff", "HEAD", "--"];
+                    args.extend(files);
+                    run_git(&scope.workspace_root, &args)?
+                }
+            }
         }
-        None => run_git(&root, &["diff", "HEAD"])?,
+    } else {
+        let root = resolve_workspace_root(&state, query.workspace_id.as_deref())?;
+        match query.file_path.as_deref() {
+            Some(fp) => {
+                let rel = safe_relative_path(fp)?;
+                run_git(&root, &["diff", "HEAD", "--", rel])?
+            }
+            None => run_git(&root, &["diff", "HEAD"])?,
+        }
     };
     Ok(Json(serde_json::json!({
         "diff": diff,
@@ -117,6 +275,7 @@ async fn get_diff(
 #[serde(rename_all = "camelCase")]
 struct ApproveChangeRequest {
     file_path: String,
+    session_id: Option<String>,
     workspace_id: Option<String>,
 }
 
@@ -124,9 +283,14 @@ async fn approve_change(
     State(state): State<ApiState>,
     Json(request): Json<ApproveChangeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let root = resolve_workspace_root(&state, request.workspace_id.as_deref())?;
-    let rel = safe_relative_path(&request.file_path)?;
-    run_git(&root, &["add", "--", rel])?;
+    let scope = resolve_session_change_scope(
+        &state,
+        request.session_id.as_deref(),
+        request.workspace_id.as_deref(),
+        None,
+    )?;
+    let rel = require_session_scoped_file(&scope, &request.file_path)?;
+    run_git(&scope.workspace_root, &["add", "--", rel])?;
     Ok(Json(serde_json::json!({
         "approved": true,
         "filePath": request.file_path,
@@ -137,6 +301,7 @@ async fn approve_change(
 #[serde(rename_all = "camelCase")]
 struct RevertChangeRequest {
     file_path: String,
+    session_id: Option<String>,
     workspace_id: Option<String>,
 }
 
@@ -144,9 +309,14 @@ async fn revert_change(
     State(state): State<ApiState>,
     Json(request): Json<RevertChangeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let root = resolve_workspace_root(&state, request.workspace_id.as_deref())?;
-    let rel = safe_relative_path(&request.file_path)?;
-    run_git(&root, &["restore", "--source=HEAD", "--staged", "--worktree", "--", rel])?;
+    let scope = resolve_session_change_scope(
+        &state,
+        request.session_id.as_deref(),
+        request.workspace_id.as_deref(),
+        None,
+    )?;
+    let rel = require_session_scoped_file(&scope, &request.file_path)?;
+    run_git(&scope.workspace_root, &["restore", "--source=HEAD", "--staged", "--worktree", "--", rel])?;
     Ok(Json(serde_json::json!({
         "reverted": true,
         "filePath": request.file_path,
@@ -156,6 +326,7 @@ async fn revert_change(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApproveAllRequest {
+    session_id: Option<String>,
     workspace_id: Option<String>,
 }
 
@@ -163,14 +334,21 @@ async fn approve_all_changes(
     State(state): State<ApiState>,
     Json(request): Json<ApproveAllRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let root = resolve_workspace_root(&state, request.workspace_id.as_deref())?;
-    run_git(&root, &["add", "-A"])?;
+    let scope = resolve_session_change_scope(
+        &state,
+        request.session_id.as_deref(),
+        request.workspace_id.as_deref(),
+        None,
+    )?;
+    let approved_files = scope.allowed_files.iter().cloned().collect::<Vec<_>>();
+    run_git_add_files(&scope.workspace_root, &approved_files)?;
     Ok(Json(serde_json::json!({ "approved": true })))
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RevertAllRequest {
+    session_id: Option<String>,
     workspace_id: Option<String>,
 }
 
@@ -178,8 +356,14 @@ async fn revert_all_changes(
     State(state): State<ApiState>,
     Json(request): Json<RevertAllRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let root = resolve_workspace_root(&state, request.workspace_id.as_deref())?;
-    run_git(&root, &["restore", "--source=HEAD", "--staged", "--worktree", "--", "."])?;
+    let scope = resolve_session_change_scope(
+        &state,
+        request.session_id.as_deref(),
+        request.workspace_id.as_deref(),
+        None,
+    )?;
+    let reverted_files = scope.allowed_files.iter().cloned().collect::<Vec<_>>();
+    run_git_restore_files(&scope.workspace_root, &reverted_files)?;
     Ok(Json(serde_json::json!({ "reverted": true })))
 }
 
@@ -187,6 +371,7 @@ async fn revert_all_changes(
 #[serde(rename_all = "camelCase")]
 struct RevertExecutionGroupRequest {
     execution_group_id: String,
+    session_id: Option<String>,
     workspace_id: Option<String>,
 }
 
@@ -194,29 +379,20 @@ async fn revert_execution_group_changes(
     State(state): State<ApiState>,
     Json(request): Json<RevertExecutionGroupRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let root = resolve_workspace_root(&state, request.workspace_id.as_deref())?;
-
-    let task_store = state
-        .task_store()
-        .ok_or_else(|| ApiError::internal_assembly("revert execution group", "task_store 未配置"))?;
-    let mission_id = magi_core::MissionId::new(&request.execution_group_id);
-    let tasks = task_store.get_tasks_by_mission(&mission_id);
-
-    let mut reverted_files: Vec<String> = Vec::new();
-    for task in &tasks {
-        for output_ref in &task.output_refs {
-            if let Some(rel) = output_ref.strip_prefix("file:") {
-                if safe_relative_path(rel).is_ok() {
-                    let _ = run_git(&root, &["restore", "--source=HEAD", "--staged", "--worktree", "--", rel]);
-                    reverted_files.push(rel.to_string());
-                }
-            }
-        }
+    let scope = resolve_session_change_scope(
+        &state,
+        request.session_id.as_deref(),
+        request.workspace_id.as_deref(),
+        Some(request.execution_group_id.as_str()),
+    )?;
+    if scope.mission_id.as_str() != request.execution_group_id {
+        return Err(ApiError::InvalidInput(format!(
+            "执行分组 {} 不属于当前会话 {}",
+            request.execution_group_id, scope.session_id
+        )));
     }
-
-    if reverted_files.is_empty() {
-        run_git(&root, &["restore", "--source=HEAD", "--staged", "--worktree", "--", "."])?;
-    }
+    let reverted_files = scope.allowed_files.iter().cloned().collect::<Vec<_>>();
+    run_git_restore_files(&scope.workspace_root, &reverted_files)?;
 
     Ok(Json(serde_json::json!({
         "reverted": true,
@@ -233,6 +409,7 @@ struct FileContentQuery {
     file_path: Option<String>,
     session_id: Option<String>,
     workspace_id: Option<String>,
+    execution_group_id: Option<String>,
 }
 
 async fn get_file_content(
@@ -240,9 +417,26 @@ async fn get_file_content(
     Query(query): Query<FileContentQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let content = if let Some(ref path) = query.file_path {
-        let root = resolve_workspace_root(&state, query.workspace_id.as_deref())?;
-        let rel = safe_relative_path(path)?;
-        let file_path = root.join(rel);
+        let file_path = if query
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+        {
+            let scope = resolve_session_change_scope(
+                &state,
+                query.session_id.as_deref(),
+                query.workspace_id.as_deref(),
+                query.execution_group_id.as_deref(),
+            )?;
+            let rel = require_session_scoped_file(&scope, path)?;
+            scope.workspace_root.join(rel)
+        } else {
+            let root = resolve_workspace_root(&state, query.workspace_id.as_deref())?;
+            let rel = safe_relative_path(path)?;
+            root.join(rel)
+        };
         std::fs::read_to_string(&file_path)
             .map_err(|e| ApiError::internal_assembly("读取文件内容失败", e))?
     } else {
@@ -471,7 +665,7 @@ async fn enhance_prompt(
     };
 
     let invocation = ModelInvocationRequest {
-        provider: "default".to_string(),
+        provider: SHADOW_MODEL_PROVIDER.to_string(),
         prompt: format!(
             "请优化以下用户 prompt，使其更清晰、具体、可执行。只输出优化后的 prompt，不要添加额外解释。\n\n原始 prompt:\n{}",
             request.prompt
@@ -490,5 +684,249 @@ async fn enhance_prompt(
         Err(error) => Err(ApiError::InvalidInput(format!(
             "增强提示词失败: {error}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ApiState;
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use magi_core::{AbsolutePath, ExecutionOwnership, SessionId, TaskId, TaskKind, TaskStatus, UtcMillis};
+    use magi_event_bus::InMemoryEventBus;
+    use magi_governance::GovernanceService;
+    use magi_orchestrator::task_store::TaskStore;
+    use magi_session_store::SessionStore;
+    use magi_workspace::WorkspaceStore;
+    use std::fs;
+    use std::process::Command;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn build_test_repo() -> String {
+        let repo_root = std::env::temp_dir().join(format!(
+            "magi-changes-route-test-{}",
+            UtcMillis::now().0
+        ));
+        fs::create_dir_all(&repo_root).expect("repo root should create");
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&repo_root)
+            .output()
+            .expect("git init should run");
+        Command::new("git")
+            .args(["config", "user.email", "codex@example.com"])
+            .current_dir(&repo_root)
+            .output()
+            .expect("git email config should run");
+        Command::new("git")
+            .args(["config", "user.name", "Codex"])
+            .current_dir(&repo_root)
+            .output()
+            .expect("git name config should run");
+        fs::write(repo_root.join("a.txt"), "alpha\n").expect("a.txt should write");
+        fs::write(repo_root.join("b.txt"), "beta\n").expect("b.txt should write");
+        Command::new("git")
+            .args(["add", "--", "a.txt", "b.txt"])
+            .current_dir(&repo_root)
+            .output()
+            .expect("git add should run");
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&repo_root)
+            .output()
+            .expect("git commit should run");
+        fs::write(repo_root.join("a.txt"), "alpha changed\n").expect("a.txt should update");
+        fs::write(repo_root.join("b.txt"), "beta changed\n").expect("b.txt should update");
+        repo_root.to_string_lossy().to_string()
+    }
+
+    fn build_state_with_repo(repo_root: &str) -> ApiState {
+        let event_bus = Arc::new(InMemoryEventBus::new(32));
+        let session_store = Arc::new(SessionStore::default());
+        let workspace_store = Arc::new(WorkspaceStore::default());
+        let governance = Arc::new(GovernanceService::default());
+        let task_store = Arc::new(TaskStore::new());
+        let state = ApiState::new(
+            "magi-test",
+            event_bus,
+            Arc::clone(&session_store),
+            Arc::clone(&workspace_store),
+            governance,
+        )
+        .with_task_store(Arc::clone(&task_store));
+
+        let workspace_id = WorkspaceId::new("workspace-session-scope");
+        state
+            .workspace_registry
+            .register(workspace_id.clone(), AbsolutePath::new(repo_root))
+            .expect("workspace should register");
+
+        let session_a = SessionId::new("session-a");
+        let session_b = SessionId::new("session-b");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_a.clone(),
+                "会话 A",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session a should create");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_b.clone(),
+                "会话 B",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session b should create");
+
+        state.session_store.bind_execution_ownership(
+            session_a.clone(),
+            ExecutionOwnership {
+                session_id: Some(session_a),
+                workspace_id: Some(workspace_id.clone()),
+                mission_id: Some(MissionId::new("mission-a")),
+                ..ExecutionOwnership::default()
+            },
+        );
+        state.session_store.bind_execution_ownership(
+            session_b.clone(),
+            ExecutionOwnership {
+                session_id: Some(session_b),
+                workspace_id: Some(workspace_id),
+                mission_id: Some(MissionId::new("mission-b")),
+                ..ExecutionOwnership::default()
+            },
+        );
+
+        task_store.insert_task(magi_core::Task {
+            task_id: TaskId::new("task-a"),
+            mission_id: MissionId::new("mission-a"),
+            root_task_id: TaskId::new("task-a"),
+            parent_task_id: None,
+            kind: TaskKind::Action,
+            title: "A".to_string(),
+            goal: "A".to_string(),
+            status: TaskStatus::Completed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: vec!["file:a.txt".to_string()],
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: UtcMillis::now(),
+            updated_at: UtcMillis::now(),
+        });
+        task_store.insert_task(magi_core::Task {
+            task_id: TaskId::new("task-b"),
+            mission_id: MissionId::new("mission-b"),
+            root_task_id: TaskId::new("task-b"),
+            parent_task_id: None,
+            kind: TaskKind::Action,
+            title: "B".to_string(),
+            goal: "B".to_string(),
+            status: TaskStatus::Completed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: vec!["file:b.txt".to_string()],
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: UtcMillis::now(),
+            updated_at: UtcMillis::now(),
+        });
+
+        state
+    }
+
+    #[tokio::test]
+    async fn approve_all_changes_is_limited_to_current_session_files() {
+        let repo_root = build_test_repo();
+        let state = build_state_with_repo(&repo_root);
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/changes/approve-all")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sessionId": "session-a",
+                            "workspaceId": "workspace-session-scope"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let staged = Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&repo_root)
+            .output()
+            .expect("git diff --cached should run");
+        let staged_paths = String::from_utf8_lossy(&staged.stdout);
+        assert!(staged_paths.contains("a.txt"));
+        assert!(!staged_paths.contains("b.txt"));
+    }
+
+    #[tokio::test]
+    async fn revert_execution_group_rejects_cross_session_mission() {
+        let repo_root = build_test_repo();
+        let state = build_state_with_repo(&repo_root);
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/changes/revert-execution-group")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sessionId": "session-a",
+                            "workspaceId": "workspace-session-scope",
+                            "executionGroupId": "mission-b"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        let message = payload["message"].as_str().unwrap_or_default();
+        assert!(message.contains("不属于当前会话"));
     }
 }

@@ -254,6 +254,19 @@ pub struct ToolRuntimeSummaryEntry {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionRuntimeBranchSummaryEntry {
+    pub task_id: String,
+    pub worker_id: String,
+    pub status: String,
+    pub stage: String,
+    pub lease_id: Option<String>,
+    pub execution_intent_ref: Option<String>,
+    pub binding_lifecycle: Option<String>,
+    pub last_checkpoint_at: Option<UtcMillis>,
+    pub is_primary: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SessionRuntimeSummaryEntry {
     pub session_id: String,
     pub event_count: usize,
@@ -267,8 +280,14 @@ pub struct SessionRuntimeSummaryEntry {
     pub recovery_ids: Vec<String>,
     pub current_status: Option<String>,
     pub last_update: Option<UtcMillis>,
+    pub mission_id: Option<String>,
+    pub root_task_id: Option<String>,
+    pub root_task_status: Option<String>,
     pub execution_chain_ref: Option<String>,
     pub recovery_ref: Option<String>,
+    pub has_recoverable_chain: bool,
+    pub recoverable_branch_count: usize,
+    pub active_branches: Vec<SessionRuntimeBranchSummaryEntry>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -924,6 +943,8 @@ impl RuntimeReadModelInput {
         let mut governance_approval_required_worker_ids = Vec::new();
         let mut governance_rejected_worker_ids = Vec::new();
         for event in events {
+            let resolved_mission_id = event_mission_id(event);
+            let resolved_task_id = event_task_id(event);
             match event.category {
                 EventCategory::Domain => category_counts.domain += 1,
                 EventCategory::Audit => category_counts.audit += 1,
@@ -931,7 +952,7 @@ impl RuntimeReadModelInput {
                 EventCategory::Projection => category_counts.projection += 1,
                 EventCategory::System => category_counts.system += 1,
             }
-            if event.mission_id.is_some() {
+            if resolved_mission_id.is_some() {
                 summary.execution_group_event_count += 1;
             }
             if event.event_type.starts_with("worker.") {
@@ -973,11 +994,11 @@ impl RuntimeReadModelInput {
                 session_entry.latest_event_type = Some(event.event_type.clone());
                 collect_unique_option_string(
                     &mut session_entry.active_execution_group_ids,
-                    event.mission_id.as_ref().map(ToString::to_string),
+                    resolved_mission_id.clone(),
                 );
                 collect_unique_option_string(
                     &mut session_entry.active_task_ids,
-                    event.task_id.as_ref().map(ToString::to_string),
+                    resolved_task_id.clone(),
                 );
                 collect_unique_payload_value(&mut session_entry.recovery_ids, &event.payload, "recovery_id");
             }
@@ -1005,11 +1026,11 @@ impl RuntimeReadModelInput {
                 workspace_entry.latest_event_type = Some(event.event_type.clone());
                 collect_unique_option_string(
                     &mut workspace_entry.active_execution_group_ids,
-                    event.mission_id.as_ref().map(ToString::to_string),
+                    resolved_mission_id.clone(),
                 );
                 collect_unique_option_string(
                     &mut workspace_entry.active_task_ids,
-                    event.task_id.as_ref().map(ToString::to_string),
+                    resolved_task_id.clone(),
                 );
                 collect_unique_payload_value(
                     &mut workspace_entry.recovery_ids,
@@ -1022,7 +1043,7 @@ impl RuntimeReadModelInput {
                     "execution_chain_ref",
                 );
             }
-            if let Some(mission_id) = event.mission_id.as_ref() {
+            if let Some(mission_id) = resolved_mission_id.as_ref() {
                 let mission_id = mission_id.to_string();
                 if !summary
                     .active_execution_group_ids
@@ -1111,14 +1132,14 @@ impl RuntimeReadModelInput {
                         nested_usize_field(context, "provenance_linked_memory_count");
                 }
                 mission_entry.latest_event_type = Some(event.event_type.clone());
-                if let Some(task_id) = event.task_id.as_ref() {
+                if let Some(task_id) = resolved_task_id.as_ref() {
                     let task_id = task_id.to_string();
                     if !mission_entry.active_task_ids.iter().any(|id| id == &task_id) {
                         mission_entry.active_task_ids.push(task_id);
                     }
                 }
             }
-            if let Some(task_id) = event.task_id.as_ref() {
+            if let Some(task_id) = resolved_task_id.as_ref() {
                 let task_id = task_id.to_string();
                 if !summary.active_task_ids.iter().any(|id| id == &task_id) {
                     summary.active_task_ids.push(task_id.clone());
@@ -1126,7 +1147,7 @@ impl RuntimeReadModelInput {
                 let task_entry = task_map.entry(task_id.clone()).or_insert_with(|| {
                     TaskRuntimeSummaryEntry {
                         task_id: task_id.clone(),
-                        mission_id: event.mission_id.as_ref().map(ToString::to_string),
+                        mission_id: resolved_mission_id.clone(),
                         assignment_id: event.assignment_id.as_ref().map(ToString::to_string),
                         ..TaskRuntimeSummaryEntry::default()
                     }
@@ -1178,7 +1199,7 @@ impl RuntimeReadModelInput {
                 if event.category == EventCategory::Audit {
                     assignment_entry.audit_event_count += 1;
                 }
-                if let Some(task_id) = event.task_id.as_ref() {
+                if let Some(task_id) = resolved_task_id.as_ref() {
                     let task_id = task_id.to_string();
                     if !assignment_entry.task_ids.iter().any(|id| id == &task_id) {
                         assignment_entry.task_ids.push(task_id);
@@ -1773,6 +1794,15 @@ impl RuntimeReadModelInput {
 }
 
 fn infer_task_status(event: &EventEnvelope) -> Option<String> {
+    if event.event_type == "task.status.changed" {
+        if let Some(status) = event
+            .payload
+            .get("new_status")
+            .and_then(|value| value.as_str())
+        {
+            return Some(status.to_ascii_lowercase());
+        }
+    }
     if let Some(status) = event.payload.get("status").and_then(|value| value.as_str()) {
         return Some(status.to_ascii_lowercase());
     }
@@ -1785,6 +1815,48 @@ fn infer_task_status(event: &EventEnvelope) -> Option<String> {
         | "worker.resumed.from_dispatch" => Some("running".to_string()),
         _ => None,
     }
+}
+
+fn event_task_id(event: &EventEnvelope) -> Option<String> {
+    event
+        .task_id
+        .as_ref()
+        .map(ToString::to_string)
+        .or_else(|| {
+            event
+                .payload
+                .get("task_id")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            event
+                .payload
+                .get("taskId")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+        })
+}
+
+fn event_mission_id(event: &EventEnvelope) -> Option<String> {
+    event
+        .mission_id
+        .as_ref()
+        .map(ToString::to_string)
+        .or_else(|| {
+            event
+                .payload
+                .get("mission_id")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            event
+                .payload
+                .get("missionId")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+        })
 }
 
 fn infer_assignment_status(event: &EventEnvelope) -> Option<String> {
@@ -2245,5 +2317,47 @@ mod tests {
             vec!["extract-a".to_string(), "extract-z".to_string()]
         );
         assert_eq!(read_model.overview.diagnostics.context_execution_group_count, 1);
+    }
+
+    #[test]
+    fn task_status_changed_updates_runtime_task_status_to_terminal() {
+        let mut task_dispatched = EventEnvelope::domain(
+            EventId::new("event-task-dispatched"),
+            "task.dispatched",
+            json!({}),
+        )
+        .with_context(EventContext {
+            mission_id: Some(MissionId::new("mission-1")),
+            task_id: Some(TaskId::new("task-1")),
+            session_id: Some(SessionId::new("session-1")),
+            ..EventContext::default()
+        });
+        task_dispatched.sequence = 1;
+
+        let mut task_completed = crate::task_events::task_status_changed_event(
+            "task-1",
+            "mission-1",
+            "Running",
+            "Completed",
+            "Action",
+        );
+        task_completed.sequence = 2;
+
+        let read_model = RuntimeReadModelInput::from_events(&[task_dispatched, task_completed]);
+        let task = read_model
+            .details
+            .tasks
+            .iter()
+            .find(|entry| entry.task_id == "task-1")
+            .expect("task runtime entry should exist");
+        assert_eq!(task.current_status.as_deref(), Some("completed"));
+
+        let mission = read_model
+            .details
+            .execution_groups
+            .iter()
+            .find(|entry| entry.mission_id == "mission-1")
+            .expect("mission runtime entry should exist");
+        assert_eq!(mission.current_status.as_deref(), Some("succeeded"));
     }
 }

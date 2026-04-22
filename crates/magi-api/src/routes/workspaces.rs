@@ -31,6 +31,17 @@ struct WorkspaceListResponse {
     workspaces: Vec<WorkspaceDto>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceSessionDto {
+    session_id: String,
+    title: String,
+    status: String,
+    created_at: u64,
+    updated_at: u64,
+    message_count: usize,
+}
+
 async fn list_workspaces(
     State(state): State<ApiState>,
 ) -> Json<WorkspaceListResponse> {
@@ -132,14 +143,165 @@ async fn workspace_sessions(
             let Some(ref workspace_id) = workspace_id else {
                 return true;
             };
-            session_sidecars.iter().find(|sidecar| sidecar.session_id == session.session_id)
+            if session.workspace_id.as_deref() == Some(workspace_id.as_str()) {
+                return true;
+            }
+            session_sidecars
+                .iter()
+                .find(|sidecar| sidecar.session_id == session.session_id)
                 .and_then(|sidecar| sidecar.ownership.workspace_id.as_ref())
                 == Some(workspace_id)
-        }).map(|s| serde_json::json!({
-            "sessionId": s.session_id.to_string(),
-            "title": s.title,
-            "status": format!("{:?}", s.status),
-            "createdAt": s.created_at.0,
-        })).collect::<Vec<_>>(),
+        }).map(|session| WorkspaceSessionDto {
+            session_id: session.session_id.to_string(),
+            title: session.title.clone(),
+            status: format!("{:?}", session.status),
+            created_at: session.created_at.0,
+            updated_at: session.updated_at.0,
+            message_count: session.message_count.unwrap_or(0),
+        }).collect::<Vec<_>>(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ApiState;
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use magi_core::{AbsolutePath, ExecutionOwnership, SessionId, WorkspaceId};
+    use magi_event_bus::InMemoryEventBus;
+    use magi_governance::GovernanceService;
+    use magi_session_store::{SessionStore, TimelineEntryKind};
+    use magi_workspace::WorkspaceStore;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn test_state() -> ApiState {
+        ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+    }
+
+    #[tokio::test]
+    async fn workspace_sessions_returns_user_message_count_and_updated_at() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-count");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-workspace-count"),
+            )
+            .expect("workspace should register");
+
+        let session_id = SessionId::new("session-counted");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "会话计数",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        state.session_store.bind_execution_ownership(
+            session_id.clone(),
+            ExecutionOwnership {
+                session_id: Some(session_id.clone()),
+                workspace_id: Some(workspace_id.clone()),
+                ..ExecutionOwnership::default()
+            },
+        );
+        state.session_store.append_timeline_entry(
+            session_id.clone(),
+            TimelineEntryKind::UserMessage,
+            "第一条用户消息",
+        );
+        state.session_store.append_timeline_entry(
+            session_id.clone(),
+            TimelineEntryKind::AssistantMessage,
+            "助手回复不应计入会话消息数",
+        );
+        state.session_store.append_timeline_entry(
+            session_id.clone(),
+            TimelineEntryKind::UserMessage,
+            "第二条用户消息",
+        );
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/workspaces/sessions?workspaceId=workspace-count")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        let sessions = payload["sessions"]
+            .as_array()
+            .expect("sessions should be an array");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "session-counted");
+        assert_eq!(sessions[0]["messageCount"], 2);
+        assert!(sessions[0]["updatedAt"].as_u64().unwrap_or_default() > 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_sessions_includes_workspace_bound_session_without_runtime_sidecar() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-session-list");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-workspace-session-list"),
+            )
+            .expect("workspace should register");
+
+        let session_id = SessionId::new("session-workspace-bound");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "仅绑定工作区的会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/workspaces/sessions?workspaceId=workspace-session-list")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        let sessions = payload["sessions"]
+            .as_array()
+            .expect("sessions should be an array");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "session-workspace-bound");
+    }
 }

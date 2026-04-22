@@ -28,6 +28,7 @@ blockRegistry.register('text', TextBlockRenderer);
 blockRegistry.register('code', CodeBlockRenderer);
 blockRegistry.register('thinking', ThinkingBlockRenderer);
 blockRegistry.register('tool_call', ToolCallRenderer);
+blockRegistry.register('tool_result', ToolCallRenderer);
 blockRegistry.register('file_change', FileChangeCard);
 blockRegistry.register('plan', PlanCard);
 blockRegistry.register('dispatch_group', DispatchGroupRenderer);

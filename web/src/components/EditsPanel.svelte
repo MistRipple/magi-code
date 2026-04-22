@@ -145,21 +145,27 @@
     }
   }
   function approveChange(filePath: string) {
+    const sessionId = getCurrentSessionId() || undefined;
     if (isWebMode) {
       fetch(`${resolveAgentBaseUrl()}/api/changes/approve`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath }),
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath, sessionId }),
       }).catch(console.error);
     } else {
-      vscode.postMessage({ type: 'approveChange', filePath });
+      vscode.postMessage({ type: 'approveChange', filePath, sessionId });
     }
   }
   function revertChange(filePath: string) {
+    const sessionId = getCurrentSessionId() || undefined;
     if (isWebMode) {
       fetch(`${resolveAgentBaseUrl()}/api/changes/revert`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath }),
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath, sessionId }),
       }).catch(console.error);
     } else {
-      vscode.postMessage({ type: 'revertChange', filePath });
+      vscode.postMessage({ type: 'revertChange', filePath, sessionId });
     }
   }
   async function viewDiff(filePath: string) {
@@ -192,29 +198,40 @@
     }
   }
   function approveAllChanges() {
+    const sessionId = getCurrentSessionId() || undefined;
     if (isWebMode) {
-      fetch(`${resolveAgentBaseUrl()}/api/changes/approve-all`, { method: 'POST' }).catch(console.error);
+      fetch(`${resolveAgentBaseUrl()}/api/changes/approve-all`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId }),
+      }).catch(console.error);
     } else {
-      vscode.postMessage({ type: 'approveAllChanges' });
+      vscode.postMessage({ type: 'approveAllChanges', sessionId });
     }
   }
   function revertAllChanges() {
+    const sessionId = getCurrentSessionId() || undefined;
     if (isWebMode) {
-      fetch(`${resolveAgentBaseUrl()}/api/changes/revert-all`, { method: 'POST' }).catch(console.error);
+      fetch(`${resolveAgentBaseUrl()}/api/changes/revert-all`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId }),
+      }).catch(console.error);
     } else {
-      vscode.postMessage({ type: 'revertAllChanges' });
+      vscode.postMessage({ type: 'revertAllChanges', sessionId });
     }
   }
   function revertExecutionGroup() {
     if (!latestExecutionGroupId) return;
+    const sessionId = getCurrentSessionId() || undefined;
     if (isWebMode) {
       fetch(`${resolveAgentBaseUrl()}/api/changes/revert-execution-group`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ executionGroupId: latestExecutionGroupId }),
+        body: JSON.stringify({ executionGroupId: latestExecutionGroupId, sessionId }),
       }).catch(console.error);
     } else {
-      vscode.postMessage({ type: 'revertExecutionGroup', executionGroupId: latestExecutionGroupId });
+      vscode.postMessage({ type: 'revertExecutionGroup', executionGroupId: latestExecutionGroupId, sessionId });
     }
   }
 

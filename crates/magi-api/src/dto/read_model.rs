@@ -1,8 +1,11 @@
 use magi_event_bus::{
     AuditUsageLedgerStatus, RecoveryActivityStage, RecoveryDiagnosticSummaryEntry,
-    RuntimeLedgerSummary, RuntimeReadModelInput, SessionRuntimeSummaryEntry,
+    RuntimeLedgerSummary, RuntimeReadModelInput, SessionRuntimeBranchSummaryEntry,
+    SessionRuntimeSummaryEntry,
     WorkspaceRuntimeSummaryEntry,
 };
+use magi_core::TaskStatus;
+use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecarExport};
 use magi_workspace::{RecoveryStatus, WorkspaceRecoverySidecarExport};
 
@@ -14,9 +17,10 @@ pub fn runtime_read_model_dto(
     session_sidecar_exports: &[SessionRuntimeSidecarExport],
     workspace_sidecar_exports: &[WorkspaceRecoverySidecarExport],
     audit_usage_ledger: AuditUsageLedgerDto,
+    task_store: Option<&TaskStore>,
 ) -> RuntimeReadModelDto {
     let mut runtime_read_model = runtime_read_model;
-    merge_session_sidecars(&mut runtime_read_model, session_sidecar_exports);
+    merge_session_sidecars(&mut runtime_read_model, session_sidecar_exports, task_store);
     merge_workspace_sidecars(&mut runtime_read_model, workspace_sidecar_exports);
     runtime_read_model.meta.ledger = audit_usage_ledger;
     runtime_read_model
@@ -30,6 +34,7 @@ pub fn ledger_dto(status: AuditUsageLedgerStatus) -> AuditUsageLedgerDto {
 fn merge_session_sidecars(
     runtime_read_model: &mut RuntimeReadModelInput,
     session_sidecar_exports: &[SessionRuntimeSidecarExport],
+    task_store: Option<&TaskStore>,
 ) {
     for export in session_sidecar_exports {
         let session_id = export.session_id.to_string();
@@ -65,15 +70,51 @@ fn merge_session_sidecars(
         entry.last_update = Some(export.last_update);
         entry.execution_chain_ref = export.execution_chain_ref.clone();
         entry.recovery_ref = export.recovery_ref.clone();
-        push_unique(
-            &mut entry.active_execution_group_ids,
-            export.ownership.mission_id.as_ref().map(ToString::to_string),
-        );
-        push_unique(
-            &mut entry.active_task_ids,
-            export.ownership.task_id.as_ref().map(ToString::to_string),
-        );
-        push_unique(&mut entry.recovery_ids, export.recovery_ref.clone());
+        entry.active_branches.clear();
+        entry.has_recoverable_chain = false;
+        entry.recoverable_branch_count = 0;
+        entry.mission_id = None;
+        entry.root_task_id = None;
+        entry.root_task_status = None;
+        if let Some(chain) = export.active_execution_chain.as_ref() {
+            entry.mission_id = Some(chain.mission_id.to_string());
+            entry.root_task_id = Some(chain.root_task_id.to_string());
+            entry.execution_chain_ref = Some(chain.execution_chain_ref.clone());
+            entry.recovery_ref = chain.recovery_ref.clone().or(export.recovery_ref.clone());
+            entry.root_task_status = task_store
+                .and_then(|store| store.get_task(&chain.root_task_id))
+                .map(|task| task_status_label(&task.status));
+            entry.active_branches = chain
+                .branches
+                .iter()
+                .map(|branch| session_branch_summary(branch, task_store))
+                .collect();
+            entry.recoverable_branch_count = entry
+                .active_branches
+                .iter()
+                .filter(|branch| branch_status_is_recoverable(branch.status.as_str()))
+                .count();
+            entry.has_recoverable_chain = entry.recoverable_branch_count > 0;
+            push_unique(
+                &mut entry.active_execution_group_ids,
+                Some(chain.mission_id.to_string()),
+            );
+            for task_id in &chain.active_branch_task_ids {
+                push_unique(&mut entry.active_task_ids, Some(task_id.to_string()));
+            }
+            push_unique(&mut entry.recovery_ids, chain.recovery_ref.clone());
+        }
+        if session_sidecar_is_runtime_active(export) {
+            push_unique(
+                &mut entry.active_execution_group_ids,
+                export.ownership.mission_id.as_ref().map(ToString::to_string),
+            );
+            push_unique(
+                &mut entry.active_task_ids,
+                export.ownership.task_id.as_ref().map(ToString::to_string),
+            );
+            push_unique(&mut entry.recovery_ids, export.recovery_ref.clone());
+        }
     }
 
     runtime_read_model
@@ -87,7 +128,71 @@ fn merge_session_sidecars(
         entry.active_task_ids.dedup();
         entry.recovery_ids.sort();
         entry.recovery_ids.dedup();
+        entry.active_branches.sort_by(|left, right| {
+            left.task_id
+                .cmp(&right.task_id)
+                .then_with(|| left.worker_id.cmp(&right.worker_id))
+        });
     }
+}
+
+fn session_branch_summary(
+    branch: &magi_session_store::ActiveExecutionBranch,
+    task_store: Option<&TaskStore>,
+) -> SessionRuntimeBranchSummaryEntry {
+    let status = task_store
+        .and_then(|store| store.get_task(&branch.task_id))
+        .map(|task| task_status_label(&task.status))
+        .unwrap_or_else(|| "unknown".to_string());
+    SessionRuntimeBranchSummaryEntry {
+        task_id: branch.task_id.to_string(),
+        worker_id: branch.worker_id.to_string(),
+        status,
+        stage: branch.stage.clone(),
+        lease_id: branch.lease_id.as_ref().map(ToString::to_string),
+        execution_intent_ref: branch.execution_intent_ref.clone(),
+        binding_lifecycle: branch.binding_lifecycle.clone(),
+        last_checkpoint_at: Some(branch.last_checkpoint_at),
+        is_primary: branch.is_primary,
+    }
+}
+
+fn task_status_label(status: &TaskStatus) -> String {
+    match status {
+        TaskStatus::Draft => "draft",
+        TaskStatus::Ready => "ready",
+        TaskStatus::Running => "running",
+        TaskStatus::AwaitingApproval => "awaiting_approval",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+        TaskStatus::Blocked => "blocked",
+        TaskStatus::Verifying => "verifying",
+        TaskStatus::Repairing => "repairing",
+        TaskStatus::Skipped => "skipped",
+    }
+    .to_string()
+}
+
+fn branch_status_is_recoverable(status: &str) -> bool {
+    matches!(
+        status,
+        "draft"
+            | "ready"
+            | "running"
+            | "blocked"
+            | "failed"
+            | "verifying"
+            | "repairing"
+            | "awaiting_approval"
+    )
+}
+
+fn session_sidecar_is_runtime_active(export: &SessionRuntimeSidecarExport) -> bool {
+    matches!(
+        export.current_status,
+        SessionExecutionSidecarStatus::RecoveryLinked | SessionExecutionSidecarStatus::Resumed
+    )
 }
 
 fn merge_workspace_sidecars(
@@ -268,6 +373,7 @@ mod tests {
                 },
                 execution_chain_ref: Some("chain-1".to_string()),
                 recovery_ref: Some("recovery-1".to_string()),
+                active_execution_chain: None,
             }],
             &[WorkspaceRecoverySidecarExport {
                 recovery_ref: "recovery-1".to_string(),
@@ -293,6 +399,7 @@ mod tests {
                 persistence_path: None,
                 last_persist_error: None,
             }),
+            None,
         );
 
         assert_eq!(runtime_read_model.details.sessions.len(), 1);
@@ -331,6 +438,7 @@ mod tests {
             &[],
             &[],
             audit_usage_ledger.clone(),
+            None,
         );
 
         assert_eq!(
@@ -381,6 +489,7 @@ mod tests {
                 },
             ],
             ledger_dto(AuditUsageLedgerStatus::default()),
+            None,
         );
 
         assert_eq!(
@@ -437,6 +546,7 @@ mod tests {
                 consumed_at: Some(UtcMillis::now()),
             }],
             ledger_dto(AuditUsageLedgerStatus::default()),
+            None,
         );
 
         assert_eq!(runtime_read_model.recovery.summaries.len(), 1);
@@ -488,6 +598,7 @@ mod tests {
                 consumed_at: Some(UtcMillis(99)),
             }],
             ledger_dto(AuditUsageLedgerStatus::default()),
+            None,
         );
 
         assert_eq!(runtime_read_model.recovery.summaries.len(), 1);
@@ -499,5 +610,37 @@ mod tests {
         assert_eq!(summary.diagnostic_summary.as_deref(), Some("resume detail"));
         assert_eq!(summary.worker_id.as_deref(), Some("worker-outcome-1"));
         assert_eq!(summary.execution_chain_ref.as_deref(), Some("chain-outcome-1"));
+    }
+
+    #[test]
+    fn bound_session_sidecar_does_not_mark_runtime_session_active() {
+        let runtime_read_model = runtime_read_model_dto(
+            RuntimeReadModelInput::default(),
+            &[SessionRuntimeSidecarExport {
+                session_id: SessionId::new("session-bound"),
+                current_status: SessionExecutionSidecarStatus::Bound,
+                last_update: UtcMillis::now(),
+                ownership: ExecutionOwnership {
+                    mission_id: Some(magi_core::MissionId::new("mission-bound")),
+                    task_id: Some(magi_core::TaskId::new("task-bound")),
+                    ..ExecutionOwnership::default()
+                },
+                execution_chain_ref: Some("chain-bound".to_string()),
+                recovery_ref: None,
+                active_execution_chain: None,
+            }],
+            &[],
+            ledger_dto(AuditUsageLedgerStatus::default()),
+            None,
+        );
+
+        assert_eq!(runtime_read_model.details.sessions.len(), 1);
+        let session = &runtime_read_model.details.sessions[0];
+        assert_eq!(session.session_id, "session-bound");
+        assert_eq!(session.current_status.as_deref(), Some("bound"));
+        assert!(session.active_execution_group_ids.is_empty());
+        assert!(session.active_task_ids.is_empty());
+        assert!(session.recovery_ids.is_empty());
+        assert_eq!(session.execution_chain_ref.as_deref(), Some("chain-bound"));
     }
 }

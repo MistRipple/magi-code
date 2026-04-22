@@ -3,7 +3,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use magi_core::{EventId, TaskId, TaskStatus, UtcMillis};
+use magi_core::{EventId, SessionId, TaskId, TaskStatus, UtcMillis};
 use magi_event_bus::EventEnvelope;
 use serde::Deserialize;
 use serde_json::json;
@@ -17,7 +17,6 @@ pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/task/append", post(append_task))
         .route("/task/start", post(start_task))
-        .route("/task/resume", post(resume_task))
         .route("/task/delete", post(delete_task))
         .route("/task/interrupt", post(interrupt_task))
         .route("/task/clear-all", post(clear_all_tasks))
@@ -30,11 +29,49 @@ pub fn routes() -> Router<ApiState> {
         .route("/chain/abandon", post(abandon_chain))
 }
 
+fn parse_session_id(value: Option<&str>) -> Result<SessionId, ApiError> {
+    let session_id = value
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("sessionId 不能为空".to_string()))?;
+    Ok(SessionId::new(session_id))
+}
+
+fn require_session_owned_task(
+    state: &ApiState,
+    session_id_value: Option<&str>,
+    task_id: &str,
+) -> Result<(SessionId, magi_core::Task), ApiError> {
+    let session_id = parse_session_id(session_id_value)?;
+    let ownership = state
+        .session_store
+        .execution_ownership(&session_id)
+        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+    let mission_id = ownership
+        .mission_id
+        .ok_or_else(|| ApiError::InvalidInput("当前会话没有活跃任务链".to_string()))?;
+    let store = state
+        .task_store()
+        .ok_or_else(|| ApiError::internal_assembly("session task guard", "task_store 未配置"))?;
+    let tid = TaskId::new(task_id);
+    let task = store
+        .get_task(&tid)
+        .ok_or_else(|| ApiError::not_found("任务不存在", task_id))?;
+    if task.mission_id != mission_id {
+        return Err(ApiError::InvalidInput(format!(
+            "任务 {} 不属于当前会话 {}",
+            task_id, session_id
+        )));
+    }
+    Ok((session_id, task))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AppendTaskRequest {
     task_id: String,
     content: String,
+    session_id: Option<String>,
 }
 
 async fn append_task(
@@ -43,14 +80,13 @@ async fn append_task(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let now = UtcMillis::now();
     let event_id = EventId::new(format!("event-task-append-{}", now.0));
-    let tid = TaskId::new(&request.task_id);
+    let (_session_id, task) =
+        require_session_owned_task(&state, request.session_id.as_deref(), &request.task_id)?;
+    let tid = task.task_id.clone();
 
     let store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("append task", "task_store 未配置"))?;
-    if store.get_task(&tid).is_none() {
-        return Err(ApiError::not_found("任务不存在", &request.task_id));
-    }
     let input_ref = format!("text:{}", request.content);
     store
         .append_input_ref(&tid, input_ref)
@@ -82,6 +118,7 @@ async fn append_task(
 #[serde(rename_all = "camelCase")]
 struct TaskIdRequest {
     task_id: String,
+    session_id: Option<String>,
 }
 
 async fn start_task(
@@ -91,14 +128,11 @@ async fn start_task(
     let now = UtcMillis::now();
     let event_id = EventId::new(format!("event-task-start-{}", now.0));
     let task_id = request.task_id;
-    let tid = TaskId::new(&task_id);
-
+    let (_session_id, task) = require_session_owned_task(&state, request.session_id.as_deref(), &task_id)?;
     let store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("start task", "task_store 未配置"))?;
-    let task = store
-        .get_task(&tid)
-        .ok_or_else(|| ApiError::not_found("任务不存在", &task_id))?;
+    let tid = task.task_id.clone();
     if task.status != TaskStatus::Draft {
         return Err(ApiError::InvalidInput("当前任务状态不支持启动".to_string()));
     }
@@ -136,57 +170,6 @@ async fn start_task(
     })))
 }
 
-async fn resume_task(
-    State(state): State<ApiState>,
-    Json(request): Json<TaskIdRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let now = UtcMillis::now();
-    let event_id = EventId::new(format!("event-task-resume-{}", now.0));
-    let task_id = request.task_id;
-    let tid = TaskId::new(&task_id);
-
-    let store = state
-        .task_store()
-        .ok_or_else(|| ApiError::internal_assembly("resume task", "task_store 未配置"))?;
-    let task = store
-        .get_task(&tid)
-        .ok_or_else(|| ApiError::not_found("任务不存在", &task_id))?;
-    if task.status != TaskStatus::Failed && task.status != TaskStatus::Blocked {
-        return Err(ApiError::InvalidInput("当前任务状态不支持恢复".to_string()));
-    }
-    store
-        .update_status(&tid, TaskStatus::Ready)
-        .map_err(|error| ApiError::internal_assembly("恢复任务状态更新失败", error))?;
-    let manager = state
-        .runner_manager()
-        .ok_or_else(|| ApiError::internal_assembly("resume task", "runner_manager 未配置"))?;
-    manager
-        .start(&task_id)
-        .map_err(|error| ApiError::internal_assembly("恢复任务 Runner 启动失败", format!("{error:?}")))?;
-
-    let event = EventEnvelope::domain(
-        event_id.clone(),
-        "task.resume.requested",
-        json!({
-            "taskId": task_id.clone(),
-            "requestedAt": now.0,
-        }),
-    );
-    state
-        .event_bus
-        .publish(event)
-        .map_err(|err| ApiError::event_publish_failed("恢复任务事件发布失败", err))?;
-
-    Ok(Json(json!({
-        "taskId": task_id,
-        "resumed": true,
-        "storeUpdated": true,
-        "runnerStarted": true,
-        "eventId": event_id.to_string(),
-        "requestedAt": now.0,
-    })))
-}
-
 async fn delete_task(
     State(state): State<ApiState>,
     Json(request): Json<TaskIdRequest>,
@@ -198,10 +181,8 @@ async fn delete_task(
     let store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("delete task", "task_store 未配置"))?;
-    let tid = TaskId::new(&task_id);
-    if store.get_task(&tid).is_none() {
-        return Err(ApiError::not_found("任务不存在", &task_id));
-    }
+    let (_session_id, task) = require_session_owned_task(&state, request.session_id.as_deref(), &task_id)?;
+    let tid = task.task_id.clone();
     store
         .update_status(&tid, TaskStatus::Cancelled)
         .map_err(|error| ApiError::internal_assembly("删除任务状态更新失败", error))?;
@@ -231,42 +212,41 @@ async fn delete_task(
     })))
 }
 
-/// 中断任务：通过事件总线发布中断请求事件
-///
-/// 将中断请求转发给事件总线，由下游订阅者处理实际的中断逻辑。
-/// 如果 TaskStore 可用，同时更新任务状态为 Cancelled 并撤销活跃租约。
+/// 中断任务：暂停原执行树，而不是取消当前 task。
 async fn interrupt_task(
     State(state): State<ApiState>,
-    Json(request): Json<serde_json::Value>,
+    Json(request): Json<TaskIdRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let now = UtcMillis::now();
     let event_id = EventId::new(format!("event-task-interrupt-{}", now.0));
 
-    let task_id = request
-        .get("taskId")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("taskId 不能为空".to_string()))?;
+    let task_id = request.task_id.trim();
+    if task_id.is_empty() {
+        return Err(ApiError::InvalidInput("taskId 不能为空".to_string()));
+    }
     let store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("interrupt task", "task_store 未配置"))?;
-    let tid = TaskId::new(task_id);
-    if store.get_task(&tid).is_none() {
-        return Err(ApiError::not_found("任务不存在", task_id));
-    }
-    store
-        .update_status(&tid, TaskStatus::Cancelled)
+    let (_session_id, task) = require_session_owned_task(&state, request.session_id.as_deref(), task_id)?;
+    let root_task_id = task.root_task_id.clone();
+    let manager = state
+        .runner_manager()
+        .ok_or_else(|| ApiError::internal_assembly("interrupt task", "runner_manager 未配置"))?;
+    manager
+        .pause_tree(root_task_id.as_str())
         .map_err(|error| ApiError::internal_assembly("中断任务状态更新失败", error))?;
-    if let Some(lease) = store.get_active_lease(&tid) {
-        store.revoke_lease(&tid, &lease.lease_id);
+    for subtree_task_id in store.collect_subtree_ids(&root_task_id) {
+        if let Some(lease) = store.get_active_lease(&subtree_task_id) {
+            store.revoke_lease(&subtree_task_id, &lease.lease_id);
+        }
     }
 
     let event = EventEnvelope::domain(
         event_id.clone(),
         "task.interrupt.requested",
         json!({
-            "request": request,
+            "taskId": task_id,
+            "rootTaskId": root_task_id.to_string(),
             "requestedAt": now.0,
         }),
     );
@@ -283,21 +263,41 @@ async fn interrupt_task(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClearAllTasksRequest {
+    session_id: Option<String>,
+}
+
 async fn clear_all_tasks(
     State(state): State<ApiState>,
+    Json(request): Json<ClearAllTasksRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let now = UtcMillis::now();
     let event_id = EventId::new(format!("event-task-clear-all-{}", now.0));
+    let session_id = parse_session_id(request.session_id.as_deref())?;
+    let ownership = state
+        .session_store
+        .execution_ownership(&session_id)
+        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+    let mission_id = ownership
+        .mission_id
+        .ok_or_else(|| ApiError::InvalidInput("当前会话没有可清理的任务链".to_string()))?;
 
     let store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("clear all tasks", "task_store 未配置"))?;
-    store.clear_all();
+    let tasks = store.get_tasks_by_mission(&mission_id);
+    for task in tasks {
+        let _ = store.update_status(&task.task_id, TaskStatus::Cancelled);
+        let _ = store.remove_task(&task.task_id);
+    }
 
     let event = EventEnvelope::domain(
         event_id.clone(),
         "task.clear-all.requested",
         json!({
+            "sessionId": session_id.to_string(),
             "requestedAt": now.0,
         }),
     );

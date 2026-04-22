@@ -19,7 +19,14 @@ use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BootstrapAgentDto {
+    pub runtime_epoch: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BootstrapDto {
+    pub agent: BootstrapAgentDto,
     pub service: ServiceInfo,
     pub generated_at: UtcMillis,
     pub current_session: Option<SessionRecord>,
@@ -46,6 +53,7 @@ impl BootstrapDto {
         requested_session_id: Option<&SessionId>,
     ) -> Self {
         Self::from_projection(
+            state.runtime_epoch().to_string(),
             state.service_info.clone(),
             select_session_projection(
                 state.session_store.projection_input(),
@@ -59,11 +67,13 @@ impl BootstrapDto {
             state.audit_usage_ledger_dto(),
             state.bridge_services_dto(),
             state.bridge_preflight_dto(),
+            state.task_store(),
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn from_projection(
+        runtime_epoch: String,
         service: ServiceInfo,
         session_projection: SessionProjectionInput,
         workspace_projection: WorkspaceProjectionInput,
@@ -74,6 +84,7 @@ impl BootstrapDto {
         audit_usage_ledger: AuditUsageLedgerDto,
         bridge_services: BridgeServicesSnapshotDto,
         bridge_preflight: BridgePreflightSnapshotDto,
+        task_store: Option<&magi_orchestrator::task_store::TaskStore>,
     ) -> Self {
         let current_session = session_projection.current_session_id.as_ref().and_then(|session_id| {
             session_projection
@@ -87,9 +98,11 @@ impl BootstrapDto {
             &session_sidecar_exports,
             &workspace_sidecar_exports,
             audit_usage_ledger.clone(),
+            task_store,
         );
 
         Self {
+            agent: BootstrapAgentDto { runtime_epoch },
             service,
             generated_at: UtcMillis::now(),
             current_session,
@@ -121,6 +134,12 @@ fn select_session_projection(
         .any(|session| session.session_id == *requested_session_id)
     {
         session_projection.current_session_id = Some(requested_session_id.clone());
+        session_projection
+            .timeline
+            .retain(|entry| entry.session_id == *requested_session_id);
+        session_projection
+            .notifications
+            .retain(|notification| notification.session_id == *requested_session_id);
     }
     session_projection
 }
@@ -142,6 +161,10 @@ mod tests {
             service_name: "magi".to_string(),
             api_version: "v0-shadow".to_string(),
         }
+    }
+
+    fn runtime_epoch() -> String {
+        "runtime-test".to_string()
     }
 
     fn empty_session_projection() -> SessionProjectionInput {
@@ -198,6 +221,7 @@ mod tests {
     #[test]
     fn bootstrap_from_projection_merges_sidecar_exports_into_runtime_read_model() {
         let bootstrap = BootstrapDto::from_projection(
+            runtime_epoch(),
             service_info(),
             empty_session_projection(),
             empty_workspace_projection(),
@@ -212,6 +236,7 @@ mod tests {
                 },
                 execution_chain_ref: Some("chain-1".to_string()),
                 recovery_ref: Some("recovery-1".to_string()),
+                active_execution_chain: None,
             }],
             vec![WorkspaceRecoverySidecarExport {
                 recovery_ref: "recovery-1".to_string(),
@@ -234,6 +259,7 @@ mod tests {
             AuditUsageLedgerDto::default(),
             BridgeServicesSnapshotDto::default(),
             BridgePreflightSnapshotDto::default(),
+            None,
         );
 
         assert_eq!(bootstrap.runtime_read_model.details.sessions.len(), 1);
@@ -261,6 +287,7 @@ mod tests {
         };
 
         let bootstrap = BootstrapDto::from_projection(
+            runtime_epoch(),
             service_info(),
             empty_session_projection(),
             empty_workspace_projection(),
@@ -271,6 +298,7 @@ mod tests {
             AuditUsageLedgerDto::default(),
             BridgeServicesSnapshotDto::default(),
             BridgePreflightSnapshotDto::default(),
+            None,
         );
 
         assert_eq!(
@@ -293,6 +321,7 @@ mod tests {
         };
 
         let bootstrap = BootstrapDto::from_projection(
+            runtime_epoch(),
             service_info(),
             empty_session_projection(),
             empty_workspace_projection(),
@@ -303,6 +332,7 @@ mod tests {
             AuditUsageLedgerDto::default(),
             BridgeServicesSnapshotDto::default(),
             BridgePreflightSnapshotDto::default(),
+            None,
         );
 
         assert_eq!(
@@ -338,6 +368,7 @@ mod tests {
         audit_usage_ledger.refresh_readiness();
 
         let bootstrap = BootstrapDto::from_projection(
+            runtime_epoch(),
             service_info(),
             empty_session_projection(),
             empty_workspace_projection(),
@@ -348,6 +379,7 @@ mod tests {
             audit_usage_ledger,
             BridgeServicesSnapshotDto::default(),
             BridgePreflightSnapshotDto::default(),
+            None,
         );
 
         assert_eq!(
@@ -367,6 +399,7 @@ mod tests {
     #[test]
     fn bootstrap_consumes_usage_ledger_updates_into_runtime_read_model() {
         let bootstrap = BootstrapDto::from_projection(
+            runtime_epoch(),
             service_info(),
             empty_session_projection(),
             empty_workspace_projection(),
@@ -384,10 +417,100 @@ mod tests {
             }),
             BridgeServicesSnapshotDto::default(),
             BridgePreflightSnapshotDto::default(),
+            None,
         );
 
         assert_eq!(bootstrap.audit_usage_ledger.next_sequence, 12);
         assert_eq!(bootstrap.runtime_read_model.meta.ledger.next_sequence, 12);
         assert_eq!(bootstrap.runtime_read_model.meta.ledger.usage_count, 7);
+    }
+
+    #[test]
+    fn bootstrap_from_state_with_selected_session_filters_timeline_and_notifications() {
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(32));
+        let session_store = Arc::new(SessionStore::default());
+        let workspace_store = Arc::new(WorkspaceStore::default());
+        let governance = Arc::new(GovernanceService::default());
+        let state = ApiState::new(
+            "magi",
+            event_bus,
+            session_store.clone(),
+            workspace_store,
+            governance,
+        );
+
+        let session_a = SessionId::new("session-a");
+        let session_b = SessionId::new("session-b");
+        session_store
+            .create_session(session_a.clone(), "Session A")
+            .expect("session a should be creatable");
+        session_store
+            .create_session(session_b.clone(), "Session B")
+            .expect("session b should be creatable");
+        session_store.append_timeline_entry(
+            session_a.clone(),
+            magi_session_store::TimelineEntryKind::UserMessage,
+            "message-a",
+        );
+        session_store.append_timeline_entry(
+            session_b.clone(),
+            magi_session_store::TimelineEntryKind::UserMessage,
+            "message-b",
+        );
+        session_store.append_notification(
+            session_a.clone(),
+            "notification-a",
+            "toast",
+            "notify-a",
+        );
+        session_store.append_notification(
+            session_b.clone(),
+            "notification-b",
+            "toast",
+            "notify-b",
+        );
+
+        let bootstrap = BootstrapDto::from_state_with_selected_session(&state, Some(&session_a));
+
+        assert_eq!(
+            bootstrap.current_session.as_ref().map(|session| session.session_id.clone()),
+            Some(session_a.clone())
+        );
+        assert!(
+            bootstrap
+                .timeline
+                .iter()
+                .all(|entry| entry.session_id == session_a)
+        );
+        assert!(
+            bootstrap
+                .notifications
+                .iter()
+                .all(|notification| notification.session_id == session_a)
+        );
+        assert!(
+            bootstrap
+                .timeline
+                .iter()
+                .any(|entry| entry.message == "message-a")
+        );
+        assert!(
+            bootstrap
+                .timeline
+                .iter()
+                .all(|entry| entry.message != "message-b")
+        );
+        assert!(
+            bootstrap
+                .notifications
+                .iter()
+                .any(|notification| notification.message == "notify-a")
+        );
+        assert!(
+            bootstrap
+                .notifications
+                .iter()
+                .all(|notification| notification.message != "notify-b")
+        );
     }
 }

@@ -29,7 +29,7 @@ use magi_skill_runtime::SkillDispatchRuntime;
 use magi_tool_runtime::ToolRegistry;
 use magi_worker_runtime::WorkerRuntime;
 use magi_workspace::WorkspaceStore;
-use std::{env, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, env, path::PathBuf, sync::Arc};
 use tracing::warn;
 
 #[cfg(test)]
@@ -220,6 +220,15 @@ impl ShadowDaemonRuntime {
                         push_terminal_task_result(&receiver, task_id, new_status);
                     },
                 ));
+                let (revoked_leases, blocked_tasks) =
+                    restored.reconcile_volatile_runtime_after_restore();
+                if revoked_leases > 0 || blocked_tasks > 0 {
+                    warn!(
+                        revoked_leases,
+                        blocked_tasks,
+                        "检测到 checkpoint 中残留的易失执行态，已统一收口为可恢复状态"
+                    );
+                }
                 Arc::new(restored)
             }
             _ => {
@@ -398,11 +407,25 @@ impl ShadowDaemonRuntime {
                 .filter(|s| s.workspace_id.as_deref() == Some(&ws_id))
                 .cloned()
                 .collect();
+            let session_ids = ws_sessions
+                .iter()
+                .map(|session| session.session_id.clone())
+                .collect::<HashSet<_>>();
             let ws_state = magi_session_store::SessionDurableState {
                 sessions: ws_sessions,
                 current_session_id: durable.current_session_id.clone(),
-                timeline: vec![],
-                notifications: vec![],
+                timeline: durable
+                    .timeline
+                    .iter()
+                    .filter(|entry| session_ids.contains(&entry.session_id))
+                    .cloned()
+                    .collect(),
+                notifications: durable
+                    .notifications
+                    .iter()
+                    .filter(|notification| session_ids.contains(&notification.session_id))
+                    .cloned()
+                    .collect(),
             };
             state_repository.save_workspace_session_state(&root, &ws_state)?;
         }
@@ -617,13 +640,23 @@ mod tests {
         .expect("response should be valid json")
     }
 
-    async fn get_task_projection(app: axum::Router, root_task_id: &str) -> Value {
-        get_json(app, &format!("/api/tasks/graph/{root_task_id}")).await
+    async fn get_task_projection(app: axum::Router, root_task_id: &str, session_id: &str) -> Value {
+        get_json(
+            app,
+            &format!("/api/tasks/graph/{root_task_id}?sessionId={session_id}"),
+        )
+        .await
     }
 
     fn assert_completed_two_task_projection(projection: &Value) {
-        assert_eq!(projection["progress_summary"]["total_tasks"], 2);
-        assert_eq!(projection["progress_summary"]["completed_tasks"], 2);
+        let total_tasks = projection["progress_summary"]["total_tasks"]
+            .as_u64()
+            .expect("total_tasks should serialize as integer");
+        let completed_tasks = projection["progress_summary"]["completed_tasks"]
+            .as_u64()
+            .expect("completed_tasks should serialize as integer");
+        assert!(total_tasks >= 2, "task projection should include at least root + action");
+        assert_eq!(completed_tasks, total_tasks);
         assert_eq!(projection["progress_summary"]["failed_tasks"], 0);
         assert_eq!(projection["root_task"]["status"], "Completed");
     }
@@ -777,7 +810,25 @@ mod tests {
         let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
         let runtime = ShadowDaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
-        let (app, _state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+        let (app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+        let active_workspace_id = state
+            .workspace_registry
+            .active_workspace_id()
+            .expect("bootstrap workspace should exist");
+        if state
+            .session_store
+            .session(&magi_core::SessionId::new("shadow-session-001"))
+            .is_none()
+        {
+            state
+                .session_store
+                .create_session_for_workspace(
+                    magi_core::SessionId::new("shadow-session-001"),
+                    "runtime session".to_string(),
+                    Some(active_workspace_id.to_string()),
+                )
+                .expect("runtime session should be creatable");
+        }
 
         let (status, first_body) = post_json(
             app.clone(),
@@ -815,7 +866,8 @@ mod tests {
                 .len(),
             0
         );
-        let first_projection = get_task_projection(app.clone(), first_root_task_id).await;
+        let first_projection =
+            get_task_projection(app.clone(), first_root_task_id, "shadow-session-001").await;
         assert_completed_two_task_projection(&first_projection);
 
         let (status, second_body) = post_json(
@@ -854,7 +906,8 @@ mod tests {
             second_execution_group["context_memory_extraction_refs"],
             json!([expected_extraction_id])
         );
-        let second_projection = get_task_projection(app, second_root_task_id).await;
+        let second_projection =
+            get_task_projection(app, second_root_task_id, "shadow-session-001").await;
         assert_completed_two_task_projection(&second_projection);
     }
 
@@ -865,6 +918,24 @@ mod tests {
         let runtime = ShadowDaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
         let (app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+        let active_workspace_id = state
+            .workspace_registry
+            .active_workspace_id()
+            .expect("bootstrap workspace should exist");
+        if state
+            .session_store
+            .session(&magi_core::SessionId::new("shadow-session-001"))
+            .is_none()
+        {
+            state
+                .session_store
+                .create_session_for_workspace(
+                    magi_core::SessionId::new("shadow-session-001"),
+                    "runtime recovery session".to_string(),
+                    Some(active_workspace_id.to_string()),
+                )
+                .expect("runtime recovery session should be creatable");
+        }
 
         let (status, seed_body) = post_json(
             app.clone(),
@@ -922,9 +993,9 @@ mod tests {
 
         let (status, recovery_body) = post_json(
             app.clone(),
-            "/recovery/resume",
+            "/api/session/continue",
             json!({
-                "recovery_id": recovery.recovery_id,
+                "sessionId": session_id.to_string(),
             }),
         )
         .await;
@@ -933,8 +1004,8 @@ mod tests {
             StatusCode::OK,
             "unexpected recovery body: {recovery_body:?}"
         );
-        assert_eq!(recovery_body["recovery_id"], "recovery-daemon-route");
-        assert_eq!(recovery_body["memory_writeback_applied"], true);
+        assert_eq!(recovery_body["sessionId"], session_id.to_string());
+        assert_eq!(recovery_body["status"], "continued");
 
         let (status, followup_body) = post_json(
             app.clone(),

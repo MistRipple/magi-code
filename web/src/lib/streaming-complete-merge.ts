@@ -68,6 +68,8 @@ function buildStructuredBlockFingerprint(block: ContentBlock): string | null {
   switch (block.type) {
     case 'tool_call':
       return block.toolCall?.id ? `tool_call:${block.toolCall.id}` : null;
+    case 'tool_result':
+      return block.toolCall?.id ? `tool_result:${block.toolCall.id}:${block.toolCall.error || block.toolCall.result || block.content || ''}` : null;
     case 'thinking': {
       const blockId = block.id || block.thinking?.blockId;
       return blockId ? `thinking:${blockId}` : null;

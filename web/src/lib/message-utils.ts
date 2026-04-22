@@ -166,11 +166,42 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
           result: block.output,
           error: block.error || standardizedError,
           standardized: block.standardized,
+          durationMs: typeof block.duration === 'number' && Number.isFinite(block.duration)
+            ? Math.max(0, Math.floor(block.duration))
+            : undefined,
         };
         return {
           type: 'tool_call',
           content: '',
           toolCall,
+        };
+      }
+      case 'tool_result': {
+        const resolvedContent = (typeof block.content === 'string' ? block.content : '').trim()
+          || (typeof block.standardized?.message === 'string' ? block.standardized.message.trim() : '');
+        const toolStatus = mapToolResultStatus(block.isError, block.standardized?.status);
+        const toolCall: ToolCall = {
+          id: block.toolCallId,
+          name: block.standardized?.toolName || 'tool_result',
+          arguments: {},
+          status: toolStatus,
+          result: toolStatus === 'error' ? undefined : (resolvedContent || undefined),
+          error: toolStatus === 'error' ? (resolvedContent || undefined) : undefined,
+          standardized: block.standardized,
+        };
+        return {
+          type: 'tool_result',
+          content: resolvedContent,
+          toolCall,
+          fileChange: block.fileChange
+            ? {
+                filePath: block.fileChange.filePath,
+                changeType: block.fileChange.changeType,
+                additions: block.fileChange.additions,
+                deletions: block.fileChange.deletions,
+                diff: block.fileChange.diff,
+              }
+            : undefined,
         };
       }
       case 'file_change':
@@ -280,6 +311,23 @@ function mapToolStatus(
   if (error) return 'error';
   if (output) return 'success';
   return 'running';
+}
+
+function mapToolResultStatus(
+  isError: boolean | undefined,
+  standardizedStatus?: string,
+): ToolCall['status'] {
+  if (isError === true) {
+    return 'error';
+  }
+  switch ((standardizedStatus || '').toLowerCase()) {
+    case 'error':
+    case 'timeout':
+    case 'killed':
+      return 'error';
+    default:
+      return 'success';
+  }
 }
 
 export function formatPlanBlock(block: any): string {

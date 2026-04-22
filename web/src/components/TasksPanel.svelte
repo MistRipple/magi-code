@@ -23,7 +23,8 @@
   const threadMessages = $derived(ensureArray(appState.threadMessages) as Message[]);
 
   // ─── Task Graph Projection (new Task-based view) ─────────────────
-  const taskGraph = getTaskGraphState();
+  const currentSessionId = $derived(appState.currentSessionId);
+  const taskGraph = $derived(getTaskGraphState(currentSessionId));
   const hasTaskProjection = $derived(taskGraph.projection !== null);
   const projectionProgress = $derived.by(() => {
     const p = taskGraph.projection?.progress_summary;
@@ -94,23 +95,24 @@
   const rootTaskId = $derived(taskGraph.rootTaskId);
 
   async function pollRunnerStatus() {
-    if (!rootTaskId) return;
+    if (!rootTaskId || !currentSessionId) return;
     try {
       const client = createClient();
-      runnerStatus = await client.getRunnerStatus(rootTaskId);
+      runnerStatus = await client.getRunnerStatus(rootTaskId, currentSessionId);
       runnerError = null;
-    } catch {
+    } catch (error) {
       // Non-critical: runner may not exist yet
+      runnerStatus = null;
     }
   }
 
   async function handleStartRunner() {
-    if (!rootTaskId || runnerLoading) return;
+    if (!rootTaskId || !currentSessionId || runnerLoading) return;
     runnerLoading = true;
     runnerError = null;
     try {
       const client = createClient();
-      await client.startRunner({ rootTaskId });
+      await client.startRunner({ rootTaskId, sessionId: currentSessionId });
       await pollRunnerStatus();
       startRunnerPolling();
     } catch (err) {
@@ -121,12 +123,12 @@
   }
 
   async function handleStopRunner() {
-    if (!rootTaskId || runnerLoading) return;
+    if (!rootTaskId || !currentSessionId || runnerLoading) return;
     runnerLoading = true;
     runnerError = null;
     try {
       const client = createClient();
-      await client.stopRunner({ rootTaskId });
+      await client.stopRunner({ rootTaskId, sessionId: currentSessionId });
       await pollRunnerStatus();
       stopRunnerPolling();
     } catch (err) {
@@ -154,6 +156,12 @@
 
   // Auto-poll runner status when root task is set and auto-start polling if runner is running
   $effect(() => {
+    if (!rootTaskId || !currentSessionId) {
+      runnerStatus = null;
+      runnerError = null;
+      stopRunnerPolling();
+      return () => { stopRunnerPolling(); };
+    }
     if (rootTaskId) {
       pollRunnerStatus().then(() => {
         if (isRunnerActive) {
@@ -174,7 +182,7 @@
     try {
       const client = createClient();
       await client.updateTaskStatus(taskId, 'Completed');
-      await refreshTaskProjection();
+      await refreshTaskProjection(currentSessionId);
     } catch (err) {
       console.error('Failed to approve decision:', err);
     } finally {
@@ -191,7 +199,7 @@
     try {
       const client = createClient();
       await client.updateTaskStatus(taskId, 'Failed');
-      await refreshTaskProjection();
+      await refreshTaskProjection(currentSessionId);
     } catch (err) {
       console.error('Failed to reject decision:', err);
     } finally {
@@ -413,8 +421,6 @@
           {#if runnerStatus.cycleCount > 0}
             <span class="runner-cycles">Cycle {runnerStatus.cycleCount}</span>
           {/if}
-        {:else}
-          <span class="runner-status runner-status--stopped">Stopped</span>
         {/if}
         {#if runnerError}
           <span class="runner-error-text" title={runnerError}>Error</span>

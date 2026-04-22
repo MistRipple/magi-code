@@ -43,8 +43,6 @@ import type {
   McpServersResponseDto,
   McpToolsResponseDto,
   MessagesResponseDto,
-  RecoveryResumeRequestDto,
-  RecoveryResumeResponseDto,
   RegisterWorkspaceRequestDto,
   RegisterWorkspaceResponseDto,
   RemoveNotificationRequestDto,
@@ -73,6 +71,8 @@ import type {
   SavedResponseDto,
   SessionActionRequestDto,
   SessionActionResponseDto,
+  SessionContinueRequestDto,
+  SessionContinueResponseDto,
   SessionCloseRequestDto,
   SessionDeleteRequestDto,
   SessionNotificationsResponseDto,
@@ -89,7 +89,6 @@ import type {
   TaskIdRequestDto,
   TaskInterruptResponseDto,
   TaskProjectionDto,
-  TaskResumeResponseDto,
   TaskStartResponseDto,
   TaskStatus,
   UpdatedResponseDto,
@@ -164,10 +163,10 @@ export class RustDaemonClient {
     return this.postJson<SessionActionResponseDto>('/session/action', request);
   }
 
-  public async resumeRecovery(
-    request: RecoveryResumeRequestDto,
-  ): Promise<RecoveryResumeResponseDto> {
-    return this.postJson<RecoveryResumeResponseDto>('/recovery/resume', request);
+  public async continueSession(
+    request: SessionContinueRequestDto,
+  ): Promise<SessionContinueResponseDto> {
+    return this.postJson<SessionContinueResponseDto>('/api/session/continue', request);
   }
 
   public async interruptTask(
@@ -182,12 +181,6 @@ export class RustDaemonClient {
     request: TaskIdRequestDto,
   ): Promise<TaskStartResponseDto> {
     return this.postJson<TaskStartResponseDto>('/api/task/start', request);
-  }
-
-  public async resumeTask(
-    request: TaskIdRequestDto,
-  ): Promise<TaskResumeResponseDto> {
-    return this.postJson<TaskResumeResponseDto>('/api/task/resume', request);
   }
 
   public async deleteTask(
@@ -660,15 +653,19 @@ export class RustDaemonClient {
 
   // ─── Task Graph ────────────────────────────────────────────────────
 
-  public async getTaskProjection(rootTaskId: string): Promise<TaskProjectionDto> {
+  public async getTaskProjection(rootTaskId: string, sessionId: string): Promise<TaskProjectionDto> {
+    const query = new URLSearchParams();
+    query.set('sessionId', sessionId);
     return this.getJson<TaskProjectionDto>(
-      `/api/tasks/graph/${encodeURIComponent(rootTaskId)}`,
+      `/api/tasks/graph/${encodeURIComponent(rootTaskId)}?${query.toString()}`,
     );
   }
 
-  public async getTask(taskId: string): Promise<TaskDto> {
+  public async getTask(taskId: string, sessionId: string): Promise<TaskDto> {
+    const query = new URLSearchParams();
+    query.set('sessionId', sessionId);
     return this.getJson<TaskDto>(
-      `/api/tasks/${encodeURIComponent(taskId)}`,
+      `/api/tasks/${encodeURIComponent(taskId)}?${query.toString()}`,
     );
   }
 
@@ -689,9 +686,11 @@ export class RustDaemonClient {
     );
   }
 
-  public async getTaskLease(taskId: string): Promise<AssignmentLeaseDto> {
+  public async getTaskLease(taskId: string, sessionId: string): Promise<AssignmentLeaseDto> {
+    const query = new URLSearchParams();
+    query.set('sessionId', sessionId);
     return this.getJson<AssignmentLeaseDto>(
-      `/api/tasks/${encodeURIComponent(taskId)}/lease`,
+      `/api/tasks/${encodeURIComponent(taskId)}/lease?${query.toString()}`,
     );
   }
 
@@ -711,9 +710,12 @@ export class RustDaemonClient {
 
   public async getRunnerStatus(
     rootTaskId: string,
+    sessionId: string,
   ): Promise<RunnerStatusResponseDto> {
+    const query = new URLSearchParams();
+    query.set('sessionId', sessionId);
     return this.getJson<RunnerStatusResponseDto>(
-      `/api/tasks/runner/status/${encodeURIComponent(rootTaskId)}`,
+      `/api/tasks/runner/status/${encodeURIComponent(rootTaskId)}?${query.toString()}`,
     );
   }
 

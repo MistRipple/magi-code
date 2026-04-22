@@ -1,8 +1,10 @@
 /**
- * Task Graph Store - fetches and caches Task Projection data from the Rust backend.
+ * Task Graph Store - 以 session 为边界缓存 Task Projection。
  *
- * Uses Svelte 5 runes for reactive state management.
- * Provides task tree data from TaskProjectionDto for the new Task-based UI.
+ * 设计约束：
+ * - 任务图、Runner 轮询、SSE 刷新都必须绑定当前会话 session
+ * - 不再保留全局唯一 rootTaskId / projection
+ * - workspace 仍然共用同一条事件流，但刷新按 session-keyed 状态执行
  */
 
 import type {
@@ -15,187 +17,288 @@ import { RustDaemonClient } from '../shared/rust-daemon-client';
 import { resolveAgentBaseUrl } from '../web/agent-api';
 import { onBridgeMessage } from '../shared/bridges/bridge-runtime';
 
-// ─── Types ──────────────────────────────────────────────────────────
-
 export interface TaskGraphState {
-  /** The full projection DTO from the backend, if loaded. */
   projection: TaskProjectionDto | null;
-  /** Active leases keyed by task_id. */
   leases: Map<string, AssignmentLeaseDto>;
-  /** Whether a fetch is in progress. */
   loading: boolean;
-  /** Last error message, if any. */
   error: string | null;
-  /** The root task ID being tracked, or null if none. */
   rootTaskId: string | null;
 }
 
-// ─── Singleton reactive state ───────────────────────────────────────
+interface InternalSessionTaskGraphState extends TaskGraphState {
+  fetchGeneration: number;
+  refreshAfterLoad: boolean;
+}
 
-let _projection = $state<TaskProjectionDto | null>(null);
-let _leases = $state<Map<string, AssignmentLeaseDto>>(new Map());
-let _loading = $state(false);
-let _error = $state<string | null>(null);
-let _rootTaskId = $state<string | null>(null);
-let _refreshTimer: ReturnType<typeof setInterval> | null = null;
-let _sseUnsubscribe: (() => void) | null = null;
-let _sseDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+const EMPTY_LEASES = new Map<string, AssignmentLeaseDto>();
+const EMPTY_TASK_GRAPH_STATE: TaskGraphState = {
+  projection: null,
+  leases: EMPTY_LEASES,
+  loading: false,
+  error: null,
+  rootTaskId: null,
+};
 const SSE_DEBOUNCE_MS = 300;
+const SETTLE_REFRESH_DELAY_MS = 1500;
 
-// ─── Helpers ────────────────────────────────────────────────────────
+let sessionStates = $state<Record<string, InternalSessionTaskGraphState>>({});
+let refreshTimer: ReturnType<typeof setInterval> | null = null;
+let settleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let sseUnsubscribe: (() => void) | null = null;
+let sseDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+function normalizeSessionKey(sessionId: string | null | undefined): string {
+  return typeof sessionId === 'string' ? sessionId.trim() : '';
+}
 
 function createClient(): RustDaemonClient {
   return new RustDaemonClient(resolveAgentBaseUrl());
 }
 
-// ─── Public API ─────────────────────────────────────────────────────
-
-/**
- * Returns the current reactive task graph state.
- * Read individual fields inside Svelte components to get fine-grained reactivity.
- */
-export function getTaskGraphState(): TaskGraphState {
+function createEmptyInternalState(): InternalSessionTaskGraphState {
   return {
-    get projection() { return _projection; },
-    get leases() { return _leases; },
-    get loading() { return _loading; },
-    get error() { return _error; },
-    get rootTaskId() { return _rootTaskId; },
+    projection: null,
+    leases: new Map(),
+    loading: false,
+    error: null,
+    rootTaskId: null,
+    fetchGeneration: 0,
+    refreshAfterLoad: false,
   };
 }
 
-/**
- * Fetch the Task Projection for the given root task ID.
- * Also fetches active leases for any Running tasks in the projection.
- */
-export async function fetchTaskProjection(rootTaskId: string): Promise<void> {
-  _rootTaskId = rootTaskId;
-  _loading = true;
-  _error = null;
+function ensureSessionState(sessionId: string): InternalSessionTaskGraphState {
+  if (!sessionStates[sessionId]) {
+    sessionStates = {
+      ...sessionStates,
+      [sessionId]: createEmptyInternalState(),
+    };
+  }
+  return sessionStates[sessionId];
+}
+
+function readSessionState(sessionId: string): InternalSessionTaskGraphState | null {
+  return sessionStates[sessionId] ?? null;
+}
+
+function trackedSessionIds(): string[] {
+  return Object.entries(sessionStates)
+    .filter(([, state]) => Boolean(state?.rootTaskId))
+    .map(([sessionId]) => sessionId);
+}
+
+async function refreshTrackedSessions(): Promise<void> {
+  const sessions = trackedSessionIds();
+  await Promise.all(sessions.map((sessionId) => refreshTaskProjection(sessionId)));
+}
+
+export function getTaskGraphState(sessionId: string | null | undefined): TaskGraphState {
+  const normalizedSessionId = normalizeSessionKey(sessionId);
+  return {
+    get projection() {
+      return normalizedSessionId
+        ? (readSessionState(normalizedSessionId)?.projection ?? EMPTY_TASK_GRAPH_STATE.projection)
+        : EMPTY_TASK_GRAPH_STATE.projection;
+    },
+    get leases() {
+      return normalizedSessionId
+        ? (readSessionState(normalizedSessionId)?.leases ?? EMPTY_TASK_GRAPH_STATE.leases)
+        : EMPTY_TASK_GRAPH_STATE.leases;
+    },
+    get loading() {
+      return normalizedSessionId
+        ? (readSessionState(normalizedSessionId)?.loading ?? EMPTY_TASK_GRAPH_STATE.loading)
+        : EMPTY_TASK_GRAPH_STATE.loading;
+    },
+    get error() {
+      return normalizedSessionId
+        ? (readSessionState(normalizedSessionId)?.error ?? EMPTY_TASK_GRAPH_STATE.error)
+        : EMPTY_TASK_GRAPH_STATE.error;
+    },
+    get rootTaskId() {
+      return normalizedSessionId
+        ? (readSessionState(normalizedSessionId)?.rootTaskId ?? EMPTY_TASK_GRAPH_STATE.rootTaskId)
+        : EMPTY_TASK_GRAPH_STATE.rootTaskId;
+    },
+  };
+}
+
+export async function fetchTaskProjection(
+  sessionId: string,
+  rootTaskId: string,
+): Promise<void> {
+  const normalizedSessionId = normalizeSessionKey(sessionId);
+  if (!normalizedSessionId) {
+    return;
+  }
+  const state = ensureSessionState(normalizedSessionId);
+  const fetchGeneration = state.fetchGeneration + 1;
+  state.fetchGeneration = fetchGeneration;
+  state.rootTaskId = rootTaskId;
+  state.loading = true;
+  state.error = null;
 
   try {
     const client = createClient();
-    const projection = await client.getTaskProjection(rootTaskId);
-    _projection = projection;
+    const projection = await client.getTaskProjection(rootTaskId, normalizedSessionId);
+    const latestState = ensureSessionState(normalizedSessionId);
+    if (
+      latestState.fetchGeneration !== fetchGeneration
+      || latestState.rootTaskId !== rootTaskId
+    ) {
+      return;
+    }
+    latestState.projection = projection;
 
-    // Fetch leases for running tasks
     const runningTaskIds = projection.running_tasks ?? [];
     const leaseMap = new Map<string, AssignmentLeaseDto>();
-    const leasePromises = runningTaskIds.map(async (taskId) => {
+    await Promise.all(runningTaskIds.map(async (taskId) => {
       try {
-        const lease = await client.getTaskLease(taskId);
+        const lease = await client.getTaskLease(taskId, normalizedSessionId);
+        const currentState = ensureSessionState(normalizedSessionId);
+        if (
+          currentState.fetchGeneration !== fetchGeneration
+          || currentState.rootTaskId !== rootTaskId
+        ) {
+          return;
+        }
         if (lease && lease.lease_status === 'Active') {
           leaseMap.set(taskId, lease);
         }
       } catch {
-        // Lease fetch failure is non-critical; task may not have an active lease
+        // 租约获取失败不影响主任务图展示
       }
-    });
-    await Promise.all(leasePromises);
-    _leases = leaseMap;
+    }));
 
-    _error = null;
+    latestState.leases = leaseMap;
+    latestState.error = null;
   } catch (err) {
-    _error = err instanceof Error ? err.message : String(err);
+    const latestState = ensureSessionState(normalizedSessionId);
+    if (
+      latestState.fetchGeneration !== fetchGeneration
+      || latestState.rootTaskId !== rootTaskId
+    ) {
+      return;
+    }
+    latestState.error = err instanceof Error ? err.message : String(err);
   } finally {
-    _loading = false;
+    const latestState = ensureSessionState(normalizedSessionId);
+    if (
+      latestState.fetchGeneration !== fetchGeneration
+      || latestState.rootTaskId !== rootTaskId
+    ) {
+      return;
+    }
+    latestState.loading = false;
+    if (latestState.refreshAfterLoad && latestState.rootTaskId) {
+      latestState.refreshAfterLoad = false;
+      queueMicrotask(() => {
+        const currentState = ensureSessionState(normalizedSessionId);
+        if (currentState.rootTaskId && !currentState.loading) {
+          void refreshTaskProjection(normalizedSessionId);
+        }
+      });
+    }
   }
 }
 
-/**
- * Refresh the currently tracked projection (if a rootTaskId is set).
- */
-export async function refreshTaskProjection(): Promise<void> {
-  if (_rootTaskId) {
-    await fetchTaskProjection(_rootTaskId);
+export async function refreshTaskProjection(sessionId: string | null | undefined): Promise<void> {
+  const normalizedSessionId = normalizeSessionKey(sessionId);
+  if (!normalizedSessionId) {
+    return;
+  }
+  const state = ensureSessionState(normalizedSessionId);
+  if (state.rootTaskId) {
+    await fetchTaskProjection(normalizedSessionId, state.rootTaskId);
   }
 }
 
-// ─── SSE event subscription ─────────────────────────────────────────
-
-/**
- * Subscribe to real-time task SSE events from the centralized bridge connection.
- * When task-domain events arrive (task.graph.created, task.status.changed, etc.),
- * triggers a debounced refresh of the task projection.
- */
 function connectToSSE(): void {
-  if (_sseUnsubscribe) {
-    return; // already subscribed
+  if (sseUnsubscribe) {
+    return;
   }
-  _sseUnsubscribe = onBridgeMessage((message) => {
+  sseUnsubscribe = onBridgeMessage((message) => {
     if (message.type !== 'rustTaskEvent') {
       return;
     }
-    // Only refresh if we have an active root task to track
-    if (!_rootTaskId || _loading) {
+    const activeSessions = trackedSessionIds();
+    if (activeSessions.length === 0) {
       return;
     }
-    // Debounce rapid event bursts (e.g. multiple status changes in quick succession)
-    if (_sseDebounceTimer !== null) {
-      clearTimeout(_sseDebounceTimer);
+    let hasLoadingSession = false;
+    for (const sessionId of activeSessions) {
+      const state = ensureSessionState(sessionId);
+      if (state.loading) {
+        state.refreshAfterLoad = true;
+        hasLoadingSession = true;
+      }
     }
-    _sseDebounceTimer = setTimeout(() => {
-      _sseDebounceTimer = null;
-      refreshTaskProjection();
+    if (hasLoadingSession) {
+      return;
+    }
+    if (sseDebounceTimer !== null) {
+      clearTimeout(sseDebounceTimer);
+    }
+    sseDebounceTimer = setTimeout(() => {
+      sseDebounceTimer = null;
+      void refreshTrackedSessions();
     }, SSE_DEBOUNCE_MS);
   });
 }
 
-/**
- * Unsubscribe from SSE events and cancel any pending debounce timer.
- */
 function disconnectFromSSE(): void {
-  if (_sseDebounceTimer !== null) {
-    clearTimeout(_sseDebounceTimer);
-    _sseDebounceTimer = null;
+  if (sseDebounceTimer !== null) {
+    clearTimeout(sseDebounceTimer);
+    sseDebounceTimer = null;
   }
-  if (_sseUnsubscribe) {
-    _sseUnsubscribe();
-    _sseUnsubscribe = null;
+  if (sseUnsubscribe) {
+    sseUnsubscribe();
+    sseUnsubscribe = null;
   }
 }
 
-/**
- * Start auto-refreshing the task projection at the given interval (ms).
- * Also subscribes to real-time SSE events for immediate updates.
- * Calling this again replaces the previous timer.
- */
 export function startAutoRefresh(intervalMs = 5000): void {
   stopAutoRefresh();
   connectToSSE();
-  _refreshTimer = setInterval(() => {
-    if (_rootTaskId && !_loading) {
-      refreshTaskProjection();
-    }
+  settleRefreshTimer = setTimeout(() => {
+    settleRefreshTimer = null;
+    void refreshTrackedSessions();
+  }, SETTLE_REFRESH_DELAY_MS);
+  refreshTimer = setInterval(() => {
+    void refreshTrackedSessions();
   }, intervalMs);
 }
 
-/**
- * Stop auto-refreshing and disconnect from SSE events.
- */
 export function stopAutoRefresh(): void {
-  if (_refreshTimer !== null) {
-    clearInterval(_refreshTimer);
-    _refreshTimer = null;
+  if (refreshTimer !== null) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
+  if (settleRefreshTimer !== null) {
+    clearTimeout(settleRefreshTimer);
+    settleRefreshTimer = null;
   }
   disconnectFromSSE();
 }
 
-/**
- * Clear the task graph state, stop any auto-refresh, and disconnect SSE.
- */
-export function clearTaskGraph(): void {
-  stopAutoRefresh();
-  _projection = null;
-  _leases = new Map();
-  _loading = false;
-  _error = null;
-  _rootTaskId = null;
+export function clearTaskGraph(sessionId?: string | null): void {
+  const normalizedSessionId = normalizeSessionKey(sessionId);
+  if (!normalizedSessionId) {
+    sessionStates = {};
+    stopAutoRefresh();
+    return;
+  }
+  if (!sessionStates[normalizedSessionId]) {
+    return;
+  }
+  const nextStates = { ...sessionStates };
+  delete nextStates[normalizedSessionId];
+  sessionStates = nextStates;
+  if (trackedSessionIds().length === 0) {
+    stopAutoRefresh();
+  }
 }
 
-// ─── View helpers ───────────────────────────────────────────────────
-
-/** Map TaskKind to a short display label. */
 export function getTaskKindLabel(kind: TaskKind): string {
   switch (kind) {
     case 'Objective': return 'OBJ';
@@ -209,7 +312,6 @@ export function getTaskKindLabel(kind: TaskKind): string {
   }
 }
 
-/** Map TaskStatus to a CSS-friendly modifier string. */
 export function getTaskStatusModifier(status: TaskStatus): string {
   switch (status) {
     case 'Ready': return 'ready';
@@ -220,23 +322,9 @@ export function getTaskStatusModifier(status: TaskStatus): string {
     case 'Cancelled': return 'cancelled';
     case 'Skipped': return 'skipped';
     case 'Draft': return 'draft';
-    case 'AwaitingApproval': return 'awaiting';
+    case 'AwaitingApproval': return 'awaiting-approval';
     case 'Verifying': return 'verifying';
     case 'Repairing': return 'repairing';
     default: return 'unknown';
-  }
-}
-
-/** Map TaskKind to an icon name (matching existing Icon component names). */
-export function getTaskKindIcon(kind: TaskKind): string {
-  switch (kind) {
-    case 'Objective': return 'target';
-    case 'Phase': return 'list';
-    case 'WorkPackage': return 'grid';
-    case 'Action': return 'play';
-    case 'Validation': return 'check-circle';
-    case 'Repair': return 'wrench';
-    case 'Decision': return 'alert-circle';
-    default: return 'circle';
   }
 }

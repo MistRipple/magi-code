@@ -98,13 +98,13 @@ export function safeJsonParse<T>(str: string, defaultValue: T): T {
 }
 
 /**
- * 格式化已用秒数（流式指示器专用，轻量格式）
+ * 格式化已用秒数（流式指示器专用，固定 MM:SS）
  */
 export function formatElapsed(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`;
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${m}m ${s}s`;
+  const normalizedSeconds = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(normalizedSeconds / 60);
+  const remainingSeconds = normalizedSeconds % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`;
 }
 
 /**

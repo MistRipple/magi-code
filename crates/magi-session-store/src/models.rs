@@ -1,4 +1,7 @@
-use magi_core::{ExecutionOwnership, SessionId, SessionLifecycleStatus, UtcMillis};
+use magi_core::{
+    ExecutionOwnership, LeaseId, MissionId, SessionId, SessionLifecycleStatus, TaskId, UtcMillis,
+    WorkerId, WorkspaceId,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -29,11 +32,82 @@ pub struct SessionRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveExecutionDispatchContext {
+    pub accepted_at: UtcMillis,
+    pub entry_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trimmed_text: Option<String>,
+    pub deep_task: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveExecutionBranch {
+    pub task_id: TaskId,
+    pub worker_id: WorkerId,
+    pub stage: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<LeaseId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_intent_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_lifecycle: Option<String>,
+    pub last_checkpoint_at: UtcMillis,
+    pub use_tools: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_name: Option<String>,
+    #[serde(default)]
+    pub is_primary: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveExecutionChain {
+    pub session_id: SessionId,
+    pub mission_id: MissionId,
+    pub root_task_id: TaskId,
+    pub execution_chain_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<WorkspaceId>,
+    #[serde(default)]
+    pub active_branch_task_ids: Vec<TaskId>,
+    #[serde(default)]
+    pub active_worker_bindings: Vec<WorkerId>,
+    #[serde(default)]
+    pub branches: Vec<ActiveExecutionBranch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_ref: Option<String>,
+    pub dispatch_context: ActiveExecutionDispatchContext,
+}
+
+impl ActiveExecutionChain {
+    pub fn normalize(&mut self) {
+        self.active_branch_task_ids
+            .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        self.active_branch_task_ids.dedup_by(|left, right| left == right);
+        self.active_worker_bindings
+            .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        self.active_worker_bindings.dedup_by(|left, right| left == right);
+        self.branches.sort_by(|left, right| {
+            left.task_id
+                .as_str()
+                .cmp(right.task_id.as_str())
+                .then_with(|| left.worker_id.as_str().cmp(right.worker_id.as_str()))
+        });
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionRuntimeSidecar {
     pub session_id: SessionId,
     pub ownership: ExecutionOwnership,
     #[serde(default, alias = "recovery_ref")]
     pub recovery_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_execution_chain: Option<ActiveExecutionChain>,
     #[serde(default)]
     pub status: SessionExecutionSidecarStatus,
     pub updated_at: UtcMillis,
@@ -50,6 +124,8 @@ pub struct SessionRuntimeSidecarExport {
     pub execution_chain_ref: Option<String>,
     #[serde(default, alias = "recovery_id")]
     pub recovery_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_execution_chain: Option<ActiveExecutionChain>,
 }
 
 impl SessionRuntimeSidecar {
@@ -61,6 +137,7 @@ impl SessionRuntimeSidecar {
             ownership: self.ownership.clone(),
             execution_chain_ref: self.ownership.execution_chain_ref.clone(),
             recovery_ref: self.recovery_id.clone(),
+            active_execution_chain: self.active_execution_chain.clone(),
         }
     }
 }
@@ -71,6 +148,7 @@ pub enum SessionSidecarFlushReason {
     BindExecutionOwnership,
     ApplyRecoveryResumeInput,
     ApplyResumeExecutionTarget,
+    UpsertActiveExecutionChain,
     AttachRecoveryRef,
     ClearExecutionOwnership,
     DeleteSession,

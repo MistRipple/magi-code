@@ -242,17 +242,25 @@ impl SessionStore {
         kind: TimelineEntryKind,
         message: impl Into<String>,
     ) {
-        self.state
+        let mut state = self
+            .state
             .write()
-            .expect("session state write lock poisoned")
-            .timeline
-            .push(TimelineEntry {
-                entry_id: format!("timeline-{}-{}", session_id, UtcMillis::now().0),
-                session_id,
-                kind,
-                message: message.into(),
-                occurred_at: UtcMillis::now(),
-            });
+            .expect("session state write lock poisoned");
+        let occurred_at = UtcMillis::now();
+        state.timeline.push(TimelineEntry {
+            entry_id: format!("timeline-{}-{}", session_id, occurred_at.0),
+            session_id: session_id.clone(),
+            kind,
+            message: message.into(),
+            occurred_at,
+        });
+        if let Some(session) = state
+            .sessions
+            .iter_mut()
+            .find(|session| session.session_id == session_id)
+        {
+            session.updated_at = occurred_at;
+        }
     }
 
     pub fn append_notification(

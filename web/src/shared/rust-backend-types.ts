@@ -23,6 +23,7 @@ export interface SessionActionImageDto {
 
 export interface SessionActionRequestDto {
   session_id?: string | null;
+  workspace_id?: string | null;
   text?: string | null;
   deep_task: boolean;
   skill_name?: string | null;
@@ -37,6 +38,8 @@ export interface SessionActionResponseDto {
   created_session: boolean;
   /** Root task ID when the backend created a task graph for this action. */
   root_task_id?: string | null;
+  /** 当前轮次实际执行的 action task ID。 */
+  action_task_id?: string | null;
 }
 
 export interface TaskInterruptResponseDto {
@@ -112,25 +115,6 @@ export interface RecoveryHandleDto {
   createdAt: number;
   updatedAt: number;
   consumedAt?: number | null;
-}
-
-export interface RecoveryResumeRequestDto {
-  recovery_id: string;
-  worker_id?: string | null;
-}
-
-export interface RecoveryResumeResponseDto {
-  recovery_id: string;
-  snapshot_id: string;
-  session_id?: string | null;
-  workspace_id?: string | null;
-  mission_id: string;
-  assignment_id: string;
-  task_id: string;
-  worker_id: string;
-  event_id: string;
-  resumed_at: number;
-  memory_writeback_applied: boolean;
 }
 
 export type BridgeServerKind = 'model' | 'host' | 'mcp';
@@ -528,8 +512,26 @@ export interface SessionRuntimeSummaryDto {
   recovery_ids: string[];
   current_status?: string | null;
   last_update?: number | null;
+  mission_id?: string | null;
+  root_task_id?: string | null;
+  root_task_status?: string | null;
   execution_chain_ref?: string | null;
   recovery_ref?: string | null;
+  has_recoverable_chain?: boolean;
+  recoverable_branch_count?: number;
+  active_branches: SessionRuntimeBranchSummaryDto[];
+}
+
+export interface SessionRuntimeBranchSummaryDto {
+  task_id: string;
+  worker_id: string;
+  status: string;
+  stage: string;
+  lease_id?: string | null;
+  execution_intent_ref?: string | null;
+  binding_lifecycle?: string | null;
+  last_checkpoint_at?: number | null;
+  is_primary: boolean;
 }
 
 export interface WorkspaceRuntimeSummaryDto {
@@ -731,6 +733,23 @@ export interface SessionRenameRequestDto {
 
 export interface SessionCloseRequestDto {
   sessionId: string;
+}
+
+export interface SessionContinueRequestDto {
+  sessionId: string;
+  requestedWorkerIds?: string[];
+}
+
+export interface SessionContinueResponseDto {
+  sessionId: string;
+  missionId: string;
+  rootTaskId: string;
+  executionChainRef: string;
+  resumedBranchCount: number;
+  status: string;
+  runnerStarted: boolean;
+  eventId: string;
+  continuedAt: number;
 }
 
 export interface SessionSelectionResponseDto {
@@ -1223,6 +1242,7 @@ export interface UpdateTaskStatusRequestDto {
 
 export interface RunnerStartRequestDto {
   rootTaskId: string;
+  sessionId: string;
 }
 
 export interface RunnerStartResponseDto {
@@ -1233,6 +1253,7 @@ export interface RunnerStartResponseDto {
 
 export interface RunnerStopRequestDto {
   rootTaskId: string;
+  sessionId: string;
 }
 
 export interface RunnerStopResponseDto {
@@ -1249,6 +1270,7 @@ export interface RunnerStatusResponseDto {
 
 export interface RunnerCycleRequestDto {
   rootTaskId: string;
+  sessionId: string;
 }
 
 export interface RunnerCycleResponseDto {

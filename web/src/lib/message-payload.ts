@@ -203,6 +203,16 @@ export function sanitizeMessageBlocks(blocks: unknown, errorPrefix = '[MessagePa
       } as ContentBlock;
     }
 
+    if (type === 'tool_result' && !sanitized.toolCall) {
+      const toolCall = adaptFlatToolResultBlock(sanitized);
+      return {
+        ...sanitized,
+        type: 'tool_result' as const,
+        content,
+        toolCall,
+      } as ContentBlock;
+    }
+
     // 后端 thinking block 使用扁平 content/summary/blockId，前端期望嵌套 thinking 对象。
     if (type === 'thinking' && !sanitized.thinking) {
       const blockId = typeof sanitized.blockId === 'string' ? sanitized.blockId : undefined;
@@ -271,6 +281,32 @@ function adaptFlatToolCallBlock(block: Record<string, unknown>): import('../type
     status: resolvedStatus,
     result: output || undefined,
     error: error || standardizedError || undefined,
+    standardized: standardized as import('../types/message').StandardizedToolResult | undefined,
+    durationMs: typeof block.duration === 'number' && Number.isFinite(block.duration)
+      ? Math.max(0, Math.floor(block.duration))
+      : undefined,
+  };
+}
+
+function adaptFlatToolResultBlock(block: Record<string, unknown>): import('../types/message').ToolCall {
+  const standardized = block.standardized as Record<string, unknown> | undefined;
+  const standardizedStatus = typeof standardized?.status === 'string'
+    ? standardized.status.toLowerCase()
+    : '';
+  const rawContent = typeof block.content === 'string' ? block.content.trim() : '';
+  const fallbackMessage = typeof standardized?.message === 'string' ? standardized.message.trim() : '';
+  const resolvedContent = rawContent || fallbackMessage;
+  const isError = block.isError === true || ['error', 'timeout', 'killed'].includes(standardizedStatus);
+
+  return {
+    id: typeof block.toolCallId === 'string' ? block.toolCallId : '',
+    name: typeof standardized?.toolName === 'string' && standardized.toolName.trim().length > 0
+      ? standardized.toolName
+      : 'tool_result',
+    arguments: {},
+    status: isError ? 'error' : 'success',
+    result: isError ? undefined : (resolvedContent || undefined),
+    error: isError ? (resolvedContent || undefined) : undefined,
     standardized: standardized as import('../types/message').StandardizedToolResult | undefined,
   };
 }

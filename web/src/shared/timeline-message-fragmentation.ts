@@ -171,6 +171,7 @@ function blockHasRenderablePayload(block: ContentBlock | undefined): boolean {
     case 'thinking':
       return true;
     case 'tool_call':
+    case 'tool_result':
       if (isInternalWorkerOrchestrationToolBlock(block)) {
         return false;
       }
@@ -194,7 +195,7 @@ function blockHasRenderablePayload(block: ContentBlock | undefined): boolean {
 }
 
 function isInternalWorkerOrchestrationToolBlock(block: ContentBlock | undefined): boolean {
-  if (!block || block.type !== 'tool_call') {
+  if (!block || (block.type !== 'tool_call' && block.type !== 'tool_result')) {
     return false;
   }
   const toolName = resolveToolBlockName(block);
@@ -298,7 +299,7 @@ export function expandRenderableTimelineMessages<T extends TimelineFragmentMessa
       continue;
     }
 
-    if (block.type === 'tool_call') {
+    if (block.type === 'tool_call' || block.type === 'tool_result') {
       toolIndex += 1;
       const toolToken = sanitizeFragmentToken(
         resolveToolBlockId(block) || resolveToolBlockName(block) || undefined,

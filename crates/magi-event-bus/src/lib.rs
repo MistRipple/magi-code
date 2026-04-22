@@ -30,7 +30,7 @@ pub use read_model::{
     RuntimeOperationsSummary, RuntimeOverviewSummary, RuntimeReadModelInput,
     RuntimeSectionOrderingRule,
     RuntimeWorkQueueSummary,
-    SessionRuntimeSummaryEntry,
+    SessionRuntimeBranchSummaryEntry, SessionRuntimeSummaryEntry,
     TaskRuntimeSummaryEntry, ToolRuntimeSummaryEntry, WorkerRuntimeSummaryEntry,
     WorkspaceRuntimeSummaryEntry,
 };

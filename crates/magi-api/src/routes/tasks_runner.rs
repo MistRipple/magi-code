@@ -1,8 +1,9 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
+use magi_core::SessionId;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -24,12 +25,49 @@ fn require_runner_manager(state: &ApiState) -> Result<&crate::state::RunnerManag
         .ok_or_else(|| ApiError::internal_assembly("Runner 未配置", "runner_manager is not configured"))
 }
 
+fn parse_session_id(value: Option<&str>) -> Result<SessionId, ApiError> {
+    let session_id = value
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("sessionId 不能为空".to_string()))?;
+    Ok(SessionId::new(session_id))
+}
+
+fn require_session_root_task(
+    state: &ApiState,
+    session_id_value: Option<&str>,
+    root_task_id: &str,
+) -> Result<SessionId, ApiError> {
+    let session_id = parse_session_id(session_id_value)?;
+    let ownership = state
+        .session_store
+        .execution_ownership(&session_id)
+        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+    let mission_id = ownership
+        .mission_id
+        .ok_or_else(|| ApiError::InvalidInput("当前会话没有活跃任务链".to_string()))?;
+    let task_store = state
+        .task_store()
+        .ok_or_else(|| ApiError::internal_assembly("runner session guard", "task_store 未配置"))?;
+    let task = task_store
+        .get_task(&magi_core::TaskId::new(root_task_id))
+        .ok_or_else(|| ApiError::not_found("任务不存在", root_task_id))?;
+    if task.mission_id != mission_id || task.parent_task_id.is_some() {
+        return Err(ApiError::InvalidInput(format!(
+            "根任务 {} 不属于当前会话 {}",
+            root_task_id, session_id
+        )));
+    }
+    Ok(session_id)
+}
+
 // ─── Request / Response DTOs ────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RunnerStartRequest {
     root_task_id: String,
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -44,6 +82,7 @@ struct RunnerStartResponse {
 #[serde(rename_all = "camelCase")]
 struct RunnerStopRequest {
     root_task_id: String,
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,6 +105,13 @@ struct RunnerStatusResponse {
 #[serde(rename_all = "camelCase")]
 struct RunnerCycleRequest {
     root_task_id: String,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunnerStatusQuery {
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +128,7 @@ async fn start_runner(
     State(state): State<ApiState>,
     Json(request): Json<RunnerStartRequest>,
 ) -> Result<Json<RunnerStartResponse>, ApiError> {
+    require_session_root_task(&state, request.session_id.as_deref(), &request.root_task_id)?;
     let manager = require_runner_manager(&state)?;
     match manager.start(&request.root_task_id) {
         Ok(_handle) => Ok(Json(RunnerStartResponse {
@@ -102,6 +149,7 @@ async fn stop_runner(
     State(state): State<ApiState>,
     Json(request): Json<RunnerStopRequest>,
 ) -> Result<Json<RunnerStopResponse>, ApiError> {
+    require_session_root_task(&state, request.session_id.as_deref(), &request.root_task_id)?;
     let manager = require_runner_manager(&state)?;
     match manager.stop(&request.root_task_id) {
         Ok(()) => Ok(Json(RunnerStopResponse {
@@ -120,7 +168,9 @@ async fn stop_runner(
 async fn runner_status(
     State(state): State<ApiState>,
     Path(root_task_id): Path<String>,
+    Query(query): Query<RunnerStatusQuery>,
 ) -> Result<Json<RunnerStatusResponse>, ApiError> {
+    require_session_root_task(&state, query.session_id.as_deref(), &root_task_id)?;
     let manager = require_runner_manager(&state)?;
     let snapshot = manager
         .status(&root_task_id)
@@ -137,6 +187,7 @@ async fn run_cycle(
     State(state): State<ApiState>,
     Json(request): Json<RunnerCycleRequest>,
 ) -> Result<Json<RunnerCycleResponse>, ApiError> {
+    require_session_root_task(&state, request.session_id.as_deref(), &request.root_task_id)?;
     let manager = require_runner_manager(&state)?;
     let outcome = manager
         .run_single_cycle(&request.root_task_id)

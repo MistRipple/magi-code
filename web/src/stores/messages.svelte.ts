@@ -304,6 +304,23 @@ function resetPanelScrollRuntimeState(): void {
 
 let deferredWebviewStateSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let sessionViewStateBySession = $state<Record<string, PersistedSessionViewState>>({});
+interface PersistedSessionExecutionState {
+  sessionId: string;
+  edits: Array<{
+    filePath: string;
+    snapshotId?: string;
+    type?: string;
+    additions?: number;
+    deletions?: number;
+    contributors?: string[];
+    workerId?: string;
+    executionGroupId?: string;
+  }>;
+  orchestratorRuntimeState: OrchestratorRuntimeState | null;
+  pendingChanges: unknown[];
+  activePlan: AppState['activePlan'] | null;
+}
+let sessionExecutionStateBySession = $state<Record<string, PersistedSessionExecutionState>>({});
 let webviewStateBatchDepth = 0;
 let webviewStateBatchPending = false;
 let timelineProjectionSource: 'none' | 'persisted' | 'live' | 'authoritative' = 'none';
@@ -652,6 +669,7 @@ function resolveWorkerVisibility(message: Message): {
     hasWorker: Boolean(worker),
     type: message.type,
     source: message.source,
+    blocks: message.blocks,
     metadata: resolveMessageMetadataRecord(message),
   });
   return {
@@ -2002,6 +2020,22 @@ function createSessionViewStateSnapshot(sessionId: string | null | undefined): P
   };
 }
 
+function createSessionExecutionStateSnapshot(
+  sessionId: string | null | undefined,
+): PersistedSessionExecutionState | null {
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  if (!normalizedSessionId) {
+    return null;
+  }
+  return {
+    sessionId: normalizedSessionId,
+    edits: clonePersistablePayload(edits) as PersistedSessionExecutionState['edits'],
+    orchestratorRuntimeState: clonePersistablePayload(messagesState.orchestratorRuntimeState) as OrchestratorRuntimeState | null,
+    pendingChanges: ensureArray(clonePersistablePayload(messagesState.appState?.pendingChanges)),
+    activePlan: clonePersistablePayload(messagesState.appState?.activePlan ?? null) as AppState['activePlan'] | null,
+  };
+}
+
 function upsertSessionViewStateSnapshot(snapshot: PersistedSessionViewState | null): void {
   if (!snapshot) {
     return;
@@ -2015,6 +2049,13 @@ function upsertSessionViewStateSnapshot(snapshot: PersistedSessionViewState | nu
 function captureCurrentSessionViewState(): void {
   ensureTimelineProjectionSnapshotCurrent(messagesState.currentSessionId);
   upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(messagesState.currentSessionId));
+  const executionSnapshot = createSessionExecutionStateSnapshot(messagesState.currentSessionId);
+  if (executionSnapshot) {
+    sessionExecutionStateBySession = {
+      ...sessionExecutionStateBySession,
+      [executionSnapshot.sessionId]: executionSnapshot,
+    };
+  }
 }
 
 function getSessionViewState(sessionId: string | null | undefined): PersistedSessionViewState | null {
@@ -2046,6 +2087,11 @@ function pruneSessionViewStateByKnownSessions(): void {
     return;
   }
   sessionViewStateBySession = Object.fromEntries(nextEntries);
+  const nextExecutionEntries = Object.entries(sessionExecutionStateBySession)
+    .filter(([sessionId]) => knownSessionIds.has(sessionId));
+  if (nextExecutionEntries.length !== Object.keys(sessionExecutionStateBySession).length) {
+    sessionExecutionStateBySession = Object.fromEntries(nextExecutionEntries);
+  }
 }
 
 function applySessionViewState(sessionId: string | null | undefined): boolean {
@@ -2063,6 +2109,20 @@ function applySessionViewState(sessionId: string | null | undefined): boolean {
   messagesState.scrollPositions = normalizePersistedScrollPositions(normalizedSnapshot.scrollPositions);
   messagesState.scrollAnchors = normalizePersistedScrollAnchors(normalizedSnapshot.scrollAnchors);
   messagesState.autoScrollEnabled = normalizePersistedAutoScrollConfig(normalizedSnapshot.autoScrollEnabled);
+  const executionSnapshot = normalizedSessionId
+    ? sessionExecutionStateBySession[normalizedSessionId] || null
+    : null;
+  if (executionSnapshot) {
+    edits = clonePersistablePayload(executionSnapshot.edits) as PersistedSessionExecutionState['edits'];
+    messagesState.orchestratorRuntimeState = clonePersistablePayload(executionSnapshot.orchestratorRuntimeState) as OrchestratorRuntimeState | null;
+    if (messagesState.appState) {
+      messagesState.appState = {
+        ...messagesState.appState,
+        pendingChanges: ensureArray(clonePersistablePayload(executionSnapshot.pendingChanges)),
+        activePlan: clonePersistablePayload(executionSnapshot.activePlan) as AppState['activePlan'] | null,
+      };
+    }
+  }
   return true;
 }
 
@@ -3086,7 +3146,7 @@ export function setTimelineProjection(
 
 export function restoreTimelineProjectionIfNewer(
   projection: SessionTimelineProjection,
-  options: { hydrateNodes?: boolean; source?: 'persisted' | 'authoritative' } = {},
+  options: { hydrateNodes?: boolean; source?: 'persisted' | 'authoritative'; force?: boolean } = {},
 ): boolean {
   const normalizedSessionId = normalizeSessionId(projection.sessionId);
   if (!normalizedSessionId) {
@@ -3097,6 +3157,10 @@ export function restoreTimelineProjectionIfNewer(
     return false;
   }
   const currentProjection = ensureTimelineProjectionSnapshotCurrent(normalizedSessionId);
+  if (options.force === true) {
+    setTimelineProjection(projection, options);
+    return true;
+  }
   const isStrictlyNewer = compareTimelineProjectionFreshness(projection, currentProjection) > 0;
   if (!isStrictlyNewer && !shouldPreferRicherAuthoritativeProjection(projection, currentProjection)) {
     return false;
@@ -3114,6 +3178,7 @@ export function initializeState() {
   clearAllRetryRuntime();
   resetPanelScrollRuntimeState();
   sessionViewStateBySession = {};
+  sessionExecutionStateBySession = {};
   timelineProjectionSource = 'none';
   const persisted = vscode.getState<WebviewPersistedState>();
   if (persisted) {

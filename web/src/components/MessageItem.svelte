@@ -10,7 +10,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import { retryRuntimeState } from '../stores/messages.svelte';
   import { getAgentColor } from '../lib/agent-colors';
-  import { formatElapsed } from '../lib/utils';
+  import { formatDuration, formatElapsed as formatElapsedMmSs } from '../lib/utils';
 
   // Props
   interface Props {
@@ -145,12 +145,16 @@
     if (explicitBlockId) {
       return `${message.id}:${block.type}:${explicitBlockId}`;
     }
-    if (block.type === 'tool_call') {
-      const toolId = typeof candidate.toolId === 'string' && candidate.toolId.trim().length > 0
-        ? candidate.toolId.trim()
-        : '';
+    if (block.type === 'tool_call' || block.type === 'tool_result') {
+      const toolId = typeof block.toolCall?.id === 'string' && block.toolCall.id.trim().length > 0
+        ? block.toolCall.id.trim()
+        : (typeof candidate.toolId === 'string' && candidate.toolId.trim().length > 0
+          ? candidate.toolId.trim()
+          : (typeof candidate.toolCallId === 'string' && candidate.toolCallId.trim().length > 0
+            ? candidate.toolCallId.trim()
+            : ''));
       if (toolId) {
-        return `${message.id}:tool_call:${toolId}`;
+        return `${message.id}:${block.type}:${toolId}`;
       }
     }
     if (block.type === 'file_change') {
@@ -173,10 +177,13 @@
     });
   }
 
+  function formatElapsed(seconds: number): string {
+    return formatElapsedMmSs(seconds);
+  }
+
   function formatDurationMs(durationMs: number): string {
     const normalizedMs = Math.max(0, durationMs);
-    const totalSeconds = Math.max(1, Math.round(normalizedMs / 1000));
-    return formatElapsed(totalSeconds);
+    return formatDuration(Math.max(1000, normalizedMs));
   }
 
   // 获取 worker 信息（如果有）
@@ -271,7 +278,7 @@
   </div>
 {:else if isDispatchGroupOnlyMessage}
   <div class="dispatch-group-only" data-message-id={message.id} data-source={message.source}>
-    <BlockRenderer block={safeBlocks[0]} isStreaming={false} {readOnly} />
+    <BlockRenderer block={safeBlocks[0]} {isStreaming} {readOnly} />
   </div>
 <!-- 助手消息：单一纯流式渲染路径，收到什么立即展示，不做模式切换 -->
 {:else}
@@ -299,7 +306,7 @@
     <div class="message-content">
       {#if isPlaceholder}
         <div class="placeholder-content">
-          {#if showStreamingIndicator}
+          {#if isStreaming && showStreamingIndicator}
             <div class="streaming-indicator-bottom">
               <span class="streaming-dot"></span>
               <span class="streaming-dot"></span>
@@ -528,7 +535,7 @@
 
   /* 当有内容时的加载指示器，增加上边距，和内容拉开距离 */
   .streaming-indicator-bottom.fallback.has-content {
-    margin-top: var(--space-2);
+    margin-top: var(--space-3);
     padding-top: var(--space-2);
   }
 
@@ -658,9 +665,9 @@
   .streaming-indicator-bottom {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 6px;
     padding: var(--space-2) 0;
-    margin-top: var(--space-2);
+    margin-top: var(--space-3);
   }
 
   .streaming-indicator-bottom.fallback {
@@ -672,9 +679,9 @@
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: var(--info);
-    opacity: 0.6;
-    animation: streamingPulse 1.4s ease-in-out infinite;
+    background: var(--foreground-muted);
+    opacity: 0.72;
+    animation: streamingBounce 1.4s ease-in-out infinite;
   }
 
   .streaming-dot:nth-child(2) {
@@ -689,6 +696,7 @@
     margin-left: 4px;
     font-size: var(--text-xs);
     color: var(--foreground-muted);
+    font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
 
@@ -716,14 +724,14 @@
     font-weight: var(--font-medium);
   }
 
-  @keyframes streamingPulse {
+  @keyframes streamingBounce {
     0%, 80%, 100% {
-      opacity: 0.4;
-      transform: scale(1);
+      opacity: 0.45;
+      transform: translateY(0);
     }
     40% {
       opacity: 1;
-      transform: scale(1.2);
+      transform: translateY(-3px);
     }
   }
 

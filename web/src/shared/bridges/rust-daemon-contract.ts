@@ -2,6 +2,7 @@ import type { SessionBootstrapSnapshot } from '../session-bootstrap';
 import type {
   AppState,
   ContentBlock,
+  DispatchGroupLane,
   Message,
   OrchestrationRuntimeAssignmentSummary,
   OrchestratorRuntimeState,
@@ -44,6 +45,7 @@ interface RustBootstrapSessionRecord {
   title?: string | null;
   createdAt?: number;
   updatedAt?: number;
+  messageCount?: number;
 }
 
 interface RustBootstrapWorkspaceRecord {
@@ -72,6 +74,7 @@ interface RustExecutionGroupRuntimeSummary {
   mission_id?: string;
   latest_event_type?: string | null;
   current_status?: string | null;
+  failed_dispatch_count?: number;
   active_task_ids?: string[];
 }
 
@@ -94,6 +97,16 @@ interface RustTaskRuntimeSummary {
   failed_dispatch_count?: number;
 }
 
+interface RustWorkerRuntimeSummary {
+  worker_id?: string;
+  tool_call_count?: number;
+  failed_dispatch_count?: number;
+  current_task_id?: string | null;
+  latest_event_type?: string | null;
+  current_status?: string | null;
+  current_stage?: string | null;
+}
+
 interface RustSessionRuntimeSummary {
   session_id?: string;
   active_execution_group_ids?: string[];
@@ -102,8 +115,26 @@ interface RustSessionRuntimeSummary {
   latest_event_type?: string | null;
   current_status?: string | null;
   last_update?: number | null;
+  mission_id?: string | null;
+  root_task_id?: string | null;
+  root_task_status?: string | null;
   execution_chain_ref?: string | null;
   recovery_ref?: string | null;
+  has_recoverable_chain?: boolean;
+  recoverable_branch_count?: number;
+  active_branches?: RustSessionRuntimeBranchSummary[];
+}
+
+interface RustSessionRuntimeBranchSummary {
+  task_id?: string;
+  worker_id?: string;
+  status?: string;
+  stage?: string;
+  lease_id?: string | null;
+  execution_intent_ref?: string | null;
+  binding_lifecycle?: string | null;
+  last_checkpoint_at?: number | null;
+  is_primary?: boolean;
 }
 
 interface RustRuntimeReadModelDto {
@@ -114,6 +145,7 @@ interface RustRuntimeReadModelDto {
     execution_groups?: RustExecutionGroupRuntimeSummary[];
     assignments?: RustAssignmentRuntimeSummary[];
     tasks?: RustTaskRuntimeSummary[];
+    workers?: RustWorkerRuntimeSummary[];
     sessions?: RustSessionRuntimeSummary[];
   };
   overview?: {
@@ -193,6 +225,23 @@ function getRuntimeDetailEntries(
   return Array.isArray(entries) ? entries : [];
 }
 
+function normalizeExecutionGroupRuntimeEntries(
+  runtimeReadModel: RustRuntimeReadModelDto | undefined,
+): RustExecutionGroupRuntimeSummary[] {
+  return getRuntimeDetailEntries(runtimeReadModel, 'execution_groups')
+    .map((entry) => normalizeObjectRecord(entry))
+    .filter((entry): entry is Record<string, unknown> => entry !== null)
+    .map((entry) => ({
+      mission_id: normalizeString(entry.mission_id) || undefined,
+      latest_event_type: normalizeString(entry.latest_event_type) || undefined,
+      current_status: normalizeString(entry.current_status) || undefined,
+      failed_dispatch_count: typeof entry.failed_dispatch_count === 'number'
+        ? Math.floor(entry.failed_dispatch_count)
+        : undefined,
+      active_task_ids: normalizeStringArray(entry.active_task_ids),
+    }));
+}
+
 function normalizeAssignmentRuntimeEntries(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
 ): RustAssignmentRuntimeSummary[] {
@@ -232,6 +281,27 @@ function normalizeTaskRuntimeEntries(
     }));
 }
 
+function normalizeWorkerRuntimeEntries(
+  runtimeReadModel: RustRuntimeReadModelDto | undefined,
+): RustWorkerRuntimeSummary[] {
+  return getRuntimeDetailEntries(runtimeReadModel, 'workers')
+    .map((entry) => normalizeObjectRecord(entry))
+    .filter((entry): entry is Record<string, unknown> => entry !== null)
+    .map((entry) => ({
+      worker_id: normalizeString(entry.worker_id) || undefined,
+      tool_call_count: typeof entry.tool_call_count === 'number'
+        ? Math.floor(entry.tool_call_count)
+        : undefined,
+      failed_dispatch_count: typeof entry.failed_dispatch_count === 'number'
+        ? Math.floor(entry.failed_dispatch_count)
+        : undefined,
+      current_task_id: normalizeString(entry.current_task_id) || undefined,
+      latest_event_type: normalizeString(entry.latest_event_type) || undefined,
+      current_status: normalizeString(entry.current_status) || undefined,
+      current_stage: normalizeString(entry.current_stage) || undefined,
+    }));
+}
+
 function normalizeSessionRuntimeEntries(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
 ): RustSessionRuntimeSummary[] {
@@ -246,8 +316,33 @@ function normalizeSessionRuntimeEntries(
       latest_event_type: normalizeString(entry.latest_event_type) || undefined,
       current_status: normalizeString(entry.current_status) || undefined,
       last_update: typeof entry.last_update === 'number' ? Math.floor(entry.last_update) : undefined,
+      mission_id: normalizeString(entry.mission_id) || undefined,
+      root_task_id: normalizeString(entry.root_task_id) || undefined,
+      root_task_status: normalizeString(entry.root_task_status) || undefined,
       execution_chain_ref: normalizeString(entry.execution_chain_ref) || undefined,
       recovery_ref: normalizeString(entry.recovery_ref) || undefined,
+      has_recoverable_chain: entry.has_recoverable_chain === true,
+      recoverable_branch_count: typeof entry.recoverable_branch_count === 'number'
+        ? Math.floor(entry.recoverable_branch_count)
+        : undefined,
+      active_branches: Array.isArray(entry.active_branches)
+        ? entry.active_branches
+          .map((branch) => normalizeObjectRecord(branch))
+          .filter((branch): branch is Record<string, unknown> => branch !== null)
+          .map((branch) => ({
+            task_id: normalizeString(branch.task_id) || undefined,
+            worker_id: normalizeString(branch.worker_id) || undefined,
+            status: normalizeString(branch.status) || undefined,
+            stage: normalizeString(branch.stage) || undefined,
+            lease_id: normalizeString(branch.lease_id) || undefined,
+            execution_intent_ref: normalizeString(branch.execution_intent_ref) || undefined,
+            binding_lifecycle: normalizeString(branch.binding_lifecycle) || undefined,
+            last_checkpoint_at: typeof branch.last_checkpoint_at === 'number'
+              ? Math.floor(branch.last_checkpoint_at)
+              : undefined,
+            is_primary: branch.is_primary === true,
+          }))
+        : [],
     }));
 }
 
@@ -278,6 +373,69 @@ function normalizeEventEnvelope(raw: unknown): RustEventEnvelope | null {
   };
 }
 
+function resolveEventPayload(event: RustEventEnvelope): Record<string, unknown> {
+  return event.payload || {};
+}
+
+function resolveEventSessionId(event: RustEventEnvelope): string {
+  const payload = resolveEventPayload(event);
+  return normalizeString(event.session_id) || normalizeString(payload.session_id);
+}
+
+function resolveEventMissionId(event: RustEventEnvelope): string {
+  const payload = resolveEventPayload(event);
+  return normalizeString(event.mission_id) || normalizeString(payload.mission_id);
+}
+
+function resolveEventAssignmentId(event: RustEventEnvelope): string {
+  const payload = resolveEventPayload(event);
+  return normalizeString(event.assignment_id) || normalizeString(payload.assignment_id);
+}
+
+function resolveEventTaskId(event: RustEventEnvelope): string {
+  const payload = resolveEventPayload(event);
+  return normalizeString(event.task_id) || normalizeString(payload.task_id);
+}
+
+function resolveEventWorkerId(event: RustEventEnvelope): string {
+  const payload = resolveEventPayload(event);
+  return normalizeString(payload.worker_id);
+}
+
+function resolveEventToolCallId(event: RustEventEnvelope): string {
+  const payload = resolveEventPayload(event);
+  return normalizeString(payload.tool_call_id);
+}
+
+function resolveEventToolName(event: RustEventEnvelope): string {
+  const payload = resolveEventPayload(event);
+  return normalizeString(payload.tool_name);
+}
+
+function resolveEventToolKind(event: RustEventEnvelope): string {
+  const payload = resolveEventPayload(event);
+  return normalizeString(payload.tool_kind);
+}
+
+function resolveEventStatus(event: RustEventEnvelope): string {
+  const payload = resolveEventPayload(event);
+  return normalizeString(payload.status);
+}
+
+function buildTaskMissionLookup(
+  runtimeReadModel: RustRuntimeReadModelDto | undefined,
+): Map<string, string> {
+  const taskMissionByTaskId = new Map<string, string>();
+  for (const task of normalizeTaskRuntimeEntries(runtimeReadModel)) {
+    const taskId = normalizeString(task.task_id);
+    const missionId = normalizeString(task.mission_id);
+    if (taskId && missionId) {
+      taskMissionByTaskId.set(taskId, missionId);
+    }
+  }
+  return taskMissionByTaskId;
+}
+
 function normalizeRustSessions(
   payload: RustBootstrapDto,
   generatedAt: number,
@@ -293,11 +451,13 @@ function normalizeRustSessions(
     }
     const createdAt = normalizeNumber(session.createdAt, generatedAt);
     const updatedAt = normalizeNumber(session.updatedAt, createdAt);
+    const messageCount = normalizeNumber(session.messageCount, NaN);
     sessions.push({
       id: sessionId,
       name: normalizeString(session.title) || undefined,
       createdAt,
       updatedAt,
+      ...(Number.isFinite(messageCount) ? { messageCount } : {}),
     });
   }
   return sessions;
@@ -347,13 +507,13 @@ function buildLookupMaps(events: RustEventEnvelope[]): {
     if (!payload) {
       continue;
     }
-    const missionId = normalizeString(payload.mission_id) || normalizeString(event.mission_id);
-    const assignmentId = normalizeString(payload.assignment_id) || normalizeString(event.assignment_id);
-    const taskId = normalizeString(payload.task_id) || normalizeString(event.task_id);
+    const missionId = resolveEventMissionId(event);
+    const assignmentId = resolveEventAssignmentId(event);
+    const taskId = resolveEventTaskId(event);
     const missionTitle = normalizeString(payload.mission_title);
     const assignmentTitle = normalizeString(payload.assignment_title);
     const taskTitle = normalizeString(payload.task_title);
-    const workerId = normalizeString(payload.worker_id);
+    const workerId = resolveEventWorkerId(event);
 
     if (missionId && missionTitle && !missionTitles.has(missionId)) {
       missionTitles.set(missionId, missionTitle);
@@ -412,6 +572,12 @@ function normalizeSubTaskStatus(status: string, failedDispatchCount = 0): SubTas
   if (normalized.includes('review')) {
     return 'review_required';
   }
+  if (normalized.includes('cancel') || normalized.includes('abort')) {
+    return 'cancelled';
+  }
+  if (normalized.includes('reject')) {
+    return 'failed';
+  }
   if (normalized.includes('block') || failedDispatchCount > 0) {
     return 'blocked';
   }
@@ -436,12 +602,123 @@ function normalizeSubTaskStatus(status: string, failedDispatchCount = 0): SubTas
   return 'pending';
 }
 
+function normalizeWorkerLaneStatus(
+  status: string,
+  failedDispatchCount = 0,
+): DispatchGroupLane['status'] {
+  const normalized = normalizeSubTaskStatus(status, failedDispatchCount);
+  switch (normalized) {
+    case 'awaiting_approval':
+    case 'review_required':
+    case 'blocked':
+    case 'running':
+    case 'completed':
+    case 'failed':
+    case 'pending':
+      return normalized;
+    case 'paused':
+    case 'waiting_deps':
+      return 'pending';
+    case 'skipped':
+      return 'cancelled';
+    default:
+      return 'pending';
+  }
+}
+
+function normalizeDispatchGroupStatus(
+  status: string,
+  failedDispatchCount = 0,
+): 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' {
+  const normalized = status.toLowerCase();
+  if (normalized.includes('cancel')) {
+    return 'cancelled';
+  }
+  const laneStatus = normalizeSubTaskStatus(status, failedDispatchCount);
+  switch (laneStatus) {
+    case 'completed':
+    case 'skipped':
+      return 'completed';
+    case 'failed':
+    case 'blocked':
+      return 'failed';
+    case 'awaiting_approval':
+    case 'review_required':
+    case 'running':
+      return 'running';
+    default:
+      return 'pending';
+  }
+}
+
+function deriveDispatchGroupStatus(
+  lanes: DispatchGroupLane[],
+  fallbackStatus: string,
+  failedDispatchCount = 0,
+): 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' {
+  if (lanes.some((lane) => lane.status === 'failed' || lane.status === 'blocked')) {
+    return 'failed';
+  }
+  if (lanes.some((lane) => lane.status === 'running'
+    || lane.status === 'awaiting_approval'
+    || lane.status === 'review_required')) {
+    return 'running';
+  }
+  if (lanes.some((lane) => lane.status === 'pending')) {
+    return 'pending';
+  }
+  if (lanes.length > 0 && lanes.every((lane) => lane.status === 'cancelled')) {
+    return 'cancelled';
+  }
+  if (lanes.length > 0 && lanes.every((lane) => lane.status === 'completed' || lane.status === 'cancelled')) {
+    return lanes.some((lane) => lane.status === 'completed') ? 'completed' : 'cancelled';
+  }
+  return normalizeDispatchGroupStatus(fallbackStatus, failedDispatchCount);
+}
+
+function normalizeWorkerLiveActivity(worker: RustWorkerRuntimeSummary): string | undefined {
+  const stage = normalizeString(worker.current_stage);
+  if (stage) {
+    return stage.replace(/_/g, ' ');
+  }
+  const eventType = normalizeString(worker.latest_event_type);
+  return eventType || undefined;
+}
+
+function resolveDispatchArtifactTimestamp(
+  missionId: string,
+  taskIds: string[],
+  workerIds: string[],
+  events: RustEventEnvelope[],
+  fallback: number,
+): number {
+  const relevantTaskIds = new Set(taskIds);
+  const relevantWorkerIds = new Set(workerIds);
+  let latestTimestamp = fallback;
+
+  for (const event of events) {
+    const eventMissionId = resolveEventMissionId(event);
+    const eventTaskId = resolveEventTaskId(event);
+    const payloadWorkerId = resolveEventWorkerId(event);
+    const isRelevant = eventMissionId === missionId
+      || relevantTaskIds.has(eventTaskId)
+      || relevantWorkerIds.has(payloadWorkerId);
+    if (!isRelevant) {
+      continue;
+    }
+    latestTimestamp = Math.max(latestTimestamp, normalizeNumber(event.occurred_at, fallback));
+  }
+
+  return latestTimestamp;
+}
+
 function buildAssignmentsFromRuntime(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
   events: RustEventEnvelope[],
+  sessionId: string,
 ): OrchestrationRuntimeAssignmentSummary[] {
   const assignmentEntries = normalizeAssignmentRuntimeEntries(runtimeReadModel);
-  const taskEntries = normalizeTaskRuntimeEntries(runtimeReadModel);
+  const { taskEntries, activeMissionIds } = resolveSessionTaskEntries(runtimeReadModel, sessionId);
   const tasksByAssignment = new Map<string, RustTaskRuntimeSummary[]>();
   for (const task of taskEntries) {
     const assignmentId = normalizeString(task.assignment_id);
@@ -457,7 +734,11 @@ function buildAssignmentsFromRuntime(
   const assignments: OrchestrationRuntimeAssignmentSummary[] = [];
   for (const assignment of assignmentEntries) {
     const assignmentId = normalizeString(assignment.assignment_id);
+    const missionId = normalizeString(assignment.mission_id);
     if (!assignmentId) {
+      continue;
+    }
+    if (missionId && activeMissionIds.size > 0 && !activeMissionIds.has(missionId)) {
       continue;
     }
     const assignmentTasks = tasksByAssignment.get(assignmentId) || [];
@@ -499,13 +780,32 @@ function buildAssignmentsFromRuntime(
 function resolveSessionTaskEntries(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
   sessionId: string,
-): { activeSession: RustSessionRuntimeSummary | undefined; taskEntries: RustTaskRuntimeSummary[] } {
+): {
+  activeSession: RustSessionRuntimeSummary | undefined;
+  taskEntries: RustTaskRuntimeSummary[];
+  activeMissionIds: Set<string>;
+} {
+  const allTaskEntries = normalizeTaskRuntimeEntries(runtimeReadModel);
   const activeSession = normalizeSessionRuntimeEntries(runtimeReadModel)
     .find((entry) => normalizeString(entry.session_id) === sessionId);
   const activeTaskIds = new Set(normalizeStringArray(activeSession?.active_task_ids));
-  const taskEntries = normalizeTaskRuntimeEntries(runtimeReadModel)
-    .filter((entry) => activeTaskIds.has(normalizeString(entry.task_id)));
-  return { activeSession, taskEntries };
+  const activeMissionIds = new Set(normalizeStringArray(activeSession?.active_execution_group_ids));
+  if (activeMissionIds.size === 0 && activeTaskIds.size > 0) {
+    for (const task of allTaskEntries) {
+      const taskId = normalizeString(task.task_id);
+      const missionId = normalizeString(task.mission_id);
+      if (taskId && missionId && activeTaskIds.has(taskId)) {
+        activeMissionIds.add(missionId);
+      }
+    }
+  }
+  const taskEntries = allTaskEntries
+    .filter((entry) => {
+      const taskId = normalizeString(entry.task_id);
+      const missionId = normalizeString(entry.mission_id);
+      return activeTaskIds.has(taskId) || (missionId && activeMissionIds.has(missionId));
+    });
+  return { activeSession, taskEntries, activeMissionIds };
 }
 
 function buildSessionTaskStatusSummary(
@@ -547,13 +847,49 @@ function buildSessionTaskStatusSummary(
   };
 }
 
+function resolveSessionMissionIds(
+  runtimeReadModel: RustRuntimeReadModelDto | undefined,
+  sessionId: string,
+  events: RustEventEnvelope[],
+): string[] {
+  const missionIds: string[] = [];
+  const pushMissionId = (missionId: string) => {
+    if (missionId && !missionIds.includes(missionId)) {
+      missionIds.push(missionId);
+    }
+  };
+
+  const activeSession = normalizeSessionRuntimeEntries(runtimeReadModel)
+    .find((entry) => normalizeString(entry.session_id) === sessionId);
+  for (const missionId of normalizeStringArray(activeSession?.active_execution_group_ids)) {
+    pushMissionId(missionId);
+  }
+
+  const taskMissionByTaskId = buildTaskMissionLookup(runtimeReadModel);
+  for (const taskId of normalizeStringArray(activeSession?.active_task_ids)) {
+    pushMissionId(taskMissionByTaskId.get(taskId) || '');
+  }
+
+  for (const event of events) {
+    const eventSessionId = resolveEventSessionId(event);
+    if (eventSessionId !== sessionId) {
+      continue;
+    }
+    const missionId = resolveEventMissionId(event)
+      || taskMissionByTaskId.get(resolveEventTaskId(event))
+      || '';
+    pushMissionId(missionId);
+  }
+
+  return missionIds;
+}
+
 function deriveProcessingState(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
   sessionId: string,
 ): AppState['processingState'] {
-  const { activeSession, runningTaskIds } = buildSessionTaskStatusSummary(runtimeReadModel, sessionId);
-  const pendingRecoveryIds = activeSession?.recovery_ids || [];
-  const isProcessing = runningTaskIds.length > 0 || pendingRecoveryIds.length > 0;
+  const { runningTaskIds } = buildSessionTaskStatusSummary(runtimeReadModel, sessionId);
+  const isProcessing = runningTaskIds.length > 0;
 
   if (!isProcessing) {
     return null;
@@ -582,15 +918,18 @@ function deriveRuntimeState(
     runtimeReadModel,
     sessionId,
   );
-  const pendingRecoveryIds = activeSession?.recovery_ids || [];
+  const hasRecoverableChain = activeSession?.has_recoverable_chain === true;
+  const recoverableBranchCount = typeof activeSession?.recoverable_branch_count === 'number'
+    ? activeSession.recoverable_branch_count
+    : 0;
   const status = runningTaskIds.length > 0
     ? 'running'
-    : pendingRecoveryIds.length > 0
-      ? 'waiting'
+    : hasRecoverableChain
+      ? 'paused'
       : failedTaskIds.length > 0
         ? 'failed'
         : activeSession
-          ? normalizeTaskStatus(normalizeString(activeSession.current_status)) === 'completed'
+          ? normalizeTaskStatus(normalizeString(activeSession.root_task_status || activeSession.current_status)) === 'completed'
             ? 'completed'
             : 'idle'
           : 'idle';
@@ -598,18 +937,18 @@ function deriveRuntimeState(
   return {
     sessionId: sessionId || undefined,
     status,
-    phase: runningTaskIds.length > 0 ? 'execute' : (pendingRecoveryIds.length > 0 ? 'recovery' : 'idle'),
+    phase: runningTaskIds.length > 0 ? 'execute' : (hasRecoverableChain ? 'paused' : 'idle'),
     errors: failedTaskIds.length > 0 ? failedTaskIds.map((id) => `task_failed:${id}`) : [],
     statusChangedAt: normalizeNumber(activeSession?.last_update, generatedAt),
     lastEventAt: normalizeNumber(activeSession?.last_update, generatedAt),
-    canResume: pendingRecoveryIds.length > 0,
+    canResume: hasRecoverableChain,
     runtimeReason: activeSession?.latest_event_type || undefined,
     assignments,
     chain: activeSession?.execution_chain_ref
       ? {
           chainId: activeSession.execution_chain_ref,
-          status: activeSession.current_status || 'unknown',
-          recoverable: normalizeString(activeSession.recovery_ref).length > 0,
+          status: activeSession.root_task_status || activeSession.current_status || 'unknown',
+          recoverable: hasRecoverableChain && recoverableBranchCount > 0,
           attempt: 1,
           createdAt: normalizeNumber(activeSession.last_update, generatedAt),
           updatedAt: normalizeNumber(activeSession.last_update, generatedAt),
@@ -670,6 +1009,8 @@ function createRustTimelineMessage(input: {
   type: Message['type'];
   rustEventType?: string;
   blocks?: ContentBlock[];
+  source?: Message['source'];
+  metadata?: Record<string, unknown>;
 }): Message {
   const blocks: ContentBlock[] = input.blocks && input.blocks.length > 0
     ? input.blocks
@@ -681,7 +1022,7 @@ function createRustTimelineMessage(input: {
   return {
     id: input.id,
     role: input.role,
-    source: 'orchestrator',
+    source: input.source || 'orchestrator',
     content: displayContent,
     blocks,
     timestamp: input.timestamp,
@@ -691,6 +1032,7 @@ function createRustTimelineMessage(input: {
     type: input.type,
     noticeType: input.type === 'system-notice' ? 'info' : undefined,
     metadata: {
+      ...(input.metadata || {}),
       sessionId: input.sessionId,
       eventSeq: input.eventSeq,
       timelineAnchorTimestamp: input.timestamp,
@@ -788,6 +1130,154 @@ function buildTimelineEntryArtifacts(
   return artifacts;
 }
 
+function buildDispatchArtifacts(
+  sessionId: string,
+  runtimeReadModel: RustRuntimeReadModelDto | undefined,
+  events: RustEventEnvelope[],
+  generatedAt: number,
+  displayOrderOffset: number,
+): TimelineProjectionArtifact[] {
+  if (!runtimeReadModel || !sessionId) {
+    return [];
+  }
+  const executionGroups = normalizeExecutionGroupRuntimeEntries(runtimeReadModel);
+  const executionGroupByMission = new Map<string, RustExecutionGroupRuntimeSummary>();
+  for (const entry of executionGroups) {
+    const missionId = normalizeString(entry.mission_id);
+    if (missionId) {
+      executionGroupByMission.set(missionId, entry);
+    }
+  }
+
+  const tasks = normalizeTaskRuntimeEntries(runtimeReadModel);
+  const taskById = new Map<string, RustTaskRuntimeSummary>();
+  for (const task of tasks) {
+    const taskId = normalizeString(task.task_id);
+    if (taskId) {
+      taskById.set(taskId, task);
+    }
+  }
+  const activeMissionIds = resolveSessionMissionIds(runtimeReadModel, sessionId, events);
+  if (activeMissionIds.length === 0) {
+    return [];
+  }
+
+  const workers = normalizeWorkerRuntimeEntries(runtimeReadModel)
+    .filter((worker) => normalizeString(worker.worker_id).length > 0);
+  if (workers.length === 0) {
+    return [];
+  }
+
+  const lookups = buildLookupMaps(events);
+  const artifacts: TimelineProjectionArtifact[] = [];
+
+  for (const [index, missionId] of activeMissionIds.entries()) {
+    const executionGroup = executionGroupByMission.get(missionId);
+    const activeTaskIds = executionGroup?.active_task_ids?.length
+      ? executionGroup.active_task_ids
+      : tasks
+        .filter((task) => normalizeString(task.mission_id) === missionId)
+        .map((task) => normalizeString(task.task_id))
+        .filter((taskId) => taskId.length > 0);
+    const activeTaskIdSet = new Set(activeTaskIds);
+    const lanes = workers
+      .filter((worker) => {
+        const currentTaskId = normalizeString(worker.current_task_id);
+        if (!currentTaskId) {
+          return false;
+        }
+        if (activeTaskIdSet.has(currentTaskId)) {
+          return true;
+        }
+        return normalizeString(taskById.get(currentTaskId)?.mission_id) === missionId;
+      })
+      .sort((left, right) => normalizeString(left.worker_id).localeCompare(normalizeString(right.worker_id)))
+      .map((worker): DispatchGroupLane => {
+        const workerId = normalizeString(worker.worker_id);
+        const currentTaskId = normalizeString(worker.current_task_id);
+        const currentTask = currentTaskId ? taskById.get(currentTaskId) : undefined;
+        const status = currentTask
+          ? normalizeWorkerLaneStatus(
+            normalizeString(currentTask.current_status),
+            typeof currentTask.failed_dispatch_count === 'number' ? currentTask.failed_dispatch_count : 0,
+          )
+          : normalizeWorkerLaneStatus(
+            normalizeString(executionGroup?.current_status),
+            typeof executionGroup?.failed_dispatch_count === 'number' ? executionGroup.failed_dispatch_count : 0,
+          );
+        const title = (currentTaskId && lookups.taskTitles.get(currentTaskId))
+          || workerId;
+
+        return {
+          laneId: `${missionId}:${workerId}`,
+          laneVersion: 1,
+          worker: workerId,
+          title,
+          status,
+          liveActivity: normalizeWorkerLiveActivity(worker),
+          toolUseCount: typeof worker.tool_call_count === 'number' ? worker.tool_call_count : undefined,
+          jumpTarget: { workerTabId: workerId },
+        };
+      });
+
+    if (lanes.length === 0) {
+      continue;
+    }
+
+    const workerIds = lanes
+      .map((lane) => normalizeString(lane.worker))
+      .filter((workerId) => workerId.length > 0);
+    const summaryTitle = lookups.missionTitles.get(missionId) || shortenId(missionId, 'mission');
+    const timestamp = resolveDispatchArtifactTimestamp(
+      missionId,
+      activeTaskIds,
+      workerIds,
+      events,
+      generatedAt,
+    );
+    const block: ContentBlock = {
+      type: 'dispatch_group',
+      content: '',
+      blockId: `dispatch-group-${missionId}`,
+      dispatchWaveId: missionId,
+      status: deriveDispatchGroupStatus(
+        lanes,
+        normalizeString(executionGroup?.current_status),
+        typeof executionGroup?.failed_dispatch_count === 'number' ? executionGroup.failed_dispatch_count : 0,
+      ),
+      summaryText: `${summaryTitle} · ${lanes.length} 个 worker`,
+      lanes,
+    };
+    const messageId = `rust-dispatch:${missionId}`;
+
+    artifacts.push({
+      artifactId: messageId,
+      kind: 'message',
+      displayOrder: displayOrderOffset + index + 1,
+      anchorEventSeq: 0,
+      latestEventSeq: 0,
+      cardStreamSeq: 0,
+      timestamp,
+      dispatchWaveId: missionId,
+      threadVisible: true,
+      workerTabs: workerIds,
+      messageIds: [messageId],
+      message: createRustTimelineMessage({
+        id: messageId,
+        content: '',
+        timestamp,
+        sessionId,
+        eventSeq: 0,
+        role: 'assistant',
+        type: 'text',
+        blocks: [block],
+      }),
+    });
+  }
+
+  return artifacts;
+}
+
 function summarizeRustEvent(event: RustEventEnvelope): string {
   const eventType = normalizeString(event.event_type);
   const payload = event.payload || {};
@@ -795,6 +1285,8 @@ function summarizeRustEvent(event: RustEventEnvelope): string {
   switch (eventType) {
     case 'session.action.accepted':
       return text || '已提交会话消息';
+    case 'session.continue.executed':
+      return '已继续当前会话执行链';
     case 'recovery.resume.executed':
       return '已执行恢复流程';
     case 'mission.created':
@@ -822,6 +1314,207 @@ function summarizeRustEvent(event: RustEventEnvelope): string {
   }
 }
 
+function normalizeToolArtifactStatus(status: string, eventType: string): 'pending' | 'running' | 'success' | 'error' {
+  const normalized = status.toLowerCase();
+  if (normalized.includes('fail')
+    || normalized.includes('error')
+    || normalized.includes('reject')
+    || normalized.includes('abort')
+    || normalized.includes('kill')
+    || normalized.includes('timeout')) {
+    return 'error';
+  }
+  if (normalized.includes('success') || normalized.includes('complete') || normalized.includes('succeed')) {
+    return 'success';
+  }
+  if (normalized.includes('run')) {
+    return 'running';
+  }
+  return eventType === 'task.tool.invoked' ? 'running' : 'pending';
+}
+
+function normalizeToolArtifactSource(toolKind: string): 'builtin' | 'mcp' | 'skill' {
+  const normalized = toolKind.toLowerCase();
+  if (normalized.includes('mcp')) {
+    return 'mcp';
+  }
+  if (normalized.includes('skill')) {
+    return 'skill';
+  }
+  return 'builtin';
+}
+
+function summarizeToolArtifactResult(toolName: string, status: 'pending' | 'running' | 'success' | 'error'): string {
+  const normalizedToolName = toolName || 'tool';
+  switch (status) {
+    case 'success':
+      return `${normalizedToolName} 已执行成功`;
+    case 'error':
+      return `${normalizedToolName} 执行失败`;
+    case 'running':
+      return `${normalizedToolName} 正在执行`;
+    default:
+      return `${normalizedToolName} 等待执行`;
+  }
+}
+
+function buildToolArtifacts(
+  sessionId: string,
+  runtimeReadModel: RustRuntimeReadModelDto | undefined,
+  events: RustEventEnvelope[],
+  displayOrderOffset: number,
+): TimelineProjectionArtifact[] {
+  if (!sessionId) {
+    return [];
+  }
+
+  const { taskEntries } = resolveSessionTaskEntries(runtimeReadModel, sessionId);
+  const relevantTaskIds = new Set(
+    taskEntries
+      .map((entry) => normalizeString(entry.task_id))
+      .filter((taskId) => taskId.length > 0),
+  );
+  const relevantMissionIds = new Set(resolveSessionMissionIds(runtimeReadModel, sessionId, events));
+  const taskMissionByTaskId = buildTaskMissionLookup(runtimeReadModel);
+
+  type ToolArtifactAggregate = {
+    toolCallId: string;
+    toolName: string;
+    toolSource: 'builtin' | 'mcp' | 'skill';
+    taskId: string;
+    missionId: string;
+    workerId: string;
+    status: 'pending' | 'running' | 'success' | 'error';
+    anchorEventSeq: number;
+    latestEventSeq: number;
+    timestamp: number;
+    rustEventType: string;
+  };
+
+  const groups = new Map<string, ToolArtifactAggregate>();
+  const relevantEvents = events
+    .filter((event) => {
+      const eventType = normalizeString(event.event_type);
+      if (eventType !== 'task.tool.invoked' && eventType !== 'tool.invoked' && eventType !== 'tool.usage.recorded') {
+        return false;
+      }
+      const eventSessionId = resolveEventSessionId(event);
+      if (eventSessionId) {
+        return eventSessionId === sessionId;
+      }
+      const eventMissionId = resolveEventMissionId(event)
+        || taskMissionByTaskId.get(resolveEventTaskId(event))
+        || '';
+      if (eventMissionId && relevantMissionIds.has(eventMissionId)) {
+        return true;
+      }
+      const eventTaskId = resolveEventTaskId(event);
+      return Boolean(eventTaskId && relevantTaskIds.has(eventTaskId));
+    })
+    .sort((left, right) => normalizeNumber(left.sequence, 0) - normalizeNumber(right.sequence, 0));
+
+  for (const event of relevantEvents) {
+    const toolCallId = resolveEventToolCallId(event);
+    const eventType = normalizeString(event.event_type);
+    if (!toolCallId) {
+      continue;
+    }
+    const status = normalizeToolArtifactStatus(resolveEventStatus(event), eventType);
+    const taskId = resolveEventTaskId(event);
+    const missionId = resolveEventMissionId(event) || taskMissionByTaskId.get(taskId) || '';
+    const timestamp = normalizeNumber(event.occurred_at, Date.now());
+    const sequence = normalizeNumber(event.sequence, 0);
+    const current = groups.get(toolCallId);
+    groups.set(toolCallId, {
+      toolCallId,
+      toolName: resolveEventToolName(event) || current?.toolName || 'tool',
+      toolSource: normalizeToolArtifactSource(resolveEventToolKind(event) || current?.toolSource || 'builtin'),
+      taskId: taskId || current?.taskId || '',
+      missionId: missionId || current?.missionId || '',
+      workerId: resolveEventWorkerId(event) || current?.workerId || '',
+      status,
+      anchorEventSeq: current?.anchorEventSeq ?? sequence,
+      latestEventSeq: sequence,
+      timestamp,
+      rustEventType: eventType || current?.rustEventType || 'tool.invoked',
+    });
+  }
+
+  return [...groups.values()]
+    .sort((left, right) => left.timestamp - right.timestamp)
+    .map((entry, index): TimelineProjectionArtifact => {
+      const resultSummary = summarizeToolArtifactResult(entry.toolName, entry.status);
+      const standardized = entry.status === 'success' || entry.status === 'error'
+        ? {
+            schemaVersion: 'tool-result.v1' as const,
+            source: entry.toolSource,
+            toolName: entry.toolName,
+            toolCallId: entry.toolCallId,
+            status: entry.status === 'error' ? 'error' as const : 'success' as const,
+            message: resultSummary,
+          }
+        : undefined;
+      const toolCallBlock: ContentBlock = {
+        type: 'tool_call',
+        content: '',
+        toolCall: {
+          id: entry.toolCallId,
+          name: entry.toolName,
+          arguments: {},
+          status: entry.status,
+          standardized: standardized || undefined,
+        },
+      };
+      const blocks: ContentBlock[] = [toolCallBlock];
+      if (entry.status === 'success' || entry.status === 'error') {
+        blocks.push({
+          type: 'tool_result',
+          content: resultSummary,
+          toolCall: {
+            id: entry.toolCallId,
+            name: entry.toolName,
+            arguments: {},
+            status: entry.status,
+            result: entry.status === 'success' ? resultSummary : undefined,
+            error: entry.status === 'error' ? resultSummary : undefined,
+            standardized: standardized || undefined,
+          },
+        });
+      }
+      const artifactId = `rust-tool:${entry.toolCallId}`;
+      return {
+        artifactId,
+        kind: 'message',
+        displayOrder: displayOrderOffset + index + 1,
+        anchorEventSeq: entry.anchorEventSeq,
+        latestEventSeq: entry.latestEventSeq,
+        cardStreamSeq: 0,
+        timestamp: entry.timestamp,
+        dispatchWaveId: entry.missionId || undefined,
+        threadVisible: true,
+        workerTabs: entry.workerId ? [entry.workerId] : [],
+        messageIds: [artifactId],
+        message: createRustTimelineMessage({
+          id: artifactId,
+          content: '',
+          timestamp: entry.timestamp,
+          sessionId,
+          eventSeq: entry.latestEventSeq,
+          role: 'assistant',
+          type: 'text',
+          blocks,
+          source: entry.workerId || 'orchestrator',
+          rustEventType: entry.rustEventType,
+          metadata: {
+            taskId: entry.taskId || undefined,
+            missionId: entry.missionId || undefined,
+            worker: entry.workerId || undefined,
+          },
+        }),
+      };
+    });
+}
+
 function buildEventArtifacts(
   sessionId: string,
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
@@ -841,15 +1534,15 @@ function buildEventArtifacts(
 
   return events
     .filter((event) => {
-      const eventSessionId = normalizeString(event.session_id);
+      const eventSessionId = resolveEventSessionId(event);
       if (eventSessionId) {
         return eventSessionId === sessionId;
       }
-      const missionId = normalizeString(event.mission_id);
+      const missionId = resolveEventMissionId(event);
       if (missionId && relevantMissionIds.has(missionId)) {
         return true;
       }
-      const taskId = normalizeString(event.task_id);
+      const taskId = resolveEventTaskId(event);
       return Boolean(taskId && relevantTaskIds.has(taskId));
     })
     .sort((left, right) => normalizeNumber(left.sequence, 0) - normalizeNumber(right.sequence, 0))
@@ -919,7 +1612,20 @@ function buildTimelineProjection(
     : [];
   const timelineArtifacts = buildTimelineEntryArtifacts(sessionId, payload.timeline);
   const eventArtifacts = buildEventArtifacts(sessionId, payload.runtimeReadModel, recentEvents);
-  const artifacts = [...timelineArtifacts, ...eventArtifacts];
+  const toolArtifacts = buildToolArtifacts(
+    sessionId,
+    payload.runtimeReadModel,
+    recentEvents,
+    timelineArtifacts.length + eventArtifacts.length,
+  );
+  const dispatchArtifacts = buildDispatchArtifacts(
+    sessionId,
+    payload.runtimeReadModel,
+    recentEvents,
+    generatedAt,
+    timelineArtifacts.length + eventArtifacts.length + toolArtifacts.length,
+  );
+  const artifacts = [...timelineArtifacts, ...eventArtifacts, ...toolArtifacts, ...dispatchArtifacts];
   const maxEventSeq = recentEvents.reduce((max, event) => Math.max(max, normalizeNumber(event.sequence, 0)), 0);
   const latestSequence = Math.max(
     normalizeNumber(payload.runtimeReadModel?.meta?.latest_sequence, 0),
@@ -965,7 +1671,11 @@ export function normalizeRustBootstrapPayload(
   const normalizedEvents = Array.isArray(payload.recentEvents)
     ? payload.recentEvents.map((event) => normalizeEventEnvelope(event)).filter((event): event is RustEventEnvelope => event !== null)
     : [];
-  const assignments = buildAssignmentsFromRuntime(payload.runtimeReadModel, normalizedEvents);
+  const assignments = buildAssignmentsFromRuntime(
+    payload.runtimeReadModel,
+    normalizedEvents,
+    currentSession?.id || '',
+  );
   const processingState = deriveProcessingState(
     payload.runtimeReadModel,
     currentSession?.id || '',

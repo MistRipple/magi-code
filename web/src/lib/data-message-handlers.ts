@@ -36,7 +36,6 @@ import {
   batchWebviewStatePersistence,
   setInterruptedChain,
   setEnabledAgents,
-  getTimelineProjectionSource,
   setSessionHistoryState,
 } from '../stores/messages.svelte';
 import type {
@@ -54,9 +53,6 @@ import { i18n } from '../stores/i18n.svelte';
 import {
   handleRetryRuntimePayload,
 } from './message-utils';
-import {
-  shouldAcceptAuthoritativeTimelineProjection,
-} from './timeline-projection-policy';
 import { buildEmptyWorkspaceAppState } from '../shared/bridges/empty-workspace-state';
 
 function normalizeStateSliceVersion(value: unknown): number {
@@ -747,6 +743,29 @@ function hasRenderableAssistantContent(message: Message): boolean {
   return Array.isArray(message?.blocks) && message.blocks.length > 0;
 }
 
+function findAssistantByThreadOrder(
+  threadMessages: Message[],
+  binding: ReturnType<typeof listRequestBindings>[number],
+): Message | undefined {
+  const userIndex = threadMessages.findIndex((message) => message.id === binding.userMessageId);
+  if (userIndex < 0) {
+    return undefined;
+  }
+  for (let index = threadMessages.length - 1; index > userIndex; index -= 1) {
+    const message = threadMessages[index];
+    if (
+      message.role === 'assistant'
+      && message.source === 'orchestrator'
+      && message.metadata?.isPlaceholder !== true
+      && message.isStreaming !== true
+      && hasRenderableAssistantContent(message)
+    ) {
+      return message;
+    }
+  }
+  return undefined;
+}
+
 function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): void {
   const currentSessionId = getState().currentSessionId || '';
   if (!sessionId || !currentSessionId || currentSessionId !== sessionId) {
@@ -776,6 +795,7 @@ function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): voi
         && message.timestamp >= lowerBoundTimestamp
         && hasRenderableAssistantContent(message)
       ))
+      || findAssistantByThreadOrder(threadMessages, binding)
     );
 
     if (!matchedAssistant) {
@@ -812,19 +832,14 @@ function handleTimelineProjectionUpdated(message: ClientBridgeMessage) {
   if (!sessionId || !timelineProjection) {
     return;
   }
-  const liveState = getState();
-  const hydrationInput = {
-    currentSessionId: liveState.currentSessionId,
-    incomingSessionId: sessionId,
-    localTimelineNodeCount: liveState.timelineNodes.length,
-    localProjectionSource: getTimelineProjectionSource(),
-    currentTimelineProjection: liveState.timelineProjection,
-    incomingTimelineProjection: timelineProjection,
-  };
-  if (!shouldAcceptAuthoritativeTimelineProjection(hydrationInput)) {
+  const currentSessionId = getState().currentSessionId || '';
+  if (!currentSessionId || currentSessionId !== sessionId) {
     return;
   }
-  restoreTimelineProjectionIfNewer(timelineProjection, { source: 'authoritative' });
+  restoreTimelineProjectionIfNewer(timelineProjection, {
+    source: 'authoritative',
+    force: true,
+  });
   reconcileRequestBindingsFromAuthoritativeThread(sessionId);
 }
 
@@ -848,7 +863,6 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
   // 仅当后端 bootstrap projection 明确比本地更新时，才允许用快照接管并修复断连期间丢失的节点。
   if (isSameSession) {
     batchWebviewStatePersistence(() => {
-      const liveState = getState();
       const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;
       const sessions = ensureArray(snapshot.sessions) as Session[];
       if (sessions.length > 0) {
@@ -875,19 +889,10 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         beforeCursor,
         isLoadingBefore: false,
       });
-      const hydrationInput = {
-        currentSessionId: liveState.currentSessionId,
-        incomingSessionId: sessionId,
-        localTimelineNodeCount: liveState.timelineNodes.length,
-        localProjectionSource: getTimelineProjectionSource(),
-        currentTimelineProjection: liveState.timelineProjection,
-        incomingTimelineProjection: timelineProjection,
-      };
-      if (!shouldAcceptAuthoritativeTimelineProjection(hydrationInput)) {
-        reconcileRequestBindingsFromAuthoritativeThread(sessionId);
-        return;
-      }
-      restoreTimelineProjectionIfNewer(timelineProjection, { source: 'authoritative' });
+      restoreTimelineProjectionIfNewer(timelineProjection, {
+        source: 'authoritative',
+        force: true,
+      });
       reconcileRequestBindingsFromAuthoritativeThread(sessionId);
     });
     return;

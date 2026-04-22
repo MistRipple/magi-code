@@ -2,7 +2,7 @@ use magi_core::{
     AssignmentLease, DomainError, DomainResult, LeaseId, LeaseStatus, MissionId, ProgressSummary,
     Task, TaskId, TaskKind, TaskPolicy, TaskProjection, TaskStatus, WorkPackageSummary, UtcMillis, WorkerId,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -681,6 +681,50 @@ impl TaskStore {
             .filter(|l| l.lease_status == LeaseStatus::Active && l.expires_at >= now)
             .map(|l| (l.task_id.clone(), l.lease_id.clone()))
             .collect()
+    }
+
+    /// 在进程重启后收敛易失执行态。
+    ///
+    /// `WorkerRuntime` 不会随 `TaskStore` 一起恢复，因此 checkpoint 中残留的
+    /// Active lease 和执行中状态都不能再被视为真实运行态。这里统一执行两件事：
+    /// 1. 撤销所有仍处于 Active 的租约；
+    /// 2. 将受影响子树中所有非终态可调度任务收口到 Blocked，等待显式 resume。
+    pub fn reconcile_volatile_runtime_after_restore(&self) -> (usize, usize) {
+        let active_leases = self.collect_active_leases();
+        if active_leases.is_empty() {
+            return (0, 0);
+        }
+
+        let mut affected_roots = HashSet::new();
+        for (task_id, lease_id) in &active_leases {
+            if let Some(task) = self.get_task(task_id) {
+                affected_roots.insert(task.root_task_id);
+            }
+            self.revoke_lease(task_id, lease_id);
+        }
+
+        let mut blocked_count = 0usize;
+        for root_task_id in affected_roots {
+            for task_id in self.collect_subtree_ids(&root_task_id) {
+                let Some(task) = self.get_task(&task_id) else {
+                    continue;
+                };
+                if matches!(
+                    task.status,
+                    TaskStatus::Draft
+                        | TaskStatus::Ready
+                        | TaskStatus::Running
+                        | TaskStatus::Verifying
+                        | TaskStatus::Repairing
+                ) {
+                    if self.update_status(&task_id, TaskStatus::Blocked).is_ok() {
+                        blocked_count += 1;
+                    }
+                }
+            }
+        }
+
+        (active_leases.len(), blocked_count)
     }
 
     /// 获取指定 worker 的所有活跃租约。
@@ -1683,5 +1727,37 @@ mod tests {
             restored_projection.progress_summary.running_tasks
         );
         assert_eq!(original_projection.aggregate_status, restored_projection.aggregate_status);
+    }
+
+    #[test]
+    fn reconcile_volatile_runtime_after_restore_revokes_active_leases_and_blocks_running_subtree() {
+        let store = TaskStore::new();
+
+        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
+        let phase = make_task("phase-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Phase, TaskStatus::Running);
+        let wp = make_task("wp-1", "m-1", "obj-1", Some("phase-1"), TaskKind::WorkPackage, TaskStatus::Running);
+        let act = make_task("act-1", "m-1", "obj-1", Some("wp-1"), TaskKind::Action, TaskStatus::Running);
+
+        store.insert_task(root);
+        store.insert_task(phase);
+        store.insert_task(wp);
+        store.insert_task(act);
+
+        let lease = store
+            .grant_lease(&TaskId::new("act-1"), &WorkerId::new("worker-1"), "executor", 60_000)
+            .expect("running task should receive active lease");
+        assert_eq!(lease.lease_status, LeaseStatus::Active);
+
+        let (revoked_leases, blocked_tasks) = store.reconcile_volatile_runtime_after_restore();
+        assert_eq!(revoked_leases, 1);
+        assert_eq!(blocked_tasks, 4);
+        assert!(store.get_active_lease(&TaskId::new("act-1")).is_none());
+
+        for task_id in ["obj-1", "phase-1", "wp-1", "act-1"] {
+            let task = store
+                .get_task(&TaskId::new(task_id))
+                .expect("task should exist after reconciliation");
+            assert_eq!(task.status, TaskStatus::Blocked, "{task_id} should become Blocked");
+        }
     }
 }

@@ -166,6 +166,7 @@ function resolveTimelineVisibilityForStandard(standard: StandardMessage): {
     hasWorker: Boolean(workerSlot),
     type: standard.type,
     source: standard.source,
+    blocks: standard.blocks,
     metadata: standard.metadata as Record<string, unknown> | undefined,
   });
   return {
@@ -498,6 +499,7 @@ function hasVisibleUserContent(message: Message): boolean {
       return Boolean(block.thinking?.content && block.thinking.content.trim());
     }
     return block.type === 'tool_call'
+      || block.type === 'tool_result'
       || block.type === 'file_change'
       || block.type === 'plan'
       || block.type === 'dispatch_group';
@@ -1127,8 +1129,8 @@ function mergeBlocks(existing: ContentBlock[], incoming: ContentBlock[]): Conten
   const safeIncoming = ensureArray(incoming).filter((block): block is ContentBlock => !!block && typeof block === 'object' && 'type' in block);
   const next = [...safeExisting];
   for (const block of safeIncoming) {
-    if (block.type === 'tool_call' && block.toolCall?.id) {
-      const idx = next.findIndex((b) => b.type === 'tool_call' && b.toolCall?.id === block.toolCall?.id);
+    if ((block.type === 'tool_call' || block.type === 'tool_result') && block.toolCall?.id) {
+      const idx = next.findIndex((b) => b.type === block.type && b.toolCall?.id === block.toolCall?.id);
       if (idx >= 0) {
         const prev = next[idx];
         const prevToolCall = prev.toolCall;
@@ -1145,6 +1147,9 @@ function mergeBlocks(existing: ContentBlock[], incoming: ContentBlock[]): Conten
             result: incomingToolCall?.result ?? prevToolCall?.result,
             error: incomingToolCall?.error ?? prevToolCall?.error,
             standardized: incomingToolCall?.standardized ?? prevToolCall?.standardized,
+            durationMs: incomingToolCall?.durationMs ?? prevToolCall?.durationMs,
+            startTime: incomingToolCall?.startTime ?? prevToolCall?.startTime,
+            endTime: incomingToolCall?.endTime ?? prevToolCall?.endTime,
           },
         };
       } else {
@@ -1205,6 +1210,10 @@ function blocksToContent(blocks: ContentBlock[]): string {
     if (!block) continue;
     if (block.type === 'text' || block.type === 'code' || block.type === 'thinking') {
       if (block.content) textParts.push(block.content);
+    }
+    if (block.type === 'tool_result') {
+      const toolContent = block.toolCall?.error || block.toolCall?.result || block.content;
+      if (toolContent) textParts.push(toolContent);
     }
     if (block.type === 'file_change' && block.fileChange) {
       textParts.push(i18n.t('messageHandler.fileChange', { filePath: block.fileChange.filePath, changeType: block.fileChange.changeType }));
