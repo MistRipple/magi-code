@@ -7,7 +7,6 @@
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { getState } from '../stores/messages.svelte';
-  import { isWebAgentMode, resolveAgentBaseUrl } from '../web/agent-api';
 
   // 知识类型定义
   interface CodeIndex {
@@ -45,7 +44,6 @@
 
   // 状态
   const appState = getState();
-  const isWebMode = isWebAgentMode();
   const isKnowledgeActive = $derived(appState.currentTopTab === 'knowledge');
   let currentTab = $state<'overview' | 'adr' | 'faq' | 'learning'>('overview');
   let isLoading = $state(false);
@@ -115,41 +113,14 @@
     expandedLearningId = null;
   }
 
-  async function fetchKnowledgeViaApi() {
-    const base = resolveAgentBaseUrl();
-    const res = await fetch(`${base}/api/knowledge`).then(r => r.json());
-    
-    adrs = ensureArray(res?.adrs).map((a: any) => ({
-      id: a.id,
-      title: a.title,
-      content: a.content,
-      tags: ensureArray(a.tags)
-    }));
-    faqs = ensureArray(res?.faqs).map((f: any) => ({
-      id: f.id,
-      question: f.title || f.question,
-      answer: f.content || f.answer,
-      tags: ensureArray(f.tags)
-    }));
-    learnings = ensureArray(res?.learnings).map((l: any) => ({
-      id: l.id,
-      content: l.content,
-      context: l.context,
-      createdAt: l.createdAt,
-      tags: ensureArray(l.tags)
-    }));
-    codeIndex = res?.codeIndex || null;
-    isLoading = false;
+  function requestKnowledge(): void {
+    vscode.postMessage({ type: 'getProjectKnowledge' });
   }
 
   function refresh() {
     hasRequestedKnowledge = true;
     isLoading = true;
-    if (isWebMode) {
-      fetchKnowledgeViaApi().catch(() => { isLoading = false; });
-    } else {
-      vscode.postMessage({ type: 'getProjectKnowledge' });
-    }
+    requestKnowledge();
   }
 
   function toggleAdr(adr: ADR) {
@@ -162,24 +133,12 @@
 
   function deleteAdr(id: string, e: Event) {
     e.stopPropagation();
-    if (isWebMode) {
-      fetch(`${resolveAgentBaseUrl()}/api/knowledge/adr/delete`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }),
-      }).then(() => refresh()).catch(console.error);
-    } else {
-      vscode.postMessage({ type: 'deleteADR', id });
-    }
+    vscode.postMessage({ type: 'deleteADR', id });
   }
 
   function deleteFaq(id: string, e: Event) {
     e.stopPropagation();
-    if (isWebMode) {
-      fetch(`${resolveAgentBaseUrl()}/api/knowledge/faq/delete`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }),
-      }).then(() => refresh()).catch(console.error);
-    } else {
-      vscode.postMessage({ type: 'deleteFAQ', id });
-    }
+    vscode.postMessage({ type: 'deleteFAQ', id });
   }
 
   function toggleLearning(learning: Learning) {
@@ -188,13 +147,7 @@
 
   function deleteLearning(id: string, e: Event) {
     e.stopPropagation();
-    if (isWebMode) {
-      fetch(`${resolveAgentBaseUrl()}/api/knowledge/learning/delete`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }),
-      }).then(() => refresh()).catch(console.error);
-    } else {
-      vscode.postMessage({ type: 'deleteLearning', id });
-    }
+    vscode.postMessage({ type: 'deleteLearning', id });
   }
 
   function confirmClear() {
@@ -208,13 +161,7 @@
   function executeClear() {
     showClearConfirm = false;
     isLoading = true;
-    if (isWebMode) {
-      fetch(`${resolveAgentBaseUrl()}/api/knowledge/clear`, { method: 'POST' })
-        .then(() => refresh())
-        .catch(() => { isLoading = false; });
-    } else {
-      vscode.postMessage({ type: 'clearProjectKnowledge' });
-    }
+    vscode.postMessage({ type: 'clearProjectKnowledge' });
   }
 
   // ADR 状态的显示文本
@@ -234,11 +181,7 @@
     }
     hasRequestedKnowledge = true;
     isLoading = true;
-    if (isWebMode) {
-      fetchKnowledgeViaApi().catch(() => { isLoading = false; });
-    } else {
-      vscode.postMessage({ type: 'getProjectKnowledge' });
-    }
+    requestKnowledge();
   });
 
   // 监听来自扩展的消息

@@ -15,7 +15,6 @@
     setSessionHistoryState,
     updatePanelScrollState,
   } from '../stores/messages.svelte';
-  import { getTaskGraphState } from '../stores/task-graph-store.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { loadAgentSessionTimelinePage } from '../web/agent-api';
   import { readStoredBrowserWorkspaceBinding } from '../shared/bridges/browser-workspace-binding';
@@ -52,65 +51,7 @@
     typeof messagesState.currentSessionId === 'string' ? messagesState.currentSessionId.trim() : ''
   ));
 
-  const hasAuthoritativeProcessing = $derived.by(() => (
-    messagesState.appState?.processingState?.isProcessing === true
-  ));
-
-  const hasActiveSessionTask = $derived.by(() => {
-    const sessionId = currentSessionId;
-    if (!sessionId) {
-      return false;
-    }
-    const taskGraphState = getTaskGraphState(sessionId);
-    if (taskGraphState.loading && taskGraphState.rootTaskId) {
-      return true;
-    }
-    return (taskGraphState.projection?.running_tasks?.length ?? 0) > 0;
-  });
-
-  const syntheticStreamingRenderItem = $derived.by((): TimelineRenderItem | null => {
-    if (displayContext !== 'thread') {
-      return null;
-    }
-    if (safeRenderItems.some((item) => item.message.isStreaming)) {
-      return null;
-    }
-    if (!(hasAuthoritativeProcessing || hasActiveSessionTask)) {
-      return null;
-    }
-    const startedAt = messagesState.appState?.processingState?.startedAt;
-    const timestamp = typeof startedAt === 'number' && Number.isFinite(startedAt) && startedAt > 0
-      ? Math.floor(startedAt)
-      : Date.now();
-    const sessionId = currentSessionId || 'session';
-    return {
-      key: `synthetic-processing-placeholder-${sessionId}`,
-      message: {
-        id: `synthetic-processing-placeholder-${sessionId}`,
-        role: 'assistant',
-        source: 'orchestrator',
-        content: '',
-        blocks: [],
-        timestamp,
-        isStreaming: true,
-        isComplete: false,
-        type: 'thinking',
-        metadata: {
-          isPlaceholder: true,
-          placeholderState: 'thinking',
-          syntheticProcessingPlaceholder: true,
-        },
-      },
-    };
-  });
-
-  const effectiveRenderItems = $derived.by(() => (
-    syntheticStreamingRenderItem
-      ? [...safeRenderItems, syntheticStreamingRenderItem]
-      : safeRenderItems
-  ));
-
-  const safeRenderMessages = $derived.by(() => effectiveRenderItems.map((item) => item.message));
+  const safeRenderMessages = $derived.by(() => safeRenderItems.map((item) => item.message));
 
   function resolveStreamingMessageVersion(message: Message): string {
     const metadata = (message.metadata && typeof message.metadata === 'object')
@@ -151,16 +92,44 @@
     return currentStreamingMessage?.id || null;
   });
 
-  const timerStartTime = $derived.by(() => {
-    const timestamp = currentStreamingMessage?.timestamp;
+  const resolvedStreamingStartAt = $derived.by(() => {
+    const message = currentStreamingMessage;
+    if (!message) {
+      return 0;
+    }
+    const timestamp = message.timestamp;
     if (typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0) {
       return timestamp;
     }
     return 0;
   });
 
+  let stableStreamingStartAt = $state(0);
+  let stableStreamingSessionId = $state('');
+
+  $effect(() => {
+    const sessionId = currentSessionId || '';
+    if (sessionId !== stableStreamingSessionId) {
+      stableStreamingSessionId = sessionId;
+      stableStreamingStartAt = 0;
+    }
+    if (!currentStreamingMessage) {
+      stableStreamingStartAt = 0;
+      return;
+    }
+    const nextStartAt = resolvedStreamingStartAt;
+    if (!(typeof nextStartAt === 'number' && Number.isFinite(nextStartAt) && nextStartAt > 0)) {
+      return;
+    }
+    if (stableStreamingStartAt === 0 || nextStartAt < stableStreamingStartAt) {
+      stableStreamingStartAt = nextStartAt;
+    }
+  });
+
+  const timerStartTime = $derived.by(() => stableStreamingStartAt);
+
   const shouldRunTimer = $derived.by(() => {
-    return Boolean(currentStreamingMessage && timerStartTime > 0);
+    return timerStartTime > 0;
   });
 
   let elapsedSeconds = $state(0);
@@ -530,7 +499,7 @@
         <p class="empty-hint">{emptyHint}</p>
       </div>
     {:else}
-      {#each effectiveRenderItems as item (item.key)}
+      {#each safeRenderItems as item (item.key)}
         <MessageItem
           message={item.message}
           {readOnly}

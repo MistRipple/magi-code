@@ -530,7 +530,10 @@ export interface SessionRuntimeBranchSummaryDto {
   lease_id?: string | null;
   execution_intent_ref?: string | null;
   binding_lifecycle?: string | null;
-  last_checkpoint_at?: number | null;
+  checkpoint_stage?: string | null;
+  next_step_index?: number | null;
+  checkpoint_at?: number | null;
+  resume_mode?: string | null;
   is_primary: boolean;
 }
 
@@ -737,6 +740,7 @@ export interface SessionCloseRequestDto {
 
 export interface SessionContinueRequestDto {
   sessionId: string;
+  promptText?: string | null;
   requestedWorkerIds?: string[];
 }
 

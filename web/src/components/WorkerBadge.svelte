@@ -9,6 +9,7 @@
 
   interface Props {
     worker: string;
+    label?: string;
     status?: WorkerStatus;
     size?: 'sm' | 'md' | 'lg';
     showStatus?: boolean;
@@ -16,6 +17,7 @@
 
   let {
     worker,
+    label = '',
     status = 'idle',
     size = 'sm',
     showStatus = false
@@ -65,6 +67,10 @@
   const statusInfo = $derived(statusConfig[status]);
   const displayWorkerName = $derived.by(() => {
     void currentLocale;
+    const explicitLabel = typeof label === 'string' ? label.trim() : '';
+    if (explicitLabel) {
+      return explicitLabel;
+    }
     return resolveAgentDisplayLabel(worker, (key) => i18n.t(key));
   });
 </script>

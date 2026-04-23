@@ -443,9 +443,27 @@ async function parseAgentJson<T>(response: Response, action: string): Promise<T>
     const contentType = response.headers.get('content-type') || '';
     if (contentType.includes('application/json')) {
       try {
-        const payload = await response.json() as { error?: string };
-        if (typeof payload?.error === 'string' && payload.error.trim()) {
-          backendError = payload.error.trim();
+        const payload = await response.json() as {
+          error?: unknown;
+          message?: unknown;
+          detail?: unknown;
+          details?: unknown;
+        };
+        const nestedError = payload?.error;
+        const candidates = [
+          nestedError,
+          typeof nestedError === 'object' && nestedError !== null
+            ? (nestedError as { message?: unknown }).message
+            : undefined,
+          payload?.message,
+          payload?.detail,
+          payload?.details,
+        ];
+        for (const candidate of candidates) {
+          if (typeof candidate === 'string' && candidate.trim()) {
+            backendError = candidate.trim();
+            break;
+          }
         }
       } catch {
         // ignore malformed error payload and fallback to generic message
@@ -934,6 +952,32 @@ export async function submitAgentSessionAction(
   }
 }
 
+export async function submitAgentChatMessage(
+  payload: {
+    text: string;
+  },
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<{
+  sessionId: string;
+  entryId: string;
+  eventId: string;
+  acceptedAt: number;
+  createdSession: boolean;
+}> {
+  return await postBoundJson<{
+    sessionId: string;
+    entryId: string;
+    eventId: string;
+    acceptedAt: number;
+    createdSession: boolean;
+  }>(
+    '/api/session/chat',
+    { text: payload.text },
+    'submit session chat',
+    bindingOverride,
+  );
+}
+
 export async function interruptAgentTask(
   payload: { taskId: string },
 ): Promise<Record<string, unknown>> {
@@ -950,10 +994,34 @@ export async function startAgentTask(taskId: string): Promise<Record<string, unk
 
 export async function continueAgentSession(
   sessionId: string,
-): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>(
+  options: { promptText?: string | null } = {},
+): Promise<{
+  sessionId: string;
+  missionId: string;
+  rootTaskId: string;
+  executionChainRef: string;
+  resumedBranchCount: number;
+  status: string;
+  runnerStarted: boolean;
+  eventId: string;
+  continuedAt: number;
+}> {
+  return await postBoundJson<{
+    sessionId: string;
+    missionId: string;
+    rootTaskId: string;
+    executionChainRef: string;
+    resumedBranchCount: number;
+    status: string;
+    runnerStarted: boolean;
+    eventId: string;
+    continuedAt: number;
+  }>(
     '/api/session/continue',
-    { sessionId },
+    {
+      sessionId,
+      ...(typeof options.promptText === 'string' ? { promptText: options.promptText } : {}),
+    },
     'continue session',
   );
 }
@@ -1096,6 +1164,12 @@ export async function clearAgentProjectKnowledge(): Promise<AgentKnowledgeMutati
   return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/clear', {}, 'clear project knowledge');
 }
 
+export async function getAgentProjectKnowledge(): Promise<Record<string, unknown>> {
+  const query = buildBoundQuery({});
+  const response = await getTransport().request(agentUrl('/api/knowledge', query));
+  return await parseAgentJson<Record<string, unknown>>(response, 'load project knowledge');
+}
+
 export async function getAgentAdrs(filter?: { status?: string }): Promise<Record<string, unknown>> {
   const query = buildBoundQuery(filter?.status ? { status: filter.status } : {});
   const response = await getTransport().request(agentUrl(`/api/knowledge/adrs`, query));
@@ -1109,7 +1183,7 @@ export async function getAgentFaqs(filter?: { category?: string }): Promise<Reco
 }
 
 export async function searchAgentFaqs(keyword: string): Promise<Record<string, unknown>> {
-  const query = buildBoundQuery({ keyword });
+  const query = buildBoundQuery({ q: keyword });
   const response = await getTransport().request(agentUrl(`/api/knowledge/faqs/search`, query));
   return await parseAgentJson<Record<string, unknown>>(response, 'search faqs');
 }

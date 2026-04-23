@@ -41,9 +41,7 @@ import {
   shouldPreferRicherAuthoritativeProjection,
 } from '../lib/timeline-projection-freshness';
 import {
-  buildTimelineNodeLookup,
   buildTimelinePanelMessages,
-  buildTimelineRenderItems,
 } from '../lib/timeline-render-items';
 import {
   compareTimelineSemanticOrder,
@@ -383,50 +381,37 @@ function isValidPersistedArray(value: unknown, max: number): value is unknown[] 
 // 新增状态：变更、阶段、Toast、模型状态
 let edits = $state<Array<{ filePath: string; snapshotId?: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string; executionGroupId?: string }>>([]);
 let timelineProjectionDirty = false;
-
-const timelineNodeLookup = $derived.by(() => buildTimelineNodeLookup(messagesState.timelineNodes));
-const liveTimelineWorkerIds = $derived.by(() => {
-  const workerIds = new Set<string>();
-  for (const node of messagesState.timelineNodes) {
-    for (const workerId of node.workerTabs || []) {
+// 统一 Worker 运行态（唯一权威来源）
+// 当前主线只从 authoritative projection 读取消息视图。
+const messageProjection = $derived.by(() => {
+  const projection = messagesState.timelineProjection;
+  const workers: Record<string, Message[]> = {};
+  if (!projection) {
+    return {
+      thread: [],
+      workers,
+    };
+  }
+  const workerKeys = new Set<string>();
+  for (const artifact of projection.artifacts || []) {
+    for (const workerId of artifact.workerTabs || []) {
       if (typeof workerId === 'string' && workerId.trim()) {
-        workerIds.add(workerId.trim());
+        workerKeys.add(workerId.trim());
       }
     }
-    for (const item of node.executionItems || []) {
+    for (const item of artifact.executionItems || []) {
       for (const workerId of item.workerTabs || []) {
         if (typeof workerId === 'string' && workerId.trim()) {
-          workerIds.add(workerId.trim());
-        }
-      }
-    }
-    // 从 dispatch_group blocks 的 lanes 提取 worker IDs
-    const blocks = node.message?.blocks;
-    if (Array.isArray(blocks)) {
-      for (const block of blocks) {
-        if (block?.type === 'dispatch_group' && Array.isArray(block.lanes)) {
-          for (const lane of block.lanes) {
-            const w = typeof lane?.worker === 'string' ? lane.worker.trim() : '';
-            if (w) workerIds.add(w);
-          }
+          workerKeys.add(workerId.trim());
         }
       }
     }
   }
-  return Array.from(workerIds);
-});
-
-// 统一 Worker 运行态（唯一权威来源）
-// UI / worker runtime 统一从 projection 读取消息视图；timelineNodes 仅用于事件接入与投影构建。
-const messageProjection = $derived.by(() => {
-  const workers: Record<string, Message[]> = {};
-  const workerKeys = liveTimelineWorkerIds;
-  const projectionSource = messagesState.timelineProjection || timelineNodeLookup;
   for (const workerId of workerKeys) {
-    workers[workerId] = buildTimelinePanelMessages(projectionSource, 'worker', workerId);
+    workers[workerId] = buildTimelinePanelMessages(projection, 'worker', workerId);
   }
   return {
-    thread: buildTimelinePanelMessages(projectionSource, 'thread'),
+    thread: buildTimelinePanelMessages(projection, 'thread'),
     workers,
   };
 });
@@ -536,6 +521,28 @@ function mergeTimelineSortTimestamp(
 
 function normalizeProjectionRestoredMessage(message: Message): Message {
   return normalizeMessagePayload(message, '[MessagesStore] 投影消息');
+}
+
+function projectionArtifactsContainCurrentTurn(
+  artifacts: TimelineProjectionArtifact[] | undefined,
+): boolean {
+  return ensureArray<TimelineProjectionArtifact>(artifacts).some((artifact) => {
+    const metadata = resolveMessageMetadataRecord(artifact.message);
+    const turnId = typeof metadata?.turnId === 'string' ? metadata.turnId.trim() : '';
+    if (turnId) {
+      return true;
+    }
+    return ensureArray<TimelineExecutionItem>(artifact.executionItems).some((item) => {
+      const itemMetadata = resolveMessageMetadataRecord(item.message);
+      return typeof itemMetadata?.turnId === 'string' && itemMetadata.turnId.trim().length > 0;
+    });
+  });
+}
+
+function projectionContainsCurrentTurn(
+  projection: SessionTimelineProjection | null | undefined,
+): boolean {
+  return projectionArtifactsContainCurrentTurn(projection?.artifacts);
 }
 
 function normalizeSessionNotificationRecord(raw: unknown): Notification | null {
@@ -1026,6 +1033,47 @@ function buildProjectionRenderEntriesFromArtifacts(
     }));
 }
 
+function normalizeProjectionRenderEntries(
+  entries: unknown,
+  artifactById: Map<string, TimelineProjectionArtifact>,
+): TimelineProjectionRenderEntry[] {
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+  const normalized: TimelineProjectionRenderEntry[] = [];
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+    const candidate = entry as Record<string, unknown>;
+    const entryId = typeof candidate.entryId === 'string' ? candidate.entryId.trim() : '';
+    const artifactId = typeof candidate.artifactId === 'string' ? candidate.artifactId.trim() : '';
+    const executionItemId = typeof candidate.executionItemId === 'string'
+      ? candidate.executionItemId.trim()
+      : '';
+    if (!entryId || !artifactId) {
+      continue;
+    }
+    const artifact = artifactById.get(artifactId);
+    if (!artifact) {
+      continue;
+    }
+    if (executionItemId) {
+      const hasExecutionItem = ensureArray<TimelineExecutionItem>(artifact.executionItems)
+        .some((item) => item.itemId === executionItemId);
+      if (!hasExecutionItem) {
+        continue;
+      }
+    }
+    normalized.push({
+      entryId,
+      artifactId,
+      ...(executionItemId ? { executionItemId } : {}),
+    });
+  }
+  return normalized;
+}
+
 function isProjectionArtifact(
   artifact: unknown,
 ): artifact is SessionTimelineProjection['artifacts'][number] {
@@ -1118,13 +1166,38 @@ function canonicalizeTimelineProjection(
       ...artifact,
       displayOrder: artifact.displayOrder || 0,
     }));
+  const containsCurrentTurn = projectionArtifactsContainCurrentTurn(artifacts);
+
+  const artifactById = new Map<string, TimelineProjectionArtifact>();
+  for (const artifact of artifacts) {
+    artifactById.set(artifact.artifactId, artifact);
+  }
+
+  const normalizedThreadRenderEntries = normalizeProjectionRenderEntries(
+    projection.threadRenderEntries,
+    artifactById,
+  );
+  const normalizedWorkerRenderEntries = Object.fromEntries(
+    Object.entries(projection.workerRenderEntries || {}).map(([workerId, entries]) => [
+      workerId,
+      normalizeProjectionRenderEntries(entries, artifactById),
+    ]),
+  );
 
   return {
     ...projection,
     sessionId: normalizeSessionId(projection.sessionId) || projection.sessionId,
     artifacts,
-    threadRenderEntries: buildProjectionRenderEntriesFromArtifacts(artifacts, 'thread'),
-    workerRenderEntries: buildDynamicWorkerRenderEntries(artifacts),
+    threadRenderEntries: containsCurrentTurn
+      ? normalizedThreadRenderEntries
+      : normalizedThreadRenderEntries.length > 0
+      ? normalizedThreadRenderEntries
+      : buildProjectionRenderEntriesFromArtifacts(artifacts, 'thread'),
+    workerRenderEntries: containsCurrentTurn
+      ? normalizedWorkerRenderEntries
+      : Object.keys(normalizedWorkerRenderEntries).length > 0
+      ? normalizedWorkerRenderEntries
+      : buildDynamicWorkerRenderEntries(artifacts),
   };
 }
 
@@ -1214,6 +1287,13 @@ function syncTimelineProjectionFromNodes(
   if (!normalizedSessionId) {
     return;
   }
+  if (projectionContainsCurrentTurn(messagesState.timelineProjection)) {
+    timelineProjectionDirty = false;
+    if (options.persist !== false) {
+      scheduleSaveWebviewState();
+    }
+    return;
+  }
   messagesState.timelineProjection = buildLiveTimelineProjection(
     normalizedSessionId,
     messagesState.timelineNodes,
@@ -1231,6 +1311,10 @@ function ensureTimelineProjectionSnapshotCurrent(
   sessionId: string | null | undefined,
 ): SessionTimelineProjection | null {
   if (!timelineProjectionDirty) {
+    return messagesState.timelineProjection;
+  }
+  if (projectionContainsCurrentTurn(messagesState.timelineProjection)) {
+    timelineProjectionDirty = false;
     return messagesState.timelineProjection;
   }
   const normalizedSessionId = normalizeSessionId(sessionId);
@@ -1797,6 +1881,11 @@ function shouldReplaceOrchestratorRuntimeState(
 export function applyAuthoritativeProcessingState(input: AppState['processingState']): void {
   const snapshot = normalizeProcessingStateSnapshot(input);
   if (!snapshot) {
+    messagesState.backendProcessing = false;
+    messagesState.pendingRequests = new Set();
+    messagesState.activeMessageIds = new Set();
+    messagesState.thinkingStartAt = null;
+    messagesState.isProcessing = false;
     return;
   }
   // 防回抬保护：如果在 forced idle 冷却期内，拒绝后端权威状态覆盖
@@ -1827,9 +1916,6 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
   }
   messagesState.isProcessing = nextIsProcessing;
 }
-
-// 执行链中断状态（可恢复）
-let interruptedChain = $state<{ chainId: string; recoverable: boolean } | null>(null);
 
 // Wave 执行状态（提案 4.6）
 let waveState = $state<WaveState | null>(null);
@@ -1928,14 +2014,6 @@ export function setEnabledAgents(agents: EnabledAgent[]) {
   enabledAgents = agents;
 }
 
-export function getInterruptedChain() {
-  return interruptedChain;
-}
-
-export function setInterruptedChain(value: { chainId: string; recoverable: boolean } | null) {
-  interruptedChain = value;
-}
-
 export function getWaveState() {
   return waveState;
 }
@@ -1988,12 +2066,6 @@ export function getState() {
     set waveState(v) { waveState = v; },
     // Worker 运行态（统一入口）
     get workerRuntime() { return workerRuntime; },
-    getThreadRenderItems() {
-      return buildTimelineRenderItems(messagesState.timelineProjection || timelineNodeLookup, 'thread');
-    },
-    getWorkerRenderItems(worker: AgentId) {
-      return buildTimelineRenderItems(messagesState.timelineProjection || timelineNodeLookup, 'worker', worker);
-    },
   };
 }
 
@@ -2200,6 +2272,10 @@ export function setOrchestratorRuntimeState(input: OrchestratorRuntimeState | nu
     return;
   }
   messagesState.orchestratorRuntimeState = next;
+}
+
+export function replaceOrchestratorRuntimeState(input: OrchestratorRuntimeState | null): void {
+  messagesState.orchestratorRuntimeState = normalizeOrchestratorRuntimeState(input);
 }
 
 export function updatePanelScrollState(
@@ -3146,7 +3222,7 @@ export function setTimelineProjection(
 
 export function restoreTimelineProjectionIfNewer(
   projection: SessionTimelineProjection,
-  options: { hydrateNodes?: boolean; source?: 'persisted' | 'authoritative'; force?: boolean } = {},
+  options: { hydrateNodes?: boolean; source?: 'persisted' | 'authoritative' } = {},
 ): boolean {
   const normalizedSessionId = normalizeSessionId(projection.sessionId);
   if (!normalizedSessionId) {
@@ -3157,10 +3233,6 @@ export function restoreTimelineProjectionIfNewer(
     return false;
   }
   const currentProjection = ensureTimelineProjectionSnapshotCurrent(normalizedSessionId);
-  if (options.force === true) {
-    setTimelineProjection(projection, options);
-    return true;
-  }
   const isStrictlyNewer = compareTimelineProjectionFreshness(projection, currentProjection) > 0;
   if (!isStrictlyNewer && !shouldPreferRicherAuthoritativeProjection(projection, currentProjection)) {
     return false;

@@ -1,11 +1,5 @@
 <script lang="ts">
-  import type {
-    OrchestratorRuntimeState,
-    SessionTimelineProjection,
-    TimelineNode,
-    TimelineRenderItem,
-    WorkerLaneStatus,
-  } from '../types/message';
+  import type { OrchestratorRuntimeState } from '../types/message';
   import {
     messagesState,
     setCurrentBottomTab,
@@ -24,28 +18,6 @@
   }
   let { isTopActive = true }: Props = $props();
 
-  const ACTIVE_LANE_STATUSES = new Set<WorkerLaneStatus>([
-    'pending',
-    'running',
-    'blocked',
-    'awaiting_approval',
-    'review_required',
-  ]);
-
-  function hasActiveDispatchLane(source: SessionTimelineProjection | TimelineNode[] | null | undefined): boolean {
-    if (!source) {
-      return false;
-    }
-    const messages = Array.isArray(source)
-      ? source.map((node) => node?.message).filter(Boolean)
-      : (Array.isArray(source.artifacts) ? source.artifacts.map((artifact) => artifact?.message).filter(Boolean) : []);
-    return messages.some((message) => Array.isArray(message?.blocks) && message.blocks.some((block) => (
-      block?.type === 'dispatch_group'
-      && Array.isArray(block.lanes)
-      && block.lanes.some((lane) => ACTIVE_LANE_STATUSES.has(lane.status as WorkerLaneStatus))
-    )));
-  }
-
   // 底部 Tab: 使用 store 中的状态，支持从其他组件跳转
   const activeBottomTab = $derived(messagesState.currentBottomTab as string);
   function handleBottomTabChange(tab: string) {
@@ -55,37 +27,28 @@
   const activeWorkerTab = $derived.by(() => (
     isTopActive && activeBottomTab !== 'thread' ? activeBottomTab : null
   ));
-  const timelineSource = $derived(messagesState.timelineProjection || messagesState.timelineNodes);
   const threadRenderItems = $derived.by(() => (
-    isTopActive && activeBottomTab === 'thread'
-      ? (buildTimelineRenderItems(
-          timelineSource,
-          'thread',
-        ) as TimelineRenderItem[])
-      : []
+    !isTopActive || activeBottomTab !== 'thread'
+      ? []
+      : messagesState.timelineProjection
+        ? buildTimelineRenderItems(
+            messagesState.timelineProjection,
+            'thread',
+          )
+        : []
   ));
   const activeWorkerRenderItems = $derived.by(() => (
-    activeWorkerTab
-      ? (buildTimelineRenderItems(
-          timelineSource,
-          'worker',
-          activeWorkerTab,
-        ) as TimelineRenderItem[])
-      : []
+    !activeWorkerTab
+      ? []
+      : messagesState.timelineProjection
+        ? buildTimelineRenderItems(
+            messagesState.timelineProjection,
+            'worker',
+            activeWorkerTab,
+          )
+        : []
   ));
-  const runtimeState = $derived.by<OrchestratorRuntimeState | null>(() => {
-    const current = messagesState.orchestratorRuntimeState;
-    if (!current) {
-      return null;
-    }
-    if (current.status === 'completed' && hasActiveDispatchLane(timelineSource)) {
-      return {
-        ...current,
-        status: 'running',
-      };
-    }
-    return current;
-  });
+  const runtimeState = $derived.by<OrchestratorRuntimeState | null>(() => messagesState.orchestratorRuntimeState);
 </script>
 
 <div class="thread-panel">

@@ -2213,12 +2213,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   >([]);
 
   function applyUserRulesConfig(config: any): void {
-    if (!config) {
-      return;
-    }
-    if (typeof config.userRules === "string") {
-      userRules = config.userRules;
-    }
+    userRules = typeof config?.userRules === "string" ? config.userRules : "";
   }
 
   function applyWorkerConfigs(configs: Record<string, any> | undefined): void {
@@ -2367,13 +2362,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   function applySafeguardConfig(config: any): void {
-    if (config && Array.isArray(config.rules)) {
-      safeguardRules = config.rules.map((r: any) => ({
-        pattern: String(r.pattern || ""),
-        enabled: r.enabled !== false,
-        category: r.category || "custom",
-      }));
-    }
+    safeguardRules = Array.isArray(config?.rules)
+      ? config.rules.map((r: any) => ({
+          pattern: String(r.pattern || ""),
+          enabled: r.enabled !== false,
+          category: r.category || "custom",
+        }))
+      : [];
   }
 
   async function saveSafeguardRules(): Promise<void> {

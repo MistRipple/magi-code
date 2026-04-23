@@ -2,10 +2,27 @@
   import { getState, getEnabledAgents } from '../stores/messages.svelte';
   import { resolveAgentIndicatorVariant } from '../lib/agent-status-indicator';
 
-import Icon from './Icon.svelte';
-import { i18n } from '../stores/i18n.svelte';
-import { getAgentColor } from '../lib/agent-colors';
-import { collectWorkerTabIds, resolveWorkerDisplayName, resolveWorkerRoleSource } from '../lib/worker-role-utils';
+  import Icon from './Icon.svelte';
+  import { i18n } from '../stores/i18n.svelte';
+  import { getAgentColor } from '../lib/agent-colors';
+  import { resolveWorkerDisplayName, resolveWorkerRoleSource } from '../lib/worker-role-utils';
+
+  interface CurrentTurnWorkerRoleMeta {
+    laneId?: string;
+    laneSeq?: number;
+    worker?: string;
+    roleId?: string;
+    status?: string;
+    title?: string;
+    isPrimary?: boolean;
+  }
+
+  interface CurrentTurnWorkerRoleTab {
+    roleId: string;
+    order: number;
+    workerId: string;
+    status: string;
+  }
 
   interface Props {
     activeTab: string;
@@ -19,74 +36,124 @@ import { collectWorkerTabIds, resolveWorkerDisplayName, resolveWorkerRoleSource 
   const modelStatus = $derived(appState.modelStatus);
   const enabledAgents = $derived(getEnabledAgents());
   const registrySnapshot = $derived(appState.settingsRegistrySnapshot);
+  const timelineProjection = $derived(appState.timelineProjection);
 
-  // 模型连接状态（使用全局统一的 modelStatus）
+  const WORKER_STATUS_PRIORITY: Record<string, number> = {
+    running: 6,
+    pending: 5,
+    awaiting_approval: 4,
+    review_required: 4,
+    repairing: 4,
+    verifying: 4,
+    blocked: 3,
+    failed: 3,
+    cancelled: 3,
+    completed: 1,
+  };
 
-  const projectionWorkerIds = $derived.by(() => {
-    const workerIds = new Set<string>();
-    for (const node of appState.timelineNodes || []) {
-      for (const workerId of node.workerTabs || []) {
-        if (typeof workerId === 'string' && workerId.trim()) {
-          workerIds.add(workerId.trim());
+  function resolveStrongerStatus(existing: string, next: string): string {
+    const normalizedExisting = existing.trim();
+    const normalizedNext = next.trim();
+    if (!normalizedExisting) return normalizedNext;
+    if (!normalizedNext) return normalizedExisting;
+    const existingPriority = WORKER_STATUS_PRIORITY[normalizedExisting] ?? 0;
+    const nextPriority = WORKER_STATUS_PRIORITY[normalizedNext] ?? 0;
+    return nextPriority > existingPriority ? normalizedNext : normalizedExisting;
+  }
+
+  function collectCurrentTurnWorkerRoles(): CurrentTurnWorkerRoleTab[] {
+    const roleById = new Map<string, CurrentTurnWorkerRoleTab>();
+    const upsertRole = (role: Partial<CurrentTurnWorkerRoleTab> & { roleId?: string; order?: number }) => {
+      const roleId = typeof role.roleId === 'string' ? role.roleId.trim() : '';
+      if (!roleId) {
+        return;
+      }
+      const existing = roleById.get(roleId);
+      const order = typeof role.order === 'number' && Number.isFinite(role.order)
+        ? Math.max(0, Math.floor(role.order))
+        : existing?.order ?? Number.MAX_SAFE_INTEGER;
+      roleById.set(roleId, {
+        roleId,
+        order: Math.min(existing?.order ?? Number.MAX_SAFE_INTEGER, order),
+        workerId: existing?.workerId || role.workerId || '',
+        status: resolveStrongerStatus(existing?.status || '', role.status || ''),
+      });
+    };
+
+    const artifacts = Array.isArray(timelineProjection?.artifacts) ? timelineProjection.artifacts : [];
+    for (const artifact of artifacts) {
+      const laneMeta = artifact.message?.metadata?.currentTurnWorkerLanes;
+      if (Array.isArray(laneMeta) && laneMeta.length > 0) {
+        for (const lane of laneMeta as CurrentTurnWorkerRoleMeta[]) {
+          const roleId = typeof lane?.roleId === 'string' ? lane.roleId.trim() : '';
+          if (!roleId || lane?.isPrimary === true) {
+            continue;
+          }
+          const order = typeof lane?.laneSeq === 'number' && Number.isFinite(lane.laneSeq)
+            ? Math.max(0, Math.floor(lane.laneSeq))
+            : Number.MAX_SAFE_INTEGER;
+          const workerId = typeof lane?.worker === 'string' ? lane.worker.trim() : '';
+          const status = typeof lane?.status === 'string' ? lane.status.trim() : '';
+          upsertRole({ roleId, order, workerId, status });
         }
       }
-      for (const item of node.executionItems || []) {
-        for (const workerId of item.workerTabs || []) {
-          if (typeof workerId === 'string' && workerId.trim()) {
-            workerIds.add(workerId.trim());
-          }
-        }
+      for (const roleId of artifact.workerTabs || []) {
+        upsertRole({
+          roleId,
+          workerId: artifact.worker || '',
+        });
       }
-      // 从 dispatch_group blocks 的 lanes 提取 worker IDs
-      const blocks = node.message?.blocks;
-      if (Array.isArray(blocks)) {
-        for (const block of blocks) {
-          if (block?.type === 'dispatch_group' && Array.isArray(block.lanes)) {
-            for (const lane of block.lanes) {
-              const w = typeof lane?.worker === 'string' ? lane.worker.trim() : '';
-              if (w) workerIds.add(w);
-            }
-          }
+      for (const item of artifact.executionItems || []) {
+        const metadata = item.message?.metadata && typeof item.message.metadata === 'object'
+          ? item.message.metadata as Record<string, unknown>
+          : {};
+        for (const roleId of item.workerTabs || []) {
+          const order = typeof metadata.laneSeq === 'number' && Number.isFinite(metadata.laneSeq)
+            ? Math.max(0, Math.floor(metadata.laneSeq))
+            : Number.MAX_SAFE_INTEGER;
+          const workerId = typeof metadata.worker === 'string' ? metadata.worker.trim() : (item.worker || '');
+          const status = typeof metadata.laneStatus === 'string'
+            ? metadata.laneStatus.trim()
+            : (typeof metadata.status === 'string' ? metadata.status.trim() : '');
+          upsertRole({ roleId, order, workerId, status });
         }
       }
     }
-    return Array.from(workerIds);
-  });
-
-  // 从 dispatch_group lanes 派生 Worker 运行状态（唯一真相源）
-  const dispatchLaneStatusMap = $derived.by(() => {
-    const map = new Map<string, string>();
-    for (const node of appState.timelineNodes || []) {
-      const blocks = node.message?.blocks;
-      if (!Array.isArray(blocks)) continue;
-      for (const block of blocks) {
-        if (block?.type !== 'dispatch_group' || !Array.isArray(block.lanes)) continue;
-        for (const lane of block.lanes) {
-          const w = typeof lane?.worker === 'string' ? lane.worker.trim() : '';
-          if (!w) continue;
-          const existing = map.get(w);
-          // 优先保留 running/pending 等活跃状态
-          if (!existing || lane.status === 'running' || lane.status === 'pending') {
-            map.set(w, lane.status || '');
-          }
-        }
+    return Array.from(roleById.values()).sort((left, right) => {
+      if (left.order !== right.order) {
+        return left.order - right.order;
       }
+      return left.roleId.localeCompare(right.roleId);
+    });
+  }
+
+  // 模型连接状态（使用全局统一的 modelStatus）
+
+  const currentTurnWorkerRoles = $derived.by(() => collectCurrentTurnWorkerRoles());
+
+  // 底部 tab 只表达角色参与状态，lane/task 只在 worker 面板内容中展示。
+  const workerRoleStatusMap = $derived.by(() => {
+    const map = new Map<string, string>();
+    for (const role of currentTurnWorkerRoles) {
+      if (!role.status) continue;
+      map.set(role.roleId, role.status);
     }
     return map;
   });
 
-  function resolveEffectiveWorkerExecuting(workerId: string): boolean {
-    const laneStatus = dispatchLaneStatusMap.get(workerId);
-    return laneStatus === 'running'
-      || laneStatus === 'pending'
-      || laneStatus === 'blocked'
-      || laneStatus === 'awaiting_approval'
-      || laneStatus === 'review_required';
+  function resolveEffectiveWorkerExecuting(roleId: string): boolean {
+    const roleStatus = workerRoleStatusMap.get(roleId);
+    return roleStatus === 'running'
+      || roleStatus === 'pending'
+      || roleStatus === 'awaiting_approval'
+      || roleStatus === 'review_required'
+      || roleStatus === 'repairing'
+      || roleStatus === 'verifying';
   }
 
-  function resolveLaneIndicatorVariant(workerId: string): 'brand' | 'warning' | 'error' | 'disabled' | null {
-    const laneStatus = dispatchLaneStatusMap.get(workerId);
-    switch (laneStatus) {
+  function resolveRoleIndicatorVariant(roleId: string): 'brand' | 'warning' | 'error' | 'disabled' | null {
+    const roleStatus = workerRoleStatusMap.get(roleId);
+    switch (roleStatus) {
       case 'running':
       case 'pending':
         return 'brand';
@@ -102,17 +169,10 @@ import { collectWorkerTabIds, resolveWorkerDisplayName, resolveWorkerRoleSource 
     }
   }
 
-  // 底栏 tab 列表：已启用角色 + 主线 projection 中的真实参与者
-  const workerTabs = $derived.by(() => collectWorkerTabIds(
-    projectionWorkerIds,
-    enabledAgents,
-    registrySnapshot,
-  ));
-
-
-
-
   function getWorkerModelStatus(workerId: string): string {
+    if (!workerId) {
+      return 'not_configured';
+    }
     const roleSource = resolveWorkerRoleSource(workerId, enabledAgents, registrySnapshot);
     if (roleSource?.enabled === false) {
       return 'disabled';
@@ -123,9 +183,10 @@ import { collectWorkerTabIds, resolveWorkerDisplayName, resolveWorkerRoleSource 
     return modelStatus[lookupKey]?.status || 'not_configured';
   }
 
-  function resolveLocalizedWorkerName(workerId: string, locale: string): string {
+  function resolveRoleDisplayName(role: CurrentTurnWorkerRoleTab, locale: string): string {
     void locale;
-    return resolveWorkerDisplayName(workerId, enabledAgents, registrySnapshot, (key) => i18n.t(key));
+    return resolveWorkerDisplayName(role.roleId, enabledAgents, registrySnapshot, (key) => i18n.t(key))
+      || role.roleId;
   }
 
 </script>
@@ -141,23 +202,23 @@ import { collectWorkerTabIds, resolveWorkerDisplayName, resolveWorkerRoleSource 
     {i18n.t('bottomTabs.thread')}
   </button>
   <div class="bt-workers-scroll">
-    {#each workerTabs as workerId (workerId)}
+    {#each currentTurnWorkerRoles as role (role.roleId)}
       {@const locale = i18n.locale}
-      {@const isExecuting = resolveEffectiveWorkerExecuting(workerId)}
-      {@const roleSource = resolveWorkerRoleSource(workerId, enabledAgents, registrySnapshot)}
-      {@const agentColorPair = getAgentColor(workerId, roleSource?.colorToken)}
-      {@const workerStatus = getWorkerModelStatus(workerId)}
-      {@const laneIndicatorVariant = resolveLaneIndicatorVariant(workerId)}
-      {@const indicatorVariant = laneIndicatorVariant || resolveAgentIndicatorVariant(workerStatus)}
+      {@const isExecuting = resolveEffectiveWorkerExecuting(role.roleId)}
+      {@const roleSource = resolveWorkerRoleSource(role.roleId, enabledAgents, registrySnapshot)}
+      {@const agentColorPair = getAgentColor(role.roleId, roleSource?.colorToken)}
+      {@const workerStatus = getWorkerModelStatus(role.roleId)}
+      {@const roleIndicatorVariant = resolveRoleIndicatorVariant(role.roleId)}
+      {@const indicatorVariant = roleIndicatorVariant || resolveAgentIndicatorVariant(workerStatus)}
 
 
       <button
         class="bt-tab bt-worker"
-        class:active={activeTab === workerId}
+        class:active={activeTab === role.roleId}
         class:is-executing={isExecuting}
         style="--w-color: {agentColorPair.color}"
-        data-tab-id={workerId}
-        onclick={() => onTabChange(workerId)}
+        data-tab-id={role.roleId}
+        onclick={() => onTabChange(role.roleId)}
         >
         <span class="bt-dot-wrap">
           <span
@@ -169,7 +230,7 @@ import { collectWorkerTabIds, resolveWorkerDisplayName, resolveWorkerRoleSource 
             class:executing={isExecuting}
           ></span>
         </span>
-        {resolveLocalizedWorkerName(workerId, locale)}
+        {resolveRoleDisplayName(role, locale)}
       </button>
     {/each}
   </div>

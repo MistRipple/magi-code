@@ -44,8 +44,7 @@
   const isStreaming = $derived(message.isStreaming);
   const retryRuntime = $derived(retryRuntimeState.byMessageId.get(message.id));
 
-  // 主角色判断：主对话区的主角色是 orchestrator，Worker 面板的主角色是当前角色 Worker
-  // 主角色消息使用 inline 模式（无卡片包裹），客角色消息使用 card 模式
+  // 主角色判断只决定来源标签；是否加卡片壳由 usesCardShell 的内容语义白名单决定。
   const isNativeSource = $derived(
     displayContext === 'thread'
       ? message.source === 'orchestrator'
@@ -71,12 +70,6 @@
       !!b && typeof b === 'object' && 'type' in b
     )
   );
-  const isDispatchGroupOnlyMessage = $derived.by(() => (
-    safeBlocks.length === 1
-    && safeBlocks[0]?.type === 'dispatch_group'
-    && !(message.content && message.content.trim().length > 0)
-  ));
-
   // 检查是否真的有可见内容（防止虽然有 blocks 但全是空字符串导致 UI 假死）
   const hasVisibleContent = $derived.by(() => {
     if (message.content && message.content.trim().length > 0) return true;
@@ -88,12 +81,19 @@
       if (block.type === 'tool_result') return true;
       if (block.type === 'file_change') return true;
       if (block.type === 'plan') return true;
-      if (block.type === 'dispatch_group') return true;
       if (block.type === 'thinking' && block.thinking?.content && block.thinking.content.trim().length > 0) return true;
       if (block.type === 'text' && block.content && block.content.trim().length > 0) return true;
     }
     return false;
   });
+
+  function blockRequiresCardShell(block: import('../types/message').ContentBlock): boolean {
+    return block.type === 'thinking'
+      || block.type === 'tool_call'
+      || block.type === 'tool_result'
+      || block.type === 'file_change'
+      || block.type === 'plan';
+  }
 
   const messagePhase = $derived.by(() => (
     typeof message.metadata?.phase === 'string' ? message.metadata.phase.trim() : ''
@@ -188,7 +188,46 @@
 
   // 获取 worker 信息（如果有）
   const worker = $derived(message.metadata?.worker || null);
+  const laneTitle = $derived.by(() => {
+    const value = message.metadata?.laneTitle;
+    return typeof value === 'string' ? value.trim() : '';
+  });
+  const turnItemKind = $derived.by(() => {
+    const value = message.metadata?.turnItemKind;
+    return typeof value === 'string' ? value.trim() : '';
+  });
+  const isWorkerContent = $derived.by(() => (
+    displayContext === 'thread'
+    && turnItemKind.startsWith('worker_')
+  ));
+  const hasCardBlock = $derived.by(() => safeBlocks.some(blockRequiresCardShell));
+  const messageTypeRequiresCardShell = $derived.by(() => {
+    switch (message.type) {
+      case 'thinking':
+      case 'tool_call':
+      case 'plan':
+      case 'task_card':
+      case 'interaction':
+      case 'error':
+        return true;
+      default:
+        return false;
+    }
+  });
+  const usesCardShell = $derived.by(() => (
+    isPlaceholder
+    || isInteraction
+    || shouldCollapseSystemSection
+    || isWorkerContent
+    || hasCardBlock
+    || messageTypeRequiresCardShell
+  ));
   const badgeWorker = $derived(worker || (message.source === 'orchestrator' ? 'orchestrator' : message.source));
+  const workerBadgeLabel = $derived.by(() => (
+    turnItemKind.startsWith('worker_') && laneTitle
+      ? laneTitle
+      : ''
+  ));
   const responseDurationMs = $derived.by(() => {
     const value = message.metadata?.responseDurationMs;
     return typeof value === 'number' && Number.isFinite(value) && value >= 0
@@ -276,16 +315,14 @@
       {formatTime(message.timestamp)}
     </div>
   </div>
-{:else if isDispatchGroupOnlyMessage}
-  <div class="dispatch-group-only" data-message-id={message.id} data-source={message.source}>
-    <BlockRenderer block={safeBlocks[0]} {isStreaming} {readOnly} />
-  </div>
 <!-- 助手消息：单一纯流式渲染路径，收到什么立即展示，不做模式切换 -->
 {:else}
   <div
     class="message-item assistant"
     class:native={isNativeSource}
     class:inline-guest={!isNativeSource}
+    class:card-shell={usesCardShell}
+    class:plain-shell={!usesCardShell}
     class:streaming={isStreaming}
     class:placeholder={isPlaceholder}
     class:was-placeholder={wasPlaceholder}
@@ -299,7 +336,7 @@
     <!-- 非主角色：在内容前显示来源标识 -->
     {#if !isNativeSource && !isPlaceholder}
       <div class="inline-source-tag">
-        <WorkerBadge worker={badgeWorker} size="sm" />
+        <WorkerBadge worker={badgeWorker} label={workerBadgeLabel} size="sm" />
       </div>
     {/if}
 
@@ -480,36 +517,36 @@
     opacity: 0.85;
   }
 
-  .dispatch-group-only {
-    padding: 0 var(--space-4);
-    margin-right: var(--space-2);
-  }
-
-  /* ===== 助手消息样式（card 模式：客角色） ===== */
+  /* ===== 助手消息基础样式：默认纯正文，不带卡片壳 ===== */
   .message-item.assistant {
     display: flex;
     flex-direction: column;
-    padding: var(--space-4);
-    border-radius: var(--radius-lg);
-    background: var(--assistant-message-bg);
-    border: 1px solid var(--border);
+    padding: 0 var(--space-4);
     margin-right: var(--space-2);
-    transition: border-color 0.2s ease, box-shadow 0.2s ease;
     flex-shrink: 0;
     height: auto;
     overflow: visible;
   }
 
-  /* ===== inline 模式样式（无卡片包裹） ===== */
-  .message-item.assistant.native {
-    background: transparent;
+  .message-item.assistant.plain-shell {
     border: none;
-    padding: 0 var(--space-4);
     border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  /* ===== 卡片壳只用于 thinking / 工具 / worker / 特殊格式 ===== */
+  .message-item.assistant.card-shell {
+    padding: var(--space-4);
+    border-radius: var(--radius-lg);
+    background: var(--assistant-message-bg);
+    border: 1px solid var(--border);
+    border-left-width: 3px;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
   }
 
   /* 主角色连续消息紧凑间距（orchestrator 在主对话区、worker 在 Worker 面板） */
-  .message-item.assistant.native:not(.inline-guest) {
+  .message-item.assistant.plain-shell:not(.inline-guest) {
     margin-top: calc(-1 * var(--space-2));
   }
 
@@ -524,8 +561,8 @@
     min-height: 0;
   }
 
-  /* 移除无可见内容时的多余包装感（针对客角色卡片） */
-  .message-item.assistant.streaming.no-visible-content:not(.placeholder) {
+  /* 移除无可见内容时的多余包装感（针对特殊卡片） */
+  .message-item.assistant.card-shell.streaming.no-visible-content:not(.placeholder) {
     border-color: transparent;
     background: transparent;
     box-shadow: none;

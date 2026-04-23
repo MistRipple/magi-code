@@ -14,11 +14,26 @@ export interface TimelineProjectionHydrationInput {
   incomingTimelineProjection?: SessionTimelineProjection | null | undefined;
 }
 
-function projectionContainsDispatchGroup(projection: SessionTimelineProjection | null | undefined): boolean {
+function projectionContainsCurrentTurn(projection: SessionTimelineProjection | null | undefined): boolean {
   const artifacts = Array.isArray(projection?.artifacts) ? projection.artifacts : [];
   return artifacts.some((artifact) => {
-    const blocks = Array.isArray(artifact?.message?.blocks) ? artifact.message.blocks : [];
-    return blocks.some((block) => block?.type === 'dispatch_group');
+    const metadata = artifact?.message?.metadata;
+    const turnId = metadata && typeof metadata === 'object' && typeof metadata.turnId === 'string'
+      ? metadata.turnId.trim()
+      : '';
+    if (turnId) {
+      return true;
+    }
+    const executionItems = Array.isArray(artifact?.executionItems) ? artifact.executionItems : [];
+    return executionItems.some((item) => {
+      const itemMetadata = item?.message?.metadata;
+      return Boolean(
+        itemMetadata
+        && typeof itemMetadata === 'object'
+        && typeof itemMetadata.turnId === 'string'
+        && itemMetadata.turnId.trim(),
+      );
+    });
   });
 }
 
@@ -57,17 +72,16 @@ export function shouldAcceptAuthoritativeTimelineProjection(
     return true;
   }
 
-  const incomingHasDispatchGroup = projectionContainsDispatchGroup(incomingProjection);
-  const currentHasDispatchGroup = projectionContainsDispatchGroup(currentProjection);
+  const incomingHasCurrentTurn = projectionContainsCurrentTurn(incomingProjection);
+  const currentHasCurrentTurn = projectionContainsCurrentTurn(currentProjection);
 
-  // 架构约束：dispatch_group 是 Worker 生命周期主线唯一宿主。
-  // 同 session 的 live 文本节点若尚未切换到 dispatch_group，
-  // authoritative projection 一旦包含 dispatch_group，必须允许其接管，
-  // 避免出现“派发后主线先无卡片、结束后卡片仍丢失”的退化体验。
-  if (incomingHasDispatchGroup && !currentHasDispatchGroup) {
+  // 当前架构下，current_turn 是主线编排唯一宿主。
+  // 同 session 的 live 节点如果还停留在旧 projection，authoritative projection
+  // 一旦带有 current_turn，就必须优先接管，避免主线顺序继续受旧宿主影响。
+  if (incomingHasCurrentTurn && !currentHasCurrentTurn) {
     return true;
   }
-  if (currentHasDispatchGroup && !incomingHasDispatchGroup) {
+  if (currentHasCurrentTurn && !incomingHasCurrentTurn) {
     return false;
   }
 

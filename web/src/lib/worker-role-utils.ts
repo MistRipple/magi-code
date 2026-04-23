@@ -139,7 +139,7 @@ export function collectWorkerTabIds(
   const workerTabs: string[] = [];
   const seen = new Set<string>();
 
-  // 当前会话真实参与者：来自主线 projection（dispatch_group lanes）。
+  // 当前会话真实参与者来自当前 turn/lane 投影；旧会话才会回退到历史兼容数据。
   // 内置角色默认可调度，但只有真实参与任务后才进入可视化工作台。
   for (const workerId of projectionWorkerIds) {
     const normalizedWorkerId = normalizeWorkerSlot(workerId) || normalizeWorkerId(workerId);

@@ -30,10 +30,8 @@
 
 /* 消息容器样式（基础） */
 .message-item {
-  background: var(--msg-orchestrator-bg);
-  border: 1px solid var(--msg-orchestrator-border);
   animation: messageEnter var(--duration-fast) var(--ease-out);
-  /* 🔧 根源修复：禁止 Flex 容器压缩消息卡片高度，确保卡片始终包裹内容 */
+  /* 禁止 Flex 容器压缩消息高度，具体卡片样式由 message 类型显式决定 */
   flex-shrink: 0;
 }
 
@@ -54,15 +52,9 @@
   border: none;
 }
 
-/* 编排者消息 */
-.message-item.assistant[data-source="orchestrator"] {
-  border-left: 3px solid var(--color-orchestrator);
+/* 编排者卡片消息 */
+.message-item.assistant.card-shell[data-source="orchestrator"] {
   --stream-accent: var(--color-orchestrator);
-}
-
-/* 通用 Worker 消息：颜色完全通过行内 style 动态注入 */
-.message-item.assistant {
-  border-left: 3px solid transparent;
 }
 
 /* 流式输出时，移除外层卡片的呼吸动画，仅保留三点跳动动画 */

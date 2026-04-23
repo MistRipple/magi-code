@@ -7,7 +7,7 @@
   import Icon from './Icon.svelte';
   import WorkerBadge from './WorkerBadge.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { isWebAgentMode, resolveAgentBaseUrl } from '../web/agent-api';
+  import { isWebAgentMode } from '../web/agent-api';
 
   const appState = getState();
   const isWebMode = isWebAgentMode();
@@ -146,27 +146,11 @@
   }
   function approveChange(filePath: string) {
     const sessionId = getCurrentSessionId() || undefined;
-    if (isWebMode) {
-      fetch(`${resolveAgentBaseUrl()}/api/changes/approve`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filePath, sessionId }),
-      }).catch(console.error);
-    } else {
-      vscode.postMessage({ type: 'approveChange', filePath, sessionId });
-    }
+    vscode.postMessage({ type: 'approveChange', filePath, sessionId });
   }
   function revertChange(filePath: string) {
     const sessionId = getCurrentSessionId() || undefined;
-    if (isWebMode) {
-      fetch(`${resolveAgentBaseUrl()}/api/changes/revert`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filePath, sessionId }),
-      }).catch(console.error);
-    } else {
-      vscode.postMessage({ type: 'revertChange', filePath, sessionId });
-    }
+    vscode.postMessage({ type: 'revertChange', filePath, sessionId });
   }
   async function viewDiff(filePath: string) {
     const edit = edits.find((candidate) => candidate.filePath === filePath) ?? null;
@@ -199,40 +183,16 @@
   }
   function approveAllChanges() {
     const sessionId = getCurrentSessionId() || undefined;
-    if (isWebMode) {
-      fetch(`${resolveAgentBaseUrl()}/api/changes/approve-all`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId }),
-      }).catch(console.error);
-    } else {
-      vscode.postMessage({ type: 'approveAllChanges', sessionId });
-    }
+    vscode.postMessage({ type: 'approveAllChanges', sessionId });
   }
   function revertAllChanges() {
     const sessionId = getCurrentSessionId() || undefined;
-    if (isWebMode) {
-      fetch(`${resolveAgentBaseUrl()}/api/changes/revert-all`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId }),
-      }).catch(console.error);
-    } else {
-      vscode.postMessage({ type: 'revertAllChanges', sessionId });
-    }
+    vscode.postMessage({ type: 'revertAllChanges', sessionId });
   }
   function revertExecutionGroup() {
     if (!latestExecutionGroupId) return;
     const sessionId = getCurrentSessionId() || undefined;
-    if (isWebMode) {
-      fetch(`${resolveAgentBaseUrl()}/api/changes/revert-execution-group`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ executionGroupId: latestExecutionGroupId, sessionId }),
-      }).catch(console.error);
-    } else {
-      vscode.postMessage({ type: 'revertExecutionGroup', executionGroupId: latestExecutionGroupId, sessionId });
-    }
+    vscode.postMessage({ type: 'revertExecutionGroup', executionGroupId: latestExecutionGroupId, sessionId });
   }
 
   function getEditKey(edit: Edit): string {

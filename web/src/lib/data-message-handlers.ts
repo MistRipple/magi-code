@@ -19,7 +19,6 @@ import {
   addToast,
   clearPendingRequest,
   setProcessingActor,
-  getBackendProcessing,
   getRequestBinding,
   clearRequestBinding,
   listRequestBindings,
@@ -27,6 +26,7 @@ import {
   clearProcessingState,
   sealAllStreamingMessages,
   setOrchestratorRuntimeState,
+  replaceOrchestratorRuntimeState,
   applyAuthoritativeProcessingState,
   markMessageComplete,
   updateRequestBinding,
@@ -34,7 +34,6 @@ import {
   settleProcessingAfterResponseCompletion,
   applySessionNotifications,
   batchWebviewStatePersistence,
-  setInterruptedChain,
   setEnabledAgents,
   setSessionHistoryState,
 } from '../stores/messages.svelte';
@@ -214,29 +213,15 @@ export function handleUnifiedControlMessage(standard: StandardMessage) {
 
   switch (controlType) {
     case 'phase_changed':
-      // 阶段变化：仅同步后端运行态
-      // 重要：禁止在这里清空 activeMessageIds/pendingRequests，
-      // 避免 Worker 仍在流式输出时 Stop 按钮提前恢复。
-      {
-        const isRunning = payload?.isRunning as boolean | undefined;
-        if (isRunning === true) {
-          setIsProcessing(true);
-        }
-      }
+      // 阶段变化只作为事件提示存在，实际处理态统一由 pending request、
+      // 活跃流式消息和 authoritative snapshot 驱动。
       break;
 
     case 'task_accepted': {
-      // 任务被接受：清除中断链状态（resume 或新任务开始）
-      setInterruptedChain(null);
-      // 防御性检查：backendProcessing 仍为 false 时先设置处理状态
+      // 任务已被接受，但当前轮仍保持 pending request，
+      // 等权威 bootstrap / 流式消息接管后再自然清空，避免接受瞬间出现 processing 空窗。
       const requestId = payload?.requestId as string | undefined;
       if (requestId) {
-        if (!getBackendProcessing()) {
-          // 异常时序：先确保处理状态为 true，避免 isProcessing 出现空窗期
-          setIsProcessing(true);
-        }
-        clearPendingRequest(requestId);
-
         // 更新占位消息状态：pending → received
         const binding = getRequestBinding(requestId);
         if (binding) {
@@ -316,8 +301,7 @@ export function handleUnifiedControlMessage(standard: StandardMessage) {
     }
 
     case 'task_started':
-      // 任务开始执行
-      setIsProcessing(true);
+      // 任务开始执行后由权威快照和实时流接管，不在这里额外抬升 processing。
       {
         const requestId = payload?.requestId as string | undefined;
         if (requestId) {
@@ -427,12 +411,10 @@ export function handleUnifiedData(standard: StandardMessage) {
     case 'processingStateChanged': {
       const isProcessing = payload.isProcessing as boolean | undefined;
       const transitionKind = payload.transitionKind as 'derived' | 'forced' | undefined;
-      // true 仍可作为兜底提升信号；
-      // false 只有在 provider 明确给出 forced idle 时才允许清空，
-      // 避免把“当前无活跃消息卡片”误判成“整个系统已经空闲”。
-      if (isProcessing === true) {
-        setIsProcessing(true);
-      } else if (isProcessing === false && transitionKind === 'forced') {
+      // 当前只接受强制 idle 终态信号。
+      // processing=true 统一由本地 pending request 或后端 authoritative snapshot 驱动，
+      // 这里不再保留兜底抬升路径，避免处理态出现双真相源。
+      if (isProcessing === false && transitionKind === 'forced') {
         clearProcessingState();
         // forced idle 代表“全局终态已确认”，需要同步封口残留流式内容，避免 UI 仍显示执行中动画。
         sealAllStreamingMessages();
@@ -496,23 +478,9 @@ export function handleUnifiedData(standard: StandardMessage) {
       applyPlanLedgerSnapshot(payload);
       break;
 
-    case 'recoveryRequest':
-      handleRecoveryRequest(asMessage(payload));
-      break;
-
     case 'orchestratorRuntimeState':
       handleOrchestratorRuntimeState(asMessage(payload));
       break;
-
-    case 'executionChainInterrupted': {
-      const chainPayload = payload as Record<string, unknown>;
-      const chainId = typeof chainPayload.chainId === 'string' ? chainPayload.chainId : '';
-      const recoverable = chainPayload.recoverable === true;
-      if (chainId) {
-        setInterruptedChain({ chainId, recoverable });
-      }
-      break;
-    }
 
     case 'clarificationRequest':
       handleClarificationRequest(asMessage(payload));
@@ -524,14 +492,6 @@ export function handleUnifiedData(standard: StandardMessage) {
 
     // missionPlanned / assignmentPlanned / assignmentStarted / assignmentCompleted
     // handlers removed — old Mission/Assignment model superseded by Task Graph.
-
-    case 'workerSessionCreated':
-      handleWorkerSessionCreated(asMessage(payload));
-      break;
-
-    case 'workerSessionResumed':
-      handleWorkerSessionResumed(asMessage(payload));
-      break;
 
     case 'settingsBootstrapLoaded':
       handleSettingsBootstrapLoaded(asMessage(payload));
@@ -838,7 +798,6 @@ function handleTimelineProjectionUpdated(message: ClientBridgeMessage) {
   }
   restoreTimelineProjectionIfNewer(timelineProjection, {
     source: 'authoritative',
-    force: true,
   });
   reconcileRequestBindingsFromAuthoritativeThread(sessionId);
 }
@@ -877,7 +836,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
           sessions: sessions.length > 0 ? sessions : state.sessions,
         },
       });
-      setOrchestratorRuntimeState(
+      replaceOrchestratorRuntimeState(
         (snapshot.orchestratorRuntimeState as OrchestratorRuntimeState | null | undefined) ?? null,
       );
       if (snapshot.notifications) {
@@ -891,7 +850,6 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       });
       restoreTimelineProjectionIfNewer(timelineProjection, {
         source: 'authoritative',
-        force: true,
       });
       reconcileRequestBindingsFromAuthoritativeThread(sessionId);
     });
@@ -928,7 +886,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         sessions: sessions.length > 0 ? sessions : state.sessions,
       },
     });
-    setOrchestratorRuntimeState(
+    replaceOrchestratorRuntimeState(
       (snapshot.orchestratorRuntimeState as OrchestratorRuntimeState | null | undefined) ?? null,
     );
     if (snapshot.notifications) {
@@ -952,18 +910,6 @@ function handleSessionNotificationsLoaded(message: ClientBridgeMessage) {
   applySessionNotifications(sessionId, message.notifications);
 }
 
-
-function handleRecoveryRequest(message: ClientBridgeMessage) {
-  const canRetry = Boolean(message.canRetry);
-  const action = canRetry
-    ? i18n.t('messageHandler.autoRecoveryRetry')
-    : i18n.t('messageHandler.autoRecoveryContinue');
-  addToast('warning', i18n.t('messageHandler.autoRecovery', { decision: action }), undefined, {
-    category: 'audit',
-    source: 'recovery',
-    countUnread: false,
-  });
-}
 
 function handleOrchestratorRuntimeState(message: ClientBridgeMessage) {
   const store = getState();
@@ -1154,43 +1100,5 @@ function handleConnectionTestResult(message: ClientBridgeMessage) {
   }
 }
 
-// ============ Worker Session 事件处理（提案 4.1） ============
-
-function handleWorkerSessionCreated(message: ClientBridgeMessage) {
-  const sessionId = (message.sessionId as string) || '';
-  const assignmentId = (message.assignmentId as string) || '';
-  const workerId = (message.workerId as string) || '';
-
-  if (!sessionId) {
-    throw new Error('[MessageHandler] WorkerSessionCreated 缺少 sessionId');
-  }
-  if (!assignmentId) {
-    throw new Error('[MessageHandler] WorkerSessionCreated 缺少 assignmentId');
-  }
-  if (!workerId) {
-    throw new Error('[MessageHandler] WorkerSessionCreated 缺少 workerId');
-  }
-}
-
-function handleWorkerSessionResumed(message: ClientBridgeMessage) {
-  const sessionId = (message.sessionId as string) || '';
-  const assignmentId = (message.assignmentId as string) || '';
-  const workerId = (message.workerId as string) || '';
-
-  if (!sessionId) {
-    throw new Error('[MessageHandler] WorkerSessionResumed 缺少 sessionId');
-  }
-  if (!assignmentId) {
-    throw new Error('[MessageHandler] WorkerSessionResumed 缺少 assignmentId');
-  }
-  if (!workerId) {
-    throw new Error('[MessageHandler] WorkerSessionResumed 缺少 workerId');
-  }
-
-  // 执行态统一从 workerRuntime 派生，前端不再维护本地 worker session 副本。
-  // 系统通知由 MessageHub 下发，前端不再本地创建。
-}
-
-
 // Named exports
-export { handleStateUpdate, handleSessionsUpdated, handleEmptyWorkspaceStateLoaded, handleSessionBootstrapLoaded, handleTimelineProjectionUpdated, handleRecoveryRequest, handleOrchestratorRuntimeState, handleClarificationRequest, handleWorkerQuestionRequest, handleWorkerStatusUpdate, handleConnectionTestResult, handleWorkerSessionCreated, handleWorkerSessionResumed };
+export { handleStateUpdate, handleSessionsUpdated, handleEmptyWorkspaceStateLoaded, handleSessionBootstrapLoaded, handleTimelineProjectionUpdated, handleOrchestratorRuntimeState, handleClarificationRequest, handleWorkerQuestionRequest, handleWorkerStatusUpdate, handleConnectionTestResult };

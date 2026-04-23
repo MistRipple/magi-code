@@ -686,10 +686,10 @@ export class RustDaemonClient {
     );
   }
 
-  public async getTaskLease(taskId: string, sessionId: string): Promise<AssignmentLeaseDto> {
+  public async getTaskLease(taskId: string, sessionId: string): Promise<AssignmentLeaseDto | null> {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
-    return this.getJson<AssignmentLeaseDto>(
+    return this.getJson<AssignmentLeaseDto | null>(
       `/api/tasks/${encodeURIComponent(taskId)}/lease?${query.toString()}`,
     );
   }

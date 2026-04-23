@@ -57,6 +57,7 @@ import {
   saveAgentSafeguardConfig,
   saveAgentSkillsConfig,
     saveAgentWorkerConfig,
+  submitAgentChatMessage,
   submitAgentSessionAction,
     revertAgentChange,
   revertAgentExecutionGroupChanges,
@@ -110,7 +111,14 @@ import {
   startAutoRefresh as startTaskAutoRefresh,
   getTaskGraphState,
   clearTaskGraph,
+  refreshTaskProjection,
 } from '../../stores/task-graph-store.svelte';
+import {
+  addPendingRequest,
+  clearPendingRequest,
+  clearRequestBinding,
+  setProcessingActor,
+} from '../../stores/messages.svelte';
 import { RustDaemonClient } from '../rust-daemon-client';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
@@ -119,6 +127,7 @@ let currentWorkspaceId = '';
 let currentWorkspacePath = '';
 let currentSessionId = '';
 let currentInterruptTaskId = '';
+let pendingInterruptTrigger: 'user_pause' | 'pause_task' | null = null;
 let currentRuntimeEpoch = '';
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
 let cachedSettingsBootstrapScope: 'none' | 'core' | 'full' = 'none';
@@ -344,16 +353,36 @@ function isTerminalRuntimeTaskStatus(status: unknown): boolean {
     || normalized.includes('skip');
 }
 
+function isAuthoritativeProcessingTaskStatus(status: unknown): boolean {
+  const normalized = trimBridgeString(status).toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+  if (isTerminalRuntimeTaskStatus(normalized)) {
+    return false;
+  }
+  return !normalized.includes('block');
+}
+
 function clearCurrentInterruptTaskId(): void {
   currentInterruptTaskId = '';
+  pendingInterruptTrigger = null;
 }
 
 function setCurrentInterruptTaskId(taskId: string): void {
   currentInterruptTaskId = trimBridgeString(taskId);
+  if (currentInterruptTaskId && pendingInterruptTrigger) {
+    const pendingTrigger = pendingInterruptTrigger;
+    pendingInterruptTrigger = null;
+    void interruptTask(pendingTrigger);
+  }
 }
 
 function reconcileCurrentInterruptTaskId(activeTaskIds: string[]): void {
   if (!currentInterruptTaskId) {
+    return;
+  }
+  if (activeTaskIds.length === 0) {
     return;
   }
   if (!activeTaskIds.includes(currentInterruptTaskId)) {
@@ -405,7 +434,22 @@ function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload
   });
   const overview = asBridgeRecord(rawRuntimeReadModel?.overview);
   const activity = asBridgeRecord(overview?.activity);
+  rootTaskId = trimBridgeString(activeRuntimeSession?.root_task_id)
+    || trimBridgeString(activeRuntimeSession?.rootTaskId);
   const sessionTaskIds = normalizeBridgeStringArray(activeRuntimeSession?.active_task_ids);
+  const sessionBranchStatusMap = new Map<string, string>();
+  const sessionBranches = Array.isArray(activeRuntimeSession?.active_branches)
+    ? activeRuntimeSession.active_branches
+      .map((entry) => asBridgeRecord(entry))
+      .filter((entry): entry is Record<string, unknown> => entry !== null)
+    : [];
+  for (const branch of sessionBranches) {
+    const branchTaskId = trimBridgeString(branch.task_id);
+    const branchStatus = trimBridgeString(branch.status);
+    if (branchTaskId && branchStatus) {
+      sessionBranchStatusMap.set(branchTaskId, branchStatus);
+    }
+  }
   const sessionMissionIds = new Set(normalizeBridgeStringArray(activeRuntimeSession?.active_execution_group_ids));
   for (const taskId of sessionTaskIds) {
     const missionId = trimBridgeString(runtimeTaskMap.get(taskId)?.mission_id);
@@ -418,8 +462,12 @@ function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload
     if (!taskId) {
       return;
     }
+    const branchStatus = sessionBranchStatusMap.get(taskId);
+    if (branchStatus && !isAuthoritativeProcessingTaskStatus(branchStatus)) {
+      return;
+    }
     const taskEntry = runtimeTaskMap.get(taskId);
-    if (taskEntry && isTerminalRuntimeTaskStatus(taskEntry.current_status)) {
+    if (taskEntry && !isAuthoritativeProcessingTaskStatus(taskEntry.current_status)) {
       return;
     }
     activeTaskIds.add(taskId);
@@ -434,37 +482,44 @@ function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload
       collectActiveTaskId(taskId);
     }
   }
-  for (const taskId of normalizeBridgeStringArray(activity?.active_task_ids)) {
-    const taskEntry = runtimeTaskMap.get(taskId);
-    const missionId = trimBridgeString(taskEntry?.mission_id);
-    if (sessionMissionIds.size > 0 && !sessionMissionIds.has(missionId)) {
-      continue;
-    }
-    collectActiveTaskId(taskId);
-  }
-
-  const recentEvents = Array.isArray(rawBootstrap?.recentEvents)
-    ? rawBootstrap.recentEvents
-      .map((entry) => asBridgeRecord(entry))
-      .filter((entry): entry is Record<string, unknown> => entry !== null)
-    : [];
-  for (let index = recentEvents.length - 1; index >= 0; index -= 1) {
-    const event = recentEvents[index];
-    const eventPayload = asBridgeRecord(event.payload);
-    const eventSessionId = trimBridgeString(event.session_id) || trimBridgeString(eventPayload?.session_id);
-    const eventTaskId = trimBridgeString(event.task_id) || trimBridgeString(eventPayload?.task_id) || trimBridgeString(eventPayload?.taskId);
-    const eventMissionId = trimBridgeString(event.mission_id) || trimBridgeString(eventPayload?.mission_id) || trimBridgeString(eventPayload?.missionId);
-    if (expectedSessionId) {
-      const belongsToExpectedSession = eventSessionId === expectedSessionId
-        || (eventTaskId && sessionTaskIds.includes(eventTaskId))
-        || (eventMissionId && sessionMissionIds.has(eventMissionId));
-      if (!belongsToExpectedSession) {
+  const allowWorkspaceActivityFallback = !expectedSessionId
+    || Boolean(activeRuntimeSession)
+    || sessionMissionIds.size > 0;
+  if (allowWorkspaceActivityFallback) {
+    for (const taskId of normalizeBridgeStringArray(activity?.active_task_ids)) {
+      const taskEntry = runtimeTaskMap.get(taskId);
+      const missionId = trimBridgeString(taskEntry?.mission_id);
+      if (sessionMissionIds.size > 0 && !sessionMissionIds.has(missionId)) {
         continue;
       }
+      collectActiveTaskId(taskId);
     }
-    rootTaskId = trimBridgeString(eventPayload?.root_task_id) || trimBridgeString(eventPayload?.rootTaskId);
-    if (rootTaskId) {
-      break;
+  }
+
+  if (!rootTaskId) {
+    const recentEvents = Array.isArray(rawBootstrap?.recentEvents)
+      ? rawBootstrap.recentEvents
+        .map((entry) => asBridgeRecord(entry))
+        .filter((entry): entry is Record<string, unknown> => entry !== null)
+      : [];
+    for (let index = recentEvents.length - 1; index >= 0; index -= 1) {
+      const event = recentEvents[index];
+      const eventPayload = asBridgeRecord(event.payload);
+      const eventSessionId = trimBridgeString(event.session_id) || trimBridgeString(eventPayload?.session_id);
+      const eventTaskId = trimBridgeString(event.task_id) || trimBridgeString(eventPayload?.task_id) || trimBridgeString(eventPayload?.taskId);
+      const eventMissionId = trimBridgeString(event.mission_id) || trimBridgeString(eventPayload?.mission_id) || trimBridgeString(eventPayload?.missionId);
+      if (expectedSessionId) {
+        const belongsToExpectedSession = (eventTaskId && sessionTaskIds.includes(eventTaskId))
+          || (eventMissionId && sessionMissionIds.has(eventMissionId))
+          || (sessionTaskIds.length === 0 && sessionMissionIds.size === 0 && eventSessionId === expectedSessionId);
+        if (!belongsToExpectedSession) {
+          continue;
+        }
+      }
+      rootTaskId = trimBridgeString(eventPayload?.root_task_id) || trimBridgeString(eventPayload?.rootTaskId);
+      if (rootTaskId) {
+        break;
+      }
     }
   }
   return {
@@ -507,6 +562,11 @@ function emitForcedProcessingIdle(reason: string, extra?: Record<string, unknown
     timestamp: Date.now(),
     ...(extra || {}),
   });
+  if (currentSessionId) {
+    void refreshTaskProjection(currentSessionId).catch((error) => {
+      console.warn('[web-client-bridge] forced idle 后刷新任务图失败:', error);
+    });
+  }
 }
 
 function emitRecoveringState(reason: string, error?: unknown): void {
@@ -676,7 +736,7 @@ function emitDataMessage(dataType: DataMessageType, payload: Record<string, unkn
   emitMessage({ type: 'unifiedMessage', message });
 }
 
-function scheduleBootstrapRefreshFromRustEvent(reason: string): void {
+function scheduleBootstrapRefreshFromRustEvent(reason: string, forceFresh = false): void {
   if (typeof window === 'undefined') {
     return;
   }
@@ -685,7 +745,7 @@ function scheduleBootstrapRefreshFromRustEvent(reason: string): void {
   }
   rustEventBootstrapRefreshTimer = window.setTimeout(() => {
     rustEventBootstrapRefreshTimer = null;
-    void fetchBootstrap().catch((error) => {
+    void fetchBootstrap(forceFresh ? { forceFresh: true } : {}).catch((error) => {
       reportExpectedRecoveryFailure('事件驱动同步', `[web-client-bridge] ${reason} 后 bootstrap 同步失败:`, error);
       scheduleRecovery('rust_event_bootstrap_failed', error, true);
     });
@@ -694,12 +754,22 @@ function scheduleBootstrapRefreshFromRustEvent(reason: string): void {
 
 function shouldRefreshFromRustEvent(event: RustEventEnvelope): boolean {
   const eventWorkspaceId = trimBridgeString(event.workspace_id);
-  if (eventWorkspaceId && currentWorkspaceId && eventWorkspaceId !== currentWorkspaceId) {
-    return false;
+  if (eventWorkspaceId) {
+    if (!currentWorkspaceId) {
+      return false;
+    }
+    if (eventWorkspaceId !== currentWorkspaceId) {
+      return false;
+    }
   }
   const eventSessionId = trimBridgeString(event.session_id);
-  if (eventSessionId && currentSessionId && eventSessionId !== currentSessionId) {
-    return false;
+  if (eventSessionId) {
+    if (!currentSessionId) {
+      return false;
+    }
+    if (eventSessionId !== currentSessionId) {
+      return false;
+    }
   }
   return true;
 }
@@ -722,12 +792,18 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
           setCurrentInterruptTaskId(acceptedActionTaskId);
         }
         if (acceptedRootTaskId) {
-          initTaskTracking(acceptedSessionId, acceptedRootTaskId);
+          const currentState = getTaskGraphState(acceptedSessionId);
+          if (!currentState.rootTaskId || currentState.rootTaskId === acceptedRootTaskId) {
+            initTaskTracking(acceptedSessionId, acceptedRootTaskId);
+          }
         }
       }
     }
   }
-  scheduleBootstrapRefreshFromRustEvent(eventType || 'rust_event');
+  scheduleBootstrapRefreshFromRustEvent(
+    eventType || 'rust_event',
+    eventType === 'task.interrupt.requested',
+  );
 
   // Notify listeners about task-domain SSE events so lightweight stores
   // (e.g. task-graph-store) can react without waiting for a full bootstrap refresh.
@@ -1195,6 +1271,11 @@ async function dispatchBootstrap(
    currentRuntimeEpoch = incomingEpoch;
  }
   persistWorkspaceBinding(payload.workspace.workspaceId, payload.workspace.rootPath, payload.sessionId);
+  if (payload.workspace.workspaceId) {
+    void emitKnowledgePayload().catch((error) => {
+      console.warn('[web-client-bridge] bootstrap 后项目知识同步失败:', error);
+    });
+  }
   const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, options.rawPayload);
   if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
     clearCurrentInterruptTaskId();
@@ -1391,6 +1472,11 @@ async function dispatchSessionSnapshot(
   });
   const pageMeta = readRustTimelinePageMeta(rawPayload);
   persistWorkspaceBinding(payload.workspace.workspaceId, payload.workspace.rootPath, payload.sessionId);
+  if (payload.workspace.workspaceId) {
+    void emitKnowledgePayload().catch((error) => {
+      console.warn('[web-client-bridge] 会话快照后项目知识同步失败:', error);
+    });
+  }
   const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, rawPayload);
   if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
     clearCurrentInterruptTaskId();
@@ -1693,26 +1779,38 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
   });
   emitMessage({ type: 'unifiedMessage', message: placeholderMsg });
 
-  emitDataMessage('processingStateChanged', {
-    isProcessing: true,
-    source: 'orchestrator',
-    agent: 'orchestrator',
-    startedAt: Date.now(),
-    pendingRequestIds: [requestId],
-  });
+  setProcessingActor('orchestrator', 'orchestrator');
+  addPendingRequest(requestId);
 
   try {
+    clearCurrentInterruptTaskId();
     await ensureFreshLiveBridge('execute_task_preflight');
+    const binding = {
+      workspaceId: currentWorkspaceId,
+      workspacePath: currentWorkspacePath,
+      sessionId: currentSessionId,
+    };
+    const shouldCreateTask = input.deepTask === true || skillName !== null || images.length > 0;
+    if (!shouldCreateTask) {
+      const chatResult = await submitAgentChatMessage({ text: normalizedText }, binding);
+      const resolvedSessionId = typeof chatResult.sessionId === 'string' && chatResult.sessionId.trim()
+        ? chatResult.sessionId.trim()
+        : currentSessionId;
+      if (resolvedSessionId) {
+        persistWorkspaceBinding(currentWorkspaceId, currentWorkspacePath, resolvedSessionId);
+      }
+      await fetchBootstrap({ forceFresh: true });
+      clearPendingRequest(requestId);
+      clearRequestBinding(requestId);
+      return;
+    }
+
     const actionResult = await submitAgentSessionAction({
       text,
       deepTask: input.deepTask,
       skillName,
       images,
-    }, {
-      workspaceId: currentWorkspaceId,
-      workspacePath: currentWorkspacePath,
-      sessionId: currentSessionId,
-    });
+    }, binding);
     const resolvedSessionId = typeof actionResult.sessionId === 'string' && actionResult.sessionId.trim()
       ? actionResult.sessionId.trim()
       : currentSessionId;
@@ -1728,6 +1826,8 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
     }
 
     await fetchBootstrap({ forceFresh: true });
+    clearPendingRequest(requestId);
+    clearRequestBinding(requestId);
   } catch (error) {
     clearCurrentInterruptTaskId();
     console.error('[web-client-bridge] 执行任务失败:', error);
@@ -1746,21 +1846,27 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
 async function interruptTask(trigger: 'user_pause' | 'pause_task' = 'user_pause'): Promise<void> {
   const taskId = currentInterruptTaskId;
   if (!taskId) {
-    emitBridgeErrorToast('停止任务', new Error('当前轮次缺少可中断任务 ID，请等待任务初始化完成后再试。'));
+    pendingInterruptTrigger = trigger;
     return;
   }
-  // 目标 task 已确认后，前端立即收敛到 idle，避免停止按钮卡死。
-  emitForcedProcessingIdle('user_interrupt_requested', { trigger, taskId });
+  pendingInterruptTrigger = null;
+  const sessionIdAtRequest = currentSessionId;
+  const workspaceIdAtRequest = currentWorkspaceId;
+  const workspacePathAtRequest = currentWorkspacePath;
   try {
     await interruptAgentTask({ taskId });
+    emitForcedProcessingIdle('interrupt_task_confirmed', { taskId });
+    if (
+      sessionIdAtRequest
+      && sessionIdAtRequest === currentSessionId
+      && workspaceIdAtRequest === currentWorkspaceId
+      && workspacePathAtRequest === currentWorkspacePath
+    ) {
+      await fetchBootstrap({ forceFresh: true });
+    }
   } catch (error) {
-    console.error('[web-client-bridge] 中断任务失败（已执行前端强制停止）:', error);
+    console.error('[web-client-bridge] 中断任务失败:', error);
     emitBridgeErrorToast('停止任务', error);
-    emitForcedProcessingIdle('user_interrupt_failed', {
-      trigger,
-      taskId,
-      error: normalizeErrorMessage(error),
-    });
   }
 }
 
@@ -1786,20 +1892,41 @@ async function startTask(taskId: string): Promise<void> {
   }
 }
 
-async function continueSessionExecution(): Promise<void> {
+interface ContinueSessionExecutionOptions {
+  promptText?: string | null;
+  requestId?: string;
+}
+
+async function continueSessionExecution(options: ContinueSessionExecutionOptions = {}): Promise<void> {
   if (!currentSessionId) {
     emitBridgeErrorToast('继续会话', new Error('当前没有可继续的会话。'));
     return;
   }
+  const promptText = typeof options.promptText === 'string' && options.promptText.trim()
+    ? options.promptText
+    : null;
+  const requestId = typeof options.requestId === 'string' && options.requestId.trim()
+    ? options.requestId.trim()
+    : generateMessageId();
+  setProcessingActor('orchestrator', 'orchestrator');
+  addPendingRequest(requestId);
   try {
     await ensureFreshLiveBridge('continue_session_preflight');
-    await continueAgentSession(currentSessionId);
+    const result = await continueAgentSession(currentSessionId, { promptText });
+    persistWorkspaceBinding(currentWorkspaceId, currentWorkspacePath, result.sessionId || currentSessionId);
+    if (result.rootTaskId) {
+      initTaskTracking(result.sessionId || currentSessionId, result.rootTaskId);
+    }
+    await fetchBootstrap({ forceFresh: true });
+    clearPendingRequest(requestId);
+    clearRequestBinding(requestId);
   } catch (error) {
     console.error('[web-client-bridge] 继续会话失败:', error);
     emitBridgeErrorToast('继续会话', error);
     emitForcedProcessingIdle('continue_session_failed', {
       error: normalizeErrorMessage(error),
       sessionId: currentSessionId,
+      requestId,
     });
     if (shouldRecoverFromBridgeError(error)) {
       closeEventStream();
@@ -2414,7 +2541,10 @@ export function createWebClientBridge(): ClientBridge {
           void interruptTask('user_pause');
           return;
         case 'continueTask':
-          void continueSessionExecution();
+          void continueSessionExecution({
+            promptText: typeof message.text === 'string' ? message.text : null,
+            requestId: typeof message.requestId === 'string' ? message.requestId : undefined,
+          });
           return;
         case 'pauseTask':
           void interruptTask('pause_task');
