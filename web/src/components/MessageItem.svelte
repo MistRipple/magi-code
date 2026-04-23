@@ -44,7 +44,7 @@
   const isStreaming = $derived(message.isStreaming);
   const retryRuntime = $derived(retryRuntimeState.byMessageId.get(message.id));
 
-  // 主角色判断只决定来源标签；是否加卡片壳由 usesCardShell 的内容语义白名单决定。
+  // 主角色判断只决定来源标签；普通正文必须保持无外层面板。
   const isNativeSource = $derived(
     displayContext === 'thread'
       ? message.source === 'orchestrator'
@@ -86,14 +86,6 @@
     }
     return false;
   });
-
-  function blockRequiresCardShell(block: import('../types/message').ContentBlock): boolean {
-    return block.type === 'thinking'
-      || block.type === 'tool_call'
-      || block.type === 'tool_result'
-      || block.type === 'file_change'
-      || block.type === 'plan';
-  }
 
   const messagePhase = $derived.by(() => (
     typeof message.metadata?.phase === 'string' ? message.metadata.phase.trim() : ''
@@ -192,21 +184,8 @@
     const value = message.metadata?.laneTitle;
     return typeof value === 'string' ? value.trim() : '';
   });
-  const turnItemKind = $derived.by(() => {
-    const value = message.metadata?.turnItemKind;
-    return typeof value === 'string' ? value.trim() : '';
-  });
-  const isWorkerContent = $derived.by(() => (
-    displayContext === 'thread'
-    && turnItemKind.startsWith('worker_')
-  ));
-  const hasCardBlock = $derived.by(() => safeBlocks.some(blockRequiresCardShell));
   const messageTypeRequiresCardShell = $derived.by(() => {
     switch (message.type) {
-      case 'thinking':
-      case 'tool_call':
-      case 'plan':
-      case 'task_card':
       case 'interaction':
       case 'error':
         return true;
@@ -215,14 +194,15 @@
     }
   });
   const usesCardShell = $derived.by(() => (
-    isPlaceholder
-    || isInteraction
+    isInteraction
     || shouldCollapseSystemSection
-    || isWorkerContent
-    || hasCardBlock
     || messageTypeRequiresCardShell
   ));
   const badgeWorker = $derived(worker || (message.source === 'orchestrator' ? 'orchestrator' : message.source));
+  const turnItemKind = $derived.by(() => {
+    const value = message.metadata?.turnItemKind;
+    return typeof value === 'string' ? value.trim() : '';
+  });
   const workerBadgeLabel = $derived.by(() => (
     turnItemKind.startsWith('worker_') && laneTitle
       ? laneTitle
@@ -535,7 +515,7 @@
     box-shadow: none;
   }
 
-  /* ===== 卡片壳只用于 thinking / 工具 / worker / 特殊格式 ===== */
+  /* ===== 外层卡片壳只用于整条交互/错误等消息；thinking / 工具 / worker card 由各自 block 组件渲染 ===== */
   .message-item.assistant.card-shell {
     padding: var(--space-4);
     border-radius: var(--radius-lg);
@@ -772,9 +752,9 @@
     }
   }
 
-  /* ===== 占位消息样式（统一在 assistant 卡片内） ===== */
+  /* ===== 占位消息样式：只保留裸态流式指示器，不给整条消息套卡片 ===== */
   .message-item.assistant.placeholder {
-    border-left: 3px solid var(--info);
+    border-left: none;
   }
 
   .placeholder-content {

@@ -41,14 +41,19 @@
   const WORKER_STATUS_PRIORITY: Record<string, number> = {
     running: 6,
     pending: 5,
+    ready: 5,
     awaiting_approval: 4,
     review_required: 4,
     repairing: 4,
     verifying: 4,
     blocked: 3,
     failed: 3,
+    error: 3,
     cancelled: 3,
     completed: 1,
+    success: 1,
+    skipped: 1,
+    idle: 1,
   };
 
   function resolveStrongerStatus(existing: string, next: string): string {
@@ -145,8 +150,7 @@
     const roleStatus = workerRoleStatusMap.get(roleId);
     return roleStatus === 'running'
       || roleStatus === 'pending'
-      || roleStatus === 'awaiting_approval'
-      || roleStatus === 'review_required'
+      || roleStatus === 'ready'
       || roleStatus === 'repairing'
       || roleStatus === 'verifying';
   }
@@ -156,14 +160,24 @@
     switch (roleStatus) {
       case 'running':
       case 'pending':
+      case 'ready':
+      case 'repairing':
+      case 'verifying':
+      case 'completed':
+      case 'success':
+      case 'skipped':
+      case 'idle':
         return 'brand';
       case 'awaiting_approval':
       case 'review_required':
         return 'warning';
       case 'blocked':
       case 'failed':
+      case 'error':
       case 'cancelled':
         return 'error';
+      case 'disabled':
+        return 'disabled';
       default:
         return null;
     }

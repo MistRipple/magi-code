@@ -2,16 +2,14 @@
  * Task Graph Store - 以 session 为边界缓存 Task Projection。
  *
  * 设计约束：
- * - 任务图、Runner 轮询、SSE 刷新都必须绑定当前会话 session
+ * - 任务图轮询、SSE 刷新都必须绑定当前会话 session
  * - 不再保留全局唯一 rootTaskId / projection
  * - workspace 仍然共用同一条事件流，但刷新按 session-keyed 状态执行
  */
 
 import type {
   TaskProjectionDto,
-  TaskKind,
   TaskStatus,
-  AssignmentLeaseDto,
 } from '../shared/rust-backend-types';
 import { RustDaemonClient } from '../shared/rust-daemon-client';
 import { resolveAgentBaseUrl } from '../web/agent-api';
@@ -19,7 +17,6 @@ import { onBridgeMessage } from '../shared/bridges/bridge-runtime';
 
 export interface TaskGraphState {
   projection: TaskProjectionDto | null;
-  leases: Map<string, AssignmentLeaseDto>;
   loading: boolean;
   error: string | null;
   rootTaskId: string | null;
@@ -30,10 +27,8 @@ interface InternalSessionTaskGraphState extends TaskGraphState {
   refreshAfterLoad: boolean;
 }
 
-const EMPTY_LEASES = new Map<string, AssignmentLeaseDto>();
 const EMPTY_TASK_GRAPH_STATE: TaskGraphState = {
   projection: null,
-  leases: EMPTY_LEASES,
   loading: false,
   error: null,
   rootTaskId: null,
@@ -58,7 +53,6 @@ function createClient(): RustDaemonClient {
 function createEmptyInternalState(): InternalSessionTaskGraphState {
   return {
     projection: null,
-    leases: new Map(),
     loading: false,
     error: null,
     rootTaskId: null,
@@ -99,11 +93,6 @@ export function getTaskGraphState(sessionId: string | null | undefined): TaskGra
       return normalizedSessionId
         ? (readSessionState(normalizedSessionId)?.projection ?? EMPTY_TASK_GRAPH_STATE.projection)
         : EMPTY_TASK_GRAPH_STATE.projection;
-    },
-    get leases() {
-      return normalizedSessionId
-        ? (readSessionState(normalizedSessionId)?.leases ?? EMPTY_TASK_GRAPH_STATE.leases)
-        : EMPTY_TASK_GRAPH_STATE.leases;
     },
     get loading() {
       return normalizedSessionId
@@ -149,28 +138,6 @@ export async function fetchTaskProjection(
       return;
     }
     latestState.projection = projection;
-
-    const runningTaskIds = projection.running_tasks ?? [];
-    const leaseMap = new Map<string, AssignmentLeaseDto>();
-    await Promise.all(runningTaskIds.map(async (taskId) => {
-      try {
-        const lease = await client.getTaskLease(taskId, normalizedSessionId);
-        const currentState = ensureSessionState(normalizedSessionId);
-        if (
-          currentState.fetchGeneration !== fetchGeneration
-          || currentState.rootTaskId !== rootTaskId
-        ) {
-          return;
-        }
-        if (lease && lease.lease_status === 'Active') {
-          leaseMap.set(taskId, lease);
-        }
-      } catch {
-        // 租约获取失败不影响主任务图展示
-      }
-    }));
-
-    latestState.leases = leaseMap;
     latestState.error = null;
   } catch (err) {
     const latestState = ensureSessionState(normalizedSessionId);
@@ -296,19 +263,6 @@ export function clearTaskGraph(sessionId?: string | null): void {
   sessionStates = nextStates;
   if (trackedSessionIds().length === 0) {
     stopAutoRefresh();
-  }
-}
-
-export function getTaskKindLabel(kind: TaskKind): string {
-  switch (kind) {
-    case 'Objective': return 'OBJ';
-    case 'Phase': return 'PHA';
-    case 'WorkPackage': return 'WPK';
-    case 'Action': return 'ACT';
-    case 'Validation': return 'VAL';
-    case 'Repair': return 'RPR';
-    case 'Decision': return 'DEC';
-    default: return kind;
   }
 }
 

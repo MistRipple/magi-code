@@ -603,7 +603,7 @@
     }, 6000);
     addToast('info', `正在切换到会话“${nextSessionName}”...`, undefined, {
       category: 'feedback',
-      source: 'session-action',
+      source: 'session-management',
       persistToCenter: false,
       countUnread: false,
       displayMode: 'toast',

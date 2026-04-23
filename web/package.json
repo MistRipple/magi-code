@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --config vite.web.config.ts",
     "dev:rust": "VITE_AGENT_BASE_URL=http://127.0.0.1:38123 VITE_AGENT_PROXY_TARGET=http://127.0.0.1:38123 vite --config vite.web.config.ts",
+    "dev:daemon": "vite --config vite.web.config.ts",
     "build": "vite build --config vite.web.config.ts",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json"

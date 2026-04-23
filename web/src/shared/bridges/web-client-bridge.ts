@@ -18,10 +18,8 @@ import {
   addAgentRepository,
   clearAgentNotifications,
   clearAgentProjectKnowledge,
-  clearAgentAllTasks,
   closeAgentSession,
   connectAgentMcpServer,
-  deleteAgentTask,
   deleteAgentSession,
   deleteAgentAdr,
   deleteAgentFaq,
@@ -56,16 +54,14 @@ import {
   saveAgentUserRules,
   saveAgentSafeguardConfig,
   saveAgentSkillsConfig,
-    saveAgentWorkerConfig,
-  submitAgentChatMessage,
-  submitAgentSessionAction,
-    revertAgentChange,
+  saveAgentWorkerConfig,
+  submitAgentSessionTurn,
+  revertAgentChange,
   revertAgentExecutionGroupChanges,
   revertAllAgentChanges,
   testAgentAuxiliaryConnection,
   testAgentOrchestratorConnection,
   testAgentWorkerConnection,
-  startAgentTask,
   updateAgentAdr,
   updateAgentFaq,
   updateAgentMcpServer,
@@ -127,7 +123,7 @@ let currentWorkspaceId = '';
 let currentWorkspacePath = '';
 let currentSessionId = '';
 let currentInterruptTaskId = '';
-let pendingInterruptTrigger: 'user_pause' | 'pause_task' | null = null;
+let pendingInterruptRequested = false;
 let currentRuntimeEpoch = '';
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
 let cachedSettingsBootstrapScope: 'none' | 'core' | 'full' = 'none';
@@ -366,15 +362,14 @@ function isAuthoritativeProcessingTaskStatus(status: unknown): boolean {
 
 function clearCurrentInterruptTaskId(): void {
   currentInterruptTaskId = '';
-  pendingInterruptTrigger = null;
+  pendingInterruptRequested = false;
 }
 
 function setCurrentInterruptTaskId(taskId: string): void {
   currentInterruptTaskId = trimBridgeString(taskId);
-  if (currentInterruptTaskId && pendingInterruptTrigger) {
-    const pendingTrigger = pendingInterruptTrigger;
-    pendingInterruptTrigger = null;
-    void interruptTask(pendingTrigger);
+  if (currentInterruptTaskId && pendingInterruptRequested) {
+    pendingInterruptRequested = false;
+    void interruptTask();
   }
 }
 
@@ -779,7 +774,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
   const eventType = trimBridgeString(event.event_type);
-  if (eventType === 'session.action.accepted' && event.payload) {
+  if (eventType === 'session.turn.task.accepted' && event.payload) {
     const acceptedSessionId = trimBridgeString(event.payload.session_id) || trimBridgeString(event.session_id);
     const acceptedActionTaskId = trimBridgeString(event.payload.action_task_id)
       || trimBridgeString(event.payload.actionTaskId);
@@ -1790,38 +1785,25 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
       workspacePath: currentWorkspacePath,
       sessionId: currentSessionId,
     };
-    const shouldCreateTask = input.deepTask === true || skillName !== null || images.length > 0;
-    if (!shouldCreateTask) {
-      const chatResult = await submitAgentChatMessage({ text: normalizedText }, binding);
-      const resolvedSessionId = typeof chatResult.sessionId === 'string' && chatResult.sessionId.trim()
-        ? chatResult.sessionId.trim()
-        : currentSessionId;
-      if (resolvedSessionId) {
-        persistWorkspaceBinding(currentWorkspaceId, currentWorkspacePath, resolvedSessionId);
-      }
-      await fetchBootstrap({ forceFresh: true });
-      clearPendingRequest(requestId);
-      clearRequestBinding(requestId);
-      return;
-    }
-
-    const actionResult = await submitAgentSessionAction({
+    const turnResult = await submitAgentSessionTurn({
       text,
       deepTask: input.deepTask,
       skillName,
       images,
     }, binding);
-    const resolvedSessionId = typeof actionResult.sessionId === 'string' && actionResult.sessionId.trim()
-      ? actionResult.sessionId.trim()
+    const resolvedSessionId = typeof turnResult.sessionId === 'string' && turnResult.sessionId.trim()
+      ? turnResult.sessionId.trim()
       : currentSessionId;
     if (resolvedSessionId) {
       persistWorkspaceBinding(currentWorkspaceId, currentWorkspacePath, resolvedSessionId);
     }
-    emitBridgeSuccessToast('发送消息', '任务已提交', { displayMode: 'notification_center' });
+    if (turnResult.route === 'task') {
+      emitBridgeSuccessToast('发送消息', '任务已提交', { displayMode: 'notification_center' });
+    }
 
-    setCurrentInterruptTaskId(actionResult.actionTaskId || '');
-    const rootTaskId = actionResult.rootTaskId;
-    if (rootTaskId && resolvedSessionId) {
+    setCurrentInterruptTaskId(turnResult.actionTaskId || '');
+    const rootTaskId = turnResult.rootTaskId;
+    if ((turnResult.route === 'task' || turnResult.route === 'continue') && rootTaskId && resolvedSessionId) {
       initTaskTracking(resolvedSessionId, rootTaskId);
     }
 
@@ -1843,13 +1825,13 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
   }
 }
 
-async function interruptTask(trigger: 'user_pause' | 'pause_task' = 'user_pause'): Promise<void> {
+async function interruptTask(): Promise<void> {
   const taskId = currentInterruptTaskId;
   if (!taskId) {
-    pendingInterruptTrigger = trigger;
+    pendingInterruptRequested = true;
     return;
   }
-  pendingInterruptTrigger = null;
+  pendingInterruptRequested = false;
   const sessionIdAtRequest = currentSessionId;
   const workspaceIdAtRequest = currentWorkspaceId;
   const workspacePathAtRequest = currentWorkspacePath;
@@ -1867,28 +1849,6 @@ async function interruptTask(trigger: 'user_pause' | 'pause_task' = 'user_pause'
   } catch (error) {
     console.error('[web-client-bridge] 中断任务失败:', error);
     emitBridgeErrorToast('停止任务', error);
-  }
-}
-
-async function clearAllTasks(): Promise<void> {
-  await clearAgentAllTasks();
-}
-
-async function startTask(taskId: string): Promise<void> {
-  try {
-    await ensureFreshLiveBridge('start_task_preflight');
-    await startAgentTask(taskId);
-  } catch (error) {
-    console.error('[web-client-bridge] 启动任务失败:', error);
-    emitBridgeErrorToast('启动任务', error);
-    emitForcedProcessingIdle('start_task_failed', {
-      error: normalizeErrorMessage(error),
-      taskId,
-    });
-    if (shouldRecoverFromBridgeError(error)) {
-      closeEventStream();
-      scheduleRecovery('start_task_failed', error, true);
-    }
   }
 }
 
@@ -1933,10 +1893,6 @@ async function continueSessionExecution(options: ContinueSessionExecutionOptions
       scheduleRecovery('continue_session_failed', error, true);
     }
   }
-}
-
-async function deleteTask(taskId: string): Promise<void> {
-  await deleteAgentTask(taskId);
 }
 
 function escapePreviewHtml(content: string): string {
@@ -2538,32 +2494,12 @@ export function createWebClientBridge(): ClientBridge {
           }
           return;
         case 'interruptTask':
-          void interruptTask('user_pause');
+          void interruptTask();
           return;
         case 'continueTask':
           void continueSessionExecution({
             promptText: typeof message.text === 'string' ? message.text : null,
             requestId: typeof message.requestId === 'string' ? message.requestId : undefined,
-          });
-          return;
-        case 'pauseTask':
-          void interruptTask('pause_task');
-          return;
-        case 'startTask':
-          if (typeof message.taskId === 'string' && message.taskId.trim()) {
-            void startTask(message.taskId);
-          }
-          return;
-        case 'deleteTask':
-          if (typeof message.taskId === 'string' && message.taskId.trim()) {
-            void deleteTask(message.taskId).catch((error) => {
-              logBridgeOperationFailure('删除任务', '[web-client-bridge] 删除任务失败:', error);
-            });
-          }
-          return;
-        case 'clearAllTasks':
-          void clearAllTasks().catch((error) => {
-            logBridgeOperationFailure('清空任务', '[web-client-bridge] 清空任务失败:', error);
           });
           return;
         case 'switchSession':

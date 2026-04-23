@@ -16,30 +16,34 @@ export interface VersionHandshakeDto {
   hostScope: string[];
 }
 
-export interface SessionActionImageDto {
+export interface SessionTurnImageDto {
   name: string;
-  data_url: string;
+  dataUrl: string;
 }
 
-export interface SessionActionRequestDto {
-  session_id?: string | null;
-  workspace_id?: string | null;
+export type SessionTurnRouteDto = 'chat' | 'execute' | 'task' | 'continue';
+
+export interface SessionTurnRequestDto {
+  sessionId?: string | null;
+  workspaceId?: string | null;
   text?: string | null;
-  deep_task: boolean;
-  skill_name?: string | null;
-  images: SessionActionImageDto[];
+  deepTask: boolean;
+  skillName?: string | null;
+  images: SessionTurnImageDto[];
 }
 
-export interface SessionActionResponseDto {
-  session_id: string;
-  entry_id: string;
-  event_id: string;
-  accepted_at: number;
-  created_session: boolean;
+export interface SessionTurnResponseDto {
+  sessionId: string;
+  entryId: string;
+  eventId: string;
+  acceptedAt: number;
+  createdSession: boolean;
+  route: SessionTurnRouteDto;
   /** Root task ID when the backend created a task graph for this action. */
-  root_task_id?: string | null;
+  rootTaskId?: string | null;
   /** 当前轮次实际执行的 action task ID。 */
-  action_task_id?: string | null;
+  actionTaskId?: string | null;
+  executionChainRef?: string | null;
 }
 
 export interface TaskInterruptResponseDto {
@@ -690,39 +694,6 @@ export interface BootstrapDto {
   recentEvents: EventEnvelope[];
 }
 
-// ─── Task lifecycle endpoints ───────────────────────────────────────
-
-export interface TaskIdRequestDto {
-  taskId: string;
-}
-
-export interface TaskStartResponseDto {
-  taskId: string;
-  started: boolean;
-  eventId: string;
-  requestedAt: number;
-}
-
-export interface TaskResumeResponseDto {
-  taskId: string;
-  resumed: boolean;
-  eventId: string;
-  requestedAt: number;
-}
-
-export interface TaskDeleteResponseDto {
-  taskId: string;
-  deleted: boolean;
-  eventId: string;
-  requestedAt: number;
-}
-
-export interface TaskClearAllResponseDto {
-  cleared: boolean;
-  eventId: string;
-  requestedAt: number;
-}
-
 // ─── Session management endpoints ───────────────────────────────────
 
 export interface SessionDeleteRequestDto {
@@ -1129,8 +1100,6 @@ export type TaskStatus =
   | 'Cancelled'
   | 'Skipped';
 
-export type LeaseStatus = 'Active' | 'Completed' | 'Expired' | 'Revoked';
-
 export interface ExecutorBindingDto {
   target_role: string;
   capability_requirements: string[];
@@ -1156,6 +1125,22 @@ export interface TaskPolicyDto {
   escalation_conditions: string[];
 }
 
+export interface DecisionOptionDto {
+  option_id: string;
+  label: string;
+  description: string;
+}
+
+export interface DecisionTaskPayloadDto {
+  decision_context: string;
+  blocked_reason: string;
+  options: DecisionOptionDto[];
+  risk_notes: string[];
+  recommended_option?: string | null;
+  required_user_input: boolean;
+  decision_evidence?: unknown;
+}
+
 export interface TaskDto {
   task_id: string;
   mission_id: string;
@@ -1178,27 +1163,9 @@ export interface TaskDto {
   evidence_refs: string[];
   retry_count: number;
   repair_count: number;
+  decision_payload?: DecisionTaskPayloadDto | null;
   created_at: number;
   updated_at: number;
-}
-
-export interface AssignmentLeaseDto {
-  lease_id: string;
-  task_id: string;
-  worker_id: string;
-  role: string;
-  granted_at: number;
-  expires_at: number;
-  heartbeat_at: number;
-  lease_status: LeaseStatus;
-}
-
-export interface WorkPackageSummaryDto {
-  task_id: string;
-  title: string;
-  status: TaskStatus;
-  completed_children: number;
-  total_children: number;
 }
 
 export interface ProgressSummaryDto {
@@ -1211,74 +1178,24 @@ export interface ProgressSummaryDto {
 
 export interface TaskProjectionDto {
   root_task: TaskDto;
+  tasks: TaskDto[];
   current_phase?: string | null;
   running_tasks: string[];
   blocked_tasks: string[];
   pending_decisions: string[];
-  workpackage_summaries: WorkPackageSummaryDto[];
   validation_summary?: string | null;
   progress_summary: ProgressSummaryDto;
   aggregate_status: TaskStatus;
   display_status: string;
 }
 
-export interface CreateTaskGraphRequestDto {
-  task_id: string;
-  mission_id: string;
-  root_task_id: string;
-  parent_task_id?: string | null;
-  kind: TaskKind;
-  title: string;
-  goal: string;
-  status?: TaskStatus;
-  dependency_ids?: string[];
-  context_refs?: string[];
-  knowledge_refs?: string[];
-  workspace_scope?: string | null;
-  write_scope?: string | null;
+export interface ResolveTaskDecisionRequestDto {
+  chosenOption: string;
+  evidence?: unknown;
 }
 
-export interface UpdateTaskStatusRequestDto {
-  status: TaskStatus;
-}
-
-// ─── Task Runner scheduling endpoints ───────────────────────────────
-
-export interface RunnerStartRequestDto {
-  rootTaskId: string;
-  sessionId: string;
-}
-
-export interface RunnerStartResponseDto {
-  rootTaskId: string;
-  started: boolean;
-  status: string;
-}
-
-export interface RunnerStopRequestDto {
-  rootTaskId: string;
-  sessionId: string;
-}
-
-export interface RunnerStopResponseDto {
-  rootTaskId: string;
-  stopped: boolean;
-}
-
-export interface RunnerStatusResponseDto {
-  rootTaskId: string;
-  status: string;
-  cycleCount: number;
-  lastError?: string | null;
-}
-
-export interface RunnerCycleRequestDto {
-  rootTaskId: string;
-  sessionId: string;
-}
-
-export interface RunnerCycleResponseDto {
-  rootTaskId: string;
-  outcome: string;
-  blockedTaskIds: string[];
+export interface ResolveTaskDecisionResponseDto {
+  taskId: string;
+  resolved: boolean;
+  chosenOption: string;
 }

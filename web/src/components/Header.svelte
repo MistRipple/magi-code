@@ -71,7 +71,7 @@
     if (pendingSwitchSessionId) {
       addToast('info', `正在切换到会话“${pendingSwitchSessionName}”...`, undefined, {
         category: 'feedback',
-        source: 'session-action',
+        source: 'session-management',
         persistToCenter: false,
         countUnread: false,
         displayMode: 'toast',
@@ -95,7 +95,7 @@
   function newSession() {
     addToast('info', '正在创建新会话...', undefined, {
       category: 'feedback',
-      source: 'session-action',
+      source: 'session-management',
       persistToCenter: false,
       countUnread: false,
       displayMode: 'toast',
@@ -123,7 +123,7 @@
     if (pendingDeleteSessionId) {
       addToast('info', `正在删除会话“${pendingDeleteSessionName}”...`, undefined, {
         category: 'feedback',
-        source: 'session-action',
+        source: 'session-management',
         persistToCenter: false,
         countUnread: false,
         displayMode: 'toast',

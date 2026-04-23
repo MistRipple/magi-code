@@ -341,6 +341,14 @@ export interface WorkerLaneProgressSummary {
   reviewRequiredTaskCount?: number;
 }
 
+export interface WorkerLaneTaskItem {
+  taskId?: string;
+  title: string;
+  status: WorkerLaneStatus;
+  isCurrent?: boolean;
+  seq?: number;
+}
+
 export interface DispatchGroupLane {
   laneId: string;
   laneVersion: number;
@@ -353,6 +361,9 @@ export interface DispatchGroupLane {
   liveActivity?: string;
   toolUseCount?: number;
   progressSummary?: WorkerLaneProgressSummary;
+  tasks?: WorkerLaneTaskItem[];
+  summary?: string;
+  fileChangeCount?: number;
   jumpTarget?: { workerTabId: string };
 }
 

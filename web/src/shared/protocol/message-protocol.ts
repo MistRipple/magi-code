@@ -251,6 +251,14 @@ export interface WorkerLaneProgressSummary {
   reviewRequiredTaskCount?: number;
 }
 
+export interface WorkerLaneTaskItem {
+  taskId?: string;
+  title: string;
+  status: WorkerLaneStatus;
+  isCurrent?: boolean;
+  seq?: number;
+}
+
 export interface WorkerLaneBlock {
   laneId: string;
   laneVersion: number;
@@ -263,6 +271,9 @@ export interface WorkerLaneBlock {
   liveActivity?: string;
   toolUseCount?: number;
   progressSummary?: WorkerLaneProgressSummary;
+  tasks?: WorkerLaneTaskItem[];
+  summary?: string;
+  fileChangeCount?: number;
   jumpTarget?: { workerTabId: string };
 }
 

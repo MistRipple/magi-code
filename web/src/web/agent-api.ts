@@ -246,21 +246,25 @@ export interface AgentChangeDiffPayload {
   currentExists?: boolean;
 }
 
-export interface AgentSessionActionImagePayload {
+export interface AgentSessionTurnImagePayload {
   name: string;
   dataUrl: string;
 }
 
-export interface AgentSessionActionResult {
+export type AgentSessionTurnRoute = 'chat' | 'execute' | 'task' | 'continue';
+
+export interface AgentSessionTurnResult {
   sessionId: string;
   entryId: string;
   eventId: string;
   acceptedAt: number;
   createdSession: boolean;
+  route: AgentSessionTurnRoute;
   /** Root task ID when the backend created a task graph for this action. */
   rootTaskId?: string | null;
   /** 当前轮次实际执行的 action task ID。 */
   actionTaskId?: string | null;
+  executionChainRef?: string | null;
 }
 
 export class AgentApiError extends Error {
@@ -893,87 +897,24 @@ export async function removeAgentNotification(notificationId: string): Promise<A
   );
 }
 
-export async function submitAgentSessionAction(
+export async function submitAgentSessionTurn(
   payload: {
     text?: string | null;
     deepTask: boolean;
     skillName?: string | null;
-    images: AgentSessionActionImagePayload[];
+    images: AgentSessionTurnImagePayload[];
   },
   bindingOverride?: Partial<AgentBindingContext>,
-): Promise<AgentSessionActionResult> {
-  try {
-    const resolvedBinding = resolveAgentBindingContext();
-    const binding: AgentBindingContext = {
-      workspaceId: bindingOverride?.workspaceId?.trim() || resolvedBinding.workspaceId,
-      workspacePath: bindingOverride?.workspacePath?.trim() || resolvedBinding.workspacePath,
-      sessionId: bindingOverride?.sessionId?.trim() || resolvedBinding.sessionId,
-    };
-    const response = await getTransport().request(agentUrl('/session/action'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        session_id: binding.sessionId || null,
-        workspace_id: binding.workspaceId || null,
-        text: payload.text ?? null,
-        deep_task: payload.deepTask,
-        skill_name: payload.skillName ?? null,
-        images: payload.images.map((image) => ({
-          name: image.name,
-          data_url: image.dataUrl,
-        })),
-      }),
-    });
-    const raw = await parseAgentJson<{
-      session_id: string;
-      entry_id: string;
-      event_id: string;
-      accepted_at: number;
-      created_session: boolean;
-      root_task_id?: string | null;
-      action_task_id?: string | null;
-    }>(response, 'submit session action');
-    return {
-      sessionId: raw.session_id,
-      entryId: raw.entry_id,
-      eventId: raw.event_id,
-      acceptedAt: raw.accepted_at,
-      createdSession: raw.created_session,
-      rootTaskId: typeof raw.root_task_id === 'string' && raw.root_task_id.trim() ? raw.root_task_id.trim() : null,
-      actionTaskId: typeof raw.action_task_id === 'string' && raw.action_task_id.trim()
-        ? raw.action_task_id.trim()
-        : null,
-    };
-  } catch (error) {
-    if (error instanceof TypeError) {
-      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
-    }
-    throw error;
-  }
-}
-
-export async function submitAgentChatMessage(
-  payload: {
-    text: string;
-  },
-  bindingOverride?: Partial<AgentBindingContext>,
-): Promise<{
-  sessionId: string;
-  entryId: string;
-  eventId: string;
-  acceptedAt: number;
-  createdSession: boolean;
-}> {
-  return await postBoundJson<{
-    sessionId: string;
-    entryId: string;
-    eventId: string;
-    acceptedAt: number;
-    createdSession: boolean;
-  }>(
-    '/api/session/chat',
-    { text: payload.text },
-    'submit session chat',
+): Promise<AgentSessionTurnResult> {
+  return await postBoundJson<AgentSessionTurnResult>(
+    '/api/session/turn',
+    {
+      text: payload.text ?? null,
+      deepTask: payload.deepTask,
+      skillName: payload.skillName ?? null,
+      images: payload.images,
+    },
+    'submit session turn',
     bindingOverride,
   );
 }
@@ -982,14 +923,6 @@ export async function interruptAgentTask(
   payload: { taskId: string },
 ): Promise<Record<string, unknown>> {
   return await postBoundJson<Record<string, unknown>>('/api/task/interrupt', payload, 'interrupt task');
-}
-
-export async function clearAgentAllTasks(): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/task/clear-all', {}, 'clear all tasks');
-}
-
-export async function startAgentTask(taskId: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/task/start', { taskId }, 'start task');
 }
 
 export async function continueAgentSession(
@@ -1024,10 +957,6 @@ export async function continueAgentSession(
     },
     'continue session',
   );
-}
-
-export async function deleteAgentTask(taskId: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/task/delete', { taskId }, 'delete task');
 }
 
 export async function getAgentSettingsBootstrap(

@@ -259,6 +259,17 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
                       reviewRequiredTaskCount: lane.progressSummary.reviewRequiredTaskCount,
                     }
                   : undefined,
+                tasks: Array.isArray(lane.tasks)
+                  ? lane.tasks.map((task) => ({
+                      taskId: task.taskId,
+                      title: task.title,
+                      status: task.status,
+                      isCurrent: task.isCurrent,
+                      seq: task.seq,
+                    }))
+                  : undefined,
+                summary: lane.summary,
+                fileChangeCount: lane.fileChangeCount,
                 jumpTarget: lane.jumpTarget,
               }))
             : [],

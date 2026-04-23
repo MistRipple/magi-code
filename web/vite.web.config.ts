@@ -3,11 +3,15 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { resolve } from 'path';
 
 const DEFAULT_AGENT_BASE_URL = 'http://127.0.0.1:38123';
+const DEFAULT_DEV_HOST = '127.0.0.1';
+const DEFAULT_DEV_PORT = 3000;
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, __dirname, '');
   const agentBaseUrl =
     env.VITE_AGENT_BASE_URL?.trim() || env.VITE_AGENT_PROXY_TARGET?.trim() || DEFAULT_AGENT_BASE_URL;
+  const devHost = env.MAGI_VITE_HOST?.trim() || DEFAULT_DEV_HOST;
+  const devPort = Number(env.MAGI_VITE_PORT || DEFAULT_DEV_PORT);
 
   return {
     base: './',
@@ -47,8 +51,15 @@ export default defineConfig(({ mode }) => {
       minify: false,
     },
     server: {
-      port: 3000,
-      open: '/web.html',
+      host: devHost,
+      port: Number.isFinite(devPort) ? devPort : DEFAULT_DEV_PORT,
+      strictPort: true,
+      open: env.MAGI_VITE_OPEN === '1' ? '/web.html' : false,
+      cors: true,
+      hmr: {
+        host: devHost,
+        port: Number.isFinite(devPort) ? devPort : DEFAULT_DEV_PORT,
+      },
       proxy: {
         '/events': {
           target: agentBaseUrl,

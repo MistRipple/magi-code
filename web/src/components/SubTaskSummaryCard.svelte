@@ -90,6 +90,10 @@
     }
   }
 
+  function resolveStatusLabel(status: CardWorkerStatus | null): string {
+    return i18n.t(resolveStatusConfig(status).key);
+  }
+
   const rawWorker = $derived.by(() => (
     normalizeText(card.worker)
     || 'orchestrator'
@@ -110,8 +114,14 @@
   ));
 
   const instructionText = $derived.by(() => (
-    normalizeText(card.instruction)
-    || normalizeText(card.description)
+    normalizeText(card.instruction) === 'worker_task_queue'
+      ? i18n.t('subTaskSummaryCard.workerTaskQueue')
+      : (
+        normalizeText(card.instruction)
+        || (normalizeText(card.description) === 'worker_task_queue'
+          ? i18n.t('subTaskSummaryCard.workerTaskQueue')
+          : normalizeText(card.description))
+      )
   ));
 
 
@@ -156,6 +166,59 @@
       ? card.toolUseCount
       : 0
   );
+
+  const taskQueue = $derived.by(() => (
+    Array.isArray(card.taskQueue)
+      ? card.taskQueue
+        .filter((item) => normalizeText(item?.title).length > 0)
+        .map((item) => ({
+          ...item,
+          title: normalizeText(item.title),
+          status: normalizeCardStatus(item.status) || 'pending',
+        }))
+      : []
+  ));
+
+  const currentTask = $derived.by(() => (
+    taskQueue.find((item) => item.isCurrent)
+    || taskQueue.find((item) => item.status === 'running')
+    || taskQueue.find((item) => item.status === 'pending')
+    || null
+  ));
+
+  const queueProgressText = $derived.by(() => {
+    const totalFromSummary = card.progressSummary?.totalTaskCount;
+    const total = typeof totalFromSummary === 'number' && Number.isFinite(totalFromSummary) && totalFromSummary > 0
+      ? Math.floor(totalFromSummary)
+      : taskQueue.length;
+    if (total <= 0) {
+      return '';
+    }
+    const currentIndex = currentTask
+      ? taskQueue.findIndex((item) => item === currentTask) + 1
+      : 0;
+    const completedFromSummary = card.progressSummary?.completedTaskCount;
+    const completedCount = typeof completedFromSummary === 'number' && Number.isFinite(completedFromSummary)
+      ? Math.max(0, Math.floor(completedFromSummary))
+      : taskQueue.filter((item) => item.status === 'completed').length;
+    const current = currentIndex > 0
+      ? currentIndex
+      : Math.min(total, Math.max(1, completedCount));
+    return i18n.t('subTaskSummaryCard.laneProgress', { current, total });
+  });
+
+  const currentTaskText = $derived.by(() => (
+    liveActivityText
+    || normalizeText(currentTask?.title)
+  ));
+
+  const summaryText = $derived.by(() => normalizeText(card.summary));
+
+  const fileChangeCount = $derived.by(() => (
+    typeof card.fileChangeCount === 'number' && Number.isFinite(card.fileChangeCount) && card.fileChangeCount > 0
+      ? Math.floor(card.fileChangeCount)
+      : 0
+  ));
 
   const resolvedDuration = $derived.by(() => {
     if (typeof card.duration === 'number' && Number.isFinite(card.duration) && card.duration >= 0) {
@@ -262,6 +325,57 @@
       <div class="worker-progress-card__instruction">
         <span class="worker-progress-card__instruction-label">{i18n.t('subTaskSummaryCard.section.instruction')}</span>
         <p class="worker-progress-card__instruction-text">{instructionText}</p>
+      </div>
+    {/if}
+
+    {#if currentTaskText || queueProgressText}
+      <div class="worker-progress-card__facts">
+        {#if currentTaskText}
+          <span class="worker-progress-card__fact">
+            <span class="worker-progress-card__fact-label">{i18n.t('subTaskSummaryCard.currentTask')}</span>
+            <span class="worker-progress-card__fact-value">{currentTaskText}</span>
+          </span>
+        {/if}
+        {#if queueProgressText}
+          <span class="worker-progress-card__fact">{queueProgressText}</span>
+        {/if}
+      </div>
+    {/if}
+
+    {#if taskQueue.length > 0}
+      <div class="worker-progress-card__queue">
+        <div class="worker-progress-card__section-head">
+          <span>{i18n.t('subTaskSummaryCard.section.taskQueue')}</span>
+          {#if queueProgressText}
+            <span>{queueProgressText}</span>
+          {/if}
+        </div>
+        <div class="worker-progress-card__queue-list">
+          {#each taskQueue as task (`${task.taskId || task.title}:${task.seq || 0}`)}
+            {@const taskStatusConfig = resolveStatusConfig(task.status)}
+            <div class="worker-progress-card__queue-row" class:is-current={task.isCurrent}>
+              <span class={`worker-progress-card__queue-icon worker-progress-card__queue-icon--${taskStatusConfig.tone}`}>
+                <Icon name={taskStatusConfig.icon} size={12} />
+              </span>
+              <span class="worker-progress-card__queue-title">{task.title}</span>
+              <span class="worker-progress-card__queue-status">{resolveStatusLabel(task.status)}</span>
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
+    {#if summaryText || fileChangeCount > 0}
+      <div class="worker-progress-card__summary">
+        {#if summaryText}
+          <div class="worker-progress-card__section-head">
+            <span>{i18n.t('subTaskSummaryCard.section.summary')}</span>
+          </div>
+          <p class="worker-progress-card__summary-text">{summaryText}</p>
+        {/if}
+        {#if fileChangeCount > 0}
+          <span class="worker-progress-card__stat">{i18n.t('subTaskSummaryCard.fileChangeCount', { count: fileChangeCount })}</span>
+        {/if}
       </div>
     {/if}
   </div>
@@ -480,6 +594,137 @@
     display: -webkit-box;
     -webkit-line-clamp: 3;
     line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-word;
+  }
+
+  .worker-progress-card__facts {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+  }
+
+  .worker-progress-card__fact {
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+    gap: 4px;
+  }
+
+  .worker-progress-card__fact-label {
+    color: var(--foreground-muted);
+    white-space: nowrap;
+  }
+
+  .worker-progress-card__fact-value {
+    min-width: 0;
+    max-width: 42ch;
+    color: var(--foreground);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .worker-progress-card__queue,
+  .worker-progress-card__summary {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+
+  .worker-progress-card__section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium);
+  }
+
+  .worker-progress-card__queue-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    overflow: hidden;
+    border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--surface) 78%, transparent);
+  }
+
+  .worker-progress-card__queue-row {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: var(--space-2);
+    padding: 6px 8px;
+    color: var(--foreground-muted);
+    background: color-mix(in srgb, var(--assistant-message-bg) 92%, var(--foreground) 8%);
+  }
+
+  .worker-progress-card__queue-row.is-current {
+    color: var(--foreground);
+    background: color-mix(in srgb, var(--primary) 9%, var(--assistant-message-bg));
+  }
+
+  .worker-progress-card__queue-icon {
+    width: 18px;
+    height: 18px;
+    border-radius: 999px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: color-mix(in srgb, currentColor 14%, transparent);
+  }
+
+  .worker-progress-card__queue-icon--pending {
+    color: var(--foreground-muted);
+  }
+
+  .worker-progress-card__queue-icon--running {
+    color: var(--primary);
+  }
+
+  .worker-progress-card__queue-icon--paused {
+    color: var(--warning);
+  }
+
+  .worker-progress-card__queue-icon--success {
+    color: var(--success);
+  }
+
+  .worker-progress-card__queue-icon--danger {
+    color: var(--error);
+  }
+
+  .worker-progress-card__queue-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--text-sm);
+  }
+
+  .worker-progress-card__queue-status {
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    white-space: nowrap;
+  }
+
+  .worker-progress-card__summary-text {
+    margin: 0;
+    color: var(--foreground-muted);
+    font-size: var(--text-sm);
+    line-height: 1.5;
+    display: -webkit-box;
+    -webkit-line-clamp: 4;
+    line-clamp: 4;
     -webkit-box-orient: vertical;
     overflow: hidden;
     word-break: break-word;

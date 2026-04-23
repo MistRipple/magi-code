@@ -1,5 +1,5 @@
 import type { TaskSemanticStatus } from '../shared/task-status-semantics';
-import type { DispatchGroupLane } from '../types/message';
+import type { DispatchGroupLane, WorkerLaneProgressSummary, WorkerLaneTaskItem } from '../types/message';
 
 export type CardWorkerStatus = TaskSemanticStatus;
 
@@ -24,6 +24,10 @@ export interface WorkerTaskCardData {
   laneTotal?: number;
   liveActivity?: string;
   toolUseCount?: number;
+  progressSummary?: WorkerLaneProgressSummary;
+  taskQueue?: WorkerLaneTaskItem[];
+  summary?: string;
+  fileChangeCount?: number;
 }
 
 function normalizeCardText(value: unknown): string {
@@ -55,6 +59,12 @@ export function buildDispatchLaneCardData(
     ...(liveActivity ? { liveActivity } : {}),
     ...(typeof lane.toolUseCount === 'number' && Number.isFinite(lane.toolUseCount) && lane.toolUseCount > 0
       ? { toolUseCount: Math.floor(lane.toolUseCount) }
+      : {}),
+    ...(lane.progressSummary ? { progressSummary: lane.progressSummary } : {}),
+    ...(Array.isArray(lane.tasks) && lane.tasks.length > 0 ? { taskQueue: lane.tasks } : {}),
+    ...(normalizeCardText(lane.summary) ? { summary: normalizeCardText(lane.summary) } : {}),
+    ...(typeof lane.fileChangeCount === 'number' && Number.isFinite(lane.fileChangeCount) && lane.fileChangeCount > 0
+      ? { fileChangeCount: Math.floor(lane.fileChangeCount) }
       : {}),
   };
 }

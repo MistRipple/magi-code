@@ -11,14 +11,12 @@ import type {
   ApproveAllChangesResponseDto,
   ApproveChangeRequestDto,
   ApproveChangeResponseDto,
-  AssignmentLeaseDto,
   AuditUsageLedgerDto,
   BootstrapDto,
   BridgePreflightSnapshotDto,
   BridgeServicesSnapshotDto,
   ClearNotificationsRequestDto,
   ConnectionTestResponseDto,
-  CreateTaskGraphRequestDto,
   CustomToolNameRequestDto,
   DeletedResponseDto,
   DeleteKnowledgeRequestDto,
@@ -49,6 +47,8 @@ import type {
   RemoveWorkspaceRequestDto,
   RemoveWorkspaceResponseDto,
   RemovedResponseDto,
+  ResolveTaskDecisionRequestDto,
+  ResolveTaskDecisionResponseDto,
   RepositoriesResponseDto,
   RepositoryIdRequestDto,
   RepositoryRefreshResponseDto,
@@ -60,17 +60,8 @@ import type {
   RevertExecutionGroupChangesRequestDto,
   RevertExecutionGroupChangesResponseDto,
   RoleTemplatesResponseDto,
-  RunnerCycleRequestDto,
-  RunnerCycleResponseDto,
-  RunnerStartRequestDto,
-  RunnerStartResponseDto,
-  RunnerStatusResponseDto,
-  RunnerStopRequestDto,
-  RunnerStopResponseDto,
   RuntimeReadModelDto,
   SavedResponseDto,
-  SessionActionRequestDto,
-  SessionActionResponseDto,
   SessionContinueRequestDto,
   SessionContinueResponseDto,
   SessionCloseRequestDto,
@@ -78,22 +69,18 @@ import type {
   SessionNotificationsResponseDto,
   SessionRenameRequestDto,
   SessionStatsResponseDto,
+  SessionTurnRequestDto,
+  SessionTurnResponseDto,
   SettingsUpdateRequestDto,
   SkillInstallResponseDto,
   SkillsConfigSaveResponseDto,
   SkillsLibraryResponseDto,
   SkillUpdateResponseDto,
-  TaskClearAllResponseDto,
-  TaskDeleteResponseDto,
   TaskDto,
-  TaskIdRequestDto,
   TaskInterruptResponseDto,
   TaskProjectionDto,
-  TaskStartResponseDto,
-  TaskStatus,
   UpdatedResponseDto,
   UpdateKnowledgeRequestDto,
-  UpdateTaskStatusRequestDto,
   VersionHandshakeDto,
   WorkspaceListResponseDto,
   WorkspacePickResponseDto,
@@ -157,10 +144,10 @@ export class RustDaemonClient {
     return this.getJson<BridgePreflightSnapshotDto>('/bridges/preflight');
   }
 
-  public async submitSessionAction(
-    request: SessionActionRequestDto,
-  ): Promise<SessionActionResponseDto> {
-    return this.postJson<SessionActionResponseDto>('/session/action', request);
+  public async submitSessionTurn(
+    request: SessionTurnRequestDto,
+  ): Promise<SessionTurnResponseDto> {
+    return this.postJson<SessionTurnResponseDto>('/api/session/turn', request);
   }
 
   public async continueSession(
@@ -173,24 +160,6 @@ export class RustDaemonClient {
     request: unknown,
   ): Promise<TaskInterruptResponseDto> {
     return this.postJson<TaskInterruptResponseDto>('/api/task/interrupt', request);
-  }
-
-  // ─── Task lifecycle ─────────────────────────────────────────────────
-
-  public async startTask(
-    request: TaskIdRequestDto,
-  ): Promise<TaskStartResponseDto> {
-    return this.postJson<TaskStartResponseDto>('/api/task/start', request);
-  }
-
-  public async deleteTask(
-    request: TaskIdRequestDto,
-  ): Promise<TaskDeleteResponseDto> {
-    return this.postJson<TaskDeleteResponseDto>('/api/task/delete', request);
-  }
-
-  public async clearAllTasks(): Promise<TaskClearAllResponseDto> {
-    return this.postJson<TaskClearAllResponseDto>('/api/task/clear-all', {});
   }
 
   // ─── Session management ───────────────────────────────────────────
@@ -669,60 +638,17 @@ export class RustDaemonClient {
     );
   }
 
-  public async createTask(
-    request: CreateTaskGraphRequestDto,
-  ): Promise<TaskDto> {
-    return this.postJson<TaskDto>('/api/tasks/create', request);
-  }
-
-  public async updateTaskStatus(
+  public async resolveTaskDecision(
     taskId: string,
-    status: TaskStatus,
-  ): Promise<TaskDto> {
-    const request: UpdateTaskStatusRequestDto = { status };
-    return this.postJson<TaskDto>(
-      `/api/tasks/${encodeURIComponent(taskId)}/status`,
+    sessionId: string,
+    request: ResolveTaskDecisionRequestDto,
+  ): Promise<ResolveTaskDecisionResponseDto> {
+    const query = new URLSearchParams();
+    query.set('sessionId', sessionId);
+    return this.postJson<ResolveTaskDecisionResponseDto>(
+      `/api/tasks/${encodeURIComponent(taskId)}/decision?${query.toString()}`,
       request,
     );
-  }
-
-  public async getTaskLease(taskId: string, sessionId: string): Promise<AssignmentLeaseDto | null> {
-    const query = new URLSearchParams();
-    query.set('sessionId', sessionId);
-    return this.getJson<AssignmentLeaseDto | null>(
-      `/api/tasks/${encodeURIComponent(taskId)}/lease?${query.toString()}`,
-    );
-  }
-
-  // ─── Task Runner scheduling ─────────────────────────────────────────
-
-  public async startRunner(
-    request: RunnerStartRequestDto,
-  ): Promise<RunnerStartResponseDto> {
-    return this.postJson<RunnerStartResponseDto>('/api/tasks/runner/start', request);
-  }
-
-  public async stopRunner(
-    request: RunnerStopRequestDto,
-  ): Promise<RunnerStopResponseDto> {
-    return this.postJson<RunnerStopResponseDto>('/api/tasks/runner/stop', request);
-  }
-
-  public async getRunnerStatus(
-    rootTaskId: string,
-    sessionId: string,
-  ): Promise<RunnerStatusResponseDto> {
-    const query = new URLSearchParams();
-    query.set('sessionId', sessionId);
-    return this.getJson<RunnerStatusResponseDto>(
-      `/api/tasks/runner/status/${encodeURIComponent(rootTaskId)}?${query.toString()}`,
-    );
-  }
-
-  public async runRunnerCycle(
-    request: RunnerCycleRequestDto,
-  ): Promise<RunnerCycleResponseDto> {
-    return this.postJson<RunnerCycleResponseDto>('/api/tasks/runner/cycle', request);
   }
 
   public connectEvents(handlers: EventStreamHandlers): () => void {

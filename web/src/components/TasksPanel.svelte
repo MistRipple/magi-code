@@ -4,11 +4,10 @@
   import type { ActivePlanState, PlanLedgerRecord, Message } from '../types/message';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import type { TaskStatus, AssignmentLeaseDto, RunnerStatusResponseDto } from '../shared/rust-backend-types';
+  import type { DecisionOptionDto, TaskDto, TaskStatus } from '../shared/rust-backend-types';
   import type { IconName } from '../lib/icons';
   import {
     getTaskGraphState,
-    getTaskKindLabel,
     getTaskStatusModifier,
     refreshTaskProjection,
   } from '../stores/task-graph-store.svelte';
@@ -17,12 +16,19 @@
 
   const appState = getState();
 
+  interface TaskTreeRow {
+    task: TaskDto;
+    depth: number;
+    hasChildren: boolean;
+    childCount: number;
+  }
+
   const appPayload = $derived((appState.appState || {}) as Record<string, unknown>);
   const activePlanState = $derived((appPayload.activePlan || null) as ActivePlanState | null);
   const planHistory = $derived(ensureArray(appPayload.planHistory) as PlanLedgerRecord[]);
   const threadMessages = $derived(ensureArray(appState.threadMessages) as Message[]);
 
-  // ─── Task Graph Projection (new Task-based view) ─────────────────
+  // ─── 任务投影视图 ─────────────────
   const currentSessionId = $derived(appState.currentSessionId);
   const taskGraph = $derived(getTaskGraphState(currentSessionId));
   const hasTaskProjection = $derived(taskGraph.projection !== null);
@@ -32,10 +38,45 @@
     const percent = Math.round((p.completed_tasks / p.total_tasks) * 100);
     return { ...p, percent };
   });
-  const workpackageSummaries = $derived(taskGraph.projection?.workpackage_summaries ?? []);
-
-  // Track expanded task graph nodes
+  const projectionTasks = $derived(taskGraph.projection?.tasks ?? []);
+  const taskById = $derived.by(() => new Map(projectionTasks.map((task) => [task.task_id, task])));
+  // 记录任务树节点展开状态。
   let expandedGraphNodes = $state<Set<string>>(new Set());
+
+  const childrenByParentId = $derived.by(() => {
+    const grouped = new Map<string, TaskDto[]>();
+    for (const task of projectionTasks) {
+      if (!task.parent_task_id) continue;
+      const siblings = grouped.get(task.parent_task_id) ?? [];
+      siblings.push(task);
+      grouped.set(task.parent_task_id, siblings);
+    }
+    for (const [parentId, children] of grouped) {
+      const parent = taskById.get(parentId);
+      const parentOrder = new Map((parent?.required_children ?? []).map((id, index) => [id, index]));
+      children.sort((left, right) => compareTaskSiblings(left, right, parentOrder));
+    }
+    return grouped;
+  });
+  const taskTreeRows = $derived.by(() => (
+    buildTaskTreeRows(taskGraph.projection?.root_task, childrenByParentId, expandedGraphNodes)
+  ));
+  const taskSummary = $derived.by(() => buildTaskSummary(projectionTasks));
+  const currentFocusTask = $derived.by(() => resolveCurrentFocusTask(projectionTasks));
+  const attentionTasks = $derived.by(() => {
+    const projection = taskGraph.projection;
+    if (!projection) return [];
+    const ids = [...projection.pending_decisions, ...projection.blocked_tasks];
+    const seen = new Set<string>();
+    return ids
+      .filter((id) => {
+        if (seen.has(id)) return false;
+        seen.add(id);
+        return true;
+      })
+      .map((id) => taskById.get(id))
+      .filter((task): task is TaskDto => Boolean(task));
+  });
 
   function toggleGraphNode(taskId: string) {
     const next = new Set(expandedGraphNodes);
@@ -44,19 +85,130 @@
     expandedGraphNodes = next;
   }
 
-  // Auto-expand running workpackages
-  $effect(() => {
-    const runningIds = taskGraph.projection?.running_tasks ?? [];
-    const wpIds = workpackageSummaries
-      .filter(wp => wp.status === 'Running')
-      .map(wp => wp.task_id);
-    const allRunning = [...runningIds, ...wpIds];
-    const needsExpand = allRunning.some(id => !expandedGraphNodes.has(id));
-    if (needsExpand) {
-      const next = new Set(expandedGraphNodes);
-      for (const id of allRunning) next.add(id);
-      expandedGraphNodes = next;
+  function compareTaskSiblings(left: TaskDto, right: TaskDto, parentOrder: Map<string, number>): number {
+    const leftOrder = parentOrder.get(left.task_id) ?? Number.MAX_SAFE_INTEGER;
+    const rightOrder = parentOrder.get(right.task_id) ?? Number.MAX_SAFE_INTEGER;
+    if (leftOrder !== rightOrder) return leftOrder - rightOrder;
+    if (left.created_at !== right.created_at) return left.created_at - right.created_at;
+    return left.task_id.localeCompare(right.task_id);
+  }
+
+  function buildTaskTreeRows(
+    rootTask: TaskDto | null | undefined,
+    childrenByParentId: Map<string, TaskDto[]>,
+    expandedNodeIds: Set<string>,
+  ): TaskTreeRow[] {
+    if (!rootTask) return [];
+    const rows: TaskTreeRow[] = [];
+    const visit = (task: TaskDto, depth: number) => {
+      const children = childrenByParentId.get(task.task_id) ?? [];
+      rows.push({
+        task,
+        depth,
+        hasChildren: children.length > 0,
+        childCount: children.length,
+      });
+      if (children.length > 0 && expandedNodeIds.has(task.task_id)) {
+        for (const child of children) visit(child, depth + 1);
+      }
+    };
+    visit(rootTask, 0);
+    return rows;
+  }
+
+  function completedChildCount(taskId: string): number {
+    return (childrenByParentId.get(taskId) ?? [])
+      .filter((child) => child.status === 'Completed')
+      .length;
+  }
+
+  function buildTaskSummary(tasks: TaskDto[]) {
+    return {
+      total: tasks.length,
+      completed: tasks.filter((task) => task.status === 'Completed' || task.status === 'Skipped').length,
+      active: tasks.filter((task) => ['Running', 'Verifying', 'Repairing'].includes(task.status)).length,
+      blocked: tasks.filter((task) => task.status === 'Blocked' || task.status === 'AwaitingApproval').length,
+      failed: tasks.filter((task) => task.status === 'Failed').length,
+    };
+  }
+
+  function resolveCurrentFocusTask(tasks: TaskDto[]): TaskDto | null {
+    const priority: TaskStatus[] = ['AwaitingApproval', 'Blocked', 'Repairing', 'Verifying', 'Running', 'Ready'];
+    for (const status of priority) {
+      const matched = tasks.find((task) => task.status === status && task.kind !== 'Objective');
+      if (matched) return matched;
     }
+    return tasks.find((task) => task.kind === 'Objective') ?? null;
+  }
+
+  function getTaskKindProductLabel(kind: TaskDto['kind']): string {
+    switch (kind) {
+      case 'Objective': return '目标';
+      case 'Phase': return '阶段';
+      case 'WorkPackage': return '工作包';
+      case 'Action': return '步骤';
+      case 'Validation': return '验证';
+      case 'Repair': return '修复';
+      case 'Decision': return '决策';
+      default: return kind;
+    }
+  }
+
+  function getTaskStatusLabel(status: TaskStatus): string {
+    switch (status) {
+      case 'Draft': return '待规划';
+      case 'Ready': return '待执行';
+      case 'Running': return '执行中';
+      case 'Blocked': return '已暂停';
+      case 'AwaitingApproval': return '等待确认';
+      case 'Verifying': return '验证中';
+      case 'Repairing': return '修复中';
+      case 'Completed': return '已完成';
+      case 'Failed': return '失败';
+      case 'Cancelled': return '已取消';
+      case 'Skipped': return '已跳过';
+      default: return status;
+    }
+  }
+
+  function getTaskStatusTone(status: TaskStatus): string {
+    if (status === 'AwaitingApproval' || status === 'Blocked') return '需要处理';
+    if (status === 'Running' || status === 'Verifying' || status === 'Repairing') return '正在推进';
+    if (status === 'Completed' || status === 'Skipped') return '已收束';
+    if (status === 'Failed') return '需要修复';
+    return '等待执行';
+  }
+
+  // 自动展开根节点和活跃分支，确保任务树能直接反映执行状态。
+  $effect(() => {
+    const projection = taskGraph.projection;
+    if (!projection) return;
+    const next = new Set(expandedGraphNodes);
+    let changed = false;
+    const expand = (taskId: string) => {
+      if (!next.has(taskId)) {
+        next.add(taskId);
+        changed = true;
+      }
+    };
+
+    expand(projection.root_task.task_id);
+    const visibleTaskIds = [
+      ...projection.running_tasks,
+      ...projection.blocked_tasks,
+      ...projection.pending_decisions,
+    ];
+    for (const taskId of visibleTaskIds) {
+      if ((childrenByParentId.get(taskId)?.length ?? 0) > 0) {
+        expand(taskId);
+      }
+      let current = taskById.get(taskId);
+      while (current?.parent_task_id) {
+        expand(current.parent_task_id);
+        current = taskById.get(current.parent_task_id);
+      }
+    }
+    if (changed) expandedGraphNodes = next;
   });
 
   function getProjectionStatusIcon(status: TaskStatus): { name: IconName; spinning: boolean } {
@@ -73,146 +225,41 @@
     }
   }
 
-  function formatLeaseRemaining(lease: AssignmentLeaseDto): string {
-    const remaining = lease.expires_at - Date.now();
-    if (remaining <= 0) return 'expired';
-    const seconds = Math.floor(remaining / 1000);
-    if (seconds < 60) return `${seconds}s`;
-    const minutes = Math.floor(seconds / 60);
-    return `${minutes}m${seconds % 60}s`;
-  }
-
-  // ─── Runner Controls ─────────────────────────────────────────────
   function createClient(): RustDaemonClient {
     return new RustDaemonClient(resolveAgentBaseUrl());
   }
 
-  let runnerStatus = $state<RunnerStatusResponseDto | null>(null);
-  let runnerLoading = $state(false);
-  let runnerError = $state<string | null>(null);
-  let runnerPollTimer = $state<ReturnType<typeof setInterval> | null>(null);
-
-  const rootTaskId = $derived(taskGraph.rootTaskId);
-
-  async function pollRunnerStatus() {
-    if (!rootTaskId || !currentSessionId) return;
-    try {
-      const client = createClient();
-      runnerStatus = await client.getRunnerStatus(rootTaskId, currentSessionId);
-      runnerError = null;
-    } catch (error) {
-      // Non-critical: runner may not exist yet
-      runnerStatus = null;
-    }
-  }
-
-  async function handleStartRunner() {
-    if (!rootTaskId || !currentSessionId || runnerLoading) return;
-    runnerLoading = true;
-    runnerError = null;
-    try {
-      const client = createClient();
-      await client.startRunner({ rootTaskId, sessionId: currentSessionId });
-      await pollRunnerStatus();
-      startRunnerPolling();
-    } catch (err) {
-      runnerError = err instanceof Error ? err.message : String(err);
-    } finally {
-      runnerLoading = false;
-    }
-  }
-
-  async function handleStopRunner() {
-    if (!rootTaskId || !currentSessionId || runnerLoading) return;
-    runnerLoading = true;
-    runnerError = null;
-    try {
-      const client = createClient();
-      await client.stopRunner({ rootTaskId, sessionId: currentSessionId });
-      await pollRunnerStatus();
-      stopRunnerPolling();
-    } catch (err) {
-      runnerError = err instanceof Error ? err.message : String(err);
-    } finally {
-      runnerLoading = false;
-    }
-  }
-
-  function startRunnerPolling() {
-    stopRunnerPolling();
-    runnerPollTimer = setInterval(() => { pollRunnerStatus(); }, 3000);
-  }
-
-  function stopRunnerPolling() {
-    if (runnerPollTimer !== null) {
-      clearInterval(runnerPollTimer);
-      runnerPollTimer = null;
-    }
-  }
-
-  const isRunnerActive = $derived(
-    runnerStatus !== null && (runnerStatus.status === 'Running' || runnerStatus.status === 'running'),
-  );
-
-  // Auto-poll runner status when root task is set and auto-start polling if runner is running
-  $effect(() => {
-    if (!rootTaskId || !currentSessionId) {
-      runnerStatus = null;
-      runnerError = null;
-      stopRunnerPolling();
-      return () => { stopRunnerPolling(); };
-    }
-    if (rootTaskId) {
-      pollRunnerStatus().then(() => {
-        if (isRunnerActive) {
-          startRunnerPolling();
-        }
-      });
-    }
-    return () => { stopRunnerPolling(); };
-  });
-
-  // ─── Decision Task Approval ──────────────────────────────────────
+  // ─── 决策任务处理 ──────────────────────────────────────
   let decisionLoading = $state<Set<string>>(new Set());
 
-  async function approveDecision(taskId: string) {
+  function getDecisionOptions(task: TaskDto): DecisionOptionDto[] {
+    return task.decision_payload?.options ?? [];
+  }
+
+  function isRecommendedDecisionOption(task: TaskDto, option: DecisionOptionDto): boolean {
+    return task.decision_payload?.recommended_option === option.option_id;
+  }
+
+  async function resolveDecision(taskId: string, option: DecisionOptionDto) {
+    const sessionId = currentSessionId?.trim();
+    if (!sessionId) return;
     const next = new Set(decisionLoading);
     next.add(taskId);
     decisionLoading = next;
     try {
       const client = createClient();
-      await client.updateTaskStatus(taskId, 'Completed');
+      await client.resolveTaskDecision(taskId, sessionId, {
+        chosenOption: option.option_id,
+      });
       await refreshTaskProjection(currentSessionId);
     } catch (err) {
-      console.error('Failed to approve decision:', err);
+      console.error('Failed to resolve decision:', err);
     } finally {
       const after = new Set(decisionLoading);
       after.delete(taskId);
       decisionLoading = after;
     }
   }
-
-  async function rejectDecision(taskId: string) {
-    const next = new Set(decisionLoading);
-    next.add(taskId);
-    decisionLoading = next;
-    try {
-      const client = createClient();
-      await client.updateTaskStatus(taskId, 'Failed');
-      await refreshTaskProjection(currentSessionId);
-    } catch (err) {
-      console.error('Failed to reject decision:', err);
-    } finally {
-      const after = new Set(decisionLoading);
-      after.delete(taskId);
-      decisionLoading = after;
-    }
-  }
-
-  // ─── Pending decisions from projection ───────────────────────────
-  // pending_decisions is an array of task IDs; we need to identify Decision+Ready tasks
-  // The projection root_task has kind info, but pending_decisions are just IDs.
-  // We display them in the attention section with approve/reject buttons.
 
   let showPlanLedger = $state(true);
 
@@ -409,175 +456,167 @@
 </script>
 
 <div class="panel-content-scrollable tasks-panel">
-  <!-- ═══ Runner Controls Bar ═══ -->
-  {#if hasTaskProjection && rootTaskId}
-    <div class="runner-bar">
-      <div class="runner-bar-left">
-        <span class="runner-label">Runner</span>
-        {#if runnerStatus}
-          <span class="runner-status runner-status--{runnerStatus.status?.toLowerCase() ?? 'unknown'}">
-            {runnerStatus.status}
-          </span>
-          {#if runnerStatus.cycleCount > 0}
-            <span class="runner-cycles">Cycle {runnerStatus.cycleCount}</span>
-          {/if}
-        {/if}
-        {#if runnerError}
-          <span class="runner-error-text" title={runnerError}>Error</span>
-        {/if}
-      </div>
-      <div class="runner-bar-right">
-        {#if isRunnerActive}
-          <button
-            class="btn-icon btn-icon--xs btn-icon--error"
-            title="Stop Runner"
-            disabled={runnerLoading}
-            onclick={() => handleStopRunner()}
-          >
-            <Icon name="stop" size={12} />
-          </button>
-        {:else}
-          <button
-            class="btn-icon btn-icon--xs"
-            title="Start Runner"
-            disabled={runnerLoading}
-            onclick={() => handleStartRunner()}
-          >
-            <Icon name="play" size={12} />
-          </button>
-        {/if}
-        {#if runnerLoading}
-          <Icon name="loader" size={14} class="spinning" />
-        {/if}
-      </div>
-    </div>
-  {/if}
-
   {#if hasTaskProjection}
-    <!-- ═══ Task Projection View (new Task Graph) ═══ -->
     {@const proj = taskGraph.projection}
     {#if proj}
-      <!-- Projection overview bar -->
-      <div class="tg-overview-bar">
-        <div class="tg-overview-header">
-          <span class="tg-overview-title">{proj.root_task.title}</span>
+      <section class="task-overview-card" aria-label="任务概览">
+        <div class="task-overview-top">
+          <div class="task-overview-main">
+            <span class="task-overview-kicker">当前任务</span>
+            <h3 class="task-overview-title">{proj.root_task.title}</h3>
+            {#if proj.root_task.goal && proj.root_task.goal !== proj.root_task.title}
+              <p class="task-overview-goal">{proj.root_task.goal}</p>
+            {/if}
+          </div>
           <span class="tg-status-badge tg-status--{getTaskStatusModifier(proj.aggregate_status)}">
-            {proj.display_status || proj.aggregate_status}
+            {getTaskStatusLabel(proj.aggregate_status)}
           </span>
         </div>
-        {#if proj.current_phase}
-          <span class="tg-phase-label">{proj.current_phase}</span>
-        {/if}
+
         {#if projectionProgress}
           <div class="tg-progress-wrap">
-            <span class="tg-progress-label">{projectionProgress.completed_tasks}/{projectionProgress.total_tasks}</span>
+            <span class="tg-progress-label">{projectionProgress.percent}%</span>
             <div class="tg-progress-bar">
               <div class="tg-progress-fill" style="width: {projectionProgress.percent}%"></div>
             </div>
           </div>
-          <div class="tg-progress-stats">
-            {#if projectionProgress.running_tasks > 0}
-              <span class="tg-stat tg-stat--running">{projectionProgress.running_tasks} running</span>
+          <div class="task-metrics">
+            <span>{taskSummary.completed}/{taskSummary.total} 已完成</span>
+            {#if taskSummary.active > 0}
+              <span class="tg-stat tg-stat--running">{taskSummary.active} 正在推进</span>
             {/if}
-            {#if projectionProgress.failed_tasks > 0}
-              <span class="tg-stat tg-stat--failed">{projectionProgress.failed_tasks} failed</span>
+            {#if taskSummary.blocked > 0}
+              <span class="tg-stat tg-stat--blocked">{taskSummary.blocked} 需要处理</span>
             {/if}
-            {#if projectionProgress.blocked_tasks > 0}
-              <span class="tg-stat tg-stat--blocked">{projectionProgress.blocked_tasks} blocked</span>
+            {#if taskSummary.failed > 0}
+              <span class="tg-stat tg-stat--failed">{taskSummary.failed} 失败</span>
             {/if}
           </div>
         {/if}
+
+        {#if currentFocusTask}
+          <div class="task-focus-card">
+            <span class="task-focus-label">当前焦点</span>
+            <div class="task-focus-main">
+              <span class="task-focus-title">{currentFocusTask.title}</span>
+              <span class="task-focus-status">{getTaskStatusTone(currentFocusTask.status)}</span>
+            </div>
+            {#if proj.current_phase}
+              <span class="task-focus-meta">阶段：{proj.current_phase}</span>
+            {/if}
+          </div>
+        {/if}
+
         {#if proj.validation_summary}
           <div class="tg-validation-summary">{proj.validation_summary}</div>
         {/if}
+      </section>
+
+      <div class="task-section-header">
+        <span>执行结构</span>
+        <span class="task-section-meta">{projectionTasks.length} 个节点</span>
       </div>
 
-      <!-- Work Package list -->
-      {#if workpackageSummaries.length > 0}
-        <div class="tg-wp-list">
-          {#each workpackageSummaries as wp (wp.task_id)}
-            {@const isWpExpanded = expandedGraphNodes.has(wp.task_id)}
-            {@const statusIcon = getProjectionStatusIcon(wp.status)}
-            {@const lease = taskGraph.leases.get(wp.task_id)}
-            <div class="tg-wp-card tg-wp--{getTaskStatusModifier(wp.status)}">
-              <div
-                class="tg-wp-header"
-                role="button"
-                tabindex="0"
-                onclick={() => toggleGraphNode(wp.task_id)}
-                onkeydown={(e) => e.key === 'Enter' && toggleGraphNode(wp.task_id)}
+      <div class="tg-tree" role="tree" aria-label="任务执行结构">
+        {#each taskTreeRows as row (row.task.task_id)}
+          {@const isExpanded = expandedGraphNodes.has(row.task.task_id)}
+          {@const statusIcon = getProjectionStatusIcon(row.task.status)}
+          <div
+            class="tg-tree-row tg-tree-row--{getTaskStatusModifier(row.task.status)}"
+            class:tg-tree-row--focus={currentFocusTask?.task_id === row.task.task_id}
+            role="treeitem"
+            aria-level={row.depth + 1}
+            aria-expanded={row.hasChildren ? isExpanded : undefined}
+            aria-selected="false"
+            style={`--task-indent: ${row.depth * 18}px;`}
+          >
+            {#if row.hasChildren}
+              <button
+                type="button"
+                class="tg-tree-toggle"
+                class:expanded={isExpanded}
+                aria-label={isExpanded ? '折叠任务' : '展开任务'}
+                onclick={() => toggleGraphNode(row.task.task_id)}
               >
-                <span class="tg-wp-chevron" class:expanded={isWpExpanded}>
-                  <Icon name="chevron-right" size={12} />
-                </span>
-                <span class="tg-kind-badge">{getTaskKindLabel('WorkPackage')}</span>
-                <span class="tg-wp-status-icon tg-status-icon--{getTaskStatusModifier(wp.status)}">
-                  {#if statusIcon.spinning}
-                    <Icon name={statusIcon.name} size={14} class="spinning" />
+                <Icon name="chevron-right" size={12} />
+              </button>
+            {:else}
+              <span class="tg-tree-toggle tg-tree-toggle--empty" aria-hidden="true"></span>
+            {/if}
+            <span class="tg-kind-badge">{getTaskKindProductLabel(row.task.kind)}</span>
+            <span class="tg-tree-status-icon tg-status-icon--{getTaskStatusModifier(row.task.status)}">
+              {#if statusIcon.spinning}
+                <Icon name={statusIcon.name} size={14} class="spinning" />
+              {:else}
+                <Icon name={statusIcon.name} size={14} />
+              {/if}
+            </span>
+            <span class="tg-tree-content">
+              <span class="tg-tree-title">{row.task.title}</span>
+              {#if row.task.goal && row.task.goal !== row.task.title}
+                <span class="tg-tree-goal">{row.task.goal}</span>
+              {/if}
+            </span>
+            <span class="tg-tree-side">
+              <span class="tg-tree-state">{getTaskStatusLabel(row.task.status)}</span>
+              {#if row.task.kind === 'WorkPackage' && row.childCount > 0}
+                <span class="tg-tree-count">{completedChildCount(row.task.task_id)}/{row.childCount}</span>
+              {:else if row.childCount > 0}
+                <span class="tg-tree-count">{row.childCount}</span>
+              {/if}
+            </span>
+          </div>
+        {/each}
+      </div>
+
+      {#if attentionTasks.length > 0}
+        <div class="tg-attention-section">
+          <div class="task-section-header">
+            <span>需要处理</span>
+            <span class="task-section-meta">{attentionTasks.length} 项</span>
+          </div>
+          {#each attentionTasks as task (task.task_id)}
+            {@const isDecLoading = decisionLoading.has(task.task_id)}
+            {@const decisionOptions = task.kind === 'Decision' ? getDecisionOptions(task) : []}
+            <div class="tg-attention-item tg-attention--{task.kind === 'Decision' ? 'decision' : 'blocked'}">
+              <Icon name={task.kind === 'Decision' ? 'shield' : 'alert-circle'} size={12} />
+              <div class="tg-attention-copy">
+                <span class="tg-attention-title">{task.title}</span>
+                <span class="tg-attention-meta">
+                  {#if task.kind === 'Decision' && task.decision_payload?.blocked_reason}
+                    {task.decision_payload.blocked_reason}
                   {:else}
-                    <Icon name={statusIcon.name} size={14} />
+                    {getTaskStatusLabel(task.status)}
                   {/if}
                 </span>
-                <span class="tg-wp-title">{wp.title}</span>
-                <span class="tg-wp-count">{wp.completed_children}/{wp.total_children}</span>
-                {#if lease}
-                  <span class="tg-lease-badge" title="Worker: {lease.worker_id}, Role: {lease.role}">
-                    {lease.worker_id} ({formatLeaseRemaining(lease)})
-                  </span>
-                {/if}
               </div>
-              {#if wp.total_children > 0}
-                <div class="tg-wp-progress-bar">
-                  <div class="tg-wp-progress-fill" style="width: {wp.total_children > 0 ? Math.round((wp.completed_children / wp.total_children) * 100) : 0}%"></div>
+              {#if task.kind === 'Decision'}
+                <div class="tg-decision-actions">
+                  {#if decisionOptions.length > 0}
+                    {#each decisionOptions as option (option.option_id)}
+                      <button
+                        class={isRecommendedDecisionOption(task, option)
+                          ? 'tg-decision-btn tg-decision-btn--recommended'
+                          : 'tg-decision-btn'}
+                        title={option.description || option.label}
+                        disabled={isDecLoading}
+                        onclick={() => resolveDecision(task.task_id, option)}
+                      >
+                        {#if isDecLoading}
+                          <Icon name="loader" size={12} class="spinning" />
+                        {:else}
+                          <Icon name="check" size={12} />
+                        {/if}
+                        {option.label}
+                      </button>
+                    {/each}
+                  {:else}
+                    <span class="tg-decision-empty">缺少决策选项</span>
+                  {/if}
                 </div>
               {/if}
             </div>
           {/each}
-        </div>
-      {/if}
-
-      <!-- Blocked / pending decisions -->
-      {#if (proj.blocked_tasks?.length ?? 0) > 0 || (proj.pending_decisions?.length ?? 0) > 0}
-        <div class="tg-attention-section">
-          {#if (proj.blocked_tasks?.length ?? 0) > 0}
-            <div class="tg-attention-item tg-attention--blocked">
-              <Icon name="alert-circle" size={12} />
-              <span>{proj.blocked_tasks.length} blocked task{proj.blocked_tasks.length > 1 ? 's' : ''}</span>
-            </div>
-          {/if}
-          {#if (proj.pending_decisions?.length ?? 0) > 0}
-            {#each proj.pending_decisions as decisionId (decisionId)}
-              {@const isDecLoading = decisionLoading.has(decisionId)}
-              <div class="tg-attention-item tg-attention--decision">
-                <Icon name="alert-circle" size={12} />
-                <span class="tg-decision-id">Decision: {decisionId.slice(0, 8)}...</span>
-                <div class="tg-decision-actions">
-                  <button
-                    class="tg-decision-btn tg-decision-btn--approve"
-                    title="Approve decision"
-                    disabled={isDecLoading}
-                    onclick={() => approveDecision(decisionId)}
-                  >
-                    {#if isDecLoading}
-                      <Icon name="loader" size={12} class="spinning" />
-                    {:else}
-                      <Icon name="check" size={12} />
-                    {/if}
-                    Approve
-                  </button>
-                  <button
-                    class="tg-decision-btn tg-decision-btn--reject"
-                    title="Reject decision"
-                    disabled={isDecLoading}
-                    onclick={() => rejectDecision(decisionId)}
-                  >
-                    <Icon name="x-circle" size={12} />
-                    Reject
-                  </button>
-                </div>
-              </div>
-            {/each}
-          {/if}
         </div>
       {/if}
 
@@ -942,113 +981,110 @@
     to { transform: rotate(360deg); }
   }
 
-  /* ========== Runner Controls Bar ========== */
-  .runner-bar {
+  /* ========== 任务概览 ========== */
+  .task-overview-card {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
+    flex-direction: column;
     gap: var(--space-3);
-    padding: var(--space-2) var(--space-3);
+    padding: var(--space-4);
+    border: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
+    border-radius: var(--radius-lg);
     background: var(--surface-1);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-sm);
   }
 
-  .runner-bar-left {
+  .task-overview-top {
     display: flex;
-    align-items: center;
-    gap: var(--space-2);
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-3);
+  }
+
+  .task-overview-main {
     min-width: 0;
   }
 
-  .runner-bar-right {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    flex-shrink: 0;
+  .task-overview-kicker {
+    display: block;
+    margin-bottom: var(--space-1);
+    font-size: var(--text-2xs);
+    font-weight: var(--font-medium);
+    color: var(--foreground-muted);
+    letter-spacing: 0.08em;
   }
 
-  .runner-label {
+  .task-overview-title {
+    margin: 0;
+    font-size: var(--text-md);
+    font-weight: var(--font-semibold);
+    line-height: var(--leading-tight);
+    color: var(--foreground);
+  }
+
+  .task-overview-goal {
+    margin: var(--space-2) 0 0;
     font-size: var(--text-xs);
+    line-height: var(--leading-normal);
+    color: var(--foreground-muted);
+  }
+
+  .task-metrics {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+  }
+
+  .task-focus-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding: var(--space-3);
+    border: 1px solid color-mix(in srgb, var(--primary) 18%, var(--border));
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--primary) 5%, transparent);
+  }
+
+  .task-focus-label {
+    font-size: var(--text-2xs);
     font-weight: var(--font-medium);
     color: var(--foreground-muted);
   }
 
-  .runner-status {
-    font-size: var(--text-2xs);
-    border-radius: 999px;
-    padding: 2px 8px;
-    border: 1px solid transparent;
-    white-space: nowrap;
-  }
-
-  .runner-status--running {
-    color: var(--primary);
-    background: var(--primary-muted);
-    border-color: color-mix(in srgb, var(--primary) 30%, var(--border));
-  }
-
-  .runner-status--stopped {
-    color: var(--foreground-muted);
-    background: var(--surface-2);
-    border-color: var(--border);
-  }
-
-  .runner-status--completed {
-    color: var(--success);
-    background: var(--success-muted);
-    border-color: color-mix(in srgb, var(--success) 32%, var(--border));
-  }
-
-  .runner-status--error,
-  .runner-status--failed {
-    color: var(--error);
-    background: var(--error-muted);
-    border-color: color-mix(in srgb, var(--error) 32%, var(--border));
-  }
-
-  .runner-status--unknown {
-    color: var(--foreground-muted);
-    background: var(--surface-2);
-    border-color: var(--border);
-  }
-
-  .runner-cycles {
-    font-size: var(--text-2xs);
-    color: var(--foreground-muted);
-    font-variant-numeric: tabular-nums;
-  }
-
-  .runner-error-text {
-    font-size: var(--text-2xs);
-    color: var(--error);
-  }
-
-  /* ========== Task Graph Overview ========== */
-  .tg-overview-bar {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    padding: var(--space-3) var(--space-4);
-    background: var(--surface-1);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-  }
-
-  .tg-overview-header {
+  .task-focus-main {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: var(--space-2);
   }
 
-  .tg-overview-title {
-    font-size: var(--text-sm);
-    font-weight: var(--font-medium);
-    color: var(--foreground);
+  .task-focus-title {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    font-size: var(--text-sm);
+    font-weight: var(--font-medium);
+    color: var(--foreground);
+  }
+
+  .task-focus-status,
+  .task-focus-meta,
+  .task-section-meta {
+    font-size: var(--text-2xs);
+    color: var(--foreground-muted);
+  }
+
+  .task-section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    padding: 0 var(--space-1);
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium);
+    color: var(--foreground-muted);
   }
 
   .tg-status-badge {
@@ -1099,7 +1135,7 @@
     border-color: var(--border);
   }
 
-  .tg-status--awaiting {
+  .tg-status--awaiting-approval {
     color: var(--warning);
     background: var(--warning-muted);
     border-color: color-mix(in srgb, var(--warning) 30%, var(--border));
@@ -1115,12 +1151,6 @@
     color: var(--warning);
     background: var(--warning-muted);
     border-color: color-mix(in srgb, var(--warning) 30%, var(--border));
-  }
-
-  .tg-phase-label {
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    font-style: italic;
   }
 
   .tg-progress-wrap {
@@ -1151,13 +1181,6 @@
     transition: width 200ms ease;
   }
 
-  .tg-progress-stats {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-    font-size: var(--text-xs);
-  }
-
   .tg-stat {
     display: inline-flex;
     align-items: center;
@@ -1174,63 +1197,79 @@
     padding: var(--space-1) 0;
   }
 
-  /* ========== Work Package List ========== */
-  .tg-wp-list {
+  /* ========== 任务树 ========== */
+  .tg-tree {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
+    gap: 2px;
   }
 
-  .tg-wp-card {
-    border: none;
+  .tg-tree-row {
+    display: grid;
+    grid-template-columns: 18px auto 18px minmax(0, 1fr) auto;
+    align-items: start;
+    gap: var(--space-2);
+    min-height: 36px;
+    padding: var(--space-2) var(--space-3);
+    padding-left: calc(var(--space-3) + var(--task-indent, 0px));
+    border: 1px solid transparent;
     border-radius: var(--radius-md);
     background: transparent;
-    overflow: hidden;
-    transition: background var(--transition-fast);
+    transition:
+      background var(--transition-fast),
+      border-color var(--transition-fast);
   }
 
-  .tg-wp-card:hover {
+  .tg-tree-row:hover {
     background: var(--surface-1);
   }
 
-  .tg-wp--running {
-    border-color: color-mix(in srgb, var(--primary) 40%, var(--border));
+  .tg-tree-row--running {
+    background: color-mix(in srgb, var(--primary) 6%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 22%, transparent);
   }
 
-  .tg-wp--completed {
-    opacity: 0.6;
+  .tg-tree-row--completed {
+    opacity: 0.72;
   }
 
-  .tg-wp--failed {
-    border-color: color-mix(in srgb, var(--error) 30%, var(--border));
+  .tg-tree-row--failed {
+    border-color: color-mix(in srgb, var(--error) 30%, transparent);
   }
 
-  .tg-wp-header {
-    display: flex;
+  .tg-tree-row--focus {
+    background: color-mix(in srgb, var(--primary) 7%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 28%, transparent);
+  }
+
+  .tg-tree-toggle {
+    display: inline-flex;
     align-items: center;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-sm);
+    color: var(--foreground-muted);
+    background: transparent;
     cursor: pointer;
-    user-select: none;
+    transition:
+      background var(--transition-fast),
+      transform var(--transition-fast);
   }
 
-  .tg-wp-header:hover {
+  .tg-tree-toggle:hover {
     background: var(--surface-hover);
   }
 
-  .tg-wp-chevron {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 16px;
-    height: 16px;
-    flex-shrink: 0;
-    color: var(--foreground-muted);
-    transition: transform var(--transition-fast);
+  .tg-tree-toggle.expanded {
+    transform: rotate(90deg);
   }
 
-  .tg-wp-chevron.expanded {
-    transform: rotate(90deg);
+  .tg-tree-toggle--empty {
+    cursor: default;
+    pointer-events: none;
   }
 
   .tg-kind-badge {
@@ -1245,7 +1284,7 @@
     letter-spacing: 0.03em;
   }
 
-  .tg-wp-status-icon {
+  .tg-tree-status-icon {
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1262,14 +1301,19 @@
   .tg-status-icon--skipped { color: var(--foreground-muted); }
   .tg-status-icon--draft,
   .tg-status-icon--ready { color: var(--foreground-muted); }
-  .tg-status-icon--awaiting { color: var(--warning); }
+  .tg-status-icon--awaiting-approval { color: var(--warning); }
   .tg-status-icon--verifying { color: var(--primary); }
   .tg-status-icon--repairing { color: var(--warning); }
   .tg-status-icon--unknown { color: var(--foreground-muted); }
 
-  .tg-wp-title {
-    flex: 1;
+  .tg-tree-content {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
     min-width: 0;
+  }
+
+  .tg-tree-title {
     font-size: var(--text-sm);
     font-weight: var(--font-medium);
     color: var(--foreground);
@@ -1278,7 +1322,29 @@
     text-overflow: ellipsis;
   }
 
-  .tg-wp-count {
+  .tg-tree-goal {
+    font-size: var(--text-2xs);
+    color: var(--foreground-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .tg-tree-side {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-1);
+    min-width: 0;
+  }
+
+  .tg-tree-state {
+    font-size: var(--text-2xs);
+    color: var(--foreground-muted);
+    white-space: nowrap;
+  }
+
+  .tg-tree-count {
     font-size: var(--text-2xs);
     color: var(--foreground-muted);
     padding: 1px 5px;
@@ -1286,28 +1352,6 @@
     border-radius: var(--radius-full);
     flex-shrink: 0;
     font-variant-numeric: tabular-nums;
-  }
-
-  .tg-lease-badge {
-    font-size: var(--text-2xs);
-    color: var(--primary);
-    background: var(--primary-muted);
-    border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border));
-    border-radius: 999px;
-    padding: 1px 6px;
-    flex-shrink: 0;
-    white-space: nowrap;
-  }
-
-  .tg-wp-progress-bar {
-    height: 2px;
-    background: var(--surface-2);
-  }
-
-  .tg-wp-progress-fill {
-    height: 100%;
-    background: var(--primary);
-    transition: width 200ms ease;
   }
 
   /* ========== Attention Section (blocked / decisions) ========== */
@@ -1327,6 +1371,27 @@
     font-size: var(--text-xs);
   }
 
+  .tg-attention-copy {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .tg-attention-title {
+    overflow: hidden;
+    color: var(--foreground);
+    font-weight: var(--font-medium);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .tg-attention-meta {
+    color: var(--foreground-muted);
+    font-size: var(--text-2xs);
+  }
+
   .tg-attention--blocked {
     color: var(--warning);
     background: var(--warning-muted);
@@ -1337,13 +1402,6 @@
     color: var(--primary);
     background: var(--primary-muted);
     border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border));
-  }
-
-  .tg-decision-id {
-    flex: 1;
-    min-width: 0;
-    font-family: var(--font-mono, monospace);
-    font-size: var(--text-2xs);
   }
 
   .tg-decision-actions {
@@ -1366,29 +1424,37 @@
     transition: background var(--transition-fast), border-color var(--transition-fast);
   }
 
+  .tg-decision-btn {
+    color: var(--text-secondary);
+    background: var(--surface-1);
+    border-color: var(--border);
+  }
+
+  .tg-decision-btn:hover:not(:disabled) {
+    color: var(--primary);
+    border-color: color-mix(in srgb, var(--primary) 30%, var(--border));
+    background: color-mix(in srgb, var(--primary) 8%, var(--surface-1));
+  }
+
   .tg-decision-btn:disabled {
     opacity: 0.5;
     cursor: not-allowed;
   }
 
-  .tg-decision-btn--approve {
+  .tg-decision-btn--recommended {
     color: var(--success);
     background: var(--success-muted);
     border-color: color-mix(in srgb, var(--success) 32%, var(--border));
   }
 
-  .tg-decision-btn--approve:hover:not(:disabled) {
+  .tg-decision-btn--recommended:hover:not(:disabled) {
     background: color-mix(in srgb, var(--success) 20%, var(--surface-1));
   }
 
-  .tg-decision-btn--reject {
-    color: var(--error);
-    background: var(--error-muted);
-    border-color: color-mix(in srgb, var(--error) 32%, var(--border));
-  }
-
-  .tg-decision-btn--reject:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--error) 20%, var(--surface-1));
+  .tg-decision-empty {
+    font-size: var(--text-2xs);
+    color: var(--text-tertiary);
+    white-space: nowrap;
   }
 
   .tg-error {
