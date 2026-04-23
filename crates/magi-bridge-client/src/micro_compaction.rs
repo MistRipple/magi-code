@@ -35,10 +35,25 @@ pub enum LlmContent {
 
 #[derive(Clone, Debug)]
 pub enum ContentBlock {
-    Text { text: String },
-    Image { media_type: String, data: String },
-    ToolUse { id: String, name: String, input: serde_json::Value },
-    ToolResult { tool_use_id: String, content: String, is_error: bool, tool_name: Option<String>, status: Option<String> },
+    Text {
+        text: String,
+    },
+    Image {
+        media_type: String,
+        data: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+        tool_name: Option<String>,
+        status: Option<String>,
+    },
 }
 
 pub fn estimate_token_count(text: &str) -> u64 {
@@ -85,29 +100,22 @@ pub fn compact_old_tool_results(
                     ..
                 } = block
                 {
-                    if mode != MicroCompactionMode::Clear
-                        && content.len() <= min_content_length
-                    {
+                    if mode != MicroCompactionMode::Clear && content.len() <= min_content_length {
                         continue;
                     }
 
                     let tokens_before = estimate_token_count(content);
                     stats.tokens_before += tokens_before;
 
-                    let resolved_tool_name =
-                        tool_name.as_deref().unwrap_or("unknown");
+                    let resolved_tool_name = tool_name.as_deref().unwrap_or("unknown");
                     let resolved_status = if *is_error {
                         "error"
                     } else {
                         status.as_deref().unwrap_or("success")
                     };
 
-                    let compacted = build_compact_summary(
-                        resolved_tool_name,
-                        resolved_status,
-                        content,
-                        mode,
-                    );
+                    let compacted =
+                        build_compact_summary(resolved_tool_name, resolved_status, content, mode);
                     *content = compacted;
                     stats.compacted_count += 1;
 

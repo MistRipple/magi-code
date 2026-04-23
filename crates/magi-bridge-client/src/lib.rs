@@ -1,10 +1,11 @@
-pub mod auto_compaction;
 pub mod assignment_dispatch;
+pub mod auto_compaction;
 pub mod base_adapter;
 mod clients;
 pub mod conversation_compaction;
 pub mod decision_engine;
 mod dispatch;
+pub mod execution_outcome;
 pub mod final_text_policy;
 mod host_loopback;
 mod http_model_client;
@@ -13,7 +14,6 @@ mod local_process_protocol;
 mod mcp_client;
 mod mcp_loopback;
 pub mod micro_compaction;
-pub mod execution_outcome;
 mod model_loopback;
 pub mod orchestrator_adapter;
 pub mod orchestrator_termination;
@@ -36,15 +36,14 @@ pub use clients::{
 pub use dispatch::BridgeDispatchRuntime;
 pub use host_loopback::{run_host_bridge_loopback_server, run_vscode_host_shell_server};
 pub use http_model_client::HttpModelBridgeClient;
-pub use mcp_client::{McpServerConfig, McpToolInfo, StdioMcpBridgeClient};
 pub use local_process_protocol::{
     BridgeServerCommandCapabilityProfile, BridgeServerContextResolutionBoundary,
     BridgeServerHandshake, BridgeServerHealth, BridgeServerKind, BridgeServerServiceCatalog,
     BridgeServerServiceDescriptor, BridgeServerSessionDescriptor, BridgeServerShellManifest,
-    BridgeServerShellProfile, BridgeServerWorkspaceContext,
-    LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD, LOCAL_BRIDGE_HANDSHAKE_METHOD,
-    LOCAL_BRIDGE_HEALTH_METHOD, LOCAL_BRIDGE_PROTOCOL_VERSION,
+    BridgeServerShellProfile, BridgeServerWorkspaceContext, LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD,
+    LOCAL_BRIDGE_HANDSHAKE_METHOD, LOCAL_BRIDGE_HEALTH_METHOD, LOCAL_BRIDGE_PROTOCOL_VERSION,
 };
+pub use mcp_client::{McpServerConfig, McpToolInfo, StdioMcpBridgeClient};
 pub use mcp_loopback::{run_mcp_bridge_loopback_server, run_mcp_manager_server};
 pub use model_loopback::run_model_bridge_loopback_server;
 pub use transport::{JsonRpcStdioTransport, JsonRpcStdioTransportConfig};
@@ -59,6 +58,6 @@ pub use types::{
     McpManagerServerHealthUpdateRequest, McpManagerServerLifecycleState,
     McpManagerServerOperationResponse, McpManagerServerRegistrationRequest,
     McpManagerServerSelectionRequest, McpToolCallRequest, ModelBridgeClient,
-    ModelInvocationRequest, SHADOW_MCP_SERVER_NAME, SHADOW_MCP_TOOL_NAME,
+    ModelInvocationRequest, ModelStreamEvent, SHADOW_MCP_SERVER_NAME, SHADOW_MCP_TOOL_NAME,
     SHADOW_MODEL_PROVIDER,
 };

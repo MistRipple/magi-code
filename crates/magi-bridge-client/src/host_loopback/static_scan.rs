@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 struct DiagnosticPattern {
     pattern: &'static str,
@@ -262,12 +262,18 @@ fn example() {
             .iter()
             .map(|d| d["category"].as_str().expect("category should be a string"))
             .collect();
-        assert!(categories.contains(&"marker"), "should detect marker category");
+        assert!(
+            categories.contains(&"marker"),
+            "should detect marker category"
+        );
         assert!(
             categories.contains(&"error_handling"),
             "should detect error_handling category"
         );
-        assert!(categories.contains(&"safety"), "should detect safety category");
+        assert!(
+            categories.contains(&"safety"),
+            "should detect safety category"
+        );
         assert!(
             categories.contains(&"completeness"),
             "should detect completeness category"
@@ -280,13 +286,23 @@ fn example() {
 
         let fixme = diagnostics
             .iter()
-            .find(|d| d["message"].as_str().expect("message should be a string").contains("FIXME"))
+            .find(|d| {
+                d["message"]
+                    .as_str()
+                    .expect("message should be a string")
+                    .contains("FIXME")
+            })
             .expect("should find FIXME");
         assert_eq!(fixme["severity"], "warning");
 
         let panic = diagnostics
             .iter()
-            .find(|d| d["message"].as_str().expect("message should be a string").contains("panic!()"))
+            .find(|d| {
+                d["message"]
+                    .as_str()
+                    .expect("message should be a string")
+                    .contains("panic!()")
+            })
             .expect("should find panic");
         assert_eq!(panic["severity"], "error");
 
@@ -298,7 +314,12 @@ fn example() {
 
         let unsafe_diag = diagnostics
             .iter()
-            .find(|d| d["message"].as_str().expect("message should be a string").contains("unsafe"))
+            .find(|d| {
+                d["message"]
+                    .as_str()
+                    .expect("message should be a string")
+                    .contains("unsafe")
+            })
             .expect("should find unsafe");
         assert_eq!(unsafe_diag["severity"], "warning");
 
@@ -315,12 +336,22 @@ fn example() {
         assert_eq!(diagnostics.len(), 2);
         let unwrap_diag = diagnostics
             .iter()
-            .find(|d| d["message"].as_str().expect("message should be a string").contains("unwrap"))
+            .find(|d| {
+                d["message"]
+                    .as_str()
+                    .expect("message should be a string")
+                    .contains("unwrap")
+            })
             .expect("should find unwrap");
         assert_eq!(unwrap_diag["line"], 2);
         let fixme_diag = diagnostics
             .iter()
-            .find(|d| d["message"].as_str().expect("message should be a string").contains("FIXME"))
+            .find(|d| {
+                d["message"]
+                    .as_str()
+                    .expect("message should be a string")
+                    .contains("FIXME")
+            })
             .expect("should find FIXME");
         assert_eq!(fixme_diag["line"], 4);
     }
@@ -329,7 +360,10 @@ fn example() {
     fn diagnostics_empty_for_clean_content() {
         let content = "fn clean() -> Result<(), Error> {\n    Ok(())\n}\n";
         let diagnostics = collect_prehost_diagnostics(content);
-        assert!(diagnostics.is_empty(), "clean code should produce no diagnostics");
+        assert!(
+            diagnostics.is_empty(),
+            "clean code should produce no diagnostics"
+        );
     }
 
     #[test]
@@ -385,7 +419,10 @@ impl MyStruct {
         assert!(kinds.contains(&"constant"), "should detect constant");
         assert!(kinds.contains(&"static"), "should detect static");
         assert!(kinds.contains(&"type_alias"), "should detect type_alias");
-        assert!(kinds.contains(&"use_reexport"), "should detect use_reexport");
+        assert!(
+            kinds.contains(&"use_reexport"),
+            "should detect use_reexport"
+        );
         assert!(kinds.contains(&"macro"), "should detect macro");
         assert!(kinds.contains(&"impl"), "should detect impl");
 
@@ -454,6 +491,9 @@ impl MyStruct {
     fn symbols_empty_for_no_definitions() {
         let content = "// just a comment\nlet x = 42;\n";
         let symbols = collect_prehost_symbols(content);
-        assert!(symbols.is_empty(), "content without definitions should produce no symbols");
+        assert!(
+            symbols.is_empty(),
+            "content without definitions should produce no symbols"
+        );
     }
 }

@@ -6,7 +6,7 @@ use crate::{
     JsonRpcMcpBridgeClient, JsonRpcModelBridgeClient, JsonRpcStdioTransport, McpBridgeClient,
     McpToolCallRequest, ModelBridgeClient, ModelInvocationRequest,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
 struct DummyHostClient;
@@ -160,7 +160,10 @@ fn stdio_transport_reports_protocol_and_remote_business_errors() {
         })
         .expect_err("invalid payload should be protocol error");
 
-    assert!(matches!(protocol_error, BridgeTransportError::Protocol { .. }));
+    assert!(matches!(
+        protocol_error,
+        BridgeTransportError::Protocol { .. }
+    ));
 
     let remote_transport = JsonRpcStdioTransport::new("sh").with_args(vec![
         "-c".to_string(),
@@ -591,7 +594,9 @@ fn pending_terminal_synthesis_retries_on_empty_text() {
     let decision = decide_pending_terminal_synthesis_action("", false, false, 0, 3);
     assert!(matches!(
         decision,
-        PendingTerminalSynthesisDecision::Retry { next_retry_count: 1 }
+        PendingTerminalSynthesisDecision::Retry {
+            next_retry_count: 1
+        }
     ));
 }
 
@@ -619,16 +624,34 @@ fn tool_concurrency_read_only_safe() {
 
 #[test]
 fn tool_concurrency_partition_mixed() {
-    let tools = ["file_view", "file_view", "file_edit", "code_search_regex", "shell"];
+    let tools = [
+        "file_view",
+        "file_view",
+        "file_edit",
+        "code_search_regex",
+        "shell",
+    ];
     let batches = crate::tool_concurrency::partition_tool_calls(&tools);
     assert_eq!(batches.len(), 4);
-    assert!(matches!(batches[0].kind, crate::tool_concurrency::ToolBatchKind::Concurrent));
+    assert!(matches!(
+        batches[0].kind,
+        crate::tool_concurrency::ToolBatchKind::Concurrent
+    ));
     assert_eq!(batches[0].tool_indices, vec![0, 1]);
-    assert!(matches!(batches[1].kind, crate::tool_concurrency::ToolBatchKind::Serial));
+    assert!(matches!(
+        batches[1].kind,
+        crate::tool_concurrency::ToolBatchKind::Serial
+    ));
     assert_eq!(batches[1].tool_indices, vec![2]);
-    assert!(matches!(batches[2].kind, crate::tool_concurrency::ToolBatchKind::Concurrent));
+    assert!(matches!(
+        batches[2].kind,
+        crate::tool_concurrency::ToolBatchKind::Concurrent
+    ));
     assert_eq!(batches[2].tool_indices, vec![3]);
-    assert!(matches!(batches[3].kind, crate::tool_concurrency::ToolBatchKind::Serial));
+    assert!(matches!(
+        batches[3].kind,
+        crate::tool_concurrency::ToolBatchKind::Serial
+    ));
     assert_eq!(batches[3].tool_indices, vec![4]);
 }
 

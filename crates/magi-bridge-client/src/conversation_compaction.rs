@@ -121,10 +121,7 @@ impl ConversationCompactor {
         let mut result_messages = pinned;
         result_messages.push(LlmMessage {
             role: "assistant".to_string(),
-            content: LlmMessageContent::Text(format!(
-                "[对话历史压缩摘要]\n{}",
-                compacted_text
-            )),
+            content: LlmMessageContent::Text(format!("[对话历史压缩摘要]\n{}", compacted_text)),
         });
         result_messages.extend(protected);
 
@@ -152,9 +149,7 @@ impl ConversationCompactor {
         let mut result = pinned;
         result.push(LlmMessage {
             role: "assistant".to_string(),
-            content: LlmMessageContent::Text(
-                "[对话历史已截断以适应上下文窗口限制]".to_string(),
-            ),
+            content: LlmMessageContent::Text("[对话历史已截断以适应上下文窗口限制]".to_string()),
         });
         result.extend(protected);
 
@@ -203,12 +198,8 @@ impl ConversationCompactor {
                     .iter()
                     .filter_map(|b| match b {
                         LlmContentBlock::Text { text } => Some(text.as_str()),
-                        LlmContentBlock::ToolUse { name, .. } => {
-                            Some(name.as_str())
-                        }
-                        LlmContentBlock::ToolResult { content, .. } => {
-                            Some(content.as_str())
-                        }
+                        LlmContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+                        LlmContentBlock::ToolResult { content, .. } => Some(content.as_str()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()

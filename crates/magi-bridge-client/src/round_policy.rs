@@ -106,18 +106,10 @@ pub fn build_summary_hijack_correction(rounds: u32) -> SummaryHijackCorrection {
 
 #[derive(Clone, Debug)]
 pub enum NoTaskPlainResponseDecision {
-    TerminateCompleted {
-        next_missing_outcome_streak: u32,
-    },
-    TerminateFailed {
-        next_missing_outcome_streak: u32,
-    },
-    RequestOutcomeBlock {
-        next_missing_outcome_streak: u32,
-    },
-    ContinueWithPrompt {
-        next_missing_outcome_streak: u32,
-    },
+    TerminateCompleted { next_missing_outcome_streak: u32 },
+    TerminateFailed { next_missing_outcome_streak: u32 },
+    RequestOutcomeBlock { next_missing_outcome_streak: u32 },
+    ContinueWithPrompt { next_missing_outcome_streak: u32 },
 }
 
 #[derive(Clone, Debug)]

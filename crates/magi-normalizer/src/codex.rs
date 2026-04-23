@@ -1,5 +1,5 @@
 use crate::base::{
-    flush_pending_thinking_to_blocks, BaseNormalizer, CallerContext, NormalizerConfig,
+    BaseNormalizer, CallerContext, NormalizerConfig, flush_pending_thinking_to_blocks,
 };
 use crate::types::*;
 
@@ -42,8 +42,7 @@ impl CodexNormalizer {
             match serde_json::from_str::<serde_json::Value>(trimmed) {
                 Ok(event) => {
                     if !plain_text.is_empty() {
-                        self.normalizer
-                            .process_text_delta(message_id, &plain_text);
+                        self.normalizer.process_text_delta(message_id, &plain_text);
                         plain_text.clear();
                     }
                     self.process_json_event(message_id, &event);
@@ -58,8 +57,7 @@ impl CodexNormalizer {
             if let Some(ctx) = self.normalizer.get_context_mut(message_id) {
                 flush_pending_thinking_to_blocks(ctx);
             }
-            self.normalizer
-                .process_text_delta(message_id, &plain_text);
+            self.normalizer.process_text_delta(message_id, &plain_text);
         }
     }
 
@@ -81,8 +79,7 @@ impl CodexNormalizer {
                 if let Some(ctx) = self.normalizer.get_context_mut(message_id) {
                     flush_pending_thinking_to_blocks(ctx);
                 }
-                self.normalizer
-                    .process_text_delta(message_id, &item_text);
+                self.normalizer.process_text_delta(message_id, &item_text);
             }
         }
 

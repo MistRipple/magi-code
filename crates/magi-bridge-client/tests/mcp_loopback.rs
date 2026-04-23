@@ -6,7 +6,7 @@ use magi_bridge_client::{
     McpManagerServerSelectionRequest, McpToolCallRequest, SHADOW_MCP_SERVER_NAME,
     SHADOW_MCP_TOOL_NAME,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 fn loopback_transport() -> JsonRpcStdioTransport {
@@ -95,10 +95,26 @@ fn mcp_loopback_exposes_shared_handshake_and_health() {
 
     let handshake = probe.handshake().expect("mcp handshake should succeed");
     assert_eq!(handshake.server_kind, BridgeServerKind::Mcp);
-    assert!(handshake.supported_methods.contains(&"mcp.call_tool".to_string()));
-    assert!(handshake.supported_methods.contains(&"mcp.list_servers".to_string()));
-    assert!(handshake.supported_methods.contains(&"mcp.enable_server".to_string()));
-    assert!(handshake.supported_methods.contains(&"mcp.update_health".to_string()));
+    assert!(
+        handshake
+            .supported_methods
+            .contains(&"mcp.call_tool".to_string())
+    );
+    assert!(
+        handshake
+            .supported_methods
+            .contains(&"mcp.list_servers".to_string())
+    );
+    assert!(
+        handshake
+            .supported_methods
+            .contains(&"mcp.enable_server".to_string())
+    );
+    assert!(
+        handshake
+            .supported_methods
+            .contains(&"mcp.update_health".to_string())
+    );
 
     let health = probe.health().expect("mcp health should succeed");
     assert_eq!(health.server_kind, BridgeServerKind::Mcp);
@@ -199,51 +215,81 @@ fn mcp_loopback_exposes_shared_handshake_and_health() {
             "selection-key:observability-default".to_string(),
         ]
     );
-    assert!(catalog.services[0]
-        .supported_operations
-        .contains(&"enable_server".to_string()));
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"implementation_source:shadow-manager-prehost".to_string()));
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"registry:shadow".to_string()));
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"manager_version:1.0.0-shadow".to_string()));
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"registry_profile:shadow-mcp-registry-v1".to_string()));
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"registry_manifest:shadow-mcp-manager@1.0.0-shadow".to_string()));
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"selection_strategy:explicit-or-selection-key".to_string()));
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"registry_config_status:clean".to_string()));
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"config_issue_count:0".to_string()));
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"default_server:shadow-mcp".to_string()));
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"default_server_health:healthy".to_string()));
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"default_server_selection_key:inspection-default".to_string()));
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"service_health:healthy".to_string()));
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"default_route_status:ready".to_string()));
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"selection_target_count:4".to_string()));
+    assert!(
+        catalog.services[0]
+            .supported_operations
+            .contains(&"enable_server".to_string())
+    );
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"implementation_source:shadow-manager-prehost".to_string())
+    );
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"registry:shadow".to_string())
+    );
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"manager_version:1.0.0-shadow".to_string())
+    );
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"registry_profile:shadow-mcp-registry-v1".to_string())
+    );
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"registry_manifest:shadow-mcp-manager@1.0.0-shadow".to_string())
+    );
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"selection_strategy:explicit-or-selection-key".to_string())
+    );
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"registry_config_status:clean".to_string())
+    );
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"config_issue_count:0".to_string())
+    );
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"default_server:shadow-mcp".to_string())
+    );
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"default_server_health:healthy".to_string())
+    );
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"default_server_selection_key:inspection-default".to_string())
+    );
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"service_health:healthy".to_string())
+    );
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"default_route_status:ready".to_string())
+    );
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"selection_target_count:4".to_string())
+    );
     assert_eq!(catalog.services[1].service_name, SHADOW_MCP_SERVER_NAME);
     assert_eq!(
         catalog.services[1]
@@ -273,30 +319,46 @@ fn mcp_loopback_exposes_shared_handshake_and_health() {
             .expect("server manifest should exist"),
         "shadow-mcp@1.2.0-shadow"
     );
-    assert!(catalog.services[1]
-        .capabilities
-        .contains(&"server_enabled:true".to_string()));
-    assert!(catalog.services[1]
-        .capabilities
-        .contains(&"implementation_source:shadow-server-prehost".to_string()));
-    assert!(catalog.services[1]
-        .capabilities
-        .contains(&"server_version:1.2.0-shadow".to_string()));
-    assert!(catalog.services[1]
-        .capabilities
-        .contains(&"server_manifest:shadow-mcp@1.2.0-shadow".to_string()));
-    assert!(catalog.services[1]
-        .capabilities
-        .contains(&"capability_profile:inspection-core-v1".to_string()));
-    assert!(catalog.services[1]
-        .capabilities
-        .contains(&"selection_key:inspection-default".to_string()));
-    assert!(catalog.services[1]
-        .capabilities
-        .contains(&format!("tool:{SHADOW_MCP_TOOL_NAME}")));
-    assert!(catalog.services[1]
-        .capabilities
-        .contains(&"tool:echo.describe".to_string()));
+    assert!(
+        catalog.services[1]
+            .capabilities
+            .contains(&"server_enabled:true".to_string())
+    );
+    assert!(
+        catalog.services[1]
+            .capabilities
+            .contains(&"implementation_source:shadow-server-prehost".to_string())
+    );
+    assert!(
+        catalog.services[1]
+            .capabilities
+            .contains(&"server_version:1.2.0-shadow".to_string())
+    );
+    assert!(
+        catalog.services[1]
+            .capabilities
+            .contains(&"server_manifest:shadow-mcp@1.2.0-shadow".to_string())
+    );
+    assert!(
+        catalog.services[1]
+            .capabilities
+            .contains(&"capability_profile:inspection-core-v1".to_string())
+    );
+    assert!(
+        catalog.services[1]
+            .capabilities
+            .contains(&"selection_key:inspection-default".to_string())
+    );
+    assert!(
+        catalog.services[1]
+            .capabilities
+            .contains(&format!("tool:{SHADOW_MCP_TOOL_NAME}"))
+    );
+    assert!(
+        catalog.services[1]
+            .capabilities
+            .contains(&"tool:echo.describe".to_string())
+    );
     assert_eq!(catalog.services[2].service_name, "shadow-mcp-observability");
     assert_eq!(
         catalog.services[2]
@@ -319,25 +381,36 @@ fn mcp_loopback_exposes_shared_handshake_and_health() {
             .expect("observability selection key should exist"),
         "observability-default"
     );
-    assert!(catalog.services[2]
-        .capabilities
-        .contains(&"server_enabled:false".to_string()));
-    assert!(catalog.services[2]
-        .capabilities
-        .contains(&"implementation_source:shadow-server-prehost".to_string()));
-    assert!(catalog.services[2]
-        .supported_operations
-        .contains(&"describe_server".to_string()));
-    assert!(catalog.services[2]
-        .capabilities
-        .contains(&"selection_key:observability-default".to_string()));
+    assert!(
+        catalog.services[2]
+            .capabilities
+            .contains(&"server_enabled:false".to_string())
+    );
+    assert!(
+        catalog.services[2]
+            .capabilities
+            .contains(&"implementation_source:shadow-server-prehost".to_string())
+    );
+    assert!(
+        catalog.services[2]
+            .supported_operations
+            .contains(&"describe_server".to_string())
+    );
+    assert!(
+        catalog.services[2]
+            .capabilities
+            .contains(&"selection_key:observability-default".to_string())
+    );
 }
 
 #[test]
 fn mcp_catalog_reflects_env_configured_default_server_and_route_health() {
     let probe = JsonRpcBridgeServerProbeClient::new(Arc::new(loopback_transport_with_env(&[
         ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
-        ("MAGI_MCP_MANAGER_ENABLED_SERVERS", "shadow-mcp-observability"),
+        (
+            "MAGI_MCP_MANAGER_ENABLED_SERVERS",
+            "shadow-mcp-observability",
+        ),
         ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
         (
             "MAGI_MCP_MANAGER_SERVER_HEALTHS",
@@ -360,7 +433,10 @@ fn mcp_catalog_reflects_env_configured_default_server_and_route_health() {
         catalog.services[0].default_server_selection_key.as_deref(),
         Some("observability-default")
     );
-    assert_eq!(catalog.services[0].service_health.as_deref(), Some("healthy"));
+    assert_eq!(
+        catalog.services[0].service_health.as_deref(),
+        Some("healthy")
+    );
     assert_eq!(
         catalog.services[0].default_route_status.as_deref(),
         Some("ready")
@@ -375,7 +451,10 @@ fn mcp_catalog_reflects_env_configured_default_server_and_route_health() {
 fn blank_selection_uses_env_configured_default_server_when_available() {
     let client = JsonRpcMcpBridgeClient::new(Arc::new(loopback_transport_with_env(&[
         ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
-        ("MAGI_MCP_MANAGER_ENABLED_SERVERS", "shadow-mcp-observability"),
+        (
+            "MAGI_MCP_MANAGER_ENABLED_SERVERS",
+            "shadow-mcp-observability",
+        ),
         ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
         (
             "MAGI_MCP_MANAGER_SERVER_HEALTHS",
@@ -400,12 +479,10 @@ fn blank_selection_uses_env_configured_default_server_when_available() {
 
 #[test]
 fn mcp_catalog_reports_unavailable_when_all_servers_are_disabled() {
-    let probe = JsonRpcBridgeServerProbeClient::new(Arc::new(loopback_transport_with_env(&[
-        (
-            "MAGI_MCP_MANAGER_DISABLED_SERVERS",
-            "shadow-mcp,shadow-mcp-observability",
-        ),
-    ])));
+    let probe = JsonRpcBridgeServerProbeClient::new(Arc::new(loopback_transport_with_env(&[(
+        "MAGI_MCP_MANAGER_DISABLED_SERVERS",
+        "shadow-mcp,shadow-mcp-observability",
+    )])));
 
     let catalog = probe
         .describe_services()
@@ -413,7 +490,10 @@ fn mcp_catalog_reports_unavailable_when_all_servers_are_disabled() {
     assert_eq!(catalog.services[0].default_server, None);
     assert_eq!(catalog.services[0].default_server_health, None);
     assert_eq!(catalog.services[0].default_server_selection_key, None);
-    assert_eq!(catalog.services[0].service_health.as_deref(), Some("unavailable"));
+    assert_eq!(
+        catalog.services[0].service_health.as_deref(),
+        Some("unavailable")
+    );
     assert_eq!(
         catalog.services[0].default_route_status.as_deref(),
         Some("unavailable")
@@ -422,33 +502,43 @@ fn mcp_catalog_reports_unavailable_when_all_servers_are_disabled() {
         catalog.services[0].default_route_target.as_deref(),
         Some("<none>")
     );
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"default_server:<none>".to_string()));
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"default_server:<none>".to_string())
+    );
 }
 
 #[test]
 fn mcp_catalog_reports_degraded_when_default_server_config_is_invalid_but_fallback_exists() {
-    let probe = JsonRpcBridgeServerProbeClient::new(Arc::new(loopback_transport_with_env(&[
-        ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "missing-server"),
-    ])));
+    let probe = JsonRpcBridgeServerProbeClient::new(Arc::new(loopback_transport_with_env(&[(
+        "MAGI_MCP_MANAGER_DEFAULT_SERVER",
+        "missing-server",
+    )])));
 
     let catalog = probe
         .describe_services()
         .expect("mcp service catalog should succeed");
-    assert_eq!(catalog.services[0].service_health.as_deref(), Some("degraded"));
+    assert_eq!(
+        catalog.services[0].service_health.as_deref(),
+        Some("degraded")
+    );
     assert_eq!(
         catalog.services[0].service_health_reason.as_deref(),
         Some(
             "registry config issues: default server target missing-server does not match any registered server"
         )
     );
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"registry_config_status:misconfigured".to_string()));
-    assert!(catalog.services[0]
-        .capabilities
-        .contains(&"config_issue_count:1".to_string()));
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"registry_config_status:misconfigured".to_string())
+    );
+    assert!(
+        catalog.services[0]
+            .capabilities
+            .contains(&"config_issue_count:1".to_string())
+    );
     assert_eq!(
         catalog.services[0].default_route_status.as_deref(),
         Some("ready")
@@ -472,12 +562,17 @@ fn mcp_catalog_reports_unavailable_when_registry_config_is_invalid_and_no_fallba
     let catalog = probe
         .describe_services()
         .expect("mcp service catalog should succeed");
-    assert_eq!(catalog.services[0].service_health.as_deref(), Some("unavailable"));
-    assert!(catalog.services[0]
-        .service_health_reason
-        .as_deref()
-        .expect("service health reason should exist")
-        .contains("default server target missing-server does not match any registered server"));
+    assert_eq!(
+        catalog.services[0].service_health.as_deref(),
+        Some("unavailable")
+    );
+    assert!(
+        catalog.services[0]
+            .service_health_reason
+            .as_deref()
+            .expect("service health reason should exist")
+            .contains("default server target missing-server does not match any registered server")
+    );
     assert_eq!(
         catalog.services[0].default_route_status.as_deref(),
         Some("unavailable")
@@ -539,10 +634,12 @@ fn mcp_manager_enable_and_disable_servers_are_callable_over_json_rpc() {
     assert_eq!(enable.operation, "enable_server");
     assert_eq!(enable.server.service_name, "shadow-mcp-observability");
     assert_eq!(enable.server.service_health.as_deref(), Some("healthy"));
-    assert!(enable
-        .server
-        .capabilities
-        .contains(&"server_enabled:true".to_string()));
+    assert!(
+        enable
+            .server
+            .capabilities
+            .contains(&"server_enabled:true".to_string())
+    );
     assert_eq!(
         enable
             .lifecycle_event
@@ -560,10 +657,12 @@ fn mcp_manager_enable_and_disable_servers_are_callable_over_json_rpc() {
     assert_eq!(disable.operation, "disable_server");
     assert_eq!(disable.server.service_name, SHADOW_MCP_SERVER_NAME);
     assert_eq!(disable.server.service_health.as_deref(), Some("disabled"));
-    assert!(disable
-        .server
-        .capabilities
-        .contains(&"lifecycle_state:stopped".to_string()));
+    assert!(
+        disable
+            .server
+            .capabilities
+            .contains(&"lifecycle_state:stopped".to_string())
+    );
     assert_eq!(
         disable
             .lifecycle_event
@@ -602,8 +701,7 @@ fn mcp_manager_start_stop_update_health_and_register_are_callable_over_json_rpc(
     assert_eq!(stop.server.service_name, SHADOW_MCP_SERVER_NAME);
     assert_eq!(stop.server.service_health.as_deref(), Some("disabled"));
     assert_eq!(
-        stop
-            .lifecycle_event
+        stop.lifecycle_event
             .as_ref()
             .expect("stop lifecycle event should exist")
             .event_kind,
@@ -618,10 +716,12 @@ fn mcp_manager_start_stop_update_health_and_register_are_callable_over_json_rpc(
         .expect("update_health should succeed over json-rpc");
     assert_eq!(health.server.service_name, SHADOW_MCP_SERVER_NAME);
     assert_eq!(health.server.service_health.as_deref(), Some("unavailable"));
-    assert!(health
-        .server
-        .capabilities
-        .contains(&"lifecycle_state:failed".to_string()));
+    assert!(
+        health
+            .server
+            .capabilities
+            .contains(&"lifecycle_state:failed".to_string())
+    );
     assert_eq!(
         health
             .lifecycle_event
@@ -644,7 +744,10 @@ fn mcp_manager_start_stop_update_health_and_register_are_callable_over_json_rpc(
         })
         .expect("register_server should succeed over json-rpc");
     assert_eq!(register.server.service_name, "shadow-mcp-dynamic");
-    assert_eq!(register.server.selection_key.as_deref(), Some("dynamic-default"));
+    assert_eq!(
+        register.server.selection_key.as_deref(),
+        Some("dynamic-default")
+    );
     assert_eq!(
         register
             .lifecycle_event
@@ -722,7 +825,10 @@ fn unsupported_tool_returns_remote_business_error() {
 fn mcp_client_blank_selection_rejects_unavailable_enabled_server() {
     let transport = loopback_transport_with_env(&[
         ("MAGI_MCP_MANAGER_ENABLED_SERVERS", SHADOW_MCP_SERVER_NAME),
-        ("MAGI_MCP_MANAGER_DISABLED_SERVERS", "shadow-mcp-observability"),
+        (
+            "MAGI_MCP_MANAGER_DISABLED_SERVERS",
+            "shadow-mcp-observability",
+        ),
         ("MAGI_MCP_MANAGER_SERVER_HEALTHS", "shadow-mcp=unavailable"),
     ]);
     let error = transport
@@ -785,7 +891,10 @@ fn mcp_blank_selection_error_reports_no_default_server_instead_of_manager_name()
 fn mcp_client_explicit_call_rejects_unavailable_server_even_when_enabled() {
     let transport = loopback_transport_with_env(&[
         ("MAGI_MCP_MANAGER_ENABLED_SERVERS", SHADOW_MCP_SERVER_NAME),
-        ("MAGI_MCP_MANAGER_DISABLED_SERVERS", "shadow-mcp-observability"),
+        (
+            "MAGI_MCP_MANAGER_DISABLED_SERVERS",
+            "shadow-mcp-observability",
+        ),
         ("MAGI_MCP_MANAGER_SERVER_HEALTHS", "shadow-mcp=unavailable"),
     ]);
     let error = transport
@@ -810,10 +919,8 @@ fn mcp_client_explicit_call_rejects_unavailable_server_even_when_enabled() {
 
 #[test]
 fn broken_subprocess_returns_transport_error() {
-    let transport = JsonRpcStdioTransport::new("sh").with_args(vec![
-        "-c".to_string(),
-        "exit 2".to_string(),
-    ]);
+    let transport =
+        JsonRpcStdioTransport::new("sh").with_args(vec!["-c".to_string(), "exit 2".to_string()]);
 
     let error = transport
         .call(BridgeTransportRequest {

@@ -22,7 +22,11 @@ fn test_base_normalizer_stream_lifecycle() {
 
     let msg = n.end_stream(&mid, None).unwrap();
     assert_eq!(msg.lifecycle, MessageLifecycle::Completed);
-    assert!(msg.blocks.iter().any(|b| matches!(b, ContentBlock::Text(t) if t.content == "hello world")));
+    assert!(
+        msg.blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.content == "hello world"))
+    );
     assert!(!n.has_active_stream());
 }
 
@@ -39,8 +43,16 @@ fn test_thinking_blocks() {
     n.process_text_delta(&mid, "answer");
 
     let msg = n.end_stream(&mid, None).unwrap();
-    assert!(msg.blocks.iter().any(|b| matches!(b, ContentBlock::Thinking(_))));
-    assert!(msg.blocks.iter().any(|b| matches!(b, ContentBlock::Text(_))));
+    assert!(
+        msg.blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Thinking(_)))
+    );
+    assert!(
+        msg.blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(_)))
+    );
 }
 
 #[test]
@@ -109,68 +121,124 @@ fn test_interrupt_stream() {
 
 #[test]
 fn test_claude_normalizer_text_delta() {
-    let mut cn = create_claude_normalizer("claude", MessageSource::Worker, false, CallerContext::Worker);
+    let mut cn = create_claude_normalizer(
+        "claude",
+        MessageSource::Worker,
+        false,
+        CallerContext::Worker,
+    );
     let mid = cn.normalizer.start_stream("trace-1", None, None, None);
-    cn.parse_chunk(&mid, r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}"#);
+    cn.parse_chunk(
+        &mid,
+        r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}"#,
+    );
     cn.parse_chunk(&mid, "\n");
 
     let msg = cn.normalizer.end_stream(&mid, None).unwrap();
-    assert!(msg.blocks.iter().any(|b| matches!(b, ContentBlock::Text(t) if t.content.contains("hello"))));
+    assert!(
+        msg.blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.content.contains("hello")))
+    );
 }
 
 #[test]
 fn test_claude_normalizer_thinking() {
-    let mut cn = create_claude_normalizer("claude", MessageSource::Worker, false, CallerContext::Worker);
+    let mut cn = create_claude_normalizer(
+        "claude",
+        MessageSource::Worker,
+        false,
+        CallerContext::Worker,
+    );
     let mid = cn.normalizer.start_stream("trace-1", None, None, None);
     cn.parse_chunk(&mid, r#"{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"reasoning..."}}"#);
     cn.parse_chunk(&mid, "\n");
-    cn.parse_chunk(&mid, r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"answer"}}"#);
+    cn.parse_chunk(
+        &mid,
+        r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"answer"}}"#,
+    );
     cn.parse_chunk(&mid, "\n");
 
     let msg = cn.normalizer.end_stream(&mid, None).unwrap();
-    assert!(msg.blocks.iter().any(|b| matches!(b, ContentBlock::Thinking(t) if t.content.contains("reasoning"))));
-    assert!(msg.blocks.iter().any(|b| matches!(b, ContentBlock::Text(t) if t.content.contains("answer"))));
+    assert!(
+        msg.blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Thinking(t) if t.content.contains("reasoning")))
+    );
+    assert!(
+        msg.blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.content.contains("answer")))
+    );
 }
 
 #[test]
 fn test_codex_normalizer_json() {
-    let mut cn = create_codex_normalizer("codex", MessageSource::Worker, false, CallerContext::Worker);
+    let mut cn =
+        create_codex_normalizer("codex", MessageSource::Worker, false, CallerContext::Worker);
     let mid = cn.normalizer.start_stream("trace-1", None, None, None);
     cn.parse_chunk(&mid, r#"{"type":"message","text":"hello from codex"}"#);
     cn.parse_chunk(&mid, "\n");
 
     let msg = cn.normalizer.end_stream(&mid, None).unwrap();
-    assert!(msg.blocks.iter().any(|b| matches!(b, ContentBlock::Text(t) if t.content.contains("hello from codex"))));
+    assert!(
+        msg.blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.content.contains("hello from codex")))
+    );
 }
 
 #[test]
 fn test_codex_normalizer_plain_text() {
-    let mut cn = create_codex_normalizer("codex", MessageSource::Worker, false, CallerContext::Worker);
+    let mut cn =
+        create_codex_normalizer("codex", MessageSource::Worker, false, CallerContext::Worker);
     let mid = cn.normalizer.start_stream("trace-1", None, None, None);
     cn.parse_chunk(&mid, "just plain text\n");
 
     let msg = cn.normalizer.end_stream(&mid, None).unwrap();
-    assert!(msg.blocks.iter().any(|b| matches!(b, ContentBlock::Text(t) if t.content.contains("plain text"))));
+    assert!(
+        msg.blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.content.contains("plain text")))
+    );
 }
 
 #[test]
 fn test_gemini_normalizer_json() {
-    let mut gn = create_gemini_normalizer("gemini", MessageSource::Worker, false, CallerContext::Worker);
+    let mut gn = create_gemini_normalizer(
+        "gemini",
+        MessageSource::Worker,
+        false,
+        CallerContext::Worker,
+    );
     let mid = gn.normalizer.start_stream("trace-1", None, None, None);
     gn.parse_chunk(&mid, r#"{"type":"text","content":"gemini response"}"#);
 
     let msg = gn.normalizer.end_stream(&mid, None).unwrap();
-    assert!(msg.blocks.iter().any(|b| matches!(b, ContentBlock::Text(t) if t.content.contains("gemini response"))));
+    assert!(
+        msg.blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.content.contains("gemini response")))
+    );
 }
 
 #[test]
 fn test_gemini_normalizer_thinking() {
-    let mut gn = create_gemini_normalizer("gemini", MessageSource::Worker, false, CallerContext::Worker);
+    let mut gn = create_gemini_normalizer(
+        "gemini",
+        MessageSource::Worker,
+        false,
+        CallerContext::Worker,
+    );
     let mid = gn.normalizer.start_stream("trace-1", None, None, None);
     gn.parse_chunk(&mid, r#"{"type":"thinking","content":"deep thought"}"#);
 
     let msg = gn.normalizer.end_stream(&mid, None).unwrap();
-    assert!(msg.blocks.iter().any(|b| matches!(b, ContentBlock::Thinking(t) if t.content.contains("deep thought"))));
+    assert!(
+        msg.blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Thinking(t) if t.content.contains("deep thought")))
+    );
 }
 
 #[test]
@@ -224,9 +292,21 @@ fn test_drain_events() {
 
     let events = n.drain_events();
     assert!(events.len() >= 3);
-    assert!(events.iter().any(|e| matches!(e, NormalizerEvent::Message(_))));
-    assert!(events.iter().any(|e| matches!(e, NormalizerEvent::Update(_))));
-    assert!(events.iter().any(|e| matches!(e, NormalizerEvent::Complete { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, NormalizerEvent::Message(_)))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, NormalizerEvent::Update(_)))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, NormalizerEvent::Complete { .. }))
+    );
 
     let events2 = n.drain_events();
     assert!(events2.is_empty());
@@ -253,5 +333,11 @@ fn test_usage_reporting() {
     n.end_stream(&mid, None);
 
     let events = n.drain_events();
-    assert!(events.iter().any(|e| matches!(e, NormalizerEvent::Update(StreamUpdate::MergeBlock { token_usage: Some(_), .. }))));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        NormalizerEvent::Update(StreamUpdate::MergeBlock {
+            token_usage: Some(_),
+            ..
+        })
+    )));
 }

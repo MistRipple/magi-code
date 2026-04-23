@@ -1,4 +1,4 @@
-use crate::llm_types::{LlmMessageParams, LlmContentBlock, LlmMessageContent};
+use crate::llm_types::{LlmContentBlock, LlmMessageContent, LlmMessageParams};
 
 #[derive(Clone, Debug)]
 pub struct ConformanceViolation {
@@ -44,7 +44,9 @@ impl ConformanceValidator {
         for (i, msg) in params.messages.iter().enumerate() {
             if msg.role == "assistant" {
                 if let LlmMessageContent::Blocks(blocks) = &msg.content {
-                    let has_tool_use = blocks.iter().any(|b| matches!(b, LlmContentBlock::ToolUse { .. }));
+                    let has_tool_use = blocks
+                        .iter()
+                        .any(|b| matches!(b, LlmContentBlock::ToolUse { .. }));
                     if has_tool_use {
                         let next = params.messages.get(i + 1);
                         let has_result = next.map_or(false, |n| {

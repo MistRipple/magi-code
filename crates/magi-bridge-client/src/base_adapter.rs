@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::llm_types::{
-    LlmContentBlock, LlmMessage, LlmMessageContent, LlmMessageParams, LlmResponse,
-    LlmUsage, ToolCall, ToolResult,
+    LlmContentBlock, LlmMessage, LlmMessageContent, LlmMessageParams, LlmResponse, LlmUsage,
+    ToolCall, ToolResult,
 };
 use crate::types::{BridgeClientError, ModelBridgeClient, ModelInvocationRequest};
 
@@ -52,10 +52,7 @@ impl BaseAdapter {
         }
     }
 
-    pub fn invoke_llm(
-        &self,
-        params: &LlmMessageParams,
-    ) -> Result<LlmResponse, BridgeClientError> {
+    pub fn invoke_llm(&self, params: &LlmMessageParams) -> Result<LlmResponse, BridgeClientError> {
         let prompt = build_prompt_from_params(params);
         let request = ModelInvocationRequest {
             provider: "openai".to_string(),
@@ -77,11 +74,7 @@ impl BaseAdapter {
                                     })
                                     .collect::<Vec<_>>()
                                     .join("\n");
-                                if text.is_empty() {
-                                    None
-                                } else {
-                                    Some(text)
-                                }
+                                if text.is_empty() { None } else { Some(text) }
                             }
                         },
                         tool_calls: Vec::new(),

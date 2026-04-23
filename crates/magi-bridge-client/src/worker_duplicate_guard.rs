@@ -22,9 +22,15 @@ fn read_only_tool_names() -> HashSet<&'static str> {
 }
 
 fn write_dedup_tool_names() -> HashSet<&'static str> {
-    ["shell", "file_create", "file_edit", "file_insert", "file_remove"]
-        .into_iter()
-        .collect()
+    [
+        "shell",
+        "file_create",
+        "file_edit",
+        "file_insert",
+        "file_remove",
+    ]
+    .into_iter()
+    .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -326,7 +332,13 @@ impl WorkerDuplicateGuard {
             keys.sort();
             let fingerprint: Vec<String> = keys
                 .iter()
-                .map(|k| format!("{}={}", k, serde_json::to_string(&obj[*k]).unwrap_or_default()))
+                .map(|k| {
+                    format!(
+                        "{}={}",
+                        k,
+                        serde_json::to_string(&obj[*k]).unwrap_or_default()
+                    )
+                })
                 .collect();
             format!("{}::{}", tool.name, fingerprint.join("|"))
         } else {
@@ -351,7 +363,10 @@ impl WorkerDuplicateGuard {
     }
 
     fn is_file_mutation_tool(&self, name: &str) -> bool {
-        matches!(name, "file_edit" | "file_create" | "file_insert" | "file_remove")
+        matches!(
+            name,
+            "file_edit" | "file_create" | "file_insert" | "file_remove"
+        )
     }
 }
 

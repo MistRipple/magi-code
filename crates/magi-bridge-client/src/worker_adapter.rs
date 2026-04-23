@@ -53,10 +53,7 @@ pub struct WorkerAdapter {
 }
 
 impl WorkerAdapter {
-    pub fn new(
-        model_client: Arc<dyn ModelBridgeClient>,
-        config: WorkerAdapterConfig,
-    ) -> Self {
+    pub fn new(model_client: Arc<dyn ModelBridgeClient>, config: WorkerAdapterConfig) -> Self {
         let base = BaseAdapter::new(model_client, config.adapter.clone());
         Self { config, base }
     }
@@ -104,8 +101,7 @@ impl WorkerAdapter {
             }
 
             if self.config.enable_micro_compaction {
-                let estimated =
-                    crate::protocol::estimate_message_tokens(&params.messages);
+                let estimated = crate::protocol::estimate_message_tokens(&params.messages);
                 if estimated > self.config.micro_compaction_threshold_tokens {
                     apply_micro_compaction(&mut params.messages);
                     micro_compaction_count += 1;
@@ -211,22 +207,32 @@ impl WorkerAdapter {
 
                     if let Some(ref mut guard) = dup_guard {
                         if guard.is_read_only_tool(&tc.name) {
-                            if let Some(reason) = guard.check_read_only_duplicate(&tool_info, now_ms) {
+                            if let Some(reason) =
+                                guard.check_read_only_duplicate(&tool_info, now_ms)
+                            {
                                 duplicate_guard_blocks += 1;
                                 return LlmContentBlock::ToolResult {
                                     tool_use_id: tc.id.clone(),
-                                    content: format!("[duplicate guard] 重复只读调用已拦截: {}", reason),
+                                    content: format!(
+                                        "[duplicate guard] 重复只读调用已拦截: {}",
+                                        reason
+                                    ),
                                     is_error: false,
                                 };
                             }
                         }
 
                         if guard.is_write_dedup_tool(&tc.name) {
-                            if let Some(reason) = guard.check_failed_write_duplicate(&tool_info, now_ms) {
+                            if let Some(reason) =
+                                guard.check_failed_write_duplicate(&tool_info, now_ms)
+                            {
                                 duplicate_guard_blocks += 1;
                                 return LlmContentBlock::ToolResult {
                                     tool_use_id: tc.id.clone(),
-                                    content: format!("[duplicate guard] 重复失败写入已拦截: {}", reason),
+                                    content: format!(
+                                        "[duplicate guard] 重复失败写入已拦截: {}",
+                                        reason
+                                    ),
                                     is_error: true,
                                 };
                             }
@@ -272,40 +278,38 @@ fn apply_micro_compaction(messages: &mut Vec<LlmMessage>) {
             role: m.role.clone(),
             content: match &m.content {
                 LlmMessageContent::Text(t) => mc::LlmContent::Text(t.clone()),
-                LlmMessageContent::Blocks(blocks) => {
-                    mc::LlmContent::Blocks(
-                        blocks
-                            .iter()
-                            .map(|b| match b {
-                                LlmContentBlock::Text { text } => {
-                                    mc::ContentBlock::Text { text: text.clone() }
+                LlmMessageContent::Blocks(blocks) => mc::LlmContent::Blocks(
+                    blocks
+                        .iter()
+                        .map(|b| match b {
+                            LlmContentBlock::Text { text } => {
+                                mc::ContentBlock::Text { text: text.clone() }
+                            }
+                            LlmContentBlock::Image { source } => mc::ContentBlock::Image {
+                                media_type: source.media_type.clone(),
+                                data: source.data.clone(),
+                            },
+                            LlmContentBlock::ToolUse { id, name, input } => {
+                                mc::ContentBlock::ToolUse {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    input: input.clone(),
                                 }
-                                LlmContentBlock::Image { source } => mc::ContentBlock::Image {
-                                    media_type: source.media_type.clone(),
-                                    data: source.data.clone(),
-                                },
-                                LlmContentBlock::ToolUse { id, name, input } => {
-                                    mc::ContentBlock::ToolUse {
-                                        id: id.clone(),
-                                        name: name.clone(),
-                                        input: input.clone(),
-                                    }
-                                }
-                                LlmContentBlock::ToolResult {
-                                    tool_use_id,
-                                    content,
-                                    is_error,
-                                } => mc::ContentBlock::ToolResult {
-                                    tool_use_id: tool_use_id.clone(),
-                                    content: content.clone(),
-                                    is_error: *is_error,
-                                    tool_name: None,
-                                    status: None,
-                                },
-                            })
-                            .collect(),
-                    )
-                }
+                            }
+                            LlmContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            } => mc::ContentBlock::ToolResult {
+                                tool_use_id: tool_use_id.clone(),
+                                content: content.clone(),
+                                is_error: *is_error,
+                                tool_name: None,
+                                status: None,
+                            },
+                        })
+                        .collect(),
+                ),
             },
         })
         .collect();
@@ -318,40 +322,36 @@ fn apply_micro_compaction(messages: &mut Vec<LlmMessage>) {
             role: m.role,
             content: match m.content {
                 mc::LlmContent::Text(t) => LlmMessageContent::Text(t),
-                mc::LlmContent::Blocks(blocks) => {
-                    LlmMessageContent::Blocks(
-                        blocks
-                            .into_iter()
-                            .map(|b| match b {
-                                mc::ContentBlock::Text { text } => {
-                                    LlmContentBlock::Text { text }
+                mc::LlmContent::Blocks(blocks) => LlmMessageContent::Blocks(
+                    blocks
+                        .into_iter()
+                        .map(|b| match b {
+                            mc::ContentBlock::Text { text } => LlmContentBlock::Text { text },
+                            mc::ContentBlock::Image { media_type, data } => {
+                                LlmContentBlock::Image {
+                                    source: crate::llm_types::ImageSource {
+                                        kind: "base64".to_string(),
+                                        media_type,
+                                        data,
+                                    },
                                 }
-                                mc::ContentBlock::Image { media_type, data } => {
-                                    LlmContentBlock::Image {
-                                        source: crate::llm_types::ImageSource {
-                                            kind: "base64".to_string(),
-                                            media_type,
-                                            data,
-                                        },
-                                    }
-                                }
-                                mc::ContentBlock::ToolUse { id, name, input } => {
-                                    LlmContentBlock::ToolUse { id, name, input }
-                                }
-                                mc::ContentBlock::ToolResult {
-                                    tool_use_id,
-                                    content,
-                                    is_error,
-                                    ..
-                                } => LlmContentBlock::ToolResult {
-                                    tool_use_id,
-                                    content,
-                                    is_error,
-                                },
-                            })
-                            .collect(),
-                    )
-                }
+                            }
+                            mc::ContentBlock::ToolUse { id, name, input } => {
+                                LlmContentBlock::ToolUse { id, name, input }
+                            }
+                            mc::ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                                ..
+                            } => LlmContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            },
+                        })
+                        .collect(),
+                ),
             },
         })
         .collect();

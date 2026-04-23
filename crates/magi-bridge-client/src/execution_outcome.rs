@@ -69,8 +69,7 @@ impl ExecutionOutcomeExtractor {
 
             if let Some(end_idx) = self.buffer.find(EXECUTION_OUTCOME_END) {
                 let raw_json = self.buffer[..end_idx].trim().to_string();
-                self.buffer =
-                    self.buffer[end_idx + EXECUTION_OUTCOME_END.len()..].to_string();
+                self.buffer = self.buffer[end_idx + EXECUTION_OUTCOME_END.len()..].to_string();
                 self.in_block = false;
                 if let Some(parsed) = parse_outcome(&raw_json) {
                     self.latest_outcome = Some(parsed);
@@ -196,12 +195,16 @@ fn parse_outcome(raw: &str) -> Option<ExecutionOutcomeBlock> {
     }
     let data: RawOutcome = serde_json::from_str(raw).ok()?;
 
-    let status = data.status.as_deref().map(|s| s.to_lowercase()).and_then(|s| match s.as_str() {
-        "running" => Some(ExecutionOutcomeStatus::Running),
-        "completed" => Some(ExecutionOutcomeStatus::Completed),
-        "failed" => Some(ExecutionOutcomeStatus::Failed),
-        _ => None,
-    });
+    let status = data
+        .status
+        .as_deref()
+        .map(|s| s.to_lowercase())
+        .and_then(|s| match s.as_str() {
+            "running" => Some(ExecutionOutcomeStatus::Running),
+            "completed" => Some(ExecutionOutcomeStatus::Completed),
+            "failed" => Some(ExecutionOutcomeStatus::Failed),
+            _ => None,
+        });
 
     let raw_steps = data.next_steps.or(data.next_steps_alt);
     let next_steps: Vec<String> = raw_steps

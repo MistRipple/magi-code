@@ -90,12 +90,11 @@ impl OrchestratorDecisionEngine {
                 0
             };
 
-        let external_wait_breach_streak =
-            if self.is_external_wait_threshold_breached(snapshot) {
-                current_external_wait_breach_streak + 1
-            } else {
-                0
-            };
+        let external_wait_breach_streak = if self.is_external_wait_threshold_breached(snapshot) {
+            current_external_wait_breach_streak + 1
+        } else {
+            0
+        };
 
         GateStreakResult {
             budget_breach_streak,
@@ -118,10 +117,7 @@ impl OrchestratorDecisionEngine {
         let running_required = snapshot.running_required.unwrap_or(0);
 
         if snapshot.required_total == 0 {
-            return BudgetCandidatesResult {
-                candidates,
-                events,
-            };
+            return BudgetCandidatesResult { candidates, events };
         }
 
         if running_required == 0 {
@@ -184,9 +180,7 @@ impl OrchestratorDecisionEngine {
             }
         }
 
-        if gate_state.consecutive_upstream_model_errors
-            >= self.policy.upstream_model_error_streak
-        {
+        if gate_state.consecutive_upstream_model_errors >= self.policy.upstream_model_error_streak {
             candidates.push(create_candidate(
                 OrchestratorTerminationReason::UpstreamModelError,
                 "upstream_model",
@@ -225,10 +219,7 @@ impl OrchestratorDecisionEngine {
             });
         }
 
-        BudgetCandidatesResult {
-            candidates,
-            events,
-        }
+        BudgetCandidatesResult { candidates, events }
     }
 
     pub fn resolve_shadow_reason(

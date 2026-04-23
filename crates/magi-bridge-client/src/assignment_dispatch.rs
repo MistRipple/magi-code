@@ -43,7 +43,8 @@ pub enum AssignmentDispatchDecision {
 
 static DISPATCH_NARRATIVE_BOUNDARY: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
-        Regex::new(r"(?:^|[：:\s])(?:我将安排|我会安排|我将派发|我会派发|接下来安排|继续安排)").unwrap(),
+        Regex::new(r"(?:^|[：:\s])(?:我将安排|我会安排|我将派发|我会派发|接下来安排|继续安排)")
+            .unwrap(),
         Regex::new(r"分派给.{0,20}Worker").unwrap(),
         Regex::new(r"(?:编排|任务).{0,8}(?:已派发|派发完成)").unwrap(),
         Regex::new(r"派发.{0,20}Worker").unwrap(),
@@ -62,9 +63,8 @@ static DISPATCH_JSON_FRAGMENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#""tasks"\s*:|"mission_title"\s*:|"task_name"\s*:|"ownership_hint"\s*:"#).unwrap()
 });
 
-static FENCED_JSON: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)```json\s*([\s\S]*?)```").unwrap()
-});
+static FENCED_JSON: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)```json\s*([\s\S]*?)```").unwrap());
 
 pub fn decide_assignment_dispatch(
     text: &str,
@@ -110,7 +110,10 @@ fn extract_assignment_dispatch(
         .map(|s| s.replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "_"))
         .unwrap_or_else(|| "request".to_string());
 
-    let id = format!("structured_assignment_dispatch_{}_round_{}", req_part, round);
+    let id = format!(
+        "structured_assignment_dispatch_{}_round_{}",
+        req_part, round
+    );
 
     Some(AssignmentDispatchRequest {
         id,
@@ -174,7 +177,9 @@ fn is_valid_dispatch_payload(value: &Value) -> bool {
             && t.get("acceptance").and_then(|v| v.as_array()).is_some()
             && t.get("constraints").and_then(|v| v.as_array()).is_some()
             && t.get("context").and_then(|v| v.as_array()).is_some()
-            && t.get("requires_modification").and_then(|v| v.as_bool()).is_some()
+            && t.get("requires_modification")
+                .and_then(|v| v.as_bool())
+                .is_some()
     })
 }
 
@@ -300,9 +305,7 @@ pub fn strip_dispatch_preview_text(text: &str) -> String {
 
     if let Some(fence_offset) = find_line_started_fence_offset(text) {
         let suffix = &text[fence_offset..];
-        if DISPATCH_JSON_FRAGMENT.is_match(suffix)
-            || suffix.trim_start().starts_with('{')
-        {
+        if DISPATCH_JSON_FRAGMENT.is_match(suffix) || suffix.trim_start().starts_with('{') {
             return normalize_visible_prefix(&text[..fence_offset]);
         }
     }
@@ -310,9 +313,7 @@ pub fn strip_dispatch_preview_text(text: &str) -> String {
     let json_offset = find_line_started_json_offset(text);
     if json_offset >= 0 {
         let suffix = &text[json_offset as usize..];
-        if DISPATCH_JSON_FRAGMENT.is_match(suffix)
-            || suffix.trim_start().starts_with('{')
-        {
+        if DISPATCH_JSON_FRAGMENT.is_match(suffix) || suffix.trim_start().starts_with('{') {
             return normalize_visible_prefix(&text[..json_offset as usize]);
         }
     }
@@ -343,10 +344,16 @@ mod tests {
 
     #[test]
     fn extract_dispatch_from_fenced_json() {
-        let text = format!("我将安排以下任务：\n```json\n{}\n```", sample_dispatch_json());
+        let text = format!(
+            "我将安排以下任务：\n```json\n{}\n```",
+            sample_dispatch_json()
+        );
         let result = decide_assignment_dispatch(&text, Some("req-1"), 1, false);
         match result {
-            AssignmentDispatchDecision::Dispatch { request, stripped_text } => {
+            AssignmentDispatchDecision::Dispatch {
+                request,
+                stripped_text,
+            } => {
                 assert_eq!(request.payload.tasks.len(), 1);
                 assert_eq!(request.payload.tasks[0].task_name, "实现 JWT 验证");
                 assert!(!stripped_text.contains("```json"));
@@ -362,7 +369,10 @@ mod tests {
         match result {
             AssignmentDispatchDecision::Dispatch { request, .. } => {
                 assert!(request.id.contains("round_2"));
-                assert_eq!(request.payload.mission_title.as_deref(), Some("实现用户认证"));
+                assert_eq!(
+                    request.payload.mission_title.as_deref(),
+                    Some("实现用户认证")
+                );
             }
             _ => panic!("expected Dispatch"),
         }

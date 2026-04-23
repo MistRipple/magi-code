@@ -9,12 +9,11 @@ use crate::{
         BridgeTransportRequest, HostBridgeClient, HostBridgeRequest, McpBridgeClient,
         McpManagerDescribeServerResponse, McpManagerListServersResponse,
         McpManagerServerHealthUpdateRequest, McpManagerServerOperationResponse,
-        McpManagerServerRegistrationRequest, McpManagerServerSelectionRequest,
-        McpToolCallRequest, ModelBridgeClient, ModelInvocationRequest,
-        SharedBridgeTransport,
+        McpManagerServerRegistrationRequest, McpManagerServerSelectionRequest, McpToolCallRequest,
+        ModelBridgeClient, ModelInvocationRequest, SharedBridgeTransport,
     },
 };
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -161,8 +160,9 @@ impl JsonRpcMcpManagerClient {
         TParams: Serialize,
         TResponse: DeserializeOwned,
     {
-        let params = serde_json::to_value(request)
-            .map_err(|error| protocol_call_failed(format!("serialize {method} request failed: {error}")))?;
+        let params = serde_json::to_value(request).map_err(|error| {
+            protocol_call_failed(format!("serialize {method} request failed: {error}"))
+        })?;
         call_and_decode(&self.transport, method, params)
     }
 }
@@ -180,8 +180,9 @@ impl JsonRpcBridgeServerProbeClient {
                 params: Value::Null,
             })
             .map_err(transport_call_failed)?;
-        serde_json::from_value(response.payload)
-            .map_err(|error| protocol_call_failed(format!("decode bridge handshake failed: {error}")))
+        serde_json::from_value(response.payload).map_err(|error| {
+            protocol_call_failed(format!("decode bridge handshake failed: {error}"))
+        })
     }
 
     pub fn health(&self) -> Result<BridgeServerHealth, BridgeClientError> {
@@ -212,8 +213,9 @@ impl JsonRpcBridgeServerProbeClient {
 
 impl HostBridgeClient for JsonRpcHostBridgeClient {
     fn call(&self, request: HostBridgeRequest) -> Result<BridgeResponse, BridgeClientError> {
-        let params = serde_json::to_value(request)
-            .map_err(|error| protocol_call_failed(format!("serialize host request failed: {error}")))?;
+        let params = serde_json::to_value(request).map_err(|error| {
+            protocol_call_failed(format!("serialize host request failed: {error}"))
+        })?;
         let response = self
             .transport
             .call(BridgeTransportRequest {
@@ -226,12 +228,10 @@ impl HostBridgeClient for JsonRpcHostBridgeClient {
 }
 
 impl ModelBridgeClient for JsonRpcModelBridgeClient {
-    fn invoke(
-        &self,
-        request: ModelInvocationRequest,
-    ) -> Result<BridgeResponse, BridgeClientError> {
-        let params = serde_json::to_value(request)
-            .map_err(|error| protocol_call_failed(format!("serialize model request failed: {error}")))?;
+    fn invoke(&self, request: ModelInvocationRequest) -> Result<BridgeResponse, BridgeClientError> {
+        let params = serde_json::to_value(request).map_err(|error| {
+            protocol_call_failed(format!("serialize model request failed: {error}"))
+        })?;
         let response = self
             .transport
             .call(BridgeTransportRequest {
@@ -241,12 +241,26 @@ impl ModelBridgeClient for JsonRpcModelBridgeClient {
             .map_err(transport_call_failed)?;
         decode_bridge_response(response.payload)
     }
+
+    fn invoke_stream(
+        &self,
+        request: ModelInvocationRequest,
+        on_event: &mut dyn FnMut(crate::ModelStreamEvent),
+    ) -> Result<BridgeResponse, BridgeClientError> {
+        let response = self.invoke(request)?;
+        let parsed = response.parse_chat_payload();
+        if let Some(content) = parsed.content.filter(|content| !content.is_empty()) {
+            on_event(crate::ModelStreamEvent::ContentDelta { delta: content });
+        }
+        Ok(response)
+    }
 }
 
 impl McpBridgeClient for JsonRpcMcpBridgeClient {
     fn call_tool(&self, request: McpToolCallRequest) -> Result<BridgeResponse, BridgeClientError> {
-        let params = serde_json::to_value(request)
-            .map_err(|error| protocol_call_failed(format!("serialize mcp request failed: {error}")))?;
+        let params = serde_json::to_value(request).map_err(|error| {
+            protocol_call_failed(format!("serialize mcp request failed: {error}"))
+        })?;
         let response = self
             .transport
             .call(BridgeTransportRequest {

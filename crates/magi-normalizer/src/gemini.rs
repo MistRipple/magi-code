@@ -1,5 +1,5 @@
 use crate::base::{
-    flush_pending_thinking_to_blocks, BaseNormalizer, CallerContext, NormalizerConfig,
+    BaseNormalizer, CallerContext, NormalizerConfig, flush_pending_thinking_to_blocks,
 };
 use crate::types::*;
 
@@ -78,8 +78,8 @@ impl GeminiNormalizer {
                     .map(|s| s.to_string())
                     .unwrap_or_else(generate_message_id);
                 let raw_input = data.get("args").or(data.get("input"));
-                let input_str = raw_input
-                    .map(|v| serde_json::to_string_pretty(v).unwrap_or_default());
+                let input_str =
+                    raw_input.map(|v| serde_json::to_string_pretty(v).unwrap_or_default());
                 self.normalizer.add_tool_call(
                     message_id,
                     ToolCallBlock {
@@ -101,7 +101,10 @@ impl GeminiNormalizer {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        let error = data.get("error").and_then(|e| e.as_str()).map(|s| s.to_string());
+                        let error = data
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .map(|s| s.to_string());
                         let _ = ctx;
                         self.normalizer.finish_tool_call(
                             message_id,

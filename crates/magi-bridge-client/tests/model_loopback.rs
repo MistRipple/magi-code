@@ -3,12 +3,12 @@ use magi_bridge_client::{
     JsonRpcBridgeServerProbeClient, JsonRpcModelBridgeClient, JsonRpcStdioTransport,
     ModelBridgeClient, ModelInvocationRequest, SHADOW_MODEL_PROVIDER,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, Arc},
+    sync::{Arc, mpsc},
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -81,10 +81,7 @@ fn read_http_request(stream: &mut TcpStream) -> RecordedHttpRequest {
     let header_text =
         String::from_utf8(buffer[..header_end].to_vec()).expect("headers should be utf-8");
     let mut lines = header_text.split("\r\n");
-    let request_line = lines
-        .next()
-        .expect("request line should exist")
-        .to_string();
+    let request_line = lines.next().expect("request line should exist").to_string();
     let mut headers = BTreeMap::new();
     for line in lines {
         if line.is_empty() {
@@ -235,8 +232,7 @@ fn openai_compatible_provider_surfaces_structured_success_payload() {
         .expect("structured openai-compatible payload should succeed");
 
     assert!(response.ok);
-    let payload: Value =
-        serde_json::from_str(&response.payload).expect("payload should be json");
+    let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
     assert_eq!(payload["content"], "hello from stub");
     assert_eq!(payload["finish_reason"], "tool_calls");
     assert_eq!(payload["usage"]["total_tokens"], 17);
@@ -289,8 +285,7 @@ fn openai_compatible_provider_accepts_tool_call_only_success_payload() {
         .expect("tool-call-only openai-compatible payload should succeed");
 
     assert!(response.ok);
-    let payload: Value =
-        serde_json::from_str(&response.payload).expect("payload should be json");
+    let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
     assert!(payload.get("content").is_none());
     assert_eq!(payload["finish_reason"], "tool_calls");
     assert_eq!(payload["usage"]["total_tokens"], 7);
@@ -340,8 +335,7 @@ fn openai_compatible_provider_surfaces_refusal_only_payload() {
         .expect("refusal-only openai-compatible payload should succeed");
 
     assert!(response.ok);
-    let payload: Value =
-        serde_json::from_str(&response.payload).expect("payload should be json");
+    let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
     assert_eq!(payload["content"], "I can't help with that request.");
     assert_eq!(payload["finish_reason"], "stop");
     assert_eq!(payload["usage"]["total_tokens"], 11);
@@ -392,8 +386,7 @@ fn openai_compatible_provider_prefers_refusal_when_content_parts_are_empty() {
         .expect("empty content parts should fall back to refusal");
 
     assert!(response.ok);
-    let payload: Value =
-        serde_json::from_str(&response.payload).expect("payload should be json");
+    let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
     assert_eq!(payload["content"], "I can't comply with that request.");
     assert_eq!(payload["finish_reason"], "stop");
     assert_eq!(payload["usage"]["total_tokens"], 9);
@@ -444,8 +437,7 @@ fn openai_compatible_provider_tolerates_structured_tool_call_arguments() {
         .expect("structured tool arguments should survive round-trip");
 
     assert!(response.ok);
-    let payload: Value =
-        serde_json::from_str(&response.payload).expect("payload should be json");
+    let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
     let arguments = payload["tool_calls"][0]["function"]["arguments"]
         .as_str()
         .expect("tool arguments should remain serialized as a string");
@@ -569,8 +561,16 @@ fn model_loopback_exposes_shared_handshake_and_health() {
 
     let handshake = probe.handshake().expect("model handshake should succeed");
     assert_eq!(handshake.server_kind, BridgeServerKind::Model);
-    assert!(handshake.supported_methods.contains(&"model.invoke".to_string()));
-    assert!(handshake.supported_methods.contains(&"bridge.handshake".to_string()));
+    assert!(
+        handshake
+            .supported_methods
+            .contains(&"model.invoke".to_string())
+    );
+    assert!(
+        handshake
+            .supported_methods
+            .contains(&"bridge.handshake".to_string())
+    );
 
     let health = probe.health().expect("model health should succeed");
     assert_eq!(health.server_kind, BridgeServerKind::Model);
@@ -581,17 +581,23 @@ fn model_loopback_exposes_shared_handshake_and_health() {
         .expect("model service catalog should succeed");
     assert_eq!(catalog.server_kind, BridgeServerKind::Model);
     assert_eq!(catalog.services.len(), 2);
-    assert!(catalog
-        .services
-        .iter()
-        .any(|service| service.service_name == SHADOW_MODEL_PROVIDER));
-    assert!(catalog
-        .services
-        .iter()
-        .any(|service| service.service_name == "openai-compatible"));
-    assert!(catalog.services.iter().all(|service| service
-        .supported_operations
-        .contains(&"invoke_prompt".to_string())));
+    assert!(
+        catalog
+            .services
+            .iter()
+            .any(|service| service.service_name == SHADOW_MODEL_PROVIDER)
+    );
+    assert!(
+        catalog
+            .services
+            .iter()
+            .any(|service| service.service_name == "openai-compatible")
+    );
+    assert!(catalog.services.iter().all(|service| {
+        service
+            .supported_operations
+            .contains(&"invoke_prompt".to_string())
+    }));
 }
 
 #[test]
@@ -656,10 +662,8 @@ fn empty_prompt_returns_remote_business_error() {
 
 #[test]
 fn broken_subprocess_returns_transport_error() {
-    let transport = JsonRpcStdioTransport::new("sh").with_args(vec![
-        "-c".to_string(),
-        "exit 2".to_string(),
-    ]);
+    let transport =
+        JsonRpcStdioTransport::new("sh").with_args(vec!["-c".to_string(), "exit 2".to_string()]);
 
     let error = transport
         .call(BridgeTransportRequest {

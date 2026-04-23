@@ -8,13 +8,8 @@ pub(super) struct TerminalPolicy {
     denied_argument_patterns: Vec<String>,
 }
 
-const TERMINAL_DENIED_ARG_PATTERNS_DEFAULT: &[&str] = &[
-    "--force",
-    "-rf",
-    "--no-preserve-root",
-    "sudo",
-    "rm -rf /",
-];
+const TERMINAL_DENIED_ARG_PATTERNS_DEFAULT: &[&str] =
+    &["--force", "-rf", "--no-preserve-root", "sudo", "rm -rf /"];
 
 impl TerminalPolicy {
     pub(super) fn from_env() -> Self {
@@ -63,7 +58,9 @@ impl TerminalPolicy {
     }
 
     pub(super) fn is_command_allowed(&self, command_name: &str) -> bool {
-        self.allowed_commands.iter().any(|allowed| allowed == command_name)
+        self.allowed_commands
+            .iter()
+            .any(|allowed| allowed == command_name)
     }
 
     pub(super) fn validate_arguments(
@@ -121,8 +118,16 @@ mod tests {
         };
 
         assert!(policy.validate_arguments("git", &["status"]).is_ok());
-        assert!(policy.validate_arguments("git", &["log", "--oneline"]).is_ok());
-        assert!(policy.validate_arguments("git", &["push", "--force"]).is_err());
+        assert!(
+            policy
+                .validate_arguments("git", &["log", "--oneline"])
+                .is_ok()
+        );
+        assert!(
+            policy
+                .validate_arguments("git", &["push", "--force"])
+                .is_err()
+        );
         assert!(policy.validate_arguments("rm", &["-rf", "/"]).is_err());
 
         let err = policy

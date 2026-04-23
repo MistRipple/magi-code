@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::adapter::{AdaptedRequest, AdaptedResponse, ProviderAdapter, ProviderFamily};
 use super::utils::{
@@ -18,10 +18,8 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         params: &LlmMessageParams,
         model: &str,
     ) -> Result<AdaptedRequest, String> {
-        let (system_messages, non_system): (Vec<_>, Vec<_>) = params
-            .messages
-            .iter()
-            .partition(|m| m.role == "system");
+        let (system_messages, non_system): (Vec<_>, Vec<_>) =
+            params.messages.iter().partition(|m| m.role == "system");
 
         let system_text = if let Some(ref sp) = params.system_prompt {
             sp.clone()
@@ -55,7 +53,8 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
             if !tools.is_empty() {
                 body["tools"] = json!(serialize_anthropic_tool_definitions(tools));
                 if let Some(ref tc) = params.tool_choice {
-                    body["tool_choice"] = serde_json::to_value(tc).unwrap_or(json!({"type": "auto"}));
+                    body["tool_choice"] =
+                        serde_json::to_value(tc).unwrap_or(json!({"type": "auto"}));
                 }
             }
         }
@@ -63,9 +62,7 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
             body["stream"] = json!(stream);
         }
 
-        let extra_headers = vec![
-            ("anthropic-version".to_string(), "2023-06-01".to_string()),
-        ];
+        let extra_headers = vec![("anthropic-version".to_string(), "2023-06-01".to_string())];
 
         Ok(AdaptedRequest {
             url_path: "/v1/messages".to_string(),
@@ -91,10 +88,7 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
             .unwrap_or("end_turn")
             .to_string();
 
-        let content_blocks = envelope["content"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let content_blocks = envelope["content"].as_array().cloned().unwrap_or_default();
 
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
@@ -107,9 +101,7 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
                     }
                 }
                 Some("tool_use") => {
-                    if let (Some(id), Some(name)) =
-                        (block["id"].as_str(), block["name"].as_str())
-                    {
+                    if let (Some(id), Some(name)) = (block["id"].as_str(), block["name"].as_str()) {
                         let input = block["input"].clone();
                         let raw = serde_json::to_string(&input).ok();
                         tool_calls.push(ToolCall {

@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::adapter::{AdaptedRequest, AdaptedResponse, ProviderAdapter, ProviderFamily};
 use super::utils::convert_messages_to_openai;
@@ -96,10 +96,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
         let envelope: Value =
             serde_json::from_str(body).map_err(|e| format!("invalid JSON response: {e}"))?;
 
-        let output = envelope["output"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let output = envelope["output"].as_array().cloned().unwrap_or_default();
 
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
@@ -121,12 +118,8 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                     if let (Some(id), Some(name)) =
                         (item["call_id"].as_str(), item["name"].as_str())
                     {
-                        let args_str = item["arguments"]
-                            .as_str()
-                            .unwrap_or("{}")
-                            .to_string();
-                        let arguments =
-                            serde_json::from_str(&args_str).unwrap_or(json!({}));
+                        let args_str = item["arguments"].as_str().unwrap_or("{}").to_string();
+                        let arguments = serde_json::from_str(&args_str).unwrap_or(json!({}));
                         tool_calls.push(ToolCall {
                             id: id.to_string(),
                             name: name.to_string(),

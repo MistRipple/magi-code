@@ -1,15 +1,12 @@
-use super::{
-    descriptors::host_kind_label, VSCODE_PREHOST_WORKSPACE_ROOTS_ENV,
-};
+use super::{VSCODE_PREHOST_WORKSPACE_ROOTS_ENV, descriptors::host_kind_label};
 use crate::{
+    HostKind,
     local_process_protocol::{
         BridgeServerCommandCapabilityProfile, BridgeServerContextResolutionBoundary,
         BridgeServerKind, BridgeServerServiceCatalog, BridgeServerServiceDescriptor,
         BridgeServerSessionDescriptor, BridgeServerShellManifest, BridgeServerShellProfile,
-        BridgeServerWorkspaceContext, LocalProcessBridgeRpcError,
-        LOCAL_BRIDGE_PROTOCOL_VERSION,
+        BridgeServerWorkspaceContext, LOCAL_BRIDGE_PROTOCOL_VERSION, LocalProcessBridgeRpcError,
     },
-    HostKind,
 };
 use serde_json::json;
 use std::{env, path::PathBuf};
@@ -46,27 +43,28 @@ impl HostServiceShim {
                     .unwrap_or_else(|_| "disabled".to_string())
                     .trim()
                     .to_ascii_lowercase();
-                let configured_roots = env::var(VSCODE_PREHOST_WORKSPACE_ROOTS_ENV)
-                    .ok()
-                    .map(|raw| {
-                        raw.split(',')
-                            .map(str::trim)
-                            .filter(|entry| !entry.is_empty())
-                            .filter_map(canonicalize_workspace_root)
-                            .map(|path| path.to_string_lossy().to_string())
-                            .collect::<Vec<_>>()
-                    });
-                let (workspace_roots, workspace_roots_source) = if let Some(roots) = configured_roots
-                {
-                    (roots, format!("env:{VSCODE_PREHOST_WORKSPACE_ROOTS_ENV}"))
-                } else {
-                    let roots = env::current_dir()
+                let configured_roots =
+                    env::var(VSCODE_PREHOST_WORKSPACE_ROOTS_ENV)
                         .ok()
-                        .map(|path| path.canonicalize().unwrap_or(path))
-                        .map(|path| vec![path.to_string_lossy().to_string()])
-                        .unwrap_or_default();
-                    (roots, "filesystem:current_dir".to_string())
-                };
+                        .map(|raw| {
+                            raw.split(',')
+                                .map(str::trim)
+                                .filter(|entry| !entry.is_empty())
+                                .filter_map(canonicalize_workspace_root)
+                                .map(|path| path.to_string_lossy().to_string())
+                                .collect::<Vec<_>>()
+                        });
+                let (workspace_roots, workspace_roots_source) =
+                    if let Some(roots) = configured_roots {
+                        (roots, format!("env:{VSCODE_PREHOST_WORKSPACE_ROOTS_ENV}"))
+                    } else {
+                        let roots = env::current_dir()
+                            .ok()
+                            .map(|path| path.canonicalize().unwrap_or(path))
+                            .map(|path| vec![path.to_string_lossy().to_string()])
+                            .unwrap_or_default();
+                        (roots, "filesystem:current_dir".to_string())
+                    };
                 let (service_health, service_health_reason) = if workspace_roots.is_empty() {
                     (
                         "unavailable".to_string(),
@@ -134,11 +132,17 @@ impl HostServiceShim {
                 format!("host_kind:{}", host_kind_label(self.host_kind)),
                 format!("implementation_source:{}", self.implementation_source),
                 format!("capability_profile:{}", self.capability_profile),
-                format!("workspace_roots_source:{}", runtime_status.workspace_roots_source),
+                format!(
+                    "workspace_roots_source:{}",
+                    runtime_status.workspace_roots_source
+                ),
                 format!("service_health:{}", runtime_status.service_health),
                 format!("runtime_mode:{}", runtime_status.runtime_mode),
                 format!("terminal_exec_mode:{}", runtime_status.terminal_exec_mode),
-                format!("workspace_root_count:{}", runtime_status.workspace_roots.len()),
+                format!(
+                    "workspace_root_count:{}",
+                    runtime_status.workspace_roots.len()
+                ),
                 "capability_version:host-shell-v1".to_string(),
                 "shell_profile:shadow-host-shell-profile-v1".to_string(),
                 "context_resolution:shadow-host-context-resolution-v1".to_string(),
@@ -246,7 +250,11 @@ impl HostServiceShim {
             "ReadDiagnostics" => ("query", "read_only", "single_absolute_path"),
             "ReadSymbols" => ("query", "read_only", "single_absolute_path"),
             "WorkspaceRoots" => ("query", "read_only", "workspace_root_listing"),
-            "TerminalExec" => ("terminal_exec", "workspace_write_possible", "working_directory"),
+            "TerminalExec" => (
+                "terminal_exec",
+                "workspace_write_possible",
+                "working_directory",
+            ),
             _ => ("query", "read_only", "opaque"),
         };
 
@@ -306,7 +314,10 @@ pub(super) fn host_service_catalog(shims: &[HostServiceShim]) -> BridgeServerSer
     BridgeServerServiceCatalog {
         protocol_version: LOCAL_BRIDGE_PROTOCOL_VERSION.to_string(),
         server_kind: BridgeServerKind::Host,
-        services: shims.iter().map(HostServiceShim::service_descriptor).collect(),
+        services: shims
+            .iter()
+            .map(HostServiceShim::service_descriptor)
+            .collect(),
     }
 }
 
@@ -352,15 +363,13 @@ mod tests {
             .find(|service| service.service_name == "shadow-host-idea")
             .expect("idea host service should exist");
         assert_eq!(
-            idea
-                .implementation_source
+            idea.implementation_source
                 .as_deref()
                 .expect("idea implementation source should exist"),
             "boundary-placeholder"
         );
         assert_eq!(
-            idea
-                .capability_profile
+            idea.capability_profile
                 .as_deref()
                 .expect("idea capability profile should exist"),
             "idea-host-shell-boundary-v1"
@@ -371,10 +380,26 @@ mod tests {
             Some("idea host shell not implemented")
         );
         for service in &catalog.services {
-            assert!(service.capabilities.contains(&"command:OpenFile".to_string()));
-            assert!(service.capabilities.contains(&"command:RevealDiff".to_string()));
-            assert!(service.capabilities.contains(&"command:ReadDiagnostics".to_string()));
-            assert!(service.capabilities.contains(&"command:ReadSymbols".to_string()));
+            assert!(
+                service
+                    .capabilities
+                    .contains(&"command:OpenFile".to_string())
+            );
+            assert!(
+                service
+                    .capabilities
+                    .contains(&"command:RevealDiff".to_string())
+            );
+            assert!(
+                service
+                    .capabilities
+                    .contains(&"command:ReadDiagnostics".to_string())
+            );
+            assert!(
+                service
+                    .capabilities
+                    .contains(&"command:ReadSymbols".to_string())
+            );
         }
     }
 

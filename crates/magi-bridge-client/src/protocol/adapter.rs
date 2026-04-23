@@ -57,7 +57,11 @@ impl From<AdaptedResponse> for LlmResponse {
 pub trait ProviderAdapter: Send + Sync {
     fn family(&self) -> ProviderFamily;
 
-    fn build_request(&self, params: &LlmMessageParams, model: &str) -> Result<AdaptedRequest, String>;
+    fn build_request(
+        &self,
+        params: &LlmMessageParams,
+        model: &str,
+    ) -> Result<AdaptedRequest, String>;
 
     fn parse_response(&self, status: u16, body: &str) -> Result<AdaptedResponse, String>;
 

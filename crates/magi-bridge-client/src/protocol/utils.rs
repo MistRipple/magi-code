@@ -1,8 +1,7 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::llm_types::{
-    LlmContentBlock, LlmMessage, LlmMessageContent, LlmUsage, ToolCall,
-    ToolDefinition,
+    LlmContentBlock, LlmMessage, LlmMessageContent, LlmUsage, ToolCall, ToolDefinition,
 };
 
 pub fn estimate_message_tokens(messages: &[LlmMessage]) -> u64 {
@@ -85,10 +84,7 @@ pub fn convert_tool_calls_to_openai(tool_calls: &[ToolCall]) -> Vec<Value> {
         .collect()
 }
 
-pub fn convert_tool_results_to_openai(
-    tool_call_id: &str,
-    content: &str,
-) -> Value {
+pub fn convert_tool_results_to_openai(tool_call_id: &str, content: &str) -> Value {
     json!({
         "role": "tool",
         "tool_call_id": tool_call_id,
@@ -177,14 +173,12 @@ pub fn convert_messages_to_anthropic(messages: &[LlmMessage]) -> Vec<Value> {
                             LlmContentBlock::Text { text } => {
                                 Some(json!({"type": "text", "text": text}))
                             }
-                            LlmContentBlock::ToolUse { id, name, input } => {
-                                Some(json!({
-                                    "type": "tool_use",
-                                    "id": id,
-                                    "name": name,
-                                    "input": input,
-                                }))
-                            }
+                            LlmContentBlock::ToolUse { id, name, input } => Some(json!({
+                                "type": "tool_use",
+                                "id": id,
+                                "name": name,
+                                "input": input,
+                            })),
                             LlmContentBlock::ToolResult {
                                 tool_use_id,
                                 content,
@@ -195,16 +189,14 @@ pub fn convert_messages_to_anthropic(messages: &[LlmMessage]) -> Vec<Value> {
                                 "content": content,
                                 "is_error": is_error,
                             })),
-                            LlmContentBlock::Image { source } => {
-                                Some(json!({
-                                    "type": "image",
-                                    "source": {
-                                        "type": source.kind,
-                                        "media_type": source.media_type,
-                                        "data": source.data,
-                                    }
-                                }))
-                            }
+                            LlmContentBlock::Image { source } => Some(json!({
+                                "type": "image",
+                                "source": {
+                                    "type": source.kind,
+                                    "media_type": source.media_type,
+                                    "data": source.data,
+                                }
+                            })),
                         })
                         .collect();
                     json!(parts)

@@ -1,6 +1,6 @@
 use super::catalog::HostServiceShim;
 use crate::{BridgeResponse, HostKind};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub(super) fn host_kind_label(host_kind: HostKind) -> &'static str {
     match host_kind {
@@ -9,11 +9,7 @@ pub(super) fn host_kind_label(host_kind: HostKind) -> &'static str {
     }
 }
 
-pub(super) fn shadow_host_payload(
-    shim: &HostServiceShim,
-    command: &str,
-    details: Value,
-) -> String {
+pub(super) fn shadow_host_payload(shim: &HostServiceShim, command: &str, details: Value) -> String {
     let runtime_status = shim.runtime_status();
     json!({
         "bridge_kind": "host",

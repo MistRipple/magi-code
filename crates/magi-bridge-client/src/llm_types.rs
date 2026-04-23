@@ -75,9 +75,7 @@ pub enum LlmContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "image")]
-    Image {
-        source: ImageSource,
-    },
+    Image { source: ImageSource },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -144,7 +142,12 @@ pub struct LlmMessageParams {
 #[serde(untagged)]
 pub enum ToolChoice {
     Simple(String),
-    Typed { #[serde(rename = "type")] kind: String, #[serde(default, skip_serializing_if = "Option::is_none")] name: Option<String> },
+    Typed {
+        #[serde(rename = "type")]
+        kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -247,10 +250,8 @@ static SUMMARY_HIJACK_MAIN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)Your task is to create a detailed summary").unwrap());
 static SUMMARY_HIJACK_NO_TOOLS: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)IMPORTANT:\s*Do NOT use any tools").unwrap());
-static SUMMARY_HIJACK_ANALYSIS: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)<analysis>").unwrap());
-static SUMMARY_HIJACK_SUMMARY: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)<summary>").unwrap());
+static SUMMARY_HIJACK_ANALYSIS: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)<analysis>").unwrap());
+static SUMMARY_HIJACK_SUMMARY: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)<summary>").unwrap());
 
 pub fn is_summary_hijack_text(text: &str) -> bool {
     let normalized = text.trim();

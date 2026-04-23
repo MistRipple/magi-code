@@ -25,12 +25,11 @@ pub fn create_normalizer(
     agent: Option<&str>,
 ) -> BaseNormalizer {
     let agent_name = agent.unwrap_or("worker");
-    let caller_context =
-        if agent_name == "orchestrator" || agent_name == "auxiliary" {
-            CallerContext::Orchestrator
-        } else {
-            CallerContext::Worker
-        };
+    let caller_context = if agent_name == "orchestrator" || agent_name == "auxiliary" {
+        CallerContext::Orchestrator
+    } else {
+        CallerContext::Worker
+    };
     BaseNormalizer::new(NormalizerConfig {
         agent: agent_name.to_string(),
         default_source: source,

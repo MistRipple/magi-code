@@ -167,7 +167,7 @@ pub fn evaluate_progress(
             return ProgressEvaluation {
                 progressed: true,
                 regressed: false,
-            }
+            };
         }
     };
 

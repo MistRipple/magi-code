@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::adapter::{AdaptedRequest, AdaptedResponse, ProviderAdapter, ProviderFamily};
 use super::utils::{convert_messages_to_openai, parse_openai_usage, serialize_tool_definitions};
@@ -55,7 +55,11 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
 
     fn parse_response(&self, status: u16, body: &str) -> Result<AdaptedResponse, String> {
         if !(200..300).contains(&status) {
-            return Err(format!("OpenAI API error (status={}): {}", status, truncate(body, 512)));
+            return Err(format!(
+                "OpenAI API error (status={}): {}",
+                status,
+                truncate(body, 512)
+            ));
         }
 
         let envelope: Value =

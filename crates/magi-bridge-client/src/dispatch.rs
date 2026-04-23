@@ -48,12 +48,12 @@ impl BridgeDispatchRuntime {
 
         let response = match (binding.bridge_kind, binding.dispatch_action) {
             (BridgeBindingKind::Model, BridgeDispatchAction::ModelPrompt) => {
-                let client = self
-                    .model_client
-                    .as_ref()
-                    .ok_or(BridgeClientError::MissingClient {
-                        bridge_kind: BridgeBindingKind::Model,
-                    })?;
+                let client =
+                    self.model_client
+                        .as_ref()
+                        .ok_or(BridgeClientError::MissingClient {
+                            bridge_kind: BridgeBindingKind::Model,
+                        })?;
                 client.invoke(ModelInvocationRequest {
                     provider: binding.bridge_target.clone(),
                     prompt: input.payload.clone(),
@@ -81,12 +81,12 @@ impl BridgeDispatchRuntime {
                         binding_id: binding.binding_id.clone(),
                     }
                 })?;
-                let client =
-                    self.host_client
-                        .as_ref()
-                        .ok_or(BridgeClientError::MissingClient {
-                            bridge_kind: BridgeBindingKind::Host,
-                        })?;
+                let client = self
+                    .host_client
+                    .as_ref()
+                    .ok_or(BridgeClientError::MissingClient {
+                        bridge_kind: BridgeBindingKind::Host,
+                    })?;
                 client.call(HostBridgeRequest {
                     host_kind,
                     command: HostBridgeCommand::TerminalExec {
@@ -113,10 +113,7 @@ impl BridgeDispatchRuntime {
     }
 }
 
-fn resolve_host_kind(
-    bridge_target: &str,
-    binding_id: &str,
-) -> Result<HostKind, BridgeClientError> {
+fn resolve_host_kind(bridge_target: &str, binding_id: &str) -> Result<HostKind, BridgeClientError> {
     match bridge_target.trim().to_ascii_lowercase().as_str() {
         "vscode" => Ok(HostKind::Vscode),
         "idea" => Ok(HostKind::Idea),

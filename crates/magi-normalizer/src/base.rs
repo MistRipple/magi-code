@@ -216,7 +216,9 @@ impl BaseNormalizer {
             tool_call.output = output.clone();
         }
         let finished = tool_call.clone();
-        context.blocks.push(ContentBlock::ToolCall(finished.clone()));
+        context
+            .blocks
+            .push(ContentBlock::ToolCall(finished.clone()));
         context.active_tool_calls.remove(tool_id);
 
         let update = StreamUpdate::MergeBlock {

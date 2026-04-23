@@ -1,9 +1,9 @@
 use crate::{
-    local_process_protocol::{
-        run_local_process_bridge_server, BridgeServerKind, LocalProcessBridgeRequest,
-        LocalProcessBridgeRpcError, LocalProcessBridgeServerError,
-    },
     HostBridgeCommand, HostBridgeRequest,
+    local_process_protocol::{
+        BridgeServerKind, LocalProcessBridgeRequest, LocalProcessBridgeRpcError,
+        LocalProcessBridgeServerError, run_local_process_bridge_server,
+    },
 };
 use serde_json::json;
 
@@ -40,7 +40,9 @@ fn handle_host_call(
     let host_request: HostBridgeRequest = match serde_json::from_value(request.params) {
         Ok(request) => request,
         Err(error) => {
-            return Err(LocalProcessBridgeRpcError::invalid_params(error.to_string()));
+            return Err(LocalProcessBridgeRpcError::invalid_params(
+                error.to_string(),
+            ));
         }
     };
 

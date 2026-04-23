@@ -2,7 +2,7 @@ use crate::types::{
     BridgeClientError, BridgeErrorLayer, BridgeResponse, McpBridgeClient, McpToolCallRequest,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     env,
@@ -10,8 +10,8 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -135,13 +135,12 @@ impl StdioMcpBridgeClient {
             .get("tools")
             .cloned()
             .unwrap_or(Value::Array(Vec::new()));
-        let tools: Vec<McpToolInfo> = serde_json::from_value(tools_value).map_err(|error| {
-            BridgeClientError::CallFailed {
+        let tools: Vec<McpToolInfo> =
+            serde_json::from_value(tools_value).map_err(|error| BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::Protocol,
                 code: None,
                 message: format!("decode tools/list response failed: {error}"),
-            }
-        })?;
+            })?;
         Ok(tools)
     }
 
@@ -181,7 +180,10 @@ impl StdioMcpBridgeClient {
         cmd.stderr(Stdio::piped());
 
         let mut child = cmd.spawn().map_err(|error| {
-            mcp_transport_error(format!("spawn MCP server {} failed: {error}", self.config.command))
+            mcp_transport_error(format!(
+                "spawn MCP server {} failed: {error}",
+                self.config.command
+            ))
         })?;
 
         let stdin = child.stdin.take().ok_or_else(|| {
@@ -244,9 +246,9 @@ impl StdioMcpBridgeClient {
             .lock()
             .map_err(|_| mcp_transport_error("connection mutex poisoned".to_string()))?;
 
-        let conn = connection_guard.as_mut().ok_or_else(|| {
-            mcp_transport_error("MCP server not connected".to_string())
-        })?;
+        let conn = connection_guard
+            .as_mut()
+            .ok_or_else(|| mcp_transport_error("MCP server not connected".to_string()))?;
 
         let request_id = self.next_request_id();
         let request = json!({
@@ -264,21 +266,18 @@ impl StdioMcpBridgeClient {
         response
             .get("result")
             .cloned()
-            .ok_or_else(|| {
-                BridgeClientError::CallFailed {
-                    layer: BridgeErrorLayer::Protocol,
-                    code: None,
-                    message: "MCP response missing 'result' field".to_string(),
-                }
+            .ok_or_else(|| BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::Protocol,
+                code: None,
+                message: "MCP response missing 'result' field".to_string(),
             })
     }
 }
 
 impl McpBridgeClient for StdioMcpBridgeClient {
     fn call_tool(&self, request: McpToolCallRequest) -> Result<BridgeResponse, BridgeClientError> {
-        let input: Value = serde_json::from_str(&request.input).unwrap_or(Value::Object(
-            serde_json::Map::new(),
-        ));
+        let input: Value =
+            serde_json::from_str(&request.input).unwrap_or(Value::Object(serde_json::Map::new()));
 
         let params = json!({
             "name": request.tool_name,
@@ -332,23 +331,17 @@ pub struct McpToolInfo {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn send_json(
-    writer: &mut impl Write,
-    value: &Value,
-) -> Result<(), BridgeClientError> {
-    let json = serde_json::to_string(value).map_err(|error| {
-        BridgeClientError::CallFailed {
-            layer: BridgeErrorLayer::Protocol,
-            code: None,
-            message: format!("serialize MCP request failed: {error}"),
-        }
+fn send_json(writer: &mut impl Write, value: &Value) -> Result<(), BridgeClientError> {
+    let json = serde_json::to_string(value).map_err(|error| BridgeClientError::CallFailed {
+        layer: BridgeErrorLayer::Protocol,
+        code: None,
+        message: format!("serialize MCP request failed: {error}"),
     })?;
-    writeln!(writer, "{json}").map_err(|error| {
-        mcp_transport_error(format!("write to MCP server failed: {error}"))
-    })?;
-    writer.flush().map_err(|error| {
-        mcp_transport_error(format!("flush MCP server stdin failed: {error}"))
-    })?;
+    writeln!(writer, "{json}")
+        .map_err(|error| mcp_transport_error(format!("write to MCP server failed: {error}")))?;
+    writer
+        .flush()
+        .map_err(|error| mcp_transport_error(format!("flush MCP server stdin failed: {error}")))?;
     Ok(())
 }
 
@@ -370,13 +363,12 @@ fn read_json_response(reader: &mut impl BufRead) -> Result<Value, BridgeClientEr
             continue;
         }
 
-        let value: Value = serde_json::from_str(trimmed).map_err(|error| {
-            BridgeClientError::CallFailed {
+        let value: Value =
+            serde_json::from_str(trimmed).map_err(|error| BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::Protocol,
                 code: None,
                 message: format!("parse MCP response failed: {error}; raw={trimmed}"),
-            }
-        })?;
+            })?;
 
         // Skip notifications (messages without "id") -- these are server-initiated
         // log messages, progress updates, etc.
@@ -539,8 +531,8 @@ mod tests {
             "id": 42,
             "result": {}
         });
-        let error = validate_jsonrpc_response(&response, 1)
-            .expect_err("wrong id should be rejected");
+        let error =
+            validate_jsonrpc_response(&response, 1).expect_err("wrong id should be rejected");
         match error {
             BridgeClientError::CallFailed { message, .. } => {
                 assert!(message.contains("id mismatch"), "message was: {message}");
@@ -559,11 +551,13 @@ mod tests {
                 "message": "method not found"
             }
         });
-        let error = validate_jsonrpc_response(&response, 1)
-            .expect_err("server error should be surfaced");
+        let error =
+            validate_jsonrpc_response(&response, 1).expect_err("server error should be surfaced");
         match error {
             BridgeClientError::CallFailed {
-                layer, code, message,
+                layer,
+                code,
+                message,
             } => {
                 assert_eq!(layer, BridgeErrorLayer::RemoteBusiness);
                 assert_eq!(code, Some(-32601));
@@ -659,10 +653,8 @@ done
 
     #[test]
     fn stdio_mcp_client_reports_spawn_failure() {
-        let config = McpServerConfig::new(
-            "/nonexistent/mcp-server-binary-that-does-not-exist",
-            vec![],
-        );
+        let config =
+            McpServerConfig::new("/nonexistent/mcp-server-binary-that-does-not-exist", vec![]);
         let client = StdioMcpBridgeClient::new(config);
 
         let error = client

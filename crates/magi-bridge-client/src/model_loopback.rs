@@ -1,13 +1,13 @@
 use crate::{
-    local_process_protocol::{
-        run_local_process_bridge_server, BridgeServerKind, BridgeServerServiceCatalog,
-        BridgeServerServiceDescriptor, LocalProcessBridgeRequest, LocalProcessBridgeRpcError,
-        LocalProcessBridgeServerError, LOCAL_BRIDGE_PROTOCOL_VERSION,
-    },
     BridgeResponse, ModelInvocationRequest, SHADOW_MODEL_PROVIDER,
+    local_process_protocol::{
+        BridgeServerKind, BridgeServerServiceCatalog, BridgeServerServiceDescriptor,
+        LOCAL_BRIDGE_PROTOCOL_VERSION, LocalProcessBridgeRequest, LocalProcessBridgeRpcError,
+        LocalProcessBridgeServerError, run_local_process_bridge_server,
+    },
 };
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{env, fmt, process::Command, sync::Arc};
 use thiserror::Error;
 
@@ -73,7 +73,9 @@ impl ModelServiceShim {
         let invocation: ModelInvocationRequest = match serde_json::from_value(request.params) {
             Ok(request) => request,
             Err(error) => {
-                return Err(LocalProcessBridgeRpcError::invalid_params(error.to_string()));
+                return Err(LocalProcessBridgeRpcError::invalid_params(
+                    error.to_string(),
+                ));
             }
         };
         let response = self.invoke(invocation)?;
@@ -112,6 +114,65 @@ impl ModelServiceShim {
 
         provider.invoke(&invocation.prompt, self.http_executor.as_ref())
     }
+}
+
+fn shadow_loopback_visible_prompt(prompt: &str) -> String {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if let Some(decomposition) = shadow_loopback_decomposition_response(trimmed) {
+        return decomposition;
+    }
+
+    if let Some((_, task_prompt)) = trimmed.rsplit_once("--- Task ---") {
+        let task_prompt = task_prompt.trim();
+        if !task_prompt.is_empty() {
+            return task_prompt.to_string();
+        }
+    }
+
+    let chunks = trimmed
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|chunk| !chunk.is_empty())
+        .collect::<Vec<_>>();
+
+    if let Some(index) = chunks
+        .iter()
+        .rposition(|chunk| chunk.starts_with("执行:") || chunk.starts_with("继续:"))
+    {
+        return chunks[index..].join("\n\n");
+    }
+
+    if let Some(index) = chunks
+        .iter()
+        .position(|chunk| !shadow_loopback_instruction_chunk(chunk))
+    {
+        if index > 0 {
+            return chunks[index..].join("\n\n");
+        }
+    }
+
+    trimmed.to_string()
+}
+
+fn shadow_loopback_decomposition_response(prompt: &str) -> Option<String> {
+    if !prompt.starts_with("请将以下任务分解为 2-5 个具体的子任务。") {
+        return None;
+    }
+    let _task_text = prompt
+        .rsplit_once("\n\n任务：")
+        .map(|(_, task)| task.trim())
+        .filter(|task| !task.is_empty())?;
+    Some("分析目标与约束\n制定执行步骤\n汇总执行结果".to_string())
+}
+
+fn shadow_loopback_instruction_chunk(chunk: &str) -> bool {
+    chunk.starts_with("--- 用户规则 ---")
+        || chunk.starts_with("--- 安全防护 ---")
+        || chunk.starts_with("--- Context ---")
 }
 
 fn handle_model_invoke(
@@ -430,7 +491,7 @@ impl ModelProvider {
         match &self.mode {
             ModelProviderMode::ShadowLoopback => Ok(BridgeResponse {
                 ok: true,
-                payload: format!("shadow-model::{}", prompt),
+                payload: format!("shadow-model::{}", shadow_loopback_visible_prompt(prompt)),
             }),
             ModelProviderMode::OpenAiCompatibleHttp(runtime) => runtime.invoke(
                 self.name,
@@ -566,10 +627,7 @@ struct OpenAiCompatibleChatChoice {
 }
 
 impl OpenAiCompatibleChatChoice {
-    fn into_payload(
-        self,
-        usage: Option<OpenAiCompatibleUsage>,
-    ) -> OpenAiCompatibleSuccessPayload {
+    fn into_payload(self, usage: Option<OpenAiCompatibleUsage>) -> OpenAiCompatibleSuccessPayload {
         let (content, tool_calls) = match self.message {
             Some(message) => (
                 message
@@ -993,9 +1051,7 @@ mod tests {
         }
     }
 
-    fn test_openai_shim(
-        http_executor: Arc<dyn OpenAiCompatibleHttpExecutor>,
-    ) -> ModelServiceShim {
+    fn test_openai_shim(http_executor: Arc<dyn OpenAiCompatibleHttpExecutor>) -> ModelServiceShim {
         ModelServiceShim {
             registry: ModelProviderRegistry {
                 providers: vec![
@@ -1027,13 +1083,59 @@ mod tests {
     }
 
     #[test]
+    fn shadow_loopback_visible_prompt_strips_prefixed_session_instructions() {
+        let prompt = r#"--- 用户规则 ---
+请始终简洁回答
+
+--- 安全防护 ---
+命中危险操作前先确认
+
+执行: 整理任务输出
+
+整理任务输出"#;
+
+        assert_eq!(
+            super::shadow_loopback_visible_prompt(prompt),
+            "执行: 整理任务输出\n\n整理任务输出"
+        );
+    }
+
+    #[test]
+    fn shadow_loopback_visible_prompt_prefers_explicit_task_section() {
+        let prompt = r#"--- Context ---
+[knowledge] foo: bar
+
+--- Task ---
+执行: 汇总结果
+
+汇总结果"#;
+
+        assert_eq!(
+            super::shadow_loopback_visible_prompt(prompt),
+            "执行: 汇总结果\n\n汇总结果"
+        );
+    }
+
+    #[test]
+    fn shadow_loopback_visible_prompt_returns_clean_decomposition_lines() {
+        let prompt = "请将以下任务分解为 2-5 个具体的子任务。每行一个子任务标题，不要编号，不要额外说明。\n\n任务：请分析并拆分这个复杂任务";
+
+        assert_eq!(
+            super::shadow_loopback_visible_prompt(prompt),
+            "分析目标与约束\n制定执行步骤\n汇总执行结果"
+        );
+    }
+
+    #[test]
     fn model_service_catalog_exposes_shadow_and_openai_compatible_provider_capability() {
         let catalog = ModelServiceShim::from_env().service_catalog();
         assert_eq!(catalog.server_kind, BridgeServerKind::Model);
         assert_eq!(catalog.services.len(), 2);
-        assert!(catalog.services.iter().any(|service| service
-            .capabilities
-            .contains(&"provider:shadow-model".to_string())));
+        assert!(catalog.services.iter().any(|service| {
+            service
+                .capabilities
+                .contains(&"provider:shadow-model".to_string())
+        }));
         let openai_service = catalog
             .services
             .iter()
@@ -1110,7 +1212,10 @@ mod tests {
 
         let requests = executor.requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://api.example.com/v1/chat/completions");
+        assert_eq!(
+            requests[0].url,
+            "https://api.example.com/v1/chat/completions"
+        );
         assert_eq!(requests[0].model, "gpt-4.1-mini");
 
         let body: Value =
@@ -1262,14 +1367,20 @@ mod tests {
         assert_eq!(payload["usage"]["prompt_tokens"], 9);
         assert_eq!(payload["usage"]["completion_tokens"], 4);
         assert_eq!(payload["usage"]["total_tokens"], 13);
-        assert_eq!(payload["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
+        assert_eq!(
+            payload["usage"]["prompt_tokens_details"]["cached_tokens"],
+            2
+        );
         assert_eq!(
             payload["usage"]["completion_tokens_details"]["reasoning_tokens"],
             1
         );
         assert_eq!(payload["tool_calls"][0]["id"], "call_weather_1");
         assert_eq!(payload["tool_calls"][0]["type"], "function");
-        assert_eq!(payload["tool_calls"][0]["function"]["name"], "weather.lookup");
+        assert_eq!(
+            payload["tool_calls"][0]["function"]["name"],
+            "weather.lookup"
+        );
         assert_eq!(
             payload["tool_calls"][0]["function"]["arguments"],
             "{\"city\":\"Shanghai\"}"

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{self, BufRead, BufReader, Write};
 use thiserror::Error;
 
@@ -306,22 +306,12 @@ where
     let request: JsonRpcRequestEnvelope = match serde_json::from_value(value) {
         Ok(request) => request,
         Err(_) => {
-            return to_json_response(error_response(
-                request_id,
-                -32600,
-                "invalid request",
-                None,
-            ));
+            return to_json_response(error_response(request_id, -32600, "invalid request", None));
         }
     };
 
     if request.jsonrpc.as_deref() != Some("2.0") || request.id.is_none() {
-        return to_json_response(error_response(
-            request_id,
-            -32600,
-            "invalid request",
-            None,
-        ));
+        return to_json_response(error_response(request_id, -32600, "invalid request", None));
     }
 
     let request_id = request.id.unwrap_or(Value::Null);
@@ -342,7 +332,10 @@ where
             ok: true,
         })?),
         LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD => Ok(serde_json::to_value(service_catalog.clone())?),
-        _ if business_methods.iter().any(|candidate| *candidate == method) => {
+        _ if business_methods
+            .iter()
+            .any(|candidate| *candidate == method) =>
+        {
             handler(
                 method.as_str(),
                 LocalProcessBridgeRequest {

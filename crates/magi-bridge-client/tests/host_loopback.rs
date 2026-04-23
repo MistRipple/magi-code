@@ -3,7 +3,7 @@ use magi_bridge_client::{
     HostBridgeClient, HostBridgeCommand, HostBridgeRequest, HostKind,
     JsonRpcBridgeServerProbeClient, JsonRpcHostBridgeClient, JsonRpcStdioTransport,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{fs, sync::Arc};
 
 fn loopback_transport() -> JsonRpcStdioTransport {
@@ -86,7 +86,10 @@ fn host_client_round_trips_workspace_roots() {
     assert_eq!(payload["bridge_kind"], "host");
     assert_eq!(payload["host_kind"], "vscode");
     assert_eq!(payload["command"], "WorkspaceRoots");
-    assert_eq!(payload["host_shell_manifest"]["shell_id"], "shadow-host-vscode");
+    assert_eq!(
+        payload["host_shell_manifest"]["shell_id"],
+        "shadow-host-vscode"
+    );
     assert_eq!(payload["host_shell_manifest"]["minimum_version"], "0.1.0");
     assert_eq!(
         payload["host_shell_manifest"]["capability_version"],
@@ -120,14 +123,23 @@ fn host_client_round_trips_workspace_roots() {
         payload["host_command_capability_profile"]["interaction_mode"],
         "query"
     );
-    assert_eq!(payload["host_session"]["session_id"], "shadow-host-session-vscode");
-    assert_eq!(payload["workspace_context"]["workspace_id"], "shadow-workspace-vscode");
+    assert_eq!(
+        payload["host_session"]["session_id"],
+        "shadow-host-session-vscode"
+    );
+    assert_eq!(
+        payload["workspace_context"]["workspace_id"],
+        "shadow-workspace-vscode"
+    );
     assert_eq!(
         payload["workspace_context"]["workspace_roots_source"],
         "filesystem:current_dir"
     );
     assert_eq!(payload["implementation_source"], "real-prehost");
-    assert_eq!(payload["capability_profile"], "vscode-host-shell-prehost-v1");
+    assert_eq!(
+        payload["capability_profile"],
+        "vscode-host-shell-prehost-v1"
+    );
     assert_eq!(payload["workspace_roots_source"], "filesystem:current_dir");
     assert_eq!(payload["service_health"], "healthy");
     assert_eq!(payload["runtime_mode"], "real-prehost");
@@ -140,7 +152,10 @@ fn host_client_round_trips_workspace_roots() {
         payload["details"]["workspace_roots"][0],
         current_workspace_root()
     );
-    assert_eq!(payload["details"]["workspace_roots_source"], "filesystem:current_dir");
+    assert_eq!(
+        payload["details"]["workspace_roots_source"],
+        "filesystem:current_dir"
+    );
 }
 
 #[test]
@@ -149,7 +164,11 @@ fn host_loopback_exposes_shared_handshake_and_health() {
 
     let handshake = probe.handshake().expect("host handshake should succeed");
     assert_eq!(handshake.server_kind, BridgeServerKind::Host);
-    assert!(handshake.supported_methods.contains(&"host.call".to_string()));
+    assert!(
+        handshake
+            .supported_methods
+            .contains(&"host.call".to_string())
+    );
 
     let health = probe.health().expect("host health should succeed");
     assert_eq!(health.server_kind, BridgeServerKind::Host);
@@ -160,18 +179,23 @@ fn host_loopback_exposes_shared_handshake_and_health() {
         .expect("host service catalog should succeed");
     assert_eq!(catalog.server_kind, BridgeServerKind::Host);
     assert_eq!(catalog.services.len(), 2);
-    assert!(catalog
-        .services
-        .iter()
-        .any(|service| service.service_name == "shadow-host-vscode"));
-        assert!(catalog
+    assert!(
+        catalog
             .services
             .iter()
-            .any(|service| service.service_name == "shadow-host-idea"));
-        assert!(catalog
-        .services
-        .iter()
-        .all(|service| service.capabilities.contains(&"command:OpenFile".to_string())));
+            .any(|service| service.service_name == "shadow-host-vscode")
+    );
+    assert!(
+        catalog
+            .services
+            .iter()
+            .any(|service| service.service_name == "shadow-host-idea")
+    );
+    assert!(catalog.services.iter().all(|service| {
+        service
+            .capabilities
+            .contains(&"command:OpenFile".to_string())
+    }));
     assert!(catalog.services.iter().all(|service| {
         service
             .capabilities
@@ -182,18 +206,24 @@ fn host_loopback_exposes_shared_handshake_and_health() {
             .capabilities
             .contains(&"shell_profile:shadow-host-shell-profile-v1".to_string())
     }));
-    assert!(catalog
-        .services
-        .iter()
-        .all(|service| service.shell_manifest.as_ref().is_some()));
-    assert!(catalog
-        .services
-        .iter()
-        .all(|service| service.shell_profile.as_ref().is_some()));
-    assert!(catalog
-        .services
-        .iter()
-        .all(|service| service.command_capability_profiles.as_ref().is_some()));
+    assert!(
+        catalog
+            .services
+            .iter()
+            .all(|service| service.shell_manifest.as_ref().is_some())
+    );
+    assert!(
+        catalog
+            .services
+            .iter()
+            .all(|service| service.shell_profile.as_ref().is_some())
+    );
+    assert!(
+        catalog
+            .services
+            .iter()
+            .all(|service| service.command_capability_profiles.as_ref().is_some())
+    );
     let vscode_service = catalog
         .services
         .iter()
@@ -270,9 +300,10 @@ fn host_loopback_exposes_shared_handshake_and_health() {
 #[test]
 fn host_catalog_reflects_env_configured_workspace_roots() {
     let workspace_root = temp_dir("env-root");
-    let probe = JsonRpcBridgeServerProbeClient::new(Arc::new(loopback_transport_with_env(&[
-        ("MAGI_VSCODE_PREHOST_WORKSPACE_ROOTS", &workspace_root),
-    ])));
+    let probe = JsonRpcBridgeServerProbeClient::new(Arc::new(loopback_transport_with_env(&[(
+        "MAGI_VSCODE_PREHOST_WORKSPACE_ROOTS",
+        &workspace_root,
+    )])));
 
     let catalog = probe
         .describe_services()
@@ -288,9 +319,10 @@ fn host_catalog_reflects_env_configured_workspace_roots() {
     );
     assert_eq!(vscode_service.service_health.as_deref(), Some("healthy"));
 
-    let client = JsonRpcHostBridgeClient::new(Arc::new(loopback_transport_with_env(&[
-        ("MAGI_VSCODE_PREHOST_WORKSPACE_ROOTS", &workspace_root),
-    ])));
+    let client = JsonRpcHostBridgeClient::new(Arc::new(loopback_transport_with_env(&[(
+        "MAGI_VSCODE_PREHOST_WORKSPACE_ROOTS",
+        &workspace_root,
+    )])));
     let response = client
         .call(HostBridgeRequest {
             host_kind: HostKind::Vscode,
@@ -314,9 +346,10 @@ fn host_catalog_reflects_env_configured_workspace_roots() {
 
 #[test]
 fn vscode_prehost_reports_unavailable_when_workspace_roots_invalid() {
-    let probe = JsonRpcBridgeServerProbeClient::new(Arc::new(loopback_transport_with_env(&[
-        ("MAGI_VSCODE_PREHOST_WORKSPACE_ROOTS", "/definitely/missing/root"),
-    ])));
+    let probe = JsonRpcBridgeServerProbeClient::new(Arc::new(loopback_transport_with_env(&[(
+        "MAGI_VSCODE_PREHOST_WORKSPACE_ROOTS",
+        "/definitely/missing/root",
+    )])));
 
     let catalog = probe
         .describe_services()
@@ -326,15 +359,19 @@ fn vscode_prehost_reports_unavailable_when_workspace_roots_invalid() {
         .iter()
         .find(|service| service.service_name == "shadow-host-vscode")
         .expect("vscode host service should exist");
-    assert_eq!(vscode_service.service_health.as_deref(), Some("unavailable"));
+    assert_eq!(
+        vscode_service.service_health.as_deref(),
+        Some("unavailable")
+    );
     assert_eq!(
         vscode_service.service_health_reason.as_deref(),
         Some("no valid workspace roots resolved")
     );
 
-    let client = JsonRpcHostBridgeClient::new(Arc::new(loopback_transport_with_env(&[
-        ("MAGI_VSCODE_PREHOST_WORKSPACE_ROOTS", "/definitely/missing/root"),
-    ])));
+    let client = JsonRpcHostBridgeClient::new(Arc::new(loopback_transport_with_env(&[(
+        "MAGI_VSCODE_PREHOST_WORKSPACE_ROOTS",
+        "/definitely/missing/root",
+    )])));
     let error = client
         .call(HostBridgeRequest {
             host_kind: HostKind::Vscode,
@@ -402,16 +439,20 @@ fn host_client_round_trips_open_file() {
     assert_eq!(payload["details"]["line"], 12);
     assert_eq!(payload["details"]["column"], 4);
     assert_eq!(payload["details"]["file_type"], "file");
-    assert_eq!(payload["details"]["implementation_mode"], "filesystem-prehost");
+    assert_eq!(
+        payload["details"]["implementation_mode"],
+        "filesystem-prehost"
+    );
 }
 
 #[test]
 fn vscode_open_file_rejects_paths_outside_configured_workspace_roots() {
     let workspace_root = temp_dir("bounded-root");
     let outside_path = temp_file("outside-open-file", "fn outside() {}\n");
-    let client = JsonRpcHostBridgeClient::new(Arc::new(loopback_transport_with_env(&[
-        ("MAGI_VSCODE_PREHOST_WORKSPACE_ROOTS", &workspace_root),
-    ])));
+    let client = JsonRpcHostBridgeClient::new(Arc::new(loopback_transport_with_env(&[(
+        "MAGI_VSCODE_PREHOST_WORKSPACE_ROOTS",
+        &workspace_root,
+    )])));
 
     let error = client
         .call(HostBridgeRequest {
@@ -466,7 +507,10 @@ fn host_client_round_trips_reveal_diff() {
             .to_string()
     );
     assert_eq!(payload["details"]["same_content"], false);
-    assert_eq!(payload["details"]["implementation_mode"], "filesystem-prehost");
+    assert_eq!(
+        payload["details"]["implementation_mode"],
+        "filesystem-prehost"
+    );
 }
 
 #[test]
@@ -475,9 +519,10 @@ fn vscode_reveal_diff_rejects_paths_outside_configured_workspace_roots() {
     let inside_path = std::path::PathBuf::from(&workspace_root).join("inside.rs");
     fs::write(&inside_path, "fn inside() {}\n").expect("inside file should be writable");
     let outside_path = temp_file("outside-diff-file", "fn outside() {}\n");
-    let client = JsonRpcHostBridgeClient::new(Arc::new(loopback_transport_with_env(&[
-        ("MAGI_VSCODE_PREHOST_WORKSPACE_ROOTS", &workspace_root),
-    ])));
+    let client = JsonRpcHostBridgeClient::new(Arc::new(loopback_transport_with_env(&[(
+        "MAGI_VSCODE_PREHOST_WORKSPACE_ROOTS",
+        &workspace_root,
+    )])));
 
     let error = client
         .call(HostBridgeRequest {
@@ -525,7 +570,10 @@ fn host_client_round_trips_read_diagnostics() {
             .to_string()
     );
     assert_eq!(payload["details"]["analysis_mode"], "prehost-static-scan");
-    assert_eq!(payload["details"]["diagnostics"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        payload["details"]["diagnostics"].as_array().unwrap().len(),
+        3
+    );
 }
 
 #[test]
@@ -663,10 +711,8 @@ fn unsupported_method_returns_protocol_error() {
 
 #[test]
 fn broken_subprocess_returns_transport_error() {
-    let transport = JsonRpcStdioTransport::new("sh").with_args(vec![
-        "-c".to_string(),
-        "exit 2".to_string(),
-    ]);
+    let transport =
+        JsonRpcStdioTransport::new("sh").with_args(vec!["-c".to_string(), "exit 2".to_string()]);
 
     let error = transport
         .call(BridgeTransportRequest {

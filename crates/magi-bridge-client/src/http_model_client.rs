@@ -1,9 +1,13 @@
+use crate::protocol::{ProviderFamily, SseLineParser, StreamAccumulator, parse_stream_event};
 use crate::types::{
-    BridgeClientError, BridgeErrorLayer, BridgeResponse, ModelBridgeClient, ModelInvocationRequest,
+    BridgeClientError, BridgeErrorLayer, BridgeResponse, ChatCompletionPayload, ChatToolCall,
+    ChatToolFunction, ModelBridgeClient, ModelInvocationRequest, ModelStreamEvent,
 };
 use serde::Deserialize;
 use serde_json::json;
 use std::env;
+use std::io::Read;
+use std::sync::mpsc;
 
 const OPENAI_BASE_URL_ENV: &str = "MAGI_OPENAI_COMPAT_BASE_URL";
 const OPENAI_API_KEY_ENV: &str = "MAGI_OPENAI_COMPAT_API_KEY";
@@ -28,8 +32,7 @@ impl HttpModelBridgeClient {
     pub fn from_env() -> Option<Self> {
         let base_url = read_non_empty_env(OPENAI_BASE_URL_ENV)?;
         let api_key = read_non_empty_env(OPENAI_API_KEY_ENV);
-        let model = read_non_empty_env(OPENAI_MODEL_ENV)
-            .unwrap_or_else(|| "gpt-4".to_string());
+        let model = read_non_empty_env(OPENAI_MODEL_ENV).unwrap_or_else(|| "gpt-4".to_string());
         Some(Self::new(base_url, api_key, model))
     }
 
@@ -54,6 +57,14 @@ impl HttpModelBridgeClient {
 
     /// Build the JSON body for a chat completions request.
     pub(crate) fn build_request_body(&self, request: &ModelInvocationRequest) -> serde_json::Value {
+        self.build_request_body_with_stream(request, false)
+    }
+
+    pub(crate) fn build_request_body_with_stream(
+        &self,
+        request: &ModelInvocationRequest,
+        stream: bool,
+    ) -> serde_json::Value {
         let messages = if let Some(ref msgs) = request.messages {
             serde_json::to_value(msgs).unwrap_or_else(|_| json!([]))
         } else {
@@ -62,7 +73,7 @@ impl HttpModelBridgeClient {
         let mut body = json!({
             "model": self.model,
             "messages": messages,
-            "stream": false,
+            "stream": stream,
         });
         if let Some(ref tools) = request.tools {
             if !tools.is_empty() {
@@ -106,22 +117,22 @@ fn execute_http_post(
             req_builder = req_builder.header("Authorization", format!("Bearer {key}"));
         }
 
-        let response = req_builder.send().map_err(|error| {
-            BridgeClientError::CallFailed {
+        let response = req_builder
+            .send()
+            .map_err(|error| BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::Transport,
                 code: Some(-32005),
                 message: format!("provider transport failed: {error}"),
-            }
-        })?;
+            })?;
 
         let status = response.status().as_u16();
-        let response_body = response.text().map_err(|error| {
-            BridgeClientError::CallFailed {
+        let response_body = response
+            .text()
+            .map_err(|error| BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::Transport,
                 code: Some(-32005),
                 message: format!("reading response body failed: {error}"),
-            }
-        })?;
+            })?;
 
         Ok((status, response_body))
     })
@@ -133,11 +144,69 @@ fn execute_http_post(
     })?
 }
 
+enum StreamThreadEvent {
+    Chunk(ModelStreamEvent),
+    Finished(Result<BridgeResponse, BridgeClientError>),
+}
+
+fn build_transport_error(message: impl Into<String>) -> BridgeClientError {
+    BridgeClientError::CallFailed {
+        layer: BridgeErrorLayer::Transport,
+        code: Some(-32005),
+        message: message.into(),
+    }
+}
+
+fn build_remote_business_error(message: impl Into<String>) -> BridgeClientError {
+    BridgeClientError::CallFailed {
+        layer: BridgeErrorLayer::RemoteBusiness,
+        code: Some(-32006),
+        message: message.into(),
+    }
+}
+
+fn build_protocol_error(message: impl Into<String>) -> BridgeClientError {
+    BridgeClientError::CallFailed {
+        layer: BridgeErrorLayer::RemoteBusiness,
+        code: Some(-32007),
+        message: message.into(),
+    }
+}
+
+fn convert_stream_tool_call(tool_call: crate::llm_types::ToolCall) -> ChatToolCall {
+    ChatToolCall {
+        id: tool_call.id,
+        kind: "function".to_string(),
+        function: ChatToolFunction {
+            name: tool_call.name,
+            arguments: tool_call
+                .raw_arguments
+                .unwrap_or_else(|| tool_call.arguments.to_string()),
+        },
+    }
+}
+
+fn build_stream_bridge_response(
+    content: String,
+    finish_reason: String,
+    tool_calls: Vec<crate::llm_types::ToolCall>,
+) -> Result<BridgeResponse, BridgeClientError> {
+    let payload = ChatCompletionPayload {
+        content: (!content.is_empty()).then_some(content),
+        finish_reason: (!finish_reason.is_empty()).then_some(finish_reason),
+        tool_calls: tool_calls
+            .into_iter()
+            .map(convert_stream_tool_call)
+            .collect(),
+    };
+    let payload = serde_json::to_string(&payload).map_err(|error| {
+        build_protocol_error(format!("serialize stream payload failed: {error}"))
+    })?;
+    Ok(BridgeResponse { ok: true, payload })
+}
+
 impl ModelBridgeClient for HttpModelBridgeClient {
-    fn invoke(
-        &self,
-        request: ModelInvocationRequest,
-    ) -> Result<BridgeResponse, BridgeClientError> {
+    fn invoke(&self, request: ModelInvocationRequest) -> Result<BridgeResponse, BridgeClientError> {
         if request.prompt.trim().is_empty() && request.messages.is_none() {
             return Err(BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::RemoteBusiness,
@@ -149,55 +218,173 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         let url = self.chat_completions_url()?;
         let body = self.build_request_body(&request);
 
-        let (status, response_body) =
-            execute_http_post(url, body, self.api_key.clone())?;
+        let (status, response_body) = execute_http_post(url, body, self.api_key.clone())?;
+        parse_openai_chat_completion_response(status, &response_body)
+    }
 
-        if !(200..300).contains(&status) {
-            // Attempt to extract OpenAI-style error details
-            if let Ok(error_envelope) =
-                serde_json::from_str::<OpenAiCompatibleErrorEnvelope>(&response_body)
-            {
-                return Err(BridgeClientError::CallFailed {
-                    layer: BridgeErrorLayer::RemoteBusiness,
-                    code: Some(-32006),
-                    message: format!(
-                        "provider rejected request: {} (http_status={status})",
-                        error_envelope.error.message
-                    ),
-                });
-            }
+    fn invoke_stream(
+        &self,
+        request: ModelInvocationRequest,
+        on_event: &mut dyn FnMut(ModelStreamEvent),
+    ) -> Result<BridgeResponse, BridgeClientError> {
+        if request.prompt.trim().is_empty() && request.messages.is_none() {
             return Err(BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::RemoteBusiness,
-                code: Some(-32006),
-                message: format!(
-                    "provider rejected request: http_status={status}, body={}",
-                    truncate_body(&response_body)
-                ),
+                code: Some(-32002),
+                message: "empty prompt".to_string(),
             });
         }
 
-        let envelope: OpenAiCompatibleChatCompletionEnvelope =
-            serde_json::from_str(&response_body).map_err(|error| {
-                BridgeClientError::CallFailed {
-                    layer: BridgeErrorLayer::RemoteBusiness,
-                    code: Some(-32007),
-                    message: format!(
-                        "provider response invalid: decode chat completion failed: {error}"
-                    ),
-                }
-            })?;
+        let url = self.chat_completions_url()?;
+        let body = self.build_request_body_with_stream(&request, true);
+        let api_key = self.api_key.clone();
+        let (sender, receiver) = mpsc::channel();
 
-        let payload =
-            select_openai_bridge_payload(envelope.choices, envelope.usage).map_err(|reason| {
-                BridgeClientError::CallFailed {
-                    layer: BridgeErrorLayer::RemoteBusiness,
-                    code: Some(-32007),
-                    message: format!("provider response invalid: {reason}"),
-                }
-            })?;
+        std::thread::spawn(move || {
+            let result = execute_openai_stream_request(url, body, api_key, &sender);
+            let _ = sender.send(StreamThreadEvent::Finished(result));
+        });
 
-        Ok(BridgeResponse { ok: true, payload })
+        loop {
+            match receiver.recv().map_err(|error| {
+                build_transport_error(format!("stream channel closed unexpectedly: {error}"))
+            })? {
+                StreamThreadEvent::Chunk(event) => on_event(event),
+                StreamThreadEvent::Finished(result) => return result,
+            }
+        }
     }
+}
+
+fn parse_openai_chat_completion_response(
+    status: u16,
+    response_body: &str,
+) -> Result<BridgeResponse, BridgeClientError> {
+    if !(200..300).contains(&status) {
+        if let Ok(error_envelope) =
+            serde_json::from_str::<OpenAiCompatibleErrorEnvelope>(response_body)
+        {
+            return Err(build_remote_business_error(format!(
+                "provider rejected request: {} (http_status={status})",
+                error_envelope.error.message
+            )));
+        }
+        return Err(build_remote_business_error(format!(
+            "provider rejected request: http_status={status}, body={}",
+            truncate_body(response_body)
+        )));
+    }
+
+    let envelope: OpenAiCompatibleChatCompletionEnvelope = serde_json::from_str(response_body)
+        .map_err(|error| {
+            build_protocol_error(format!(
+                "provider response invalid: decode chat completion failed: {error}"
+            ))
+        })?;
+
+    let payload = select_openai_bridge_payload(envelope.choices, envelope.usage)
+        .map_err(|reason| build_protocol_error(format!("provider response invalid: {reason}")))?;
+
+    Ok(BridgeResponse { ok: true, payload })
+}
+
+fn execute_openai_stream_request(
+    url: String,
+    body: serde_json::Value,
+    api_key: Option<String>,
+    sender: &mpsc::Sender<StreamThreadEvent>,
+) -> Result<BridgeResponse, BridgeClientError> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|error| build_transport_error(format!("HTTP client build failed: {error}")))?;
+
+    let mut req_builder = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream, application/json")
+        .json(&body);
+
+    if let Some(ref key) = api_key {
+        req_builder = req_builder.header("Authorization", format!("Bearer {key}"));
+    }
+
+    let mut response = req_builder
+        .send()
+        .map_err(|error| build_transport_error(format!("provider transport failed: {error}")))?;
+
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if !content_type.contains("text/event-stream") {
+        let response_body = response.text().map_err(|error| {
+            build_transport_error(format!("reading response body failed: {error}"))
+        })?;
+        return parse_openai_chat_completion_response(status, &response_body);
+    }
+
+    if !(200..300).contains(&status) {
+        let response_body = response.text().map_err(|error| {
+            build_transport_error(format!("reading error stream failed: {error}"))
+        })?;
+        return parse_openai_chat_completion_response(status, &response_body);
+    }
+
+    let mut parser = SseLineParser::new();
+    let mut accumulator = StreamAccumulator::new();
+    let mut chunk = [0_u8; 8192];
+
+    loop {
+        let read = response.read(&mut chunk).map_err(|error| {
+            build_transport_error(format!("reading event stream failed: {error}"))
+        })?;
+        if read == 0 {
+            break;
+        }
+        let text = String::from_utf8_lossy(&chunk[..read]);
+        let events = parser.feed(&text);
+        for event in events {
+            let chunks = parse_stream_event(ProviderFamily::OpenAiChat, &event);
+            for stream_chunk in &chunks {
+                match stream_chunk.kind {
+                    crate::llm_types::LlmStreamChunkType::ContentDelta
+                    | crate::llm_types::LlmStreamChunkType::ContentStart => {
+                        if let Some(delta) = stream_chunk
+                            .content
+                            .clone()
+                            .filter(|delta| !delta.is_empty())
+                        {
+                            let _ = sender.send(StreamThreadEvent::Chunk(
+                                ModelStreamEvent::ContentDelta { delta },
+                            ));
+                        }
+                    }
+                    crate::llm_types::LlmStreamChunkType::Thinking => {
+                        if let Some(delta) = stream_chunk
+                            .thinking
+                            .clone()
+                            .filter(|delta| !delta.is_empty())
+                        {
+                            let _ = sender.send(StreamThreadEvent::Chunk(
+                                ModelStreamEvent::ThinkingDelta { delta },
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            accumulator.apply_all(&chunks);
+        }
+    }
+
+    let adapted = accumulator.finalize();
+    build_stream_bridge_response(adapted.content, adapted.stop_reason, adapted.tool_calls)
 }
 
 // ---------------------------------------------------------------------------
@@ -222,10 +409,7 @@ struct OpenAiCompatibleChatChoice {
 }
 
 impl OpenAiCompatibleChatChoice {
-    fn into_payload(
-        self,
-        usage: Option<OpenAiCompatibleUsage>,
-    ) -> OpenAiCompatibleSuccessPayload {
+    fn into_payload(self, usage: Option<OpenAiCompatibleUsage>) -> OpenAiCompatibleSuccessPayload {
         let (content, tool_calls) = match self.message {
             Some(message) => (
                 message
@@ -461,7 +645,10 @@ mod tests {
         unsafe { env::remove_var(OPENAI_BASE_URL_ENV) };
 
         let result = HttpModelBridgeClient::from_env();
-        assert!(result.is_none(), "from_env() should return None without BASE_URL");
+        assert!(
+            result.is_none(),
+            "from_env() should return None without BASE_URL"
+        );
 
         // Restore if it was set.
         if let Some(value) = saved {
@@ -536,11 +723,8 @@ mod tests {
             "https://api.example.com/v1/chat/completions"
         );
 
-        let client3 = HttpModelBridgeClient::new(
-            "not-a-url".to_string(),
-            None,
-            "gpt-4".to_string(),
-        );
+        let client3 =
+            HttpModelBridgeClient::new("not-a-url".to_string(), None, "gpt-4".to_string());
         assert!(client3.chat_completions_url().is_err());
 
         let client4 = HttpModelBridgeClient::new(
@@ -588,16 +772,13 @@ mod tests {
                 let read = stream.read(&mut chunk).expect("should read");
                 assert!(read > 0, "should receive data");
                 buffer.extend_from_slice(&chunk[..read]);
-                if let Some(pos) = buffer
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                {
+                if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
                     break pos + 4;
                 }
             };
 
-            let header_text = String::from_utf8(buffer[..header_end].to_vec())
-                .expect("headers should be utf-8");
+            let header_text =
+                String::from_utf8(buffer[..header_end].to_vec()).expect("headers should be utf-8");
             let mut lines = header_text.split("\r\n");
             let request_line = lines.next().expect("request line should exist").to_string();
             let mut authorization = None;
@@ -623,9 +804,8 @@ mod tests {
                 buffer.extend_from_slice(&chunk[..read]);
             }
 
-            let body =
-                String::from_utf8(buffer[header_end..header_end + content_length].to_vec())
-                    .expect("body should be utf-8");
+            let body = String::from_utf8(buffer[header_end..header_end + content_length].to_vec())
+                .expect("body should be utf-8");
 
             // Parse method and path from request line
             let parts: Vec<&str> = request_line.split_whitespace().collect();
@@ -808,8 +988,7 @@ mod tests {
     fn invoke_against_unreachable_server_returns_transport_error() {
         // Bind and immediately drop to get an unreachable port.
         let address = {
-            let listener =
-                TcpListener::bind("127.0.0.1:0").expect("ephemeral bind should succeed");
+            let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral bind should succeed");
             let addr = listener.local_addr().expect("address should exist");
             drop(listener);
             addr

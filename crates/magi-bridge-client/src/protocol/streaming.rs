@@ -1,9 +1,7 @@
 use serde_json::Value;
 
-use crate::llm_types::{
-    LlmStreamChunk, LlmStreamChunkType, LlmUsage, PartialToolCall, ToolCall,
-};
 use super::adapter::{AdaptedResponse, ProviderFamily};
+use crate::llm_types::{LlmStreamChunk, LlmStreamChunkType, LlmUsage, PartialToolCall, ToolCall};
 
 #[derive(Clone, Debug, Default)]
 pub struct SseLineParser {
@@ -28,7 +26,9 @@ impl SseLineParser {
         let mut data_lines: Vec<String> = Vec::new();
 
         while let Some(newline_pos) = self.buffer.find('\n') {
-            let line = self.buffer[..newline_pos].trim_end_matches('\r').to_string();
+            let line = self.buffer[..newline_pos]
+                .trim_end_matches('\r')
+                .to_string();
             self.buffer = self.buffer[newline_pos + 1..].to_string();
 
             if line.is_empty() {
@@ -42,11 +42,14 @@ impl SseLineParser {
                 continue;
             }
 
-            if let Some(value) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:"))
+            if let Some(value) = line
+                .strip_prefix("data: ")
+                .or_else(|| line.strip_prefix("data:"))
             {
                 data_lines.push(value.to_string());
-            } else if let Some(value) =
-                line.strip_prefix("event: ").or_else(|| line.strip_prefix("event:"))
+            } else if let Some(value) = line
+                .strip_prefix("event: ")
+                .or_else(|| line.strip_prefix("event:"))
             {
                 self.current_event_type = Some(value.trim().to_string());
             }
@@ -56,10 +59,7 @@ impl SseLineParser {
     }
 }
 
-pub fn parse_stream_event(
-    family: ProviderFamily,
-    event: &SseEvent,
-) -> Vec<LlmStreamChunk> {
+pub fn parse_stream_event(family: ProviderFamily, event: &SseEvent) -> Vec<LlmStreamChunk> {
     match family {
         ProviderFamily::OpenAiChat | ProviderFamily::OpenAiResponses => {
             parse_openai_stream_data(&event.data)
@@ -67,9 +67,7 @@ pub fn parse_stream_event(
         ProviderFamily::Anthropic => {
             parse_anthropic_stream_event(event.event_type.as_deref(), &event.data)
         }
-        ProviderFamily::Gemini => {
-            parse_openai_stream_data(&event.data)
-        }
+        ProviderFamily::Gemini => parse_openai_stream_data(&event.data),
     }
 }
 
@@ -175,10 +173,7 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
     chunks
 }
 
-fn parse_anthropic_stream_event(
-    event_type: Option<&str>,
-    data: &str,
-) -> Vec<LlmStreamChunk> {
+fn parse_anthropic_stream_event(event_type: Option<&str>, data: &str) -> Vec<LlmStreamChunk> {
     let Ok(envelope) = serde_json::from_str::<Value>(data) else {
         return Vec::new();
     };
@@ -399,15 +394,13 @@ impl StreamAccumulator {
             })
             .collect();
 
-        let stop_reason = self
-            .stop_reason
-            .unwrap_or_else(|| {
-                if tool_calls.is_empty() {
-                    "end_turn".to_string()
-                } else {
-                    "tool_use".to_string()
-                }
-            });
+        let stop_reason = self.stop_reason.unwrap_or_else(|| {
+            if tool_calls.is_empty() {
+                "end_turn".to_string()
+            } else {
+                "tool_use".to_string()
+            }
+        });
 
         AdaptedResponse {
             content: self.content_parts.join(""),
@@ -451,10 +444,7 @@ mod tests {
 
         let events = parser.feed("event: content_block_delta\ndata: {\"delta\":{}}\n\n");
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].event_type.as_deref(),
-            Some("content_block_delta")
-        );
+        assert_eq!(events[0].event_type.as_deref(), Some("content_block_delta"));
     }
 
     #[test]
@@ -526,11 +516,18 @@ mod tests {
 
     #[test]
     fn openai_stream_parses_finish_reason() {
-        let data =
-            r#"{"choices":[{"delta":{"content":"end"},"finish_reason":"stop"}]}"#;
+        let data = r#"{"choices":[{"delta":{"content":"end"},"finish_reason":"stop"}]}"#;
         let chunks = parse_openai_stream_data(data);
-        assert!(chunks.iter().any(|c| c.kind == LlmStreamChunkType::ContentDelta));
-        assert!(chunks.iter().any(|c| c.kind == LlmStreamChunkType::ContentEnd));
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.kind == LlmStreamChunkType::ContentDelta)
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.kind == LlmStreamChunkType::ContentEnd)
+        );
     }
 
     #[test]
@@ -550,10 +547,8 @@ mod tests {
         assert_eq!(delta_chunks[0].kind, LlmStreamChunkType::ContentDelta);
         assert_eq!(delta_chunks[0].content.as_deref(), Some("Hello"));
 
-        let stop_chunks = parse_anthropic_stream_event(
-            Some("content_block_stop"),
-            r#"{"index":0}"#,
-        );
+        let stop_chunks =
+            parse_anthropic_stream_event(Some("content_block_stop"), r#"{"index":0}"#);
         assert_eq!(stop_chunks.len(), 1);
         assert_eq!(stop_chunks[0].kind, LlmStreamChunkType::ContentEnd);
     }

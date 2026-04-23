@@ -25,7 +25,10 @@ pub fn extract_structured_dispatch(response: &LlmResponse) -> Option<StructuredD
 
     if let Ok(parsed) = serde_json::from_str::<Value>(&response.content) {
         if let Some(name) = parsed.get("tool").and_then(|v| v.as_str()) {
-            let args = parsed.get("arguments").cloned().unwrap_or(Value::Object(Default::default()));
+            let args = parsed
+                .get("arguments")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default()));
             return Some(StructuredDispatchResult {
                 tool_name: name.to_string(),
                 arguments: args,

@@ -1,4 +1,4 @@
-use crate::micro_compaction::{estimate_token_count, LlmContent, LlmMessage};
+use crate::micro_compaction::{LlmContent, LlmMessage, estimate_token_count};
 
 const AUTOCOMPACT_BUFFER_TOKENS: u64 = 13_000;
 const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES: u32 = 3;
@@ -151,8 +151,7 @@ pub fn try_session_memory_compaction(
     let threshold = get_auto_compact_threshold(config);
     let pre_compact_tokens = estimate_history_tokens(history);
 
-    let target_tokens = SM_COMPACT_MAX_TOKENS
-        .min(SM_COMPACT_MIN_TOKENS.max(threshold / 2));
+    let target_tokens = SM_COMPACT_MAX_TOKENS.min(SM_COMPACT_MIN_TOKENS.max(threshold / 2));
 
     let session_memory_tokens = estimate_token_count(&sm.summary);
     let available_for_messages = target_tokens.saturating_sub(session_memory_tokens);
@@ -193,8 +192,7 @@ pub fn try_session_memory_compaction(
         return AutoCompactResult::with_error("nothing to compact");
     }
 
-    let retained_messages: Vec<LlmMessage> =
-        history.split_off(history.len() - retained_count);
+    let retained_messages: Vec<LlmMessage> = history.split_off(history.len() - retained_count);
 
     let summary_message = LlmMessage {
         role: "user".to_string(),

@@ -1,8 +1,8 @@
 use magi_core::UtcMillis;
 
 use crate::base::{
-    flush_pending_thinking_to_blocks, BaseNormalizer, CallerContext, NormalizerConfig,
-    NormalizerEvent,
+    BaseNormalizer, CallerContext, NormalizerConfig, NormalizerEvent,
+    flush_pending_thinking_to_blocks,
 };
 use crate::types::*;
 
@@ -34,7 +34,11 @@ impl ClaudeNormalizer {
     pub fn parse_chunk(&mut self, message_id: &str, chunk: &str) {
         self.json_buffer.push_str(chunk);
 
-        let owned_lines: Vec<String> = self.json_buffer.split('\n').map(|s| s.to_string()).collect();
+        let owned_lines: Vec<String> = self
+            .json_buffer
+            .split('\n')
+            .map(|s| s.to_string())
+            .collect();
         let last = owned_lines.last().cloned().unwrap_or_default();
         let complete_count = owned_lines.len().saturating_sub(1);
         self.json_buffer = last;
@@ -46,13 +50,12 @@ impl ClaudeNormalizer {
             }
             match serde_json::from_str::<serde_json::Value>(trimmed) {
                 Ok(event) => {
-                    let unwrapped = if event.get("type").and_then(|t| t.as_str())
-                        == Some("stream_event")
-                    {
-                        event.get("event").cloned().unwrap_or(event)
-                    } else {
-                        event
-                    };
+                    let unwrapped =
+                        if event.get("type").and_then(|t| t.as_str()) == Some("stream_event") {
+                            event.get("event").cloned().unwrap_or(event)
+                        } else {
+                            event
+                        };
                     self.process_event(message_id, &unwrapped);
                 }
                 Err(_) => {
@@ -67,7 +70,11 @@ impl ClaudeNormalizer {
         let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         if event_type == "assistant" {
-            if let Some(content) = event.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+            if let Some(content) = event
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            {
                 for block in content {
                     if block.get("type").and_then(|t| t.as_str()) == Some("text") {
                         if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
@@ -83,14 +90,12 @@ impl ClaudeNormalizer {
             let text = event
                 .get("result")
                 .and_then(|r| {
-                    r.as_str()
-                        .map(|s| s.to_string())
-                        .or_else(|| {
-                            r.get("content")
-                                .or(r.get("output"))
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                        })
+                    r.as_str().map(|s| s.to_string()).or_else(|| {
+                        r.get("content")
+                            .or(r.get("output"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
                 })
                 .unwrap_or_default();
             if !text.is_empty() {
@@ -137,25 +142,19 @@ impl ClaudeNormalizer {
                     match delta_type {
                         "text_delta" => {
                             if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                                if let Some(ctx) =
-                                    self.normalizer.get_context_mut(message_id)
-                                {
+                                if let Some(ctx) = self.normalizer.get_context_mut(message_id) {
                                     flush_pending_thinking_to_blocks(ctx);
                                 }
                                 self.normalizer.process_text_delta(message_id, text);
                             }
                         }
                         "thinking_delta" => {
-                            if let Some(thinking) =
-                                delta.get("thinking").and_then(|t| t.as_str())
-                            {
+                            if let Some(thinking) = delta.get("thinking").and_then(|t| t.as_str()) {
                                 self.normalizer.process_thinking(message_id, thinking);
                             }
                         }
                         "input_json_delta" => {
-                            if let Some(json) =
-                                delta.get("partial_json").and_then(|t| t.as_str())
-                            {
+                            if let Some(json) = delta.get("partial_json").and_then(|t| t.as_str()) {
                                 self.pending_tool_input_json.push_str(json);
                             }
                         }
@@ -168,16 +167,13 @@ impl ClaudeNormalizer {
                     if let Some(ctx) = self.normalizer.get_context_mut(message_id) {
                         if let Some(tool_id) = ctx.active_tool_calls.keys().last().cloned() {
                             if let Some(tc) = ctx.active_tool_calls.get_mut(&tool_id) {
-                                let formatted =
-                                    match serde_json::from_str::<serde_json::Value>(
-                                        &self.pending_tool_input_json,
-                                    ) {
-                                        Ok(v) => serde_json::to_string_pretty(&v)
-                                            .unwrap_or_else(|_| {
-                                                self.pending_tool_input_json.clone()
-                                            }),
-                                        Err(_) => self.pending_tool_input_json.clone(),
-                                    };
+                                let formatted = match serde_json::from_str::<serde_json::Value>(
+                                    &self.pending_tool_input_json,
+                                ) {
+                                    Ok(v) => serde_json::to_string_pretty(&v)
+                                        .unwrap_or_else(|_| self.pending_tool_input_json.clone()),
+                                    Err(_) => self.pending_tool_input_json.clone(),
+                                };
                                 tc.input = Some(formatted);
                                 let update = StreamUpdate::MergeBlock {
                                     message_id: message_id.to_string(),
@@ -216,12 +212,8 @@ impl ClaudeNormalizer {
                                 }
                             };
                             let _ = ctx;
-                            self.normalizer.finish_tool_call(
-                                message_id,
-                                &tool_id,
-                                output,
-                                error,
-                            );
+                            self.normalizer
+                                .finish_tool_call(message_id, &tool_id, output, error);
                         }
                     }
                 }

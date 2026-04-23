@@ -76,19 +76,30 @@ impl BridgeTransport for JsonRpcStdioTransport {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
-        let mut child = command.spawn().map_err(|error| BridgeTransportError::Transport {
-            message: format!("spawn {} failed: {error}", self.config.executable),
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|error| BridgeTransportError::Transport {
+                message: format!("spawn {} failed: {error}", self.config.executable),
+            })?;
 
-        let mut stdin = child.stdin.take().ok_or_else(|| BridgeTransportError::Transport {
-            message: format!("{} stdin unavailable", self.config.executable),
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| BridgeTransportError::Transport {
-            message: format!("{} stdout unavailable", self.config.executable),
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| BridgeTransportError::Transport {
-            message: format!("{} stderr unavailable", self.config.executable),
-        })?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| BridgeTransportError::Transport {
+                message: format!("{} stdin unavailable", self.config.executable),
+            })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| BridgeTransportError::Transport {
+                message: format!("{} stdout unavailable", self.config.executable),
+            })?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| BridgeTransportError::Transport {
+                message: format!("{} stderr unavailable", self.config.executable),
+            })?;
 
         let stdout_handle = thread::spawn(move || read_stream(stdout));
         let stderr_handle = thread::spawn(move || read_stream(stderr));
@@ -99,25 +110,34 @@ impl BridgeTransport for JsonRpcStdioTransport {
             method: request.method,
             params: request.params,
         };
-        let json =
-            serde_json::to_string(&json_rpc_request).map_err(|error| BridgeTransportError::Protocol {
+        let json = serde_json::to_string(&json_rpc_request).map_err(|error| {
+            BridgeTransportError::Protocol {
                 message: format!("serialize request failed: {error}"),
-            })?;
+            }
+        })?;
         writeln!(stdin, "{json}").map_err(|error| BridgeTransportError::Transport {
             message: format!("write request failed: {error}"),
         })?;
         drop(stdin);
 
-        let status = child.wait().map_err(|error| BridgeTransportError::Transport {
-            message: format!("wait {} failed: {error}", self.config.executable),
-        })?;
+        let status = child
+            .wait()
+            .map_err(|error| BridgeTransportError::Transport {
+                message: format!("wait {} failed: {error}", self.config.executable),
+            })?;
 
-        let stdout_bytes = stdout_handle.join().map_err(|_| BridgeTransportError::Transport {
-            message: "stdout reader thread panicked".to_string(),
-        })??;
-        let stderr_bytes = stderr_handle.join().map_err(|_| BridgeTransportError::Transport {
-            message: "stderr reader thread panicked".to_string(),
-        })??;
+        let stdout_bytes =
+            stdout_handle
+                .join()
+                .map_err(|_| BridgeTransportError::Transport {
+                    message: "stdout reader thread panicked".to_string(),
+                })??;
+        let stderr_bytes =
+            stderr_handle
+                .join()
+                .map_err(|_| BridgeTransportError::Transport {
+                    message: "stderr reader thread panicked".to_string(),
+                })??;
 
         if !status.success() {
             return Err(BridgeTransportError::Transport {
@@ -130,16 +150,16 @@ impl BridgeTransport for JsonRpcStdioTransport {
             });
         }
 
-        let stdout_text = String::from_utf8(stdout_bytes).map_err(|error| {
-            BridgeTransportError::Protocol {
+        let stdout_text =
+            String::from_utf8(stdout_bytes).map_err(|error| BridgeTransportError::Protocol {
                 message: format!("stdout is not utf-8: {error}"),
-            }
-        })?;
-        let envelope: JsonRpcResponseEnvelope = serde_json::from_str(stdout_text.trim()).map_err(
-            |error| BridgeTransportError::Protocol {
-                message: format!("parse response failed: {error}; body={stdout_text}"),
-            },
-        )?;
+            })?;
+        let envelope: JsonRpcResponseEnvelope =
+            serde_json::from_str(stdout_text.trim()).map_err(|error| {
+                BridgeTransportError::Protocol {
+                    message: format!("parse response failed: {error}; body={stdout_text}"),
+                }
+            })?;
 
         if envelope.jsonrpc != "2.0" {
             return Err(BridgeTransportError::Protocol {
@@ -176,9 +196,11 @@ impl BridgeTransport for JsonRpcStdioTransport {
             });
         }
 
-        let payload = envelope.result.ok_or_else(|| BridgeTransportError::Protocol {
-            message: "missing result and error in response".to_string(),
-        })?;
+        let payload = envelope
+            .result
+            .ok_or_else(|| BridgeTransportError::Protocol {
+                message: "missing result and error in response".to_string(),
+            })?;
 
         Ok(BridgeTransportResponse { payload })
     }

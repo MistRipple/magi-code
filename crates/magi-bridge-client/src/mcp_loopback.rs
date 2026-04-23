@@ -1,21 +1,20 @@
 use crate::{
-    local_process_protocol::{
-        run_local_process_bridge_server_with_methods, BridgeServerCommandCapabilityProfile,
-        BridgeServerContextResolutionBoundary, BridgeServerKind, BridgeServerServiceCatalog,
-        BridgeServerServiceDescriptor, LocalProcessBridgeRequest, LocalProcessBridgeRpcError,
-        LocalProcessBridgeServerError, LOCAL_BRIDGE_PROTOCOL_VERSION,
-    },
     BridgeResponse, McpManagerDescribeServerResponse,
     McpManagerLifecycleEvent as McpLifecycleEvent,
     McpManagerLifecycleEventKind as McpLifecycleEventKind, McpManagerListServersResponse,
-    McpManagerServerHealthUpdateRequest,
-    McpManagerServerLifecycleState as McpServerLifecycleState,
+    McpManagerServerHealthUpdateRequest, McpManagerServerLifecycleState as McpServerLifecycleState,
     McpManagerServerOperationResponse, McpManagerServerRegistrationRequest,
     McpManagerServerSelectionRequest, McpToolCallRequest, SHADOW_MCP_SERVER_NAME,
     SHADOW_MCP_TOOL_NAME,
+    local_process_protocol::{
+        BridgeServerCommandCapabilityProfile, BridgeServerContextResolutionBoundary,
+        BridgeServerKind, BridgeServerServiceCatalog, BridgeServerServiceDescriptor,
+        LOCAL_BRIDGE_PROTOCOL_VERSION, LocalProcessBridgeRequest, LocalProcessBridgeRpcError,
+        LocalProcessBridgeServerError, run_local_process_bridge_server_with_methods,
+    },
 };
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::env;
 
 const MCP_MANAGER_DEFAULT_SERVER_ENV: &str = "MAGI_MCP_MANAGER_DEFAULT_SERVER";
@@ -244,7 +243,11 @@ impl McpServerDescriptor {
             format!("lifecycle_state:{}", self.lifecycle_state),
             format!("tool_count:{}", self.tools.len()),
         ];
-        capabilities.extend(self.tools.iter().map(|tool| format!("tool:{}", tool.tool_name())));
+        capabilities.extend(
+            self.tools
+                .iter()
+                .map(|tool| format!("tool:{}", tool.tool_name())),
+        );
 
         BridgeServerServiceDescriptor {
             service_name: self.server_name.to_string(),
@@ -480,15 +483,18 @@ impl McpServerRegistry {
             .find_server_mut(server_name)
             .ok_or_else(|| format!("server {server_name} not found in registry"))?;
         if server.lifecycle_state == McpServerLifecycleState::Deregistered {
-            return Err(format!("server {} has been deregistered", server.server_name));
+            return Err(format!(
+                "server {} has been deregistered",
+                server.server_name
+            ));
         }
 
-        let target_health = if server.health_status == "disabled" || server.health_status == "unavailable"
-        {
-            "healthy"
-        } else {
-            server.health_status
-        };
+        let target_health =
+            if server.health_status == "disabled" || server.health_status == "unavailable" {
+                "healthy"
+            } else {
+                server.health_status
+            };
         if server.enabled
             && server.health_status == target_health
             && server.lifecycle_state == McpServerLifecycleState::Running
@@ -516,7 +522,10 @@ impl McpServerRegistry {
             .find_server_mut(server_name)
             .ok_or_else(|| format!("server {server_name} not found in registry"))?;
         if server.lifecycle_state == McpServerLifecycleState::Deregistered {
-            return Err(format!("server {} has been deregistered", server.server_name));
+            return Err(format!(
+                "server {} has been deregistered",
+                server.server_name
+            ));
         }
         if !server.enabled
             && server.health_status == "disabled"
@@ -541,7 +550,11 @@ impl McpServerRegistry {
     }
 
     fn register_server(&mut self, descriptor: McpServerDescriptor) -> bool {
-        if self.servers.iter().any(|s| s.server_name == descriptor.server_name) {
+        if self
+            .servers
+            .iter()
+            .any(|s| s.server_name == descriptor.server_name)
+        {
             return false;
         }
         let server_name = descriptor.server_name.to_string();
@@ -565,7 +578,10 @@ impl McpServerRegistry {
                 return Err(format!("server {} is already running", server.server_name));
             }
             McpServerLifecycleState::Deregistered => {
-                return Err(format!("server {} has been deregistered", server.server_name));
+                return Err(format!(
+                    "server {} has been deregistered",
+                    server.server_name
+                ));
             }
             _ => {}
         }
@@ -595,7 +611,10 @@ impl McpServerRegistry {
                 return Err(format!("server {} is already stopped", server.server_name));
             }
             McpServerLifecycleState::Deregistered => {
-                return Err(format!("server {} has been deregistered", server.server_name));
+                return Err(format!(
+                    "server {} has been deregistered",
+                    server.server_name
+                ));
             }
             _ => {}
         }
@@ -619,7 +638,10 @@ impl McpServerRegistry {
             .find_server_mut(server_name)
             .ok_or_else(|| format!("server {server_name} not found in registry"))?;
         if server.lifecycle_state == McpServerLifecycleState::Deregistered {
-            return Err(format!("server {} is already deregistered", server.server_name));
+            return Err(format!(
+                "server {} is already deregistered",
+                server.server_name
+            ));
         }
         let previous_state = server.lifecycle_state.clone();
         let canonical_name = server.server_name.to_string();
@@ -645,7 +667,10 @@ impl McpServerRegistry {
             .find_server_mut(server_name)
             .ok_or_else(|| format!("server {server_name} not found in registry"))?;
         if server.lifecycle_state == McpServerLifecycleState::Deregistered {
-            return Err(format!("server {} has been deregistered", server.server_name));
+            return Err(format!(
+                "server {} has been deregistered",
+                server.server_name
+            ));
         }
         let old_health = server.health_status;
         if old_health == new_health {
@@ -719,7 +744,8 @@ impl McpServerRegistry {
                 if server.health_status == "disabled" {
                     server.health_status = "healthy";
                 }
-                server.lifecycle_state = lifecycle_state_for_health(server.enabled, server.health_status);
+                server.lifecycle_state =
+                    lifecycle_state_for_health(server.enabled, server.health_status);
             } else {
                 self.config_issues.push(format!(
                     "enabled server target {enabled_server} does not match any registered server"
@@ -744,7 +770,11 @@ impl McpServerRegistry {
         }
 
         if let Ok(raw) = env::var(MCP_MANAGER_SERVER_HEALTHS_ENV) {
-            for override_pair in raw.split(',').map(str::trim).filter(|pair| !pair.is_empty()) {
+            for override_pair in raw
+                .split(',')
+                .map(str::trim)
+                .filter(|pair| !pair.is_empty())
+            {
                 let Some((server_name, health_status)) = override_pair.split_once('=') else {
                     self.config_issues.push(format!(
                         "health override {override_pair} is missing '=' separator"
@@ -781,11 +811,13 @@ impl McpServerRegistry {
     }
 
     fn configured_default_server(&self) -> Option<&McpServerDescriptor> {
-        self.default_server_preference.as_deref().and_then(|target| {
-            self.servers
-                .iter()
-                .find(|server| server.matches_requested_server(target))
-        })
+        self.default_server_preference
+            .as_deref()
+            .and_then(|target| {
+                self.servers
+                    .iter()
+                    .find(|server| server.matches_requested_server(target))
+            })
     }
 
     fn manager_service_health(&self) -> &'static str {
@@ -932,7 +964,8 @@ impl McpServerRegistry {
             selection_strategy: Some(self.selection_strategy.to_string()),
             default_server: default_server_name.map(str::to_string),
             default_server_health: default_server.map(|server| server.health_status.to_string()),
-            default_server_selection_key: default_server.map(|server| server.selection_key.to_string()),
+            default_server_selection_key: default_server
+                .map(|server| server.selection_key.to_string()),
             default_route_status: Some(default_route_status.to_string()),
             default_route_target: Some(default_route_target),
             selection_targets: Some(selection_targets),
@@ -973,7 +1006,8 @@ impl McpServerRegistry {
     }
 
     fn default_server_name(&self) -> Option<&'static str> {
-        self.default_server_descriptor().map(|server| server.server_name)
+        self.default_server_descriptor()
+            .map(|server| server.server_name)
     }
 
     fn default_server_descriptor(&self) -> Option<&McpServerDescriptor> {
@@ -982,9 +1016,7 @@ impl McpServerRegistry {
                 return Some(preferred_server);
             }
         }
-        self.servers
-            .iter()
-            .find(|server| server.is_routable())
+        self.servers.iter().find(|server| server.is_routable())
     }
 
     fn selection_targets(&self) -> Vec<String> {
@@ -1001,7 +1033,11 @@ impl McpServerRegistry {
 
     fn service_catalog(&self) -> BridgeServerServiceCatalog {
         let mut services = vec![self.manager_descriptor()];
-        services.extend(self.servers.iter().map(McpServerDescriptor::service_descriptor));
+        services.extend(
+            self.servers
+                .iter()
+                .map(McpServerDescriptor::service_descriptor),
+        );
         BridgeServerServiceCatalog {
             protocol_version: LOCAL_BRIDGE_PROTOCOL_VERSION.to_string(),
             server_kind: BridgeServerKind::Mcp,
@@ -1025,7 +1061,10 @@ impl McpServerRegistry {
             }
             MCP_ENABLE_SERVER_METHOD => {
                 let params: McpManagerServerSelectionRequest = decode_params(request.params)?;
-                let resolved = self.resolve_server(&params.server_name)?.server_name.to_string();
+                let resolved = self
+                    .resolve_server(&params.server_name)?
+                    .server_name
+                    .to_string();
                 let previous_event_count = self.lifecycle_event_count();
                 self.enable_server(&params.server_name).map_err(|reason| {
                     lifecycle_operation_error("enable_server", &resolved, reason)
@@ -1034,7 +1073,10 @@ impl McpServerRegistry {
             }
             MCP_DISABLE_SERVER_METHOD => {
                 let params: McpManagerServerSelectionRequest = decode_params(request.params)?;
-                let resolved = self.resolve_server(&params.server_name)?.server_name.to_string();
+                let resolved = self
+                    .resolve_server(&params.server_name)?
+                    .server_name
+                    .to_string();
                 let previous_event_count = self.lifecycle_event_count();
                 self.disable_server(&params.server_name).map_err(|reason| {
                     lifecycle_operation_error("disable_server", &resolved, reason)
@@ -1055,45 +1097,67 @@ impl McpServerRegistry {
                         })),
                     ));
                 }
-                self.server_operation_value("register_server", &requested_name, previous_event_count)
+                self.server_operation_value(
+                    "register_server",
+                    &requested_name,
+                    previous_event_count,
+                )
             }
             MCP_START_SERVER_METHOD => {
                 let params: McpManagerServerSelectionRequest = decode_params(request.params)?;
-                let resolved = self.resolve_server(&params.server_name)?.server_name.to_string();
+                let resolved = self
+                    .resolve_server(&params.server_name)?
+                    .server_name
+                    .to_string();
                 let previous_event_count = self.lifecycle_event_count();
-                self.start_server(&params.server_name)
-                    .map_err(|reason| lifecycle_operation_error("start_server", &resolved, reason))?;
+                self.start_server(&params.server_name).map_err(|reason| {
+                    lifecycle_operation_error("start_server", &resolved, reason)
+                })?;
                 self.server_operation_value("start_server", &resolved, previous_event_count)
             }
             MCP_STOP_SERVER_METHOD => {
                 let params: McpManagerServerSelectionRequest = decode_params(request.params)?;
-                let resolved = self.resolve_server(&params.server_name)?.server_name.to_string();
+                let resolved = self
+                    .resolve_server(&params.server_name)?
+                    .server_name
+                    .to_string();
                 let previous_event_count = self.lifecycle_event_count();
-                self.stop_server(&params.server_name)
-                    .map_err(|reason| lifecycle_operation_error("stop_server", &resolved, reason))?;
+                self.stop_server(&params.server_name).map_err(|reason| {
+                    lifecycle_operation_error("stop_server", &resolved, reason)
+                })?;
                 self.server_operation_value("stop_server", &resolved, previous_event_count)
             }
             MCP_DEREGISTER_SERVER_METHOD => {
                 let params: McpManagerServerSelectionRequest = decode_params(request.params)?;
-                let resolved = self.resolve_server(&params.server_name)?.server_name.to_string();
+                let resolved = self
+                    .resolve_server(&params.server_name)?
+                    .server_name
+                    .to_string();
                 let previous_event_count = self.lifecycle_event_count();
-                self.deregister_server(&params.server_name).map_err(|reason| {
-                    lifecycle_operation_error("deregister_server", &resolved, reason)
-                })?;
+                self.deregister_server(&params.server_name)
+                    .map_err(|reason| {
+                        lifecycle_operation_error("deregister_server", &resolved, reason)
+                    })?;
                 self.server_operation_value("deregister_server", &resolved, previous_event_count)
             }
             MCP_UPDATE_HEALTH_METHOD => {
                 let params: McpManagerServerHealthUpdateRequest = decode_params(request.params)?;
-                let resolved = self.resolve_server(&params.server_name)?.server_name.to_string();
+                let resolved = self
+                    .resolve_server(&params.server_name)?
+                    .server_name
+                    .to_string();
                 let previous_event_count = self.lifecycle_event_count();
-                let health_status = parse_server_health(&params.health_status).ok_or_else(|| {
-                    LocalProcessBridgeRpcError::invalid_params(format!(
-                        "unsupported health status {}",
-                        params.health_status
-                    ))
-                })?;
+                let health_status =
+                    parse_server_health(&params.health_status).ok_or_else(|| {
+                        LocalProcessBridgeRpcError::invalid_params(format!(
+                            "unsupported health status {}",
+                            params.health_status
+                        ))
+                    })?;
                 self.update_server_health(&params.server_name, health_status)
-                    .map_err(|reason| lifecycle_operation_error("update_health", &resolved, reason))?;
+                    .map_err(|reason| {
+                        lifecycle_operation_error("update_health", &resolved, reason)
+                    })?;
                 self.server_operation_value("update_health", &resolved, previous_event_count)
             }
             _ => Err(LocalProcessBridgeRpcError::remote_business(
@@ -1138,7 +1202,10 @@ impl McpServerRegistry {
         .expect("manager list response should serialize")
     }
 
-    fn describe_server_value(&self, server_name: &str) -> Result<Value, LocalProcessBridgeRpcError> {
+    fn describe_server_value(
+        &self,
+        server_name: &str,
+    ) -> Result<Value, LocalProcessBridgeRpcError> {
         let server = self.resolve_server(server_name)?;
         let events = self
             .lifecycle_events_for(server.server_name)
@@ -1236,7 +1303,9 @@ fn handle_mcp_request(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn handle_mcp_call(request: LocalProcessBridgeRequest) -> Result<Value, LocalProcessBridgeRpcError> {
+fn handle_mcp_call(
+    request: LocalProcessBridgeRequest,
+) -> Result<Value, LocalProcessBridgeRpcError> {
     handle_mcp_request(MCP_CALL_TOOL_METHOD, request)
 }
 
@@ -1403,36 +1472,56 @@ mod tests {
                 "selection-key:observability-default".to_string(),
             ]
         );
-        assert!(catalog.services[0]
-            .capabilities
-            .contains(&"registry:shadow".to_string()));
-        assert!(catalog.services[0]
-            .capabilities
-            .contains(&"manager_version:1.0.0-shadow".to_string()));
-        assert!(catalog.services[0]
-            .capabilities
-            .contains(&"registry_profile:shadow-mcp-registry-v1".to_string()));
-        assert!(catalog.services[0]
-            .capabilities
-            .contains(&"registry_manifest:shadow-mcp-manager@1.0.0-shadow".to_string()));
-        assert!(catalog.services[0]
-            .capabilities
-            .contains(&"selection_strategy:explicit-or-selection-key".to_string()));
-        assert!(catalog.services[0]
-            .capabilities
-            .contains(&"default_server:shadow-mcp".to_string()));
-        assert!(catalog.services[0]
-            .capabilities
-            .contains(&"default_server_health:healthy".to_string()));
-        assert!(catalog.services[0]
-            .capabilities
-            .contains(&"default_server_selection_key:inspection-default".to_string()));
-        assert!(catalog.services[0]
-            .capabilities
-            .contains(&"selection_target_count:4".to_string()));
-        assert!(catalog.services[0]
-            .supported_operations
-            .contains(&"enable_server".to_string()));
+        assert!(
+            catalog.services[0]
+                .capabilities
+                .contains(&"registry:shadow".to_string())
+        );
+        assert!(
+            catalog.services[0]
+                .capabilities
+                .contains(&"manager_version:1.0.0-shadow".to_string())
+        );
+        assert!(
+            catalog.services[0]
+                .capabilities
+                .contains(&"registry_profile:shadow-mcp-registry-v1".to_string())
+        );
+        assert!(
+            catalog.services[0]
+                .capabilities
+                .contains(&"registry_manifest:shadow-mcp-manager@1.0.0-shadow".to_string())
+        );
+        assert!(
+            catalog.services[0]
+                .capabilities
+                .contains(&"selection_strategy:explicit-or-selection-key".to_string())
+        );
+        assert!(
+            catalog.services[0]
+                .capabilities
+                .contains(&"default_server:shadow-mcp".to_string())
+        );
+        assert!(
+            catalog.services[0]
+                .capabilities
+                .contains(&"default_server_health:healthy".to_string())
+        );
+        assert!(
+            catalog.services[0]
+                .capabilities
+                .contains(&"default_server_selection_key:inspection-default".to_string())
+        );
+        assert!(
+            catalog.services[0]
+                .capabilities
+                .contains(&"selection_target_count:4".to_string())
+        );
+        assert!(
+            catalog.services[0]
+                .supported_operations
+                .contains(&"enable_server".to_string())
+        );
         assert_eq!(
             catalog.services[1]
                 .implementation_source
@@ -1461,30 +1550,46 @@ mod tests {
                 .expect("server manifest should exist"),
             "shadow-mcp@1.2.0-shadow"
         );
-        assert!(catalog.services[1]
-            .capabilities
-            .contains(&"server_enabled:true".to_string()));
-        assert!(catalog.services[1]
-            .capabilities
-            .contains(&"server_version:1.2.0-shadow".to_string()));
-        assert!(catalog.services[1]
-            .capabilities
-            .contains(&"server_manifest:shadow-mcp@1.2.0-shadow".to_string()));
-        assert!(catalog.services[1]
-            .capabilities
-            .contains(&"capability_profile:inspection-core-v1".to_string()));
-        assert!(catalog.services[1]
-            .capabilities
-            .contains(&"selection_key:inspection-default".to_string()));
-        assert!(catalog.services[1]
-            .capabilities
-            .contains(&"tool:echo.inspect".to_string()));
-        assert!(catalog.services[1]
-            .capabilities
-            .contains(&"tool:echo.describe".to_string()));
-        assert!(catalog.services[2]
-            .capabilities
-            .contains(&"server_enabled:false".to_string()));
+        assert!(
+            catalog.services[1]
+                .capabilities
+                .contains(&"server_enabled:true".to_string())
+        );
+        assert!(
+            catalog.services[1]
+                .capabilities
+                .contains(&"server_version:1.2.0-shadow".to_string())
+        );
+        assert!(
+            catalog.services[1]
+                .capabilities
+                .contains(&"server_manifest:shadow-mcp@1.2.0-shadow".to_string())
+        );
+        assert!(
+            catalog.services[1]
+                .capabilities
+                .contains(&"capability_profile:inspection-core-v1".to_string())
+        );
+        assert!(
+            catalog.services[1]
+                .capabilities
+                .contains(&"selection_key:inspection-default".to_string())
+        );
+        assert!(
+            catalog.services[1]
+                .capabilities
+                .contains(&"tool:echo.inspect".to_string())
+        );
+        assert!(
+            catalog.services[1]
+                .capabilities
+                .contains(&"tool:echo.describe".to_string())
+        );
+        assert!(
+            catalog.services[2]
+                .capabilities
+                .contains(&"server_enabled:false".to_string())
+        );
         assert_eq!(
             catalog.services[2]
                 .implementation_source
@@ -1506,12 +1611,16 @@ mod tests {
                 .expect("observability selection key should exist"),
             "observability-default"
         );
-        assert!(catalog.services[2]
-            .capabilities
-            .contains(&"capability_profile:observability-readonly-v1".to_string()));
-        assert!(catalog.services[2]
-            .capabilities
-            .contains(&"tool:echo.describe".to_string()));
+        assert!(
+            catalog.services[2]
+                .capabilities
+                .contains(&"capability_profile:observability-readonly-v1".to_string())
+        );
+        assert!(
+            catalog.services[2]
+                .capabilities
+                .contains(&"tool:echo.describe".to_string())
+        );
     }
 
     #[test]
@@ -1562,11 +1671,14 @@ mod tests {
             .find(|server| server.server_name == "shadow-mcp-observability")
             .expect("disabled server should exist");
         let error = disabled
-            .execute(&McpToolCallRequest {
-                server_name: "shadow-mcp-observability".to_string(),
-                tool_name: "echo.describe".to_string(),
-                input: "{}".to_string(),
-            }, &registry)
+            .execute(
+                &McpToolCallRequest {
+                    server_name: "shadow-mcp-observability".to_string(),
+                    tool_name: "echo.describe".to_string(),
+                    input: "{}".to_string(),
+                },
+                &registry,
+            )
             .expect_err("disabled server should reject calls");
 
         assert_eq!(error.code(), -32014);
@@ -1637,16 +1749,20 @@ mod tests {
             .disable_server(SHADOW_MCP_SERVER_NAME)
             .expect("disable should succeed");
         let catalog = registry.service_catalog();
-        assert!(catalog.services[1]
-            .capabilities
-            .contains(&"server_enabled:false".to_string()));
+        assert!(
+            catalog.services[1]
+                .capabilities
+                .contains(&"server_enabled:false".to_string())
+        );
         registry
             .enable_server(SHADOW_MCP_SERVER_NAME)
             .expect("enable should succeed");
         let catalog = registry.service_catalog();
-        assert!(catalog.services[1]
-            .capabilities
-            .contains(&"server_enabled:true".to_string()));
+        assert!(
+            catalog.services[1]
+                .capabilities
+                .contains(&"server_enabled:true".to_string())
+        );
     }
 
     #[test]
@@ -1717,15 +1833,21 @@ mod tests {
         assert_eq!(catalog.services[0].default_server, None);
         assert_eq!(catalog.services[0].default_server_health, None);
         assert_eq!(catalog.services[0].default_server_selection_key, None);
-        assert!(catalog.services[0]
-            .capabilities
-            .contains(&"default_server:<none>".to_string()));
-        assert!(catalog.services[0]
-            .capabilities
-            .contains(&"default_server_health:unavailable".to_string()));
-        assert!(catalog.services[0]
-            .capabilities
-            .contains(&"default_server_selection_key:<none>".to_string()));
+        assert!(
+            catalog.services[0]
+                .capabilities
+                .contains(&"default_server:<none>".to_string())
+        );
+        assert!(
+            catalog.services[0]
+                .capabilities
+                .contains(&"default_server_health:unavailable".to_string())
+        );
+        assert!(
+            catalog.services[0]
+                .capabilities
+                .contains(&"default_server_selection_key:<none>".to_string())
+        );
     }
 
     #[test]
@@ -1733,13 +1855,17 @@ mod tests {
         let registry = McpServerRegistry::shadow();
         let catalog = registry.service_catalog();
         // Enabled server should have lifecycle_state:running
-        assert!(catalog.services[1]
-            .capabilities
-            .contains(&"lifecycle_state:running".to_string()));
+        assert!(
+            catalog.services[1]
+                .capabilities
+                .contains(&"lifecycle_state:running".to_string())
+        );
         // Disabled server should have lifecycle_state:stopped
-        assert!(catalog.services[2]
-            .capabilities
-            .contains(&"lifecycle_state:stopped".to_string()));
+        assert!(
+            catalog.services[2]
+                .capabilities
+                .contains(&"lifecycle_state:stopped".to_string())
+        );
     }
 
     #[test]
@@ -1778,7 +1904,10 @@ mod tests {
         let events = registry.lifecycle_events_for("test-new-server");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_kind, McpLifecycleEventKind::Registered);
-        assert_eq!(events[0].previous_state, McpServerLifecycleState::Deregistered);
+        assert_eq!(
+            events[0].previous_state,
+            McpServerLifecycleState::Deregistered
+        );
         assert_eq!(events[0].new_state, McpServerLifecycleState::Registered);
     }
 
@@ -1787,7 +1916,9 @@ mod tests {
         let mut registry = McpServerRegistry::shadow();
         // shadow-mcp-observability starts as disabled/stopped
         assert_eq!(
-            registry.servers.iter()
+            registry
+                .servers
+                .iter()
                 .find(|s| s.server_name == "shadow-mcp-observability")
                 .unwrap()
                 .lifecycle_state,
@@ -1795,8 +1926,12 @@ mod tests {
         );
 
         // Start it
-        registry.start_server("shadow-mcp-observability").expect("start should succeed");
-        let server = registry.servers.iter()
+        registry
+            .start_server("shadow-mcp-observability")
+            .expect("start should succeed");
+        let server = registry
+            .servers
+            .iter()
             .find(|s| s.server_name == "shadow-mcp-observability")
             .unwrap();
         assert_eq!(server.lifecycle_state, McpServerLifecycleState::Running);
@@ -1807,8 +1942,12 @@ mod tests {
         assert!(registry.start_server("shadow-mcp-observability").is_err());
 
         // Stop it
-        registry.stop_server("shadow-mcp-observability").expect("stop should succeed");
-        let server = registry.servers.iter()
+        registry
+            .stop_server("shadow-mcp-observability")
+            .expect("stop should succeed");
+        let server = registry
+            .servers
+            .iter()
             .find(|s| s.server_name == "shadow-mcp-observability")
             .unwrap();
         assert_eq!(server.lifecycle_state, McpServerLifecycleState::Stopped);
@@ -1832,20 +1971,35 @@ mod tests {
     #[test]
     fn deregister_server_transitions_to_deregistered_and_blocks_further_ops() {
         let mut registry = McpServerRegistry::shadow();
-        registry.deregister_server("shadow-mcp-observability").expect("deregister should succeed");
-        let server = registry.servers.iter()
+        registry
+            .deregister_server("shadow-mcp-observability")
+            .expect("deregister should succeed");
+        let server = registry
+            .servers
+            .iter()
             .find(|s| s.server_name == "shadow-mcp-observability")
             .unwrap();
-        assert_eq!(server.lifecycle_state, McpServerLifecycleState::Deregistered);
+        assert_eq!(
+            server.lifecycle_state,
+            McpServerLifecycleState::Deregistered
+        );
         assert!(!server.enabled);
         assert_eq!(server.health_status, "unavailable");
 
         // Double deregister should error
-        assert!(registry.deregister_server("shadow-mcp-observability").is_err());
+        assert!(
+            registry
+                .deregister_server("shadow-mcp-observability")
+                .is_err()
+        );
         // Start after deregister should error
         assert!(registry.start_server("shadow-mcp-observability").is_err());
         // Health update after deregister should error
-        assert!(registry.update_server_health("shadow-mcp-observability", "healthy").is_err());
+        assert!(
+            registry
+                .update_server_health("shadow-mcp-observability", "healthy")
+                .is_err()
+        );
 
         let events = registry.lifecycle_events_for("shadow-mcp-observability");
         assert_eq!(events.len(), 1);
@@ -1856,27 +2010,36 @@ mod tests {
     fn update_server_health_emits_health_changed_event_and_transitions_state() {
         let mut registry = McpServerRegistry::shadow();
         // shadow-mcp starts as healthy/running
-        registry.update_server_health(SHADOW_MCP_SERVER_NAME, "degraded")
+        registry
+            .update_server_health(SHADOW_MCP_SERVER_NAME, "degraded")
             .expect("health update should succeed");
-        let server = registry.servers.iter()
+        let server = registry
+            .servers
+            .iter()
             .find(|s| s.server_name == SHADOW_MCP_SERVER_NAME)
             .unwrap();
         assert_eq!(server.health_status, "degraded");
         assert_eq!(server.lifecycle_state, McpServerLifecycleState::Running);
 
         // Transition to unavailable -> lifecycle_state should become Failed
-        registry.update_server_health(SHADOW_MCP_SERVER_NAME, "unavailable")
+        registry
+            .update_server_health(SHADOW_MCP_SERVER_NAME, "unavailable")
             .expect("health update should succeed");
-        let server = registry.servers.iter()
+        let server = registry
+            .servers
+            .iter()
             .find(|s| s.server_name == SHADOW_MCP_SERVER_NAME)
             .unwrap();
         assert_eq!(server.health_status, "unavailable");
         assert_eq!(server.lifecycle_state, McpServerLifecycleState::Failed);
 
         // Transition to disabled -> lifecycle_state should become Stopped, enabled false
-        registry.update_server_health(SHADOW_MCP_SERVER_NAME, "disabled")
+        registry
+            .update_server_health(SHADOW_MCP_SERVER_NAME, "disabled")
             .expect("health update should succeed");
-        let server = registry.servers.iter()
+        let server = registry
+            .servers
+            .iter()
             .find(|s| s.server_name == SHADOW_MCP_SERVER_NAME)
             .unwrap();
         assert_eq!(server.health_status, "disabled");
@@ -1884,12 +2047,17 @@ mod tests {
         assert!(!server.enabled);
 
         // Same health should be a no-op (no event emitted)
-        registry.update_server_health(SHADOW_MCP_SERVER_NAME, "disabled")
+        registry
+            .update_server_health(SHADOW_MCP_SERVER_NAME, "disabled")
             .expect("no-op health update should succeed");
 
         let events = registry.lifecycle_events_for(SHADOW_MCP_SERVER_NAME);
         assert_eq!(events.len(), 3); // degraded, unavailable, disabled
-        assert!(events.iter().all(|e| e.event_kind == McpLifecycleEventKind::HealthChanged));
+        assert!(
+            events
+                .iter()
+                .all(|e| e.event_kind == McpLifecycleEventKind::HealthChanged)
+        );
     }
 
     #[test]
@@ -1904,7 +2072,10 @@ mod tests {
             .iter()
             .find(|s| s.server_name == SHADOW_MCP_SERVER_NAME)
             .expect("shadow server should exist");
-        assert_eq!(failed_server.lifecycle_state, McpServerLifecycleState::Failed);
+        assert_eq!(
+            failed_server.lifecycle_state,
+            McpServerLifecycleState::Failed
+        );
         assert!(failed_server.enabled);
 
         registry
@@ -1916,7 +2087,10 @@ mod tests {
             .find(|s| s.server_name == SHADOW_MCP_SERVER_NAME)
             .expect("shadow server should exist");
         assert_eq!(recovered_server.health_status, "healthy");
-        assert_eq!(recovered_server.lifecycle_state, McpServerLifecycleState::Running);
+        assert_eq!(
+            recovered_server.lifecycle_state,
+            McpServerLifecycleState::Running
+        );
         assert!(recovered_server.enabled);
 
         let catalog = registry.service_catalog();
@@ -1925,9 +2099,11 @@ mod tests {
             .iter()
             .find(|service| service.service_name == SHADOW_MCP_SERVER_NAME)
             .expect("shadow service should appear in catalog");
-        assert!(service
-            .capabilities
-            .contains(&"lifecycle_state:running".to_string()));
+        assert!(
+            service
+                .capabilities
+                .contains(&"lifecycle_state:running".to_string())
+        );
     }
 
     #[test]
@@ -1952,12 +2128,16 @@ mod tests {
             .iter()
             .find(|service| service.service_name == "shadow-mcp-observability")
             .expect("observability service should appear in catalog");
-        assert!(service
-            .capabilities
-            .contains(&"server_enabled:false".to_string()));
-        assert!(service
-            .capabilities
-            .contains(&"lifecycle_state:registered".to_string()));
+        assert!(
+            service
+                .capabilities
+                .contains(&"server_enabled:false".to_string())
+        );
+        assert!(
+            service
+                .capabilities
+                .contains(&"lifecycle_state:registered".to_string())
+        );
     }
 
     #[test]
@@ -1990,17 +2170,21 @@ mod tests {
         let mut registry = McpServerRegistry::shadow();
         // No events initially from shadow()
         let catalog = registry.service_catalog();
-        assert!(catalog.services[0]
-            .capabilities
-            .contains(&"lifecycle_event_count:0".to_string()));
+        assert!(
+            catalog.services[0]
+                .capabilities
+                .contains(&"lifecycle_event_count:0".to_string())
+        );
 
         // After some operations, event count should reflect
         registry.start_server("shadow-mcp-observability").unwrap();
         registry.stop_server("shadow-mcp-observability").unwrap();
         let catalog = registry.service_catalog();
-        assert!(catalog.services[0]
-            .capabilities
-            .contains(&"lifecycle_event_count:2".to_string()));
+        assert!(
+            catalog.services[0]
+                .capabilities
+                .contains(&"lifecycle_event_count:2".to_string())
+        );
     }
 
     #[test]
@@ -2023,7 +2207,9 @@ mod tests {
         // Start
         registry.start_server("lifecycle-test-server").unwrap();
         // Health change
-        registry.update_server_health("lifecycle-test-server", "degraded").unwrap();
+        registry
+            .update_server_health("lifecycle-test-server", "degraded")
+            .unwrap();
         // Stop
         registry.stop_server("lifecycle-test-server").unwrap();
         // Deregister
@@ -2040,7 +2226,10 @@ mod tests {
 
         // Verify state transitions are correct
         assert_eq!(events[0].new_state, McpServerLifecycleState::Registered);
-        assert_eq!(events[1].previous_state, McpServerLifecycleState::Registered);
+        assert_eq!(
+            events[1].previous_state,
+            McpServerLifecycleState::Registered
+        );
         assert_eq!(events[1].new_state, McpServerLifecycleState::Running);
         assert_eq!(events[2].previous_state, McpServerLifecycleState::Running);
         assert_eq!(events[3].previous_state, McpServerLifecycleState::Running);
@@ -2050,13 +2239,21 @@ mod tests {
 
         // Verify the service catalog reflects the final deregistered state
         let catalog = registry.service_catalog();
-        let lifecycle_server = catalog.services.iter()
+        let lifecycle_server = catalog
+            .services
+            .iter()
             .find(|s| s.service_name == "lifecycle-test-server")
             .expect("registered server should appear in catalog");
-        assert!(lifecycle_server.capabilities
-            .contains(&"lifecycle_state:deregistered".to_string()));
-        assert!(lifecycle_server.capabilities
-            .contains(&"server_enabled:false".to_string()));
+        assert!(
+            lifecycle_server
+                .capabilities
+                .contains(&"lifecycle_state:deregistered".to_string())
+        );
+        assert!(
+            lifecycle_server
+                .capabilities
+                .contains(&"server_enabled:false".to_string())
+        );
     }
 
     #[test]
@@ -2064,11 +2261,31 @@ mod tests {
         let registry = McpServerRegistry::shadow();
         let catalog = registry.service_catalog();
         let manager = &catalog.services[0];
-        assert!(manager.supported_operations.contains(&"register_server".to_string()));
-        assert!(manager.supported_operations.contains(&"start_server".to_string()));
-        assert!(manager.supported_operations.contains(&"stop_server".to_string()));
-        assert!(manager.supported_operations.contains(&"deregister_server".to_string()));
-        assert!(manager.supported_operations.contains(&"update_health".to_string()));
+        assert!(
+            manager
+                .supported_operations
+                .contains(&"register_server".to_string())
+        );
+        assert!(
+            manager
+                .supported_operations
+                .contains(&"start_server".to_string())
+        );
+        assert!(
+            manager
+                .supported_operations
+                .contains(&"stop_server".to_string())
+        );
+        assert!(
+            manager
+                .supported_operations
+                .contains(&"deregister_server".to_string())
+        );
+        assert!(
+            manager
+                .supported_operations
+                .contains(&"update_health".to_string())
+        );
     }
 
     #[test]
@@ -2077,7 +2294,11 @@ mod tests {
         assert!(registry.start_server("nonexistent").is_err());
         assert!(registry.stop_server("nonexistent").is_err());
         assert!(registry.deregister_server("nonexistent").is_err());
-        assert!(registry.update_server_health("nonexistent", "healthy").is_err());
+        assert!(
+            registry
+                .update_server_health("nonexistent", "healthy")
+                .is_err()
+        );
     }
 
     #[test]
@@ -2110,14 +2331,18 @@ mod tests {
             register.server.service_health_reason.as_deref(),
             Some("server disabled")
         );
-        assert!(register
-            .server
-            .capabilities
-            .contains(&"server_enabled:false".to_string()));
-        assert!(register
-            .server
-            .capabilities
-            .contains(&"lifecycle_state:registered".to_string()));
+        assert!(
+            register
+                .server
+                .capabilities
+                .contains(&"server_enabled:false".to_string())
+        );
+        assert!(
+            register
+                .server
+                .capabilities
+                .contains(&"lifecycle_state:registered".to_string())
+        );
         assert_eq!(register.lifecycle_event_count, 1);
         assert_eq!(register.server_events.len(), 1);
         assert_eq!(
@@ -2131,12 +2356,14 @@ mod tests {
 
         let list = client.list_servers().expect("list_servers should succeed");
         assert_eq!(list.servers.len(), 3);
-        assert!(list
-            .selection_targets
-            .contains(&"shadow-mcp-dynamic".to_string()));
-        assert!(list
-            .selection_targets
-            .contains(&"selection-key:dynamic-default".to_string()));
+        assert!(
+            list.selection_targets
+                .contains(&"shadow-mcp-dynamic".to_string())
+        );
+        assert!(
+            list.selection_targets
+                .contains(&"selection-key:dynamic-default".to_string())
+        );
 
         let describe = client
             .describe_server(McpManagerServerSelectionRequest {
@@ -2158,14 +2385,18 @@ mod tests {
         assert_eq!(start.lifecycle_event_count, 2);
         assert_eq!(start.server_events.len(), 2);
         assert_eq!(start.server.service_health.as_deref(), Some("healthy"));
-        assert!(start
-            .server
-            .capabilities
-            .contains(&"server_enabled:true".to_string()));
-        assert!(start
-            .server
-            .capabilities
-            .contains(&"lifecycle_state:running".to_string()));
+        assert!(
+            start
+                .server
+                .capabilities
+                .contains(&"server_enabled:true".to_string())
+        );
+        assert!(
+            start
+                .server
+                .capabilities
+                .contains(&"lifecycle_state:running".to_string())
+        );
         assert_eq!(
             start
                 .lifecycle_event
@@ -2187,10 +2418,12 @@ mod tests {
             update_health.server.service_health.as_deref(),
             Some("degraded")
         );
-        assert!(update_health
-            .server
-            .capabilities
-            .contains(&"lifecycle_state:running".to_string()));
+        assert!(
+            update_health
+                .server
+                .capabilities
+                .contains(&"lifecycle_state:running".to_string())
+        );
         assert_eq!(
             update_health
                 .lifecycle_event
@@ -2208,10 +2441,11 @@ mod tests {
         assert_eq!(stop.lifecycle_event_count, 4);
         assert_eq!(stop.server_events.len(), 4);
         assert_eq!(stop.server.service_health.as_deref(), Some("disabled"));
-        assert!(stop
-            .server
-            .capabilities
-            .contains(&"lifecycle_state:stopped".to_string()));
+        assert!(
+            stop.server
+                .capabilities
+                .contains(&"lifecycle_state:stopped".to_string())
+        );
         assert_eq!(
             stop.lifecycle_event
                 .as_ref()
@@ -2231,14 +2465,18 @@ mod tests {
             deregister.server.service_health.as_deref(),
             Some("unavailable")
         );
-        assert!(deregister
-            .server
-            .capabilities
-            .contains(&"server_enabled:false".to_string()));
-        assert!(deregister
-            .server
-            .capabilities
-            .contains(&"lifecycle_state:deregistered".to_string()));
+        assert!(
+            deregister
+                .server
+                .capabilities
+                .contains(&"server_enabled:false".to_string())
+        );
+        assert!(
+            deregister
+                .server
+                .capabilities
+                .contains(&"lifecycle_state:deregistered".to_string())
+        );
         assert_eq!(
             deregister
                 .lifecycle_event
@@ -2254,10 +2492,12 @@ mod tests {
             })
             .expect("describe_server should keep exposing lifecycle history");
         assert_eq!(describe_after_deregister.lifecycle_events.len(), 5);
-        assert!(describe_after_deregister
-            .server
-            .capabilities
-            .contains(&"lifecycle_state:deregistered".to_string()));
+        assert!(
+            describe_after_deregister
+                .server
+                .capabilities
+                .contains(&"lifecycle_state:deregistered".to_string())
+        );
     }
 
     #[test]
@@ -2274,10 +2514,12 @@ mod tests {
             unavailable.server.service_health.as_deref(),
             Some("unavailable")
         );
-        assert!(unavailable
-            .server
-            .capabilities
-            .contains(&"lifecycle_state:failed".to_string()));
+        assert!(
+            unavailable
+                .server
+                .capabilities
+                .contains(&"lifecycle_state:failed".to_string())
+        );
 
         let recovered = client
             .update_health(McpManagerServerHealthUpdateRequest {
@@ -2286,14 +2528,18 @@ mod tests {
             })
             .expect("healthy update should recover the server");
         assert_eq!(recovered.server.service_health.as_deref(), Some("healthy"));
-        assert!(recovered
-            .server
-            .capabilities
-            .contains(&"server_enabled:true".to_string()));
-        assert!(recovered
-            .server
-            .capabilities
-            .contains(&"lifecycle_state:running".to_string()));
+        assert!(
+            recovered
+                .server
+                .capabilities
+                .contains(&"server_enabled:true".to_string())
+        );
+        assert!(
+            recovered
+                .server
+                .capabilities
+                .contains(&"lifecycle_state:running".to_string())
+        );
         assert_eq!(
             recovered
                 .lifecycle_event
@@ -2321,14 +2567,18 @@ mod tests {
             disabled_recovered.server.service_health.as_deref(),
             Some("healthy")
         );
-        assert!(disabled_recovered
-            .server
-            .capabilities
-            .contains(&"server_enabled:false".to_string()));
-        assert!(disabled_recovered
-            .server
-            .capabilities
-            .contains(&"lifecycle_state:registered".to_string()));
+        assert!(
+            disabled_recovered
+                .server
+                .capabilities
+                .contains(&"server_enabled:false".to_string())
+        );
+        assert!(
+            disabled_recovered
+                .server
+                .capabilities
+                .contains(&"lifecycle_state:registered".to_string())
+        );
     }
 
     #[test]
@@ -2360,11 +2610,16 @@ mod tests {
         assert_eq!(repeated.lifecycle_event_count, 1);
         assert!(repeated.lifecycle_event.is_none());
         assert_eq!(repeated.server_events.len(), 1);
-        assert_eq!(repeated.server.service_health.as_deref(), Some("unavailable"));
-        assert!(repeated
-            .server
-            .capabilities
-            .contains(&"lifecycle_state:failed".to_string()));
+        assert_eq!(
+            repeated.server.service_health.as_deref(),
+            Some("unavailable")
+        );
+        assert!(
+            repeated
+                .server
+                .capabilities
+                .contains(&"lifecycle_state:failed".to_string())
+        );
     }
 
     #[test]
@@ -2398,10 +2653,12 @@ mod tests {
             repeated_disable.server.service_health.as_deref(),
             Some("disabled")
         );
-        assert!(repeated_disable
-            .server
-            .capabilities
-            .contains(&"lifecycle_state:stopped".to_string()));
+        assert!(
+            repeated_disable
+                .server
+                .capabilities
+                .contains(&"lifecycle_state:stopped".to_string())
+        );
 
         let enabled = client
             .enable_server(McpManagerServerSelectionRequest {
@@ -2426,14 +2683,21 @@ mod tests {
         assert_eq!(repeated_enable.lifecycle_event_count, 2);
         assert!(repeated_enable.lifecycle_event.is_none());
         assert_eq!(repeated_enable.server_events.len(), 2);
-        assert_eq!(repeated_enable.server.service_health.as_deref(), Some("healthy"));
-        assert!(repeated_enable
-            .server
-            .capabilities
-            .contains(&"server_enabled:true".to_string()));
-        assert!(repeated_enable
-            .server
-            .capabilities
-            .contains(&"lifecycle_state:running".to_string()));
+        assert_eq!(
+            repeated_enable.server.service_health.as_deref(),
+            Some("healthy")
+        );
+        assert!(
+            repeated_enable
+                .server
+                .capabilities
+                .contains(&"server_enabled:true".to_string())
+        );
+        assert!(
+            repeated_enable
+                .server
+                .capabilities
+                .contains(&"lifecycle_state:running".to_string())
+        );
     }
 }

@@ -263,6 +263,12 @@ impl BridgeResponse {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelStreamEvent {
+    ContentDelta { delta: String },
+    ThinkingDelta { delta: String },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BridgeTransportRequest {
     pub method: String,
@@ -370,9 +376,12 @@ pub trait HostBridgeClient: Send + Sync {
 }
 
 pub trait ModelBridgeClient: Send + Sync {
-    fn invoke(
+    fn invoke(&self, request: ModelInvocationRequest) -> Result<BridgeResponse, BridgeClientError>;
+
+    fn invoke_stream(
         &self,
         request: ModelInvocationRequest,
+        on_event: &mut dyn FnMut(ModelStreamEvent),
     ) -> Result<BridgeResponse, BridgeClientError>;
 }
 

@@ -96,8 +96,7 @@ impl HostServiceShim {
                 right_path,
             } => {
                 self.ensure_vscode_prehost_ready("RevealDiff")?;
-                let left =
-                    ensure_host_path_within_workspace_roots(self, &left_path, "left_path")?;
+                let left = ensure_host_path_within_workspace_roots(self, &left_path, "left_path")?;
                 let right =
                     ensure_host_path_within_workspace_roots(self, &right_path, "right_path")?;
                 let left_content = read_text_file(&left)?;
@@ -290,7 +289,10 @@ fn ensure_host_path_within_workspace_roots(
 ) -> Result<PathBuf, crate::local_process_protocol::LocalProcessBridgeRpcError> {
     let canonical_path = canonicalize_host_path(path)?;
     let canonical_roots = canonical_workspace_roots(shim)?;
-    if canonical_roots.iter().any(|root| canonical_path.starts_with(root)) {
+    if canonical_roots
+        .iter()
+        .any(|root| canonical_path.starts_with(root))
+    {
         return Ok(canonical_path);
     }
     Err(

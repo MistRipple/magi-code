@@ -2,17 +2,15 @@ use std::sync::Arc;
 
 use crate::base_adapter::{AdapterConfig, BaseAdapter, RoundResult, ToolExecutor};
 use crate::conversation_compaction::{ConversationCompactionConfig, ConversationCompactor};
-use crate::decision_engine::{
-    OrchestratorDecisionPolicy, OrchestratorExecutionBudget,
-};
+use crate::decision_engine::{OrchestratorDecisionPolicy, OrchestratorExecutionBudget};
+use crate::execution_outcome::{ExecutionOutcomeStatus, extract_execution_outcome};
 use crate::llm_types::{
-    is_summary_hijack_text, sanitize_summary_hijack_messages,
     LlmContentBlock, LlmMessage, LlmMessageContent, LlmMessageParams, LlmResponse, LlmUsage,
+    is_summary_hijack_text, sanitize_summary_hijack_messages,
 };
-use crate::execution_outcome::{extract_execution_outcome, ExecutionOutcomeStatus};
 use crate::orchestrator_termination::OrchestratorTerminationReason;
 use crate::round_policy::build_summary_hijack_correction;
-use crate::structured_dispatch::{extract_structured_dispatch, StructuredDispatchResult};
+use crate::structured_dispatch::{StructuredDispatchResult, extract_structured_dispatch};
 use crate::types::{BridgeClientError, ModelBridgeClient};
 
 #[derive(Clone, Debug)]
@@ -124,8 +122,8 @@ impl OrchestratorAdapter {
         config: OrchestratorAdapterConfig,
     ) -> Self {
         let base = BaseAdapter::new(model_client.clone(), config.adapter.clone());
-        let compactor = ConversationCompactor::new(config.compaction.clone())
-            .with_model_client(model_client);
+        let compactor =
+            ConversationCompactor::new(config.compaction.clone()).with_model_client(model_client);
         Self {
             config,
             base,
@@ -310,9 +308,7 @@ impl OrchestratorAdapter {
                     Some(ExecutionOutcomeStatus::Completed) => {
                         OrchestratorTerminationReason::Completed
                     }
-                    Some(ExecutionOutcomeStatus::Failed) => {
-                        OrchestratorTerminationReason::Failed
-                    }
+                    Some(ExecutionOutcomeStatus::Failed) => OrchestratorTerminationReason::Failed,
                     _ => OrchestratorTerminationReason::Completed,
                 };
 
@@ -367,7 +363,8 @@ impl OrchestratorAdapter {
             }
 
             // --- 执行工具并追加结果 ---
-            let tool_error_count = append_tool_round(&mut params.messages, &response, tool_executor);
+            let tool_error_count =
+                append_tool_round(&mut params.messages, &response, tool_executor);
             progress.error_count += tool_error_count;
 
             decision_trace.push(DecisionTraceEntry {
