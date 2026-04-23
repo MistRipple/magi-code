@@ -24,7 +24,10 @@ fn governance_service_can_distinguish_tool_and_worker_control_paths() {
         risk_level: RiskLevel::High,
         approval_requirement: ApprovalRequirement::None,
     });
-    assert_eq!(tool_needs_approval.outcome, GovernanceOutcome::NeedsApproval);
+    assert_eq!(
+        tool_needs_approval.outcome,
+        GovernanceOutcome::NeedsApproval
+    );
     assert!(tool_needs_approval.requires_approval);
 
     let worker_blocked = service.evaluate_worker_control_request(&WorkerControlRequest {
@@ -95,7 +98,10 @@ fn governance_service_can_emit_tool_decision_trace() {
     assert!(trace.summary.contains("tool:shell_exec"));
     assert!(trace.summary.contains("needs_approval"));
     match trace.target {
-        GovernanceTarget::Tool { tool_name, tool_kind } => {
+        GovernanceTarget::Tool {
+            tool_name,
+            tool_kind,
+        } => {
             assert_eq!(tool_name, "shell_exec");
             assert_eq!(tool_kind, ToolKind::Builtin);
         }

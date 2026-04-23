@@ -101,8 +101,8 @@ impl SnapshotManager {
                 continue;
             }
 
-            let content = fs::read_to_string(path)
-                .map_err(|e| format!("读取文件失败 {file_path}: {e}"))?;
+            let content =
+                fs::read_to_string(path).map_err(|e| format!("读取文件失败 {file_path}: {e}"))?;
             let hash = simple_hash(&content);
 
             self.cache_content(file_path, &content);
@@ -142,8 +142,7 @@ impl SnapshotManager {
             let path = Path::new(&file.path);
             if let Some(dir) = path.parent() {
                 if !dir.exists() {
-                    fs::create_dir_all(dir)
-                        .map_err(|e| format!("创建目录失败: {e}"))?;
+                    fs::create_dir_all(dir).map_err(|e| format!("创建目录失败: {e}"))?;
                 }
             }
             fs::write(path, &file.content)
@@ -200,11 +199,8 @@ impl SnapshotManager {
     }
 
     pub fn list_snapshots(&self) -> Vec<&SnapshotMetadata> {
-        let mut metas: Vec<&SnapshotMetadata> = self
-            .snapshots
-            .values()
-            .map(|s| &s.metadata)
-            .collect();
+        let mut metas: Vec<&SnapshotMetadata> =
+            self.snapshots.values().map(|s| &s.metadata).collect();
         metas.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         metas
     }
@@ -220,14 +216,13 @@ impl SnapshotManager {
 
     fn persist_snapshot(&self, snapshot: &Snapshot) -> Result<(), String> {
         if !self.storage_path.exists() {
-            fs::create_dir_all(&self.storage_path)
-                .map_err(|e| format!("创建快照目录失败: {e}"))?;
+            fs::create_dir_all(&self.storage_path).map_err(|e| format!("创建快照目录失败: {e}"))?;
         }
         let file_path = self
             .storage_path
             .join(format!("{}.json", snapshot.metadata.snapshot_id));
-        let payload = serde_json::to_string_pretty(snapshot)
-            .map_err(|e| format!("序列化快照失败: {e}"))?;
+        let payload =
+            serde_json::to_string_pretty(snapshot).map_err(|e| format!("序列化快照失败: {e}"))?;
         fs::write(&file_path, payload).map_err(|e| format!("写入快照失败: {e}"))?;
         Ok(())
     }
@@ -253,7 +248,9 @@ fn is_binary_file(path: &Path) -> bool {
     ];
     path.extension()
         .and_then(|e| e.to_str())
-        .map_or(false, |ext| BINARY_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+        .map_or(false, |ext| {
+            BINARY_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+        })
 }
 
 fn generate_unified_diff(path: &str, old: &str, new: &str) -> String {

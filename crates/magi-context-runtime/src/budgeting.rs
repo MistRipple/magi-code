@@ -28,7 +28,8 @@ pub(super) fn assemble_budgeted_selection(
 ) -> BudgetedContextSelection {
     let (selected_recent_turns, turns_truncation) =
         select_limited(recent_turns, budget.max_turns, "recent_turns");
-    let recent_turns_summary = finalize_recent_turns_summary(recent_turns_summary, &selected_recent_turns);
+    let recent_turns_summary =
+        finalize_recent_turns_summary(recent_turns_summary, &selected_recent_turns);
     let selected_turns = selected_recent_turns
         .iter()
         .map(|turn| turn.content.clone())
@@ -98,11 +99,13 @@ fn select_knowledge(
     knowledge_query.limit = budget.max_knowledge.min(knowledge_query.limit);
     let knowledge_query_result = runtime.knowledge_store.query(&knowledge_query);
     let selected_knowledge = runtime.knowledge_store.governed_output(&knowledge_query);
-    let knowledge_truncation = knowledge_query_result.truncated.then_some(TruncationRecord {
-        part: "knowledge".to_string(),
-        original_count: knowledge_query_result.total_matches,
-        retained_count: selected_knowledge.len(),
-    });
+    let knowledge_truncation = knowledge_query_result
+        .truncated
+        .then_some(TruncationRecord {
+            part: "knowledge".to_string(),
+            original_count: knowledge_query_result.total_matches,
+            retained_count: selected_knowledge.len(),
+        });
     (selected_knowledge, knowledge_truncation)
 }
 

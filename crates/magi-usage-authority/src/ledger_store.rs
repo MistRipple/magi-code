@@ -79,8 +79,7 @@ impl InMemoryLedgerStore {
     }
 
     pub fn write_session_index(&mut self, session_id: &str, index: SessionLedgerIndex) {
-        self.session_indices
-            .insert(session_id.to_string(), index);
+        self.session_indices.insert(session_id.to_string(), index);
     }
 
     pub fn list_session_ids(&self) -> Vec<String> {

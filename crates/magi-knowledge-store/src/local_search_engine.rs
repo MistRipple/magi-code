@@ -8,7 +8,9 @@ use crate::dependency_graph::DependencyGraph;
 use crate::index_persistence::{IndexPersistence, PersistenceSnapshot};
 use crate::inverted_index::{IndexSearchHit, InvertedIndex};
 use crate::query_expander::{LlmExpandResult, QueryExpander};
-use crate::result_ranker::{RankBoostSignals, RankWeights, RankedResult, ResultRanker, ScoreDimensions};
+use crate::result_ranker::{
+    RankBoostSignals, RankWeights, RankedResult, ResultRanker, ScoreDimensions,
+};
 use crate::search_cache::SearchCache;
 use crate::semantic_reranker::SemanticReranker;
 use crate::symbol_index::{SymbolIndex, SymbolSearchHit};
@@ -176,7 +178,8 @@ impl LocalSearchEngine {
         let should_expand = query_intent == QueryIntent::Semantic && query_tokens.len() <= 3;
         if should_expand {
             if let Some(llm_result) = options.llm_expand_result {
-                self.query_expander.merge_llm_result(&mut expanded, llm_result);
+                self.query_expander
+                    .merge_llm_result(&mut expanded, llm_result);
             }
         }
 
@@ -189,7 +192,8 @@ impl LocalSearchEngine {
         };
 
         let symbol_hits = if self.symbol_index.is_ready() {
-            self.symbol_index.search_multi(search_tokens, max_results * 2, Some(trimmed))
+            self.symbol_index
+                .search_multi(search_tokens, max_results * 2, Some(trimmed))
         } else {
             Vec::new()
         };
@@ -230,12 +234,24 @@ impl LocalSearchEngine {
             }),
             QueryIntent::Semantic => expanded.weight_hints.map(|wh| {
                 let mut w = RankWeights::default();
-                if let Some(v) = wh.symbol_match { w.symbol_match = v; }
-                if let Some(v) = wh.tfidf { w.tfidf = v; }
-                if let Some(v) = wh.position_weight { w.position_weight = v; }
-                if let Some(v) = wh.centrality { w.centrality = v; }
-                if let Some(v) = wh.recency { w.recency = v; }
-                if let Some(v) = wh.type_weight { w.type_weight = v; }
+                if let Some(v) = wh.symbol_match {
+                    w.symbol_match = v;
+                }
+                if let Some(v) = wh.tfidf {
+                    w.tfidf = v;
+                }
+                if let Some(v) = wh.position_weight {
+                    w.position_weight = v;
+                }
+                if let Some(v) = wh.centrality {
+                    w.centrality = v;
+                }
+                if let Some(v) = wh.recency {
+                    w.recency = v;
+                }
+                if let Some(v) = wh.type_weight {
+                    w.type_weight = v;
+                }
                 w
             }),
         };
@@ -403,8 +419,7 @@ impl LocalSearchEngine {
             self.inverted_index
                 .update_file(&project_root, file_path, file_type);
             self.symbol_index.update_file(&project_root, file_path);
-            self.dependency_graph
-                .update_file(&project_root, file_path);
+            self.dependency_graph.update_file(&project_root, file_path);
         }
 
         for file_path in &freshness.added {
@@ -417,15 +432,15 @@ impl LocalSearchEngine {
             self.inverted_index
                 .update_file(&project_root, file_path, file_type);
             self.symbol_index.update_file(&project_root, file_path);
-            self.dependency_graph
-                .update_file(&project_root, file_path);
+            self.dependency_graph.update_file(&project_root, file_path);
         }
 
         true
     }
 
     fn save_index(&self) {
-        let manifest = IndexPersistence::build_file_manifest(&self.project_root, &self.indexed_files);
+        let manifest =
+            IndexPersistence::build_file_manifest(&self.project_root, &self.indexed_files);
         let snapshot = PersistenceSnapshot {
             version: 1,
             project_root: self.project_root.clone(),
@@ -444,8 +459,7 @@ impl LocalSearchEngine {
         let project_root = self.project_root.clone();
         self.inverted_index
             .update_file(&project_root, relative_path, file_type);
-        self.symbol_index
-            .update_file(&project_root, relative_path);
+        self.symbol_index.update_file(&project_root, relative_path);
         self.dependency_graph
             .update_file(&project_root, relative_path);
         self.update_tracked_file_state(relative_path);
@@ -466,14 +480,19 @@ impl LocalSearchEngine {
         self.search_cache.invalidate_by_file(relative_path);
     }
 
-    fn ensure_indexed_file_record(&mut self, relative_path: &str, preferred_type: Option<&str>) -> String {
+    fn ensure_indexed_file_record(
+        &mut self,
+        relative_path: &str,
+        preferred_type: Option<&str>,
+    ) -> String {
         if let Some(entry) = self.indexed_files.iter().find(|(p, _)| p == relative_path) {
             return entry.1.clone();
         }
         let ft = preferred_type
             .unwrap_or_else(|| classify_file_type_str(relative_path))
             .to_string();
-        self.indexed_files.push((relative_path.to_string(), ft.clone()));
+        self.indexed_files
+            .push((relative_path.to_string(), ft.clone()));
         ft
     }
 
@@ -555,8 +574,7 @@ impl LocalSearchEngine {
             let drifted = match tracked {
                 None => true,
                 Some(&(t_mtime, t_size)) => {
-                    (mtime as i64 - t_mtime as i64).unsigned_abs() > 1
-                        || t_size != meta.len()
+                    (mtime as i64 - t_mtime as i64).unsigned_abs() > 1 || t_size != meta.len()
                 }
             };
 
@@ -576,8 +594,7 @@ impl LocalSearchEngine {
         let now = now_millis();
         self.recent_edited_files.insert(file_path.to_string(), now);
         if self.recent_edited_files.len() > RECENT_EDIT_MAX_FILES {
-            let mut sorted: Vec<(String, u64)> =
-                self.recent_edited_files.drain().collect();
+            let mut sorted: Vec<(String, u64)> = self.recent_edited_files.drain().collect();
             sorted.sort_by(|a, b| b.1.cmp(&a.1));
             sorted.truncate(RECENT_EDIT_MAX_FILES);
             self.recent_edited_files = sorted.into_iter().collect();
@@ -587,7 +604,8 @@ impl LocalSearchEngine {
     fn get_recent_edited_file_set(&mut self) -> HashSet<String> {
         let now = now_millis();
         let mut recent = HashSet::new();
-        self.recent_edited_files.retain(|_, ts| now - *ts <= RECENT_EDIT_TTL_MS);
+        self.recent_edited_files
+            .retain(|_, ts| now - *ts <= RECENT_EDIT_TTL_MS);
         for (fp, _) in &self.recent_edited_files {
             recent.insert(fp.clone());
         }
@@ -609,9 +627,11 @@ impl LocalSearchEngine {
 
         for i in 0..top_n {
             let top_result = &ranked[i];
-            let neighbors = self
-                .dependency_graph
-                .expand(&top_result.file_path, 1, crate::dependency_graph::ExpandDirection::Both);
+            let neighbors = self.dependency_graph.expand(
+                &top_result.file_path,
+                1,
+                crate::dependency_graph::ExpandDirection::Both,
+            );
 
             for neighbor_file in neighbors {
                 if existing.contains(&neighbor_file) {
@@ -652,8 +672,10 @@ impl LocalSearchEngine {
         max_results: usize,
         max_context_length: usize,
     ) -> Vec<SearchResult> {
-        let index_hit_map: HashMap<&str, &IndexSearchHit> =
-            index_hits.iter().map(|h| (h.file_path.as_str(), h)).collect();
+        let index_hit_map: HashMap<&str, &IndexSearchHit> = index_hits
+            .iter()
+            .map(|h| (h.file_path.as_str(), h))
+            .collect();
 
         let mut symbol_line_map: HashMap<&str, Vec<usize>> = HashMap::new();
         for hit in symbol_hits {
@@ -758,13 +780,22 @@ fn extract_snippets(
                 } else if e > s {
                     (s, e)
                 } else {
-                    (hit_line.saturating_sub(2), (hit_line + 2).min(lines.len().saturating_sub(1)))
+                    (
+                        hit_line.saturating_sub(2),
+                        (hit_line + 2).min(lines.len().saturating_sub(1)),
+                    )
                 }
             } else {
-                (hit_line.saturating_sub(2), (hit_line + 2).min(lines.len().saturating_sub(1)))
+                (
+                    hit_line.saturating_sub(2),
+                    (hit_line + 2).min(lines.len().saturating_sub(1)),
+                )
             }
         } else {
-            (hit_line.saturating_sub(2), (hit_line + 2).min(lines.len().saturating_sub(1)))
+            (
+                hit_line.saturating_sub(2),
+                (hit_line + 2).min(lines.len().saturating_sub(1)),
+            )
         };
         ranges.push((start, end));
     }
@@ -841,8 +872,10 @@ fn classify_file_type_str(file_path: &str) -> &'static str {
         .unwrap_or_default()
         .to_string_lossy();
 
-    if base.contains(".test.") || base.contains(".spec.")
-        || lower.contains("/test/") || lower.contains("/tests/")
+    if base.contains(".test.")
+        || base.contains(".spec.")
+        || lower.contains("/test/")
+        || lower.contains("/tests/")
         || lower.contains("/__tests__/")
     {
         return "test";
@@ -855,9 +888,9 @@ fn classify_file_type_str(file_path: &str) -> &'static str {
 
     match ext.as_ref() {
         "json" | "yaml" | "yml" | "toml" | "ini" | "env" | "cfg" => "config",
-        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "go" | "java" | "rs" | "c"
-        | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "cs" | "php" | "rb" | "swift" | "kt"
-        | "kts" | "m" | "mm" | "vue" | "svelte" => "source",
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "go" | "java" | "rs" | "c" | "h"
+        | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "cs" | "php" | "rb" | "swift" | "kt" | "kts"
+        | "m" | "mm" | "vue" | "svelte" => "source",
         "md" | "txt" | "rst" => "doc",
         _ => "doc",
     }
@@ -877,7 +910,10 @@ fn add_path_tokens_to_vocabulary(file_path: &str, vocab: &mut HashSet<String>) {
     let normalized = file_path.replace('\\', "/");
     for part in normalized.split(&['/', '.', '_', '-'][..]) {
         let token = part.trim().to_lowercase();
-        if token.len() >= 3 && token.len() <= 64 && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        if token.len() >= 3
+            && token.len() <= 64
+            && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
             vocab.insert(token);
         }
     }
@@ -930,7 +966,8 @@ mod tests {
 
     #[test]
     fn test_engine_not_ready_before_build() {
-        let engine = LocalSearchEngine::new("/tmp/nonexistent_12345", SearchEngineConfig::default());
+        let engine =
+            LocalSearchEngine::new("/tmp/nonexistent_12345", SearchEngineConfig::default());
         assert!(!engine.is_ready());
     }
 }

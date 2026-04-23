@@ -3,7 +3,7 @@ use crate::{
     KnowledgeGovernanceLink, KnowledgeGovernanceOutcome, KnowledgeKind, KnowledgeQuery,
     KnowledgeRecord, KnowledgeStore,
 };
-use magi_core::UtcMillis;
+use magi_core::{UtcMillis, WorkspaceId};
 
 #[test]
 fn list_uses_deterministic_tie_breaker() {
@@ -16,6 +16,7 @@ fn list_uses_deterministic_tie_breaker() {
         title: "B".to_string(),
         content: "content".to_string(),
         tags: vec!["tag".to_string()],
+        workspace_id: None,
         source_ref: Some("ref-b".to_string()),
         updated_at,
     });
@@ -25,6 +26,7 @@ fn list_uses_deterministic_tie_breaker() {
         title: "A".to_string(),
         content: "content".to_string(),
         tags: vec!["tag".to_string()],
+        workspace_id: None,
         source_ref: Some("ref-a".to_string()),
         updated_at,
     });
@@ -61,7 +63,10 @@ fn code_index_ingestion_persists_source_and_governance_sidecars() {
         .code_source("kb-code-1")
         .expect("code index source should be retained");
     assert_eq!(source.path, "crates/magi-knowledge-store/src/query.rs");
-    assert_eq!(source.symbol.as_ref().map(|symbol| symbol.name.as_str()), Some("execute"));
+    assert_eq!(
+        source.symbol.as_ref().map(|symbol| symbol.name.as_str()),
+        Some("execute")
+    );
 
     let audit = store
         .audit_link("kb-code-1")
@@ -92,6 +97,7 @@ fn query_and_governed_output_close_the_code_index_loop() {
         title: "FAQ".to_string(),
         content: "Human guidance without source metadata".to_string(),
         tags: vec!["faq".to_string()],
+        workspace_id: None,
         source_ref: None,
         updated_at: UtcMillis(50),
     });
@@ -100,15 +106,28 @@ fn query_and_governed_output_close_the_code_index_loop() {
         kind: Some(KnowledgeKind::CodeIndex),
         text: Some("execute query.rs safe_read".to_string()),
         tags: vec![],
+        workspace_id: None,
         limit: 10,
     };
 
     let result = store.query(&query);
     assert_eq!(result.total_matches, 1);
     assert_eq!(result.matches[0].record.knowledge_id, "kb-code-1");
-    assert!(result.matches[0].matched_terms.contains(&"execute".to_string()));
-    assert!(result.matches[0].matched_terms.contains(&"query".to_string()));
-    assert!(result.matches[0].matched_terms.contains(&"safe".to_string()));
+    assert!(
+        result.matches[0]
+            .matched_terms
+            .contains(&"execute".to_string())
+    );
+    assert!(
+        result.matches[0]
+            .matched_terms
+            .contains(&"query".to_string())
+    );
+    assert!(
+        result.matches[0]
+            .matched_terms
+            .contains(&"safe".to_string())
+    );
 
     let governed = store.governed_output(&query);
     assert_eq!(governed.len(), 1);
@@ -117,7 +136,10 @@ fn query_and_governed_output_close_the_code_index_loop() {
     assert_eq!(record.knowledge_id, "kb-code-1");
     assert_eq!(record.source_ref.as_deref(), Some("src/query.rs#execute"));
     assert_eq!(
-        record.code_source.as_ref().map(|source| source.path.as_str()),
+        record
+            .code_source
+            .as_ref()
+            .map(|source| source.path.as_str()),
         Some("crates/magi-knowledge-store/src/query.rs")
     );
     assert_eq!(
@@ -129,7 +151,10 @@ fn query_and_governed_output_close_the_code_index_loop() {
         Some(CodeSymbolKind::Function)
     );
     assert_eq!(
-        record.audit_link.as_ref().map(|audit| audit.audit_event_id.as_str()),
+        record
+            .audit_link
+            .as_ref()
+            .map(|audit| audit.audit_event_id.as_str()),
         Some("audit-knowledge-index-1")
     );
     assert_eq!(
@@ -152,6 +177,7 @@ fn plain_upsert_overwrites_old_code_index_sidecars() {
         title: "Shared FAQ".to_string(),
         content: "Fallback human-authored note".to_string(),
         tags: vec!["faq".to_string()],
+        workspace_id: None,
         source_ref: None,
         updated_at: UtcMillis(200),
     });
@@ -164,6 +190,7 @@ fn plain_upsert_overwrites_old_code_index_sidecars() {
         kind: None,
         text: Some("fallback".to_string()),
         tags: vec![],
+        workspace_id: None,
         limit: 10,
     });
     let overwritten = outputs
@@ -212,4 +239,80 @@ fn sample_code_index(knowledge_id: &str) -> CodeIndexIngestion {
             audit_event_id: Some("audit-knowledge-index-1".to_string()),
         }),
     }
+}
+
+#[test]
+fn query_filters_records_by_workspace_id() {
+    let store = KnowledgeStore::new();
+    let workspace_a = WorkspaceId::new("workspace-a");
+    let workspace_b = WorkspaceId::new("workspace-b");
+
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "kb-a".to_string(),
+        kind: KnowledgeKind::Faq,
+        title: "Workspace A".to_string(),
+        content: "alpha".to_string(),
+        tags: vec!["faq".to_string()],
+        workspace_id: Some(workspace_a.clone()),
+        source_ref: None,
+        updated_at: UtcMillis(1),
+    });
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "kb-b".to_string(),
+        kind: KnowledgeKind::Faq,
+        title: "Workspace B".to_string(),
+        content: "beta".to_string(),
+        tags: vec!["faq".to_string()],
+        workspace_id: Some(workspace_b.clone()),
+        source_ref: None,
+        updated_at: UtcMillis(2),
+    });
+
+    let scoped = store.query(&KnowledgeQuery {
+        kind: None,
+        text: None,
+        tags: vec![],
+        workspace_id: Some(workspace_a),
+        limit: 10,
+    });
+
+    assert_eq!(scoped.total_matches, 1);
+    assert_eq!(scoped.records[0].knowledge_id, "kb-a");
+}
+
+#[test]
+fn clear_workspace_and_delete_in_workspace_are_scoped() {
+    let store = KnowledgeStore::new();
+    let workspace_a = WorkspaceId::new("workspace-a");
+    let workspace_b = WorkspaceId::new("workspace-b");
+
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "kb-a".to_string(),
+        kind: KnowledgeKind::Faq,
+        title: "Workspace A".to_string(),
+        content: "alpha".to_string(),
+        tags: vec![],
+        workspace_id: Some(workspace_a.clone()),
+        source_ref: None,
+        updated_at: UtcMillis(1),
+    });
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "kb-b".to_string(),
+        kind: KnowledgeKind::Faq,
+        title: "Workspace B".to_string(),
+        content: "beta".to_string(),
+        tags: vec![],
+        workspace_id: Some(workspace_b.clone()),
+        source_ref: None,
+        updated_at: UtcMillis(2),
+    });
+
+    store
+        .delete_in_workspace("kb-a", &workspace_a)
+        .expect("workspace owned record should delete");
+    assert!(store.get("kb-a").is_none());
+    assert!(store.get("kb-b").is_some());
+
+    store.clear_workspace(&workspace_b);
+    assert!(store.get("kb-b").is_none());
 }

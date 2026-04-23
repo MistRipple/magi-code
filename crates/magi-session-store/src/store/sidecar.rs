@@ -1,11 +1,11 @@
 use super::SessionStore;
 use crate::models::{
-    ActiveExecutionChain, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
-    SessionRuntimeSidecar, SessionSidecarFlushReason,
+    ActiveExecutionChain, ActiveExecutionTurnItem, SessionExecutionSidecarStatus,
+    SessionExecutionSidecarStoreState, SessionRuntimeSidecar, SessionSidecarFlushReason,
 };
 use magi_core::{
-    DomainError, DomainResult, ExecutionOwnership, RecoveryResumeInput, SessionId,
-    TaskExecutionTarget, UtcMillis,
+    DomainError, DomainResult, ExecutionOwnership, LeaseId, RecoveryResumeInput, SessionId,
+    TaskExecutionTarget, TaskId, UtcMillis, WorkerId,
 };
 
 impl SessionStore {
@@ -57,7 +57,9 @@ impl SessionStore {
             .state
             .write()
             .expect("session state write lock poisoned");
-        state.execution_sidecar_store.upsert_runtime_sidecar(sidecar);
+        state
+            .execution_sidecar_store
+            .upsert_runtime_sidecar(sidecar);
         drop(state);
         self.mark_sidecar_dirty(reason);
     }
@@ -99,10 +101,22 @@ impl SessionStore {
     pub fn bind_execution_ownership(&self, session_id: SessionId, ownership: ExecutionOwnership) {
         let session_key = session_id.clone();
         let existing = self.runtime_sidecar(&session_id);
-        let recovery_id = existing.as_ref().and_then(|sidecar| sidecar.recovery_id.clone());
-        let active_execution_chain = existing
+        let recovery_id = existing
+            .as_ref()
+            .and_then(|sidecar| sidecar.recovery_id.clone());
+        let requested_workspace_id = ownership.workspace_id.clone().or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|sidecar| sidecar.ownership.workspace_id.clone())
+        });
+        let mut active_execution_chain = existing
             .as_ref()
             .and_then(|sidecar| sidecar.active_execution_chain.clone());
+        if let Some(chain) = active_execution_chain.as_mut()
+            && chain.workspace_id.is_none()
+        {
+            chain.workspace_id = requested_workspace_id;
+        }
         let ownership = if let Some(chain) = active_execution_chain.as_ref() {
             Self::ownership_from_active_execution_chain(chain)
         } else {
@@ -145,10 +159,11 @@ impl SessionStore {
             });
         }
         active_execution_chain.normalize();
-        let recovery_id = active_execution_chain
-            .recovery_ref
-            .clone()
-            .or_else(|| existing.as_ref().and_then(|sidecar| sidecar.recovery_id.clone()));
+        let recovery_id = active_execution_chain.recovery_ref.clone().or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|sidecar| sidecar.recovery_id.clone())
+        });
         let active_execution_chain = Some(active_execution_chain);
         let ownership = active_execution_chain
             .as_ref()
@@ -167,7 +182,10 @@ impl SessionStore {
             updated.clone(),
             SessionSidecarFlushReason::UpsertActiveExecutionChain,
         );
-        self.sync_session_workspace_binding(&updated.session_id, updated.ownership.workspace_id.as_ref());
+        self.sync_session_workspace_binding(
+            &updated.session_id,
+            updated.ownership.workspace_id.as_ref(),
+        );
         Ok(updated)
     }
 
@@ -312,7 +330,10 @@ impl SessionStore {
             updated.clone(),
             SessionSidecarFlushReason::ApplyResumeExecutionTarget,
         );
-        self.sync_session_workspace_binding(&updated.session_id, updated.ownership.workspace_id.as_ref());
+        self.sync_session_workspace_binding(
+            &updated.session_id,
+            updated.ownership.workspace_id.as_ref(),
+        );
         Ok(updated)
     }
 
@@ -352,6 +373,232 @@ impl SessionStore {
         recovery_ref: Option<String>,
     ) -> DomainResult<SessionRuntimeSidecar> {
         self.attach_recovery_id(session_id, recovery_ref)
+    }
+
+    pub fn update_active_execution_branch_snapshot(
+        &self,
+        task_id: &TaskId,
+        worker_id: WorkerId,
+        stage: String,
+        lease_id: Option<LeaseId>,
+        execution_intent_ref: Option<String>,
+        binding_lifecycle: Option<String>,
+        checkpoint_stage: Option<String>,
+        next_step_index: Option<usize>,
+        checkpoint_at: Option<UtcMillis>,
+        resume_mode: Option<String>,
+        resume_token: Option<String>,
+    ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        let updated = {
+            let mut state = self
+                .state
+                .write()
+                .expect("session state write lock poisoned");
+            'updated: {
+                for sidecar in &mut state.execution_sidecar_store.runtime_sidecars {
+                    let Some(chain) = sidecar.active_execution_chain.as_mut() else {
+                        continue;
+                    };
+                    let Some(branch) = chain
+                        .branches
+                        .iter_mut()
+                        .find(|branch| &branch.task_id == task_id)
+                    else {
+                        continue;
+                    };
+                    branch.worker_id = worker_id.clone();
+                    branch.stage = stage.clone();
+                    branch.lease_id = lease_id.clone();
+                    branch.execution_intent_ref = execution_intent_ref.clone();
+                    branch.binding_lifecycle = binding_lifecycle.clone();
+                    branch.checkpoint_stage = checkpoint_stage.clone();
+                    branch.next_step_index = next_step_index;
+                    branch.checkpoint_at = checkpoint_at;
+                    branch.resume_mode = resume_mode.clone();
+                    branch.resume_token = resume_token.clone();
+                    if let Some(turn) = chain.current_turn.as_mut() {
+                        if let Some(lane) = turn
+                            .worker_lanes
+                            .iter_mut()
+                            .find(|lane| lane.task_id == branch.task_id)
+                        {
+                            lane.worker_id = branch.worker_id.clone();
+                        }
+                        turn.normalize();
+                    }
+                    chain.active_branch_task_ids = chain
+                        .branches
+                        .iter()
+                        .map(|entry| entry.task_id.clone())
+                        .collect();
+                    chain.active_worker_bindings = chain
+                        .branches
+                        .iter()
+                        .map(|entry| entry.worker_id.clone())
+                        .collect();
+                    chain.normalize();
+                    sidecar.ownership = Self::ownership_from_active_execution_chain(chain);
+                    sidecar.status = Self::derive_sidecar_status(
+                        &sidecar.ownership,
+                        sidecar.recovery_id.as_deref(),
+                    );
+                    sidecar.updated_at = UtcMillis::now();
+                    break 'updated Some(sidecar.clone());
+                }
+                None
+            }
+        };
+        if updated.is_some() {
+            self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateActiveExecutionBranchSnapshot);
+        }
+        Ok(updated)
+    }
+
+    pub fn append_current_turn_item(
+        &self,
+        session_id: &SessionId,
+        mut item: ActiveExecutionTurnItem,
+    ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        let updated = {
+            let mut state = self
+                .state
+                .write()
+                .expect("session state write lock poisoned");
+            let Some(sidecar) = state
+                .execution_sidecar_store
+                .runtime_sidecars
+                .iter_mut()
+                .find(|sidecar| &sidecar.session_id == session_id)
+            else {
+                return Err(DomainError::NotFound {
+                    entity: "session_runtime_sidecar",
+                });
+            };
+            let Some(chain) = sidecar.active_execution_chain.as_mut() else {
+                return Ok(None);
+            };
+            let Some(turn) = chain.current_turn.as_mut() else {
+                return Ok(None);
+            };
+            let next_item_seq = turn
+                .items
+                .iter()
+                .map(|existing| existing.item_seq)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            if item.item_seq == 0 {
+                item.item_seq = next_item_seq;
+            }
+            turn.items.push(item);
+            turn.normalize();
+            chain.normalize();
+            sidecar.updated_at = UtcMillis::now();
+            Some(sidecar.clone())
+        };
+        if updated.is_some() {
+            self.mark_sidecar_dirty(SessionSidecarFlushReason::AppendCurrentTurnItem);
+        }
+        Ok(updated)
+    }
+
+    pub fn upsert_current_turn_item(
+        &self,
+        session_id: &SessionId,
+        mut item: ActiveExecutionTurnItem,
+    ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        let updated = {
+            let mut state = self
+                .state
+                .write()
+                .expect("session state write lock poisoned");
+            let Some(sidecar) = state
+                .execution_sidecar_store
+                .runtime_sidecars
+                .iter_mut()
+                .find(|sidecar| &sidecar.session_id == session_id)
+            else {
+                return Err(DomainError::NotFound {
+                    entity: "session_runtime_sidecar",
+                });
+            };
+            let Some(chain) = sidecar.active_execution_chain.as_mut() else {
+                return Ok(None);
+            };
+            let Some(turn) = chain.current_turn.as_mut() else {
+                return Ok(None);
+            };
+
+            if let Some(existing) = turn
+                .items
+                .iter_mut()
+                .find(|existing| existing.item_id == item.item_id)
+            {
+                if item.item_seq == 0 {
+                    item.item_seq = existing.item_seq;
+                }
+                *existing = item;
+            } else {
+                let next_item_seq = turn
+                    .items
+                    .iter()
+                    .map(|existing| existing.item_seq)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                if item.item_seq == 0 {
+                    item.item_seq = next_item_seq;
+                }
+                turn.items.push(item);
+            }
+
+            turn.normalize();
+            chain.normalize();
+            sidecar.updated_at = UtcMillis::now();
+            Some(sidecar.clone())
+        };
+        if updated.is_some() {
+            self.mark_sidecar_dirty(SessionSidecarFlushReason::AppendCurrentTurnItem);
+        }
+        Ok(updated)
+    }
+
+    pub fn update_current_turn_status(
+        &self,
+        session_id: &SessionId,
+        status: impl Into<String>,
+    ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        let updated = {
+            let mut state = self
+                .state
+                .write()
+                .expect("session state write lock poisoned");
+            let Some(sidecar) = state
+                .execution_sidecar_store
+                .runtime_sidecars
+                .iter_mut()
+                .find(|sidecar| &sidecar.session_id == session_id)
+            else {
+                return Err(DomainError::NotFound {
+                    entity: "session_runtime_sidecar",
+                });
+            };
+            let Some(chain) = sidecar.active_execution_chain.as_mut() else {
+                return Ok(None);
+            };
+            let Some(turn) = chain.current_turn.as_mut() else {
+                return Ok(None);
+            };
+            turn.status = status.into();
+            turn.normalize();
+            chain.normalize();
+            sidecar.updated_at = UtcMillis::now();
+            Some(sidecar.clone())
+        };
+        if updated.is_some() {
+            self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateCurrentTurnStatus);
+        }
+        Ok(updated)
     }
 
     pub fn clear_execution_ownership(&self, session_id: &SessionId) -> DomainResult<()> {

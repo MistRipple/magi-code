@@ -10,9 +10,7 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
-pub use authority::{
-    UsageAuthority, build_execution_binding_identity, build_usage_call_identity,
-};
+pub use authority::{UsageAuthority, build_execution_binding_identity, build_usage_call_identity};
 pub use costing::{NormalizedUsageTotals, normalize_usage_delta};
 pub use ledger_store::InMemoryLedgerStore;
 pub use model_identity::build_model_resolution_identity;

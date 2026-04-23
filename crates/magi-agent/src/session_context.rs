@@ -106,12 +106,19 @@ impl SessionExecutionContext {
         self.touch();
     }
 
-    pub fn set_pending_plan_approval(&mut self, request_id: String, context: PendingPlanApprovalContext) {
+    pub fn set_pending_plan_approval(
+        &mut self,
+        request_id: String,
+        context: PendingPlanApprovalContext,
+    ) {
         self.pending_plan_approvals.insert(request_id, context);
         self.touch();
     }
 
-    pub fn get_pending_plan_approval(&self, request_id: &str) -> Option<&PendingPlanApprovalContext> {
+    pub fn get_pending_plan_approval(
+        &self,
+        request_id: &str,
+    ) -> Option<&PendingPlanApprovalContext> {
         self.pending_plan_approvals.get(request_id)
     }
 

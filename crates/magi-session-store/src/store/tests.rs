@@ -1,11 +1,44 @@
 use super::*;
-use crate::models::{SessionExecutionSidecarStatus, SessionSidecarFlushReason, SessionStoreState};
+use crate::models::{
+    ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
+    SessionExecutionSidecarStatus, SessionSidecarFlushReason, SessionStoreState,
+};
 use magi_core::{
     ExecutionOwnership, MissionId, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskId,
     UtcMillis, WorkerId, WorkspaceId,
 };
 use serde_json::json;
 use std::{thread, time::Duration};
+
+#[test]
+fn unique_timeline_entry_id_appends_suffix_for_duplicate_base() {
+    let session_id = SessionId::new("session-duplicate-entry");
+    let occurred_at = UtcMillis(42);
+    let mut timeline = vec![TimelineEntry {
+        entry_id: "timeline-session-duplicate-entry-42".to_string(),
+        session_id: session_id.clone(),
+        kind: TimelineEntryKind::UserMessage,
+        message: "第一条并发消息".to_string(),
+        occurred_at,
+    }];
+
+    let next =
+        unique_timeline_entry_id(&timeline, "timeline-session-duplicate-entry-42".to_string());
+    assert_eq!(next, "timeline-session-duplicate-entry-42-1");
+
+    timeline.push(TimelineEntry {
+        entry_id: next,
+        session_id,
+        kind: TimelineEntryKind::UserMessage,
+        message: "第二条并发消息".to_string(),
+        occurred_at,
+    });
+
+    assert_eq!(
+        unique_timeline_entry_id(&timeline, "timeline-session-duplicate-entry-42".to_string()),
+        "timeline-session-duplicate-entry-42-2"
+    );
+}
 
 #[test]
 fn append_timeline_entry_updates_session_timestamp_and_user_message_count() {
@@ -64,7 +97,10 @@ fn session_sidecar_store_keeps_status_and_recovery_alias() {
         .attach_recovery_id(&session_id, Some("recovery-1".to_string()))
         .expect("recovery id should be attachable");
     assert_eq!(sidecar.recovery_id.as_deref(), Some("recovery-1"));
-    assert_eq!(sidecar.status, SessionExecutionSidecarStatus::RecoveryLinked);
+    assert_eq!(
+        sidecar.status,
+        SessionExecutionSidecarStatus::RecoveryLinked
+    );
 
     let state = store.export_state();
     let roundtrip: SessionStoreState =
@@ -97,6 +133,91 @@ fn session_sidecar_store_keeps_status_and_recovery_alias() {
     );
     assert_eq!(export.recovery_ref.as_deref(), Some("recovery-1"));
     assert_eq!(export.execution_chain_ref.as_deref(), Some("chain-1"));
+}
+
+#[test]
+fn bind_execution_ownership_backfills_workspace_into_active_chain() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-active-chain-workspace");
+    let workspace_id = WorkspaceId::new("workspace-active-chain");
+    store
+        .create_session(session_id.clone(), "Active Chain Workspace")
+        .expect("session should be creatable");
+    store
+        .upsert_active_execution_chain(
+            session_id.clone(),
+            ActiveExecutionChain {
+                session_id: session_id.clone(),
+                mission_id: MissionId::new("mission-active-chain"),
+                root_task_id: TaskId::new("task-root-active-chain"),
+                execution_chain_ref: "chain-active-workspace".to_string(),
+                workspace_id: None,
+                active_branch_task_ids: vec![TaskId::new("task-active-chain")],
+                active_worker_bindings: vec![WorkerId::new("worker-active-chain")],
+                branches: vec![ActiveExecutionBranch {
+                    task_id: TaskId::new("task-active-chain"),
+                    worker_id: WorkerId::new("worker-active-chain"),
+                    stage: "finish".to_string(),
+                    lease_id: None,
+                    execution_intent_ref: None,
+                    binding_lifecycle: None,
+                    checkpoint_stage: None,
+                    next_step_index: None,
+                    checkpoint_at: None,
+                    resume_mode: None,
+                    resume_token: None,
+                    use_tools: false,
+                    skill_name: None,
+                    is_primary: true,
+                }],
+                recovery_ref: None,
+                dispatch_context: ActiveExecutionDispatchContext {
+                    accepted_at: UtcMillis::now(),
+                    entry_id: "timeline-active-chain".to_string(),
+                    trimmed_text: Some("active chain".to_string()),
+                    deep_task: false,
+                    skill_name: None,
+                },
+                current_turn: None,
+            },
+        )
+        .expect("active execution chain should upsert");
+    assert!(
+        store
+            .runtime_sidecar(&session_id)
+            .expect("sidecar should exist")
+            .ownership
+            .workspace_id
+            .is_none()
+    );
+
+    store.bind_execution_ownership(
+        session_id.clone(),
+        ExecutionOwnership {
+            session_id: Some(session_id.clone()),
+            workspace_id: Some(workspace_id.clone()),
+            execution_chain_ref: Some("chain-active-workspace".to_string()),
+            ..ExecutionOwnership::default()
+        },
+    );
+
+    let sidecar = store
+        .runtime_sidecar(&session_id)
+        .expect("sidecar should exist after binding");
+    assert_eq!(sidecar.ownership.workspace_id, Some(workspace_id.clone()));
+    assert_eq!(
+        sidecar
+            .active_execution_chain
+            .as_ref()
+            .and_then(|chain| chain.workspace_id.clone()),
+        Some(workspace_id.clone())
+    );
+    assert_eq!(
+        store
+            .session(&session_id)
+            .and_then(|session| session.workspace_id),
+        Some(workspace_id.to_string())
+    );
 }
 
 #[test]
@@ -162,7 +283,10 @@ fn persisted_parts_round_trip_preserves_sidecars() {
         export.current_status,
         SessionExecutionSidecarStatus::RecoveryLinked
     );
-    assert_eq!(export.execution_chain_ref.as_deref(), Some("chain-persisted"));
+    assert_eq!(
+        export.execution_chain_ref.as_deref(),
+        Some("chain-persisted")
+    );
     assert_eq!(export.recovery_ref.as_deref(), Some("recovery-persisted"));
 }
 
@@ -219,7 +343,10 @@ fn execution_sidecar_flush_metadata_tracks_recovery_apply_and_resume() {
         Some(SessionSidecarFlushReason::ApplyRecoveryResumeInput)
     );
     assert!(recovery_metadata.last_dirty_at.is_some());
-    assert_eq!(recovery_metadata.next_flush_hint, recovery_metadata.last_dirty_at);
+    assert_eq!(
+        recovery_metadata.next_flush_hint,
+        recovery_metadata.last_dirty_at
+    );
 
     let updated = store
         .apply_resume_execution_target(
@@ -242,7 +369,10 @@ fn execution_sidecar_flush_metadata_tracks_recovery_apply_and_resume() {
         Some(SessionSidecarFlushReason::ApplyResumeExecutionTarget)
     );
     assert!(resume_metadata.last_dirty_at.is_some());
-    assert_eq!(resume_metadata.next_flush_hint, resume_metadata.last_dirty_at);
+    assert_eq!(
+        resume_metadata.next_flush_hint,
+        resume_metadata.last_dirty_at
+    );
 
     let mut flushes = Vec::new();
     assert!(
@@ -325,7 +455,10 @@ fn full_recovery_lifecycle_bind_resume_input_dispatch_with_consistency_checks() 
     let sidecar = store
         .runtime_sidecar(&session_id)
         .expect("sidecar should exist after recovery input");
-    assert_eq!(sidecar.status, SessionExecutionSidecarStatus::RecoveryLinked);
+    assert_eq!(
+        sidecar.status,
+        SessionExecutionSidecarStatus::RecoveryLinked
+    );
     assert_eq!(sidecar.recovery_id.as_deref(), Some("recovery-full"));
     assert_eq!(
         sidecar.ownership.execution_chain_ref.as_deref(),
@@ -355,9 +488,15 @@ fn full_recovery_lifecycle_bind_resume_input_dispatch_with_consistency_checks() 
         )
         .expect("resume execution target should apply");
     assert_eq!(resumed.status, SessionExecutionSidecarStatus::Resumed);
-    assert_eq!(resumed.ownership.mission_id, Some(MissionId::new("mission-full")));
+    assert_eq!(
+        resumed.ownership.mission_id,
+        Some(MissionId::new("mission-full"))
+    );
     assert_eq!(resumed.ownership.task_id, Some(TaskId::new("todo-full")));
-    assert_eq!(resumed.ownership.worker_id, Some(WorkerId::new("worker-full")));
+    assert_eq!(
+        resumed.ownership.worker_id,
+        Some(WorkerId::new("worker-full"))
+    );
     assert_eq!(resumed.ownership.session_id, Some(session_id.clone()));
     assert_eq!(resumed.ownership.workspace_id, Some(workspace_id.clone()));
     assert_eq!(
@@ -378,7 +517,10 @@ fn full_recovery_lifecycle_bind_resume_input_dispatch_with_consistency_checks() 
         export.execution_chain_ref.as_deref(),
         Some("chain-recovery-full")
     );
-    assert_eq!(export.ownership.mission_id, Some(MissionId::new("mission-full")));
+    assert_eq!(
+        export.ownership.mission_id,
+        Some(MissionId::new("mission-full"))
+    );
 
     let active = store.active_execution_sidecars();
     assert_eq!(active.len(), 1);
@@ -627,7 +769,10 @@ fn multi_session_recovery_sidecars_are_isolated() {
         export_a.current_status,
         SessionExecutionSidecarStatus::RecoveryLinked
     );
-    assert_eq!(export_b.current_status, SessionExecutionSidecarStatus::Bound);
+    assert_eq!(
+        export_b.current_status,
+        SessionExecutionSidecarStatus::Bound
+    );
 
     let metadata = store.execution_sidecar_flush_metadata();
     assert_eq!(metadata.current_version, 3);

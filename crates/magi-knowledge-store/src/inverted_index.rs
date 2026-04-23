@@ -71,11 +71,7 @@ impl InvertedIndex {
         self.ready
     }
 
-    pub fn build_from_files(
-        &mut self,
-        project_root: &str,
-        files: &[(String, String)],
-    ) {
+    pub fn build_from_files(&mut self, project_root: &str, files: &[(String, String)]) {
         self.postings.clear();
         self.doc_meta.clear();
         self.file_tokens.clear();
@@ -137,7 +133,8 @@ impl InvertedIndex {
             );
         }
 
-        self.file_tokens.insert(file_path.to_string(), file_term_set);
+        self.file_tokens
+            .insert(file_path.to_string(), file_term_set);
         self.total_docs += 1;
     }
 
@@ -179,10 +176,8 @@ impl InvertedIndex {
         for token in query_tokens {
             if let Some(posting_map) = self.postings.get(token) {
                 let df = posting_map.len();
-                let idf = ((self.total_docs as f64 - df as f64 + 0.5)
-                    / (df as f64 + 0.5)
-                    + 1.0)
-                    .ln();
+                let idf =
+                    ((self.total_docs as f64 - df as f64 + 0.5) / (df as f64 + 0.5) + 1.0).ln();
 
                 for (file_path, entry) in posting_map {
                     let doc_len = self
@@ -240,7 +235,9 @@ impl InvertedIndex {
         }
 
         let cmp = |a: &IndexSearchHit, b: &IndexSearchHit| -> std::cmp::Ordering {
-            a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal)
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         };
         let mut heap = MinHeap::new(max_results, cmp);
 

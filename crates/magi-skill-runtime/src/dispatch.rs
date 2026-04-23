@@ -1,8 +1,8 @@
 use crate::{
-    observation::build_dispatch_observation,
-    routing::{resolve_bridge_binding_id, resolve_observation_binding, resolve_route},
     SkillDispatchError, SkillDispatchExecutionOutcome, SkillDispatchInput, SkillDispatchResult,
     SkillDispatchRoute, SkillDispatchRuntime, SkillToolRuntimePlan,
+    observation::build_dispatch_observation,
+    routing::{resolve_bridge_binding_id, resolve_observation_binding, resolve_route},
 };
 use magi_bridge_client::BridgeDispatchInput;
 use magi_governance::ToolKind;

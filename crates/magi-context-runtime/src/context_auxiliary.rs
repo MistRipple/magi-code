@@ -81,15 +81,9 @@ impl ContextAuxiliary {
         }
 
         let compressed = match self.config.strategy {
-            CompressionStrategy::PreventiveTruncation => {
-                self.preventive_truncation(messages)
-            }
-            CompressionStrategy::ImportanceBased => {
-                self.importance_based(messages)
-            }
-            CompressionStrategy::SummaryBased => {
-                self.summary_based(messages)
-            }
+            CompressionStrategy::PreventiveTruncation => self.preventive_truncation(messages),
+            CompressionStrategy::ImportanceBased => self.importance_based(messages),
+            CompressionStrategy::SummaryBased => self.summary_based(messages),
         };
 
         let retained_count = compressed.len();
@@ -176,11 +170,7 @@ impl ContextAuxiliary {
                 let protected = msg.pinned
                     || (self.config.preserve_system && msg.role == MessageRole::System)
                     || i >= tail_start;
-                let score = if protected {
-                    f64::MAX
-                } else {
-                    msg.importance
-                };
+                let score = if protected { f64::MAX } else { msg.importance };
                 (i, score, protected)
             })
             .collect();

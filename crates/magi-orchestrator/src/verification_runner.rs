@@ -100,10 +100,7 @@ pub enum DiagnosticSeverity {
     Warning,
 }
 
-const NON_BLOCKING_WARNING_PATTERNS: &[&str] = &[
-    "自动跳过编译检查",
-    "未找到可用编译命令",
-];
+const NON_BLOCKING_WARNING_PATTERNS: &[&str] = &["自动跳过编译检查", "未找到可用编译命令"];
 
 pub fn is_non_blocking_verification_warning(warning: &str) -> bool {
     let trimmed = warning.trim();
@@ -303,8 +300,16 @@ impl VerificationRunner {
         let start = Instant::now();
         let timeout = Duration::from_millis(self.config.timeout_ms);
 
-        let shell = if cfg!(target_os = "windows") { "cmd" } else { "sh" };
-        let flag = if cfg!(target_os = "windows") { "/C" } else { "-c" };
+        let shell = if cfg!(target_os = "windows") {
+            "cmd"
+        } else {
+            "sh"
+        };
+        let flag = if cfg!(target_os = "windows") {
+            "/C"
+        } else {
+            "-c"
+        };
 
         let output = Command::new(shell)
             .arg(flag)
@@ -325,10 +330,7 @@ impl VerificationRunner {
                     output: stdout,
                     error: if !success {
                         Some(if stderr.is_empty() {
-                            format!(
-                                "{name}失败，退出码: {}",
-                                output.status.code().unwrap_or(-1)
-                            )
+                            format!("{name}失败，退出码: {}", output.status.code().unwrap_or(-1))
                         } else {
                             stderr
                         })
@@ -422,7 +424,9 @@ impl VerificationRunner {
         let mut hit_count = std::collections::HashMap::<PathBuf, usize>::new();
         for file in files {
             let normalized = self.normalize_modified_path(file);
-            let Some(normalized) = normalized else { continue };
+            let Some(normalized) = normalized else {
+                continue;
+            };
             let project_root = self
                 .find_nearest_project_root(&normalized)
                 .unwrap_or_else(|| self.workspace_root.clone());

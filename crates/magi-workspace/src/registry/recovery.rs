@@ -1,8 +1,7 @@
 use super::{RecoverySidecarFlushState, WorkspaceStore};
 use crate::models::{
-    RecoveryHandle, RecoveryStatus, WorkspaceRecoveryFlushMetadata,
-    WorkspaceRecoveryFlushReason, WorkspaceRecoverySidecarExport,
-    WorkspaceRecoverySidecarStoreState,
+    RecoveryHandle, RecoveryStatus, WorkspaceRecoveryFlushMetadata, WorkspaceRecoveryFlushReason,
+    WorkspaceRecoverySidecarExport, WorkspaceRecoverySidecarStoreState,
 };
 use magi_core::{
     DomainError, DomainResult, ExecutionOwnership, RecoveryResumeInput, UtcMillis, WorkspaceId,

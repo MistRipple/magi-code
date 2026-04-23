@@ -1,9 +1,8 @@
 use super::{
-    collect_unique_option_string, AssignmentRuntimeSummaryEntry,
-    ExecutionGroupRuntimeSummaryEntry,
-    RecoveryActivityStage, RecoveryReadModelInput, RecoveryResumeObservationSummary,
-    RuntimeAttentionSummary, RuntimeDiagnosticSummary, RuntimeWorkQueueSummary,
-    TaskRuntimeSummaryEntry, ToolRuntimeSummaryEntry, WorkerRuntimeSummaryEntry,
+    AssignmentRuntimeSummaryEntry, ExecutionGroupRuntimeSummaryEntry, RecoveryActivityStage,
+    RecoveryReadModelInput, RecoveryResumeObservationSummary, RuntimeAttentionSummary,
+    RuntimeDiagnosticSummary, RuntimeWorkQueueSummary, TaskRuntimeSummaryEntry,
+    ToolRuntimeSummaryEntry, WorkerRuntimeSummaryEntry, collect_unique_option_string,
 };
 
 impl RuntimeDiagnosticSummary {
@@ -62,30 +61,20 @@ impl RuntimeDiagnosticSummary {
                 "failed",
             ),
             active_worker_count: count_status(
-                workers
-                    .iter()
-                    .map(|entry| entry.current_status.as_deref()),
+                workers.iter().map(|entry| entry.current_status.as_deref()),
                 "running",
             ) + count_status(
-                workers
-                    .iter()
-                    .map(|entry| entry.current_status.as_deref()),
+                workers.iter().map(|entry| entry.current_status.as_deref()),
                 "reviewing",
             ) + count_status(
-                workers
-                    .iter()
-                    .map(|entry| entry.current_status.as_deref()),
+                workers.iter().map(|entry| entry.current_status.as_deref()),
                 "verifying",
             ) + count_status(
-                workers
-                    .iter()
-                    .map(|entry| entry.current_status.as_deref()),
+                workers.iter().map(|entry| entry.current_status.as_deref()),
                 "repairing",
             ),
             failed_worker_count: count_status(
-                workers
-                    .iter()
-                    .map(|entry| entry.current_status.as_deref()),
+                workers.iter().map(|entry| entry.current_status.as_deref()),
                 "failed",
             ),
             blocked_tool_count: tools.iter().map(|entry| entry.blocked_count).sum(),
@@ -276,10 +265,7 @@ impl RuntimeWorkQueueSummary {
                 .filter(|entry| {
                     matches!(
                         entry.current_status.as_deref(),
-                        Some("running")
-                            | Some("reviewing")
-                            | Some("verifying")
-                            | Some("repairing")
+                        Some("running") | Some("reviewing") | Some("verifying") | Some("repairing")
                     )
                 })
                 .map(|entry| entry.worker_id.clone())

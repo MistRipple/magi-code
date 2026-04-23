@@ -15,9 +15,9 @@ struct OwnershipFilter<'a> {
 impl OwnershipFilter<'_> {
     fn matches(self, allocation: &WorktreeAllocation) -> bool {
         allocation.active
-            && self
-                .session_id
-                .is_none_or(|session_id| allocation.ownership.session_id.as_ref() == Some(session_id))
+            && self.session_id.is_none_or(|session_id| {
+                allocation.ownership.session_id.as_ref() == Some(session_id)
+            })
             && self
                 .task_id
                 .is_none_or(|task_id| allocation.ownership.task_id.as_ref() == Some(task_id))
@@ -27,21 +27,24 @@ impl OwnershipFilter<'_> {
     }
 }
 
-fn has_active_ownership_conflict(
+fn active_ownership_conflict_index(
     state: &WorkspaceStoreState,
     workspace_id: &WorkspaceId,
     ownership: &ExecutionOwnership,
-) -> bool {
-    let ownership_scoped =
-        ownership.session_id.is_some() || ownership.task_id.is_some() || ownership.worker_id.is_some();
-    ownership_scoped
-        && state.worktree_allocations.iter().any(|allocation| {
-            allocation.active
-                && &allocation.workspace_id == workspace_id
-                && allocation.ownership.session_id == ownership.session_id
-                && allocation.ownership.task_id == ownership.task_id
-                && allocation.ownership.worker_id == ownership.worker_id
-        })
+) -> Option<usize> {
+    let ownership_scoped = ownership.session_id.is_some()
+        || ownership.task_id.is_some()
+        || ownership.worker_id.is_some();
+    if !ownership_scoped {
+        return None;
+    }
+    state.worktree_allocations.iter().position(|allocation| {
+        allocation.active
+            && &allocation.workspace_id == workspace_id
+            && allocation.ownership.session_id == ownership.session_id
+            && allocation.ownership.task_id == ownership.task_id
+            && allocation.ownership.worker_id == ownership.worker_id
+    })
 }
 
 fn release_workspace_allocations(
@@ -59,10 +62,7 @@ fn release_workspace_allocations(
     }
 }
 
-fn clear_workspace_root_if_inactive(
-    state: &mut WorkspaceStoreState,
-    workspace_id: &WorkspaceId,
-) {
+fn clear_workspace_root_if_inactive(state: &mut WorkspaceStoreState, workspace_id: &WorkspaceId) {
     let has_active = state
         .worktree_allocations
         .iter()
@@ -101,10 +101,23 @@ impl WorkspaceStore {
         worktree_root: AbsolutePath,
     ) -> DomainResult<WorkspaceRecord> {
         let mut state = self.write_state();
-        if has_active_ownership_conflict(&state, workspace_id, &ownership) {
-            return Err(DomainError::AlreadyExists {
-                entity: "worktree_allocation",
-            });
+        if let Some(index) = active_ownership_conflict_index(&state, workspace_id, &ownership) {
+            let existing_root = state.worktree_allocations[index].worktree_root.clone();
+            if existing_root != worktree_root {
+                return Err(DomainError::AlreadyExists {
+                    entity: "worktree_allocation",
+                });
+            }
+            let workspace = state
+                .workspaces
+                .iter_mut()
+                .find(|workspace| &workspace.workspace_id == workspace_id)
+                .ok_or(DomainError::NotFound {
+                    entity: "workspace",
+                })?;
+            workspace.worktree_root = Some(existing_root);
+            workspace.updated_at = UtcMillis::now();
+            return Ok(workspace.clone());
         }
 
         let now = UtcMillis::now();
@@ -113,7 +126,9 @@ impl WorkspaceStore {
                 .workspaces
                 .iter_mut()
                 .find(|workspace| &workspace.workspace_id == workspace_id)
-                .ok_or(DomainError::NotFound { entity: "workspace" })?;
+                .ok_or(DomainError::NotFound {
+                    entity: "workspace",
+                })?;
             workspace.worktree_root = Some(worktree_root.clone());
             workspace.updated_at = now;
             workspace.clone()
@@ -143,7 +158,9 @@ impl WorkspaceStore {
                 .workspaces
                 .iter_mut()
                 .find(|workspace| &workspace.workspace_id == workspace_id)
-                .ok_or(DomainError::NotFound { entity: "workspace" })?;
+                .ok_or(DomainError::NotFound {
+                    entity: "workspace",
+                })?;
             workspace.worktree_root = None;
             workspace.updated_at = released_at;
             workspace.clone()

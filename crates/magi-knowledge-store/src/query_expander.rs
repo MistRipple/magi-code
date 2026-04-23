@@ -90,7 +90,8 @@ impl QueryExpander {
 
         self.offline_expand(query, original_tokens, &mut all_tokens);
 
-        let expanded_tokens: Vec<String> = all_tokens.into_iter().take(MAX_EXPANDED_TOKENS).collect();
+        let expanded_tokens: Vec<String> =
+            all_tokens.into_iter().take(MAX_EXPANDED_TOKENS).collect();
 
         ExpandedQuery {
             original: query.to_string(),
@@ -189,12 +190,7 @@ impl QueryExpander {
         }
     }
 
-    fn offline_expand(
-        &self,
-        query: &str,
-        tokens: &[String],
-        result: &mut HashSet<String>,
-    ) {
+    fn offline_expand(&self, query: &str, tokens: &[String], result: &mut HashSet<String>) {
         let query_lower = query.to_lowercase();
 
         for (zh_key, en_values) in SYNONYM_ENTRIES {
@@ -402,7 +398,10 @@ static SYNONYM_ENTRIES: &[(&str, &[&str])] = &[
     ("提示词", &["prompt", "instruction", "systemprompt"]),
     // English synonym expansions
     ("auth", &["authentication", "authorize", "login", "signin"]),
-    ("config", &["configuration", "settings", "options", "preferences"]),
+    (
+        "config",
+        &["configuration", "settings", "options", "preferences"],
+    ),
     ("init", &["initialize", "setup", "bootstrap", "startup"]),
     ("exec", &["execute", "run", "invoke", "perform"]),
     ("err", &["error", "exception", "failure", "fault"]),
@@ -414,40 +413,138 @@ static SYNONYM_ENTRIES: &[(&str, &[&str])] = &[
     ("fn", &["function", "method", "handler", "procedure"]),
     ("args", &["arguments", "params", "parameters", "inputs"]),
     ("opts", &["options", "config", "settings", "preferences"]),
-    ("create", &["generate", "produce", "build", "make", "construct", "add", "insert"]),
-    ("remove", &["delete", "destroy", "drop", "unlink", "erase", "purge"]),
-    ("update", &["modify", "patch", "edit", "change", "alter", "mutate"]),
-    ("get", &["fetch", "retrieve", "obtain", "read", "load", "acquire"]),
-    ("set", &["assign", "store", "write", "save", "put", "update"]),
-    ("send", &["emit", "dispatch", "publish", "broadcast", "transmit"]),
-    ("receive", &["accept", "consume", "handle", "process", "listen"]),
+    (
+        "create",
+        &[
+            "generate",
+            "produce",
+            "build",
+            "make",
+            "construct",
+            "add",
+            "insert",
+        ],
+    ),
+    (
+        "remove",
+        &["delete", "destroy", "drop", "unlink", "erase", "purge"],
+    ),
+    (
+        "update",
+        &["modify", "patch", "edit", "change", "alter", "mutate"],
+    ),
+    (
+        "get",
+        &["fetch", "retrieve", "obtain", "read", "load", "acquire"],
+    ),
+    (
+        "set",
+        &["assign", "store", "write", "save", "put", "update"],
+    ),
+    (
+        "send",
+        &["emit", "dispatch", "publish", "broadcast", "transmit"],
+    ),
+    (
+        "receive",
+        &["accept", "consume", "handle", "process", "listen"],
+    ),
     ("start", &["begin", "launch", "open", "activate", "enable"]),
-    ("stop", &["end", "halt", "close", "deactivate", "disable", "shutdown"]),
-    ("parse", &["analyze", "extract", "decode", "deserialize", "interpret"]),
-    ("format", &["serialize", "encode", "stringify", "render", "template"]),
-    ("validate", &["verify", "check", "assert", "ensure", "confirm", "sanitize"]),
-    ("convert", &["transform", "map", "translate", "adapt", "cast"]),
-    ("find", &["search", "query", "lookup", "locate", "discover", "match"]),
-    ("filter", &["exclude", "select", "where", "predicate", "sieve"]),
-    ("sort", &["order", "rank", "arrange", "compare", "prioritize"]),
-    ("merge", &["combine", "join", "concat", "aggregate", "union"]),
-    ("split", &["divide", "separate", "partition", "chunk", "tokenize"]),
+    (
+        "stop",
+        &["end", "halt", "close", "deactivate", "disable", "shutdown"],
+    ),
+    (
+        "parse",
+        &["analyze", "extract", "decode", "deserialize", "interpret"],
+    ),
+    (
+        "format",
+        &["serialize", "encode", "stringify", "render", "template"],
+    ),
+    (
+        "validate",
+        &["verify", "check", "assert", "ensure", "confirm", "sanitize"],
+    ),
+    (
+        "convert",
+        &["transform", "map", "translate", "adapt", "cast"],
+    ),
+    (
+        "find",
+        &["search", "query", "lookup", "locate", "discover", "match"],
+    ),
+    (
+        "filter",
+        &["exclude", "select", "where", "predicate", "sieve"],
+    ),
+    (
+        "sort",
+        &["order", "rank", "arrange", "compare", "prioritize"],
+    ),
+    (
+        "merge",
+        &["combine", "join", "concat", "aggregate", "union"],
+    ),
+    (
+        "split",
+        &["divide", "separate", "partition", "chunk", "tokenize"],
+    ),
     ("cache", &["memo", "memoize", "buffer", "store", "pool"]),
     ("queue", &["buffer", "fifo", "stack", "pipe", "channel"]),
-    ("event", &["signal", "trigger", "hook", "notification", "action"]),
-    ("error", &["exception", "failure", "fault", "issue", "bug", "defect"]),
-    ("log", &["logger", "logging", "trace", "debug", "audit", "record"]),
-    ("test", &["spec", "unittest", "assert", "expect", "mock", "stub"]),
+    (
+        "event",
+        &["signal", "trigger", "hook", "notification", "action"],
+    ),
+    (
+        "error",
+        &["exception", "failure", "fault", "issue", "bug", "defect"],
+    ),
+    (
+        "log",
+        &["logger", "logging", "trace", "debug", "audit", "record"],
+    ),
+    (
+        "test",
+        &["spec", "unittest", "assert", "expect", "mock", "stub"],
+    ),
     ("route", &["router", "endpoint", "path", "url", "mapping"]),
-    ("middleware", &["interceptor", "filter", "guard", "plugin", "hook"]),
-    ("component", &["widget", "element", "module", "block", "part"]),
-    ("state", &["status", "store", "redux", "atom", "signal", "reactive"]),
-    ("database", &["db", "storage", "repository", "datastore", "persistence"]),
-    ("schema", &["model", "entity", "shape", "definition", "structure"]),
-    ("token", &["identifier", "symbol", "key", "credential", "jwt"]),
-    ("stream", &["pipe", "flow", "observable", "channel", "reader", "writer"]),
-    ("worker", &["thread", "process", "executor", "runner", "agent"]),
-    ("promise", &["async", "await", "future", "deferred", "observable"]),
+    (
+        "middleware",
+        &["interceptor", "filter", "guard", "plugin", "hook"],
+    ),
+    (
+        "component",
+        &["widget", "element", "module", "block", "part"],
+    ),
+    (
+        "state",
+        &["status", "store", "redux", "atom", "signal", "reactive"],
+    ),
+    (
+        "database",
+        &["db", "storage", "repository", "datastore", "persistence"],
+    ),
+    (
+        "schema",
+        &["model", "entity", "shape", "definition", "structure"],
+    ),
+    (
+        "token",
+        &["identifier", "symbol", "key", "credential", "jwt"],
+    ),
+    (
+        "stream",
+        &["pipe", "flow", "observable", "channel", "reader", "writer"],
+    ),
+    (
+        "worker",
+        &["thread", "process", "executor", "runner", "agent"],
+    ),
+    (
+        "promise",
+        &["async", "await", "future", "deferred", "observable"],
+    ),
 ];
 
 #[cfg(test)]
@@ -458,14 +555,23 @@ mod tests {
     fn test_offline_expand_chinese() {
         let expander = QueryExpander::new();
         let result = expander.expand_offline("查找登录逻辑", &[]);
-        assert!(result.expanded_tokens.iter().any(|t| t == "login" || t == "auth"));
+        assert!(
+            result
+                .expanded_tokens
+                .iter()
+                .any(|t| t == "login" || t == "auth")
+        );
     }
 
     #[test]
     fn test_offline_expand_english_synonym() {
         let expander = QueryExpander::new();
         let result = expander.expand_offline("auth module", &["auth".into()]);
-        assert!(result.expanded_tokens.contains(&"authentication".to_string()));
+        assert!(
+            result
+                .expanded_tokens
+                .contains(&"authentication".to_string())
+        );
     }
 
     #[test]
@@ -539,17 +645,24 @@ mod tests {
         };
         expander.merge_llm_result(&mut expanded, llm_result);
         assert_eq!(expanded.mode, ExpandMode::Hybrid);
-        assert!(expanded.expanded_tokens.contains(&"extra_token".to_string()));
+        assert!(
+            expanded
+                .expanded_tokens
+                .contains(&"extra_token".to_string())
+        );
         assert!(expanded.weight_hints.is_some());
     }
 
     #[test]
     fn test_export_import_cache() {
         let mut expander = QueryExpander::new();
-        expander.cache_llm_result("q1", &LlmExpandResult {
-            tokens: vec!["t1".into()],
-            weight_hints: None,
-        });
+        expander.cache_llm_result(
+            "q1",
+            &LlmExpandResult {
+                tokens: vec!["t1".into()],
+                weight_hints: None,
+            },
+        );
         let snapshot = expander.export_cache();
         assert_eq!(snapshot.entries.len(), 1);
 

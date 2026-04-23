@@ -1,7 +1,7 @@
 use crate::{
-    builtin::{field_string, parse_json_object, resolve_path},
     BuiltinToolAccessMode, ToolExecutionContext, ToolExecutionInput, ToolExecutionOutput,
     ToolExecutionPolicy, ToolRegistry, WriteProtectionScope,
+    builtin::{field_string, parse_json_object, resolve_path},
 };
 use magi_core::{ToolCallId, UtcMillis};
 use magi_governance::{DecisionPhase, GovernanceDecision, GovernanceOutcome};
@@ -110,10 +110,7 @@ impl ToolRegistry {
         }
     }
 
-    pub(crate) fn resolve_access_mode(
-        &self,
-        input: &ToolExecutionInput,
-    ) -> BuiltinToolAccessMode {
+    pub(crate) fn resolve_access_mode(&self, input: &ToolExecutionInput) -> BuiltinToolAccessMode {
         if input.tool_name == crate::BuiltinToolName::ShellExec.as_str() {
             self.parse_requested_access_mode(&input.input)
                 .unwrap_or(BuiltinToolAccessMode::MaybeWrite)
@@ -122,10 +119,7 @@ impl ToolRegistry {
         }
     }
 
-    pub(crate) fn parse_requested_access_mode(
-        &self,
-        input: &str,
-    ) -> Option<BuiltinToolAccessMode> {
+    pub(crate) fn parse_requested_access_mode(&self, input: &str) -> Option<BuiltinToolAccessMode> {
         parse_json_object(input).and_then(|object| {
             field_string(&object, &["access_mode", "write_mode", "intent"])
                 .and_then(|value| BuiltinToolAccessMode::from_str(&value))

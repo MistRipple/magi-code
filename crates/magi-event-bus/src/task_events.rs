@@ -120,11 +120,7 @@ pub fn lease_granted_event(
 }
 
 /// Create a domain event when a lease is completed.
-pub fn lease_completed_event(
-    lease_id: &str,
-    task_id: &str,
-    worker_id: &str,
-) -> EventEnvelope {
+pub fn lease_completed_event(lease_id: &str, task_id: &str, worker_id: &str) -> EventEnvelope {
     EventEnvelope::domain(
         EventId::new(format!("event-task-lease-completed-{}", UtcMillis::now().0)),
         LEASE_COMPLETED,
@@ -137,11 +133,7 @@ pub fn lease_completed_event(
 }
 
 /// Create a domain event when a lease expires.
-pub fn lease_expired_event(
-    lease_id: &str,
-    task_id: &str,
-    worker_id: &str,
-) -> EventEnvelope {
+pub fn lease_expired_event(lease_id: &str, task_id: &str, worker_id: &str) -> EventEnvelope {
     EventEnvelope::domain(
         EventId::new(format!("event-task-lease-expired-{}", UtcMillis::now().0)),
         LEASE_EXPIRED,
@@ -180,7 +172,10 @@ pub fn decision_created_event(
     description: &str,
 ) -> EventEnvelope {
     EventEnvelope::domain(
-        EventId::new(format!("event-task-decision-created-{}", UtcMillis::now().0)),
+        EventId::new(format!(
+            "event-task-decision-created-{}",
+            UtcMillis::now().0
+        )),
         DECISION_CREATED,
         json!({
             "decision_id": decision_id,
@@ -198,7 +193,10 @@ pub fn decision_resolved_event(
     resolution: &str,
 ) -> EventEnvelope {
     EventEnvelope::domain(
-        EventId::new(format!("event-task-decision-resolved-{}", UtcMillis::now().0)),
+        EventId::new(format!(
+            "event-task-decision-resolved-{}",
+            UtcMillis::now().0
+        )),
         DECISION_RESOLVED,
         json!({
             "decision_id": decision_id,
@@ -215,7 +213,10 @@ pub fn checkpoint_saved_event(
     mission_id: &str,
 ) -> EventEnvelope {
     EventEnvelope::domain(
-        EventId::new(format!("event-task-checkpoint-saved-{}", UtcMillis::now().0)),
+        EventId::new(format!(
+            "event-task-checkpoint-saved-{}",
+            UtcMillis::now().0
+        )),
         CHECKPOINT_SAVED,
         json!({
             "checkpoint_id": checkpoint_id,
@@ -232,7 +233,10 @@ pub fn checkpoint_restored_event(
     mission_id: &str,
 ) -> EventEnvelope {
     EventEnvelope::domain(
-        EventId::new(format!("event-task-checkpoint-restored-{}", UtcMillis::now().0)),
+        EventId::new(format!(
+            "event-task-checkpoint-restored-{}",
+            UtcMillis::now().0
+        )),
         CHECKPOINT_RESTORED,
         json!({
             "checkpoint_id": checkpoint_id,
@@ -249,16 +253,16 @@ mod tests {
 
     #[test]
     fn task_status_changed_event_creates_valid_envelope() {
-        let event = task_status_changed_event(
-            "task-001",
-            "mission-001",
-            "ready",
-            "started",
-            "execution",
-        );
+        let event =
+            task_status_changed_event("task-001", "mission-001", "ready", "started", "execution");
         assert_eq!(event.event_type, TASK_STATUS_CHANGED);
         assert_eq!(event.category, EventCategory::Domain);
-        assert!(event.event_id.as_str().starts_with("event-task-status-changed-"));
+        assert!(
+            event
+                .event_id
+                .as_str()
+                .starts_with("event-task-status-changed-")
+        );
         assert_eq!(event.payload["task_id"], "task-001");
         assert_eq!(event.payload["mission_id"], "mission-001");
         assert_eq!(event.payload["old_status"], "ready");
@@ -271,7 +275,12 @@ mod tests {
         let event = task_graph_created_event("mission-001", "root-001", 5);
         assert_eq!(event.event_type, TASK_GRAPH_CREATED);
         assert_eq!(event.category, EventCategory::Domain);
-        assert!(event.event_id.as_str().starts_with("event-task-graph-created-"));
+        assert!(
+            event
+                .event_id
+                .as_str()
+                .starts_with("event-task-graph-created-")
+        );
         assert_eq!(event.payload["mission_id"], "mission-001");
         assert_eq!(event.payload["root_task_id"], "root-001");
         assert_eq!(event.payload["task_count"], 5);
@@ -282,7 +291,12 @@ mod tests {
         let event = task_graph_replanned_event("mission-002", "root-002", 8, "scope changed");
         assert_eq!(event.event_type, TASK_GRAPH_REPLANNED);
         assert_eq!(event.category, EventCategory::Domain);
-        assert!(event.event_id.as_str().starts_with("event-task-graph-replanned-"));
+        assert!(
+            event
+                .event_id
+                .as_str()
+                .starts_with("event-task-graph-replanned-")
+        );
         assert_eq!(event.payload["mission_id"], "mission-002");
         assert_eq!(event.payload["root_task_id"], "root-002");
         assert_eq!(event.payload["task_count"], 8);
@@ -294,7 +308,12 @@ mod tests {
         let event = lease_granted_event("lease-001", "task-001", "worker-001", "executor");
         assert_eq!(event.event_type, LEASE_GRANTED);
         assert_eq!(event.category, EventCategory::Domain);
-        assert!(event.event_id.as_str().starts_with("event-task-lease-granted-"));
+        assert!(
+            event
+                .event_id
+                .as_str()
+                .starts_with("event-task-lease-granted-")
+        );
         assert_eq!(event.payload["lease_id"], "lease-001");
         assert_eq!(event.payload["task_id"], "task-001");
         assert_eq!(event.payload["worker_id"], "worker-001");
@@ -334,12 +353,8 @@ mod tests {
 
     #[test]
     fn decision_created_event_creates_valid_envelope() {
-        let event = decision_created_event(
-            "decision-001",
-            "task-001",
-            "approval",
-            "needs human review",
-        );
+        let event =
+            decision_created_event("decision-001", "task-001", "approval", "needs human review");
         assert_eq!(event.event_type, DECISION_CREATED);
         assert_eq!(event.category, EventCategory::Domain);
         assert_eq!(event.payload["decision_id"], "decision-001");
@@ -392,7 +407,9 @@ mod tests {
         ];
 
         for event in &events {
-            let sequence = bus.publish(event.clone()).expect("publish task event should succeed");
+            let sequence = bus
+                .publish(event.clone())
+                .expect("publish task event should succeed");
             assert!(sequence > 0);
         }
 

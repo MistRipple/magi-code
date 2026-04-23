@@ -51,6 +51,7 @@ impl ExecutionContextAssemblyRequest {
             kind: None,
             text: self.clues.knowledge_query_text(),
             tags: vec![],
+            workspace_id: Some(self.workspace_id.clone()),
             limit: self.budget.max_knowledge,
         }
     }

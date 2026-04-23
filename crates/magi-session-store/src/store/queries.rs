@@ -2,8 +2,8 @@ use super::SessionStore;
 use crate::models::{
     ActiveExecutionChain, NotificationRecord, SessionDurableState,
     SessionExecutionSidecarStoreState, SessionProjectionInput, SessionRecord,
-    SessionRuntimeSidecar, SessionRuntimeSidecarExport, SessionSidecarFlushMetadata,
-    TimelineEntry, TimelineEntryKind,
+    SessionRuntimeSidecar, SessionRuntimeSidecarExport, SessionSidecarFlushMetadata, TimelineEntry,
+    TimelineEntryKind,
 };
 use magi_core::{ExecutionOwnership, SessionId};
 
@@ -20,7 +20,10 @@ fn with_session_message_count(
     mut session: SessionRecord,
     timeline: &[TimelineEntry],
 ) -> SessionRecord {
-    session.message_count = Some(user_message_count_for_session(timeline, &session.session_id));
+    session.message_count = Some(user_message_count_for_session(
+        timeline,
+        &session.session_id,
+    ));
     session
 }
 
@@ -82,10 +85,7 @@ impl SessionStore {
     }
 
     pub fn current_session(&self) -> Option<SessionRecord> {
-        let state = self
-            .state
-            .read()
-            .expect("session state read lock poisoned");
+        let state = self.state.read().expect("session state read lock poisoned");
         state.current_session_id.as_ref().and_then(|session_id| {
             state
                 .sessions
@@ -97,10 +97,7 @@ impl SessionStore {
     }
 
     pub fn session(&self, session_id: &SessionId) -> Option<SessionRecord> {
-        let state = self
-            .state
-            .read()
-            .expect("session state read lock poisoned");
+        let state = self.state.read().expect("session state read lock poisoned");
         state
             .sessions
             .iter()
@@ -110,10 +107,7 @@ impl SessionStore {
     }
 
     pub fn sessions(&self) -> Vec<SessionRecord> {
-        let state = self
-            .state
-            .read()
-            .expect("session state read lock poisoned");
+        let state = self.state.read().expect("session state read lock poisoned");
         let mut sessions = state.sessions.clone();
         sessions.sort_by(|left, right| left.session_id.as_str().cmp(right.session_id.as_str()));
         sessions
@@ -235,7 +229,8 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
     ) -> Option<SessionRuntimeSidecarExport> {
-        self.runtime_sidecar(session_id).map(|sidecar| sidecar.export_view())
+        self.runtime_sidecar(session_id)
+            .map(|sidecar| sidecar.export_view())
     }
 
     pub fn active_execution_chain(&self, session_id: &SessionId) -> Option<ActiveExecutionChain> {

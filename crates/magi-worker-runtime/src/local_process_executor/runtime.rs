@@ -1,3 +1,4 @@
+use super::loopback::loopback_capability;
 use super::types::{
     LocalProcessExecutionRequest, LocalProcessExecutionResponse, LocalProcessExecutorCapability,
     LocalProcessExecutorProcessModel, LocalProcessProbeRequest, LocalProcessProtocolRequest,
@@ -7,11 +8,10 @@ use super::types::{
     LocalProcessVerifyResponse, WorkerExecutionBindingLifecycle, WorkerExecutionBindingScope,
     WorkerExecutionLeaseState, WorkerExecutionProcessLifecycle, WorkerExecutorFailure,
 };
-use super::loopback::loopback_capability;
 use crate::{
-    ShadowWorkerExecutor, WorkerExecutionFinalReport, WorkerExecutionIntent, WorkerExecutorKind,
-    WorkerExecutorProbe, WorkerExecutorRequest, WorkerStage, WorkerExecutionStepKind,
-    WorkerExecutionTrace,
+    ShadowWorkerExecutor, WorkerExecutionFinalReport, WorkerExecutionIntent,
+    WorkerExecutionStepKind, WorkerExecutionTrace, WorkerExecutorKind, WorkerExecutorProbe,
+    WorkerExecutorRequest, WorkerStage,
 };
 use magi_core::{TaskResultKind, TerminationReason, UtcMillis, VerificationStatus};
 use serde::{Deserialize, Serialize};
@@ -103,7 +103,11 @@ impl LocalProcessWorkerExecutor {
         match std::env::var("MAGI_LOCAL_WORKER_SUPPORTED_STEP_KINDS") {
             Ok(raw) => {
                 let mut kinds = Vec::new();
-                for token in raw.split(',').map(|token| token.trim()).filter(|token| !token.is_empty()) {
+                for token in raw
+                    .split(',')
+                    .map(|token| token.trim())
+                    .filter(|token| !token.is_empty())
+                {
                     let kind = match token {
                         "builtin-tool-invocation" | "builtin" => {
                             Some(WorkerExecutionStepKind::BuiltinToolInvocation)
@@ -195,7 +199,8 @@ impl LocalProcessWorkerExecutor {
 
         let binding_key = Self::binding_key_for_request(request)?;
         if capability.descriptor.reuse_scope != WorkerExecutionBindingScope::None
-            && request.requested_execution_profile.binding_scope == capability.descriptor.reuse_scope
+            && request.requested_execution_profile.binding_scope
+                == capability.descriptor.reuse_scope
             && binding_key.is_some()
         {
             let binding_key = binding_key.expect("binding key checked above");
@@ -205,7 +210,9 @@ impl LocalProcessWorkerExecutor {
                     .descriptor
                     .executor_lease_id
                     .clone()
-                    .unwrap_or_else(|| format!("{}-{binding_suffix}-lease", capability.executor_id)),
+                    .unwrap_or_else(|| {
+                        format!("{}-{binding_suffix}-lease", capability.executor_id)
+                    }),
             );
             capability.descriptor.lease_state = match request.requested_lease_state {
                 WorkerExecutionLeaseState::Released => WorkerExecutionLeaseState::Released,
@@ -220,9 +227,7 @@ impl LocalProcessWorkerExecutor {
                     WorkerExecutionBindingLifecycle::Released
                 }
                 WorkerExecutionBindingLifecycle::Requested
-                | WorkerExecutionBindingLifecycle::Bound => {
-                    WorkerExecutionBindingLifecycle::Bound
-                }
+                | WorkerExecutionBindingLifecycle::Bound => WorkerExecutionBindingLifecycle::Bound,
                 WorkerExecutionBindingLifecycle::None => WorkerExecutionBindingLifecycle::None,
             };
         }
@@ -268,7 +273,8 @@ impl LocalProcessWorkerExecutor {
         };
 
         if capability.descriptor.reuse_scope == WorkerExecutionBindingScope::None
-            || request.requested_execution_profile.binding_scope != capability.descriptor.reuse_scope
+            || request.requested_execution_profile.binding_scope
+                != capability.descriptor.reuse_scope
         {
             return Ok(capability);
         }
@@ -292,13 +298,12 @@ impl LocalProcessWorkerExecutor {
                 .as_ref()
                 .and_then(|record| record.executor_instance_id.clone())
                 .or_else(|| capability.descriptor.executor_instance_id.clone());
-            capability.descriptor.lease_state = if request.requested_lease_state
-                == WorkerExecutionLeaseState::Expired
-            {
-                WorkerExecutionLeaseState::Expired
-            } else {
-                WorkerExecutionLeaseState::Released
-            };
+            capability.descriptor.lease_state =
+                if request.requested_lease_state == WorkerExecutionLeaseState::Expired {
+                    WorkerExecutionLeaseState::Expired
+                } else {
+                    WorkerExecutionLeaseState::Released
+                };
             capability.descriptor.binding_lifecycle = WorkerExecutionBindingLifecycle::Released;
             return Ok(capability);
         }
@@ -313,15 +318,17 @@ impl LocalProcessWorkerExecutor {
             state.next_lease_sequence
         };
         let binding_suffix = binding_key.replace(':', "-");
-        let record = state
-            .leases
-            .entry(binding_key.clone())
-            .or_insert_with(|| LocalProcessExecutorLeaseRecord {
-                lease_id: format!("{}-{binding_suffix}-lease-{next_sequence}", capability.executor_id),
+        let record = state.leases.entry(binding_key.clone()).or_insert_with(|| {
+            LocalProcessExecutorLeaseRecord {
+                lease_id: format!(
+                    "{}-{binding_suffix}-lease-{next_sequence}",
+                    capability.executor_id
+                ),
                 executor_instance_id: Some(instance_id.clone()),
                 last_request_id: request.request_id.clone(),
                 acquisition_count: 0,
-            });
+            }
+        });
         record.last_request_id = request.request_id.clone();
         record.acquisition_count += 1;
         capability.descriptor.executor_instance_id = record.executor_instance_id.clone();
@@ -402,25 +409,30 @@ impl LocalProcessWorkerExecutor {
         for (key, value) in &self.config.env {
             command.env(key, value);
         }
-        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-        let mut child = command
-            .spawn()
-            .map_err(|error| WorkerExecutorFailure::transport(format!("spawn local worker executor failed: {error}")))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| WorkerExecutorFailure::transport("local worker executor stdin unavailable"))?;
-        let request_json = serde_json::to_vec(request)
-            .map_err(|error| WorkerExecutorFailure::protocol(format!("serialize local worker request failed: {error}")))?;
-        stdin
-            .write_all(&request_json)
-            .map_err(|error| WorkerExecutorFailure::transport(format!("write local worker request failed: {error}")))?;
+        let mut child = command.spawn().map_err(|error| {
+            WorkerExecutorFailure::transport(format!("spawn local worker executor failed: {error}"))
+        })?;
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            WorkerExecutorFailure::transport("local worker executor stdin unavailable")
+        })?;
+        let request_json = serde_json::to_vec(request).map_err(|error| {
+            WorkerExecutorFailure::protocol(format!(
+                "serialize local worker request failed: {error}"
+            ))
+        })?;
+        stdin.write_all(&request_json).map_err(|error| {
+            WorkerExecutorFailure::transport(format!("write local worker request failed: {error}"))
+        })?;
         drop(stdin);
 
-        let output = child
-            .wait_with_output()
-            .map_err(|error| WorkerExecutorFailure::transport(format!("wait local worker executor failed: {error}")))?;
+        let output = child.wait_with_output().map_err(|error| {
+            WorkerExecutorFailure::transport(format!("wait local worker executor failed: {error}"))
+        })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(WorkerExecutorFailure::transport(if stderr.is_empty() {
@@ -434,7 +446,11 @@ impl LocalProcessWorkerExecutor {
         }
 
         let response: LocalProcessProtocolResponse = serde_json::from_slice(&output.stdout)
-            .map_err(|error| WorkerExecutorFailure::protocol(format!("decode local worker response failed: {error}")))?;
+            .map_err(|error| {
+                WorkerExecutorFailure::protocol(format!(
+                    "decode local worker response failed: {error}"
+                ))
+            })?;
         if response.request_id != request.request_id {
             return Err(WorkerExecutorFailure::protocol(format!(
                 "local worker response request_id mismatch: expected {}, got {}",
@@ -541,22 +557,23 @@ impl LocalProcessWorkerExecutor {
 
 impl ShadowWorkerExecutor for LocalProcessWorkerExecutor {
     fn execute(&self, intent: &WorkerExecutionIntent) -> WorkerExecutionTrace {
-        self.execute_checked(intent).unwrap_or_else(|error| WorkerExecutionTrace {
-            worker_id: intent.worker_id.clone(),
-            task_id: intent.task_id.clone(),
-            tool_invocations: Vec::new(),
-            skill_dispatches: Vec::new(),
-            final_report: WorkerExecutionFinalReport {
-                summary: format!(
-                    "local process execution failed [{}]: {}",
-                    error.layer.label(),
-                    error.message
-                ),
-                result_kind: Some(TaskResultKind::Failure),
-                termination_reason: Some(TerminationReason::Failed),
-                verification_status: VerificationStatus::Failed,
-            },
-        })
+        self.execute_checked(intent)
+            .unwrap_or_else(|error| WorkerExecutionTrace {
+                worker_id: intent.worker_id.clone(),
+                task_id: intent.task_id.clone(),
+                tool_invocations: Vec::new(),
+                skill_dispatches: Vec::new(),
+                final_report: WorkerExecutionFinalReport {
+                    summary: format!(
+                        "local process execution failed [{}]: {}",
+                        error.layer.label(),
+                        error.message
+                    ),
+                    result_kind: Some(TaskResultKind::Failure),
+                    termination_reason: Some(TerminationReason::Failed),
+                    verification_status: VerificationStatus::Failed,
+                },
+            })
     }
 
     fn execute_checked(
@@ -566,11 +583,40 @@ impl ShadowWorkerExecutor for LocalProcessWorkerExecutor {
         let executor_request = intent.executor_request(WorkerStage::Execute, "execute");
         let probe = self.probe_request(Some(&executor_request))?;
         probe.supports_request(&executor_request)?;
-        Ok(self.execute_request(&LocalProcessExecutionRequest {
+        Ok(self
+            .execute_request(&LocalProcessExecutionRequest {
+                executor_request,
+                intent: intent.clone(),
+                checkpoint_cursor: None,
+            })?
+            .trace)
+    }
+
+    fn execute_from_checkpoint(
+        &self,
+        intent: &WorkerExecutionIntent,
+        checkpoint_cursor: Option<&crate::WorkerExecutionCheckpointCursor>,
+    ) -> Result<crate::WorkerExecutionProgress, WorkerExecutorFailure> {
+        let executor_request = intent.executor_request(WorkerStage::Execute, "execute");
+        let probe = self.probe_request(Some(&executor_request))?;
+        probe.supports_request(&executor_request)?;
+        let response = self.execute_request(&LocalProcessExecutionRequest {
             executor_request,
             intent: intent.clone(),
-        })?
-        .trace)
+            checkpoint_cursor: checkpoint_cursor.cloned(),
+        })?;
+        Ok(crate::WorkerExecutionProgress {
+            trace: response.trace,
+            next_step_index: response.next_step_index,
+            completed: response.completed,
+            checkpoint_cursor: Some(crate::WorkerExecutionCheckpointCursor {
+                checkpoint_stage: WorkerStage::Execute,
+                next_step_index: response.next_step_index,
+                checkpoint_at: magi_core::UtcMillis::now(),
+                resume_mode: crate::WorkerCheckpointResumeMode::StepCheckpoint,
+                resume_token: None,
+            }),
+        })
     }
 
     fn probe(&self) -> Result<WorkerExecutorProbe, WorkerExecutorFailure> {
@@ -596,6 +642,7 @@ impl ShadowWorkerExecutor for LocalProcessWorkerExecutor {
             executor_request,
             intent: intent.clone(),
             prior_trace: prior_trace.cloned(),
+            checkpoint_cursor: None,
         })?;
         Ok((response.trace, response.review_summary))
     }
@@ -612,8 +659,13 @@ impl ShadowWorkerExecutor for LocalProcessWorkerExecutor {
             executor_request,
             intent: intent.clone(),
             prior_trace: prior_trace.cloned(),
+            checkpoint_cursor: None,
         })?;
-        Ok((response.trace, response.verification_status, response.verify_summary))
+        Ok((
+            response.trace,
+            response.verification_status,
+            response.verify_summary,
+        ))
     }
 
     fn repair(
@@ -630,6 +682,7 @@ impl ShadowWorkerExecutor for LocalProcessWorkerExecutor {
             intent: intent.clone(),
             prior_trace: prior_trace.cloned(),
             repair_reason: repair_reason.to_string(),
+            checkpoint_cursor: None,
         })?;
         Ok((response.trace, response.repair_summary))
     }

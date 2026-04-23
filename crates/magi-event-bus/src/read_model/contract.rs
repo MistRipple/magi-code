@@ -236,12 +236,20 @@ impl RuntimeReadModelInput {
             );
         }
         for entry in &self.details.assignments {
-            validate_string_set(&entry.task_ids, "details.assignments[].task_ids", &mut issues);
+            validate_string_set(
+                &entry.task_ids,
+                "details.assignments[].task_ids",
+                &mut issues,
+            );
         }
         for entry in &self.details.tools {
             validate_string_set(&entry.worker_ids, "details.tools[].worker_ids", &mut issues);
             validate_string_set(&entry.task_ids, "details.tools[].task_ids", &mut issues);
-            validate_string_set(&entry.session_ids, "details.tools[].session_ids", &mut issues);
+            validate_string_set(
+                &entry.session_ids,
+                "details.tools[].session_ids",
+                &mut issues,
+            );
             validate_string_set(
                 &entry.workspace_ids,
                 "details.tools[].workspace_ids",
@@ -336,7 +344,10 @@ impl RuntimeReadModelInput {
             &mut issues,
         );
         validate_string_set(
-            &self.operations.attention.governance_approval_required_task_ids,
+            &self
+                .operations
+                .attention
+                .governance_approval_required_task_ids,
             "operations.attention.governance_approval_required_task_ids",
             &mut issues,
         );
@@ -351,7 +362,10 @@ impl RuntimeReadModelInput {
             &mut issues,
         );
         validate_string_set(
-            &self.operations.attention.governance_approval_required_worker_ids,
+            &self
+                .operations
+                .attention
+                .governance_approval_required_worker_ids,
             "operations.attention.governance_approval_required_worker_ids",
             &mut issues,
         );
@@ -411,7 +425,10 @@ impl RuntimeReadModelInput {
             &mut issues,
         );
         validate_string_set(
-            &self.operations.resume_observation.affected_execution_group_ids,
+            &self
+                .operations
+                .resume_observation
+                .affected_execution_group_ids,
             "operations.resume_observation.affected_execution_group_ids",
             &mut issues,
         );
@@ -452,18 +469,12 @@ impl RuntimeReadModelInput {
 
     fn build_freeze_summary(&self) -> RuntimeContractFreezeSummary {
         let mut canonical_entries = Vec::new();
-        canonical_entries.push(format!(
-            "contract_version={}",
-            self.meta.contract_version
-        ));
+        canonical_entries.push(format!("contract_version={}", self.meta.contract_version));
         canonical_entries.push(format!(
             "contract_sections={}",
             self.meta.contract_sections.join(",")
         ));
-        canonical_entries.push(format!(
-            "ordering_strategy={}",
-            self.meta.ordering_strategy
-        ));
+        canonical_entries.push(format!("ordering_strategy={}", self.meta.ordering_strategy));
         for rule in &self.meta.section_ordering_rules {
             canonical_entries.push(format!("rule:{}={}", rule.target, rule.ordering));
         }
@@ -562,10 +573,7 @@ impl RuntimeReadModelInput {
 
     fn build_freeze_evidence_summary(&self) -> RuntimeContractFreezeEvidenceSummary {
         let mut evidence_entries = Vec::new();
-        evidence_entries.push(format!(
-            "contract_version={}",
-            self.meta.contract_version
-        ));
+        evidence_entries.push(format!("contract_version={}", self.meta.contract_version));
         evidence_entries.push(format!(
             "freeze_signature={}",
             self.meta.freeze.canonical_signature
@@ -574,10 +582,7 @@ impl RuntimeReadModelInput {
             "validation_passed={}",
             self.meta.validation.is_valid
         ));
-        evidence_entries.push(format!(
-            "freeze_ready={}",
-            self.meta.freeze_gate.is_ready
-        ));
+        evidence_entries.push(format!("freeze_ready={}", self.meta.freeze_gate.is_ready));
         evidence_entries.push(format!(
             "satisfied_validation_refs={}",
             self.meta.freeze_gate.satisfied_validation_refs.join(",")
@@ -632,19 +637,24 @@ impl RuntimeReadModelInput {
             issues.push("freeze_report.status 与 freeze_gate 结论不一致".to_string());
         }
 
-        if self.meta.freeze_report.evidence_signature != self.meta.freeze_evidence.evidence_signature
+        if self.meta.freeze_report.evidence_signature
+            != self.meta.freeze_evidence.evidence_signature
         {
             issues.push("freeze_report.evidence_signature 与 freeze_evidence 不一致".to_string());
         }
 
         if self.meta.freeze_gate.blocking_issue_count != self.meta.freeze_gate.blocking_issues.len()
         {
-            issues.push("freeze_gate.blocking_issue_count 与 blocking_issues 数量不一致".to_string());
+            issues
+                .push("freeze_gate.blocking_issue_count 与 blocking_issues 数量不一致".to_string());
         }
 
         if self.meta.freeze_report.ready_check_count != self.meta.freeze_gate.readiness_checks.len()
         {
-            issues.push("freeze_report.ready_check_count 与 freeze_gate.readiness_checks 数量不一致".to_string());
+            issues.push(
+                "freeze_report.ready_check_count 与 freeze_gate.readiness_checks 数量不一致"
+                    .to_string(),
+            );
         }
 
         if self.meta.freeze.canonical_signature.is_empty() {
@@ -695,8 +705,12 @@ fn validate_string_set(values: &[String], label: &str, issues: &mut Vec<String>)
     }
 }
 
-fn validate_sorted_by_key<T, K, F>(values: &[T], mut key_fn: F, label: &str, issues: &mut Vec<String>)
-where
+fn validate_sorted_by_key<T, K, F>(
+    values: &[T],
+    mut key_fn: F,
+    label: &str,
+    issues: &mut Vec<String>,
+) where
     K: PartialOrd,
     F: FnMut(&T) -> K,
 {

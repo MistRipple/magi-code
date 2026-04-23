@@ -213,10 +213,7 @@ impl MemoryConsolidationService {
 
         for entry in entries {
             let topic = classify_topic(&entry.content);
-            topic_map
-                .entry(topic.to_string())
-                .or_default()
-                .push(entry);
+            topic_map.entry(topic.to_string()).or_default().push(entry);
         }
 
         topic_map
@@ -243,9 +240,11 @@ impl MemoryConsolidationService {
     fn enforce_topic_token_limit(&self, block: &mut TopicBlock) {
         let mut total_tokens = 0usize;
         let mut keep = Vec::new();
-        block
-            .entries
-            .sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        block.entries.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for entry in block.entries.drain(..) {
             let tokens = estimate_tokens(&entry.content);
             if total_tokens + tokens > self.config.max_topic_tokens {
@@ -303,7 +302,11 @@ fn estimate_tokens(text: &str) -> usize {
 }
 
 fn format_citations(citations: &[String]) -> String {
-    let valid: Vec<&str> = citations.iter().map(|c| c.trim()).filter(|c| !c.is_empty()).collect();
+    let valid: Vec<&str> = citations
+        .iter()
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .collect();
     if valid.is_empty() {
         String::new()
     } else {

@@ -28,11 +28,7 @@ pub struct GovernanceDecision {
 }
 
 impl GovernanceDecision {
-    pub fn allowed(
-        phase: DecisionPhase,
-        threshold: RiskLevel,
-        reason: Option<String>,
-    ) -> Self {
+    pub fn allowed(phase: DecisionPhase, threshold: RiskLevel, reason: Option<String>) -> Self {
         Self {
             outcome: GovernanceOutcome::Allowed,
             allowed: true,

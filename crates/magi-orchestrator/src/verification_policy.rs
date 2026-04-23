@@ -17,12 +17,26 @@ pub struct VerificationModeInput<'a> {
 }
 
 const SMOKE_PATTERNS: &[&str] = &[
-    "快速验证", "快速测试", "快速 smoke", "smoke test", "smoke", "烟测",
-    "连通性验证", "链路验证", "编排测试", "文件编辑测试",
+    "快速验证",
+    "快速测试",
+    "快速 smoke",
+    "smoke test",
+    "smoke",
+    "烟测",
+    "连通性验证",
+    "链路验证",
+    "编排测试",
+    "文件编辑测试",
 ];
 
 const LOW_COST_PATTERNS: &[&str] = &[
-    "不用很麻烦", "别太复杂", "简单验证", "简单测试", "快速完成", "只做验证", "仅做验证",
+    "不用很麻烦",
+    "别太复杂",
+    "简单验证",
+    "简单测试",
+    "快速完成",
+    "只做验证",
+    "仅做验证",
 ];
 
 const QUICK_PATTERNS: &[&str] = &["快速", "简单", "只做", "仅做", "轻量"];
@@ -37,32 +51,44 @@ pub fn resolve_verification_mode(input: &VerificationModeInput) -> VerificationM
 
     if let Some(v) = input.task_title {
         let trimmed = v.trim();
-        if !trimmed.is_empty() { parts.push(trimmed.to_string()); }
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
     }
     if let Some(v) = input.goal {
         let trimmed = v.trim();
-        if !trimmed.is_empty() { parts.push(trimmed.to_string()); }
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
     }
     if let Some(v) = input.analysis {
         let trimmed = v.trim();
-        if !trimmed.is_empty() { parts.push(trimmed.to_string()); }
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
     }
     if let Some(items) = input.acceptance {
         for item in items.iter() {
             let trimmed = item.trim();
-            if !trimmed.is_empty() { parts.push(trimmed.to_string()); }
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_string());
+            }
         }
     }
     if let Some(items) = input.constraints {
         for item in items.iter() {
             let trimmed = item.trim();
-            if !trimmed.is_empty() { parts.push(trimmed.to_string()); }
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_string());
+            }
         }
     }
     if let Some(items) = input.context {
         for item in items.iter() {
             let trimmed = item.trim();
-            if !trimmed.is_empty() { parts.push(trimmed.to_string()); }
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_string());
+            }
         }
     }
 

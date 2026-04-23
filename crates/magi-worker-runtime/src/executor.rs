@@ -1,23 +1,22 @@
 use crate::{
     LocalProcessExecutorAffinity, LocalProcessExecutorCapability, LocalProcessExecutorDescriptor,
-    LocalProcessExecutorHealth, LocalProcessExecutorHealthStatus,
-    LocalProcessExecutorProcessModel, LocalProcessExecutorStageMatrix,
-    WorkerExecutionBindingLifecycle, WorkerExecutionBindingScope,
-    WorkerExecutionFinalReport, WorkerExecutionIntent, WorkerExecutionIntentStep,
-    WorkerExecutionLeaseState, WorkerExecutionMode, WorkerExecutionParallelismScope,
-    WorkerExecutionProcessLifecycle, WorkerExecutionProfile, WorkerExecutionStepKind,
-    WorkerExecutorFailure, WorkerExecutorRequest, WorkerStage, WorkerToolInvocation,
+    LocalProcessExecutorHealth, LocalProcessExecutorHealthStatus, LocalProcessExecutorProcessModel,
+    LocalProcessExecutorStageMatrix, WorkerCheckpointResumeMode, WorkerExecutionBindingLifecycle,
+    WorkerExecutionBindingScope, WorkerExecutionCheckpointCursor, WorkerExecutionFinalReport,
+    WorkerExecutionIntent, WorkerExecutionIntentStep, WorkerExecutionLeaseState,
+    WorkerExecutionMode, WorkerExecutionParallelismScope, WorkerExecutionProcessLifecycle,
+    WorkerExecutionProfile, WorkerExecutionStepKind, WorkerExecutorFailure, WorkerExecutorRequest,
+    WorkerStage, WorkerToolInvocation,
 };
 use magi_bridge_client::BridgeBindingDispatchPlan;
 use magi_core::{
-    ApprovalRequirement, ExecutionResultStatus, RiskLevel, SessionId, TaskResultKind,
-    TerminationReason, TaskId, ToolCallId, UtcMillis, VerificationStatus, WorkerId,
-    WorkspaceId,
+    ApprovalRequirement, ExecutionResultStatus, RiskLevel, SessionId, TaskId, TaskResultKind,
+    TerminationReason, ToolCallId, UtcMillis, VerificationStatus, WorkerId, WorkspaceId,
 };
 use magi_governance::ToolKind;
 use magi_skill_runtime::{
-    SkillDispatchObservation, SkillDispatchRoute, SkillDispatchStatus,
-    SkillToolRoutingSummary, SkillToolRuntimePlan,
+    SkillDispatchObservation, SkillDispatchRoute, SkillDispatchStatus, SkillToolRoutingSummary,
+    SkillToolRuntimePlan,
 };
 use magi_tool_runtime::ToolExecutionPolicy;
 use serde::{Deserialize, Serialize};
@@ -29,6 +28,15 @@ pub struct WorkerExecutionTrace {
     pub tool_invocations: Vec<WorkerToolInvocation>,
     pub skill_dispatches: Vec<SkillDispatchObservation>,
     pub final_report: WorkerExecutionFinalReport,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerExecutionProgress {
+    pub trace: WorkerExecutionTrace,
+    pub next_step_index: usize,
+    pub completed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_cursor: Option<WorkerExecutionCheckpointCursor>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +174,28 @@ impl WorkerExecutorProbe {
 
 pub trait ShadowWorkerExecutor: Send + Sync {
     fn execute(&self, intent: &WorkerExecutionIntent) -> WorkerExecutionTrace;
+
+    fn execute_from_checkpoint(
+        &self,
+        intent: &WorkerExecutionIntent,
+        checkpoint_cursor: Option<&WorkerExecutionCheckpointCursor>,
+    ) -> Result<WorkerExecutionProgress, WorkerExecutorFailure> {
+        let trace = self.execute_checked(intent)?;
+        Ok(WorkerExecutionProgress {
+            trace,
+            next_step_index: intent.steps.len(),
+            completed: true,
+            checkpoint_cursor: checkpoint_cursor.cloned().or_else(|| {
+                Some(WorkerExecutionCheckpointCursor {
+                    checkpoint_stage: WorkerStage::Execute,
+                    next_step_index: intent.steps.len(),
+                    checkpoint_at: UtcMillis::now(),
+                    resume_mode: WorkerCheckpointResumeMode::StageRestart,
+                    resume_token: None,
+                })
+            }),
+        })
+    }
 
     fn execute_checked(
         &self,
@@ -338,6 +368,93 @@ impl DeterministicWorkerExecutor {
             ],
         }
     }
+
+    fn execute_step(
+        &self,
+        intent: &WorkerExecutionIntent,
+        step_index: usize,
+    ) -> Result<WorkerExecutionProgress, WorkerExecutorFailure> {
+        let step = intent.steps.get(step_index).ok_or_else(|| {
+            WorkerExecutorFailure::remote_business(format!(
+                "checkpoint step index {} 超出 intent steps 范围",
+                step_index
+            ))
+        })?;
+        let mut tool_invocations = Vec::new();
+        let mut skill_dispatches = Vec::new();
+        let final_report = match step {
+            WorkerExecutionIntentStep::BuiltinToolInvocation {
+                tool_call_id,
+                tool_name,
+                status,
+                ..
+            } => {
+                tool_invocations.push(WorkerToolInvocation {
+                    worker_id: intent.worker_id.clone(),
+                    task_id: intent.task_id.clone(),
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    status: *status,
+                    observed_at: UtcMillis::now(),
+                });
+                WorkerExecutionFinalReport {
+                    summary: format!("step {} completed", step_index),
+                    result_kind: None,
+                    termination_reason: None,
+                    verification_status: VerificationStatus::Pending,
+                }
+            }
+            WorkerExecutionIntentStep::SkillDispatch {
+                tool_call_id,
+                tool_name,
+                route,
+                binding_id,
+                detail,
+                status,
+                ..
+            } => {
+                skill_dispatches.push(SkillDispatchObservation {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    route: Some(*route),
+                    binding_id: binding_id.clone(),
+                    bridge_kind: None,
+                    dispatch_action: None,
+                    status: *status,
+                    error_kind: None,
+                    bridge_error_layer: None,
+                    bridge_error_message: None,
+                    detail: detail.clone(),
+                });
+                WorkerExecutionFinalReport {
+                    summary: format!("step {} completed", step_index),
+                    result_kind: None,
+                    termination_reason: None,
+                    verification_status: VerificationStatus::Pending,
+                }
+            }
+            WorkerExecutionIntentStep::FinalReport(report) => report.clone(),
+        };
+        let next_step_index = step_index + 1;
+        Ok(WorkerExecutionProgress {
+            trace: WorkerExecutionTrace {
+                worker_id: intent.worker_id.clone(),
+                task_id: intent.task_id.clone(),
+                tool_invocations,
+                skill_dispatches,
+                final_report,
+            },
+            next_step_index,
+            completed: next_step_index >= intent.steps.len(),
+            checkpoint_cursor: Some(WorkerExecutionCheckpointCursor {
+                checkpoint_stage: WorkerStage::Execute,
+                next_step_index,
+                checkpoint_at: UtcMillis::now(),
+                resume_mode: WorkerCheckpointResumeMode::StepCheckpoint,
+                resume_token: None,
+            }),
+        })
+    }
 }
 
 impl ShadowWorkerExecutor for DeterministicWorkerExecutor {
@@ -442,5 +559,16 @@ impl ShadowWorkerExecutor for DeterministicWorkerExecutor {
             skill_dispatches,
             final_report,
         }
+    }
+
+    fn execute_from_checkpoint(
+        &self,
+        intent: &WorkerExecutionIntent,
+        checkpoint_cursor: Option<&WorkerExecutionCheckpointCursor>,
+    ) -> Result<WorkerExecutionProgress, WorkerExecutorFailure> {
+        let step_index = checkpoint_cursor
+            .map(|cursor| cursor.next_step_index)
+            .unwrap_or(0);
+        self.execute_step(intent, step_index)
     }
 }

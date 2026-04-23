@@ -4,8 +4,8 @@ use crate::{
     WorkerExecutionBindingScope, WorkerExecutionIntent, WorkerExecutionLeaseState,
     WorkerExecutionMode, WorkerExecutionParallelismScope, WorkerExecutionProcessLifecycle,
     WorkerExecutionReusePolicy, WorkerExecutionStepKind, WorkerExecutorFailure,
-    WorkerExecutorFailureLayer, WorkerExecutorKind, WorkerExecutorProbe,
-    WorkerExecutorRequest, WorkerRuntime, WorkerStage,
+    WorkerExecutorFailureLayer, WorkerExecutorKind, WorkerExecutorProbe, WorkerExecutorRequest,
+    WorkerRuntime, WorkerStage,
 };
 use magi_core::{TaskId, UtcMillis, WorkerId};
 use serde::{Deserialize, Serialize};
@@ -105,13 +105,57 @@ impl WorkerRuntime {
         probe_result: &Result<WorkerExecutorProbe, WorkerExecutorFailure>,
     ) -> WorkerExecutorObservation {
         let record = match probe_result {
-            Ok(probe) => self.observation_from_probe(worker_id, task_id.clone(), requested_stage, request, probe),
-            Err(error) => self.observation_from_error(worker_id, task_id.clone(), requested_stage, request, error),
+            Ok(probe) => self.observation_from_probe(
+                worker_id,
+                task_id.clone(),
+                requested_stage,
+                request,
+                probe,
+            ),
+            Err(error) => self.observation_from_error(
+                worker_id,
+                task_id.clone(),
+                requested_stage,
+                request,
+                error,
+            ),
         };
         self.executor_observations
             .write()
             .expect("worker executor observation write lock poisoned")
             .push(record.clone());
+        if let Some(task_id) = task_id.clone() {
+            let worker_id = worker_id.clone();
+            let requested_stage = requested_stage.unwrap_or(WorkerStage::Execute);
+            let observed_at = record.observed_at;
+            let executor_lease_id = record.executor_lease_id.clone();
+            let binding_lifecycle = record
+                .binding_lifecycle
+                .or(record.requested_binding_lifecycle);
+            self.upsert_branch_snapshot(&task_id, |existing| crate::WorkerRuntimeBranchSnapshot {
+                task_id: task_id.clone(),
+                worker_id: worker_id.clone(),
+                stage: requested_stage,
+                lease_id: executor_lease_id
+                    .clone()
+                    .or_else(|| existing.and_then(|snapshot| snapshot.lease_id.clone())),
+                execution_intent_ref: existing
+                    .and_then(|snapshot| snapshot.execution_intent_ref.clone()),
+                binding_lifecycle: binding_lifecycle
+                    .or_else(|| existing.and_then(|snapshot| snapshot.binding_lifecycle)),
+                checkpoint_cursor: existing
+                    .and_then(|snapshot| snapshot.checkpoint_cursor.clone())
+                    .or_else(|| {
+                        Some(crate::WorkerExecutionCheckpointCursor {
+                            checkpoint_stage: requested_stage,
+                            next_step_index: 0,
+                            checkpoint_at: observed_at,
+                            resume_mode: crate::WorkerCheckpointResumeMode::StageRestart,
+                            resume_token: None,
+                        })
+                    }),
+            });
+        }
         self.publish_with_category(
             "worker.executor.observed",
             EventCategory::Audit,
@@ -284,7 +328,10 @@ impl WorkerRuntime {
                 .unwrap_or_default(),
             executor_kind: self.executor_kind(),
             observation_status: WorkerExecutorObservationStatus::Unavailable,
-            executor_id: error.detail.as_ref().and_then(|detail| detail.executor_id.clone()),
+            executor_id: error
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.executor_id.clone()),
             executor_version: error
                 .detail
                 .as_ref()

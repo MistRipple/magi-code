@@ -163,7 +163,10 @@ impl WorkspaceRecoverySidecarStoreState {
         recovery_handles
     }
 
-    pub fn recovery_handles_for_workspace(&self, workspace_id: &WorkspaceId) -> Vec<RecoveryHandle> {
+    pub fn recovery_handles_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Vec<RecoveryHandle> {
         let mut recovery_handles = self
             .recovery_handles()
             .into_iter()
@@ -237,12 +240,12 @@ impl WorkspaceRecoverySidecarStoreState {
                 RecoveryStatus::Prepared => {
                     return Err(DomainError::InvalidState {
                         message: format!("recovery_handle {recovery_id} 还未进入 Ready，不能消费"),
-                    })
+                    });
                 }
                 RecoveryStatus::Consumed => {
                     return Err(DomainError::InvalidState {
                         message: format!("recovery_handle {recovery_id} 已被消费"),
-                    })
+                    });
                 }
             }
             handle.ownership = ExecutionOwnership {

@@ -22,16 +22,8 @@ impl KnowledgeState {
     ) {
         self.index_terms
             .insert(record.knowledge_id.clone(), indexed_terms);
-        Self::set_sidecar(
-            &record.knowledge_id,
-            &mut self.code_sources,
-            code_source,
-        );
-        Self::set_sidecar(
-            &record.knowledge_id,
-            &mut self.audit_links,
-            audit_link,
-        );
+        Self::set_sidecar(&record.knowledge_id, &mut self.code_sources, code_source);
+        Self::set_sidecar(&record.knowledge_id, &mut self.audit_links, audit_link);
         Self::set_sidecar(
             &record.knowledge_id,
             &mut self.governance_links,
@@ -75,11 +67,7 @@ impl KnowledgeState {
         self.governance_links.get(knowledge_id).cloned()
     }
 
-    fn set_sidecar<T>(
-        knowledge_id: &str,
-        target: &mut HashMap<String, T>,
-        value: Option<T>,
-    ) {
+    fn set_sidecar<T>(knowledge_id: &str, target: &mut HashMap<String, T>, value: Option<T>) {
         match value {
             Some(value) => {
                 target.insert(knowledge_id.to_string(), value);

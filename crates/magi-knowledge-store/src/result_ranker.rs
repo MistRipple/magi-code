@@ -53,12 +53,36 @@ impl RankWeights {
 
     fn merge_overrides(&self, overrides: &RankWeights) -> Self {
         Self {
-            tfidf: if overrides.tfidf > 0.0 { overrides.tfidf } else { self.tfidf },
-            symbol_match: if overrides.symbol_match > 0.0 { overrides.symbol_match } else { self.symbol_match },
-            position_weight: if overrides.position_weight > 0.0 { overrides.position_weight } else { self.position_weight },
-            centrality: if overrides.centrality > 0.0 { overrides.centrality } else { self.centrality },
-            recency: if overrides.recency > 0.0 { overrides.recency } else { self.recency },
-            type_weight: if overrides.type_weight > 0.0 { overrides.type_weight } else { self.type_weight },
+            tfidf: if overrides.tfidf > 0.0 {
+                overrides.tfidf
+            } else {
+                self.tfidf
+            },
+            symbol_match: if overrides.symbol_match > 0.0 {
+                overrides.symbol_match
+            } else {
+                self.symbol_match
+            },
+            position_weight: if overrides.position_weight > 0.0 {
+                overrides.position_weight
+            } else {
+                self.position_weight
+            },
+            centrality: if overrides.centrality > 0.0 {
+                overrides.centrality
+            } else {
+                self.centrality
+            },
+            recency: if overrides.recency > 0.0 {
+                overrides.recency
+            } else {
+                self.recency
+            },
+            type_weight: if overrides.type_weight > 0.0 {
+                overrides.type_weight
+            } else {
+                self.type_weight
+            },
         }
     }
 }
@@ -160,9 +184,7 @@ impl ResultRanker {
         }
 
         for hit in symbol_hits {
-            let entry = file_map
-                .entry(hit.symbol.file_path.clone())
-                .or_default();
+            let entry = file_map.entry(hit.symbol.file_path.clone()).or_default();
             entry.sources.insert("symbol".to_string());
             entry.symbol_match = entry.symbol_match.max(hit.score);
             if hit.symbol.is_exported {
@@ -193,18 +215,16 @@ impl ResultRanker {
             }
             if !signals.preferred_scopes.is_empty() {
                 for (file_path, entry) in file_map.iter_mut() {
-                    entry.scope_boost =
-                        calculate_scope_boost(file_path, &signals.preferred_scopes);
+                    entry.scope_boost = calculate_scope_boost(file_path, &signals.preferred_scopes);
                 }
             }
         }
 
-        let cmp =
-            |a: &RankedResult, b: &RankedResult| -> std::cmp::Ordering {
-                a.final_score
-                    .partial_cmp(&b.final_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            };
+        let cmp = |a: &RankedResult, b: &RankedResult| -> std::cmp::Ordering {
+            a.final_score
+                .partial_cmp(&b.final_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        };
         let mut heap = MinHeap::new(max_results, cmp);
 
         for (file_path, entry) in file_map {
@@ -306,7 +326,8 @@ mod tests {
     #[test]
     fn test_weight_normalization() {
         let w = RankWeights::default().normalized();
-        let total = w.tfidf + w.symbol_match + w.position_weight + w.centrality + w.recency + w.type_weight;
+        let total =
+            w.tfidf + w.symbol_match + w.position_weight + w.centrality + w.recency + w.type_weight;
         assert!((total - 1.0).abs() < 0.001);
     }
 
@@ -334,7 +355,15 @@ mod tests {
             score: 80.0,
             match_type: MatchType::Exact,
         }];
-        let results = ranker.rank(&index_hits, &symbol_hits, &HashMap::new(), 10, &HashMap::new(), None, None);
+        let results = ranker.rank(
+            &index_hits,
+            &symbol_hits,
+            &HashMap::new(),
+            10,
+            &HashMap::new(),
+            None,
+            None,
+        );
         assert_eq!(results.len(), 1);
         assert!(results[0].final_score > 0.0);
         assert!(results[0].sources.len() >= 2);
@@ -366,7 +395,15 @@ mod tests {
         }];
         let mut centrality = HashMap::new();
         centrality.insert("a.rs".to_string(), 0.5);
-        let r2 = ranker.rank(&index_hits, &symbol_hits, &centrality, 10, &HashMap::new(), None, None);
+        let r2 = ranker.rank(
+            &index_hits,
+            &symbol_hits,
+            &centrality,
+            10,
+            &HashMap::new(),
+            None,
+            None,
+        );
         assert!(r2[0].sources.len() >= 2);
     }
 
@@ -381,8 +418,14 @@ mod tests {
 
     #[test]
     fn test_scope_boost() {
-        assert_eq!(calculate_scope_boost("src/auth.rs", &["src/auth.rs".into()]), 1.0);
-        assert_eq!(calculate_scope_boost("src/auth/login.rs", &["src/auth".into()]), 0.8);
+        assert_eq!(
+            calculate_scope_boost("src/auth.rs", &["src/auth.rs".into()]),
+            1.0
+        );
+        assert_eq!(
+            calculate_scope_boost("src/auth/login.rs", &["src/auth".into()]),
+            0.8
+        );
         assert!((calculate_scope_boost("lib/src/auth/x.rs", &["auth".into()]) - 0.4).abs() < 0.01);
     }
 }

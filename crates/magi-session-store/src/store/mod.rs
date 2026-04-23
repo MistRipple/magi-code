@@ -5,13 +5,10 @@ mod sidecar;
 mod tests;
 
 use crate::models::{
-    NotificationRecord, SessionDurableState, SessionExecutionSidecarStoreState,
-    SessionRecord, SessionSidecarFlushReason, SessionStoreState, TimelineEntry,
-    TimelineEntryKind,
+    NotificationRecord, SessionDurableState, SessionExecutionSidecarStoreState, SessionRecord,
+    SessionSidecarFlushReason, SessionStoreState, TimelineEntry, TimelineEntryKind,
 };
-use magi_core::{
-    DomainError, DomainResult, SessionId, SessionLifecycleStatus, UtcMillis,
-};
+use magi_core::{DomainError, DomainResult, SessionId, SessionLifecycleStatus, UtcMillis};
 use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Debug, Default)]
@@ -28,6 +25,21 @@ struct SidecarFlushState {
 pub struct SessionStore {
     state: Arc<RwLock<SessionStoreState>>,
     sidecar_flush_state: Arc<RwLock<SidecarFlushState>>,
+}
+
+fn unique_timeline_entry_id(existing: &[TimelineEntry], base: String) -> String {
+    if !existing.iter().any(|entry| entry.entry_id == base) {
+        return base;
+    }
+
+    let mut suffix = 1usize;
+    loop {
+        let candidate = format!("{base}-{suffix}");
+        if !existing.iter().any(|entry| entry.entry_id == candidate) {
+            return candidate;
+        }
+        suffix = suffix.saturating_add(1);
+    }
 }
 
 impl Default for SessionStore {
@@ -91,7 +103,11 @@ impl SessionStore {
             .state
             .write()
             .expect("session state write lock poisoned");
-        if state.sessions.iter().any(|session| session.session_id == session_id) {
+        if state
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id)
+        {
             return Err(DomainError::AlreadyExists { entity: "session" });
         }
 
@@ -121,7 +137,9 @@ impl SessionStore {
     /// 按 workspace_id 过滤返回会话列表
     pub fn sessions_for_workspace(&self, workspace_id: &str) -> Vec<SessionRecord> {
         let state = self.state.read().expect("session state read lock poisoned");
-        state.sessions.iter()
+        state
+            .sessions
+            .iter()
             .filter(|s| s.workspace_id.as_deref() == Some(workspace_id))
             .cloned()
             .collect()
@@ -145,8 +163,12 @@ impl SessionStore {
         session.title = new_title.clone();
         session.updated_at = UtcMillis::now();
         let updated = session.clone();
+        let entry_id = unique_timeline_entry_id(
+            &state.timeline,
+            format!("timeline-session-renamed-{}", session_id),
+        );
         state.timeline.push(TimelineEntry {
-            entry_id: format!("timeline-session-renamed-{}", session_id),
+            entry_id,
             session_id: session_id.clone(),
             kind: TimelineEntryKind::SessionRenamed,
             message: format!("会话已重命名: {}", new_title),
@@ -192,16 +214,25 @@ impl SessionStore {
             .write()
             .expect("session state write lock poisoned");
         let before_len = state.sessions.len();
-        state.sessions.retain(|session| &session.session_id != session_id);
+        state
+            .sessions
+            .retain(|session| &session.session_id != session_id);
         if state.sessions.len() == before_len {
             return Err(DomainError::NotFound { entity: "session" });
         }
-        state.timeline.retain(|entry| &entry.session_id != session_id);
+        state
+            .timeline
+            .retain(|entry| &entry.session_id != session_id);
         state
             .notifications
             .retain(|notification| &notification.session_id != session_id);
-        let removed_sidecar = state.execution_sidecar_store.runtime_sidecar(session_id).is_some();
-        state.execution_sidecar_store.remove_runtime_sidecar(session_id);
+        let removed_sidecar = state
+            .execution_sidecar_store
+            .runtime_sidecar(session_id)
+            .is_some();
+        state
+            .execution_sidecar_store
+            .remove_runtime_sidecar(session_id);
         if state.current_session_id.as_ref() == Some(session_id) {
             state.current_session_id = state
                 .sessions
@@ -221,13 +252,21 @@ impl SessionStore {
             .state
             .write()
             .expect("session state write lock poisoned");
-        if !state.sessions.iter().any(|session| &session.session_id == session_id) {
+        if !state
+            .sessions
+            .iter()
+            .any(|session| &session.session_id == session_id)
+        {
             return Err(DomainError::NotFound { entity: "session" });
         }
         let occurred_at = UtcMillis::now();
         state.current_session_id = Some(session_id.clone());
+        let entry_id = unique_timeline_entry_id(
+            &state.timeline,
+            format!("timeline-session-switched-{}-{}", session_id, occurred_at.0),
+        );
         state.timeline.push(TimelineEntry {
-            entry_id: format!("timeline-session-switched-{}-{}", session_id, occurred_at.0),
+            entry_id,
             session_id: session_id.clone(),
             kind: TimelineEntryKind::SessionSwitched,
             message: "当前会话已切换".to_string(),
@@ -247,8 +286,12 @@ impl SessionStore {
             .write()
             .expect("session state write lock poisoned");
         let occurred_at = UtcMillis::now();
+        let entry_id = unique_timeline_entry_id(
+            &state.timeline,
+            format!("timeline-{}-{}", session_id, occurred_at.0),
+        );
         state.timeline.push(TimelineEntry {
-            entry_id: format!("timeline-{}-{}", session_id, occurred_at.0),
+            entry_id,
             session_id: session_id.clone(),
             kind,
             message: message.into(),
@@ -283,8 +326,12 @@ impl SessionStore {
             .write()
             .expect("session state write lock poisoned");
         state.notifications.push(notification.clone());
+        let entry_id = unique_timeline_entry_id(
+            &state.timeline,
+            format!("timeline-notification-{}", notification.notification_id),
+        );
         state.timeline.push(TimelineEntry {
-            entry_id: format!("timeline-notification-{}", notification.notification_id),
+            entry_id,
             session_id,
             kind: TimelineEntryKind::NotificationPublished,
             message: format!("通知已生成: {}", notification.kind),

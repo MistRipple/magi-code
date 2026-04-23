@@ -19,10 +19,7 @@ pub fn canonicalize_base_url(base_url: &str) -> String {
         Ok(parsed) => {
             let scheme = parsed.scheme().to_lowercase();
             let host = parsed.host_str().unwrap_or("").to_lowercase();
-            let port = parsed
-                .port()
-                .map(|p| format!(":{p}"))
-                .unwrap_or_default();
+            let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
             let path = parsed.path().trim_end_matches('/');
             format!("{scheme}://{host}{port}{path}")
         }
@@ -55,11 +52,7 @@ pub fn build_model_resolution_identity(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
             let m = model_config.model.trim();
-            if m.is_empty() {
-                "unknown"
-            } else {
-                m
-            }
+            if m.is_empty() { "unknown" } else { m }
         })
         .to_string();
     let resolved = {

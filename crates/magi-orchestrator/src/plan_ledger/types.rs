@@ -34,21 +34,42 @@ impl PlanStatus {
     pub fn allowed_transitions(self) -> &'static [PlanStatus] {
         match self {
             Self::Draft => &[
-                Self::AwaitingConfirmation, Self::Approved, Self::Executing,
-                Self::Rejected, Self::Failed, Self::Cancelled, Self::Superseded, Self::Completed,
+                Self::AwaitingConfirmation,
+                Self::Approved,
+                Self::Executing,
+                Self::Rejected,
+                Self::Failed,
+                Self::Cancelled,
+                Self::Superseded,
+                Self::Completed,
             ],
             Self::AwaitingConfirmation => &[
-                Self::Approved, Self::Rejected, Self::Executing,
-                Self::Failed, Self::Cancelled, Self::Superseded, Self::Completed,
+                Self::Approved,
+                Self::Rejected,
+                Self::Executing,
+                Self::Failed,
+                Self::Cancelled,
+                Self::Superseded,
+                Self::Completed,
             ],
             Self::Approved => &[
-                Self::Executing, Self::Failed, Self::Cancelled, Self::Superseded, Self::Completed,
+                Self::Executing,
+                Self::Failed,
+                Self::Cancelled,
+                Self::Superseded,
+                Self::Completed,
             ],
             Self::Executing => &[
-                Self::PartiallyCompleted, Self::Completed, Self::Failed, Self::Cancelled,
+                Self::PartiallyCompleted,
+                Self::Completed,
+                Self::Failed,
+                Self::Cancelled,
             ],
             Self::PartiallyCompleted => &[
-                Self::Executing, Self::Completed, Self::Failed, Self::Cancelled,
+                Self::Executing,
+                Self::Completed,
+                Self::Failed,
+                Self::Cancelled,
             ],
             _ => &[],
         }
@@ -66,8 +87,7 @@ pub enum PlanItemStatus {
     Cancelled,
 }
 
-impl PlanItemStatus {
-}
+impl PlanItemStatus {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,7 +119,12 @@ impl PlanAttemptStatus {
     pub fn allowed_transitions(self) -> &'static [PlanAttemptStatus] {
         match self {
             Self::Created => &[Self::Inflight],
-            Self::Inflight => &[Self::Succeeded, Self::Failed, Self::Timeout, Self::Cancelled],
+            Self::Inflight => &[
+                Self::Succeeded,
+                Self::Failed,
+                Self::Timeout,
+                Self::Cancelled,
+            ],
             _ => &[],
         }
     }

@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use magi_bridge_client::BridgeBindingDispatchPlan;
 use magi_core::{
-    ApprovalRequirement, ExecutionResultStatus, RiskLevel, TaskResultKind, TerminationReason,
-    SessionId, TaskId, ToolCallId, VerificationStatus, WorkerId, WorkspaceId,
+    ApprovalRequirement, ExecutionResultStatus, RiskLevel, SessionId, TaskId, TaskResultKind,
+    TerminationReason, ToolCallId, VerificationStatus, WorkerId, WorkspaceId,
 };
 use magi_event_bus::InMemoryEventBus;
 use magi_governance::ToolKind;
@@ -15,12 +15,12 @@ use magi_worker_runtime::{
     LocalProcessExecutorDescriptor, LocalProcessExecutorHealth, LocalProcessExecutorHealthStatus,
     LocalProcessExecutorProcessModel, LocalProcessProbeResponse, LocalProcessProtocolResponse,
     LocalProcessProtocolResponseKind, LocalProcessWorkerExecutor, ShadowWorkerExecutor,
-    WorkerExecutionBindingLifecycle, WorkerExecutionBindingScope, WorkerExecutionLeaseState,
-    WorkerExecutionParallelismScope, WorkerExecutionProcessLifecycle,
-    WorkerExecutionFinalReport, WorkerExecutionIntent, WorkerExecutionIntentStep,
-    WorkerExecutionProfile, WorkerExecutionReusePolicy, WorkerExecutionStepKind,
-    WorkerExecutorFailureLayer,
-    WorkerExecutionMode, WorkerLoopAction, WorkerLoopOutcomeKind, WorkerRuntime,
+    WorkerCheckpointResumeMode, WorkerExecutionBindingLifecycle, WorkerExecutionBindingScope,
+    WorkerExecutionCheckpointCursor, WorkerExecutionFinalReport, WorkerExecutionIntent,
+    WorkerExecutionIntentStep, WorkerExecutionLeaseState, WorkerExecutionMode,
+    WorkerExecutionParallelismScope, WorkerExecutionProcessLifecycle, WorkerExecutionProfile,
+    WorkerExecutionReusePolicy, WorkerExecutionStepKind, WorkerExecutorFailureLayer,
+    WorkerLoopAction, WorkerLoopOutcomeKind, WorkerRuntime, WorkerStage,
 };
 
 fn worker_id(value: &str) -> WorkerId {
@@ -102,7 +102,9 @@ fn local_process_executor_can_run_execute_chain() {
         task_id: task_id.clone(),
     });
 
-    let outcome = loop_controller.step().expect("execute outcome should exist");
+    let outcome = loop_controller
+        .step()
+        .expect("execute outcome should exist");
     assert_eq!(outcome.kind, WorkerLoopOutcomeKind::Applied);
     assert_eq!(
         outcome.report.expect("final report missing").summary,
@@ -120,12 +122,130 @@ fn local_process_executor_can_run_execute_chain() {
 }
 
 #[test]
+fn local_process_executor_resumes_from_checkpoint_without_replaying_completed_steps() {
+    let bus = Arc::new(InMemoryEventBus::new(32));
+    let runtime = WorkerRuntime::new(bus)
+        .with_executor(Arc::new(LocalProcessWorkerExecutor::cargo_loopback()));
+    let worker_id = worker_id("worker-local-process-resume");
+    let task_id = task_id("todo-local-process-resume");
+    runtime.register_worker(worker_id.clone());
+    runtime.register_execution_intent(WorkerExecutionIntent {
+        worker_id: worker_id.clone(),
+        task_id: task_id.clone(),
+        session_id: None,
+        workspace_id: None,
+        execution_profile: WorkerExecutionProfile::default(),
+        steps: vec![
+            WorkerExecutionIntentStep::BuiltinToolInvocation {
+                tool_call_id: ToolCallId::new("resume-tool-1".to_string()),
+                tool_name: "process_inspect".to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: "{\"mode\":\"resume-step-1\"}".to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+                status: ExecutionResultStatus::Succeeded,
+            },
+            WorkerExecutionIntentStep::SkillDispatch {
+                tool_call_id: ToolCallId::new("resume-skill-1".to_string()),
+                tool_name: "process_inspect".to_string(),
+                plan: builtin_skill_plan("process_inspect"),
+                payload: "{\"mode\":\"resume-step-2\"}".to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+                working_directory: None,
+                route: SkillDispatchRoute::Builtin,
+                binding_id: None,
+                detail: "resume from checkpoint step 2".to_string(),
+                status: SkillDispatchStatus::Succeeded,
+            },
+            WorkerExecutionIntentStep::FinalReport(WorkerExecutionFinalReport {
+                summary: "local process resumed from checkpoint".to_string(),
+                result_kind: Some(TaskResultKind::Success),
+                termination_reason: Some(TerminationReason::Completed),
+                verification_status: VerificationStatus::Passed,
+            }),
+        ],
+    });
+    runtime.record_branch_checkpoint(
+        &task_id,
+        &worker_id,
+        WorkerStage::Execute,
+        None,
+        Some(format!("worker-intent-{task_id}")),
+        Some(WorkerExecutionBindingLifecycle::Requested),
+        Some(WorkerExecutionCheckpointCursor {
+            checkpoint_stage: WorkerStage::Execute,
+            next_step_index: 1,
+            checkpoint_at: magi_core::UtcMillis::now(),
+            resume_mode: WorkerCheckpointResumeMode::StepCheckpoint,
+            resume_token: None,
+        }),
+    );
+
+    let loop_controller = runtime.loop_controller();
+    loop_controller.enqueue_action(WorkerLoopAction::Execute {
+        worker_id: worker_id.clone(),
+        task_id: task_id.clone(),
+    });
+
+    let outcome = loop_controller
+        .step()
+        .expect("execute outcome should exist");
+    assert_eq!(outcome.kind, WorkerLoopOutcomeKind::Applied);
+    assert_eq!(
+        outcome.report.expect("final report missing").summary,
+        "local process resumed from checkpoint"
+    );
+
+    let summary = runtime.summary();
+    assert_eq!(summary.tool_call_count, 0, "已完成 step 不应被重放");
+    assert_eq!(
+        summary.skill_dispatch_count, 1,
+        "恢复后只应执行剩余 skill step"
+    );
+    assert_eq!(summary.report_count, 1);
+
+    let snapshot = runtime.snapshot_for_task(&task_id);
+    assert!(
+        snapshot.tool_invocations.is_empty(),
+        "首个 tool step 不应重复执行"
+    );
+    assert_eq!(snapshot.skill_dispatches.len(), 1);
+    assert_eq!(
+        snapshot.skill_dispatches[0].tool_call_id.to_string(),
+        "resume-skill-1"
+    );
+
+    let branch_snapshot = runtime
+        .branch_snapshot_for_task(&task_id)
+        .expect("branch snapshot should remain queryable");
+    assert_eq!(branch_snapshot.stage, WorkerStage::Finish);
+    assert!(
+        branch_snapshot.checkpoint_cursor.is_none(),
+        "执行完成后 checkpoint 应被清空"
+    );
+
+    let durable_snapshot = runtime.durable_snapshot();
+    assert_eq!(durable_snapshot.branches.len(), 1);
+    assert!(
+        durable_snapshot.branches[0].checkpoint_cursor.is_none(),
+        "durable snapshot 不应保留已完成 branch 的 checkpoint"
+    );
+}
+
+#[test]
 fn local_process_executor_probe_reports_capability_and_health() {
     let executor = LocalProcessWorkerExecutor::cargo_loopback();
     let probe = executor.probe().expect("probe should succeed");
     assert_eq!(probe.executor_id, "shadow-local-process-worker-executor");
-    assert_eq!(probe.executor_version, "worker-shadow-local-process-executor-v2");
-    assert_eq!(probe.executor_kind, magi_worker_runtime::WorkerExecutorKind::LocalProcess);
+    assert_eq!(
+        probe.executor_version,
+        "worker-shadow-local-process-executor-v2"
+    );
+    assert_eq!(
+        probe.executor_kind,
+        magi_worker_runtime::WorkerExecutorKind::LocalProcess
+    );
     assert_eq!(
         probe.capability.execution_mode,
         WorkerExecutionMode::LocalProcess
@@ -158,18 +278,24 @@ fn local_process_executor_probe_reports_capability_and_health() {
     assert_eq!(probe.capability.descriptor.max_parallelism, 1);
     assert!(probe.capability.descriptor.executor_instance_id.is_none());
     assert!(probe.capability.descriptor.executor_lease_id.is_none());
-    assert!(probe
-        .capability
-        .supported_step_kinds
-        .contains(&WorkerExecutionStepKind::BuiltinToolInvocation));
-    assert!(probe
-        .capability
-        .supported_step_kinds
-        .contains(&WorkerExecutionStepKind::SkillDispatch));
-    assert!(probe
-        .capability
-        .supported_step_kinds
-        .contains(&WorkerExecutionStepKind::FinalReport));
+    assert!(
+        probe
+            .capability
+            .supported_step_kinds
+            .contains(&WorkerExecutionStepKind::BuiltinToolInvocation)
+    );
+    assert!(
+        probe
+            .capability
+            .supported_step_kinds
+            .contains(&WorkerExecutionStepKind::SkillDispatch)
+    );
+    assert!(
+        probe
+            .capability
+            .supported_step_kinds
+            .contains(&WorkerExecutionStepKind::FinalReport)
+    );
     assert_eq!(
         probe.health.status,
         LocalProcessExecutorHealthStatus::Healthy
@@ -180,14 +306,20 @@ fn local_process_executor_probe_reports_capability_and_health() {
 fn local_process_executor_exposes_identity_and_step_capability_override() {
     let executor = LocalProcessWorkerExecutor::cargo_loopback()
         .with_env("MAGI_LOCAL_WORKER_EXECUTOR_ID", "shadow-local-process-test")
-        .with_env("MAGI_LOCAL_WORKER_EXECUTOR_VERSION", "worker-shadow-local-process-test-v9")
+        .with_env(
+            "MAGI_LOCAL_WORKER_EXECUTOR_VERSION",
+            "worker-shadow-local-process-test-v9",
+        )
         .with_env("MAGI_LOCAL_WORKER_SUPPORTED_STEP_KINDS", "final-report")
         .with_env("MAGI_LOCAL_WORKER_PROCESS_MODEL", "persistent-process")
         .with_env("MAGI_LOCAL_WORKER_MAX_PARALLELISM", "3");
 
     let probe = executor.probe().expect("probe should succeed");
     assert_eq!(probe.executor_id, "shadow-local-process-test");
-    assert_eq!(probe.executor_version, "worker-shadow-local-process-test-v9");
+    assert_eq!(
+        probe.executor_version,
+        "worker-shadow-local-process-test-v9"
+    );
     assert_eq!(
         probe.capability.supported_step_kinds,
         vec![WorkerExecutionStepKind::FinalReport]
@@ -237,12 +369,14 @@ fn local_process_executor_rejects_affinity_mismatch() {
             session_id: Some(SessionId::new("session-other")),
             workspace_id: Some(WorkspaceId::new("workspace-other")),
             execution_profile: WorkerExecutionProfile::default(),
-            steps: vec![WorkerExecutionIntentStep::FinalReport(WorkerExecutionFinalReport {
-                summary: "should not run".to_string(),
-                result_kind: Some(TaskResultKind::Success),
-                termination_reason: Some(TerminationReason::Completed),
-                verification_status: VerificationStatus::Passed,
-            })],
+            steps: vec![WorkerExecutionIntentStep::FinalReport(
+                WorkerExecutionFinalReport {
+                    summary: "should not run".to_string(),
+                    result_kind: Some(TaskResultKind::Success),
+                    termination_reason: Some(TerminationReason::Completed),
+                    verification_status: VerificationStatus::Passed,
+                },
+            )],
         })
         .expect_err("affinity mismatch should be rejected");
 
@@ -297,12 +431,14 @@ fn local_process_executor_rejects_missing_step_capability() {
 
     assert_eq!(error.layer, WorkerExecutorFailureLayer::RemoteBusiness);
     assert!(error.message.contains("missing required steps"));
-    assert!(error
-        .detail
-        .as_ref()
-        .expect("failure detail missing")
-        .missing_step_kinds
-        .contains(&WorkerExecutionStepKind::BuiltinToolInvocation));
+    assert!(
+        error
+            .detail
+            .as_ref()
+            .expect("failure detail missing")
+            .missing_step_kinds
+            .contains(&WorkerExecutionStepKind::BuiltinToolInvocation)
+    );
 }
 
 #[test]
@@ -359,12 +495,16 @@ fn worker_runtime_loop_rejects_missing_step_capability_before_fallback() {
         task_id: task_id.clone(),
     });
 
-    let outcome = loop_controller.step().expect("execute outcome should exist");
+    let outcome = loop_controller
+        .step()
+        .expect("execute outcome should exist");
     assert_eq!(outcome.kind, WorkerLoopOutcomeKind::Rejected);
-    assert!(outcome
-        .rejection_reason
-        .expect("rejection reason missing")
-        .contains("executor capability insufficient"));
+    assert!(
+        outcome
+            .rejection_reason
+            .expect("rejection reason missing")
+            .contains("executor capability insufficient")
+    );
     assert!(runtime.snapshot_for_task(&task_id).reports.is_empty());
 }
 
@@ -392,14 +532,18 @@ fn local_process_executor_reports_protocol_failures() {
             "cat >/dev/null; printf '%s' \"$WORKER_RESPONSE\"".to_string(),
         ])
         .with_env("WORKER_RESPONSE", "not-json");
-    let error = executor.probe().expect_err("invalid stdout should be protocol failure");
+    let error = executor
+        .probe()
+        .expect_err("invalid stdout should be protocol failure");
     assert_eq!(error.layer, WorkerExecutorFailureLayer::Protocol);
 }
 
 #[test]
 fn local_process_executor_reports_transport_failures() {
     let executor = LocalProcessWorkerExecutor::new("/path/does/not/exist/worker-executor");
-    let error = executor.probe().expect_err("missing executable should be transport failure");
+    let error = executor
+        .probe()
+        .expect_err("missing executable should be transport failure");
     assert_eq!(error.layer, WorkerExecutorFailureLayer::Transport);
 }
 
@@ -407,43 +551,43 @@ fn local_process_executor_reports_transport_failures() {
 fn local_process_executor_rejects_mismatched_request_id() {
     let response = serde_json::to_string(&LocalProcessProtocolResponse {
         request_id: "probe-123".to_string(),
-            kind: LocalProcessProtocolResponseKind::Probe(LocalProcessProbeResponse {
-                capability: magi_worker_runtime::LocalProcessExecutorCapability {
-                    executor_id: "shadow-local-process-worker-executor".to_string(),
-                    executor_version: "worker-shadow-local-process-executor-v2".to_string(),
-                    execution_mode: WorkerExecutionMode::LocalProcess,
-                    protocol_version: "worker-shadow-local-process-v1".to_string(),
-                    supports_probe: true,
-                    supports_execute: true,
-                    supports_review: false,
-                    supports_verify: false,
-                    supports_repair: false,
-                    affinity: magi_worker_runtime::LocalProcessExecutorAffinity::default(),
-                    stage_matrix: magi_worker_runtime::LocalProcessExecutorStageMatrix {
-                        execute: true,
-                        review: false,
-                        verify: false,
-                        repair: false,
-                    },
-                    descriptor: LocalProcessExecutorDescriptor {
-                        process_model: LocalProcessExecutorProcessModel::OneShotSubprocess,
-                        reuse_scope: WorkerExecutionBindingScope::None,
-                        parallelism_scope: WorkerExecutionParallelismScope::Executor,
-                        lease_state: WorkerExecutionLeaseState::None,
-                        binding_lifecycle: WorkerExecutionBindingLifecycle::None,
-                        process_lifecycle: WorkerExecutionProcessLifecycle::OneShot,
-                        max_parallelism: 1,
-                        executor_instance_id: None,
-                        executor_lease_id: None,
-                    },
-                    supported_step_kinds: vec![
-                        WorkerExecutionStepKind::BuiltinToolInvocation,
-                        WorkerExecutionStepKind::SkillDispatch,
-                        WorkerExecutionStepKind::FinalReport,
-                    ],
+        kind: LocalProcessProtocolResponseKind::Probe(LocalProcessProbeResponse {
+            capability: magi_worker_runtime::LocalProcessExecutorCapability {
+                executor_id: "shadow-local-process-worker-executor".to_string(),
+                executor_version: "worker-shadow-local-process-executor-v2".to_string(),
+                execution_mode: WorkerExecutionMode::LocalProcess,
+                protocol_version: "worker-shadow-local-process-v1".to_string(),
+                supports_probe: true,
+                supports_execute: true,
+                supports_review: false,
+                supports_verify: false,
+                supports_repair: false,
+                affinity: magi_worker_runtime::LocalProcessExecutorAffinity::default(),
+                stage_matrix: magi_worker_runtime::LocalProcessExecutorStageMatrix {
+                    execute: true,
+                    review: false,
+                    verify: false,
+                    repair: false,
                 },
-                health: LocalProcessExecutorHealth {
-                    status: LocalProcessExecutorHealthStatus::Unavailable,
+                descriptor: LocalProcessExecutorDescriptor {
+                    process_model: LocalProcessExecutorProcessModel::OneShotSubprocess,
+                    reuse_scope: WorkerExecutionBindingScope::None,
+                    parallelism_scope: WorkerExecutionParallelismScope::Executor,
+                    lease_state: WorkerExecutionLeaseState::None,
+                    binding_lifecycle: WorkerExecutionBindingLifecycle::None,
+                    process_lifecycle: WorkerExecutionProcessLifecycle::OneShot,
+                    max_parallelism: 1,
+                    executor_instance_id: None,
+                    executor_lease_id: None,
+                },
+                supported_step_kinds: vec![
+                    WorkerExecutionStepKind::BuiltinToolInvocation,
+                    WorkerExecutionStepKind::SkillDispatch,
+                    WorkerExecutionStepKind::FinalReport,
+                ],
+            },
+            health: LocalProcessExecutorHealth {
+                status: LocalProcessExecutorHealthStatus::Unavailable,
                 detail: "loopback unhealthy".to_string(),
             },
         }),
@@ -478,17 +622,17 @@ fn local_process_executor_rejects_missing_reusable_session_support() {
                 lease_state: WorkerExecutionLeaseState::Requested,
                 binding_lifecycle: WorkerExecutionBindingLifecycle::Requested,
                 process_lifecycle: WorkerExecutionProcessLifecycle::OneShot,
-                requested_process_model: Some(
-                    LocalProcessExecutorProcessModel::OneShotSubprocess,
-                ),
+                requested_process_model: Some(LocalProcessExecutorProcessModel::OneShotSubprocess),
                 requested_parallelism: 1,
             },
-            steps: vec![WorkerExecutionIntentStep::FinalReport(WorkerExecutionFinalReport {
-                summary: "should not run".to_string(),
-                result_kind: Some(TaskResultKind::Success),
-                termination_reason: Some(TerminationReason::Completed),
-                verification_status: VerificationStatus::Passed,
-            })],
+            steps: vec![WorkerExecutionIntentStep::FinalReport(
+                WorkerExecutionFinalReport {
+                    summary: "should not run".to_string(),
+                    result_kind: Some(TaskResultKind::Success),
+                    termination_reason: Some(TerminationReason::Completed),
+                    verification_status: VerificationStatus::Passed,
+                },
+            )],
         })
         .expect_err("missing reusable session support should be rejected");
 
@@ -513,17 +657,17 @@ fn local_process_executor_rejects_parallelism_overflow() {
                 lease_state: WorkerExecutionLeaseState::Requested,
                 binding_lifecycle: WorkerExecutionBindingLifecycle::Requested,
                 process_lifecycle: WorkerExecutionProcessLifecycle::OneShot,
-                requested_process_model: Some(
-                    LocalProcessExecutorProcessModel::OneShotSubprocess,
-                ),
+                requested_process_model: Some(LocalProcessExecutorProcessModel::OneShotSubprocess),
                 requested_parallelism: 2,
             },
-            steps: vec![WorkerExecutionIntentStep::FinalReport(WorkerExecutionFinalReport {
-                summary: "should not run".to_string(),
-                result_kind: Some(TaskResultKind::Success),
-                termination_reason: Some(TerminationReason::Completed),
-                verification_status: VerificationStatus::Passed,
-            })],
+            steps: vec![WorkerExecutionIntentStep::FinalReport(
+                WorkerExecutionFinalReport {
+                    summary: "should not run".to_string(),
+                    result_kind: Some(TaskResultKind::Success),
+                    termination_reason: Some(TerminationReason::Completed),
+                    verification_status: VerificationStatus::Passed,
+                },
+            )],
         })
         .expect_err("parallelism overflow should be rejected");
 
@@ -549,17 +693,17 @@ fn local_process_executor_rejects_binding_scope_mismatch() {
                 lease_state: WorkerExecutionLeaseState::Requested,
                 binding_lifecycle: WorkerExecutionBindingLifecycle::Requested,
                 process_lifecycle: WorkerExecutionProcessLifecycle::Persistent,
-                requested_process_model: Some(
-                    LocalProcessExecutorProcessModel::PersistentProcess,
-                ),
+                requested_process_model: Some(LocalProcessExecutorProcessModel::PersistentProcess),
                 requested_parallelism: 1,
             },
-            steps: vec![WorkerExecutionIntentStep::FinalReport(WorkerExecutionFinalReport {
-                summary: "should not run".to_string(),
-                result_kind: Some(TaskResultKind::Success),
-                termination_reason: Some(TerminationReason::Completed),
-                verification_status: VerificationStatus::Passed,
-            })],
+            steps: vec![WorkerExecutionIntentStep::FinalReport(
+                WorkerExecutionFinalReport {
+                    summary: "should not run".to_string(),
+                    result_kind: Some(TaskResultKind::Success),
+                    termination_reason: Some(TerminationReason::Completed),
+                    verification_status: VerificationStatus::Passed,
+                },
+            )],
         })
         .expect_err("binding scope mismatch should be rejected");
 
@@ -571,7 +715,10 @@ fn local_process_executor_rejects_binding_scope_mismatch() {
         Some(WorkerExecutionBindingScope::Session)
     );
     assert_eq!(
-        detail.requested_execution_profile.expect("requested profile missing").binding_scope,
+        detail
+            .requested_execution_profile
+            .expect("requested profile missing")
+            .binding_scope,
         WorkerExecutionBindingScope::Workspace
     );
 }
@@ -594,22 +741,26 @@ fn local_process_executor_rejects_session_binding_without_session_context() {
                 lease_state: WorkerExecutionLeaseState::Requested,
                 binding_lifecycle: WorkerExecutionBindingLifecycle::Requested,
                 process_lifecycle: WorkerExecutionProcessLifecycle::Persistent,
-                requested_process_model: Some(
-                    LocalProcessExecutorProcessModel::PersistentProcess,
-                ),
+                requested_process_model: Some(LocalProcessExecutorProcessModel::PersistentProcess),
                 requested_parallelism: 1,
             },
-            steps: vec![WorkerExecutionIntentStep::FinalReport(WorkerExecutionFinalReport {
-                summary: "should not run".to_string(),
-                result_kind: Some(TaskResultKind::Success),
-                termination_reason: Some(TerminationReason::Completed),
-                verification_status: VerificationStatus::Passed,
-            })],
+            steps: vec![WorkerExecutionIntentStep::FinalReport(
+                WorkerExecutionFinalReport {
+                    summary: "should not run".to_string(),
+                    result_kind: Some(TaskResultKind::Success),
+                    termination_reason: Some(TerminationReason::Completed),
+                    verification_status: VerificationStatus::Passed,
+                },
+            )],
         })
         .expect_err("session binding without session_id should be rejected");
 
     assert_eq!(error.layer, WorkerExecutorFailureLayer::RemoteBusiness);
-    assert!(error.message.contains("session binding requires session_id"));
+    assert!(
+        error
+            .message
+            .contains("session binding requires session_id")
+    );
 }
 
 #[test]
@@ -635,17 +786,17 @@ fn worker_runtime_records_active_lease_for_persistent_session_binding() {
             lease_state: WorkerExecutionLeaseState::Requested,
             binding_lifecycle: WorkerExecutionBindingLifecycle::Requested,
             process_lifecycle: WorkerExecutionProcessLifecycle::Persistent,
-            requested_process_model: Some(
-                LocalProcessExecutorProcessModel::PersistentProcess,
-            ),
+            requested_process_model: Some(LocalProcessExecutorProcessModel::PersistentProcess),
             requested_parallelism: 1,
         },
-        steps: vec![WorkerExecutionIntentStep::FinalReport(WorkerExecutionFinalReport {
-            summary: "persistent lease path".to_string(),
-            result_kind: Some(TaskResultKind::Success),
-            termination_reason: Some(TerminationReason::Completed),
-            verification_status: VerificationStatus::Passed,
-        })],
+        steps: vec![WorkerExecutionIntentStep::FinalReport(
+            WorkerExecutionFinalReport {
+                summary: "persistent lease path".to_string(),
+                result_kind: Some(TaskResultKind::Success),
+                termination_reason: Some(TerminationReason::Completed),
+                verification_status: VerificationStatus::Passed,
+            },
+        )],
     });
 
     let loop_controller = runtime.loop_controller();
@@ -653,7 +804,9 @@ fn worker_runtime_records_active_lease_for_persistent_session_binding() {
         worker_id: worker_id.clone(),
         task_id: task_id.clone(),
     });
-    let outcome = loop_controller.step().expect("execute outcome should exist");
+    let outcome = loop_controller
+        .step()
+        .expect("execute outcome should exist");
     assert_eq!(outcome.kind, WorkerLoopOutcomeKind::Applied);
 
     let observations = runtime.executor_observations();
@@ -684,7 +837,10 @@ fn worker_runtime_records_active_lease_for_persistent_session_binding() {
         observation.process_lifecycle,
         Some(WorkerExecutionProcessLifecycle::Persistent)
     );
-    assert_eq!(observation.executor_instance_id.as_deref(), Some("shadow-local-process-worker-executor-instance-1"));
+    assert_eq!(
+        observation.executor_instance_id.as_deref(),
+        Some("shadow-local-process-worker-executor-instance-1")
+    );
     assert_eq!(
         observation.executor_lease_id.as_deref(),
         Some("shadow-local-process-worker-executor-session-session-persistent-lease-lease-1")
@@ -707,17 +863,17 @@ fn persistent_executor_reuses_same_lease_for_same_session_binding() {
             lease_state: WorkerExecutionLeaseState::Requested,
             binding_lifecycle: WorkerExecutionBindingLifecycle::Requested,
             process_lifecycle: WorkerExecutionProcessLifecycle::Persistent,
-            requested_process_model: Some(
-                LocalProcessExecutorProcessModel::PersistentProcess,
-            ),
+            requested_process_model: Some(LocalProcessExecutorProcessModel::PersistentProcess),
             requested_parallelism: 1,
         },
-        steps: vec![WorkerExecutionIntentStep::FinalReport(WorkerExecutionFinalReport {
-            summary: "reuse same session".to_string(),
-            result_kind: Some(TaskResultKind::Success),
-            termination_reason: Some(TerminationReason::Completed),
-            verification_status: VerificationStatus::Passed,
-        })],
+        steps: vec![WorkerExecutionIntentStep::FinalReport(
+            WorkerExecutionFinalReport {
+                summary: "reuse same session".to_string(),
+                result_kind: Some(TaskResultKind::Success),
+                termination_reason: Some(TerminationReason::Completed),
+                verification_status: VerificationStatus::Passed,
+            },
+        )],
     };
 
     let request_a = intent.executor_request(magi_worker_runtime::WorkerStage::Execute, "probe-a");
@@ -768,12 +924,14 @@ fn persistent_executor_allocates_distinct_leases_for_distinct_session_bindings()
         session_id: Some(SessionId::new("session-a")),
         workspace_id: None,
         execution_profile: base_profile.clone(),
-        steps: vec![WorkerExecutionIntentStep::FinalReport(WorkerExecutionFinalReport {
-            summary: "a".to_string(),
-            result_kind: Some(TaskResultKind::Success),
-            termination_reason: Some(TerminationReason::Completed),
-            verification_status: VerificationStatus::Passed,
-        })],
+        steps: vec![WorkerExecutionIntentStep::FinalReport(
+            WorkerExecutionFinalReport {
+                summary: "a".to_string(),
+                result_kind: Some(TaskResultKind::Success),
+                termination_reason: Some(TerminationReason::Completed),
+                verification_status: VerificationStatus::Passed,
+            },
+        )],
     }
     .executor_request(magi_worker_runtime::WorkerStage::Execute, "probe-a");
     let request_b = WorkerExecutionIntent {
@@ -782,12 +940,14 @@ fn persistent_executor_allocates_distinct_leases_for_distinct_session_bindings()
         session_id: Some(SessionId::new("session-b")),
         workspace_id: None,
         execution_profile: base_profile,
-        steps: vec![WorkerExecutionIntentStep::FinalReport(WorkerExecutionFinalReport {
-            summary: "b".to_string(),
-            result_kind: Some(TaskResultKind::Success),
-            termination_reason: Some(TerminationReason::Completed),
-            verification_status: VerificationStatus::Passed,
-        })],
+        steps: vec![WorkerExecutionIntentStep::FinalReport(
+            WorkerExecutionFinalReport {
+                summary: "b".to_string(),
+                result_kind: Some(TaskResultKind::Success),
+                termination_reason: Some(TerminationReason::Completed),
+                verification_status: VerificationStatus::Passed,
+            },
+        )],
     }
     .executor_request(magi_worker_runtime::WorkerStage::Execute, "probe-b");
 
@@ -825,12 +985,14 @@ fn persistent_executor_releases_lease_and_reallocates_on_next_request() {
             session_id: Some(SessionId::new("session-release")),
             workspace_id: None,
             execution_profile: profile,
-            steps: vec![WorkerExecutionIntentStep::FinalReport(WorkerExecutionFinalReport {
-                summary: "release".to_string(),
-                result_kind: Some(TaskResultKind::Success),
-                termination_reason: Some(TerminationReason::Completed),
-                verification_status: VerificationStatus::Passed,
-            })],
+            steps: vec![WorkerExecutionIntentStep::FinalReport(
+                WorkerExecutionFinalReport {
+                    summary: "release".to_string(),
+                    result_kind: Some(TaskResultKind::Success),
+                    termination_reason: Some(TerminationReason::Completed),
+                    verification_status: VerificationStatus::Passed,
+                },
+            )],
         }
         .executor_request(magi_worker_runtime::WorkerStage::Execute, request_source)
     };
@@ -992,12 +1154,14 @@ fn local_process_executor_review_verify_repair_with_prior_trace() {
         session_id: None,
         workspace_id: None,
         execution_profile: WorkerExecutionProfile::default(),
-        steps: vec![WorkerExecutionIntentStep::FinalReport(WorkerExecutionFinalReport {
-            summary: "prior trace test".to_string(),
-            result_kind: Some(TaskResultKind::Success),
-            termination_reason: Some(TerminationReason::Completed),
-            verification_status: VerificationStatus::Passed,
-        })],
+        steps: vec![WorkerExecutionIntentStep::FinalReport(
+            WorkerExecutionFinalReport {
+                summary: "prior trace test".to_string(),
+                result_kind: Some(TaskResultKind::Success),
+                termination_reason: Some(TerminationReason::Completed),
+                verification_status: VerificationStatus::Passed,
+            },
+        )],
     };
 
     // Execute first to get a prior trace
@@ -1041,12 +1205,14 @@ fn worker_runtime_loop_can_run_review_verify_repair_stages() {
         session_id: None,
         workspace_id: None,
         execution_profile: WorkerExecutionProfile::default(),
-        steps: vec![WorkerExecutionIntentStep::FinalReport(WorkerExecutionFinalReport {
-            summary: "full lifecycle test".to_string(),
-            result_kind: Some(TaskResultKind::Success),
-            termination_reason: Some(TerminationReason::Completed),
-            verification_status: VerificationStatus::Passed,
-        })],
+        steps: vec![WorkerExecutionIntentStep::FinalReport(
+            WorkerExecutionFinalReport {
+                summary: "full lifecycle test".to_string(),
+                result_kind: Some(TaskResultKind::Success),
+                termination_reason: Some(TerminationReason::Completed),
+                verification_status: VerificationStatus::Passed,
+            },
+        )],
     });
 
     let loop_controller = runtime.loop_controller();
@@ -1056,7 +1222,9 @@ fn worker_runtime_loop_can_run_review_verify_repair_stages() {
         worker_id: wid.clone(),
         task_id: tid.clone(),
     });
-    let execute_outcome = loop_controller.step().expect("execute outcome should exist");
+    let execute_outcome = loop_controller
+        .step()
+        .expect("execute outcome should exist");
     assert_eq!(execute_outcome.kind, WorkerLoopOutcomeKind::Applied);
 
     // Review stage

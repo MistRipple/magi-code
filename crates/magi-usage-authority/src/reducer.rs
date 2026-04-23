@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::costing::normalize_usage_delta;
 use crate::types::{
-    SessionUsageSnapshot, UsageBindingSnapshot, UsageCallStatus, UsageEvent, UsageEventType,
-    UsageModelSnapshot, UsageTotals, WorkspaceUsageSnapshot, SessionSummary,
+    SessionSummary, SessionUsageSnapshot, UsageBindingSnapshot, UsageCallStatus, UsageEvent,
+    UsageEventType, UsageModelSnapshot, UsageTotals, WorkspaceUsageSnapshot,
 };
 
 fn apply_delta(

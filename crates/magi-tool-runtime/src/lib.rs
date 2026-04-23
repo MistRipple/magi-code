@@ -1,11 +1,9 @@
 use magi_core::{
-    ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId, TaskId,
-    ToolCallId, UtcMillis, WorkerId, WorkspaceId,
+    ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId, TaskId, ToolCallId,
+    UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventCategory, EventContext, EventEnvelope, InMemoryEventBus};
-use magi_governance::{
-    GovernanceDecision, GovernanceService, ToolExecutionRequest, ToolKind,
-};
+use magi_governance::{GovernanceDecision, GovernanceService, ToolExecutionRequest, ToolKind};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -15,7 +13,7 @@ use std::{
 
 mod builtin;
 mod policy;
-use builtin::{infer_execution_status, NormalizedBuiltinTool};
+use builtin::{NormalizedBuiltinTool, infer_execution_status};
 use policy::WriteProtectionClaim;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,37 +273,129 @@ impl ToolRegistry {
     pub fn register_default_builtins(&mut self) {
         let tools: &[(BuiltinToolName, RiskLevel, ApprovalRequirement)] = &[
             // 文件系统
-            (BuiltinToolName::FileRead, RiskLevel::Low, ApprovalRequirement::None),
-            (BuiltinToolName::FileWrite, RiskLevel::Medium, ApprovalRequirement::None),
-            (BuiltinToolName::FilePatch, RiskLevel::Medium, ApprovalRequirement::None),
-            (BuiltinToolName::FileRemove, RiskLevel::High, ApprovalRequirement::Required),
-            (BuiltinToolName::FileMkdir, RiskLevel::Low, ApprovalRequirement::None),
-            (BuiltinToolName::FileCopy, RiskLevel::Medium, ApprovalRequirement::None),
-            (BuiltinToolName::FileMove, RiskLevel::Medium, ApprovalRequirement::None),
+            (
+                BuiltinToolName::FileRead,
+                RiskLevel::Low,
+                ApprovalRequirement::None,
+            ),
+            (
+                BuiltinToolName::FileWrite,
+                RiskLevel::Medium,
+                ApprovalRequirement::None,
+            ),
+            (
+                BuiltinToolName::FilePatch,
+                RiskLevel::Medium,
+                ApprovalRequirement::None,
+            ),
+            (
+                BuiltinToolName::FileRemove,
+                RiskLevel::High,
+                ApprovalRequirement::Required,
+            ),
+            (
+                BuiltinToolName::FileMkdir,
+                RiskLevel::Low,
+                ApprovalRequirement::None,
+            ),
+            (
+                BuiltinToolName::FileCopy,
+                RiskLevel::Medium,
+                ApprovalRequirement::None,
+            ),
+            (
+                BuiltinToolName::FileMove,
+                RiskLevel::Medium,
+                ApprovalRequirement::None,
+            ),
             // 搜索
-            (BuiltinToolName::SearchText, RiskLevel::Low, ApprovalRequirement::None),
-            (BuiltinToolName::SearchSemantic, RiskLevel::Low, ApprovalRequirement::None),
+            (
+                BuiltinToolName::SearchText,
+                RiskLevel::Low,
+                ApprovalRequirement::None,
+            ),
+            (
+                BuiltinToolName::SearchSemantic,
+                RiskLevel::Low,
+                ApprovalRequirement::None,
+            ),
             // Shell / 进程
-            (BuiltinToolName::ShellExec, RiskLevel::High, ApprovalRequirement::Required),
-            (BuiltinToolName::ProcessInspect, RiskLevel::Medium, ApprovalRequirement::None),
+            (
+                BuiltinToolName::ShellExec,
+                RiskLevel::High,
+                ApprovalRequirement::Required,
+            ),
+            (
+                BuiltinToolName::ProcessInspect,
+                RiskLevel::Medium,
+                ApprovalRequirement::None,
+            ),
             // Diff
-            (BuiltinToolName::DiffPreview, RiskLevel::Low, ApprovalRequirement::None),
+            (
+                BuiltinToolName::DiffPreview,
+                RiskLevel::Low,
+                ApprovalRequirement::None,
+            ),
             // Web
-            (BuiltinToolName::WebSearch, RiskLevel::Low, ApprovalRequirement::None),
-            (BuiltinToolName::WebFetch, RiskLevel::Low, ApprovalRequirement::None),
+            (
+                BuiltinToolName::WebSearch,
+                RiskLevel::Low,
+                ApprovalRequirement::None,
+            ),
+            (
+                BuiltinToolName::WebFetch,
+                RiskLevel::Low,
+                ApprovalRequirement::None,
+            ),
             // 可视化
-            (BuiltinToolName::MermaidDiagram, RiskLevel::Low, ApprovalRequirement::None),
+            (
+                BuiltinToolName::MermaidDiagram,
+                RiskLevel::Low,
+                ApprovalRequirement::None,
+            ),
             // 知识库
-            (BuiltinToolName::KnowledgeQuery, RiskLevel::Low, ApprovalRequirement::None),
+            (
+                BuiltinToolName::KnowledgeQuery,
+                RiskLevel::Low,
+                ApprovalRequirement::None,
+            ),
             // 编排
-            (BuiltinToolName::WorkerSendMessage, RiskLevel::Medium, ApprovalRequirement::None),
-            (BuiltinToolName::TaskSplit, RiskLevel::Low, ApprovalRequirement::None),
-            (BuiltinToolName::TaskList, RiskLevel::Low, ApprovalRequirement::None),
-            (BuiltinToolName::TaskUpdate, RiskLevel::Low, ApprovalRequirement::None),
-            (BuiltinToolName::TaskClaimNext, RiskLevel::Low, ApprovalRequirement::None),
-            (BuiltinToolName::ContextCompact, RiskLevel::Medium, ApprovalRequirement::None),
+            (
+                BuiltinToolName::WorkerSendMessage,
+                RiskLevel::Medium,
+                ApprovalRequirement::None,
+            ),
+            (
+                BuiltinToolName::TaskSplit,
+                RiskLevel::Low,
+                ApprovalRequirement::None,
+            ),
+            (
+                BuiltinToolName::TaskList,
+                RiskLevel::Low,
+                ApprovalRequirement::None,
+            ),
+            (
+                BuiltinToolName::TaskUpdate,
+                RiskLevel::Low,
+                ApprovalRequirement::None,
+            ),
+            (
+                BuiltinToolName::TaskClaimNext,
+                RiskLevel::Low,
+                ApprovalRequirement::None,
+            ),
+            (
+                BuiltinToolName::ContextCompact,
+                RiskLevel::Medium,
+                ApprovalRequirement::None,
+            ),
             // Skill
-            (BuiltinToolName::SkillApply, RiskLevel::Low, ApprovalRequirement::None),
+            (
+                BuiltinToolName::SkillApply,
+                RiskLevel::Low,
+                ApprovalRequirement::None,
+            ),
         ];
         for &(name, risk, approval) in tools {
             self.register_builtin(Arc::new(NormalizedBuiltinTool::new(name, risk, approval)));
@@ -313,17 +403,22 @@ impl ToolRegistry {
     }
 
     pub fn builtin_specs(&self) -> Vec<BuiltinToolSpec> {
-        self.builtin_tools.values().map(|tool| tool.spec()).collect()
+        self.builtin_tools
+            .values()
+            .map(|tool| tool.spec())
+            .collect()
     }
 
     pub fn builtin_access_mode(&self, tool_name: &str) -> Option<BuiltinToolAccessMode> {
-        self.builtin_tools.get(tool_name).map(|_| {
-            match BuiltinToolName::from_str(tool_name) {
-                Some(name) if name == BuiltinToolName::ShellExec => BuiltinToolAccessMode::MaybeWrite,
+        self.builtin_tools
+            .get(tool_name)
+            .map(|_| match BuiltinToolName::from_str(tool_name) {
+                Some(name) if name == BuiltinToolName::ShellExec => {
+                    BuiltinToolAccessMode::MaybeWrite
+                }
                 Some(name) if name.is_write_operation() => BuiltinToolAccessMode::ExplicitWrite,
                 _ => BuiltinToolAccessMode::ReadOnly,
-            }
-        })
+            })
     }
 
     pub fn execute(&self, input: ToolExecutionInput) -> ToolExecutionOutput {
@@ -349,12 +444,14 @@ impl ToolRegistry {
             return output;
         }
 
-        let governance = self.governance.evaluate_tool_request(&ToolExecutionRequest {
-            tool_name: input.tool_name.clone(),
-            tool_kind: input.tool_kind.clone(),
-            risk_level: input.risk_level,
-            approval_requirement: input.approval_requirement,
-        });
+        let governance = self
+            .governance
+            .evaluate_tool_request(&ToolExecutionRequest {
+                tool_name: input.tool_name.clone(),
+                tool_kind: input.tool_kind.clone(),
+                risk_level: input.risk_level,
+                approval_requirement: input.approval_requirement,
+            });
 
         let output = if !governance.allowed {
             ToolExecutionOutput {
@@ -374,7 +471,8 @@ impl ToolRegistry {
             match self.builtin_tools.get(&input.tool_name) {
                 Some(tool) => {
                     let access_mode = self.resolve_access_mode(&input);
-                    let write_guard = match self.acquire_write_guard(&input, &context, access_mode) {
+                    let write_guard = match self.acquire_write_guard(&input, &context, access_mode)
+                    {
                         Ok(guard) => guard,
                         Err(output) => {
                             self.record_invocation(&input, &context, &output);
@@ -414,23 +512,45 @@ impl ToolRegistry {
         self.summary_for_query(&ToolExecutionContextQuery::default())
     }
 
-    pub fn query_invocations(&self, query: &ToolExecutionContextQuery) -> Vec<ToolInvocationRecord> {
+    pub fn query_invocations(
+        &self,
+        query: &ToolExecutionContextQuery,
+    ) -> Vec<ToolInvocationRecord> {
         self.invocations
             .read()
             .expect("tool invocation read lock poisoned")
             .iter()
-            .filter(|record| query.worker_id.as_ref().is_none_or(|id| record.context.worker_id.as_ref() == Some(id)))
-            .filter(|record| query.task_id.as_ref().is_none_or(|id| record.context.task_id.as_ref() == Some(id)))
-            .filter(|record| query.session_id.as_ref().is_none_or(|id| record.context.session_id.as_ref() == Some(id)))
-            .filter(|record| query.workspace_id.as_ref().is_none_or(|id| record.context.workspace_id.as_ref() == Some(id)))
+            .filter(|record| {
+                query
+                    .worker_id
+                    .as_ref()
+                    .is_none_or(|id| record.context.worker_id.as_ref() == Some(id))
+            })
+            .filter(|record| {
+                query
+                    .task_id
+                    .as_ref()
+                    .is_none_or(|id| record.context.task_id.as_ref() == Some(id))
+            })
+            .filter(|record| {
+                query
+                    .session_id
+                    .as_ref()
+                    .is_none_or(|id| record.context.session_id.as_ref() == Some(id))
+            })
+            .filter(|record| {
+                query
+                    .workspace_id
+                    .as_ref()
+                    .is_none_or(|id| record.context.workspace_id.as_ref() == Some(id))
+            })
             .cloned()
             .collect()
     }
 
     pub fn summary_for_query(&self, query: &ToolExecutionContextQuery) -> ToolExecutionSummary {
         let invocations = self.query_invocations(query);
-        let invocations = self
-            .summarize_invocations(&invocations);
+        let invocations = self.summarize_invocations(&invocations);
         invocations
     }
 
@@ -602,7 +722,12 @@ mod tests {
         assert_eq!(payload["access_mode"], "read_only");
         assert_eq!(payload["mode"], "file");
         assert_eq!(payload["truncated"], false);
-        assert!(payload["content"].as_str().expect("content").contains("hello"));
+        assert!(
+            payload["content"]
+                .as_str()
+                .expect("content")
+                .contains("hello")
+        );
 
         let dir_output = tool_registry.execute_with_policy(
             ToolExecutionInput {
@@ -622,7 +747,8 @@ mod tests {
         );
 
         assert_eq!(dir_output.status, ExecutionResultStatus::Succeeded);
-        let dir_payload: Value = serde_json::from_str(&dir_output.payload).expect("dir payload json");
+        let dir_payload: Value =
+            serde_json::from_str(&dir_output.payload).expect("dir payload json");
         assert_eq!(dir_payload["mode"], "directory");
         assert_eq!(dir_payload["entries"].as_array().expect("entries").len(), 1);
     }
@@ -701,7 +827,12 @@ mod tests {
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
         assert_eq!(payload["tool"], "search_text");
         assert_eq!(payload["access_mode"], "read_only");
-        assert!(payload["returned_matches"].as_u64().expect("returned matches") >= 2);
+        assert!(
+            payload["returned_matches"]
+                .as_u64()
+                .expect("returned matches")
+                >= 2
+        );
         assert!(!payload["matches"].as_array().expect("matches").is_empty());
     }
 
@@ -903,12 +1034,18 @@ mod tests {
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
         assert_eq!(payload["tool"], "process_inspect");
         assert_eq!(payload["access_mode"], "read_only");
-        assert!(payload["matches"].as_array().expect("matches").iter().any(|item| {
-            item["pid"]
-                .as_u64()
-                .map(|pid| pid as u32 == current_pid)
-                .unwrap_or(false)
-        }));
+        assert!(
+            payload["matches"]
+                .as_array()
+                .expect("matches")
+                .iter()
+                .any(|item| {
+                    item["pid"]
+                        .as_u64()
+                        .map(|pid| pid as u32 == current_pid)
+                        .unwrap_or(false)
+                })
+        );
     }
 
     #[test]
@@ -939,14 +1076,18 @@ mod tests {
         let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
         assert_eq!(payload["tool"], "diff_preview");
         assert_eq!(payload["access_mode"], "read_only");
-        assert!(payload["preview"]
-            .as_str()
-            .expect("preview")
-            .contains("+new"));
-        assert!(payload["preview"]
-            .as_str()
-            .expect("preview")
-            .contains("-old"));
+        assert!(
+            payload["preview"]
+                .as_str()
+                .expect("preview")
+                .contains("+new")
+        );
+        assert!(
+            payload["preview"]
+                .as_str()
+                .expect("preview")
+                .contains("-old")
+        );
     }
 
     #[test]
@@ -1152,8 +1293,11 @@ mod tests {
             approval_requirement: ApprovalRequirement::None,
             risk_level: RiskLevel::Low,
         };
-        let blocked_result =
-            tool_registry.acquire_write_guard(&input_b, &ctx_b, BuiltinToolAccessMode::ExplicitWrite);
+        let blocked_result = tool_registry.acquire_write_guard(
+            &input_b,
+            &ctx_b,
+            BuiltinToolAccessMode::ExplicitWrite,
+        );
         assert!(
             blocked_result.is_err(),
             "should be blocked by path-level conflict"
@@ -1164,8 +1308,11 @@ mod tests {
 
         // After dropping guard A, context B should succeed
         drop(guard);
-        let after_result =
-            tool_registry.acquire_write_guard(&input_b, &ctx_b, BuiltinToolAccessMode::ExplicitWrite);
+        let after_result = tool_registry.acquire_write_guard(
+            &input_b,
+            &ctx_b,
+            BuiltinToolAccessMode::ExplicitWrite,
+        );
         assert!(after_result.is_ok());
         assert!(after_result.unwrap().is_some());
     }
@@ -1498,25 +1645,15 @@ mod tests {
             let matching_audit = audit_events
                 .iter()
                 .find(|e| e.payload["tool_call_id"] == call_id);
-            assert!(
-                matching_audit.is_some(),
-                "audit event for {}",
-                call_id
-            );
+            assert!(matching_audit.is_some(), "audit event for {}", call_id);
 
             let matching_usage = usage_events
                 .iter()
                 .find(|e| e.payload["tool_call_id"] == call_id);
-            assert!(
-                matching_usage.is_some(),
-                "usage event for {}",
-                call_id
-            );
+            assert!(matching_usage.is_some(), "usage event for {}", call_id);
 
             // Status must agree between invocation record and usage event
-            let usage_status = matching_usage.unwrap().payload["status"]
-                .as_str()
-                .unwrap();
+            let usage_status = matching_usage.unwrap().payload["status"].as_str().unwrap();
             assert_eq!(
                 usage_status,
                 format!("{:?}", record.status),
@@ -1539,7 +1676,11 @@ mod tests {
         r
     }
 
-    fn exec_tool(registry: &ToolRegistry, tool: BuiltinToolName, input: &str) -> ToolExecutionOutput {
+    fn exec_tool(
+        registry: &ToolRegistry,
+        tool: BuiltinToolName,
+        input: &str,
+    ) -> ToolExecutionOutput {
         registry.execute_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new(format!("tc-{}", tool.as_str())),
@@ -1566,7 +1707,8 @@ mod tests {
             &serde_json::json!({
                 "path": file.to_string_lossy(),
                 "content": "hello world"
-            }).to_string(),
+            })
+            .to_string(),
         );
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         assert_eq!(fs::read_to_string(&file).unwrap(), "hello world");
@@ -1577,7 +1719,8 @@ mod tests {
             &serde_json::json!({
                 "path": file.to_string_lossy(),
                 "content": "updated"
-            }).to_string(),
+            })
+            .to_string(),
         );
         assert_eq!(output2.status, ExecutionResultStatus::Succeeded);
         assert_eq!(fs::read_to_string(&file).unwrap(), "updated");
@@ -1595,7 +1738,8 @@ mod tests {
             &serde_json::json!({
                 "path": file.to_string_lossy(),
                 "content": "deep"
-            }).to_string(),
+            })
+            .to_string(),
         );
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         assert_eq!(fs::read_to_string(&file).unwrap(), "deep");
@@ -1615,7 +1759,8 @@ mod tests {
                 "path": file.to_string_lossy(),
                 "content": "replaced",
                 "overwrite": false
-            }).to_string(),
+            })
+            .to_string(),
         );
         assert_eq!(output.status, ExecutionResultStatus::Failed);
         assert_eq!(fs::read_to_string(&file).unwrap(), "original");
@@ -1635,12 +1780,16 @@ mod tests {
                 "path": file.to_string_lossy(),
                 "old_string": "old_value",
                 "new_string": "new_value"
-            }).to_string(),
+            })
+            .to_string(),
         );
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         let payload: Value = serde_json::from_str(&output.payload).unwrap();
         assert_eq!(payload["applied"], 1);
-        assert_eq!(fs::read_to_string(&file).unwrap(), "line1\nnew_value\nline3");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "line1\nnew_value\nline3"
+        );
     }
 
     #[test]
@@ -1659,7 +1808,8 @@ mod tests {
                     { "old_string": "aaa", "new_string": "AAA" },
                     { "old_string": "ccc", "new_string": "CCC" }
                 ]
-            }).to_string(),
+            })
+            .to_string(),
         );
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         let payload: Value = serde_json::from_str(&output.payload).unwrap();
@@ -1681,7 +1831,8 @@ mod tests {
                 "path": file.to_string_lossy(),
                 "old_string": "same",
                 "new_string": "replaced"
-            }).to_string(),
+            })
+            .to_string(),
         );
         assert_eq!(output.status, ExecutionResultStatus::Failed);
         assert_eq!(fs::read_to_string(&file).unwrap(), "same\nsame\nother");
@@ -1754,7 +1905,8 @@ mod tests {
             &serde_json::json!({
                 "source": src.to_string_lossy(),
                 "destination": dst.to_string_lossy()
-            }).to_string(),
+            })
+            .to_string(),
         );
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         assert_eq!(fs::read_to_string(&dst).unwrap(), "copy me");
@@ -1771,7 +1923,8 @@ mod tests {
             &serde_json::json!({
                 "source": src_dir.to_string_lossy(),
                 "destination": dst_dir.to_string_lossy()
-            }).to_string(),
+            })
+            .to_string(),
         );
         assert_eq!(output2.status, ExecutionResultStatus::Succeeded);
         assert_eq!(
@@ -1795,7 +1948,8 @@ mod tests {
             &serde_json::json!({
                 "source": src.to_string_lossy(),
                 "destination": dst.to_string_lossy()
-            }).to_string(),
+            })
+            .to_string(),
         );
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         assert!(!src.exists());
@@ -1818,7 +1972,8 @@ mod tests {
             &serde_json::json!({
                 "source": src.to_string_lossy(),
                 "destination": dst.to_string_lossy()
-            }).to_string(),
+            })
+            .to_string(),
         );
         assert_eq!(output.status, ExecutionResultStatus::Failed);
         assert!(src.exists());
@@ -1901,14 +2056,29 @@ mod tests {
     #[test]
     fn from_str_roundtrips_through_as_str() {
         let all = [
-            BuiltinToolName::FileRead, BuiltinToolName::FileWrite, BuiltinToolName::FilePatch,
-            BuiltinToolName::FileRemove, BuiltinToolName::FileMkdir, BuiltinToolName::FileCopy,
-            BuiltinToolName::FileMove, BuiltinToolName::SearchText, BuiltinToolName::SearchSemantic,
-            BuiltinToolName::ShellExec, BuiltinToolName::ProcessInspect, BuiltinToolName::DiffPreview,
-            BuiltinToolName::WebSearch, BuiltinToolName::WebFetch, BuiltinToolName::MermaidDiagram,
-            BuiltinToolName::KnowledgeQuery, BuiltinToolName::WorkerSendMessage,
-            BuiltinToolName::TaskSplit, BuiltinToolName::TaskList, BuiltinToolName::TaskUpdate,
-            BuiltinToolName::TaskClaimNext, BuiltinToolName::ContextCompact, BuiltinToolName::SkillApply,
+            BuiltinToolName::FileRead,
+            BuiltinToolName::FileWrite,
+            BuiltinToolName::FilePatch,
+            BuiltinToolName::FileRemove,
+            BuiltinToolName::FileMkdir,
+            BuiltinToolName::FileCopy,
+            BuiltinToolName::FileMove,
+            BuiltinToolName::SearchText,
+            BuiltinToolName::SearchSemantic,
+            BuiltinToolName::ShellExec,
+            BuiltinToolName::ProcessInspect,
+            BuiltinToolName::DiffPreview,
+            BuiltinToolName::WebSearch,
+            BuiltinToolName::WebFetch,
+            BuiltinToolName::MermaidDiagram,
+            BuiltinToolName::KnowledgeQuery,
+            BuiltinToolName::WorkerSendMessage,
+            BuiltinToolName::TaskSplit,
+            BuiltinToolName::TaskList,
+            BuiltinToolName::TaskUpdate,
+            BuiltinToolName::TaskClaimNext,
+            BuiltinToolName::ContextCompact,
+            BuiltinToolName::SkillApply,
         ];
         for tool in &all {
             assert_eq!(
@@ -1931,29 +2101,46 @@ mod tests {
             BuiltinToolName::ContextCompact,
         ];
         let non_orchestration = [
-            BuiltinToolName::FileRead, BuiltinToolName::ShellExec,
-            BuiltinToolName::WebSearch, BuiltinToolName::SkillApply,
-            BuiltinToolName::MermaidDiagram, BuiltinToolName::SearchText,
+            BuiltinToolName::FileRead,
+            BuiltinToolName::ShellExec,
+            BuiltinToolName::WebSearch,
+            BuiltinToolName::SkillApply,
+            BuiltinToolName::MermaidDiagram,
+            BuiltinToolName::SearchText,
         ];
         for tool in &orchestration {
-            assert!(tool.is_orchestration(), "{:?} should be orchestration", tool);
+            assert!(
+                tool.is_orchestration(),
+                "{:?} should be orchestration",
+                tool
+            );
         }
         for tool in &non_orchestration {
-            assert!(!tool.is_orchestration(), "{:?} should not be orchestration", tool);
+            assert!(
+                !tool.is_orchestration(),
+                "{:?} should not be orchestration",
+                tool
+            );
         }
     }
 
     #[test]
     fn is_write_operation_identifies_correct_tools() {
         let write_ops = [
-            BuiltinToolName::FileWrite, BuiltinToolName::FilePatch,
-            BuiltinToolName::FileRemove, BuiltinToolName::FileMkdir,
-            BuiltinToolName::FileCopy, BuiltinToolName::FileMove,
+            BuiltinToolName::FileWrite,
+            BuiltinToolName::FilePatch,
+            BuiltinToolName::FileRemove,
+            BuiltinToolName::FileMkdir,
+            BuiltinToolName::FileCopy,
+            BuiltinToolName::FileMove,
         ];
         let non_write = [
-            BuiltinToolName::FileRead, BuiltinToolName::SearchText,
-            BuiltinToolName::ShellExec, BuiltinToolName::WebSearch,
-            BuiltinToolName::DiffPreview, BuiltinToolName::MermaidDiagram,
+            BuiltinToolName::FileRead,
+            BuiltinToolName::SearchText,
+            BuiltinToolName::ShellExec,
+            BuiltinToolName::WebSearch,
+            BuiltinToolName::DiffPreview,
+            BuiltinToolName::MermaidDiagram,
         ];
         for tool in &write_ops {
             assert!(tool.is_write_operation(), "{:?} should be write", tool);
@@ -1987,7 +2174,12 @@ mod tests {
                 BuiltinToolName::MermaidDiagram,
                 &serde_json::json!({ "code": code }).to_string(),
             );
-            assert_eq!(output.status, ExecutionResultStatus::Succeeded, "code: {}", code);
+            assert_eq!(
+                output.status,
+                ExecutionResultStatus::Succeeded,
+                "code: {}",
+                code
+            );
             let payload: Value = serde_json::from_str(&output.payload).unwrap();
             assert_eq!(payload["diagram_type"], *expected_type, "code: {}", code);
         }
@@ -2027,7 +2219,12 @@ mod tests {
         );
         assert_eq!(output.status, ExecutionResultStatus::Failed);
         let payload: Value = serde_json::from_str(&output.payload).unwrap();
-        assert!(payload["hint"].as_str().unwrap().contains("CodebaseRetrievalService"));
+        assert!(
+            payload["hint"]
+                .as_str()
+                .unwrap()
+                .contains("CodebaseRetrievalService")
+        );
     }
 
     #[test]
@@ -2040,7 +2237,12 @@ mod tests {
         );
         assert_eq!(output.status, ExecutionResultStatus::Failed);
         let payload: Value = serde_json::from_str(&output.payload).unwrap();
-        assert!(payload["hint"].as_str().unwrap().contains("ProjectKnowledgeBase"));
+        assert!(
+            payload["hint"]
+                .as_str()
+                .unwrap()
+                .contains("ProjectKnowledgeBase")
+        );
     }
 
     #[test]
@@ -2107,14 +2309,29 @@ mod tests {
         let specs = registry.builtin_specs();
         assert_eq!(specs.len(), 23, "应注册 23 个内置工具");
         let all_tools = [
-            BuiltinToolName::FileRead, BuiltinToolName::FileWrite, BuiltinToolName::FilePatch,
-            BuiltinToolName::FileRemove, BuiltinToolName::FileMkdir, BuiltinToolName::FileCopy,
-            BuiltinToolName::FileMove, BuiltinToolName::SearchText, BuiltinToolName::SearchSemantic,
-            BuiltinToolName::ShellExec, BuiltinToolName::ProcessInspect, BuiltinToolName::DiffPreview,
-            BuiltinToolName::WebSearch, BuiltinToolName::WebFetch, BuiltinToolName::MermaidDiagram,
-            BuiltinToolName::KnowledgeQuery, BuiltinToolName::WorkerSendMessage,
-            BuiltinToolName::TaskSplit, BuiltinToolName::TaskList, BuiltinToolName::TaskUpdate,
-            BuiltinToolName::TaskClaimNext, BuiltinToolName::ContextCompact, BuiltinToolName::SkillApply,
+            BuiltinToolName::FileRead,
+            BuiltinToolName::FileWrite,
+            BuiltinToolName::FilePatch,
+            BuiltinToolName::FileRemove,
+            BuiltinToolName::FileMkdir,
+            BuiltinToolName::FileCopy,
+            BuiltinToolName::FileMove,
+            BuiltinToolName::SearchText,
+            BuiltinToolName::SearchSemantic,
+            BuiltinToolName::ShellExec,
+            BuiltinToolName::ProcessInspect,
+            BuiltinToolName::DiffPreview,
+            BuiltinToolName::WebSearch,
+            BuiltinToolName::WebFetch,
+            BuiltinToolName::MermaidDiagram,
+            BuiltinToolName::KnowledgeQuery,
+            BuiltinToolName::WorkerSendMessage,
+            BuiltinToolName::TaskSplit,
+            BuiltinToolName::TaskList,
+            BuiltinToolName::TaskUpdate,
+            BuiltinToolName::TaskClaimNext,
+            BuiltinToolName::ContextCompact,
+            BuiltinToolName::SkillApply,
         ];
         for tool in &all_tools {
             assert!(

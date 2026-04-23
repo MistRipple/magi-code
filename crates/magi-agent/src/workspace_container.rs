@@ -28,7 +28,10 @@ impl WorkspaceRuntimeContainer {
         }
     }
 
-    pub fn with_session_registry(workspace: WorkspaceDescriptor, registry: SessionRuntimeRegistry) -> Self {
+    pub fn with_session_registry(
+        workspace: WorkspaceDescriptor,
+        registry: SessionRuntimeRegistry,
+    ) -> Self {
         Self {
             workspace,
             session_registry: registry,

@@ -1,14 +1,12 @@
-
 use crate::{
     DispatchExecutionResult, ExecutionContextSummary, ExecutionWritebackPlans,
-    OrchestratedExecutionRuntime, OrchestratorCommandError, RecoveryExecutionResult,
-    default_builtin_skill_plan, execution_overview, recovery_planner, resolve_skill_tool_name,
-};
-use magi_core::{
-    ExecutionResultStatus, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskStatus,
-    WorkerId, WorkspaceId,
+    OrchestratedExecutionRuntime, OrchestratorCommandError, default_builtin_skill_plan,
+    execution_overview, resolve_skill_tool_name,
 };
 use magi_context_runtime::{ExecutionContextAssemblyRequest, ExecutionContextClues};
+use magi_core::{
+    ExecutionResultStatus, SessionId, TaskExecutionTarget, TaskStatus, WorkerId, WorkspaceId,
+};
 use magi_event_bus::{EventCategory, EventContext};
 use magi_memory_store::MemoryStore;
 use magi_skill_runtime::SkillToolRuntimePlan;
@@ -32,7 +30,8 @@ impl OrchestratedExecutionRuntime {
             "{}-{}-{}",
             target.mission_id, target.root_task_id, target.task_id
         );
-        let skill_plan = skill_plan.unwrap_or_else(|| default_builtin_skill_plan("process_inspect"));
+        let skill_plan =
+            skill_plan.unwrap_or_else(|| default_builtin_skill_plan("process_inspect"));
         let skill_tool_name = resolve_skill_tool_name(&skill_plan);
         let skill_route = if skill_plan.routing.requested_bridge_tool_names.is_empty()
             && skill_plan.bridge_dispatch_plan.bindings.is_empty()
@@ -157,157 +156,6 @@ impl OrchestratedExecutionRuntime {
         )
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn execute_recovery(
-        &self,
-        input: RecoveryResumeInput,
-        worker_id: WorkerId,
-        skill_plan: Option<SkillToolRuntimePlan>,
-    ) -> Result<RecoveryExecutionResult, OrchestratorCommandError> {
-        self.execute_recovery_flow(input, worker_id, skill_plan)
-    }
-
-    pub fn execute_recovery_then<F>(
-        &self,
-        input: RecoveryResumeInput,
-        worker_id: WorkerId,
-        skill_plan: Option<SkillToolRuntimePlan>,
-        on_success: F,
-    ) -> Result<RecoveryExecutionResult, OrchestratorCommandError>
-    where
-        F: FnOnce(&RecoveryExecutionResult),
-    {
-        let result = self.execute_recovery_flow(input, worker_id, skill_plan)?;
-        on_success(&result);
-        Ok(result)
-    }
-
-    pub fn execute_recovery_with_writebacks(
-        &self,
-        input: RecoveryResumeInput,
-        worker_id: WorkerId,
-        skill_plan: Option<SkillToolRuntimePlan>,
-        memory_store: MemoryStore,
-        writebacks: ExecutionWritebackPlans,
-    ) -> Result<RecoveryExecutionResult, OrchestratorCommandError> {
-        self.execute_recovery_then(input, worker_id, skill_plan, move |_| {
-            writebacks.apply(&memory_store)
-        })
-    }
-
-    fn execute_recovery_flow(
-        &self,
-        input: RecoveryResumeInput,
-        worker_id: WorkerId,
-        skill_plan: Option<SkillToolRuntimePlan>,
-    ) -> Result<RecoveryExecutionResult, OrchestratorCommandError> {
-        if input.ownership.workspace_id.is_some() {
-            let store = self.workspace_store.as_ref().ok_or(
-                OrchestratorCommandError::RecoverySupportUnavailable {
-                    missing: "workspace_store".to_string(),
-                },
-            )?;
-            store.ensure_recovery_ready(&input.recovery_id).map_err(|error| {
-                OrchestratorCommandError::RecoverySupportUnavailable {
-                    missing: format!("workspace_store: {error}"),
-                }
-            })?;
-        }
-        let resume_command = self
-            .service
-            .build_resume_command(&input)
-            .ok_or(OrchestratorCommandError::NoResumeTarget {
-                recovery_id: input.recovery_id.clone(),
-            })?;
-        let mut target = recovery_planner::build_recovery_target(&self.task_store, &input)
-            .ok_or(OrchestratorCommandError::NoResumeTarget {
-                recovery_id: input.recovery_id.clone(),
-            })?;
-        target.requested_worker_id = Some(worker_id.clone());
-        let assignment_id = execution_overview::assignment_id_for_task(
-            &self.task_store,
-            &target.root_task_id,
-            &target.task_id,
-        );
-
-        let _ = self
-            .worker_runtime
-            .resume_from_execution_target(&target, worker_id.clone());
-        let _ = self.task_store.update_status(&target.task_id, TaskStatus::Running);
-
-        let session_sidecar = if let Some(session_id) = input.ownership.session_id.clone() {
-            let store = self.session_store.as_ref().ok_or(
-                OrchestratorCommandError::RecoverySupportUnavailable {
-                    missing: "session_store".to_string(),
-                },
-            )?;
-            store
-                .apply_recovery_resume_input(session_id.clone(), input.clone())
-                .map_err(|error| OrchestratorCommandError::RecoverySupportUnavailable {
-                    missing: format!("session_store: {error}"),
-                })?;
-            let session_sidecar = store
-                .apply_resume_execution_target(&session_id, &target)
-                .map_err(|error| OrchestratorCommandError::RecoverySupportUnavailable {
-                    missing: format!("session_store: {error}"),
-                })?;
-            Some(session_sidecar.export_view())
-        } else {
-            None
-        };
-
-        let workspace_recovery = if let Some(workspace_id) = input.ownership.workspace_id.clone() {
-            let store = self.workspace_store.as_ref().ok_or(
-                OrchestratorCommandError::RecoverySupportUnavailable {
-                    missing: "workspace_store".to_string(),
-                },
-            )?;
-            let resolved_ownership = magi_core::ExecutionOwnership {
-                session_id: input.ownership.session_id.clone(),
-                workspace_id: Some(workspace_id.clone()),
-                mission_id: Some(target.mission_id.clone()),
-                task_id: Some(target.task_id.clone()),
-                worker_id: target.requested_worker_id.clone(),
-                execution_chain_ref: target.execution_chain_ref.clone(),
-            };
-            let recovery_handle = store
-                .consume_recovery_with_ownership(&input.recovery_id, resolved_ownership)
-                .map_err(|error| OrchestratorCommandError::RecoverySupportUnavailable {
-                    missing: format!("workspace_store: {error}"),
-                })?;
-            if recovery_handle.workspace_id != workspace_id {
-                return Err(OrchestratorCommandError::RecoverySupportUnavailable {
-                    missing: format!(
-                        "workspace_store/recovery workspace mismatch: {} != {}",
-                        recovery_handle.workspace_id, workspace_id
-                    ),
-                });
-            }
-            Some(recovery_handle.export_view())
-        } else {
-            None
-        };
-
-        let dispatch = self.execute_dispatch_flow(
-            target.clone(),
-            worker_id,
-            input.ownership.session_id.clone(),
-            input.ownership.workspace_id.clone(),
-            skill_plan,
-        )?;
-        let runtime_snapshot = dispatch.overview.runtime_snapshot.clone();
-        Ok(RecoveryExecutionResult {
-            recovery_input: input,
-            resume_command,
-            target,
-            assignment_id,
-            dispatch,
-            session_sidecar,
-            workspace_recovery,
-            runtime_snapshot,
-        })
-    }
-
     fn build_context_summary_for_dispatch(
         &self,
         target: &TaskExecutionTarget,
@@ -349,19 +197,17 @@ impl OrchestratedExecutionRuntime {
             self.worker_runtime.executor_kind(),
             WorkerExecutorKind::LocalProcess
         ) {
-            let probe = self
-                .worker_runtime
-                .executor_probe()
-                .map_err(|error| OrchestratorCommandError::WorkerExecutorUnavailable {
+            let probe = self.worker_runtime.executor_probe().map_err(|error| {
+                OrchestratorCommandError::WorkerExecutorUnavailable {
                     reason: error.to_string(),
-                })?;
+                }
+            })?;
             if !probe.capability.supports_execute {
                 return Err(OrchestratorCommandError::WorkerExecutorUnavailable {
                     reason: "local process executor does not support execute".to_string(),
                 });
             }
-            if probe.health.status
-                != magi_worker_runtime::LocalProcessExecutorHealthStatus::Healthy
+            if probe.health.status != magi_worker_runtime::LocalProcessExecutorHealthStatus::Healthy
             {
                 return Err(OrchestratorCommandError::WorkerExecutorUnavailable {
                     reason: format!(
@@ -372,9 +218,11 @@ impl OrchestratedExecutionRuntime {
             }
             probe
                 .supports_context(&session_id, &workspace_id)
-                .map_err(|error| OrchestratorCommandError::WorkerExecutorUnavailable {
-                    reason: error.to_string(),
-                })?;
+                .map_err(
+                    |error| OrchestratorCommandError::WorkerExecutorUnavailable {
+                        reason: error.to_string(),
+                    },
+                )?;
             Some(probe)
         } else {
             None
@@ -390,25 +238,27 @@ impl OrchestratedExecutionRuntime {
             .ok_or(OrchestratorCommandError::TaskNotFound {
                 task_id: target.task_id.clone(),
             })?;
-        let mut executor_request = self
-            .service
-            .derive_executor_request(&intent, "dispatch");
+        let mut executor_request = self.service.derive_executor_request(&intent, "dispatch");
         if let Some(probe) = &executor_probe {
-            intent.execution_profile =
-                self.service.finalize_execution_profile(&intent.execution_profile, probe);
+            intent.execution_profile = self
+                .service
+                .finalize_execution_profile(&intent.execution_profile, probe);
             executor_request.requested_execution_profile = intent.execution_profile.clone();
             probe
                 .supports_execution_profile(&intent.execution_profile)
-                .map_err(|error| OrchestratorCommandError::WorkerExecutorUnavailable {
-                    reason: error.to_string(),
-                })?;
+                .map_err(
+                    |error| OrchestratorCommandError::WorkerExecutorUnavailable {
+                        reason: error.to_string(),
+                    },
+                )?;
             probe.supports_request(&executor_request).map_err(|error| {
                 OrchestratorCommandError::WorkerExecutorUnavailable {
                     reason: error.to_string(),
                 }
             })?;
         }
-        self.worker_runtime.register_execution_intent(intent.clone());
+        self.worker_runtime
+            .register_execution_intent(intent.clone());
         let loop_controller = match self.worker_runtime.executor_kind() {
             WorkerExecutorKind::LocalProcess => self.worker_runtime.loop_controller(),
             WorkerExecutorKind::Deterministic => self
@@ -438,10 +288,11 @@ impl OrchestratedExecutionRuntime {
         let tool_summary = match self.worker_runtime.executor_kind() {
             WorkerExecutorKind::LocalProcess => tool_summary_from_worker_snapshot(&snapshot),
             WorkerExecutorKind::Deterministic => {
-                self.tool_registry.summary_for_query(&ToolExecutionContextQuery {
-                    task_id: Some(target.task_id.clone()),
-                    ..ToolExecutionContextQuery::default()
-                })
+                self.tool_registry
+                    .summary_for_query(&ToolExecutionContextQuery {
+                        task_id: Some(target.task_id.clone()),
+                        ..ToolExecutionContextQuery::default()
+                    })
             }
         };
         let context_summary =
@@ -576,7 +427,6 @@ impl OrchestratedExecutionRuntime {
             }),
         );
     }
-
 }
 
 fn tool_summary_from_worker_snapshot(snapshot: &TaskExecutionSnapshot) -> ToolExecutionSummary {

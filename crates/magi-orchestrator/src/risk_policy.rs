@@ -156,7 +156,11 @@ fn count_modules(files: &HashSet<&str>) -> usize {
     modules.len()
 }
 
-fn has_interface_change(prompt: &str, analysis: Option<&str>, feature_contract: Option<&str>) -> bool {
+fn has_interface_change(
+    prompt: &str,
+    analysis: Option<&str>,
+    feature_contract: Option<&str>,
+) -> bool {
     let combined = format!(
         "{}\n{}\n{}",
         prompt,
@@ -177,10 +181,24 @@ fn has_config_change(files: &HashSet<&str>) -> bool {
         return false;
     }
     const CONFIG_FILES: &[&str] = &[
-        "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
-        "requirements.txt", "pyproject.toml", "Pipfile", "go.mod", "go.sum",
-        "Cargo.toml", "Cargo.lock", "pom.xml", "build.gradle", "build.gradle.kts",
-        "tsconfig.json", "vite.config", "webpack.config", "next.config",
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "requirements.txt",
+        "pyproject.toml",
+        "Pipfile",
+        "go.mod",
+        "go.sum",
+        "Cargo.toml",
+        "Cargo.lock",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "tsconfig.json",
+        "vite.config",
+        "webpack.config",
+        "next.config",
     ];
     for file in files {
         let base = file.rsplit('/').next().unwrap_or(file);

@@ -31,8 +31,7 @@ impl<T> MinHeap<T> {
         if self.heap.len() < self.capacity {
             self.heap.push(item);
             self.sift_up(self.heap.len() - 1);
-        } else if !self.heap.is_empty()
-            && (self.compare)(&item, &self.heap[0]) == Ordering::Greater
+        } else if !self.heap.is_empty() && (self.compare)(&item, &self.heap[0]) == Ordering::Greater
         {
             self.heap[0] = item;
             self.sift_down(0);
@@ -63,8 +62,7 @@ impl<T> MinHeap<T> {
             let left = 2 * index + 1;
             let right = 2 * index + 2;
 
-            if left < n
-                && (self.compare)(&self.heap[left], &self.heap[smallest]) == Ordering::Less
+            if left < n && (self.compare)(&self.heap[left], &self.heap[smallest]) == Ordering::Less
             {
                 smallest = left;
             }

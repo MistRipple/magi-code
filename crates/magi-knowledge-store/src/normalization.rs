@@ -12,7 +12,9 @@ pub(crate) fn normalize_record(mut record: KnowledgeRecord) -> KnowledgeRecord {
     record
 }
 
-pub(crate) fn normalize_code_index_ingestion(mut ingestion: CodeIndexIngestion) -> CodeIndexIngestion {
+pub(crate) fn normalize_code_index_ingestion(
+    mut ingestion: CodeIndexIngestion,
+) -> CodeIndexIngestion {
     ingestion.knowledge_id = normalize_required_text(ingestion.knowledge_id);
     ingestion.title = normalize_required_text(ingestion.title);
     ingestion.content = ingestion.content.trim().to_string();

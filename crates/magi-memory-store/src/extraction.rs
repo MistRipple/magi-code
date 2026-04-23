@@ -1,7 +1,6 @@
 use super::{
-    ExtractedMemory, MemoryExtractionApplyRequest, MemoryExtractionLinkage,
-    MemoryExtractionRecord, MemoryExtractionVerification, MemoryProvenance, MemoryRecord,
-    MemoryStore,
+    ExtractedMemory, MemoryExtractionApplyRequest, MemoryExtractionLinkage, MemoryExtractionRecord,
+    MemoryExtractionVerification, MemoryProvenance, MemoryRecord, MemoryStore,
 };
 use std::collections::HashSet;
 
@@ -21,8 +20,7 @@ impl MemoryStore {
             created_at,
         } = request;
 
-        let produced_records =
-            normalize_extracted_memories(&session_id, &extraction_id, memories);
+        let produced_records = normalize_extracted_memories(&session_id, &extraction_id, memories);
         {
             let mut entries = self
                 .entries

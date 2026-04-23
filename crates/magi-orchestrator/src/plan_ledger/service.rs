@@ -82,12 +82,18 @@ impl PlanLedgerService {
             status: PlanStatus::Draft,
             prompt_digest: build_prompt_digest(&input.prompt),
             summary,
-            analysis: input.analysis.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            analysis: input
+                .analysis
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             constraints: normalize_string_vec(input.constraints),
             risk_level: input.risk_level,
             review: None,
             runtime: create_initial_runtime_state(acceptance_criteria, now),
-            formatted_plan: input.formatted_plan.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            formatted_plan: input
+                .formatted_plan
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             items: Vec::new(),
             attempts: Vec::new(),
             links: PlanLinks::default(),
@@ -118,7 +124,9 @@ impl PlanLedgerService {
         record.review = Some(PlanReview {
             status: PlanReviewStatus::Approved,
             reviewer: Some(reviewer.unwrap_or("system:auto").to_string()),
-            reason: reason.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            reason: reason
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             reviewed_at: now,
         });
         record.updated_at = now;
@@ -430,11 +438,16 @@ impl PlanLedgerService {
 
         if let Some(attempt) = existing {
             if attempt.status == PlanAttemptStatus::Created {
-                apply_attempt_transition(attempt, PlanAttemptStatus::Inflight, normalized.reason.as_deref());
+                apply_attempt_transition(
+                    attempt,
+                    PlanAttemptStatus::Inflight,
+                    normalized.reason.as_deref(),
+                );
             }
         } else {
             let sequence = next_attempt_sequence(&record.attempts, &normalized);
-            let attempt_id = generate_attempt_id(&normalized.scope, &normalized.target_id, sequence);
+            let attempt_id =
+                generate_attempt_id(&normalized.scope, &normalized.target_id, sequence);
             let mut attempt = PlanAttemptRecord {
                 attempt_id,
                 scope: normalized.scope,
@@ -452,7 +465,11 @@ impl PlanLedgerService {
                 ended_at: None,
                 updated_at: now,
             };
-            apply_attempt_transition(&mut attempt, PlanAttemptStatus::Inflight, normalized.reason.as_deref());
+            apply_attempt_transition(
+                &mut attempt,
+                PlanAttemptStatus::Inflight,
+                normalized.reason.as_deref(),
+            );
             record.attempts.push(attempt);
         }
 
@@ -611,7 +628,10 @@ impl PlanLedgerService {
         if let Some(r) = round {
             record.runtime.review.round = r;
         }
-        if matches!(state, ReviewState::Running | ReviewState::Accepted | ReviewState::Rejected) {
+        if matches!(
+            state,
+            ReviewState::Running | ReviewState::Accepted | ReviewState::Rejected
+        ) {
             record.runtime.review.last_reviewed_at = Some(now);
         }
         record.updated_at = now;
@@ -878,7 +898,10 @@ impl PlanLedgerService {
 
     fn update_index(&mut self, record: &PlanRecord) {
         let session_index = self.index.entry(record.session_id.clone()).or_default();
-        if let Some(entry) = session_index.iter_mut().find(|e| e.plan_id == record.plan_id) {
+        if let Some(entry) = session_index
+            .iter_mut()
+            .find(|e| e.plan_id == record.plan_id)
+        {
             entry.status = record.status;
             entry.mission_id.clone_from(&record.mission_id);
             entry.updated_at = record.updated_at;
@@ -1156,9 +1179,21 @@ fn build_prompt_digest(prompt: &str) -> String {
 }
 
 fn normalize_attempt_input(input: &PlanAttemptStartInput) -> NormalizedAttemptSelector {
-    let assignment_id = input.assignment_id.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let task_id = input.task_id.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let explicit_target = input.target_id.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let assignment_id = input
+        .assignment_id
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let task_id = input
+        .task_id
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let explicit_target = input
+        .target_id
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     let target_id = explicit_target
         .or_else(|| {
@@ -1186,10 +1221,24 @@ fn normalize_attempt_input(input: &PlanAttemptStartInput) -> NormalizedAttemptSe
     }
 }
 
-fn normalize_attempt_input_from_complete(input: &PlanAttemptCompleteInput) -> NormalizedAttemptSelector {
-    let assignment_id = input.assignment_id.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let task_id = input.task_id.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let explicit_target = input.target_id.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+fn normalize_attempt_input_from_complete(
+    input: &PlanAttemptCompleteInput,
+) -> NormalizedAttemptSelector {
+    let assignment_id = input
+        .assignment_id
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let task_id = input
+        .task_id
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let explicit_target = input
+        .target_id
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     let target_id = explicit_target
         .or_else(|| {
@@ -1292,7 +1341,13 @@ fn generate_plan_id(now: u64) -> String {
 fn generate_attempt_id(scope: &PlanAttemptScope, target_id: &str, sequence: u32) -> String {
     let safe_target: String = target_id
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(48)
         .collect();
     let safe_target = if safe_target.is_empty() {

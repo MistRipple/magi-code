@@ -1,7 +1,7 @@
 use crate::{
+    CodeIndexSource, KnowledgeAuditLink, KnowledgeGovernanceLink, KnowledgeIndexer, KnowledgeMatch,
+    KnowledgeQuery, KnowledgeQueryResult, KnowledgeQueryService, KnowledgeRecord,
     normalization::{merge_unique_terms, normalize_tags, tokenize},
-    CodeIndexSource, KnowledgeAuditLink, KnowledgeGovernanceLink, KnowledgeIndexer,
-    KnowledgeMatch, KnowledgeQuery, KnowledgeQueryResult, KnowledgeQueryService, KnowledgeRecord,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -19,6 +19,12 @@ impl KnowledgeQueryService {
 
         let mut matches = entries
             .values()
+            .filter(|record| {
+                query
+                    .workspace_id
+                    .as_ref()
+                    .is_none_or(|workspace_id| record.workspace_id.as_ref() == Some(workspace_id))
+            })
             .filter(|record| query.kind.is_none_or(|kind| record.kind == kind))
             .filter_map(|record| {
                 let indexed_terms = index_terms

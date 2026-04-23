@@ -3,7 +3,9 @@ use crate::authority::{
 };
 use crate::costing::normalize_usage_delta;
 use crate::model_identity::{build_model_resolution_identity, canonicalize_base_url};
-use crate::reducer::{rebuild_session_snapshot_from_events, rebuild_workspace_snapshot_from_sessions};
+use crate::reducer::{
+    rebuild_session_snapshot_from_events, rebuild_workspace_snapshot_from_sessions,
+};
 use crate::types::*;
 
 fn make_llm_config() -> LlmConfig {
@@ -99,17 +101,16 @@ fn test_canonicalize_base_url() {
         "https://example.com:8080/api"
     );
     assert_eq!(canonicalize_base_url(""), "");
-    assert_eq!(
-        canonicalize_base_url("not-a-url///"),
-        "not-a-url"
-    );
+    assert_eq!(canonicalize_base_url("not-a-url///"), "not-a-url");
 }
 
 #[test]
 fn test_build_model_resolution_identity() {
     let config = make_llm_config();
-    let binding = build_execution_binding_identity("tmpl-1", "engine-1", 1, UsageSourceRole::Worker);
-    let identity = build_model_resolution_identity(&config, &binding, Some("claude-sonnet-4-20250514"), None);
+    let binding =
+        build_execution_binding_identity("tmpl-1", "engine-1", 1, UsageSourceRole::Worker);
+    let identity =
+        build_model_resolution_identity(&config, &binding, Some("claude-sonnet-4-20250514"), None);
 
     assert_eq!(identity.provider, "anthropic");
     assert_eq!(identity.resolved_model, "claude-sonnet-4-20250514");
@@ -122,7 +123,8 @@ fn test_build_model_resolution_identity() {
 #[test]
 fn test_model_identity_key_deterministic() {
     let config = make_llm_config();
-    let binding = build_execution_binding_identity("tmpl-1", "engine-1", 1, UsageSourceRole::Worker);
+    let binding =
+        build_execution_binding_identity("tmpl-1", "engine-1", 1, UsageSourceRole::Worker);
     let id1 = build_model_resolution_identity(&config, &binding, None, None);
     let id2 = build_model_resolution_identity(&config, &binding, None, None);
     assert_eq!(id1.model_identity_key, id2.model_identity_key);
@@ -227,7 +229,8 @@ fn test_binding_and_model_snapshots() {
 
 #[test]
 fn test_rebuild_session_from_events() {
-    let binding = build_execution_binding_identity("tmpl-1", "engine-1", 1, UsageSourceRole::Worker);
+    let binding =
+        build_execution_binding_identity("tmpl-1", "engine-1", 1, UsageSourceRole::Worker);
     let config = make_llm_config();
     let model_id = build_model_resolution_identity(&config, &binding, None, None);
 
@@ -244,7 +247,12 @@ fn test_rebuild_session_from_events() {
             event_type: UsageEventType::LlmCallCompleted,
             execution_binding: Some(binding.clone()),
             model_identity: Some(model_id.clone()),
-            call_identity: Some(build_usage_call_identity("c1", None, UsageSourceRole::Worker, None)),
+            call_identity: Some(build_usage_call_identity(
+                "c1",
+                None,
+                UsageSourceRole::Worker,
+                None,
+            )),
             usage_delta: Some(UsageEventUsageDelta {
                 raw_input_tokens: 500,
                 raw_output_tokens: 200,
@@ -266,7 +274,12 @@ fn test_rebuild_session_from_events() {
             event_type: UsageEventType::LlmCallCompleted,
             execution_binding: Some(binding),
             model_identity: Some(model_id),
-            call_identity: Some(build_usage_call_identity("c2", None, UsageSourceRole::Worker, None)),
+            call_identity: Some(build_usage_call_identity(
+                "c2",
+                None,
+                UsageSourceRole::Worker,
+                None,
+            )),
             usage_delta: Some(UsageEventUsageDelta {
                 raw_input_tokens: 300,
                 raw_output_tokens: 100,
@@ -357,7 +370,8 @@ fn test_usage_totals_add() {
 
 #[test]
 fn test_session_reset_rebuilds_from_events() {
-    let binding = build_execution_binding_identity("tmpl-1", "engine-1", 1, UsageSourceRole::Worker);
+    let binding =
+        build_execution_binding_identity("tmpl-1", "engine-1", 1, UsageSourceRole::Worker);
     let config = make_llm_config();
     let model_id = build_model_resolution_identity(&config, &binding, None, None);
 
@@ -374,7 +388,12 @@ fn test_session_reset_rebuilds_from_events() {
             event_type: UsageEventType::LlmCallCompleted,
             execution_binding: Some(binding.clone()),
             model_identity: Some(model_id.clone()),
-            call_identity: Some(build_usage_call_identity("c1", None, UsageSourceRole::Worker, None)),
+            call_identity: Some(build_usage_call_identity(
+                "c1",
+                None,
+                UsageSourceRole::Worker,
+                None,
+            )),
             usage_delta: Some(UsageEventUsageDelta {
                 raw_input_tokens: 500,
                 raw_output_tokens: 200,
@@ -413,7 +432,12 @@ fn test_session_reset_rebuilds_from_events() {
             event_type: UsageEventType::LlmCallCompleted,
             execution_binding: Some(binding),
             model_identity: Some(model_id),
-            call_identity: Some(build_usage_call_identity("c2", None, UsageSourceRole::Worker, None)),
+            call_identity: Some(build_usage_call_identity(
+                "c2",
+                None,
+                UsageSourceRole::Worker,
+                None,
+            )),
             usage_delta: Some(UsageEventUsageDelta {
                 raw_input_tokens: 300,
                 raw_output_tokens: 100,

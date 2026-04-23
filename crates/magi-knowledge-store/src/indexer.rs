@@ -1,6 +1,6 @@
 use crate::{
-    normalization::tokenize, CodeIndexSource, KnowledgeAuditLink, KnowledgeGovernanceLink,
-    KnowledgeIndexer, KnowledgeRecord,
+    CodeIndexSource, KnowledgeAuditLink, KnowledgeGovernanceLink, KnowledgeIndexer,
+    KnowledgeRecord, normalization::tokenize,
 };
 
 impl KnowledgeIndexer {

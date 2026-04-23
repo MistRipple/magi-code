@@ -2,11 +2,13 @@ use magi_core::UtcMillis;
 
 use crate::ledger_store::InMemoryLedgerStore;
 use crate::model_identity::build_model_resolution_identity;
-use crate::reducer::{rebuild_session_snapshot_from_events, rebuild_workspace_snapshot_from_sessions};
+use crate::reducer::{
+    rebuild_session_snapshot_from_events, rebuild_workspace_snapshot_from_sessions,
+};
 use crate::types::{
     ExecutionBindingIdentity, SessionUsageSnapshot, UsageCallIdentity, UsageCallRecordInput,
-    UsageCallStatus, UsageEvent, UsageEventType, UsageEventUsageDelta, UsagePhase,
-    UsageSourceRole, WorkspaceUsageSnapshot,
+    UsageCallStatus, UsageEvent, UsageEventType, UsageEventUsageDelta, UsagePhase, UsageSourceRole,
+    WorkspaceUsageSnapshot,
 };
 
 fn build_event_id(
@@ -17,9 +19,7 @@ fn build_event_id(
     binding_revision: u32,
     timestamp: u64,
 ) -> String {
-    format!(
-        "{workspace_id}:{session_id}:{call_id}:{template_id}:{binding_revision}:{timestamp}"
-    )
+    format!("{workspace_id}:{session_id}:{call_id}:{template_id}:{binding_revision}:{timestamp}")
 }
 
 pub struct UsageAuthority {
@@ -116,8 +116,7 @@ impl UsageAuthority {
             index.processed_event_ids.drain(..drain_count);
         }
         index.processed_event_ids.push(event_id);
-        self.store
-            .write_session_index(&input.session_id, index);
+        self.store.write_session_index(&input.session_id, index);
 
         let session_snapshot =
             self.rebuild_session_snapshot_internal(&input.workspace_id, &input.session_id);
@@ -134,17 +133,13 @@ impl UsageAuthority {
         self.rebuild_session_snapshot_internal(workspace_id, session_id)
     }
 
-    pub fn rebuild_workspace_snapshot(
-        &mut self,
-        workspace_id: &str,
-    ) -> WorkspaceUsageSnapshot {
+    pub fn rebuild_workspace_snapshot(&mut self, workspace_id: &str) -> WorkspaceUsageSnapshot {
         let session_ids = self.store.list_session_ids();
         let session_snapshots: Vec<SessionUsageSnapshot> = session_ids
             .iter()
             .map(|sid| self.store.read_session_snapshot(workspace_id, sid))
             .collect();
-        let snapshot =
-            rebuild_workspace_snapshot_from_sessions(workspace_id, &session_snapshots);
+        let snapshot = rebuild_workspace_snapshot_from_sessions(workspace_id, &session_snapshots);
         self.store.write_workspace_snapshot(snapshot.clone());
         snapshot
     }
@@ -211,8 +206,7 @@ impl UsageAuthority {
         session_id: &str,
     ) -> SessionUsageSnapshot {
         let events = self.store.read_session_events(session_id);
-        let snapshot =
-            rebuild_session_snapshot_from_events(workspace_id, session_id, &events);
+        let snapshot = rebuild_session_snapshot_from_events(workspace_id, session_id, &events);
         self.store.write_session_snapshot(snapshot.clone());
         snapshot
     }

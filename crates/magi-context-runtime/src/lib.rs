@@ -370,30 +370,30 @@ impl FileSummaryStore {
     }
 
     pub fn query(&self, query: &FileSummaryQuery) -> Vec<FileSummaryRecord> {
-        let mut records = self
-            .entries
-            .read()
-            .expect("file summary store read lock poisoned")
-            .values()
-            .filter(|record| {
-                query
-                    .workspace_id
-                    .as_ref()
-                    .is_none_or(|id| record.workspace_id.as_ref() == Some(id))
-            })
-            .filter(|record| {
-                query
-                    .project_key
-                    .as_ref()
-                    .is_none_or(|project_key| record.project_key.as_ref() == Some(project_key))
-            })
-            .filter(|record| {
-                query.path_prefix.as_ref().is_none_or(|path_prefix| {
-                    record.item.absolute_path.starts_with(path_prefix)
+        let mut records =
+            self.entries
+                .read()
+                .expect("file summary store read lock poisoned")
+                .values()
+                .filter(|record| {
+                    query
+                        .workspace_id
+                        .as_ref()
+                        .is_none_or(|id| record.workspace_id.as_ref() == Some(id))
                 })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+                .filter(|record| {
+                    query
+                        .project_key
+                        .as_ref()
+                        .is_none_or(|project_key| record.project_key.as_ref() == Some(project_key))
+                })
+                .filter(|record| {
+                    query.path_prefix.as_ref().is_none_or(|path_prefix| {
+                        record.item.absolute_path.starts_with(path_prefix)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
         records.sort_by(|left, right| {
             right
                 .updated_at
@@ -812,7 +812,10 @@ mod tests {
 
         let source_input = request.to_source_assembly_input();
 
-        assert_eq!(source_input.recent_turns_query.session_id, Some(session_id.clone()));
+        assert_eq!(
+            source_input.recent_turns_query.session_id,
+            Some(session_id.clone())
+        );
         assert_eq!(
             source_input.recent_turns_query.project_key.as_deref(),
             Some("project-alpha")
@@ -959,14 +962,18 @@ mod tests {
             result.selected_knowledge[0].knowledge_id,
             "kb-parser-diagnostics"
         );
-        assert!(result.selected_knowledge[0]
-            .matched_terms
-            .iter()
-            .any(|term| term == "parser"));
-        assert!(result.selected_knowledge[0]
-            .matched_terms
-            .iter()
-            .any(|term| term == "diagnostics"));
+        assert!(
+            result.selected_knowledge[0]
+                .matched_terms
+                .iter()
+                .any(|term| term == "parser")
+        );
+        assert!(
+            result.selected_knowledge[0]
+                .matched_terms
+                .iter()
+                .any(|term| term == "diagnostics")
+        );
 
         assert_eq!(result.selected_memory.len(), 1);
         assert_eq!(result.selected_memory[0].memory_id, "mem-session-1");
@@ -980,16 +987,20 @@ mod tests {
             "/repo/src/parser.rs"
         );
         assert_eq!(result.selected_recent_turns.len(), 2);
-        assert!(result
-            .selected_recent_turns
-            .iter()
-            .any(|turn| turn.source == RecentTurnSource::Session
-                && turn.content == "Session turn about parser diagnostics"));
-        assert!(result
-            .selected_recent_turns
-            .iter()
-            .any(|turn| turn.source == RecentTurnSource::Project
-                && turn.content == "Project turn for parser fallback review"));
+        assert!(
+            result
+                .selected_recent_turns
+                .iter()
+                .any(|turn| turn.source == RecentTurnSource::Session
+                    && turn.content == "Session turn about parser diagnostics")
+        );
+        assert!(
+            result
+                .selected_recent_turns
+                .iter()
+                .any(|turn| turn.source == RecentTurnSource::Project
+                    && turn.content == "Project turn for parser fallback review")
+        );
         assert_eq!(result.recent_turns_summary.resolved_count, 2);
         assert_eq!(result.recent_turns_summary.retained_count, 2);
     }
@@ -1164,9 +1175,15 @@ mod tests {
         assert_eq!(result.selected_knowledge.len(), 1);
         let selected = &result.selected_knowledge[0];
         assert_eq!(selected.knowledge_id, "kb-code-1");
-        assert_eq!(selected.kind, magi_knowledge_store::KnowledgeKind::CodeIndex);
         assert_eq!(
-            selected.code_source.as_ref().map(|source| source.path.as_str()),
+            selected.kind,
+            magi_knowledge_store::KnowledgeKind::CodeIndex
+        );
+        assert_eq!(
+            selected
+                .code_source
+                .as_ref()
+                .map(|source| source.path.as_str()),
             Some("src/parser.rs")
         );
         assert_eq!(
@@ -1306,31 +1323,34 @@ mod tests {
     fn extracted_memory_records_flow_through_context_assembly() {
         let session_id = SessionId::new("session-extract");
         let memory_store = MemoryStore::new();
-        let linkage = memory_store.apply_extraction(magi_memory_store::MemoryExtractionApplyRequest {
-            extraction_id: "extract-ctx-1".to_string(),
-            session_id: session_id.clone(),
-            source_ref: Some("timeline:42".to_string()),
-            summary: "Summarized stable user preferences".to_string(),
-            memories: vec![
-                magi_memory_store::ExtractedMemory {
-                    memory_id: "mem-extract-2".to_string(),
-                    layer: magi_memory_store::MemoryLayer::Durable,
-                    content: "User prefers deterministic output".to_string(),
-                    created_at: UtcMillis(40),
-                },
-                magi_memory_store::ExtractedMemory {
-                    memory_id: "mem-extract-1".to_string(),
-                    layer: magi_memory_store::MemoryLayer::Durable,
-                    content: "Prefer showing audit links in context".to_string(),
-                    created_at: UtcMillis(30),
-                },
-            ],
-            created_at: UtcMillis(25),
-        });
+        let linkage =
+            memory_store.apply_extraction(magi_memory_store::MemoryExtractionApplyRequest {
+                extraction_id: "extract-ctx-1".to_string(),
+                session_id: session_id.clone(),
+                source_ref: Some("timeline:42".to_string()),
+                summary: "Summarized stable user preferences".to_string(),
+                memories: vec![
+                    magi_memory_store::ExtractedMemory {
+                        memory_id: "mem-extract-2".to_string(),
+                        layer: magi_memory_store::MemoryLayer::Durable,
+                        content: "User prefers deterministic output".to_string(),
+                        created_at: UtcMillis(40),
+                    },
+                    magi_memory_store::ExtractedMemory {
+                        memory_id: "mem-extract-1".to_string(),
+                        layer: magi_memory_store::MemoryLayer::Durable,
+                        content: "Prefer showing audit links in context".to_string(),
+                        created_at: UtcMillis(30),
+                    },
+                ],
+                created_at: UtcMillis(25),
+            });
         assert_eq!(linkage.produced_records.len(), 2);
-        assert!(memory_store
-            .verify_extraction_linkage("extract-ctx-1")
-            .is_some_and(|verification| verification.is_consistent));
+        assert!(
+            memory_store
+                .verify_extraction_linkage("extract-ctx-1")
+                .is_some_and(|verification| verification.is_consistent)
+        );
 
         let runtime = ContextRuntime::new(KnowledgeStore::new(), memory_store);
         let budget = ContextBudget {
@@ -1366,7 +1386,10 @@ mod tests {
         for record in &result.selected_memory {
             assert_eq!(record.session_id, session_id);
             assert_eq!(
-                record.provenance.as_ref().map(|provenance| provenance.source.as_str()),
+                record
+                    .provenance
+                    .as_ref()
+                    .map(|provenance| provenance.source.as_str()),
                 Some("extraction")
             );
             assert_eq!(

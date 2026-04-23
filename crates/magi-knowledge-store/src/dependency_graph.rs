@@ -79,8 +79,12 @@ impl DependencyGraph {
             patterns: ImportPatterns {
                 es_import: vec![
                     Regex::new(r#"^import\s+\{[^}]+\}\s+from\s+['"]([^'"]+)['"]"#).unwrap(),
-                    Regex::new(r#"^import\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s+from\s+['"]([^'"]+)['"]"#).unwrap(),
-                    Regex::new(r#"^import\s+\*\s+as\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s+from\s+['"]([^'"]+)['"]"#).unwrap(),
+                    Regex::new(r#"^import\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s+from\s+['"]([^'"]+)['"]"#)
+                        .unwrap(),
+                    Regex::new(
+                        r#"^import\s+\*\s+as\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s+from\s+['"]([^'"]+)['"]"#,
+                    )
+                    .unwrap(),
                     Regex::new(r#"^import\s+['"]([^'"]+)['"]"#).unwrap(),
                 ],
                 reexport: vec![
@@ -89,9 +93,7 @@ impl DependencyGraph {
                 ],
                 require: Regex::new(r#"require\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap(),
                 dynamic_import: Regex::new(r#"import\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap(),
-                py_import: vec![
-                    Regex::new(r"^from\s+(\.+\w*)\s+import\s+").unwrap(),
-                ],
+                py_import: vec![Regex::new(r"^from\s+(\.+\w*)\s+import\s+").unwrap()],
             },
             ready: false,
         }
@@ -147,12 +149,7 @@ impl DependencyGraph {
         self.centrality_cache.get(file_path).copied().unwrap_or(0.0)
     }
 
-    pub fn expand(
-        &self,
-        file_path: &str,
-        depth: usize,
-        direction: ExpandDirection,
-    ) -> Vec<String> {
+    pub fn expand(&self, file_path: &str, depth: usize, direction: ExpandDirection) -> Vec<String> {
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         queue.push_back((file_path.to_string(), 0usize));
@@ -201,7 +198,11 @@ impl DependencyGraph {
                     .get(&file_path)
                     .map(|s| s.len())
                     .unwrap_or(0);
-                let centrality = self.centrality_cache.get(&file_path).copied().unwrap_or(0.0);
+                let centrality = self
+                    .centrality_cache
+                    .get(&file_path)
+                    .copied()
+                    .unwrap_or(0.0);
                 FileCentrality {
                     file_path,
                     in_degree,
@@ -353,10 +354,7 @@ impl DependencyGraph {
 
         for line in content.lines() {
             let trimmed = line.trim_start();
-            if trimmed.starts_with("//")
-                || trimmed.starts_with('*')
-                || trimmed.starts_with("/*")
-            {
+            if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
                 continue;
             }
             if is_python && trimmed.starts_with('#') {
@@ -368,8 +366,17 @@ impl DependencyGraph {
                 if let Some(caps) = pat.captures(trimmed) {
                     let module_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                     if !module_path.is_empty() && is_internal(&self.path_aliases, module_path) {
-                        if let Some(resolved) = resolve_module(&self.path_aliases, &self.file_set, file_path, module_path) {
-                            collected_edges.push((file_path.to_string(), resolved, ImportType::Static));
+                        if let Some(resolved) = resolve_module(
+                            &self.path_aliases,
+                            &self.file_set,
+                            file_path,
+                            module_path,
+                        ) {
+                            collected_edges.push((
+                                file_path.to_string(),
+                                resolved,
+                                ImportType::Static,
+                            ));
                         }
                     }
                 }
@@ -380,8 +387,17 @@ impl DependencyGraph {
                 if let Some(caps) = pat.captures(trimmed) {
                     let module_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                     if !module_path.is_empty() && is_internal(&self.path_aliases, module_path) {
-                        if let Some(resolved) = resolve_module(&self.path_aliases, &self.file_set, file_path, module_path) {
-                            collected_edges.push((file_path.to_string(), resolved, ImportType::Static));
+                        if let Some(resolved) = resolve_module(
+                            &self.path_aliases,
+                            &self.file_set,
+                            file_path,
+                            module_path,
+                        ) {
+                            collected_edges.push((
+                                file_path.to_string(),
+                                resolved,
+                                ImportType::Static,
+                            ));
                         }
                     }
                 }
@@ -391,8 +407,14 @@ impl DependencyGraph {
             for caps in self.patterns.require.captures_iter(line) {
                 let module_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 if !module_path.is_empty() && is_internal(&self.path_aliases, module_path) {
-                    if let Some(resolved) = resolve_module(&self.path_aliases, &self.file_set, file_path, module_path) {
-                        collected_edges.push((file_path.to_string(), resolved, ImportType::Require));
+                    if let Some(resolved) =
+                        resolve_module(&self.path_aliases, &self.file_set, file_path, module_path)
+                    {
+                        collected_edges.push((
+                            file_path.to_string(),
+                            resolved,
+                            ImportType::Require,
+                        ));
                     }
                 }
             }
@@ -401,8 +423,14 @@ impl DependencyGraph {
             for caps in self.patterns.dynamic_import.captures_iter(line) {
                 let module_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 if !module_path.is_empty() && is_internal(&self.path_aliases, module_path) {
-                    if let Some(resolved) = resolve_module(&self.path_aliases, &self.file_set, file_path, module_path) {
-                        collected_edges.push((file_path.to_string(), resolved, ImportType::Dynamic));
+                    if let Some(resolved) =
+                        resolve_module(&self.path_aliases, &self.file_set, file_path, module_path)
+                    {
+                        collected_edges.push((
+                            file_path.to_string(),
+                            resolved,
+                            ImportType::Dynamic,
+                        ));
                     }
                 }
             }
@@ -415,7 +443,11 @@ impl DependencyGraph {
                         if let Some(resolved) =
                             resolve_python(&self.file_set, file_path, py_module_path)
                         {
-                            collected_edges.push((file_path.to_string(), resolved, ImportType::Static));
+                            collected_edges.push((
+                                file_path.to_string(),
+                                resolved,
+                                ImportType::Static,
+                            ));
                         }
                     }
                 }
@@ -489,11 +521,29 @@ fn resolve_module(
     };
 
     let extensions = [
-        "", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
-        "/index.ts", "/index.js",
-        ".py", ".go", ".java", ".rs",
-        ".c", ".h", ".cpp", ".cc", ".hpp",
-        ".cs", ".php", ".rb", ".swift", ".kt",
+        "",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        "/index.ts",
+        "/index.js",
+        ".py",
+        ".go",
+        ".java",
+        ".rs",
+        ".c",
+        ".h",
+        ".cpp",
+        ".cc",
+        ".hpp",
+        ".cs",
+        ".php",
+        ".rb",
+        ".swift",
+        ".kt",
     ];
     for ext in &extensions {
         let candidate = format!("{}{}", resolved_base, ext);
@@ -531,8 +581,7 @@ fn resolve_python(
         if file_set.contains(&as_file) {
             return Some(as_file);
         }
-        let as_package =
-            normalize_path(&format!("{}/{}/__init__.py", target_dir, module_file));
+        let as_package = normalize_path(&format!("{}/{}/__init__.py", target_dir, module_file));
         if file_set.contains(&as_package) {
             return Some(as_package);
         }
@@ -592,8 +641,7 @@ impl DependencyGraph {
             let alias_prefix = alias.trim_end_matches('*');
             let target_prefix = first_target.trim_end_matches('*');
             let resolved = normalize_path(&format!("{}/{}", base_url, target_prefix));
-            self.path_aliases
-                .insert(alias_prefix.to_string(), resolved);
+            self.path_aliases.insert(alias_prefix.to_string(), resolved);
         }
     }
 
@@ -612,8 +660,11 @@ impl DependencyGraph {
         let initial_score = 1.0 / n as f64;
 
         let files: Vec<String> = all_files.into_iter().collect();
-        let file_idx: HashMap<&str, usize> =
-            files.iter().enumerate().map(|(i, f)| (f.as_str(), i)).collect();
+        let file_idx: HashMap<&str, usize> = files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.as_str(), i))
+            .collect();
         let mut scores = vec![initial_score; n];
 
         for _ in 0..iterations {
@@ -831,8 +882,7 @@ from ..app import create_app
 
         let snapshot = g.to_snapshot();
         let mut g2 = DependencyGraph::new();
-        let file_set: HashSet<String> =
-            ["a.ts", "b.ts"].iter().map(|s| s.to_string()).collect();
+        let file_set: HashSet<String> = ["a.ts", "b.ts"].iter().map(|s| s.to_string()).collect();
         g2.from_snapshot(snapshot, "", file_set);
 
         assert!(g2.is_ready());

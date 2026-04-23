@@ -1,13 +1,16 @@
 use magi_core::{
     AssignmentLease, DomainError, DomainResult, LeaseId, LeaseStatus, MissionId, ProgressSummary,
-    Task, TaskId, TaskKind, TaskPolicy, TaskProjection, TaskStatus, WorkPackageSummary, UtcMillis, WorkerId,
+    Task, TaskId, TaskKind, TaskPolicy, TaskProjection, TaskStatus, UtcMillis, WorkPackageSummary,
+    WorkerId,
 };
+use magi_worker_runtime::WorkerRuntimeDurableSnapshot;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 static LEASE_COUNTER: AtomicU64 = AtomicU64::new(1);
+static CHECKPOINT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Callback invoked after a successful `update_status` call.
 ///
@@ -74,12 +77,18 @@ impl TaskStore {
 
     /// Set or replace the per-transition checkpoint callback (design 6.8).
     pub fn set_checkpoint_callback(&self, callback: Box<dyn Fn(&TaskStore) + Send + Sync>) {
-        let mut guard = self.on_checkpoint.lock().expect("on_checkpoint lock poisoned");
+        let mut guard = self
+            .on_checkpoint
+            .lock()
+            .expect("on_checkpoint lock poisoned");
         *guard = Some(callback);
     }
 
     fn fire_checkpoint(&self) {
-        let guard = self.on_checkpoint.lock().expect("on_checkpoint lock poisoned");
+        let guard = self
+            .on_checkpoint
+            .lock()
+            .expect("on_checkpoint lock poisoned");
         if let Some(ref cb) = *guard {
             cb(self);
         }
@@ -125,9 +134,9 @@ impl TaskStore {
     /// 更新任务状态（不做迁移合法性校验，兼容内部传播场景）。
     pub fn update_status(&self, task_id: &TaskId, status: TaskStatus) -> DomainResult<()> {
         let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
-        let task = tasks.get_mut(task_id).ok_or(DomainError::NotFound {
-            entity: "Task",
-        })?;
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
         task.status = status;
         task.updated_at = UtcMillis::now();
         let callback = self
@@ -151,15 +160,12 @@ impl TaskStore {
         new_status: TaskStatus,
     ) -> DomainResult<()> {
         let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
-        let task = tasks.get_mut(task_id).ok_or(DomainError::NotFound {
-            entity: "Task",
-        })?;
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
         if !is_valid_transition(task.status, new_status) {
             return Err(DomainError::InvalidState {
-                message: format!(
-                    "非法状态迁移: {:?} -> {:?}",
-                    task.status, new_status
-                ),
+                message: format!("非法状态迁移: {:?} -> {:?}", task.status, new_status),
             });
         }
         // G9: Policy freeze — snapshot policy on Draft→Ready transition.
@@ -187,7 +193,10 @@ impl TaskStore {
         if is_terminal_status(new_status)
             && !is_terminal_status(task.status)
             && task.evidence_refs.is_empty()
-            && matches!(task.kind, TaskKind::Action | TaskKind::Validation | TaskKind::Repair)
+            && matches!(
+                task.kind,
+                TaskKind::Action | TaskKind::Validation | TaskKind::Repair
+            )
         {
             tracing::warn!(
                 task_id = %task_id,
@@ -227,9 +236,9 @@ impl TaskStore {
 
     pub fn append_input_ref(&self, task_id: &TaskId, input_ref: String) -> DomainResult<()> {
         let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
-        let task = tasks.get_mut(task_id).ok_or(DomainError::NotFound {
-            entity: "Task",
-        })?;
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
         task.input_refs.push(input_ref);
         task.updated_at = UtcMillis::now();
         Ok(())
@@ -237,9 +246,9 @@ impl TaskStore {
 
     pub fn update_task_goal(&self, task_id: &TaskId, goal: String) -> DomainResult<()> {
         let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
-        let task = tasks.get_mut(task_id).ok_or(DomainError::NotFound {
-            entity: "Task",
-        })?;
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
         task.goal = goal;
         task.updated_at = UtcMillis::now();
         Ok(())
@@ -478,21 +487,19 @@ impl TaskStore {
             .collect();
 
         // Current phase: first Running or Ready Phase child of root
-        let current_phase = children_index
-            .get(root_task_id)
-            .and_then(|child_ids| {
-                child_ids.iter().find_map(|cid| {
-                    tasks.get(cid).and_then(|t| {
-                        if t.kind == TaskKind::Phase
-                            && (t.status == TaskStatus::Running || t.status == TaskStatus::Ready)
-                        {
-                            Some(t.title.clone())
-                        } else {
-                            None
-                        }
-                    })
+        let current_phase = children_index.get(root_task_id).and_then(|child_ids| {
+            child_ids.iter().find_map(|cid| {
+                tasks.get(cid).and_then(|t| {
+                    if t.kind == TaskKind::Phase
+                        && (t.status == TaskStatus::Running || t.status == TaskStatus::Ready)
+                    {
+                        Some(t.title.clone())
+                    } else {
+                        None
+                    }
                 })
-            });
+            })
+        });
 
         // WorkPackage summaries
         let workpackage_summaries: Vec<WorkPackageSummary> = all_tasks
@@ -685,13 +692,34 @@ impl TaskStore {
 
     /// 在进程重启后收敛易失执行态。
     ///
-    /// `WorkerRuntime` 不会随 `TaskStore` 一起恢复，因此 checkpoint 中残留的
-    /// Active lease 和执行中状态都不能再被视为真实运行态。这里统一执行两件事：
-    /// 1. 撤销所有仍处于 Active 的租约；
-    /// 2. 将受影响子树中所有非终态可调度任务收口到 Blocked，等待显式 resume。
-    pub fn reconcile_volatile_runtime_after_restore(&self) -> (usize, usize) {
+    /// 本轮只保证逻辑续接，不恢复进程内瞬时现场，因此 restore 后的 Active lease
+    /// 仍然不能被视为真实运行态。这里会结合 `WorkerRuntime` 的最小快照一起决定
+    /// 哪些 branch 属于当前可恢复执行树，并把对应子树统一收口到 `Blocked`。
+    pub fn reconcile_volatile_runtime_after_restore(
+        &self,
+        worker_snapshot: &WorkerRuntimeDurableSnapshot,
+    ) -> (usize, usize) {
         let active_leases = self.collect_active_leases();
-        if active_leases.is_empty() {
+        let recoverable_branch_task_ids: Vec<_> = worker_snapshot
+            .branches
+            .iter()
+            .filter_map(|branch| {
+                let task = self.get_task(&branch.task_id)?;
+                if matches!(
+                    task.status,
+                    TaskStatus::Blocked
+                        | TaskStatus::Ready
+                        | TaskStatus::Running
+                        | TaskStatus::Verifying
+                        | TaskStatus::Repairing
+                ) {
+                    Some(branch.task_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if active_leases.is_empty() && recoverable_branch_task_ids.is_empty() {
             return (0, 0);
         }
 
@@ -701,6 +729,11 @@ impl TaskStore {
                 affected_roots.insert(task.root_task_id);
             }
             self.revoke_lease(task_id, lease_id);
+        }
+        for task_id in &recoverable_branch_task_ids {
+            if let Some(task) = self.get_task(task_id) {
+                affected_roots.insert(task.root_task_id);
+            }
         }
 
         let mut blocked_count = 0usize;
@@ -789,7 +822,9 @@ impl TaskStore {
                 .filter_map(|id| {
                     let s = id.to_string();
                     // lease IDs have the form "lease-{timestamp}-{counter}"
-                    s.rsplit('-').next().and_then(|part| part.parse::<u64>().ok())
+                    s.rsplit('-')
+                        .next()
+                        .and_then(|part| part.parse::<u64>().ok())
                 })
                 .max()
                 .unwrap_or(0);
@@ -807,20 +842,18 @@ impl TaskStore {
     // ------------------------------------------------------------------
 
     /// 运行时添加依赖关系。不允许自依赖或对已完成任务的依赖。
-    pub fn add_dependency(
-        &self,
-        task_id: &TaskId,
-        dependency_id: &TaskId,
-    ) -> DomainResult<()> {
+    pub fn add_dependency(&self, task_id: &TaskId, dependency_id: &TaskId) -> DomainResult<()> {
         if task_id == dependency_id {
             return Err(DomainError::InvalidState {
                 message: format!("任务 {} 不能依赖自身", task_id),
             });
         }
         let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
-        let task = tasks.get_mut(task_id).ok_or_else(|| DomainError::InvalidState {
-            message: format!("任务 {} 不存在", task_id),
-        })?;
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or_else(|| DomainError::InvalidState {
+                message: format!("任务 {} 不存在", task_id),
+            })?;
         if task.dependency_ids.contains(dependency_id) {
             return Ok(());
         }
@@ -830,15 +863,13 @@ impl TaskStore {
     }
 
     /// 运行时移除依赖关系。
-    pub fn remove_dependency(
-        &self,
-        task_id: &TaskId,
-        dependency_id: &TaskId,
-    ) -> DomainResult<()> {
+    pub fn remove_dependency(&self, task_id: &TaskId, dependency_id: &TaskId) -> DomainResult<()> {
         let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
-        let task = tasks.get_mut(task_id).ok_or_else(|| DomainError::InvalidState {
-            message: format!("任务 {} 不存在", task_id),
-        })?;
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or_else(|| DomainError::InvalidState {
+                message: format!("任务 {} 不存在", task_id),
+            })?;
         task.dependency_ids.retain(|id| id != dependency_id);
         task.updated_at = UtcMillis::now();
         Ok(())
@@ -893,9 +924,16 @@ impl TaskStore {
         let data = self.checkpoint();
         let content = serde_json::to_vec_pretty(&data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        let temp_path = path.with_extension("json.tmp");
+        let temp_path = path.with_extension(format!(
+            "json.{}.{}.tmp",
+            std::process::id(),
+            CHECKPOINT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::write(&temp_path, content)?;
-        std::fs::rename(temp_path, path)?;
+        if let Err(error) = std::fs::rename(&temp_path, path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1035,9 +1073,30 @@ mod tests {
     fn task_graph_insert_and_get_children() {
         let store = TaskStore::new();
 
-        let objective = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Draft);
-        let action1 = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Draft);
-        let action2 = make_task("act-2", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Draft);
+        let objective = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Draft,
+        );
+        let action1 = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Draft,
+        );
+        let action2 = make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Draft,
+        );
 
         store.insert_task(objective.clone());
         store.insert_task(action1.clone());
@@ -1068,20 +1127,48 @@ mod tests {
     fn status_transitions() {
         let store = TaskStore::new();
 
-        let task = make_task("t-1", "m-1", "t-1", None, TaskKind::Action, TaskStatus::Draft);
+        let task = make_task(
+            "t-1",
+            "m-1",
+            "t-1",
+            None,
+            TaskKind::Action,
+            TaskStatus::Draft,
+        );
         store.insert_task(task);
 
         // Draft -> Ready
-        assert!(store.update_status(&TaskId::new("t-1"), TaskStatus::Ready).is_ok());
-        assert_eq!(store.get_task(&TaskId::new("t-1")).unwrap().status, TaskStatus::Ready);
+        assert!(
+            store
+                .update_status(&TaskId::new("t-1"), TaskStatus::Ready)
+                .is_ok()
+        );
+        assert_eq!(
+            store.get_task(&TaskId::new("t-1")).unwrap().status,
+            TaskStatus::Ready
+        );
 
         // Ready -> Running
-        assert!(store.update_status(&TaskId::new("t-1"), TaskStatus::Running).is_ok());
-        assert_eq!(store.get_task(&TaskId::new("t-1")).unwrap().status, TaskStatus::Running);
+        assert!(
+            store
+                .update_status(&TaskId::new("t-1"), TaskStatus::Running)
+                .is_ok()
+        );
+        assert_eq!(
+            store.get_task(&TaskId::new("t-1")).unwrap().status,
+            TaskStatus::Running
+        );
 
         // Running -> Completed
-        assert!(store.update_status(&TaskId::new("t-1"), TaskStatus::Completed).is_ok());
-        assert_eq!(store.get_task(&TaskId::new("t-1")).unwrap().status, TaskStatus::Completed);
+        assert!(
+            store
+                .update_status(&TaskId::new("t-1"), TaskStatus::Completed)
+                .is_ok()
+        );
+        assert_eq!(
+            store.get_task(&TaskId::new("t-1")).unwrap().status,
+            TaskStatus::Completed
+        );
 
         // Updating a nonexistent task should return an error
         let result = store.update_status(&TaskId::new("nonexistent"), TaskStatus::Running);
@@ -1097,10 +1184,38 @@ mod tests {
         let store = TaskStore::new();
 
         // Objective -> Phase -> 2 Actions (act-1 depends on nothing, act-2 depends on act-1)
-        let objective = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let phase = make_task("phase-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Phase, TaskStatus::Running);
-        let action1 = make_task("act-1", "m-1", "obj-1", Some("phase-1"), TaskKind::Action, TaskStatus::Ready);
-        let mut action2 = make_task("act-2", "m-1", "obj-1", Some("phase-1"), TaskKind::Action, TaskStatus::Ready);
+        let objective = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let phase = make_task(
+            "phase-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Phase,
+            TaskStatus::Running,
+        );
+        let action1 = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("phase-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
+        let mut action2 = make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("phase-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
         action2.dependency_ids = vec![TaskId::new("act-1")];
 
         store.insert_task(objective);
@@ -1114,7 +1229,9 @@ mod tests {
         assert_eq!(runnable[0].task_id.to_string(), "act-1");
 
         // Complete act-1
-        store.update_status(&TaskId::new("act-1"), TaskStatus::Completed).unwrap();
+        store
+            .update_status(&TaskId::new("act-1"), TaskStatus::Completed)
+            .unwrap();
 
         // Now act-2 should be runnable
         let runnable = store.get_runnable_leaves(&TaskId::new("obj-1"));
@@ -1122,7 +1239,9 @@ mod tests {
         assert_eq!(runnable[0].task_id.to_string(), "act-2");
 
         // Complete act-2 as well
-        store.update_status(&TaskId::new("act-2"), TaskStatus::Completed).unwrap();
+        store
+            .update_status(&TaskId::new("act-2"), TaskStatus::Completed)
+            .unwrap();
 
         // No runnable leaves
         let runnable = store.get_runnable_leaves(&TaskId::new("obj-1"));
@@ -1137,12 +1256,54 @@ mod tests {
     fn build_projection() {
         let store = TaskStore::new();
 
-        let objective = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let phase = make_task("phase-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Phase, TaskStatus::Running);
-        let wp = make_task("wp-1", "m-1", "obj-1", Some("phase-1"), TaskKind::WorkPackage, TaskStatus::Running);
-        let act1 = make_task("act-1", "m-1", "obj-1", Some("wp-1"), TaskKind::Action, TaskStatus::Completed);
-        let act2 = make_task("act-2", "m-1", "obj-1", Some("wp-1"), TaskKind::Action, TaskStatus::Running);
-        let blocked = make_task("act-3", "m-1", "obj-1", Some("wp-1"), TaskKind::Action, TaskStatus::Blocked);
+        let objective = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let phase = make_task(
+            "phase-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Phase,
+            TaskStatus::Running,
+        );
+        let wp = make_task(
+            "wp-1",
+            "m-1",
+            "obj-1",
+            Some("phase-1"),
+            TaskKind::WorkPackage,
+            TaskStatus::Running,
+        );
+        let act1 = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("wp-1"),
+            TaskKind::Action,
+            TaskStatus::Completed,
+        );
+        let act2 = make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("wp-1"),
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
+        let blocked = make_task(
+            "act-3",
+            "m-1",
+            "obj-1",
+            Some("wp-1"),
+            TaskKind::Action,
+            TaskStatus::Blocked,
+        );
 
         store.insert_task(objective);
         store.insert_task(phase);
@@ -1174,7 +1335,11 @@ mod tests {
         assert_eq!(wp_summary.completed_children, 1);
 
         // Nonexistent root returns None
-        assert!(store.build_projection(&TaskId::new("nonexistent")).is_none());
+        assert!(
+            store
+                .build_projection(&TaskId::new("nonexistent"))
+                .is_none()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1185,7 +1350,14 @@ mod tests {
     fn lease_creation_and_retrieval() {
         let store = TaskStore::new();
 
-        let task = make_task("t-1", "m-1", "t-1", None, TaskKind::Action, TaskStatus::Running);
+        let task = make_task(
+            "t-1",
+            "m-1",
+            "t-1",
+            None,
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
         store.insert_task(task);
 
         let now = UtcMillis::now();
@@ -1222,9 +1394,30 @@ mod tests {
     fn get_tasks_by_mission() {
         let store = TaskStore::new();
 
-        let t1 = make_task("t-1", "m-1", "t-1", None, TaskKind::Objective, TaskStatus::Draft);
-        let t2 = make_task("t-2", "m-1", "t-1", Some("t-1"), TaskKind::Action, TaskStatus::Draft);
-        let t3 = make_task("t-3", "m-2", "t-3", None, TaskKind::Objective, TaskStatus::Draft);
+        let t1 = make_task(
+            "t-1",
+            "m-1",
+            "t-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Draft,
+        );
+        let t2 = make_task(
+            "t-2",
+            "m-1",
+            "t-1",
+            Some("t-1"),
+            TaskKind::Action,
+            TaskStatus::Draft,
+        );
+        let t3 = make_task(
+            "t-3",
+            "m-2",
+            "t-3",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Draft,
+        );
 
         store.insert_task(t1);
         store.insert_task(t2);
@@ -1248,9 +1441,30 @@ mod tests {
     fn projection_aggregate_status_reflects_failure() {
         let store = TaskStore::new();
 
-        let objective = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let act1 = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Completed);
-        let act2 = make_task("act-2", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Failed);
+        let objective = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let act1 = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Completed,
+        );
+        let act2 = make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Failed,
+        );
 
         store.insert_task(objective);
         store.insert_task(act1);
@@ -1269,9 +1483,30 @@ mod tests {
     fn pending_decisions_in_projection() {
         let store = TaskStore::new();
 
-        let obj = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let decision = make_task("dec-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Decision, TaskStatus::AwaitingApproval);
-        let act = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Blocked);
+        let obj = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let decision = make_task(
+            "dec-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Decision,
+            TaskStatus::AwaitingApproval,
+        );
+        let act = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Blocked,
+        );
 
         store.insert_task(obj);
         store.insert_task(decision);
@@ -1289,7 +1524,14 @@ mod tests {
     #[test]
     fn grant_lease_succeeds_on_fresh_task() {
         let store = TaskStore::new();
-        let task = make_task("t-1", "m-1", "t-1", None, TaskKind::Action, TaskStatus::Running);
+        let task = make_task(
+            "t-1",
+            "m-1",
+            "t-1",
+            None,
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
         store.insert_task(task);
 
         let worker_id = WorkerId::new("worker-1");
@@ -1312,7 +1554,14 @@ mod tests {
     #[test]
     fn grant_lease_fails_when_active_lease_exists() {
         let store = TaskStore::new();
-        let task = make_task("t-1", "m-1", "t-1", None, TaskKind::Action, TaskStatus::Running);
+        let task = make_task(
+            "t-1",
+            "m-1",
+            "t-1",
+            None,
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
         store.insert_task(task);
 
         let worker_id = WorkerId::new("worker-1");
@@ -1332,11 +1581,20 @@ mod tests {
     #[test]
     fn complete_lease_marks_lease_completed() {
         let store = TaskStore::new();
-        let task = make_task("t-1", "m-1", "t-1", None, TaskKind::Action, TaskStatus::Running);
+        let task = make_task(
+            "t-1",
+            "m-1",
+            "t-1",
+            None,
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
         store.insert_task(task);
 
         let worker_id = WorkerId::new("worker-1");
-        let lease = store.grant_lease(&TaskId::new("t-1"), &worker_id, "executor", 60_000).unwrap();
+        let lease = store
+            .grant_lease(&TaskId::new("t-1"), &worker_id, "executor", 60_000)
+            .unwrap();
 
         let result = store.complete_lease(&TaskId::new("t-1"), &lease.lease_id);
         assert!(result);
@@ -1360,11 +1618,20 @@ mod tests {
     #[test]
     fn revoke_lease_marks_lease_revoked() {
         let store = TaskStore::new();
-        let task = make_task("t-1", "m-1", "t-1", None, TaskKind::Action, TaskStatus::Running);
+        let task = make_task(
+            "t-1",
+            "m-1",
+            "t-1",
+            None,
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
         store.insert_task(task);
 
         let worker_id = WorkerId::new("worker-1");
-        let lease = store.grant_lease(&TaskId::new("t-1"), &worker_id, "executor", 60_000).unwrap();
+        let lease = store
+            .grant_lease(&TaskId::new("t-1"), &worker_id, "executor", 60_000)
+            .unwrap();
 
         let result = store.revoke_lease(&TaskId::new("t-1"), &lease.lease_id);
         assert!(result);
@@ -1388,11 +1655,20 @@ mod tests {
     #[test]
     fn heartbeat_lease_updates_heartbeat_at() {
         let store = TaskStore::new();
-        let task = make_task("t-1", "m-1", "t-1", None, TaskKind::Action, TaskStatus::Running);
+        let task = make_task(
+            "t-1",
+            "m-1",
+            "t-1",
+            None,
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
         store.insert_task(task);
 
         let worker_id = WorkerId::new("worker-1");
-        let lease = store.grant_lease(&TaskId::new("t-1"), &worker_id, "executor", 60_000).unwrap();
+        let lease = store
+            .grant_lease(&TaskId::new("t-1"), &worker_id, "executor", 60_000)
+            .unwrap();
         let original_heartbeat = lease.heartbeat_at;
 
         // Small busy-wait to ensure time advances (UtcMillis is ms-resolution)
@@ -1416,8 +1692,22 @@ mod tests {
     #[test]
     fn collect_expired_leases_finds_expired() {
         let store = TaskStore::new();
-        let task1 = make_task("t-1", "m-1", "t-1", None, TaskKind::Action, TaskStatus::Running);
-        let task2 = make_task("t-2", "m-1", "t-2", None, TaskKind::Action, TaskStatus::Running);
+        let task1 = make_task(
+            "t-1",
+            "m-1",
+            "t-1",
+            None,
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
+        let task2 = make_task(
+            "t-2",
+            "m-1",
+            "t-2",
+            None,
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
         store.insert_task(task1);
         store.insert_task(task2);
 
@@ -1452,9 +1742,30 @@ mod tests {
     #[test]
     fn get_leases_by_worker_filters_correctly() {
         let store = TaskStore::new();
-        let task1 = make_task("t-1", "m-1", "t-1", None, TaskKind::Action, TaskStatus::Running);
-        let task2 = make_task("t-2", "m-1", "t-2", None, TaskKind::Action, TaskStatus::Running);
-        let task3 = make_task("t-3", "m-1", "t-3", None, TaskKind::Action, TaskStatus::Running);
+        let task1 = make_task(
+            "t-1",
+            "m-1",
+            "t-1",
+            None,
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
+        let task2 = make_task(
+            "t-2",
+            "m-1",
+            "t-2",
+            None,
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
+        let task3 = make_task(
+            "t-3",
+            "m-1",
+            "t-3",
+            None,
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
         store.insert_task(task1);
         store.insert_task(task2);
         store.insert_task(task3);
@@ -1471,7 +1782,11 @@ mod tests {
 
         let w1_leases = store.get_leases_by_worker(&worker1);
         assert_eq!(w1_leases.len(), 2);
-        assert!(w1_leases.iter().all(|l| l.worker_id.to_string() == "worker-1"));
+        assert!(
+            w1_leases
+                .iter()
+                .all(|l| l.worker_id.to_string() == "worker-1")
+        );
 
         let w2_leases = store.get_leases_by_worker(&worker2);
         assert_eq!(w2_leases.len(), 1);
@@ -1498,9 +1813,30 @@ mod tests {
     fn checkpoint_restore_round_trip() {
         let store = TaskStore::new();
 
-        let obj = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let act1 = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Completed);
-        let act2 = make_task("act-2", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Running);
+        let obj = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let act1 = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Completed,
+        );
+        let act2 = make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
 
         store.insert_task(obj);
         store.insert_task(act1);
@@ -1508,7 +1844,9 @@ mod tests {
 
         // Grant a lease
         let worker_id = WorkerId::new("worker-1");
-        let lease = store.grant_lease(&TaskId::new("act-2"), &worker_id, "executor", 60_000).unwrap();
+        let lease = store
+            .grant_lease(&TaskId::new("act-2"), &worker_id, "executor", 60_000)
+            .unwrap();
 
         // Checkpoint
         let data = store.checkpoint();
@@ -1520,8 +1858,14 @@ mod tests {
         assert!(restored.get_task(&TaskId::new("obj-1")).is_some());
         assert!(restored.get_task(&TaskId::new("act-1")).is_some());
         assert!(restored.get_task(&TaskId::new("act-2")).is_some());
-        assert_eq!(restored.get_task(&TaskId::new("obj-1")).unwrap().status, TaskStatus::Running);
-        assert_eq!(restored.get_task(&TaskId::new("act-1")).unwrap().status, TaskStatus::Completed);
+        assert_eq!(
+            restored.get_task(&TaskId::new("obj-1")).unwrap().status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            restored.get_task(&TaskId::new("act-1")).unwrap().status,
+            TaskStatus::Completed
+        );
 
         // Verify children index was rebuilt
         let children = restored.get_children(&TaskId::new("obj-1"));
@@ -1555,8 +1899,22 @@ mod tests {
 
         let store = TaskStore::new();
 
-        let obj = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let act = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Ready);
+        let obj = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let act = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
         store.insert_task(obj);
         store.insert_task(act);
 
@@ -1564,7 +1922,9 @@ mod tests {
         store.grant_lease(&TaskId::new("act-1"), &worker_id, "executor", 60_000);
 
         // Write checkpoint
-        store.checkpoint_to_file(&path).expect("checkpoint should write");
+        store
+            .checkpoint_to_file(&path)
+            .expect("checkpoint should write");
         assert!(path.exists());
 
         // Restore from file
@@ -1572,8 +1932,14 @@ mod tests {
             .expect("restore should succeed")
             .expect("file should exist");
 
-        assert_eq!(restored.get_task(&TaskId::new("obj-1")).unwrap().status, TaskStatus::Running);
-        assert_eq!(restored.get_task(&TaskId::new("act-1")).unwrap().status, TaskStatus::Ready);
+        assert_eq!(
+            restored.get_task(&TaskId::new("obj-1")).unwrap().status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            restored.get_task(&TaskId::new("act-1")).unwrap().status,
+            TaskStatus::Ready
+        );
         assert!(restored.get_active_lease(&TaskId::new("act-1")).is_some());
 
         let children = restored.get_children(&TaskId::new("obj-1"));
@@ -1599,26 +1965,57 @@ mod tests {
     fn valid_transitions_accepted() {
         use TaskStatus::*;
         let valid = [
-            (Draft, Ready), (Draft, Skipped), (Draft, Cancelled),
-            (Ready, Running), (Ready, Blocked), (Ready, AwaitingApproval),
-            (Ready, Skipped), (Ready, Cancelled),
-            (Running, Verifying), (Running, Completed), (Running, Repairing),
-            (Running, Failed), (Running, Cancelled),
-            (Blocked, Ready), (Blocked, Skipped), (Blocked, Cancelled),
-            (AwaitingApproval, Completed), (AwaitingApproval, Cancelled),
-            (Verifying, Completed), (Verifying, Repairing), (Verifying, Failed),
-            (Repairing, Verifying), (Repairing, Failed),
+            (Draft, Ready),
+            (Draft, Skipped),
+            (Draft, Cancelled),
+            (Ready, Running),
+            (Ready, Blocked),
+            (Ready, AwaitingApproval),
+            (Ready, Skipped),
+            (Ready, Cancelled),
+            (Running, Verifying),
+            (Running, Completed),
+            (Running, Repairing),
+            (Running, Failed),
+            (Running, Cancelled),
+            (Blocked, Ready),
+            (Blocked, Skipped),
+            (Blocked, Cancelled),
+            (AwaitingApproval, Completed),
+            (AwaitingApproval, Cancelled),
+            (Verifying, Completed),
+            (Verifying, Repairing),
+            (Verifying, Failed),
+            (Repairing, Verifying),
+            (Repairing, Failed),
         ];
         for (from, to) in valid {
             assert!(
                 is_valid_transition(from, to),
-                "expected valid: {:?} -> {:?}", from, to
+                "expected valid: {:?} -> {:?}",
+                from,
+                to
             );
         }
         // Self-transitions are always valid.
-        for s in [Draft, Ready, Running, Blocked, AwaitingApproval,
-                  Verifying, Repairing, Completed, Failed, Cancelled, Skipped] {
-            assert!(is_valid_transition(s, s), "self-transition {:?} should be valid", s);
+        for s in [
+            Draft,
+            Ready,
+            Running,
+            Blocked,
+            AwaitingApproval,
+            Verifying,
+            Repairing,
+            Completed,
+            Failed,
+            Cancelled,
+            Skipped,
+        ] {
+            assert!(
+                is_valid_transition(s, s),
+                "self-transition {:?} should be valid",
+                s
+            );
         }
     }
 
@@ -1626,21 +2023,37 @@ mod tests {
     fn invalid_transitions_rejected() {
         use TaskStatus::*;
         let invalid = [
-            (Draft, Running), (Draft, Completed), (Draft, Failed),
-            (Ready, Completed), (Ready, Verifying),
-            (Running, Ready), (Running, Blocked), (Running, Draft),
-            (Blocked, Running), (Blocked, Completed),
-            (Completed, Running), (Completed, Failed), (Completed, Ready),
-            (Failed, Running), (Failed, Ready), (Failed, Completed),
-            (Cancelled, Running), (Cancelled, Ready),
-            (Skipped, Running), (Skipped, Ready),
-            (AwaitingApproval, Running), (AwaitingApproval, Failed),
-            (Repairing, Completed), (Repairing, Running),
+            (Draft, Running),
+            (Draft, Completed),
+            (Draft, Failed),
+            (Ready, Completed),
+            (Ready, Verifying),
+            (Running, Ready),
+            (Running, Blocked),
+            (Running, Draft),
+            (Blocked, Running),
+            (Blocked, Completed),
+            (Completed, Running),
+            (Completed, Failed),
+            (Completed, Ready),
+            (Failed, Running),
+            (Failed, Ready),
+            (Failed, Completed),
+            (Cancelled, Running),
+            (Cancelled, Ready),
+            (Skipped, Running),
+            (Skipped, Ready),
+            (AwaitingApproval, Running),
+            (AwaitingApproval, Failed),
+            (Repairing, Completed),
+            (Repairing, Running),
         ];
         for (from, to) in invalid {
             assert!(
                 !is_valid_transition(from, to),
-                "expected invalid: {:?} -> {:?}", from, to
+                "expected invalid: {:?} -> {:?}",
+                from,
+                to
             );
         }
     }
@@ -1652,17 +2065,34 @@ mod tests {
     #[test]
     fn update_status_checked_accepts_valid_rejects_invalid() {
         let store = TaskStore::new();
-        let task = make_task("t-1", "m-1", "t-1", None, TaskKind::Action, TaskStatus::Draft);
+        let task = make_task(
+            "t-1",
+            "m-1",
+            "t-1",
+            None,
+            TaskKind::Action,
+            TaskStatus::Draft,
+        );
         store.insert_task(task);
 
         // Draft -> Ready: valid
-        assert!(store.update_status_checked(&TaskId::new("t-1"), TaskStatus::Ready).is_ok());
-        assert_eq!(store.get_task(&TaskId::new("t-1")).unwrap().status, TaskStatus::Ready);
+        assert!(
+            store
+                .update_status_checked(&TaskId::new("t-1"), TaskStatus::Ready)
+                .is_ok()
+        );
+        assert_eq!(
+            store.get_task(&TaskId::new("t-1")).unwrap().status,
+            TaskStatus::Ready
+        );
 
         // Ready -> Completed: invalid (must go through Running first)
         let err = store.update_status_checked(&TaskId::new("t-1"), TaskStatus::Completed);
         assert!(err.is_err());
-        assert_eq!(store.get_task(&TaskId::new("t-1")).unwrap().status, TaskStatus::Ready);
+        assert_eq!(
+            store.get_task(&TaskId::new("t-1")).unwrap().status,
+            TaskStatus::Ready
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1672,7 +2102,14 @@ mod tests {
     #[test]
     fn increment_counts() {
         let store = TaskStore::new();
-        let task = make_task("t-1", "m-1", "t-1", None, TaskKind::Action, TaskStatus::Running);
+        let task = make_task(
+            "t-1",
+            "m-1",
+            "t-1",
+            None,
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
         store.insert_task(task);
 
         assert_eq!(store.get_task(&TaskId::new("t-1")).unwrap().repair_count, 0);
@@ -1694,11 +2131,46 @@ mod tests {
     fn checkpoint_restore_preserves_projection() {
         let store = TaskStore::new();
 
-        let obj = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let phase = make_task("phase-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Phase, TaskStatus::Running);
-        let wp = make_task("wp-1", "m-1", "obj-1", Some("phase-1"), TaskKind::WorkPackage, TaskStatus::Running);
-        let act1 = make_task("act-1", "m-1", "obj-1", Some("wp-1"), TaskKind::Action, TaskStatus::Completed);
-        let act2 = make_task("act-2", "m-1", "obj-1", Some("wp-1"), TaskKind::Action, TaskStatus::Running);
+        let obj = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let phase = make_task(
+            "phase-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Phase,
+            TaskStatus::Running,
+        );
+        let wp = make_task(
+            "wp-1",
+            "m-1",
+            "obj-1",
+            Some("phase-1"),
+            TaskKind::WorkPackage,
+            TaskStatus::Running,
+        );
+        let act1 = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("wp-1"),
+            TaskKind::Action,
+            TaskStatus::Completed,
+        );
+        let act2 = make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("wp-1"),
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
 
         store.insert_task(obj);
         store.insert_task(phase);
@@ -1726,17 +2198,48 @@ mod tests {
             original_projection.progress_summary.running_tasks,
             restored_projection.progress_summary.running_tasks
         );
-        assert_eq!(original_projection.aggregate_status, restored_projection.aggregate_status);
+        assert_eq!(
+            original_projection.aggregate_status,
+            restored_projection.aggregate_status
+        );
     }
 
     #[test]
     fn reconcile_volatile_runtime_after_restore_revokes_active_leases_and_blocks_running_subtree() {
         let store = TaskStore::new();
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let phase = make_task("phase-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Phase, TaskStatus::Running);
-        let wp = make_task("wp-1", "m-1", "obj-1", Some("phase-1"), TaskKind::WorkPackage, TaskStatus::Running);
-        let act = make_task("act-1", "m-1", "obj-1", Some("wp-1"), TaskKind::Action, TaskStatus::Running);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let phase = make_task(
+            "phase-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Phase,
+            TaskStatus::Running,
+        );
+        let wp = make_task(
+            "wp-1",
+            "m-1",
+            "obj-1",
+            Some("phase-1"),
+            TaskKind::WorkPackage,
+            TaskStatus::Running,
+        );
+        let act = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("wp-1"),
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
 
         store.insert_task(root);
         store.insert_task(phase);
@@ -1744,11 +2247,17 @@ mod tests {
         store.insert_task(act);
 
         let lease = store
-            .grant_lease(&TaskId::new("act-1"), &WorkerId::new("worker-1"), "executor", 60_000)
+            .grant_lease(
+                &TaskId::new("act-1"),
+                &WorkerId::new("worker-1"),
+                "executor",
+                60_000,
+            )
             .expect("running task should receive active lease");
         assert_eq!(lease.lease_status, LeaseStatus::Active);
 
-        let (revoked_leases, blocked_tasks) = store.reconcile_volatile_runtime_after_restore();
+        let (revoked_leases, blocked_tasks) = store
+            .reconcile_volatile_runtime_after_restore(&WorkerRuntimeDurableSnapshot::default());
         assert_eq!(revoked_leases, 1);
         assert_eq!(blocked_tasks, 4);
         assert!(store.get_active_lease(&TaskId::new("act-1")).is_none());
@@ -1757,7 +2266,144 @@ mod tests {
             let task = store
                 .get_task(&TaskId::new(task_id))
                 .expect("task should exist after reconciliation");
-            assert_eq!(task.status, TaskStatus::Blocked, "{task_id} should become Blocked");
+            assert_eq!(
+                task.status,
+                TaskStatus::Blocked,
+                "{task_id} should become Blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_volatile_runtime_after_restore_blocks_snapshot_tracked_branch_without_active_lease()
+     {
+        let store = TaskStore::new();
+
+        let root = make_task(
+            "obj-2",
+            "m-2",
+            "obj-2",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let phase = make_task(
+            "phase-2",
+            "m-2",
+            "obj-2",
+            Some("obj-2"),
+            TaskKind::Phase,
+            TaskStatus::Running,
+        );
+        let wp = make_task(
+            "wp-2",
+            "m-2",
+            "obj-2",
+            Some("phase-2"),
+            TaskKind::WorkPackage,
+            TaskStatus::Running,
+        );
+        let act = make_task(
+            "act-2",
+            "m-2",
+            "obj-2",
+            Some("wp-2"),
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
+
+        store.insert_task(root);
+        store.insert_task(phase);
+        store.insert_task(wp);
+        store.insert_task(act);
+
+        let (revoked_leases, blocked_tasks) =
+            store.reconcile_volatile_runtime_after_restore(&WorkerRuntimeDurableSnapshot {
+                branches: vec![magi_worker_runtime::WorkerRuntimeBranchSnapshot {
+                    task_id: TaskId::new("act-2"),
+                    worker_id: WorkerId::new("worker-2"),
+                    stage: magi_worker_runtime::WorkerStage::Execute,
+                    lease_id: Some("snapshot-lease-2".to_string()),
+                    execution_intent_ref: Some("worker-intent-act-2".to_string()),
+                    binding_lifecycle: None,
+                    checkpoint_cursor: Some(magi_worker_runtime::WorkerExecutionCheckpointCursor {
+                        checkpoint_stage: magi_worker_runtime::WorkerStage::Execute,
+                        next_step_index: 1,
+                        checkpoint_at: UtcMillis::now(),
+                        resume_mode:
+                            magi_worker_runtime::WorkerCheckpointResumeMode::StepCheckpoint,
+                        resume_token: None,
+                    }),
+                }],
+            });
+        assert_eq!(revoked_leases, 0);
+        assert_eq!(blocked_tasks, 4);
+
+        for task_id in ["obj-2", "phase-2", "wp-2", "act-2"] {
+            let task = store
+                .get_task(&TaskId::new(task_id))
+                .expect("task should exist after snapshot reconciliation");
+            assert_eq!(
+                task.status,
+                TaskStatus::Blocked,
+                "{task_id} should become Blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_volatile_runtime_after_restore_ignores_completed_branch_snapshots() {
+        let store = TaskStore::new();
+
+        let root = make_task(
+            "obj-3",
+            "m-3",
+            "obj-3",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Completed,
+        );
+        let phase = make_task(
+            "phase-3",
+            "m-3",
+            "obj-3",
+            Some("obj-3"),
+            TaskKind::Phase,
+            TaskStatus::Completed,
+        );
+        let act = make_task(
+            "act-3",
+            "m-3",
+            "obj-3",
+            Some("phase-3"),
+            TaskKind::Action,
+            TaskStatus::Completed,
+        );
+
+        store.insert_task(root);
+        store.insert_task(phase);
+        store.insert_task(act);
+
+        let (revoked_leases, blocked_tasks) =
+            store.reconcile_volatile_runtime_after_restore(&WorkerRuntimeDurableSnapshot {
+                branches: vec![magi_worker_runtime::WorkerRuntimeBranchSnapshot {
+                    task_id: TaskId::new("act-3"),
+                    worker_id: WorkerId::new("worker-3"),
+                    stage: magi_worker_runtime::WorkerStage::Finish,
+                    lease_id: None,
+                    execution_intent_ref: Some("worker-intent-act-3".to_string()),
+                    binding_lifecycle: None,
+                    checkpoint_cursor: None,
+                }],
+            });
+        assert_eq!(revoked_leases, 0);
+        assert_eq!(blocked_tasks, 0);
+
+        for task_id in ["obj-3", "phase-3", "act-3"] {
+            let task = store
+                .get_task(&TaskId::new(task_id))
+                .expect("completed task should remain in store");
+            assert_eq!(task.status, TaskStatus::Completed);
         }
     }
 }

@@ -54,7 +54,10 @@ where
     let mut workers = Vec::new();
     for role in roles {
         let role = role.as_ref();
-        if workers.iter().any(|worker: &WorkerInfo| worker.role == role) {
+        if workers
+            .iter()
+            .any(|worker: &WorkerInfo| worker.role == role)
+        {
             continue;
         }
         if let Some(worker) = build_worker_info_for_role(role) {

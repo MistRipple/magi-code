@@ -62,10 +62,7 @@ impl IndexPersistence {
     }
 
     pub fn save(&self, snapshot: &PersistenceSnapshot) -> Result<(), String> {
-        let dir = self
-            .cache_file_path
-            .parent()
-            .ok_or("invalid cache path")?;
+        let dir = self.cache_file_path.parent().ok_or("invalid cache path")?;
         fs::create_dir_all(dir).map_err(|e| format!("mkdir failed: {}", e))?;
 
         let json_str =
@@ -201,16 +198,14 @@ impl IndexPersistence {
 }
 
 fn compress_gzip(data: &[u8]) -> Result<Vec<u8>, String> {
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder
         .write_all(data)
         .map_err(|e| format!("gzip compress: {}", e))?;
-    encoder
-        .finish()
-        .map_err(|e| format!("gzip finish: {}", e))
+    encoder.finish().map_err(|e| format!("gzip finish: {}", e))
 }
 
 fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, String> {

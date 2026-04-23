@@ -68,21 +68,30 @@ fn query_and_history_use_deterministic_tie_breakers() {
         .into_iter()
         .map(|record| record.memory_id)
         .collect::<Vec<_>>();
-    assert_eq!(query_ids, vec!["memory-a".to_string(), "memory-b".to_string()]);
+    assert_eq!(
+        query_ids,
+        vec!["memory-a".to_string(), "memory-b".to_string()]
+    );
 
     let preference_ids = store
         .preferences_for_session(&session_id)
         .into_iter()
         .map(|record| record.preference_id)
         .collect::<Vec<_>>();
-    assert_eq!(preference_ids, vec!["pref-a".to_string(), "pref-b".to_string()]);
+    assert_eq!(
+        preference_ids,
+        vec!["pref-a".to_string(), "pref-b".to_string()]
+    );
 
     let extraction_ids = store
         .extraction_results_for_session(&session_id)
         .into_iter()
         .map(|record| record.extraction_id)
         .collect::<Vec<_>>();
-    assert_eq!(extraction_ids, vec!["extract-a".to_string(), "extract-b".to_string()]);
+    assert_eq!(
+        extraction_ids,
+        vec!["extract-a".to_string(), "extract-b".to_string()]
+    );
 
     let compaction = store.compact_session(&session_id, "memory-retained", "retained content");
     assert_eq!(compaction.session_id, session_id);
@@ -111,7 +120,10 @@ fn record_extraction_normalizes_duplicate_memory_ids() {
 
     let records = store.extraction_results_for_session(&session_id);
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].produced_memory_ids, vec!["m-1".to_string(), "m-2".to_string()]);
+    assert_eq!(
+        records[0].produced_memory_ids,
+        vec!["m-1".to_string(), "m-2".to_string()]
+    );
 }
 
 #[test]
@@ -193,7 +205,10 @@ fn apply_extraction_writes_memory_records_and_verifies_closed_loop() {
     let verification = store
         .verify_extraction_linkage("extract-1")
         .expect("verification to exist");
-    assert_eq!(verification.resolved_memory_ids, linkage.extraction.produced_memory_ids);
+    assert_eq!(
+        verification.resolved_memory_ids,
+        linkage.extraction.produced_memory_ids
+    );
     assert!(verification.missing_memory_ids.is_empty());
     assert!(verification.provenance_mismatch_memory_ids.is_empty());
     assert!(verification.dangling_memory_ids.is_empty());
@@ -257,12 +272,18 @@ fn verify_extraction_linkage_detects_missing_and_mismatched_records() {
         .verify_extraction_linkage("extract-1")
         .expect("verification to exist");
     assert_eq!(verification.resolved_memory_ids, Vec::<String>::new());
-    assert_eq!(verification.missing_memory_ids, vec!["memory-missing".to_string()]);
+    assert_eq!(
+        verification.missing_memory_ids,
+        vec!["memory-missing".to_string()]
+    );
     assert_eq!(
         verification.provenance_mismatch_memory_ids,
         vec!["memory-provenance-mismatch".to_string()]
     );
-    assert_eq!(verification.dangling_memory_ids, vec!["memory-dangling".to_string()]);
+    assert_eq!(
+        verification.dangling_memory_ids,
+        vec!["memory-dangling".to_string()]
+    );
     assert_eq!(
         verification.session_mismatch_memory_ids,
         vec!["memory-wrong-session".to_string()]
@@ -300,7 +321,9 @@ fn compaction_marks_existing_entries_and_retains_new_record() {
     assert!(store.get("memory-a").is_some_and(|record| record.compacted));
     assert!(store.get("memory-b").is_some_and(|record| record.compacted));
 
-    let retained = store.get("memory-retained").expect("retained memory to exist");
+    let retained = store
+        .get("memory-retained")
+        .expect("retained memory to exist");
     assert_eq!(retained.layer, MemoryLayer::Durable);
     assert!(!retained.compacted);
     assert_eq!(retained.content, "retained");

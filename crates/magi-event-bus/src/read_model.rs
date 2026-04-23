@@ -10,15 +10,12 @@ mod read_model_aggregates;
 pub use contract::{
     RUNTIME_READ_MODEL_CONTRACT_SECTIONS, RUNTIME_READ_MODEL_CONTRACT_VERSION,
     RUNTIME_READ_MODEL_ORDERING_STRATEGY, RUNTIME_READ_MODEL_REQUIRED_VALIDATION_REFS,
-    RUNTIME_READ_MODEL_SECTION_ORDERING_RULES,
-    RuntimeContractFreezeClosureSummary, RuntimeContractFreezeConsistencySummary,
-    RuntimeContractFreezeEvidenceSummary, RuntimeContractFreezeGateSummary,
-    RuntimeContractFreezeReportSummary, RuntimeContractFreezeSummary,
-    RuntimeContractValidationSummary, RuntimeSectionOrderingRule,
+    RUNTIME_READ_MODEL_SECTION_ORDERING_RULES, RuntimeContractFreezeClosureSummary,
+    RuntimeContractFreezeConsistencySummary, RuntimeContractFreezeEvidenceSummary,
+    RuntimeContractFreezeGateSummary, RuntimeContractFreezeReportSummary,
+    RuntimeContractFreezeSummary, RuntimeContractValidationSummary, RuntimeSectionOrderingRule,
 };
-use contract::{
-    runtime_read_model_contract_sections, runtime_read_model_section_ordering_rules,
-};
+use contract::{runtime_read_model_contract_sections, runtime_read_model_section_ordering_rules};
 pub const RUNTIME_LEDGER_SCHEMA_VERSION: &str = "shadow-audit-usage-ledger-v1";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -262,7 +259,57 @@ pub struct SessionRuntimeBranchSummaryEntry {
     pub lease_id: Option<String>,
     pub execution_intent_ref: Option<String>,
     pub binding_lifecycle: Option<String>,
-    pub last_checkpoint_at: Option<UtcMillis>,
+    pub checkpoint_stage: Option<String>,
+    pub next_step_index: Option<usize>,
+    pub checkpoint_at: Option<UtcMillis>,
+    pub resume_mode: Option<String>,
+    pub is_primary: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionRuntimeTurnSummaryEntry {
+    pub turn_id: String,
+    pub turn_seq: u64,
+    pub accepted_at: Option<UtcMillis>,
+    pub status: String,
+    pub user_message: Option<String>,
+    pub mission_id: Option<String>,
+    pub root_task_id: Option<String>,
+    pub execution_chain_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionRuntimeTurnItemSummaryEntry {
+    pub item_id: String,
+    pub item_seq: usize,
+    pub lane_id: Option<String>,
+    pub lane_seq: Option<usize>,
+    pub kind: String,
+    pub status: String,
+    pub source: String,
+    pub title: Option<String>,
+    pub content: Option<String>,
+    pub task_id: Option<String>,
+    pub worker_id: Option<String>,
+    pub role_id: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_status: Option<String>,
+    pub tool_result: Option<String>,
+    pub tool_error: Option<String>,
+    pub thread_visible: bool,
+    pub worker_visible: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionRuntimeTurnLaneSummaryEntry {
+    pub lane_id: String,
+    pub lane_seq: usize,
+    pub task_id: String,
+    pub worker_id: String,
+    pub role_id: Option<String>,
+    pub title: String,
+    pub status: String,
     pub is_primary: bool,
 }
 
@@ -283,11 +330,15 @@ pub struct SessionRuntimeSummaryEntry {
     pub mission_id: Option<String>,
     pub root_task_id: Option<String>,
     pub root_task_status: Option<String>,
+    pub root_task_created_at: Option<UtcMillis>,
     pub execution_chain_ref: Option<String>,
     pub recovery_ref: Option<String>,
     pub has_recoverable_chain: bool,
     pub recoverable_branch_count: usize,
     pub active_branches: Vec<SessionRuntimeBranchSummaryEntry>,
+    pub current_turn: Option<SessionRuntimeTurnSummaryEntry>,
+    pub turn_items: Vec<SessionRuntimeTurnItemSummaryEntry>,
+    pub worker_lanes: Vec<SessionRuntimeTurnLaneSummaryEntry>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -800,7 +851,11 @@ impl RuntimeExecutorSummary {
         if self.executor_id.is_none() || self.executor_version.is_none() {
             blocking_issues.push("executor identity is incomplete".to_string());
         }
-        if !self.supported_step_kinds.iter().any(|kind| kind == "final-report") {
+        if !self
+            .supported_step_kinds
+            .iter()
+            .any(|kind| kind == "final-report")
+        {
             blocking_issues.push("executor missing final-report capability".to_string());
         }
         if self.max_parallelism == Some(0) {
@@ -812,15 +867,21 @@ impl RuntimeExecutorSummary {
                 Some("persistent") | Some("reusable")
             )
         {
-            blocking_issues.push("persistent-process executor lifecycle is not reusable/persistent".to_string());
+            blocking_issues.push(
+                "persistent-process executor lifecycle is not reusable/persistent".to_string(),
+            );
         }
-        if matches!(self.reuse_scope.as_deref(), Some("session") | Some("workspace"))
-            && !matches!(self.lease_state.as_deref(), Some("active"))
+        if matches!(
+            self.reuse_scope.as_deref(),
+            Some("session") | Some("workspace")
+        ) && !matches!(self.lease_state.as_deref(), Some("active"))
         {
             blocking_issues.push("reusable executor lease is not active".to_string());
         }
-        if matches!(self.reuse_scope.as_deref(), Some("session") | Some("workspace"))
-            && !matches!(self.binding_lifecycle.as_deref(), Some("bound"))
+        if matches!(
+            self.reuse_scope.as_deref(),
+            Some("session") | Some("workspace")
+        ) && !matches!(self.binding_lifecycle.as_deref(), Some("bound"))
         {
             blocking_issues.push("reusable executor binding is not bound".to_string());
         }
@@ -1000,16 +1061,21 @@ impl RuntimeReadModelInput {
                     &mut session_entry.active_task_ids,
                     resolved_task_id.clone(),
                 );
-                collect_unique_payload_value(&mut session_entry.recovery_ids, &event.payload, "recovery_id");
+                collect_unique_payload_value(
+                    &mut session_entry.recovery_ids,
+                    &event.payload,
+                    "recovery_id",
+                );
             }
             if let Some(workspace_id) = event.workspace_id.as_ref() {
                 let workspace_id = workspace_id.to_string();
-                let workspace_entry = workspace_map
-                    .entry(workspace_id.clone())
-                    .or_insert_with(|| WorkspaceRuntimeSummaryEntry {
-                        workspace_id: workspace_id.clone(),
-                        ..WorkspaceRuntimeSummaryEntry::default()
-                    });
+                let workspace_entry =
+                    workspace_map
+                        .entry(workspace_id.clone())
+                        .or_insert_with(|| WorkspaceRuntimeSummaryEntry {
+                            workspace_id: workspace_id.clone(),
+                            ..WorkspaceRuntimeSummaryEntry::default()
+                        });
                 workspace_entry.event_count += 1;
                 if event.category == EventCategory::Audit {
                     workspace_entry.audit_event_count += 1;
@@ -1054,12 +1120,10 @@ impl RuntimeReadModelInput {
                 }
                 let mission_entry = execution_group_map
                     .entry(mission_id.clone())
-                    .or_insert_with(|| {
-                    ExecutionGroupRuntimeSummaryEntry {
+                    .or_insert_with(|| ExecutionGroupRuntimeSummaryEntry {
                         mission_id: mission_id.clone(),
                         ..ExecutionGroupRuntimeSummaryEntry::default()
-                    }
-                });
+                    });
                 mission_entry.event_count += 1;
                 if event.category == EventCategory::Audit {
                     mission_entry.audit_event_count += 1;
@@ -1089,8 +1153,7 @@ impl RuntimeReadModelInput {
                         _ => {}
                     }
                 }
-                if event.event_type == "mission.execution.overview"
-                {
+                if event.event_type == "mission.execution.overview" {
                     if let Some(progress) = mission_progress_from_payload(&event.payload) {
                         mission_progress_map.insert(mission_id.clone(), progress);
                     }
@@ -1134,7 +1197,11 @@ impl RuntimeReadModelInput {
                 mission_entry.latest_event_type = Some(event.event_type.clone());
                 if let Some(task_id) = resolved_task_id.as_ref() {
                     let task_id = task_id.to_string();
-                    if !mission_entry.active_task_ids.iter().any(|id| id == &task_id) {
+                    if !mission_entry
+                        .active_task_ids
+                        .iter()
+                        .any(|id| id == &task_id)
+                    {
                         mission_entry.active_task_ids.push(task_id);
                     }
                 }
@@ -1144,14 +1211,15 @@ impl RuntimeReadModelInput {
                 if !summary.active_task_ids.iter().any(|id| id == &task_id) {
                     summary.active_task_ids.push(task_id.clone());
                 }
-                let task_entry = task_map.entry(task_id.clone()).or_insert_with(|| {
-                    TaskRuntimeSummaryEntry {
-                        task_id: task_id.clone(),
-                        mission_id: resolved_mission_id.clone(),
-                        assignment_id: event.assignment_id.as_ref().map(ToString::to_string),
-                        ..TaskRuntimeSummaryEntry::default()
-                    }
-                });
+                let task_entry =
+                    task_map
+                        .entry(task_id.clone())
+                        .or_insert_with(|| TaskRuntimeSummaryEntry {
+                            task_id: task_id.clone(),
+                            mission_id: resolved_mission_id.clone(),
+                            assignment_id: event.assignment_id.as_ref().map(ToString::to_string),
+                            ..TaskRuntimeSummaryEntry::default()
+                        });
                 task_entry.event_count += 1;
                 if event.category == EventCategory::Audit {
                     task_entry.audit_event_count += 1;
@@ -1188,13 +1256,14 @@ impl RuntimeReadModelInput {
             }
             if let Some(assignment_id) = event.assignment_id.as_ref() {
                 let assignment_id = assignment_id.to_string();
-                let assignment_entry = assignment_map
-                    .entry(assignment_id.clone())
-                    .or_insert_with(|| AssignmentRuntimeSummaryEntry {
-                        assignment_id: assignment_id.clone(),
-                        mission_id: event.mission_id.as_ref().map(ToString::to_string),
-                        ..AssignmentRuntimeSummaryEntry::default()
-                    });
+                let assignment_entry =
+                    assignment_map
+                        .entry(assignment_id.clone())
+                        .or_insert_with(|| AssignmentRuntimeSummaryEntry {
+                            assignment_id: assignment_id.clone(),
+                            mission_id: event.mission_id.as_ref().map(ToString::to_string),
+                            ..AssignmentRuntimeSummaryEntry::default()
+                        });
                 assignment_entry.event_count += 1;
                 if event.category == EventCategory::Audit {
                     assignment_entry.audit_event_count += 1;
@@ -1213,21 +1282,21 @@ impl RuntimeReadModelInput {
                 if let Some(status) = infer_assignment_status(event) {
                     assignment_entry.current_status = Some(status);
                 }
-                if matches!(event.event_type.as_str(), "task.completed" | "worker.report.applied")
-                    && event
-                        .payload
-                        .get("status")
-                        .and_then(|value| value.as_str())
-                        == Some("Succeeded")
+                if matches!(
+                    event.event_type.as_str(),
+                    "task.completed" | "worker.report.applied"
+                ) && event.payload.get("status").and_then(|value| value.as_str())
+                    == Some("Succeeded")
                 {
                     assignment_entry.completed_task_count += 1;
                 }
-                if matches!(event.event_type.as_str(), "task.failed" | "worker.report.applied")
-                    && matches!(
-                        event.payload.get("status").and_then(|value| value.as_str()),
-                        Some("Failed") | Some("Blocked")
-                    )
-                {
+                if matches!(
+                    event.event_type.as_str(),
+                    "task.failed" | "worker.report.applied"
+                ) && matches!(
+                    event.payload.get("status").and_then(|value| value.as_str()),
+                    Some("Failed") | Some("Blocked")
+                ) {
                     assignment_entry.failed_task_count += 1;
                 }
                 assignment_entry.latest_event_type = Some(event.event_type.clone());
@@ -1251,7 +1320,8 @@ impl RuntimeReadModelInput {
                 if event.event_type == "worker.reported" {
                     worker_entry.report_count += 1;
                 }
-                if event.event_type == "worker.tool.observed" || event.event_type == "tool.invoked" {
+                if event.event_type == "worker.tool.observed" || event.event_type == "tool.invoked"
+                {
                     worker_entry.tool_call_count += 1;
                 }
                 if event.event_type == "worker.skill_dispatch.observed" {
@@ -1480,12 +1550,13 @@ impl RuntimeReadModelInput {
                     .and_then(|value| value.as_str())
                     .unwrap_or("unknown")
                     .to_string();
-                let tool_entry = tool_map.entry(tool_name.clone()).or_insert_with(|| {
-                    ToolRuntimeSummaryEntry {
-                        tool_name: tool_name.clone(),
-                        ..ToolRuntimeSummaryEntry::default()
-                    }
-                });
+                let tool_entry =
+                    tool_map
+                        .entry(tool_name.clone())
+                        .or_insert_with(|| ToolRuntimeSummaryEntry {
+                            tool_name: tool_name.clone(),
+                            ..ToolRuntimeSummaryEntry::default()
+                        });
                 tool_entry.event_count += 1;
                 tool_entry.latest_event_type = Some(event.event_type.clone());
                 tool_entry.tool_kind = event
@@ -1507,7 +1578,11 @@ impl RuntimeReadModelInput {
                     }
                     tool_entry.latest_status = Some(status);
                 }
-                collect_unique_payload_value(&mut tool_entry.worker_ids, &event.payload, "worker_id");
+                collect_unique_payload_value(
+                    &mut tool_entry.worker_ids,
+                    &event.payload,
+                    "worker_id",
+                );
                 collect_unique_payload_value(&mut tool_entry.task_ids, &event.payload, "task_id");
                 collect_unique_payload_value(
                     &mut tool_entry.session_ids,
@@ -1682,22 +1757,30 @@ impl RuntimeReadModelInput {
         read_model.refresh_contract_state();
         read_model.overview.diagnostics.governance_total_count = governance_total_count;
         read_model.overview.diagnostics.governance_allowed_count = governance_allowed_count;
-        read_model.overview.diagnostics.governance_needs_approval_count =
-            governance_needs_approval_count;
+        read_model
+            .overview
+            .diagnostics
+            .governance_needs_approval_count = governance_needs_approval_count;
         read_model.overview.diagnostics.governance_blocked_count = governance_blocked_count;
         read_model.overview.diagnostics.governance_rejected_count = governance_rejected_count;
-        read_model.operations.attention.governance_blocked_task_ids =
-            governance_blocked_task_ids;
-        read_model.operations.attention.governance_approval_required_task_ids =
-            governance_approval_required_task_ids;
-        read_model.operations.attention.governance_rejected_task_ids =
-            governance_rejected_task_ids;
-        read_model.operations.attention.governance_blocked_worker_ids =
-            governance_blocked_worker_ids;
-        read_model.operations.attention.governance_approval_required_worker_ids =
-            governance_approval_required_worker_ids;
-        read_model.operations.attention.governance_rejected_worker_ids =
-            governance_rejected_worker_ids;
+        read_model.operations.attention.governance_blocked_task_ids = governance_blocked_task_ids;
+        read_model
+            .operations
+            .attention
+            .governance_approval_required_task_ids = governance_approval_required_task_ids;
+        read_model.operations.attention.governance_rejected_task_ids = governance_rejected_task_ids;
+        read_model
+            .operations
+            .attention
+            .governance_blocked_worker_ids = governance_blocked_worker_ids;
+        read_model
+            .operations
+            .attention
+            .governance_approval_required_worker_ids = governance_approval_required_worker_ids;
+        read_model
+            .operations
+            .attention
+            .governance_rejected_worker_ids = governance_rejected_worker_ids;
         read_model
     }
 
@@ -1712,9 +1795,9 @@ impl RuntimeReadModelInput {
         self.details
             .tasks
             .sort_by(|left, right| left.task_id.cmp(&right.task_id));
-        self.details.assignments.sort_by(|left, right| {
-            left.assignment_id.cmp(&right.assignment_id)
-        });
+        self.details
+            .assignments
+            .sort_by(|left, right| left.assignment_id.cmp(&right.assignment_id));
         self.details
             .workers
             .sort_by(|left, right| left.worker_id.cmp(&right.worker_id));
@@ -1724,9 +1807,9 @@ impl RuntimeReadModelInput {
         self.details
             .sessions
             .sort_by(|left, right| left.session_id.cmp(&right.session_id));
-        self.details.workspaces.sort_by(|left, right| {
-            left.workspace_id.cmp(&right.workspace_id)
-        });
+        self.details
+            .workspaces
+            .sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
 
         for entry in &mut self.details.execution_groups {
             sort_string_vec(&mut entry.active_task_ids);
@@ -1768,10 +1851,20 @@ impl RuntimeReadModelInput {
         sort_string_vec(&mut self.operations.attention.failed_worker_ids);
         sort_string_vec(&mut self.operations.attention.blocked_tool_names);
         sort_string_vec(&mut self.operations.attention.governance_blocked_task_ids);
-        sort_string_vec(&mut self.operations.attention.governance_approval_required_task_ids);
+        sort_string_vec(
+            &mut self
+                .operations
+                .attention
+                .governance_approval_required_task_ids,
+        );
         sort_string_vec(&mut self.operations.attention.governance_rejected_task_ids);
         sort_string_vec(&mut self.operations.attention.governance_blocked_worker_ids);
-        sort_string_vec(&mut self.operations.attention.governance_approval_required_worker_ids);
+        sort_string_vec(
+            &mut self
+                .operations
+                .attention
+                .governance_approval_required_worker_ids,
+        );
         sort_string_vec(&mut self.operations.attention.governance_rejected_worker_ids);
         sort_string_vec(&mut self.operations.attention.rejected_skill_dispatch_worker_ids);
         sort_string_vec(&mut self.operations.attention.failed_skill_dispatch_worker_ids);
@@ -1784,7 +1877,10 @@ impl RuntimeReadModelInput {
         sort_string_vec(&mut self.operations.work_queues.active_worker_ids);
         sort_string_vec(&mut self.operations.work_queues.pending_recovery_ids);
         sort_string_vec(
-            &mut self.operations.resume_observation.affected_execution_group_ids,
+            &mut self
+                .operations
+                .resume_observation
+                .affected_execution_group_ids,
         );
         sort_string_vec(&mut self.operations.resume_observation.affected_worker_ids);
 
@@ -1863,16 +1959,14 @@ fn infer_assignment_status(event: &EventEnvelope) -> Option<String> {
     match event.event_type.as_str() {
         "assignment.created" => Some("pending".to_string()),
         "task.dispatched" | "mission.resume.dispatch.created" => Some("running".to_string()),
-        "task.completed" | "worker.report.applied" => match event
-            .payload
-            .get("status")
-            .and_then(|value| value.as_str())
-        {
-            Some("Succeeded") => Some("succeeded".to_string()),
-            Some("Failed") | Some("Blocked") => Some("failed".to_string()),
-            Some("Running") => Some("running".to_string()),
-            _ => None,
-        },
+        "task.completed" | "worker.report.applied" => {
+            match event.payload.get("status").and_then(|value| value.as_str()) {
+                Some("Succeeded") => Some("succeeded".to_string()),
+                Some("Failed") | Some("Blocked") => Some("failed".to_string()),
+                Some("Running") => Some("running".to_string()),
+                _ => None,
+            }
+        }
         "task.failed" => Some("failed".to_string()),
         _ => None,
     }
@@ -1919,21 +2013,22 @@ fn derive_execution_group_status(
     recovery: &RecoveryReadModelInput,
     progress: Option<MissionProgressSummary>,
 ) -> Option<String> {
-    if recovery
-        .summaries
-        .iter()
-        .any(|summary| {
-            summary.mission_id.as_ref().map(|mission_id| mission_id.as_str())
-                == Some(execution_group_entry.mission_id.as_str())
-                && summary.current_status == "resuming"
-        })
-    {
+    if recovery.summaries.iter().any(|summary| {
+        summary
+            .mission_id
+            .as_ref()
+            .map(|mission_id| mission_id.as_str())
+            == Some(execution_group_entry.mission_id.as_str())
+            && summary.current_status == "resuming"
+    }) {
         return Some("resuming".to_string());
     }
 
     let task_statuses = task_map
         .values()
-        .filter(|task| task.mission_id.as_deref() == Some(execution_group_entry.mission_id.as_str()))
+        .filter(|task| {
+            task.mission_id.as_deref() == Some(execution_group_entry.mission_id.as_str())
+        })
         .filter_map(|task| task.current_status.as_deref())
         .collect::<Vec<_>>();
 
@@ -2013,7 +2108,8 @@ fn infer_worker_status(event: &EventEnvelope) -> Option<String> {
 }
 
 fn infer_worker_stage(event: &EventEnvelope) -> Option<String> {
-    event.payload
+    event
+        .payload
         .get("stage")
         .and_then(|value| value.as_str())
         .map(|value| value.to_ascii_lowercase())
@@ -2041,11 +2137,7 @@ fn nested_string_vec_field(value: &serde_json::Value, key: &str) -> Vec<String> 
         .unwrap_or_default()
 }
 
-fn collect_unique_payload_value(
-    target: &mut Vec<String>,
-    payload: &serde_json::Value,
-    key: &str,
-) {
+fn collect_unique_payload_value(target: &mut Vec<String>, payload: &serde_json::Value, key: &str) {
     if let Some(value) = payload.get(key).and_then(|value| value.as_str()) {
         let value = value.to_string();
         if !target.iter().any(|existing| existing == &value) {
@@ -2223,8 +2315,17 @@ mod tests {
         assert_eq!(mission.context_governed_knowledge_count, 1);
         assert_eq!(mission.context_extracted_memory_count, 2);
         assert_eq!(mission.context_provenance_linked_memory_count, 3);
-        assert_eq!(read_model.overview.diagnostics.context_execution_group_count, 1);
-        assert_eq!(read_model.overview.diagnostics.context_used_knowledge_count, 2);
+        assert_eq!(
+            read_model
+                .overview
+                .diagnostics
+                .context_execution_group_count,
+            1
+        );
+        assert_eq!(
+            read_model.overview.diagnostics.context_used_knowledge_count,
+            2
+        );
         assert_eq!(read_model.overview.diagnostics.context_used_memory_count, 3);
         assert_eq!(
             read_model
@@ -2316,7 +2417,13 @@ mod tests {
             mission.context_memory_extraction_refs,
             vec!["extract-a".to_string(), "extract-z".to_string()]
         );
-        assert_eq!(read_model.overview.diagnostics.context_execution_group_count, 1);
+        assert_eq!(
+            read_model
+                .overview
+                .diagnostics
+                .context_execution_group_count,
+            1
+        );
     }
 
     #[test]

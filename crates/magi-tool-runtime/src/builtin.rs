@@ -1,6 +1,4 @@
-use crate::{
-    BuiltinTool, BuiltinToolAccessMode, BuiltinToolName, BuiltinToolSpec,
-};
+use crate::{BuiltinTool, BuiltinToolAccessMode, BuiltinToolName, BuiltinToolSpec};
 use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel};
 use serde_json::Value;
 use std::{
@@ -122,11 +120,10 @@ pub(crate) fn field_string(
 fn field_usize(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<usize> {
     keys.iter().find_map(|key| {
         object.get(*key).and_then(|value| {
-            value.as_u64().map(|value| value as usize).or_else(|| {
-                value
-                    .as_str()
-                    .and_then(|value| value.parse::<usize>().ok())
-            })
+            value
+                .as_u64()
+                .map(|value| value as usize)
+                .or_else(|| value.as_str().and_then(|value| value.parse::<usize>().ok()))
         })
     })
 }
@@ -263,16 +260,11 @@ fn execute_search_text(input: &str) -> String {
         .and_then(|object| field_bool(object, &["include_hidden"]))
         .unwrap_or(false);
 
-    let (matches, scanned_files, truncated) = match search_text_matches(
-        &root,
-        &query,
-        case_sensitive,
-        include_hidden,
-        limit,
-    ) {
-        Ok(result) => result,
-        Err(error) => return builtin_error("search_text", error),
-    };
+    let (matches, scanned_files, truncated) =
+        match search_text_matches(&root, &query, case_sensitive, include_hidden, limit) {
+            Ok(result) => result,
+            Err(error) => return builtin_error("search_text", error),
+        };
 
     serde_json::json!({
         "tool": "search_text",
@@ -403,7 +395,9 @@ fn execute_process_inspect(input: &str) -> String {
             .output()
         {
             Ok(output) => output.stdout,
-            Err(error) => return builtin_error("process_inspect", format!("进程检查失败: {error}")),
+            Err(error) => {
+                return builtin_error("process_inspect", format!("进程检查失败: {error}"));
+            }
         }
     } else {
         match Command::new("ps")
@@ -411,7 +405,9 @@ fn execute_process_inspect(input: &str) -> String {
             .output()
         {
             Ok(output) => output.stdout,
-            Err(error) => return builtin_error("process_inspect", format!("进程检查失败: {error}")),
+            Err(error) => {
+                return builtin_error("process_inspect", format!("进程检查失败: {error}"));
+            }
         }
     };
 
@@ -465,7 +461,14 @@ fn execute_diff_preview(input: &str) -> String {
             .unwrap_or_else(|| before_path.clone().unwrap_or_else(|| "before".to_string()));
         let after_label = field_string(&object, &["after_label", "right_label"])
             .unwrap_or_else(|| after_path.clone().unwrap_or_else(|| "after".to_string()));
-        (before_path, after_path, before, after, before_label, after_label)
+        (
+            before_path,
+            after_path,
+            before,
+            after,
+            before_label,
+            after_label,
+        )
     } else if let Some((before, after)) = input.split_once("\n---\n") {
         (
             None,
@@ -547,11 +550,7 @@ fn default_shell_binary() -> String {
 }
 
 fn shell_arg() -> &'static str {
-    if cfg!(windows) {
-        "/C"
-    } else {
-        "-lc"
-    }
+    if cfg!(windows) { "/C" } else { "-lc" }
 }
 
 fn should_skip_directory(path: &Path, include_hidden: bool) -> bool {
@@ -740,17 +739,18 @@ fn common_suffix_len(before: &[&str], after: &[&str], prefix_len: usize) -> usiz
 }
 
 fn infer_process_mode(query: &Option<String>) -> &'static str {
-    if query.is_some() {
-        "query"
-    } else {
-        "pid"
-    }
+    if query.is_some() { "query" } else { "pid" }
 }
 
 fn execute_file_write(input: &str) -> String {
     let request = match parse_json_object(input) {
         Some(obj) => obj,
-        None => return builtin_error("file.write", "输入必须为 JSON 对象，包含 path 和 content 字段"),
+        None => {
+            return builtin_error(
+                "file.write",
+                "输入必须为 JSON 对象，包含 path 和 content 字段",
+            );
+        }
     };
 
     let path_input = match field_string(&request, &["path", "file_path"]) {
@@ -771,7 +771,10 @@ fn execute_file_write(input: &str) -> String {
     let create_dirs = field_bool(&request, &["create_dirs", "mkdir"]).unwrap_or(true);
 
     if path.exists() && !overwrite {
-        return builtin_error("file.write", format!("文件已存在且 overwrite=false: {}", path.display()));
+        return builtin_error(
+            "file.write",
+            format!("文件已存在且 overwrite=false: {}", path.display()),
+        );
     }
 
     if create_dirs {
@@ -821,22 +824,32 @@ fn execute_file_patch(input: &str) -> String {
         Err(e) => return builtin_error("file.patch", format!("读取文件失败: {e}")),
     };
 
-    let patches: Vec<(String, String)> = if let Some(arr) = request.get("patches").and_then(Value::as_array) {
-        arr.iter()
-            .filter_map(|p| {
-                let old = p.get("old_string").or_else(|| p.get("old")).and_then(Value::as_str)?;
-                let new = p.get("new_string").or_else(|| p.get("new")).and_then(Value::as_str)?;
-                Some((old.to_string(), new.to_string()))
-            })
-            .collect()
-    } else if let (Some(old), Some(new)) = (
-        field_string(&request, &["old_string", "old"]),
-        field_string(&request, &["new_string", "new"]),
-    ) {
-        vec![(old, new)]
-    } else {
-        return builtin_error("file.patch", "缺少 patches 数组或 old_string/new_string 字段");
-    };
+    let patches: Vec<(String, String)> =
+        if let Some(arr) = request.get("patches").and_then(Value::as_array) {
+            arr.iter()
+                .filter_map(|p| {
+                    let old = p
+                        .get("old_string")
+                        .or_else(|| p.get("old"))
+                        .and_then(Value::as_str)?;
+                    let new = p
+                        .get("new_string")
+                        .or_else(|| p.get("new"))
+                        .and_then(Value::as_str)?;
+                    Some((old.to_string(), new.to_string()))
+                })
+                .collect()
+        } else if let (Some(old), Some(new)) = (
+            field_string(&request, &["old_string", "old"]),
+            field_string(&request, &["new_string", "new"]),
+        ) {
+            vec![(old, new)]
+        } else {
+            return builtin_error(
+                "file.patch",
+                "缺少 patches 数组或 old_string/new_string 字段",
+            );
+        };
 
     if patches.is_empty() {
         return builtin_error("file.patch", "patches 为空");
@@ -853,7 +866,10 @@ fn execute_file_patch(input: &str) -> String {
             continue;
         }
         if count > 1 {
-            errors.push(format!("patch[{}]: old_string 匹配了 {} 处（需要唯一匹配）", i, count));
+            errors.push(format!(
+                "patch[{}]: old_string 匹配了 {} 处（需要唯一匹配）",
+                i, count
+            ));
             continue;
         }
         result = result.replacen(old, new, 1);
@@ -969,7 +985,10 @@ fn execute_file_mkdir(input: &str) -> String {
             })
             .to_string();
         }
-        return builtin_error("file.mkdir", format!("路径已存在且不是目录: {}", path.display()));
+        return builtin_error(
+            "file.mkdir",
+            format!("路径已存在且不是目录: {}", path.display()),
+        );
     }
 
     if let Err(e) = fs::create_dir_all(&path) {
@@ -990,7 +1009,12 @@ fn execute_file_mkdir(input: &str) -> String {
 fn execute_file_copy(input: &str) -> String {
     let request = match parse_json_object(input) {
         Some(obj) => obj,
-        None => return builtin_error("file.copy", "输入必须为 JSON 对象，包含 source 和 destination 字段"),
+        None => {
+            return builtin_error(
+                "file.copy",
+                "输入必须为 JSON 对象，包含 source 和 destination 字段",
+            );
+        }
     };
 
     let src_input = match field_string(&request, &["source", "src", "from"]) {
@@ -1018,7 +1042,10 @@ fn execute_file_copy(input: &str) -> String {
     }
 
     if dst.exists() && !overwrite {
-        return builtin_error("file.copy", format!("目标路径已存在且 overwrite=false: {}", dst.display()));
+        return builtin_error(
+            "file.copy",
+            format!("目标路径已存在且 overwrite=false: {}", dst.display()),
+        );
     }
 
     if let Some(parent) = dst.parent() {
@@ -1068,7 +1095,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 fn execute_file_move(input: &str) -> String {
     let request = match parse_json_object(input) {
         Some(obj) => obj,
-        None => return builtin_error("file.move", "输入必须为 JSON 对象，包含 source 和 destination 字段"),
+        None => {
+            return builtin_error(
+                "file.move",
+                "输入必须为 JSON 对象，包含 source 和 destination 字段",
+            );
+        }
     };
 
     let src_input = match field_string(&request, &["source", "src", "from"]) {
@@ -1096,7 +1128,10 @@ fn execute_file_move(input: &str) -> String {
     }
 
     if dst.exists() && !overwrite {
-        return builtin_error("file.move", format!("目标路径已存在且 overwrite=false: {}", dst.display()));
+        return builtin_error(
+            "file.move",
+            format!("目标路径已存在且 overwrite=false: {}", dst.display()),
+        );
     }
 
     if let Some(parent) = dst.parent() {
@@ -1271,7 +1306,9 @@ fn execute_web_fetch(input: &str) -> String {
         return builtin_error("web_fetch", "缺少 URL");
     }
 
-    let prompt = request.as_ref().and_then(|obj| field_string(obj, &["prompt"]));
+    let prompt = request
+        .as_ref()
+        .and_then(|obj| field_string(obj, &["prompt"]));
 
     let client = match reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
@@ -1314,7 +1351,13 @@ fn execute_web_fetch(input: &str) -> String {
 
     let max_len = 50_000;
     let (content, truncated) = if content.len() > max_len {
-        (format!("{}\n\n---\n*[内容已截断至 50,000 字符]*", &content[..max_len]), true)
+        (
+            format!(
+                "{}\n\n---\n*[内容已截断至 50,000 字符]*",
+                &content[..max_len]
+            ),
+            true,
+        )
     } else {
         (content, false)
     };
@@ -1336,38 +1379,59 @@ fn execute_web_fetch(input: &str) -> String {
 
 fn html_to_markdown(html: &str) -> String {
     let main = extract_main_content(html);
-    let cleaned = regex::Regex::new(r"(?si)<script[\s\S]*?</script>").unwrap().replace_all(&main, "");
-    let cleaned = regex::Regex::new(r"(?si)<style[\s\S]*?</style>").unwrap().replace_all(&cleaned, "");
-    let cleaned = regex::Regex::new(r"(?si)<noscript[\s\S]*?</noscript>").unwrap().replace_all(&cleaned, "");
-    let cleaned = regex::Regex::new(r"(?si)<(nav|footer|header|aside|iframe)[^>]*>[\s\S]*?</\1>").unwrap().replace_all(&cleaned, "");
+    let cleaned = regex::Regex::new(r"(?si)<script[\s\S]*?</script>")
+        .unwrap()
+        .replace_all(&main, "");
+    let cleaned = regex::Regex::new(r"(?si)<style[\s\S]*?</style>")
+        .unwrap()
+        .replace_all(&cleaned, "");
+    let cleaned = regex::Regex::new(r"(?si)<noscript[\s\S]*?</noscript>")
+        .unwrap()
+        .replace_all(&cleaned, "");
+    let cleaned = regex::Regex::new(r"(?si)<(nav|footer|header|aside|iframe)[^>]*>[\s\S]*?</\1>")
+        .unwrap()
+        .replace_all(&cleaned, "");
 
-    let md = regex::Regex::new(r"(?si)<h([1-6])[^>]*>([\s\S]*?)</h\1>").unwrap()
+    let md = regex::Regex::new(r"(?si)<h([1-6])[^>]*>([\s\S]*?)</h\1>")
+        .unwrap()
         .replace_all(&cleaned, |caps: &regex::Captures| {
             let level: usize = caps[1].parse().unwrap_or(1);
             let text = strip_html_tags(&decode_html_entities(&caps[2]));
             format!("\n{} {}\n", "#".repeat(level), text.trim())
         });
-    let md = regex::Regex::new(r"(?si)<pre[^>]*>\s*<code[^>]*>([\s\S]*?)</code>\s*</pre>").unwrap()
+    let md = regex::Regex::new(r"(?si)<pre[^>]*>\s*<code[^>]*>([\s\S]*?)</code>\s*</pre>")
+        .unwrap()
         .replace_all(&md, |caps: &regex::Captures| {
             format!("\n```\n{}\n```\n", decode_html_entities(&caps[1]).trim())
         });
-    let md = regex::Regex::new(r"(?si)<code[^>]*>([\s\S]*?)</code>").unwrap()
+    let md = regex::Regex::new(r"(?si)<code[^>]*>([\s\S]*?)</code>")
+        .unwrap()
         .replace_all(&md, |caps: &regex::Captures| {
             format!("`{}`", decode_html_entities(&caps[1]).trim())
         });
-    let md = regex::Regex::new(r#"(?si)<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#).unwrap()
+    let md = regex::Regex::new(r#"(?si)<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#)
+        .unwrap()
         .replace_all(&md, |caps: &regex::Captures| {
             let text = strip_html_tags(&decode_html_entities(&caps[2]));
             format!("[{}]({})", text.trim(), &caps[1])
         });
-    let md = regex::Regex::new(r"(?si)<li[^>]*>([\s\S]*?)</li>").unwrap()
+    let md = regex::Regex::new(r"(?si)<li[^>]*>([\s\S]*?)</li>")
+        .unwrap()
         .replace_all(&md, |caps: &regex::Captures| {
-            format!("\n- {}", strip_html_tags(&decode_html_entities(&caps[1])).trim())
+            format!(
+                "\n- {}",
+                strip_html_tags(&decode_html_entities(&caps[1])).trim()
+            )
         });
-    let md = md.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n");
+    let md = md
+        .replace("<br>", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br />", "\n");
     let md = md.replace("</p>", "\n\n");
     let md = regex::Regex::new(r"<[^>]+>").unwrap().replace_all(&md, "");
-    let md = regex::Regex::new(r"\n{3,}").unwrap().replace_all(&md, "\n\n");
+    let md = regex::Regex::new(r"\n{3,}")
+        .unwrap()
+        .replace_all(&md, "\n\n");
 
     decode_html_entities(&md).trim().to_string()
 }
@@ -1410,26 +1474,39 @@ fn execute_mermaid_diagram(input: &str) -> String {
     }
 
     let diagram_types: &[(&str, &str)] = &[
-        ("graph ", "flowchart"), ("flowchart ", "flowchart"),
-        ("sequenceDiagram", "sequence"), ("classDiagram", "class"),
-        ("stateDiagram", "state"), ("erDiagram", "er"),
-        ("gantt", "gantt"), ("pie", "pie"), ("journey", "journey"),
-        ("gitGraph", "git"), ("mindmap", "mindmap"), ("timeline", "timeline"),
-        ("quadrantChart", "quadrant"), ("requirementDiagram", "requirement"),
-        ("C4Context", "c4"), ("sankey", "sankey"), ("xychart", "xychart"),
+        ("graph ", "flowchart"),
+        ("flowchart ", "flowchart"),
+        ("sequenceDiagram", "sequence"),
+        ("classDiagram", "class"),
+        ("stateDiagram", "state"),
+        ("erDiagram", "er"),
+        ("gantt", "gantt"),
+        ("pie", "pie"),
+        ("journey", "journey"),
+        ("gitGraph", "git"),
+        ("mindmap", "mindmap"),
+        ("timeline", "timeline"),
+        ("quadrantChart", "quadrant"),
+        ("requirementDiagram", "requirement"),
+        ("C4Context", "c4"),
+        ("sankey", "sankey"),
+        ("xychart", "xychart"),
         ("block-beta", "block"),
     ];
 
-    let diagram_type = diagram_types.iter()
+    let diagram_type = diagram_types
+        .iter()
         .find(|(prefix, _)| trimmed.to_lowercase().starts_with(&prefix.to_lowercase()))
         .map(|(_, t)| *t);
 
     let diagram_type = match diagram_type {
         Some(t) => t,
-        None => return builtin_error(
-            "mermaid_diagram",
-            "无法识别的 Mermaid 图表类型。代码须以有效声明开头（graph, flowchart, sequenceDiagram, classDiagram 等）"
-        ),
+        None => {
+            return builtin_error(
+                "mermaid_diagram",
+                "无法识别的 Mermaid 图表类型。代码须以有效声明开头（graph, flowchart, sequenceDiagram, classDiagram 等）",
+            );
+        }
     };
 
     serde_json::json!({

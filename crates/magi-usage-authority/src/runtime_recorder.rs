@@ -1,7 +1,7 @@
 use crate::authority::UsageAuthority;
 use crate::types::{
-    ExecutionBindingIdentity, LlmConfig, UsageCallIdentity, UsageCallRecordInput,
-    UsageCallStatus, UsageTokenInput,
+    ExecutionBindingIdentity, LlmConfig, UsageCallIdentity, UsageCallRecordInput, UsageCallStatus,
+    UsageTokenInput,
 };
 
 pub struct RuntimeRecorder<'a> {

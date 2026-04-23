@@ -19,7 +19,7 @@ pub mod symbol_index;
 #[cfg(test)]
 mod tests;
 
-use magi_core::{DomainError, UtcMillis};
+use magi_core::{DomainError, UtcMillis, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 
@@ -45,6 +45,8 @@ pub struct KnowledgeRecord {
     pub title: String,
     pub content: String,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<WorkspaceId>,
     pub source_ref: Option<String>,
     pub updated_at: UtcMillis,
 }
@@ -54,6 +56,8 @@ pub struct KnowledgeQuery {
     pub kind: Option<KnowledgeKind>,
     pub text: Option<String>,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<WorkspaceId>,
     pub limit: usize,
 }
 
@@ -132,6 +136,22 @@ impl KnowledgeStore {
     }
 
     pub fn ingest_code_index(&self, ingestion: CodeIndexIngestion) {
+        self.ingest_code_index_with_workspace(ingestion, None);
+    }
+
+    pub fn ingest_code_index_in_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        ingestion: CodeIndexIngestion,
+    ) {
+        self.ingest_code_index_with_workspace(ingestion, Some(workspace_id));
+    }
+
+    fn ingest_code_index_with_workspace(
+        &self,
+        ingestion: CodeIndexIngestion,
+        workspace_id: Option<WorkspaceId>,
+    ) {
         let normalized = normalize_code_index_ingestion(ingestion);
         let record = KnowledgeRecord {
             knowledge_id: normalized.knowledge_id,
@@ -139,6 +159,7 @@ impl KnowledgeStore {
             title: normalized.title,
             content: normalized.content,
             tags: normalized.tags,
+            workspace_id,
             source_ref: normalized.source_ref,
             updated_at: normalized.updated_at,
         };
@@ -255,6 +276,25 @@ impl KnowledgeStore {
         Ok(())
     }
 
+    pub fn delete_in_workspace(
+        &self,
+        knowledge_id: &str,
+        workspace_id: &WorkspaceId,
+    ) -> Result<(), DomainError> {
+        let record = self.get(knowledge_id).ok_or(DomainError::NotFound {
+            entity: "knowledge",
+        })?;
+        if record.workspace_id.as_ref() != Some(workspace_id) {
+            return Err(DomainError::InvalidState {
+                message: format!(
+                    "知识记录 {knowledge_id} 不属于 workspace {}",
+                    workspace_id.as_str()
+                ),
+            });
+        }
+        self.delete(knowledge_id)
+    }
+
     pub fn clear(&self) {
         let mut state = self
             .state
@@ -265,5 +305,17 @@ impl KnowledgeStore {
         state.code_sources.clear();
         state.audit_links.clear();
         state.governance_links.clear();
+    }
+
+    pub fn clear_workspace(&self, workspace_id: &WorkspaceId) {
+        let knowledge_ids = self
+            .list()
+            .into_iter()
+            .filter(|record| record.workspace_id.as_ref() == Some(workspace_id))
+            .map(|record| record.knowledge_id)
+            .collect::<Vec<_>>();
+        for knowledge_id in knowledge_ids {
+            let _ = self.delete(&knowledge_id);
+        }
     }
 }

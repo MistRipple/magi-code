@@ -15,7 +15,8 @@ impl<'a> UsageQueryService<'a> {
         workspace_id: &str,
         session_id: &str,
     ) -> SessionUsageSnapshot {
-        self.authority.get_session_snapshot(workspace_id, session_id)
+        self.authority
+            .get_session_snapshot(workspace_id, session_id)
     }
 
     pub fn workspace_snapshot(&mut self, workspace_id: &str) -> WorkspaceUsageSnapshot {

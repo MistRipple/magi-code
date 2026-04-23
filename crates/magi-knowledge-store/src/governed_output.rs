@@ -1,6 +1,6 @@
 use crate::{
-    normalization::summarize_excerpt, CodeIndexSource, GovernedKnowledgeOutput,
-    GovernedKnowledgeService, KnowledgeAuditLink, KnowledgeGovernanceLink, KnowledgeQueryResult,
+    CodeIndexSource, GovernedKnowledgeOutput, GovernedKnowledgeService, KnowledgeAuditLink,
+    KnowledgeGovernanceLink, KnowledgeQueryResult, normalization::summarize_excerpt,
 };
 use std::collections::HashMap;
 

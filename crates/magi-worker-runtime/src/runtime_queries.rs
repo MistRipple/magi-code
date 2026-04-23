@@ -1,12 +1,43 @@
 use crate::{
     EventCategory, EventContext, GovernanceDecision, GovernanceOutcome, SkillDispatchSummary,
     TaskExecutionSnapshot, TaskId, UtcMillis, WorkerControlKind, WorkerExecutionSnapshot,
-    WorkerExecutorObservation, WorkerGovernanceObservation, WorkerGovernanceSummary,
-    WorkerId, WorkerLifecycleStatus, WorkerRuntime, WorkerRuntimeSummary,
-    WorkerSkillDispatchObservation,
+    WorkerExecutorObservation, WorkerGovernanceObservation, WorkerGovernanceSummary, WorkerId,
+    WorkerLifecycleStatus, WorkerRuntime, WorkerRuntimeBranchSnapshot,
+    WorkerRuntimeDurableSnapshot, WorkerRuntimeSummary, WorkerSkillDispatchObservation,
 };
 
 impl WorkerRuntime {
+    pub fn durable_snapshot(&self) -> WorkerRuntimeDurableSnapshot {
+        let mut branches = self.branch_snapshots();
+        branches.sort_by(|left, right| {
+            left.task_id
+                .as_str()
+                .cmp(right.task_id.as_str())
+                .then_with(|| left.worker_id.as_str().cmp(right.worker_id.as_str()))
+        });
+        WorkerRuntimeDurableSnapshot { branches }
+    }
+
+    pub fn branch_snapshots(&self) -> Vec<WorkerRuntimeBranchSnapshot> {
+        self.branch_snapshots
+            .read()
+            .expect("worker branch snapshot read lock poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn branch_snapshot_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> Option<WorkerRuntimeBranchSnapshot> {
+        self.branch_snapshots
+            .read()
+            .expect("worker branch snapshot read lock poisoned")
+            .get(task_id)
+            .cloned()
+    }
+
     pub fn skill_dispatches(&self) -> Vec<WorkerSkillDispatchObservation> {
         self.skill_dispatches
             .read()
@@ -22,10 +53,7 @@ impl WorkerRuntime {
         SkillDispatchSummary::from_observations(skill_dispatches.iter())
     }
 
-    pub fn skill_dispatch_summary_for_worker(
-        &self,
-        worker_id: &WorkerId,
-    ) -> SkillDispatchSummary {
+    pub fn skill_dispatch_summary_for_worker(&self, worker_id: &WorkerId) -> SkillDispatchSummary {
         let skill_dispatches = self
             .skill_dispatches
             .read()
@@ -104,16 +132,15 @@ impl WorkerRuntime {
         WorkerGovernanceSummary::from_observations(observations.iter())
     }
 
-    pub fn governance_summary_for_worker(
-        &self,
-        worker_id: &WorkerId,
-    ) -> WorkerGovernanceSummary {
+    pub fn governance_summary_for_worker(&self, worker_id: &WorkerId) -> WorkerGovernanceSummary {
         let observations = self
             .governance_observations
             .read()
             .expect("worker governance observation read lock poisoned");
         WorkerGovernanceSummary::from_observations(
-            observations.iter().filter(|observation| &observation.worker_id == worker_id),
+            observations
+                .iter()
+                .filter(|observation| &observation.worker_id == worker_id),
         )
     }
 
@@ -176,10 +203,10 @@ impl WorkerRuntime {
             .filter(|record| &record.worker_id == worker_id)
             .cloned()
             .collect();
-        let skill_dispatch_summary = SkillDispatchSummary::from_observations(skill_dispatches.iter());
-        let governance_summary = WorkerGovernanceSummary::from_observations(
-            governance_observations.iter(),
-        );
+        let skill_dispatch_summary =
+            SkillDispatchSummary::from_observations(skill_dispatches.iter());
+        let governance_summary =
+            WorkerGovernanceSummary::from_observations(governance_observations.iter());
         Some(WorkerExecutionSnapshot {
             worker,
             reports,
@@ -233,10 +260,10 @@ impl WorkerRuntime {
             .filter(|record| record.task_id.as_ref() == Some(task_id))
             .cloned()
             .collect();
-        let skill_dispatch_summary = SkillDispatchSummary::from_observations(skill_dispatches.iter());
-        let governance_summary = WorkerGovernanceSummary::from_observations(
-            governance_observations.iter(),
-        );
+        let skill_dispatch_summary =
+            SkillDispatchSummary::from_observations(skill_dispatches.iter());
+        let governance_summary =
+            WorkerGovernanceSummary::from_observations(governance_observations.iter());
         TaskExecutionSnapshot {
             task_id: task_id.clone(),
             reports,

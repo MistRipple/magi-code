@@ -1,6 +1,6 @@
 use crate::{
-    WorkerExecutionIntent, WorkerExecutionStepKind, WorkerExecutionTrace,
-    WorkerExecutorFailureDetail, WorkerExecutorRequest, WorkerStage,
+    WorkerExecutionCheckpointCursor, WorkerExecutionIntent, WorkerExecutionStepKind,
+    WorkerExecutionTrace, WorkerExecutorFailureDetail, WorkerExecutorRequest, WorkerStage,
 };
 use magi_core::{SessionId, VerificationStatus, WorkspaceId};
 use serde::{Deserialize, Serialize};
@@ -321,15 +321,9 @@ impl LocalProcessExecutorCapability {
                 effective,
                 WorkerExecutionLeaseState::Requested | WorkerExecutionLeaseState::Active
             ),
-            WorkerExecutionLeaseState::Active => {
-                effective == WorkerExecutionLeaseState::Active
-            }
-            WorkerExecutionLeaseState::Released => {
-                effective == WorkerExecutionLeaseState::Released
-            }
-            WorkerExecutionLeaseState::Expired => {
-                effective == WorkerExecutionLeaseState::Expired
-            }
+            WorkerExecutionLeaseState::Active => effective == WorkerExecutionLeaseState::Active,
+            WorkerExecutionLeaseState::Released => effective == WorkerExecutionLeaseState::Released,
+            WorkerExecutionLeaseState::Expired => effective == WorkerExecutionLeaseState::Expired,
         }
     }
 
@@ -414,7 +408,8 @@ impl LocalProcessExecutorCapability {
         session_id: &Option<SessionId>,
         workspace_id: &Option<WorkspaceId>,
     ) -> Result<(), WorkerExecutorFailure> {
-        if self.affinity.strict_session && self.affinity.session_id.as_ref() != session_id.as_ref() {
+        if self.affinity.strict_session && self.affinity.session_id.as_ref() != session_id.as_ref()
+        {
             return Err(WorkerExecutorFailure::remote_business(format!(
                 "executor {} {} session affinity mismatch: expected {}, got {}",
                 self.executor_id,
@@ -587,11 +582,15 @@ pub struct LocalProcessProbeResponse {
 pub struct LocalProcessExecutionRequest {
     pub executor_request: WorkerExecutorRequest,
     pub intent: WorkerExecutionIntent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_cursor: Option<WorkerExecutionCheckpointCursor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LocalProcessExecutionResponse {
     pub trace: WorkerExecutionTrace,
+    pub next_step_index: usize,
+    pub completed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -599,12 +598,16 @@ pub struct LocalProcessReviewRequest {
     pub executor_request: WorkerExecutorRequest,
     pub intent: WorkerExecutionIntent,
     pub prior_trace: Option<WorkerExecutionTrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_cursor: Option<WorkerExecutionCheckpointCursor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LocalProcessReviewResponse {
     pub trace: WorkerExecutionTrace,
     pub review_summary: String,
+    pub next_step_index: usize,
+    pub completed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -612,6 +615,8 @@ pub struct LocalProcessVerifyRequest {
     pub executor_request: WorkerExecutorRequest,
     pub intent: WorkerExecutionIntent,
     pub prior_trace: Option<WorkerExecutionTrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_cursor: Option<WorkerExecutionCheckpointCursor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -619,6 +624,8 @@ pub struct LocalProcessVerifyResponse {
     pub trace: WorkerExecutionTrace,
     pub verification_status: VerificationStatus,
     pub verify_summary: String,
+    pub next_step_index: usize,
+    pub completed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -627,12 +634,16 @@ pub struct LocalProcessRepairRequest {
     pub intent: WorkerExecutionIntent,
     pub prior_trace: Option<WorkerExecutionTrace>,
     pub repair_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_cursor: Option<WorkerExecutionCheckpointCursor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LocalProcessRepairResponse {
     pub trace: WorkerExecutionTrace,
     pub repair_summary: String,
+    pub next_step_index: usize,
+    pub completed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -6,29 +6,26 @@ mod execution_runtime;
 mod execution_writeback;
 #[cfg(test)]
 pub(crate) mod plan_ledger;
-mod recovery_planner;
 pub mod risk_policy;
 pub mod task_runner;
 pub mod task_store;
 pub mod task_worker_catalog;
+pub mod turn_diff_tracker;
 pub mod verification_policy;
 pub mod verification_runner;
-pub mod turn_diff_tracker;
 
-use magi_core::{
-    AssignmentId, DispatchReason, EventId, MissionId, RecoveryResumeInput,
-    SessionId, TaskExecutionTarget, TaskId, UtcMillis, WorkspaceId,
-};
 use magi_bridge_client::BridgeBindingDispatchPlan;
 use magi_context_runtime::{ContextAssemblyResult, ContextBudget, ContextRuntime};
+use magi_core::{
+    AssignmentId, EventId, MissionId, SessionId, TaskExecutionTarget, TaskId, UtcMillis,
+    WorkspaceId,
+};
 use magi_event_bus::{EventCategory, EventContext, EventEnvelope, InMemoryEventBus};
-use magi_session_store::{SessionRuntimeSidecarExport, SessionStore};
 use magi_skill_runtime::{SkillDispatchRuntime, SkillToolRoutingSummary, SkillToolRuntimePlan};
 use magi_tool_runtime::{ToolExecutionPolicy, ToolExecutionSummary, ToolRegistry};
-use magi_workspace::{WorkspaceRecoverySidecarExport, WorkspaceStore};
 use magi_worker_runtime::{
-    SkillDispatchSummary, WorkerExecutionIntent, WorkerExecutionBindingScope,
-    WorkerExecutionProfile, WorkerExecutorRequest, WorkerExecutionReusePolicy,
+    SkillDispatchSummary, WorkerExecutionBindingScope, WorkerExecutionIntent,
+    WorkerExecutionProfile, WorkerExecutionReusePolicy, WorkerExecutorRequest,
     WorkerGovernanceObservation, WorkerGovernanceSummary, WorkerLoopOutcome, WorkerRuntime,
     WorkerRuntimeSummary, WorkerSkillDispatchObservation, WorkerStage,
 };
@@ -54,12 +51,6 @@ pub enum OrchestratorCommandError {
     },
     GovernanceTargetMissing {
         reason: String,
-    },
-    NoResumeTarget {
-        recovery_id: String,
-    },
-    RecoverySupportUnavailable {
-        missing: String,
     },
     WorkerExecutorUnavailable {
         reason: String,
@@ -132,7 +123,12 @@ impl ExecutionContextSummary {
         let mut knowledge_source_paths = result
             .selected_knowledge
             .iter()
-            .filter_map(|record| record.code_source.as_ref().map(|source| source.path.clone()))
+            .filter_map(|record| {
+                record
+                    .code_source
+                    .as_ref()
+                    .map(|source| source.path.clone())
+            })
             .collect::<Vec<_>>();
         knowledge_source_paths.sort();
         knowledge_source_paths.dedup();
@@ -236,15 +232,6 @@ pub struct TaskSkillDispatchSummary {
     pub skill_dispatch_summary: ExecutionSkillDispatchSummary,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ResumeCommand {
-    pub mission_id: MissionId,
-    pub task_id: Option<TaskId>,
-    pub dispatch_reason: DispatchReason,
-    pub recovery_id: String,
-    pub execution_chain_ref: Option<String>,
-}
-
 #[derive(Clone)]
 pub struct OrchestratorService {
     event_bus: Arc<InMemoryEventBus>,
@@ -257,8 +244,6 @@ pub struct OrchestratedExecutionRuntime {
     worker_runtime: WorkerRuntime,
     tool_registry: ToolRegistry,
     skill_dispatch_runtime: SkillDispatchRuntime,
-    session_store: Option<Arc<SessionStore>>,
-    workspace_store: Option<Arc<WorkspaceStore>>,
     context_runtime: Option<ContextRuntime>,
     context_config: Option<ExecutionContextConfig>,
 }
@@ -275,18 +260,6 @@ pub struct DispatchExecutionResult {
     pub intent: WorkerExecutionIntent,
     pub outcome: WorkerLoopOutcome,
     pub overview: ExecutionOverview,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecoveryExecutionResult {
-    pub recovery_input: RecoveryResumeInput,
-    pub resume_command: ResumeCommand,
-    pub target: TaskExecutionTarget,
-    pub assignment_id: Option<AssignmentId>,
-    pub dispatch: DispatchExecutionResult,
-    pub session_sidecar: Option<SessionRuntimeSidecarExport>,
-    pub workspace_recovery: Option<WorkspaceRecoverySidecarExport>,
-    pub runtime_snapshot: ExecutionRuntimeSnapshot,
 }
 
 impl OrchestratorService {
@@ -306,29 +279,6 @@ impl OrchestratorService {
             worker_runtime,
             tool_registry,
             skill_dispatch_runtime,
-            session_store: None,
-            workspace_store: None,
-            context_runtime: None,
-            context_config: None,
-        }
-    }
-
-    pub fn execution_runtime_with_recovery_support(
-        &self,
-        worker_runtime: WorkerRuntime,
-        tool_registry: ToolRegistry,
-        skill_dispatch_runtime: SkillDispatchRuntime,
-        session_store: Arc<SessionStore>,
-        workspace_store: Arc<WorkspaceStore>,
-    ) -> OrchestratedExecutionRuntime {
-        OrchestratedExecutionRuntime {
-            service: self.clone(),
-            task_store: Arc::new(task_store::TaskStore::new()),
-            worker_runtime,
-            tool_registry,
-            skill_dispatch_runtime,
-            session_store: Some(session_store),
-            workspace_store: Some(workspace_store),
             context_runtime: None,
             context_config: None,
         }
@@ -385,8 +335,11 @@ impl OrchestratorService {
             }
             _ => magi_worker_runtime::WorkerExecutionProcessLifecycle::OneShot,
         };
-        if probe.capability.descriptor.reuse_scope != magi_worker_runtime::WorkerExecutionBindingScope::None {
-            effective_profile.binding_lifecycle = magi_worker_runtime::WorkerExecutionBindingLifecycle::Bound;
+        if probe.capability.descriptor.reuse_scope
+            != magi_worker_runtime::WorkerExecutionBindingScope::None
+        {
+            effective_profile.binding_lifecycle =
+                magi_worker_runtime::WorkerExecutionBindingLifecycle::Bound;
             effective_profile.lease_state = magi_worker_runtime::WorkerExecutionLeaseState::Active;
         }
         effective_profile
@@ -432,23 +385,6 @@ impl OrchestratorService {
         Some(overview)
     }
 
-    pub fn build_resume_command(&self, input: &RecoveryResumeInput) -> Option<ResumeCommand> {
-        let command = recovery_planner::build_resume_command(input)?;
-        self.publish_with_category(
-            "mission.resume.command.created",
-            EventCategory::Audit,
-            EventContext {
-                workspace_id: input.ownership.workspace_id.clone(),
-                session_id: input.ownership.session_id.clone(),
-                mission_id: Some(command.mission_id.clone()),
-                task_id: command.task_id.clone(),
-                ..EventContext::default()
-            },
-            recovery_planner::build_resume_command_payload(&command),
-        );
-        Some(command)
-    }
-
     fn publish_with_category(
         &self,
         event_type: &str,
@@ -484,6 +420,16 @@ impl OrchestratorService {
             ),
         };
         let _ = self.event_bus.publish(base.with_context(context));
+    }
+}
+
+impl OrchestratedExecutionRuntime {
+    pub fn worker_runtime(&self) -> &WorkerRuntime {
+        &self.worker_runtime
+    }
+
+    pub fn task_store(&self) -> &task_store::TaskStore {
+        &self.task_store
     }
 }
 

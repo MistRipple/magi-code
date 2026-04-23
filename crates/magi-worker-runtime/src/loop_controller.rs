@@ -1,9 +1,9 @@
 use crate::{
-    execute_intent_with_drivers, SkillDispatchSummary, WorkerExecutionFinalReport,
-    WorkerExecutionIntent, WorkerExecutionReport, WorkerExecutionTrace,
-    WorkerExecutorFailure, WorkerGovernanceSummary, WorkerLoopAction, WorkerLoopEntry,
-    WorkerLoopOutcome, WorkerLoopOutcomeKind, WorkerRecord, WorkerRuntime,
-    WorkerRuntimeLoop, WorkerStage,
+    SkillDispatchSummary, WorkerCheckpointResumeMode, WorkerExecutionCheckpointCursor,
+    WorkerExecutionFinalReport, WorkerExecutionIntent, WorkerExecutionProgress,
+    WorkerExecutionReport, WorkerExecutionTrace, WorkerExecutorFailure, WorkerGovernanceSummary,
+    WorkerLoopAction, WorkerLoopEntry, WorkerLoopOutcome, WorkerLoopOutcomeKind, WorkerRecord,
+    WorkerRuntime, WorkerRuntimeLoop, WorkerStage, execute_intent_step_with_drivers,
 };
 use magi_core::{TaskResultKind, TerminationReason, UtcMillis, VerificationStatus};
 use magi_governance::{GovernanceDecision, GovernanceOutcome, WorkerControlKind};
@@ -144,7 +144,9 @@ impl WorkerRuntimeLoop {
         if let Some(decision) = governance_decision.clone() {
             let observation = self.runtime.observe_governance_decision(
                 &worker_id,
-                task_id_hint.clone().or_else(|| self.runtime.current_task_id(&worker_id)),
+                task_id_hint
+                    .clone()
+                    .or_else(|| self.runtime.current_task_id(&worker_id)),
                 action.control_kind(),
                 decision.clone(),
             );
@@ -255,39 +257,94 @@ impl WorkerRuntimeLoop {
                         "worker missing current task or not registered",
                     );
                 }
-                let trace = self.execute_intent_with_drivers(&intent).unwrap_or_else(|| {
-                    self.runtime
-                        .executor()
-                        .execute_checked(&intent)
-                        .unwrap_or_else(|error| WorkerExecutionTrace {
-                            worker_id: intent.worker_id.clone(),
-                            task_id: intent.task_id.clone(),
-                            tool_invocations: Vec::new(),
-                            skill_dispatches: Vec::new(),
-                            final_report: WorkerExecutionFinalReport {
-                                summary: format!(
-                                    "external executor failed [{}]: {}",
-                                    error.layer.label(),
-                                    error.message
-                                ),
-                                result_kind: Some(TaskResultKind::Failure),
-                                termination_reason: Some(TerminationReason::Failed),
-                                verification_status: VerificationStatus::Failed,
-                            },
-                        })
-                });
+                let mut checkpoint_cursor = self
+                    .runtime
+                    .checkpoint_cursor_for_task(&task_id)
+                    .filter(|cursor| cursor.checkpoint_stage == WorkerStage::Execute)
+                    .unwrap_or(WorkerExecutionCheckpointCursor {
+                        checkpoint_stage: WorkerStage::Execute,
+                        next_step_index: 0,
+                        checkpoint_at: UtcMillis::now(),
+                        resume_mode: WorkerCheckpointResumeMode::StageRestart,
+                        resume_token: None,
+                    });
+                let mut tool_invocations = Vec::new();
+                let mut skill_dispatches = Vec::new();
+                let mut final_report: Option<WorkerExecutionFinalReport> = None;
 
-                for invocation in &trace.tool_invocations {
-                    let _ = self.runtime.observe_tool_invocation(
-                        &invocation.worker_id,
-                        invocation.tool_call_id.clone(),
-                        invocation.tool_name.clone(),
-                        invocation.status,
+                while checkpoint_cursor.next_step_index < intent.steps.len() {
+                    let progress = self
+                        .execute_single_step(&intent, &checkpoint_cursor)
+                        .unwrap_or_else(|error| WorkerExecutionProgress {
+                            trace: WorkerExecutionTrace {
+                                worker_id: intent.worker_id.clone(),
+                                task_id: intent.task_id.clone(),
+                                tool_invocations: Vec::new(),
+                                skill_dispatches: Vec::new(),
+                                final_report: WorkerExecutionFinalReport {
+                                    summary: format!(
+                                        "external executor failed [{}]: {}",
+                                        error.layer.label(),
+                                        error.message
+                                    ),
+                                    result_kind: Some(TaskResultKind::Failure),
+                                    termination_reason: Some(TerminationReason::Failed),
+                                    verification_status: VerificationStatus::Failed,
+                                },
+                            },
+                            next_step_index: checkpoint_cursor.next_step_index,
+                            completed: true,
+                            checkpoint_cursor: Some(checkpoint_cursor.clone()),
+                        });
+
+                    for invocation in &progress.trace.tool_invocations {
+                        let _ = self.runtime.observe_tool_invocation(
+                            &invocation.worker_id,
+                            invocation.tool_call_id.clone(),
+                            invocation.tool_name.clone(),
+                            invocation.status,
+                        );
+                    }
+                    for observation in &progress.trace.skill_dispatches {
+                        let _ = self
+                            .runtime
+                            .observe_skill_dispatch(&worker_id, observation.clone());
+                    }
+
+                    tool_invocations.extend(progress.trace.tool_invocations.clone());
+                    skill_dispatches.extend(progress.trace.skill_dispatches.clone());
+                    final_report = Some(progress.trace.final_report.clone());
+
+                    let Some(next_cursor) = progress.checkpoint_cursor.clone() else {
+                        break;
+                    };
+                    checkpoint_cursor = next_cursor;
+                    if progress.completed {
+                        break;
+                    }
+                    self.runtime.record_branch_checkpoint(
+                        &task_id,
+                        &worker_id,
+                        WorkerStage::Execute,
+                        None,
+                        Some(format!("worker-intent-{}", intent.task_id)),
+                        Some(intent.execution_profile.binding_lifecycle),
+                        Some(checkpoint_cursor.clone()),
                     );
                 }
-                for observation in &trace.skill_dispatches {
-                    let _ = self.runtime.observe_skill_dispatch(&worker_id, observation.clone());
-                }
+
+                let trace = WorkerExecutionTrace {
+                    worker_id: intent.worker_id.clone(),
+                    task_id: intent.task_id.clone(),
+                    tool_invocations,
+                    skill_dispatches,
+                    final_report: final_report.unwrap_or_else(|| WorkerExecutionFinalReport {
+                        summary: "worker execution ended without final report".to_string(),
+                        result_kind: Some(TaskResultKind::Failure),
+                        termination_reason: Some(TerminationReason::Failed),
+                        verification_status: VerificationStatus::Failed,
+                    }),
+                };
 
                 let final_status = match (
                     trace.final_report.result_kind,
@@ -338,8 +395,12 @@ impl WorkerRuntimeLoop {
             WorkerLoopAction::Review { worker_id, summary } => {
                 let task_id = self.runtime.current_task_id(&worker_id);
                 let executor_request = task_id.as_ref().and_then(|task_id| {
-                    self.runtime
-                        .executor_request_for(&worker_id, task_id, WorkerStage::Review, "review")
+                    self.runtime.executor_request_for(
+                        &worker_id,
+                        task_id,
+                        WorkerStage::Review,
+                        "review",
+                    )
                 });
                 let executor_probe = self.runtime.executor_probe_for(executor_request.as_ref());
                 let _ = self.runtime.observe_executor_probe(
@@ -408,8 +469,12 @@ impl WorkerRuntimeLoop {
             } => {
                 let task_id = self.runtime.current_task_id(&worker_id);
                 let executor_request = task_id.as_ref().and_then(|task_id| {
-                    self.runtime
-                        .executor_request_for(&worker_id, task_id, WorkerStage::Verify, "verify")
+                    self.runtime.executor_request_for(
+                        &worker_id,
+                        task_id,
+                        WorkerStage::Verify,
+                        "verify",
+                    )
                 });
                 let executor_probe = self.runtime.executor_probe_for(executor_request.as_ref());
                 let _ = self.runtime.observe_executor_probe(
@@ -460,9 +525,9 @@ impl WorkerRuntimeLoop {
                         "worker missing current task or not registered",
                     );
                 }
-                let report = self
-                    .runtime
-                    .record_verification(&worker_id, verification_status, summary);
+                let report =
+                    self.runtime
+                        .record_verification(&worker_id, verification_status, summary);
                 self.outcome(
                     sequence,
                     action,
@@ -476,8 +541,12 @@ impl WorkerRuntimeLoop {
             WorkerLoopAction::Repair { worker_id, summary } => {
                 let task_id = self.runtime.current_task_id(&worker_id);
                 let executor_request = task_id.as_ref().and_then(|task_id| {
-                    self.runtime
-                        .executor_request_for(&worker_id, task_id, WorkerStage::Repair, "repair")
+                    self.runtime.executor_request_for(
+                        &worker_id,
+                        task_id,
+                        WorkerStage::Repair,
+                        "repair",
+                    )
                 });
                 let executor_probe = self.runtime.executor_probe_for(executor_request.as_ref());
                 let _ = self.runtime.observe_executor_probe(
@@ -626,9 +695,9 @@ impl WorkerRuntimeLoop {
                     .as_ref()
                     .and_then(|record| record.current_task_id.clone())
                     .expect("finished worker should retain task id");
-                let report = self
-                    .runtime
-                    .latest_report_for(&worker_id, &task_id, WorkerStage::Finish);
+                let report =
+                    self.runtime
+                        .latest_report_for(&worker_id, &task_id, WorkerStage::Finish);
                 self.outcome(
                     sequence,
                     action,
@@ -654,9 +723,9 @@ impl WorkerRuntimeLoop {
                     .as_ref()
                     .and_then(|record| record.current_task_id.clone())
                     .expect("failed worker should retain task id");
-                let report = self
-                    .runtime
-                    .latest_report_for(&worker_id, &task_id, WorkerStage::Finish);
+                let report =
+                    self.runtime
+                        .latest_report_for(&worker_id, &task_id, WorkerStage::Finish);
                 self.outcome(
                     sequence,
                     action,
@@ -670,14 +739,31 @@ impl WorkerRuntimeLoop {
         }
     }
 
-    fn execute_intent_with_drivers(&self, intent: &WorkerExecutionIntent) -> Option<WorkerExecutionTrace> {
-        let tool_registry = self.tool_registry.as_ref()?;
-        let skill_dispatch_runtime = self.skill_dispatch_runtime.as_ref()?;
-        Some(execute_intent_with_drivers(
-            intent,
-            tool_registry,
-            skill_dispatch_runtime,
-        ))
+    fn execute_single_step(
+        &self,
+        intent: &WorkerExecutionIntent,
+        checkpoint_cursor: &WorkerExecutionCheckpointCursor,
+    ) -> Result<WorkerExecutionProgress, WorkerExecutorFailure> {
+        if let (Some(tool_registry), Some(skill_dispatch_runtime)) = (
+            self.tool_registry.as_ref(),
+            self.skill_dispatch_runtime.as_ref(),
+        ) {
+            let (trace, next_cursor, completed) = execute_intent_step_with_drivers(
+                intent,
+                checkpoint_cursor.next_step_index,
+                tool_registry,
+                skill_dispatch_runtime,
+            )?;
+            return Ok(WorkerExecutionProgress {
+                trace,
+                next_step_index: next_cursor.next_step_index,
+                completed,
+                checkpoint_cursor: Some(next_cursor),
+            });
+        }
+        self.runtime
+            .executor()
+            .execute_from_checkpoint(intent, Some(checkpoint_cursor))
     }
 
     fn outcome(

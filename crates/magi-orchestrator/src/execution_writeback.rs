@@ -55,9 +55,7 @@ impl ExecutionWritebackPlans {
         }
     }
 
-    pub fn from_optional_memory_extraction(
-        request: Option<MemoryExtractionApplyRequest>,
-    ) -> Self {
+    pub fn from_optional_memory_extraction(request: Option<MemoryExtractionApplyRequest>) -> Self {
         let plans = request
             .into_iter()
             .map(ExecutionWritebackPlan::MemoryExtraction)
@@ -65,7 +63,7 @@ impl ExecutionWritebackPlans {
         Self { plans }
     }
 
-    pub fn from_recovery_resume_input(input: &RecoveryResumeInput) -> Self {
+    pub fn from_continue_checkpoint_input(input: &RecoveryResumeInput) -> Self {
         let Some(session_id) = input.ownership.session_id.clone() else {
             return Self::default();
         };
@@ -81,15 +79,15 @@ impl ExecutionWritebackPlans {
         Self {
             plans: vec![ExecutionWritebackPlan::MemoryExtraction(
                 MemoryExtractionApplyRequest {
-                    extraction_id: format!("extract-recovery-{}", input.recovery_id),
+                    extraction_id: format!("extract-session-continue-{}", input.recovery_id),
                     session_id,
                     source_ref: Some(format!(
-                        "recovery://{}/snapshot/{}",
+                        "session-continue://{}/snapshot/{}",
                         input.recovery_id, input.snapshot_id
                     )),
-                    summary: "recovery.resume diagnostic extraction".to_string(),
+                    summary: "session.continue checkpoint diagnostic extraction".to_string(),
                     memories: vec![ExtractedMemory {
-                        memory_id: format!("mem-recovery-{}", input.recovery_id),
+                        memory_id: format!("mem-session-continue-{}", input.recovery_id),
                         layer: MemoryLayer::Durable,
                         content: diagnostic_summary.to_string(),
                         created_at: input.updated_at,
@@ -129,7 +127,9 @@ fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {
 mod tests {
     use super::{DispatchMemoryExtractionInput, ExecutionWritebackPlans};
     use magi_core::{ExecutionOwnership, RecoveryResumeInput, SessionId, UtcMillis, WorkspaceId};
-    use magi_memory_store::{ExtractedMemory, MemoryExtractionApplyRequest, MemoryLayer, MemoryStore};
+    use magi_memory_store::{
+        ExtractedMemory, MemoryExtractionApplyRequest, MemoryLayer, MemoryStore,
+    };
 
     #[test]
     fn empty_writeback_plan_is_noop() {
@@ -137,9 +137,11 @@ mod tests {
 
         ExecutionWritebackPlans::default().apply(&store);
 
-        assert!(store
-            .extraction_results_for_session(&SessionId::new("session-1"))
-            .is_empty());
+        assert!(
+            store
+                .extraction_results_for_session(&SessionId::new("session-1"))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -195,8 +197,14 @@ mod tests {
             linkage.extraction.source_ref.as_deref(),
             Some("timeline://timeline-1")
         );
-        assert_eq!(linkage.extraction.summary, "session.action shadow extraction");
-        assert_eq!(linkage.produced_records[0].memory_id, "mem-session-action-42");
+        assert_eq!(
+            linkage.extraction.summary,
+            "session.action shadow extraction"
+        );
+        assert_eq!(
+            linkage.produced_records[0].memory_id,
+            "mem-session-action-42"
+        );
         assert_eq!(
             linkage.produced_records[0].content,
             "hello world\nskill:refactor\nmode:deep_task"
@@ -218,13 +226,17 @@ mod tests {
         })
         .apply(&store);
 
-        assert!(store.extraction_linkage("extract-session-action-7").is_none());
+        assert!(
+            store
+                .extraction_linkage("extract-session-action-7")
+                .is_none()
+        );
     }
 
     #[test]
-    fn recovery_resume_input_builds_recovery_memory_extraction_plan() {
+    fn continue_checkpoint_input_builds_session_continue_memory_extraction_plan() {
         let store = MemoryStore::new();
-        let plans = ExecutionWritebackPlans::from_recovery_resume_input(&RecoveryResumeInput {
+        let plans = ExecutionWritebackPlans::from_continue_checkpoint_input(&RecoveryResumeInput {
             recovery_id: "recovery-1".to_string(),
             snapshot_id: "snapshot-1".to_string(),
             ownership: ExecutionOwnership {
@@ -240,23 +252,26 @@ mod tests {
         plans.apply(&store);
 
         let verification = store
-            .verify_extraction_linkage("extract-recovery-recovery-1")
-            .expect("recovery writeback plan should persist extraction linkage");
+            .verify_extraction_linkage("extract-session-continue-recovery-1")
+            .expect("session continue writeback plan should persist extraction linkage");
         assert!(verification.is_consistent);
         let linkage = store
-            .extraction_linkage("extract-recovery-recovery-1")
-            .expect("recovery extraction linkage should exist");
+            .extraction_linkage("extract-session-continue-recovery-1")
+            .expect("session continue extraction linkage should exist");
         assert_eq!(
             linkage.extraction.source_ref.as_deref(),
-            Some("recovery://recovery-1/snapshot/snapshot-1")
+            Some("session-continue://recovery-1/snapshot/snapshot-1")
         );
-        assert_eq!(linkage.produced_records[0].content, "resume parser after crash");
+        assert_eq!(
+            linkage.produced_records[0].content,
+            "resume parser after crash"
+        );
     }
 
     #[test]
-    fn recovery_resume_input_without_session_or_diagnostic_skips_writeback_plan() {
+    fn continue_checkpoint_input_without_session_or_diagnostic_skips_writeback_plan() {
         let store = MemoryStore::new();
-        ExecutionWritebackPlans::from_recovery_resume_input(&RecoveryResumeInput {
+        ExecutionWritebackPlans::from_continue_checkpoint_input(&RecoveryResumeInput {
             recovery_id: "recovery-blank".to_string(),
             snapshot_id: "snapshot-blank".to_string(),
             ownership: ExecutionOwnership::default(),
@@ -266,6 +281,10 @@ mod tests {
         })
         .apply(&store);
 
-        assert!(store.extraction_linkage("extract-recovery-recovery-blank").is_none());
+        assert!(
+            store
+                .extraction_linkage("extract-session-continue-recovery-blank")
+                .is_none()
+        );
     }
 }

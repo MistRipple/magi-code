@@ -87,17 +87,11 @@ pub enum AgentErrorCode {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientToAgentMessage {
     #[serde(rename = "agent.handshake.request")]
-    HandshakeRequest {
-        identity: AgentClientIdentity,
-    },
+    HandshakeRequest { identity: AgentClientIdentity },
     #[serde(rename = "agent.workspace.bind")]
-    BindWorkspace {
-        workspace: AgentWorkspaceBinding,
-    },
+    BindWorkspace { workspace: AgentWorkspaceBinding },
     #[serde(rename = "agent.session.attach")]
-    AttachSession {
-        session: AgentSessionBinding,
-    },
+    AttachSession { session: AgentSessionBinding },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -109,13 +103,9 @@ pub enum AgentToClientMessage {
         capabilities: AgentCapabilities,
     },
     #[serde(rename = "agent.workspace.bound")]
-    WorkspaceBound {
-        workspace: AgentWorkspaceBinding,
-    },
+    WorkspaceBound { workspace: AgentWorkspaceBinding },
     #[serde(rename = "agent.session.attached")]
-    SessionAttached {
-        session: AgentSessionBinding,
-    },
+    SessionAttached { session: AgentSessionBinding },
     #[serde(rename = "agent.runtime.event")]
     RuntimeEvent {
         workspace_id: String,
@@ -123,9 +113,7 @@ pub enum AgentToClientMessage {
         payload: serde_json::Value,
     },
     #[serde(rename = "agent.disconnect")]
-    Disconnect {
-        reason: DisconnectReason,
-    },
+    Disconnect { reason: DisconnectReason },
     #[serde(rename = "agent.error")]
     Error {
         code: AgentErrorCode,

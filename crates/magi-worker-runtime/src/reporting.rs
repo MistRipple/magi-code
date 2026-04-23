@@ -1,8 +1,6 @@
-use crate::{
-    EventCategory, EventContext, WorkerRecord, WorkerRuntime, WorkerStage,
-};
+use crate::{EventCategory, EventContext, WorkerRecord, WorkerRuntime, WorkerStage};
 use magi_core::{
-    ExecutionResultStatus, TaskResultKind, TerminationReason, TaskId, ToolCallId, UtcMillis,
+    ExecutionResultStatus, TaskId, TaskResultKind, TerminationReason, ToolCallId, UtcMillis,
     VerificationStatus, WorkerId, WorkerLifecycleStatus,
 };
 use magi_skill_runtime::{SkillDispatchObservation, SkillDispatchRoute, SkillDispatchStatus};
@@ -62,11 +60,7 @@ pub struct SkillDispatchSummary {
 }
 
 impl WorkerRuntime {
-    pub fn finish(
-        &self,
-        worker_id: &WorkerId,
-        summary: impl Into<String>,
-    ) -> Option<WorkerRecord> {
+    pub fn finish(&self, worker_id: &WorkerId, summary: impl Into<String>) -> Option<WorkerRecord> {
         let task_id = self.current_task_id(worker_id)?;
         let worker = self.transition(
             worker_id,
@@ -86,11 +80,7 @@ impl WorkerRuntime {
         Some(worker)
     }
 
-    pub fn fail(
-        &self,
-        worker_id: &WorkerId,
-        summary: impl Into<String>,
-    ) -> Option<WorkerRecord> {
+    pub fn fail(&self, worker_id: &WorkerId, summary: impl Into<String>) -> Option<WorkerRecord> {
         let task_id = self.current_task_id(worker_id)?;
         let worker = self.transition(
             worker_id,
@@ -313,7 +303,9 @@ impl WorkerRuntime {
             .iter()
             .rev()
             .find(|report| {
-                &report.worker_id == worker_id && &report.task_id == task_id && report.stage == stage
+                &report.worker_id == worker_id
+                    && &report.task_id == task_id
+                    && report.stage == stage
             })
             .cloned()
     }

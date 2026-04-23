@@ -4,13 +4,13 @@ mod routing;
 mod validation;
 
 use magi_bridge_client::{
-    BridgeBindingDispatchPlan, BridgeBindingKind, BridgeDispatchAction, BridgeClientError,
+    BridgeBindingDispatchPlan, BridgeBindingKind, BridgeClientError, BridgeDispatchAction,
     BridgeDispatchResult, BridgeDispatchRuntime, BridgeErrorLayer,
 };
+use magi_core::{ApprovalRequirement, RiskLevel, ToolCallId};
 use magi_tool_runtime::{
     ToolExecutionContext, ToolExecutionOutput, ToolExecutionPolicy, ToolRegistry,
 };
-use magi_core::{ApprovalRequirement, RiskLevel, ToolCallId};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -126,12 +126,8 @@ pub struct SkillDispatchInput {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SkillDispatchResult {
-    Builtin {
-        output: ToolExecutionOutput,
-    },
-    Bridge {
-        output: BridgeDispatchResult,
-    },
+    Builtin { output: ToolExecutionOutput },
+    Bridge { output: BridgeDispatchResult },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -157,9 +153,17 @@ pub struct SkillDispatchExecutionOutcome {
 
 #[derive(Debug)]
 pub enum SkillDispatchError {
-    UnknownRequestedTool { tool_name: String },
-    AmbiguousBridgeBinding { tool_name: String, binding_ids: Vec<String> },
-    MissingBridgeBinding { tool_name: String, binding_id: String },
+    UnknownRequestedTool {
+        tool_name: String,
+    },
+    AmbiguousBridgeBinding {
+        tool_name: String,
+        binding_ids: Vec<String>,
+    },
+    MissingBridgeBinding {
+        tool_name: String,
+        binding_id: String,
+    },
     Bridge(BridgeClientError),
 }
 
@@ -185,7 +189,10 @@ impl SkillRegistry {
     }
 
     pub fn clear(&self) {
-        self.skills.write().expect("skill registry write lock poisoned").clear();
+        self.skills
+            .write()
+            .expect("skill registry write lock poisoned")
+            .clear();
     }
 
     pub fn register(&self, skill: SkillDefinition) {
@@ -420,10 +427,7 @@ impl SkillDispatchError {
             Self::MissingBridgeBinding {
                 tool_name,
                 binding_id,
-            } => format!(
-                "missing bridge binding for {}: {}",
-                tool_name, binding_id
-            ),
+            } => format!("missing bridge binding for {}: {}", tool_name, binding_id),
             Self::Bridge(error) => error.to_string(),
         }
     }
@@ -696,7 +700,10 @@ mod tests {
         );
 
         assert_eq!(outcome.observation.status, SkillDispatchStatus::Rejected);
-        assert_eq!(outcome.observation.error_kind, Some(SkillDispatchErrorKind::BridgeError));
+        assert_eq!(
+            outcome.observation.error_kind,
+            Some(SkillDispatchErrorKind::BridgeError)
+        );
         assert!(outcome.observation.bridge_error_layer.is_none());
         assert!(matches!(
             outcome.result,
@@ -757,16 +764,21 @@ mod tests {
         );
 
         assert_eq!(outcome.observation.status, SkillDispatchStatus::Failed);
-        assert_eq!(outcome.observation.error_kind, Some(SkillDispatchErrorKind::BridgeError));
+        assert_eq!(
+            outcome.observation.error_kind,
+            Some(SkillDispatchErrorKind::BridgeError)
+        );
         assert_eq!(
             outcome.observation.bridge_error_layer,
             Some(magi_bridge_client::BridgeErrorLayer::RemoteBusiness)
         );
-        assert!(outcome
-            .observation
-            .bridge_error_message
-            .as_deref()
-            .is_some_and(|message| message.contains("remote denied")));
+        assert!(
+            outcome
+                .observation
+                .bridge_error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("remote denied"))
+        );
         assert!(matches!(
             outcome.result,
             Err(SkillDispatchError::Bridge(
@@ -903,10 +915,7 @@ mod tests {
             outcome.observation.error_kind,
             Some(SkillDispatchErrorKind::AmbiguousBridgeBinding)
         );
-        assert_eq!(
-            outcome.observation.route,
-            Some(SkillDispatchRoute::Bridge)
-        );
+        assert_eq!(outcome.observation.route, Some(SkillDispatchRoute::Bridge));
         assert!(matches!(
             outcome.result,
             Err(SkillDispatchError::AmbiguousBridgeBinding { ref binding_ids, .. })
@@ -1037,8 +1046,7 @@ mod tests {
             .recent_events
             .iter()
             .filter(|e| {
-                e.category == magi_event_bus::EventCategory::Audit
-                    && e.event_type == "tool.invoked"
+                e.category == magi_event_bus::EventCategory::Audit && e.event_type == "tool.invoked"
             })
             .collect();
         assert_eq!(audit_events.len(), 1, "one audit event");
@@ -1098,11 +1106,16 @@ mod tests {
         });
 
         // Verify routing summary
-        assert!(plan.routing.requested_builtin_tools.contains(&"file_read".to_string()));
-        assert!(plan
-            .routing
-            .requested_bridge_tool_names
-            .contains(&"model.prompt".to_string()));
+        assert!(
+            plan.routing
+                .requested_builtin_tools
+                .contains(&"file_read".to_string())
+        );
+        assert!(
+            plan.routing
+                .requested_bridge_tool_names
+                .contains(&"model.prompt".to_string())
+        );
 
         // Dispatch builtin
         let builtin_outcome = runtime.dispatch_observed(
@@ -1183,8 +1196,7 @@ mod tests {
             .recent_events
             .iter()
             .filter(|e| {
-                e.category == magi_event_bus::EventCategory::Audit
-                    && e.event_type == "tool.invoked"
+                e.category == magi_event_bus::EventCategory::Audit && e.event_type == "tool.invoked"
             })
             .count();
         assert_eq!(audit_count, 1, "only builtin dispatches emit tool.invoked");

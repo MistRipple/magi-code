@@ -23,7 +23,10 @@ fn root_exports_remain_usable() {
         resume.ownership.session_id.as_ref().map(SessionId::as_str),
         Some("session-1")
     );
-    assert!(matches!(DispatchReason::ManualResume, DispatchReason::ManualResume));
+    assert!(matches!(
+        DispatchReason::ManualResume,
+        DispatchReason::ManualResume
+    ));
 }
 
 #[test]

@@ -1,13 +1,13 @@
 use crate::{
-    AuditUsageLedgerSnapshot, AuditUsageLedgerError, AuditUsageLedgerStatus, EventEnvelope,
+    AuditUsageLedgerError, AuditUsageLedgerSnapshot, AuditUsageLedgerStatus, EventEnvelope,
     EventStreamSnapshot, RecoveryReadModelInput, RuntimeLedgerSummary, RuntimeReadModelInput,
 };
 use magi_core::UtcMillis;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc, RwLock,
-};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 use thiserror::Error;
 use tokio::sync::broadcast;
 
@@ -65,7 +65,10 @@ impl InMemoryEventBus {
                 .expect("event bus audit/usage ledger write lock poisoned");
             ledger.record_event(&event);
         }
-        if matches!(event.category, crate::EventCategory::Audit | crate::EventCategory::Usage) {
+        if matches!(
+            event.category,
+            crate::EventCategory::Audit | crate::EventCategory::Usage
+        ) {
             self.mark_audit_usage_ledger_dirty();
         }
         self.refresh_audit_usage_ledger_persistence_if_configured();
@@ -150,10 +153,7 @@ impl InMemoryEventBus {
         self.audit_usage_ledger_snapshot().export_json()
     }
 
-    pub fn import_audit_usage_ledger_json(
-        &self,
-        value: &str,
-    ) -> Result<(), AuditUsageLedgerError> {
+    pub fn import_audit_usage_ledger_json(&self, value: &str) -> Result<(), AuditUsageLedgerError> {
         let snapshot = AuditUsageLedgerSnapshot::import_json(value)?;
         let mut ledger = self
             .audit_usage_ledger
@@ -165,10 +165,7 @@ impl InMemoryEventBus {
         Ok(())
     }
 
-    pub fn import_audit_usage_ledger_snapshot(
-        &self,
-        snapshot: AuditUsageLedgerSnapshot,
-    ) {
+    pub fn import_audit_usage_ledger_snapshot(&self, snapshot: AuditUsageLedgerSnapshot) {
         let mut ledger = self
             .audit_usage_ledger
             .write()
@@ -179,20 +176,19 @@ impl InMemoryEventBus {
     }
 
     pub fn reset_audit_usage_ledger(&self) {
-        let mut ledger = self
-            .audit_usage_ledger
-            .write()
-            .expect("event bus audit/usage ledger write lock poisoned");
-        *ledger = AuditUsageLedgerSnapshot::default();
+        {
+            let mut ledger = self
+                .audit_usage_ledger
+                .write()
+                .expect("event bus audit/usage ledger write lock poisoned");
+            *ledger = AuditUsageLedgerSnapshot::default();
+        }
         self.clear_audit_usage_ledger_error();
         self.mark_audit_usage_ledger_dirty();
         self.refresh_audit_usage_ledger_persistence_if_configured();
     }
 
-    pub fn set_audit_usage_ledger_persistence(
-        &self,
-        path: impl Into<PathBuf>,
-    ) {
+    pub fn set_audit_usage_ledger_persistence(&self, path: impl Into<PathBuf>) {
         let mut target = self
             .audit_usage_ledger_path
             .write()
@@ -200,9 +196,7 @@ impl InMemoryEventBus {
         *target = Some(path.into());
     }
 
-    pub fn refresh_audit_usage_ledger_persistence(
-        &self,
-    ) -> Result<(), AuditUsageLedgerError> {
+    pub fn refresh_audit_usage_ledger_persistence(&self) -> Result<(), AuditUsageLedgerError> {
         match self.persist_audit_usage_ledger_if_configured() {
             Ok(()) => Ok(()),
             Err(error) => Err(error),
@@ -308,21 +302,31 @@ mod tests {
 
     fn event(category: EventCategory, event_type: &str, sequence: u64) -> EventEnvelope {
         let mut event = match category {
-            EventCategory::Domain => {
-                EventEnvelope::domain(EventId::new(format!("e-{sequence}")), event_type, json!({"sequence": sequence}))
-            }
-            EventCategory::Audit => {
-                EventEnvelope::audit(EventId::new(format!("e-{sequence}")), event_type, json!({"sequence": sequence}))
-            }
-            EventCategory::Usage => {
-                EventEnvelope::usage(EventId::new(format!("e-{sequence}")), event_type, json!({"sequence": sequence}))
-            }
-            EventCategory::Projection => {
-                EventEnvelope::projection(EventId::new(format!("e-{sequence}")), event_type, json!({"sequence": sequence}))
-            }
-            EventCategory::System => {
-                EventEnvelope::system(EventId::new(format!("e-{sequence}")), event_type, json!({"sequence": sequence}))
-            }
+            EventCategory::Domain => EventEnvelope::domain(
+                EventId::new(format!("e-{sequence}")),
+                event_type,
+                json!({"sequence": sequence}),
+            ),
+            EventCategory::Audit => EventEnvelope::audit(
+                EventId::new(format!("e-{sequence}")),
+                event_type,
+                json!({"sequence": sequence}),
+            ),
+            EventCategory::Usage => EventEnvelope::usage(
+                EventId::new(format!("e-{sequence}")),
+                event_type,
+                json!({"sequence": sequence}),
+            ),
+            EventCategory::Projection => EventEnvelope::projection(
+                EventId::new(format!("e-{sequence}")),
+                event_type,
+                json!({"sequence": sequence}),
+            ),
+            EventCategory::System => EventEnvelope::system(
+                EventId::new(format!("e-{sequence}")),
+                event_type,
+                json!({"sequence": sequence}),
+            ),
         };
         event.sequence = sequence;
         event
@@ -378,8 +382,14 @@ mod tests {
         assert_eq!(runtime_ledger.readiness.blocking_issue_count, 0);
         assert!(runtime_ledger.cutover_readiness.is_ready);
         assert_eq!(runtime_ledger.cutover_readiness.blocking_issue_count, 0);
-        assert_eq!(read_model.meta.ledger.is_persist_healthy, runtime_ledger.is_persist_healthy);
-        assert_eq!(read_model.meta.ledger.pending_flush, runtime_ledger.pending_flush);
+        assert_eq!(
+            read_model.meta.ledger.is_persist_healthy,
+            runtime_ledger.is_persist_healthy
+        );
+        assert_eq!(
+            read_model.meta.ledger.pending_flush,
+            runtime_ledger.pending_flush
+        );
         assert_eq!(
             read_model.meta.ledger.last_persisted_at,
             runtime_ledger.last_persisted_at
@@ -418,21 +428,33 @@ mod tests {
         assert!(runtime_ledger.pending_flush);
         assert!(runtime_ledger.last_persisted_at.is_none());
         assert!(!runtime_ledger.readiness.is_ready);
-        assert!(runtime_ledger
-            .readiness
-            .blocking_issues
-            .contains(&"ledger persistence is unhealthy".to_string()));
+        assert!(
+            runtime_ledger
+                .readiness
+                .blocking_issues
+                .contains(&"ledger persistence is unhealthy".to_string())
+        );
         assert!(!runtime_ledger.cutover_readiness.is_ready);
-        assert!(runtime_ledger
-            .cutover_readiness
-            .blocking_issues
-            .contains(&"ledger has pending flush".to_string()));
-        assert!(runtime_ledger
-            .cutover_readiness
-            .blocking_issues
-            .contains(&"ledger has not been persisted yet".to_string()));
-        assert_eq!(read_model.meta.ledger.is_persist_healthy, runtime_ledger.is_persist_healthy);
-        assert_eq!(read_model.meta.ledger.pending_flush, runtime_ledger.pending_flush);
+        assert!(
+            runtime_ledger
+                .cutover_readiness
+                .blocking_issues
+                .contains(&"ledger has pending flush".to_string())
+        );
+        assert!(
+            runtime_ledger
+                .cutover_readiness
+                .blocking_issues
+                .contains(&"ledger has not been persisted yet".to_string())
+        );
+        assert_eq!(
+            read_model.meta.ledger.is_persist_healthy,
+            runtime_ledger.is_persist_healthy
+        );
+        assert_eq!(
+            read_model.meta.ledger.pending_flush,
+            runtime_ledger.pending_flush
+        );
         assert_eq!(
             read_model.meta.ledger.last_persisted_at,
             runtime_ledger.last_persisted_at
@@ -446,7 +468,11 @@ mod tests {
             runtime_ledger.cutover_readiness.is_ready
         );
         assert_eq!(
-            read_model.meta.ledger.cutover_readiness.blocking_issue_count,
+            read_model
+                .meta
+                .ledger
+                .cutover_readiness
+                .blocking_issue_count,
             runtime_ledger.cutover_readiness.blocking_issue_count
         );
     }
@@ -486,11 +512,26 @@ mod tests {
                 .map(|path| path.display().to_string())
         );
         assert_eq!(runtime_ledger.last_persist_error, status.last_persist_error);
-        assert_eq!(runtime_ledger.is_persist_healthy, status.last_persist_error.is_none());
-        assert_eq!(read_model.meta.ledger.schema_version, runtime_ledger.schema_version);
-        assert_eq!(read_model.meta.ledger.audit_count, runtime_ledger.audit_count);
-        assert_eq!(read_model.meta.ledger.usage_count, runtime_ledger.usage_count);
-        assert_eq!(read_model.meta.ledger.next_sequence, runtime_ledger.next_sequence);
+        assert_eq!(
+            runtime_ledger.is_persist_healthy,
+            status.last_persist_error.is_none()
+        );
+        assert_eq!(
+            read_model.meta.ledger.schema_version,
+            runtime_ledger.schema_version
+        );
+        assert_eq!(
+            read_model.meta.ledger.audit_count,
+            runtime_ledger.audit_count
+        );
+        assert_eq!(
+            read_model.meta.ledger.usage_count,
+            runtime_ledger.usage_count
+        );
+        assert_eq!(
+            read_model.meta.ledger.next_sequence,
+            runtime_ledger.next_sequence
+        );
         assert_eq!(
             read_model.meta.ledger.persistence_path,
             runtime_ledger.persistence_path
@@ -524,7 +565,11 @@ mod tests {
             runtime_ledger.cutover_readiness.is_ready
         );
         assert_eq!(
-            read_model.meta.ledger.cutover_readiness.blocking_issue_count,
+            read_model
+                .meta
+                .ledger
+                .cutover_readiness
+                .blocking_issue_count,
             runtime_ledger.cutover_readiness.blocking_issue_count
         );
     }
@@ -566,7 +611,10 @@ mod tests {
             read_model.meta.maintenance.mode_reason.as_deref(),
             Some("cutover readiness probe")
         );
-        assert_eq!(read_model.meta.maintenance.last_tick_at, Some(magi_core::UtcMillis(123456)));
+        assert_eq!(
+            read_model.meta.maintenance.last_tick_at,
+            Some(magi_core::UtcMillis(123456))
+        );
         assert_eq!(
             read_model.meta.maintenance.last_sidecar_outcome.as_deref(),
             Some("due-and-flushed")
@@ -719,28 +767,25 @@ mod tests {
             Some("persistent")
         );
         assert_eq!(
-            read_model.details.workers[0].executor_lease_state.as_deref(),
+            read_model.details.workers[0]
+                .executor_lease_state
+                .as_deref(),
             Some("active")
         );
         assert_eq!(
-            read_model
-                .details
-                .workers[0]
+            read_model.details.workers[0]
                 .executor_binding_lifecycle
                 .as_deref(),
             Some("bound")
         );
         assert_eq!(
-            read_model
-                .details
-                .workers[0]
+            read_model.details.workers[0]
                 .executor_process_lifecycle
                 .as_deref(),
             Some("persistent")
         );
         assert_eq!(
-            read_model.details.workers[0]
-                .executor_supported_step_kinds,
+            read_model.details.workers[0].executor_supported_step_kinds,
             vec![
                 "builtin-tool-invocation".to_string(),
                 "final-report".to_string(),
@@ -800,13 +845,19 @@ mod tests {
 
         let read_model = bus.runtime_read_model_input();
         assert_eq!(read_model.overview.diagnostics.degraded_executor_count, 1);
-        assert_eq!(read_model.overview.diagnostics.unavailable_executor_count, 1);
+        assert_eq!(
+            read_model.overview.diagnostics.unavailable_executor_count,
+            1
+        );
         assert_eq!(
             read_model.operations.attention.degraded_executor_worker_ids,
             vec!["worker-shadow-1".to_string()]
         );
         assert_eq!(
-            read_model.operations.attention.unavailable_executor_worker_ids,
+            read_model
+                .operations
+                .attention
+                .unavailable_executor_worker_ids,
             vec!["worker-shadow-2".to_string()]
         );
         assert!(!read_model.meta.executor.is_ready);
@@ -861,7 +912,11 @@ mod tests {
         assert!(read_model.meta.executor.is_ready);
         assert!(!read_model.meta.executor.is_cutover_candidate);
         assert_eq!(
-            read_model.meta.executor.requested_process_lifecycle.as_deref(),
+            read_model
+                .meta
+                .executor
+                .requested_process_lifecycle
+                .as_deref(),
             Some("one-shot")
         );
         assert_eq!(
@@ -919,17 +974,21 @@ mod tests {
         let read_model = bus.runtime_read_model_input();
         assert!(!read_model.meta.executor.is_ready);
         assert!(!read_model.meta.executor.is_cutover_candidate);
-        assert!(read_model
-            .meta
-            .executor
-            .blocking_issues
-            .iter()
-            .any(|issue| issue.contains("lease is not active")));
-        assert!(read_model
-            .meta
-            .executor
-            .blocking_issues
-            .iter()
-            .any(|issue| issue.contains("binding is not bound")));
+        assert!(
+            read_model
+                .meta
+                .executor
+                .blocking_issues
+                .iter()
+                .any(|issue| issue.contains("lease is not active"))
+        );
+        assert!(
+            read_model
+                .meta
+                .executor
+                .blocking_issues
+                .iter()
+                .any(|issue| issue.contains("binding is not bound"))
+        );
     }
 }

@@ -125,9 +125,9 @@ impl AutoLearningManager {
 
         self.raw_memories.push(raw.clone());
 
-        let _preference_result =
-            self.preference_miner
-                .mine_from_conversation(user_messages, assistant_messages);
+        let _preference_result = self
+            .preference_miner
+            .mine_from_conversation(user_messages, assistant_messages);
 
         raw
     }

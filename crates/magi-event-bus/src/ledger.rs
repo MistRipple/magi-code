@@ -1,7 +1,12 @@
 use crate::{EventCategory, EventContext, EventEnvelope};
 use magi_core::UtcMillis;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs, io::Write, path::{Path, PathBuf}};
+use std::{
+    collections::HashSet,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 use thiserror::Error;
 
 pub const AUDIT_USAGE_LEDGER_SCHEMA_VERSION: &str = "shadow-audit-usage-ledger-v1";
@@ -85,7 +90,10 @@ impl AuditUsageLedgerSnapshot {
             .map(|entry| entry.sequence)
             .max()
             .unwrap_or(0);
-        self.next_sequence = self.next_sequence.max(highest_sequence.saturating_add(1)).max(1);
+        self.next_sequence = self
+            .next_sequence
+            .max(highest_sequence.saturating_add(1))
+            .max(1);
         self
     }
 
@@ -207,11 +215,31 @@ mod tests {
 
     fn event(category: EventCategory, event_type: &str, sequence: u64) -> EventEnvelope {
         let mut event = match category {
-            EventCategory::Domain => EventEnvelope::domain(EventId::new(format!("e-{sequence}")), event_type, json!({"sequence": sequence})),
-            EventCategory::Audit => EventEnvelope::audit(EventId::new(format!("e-{sequence}")), event_type, json!({"sequence": sequence})),
-            EventCategory::Usage => EventEnvelope::usage(EventId::new(format!("e-{sequence}")), event_type, json!({"sequence": sequence})),
-            EventCategory::Projection => EventEnvelope::projection(EventId::new(format!("e-{sequence}")), event_type, json!({"sequence": sequence})),
-            EventCategory::System => EventEnvelope::system(EventId::new(format!("e-{sequence}")), event_type, json!({"sequence": sequence})),
+            EventCategory::Domain => EventEnvelope::domain(
+                EventId::new(format!("e-{sequence}")),
+                event_type,
+                json!({"sequence": sequence}),
+            ),
+            EventCategory::Audit => EventEnvelope::audit(
+                EventId::new(format!("e-{sequence}")),
+                event_type,
+                json!({"sequence": sequence}),
+            ),
+            EventCategory::Usage => EventEnvelope::usage(
+                EventId::new(format!("e-{sequence}")),
+                event_type,
+                json!({"sequence": sequence}),
+            ),
+            EventCategory::Projection => EventEnvelope::projection(
+                EventId::new(format!("e-{sequence}")),
+                event_type,
+                json!({"sequence": sequence}),
+            ),
+            EventCategory::System => EventEnvelope::system(
+                EventId::new(format!("e-{sequence}")),
+                event_type,
+                json!({"sequence": sequence}),
+            ),
         };
         event.sequence = sequence;
         event
@@ -228,8 +256,14 @@ mod tests {
         assert_eq!(snapshot.audit_count(), 1);
         assert_eq!(snapshot.usage_count(), 1);
         assert_eq!(snapshot.next_sequence, 4);
-        assert_eq!(snapshot.audit_entries[0].event_type, "ledger.audit.recorded");
-        assert_eq!(snapshot.usage_entries[0].event_type, "ledger.usage.recorded");
+        assert_eq!(
+            snapshot.audit_entries[0].event_type,
+            "ledger.audit.recorded"
+        );
+        assert_eq!(
+            snapshot.usage_entries[0].event_type,
+            "ledger.usage.recorded"
+        );
     }
 
     #[test]

@@ -28,37 +28,146 @@ pub struct FileTokenResult {
 fn is_code_stop_word(word: &str) -> bool {
     matches!(
         word,
-        "const" | "let" | "var" | "function" | "return" | "if" | "else"
-            | "for" | "while" | "do" | "switch" | "case" | "break" | "continue"
-            | "new" | "delete" | "typeof" | "instanceof" | "void" | "null"
-            | "undefined" | "true" | "false" | "try" | "catch" | "finally" | "throw"
-            | "yield" | "static" | "private" | "protected" | "public" | "readonly"
-            | "declare" | "module" | "require" | "from" | "as" | "default" | "super"
-            | "fn" | "pub" | "mut" | "ref" | "self" | "impl" | "mod" | "use"
-            | "crate" | "where" | "match" | "loop" | "move" | "unsafe"
-            | "def" | "elif" | "pass" | "with" | "lambda" | "nonlocal" | "global"
-            | "func" | "defer" | "go" | "select" | "chan" | "range"
+        "const"
+            | "let"
+            | "var"
+            | "function"
+            | "return"
+            | "if"
+            | "else"
+            | "for"
+            | "while"
+            | "do"
+            | "switch"
+            | "case"
+            | "break"
+            | "continue"
+            | "new"
+            | "delete"
+            | "typeof"
+            | "instanceof"
+            | "void"
+            | "null"
+            | "undefined"
+            | "true"
+            | "false"
+            | "try"
+            | "catch"
+            | "finally"
+            | "throw"
+            | "yield"
+            | "static"
+            | "private"
+            | "protected"
+            | "public"
+            | "readonly"
+            | "declare"
+            | "module"
+            | "require"
+            | "from"
+            | "as"
+            | "default"
+            | "super"
+            | "fn"
+            | "pub"
+            | "mut"
+            | "ref"
+            | "self"
+            | "impl"
+            | "mod"
+            | "use"
+            | "crate"
+            | "where"
+            | "match"
+            | "loop"
+            | "move"
+            | "unsafe"
+            | "def"
+            | "elif"
+            | "pass"
+            | "with"
+            | "lambda"
+            | "nonlocal"
+            | "global"
+            | "func"
+            | "defer"
+            | "go"
+            | "select"
+            | "chan"
+            | "range"
     )
 }
 
 fn is_english_stop_word(word: &str) -> bool {
     matches!(
         word,
-        "the" | "a" | "an" | "is" | "are" | "was" | "were" | "be" | "been"
-            | "being" | "have" | "has" | "had" | "do" | "does" | "did" | "will"
-            | "would" | "could" | "should" | "may" | "might" | "shall" | "can"
-            | "of" | "in" | "to" | "for" | "with" | "on" | "at" | "by"
-            | "this" | "that" | "these" | "those" | "it" | "its" | "not" | "no"
-            | "or" | "and" | "but" | "so" | "then" | "than" | "also" | "just"
+        "the"
+            | "a"
+            | "an"
+            | "is"
+            | "are"
+            | "was"
+            | "were"
+            | "be"
+            | "been"
+            | "being"
+            | "have"
+            | "has"
+            | "had"
+            | "do"
+            | "does"
+            | "did"
+            | "will"
+            | "would"
+            | "could"
+            | "should"
+            | "may"
+            | "might"
+            | "shall"
+            | "can"
+            | "of"
+            | "in"
+            | "to"
+            | "for"
+            | "with"
+            | "on"
+            | "at"
+            | "by"
+            | "this"
+            | "that"
+            | "these"
+            | "those"
+            | "it"
+            | "its"
+            | "not"
+            | "no"
+            | "or"
+            | "and"
+            | "but"
+            | "so"
+            | "then"
+            | "than"
+            | "also"
+            | "just"
     )
 }
 
 fn is_structural_keyword(word: &str) -> bool {
     matches!(
         word,
-        "import" | "export" | "async" | "await" | "interface" | "type"
-            | "class" | "enum" | "extends" | "implements" | "abstract"
-            | "struct" | "trait"
+        "import"
+            | "export"
+            | "async"
+            | "await"
+            | "interface"
+            | "type"
+            | "class"
+            | "enum"
+            | "extends"
+            | "implements"
+            | "abstract"
+            | "struct"
+            | "trait"
     )
 }
 
@@ -88,8 +197,7 @@ impl CodeTokenizer {
         let mut in_block_comment = false;
 
         for (line_idx, line) in content.lines().enumerate() {
-            let (context, new_block_state) =
-                self.detect_line_context(line, in_block_comment);
+            let (context, new_block_state) = self.detect_line_context(line, in_block_comment);
             in_block_comment = new_block_state;
 
             for tok in self.tokenize_line(line, line_idx, context) {
@@ -164,11 +272,7 @@ impl CodeTokenizer {
         tokens.into_iter().collect()
     }
 
-    fn detect_line_context(
-        &self,
-        line: &str,
-        in_block_comment: bool,
-    ) -> (TokenContext, bool) {
+    fn detect_line_context(&self, line: &str, in_block_comment: bool) -> (TokenContext, bool) {
         let trimmed = line.trim();
 
         if in_block_comment {
@@ -189,8 +293,10 @@ impl CodeTokenizer {
             return (ctx, true);
         }
 
-        if trimmed.starts_with("import ") || trimmed.starts_with("import{")
-            || trimmed.starts_with("use ") || trimmed.starts_with("from ")
+        if trimmed.starts_with("import ")
+            || trimmed.starts_with("import{")
+            || trimmed.starts_with("use ")
+            || trimmed.starts_with("from ")
         {
             return (TokenContext::Import, false);
         }
@@ -211,7 +317,8 @@ impl CodeTokenizer {
     }
 
     fn detect_inline_context(&self, trimmed: &str) -> TokenContext {
-        if trimmed.starts_with("import ") || trimmed.starts_with("import{")
+        if trimmed.starts_with("import ")
+            || trimmed.starts_with("import{")
             || trimmed.starts_with("use ")
         {
             return TokenContext::Import;
@@ -306,10 +413,29 @@ impl CodeTokenizer {
 
 fn is_definition_line(trimmed: &str) -> bool {
     let def_prefixes = [
-        "export ", "class ", "interface ", "type ", "enum ", "function ",
-        "const ", "let ", "var ", "pub fn ", "fn ", "pub struct ", "struct ",
-        "pub enum ", "pub trait ", "trait ", "impl ", "pub type ", "pub const ",
-        "pub static ", "static ", "def ", "func ",
+        "export ",
+        "class ",
+        "interface ",
+        "type ",
+        "enum ",
+        "function ",
+        "const ",
+        "let ",
+        "var ",
+        "pub fn ",
+        "fn ",
+        "pub struct ",
+        "struct ",
+        "pub enum ",
+        "pub trait ",
+        "trait ",
+        "impl ",
+        "pub type ",
+        "pub const ",
+        "pub static ",
+        "static ",
+        "def ",
+        "func ",
     ];
     for prefix in &def_prefixes {
         if trimmed.starts_with(prefix) {

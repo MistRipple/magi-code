@@ -71,9 +71,7 @@ impl WorkspaceStore {
             .expect("workspace sidecar flush state read lock poisoned")
     }
 
-    pub(super) fn write_flush_state(
-        &self,
-    ) -> RwLockWriteGuard<'_, RecoverySidecarFlushState> {
+    pub(super) fn write_flush_state(&self) -> RwLockWriteGuard<'_, RecoverySidecarFlushState> {
         self.recovery_sidecar_flush_state
             .write()
             .expect("workspace sidecar flush state write lock poisoned")
@@ -119,11 +117,9 @@ impl WorkspaceStore {
 
     pub fn projection_input(&self) -> WorkspaceProjectionInput {
         let mut state = self.export_state();
-        state.workspaces.sort_by(|left, right| {
-            left.workspace_id
-                .as_str()
-                .cmp(right.workspace_id.as_str())
-        });
+        state
+            .workspaces
+            .sort_by(|left, right| left.workspace_id.as_str().cmp(right.workspace_id.as_str()));
         Self::sort_worktree_allocations(&mut state.worktree_allocations);
         Self::sort_snapshots(&mut state.snapshots);
         WorkspaceProjectionInput {
@@ -157,7 +153,9 @@ impl WorkspaceStore {
             .iter()
             .any(|workspace| workspace.workspace_id == workspace_id)
         {
-            return Err(DomainError::AlreadyExists { entity: "workspace" });
+            return Err(DomainError::AlreadyExists {
+                entity: "workspace",
+            });
         }
 
         let now = UtcMillis::now();
@@ -183,7 +181,9 @@ impl WorkspaceStore {
             .workspaces
             .iter_mut()
             .find(|workspace| &workspace.workspace_id == workspace_id)
-            .ok_or(DomainError::NotFound { entity: "workspace" })?;
+            .ok_or(DomainError::NotFound {
+                entity: "workspace",
+            })?;
         workspace.status = WorkspaceLifecycleStatus::Active;
         workspace.updated_at = UtcMillis::now();
         let updated = workspace.clone();
@@ -221,9 +221,7 @@ impl WorkspaceStore {
             label: label.into(),
             created_at: UtcMillis::now(),
         };
-        self.write_state()
-            .snapshots
-            .push(snapshot.clone());
+        self.write_state().snapshots.push(snapshot.clone());
         snapshot
     }
 
@@ -237,11 +235,8 @@ impl WorkspaceStore {
 
     pub fn workspaces(&self) -> Vec<WorkspaceRecord> {
         let mut workspaces = self.read_state().workspaces.clone();
-        workspaces.sort_by(|left, right| {
-            left.workspace_id
-                .as_str()
-                .cmp(right.workspace_id.as_str())
-        });
+        workspaces
+            .sort_by(|left, right| left.workspace_id.as_str().cmp(right.workspace_id.as_str()));
         workspaces
     }
 
@@ -265,14 +260,15 @@ impl WorkspaceStore {
             .workspaces
             .iter()
             .position(|w| &w.workspace_id == workspace_id)
-            .ok_or(DomainError::NotFound { entity: "workspace" })?;
+            .ok_or(DomainError::NotFound {
+                entity: "workspace",
+            })?;
         state.workspaces.remove(pos);
         if state.active_workspace_id.as_ref() == Some(workspace_id) {
             state.active_workspace_id = state.workspaces.first().map(|w| w.workspace_id.clone());
         }
         Ok(())
     }
-
 }
 
 #[cfg(test)]
@@ -287,7 +283,10 @@ mod tests {
         let store = WorkspaceStore::new();
         let workspace_id = WorkspaceId::new("workspace-1");
         store
-            .register(workspace_id.clone(), AbsolutePath::new("/Users/xie/code/magi"))
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/Users/xie/code/magi"),
+            )
             .expect("workspace should be registrable");
 
         let snapshot = store.append_execution_snapshot(
@@ -350,7 +349,10 @@ mod tests {
         let store = WorkspaceStore::new();
         let workspace_id = WorkspaceId::new("workspace-metadata");
         store
-            .register(workspace_id.clone(), AbsolutePath::new("/Users/xie/code/magi"))
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/Users/xie/code/magi"),
+            )
             .expect("workspace should be registrable");
 
         let snapshot = store.append_execution_snapshot(
@@ -426,7 +428,10 @@ mod tests {
         );
         assert_eq!(flushes, vec![1]);
         let flushed_metadata = store.recovery_sidecar_flush_metadata();
-        assert_eq!(flushed_metadata.current_version, flushed_metadata.flushed_version);
+        assert_eq!(
+            flushed_metadata.current_version,
+            flushed_metadata.flushed_version
+        );
         assert!(flushed_metadata.last_flush_at.is_some());
         assert_eq!(flushed_metadata.next_flush_hint, None);
     }
@@ -474,7 +479,10 @@ mod tests {
         let store = WorkspaceStore::new();
         let workspace_id = WorkspaceId::new("workspace-1");
         store
-            .register(workspace_id.clone(), AbsolutePath::new("/Users/xie/code/magi"))
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/Users/xie/code/magi"),
+            )
             .expect("workspace should be registrable");
 
         let snapshot = store.append_execution_snapshot(
@@ -518,7 +526,10 @@ mod tests {
         let store = WorkspaceStore::new();
         let workspace_id = WorkspaceId::new("workspace-consume-runtime");
         store
-            .register(workspace_id.clone(), AbsolutePath::new("/Users/xie/code/magi"))
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/Users/xie/code/magi"),
+            )
             .expect("workspace should be registrable");
 
         let snapshot = store.append_execution_snapshot(
@@ -568,15 +579,30 @@ mod tests {
             .expect("recovery export should exist");
         assert_eq!(export.current_status, RecoveryStatus::Consumed);
         assert_eq!(
-            export.ownership.mission_id.as_ref().map(ToString::to_string).as_deref(),
+            export
+                .ownership
+                .mission_id
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
             Some("mission-updated")
         );
         assert_eq!(
-            export.ownership.task_id.as_ref().map(ToString::to_string).as_deref(),
+            export
+                .ownership
+                .task_id
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
             Some("task-updated")
         );
         assert_eq!(
-            export.ownership.worker_id.as_ref().map(ToString::to_string).as_deref(),
+            export
+                .ownership
+                .worker_id
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
             Some("worker-updated")
         );
         assert_eq!(export.execution_chain_ref.as_deref(), Some("chain-updated"));
@@ -587,7 +613,10 @@ mod tests {
         let store = WorkspaceStore::new();
         let workspace_id = WorkspaceId::new("workspace-persisted");
         store
-            .register(workspace_id.clone(), AbsolutePath::new("/Users/xie/code/magi"))
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/Users/xie/code/magi"),
+            )
             .expect("workspace should be registrable");
 
         let snapshot = store.append_execution_snapshot(
@@ -625,7 +654,10 @@ mod tests {
             .recovery_sidecar_export("recovery-persisted")
             .expect("restored recovery export should exist");
         assert_eq!(export.current_status, RecoveryStatus::Ready);
-        assert_eq!(export.execution_chain_ref.as_deref(), Some("chain-persisted"));
+        assert_eq!(
+            export.execution_chain_ref.as_deref(),
+            Some("chain-persisted")
+        );
         assert_eq!(export.recovery_ref, "recovery-persisted");
     }
 
@@ -634,7 +666,10 @@ mod tests {
         let store = WorkspaceStore::new();
         let workspace_id = WorkspaceId::new("workspace-flush");
         store
-            .register(workspace_id.clone(), AbsolutePath::new("/Users/xie/code/magi"))
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/Users/xie/code/magi"),
+            )
             .expect("workspace should be registrable");
 
         let mut flushes = Vec::new();
@@ -731,12 +766,67 @@ mod tests {
         // 第二个仍然活跃
         let remaining = store.active_worktree_allocations(&workspace_id);
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].ownership.task_id.as_ref().map(|t| t.as_str()), Some("t2"));
+        assert_eq!(
+            remaining[0].ownership.task_id.as_ref().map(|t| t.as_str()),
+            Some("t2")
+        );
 
         // workspace.worktree_root 仍存在（还有活跃分配）
         let workspaces = store.workspaces();
-        let ws = workspaces.iter().find(|w| w.workspace_id == workspace_id).unwrap();
+        let ws = workspaces
+            .iter()
+            .find(|w| w.workspace_id == workspace_id)
+            .unwrap();
         assert!(ws.worktree_root.is_some());
+    }
+
+    #[test]
+    fn worktree_assignment_is_idempotent_for_same_ownership_and_root() {
+        let store = WorkspaceStore::new();
+        let workspace_id = WorkspaceId::new("workspace-idempotent");
+        let ownership = ExecutionOwnership {
+            session_id: Some(SessionId::new("s1")),
+            task_id: Some(magi_core::TaskId::new("t1")),
+            ..ExecutionOwnership::default()
+        };
+        store
+            .register(workspace_id.clone(), AbsolutePath::new("/tmp/ws"))
+            .expect("register");
+
+        store
+            .assign_worktree_root_for_execution(
+                &workspace_id,
+                ownership.clone(),
+                AbsolutePath::new("/tmp/ws/wt1"),
+            )
+            .expect("first allocation should succeed");
+        let repeated = store
+            .assign_worktree_root_for_execution(
+                &workspace_id,
+                ownership.clone(),
+                AbsolutePath::new("/tmp/ws/wt1"),
+            )
+            .expect("same ownership and root should be idempotent");
+
+        assert_eq!(
+            repeated.worktree_root,
+            Some(AbsolutePath::new("/tmp/ws/wt1"))
+        );
+        assert_eq!(store.active_worktree_allocations(&workspace_id).len(), 1);
+
+        let conflicting = store
+            .assign_worktree_root_for_execution(
+                &workspace_id,
+                ownership,
+                AbsolutePath::new("/tmp/ws/wt2"),
+            )
+            .expect_err("same ownership with different root remains a conflict");
+        assert!(matches!(
+            conflicting,
+            DomainError::AlreadyExists {
+                entity: "worktree_allocation"
+            }
+        ));
     }
 
     #[test]
@@ -775,10 +865,12 @@ mod tests {
             .expect("release workspace root");
         assert!(released_workspace.worktree_root.is_none());
         assert!(store.active_worktree_allocations(&workspace_id).is_empty());
-        assert!(store
-            .worktree_allocations()
-            .into_iter()
-            .all(|allocation| !allocation.active && allocation.released_at.is_some()));
+        assert!(
+            store
+                .worktree_allocations()
+                .into_iter()
+                .all(|allocation| !allocation.active && allocation.released_at.is_some())
+        );
     }
 
     #[test]
@@ -810,7 +902,10 @@ mod tests {
             .expect("release last");
 
         let workspaces = store.workspaces();
-        let ws = workspaces.iter().find(|w| w.workspace_id == workspace_id).unwrap();
+        let ws = workspaces
+            .iter()
+            .find(|w| w.workspace_id == workspace_id)
+            .unwrap();
         assert!(ws.worktree_root.is_none());
     }
 
@@ -836,8 +931,12 @@ mod tests {
         let all = store.worktree_allocations();
         let id = &all[0].allocation_id;
 
-        store.release_worktree_allocation(id).expect("release first time");
-        let err = store.release_worktree_allocation(id).expect_err("double release should fail");
+        store
+            .release_worktree_allocation(id)
+            .expect("release first time");
+        let err = store
+            .release_worktree_allocation(id)
+            .expect_err("double release should fail");
         assert!(matches!(err, DomainError::InvalidState { .. }));
     }
 

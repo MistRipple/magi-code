@@ -108,10 +108,7 @@ impl LayeredMemoryStore {
         let source_key = entry.source_key.clone();
 
         self.memories.insert(id.clone(), entry);
-        self.source_index
-            .entry(source_key)
-            .or_default()
-            .push(id);
+        self.source_index.entry(source_key).or_default().push(id);
 
         self.enforce_layer_limits();
         true
@@ -139,9 +136,7 @@ impl LayeredMemoryStore {
         let mut results: Vec<&MemoryEntry> = self
             .memories
             .values()
-            .filter(|e| {
-                !self.is_expired(e) && e.tags.iter().any(|t| tags.contains(t))
-            })
+            .filter(|e| !self.is_expired(e) && e.tags.iter().any(|t| tags.contains(t)))
             .collect();
         results.sort_by(|a, b| b.importance.cmp(&a.importance));
         results
@@ -197,13 +192,20 @@ impl LayeredMemoryStore {
         true
     }
 
-    pub fn get_preferences_by_category(&self, category: PreferenceCategory) -> Vec<&PreferenceEntry> {
+    pub fn get_preferences_by_category(
+        &self,
+        category: PreferenceCategory,
+    ) -> Vec<&PreferenceEntry> {
         let mut results: Vec<&PreferenceEntry> = self
             .preferences
             .values()
             .filter(|p| p.category == category)
             .collect();
-        results.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results
     }
 
@@ -217,7 +219,8 @@ impl LayeredMemoryStore {
             .memories
             .iter()
             .filter(|(_, e)| {
-                e.ttl_ms.map_or(false, |ttl| now.saturating_sub(e.created_at) > ttl)
+                e.ttl_ms
+                    .map_or(false, |ttl| now.saturating_sub(e.created_at) > ttl)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -265,10 +268,7 @@ impl LayeredMemoryStore {
             return;
         }
 
-        layer_entries.sort_by(|a, b| {
-            a.2.cmp(&b.2)
-                .then_with(|| a.1.cmp(&b.1))
-        });
+        layer_entries.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)));
 
         let overflow = layer_entries.len() - limit;
         for (id, _, _) in layer_entries.into_iter().take(overflow) {

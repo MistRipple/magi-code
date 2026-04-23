@@ -1,6 +1,6 @@
 use crate::task_store::TaskStore;
 use crate::task_worker_catalog::resolve_task_role;
-use magi_bridge_client::{ModelBridgeClient, ModelInvocationRequest, ChatMessage};
+use magi_bridge_client::{ChatMessage, ModelBridgeClient, ModelInvocationRequest};
 use magi_core::{
     AssignmentLease, DecisionOption, DecisionTaskPayload, EventId, LeaseId, Task, TaskId, TaskKind,
     TaskResultKind, TaskStatus, UtcMillis, WorkerId,
@@ -161,7 +161,10 @@ impl EventBasedResultReceiver {
     /// If a result for this `task_id` has already been pushed, the call is a
     /// no-op — this prevents feedback loops.
     pub fn push_result(&self, result: TaskResult) {
-        let mut seen = self.seen.lock().expect("EventBasedResultReceiver seen lock poisoned");
+        let mut seen = self
+            .seen
+            .lock()
+            .expect("EventBasedResultReceiver seen lock poisoned");
         if !seen.insert(result.task_id.clone()) {
             // Already pushed a result for this task — skip.
             return;
@@ -185,7 +188,10 @@ impl EventBasedResultReceiver {
 
 impl TaskResultReceiver for EventBasedResultReceiver {
     fn poll_results(&self) -> Vec<TaskResult> {
-        let mut guard = self.results.lock().expect("EventBasedResultReceiver results lock poisoned");
+        let mut guard = self
+            .results
+            .lock()
+            .expect("EventBasedResultReceiver results lock poisoned");
         std::mem::take(&mut *guard)
     }
 }
@@ -289,11 +295,7 @@ impl WorkerExecutionDispatcher {
         self
     }
 
-    fn build_intent_from_task(
-        &self,
-        task: &Task,
-        worker: &WorkerInfo,
-    ) -> WorkerExecutionIntent {
+    fn build_intent_from_task(&self, task: &Task, worker: &WorkerInfo) -> WorkerExecutionIntent {
         let prefix = format!("{}-{}", task.mission_id, task.task_id);
         let mut steps: Vec<WorkerExecutionIntentStep> = Vec::new();
 
@@ -419,15 +421,11 @@ impl TaskDispatcher for WorkerExecutionDispatcher {
             task_id: task.task_id.clone(),
         });
 
-        let outcome = loop_controller.step().ok_or_else(|| {
-            format!(
-                "worker loop returned no outcome for task {}",
-                task.task_id
-            )
-        })?;
+        let outcome = loop_controller
+            .step()
+            .ok_or_else(|| format!("worker loop returned no outcome for task {}", task.task_id))?;
 
-        let task_result =
-            Self::outcome_to_task_result(&task.task_id, &lease.lease_id, &outcome);
+        let task_result = Self::outcome_to_task_result(&task.task_id, &lease.lease_id, &outcome);
         self.result_receiver.push_result(task_result);
 
         if let Some(ref event_bus) = self.event_bus {
@@ -531,9 +529,10 @@ impl TaskRunner {
         root_task_id: &TaskId,
         goal: &str,
     ) -> Result<Vec<TaskId>, String> {
-        let decomposer = self.decomposer.as_ref().ok_or_else(|| {
-            "MissionDecomposer 未配置".to_string()
-        })?;
+        let decomposer = self
+            .decomposer
+            .as_ref()
+            .ok_or_else(|| "MissionDecomposer 未配置".to_string())?;
         let tasks = decomposer.decompose(mission_id, root_task_id, goal)?;
         let ids: Vec<TaskId> = tasks.iter().map(|t| t.task_id.clone()).collect();
         for task in tasks {
@@ -608,7 +607,10 @@ impl TaskRunner {
             // Write scope conflict check: skip task if it would conflict
             // with a currently running task.
             if let Some(ref scope) = task.write_scope {
-                if running_write_scopes.iter().any(|rs| scopes_conflict(rs, scope)) {
+                if running_write_scopes
+                    .iter()
+                    .any(|rs| scopes_conflict(rs, scope))
+                {
                     unmatched_ids.push(task.task_id.clone());
                     continue;
                 }
@@ -650,14 +652,27 @@ impl TaskRunner {
                 continue;
             };
 
-            let matched_worker = self.workers.iter().find(|w| {
-                w.role == required_role && w.supported_kinds.contains(&task.kind)
-            });
+            let matched_worker = self
+                .workers
+                .iter()
+                .find(|w| w.role == required_role && w.supported_kinds.contains(&task.kind));
 
             if let Some(worker) = matched_worker {
+                let latest_task = match self.store.get_task(&task.task_id) {
+                    Some(latest_task) => latest_task,
+                    None => {
+                        unmatched_ids.push(task.task_id.clone());
+                        continue;
+                    }
+                };
+                if latest_task.status != TaskStatus::Ready {
+                    unmatched_ids.push(task.task_id.clone());
+                    continue;
+                }
                 // Worker parallelism_limit check (design 5.4).
                 if let Some(limit) = worker.parallelism_limit {
-                    let active_count = self.store.get_leases_by_worker(&worker.worker_id).len() as u32;
+                    let active_count =
+                        self.store.get_leases_by_worker(&worker.worker_id).len() as u32;
                     if active_count >= limit {
                         unmatched_ids.push(task.task_id.clone());
                         continue;
@@ -671,10 +686,23 @@ impl TaskRunner {
                     DEFAULT_LEASE_DURATION_MS,
                 );
                 if let Some(ref granted_lease) = lease {
+                    let latest_task = match self.store.get_task(&task.task_id) {
+                        Some(latest_task) => latest_task,
+                        None => {
+                            self.store
+                                .revoke_lease(&task.task_id, &granted_lease.lease_id);
+                            unmatched_ids.push(task.task_id.clone());
+                            continue;
+                        }
+                    };
+                    if latest_task.status != TaskStatus::Ready {
+                        self.store
+                            .revoke_lease(&task.task_id, &granted_lease.lease_id);
+                        unmatched_ids.push(task.task_id.clone());
+                        continue;
+                    }
                     // Mark task as Running.
-                    if let Err(e) =
-                        self.store.update_status(&task.task_id, TaskStatus::Running)
-                    {
+                    if let Err(e) = self.store.update_status(&task.task_id, TaskStatus::Running) {
                         return RunCycleOutcome::Error(format!(
                             "failed to mark task {} as Running: {e}",
                             task.task_id
@@ -715,16 +743,29 @@ impl TaskRunner {
     fn apply_results(&self) -> Result<(), String> {
         let results = self.result_receiver.poll_results();
         for result in results {
-            self.store.complete_lease(&result.task_id, &result.lease_id);
+            if !self.store.complete_lease(&result.task_id, &result.lease_id) {
+                tracing::warn!(
+                    task_id = %result.task_id,
+                    lease_id = %result.lease_id,
+                    "ignore stale task result because lease is no longer active"
+                );
+                continue;
+            }
 
             let next_status = match &result.outcome {
                 TaskOutcome::Completed { output_refs } => {
                     if !output_refs.is_empty() {
-                        self.store.set_output_refs(&result.task_id, output_refs.clone());
+                        self.store
+                            .set_output_refs(&result.task_id, output_refs.clone());
                     }
                     // If task has a validation_profile, route through Verifying (design 3.3.3).
                     if let Some(task) = self.store.get_task(&result.task_id) {
-                        if task.policy_snapshot.as_ref().and_then(|p| p.validation_profile.as_ref()).is_some() {
+                        if task
+                            .policy_snapshot
+                            .as_ref()
+                            .and_then(|p| p.validation_profile.as_ref())
+                            .is_some()
+                        {
                             TaskStatus::Verifying
                         } else {
                             TaskStatus::Completed
@@ -735,7 +776,8 @@ impl TaskRunner {
                 }
                 TaskOutcome::NeedsVerification { output_refs } => {
                     if !output_refs.is_empty() {
-                        self.store.set_output_refs(&result.task_id, output_refs.clone());
+                        self.store
+                            .set_output_refs(&result.task_id, output_refs.clone());
                     }
                     TaskStatus::Verifying
                 }
@@ -770,10 +812,7 @@ impl TaskRunner {
                                 parent_task_id: Some(task.task_id.clone()),
                                 kind: TaskKind::Repair,
                                 title: format!("Repair: {}", task.title),
-                                goal: format!(
-                                    "修复失败: {}",
-                                    reason
-                                ),
+                                goal: format!("修复失败: {}", reason),
                                 status: TaskStatus::Ready,
                                 dependency_ids: Vec::new(),
                                 required_children: Vec::new(),
@@ -813,12 +852,7 @@ impl TaskRunner {
             };
             self.store
                 .update_status(&result.task_id, next_status)
-                .map_err(|e| {
-                    format!(
-                        "failed to apply result for task {}: {e}",
-                        result.task_id
-                    )
-                })?;
+                .map_err(|e| format!("failed to apply result for task {}: {e}", result.task_id))?;
 
             // Auto-create Validation child when entering Verifying state.
             if next_status == TaskStatus::Verifying {
@@ -849,11 +883,7 @@ impl TaskRunner {
             .unwrap_or("standard")
             .to_string();
         let validation_task = Task {
-            task_id: TaskId::new(format!(
-                "{}-validation-{}",
-                task_id,
-                UtcMillis::now().0
-            )),
+            task_id: TaskId::new(format!("{}-validation-{}", task_id, UtcMillis::now().0)),
             mission_id: task.mission_id.clone(),
             root_task_id: task.root_task_id.clone(),
             parent_task_id: Some(task.task_id.clone()),
@@ -898,9 +928,9 @@ impl TaskRunner {
         if conditions.is_empty() {
             return;
         }
-        let should_escalate = conditions.iter().any(|c| {
-            c == "on_failure" || c == "high_risk" || c == "on_repair_exhausted"
-        });
+        let should_escalate = conditions
+            .iter()
+            .any(|c| c == "on_failure" || c == "high_risk" || c == "on_repair_exhausted");
         if !should_escalate {
             return;
         }
@@ -909,10 +939,7 @@ impl TaskRunner {
         };
         let payload = DecisionTaskPayload {
             decision_context: format!("任务 {} 执行失败，需要决策后续操作", task.title),
-            blocked_reason: format!(
-                "任务 {} 失败 (escalation: {:?})",
-                task_id, conditions
-            ),
+            blocked_reason: format!("任务 {} 失败 (escalation: {:?})", task_id, conditions),
             options: vec![
                 DecisionOption {
                     option_id: "retry".to_string(),
@@ -982,9 +1009,11 @@ impl TaskRunner {
                     } else {
                         TaskStatus::Completed
                     };
-                    self.store.update_status(task_id, next_status).map_err(|e| {
-                        format!("failed to propagate completion for {task_id}: {e}")
-                    })?;
+                    self.store
+                        .update_status(task_id, next_status)
+                        .map_err(|e| {
+                            format!("failed to propagate completion for {task_id}: {e}")
+                        })?;
                     changed = true;
                     continue;
                 }
@@ -992,15 +1021,12 @@ impl TaskRunner {
                 // Blocked/AwaitingApproval propagation: if any required child
                 // is blocked, parent should reflect that.
                 let any_blocked = required_children.iter().any(|c| {
-                    c.status == TaskStatus::Blocked
-                        || c.status == TaskStatus::AwaitingApproval
+                    c.status == TaskStatus::Blocked || c.status == TaskStatus::AwaitingApproval
                 });
                 if any_blocked && task.status != TaskStatus::Blocked {
                     self.store
                         .update_status(task_id, TaskStatus::Blocked)
-                        .map_err(|e| {
-                            format!("failed to propagate blocked for {task_id}: {e}")
-                        })?;
+                        .map_err(|e| format!("failed to propagate blocked for {task_id}: {e}"))?;
                     changed = true;
                 }
             }
@@ -1075,20 +1101,20 @@ impl TaskRunner {
         scope: &str,
         exclude_task_id: &TaskId,
     ) -> bool {
-        self.collect_all_task_ids(root_task_id).into_iter().any(|id| {
-            if id == *exclude_task_id {
-                return false;
-            }
-            self.store
-                .get_task(&id)
-                .is_some_and(|t| {
+        self.collect_all_task_ids(root_task_id)
+            .into_iter()
+            .any(|id| {
+                if id == *exclude_task_id {
+                    return false;
+                }
+                self.store.get_task(&id).is_some_and(|t| {
                     t.status == TaskStatus::Running
                         && t.executor_binding
                             .as_ref()
                             .and_then(|b| b.exclusive_scope.as_deref())
                             == Some(scope)
                 })
-        })
+            })
     }
 
     /// Collect parallelism_group values from Running tasks (design 5.3).
@@ -1110,11 +1136,7 @@ impl TaskRunner {
     }
 
     /// Check if the task's policy allows dispatch.
-    fn check_policy_allows_dispatch(
-        &self,
-        policy: &magi_core::TaskPolicy,
-        _task: &Task,
-    ) -> bool {
+    fn check_policy_allows_dispatch(&self, policy: &magi_core::TaskPolicy, _task: &Task) -> bool {
         // Reject tasks that require manual approval but are in auto-dispatch flow.
         if policy.autonomy_level == "Manual" {
             return false;
@@ -1133,11 +1155,16 @@ impl TaskRunner {
         parent_task_id: &TaskId,
         payload: magi_core::DecisionTaskPayload,
     ) -> Result<TaskId, String> {
-        let parent = self.store.get_task(parent_task_id).ok_or_else(|| {
-            format!("parent task {parent_task_id} not found")
-        })?;
+        let parent = self
+            .store
+            .get_task(parent_task_id)
+            .ok_or_else(|| format!("parent task {parent_task_id} not found"))?;
 
-        let decision_id = TaskId::new(format!("{}-decision-{}", parent_task_id, UtcMillis::now().0));
+        let decision_id = TaskId::new(format!(
+            "{}-decision-{}",
+            parent_task_id,
+            UtcMillis::now().0
+        ));
         let decision_task = Task {
             task_id: decision_id.clone(),
             mission_id: parent.mission_id.clone(),
@@ -1165,7 +1192,8 @@ impl TaskRunner {
             updated_at: UtcMillis::now(),
         };
         self.store.insert_task(decision_task);
-        self.store.update_status(parent_task_id, TaskStatus::Blocked)
+        self.store
+            .update_status(parent_task_id, TaskStatus::Blocked)
             .map_err(|e| format!("failed to block parent {parent_task_id}: {e}"))?;
 
         Ok(decision_id)
@@ -1179,14 +1207,17 @@ impl TaskRunner {
         chosen_option: &str,
         evidence: Option<serde_json::Value>,
     ) -> Result<(), String> {
-        let decision = self.store.get_task(decision_task_id).ok_or_else(|| {
-            format!("decision task {decision_task_id} not found")
-        })?;
+        let decision = self
+            .store
+            .get_task(decision_task_id)
+            .ok_or_else(|| format!("decision task {decision_task_id} not found"))?;
         if decision.kind != TaskKind::Decision {
             return Err(format!("{decision_task_id} is not a Decision task"));
         }
         if decision.status != TaskStatus::AwaitingApproval {
-            return Err(format!("decision {decision_task_id} is not AwaitingApproval"));
+            return Err(format!(
+                "decision {decision_task_id} is not AwaitingApproval"
+            ));
         }
 
         self.store.set_output_refs(
@@ -1199,7 +1230,8 @@ impl TaskRunner {
                 vec![serde_json::to_string(ev).unwrap_or_default()],
             );
         }
-        self.store.update_status(decision_task_id, TaskStatus::Completed)
+        self.store
+            .update_status(decision_task_id, TaskStatus::Completed)
             .map_err(|e| format!("failed to complete decision: {e}"))?;
 
         // Unblock parent.
@@ -1213,7 +1245,8 @@ impl TaskRunner {
                 let parent = self.store.get_task(parent_id);
                 if let Some(p) = parent {
                     if p.status == TaskStatus::Blocked {
-                        self.store.update_status(parent_id, TaskStatus::Running)
+                        self.store
+                            .update_status(parent_id, TaskStatus::Running)
                             .map_err(|e| format!("failed to unblock parent: {e}"))?;
                     }
                 }
@@ -1233,7 +1266,8 @@ impl TaskRunner {
         if task.status != TaskStatus::Running {
             return Err(format!("cannot pause task in {:?} state", task.status));
         }
-        self.store.update_status(task_id, TaskStatus::Blocked)
+        self.store
+            .update_status(task_id, TaskStatus::Blocked)
             .map_err(|e| format!("pause failed: {e}"))?;
         for descendant_id in self.collect_all_task_ids(task_id) {
             if descendant_id == *task_id {
@@ -1253,7 +1287,9 @@ impl TaskRunner {
                     )
                 })
             {
-                let _ = self.store.update_status(&descendant_id, TaskStatus::Blocked);
+                let _ = self
+                    .store
+                    .update_status(&descendant_id, TaskStatus::Blocked);
             }
         }
         Ok(())
@@ -1265,7 +1301,8 @@ impl TaskRunner {
         if task.status != TaskStatus::Blocked {
             return Err(format!("cannot resume task in {:?} state", task.status));
         }
-        self.store.update_status(task_id, TaskStatus::Running)
+        self.store
+            .update_status(task_id, TaskStatus::Running)
             .map_err(|e| format!("resume failed: {e}"))?;
         for descendant_id in self.collect_all_task_ids(task_id) {
             if descendant_id == *task_id {
@@ -1289,7 +1326,8 @@ impl TaskRunner {
         for id in &all_ids {
             if let Some(task) = self.store.get_task(id) {
                 if !is_terminal(task.status) {
-                    self.store.update_status(id, TaskStatus::Cancelled)
+                    self.store
+                        .update_status(id, TaskStatus::Cancelled)
                         .map_err(|e| format!("cancel failed for {id}: {e}"))?;
                     // Revoke any active lease.
                     if let Some(lease) = self.store.get_active_lease(id) {
@@ -1313,7 +1351,8 @@ impl TaskRunner {
             }
             if let Some(task) = self.store.get_task(id) {
                 if !is_terminal(task.status) && task.status != TaskStatus::Completed {
-                    self.store.update_status(id, TaskStatus::Cancelled)
+                    self.store
+                        .update_status(id, TaskStatus::Cancelled)
                         .map_err(|e| format!("replan cancel failed for {id}: {e}"))?;
                     if let Some(lease) = self.store.get_active_lease(id) {
                         self.store.revoke_lease(id, &lease.lease_id);
@@ -1419,10 +1458,7 @@ impl LlmGraphReflector {
         }
     }
 
-    fn build_replan_prompt(
-        store: &TaskStore,
-        parent_task_id: &TaskId,
-    ) -> Option<String> {
+    fn build_replan_prompt(store: &TaskStore, parent_task_id: &TaskId) -> Option<String> {
         let parent = store.get_task(parent_task_id)?;
         let children = store.get_children(parent_task_id);
 
@@ -1526,10 +1562,7 @@ impl LlmGraphReflector {
             serde_json::from_str(json_text).map_err(|e| format!("JSON 解析失败: {e}"))?;
 
         let action = value["action"].as_str().unwrap_or("keep");
-        let reason = value["reason"]
-            .as_str()
-            .unwrap_or("no reason")
-            .to_string();
+        let reason = value["reason"].as_str().unwrap_or("no reason").to_string();
 
         if action == "keep" {
             return Ok(ReplanDecision {
@@ -1760,7 +1793,10 @@ impl MissionDecomposer for LlmMissionDecomposer {
             }]),
             tools: None,
         };
-        let response = self.client.invoke(request).map_err(|e| format!("LLM 调用失败: {e}"))?;
+        let response = self
+            .client
+            .invoke(request)
+            .map_err(|e| format!("LLM 调用失败: {e}"))?;
         if !response.ok {
             return Err(format!("LLM 返回错误: {}", response.payload));
         }
@@ -1858,13 +1894,31 @@ mod tests {
     fn single_task_dispatch_cycle() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let action = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Ready);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let action = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
 
         store.insert_task(root);
         store.insert_task(action);
 
-        let workers = vec![make_worker("w-1", "integration-dev", vec![TaskKind::Action])];
+        let workers = vec![make_worker(
+            "w-1",
+            "integration-dev",
+            vec![TaskKind::Action],
+        )];
         let runner = TaskRunner::new(Arc::clone(&store), workers);
 
         // First cycle: should dispatch act-1.
@@ -1885,15 +1939,40 @@ mod tests {
     fn multi_task_parallel_dispatch() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let act1 = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Ready);
-        let act2 = make_task("act-2", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Ready);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let act1 = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
+        let act2 = make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
 
         store.insert_task(root);
         store.insert_task(act1);
         store.insert_task(act2);
 
-        let workers = vec![make_worker("w-1", "integration-dev", vec![TaskKind::Action])];
+        let workers = vec![make_worker(
+            "w-1",
+            "integration-dev",
+            vec![TaskKind::Action],
+        )];
         let runner = TaskRunner::new(Arc::clone(&store), workers);
 
         let outcome = runner.run_cycle(&TaskId::new("obj-1"));
@@ -1918,8 +1997,22 @@ mod tests {
     fn lease_expiry_resets_task_to_ready() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let action = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Running);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let action = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
 
         store.insert_task(root);
         store.insert_task(action);
@@ -1938,7 +2031,11 @@ mod tests {
         };
         store.insert_lease(expired_lease);
 
-        let workers = vec![make_worker("w-1", "integration-dev", vec![TaskKind::Action])];
+        let workers = vec![make_worker(
+            "w-1",
+            "integration-dev",
+            vec![TaskKind::Action],
+        )];
         let runner = TaskRunner::new(Arc::clone(&store), workers);
 
         // The cycle should revoke the expired lease and reset act-1 to Ready,
@@ -1968,15 +2065,40 @@ mod tests {
     fn parent_completed_when_all_children_complete() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let act1 = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Completed);
-        let act2 = make_task("act-2", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Completed);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let act1 = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Completed,
+        );
+        let act2 = make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Completed,
+        );
 
         store.insert_task(root);
         store.insert_task(act1);
         store.insert_task(act2);
 
-        let workers = vec![make_worker("w-1", "integration-dev", vec![TaskKind::Action])];
+        let workers = vec![make_worker(
+            "w-1",
+            "integration-dev",
+            vec![TaskKind::Action],
+        )];
         let runner = TaskRunner::new(Arc::clone(&store), workers);
 
         let outcome = runner.run_cycle(&TaskId::new("obj-1"));
@@ -1995,15 +2117,40 @@ mod tests {
     fn parent_fails_when_any_child_fails() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let act1 = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Completed);
-        let act2 = make_task("act-2", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Failed);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let act1 = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Completed,
+        );
+        let act2 = make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Failed,
+        );
 
         store.insert_task(root);
         store.insert_task(act1);
         store.insert_task(act2);
 
-        let workers = vec![make_worker("w-1", "integration-dev", vec![TaskKind::Action])];
+        let workers = vec![make_worker(
+            "w-1",
+            "integration-dev",
+            vec![TaskKind::Action],
+        )];
         let runner = TaskRunner::new(Arc::clone(&store), workers);
 
         let outcome = runner.run_cycle(&TaskId::new("obj-1"));
@@ -2021,14 +2168,32 @@ mod tests {
     fn blocked_when_no_workers_match() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let val = make_task("val-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Validation, TaskStatus::Ready);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let val = make_task(
+            "val-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Validation,
+            TaskStatus::Ready,
+        );
 
         store.insert_task(root);
         store.insert_task(val);
 
         // Worker only supports Action, not Validation.
-        let workers = vec![make_worker("w-1", "integration-dev", vec![TaskKind::Action])];
+        let workers = vec![make_worker(
+            "w-1",
+            "integration-dev",
+            vec![TaskKind::Action],
+        )];
         let runner = TaskRunner::new(Arc::clone(&store), workers);
 
         let outcome = runner.run_cycle(&TaskId::new("obj-1"));
@@ -2048,8 +2213,22 @@ mod tests {
     fn no_workers_produces_blocked() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let act = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Ready);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let act = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
 
         store.insert_task(root);
         store.insert_task(act);
@@ -2073,8 +2252,22 @@ mod tests {
     fn decision_tasks_are_not_dispatched() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let decision = make_task("dec-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Decision, TaskStatus::Ready);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let decision = make_task(
+            "dec-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Decision,
+            TaskStatus::Ready,
+        );
 
         store.insert_task(root);
         store.insert_task(decision);
@@ -2105,10 +2298,38 @@ mod tests {
         let store = Arc::new(TaskStore::new());
 
         // Objective -> Phase -> 2 completed Actions
-        let obj = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let phase = make_task("phase-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Phase, TaskStatus::Running);
-        let act1 = make_task("act-1", "m-1", "obj-1", Some("phase-1"), TaskKind::Action, TaskStatus::Completed);
-        let act2 = make_task("act-2", "m-1", "obj-1", Some("phase-1"), TaskKind::Action, TaskStatus::Completed);
+        let obj = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let phase = make_task(
+            "phase-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Phase,
+            TaskStatus::Running,
+        );
+        let act1 = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("phase-1"),
+            TaskKind::Action,
+            TaskStatus::Completed,
+        );
+        let act2 = make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("phase-1"),
+            TaskKind::Action,
+            TaskStatus::Completed,
+        );
 
         store.insert_task(obj);
         store.insert_task(phase);
@@ -2137,8 +2358,22 @@ mod tests {
     fn validation_task_dispatched_to_validator_worker() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let val = make_task("val-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Validation, TaskStatus::Ready);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let val = make_task(
+            "val-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Validation,
+            TaskStatus::Ready,
+        );
 
         store.insert_task(root);
         store.insert_task(val);
@@ -2201,16 +2436,41 @@ mod tests {
     fn dispatcher_callback_is_invoked_on_dispatch() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let act1 = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Ready);
-        let act2 = make_task("act-2", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Ready);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let act1 = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
+        let act2 = make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
 
         store.insert_task(root);
         store.insert_task(act1);
         store.insert_task(act2);
 
         let dispatcher = Arc::new(RecordingDispatcher::new());
-        let workers = vec![make_worker("w-1", "integration-dev", vec![TaskKind::Action])];
+        let workers = vec![make_worker(
+            "w-1",
+            "integration-dev",
+            vec![TaskKind::Action],
+        )];
         let runner = TaskRunner::with_dispatcher(
             Arc::clone(&store),
             workers,
@@ -2263,8 +2523,22 @@ mod tests {
     fn result_receiver_applies_completed_outcome() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let act = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Running);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let act = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
 
         store.insert_task(root);
         store.insert_task(act);
@@ -2309,6 +2583,76 @@ mod tests {
         assert_eq!(obj.status, TaskStatus::Completed);
     }
 
+    #[test]
+    fn result_receiver_ignores_completed_outcome_when_lease_was_revoked() {
+        let store = Arc::new(TaskStore::new());
+
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let act = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Blocked,
+        );
+
+        store.insert_task(root);
+        store.insert_task(act);
+
+        let now = UtcMillis::now();
+        let lease = AssignmentLease {
+            lease_id: LeaseId::new("lease-act-1"),
+            task_id: TaskId::new("act-1"),
+            worker_id: WorkerId::new("w-1"),
+            role: "executor".to_string(),
+            granted_at: now,
+            expires_at: UtcMillis(now.0 + 120_000),
+            heartbeat_at: now,
+            lease_status: LeaseStatus::Active,
+        };
+        store.insert_lease(lease);
+        assert!(
+            store.revoke_lease(&TaskId::new("act-1"), &LeaseId::new("lease-act-1")),
+            "lease should be revoked before stale result arrives"
+        );
+
+        let receiver = Arc::new(FixedResultReceiver::new(vec![TaskResult {
+            task_id: TaskId::new("act-1"),
+            lease_id: LeaseId::new("lease-act-1"),
+            outcome: TaskOutcome::Completed {
+                output_refs: vec!["late-output".to_string()],
+            },
+        }]));
+
+        let runner = TaskRunner::with_dispatcher(
+            Arc::clone(&store),
+            Vec::new(),
+            Arc::new(NoOpDispatcher),
+            receiver,
+        );
+
+        let outcome = runner.run_cycle(&TaskId::new("obj-1"));
+        assert_ne!(outcome, RunCycleOutcome::AllComplete);
+
+        let act = store.get_task(&TaskId::new("act-1")).unwrap();
+        assert_eq!(act.status, TaskStatus::Blocked);
+        assert!(
+            act.output_refs.is_empty(),
+            "stale result must not write output refs"
+        );
+
+        let obj = store.get_task(&TaskId::new("obj-1")).unwrap();
+        assert_eq!(obj.status, TaskStatus::Blocked);
+    }
+
     // -----------------------------------------------------------------------
     // Test 13: Failed result marks task as Failed
     // -----------------------------------------------------------------------
@@ -2317,8 +2661,22 @@ mod tests {
     fn result_receiver_applies_failed_outcome() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let act = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Running);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let act = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
 
         store.insert_task(root);
         store.insert_task(act);
@@ -2382,13 +2740,31 @@ mod tests {
     fn dispatcher_error_propagates_as_cycle_error() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let act = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Ready);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let act = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
 
         store.insert_task(root);
         store.insert_task(act);
 
-        let workers = vec![make_worker("w-1", "integration-dev", vec![TaskKind::Action])];
+        let workers = vec![make_worker(
+            "w-1",
+            "integration-dev",
+            vec![TaskKind::Action],
+        )];
         let runner = TaskRunner::with_dispatcher(
             Arc::clone(&store),
             workers,
@@ -2414,17 +2790,42 @@ mod tests {
     fn write_scope_conflict_blocks_parallel_dispatch() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let mut act1 = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Ready);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let mut act1 = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
         act1.write_scope = Some("src/components".to_string());
-        let mut act2 = make_task("act-2", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Ready);
+        let mut act2 = make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
         act2.write_scope = Some("src/components/button".to_string());
 
         store.insert_task(root);
         store.insert_task(act1);
         store.insert_task(act2);
 
-        let workers = vec![make_worker("w-1", "integration-dev", vec![TaskKind::Action])];
+        let workers = vec![make_worker(
+            "w-1",
+            "integration-dev",
+            vec![TaskKind::Action],
+        )];
         let runner = TaskRunner::new(Arc::clone(&store), workers);
 
         let outcome = runner.run_cycle(&TaskId::new("obj-1"));
@@ -2433,8 +2834,14 @@ mod tests {
         // Only one should be Running (the first one dispatched blocks the second).
         let a1 = store.get_task(&TaskId::new("act-1")).unwrap();
         let a2 = store.get_task(&TaskId::new("act-2")).unwrap();
-        let running_count = [a1.status, a2.status].iter().filter(|s| **s == TaskStatus::Running).count();
-        assert_eq!(running_count, 1, "only one task should be running due to write scope conflict");
+        let running_count = [a1.status, a2.status]
+            .iter()
+            .filter(|s| **s == TaskStatus::Running)
+            .count();
+        assert_eq!(
+            running_count, 1,
+            "only one task should be running due to write scope conflict"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2459,8 +2866,22 @@ mod tests {
     fn exclusive_scope_conflict_blocks_dispatch() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let mut act1 = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Ready);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let mut act1 = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
         act1.executor_binding = Some(magi_core::ExecutorBinding {
             target_role: "integration-dev".to_string(),
             capability_requirements: Vec::new(),
@@ -2468,7 +2889,14 @@ mod tests {
             exclusive_scope: Some("deploy-prod".to_string()),
             worker_selector: None,
         });
-        let mut act2 = make_task("act-2", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Ready);
+        let mut act2 = make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
         act2.executor_binding = Some(magi_core::ExecutorBinding {
             target_role: "integration-dev".to_string(),
             capability_requirements: Vec::new(),
@@ -2481,7 +2909,11 @@ mod tests {
         store.insert_task(act1);
         store.insert_task(act2);
 
-        let workers = vec![make_worker("w-1", "integration-dev", vec![TaskKind::Action])];
+        let workers = vec![make_worker(
+            "w-1",
+            "integration-dev",
+            vec![TaskKind::Action],
+        )];
         let runner = TaskRunner::new(Arc::clone(&store), workers);
 
         let outcome = runner.run_cycle(&TaskId::new("obj-1"));
@@ -2489,8 +2921,14 @@ mod tests {
 
         let a1 = store.get_task(&TaskId::new("act-1")).unwrap();
         let a2 = store.get_task(&TaskId::new("act-2")).unwrap();
-        let running_count = [a1.status, a2.status].iter().filter(|s| **s == TaskStatus::Running).count();
-        assert_eq!(running_count, 1, "exclusive scope should prevent parallel dispatch");
+        let running_count = [a1.status, a2.status]
+            .iter()
+            .filter(|s| **s == TaskStatus::Running)
+            .count();
+        assert_eq!(
+            running_count, 1,
+            "exclusive scope should prevent parallel dispatch"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2501,9 +2939,30 @@ mod tests {
     fn blocked_child_propagates_to_parent() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let act1 = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Completed);
-        let act2 = make_task("act-2", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Blocked);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let act1 = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Completed,
+        );
+        let act2 = make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Blocked,
+        );
 
         store.insert_task(root);
         store.insert_task(act1);
@@ -2513,7 +2972,11 @@ mod tests {
         let _outcome = runner.run_cycle(&TaskId::new("obj-1"));
 
         let obj = store.get_task(&TaskId::new("obj-1")).unwrap();
-        assert_eq!(obj.status, TaskStatus::Blocked, "parent should be Blocked when any required child is Blocked");
+        assert_eq!(
+            obj.status,
+            TaskStatus::Blocked,
+            "parent should be Blocked when any required child is Blocked"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2524,10 +2987,31 @@ mod tests {
     fn required_children_controls_aggregation() {
         let store = Arc::new(TaskStore::new());
 
-        let mut root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
+        let mut root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
         root.required_children = vec![TaskId::new("act-1")];
-        let act1 = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Completed);
-        let act2 = make_task("act-2", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Failed);
+        let act1 = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Completed,
+        );
+        let act2 = make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Failed,
+        );
 
         store.insert_task(root);
         store.insert_task(act1);
@@ -2537,8 +3021,11 @@ mod tests {
         let _outcome = runner.run_cycle(&TaskId::new("obj-1"));
 
         let obj = store.get_task(&TaskId::new("obj-1")).unwrap();
-        assert_eq!(obj.status, TaskStatus::Completed,
-            "parent should complete because only required child (act-1) is Completed; act-2 (Failed) is not required");
+        assert_eq!(
+            obj.status,
+            TaskStatus::Completed,
+            "parent should complete because only required child (act-1) is Completed; act-2 (Failed) is not required"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2549,8 +3036,22 @@ mod tests {
     fn needs_repair_creates_repair_child() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let act = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Running);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let act = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
 
         store.insert_task(root);
         store.insert_task(act);
@@ -2606,8 +3107,22 @@ mod tests {
     fn repair_budget_exhausted_marks_failed() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let mut act = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Running);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let mut act = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
         act.repair_count = 3; // Already at default limit
         act.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
@@ -2661,7 +3176,11 @@ mod tests {
         assert_eq!(outcome, RunCycleOutcome::AllComplete);
 
         let act = store.get_task(&TaskId::new("act-1")).unwrap();
-        assert_eq!(act.status, TaskStatus::Failed, "should fail when repair budget exhausted");
+        assert_eq!(
+            act.status,
+            TaskStatus::Failed,
+            "should fail when repair budget exhausted"
+        );
 
         // No Repair child should have been created.
         let children = store.get_children(&TaskId::new("act-1"));
@@ -2676,8 +3195,22 @@ mod tests {
     fn manual_autonomy_blocks_dispatch() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let mut act = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Ready);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let mut act = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
         act.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Manual".to_string(),
             approval_mode: "explicit".to_string(),
@@ -2698,7 +3231,11 @@ mod tests {
         store.insert_task(root);
         store.insert_task(act);
 
-        let workers = vec![make_worker("w-1", "integration-dev", vec![TaskKind::Action])];
+        let workers = vec![make_worker(
+            "w-1",
+            "integration-dev",
+            vec![TaskKind::Action],
+        )];
         let runner = TaskRunner::new(Arc::clone(&store), workers);
 
         let outcome = runner.run_cycle(&TaskId::new("obj-1"));
@@ -2708,24 +3245,60 @@ mod tests {
         }
 
         let act = store.get_task(&TaskId::new("act-1")).unwrap();
-        assert_eq!(act.status, TaskStatus::Ready, "Manual task should remain Ready");
+        assert_eq!(
+            act.status,
+            TaskStatus::Ready,
+            "Manual task should remain Ready"
+        );
     }
 
     #[test]
     fn pause_and_resume_task_propagate_recursively_to_worker_branches() {
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let phase = make_task("phase-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Phase, TaskStatus::Running);
-        let wp = make_task("wp-1", "m-1", "obj-1", Some("phase-1"), TaskKind::WorkPackage, TaskStatus::Running);
-        let act = make_task("act-1", "m-1", "obj-1", Some("wp-1"), TaskKind::Action, TaskStatus::Running);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let phase = make_task(
+            "phase-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Phase,
+            TaskStatus::Running,
+        );
+        let wp = make_task(
+            "wp-1",
+            "m-1",
+            "obj-1",
+            Some("phase-1"),
+            TaskKind::WorkPackage,
+            TaskStatus::Running,
+        );
+        let act = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("wp-1"),
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
 
         store.insert_task(root);
         store.insert_task(phase);
         store.insert_task(wp);
         store.insert_task(act);
 
-        let workers = vec![make_worker("w-1", "integration-dev", vec![TaskKind::Action])];
+        let workers = vec![make_worker(
+            "w-1",
+            "integration-dev",
+            vec![TaskKind::Action],
+        )];
         let runner = TaskRunner::new(Arc::clone(&store), workers);
 
         runner
@@ -2735,7 +3308,11 @@ mod tests {
             let task = store
                 .get_task(&TaskId::new(task_id))
                 .expect("task should exist after pause");
-            assert_eq!(task.status, TaskStatus::Blocked, "{task_id} should become Blocked");
+            assert_eq!(
+                task.status,
+                TaskStatus::Blocked,
+                "{task_id} should become Blocked"
+            );
         }
 
         runner
@@ -2749,7 +3326,11 @@ mod tests {
             let task = store
                 .get_task(&TaskId::new(task_id))
                 .expect("task should exist after resume");
-            assert_eq!(task.status, TaskStatus::Ready, "{task_id} should become Ready");
+            assert_eq!(
+                task.status,
+                TaskStatus::Ready,
+                "{task_id} should become Ready"
+            );
         }
     }
 
@@ -2765,20 +3346,37 @@ mod tests {
         let worker_runtime = magi_worker_runtime::WorkerRuntime::new(Arc::clone(&event_bus));
         let result_receiver = Arc::new(EventBasedResultReceiver::new());
 
-        let dispatcher = WorkerExecutionDispatcher::new(
-            worker_runtime,
-            Arc::clone(&result_receiver),
-        ).with_event_bus(Arc::clone(&event_bus));
+        let dispatcher =
+            WorkerExecutionDispatcher::new(worker_runtime, Arc::clone(&result_receiver))
+                .with_event_bus(Arc::clone(&event_bus));
 
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let act = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Ready);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let act = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
 
         store.insert_task(root);
         store.insert_task(act);
 
-        let workers = vec![make_worker("w-1", "integration-dev", vec![TaskKind::Action])];
+        let workers = vec![make_worker(
+            "w-1",
+            "integration-dev",
+            vec![TaskKind::Action],
+        )];
         let runner = TaskRunner::with_dispatcher(
             Arc::clone(&store),
             workers,
@@ -2824,22 +3422,45 @@ mod tests {
         let worker_runtime = magi_worker_runtime::WorkerRuntime::new(Arc::clone(&event_bus));
         let result_receiver = Arc::new(EventBasedResultReceiver::new());
 
-        let dispatcher = WorkerExecutionDispatcher::new(
-            worker_runtime,
-            Arc::clone(&result_receiver),
-        );
+        let dispatcher =
+            WorkerExecutionDispatcher::new(worker_runtime, Arc::clone(&result_receiver));
 
         let store = Arc::new(TaskStore::new());
 
-        let root = make_task("obj-1", "m-1", "obj-1", None, TaskKind::Objective, TaskStatus::Running);
-        let act1 = make_task("act-1", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Ready);
-        let act2 = make_task("act-2", "m-1", "obj-1", Some("obj-1"), TaskKind::Action, TaskStatus::Ready);
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let act1 = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
+        let act2 = make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
 
         store.insert_task(root);
         store.insert_task(act1);
         store.insert_task(act2);
 
-        let workers = vec![make_worker("w-1", "integration-dev", vec![TaskKind::Action])];
+        let workers = vec![make_worker(
+            "w-1",
+            "integration-dev",
+            vec![TaskKind::Action],
+        )];
         let runner = TaskRunner::with_dispatcher(
             Arc::clone(&store),
             workers,

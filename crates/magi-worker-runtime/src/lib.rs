@@ -1,10 +1,10 @@
 use magi_core::{
-    ApprovalRequirement, EventId, ExecutionResultStatus, RecoveryResumeInput,
-    RiskLevel, SessionId, TaskExecutionTarget, TaskId, ToolCallId, UtcMillis,
-    VerificationStatus, WorkerId, WorkerLifecycleStatus, WorkspaceId,
+    ApprovalRequirement, EventId, ExecutionResultStatus, RecoveryResumeInput, RiskLevel, SessionId,
+    TaskExecutionTarget, TaskId, ToolCallId, UtcMillis, VerificationStatus, WorkerId,
+    WorkerLifecycleStatus, WorkspaceId,
 };
-use magi_governance::{GovernanceDecision, GovernanceOutcome, ToolKind, WorkerControlKind};
 use magi_event_bus::{EventCategory, EventContext, EventEnvelope, InMemoryEventBus};
+use magi_governance::{GovernanceDecision, GovernanceOutcome, ToolKind, WorkerControlKind};
 use magi_skill_runtime::{
     SkillDispatchRoute, SkillDispatchRuntime, SkillDispatchStatus, SkillToolRuntimePlan,
 };
@@ -12,42 +12,43 @@ use magi_tool_runtime::ToolRegistry;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 mod executor;
 mod executor_observation;
-mod loop_controller;
 mod local_process_executor;
+mod loop_controller;
 mod reporting;
 mod runtime_queries;
 pub use executor::{
-    DeterministicWorkerExecutor, ShadowWorkerExecutor, WorkerExecutionTrace,
-    WorkerExecutorFailureDetail, WorkerExecutorKind, WorkerExecutorProbe,
+    DeterministicWorkerExecutor, ShadowWorkerExecutor, WorkerExecutionProgress,
+    WorkerExecutionTrace, WorkerExecutorFailureDetail, WorkerExecutorKind, WorkerExecutorProbe,
 };
-pub use executor_observation::{
-    WorkerExecutorObservation, WorkerExecutorObservationStatus,
-};
+pub use executor_observation::{WorkerExecutorObservation, WorkerExecutorObservationStatus};
 pub use local_process_executor::{
-    execute_intent_with_drivers, execute_intent_with_shadow_drivers, run_local_worker_executor_stdio,
-    LocalProcessExecutionRequest, LocalProcessExecutionResponse, LocalProcessExecutorCapability,
-    LocalProcessExecutorConfig, LocalProcessExecutorDescriptor, LocalProcessExecutorHealth,
-    LocalProcessExecutorHealthStatus, LocalProcessExecutorAffinity,
-    LocalProcessExecutorProcessModel, LocalProcessExecutorStageMatrix,
-    LocalProcessProbeRequest, LocalProcessProbeResponse, LocalProcessProtocolRequest,
-    LocalProcessProtocolRequestKind, LocalProcessProtocolResponse,
+    LocalProcessExecutionRequest, LocalProcessExecutionResponse, LocalProcessExecutorAffinity,
+    LocalProcessExecutorCapability, LocalProcessExecutorConfig, LocalProcessExecutorDescriptor,
+    LocalProcessExecutorHealth, LocalProcessExecutorHealthStatus, LocalProcessExecutorProcessModel,
+    LocalProcessExecutorStageMatrix, LocalProcessProbeRequest, LocalProcessProbeResponse,
+    LocalProcessProtocolRequest, LocalProcessProtocolRequestKind, LocalProcessProtocolResponse,
     LocalProcessProtocolResponseKind, LocalProcessRepairRequest, LocalProcessRepairResponse,
     LocalProcessReviewRequest, LocalProcessReviewResponse, LocalProcessVerifyRequest,
-    LocalProcessVerifyResponse, LocalProcessWorkerExecutor, WorkerExecutionMode,
-    WorkerExecutionBindingLifecycle, WorkerExecutionLeaseState, WorkerExecutionProcessLifecycle,
-    WorkerExecutionBindingScope, WorkerExecutionParallelismScope, WorkerExecutionProfile,
+    LocalProcessVerifyResponse, LocalProcessWorkerExecutor, WorkerExecutionBindingLifecycle,
+    WorkerExecutionBindingScope, WorkerExecutionLeaseState, WorkerExecutionMode,
+    WorkerExecutionParallelismScope, WorkerExecutionProcessLifecycle, WorkerExecutionProfile,
     WorkerExecutionReusePolicy, WorkerExecutorFailure, WorkerExecutorFailureLayer,
+    execute_intent_step_with_drivers, execute_intent_with_drivers,
+    execute_intent_with_shadow_drivers, run_local_worker_executor_stdio,
 };
+pub(crate) use reporting::derive_final_report;
 pub use reporting::{
     SkillDispatchSummary, WorkerExecutionFinalReport, WorkerExecutionReport,
     WorkerSkillDispatchObservation, WorkerToolInvocation,
 };
-pub(crate) use reporting::derive_final_report;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkerStage {
@@ -68,6 +69,31 @@ impl WorkerStage {
             Self::Finish => "finish",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkerCheckpointResumeMode {
+    StepCheckpoint,
+    StageRestart,
+}
+
+impl WorkerCheckpointResumeMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::StepCheckpoint => "step-checkpoint",
+            Self::StageRestart => "stage-restart",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerExecutionCheckpointCursor {
+    pub checkpoint_stage: WorkerStage,
+    pub next_step_index: usize,
+    pub checkpoint_at: UtcMillis,
+    pub resume_mode: WorkerCheckpointResumeMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -364,6 +390,31 @@ pub struct TaskExecutionSnapshot {
     pub skill_dispatch_summary: SkillDispatchSummary,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerRuntimeBranchSnapshot {
+    pub task_id: TaskId,
+    pub worker_id: WorkerId,
+    pub stage: WorkerStage,
+    pub lease_id: Option<String>,
+    pub execution_intent_ref: Option<String>,
+    pub binding_lifecycle: Option<WorkerExecutionBindingLifecycle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_cursor: Option<WorkerExecutionCheckpointCursor>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerRuntimeDurableSnapshot {
+    pub branches: Vec<WorkerRuntimeBranchSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WorkerRuntimeSnapshotFlushState {
+    pub current_version: u64,
+    pub flushed_version: u64,
+}
+
+pub type WorkerBranchSnapshotObserver = Arc<dyn Fn(WorkerRuntimeBranchSnapshot) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct WorkerRuntime {
     event_bus: Arc<InMemoryEventBus>,
@@ -374,10 +425,35 @@ pub struct WorkerRuntime {
     executor_observations: Arc<RwLock<Vec<WorkerExecutorObservation>>>,
     governance_observations: Arc<RwLock<Vec<WorkerGovernanceObservation>>>,
     execution_intents: Arc<RwLock<HashMap<TaskId, WorkerExecutionIntent>>>,
+    branch_snapshots: Arc<RwLock<HashMap<TaskId, WorkerRuntimeBranchSnapshot>>>,
+    branch_snapshot_observer: Arc<RwLock<Option<WorkerBranchSnapshotObserver>>>,
+    durable_snapshot_version: Arc<AtomicU64>,
+    flushed_durable_snapshot_version: Arc<AtomicU64>,
     executor: Arc<dyn ShadowWorkerExecutor>,
 }
 
 impl WorkerRuntime {
+    fn default_checkpoint_cursor(
+        stage: WorkerStage,
+        checkpoint_at: UtcMillis,
+    ) -> WorkerExecutionCheckpointCursor {
+        WorkerExecutionCheckpointCursor {
+            checkpoint_stage: stage,
+            next_step_index: 0,
+            checkpoint_at,
+            resume_mode: WorkerCheckpointResumeMode::StageRestart,
+            resume_token: None,
+        }
+    }
+
+    pub fn checkpoint_cursor_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> Option<WorkerExecutionCheckpointCursor> {
+        self.branch_snapshot_for_task(task_id)
+            .and_then(|snapshot| snapshot.checkpoint_cursor)
+    }
+
     pub fn new(event_bus: Arc<InMemoryEventBus>) -> Self {
         Self {
             event_bus,
@@ -388,6 +464,10 @@ impl WorkerRuntime {
             executor_observations: Arc::new(RwLock::new(Vec::new())),
             governance_observations: Arc::new(RwLock::new(Vec::new())),
             execution_intents: Arc::new(RwLock::new(HashMap::new())),
+            branch_snapshots: Arc::new(RwLock::new(HashMap::new())),
+            branch_snapshot_observer: Arc::new(RwLock::new(None)),
+            durable_snapshot_version: Arc::new(AtomicU64::new(0)),
+            flushed_durable_snapshot_version: Arc::new(AtomicU64::new(0)),
             executor: Arc::new(LocalProcessWorkerExecutor::cargo_loopback()),
         }
     }
@@ -402,6 +482,10 @@ impl WorkerRuntime {
             executor_observations: Arc::new(RwLock::new(Vec::new())),
             governance_observations: Arc::new(RwLock::new(Vec::new())),
             execution_intents: Arc::new(RwLock::new(HashMap::new())),
+            branch_snapshots: Arc::new(RwLock::new(HashMap::new())),
+            branch_snapshot_observer: Arc::new(RwLock::new(None)),
+            durable_snapshot_version: Arc::new(AtomicU64::new(0)),
+            flushed_durable_snapshot_version: Arc::new(AtomicU64::new(0)),
             executor: Arc::new(DeterministicWorkerExecutor::default()),
         }
     }
@@ -409,6 +493,134 @@ impl WorkerRuntime {
     pub fn with_executor(mut self, executor: Arc<dyn ShadowWorkerExecutor>) -> Self {
         self.executor = executor;
         self
+    }
+
+    pub fn set_branch_snapshot_observer(&self, observer: Option<WorkerBranchSnapshotObserver>) {
+        *self
+            .branch_snapshot_observer
+            .write()
+            .expect("worker branch snapshot observer write lock poisoned") = observer;
+    }
+
+    pub fn record_branch_checkpoint(
+        &self,
+        task_id: &TaskId,
+        worker_id: &WorkerId,
+        stage: WorkerStage,
+        lease_id: Option<String>,
+        execution_intent_ref: Option<String>,
+        binding_lifecycle: Option<WorkerExecutionBindingLifecycle>,
+        checkpoint_cursor: Option<WorkerExecutionCheckpointCursor>,
+    ) -> WorkerRuntimeBranchSnapshot {
+        self.upsert_branch_snapshot(task_id, |existing| WorkerRuntimeBranchSnapshot {
+            task_id: task_id.clone(),
+            worker_id: worker_id.clone(),
+            stage,
+            lease_id: lease_id
+                .clone()
+                .or_else(|| existing.and_then(|snapshot| snapshot.lease_id.clone())),
+            execution_intent_ref: execution_intent_ref
+                .clone()
+                .or_else(|| existing.and_then(|snapshot| snapshot.execution_intent_ref.clone())),
+            binding_lifecycle: binding_lifecycle
+                .or_else(|| existing.and_then(|snapshot| snapshot.binding_lifecycle)),
+            checkpoint_cursor: if matches!(stage, WorkerStage::Finish) {
+                None
+            } else {
+                checkpoint_cursor
+                    .clone()
+                    .or_else(|| existing.and_then(|snapshot| snapshot.checkpoint_cursor.clone()))
+            },
+        })
+    }
+
+    fn mark_durable_snapshot_dirty(&self) {
+        self.durable_snapshot_version
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn durable_snapshot_flush_state(&self) -> WorkerRuntimeSnapshotFlushState {
+        WorkerRuntimeSnapshotFlushState {
+            current_version: self.durable_snapshot_version.load(Ordering::Relaxed),
+            flushed_version: self
+                .flushed_durable_snapshot_version
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn durable_snapshot_dirty(&self) -> bool {
+        let state = self.durable_snapshot_flush_state();
+        state.current_version != state.flushed_version
+    }
+
+    fn publish_branch_snapshot(&self, snapshot: WorkerRuntimeBranchSnapshot) {
+        let observer = self
+            .branch_snapshot_observer
+            .read()
+            .expect("worker branch snapshot observer read lock poisoned")
+            .clone();
+        if let Some(observer) = observer {
+            observer(snapshot);
+        }
+    }
+
+    fn upsert_branch_snapshot(
+        &self,
+        task_id: &TaskId,
+        mutate: impl FnOnce(Option<&WorkerRuntimeBranchSnapshot>) -> WorkerRuntimeBranchSnapshot,
+    ) -> WorkerRuntimeBranchSnapshot {
+        let snapshot = {
+            let mut snapshots = self
+                .branch_snapshots
+                .write()
+                .expect("worker branch snapshot write lock poisoned");
+            let next = mutate(snapshots.get(task_id));
+            snapshots.insert(task_id.clone(), next.clone());
+            next
+        };
+        self.mark_durable_snapshot_dirty();
+        self.publish_branch_snapshot(snapshot.clone());
+        snapshot
+    }
+
+    fn restore_branch_snapshots(
+        &self,
+        branches: impl IntoIterator<Item = WorkerRuntimeBranchSnapshot>,
+    ) {
+        let mut branch_map = self
+            .branch_snapshots
+            .write()
+            .expect("worker branch snapshot write lock poisoned");
+        branch_map.clear();
+        for branch in branches {
+            branch_map.insert(branch.task_id.clone(), branch);
+        }
+        drop(branch_map);
+        self.durable_snapshot_version.store(0, Ordering::Relaxed);
+        self.flushed_durable_snapshot_version
+            .store(0, Ordering::Relaxed);
+    }
+
+    pub fn restore_durable_snapshot(&self, snapshot: WorkerRuntimeDurableSnapshot) {
+        self.restore_branch_snapshots(snapshot.branches);
+    }
+
+    pub fn flush_durable_snapshot_with<E, F>(&self, persist: F) -> Result<bool, E>
+    where
+        F: FnOnce(&WorkerRuntimeDurableSnapshot) -> Result<(), E>,
+    {
+        let current_version = self.durable_snapshot_version.load(Ordering::Relaxed);
+        let flushed_version = self
+            .flushed_durable_snapshot_version
+            .load(Ordering::Relaxed);
+        if current_version == flushed_version {
+            return Ok(false);
+        }
+        let snapshot = self.durable_snapshot();
+        persist(&snapshot)?;
+        self.flushed_durable_snapshot_version
+            .store(current_version, Ordering::Relaxed);
+        Ok(true)
     }
 
     pub fn register_worker(&self, worker_id: WorkerId) -> WorkerRecord {
@@ -431,7 +643,12 @@ impl WorkerRuntime {
     }
 
     pub fn start_execution(&self, worker_id: &WorkerId, task_id: TaskId) -> Option<WorkerRecord> {
-        self.transition(worker_id, Some(task_id), WorkerLifecycleStatus::Running, WorkerStage::Execute)
+        self.transition(
+            worker_id,
+            Some(task_id),
+            WorkerLifecycleStatus::Running,
+            WorkerStage::Execute,
+        )
     }
 
     pub fn resume_execution(
@@ -503,7 +720,12 @@ impl WorkerRuntime {
 
     pub fn start_review(&self, worker_id: &WorkerId) -> Option<WorkerRecord> {
         let task_id = self.current_task_id(worker_id)?;
-        self.transition(worker_id, Some(task_id), WorkerLifecycleStatus::Reviewing, WorkerStage::Review)
+        self.transition(
+            worker_id,
+            Some(task_id),
+            WorkerLifecycleStatus::Reviewing,
+            WorkerStage::Review,
+        )
     }
 
     pub fn start_verification(&self, worker_id: &WorkerId) -> Option<WorkerRecord> {
@@ -527,10 +749,28 @@ impl WorkerRuntime {
     }
 
     pub fn register_execution_intent(&self, intent: WorkerExecutionIntent) {
+        let task_id = intent.task_id.clone();
+        let worker_id = intent.worker_id.clone();
+        let binding_lifecycle = Some(intent.execution_profile.binding_lifecycle);
+        let checkpoint_at = UtcMillis::now();
         self.execution_intents
             .write()
             .expect("worker execution intent write lock poisoned")
             .insert(intent.task_id.clone(), intent);
+        self.record_branch_checkpoint(
+            &task_id,
+            &worker_id,
+            self.branch_snapshot_for_task(&task_id)
+                .map(|snapshot| snapshot.stage)
+                .unwrap_or(WorkerStage::Execute),
+            None,
+            Some(format!("worker-intent-{task_id}")),
+            binding_lifecycle,
+            Some(Self::default_checkpoint_cursor(
+                WorkerStage::Execute,
+                checkpoint_at,
+            )),
+        );
     }
 
     pub fn execution_intent_for(&self, task_id: &TaskId) -> Option<WorkerExecutionIntent> {
@@ -586,6 +826,29 @@ impl WorkerRuntime {
         worker.updated_at = UtcMillis::now();
         let snapshot = worker.clone();
         drop(workers);
+        if let Some(task_id) = snapshot.current_task_id.clone() {
+            let worker_id = snapshot.worker_id.clone();
+            let checkpoint_cursor = match stage {
+                WorkerStage::Execute
+                | WorkerStage::Review
+                | WorkerStage::Verify
+                | WorkerStage::Repair => self
+                    .branch_snapshot_for_task(&task_id)
+                    .and_then(|branch| branch.checkpoint_cursor)
+                    .filter(|cursor| cursor.checkpoint_stage == stage)
+                    .or_else(|| Some(Self::default_checkpoint_cursor(stage, snapshot.updated_at))),
+                WorkerStage::Finish => None,
+            };
+            self.record_branch_checkpoint(
+                &task_id,
+                &worker_id,
+                stage,
+                None,
+                None,
+                None,
+                checkpoint_cursor,
+            );
+        }
         self.publish(
             "worker.transitioned",
             serde_json::json!({
@@ -711,11 +974,11 @@ impl WorkerLoopAction {
 mod tests {
     use super::*;
     use magi_core::{
-        ApprovalRequirement, RiskLevel, TaskResultKind, TerminationReason,
-        VerificationStatus, WorkerLifecycleStatus,
+        ApprovalRequirement, RiskLevel, TaskResultKind, TerminationReason, VerificationStatus,
+        WorkerLifecycleStatus,
     };
-    use magi_governance::{GovernanceService, WorkerControlRequest};
     use magi_event_bus::InMemoryEventBus;
+    use magi_governance::{GovernanceService, WorkerControlRequest};
     use std::sync::Arc;
 
     fn worker_id(value: &str) -> WorkerId {
@@ -834,7 +1097,9 @@ mod tests {
             task_id: task_id.clone(),
         });
 
-        let outcome = loop_controller.step().expect("execute outcome should exist");
+        let outcome = loop_controller
+            .step()
+            .expect("execute outcome should exist");
         assert_eq!(outcome.kind, WorkerLoopOutcomeKind::Applied);
         assert!(outcome.report.is_some());
 
@@ -845,10 +1110,92 @@ mod tests {
 
         let reports = runtime.reports();
         assert_eq!(reports.len(), 1);
-        assert_eq!(
-            reports[0].summary,
-            "intent completed".to_string()
+        assert_eq!(reports[0].summary, "intent completed".to_string());
+    }
+
+    #[test]
+    fn worker_loop_execute_resumes_from_checkpoint_step_cursor() {
+        let bus = Arc::new(InMemoryEventBus::new(16));
+        let runtime = WorkerRuntime::new_compare(bus);
+        let loop_controller = runtime.loop_controller();
+        let worker_id = worker_id("worker-checkpoint");
+        let task_id = task_id("todo-checkpoint");
+
+        runtime.register_worker(worker_id.clone());
+        runtime.register_execution_intent(WorkerExecutionIntent {
+            worker_id: worker_id.clone(),
+            task_id: task_id.clone(),
+            session_id: None,
+            workspace_id: None,
+            execution_profile: WorkerExecutionProfile::default(),
+            steps: vec![
+                WorkerExecutionIntentStep::BuiltinToolInvocation {
+                    tool_call_id: ToolCallId::new("call-checkpoint-1".to_string()),
+                    tool_name: "file_read".to_string(),
+                    tool_kind: ToolKind::Builtin,
+                    input: "{\"path\":\"README.md\"}".to_string(),
+                    approval_requirement: ApprovalRequirement::None,
+                    risk_level: RiskLevel::Low,
+                    status: ExecutionResultStatus::Succeeded,
+                },
+                WorkerExecutionIntentStep::SkillDispatch {
+                    tool_call_id: ToolCallId::new("call-checkpoint-2".to_string()),
+                    tool_name: "process_inspect".to_string(),
+                    plan: DeterministicWorkerExecutor::default_skill_plan("process_inspect"),
+                    payload: "{\"mode\":\"intent-skill\"}".to_string(),
+                    approval_requirement: ApprovalRequirement::None,
+                    risk_level: RiskLevel::Low,
+                    working_directory: None,
+                    route: SkillDispatchRoute::Builtin,
+                    binding_id: None,
+                    detail: "intent replay".to_string(),
+                    status: SkillDispatchStatus::Succeeded,
+                },
+                WorkerExecutionIntentStep::FinalReport(WorkerExecutionFinalReport {
+                    summary: "checkpoint resumed".to_string(),
+                    result_kind: Some(TaskResultKind::Success),
+                    termination_reason: Some(TerminationReason::Completed),
+                    verification_status: VerificationStatus::Passed,
+                }),
+            ],
+        });
+        runtime.record_branch_checkpoint(
+            &task_id,
+            &worker_id,
+            WorkerStage::Execute,
+            None,
+            Some(format!("worker-intent-{task_id}")),
+            Some(WorkerExecutionBindingLifecycle::Requested),
+            Some(WorkerExecutionCheckpointCursor {
+                checkpoint_stage: WorkerStage::Execute,
+                next_step_index: 2,
+                checkpoint_at: UtcMillis::now(),
+                resume_mode: WorkerCheckpointResumeMode::StepCheckpoint,
+                resume_token: None,
+            }),
         );
+
+        loop_controller.enqueue_action(WorkerLoopAction::Execute {
+            worker_id: worker_id.clone(),
+            task_id: task_id.clone(),
+        });
+
+        let outcome = loop_controller
+            .step()
+            .expect("execute outcome should exist");
+        assert_eq!(outcome.kind, WorkerLoopOutcomeKind::Applied);
+
+        let summary = runtime.summary();
+        assert_eq!(summary.tool_call_count, 0);
+        assert_eq!(summary.skill_dispatch_count, 0);
+        let reports = runtime.reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].summary, "checkpoint resumed");
+        let snapshot = runtime
+            .branch_snapshot_for_task(&task_id)
+            .expect("branch snapshot should remain available");
+        assert_eq!(snapshot.stage, WorkerStage::Finish);
+        assert!(snapshot.checkpoint_cursor.is_none());
     }
 
     #[test]
@@ -891,10 +1238,12 @@ mod tests {
 
         let outcome = loop_controller.step().expect("step should exist");
         assert_eq!(outcome.kind, WorkerLoopOutcomeKind::Rejected);
-        assert!(outcome
-            .rejection_reason
-            .expect("rejection reason missing")
-            .contains("executor capability insufficient"));
+        assert!(
+            outcome
+                .rejection_reason
+                .expect("rejection reason missing")
+                .contains("executor capability insufficient")
+        );
         assert!(outcome.report.is_none());
         assert!(runtime.reports().is_empty());
     }
@@ -919,7 +1268,8 @@ mod tests {
             blocked: true,
             reason: Some("治理阻断".to_string()),
         };
-        let blocked_decision = GovernanceService::default().evaluate_worker_control_request(&blocked_request);
+        let blocked_decision =
+            GovernanceService::default().evaluate_worker_control_request(&blocked_request);
         loop_controller.enqueue_guarded_action(
             WorkerLoopAction::Execute {
                 worker_id: worker_id.clone(),
@@ -928,7 +1278,9 @@ mod tests {
             Some(blocked_decision),
         );
 
-        let blocked_outcome = loop_controller.step().expect("blocked outcome should exist");
+        let blocked_outcome = loop_controller
+            .step()
+            .expect("blocked outcome should exist");
         assert_eq!(blocked_outcome.kind, WorkerLoopOutcomeKind::Blocked);
         assert!(blocked_outcome.worker.is_none());
         assert!(blocked_outcome.report.is_none());
@@ -959,7 +1311,9 @@ mod tests {
             Some(repair_retry_decision),
         );
 
-        let retry_outcome = loop_controller.step().expect("repair retry outcome should exist");
+        let retry_outcome = loop_controller
+            .step()
+            .expect("repair retry outcome should exist");
         assert_eq!(retry_outcome.kind, WorkerLoopOutcomeKind::Applied);
         assert!(retry_outcome.report.is_some());
         assert_eq!(runtime.governance_summary().repair_retry, 1);

@@ -74,7 +74,12 @@ impl RuntimeStateManager {
         Some(state)
     }
 
-    pub fn write_runtime_state(&self, pid: u32, host: Option<&str>, port: u16) -> AgentRuntimeState {
+    pub fn write_runtime_state(
+        &self,
+        pid: u32,
+        host: Option<&str>,
+        port: u16,
+    ) -> AgentRuntimeState {
         let _ = std::fs::create_dir_all(&self.state_dir);
         let host = host
             .filter(|h| !h.trim().is_empty())
@@ -90,7 +95,10 @@ impl RuntimeStateManager {
             started_at: now,
             updated_at: now,
         };
-        let _ = std::fs::write(self.runtime_file(), serde_json::to_string_pretty(&state).unwrap_or_default());
+        let _ = std::fs::write(
+            self.runtime_file(),
+            serde_json::to_string_pretty(&state).unwrap_or_default(),
+        );
         state
     }
 
@@ -120,7 +128,12 @@ impl RuntimeStateManager {
         let _ = std::fs::remove_file(self.pid_file());
     }
 
-    pub fn write_client_lease(&self, client_id: &str, pid: u32, workspace_roots: Vec<String>) -> Option<AgentClientLease> {
+    pub fn write_client_lease(
+        &self,
+        client_id: &str,
+        pid: u32,
+        workspace_roots: Vec<String>,
+    ) -> Option<AgentClientLease> {
         let normalized = normalize_client_id(client_id)?;
         let _ = std::fs::create_dir_all(&self.clients_dir);
         let now = now_millis();
@@ -134,7 +147,10 @@ impl RuntimeStateManager {
             updated_at: now,
         };
         let path = self.client_lease_file(&normalized)?;
-        let _ = std::fs::write(&path, serde_json::to_string_pretty(&lease).unwrap_or_default());
+        let _ = std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&lease).unwrap_or_default(),
+        );
         Some(lease)
     }
 
@@ -162,7 +178,9 @@ impl RuntimeStateManager {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(content) = std::fs::read_to_string(&path) else { continue };
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             let Ok(lease) = serde_json::from_str::<AgentClientLease>(&content) else {
                 let _ = std::fs::remove_file(&path);
                 continue;
@@ -197,7 +215,13 @@ fn normalize_client_id(raw: &str) -> Option<String> {
     }
     let normalized: String = trimmed
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     Some(normalized)
 }

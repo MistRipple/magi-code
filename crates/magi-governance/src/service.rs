@@ -1,9 +1,9 @@
 use magi_core::{ApprovalRequirement, RiskLevel};
 
 use crate::{
-    ApprovalAction, DecisionPhase, GovernanceDecision, GovernanceDecisionTrace,
-    GovernanceTarget, GovernanceThresholds, PathAccessRequest, SandboxRequest,
-    ToolExecutionRequest, WorkerControlKind, WorkerControlRequest,
+    ApprovalAction, DecisionPhase, GovernanceDecision, GovernanceDecisionTrace, GovernanceTarget,
+    GovernanceThresholds, PathAccessRequest, SandboxRequest, ToolExecutionRequest,
+    WorkerControlKind, WorkerControlRequest,
 };
 
 #[derive(Clone, Debug)]

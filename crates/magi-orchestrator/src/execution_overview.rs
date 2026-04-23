@@ -1,10 +1,9 @@
-
+use crate::task_store::TaskStore;
 use crate::{
     AssignmentGovernanceSummary, AssignmentSkillDispatchSummary, ExecutionContextSummary,
     ExecutionOverview, ExecutionRuntimeSnapshot, ExecutionSkillDispatchSummary,
     TaskGovernanceSummary, TaskSkillDispatchSummary,
 };
-use crate::task_store::TaskStore;
 use magi_core::{AssignmentId, MissionId, Task, TaskId, TaskProjection};
 use magi_skill_runtime::{SkillDispatchRoute, SkillDispatchStatus};
 use magi_tool_runtime::ToolExecutionSummary;
@@ -14,9 +13,7 @@ use magi_worker_runtime::{
 };
 use std::collections::HashSet;
 
-pub(crate) fn build_execution_overview_payload(
-    overview: &ExecutionOverview,
-) -> serde_json::Value {
+pub(crate) fn build_execution_overview_payload(overview: &ExecutionOverview) -> serde_json::Value {
     let context_payload = overview
         .context_summary
         .as_ref()
@@ -190,7 +187,10 @@ pub(crate) fn build_execution_overview_from_task_graph(
     );
 
     Some(ExecutionOverview {
-        runtime_snapshot: build_runtime_snapshot_from_projection(&projection, assignment_roots.len()),
+        runtime_snapshot: build_runtime_snapshot_from_projection(
+            &projection,
+            assignment_roots.len(),
+        ),
         running_task_ids: projection.running_tasks.clone(),
         worker_summary,
         tool_summary,
@@ -287,7 +287,8 @@ fn build_task_governance_summaries_from_tasks(
     tasks: &[Task],
     observations: &[WorkerGovernanceObservation],
 ) -> Vec<TaskGovernanceSummary> {
-    tasks.iter()
+    tasks
+        .iter()
         .filter(|task| task.task_id != root_task.task_id)
         .map(|task| {
             let filtered = observations
@@ -339,7 +340,8 @@ fn build_task_skill_dispatch_summaries_from_tasks(
     tasks: &[Task],
     observations: &[WorkerSkillDispatchObservation],
 ) -> Vec<TaskSkillDispatchSummary> {
-    tasks.iter()
+    tasks
+        .iter()
         .filter(|task| task.task_id != root_task.task_id)
         .map(|task| {
             let filtered = observations
@@ -359,7 +361,6 @@ fn build_task_skill_dispatch_summaries_from_tasks(
         })
         .collect()
 }
-
 
 fn build_skill_dispatch_summary<'a, I>(observations: I) -> ExecutionSkillDispatchSummary
 where

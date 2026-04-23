@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::task_store::TaskStore;
 use magi_core::{
@@ -10,11 +9,11 @@ use magi_governance::{DecisionPhase, GovernanceDecision, GovernanceService, Work
 use magi_skill_runtime::{SkillDispatchRoute, SkillDispatchRuntime};
 use magi_tool_runtime::{ToolExecutionSummary, ToolRegistry};
 use magi_worker_runtime::{
-    LocalProcessExecutorCapability, LocalProcessExecutorHealth,
-    LocalProcessExecutorHealthStatus, LocalProcessWorkerExecutor, ShadowWorkerExecutor,
-    SkillDispatchSummary, WorkerExecutionFinalReport, WorkerExecutionStepKind,
-    WorkerExecutionTrace, WorkerExecutorFailure, WorkerExecutorKind, WorkerExecutorProbe,
-    WorkerRuntime, WorkerSkillDispatchObservation,
+    LocalProcessExecutorCapability, LocalProcessExecutorHealth, LocalProcessExecutorHealthStatus,
+    LocalProcessWorkerExecutor, ShadowWorkerExecutor, SkillDispatchSummary,
+    WorkerExecutionFinalReport, WorkerExecutionStepKind, WorkerExecutionTrace,
+    WorkerExecutorFailure, WorkerExecutorKind, WorkerExecutorProbe, WorkerRuntime,
+    WorkerSkillDispatchObservation,
 };
 use std::sync::{Arc, Mutex};
 
@@ -53,7 +52,10 @@ fn seed_action_tasks(
         goal: mission_title.to_string(),
         status: TaskStatus::Running,
         dependency_ids: Vec::new(),
-        required_children: tasks.iter().map(|(task_id, _, _)| task_id.clone()).collect(),
+        required_children: tasks
+            .iter()
+            .map(|(task_id, _, _)| task_id.clone())
+            .collect(),
         policy_snapshot: None,
         executor_binding: None,
         context_refs: Vec::new(),
@@ -112,7 +114,9 @@ fn seed_task_hierarchy(
     let mut child_map: std::collections::HashMap<TaskId, Vec<TaskId>> =
         std::collections::HashMap::new();
     for (task_id, parent_task_id, _, _) in tasks {
-        let parent = parent_task_id.clone().unwrap_or_else(|| root_task_id.clone());
+        let parent = parent_task_id
+            .clone()
+            .unwrap_or_else(|| root_task_id.clone());
         child_map.entry(parent).or_default().push(task_id.clone());
     }
 
@@ -126,10 +130,7 @@ fn seed_task_hierarchy(
         goal: mission_title.to_string(),
         status: root_status,
         dependency_ids: Vec::new(),
-        required_children: child_map
-            .get(&root_task_id)
-            .cloned()
-            .unwrap_or_default(),
+        required_children: child_map.get(&root_task_id).cloned().unwrap_or_default(),
         policy_snapshot: None,
         executor_binding: None,
         context_refs: Vec::new(),
@@ -147,7 +148,9 @@ fn seed_task_hierarchy(
     });
 
     for (task_id, parent_task_id, title, status) in tasks {
-        let parent = parent_task_id.clone().unwrap_or_else(|| root_task_id.clone());
+        let parent = parent_task_id
+            .clone()
+            .unwrap_or_else(|| root_task_id.clone());
         task_store.insert_task(Task {
             task_id: task_id.clone(),
             mission_id: mission_id.clone(),
@@ -284,102 +287,6 @@ fn governance_observation(
     }
 }
 
-fn build_recovery_execution_fixture(
-    with_recovery_support: bool,
-) -> (
-    OrchestratedExecutionRuntime,
-    RecoveryResumeInput,
-    WorkerId,
-    TaskId,
-) {
-    let event_bus = Arc::new(InMemoryEventBus::new(16));
-    let governance = Arc::new(GovernanceService::default());
-    let service = OrchestratorService::new(Arc::clone(&event_bus));
-    let session_store = Arc::new(magi_session_store::SessionStore::new());
-    let workspace_store = Arc::new(magi_workspace::WorkspaceStore::new());
-
-    let mission_id = MissionId::new("mission-recovery-hook");
-    let task_id = TaskId::new("todo-recovery-hook");
-    let session_id = SessionId::new("session-recovery-hook");
-    let workspace_id = WorkspaceId::new("workspace-recovery-hook");
-    let worker_id = WorkerId::new("worker-recovery-hook");
-
-    session_store
-        .create_session(session_id.clone(), "session")
-        .expect("session should be creatable");
-    session_store.bind_execution_ownership(
-        session_id.clone(),
-        magi_core::ExecutionOwnership {
-            session_id: Some(session_id.clone()),
-            workspace_id: Some(workspace_id.clone()),
-            mission_id: Some(mission_id.clone()),
-            task_id: Some(task_id.clone()),
-            worker_id: Some(worker_id.clone()),
-            execution_chain_ref: Some("chain-1".to_string()),
-        },
-    );
-
-    workspace_store
-        .register(
-            workspace_id.clone(),
-            magi_core::AbsolutePath::new("/Users/xie/code/magi"),
-        )
-        .expect("workspace should be creatable");
-    let recovery_handle = workspace_store.prepare_recovery_entry(
-        workspace_id.clone(),
-        magi_core::ExecutionOwnership {
-            session_id: Some(session_id.clone()),
-            workspace_id: Some(workspace_id.clone()),
-            mission_id: Some(mission_id.clone()),
-            task_id: Some(task_id.clone()),
-            worker_id: Some(worker_id.clone()),
-            execution_chain_ref: Some("chain-1".to_string()),
-        },
-        "snapshot-recovery-hook",
-        "recovery-recovery-hook",
-        Some("resume".to_string()),
-    );
-    workspace_store
-        .mark_recovery_ready(&recovery_handle.recovery_id)
-        .expect("recovery should be ready");
-
-    let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
-    tool_registry.register_default_builtins();
-    let skill_runtime = SkillDispatchRuntime::new(
-        tool_registry.clone(),
-        magi_bridge_client::BridgeDispatchRuntime::new(),
-    );
-    let worker_runtime = WorkerRuntime::new_compare(Arc::clone(&event_bus));
-    let task_store = Arc::new(TaskStore::new());
-    seed_action_tasks(
-        &task_store,
-        &mission_id,
-        "mission",
-        &[(task_id.clone(), "task", TaskStatus::Blocked)],
-    );
-    let execution_runtime = if with_recovery_support {
-        service
-            .execution_runtime_with_recovery_support(
-            worker_runtime,
-            tool_registry,
-            skill_runtime,
-            session_store,
-            workspace_store.clone(),
-        )
-            .with_task_store(Arc::clone(&task_store))
-    } else {
-        service
-            .execution_runtime(worker_runtime, tool_registry, skill_runtime)
-            .with_task_store(Arc::clone(&task_store))
-    };
-
-    let recovery_input = workspace_store
-        .build_recovery_resume_input(&recovery_handle.recovery_id)
-        .expect("recovery input should be buildable");
-
-    (execution_runtime, recovery_input, worker_id, task_id)
-}
-
 #[test]
 fn execution_overview_exports_context_consumption_into_runtime_read_model() {
     let event_bus = Arc::new(InMemoryEventBus::new(32));
@@ -475,6 +382,7 @@ fn execution_overview_exports_context_consumption_into_runtime_read_model() {
                 kind: Some(magi_knowledge_store::KnowledgeKind::CodeIndex),
                 text: Some("parse_manifest".to_string()),
                 tags: vec!["parser".to_string()],
+                workspace_id: None,
                 limit: 5,
             },
             memory_query: magi_memory_store::MemoryQuery {
@@ -557,8 +465,17 @@ fn execution_overview_exports_context_consumption_into_runtime_read_model() {
         mission_entry.context_memory_extraction_refs,
         vec!["extract-context-1".to_string()]
     );
-    assert_eq!(read_model.overview.diagnostics.context_execution_group_count, 1);
-    assert_eq!(read_model.overview.diagnostics.context_used_knowledge_count, 1);
+    assert_eq!(
+        read_model
+            .overview
+            .diagnostics
+            .context_execution_group_count,
+        1
+    );
+    assert_eq!(
+        read_model.overview.diagnostics.context_used_knowledge_count,
+        1
+    );
     assert_eq!(read_model.overview.diagnostics.context_used_memory_count, 2);
     assert_eq!(
         read_model
@@ -732,335 +649,6 @@ fn task_graph_aggregates_governance_summaries_by_layer() {
 }
 
 #[test]
-fn resume_dispatch_decision_prefers_blocked_task_when_recovery_target_is_implicit() {
-    let mission_id = MissionId::new("mission-implicit-resume");
-    let blocked_task_id = TaskId::new("todo-blocked");
-    let pending_task_id = TaskId::new("todo-pending");
-    let task_store = TaskStore::new();
-    let root_task_id = seed_action_tasks(
-        &task_store,
-        &mission_id,
-        "mission",
-        &[
-            (blocked_task_id.clone(), "blocked", TaskStatus::Blocked),
-            (pending_task_id, "pending", TaskStatus::Ready),
-        ],
-    );
-
-    let recovery_input = RecoveryResumeInput {
-        recovery_id: "recovery-implicit".to_string(),
-        snapshot_id: "snapshot-implicit".to_string(),
-        ownership: magi_core::ExecutionOwnership {
-            mission_id: Some(mission_id.clone()),
-            task_id: None,
-            ..Default::default()
-        },
-        diagnostic_summary: Some("resume".to_string()),
-        created_at: UtcMillis::now(),
-        updated_at: UtcMillis::now(),
-    };
-
-    let target = recovery_planner::build_recovery_target(&task_store, &recovery_input)
-        .expect("resume target should be built from task graph");
-
-    assert_eq!(target.mission_id, mission_id);
-    assert_eq!(target.root_task_id, root_task_id);
-    assert_eq!(target.task_id, blocked_task_id);
-}
-
-#[test]
-fn recovery_consume_entry_can_execute_worker_and_sync_sidecars() {
-    let event_bus = Arc::new(InMemoryEventBus::new(16));
-    let governance = Arc::new(GovernanceService::default());
-    let service = OrchestratorService::new(Arc::clone(&event_bus));
-    let session_store = Arc::new(magi_session_store::SessionStore::new());
-    let workspace_store = Arc::new(magi_workspace::WorkspaceStore::new());
-
-    let mission_id = MissionId::new("mission-recovery");
-    let task_id = TaskId::new("todo-recovery");
-    let session_id = SessionId::new("session-recovery");
-    let workspace_id = WorkspaceId::new("workspace-recovery");
-    let worker_id = WorkerId::new("worker-recovery");
-
-    session_store
-        .create_session(session_id.clone(), "session")
-        .expect("session should be creatable");
-    session_store.bind_execution_ownership(
-        session_id.clone(),
-        magi_core::ExecutionOwnership {
-            session_id: Some(session_id.clone()),
-            workspace_id: Some(workspace_id.clone()),
-            mission_id: Some(mission_id.clone()),
-            task_id: Some(task_id.clone()),
-            worker_id: Some(worker_id.clone()),
-            execution_chain_ref: Some("chain-1".to_string()),
-        },
-    );
-
-    workspace_store
-        .register(
-            workspace_id.clone(),
-            magi_core::AbsolutePath::new("/Users/xie/code/magi"),
-        )
-        .expect("workspace should be creatable");
-    let recovery_handle = workspace_store.prepare_recovery_entry(
-        workspace_id.clone(),
-        magi_core::ExecutionOwnership {
-            session_id: Some(session_id.clone()),
-            workspace_id: Some(workspace_id.clone()),
-            mission_id: Some(mission_id.clone()),
-            task_id: Some(task_id.clone()),
-            worker_id: Some(worker_id.clone()),
-            execution_chain_ref: Some("chain-1".to_string()),
-        },
-        "snapshot-recovery",
-        "recovery-recovery",
-        Some("resume".to_string()),
-    );
-    workspace_store
-        .mark_recovery_ready(&recovery_handle.recovery_id)
-        .expect("recovery should be ready");
-
-    let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
-    tool_registry.register_default_builtins();
-    let task_store = Arc::new(TaskStore::new());
-    seed_action_tasks(
-        &task_store,
-        &mission_id,
-        "mission",
-        &[(task_id.clone(), "task", TaskStatus::Blocked)],
-    );
-    let execution_runtime = service
-        .execution_runtime_with_recovery_support(
-            WorkerRuntime::new_compare(Arc::clone(&event_bus)),
-            tool_registry.clone(),
-            SkillDispatchRuntime::new(
-                tool_registry,
-                magi_bridge_client::BridgeDispatchRuntime::new(),
-            ),
-            session_store.clone(),
-            workspace_store.clone(),
-        )
-        .with_task_store(Arc::clone(&task_store));
-
-    let recovery_input = workspace_store
-        .build_recovery_resume_input(&recovery_handle.recovery_id)
-        .expect("recovery input should be buildable");
-    let result = execution_runtime
-        .execute_recovery(recovery_input, worker_id, None)
-        .expect("recovery should execute");
-
-    assert_eq!(result.target.task_id, task_id);
-    assert_eq!(result.dispatch.overview.runtime_snapshot.completed_tasks, 1);
-    assert_eq!(result.dispatch.overview.skill_dispatch_summary.total_dispatches, 1);
-    assert_eq!(
-        result
-            .session_sidecar
-            .as_ref()
-            .map(|sidecar| sidecar.current_status.clone()),
-        Some(magi_session_store::SessionExecutionSidecarStatus::Resumed)
-    );
-    assert_eq!(
-        result
-            .session_sidecar
-            .as_ref()
-            .and_then(|sidecar| sidecar.recovery_ref.clone())
-            .as_deref(),
-        Some("recovery-recovery")
-    );
-    assert_eq!(
-        result
-            .workspace_recovery
-            .as_ref()
-            .map(|handle| handle.current_status.clone()),
-        Some(magi_workspace::RecoveryStatus::Consumed)
-    );
-    assert_eq!(result.runtime_snapshot.completed_tasks, 1);
-}
-
-#[test]
-fn recovery_execution_prefers_requested_worker_id_over_stored_ownership_worker() {
-    let (execution_runtime, recovery_input, _, _) = build_recovery_execution_fixture(true);
-    let override_worker_id = WorkerId::new("worker-recovery-override");
-
-    let result = execution_runtime
-        .execute_recovery(recovery_input, override_worker_id.clone(), None)
-        .expect("recovery should execute with override worker");
-
-    assert_eq!(result.target.requested_worker_id, Some(override_worker_id.clone()));
-    assert_eq!(result.dispatch.intent.worker_id, override_worker_id);
-    assert_eq!(
-        result
-            .session_sidecar
-            .as_ref()
-            .and_then(|sidecar| sidecar.ownership.worker_id.clone()),
-        result.target.requested_worker_id
-    );
-    assert_eq!(
-        result
-            .workspace_recovery
-            .as_ref()
-            .and_then(|recovery| recovery.ownership.worker_id.clone()),
-        result.target.requested_worker_id
-    );
-}
-
-#[test]
-fn execution_runtime_execute_recovery_then_runs_hook_only_after_success() {
-    let (execution_runtime, recovery_input, worker_id, task_id) =
-        build_recovery_execution_fixture(true);
-
-    let hook_log = Arc::new(Mutex::new(Vec::<String>::new()));
-    let hook_log_capture = Arc::clone(&hook_log);
-    let result = execution_runtime
-        .execute_recovery_then(recovery_input, worker_id, None, move |result| {
-            hook_log_capture
-                .lock()
-                .expect("hook log lock should hold")
-                .push(result.recovery_input.recovery_id.clone());
-        })
-        .expect("recovery should execute");
-
-    assert_eq!(result.target.task_id, task_id);
-    assert_eq!(result.dispatch.overview.runtime_snapshot.completed_tasks, 1);
-    assert_eq!(
-        hook_log.lock().expect("hook log lock should hold").as_slice(),
-        &[result.recovery_input.recovery_id.clone()]
-    );
-}
-
-#[test]
-fn execution_runtime_execute_recovery_then_skips_hook_when_recovery_support_missing() {
-    let (execution_runtime, recovery_input, worker_id, _) = build_recovery_execution_fixture(false);
-
-    let hook_calls = Arc::new(Mutex::new(0usize));
-    let hook_calls_capture = Arc::clone(&hook_calls);
-    let error = execution_runtime
-        .execute_recovery_then(recovery_input, worker_id, None, move |_| {
-            let mut calls = hook_calls_capture
-                .lock()
-                .expect("hook calls lock should hold");
-            *calls += 1;
-        })
-        .expect_err("missing recovery support should reject execution before hook");
-
-    match error {
-        OrchestratorCommandError::RecoverySupportUnavailable { missing } => {
-            assert!(missing.contains("workspace_store"));
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
-    assert_eq!(*hook_calls.lock().expect("hook calls lock should hold"), 0);
-}
-
-#[test]
-fn execution_runtime_execute_recovery_rejects_prepared_input_before_sidecar_mutation() {
-    let event_bus = Arc::new(InMemoryEventBus::new(16));
-    let governance = Arc::new(GovernanceService::default());
-    let service = OrchestratorService::new(Arc::clone(&event_bus));
-    let session_store = Arc::new(magi_session_store::SessionStore::new());
-    let workspace_store = Arc::new(magi_workspace::WorkspaceStore::new());
-    let task_store = Arc::new(TaskStore::new());
-
-    let mission_id = MissionId::new("mission-recovery-prepared");
-    let task_id = TaskId::new("todo-recovery-prepared");
-    let session_id = SessionId::new("session-recovery-prepared");
-    let workspace_id = WorkspaceId::new("workspace-recovery-prepared");
-    let worker_id = WorkerId::new("worker-recovery-prepared");
-
-    seed_action_tasks(
-        &task_store,
-        &mission_id,
-        "mission",
-        &[(task_id.clone(), "task", TaskStatus::Ready)],
-    );
-
-    session_store
-        .create_session(session_id.clone(), "session")
-        .expect("session should be creatable");
-    session_store.bind_execution_ownership(
-        session_id.clone(),
-        magi_core::ExecutionOwnership {
-            session_id: Some(session_id.clone()),
-            workspace_id: Some(workspace_id.clone()),
-            mission_id: Some(mission_id.clone()),
-            task_id: Some(task_id.clone()),
-            worker_id: Some(worker_id.clone()),
-            execution_chain_ref: Some("chain-prepared".to_string()),
-        },
-    );
-
-    workspace_store
-        .register(
-            workspace_id.clone(),
-            magi_core::AbsolutePath::new("/Users/xie/code/magi"),
-        )
-        .expect("workspace should be creatable");
-    let recovery_handle = workspace_store.prepare_recovery_entry(
-        workspace_id.clone(),
-        magi_core::ExecutionOwnership {
-            session_id: Some(session_id.clone()),
-            workspace_id: Some(workspace_id.clone()),
-            mission_id: Some(mission_id.clone()),
-            task_id: Some(task_id.clone()),
-            worker_id: Some(worker_id.clone()),
-            execution_chain_ref: Some("chain-prepared".to_string()),
-        },
-        "snapshot-recovery-prepared",
-        "recovery-prepared",
-        Some("resume".to_string()),
-    );
-
-    let recovery_input = magi_core::RecoveryResumeInput {
-        recovery_id: recovery_handle.recovery_id.clone(),
-        snapshot_id: recovery_handle.snapshot_id.clone(),
-        ownership: recovery_handle.ownership.clone(),
-        diagnostic_summary: recovery_handle.diagnostic_summary.clone(),
-        created_at: recovery_handle.created_at,
-        updated_at: recovery_handle.updated_at,
-    };
-
-    let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
-    tool_registry.register_default_builtins();
-    let execution_runtime = service.execution_runtime_with_recovery_support(
-        WorkerRuntime::new_compare(Arc::clone(&event_bus)),
-        tool_registry.clone(),
-        SkillDispatchRuntime::new(
-            tool_registry,
-            magi_bridge_client::BridgeDispatchRuntime::new(),
-        ),
-        session_store.clone(),
-        workspace_store.clone(),
-    )
-    .with_task_store(Arc::clone(&task_store));
-
-    let error = execution_runtime
-        .execute_recovery(recovery_input, worker_id, None)
-        .expect_err("prepared recovery should fail before mutation");
-
-    match error {
-        OrchestratorCommandError::RecoverySupportUnavailable { missing } => {
-            assert!(missing.contains("还未进入 Ready"));
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
-
-    let sidecar = session_store
-        .execution_sidecar_export(&session_id)
-        .expect("session sidecar should remain available");
-    assert_eq!(
-        sidecar.current_status,
-        magi_session_store::SessionExecutionSidecarStatus::Bound
-    );
-    assert!(sidecar.recovery_ref.is_none());
-
-    let recovery_export = workspace_store
-        .recovery_sidecar_export("recovery-prepared")
-        .expect("recovery export should still exist");
-    assert_eq!(recovery_export.current_status, magi_workspace::RecoveryStatus::Prepared);
-}
-
-#[test]
 fn execution_runtime_can_run_dispatch_through_worker_loop() {
     let event_bus = Arc::new(InMemoryEventBus::new(32));
     let service = OrchestratorService::new(Arc::clone(&event_bus));
@@ -1072,12 +660,21 @@ fn execution_runtime_can_run_dispatch_through_worker_loop() {
         magi_bridge_client::BridgeDispatchRuntime::new(),
     );
     let worker_runtime = WorkerRuntime::new_compare(Arc::clone(&event_bus));
-    let (execution_runtime, task_store) =
-        build_execution_runtime_with_task_store(&service, worker_runtime, tool_registry, skill_runtime);
+    let (execution_runtime, task_store) = build_execution_runtime_with_task_store(
+        &service,
+        worker_runtime,
+        tool_registry,
+        skill_runtime,
+    );
 
     let mission_id = MissionId::new("mission-exec");
     let task_id = TaskId::new("todo-exec");
-    seed_action_tasks(&task_store, &mission_id, "mission", &[(task_id.clone(), "task", TaskStatus::Ready)]);
+    seed_action_tasks(
+        &task_store,
+        &mission_id,
+        "mission",
+        &[(task_id.clone(), "task", TaskStatus::Ready)],
+    );
 
     let result = execution_runtime
         .execute_dispatch(
@@ -1124,43 +721,45 @@ fn execution_runtime_automatically_assembles_context_summary_when_configured() {
     );
     let worker_runtime = WorkerRuntime::new_compare(Arc::clone(&event_bus));
 
-    let knowledge_store = magi_knowledge_store::KnowledgeStore::new();
-    knowledge_store.ingest_code_index(magi_knowledge_store::CodeIndexIngestion {
-        knowledge_id: "kb-exec-context-1".to_string(),
-        title: "Mission parser refresh".to_string(),
-        content: "Fix manifest parser for execution runtime context.".to_string(),
-        tags: vec!["parser".to_string(), "runtime".to_string()],
-        source_ref: Some("knowledge://execution-context".to_string()),
-        updated_at: UtcMillis::now(),
-        source: magi_knowledge_store::CodeIndexSource {
-            path: "src/parser.rs".to_string(),
-            language: Some("rust".to_string()),
-            repo_ref: Some("repo".to_string()),
-            commit_ref: Some("commit".to_string()),
-            start_line: Some(12),
-            end_line: Some(48),
-            symbol: Some(magi_knowledge_store::CodeIndexSymbol {
-                name: "refresh_manifest_parser".to_string(),
-                kind: magi_knowledge_store::CodeSymbolKind::Function,
-                container: None,
-                signature: Some("fn refresh_manifest_parser(input: &str)".to_string()),
-            }),
-        },
-        audit: Some(magi_knowledge_store::KnowledgeAuditLink {
-            audit_event_id: "audit-exec-context-1".to_string(),
-            trail_ref: Some("audit/trails/execution-context.json".to_string()),
-            sequence: Some(3),
-        }),
-        governance: Some(magi_knowledge_store::KnowledgeGovernanceLink {
-            outcome: magi_knowledge_store::KnowledgeGovernanceOutcome::Allowed,
-            policy_refs: vec!["policy.knowledge.read".to_string()],
-            rationale: Some("allowed for execution runtime context".to_string()),
-            audit_event_id: Some("audit-exec-context-1".to_string()),
-        }),
-    });
-
     let session_id = SessionId::new("session-exec-context");
     let workspace_id = WorkspaceId::new("workspace-exec-context");
+    let knowledge_store = magi_knowledge_store::KnowledgeStore::new();
+    knowledge_store.ingest_code_index_in_workspace(
+        workspace_id.clone(),
+        magi_knowledge_store::CodeIndexIngestion {
+            knowledge_id: "kb-exec-context-1".to_string(),
+            title: "Mission parser refresh".to_string(),
+            content: "Fix manifest parser for execution runtime context.".to_string(),
+            tags: vec!["parser".to_string(), "runtime".to_string()],
+            source_ref: Some("knowledge://execution-context".to_string()),
+            updated_at: UtcMillis::now(),
+            source: magi_knowledge_store::CodeIndexSource {
+                path: "src/parser.rs".to_string(),
+                language: Some("rust".to_string()),
+                repo_ref: Some("repo".to_string()),
+                commit_ref: Some("commit".to_string()),
+                start_line: Some(12),
+                end_line: Some(48),
+                symbol: Some(magi_knowledge_store::CodeIndexSymbol {
+                    name: "refresh_manifest_parser".to_string(),
+                    kind: magi_knowledge_store::CodeSymbolKind::Function,
+                    container: None,
+                    signature: Some("fn refresh_manifest_parser(input: &str)".to_string()),
+                }),
+            },
+            audit: Some(magi_knowledge_store::KnowledgeAuditLink {
+                audit_event_id: "audit-exec-context-1".to_string(),
+                trail_ref: Some("audit/trails/execution-context.json".to_string()),
+                sequence: Some(3),
+            }),
+            governance: Some(magi_knowledge_store::KnowledgeGovernanceLink {
+                outcome: magi_knowledge_store::KnowledgeGovernanceOutcome::Allowed,
+                policy_refs: vec!["policy.knowledge.read".to_string()],
+                rationale: Some("allowed for execution runtime context".to_string()),
+                audit_event_id: Some("audit-exec-context-1".to_string()),
+            }),
+        },
+    );
     let memory_store = magi_memory_store::MemoryStore::new();
     memory_store.apply_extraction(magi_memory_store::MemoryExtractionApplyRequest {
         extraction_id: "extract-exec-context-1".to_string(),
@@ -1190,18 +789,18 @@ fn execution_runtime_automatically_assembles_context_summary_when_configured() {
         skill_runtime,
     );
     let execution_runtime = execution_runtime.with_context_runtime(
-            context_runtime,
-            ExecutionContextConfig {
-                budget: magi_context_runtime::ContextBudget {
-                    max_turns: 4,
-                    max_knowledge: 3,
-                    max_memory: 3,
-                    max_shared_items: 2,
-                    max_file_summaries: 2,
-                },
-                project_key: Some("project-exec-context".to_string()),
+        context_runtime,
+        ExecutionContextConfig {
+            budget: magi_context_runtime::ContextBudget {
+                max_turns: 4,
+                max_knowledge: 3,
+                max_memory: 3,
+                max_shared_items: 2,
+                max_file_summaries: 2,
             },
-        );
+            project_key: Some("project-exec-context".to_string()),
+        },
+    );
 
     let mission_id = MissionId::new("mission-exec-context");
     let task_id = TaskId::new("todo-exec-context");
@@ -1277,12 +876,21 @@ fn execution_runtime_execute_dispatch_then_runs_hook_only_after_success() {
         magi_bridge_client::BridgeDispatchRuntime::new(),
     );
     let worker_runtime = WorkerRuntime::new_compare(Arc::clone(&event_bus));
-    let (execution_runtime, task_store) =
-        build_execution_runtime_with_task_store(&service, worker_runtime, tool_registry, skill_runtime);
+    let (execution_runtime, task_store) = build_execution_runtime_with_task_store(
+        &service,
+        worker_runtime,
+        tool_registry,
+        skill_runtime,
+    );
 
     let mission_id = MissionId::new("mission-dispatch-hook-success");
     let task_id = TaskId::new("todo-dispatch-hook-success");
-    seed_action_tasks(&task_store, &mission_id, "mission", &[(task_id.clone(), "task", TaskStatus::Ready)]);
+    seed_action_tasks(
+        &task_store,
+        &mission_id,
+        "mission",
+        &[(task_id.clone(), "task", TaskStatus::Ready)],
+    );
 
     let hook_log = Arc::new(Mutex::new(Vec::<String>::new()));
     let hook_log_capture = Arc::clone(&hook_log);
@@ -1304,7 +912,10 @@ fn execution_runtime_execute_dispatch_then_runs_hook_only_after_success() {
 
     assert_eq!(result.target.task_id, task_id);
     assert_eq!(
-        hook_log.lock().expect("hook log lock should hold").as_slice(),
+        hook_log
+            .lock()
+            .expect("hook log lock should hold")
+            .as_slice(),
         &[task_id.to_string()]
     );
 }
@@ -1321,14 +932,23 @@ fn execution_runtime_execute_dispatch_with_writebacks_persists_memory_extraction
         magi_bridge_client::BridgeDispatchRuntime::new(),
     );
     let worker_runtime = WorkerRuntime::new_compare(Arc::clone(&event_bus));
-    let (execution_runtime, task_store) =
-        build_execution_runtime_with_task_store(&service, worker_runtime, tool_registry, skill_runtime);
+    let (execution_runtime, task_store) = build_execution_runtime_with_task_store(
+        &service,
+        worker_runtime,
+        tool_registry,
+        skill_runtime,
+    );
     let memory_store = magi_memory_store::MemoryStore::new();
 
     let mission_id = MissionId::new("mission-dispatch-writeback-success");
     let task_id = TaskId::new("todo-dispatch-writeback-success");
     let session_id = SessionId::new("session-dispatch-writeback-success");
-    seed_action_tasks(&task_store, &mission_id, "mission", &[(task_id.clone(), "task", TaskStatus::Ready)]);
+    seed_action_tasks(
+        &task_store,
+        &mission_id,
+        "mission",
+        &[(task_id.clone(), "task", TaskStatus::Ready)],
+    );
 
     let writebacks = ExecutionWritebackPlans::from_optional_memory_extraction(Some(
         magi_memory_store::MemoryExtractionApplyRequest {
@@ -1359,10 +979,12 @@ fn execution_runtime_execute_dispatch_with_writebacks_persists_memory_extraction
         .expect("execution should run");
 
     assert_eq!(result.target.task_id, task_id);
-    assert!(memory_store
-        .verify_extraction_linkage("extract-dispatch-writeback-success")
-        .expect("dispatch writeback should persist extraction linkage")
-        .is_consistent);
+    assert!(
+        memory_store
+            .verify_extraction_linkage("extract-dispatch-writeback-success")
+            .expect("dispatch writeback should persist extraction linkage")
+            .is_consistent
+    );
 }
 
 #[test]
@@ -1378,12 +1000,21 @@ fn execution_runtime_can_run_dispatch_through_local_process_executor() {
     );
     let worker_runtime = WorkerRuntime::new(Arc::clone(&event_bus))
         .with_executor(Arc::new(LocalProcessWorkerExecutor::cargo_loopback()));
-    let (execution_runtime, task_store) =
-        build_execution_runtime_with_task_store(&service, worker_runtime, tool_registry, skill_runtime);
+    let (execution_runtime, task_store) = build_execution_runtime_with_task_store(
+        &service,
+        worker_runtime,
+        tool_registry,
+        skill_runtime,
+    );
 
     let mission_id = MissionId::new("mission-local-exec");
     let task_id = TaskId::new("todo-local-exec");
-    seed_action_tasks(&task_store, &mission_id, "mission", &[(task_id.clone(), "task", TaskStatus::Ready)]);
+    seed_action_tasks(
+        &task_store,
+        &mission_id,
+        "mission",
+        &[(task_id.clone(), "task", TaskStatus::Ready)],
+    );
 
     let result = execution_runtime
         .execute_dispatch(
@@ -1447,7 +1078,8 @@ impl ShadowWorkerExecutor for UnhealthyLocalExecutor {
                     process_model:
                         magi_worker_runtime::LocalProcessExecutorProcessModel::OneShotSubprocess,
                     reuse_scope: magi_worker_runtime::WorkerExecutionBindingScope::None,
-                    parallelism_scope: magi_worker_runtime::WorkerExecutionParallelismScope::Executor,
+                    parallelism_scope:
+                        magi_worker_runtime::WorkerExecutionParallelismScope::Executor,
                     lease_state: magi_worker_runtime::WorkerExecutionLeaseState::None,
                     binding_lifecycle: magi_worker_runtime::WorkerExecutionBindingLifecycle::None,
                     process_lifecycle:
@@ -1487,8 +1119,12 @@ fn execution_runtime_rejects_unhealthy_local_process_executor_before_execute() {
     );
     let worker_runtime =
         WorkerRuntime::new(Arc::clone(&event_bus)).with_executor(Arc::new(UnhealthyLocalExecutor));
-    let (execution_runtime, task_store) =
-        build_execution_runtime_with_task_store(&service, worker_runtime, tool_registry, skill_runtime);
+    let (execution_runtime, task_store) = build_execution_runtime_with_task_store(
+        &service,
+        worker_runtime,
+        tool_registry,
+        skill_runtime,
+    );
 
     let mission_id = MissionId::new("mission-unhealthy-exec");
     let task_id = TaskId::new("todo-unhealthy-exec");
@@ -1530,8 +1166,12 @@ fn execution_runtime_execute_dispatch_then_skips_hook_on_failure() {
     );
     let worker_runtime =
         WorkerRuntime::new(Arc::clone(&event_bus)).with_executor(Arc::new(UnhealthyLocalExecutor));
-    let (execution_runtime, task_store) =
-        build_execution_runtime_with_task_store(&service, worker_runtime, tool_registry, skill_runtime);
+    let (execution_runtime, task_store) = build_execution_runtime_with_task_store(
+        &service,
+        worker_runtime,
+        tool_registry,
+        skill_runtime,
+    );
 
     let mission_id = MissionId::new("mission-dispatch-hook-failure");
     let task_id = TaskId::new("todo-dispatch-hook-failure");
@@ -1582,8 +1222,12 @@ fn execution_runtime_execute_dispatch_with_writebacks_skips_writeback_on_failure
     );
     let worker_runtime =
         WorkerRuntime::new(Arc::clone(&event_bus)).with_executor(Arc::new(UnhealthyLocalExecutor));
-    let (execution_runtime, task_store) =
-        build_execution_runtime_with_task_store(&service, worker_runtime, tool_registry, skill_runtime);
+    let (execution_runtime, task_store) = build_execution_runtime_with_task_store(
+        &service,
+        worker_runtime,
+        tool_registry,
+        skill_runtime,
+    );
     let memory_store = magi_memory_store::MemoryStore::new();
 
     let mission_id = MissionId::new("mission-dispatch-writeback-failure");
@@ -1630,9 +1274,11 @@ fn execution_runtime_execute_dispatch_with_writebacks_skips_writeback_on_failure
         }
         other => panic!("unexpected error: {other:?}"),
     }
-    assert!(memory_store
-        .extraction_linkage("extract-dispatch-writeback-failure")
-        .is_none());
+    assert!(
+        memory_store
+            .extraction_linkage("extract-dispatch-writeback-failure")
+            .is_none()
+    );
 }
 
 #[test]
@@ -1650,12 +1296,21 @@ fn execution_runtime_rejects_local_process_executor_missing_step_capability_befo
         LocalProcessWorkerExecutor::cargo_loopback()
             .with_env("MAGI_LOCAL_WORKER_SUPPORTED_STEP_KINDS", "final-report"),
     ));
-    let (execution_runtime, task_store) =
-        build_execution_runtime_with_task_store(&service, worker_runtime, tool_registry, skill_runtime);
+    let (execution_runtime, task_store) = build_execution_runtime_with_task_store(
+        &service,
+        worker_runtime,
+        tool_registry,
+        skill_runtime,
+    );
 
     let mission_id = MissionId::new("mission-step-capability");
     let task_id = TaskId::new("todo-step-capability");
-    seed_action_tasks(&task_store, &mission_id, "mission", &[(task_id.clone(), "task", TaskStatus::Ready)]);
+    seed_action_tasks(
+        &task_store,
+        &mission_id,
+        "mission",
+        &[(task_id.clone(), "task", TaskStatus::Ready)],
+    );
 
     let error = execution_runtime
         .execute_dispatch(
@@ -1691,8 +1346,12 @@ fn execution_runtime_rejects_local_process_executor_affinity_mismatch_before_exe
             .with_env("MAGI_LOCAL_WORKER_SESSION_ID", "session-affine")
             .with_env("MAGI_LOCAL_WORKER_WORKSPACE_ID", "workspace-affine"),
     ));
-    let (execution_runtime, task_store) =
-        build_execution_runtime_with_task_store(&service, worker_runtime, tool_registry, skill_runtime);
+    let (execution_runtime, task_store) = build_execution_runtime_with_task_store(
+        &service,
+        worker_runtime,
+        tool_registry,
+        skill_runtime,
+    );
 
     let mission_id = MissionId::new("mission-affinity-capability");
     let task_id = TaskId::new("todo-affinity-capability");
@@ -1915,7 +1574,11 @@ mod risk_policy_tests {
             acceptance_criteria_count: 0,
             failure_rate: None,
         });
-        assert!(assessment.signals.contains(&"config_or_dependency_change".to_string()));
+        assert!(
+            assessment
+                .signals
+                .contains(&"config_or_dependency_change".to_string())
+        );
     }
 
     #[test]
@@ -1929,7 +1592,12 @@ mod risk_policy_tests {
             acceptance_criteria_count: 0,
             failure_rate: Some(0.5),
         });
-        assert!(assessment.signals.iter().any(|s| s.starts_with("failure_rate")));
+        assert!(
+            assessment
+                .signals
+                .iter()
+                .any(|s| s.starts_with("failure_rate"))
+        );
     }
 
     #[test]
@@ -1943,7 +1611,11 @@ mod risk_policy_tests {
             acceptance_criteria_count: 0,
             failure_rate: None,
         });
-        assert!(assessment.signals.contains(&"unknown_file_scope".to_string()));
+        assert!(
+            assessment
+                .signals
+                .contains(&"unknown_file_scope".to_string())
+        );
     }
 }
 
@@ -2097,15 +1769,25 @@ mod plan_ledger_tests {
         let mut svc = PlanLedgerService::new();
         let plan = svc.create_draft(draft_input("s1", "t1"));
 
-        let approved = svc.approve("s1", &plan.plan_id, None, Some("看起来不错")).unwrap();
+        let approved = svc
+            .approve("s1", &plan.plan_id, None, Some("看起来不错"))
+            .unwrap();
         assert_eq!(approved.status, PlanStatus::Approved);
-        assert_eq!(approved.review.as_ref().unwrap().status, PlanReviewStatus::Approved);
+        assert_eq!(
+            approved.review.as_ref().unwrap().status,
+            PlanReviewStatus::Approved
+        );
 
         let mut svc2 = PlanLedgerService::new();
         let plan2 = svc2.create_draft(draft_input("s1", "t2"));
-        let rejected = svc2.reject("s1", &plan2.plan_id, None, Some("方案不合理")).unwrap();
+        let rejected = svc2
+            .reject("s1", &plan2.plan_id, None, Some("方案不合理"))
+            .unwrap();
         assert_eq!(rejected.status, PlanStatus::Rejected);
-        assert_eq!(rejected.review.as_ref().unwrap().reason.as_deref(), Some("方案不合理"));
+        assert_eq!(
+            rejected.review.as_ref().unwrap().reason.as_deref(),
+            Some("方案不合理")
+        );
     }
 
     #[test]
@@ -2116,9 +1798,14 @@ mod plan_ledger_tests {
         let executing = svc.mark_executing("s1", &plan.plan_id).unwrap();
         assert_eq!(executing.status, PlanStatus::Executing);
 
-        let finalized = svc.finalize("s1", &plan.plan_id, PlanStatus::Completed).unwrap();
+        let finalized = svc
+            .finalize("s1", &plan.plan_id, PlanStatus::Completed)
+            .unwrap();
         assert_eq!(finalized.status, PlanStatus::Completed);
-        assert_eq!(finalized.runtime.acceptance.summary, PlanAcceptanceSummary::Passed);
+        assert_eq!(
+            finalized.runtime.acceptance.summary,
+            PlanAcceptanceSummary::Passed
+        );
     }
 
     #[test]
@@ -2166,12 +1853,24 @@ mod plan_ledger_tests {
         let mut svc = PlanLedgerService::new();
         let plan = svc.create_draft(draft_input("s1", "t1"));
 
-        let updated = svc.upsert_dispatch_item("s1", &plan.plan_id, item_input("item-1", "编写接口", "worker-a")).unwrap();
+        let updated = svc
+            .upsert_dispatch_item(
+                "s1",
+                &plan.plan_id,
+                item_input("item-1", "编写接口", "worker-a"),
+            )
+            .unwrap();
         assert_eq!(updated.items.len(), 1);
         assert_eq!(updated.items[0].title, "编写接口");
         assert!(updated.status == PlanStatus::Approved);
 
-        let updated2 = svc.upsert_dispatch_item("s1", &plan.plan_id, item_input("item-1", "修改接口", "worker-b")).unwrap();
+        let updated2 = svc
+            .upsert_dispatch_item(
+                "s1",
+                &plan.plan_id,
+                item_input("item-1", "修改接口", "worker-b"),
+            )
+            .unwrap();
         assert_eq!(updated2.items.len(), 1);
         assert_eq!(updated2.items[0].title, "修改接口");
         assert_eq!(updated2.items[0].owner, "worker-b");
@@ -2237,25 +1936,37 @@ mod plan_ledger_tests {
         svc.approve("s1", &plan.plan_id, None, None);
         svc.mark_executing("s1", &plan.plan_id);
 
-        let started = svc.start_attempt("s1", &plan.plan_id, PlanAttemptStartInput {
-            scope: PlanAttemptScope::Orchestrator,
-            target_id: None,
-            assignment_id: None,
-            task_id: None,
-            reason: Some("开始执行".to_string()),
-        }).unwrap();
+        let started = svc
+            .start_attempt(
+                "s1",
+                &plan.plan_id,
+                PlanAttemptStartInput {
+                    scope: PlanAttemptScope::Orchestrator,
+                    target_id: None,
+                    assignment_id: None,
+                    task_id: None,
+                    reason: Some("开始执行".to_string()),
+                },
+            )
+            .unwrap();
         assert_eq!(started.attempts.len(), 1);
         assert_eq!(started.attempts[0].status, PlanAttemptStatus::Inflight);
 
-        let completed = svc.complete_latest_attempt("s1", &plan.plan_id, PlanAttemptCompleteInput {
-            scope: PlanAttemptScope::Orchestrator,
-            target_id: None,
-            assignment_id: None,
-            task_id: None,
-            status: PlanAttemptStatus::Succeeded,
-            error: None,
-            evidence_ids: None,
-        }).unwrap();
+        let completed = svc
+            .complete_latest_attempt(
+                "s1",
+                &plan.plan_id,
+                PlanAttemptCompleteInput {
+                    scope: PlanAttemptScope::Orchestrator,
+                    target_id: None,
+                    assignment_id: None,
+                    task_id: None,
+                    status: PlanAttemptStatus::Succeeded,
+                    error: None,
+                    evidence_ids: None,
+                },
+            )
+            .unwrap();
         assert_eq!(completed.attempts[0].status, PlanAttemptStatus::Succeeded);
         assert!(completed.attempts[0].ended_at.is_some());
     }
@@ -2336,7 +2047,9 @@ mod plan_ledger_tests {
         svc.approve("s1", &plan.plan_id, None, None);
         svc.mark_executing("s1", &plan.plan_id);
 
-        let updated = svc.update_runtime_review("s1", &plan.plan_id, ReviewState::Running, Some(1)).unwrap();
+        let updated = svc
+            .update_runtime_review("s1", &plan.plan_id, ReviewState::Running, Some(1))
+            .unwrap();
         assert_eq!(updated.runtime.review.state, ReviewState::Running);
         assert_eq!(updated.runtime.review.round, 1);
         assert!(updated.runtime.review.last_reviewed_at.is_some());
@@ -2347,16 +2060,27 @@ mod plan_ledger_tests {
         let mut svc = PlanLedgerService::new();
         let plan = svc.create_draft(draft_input("s1", "t1"));
 
-        let updated = svc.update_runtime_acceptance(
-            "s1",
-            &plan.plan_id,
-            Some(vec![
-                AcceptanceCriterion { description: "编译通过".to_string(), met: true },
-                AcceptanceCriterion { description: "测试通过".to_string(), met: false },
-            ]),
-            None,
-        ).unwrap();
-        assert_eq!(updated.runtime.acceptance.summary, PlanAcceptanceSummary::Partial);
+        let updated = svc
+            .update_runtime_acceptance(
+                "s1",
+                &plan.plan_id,
+                Some(vec![
+                    AcceptanceCriterion {
+                        description: "编译通过".to_string(),
+                        met: true,
+                    },
+                    AcceptanceCriterion {
+                        description: "测试通过".to_string(),
+                        met: false,
+                    },
+                ]),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            updated.runtime.acceptance.summary,
+            PlanAcceptanceSummary::Partial
+        );
         assert_eq!(updated.runtime.acceptance.criteria.len(), 2);
     }
 }
@@ -2367,23 +2091,24 @@ mod auto_learning_tests {
     #[test]
     fn preference_miner_correction() {
         let miner = PreferenceMiner::new();
-        let result = miner.mine_from_conversation(
-            &["不要添加注释", "必须使用中文"],
-            &["好的"],
-        );
+        let result = miner.mine_from_conversation(&["不要添加注释", "必须使用中文"], &["好的"]);
         assert!(result.preferences.len() >= 2);
-        let correction = result.preferences.iter().find(|p| p.pattern.contains("注释")).unwrap();
-        assert_eq!(correction.category, preference_miner::PreferenceCategory::Constraint);
+        let correction = result
+            .preferences
+            .iter()
+            .find(|p| p.pattern.contains("注释"))
+            .unwrap();
+        assert_eq!(
+            correction.category,
+            preference_miner::PreferenceCategory::Constraint
+        );
         assert!(correction.confidence >= 0.7);
     }
 
     #[test]
     fn preference_miner_mandatory() {
         let miner = PreferenceMiner::new();
-        let result = miner.mine_from_conversation(
-            &["务必先跑测试再提交"],
-            &[],
-        );
+        let result = miner.mine_from_conversation(&["务必先跑测试再提交"], &[]);
         assert!(!result.preferences.is_empty());
         let mandatory = &result.preferences[0];
         assert!(mandatory.pattern.contains("先跑测试再提交"));
@@ -2392,33 +2117,34 @@ mod auto_learning_tests {
     #[test]
     fn preference_miner_format() {
         let miner = PreferenceMiner::new();
-        let result = miner.mine_from_conversation(
-            &["请用中文回复"],
-            &[],
-        );
-        let format_pref = result.preferences.iter().find(|p| p.pattern.contains("中文"));
+        let result = miner.mine_from_conversation(&["请用中文回复"], &[]);
+        let format_pref = result
+            .preferences
+            .iter()
+            .find(|p| p.pattern.contains("中文"));
         assert!(format_pref.is_some());
     }
 
     #[test]
     fn preference_miner_style() {
         let miner = PreferenceMiner::new();
-        let result = miner.mine_from_conversation(
-            &["简单点说"],
-            &[],
-        );
-        let style_pref = result.preferences.iter().find(|p| p.pattern.contains("简洁"));
+        let result = miner.mine_from_conversation(&["简单点说"], &[]);
+        let style_pref = result
+            .preferences
+            .iter()
+            .find(|p| p.pattern.contains("简洁"));
         assert!(style_pref.is_some());
     }
 
     #[test]
     fn preference_miner_repetition() {
         let miner = PreferenceMiner::new();
-        let result = miner.mine_from_conversation(
-            &["继续", "继续", "继续", "继续"],
-            &["好的", "好的", "好的"],
-        );
-        let workflow = result.preferences.iter().find(|p| p.category == preference_miner::PreferenceCategory::Workflow);
+        let result = miner
+            .mine_from_conversation(&["继续", "继续", "继续", "继续"], &["好的", "好的", "好的"]);
+        let workflow = result
+            .preferences
+            .iter()
+            .find(|p| p.category == preference_miner::PreferenceCategory::Workflow);
         assert!(workflow.is_some());
     }
 
