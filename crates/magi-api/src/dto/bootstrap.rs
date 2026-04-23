@@ -259,6 +259,7 @@ mod tests {
                 },
                 execution_chain_ref: Some("chain-1".to_string()),
                 recovery_ref: Some("recovery-1".to_string()),
+                current_turn: None,
                 active_execution_chain: None,
             }],
             vec![WorkspaceRecoverySidecarExport {

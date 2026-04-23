@@ -1,7 +1,8 @@
 use super::*;
 use crate::models::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
-    SessionExecutionSidecarStatus, SessionSidecarFlushReason, SessionStoreState,
+    ActiveExecutionTurn, SessionExecutionSidecarStatus, SessionSidecarFlushReason,
+    SessionStoreState,
 };
 use magi_core::{
     ExecutionOwnership, MissionId, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskId,
@@ -217,6 +218,149 @@ fn bind_execution_ownership_backfills_workspace_into_active_chain() {
             .session(&session_id)
             .and_then(|session| session.workspace_id),
         Some(workspace_id.to_string())
+    );
+}
+
+#[test]
+fn active_execution_chain_turn_replaces_stale_session_turn() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-active-chain-turn-replace");
+    store
+        .create_session(session_id.clone(), "Active Chain Turn Replace")
+        .expect("session should be creatable");
+
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            ActiveExecutionTurn {
+                turn_id: "turn-chat".to_string(),
+                turn_seq: 1,
+                accepted_at: UtcMillis(1),
+                status: "completed".to_string(),
+                user_message: Some("普通问答".to_string()),
+                items: Vec::new(),
+                worker_lanes: Vec::new(),
+            },
+        )
+        .expect("chat turn should upsert");
+
+    let task_turn = ActiveExecutionTurn {
+        turn_id: "turn-task".to_string(),
+        turn_seq: 2,
+        accepted_at: UtcMillis(2),
+        status: "accepted".to_string(),
+        user_message: Some("创建产品级任务".to_string()),
+        items: Vec::new(),
+        worker_lanes: Vec::new(),
+    };
+
+    store
+        .upsert_active_execution_chain(
+            session_id.clone(),
+            ActiveExecutionChain {
+                session_id: session_id.clone(),
+                mission_id: MissionId::new("mission-active-chain-turn-replace"),
+                root_task_id: TaskId::new("task-root-active-chain-turn-replace"),
+                execution_chain_ref: "chain-active-chain-turn-replace".to_string(),
+                workspace_id: None,
+                active_branch_task_ids: Vec::new(),
+                active_worker_bindings: Vec::new(),
+                branches: Vec::new(),
+                recovery_ref: None,
+                dispatch_context: ActiveExecutionDispatchContext {
+                    accepted_at: UtcMillis(2),
+                    entry_id: "timeline-active-chain-turn-replace".to_string(),
+                    trimmed_text: Some("创建产品级任务".to_string()),
+                    deep_task: true,
+                    skill_name: None,
+                },
+                current_turn: Some(task_turn.clone()),
+            },
+        )
+        .expect("task chain should upsert");
+
+    let sidecar = store
+        .runtime_sidecar(&session_id)
+        .expect("sidecar should exist");
+    assert_eq!(
+        sidecar
+            .current_turn
+            .as_ref()
+            .map(|turn| turn.turn_id.as_str()),
+        Some("turn-task")
+    );
+    assert_eq!(
+        sidecar
+            .active_execution_chain
+            .as_ref()
+            .and_then(|chain| chain.current_turn.as_ref())
+            .map(|turn| turn.turn_id.as_str()),
+        Some("turn-task")
+    );
+}
+
+#[test]
+fn active_execution_chain_does_not_reuse_turn_from_different_chain() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-active-chain-turn-isolated");
+    store
+        .create_session(session_id.clone(), "Active Chain Turn Isolated")
+        .expect("session should be creatable");
+
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            ActiveExecutionTurn {
+                turn_id: "turn-chat".to_string(),
+                turn_seq: 1,
+                accepted_at: UtcMillis(1),
+                status: "completed".to_string(),
+                user_message: Some("普通问答".to_string()),
+                items: Vec::new(),
+                worker_lanes: Vec::new(),
+            },
+        )
+        .expect("chat turn should upsert");
+
+    store
+        .upsert_active_execution_chain(
+            session_id.clone(),
+            ActiveExecutionChain {
+                session_id: session_id.clone(),
+                mission_id: MissionId::new("mission-active-chain-turn-isolated"),
+                root_task_id: TaskId::new("task-root-active-chain-turn-isolated"),
+                execution_chain_ref: "chain-active-chain-turn-isolated".to_string(),
+                workspace_id: None,
+                active_branch_task_ids: Vec::new(),
+                active_worker_bindings: Vec::new(),
+                branches: Vec::new(),
+                recovery_ref: None,
+                dispatch_context: ActiveExecutionDispatchContext {
+                    accepted_at: UtcMillis(2),
+                    entry_id: "timeline-active-chain-turn-isolated".to_string(),
+                    trimmed_text: Some("创建产品级任务".to_string()),
+                    deep_task: true,
+                    skill_name: None,
+                },
+                current_turn: None,
+            },
+        )
+        .expect("task chain should upsert");
+
+    let sidecar = store
+        .runtime_sidecar(&session_id)
+        .expect("sidecar should exist");
+    assert!(
+        sidecar.current_turn.is_none(),
+        "不同 execution chain 不能复用旧 turn，否则任务会挂到上一轮普通对话"
+    );
+    assert!(
+        sidecar
+            .active_execution_chain
+            .as_ref()
+            .and_then(|chain| chain.current_turn.as_ref())
+            .is_none(),
+        "active chain 内部也不能保留跨链 turn"
     );
 }
 

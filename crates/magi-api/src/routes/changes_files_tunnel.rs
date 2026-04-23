@@ -573,6 +573,7 @@ async fn enhance_prompt(
         ),
         messages: None,
         tools: None,
+        tool_choice: None,
     };
 
     match client.invoke(invocation) {

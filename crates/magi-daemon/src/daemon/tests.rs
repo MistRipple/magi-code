@@ -890,7 +890,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
 
     let (status, followup_body) = post_json(
         app.clone(),
-        "/session/action",
+        "/api/session/turn",
         json!({
             "session_id": session_id.to_string(),
             "text": "follow up recovery task",
@@ -906,11 +906,11 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         "unexpected followup response body: {followup_body:?}"
     );
 
-    let accepted_at = followup_body["accepted_at"]
+    let accepted_at = followup_body["acceptedAt"]
         .as_u64()
         .expect("accepted_at should serialize as integer");
     let followup_mission_id = format!("mission-session-action-{accepted_at}");
-    let followup_root_task_id = followup_body["root_task_id"]
+    let followup_root_task_id = followup_body["rootTaskId"]
         .as_str()
         .expect("root_task_id should serialize as string");
     let followup_execution_group =
@@ -955,7 +955,7 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
 
     let (status, first_body) = post_json(
         app.clone(),
-        "/session/action",
+        "/api/session/turn",
         json!({
             "session_id": "shadow-session-bootstrap",
             "text": "Route parser refresh",
@@ -971,11 +971,11 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         "unexpected first body: {first_body:?}"
     );
 
-    let first_accepted_at = first_body["accepted_at"]
+    let first_accepted_at = first_body["acceptedAt"]
         .as_u64()
         .expect("accepted_at should serialize as integer");
     let expected_extraction_id = format!("extract-session-action-{first_accepted_at}");
-    let first_root_task_id = first_body["root_task_id"]
+    let first_root_task_id = first_body["rootTaskId"]
         .as_str()
         .expect("root_task_id should serialize as string");
     let first_projection =
@@ -985,7 +985,7 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
 
     let (status, second_body) = post_json(
         app.clone(),
-        "/session/action",
+        "/api/session/turn",
         json!({
             "session_id": "shadow-session-bootstrap",
             "text": "Route parser refresh followup",
@@ -1001,11 +1001,11 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         "unexpected second body: {second_body:?}"
     );
 
-    let second_accepted_at = second_body["accepted_at"]
+    let second_accepted_at = second_body["acceptedAt"]
         .as_u64()
         .expect("accepted_at should serialize as integer");
     let second_mission_id = format!("mission-session-action-{second_accepted_at}");
-    let second_root_task_id = second_body["root_task_id"]
+    let second_root_task_id = second_body["rootTaskId"]
         .as_str()
         .expect("root_task_id should serialize as string");
     let second_execution_group =
@@ -1057,7 +1057,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
 
     let (status, seed_body) = post_json(
         app.clone(),
-        "/session/action",
+        "/api/session/turn",
         json!({
             "session_id": "shadow-session-bootstrap-recovery",
             "text": "seed bootstrap recovery state",
@@ -1148,7 +1148,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
 
     let (status, followup_body) = post_json(
         app.clone(),
-        "/session/action",
+        "/api/session/turn",
         json!({
             "session_id": "shadow-session-bootstrap-recovery",
             "text": "consume resumed bootstrap memory",
@@ -1164,11 +1164,11 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         "unexpected followup body: {followup_body:?}"
     );
 
-    let followup_accepted_at = followup_body["accepted_at"]
+    let followup_accepted_at = followup_body["acceptedAt"]
         .as_u64()
         .expect("accepted_at should serialize as integer");
     let followup_mission_id = format!("mission-session-action-{followup_accepted_at}");
-    let followup_root_task_id = followup_body["root_task_id"]
+    let followup_root_task_id = followup_body["rootTaskId"]
         .as_str()
         .expect("root_task_id should serialize as string");
     let followup_execution_group =
@@ -2142,7 +2142,7 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
 
     let (status, body) = post_json(
         app.clone(),
-        "/session/action",
+        "/api/session/turn",
         json!({
             "text": "Hello integration test",
             "deep_task": true,
@@ -2156,19 +2156,19 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
         StatusCode::OK,
         "session action should succeed: {body:?}"
     );
-    assert!(body["accepted_at"].as_u64().is_some());
-    assert!(body["root_task_id"].is_string());
+    assert!(body["acceptedAt"].as_u64().is_some());
+    assert!(body["rootTaskId"].is_string());
 
-    let session_id = body["session_id"].as_str().unwrap();
+    let session_id = body["sessionId"].as_str().unwrap();
     assert_eq!(
         session_id, "shadow-session-001",
         "should use bootstrapped session"
     );
-    let accepted_at = body["accepted_at"]
+    let accepted_at = body["acceptedAt"]
         .as_u64()
         .expect("accepted_at should serialize as integer");
     let mission_id = format!("mission-session-action-{accepted_at}");
-    let root_task_id = body["root_task_id"]
+    let root_task_id = body["rootTaskId"]
         .as_str()
         .expect("root_task_id should serialize as string");
     let projection =
@@ -2234,7 +2234,7 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
 
     let (status, body) = post_json(
         app.clone(),
-        "/session/action",
+        "/api/session/turn",
         json!({
             "text": "Restart persistence verification",
             "deep_task": false,
@@ -2248,7 +2248,7 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
         StatusCode::OK,
         "session action should succeed: {body:?}"
     );
-    let session_id = body["session_id"]
+    let session_id = body["sessionId"]
         .as_str()
         .expect("session_id should serialize as string")
         .to_string();
@@ -2319,7 +2319,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
 
     let (status, body) = post_json(
         app.clone(),
-        "/session/action",
+        "/api/session/turn",
         json!({
             "text": "Restart continue verification",
             "deep_task": true,
@@ -2333,7 +2333,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         "session action should succeed: {body:?}"
     );
 
-    let session_id_text = body["session_id"]
+    let session_id_text = body["sessionId"]
         .as_str()
         .expect("session_id should serialize as string")
         .to_string();
@@ -2759,7 +2759,7 @@ async fn unbound_session_continue_survives_runtime_restart() {
 
     let (action_status, action_body) = post_json(
         app.clone(),
-        "/session/action",
+        "/api/session/turn",
         json!({
             "text": "Unbound session restart verification",
             "deep_task": true,
@@ -2896,7 +2896,7 @@ async fn session_action_publishes_domain_event_on_event_bus() {
 
     let (status, body) = post_json(
         app.clone(),
-        "/session/action",
+        "/api/session/turn",
         json!({
             "session_id": "session-e2e-events",
             "text": "event bus test",
@@ -2912,8 +2912,8 @@ async fn session_action_publishes_domain_event_on_event_bus() {
         "session action should succeed: {body:?}"
     );
 
-    let accepted_at = body["accepted_at"].as_u64().unwrap();
-    let expected_event_id = format!("event-session-action-{accepted_at}");
+    let accepted_at = body["acceptedAt"].as_u64().unwrap();
+    let expected_event_id = format!("event-session-turn-task-{accepted_at}");
 
     let snapshot = state.event_bus.snapshot();
     let action_event = snapshot
@@ -2922,7 +2922,7 @@ async fn session_action_publishes_domain_event_on_event_bus() {
         .find(|e| e.event_id.as_str() == expected_event_id);
     assert!(
         action_event.is_some(),
-        "event bus should contain session.action.accepted event (expected {expected_event_id}), found: {:?}",
+        "event bus should contain session.turn.task.accepted event (expected {expected_event_id}), found: {:?}",
         snapshot
             .recent_events
             .iter()
@@ -2931,7 +2931,7 @@ async fn session_action_publishes_domain_event_on_event_bus() {
     );
 
     let event = action_event.unwrap();
-    assert_eq!(event.event_type, "session.action.accepted");
+    assert_eq!(event.event_type, "session.turn.task.accepted");
     assert_eq!(
         event.payload["session_id"].as_str().unwrap(),
         "session-e2e-events"
@@ -2948,7 +2948,7 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
 
     let (status, first_body) = post_json(
         app.clone(),
-        "/session/action",
+        "/api/session/turn",
         json!({
             "text": "first action",
             "deep_task": true,
@@ -2958,8 +2958,8 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let session_id = first_body["session_id"].as_str().unwrap().to_string();
-    let first_root_task_id = first_body["root_task_id"]
+    let session_id = first_body["sessionId"].as_str().unwrap().to_string();
+    let first_root_task_id = first_body["rootTaskId"]
         .as_str()
         .expect("first root task id should serialize as string")
         .to_string();
@@ -2969,7 +2969,7 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
 
     let (status, second_body) = post_json(
         app.clone(),
-        "/session/action",
+        "/api/session/turn",
         json!({
             "session_id": session_id,
             "text": "second action",
@@ -2979,8 +2979,8 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(!second_body["created_session"].as_bool().unwrap_or(true));
-    let second_root_task_id = second_body["root_task_id"]
+    assert!(!second_body["createdSession"].as_bool().unwrap_or(true));
+    let second_root_task_id = second_body["rootTaskId"]
         .as_str()
         .expect("second root task id should serialize as string")
         .to_string();
@@ -3000,8 +3000,8 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
     let user_messages: Vec<_> = msg_list.iter().filter(|m| m["role"] == "user").collect();
     assert_eq!(user_messages.len(), 2, "should have 2 user messages");
 
-    let first_accepted_at = first_body["accepted_at"].as_u64().unwrap();
-    let second_accepted_at = second_body["accepted_at"].as_u64().unwrap();
+    let first_accepted_at = first_body["acceptedAt"].as_u64().unwrap();
+    let second_accepted_at = second_body["acceptedAt"].as_u64().unwrap();
     let first_mission_id = format!("mission-session-action-{first_accepted_at}");
     let second_mission_id = format!("mission-session-action-{second_accepted_at}");
 

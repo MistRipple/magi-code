@@ -686,12 +686,8 @@ impl WorkerRuntime {
     pub fn resume_from_execution_target(
         &self,
         target: &TaskExecutionTarget,
-        fallback_worker_id: WorkerId,
     ) -> Option<WorkerRecord> {
-        let worker_id = target
-            .requested_worker_id
-            .clone()
-            .unwrap_or(fallback_worker_id);
+        let worker_id = target.requested_worker_id.clone()?;
         self.ensure_worker_registered(&worker_id);
         let record = self.transition(
             &worker_id,

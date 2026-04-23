@@ -73,6 +73,29 @@ pub struct ModelInvocationRequest {
     pub messages: Option<Vec<ChatMessage>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ChatToolDefinition>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ChatToolChoice>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatToolChoice {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ChatToolChoiceFunction,
+}
+
+impl ChatToolChoice {
+    pub fn force_function(name: impl Into<String>) -> Self {
+        Self {
+            kind: "function".to_string(),
+            function: ChatToolChoiceFunction { name: name.into() },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatToolChoiceFunction {
+    pub name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

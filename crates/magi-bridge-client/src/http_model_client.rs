@@ -78,7 +78,11 @@ impl HttpModelBridgeClient {
         if let Some(ref tools) = request.tools {
             if !tools.is_empty() {
                 body["tools"] = serde_json::to_value(tools).unwrap_or_else(|_| json!([]));
-                body["tool_choice"] = json!("auto");
+                body["tool_choice"] = request
+                    .tool_choice
+                    .as_ref()
+                    .and_then(|choice| serde_json::to_value(choice).ok())
+                    .unwrap_or_else(|| json!("auto"));
             }
         }
         body
@@ -629,7 +633,7 @@ fn truncate_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -670,6 +674,7 @@ mod tests {
             prompt: "hello world".to_string(),
             messages: None,
             tools: None,
+            tool_choice: None,
         });
         assert_eq!(body["model"], "gpt-4.1-mini");
         assert_eq!(body["messages"][0]["role"], "user");
@@ -690,6 +695,7 @@ mod tests {
             prompt: "   ".to_string(),
             messages: None,
             tools: None,
+            tool_choice: None,
         });
 
         let error = result.expect_err("empty prompt should fail");
@@ -873,6 +879,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect("invoke should succeed against mock server");
 
@@ -929,6 +936,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect("invoke should succeed");
 
@@ -967,6 +975,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect_err("rejected request should return error");
 
@@ -1006,6 +1015,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect_err("unreachable server should return error");
 
@@ -1042,6 +1052,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect("invoke should succeed without API key");
 

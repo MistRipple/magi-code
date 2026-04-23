@@ -59,6 +59,7 @@ impl BridgeDispatchRuntime {
                     prompt: input.payload.clone(),
                     messages: None,
                     tools: None,
+                    tool_choice: None,
                 })?
             }
             (BridgeBindingKind::Mcp, BridgeDispatchAction::McpToolCall) => {

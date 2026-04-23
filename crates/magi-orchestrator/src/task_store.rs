@@ -1,7 +1,6 @@
 use magi_core::{
     AssignmentLease, DomainError, DomainResult, LeaseId, LeaseStatus, MissionId, ProgressSummary,
-    Task, TaskId, TaskKind, TaskPolicy, TaskProjection, TaskStatus, UtcMillis, WorkPackageSummary,
-    WorkerId,
+    Task, TaskId, TaskKind, TaskPolicy, TaskProjection, TaskStatus, UtcMillis, WorkerId,
 };
 use magi_worker_runtime::WorkerRuntimeDurableSnapshot;
 use std::collections::{HashMap, HashSet};
@@ -254,6 +253,75 @@ impl TaskStore {
         Ok(())
     }
 
+    pub fn resolve_decision(
+        &self,
+        decision_task_id: &TaskId,
+        chosen_option: &str,
+        evidence: Option<serde_json::Value>,
+    ) -> Result<(), String> {
+        let chosen_option = chosen_option.trim();
+        if chosen_option.is_empty() {
+            return Err("chosen option must not be empty".to_string());
+        }
+        let decision = self
+            .get_task(decision_task_id)
+            .ok_or_else(|| format!("decision task {decision_task_id} not found"))?;
+        if decision.kind != TaskKind::Decision {
+            return Err(format!("{decision_task_id} is not a Decision task"));
+        }
+        if decision.status != TaskStatus::AwaitingApproval {
+            return Err(format!(
+                "decision {decision_task_id} is not AwaitingApproval"
+            ));
+        }
+        let payload = decision
+            .decision_payload
+            .as_ref()
+            .ok_or_else(|| format!("decision {decision_task_id} missing decision payload"))?;
+        if payload.options.is_empty() {
+            return Err(format!("decision {decision_task_id} has no options"));
+        }
+        if !payload
+            .options
+            .iter()
+            .any(|option| option.option_id == chosen_option)
+        {
+            return Err(format!(
+                "option {chosen_option} is not valid for decision {decision_task_id}"
+            ));
+        }
+
+        self.set_output_refs(
+            decision_task_id,
+            vec![format!("decision_chosen:{chosen_option}")],
+        );
+        if let Some(ref ev) = evidence {
+            self.set_evidence_refs(
+                decision_task_id,
+                vec![serde_json::to_string(ev).unwrap_or_default()],
+            );
+        }
+        self.update_status(decision_task_id, TaskStatus::Completed)
+            .map_err(|e| format!("failed to complete decision: {e}"))?;
+
+        if let Some(ref parent_id) = decision.parent_task_id {
+            let siblings = self.get_children(parent_id);
+            let still_blocked = siblings.iter().any(|s| {
+                s.task_id != *decision_task_id
+                    && (s.status == TaskStatus::Blocked || s.status == TaskStatus::AwaitingApproval)
+            });
+            if !still_blocked {
+                if let Some(parent) = self.get_task(parent_id) {
+                    if parent.status == TaskStatus::Blocked {
+                        self.update_status(parent_id, TaskStatus::Running)
+                            .map_err(|e| format!("failed to unblock parent: {e}"))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 递增任务的 repair_count。
     pub fn increment_repair_count(&self, task_id: &TaskId) {
         let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
@@ -456,17 +524,27 @@ impl TaskStore {
 
         let root_task = tasks.get(root_task_id)?.clone();
 
-        // Collect all tasks in this tree
-        let mut all_tasks: Vec<&Task> = Vec::new();
-        let mut queue: Vec<&TaskId> = vec![root_task_id];
-        while let Some(current) = queue.pop() {
-            if let Some(task) = tasks.get(current) {
-                all_tasks.push(task);
-                if let Some(child_ids) = children_index.get(current) {
-                    queue.extend(child_ids.iter());
+        let mut ordered_task_ids: Vec<TaskId> = Vec::new();
+        let mut stack: Vec<TaskId> = vec![root_task_id.clone()];
+        let mut visited: HashSet<TaskId> = HashSet::new();
+        while let Some(current) = stack.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            if tasks.contains_key(&current) {
+                ordered_task_ids.push(current.clone());
+                if let Some(child_ids) = children_index.get(&current) {
+                    for child_id in child_ids.iter().rev() {
+                        stack.push(child_id.clone());
+                    }
                 }
             }
         }
+        let all_tasks: Vec<&Task> = ordered_task_ids
+            .iter()
+            .filter_map(|task_id| tasks.get(task_id))
+            .collect();
+        let projection_tasks: Vec<Task> = all_tasks.iter().map(|task| (*task).clone()).collect();
 
         let running_tasks: Vec<TaskId> = all_tasks
             .iter()
@@ -501,34 +579,6 @@ impl TaskStore {
             })
         });
 
-        // WorkPackage summaries
-        let workpackage_summaries: Vec<WorkPackageSummary> = all_tasks
-            .iter()
-            .filter(|t| t.kind == TaskKind::WorkPackage)
-            .map(|wp| {
-                let children = children_index
-                    .get(&wp.task_id)
-                    .map(|ids| ids.as_slice())
-                    .unwrap_or_default();
-                let total_children = children.len() as u32;
-                let completed_children = children
-                    .iter()
-                    .filter(|cid| {
-                        tasks
-                            .get(cid)
-                            .is_some_and(|t| t.status == TaskStatus::Completed)
-                    })
-                    .count() as u32;
-                WorkPackageSummary {
-                    task_id: wp.task_id.clone(),
-                    title: wp.title.clone(),
-                    status: wp.status,
-                    completed_children,
-                    total_children,
-                }
-            })
-            .collect();
-
         let total_tasks = all_tasks.len() as u32;
         let completed_tasks = all_tasks
             .iter()
@@ -557,11 +607,11 @@ impl TaskStore {
 
         Some(TaskProjection {
             root_task,
+            tasks: projection_tasks,
             current_phase,
             running_tasks,
             blocked_tasks,
             pending_decisions,
-            workpackage_summaries,
             validation_summary: None,
             progress_summary: ProgressSummary {
                 total_tasks,
@@ -1317,6 +1367,15 @@ mod tests {
         let projection = projection.unwrap();
 
         assert_eq!(projection.root_task.task_id.to_string(), "obj-1");
+        let projection_task_ids: Vec<String> = projection
+            .tasks
+            .iter()
+            .map(|task| task.task_id.to_string())
+            .collect();
+        assert_eq!(
+            projection_task_ids,
+            vec!["obj-1", "phase-1", "wp-1", "act-1", "act-2", "act-3"]
+        );
         assert_eq!(projection.current_phase, Some("Task phase-1".to_string()));
         assert_eq!(projection.running_tasks.len(), 4); // objective, phase, wp, act-2
         assert_eq!(projection.blocked_tasks.len(), 1);
@@ -1326,13 +1385,6 @@ mod tests {
         assert_eq!(projection.progress_summary.running_tasks, 4);
         assert_eq!(projection.progress_summary.blocked_tasks, 1);
         assert_eq!(projection.aggregate_status, TaskStatus::Running);
-
-        // WorkPackage summary
-        assert_eq!(projection.workpackage_summaries.len(), 1);
-        let wp_summary = &projection.workpackage_summaries[0];
-        assert_eq!(wp_summary.task_id.to_string(), "wp-1");
-        assert_eq!(wp_summary.total_children, 3);
-        assert_eq!(wp_summary.completed_children, 1);
 
         // Nonexistent root returns None
         assert!(

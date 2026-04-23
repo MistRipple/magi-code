@@ -446,14 +446,13 @@ pub fn routes() -> Router<ApiState> {
         .route("/settings/models/fetch", post(fetch_models))
         .route("/settings/stats/session", get(session_stats))
         .route("/settings/stats/reset", post(reset_stats))
-        .route("/bridges/cutover-smoke", get(bridge_cutover_smoke_fallback))
 }
 
 pub(crate) fn builtin_role_templates() -> Vec<Value> {
     vec![
         json!({
             "templateId": "frontend-dev",
-            "displayName": "Frontend Engineering",
+            "displayName": "Frontend Engineer",
             "description": "负责界面实现、交互体验与前端状态流",
             "i18n": {
                 "displayNameKey": "roleTemplate.frontend-dev.displayName",
@@ -471,7 +470,7 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
         }),
         json!({
             "templateId": "backend-dev",
-            "displayName": "Backend Engineering",
+            "displayName": "Backend Engineer",
             "description": "负责服务接口、状态流转与运行时主链实现",
             "i18n": {
                 "displayNameKey": "roleTemplate.backend-dev.displayName",
@@ -489,7 +488,7 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
         }),
         json!({
             "templateId": "reviewer",
-            "displayName": "Code Review",
+            "displayName": "Code Review Engineer",
             "description": "负责风险识别、回归扫描与交付质量把关",
             "i18n": {
                 "displayNameKey": "roleTemplate.reviewer.displayName",
@@ -507,7 +506,7 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
         }),
         json!({
             "templateId": "test-engineer",
-            "displayName": "Test Engineering",
+            "displayName": "Test Engineer",
             "description": "负责验证链路、场景覆盖与失败复现",
             "i18n": {
                 "displayNameKey": "roleTemplate.test-engineer.displayName",
@@ -525,7 +524,7 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
         }),
         json!({
             "templateId": "doc-writer",
-            "displayName": "Documentation",
+            "displayName": "Documentation Engineer",
             "description": "负责沉淀接口说明、迁移结论与交付说明",
             "i18n": {
                 "displayNameKey": "roleTemplate.doc-writer.displayName",
@@ -543,7 +542,7 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
         }),
         json!({
             "templateId": "debugger",
-            "displayName": "Bug Fixing",
+            "displayName": "Debugging Engineer",
             "description": "负责问题定位、根因分析与修复闭环",
             "i18n": {
                 "displayNameKey": "roleTemplate.debugger.displayName",
@@ -561,7 +560,7 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
         }),
         json!({
             "templateId": "integration-dev",
-            "displayName": "Integration Engineering",
+            "displayName": "Integration Engineer",
             "description": "负责跨模块、跨端与跨服务联调收口",
             "i18n": {
                 "displayNameKey": "roleTemplate.integration-dev.displayName",
@@ -579,7 +578,7 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
         }),
         json!({
             "templateId": "data-engineer",
-            "displayName": "Data Engineering",
+            "displayName": "Data Engineer",
             "description": "负责数据投影、索引、提取与数据契约",
             "i18n": {
                 "displayNameKey": "roleTemplate.data-engineer.displayName",
@@ -597,7 +596,7 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
         }),
         json!({
             "templateId": "devops-engineer",
-            "displayName": "Platform Operations",
+            "displayName": "DevOps Engineer",
             "description": "负责环境、部署、运行配置与运维可用性",
             "i18n": {
                 "displayNameKey": "roleTemplate.devops-engineer.displayName",
@@ -615,7 +614,7 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
         }),
         json!({
             "templateId": "security-analyst",
-            "displayName": "Security Engineering",
+            "displayName": "Security Engineer",
             "description": "负责权限、数据暴露面与安全风险评估",
             "i18n": {
                 "displayNameKey": "roleTemplate.security-analyst.displayName",
@@ -633,7 +632,7 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
         }),
         json!({
             "templateId": "architect",
-            "displayName": "Architecture Design",
+            "displayName": "Architect",
             "description": "负责结构裁决、边界治理与长期演进方向",
             "i18n": {
                 "displayNameKey": "roleTemplate.architect.displayName",
@@ -1340,10 +1339,6 @@ async fn session_stats(
 async fn reset_stats(State(state): State<ApiState>) -> Result<Json<serde_json::Value>, ApiError> {
     state.event_bus.reset_audit_usage_ledger();
     Ok(Json(serde_json::json!({ "reset": true })))
-}
-
-async fn bridge_cutover_smoke_fallback(State(state): State<ApiState>) -> Json<serde_json::Value> {
-    Json(serde_json::to_value(state.bridge_cutover_smoke_dto()).unwrap_or_default())
 }
 
 #[cfg(test)]

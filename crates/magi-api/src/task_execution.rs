@@ -56,6 +56,18 @@ pub struct ShadowGraphDriveResult {
     pub runner_started: bool,
 }
 
+pub struct SessionTurnExecutionRequest {
+    pub session_id: SessionId,
+    pub workspace_id: Option<WorkspaceId>,
+    pub prompt: String,
+    pub use_tools: bool,
+    pub skill_name: Option<String>,
+}
+
+pub struct SessionTurnExecutionOutput {
+    pub final_content: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct DispatchSubmissionRequest {
     pub accepted_at: UtcMillis,
@@ -66,6 +78,7 @@ pub struct DispatchSubmissionRequest {
     pub mission_title: String,
     pub task_title: String,
     pub trimmed_text: Option<String>,
+    pub execution_goal: Option<String>,
     pub deep_task: bool,
     pub skill_name: Option<String>,
     pub target_role: Option<String>,
@@ -102,7 +115,11 @@ fn task_status_is_terminal(status: &TaskStatus) -> bool {
     matches!(status, TaskStatus::Completed | TaskStatus::Cancelled)
 }
 
-fn task_status_is_continue_recoverable(status: &TaskStatus) -> bool {
+pub(crate) fn task_status_is_continue_recoverable(status: &TaskStatus) -> bool {
+    matches!(status, TaskStatus::Blocked)
+}
+
+fn task_status_needs_terminal_branch_finalization(status: &TaskStatus) -> bool {
     matches!(
         status,
         TaskStatus::Blocked
@@ -111,6 +128,96 @@ fn task_status_is_continue_recoverable(status: &TaskStatus) -> bool {
             | TaskStatus::Verifying
             | TaskStatus::Repairing
     )
+}
+
+pub(crate) fn branch_stage_is_terminal(stage: &str) -> bool {
+    matches!(
+        stage.trim().to_ascii_lowercase().as_str(),
+        "finish" | "finished"
+    )
+}
+
+pub(crate) fn active_execution_branch_is_continue_recoverable(
+    state: &ApiState,
+    chain: &ActiveExecutionChain,
+    branch: &ActiveExecutionBranch,
+) -> bool {
+    if branch_stage_is_terminal(&branch.stage) {
+        return false;
+    }
+    let Some(task_store) = state.task_store() else {
+        return false;
+    };
+    let Some(task) = task_store.get_task(&branch.task_id) else {
+        return false;
+    };
+    task.mission_id == chain.mission_id
+        && task.root_task_id == chain.root_task_id
+        && task_status_is_continue_recoverable(&task.status)
+}
+
+fn terminal_status_for_branch(
+    state: &ApiState,
+    branch: &ActiveExecutionBranch,
+) -> Option<TaskStatus> {
+    let reports = state
+        .shadow_execution_pipeline()?
+        .execution_runtime
+        .worker_runtime()
+        .reports();
+    reports
+        .iter()
+        .rev()
+        .find(|report| {
+            report.worker_id == branch.worker_id
+                && report.task_id == branch.task_id
+                && report.stage == magi_worker_runtime::WorkerStage::Finish
+        })
+        .map(|report| match report.termination_reason {
+            Some(magi_core::TerminationReason::Failed) => TaskStatus::Failed,
+            Some(magi_core::TerminationReason::Cancelled) => TaskStatus::Cancelled,
+            Some(magi_core::TerminationReason::Blocked) => TaskStatus::Blocked,
+            Some(magi_core::TerminationReason::Completed) | None => TaskStatus::Completed,
+        })
+}
+
+pub(crate) fn finalize_terminal_worker_branches(
+    state: &ApiState,
+    session_id: &SessionId,
+) -> Result<usize, ApiError> {
+    let Some(chain) = state
+        .session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.active_execution_chain)
+    else {
+        return Ok(0);
+    };
+    let task_store = state
+        .task_store()
+        .ok_or_else(|| ApiError::internal_assembly("收敛 worker 终态失败", "task_store 未配置"))?;
+    let mut finalized_count = 0usize;
+    for branch in chain
+        .branches
+        .iter()
+        .filter(|branch| branch_stage_is_terminal(&branch.stage))
+    {
+        let Some(task) = task_store.get_task(&branch.task_id) else {
+            continue;
+        };
+        if !task_status_needs_terminal_branch_finalization(&task.status) {
+            continue;
+        }
+        let terminal_status =
+            terminal_status_for_branch(state, branch).unwrap_or(TaskStatus::Completed);
+        if matches!(terminal_status, TaskStatus::Blocked) {
+            continue;
+        }
+        task_store
+            .update_status(&branch.task_id, terminal_status)
+            .map_err(|error| ApiError::internal_assembly("收敛 worker 终态失败", error))?;
+        finalized_count += 1;
+    }
+    Ok(finalized_count)
 }
 
 fn rebuild_dispatch_plan_for_branch(
@@ -341,19 +448,14 @@ pub fn continue_shadow_execution_chain(
             ),
         ));
     }
+    finalize_terminal_worker_branches(state, session_id)?;
 
     let resumable_branches = chain
         .branches
         .iter()
         .filter_map(|branch| {
-            let task = task_store.get_task(&branch.task_id)?;
-            if task.mission_id != chain.mission_id || task.root_task_id != chain.root_task_id {
-                return None;
-            }
-            if !task_status_is_continue_recoverable(&task.status) {
-                return None;
-            }
-            Some(branch.clone())
+            active_execution_branch_is_continue_recoverable(state, &chain, branch)
+                .then(|| branch.clone())
         })
         .collect::<Vec<_>>();
     if resumable_branches.is_empty() {
@@ -648,6 +750,307 @@ impl ShadowTaskDispatcher {
         }
     }
 
+    fn build_session_turn_item(
+        &self,
+        kind: &str,
+        status: &str,
+        title: Option<String>,
+        content: Option<String>,
+        tool_call: Option<&ChatToolCall>,
+        thread_visible: bool,
+    ) -> ActiveExecutionTurnItem {
+        ActiveExecutionTurnItem {
+            item_id: format!("turn-item-{}-{}", kind, UtcMillis::now().0),
+            item_seq: 0,
+            lane_id: None,
+            lane_seq: None,
+            kind: kind.to_string(),
+            status: status.to_string(),
+            source: "orchestrator".to_string(),
+            title,
+            content,
+            task_id: None,
+            worker_id: None,
+            role_id: None,
+            tool_call_id: tool_call.map(|call| call.id.clone()),
+            tool_name: tool_call.map(|call| call.function.name.clone()),
+            tool_status: None,
+            tool_result: None,
+            tool_error: None,
+            thread_visible,
+            worker_visible: false,
+        }
+    }
+
+    fn execute_session_tool_call(
+        &self,
+        tool_call: &ChatToolCall,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+    ) -> String {
+        let Some(ref registry) = self.tool_registry else {
+            return serde_json::json!({ "error": "tool registry not available" }).to_string();
+        };
+
+        let _ = self.event_bus.publish(
+            EventEnvelope::domain(
+                EventId::new(format!("event-session-tool-invoked-{}", UtcMillis::now().0)),
+                "session.tool.invoked",
+                serde_json::json!({
+                    "session_id": session_id.to_string(),
+                    "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+                    "tool_name": tool_call.function.name,
+                    "tool_call_id": tool_call.id,
+                }),
+            )
+            .with_context(EventContext {
+                workspace_id: workspace_id.clone(),
+                session_id: Some(session_id.clone()),
+                ..EventContext::default()
+            }),
+        );
+
+        if let Some(mcp_result) = execute_mcp_tool_call(
+            self.settings_store.as_deref(),
+            &tool_call.function.name,
+            &tool_call.function.arguments,
+        ) {
+            return mcp_result;
+        }
+
+        let output = registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new(&tool_call.id),
+                tool_name: tool_call.function.name.clone(),
+                tool_kind: ToolKind::Builtin,
+                input: tool_call.function.arguments.clone(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext {
+                worker_id: None,
+                task_id: None,
+                session_id: Some(session_id.clone()),
+                workspace_id: workspace_id.clone(),
+            },
+            &ToolExecutionPolicy::default(),
+        );
+
+        output.payload
+    }
+
+    pub fn execute_session_turn(
+        &self,
+        request: SessionTurnExecutionRequest,
+    ) -> Result<SessionTurnExecutionOutput, ApiError> {
+        let Some(client) = self.resolve_model_client() else {
+            return Err(ApiError::internal_assembly(
+                "执行 session turn 失败",
+                "model bridge client 未配置",
+            ));
+        };
+
+        let mut prompt = prepend_session_instructions(
+            resolve_session_user_rules_prompt(self.settings_store.as_deref(), &request.session_id)
+                .as_deref(),
+            resolve_session_safeguard_prompt(self.settings_store.as_deref(), &request.session_id)
+                .as_deref(),
+            &request.prompt,
+        );
+        if let Some(skill_id) = request.skill_name.clone()
+            && let Some(ref skill_rt) = self.skill_runtime
+        {
+            let plan = skill_rt.build_tool_runtime_plan(magi_skill_runtime::SkillSelection {
+                skill_ids: vec![skill_id],
+                requested_tools: vec![],
+            });
+            for injection in plan.prompt_injections {
+                prompt = format!("{}\n\n{}", injection.body, prompt);
+            }
+        }
+
+        let tools = if request.use_tools {
+            let tool_defs = self.build_tool_definitions(false);
+            (!tool_defs.is_empty()).then_some(tool_defs)
+        } else {
+            None
+        };
+        let mut messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(prompt.clone()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }];
+
+        self.append_turn_item(
+            &request.session_id,
+            self.build_session_turn_item(
+                "assistant_phase",
+                "running",
+                Some("理解请求".to_string()),
+                Some(if request.use_tools {
+                    "正在理解请求并准备调用工具。".to_string()
+                } else {
+                    "正在理解请求并生成回复。".to_string()
+                }),
+                None,
+                true,
+            ),
+        );
+
+        let mut final_content = String::new();
+        for round in 0..MAX_TOOL_CALL_ROUNDS {
+            let stream_item_id = format!(
+                "turn-item-assistant-stream-{}-{}",
+                round + 1,
+                UtcMillis::now().0
+            );
+            let mut streamed_content = String::new();
+            let mut last_persisted_content = String::new();
+            let mut last_flush_at = Instant::now();
+            let mut stream_item_created = false;
+
+            let response = client
+                .invoke_stream(
+                    ModelInvocationRequest {
+                        provider: SHADOW_MODEL_PROVIDER.to_string(),
+                        prompt: prompt.clone(),
+                        messages: Some(messages.clone()),
+                        tools: tools.clone(),
+                        tool_choice: None,
+                    },
+                    &mut |event| match event {
+                        ModelStreamEvent::ContentDelta { delta } => {
+                            if delta.is_empty() {
+                                return;
+                            }
+                            streamed_content.push_str(&delta);
+                            let visible_content =
+                                normalize_shadow_model_visible_content(&streamed_content);
+                            let should_flush = !stream_item_created
+                                || delta.contains('\n')
+                                || visible_content
+                                    .len()
+                                    .saturating_sub(last_persisted_content.len())
+                                    >= 32
+                                || last_flush_at.elapsed() >= Duration::from_millis(120);
+                            if should_flush {
+                                let mut item = self.build_session_turn_item(
+                                    "assistant_stream",
+                                    "running",
+                                    Some("生成回复".to_string()),
+                                    Some(visible_content.clone()),
+                                    None,
+                                    true,
+                                );
+                                item.item_id = stream_item_id.clone();
+                                self.upsert_turn_item(&request.session_id, item);
+                                last_persisted_content = visible_content;
+                                stream_item_created = true;
+                                last_flush_at = Instant::now();
+                            }
+                        }
+                        ModelStreamEvent::ThinkingDelta { .. } => {}
+                    },
+                )
+                .map_err(|error| ApiError::internal_assembly("执行 session turn 失败", error))?;
+
+            let parsed = response.parse_chat_payload();
+            if let Some(content) = parsed.content.clone() {
+                final_content = normalize_shadow_model_visible_content(&content);
+                streamed_content = content;
+            }
+
+            let visible_content = normalize_shadow_model_visible_content(&streamed_content);
+            if !visible_content.is_empty() {
+                let mut item = self.build_session_turn_item(
+                    "assistant_stream",
+                    "completed",
+                    Some("生成回复".to_string()),
+                    Some(visible_content),
+                    None,
+                    true,
+                );
+                item.item_id = stream_item_id;
+                self.upsert_turn_item(&request.session_id, item);
+            }
+
+            if parsed.tool_calls.is_empty() {
+                break;
+            }
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: parsed.content.clone(),
+                tool_calls: parsed.tool_calls.clone(),
+                tool_call_id: None,
+            });
+            for tool_call in &parsed.tool_calls {
+                let mut started = self.build_session_turn_item(
+                    "tool_call_started",
+                    "running",
+                    Some(tool_call.function.name.clone()),
+                    Some(format!("开始调用工具 {}", tool_call.function.name)),
+                    Some(tool_call),
+                    true,
+                );
+                started.tool_status = Some("running".to_string());
+                self.append_turn_item(&request.session_id, started);
+
+                let result = self.execute_session_tool_call(
+                    tool_call,
+                    &request.session_id,
+                    &request.workspace_id,
+                );
+                let status = infer_tool_call_status(&result);
+                let mut completed = self.build_session_turn_item(
+                    "tool_call_result",
+                    status,
+                    Some(tool_call.function.name.clone()),
+                    Some(format!(
+                        "{}：{}",
+                        tool_call.function.name,
+                        summarize_tool_result(&result)
+                    )),
+                    Some(tool_call),
+                    true,
+                );
+                completed.tool_status = Some(status.to_string());
+                completed.tool_result = Some(summarize_tool_result(&result));
+                completed.tool_error = (status == "error").then(|| summarize_tool_result(&result));
+                self.append_turn_item(&request.session_id, completed);
+
+                messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(result),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some(tool_call.id.clone()),
+                });
+            }
+        }
+
+        if final_content.trim().is_empty() {
+            return Err(ApiError::internal_assembly(
+                "执行 session turn 失败",
+                "模型没有返回可展示内容",
+            ));
+        }
+
+        self.append_turn_item(
+            &request.session_id,
+            self.build_session_turn_item(
+                "assistant_final",
+                "completed",
+                Some("最终回复".to_string()),
+                Some(final_content.clone()),
+                None,
+                true,
+            ),
+        );
+        self.update_turn_status(&request.session_id, "completed");
+
+        Ok(SessionTurnExecutionOutput { final_content })
+    }
+
     fn publish_task_dispatched_event(
         &self,
         task_id: &TaskId,
@@ -807,6 +1210,8 @@ impl ShadowTaskDispatcher {
         task: &magi_core::Task,
         task_id: &TaskId,
         lease_id: &LeaseId,
+        target: TaskExecutionTarget,
+        worker_id: WorkerId,
         lane_id: Option<String>,
         lane_seq: Option<usize>,
         is_primary: bool,
@@ -816,19 +1221,30 @@ impl ShadowTaskDispatcher {
         writebacks: ExecutionWritebackPlans,
         use_tools: bool,
         skill_name: Option<String>,
-    ) {
-        let worker_id = ownership
+    ) -> Result<(), String> {
+        if target.task_id != task.task_id
+            || target.mission_id != task.mission_id
+            || target.root_task_id != task.root_task_id
+        {
+            return Err(format!("执行计划目标与任务不一致: {}", task.task_id));
+        }
+        if target
+            .requested_worker_id
+            .as_ref()
+            .is_none_or(|requested_worker_id| requested_worker_id != &worker_id)
+        {
+            return Err(format!("执行计划缺少一致的 worker 绑定: {}", task.task_id));
+        }
+        if ownership
             .worker_id
-            .clone()
-            .unwrap_or_else(|| WorkerId::new(format!("worker-{}", task.task_id)));
-        let target = TaskExecutionTarget {
-            mission_id: task.mission_id.clone(),
-            root_task_id: task.root_task_id.clone(),
-            task_id: task.task_id.clone(),
-            requested_worker_id: Some(worker_id.clone()),
-            recovery_id: None,
-            execution_chain_ref: ownership.execution_chain_ref.clone(),
-        };
+            .as_ref()
+            .is_some_and(|ownership_worker_id| ownership_worker_id != &worker_id)
+        {
+            return Err(format!(
+                "执行计划 worker 与 ownership 不一致: {}",
+                task.task_id
+            ));
+        }
         let worker_runtime = self.pipeline.execution_runtime.worker_runtime();
         self.update_turn_status(&session_id, "running");
         if is_primary {
@@ -876,7 +1292,7 @@ impl ShadowTaskDispatcher {
             let binding_lifecycle = Some(intent.execution_profile.binding_lifecycle);
             let execution_intent_ref = Some(format!("worker-intent-{}", intent.task_id));
             worker_runtime.register_execution_intent(intent);
-            let _ = worker_runtime.resume_from_execution_target(&target, worker_id.clone());
+            let _ = worker_runtime.resume_from_execution_target(&target);
             worker_runtime.record_branch_checkpoint(
                 task_id,
                 &worker_id,
@@ -910,7 +1326,7 @@ impl ShadowTaskDispatcher {
                 lease_id = %lease_id,
                 "dispatch outcome arrived after interrupt or lease revocation; skip finish/writeback/result"
             );
-            return;
+            return Ok(());
         }
         match &outcome {
             TaskOutcome::Completed { output_refs } => {
@@ -1061,6 +1477,7 @@ impl ShadowTaskDispatcher {
             self.publish_execution_overview(task, &session_id, &workspace_id, context_summary);
         }
         self.push_result(task_id, lease_id, outcome);
+        Ok(())
     }
 
     fn publish_execution_overview(
@@ -1425,6 +1842,7 @@ impl ShadowTaskDispatcher {
                 prompt: prompt.clone(),
                 messages: Some(messages.clone()),
                 tools: tools.clone(),
+                tool_choice: None,
             };
 
             let stream_item_kind = if is_primary {
@@ -1723,40 +2141,13 @@ impl TaskDispatcher for ShadowTaskDispatcher {
         lease: &magi_core::AssignmentLease,
     ) -> Result<(), String> {
         let Some(plan) = self.execution_registry.remove(&task.task_id) else {
-            let session_id = self
-                .session_store
-                .current_session()
-                .map(|s| s.session_id)
-                .unwrap_or_else(|| SessionId::new("default"));
-            self.publish_task_dispatched_event(
-                &task.task_id,
-                &task.mission_id,
-                worker,
-                &lease.lease_id,
-                task.kind,
-                Some(&session_id),
-                None,
-            );
-            let fallback_worker_id = WorkerId::new(format!("worker-{}", task.task_id));
-            let (outcome, _) = self.invoke_llm_with_tools(
-                task,
-                &session_id,
-                &None,
-                false,
-                None,
-                None,
-                None,
-                true,
-                &fallback_worker_id,
-            );
-            self.push_result(&task.task_id, &lease.lease_id, outcome);
-            return Ok(());
+            return Err(format!("任务缺少执行计划: {}", task.task_id));
         };
 
         match plan {
             ShadowTaskExecutionPlan::Dispatch {
-                target: _,
-                worker_id: _,
+                target,
+                worker_id,
                 lane_id,
                 lane_seq,
                 is_primary,
@@ -1780,6 +2171,8 @@ impl TaskDispatcher for ShadowTaskDispatcher {
                     task,
                     &task.task_id,
                     &lease.lease_id,
+                    target,
+                    worker_id,
                     lane_id,
                     lane_seq,
                     is_primary,
@@ -1789,7 +2182,7 @@ impl TaskDispatcher for ShadowTaskDispatcher {
                     writebacks,
                     use_tools,
                     skill_name,
-                );
+                )?;
             }
         }
 

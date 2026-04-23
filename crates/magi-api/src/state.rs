@@ -11,7 +11,7 @@ use crate::routes::settings::{
     resolve_registry_agents,
 };
 use crate::settings_store::SettingsStore;
-use crate::task_execution::ShadowTaskExecutionRegistry;
+use crate::task_execution::{ShadowTaskDispatcher, ShadowTaskExecutionRegistry};
 use magi_bridge_client::{
     BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerConfig,
     ModelBridgeClient, StdioMcpBridgeClient,
@@ -407,8 +407,10 @@ pub struct ApiState {
     shadow_task_execution_registry: ShadowTaskExecutionRegistry,
     task_store: Option<Arc<TaskStore>>,
     runner_manager: Option<RunnerManager>,
+    session_turn_dispatcher: Option<Arc<ShadowTaskDispatcher>>,
     mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
+    model_bridge_client_is_real: bool,
     pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     pub tunnel_manager: crate::tunnel::TunnelManager,
 }
@@ -511,8 +513,10 @@ impl ApiState {
             shadow_task_execution_registry: ShadowTaskExecutionRegistry::default(),
             task_store: None,
             runner_manager: None,
+            session_turn_dispatcher: None,
             mcp_connections: Arc::new(RwLock::new(HashMap::new())),
             model_bridge_client: None,
+            model_bridge_client_is_real: false,
             skill_runtime: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
         }
@@ -908,8 +912,23 @@ impl ApiState {
         self
     }
 
+    pub fn with_session_turn_dispatcher(mut self, dispatcher: Arc<ShadowTaskDispatcher>) -> Self {
+        self.session_turn_dispatcher = Some(dispatcher);
+        self
+    }
+
+    pub fn session_turn_dispatcher(&self) -> Option<&Arc<ShadowTaskDispatcher>> {
+        self.session_turn_dispatcher.as_ref()
+    }
+
     pub fn with_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
         self.model_bridge_client = Some(client);
+        self
+    }
+
+    pub fn with_real_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
+        self.model_bridge_client = Some(client);
+        self.model_bridge_client_is_real = true;
         self
     }
 
@@ -931,6 +950,10 @@ impl ApiState {
 
     pub fn model_bridge_client(&self) -> Option<&Arc<dyn ModelBridgeClient>> {
         self.model_bridge_client.as_ref()
+    }
+
+    pub fn model_bridge_client_is_real(&self) -> bool {
+        self.model_bridge_client_is_real
     }
 }
 

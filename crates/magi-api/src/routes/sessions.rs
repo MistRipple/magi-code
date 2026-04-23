@@ -3,27 +3,43 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
-use magi_bridge_client::{ModelInvocationRequest, SHADOW_MODEL_PROVIDER};
+use magi_bridge_client::{
+    ChatCompletionPayload, ChatToolChoice, ChatToolDefinition, ChatToolFunctionDefinition,
+    HttpModelBridgeClient, ModelBridgeClient, ModelInvocationRequest, SHADOW_MODEL_PROVIDER,
+};
 use magi_core::TaskStatus;
 use magi_core::{DomainError, EventId, SessionId, UtcMillis, WorkerId};
 use magi_event_bus::{EventContext, EventEnvelope};
-use magi_session_store::{SessionRecord, TimelineEntryKind};
+use magi_session_store::{
+    ActiveExecutionTurn, ActiveExecutionTurnItem, SessionRecord, TimelineEntryKind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use super::append_session_user_message;
 use crate::{
-    dto::{BootstrapDto, SessionNotificationsResponseDto},
+    dto::{
+        BootstrapDto, SessionNotificationsResponseDto, SessionTurnRequestDto,
+        SessionTurnResponseDto, SessionTurnRouteDto,
+    },
     errors::ApiError,
     state::ApiState,
-    task_execution::continue_shadow_execution_chain,
+    task_execution::{
+        SessionTurnExecutionRequest, active_execution_branch_is_continue_recoverable,
+        continue_shadow_execution_chain,
+    },
 };
+
+const SESSION_TURN_CLASSIFIER_TOOL_NAME: &str = "classify_session_turn";
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/session/new", post(create_session))
-        .route("/session/chat", post(chat_session))
+        .route("/session/turn", post(submit_session_turn))
         .route("/session/continue", post(continue_session))
         .route("/session/switch", post(switch_session))
         .route("/session/delete", post(delete_session))
@@ -53,24 +69,6 @@ struct CreateSessionRequest {
     workspace_path: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ChatSessionRequest {
-    session_id: Option<String>,
-    workspace_id: Option<String>,
-    text: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ChatSessionResponseDto {
-    session_id: String,
-    entry_id: String,
-    event_id: String,
-    accepted_at: UtcMillis,
-    created_session: bool,
-}
-
 async fn create_session(
     State(state): State<ApiState>,
     Json(request): Json<CreateSessionRequest>,
@@ -88,137 +86,71 @@ async fn create_session(
     }))
 }
 
-async fn chat_session(
+async fn submit_session_turn(
     State(state): State<ApiState>,
-    Json(request): Json<ChatSessionRequest>,
-) -> Result<Json<ChatSessionResponseDto>, ApiError> {
-    let text = request
-        .text
-        .as_deref()
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("普通对话内容不能为空".to_string()))?;
+    Json(request): Json<SessionTurnRequestDto>,
+) -> Result<Json<SessionTurnResponseDto>, ApiError> {
+    validate_session_turn_input(&request)?;
     let accepted_at = super::monotonic_accepted_at();
-    let requested_session_id = request
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|session_id| !session_id.is_empty())
-        .map(SessionId::new);
-    let requested_workspace_id = request
-        .workspace_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|workspace_id| !workspace_id.is_empty())
-        .map(str::to_string);
-    let response_text = invoke_plain_chat(&state, text)?;
-    let (session_id, created_session) =
-        resolve_chat_session(&state, requested_session_id, requested_workspace_id, text)?;
-
-    append_session_user_message(&state, &session_id, accepted_at, text);
-    append_session_assistant_message(&state, &session_id, accepted_at, &response_text);
-    state.persist_session_durable_state()?;
-
-    let event_id = EventId::new(format!("event-session-chat-{}", accepted_at.0));
-    state
-        .event_bus
-        .publish(
-            EventEnvelope::domain(
-                event_id.clone(),
-                "session.chat.completed",
-                json!({
-                    "session_id": session_id.to_string(),
-                    "created_session": created_session,
-                }),
-            )
-            .with_context(EventContext {
-                session_id: Some(session_id.clone()),
-                ..EventContext::default()
-            }),
-        )
-        .map_err(|err| ApiError::event_publish_failed("普通对话事件发布失败", err))?;
-
-    Ok(Json(ChatSessionResponseDto {
-        session_id: session_id.to_string(),
-        entry_id: format!("timeline-{}-{}", session_id, accepted_at.0),
-        event_id: event_id.to_string(),
-        accepted_at,
-        created_session,
-    }))
-}
-
-fn invoke_plain_chat(state: &ApiState, text: &str) -> Result<String, ApiError> {
-    let client = state
-        .model_bridge_client()
-        .ok_or_else(|| ApiError::internal_assembly("普通对话失败", "model bridge 未配置"))?;
-    let response = client
-        .invoke(ModelInvocationRequest {
-            provider: SHADOW_MODEL_PROVIDER.to_string(),
-            prompt: text.to_string(),
-            messages: None,
-            tools: None,
-        })
-        .map_err(|error| ApiError::internal_assembly("普通对话模型调用失败", error))?;
-    let payload = response.payload.trim();
-    if !response.ok || payload.is_empty() {
-        return Err(ApiError::internal_assembly(
-            "普通对话模型调用失败",
-            "模型返回空内容",
-        ));
-    }
-    Ok(payload.to_string())
-}
-
-fn resolve_chat_session(
-    state: &ApiState,
-    requested_session_id: Option<SessionId>,
-    requested_workspace_id: Option<String>,
-    title_seed: &str,
-) -> Result<(SessionId, bool), ApiError> {
-    if let Some(session_id) = requested_session_id {
-        state
-            .session_store
-            .session(&session_id)
-            .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
-        return Ok((session_id, false));
-    }
-
-    if let Some(current_session) = state.session_store.current_session() {
-        if let Some(requested_workspace_id) = requested_workspace_id.as_deref() {
-            if current_session.workspace_id.as_deref() != Some(requested_workspace_id) {
-                let session_id = super::new_session_id();
-                state
-                    .session_store
-                    .create_session_for_workspace(
-                        session_id.clone(),
-                        chat_session_title(title_seed),
-                        Some(requested_workspace_id.to_string()),
-                    )
-                    .map_err(|err| ApiError::internal_assembly("创建普通对话会话失败", err))?;
-                return Ok((session_id, true));
-            }
+    let decision = classify_session_turn(&state, &request)?;
+    match decision.route {
+        SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute => {
+            submit_regular_session_turn(state, request, accepted_at, decision).map(Json)
         }
-        return Ok((current_session.session_id, false));
-    }
-
-    let session_id = super::new_session_id();
-    state
-        .session_store
-        .create_session_for_workspace(
-            session_id.clone(),
-            chat_session_title(title_seed),
-            requested_workspace_id,
-        )
-        .map_err(|err| ApiError::internal_assembly("创建普通对话会话失败", err))?;
-    Ok((session_id, true))
-}
-
-fn chat_session_title(text: &str) -> String {
-    let title = text.chars().take(80).collect::<String>().trim().to_string();
-    if title.is_empty() {
-        "新会话".to_string()
-    } else {
-        title
+        SessionTurnRouteDto::Task => {
+            let (accepted, event_id) = super::accept_session_task_submission(
+                &state,
+                &request,
+                decision.task_title.clone(),
+                decision.execution_goal.clone(),
+            )?;
+            super::spawn_session_task_dispatch(state.clone(), accepted.clone());
+            let execution_chain_ref = state
+                .session_store
+                .runtime_sidecar(&accepted.session_id)
+                .and_then(|sidecar| sidecar.ownership.execution_chain_ref);
+            Ok(Json(SessionTurnResponseDto::new(
+                accepted.session_id,
+                accepted.entry_id,
+                event_id,
+                accepted.accepted_at,
+                accepted.created_session,
+                SessionTurnRouteDto::Task,
+                Some(accepted.root_task_id),
+                Some(accepted.action_task_id),
+                execution_chain_ref,
+            )))
+        }
+        SessionTurnRouteDto::Continue => {
+            let session_id = request
+                .requested_session_id()
+                .or_else(|| {
+                    state
+                        .session_store
+                        .current_session()
+                        .map(|session| session.session_id)
+                })
+                .ok_or_else(|| ApiError::InvalidInput("继续会话需要明确的 session".to_string()))?;
+            let prompt_text = request.trimmed_text();
+            let accepted = continue_shadow_execution_chain(&state, &session_id, &[])?;
+            spawn_continue_session_finalize(state.clone(), accepted.clone(), accepted_at);
+            if let Some(prompt_text) = prompt_text.as_deref() {
+                append_session_user_message(&state, &session_id, accepted_at, prompt_text);
+            }
+            state.persist_runtime_durable_state()?;
+            let event_id = publish_session_turn_continue_event(&state, &accepted, accepted_at)?;
+            Ok(Json(SessionTurnResponseDto::new(
+                accepted.session_id,
+                format!("timeline-{}-{}", session_id, accepted_at.0),
+                event_id,
+                accepted_at,
+                false,
+                SessionTurnRouteDto::Continue,
+                Some(accepted.root_task_id),
+                Some(accepted.action_task_id),
+                Some(accepted.execution_chain_ref),
+            )))
+        }
     }
 }
 
@@ -249,6 +181,357 @@ fn append_session_assistant_message(
             ..EventContext::default()
         }),
     );
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionTurnIntentDecision {
+    route: SessionTurnRouteDto,
+    task_title: Option<String>,
+    execution_goal: Option<String>,
+    #[serde(default)]
+    required_workers: Vec<String>,
+    tool_intent: Option<String>,
+}
+
+fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), ApiError> {
+    if request.trimmed_text().is_none()
+        && request
+            .skill_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        && request.images.is_empty()
+    {
+        return Err(ApiError::InvalidInput("会话输入不能为空".to_string()));
+    }
+    Ok(())
+}
+
+fn classify_session_turn(
+    state: &ApiState,
+    request: &SessionTurnRequestDto,
+) -> Result<SessionTurnIntentDecision, ApiError> {
+    let session_id = request.requested_session_id().or_else(|| {
+        state
+            .session_store
+            .current_session()
+            .map(|session| session.session_id)
+    });
+    let has_recoverable_chain = session_id
+        .as_ref()
+        .and_then(|session_id| state.session_store.runtime_sidecar(session_id))
+        .and_then(|sidecar| sidecar.active_execution_chain)
+        .is_some_and(|chain| {
+            chain.branches.iter().any(|branch| {
+                active_execution_branch_is_continue_recoverable(state, &chain, branch)
+            })
+        });
+    let client = resolve_session_turn_model_client(state)?;
+    let prompt = build_session_turn_classifier_prompt(request, has_recoverable_chain);
+    let response = client
+        .invoke(ModelInvocationRequest {
+            provider: SHADOW_MODEL_PROVIDER.to_string(),
+            prompt,
+            messages: None,
+            tools: Some(session_turn_classifier_tools()),
+            tool_choice: Some(ChatToolChoice::force_function(
+                SESSION_TURN_CLASSIFIER_TOOL_NAME,
+            )),
+        })
+        .map_err(|error| ApiError::internal_assembly("session turn 分类失败", error))?;
+    if !response.ok {
+        return Err(ApiError::internal_assembly(
+            "session turn 分类失败",
+            "模型返回非成功状态",
+        ));
+    }
+    let decision = parse_session_turn_intent_decision(&response.payload)?;
+    if matches!(decision.route, SessionTurnRouteDto::Continue) && !has_recoverable_chain {
+        return Err(ApiError::InvalidInput(
+            "模型判定继续会话，但当前 session 没有可继续的执行链".to_string(),
+        ));
+    }
+    Ok(decision)
+}
+
+fn resolve_session_turn_model_client(
+    state: &ApiState,
+) -> Result<Arc<dyn ModelBridgeClient>, ApiError> {
+    let config = state.settings_store.get_section("orchestrator");
+    let base_url = config
+        .get("baseUrl")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(base_url) = base_url {
+        let api_key = config
+            .get("apiKey")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let model = config
+            .get("model")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("gpt-4")
+            .to_string();
+        return Ok(Arc::new(HttpModelBridgeClient::new(
+            base_url.to_string(),
+            api_key,
+            model,
+        )));
+    }
+
+    if state.model_bridge_client_is_real() {
+        if let Some(client) = state.model_bridge_client() {
+            return Ok(client.clone());
+        }
+    }
+
+    #[cfg(test)]
+    if let Some(client) = state.model_bridge_client() {
+        return Ok(client.clone());
+    }
+
+    Err(ApiError::InvalidInput(
+        "session turn 分类需要先配置真实编排模型".to_string(),
+    ))
+}
+
+fn build_session_turn_classifier_prompt(
+    request: &SessionTurnRequestDto,
+    has_recoverable_chain: bool,
+) -> String {
+    let text = request.trimmed_text().unwrap_or_default();
+    let skill_name = request
+        .skill_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+    format!(
+        r#"你是 Magi 的 Session Turn 编排分类器，只能返回一个严格 JSON 对象，不要输出任何解释。
+
+字段：
+- route: 必填，只能是 "chat" | "execute" | "task" | "continue"
+- taskTitle: route=task 时可选，产品化任务标题
+- executionGoal: route=task 时可选，执行目标
+- requiredWorkers: 可选字符串数组
+- toolIntent: route=execute 时可选，工具执行意图
+
+判定原则：
+- chat: 普通对话、解释、问答、讨论，不创建任务
+- execute: 需要即时工具调用，但不需要产品级任务编排
+- task: 需要拆解、长流程、多 worker、可中断续接、持续跟踪的产品级任务
+- continue: 用户表达继续/恢复/接着执行，且 hasRecoverableChain=true
+
+状态：
+hasRecoverableChain={has_recoverable_chain}
+deepTask={}
+skillName={}
+imageCount={}
+userText={}
+
+只返回 JSON。"#,
+        request.deep_task,
+        serde_json::to_string(skill_name).unwrap_or_else(|_| "\"\"".to_string()),
+        request.images.len(),
+        serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string())
+    )
+}
+
+fn parse_session_turn_intent_decision(
+    payload: &str,
+) -> Result<SessionTurnIntentDecision, ApiError> {
+    let payload =
+        serde_json::from_str::<ChatCompletionPayload>(payload.trim()).map_err(|error| {
+            ApiError::InvalidInput(format!(
+                "session turn 分类响应不是合法工具调用载荷: {error}"
+            ))
+        })?;
+    let tool_call = payload
+        .tool_calls
+        .iter()
+        .find(|call| call.function.name == SESSION_TURN_CLASSIFIER_TOOL_NAME)
+        .ok_or_else(|| {
+            ApiError::InvalidInput("session turn 分类响应缺少结构化工具调用".to_string())
+        })?;
+    if tool_call.function.arguments.trim().is_empty() {
+        return Err(ApiError::InvalidInput(
+            "session turn 分类工具参数为空".to_string(),
+        ));
+    }
+    serde_json::from_str::<SessionTurnIntentDecision>(&tool_call.function.arguments)
+        .map_err(|error| ApiError::InvalidInput(format!("session turn 分类结构不合法: {error}")))
+}
+
+fn session_turn_classifier_tools() -> Vec<ChatToolDefinition> {
+    vec![ChatToolDefinition {
+        kind: "function".to_string(),
+        function: ChatToolFunctionDefinition {
+            name: SESSION_TURN_CLASSIFIER_TOOL_NAME.to_string(),
+            description: "输出 Magi session turn 编排路线".to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "route": {
+                        "type": "string",
+                        "enum": ["chat", "execute", "task", "continue"]
+                    },
+                    "taskTitle": { "type": "string" },
+                    "executionGoal": { "type": "string" },
+                    "requiredWorkers": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "toolIntent": { "type": "string" }
+                },
+                "required": ["route"]
+            }),
+        },
+    }]
+}
+
+fn submit_regular_session_turn(
+    state: ApiState,
+    request: SessionTurnRequestDto,
+    accepted_at: UtcMillis,
+    decision: SessionTurnIntentDecision,
+) -> Result<SessionTurnResponseDto, ApiError> {
+    let trimmed_text = request.trimmed_text();
+    let message = request.timeline_message(trimmed_text.as_deref());
+    let title_seed = trimmed_text.as_deref().unwrap_or("新会话");
+    let (session_id, created_session, workspace_id) = super::resolve_dispatch_session(
+        &state,
+        request.requested_session_id(),
+        request
+            .requested_workspace_id()
+            .map(magi_core::WorkspaceId::new),
+        title_seed,
+        accepted_at,
+    )?;
+    let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
+    append_session_user_message(&state, &session_id, accepted_at, &message);
+    let mut turn = ActiveExecutionTurn {
+        turn_id: format!("turn-session-{}", accepted_at.0),
+        turn_seq: accepted_at.0 as u64,
+        accepted_at,
+        status: "running".to_string(),
+        user_message: Some(message.clone()),
+        items: vec![ActiveExecutionTurnItem {
+            item_id: format!("turn-item-user-{}", accepted_at.0),
+            item_seq: 1,
+            lane_id: None,
+            lane_seq: None,
+            kind: "user_message".to_string(),
+            status: "completed".to_string(),
+            source: "user".to_string(),
+            title: None,
+            content: Some(message.clone()),
+            task_id: None,
+            worker_id: None,
+            role_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            tool_status: None,
+            tool_result: None,
+            tool_error: None,
+            thread_visible: false,
+            worker_visible: false,
+        }],
+        worker_lanes: Vec::new(),
+    };
+    turn.normalize();
+    state
+        .session_store
+        .upsert_current_turn(session_id.clone(), turn)
+        .map_err(|error| ApiError::internal_assembly("写入 session turn 失败", error))?;
+    let dispatcher = state.session_turn_dispatcher().ok_or_else(|| {
+        ApiError::internal_assembly("执行 session turn 失败", "session turn dispatcher 未配置")
+    })?;
+    let prompt = decision
+        .tool_intent
+        .as_deref()
+        .filter(|intent| !intent.trim().is_empty())
+        .map(|intent| format!("{}\n\n用户原始输入：{}", intent.trim(), message))
+        .unwrap_or_else(|| message.clone());
+    let output = dispatcher.execute_session_turn(SessionTurnExecutionRequest {
+        session_id: session_id.clone(),
+        workspace_id,
+        prompt,
+        use_tools: matches!(decision.route, SessionTurnRouteDto::Execute),
+        skill_name: request.skill_name.clone(),
+    })?;
+    append_session_assistant_message(&state, &session_id, accepted_at, &output.final_content);
+    state.persist_session_durable_state()?;
+    let event_id = EventId::new(format!("event-session-turn-{}", accepted_at.0));
+    state
+        .event_bus
+        .publish(
+            EventEnvelope::domain(
+                event_id.clone(),
+                "session.turn.completed",
+                json!({
+                    "session_id": session_id.to_string(),
+                    "route": decision.route,
+                    "created_session": created_session,
+                    "required_workers": decision.required_workers,
+                }),
+            )
+            .with_context(EventContext {
+                session_id: Some(session_id.clone()),
+                ..EventContext::default()
+            }),
+        )
+        .map_err(|err| ApiError::event_publish_failed("session turn 事件发布失败", err))?;
+
+    Ok(SessionTurnResponseDto::new(
+        session_id,
+        entry_id,
+        event_id,
+        accepted_at,
+        created_session,
+        decision.route,
+        None,
+        None,
+        None,
+    ))
+}
+
+fn publish_session_turn_continue_event(
+    state: &ApiState,
+    accepted: &crate::task_execution::SessionContinueAccepted,
+    continued_at: UtcMillis,
+) -> Result<EventId, ApiError> {
+    let event_id = EventId::new(format!("event-session-turn-continue-{}", continued_at.0));
+    let event = EventEnvelope::domain(
+        event_id.clone(),
+        "session.turn.continue.executed",
+        json!({
+            "session_id": accepted.session_id.to_string(),
+            "mission_id": accepted.mission_id.to_string(),
+            "root_task_id": accepted.root_task_id.to_string(),
+            "execution_chain_ref": accepted.execution_chain_ref.clone(),
+            "resumed_branch_count": accepted.resumed_branch_count,
+            "runner_started": accepted.runner_started,
+        }),
+    )
+    .with_context(EventContext {
+        session_id: Some(accepted.session_id.clone()),
+        mission_id: Some(accepted.mission_id.clone()),
+        task_id: Some(accepted.root_task_id.clone()),
+        ..EventContext::default()
+    });
+    state
+        .event_bus
+        .publish(event)
+        .map_err(|err| ApiError::event_publish_failed("session turn 继续事件发布失败", err))?;
+    Ok(event_id)
 }
 
 #[derive(Debug, Deserialize)]

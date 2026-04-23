@@ -6,20 +6,19 @@ mod sessions;
 pub(crate) mod settings;
 mod tasks_graph;
 mod tasks_interaction;
-mod tasks_runner;
 mod workspaces;
 
 use axum::{
     Json, Router,
     extract::{Query, State},
-    routing::{get, post},
+    routing::get,
 };
-use magi_core::{EventId, SessionId, Task, TaskStatus, UtcMillis, WorkspaceId};
+use magi_core::{EventId, SessionId, TaskStatus, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::TimelineEntryKind;
 use magi_session_store::{ActiveExecutionTurn, SessionRecord};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static ACCEPTED_AT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -42,7 +41,7 @@ use crate::{
     dto::{
         AuditUsageLedgerDto, BootstrapDto, BridgeCutoverSmokeSnapshotDto,
         BridgePreflightSnapshotDto, BridgeServicesSnapshotDto, HealthDto, RuntimeReadModelDto,
-        SessionActionRequestDto, SessionActionResponseDto, VersionHandshakeDto,
+        SessionTurnRequestDto, VersionHandshakeDto,
     },
     errors::ApiError,
     sse,
@@ -63,7 +62,6 @@ pub fn build_router(state: ApiState) -> Router {
         .merge(changes_files_tunnel::routes())
         .merge(tasks_interaction::routes())
         .merge(tasks_graph::routes())
-        .merge(tasks_runner::routes())
         .merge(messages::routes());
 
     Router::new()
@@ -76,7 +74,6 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/bridges/cutover-smoke", get(bridge_cutover_smoke))
         .route("/events", get(stream_events))
         .route("/version", get(version))
-        .route("/session/action", post(submit_session_action))
         .nest("/api", api_routes)
         .with_state(state)
 }
@@ -149,37 +146,25 @@ async fn version(State(state): State<ApiState>) -> Json<VersionHandshakeDto> {
     Json(state.version_handshake_dto())
 }
 
-async fn submit_session_action(
-    State(state): State<ApiState>,
-    Json(request): Json<SessionActionRequestDto>,
-) -> Result<Json<SessionActionResponseDto>, ApiError> {
-    let (accepted, event_id) = accept_session_action_submission(&state, &request)?;
-    spawn_session_action_dispatch(state.clone(), accepted.clone());
-
-    Ok(Json(SessionActionResponseDto::new(
-        accepted.session_id,
-        accepted.entry_id,
-        event_id,
-        accepted.accepted_at,
-        accepted.created_session,
-        Some(accepted.root_task_id),
-        Some(accepted.action_task_id),
-    )))
-}
-
-pub(super) fn accept_session_action_submission(
+pub(super) fn accept_session_task_submission(
     state: &ApiState,
-    request: &SessionActionRequestDto,
+    request: &SessionTurnRequestDto,
+    task_title: Option<String>,
+    execution_goal: Option<String>,
 ) -> Result<(DispatchSubmissionAccepted, EventId), ApiError> {
-    if !request.has_execution_trigger() {
-        return Err(ApiError::InvalidInput(
-            "普通对话不能提交到任务执行入口，请使用普通对话通道".to_string(),
-        ));
-    }
-
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_message(trimmed_text.as_deref());
-    let mission_title = request.mission_title(trimmed_text.as_deref());
+    let mission_title = task_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| request.mission_title(trimmed_text.as_deref()));
+    let execution_goal = execution_goal
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     execute_dispatch_submission(
         state,
@@ -188,6 +173,7 @@ pub(super) fn accept_session_action_submission(
         mission_title,
         message,
         trimmed_text,
+        execution_goal,
         request.deep_task,
         request.skill_name.clone(),
         None,
@@ -202,10 +188,11 @@ fn execute_dispatch_submission(
     mission_title: String,
     message: String,
     trimmed_text: Option<String>,
+    execution_goal: Option<String>,
     deep_task: bool,
     skill_name: Option<String>,
     target_role: Option<String>,
-    request: &SessionActionRequestDto,
+    request: &SessionTurnRequestDto,
 ) -> Result<(DispatchSubmissionAccepted, EventId), ApiError> {
     let accepted_at = monotonic_accepted_at();
     let (session_id, created_session, workspace_id) = resolve_dispatch_session(
@@ -227,17 +214,18 @@ fn execute_dispatch_submission(
         mission_title,
         task_title: action_task_title,
         trimmed_text,
+        execution_goal,
         deep_task,
         skill_name,
         target_role,
     };
     let accepted = submit_shadow_dispatch_submission(state, dispatch)?;
-    let event_id = publish_session_action_accepted_event(state, request, &accepted)?;
+    let event_id = publish_session_turn_task_accepted_event(state, request, &accepted)?;
     state.persist_session_durable_state()?;
     Ok((accepted, event_id))
 }
 
-fn spawn_session_action_dispatch(state: ApiState, accepted: DispatchSubmissionAccepted) {
+pub(super) fn spawn_session_task_dispatch(state: ApiState, accepted: DispatchSubmissionAccepted) {
     tokio::task::spawn_blocking(move || {
         let mut accepted = accepted;
         if let Err(error) = drive_shadow_dispatch_submission(&state, &mut accepted) {
@@ -246,7 +234,7 @@ fn spawn_session_action_dispatch(state: ApiState, accepted: DispatchSubmissionAc
                 root_task_id = %accepted.root_task_id,
                 action_task_id = %accepted.action_task_id,
                 ?error,
-                "session action background dispatch failed"
+                "session turn task background dispatch failed"
             );
             let _ = state.persist_session_durable_state();
             return;
@@ -257,15 +245,15 @@ fn spawn_session_action_dispatch(state: ApiState, accepted: DispatchSubmissionAc
                 session_id = %accepted.session_id,
                 root_task_id = %accepted.root_task_id,
                 ?error,
-                "session action background dispatch persist failed"
+                "session turn task background dispatch persist failed"
             );
         }
     });
 }
 
-fn publish_session_action_accepted_event(
+fn publish_session_turn_task_accepted_event(
     state: &ApiState,
-    request: &SessionActionRequestDto,
+    request: &SessionTurnRequestDto,
     accepted: &DispatchSubmissionAccepted,
 ) -> Result<EventId, ApiError> {
     let workspace_id = state
@@ -273,10 +261,13 @@ fn publish_session_action_accepted_event(
         .execution_ownership(&accepted.session_id)
         .and_then(|ownership| ownership.workspace_id)
         .or_else(|| request.requested_workspace_id().map(WorkspaceId::new));
-    let event_id = EventId::new(format!("event-session-action-{}", accepted.accepted_at.0));
+    let event_id = EventId::new(format!(
+        "event-session-turn-task-{}",
+        accepted.accepted_at.0
+    ));
     let event = EventEnvelope::domain(
         event_id.clone(),
-        "session.action.accepted",
+        "session.turn.task.accepted",
         json!({
             "session_id": accepted.session_id,
             "entry_id": accepted.entry_id,
@@ -428,16 +419,13 @@ fn append_dispatch_assistant_message(state: &ApiState, accepted: &DispatchSubmis
     let current_turn = state
         .session_store
         .runtime_sidecar(&accepted.session_id)
-        .and_then(|sidecar| sidecar.active_execution_chain)
-        .and_then(|chain| chain.current_turn);
+        .and_then(|sidecar| sidecar.current_turn);
     let current_turn_matches = current_turn
         .as_ref()
         .is_some_and(|turn| turn_matches_accepted_dispatch(turn, accepted));
-    let response_text = if current_turn_matches {
-        current_turn.and_then(|turn| assistant_final_from_turn(turn, accepted))
-    } else {
-        assistant_message_from_task_output_refs(&task)
-    };
+    let response_text = current_turn_matches
+        .then(|| current_turn.and_then(|turn| assistant_final_from_turn(turn, accepted)))
+        .flatten();
 
     let Some(response_text) = response_text else {
         return;
@@ -497,33 +485,6 @@ fn assistant_final_from_turn(
         .map(|(_, content)| content)
 }
 
-fn assistant_message_from_task_output_refs(task: &Task) -> Option<String> {
-    task.output_refs
-        .iter()
-        .rev()
-        .find_map(|output_ref| visible_text_from_output_ref(output_ref))
-}
-
-fn visible_text_from_output_ref(output_ref: &str) -> Option<String> {
-    let trimmed = output_ref.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Ok(value) = serde_json::from_str::<Value>(trimmed)
-        && let Some(blocks) = value.get("blocks").and_then(Value::as_array)
-        && let Some(content) = blocks
-            .iter()
-            .rev()
-            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|block| block.get("content").and_then(Value::as_str))
-            .map(str::trim)
-            .find(|content| !content.is_empty())
-    {
-        return Some(content.to_string());
-    }
-    Some(trimmed.to_string())
-}
-
 async fn stream_events(State(state): State<ApiState>) -> impl axum::response::IntoResponse {
     sse::events(state).await
 }
@@ -551,8 +512,8 @@ mod tests {
     };
     use magi_context_runtime::{ContextBudget, ContextRuntime};
     use magi_core::{
-        AbsolutePath, EventId, ExecutionOwnership, LeaseId, MissionId, SessionId, Task, TaskId,
-        TaskKind, TaskStatus, UtcMillis, WorkspaceId,
+        AbsolutePath, DecisionOption, DecisionTaskPayload, EventId, ExecutionOwnership, LeaseId,
+        MissionId, SessionId, Task, TaskId, TaskKind, TaskStatus, UtcMillis, WorkerId, WorkspaceId,
     };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
@@ -561,8 +522,8 @@ mod tests {
     use magi_orchestrator::task_runner::{EventBasedResultReceiver, TaskOutcome, TaskResult};
     use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
     use magi_session_store::{
-        ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
-        ActiveExecutionTurnItem, SessionStore,
+        ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
+        ActiveExecutionTurn, ActiveExecutionTurnItem, SessionStore,
     };
     use magi_skill_runtime::SkillDispatchRuntime;
     use magi_tool_runtime::ToolRegistry;
@@ -763,10 +724,12 @@ mod tests {
         let runner_manager = RunnerManager::with_dispatcher_and_worker_catalog(
             task_store,
             Arc::new(move || state_for_task_workers.task_worker_catalog()),
-            dispatcher,
+            dispatcher.clone(),
             runner_result_receiver,
         );
-        state = state.with_runner_manager(runner_manager);
+        state = state
+            .with_session_turn_dispatcher(dispatcher)
+            .with_runner_manager(runner_manager);
         state
     }
 
@@ -935,7 +898,7 @@ mod tests {
 
         let (status, body) = post_json(
             app.clone(),
-            "/api/session/chat",
+            "/api/session/turn",
             json!({
                 "sessionId": "session-route-shadow",
                 "text": "你好，这只是普通对话",
@@ -963,10 +926,9 @@ mod tests {
             .iter()
             .find(|session| session["session_id"] == "session-route-shadow")
             .expect("chat session should exist in read model");
-        assert!(
-            session_summary["current_turn"].is_null(),
-            "普通对话不应创建任务 turn envelope"
-        );
+        assert_eq!(session_summary["current_turn"]["status"], "completed");
+        assert_eq!(session_summary["current_turn"]["mission_id"], Value::Null);
+        assert_eq!(session_summary["current_turn"]["root_task_id"], Value::Null);
 
         let messages = get_json(app, "/api/messages?sessionId=session-route-shadow").await;
         let message_items = messages["messages"]
@@ -989,27 +951,220 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_action_route_rejects_plain_chat_without_execution_trigger() {
+    async fn session_task_after_chat_replaces_current_turn_owner() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let app = build_router(state.clone());
+        let session_id = "session-chat-then-task";
+        let task_text = "请分析并拆分这个复杂任务";
+        state
+            .session_store
+            .create_session(SessionId::new(session_id), "chat then task session")
+            .expect("session should create");
+
+        let (chat_status, chat_body) = post_json(
+            app.clone(),
+            "/api/session/turn",
+            json!({
+                "sessionId": session_id,
+                "text": "你好，这只是普通对话",
+                "deepTask": false,
+                "skillName": null,
+                "images": [],
+            }),
+        )
+        .await;
+        assert_eq!(
+            chat_status,
+            StatusCode::OK,
+            "普通对话应提交成功: {chat_body:?}"
+        );
+        assert_eq!(chat_body["route"], "chat");
+
+        let (task_status, task_body) = post_json(
+            app,
+            "/api/session/turn",
+            json!({
+                "sessionId": session_id,
+                "text": task_text,
+                "deepTask": true,
+                "skillName": "deep_task",
+                "images": [],
+            }),
+        )
+        .await;
+        assert_eq!(
+            task_status,
+            StatusCode::OK,
+            "任务 turn 应提交成功: {task_body:?}"
+        );
+        assert_eq!(task_body["route"], "task");
+        let root_task_id = task_body["rootTaskId"]
+            .as_str()
+            .expect("task route should expose root task id");
+
+        let read_model = state.runtime_read_model_dto();
+        let session_entry = read_model
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == session_id)
+            .expect("session runtime summary should exist");
+        let current_turn = session_entry
+            .current_turn
+            .as_ref()
+            .expect("current turn should exist after task route");
+
+        assert_eq!(current_turn.user_message.as_deref(), Some(task_text));
+        assert_eq!(current_turn.root_task_id.as_deref(), Some(root_task_id));
+        assert!(
+            session_entry
+                .turn_items
+                .first()
+                .is_some_and(|item| item.kind == "user_message"
+                    && item.content.as_deref() == Some(task_text)
+                    && !item.thread_visible),
+            "任务 turn 的用户消息只作为请求锚点，不应进入响应区渲染"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_turn_route_accepts_model_classified_plain_chat() {
         let app = build_router(test_state_with_shadow_execution_pipeline());
 
         let (status, body) = post_json(
             app,
-            "/session/action",
+            "/api/session/turn",
             json!({
-                "session_id": "session-route-shadow",
+                "sessionId": "session-route-shadow",
                 "text": "你好，这只是普通对话",
-                "deep_task": false,
-                "skill_name": null,
+                "deepTask": false,
+                "skillName": null,
                 "images": [],
             }),
         )
         .await;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error_code"], "INPUT_INVALID");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["route"], "chat");
+    }
+
+    #[tokio::test]
+    async fn session_turn_continue_excludes_finished_branch_from_recoverable_prompt() {
+        let state = build_shadow_execution_state(
+            WorkerRuntime::new_compare,
+            Arc::new(ContinueClassifierExpectingNoRecoverableChain),
+        );
+        let app = build_router(state.clone());
+        let session_id = SessionId::new("session-route-shadow");
+        let mission_id = MissionId::new("mission-finished-branch-prompt");
+        let root_task_id = TaskId::new("task-root-finished-branch-prompt");
+        let branch_task_id = TaskId::new("task-branch-finished-branch-prompt");
+        let worker_id = WorkerId::new("worker-finished-branch-prompt");
+        let accepted_at = UtcMillis::now();
+        let task_store = state.task_store().expect("task store should exist");
+        for (task_id, parent_task_id, kind) in [
+            (root_task_id.clone(), None, TaskKind::Objective),
+            (
+                branch_task_id.clone(),
+                Some(root_task_id.clone()),
+                TaskKind::Action,
+            ),
+        ] {
+            task_store.insert_task(Task {
+                task_id,
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                parent_task_id,
+                kind,
+                title: "finish 阶段分支".to_string(),
+                goal: "验证 finish 阶段不进入自然语言继续集合".to_string(),
+                status: TaskStatus::Blocked,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                context_refs: Vec::new(),
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                repair_count: 0,
+                decision_payload: None,
+                created_at: accepted_at,
+                updated_at: accepted_at,
+            });
+        }
+        state
+            .session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-finished-branch-prompt".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![branch_task_id.clone()],
+                    active_worker_bindings: vec![worker_id.clone()],
+                    branches: vec![ActiveExecutionBranch {
+                        task_id: branch_task_id.clone(),
+                        worker_id,
+                        stage: "finish".to_string(),
+                        lease_id: None,
+                        execution_intent_ref: None,
+                        binding_lifecycle: Some("completed".to_string()),
+                        checkpoint_stage: None,
+                        next_step_index: None,
+                        checkpoint_at: None,
+                        resume_mode: None,
+                        resume_token: None,
+                        use_tools: false,
+                        skill_name: None,
+                        is_primary: true,
+                    }],
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at,
+                        entry_id: "timeline-finished-branch-prompt".to_string(),
+                        trimmed_text: Some("继续".to_string()),
+                        deep_task: true,
+                        skill_name: None,
+                    },
+                    current_turn: None,
+                },
+            )
+            .expect("active chain should upsert");
+
+        let (status, body) = post_json(
+            app,
+            "/api/session/turn",
+            json!({
+                "sessionId": session_id.to_string(),
+                "text": "继续刚刚的任务",
+                "deepTask": false,
+                "skillName": null,
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body:?}");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("没有可继续的执行链")),
+            "错误必须明确说明没有可继续链: {body:?}"
+        );
         assert_eq!(
-            body["message"],
-            "普通对话不能提交到任务执行入口，请使用普通对话通道"
+            task_store
+                .get_task(&branch_task_id)
+                .expect("branch task should still exist")
+                .status,
+            TaskStatus::Blocked,
+            "分类阶段不能把 finish 分支当成 continue 调度来改写"
         );
     }
 
@@ -1020,12 +1175,12 @@ mod tests {
 
         let (status, first_body) = post_json(
             app.clone(),
-            "/session/action",
+            "/api/session/turn",
             json!({
-                "session_id": "session-route-shadow",
+                "sessionId": "session-route-shadow",
                 "text": "Route parser refresh",
-                "deep_task": true,
-                "skill_name": "refactor",
+                "deepTask": true,
+                "skillName": "refactor",
                 "images": [],
             }),
         )
@@ -1036,20 +1191,20 @@ mod tests {
             StatusCode::OK,
             "unexpected response body: {first_body:?}"
         );
-        assert_eq!(first_body["session_id"], "session-route-shadow");
-        assert!(first_body["action_task_id"].is_string());
-        let first_accepted_at = first_body["accepted_at"]
+        assert_eq!(first_body["sessionId"], "session-route-shadow");
+        assert!(first_body["actionTaskId"].is_string());
+        let first_accepted_at = first_body["acceptedAt"]
             .as_u64()
             .expect("accepted_at should serialize as integer");
         let first_extraction_id = format!("extract-session-action-{first_accepted_at}");
         let first_mission_id = format!("mission-session-action-{first_accepted_at}");
         let first_root_task_id = TaskId::new(
-            first_body["root_task_id"]
+            first_body["rootTaskId"]
                 .as_str()
                 .expect("root_task_id should serialize as string"),
         );
         let first_action_task_id = TaskId::new(
-            first_body["action_task_id"]
+            first_body["actionTaskId"]
                 .as_str()
                 .expect("action_task_id should serialize as string"),
         );
@@ -1129,12 +1284,12 @@ mod tests {
 
         let (status, second_body) = post_json(
             app,
-            "/session/action",
+            "/api/session/turn",
             json!({
-                "session_id": "session-route-shadow",
+                "sessionId": "session-route-shadow",
                 "text": "Route parser refresh followup",
-                "deep_task": true,
-                "skill_name": "refactor",
+                "deepTask": true,
+                "skillName": "refactor",
                 "images": [],
             }),
         )
@@ -1144,18 +1299,18 @@ mod tests {
             StatusCode::OK,
             "unexpected response body: {second_body:?}"
         );
-        assert!(second_body["action_task_id"].is_string());
-        let second_accepted_at = second_body["accepted_at"]
+        assert!(second_body["actionTaskId"].is_string());
+        let second_accepted_at = second_body["acceptedAt"]
             .as_u64()
             .expect("accepted_at should serialize as integer");
         let second_mission_id = format!("mission-session-action-{second_accepted_at}");
         let second_root_task_id = TaskId::new(
-            second_body["root_task_id"]
+            second_body["rootTaskId"]
                 .as_str()
                 .expect("root_task_id should serialize as string"),
         );
         let second_action_task_id = TaskId::new(
-            second_body["action_task_id"]
+            second_body["actionTaskId"]
                 .as_str()
                 .expect("action_task_id should serialize as string"),
         );
@@ -1274,13 +1429,13 @@ mod tests {
 
         let (status, body) = post_json(
             app,
-            "/session/action",
+            "/api/session/turn",
             json!({
-                "session_id": session_id.to_string(),
-                "workspace_id": workspace_id.to_string(),
+                "sessionId": session_id.to_string(),
+                "workspaceId": workspace_id.to_string(),
                 "text": "Use alternate workspace",
-                "deep_task": false,
-                "skill_name": "refactor",
+                "deepTask": false,
+                "skillName": "refactor",
                 "images": [],
             }),
         )
@@ -1311,12 +1466,12 @@ mod tests {
 
         let (status, body) = post_json(
             app,
-            "/session/action",
+            "/api/session/turn",
             json!({
-                "session_id": session_id.to_string(),
+                "sessionId": session_id.to_string(),
                 "text": "请分析并拆分这个复杂任务",
-                "deep_task": true,
-                "skill_name": "deep_task",
+                "deepTask": true,
+                "skillName": "deep_task",
                 "images": [],
             }),
         )
@@ -1662,7 +1817,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_dispatch_assistant_message_uses_task_output_when_current_turn_was_replaced() {
+    async fn append_dispatch_assistant_message_skips_stale_turn_when_current_turn_was_replaced() {
         let state = test_state_with_shadow_execution_pipeline();
         let session_id = SessionId::new("session-turn-replaced");
         state
@@ -1740,7 +1895,7 @@ mod tests {
                 parent_task_id: None,
                 kind: TaskKind::Action,
                 title: "执行: first".to_string(),
-                goal: "验证 current_turn 被替换后仍写回第一轮结果".to_string(),
+                goal: "验证 current_turn 被替换后不写回旧轮结果".to_string(),
                 status: TaskStatus::Completed,
                 dependency_ids: vec![],
                 required_children: vec![],
@@ -1793,11 +1948,7 @@ mod tests {
                     )
             })
             .collect::<Vec<_>>();
-        assert_eq!(assistant_messages.len(), 1);
-        assert_eq!(
-            assistant_messages[0].message,
-            "第一轮 action 自己的最终结果"
-        );
+        assert!(assistant_messages.is_empty());
     }
 
     #[tokio::test]
@@ -1881,13 +2032,13 @@ mod tests {
 
         let (status, body) = post_json(
             app,
-            "/session/action",
+            "/api/session/turn",
             json!({
-                "session_id": "session-route-shadow",
-                "workspace_id": alt_workspace_id.to_string(),
+                "sessionId": "session-route-shadow",
+                "workspaceId": alt_workspace_id.to_string(),
                 "text": "cross workspace should fail",
-                "deep_task": false,
-                "skill_name": "refactor",
+                "deepTask": false,
+                "skillName": "refactor",
                 "images": [],
             }),
         )
@@ -1908,13 +2059,13 @@ mod tests {
 
         let (status, body) = post_json(
             app,
-            "/session/action",
+            "/api/session/turn",
             json!({
-                "session_id": "session-route-missing",
-                "workspace_id": "workspace-route-shadow",
+                "sessionId": "session-route-missing",
+                "workspaceId": "workspace-route-shadow",
                 "text": "missing session should fail",
-                "deep_task": false,
-                "skill_name": "refactor",
+                "deepTask": false,
+                "skillName": "refactor",
                 "images": [],
             }),
         )
@@ -1946,11 +2097,11 @@ mod tests {
 
         let (status, body) = post_json(
             app,
-            "/session/action",
+            "/api/session/turn",
             json!({
-                "session_id": "session-route-shadow",
+                "sessionId": "session-route-shadow",
                 "text": "读取一个配置文件并总结",
-                "deep_task": true,
+                "deepTask": true,
                 "images": [],
             }),
         )
@@ -2023,25 +2174,19 @@ mod tests {
 
         let (status, body) = post_json(
             app,
-            "/session/action",
+            "/api/session/turn",
             json!({
-                "session_id": "session-route-shadow",
+                "sessionId": "session-route-shadow",
                 "text": "Route parser refresh failure",
-                "deep_task": true,
-                "skill_name": "refactor",
+                "deepTask": true,
+                "skillName": "refactor",
                 "images": [],
             }),
         )
         .await;
 
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "dispatch failure should still accept the task: {body:?}"
-        );
-        assert!(body["session_id"].is_string());
-        assert!(body["root_task_id"].is_string());
-        assert!(body["action_task_id"].is_string());
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error_code"], "INTERNAL_ASSEMBLY_ERROR");
 
         let extraction_history = state
             .shadow_execution_pipeline()
@@ -2054,9 +2199,9 @@ mod tests {
             .session_store
             .execution_ownership(&SessionId::new("session-route-shadow"))
             .expect("base session ownership should remain present");
-        assert!(ownership.mission_id.is_some());
-        assert!(ownership.task_id.is_some());
-        assert!(ownership.worker_id.is_some());
+        assert!(ownership.mission_id.is_none());
+        assert!(ownership.task_id.is_none());
+        assert!(ownership.worker_id.is_none());
     }
 
     #[tokio::test]
@@ -2070,19 +2215,19 @@ mod tests {
 
         let (status, body) = post_json(
             app,
-            "/session/action",
+            "/api/session/turn",
             json!({
-                "session_id": "session-route-blank",
+                "sessionId": "session-route-blank",
                 "text": "   ",
-                "deep_task": true,
-                "skill_name": "refactor",
+                "deepTask": true,
+                "skillName": "refactor",
                 "images": [],
             }),
         )
         .await;
 
         assert_eq!(status, StatusCode::OK, "unexpected response body: {body:?}");
-        assert!(body["action_task_id"].is_string());
+        assert!(body["actionTaskId"].is_string());
 
         let extraction_history = state
             .shadow_execution_pipeline()
@@ -2091,7 +2236,7 @@ mod tests {
             .extraction_results_for_session(&SessionId::new("session-route-blank"));
         assert!(extraction_history.is_empty());
 
-        let accepted_at = body["accepted_at"]
+        let accepted_at = body["acceptedAt"]
             .as_u64()
             .expect("accepted_at should serialize as integer");
         let mission_id = format!("mission-session-action-{accepted_at}");
@@ -2113,12 +2258,12 @@ mod tests {
 
         let (status, seed_body) = post_json(
             app.clone(),
-            "/session/action",
+            "/api/session/turn",
             json!({
-                "session_id": "session-route-shadow",
+                "sessionId": "session-route-shadow",
                 "text": "seed recovery route state",
-                "deep_task": true,
-                "skill_name": "refactor",
+                "deepTask": true,
+                "skillName": "refactor",
                 "images": [],
             }),
         )
@@ -2132,7 +2277,7 @@ mod tests {
         let session_id = SessionId::new("session-route-shadow");
         let task_store = state.task_store().expect("task store should be configured");
         let seed_action_task_id = TaskId::new(
-            seed_body["action_task_id"]
+            seed_body["actionTaskId"]
                 .as_str()
                 .expect("seed action task id should be returned"),
         );
@@ -2301,12 +2446,12 @@ mod tests {
 
         let (status, seed_body) = post_json(
             app.clone(),
-            "/session/action",
+            "/api/session/turn",
             json!({
-                "session_id": "session-route-shadow-override",
+                "sessionId": "session-route-shadow-override",
                 "text": "seed recovery route state",
-                "deep_task": true,
-                "skill_name": "refactor",
+                "deepTask": true,
+                "skillName": "refactor",
                 "images": [],
             }),
         )
@@ -2379,12 +2524,12 @@ mod tests {
 
         let (status, seed_body) = post_json(
             app.clone(),
-            "/session/action",
+            "/api/session/turn",
             json!({
-                "session_id": "session-route-missing-recovery",
+                "sessionId": "session-route-missing-recovery",
                 "text": "seed missing recovery state",
-                "deep_task": true,
-                "skill_name": "refactor",
+                "deepTask": true,
+                "skillName": "refactor",
                 "images": [],
             }),
         )
@@ -2443,12 +2588,12 @@ mod tests {
 
         let (status, seed_body) = post_json(
             app.clone(),
-            "/session/action",
+            "/api/session/turn",
             json!({
-                "session_id": "session-route-prepared",
+                "sessionId": "session-route-prepared",
                 "text": "seed prepared recovery state",
-                "deep_task": true,
-                "skill_name": "resume",
+                "deepTask": true,
+                "skillName": "resume",
                 "images": [],
             }),
         )
@@ -2521,12 +2666,12 @@ mod tests {
 
         let (status, seed_body) = post_json(
             app.clone(),
-            "/session/action",
+            "/api/session/turn",
             json!({
-                "session_id": "session-route-consumed",
+                "sessionId": "session-route-consumed",
                 "text": "seed consumed recovery state",
-                "deep_task": true,
-                "skill_name": "resume",
+                "deepTask": true,
+                "skillName": "resume",
                 "images": [],
             }),
         )
@@ -2621,6 +2766,9 @@ mod tests {
             &self,
             request: ModelInvocationRequest,
         ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            if let Some(payload) = classifier_payload_for_prompt(&request.prompt) {
+                return Ok(BridgeResponse { ok: true, payload });
+            }
             Ok(BridgeResponse {
                 ok: true,
                 payload: format!("shadow-model::{}", request.prompt.trim()),
@@ -2645,8 +2793,11 @@ mod tests {
     impl ModelBridgeClient for DelayedModelBridgeClient {
         fn invoke(
             &self,
-            _request: ModelInvocationRequest,
+            request: ModelInvocationRequest,
         ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            if let Some(payload) = classifier_payload_for_prompt(&request.prompt) {
+                return Ok(BridgeResponse { ok: true, payload });
+            }
             thread::sleep(self.delay);
             Ok(BridgeResponse {
                 ok: true,
@@ -2671,10 +2822,61 @@ mod tests {
 
     struct FailingModelBridgeClient;
 
+    struct ContinueClassifierExpectingNoRecoverableChain;
+
     struct SessionSwitchingToolModelBridgeClient {
         session_store: Arc<SessionStore>,
         switch_to: SessionId,
         invoke_count: AtomicUsize,
+    }
+
+    fn classifier_payload_for_prompt(prompt: &str) -> Option<String> {
+        if !prompt.contains("Session Turn 编排分类器") {
+            return None;
+        }
+        let has_recoverable_chain = prompt
+            .lines()
+            .any(|line| line.trim() == "hasRecoverableChain=true");
+        let user_text = prompt
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("userText="))
+            .unwrap_or("");
+        let route = if has_recoverable_chain && user_text.contains("继续") {
+            "continue"
+        } else if prompt.contains("deepTask=true")
+            || !prompt.contains("skillName=\"\"")
+            || !prompt.contains("imageCount=0")
+            || user_text.contains("复杂任务")
+            || user_text.contains("分析并拆分")
+        {
+            "task"
+        } else {
+            "chat"
+        };
+        let arguments = serde_json::json!({
+            "route": route,
+            "taskTitle": (route == "task").then_some("模型判定任务"),
+            "executionGoal": (route == "task").then_some(user_text.trim_matches('"')),
+            "requiredWorkers": [],
+            "toolIntent": null,
+        });
+        Some(classifier_tool_payload(arguments))
+    }
+
+    fn classifier_tool_payload(arguments: serde_json::Value) -> String {
+        serde_json::json!({
+            "content": null,
+            "finish_reason": "tool_calls",
+            "tool_calls": [{
+                "id": "call-classify-session-turn",
+                "type": "function",
+                "function": {
+                    "name": "classify_session_turn",
+                    "arguments": arguments.to_string(),
+                }
+            }]
+        })
+        .to_string()
     }
 
     impl ModelBridgeClient for FailingModelBridgeClient {
@@ -2698,11 +2900,59 @@ mod tests {
         }
     }
 
+    impl ModelBridgeClient for ContinueClassifierExpectingNoRecoverableChain {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            if request.prompt.contains("Session Turn 编排分类器") {
+                assert!(
+                    request
+                        .prompt
+                        .lines()
+                        .any(|line| line.trim() == "hasRecoverableChain=false"),
+                    "finish 阶段 branch 不能让分类器看到可继续链"
+                );
+                return Ok(BridgeResponse {
+                    ok: true,
+                    payload: classifier_tool_payload(serde_json::json!({
+                        "route": "continue",
+                        "taskTitle": null,
+                        "executionGoal": null,
+                        "requiredWorkers": [],
+                        "toolIntent": null,
+                    })),
+                });
+            }
+            Ok(BridgeResponse {
+                ok: true,
+                payload: "shadow-model::ok".to_string(),
+            })
+        }
+
+        fn invoke_stream(
+            &self,
+            request: ModelInvocationRequest,
+            on_event: &mut dyn FnMut(magi_bridge_client::ModelStreamEvent),
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            let response = self.invoke(request)?;
+            if !response.payload.is_empty() {
+                on_event(magi_bridge_client::ModelStreamEvent::ContentDelta {
+                    delta: response.payload.clone(),
+                });
+            }
+            Ok(response)
+        }
+    }
+
     impl ModelBridgeClient for SessionSwitchingToolModelBridgeClient {
         fn invoke(
             &self,
             request: ModelInvocationRequest,
         ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            if let Some(payload) = classifier_payload_for_prompt(&request.prompt) {
+                return Ok(BridgeResponse { ok: true, payload });
+            }
             if request.prompt.contains("请将以下任务分解") {
                 return Ok(BridgeResponse {
                     ok: true,
@@ -3976,12 +4226,12 @@ mod tests {
 
         let (submit_status, submit_body) = post_json(
             app.clone(),
-            "/session/action",
+            "/api/session/turn",
             json!({
-                "session_id": "session-route-shadow",
+                "sessionId": "session-route-shadow",
                 "text": "interrupt target task",
-                "deep_task": false,
-                "skill_name": "code",
+                "deepTask": false,
+                "skillName": "code",
                 "images": [],
             }),
         )
@@ -3992,7 +4242,7 @@ mod tests {
             "unexpected response body: {submit_body:?}"
         );
 
-        let action_task_id = submit_body["action_task_id"]
+        let action_task_id = submit_body["actionTaskId"]
             .as_str()
             .expect("action_task_id should serialize as string");
         let task_store = state.task_store().expect("task store should be configured");
@@ -4047,12 +4297,12 @@ mod tests {
         let submit_handle = tokio::spawn(async move {
             post_json(
                 submit_app,
-                "/session/action",
+                "/api/session/turn",
                 json!({
-                    "session_id": "session-route-shadow",
+                    "sessionId": "session-route-shadow",
                     "text": "interrupt delayed completion",
-                    "deep_task": false,
-                    "skill_name": "code",
+                    "deepTask": false,
+                    "skillName": "code",
                     "images": [],
                 }),
             )
@@ -4153,6 +4403,7 @@ mod tests {
                 mission_title: "deep interrupt delayed completion".to_string(),
                 task_title: "执行: deep interrupt delayed completion".to_string(),
                 trimmed_text: Some("deep interrupt delayed completion".to_string()),
+                execution_goal: None,
                 deep_task: true,
                 skill_name: None,
                 target_role: None,
@@ -4231,75 +4482,119 @@ mod tests {
         state.with_task_store(task_store)
     }
 
+    fn insert_test_task(
+        state: &ApiState,
+        task_id: &str,
+        mission_id: &str,
+        root_task_id: &str,
+        parent_task_id: Option<&str>,
+        kind: TaskKind,
+        status: TaskStatus,
+        decision_payload: Option<DecisionTaskPayload>,
+    ) {
+        let now = UtcMillis::now();
+        state
+            .task_store()
+            .expect("task store should be configured")
+            .insert_task(Task {
+                task_id: TaskId::new(task_id),
+                mission_id: MissionId::new(mission_id),
+                root_task_id: TaskId::new(root_task_id),
+                parent_task_id: parent_task_id.map(TaskId::new),
+                kind,
+                title: format!("Task {task_id}"),
+                goal: format!("Goal for {task_id}"),
+                status,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                context_refs: Vec::new(),
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                repair_count: 0,
+                decision_payload,
+                created_at: now,
+                updated_at: now,
+            });
+    }
+
     #[tokio::test]
-    async fn task_graph_create_and_get_task() {
+    async fn task_graph_get_task_reads_existing_session_task() {
         let state = test_state_with_task_store();
-        let app = build_router(state.clone());
-
-        let (status, body) = post_json(
-            app.clone(),
-            "/api/tasks/create",
-            json!({
-                "task_id": "task-1",
-                "mission_id": "mission-1",
-                "root_task_id": "task-1",
-                "kind": "Objective",
-                "title": "Root objective",
-                "goal": "Complete the objective",
-                "status": "Draft",
-            }),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "unexpected create response: {body:?}"
+        insert_test_task(
+            &state,
+            "task-1",
+            "mission-1",
+            "task-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Draft,
+            None,
         );
-        assert_eq!(body["task_id"], "task-1");
-        assert_eq!(body["title"], "Root objective");
-        assert_eq!(body["kind"], "Objective");
-        assert_eq!(body["status"], "Draft");
-
         bind_test_session_mission(&state, "session-task-graph", "mission-1", "task-1");
+        let app = build_router(state);
 
         let retrieved = get_json(app, "/api/tasks/task-1?sessionId=session-task-graph").await;
         assert_eq!(retrieved["task_id"], "task-1");
-        assert_eq!(retrieved["title"], "Root objective");
+        assert_eq!(retrieved["title"], "Task task-1");
         assert_eq!(retrieved["mission_id"], "mission-1");
     }
 
     #[tokio::test]
-    async fn task_graph_create_graph_and_get_projection() {
+    async fn task_graph_get_projection_reads_existing_task_tree() {
         let state = test_state_with_task_store();
-        let app = build_router(state.clone());
 
-        // Create a small task tree: Objective -> Phase -> 2 Actions
         for (task_id, parent, kind, status) in [
-            ("obj-1", None, "Objective", "Running"),
-            ("phase-1", Some("obj-1"), "Phase", "Running"),
-            ("act-1", Some("phase-1"), "Action", "Completed"),
-            ("act-2", Some("phase-1"), "Action", "Running"),
+            ("obj-1", None, TaskKind::Objective, TaskStatus::Running),
+            (
+                "phase-1",
+                Some("obj-1"),
+                TaskKind::Phase,
+                TaskStatus::Running,
+            ),
+            (
+                "act-1",
+                Some("phase-1"),
+                TaskKind::Action,
+                TaskStatus::Completed,
+            ),
+            (
+                "act-2",
+                Some("phase-1"),
+                TaskKind::Action,
+                TaskStatus::Running,
+            ),
         ] {
-            let mut payload = json!({
-                "task_id": task_id,
-                "mission_id": "mission-proj",
-                "root_task_id": "obj-1",
-                "kind": kind,
-                "title": format!("Task {}", task_id),
-                "goal": format!("Goal for {}", task_id),
-                "status": status,
-            });
-            if let Some(p) = parent {
-                payload["parent_task_id"] = json!(p);
-            }
-            let (status_code, _body) = post_json(app.clone(), "/api/tasks/create", payload).await;
-            assert_eq!(status_code, StatusCode::OK);
+            insert_test_task(
+                &state,
+                task_id,
+                "mission-proj",
+                "obj-1",
+                parent,
+                kind,
+                status,
+                None,
+            );
         }
 
         bind_test_session_mission(&state, "session-task-graph", "mission-proj", "obj-1");
+        let app = build_router(state);
 
         let projection = get_json(app, "/api/tasks/graph/obj-1?sessionId=session-task-graph").await;
         assert_eq!(projection["root_task"]["task_id"], "obj-1");
+        let task_ids: Vec<&str> = projection["tasks"]
+            .as_array()
+            .expect("projection tasks must be an array")
+            .iter()
+            .map(|task| task["task_id"].as_str().expect("task_id must be a string"))
+            .collect();
+        assert_eq!(task_ids, vec!["obj-1", "phase-1", "act-1", "act-2"]);
         assert_eq!(projection["current_phase"], "Task phase-1");
         assert_eq!(projection["progress_summary"]["total_tasks"], 4);
         assert_eq!(projection["progress_summary"]["completed_tasks"], 1);
@@ -4308,73 +4603,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_graph_update_status() {
+    async fn task_graph_resolves_decision_through_product_action() {
         let state = test_state_with_task_store();
-        let app = build_router(state.clone());
-
-        let (status, _body) = post_json(
-            app.clone(),
-            "/api/tasks/create",
-            json!({
-                "task_id": "task-status-1",
-                "mission_id": "mission-status",
-                "root_task_id": "task-status-1",
-                "kind": "Action",
-                "title": "Status test task",
-                "goal": "Test status transitions",
+        insert_test_task(
+            &state,
+            "task-decision-root",
+            "mission-status",
+            "task-decision-root",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Blocked,
+            None,
+        );
+        insert_test_task(
+            &state,
+            "task-decision-1",
+            "mission-status",
+            "task-decision-root",
+            Some("task-decision-root"),
+            TaskKind::Decision,
+            TaskStatus::AwaitingApproval,
+            Some(DecisionTaskPayload {
+                decision_context: "任务失败后需要选择处理方式".to_string(),
+                blocked_reason: "等待用户选择失败任务处理方式".to_string(),
+                options: vec![
+                    DecisionOption {
+                        option_id: "retry".to_string(),
+                        label: "重试".to_string(),
+                        description: "重新执行失败任务".to_string(),
+                    },
+                    DecisionOption {
+                        option_id: "abort".to_string(),
+                        label: "中止".to_string(),
+                        description: "中止当前任务链".to_string(),
+                    },
+                ],
+                risk_notes: Vec::new(),
+                recommended_option: Some("retry".to_string()),
+                required_user_input: true,
+                decision_evidence: None,
             }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-
+        );
         bind_test_session_mission(
             &state,
             "session-task-status",
             "mission-status",
-            "task-status-1",
+            "task-decision-root",
         );
 
-        // Update Draft -> Ready
+        let app = build_router(state.clone());
         let (status, body) = post_json(
-            app.clone(),
-            "/api/tasks/task-status-1/status",
-            json!({ "status": "Ready" }),
+            app,
+            "/api/tasks/task-decision-1/decision?sessionId=session-task-status",
+            json!({ "chosenOption": "retry" }),
         )
         .await;
         assert_eq!(
             status,
             StatusCode::OK,
-            "unexpected status update response: {body:?}"
+            "unexpected decision response: {body:?}"
         );
-        assert_eq!(body["status"], "Ready");
+        assert_eq!(body["resolved"], true);
+        assert_eq!(body["chosenOption"], "retry");
 
-        // Update Ready -> Running
-        let (status, body) = post_json(
-            app.clone(),
-            "/api/tasks/task-status-1/status",
-            json!({ "status": "Running" }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["status"], "Running");
-
-        // Update Running -> Completed
-        let (status, body) = post_json(
-            app.clone(),
-            "/api/tasks/task-status-1/status",
-            json!({ "status": "Completed" }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["status"], "Completed");
-
-        // Verify via GET
-        let task = get_json(
-            app,
-            "/api/tasks/task-status-1?sessionId=session-task-status",
-        )
-        .await;
-        assert_eq!(task["status"], "Completed");
+        let store = state.task_store().expect("task store should be configured");
+        let decision = store
+            .get_task(&TaskId::new("task-decision-1"))
+            .expect("decision task should remain queryable");
+        assert_eq!(decision.status, TaskStatus::Completed);
+        assert_eq!(decision.output_refs, vec!["decision_chosen:retry"]);
+        let root = store
+            .get_task(&TaskId::new("task-decision-root"))
+            .expect("root task should remain queryable");
+        assert_eq!(root.status, TaskStatus::Running);
     }
 
     #[tokio::test]

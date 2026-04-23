@@ -862,6 +862,7 @@ dependencies = [
  "magi-tool-runtime",
  "magi-worker-runtime",
  "magi-workspace",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

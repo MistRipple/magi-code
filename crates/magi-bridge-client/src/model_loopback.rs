@@ -17,7 +17,7 @@ const OPENAI_BASE_URL_ENV: &str = "MAGI_OPENAI_COMPAT_BASE_URL";
 const OPENAI_API_KEY_ENV: &str = "MAGI_OPENAI_COMPAT_API_KEY";
 const OPENAI_MODEL_ENV: &str = "MAGI_OPENAI_COMPAT_MODEL";
 const OPENAI_HTTP_EXECUTABLE: &str = "curl";
-const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 const OPENAI_PROVIDER_UNAVAILABLE_CODE: i64 = -32003;
 const OPENAI_PROVIDER_MISCONFIGURED_CODE: i64 = -32004;
 const OPENAI_PROVIDER_TRANSPORT_CODE: i64 = -32005;
@@ -815,6 +815,12 @@ fn build_openai_chat_completions_url(base_url: &str) -> Result<String, String> {
     if normalized.ends_with(OPENAI_CHAT_COMPLETIONS_PATH) {
         return Ok(normalized.to_string());
     }
+    if normalized.ends_with("/chat/completions") {
+        return Ok(normalized.to_string());
+    }
+    if normalized.ends_with("/v1") {
+        return Ok(format!("{normalized}/chat/completions"));
+    }
 
     Ok(format!("{normalized}{OPENAI_CHAT_COMPLETIONS_PATH}"))
 }
@@ -1205,6 +1211,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect("openai alias should resolve through HTTP smoke path");
 
@@ -1252,6 +1259,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect_err("provider should stay unavailable without config");
 
@@ -1280,6 +1288,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect_err("upstream rejection should remain remote business error");
 
@@ -1304,6 +1313,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect_err("transport failures should stay remote business errors");
 
@@ -1357,6 +1367,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect("structured success payload should decode");
 
@@ -1419,6 +1430,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect("tool-call-only success payload should remain valid");
 
@@ -1459,6 +1471,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect("refusal-only success payload should remain bridgeable");
 
@@ -1498,6 +1511,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect("empty content should fall back to refusal text");
 
@@ -1547,6 +1561,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect("structured tool arguments should decode");
 
@@ -1597,6 +1612,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect("later bridgeable choice should still succeed");
 
@@ -1627,6 +1643,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect_err("all-unbridgeable choices should be rejected");
 
@@ -1655,6 +1672,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect_err("invalid success payload should be rejected");
 

@@ -14,7 +14,7 @@ use magi_session_store::{
 };
 
 #[cfg(test)]
-use crate::dto::SessionActionRequestDto;
+use crate::dto::SessionTurnRequestDto;
 use crate::{
     errors::ApiError,
     state::ApiState,
@@ -45,6 +45,7 @@ pub(crate) fn run_shadow_dispatch_submission(
     let session_id = &request.session_id;
     let entry_id = request.entry_id.as_str();
     let trimmed_text = request.trimmed_text.as_deref();
+    let execution_goal = request.execution_goal.as_deref().or(trimmed_text);
 
     let mission_id = MissionId::new(format!("mission-session-action-{}", accepted_at.0));
     let worker_id = WorkerId::new(format!("worker-session-action-{}", accepted_at.0));
@@ -60,14 +61,14 @@ pub(crate) fn run_shadow_dispatch_submission(
         None,
         TaskKind::Objective,
         request.mission_title.clone(),
-        trimmed_text.unwrap_or("").to_string(),
+        execution_goal.unwrap_or("").to_string(),
         TaskStatus::Running,
         now,
         Some("architect"),
     );
     task_store.insert_task(objective);
 
-    let action_goal = trimmed_text.unwrap_or("").to_string();
+    let action_goal = execution_goal.unwrap_or("").to_string();
     let action = make_shadow_task(
         act_task_id.clone(),
         mission_id.clone(),
@@ -90,7 +91,7 @@ pub(crate) fn run_shadow_dispatch_submission(
     let mut total_task_count = 2usize;
     let mut sub_task_ids: Vec<TaskId> = Vec::new();
     if request.deep_task {
-        if let Some(sub_actions) = decompose_mission(state, trimmed_text, &now) {
+        if let Some(sub_actions) = decompose_mission(state, execution_goal, &now) {
             for (i, sub_title) in sub_actions.iter().enumerate() {
                 let sub_task_id = TaskId::new(format!("task-sub-{}-{}", accepted_at.0, i));
                 let sub_action = make_shadow_task(
@@ -257,27 +258,50 @@ pub(crate) fn run_shadow_dispatch_submission(
         accepted_at,
         status: "accepted".to_string(),
         user_message: trimmed_text.map(str::to_string),
-        items: vec![ActiveExecutionTurnItem {
-            item_id: format!("turn-item-phase-{}", accepted_at.0),
-            item_seq: 1,
-            lane_id: None,
-            lane_seq: None,
-            kind: "assistant_phase".to_string(),
-            status: "pending".to_string(),
-            source: "orchestrator".to_string(),
-            title: Some("任务理解".to_string()),
-            content: Some("已接收请求，正在整理执行步骤。".to_string()),
-            task_id: Some(act_task_id.clone()),
-            worker_id: Some(worker_id.clone()),
-            role_id: role_for_task(&act_task_id),
-            tool_call_id: None,
-            tool_name: None,
-            tool_status: None,
-            tool_result: None,
-            tool_error: None,
-            thread_visible: true,
-            worker_visible: false,
-        }],
+        items: vec![
+            ActiveExecutionTurnItem {
+                item_id: format!("turn-item-user-{}", accepted_at.0),
+                item_seq: 1,
+                lane_id: None,
+                lane_seq: None,
+                kind: "user_message".to_string(),
+                status: "completed".to_string(),
+                source: "user".to_string(),
+                title: None,
+                content: trimmed_text.map(str::to_string),
+                task_id: Some(act_task_id.clone()),
+                worker_id: None,
+                role_id: None,
+                tool_call_id: None,
+                tool_name: None,
+                tool_status: None,
+                tool_result: None,
+                tool_error: None,
+                thread_visible: false,
+                worker_visible: false,
+            },
+            ActiveExecutionTurnItem {
+                item_id: format!("turn-item-phase-{}", accepted_at.0),
+                item_seq: 2,
+                lane_id: None,
+                lane_seq: None,
+                kind: "assistant_phase".to_string(),
+                status: "pending".to_string(),
+                source: "orchestrator".to_string(),
+                title: Some("任务理解".to_string()),
+                content: Some("已接收请求，正在整理执行步骤。".to_string()),
+                task_id: Some(act_task_id.clone()),
+                worker_id: Some(worker_id.clone()),
+                role_id: role_for_task(&act_task_id),
+                tool_call_id: None,
+                tool_name: None,
+                tool_status: None,
+                tool_result: None,
+                tool_error: None,
+                thread_visible: true,
+                worker_visible: false,
+            },
+        ],
         worker_lanes: sub_task_ids
             .iter()
             .enumerate()
@@ -306,7 +330,7 @@ pub(crate) fn run_shadow_dispatch_submission(
             .unwrap_or_else(|| sub_task_id.to_string());
         current_turn.items.push(ActiveExecutionTurnItem {
             item_id: format!("turn-item-worker-spawned-{}-{}", accepted_at.0, index),
-            item_seq: index + 2,
+            item_seq: index + 3,
             lane_id: Some(lane_id),
             lane_seq: Some(index + 1),
             kind: "worker_spawned".to_string(),
@@ -362,7 +386,7 @@ pub(crate) fn run_shadow_dispatch_submission(
 #[cfg(test)]
 pub(crate) fn run_shadow_session_action(
     state: &ApiState,
-    request: &SessionActionRequestDto,
+    request: &SessionTurnRequestDto,
     accepted_at: UtcMillis,
     session_id: &SessionId,
     entry_id: &str,
@@ -382,6 +406,7 @@ pub(crate) fn run_shadow_session_action(
             mission_title: mission_title.clone(),
             task_title: format!("执行: {mission_title}"),
             trimmed_text: trimmed_text.map(str::to_string),
+            execution_goal: None,
             deep_task: request.deep_task,
             skill_name: request.skill_name.clone(),
             target_role: None,
@@ -404,6 +429,7 @@ fn decompose_mission(
         ),
         messages: None,
         tools: None,
+        tool_choice: None,
     };
     let response = client.invoke(request).ok()?;
     if !response.ok {
@@ -578,7 +604,7 @@ mod tests {
     use magi_workspace::WorkspaceStore;
     use std::sync::Arc;
 
-    use crate::dto::SessionActionRequestDto;
+    use crate::dto::SessionTurnRequestDto;
 
     /// Build a minimal ApiState with a shadow execution pipeline and task store.
     fn build_test_state() -> (ApiState, Arc<TaskStore>) {
@@ -630,7 +656,7 @@ mod tests {
             .expect("session should be creatable");
 
         let accepted_at = UtcMillis::now();
-        let request = SessionActionRequestDto {
+        let request = SessionTurnRequestDto {
             session_id: None,
             workspace_id: None,
             text: Some("Hello world".to_string()),
@@ -676,6 +702,56 @@ mod tests {
         assert!(child_ids.contains(&act_task_id.as_str()));
     }
 
+    #[test]
+    fn dispatch_execution_goal_does_not_rewrite_turn_user_message() {
+        let (state, task_store) = build_test_state();
+        let session_id = SessionId::new("session-execution-goal-split");
+        state
+            .session_store
+            .create_session(session_id.clone(), "execution goal split")
+            .expect("session should be creatable");
+
+        let accepted_at = UtcMillis::now();
+        let submission = run_shadow_dispatch_submission(
+            &state,
+            &DispatchSubmissionRequest {
+                accepted_at,
+                session_id: session_id.clone(),
+                workspace_id: None,
+                entry_id: "entry-execution-goal-split".to_string(),
+                created_session: false,
+                mission_title: "模型判定任务".to_string(),
+                task_title: "执行: 模型判定任务".to_string(),
+                trimmed_text: Some("用户原始任务描述".to_string()),
+                execution_goal: Some("模型结构化执行目标".to_string()),
+                deep_task: false,
+                skill_name: None,
+                target_role: None,
+            },
+        )
+        .expect("shadow dispatch should create task graph");
+
+        let action = task_store
+            .get_task(&submission.action_task_id)
+            .expect("action task should exist");
+        assert_eq!(action.goal, "模型结构化执行目标");
+
+        let turn = submission
+            .active_execution_chain
+            .as_ref()
+            .and_then(|chain| chain.current_turn.as_ref())
+            .expect("current turn should exist");
+        assert_eq!(turn.user_message.as_deref(), Some("用户原始任务描述"));
+        assert!(
+            turn.items
+                .first()
+                .is_some_and(|item| item.kind == "user_message"
+                    && item.content.as_deref() == Some("用户原始任务描述")
+                    && !item.thread_visible),
+            "turn ordered items 必须保留用户原文，但不能进入响应区渲染"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Test 2: Task status reflects dispatch outcome (failure path)
     // -----------------------------------------------------------------------
@@ -691,7 +767,7 @@ mod tests {
             .expect("session should be creatable");
 
         let accepted_at = UtcMillis::now();
-        let request = SessionActionRequestDto {
+        let request = SessionTurnRequestDto {
             session_id: None,
             workspace_id: None,
             text: Some("Run a failing action".to_string()),
@@ -771,7 +847,7 @@ mod tests {
             .expect("session should be creatable");
 
         let accepted_at = UtcMillis::now();
-        let request = SessionActionRequestDto {
+        let request = SessionTurnRequestDto {
             session_id: None,
             workspace_id: None,
             text: Some("test".to_string()),

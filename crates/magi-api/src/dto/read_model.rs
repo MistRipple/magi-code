@@ -98,77 +98,10 @@ fn merge_session_sidecars(
                 .iter()
                 .map(|branch| session_branch_summary(branch, task_store))
                 .collect();
-            if let Some(turn) = chain.current_turn.as_ref() {
-                entry.current_turn = Some(SessionRuntimeTurnSummaryEntry {
-                    turn_id: turn.turn_id.clone(),
-                    turn_seq: turn.turn_seq,
-                    accepted_at: Some(turn.accepted_at),
-                    status: turn.status.clone(),
-                    user_message: turn.user_message.clone(),
-                    mission_id: Some(chain.mission_id.to_string()),
-                    root_task_id: Some(chain.root_task_id.to_string()),
-                    execution_chain_ref: Some(chain.execution_chain_ref.clone()),
-                });
-                entry.turn_items = turn
-                    .items
-                    .iter()
-                    .map(|item| {
-                        let role_id = item.role_id.clone().or_else(|| {
-                            item.task_id
-                                .as_ref()
-                                .and_then(|task_id| task_role_id(task_store, task_id))
-                        });
-                        SessionRuntimeTurnItemSummaryEntry {
-                            item_id: item.item_id.clone(),
-                            item_seq: item.item_seq,
-                            lane_id: item.lane_id.clone(),
-                            lane_seq: item.lane_seq,
-                            kind: item.kind.clone(),
-                            status: item.status.clone(),
-                            source: item.source.clone(),
-                            title: item.title.clone(),
-                            content: item.content.clone(),
-                            task_id: item.task_id.as_ref().map(ToString::to_string),
-                            worker_id: item.worker_id.as_ref().map(ToString::to_string),
-                            role_id,
-                            tool_call_id: item.tool_call_id.clone(),
-                            tool_name: item.tool_name.clone(),
-                            tool_status: item.tool_status.clone(),
-                            tool_result: item.tool_result.clone(),
-                            tool_error: item.tool_error.clone(),
-                            thread_visible: item.thread_visible,
-                            worker_visible: item.worker_visible,
-                        }
-                    })
-                    .collect();
-                entry.worker_lanes = turn
-                    .worker_lanes
-                    .iter()
-                    .map(|lane| {
-                        let role_id = lane
-                            .role_id
-                            .clone()
-                            .or_else(|| task_role_id(task_store, &lane.task_id));
-                        SessionRuntimeTurnLaneSummaryEntry {
-                            lane_id: lane.lane_id.clone(),
-                            lane_seq: lane.lane_seq,
-                            task_id: lane.task_id.to_string(),
-                            worker_id: lane.worker_id.to_string(),
-                            role_id,
-                            title: lane.title.clone(),
-                            status: task_store
-                                .and_then(|store| store.get_task(&lane.task_id))
-                                .map(|task| task_status_label(&task.status))
-                                .unwrap_or_else(|| "unknown".to_string()),
-                            is_primary: lane.is_primary,
-                        }
-                    })
-                    .collect();
-            }
             entry.recoverable_branch_count = entry
                 .active_branches
                 .iter()
-                .filter(|branch| branch_status_is_recoverable(branch.status.as_str()))
+                .filter(|branch| branch_is_recoverable(branch))
                 .count();
             entry.has_recoverable_chain = entry.recoverable_branch_count > 0;
             push_unique(
@@ -199,6 +132,73 @@ fn merge_session_sidecars(
         }
         if session_root_task_is_terminal(entry.root_task_status.as_deref()) {
             clear_session_runtime_live_ids(entry);
+        }
+        if let Some(turn) = export.current_turn.as_ref() {
+            entry.current_turn = Some(SessionRuntimeTurnSummaryEntry {
+                turn_id: turn.turn_id.clone(),
+                turn_seq: turn.turn_seq,
+                accepted_at: Some(turn.accepted_at),
+                status: turn.status.clone(),
+                user_message: turn.user_message.clone(),
+                mission_id: entry.mission_id.clone(),
+                root_task_id: entry.root_task_id.clone(),
+                execution_chain_ref: entry.execution_chain_ref.clone(),
+            });
+            entry.turn_items = turn
+                .items
+                .iter()
+                .map(|item| {
+                    let role_id = item.role_id.clone().or_else(|| {
+                        item.task_id
+                            .as_ref()
+                            .and_then(|task_id| task_role_id(task_store, task_id))
+                    });
+                    SessionRuntimeTurnItemSummaryEntry {
+                        item_id: item.item_id.clone(),
+                        item_seq: item.item_seq,
+                        lane_id: item.lane_id.clone(),
+                        lane_seq: item.lane_seq,
+                        kind: item.kind.clone(),
+                        status: item.status.clone(),
+                        source: item.source.clone(),
+                        title: item.title.clone(),
+                        content: item.content.clone(),
+                        task_id: item.task_id.as_ref().map(ToString::to_string),
+                        worker_id: item.worker_id.as_ref().map(ToString::to_string),
+                        role_id,
+                        tool_call_id: item.tool_call_id.clone(),
+                        tool_name: item.tool_name.clone(),
+                        tool_status: item.tool_status.clone(),
+                        tool_result: item.tool_result.clone(),
+                        tool_error: item.tool_error.clone(),
+                        thread_visible: item.thread_visible,
+                        worker_visible: item.worker_visible,
+                    }
+                })
+                .collect();
+            entry.worker_lanes = turn
+                .worker_lanes
+                .iter()
+                .map(|lane| {
+                    let role_id = lane
+                        .role_id
+                        .clone()
+                        .or_else(|| task_role_id(task_store, &lane.task_id));
+                    SessionRuntimeTurnLaneSummaryEntry {
+                        lane_id: lane.lane_id.clone(),
+                        lane_seq: lane.lane_seq,
+                        task_id: lane.task_id.to_string(),
+                        worker_id: lane.worker_id.to_string(),
+                        role_id,
+                        title: lane.title.clone(),
+                        status: task_store
+                            .and_then(|store| store.get_task(&lane.task_id))
+                            .map(|task| task_status_label(&task.status))
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        is_primary: lane.is_primary,
+                    }
+                })
+                .collect();
         }
     }
 
@@ -280,8 +280,15 @@ fn task_status_label(status: &TaskStatus) -> String {
     .to_string()
 }
 
-fn branch_status_is_recoverable(status: &str) -> bool {
-    matches!(status, "blocked")
+fn branch_stage_is_terminal(stage: &str) -> bool {
+    matches!(
+        stage.trim().to_ascii_lowercase().as_str(),
+        "finish" | "finished"
+    )
+}
+
+fn branch_is_recoverable(branch: &SessionRuntimeBranchSummaryEntry) -> bool {
+    matches!(branch.status.as_str(), "blocked") && !branch_stage_is_terminal(&branch.stage)
 }
 
 fn session_root_task_is_terminal(status: Option<&str>) -> bool {
@@ -487,6 +494,7 @@ mod tests {
                 },
                 execution_chain_ref: Some("chain-1".to_string()),
                 recovery_ref: Some("recovery-1".to_string()),
+                current_turn: None,
                 active_execution_chain: None,
             }],
             &[WorkspaceRecoverySidecarExport {
@@ -574,6 +582,7 @@ mod tests {
             ("task-branch-ready", TaskStatus::Ready),
             ("task-branch-running", TaskStatus::Running),
             ("task-branch-completed", TaskStatus::Completed),
+            ("task-branch-finished-blocked", TaskStatus::Blocked),
         ] {
             task_store.insert_task(magi_core::Task {
                 task_id: magi_core::TaskId::new(task_id),
@@ -618,6 +627,7 @@ mod tests {
                 },
                 execution_chain_ref: Some("chain-recoverable-1".to_string()),
                 recovery_ref: None,
+                current_turn: None,
                 active_execution_chain: Some(magi_session_store::ActiveExecutionChain {
                     session_id: SessionId::new("session-recoverable-1"),
                     mission_id,
@@ -629,6 +639,7 @@ mod tests {
                         magi_core::TaskId::new("task-branch-ready"),
                         magi_core::TaskId::new("task-branch-running"),
                         magi_core::TaskId::new("task-branch-completed"),
+                        magi_core::TaskId::new("task-branch-finished-blocked"),
                     ],
                     active_worker_bindings: vec![magi_core::WorkerId::new("worker-recoverable-1")],
                     recovery_ref: None,
@@ -697,6 +708,22 @@ mod tests {
                             skill_name: None,
                             is_primary: false,
                         },
+                        magi_session_store::ActiveExecutionBranch {
+                            task_id: magi_core::TaskId::new("task-branch-finished-blocked"),
+                            worker_id: magi_core::WorkerId::new("worker-recoverable-1"),
+                            stage: "finish".to_string(),
+                            lease_id: None,
+                            execution_intent_ref: None,
+                            binding_lifecycle: None,
+                            checkpoint_stage: None,
+                            next_step_index: None,
+                            checkpoint_at: None,
+                            resume_mode: None,
+                            resume_token: None,
+                            use_tools: true,
+                            skill_name: None,
+                            is_primary: false,
+                        },
                     ],
                     dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
                         accepted_at: UtcMillis::now(),
@@ -716,7 +743,7 @@ mod tests {
         let session = &runtime_read_model.details.sessions[0];
         assert!(session.has_recoverable_chain);
         assert_eq!(session.recoverable_branch_count, 1);
-        assert_eq!(session.active_branches.len(), 4);
+        assert_eq!(session.active_branches.len(), 5);
     }
 
     #[test]
@@ -942,6 +969,7 @@ mod tests {
                 },
                 execution_chain_ref: Some("chain-bound".to_string()),
                 recovery_ref: None,
+                current_turn: None,
                 active_execution_chain: None,
             }],
             &[],
@@ -1052,6 +1080,7 @@ mod tests {
                 },
                 execution_chain_ref: Some("chain-current".to_string()),
                 recovery_ref: None,
+                current_turn: None,
                 active_execution_chain: Some(magi_session_store::ActiveExecutionChain {
                     session_id: SessionId::new("session-stale"),
                     mission_id: mission_id.clone(),
@@ -1198,6 +1227,43 @@ mod tests {
                 },
                 execution_chain_ref: Some("chain-turn-completed".to_string()),
                 recovery_ref: None,
+                current_turn: Some(magi_session_store::ActiveExecutionTurn {
+                    turn_id: "turn-session-action-completed".to_string(),
+                    turn_seq: accepted_at.0,
+                    accepted_at,
+                    status: "completed".to_string(),
+                    user_message: Some("请继续整理结果".to_string()),
+                    items: vec![magi_session_store::ActiveExecutionTurnItem {
+                        item_id: "turn-item-final".to_string(),
+                        item_seq: 1,
+                        lane_id: None,
+                        lane_seq: None,
+                        kind: "assistant_final".to_string(),
+                        status: "completed".to_string(),
+                        source: "orchestrator".to_string(),
+                        title: Some("总结".to_string()),
+                        content: Some("这是 turn 主线最终总结".to_string()),
+                        task_id: Some(branch_task_id.clone()),
+                        worker_id: Some(worker_id.clone()),
+                        role_id: None,
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_status: None,
+                        tool_result: None,
+                        tool_error: None,
+                        thread_visible: true,
+                        worker_visible: false,
+                    }],
+                    worker_lanes: vec![magi_session_store::ActiveExecutionTurnLane {
+                        lane_id: "lane-branch".to_string(),
+                        lane_seq: 1,
+                        task_id: branch_task_id.clone(),
+                        worker_id: worker_id.clone(),
+                        role_id: None,
+                        title: "完成分支".to_string(),
+                        is_primary: false,
+                    }],
+                }),
                 active_execution_chain: Some(magi_session_store::ActiveExecutionChain {
                     session_id: SessionId::new("session-turn-completed"),
                     mission_id: mission_id.clone(),

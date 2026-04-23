@@ -95,6 +95,7 @@ impl BaseAdapter {
                     })
                     .collect()
             }),
+            tool_choice: None,
         };
 
         let bridge_response = self.model_client.invoke(request)?;

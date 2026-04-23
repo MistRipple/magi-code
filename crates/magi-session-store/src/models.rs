@@ -217,6 +217,8 @@ pub struct SessionRuntimeSidecar {
     #[serde(default, alias = "recovery_ref")]
     pub recovery_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_turn: Option<ActiveExecutionTurn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_execution_chain: Option<ActiveExecutionChain>,
     #[serde(default)]
     pub status: SessionExecutionSidecarStatus,
@@ -235,6 +237,8 @@ pub struct SessionRuntimeSidecarExport {
     #[serde(default, alias = "recovery_id")]
     pub recovery_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_turn: Option<ActiveExecutionTurn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_execution_chain: Option<ActiveExecutionChain>,
 }
 
@@ -247,6 +251,7 @@ impl SessionRuntimeSidecar {
             ownership: self.ownership.clone(),
             execution_chain_ref: self.ownership.execution_chain_ref.clone(),
             recovery_ref: self.recovery_id.clone(),
+            current_turn: self.current_turn.clone(),
             active_execution_chain: self.active_execution_chain.clone(),
         }
     }
@@ -259,6 +264,7 @@ pub enum SessionSidecarFlushReason {
     ApplyRecoveryResumeInput,
     ApplyResumeExecutionTarget,
     UpsertActiveExecutionChain,
+    UpsertCurrentTurn,
     UpdateActiveExecutionBranchSnapshot,
     AppendCurrentTurnItem,
     UpdateCurrentTurnStatus,

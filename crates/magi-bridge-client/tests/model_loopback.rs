@@ -136,6 +136,7 @@ fn model_client_round_trips_through_loopback_server() {
             prompt: "hello".to_string(),
             messages: None,
             tools: None,
+            tool_choice: None,
         })
         .expect("loopback model invoke should succeed");
 
@@ -167,6 +168,7 @@ fn openai_compatible_provider_executes_real_http_smoke_path() {
             prompt: "say hi".to_string(),
             messages: None,
             tools: None,
+            tool_choice: None,
         })
         .expect("openai-compatible HTTP smoke invoke should succeed");
 
@@ -228,6 +230,7 @@ fn openai_compatible_provider_surfaces_structured_success_payload() {
             prompt: "say hi".to_string(),
             messages: None,
             tools: None,
+            tool_choice: None,
         })
         .expect("structured openai-compatible payload should succeed");
 
@@ -281,6 +284,7 @@ fn openai_compatible_provider_accepts_tool_call_only_success_payload() {
             prompt: "say hi".to_string(),
             messages: None,
             tools: None,
+            tool_choice: None,
         })
         .expect("tool-call-only openai-compatible payload should succeed");
 
@@ -331,6 +335,7 @@ fn openai_compatible_provider_surfaces_refusal_only_payload() {
             prompt: "say hi".to_string(),
             messages: None,
             tools: None,
+            tool_choice: None,
         })
         .expect("refusal-only openai-compatible payload should succeed");
 
@@ -382,6 +387,7 @@ fn openai_compatible_provider_prefers_refusal_when_content_parts_are_empty() {
             prompt: "say hi".to_string(),
             messages: None,
             tools: None,
+            tool_choice: None,
         })
         .expect("empty content parts should fall back to refusal");
 
@@ -433,6 +439,7 @@ fn openai_compatible_provider_tolerates_structured_tool_call_arguments() {
             prompt: "say hi".to_string(),
             messages: None,
             tools: None,
+            tool_choice: None,
         })
         .expect("structured tool arguments should survive round-trip");
 
@@ -491,6 +498,7 @@ fn openai_compatible_provider_flattens_content_parts_without_structured_metadata
             prompt: "say hi".to_string(),
             messages: None,
             tools: None,
+            tool_choice: None,
         })
         .expect("content parts without usage/finish_reason should still succeed");
 

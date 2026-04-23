@@ -113,6 +113,7 @@ impl ConversationCompactor {
             prompt,
             messages: None,
             tools: None,
+            tool_choice: None,
         };
 
         let response = client.invoke(request).ok()?;

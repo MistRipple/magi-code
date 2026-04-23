@@ -10,6 +10,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+reqwest.workspace = true
 tower-http = { version = "0.6.6", features = ["fs"] }
 magi-api = { path = "../magi-api" }
 magi-bridge-client = { path = "../magi-bridge-client" }

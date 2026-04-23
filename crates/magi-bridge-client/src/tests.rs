@@ -213,6 +213,7 @@ fn json_rpc_clients_share_the_same_transport_abstraction() {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect("model call should succeed")
             .payload,

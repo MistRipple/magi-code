@@ -1,7 +1,8 @@
 use super::SessionStore;
 use crate::models::{
-    ActiveExecutionChain, ActiveExecutionTurnItem, SessionExecutionSidecarStatus,
-    SessionExecutionSidecarStoreState, SessionRuntimeSidecar, SessionSidecarFlushReason,
+    ActiveExecutionChain, ActiveExecutionTurn, ActiveExecutionTurnItem,
+    SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionRuntimeSidecar,
+    SessionSidecarFlushReason,
 };
 use magi_core::{
     DomainError, DomainResult, ExecutionOwnership, LeaseId, RecoveryResumeInput, SessionId,
@@ -104,6 +105,9 @@ impl SessionStore {
         let recovery_id = existing
             .as_ref()
             .and_then(|sidecar| sidecar.recovery_id.clone());
+        let current_turn = existing
+            .as_ref()
+            .and_then(|sidecar| sidecar.current_turn.clone());
         let requested_workspace_id = ownership.workspace_id.clone().or_else(|| {
             existing
                 .as_ref()
@@ -135,6 +139,7 @@ impl SessionStore {
                 session_id,
                 ownership: ownership.clone(),
                 recovery_id: recovery_id.clone(),
+                current_turn,
                 active_execution_chain,
                 status,
                 updated_at: UtcMillis::now(),
@@ -164,6 +169,22 @@ impl SessionStore {
                 .as_ref()
                 .and_then(|sidecar| sidecar.recovery_id.clone())
         });
+        let incoming_execution_chain_ref = active_execution_chain.execution_chain_ref.clone();
+        let existing_current_turn = existing
+            .as_ref()
+            .and_then(|sidecar| sidecar.current_turn.clone());
+        let existing_execution_chain_ref = existing.as_ref().and_then(|sidecar| {
+            sidecar
+                .active_execution_chain
+                .as_ref()
+                .map(|chain| chain.execution_chain_ref.as_str())
+        });
+        let current_turn = active_execution_chain.current_turn.clone().or_else(|| {
+            (existing_execution_chain_ref == Some(incoming_execution_chain_ref.as_str()))
+                .then(|| existing_current_turn.clone())
+                .flatten()
+        });
+        active_execution_chain.current_turn = current_turn.clone();
         let active_execution_chain = Some(active_execution_chain);
         let ownership = active_execution_chain
             .as_ref()
@@ -174,6 +195,7 @@ impl SessionStore {
             session_id,
             ownership,
             recovery_id,
+            current_turn,
             active_execution_chain,
             status,
             updated_at: UtcMillis::now(),
@@ -232,6 +254,9 @@ impl SessionStore {
                 chain.recovery_ref = Some(input.recovery_id.clone());
                 chain
             });
+        let current_turn = existing
+            .as_ref()
+            .and_then(|sidecar| sidecar.current_turn.clone());
         let ownership = if let Some(chain) = active_execution_chain.as_ref() {
             Self::ownership_from_active_execution_chain(chain)
         } else {
@@ -245,6 +270,7 @@ impl SessionStore {
                 session_id: session_id.clone(),
                 ownership: ownership.clone(),
                 recovery_id: Some(input.recovery_id),
+                current_turn,
                 active_execution_chain,
                 status: SessionExecutionSidecarStatus::RecoveryLinked,
                 updated_at: UtcMillis::now(),
@@ -322,6 +348,7 @@ impl SessionStore {
                 execution_chain_ref,
             },
             recovery_id: target.recovery_id.clone(),
+            current_turn: existing.current_turn,
             active_execution_chain,
             status: SessionExecutionSidecarStatus::Resumed,
             updated_at: UtcMillis::now(),
@@ -356,6 +383,7 @@ impl SessionStore {
             session_id: existing.session_id,
             ownership: existing.ownership,
             recovery_id,
+            current_turn: existing.current_turn,
             active_execution_chain,
             status,
             updated_at: UtcMillis::now(),
@@ -416,7 +444,7 @@ impl SessionStore {
                     branch.checkpoint_at = checkpoint_at;
                     branch.resume_mode = resume_mode.clone();
                     branch.resume_token = resume_token.clone();
-                    if let Some(turn) = chain.current_turn.as_mut() {
+                    if let Some(turn) = sidecar.current_turn.as_mut() {
                         if let Some(lane) = turn
                             .worker_lanes
                             .iter_mut()
@@ -454,6 +482,48 @@ impl SessionStore {
         Ok(updated)
     }
 
+    pub fn upsert_current_turn(
+        &self,
+        session_id: SessionId,
+        mut turn: ActiveExecutionTurn,
+    ) -> DomainResult<SessionRuntimeSidecar> {
+        turn.normalize();
+        let existing = self.runtime_sidecar(&session_id);
+        let (ownership, recovery_id, active_execution_chain, status) =
+            if let Some(existing) = existing {
+                (
+                    existing.ownership,
+                    existing.recovery_id,
+                    existing.active_execution_chain,
+                    existing.status,
+                )
+            } else {
+                (
+                    ExecutionOwnership {
+                        session_id: Some(session_id.clone()),
+                        ..ExecutionOwnership::default()
+                    },
+                    None,
+                    None,
+                    SessionExecutionSidecarStatus::Detached,
+                )
+            };
+        let updated = SessionRuntimeSidecar {
+            session_id,
+            ownership,
+            recovery_id,
+            current_turn: Some(turn),
+            active_execution_chain,
+            status,
+            updated_at: UtcMillis::now(),
+        };
+        self.upsert_runtime_sidecar_with_reason(
+            updated.clone(),
+            SessionSidecarFlushReason::UpsertCurrentTurn,
+        );
+        Ok(updated)
+    }
+
     pub fn append_current_turn_item(
         &self,
         session_id: &SessionId,
@@ -474,10 +544,7 @@ impl SessionStore {
                     entity: "session_runtime_sidecar",
                 });
             };
-            let Some(chain) = sidecar.active_execution_chain.as_mut() else {
-                return Ok(None);
-            };
-            let Some(turn) = chain.current_turn.as_mut() else {
+            let Some(turn) = sidecar.current_turn.as_mut() else {
                 return Ok(None);
             };
             let next_item_seq = turn
@@ -492,7 +559,10 @@ impl SessionStore {
             }
             turn.items.push(item);
             turn.normalize();
-            chain.normalize();
+            if let Some(chain) = sidecar.active_execution_chain.as_mut() {
+                chain.current_turn = sidecar.current_turn.clone();
+                chain.normalize();
+            }
             sidecar.updated_at = UtcMillis::now();
             Some(sidecar.clone())
         };
@@ -522,10 +592,7 @@ impl SessionStore {
                     entity: "session_runtime_sidecar",
                 });
             };
-            let Some(chain) = sidecar.active_execution_chain.as_mut() else {
-                return Ok(None);
-            };
-            let Some(turn) = chain.current_turn.as_mut() else {
+            let Some(turn) = sidecar.current_turn.as_mut() else {
                 return Ok(None);
             };
 
@@ -553,7 +620,10 @@ impl SessionStore {
             }
 
             turn.normalize();
-            chain.normalize();
+            if let Some(chain) = sidecar.active_execution_chain.as_mut() {
+                chain.current_turn = sidecar.current_turn.clone();
+                chain.normalize();
+            }
             sidecar.updated_at = UtcMillis::now();
             Some(sidecar.clone())
         };
@@ -583,15 +653,15 @@ impl SessionStore {
                     entity: "session_runtime_sidecar",
                 });
             };
-            let Some(chain) = sidecar.active_execution_chain.as_mut() else {
-                return Ok(None);
-            };
-            let Some(turn) = chain.current_turn.as_mut() else {
+            let Some(turn) = sidecar.current_turn.as_mut() else {
                 return Ok(None);
             };
             turn.status = status.into();
             turn.normalize();
-            chain.normalize();
+            if let Some(chain) = sidecar.active_execution_chain.as_mut() {
+                chain.current_turn = sidecar.current_turn.clone();
+                chain.normalize();
+            }
             sidecar.updated_at = UtcMillis::now();
             Some(sidecar.clone())
         };
@@ -608,6 +678,7 @@ impl SessionStore {
                 entity: "session_runtime_sidecar",
             })?;
         let recovery_id = existing.recovery_id.clone();
+        let current_turn = existing.current_turn.clone();
         let active_execution_chain = existing.active_execution_chain.clone();
         let ownership = active_execution_chain
             .as_ref()
@@ -619,6 +690,7 @@ impl SessionStore {
                 session_id: session_id.clone(),
                 ownership,
                 recovery_id,
+                current_turn,
                 active_execution_chain,
                 status,
                 updated_at: UtcMillis::now(),

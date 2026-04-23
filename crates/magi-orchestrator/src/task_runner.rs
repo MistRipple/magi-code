@@ -93,13 +93,13 @@ pub trait TaskResultReceiver: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// No-op implementations for testing / backward compatibility
+// Inert implementations used by isolated runner tests
 // ---------------------------------------------------------------------------
 
 /// A dispatcher that accepts every dispatch but does nothing.
 ///
-/// This is the default used when no real execution pipeline is wired in,
-/// which keeps existing tests working without changes.
+/// This is the default used by isolated runner tests that only verify graph
+/// scheduling semantics.
 pub struct NoOpDispatcher;
 
 impl TaskDispatcher for NoOpDispatcher {
@@ -115,7 +115,7 @@ impl TaskDispatcher for NoOpDispatcher {
 
 /// A result receiver that never returns any results.
 ///
-/// Paired with `NoOpDispatcher` for backward compatibility.
+/// Paired with `NoOpDispatcher` when tests do not need external results.
 pub struct NoOpResultReceiver;
 
 impl TaskResultReceiver for NoOpResultReceiver {
@@ -472,10 +472,10 @@ pub struct TaskRunner {
 }
 
 impl TaskRunner {
-    /// Create a runner with the default no-op dispatcher and result receiver.
+    /// Create a runner with an inert dispatcher and result receiver.
     ///
-    /// This preserves backward compatibility — existing callers and tests
-    /// continue to work without any changes.
+    /// Production daemon wiring uses `with_dispatcher`; this constructor keeps
+    /// unit tests focused on task-graph scheduling without external runtime IO.
     pub fn new(store: Arc<TaskStore>, workers: Vec<WorkerInfo>) -> Self {
         Self {
             store,
@@ -1207,53 +1207,8 @@ impl TaskRunner {
         chosen_option: &str,
         evidence: Option<serde_json::Value>,
     ) -> Result<(), String> {
-        let decision = self
-            .store
-            .get_task(decision_task_id)
-            .ok_or_else(|| format!("decision task {decision_task_id} not found"))?;
-        if decision.kind != TaskKind::Decision {
-            return Err(format!("{decision_task_id} is not a Decision task"));
-        }
-        if decision.status != TaskStatus::AwaitingApproval {
-            return Err(format!(
-                "decision {decision_task_id} is not AwaitingApproval"
-            ));
-        }
-
-        self.store.set_output_refs(
-            decision_task_id,
-            vec![format!("decision_chosen:{chosen_option}")],
-        );
-        if let Some(ref ev) = evidence {
-            self.store.set_evidence_refs(
-                decision_task_id,
-                vec![serde_json::to_string(ev).unwrap_or_default()],
-            );
-        }
         self.store
-            .update_status(decision_task_id, TaskStatus::Completed)
-            .map_err(|e| format!("failed to complete decision: {e}"))?;
-
-        // Unblock parent.
-        if let Some(ref parent_id) = decision.parent_task_id {
-            let siblings = self.store.get_children(parent_id);
-            let still_blocked = siblings.iter().any(|s| {
-                s.task_id != *decision_task_id
-                    && (s.status == TaskStatus::Blocked || s.status == TaskStatus::AwaitingApproval)
-            });
-            if !still_blocked {
-                let parent = self.store.get_task(parent_id);
-                if let Some(p) = parent {
-                    if p.status == TaskStatus::Blocked {
-                        self.store
-                            .update_status(parent_id, TaskStatus::Running)
-                            .map_err(|e| format!("failed to unblock parent: {e}"))?;
-                    }
-                }
-            }
-        }
-
-        Ok(())
+            .resolve_decision(decision_task_id, chosen_option, evidence)
     }
 
     // ------------------------------------------------------------------
@@ -1539,6 +1494,7 @@ impl LlmGraphReflector {
                 tool_call_id: None,
             }]),
             tools: None,
+            tool_choice: None,
         };
 
         let response = self
@@ -1792,6 +1748,7 @@ impl MissionDecomposer for LlmMissionDecomposer {
                 tool_call_id: None,
             }]),
             tools: None,
+            tool_choice: None,
         };
         let response = self
             .client

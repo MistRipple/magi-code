@@ -10,10 +10,11 @@ use magi_api::{
     ApiState, DirectHttpModelProbeConfig, RunnerManager, RuntimeStatePersistence, SettingsStore,
     build_router,
 };
+#[cfg(not(test))]
+use magi_bridge_client::JsonRpcModelBridgeClient;
 use magi_bridge_client::{
     BridgeDispatchRuntime, BridgeServerKind, BridgeTransport, HttpModelBridgeClient,
-    JsonRpcHostBridgeClient, JsonRpcMcpBridgeClient, JsonRpcModelBridgeClient,
-    JsonRpcStdioTransport, StdioMcpBridgeClient,
+    JsonRpcHostBridgeClient, JsonRpcMcpBridgeClient, JsonRpcStdioTransport, StdioMcpBridgeClient,
 };
 use magi_context_runtime::{ContextBudget, ContextRuntime};
 use magi_core::EventId;
@@ -36,11 +37,47 @@ use tracing::warn;
 struct StaticTestModelBridgeClient;
 
 #[cfg(test)]
+fn classifier_payload_for_prompt(prompt: &str) -> Option<String> {
+    if !prompt.contains("Session Turn 编排分类器") {
+        return None;
+    }
+    let user_text = prompt
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("userText="))
+        .unwrap_or("");
+    let arguments = serde_json::json!({
+        "route": "task",
+        "taskTitle": "模型判定任务",
+        "executionGoal": user_text.trim_matches('"'),
+        "requiredWorkers": [],
+        "toolIntent": null,
+    });
+    Some(
+        serde_json::json!({
+            "content": null,
+            "finish_reason": "tool_calls",
+            "tool_calls": [{
+                "id": "call-classify-session-turn",
+                "type": "function",
+                "function": {
+                    "name": "classify_session_turn",
+                    "arguments": arguments.to_string(),
+                }
+            }]
+        })
+        .to_string(),
+    )
+}
+
+#[cfg(test)]
 impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
     fn invoke(
         &self,
         request: magi_bridge_client::ModelInvocationRequest,
     ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError> {
+        if let Some(payload) = classifier_payload_for_prompt(&request.prompt) {
+            return Ok(magi_bridge_client::BridgeResponse { ok: true, payload });
+        }
         Ok(magi_bridge_client::BridgeResponse {
             ok: true,
             payload: format!("shadow-model::{}", request.prompt.trim()),
@@ -196,18 +233,31 @@ impl ShadowDaemonRuntime {
         let direct_http_probe_config = direct_http_result
             .as_ref()
             .map(|(_, config)| config.clone());
+        let direct_http_model_configured = direct_http_probe_config.is_some();
 
         // Use StdioMcpBridgeClient for direct MCP server connections when
         // MAGI_MCP_SERVER_COMMAND is configured, falling back to the
         // JSON-RPC subprocess loopback.
         let direct_mcp_client = StdioMcpBridgeClient::from_env();
 
-        let model_bridge_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
+        let default_model_bridge_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
             if let Some((http_client, _)) = direct_http_result {
                 Arc::new(http_client)
             } else {
-                Arc::new(JsonRpcModelBridgeClient::new(model_transport.clone()))
+                #[cfg(test)]
+                {
+                    Arc::new(StaticTestModelBridgeClient)
+                }
+                #[cfg(not(test))]
+                {
+                    Arc::new(JsonRpcModelBridgeClient::new(model_transport.clone()))
+                }
             };
+        let model_bridge_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
+            model_bridge_override
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| default_model_bridge_client.clone());
         let dispatcher_model_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
             model_bridge_override.unwrap_or_else(|| model_bridge_client.clone());
         let bridge_runtime = BridgeDispatchRuntime::new()
@@ -349,14 +399,20 @@ impl ShadowDaemonRuntime {
         let runner_manager = RunnerManager::with_dispatcher_and_worker_catalog(
             Arc::clone(&task_store),
             Arc::new(move || state_for_task_workers.task_worker_catalog()),
-            shadow_task_dispatcher,
+            shadow_task_dispatcher.clone(),
             runner_result_receiver,
         )
         .with_checkpoint_path(task_store_checkpoint_path);
         state = state
+            .with_session_turn_dispatcher(shadow_task_dispatcher)
             .with_task_store(task_store)
-            .with_runner_manager(runner_manager)
-            .with_model_bridge_client(model_bridge_client.clone());
+            .with_runner_manager(runner_manager);
+
+        state = if direct_http_model_configured || cfg!(test) {
+            state.with_real_model_bridge_client(model_bridge_client.clone())
+        } else {
+            state.with_model_bridge_client(model_bridge_client.clone())
+        };
 
         if let Some(probe_config) = direct_http_probe_config {
             state = state.with_direct_http_model_probe(probe_config);
@@ -936,7 +992,7 @@ mod tests {
 
         let (status, first_body) = post_json(
             app.clone(),
-            "/session/action",
+            "/api/session/turn",
             json!({
                 "session_id": "shadow-session-001",
                 "text": "remember parser constraint",
@@ -948,11 +1004,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "unexpected body: {first_body:?}");
 
-        let first_accepted_at = first_body["accepted_at"]
+        let first_accepted_at = first_body["acceptedAt"]
             .as_u64()
             .expect("accepted_at should serialize as integer");
         let first_mission_id = format!("mission-session-action-{first_accepted_at}");
-        let first_root_task_id = first_body["root_task_id"]
+        let first_root_task_id = first_body["rootTaskId"]
             .as_str()
             .expect("root_task_id should serialize as string");
         let first_projection = wait_for_task_projection_completed(
@@ -975,7 +1031,7 @@ mod tests {
 
         let (status, second_body) = post_json(
             app.clone(),
-            "/session/action",
+            "/api/session/turn",
             json!({
                 "session_id": "shadow-session-001",
                 "text": "follow up parser work",
@@ -987,11 +1043,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "unexpected body: {second_body:?}");
 
-        let second_accepted_at = second_body["accepted_at"]
+        let second_accepted_at = second_body["acceptedAt"]
             .as_u64()
             .expect("accepted_at should serialize as integer");
         let second_mission_id = format!("mission-session-action-{second_accepted_at}");
-        let second_root_task_id = second_body["root_task_id"]
+        let second_root_task_id = second_body["rootTaskId"]
             .as_str()
             .expect("root_task_id should serialize as string");
         let expected_extraction_id = format!("extract-session-action-{first_accepted_at}");
@@ -1041,7 +1097,7 @@ mod tests {
 
         let (status, seed_body) = post_json(
             app.clone(),
-            "/session/action",
+            "/api/session/turn",
             json!({
                 "session_id": "shadow-session-001",
                 "text": "seed recovery route state",
@@ -1115,7 +1171,7 @@ mod tests {
 
         let (status, followup_body) = post_json(
             app.clone(),
-            "/session/action",
+            "/api/session/turn",
             json!({
                 "session_id": "shadow-session-001",
                 "text": "consume recovery memory",
@@ -1131,7 +1187,7 @@ mod tests {
             "unexpected followup body: {followup_body:?}"
         );
 
-        let followup_accepted_at = followup_body["accepted_at"]
+        let followup_accepted_at = followup_body["acceptedAt"]
             .as_u64()
             .expect("accepted_at should serialize as integer");
         let followup_mission_id = format!("mission-session-action-{followup_accepted_at}");

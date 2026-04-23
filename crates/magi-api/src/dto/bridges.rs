@@ -839,6 +839,7 @@ fn capture_model_preflight_checks(
             prompt: "bridge preflight ping".to_string(),
             messages: None,
             tools: None,
+            tool_choice: None,
         }),
     )];
 
@@ -855,6 +856,7 @@ fn capture_model_preflight_checks(
                     prompt: "bridge preflight ping".to_string(),
                     messages: None,
                     tools: None,
+                    tool_choice: None,
                 }),
             ));
         }
@@ -922,6 +924,7 @@ fn capture_model_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<Brid
             prompt: "bridge cutover smoke".to_string(),
             messages: None,
             tools: None,
+            tool_choice: None,
         }),
     ));
 
@@ -942,6 +945,7 @@ fn capture_model_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<Brid
                 prompt: "bridge cutover smoke".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             }),
         ));
     }
@@ -971,6 +975,7 @@ fn capture_direct_http_model_cutover_check(
             prompt: "bridge cutover smoke".to_string(),
             messages: None,
             tools: None,
+            tool_choice: None,
         }),
     )
 }

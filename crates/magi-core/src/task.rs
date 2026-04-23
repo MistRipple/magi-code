@@ -160,24 +160,15 @@ pub struct DecisionOption {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskProjection {
     pub root_task: Task,
+    pub tasks: Vec<Task>,
     pub current_phase: Option<String>,
     pub running_tasks: Vec<TaskId>,
     pub blocked_tasks: Vec<TaskId>,
     pub pending_decisions: Vec<TaskId>,
-    pub workpackage_summaries: Vec<WorkPackageSummary>,
     pub validation_summary: Option<String>,
     pub progress_summary: ProgressSummary,
     pub aggregate_status: TaskStatus,
     pub display_status: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WorkPackageSummary {
-    pub task_id: TaskId,
-    pub title: String,
-    pub status: TaskStatus,
-    pub completed_children: u32,
-    pub total_children: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
