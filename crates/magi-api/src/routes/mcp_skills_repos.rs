@@ -1,7 +1,7 @@
 use axum::{
+    Json, Router,
     extract::State,
     routing::{get, post},
-    Json, Router,
 };
 use magi_bridge_client::{McpServerConfig, StdioMcpBridgeClient};
 use std::collections::BTreeMap;
@@ -27,11 +27,20 @@ pub fn routes() -> Router<ApiState> {
         .route("/settings/skills/library", get(list_skills))
         .route("/settings/skills/install", post(install_skill))
         .route("/settings/skills/install-local", post(install_local_skill))
-        .route("/settings/skills/scan-local", post(scan_local_skill_directory))
+        .route(
+            "/settings/skills/scan-local",
+            post(scan_local_skill_directory),
+        )
         .route("/settings/skills/config/save", post(save_skills_config))
         .route("/settings/skills/custom-tool/add", post(add_custom_tool))
-        .route("/settings/skills/custom-tool/remove", post(remove_custom_tool))
-        .route("/settings/skills/instruction/remove", post(remove_instruction_skill))
+        .route(
+            "/settings/skills/custom-tool/remove",
+            post(remove_custom_tool),
+        )
+        .route(
+            "/settings/skills/instruction/remove",
+            post(remove_instruction_skill),
+        )
         .route("/settings/skills/update", post(update_skill))
         .route("/settings/skills/update-all", post(update_all_skills))
 }
@@ -49,7 +58,8 @@ fn unwrap_request_value<'a>(
 }
 
 fn server_entry_id(entry: &serde_json::Value) -> Option<&str> {
-    entry.get("id")
+    entry
+        .get("id")
         .and_then(|v| v.as_str())
         .or_else(|| entry.get("serverId").and_then(|v| v.as_str()))
 }
@@ -88,7 +98,10 @@ fn load_skills_config_object(state: &ApiState) -> serde_json::Map<String, serde_
         .unwrap_or_default()
 }
 
-fn persist_skills_config_object(state: &ApiState, config: serde_json::Map<String, serde_json::Value>) {
+fn persist_skills_config_object(
+    state: &ApiState,
+    config: serde_json::Map<String, serde_json::Value>,
+) {
     state
         .settings_store
         .set_section("skillsConfig", serde_json::Value::Object(config));
@@ -296,7 +309,6 @@ fn normalize_local_instruction_skill_request_path(
     Ok(std::path::PathBuf::from(directory_path))
 }
 
-
 fn epoch_ms_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -323,7 +335,8 @@ fn read_local_skill_metadata(dir: &std::path::Path) -> LocalSkillMetadata {
             }
             if let Ok(modified) = meta.modified() {
                 latest_modified = Some(
-                    latest_modified.map_or(modified, |prev: std::time::SystemTime| prev.max(modified)),
+                    latest_modified
+                        .map_or(modified, |prev: std::time::SystemTime| prev.max(modified)),
                 );
             }
         }
@@ -341,9 +354,7 @@ fn read_local_skill_metadata(dir: &std::path::Path) -> LocalSkillMetadata {
     }
 }
 
-fn normalize_repository_entry(
-    request: &serde_json::Value,
-) -> Result<serde_json::Value, ApiError> {
+fn normalize_repository_entry(request: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
     let raw = unwrap_request_value(request, &["repository", "updates"]);
     let repository_url = raw
         .get("url")
@@ -360,10 +371,7 @@ fn normalize_repository_entry(
         .or(repository_url)
         .ok_or_else(|| ApiError::InvalidInput("repositoryId 或 url 不能为空".to_string()))?;
     let mut entry = raw.as_object().cloned().unwrap_or_default();
-    entry.insert(
-        "repositoryId".to_string(),
-        serde_json::json!(repository_id),
-    );
+    entry.insert("repositoryId".to_string(), serde_json::json!(repository_id));
     if entry
         .get("url")
         .and_then(|value| value.as_str())
@@ -414,9 +422,7 @@ fn canonical_mcp_servers(state: &ApiState) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-async fn list_mcp_servers(
-    State(state): State<ApiState>,
-) -> Json<serde_json::Value> {
+async fn list_mcp_servers(State(state): State<ApiState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "servers": canonical_mcp_servers(&state) }))
 }
 
@@ -639,10 +645,13 @@ async fn refresh_mcp_tools(
 
 // ─── Repositories ───────────────────────────────────────────────────────────
 
-async fn list_repositories(
-    State(state): State<ApiState>,
-) -> Json<serde_json::Value> {
-    let repos = state.settings_store.get_section("repositories");
+async fn list_repositories(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    let repos = state
+        .settings_store
+        .get_section("repositories")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     Json(serde_json::json!({ "repositories": repos }))
 }
 
@@ -712,7 +721,10 @@ async fn refresh_repository(
 
     let mut updated_repos = repos;
     let mut entry = updated_repos[pos].as_object().cloned().unwrap_or_default();
-    entry.insert("lastRefreshed".to_string(), serde_json::json!(epoch_ms_now()));
+    entry.insert(
+        "lastRefreshed".to_string(),
+        serde_json::json!(epoch_ms_now()),
+    );
     updated_repos[pos] = serde_json::Value::Object(entry);
     state
         .settings_store
@@ -723,9 +735,7 @@ async fn refresh_repository(
 
 // ─── Skills ─────────────────────────────────────────────────────────────────
 
-async fn list_skills(
-    State(state): State<ApiState>,
-) -> Json<serde_json::Value> {
+async fn list_skills(State(state): State<ApiState>) -> Json<serde_json::Value> {
     let installed_skills = load_instruction_skills(&state);
     let installed_names: std::collections::HashSet<String> = installed_skills
         .iter()
@@ -739,25 +749,44 @@ async fn list_skills(
             serde_json::Value::Object(entry)
         })
         .collect();
-    let repos = state.settings_store.get_section("repositories")
-        .as_array().cloned().unwrap_or_default();
+    let repos = state
+        .settings_store
+        .get_section("repositories")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let mut failed_repos: Vec<serde_json::Value> = Vec::new();
     for repo in &repos {
         let repo_url = repo.get("url").and_then(|v| v.as_str()).unwrap_or_default();
-        let repo_id = repo.get("repositoryId").and_then(|v| v.as_str()).unwrap_or(repo_url);
-        if repo_url.is_empty() { continue; }
+        let repo_id = repo
+            .get("repositoryId")
+            .and_then(|v| v.as_str())
+            .unwrap_or(repo_url);
+        if repo_url.is_empty() {
+            continue;
+        }
         match fetch_github_repo_skills(repo_url).await {
             Ok(remote) => {
                 for mut rs in remote {
-                    let nm = rs.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                    let fl = rs.get("fullName").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    let nm = rs
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let fl = rs
+                        .get("fullName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
                     let inst = installed_names.contains(&nm) || installed_names.contains(&fl);
                     if let Some(o) = rs.as_object_mut() {
                         o.insert("installed".into(), serde_json::json!(inst));
                         o.insert("repositoryId".into(), serde_json::json!(repo_id));
                         o.insert("repositoryName".into(), serde_json::json!(repo_url));
                     }
-                    if !inst { all_skills.push(rs); }
+                    if !inst {
+                        all_skills.push(rs);
+                    }
                 }
             }
             Err(e) => {
@@ -769,24 +798,47 @@ async fn list_skills(
 }
 
 async fn fetch_github_repo_skills(repo_url: &str) -> Result<Vec<serde_json::Value>, ApiError> {
-    let path = repo_url.trim_end_matches('/').trim_end_matches(".git")
-        .rsplit("github.com/").next().unwrap_or_default();
-    if path.is_empty() || !path.contains('/') { return Ok(vec![]); }
+    let path = repo_url
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .rsplit("github.com/")
+        .next()
+        .unwrap_or_default();
+    if path.is_empty() || !path.contains('/') {
+        return Ok(vec![]);
+    }
     let api_url = format!("https://api.github.com/repos/{}/contents/skills", path);
-    let client = reqwest::Client::builder().user_agent("magi-daemon")
-        .timeout(std::time::Duration::from_secs(15)).build()
+    let client = reqwest::Client::builder()
+        .user_agent("magi-daemon")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
         .map_err(|e| ApiError::internal_assembly("HTTP client error", e))?;
-    let resp = client.get(&api_url).send().await
+    let resp = client
+        .get(&api_url)
+        .send()
+        .await
         .map_err(|e| ApiError::internal_assembly("GitHub API failed", e))?;
     if !resp.status().is_success() {
-        return Err(ApiError::InvalidInput(format!("GitHub API {} for {}", resp.status(), api_url)));
+        return Err(ApiError::InvalidInput(format!(
+            "GitHub API {} for {}",
+            resp.status(),
+            api_url
+        )));
     }
-    let items: Vec<serde_json::Value> = resp.json().await
+    let items: Vec<serde_json::Value> = resp
+        .json()
+        .await
         .map_err(|e| ApiError::internal_assembly("Parse GitHub response failed", e))?;
     let mut skills = Vec::new();
     for item in items {
-        let t = item.get("type").and_then(|v| v.as_str()).unwrap_or_default();
-        let n = item.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+        let t = item
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let n = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         if t == "dir" && !n.starts_with('.') {
             let full = format!("{}/{}", path, n);
             skills.push(serde_json::json!({"name": n, "skillName": n, "skillId": full, "fullName": full, "source": "repository"}));
@@ -820,7 +872,10 @@ async fn install_skill(
 
     // Inject the directoryPath so the local loader can read it
     if let Some(obj) = normalized.as_object_mut() {
-        obj.insert("directoryPath".to_string(), serde_json::json!(target_dir.to_string_lossy().to_string()));
+        obj.insert(
+            "directoryPath".to_string(),
+            serde_json::json!(target_dir.to_string_lossy().to_string()),
+        );
     }
 
     let mut instruction_skills = load_instruction_skills(&state);
@@ -862,7 +917,6 @@ async fn install_local_skill(
         "skills": entries,
     })))
 }
-
 
 async fn scan_local_skill_directory(
     Json(request): Json<serde_json::Value>,
@@ -913,7 +967,10 @@ async fn add_custom_tool(
         serde_json::Value::Object(entry),
         &["toolName", "name"],
     );
-    config.insert("customTools".to_string(), serde_json::Value::Array(custom_tools));
+    config.insert(
+        "customTools".to_string(),
+        serde_json::Value::Array(custom_tools),
+    );
     persist_skills_config_object(&state, config);
     Ok(Json(serde_json::json!({ "added": true })))
 }
@@ -938,7 +995,10 @@ async fn remove_custom_tool(
                 .is_some_and(|value| value == tool_name)
         })
     });
-    config.insert("customTools".to_string(), serde_json::Value::Array(custom_tools));
+    config.insert(
+        "customTools".to_string(),
+        serde_json::Value::Array(custom_tools),
+    );
     persist_skills_config_object(&state, config);
     Ok(Json(serde_json::json!({ "removed": true })))
 }
@@ -1006,7 +1066,10 @@ async fn update_skill(
         let mut updated_entry = skill.as_object().cloned().unwrap_or_default();
         let meta = read_local_skill_metadata(path);
         updated_entry.insert("fileCount".to_string(), serde_json::json!(meta.file_count));
-        updated_entry.insert("lastRefreshed".to_string(), serde_json::json!(epoch_ms_now()));
+        updated_entry.insert(
+            "lastRefreshed".to_string(),
+            serde_json::json!(epoch_ms_now()),
+        );
         if let Some(ts) = meta.last_modified_epoch_ms {
             updated_entry.insert("lastModified".to_string(), serde_json::json!(ts));
         }
@@ -1034,7 +1097,10 @@ async fn update_all_skills(
         let mut entry = skill.as_object().cloned().unwrap_or_default();
         let meta = read_local_skill_metadata(path);
         entry.insert("fileCount".to_string(), serde_json::json!(meta.file_count));
-        entry.insert("lastRefreshed".to_string(), serde_json::json!(epoch_ms_now()));
+        entry.insert(
+            "lastRefreshed".to_string(),
+            serde_json::json!(epoch_ms_now()),
+        );
         if let Some(ts) = meta.last_modified_epoch_ms {
             entry.insert("lastModified".to_string(), serde_json::json!(ts));
         }
@@ -1052,7 +1118,10 @@ async fn update_all_skills(
     })))
 }
 
-async fn download_github_skill(skill_id: &str, target_dir: &std::path::Path) -> Result<(), ApiError> {
+async fn download_github_skill(
+    skill_id: &str,
+    target_dir: &std::path::Path,
+) -> Result<(), ApiError> {
     let client = reqwest::Client::builder()
         .user_agent("magi-agent")
         .build()
@@ -1070,7 +1139,10 @@ async fn download_github_skill(skill_id: &str, target_dir: &std::path::Path) -> 
 
     // Try fetching prompt.md or README.md
     for branch in &branches {
-        let prompt_url = format!("https://raw.githubusercontent.com/{}/{}/prompt.md", skill_id, branch);
+        let prompt_url = format!(
+            "https://raw.githubusercontent.com/{}/{}/prompt.md",
+            skill_id, branch
+        );
         if let Ok(resp) = client.get(&prompt_url).send().await {
             if resp.status().is_success() {
                 if let Ok(text) = resp.text().await {
@@ -1079,7 +1151,10 @@ async fn download_github_skill(skill_id: &str, target_dir: &std::path::Path) -> 
                     prompt_downloaded = true;
 
                     // Also try to download config.json from the same branch
-                    let config_url = format!("https://raw.githubusercontent.com/{}/{}/config.json", skill_id, branch);
+                    let config_url = format!(
+                        "https://raw.githubusercontent.com/{}/{}/config.json",
+                        skill_id, branch
+                    );
                     if let Ok(c_resp) = client.get(&config_url).send().await {
                         if c_resp.status().is_success() {
                             if let Ok(c_text) = c_resp.text().await {
@@ -1092,7 +1167,10 @@ async fn download_github_skill(skill_id: &str, target_dir: &std::path::Path) -> 
             }
         }
 
-        let readme_url = format!("https://raw.githubusercontent.com/{}/{}/README.md", skill_id, branch);
+        let readme_url = format!(
+            "https://raw.githubusercontent.com/{}/{}/README.md",
+            skill_id, branch
+        );
         if let Ok(resp) = client.get(&readme_url).send().await {
             if resp.status().is_success() {
                 if let Ok(text) = resp.text().await {
@@ -1100,7 +1178,10 @@ async fn download_github_skill(skill_id: &str, target_dir: &std::path::Path) -> 
                         .map_err(|e| ApiError::internal_assembly("Failed to write README.md", e))?;
                     prompt_downloaded = true;
 
-                    let config_url = format!("https://raw.githubusercontent.com/{}/{}/config.json", skill_id, branch);
+                    let config_url = format!(
+                        "https://raw.githubusercontent.com/{}/{}/config.json",
+                        skill_id, branch
+                    );
                     if let Ok(c_resp) = client.get(&config_url).send().await {
                         if c_resp.status().is_success() {
                             if let Ok(c_text) = c_resp.text().await {
@@ -1115,7 +1196,10 @@ async fn download_github_skill(skill_id: &str, target_dir: &std::path::Path) -> 
     }
 
     if !prompt_downloaded {
-        return Err(ApiError::InvalidInput(format!("Could not find prompt.md or README.md in repository {}", skill_id)));
+        return Err(ApiError::InvalidInput(format!(
+            "Could not find prompt.md or README.md in repository {}",
+            skill_id
+        )));
     }
 
     Ok(())

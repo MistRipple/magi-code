@@ -45,4 +45,12 @@ pub enum DaemonError {
     Io(#[from] std::io::Error),
     #[error("状态序列化失败: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("daemon 内部错误: {0}")]
+    Internal(String),
+}
+
+impl DaemonError {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self::Internal(message.into())
+    }
 }

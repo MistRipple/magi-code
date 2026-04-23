@@ -12,6 +12,4 @@ mod tests;
 
 pub use app::Daemon;
 pub use config::{DaemonConfig, DaemonError};
-pub use types::{
-    DaemonMaintenanceMode, DaemonMaintenancePolicyProfile, DaemonRuntimeStatus,
-};
+pub use types::{DaemonMaintenanceMode, DaemonMaintenancePolicyProfile, DaemonRuntimeStatus};

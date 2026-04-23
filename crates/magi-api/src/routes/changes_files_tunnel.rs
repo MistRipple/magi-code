@@ -1,17 +1,22 @@
 use axum::{
+    Json, Router,
     extract::{Query, State},
     routing::{get, post},
-    Json, Router,
 };
-use magi_core::{MissionId, SessionId, WorkspaceId};
+use magi_core::{SessionId, WorkspaceId};
 use serde::Deserialize;
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use magi_bridge_client::{ModelInvocationRequest, SHADOW_MODEL_PROVIDER};
 
-use crate::{errors::ApiError, state::ApiState};
+use crate::{
+    change_projection::{
+        SessionChangeScope, resolve_session_change_scope, run_git, run_git_add_files,
+        run_git_restore_files, safe_relative_path,
+    },
+    errors::ApiError,
+    state::ApiState,
+};
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -33,27 +38,6 @@ pub fn routes() -> Router<ApiState> {
         .route("/prompt/enhance", post(enhance_prompt))
 }
 
-fn resolve_workspace_root(
-    state: &ApiState,
-    workspace_id: Option<&str>,
-) -> Result<PathBuf, ApiError> {
-    let ws_id = match workspace_id.filter(|s| !s.is_empty()) {
-        Some(id) => WorkspaceId::new(id),
-        None => state
-            .workspace_registry
-            .active_workspace_id()
-            .ok_or_else(|| {
-                ApiError::InvalidInput("未指定 workspace_id 且没有活动 workspace".to_string())
-            })?,
-    };
-    let workspaces = state.workspace_registry.workspaces();
-    let workspace = workspaces
-        .iter()
-        .find(|w| w.workspace_id == ws_id)
-        .ok_or_else(|| ApiError::not_found("workspace 不存在", ws_id.as_str()))?;
-    Ok(PathBuf::from(workspace.root_path.as_str()))
-}
-
 fn parse_session_id(value: Option<&str>) -> Result<SessionId, ApiError> {
     let session_id = value
         .map(str::trim)
@@ -62,90 +46,8 @@ fn parse_session_id(value: Option<&str>) -> Result<SessionId, ApiError> {
     Ok(SessionId::new(session_id))
 }
 
-#[derive(Clone)]
-struct SessionScopedChangeSet {
-    session_id: SessionId,
-    workspace_root: PathBuf,
-    mission_id: MissionId,
-    allowed_files: BTreeSet<String>,
-}
-
-fn collect_mission_output_files(
-    state: &ApiState,
-    mission_id: &MissionId,
-) -> Result<BTreeSet<String>, ApiError> {
-    let task_store = state
-        .task_store()
-        .ok_or_else(|| ApiError::internal_assembly("changes scope", "task_store 未配置"))?;
-    let mut files = BTreeSet::new();
-    for task in task_store.get_tasks_by_mission(mission_id) {
-        for output_ref in &task.output_refs {
-            if let Some(rel) = output_ref.strip_prefix("file:")
-                && safe_relative_path(rel).is_ok()
-            {
-                files.insert(rel.to_string());
-            }
-        }
-    }
-    Ok(files)
-}
-
-fn resolve_session_change_scope(
-    state: &ApiState,
-    session_id_value: Option<&str>,
-    workspace_id: Option<&str>,
-    mission_id_override: Option<&str>,
-) -> Result<SessionScopedChangeSet, ApiError> {
-    let session_id = parse_session_id(session_id_value)?;
-    let ownership = state
-        .session_store
-        .execution_ownership(&session_id)
-        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
-
-    let ownership_workspace_id = ownership
-        .workspace_id
-        .clone()
-        .ok_or_else(|| ApiError::InvalidInput("当前会话未绑定 workspace，不能执行变更操作".to_string()))?;
-    if let Some(requested_workspace_id) = workspace_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        && requested_workspace_id != ownership_workspace_id.as_str()
-    {
-        return Err(ApiError::InvalidInput(format!(
-            "会话 {} 不属于 workspace {}",
-            session_id, requested_workspace_id
-        )));
-    }
-
-    let bound_mission_id = ownership
-        .mission_id
-        .clone()
-        .ok_or_else(|| ApiError::InvalidInput("当前会话没有可归属的执行分组".to_string()))?;
-    let mission_id = match mission_id_override.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(mission_id) => {
-            if mission_id != bound_mission_id.as_str() {
-                return Err(ApiError::InvalidInput(format!(
-                    "执行分组 {} 不属于当前会话 {}",
-                    mission_id, session_id
-                )));
-            }
-            MissionId::new(mission_id)
-        }
-        None => bound_mission_id,
-    };
-    let allowed_files = collect_mission_output_files(state, &mission_id)?;
-    let workspace_root = resolve_workspace_root(state, Some(ownership_workspace_id.as_str()))?;
-
-    Ok(SessionScopedChangeSet {
-        session_id,
-        workspace_root,
-        mission_id,
-        allowed_files,
-    })
-}
-
 fn require_session_scoped_file<'a>(
-    scope: &SessionScopedChangeSet,
+    scope: &SessionChangeScope,
     file_path: &'a str,
 ) -> Result<&'a str, ApiError> {
     let rel = safe_relative_path(file_path)?;
@@ -156,59 +58,6 @@ fn require_session_scoped_file<'a>(
         )));
     }
     Ok(rel)
-}
-
-fn run_git_restore_files(workspace_root: &Path, files: &[String]) -> Result<(), ApiError> {
-    if files.is_empty() {
-        return Ok(());
-    }
-    let mut args = vec!["restore", "--source=HEAD", "--staged", "--worktree", "--"];
-    let file_refs = files.iter().map(|file| file.as_str()).collect::<Vec<_>>();
-    args.extend(file_refs);
-    run_git(workspace_root, &args)?;
-    Ok(())
-}
-
-fn run_git_add_files(workspace_root: &Path, files: &[String]) -> Result<(), ApiError> {
-    if files.is_empty() {
-        return Ok(());
-    }
-    let mut args = vec!["add", "--"];
-    let file_refs = files.iter().map(|file| file.as_str()).collect::<Vec<_>>();
-    args.extend(file_refs);
-    run_git(workspace_root, &args)?;
-    Ok(())
-}
-
-fn safe_relative_path(file_path: &str) -> Result<&str, ApiError> {
-    let path = Path::new(file_path);
-    for component in path.components() {
-        if matches!(component, std::path::Component::ParentDir) {
-            return Err(ApiError::InvalidInput(
-                "路径不允许包含 ..".to_string(),
-            ));
-        }
-        if matches!(component, std::path::Component::RootDir) {
-            return Err(ApiError::InvalidInput(
-                "路径不允许为绝对路径".to_string(),
-            ));
-        }
-    }
-    Ok(file_path)
-}
-
-fn run_git(workspace_root: &Path, args: &[&str]) -> Result<String, ApiError> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(workspace_root)
-        .output()
-        .map_err(|e| ApiError::internal_assembly("执行 git 命令失败", e))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        Err(ApiError::internal_assembly("git 命令执行出错", stderr))
-    }
 }
 
 // ─── Changes ────────────────────────────────────────────────────────────────
@@ -226,6 +75,7 @@ async fn get_diff(
     State(state): State<ApiState>,
     Query(query): Query<DiffQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let root = resolve_workspace_root_fallback(&state, query.workspace_id.as_deref())?;
     let diff = if query
         .session_id
         .as_deref()
@@ -233,9 +83,10 @@ async fn get_diff(
         .filter(|value| !value.is_empty())
         .is_some()
     {
+        let session_id = parse_session_id(query.session_id.as_deref())?;
         let scope = resolve_session_change_scope(
             &state,
-            query.session_id.as_deref(),
+            &session_id,
             query.workspace_id.as_deref(),
             query.execution_group_id.as_deref(),
         )?;
@@ -245,7 +96,11 @@ async fn get_diff(
                 run_git(&scope.workspace_root, &["diff", "HEAD", "--", rel])?
             }
             None => {
-                let files = scope.allowed_files.iter().map(String::as_str).collect::<Vec<_>>();
+                let files = scope
+                    .allowed_files
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
                 if files.is_empty() {
                     String::new()
                 } else {
@@ -256,7 +111,6 @@ async fn get_diff(
             }
         }
     } else {
-        let root = resolve_workspace_root(&state, query.workspace_id.as_deref())?;
         match query.file_path.as_deref() {
             Some(fp) => {
                 let rel = safe_relative_path(fp)?;
@@ -283,12 +137,9 @@ async fn approve_change(
     State(state): State<ApiState>,
     Json(request): Json<ApproveChangeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let scope = resolve_session_change_scope(
-        &state,
-        request.session_id.as_deref(),
-        request.workspace_id.as_deref(),
-        None,
-    )?;
+    let session_id = parse_session_id(request.session_id.as_deref())?;
+    let scope =
+        resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
     let rel = require_session_scoped_file(&scope, &request.file_path)?;
     run_git(&scope.workspace_root, &["add", "--", rel])?;
     Ok(Json(serde_json::json!({
@@ -309,14 +160,21 @@ async fn revert_change(
     State(state): State<ApiState>,
     Json(request): Json<RevertChangeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let scope = resolve_session_change_scope(
-        &state,
-        request.session_id.as_deref(),
-        request.workspace_id.as_deref(),
-        None,
-    )?;
+    let session_id = parse_session_id(request.session_id.as_deref())?;
+    let scope =
+        resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
     let rel = require_session_scoped_file(&scope, &request.file_path)?;
-    run_git(&scope.workspace_root, &["restore", "--source=HEAD", "--staged", "--worktree", "--", rel])?;
+    run_git(
+        &scope.workspace_root,
+        &[
+            "restore",
+            "--source=HEAD",
+            "--staged",
+            "--worktree",
+            "--",
+            rel,
+        ],
+    )?;
     Ok(Json(serde_json::json!({
         "reverted": true,
         "filePath": request.file_path,
@@ -334,12 +192,9 @@ async fn approve_all_changes(
     State(state): State<ApiState>,
     Json(request): Json<ApproveAllRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let scope = resolve_session_change_scope(
-        &state,
-        request.session_id.as_deref(),
-        request.workspace_id.as_deref(),
-        None,
-    )?;
+    let session_id = parse_session_id(request.session_id.as_deref())?;
+    let scope =
+        resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
     let approved_files = scope.allowed_files.iter().cloned().collect::<Vec<_>>();
     run_git_add_files(&scope.workspace_root, &approved_files)?;
     Ok(Json(serde_json::json!({ "approved": true })))
@@ -356,12 +211,9 @@ async fn revert_all_changes(
     State(state): State<ApiState>,
     Json(request): Json<RevertAllRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let scope = resolve_session_change_scope(
-        &state,
-        request.session_id.as_deref(),
-        request.workspace_id.as_deref(),
-        None,
-    )?;
+    let session_id = parse_session_id(request.session_id.as_deref())?;
+    let scope =
+        resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
     let reverted_files = scope.allowed_files.iter().cloned().collect::<Vec<_>>();
     run_git_restore_files(&scope.workspace_root, &reverted_files)?;
     Ok(Json(serde_json::json!({ "reverted": true })))
@@ -379,9 +231,10 @@ async fn revert_execution_group_changes(
     State(state): State<ApiState>,
     Json(request): Json<RevertExecutionGroupRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let session_id = parse_session_id(request.session_id.as_deref())?;
     let scope = resolve_session_change_scope(
         &state,
-        request.session_id.as_deref(),
+        &session_id,
         request.workspace_id.as_deref(),
         Some(request.execution_group_id.as_str()),
     )?;
@@ -424,16 +277,17 @@ async fn get_file_content(
             .filter(|value| !value.is_empty())
             .is_some()
         {
+            let session_id = parse_session_id(query.session_id.as_deref())?;
             let scope = resolve_session_change_scope(
                 &state,
-                query.session_id.as_deref(),
+                &session_id,
                 query.workspace_id.as_deref(),
                 query.execution_group_id.as_deref(),
             )?;
             let rel = require_session_scoped_file(&scope, path)?;
             scope.workspace_root.join(rel)
         } else {
-            let root = resolve_workspace_root(&state, query.workspace_id.as_deref())?;
+            let root = resolve_workspace_root_fallback(&state, query.workspace_id.as_deref())?;
             let rel = safe_relative_path(path)?;
             root.join(rel)
         };
@@ -460,18 +314,23 @@ async fn list_filesystem(
     State(state): State<ApiState>,
     Query(query): Query<FilesystemListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let path = match query.path.as_deref().filter(|value| !value.trim().is_empty()) {
+    let path = match query
+        .path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         Some(p) => {
             let p_path = Path::new(p);
             if p_path.is_absolute() {
                 p_path.to_path_buf()
             } else {
-                let root = resolve_workspace_root(&state, query.workspace_id.as_deref())?;
+                let root = resolve_workspace_root_fallback(&state, query.workspace_id.as_deref())?;
                 root.join(safe_relative_path(p)?)
             }
         }
         None => {
-            if let Ok(root) = resolve_workspace_root(&state, query.workspace_id.as_deref()) {
+            if let Ok(root) = resolve_workspace_root_fallback(&state, query.workspace_id.as_deref())
+            {
                 root
             } else {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
@@ -496,6 +355,27 @@ async fn list_filesystem(
     Ok(Json(serde_json::json!({ "entries": entries })))
 }
 
+fn resolve_workspace_root_fallback(
+    state: &ApiState,
+    workspace_id: Option<&str>,
+) -> Result<PathBuf, ApiError> {
+    let ws_id = match workspace_id.filter(|value| !value.is_empty()) {
+        Some(id) => WorkspaceId::new(id),
+        None => state
+            .workspace_registry
+            .active_workspace_id()
+            .ok_or_else(|| {
+                ApiError::InvalidInput("未指定 workspace_id 且没有活动 workspace".to_string())
+            })?,
+    };
+    let workspaces = state.workspace_registry.workspaces();
+    let workspace = workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == ws_id)
+        .ok_or_else(|| ApiError::not_found("workspace 不存在", ws_id.as_str()))?;
+    Ok(PathBuf::from(workspace.root_path.as_str()))
+}
+
 // ─── Tunnel ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -510,19 +390,19 @@ async fn start_tunnel(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let ws_id = request.workspace_id.as_deref();
     let tunnel_state = state.tunnel_manager.start(ws_id).await;
-    Ok(Json(serde_json::to_value(&tunnel_state).unwrap_or_default()))
+    Ok(Json(
+        serde_json::to_value(&tunnel_state).unwrap_or_default(),
+    ))
 }
 
-async fn stop_tunnel(
-    State(state): State<ApiState>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+async fn stop_tunnel(State(state): State<ApiState>) -> Result<Json<serde_json::Value>, ApiError> {
     let tunnel_state = state.tunnel_manager.stop().await;
-    Ok(Json(serde_json::to_value(&tunnel_state).unwrap_or_default()))
+    Ok(Json(
+        serde_json::to_value(&tunnel_state).unwrap_or_default(),
+    ))
 }
 
-async fn tunnel_status(
-    State(state): State<ApiState>,
-) -> Json<serde_json::Value> {
+async fn tunnel_status(State(state): State<ApiState>) -> Json<serde_json::Value> {
     let tunnel_state = state.tunnel_manager.get_state().await;
     Json(serde_json::to_value(&tunnel_state).unwrap_or_default())
 }
@@ -584,7 +464,11 @@ fn resolve_preferred_lan_ipv4() -> String {
     }
 
     candidates.sort_by(|a, b| b.1.cmp(&a.1));
-    candidates.into_iter().next().map(|(ip, _)| ip).unwrap_or_else(fallback_udp_ip)
+    candidates
+        .into_iter()
+        .next()
+        .map(|(ip, _)| ip)
+        .unwrap_or_else(fallback_udp_ip)
 }
 
 fn extract_ipv4_from_line(line: &str) -> Option<String> {
@@ -614,20 +498,37 @@ fn score_lan_candidate(iface: &str, addr: &str) -> i32 {
     let mut score = 0i32;
     // 优先物理网卡
     let iface_lower = iface.to_lowercase();
-    if iface_lower.starts_with("en") || iface_lower.starts_with("eth") || iface_lower.starts_with("wlan") || iface_lower.contains("wi-fi") {
+    if iface_lower.starts_with("en")
+        || iface_lower.starts_with("eth")
+        || iface_lower.starts_with("wlan")
+        || iface_lower.contains("wi-fi")
+    {
         score += 50;
     }
     // 排除虚拟网卡
-    if iface_lower.starts_with("bridge") || iface_lower.starts_with("docker") || iface_lower.starts_with("veth")
-        || iface_lower.starts_with("utun") || iface_lower.starts_with("tun") || iface_lower.starts_with("tap")
-        || iface_lower.starts_with("vmnet") || iface_lower.starts_with("lo") {
+    if iface_lower.starts_with("bridge")
+        || iface_lower.starts_with("docker")
+        || iface_lower.starts_with("veth")
+        || iface_lower.starts_with("utun")
+        || iface_lower.starts_with("tun")
+        || iface_lower.starts_with("tap")
+        || iface_lower.starts_with("vmnet")
+        || iface_lower.starts_with("lo")
+    {
         score -= 100;
     }
     // 优先常见私网段
-    if addr.starts_with("192.168.") { score += 30; }
-    else if addr.starts_with("10.") { score += 20; }
-    else if addr.starts_with("172.") { score += 10; } // 简化判断
-    else { score -= 20; }
+    if addr.starts_with("192.168.") {
+        score += 30;
+    } else if addr.starts_with("10.") {
+        score += 20;
+    } else if addr.starts_with("172.") {
+        score += 10;
+    }
+    // 简化判断
+    else {
+        score -= 20;
+    }
     score
 }
 
@@ -678,24 +579,24 @@ async fn enhance_prompt(
         Ok(response) if response.ok => Ok(Json(serde_json::json!({
             "enhancedPrompt": response.payload.trim(),
         }))),
-        Ok(response) => Err(ApiError::InvalidInput(
-            response.payload.trim().to_string(),
-        )),
-        Err(error) => Err(ApiError::InvalidInput(format!(
-            "增强提示词失败: {error}"
-        ))),
+        Ok(response) => Err(ApiError::InvalidInput(response.payload.trim().to_string())),
+        Err(error) => Err(ApiError::InvalidInput(format!("增强提示词失败: {error}"))),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::change_projection::collect_session_pending_changes;
     use crate::state::ApiState;
     use axum::{
-        body::{to_bytes, Body},
+        body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use magi_core::{AbsolutePath, ExecutionOwnership, SessionId, TaskId, TaskKind, TaskStatus, UtcMillis};
+    use magi_core::{
+        AbsolutePath, ExecutionOwnership, MissionId, SessionId, TaskId, TaskKind, TaskStatus,
+        UtcMillis,
+    };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_orchestrator::task_store::TaskStore;
@@ -704,12 +605,18 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tower::ServiceExt;
 
+    static TEST_REPO_COUNTER: AtomicU64 = AtomicU64::new(1);
+
     fn build_test_repo() -> String {
+        let unique_suffix = TEST_REPO_COUNTER.fetch_add(1, Ordering::Relaxed);
         let repo_root = std::env::temp_dir().join(format!(
-            "magi-changes-route-test-{}",
-            UtcMillis::now().0
+            "magi-changes-route-test-{}-{}-{}",
+            std::process::id(),
+            UtcMillis::now().0,
+            unique_suffix
         ));
         fs::create_dir_all(&repo_root).expect("repo root should create");
         Command::new("git")
@@ -896,6 +803,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approve_all_changes_clears_pending_changes_for_current_session() {
+        let repo_root = build_test_repo();
+        let state = build_state_with_repo(&repo_root);
+
+        let before = collect_session_pending_changes(
+            &state,
+            &SessionId::new("session-a"),
+            Some("workspace-session-scope"),
+        )
+        .expect("pending changes should collect before approval");
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].file_path, "a.txt");
+
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/changes/approve-all")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sessionId": "session-a",
+                            "workspaceId": "workspace-session-scope"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let after = collect_session_pending_changes(
+            &state,
+            &SessionId::new("session-a"),
+            Some("workspace-session-scope"),
+        )
+        .expect("pending changes should collect after approval");
+        assert!(
+            after.is_empty(),
+            "approved files should disappear from pending changes"
+        );
+    }
+
+    #[tokio::test]
     async fn revert_execution_group_rejects_cross_session_mission() {
         let repo_root = build_test_repo();
         let state = build_state_with_repo(&repo_root);
@@ -928,5 +882,66 @@ mod tests {
             serde_json::from_slice(&body).expect("payload should deserialize");
         let message = payload["message"].as_str().unwrap_or_default();
         assert!(message.contains("不属于当前会话"));
+    }
+
+    #[tokio::test]
+    async fn revert_all_changes_removes_untracked_session_file() {
+        let repo_root = build_test_repo();
+        let state = build_state_with_repo(&repo_root);
+        fs::create_dir_all(Path::new(&repo_root).join("tmp")).expect("tmp dir should create");
+        fs::write(Path::new(&repo_root).join("tmp/new-a.txt"), "new file\n")
+            .expect("untracked file should write");
+
+        state
+            .task_store()
+            .expect("task store should exist")
+            .insert_task(magi_core::Task {
+                task_id: TaskId::new("task-a-untracked"),
+                mission_id: MissionId::new("mission-a"),
+                root_task_id: TaskId::new("task-a-untracked"),
+                parent_task_id: None,
+                kind: TaskKind::Action,
+                title: "A-untracked".to_string(),
+                goal: "A-untracked".to_string(),
+                status: TaskStatus::Completed,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                context_refs: Vec::new(),
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: vec!["file:tmp/new-a.txt".to_string()],
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                repair_count: 0,
+                decision_payload: None,
+                created_at: UtcMillis::now(),
+                updated_at: UtcMillis::now(),
+            });
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/changes/revert-all")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sessionId": "session-a",
+                            "workspaceId": "workspace-session-scope"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!Path::new(&repo_root).join("tmp/new-a.txt").exists());
     }
 }

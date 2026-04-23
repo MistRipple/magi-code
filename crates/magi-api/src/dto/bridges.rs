@@ -1,12 +1,11 @@
 use magi_bridge_client::{
-    BridgeClientError, BridgeErrorLayer, BridgeResponse, BridgeServerHandshake,
-    BridgeServerHealth, BridgeServerKind, BridgeServerServiceCatalog, BridgeTransport,
-    HostBridgeClient, HostBridgeCommand, HostBridgeRequest, HostKind, HttpModelBridgeClient,
+    BridgeClientError, BridgeErrorLayer, BridgeResponse, BridgeServerHandshake, BridgeServerHealth,
+    BridgeServerKind, BridgeServerServiceCatalog, BridgeTransport, HostBridgeClient,
+    HostBridgeCommand, HostBridgeRequest, HostKind, HttpModelBridgeClient,
     JsonRpcBridgeServerProbeClient, JsonRpcHostBridgeClient, JsonRpcMcpBridgeClient,
     JsonRpcMcpManagerClient, JsonRpcModelBridgeClient, McpBridgeClient,
-    McpManagerServerSelectionRequest, ModelBridgeClient, McpToolCallRequest,
-    ModelInvocationRequest, SHADOW_MCP_SERVER_NAME, SHADOW_MCP_TOOL_NAME,
-    SHADOW_MODEL_PROVIDER,
+    McpManagerServerSelectionRequest, McpToolCallRequest, ModelBridgeClient,
+    ModelInvocationRequest, SHADOW_MCP_SERVER_NAME, SHADOW_MCP_TOOL_NAME, SHADOW_MODEL_PROVIDER,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -128,10 +127,7 @@ pub struct BridgeCutoverServiceDto {
 }
 
 impl BridgeCutoverServiceDto {
-    fn from_checks(
-        server_kind: BridgeServerKind,
-        checks: Vec<BridgeCutoverCheckDto>,
-    ) -> Self {
+    fn from_checks(server_kind: BridgeServerKind, checks: Vec<BridgeCutoverCheckDto>) -> Self {
         let blocking_targets = checks
             .iter()
             .filter(|check| !check.ok)
@@ -140,7 +136,8 @@ impl BridgeCutoverServiceDto {
         let blocking_check_count = blocking_targets.len();
         let service_ok = blocking_check_count == 0;
         let mcp_default_route_gate = checks.iter().find_map(|check| {
-            check.mcp_contract
+            check
+                .mcp_contract
                 .as_ref()
                 .map(BridgeMcpDefaultRouteGateDto::from_contract)
         });
@@ -238,10 +235,8 @@ pub enum BridgeCutoverBlockingReasonCode {
 const MCP_MANAGER_LIST_SERVERS_FAILED_REASON: &str = "mcp manager list_servers failed";
 const MCP_DEFAULT_ROUTE_FALLBACK_ONLY_REASON: &str = "default route is fallback-only";
 const MCP_DEFAULT_ROUTE_UNAVAILABLE_REASON: &str = "default route is unavailable";
-const MCP_BLANK_SELECTION_INVOCATION_FAILED_REASON: &str =
-    "blank selection invocation failed";
-const MCP_BLANK_SELECTION_RESPONSE_NOT_OK_REASON: &str =
-    "blank selection response was not ok";
+const MCP_BLANK_SELECTION_INVOCATION_FAILED_REASON: &str = "blank selection invocation failed";
+const MCP_BLANK_SELECTION_RESPONSE_NOT_OK_REASON: &str = "blank selection response was not ok";
 const MCP_DEFAULT_ROUTE_METADATA_DRIFT_REASON: &str =
     "blank selection payload drifted from manager metadata";
 const MCP_DEFAULT_ROUTE_RESOLVED_SERVER_MISMATCH_REASON: &str =
@@ -266,33 +261,17 @@ impl BridgeCutoverBlockingReasonCode {
                 "model_structured_payload_missing_content_or_tool_calls"
             }
             Self::McpListServersFailed => "mcp_manager_list_servers_failed",
-            Self::McpDefaultRouteStatusFallbackOnly => {
-                "mcp_default_route_status_fallback_only"
-            }
-            Self::McpDefaultRouteStatusUnavailable => {
-                "mcp_default_route_status_unavailable"
-            }
-            Self::McpDefaultRouteStatusUnsupported => {
-                "mcp_default_route_status_unsupported"
-            }
-            Self::McpDefaultRouteTargetDescribeFailed => {
-                "mcp_default_route_target_describe_failed"
-            }
-            Self::McpBlankSelectionInvocationFailed => {
-                "mcp_blank_selection_invocation_failed"
-            }
-            Self::McpBlankSelectionResponseNotOk => {
-                "mcp_blank_selection_response_not_ok"
-            }
-            Self::McpDefaultRouteMetadataDrift => {
-                "mcp_default_route_metadata_drift"
-            }
+            Self::McpDefaultRouteStatusFallbackOnly => "mcp_default_route_status_fallback_only",
+            Self::McpDefaultRouteStatusUnavailable => "mcp_default_route_status_unavailable",
+            Self::McpDefaultRouteStatusUnsupported => "mcp_default_route_status_unsupported",
+            Self::McpDefaultRouteTargetDescribeFailed => "mcp_default_route_target_describe_failed",
+            Self::McpBlankSelectionInvocationFailed => "mcp_blank_selection_invocation_failed",
+            Self::McpBlankSelectionResponseNotOk => "mcp_blank_selection_response_not_ok",
+            Self::McpDefaultRouteMetadataDrift => "mcp_default_route_metadata_drift",
             Self::McpDefaultRouteResolvedServerMismatch => {
                 "mcp_default_route_resolved_server_mismatch"
             }
-            Self::ModelProviderDirectHttpOk => {
-                "model_provider_direct_http_ok"
-            }
+            Self::ModelProviderDirectHttpOk => "model_provider_direct_http_ok",
         }
     }
 
@@ -314,25 +293,15 @@ impl BridgeCutoverBlockingReasonCode {
                 "structured payload missing content or tool_calls"
             }
             Self::McpListServersFailed => MCP_MANAGER_LIST_SERVERS_FAILED_REASON,
-            Self::McpDefaultRouteStatusFallbackOnly => {
-                MCP_DEFAULT_ROUTE_FALLBACK_ONLY_REASON
-            }
-            Self::McpDefaultRouteStatusUnavailable => {
-                MCP_DEFAULT_ROUTE_UNAVAILABLE_REASON
-            }
+            Self::McpDefaultRouteStatusFallbackOnly => MCP_DEFAULT_ROUTE_FALLBACK_ONLY_REASON,
+            Self::McpDefaultRouteStatusUnavailable => MCP_DEFAULT_ROUTE_UNAVAILABLE_REASON,
             Self::McpDefaultRouteStatusUnsupported => "default route status is unsupported",
             Self::McpDefaultRouteTargetDescribeFailed => {
                 "default route target could not be described"
             }
-            Self::McpBlankSelectionInvocationFailed => {
-                MCP_BLANK_SELECTION_INVOCATION_FAILED_REASON
-            }
-            Self::McpBlankSelectionResponseNotOk => {
-                MCP_BLANK_SELECTION_RESPONSE_NOT_OK_REASON
-            }
-            Self::McpDefaultRouteMetadataDrift => {
-                MCP_DEFAULT_ROUTE_METADATA_DRIFT_REASON
-            }
+            Self::McpBlankSelectionInvocationFailed => MCP_BLANK_SELECTION_INVOCATION_FAILED_REASON,
+            Self::McpBlankSelectionResponseNotOk => MCP_BLANK_SELECTION_RESPONSE_NOT_OK_REASON,
+            Self::McpDefaultRouteMetadataDrift => MCP_DEFAULT_ROUTE_METADATA_DRIFT_REASON,
             Self::McpDefaultRouteResolvedServerMismatch => {
                 MCP_DEFAULT_ROUTE_RESOLVED_SERVER_MISMATCH_REASON
             }
@@ -495,9 +464,7 @@ fn infer_bridge_response_reason_code(
         Some("bridge response payload was empty") | Some("bridge payload was empty") => {
             BridgeCutoverBlockingReasonCode::BridgeResponseEmptyPayload
         }
-        Some("bridge response was not ok") => {
-            BridgeCutoverBlockingReasonCode::BridgeResponseNotOk
-        }
+        Some("bridge response was not ok") => BridgeCutoverBlockingReasonCode::BridgeResponseNotOk,
         _ => BridgeCutoverBlockingReasonCode::BridgeResponseNotOk,
     }
 }
@@ -565,8 +532,7 @@ fn infer_mcp_reason_code(
             ) {
                 reason_code
             } else if !contract.contract_ok
-                && contract.resolved_server.as_deref()
-                    != Some(contract.route_target.as_str())
+                && contract.resolved_server.as_deref() != Some(contract.route_target.as_str())
             {
                 BridgeCutoverBlockingReasonCode::McpDefaultRouteResolvedServerMismatch
             } else if !contract.contract_ok {
@@ -594,9 +560,9 @@ fn infer_ready_mcp_blank_selection_reason_code(
         Some(MCP_DEFAULT_ROUTE_METADATA_DRIFT_REASON) => {
             Some(BridgeCutoverBlockingReasonCode::McpDefaultRouteMetadataDrift)
         }
-        Some(MCP_DEFAULT_ROUTE_RESOLVED_SERVER_MISMATCH_REASON) => Some(
-            BridgeCutoverBlockingReasonCode::McpDefaultRouteResolvedServerMismatch,
-        ),
+        Some(MCP_DEFAULT_ROUTE_RESOLVED_SERVER_MISMATCH_REASON) => {
+            Some(BridgeCutoverBlockingReasonCode::McpDefaultRouteResolvedServerMismatch)
+        }
         _ if !blank_selection_ok && has_error => {
             Some(BridgeCutoverBlockingReasonCode::McpBlankSelectionInvocationFailed)
         }
@@ -680,7 +646,8 @@ impl BridgeProbeSnapshotProvider {
         server_kind: BridgeServerKind,
         probe: JsonRpcBridgeServerProbeClient,
     ) {
-        self.probes.retain(|binding| binding.server_kind != server_kind);
+        self.probes
+            .retain(|binding| binding.server_kind != server_kind);
         self.probes.push(BridgeProbeBinding { server_kind, probe });
     }
 
@@ -724,9 +691,12 @@ impl BridgePreflightSnapshotProvider {
         server_kind: BridgeServerKind,
         transport: Arc<dyn BridgeTransport>,
     ) {
-        self.bindings.retain(|binding| binding.server_kind != server_kind);
         self.bindings
-            .push(BridgeTransportBinding { server_kind, transport });
+            .retain(|binding| binding.server_kind != server_kind);
+        self.bindings.push(BridgeTransportBinding {
+            server_kind,
+            transport,
+        });
     }
 
     fn capture_binding_snapshot(binding: &BridgeTransportBinding) -> BridgePreflightServiceDto {
@@ -749,9 +719,12 @@ impl BridgeCutoverSmokeSnapshotProvider {
         server_kind: BridgeServerKind,
         transport: Arc<dyn BridgeTransport>,
     ) {
-        self.bindings.retain(|binding| binding.server_kind != server_kind);
         self.bindings
-            .push(BridgeTransportBinding { server_kind, transport });
+            .retain(|binding| binding.server_kind != server_kind);
+        self.bindings.push(BridgeTransportBinding {
+            server_kind,
+            transport,
+        });
     }
 
     pub fn register_direct_http_probe(&mut self, config: DirectHttpModelProbeConfig) {
@@ -932,9 +905,7 @@ fn capture_host_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<Bridg
     )]
 }
 
-fn capture_model_cutover_checks(
-    transport: Arc<dyn BridgeTransport>,
-) -> Vec<BridgeCutoverCheckDto> {
+fn capture_model_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<BridgeCutoverCheckDto> {
     let probe = JsonRpcBridgeServerProbeClient::new(transport.clone());
     let client = JsonRpcModelBridgeClient::new(transport);
     let catalog = probe.describe_services().ok();
@@ -1014,9 +985,7 @@ fn capture_mcp_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<Bridge
                 check_name: "default_route_contract".to_string(),
                 target: "shadow-mcp-manager".to_string(),
                 ok: false,
-                blocking_reason: Some(
-                    MCP_MANAGER_LIST_SERVERS_FAILED_REASON.to_string(),
-                ),
+                blocking_reason: Some(MCP_MANAGER_LIST_SERVERS_FAILED_REASON.to_string()),
                 response_excerpt: None,
                 error: Some(BridgeProbeErrorDto::from_client_error(error)),
                 model_contract: None,
@@ -1043,9 +1012,8 @@ fn capture_mcp_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<Bridge
 
     if route_status == "ready" || route_status == "fallback-only" {
         match manager.describe_server(McpManagerServerSelectionRequest {
-                server_name: route_target.clone(),
-            })
-        {
+            server_name: route_target.clone(),
+        }) {
             Ok(_) => describe_ok = true,
             Err(client_error) => {
                 describe_error = Some(BridgeProbeErrorDto::from_client_error(client_error));
@@ -1070,15 +1038,10 @@ fn capture_mcp_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<Bridge
                     .get("server_name")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                metadata_matches =
-                    payload
-                        .get("default_route_status")
-                        .and_then(Value::as_str)
-                        == Some(route_status.as_str())
-                        && payload
-                            .get("default_route_target")
-                            .and_then(Value::as_str)
-                            == Some(route_target.as_str());
+                metadata_matches = payload.get("default_route_status").and_then(Value::as_str)
+                    == Some(route_status.as_str())
+                    && payload.get("default_route_target").and_then(Value::as_str)
+                        == Some(route_target.as_str());
             }
             route_matches = resolved_server.as_deref() == Some(route_target.as_str());
         }
@@ -1104,9 +1067,7 @@ fn capture_mcp_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<Bridge
         blocking_reason = Some(MCP_DEFAULT_ROUTE_METADATA_DRIFT_REASON.to_string());
     }
     if blocking_reason.is_none() && !route_matches {
-        blocking_reason = Some(
-            MCP_DEFAULT_ROUTE_RESOLVED_SERVER_MISMATCH_REASON.to_string(),
-        );
+        blocking_reason = Some(MCP_DEFAULT_ROUTE_RESOLVED_SERVER_MISMATCH_REASON.to_string());
     }
 
     let error = if !describe_ok {
@@ -1379,12 +1340,11 @@ fn excerpt(value: &str) -> String {
 mod tests {
     use super::*;
     use magi_bridge_client::{
-        BridgeResponse, BridgeServerServiceDescriptor, McpManagerListServersResponse,
-        BridgeTransportError, BridgeTransportRequest, BridgeTransportResponse,
-        LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD, LOCAL_BRIDGE_HANDSHAKE_METHOD,
-        LOCAL_BRIDGE_HEALTH_METHOD,
+        BridgeResponse, BridgeServerServiceDescriptor, BridgeTransportError,
+        BridgeTransportRequest, BridgeTransportResponse, LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD,
+        LOCAL_BRIDGE_HANDSHAKE_METHOD, LOCAL_BRIDGE_HEALTH_METHOD, McpManagerListServersResponse,
     };
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::{collections::HashMap, sync::Mutex};
 
     #[derive(Clone)]
@@ -1418,12 +1378,11 @@ mod tests {
             request: BridgeTransportRequest,
         ) -> Result<BridgeTransportResponse, BridgeTransportError> {
             let responses = self.responses.lock().expect("responses lock should hold");
-            let outcome = responses
-                .get(&request.method)
-                .cloned()
-                .unwrap_or_else(|| FakeTransportOutcome::Protocol {
+            let outcome = responses.get(&request.method).cloned().unwrap_or_else(|| {
+                FakeTransportOutcome::Protocol {
                     message: format!("unexpected method {}", request.method),
-                });
+                }
+            });
             match outcome {
                 FakeTransportOutcome::Payload(payload) => Ok(BridgeTransportResponse { payload }),
                 FakeTransportOutcome::RemoteBusiness {
@@ -1663,8 +1622,9 @@ mod tests {
             Some(BridgeProbeErrorDto {
                 layer: Some(BridgeErrorLayer::RemoteBusiness),
                 code: Some(-32042),
-                message: "桥接调用失败[RemoteBusiness]: remote business error [-32042]: probe degraded"
-                    .to_string(),
+                message:
+                    "桥接调用失败[RemoteBusiness]: remote business error [-32042]: probe degraded"
+                        .to_string(),
             })
         );
     }
@@ -1684,7 +1644,9 @@ mod tests {
             Arc::new(FakeTransport::new(HashMap::from([
                 (
                     "model.invoke".to_string(),
-                    FakeTransportOutcome::Payload(bridge_response("shadow-model::bridge preflight ping")),
+                    FakeTransportOutcome::Payload(bridge_response(
+                        "shadow-model::bridge preflight ping",
+                    )),
                 ),
                 (
                     LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
@@ -2147,13 +2109,13 @@ mod tests {
             BridgeCutoverBlockingReasonCode::ModelProviderUnavailable
         );
         assert_eq!(
-            snapshot
-                .blocking_issue_counts_by_server_kind
-                .get("model"),
+            snapshot.blocking_issue_counts_by_server_kind.get("model"),
             Some(&2)
         );
         assert!(
-            model.blocking_targets.contains(&"openai-compatible".to_string()),
+            model
+                .blocking_targets
+                .contains(&"openai-compatible".to_string()),
             "degraded provider should remain in blocking targets: {model:?}"
         );
     }
@@ -2825,17 +2787,24 @@ mod tests {
 
         let snapshot = provider.cutover_smoke_snapshot();
         assert!(!snapshot.overall_ok);
-        assert_eq!(snapshot.blocking_check_count, snapshot.blocking_issues.len());
+        assert_eq!(
+            snapshot.blocking_check_count,
+            snapshot.blocking_issues.len()
+        );
         assert_eq!(
             snapshot.blocking_services,
             vec![BridgeServerKind::Host, BridgeServerKind::Mcp]
         );
         assert_eq!(
-            snapshot.blocking_issue_counts_by_reason_code.get("bridge_response_empty_payload"),
+            snapshot
+                .blocking_issue_counts_by_reason_code
+                .get("bridge_response_empty_payload"),
             Some(&1)
         );
         assert_eq!(
-            snapshot.blocking_issue_counts_by_reason_code.get("mcp_manager_list_servers_failed"),
+            snapshot
+                .blocking_issue_counts_by_reason_code
+                .get("mcp_manager_list_servers_failed"),
             Some(&1)
         );
         assert_eq!(

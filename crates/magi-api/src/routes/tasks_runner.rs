@@ -1,7 +1,7 @@
 use axum::{
+    Json, Router,
     extract::{Path, Query, State},
     routing::{get, post},
-    Json, Router,
 };
 use magi_core::SessionId;
 use serde::{Deserialize, Serialize};
@@ -20,9 +20,9 @@ pub fn routes() -> Router<ApiState> {
 }
 
 fn require_runner_manager(state: &ApiState) -> Result<&crate::state::RunnerManager, ApiError> {
-    state
-        .runner_manager()
-        .ok_or_else(|| ApiError::internal_assembly("Runner 未配置", "runner_manager is not configured"))
+    state.runner_manager().ok_or_else(|| {
+        ApiError::internal_assembly("Runner 未配置", "runner_manager is not configured")
+    })
 }
 
 fn parse_session_id(value: Option<&str>) -> Result<SessionId, ApiError> {
@@ -159,9 +159,10 @@ async fn stop_runner(
         Err(RunnerStopError::NotFound) => {
             Err(ApiError::not_found("Runner 不存在", &request.root_task_id))
         }
-        Err(RunnerStopError::NotRunning) => {
-            Err(ApiError::not_found("Runner 未在运行", &request.root_task_id))
-        }
+        Err(RunnerStopError::NotRunning) => Err(ApiError::not_found(
+            "Runner 未在运行",
+            &request.root_task_id,
+        )),
     }
 }
 
@@ -194,7 +195,9 @@ async fn run_cycle(
         .map_err(|err| ApiError::not_found("任务不存在", &err))?;
 
     let (outcome_str, blocked_ids) = match &outcome {
-        magi_orchestrator::task_runner::RunCycleOutcome::Continue => ("continue".to_string(), vec![]),
+        magi_orchestrator::task_runner::RunCycleOutcome::Continue => {
+            ("continue".to_string(), vec![])
+        }
         magi_orchestrator::task_runner::RunCycleOutcome::AllComplete => {
             ("all_complete".to_string(), vec![])
         }

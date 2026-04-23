@@ -1,12 +1,9 @@
 use super::config::DaemonError;
 use magi_event_bus::AuditUsageLedgerSnapshot;
 use magi_knowledge_store::KnowledgeState;
-use magi_session_store::{
-    SessionDurableState, SessionExecutionSidecarStoreState, SessionStore,
-};
-use magi_workspace::{
-    WorkspaceDurableState, WorkspaceRecoverySidecarStoreState, WorkspaceStore,
-};
+use magi_session_store::{SessionDurableState, SessionExecutionSidecarStoreState, SessionStore};
+use magi_worker_runtime::{WorkerRuntime, WorkerRuntimeDurableSnapshot};
+use magi_workspace::{WorkspaceDurableState, WorkspaceRecoverySidecarStoreState, WorkspaceStore};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -24,9 +21,12 @@ impl ShadowStateRepository {
         Self { state_root }
     }
 
-    #[cfg(test)]
+    pub(crate) fn session_durable_state_path(&self) -> PathBuf {
+        self.state_root.join("sessions.json")
+    }
+
     pub(crate) fn load_session_durable_state(&self) -> Result<SessionDurableState, DaemonError> {
-        self.read_json_or_default(self.state_root.join("sessions.json"))
+        self.read_json_or_default(self.session_durable_state_path())
     }
 
     /// 从指定工作区的 .magi/sessions.json 加载会话
@@ -48,31 +48,37 @@ impl ShadowStateRepository {
         &self,
         workspace_roots: &[(String, PathBuf)],
     ) -> Result<SessionDurableState, DaemonError> {
-        let global_path = self.state_root.join("sessions.json");
+        let global_path = self.session_durable_state_path();
 
-        // 迁移：旧全局文件存在时，按 workspace_id 分发到各工作区目录
+        // 迁移：旧全局文件里如果仍携带 workspace 绑定会话，则分发回各工作区；
+        // 未绑定工作区的会话继续保留在全局 sessions.json。
         if global_path.exists() {
-            let legacy: SessionDurableState = self.read_json_or_default(global_path.clone())?;
-            if !legacy.sessions.is_empty() {
-                let default_ws = workspace_roots.first().map(|(id, _)| id.clone());
-                for session in &legacy.sessions {
-                    let ws_id = session.workspace_id.clone()
-                        .or_else(|| default_ws.clone())
-                        .unwrap_or_default();
-                    if let Some((_, root)) = workspace_roots.iter().find(|(id, _)| id == &ws_id) {
-                        let mut ws_state = self.load_workspace_session_state(root)?;
-                        if !ws_state.sessions.iter().any(|s| s.session_id == session.session_id) {
-                            ws_state.sessions.push(session.clone());
-                            self.save_workspace_session_state(root, &ws_state)?;
+            let legacy = self.load_session_durable_state()?;
+            let (global_state, workspace_states) = legacy.partition_by_workspace();
+            for (workspace_id, workspace_state) in workspace_states {
+                if let Some((_, root)) = workspace_roots.iter().find(|(id, _)| id == &workspace_id)
+                {
+                    let mut ws_state = self.load_workspace_session_state(root)?;
+                    if !workspace_state.sessions.is_empty() {
+                        ws_state.sessions.extend(workspace_state.sessions);
+                        ws_state.timeline.extend(workspace_state.timeline);
+                        ws_state.notifications.extend(workspace_state.notifications);
+                        if ws_state.current_session_id.is_none() {
+                            ws_state.current_session_id = workspace_state.current_session_id;
                         }
+                        self.save_workspace_session_state(root, &ws_state)?;
                     }
                 }
+            }
+            if global_state.is_empty() {
                 let _ = fs::remove_file(&global_path);
+            } else {
+                self.save_session_durable_state(&global_state)?;
             }
         }
 
-        // 从各工作区 .magi/sessions.json 合并加载
-        let mut merged = SessionDurableState::default();
+        // 从全局未绑定会话 + 各工作区 .magi/sessions.json 合并加载
+        let mut merged = self.load_session_durable_state()?;
         for (_, root_path) in workspace_roots {
             let ws_state = self.load_workspace_session_state(root_path)?;
             merged.sessions.extend(ws_state.sessions);
@@ -95,12 +101,11 @@ impl ShadowStateRepository {
         self.write_json_atomically(path, state)
     }
 
-    #[cfg(test)]
     pub(crate) fn save_session_durable_state(
         &self,
         state: &SessionDurableState,
     ) -> Result<(), DaemonError> {
-        self.write_json_atomically(self.state_root.join("sessions.json"), state)
+        self.write_json_atomically(self.session_durable_state_path(), state)
     }
 
     pub(crate) fn session_sidecars_path(&self) -> PathBuf {
@@ -110,9 +115,13 @@ impl ShadowStateRepository {
     pub(crate) fn load_session_sidecars(
         &self,
     ) -> Result<SessionExecutionSidecarStoreState, DaemonError> {
-        self.read_json_or_default_with_legacy(
-            self.session_sidecars_path(),
-            Some(self.state_root.join("sessions.json")),
+        let path = self.session_sidecars_path();
+        if path.exists() {
+            return self.read_json_or_default(path);
+        }
+        self.read_json_with_required_field_or_default(
+            self.session_durable_state_path(),
+            "runtime_sidecars",
         )
     }
 
@@ -136,6 +145,23 @@ impl ShadowStateRepository {
         self.write_json_atomically(self.state_root.join("workspaces.json"), state)
     }
 
+    pub(crate) fn worker_runtime_snapshot_path(&self) -> PathBuf {
+        self.state_root.join("worker-runtime.json")
+    }
+
+    pub(crate) fn load_worker_runtime_snapshot(
+        &self,
+    ) -> Result<WorkerRuntimeDurableSnapshot, DaemonError> {
+        self.read_json_or_default(self.worker_runtime_snapshot_path())
+    }
+
+    pub(crate) fn save_worker_runtime_snapshot(
+        &self,
+        snapshot: &WorkerRuntimeDurableSnapshot,
+    ) -> Result<(), DaemonError> {
+        self.write_json_atomically(self.worker_runtime_snapshot_path(), snapshot)
+    }
+
     pub(crate) fn workspace_recovery_sidecars_path(&self) -> PathBuf {
         self.state_root.join("workspace-recovery-sidecars.json")
     }
@@ -143,9 +169,13 @@ impl ShadowStateRepository {
     pub(crate) fn load_workspace_recovery_sidecars(
         &self,
     ) -> Result<WorkspaceRecoverySidecarStoreState, DaemonError> {
-        self.read_json_or_default_with_legacy(
-            self.workspace_recovery_sidecars_path(),
-            Some(self.state_root.join("workspaces.json")),
+        let path = self.workspace_recovery_sidecars_path();
+        if path.exists() {
+            return self.read_json_or_default(path);
+        }
+        self.read_json_with_required_field_or_default(
+            self.state_root.join("workspaces.json"),
+            "recovery_handles",
         )
     }
 
@@ -160,9 +190,7 @@ impl ShadowStateRepository {
         self.state_root.join("audit-usage-ledger.json")
     }
 
-    pub(crate) fn load_audit_usage_ledger(
-        &self,
-    ) -> Result<AuditUsageLedgerSnapshot, DaemonError> {
+    pub(crate) fn load_audit_usage_ledger(&self) -> Result<AuditUsageLedgerSnapshot, DaemonError> {
         self.read_json_or_default(self.audit_usage_ledger_path())
     }
 
@@ -184,18 +212,20 @@ impl ShadowStateRepository {
     fn read_json_or_default_with_legacy<T>(
         &self,
         path: PathBuf,
-        legacy_path: Option<PathBuf>,
+        legacy_required_field: Option<&str>,
     ) -> Result<T, DaemonError>
     where
         T: Default + for<'de> serde::Deserialize<'de>,
     {
-        if !path.exists() {
-            if let Some(legacy_path) = legacy_path && legacy_path.exists() {
-                return self.read_json_value_or_default(legacy_path);
+        match legacy_required_field {
+            Some(field_name) => self.read_json_with_required_field_or_default(path, field_name),
+            None => {
+                if !path.exists() {
+                    return Ok(T::default());
+                }
+                self.read_json_value_or_default(path)
             }
-            return Ok(T::default());
         }
-        self.read_json_value_or_default(path)
     }
 
     fn read_json_value_or_default<T>(&self, path: PathBuf) -> Result<T, DaemonError>
@@ -219,6 +249,38 @@ impl ShadowStateRepository {
         }
     }
 
+    fn read_json_with_required_field_or_default<T>(
+        &self,
+        path: PathBuf,
+        field_name: &str,
+    ) -> Result<T, DaemonError>
+    where
+        T: Default + for<'de> serde::Deserialize<'de>,
+    {
+        if !path.exists() {
+            return Ok(T::default());
+        }
+        let content = fs::read_to_string(&path)?;
+        let value: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(value) => value,
+            Err(error) => {
+                let backup_path = stale_backup_path(&path);
+                warn!(
+                    path = %path.display(),
+                    backup_path = %backup_path.display(),
+                    error = %error,
+                    "影子状态文件与当前 schema 不兼容，已转存并回退到默认状态"
+                );
+                fs::rename(&path, &backup_path)?;
+                return Ok(T::default());
+            }
+        };
+        if value.get(field_name).is_none() {
+            return Ok(T::default());
+        }
+        serde_json::from_value(value).map_err(DaemonError::from)
+    }
+
     fn write_json_atomically<T>(&self, path: PathBuf, value: &T) -> Result<(), DaemonError>
     where
         T: serde::Serialize,
@@ -238,6 +300,7 @@ impl ShadowStateRepository {
 pub(crate) struct RuntimeSidecarFlushReport {
     pub(crate) session_sidecars_flushed: bool,
     pub(crate) workspace_recovery_sidecars_flushed: bool,
+    pub(crate) worker_runtime_snapshot_flushed: bool,
 }
 
 #[derive(Clone)]
@@ -245,6 +308,7 @@ pub(crate) struct ShadowRuntimeSidecarPersistence {
     state_repository: ShadowStateRepository,
     session_store: Arc<SessionStore>,
     workspace_store: Arc<WorkspaceStore>,
+    worker_runtime: WorkerRuntime,
 }
 
 impl ShadowRuntimeSidecarPersistence {
@@ -252,27 +316,39 @@ impl ShadowRuntimeSidecarPersistence {
         state_repository: ShadowStateRepository,
         session_store: Arc<SessionStore>,
         workspace_store: Arc<WorkspaceStore>,
+        worker_runtime: WorkerRuntime,
     ) -> Self {
         Self {
             state_repository,
             session_store,
             workspace_store,
+            worker_runtime,
         }
     }
 
-    pub(crate) fn flush_runtime_sidecars(
-        &self,
-    ) -> Result<RuntimeSidecarFlushReport, DaemonError> {
-        let session_sidecars_flushed = self
-            .session_store
-            .flush_execution_sidecars_with(|state| self.state_repository.save_session_sidecars(state))?;
+    pub(crate) fn worker_runtime_snapshot_dirty(&self) -> bool {
+        self.worker_runtime.durable_snapshot_dirty()
+    }
+
+    pub(crate) fn flush_runtime_sidecars(&self) -> Result<RuntimeSidecarFlushReport, DaemonError> {
+        let worker_runtime_snapshot_flushed =
+            self.worker_runtime
+                .flush_durable_snapshot_with(|snapshot| {
+                    self.state_repository.save_worker_runtime_snapshot(snapshot)
+                })?;
+        let session_sidecars_flushed =
+            self.session_store.flush_execution_sidecars_with(|state| {
+                self.state_repository.save_session_sidecars(state)
+            })?;
         let workspace_recovery_sidecars_flushed =
             self.workspace_store.flush_recovery_sidecars_with(|state| {
-                self.state_repository.save_workspace_recovery_sidecars(state)
+                self.state_repository
+                    .save_workspace_recovery_sidecars(state)
             })?;
         Ok(RuntimeSidecarFlushReport {
             session_sidecars_flushed,
             workspace_recovery_sidecars_flushed,
+            worker_runtime_snapshot_flushed,
         })
     }
 }
@@ -307,7 +383,9 @@ fn stale_backup_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use magi_core::{SessionId, SessionLifecycleStatus, UtcMillis};
-    use magi_session_store::{NotificationRecord, SessionDurableState, SessionRecord, TimelineEntry, TimelineEntryKind};
+    use magi_session_store::{
+        NotificationRecord, SessionDurableState, SessionRecord, TimelineEntry, TimelineEntryKind,
+    };
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -371,5 +449,118 @@ mod tests {
 
         let _ = fs::remove_dir_all(state_root);
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn load_sessions_from_workspaces_preserves_global_unbound_sessions() {
+        let state_root = unique_temp_dir("magi-persistence-global-session");
+        let workspace_root = unique_temp_dir("magi-persistence-global-workspace");
+        let repository = ShadowStateRepository::new(state_root.clone());
+        let now = UtcMillis::now();
+        let global_session_id = SessionId::new("session-global-unbound");
+        let workspace_session_id = SessionId::new("session-workspace-bound");
+
+        repository
+            .save_session_durable_state(&SessionDurableState {
+                current_session_id: Some(global_session_id.clone()),
+                sessions: vec![SessionRecord {
+                    session_id: global_session_id.clone(),
+                    title: "全局会话".to_string(),
+                    status: SessionLifecycleStatus::Active,
+                    created_at: now,
+                    updated_at: now,
+                    message_count: Some(1),
+                    workspace_id: None,
+                }],
+                timeline: vec![TimelineEntry {
+                    entry_id: "timeline-global-session".to_string(),
+                    session_id: global_session_id.clone(),
+                    kind: TimelineEntryKind::UserMessage,
+                    message: "全局未绑定消息".to_string(),
+                    occurred_at: now,
+                }],
+                notifications: vec![],
+            })
+            .expect("global session durable state should save");
+
+        repository
+            .save_workspace_session_state(
+                &workspace_root,
+                &SessionDurableState {
+                    current_session_id: Some(workspace_session_id.clone()),
+                    sessions: vec![SessionRecord {
+                        session_id: workspace_session_id.clone(),
+                        title: "工作区会话".to_string(),
+                        status: SessionLifecycleStatus::Active,
+                        created_at: now,
+                        updated_at: now,
+                        message_count: Some(2),
+                        workspace_id: Some("workspace-bound".to_string()),
+                    }],
+                    timeline: vec![TimelineEntry {
+                        entry_id: "timeline-workspace-session".to_string(),
+                        session_id: workspace_session_id.clone(),
+                        kind: TimelineEntryKind::UserMessage,
+                        message: "工作区绑定消息".to_string(),
+                        occurred_at: now,
+                    }],
+                    notifications: vec![],
+                },
+            )
+            .expect("workspace session durable state should save");
+
+        let merged = repository
+            .load_sessions_from_workspaces(&[(
+                "workspace-bound".to_string(),
+                workspace_root.clone(),
+            )])
+            .expect("session durable states should merge");
+
+        assert_eq!(merged.sessions.len(), 2);
+        assert!(merged.sessions.iter().any(
+            |session| session.session_id == global_session_id && session.workspace_id.is_none()
+        ));
+        assert!(merged.sessions.iter().any(|session| {
+            session.session_id == workspace_session_id
+                && session.workspace_id.as_deref() == Some("workspace-bound")
+        }));
+        assert_eq!(merged.current_session_id, Some(global_session_id));
+        assert_eq!(merged.timeline.len(), 2);
+
+        let _ = fs::remove_dir_all(state_root);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn load_session_sidecars_does_not_treat_current_global_session_file_as_legacy_sidecars() {
+        let state_root = unique_temp_dir("magi-persistence-session-sidecar-legacy-guard");
+        let repository = ShadowStateRepository::new(state_root.clone());
+        let now = UtcMillis::now();
+        let session_id = SessionId::new("session-no-legacy-sidecar");
+
+        repository
+            .save_session_durable_state(&SessionDurableState {
+                current_session_id: Some(session_id.clone()),
+                sessions: vec![SessionRecord {
+                    session_id,
+                    title: "普通会话".to_string(),
+                    status: SessionLifecycleStatus::Active,
+                    created_at: now,
+                    updated_at: now,
+                    message_count: Some(0),
+                    workspace_id: None,
+                }],
+                timeline: vec![],
+                notifications: vec![],
+            })
+            .expect("global session durable state should save");
+
+        let sidecars = repository
+            .load_session_sidecars()
+            .expect("current global session file should not be parsed as legacy sidecars");
+        assert!(sidecars.runtime_sidecars.is_empty());
+        assert!(repository.session_durable_state_path().exists());
+
+        let _ = fs::remove_dir_all(state_root);
     }
 }

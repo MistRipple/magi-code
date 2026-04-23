@@ -1,7 +1,7 @@
 use axum::{
+    Json, Router,
     extract::{Query, State},
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 
@@ -42,9 +42,14 @@ struct WorkspaceSessionDto {
     message_count: usize,
 }
 
-async fn list_workspaces(
-    State(state): State<ApiState>,
-) -> Json<WorkspaceListResponse> {
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceSessionsResponse {
+    session_id: String,
+    sessions: Vec<WorkspaceSessionDto>,
+}
+
+async fn list_workspaces(State(state): State<ApiState>) -> Json<WorkspaceListResponse> {
     let workspaces = state
         .workspace_registry
         .workspaces()
@@ -72,10 +77,8 @@ async fn register_workspace(
     State(state): State<ApiState>,
     Json(request): Json<RegisterWorkspaceRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = magi_core::WorkspaceId::new(format!(
-        "workspace-{}",
-        magi_core::UtcMillis::now().0
-    ));
+    let workspace_id =
+        magi_core::WorkspaceId::new(format!("workspace-{}", magi_core::UtcMillis::now().0));
     let path = magi_core::AbsolutePath::new(&request.path);
     state
         .workspace_registry
@@ -107,9 +110,7 @@ async fn remove_workspace(
     Ok(Json(serde_json::json!({ "removed": true })))
 }
 
-async fn pick_workspace(
-    State(state): State<ApiState>,
-) -> Json<serde_json::Value> {
+async fn pick_workspace(State(state): State<ApiState>) -> Json<serde_json::Value> {
     let workspaces = state.workspace_registry.workspaces();
     let active_id = state.workspace_registry.active_workspace_id();
     Json(serde_json::json!({
@@ -123,43 +124,64 @@ async fn pick_workspace(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct WorkspaceSessionsQuery {
+    #[serde(rename = "workspaceId", alias = "workspace_id")]
     workspace_id: Option<String>,
 }
 
 async fn workspace_sessions(
     State(state): State<ApiState>,
     Query(query): Query<WorkspaceSessionsQuery>,
-) -> Json<serde_json::Value> {
+) -> Json<WorkspaceSessionsResponse> {
     let sessions = state.session_store.sessions();
     let workspace_id = query
         .workspace_id
         .as_deref()
         .map(magi_core::WorkspaceId::new);
     let session_sidecars = state.session_store.execution_sidecar_exports();
-    Json(serde_json::json!({
-        "sessions": sessions.iter().filter(|session| {
-            let Some(ref workspace_id) = workspace_id else {
-                return true;
-            };
-            if session.workspace_id.as_deref() == Some(workspace_id.as_str()) {
-                return true;
-            }
-            session_sidecars
-                .iter()
-                .find(|sidecar| sidecar.session_id == session.session_id)
-                .and_then(|sidecar| sidecar.ownership.workspace_id.as_ref())
-                == Some(workspace_id)
-        }).map(|session| WorkspaceSessionDto {
+    let session_matches_workspace = |session: &magi_session_store::SessionRecord| {
+        let Some(ref workspace_id) = workspace_id else {
+            return true;
+        };
+        if session.workspace_id.as_deref() == Some(workspace_id.as_str()) {
+            return true;
+        }
+        session_sidecars
+            .iter()
+            .find(|sidecar| sidecar.session_id == session.session_id)
+            .and_then(|sidecar| sidecar.ownership.workspace_id.as_ref())
+            == Some(workspace_id)
+    };
+
+    let mut scoped_sessions = sessions
+        .iter()
+        .filter(|session| session_matches_workspace(session))
+        .map(|session| WorkspaceSessionDto {
             session_id: session.session_id.to_string(),
             title: session.title.clone(),
             status: format!("{:?}", session.status),
             created_at: session.created_at.0,
             updated_at: session.updated_at.0,
             message_count: session.message_count.unwrap_or(0),
-        }).collect::<Vec<_>>(),
-    }))
+        })
+        .collect::<Vec<_>>();
+    scoped_sessions.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| right.session_id.cmp(&left.session_id))
+    });
+
+    let current_session_id = scoped_sessions
+        .first()
+        .map(|session| session.session_id.clone())
+        .unwrap_or_default();
+
+    Json(WorkspaceSessionsResponse {
+        session_id: current_session_id,
+        sessions: scoped_sessions,
+    })
 }
 
 #[cfg(test)]
@@ -167,7 +189,7 @@ mod tests {
     use super::*;
     use crate::state::ApiState;
     use axum::{
-        body::{to_bytes, Body},
+        body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
     use magi_core::{AbsolutePath, ExecutionOwnership, SessionId, WorkspaceId};
@@ -175,7 +197,7 @@ mod tests {
     use magi_governance::GovernanceService;
     use magi_session_store::{SessionStore, TimelineEntryKind};
     use magi_workspace::WorkspaceStore;
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
     use tower::ServiceExt;
 
     fn test_state() -> ApiState {
@@ -250,6 +272,7 @@ mod tests {
             .expect("body should read");
         let payload: serde_json::Value =
             serde_json::from_slice(&body).expect("payload should deserialize");
+        assert_eq!(payload["sessionId"], "session-counted");
         let sessions = payload["sessions"]
             .as_array()
             .expect("sessions should be an array");
@@ -298,10 +321,80 @@ mod tests {
             .expect("body should read");
         let payload: serde_json::Value =
             serde_json::from_slice(&body).expect("payload should deserialize");
+        assert_eq!(payload["sessionId"], "session-workspace-bound");
         let sessions = payload["sessions"]
             .as_array()
             .expect("sessions should be an array");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0]["sessionId"], "session-workspace-bound");
+    }
+
+    #[tokio::test]
+    async fn workspace_sessions_returns_current_session_and_sorts_by_updated_at_desc() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-session-order");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-workspace-session-order"),
+            )
+            .expect("workspace should register");
+
+        let older_session_id = SessionId::new("session-older");
+        state
+            .session_store
+            .create_session_for_workspace(
+                older_session_id.clone(),
+                "较早会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("older session should create");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        let newer_session_id = SessionId::new("session-newer");
+        state
+            .session_store
+            .create_session_for_workspace(
+                newer_session_id.clone(),
+                "较新会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("newer session should create");
+        state
+            .session_store
+            .switch_session(&newer_session_id)
+            .expect("current session should switch");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        state.session_store.append_timeline_entry(
+            newer_session_id.clone(),
+            TimelineEntryKind::UserMessage,
+            "刷新较新会话更新时间",
+        );
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/workspaces/sessions?workspaceId=workspace-session-order")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        assert_eq!(payload["sessionId"], "session-newer");
+        let sessions = payload["sessions"]
+            .as_array()
+            .expect("sessions should be an array");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0]["sessionId"], "session-newer");
+        assert_eq!(sessions[1]["sessionId"], "session-older");
     }
 }

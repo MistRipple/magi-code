@@ -1,12 +1,11 @@
 use axum::{
+    Json, Router,
     extract::{Query, State},
     routing::{get, post},
-    Json, Router,
 };
+use magi_core::SessionId;
 use magi_core::UtcMillis;
-use reqwest::header::{
-    ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue,
-};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -19,6 +18,54 @@ fn unwrap_settings_section_request(request: &serde_json::Value) -> serde_json::V
         .or_else(|| request.get("data"))
         .cloned()
         .unwrap_or_else(|| request.clone())
+}
+
+fn strip_scope_binding_fields(mut request: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = request.as_object_mut() {
+        for key in ["workspaceId", "workspace_id", "sessionId", "session_id"] {
+            object.remove(key);
+        }
+    }
+    request
+}
+
+fn scoped_settings_section_request(request: &serde_json::Value) -> serde_json::Value {
+    strip_scope_binding_fields(unwrap_settings_section_request(request))
+}
+
+fn parse_optional_session_id_from_query(query: &HashMap<String, String>) -> Option<SessionId> {
+    query
+        .get("sessionId")
+        .or_else(|| query.get("session_id"))
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(SessionId::new)
+}
+
+fn parse_optional_query_string(
+    query: &HashMap<String, String>,
+    camel_key: &str,
+    snake_key: &str,
+) -> Option<String> {
+    query
+        .get(camel_key)
+        .or_else(|| query.get(snake_key))
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn require_session_id_from_request(request: &serde_json::Value) -> Result<SessionId, ApiError> {
+    let session_id = request
+        .get("sessionId")
+        .or_else(|| request.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("sessionId 不能为空".to_string()))?;
+    Ok(SessionId::new(session_id))
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,7 +93,9 @@ struct ConnectionProbeConfig {
     openai_protocol: String,
 }
 
-fn parse_fetch_models_config(request: FetchModelsRequest) -> Result<(FetchModelsConfig, String), ApiError> {
+fn parse_fetch_models_config(
+    request: FetchModelsRequest,
+) -> Result<(FetchModelsConfig, String), ApiError> {
     let config = request.config;
     let provider = config
         .get("provider")
@@ -81,12 +130,6 @@ fn parse_fetch_models_config(request: FetchModelsRequest) -> Result<(FetchModels
             "完整路径模式下不支持自动获取模型列表，请手动填写模型名".to_string(),
         ));
     }
-    if provider != "openai" {
-        return Err(ApiError::InvalidInput(
-            "该 API 不支持模型列表查询，请手动填写模型名".to_string(),
-        ));
-    }
-
     Ok((
         FetchModelsConfig {
             provider,
@@ -101,7 +144,9 @@ fn parse_fetch_models_config(request: FetchModelsRequest) -> Result<(FetchModels
 fn build_openai_models_url(base_url: &str) -> Result<String, ApiError> {
     let normalized = base_url.trim().trim_end_matches('/');
     if normalized.is_empty() {
-        return Err(ApiError::InvalidInput("模型配置缺少有效的 baseUrl".to_string()));
+        return Err(ApiError::InvalidInput(
+            "模型配置缺少有效的 baseUrl".to_string(),
+        ));
     }
     if !normalized.starts_with("http://") && !normalized.starts_with("https://") {
         return Err(ApiError::InvalidInput(
@@ -218,7 +263,9 @@ fn parse_connection_probe_config(request: Value) -> Result<ConnectionProbeConfig
 fn ensure_http_url(base_url: &str) -> Result<String, ApiError> {
     let normalized = base_url.trim().trim_end_matches('/');
     if normalized.is_empty() {
-        return Err(ApiError::InvalidInput("模型配置缺少有效的 baseUrl".to_string()));
+        return Err(ApiError::InvalidInput(
+            "模型配置缺少有效的 baseUrl".to_string(),
+        ));
     }
     if !normalized.starts_with("http://") && !normalized.starts_with("https://") {
         return Err(ApiError::InvalidInput(
@@ -292,7 +339,10 @@ async fn execute_connection_probe(
             let auth_value = HeaderValue::from_str(&format!("Bearer {}", config.api_key))
                 .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
             headers.insert(AUTHORIZATION, auth_value);
-            (build_openai_probe_url(config)?, build_openai_probe_body(config))
+            (
+                build_openai_probe_url(config)?,
+                build_openai_probe_body(config),
+            )
         }
         "anthropic" => {
             let api_key_name = HeaderName::from_static("x-api-key");
@@ -303,7 +353,10 @@ async fn execute_connection_probe(
                 HeaderName::from_static("anthropic-version"),
                 HeaderValue::from_static("2023-06-01"),
             );
-            (build_anthropic_probe_url(config)?, build_anthropic_probe_body(config))
+            (
+                build_anthropic_probe_url(config)?,
+                build_anthropic_probe_body(config),
+            )
         }
         _ => {
             return Err(ApiError::InvalidInput(format!(
@@ -367,14 +420,23 @@ pub fn routes() -> Router<ApiState> {
         .route("/settings/worker/save", post(save_worker_config))
         .route("/settings/worker/remove", post(remove_worker_config))
         .route("/settings/worker/test", post(test_worker_connection))
-        .route("/settings/orchestrator/save", post(save_orchestrator_config))
-        .route("/settings/orchestrator/test", post(test_orchestrator_connection))
+        .route(
+            "/settings/orchestrator/save",
+            post(save_orchestrator_config),
+        )
+        .route(
+            "/settings/orchestrator/test",
+            post(test_orchestrator_connection),
+        )
         .route("/settings/auxiliary/save", post(save_auxiliary_config))
         .route("/settings/auxiliary/test", post(test_auxiliary_connection))
         .route("/settings/user-rules/save", post(save_user_rules))
         .route("/settings/user-rules/reset", post(reset_user_rules))
         .route("/settings/safeguard/save", post(save_safeguard_config))
-        .route("/settings/registry/role-templates", get(list_role_templates))
+        .route(
+            "/settings/registry/role-templates",
+            get(list_role_templates),
+        )
         .route("/settings/registry/engines", get(list_engines))
         .route("/settings/registry/engines/upsert", post(upsert_engine))
         .route("/settings/registry/engines/remove", post(remove_engine))
@@ -735,13 +797,11 @@ fn normalize_agent_override_entry(
     );
     normalized.insert(
         "engineId".to_string(),
-        Value::String(
-            if model_source == "engine" {
-                raw_engine_id.to_string()
-            } else {
-                String::new()
-            },
-        ),
+        Value::String(if model_source == "engine" {
+            raw_engine_id.to_string()
+        } else {
+            String::new()
+        }),
     );
     normalized.insert("enabled".to_string(), Value::Bool(enabled));
     normalized.insert("bindingRevision".to_string(), Value::from(binding_revision));
@@ -860,9 +920,15 @@ pub(crate) fn resolve_registry_agents(state: &ApiState) -> Vec<Value> {
 pub(crate) fn enabled_registry_agent_roles(state: &ApiState) -> Vec<String> {
     resolve_registry_agents(state)
         .into_iter()
-        .filter(|entry| entry.get("enabled").and_then(Value::as_bool).unwrap_or(true))
+        .filter(|entry| {
+            entry
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        })
         .filter_map(|entry| {
-            entry.get("templateId")
+            entry
+                .get("templateId")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         })
@@ -871,9 +937,10 @@ pub(crate) fn enabled_registry_agent_roles(state: &ApiState) -> Vec<String> {
 
 async fn settings_bootstrap(
     State(state): State<ApiState>,
-    Query(_query): Query<HashMap<String, String>>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    Json(state.settings_snapshot_json())
+    let session_id = parse_optional_session_id_from_query(&query);
+    Json(state.settings_snapshot_json_for_session(session_id.as_ref()))
 }
 
 async fn runtime_status(State(state): State<ApiState>) -> Json<serde_json::Value> {
@@ -894,7 +961,7 @@ async fn update_setting(
     state
         .settings_store
         .set(&request.key, request.value.clone());
-    Ok(Json(state.settings_snapshot_json()))
+    Ok(Json(state.settings_runtime_json()))
 }
 
 async fn save_worker_config(
@@ -922,7 +989,7 @@ async fn save_worker_config(
     } else {
         state
             .settings_store
-            .set_section("workers", unwrap_settings_section_request(&request));
+            .set_section("workers", scoped_settings_section_request(&request));
     }
     Ok(Json(serde_json::json!({ "saved": true })))
 }
@@ -952,7 +1019,7 @@ async fn save_orchestrator_config(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state
         .settings_store
-        .set_section("orchestrator", unwrap_settings_section_request(&request));
+        .set_section("orchestrator", scoped_settings_section_request(&request));
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -969,7 +1036,7 @@ async fn save_auxiliary_config(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state
         .settings_store
-        .set_section("auxiliary", unwrap_settings_section_request(&request));
+        .set_section("auxiliary", scoped_settings_section_request(&request));
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -984,18 +1051,23 @@ async fn save_user_rules(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state
-        .settings_store
-        .set_section("userRules", unwrap_settings_section_request(&request));
+    let session_id = require_session_id_from_request(&request)?;
+    state.settings_store.set_session_section(
+        &session_id,
+        "userRules",
+        scoped_settings_section_request(&request),
+    );
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
 async fn reset_user_rules(
     State(state): State<ApiState>,
+    Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let session_id = require_session_id_from_request(&request)?;
     state
         .settings_store
-        .set_section("userRules", serde_json::json!({}));
+        .set_session_section(&session_id, "userRules", serde_json::json!({}));
     Ok(Json(serde_json::json!({ "reset": true })))
 }
 
@@ -1003,9 +1075,12 @@ async fn save_safeguard_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state
-        .settings_store
-        .set_section("safeguardConfig", unwrap_settings_section_request(&request));
+    let session_id = require_session_id_from_request(&request)?;
+    state.settings_store.set_session_section(
+        &session_id,
+        "safeguardConfig",
+        scoped_settings_section_request(&request),
+    );
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -1233,23 +1308,41 @@ async fn fetch_models(
 
 async fn session_stats(
     State(state): State<ApiState>,
-    Query(_query): Query<std::collections::HashMap<String, String>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
+    let ledger = state.event_bus.runtime_ledger_summary();
+    let workspace_id =
+        parse_optional_query_string(&query, "workspaceId", "workspace_id").unwrap_or_default();
+    let session_id = parse_optional_query_string(&query, "sessionId", "session_id");
     Json(serde_json::json!({
-        "stats": state.event_bus.runtime_ledger_summary()
+        "scope": "session",
+        "workspaceId": workspace_id,
+        "sessionId": session_id,
+        "version": ledger.next_sequence,
+        "lastAppliedLedgerSeq": ledger.next_sequence.saturating_sub(1),
+        "updatedAt": UtcMillis::now().0,
+        "totals": {
+            "llmCallCount": ledger.usage_count,
+            "assignmentCount": 0,
+            "turnCount": ledger.audit_count + ledger.usage_count,
+            "totalTokens": 0,
+            "netInputTokens": 0,
+            "netOutputTokens": 0,
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 0,
+            "successCount": 0,
+            "failureCount": 0,
+        },
+        "items": []
     }))
 }
 
-async fn reset_stats(
-    State(state): State<ApiState>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+async fn reset_stats(State(state): State<ApiState>) -> Result<Json<serde_json::Value>, ApiError> {
     state.event_bus.reset_audit_usage_ledger();
     Ok(Json(serde_json::json!({ "reset": true })))
 }
 
-async fn bridge_cutover_smoke_fallback(
-    State(state): State<ApiState>,
-) -> Json<serde_json::Value> {
+async fn bridge_cutover_smoke_fallback(State(state): State<ApiState>) -> Json<serde_json::Value> {
     Json(serde_json::to_value(state.bridge_cutover_smoke_dto()).unwrap_or_default())
 }
 
@@ -1273,23 +1366,266 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_safeguard_config_persists_canonical_section() {
+    async fn settings_bootstrap_returns_frontend_contract_sections() {
         let state = test_state();
-        let payload = serde_json::json!({
+        let session_id = SessionId::new("session-empty-contract");
+
+        let bootstrap = settings_bootstrap(
+            State(state),
+            Query(HashMap::from([(
+                "sessionId".to_string(),
+                session_id.as_str().to_string(),
+            )])),
+        )
+        .await
+        .0;
+        let object = bootstrap
+            .as_object()
+            .expect("settings bootstrap should be an object");
+
+        for key in [
+            "workerConfigs",
+            "orchestratorConfig",
+            "auxiliaryConfig",
+            "userRulesConfig",
+            "skillsConfig",
+            "safeguardConfig",
+            "workerStatuses",
+            "runtimeSettings",
+        ] {
+            assert!(bootstrap[key].is_object(), "{key} should be an object");
+        }
+        for key in [
+            "repositories",
+            "mcpServers",
+            "roleTemplates",
+            "registryEngines",
+            "registryAgents",
+        ] {
+            assert!(bootstrap[key].is_array(), "{key} should be an array");
+        }
+        assert_eq!(bootstrap["userRulesConfig"], serde_json::json!({}));
+        assert_eq!(
+            bootstrap["runtimeSettings"]["locale"],
+            serde_json::json!("zh-CN")
+        );
+        assert_eq!(
+            bootstrap["runtimeSettings"]["deepTask"],
+            serde_json::json!(false)
+        );
+        assert_eq!(bootstrap["bootstrapScope"], serde_json::json!("full"));
+        assert_eq!(bootstrap["mcpServersHydrated"], serde_json::json!(true));
+        assert!(
+            bootstrap["safeguardConfig"]["rules"]
+                .as_array()
+                .expect("safeguard rules should be an array")
+                .len()
+                > 0
+        );
+        assert!(!object.contains_key("userRules"));
+        assert!(!object.contains_key("engines"));
+        assert!(!object.contains_key("agents"));
+    }
+
+    #[test]
+    fn fetch_models_config_allows_openai_compatible_gateway_provider_labels() {
+        let (config, target) = parse_fetch_models_config(FetchModelsRequest {
+            config: serde_json::json!({
+                "provider": "anthropic",
+                "baseUrl": "http://127.0.0.1:8320/",
+                "apiKey": "test-key",
+                "urlMode": "standard"
+            }),
+            target: "orch".to_string(),
+        })
+        .expect("openai-compatible gateways may keep their provider label");
+
+        assert_eq!(config.provider, "anthropic");
+        assert_eq!(config.base_url, "http://127.0.0.1:8320/");
+        assert_eq!(config.api_key, "test-key");
+        assert_eq!(config.url_mode, "standard");
+        assert_eq!(target, "orch");
+    }
+
+    #[test]
+    fn fetch_models_config_rejects_full_url_mode() {
+        let error = parse_fetch_models_config(FetchModelsRequest {
+            config: serde_json::json!({
+                "provider": "anthropic",
+                "baseUrl": "http://127.0.0.1:8320/v1/chat/completions",
+                "apiKey": "test-key",
+                "urlMode": "full"
+            }),
+            target: "orch".to_string(),
+        })
+        .expect_err("full path mode has no canonical models endpoint");
+
+        match error {
+            ApiError::InvalidInput(message) => {
+                assert!(message.contains("完整路径模式下不支持自动获取模型列表"));
+            }
+            other => panic!("expected invalid input, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_stats_returns_frontend_stats_contract() {
+        let state = test_state();
+        let payload = session_stats(
+            State(state),
+            Query(HashMap::from([
+                ("workspaceId".to_string(), "workspace-stats".to_string()),
+                ("sessionId".to_string(), "session-stats".to_string()),
+            ])),
+        )
+        .await
+        .0;
+
+        assert_eq!(payload["scope"], serde_json::json!("session"));
+        assert_eq!(payload["workspaceId"], serde_json::json!("workspace-stats"));
+        assert_eq!(payload["sessionId"], serde_json::json!("session-stats"));
+        assert!(payload["items"].is_array());
+        assert!(payload["totals"].is_object());
+        assert!(payload["updatedAt"].is_number());
+        assert!(payload["version"].is_number());
+        assert!(payload.get("stats").is_none());
+    }
+
+    #[tokio::test]
+    async fn session_scoped_rules_and_safeguard_are_isolated_in_bootstrap() {
+        let state = test_state();
+        let session_a = SessionId::new("session-a");
+        let session_b = SessionId::new("session-b");
+
+        let user_rules_payload = serde_json::json!({
+            "sessionId": session_a.as_str(),
+            "userRules": "【仅 A 生效】"
+        });
+        let safeguard_payload = serde_json::json!({
+            "sessionId": session_a.as_str(),
             "rules": [
                 {
-                    "pattern": "rm -rf",
+                    "pattern": "custom-danger-a",
                     "enabled": true,
                     "category": "custom"
                 }
             ]
         });
 
-        let result = save_safeguard_config(State(state.clone()), Json(payload.clone()))
+        let saved_rules = save_user_rules(State(state.clone()), Json(user_rules_payload))
+            .await
+            .expect("save user rules should succeed");
+        assert_eq!(saved_rules.0["saved"], serde_json::json!(true));
+
+        let saved_safeguard = save_safeguard_config(State(state.clone()), Json(safeguard_payload))
             .await
             .expect("save safeguard config should succeed");
+        assert_eq!(saved_safeguard.0["saved"], serde_json::json!(true));
 
-        assert_eq!(result.0["saved"], serde_json::json!(true));
-        assert_eq!(state.settings_store.get_section("safeguardConfig"), payload);
+        let bootstrap_a = settings_bootstrap(
+            State(state.clone()),
+            Query(HashMap::from([(
+                "sessionId".to_string(),
+                session_a.as_str().to_string(),
+            )])),
+        )
+        .await
+        .0;
+        let bootstrap_b = settings_bootstrap(
+            State(state.clone()),
+            Query(HashMap::from([(
+                "sessionId".to_string(),
+                session_b.as_str().to_string(),
+            )])),
+        )
+        .await
+        .0;
+
+        assert_eq!(
+            bootstrap_a["userRulesConfig"]["userRules"],
+            serde_json::json!("【仅 A 生效】")
+        );
+        assert_eq!(
+            bootstrap_a["safeguardConfig"]["rules"][0]["pattern"],
+            serde_json::json!("git push --force")
+        );
+        assert!(
+            bootstrap_a["safeguardConfig"]["rules"]
+                .as_array()
+                .expect("rules should be array")
+                .iter()
+                .any(|rule| rule["pattern"] == serde_json::json!("custom-danger-a"))
+        );
+        assert_eq!(bootstrap_b["userRulesConfig"], serde_json::json!({}));
+        assert_eq!(
+            bootstrap_b["safeguardConfig"]["rules"][0]["pattern"],
+            serde_json::json!("git push --force")
+        );
+        assert!(
+            !bootstrap_b["safeguardConfig"]["rules"]
+                .as_array()
+                .expect("rules should be array")
+                .iter()
+                .any(|rule| rule["pattern"] == serde_json::json!("custom-danger-a"))
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_user_rules_only_resets_target_session() {
+        let state = test_state();
+        let session_a = SessionId::new("session-a");
+        let session_b = SessionId::new("session-b");
+
+        let _ = save_user_rules(
+            State(state.clone()),
+            Json(serde_json::json!({
+                "sessionId": session_a.as_str(),
+                "userRules": "A"
+            })),
+        )
+        .await
+        .expect("save user rules for session a should succeed");
+        let _ = save_user_rules(
+            State(state.clone()),
+            Json(serde_json::json!({
+                "sessionId": session_b.as_str(),
+                "userRules": "B"
+            })),
+        )
+        .await
+        .expect("save user rules for session b should succeed");
+
+        let reset = reset_user_rules(
+            State(state.clone()),
+            Json(serde_json::json!({ "sessionId": session_a.as_str() })),
+        )
+        .await
+        .expect("reset user rules should succeed");
+        assert_eq!(reset.0["reset"], serde_json::json!(true));
+
+        let bootstrap_a = settings_bootstrap(
+            State(state.clone()),
+            Query(HashMap::from([(
+                "sessionId".to_string(),
+                session_a.as_str().to_string(),
+            )])),
+        )
+        .await
+        .0;
+        let bootstrap_b = settings_bootstrap(
+            State(state),
+            Query(HashMap::from([(
+                "sessionId".to_string(),
+                session_b.as_str().to_string(),
+            )])),
+        )
+        .await
+        .0;
+
+        assert_eq!(bootstrap_a["userRulesConfig"], serde_json::json!({}));
+        assert_eq!(
+            bootstrap_b["userRulesConfig"]["userRules"],
+            serde_json::json!("B")
+        );
     }
 }

@@ -53,12 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime_state_manager.write_runtime_state(pid, Some(&host), port);
     runtime_state_manager.write_pid(pid);
 
-    let config = DaemonConfig::new(
-        host,
-        port,
-        service_name,
-        state_root,
-    );
+    let config = DaemonConfig::new(host, port, service_name, state_root);
     let daemon = Daemon::new(config);
     let result = daemon.run().await;
 

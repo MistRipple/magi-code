@@ -1,17 +1,10 @@
-use axum::{
-    extract::State,
-    routing::post,
-    Json, Router,
-};
+use axum::{Json, Router, extract::State, routing::post};
 use magi_core::{EventId, SessionId, TaskId, TaskStatus, UtcMillis};
 use magi_event_bus::EventEnvelope;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{
-    errors::ApiError,
-    state::ApiState,
-};
+use crate::{errors::ApiError, state::ApiState};
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -24,7 +17,10 @@ pub fn routes() -> Router<ApiState> {
         .route("/task/queued/delete", post(delete_queued_task))
         .route("/interaction/confirm-recovery", post(confirm_recovery))
         .route("/interaction/response", post(interaction_response))
-        .route("/interaction/clarification", post(interaction_clarification))
+        .route(
+            "/interaction/clarification",
+            post(interaction_clarification),
+        )
         .route("/interaction/worker-question", post(worker_question))
         .route("/chain/abandon", post(abandon_chain))
 }
@@ -128,7 +124,8 @@ async fn start_task(
     let now = UtcMillis::now();
     let event_id = EventId::new(format!("event-task-start-{}", now.0));
     let task_id = request.task_id;
-    let (_session_id, task) = require_session_owned_task(&state, request.session_id.as_deref(), &task_id)?;
+    let (_session_id, task) =
+        require_session_owned_task(&state, request.session_id.as_deref(), &task_id)?;
     let store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("start task", "task_store 未配置"))?;
@@ -143,9 +140,9 @@ async fn start_task(
     let manager = state
         .runner_manager()
         .ok_or_else(|| ApiError::internal_assembly("start task", "runner_manager 未配置"))?;
-    manager
-        .start(&task_id)
-        .map_err(|error| ApiError::internal_assembly("启动任务 Runner 失败", format!("{error:?}")))?;
+    manager.start(&task_id).map_err(|error| {
+        ApiError::internal_assembly("启动任务 Runner 失败", format!("{error:?}"))
+    })?;
 
     let event = EventEnvelope::domain(
         event_id.clone(),
@@ -181,7 +178,8 @@ async fn delete_task(
     let store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("delete task", "task_store 未配置"))?;
-    let (_session_id, task) = require_session_owned_task(&state, request.session_id.as_deref(), &task_id)?;
+    let (_session_id, task) =
+        require_session_owned_task(&state, request.session_id.as_deref(), &task_id)?;
     let tid = task.task_id.clone();
     store
         .update_status(&tid, TaskStatus::Cancelled)
@@ -227,7 +225,8 @@ async fn interrupt_task(
     let store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("interrupt task", "task_store 未配置"))?;
-    let (_session_id, task) = require_session_owned_task(&state, request.session_id.as_deref(), task_id)?;
+    let (session_id, task) =
+        require_session_owned_task(&state, request.session_id.as_deref(), task_id)?;
     let root_task_id = task.root_task_id.clone();
     let manager = state
         .runner_manager()
@@ -240,6 +239,9 @@ async fn interrupt_task(
             store.revoke_lease(&subtree_task_id, &lease.lease_id);
         }
     }
+    let _ = state
+        .session_store
+        .update_current_turn_status(&session_id, "blocked");
 
     let event = EventEnvelope::domain(
         event_id.clone(),

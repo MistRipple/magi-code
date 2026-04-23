@@ -1,7 +1,7 @@
 use axum::{
+    Json, Router,
     extract::{Path, Query, State},
     routing::{get, post},
-    Json, Router,
 };
 use magi_core::{MissionId, SessionId, TaskId, TaskKind, TaskStatus, UtcMillis};
 use serde::Deserialize;
@@ -22,10 +22,12 @@ pub fn routes() -> Router<ApiState> {
         .route("/tasks/{task_id}/decision", post(resolve_decision))
 }
 
-fn require_task_store(state: &ApiState) -> Result<&magi_orchestrator::task_store::TaskStore, ApiError> {
-    state
-        .task_store()
-        .ok_or_else(|| ApiError::internal_assembly("任务存储未配置", "task_store is not configured"))
+fn require_task_store(
+    state: &ApiState,
+) -> Result<&magi_orchestrator::task_store::TaskStore, ApiError> {
+    state.task_store().ok_or_else(|| {
+        ApiError::internal_assembly("任务存储未配置", "task_store is not configured")
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,7 +142,11 @@ async fn create_task(
         title: request.title,
         goal: request.goal,
         status: request.status,
-        dependency_ids: request.dependency_ids.iter().map(|s| TaskId::new(s)).collect(),
+        dependency_ids: request
+            .dependency_ids
+            .iter()
+            .map(|s| TaskId::new(s))
+            .collect(),
         required_children: Vec::new(),
         policy_snapshot: None,
         executor_binding: None,
@@ -194,10 +200,7 @@ async fn get_task_lease(
     let store = require_task_store(&state)?;
     let id = TaskId::new(&task_id);
     require_session_task(&state, query.session_id.as_deref(), &id)?;
-    let lease = store
-        .get_active_lease(&id)
-        .ok_or_else(|| ApiError::not_found("活跃租约不存在", &task_id))?;
-    let value = serde_json::to_value(&lease)
+    let value = serde_json::to_value(store.get_active_lease(&id))
         .map_err(|err| ApiError::internal_assembly("序列化租约失败", err))?;
     Ok(Json(value))
 }
@@ -379,10 +382,7 @@ async fn resolve_decision(
         vec![format!("decision_chosen:{}", request.chosen_option)],
     );
     if let Some(ref ev) = request.evidence {
-        store.set_evidence_refs(
-            &id,
-            vec![serde_json::to_string(ev).unwrap_or_default()],
-        );
+        store.set_evidence_refs(&id, vec![serde_json::to_string(ev).unwrap_or_default()]);
     }
     store
         .update_status(&id, TaskStatus::Completed)

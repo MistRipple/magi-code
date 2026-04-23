@@ -1,14 +1,15 @@
 use crate::{
     errors::ApiError,
     shadow_execution::run_shadow_dispatch_submission,
-    state::{ApiState, ShadowExecutionPipeline},
-};
-use magi_context_runtime::{
-    ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
+    state::{ApiState, ShadowExecutionPipeline, build_mcp_config_from_entry},
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolCall, ChatToolDefinition, ChatToolFunctionDefinition,
-    HttpModelBridgeClient, ModelBridgeClient, ModelInvocationRequest, SHADOW_MODEL_PROVIDER,
+    HttpModelBridgeClient, McpBridgeClient, McpToolCallRequest, McpToolInfo, ModelBridgeClient,
+    ModelInvocationRequest, ModelStreamEvent, SHADOW_MODEL_PROVIDER, StdioMcpBridgeClient,
+};
+use magi_context_runtime::{
+    ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
 };
 use magi_core::{
     ApprovalRequirement, EventId, ExecutionOwnership, LeaseId, RecoveryResumeInput, RiskLevel,
@@ -21,17 +22,27 @@ use magi_orchestrator::{
     ExecutionContextSummary, ExecutionWritebackPlans,
     task_runner::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult, WorkerInfo},
 };
-use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain, SessionStore};
-use magi_tool_runtime::{BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry};
+use magi_session_store::{
+    ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionTurnItem, SessionStore,
+};
+use magi_tool_runtime::{
+    BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
+};
+use magi_worker_runtime::WorkerStage;
 use magi_workspace::RecoveryStatus;
+use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub enum ShadowTaskExecutionPlan {
     Dispatch {
         target: TaskExecutionTarget,
         worker_id: WorkerId,
+        lane_id: Option<String>,
+        lane_seq: Option<usize>,
+        is_primary: bool,
         session_id: SessionId,
         workspace_id: Option<WorkspaceId>,
         ownership: ExecutionOwnership,
@@ -76,6 +87,7 @@ pub struct SessionContinueAccepted {
     pub session_id: SessionId,
     pub mission_id: magi_core::MissionId,
     pub root_task_id: TaskId,
+    pub action_task_id: TaskId,
     pub execution_chain_ref: String,
     pub resumed_branch_count: usize,
     pub runner_started: bool,
@@ -88,6 +100,17 @@ pub struct ShadowTaskExecutionRegistry {
 
 fn task_status_is_terminal(status: &TaskStatus) -> bool {
     matches!(status, TaskStatus::Completed | TaskStatus::Cancelled)
+}
+
+fn task_status_is_continue_recoverable(status: &TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Blocked
+            | TaskStatus::Ready
+            | TaskStatus::Running
+            | TaskStatus::Verifying
+            | TaskStatus::Repairing
+    )
 }
 
 fn rebuild_dispatch_plan_for_branch(
@@ -126,6 +149,19 @@ fn rebuild_dispatch_plan_for_branch(
             execution_chain_ref: Some(chain.execution_chain_ref.clone()),
         },
         worker_id: branch.worker_id.clone(),
+        lane_id: chain.current_turn.as_ref().and_then(|turn| {
+            turn.worker_lanes
+                .iter()
+                .find(|lane| lane.task_id == branch.task_id)
+                .map(|lane| lane.lane_id.clone())
+        }),
+        lane_seq: chain.current_turn.as_ref().and_then(|turn| {
+            turn.worker_lanes
+                .iter()
+                .find(|lane| lane.task_id == branch.task_id)
+                .map(|lane| lane.lane_seq)
+        }),
+        is_primary: branch.is_primary,
         session_id: chain.session_id.clone(),
         workspace_id: chain.workspace_id.clone(),
         ownership,
@@ -135,89 +171,95 @@ fn rebuild_dispatch_plan_for_branch(
     }
 }
 
-fn validate_recovery_status(state: &ApiState, recovery_id: &str) -> Result<(), ApiError> {
+fn validate_continue_checkpoint_ready(
+    state: &ApiState,
+    checkpoint_id: &str,
+) -> Result<(), ApiError> {
     let export = state
         .workspace_registry
-        .recovery_sidecar_export(recovery_id)
-        .ok_or_else(|| ApiError::recovery_not_found(recovery_id))?;
+        .recovery_sidecar_export(checkpoint_id)
+        .ok_or_else(|| ApiError::recovery_not_found(checkpoint_id))?;
     match export.current_status {
         RecoveryStatus::Ready => Ok(()),
         RecoveryStatus::Prepared => Err(ApiError::InvalidInput(format!(
-            "恢复入口 {} 当前状态为 prepared，必须先进入 ready 才能继续会话",
-            recovery_id
+            "继续检查点 {} 当前状态为 prepared，必须先进入 ready 才能继续会话",
+            checkpoint_id
         ))),
         RecoveryStatus::Consumed => Err(ApiError::InvalidInput(format!(
-            "恢复入口 {} 已被消费，不能再次继续会话",
-            recovery_id
+            "继续检查点 {} 已被消费，不能再次继续会话",
+            checkpoint_id
         ))),
     }
 }
 
-fn map_recovery_input_error(recovery_id: &str, error: magi_core::DomainError) -> ApiError {
+fn map_continue_checkpoint_input_error(
+    checkpoint_id: &str,
+    error: magi_core::DomainError,
+) -> ApiError {
     match error {
-        magi_core::DomainError::NotFound { .. } => ApiError::recovery_not_found(recovery_id),
+        magi_core::DomainError::NotFound { .. } => ApiError::recovery_not_found(checkpoint_id),
         magi_core::DomainError::InvalidState { message }
         | magi_core::DomainError::Validation { message } => ApiError::InvalidInput(message),
         magi_core::DomainError::AlreadyExists { entity } => ApiError::internal_assembly(
             "继续会话失败",
-            format!("recovery 输入构建遇到重复实体: {entity}"),
+            format!("继续检查点输入构建遇到重复实体: {entity}"),
         ),
     }
 }
 
-fn validate_recovery_input_matches_chain(
+fn validate_continue_checkpoint_matches_chain(
     chain: &ActiveExecutionChain,
     input: &RecoveryResumeInput,
 ) -> Result<(), ApiError> {
     if input.ownership.session_id.as_ref() != Some(&chain.session_id) {
         return Err(ApiError::InvalidInput(format!(
-            "恢复入口 {} 不属于当前会话 {}",
+            "继续检查点 {} 不属于当前会话 {}",
             input.recovery_id, chain.session_id
         )));
     }
     if input.ownership.mission_id.as_ref() != Some(&chain.mission_id) {
         return Err(ApiError::InvalidInput(format!(
-            "恢复入口 {} 不属于当前执行链 mission {}",
+            "继续检查点 {} 不属于当前执行链 mission {}",
             input.recovery_id, chain.mission_id
         )));
     }
     if input.ownership.workspace_id != chain.workspace_id {
         return Err(ApiError::InvalidInput(format!(
-            "恢复入口 {} 的工作区与当前执行链不一致",
+            "继续检查点 {} 的工作区与当前执行链不一致",
             input.recovery_id
         )));
     }
     if input.ownership.execution_chain_ref.as_deref() != Some(chain.execution_chain_ref.as_str()) {
         return Err(ApiError::InvalidInput(format!(
-            "恢复入口 {} 的 execution_chain_ref 与当前执行链不一致",
+            "继续检查点 {} 的 execution_chain_ref 与当前执行链不一致",
             input.recovery_id
         )));
     }
     Ok(())
 }
 
-fn apply_chain_recovery_if_needed(
+fn consume_continue_checkpoint_if_needed(
     state: &ApiState,
     session_id: &SessionId,
     chain: &mut ActiveExecutionChain,
     primary_branch: &ActiveExecutionBranch,
 ) -> Result<(), ApiError> {
-    let Some(recovery_id) = chain.recovery_ref.clone() else {
+    let Some(checkpoint_id) = chain.recovery_ref.clone() else {
         return Ok(());
     };
-    validate_recovery_status(state, &recovery_id)?;
+    validate_continue_checkpoint_ready(state, &checkpoint_id)?;
     let input = state
         .workspace_registry
-        .build_recovery_resume_input(&recovery_id)
-        .map_err(|error| map_recovery_input_error(&recovery_id, error))?;
-    validate_recovery_input_matches_chain(chain, &input)?;
+        .build_recovery_resume_input(&checkpoint_id)
+        .map_err(|error| map_continue_checkpoint_input_error(&checkpoint_id, error))?;
+    validate_continue_checkpoint_matches_chain(chain, &input)?;
 
     state
         .session_store
         .apply_recovery_resume_input(session_id.clone(), input.clone())
         .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?;
 
-    let writebacks = ExecutionWritebackPlans::from_recovery_resume_input(&input);
+    let writebacks = ExecutionWritebackPlans::from_continue_checkpoint_input(&input);
     if !writebacks.is_empty() {
         let pipeline = state.shadow_execution_pipeline().ok_or_else(|| {
             ApiError::internal_assembly("继续会话失败", "shadow execution pipeline 未配置")
@@ -260,9 +302,9 @@ pub fn continue_shadow_execution_chain(
         .session_store
         .runtime_sidecar(session_id)
         .ok_or_else(|| ApiError::InvalidInput("当前会话没有可继续的执行链".to_string()))?;
-    let mut chain = sidecar.active_execution_chain.ok_or_else(|| {
-        ApiError::InvalidInput("当前会话没有可继续的执行链".to_string())
-    })?;
+    let mut chain = sidecar
+        .active_execution_chain
+        .ok_or_else(|| ApiError::InvalidInput("当前会话没有可继续的执行链".to_string()))?;
     if &chain.session_id != session_id {
         return Err(ApiError::internal_assembly(
             "继续会话失败",
@@ -308,14 +350,16 @@ pub fn continue_shadow_execution_chain(
             if task.mission_id != chain.mission_id || task.root_task_id != chain.root_task_id {
                 return None;
             }
-            if task_status_is_terminal(&task.status) {
+            if !task_status_is_continue_recoverable(&task.status) {
                 return None;
             }
             Some(branch.clone())
         })
         .collect::<Vec<_>>();
     if resumable_branches.is_empty() {
-        return Err(ApiError::InvalidInput("当前会话没有可继续的 branch".to_string()));
+        return Err(ApiError::InvalidInput(
+            "当前会话没有可继续的 branch".to_string(),
+        ));
     }
 
     let primary_branch = resumable_branches
@@ -323,7 +367,7 @@ pub fn continue_shadow_execution_chain(
         .find(|branch| branch.is_primary)
         .or_else(|| resumable_branches.first())
         .expect("resumable_branches checked as non-empty");
-    apply_chain_recovery_if_needed(state, session_id, &mut chain, primary_branch)?;
+    consume_continue_checkpoint_if_needed(state, session_id, &mut chain, primary_branch)?;
 
     let mut root_status = root_task.status;
     if matches!(root_status, TaskStatus::Completed) {
@@ -332,7 +376,9 @@ pub fn continue_shadow_execution_chain(
             .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?;
         root_status = TaskStatus::Blocked;
     } else if task_status_is_terminal(&root_status) {
-        return Err(ApiError::InvalidInput("当前会话执行链已结束，不能继续".to_string()));
+        return Err(ApiError::InvalidInput(
+            "当前会话执行链已结束，不能继续".to_string(),
+        ));
     }
 
     for branch in &resumable_branches {
@@ -375,7 +421,10 @@ pub fn continue_shadow_execution_chain(
         Ok(_handle) => true,
         Err(crate::state::RunnerStartError::AlreadyRunning) => false,
         Err(crate::state::RunnerStartError::NotFound) => {
-            return Err(ApiError::not_found("根任务不存在", chain.root_task_id.as_str()));
+            return Err(ApiError::not_found(
+                "根任务不存在",
+                chain.root_task_id.as_str(),
+            ));
         }
     };
 
@@ -383,6 +432,7 @@ pub fn continue_shadow_execution_chain(
         session_id: session_id.clone(),
         mission_id: chain.mission_id,
         root_task_id: chain.root_task_id,
+        action_task_id: primary_branch.task_id.clone(),
         execution_chain_ref: chain.execution_chain_ref,
         resumed_branch_count: resumable_branches.len(),
         runner_started,
@@ -419,6 +469,68 @@ pub struct ShadowTaskDispatcher {
 }
 
 const MAX_TOOL_CALL_ROUNDS: usize = 8;
+const MCP_TOOL_NAME_PREFIX: &str = "mcp__";
+
+fn resolve_session_user_rules_prompt(
+    store: Option<&crate::settings_store::SettingsStore>,
+    session_id: &SessionId,
+) -> Option<String> {
+    let raw = store?.get_session_section(session_id, "userRules");
+    match raw {
+        serde_json::Value::String(value) => {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        serde_json::Value::Object(map) => {
+            let candidate = map
+                .get("userRules")
+                .and_then(|value| value.as_str())
+                .or_else(|| map.get("content").and_then(|value| value.as_str()))
+                .or_else(|| map.get("prompt").and_then(|value| value.as_str()))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            (!candidate.is_empty()).then_some(candidate)
+        }
+        _ => None,
+    }
+}
+
+fn resolve_session_safeguard_prompt(
+    store: Option<&crate::settings_store::SettingsStore>,
+    session_id: &SessionId,
+) -> Option<String> {
+    let raw = crate::state::normalize_safeguard_config_value(
+        store?.get_session_section(session_id, "safeguardConfig"),
+    );
+    let rules = raw
+        .get("rules")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let patterns = rules
+        .iter()
+        .filter(|rule| {
+            rule.get("enabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true)
+        })
+        .filter_map(|rule| rule.get("pattern").and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .collect::<Vec<_>>();
+    if patterns.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "执行 shell / git / 文件写操作前，如果命中以下危险模式，必须先向用户确认，不得直接执行：\n{}",
+        patterns
+            .iter()
+            .map(|pattern| format!("- {}", pattern))
+            .collect::<Vec<_>>()
+            .join("\n")
+    ))
+}
 
 impl ShadowTaskDispatcher {
     pub fn new(
@@ -467,6 +579,75 @@ impl ShadowTaskDispatcher {
         self
     }
 
+    fn append_turn_item(&self, session_id: &SessionId, item: ActiveExecutionTurnItem) {
+        if let Err(error) = self
+            .session_store
+            .append_current_turn_item(session_id, item)
+        {
+            tracing::warn!(session_id = %session_id, ?error, "写入当前 turn item 失败");
+        }
+    }
+
+    fn upsert_turn_item(&self, session_id: &SessionId, item: ActiveExecutionTurnItem) {
+        if let Err(error) = self
+            .session_store
+            .upsert_current_turn_item(session_id, item)
+        {
+            tracing::warn!(session_id = %session_id, ?error, "更新当前 turn item 失败");
+        }
+    }
+
+    fn update_turn_status(&self, session_id: &SessionId, status: &str) {
+        if let Err(error) = self
+            .session_store
+            .update_current_turn_status(session_id, status)
+        {
+            tracing::warn!(session_id = %session_id, ?error, "更新当前 turn 状态失败");
+        }
+    }
+
+    fn build_turn_item(
+        &self,
+        kind: &str,
+        status: &str,
+        source: &str,
+        title: Option<String>,
+        content: Option<String>,
+        task_id: Option<&TaskId>,
+        worker_id: Option<&WorkerId>,
+        lane_id: Option<&str>,
+        lane_seq: Option<usize>,
+        thread_visible: bool,
+        worker_visible: bool,
+    ) -> ActiveExecutionTurnItem {
+        let role_id = task_id
+            .and_then(|id| self.pipeline.execution_runtime.task_store().get_task(id))
+            .and_then(|task| task.executor_binding.map(|binding| binding.target_role))
+            .map(|role| role.trim().to_string())
+            .filter(|role| !role.is_empty());
+        ActiveExecutionTurnItem {
+            item_id: format!("turn-item-{}-{}", kind, UtcMillis::now().0),
+            item_seq: 0,
+            lane_id: lane_id.map(str::to_string),
+            lane_seq,
+            kind: kind.to_string(),
+            status: status.to_string(),
+            source: source.to_string(),
+            title,
+            content,
+            task_id: task_id.cloned(),
+            worker_id: worker_id.cloned(),
+            role_id,
+            tool_call_id: None,
+            tool_name: None,
+            tool_status: None,
+            tool_result: None,
+            tool_error: None,
+            thread_visible,
+            worker_visible,
+        }
+    }
+
     fn publish_task_dispatched_event(
         &self,
         task_id: &TaskId,
@@ -501,6 +682,96 @@ impl ShadowTaskDispatcher {
         let _ = self.event_bus.publish(event);
     }
 
+    fn publish_llm_delta_event(
+        &self,
+        task: &magi_core::Task,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+        round: usize,
+        item_id: &str,
+        content_len: usize,
+    ) {
+        let _ = self.event_bus.publish(
+            EventEnvelope::domain(
+                EventId::new(format!("event-task-llm-delta-{}", UtcMillis::now().0)),
+                "task.llm.delta",
+                serde_json::json!({
+                    "task_id": task.task_id.to_string(),
+                    "mission_id": task.mission_id.to_string(),
+                    "session_id": session_id.to_string(),
+                    "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+                    "round": round,
+                    "item_id": item_id,
+                    "content_length": content_len,
+                }),
+            )
+            .with_context(EventContext {
+                workspace_id: workspace_id.clone(),
+                session_id: Some(session_id.clone()),
+                mission_id: Some(task.mission_id.clone()),
+                task_id: Some(task.task_id.clone()),
+                ..EventContext::default()
+            }),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sync_stream_turn_item(
+        &self,
+        task: &magi_core::Task,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+        round: usize,
+        stream_item_id: &str,
+        stream_item_kind: &str,
+        stream_item_title: Option<String>,
+        worker_id: &WorkerId,
+        lane_id: Option<&str>,
+        lane_seq: Option<usize>,
+        is_primary: bool,
+        streamed_content: &str,
+        status: &str,
+        thread_visible: bool,
+        last_persisted_content: &mut String,
+        stream_item_created: &mut bool,
+        force_publish: bool,
+    ) {
+        if streamed_content.is_empty() {
+            return;
+        }
+        let mut item = self.build_turn_item(
+            stream_item_kind,
+            status,
+            if is_primary {
+                "orchestrator"
+            } else {
+                worker_id.as_str()
+            },
+            stream_item_title,
+            Some(streamed_content.to_string()),
+            Some(&task.task_id),
+            Some(worker_id),
+            lane_id,
+            lane_seq,
+            thread_visible,
+            !is_primary,
+        );
+        item.item_id = stream_item_id.to_string();
+        self.upsert_turn_item(session_id, item);
+        if force_publish || streamed_content != last_persisted_content.as_str() {
+            self.publish_llm_delta_event(
+                task,
+                session_id,
+                workspace_id,
+                round,
+                stream_item_id,
+                streamed_content.chars().count(),
+            );
+            *last_persisted_content = streamed_content.to_string();
+        }
+        *stream_item_created = true;
+    }
+
     fn push_result(&self, task_id: &TaskId, lease_id: &LeaseId, outcome: TaskOutcome) {
         self.result_receiver.push_result(TaskResult {
             task_id: task_id.clone(),
@@ -509,11 +780,36 @@ impl ShadowTaskDispatcher {
         });
     }
 
+    fn dispatch_result_still_authoritative(
+        &self,
+        task: &magi_core::Task,
+        lease_id: &LeaseId,
+    ) -> bool {
+        let task_store = self.pipeline.execution_runtime.task_store();
+        let current_task = task_store.get_task(&task.task_id);
+        let current_root = task_store.get_task(&task.root_task_id);
+        let blocked_or_cancelled = current_task.as_ref().is_some_and(|entry| {
+            matches!(entry.status, TaskStatus::Blocked | TaskStatus::Cancelled)
+        }) || current_root.as_ref().is_some_and(|entry| {
+            matches!(entry.status, TaskStatus::Blocked | TaskStatus::Cancelled)
+        });
+        if blocked_or_cancelled {
+            return false;
+        }
+
+        task_store
+            .get_active_lease(&task.task_id)
+            .is_some_and(|lease| lease.lease_id == *lease_id)
+    }
+
     fn execute_dispatch_plan(
         &self,
         task: &magi_core::Task,
         task_id: &TaskId,
         lease_id: &LeaseId,
+        lane_id: Option<String>,
+        lane_seq: Option<usize>,
+        is_primary: bool,
         session_id: SessionId,
         workspace_id: Option<WorkspaceId>,
         ownership: ExecutionOwnership,
@@ -521,8 +817,243 @@ impl ShadowTaskDispatcher {
         use_tools: bool,
         skill_name: Option<String>,
     ) {
-        let (outcome, context_summary) =
-            self.invoke_llm_with_tools(task, &session_id, &workspace_id, use_tools, skill_name);
+        let worker_id = ownership
+            .worker_id
+            .clone()
+            .unwrap_or_else(|| WorkerId::new(format!("worker-{}", task.task_id)));
+        let target = TaskExecutionTarget {
+            mission_id: task.mission_id.clone(),
+            root_task_id: task.root_task_id.clone(),
+            task_id: task.task_id.clone(),
+            requested_worker_id: Some(worker_id.clone()),
+            recovery_id: None,
+            execution_chain_ref: ownership.execution_chain_ref.clone(),
+        };
+        let worker_runtime = self.pipeline.execution_runtime.worker_runtime();
+        self.update_turn_status(&session_id, "running");
+        if is_primary {
+            self.append_turn_item(
+                &session_id,
+                self.build_turn_item(
+                    "assistant_phase",
+                    "running",
+                    "orchestrator",
+                    Some("开始执行".to_string()),
+                    Some(format!("正在执行主线任务：{}", task.title)),
+                    Some(task_id),
+                    Some(&worker_id),
+                    lane_id.as_deref(),
+                    lane_seq,
+                    true,
+                    false,
+                ),
+            );
+        } else {
+            self.append_turn_item(
+                &session_id,
+                self.build_turn_item(
+                    "worker_phase",
+                    "running",
+                    worker_id.as_str(),
+                    Some(task.title.clone()),
+                    Some(format!("开始执行分支：{}", task.title)),
+                    Some(task_id),
+                    Some(&worker_id),
+                    lane_id.as_deref(),
+                    lane_seq,
+                    false,
+                    true,
+                ),
+            );
+        }
+        if let Some(intent) = self.pipeline.execution_runtime.build_execution_intent(
+            &target,
+            worker_id.clone(),
+            Some(session_id.clone()),
+            workspace_id.clone(),
+            None,
+        ) {
+            let binding_lifecycle = Some(intent.execution_profile.binding_lifecycle);
+            let execution_intent_ref = Some(format!("worker-intent-{}", intent.task_id));
+            worker_runtime.register_execution_intent(intent);
+            let _ = worker_runtime.resume_from_execution_target(&target, worker_id.clone());
+            worker_runtime.record_branch_checkpoint(
+                task_id,
+                &worker_id,
+                WorkerStage::Execute,
+                Some(lease_id.to_string()),
+                execution_intent_ref,
+                binding_lifecycle,
+                Some(magi_worker_runtime::WorkerExecutionCheckpointCursor {
+                    checkpoint_stage: WorkerStage::Execute,
+                    next_step_index: 0,
+                    checkpoint_at: UtcMillis::now(),
+                    resume_mode: magi_worker_runtime::WorkerCheckpointResumeMode::StageRestart,
+                    resume_token: None,
+                }),
+            );
+        }
+        let (outcome, context_summary) = self.invoke_llm_with_tools(
+            task,
+            &session_id,
+            &workspace_id,
+            use_tools,
+            skill_name,
+            lane_id.as_deref(),
+            lane_seq,
+            is_primary,
+            &worker_id,
+        );
+        if !self.dispatch_result_still_authoritative(task, lease_id) {
+            tracing::info!(
+                task_id = %task.task_id,
+                lease_id = %lease_id,
+                "dispatch outcome arrived after interrupt or lease revocation; skip finish/writeback/result"
+            );
+            return;
+        }
+        match &outcome {
+            TaskOutcome::Completed { output_refs } => {
+                let summary = if output_refs.is_empty() {
+                    format!("任务 {} 已完成", task.title)
+                } else {
+                    output_refs.join("\n")
+                };
+                let _ = worker_runtime.finish(&worker_id, summary);
+                self.append_turn_item(
+                    &session_id,
+                    self.build_turn_item(
+                        if is_primary {
+                            "assistant_final"
+                        } else {
+                            "worker_completed"
+                        },
+                        "completed",
+                        if is_primary {
+                            "orchestrator"
+                        } else {
+                            worker_id.as_str()
+                        },
+                        Some(task.title.clone()),
+                        Some(
+                            output_refs
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| format!("任务 {} 已完成", task.title)),
+                        ),
+                        Some(task_id),
+                        Some(&worker_id),
+                        lane_id.as_deref(),
+                        lane_seq,
+                        true,
+                        !is_primary,
+                    ),
+                );
+                if is_primary {
+                    self.update_turn_status(&session_id, "completed");
+                }
+            }
+            TaskOutcome::Failed { error } => {
+                let _ = worker_runtime.fail(&worker_id, error.clone());
+                self.append_turn_item(
+                    &session_id,
+                    self.build_turn_item(
+                        if is_primary {
+                            "assistant_phase"
+                        } else {
+                            "worker_phase"
+                        },
+                        "failed",
+                        if is_primary {
+                            "orchestrator"
+                        } else {
+                            worker_id.as_str()
+                        },
+                        Some(task.title.clone()),
+                        Some(error.clone()),
+                        Some(task_id),
+                        Some(&worker_id),
+                        lane_id.as_deref(),
+                        lane_seq,
+                        is_primary,
+                        !is_primary,
+                    ),
+                );
+                if is_primary {
+                    self.update_turn_status(&session_id, "failed");
+                }
+            }
+            TaskOutcome::NeedsRepair { reason } => {
+                let _ = worker_runtime.start_repair(&worker_id);
+                let _ = worker_runtime.record_repair_note(&worker_id, reason.clone());
+                self.append_turn_item(
+                    &session_id,
+                    self.build_turn_item(
+                        if is_primary {
+                            "assistant_phase"
+                        } else {
+                            "worker_phase"
+                        },
+                        "repairing",
+                        if is_primary {
+                            "orchestrator"
+                        } else {
+                            worker_id.as_str()
+                        },
+                        Some(task.title.clone()),
+                        Some(reason.clone()),
+                        Some(task_id),
+                        Some(&worker_id),
+                        lane_id.as_deref(),
+                        lane_seq,
+                        is_primary,
+                        !is_primary,
+                    ),
+                );
+            }
+            TaskOutcome::NeedsVerification { output_refs } => {
+                let _ = worker_runtime.start_verification(&worker_id);
+                let summary = if output_refs.is_empty() {
+                    format!("任务 {} 进入验证阶段", task.title)
+                } else {
+                    output_refs.join("\n")
+                };
+                let _ = worker_runtime.record_verification(
+                    &worker_id,
+                    magi_core::VerificationStatus::Pending,
+                    summary,
+                );
+                self.append_turn_item(
+                    &session_id,
+                    self.build_turn_item(
+                        if is_primary {
+                            "assistant_phase"
+                        } else {
+                            "worker_phase"
+                        },
+                        "verifying",
+                        if is_primary {
+                            "orchestrator"
+                        } else {
+                            worker_id.as_str()
+                        },
+                        Some(task.title.clone()),
+                        Some(
+                            output_refs
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| format!("任务 {} 进入验证阶段", task.title)),
+                        ),
+                        Some(task_id),
+                        Some(&worker_id),
+                        lane_id.as_deref(),
+                        lane_seq,
+                        is_primary,
+                        !is_primary,
+                    ),
+                );
+            }
+        }
         if matches!(&outcome, TaskOutcome::Completed { .. }) {
             self.session_store
                 .bind_execution_ownership(session_id.clone(), ownership);
@@ -544,10 +1075,7 @@ impl ShadowTaskDispatcher {
             .and_then(|s| serde_json::to_value(s).ok())
             .unwrap_or(serde_json::Value::Null);
         let event = EventEnvelope::audit(
-            EventId::new(format!(
-                "event-mission-overview-{}",
-                UtcMillis::now().0
-            )),
+            EventId::new(format!("event-mission-overview-{}", UtcMillis::now().0)),
             "mission.execution.overview",
             serde_json::json!({
                 "mission_id": task.mission_id.to_string(),
@@ -567,29 +1095,39 @@ impl ShadowTaskDispatcher {
     }
 
     fn build_tool_definitions(&self, include_orchestration_tools: bool) -> Vec<ChatToolDefinition> {
-        let Some(ref registry) = self.tool_registry else {
-            return Vec::new();
-        };
-        registry
-            .builtin_specs()
-            .into_iter()
-            .filter(|spec| {
-                if include_orchestration_tools {
-                    return true;
-                }
-                !BuiltinToolName::from_str(&spec.name)
-                    .map(|tool_name| tool_name.is_orchestration())
-                    .unwrap_or(false)
+        let mut tool_definitions = self
+            .tool_registry
+            .as_ref()
+            .map(|registry| {
+                registry
+                    .builtin_specs()
+                    .into_iter()
+                    .filter(|spec| {
+                        if include_orchestration_tools {
+                            return true;
+                        }
+                        !BuiltinToolName::from_str(&spec.name)
+                            .map(|tool_name| tool_name.is_orchestration())
+                            .unwrap_or(false)
+                    })
+                    .map(|spec| ChatToolDefinition {
+                        kind: "function".to_string(),
+                        function: ChatToolFunctionDefinition {
+                            name: spec.name.clone(),
+                            description: builtin_tool_description(&spec.name),
+                            parameters: builtin_tool_parameters(&spec.name),
+                        },
+                    })
+                    .collect::<Vec<_>>()
             })
-            .map(|spec| ChatToolDefinition {
-                kind: "function".to_string(),
-                function: ChatToolFunctionDefinition {
-                    name: spec.name.clone(),
-                    description: builtin_tool_description(&spec.name),
-                    parameters: builtin_tool_parameters(&spec.name),
-                },
-            })
-            .collect()
+            .unwrap_or_default();
+
+        tool_definitions.extend(available_mcp_tool_definitions(
+            self.settings_store.as_deref(),
+        ));
+        tool_definitions.sort_by(|left, right| left.function.name.cmp(&right.function.name));
+        tool_definitions.dedup_by(|left, right| left.function.name == right.function.name);
+        tool_definitions
     }
 
     fn assemble_prompt(
@@ -603,8 +1141,10 @@ impl ShadowTaskDispatcher {
         } else {
             format!("{}\n\n{}", task.title, task.goal)
         };
-        let user_rules_prefix = self.resolve_user_rules_prompt();
-        let safeguard_prefix = self.resolve_safeguard_prompt();
+        let user_rules_prefix =
+            resolve_session_user_rules_prompt(self.settings_store.as_deref(), session_id);
+        let safeguard_prefix =
+            resolve_session_safeguard_prompt(self.settings_store.as_deref(), session_id);
 
         let Some(ref ctx_runtime) = self.context_runtime else {
             return (
@@ -620,25 +1160,23 @@ impl ShadowTaskDispatcher {
         let ws_id = workspace_id
             .clone()
             .unwrap_or_else(|| WorkspaceId::new("default"));
-        let result = ctx_runtime.assemble_execution_context(
-            &ExecutionContextAssemblyRequest {
-                session_id: session_id.clone(),
-                workspace_id: ws_id,
-                project_key: None,
-                clues: ExecutionContextClues {
-                    mission: Some(task.title.clone()),
-                    assignment: None,
-                    task: Some(task.goal.clone()),
-                },
-                budget: ContextBudget {
-                    max_turns: 3,
-                    max_knowledge: 3,
-                    max_memory: 2,
-                    max_shared_items: 1,
-                    max_file_summaries: 2,
-                },
+        let result = ctx_runtime.assemble_execution_context(&ExecutionContextAssemblyRequest {
+            session_id: session_id.clone(),
+            workspace_id: ws_id,
+            project_key: None,
+            clues: ExecutionContextClues {
+                mission: Some(task.title.clone()),
+                assignment: None,
+                task: Some(task.goal.clone()),
             },
-        );
+            budget: ContextBudget {
+                max_turns: 3,
+                max_knowledge: 3,
+                max_memory: 2,
+                max_shared_items: 1,
+                max_file_summaries: 2,
+            },
+        });
         let has_context = !result.selected_knowledge.is_empty()
             || !result.selected_memory.is_empty()
             || !result.selected_shared_context.is_empty();
@@ -676,57 +1214,6 @@ impl ShadowTaskDispatcher {
         )
     }
 
-    fn resolve_user_rules_prompt(&self) -> Option<String> {
-        let store = self.settings_store.as_ref()?;
-        let raw = store.get_section("userRules");
-        match raw {
-            serde_json::Value::String(value) => {
-                let trimmed = value.trim();
-                (!trimmed.is_empty()).then(|| trimmed.to_string())
-            }
-            serde_json::Value::Object(map) => {
-                let candidate = map
-                    .get("userRules")
-                    .and_then(|value| value.as_str())
-                    .or_else(|| map.get("content").and_then(|value| value.as_str()))
-                    .or_else(|| map.get("prompt").and_then(|value| value.as_str()))
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                (!candidate.is_empty()).then_some(candidate)
-            }
-            _ => None,
-        }
-    }
-
-    fn resolve_safeguard_prompt(&self) -> Option<String> {
-        let store = self.settings_store.as_ref()?;
-        let raw = store.get_section("safeguardConfig");
-        let rules = raw
-            .get("rules")
-            .and_then(|value| value.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let patterns = rules
-            .iter()
-            .filter(|rule| rule.get("enabled").and_then(|value| value.as_bool()).unwrap_or(true))
-            .filter_map(|rule| rule.get("pattern").and_then(|value| value.as_str()))
-            .map(str::trim)
-            .filter(|pattern| !pattern.is_empty())
-            .collect::<Vec<_>>();
-        if patterns.is_empty() {
-            return None;
-        }
-        Some(format!(
-            "执行 shell / git / 文件写操作前，如果命中以下危险模式，必须先向用户确认，不得直接执行：\n{}",
-            patterns
-                .iter()
-                .map(|pattern| format!("- {}", pattern))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ))
-    }
-
     fn execute_tool_call(
         &self,
         tool_call: &ChatToolCall,
@@ -740,10 +1227,7 @@ impl ShadowTaskDispatcher {
 
         let _ = self.event_bus.publish(
             EventEnvelope::domain(
-                EventId::new(format!(
-                    "event-task-tool-invoked-{}",
-                    UtcMillis::now().0
-                )),
+                EventId::new(format!("event-task-tool-invoked-{}", UtcMillis::now().0)),
                 "task.tool.invoked",
                 serde_json::json!({
                     "task_id": task.task_id.to_string(),
@@ -762,6 +1246,14 @@ impl ShadowTaskDispatcher {
                 ..EventContext::default()
             }),
         );
+
+        if let Some(mcp_result) = execute_mcp_tool_call(
+            self.settings_store.as_deref(),
+            &tool_call.function.name,
+            &tool_call.function.arguments,
+        ) {
+            return mcp_result;
+        }
 
         let context = ToolExecutionContext {
             worker_id: None,
@@ -823,6 +1315,10 @@ impl ShadowTaskDispatcher {
         workspace_id: &Option<WorkspaceId>,
         use_tools: bool,
         skill_name: Option<String>,
+        lane_id: Option<&str>,
+        lane_seq: Option<usize>,
+        is_primary: bool,
+        worker_id: &WorkerId,
     ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
         let Some(client) = self.resolve_model_client() else {
             tracing::error!(task_id = %task.task_id, "invoke_llm_with_tools: no model bridge client configured");
@@ -838,7 +1334,7 @@ impl ShadowTaskDispatcher {
         };
 
         let (mut prompt, context_summary) = self.assemble_prompt(task, session_id, workspace_id);
-        
+
         if let Some(skill_id) = skill_name {
             if let Some(ref skill_rt) = self.skill_runtime {
                 let plan = skill_rt.build_tool_runtime_plan(magi_skill_runtime::SkillSelection {
@@ -853,7 +1349,11 @@ impl ShadowTaskDispatcher {
 
         let tools = if use_tools {
             let tool_defs = self.build_tool_definitions(false);
-            if tool_defs.is_empty() { None } else { Some(tool_defs) }
+            if tool_defs.is_empty() {
+                None
+            } else {
+                Some(tool_defs)
+            }
         } else {
             None
         };
@@ -890,6 +1390,34 @@ impl ShadowTaskDispatcher {
 
         let mut final_content = String::new();
         let mut tool_call_records: Vec<serde_json::Value> = Vec::new();
+        self.append_turn_item(
+            session_id,
+            self.build_turn_item(
+                "assistant_phase",
+                "running",
+                if is_primary {
+                    "orchestrator"
+                } else {
+                    worker_id.as_str()
+                },
+                Some(if is_primary {
+                    "分析任务".to_string()
+                } else {
+                    task.title.clone()
+                }),
+                Some(if use_tools {
+                    "正在分析请求并准备调用工具。".to_string()
+                } else {
+                    "正在分析请求并生成结果。".to_string()
+                }),
+                Some(&task.task_id),
+                Some(worker_id),
+                lane_id,
+                lane_seq,
+                is_primary,
+                !is_primary,
+            ),
+        );
 
         for round in 0..MAX_TOOL_CALL_ROUNDS {
             let request = ModelInvocationRequest {
@@ -899,7 +1427,66 @@ impl ShadowTaskDispatcher {
                 tools: tools.clone(),
             };
 
-            let response = match client.invoke(request) {
+            let stream_item_kind = if is_primary {
+                "assistant_stream"
+            } else {
+                "worker_stream"
+            };
+            let stream_item_id = format!(
+                "turn-item-{stream_item_kind}-{}-{}",
+                round + 1,
+                UtcMillis::now().0
+            );
+            let stream_item_title = Some(if is_primary {
+                "生成回复".to_string()
+            } else {
+                task.title.clone()
+            });
+            let mut streamed_content = String::new();
+            let mut last_persisted_content = String::new();
+            let mut stream_item_created = false;
+            let mut last_flush_at = Instant::now();
+
+            let response = match client.invoke_stream(request, &mut |event| match event {
+                ModelStreamEvent::ContentDelta { delta } => {
+                    if delta.is_empty() {
+                        return;
+                    }
+                    streamed_content.push_str(&delta);
+                    let visible_streamed_content =
+                        normalize_shadow_model_visible_content(&streamed_content);
+                    let should_flush = !stream_item_created
+                        || delta.contains('\n')
+                        || visible_streamed_content
+                            .len()
+                            .saturating_sub(last_persisted_content.len())
+                            >= 32
+                        || last_flush_at.elapsed() >= Duration::from_millis(120);
+                    if should_flush {
+                        self.sync_stream_turn_item(
+                            task,
+                            session_id,
+                            workspace_id,
+                            round + 1,
+                            &stream_item_id,
+                            stream_item_kind,
+                            stream_item_title.clone(),
+                            worker_id,
+                            lane_id,
+                            lane_seq,
+                            is_primary,
+                            &visible_streamed_content,
+                            "running",
+                            true,
+                            &mut last_persisted_content,
+                            &mut stream_item_created,
+                            true,
+                        );
+                        last_flush_at = Instant::now();
+                    }
+                }
+                ModelStreamEvent::ThinkingDelta { .. } => {}
+            }) {
                 Ok(resp) => resp,
                 Err(error) => {
                     tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM invocation failed");
@@ -915,16 +1502,39 @@ impl ShadowTaskDispatcher {
             let parsed = response.parse_chat_payload();
 
             if let Some(ref content) = parsed.content {
-                final_content = content.clone();
+                final_content = normalize_shadow_model_visible_content(content);
+                if streamed_content != *content {
+                    streamed_content = content.clone();
+                }
             }
 
             if parsed.tool_calls.is_empty() {
+                let visible_streamed_content =
+                    normalize_shadow_model_visible_content(&streamed_content);
+                if !visible_streamed_content.is_empty() {
+                    self.sync_stream_turn_item(
+                        task,
+                        session_id,
+                        workspace_id,
+                        round + 1,
+                        &stream_item_id,
+                        stream_item_kind,
+                        stream_item_title.clone(),
+                        worker_id,
+                        lane_id,
+                        lane_seq,
+                        is_primary,
+                        &visible_streamed_content,
+                        "completed",
+                        false,
+                        &mut last_persisted_content,
+                        &mut stream_item_created,
+                        true,
+                    );
+                }
                 let _ = self.event_bus.publish(
                     EventEnvelope::domain(
-                        EventId::new(format!(
-                            "event-task-llm-completed-{}",
-                            UtcMillis::now().0
-                        )),
+                        EventId::new(format!("event-task-llm-completed-{}", UtcMillis::now().0)),
                         "task.llm.completed",
                         serde_json::json!({
                             "task_id": task.task_id.to_string(),
@@ -940,6 +1550,31 @@ impl ShadowTaskDispatcher {
                 break;
             }
 
+            let visible_streamed_content =
+                normalize_shadow_model_visible_content(&streamed_content);
+            if !visible_streamed_content.is_empty() {
+                let should_force_publish = !stream_item_created;
+                self.sync_stream_turn_item(
+                    task,
+                    session_id,
+                    workspace_id,
+                    round + 1,
+                    &stream_item_id,
+                    stream_item_kind,
+                    stream_item_title.clone(),
+                    worker_id,
+                    lane_id,
+                    lane_seq,
+                    is_primary,
+                    &visible_streamed_content,
+                    "completed",
+                    true,
+                    &mut last_persisted_content,
+                    &mut stream_item_created,
+                    should_force_publish,
+                );
+            }
+
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: parsed.content.clone(),
@@ -948,6 +1583,35 @@ impl ShadowTaskDispatcher {
             });
 
             for tc in &parsed.tool_calls {
+                self.append_turn_item(
+                    session_id,
+                    ActiveExecutionTurnItem {
+                        tool_call_id: Some(tc.id.clone()),
+                        tool_name: Some(tc.function.name.clone()),
+                        tool_status: Some("running".to_string()),
+                        ..self.build_turn_item(
+                            if is_primary {
+                                "tool_call_started"
+                            } else {
+                                "worker_tool_call_started"
+                            },
+                            "running",
+                            if is_primary {
+                                "orchestrator"
+                            } else {
+                                worker_id.as_str()
+                            },
+                            Some(tc.function.name.clone()),
+                            Some(format!("开始调用工具 {}", tc.function.name)),
+                            Some(&task.task_id),
+                            Some(worker_id),
+                            lane_id,
+                            lane_seq,
+                            is_primary,
+                            !is_primary,
+                        )
+                    },
+                );
                 let result = self.execute_tool_call(tc, task, session_id, workspace_id);
                 let status = infer_tool_call_status(&result);
                 tool_call_records.push(serde_json::json!({
@@ -962,6 +1626,41 @@ impl ShadowTaskDispatcher {
                         "result": result,
                     }
                 }));
+                self.append_turn_item(
+                    session_id,
+                    ActiveExecutionTurnItem {
+                        tool_call_id: Some(tc.id.clone()),
+                        tool_name: Some(tc.function.name.clone()),
+                        tool_status: Some(status.to_string()),
+                        tool_result: Some(summarize_tool_result(&result)),
+                        tool_error: (status == "error").then(|| summarize_tool_result(&result)),
+                        ..self.build_turn_item(
+                            if is_primary {
+                                "tool_call_result"
+                            } else {
+                                "worker_tool_call_result"
+                            },
+                            status,
+                            if is_primary {
+                                "orchestrator"
+                            } else {
+                                worker_id.as_str()
+                            },
+                            Some(tc.function.name.clone()),
+                            Some(format!(
+                                "{}：{}",
+                                tc.function.name,
+                                summarize_tool_result(&result)
+                            )),
+                            Some(&task.task_id),
+                            Some(worker_id),
+                            lane_id,
+                            lane_seq,
+                            is_primary,
+                            !is_primary,
+                        )
+                    },
+                );
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
                     content: Some(result),
@@ -1004,7 +1703,10 @@ fn prepend_session_instructions(
     if let Some(rules) = user_rules.map(str::trim).filter(|rules| !rules.is_empty()) {
         sections.push(format!("--- 用户规则 ---\n{rules}"));
     }
-    if let Some(rules) = safeguard_rules.map(str::trim).filter(|rules| !rules.is_empty()) {
+    if let Some(rules) = safeguard_rules
+        .map(str::trim)
+        .filter(|rules| !rules.is_empty())
+    {
         sections.push(format!("--- 安全防护 ---\n{rules}"));
     }
     if sections.is_empty() {
@@ -1035,7 +1737,18 @@ impl TaskDispatcher for ShadowTaskDispatcher {
                 Some(&session_id),
                 None,
             );
-            let (outcome, _) = self.invoke_llm_with_tools(task, &session_id, &None, false, None);
+            let fallback_worker_id = WorkerId::new(format!("worker-{}", task.task_id));
+            let (outcome, _) = self.invoke_llm_with_tools(
+                task,
+                &session_id,
+                &None,
+                false,
+                None,
+                None,
+                None,
+                true,
+                &fallback_worker_id,
+            );
             self.push_result(&task.task_id, &lease.lease_id, outcome);
             return Ok(());
         };
@@ -1044,6 +1757,9 @@ impl TaskDispatcher for ShadowTaskDispatcher {
             ShadowTaskExecutionPlan::Dispatch {
                 target: _,
                 worker_id: _,
+                lane_id,
+                lane_seq,
+                is_primary,
                 session_id,
                 workspace_id,
                 ownership,
@@ -1064,6 +1780,9 @@ impl TaskDispatcher for ShadowTaskDispatcher {
                     task,
                     &task.task_id,
                     &lease.lease_id,
+                    lane_id,
+                    lane_seq,
+                    is_primary,
                     session_id,
                     workspace_id,
                     ownership,
@@ -1145,6 +1864,11 @@ pub fn drive_shadow_task_graph(
             magi_orchestrator::task_runner::RunCycleOutcome::Continue => continue,
             magi_orchestrator::task_runner::RunCycleOutcome::AllComplete => break,
             magi_orchestrator::task_runner::RunCycleOutcome::Blocked(task_ids) => {
+                if shadow_dispatch_interrupted(task_store, root_task_id, action_task_id) {
+                    return Ok(ShadowGraphDriveResult {
+                        runner_started: executed,
+                    });
+                }
                 return Err(ApiError::internal_assembly(
                     failure_title,
                     format!("task runner blocked: {:?}", task_ids),
@@ -1160,16 +1884,158 @@ pub fn drive_shadow_task_graph(
         .get_task(action_task_id)
         .ok_or_else(|| ApiError::internal_assembly(failure_title, "action task 不存在"))?
         .status;
+    if action_status == TaskStatus::Blocked
+        && shadow_dispatch_interrupted(task_store, root_task_id, action_task_id)
+    {
+        return Ok(ShadowGraphDriveResult {
+            runner_started: executed,
+        });
+    }
     if action_status != TaskStatus::Completed && action_status != TaskStatus::Failed {
         return Err(ApiError::internal_assembly(
             failure_title,
-            format!("task runner did not complete action task: {:?}", action_status),
+            format!(
+                "task runner did not complete action task: {:?}",
+                action_status
+            ),
         ));
     }
 
     Ok(ShadowGraphDriveResult {
         runner_started: executed,
     })
+}
+
+fn shadow_dispatch_interrupted(
+    task_store: &magi_orchestrator::task_store::TaskStore,
+    root_task_id: &TaskId,
+    action_task_id: &TaskId,
+) -> bool {
+    let root_blocked = task_store
+        .get_task(root_task_id)
+        .map(|task| task.status == TaskStatus::Blocked)
+        .unwrap_or(false);
+    let action_blocked = task_store
+        .get_task(action_task_id)
+        .map(|task| task.status == TaskStatus::Blocked)
+        .unwrap_or(false);
+    root_blocked || action_blocked
+}
+
+fn configured_mcp_servers(
+    store: Option<&crate::settings_store::SettingsStore>,
+) -> Vec<serde_json::Value> {
+    store
+        .and_then(|store| store.get_section("mcpServers").as_array().cloned())
+        .unwrap_or_default()
+}
+
+fn mcp_server_id(entry: &serde_json::Value) -> Option<String> {
+    entry
+        .get("id")
+        .and_then(|value| value.as_str())
+        .or_else(|| entry.get("serverId").and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn encode_mcp_tool_name(server_id: &str, tool_name: &str) -> String {
+    format!("{MCP_TOOL_NAME_PREFIX}{server_id}__{tool_name}")
+}
+
+fn decode_mcp_tool_name(encoded_name: &str) -> Option<(String, String)> {
+    let mut parts = encoded_name.splitn(3, "__");
+    let prefix = parts.next()?;
+    if prefix != "mcp" {
+        return None;
+    }
+    let server_id = parts.next()?.trim().to_string();
+    let tool_name = parts.next()?.trim().to_string();
+    if server_id.is_empty() || tool_name.is_empty() {
+        return None;
+    }
+    Some((server_id, tool_name))
+}
+
+fn normalize_mcp_tool_parameters(input_schema: Option<serde_json::Value>) -> serde_json::Value {
+    match input_schema {
+        Some(serde_json::Value::Object(map)) if !map.is_empty() => serde_json::Value::Object(map),
+        _ => json!({
+            "type": "object",
+            "properties": {}
+        }),
+    }
+}
+
+fn mcp_tool_definition(server_id: &str, tool: McpToolInfo) -> ChatToolDefinition {
+    let tool_name = tool.name;
+    let description = tool
+        .description
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("MCP tool {tool_name} from server {server_id}"));
+    ChatToolDefinition {
+        kind: "function".to_string(),
+        function: ChatToolFunctionDefinition {
+            name: encode_mcp_tool_name(server_id, &tool_name),
+            description,
+            parameters: normalize_mcp_tool_parameters(tool.input_schema),
+        },
+    }
+}
+
+fn available_mcp_tool_definitions(
+    store: Option<&crate::settings_store::SettingsStore>,
+) -> Vec<ChatToolDefinition> {
+    let mut tool_definitions = Vec::new();
+    for entry in configured_mcp_servers(store) {
+        let enabled = entry
+            .get("enabled")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        if !enabled {
+            continue;
+        }
+        let Some(server_id) = mcp_server_id(&entry) else {
+            continue;
+        };
+        let Some(config) = build_mcp_config_from_entry(&entry) else {
+            continue;
+        };
+        let client = StdioMcpBridgeClient::new(config);
+        let Ok(tools) = client.list_tools() else {
+            continue;
+        };
+        tool_definitions.extend(
+            tools
+                .into_iter()
+                .map(|tool| mcp_tool_definition(&server_id, tool)),
+        );
+    }
+    tool_definitions
+}
+
+fn execute_mcp_tool_call(
+    store: Option<&crate::settings_store::SettingsStore>,
+    encoded_tool_name: &str,
+    input: &str,
+) -> Option<String> {
+    let (server_id, tool_name) = decode_mcp_tool_name(encoded_tool_name)?;
+    let entry = configured_mcp_servers(store)
+        .into_iter()
+        .find(|candidate| mcp_server_id(candidate).as_deref() == Some(server_id.as_str()))?;
+    let config = build_mcp_config_from_entry(&entry)?;
+    let client = StdioMcpBridgeClient::new(config);
+    match client.call_tool(McpToolCallRequest {
+        server_name: server_id,
+        tool_name,
+        input: input.to_string(),
+    }) {
+        Ok(response) if response.ok => Some(response.payload),
+        Ok(response) => Some(json!({ "error": response.payload }).to_string()),
+        Err(error) => Some(json!({ "error": format!("MCP 调用失败: {error:?}") }).to_string()),
+    }
 }
 
 fn builtin_tool_description(name: &str) -> String {
@@ -1233,11 +2099,45 @@ fn builtin_tool_parameters(name: &str) -> serde_json::Value {
 
 fn infer_tool_call_status(result: &str) -> &'static str {
     let parsed = serde_json::from_str::<serde_json::Value>(result).ok();
-    match parsed.as_ref().and_then(|v| v.get("status")).and_then(|v| v.as_str()) {
+    match parsed
+        .as_ref()
+        .and_then(|v| v.get("status"))
+        .and_then(|v| v.as_str())
+    {
         Some("error") | Some("failed") => "error",
         _ if parsed.as_ref().and_then(|v| v.get("error")).is_some() => "error",
         _ => "success",
     }
+}
+
+fn normalize_shadow_model_visible_content(content: &str) -> String {
+    let mut value = content.trim();
+    while let Some(rest) = value.strip_prefix("shadow-model::") {
+        value = rest.trim();
+    }
+    let chunks = value
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|chunk| !chunk.is_empty())
+        .collect::<Vec<_>>();
+    if chunks.len() == 2 {
+        let first = chunks[0];
+        let second = chunks[1];
+        if first == second {
+            return second.to_string();
+        }
+        if first
+            .strip_prefix("执行:")
+            .or_else(|| first.strip_prefix("执行："))
+            .or_else(|| first.strip_prefix("继续:"))
+            .or_else(|| first.strip_prefix("继续："))
+            .map(str::trim)
+            == Some(second)
+        {
+            return second.to_string();
+        }
+    }
+    value.to_string()
 }
 
 fn summarize_tool_result(result: &str) -> String {
@@ -1249,4 +2149,147 @@ fn summarize_tool_result(result: &str) -> String {
         end -= 1;
     }
     format!("{}…", &result[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings_store::SettingsStore;
+    use serde_json::json;
+
+    fn mock_mcp_server_entry() -> serde_json::Value {
+        json!({
+            "id": "mock-mcp-e2e",
+            "serverId": "mock-mcp-e2e",
+            "name": "mock-mcp-e2e",
+            "enabled": true,
+            "command": "sh",
+            "args": [
+                "-c",
+                r#"while IFS= read -r line; do
+  method=$(echo "$line" | grep -o '"method":"[^"]*"' | head -1 | cut -d'"' -f4)
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  case "$method" in
+    initialize)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"mock-mcp","version":"0.1.0"}}}\n' "$id"
+      ;;
+    notifications/initialized)
+      ;;
+    tools/list)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"mock.echo","description":"A mock echo tool","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}]}}\n' "$id"
+      ;;
+    tools/call)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"mock tool result"}]}}\n' "$id"
+      ;;
+    *)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"method not found"}}\n' "$id"
+      ;;
+  esac
+done"#
+            ]
+        })
+    }
+
+    #[test]
+    fn normalizes_shadow_model_visible_echo_content() {
+        assert_eq!(
+            normalize_shadow_model_visible_content("shadow-model::执行: 整理结果\n\n整理结果"),
+            "整理结果"
+        );
+        assert_eq!(
+            normalize_shadow_model_visible_content(
+                "shadow-model::shadow-model::汇总执行结果\n\n汇总执行结果"
+            ),
+            "汇总执行结果"
+        );
+    }
+
+    #[test]
+    fn session_user_rules_prompt_only_reads_current_session() {
+        let store = SettingsStore::new();
+        let session_a = SessionId::new("session-a");
+        let session_b = SessionId::new("session-b");
+        store.set_session_section(
+            &session_a,
+            "userRules",
+            serde_json::json!({ "userRules": "【A】" }),
+        );
+        store.set_session_section(
+            &session_b,
+            "userRules",
+            serde_json::json!({ "userRules": "【B】" }),
+        );
+
+        assert_eq!(
+            resolve_session_user_rules_prompt(Some(&store), &session_a).as_deref(),
+            Some("【A】")
+        );
+        assert_eq!(
+            resolve_session_user_rules_prompt(Some(&store), &session_b).as_deref(),
+            Some("【B】")
+        );
+    }
+
+    #[test]
+    fn session_safeguard_prompt_uses_session_specific_rules_without_leaking() {
+        let store = SettingsStore::new();
+        let session_a = SessionId::new("session-a");
+        let session_b = SessionId::new("session-b");
+        store.set_session_section(
+            &session_a,
+            "safeguardConfig",
+            serde_json::json!({
+                "rules": [
+                    {
+                        "pattern": "custom-danger-a",
+                        "enabled": true,
+                        "category": "custom"
+                    }
+                ]
+            }),
+        );
+
+        let prompt_a = resolve_session_safeguard_prompt(Some(&store), &session_a)
+            .expect("session a should have safeguard prompt");
+        let prompt_b = resolve_session_safeguard_prompt(Some(&store), &session_b)
+            .expect("session b should still have builtin safeguard prompt");
+
+        assert!(prompt_a.contains("custom-danger-a"));
+        assert!(prompt_a.contains("git push --force"));
+        assert!(!prompt_b.contains("custom-danger-a"));
+        assert!(prompt_b.contains("git push --force"));
+    }
+
+    #[test]
+    fn available_mcp_tool_definitions_exposes_connected_server_tools() {
+        let store = SettingsStore::new();
+        store.set_section("mcpServers", json!([mock_mcp_server_entry()]));
+
+        let tool_definitions = available_mcp_tool_definitions(Some(&store));
+        assert_eq!(tool_definitions.len(), 1);
+        assert_eq!(
+            tool_definitions[0].function.name,
+            "mcp__mock-mcp-e2e__mock.echo"
+        );
+        assert_eq!(tool_definitions[0].function.description, "A mock echo tool");
+        assert_eq!(
+            tool_definitions[0].function.parameters["required"][0],
+            "text"
+        );
+    }
+
+    #[test]
+    fn execute_mcp_tool_call_dispatches_to_configured_server() {
+        let store = SettingsStore::new();
+        store.set_section("mcpServers", json!([mock_mcp_server_entry()]));
+
+        let result = execute_mcp_tool_call(
+            Some(&store),
+            "mcp__mock-mcp-e2e__mock.echo",
+            r#"{"text":"hello"}"#,
+        )
+        .expect("mcp tool should resolve");
+
+        assert_eq!(result, "mock tool result");
+    }
 }

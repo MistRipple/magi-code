@@ -163,7 +163,11 @@ fn magi_bin_dir() -> PathBuf {
 }
 
 fn cloudflared_bin_name() -> &'static str {
-    if cfg!(target_os = "windows") { "cloudflared.exe" } else { "cloudflared" }
+    if cfg!(target_os = "windows") {
+        "cloudflared.exe"
+    } else {
+        "cloudflared"
+    }
 }
 
 async fn resolve_cloudflared_path() -> Option<PathBuf> {
@@ -173,7 +177,11 @@ async fn resolve_cloudflared_path() -> Option<PathBuf> {
         return Some(local);
     }
     // 2. PATH
-    let which = if cfg!(target_os = "windows") { "where" } else { "which" };
+    let which = if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    };
     if let Ok(output) = tokio::process::Command::new(which)
         .arg("cloudflared")
         .output()
@@ -216,7 +224,12 @@ async fn install_cloudflared() -> Result<PathBuf, String> {
 
     if is_tgz {
         let status = tokio::process::Command::new("tar")
-            .args(["-xzf", download_dest.to_str().unwrap(), "-C", bin_dir.to_str().unwrap()])
+            .args([
+                "-xzf",
+                download_dest.to_str().unwrap(),
+                "-C",
+                bin_dir.to_str().unwrap(),
+            ])
             .status()
             .await
             .map_err(|e| format!("tar 解压失败: {e}"))?;
@@ -232,23 +245,40 @@ async fn install_cloudflared() -> Result<PathBuf, String> {
         let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
     }
 
-    if dest.exists() { Ok(dest) } else { Err("安装完成但未找到 cloudflared".into()) }
+    if dest.exists() {
+        Ok(dest)
+    } else {
+        Err("安装完成但未找到 cloudflared".into())
+    }
 }
 
 fn resolve_download_url() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => Some("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz"),
-        ("macos", "x86_64") => Some("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz"),
-        ("linux", "aarch64") => Some("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"),
-        ("linux", "x86_64") => Some("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"),
-        ("windows", "x86_64") => Some("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"),
+        ("macos", "aarch64") => Some(
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz",
+        ),
+        ("macos", "x86_64") => Some(
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz",
+        ),
+        ("linux", "aarch64") => Some(
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64",
+        ),
+        ("linux", "x86_64") => Some(
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+        ),
+        ("windows", "x86_64") => Some(
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe",
+        ),
         _ => None,
     }
 }
 
 fn generate_token() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
     format!("{:x}{:x}", ts, rand_u64())
 }
 

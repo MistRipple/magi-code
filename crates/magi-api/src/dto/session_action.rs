@@ -61,6 +61,11 @@ impl SessionActionRequestDto {
         }
     }
 
+    pub fn has_execution_trigger(&self) -> bool {
+        self.deep_task
+            || trimmed_non_empty(self.skill_name.as_deref()).is_some()
+            || !self.images.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -106,7 +111,12 @@ fn trimmed_non_empty(value: Option<&str>) -> Option<String> {
 }
 
 fn normalize_task_title(value: &str) -> String {
-    value.chars().take(80).collect::<String>().trim().to_string()
+    value
+        .chars()
+        .take(80)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -132,7 +142,10 @@ mod tests {
         let request = request();
 
         assert_eq!(
-            request.requested_session_id().as_ref().map(ToString::to_string),
+            request
+                .requested_session_id()
+                .as_ref()
+                .map(ToString::to_string),
             Some("session-1".to_string())
         );
         assert_eq!(
@@ -158,7 +171,10 @@ mod tests {
         ));
 
         assert_eq!(title.len(), 80);
-        assert_eq!(title, "01234567890123456789012345678901234567890123456789012345678901234567890123456789");
+        assert_eq!(
+            title,
+            "01234567890123456789012345678901234567890123456789012345678901234567890123456789"
+        );
     }
 
     #[test]
@@ -181,5 +197,4 @@ mod tests {
 
         assert_eq!(request.timeline_message(None), "[空输入]");
     }
-
 }

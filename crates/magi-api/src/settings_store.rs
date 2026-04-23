@@ -1,9 +1,12 @@
+use magi_core::SessionId;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::RwLock;
 use tracing::warn;
+
+const SESSION_SECTION_PREFIX: &str = "__session__:";
 
 #[derive(Debug)]
 pub struct SettingsStore {
@@ -102,10 +105,10 @@ impl SettingsStore {
     }
 
     pub fn set(&self, key: &str, value: Value) {
-        self.sections
-            .write()
-            .unwrap()
-            .insert(key.to_string(), value);
+        {
+            let mut sections = self.sections.write().unwrap();
+            sections.insert(key.to_string(), value);
+        }
         self.auto_persist();
     }
 
@@ -119,11 +122,19 @@ impl SettingsStore {
     }
 
     pub fn set_section(&self, section: &str, value: Value) {
-        self.sections
-            .write()
-            .unwrap()
-            .insert(section.to_string(), value);
+        {
+            let mut sections = self.sections.write().unwrap();
+            sections.insert(section.to_string(), value);
+        }
         self.auto_persist();
+    }
+
+    pub fn get_session_section(&self, session_id: &SessionId, section: &str) -> Value {
+        self.get_section(&session_section_key(session_id, section))
+    }
+
+    pub fn set_session_section(&self, session_id: &SessionId, section: &str, value: Value) {
+        self.set_section(&session_section_key(session_id, section), value);
     }
 
     pub fn remove_section_entry(&self, section: &str, key: &str) {
@@ -143,7 +154,10 @@ impl SettingsStore {
         if let Value::Array(items) = arr {
             let id_str = Self::extract_id_str(entry, id_field);
             if let Some(id_val) = id_str {
-                if let Some(pos) = items.iter().position(|item| Self::extract_id_str(item, id_field) == Some(id_val)) {
+                if let Some(pos) = items
+                    .iter()
+                    .position(|item| Self::extract_id_str(item, id_field) == Some(id_val))
+                {
                     items[pos] = entry.clone();
                     drop(sections);
                     self.auto_persist();
@@ -160,7 +174,9 @@ impl SettingsStore {
         let mut sections = self.sections.write().unwrap();
         if let Some(Value::Array(items)) = sections.get_mut(section) {
             items.retain(|item| {
-                Self::extract_id_str(item, id_field).map(|v| v != id_value).unwrap_or(true)
+                Self::extract_id_str(item, id_field)
+                    .map(|v| v != id_value)
+                    .unwrap_or(true)
             });
         }
         drop(sections);
@@ -168,36 +184,76 @@ impl SettingsStore {
     }
 
     fn extract_id_str<'a>(item: &'a Value, primary_field: &str) -> Option<&'a str> {
-        if let Some(s) = item.get(primary_field).and_then(|v| v.as_str()) { return Some(s); }
-        if let Some(s) = item.get("id").and_then(|v| v.as_str()) { return Some(s); }
-        if let Some(s) = item.get("serverId").and_then(|v| v.as_str()) { return Some(s); }
-        if let Some(s) = item.get("repositoryId").and_then(|v| v.as_str()) { return Some(s); }
-        if let Some(s) = item.get("engineId").and_then(|v| v.as_str()) { return Some(s); }
-        
+        if let Some(s) = item.get(primary_field).and_then(|v| v.as_str()) {
+            return Some(s);
+        }
+        if let Some(s) = item.get("id").and_then(|v| v.as_str()) {
+            return Some(s);
+        }
+        if let Some(s) = item.get("serverId").and_then(|v| v.as_str()) {
+            return Some(s);
+        }
+        if let Some(s) = item.get("repositoryId").and_then(|v| v.as_str()) {
+            return Some(s);
+        }
+        if let Some(s) = item.get("engineId").and_then(|v| v.as_str()) {
+            return Some(s);
+        }
+
         if let Some(server) = item.get("server") {
-            if let Some(s) = server.get(primary_field).and_then(|v| v.as_str()) { return Some(s); }
-            if let Some(s) = server.get("id").and_then(|v| v.as_str()) { return Some(s); }
-            if let Some(s) = server.get("serverId").and_then(|v| v.as_str()) { return Some(s); }
+            if let Some(s) = server.get(primary_field).and_then(|v| v.as_str()) {
+                return Some(s);
+            }
+            if let Some(s) = server.get("id").and_then(|v| v.as_str()) {
+                return Some(s);
+            }
+            if let Some(s) = server.get("serverId").and_then(|v| v.as_str()) {
+                return Some(s);
+            }
         }
         if let Some(engine) = item.get("engine") {
-            if let Some(s) = engine.get(primary_field).and_then(|v| v.as_str()) { return Some(s); }
-            if let Some(s) = engine.get("id").and_then(|v| v.as_str()) { return Some(s); }
-            if let Some(s) = engine.get("engineId").and_then(|v| v.as_str()) { return Some(s); }
+            if let Some(s) = engine.get(primary_field).and_then(|v| v.as_str()) {
+                return Some(s);
+            }
+            if let Some(s) = engine.get("id").and_then(|v| v.as_str()) {
+                return Some(s);
+            }
+            if let Some(s) = engine.get("engineId").and_then(|v| v.as_str()) {
+                return Some(s);
+            }
         }
         if let Some(agent) = item.get("agent") {
-            if let Some(s) = agent.get(primary_field).and_then(|v| v.as_str()) { return Some(s); }
-            if let Some(s) = agent.get("id").and_then(|v| v.as_str()) { return Some(s); }
+            if let Some(s) = agent.get(primary_field).and_then(|v| v.as_str()) {
+                return Some(s);
+            }
+            if let Some(s) = agent.get("id").and_then(|v| v.as_str()) {
+                return Some(s);
+            }
         }
         if let Some(llm) = item.get("llm") {
-            if let Some(s) = llm.get(primary_field).and_then(|v| v.as_str()) { return Some(s); }
-            if let Some(s) = llm.get("id").and_then(|v| v.as_str()) { return Some(s); }
+            if let Some(s) = llm.get(primary_field).and_then(|v| v.as_str()) {
+                return Some(s);
+            }
+            if let Some(s) = llm.get("id").and_then(|v| v.as_str()) {
+                return Some(s);
+            }
         }
-        
+
         None
     }
 
     pub fn snapshot(&self) -> HashMap<String, Value> {
         self.sections.read().unwrap().clone()
+    }
+
+    pub fn public_snapshot(&self) -> HashMap<String, Value> {
+        self.sections
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| !is_session_section_key(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
     }
 }
 
@@ -209,6 +265,14 @@ fn temp_path_for(path: &PathBuf) -> PathBuf {
         .unwrap_or_else(|| "settings.json".to_string());
     file_name.push_str(".tmp");
     path.with_file_name(file_name)
+}
+
+fn session_section_key(session_id: &SessionId, section: &str) -> String {
+    format!("{SESSION_SECTION_PREFIX}{}:{section}", session_id.as_str())
+}
+
+fn is_session_section_key(section: &str) -> bool {
+    section.starts_with(SESSION_SECTION_PREFIX)
 }
 
 #[cfg(test)]
@@ -269,7 +333,11 @@ mod tests {
         let path = dir.join("settings.json");
 
         let store = SettingsStore::with_persistence_path(path.clone());
-        store.upsert_array_entry("engines", "engineId", &json!({"engineId": "e1", "name": "test"}));
+        store.upsert_array_entry(
+            "engines",
+            "engineId",
+            &json!({"engineId": "e1", "name": "test"}),
+        );
         store.remove_array_entry("engines", "engineId", "e1");
         store.set_section("config", json!({"a": 1}));
         store.remove_section_entry("config", "a");
@@ -279,5 +347,30 @@ mod tests {
         store2.load_from_disk().unwrap();
         assert_eq!(store2.get_section("engines"), json!([]));
         assert_eq!(store2.get_section("config"), json!({}));
+    }
+
+    #[test]
+    fn session_scoped_sections_do_not_leak_into_public_snapshot() {
+        let store = SettingsStore::new();
+        let session_a = SessionId::new("session-a");
+        let session_b = SessionId::new("session-b");
+
+        store.set_section("workers", json!({"primary": "gpu-0"}));
+        store.set_session_section(&session_a, "userRules", json!({"userRules": "A"}));
+        store.set_session_section(&session_b, "userRules", json!({"userRules": "B"}));
+
+        assert_eq!(
+            store.get_session_section(&session_a, "userRules"),
+            json!({"userRules": "A"})
+        );
+        assert_eq!(
+            store.get_session_section(&session_b, "userRules"),
+            json!({"userRules": "B"})
+        );
+
+        let snapshot = store.public_snapshot();
+        assert_eq!(snapshot.get("workers"), Some(&json!({"primary": "gpu-0"})));
+        assert!(!snapshot.contains_key("__session__:session-a:userRules"));
+        assert!(!snapshot.contains_key("__session__:session-b:userRules"));
     }
 }

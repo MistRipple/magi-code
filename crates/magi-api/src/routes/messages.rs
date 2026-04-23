@@ -1,7 +1,7 @@
 use axum::{
+    Json, Router,
     extract::{Query, State},
     routing::get,
-    Json, Router,
 };
 use magi_core::{SessionId, UtcMillis};
 use magi_session_store::{NotificationRecord, SessionRecord, TimelineEntry, TimelineEntryKind};
@@ -67,7 +67,12 @@ async fn get_messages(
     State(state): State<ApiState>,
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<MessagesResponseDto>, ApiError> {
-    let session_id = match query.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let session_id = match query
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(id) => {
             let sid = SessionId::new(id);
             if state.session_store.session(&sid).is_none() {
@@ -84,7 +89,12 @@ async fn get_messages(
 
     let timeline = state.session_store.timeline_for_session(&session_id);
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let end = match query.before_cursor.as_deref().map(str::trim).filter(|cursor| !cursor.is_empty()) {
+    let end = match query
+        .before_cursor
+        .as_deref()
+        .map(str::trim)
+        .filter(|cursor| !cursor.is_empty())
+    {
         Some(cursor) => timeline
             .iter()
             .position(|entry| entry.entry_id == cursor)

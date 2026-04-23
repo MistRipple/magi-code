@@ -10,16 +10,16 @@ mod tasks_runner;
 mod workspaces;
 
 use axum::{
+    Json, Router,
     extract::{Query, State},
     routing::{get, post},
-    Json, Router,
 };
-use magi_core::{EventId, SessionId, UtcMillis, WorkspaceId};
-use magi_session_store::SessionRecord;
+use magi_core::{EventId, SessionId, Task, TaskStatus, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::TimelineEntryKind;
+use magi_session_store::{ActiveExecutionTurn, SessionRecord};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static ACCEPTED_AT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -52,15 +52,6 @@ use crate::{
         submit_shadow_dispatch_submission,
     },
 };
-
-pub(super) struct SessionActionAccepted {
-    session_id: SessionId,
-    entry_id: String,
-    accepted_at: UtcMillis,
-    created_session: bool,
-    root_task_id: magi_core::TaskId,
-    action_task_id: magi_core::TaskId,
-}
 
 pub fn build_router(state: ApiState) -> Router {
     let api_routes = Router::new()
@@ -95,9 +86,10 @@ async fn health(State(state): State<ApiState>) -> Json<HealthDto> {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct BootstrapQuery {
+    #[serde(rename = "sessionId", alias = "session_id")]
     session_id: Option<String>,
+    #[serde(rename = "workspaceId", alias = "workspace_id")]
     workspace_id: Option<String>,
 }
 
@@ -125,12 +117,10 @@ async fn bootstrap(
 ) -> Result<Json<BootstrapDto>, ApiError> {
     let requested_session_id = query.requested_session_id();
     let workspace_id = query.requested_workspace_id();
-    Ok(Json(
-        state.bootstrap_dto_for_workspace_session(
-            workspace_id.as_deref(),
-            requested_session_id.as_ref(),
-        ),
-    ))
+    Ok(Json(state.bootstrap_dto_for_workspace_session(
+        workspace_id.as_deref(),
+        requested_session_id.as_ref(),
+    )))
 }
 
 async fn runtime_read_model(State(state): State<ApiState>) -> Json<RuntimeReadModelDto> {
@@ -149,7 +139,9 @@ async fn bridge_preflight(State(state): State<ApiState>) -> Json<BridgePreflight
     Json(state.bridge_preflight_dto())
 }
 
-async fn bridge_cutover_smoke(State(state): State<ApiState>) -> Json<BridgeCutoverSmokeSnapshotDto> {
+async fn bridge_cutover_smoke(
+    State(state): State<ApiState>,
+) -> Json<BridgeCutoverSmokeSnapshotDto> {
     Json(state.bridge_cutover_smoke_dto())
 }
 
@@ -161,7 +153,8 @@ async fn submit_session_action(
     State(state): State<ApiState>,
     Json(request): Json<SessionActionRequestDto>,
 ) -> Result<Json<SessionActionResponseDto>, ApiError> {
-    let (accepted, event_id) = execute_session_action_submission(&state, &request)?;
+    let (accepted, event_id) = accept_session_action_submission(&state, &request)?;
+    spawn_session_action_dispatch(state.clone(), accepted.clone());
 
     Ok(Json(SessionActionResponseDto::new(
         accepted.session_id,
@@ -174,10 +167,16 @@ async fn submit_session_action(
     )))
 }
 
-pub(super) fn execute_session_action_submission(
+pub(super) fn accept_session_action_submission(
     state: &ApiState,
     request: &SessionActionRequestDto,
-) -> Result<(SessionActionAccepted, EventId), ApiError> {
+) -> Result<(DispatchSubmissionAccepted, EventId), ApiError> {
+    if !request.has_execution_trigger() {
+        return Err(ApiError::InvalidInput(
+            "普通对话不能提交到任务执行入口，请使用普通对话通道".to_string(),
+        ));
+    }
+
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_message(trimmed_text.as_deref());
     let mission_title = request.mission_title(trimmed_text.as_deref());
@@ -207,7 +206,7 @@ fn execute_dispatch_submission(
     skill_name: Option<String>,
     target_role: Option<String>,
     request: &SessionActionRequestDto,
-) -> Result<(SessionActionAccepted, EventId), ApiError> {
+) -> Result<(DispatchSubmissionAccepted, EventId), ApiError> {
     let accepted_at = monotonic_accepted_at();
     let (session_id, created_session, workspace_id) = resolve_dispatch_session(
         state,
@@ -216,7 +215,7 @@ fn execute_dispatch_submission(
         &mission_title,
         accepted_at,
     )?;
-    append_dispatch_user_message(state, &session_id, accepted_at, &message);
+    append_session_user_message(state, &session_id, accepted_at, &message);
     let action_task_title = format!("执行: {}", mission_title);
 
     let dispatch = DispatchSubmissionRequest {
@@ -232,23 +231,36 @@ fn execute_dispatch_submission(
         skill_name,
         target_role,
     };
-    let mut accepted = submit_shadow_dispatch_submission(state, dispatch)?;
+    let accepted = submit_shadow_dispatch_submission(state, dispatch)?;
     let event_id = publish_session_action_accepted_event(state, request, &accepted)?;
-    drive_shadow_dispatch_submission(state, &mut accepted)?;
-    append_dispatch_assistant_message(state, &accepted);
     state.persist_session_durable_state()?;
+    Ok((accepted, event_id))
+}
 
-    Ok((
-        SessionActionAccepted {
-            session_id: accepted.session_id,
-            entry_id: accepted.entry_id,
-            accepted_at: accepted.accepted_at,
-            created_session: accepted.created_session,
-            root_task_id: accepted.root_task_id,
-            action_task_id: accepted.action_task_id,
-        },
-        event_id,
-    ))
+fn spawn_session_action_dispatch(state: ApiState, accepted: DispatchSubmissionAccepted) {
+    tokio::task::spawn_blocking(move || {
+        let mut accepted = accepted;
+        if let Err(error) = drive_shadow_dispatch_submission(&state, &mut accepted) {
+            tracing::error!(
+                session_id = %accepted.session_id,
+                root_task_id = %accepted.root_task_id,
+                action_task_id = %accepted.action_task_id,
+                ?error,
+                "session action background dispatch failed"
+            );
+            let _ = state.persist_session_durable_state();
+            return;
+        }
+        append_dispatch_assistant_message(&state, &accepted);
+        if let Err(error) = state.persist_session_durable_state() {
+            tracing::error!(
+                session_id = %accepted.session_id,
+                root_task_id = %accepted.root_task_id,
+                ?error,
+                "session action background dispatch persist failed"
+            );
+        }
+    });
 }
 
 fn publish_session_action_accepted_event(
@@ -303,22 +315,17 @@ fn resolve_dispatch_session(
             .session_store
             .session(&session_id)
             .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
-        let workspace_id = resolve_session_workspace_binding(
-            state,
-            &session,
-            requested_workspace_id.as_ref(),
-        )?;
+        let workspace_id =
+            resolve_session_workspace_binding(state, &session, requested_workspace_id.as_ref())?;
         return Ok((session_id, false, workspace_id));
     }
     if let Some(current_session) = state.session_store.current_session() {
-        let current_workspace_id = resolve_session_workspace_binding(
-            state,
-            &current_session,
-            None,
-        )?;
-        if let (Some(requested_workspace_id), Some(bound_workspace_id)) =
-            (requested_workspace_id.as_ref(), current_workspace_id.as_ref())
-            && requested_workspace_id != bound_workspace_id
+        let current_workspace_id =
+            resolve_session_workspace_binding(state, &current_session, None)?;
+        if let (Some(requested_workspace_id), Some(bound_workspace_id)) = (
+            requested_workspace_id.as_ref(),
+            current_workspace_id.as_ref(),
+        ) && requested_workspace_id != bound_workspace_id
         {
             let session_id = new_session_id();
             state
@@ -379,7 +386,7 @@ fn resolve_session_workspace_binding(
     Ok(requested_workspace_id.cloned().or(bound_workspace_id))
 }
 
-fn append_dispatch_user_message(
+pub(super) fn append_session_user_message(
     state: &ApiState,
     session_id: &SessionId,
     accepted_at: UtcMillis,
@@ -415,10 +422,26 @@ fn append_dispatch_assistant_message(state: &ApiState, accepted: &DispatchSubmis
     let Some(task) = task_store.get_task(&accepted.action_task_id) else {
         return;
     };
-    let response_text = task.output_refs.join("\n");
-    if response_text.is_empty() {
+    if task.status != TaskStatus::Completed {
         return;
     }
+    let current_turn = state
+        .session_store
+        .runtime_sidecar(&accepted.session_id)
+        .and_then(|sidecar| sidecar.active_execution_chain)
+        .and_then(|chain| chain.current_turn);
+    let current_turn_matches = current_turn
+        .as_ref()
+        .is_some_and(|turn| turn_matches_accepted_dispatch(turn, accepted));
+    let response_text = if current_turn_matches {
+        current_turn.and_then(|turn| assistant_final_from_turn(turn, accepted))
+    } else {
+        assistant_message_from_task_output_refs(&task)
+    };
+
+    let Some(response_text) = response_text else {
+        return;
+    };
 
     state.session_store.append_timeline_entry(
         accepted.session_id.clone(),
@@ -442,6 +465,65 @@ fn append_dispatch_assistant_message(state: &ApiState, accepted: &DispatchSubmis
     );
 }
 
+fn turn_matches_accepted_dispatch(
+    turn: &ActiveExecutionTurn,
+    accepted: &DispatchSubmissionAccepted,
+) -> bool {
+    turn.accepted_at == accepted.accepted_at
+        || turn
+            .items
+            .iter()
+            .any(|item| item.task_id.as_ref() == Some(&accepted.action_task_id))
+}
+
+fn assistant_final_from_turn(
+    turn: ActiveExecutionTurn,
+    accepted: &DispatchSubmissionAccepted,
+) -> Option<String> {
+    turn.items
+        .into_iter()
+        .filter(|item| item.kind == "assistant_final")
+        .filter(|item| {
+            item.task_id
+                .as_ref()
+                .is_none_or(|task_id| task_id == &accepted.action_task_id)
+        })
+        .filter_map(|item| {
+            item.content
+                .filter(|content| !content.trim().is_empty())
+                .map(|content| (item.item_seq, content))
+        })
+        .max_by_key(|(item_seq, _)| *item_seq)
+        .map(|(_, content)| content)
+}
+
+fn assistant_message_from_task_output_refs(task: &Task) -> Option<String> {
+    task.output_refs
+        .iter()
+        .rev()
+        .find_map(|output_ref| visible_text_from_output_ref(output_ref))
+}
+
+fn visible_text_from_output_ref(output_ref: &str) -> Option<String> {
+    let trimmed = output_ref.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed)
+        && let Some(blocks) = value.get("blocks").and_then(Value::as_array)
+        && let Some(content) = blocks
+            .iter()
+            .rev()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("content").and_then(Value::as_str))
+            .map(str::trim)
+            .find(|content| !content.is_empty())
+    {
+        return Some(content.to_string());
+    }
+    Some(trimmed.to_string())
+}
+
 async fn stream_events(State(state): State<ApiState>) -> impl axum::response::IntoResponse {
     sse::events(state).await
 }
@@ -449,48 +531,55 @@ async fn stream_events(State(state): State<ApiState>) -> impl axum::response::In
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dto::{
+        BridgeProbeErrorDto, BridgeServiceSnapshotDto, BridgeServicesSnapshotDto,
+        BridgeSnapshotProvider,
+    };
+    use crate::state::RunnerManager;
+    use crate::task_execution::{ShadowTaskDispatcher, submit_shadow_dispatch_submission};
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use crate::dto::{
-        BridgeProbeErrorDto, BridgeServiceSnapshotDto, BridgeSnapshotProvider,
-        BridgeServicesSnapshotDto,
-    };
-    use crate::task_execution::ShadowTaskDispatcher;
     use magi_bridge_client::{
         BridgeErrorLayer, BridgeResponse, BridgeServerHandshake, BridgeServerHealth,
         BridgeServerKind, BridgeServerServiceCatalog, BridgeTransport, BridgeTransportError,
         BridgeTransportRequest, BridgeTransportResponse, LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD,
-        LOCAL_BRIDGE_HANDSHAKE_METHOD, LOCAL_BRIDGE_HEALTH_METHOD, ModelBridgeClient,
-        ModelInvocationRequest,
-        McpManagerListServersResponse, SHADOW_MCP_SERVER_NAME, SHADOW_MCP_TOOL_NAME,
+        LOCAL_BRIDGE_HANDSHAKE_METHOD, LOCAL_BRIDGE_HEALTH_METHOD, McpManagerListServersResponse,
+        ModelBridgeClient, ModelInvocationRequest, SHADOW_MCP_SERVER_NAME, SHADOW_MCP_TOOL_NAME,
         SHADOW_MODEL_PROVIDER,
     };
-    use magi_core::{AbsolutePath, EventId, ExecutionOwnership, MissionId, SessionId, TaskId, TaskStatus, WorkspaceId};
     use magi_context_runtime::{ContextBudget, ContextRuntime};
+    use magi_core::{
+        AbsolutePath, EventId, ExecutionOwnership, LeaseId, MissionId, SessionId, Task, TaskId,
+        TaskKind, TaskStatus, UtcMillis, WorkspaceId,
+    };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_knowledge_store::KnowledgeStore;
     use magi_memory_store::MemoryStore;
+    use magi_orchestrator::task_runner::{EventBasedResultReceiver, TaskOutcome, TaskResult};
     use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
-    use magi_session_store::SessionStore;
-    use serde_json::Value;
-    use std::{
-        collections::{HashMap, HashSet},
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Mutex,
-        },
+    use magi_session_store::{
+        ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
+        ActiveExecutionTurnItem, SessionStore,
     };
     use magi_skill_runtime::SkillDispatchRuntime;
     use magi_tool_runtime::ToolRegistry;
     use magi_worker_runtime::WorkerRuntime;
     use magi_workspace::WorkspaceStore;
+    use serde_json::Value;
     use std::sync::Arc;
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
     use tower::util::ServiceExt;
-    use crate::state::RunnerManager;
-    use magi_orchestrator::task_runner::EventBasedResultReceiver;
 
     fn test_state() -> ApiState {
         let event_bus = Arc::new(InMemoryEventBus::new(32));
@@ -545,41 +634,47 @@ mod tests {
             session_id.clone(),
             ExecutionOwnership {
                 session_id: Some(session_id.clone()),
-                workspace_id: Some(workspace_id),
+                workspace_id: Some(workspace_id.clone()),
                 execution_chain_ref: Some("shadow-route-chain".to_string()),
                 ..ExecutionOwnership::default()
             },
         );
 
-        let knowledge_store = KnowledgeStore::new();
-        knowledge_store.ingest_code_index(magi_knowledge_store::CodeIndexIngestion {
-            knowledge_id: "kb-route-context-1".to_string(),
-            title: "Route parser refresh".to_string(),
-            content: "Refresh parser through session action route.".to_string(),
-            tags: vec!["parser".to_string(), "route".to_string()],
-            source_ref: Some("knowledge://route-context".to_string()),
-            updated_at: magi_core::UtcMillis::now(),
-            source: magi_knowledge_store::CodeIndexSource {
-                path: "src/routes.rs".to_string(),
-                language: Some("rust".to_string()),
-                repo_ref: Some("repo".to_string()),
-                commit_ref: Some("commit".to_string()),
-                start_line: Some(20),
-                end_line: Some(120),
-                symbol: None,
-            },
-            audit: Some(magi_knowledge_store::KnowledgeAuditLink {
-                audit_event_id: "audit-route-context-1".to_string(),
-                trail_ref: Some("audit/trails/route-context.json".to_string()),
-                sequence: Some(5),
-            }),
-            governance: Some(magi_knowledge_store::KnowledgeGovernanceLink {
-                outcome: magi_knowledge_store::KnowledgeGovernanceOutcome::Allowed,
-                policy_refs: vec!["policy.knowledge.read".to_string()],
-                rationale: Some("allowed for session action shadow dispatch".to_string()),
-                audit_event_id: Some("audit-route-context-1".to_string()),
-            }),
-        });
+        let knowledge_store = {
+            let store = KnowledgeStore::new();
+            store.ingest_code_index_in_workspace(
+                workspace_id,
+                magi_knowledge_store::CodeIndexIngestion {
+                    knowledge_id: "kb-route-context-1".to_string(),
+                    title: "Route parser refresh".to_string(),
+                    content: "Refresh parser through session action route.".to_string(),
+                    tags: vec!["parser".to_string(), "route".to_string()],
+                    source_ref: Some("knowledge://route-context".to_string()),
+                    updated_at: magi_core::UtcMillis::now(),
+                    source: magi_knowledge_store::CodeIndexSource {
+                        path: "src/routes.rs".to_string(),
+                        language: Some("rust".to_string()),
+                        repo_ref: Some("repo".to_string()),
+                        commit_ref: Some("commit".to_string()),
+                        start_line: Some(20),
+                        end_line: Some(120),
+                        symbol: None,
+                    },
+                    audit: Some(magi_knowledge_store::KnowledgeAuditLink {
+                        audit_event_id: "audit-route-context-1".to_string(),
+                        trail_ref: Some("audit/trails/route-context.json".to_string()),
+                        sequence: Some(5),
+                    }),
+                    governance: Some(magi_knowledge_store::KnowledgeGovernanceLink {
+                        outcome: magi_knowledge_store::KnowledgeGovernanceOutcome::Allowed,
+                        policy_refs: vec!["policy.knowledge.read".to_string()],
+                        rationale: Some("allowed for session action shadow dispatch".to_string()),
+                        audit_event_id: Some("audit-route-context-1".to_string()),
+                    }),
+                },
+            );
+            store
+        };
 
         let memory_store = MemoryStore::new();
 
@@ -594,15 +689,35 @@ mod tests {
         let worker_runtime = worker_runtime_factory(Arc::clone(&event_bus));
         let context_runtime = ContextRuntime::new(knowledge_store, memory_store.clone());
         let context_runtime_for_dispatcher = Arc::new(context_runtime.clone());
-        let task_store = Arc::new(TaskStore::new());
+        let runner_result_receiver = Arc::new(EventBasedResultReceiver::new());
+        let receiver_for_status = runner_result_receiver.clone();
+        let task_store = Arc::new(TaskStore::with_status_change_callback(Box::new(
+            move |task_id, new_status, _task| match new_status {
+                TaskStatus::Completed => {
+                    receiver_for_status.push_result(TaskResult {
+                        task_id: task_id.clone(),
+                        lease_id: LeaseId::new(format!("lease-result-{}", task_id)),
+                        outcome: TaskOutcome::Completed {
+                            output_refs: Vec::new(),
+                        },
+                    });
+                }
+                TaskStatus::Failed => {
+                    receiver_for_status.push_result(TaskResult {
+                        task_id: task_id.clone(),
+                        lease_id: LeaseId::new(format!("lease-result-{}", task_id)),
+                        outcome: TaskOutcome::Failed {
+                            error: "task store reported terminal failure".to_string(),
+                        },
+                    });
+                }
+                _ => {
+                    receiver_for_status.clear_seen(task_id);
+                }
+            },
+        )));
         let execution_runtime = orchestrator
-            .execution_runtime_with_recovery_support(
-                worker_runtime,
-                tool_registry,
-                skill_runtime,
-                Arc::clone(&session_store),
-                Arc::clone(&workspace_store),
-            )
+            .execution_runtime(worker_runtime, tool_registry, skill_runtime)
             .with_task_store(Arc::clone(&task_store))
             .with_context_runtime(
                 context_runtime,
@@ -626,10 +741,10 @@ mod tests {
             governance,
         )
         .with_shadow_execution_pipeline(orchestrator, execution_runtime, memory_store)
+        .with_model_bridge_client(model_bridge_client.clone())
         .with_task_store(Arc::clone(&task_store));
 
         let state_for_task_workers = state.clone();
-        let runner_result_receiver = Arc::new(EventBasedResultReceiver::new());
         let dispatcher = Arc::new(
             ShadowTaskDispatcher::new(
                 event_bus,
@@ -712,6 +827,25 @@ mod tests {
         (status, body)
     }
 
+    async fn wait_for_condition(
+        timeout: Duration,
+        interval: Duration,
+        mut condition: impl FnMut() -> bool,
+        description: &str,
+    ) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if condition() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                assert!(condition(), "{description}");
+                return;
+            }
+            tokio::time::sleep(interval).await;
+        }
+    }
+
     fn bind_test_session_mission(
         state: &ApiState,
         session_id: &str,
@@ -753,6 +887,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_accepts_camel_case_workspace_query() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-bootstrap-query");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-workspace-bootstrap-query"),
+            )
+            .expect("workspace should register");
+        let session_id = SessionId::new("session-bootstrap-query");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "Bootstrap Query Session",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        state.session_store.bind_execution_ownership(
+            session_id.clone(),
+            ExecutionOwnership {
+                session_id: Some(session_id),
+                workspace_id: Some(workspace_id),
+                ..ExecutionOwnership::default()
+            },
+        );
+        let app = build_router(state);
+
+        let bootstrap = get_json(app, "/bootstrap?workspaceId=workspace-bootstrap-query").await;
+
+        assert_eq!(
+            bootstrap["currentSession"]["sessionId"],
+            "session-bootstrap-query"
+        );
+        let sessions = bootstrap["sessions"]
+            .as_array()
+            .expect("sessions should be an array");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "session-bootstrap-query");
+    }
+
+    #[tokio::test]
+    async fn session_chat_does_not_create_task_graph() {
+        let app = build_router(test_state_with_shadow_execution_pipeline());
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/api/session/chat",
+            json!({
+                "sessionId": "session-route-shadow",
+                "text": "你好，这只是普通对话",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "普通对话应提交成功: {body:?}");
+        assert_eq!(body["sessionId"], "session-route-shadow");
+        assert!(
+            body.get("rootTaskId").is_none(),
+            "普通对话响应不应暴露任务根 ID: {body:?}"
+        );
+
+        let runtime_read_model = get_json(app.clone(), "/runtime/read-model").await;
+        assert!(
+            runtime_read_model["details"]["tasks"]
+                .as_array()
+                .expect("tasks should serialize as array")
+                .is_empty(),
+            "普通对话不能创建 TaskStore 任务"
+        );
+        let session_summary = runtime_read_model["details"]["sessions"]
+            .as_array()
+            .expect("sessions should serialize as array")
+            .iter()
+            .find(|session| session["session_id"] == "session-route-shadow")
+            .expect("chat session should exist in read model");
+        assert!(
+            session_summary["current_turn"].is_null(),
+            "普通对话不应创建任务 turn envelope"
+        );
+
+        let messages = get_json(app, "/api/messages?sessionId=session-route-shadow").await;
+        let message_items = messages["messages"]
+            .as_array()
+            .expect("messages should serialize as array");
+        assert_eq!(
+            message_items
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .count(),
+            1
+        );
+        assert_eq!(
+            message_items
+                .iter()
+                .filter(|message| message["role"] == "assistant")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn session_action_route_rejects_plain_chat_without_execution_trigger() {
+        let app = build_router(test_state_with_shadow_execution_pipeline());
+
+        let (status, body) = post_json(
+            app,
+            "/session/action",
+            json!({
+                "session_id": "session-route-shadow",
+                "text": "你好，这只是普通对话",
+                "deep_task": false,
+                "skill_name": null,
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error_code"], "INPUT_INVALID");
+        assert_eq!(
+            body["message"],
+            "普通对话不能提交到任务执行入口，请使用普通对话通道"
+        );
+    }
+
+    #[tokio::test]
     async fn session_action_route_drives_shadow_dispatch_and_updates_runtime_read_model() {
         let state = test_state_with_shadow_execution_pipeline();
         let app = build_router(state.clone());
@@ -781,8 +1042,6 @@ mod tests {
             .as_u64()
             .expect("accepted_at should serialize as integer");
         let first_extraction_id = format!("extract-session-action-{first_accepted_at}");
-        let first_read_model = state.runtime_read_model_dto();
-        assert_eq!(first_read_model.details.execution_groups.len(), 1);
         let first_mission_id = format!("mission-session-action-{first_accepted_at}");
         let first_root_task_id = TaskId::new(
             first_body["root_task_id"]
@@ -794,6 +1053,39 @@ mod tests {
                 .as_str()
                 .expect("action_task_id should serialize as string"),
         );
+        let task_store = state.task_store().expect("task store should be configured");
+        wait_for_condition(
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+            || {
+                let root_completed = task_store
+                    .get_task(&first_root_task_id)
+                    .map(|task| task.status == TaskStatus::Completed)
+                    .unwrap_or(false);
+                let action_completed = task_store
+                    .get_task(&first_action_task_id)
+                    .map(|task| task.status == TaskStatus::Completed)
+                    .unwrap_or(false);
+                let read_model = state.runtime_read_model_dto();
+                let first_mission_entry = read_model
+                    .details
+                    .execution_groups
+                    .iter()
+                    .find(|entry| entry.mission_id == first_mission_id);
+                root_completed
+                    && action_completed
+                    && first_mission_entry
+                        .map(|entry| {
+                            entry.context_used_knowledge_count == 1
+                                && entry.context_used_memory_count == 0
+                                && entry.context_memory_extraction_refs.is_empty()
+                        })
+                        .unwrap_or(false)
+            },
+            "first session action background dispatch should complete and publish context usage",
+        )
+        .await;
+        let first_read_model = state.runtime_read_model_dto();
         let first_mission_entry = first_read_model
             .details
             .execution_groups
@@ -802,8 +1094,11 @@ mod tests {
             .expect("first execution group entry should exist");
         assert_eq!(first_mission_entry.context_used_knowledge_count, 1);
         assert_eq!(first_mission_entry.context_used_memory_count, 0);
-        assert!(first_mission_entry.context_memory_extraction_refs.is_empty());
-        let task_store = state.task_store().expect("task store should be configured");
+        assert!(
+            first_mission_entry
+                .context_memory_extraction_refs
+                .is_empty()
+        );
         let first_root_task = task_store
             .get_task(&first_root_task_id)
             .expect("root task should exist");
@@ -859,6 +1154,56 @@ mod tests {
                 .as_str()
                 .expect("root_task_id should serialize as string"),
         );
+        let second_action_task_id = TaskId::new(
+            second_body["action_task_id"]
+                .as_str()
+                .expect("action_task_id should serialize as string"),
+        );
+        let second_extraction_id = format!("extract-session-action-{second_accepted_at}");
+        wait_for_condition(
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+            || {
+                let root_completed = task_store
+                    .get_task(&second_root_task_id)
+                    .map(|task| task.status == TaskStatus::Completed)
+                    .unwrap_or(false);
+                let action_completed = task_store
+                    .get_task(&second_action_task_id)
+                    .map(|task| task.status == TaskStatus::Completed)
+                    .unwrap_or(false);
+                let read_model = state.runtime_read_model_dto();
+                let second_mission_entry = read_model
+                    .details
+                    .execution_groups
+                    .iter()
+                    .find(|entry| entry.mission_id == second_mission_id);
+                let extraction_ready = state
+                    .shadow_execution_pipeline()
+                    .expect("shadow execution pipeline should exist")
+                    .memory_store
+                    .verify_extraction_linkage(&second_extraction_id)
+                    .map(|verification| verification.is_consistent)
+                    .unwrap_or(false);
+                root_completed
+                    && action_completed
+                    && extraction_ready
+                    && second_mission_entry
+                        .map(|entry| {
+                            entry.context_used_knowledge_count == 1
+                                && entry.context_used_memory_count == 1
+                                && entry.context_code_index_knowledge_count == 1
+                                && entry.context_extracted_memory_count == 1
+                                && entry.context_knowledge_source_paths
+                                    == vec!["src/routes.rs".to_string()]
+                                && entry.context_memory_extraction_refs
+                                    == vec![format!("extract-session-action-{first_accepted_at}")]
+                        })
+                        .unwrap_or(false)
+            },
+            "second session action background dispatch should complete and reuse prior extraction context",
+        )
+        .await;
         let read_model = state.runtime_read_model_dto();
         assert_eq!(read_model.details.execution_groups.len(), 2);
         let mission_entry = read_model
@@ -886,7 +1231,6 @@ mod tests {
         let second_children = task_store.get_children(&second_root_task_id);
         assert_eq!(second_children.len(), 1);
         assert_eq!(second_children[0].status, TaskStatus::Completed);
-        let second_extraction_id = format!("extract-session-action-{second_accepted_at}");
         let verification = state
             .shadow_execution_pipeline()
             .expect("shadow execution pipeline should exist")
@@ -936,7 +1280,7 @@ mod tests {
                 "workspace_id": workspace_id.to_string(),
                 "text": "Use alternate workspace",
                 "deep_task": false,
-                "skill_name": null,
+                "skill_name": "refactor",
                 "images": [],
             }),
         )
@@ -953,6 +1297,572 @@ mod tests {
             .session(&session_id)
             .expect("session should still exist");
         assert_eq!(session.workspace_id.as_deref(), Some(workspace_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn session_action_route_exposes_current_turn_items_and_worker_lanes() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let app = build_router(state.clone());
+        let session_id = SessionId::new("session-turn-view");
+        state
+            .session_store
+            .create_session(session_id.clone(), "turn view session")
+            .expect("session should create");
+
+        let (status, body) = post_json(
+            app,
+            "/session/action",
+            json!({
+                "session_id": session_id.to_string(),
+                "text": "请分析并拆分这个复杂任务",
+                "deep_task": true,
+                "skill_name": "deep_task",
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected response body: {body:?}");
+
+        let read_model = state.runtime_read_model_dto();
+        let session_entry = read_model
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == session_id.to_string())
+            .expect("session runtime summary should exist");
+        let current_turn = session_entry
+            .current_turn
+            .as_ref()
+            .expect("current turn should exist after session action");
+        assert!(current_turn.turn_id.starts_with("turn-session-action-"));
+        assert_eq!(
+            current_turn.execution_chain_ref.as_deref(),
+            session_entry.execution_chain_ref.as_deref(),
+        );
+        assert!(
+            session_entry
+                .turn_items
+                .iter()
+                .any(|item| item.kind == "assistant_phase"),
+            "turn items should include assistant phase"
+        );
+        let expected_lane_count = session_entry
+            .active_branches
+            .iter()
+            .filter(|branch| !branch.is_primary)
+            .count();
+        assert_eq!(session_entry.worker_lanes.len(), expected_lane_count);
+        if expected_lane_count > 0 {
+            assert!(
+                session_entry
+                    .worker_lanes
+                    .iter()
+                    .all(|lane| !lane.status.is_empty()),
+                "worker lane status should be populated from task store"
+            );
+            assert!(
+                session_entry
+                    .worker_lanes
+                    .iter()
+                    .all(|lane| lane.role_id.as_deref() == Some("integration-dev")),
+                "worker lane tabs must expose role ids, not internal lane/task ids"
+            );
+            assert!(
+                session_entry
+                    .turn_items
+                    .iter()
+                    .filter(|item| item.worker_visible)
+                    .all(|item| item.role_id.as_deref() == Some("integration-dev")),
+                "worker-visible turn items must be grouped by role id"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn append_dispatch_assistant_message_uses_current_turn_assistant_final_as_authoritative_source()
+     {
+        let state = test_state_with_shadow_execution_pipeline();
+        let session_id = SessionId::new("session-turn-output-refs");
+        state
+            .session_store
+            .create_session(session_id.clone(), "turn output refs session")
+            .expect("session should create");
+
+        let mission_id = MissionId::new("mission-turn-output-refs");
+        let action_task_id = TaskId::new("task-turn-output-refs");
+        let accepted_at = UtcMillis::now();
+
+        state
+            .session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: action_task_id.clone(),
+                    execution_chain_ref: "chain-turn-output-refs".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![action_task_id.clone()],
+                    active_worker_bindings: vec![],
+                    branches: vec![],
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at,
+                        entry_id: format!("timeline-{session_id}-{}", accepted_at.0),
+                        trimmed_text: Some("请输出完整总结".to_string()),
+                        deep_task: false,
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: "turn-output-refs".to_string(),
+                        turn_seq: 1,
+                        accepted_at,
+                        status: "completed".to_string(),
+                        user_message: Some("请输出完整总结".to_string()),
+                        items: vec![
+                            ActiveExecutionTurnItem {
+                                item_id: "turn-item-assistant-stream".to_string(),
+                                item_seq: 1,
+                                lane_id: None,
+                                lane_seq: None,
+                                kind: "assistant_stream".to_string(),
+                                status: "completed".to_string(),
+                                source: "orchestrator".to_string(),
+                                title: Some("生成回复".to_string()),
+                                content: Some("这是一段流式中的中间内容".to_string()),
+                                task_id: Some(action_task_id.clone()),
+                                worker_id: None,
+                                role_id: None,
+                                tool_call_id: None,
+                                tool_name: None,
+                                tool_status: None,
+                                tool_result: None,
+                                tool_error: None,
+                                thread_visible: false,
+                                worker_visible: false,
+                            },
+                            ActiveExecutionTurnItem {
+                                item_id: "turn-item-assistant-final".to_string(),
+                                item_seq: 2,
+                                lane_id: None,
+                                lane_seq: None,
+                                kind: "assistant_final".to_string(),
+                                status: "completed".to_string(),
+                                source: "orchestrator".to_string(),
+                                title: Some("最终总结".to_string()),
+                                content: Some("这是来自 assistant_final 的最终总结".to_string()),
+                                task_id: Some(action_task_id.clone()),
+                                worker_id: None,
+                                role_id: None,
+                                tool_call_id: None,
+                                tool_name: None,
+                                tool_status: None,
+                                tool_result: None,
+                                tool_error: None,
+                                thread_visible: true,
+                                worker_visible: false,
+                            },
+                        ],
+                        worker_lanes: vec![],
+                    }),
+                },
+            )
+            .expect("active execution chain should upsert");
+
+        state
+            .task_store()
+            .expect("task store should exist")
+            .insert_task(Task {
+                task_id: action_task_id.clone(),
+                mission_id: mission_id.clone(),
+                root_task_id: action_task_id.clone(),
+                parent_task_id: None,
+                kind: TaskKind::Action,
+                title: "执行: turn output refs".to_string(),
+                goal: "验证 assistant_final 作为唯一结果来源".to_string(),
+                status: TaskStatus::Completed,
+                dependency_ids: vec![],
+                required_children: vec![],
+                policy_snapshot: None,
+                executor_binding: None,
+                context_refs: vec![],
+                knowledge_refs: vec![],
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: vec![],
+                output_refs: vec!["这是来自 output_refs 的旧结果".to_string()],
+                evidence_refs: vec![],
+                retry_count: 0,
+                repair_count: 0,
+                decision_payload: None,
+                created_at: accepted_at,
+                updated_at: accepted_at,
+            });
+
+        append_dispatch_assistant_message(
+            &state,
+            &DispatchSubmissionAccepted {
+                session_id: session_id.clone(),
+                entry_id: format!("timeline-{session_id}-{}", accepted_at.0),
+                accepted_at,
+                created_session: false,
+                root_task_id: action_task_id.clone(),
+                action_task_id: action_task_id.clone(),
+                runner_started: false,
+            },
+        );
+
+        let assistant_messages = state
+            .session_store
+            .timeline()
+            .into_iter()
+            .filter(|entry| {
+                entry.session_id == session_id
+                    && matches!(
+                        entry.kind,
+                        magi_session_store::TimelineEntryKind::AssistantMessage
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistant_messages.len(), 1);
+        assert_eq!(
+            assistant_messages[0].message,
+            "这是来自 assistant_final 的最终总结"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_dispatch_assistant_message_skips_output_refs_when_current_turn_has_no_assistant_final()
+     {
+        let state = test_state_with_shadow_execution_pipeline();
+        let session_id = SessionId::new("session-turn-no-assistant-final");
+        state
+            .session_store
+            .create_session(session_id.clone(), "turn no assistant final session")
+            .expect("session should create");
+
+        let mission_id = MissionId::new("mission-turn-no-assistant-final");
+        let action_task_id = TaskId::new("task-turn-no-assistant-final");
+        let accepted_at = UtcMillis::now();
+
+        state
+            .session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: action_task_id.clone(),
+                    execution_chain_ref: "chain-turn-no-assistant-final".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![action_task_id.clone()],
+                    active_worker_bindings: vec![],
+                    branches: vec![],
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at,
+                        entry_id: format!("timeline-{session_id}-{}", accepted_at.0),
+                        trimmed_text: Some("请不要回退到 output refs".to_string()),
+                        deep_task: false,
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: "turn-no-assistant-final".to_string(),
+                        turn_seq: 1,
+                        accepted_at,
+                        status: "completed".to_string(),
+                        user_message: Some("请不要回退到 output refs".to_string()),
+                        items: vec![ActiveExecutionTurnItem {
+                            item_id: "turn-item-assistant-phase".to_string(),
+                            item_seq: 1,
+                            lane_id: None,
+                            lane_seq: None,
+                            kind: "assistant_phase".to_string(),
+                            status: "completed".to_string(),
+                            source: "orchestrator".to_string(),
+                            title: Some("生成回复".to_string()),
+                            content: Some("只存在阶段项".to_string()),
+                            task_id: Some(action_task_id.clone()),
+                            worker_id: None,
+                            role_id: None,
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_status: None,
+                            tool_result: None,
+                            tool_error: None,
+                            thread_visible: true,
+                            worker_visible: false,
+                        }],
+                        worker_lanes: vec![],
+                    }),
+                },
+            )
+            .expect("active execution chain should upsert");
+
+        state
+            .task_store()
+            .expect("task store should exist")
+            .insert_task(Task {
+                task_id: action_task_id.clone(),
+                mission_id: mission_id.clone(),
+                root_task_id: action_task_id.clone(),
+                parent_task_id: None,
+                kind: TaskKind::Action,
+                title: "执行: turn no assistant final".to_string(),
+                goal: "验证没有 assistant_final 时不回退".to_string(),
+                status: TaskStatus::Completed,
+                dependency_ids: vec![],
+                required_children: vec![],
+                policy_snapshot: None,
+                executor_binding: None,
+                context_refs: vec![],
+                knowledge_refs: vec![],
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: vec![],
+                output_refs: vec!["这是不应再被采用的 output refs".to_string()],
+                evidence_refs: vec![],
+                retry_count: 0,
+                repair_count: 0,
+                decision_payload: None,
+                created_at: accepted_at,
+                updated_at: accepted_at,
+            });
+
+        append_dispatch_assistant_message(
+            &state,
+            &DispatchSubmissionAccepted {
+                session_id: session_id.clone(),
+                entry_id: format!("timeline-{session_id}-{}", accepted_at.0),
+                accepted_at,
+                created_session: false,
+                root_task_id: action_task_id.clone(),
+                action_task_id,
+                runner_started: false,
+            },
+        );
+
+        let assistant_messages = state
+            .session_store
+            .timeline()
+            .into_iter()
+            .filter(|entry| {
+                entry.session_id == session_id
+                    && matches!(
+                        entry.kind,
+                        magi_session_store::TimelineEntryKind::AssistantMessage
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            assistant_messages.is_empty(),
+            "当前 turn 缺少 assistant_final 时，不应再回退到 output refs 追加主线 assistant"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_dispatch_assistant_message_uses_task_output_when_current_turn_was_replaced() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let session_id = SessionId::new("session-turn-replaced");
+        state
+            .session_store
+            .create_session(session_id.clone(), "turn replaced session")
+            .expect("session should create");
+
+        let mission_id = MissionId::new("mission-turn-replaced");
+        let first_action_task_id = TaskId::new("task-turn-replaced-first");
+        let second_action_task_id = TaskId::new("task-turn-replaced-second");
+        let first_accepted_at = UtcMillis::now();
+        let second_accepted_at = UtcMillis(first_accepted_at.0 + 1);
+
+        state
+            .session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: second_action_task_id.clone(),
+                    execution_chain_ref: "chain-turn-replaced-second".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![second_action_task_id.clone()],
+                    active_worker_bindings: vec![],
+                    branches: vec![],
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: second_accepted_at,
+                        entry_id: format!("timeline-{session_id}-{}", second_accepted_at.0),
+                        trimmed_text: Some("第二轮已经替换 current_turn".to_string()),
+                        deep_task: false,
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: "turn-replaced-second".to_string(),
+                        turn_seq: 2,
+                        accepted_at: second_accepted_at,
+                        status: "running".to_string(),
+                        user_message: Some("第二轮已经替换 current_turn".to_string()),
+                        items: vec![ActiveExecutionTurnItem {
+                            item_id: "turn-item-second-stream".to_string(),
+                            item_seq: 1,
+                            lane_id: None,
+                            lane_seq: None,
+                            kind: "assistant_stream".to_string(),
+                            status: "running".to_string(),
+                            source: "orchestrator".to_string(),
+                            title: Some("第二轮".to_string()),
+                            content: Some("第二轮内容".to_string()),
+                            task_id: Some(second_action_task_id.clone()),
+                            worker_id: None,
+                            role_id: None,
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_status: None,
+                            tool_result: None,
+                            tool_error: None,
+                            thread_visible: true,
+                            worker_visible: false,
+                        }],
+                        worker_lanes: vec![],
+                    }),
+                },
+            )
+            .expect("active execution chain should upsert");
+
+        state
+            .task_store()
+            .expect("task store should exist")
+            .insert_task(Task {
+                task_id: first_action_task_id.clone(),
+                mission_id: mission_id.clone(),
+                root_task_id: first_action_task_id.clone(),
+                parent_task_id: None,
+                kind: TaskKind::Action,
+                title: "执行: first".to_string(),
+                goal: "验证 current_turn 被替换后仍写回第一轮结果".to_string(),
+                status: TaskStatus::Completed,
+                dependency_ids: vec![],
+                required_children: vec![],
+                policy_snapshot: None,
+                executor_binding: None,
+                context_refs: vec![],
+                knowledge_refs: vec![],
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: vec![],
+                output_refs: vec![
+                    json!({
+                        "blocks": [
+                            { "type": "tool_call", "content": "工具块不应作为主线文本" },
+                            { "type": "text", "content": "第一轮 action 自己的最终结果" }
+                        ]
+                    })
+                    .to_string(),
+                ],
+                evidence_refs: vec![],
+                retry_count: 0,
+                repair_count: 0,
+                decision_payload: None,
+                created_at: first_accepted_at,
+                updated_at: first_accepted_at,
+            });
+
+        append_dispatch_assistant_message(
+            &state,
+            &DispatchSubmissionAccepted {
+                session_id: session_id.clone(),
+                entry_id: format!("timeline-{session_id}-{}", first_accepted_at.0),
+                accepted_at: first_accepted_at,
+                created_session: false,
+                root_task_id: first_action_task_id.clone(),
+                action_task_id: first_action_task_id,
+                runner_started: false,
+            },
+        );
+
+        let assistant_messages = state
+            .session_store
+            .timeline()
+            .into_iter()
+            .filter(|entry| {
+                entry.session_id == session_id
+                    && matches!(
+                        entry.kind,
+                        magi_session_store::TimelineEntryKind::AssistantMessage
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistant_messages.len(), 1);
+        assert_eq!(
+            assistant_messages[0].message,
+            "第一轮 action 自己的最终结果"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_route_handles_concurrent_creates_without_duplicate_ids() {
+        let persistence_root = std::env::temp_dir().join(format!(
+            "magi-route-session-new-concurrency-{}",
+            UtcMillis::now().0
+        ));
+        std::fs::create_dir_all(&persistence_root).expect("persistence root should be creatable");
+        let workspace_root = persistence_root.join("workspace-root");
+        std::fs::create_dir_all(&workspace_root).expect("workspace root should be creatable");
+
+        let event_bus = Arc::new(InMemoryEventBus::new(32));
+        let session_store = Arc::new(SessionStore::default());
+        let workspace_store = Arc::new(WorkspaceStore::default());
+        let workspace_id = WorkspaceId::new("workspace-route-concurrent-session-new");
+        workspace_store
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new(workspace_root.to_string_lossy().as_ref()),
+            )
+            .expect("workspace should register");
+        workspace_store
+            .activate(&workspace_id)
+            .expect("workspace should activate");
+
+        let state = ApiState::new(
+            "magi",
+            event_bus,
+            session_store,
+            workspace_store,
+            Arc::new(GovernanceService::default()),
+        )
+        .with_runtime_persistence(Arc::new(crate::state::RuntimeStatePersistence::new(
+            persistence_root.join("sessions.json"),
+            persistence_root.join("workspaces.json"),
+            persistence_root.join("knowledge.json"),
+        )));
+        let app = build_router(state);
+
+        let tasks = (0..8)
+            .map(|_| {
+                tokio::spawn(post_json(
+                    app.clone(),
+                    "/api/session/new",
+                    json!({ "workspaceId": workspace_id.to_string() }),
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        let mut seen = std::collections::HashSet::new();
+        for task in tasks {
+            let (status, body) = task.await.expect("request task should join");
+            assert_eq!(status, StatusCode::OK, "unexpected response body: {body:?}");
+            let session_id = body["sessionId"]
+                .as_str()
+                .expect("sessionId should be string")
+                .to_string();
+            let current_session_id = body["currentSession"]["sessionId"]
+                .as_str()
+                .expect("currentSession.sessionId should be string")
+                .to_string();
+            assert_eq!(session_id, current_session_id);
+            assert!(seen.insert(session_id), "sessionId should be unique");
+        }
     }
 
     #[tokio::test]
@@ -977,7 +1887,7 @@ mod tests {
                 "workspace_id": alt_workspace_id.to_string(),
                 "text": "cross workspace should fail",
                 "deep_task": false,
-                "skill_name": null,
+                "skill_name": "refactor",
                 "images": [],
             }),
         )
@@ -1004,7 +1914,7 @@ mod tests {
                 "workspace_id": "workspace-route-shadow",
                 "text": "missing session should fail",
                 "deep_task": false,
-                "skill_name": null,
+                "skill_name": "refactor",
                 "images": [],
             }),
         )
@@ -1047,6 +1957,28 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK, "unexpected response body: {body:?}");
+
+        wait_for_condition(
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+            || {
+                let events = state.event_bus.snapshot().recent_events;
+                events
+                    .iter()
+                    .any(|event| event.event_type == "task.dispatched")
+                    && events
+                        .iter()
+                        .any(|event| event.event_type == "task.llm.started")
+                    && events
+                        .iter()
+                        .any(|event| event.event_type == "task.tool.invoked")
+                    && events
+                        .iter()
+                        .any(|event| event.event_type == "tool.invoked")
+            },
+            "session action dispatch/tool events should be emitted",
+        )
+        .await;
 
         let events = state.event_bus.snapshot().recent_events;
         let owning_session = Some(SessionId::new("session-route-shadow"));
@@ -1102,7 +2034,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::OK, "dispatch failure should still accept the task: {body:?}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "dispatch failure should still accept the task: {body:?}"
+        );
         assert!(body["session_id"].is_string());
         assert!(body["root_task_id"].is_string());
         assert!(body["action_task_id"].is_string());
@@ -1187,9 +2123,30 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "unexpected response body: {seed_body:?}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "unexpected response body: {seed_body:?}"
+        );
 
         let session_id = SessionId::new("session-route-shadow");
+        let task_store = state.task_store().expect("task store should be configured");
+        let seed_action_task_id = TaskId::new(
+            seed_body["action_task_id"]
+                .as_str()
+                .expect("seed action task id should be returned"),
+        );
+        wait_for_condition(
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+            || {
+                task_store
+                    .get_task(&seed_action_task_id)
+                    .is_some_and(|task| task.status == TaskStatus::Completed)
+            },
+            "异步 seed dispatch 应先完成，测试再构造 recovery 状态",
+        )
+        .await;
         let chain = state
             .session_store
             .active_execution_chain(&session_id)
@@ -1202,7 +2159,6 @@ mod tests {
             .workspace_id
             .clone()
             .expect("seed dispatch should bind workspace");
-        let task_store = state.task_store().expect("task store should be configured");
         let recovery_task_id = ownership
             .task_id
             .clone()
@@ -1232,11 +2188,18 @@ mod tests {
             .attach_recovery_ref(&session_id, Some(recovery.recovery_id.clone()))
             .expect("recovery ref should attach to session");
 
+        let assistant_count_before_continue = state
+            .session_store
+            .timeline_for_session(&session_id)
+            .iter()
+            .filter(|entry| matches!(entry.kind, TimelineEntryKind::AssistantMessage))
+            .count();
         let (status, body) = post_json(
             app,
             "/api/session/continue",
             json!({
                 "sessionId": session_id.to_string(),
+                "promptText": "继续刚才的恢复链",
             }),
         )
         .await;
@@ -1256,18 +2219,18 @@ mod tests {
             .shadow_execution_pipeline()
             .expect("shadow execution pipeline should exist")
             .memory_store
-            .verify_extraction_linkage("extract-recovery-recovery-route-1")
-            .expect("recovery route extraction should persist");
+            .verify_extraction_linkage("extract-session-continue-recovery-route-1")
+            .expect("session continue extraction should persist");
         assert!(verification.is_consistent);
         let linkage = state
             .shadow_execution_pipeline()
             .expect("shadow execution pipeline should exist")
             .memory_store
-            .extraction_linkage("extract-recovery-recovery-route-1")
-            .expect("recovery route extraction linkage should exist");
+            .extraction_linkage("extract-session-continue-recovery-route-1")
+            .expect("session continue extraction linkage should exist");
         assert_eq!(
             linkage.extraction.source_ref.as_deref(),
-            Some("recovery://recovery-route-1/snapshot/snapshot-route-recovery")
+            Some("session-continue://recovery-route-1/snapshot/snapshot-route-recovery")
         );
         assert_eq!(linkage.produced_records[0].content, "resume route followup");
 
@@ -1279,6 +2242,42 @@ mod tests {
         assert_eq!(updated_chain.root_task_id, chain.root_task_id);
         assert_eq!(updated_chain.execution_chain_ref, chain.execution_chain_ref);
         assert!(updated_chain.recovery_ref.is_none());
+        let timeline = state.session_store.timeline_for_session(&session_id);
+        assert!(
+            timeline.iter().any(|entry| {
+                matches!(entry.kind, TimelineEntryKind::UserMessage)
+                    && entry.message == "继续刚才的恢复链"
+            }),
+            "自然语言 continue 应写入当前 session timeline"
+        );
+        wait_for_condition(
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+            || {
+                state
+                    .session_store
+                    .timeline_for_session(&session_id)
+                    .iter()
+                    .filter(|entry| {
+                        matches!(entry.kind, TimelineEntryKind::AssistantMessage)
+                            && !entry.message.trim().is_empty()
+                            && !entry.message.contains("shadow-model::")
+                    })
+                    .count()
+                    > assistant_count_before_continue
+            },
+            "continue 路由执行完成后应把归一化 assistant 结果追加到当前 session timeline",
+        )
+        .await;
+        let runtime_session = state
+            .runtime_read_model_dto()
+            .details
+            .sessions
+            .into_iter()
+            .find(|entry| entry.session_id == session_id.to_string())
+            .expect("runtime read model should still contain current session");
+        assert!(!runtime_session.has_recoverable_chain);
+        assert_eq!(runtime_session.recoverable_branch_count, 0);
         assert!(
             task_store
                 .get_tasks_by_mission(&MissionId::new("mission-recovery-recovery-route-1"))
@@ -1312,7 +2311,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "unexpected response body: {seed_body:?}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "unexpected response body: {seed_body:?}"
+        );
 
         let session_id = SessionId::new("session-route-shadow-override");
         let chain = state
@@ -1386,7 +2389,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "unexpected response body: {seed_body:?}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "unexpected response body: {seed_body:?}"
+        );
 
         let session_id = SessionId::new("session-route-missing-recovery");
         let ownership = state
@@ -1446,7 +2453,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "unexpected response body: {seed_body:?}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "unexpected response body: {seed_body:?}"
+        );
 
         let session_id = SessionId::new("session-route-prepared");
         let ownership = state
@@ -1491,7 +2502,7 @@ mod tests {
         assert_eq!(body["error_code"], "INPUT_INVALID");
         assert_eq!(
             body["message"],
-            "恢复入口 recovery-route-prepared 当前状态为 prepared，必须先进入 ready 才能继续会话"
+            "继续检查点 recovery-route-prepared 当前状态为 prepared，必须先进入 ready 才能继续会话"
         );
     }
 
@@ -1520,7 +2531,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "unexpected response body: {seed_body:?}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "unexpected response body: {seed_body:?}"
+        );
 
         let session_id = SessionId::new("session-route-consumed");
         let ownership = state
@@ -1573,7 +2588,7 @@ mod tests {
         assert_eq!(body["error_code"], "INPUT_INVALID");
         assert_eq!(
             body["message"],
-            "恢复入口 recovery-route-consumed 已被消费，不能再次继续会话"
+            "继续检查点 recovery-route-consumed 已被消费，不能再次继续会话"
         );
     }
 
@@ -1596,6 +2611,11 @@ mod tests {
 
     struct StaticModelBridgeClient;
 
+    struct DelayedModelBridgeClient {
+        delay: Duration,
+        payload: String,
+    }
+
     impl ModelBridgeClient for StaticModelBridgeClient {
         fn invoke(
             &self,
@@ -1605,6 +2625,47 @@ mod tests {
                 ok: true,
                 payload: format!("shadow-model::{}", request.prompt.trim()),
             })
+        }
+
+        fn invoke_stream(
+            &self,
+            request: ModelInvocationRequest,
+            on_event: &mut dyn FnMut(magi_bridge_client::ModelStreamEvent),
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            let response = self.invoke(request)?;
+            if !response.payload.is_empty() {
+                on_event(magi_bridge_client::ModelStreamEvent::ContentDelta {
+                    delta: response.payload.clone(),
+                });
+            }
+            Ok(response)
+        }
+    }
+
+    impl ModelBridgeClient for DelayedModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            thread::sleep(self.delay);
+            Ok(BridgeResponse {
+                ok: true,
+                payload: self.payload.clone(),
+            })
+        }
+
+        fn invoke_stream(
+            &self,
+            request: ModelInvocationRequest,
+            on_event: &mut dyn FnMut(magi_bridge_client::ModelStreamEvent),
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            let response = self.invoke(request)?;
+            if !response.payload.is_empty() {
+                on_event(magi_bridge_client::ModelStreamEvent::ContentDelta {
+                    delta: response.payload.clone(),
+                });
+            }
+            Ok(response)
         }
     }
 
@@ -1627,13 +2688,28 @@ mod tests {
                 message: "model bridge unavailable".to_string(),
             })
         }
+
+        fn invoke_stream(
+            &self,
+            request: ModelInvocationRequest,
+            _on_event: &mut dyn FnMut(magi_bridge_client::ModelStreamEvent),
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            self.invoke(request)
+        }
     }
 
     impl ModelBridgeClient for SessionSwitchingToolModelBridgeClient {
         fn invoke(
             &self,
-            _request: ModelInvocationRequest,
+            request: ModelInvocationRequest,
         ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            if request.prompt.contains("请将以下任务分解") {
+                return Ok(BridgeResponse {
+                    ok: true,
+                    payload: "读取配置文件\n总结配置内容".to_string(),
+                });
+            }
+
             let round = self.invoke_count.fetch_add(1, Ordering::SeqCst);
             if round == 0 {
                 self.session_store
@@ -1669,6 +2745,19 @@ mod tests {
                 })
                 .to_string(),
             })
+        }
+
+        fn invoke_stream(
+            &self,
+            request: ModelInvocationRequest,
+            on_event: &mut dyn FnMut(magi_bridge_client::ModelStreamEvent),
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            let response = self.invoke(request)?;
+            let parsed = response.parse_chat_payload();
+            if let Some(content) = parsed.content.filter(|content| !content.is_empty()) {
+                on_event(magi_bridge_client::ModelStreamEvent::ContentDelta { delta: content });
+            }
+            Ok(response)
         }
     }
 
@@ -1746,7 +2835,9 @@ mod tests {
                             message: "model.invoke missing provider".to_string(),
                         })?;
                     let payload = match provider {
-                        SHADOW_MODEL_PROVIDER => bridge_response("shadow-model::bridge cutover smoke"),
+                        SHADOW_MODEL_PROVIDER => {
+                            bridge_response("shadow-model::bridge cutover smoke")
+                        }
                         "openai-compatible" => structured_bridge_response(json!({
                             "content": "hello from cutover smoke",
                             "finish_reason": "tool_calls",
@@ -1800,12 +2891,11 @@ mod tests {
             request: BridgeTransportRequest,
         ) -> Result<BridgeTransportResponse, BridgeTransportError> {
             let responses = self.responses.lock().expect("responses lock should hold");
-            let outcome = responses
-                .get(&request.method)
-                .cloned()
-                .unwrap_or_else(|| FakeTransportOutcome::Protocol {
+            let outcome = responses.get(&request.method).cloned().unwrap_or_else(|| {
+                FakeTransportOutcome::Protocol {
                     message: format!("unexpected method {}", request.method),
-                });
+                }
+            });
             match outcome {
                 FakeTransportOutcome::Payload(payload) => Ok(BridgeTransportResponse { payload }),
                 FakeTransportOutcome::RemoteBusiness {
@@ -2040,7 +3130,11 @@ mod tests {
         let services = snapshot["services"]
             .as_array()
             .expect("services should serialize as array");
-        assert_eq!(services.len(), 3, "unexpected preflight snapshot: {snapshot:?}");
+        assert_eq!(
+            services.len(),
+            3,
+            "unexpected preflight snapshot: {snapshot:?}"
+        );
 
         let host = services
             .iter()
@@ -2074,12 +3168,10 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_preflight_route_executes_ready_openai_compatible_smoke() {
-        let app = build_router(
-            test_state().with_bridge_probe_transport(
-                BridgeServerKind::Model,
-                Arc::new(ProviderAwareModelTransport),
-            ),
-        );
+        let app = build_router(test_state().with_bridge_probe_transport(
+            BridgeServerKind::Model,
+            Arc::new(ProviderAwareModelTransport),
+        ));
 
         let snapshot = get_json(app, "/bridges/preflight").await;
         let model = snapshot["services"]
@@ -2099,12 +3191,14 @@ mod tests {
             "model preflight should keep shadow-model smoke: {model:?}"
         );
         assert!(
-            checks.iter().any(|check| check["target"] == "openai-compatible"
-                && check["ok"] == true
-                && check["response_excerpt"]
-                    .as_str()
-                    .expect("response excerpt should serialize as string")
-                    .contains("openai-compatible::bridge preflight ping")),
+            checks
+                .iter()
+                .any(|check| check["target"] == "openai-compatible"
+                    && check["ok"] == true
+                    && check["response_excerpt"]
+                        .as_str()
+                        .expect("response excerpt should serialize as string")
+                        .contains("openai-compatible::bridge preflight ping")),
             "model preflight should execute openai-compatible ready smoke: {model:?}"
         );
     }
@@ -2201,7 +3295,11 @@ mod tests {
             })
             .filter(|check| check["ok"] != true)
             .count();
-        assert_eq!(services.len(), 3, "unexpected cutover smoke snapshot: {snapshot:?}");
+        assert_eq!(
+            services.len(),
+            3,
+            "unexpected cutover smoke snapshot: {snapshot:?}"
+        );
         assert_eq!(snapshot["overall_ok"], true);
         assert_eq!(snapshot["checked_service_count"], 3);
         assert_eq!(snapshot["blocking_check_count"], failing_checks);
@@ -2295,10 +3393,7 @@ mod tests {
         );
         assert_eq!(mcp["checks"][0]["check_name"], "default_route_contract");
         assert_eq!(mcp["checks"][0]["ok"], true);
-        assert_eq!(
-            mcp["checks"][0]["mcp_contract"]["route_status"],
-            "ready"
-        );
+        assert_eq!(mcp["checks"][0]["mcp_contract"]["route_status"], "ready");
         assert_eq!(
             mcp["checks"][0]["mcp_contract"]["route_target"],
             "shadow-mcp-observability"
@@ -2337,47 +3432,49 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_cutover_smoke_route_surfaces_mcp_describe_errors() {
-        let app = build_router(test_state().with_bridge_probe_transport(
-            BridgeServerKind::Mcp,
-            Arc::new(FakeTransport::new(HashMap::from([
-                (
-                    "mcp.list_servers".to_string(),
-                    FakeTransportOutcome::Payload(
-                        serde_json::to_value(McpManagerListServersResponse {
-                            manager: descriptor_with_route(
-                                "shadow-mcp-manager",
-                                "ready",
-                                "shadow-mcp-observability",
-                            ),
-                            servers: vec![descriptor_with_profile(
-                                "shadow-mcp-observability",
-                                "ready",
-                                "observability-v1",
-                            )],
-                            selection_targets: vec!["shadow-mcp-observability".to_string()],
-                            default_route_status: "ready".to_string(),
-                            default_route_target: "shadow-mcp-observability".to_string(),
-                        })
-                        .expect("mcp manager list should serialize"),
+        let app = build_router(
+            test_state().with_bridge_probe_transport(
+                BridgeServerKind::Mcp,
+                Arc::new(FakeTransport::new(HashMap::from([
+                    (
+                        "mcp.list_servers".to_string(),
+                        FakeTransportOutcome::Payload(
+                            serde_json::to_value(McpManagerListServersResponse {
+                                manager: descriptor_with_route(
+                                    "shadow-mcp-manager",
+                                    "ready",
+                                    "shadow-mcp-observability",
+                                ),
+                                servers: vec![descriptor_with_profile(
+                                    "shadow-mcp-observability",
+                                    "ready",
+                                    "observability-v1",
+                                )],
+                                selection_targets: vec!["shadow-mcp-observability".to_string()],
+                                default_route_status: "ready".to_string(),
+                                default_route_target: "shadow-mcp-observability".to_string(),
+                            })
+                            .expect("mcp manager list should serialize"),
+                        ),
                     ),
-                ),
-                (
-                    "mcp.describe_server".to_string(),
-                    FakeTransportOutcome::Protocol {
-                        message: "describe degraded".to_string(),
-                    },
-                ),
-                (
-                    "mcp.call_tool".to_string(),
-                    FakeTransportOutcome::Payload(structured_bridge_response(json!({
-                        "server_name": "shadow-mcp-observability",
-                        "default_route_status": "ready",
-                        "default_route_target": "shadow-mcp-observability",
-                        "tool_name": "echo.describe",
-                    }))),
-                ),
-            ]))),
-        ));
+                    (
+                        "mcp.describe_server".to_string(),
+                        FakeTransportOutcome::Protocol {
+                            message: "describe degraded".to_string(),
+                        },
+                    ),
+                    (
+                        "mcp.call_tool".to_string(),
+                        FakeTransportOutcome::Payload(structured_bridge_response(json!({
+                            "server_name": "shadow-mcp-observability",
+                            "default_route_status": "ready",
+                            "default_route_target": "shadow-mcp-observability",
+                            "tool_name": "echo.describe",
+                        }))),
+                    ),
+                ]))),
+            ),
+        );
 
         let snapshot = get_json(app, "/bridges/cutover-smoke").await;
         assert_eq!(snapshot["overall_ok"], false);
@@ -2387,9 +3484,7 @@ mod tests {
             "mcp_default_route_target_describe_failed"
         );
         assert_eq!(
-            snapshot["blocking_issue_counts_by_reason_code"][
-                "mcp_default_route_target_describe_failed"
-            ],
+            snapshot["blocking_issue_counts_by_reason_code"]["mcp_default_route_target_describe_failed"],
             1
         );
         assert_eq!(snapshot["blocking_issue_counts_by_server_kind"]["mcp"], 1);
@@ -2411,52 +3506,54 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_cutover_smoke_route_surfaces_mcp_blank_selection_reason_codes() {
-        let app = build_router(test_state().with_bridge_probe_transport(
-            BridgeServerKind::Mcp,
-            Arc::new(FakeTransport::new(HashMap::from([
-                (
-                    "mcp.list_servers".to_string(),
-                    FakeTransportOutcome::Payload(
-                        serde_json::to_value(McpManagerListServersResponse {
-                            manager: descriptor_with_route(
+        let app = build_router(
+            test_state().with_bridge_probe_transport(
+                BridgeServerKind::Mcp,
+                Arc::new(FakeTransport::new(HashMap::from([
+                    (
+                        "mcp.list_servers".to_string(),
+                        FakeTransportOutcome::Payload(
+                            serde_json::to_value(McpManagerListServersResponse {
+                                manager: descriptor_with_route(
+                                    "shadow-mcp-manager",
+                                    "ready",
+                                    "shadow-mcp-observability",
+                                ),
+                                servers: vec![descriptor_with_profile(
+                                    "shadow-mcp-observability",
+                                    "ready",
+                                    "observability-v1",
+                                )],
+                                selection_targets: vec!["shadow-mcp-observability".to_string()],
+                                default_route_status: "ready".to_string(),
+                                default_route_target: "shadow-mcp-observability".to_string(),
+                            })
+                            .expect("mcp manager list should serialize"),
+                        ),
+                    ),
+                    (
+                        "mcp.describe_server".to_string(),
+                        FakeTransportOutcome::Payload(json!({
+                            "manager": descriptor_with_route(
                                 "shadow-mcp-manager",
                                 "ready",
                                 "shadow-mcp-observability",
                             ),
-                            servers: vec![descriptor_with_profile(
+                            "server": descriptor_with_profile(
                                 "shadow-mcp-observability",
                                 "ready",
                                 "observability-v1",
-                            )],
-                            selection_targets: vec!["shadow-mcp-observability".to_string()],
-                            default_route_status: "ready".to_string(),
-                            default_route_target: "shadow-mcp-observability".to_string(),
-                        })
-                        .expect("mcp manager list should serialize"),
+                            ),
+                            "lifecycle_events": [],
+                        })),
                     ),
-                ),
-                (
-                    "mcp.describe_server".to_string(),
-                    FakeTransportOutcome::Payload(json!({
-                        "manager": descriptor_with_route(
-                            "shadow-mcp-manager",
-                            "ready",
-                            "shadow-mcp-observability",
-                        ),
-                        "server": descriptor_with_profile(
-                            "shadow-mcp-observability",
-                            "ready",
-                            "observability-v1",
-                        ),
-                        "lifecycle_events": [],
-                    })),
-                ),
-                (
-                    "mcp.call_tool".to_string(),
-                    FakeTransportOutcome::Payload(bridge_response_with_status(false, "denied")),
-                ),
-            ]))),
-        ));
+                    (
+                        "mcp.call_tool".to_string(),
+                        FakeTransportOutcome::Payload(bridge_response_with_status(false, "denied")),
+                    ),
+                ]))),
+            ),
+        );
 
         let snapshot = get_json(app, "/bridges/cutover-smoke").await;
         assert_eq!(snapshot["overall_ok"], false);
@@ -2480,56 +3577,58 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_cutover_smoke_route_surfaces_mcp_blank_selection_invocation_failures() {
-        let app = build_router(test_state().with_bridge_probe_transport(
-            BridgeServerKind::Mcp,
-            Arc::new(FakeTransport::new(HashMap::from([
-                (
-                    "mcp.list_servers".to_string(),
-                    FakeTransportOutcome::Payload(
-                        serde_json::to_value(McpManagerListServersResponse {
-                            manager: descriptor_with_route(
+        let app = build_router(
+            test_state().with_bridge_probe_transport(
+                BridgeServerKind::Mcp,
+                Arc::new(FakeTransport::new(HashMap::from([
+                    (
+                        "mcp.list_servers".to_string(),
+                        FakeTransportOutcome::Payload(
+                            serde_json::to_value(McpManagerListServersResponse {
+                                manager: descriptor_with_route(
+                                    "shadow-mcp-manager",
+                                    "ready",
+                                    "shadow-mcp-observability",
+                                ),
+                                servers: vec![descriptor_with_profile(
+                                    "shadow-mcp-observability",
+                                    "ready",
+                                    "observability-v1",
+                                )],
+                                selection_targets: vec!["shadow-mcp-observability".to_string()],
+                                default_route_status: "ready".to_string(),
+                                default_route_target: "shadow-mcp-observability".to_string(),
+                            })
+                            .expect("mcp manager list should serialize"),
+                        ),
+                    ),
+                    (
+                        "mcp.describe_server".to_string(),
+                        FakeTransportOutcome::Payload(json!({
+                            "manager": descriptor_with_route(
                                 "shadow-mcp-manager",
                                 "ready",
                                 "shadow-mcp-observability",
                             ),
-                            servers: vec![descriptor_with_profile(
+                            "server": descriptor_with_profile(
                                 "shadow-mcp-observability",
                                 "ready",
                                 "observability-v1",
-                            )],
-                            selection_targets: vec!["shadow-mcp-observability".to_string()],
-                            default_route_status: "ready".to_string(),
-                            default_route_target: "shadow-mcp-observability".to_string(),
-                        })
-                        .expect("mcp manager list should serialize"),
+                            ),
+                            "lifecycle_events": [],
+                        })),
                     ),
-                ),
-                (
-                    "mcp.describe_server".to_string(),
-                    FakeTransportOutcome::Payload(json!({
-                        "manager": descriptor_with_route(
-                            "shadow-mcp-manager",
-                            "ready",
-                            "shadow-mcp-observability",
-                        ),
-                        "server": descriptor_with_profile(
-                            "shadow-mcp-observability",
-                            "ready",
-                            "observability-v1",
-                        ),
-                        "lifecycle_events": [],
-                    })),
-                ),
-                (
-                    "mcp.call_tool".to_string(),
-                    FakeTransportOutcome::RemoteBusiness {
-                        code: -32015,
-                        message: "default route unavailable".to_string(),
-                        data: None,
-                    },
-                ),
-            ]))),
-        ));
+                    (
+                        "mcp.call_tool".to_string(),
+                        FakeTransportOutcome::RemoteBusiness {
+                            code: -32015,
+                            message: "default route unavailable".to_string(),
+                            data: None,
+                        },
+                    ),
+                ]))),
+            ),
+        );
 
         let snapshot = get_json(app, "/bridges/cutover-smoke").await;
         assert_eq!(snapshot["overall_ok"], false);
@@ -2545,7 +3644,10 @@ mod tests {
             snapshot["blocking_issues"][0]["error"]["layer"],
             "RemoteBusiness"
         );
-        assert_eq!(snapshot["blocking_issues"][0]["response_excerpt"], Value::Null);
+        assert_eq!(
+            snapshot["blocking_issues"][0]["response_excerpt"],
+            Value::Null
+        );
         assert_eq!(snapshot["services"][0]["service_ok"], false);
         assert_eq!(
             snapshot["services"][0]["mcp_default_route_gate"]["contract_ok"],
@@ -2555,57 +3657,59 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_cutover_smoke_route_surfaces_mcp_metadata_drift_reason_codes() {
-        let app = build_router(test_state().with_bridge_probe_transport(
-            BridgeServerKind::Mcp,
-            Arc::new(FakeTransport::new(HashMap::from([
-                (
-                    "mcp.list_servers".to_string(),
-                    FakeTransportOutcome::Payload(
-                        serde_json::to_value(McpManagerListServersResponse {
-                            manager: descriptor_with_route(
+        let app = build_router(
+            test_state().with_bridge_probe_transport(
+                BridgeServerKind::Mcp,
+                Arc::new(FakeTransport::new(HashMap::from([
+                    (
+                        "mcp.list_servers".to_string(),
+                        FakeTransportOutcome::Payload(
+                            serde_json::to_value(McpManagerListServersResponse {
+                                manager: descriptor_with_route(
+                                    "shadow-mcp-manager",
+                                    "ready",
+                                    "shadow-mcp-observability",
+                                ),
+                                servers: vec![descriptor_with_profile(
+                                    "shadow-mcp-observability",
+                                    "ready",
+                                    "observability-v1",
+                                )],
+                                selection_targets: vec!["shadow-mcp-observability".to_string()],
+                                default_route_status: "ready".to_string(),
+                                default_route_target: "shadow-mcp-observability".to_string(),
+                            })
+                            .expect("mcp manager list should serialize"),
+                        ),
+                    ),
+                    (
+                        "mcp.describe_server".to_string(),
+                        FakeTransportOutcome::Payload(json!({
+                            "manager": descriptor_with_route(
                                 "shadow-mcp-manager",
                                 "ready",
                                 "shadow-mcp-observability",
                             ),
-                            servers: vec![descriptor_with_profile(
+                            "server": descriptor_with_profile(
                                 "shadow-mcp-observability",
                                 "ready",
                                 "observability-v1",
-                            )],
-                            selection_targets: vec!["shadow-mcp-observability".to_string()],
-                            default_route_status: "ready".to_string(),
-                            default_route_target: "shadow-mcp-observability".to_string(),
-                        })
-                        .expect("mcp manager list should serialize"),
+                            ),
+                            "lifecycle_events": [],
+                        })),
                     ),
-                ),
-                (
-                    "mcp.describe_server".to_string(),
-                    FakeTransportOutcome::Payload(json!({
-                        "manager": descriptor_with_route(
-                            "shadow-mcp-manager",
-                            "ready",
-                            "shadow-mcp-observability",
-                        ),
-                        "server": descriptor_with_profile(
-                            "shadow-mcp-observability",
-                            "ready",
-                            "observability-v1",
-                        ),
-                        "lifecycle_events": [],
-                    })),
-                ),
-                (
-                    "mcp.call_tool".to_string(),
-                    FakeTransportOutcome::Payload(structured_bridge_response(json!({
-                        "server_name": "shadow-mcp-observability",
-                        "default_route_status": "ready",
-                        "default_route_target": "shadow-mcp-inspection",
-                        "tool_name": "echo.describe",
-                    }))),
-                ),
-            ]))),
-        ));
+                    (
+                        "mcp.call_tool".to_string(),
+                        FakeTransportOutcome::Payload(structured_bridge_response(json!({
+                            "server_name": "shadow-mcp-observability",
+                            "default_route_status": "ready",
+                            "default_route_target": "shadow-mcp-inspection",
+                            "tool_name": "echo.describe",
+                        }))),
+                    ),
+                ]))),
+            ),
+        );
 
         let snapshot = get_json(app, "/bridges/cutover-smoke").await;
         assert_eq!(snapshot["overall_ok"], false);
@@ -2630,67 +3734,69 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_cutover_smoke_route_surfaces_mcp_resolved_server_mismatch_reason_codes() {
-        let app = build_router(test_state().with_bridge_probe_transport(
-            BridgeServerKind::Mcp,
-            Arc::new(FakeTransport::new(HashMap::from([
-                (
-                    "mcp.list_servers".to_string(),
-                    FakeTransportOutcome::Payload(
-                        serde_json::to_value(McpManagerListServersResponse {
-                            manager: descriptor_with_route(
+        let app = build_router(
+            test_state().with_bridge_probe_transport(
+                BridgeServerKind::Mcp,
+                Arc::new(FakeTransport::new(HashMap::from([
+                    (
+                        "mcp.list_servers".to_string(),
+                        FakeTransportOutcome::Payload(
+                            serde_json::to_value(McpManagerListServersResponse {
+                                manager: descriptor_with_route(
+                                    "shadow-mcp-manager",
+                                    "ready",
+                                    "shadow-mcp-observability",
+                                ),
+                                servers: vec![
+                                    descriptor_with_profile(
+                                        "shadow-mcp-observability",
+                                        "ready",
+                                        "observability-v1",
+                                    ),
+                                    descriptor_with_profile(
+                                        "shadow-mcp-inspection",
+                                        "ready",
+                                        "inspection-v1",
+                                    ),
+                                ],
+                                selection_targets: vec![
+                                    "shadow-mcp-observability".to_string(),
+                                    "shadow-mcp-inspection".to_string(),
+                                ],
+                                default_route_status: "ready".to_string(),
+                                default_route_target: "shadow-mcp-observability".to_string(),
+                            })
+                            .expect("mcp manager list should serialize"),
+                        ),
+                    ),
+                    (
+                        "mcp.describe_server".to_string(),
+                        FakeTransportOutcome::Payload(json!({
+                            "manager": descriptor_with_route(
                                 "shadow-mcp-manager",
                                 "ready",
                                 "shadow-mcp-observability",
                             ),
-                            servers: vec![
-                                descriptor_with_profile(
-                                    "shadow-mcp-observability",
-                                    "ready",
-                                    "observability-v1",
-                                ),
-                                descriptor_with_profile(
-                                    "shadow-mcp-inspection",
-                                    "ready",
-                                    "inspection-v1",
-                                ),
-                            ],
-                            selection_targets: vec![
-                                "shadow-mcp-observability".to_string(),
-                                "shadow-mcp-inspection".to_string(),
-                            ],
-                            default_route_status: "ready".to_string(),
-                            default_route_target: "shadow-mcp-observability".to_string(),
-                        })
-                        .expect("mcp manager list should serialize"),
+                            "server": descriptor_with_profile(
+                                "shadow-mcp-observability",
+                                "ready",
+                                "observability-v1",
+                            ),
+                            "lifecycle_events": [],
+                        })),
                     ),
-                ),
-                (
-                    "mcp.describe_server".to_string(),
-                    FakeTransportOutcome::Payload(json!({
-                        "manager": descriptor_with_route(
-                            "shadow-mcp-manager",
-                            "ready",
-                            "shadow-mcp-observability",
-                        ),
-                        "server": descriptor_with_profile(
-                            "shadow-mcp-observability",
-                            "ready",
-                            "observability-v1",
-                        ),
-                        "lifecycle_events": [],
-                    })),
-                ),
-                (
-                    "mcp.call_tool".to_string(),
-                    FakeTransportOutcome::Payload(structured_bridge_response(json!({
-                        "server_name": "shadow-mcp-inspection",
-                        "default_route_status": "ready",
-                        "default_route_target": "shadow-mcp-observability",
-                        "tool_name": "echo.describe",
-                    }))),
-                ),
-            ]))),
-        ));
+                    (
+                        "mcp.call_tool".to_string(),
+                        FakeTransportOutcome::Payload(structured_bridge_response(json!({
+                            "server_name": "shadow-mcp-inspection",
+                            "default_route_status": "ready",
+                            "default_route_target": "shadow-mcp-observability",
+                            "tool_name": "echo.describe",
+                        }))),
+                    ),
+                ]))),
+            ),
+        );
 
         let snapshot = get_json(app, "/bridges/cutover-smoke").await;
         assert_eq!(snapshot["overall_ok"], false);
@@ -2774,10 +3880,12 @@ mod tests {
 
         let before_runtime_read_model = serde_json::to_value(state.runtime_read_model_dto())
             .expect("runtime read model should serialize");
-        let before_session_sidecars = serde_json::to_value(state.session_store.execution_sidecar_exports())
-            .expect("session sidecars should serialize");
-        let before_workspace_sidecars = serde_json::to_value(state.workspace_registry.recovery_sidecar_exports())
-            .expect("workspace sidecars should serialize");
+        let before_session_sidecars =
+            serde_json::to_value(state.session_store.execution_sidecar_exports())
+                .expect("session sidecars should serialize");
+        let before_workspace_sidecars =
+            serde_json::to_value(state.workspace_registry.recovery_sidecar_exports())
+                .expect("workspace sidecars should serialize");
 
         let _ = get_json(app.clone(), "/bridges/preflight").await;
         let _ = get_json(app, "/bridges/cutover-smoke").await;
@@ -2873,6 +3981,7 @@ mod tests {
                 "session_id": "session-route-shadow",
                 "text": "interrupt target task",
                 "deep_task": false,
+                "skill_name": "code",
                 "images": [],
             }),
         )
@@ -2923,6 +4032,196 @@ mod tests {
         assert_eq!(root_task.status, TaskStatus::Blocked);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_action_interrupt_discards_late_completion_for_blocked_session_task() {
+        let state = build_shadow_execution_state(
+            WorkerRuntime::new_compare,
+            Arc::new(DelayedModelBridgeClient {
+                delay: Duration::from_millis(200),
+                payload: "shadow-model::被中断的晚到结果".to_string(),
+            }),
+        );
+        let app = build_router(state.clone());
+
+        let submit_app = app.clone();
+        let submit_handle = tokio::spawn(async move {
+            post_json(
+                submit_app,
+                "/session/action",
+                json!({
+                    "session_id": "session-route-shadow",
+                    "text": "interrupt delayed completion",
+                    "deep_task": false,
+                    "skill_name": "code",
+                    "images": [],
+                }),
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let chain = state
+            .session_store
+            .active_execution_chain(&SessionId::new("session-route-shadow"))
+            .expect("active execution chain should exist while session action is running");
+        let action_task_id = chain
+            .branches
+            .iter()
+            .find(|branch| branch.is_primary)
+            .map(|branch| branch.task_id.clone())
+            .or_else(|| chain.active_branch_task_ids.first().cloned())
+            .expect("primary action branch should exist");
+
+        let (interrupt_status, interrupt_body) = post_json(
+            app,
+            "/api/task/interrupt",
+            json!({
+                "sessionId": "session-route-shadow",
+                "taskId": action_task_id.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            interrupt_status,
+            StatusCode::OK,
+            "unexpected response body: {interrupt_body:?}"
+        );
+        assert_eq!(interrupt_body["interrupted"], true);
+
+        let (submit_status, submit_body) = submit_handle
+            .await
+            .expect("session action task should join successfully");
+        assert_eq!(
+            submit_status,
+            StatusCode::OK,
+            "unexpected response body: {submit_body:?}"
+        );
+
+        let task_store = state.task_store().expect("task store should be configured");
+        let interrupted_task = task_store
+            .get_task(&action_task_id)
+            .expect("interrupted task should remain queryable");
+        assert_eq!(interrupted_task.status, TaskStatus::Blocked);
+        assert!(
+            interrupted_task.output_refs.is_empty(),
+            "late completion must not write assistant output refs after interrupt"
+        );
+        let root_task = task_store
+            .get_task(&interrupted_task.root_task_id)
+            .expect("root task should remain queryable");
+        assert_eq!(root_task.status, TaskStatus::Blocked);
+
+        let assistant_messages = state
+            .session_store
+            .timeline()
+            .into_iter()
+            .filter(|entry| {
+                entry.session_id == SessionId::new("session-route-shadow")
+                    && matches!(
+                        entry.kind,
+                        magi_session_store::TimelineEntryKind::AssistantMessage
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            assistant_messages.is_empty(),
+            "interrupted session action must not append assistant message from stale completion"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deep_session_action_interrupt_discards_late_completion_for_blocked_session_task() {
+        let state = build_shadow_execution_state(
+            WorkerRuntime::new_compare,
+            Arc::new(DelayedModelBridgeClient {
+                delay: Duration::from_millis(200),
+                payload: "shadow-model::deep interrupted late result".to_string(),
+            }),
+        );
+        let app = build_router(state.clone());
+        let session_id = SessionId::new("session-route-shadow-deep");
+        let accepted_at = UtcMillis::now();
+        let mut accepted = submit_shadow_dispatch_submission(
+            &state,
+            crate::task_execution::DispatchSubmissionRequest {
+                accepted_at,
+                session_id: session_id.clone(),
+                workspace_id: None,
+                entry_id: format!("timeline-{session_id}-{}", accepted_at.0),
+                created_session: false,
+                mission_title: "deep interrupt delayed completion".to_string(),
+                task_title: "执行: deep interrupt delayed completion".to_string(),
+                trimmed_text: Some("deep interrupt delayed completion".to_string()),
+                deep_task: true,
+                skill_name: None,
+                target_role: None,
+            },
+        )
+        .expect("deep dispatch submission should succeed");
+        let action_task_id = accepted.action_task_id.clone();
+
+        let drive_state = state.clone();
+        let drive_handle = tokio::spawn(async move {
+            drive_shadow_dispatch_submission(&drive_state, &mut accepted)
+                .expect("deep shadow dispatch should finish without route-level error");
+            append_dispatch_assistant_message(&drive_state, &accepted);
+        });
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let (interrupt_status, interrupt_body) = post_json(
+            app,
+            "/api/task/interrupt",
+            json!({
+                "sessionId": session_id.to_string(),
+                "taskId": action_task_id.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            interrupt_status,
+            StatusCode::OK,
+            "unexpected response body: {interrupt_body:?}"
+        );
+        assert_eq!(interrupt_body["interrupted"], true);
+
+        drive_handle
+            .await
+            .expect("deep shadow dispatch task should join successfully");
+
+        let task_store = state.task_store().expect("task store should be configured");
+        let interrupted_task = task_store
+            .get_task(&action_task_id)
+            .expect("interrupted task should remain queryable");
+        assert_eq!(interrupted_task.status, TaskStatus::Blocked);
+        assert!(
+            interrupted_task.output_refs.is_empty(),
+            "interrupted deep session action must not write assistant output refs after interrupt"
+        );
+        let root_task = task_store
+            .get_task(&interrupted_task.root_task_id)
+            .expect("root task should remain queryable");
+        assert_eq!(root_task.status, TaskStatus::Blocked);
+
+        let assistant_messages = state
+            .session_store
+            .timeline()
+            .into_iter()
+            .filter(|entry| {
+                entry.session_id == SessionId::new("session-route-shadow-deep")
+                    && matches!(
+                        entry.kind,
+                        magi_session_store::TimelineEntryKind::AssistantMessage
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            assistant_messages.is_empty(),
+            "interrupted deep session action must not append assistant message from stale completion"
+        );
+    }
+
     // ─── /api/tasks/* task graph routes integration tests ───
 
     fn test_state_with_task_store() -> ApiState {
@@ -2951,7 +4250,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "unexpected create response: {body:?}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "unexpected create response: {body:?}"
+        );
         assert_eq!(body["task_id"], "task-1");
         assert_eq!(body["title"], "Root objective");
         assert_eq!(body["kind"], "Objective");
@@ -3038,7 +4341,11 @@ mod tests {
             json!({ "status": "Ready" }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "unexpected status update response: {body:?}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "unexpected status update response: {body:?}"
+        );
         assert_eq!(body["status"], "Ready");
 
         // Update Ready -> Running
@@ -3105,9 +4412,9 @@ mod tests {
                     .uri("/api/tasks/some-task")
                     .body(Body::empty())
                     .expect("request should build"),
-        )
-        .await
-        .expect("router should respond");
+            )
+            .await
+            .expect("router should respond");
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 

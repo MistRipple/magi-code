@@ -1,10 +1,9 @@
 use crate::dto::{
-    runtime_read_model_dto, AuditUsageLedgerDto, BootstrapDto, BridgeCutoverSmokeProvider,
-    BridgeCutoverSmokeSnapshotDto, BridgeCutoverSmokeSnapshotProvider,
-    BridgePreflightSnapshotDto, BridgePreflightProvider, BridgePreflightSnapshotProvider,
-    BridgeProbeSnapshotProvider, BridgeServicesSnapshotDto, BridgeSnapshotProvider,
-    DirectHttpModelProbeConfig, HealthDto,
-    RuntimeReadModelDto, ServiceInfo, VersionHandshakeDto,
+    AuditUsageLedgerDto, BootstrapDto, BridgeCutoverSmokeProvider, BridgeCutoverSmokeSnapshotDto,
+    BridgeCutoverSmokeSnapshotProvider, BridgePreflightProvider, BridgePreflightSnapshotDto,
+    BridgePreflightSnapshotProvider, BridgeProbeSnapshotProvider, BridgeServicesSnapshotDto,
+    BridgeSnapshotProvider, DirectHttpModelProbeConfig, HealthDto, RuntimeReadModelDto,
+    ServiceInfo, VersionHandshakeDto, runtime_read_model_dto,
 };
 use crate::errors::ApiError;
 use crate::routes::settings::{
@@ -13,26 +12,33 @@ use crate::routes::settings::{
 };
 use crate::settings_store::SettingsStore;
 use crate::task_execution::ShadowTaskExecutionRegistry;
-use magi_bridge_client::{BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerConfig, ModelBridgeClient, StdioMcpBridgeClient};
-use magi_core::{SessionId, TaskId, UtcMillis, WorkerId};
+use magi_bridge_client::{
+    BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerConfig,
+    ModelBridgeClient, StdioMcpBridgeClient,
+};
+use magi_core::{SessionId, TaskId, UtcMillis};
 use magi_event_bus::InMemoryEventBus;
 use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{
-    ExecutionWritebackPlans,
-    OrchestratedExecutionRuntime, OrchestratorCommandError, OrchestratorService,
-    RecoveryExecutionResult,
-    task_worker_catalog::build_worker_catalog_for_roles,
-    task_runner::{EventBasedResultReceiver, EventBasedTaskDispatcher, RunCycleOutcome, TaskDispatcher, TaskResultReceiver, TaskRunner, WorkerExecutionDispatcher, WorkerInfo},
+    OrchestratedExecutionRuntime, OrchestratorService,
+    task_runner::{
+        EventBasedResultReceiver, EventBasedTaskDispatcher, RunCycleOutcome, TaskDispatcher,
+        TaskResultReceiver, TaskRunner, WorkerExecutionDispatcher, WorkerInfo,
+    },
     task_store::TaskStore,
+    task_worker_catalog::build_worker_catalog_for_roles,
 };
 use magi_session_store::SessionStore;
 use magi_workspace::WorkspaceStore;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::sync::{
+    Arc, Mutex, RwLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 /// Tracks the state of a single running Runner instance.
 pub struct RunnerHandle {
@@ -261,8 +267,7 @@ impl RunnerManager {
                         if let Some(ref path) = bg_checkpoint_path {
                             let _ = bg_task_store.checkpoint_to_file(path);
                         }
-                        let mut status =
-                            bg_handle.status.lock().expect("status lock should hold");
+                        let mut status = bg_handle.status.lock().expect("status lock should hold");
                         *status = "completed".to_string();
                         break;
                     }
@@ -275,11 +280,12 @@ impl RunnerManager {
                         if let Some(ref path) = bg_checkpoint_path {
                             let _ = bg_task_store.checkpoint_to_file(path);
                         }
-                        let mut status =
-                            bg_handle.status.lock().expect("status lock should hold");
+                        let mut status = bg_handle.status.lock().expect("status lock should hold");
                         *status = "error".to_string();
-                        let mut last_error =
-                            bg_handle.last_error.lock().expect("last_error lock should hold");
+                        let mut last_error = bg_handle
+                            .last_error
+                            .lock()
+                            .expect("last_error lock should hold");
                         *last_error = Some(err);
                         break;
                     }
@@ -293,9 +299,7 @@ impl RunnerManager {
     /// Signal a runner to stop.
     pub fn stop(&self, root_task_id: &str) -> Result<(), RunnerStopError> {
         let runners = self.runners.lock().expect("runners lock should hold");
-        let handle = runners
-            .get(root_task_id)
-            .ok_or(RunnerStopError::NotFound)?;
+        let handle = runners.get(root_task_id).ok_or(RunnerStopError::NotFound)?;
         let status = handle.status.lock().expect("status lock should hold");
         if *status != "running" {
             return Err(RunnerStopError::NotRunning);
@@ -308,7 +312,11 @@ impl RunnerManager {
     pub fn status(&self, root_task_id: &str) -> Option<RunnerStatusSnapshot> {
         let runners = self.runners.lock().expect("runners lock should hold");
         runners.get(root_task_id).map(|handle| {
-            let status = handle.status.lock().expect("status lock should hold").clone();
+            let status = handle
+                .status
+                .lock()
+                .expect("status lock should hold")
+                .clone();
             let cycle_count = handle.cycle_count.load(Ordering::Relaxed);
             let last_error = handle
                 .last_error
@@ -378,24 +386,7 @@ pub struct ShadowExecutionPipeline {
     pub memory_store: MemoryStore,
 }
 
-impl ShadowExecutionPipeline {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn execute_recovery_with_writebacks(
-        &self,
-        input: magi_core::RecoveryResumeInput,
-        worker_id: WorkerId,
-        writebacks: ExecutionWritebackPlans,
-    ) -> Result<RecoveryExecutionResult, OrchestratorCommandError> {
-        self.execution_runtime.execute_recovery_with_writebacks(
-            input,
-            worker_id,
-            None,
-            self.memory_store.clone(),
-            writebacks,
-        )
-    }
-
-}
+impl ShadowExecutionPipeline {}
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -427,7 +418,10 @@ pub struct RuntimeStatePersistence {
     session_path: PathBuf,
     workspace_path: PathBuf,
     knowledge_path: PathBuf,
+    write_lock: Arc<Mutex<()>>,
 }
+
+static RUNTIME_PERSISTENCE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl RuntimeStatePersistence {
     pub fn new(
@@ -439,6 +433,7 @@ impl RuntimeStatePersistence {
             session_path: session_path.into(),
             workspace_path: workspace_path.into(),
             knowledge_path: knowledge_path.into(),
+            write_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -450,6 +445,10 @@ impl RuntimeStatePersistence {
     where
         T: serde::Serialize,
     {
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .expect("runtime persistence write lock poisoned");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| ApiError::internal_assembly("创建运行态持久化目录失败", error))?;
@@ -478,7 +477,8 @@ fn temp_path_for(path: &Path) -> PathBuf {
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "runtime-state.json".to_string());
-    file_name.push_str(".tmp");
+    let nonce = RUNTIME_PERSISTENCE_TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+    file_name.push_str(&format!(".{nonce}.tmp"));
     path.with_file_name(file_name)
 }
 
@@ -602,10 +602,35 @@ impl ApiState {
         workspace_id: Option<&str>,
         requested_session_id: Option<&SessionId>,
     ) -> BootstrapDto {
-        let mut dto = BootstrapDto::from_state_with_selected_session(self, requested_session_id);
+        let effective_session_id = if requested_session_id.is_some() || workspace_id.is_none() {
+            requested_session_id.cloned()
+        } else {
+            let projection = self.session_store.projection_input();
+            projection
+                .current_session_id
+                .as_ref()
+                .filter(|session_id| {
+                    projection.sessions.iter().any(|session| {
+                        &session.session_id == *session_id
+                            && session.workspace_id.as_deref() == workspace_id
+                    })
+                })
+                .cloned()
+                .or_else(|| {
+                    projection
+                        .sessions
+                        .iter()
+                        .find(|session| session.workspace_id.as_deref() == workspace_id)
+                        .map(|session| session.session_id.clone())
+                })
+        };
+        let mut dto =
+            BootstrapDto::from_state_with_selected_session(self, effective_session_id.as_ref());
         // 按 workspace_id 过滤会话列表
         if let Some(ws_id) = workspace_id {
-            dto.sessions = dto.sessions.into_iter()
+            dto.sessions = dto
+                .sessions
+                .into_iter()
                 .filter(|s| s.workspace_id.as_deref() == Some(ws_id))
                 .collect();
         }
@@ -654,22 +679,60 @@ impl ApiState {
     }
 
     pub fn settings_snapshot_json(&self) -> serde_json::Value {
-        let mut snapshot = self.settings_store.snapshot();
+        self.settings_snapshot_json_for_session(None)
+    }
+
+    pub fn settings_snapshot_json_for_session(
+        &self,
+        session_id: Option<&SessionId>,
+    ) -> serde_json::Value {
+        let mut snapshot = self.settings_store.public_snapshot();
+        snapshot.remove("userRules");
+        snapshot.remove("safeguard");
+        snapshot.remove("safeguardConfig");
+        if let Some(session_id) = session_id {
+            snapshot.insert(
+                "userRulesConfig".to_string(),
+                settings_section_or_empty(
+                    self.settings_store
+                        .get_session_section(session_id, "userRules"),
+                ),
+            );
+            snapshot.insert(
+                "safeguardConfig".to_string(),
+                settings_section_or_empty(
+                    self.settings_store
+                        .get_session_section(session_id, "safeguardConfig"),
+                ),
+            );
+        } else {
+            snapshot.insert("userRulesConfig".to_string(), serde_json::json!({}));
+            snapshot.insert("safeguardConfig".to_string(), serde_json::json!({}));
+        }
         normalize_settings_snapshot_sections(&mut snapshot);
-        snapshot.insert(
-            "roleTemplates".to_string(),
-            serde_json::Value::Array(builtin_role_templates()),
-        );
-        snapshot.insert(
-            "engines".to_string(),
-            serde_json::Value::Array(load_registry_engines(self)),
-        );
-        snapshot.insert(
-            "agents".to_string(),
-            serde_json::Value::Array(resolve_registry_agents(self)),
-        );
         self.enrich_mcp_servers_with_connection_status(&mut snapshot);
-        serde_json::json!(snapshot)
+        serde_json::json!({
+            "workerConfigs": object_section(&snapshot, "workerConfigs"),
+            "orchestratorConfig": object_section(&snapshot, "orchestratorConfig"),
+            "auxiliaryConfig": object_section(&snapshot, "auxiliaryConfig"),
+            "userRulesConfig": object_section(&snapshot, "userRulesConfig"),
+            "skillsConfig": object_section(&snapshot, "skillsConfig"),
+            "safeguardConfig": object_section(&snapshot, "safeguardConfig"),
+            "repositories": array_section(&snapshot, "repositories"),
+            "mcpServers": array_section(&snapshot, "mcpServers"),
+            "workerStatuses": object_section(&snapshot, "workerStatuses"),
+            "runtimeSettings": runtime_settings_from_snapshot(&snapshot),
+            "roleTemplates": builtin_role_templates(),
+            "registryEngines": load_registry_engines(self),
+            "registryAgents": resolve_registry_agents(self),
+            "bootstrapScope": "full",
+            "mcpServersHydrated": true,
+        })
+    }
+
+    pub fn settings_runtime_json(&self) -> serde_json::Value {
+        let snapshot = self.settings_store.public_snapshot();
+        runtime_settings_from_snapshot(&snapshot)
     }
 
     pub fn runtime_status_json(&self) -> serde_json::Value {
@@ -763,10 +826,7 @@ impl ApiState {
         self
     }
 
-    pub fn with_runtime_persistence(
-        mut self,
-        persistence: Arc<RuntimeStatePersistence>,
-    ) -> Self {
+    pub fn with_runtime_persistence(mut self, persistence: Arc<RuntimeStatePersistence>) -> Self {
         self.runtime_persistence = Some(persistence);
         self
     }
@@ -776,31 +836,38 @@ impl ApiState {
             return Ok(());
         };
 
-        // 按工作区分组保存会话
         let durable = self.session_store.durable_state();
+        let (global_state, mut workspace_states) = durable.partition_by_workspace();
         let workspaces = self.workspace_registry.workspaces();
-
-        // 按 workspace_id 分组
-        let mut by_workspace: std::collections::HashMap<String, Vec<magi_session_store::SessionRecord>> = std::collections::HashMap::new();
-
-        for session in &durable.sessions {
-            let ws_id = session.workspace_id.clone().unwrap_or_default();
-            by_workspace.entry(ws_id).or_default().push(session.clone());
-        }
-
-        // 为每个工作区写入各自 .magi/sessions.json
         for workspace in &workspaces {
             let ws_id = workspace.workspace_id.to_string();
-            let sessions = by_workspace.remove(&ws_id).unwrap_or_default();
-            let ws_state = magi_session_store::SessionDurableState {
-                sessions,
-                current_session_id: durable.current_session_id.clone(),
-                timeline: durable.timeline.clone(),
-                notifications: durable.notifications.clone(),
-            };
+            let ws_state = workspace_states.remove(&ws_id).unwrap_or_default();
             let magi_dir = std::path::Path::new(workspace.root_path.as_str()).join(".magi");
             let session_path = magi_dir.join("sessions.json");
             persistence.save_json(&session_path, &ws_state)?;
+        }
+
+        if let Some((workspace_id, _)) = workspace_states.into_iter().next() {
+            return Err(ApiError::internal_assembly(
+                "持久化会话失败",
+                format!("检测到未注册工作区的会话状态: {workspace_id}"),
+            ));
+        }
+
+        let Some(state_root) = persistence.state_root() else {
+            return Ok(());
+        };
+        let global_session_path = state_root.join("sessions.json");
+        if global_state.is_empty() {
+            match fs::remove_file(&global_session_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(ApiError::internal_assembly("删除全局会话状态失败", error));
+                }
+            }
+        } else {
+            persistence.save_json(&global_session_path, &global_state)?;
         }
 
         Ok(())
@@ -846,7 +913,10 @@ impl ApiState {
         self
     }
 
-    pub fn with_skill_runtime(mut self, skill_runtime: Arc<magi_skill_runtime::SkillRuntime>) -> Self {
+    pub fn with_skill_runtime(
+        mut self,
+        skill_runtime: Arc<magi_skill_runtime::SkillRuntime>,
+    ) -> Self {
         self.skill_runtime = Some(skill_runtime);
         self
     }
@@ -865,7 +935,16 @@ impl ApiState {
 }
 
 fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_json::Value>) {
-    for key in ["orchestrator", "auxiliary", "userRules", "safeguard", "skillsConfig"] {
+    for key in [
+        "orchestrator",
+        "orchestratorConfig",
+        "auxiliary",
+        "auxiliaryConfig",
+        "userRulesConfig",
+        "safeguard",
+        "safeguardConfig",
+        "skillsConfig",
+    ] {
         if let Some(value) = snapshot.get_mut(key) {
             normalize_wrapped_section_value(value);
         }
@@ -876,6 +955,17 @@ fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_jso
     normalize_mcp_servers_section(snapshot);
     seed_default_safeguard_rules(snapshot);
     alias_snapshot_keys(snapshot);
+}
+
+pub(crate) fn normalize_safeguard_config_value(
+    safeguard_config: serde_json::Value,
+) -> serde_json::Value {
+    let mut snapshot = HashMap::new();
+    snapshot.insert("safeguardConfig".to_string(), safeguard_config);
+    normalize_settings_snapshot_sections(&mut snapshot);
+    snapshot
+        .remove("safeguardConfig")
+        .unwrap_or_else(|| serde_json::json!({}))
 }
 
 fn alias_snapshot_keys(snapshot: &mut HashMap<String, serde_json::Value>) {
@@ -893,14 +983,58 @@ fn alias_snapshot_keys(snapshot: &mut HashMap<String, serde_json::Value>) {
     }
 }
 
+fn settings_section_or_empty(value: serde_json::Value) -> serde_json::Value {
+    if value.is_null() {
+        serde_json::json!({})
+    } else {
+        value
+    }
+}
+
+fn object_section(snapshot: &HashMap<String, serde_json::Value>, key: &str) -> serde_json::Value {
+    snapshot
+        .get(key)
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+fn array_section(snapshot: &HashMap<String, serde_json::Value>, key: &str) -> serde_json::Value {
+    snapshot
+        .get(key)
+        .filter(|value| value.is_array())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]))
+}
+
+fn runtime_settings_from_snapshot(
+    snapshot: &HashMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    let runtime = snapshot
+        .get("runtimeSettings")
+        .and_then(|value| value.as_object());
+    let locale = runtime
+        .and_then(|value| value.get("locale"))
+        .and_then(|value| value.as_str())
+        .or_else(|| snapshot.get("locale").and_then(|value| value.as_str()))
+        .filter(|value| matches!(*value, "zh-CN" | "en-US"))
+        .unwrap_or("zh-CN");
+    let deep_task = runtime
+        .and_then(|value| value.get("deepTask"))
+        .and_then(|value| value.as_bool())
+        .or_else(|| snapshot.get("deepTask").and_then(|value| value.as_bool()))
+        .unwrap_or(false);
+    serde_json::json!({
+        "locale": locale,
+        "deepTask": deep_task,
+    })
+}
+
 fn normalize_wrapped_section_value(value: &mut serde_json::Value) {
     let Some(object) = value.as_object() else {
         return;
     };
-    let nested = object
-        .get("config")
-        .or_else(|| object.get("data"))
-        .cloned();
+    let nested = object.get("config").or_else(|| object.get("data")).cloned();
     if let Some(nested) = nested {
         *value = nested;
     }
@@ -938,13 +1072,18 @@ fn builtin_safeguard_rules() -> Vec<serde_json::Value> {
 
 fn seed_default_safeguard_rules(snapshot: &mut HashMap<String, serde_json::Value>) {
     if !snapshot.contains_key("safeguardConfig") {
-        let legacy = snapshot.remove("safeguard").unwrap_or(serde_json::json!({}));
+        let legacy = snapshot
+            .remove("safeguard")
+            .unwrap_or(serde_json::json!({}));
         snapshot.insert("safeguardConfig".to_string(), legacy);
     }
 
     let safeguard = snapshot
         .get_mut("safeguardConfig")
         .expect("safeguardConfig just inserted");
+    if !safeguard.is_object() {
+        *safeguard = serde_json::json!({});
+    }
 
     let existing_rules = safeguard
         .get("rules")
@@ -952,9 +1091,11 @@ fn seed_default_safeguard_rules(snapshot: &mut HashMap<String, serde_json::Value
         .cloned()
         .unwrap_or_default();
 
-    let has_builtin = existing_rules
-        .iter()
-        .any(|r| r.get("category").and_then(|v| v.as_str()).is_some_and(|c| c != "custom"));
+    let has_builtin = existing_rules.iter().any(|r| {
+        r.get("category")
+            .and_then(|v| v.as_str())
+            .is_some_and(|c| c != "custom")
+    });
 
     if has_builtin {
         return;
@@ -1144,184 +1285,7 @@ fn merge_legacy_instruction_skills_into_skills_config(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::ShadowExecutionPipeline;
-    use magi_core::{
-        AbsolutePath, ExecutionOwnership, MissionId, SessionId, TaskId, UtcMillis, WorkerId,
-        WorkspaceId,
-    };
-    use magi_event_bus::InMemoryEventBus;
-    use magi_governance::GovernanceService;
-    use magi_memory_store::MemoryStore;
-    use magi_orchestrator::{
-        ExecutionWritebackPlans, OrchestratorService, task_store::TaskStore,
-    };
-    use magi_session_store::SessionStore;
-    use magi_skill_runtime::SkillDispatchRuntime;
-    use magi_tool_runtime::ToolRegistry;
-    use magi_worker_runtime::WorkerRuntime;
-    use magi_workspace::WorkspaceStore;
-    use std::sync::Arc;
-
-    #[test]
-    fn recovery_writeback_pipeline_persists_recovery_memory_extraction_on_success() {
-        let event_bus = Arc::new(InMemoryEventBus::new(16));
-        let governance = Arc::new(GovernanceService::default());
-        let orchestrator =
-            OrchestratorService::new(Arc::clone(&event_bus));
-        let session_store = Arc::new(SessionStore::new());
-        let workspace_store = Arc::new(WorkspaceStore::new());
-        let memory_store = MemoryStore::new();
-
-        let mission_id = MissionId::new("mission-recovery-pipeline");
-        let task_id = TaskId::new("task-recovery-pipeline");
-        let session_id = SessionId::new("session-recovery-pipeline");
-        let workspace_id = WorkspaceId::new("workspace-recovery-pipeline");
-        let worker_id = WorkerId::new("worker-recovery-pipeline");
-
-        session_store
-            .create_session(session_id.clone(), "session")
-            .expect("session should be creatable");
-        session_store.bind_execution_ownership(
-            session_id.clone(),
-            ExecutionOwnership {
-                session_id: Some(session_id.clone()),
-                workspace_id: Some(workspace_id.clone()),
-                mission_id: Some(mission_id.clone()),
-                task_id: Some(task_id.clone()),
-                worker_id: Some(worker_id.clone()),
-                execution_chain_ref: Some("chain-recovery-pipeline".to_string()),
-            },
-        );
-
-        workspace_store
-            .register(workspace_id.clone(), AbsolutePath::new("/Users/xie/code/magi"))
-            .expect("workspace should be creatable");
-        let recovery_handle = workspace_store.prepare_recovery_entry(
-            workspace_id.clone(),
-            ExecutionOwnership {
-                session_id: Some(session_id.clone()),
-                workspace_id: Some(workspace_id.clone()),
-                mission_id: Some(mission_id.clone()),
-                task_id: Some(task_id.clone()),
-                worker_id: Some(worker_id.clone()),
-                execution_chain_ref: Some("chain-recovery-pipeline".to_string()),
-            },
-            "snapshot-recovery-pipeline",
-            "recovery-recovery-pipeline",
-            Some("resume parser after crash".to_string()),
-        );
-        workspace_store
-            .mark_recovery_ready(&recovery_handle.recovery_id)
-            .expect("recovery should be ready");
-
-        let task_store = Arc::new(TaskStore::new());
-        let root_task_id = TaskId::new("task-root-recovery-pipeline");
-        let now = UtcMillis::now();
-        task_store.insert_task(magi_core::Task {
-            task_id: root_task_id.clone(),
-            mission_id: mission_id.clone(),
-            root_task_id: root_task_id.clone(),
-            parent_task_id: None,
-            kind: magi_core::TaskKind::Objective,
-            title: "mission".to_string(),
-            goal: "mission".to_string(),
-            status: magi_core::TaskStatus::Running,
-            dependency_ids: Vec::new(),
-            required_children: vec![task_id.clone()],
-            policy_snapshot: None,
-            executor_binding: None,
-            context_refs: Vec::new(),
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            created_at: now,
-            updated_at: now,
-        });
-        task_store.insert_task(magi_core::Task {
-            task_id: task_id.clone(),
-            mission_id: mission_id.clone(),
-            root_task_id: root_task_id,
-            parent_task_id: Some(TaskId::new("task-root-recovery-pipeline")),
-            kind: magi_core::TaskKind::Action,
-            title: "todo".to_string(),
-            goal: "todo".to_string(),
-            status: magi_core::TaskStatus::Blocked,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: Some(magi_core::ExecutorBinding {
-                target_role: "integration-dev".to_string(),
-                capability_requirements: Vec::new(),
-                parallelism_group: None,
-                exclusive_scope: None,
-                worker_selector: None,
-            }),
-            context_refs: Vec::new(),
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: Vec::new(),
-            evidence_refs: vec!["seed".to_string()],
-            retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            created_at: now,
-            updated_at: now,
-        });
-
-        let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
-        tool_registry.register_default_builtins();
-        let execution_runtime = orchestrator.execution_runtime_with_recovery_support(
-            WorkerRuntime::new_compare(Arc::clone(&event_bus)),
-            tool_registry.clone(),
-            SkillDispatchRuntime::new(
-                tool_registry,
-                magi_bridge_client::BridgeDispatchRuntime::new(),
-            ),
-            Arc::clone(&session_store),
-            Arc::clone(&workspace_store),
-        )
-        .with_task_store(Arc::clone(&task_store));
-        let pipeline = ShadowExecutionPipeline {
-            orchestrator,
-            execution_runtime,
-            memory_store: memory_store.clone(),
-        };
-
-        let recovery_input = workspace_store
-            .build_recovery_resume_input(&recovery_handle.recovery_id)
-            .expect("recovery input should be buildable");
-        let writebacks = ExecutionWritebackPlans::from_recovery_resume_input(&recovery_input);
-        let result = pipeline
-            .execute_recovery_with_writebacks(recovery_input, worker_id, writebacks)
-            .expect("recovery should execute");
-
-        assert_eq!(result.target.task_id, task_id);
-        let verification = memory_store
-            .verify_extraction_linkage("extract-recovery-recovery-recovery-pipeline")
-            .expect("recovery writeback should persist extraction linkage");
-        assert!(verification.is_consistent);
-        let linkage = memory_store
-            .extraction_linkage("extract-recovery-recovery-recovery-pipeline")
-            .expect("recovery extraction linkage should exist");
-        assert_eq!(
-            linkage.extraction.source_ref.as_deref(),
-            Some("recovery://recovery-recovery-pipeline/snapshot/snapshot-recovery-pipeline")
-        );
-        assert_eq!(linkage.produced_records[0].content, "resume parser after crash");
-    }
-}
-
-fn build_mcp_config_from_entry(entry: &serde_json::Value) -> Option<McpServerConfig> {
+pub(crate) fn build_mcp_config_from_entry(entry: &serde_json::Value) -> Option<McpServerConfig> {
     let command = entry.get("command")?.as_str()?.to_string();
     if command.is_empty() {
         return None;

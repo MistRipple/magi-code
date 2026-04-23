@@ -1,10 +1,11 @@
+use magi_core::{TaskId, TaskStatus};
 use magi_event_bus::{
     AuditUsageLedgerStatus, RecoveryActivityStage, RecoveryDiagnosticSummaryEntry,
     RuntimeLedgerSummary, RuntimeReadModelInput, SessionRuntimeBranchSummaryEntry,
-    SessionRuntimeSummaryEntry,
+    SessionRuntimeSummaryEntry, SessionRuntimeTurnItemSummaryEntry,
+    SessionRuntimeTurnLaneSummaryEntry, SessionRuntimeTurnSummaryEntry,
     WorkspaceRuntimeSummaryEntry,
 };
-use magi_core::TaskStatus;
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecarExport};
 use magi_workspace::{RecoveryStatus, WorkspaceRecoverySidecarExport};
@@ -70,25 +71,100 @@ fn merge_session_sidecars(
         entry.last_update = Some(export.last_update);
         entry.execution_chain_ref = export.execution_chain_ref.clone();
         entry.recovery_ref = export.recovery_ref.clone();
+        entry.active_execution_group_ids.clear();
+        entry.active_task_ids.clear();
+        entry.recovery_ids.clear();
         entry.active_branches.clear();
         entry.has_recoverable_chain = false;
         entry.recoverable_branch_count = 0;
         entry.mission_id = None;
         entry.root_task_id = None;
         entry.root_task_status = None;
+        entry.root_task_created_at = None;
+        entry.current_turn = None;
+        entry.turn_items.clear();
+        entry.worker_lanes.clear();
         if let Some(chain) = export.active_execution_chain.as_ref() {
             entry.mission_id = Some(chain.mission_id.to_string());
             entry.root_task_id = Some(chain.root_task_id.to_string());
             entry.execution_chain_ref = Some(chain.execution_chain_ref.clone());
             entry.recovery_ref = chain.recovery_ref.clone().or(export.recovery_ref.clone());
-            entry.root_task_status = task_store
-                .and_then(|store| store.get_task(&chain.root_task_id))
-                .map(|task| task_status_label(&task.status));
+            if let Some(task) = task_store.and_then(|store| store.get_task(&chain.root_task_id)) {
+                entry.root_task_status = Some(task_status_label(&task.status));
+                entry.root_task_created_at = Some(task.created_at);
+            }
             entry.active_branches = chain
                 .branches
                 .iter()
                 .map(|branch| session_branch_summary(branch, task_store))
                 .collect();
+            if let Some(turn) = chain.current_turn.as_ref() {
+                entry.current_turn = Some(SessionRuntimeTurnSummaryEntry {
+                    turn_id: turn.turn_id.clone(),
+                    turn_seq: turn.turn_seq,
+                    accepted_at: Some(turn.accepted_at),
+                    status: turn.status.clone(),
+                    user_message: turn.user_message.clone(),
+                    mission_id: Some(chain.mission_id.to_string()),
+                    root_task_id: Some(chain.root_task_id.to_string()),
+                    execution_chain_ref: Some(chain.execution_chain_ref.clone()),
+                });
+                entry.turn_items = turn
+                    .items
+                    .iter()
+                    .map(|item| {
+                        let role_id = item.role_id.clone().or_else(|| {
+                            item.task_id
+                                .as_ref()
+                                .and_then(|task_id| task_role_id(task_store, task_id))
+                        });
+                        SessionRuntimeTurnItemSummaryEntry {
+                            item_id: item.item_id.clone(),
+                            item_seq: item.item_seq,
+                            lane_id: item.lane_id.clone(),
+                            lane_seq: item.lane_seq,
+                            kind: item.kind.clone(),
+                            status: item.status.clone(),
+                            source: item.source.clone(),
+                            title: item.title.clone(),
+                            content: item.content.clone(),
+                            task_id: item.task_id.as_ref().map(ToString::to_string),
+                            worker_id: item.worker_id.as_ref().map(ToString::to_string),
+                            role_id,
+                            tool_call_id: item.tool_call_id.clone(),
+                            tool_name: item.tool_name.clone(),
+                            tool_status: item.tool_status.clone(),
+                            tool_result: item.tool_result.clone(),
+                            tool_error: item.tool_error.clone(),
+                            thread_visible: item.thread_visible,
+                            worker_visible: item.worker_visible,
+                        }
+                    })
+                    .collect();
+                entry.worker_lanes = turn
+                    .worker_lanes
+                    .iter()
+                    .map(|lane| {
+                        let role_id = lane
+                            .role_id
+                            .clone()
+                            .or_else(|| task_role_id(task_store, &lane.task_id));
+                        SessionRuntimeTurnLaneSummaryEntry {
+                            lane_id: lane.lane_id.clone(),
+                            lane_seq: lane.lane_seq,
+                            task_id: lane.task_id.to_string(),
+                            worker_id: lane.worker_id.to_string(),
+                            role_id,
+                            title: lane.title.clone(),
+                            status: task_store
+                                .and_then(|store| store.get_task(&lane.task_id))
+                                .map(|task| task_status_label(&task.status))
+                                .unwrap_or_else(|| "unknown".to_string()),
+                            is_primary: lane.is_primary,
+                        }
+                    })
+                    .collect();
+            }
             entry.recoverable_branch_count = entry
                 .active_branches
                 .iter()
@@ -104,16 +180,25 @@ fn merge_session_sidecars(
             }
             push_unique(&mut entry.recovery_ids, chain.recovery_ref.clone());
         }
-        if session_sidecar_is_runtime_active(export) {
+        if session_sidecar_is_runtime_active(export)
+            && !session_root_task_is_terminal(entry.root_task_status.as_deref())
+        {
             push_unique(
                 &mut entry.active_execution_group_ids,
-                export.ownership.mission_id.as_ref().map(ToString::to_string),
+                export
+                    .ownership
+                    .mission_id
+                    .as_ref()
+                    .map(ToString::to_string),
             );
             push_unique(
                 &mut entry.active_task_ids,
                 export.ownership.task_id.as_ref().map(ToString::to_string),
             );
             push_unique(&mut entry.recovery_ids, export.recovery_ref.clone());
+        }
+        if session_root_task_is_terminal(entry.root_task_status.as_deref()) {
+            clear_session_runtime_live_ids(entry);
         }
     }
 
@@ -133,7 +218,25 @@ fn merge_session_sidecars(
                 .cmp(&right.task_id)
                 .then_with(|| left.worker_id.cmp(&right.worker_id))
         });
+        entry.turn_items.sort_by(|left, right| {
+            left.item_seq
+                .cmp(&right.item_seq)
+                .then_with(|| left.item_id.cmp(&right.item_id))
+        });
+        entry.worker_lanes.sort_by(|left, right| {
+            left.lane_seq
+                .cmp(&right.lane_seq)
+                .then_with(|| left.lane_id.cmp(&right.lane_id))
+        });
     }
+}
+
+fn task_role_id(task_store: Option<&TaskStore>, task_id: &TaskId) -> Option<String> {
+    task_store
+        .and_then(|store| store.get_task(task_id))
+        .and_then(|task| task.executor_binding.map(|binding| binding.target_role))
+        .map(|role| role.trim().to_string())
+        .filter(|role| !role.is_empty())
 }
 
 fn session_branch_summary(
@@ -152,7 +255,10 @@ fn session_branch_summary(
         lease_id: branch.lease_id.as_ref().map(ToString::to_string),
         execution_intent_ref: branch.execution_intent_ref.clone(),
         binding_lifecycle: branch.binding_lifecycle.clone(),
-        last_checkpoint_at: Some(branch.last_checkpoint_at),
+        checkpoint_stage: branch.checkpoint_stage.clone(),
+        next_step_index: branch.next_step_index,
+        checkpoint_at: branch.checkpoint_at,
+        resume_mode: branch.resume_mode.clone(),
         is_primary: branch.is_primary,
     }
 }
@@ -175,17 +281,21 @@ fn task_status_label(status: &TaskStatus) -> String {
 }
 
 fn branch_status_is_recoverable(status: &str) -> bool {
+    matches!(status, "blocked")
+}
+
+fn session_root_task_is_terminal(status: Option<&str>) -> bool {
     matches!(
         status,
-        "draft"
-            | "ready"
-            | "running"
-            | "blocked"
-            | "failed"
-            | "verifying"
-            | "repairing"
-            | "awaiting_approval"
+        Some("completed" | "failed" | "cancelled" | "skipped")
     )
+}
+
+fn clear_session_runtime_live_ids(entry: &mut SessionRuntimeSummaryEntry) {
+    entry.active_execution_group_ids.clear();
+    entry.active_task_ids.clear();
+    entry.has_recoverable_chain = false;
+    entry.recoverable_branch_count = 0;
 }
 
 fn session_sidecar_is_runtime_active(export: &SessionRuntimeSidecarExport) -> bool {
@@ -234,7 +344,11 @@ fn merge_workspace_sidecars(
         entry.recovery_ref = Some(export.recovery_ref.clone());
         push_unique(
             &mut entry.active_execution_group_ids,
-            export.ownership.mission_id.as_ref().map(ToString::to_string),
+            export
+                .ownership
+                .mission_id
+                .as_ref()
+                .map(ToString::to_string),
         );
         push_unique(
             &mut entry.active_task_ids,
@@ -404,11 +518,15 @@ mod tests {
 
         assert_eq!(runtime_read_model.details.sessions.len(), 1);
         assert_eq!(
-            runtime_read_model.details.sessions[0].recovery_ref.as_deref(),
+            runtime_read_model.details.sessions[0]
+                .recovery_ref
+                .as_deref(),
             Some("recovery-1")
         );
         assert_eq!(
-            runtime_read_model.details.workspaces[0].recovery_ref.as_deref(),
+            runtime_read_model.details.workspaces[0]
+                .recovery_ref
+                .as_deref(),
             Some("recovery-1")
         );
         assert_eq!(
@@ -417,6 +535,188 @@ mod tests {
         );
         assert_eq!(runtime_read_model.meta.ledger.next_sequence, 12);
         assert_eq!(runtime_read_model.meta.ledger.usage_count, 7);
+    }
+
+    #[test]
+    fn runtime_read_model_only_counts_blocked_branches_as_recoverable() {
+        let task_store = TaskStore::new();
+        let mission_id = magi_core::MissionId::new("mission-recoverable-1");
+        let root_task_id = magi_core::TaskId::new("task-root-recoverable-1");
+
+        task_store.insert_task(magi_core::Task {
+            task_id: root_task_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            parent_task_id: None,
+            kind: magi_core::TaskKind::Objective,
+            title: "root".to_string(),
+            goal: "root".to_string(),
+            status: TaskStatus::Blocked,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: UtcMillis::now(),
+            updated_at: UtcMillis::now(),
+        });
+        for (task_id, status) in [
+            ("task-branch-blocked", TaskStatus::Blocked),
+            ("task-branch-ready", TaskStatus::Ready),
+            ("task-branch-running", TaskStatus::Running),
+            ("task-branch-completed", TaskStatus::Completed),
+        ] {
+            task_store.insert_task(magi_core::Task {
+                task_id: magi_core::TaskId::new(task_id),
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                parent_task_id: Some(root_task_id.clone()),
+                kind: magi_core::TaskKind::Action,
+                title: task_id.to_string(),
+                goal: task_id.to_string(),
+                status,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                context_refs: Vec::new(),
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                repair_count: 0,
+                decision_payload: None,
+                created_at: UtcMillis::now(),
+                updated_at: UtcMillis::now(),
+            });
+        }
+
+        let runtime_read_model = runtime_read_model_dto(
+            RuntimeReadModelInput::default(),
+            &[SessionRuntimeSidecarExport {
+                session_id: SessionId::new("session-recoverable-1"),
+                current_status: SessionExecutionSidecarStatus::Bound,
+                last_update: UtcMillis::now(),
+                ownership: ExecutionOwnership {
+                    session_id: Some(SessionId::new("session-recoverable-1")),
+                    mission_id: Some(mission_id.clone()),
+                    task_id: Some(root_task_id.clone()),
+                    execution_chain_ref: Some("chain-recoverable-1".to_string()),
+                    ..ExecutionOwnership::default()
+                },
+                execution_chain_ref: Some("chain-recoverable-1".to_string()),
+                recovery_ref: None,
+                active_execution_chain: Some(magi_session_store::ActiveExecutionChain {
+                    session_id: SessionId::new("session-recoverable-1"),
+                    mission_id,
+                    root_task_id,
+                    execution_chain_ref: "chain-recoverable-1".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![
+                        magi_core::TaskId::new("task-branch-blocked"),
+                        magi_core::TaskId::new("task-branch-ready"),
+                        magi_core::TaskId::new("task-branch-running"),
+                        magi_core::TaskId::new("task-branch-completed"),
+                    ],
+                    active_worker_bindings: vec![magi_core::WorkerId::new("worker-recoverable-1")],
+                    recovery_ref: None,
+                    branches: vec![
+                        magi_session_store::ActiveExecutionBranch {
+                            task_id: magi_core::TaskId::new("task-branch-blocked"),
+                            worker_id: magi_core::WorkerId::new("worker-recoverable-1"),
+                            stage: "execute".to_string(),
+                            lease_id: None,
+                            execution_intent_ref: None,
+                            binding_lifecycle: None,
+                            checkpoint_stage: Some("execute".to_string()),
+                            next_step_index: Some(2),
+                            checkpoint_at: Some(UtcMillis::now()),
+                            resume_mode: Some("step-checkpoint".to_string()),
+                            resume_token: None,
+                            use_tools: true,
+                            skill_name: None,
+                            is_primary: true,
+                        },
+                        magi_session_store::ActiveExecutionBranch {
+                            task_id: magi_core::TaskId::new("task-branch-ready"),
+                            worker_id: magi_core::WorkerId::new("worker-recoverable-1"),
+                            stage: "execute".to_string(),
+                            lease_id: None,
+                            execution_intent_ref: None,
+                            binding_lifecycle: None,
+                            checkpoint_stage: Some("execute".to_string()),
+                            next_step_index: Some(0),
+                            checkpoint_at: Some(UtcMillis::now()),
+                            resume_mode: Some("stage-restart".to_string()),
+                            resume_token: None,
+                            use_tools: true,
+                            skill_name: None,
+                            is_primary: false,
+                        },
+                        magi_session_store::ActiveExecutionBranch {
+                            task_id: magi_core::TaskId::new("task-branch-running"),
+                            worker_id: magi_core::WorkerId::new("worker-recoverable-1"),
+                            stage: "execute".to_string(),
+                            lease_id: None,
+                            execution_intent_ref: None,
+                            binding_lifecycle: None,
+                            checkpoint_stage: Some("execute".to_string()),
+                            next_step_index: Some(1),
+                            checkpoint_at: Some(UtcMillis::now()),
+                            resume_mode: Some("step-checkpoint".to_string()),
+                            resume_token: None,
+                            use_tools: true,
+                            skill_name: None,
+                            is_primary: false,
+                        },
+                        magi_session_store::ActiveExecutionBranch {
+                            task_id: magi_core::TaskId::new("task-branch-completed"),
+                            worker_id: magi_core::WorkerId::new("worker-recoverable-1"),
+                            stage: "finish".to_string(),
+                            lease_id: None,
+                            execution_intent_ref: None,
+                            binding_lifecycle: None,
+                            checkpoint_stage: None,
+                            next_step_index: None,
+                            checkpoint_at: None,
+                            resume_mode: None,
+                            resume_token: None,
+                            use_tools: true,
+                            skill_name: None,
+                            is_primary: false,
+                        },
+                    ],
+                    dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
+                        accepted_at: UtcMillis::now(),
+                        entry_id: "timeline-recoverable-1".to_string(),
+                        trimmed_text: Some("recoverable".to_string()),
+                        deep_task: true,
+                        skill_name: None,
+                    },
+                    current_turn: None,
+                }),
+            }],
+            &[],
+            ledger_dto(AuditUsageLedgerStatus::default()),
+            Some(&task_store),
+        );
+
+        let session = &runtime_read_model.details.sessions[0];
+        assert!(session.has_recoverable_chain);
+        assert_eq!(session.recoverable_branch_count, 1);
+        assert_eq!(session.active_branches.len(), 4);
     }
 
     #[test]
@@ -510,23 +810,26 @@ mod tests {
     #[test]
     fn runtime_read_model_keeps_event_sourced_recovery_worker_when_workspace_sidecar_is_stale() {
         let mut input = RuntimeReadModelInput::default();
-        input.recovery.summaries.push(RecoveryDiagnosticSummaryEntry {
-            recovery_id: "recovery-worker-1".to_string(),
-            event_count: 2,
-            latest_stage: RecoveryActivityStage::WorkerResumed,
-            latest_event_type: "worker.resumed.from_recovery".to_string(),
-            latest_sequence: 3,
-            latest_occurred_at: UtcMillis::now(),
-            workspace_id: Some(WorkspaceId::new("workspace-1")),
-            session_id: Some(magi_core::SessionId::new("session-1")),
-            mission_id: Some(magi_core::MissionId::new("mission-1")),
-            assignment_id: None,
-            task_id: Some(magi_core::TaskId::new("todo-1")),
-            worker_id: Some("worker-actual".to_string()),
-            execution_chain_ref: Some("chain-1".to_string()),
-            diagnostic_summary: Some("resume".to_string()),
-            current_status: "worker_resumed".to_string(),
-        });
+        input
+            .recovery
+            .summaries
+            .push(RecoveryDiagnosticSummaryEntry {
+                recovery_id: "recovery-worker-1".to_string(),
+                event_count: 2,
+                latest_stage: RecoveryActivityStage::WorkerResumed,
+                latest_event_type: "worker.resumed.from_recovery".to_string(),
+                latest_sequence: 3,
+                latest_occurred_at: UtcMillis::now(),
+                workspace_id: Some(WorkspaceId::new("workspace-1")),
+                session_id: Some(magi_core::SessionId::new("session-1")),
+                mission_id: Some(magi_core::MissionId::new("mission-1")),
+                assignment_id: None,
+                task_id: Some(magi_core::TaskId::new("todo-1")),
+                worker_id: Some("worker-actual".to_string()),
+                execution_chain_ref: Some("chain-1".to_string()),
+                diagnostic_summary: Some("resume".to_string()),
+                current_status: "worker_resumed".to_string(),
+            });
 
         let runtime_read_model = runtime_read_model_dto(
             input,
@@ -551,31 +854,37 @@ mod tests {
 
         assert_eq!(runtime_read_model.recovery.summaries.len(), 1);
         assert_eq!(
-            runtime_read_model.recovery.summaries[0].worker_id.as_deref(),
+            runtime_read_model.recovery.summaries[0]
+                .worker_id
+                .as_deref(),
             Some("worker-actual")
         );
     }
 
     #[test]
-    fn runtime_read_model_preserves_event_sourced_recovery_outcome_when_workspace_sidecar_is_consumed_snapshot() {
+    fn runtime_read_model_preserves_event_sourced_recovery_outcome_when_workspace_sidecar_is_consumed_snapshot()
+     {
         let mut input = RuntimeReadModelInput::default();
-        input.recovery.summaries.push(RecoveryDiagnosticSummaryEntry {
-            recovery_id: "recovery-outcome-1".to_string(),
-            event_count: 2,
-            latest_stage: RecoveryActivityStage::WorkerResumed,
-            latest_event_type: "worker.resumed.from_recovery".to_string(),
-            latest_sequence: 7,
-            latest_occurred_at: UtcMillis(50),
-            workspace_id: None,
-            session_id: Some(magi_core::SessionId::new("session-outcome-1")),
-            mission_id: Some(magi_core::MissionId::new("mission-outcome-1")),
-            assignment_id: None,
-            task_id: Some(magi_core::TaskId::new("todo-outcome-1")),
-            worker_id: Some("worker-outcome-1".to_string()),
-            execution_chain_ref: Some("chain-outcome-1".to_string()),
-            diagnostic_summary: None,
-            current_status: "worker_resumed".to_string(),
-        });
+        input
+            .recovery
+            .summaries
+            .push(RecoveryDiagnosticSummaryEntry {
+                recovery_id: "recovery-outcome-1".to_string(),
+                event_count: 2,
+                latest_stage: RecoveryActivityStage::WorkerResumed,
+                latest_event_type: "worker.resumed.from_recovery".to_string(),
+                latest_sequence: 7,
+                latest_occurred_at: UtcMillis(50),
+                workspace_id: None,
+                session_id: Some(magi_core::SessionId::new("session-outcome-1")),
+                mission_id: Some(magi_core::MissionId::new("mission-outcome-1")),
+                assignment_id: None,
+                task_id: Some(magi_core::TaskId::new("todo-outcome-1")),
+                worker_id: Some("worker-outcome-1".to_string()),
+                execution_chain_ref: Some("chain-outcome-1".to_string()),
+                diagnostic_summary: None,
+                current_status: "worker_resumed".to_string(),
+            });
 
         let runtime_read_model = runtime_read_model_dto(
             input,
@@ -606,10 +915,16 @@ mod tests {
         assert_eq!(summary.latest_stage, RecoveryActivityStage::WorkerResumed);
         assert_eq!(summary.current_status, "worker_resumed");
         assert_eq!(summary.latest_occurred_at, UtcMillis(50));
-        assert_eq!(summary.workspace_id, Some(WorkspaceId::new("workspace-outcome-1")));
+        assert_eq!(
+            summary.workspace_id,
+            Some(WorkspaceId::new("workspace-outcome-1"))
+        );
         assert_eq!(summary.diagnostic_summary.as_deref(), Some("resume detail"));
         assert_eq!(summary.worker_id.as_deref(), Some("worker-outcome-1"));
-        assert_eq!(summary.execution_chain_ref.as_deref(), Some("chain-outcome-1"));
+        assert_eq!(
+            summary.execution_chain_ref.as_deref(),
+            Some("chain-outcome-1")
+        );
     }
 
     #[test]
@@ -642,5 +957,352 @@ mod tests {
         assert!(session.active_task_ids.is_empty());
         assert!(session.recovery_ids.is_empty());
         assert_eq!(session.execution_chain_ref.as_deref(), Some("chain-bound"));
+    }
+
+    #[test]
+    fn session_sidecar_overrides_stale_event_scoped_active_ids() {
+        let mission_id = magi_core::MissionId::new("mission-current");
+        let root_task_id = magi_core::TaskId::new("task-root-current");
+        let branch_task_id = magi_core::TaskId::new("task-branch-current");
+        let worker_id = magi_core::WorkerId::new("worker-current");
+        let root_created_at = UtcMillis::now();
+        let branch_created_at = UtcMillis::now();
+        let task_store = TaskStore::new();
+        task_store.insert_task(magi_core::Task {
+            task_id: root_task_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            parent_task_id: None,
+            kind: magi_core::TaskKind::Objective,
+            title: "current root".to_string(),
+            goal: "current root".to_string(),
+            status: TaskStatus::Completed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: root_created_at,
+            updated_at: UtcMillis::now(),
+        });
+        task_store.insert_task(magi_core::Task {
+            task_id: branch_task_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            parent_task_id: Some(root_task_id.clone()),
+            kind: magi_core::TaskKind::Action,
+            title: "current branch".to_string(),
+            goal: "current branch".to_string(),
+            status: TaskStatus::Completed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: branch_created_at,
+            updated_at: UtcMillis::now(),
+        });
+
+        let mut input = RuntimeReadModelInput::default();
+        input.details.sessions.push(SessionRuntimeSummaryEntry {
+            session_id: "session-stale".to_string(),
+            active_execution_group_ids: vec!["mission-stale".to_string()],
+            active_task_ids: vec!["task-stale".to_string()],
+            recovery_ids: vec!["recovery-stale".to_string()],
+            current_status: Some("failed".to_string()),
+            mission_id: Some("mission-stale".to_string()),
+            root_task_id: Some("task-root-stale".to_string()),
+            root_task_status: Some("blocked".to_string()),
+            execution_chain_ref: Some("chain-stale".to_string()),
+            recovery_ref: Some("recovery-stale".to_string()),
+            ..SessionRuntimeSummaryEntry::default()
+        });
+
+        let runtime_read_model = runtime_read_model_dto(
+            input,
+            &[SessionRuntimeSidecarExport {
+                session_id: SessionId::new("session-stale"),
+                current_status: SessionExecutionSidecarStatus::Bound,
+                last_update: UtcMillis::now(),
+                ownership: ExecutionOwnership {
+                    session_id: Some(SessionId::new("session-stale")),
+                    mission_id: Some(mission_id.clone()),
+                    task_id: Some(branch_task_id.clone()),
+                    worker_id: Some(worker_id.clone()),
+                    execution_chain_ref: Some("chain-current".to_string()),
+                    ..ExecutionOwnership::default()
+                },
+                execution_chain_ref: Some("chain-current".to_string()),
+                recovery_ref: None,
+                active_execution_chain: Some(magi_session_store::ActiveExecutionChain {
+                    session_id: SessionId::new("session-stale"),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-current".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![branch_task_id.clone()],
+                    active_worker_bindings: vec![worker_id.clone()],
+                    recovery_ref: None,
+                    branches: vec![magi_session_store::ActiveExecutionBranch {
+                        task_id: branch_task_id.clone(),
+                        worker_id: worker_id.clone(),
+                        stage: "finish".to_string(),
+                        lease_id: None,
+                        execution_intent_ref: None,
+                        binding_lifecycle: None,
+                        checkpoint_stage: None,
+                        next_step_index: None,
+                        checkpoint_at: None,
+                        resume_mode: None,
+                        resume_token: None,
+                        use_tools: false,
+                        skill_name: None,
+                        is_primary: true,
+                    }],
+                    dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
+                        accepted_at: UtcMillis::now(),
+                        entry_id: "timeline-current".to_string(),
+                        trimmed_text: Some("current".to_string()),
+                        deep_task: false,
+                        skill_name: None,
+                    },
+                    current_turn: None,
+                }),
+            }],
+            &[],
+            ledger_dto(AuditUsageLedgerStatus::default()),
+            Some(&task_store),
+        );
+
+        let session = runtime_read_model
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == "session-stale")
+            .expect("session summary should exist");
+        assert!(session.active_execution_group_ids.is_empty());
+        assert!(session.active_task_ids.is_empty());
+        assert!(session.recovery_ids.is_empty());
+        assert_eq!(session.current_status.as_deref(), Some("bound"));
+        assert_eq!(session.mission_id.as_deref(), Some("mission-current"));
+        assert_eq!(session.root_task_id.as_deref(), Some("task-root-current"));
+        assert_eq!(session.root_task_status.as_deref(), Some("completed"));
+        assert_eq!(session.root_task_created_at, Some(root_created_at));
+        assert_eq!(
+            session.execution_chain_ref.as_deref(),
+            Some("chain-current")
+        );
+        assert!(session.current_turn.is_none());
+        assert!(session.turn_items.is_empty());
+        assert!(session.worker_lanes.is_empty());
+    }
+
+    #[test]
+    fn session_sidecar_keeps_completed_current_turn_as_display_source() {
+        let mission_id = magi_core::MissionId::new("mission-turn-completed");
+        let root_task_id = magi_core::TaskId::new("task-root-turn-completed");
+        let branch_task_id = magi_core::TaskId::new("task-branch-turn-completed");
+        let worker_id = magi_core::WorkerId::new("worker-turn-completed");
+        let accepted_at = UtcMillis::now();
+        let task_store = TaskStore::new();
+        task_store.insert_task(magi_core::Task {
+            task_id: root_task_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            parent_task_id: None,
+            kind: magi_core::TaskKind::Objective,
+            title: "completed root".to_string(),
+            goal: "completed root".to_string(),
+            status: TaskStatus::Completed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: accepted_at,
+            updated_at: accepted_at,
+        });
+        task_store.insert_task(magi_core::Task {
+            task_id: branch_task_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            parent_task_id: Some(root_task_id.clone()),
+            kind: magi_core::TaskKind::Action,
+            title: "completed branch".to_string(),
+            goal: "completed branch".to_string(),
+            status: TaskStatus::Completed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: Some(magi_core::ExecutorBinding {
+                target_role: "reviewer".to_string(),
+                capability_requirements: Vec::new(),
+                parallelism_group: None,
+                exclusive_scope: None,
+                worker_selector: None,
+            }),
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: accepted_at,
+            updated_at: accepted_at,
+        });
+
+        let runtime_read_model = runtime_read_model_dto(
+            RuntimeReadModelInput::default(),
+            &[SessionRuntimeSidecarExport {
+                session_id: SessionId::new("session-turn-completed"),
+                current_status: SessionExecutionSidecarStatus::Bound,
+                last_update: accepted_at,
+                ownership: ExecutionOwnership {
+                    session_id: Some(SessionId::new("session-turn-completed")),
+                    mission_id: Some(mission_id.clone()),
+                    task_id: Some(branch_task_id.clone()),
+                    worker_id: Some(worker_id.clone()),
+                    execution_chain_ref: Some("chain-turn-completed".to_string()),
+                    ..ExecutionOwnership::default()
+                },
+                execution_chain_ref: Some("chain-turn-completed".to_string()),
+                recovery_ref: None,
+                active_execution_chain: Some(magi_session_store::ActiveExecutionChain {
+                    session_id: SessionId::new("session-turn-completed"),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-turn-completed".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![branch_task_id.clone()],
+                    active_worker_bindings: vec![worker_id.clone()],
+                    recovery_ref: None,
+                    branches: vec![magi_session_store::ActiveExecutionBranch {
+                        task_id: branch_task_id.clone(),
+                        worker_id: worker_id.clone(),
+                        stage: "finish".to_string(),
+                        lease_id: None,
+                        execution_intent_ref: None,
+                        binding_lifecycle: Some("completed".to_string()),
+                        checkpoint_stage: None,
+                        next_step_index: None,
+                        checkpoint_at: None,
+                        resume_mode: None,
+                        resume_token: None,
+                        use_tools: false,
+                        skill_name: None,
+                        is_primary: false,
+                    }],
+                    dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
+                        accepted_at,
+                        entry_id: "timeline-turn-completed".to_string(),
+                        trimmed_text: Some("已完成".to_string()),
+                        deep_task: true,
+                        skill_name: None,
+                    },
+                    current_turn: Some(magi_session_store::ActiveExecutionTurn {
+                        turn_id: "turn-session-action-completed".to_string(),
+                        turn_seq: accepted_at.0,
+                        accepted_at,
+                        status: "completed".to_string(),
+                        user_message: Some("请继续整理结果".to_string()),
+                        items: vec![magi_session_store::ActiveExecutionTurnItem {
+                            item_id: "turn-item-final".to_string(),
+                            item_seq: 1,
+                            lane_id: None,
+                            lane_seq: None,
+                            kind: "assistant_final".to_string(),
+                            status: "completed".to_string(),
+                            source: "orchestrator".to_string(),
+                            title: Some("总结".to_string()),
+                            content: Some("这是 turn 主线最终总结".to_string()),
+                            task_id: Some(branch_task_id.clone()),
+                            worker_id: Some(worker_id.clone()),
+                            role_id: None,
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_status: None,
+                            tool_result: None,
+                            tool_error: None,
+                            thread_visible: true,
+                            worker_visible: false,
+                        }],
+                        worker_lanes: vec![magi_session_store::ActiveExecutionTurnLane {
+                            lane_id: "lane-branch".to_string(),
+                            lane_seq: 1,
+                            task_id: branch_task_id.clone(),
+                            worker_id: worker_id.clone(),
+                            role_id: None,
+                            title: "完成分支".to_string(),
+                            is_primary: false,
+                        }],
+                    }),
+                }),
+            }],
+            &[],
+            ledger_dto(AuditUsageLedgerStatus::default()),
+            Some(&task_store),
+        );
+
+        let session = runtime_read_model
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == "session-turn-completed")
+            .expect("session summary should exist");
+        assert!(session.active_execution_group_ids.is_empty());
+        assert!(session.active_task_ids.is_empty());
+        assert!(!session.active_branches.is_empty());
+        assert!(!session.turn_items.is_empty());
+        assert_eq!(session.worker_lanes.len(), 1);
+        assert_eq!(
+            session.turn_items[0].role_id.as_deref(),
+            Some("reviewer"),
+            "turn item role_id should be backfilled from task executor binding"
+        );
+        assert_eq!(
+            session.worker_lanes[0].role_id.as_deref(),
+            Some("reviewer"),
+            "worker lane role_id should be backfilled from task executor binding"
+        );
+        let current_turn = session
+            .current_turn
+            .as_ref()
+            .expect("completed root should still preserve current turn display state");
+        assert_eq!(current_turn.turn_id, "turn-session-action-completed");
+        assert_eq!(current_turn.user_message.as_deref(), Some("请继续整理结果"));
+        assert_eq!(session.root_task_status.as_deref(), Some("completed"));
+        assert!(!session.has_recoverable_chain);
+        assert_eq!(session.recoverable_branch_count, 0);
     }
 }

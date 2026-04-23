@@ -72,9 +72,7 @@ impl ShadowRuntimeMaintenancePolicy {
             DaemonMaintenancePolicyProfile::AggressiveFlush => {
                 DaemonMaintenanceMode::AggressiveFlush
             }
-            DaemonMaintenancePolicyProfile::PreCutoverDrain => {
-                DaemonMaintenanceMode::CutoverPrep
-            }
+            DaemonMaintenancePolicyProfile::PreCutoverDrain => DaemonMaintenanceMode::CutoverPrep,
         }
     }
 }
@@ -304,11 +302,17 @@ impl ShadowRuntimeMaintenance {
         if !self.config.policy.sidecar_flush_enabled {
             return false;
         }
+        let worker_runtime_snapshot_dirty =
+            self.sidecar_persistence.worker_runtime_snapshot_dirty();
         if self.config.policy.eager_flush_dirty_sidecars {
             let session_metadata = self.session_store.execution_sidecar_flush_metadata();
             let workspace_metadata = self.workspace_store.recovery_sidecar_flush_metadata();
             return session_metadata.current_version != session_metadata.flushed_version
-                || workspace_metadata.current_version != workspace_metadata.flushed_version;
+                || workspace_metadata.current_version != workspace_metadata.flushed_version
+                || worker_runtime_snapshot_dirty;
+        }
+        if worker_runtime_snapshot_dirty {
+            return true;
         }
         session_sidecar_flush_due(&self.session_store.execution_sidecar_flush_metadata(), now)
             || workspace_sidecar_flush_due(
@@ -341,8 +345,10 @@ impl ShadowRuntimeMaintenance {
                 kind: RuntimeMaintenanceStepKind::SidecarFlush,
                 outcome: RuntimeMaintenanceStepOutcome::DueAndFlushed,
                 detail: Some(format!(
-                    "force_flush={force_flush};session_sidecars_flushed={};workspace_recovery_sidecars_flushed={}",
-                    flushed.session_sidecars_flushed, flushed.workspace_recovery_sidecars_flushed
+                    "force_flush={force_flush};session_sidecars_flushed={};workspace_recovery_sidecars_flushed={};worker_runtime_snapshot_flushed={}",
+                    flushed.session_sidecars_flushed,
+                    flushed.workspace_recovery_sidecars_flushed,
+                    flushed.worker_runtime_snapshot_flushed
                 )),
             }),
             Err(error) => {
@@ -473,8 +479,7 @@ impl ShadowRuntimeMaintenance {
             mode,
             mode_reason: state_before.mode_reason.clone(),
             shutdown_requested_at: state_before.shutdown_requested_at,
-            shutdown_completed_at: if state_before.mode
-                == DaemonMaintenanceMode::ShutdownRequested
+            shutdown_completed_at: if state_before.mode == DaemonMaintenanceMode::ShutdownRequested
             {
                 Some(now)
             } else {

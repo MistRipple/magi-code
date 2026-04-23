@@ -1,10 +1,12 @@
 use crate::{
+    change_projection::PendingChangeDto,
     dto::{
-        runtime_read_model_dto, AuditUsageLedgerDto, BridgePreflightSnapshotDto,
-        BridgeServicesSnapshotDto, RuntimeReadModelDto, ServiceInfo,
+        AuditUsageLedgerDto, BridgePreflightSnapshotDto, BridgeServicesSnapshotDto,
+        RuntimeReadModelDto, ServiceInfo, runtime_read_model_dto,
     },
     state::ApiState,
 };
+use magi_core::{SessionId, UtcMillis};
 use magi_event_bus::{EventEnvelope, EventStreamSnapshot, RuntimeReadModelInput};
 use magi_session_store::{
     NotificationRecord, SessionProjectionInput, SessionRecord, SessionRuntimeSidecarExport,
@@ -14,7 +16,6 @@ use magi_workspace::{
     RecoveryHandle, SnapshotRecord, WorkspaceProjectionInput, WorkspaceRecord,
     WorkspaceRecoverySidecarExport,
 };
-use magi_core::{SessionId, UtcMillis};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
@@ -41,6 +42,8 @@ pub struct BootstrapDto {
     pub bridge_preflight: BridgePreflightSnapshotDto,
     pub notifications: Vec<NotificationRecord>,
     pub recent_events: Vec<EventEnvelope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_changes: Vec<PendingChangeDto>,
 }
 
 impl BootstrapDto {
@@ -52,13 +55,10 @@ impl BootstrapDto {
         state: &ApiState,
         requested_session_id: Option<&SessionId>,
     ) -> Self {
-        Self::from_projection(
+        let mut dto = Self::from_projection(
             state.runtime_epoch().to_string(),
             state.service_info.clone(),
-            select_session_projection(
-                state.session_store.projection_input(),
-                requested_session_id,
-            ),
+            select_session_projection(state.session_store.projection_input(), requested_session_id),
             state.workspace_registry.projection_input(),
             state.session_store.execution_sidecar_exports(),
             state.workspace_registry.recovery_sidecar_exports(),
@@ -68,7 +68,23 @@ impl BootstrapDto {
             state.bridge_services_dto(),
             state.bridge_preflight_dto(),
             state.task_store(),
-        )
+        );
+        if let Some(current_session) = dto.current_session.as_ref() {
+            dto.pending_changes = crate::change_projection::collect_session_pending_changes(
+                state,
+                &current_session.session_id,
+                current_session.workspace_id.as_deref(),
+            )
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    session_id = %current_session.session_id,
+                    "bootstrap pending changes 收集失败: {:?}",
+                    error
+                );
+                Vec::new()
+            });
+        }
+        dto
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -86,13 +102,17 @@ impl BootstrapDto {
         bridge_preflight: BridgePreflightSnapshotDto,
         task_store: Option<&magi_orchestrator::task_store::TaskStore>,
     ) -> Self {
-        let current_session = session_projection.current_session_id.as_ref().and_then(|session_id| {
+        let current_session =
             session_projection
-                .sessions
-                .iter()
-                .find(|session| &session.session_id == session_id)
-                .cloned()
-        });
+                .current_session_id
+                .as_ref()
+                .and_then(|session_id| {
+                    session_projection
+                        .sessions
+                        .iter()
+                        .find(|session| &session.session_id == session_id)
+                        .cloned()
+                });
         let runtime_read_model = runtime_read_model_dto(
             runtime_read_model,
             &session_sidecar_exports,
@@ -117,6 +137,7 @@ impl BootstrapDto {
             bridge_preflight,
             notifications: session_projection.notifications,
             recent_events: event_snapshot.recent_events,
+            pending_changes: Vec::new(),
         }
     }
 }
@@ -149,7 +170,9 @@ mod tests {
     use super::*;
     use crate::dto::ledger_dto;
     use magi_core::{ExecutionOwnership, SessionId, WorkspaceId};
-    use magi_event_bus::{AuditUsageLedgerStatus, RuntimeExecutorSummary, RuntimeMaintenanceSummary};
+    use magi_event_bus::{
+        AuditUsageLedgerStatus, RuntimeExecutorSummary, RuntimeMaintenanceSummary,
+    };
     use magi_governance::GovernanceService;
     use magi_session_store::SessionExecutionSidecarStatus;
     use magi_session_store::SessionStore;
@@ -264,11 +287,15 @@ mod tests {
 
         assert_eq!(bootstrap.runtime_read_model.details.sessions.len(), 1);
         assert_eq!(
-            bootstrap.runtime_read_model.details.sessions[0].recovery_ref.as_deref(),
+            bootstrap.runtime_read_model.details.sessions[0]
+                .recovery_ref
+                .as_deref(),
             Some("recovery-1")
         );
         assert_eq!(
-            bootstrap.runtime_read_model.details.workspaces[0].recovery_ref.as_deref(),
+            bootstrap.runtime_read_model.details.workspaces[0]
+                .recovery_ref
+                .as_deref(),
             Some("recovery-1")
         );
         assert_eq!(
@@ -302,11 +329,21 @@ mod tests {
         );
 
         assert_eq!(
-            bootstrap.runtime_read_model.meta.maintenance.maintenance_mode.as_deref(),
+            bootstrap
+                .runtime_read_model
+                .meta
+                .maintenance
+                .maintenance_mode
+                .as_deref(),
             Some("active")
         );
         assert_eq!(
-            bootstrap.runtime_read_model.meta.maintenance.policy_profile.as_deref(),
+            bootstrap
+                .runtime_read_model
+                .meta
+                .maintenance
+                .policy_profile
+                .as_deref(),
             Some("aggressive")
         );
     }
@@ -336,7 +373,12 @@ mod tests {
         );
 
         assert_eq!(
-            bootstrap.runtime_read_model.meta.executor.executor_id.as_deref(),
+            bootstrap
+                .runtime_read_model
+                .meta
+                .executor
+                .executor_id
+                .as_deref(),
             Some("executor-1")
         );
         assert_eq!(
@@ -389,11 +431,23 @@ mod tests {
         assert_eq!(bootstrap.runtime_read_model.meta.ledger.audit_count, 3);
         assert_eq!(bootstrap.runtime_read_model.meta.ledger.usage_count, 4);
         assert_eq!(
-            bootstrap.runtime_read_model.meta.ledger.last_persist_error.as_deref(),
+            bootstrap
+                .runtime_read_model
+                .meta
+                .ledger
+                .last_persist_error
+                .as_deref(),
             Some("blocked")
         );
         assert!(bootstrap.runtime_read_model.meta.ledger.pending_flush);
-        assert!(bootstrap.runtime_read_model.meta.ledger.last_persisted_at.is_some());
+        assert!(
+            bootstrap
+                .runtime_read_model
+                .meta
+                .ledger
+                .last_persisted_at
+                .is_some()
+        );
     }
 
     #[test]
@@ -457,23 +511,16 @@ mod tests {
             magi_session_store::TimelineEntryKind::UserMessage,
             "message-b",
         );
-        session_store.append_notification(
-            session_a.clone(),
-            "notification-a",
-            "toast",
-            "notify-a",
-        );
-        session_store.append_notification(
-            session_b.clone(),
-            "notification-b",
-            "toast",
-            "notify-b",
-        );
+        session_store.append_notification(session_a.clone(), "notification-a", "toast", "notify-a");
+        session_store.append_notification(session_b.clone(), "notification-b", "toast", "notify-b");
 
         let bootstrap = BootstrapDto::from_state_with_selected_session(&state, Some(&session_a));
 
         assert_eq!(
-            bootstrap.current_session.as_ref().map(|session| session.session_id.clone()),
+            bootstrap
+                .current_session
+                .as_ref()
+                .map(|session| session.session_id.clone()),
             Some(session_a.clone())
         );
         assert!(

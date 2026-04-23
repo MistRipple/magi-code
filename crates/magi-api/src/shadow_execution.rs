@@ -1,25 +1,25 @@
-
 use magi_bridge_client::ModelInvocationRequest;
 use magi_bridge_client::SHADOW_MODEL_PROVIDER;
-use magi_core::{
-    ExecutionOwnership, ExecutorBinding, MissionId, Task, TaskExecutionTarget, TaskId,
-    TaskKind, TaskStatus, UtcMillis, WorkerId,
-};
 #[cfg(test)]
 use magi_core::SessionId;
+use magi_core::{
+    ExecutionOwnership, ExecutorBinding, MissionId, Task, TaskExecutionTarget, TaskId, TaskKind,
+    TaskStatus, UtcMillis, WorkerId,
+};
 use magi_event_bus::{EventContext, task_events};
 use magi_orchestrator::ExecutionWritebackPlans;
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
+    ActiveExecutionTurn, ActiveExecutionTurnItem, ActiveExecutionTurnLane,
 };
 
+#[cfg(test)]
+use crate::dto::SessionActionRequestDto;
 use crate::{
     errors::ApiError,
     state::ApiState,
     task_execution::{DispatchSubmissionRequest, ShadowTaskExecutionPlan},
 };
-#[cfg(test)]
-use crate::dto::SessionActionRequestDto;
 
 pub(crate) struct ShadowTaskGraphSubmission {
     pub root_task_id: TaskId,
@@ -32,11 +32,14 @@ pub(crate) fn run_shadow_dispatch_submission(
     request: &DispatchSubmissionRequest,
 ) -> Result<ShadowTaskGraphSubmission, ApiError> {
     let _ = state.shadow_execution_pipeline().ok_or_else(|| {
-        ApiError::internal_assembly("执行 shadow dispatch 失败", "shadow execution pipeline 未配置")
+        ApiError::internal_assembly(
+            "执行 shadow dispatch 失败",
+            "shadow execution pipeline 未配置",
+        )
     })?;
-    let task_store = state
-        .task_store()
-        .ok_or_else(|| ApiError::internal_assembly("执行 shadow dispatch 失败", "task_store 未配置"))?;
+    let task_store = state.task_store().ok_or_else(|| {
+        ApiError::internal_assembly("执行 shadow dispatch 失败", "task_store 未配置")
+    })?;
 
     let accepted_at = request.accepted_at;
     let session_id = &request.session_id;
@@ -144,6 +147,9 @@ pub(crate) fn run_shadow_dispatch_submission(
                 execution_chain_ref: execution_chain_ref.clone(),
             },
             worker_id: worker_id.clone(),
+            lane_id: None,
+            lane_seq: None,
+            is_primary: true,
             session_id: session_id.clone(),
             workspace_id: workspace_id.clone(),
             ownership: ownership.clone(),
@@ -184,6 +190,15 @@ pub(crate) fn run_shadow_dispatch_submission(
                     execution_chain_ref: execution_chain_ref.clone(),
                 },
                 worker_id: worker_id.clone(),
+                lane_id: Some(format!("lane-{}", sub_task_id)),
+                lane_seq: Some(
+                    sub_task_ids
+                        .iter()
+                        .position(|candidate| candidate == sub_task_id)
+                        .unwrap_or(0)
+                        + 1,
+                ),
+                is_primary: false,
                 session_id: request.session_id.clone(),
                 workspace_id: workspace_id.clone(),
                 ownership: sub_ownership,
@@ -201,11 +216,23 @@ pub(crate) fn run_shadow_dispatch_submission(
         lease_id: None,
         execution_intent_ref: None,
         binding_lifecycle: None,
-        last_checkpoint_at: now,
+        checkpoint_stage: Some("execute".to_string()),
+        next_step_index: Some(0),
+        checkpoint_at: Some(now),
+        resume_mode: Some("stage-restart".to_string()),
+        resume_token: None,
         use_tools: request.deep_task,
         skill_name: request.skill_name.clone(),
         is_primary: true,
     }];
+    let role_for_task = |task_id: &TaskId| {
+        state
+            .task_store()
+            .and_then(|store| store.get_task(task_id))
+            .and_then(|task| task.executor_binding.map(|binding| binding.target_role))
+            .map(|role| role.trim().to_string())
+            .filter(|role| !role.is_empty())
+    };
     for sub_task_id in &sub_task_ids {
         branches.push(ActiveExecutionBranch {
             task_id: sub_task_id.clone(),
@@ -214,12 +241,92 @@ pub(crate) fn run_shadow_dispatch_submission(
             lease_id: None,
             execution_intent_ref: None,
             binding_lifecycle: None,
-            last_checkpoint_at: now,
+            checkpoint_stage: Some("execute".to_string()),
+            next_step_index: Some(0),
+            checkpoint_at: Some(now),
+            resume_mode: Some("stage-restart".to_string()),
+            resume_token: None,
             use_tools: true,
             skill_name: request.skill_name.clone(),
             is_primary: false,
         });
     }
+    let mut current_turn = ActiveExecutionTurn {
+        turn_id: format!("turn-session-action-{}", accepted_at.0),
+        turn_seq: accepted_at.0,
+        accepted_at,
+        status: "accepted".to_string(),
+        user_message: trimmed_text.map(str::to_string),
+        items: vec![ActiveExecutionTurnItem {
+            item_id: format!("turn-item-phase-{}", accepted_at.0),
+            item_seq: 1,
+            lane_id: None,
+            lane_seq: None,
+            kind: "assistant_phase".to_string(),
+            status: "pending".to_string(),
+            source: "orchestrator".to_string(),
+            title: Some("任务理解".to_string()),
+            content: Some("已接收请求，正在整理执行步骤。".to_string()),
+            task_id: Some(act_task_id.clone()),
+            worker_id: Some(worker_id.clone()),
+            role_id: role_for_task(&act_task_id),
+            tool_call_id: None,
+            tool_name: None,
+            tool_status: None,
+            tool_result: None,
+            tool_error: None,
+            thread_visible: true,
+            worker_visible: false,
+        }],
+        worker_lanes: sub_task_ids
+            .iter()
+            .enumerate()
+            .map(|(index, sub_task_id)| ActiveExecutionTurnLane {
+                lane_id: format!("lane-{}", sub_task_id),
+                lane_seq: index + 1,
+                task_id: sub_task_id.clone(),
+                worker_id: worker_id.clone(),
+                role_id: role_for_task(sub_task_id),
+                title: state
+                    .task_store()
+                    .and_then(|store| store.get_task(sub_task_id))
+                    .map(|task| task.title)
+                    .unwrap_or_else(|| sub_task_id.to_string()),
+                is_primary: false,
+            })
+            .collect(),
+    };
+    for (index, sub_task_id) in sub_task_ids.iter().enumerate() {
+        let lane_id = format!("lane-{}", sub_task_id);
+        let lane_title = current_turn
+            .worker_lanes
+            .iter()
+            .find(|lane| lane.task_id == *sub_task_id)
+            .map(|lane| lane.title.clone())
+            .unwrap_or_else(|| sub_task_id.to_string());
+        current_turn.items.push(ActiveExecutionTurnItem {
+            item_id: format!("turn-item-worker-spawned-{}-{}", accepted_at.0, index),
+            item_seq: index + 2,
+            lane_id: Some(lane_id),
+            lane_seq: Some(index + 1),
+            kind: "worker_spawned".to_string(),
+            status: "pending".to_string(),
+            source: worker_id.to_string(),
+            title: Some(lane_title.clone()),
+            content: Some(format!("已为 {} 创建执行分支。", lane_title)),
+            task_id: Some(sub_task_id.clone()),
+            worker_id: Some(worker_id.clone()),
+            role_id: role_for_task(sub_task_id),
+            tool_call_id: None,
+            tool_name: None,
+            tool_status: None,
+            tool_result: None,
+            tool_error: None,
+            thread_visible: false,
+            worker_visible: true,
+        });
+    }
+    current_turn.normalize();
     Ok(ShadowTaskGraphSubmission {
         root_task_id: obj_task_id.clone(),
         action_task_id: act_task_id.clone(),
@@ -230,7 +337,10 @@ pub(crate) fn run_shadow_dispatch_submission(
             execution_chain_ref: execution_chain_ref
                 .expect("dispatch execution chain ref should exist"),
             workspace_id,
-            active_branch_task_ids: branches.iter().map(|branch| branch.task_id.clone()).collect(),
+            active_branch_task_ids: branches
+                .iter()
+                .map(|branch| branch.task_id.clone())
+                .collect(),
             active_worker_bindings: branches
                 .iter()
                 .map(|branch| branch.worker_id.clone())
@@ -244,6 +354,7 @@ pub(crate) fn run_shadow_dispatch_submission(
                 deep_task: request.deep_task,
                 skill_name: request.skill_name.clone(),
             },
+            current_turn: Some(current_turn),
         }),
     })
 }
@@ -298,18 +409,79 @@ fn decompose_mission(
     if !response.ok {
         return None;
     }
-    let sub_tasks: Vec<String> = response
-        .payload
-        .lines()
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
-        .take(5)
-        .collect();
+    let sub_tasks = parse_decomposition_response(&response.payload, prompt_text);
     if sub_tasks.is_empty() {
         None
     } else {
         Some(sub_tasks)
     }
+}
+
+fn parse_decomposition_response(response: &str, original_prompt: &str) -> Vec<String> {
+    let mut tasks = Vec::new();
+    for line in response.lines() {
+        let Some(task_title) = normalize_decomposition_line(line, original_prompt) else {
+            continue;
+        };
+        if tasks.iter().any(|existing| existing == &task_title) {
+            continue;
+        }
+        tasks.push(task_title);
+        if tasks.len() >= 5 {
+            break;
+        }
+    }
+    tasks
+}
+
+fn normalize_decomposition_line(line: &str, original_prompt: &str) -> Option<String> {
+    let mut value = line.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(rest) = value.strip_prefix("shadow-model::") {
+        value = rest.trim();
+    }
+    value = value
+        .trim_start_matches(|ch: char| ch == '-' || ch == '*' || ch == '•' || ch.is_whitespace())
+        .trim();
+    let numbered = value
+        .char_indices()
+        .find(|(_, ch)| !ch.is_ascii_digit())
+        .and_then(|(index, ch)| {
+            if index > 0 && (ch == '.' || ch == ')' || ch == '、') {
+                Some(value[index + ch.len_utf8()..].trim())
+            } else {
+                None
+            }
+        });
+    if let Some(rest) = numbered {
+        value = rest;
+    }
+
+    let lower = value.to_ascii_lowercase();
+    let original_prompt = original_prompt.trim();
+    if value.starts_with("请将以下任务分解")
+        || value.starts_with("每行一个子任务")
+        || value.starts_with("不要编号")
+        || value.starts_with("不要额外说明")
+        || value.starts_with("只返回")
+        || lower.starts_with("task:")
+        || value.starts_with("任务：")
+        || value.starts_with("目标:")
+        || value.starts_with("目标：")
+        || (!original_prompt.is_empty() && value == original_prompt)
+    {
+        return None;
+    }
+
+    let value = value
+        .trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`')
+        .trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 /// Build a Task with sensible defaults for shadow execution entries.
@@ -360,10 +532,7 @@ fn make_shadow_task(
 }
 
 fn infer_dispatch_task_role(skill_name: Option<&str>) -> &'static str {
-    let Some(skill_name) = skill_name
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+    let Some(skill_name) = skill_name.map(str::trim).filter(|value| !value.is_empty()) else {
         return "integration-dev";
     };
 
@@ -622,4 +791,28 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn decomposition_parser_rejects_prompt_echo_lines() {
+        let response = "shadow-model::请将以下任务分解为 2-5 个具体的子任务。每行一个子任务标题，不要编号，不要额外说明。\n\n任务：请分析并拆分这个复杂任务";
+
+        let tasks = parse_decomposition_response(response, "请分析并拆分这个复杂任务");
+
+        assert!(tasks.is_empty(), "提示词回显不能被当成子任务标题");
+    }
+
+    #[test]
+    fn decomposition_parser_accepts_clean_numbered_lines() {
+        let response = "1. 分析目标与约束\n2) 制定执行步骤\n- 汇总结果";
+
+        let tasks = parse_decomposition_response(response, "请分析并拆分这个复杂任务");
+
+        assert_eq!(
+            tasks,
+            vec![
+                "分析目标与约束".to_string(),
+                "制定执行步骤".to_string(),
+                "汇总结果".to_string(),
+            ]
+        );
+    }
 }

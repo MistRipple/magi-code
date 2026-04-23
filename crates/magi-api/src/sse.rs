@@ -1,5 +1,5 @@
 use axum::response::sse::{Event, KeepAlive, Sse};
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use magi_event_bus::EventEnvelope;
 use std::{convert::Infallible, time::Duration};
 use tokio_stream::wrappers::BroadcastStream;
@@ -34,5 +34,7 @@ pub async fn events(
 
 fn event_to_sse(event: EventEnvelope) -> Event {
     let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-    Event::default().id(event.event_id.to_string()).data(payload)
+    Event::default()
+        .id(event.event_id.to_string())
+        .data(payload)
 }
