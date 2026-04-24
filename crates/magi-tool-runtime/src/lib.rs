@@ -2015,32 +2015,38 @@ mod tests {
         assert_eq!(output.status, ExecutionResultStatus::Failed);
     }
 
-    // ── 桩工具行为验证 ──
+    // ── 实际工具行为验证 ──
 
     #[test]
-    fn search_semantic_stub_returns_hint() {
+    fn search_semantic_returns_results_structure() {
         let registry = make_registry();
         let output = exec_tool(
             &registry,
             BuiltinToolName::SearchSemantic,
             &serde_json::json!({ "query": "test query" }).to_string(),
         );
-        assert_eq!(output.status, ExecutionResultStatus::Failed);
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         let payload: Value = serde_json::from_str(&output.payload).unwrap();
-        assert!(payload["hint"].as_str().unwrap().contains("CodebaseRetrievalService"));
+        assert_eq!(payload["tool"], "search_semantic");
+        assert_eq!(payload["status"], "succeeded");
+        assert!(payload["results"].is_array());
+        assert!(payload["scanned_files"].is_number());
     }
 
     #[test]
-    fn knowledge_query_stub_returns_hint() {
+    fn knowledge_query_returns_results_structure() {
         let registry = make_registry();
         let output = exec_tool(
             &registry,
             BuiltinToolName::KnowledgeQuery,
-            &serde_json::json!({ "category": "architecture" }).to_string(),
+            &serde_json::json!({ "query": "architecture" }).to_string(),
         );
-        assert_eq!(output.status, ExecutionResultStatus::Failed);
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
         let payload: Value = serde_json::from_str(&output.payload).unwrap();
-        assert!(payload["hint"].as_str().unwrap().contains("ProjectKnowledgeBase"));
+        assert_eq!(payload["tool"], "knowledge_query");
+        assert_eq!(payload["status"], "succeeded");
+        assert!(payload["results"].is_array());
+        assert!(payload["scanned_docs"].is_number());
     }
 
     #[test]
@@ -2067,7 +2073,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_apply_stub_returns_hint() {
+    fn skill_apply_returns_not_found_for_missing_skill() {
         let registry = make_registry();
         let output = exec_tool(
             &registry,
@@ -2076,8 +2082,9 @@ mod tests {
         );
         assert_eq!(output.status, ExecutionResultStatus::Failed);
         let payload: Value = serde_json::from_str(&output.payload).unwrap();
-        assert!(payload["hint"].as_str().unwrap().contains("SkillRuntime"));
+        assert_eq!(payload["tool"], "skill_apply");
         assert_eq!(payload["skill_name"], "auto-review");
+        assert!(payload["error"].as_str().unwrap().contains("auto-review"));
     }
 
     // ── web 工具 access mode ──
