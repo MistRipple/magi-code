@@ -5,6 +5,7 @@
     markAllNotificationsRead,
     clearAllNotifications,
     removeNotification,
+    messagesState,
     type Notification,
   } from '../stores/messages.svelte';
   import Icon from './Icon.svelte';
@@ -23,7 +24,7 @@
 
   function togglePanel() {
     panelOpen = !panelOpen;
-    if (panelOpen) {
+    if (panelOpen && messagesState.bootstrapped) {
       markAllNotificationsRead();
     }
   }
@@ -33,10 +34,16 @@
   }
 
   function handleClearAll() {
+    if (!messagesState.bootstrapped) {
+      return;
+    }
     clearAllNotifications();
   }
 
   function handleRemove(id: string) {
+    if (!messagesState.bootstrapped) {
+      return;
+    }
     removeNotification(id);
   }
 

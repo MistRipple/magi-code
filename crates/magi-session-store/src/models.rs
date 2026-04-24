@@ -415,6 +415,15 @@ impl SessionDurableState {
             && self.notifications.is_empty()
     }
 
+    pub fn append_state(&mut self, other: SessionDurableState) {
+        if self.current_session_id.is_none() {
+            self.current_session_id = other.current_session_id;
+        }
+        self.sessions.extend(other.sessions);
+        self.timeline.extend(other.timeline);
+        self.notifications.extend(other.notifications);
+    }
+
     pub fn partition_by_workspace(
         &self,
     ) -> (SessionDurableState, HashMap<String, SessionDurableState>) {

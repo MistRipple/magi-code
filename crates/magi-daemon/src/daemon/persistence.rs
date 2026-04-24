@@ -54,7 +54,7 @@ impl ShadowStateRepository {
         // 未绑定工作区的会话继续保留在全局 sessions.json。
         if global_path.exists() {
             let legacy = self.load_session_durable_state()?;
-            let (global_state, workspace_states) = legacy.partition_by_workspace();
+            let (mut global_state, workspace_states) = legacy.partition_by_workspace();
             for (workspace_id, workspace_state) in workspace_states {
                 if let Some((_, root)) = workspace_roots.iter().find(|(id, _)| id == &workspace_id)
                 {
@@ -68,6 +68,8 @@ impl ShadowStateRepository {
                         }
                         self.save_workspace_session_state(root, &ws_state)?;
                     }
+                } else {
+                    global_state.append_state(workspace_state);
                 }
             }
             if global_state.is_empty() {
@@ -456,6 +458,63 @@ mod tests {
 
         let _ = fs::remove_dir_all(state_root);
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn load_sessions_from_workspaces_keeps_unknown_workspace_sessions_in_global_state() {
+        let state_root = unique_temp_dir("magi-persistence-unknown-workspace");
+        let repository = ShadowStateRepository::new(state_root.clone());
+        let session_id = SessionId::new("session-unknown-workspace");
+        let now = UtcMillis::now();
+
+        repository
+            .save_session_durable_state(&SessionDurableState {
+                current_session_id: Some(session_id.clone()),
+                sessions: vec![SessionRecord {
+                    session_id: session_id.clone(),
+                    title: "未知工作区会话".to_string(),
+                    status: SessionLifecycleStatus::Active,
+                    created_at: now,
+                    updated_at: now,
+                    message_count: Some(1),
+                    workspace_id: Some("workspace-missing".to_string()),
+                }],
+                timeline: vec![TimelineEntry {
+                    entry_id: "timeline-unknown-workspace".to_string(),
+                    session_id: session_id.clone(),
+                    kind: TimelineEntryKind::UserMessage,
+                    message: "未知工作区会话消息".to_string(),
+                    occurred_at: now,
+                }],
+                notifications: vec![NotificationRecord {
+                    notification_id: "notification-unknown-workspace".to_string(),
+                    session_id: session_id.clone(),
+                    kind: "incident".to_string(),
+                    message: "未知工作区通知".to_string(),
+                    created_at: now,
+                    handled: false,
+                }],
+            })
+            .expect("legacy global session state should save");
+
+        let merged = repository
+            .load_sessions_from_workspaces(&[])
+            .expect("unknown workspace sessions should stay readable");
+
+        assert_eq!(merged.sessions.len(), 1);
+        assert_eq!(merged.timeline.len(), 1);
+        assert_eq!(merged.notifications.len(), 1);
+        assert_eq!(merged.current_session_id, Some(session_id.clone()));
+
+        let global_state = repository
+            .load_session_durable_state()
+            .expect("unknown workspace sessions should persist globally");
+        assert!(global_state.sessions.iter().any(|session| {
+            session.session_id == session_id
+                && session.workspace_id.as_deref() == Some("workspace-missing")
+        }));
+
+        let _ = fs::remove_dir_all(state_root);
     }
 
     #[test]

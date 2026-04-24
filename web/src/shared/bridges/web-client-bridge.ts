@@ -499,6 +499,7 @@ function isExpectedRecoveryBridgeFailure(error: unknown): boolean {
     || detail.includes('networkerror')
     || detail.includes('network error')
     || detail.includes('connection refused')
+    || detail.includes('bootstrap failed: 500')
     || detail.includes('local agent');
 }
 
@@ -2424,18 +2425,18 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'markAllNotificationsRead':
           void markAllNotificationsRead().catch((error) => {
-            logBridgeOperationFailure('标记通知已读', '[web-client-bridge] 标记通知已读失败:', error);
+            reportExpectedRecoveryFailure('标记通知已读', '[web-client-bridge] 标记通知已读失败:', error);
           });
           return;
         case 'clearAllNotifications':
           void clearAllNotifications().catch((error) => {
-            logBridgeOperationFailure('清空通知', '[web-client-bridge] 清空通知失败:', error);
+            reportExpectedRecoveryFailure('清空通知', '[web-client-bridge] 清空通知失败:', error);
           });
           return;
         case 'removeNotification':
           if (typeof message.notificationId === 'string' && message.notificationId.trim()) {
             void removeNotification(message.notificationId).catch((error) => {
-              logBridgeOperationFailure('删除通知', '[web-client-bridge] 删除通知失败:', error);
+              reportExpectedRecoveryFailure('删除通知', '[web-client-bridge] 删除通知失败:', error);
             });
           }
           return;

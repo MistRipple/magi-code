@@ -850,7 +850,7 @@ impl ApiState {
         };
 
         let durable = self.session_store.durable_state();
-        let (global_state, mut workspace_states) = durable.partition_by_workspace();
+        let (mut global_state, mut workspace_states) = durable.partition_by_workspace();
         let workspaces = self.workspace_registry.workspaces();
         for workspace in &workspaces {
             let ws_id = workspace.workspace_id.to_string();
@@ -860,11 +860,8 @@ impl ApiState {
             persistence.save_json(&session_path, &ws_state)?;
         }
 
-        if let Some((workspace_id, _)) = workspace_states.into_iter().next() {
-            return Err(ApiError::internal_assembly(
-                "持久化会话失败",
-                format!("检测到未注册工作区的会话状态: {workspace_id}"),
-            ));
+        for (_, orphan_state) in workspace_states {
+            global_state.append_state(orphan_state);
         }
 
         let Some(state_root) = persistence.state_root() else {

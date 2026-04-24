@@ -5,6 +5,8 @@
   "common.unlimited": "Unlimited",
   "app.bootstrapConnecting": "Connecting to service...",
   "app.bootstrapConnectingHint": "Initializing backend service, please wait",
+  "app.bootstrapConnectionFailed": "Unable to connect to backend service",
+  "app.bootstrapConnectionAddress": "Current connection address: {baseUrl}",
   "app.recoveryTitle": "Recovery Strategy Confirmation",
   "app.recoveryMessage": "Task execution failed. Please select a recovery strategy:",
   "app.recoveryContinue": "Continue",

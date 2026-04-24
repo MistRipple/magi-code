@@ -829,6 +829,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_handles_session_bound_to_unknown_workspace() {
+        let state = test_state();
+        let session_id = SessionId::new("session-bootstrap-unknown-workspace");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "未知工作区会话",
+                Some("workspace-missing".to_string()),
+            )
+            .expect("session should create");
+        state.session_store.append_notification(
+            session_id.clone(),
+            "notification-bootstrap-unknown-workspace",
+            "incident",
+            "未知工作区通知",
+        );
+
+        let app = build_router(state);
+        let bootstrap = get_json(app, "/bootstrap").await;
+
+        assert_eq!(
+            bootstrap["currentSession"]["sessionId"],
+            serde_json::json!(session_id.as_str())
+        );
+        assert_eq!(
+            bootstrap["notifications"]
+                .as_array()
+                .expect("notifications should be an array")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn bootstrap_accepts_camel_case_workspace_query() {
         let state = test_state();
         let workspace_id = WorkspaceId::new("workspace-bootstrap-query");

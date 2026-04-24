@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import Header from './components/Header.svelte';
   import TopTabs from './components/TopTabs.svelte';
   import ThreadPanel from './components/ThreadPanel.svelte';
@@ -10,6 +11,11 @@
   import Icon from './components/Icon.svelte';
   import { setCurrentTopTab, messagesState } from './stores/messages.svelte';
   import { i18n } from './stores/i18n.svelte';
+  import {
+    AGENT_CONNECTION_EVENT,
+    resolveAgentBaseUrl,
+    type AgentConnectionEventDetail,
+  } from './web/agent-api';
 
   type TopTabType = 'thread' | 'tasks' | 'edits' | 'knowledge';
 
@@ -25,6 +31,8 @@
 
   // 启动连接状态：后端 bootstrap 数据尚未就绪时显示等待提示
   const isBootstrapping = $derived(!messagesState.bootstrapped);
+  let bootstrapConnectionError = $state('');
+  let bootstrapConnectionBaseUrl = $state('');
 
   function handleTabChange(tab: TopTabType) {
     setCurrentTopTab(tab);
@@ -37,6 +45,31 @@
   function closeSettings() {
     settingsOpen = false;
   }
+
+  onMount(() => {
+    bootstrapConnectionBaseUrl = resolveAgentBaseUrl();
+    const handleAgentConnection = (event: Event) => {
+      const detail = (event as CustomEvent<AgentConnectionEventDetail>).detail;
+      bootstrapConnectionBaseUrl = detail?.baseUrl || resolveAgentBaseUrl();
+      if (detail?.status === 'connected') {
+        bootstrapConnectionError = '';
+        return;
+      }
+      if (!messagesState.bootstrapped) {
+        bootstrapConnectionError = detail?.error || i18n.t('bridge.agentUnreachable');
+      }
+    };
+    window.addEventListener(AGENT_CONNECTION_EVENT, handleAgentConnection as EventListener);
+    return () => {
+      window.removeEventListener(AGENT_CONNECTION_EVENT, handleAgentConnection as EventListener);
+    };
+  });
+
+  $effect(() => {
+    if (messagesState.bootstrapped) {
+      bootstrapConnectionError = '';
+    }
+  });
 
 </script>
 
@@ -51,12 +84,20 @@
     {#if isBootstrapping}
       <!-- 启动连接等待层：后端 bootstrap 数据尚未就绪 -->
       <div class="bootstrap-overlay">
-        <div class="bootstrap-content">
-          <div class="bootstrap-spinner">
-            <Icon name="loader" size={32} />
+        <div class="bootstrap-content" class:error={Boolean(bootstrapConnectionError)}>
+          <div class="bootstrap-spinner" class:static={Boolean(bootstrapConnectionError)}>
+            <Icon name={bootstrapConnectionError ? 'warning' : 'loader'} size={32} />
           </div>
-          <p class="bootstrap-title">{i18n.t('app.bootstrapConnecting')}</p>
-          <p class="bootstrap-hint">{i18n.t('app.bootstrapConnectingHint')}</p>
+          <p class="bootstrap-title">
+            {bootstrapConnectionError ? i18n.t('app.bootstrapConnectionFailed') : i18n.t('app.bootstrapConnecting')}
+          </p>
+          <p class="bootstrap-hint">
+            {bootstrapConnectionError || i18n.t('app.bootstrapConnectingHint')}
+          </p>
+          {#if bootstrapConnectionError}
+            <p class="bootstrap-hint">{i18n.t('app.bootstrapConnectionAddress', { baseUrl: bootstrapConnectionBaseUrl || 'http://127.0.0.1:38123' })}</p>
+            <code class="bootstrap-command">MAGI_WEB_DEV=1 cargo run -p magi-daemon-app</code>
+          {/if}
         </div>
       </div>
     {/if}
@@ -126,11 +167,21 @@
     gap: 12px;
     text-align: center;
     padding: 0 24px;
+    max-width: min(460px, calc(100% - 48px));
+  }
+
+  .bootstrap-content.error {
+    gap: 10px;
   }
 
   .bootstrap-spinner {
     color: var(--foreground-muted, #888);
     animation: bootstrap-spin 1.2s linear infinite;
+  }
+
+  .bootstrap-spinner.static {
+    color: var(--warning, #fbbf24);
+    animation: none;
   }
 
   .bootstrap-title {
@@ -142,8 +193,21 @@
 
   .bootstrap-hint {
     font-size: 12px;
+    line-height: 1.6;
     color: var(--foreground-muted, #888);
     margin: 0;
+  }
+
+  .bootstrap-command {
+    margin-top: 4px;
+    padding: 7px 10px;
+    border: 1px solid var(--border, rgba(148, 163, 184, 0.2));
+    border-radius: 8px;
+    background: var(--panel-bg, rgba(15, 23, 42, 0.72));
+    color: var(--foreground, #ddd);
+    font-size: 11px;
+    white-space: normal;
+    word-break: break-word;
   }
 
   @keyframes bootstrap-spin {

@@ -5,6 +5,8 @@
   "common.unlimited": "不限",
   "app.bootstrapConnecting": "正在连接服务...",
   "app.bootstrapConnectingHint": "正在初始化后台服务，请稍候",
+  "app.bootstrapConnectionFailed": "无法连接后台服务",
+  "app.bootstrapConnectionAddress": "当前连接地址：{baseUrl}",
   "app.recoveryTitle": "恢复策略确认",
   "app.recoveryMessage": "任务执行失败，需要选择恢复策略：",
   "app.recoveryContinue": "继续",

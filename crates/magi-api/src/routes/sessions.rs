@@ -21,9 +21,7 @@ use crate::{
     },
     errors::ApiError,
     state::ApiState,
-    task_execution::{
-        SessionTurnExecutionRequest, continue_shadow_execution_chain,
-    },
+    task_execution::{SessionTurnExecutionRequest, continue_shadow_execution_chain},
 };
 
 pub fn routes() -> Router<ApiState> {
@@ -890,4 +888,99 @@ fn parse_requested_session_id(value: Option<&str>) -> Option<SessionId> {
 
 fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{ApiState, RuntimeStatePersistence};
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use magi_core::UtcMillis;
+    use magi_event_bus::InMemoryEventBus;
+    use magi_governance::GovernanceService;
+    use magi_session_store::SessionStore;
+    use magi_workspace::WorkspaceStore;
+    use std::{fs, sync::Arc};
+    use tower::ServiceExt;
+
+    fn test_state() -> ApiState {
+        ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            UtcMillis::now().0
+        ));
+        fs::create_dir_all(&path).expect("temp dir should create");
+        path
+    }
+
+    #[tokio::test]
+    async fn mark_all_notifications_read_persists_unknown_workspace_session_without_500() {
+        let persistence_root = unique_temp_dir("magi-api-notification-orphan-workspace");
+        let session_id = SessionId::new("session-notification-orphan-workspace");
+        let state = test_state().with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
+            persistence_root.join("sessions.json"),
+            persistence_root.join("workspaces.json"),
+            persistence_root.join("knowledge.json"),
+        )));
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "未知工作区会话",
+                Some("workspace-missing".to_string()),
+            )
+            .expect("session should create");
+        state.session_store.append_notification(
+            session_id.clone(),
+            "notification-orphan-workspace",
+            "incident",
+            "未知工作区通知",
+        );
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/session/notifications/mark-all-read")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "sessionId": session_id.as_str() }).to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        let status = response.status();
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should read"),
+        )
+        .expect("response should be json");
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["sessionId"], serde_json::json!(session_id.as_str()));
+        assert_eq!(body["notifications"]["records"][0]["handled"], true);
+
+        let persisted = fs::read_to_string(persistence_root.join("sessions.json"))
+            .expect("orphan workspace session should persist globally");
+        assert!(persisted.contains("session-notification-orphan-workspace"));
+        assert!(persisted.contains("workspace-missing"));
+
+        let _ = fs::remove_dir_all(persistence_root);
+    }
 }
