@@ -420,8 +420,12 @@ fn append_dispatch_assistant_message(state: &ApiState, accepted: &DispatchSubmis
         return;
     }
 
-    state.session_store.append_timeline_entry(
+    // 使用与 invoke_llm_with_tools 中一致的确定性 entry_id，
+    // 若流式输出已创建该条目则更新为最终内容，否则插入新条目。
+    let streaming_entry_id = format!("timeline-streaming-{}", accepted.action_task_id);
+    state.session_store.upsert_timeline_entry(
         accepted.session_id.clone(),
+        &streaming_entry_id,
         TimelineEntryKind::AssistantMessage,
         response_text.clone(),
     );

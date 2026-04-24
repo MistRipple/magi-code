@@ -263,6 +263,48 @@ impl SessionStore {
         }
     }
 
+    /// 按 entry_id 更新已有 timeline 条目的内容，不存在则插入新条目。
+    /// 用于流式 LLM 输出时增量更新 timeline 中的 AssistantMessage。
+    pub fn upsert_timeline_entry(
+        &self,
+        session_id: SessionId,
+        entry_id: &str,
+        kind: TimelineEntryKind,
+        message: impl Into<String>,
+    ) {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        let now = UtcMillis::now();
+        let message_str = message.into();
+
+        if let Some(entry) = state
+            .timeline
+            .iter_mut()
+            .find(|entry| entry.entry_id == entry_id)
+        {
+            entry.message = message_str;
+            entry.kind = kind;
+        } else {
+            state.timeline.push(TimelineEntry {
+                entry_id: entry_id.to_string(),
+                session_id: session_id.clone(),
+                kind,
+                message: message_str,
+                occurred_at: now,
+            });
+        }
+
+        if let Some(session) = state
+            .sessions
+            .iter_mut()
+            .find(|session| session.session_id == session_id)
+        {
+            session.updated_at = now;
+        }
+    }
+
     pub fn append_notification(
         &self,
         session_id: SessionId,

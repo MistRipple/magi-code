@@ -174,6 +174,13 @@ impl ShadowStateRepository {
         self.read_json_or_default(self.knowledge_state_path())
     }
 
+    pub(crate) fn save_knowledge_state(
+        &self,
+        state: &KnowledgeState,
+    ) -> Result<(), DaemonError> {
+        self.write_json_atomically(self.knowledge_state_path(), state)
+    }
+
     fn read_json_or_default<T>(&self, path: PathBuf) -> Result<T, DaemonError>
     where
         T: Default + for<'de> serde::Deserialize<'de>,

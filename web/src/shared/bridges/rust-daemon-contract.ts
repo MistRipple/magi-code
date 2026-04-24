@@ -5,6 +5,10 @@ import type {
   DispatchGroupLane,
   Message,
   OrchestrationRuntimeAssignmentSummary,
+  OrchestrationRuntimeFailureRootCause,
+  OrchestrationRuntimeOpsView,
+  OrchestrationRuntimeRecoverySummary,
+  OrchestrationRuntimeTimelineEntry,
   OrchestratorRuntimeState,
   Session,
   SessionNotificationRecord,
@@ -137,6 +141,55 @@ interface RustSessionRuntimeBranchSummary {
   is_primary?: boolean;
 }
 
+/** 后端 RecoveryDiagnosticSummaryEntry 的 TS 映射 */
+interface RustRecoveryDiagnosticSummary {
+  recovery_id?: string;
+  event_count?: number;
+  latest_stage?: string;
+  latest_event_type?: string;
+  latest_sequence?: number;
+  latest_occurred_at?: number;
+  workspace_id?: string | null;
+  session_id?: string | null;
+  mission_id?: string | null;
+  assignment_id?: string | null;
+  task_id?: string | null;
+  worker_id?: string | null;
+  execution_chain_ref?: string | null;
+  diagnostic_summary?: string | null;
+  current_status?: string;
+}
+
+/** 后端 RuntimeDiagnosticSummary 的 TS 映射 */
+interface RustRuntimeDiagnosticSummary {
+  running_execution_group_count?: number;
+  failed_execution_group_count?: number;
+  running_task_count?: number;
+  failed_task_count?: number;
+  running_assignment_count?: number;
+  failed_assignment_count?: number;
+  active_worker_count?: number;
+  failed_worker_count?: number;
+  blocked_tool_count?: number;
+  failed_tool_count?: number;
+  governance_total_count?: number;
+  governance_allowed_count?: number;
+  governance_needs_approval_count?: number;
+  governance_blocked_count?: number;
+  governance_rejected_count?: number;
+  pending_recovery_count?: number;
+  resumed_recovery_count?: number;
+}
+
+/** 后端 EventCategoryCounts 的 TS 映射 */
+interface RustEventCategoryCounts {
+  domain?: number;
+  audit?: number;
+  usage?: number;
+  projection?: number;
+  system?: number;
+}
+
 interface RustRuntimeReadModelDto {
   meta?: {
     latest_sequence?: number;
@@ -149,25 +202,46 @@ interface RustRuntimeReadModelDto {
     sessions?: RustSessionRuntimeSummary[];
   };
   overview?: {
+    category_counts?: RustEventCategoryCounts;
     activity?: {
       active_execution_group_ids?: string[];
       active_task_ids?: string[];
     };
+    diagnostics?: RustRuntimeDiagnosticSummary;
   };
   operations?: {
     attention?: {
       failed_execution_group_ids?: string[];
       failed_task_ids?: string[];
+      failed_assignment_ids?: string[];
+      failed_worker_ids?: string[];
+      blocked_tool_names?: string[];
       pending_recovery_ids?: string[];
     };
     work_queues?: {
       running_execution_group_ids?: string[];
       running_task_ids?: string[];
+      running_assignment_ids?: string[];
+      active_worker_ids?: string[];
       pending_recovery_ids?: string[];
+    };
+    dispatch?: {
+      total_dispatches?: number;
+      resume_dispatches?: number;
+      latest_dispatch_reason?: string | null;
+      active_assignment_ids?: string[];
+    };
+    resume_observation?: {
+      total_recoveries?: number;
+      resume_command_count?: number;
+      resume_dispatch_count?: number;
+      mission_resumed_count?: number;
+      worker_resumed_count?: number;
     };
   };
   recovery?: {
     active_recovery_ids?: string[];
+    summaries?: RustRecoveryDiagnosticSummary[];
   };
 }
 
@@ -904,9 +978,177 @@ function deriveProcessingState(
   };
 }
 
+/**
+ * 从后端 recovery.summaries 构建前端 OrchestrationRuntimeRecoverySummary。
+ * 聚合所有恢复摘要条目，提取最新快照和任务统计。
+ */
+function deriveRecoverySummary(
+  runtimeReadModel: RustRuntimeReadModelDto,
+): OrchestrationRuntimeRecoverySummary | undefined {
+  const summaries = runtimeReadModel.recovery?.summaries;
+  const activeIds = normalizeStringArray(runtimeReadModel.recovery?.active_recovery_ids);
+  if (!Array.isArray(summaries) || summaries.length === 0) {
+    return undefined;
+  }
+  // 取最新的 recovery 摘要
+  const sorted = [...summaries].sort(
+    (a, b) => normalizeNumber(b.latest_occurred_at, 0) - normalizeNumber(a.latest_occurred_at, 0),
+  );
+  const latest = sorted[0];
+  const pendingCount = activeIds.length;
+  const completedCount = summaries.filter(
+    (s) => normalizeString(s.current_status) === 'consumed'
+      || normalizeString(s.current_status) === 'worker_resumed',
+  ).length;
+
+  return {
+    continuationPolicy: pendingCount > 0 ? 'resumable' : 'none',
+    continuationReason: latest.diagnostic_summary || undefined,
+    latestSnapshotId: normalizeString(latest.recovery_id) || undefined,
+    latestSnapshotCreatedAt: normalizeNumber(latest.latest_occurred_at, undefined as unknown as number) || undefined,
+    pendingTaskCount: pendingCount,
+    completedTaskCount: completedCount,
+    runningTaskCount: summaries.filter(
+      (s) => normalizeString(s.current_status) === 'ready',
+    ).length,
+  };
+}
+
+/**
+ * 从后端 recentEvents 构建前端 OrchestrationRuntimeTimelineEntry[]。
+ * 仅筛选与当前 session 相关的事件。
+ */
+function deriveRecentTimeline(
+  recentEvents: RustEventEnvelope[],
+  sessionId: string,
+): OrchestrationRuntimeTimelineEntry[] {
+  if (!Array.isArray(recentEvents) || recentEvents.length === 0) {
+    return [];
+  }
+  return recentEvents
+    .filter((event) => {
+      const eventSessionId = normalizeString(event.session_id);
+      // 保留匹配当前 session 的事件，或无 session 归属的系统事件
+      return !eventSessionId || eventSessionId === sessionId;
+    })
+    .map((event) => ({
+      eventId: normalizeString(event.event_id) || `evt-${normalizeNumber(event.sequence, 0)}`,
+      seq: normalizeNumber(event.sequence, 0),
+      timestamp: normalizeNumber(event.occurred_at, 0),
+      type: normalizeString(event.event_type) || 'unknown',
+      summary: buildEventSummary(event),
+      diffCount: 0,
+    }))
+    .sort((a, b) => a.seq - b.seq);
+}
+
+/** 从 EventEnvelope 构建可读摘要 */
+function buildEventSummary(event: RustEventEnvelope): string {
+  const eventType = normalizeString(event.event_type);
+  const parts: string[] = [];
+  if (eventType) {
+    parts.push(eventType);
+  }
+  const taskId = normalizeString(event.task_id);
+  if (taskId) {
+    parts.push(`task:${taskId}`);
+  }
+  const missionId = normalizeString(event.mission_id);
+  if (missionId && !taskId) {
+    parts.push(`mission:${missionId}`);
+  }
+  return parts.join(' ') || 'event';
+}
+
+/**
+ * 从后端 operations.attention 构建 failureRootCause（仅在有失败时）。
+ */
+function deriveFailureRootCause(
+  runtimeReadModel: RustRuntimeReadModelDto,
+  generatedAt: number,
+): OrchestrationRuntimeFailureRootCause | undefined {
+  const attention = runtimeReadModel.operations?.attention;
+  if (!attention) {
+    return undefined;
+  }
+  const failedTaskIds = normalizeStringArray(attention.failed_task_ids);
+  const failedWorkerIds = normalizeStringArray(attention.failed_worker_ids);
+  const failedAssignmentIds = normalizeStringArray(attention.failed_assignment_ids);
+  if (failedTaskIds.length === 0 && failedWorkerIds.length === 0 && failedAssignmentIds.length === 0) {
+    return undefined;
+  }
+  const parts: string[] = [];
+  if (failedTaskIds.length > 0) {
+    parts.push(`${failedTaskIds.length} 个任务失败 (${failedTaskIds.join(', ')})`);
+  }
+  if (failedWorkerIds.length > 0) {
+    parts.push(`${failedWorkerIds.length} 个 Worker 失败`);
+  }
+  if (failedAssignmentIds.length > 0) {
+    parts.push(`${failedAssignmentIds.length} 个分配失败`);
+  }
+  return {
+    summary: parts.join('; '),
+    taskId: failedTaskIds[0] || undefined,
+    assignmentId: failedAssignmentIds[0] || undefined,
+    occurredAt: generatedAt,
+  };
+}
+
+/**
+ * 构建 opsView：聚合 recovery、timeline、diagnostics 等后端已有数据。
+ */
+function deriveOpsView(
+  runtimeReadModel: RustRuntimeReadModelDto,
+  recentEvents: RustEventEnvelope[],
+  sessionId: string,
+  generatedAt: number,
+): OrchestrationRuntimeOpsView | null {
+  const recovery = deriveRecoverySummary(runtimeReadModel);
+  const recentTimeline = deriveRecentTimeline(recentEvents, sessionId);
+  const failureRootCause = deriveFailureRootCause(runtimeReadModel, generatedAt);
+  const diagnostics = runtimeReadModel.overview?.diagnostics;
+  const categoryCounts = runtimeReadModel.overview?.category_counts;
+
+  // 计算总事件数
+  const eventCount = (categoryCounts?.domain ?? 0)
+    + (categoryCounts?.audit ?? 0)
+    + (categoryCounts?.usage ?? 0)
+    + (categoryCounts?.projection ?? 0)
+    + (categoryCounts?.system ?? 0);
+
+  // 没有任何有意义数据时返回 null，避免空壳
+  const hasContent = recentTimeline.length > 0
+    || recovery !== undefined
+    || failureRootCause !== undefined
+    || eventCount > 0
+    || (diagnostics && (
+      (diagnostics.running_task_count ?? 0) > 0
+      || (diagnostics.failed_task_count ?? 0) > 0
+      || (diagnostics.active_worker_count ?? 0) > 0
+    ));
+  if (!hasContent) {
+    return null;
+  }
+
+  return {
+    scope: {
+      sessionId,
+    },
+    timelinePath: 'bootstrap',
+    eventCount,
+    diffCount: 0,
+    recentTimeline,
+    recentStateDiffs: [],
+    recovery,
+    failureRootCause,
+  };
+}
+
 function deriveRuntimeState(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
   assignments: OrchestrationRuntimeAssignmentSummary[],
+  recentEvents: RustEventEnvelope[],
   sessionId: string,
   generatedAt: number,
 ): OrchestratorRuntimeState | null {
@@ -934,6 +1176,8 @@ function deriveRuntimeState(
             : 'idle'
           : 'idle';
 
+  const opsView = deriveOpsView(runtimeReadModel, recentEvents, sessionId, generatedAt);
+
   return {
     sessionId: sessionId || undefined,
     status,
@@ -954,7 +1198,7 @@ function deriveRuntimeState(
           updatedAt: normalizeNumber(activeSession.last_update, generatedAt),
         }
       : undefined,
-    opsView: null,
+    opsView,
     runtimeSnapshot: null,
     runtimeDecisionTrace: [],
   };
@@ -1559,7 +1803,7 @@ function buildEventArtifacts(
       const suppressedTypes = [
         'session.action.accepted',
         'tool.invoked', 'tool.usage.recorded',
-        'task.llm.started', 'task.llm.completed',
+        'task.llm.started', 'task.llm.completed', 'task.llm.delta',
         'task.tool.invoked',
         'task.lease.granted', 'task.lease.completed',
         'task.ready', 'task.started',
@@ -1717,6 +1961,7 @@ export function normalizeRustBootstrapPayload(
     orchestratorRuntimeState: deriveRuntimeState(
       payload.runtimeReadModel,
       assignments,
+      normalizedEvents,
       currentSession?.id || '',
       generatedAt,
     ),

@@ -339,4 +339,14 @@
   .diff-line.context {
     color: var(--foreground-muted);
   }
+
+  :global(.theme-light) .diff-line.add,
+  :global(:root.theme-light) .diff-line.add {
+    background: #dafbe1;
+  }
+
+  :global(.theme-light) .diff-line.delete,
+  :global(:root.theme-light) .diff-line.delete {
+    background: #ffeef0;
+  }
 </style>

@@ -1096,22 +1096,39 @@ export async function clearAgentProjectKnowledge(): Promise<AgentKnowledgeMutati
   return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/clear', {}, 'clear project knowledge');
 }
 
-export async function getAgentAdrs(filter?: { status?: string }): Promise<Record<string, unknown>> {
-  const query = buildBoundQuery(filter?.status ? { status: filter.status } : {});
+export async function getAgentAdrs(): Promise<Record<string, unknown>> {
+  const query = buildBoundQuery({});
   const response = await getTransport().request(agentUrl(`/api/knowledge/adrs`, query));
   return await parseAgentJson<Record<string, unknown>>(response, 'load adrs');
 }
 
-export async function getAgentFaqs(filter?: { category?: string }): Promise<Record<string, unknown>> {
-  const query = buildBoundQuery(filter?.category ? { category: filter.category } : {});
+export async function getAgentFaqs(): Promise<Record<string, unknown>> {
+  const query = buildBoundQuery({});
   const response = await getTransport().request(agentUrl(`/api/knowledge/faqs`, query));
   return await parseAgentJson<Record<string, unknown>>(response, 'load faqs');
 }
 
+export async function searchAgentAdrs(keyword: string): Promise<Record<string, unknown>> {
+  const query = buildBoundQuery({ q: keyword });
+  const response = await getTransport().request(agentUrl(`/api/knowledge/adrs/search`, query));
+  return await parseAgentJson<Record<string, unknown>>(response, 'search adrs');
+}
+
 export async function searchAgentFaqs(keyword: string): Promise<Record<string, unknown>> {
-  const query = buildBoundQuery({ keyword });
+  const query = buildBoundQuery({ q: keyword });
   const response = await getTransport().request(agentUrl(`/api/knowledge/faqs/search`, query));
   return await parseAgentJson<Record<string, unknown>>(response, 'search faqs');
+}
+
+export async function getAgentLearnings(): Promise<Record<string, unknown>> {
+  const response = await getTransport().request(agentUrl(`/api/knowledge/learnings`, buildBoundQuery({})));
+  return await parseAgentJson<Record<string, unknown>>(response, 'load learnings');
+}
+
+export async function searchAgentLearnings(keyword: string): Promise<Record<string, unknown>> {
+  const query = buildBoundQuery({ q: keyword });
+  const response = await getTransport().request(agentUrl(`/api/knowledge/learnings/search`, query));
+  return await parseAgentJson<Record<string, unknown>>(response, 'search learnings');
 }
 
 export async function addAgentAdr(adr: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
@@ -1128,6 +1145,14 @@ export async function addAgentFaq(faq: Record<string, unknown>): Promise<AgentKn
 
 export async function updateAgentFaq(id: string, updates: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
   return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/faq/update', { id, updates }, 'update faq');
+}
+
+export async function addAgentLearning(learning: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
+  return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/learning/add', { learning }, 'add learning');
+}
+
+export async function updateAgentLearning(id: string, updates: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
+  return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/learning/update', { id, updates }, 'update learning');
 }
 
 export async function deleteAgentAdr(id: string): Promise<AgentKnowledgeMutationPayload> {

@@ -20,7 +20,7 @@ use magi_core::{LeaseId, TaskStatus};
 use magi_context_runtime::{ContextBudget, ContextRuntime};
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
-use magi_knowledge_store::KnowledgeStore;
+use magi_knowledge_store::{code_scanner::ingest_workspace_code_index, KnowledgeStore};
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
 use magi_orchestrator::task_runner::{EventBasedResultReceiver, TaskResult, TaskOutcome};
@@ -100,6 +100,38 @@ impl ShadowDaemonRuntime {
             &session_store,
             &workspace_store,
         )?;
+
+        // 引导阶段：若知识库尚无代码索引，扫描工作区代码
+        if knowledge_store.code_index_summary().is_none() {
+            let scan_root = workspace_store
+                .active_workspace_id()
+                .and_then(|ws_id| {
+                    workspace_store
+                        .workspaces()
+                        .into_iter()
+                        .find(|w| w.workspace_id == ws_id)
+                        .map(|w| std::path::PathBuf::from(w.root_path.as_str()))
+                })
+                .unwrap_or_else(|| config.bootstrap_workspace_root.clone());
+
+            ingest_workspace_code_index(&knowledge_store, &scan_root);
+
+            // 若扫描结果为空（引导工作区可能是空目录），回退到当前工作目录
+            if knowledge_store
+                .code_index_summary()
+                .map(|s| s.files.is_empty())
+                .unwrap_or(true)
+            {
+                if let Ok(cwd) = std::env::current_dir() {
+                    if cwd != scan_root {
+                        ingest_workspace_code_index(&knowledge_store, &cwd);
+                    }
+                }
+            }
+
+            // 持久化知识库状态
+            let _ = state_repository.save_knowledge_state(&knowledge_store.export_state());
+        }
 
         let runtime_maintenance = ShadowRuntimeMaintenance::new(
             ShadowRuntimeMaintenanceConfig::default(),
@@ -303,6 +335,12 @@ impl ShadowDaemonRuntime {
         .with_shadow_execution_pipeline(orchestrator, execution_runtime, memory_store);
 
         let state_for_task_workers = state.clone();
+        let state_for_knowledge_persist = state.clone();
+        let knowledge_persist_callback = Arc::new(move || {
+            if let Err(error) = state_for_knowledge_persist.persist_knowledge_state() {
+                tracing::warn!(?error, "自动知识沉淀持久化失败");
+            }
+        });
         let shadow_task_dispatcher = ShadowTaskDispatcher::new(
             self.event_bus.clone(),
             state
@@ -316,6 +354,8 @@ impl ShadowDaemonRuntime {
         let shadow_task_dispatcher = Arc::new(
             shadow_task_dispatcher
                 .with_model_bridge_client(dispatcher_model_client)
+                .with_knowledge_store(state.knowledge_store.clone())
+                .with_knowledge_persist_callback(knowledge_persist_callback)
                 .with_settings_store(state.settings_store.clone())
                 .with_context_runtime(context_runtime_for_dispatcher)
                 .with_tool_registry(tool_registry_for_dispatcher)
@@ -592,6 +632,49 @@ mod tests {
         .expect("audit usage ledger should deserialize");
         assert!(ledger.audit_entries.is_empty());
         assert!(ledger.usage_entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn knowledge_endpoint_returns_code_index_after_bootstrap_scan() {
+        let state_root = temp_state_root("knowledge-code-index");
+        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root.clone());
+        let workspace_root = config.bootstrap_workspace_root.clone();
+
+        // 在引导工作区中创建模拟源文件，供代码扫描器发现
+        fs::create_dir_all(workspace_root.join("src")).unwrap();
+        fs::write(workspace_root.join("src/main.rs"), "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+        fs::write(workspace_root.join("src/lib.rs"), "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n").unwrap();
+        fs::write(workspace_root.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
+
+        let runtime = ShadowDaemonRuntime::restore(&config)
+            .expect("runtime restore should bootstrap and scan code");
+
+        // 验证知识存储中有代码索引摘要
+        let summary = runtime
+            .knowledge_store
+            .code_index_summary()
+            .expect("code index summary should exist after bootstrap scan");
+        assert!(!summary.files.is_empty(), "code index should contain scanned files");
+        assert!(summary.tech_stack.iter().any(|t| t == "Rust"), "tech stack should detect Rust");
+        assert!(
+            summary.entry_points.iter().any(|e| e.ends_with("main.rs")),
+            "entry points should detect main.rs"
+        );
+
+        // 通过 API 路由验证返回结构
+        let app = runtime.router("shadow-test".to_string());
+        let knowledge = get_json(app, "/api/knowledge").await;
+        assert!(
+            knowledge.get("codeIndex").is_some_and(|v| !v.is_null()),
+            "API should return non-null codeIndex"
+        );
+        let code_index = knowledge["codeIndex"].as_object().expect("codeIndex should be an object");
+        let files = code_index["files"].as_array().expect("files should be an array");
+        assert!(!files.is_empty(), "codeIndex.files should not be empty");
+        assert!(
+            code_index["techStack"].as_array().is_some_and(|t| !t.is_empty()),
+            "codeIndex.techStack should not be empty"
+        );
     }
 
     async fn post_json(
