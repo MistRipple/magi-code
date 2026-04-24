@@ -14,6 +14,7 @@ import {
   addAgentAdr,
   addAgentCustomTool,
   addAgentFaq,
+  addAgentLearning,
   addAgentMcpServer,
   addAgentRepository,
   clearAgentNotifications,
@@ -67,6 +68,7 @@ import {
   startAgentTask,
   updateAgentAdr,
   updateAgentFaq,
+  updateAgentLearning,
   updateAgentMcpServer,
   updateAgentRepository,
   updateAgentRuntimeSetting,
@@ -112,6 +114,10 @@ import {
   clearTaskGraph,
 } from '../../stores/task-graph-store.svelte';
 import { RustDaemonClient } from '../rust-daemon-client';
+import {
+  applyStreamingDelta,
+  sealStreamingDelta,
+} from '../../stores/messages.svelte';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
 let bridgeListenerRegistered = false;
@@ -709,6 +715,34 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
   const eventType = trimBridgeString(event.event_type);
+
+  // ── 流式 delta 快速路径 ──
+  // 后端推送增量文本片段，前端追加到现有 timeline 节点，跳过 fetchBootstrap 轮询。
+  if (eventType === 'task.llm.delta' && event.payload) {
+    const deltaText = event.payload.delta;
+    const rawEntryId = event.payload.entry_id;
+    const deltaSessionId = trimBridgeString(event.payload.session_id);
+    if (typeof deltaText === 'string' && rawEntryId != null) {
+      const entryId = typeof rawEntryId === 'number' ? rawEntryId : String(rawEntryId);
+      applyStreamingDelta(entryId, deltaText, deltaSessionId || undefined);
+      // delta 事件仍然通知 task-graph 等轻量监听器
+      emitMessage({ type: 'rustTaskEvent', eventType, payload: event.payload ?? {} } as ClientBridgeMessage);
+      return; // 跳过 fetchBootstrap
+    }
+  }
+
+  // ── 流式完成事件：标记 streaming 结束 ──
+  if (eventType === 'task.llm.completed' && event.payload) {
+    const rawCompletedEntryId = event.payload.entry_id;
+    if (rawCompletedEntryId != null) {
+      const completedEntryId = typeof rawCompletedEntryId === 'number'
+        ? rawCompletedEntryId
+        : String(rawCompletedEntryId);
+      sealStreamingDelta(completedEntryId);
+    }
+    // 完成事件仍需触发 bootstrap 以同步最终状态，继续走下方逻辑
+  }
+
   if (eventType === 'session.action.accepted' && event.payload) {
     const acceptedSessionId = trimBridgeString(event.payload.session_id) || trimBridgeString(event.session_id);
     const acceptedActionTaskId = trimBridgeString(event.payload.action_task_id)
@@ -2163,6 +2197,18 @@ async function deleteFaq(id: string): Promise<void> {
   emitBridgeSuccessToast('删除 FAQ', 'FAQ 已删除');
 }
 
+async function addLearning(learning: Record<string, unknown>): Promise<void> {
+  await addAgentLearning(learning);
+  await emitKnowledgePayload();
+  emitBridgeSuccessToast('添加经验', '经验记录已添加');
+}
+
+async function updateLearning(id: string, updates: Record<string, unknown>): Promise<void> {
+  await updateAgentLearning(id, updates);
+  await emitKnowledgePayload();
+  emitBridgeSuccessToast('更新经验', '经验记录已更新');
+}
+
 async function deleteLearning(id: string): Promise<void> {
   await deleteAgentLearning(id);
   await emitKnowledgePayload();
@@ -2641,6 +2687,20 @@ export function createWebClientBridge(): ClientBridge {
               emitBridgeSuccessToast('更新 FAQ', 'FAQ 已更新');
             }).catch((error) => {
               logBridgeOperationFailure('更新 FAQ ', '[web-client-bridge] 更新 FAQ 失败:', error);
+            });
+          }
+          return;
+        case 'addLearning':
+          if (message.learning && typeof message.learning === 'object') {
+            void addLearning(message.learning as Record<string, unknown>).catch((error) => {
+              logBridgeOperationFailure('添加经验', '[web-client-bridge] 添加经验失败:', error);
+            });
+          }
+          return;
+        case 'updateLearning':
+          if (typeof message.id === 'string' && message.updates && typeof message.updates === 'object') {
+            void updateLearning(message.id, message.updates as Record<string, unknown>).catch((error) => {
+              logBridgeOperationFailure('更新经验', '[web-client-bridge] 更新经验失败:', error);
             });
           }
           return;

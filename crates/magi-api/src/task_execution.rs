@@ -17,11 +17,12 @@ use magi_core::{
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::ToolKind;
+use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
 use magi_orchestrator::{
     ExecutionContextSummary, ExecutionWritebackPlans,
     task_runner::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult, WorkerInfo},
 };
-use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain, SessionStore};
+use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain, SessionStore, TimelineEntryKind};
 use magi_tool_runtime::{BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry};
 use magi_workspace::RecoveryStatus;
 use std::collections::HashMap;
@@ -412,6 +413,8 @@ pub struct ShadowTaskDispatcher {
     execution_registry: ShadowTaskExecutionRegistry,
     result_receiver: Arc<EventBasedResultReceiver>,
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
+    knowledge_store: Option<Arc<KnowledgeStore>>,
+    knowledge_persist_callback: Option<Arc<dyn Fn() + Send + Sync>>,
     settings_store: Option<Arc<crate::settings_store::SettingsStore>>,
     context_runtime: Option<Arc<ContextRuntime>>,
     tool_registry: Option<ToolRegistry>,
@@ -435,6 +438,8 @@ impl ShadowTaskDispatcher {
             execution_registry,
             result_receiver,
             model_bridge_client: None,
+            knowledge_store: None,
+            knowledge_persist_callback: None,
             settings_store: None,
             context_runtime: None,
             tool_registry: None,
@@ -444,6 +449,16 @@ impl ShadowTaskDispatcher {
 
     pub fn with_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
         self.model_bridge_client = Some(client);
+        self
+    }
+
+    pub fn with_knowledge_store(mut self, store: Arc<KnowledgeStore>) -> Self {
+        self.knowledge_store = Some(store);
+        self
+    }
+
+    pub fn with_knowledge_persist_callback(mut self, callback: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.knowledge_persist_callback = Some(callback);
         self
     }
 
@@ -521,15 +536,79 @@ impl ShadowTaskDispatcher {
         use_tools: bool,
         skill_name: Option<String>,
     ) {
+        // 仅在有 writebacks 时（即主 action task）才生成 streaming entry_id。
+        // sub-task 的 writebacks 为空，不需要在 timeline 中创建流式条目。
+        let streaming_entry_id = if writebacks.is_empty() {
+            None
+        } else {
+            Some(format!("timeline-streaming-{}", task.task_id))
+        };
         let (outcome, context_summary) =
-            self.invoke_llm_with_tools(task, &session_id, &workspace_id, use_tools, skill_name);
+            self.invoke_llm_with_tools(task, &session_id, &workspace_id, use_tools, skill_name, streaming_entry_id.as_deref());
         if matches!(&outcome, TaskOutcome::Completed { .. }) {
             self.session_store
                 .bind_execution_ownership(session_id.clone(), ownership);
+            let should_extract_knowledge = !writebacks.is_empty();
             writebacks.apply(&self.pipeline.memory_store);
+            if should_extract_knowledge {
+                self.extract_and_persist_knowledge(&session_id, &outcome);
+            }
             self.publish_execution_overview(task, &session_id, &workspace_id, context_summary);
         }
         self.push_result(task_id, lease_id, outcome);
+    }
+
+    fn extract_and_persist_knowledge(&self, session_id: &SessionId, outcome: &TaskOutcome) {
+        let Some(store) = self.knowledge_store.as_ref() else {
+            return;
+        };
+        let TaskOutcome::Completed { output_refs } = outcome else {
+            return;
+        };
+
+        let timeline_text = self
+            .session_store
+            .timeline_for_session(session_id)
+            .into_iter()
+            .rev()
+            .filter(|entry| matches!(entry.kind, TimelineEntryKind::UserMessage | TimelineEntryKind::AssistantMessage))
+            .take(12)
+            .map(|entry| entry.message)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let output_text = output_refs.join("\n\n");
+        let extraction_text = format!("{timeline_text}\n\n{output_text}");
+        let learnings = extract_learning_candidates(&extraction_text);
+        if learnings.is_empty() {
+            return;
+        }
+
+        let existing = store.list();
+        let mut inserted = 0usize;
+        for (index, learning) in learnings.into_iter().enumerate() {
+            if knowledge_duplicate(&existing, KnowledgeKind::Learning, &learning.content) {
+                continue;
+            }
+            let now = UtcMillis::now();
+            store.upsert(KnowledgeRecord {
+                knowledge_id: format!("learning-auto-{}-{index}", now.0),
+                kind: KnowledgeKind::Learning,
+                title: title_from_learning_content(&learning.content),
+                content: learning.content,
+                tags: learning.tags,
+                source_ref: Some(learning.context.unwrap_or_else(|| format!("session:{}", session_id.as_str()))),
+                updated_at: now,
+            });
+            inserted += 1;
+        }
+        if inserted > 0 {
+            if let Some(callback) = self.knowledge_persist_callback.as_ref() {
+                callback();
+            }
+        }
     }
 
     fn publish_execution_overview(
@@ -770,6 +849,18 @@ impl ShadowTaskDispatcher {
             workspace_id: workspace_id.clone(),
         };
 
+        // skill_apply 特殊处理：优先通过 SkillRuntime 查找已注册的 skill
+        if tool_call.function.name == "skill_apply" {
+            if let Some(ref skill_rt) = self.skill_runtime {
+                if let Some(result) = self.execute_skill_apply_via_runtime(
+                    &tool_call.function.arguments,
+                    skill_rt,
+                ) {
+                    return result;
+                }
+            }
+        }
+
         let output = registry.execute_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new(&tool_call.id),
@@ -784,6 +875,38 @@ impl ShadowTaskDispatcher {
         );
 
         output.payload
+    }
+
+    /// 通过 SkillRuntime 执行 skill_apply：在已注册的 skill 中查找
+    fn execute_skill_apply_via_runtime(
+        &self,
+        arguments: &str,
+        skill_rt: &magi_skill_runtime::SkillRuntime,
+    ) -> Option<String> {
+        let parsed: serde_json::Value = serde_json::from_str(arguments).ok()?;
+        let skill_name = parsed
+            .get("skill_name")
+            .or_else(|| parsed.get("name"))
+            .and_then(|v| v.as_str())?;
+
+        let skill = skill_rt.registry().get(skill_name)?;
+
+        Some(
+            serde_json::json!({
+                "tool": "skill_apply",
+                "status": "succeeded",
+                "skill_name": skill.skill_id,
+                "title": skill.title,
+                "instruction": skill.instruction,
+                "allowed_tools": skill.allowed_tools,
+                "metadata": {
+                    "category": skill.metadata.category,
+                    "tags": skill.metadata.tags,
+                },
+                "summary": format!("已加载已注册 skill: {} ({})", skill.skill_id, skill.title)
+            })
+            .to_string(),
+        )
     }
 
     fn resolve_model_client(&self) -> Option<Arc<dyn ModelBridgeClient>> {
@@ -823,6 +946,7 @@ impl ShadowTaskDispatcher {
         workspace_id: &Option<WorkspaceId>,
         use_tools: bool,
         skill_name: Option<String>,
+        streaming_entry_id: Option<&str>,
     ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
         let Some(client) = self.resolve_model_client() else {
             tracing::error!(task_id = %task.task_id, "invoke_llm_with_tools: no model bridge client configured");
@@ -899,16 +1023,86 @@ impl ShadowTaskDispatcher {
                 tools: tools.clone(),
             };
 
-            let response = match client.invoke(request) {
-                Ok(resp) => resp,
-                Err(error) => {
-                    tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM invocation failed");
-                    return (
-                        TaskOutcome::Failed {
-                            error: format!("LLM invocation failed (round {round}): {error:?}"),
-                        },
-                        context_summary,
+            // 仅当有 streaming_entry_id 时才创建流式 timeline entry 并使用流式调用
+            let response = if let Some(entry_id) = streaming_entry_id {
+                // 仅在首轮创建空的 streaming timeline entry。
+                // 后续轮次不重置为空，避免前端看到内容闪烁（消失再重新出现）。
+                // on_delta 回调会在新内容到达时自然覆盖旧内容。
+                if round == 0 {
+                    self.session_store.upsert_timeline_entry(
+                        session_id.clone(),
+                        entry_id,
+                        magi_session_store::TimelineEntryKind::AssistantMessage,
+                        "",
                     );
+                }
+
+                let session_store_ref = &self.session_store;
+                let event_bus_ref = &self.event_bus;
+                let session_id_ref = session_id;
+                let task_context_ref = &task_context;
+                let task_id_str = task.task_id.to_string();
+                let mission_id_str = task.mission_id.to_string();
+                // 跟踪上次已发送的累积文本长度，用于计算增量
+                let last_sent_len = std::cell::Cell::new(0usize);
+
+                let on_delta = |accumulated_text: &str| {
+                    session_store_ref.upsert_timeline_entry(
+                        session_id_ref.clone(),
+                        entry_id,
+                        magi_session_store::TimelineEntryKind::AssistantMessage,
+                        accumulated_text,
+                    );
+
+                    // 计算增量：只发送自上次以来新增的文本片段
+                    let prev_len = last_sent_len.get();
+                    let delta = &accumulated_text[prev_len..];
+                    if delta.is_empty() {
+                        return;
+                    }
+                    last_sent_len.set(accumulated_text.len());
+
+                    let _ = event_bus_ref.publish(
+                        EventEnvelope::domain(
+                            EventId::new(format!("event-task-llm-delta-{}", UtcMillis::now().0)),
+                            "task.llm.delta",
+                            serde_json::json!({
+                                "task_id": task_id_str,
+                                "mission_id": mission_id_str,
+                                "session_id": session_id_ref.to_string(),
+                                "entry_id": entry_id,
+                                "delta": delta,
+                            }),
+                        )
+                        .with_context(task_context_ref.clone()),
+                    );
+                };
+
+                match client.invoke_streaming(request, &on_delta) {
+                    Ok(resp) => resp,
+                    Err(error) => {
+                        tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM streaming invocation failed");
+                        return (
+                            TaskOutcome::Failed {
+                                error: format!("LLM invocation failed (round {round}): {error:?}"),
+                            },
+                            context_summary,
+                        );
+                    }
+                }
+            } else {
+                // 非流式调用（无需 timeline 更新）
+                match client.invoke(request) {
+                    Ok(resp) => resp,
+                    Err(error) => {
+                        tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM invocation failed");
+                        return (
+                            TaskOutcome::Failed {
+                                error: format!("LLM invocation failed (round {round}): {error:?}"),
+                            },
+                            context_summary,
+                        );
+                    }
                 }
             };
 
@@ -931,6 +1125,7 @@ impl ShadowTaskDispatcher {
                             "mission_id": task.mission_id.to_string(),
                             "session_id": session_id.to_string(),
                             "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+                            "entry_id": streaming_entry_id,
                             "response_length": final_content.len(),
                             "rounds": round + 1,
                         }),
@@ -995,6 +1190,72 @@ impl ShadowTaskDispatcher {
     }
 }
 
+struct LearningCandidate {
+    content: String,
+    context: Option<String>,
+    tags: Vec<String>,
+}
+
+fn extract_learning_candidates(text: &str) -> Vec<LearningCandidate> {
+    let markers = [
+        "经验", "教训", "结论", "注意", "建议", "最佳实践", "踩坑", "坑点", "要点",
+        "important", "note", "lesson", "tip", "best practice",
+    ];
+    let mut candidates = Vec::new();
+    for raw in text.lines() {
+        let line = raw
+            .trim()
+            .trim_start_matches(['-', '*', '•', '1', '2', '3', '4', '5', '.', ' '])
+            .trim();
+        if line.chars().count() < 12 || line.chars().count() > 600 {
+            continue;
+        }
+        let lower = line.to_lowercase();
+        if !markers.iter().any(|marker| lower.contains(&marker.to_lowercase())) {
+            continue;
+        }
+        if candidates.iter().any(|candidate: &LearningCandidate| normalized_text(&candidate.content) == normalized_text(line)) {
+            continue;
+        }
+        candidates.push(LearningCandidate {
+            content: line.to_string(),
+            context: None,
+            tags: vec!["auto".to_string(), "learning".to_string()],
+        });
+        if candidates.len() >= 5 {
+            break;
+        }
+    }
+    candidates
+}
+
+fn normalized_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_whitespace() && !ch.is_ascii_punctuation())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn knowledge_duplicate(existing: &[KnowledgeRecord], kind: KnowledgeKind, content: &str) -> bool {
+    let normalized = normalized_text(content);
+    existing.iter().any(|record| {
+        record.kind == kind && {
+            let record_text = normalized_text(&record.content);
+            record_text == normalized
+                || record_text.contains(&normalized)
+                || normalized.contains(&record_text)
+        }
+    })
+}
+
+fn title_from_learning_content(content: &str) -> String {
+    let mut title = content.chars().take(80).collect::<String>();
+    if content.chars().count() > 80 {
+        title.push('…');
+    }
+    title
+}
+
 fn prepend_session_instructions(
     user_rules: Option<&str>,
     safeguard_rules: Option<&str>,
@@ -1035,7 +1296,7 @@ impl TaskDispatcher for ShadowTaskDispatcher {
                 Some(&session_id),
                 None,
             );
-            let (outcome, _) = self.invoke_llm_with_tools(task, &session_id, &None, false, None);
+            let (outcome, _) = self.invoke_llm_with_tools(task, &session_id, &None, false, None, None);
             self.push_result(&task.task_id, &lease.lease_id, outcome);
             return Ok(());
         };
@@ -1175,10 +1436,22 @@ pub fn drive_shadow_task_graph(
 fn builtin_tool_description(name: &str) -> String {
     match name {
         "file_read" => "Read the contents of a file at a given path".to_string(),
+        "file_write" => "Create or overwrite a file with the given content".to_string(),
+        "file_patch" => "Apply targeted text replacements to a file (find-and-replace)".to_string(),
+        "file_remove" => "Delete a file or directory".to_string(),
+        "file_mkdir" => "Create a directory (including parent directories)".to_string(),
+        "file_copy" => "Copy a file or directory to a new location".to_string(),
+        "file_move" => "Move or rename a file or directory".to_string(),
         "search_text" => "Search for text patterns in files within a directory".to_string(),
+        "search_semantic" => "Semantic code search: find code by natural language description".to_string(),
         "shell_exec" => "Execute a shell command and return stdout/stderr".to_string(),
         "process_inspect" => "Inspect running processes by PID or name".to_string(),
         "diff_preview" => "Generate a unified diff between two text inputs".to_string(),
+        "web_search" => "Search the web using DuckDuckGo and return results".to_string(),
+        "web_fetch" => "Fetch content from a URL and convert HTML to markdown".to_string(),
+        "mermaid_diagram" => "Generate a Mermaid diagram from code".to_string(),
+        "knowledge_query" => "Query project knowledge base: search README, docs, and code documentation".to_string(),
+        "skill_apply" => "Load and apply a named skill for specialized task execution".to_string(),
         _ => format!("Builtin tool: {name}"),
     }
 }
@@ -1191,6 +1464,70 @@ fn builtin_tool_parameters(name: &str) -> serde_json::Value {
                 "path": { "type": "string", "description": "Absolute path to the file to read" }
             },
             "required": ["path"]
+        }),
+        "file_write" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Absolute path to the file to write" },
+                "content": { "type": "string", "description": "Content to write to the file" },
+                "overwrite": { "type": "boolean", "description": "Whether to overwrite existing file (default: true)" },
+                "create_dirs": { "type": "boolean", "description": "Whether to create parent directories (default: true)" }
+            },
+            "required": ["path", "content"]
+        }),
+        "file_patch" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Absolute path to the file to patch" },
+                "old_string": { "type": "string", "description": "Text to find (must match exactly once)" },
+                "new_string": { "type": "string", "description": "Replacement text" },
+                "patches": {
+                    "type": "array",
+                    "description": "Array of patches to apply (alternative to old_string/new_string)",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": { "type": "string" },
+                            "new_string": { "type": "string" }
+                        },
+                        "required": ["old_string", "new_string"]
+                    }
+                }
+            },
+            "required": ["path"]
+        }),
+        "file_remove" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Absolute path to the file or directory to delete" },
+                "recursive": { "type": "boolean", "description": "Whether to recursively delete directories (default: false)" }
+            },
+            "required": ["path"]
+        }),
+        "file_mkdir" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Absolute path of the directory to create" }
+            },
+            "required": ["path"]
+        }),
+        "file_copy" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "source": { "type": "string", "description": "Absolute path of the source file or directory" },
+                "destination": { "type": "string", "description": "Absolute path of the destination" },
+                "overwrite": { "type": "boolean", "description": "Whether to overwrite if destination exists (default: false)" }
+            },
+            "required": ["source", "destination"]
+        }),
+        "file_move" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "source": { "type": "string", "description": "Absolute path of the source file or directory" },
+                "destination": { "type": "string", "description": "Absolute path of the destination" },
+                "overwrite": { "type": "boolean", "description": "Whether to overwrite if destination exists (default: false)" }
+            },
+            "required": ["source", "destination"]
         }),
         "search_text" => serde_json::json!({
             "type": "object",
@@ -1223,6 +1560,54 @@ fn builtin_tool_parameters(name: &str) -> serde_json::Value {
                 "after": { "type": "string", "description": "Modified text" }
             },
             "required": ["before", "after"]
+        }),
+        "web_search" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Search query keywords" }
+            },
+            "required": ["query"]
+        }),
+        "web_fetch" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "URL to fetch content from" }
+            },
+            "required": ["url"]
+        }),
+        "mermaid_diagram" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "code": { "type": "string", "description": "Mermaid diagram code" },
+                "title": { "type": "string", "description": "Optional diagram title" },
+                "theme": { "type": "string", "description": "Diagram theme (default: default)" }
+            },
+            "required": ["code"]
+        }),
+        "knowledge_query" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Natural language query to search project documentation" },
+                "category": { "type": "string", "description": "Knowledge category: all, readme, docs, code (default: all)" }
+            },
+            "required": ["query"]
+        }),
+        "search_semantic" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Natural language description of the code to find" },
+                "root": { "type": "string", "description": "Root directory to search in" },
+                "limit": { "type": "integer", "description": "Maximum number of results (default: 10)" }
+            },
+            "required": ["query"]
+        }),
+        "skill_apply" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "skill_name": { "type": "string", "description": "Name of the skill to apply" },
+                "context": { "type": "string", "description": "Additional context for the skill execution" }
+            },
+            "required": ["skill_name"]
         }),
         _ => serde_json::json!({
             "type": "object",
