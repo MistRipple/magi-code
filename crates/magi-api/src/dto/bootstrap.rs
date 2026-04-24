@@ -18,6 +18,8 @@ use magi_workspace::{
 };
 use serde::Serialize;
 
+const BOOTSTRAP_TIMELINE_PAGE_SIZE: usize = 50;
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BootstrapAgentDto {
@@ -42,6 +44,8 @@ pub struct BootstrapDto {
     pub bridge_preflight: BridgePreflightSnapshotDto,
     pub notifications: Vec<NotificationRecord>,
     pub recent_events: Vec<EventEnvelope>,
+    pub has_more_before: bool,
+    pub before_cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_changes: Vec<PendingChangeDto>,
 }
@@ -84,6 +88,7 @@ impl BootstrapDto {
                 Vec::new()
             });
         }
+        dto.truncate_initial_timeline_page();
         dto
     }
 
@@ -137,8 +142,25 @@ impl BootstrapDto {
             bridge_preflight,
             notifications: session_projection.notifications,
             recent_events: event_snapshot.recent_events,
+            has_more_before: false,
+            before_cursor: None,
             pending_changes: Vec::new(),
         }
+    }
+
+    fn truncate_initial_timeline_page(&mut self) {
+        if self.timeline.len() <= BOOTSTRAP_TIMELINE_PAGE_SIZE {
+            self.has_more_before = false;
+            self.before_cursor = self.timeline.first().map(|entry| entry.entry_id.clone());
+            return;
+        }
+        let start = self
+            .timeline
+            .len()
+            .saturating_sub(BOOTSTRAP_TIMELINE_PAGE_SIZE);
+        self.timeline = self.timeline.split_off(start);
+        self.has_more_before = true;
+        self.before_cursor = self.timeline.first().map(|entry| entry.entry_id.clone());
     }
 }
 
@@ -559,6 +581,45 @@ mod tests {
                 .notifications
                 .iter()
                 .all(|notification| notification.message != "notify-b")
+        );
+    }
+
+    #[test]
+    fn bootstrap_selected_session_returns_initial_timeline_page_only() {
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(32));
+        let session_store = Arc::new(SessionStore::default());
+        let workspace_store = Arc::new(WorkspaceStore::default());
+        let governance = Arc::new(GovernanceService::default());
+        let state = ApiState::new(
+            "magi",
+            event_bus,
+            session_store.clone(),
+            workspace_store,
+            governance,
+        );
+
+        let session_id = SessionId::new("session-paged-bootstrap");
+        session_store
+            .create_session(session_id.clone(), "Paged Session")
+            .expect("session should be creatable");
+        for index in 0..60 {
+            session_store.append_timeline_entry(
+                session_id.clone(),
+                magi_session_store::TimelineEntryKind::UserMessage,
+                format!("message-{index}"),
+            );
+        }
+
+        let bootstrap = BootstrapDto::from_state_with_selected_session(&state, Some(&session_id));
+
+        assert_eq!(bootstrap.timeline.len(), BOOTSTRAP_TIMELINE_PAGE_SIZE);
+        assert!(bootstrap.has_more_before);
+        assert_eq!(
+            bootstrap.before_cursor.as_deref(),
+            bootstrap
+                .timeline
+                .first()
+                .map(|entry| entry.entry_id.as_str())
         );
     }
 }

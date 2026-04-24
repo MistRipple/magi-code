@@ -137,20 +137,13 @@ async fn workspace_sessions(
     let workspace_id = query
         .workspace_id
         .as_deref()
-        .map(magi_core::WorkspaceId::new);
-    let session_sidecars = state.session_store.execution_sidecar_exports();
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let session_matches_workspace = |session: &magi_session_store::SessionRecord| {
-        let Some(ref workspace_id) = workspace_id else {
+        let Some(workspace_id) = workspace_id else {
             return true;
         };
-        if session.workspace_id.as_deref() == Some(workspace_id.as_str()) {
-            return true;
-        }
-        session_sidecars
-            .iter()
-            .find(|sidecar| sidecar.session_id == session.session_id)
-            .and_then(|sidecar| sidecar.ownership.workspace_id.as_ref())
-            == Some(workspace_id)
+        session.workspace_id.as_deref() == Some(workspace_id)
     };
 
     let mut scoped_sessions = sessions
@@ -192,10 +185,13 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use magi_core::{AbsolutePath, ExecutionOwnership, SessionId, WorkspaceId};
+    use magi_core::{AbsolutePath, ExecutionOwnership, SessionId, UtcMillis, WorkspaceId};
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
-    use magi_session_store::{SessionStore, TimelineEntryKind};
+    use magi_session_store::{
+        SessionDurableState, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
+        SessionRecord, SessionRuntimeSidecar, SessionStore, TimelineEntryKind,
+    };
     use magi_workspace::WorkspaceStore;
     use std::{sync::Arc, time::Duration};
     use tower::ServiceExt;
@@ -327,6 +323,91 @@ mod tests {
             .expect("sessions should be an array");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0]["sessionId"], "session-workspace-bound");
+    }
+
+    #[tokio::test]
+    async fn workspace_sessions_excludes_sidecar_only_workspace_binding() {
+        let workspace_a_id = WorkspaceId::new("workspace-strict-a");
+        let workspace_b_id = WorkspaceId::new("workspace-strict-b");
+        let session_id = SessionId::new("session-workspace-a");
+        let now = UtcMillis::now();
+        let durable_state = SessionDurableState {
+            current_session_id: Some(session_id.clone()),
+            sessions: vec![SessionRecord {
+                session_id: session_id.clone(),
+                title: "归属工作区 A 的会话".to_string(),
+                status: magi_core::SessionLifecycleStatus::Active,
+                created_at: now,
+                updated_at: now,
+                message_count: None,
+                workspace_id: Some(workspace_a_id.to_string()),
+            }],
+            timeline: Vec::new(),
+            notifications: Vec::new(),
+        };
+        let sidecar_state = SessionExecutionSidecarStoreState {
+            runtime_sidecars: vec![SessionRuntimeSidecar {
+                session_id: session_id.clone(),
+                ownership: ExecutionOwnership {
+                    workspace_id: Some(workspace_b_id.clone()),
+                    ..ExecutionOwnership::default()
+                },
+                recovery_id: None,
+                current_turn: None,
+                active_execution_chain: None,
+                status: SessionExecutionSidecarStatus::Bound,
+                updated_at: now,
+            }],
+        };
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::from_persisted_parts(
+                durable_state,
+                sidecar_state,
+            )),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        state
+            .workspace_registry
+            .register(
+                workspace_a_id.clone(),
+                AbsolutePath::new("/tmp/magi-workspace-strict-a"),
+            )
+            .expect("workspace a should register");
+        state
+            .workspace_registry
+            .register(
+                workspace_b_id.clone(),
+                AbsolutePath::new("/tmp/magi-workspace-strict-b"),
+            )
+            .expect("workspace b should register");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/workspaces/sessions?workspaceId=workspace-strict-b")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        assert_eq!(payload["sessionId"], "");
+        assert!(
+            payload["sessions"]
+                .as_array()
+                .expect("sessions should be an array")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

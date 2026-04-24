@@ -799,6 +799,7 @@ dependencies = [
  "magi-session-store",
  "magi-skill-runtime",
  "magi-tool-runtime",
+ "magi-usage-authority",
  "magi-worker-runtime",
  "magi-workspace",
  "reqwest",

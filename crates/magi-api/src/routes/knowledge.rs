@@ -6,8 +6,16 @@ use axum::{
 use magi_core::{UtcMillis, WorkspaceId};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeQuery, KnowledgeRecord};
 use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::{Path, PathBuf},
+};
 
 use crate::{errors::ApiError, state::ApiState};
+
+const KNOWLEDGE_CODE_INDEX_SCAN_FILE_LIMIT: usize = 2_000;
+const KNOWLEDGE_CODE_INDEX_MAX_FILE_BYTES: u64 = 1_000_000;
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -74,6 +82,222 @@ fn mutation_response(state: &ApiState, workspace_id: &WorkspaceId) -> KnowledgeM
             })
             .total_matches,
     }
+}
+
+fn workspace_root_path(state: &ApiState, workspace_id: &WorkspaceId) -> Option<PathBuf> {
+    state
+        .workspace_registry
+        .workspaces()
+        .into_iter()
+        .find(|workspace| &workspace.workspace_id == workspace_id)
+        .map(|workspace| PathBuf::from(workspace.root_path.to_string()))
+}
+
+fn is_ignored_knowledge_scan_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        ".git"
+            | ".magi"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".svelte-kit"
+            | "coverage"
+            | ".turbo"
+    )
+}
+
+fn infer_language_from_path(path: &str) -> Option<&'static str> {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "rs" => Some("Rust"),
+        "ts" | "tsx" => Some("TypeScript"),
+        "js" | "jsx" | "mjs" | "cjs" => Some("JavaScript"),
+        "svelte" => Some("Svelte"),
+        "vue" => Some("Vue"),
+        "py" => Some("Python"),
+        "go" => Some("Go"),
+        "java" => Some("Java"),
+        "kt" | "kts" => Some("Kotlin"),
+        "swift" => Some("Swift"),
+        "c" | "h" => Some("C"),
+        "cc" | "cpp" | "cxx" | "hpp" => Some("C++"),
+        "cs" => Some("C#"),
+        "php" => Some("PHP"),
+        "rb" => Some("Ruby"),
+        "md" | "mdx" => Some("Markdown"),
+        "json" => Some("JSON"),
+        "toml" => Some("TOML"),
+        "yaml" | "yml" => Some("YAML"),
+        "css" => Some("CSS"),
+        "scss" | "sass" => Some("Sass"),
+        "html" => Some("HTML"),
+        "sql" => Some("SQL"),
+        "sh" | "bash" | "zsh" => Some("Shell"),
+        _ => None,
+    }
+}
+
+fn is_entry_point_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let file_name = Path::new(&normalized)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    matches!(
+        file_name,
+        "Cargo.toml"
+            | "package.json"
+            | "pnpm-workspace.yaml"
+            | "vite.config.ts"
+            | "vite.config.js"
+            | "svelte.config.js"
+            | "README.md"
+            | "AGENTS.md"
+    ) || normalized.ends_with("/src/main.rs")
+        || normalized.ends_with("/src/lib.rs")
+        || normalized.ends_with("/src/main.ts")
+        || normalized.ends_with("/src/main.tsx")
+        || normalized.ends_with("/src/App.svelte")
+        || normalized.ends_with("/src/App.tsx")
+}
+
+fn relative_workspace_path(root: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(root)
+        .ok()
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .filter(|relative| !relative.is_empty())
+}
+
+fn count_file_lines(path: &Path, metadata: &fs::Metadata) -> usize {
+    if metadata.len() > KNOWLEDGE_CODE_INDEX_MAX_FILE_BYTES {
+        return 0;
+    }
+    let Ok(content) = fs::read_to_string(path) else {
+        return 0;
+    };
+    content.lines().count()
+}
+
+fn scan_workspace_code_files(root: &Path) -> Vec<(String, usize)> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if files.len() >= KNOWLEDGE_CODE_INDEX_SCAN_FILE_LIMIT {
+            break;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                if !is_ignored_knowledge_scan_dir(&path) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            let Some(relative_path) = relative_workspace_path(root, &path) else {
+                continue;
+            };
+            if infer_language_from_path(&relative_path).is_none() {
+                continue;
+            }
+            let lines = count_file_lines(&path, &metadata);
+            files.push((relative_path, lines));
+            if files.len() >= KNOWLEDGE_CODE_INDEX_SCAN_FILE_LIMIT {
+                break;
+            }
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
+fn build_code_index_snapshot(state: &ApiState, workspace_id: &WorkspaceId) -> serde_json::Value {
+    let code_query = KnowledgeQuery {
+        kind: Some(KnowledgeKind::CodeIndex),
+        text: None,
+        tags: vec![],
+        workspace_id: Some(workspace_id.clone()),
+        limit: usize::MAX,
+    };
+    let code_records = state.knowledge_store.query(&code_query);
+    let mut files: BTreeMap<String, usize> = BTreeMap::new();
+    let mut tech_stack: BTreeSet<String> = BTreeSet::new();
+    let mut entry_points: BTreeSet<String> = BTreeSet::new();
+
+    for item in &code_records.matches {
+        let Some(source) = state.knowledge_store.code_source(&item.record.knowledge_id) else {
+            continue;
+        };
+        let path = source.path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let line_count = match (source.start_line, source.end_line) {
+            (Some(start), Some(end)) if end >= start => end - start + 1,
+            _ => 0,
+        };
+        files
+            .entry(path.to_string())
+            .and_modify(|existing| *existing = (*existing).max(line_count))
+            .or_insert(line_count);
+        if let Some(language) = source
+            .language
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            tech_stack.insert(language.to_string());
+        } else if let Some(language) = infer_language_from_path(path) {
+            tech_stack.insert(language.to_string());
+        }
+        if is_entry_point_path(path) {
+            entry_points.insert(path.to_string());
+        }
+    }
+
+    if files.is_empty() {
+        if let Some(root) = workspace_root_path(state, workspace_id) {
+            for (path, lines) in scan_workspace_code_files(&root) {
+                if let Some(language) = infer_language_from_path(&path) {
+                    tech_stack.insert(language.to_string());
+                }
+                if is_entry_point_path(&path) {
+                    entry_points.insert(path.clone());
+                }
+                files.insert(path, lines);
+            }
+        }
+    }
+
+    serde_json::json!({
+        "files": files
+            .into_iter()
+            .map(|(path, lines)| serde_json::json!({
+                "path": path,
+                "lines": lines,
+            }))
+            .collect::<Vec<_>>(),
+        "techStack": tech_stack.into_iter().collect::<Vec<_>>(),
+        "entryPoints": entry_points.into_iter().collect::<Vec<_>>(),
+    })
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -178,7 +402,7 @@ async fn get_project_knowledge(
         kind: Some(KnowledgeKind::Learning),
         text: None,
         tags: vec![],
-        workspace_id: Some(workspace_id),
+        workspace_id: Some(workspace_id.clone()),
         limit: 1000,
     };
     let learnings_result = state.knowledge_store.query(&learnings_query);
@@ -200,7 +424,7 @@ async fn get_project_knowledge(
         "adrs": adrs,
         "faqs": faqs,
         "learnings": learnings,
-        "codeIndex": null,
+        "codeIndex": build_code_index_snapshot(&state, &workspace_id),
     })))
 }
 

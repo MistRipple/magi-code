@@ -22,6 +22,7 @@ magi-memory-store = { path = "../magi-memory-store" }
 magi-orchestrator = { path = "../magi-orchestrator" }
 magi-session-store = { path = "../magi-session-store" }
 magi-tool-runtime = { path = "../magi-tool-runtime" }
+magi-usage-authority = { path = "../magi-usage-authority" }
 magi-workspace = { path = "../magi-workspace" }
 magi-skill-runtime = { version = "0.1.0", path = "../magi-skill-runtime" }
 magi-worker-runtime = { path = "../magi-worker-runtime" }

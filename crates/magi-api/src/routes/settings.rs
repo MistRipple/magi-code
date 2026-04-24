@@ -431,7 +431,6 @@ pub fn routes() -> Router<ApiState> {
         .route("/settings/auxiliary/save", post(save_auxiliary_config))
         .route("/settings/auxiliary/test", post(test_auxiliary_connection))
         .route("/settings/user-rules/save", post(save_user_rules))
-        .route("/settings/user-rules/reset", post(reset_user_rules))
         .route("/settings/safeguard/save", post(save_safeguard_config))
         .route(
             "/settings/registry/role-templates",
@@ -1059,17 +1058,6 @@ async fn save_user_rules(
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
-async fn reset_user_rules(
-    State(state): State<ApiState>,
-    Json(request): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let session_id = require_session_id_from_request(&request)?;
-    state
-        .settings_store
-        .set_session_section(&session_id, "userRules", serde_json::json!({}));
-    Ok(Json(serde_json::json!({ "reset": true })))
-}
-
 async fn save_safeguard_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
@@ -1309,35 +1297,91 @@ async fn session_stats(
     State(state): State<ApiState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    let ledger = state.event_bus.runtime_ledger_summary();
     let workspace_id =
         parse_optional_query_string(&query, "workspaceId", "workspace_id").unwrap_or_default();
     let session_id = parse_optional_query_string(&query, "sessionId", "session_id");
-    Json(serde_json::json!({
-        "scope": "session",
-        "workspaceId": workspace_id,
-        "sessionId": session_id,
-        "version": ledger.next_sequence,
-        "lastAppliedLedgerSeq": ledger.next_sequence.saturating_sub(1),
-        "updatedAt": UtcMillis::now().0,
-        "totals": {
-            "llmCallCount": ledger.usage_count,
-            "assignmentCount": 0,
-            "turnCount": ledger.audit_count + ledger.usage_count,
-            "totalTokens": 0,
-            "netInputTokens": 0,
-            "netOutputTokens": 0,
-            "cacheReadTokens": 0,
-            "cacheWriteTokens": 0,
-            "successCount": 0,
-            "failureCount": 0,
-        },
-        "items": []
-    }))
+    let authority = state.usage_authority();
+    let mut authority = authority.lock().expect("usage authority lock poisoned");
+    if let Some(session_id) = session_id.as_deref() {
+        let snapshot = authority.get_session_snapshot(&workspace_id, session_id);
+        Json(serde_json::json!({
+            "scope": "session",
+            "workspaceId": snapshot.workspace_id,
+            "sessionId": snapshot.session_id,
+            "version": snapshot.version,
+            "lastAppliedLedgerSeq": snapshot.last_applied_ledger_seq,
+            "updatedAt": snapshot.updated_at,
+            "totals": snapshot.totals,
+            "items": snapshot.by_execution_binding.into_iter().map(usage_binding_item_json).collect::<Vec<_>>(),
+            "models": snapshot.by_model_identity,
+        }))
+    } else {
+        let snapshot = authority.get_workspace_snapshot(&workspace_id);
+        Json(serde_json::json!({
+            "scope": "workspace",
+            "workspaceId": snapshot.workspace_id,
+            "sessionId": serde_json::Value::Null,
+            "version": snapshot.version,
+            "lastAppliedLedgerSeq": snapshot.version,
+            "updatedAt": snapshot.updated_at,
+            "totals": snapshot.totals,
+            "items": snapshot.by_execution_binding.into_iter().map(usage_binding_item_json).collect::<Vec<_>>(),
+            "models": snapshot.by_model_identity,
+            "sessions": snapshot.by_session,
+        }))
+    }
 }
 
-async fn reset_stats(State(state): State<ApiState>) -> Result<Json<serde_json::Value>, ApiError> {
+fn usage_binding_item_json(
+    binding: magi_usage_authority::UsageBindingSnapshot,
+) -> serde_json::Value {
+    serde_json::json!({
+        "templateId": binding.template_id,
+        "engineId": binding.engine_id,
+        "bindingRevision": binding.binding_revision,
+        "role": binding.role,
+        "displayName": binding.template_id,
+        "provider": binding.provider,
+        "declaredModelSpec": binding.declared_model_spec,
+        "resolvedModel": binding.resolved_model,
+        "modelIdentityKey": binding.model_identity_key,
+        "llmCallCount": binding.totals.llm_call_count,
+        "assignmentCount": binding.totals.assignment_count,
+        "successCount": binding.totals.success_count,
+        "failureCount": binding.totals.failure_count,
+        "totalTokens": binding.totals.total_tokens,
+        "netInputTokens": binding.totals.net_input_tokens,
+        "netOutputTokens": binding.totals.net_output_tokens,
+        "cacheReadTokens": binding.totals.cache_read_tokens,
+        "cacheWriteTokens": binding.totals.cache_write_tokens,
+    })
+}
+
+async fn reset_stats(
+    State(state): State<ApiState>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     state.event_bus.reset_audit_usage_ledger();
+    let workspace_id = request
+        .get("workspaceId")
+        .or_else(|| request.get("workspace_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("default-workspace");
+    let session_id = request
+        .get("sessionId")
+        .or_else(|| request.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let authority = state.usage_authority();
+    let mut authority = authority.lock().expect("usage authority lock poisoned");
+    if let Some(session_id) = session_id {
+        authority.reset_session(workspace_id, session_id);
+    } else {
+        authority.reset_workspace(workspace_id);
+    }
     Ok(Json(serde_json::json!({ "reset": true })))
 }
 
@@ -1562,65 +1606,6 @@ mod tests {
                 .expect("rules should be array")
                 .iter()
                 .any(|rule| rule["pattern"] == serde_json::json!("custom-danger-a"))
-        );
-    }
-
-    #[tokio::test]
-    async fn reset_user_rules_only_resets_target_session() {
-        let state = test_state();
-        let session_a = SessionId::new("session-a");
-        let session_b = SessionId::new("session-b");
-
-        let _ = save_user_rules(
-            State(state.clone()),
-            Json(serde_json::json!({
-                "sessionId": session_a.as_str(),
-                "userRules": "A"
-            })),
-        )
-        .await
-        .expect("save user rules for session a should succeed");
-        let _ = save_user_rules(
-            State(state.clone()),
-            Json(serde_json::json!({
-                "sessionId": session_b.as_str(),
-                "userRules": "B"
-            })),
-        )
-        .await
-        .expect("save user rules for session b should succeed");
-
-        let reset = reset_user_rules(
-            State(state.clone()),
-            Json(serde_json::json!({ "sessionId": session_a.as_str() })),
-        )
-        .await
-        .expect("reset user rules should succeed");
-        assert_eq!(reset.0["reset"], serde_json::json!(true));
-
-        let bootstrap_a = settings_bootstrap(
-            State(state.clone()),
-            Query(HashMap::from([(
-                "sessionId".to_string(),
-                session_a.as_str().to_string(),
-            )])),
-        )
-        .await
-        .0;
-        let bootstrap_b = settings_bootstrap(
-            State(state),
-            Query(HashMap::from([(
-                "sessionId".to_string(),
-                session_b.as_str().to_string(),
-            )])),
-        )
-        .await
-        .0;
-
-        assert_eq!(bootstrap_a["userRulesConfig"], serde_json::json!({}));
-        assert_eq!(
-            bootstrap_b["userRulesConfig"]["userRules"],
-            serde_json::json!("B")
         );
     }
 }

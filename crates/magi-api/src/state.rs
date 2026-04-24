@@ -31,6 +31,7 @@ use magi_orchestrator::{
     task_worker_catalog::build_worker_catalog_for_roles,
 };
 use magi_session_store::SessionStore;
+use magi_usage_authority::UsageAuthority;
 use magi_workspace::WorkspaceStore;
 use std::collections::HashMap;
 use std::fs;
@@ -408,6 +409,7 @@ pub struct ApiState {
     task_store: Option<Arc<TaskStore>>,
     runner_manager: Option<RunnerManager>,
     session_turn_dispatcher: Option<Arc<ShadowTaskDispatcher>>,
+    usage_authority: Arc<Mutex<UsageAuthority>>,
     mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
     model_bridge_client_is_real: bool,
@@ -514,6 +516,7 @@ impl ApiState {
             task_store: None,
             runner_manager: None,
             session_turn_dispatcher: None,
+            usage_authority: Arc::new(Mutex::new(UsageAuthority::new())),
             mcp_connections: Arc::new(RwLock::new(HashMap::new())),
             model_bridge_client: None,
             model_bridge_client_is_real: false,
@@ -606,27 +609,33 @@ impl ApiState {
         workspace_id: Option<&str>,
         requested_session_id: Option<&SessionId>,
     ) -> BootstrapDto {
-        let effective_session_id = if requested_session_id.is_some() || workspace_id.is_none() {
-            requested_session_id.cloned()
-        } else {
-            let projection = self.session_store.projection_input();
-            projection
-                .current_session_id
-                .as_ref()
-                .filter(|session_id| {
-                    projection.sessions.iter().any(|session| {
-                        &session.session_id == *session_id
-                            && session.workspace_id.as_deref() == workspace_id
-                    })
-                })
+        let projection = self.session_store.projection_input();
+        let session_belongs_to_workspace = |session_id: &SessionId, workspace_id: &str| {
+            projection.sessions.iter().any(|session| {
+                &session.session_id == session_id
+                    && session.workspace_id.as_deref() == Some(workspace_id)
+            })
+        };
+        let effective_session_id = if let Some(workspace_id) = workspace_id {
+            requested_session_id
+                .filter(|session_id| session_belongs_to_workspace(session_id, workspace_id))
                 .cloned()
+                .or_else(|| {
+                    projection
+                        .current_session_id
+                        .as_ref()
+                        .filter(|session_id| session_belongs_to_workspace(session_id, workspace_id))
+                        .cloned()
+                })
                 .or_else(|| {
                     projection
                         .sessions
                         .iter()
-                        .find(|session| session.workspace_id.as_deref() == workspace_id)
+                        .find(|session| session.workspace_id.as_deref() == Some(workspace_id))
                         .map(|session| session.session_id.clone())
                 })
+        } else {
+            requested_session_id.cloned()
         };
         let mut dto =
             BootstrapDto::from_state_with_selected_session(self, effective_session_id.as_ref());
@@ -919,6 +928,10 @@ impl ApiState {
 
     pub fn session_turn_dispatcher(&self) -> Option<&Arc<ShadowTaskDispatcher>> {
         self.session_turn_dispatcher.as_ref()
+    }
+
+    pub fn usage_authority(&self) -> Arc<Mutex<UsageAuthority>> {
+        self.usage_authority.clone()
     }
 
     pub fn with_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
