@@ -90,6 +90,7 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
                 tool_call: None,
                 thinking: None,
                 usage: Some(parse_openai_usage_value(usage)),
+                stop_reason: None,
             }];
         }
         return Vec::new();
@@ -108,6 +109,7 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
                     tool_call: None,
                     thinking: None,
                     usage: None,
+                    stop_reason: None,
                 });
             }
         }
@@ -120,6 +122,7 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
                     tool_call: None,
                     thinking: Some(reasoning.to_string()),
                     usage: None,
+                    stop_reason: None,
                 });
             }
         }
@@ -130,6 +133,7 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
                 let id = tc["id"].as_str().map(str::to_string);
                 let name = func["name"].as_str().map(str::to_string);
                 let args = func["arguments"].as_str().map(str::to_string);
+                let index = tc["index"].as_u64().map(|i| i as usize);
 
                 let kind = if id.is_some() || name.is_some() {
                     LlmStreamChunkType::ToolCallStart
@@ -144,20 +148,23 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
                         id,
                         name,
                         arguments: args.map(|a| Value::String(a)),
+                        index,
                     }),
                     thinking: None,
                     usage: None,
+                    stop_reason: None,
                 });
             }
         }
 
-        if choice["finish_reason"].as_str().is_some() {
+        if let Some(reason) = choice["finish_reason"].as_str() {
             chunks.push(LlmStreamChunk {
                 kind: LlmStreamChunkType::ContentEnd,
                 content: None,
                 tool_call: None,
                 thinking: None,
                 usage: None,
+                stop_reason: Some(reason.to_string()),
             });
         }
     }
@@ -169,6 +176,7 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
             tool_call: None,
             thinking: None,
             usage: Some(parse_openai_usage_value(usage)),
+            stop_reason: None,
         });
     }
 
@@ -193,6 +201,7 @@ fn parse_anthropic_stream_event(
                     tool_call: None,
                     thinking: None,
                     usage: None,
+                    stop_reason: None,
                 }],
                 Some("tool_use") => vec![LlmStreamChunk {
                     kind: LlmStreamChunkType::ToolCallStart,
@@ -201,9 +210,11 @@ fn parse_anthropic_stream_event(
                         id: block["id"].as_str().map(str::to_string),
                         name: block["name"].as_str().map(str::to_string),
                         arguments: None,
+                        index: None,
                     }),
                     thinking: None,
                     usage: None,
+                    stop_reason: None,
                 }],
                 Some("thinking") => vec![LlmStreamChunk {
                     kind: LlmStreamChunkType::Thinking,
@@ -211,6 +222,7 @@ fn parse_anthropic_stream_event(
                     tool_call: None,
                     thinking: block["thinking"].as_str().map(str::to_string),
                     usage: None,
+                    stop_reason: None,
                 }],
                 _ => Vec::new(),
             }
@@ -224,6 +236,7 @@ fn parse_anthropic_stream_event(
                     tool_call: None,
                     thinking: None,
                     usage: None,
+                    stop_reason: None,
                 }],
                 Some("input_json_delta") => vec![LlmStreamChunk {
                     kind: LlmStreamChunkType::ToolCallDelta,
@@ -234,9 +247,11 @@ fn parse_anthropic_stream_event(
                         arguments: delta["partial_json"]
                             .as_str()
                             .map(|s| Value::String(s.to_string())),
+                        index: None,
                     }),
                     thinking: None,
                     usage: None,
+                    stop_reason: None,
                 }],
                 Some("thinking_delta") => vec![LlmStreamChunk {
                     kind: LlmStreamChunkType::Thinking,
@@ -244,6 +259,7 @@ fn parse_anthropic_stream_event(
                     tool_call: None,
                     thinking: delta["thinking"].as_str().map(str::to_string),
                     usage: None,
+                    stop_reason: None,
                 }],
                 _ => Vec::new(),
             }
@@ -254,6 +270,7 @@ fn parse_anthropic_stream_event(
             tool_call: None,
             thinking: None,
             usage: None,
+            stop_reason: None,
         }],
         Some("message_start") => {
             let mut chunks = Vec::new();
@@ -264,12 +281,27 @@ fn parse_anthropic_stream_event(
                     tool_call: None,
                     thinking: None,
                     usage: Some(parse_anthropic_usage_value(usage)),
+                    stop_reason: None,
                 });
             }
             chunks
         }
         Some("message_delta") => {
             let mut chunks = Vec::new();
+            // 捕获消息级别的 stop_reason
+            let stop_reason = envelope["delta"]["stop_reason"]
+                .as_str()
+                .map(str::to_string);
+            if stop_reason.is_some() {
+                chunks.push(LlmStreamChunk {
+                    kind: LlmStreamChunkType::ContentEnd,
+                    content: None,
+                    tool_call: None,
+                    thinking: None,
+                    usage: None,
+                    stop_reason,
+                });
+            }
             if let Some(usage) = envelope.get("usage") {
                 chunks.push(LlmStreamChunk {
                     kind: LlmStreamChunkType::Usage,
@@ -277,6 +309,7 @@ fn parse_anthropic_stream_event(
                     tool_call: None,
                     thinking: None,
                     usage: Some(parse_anthropic_usage_value(usage)),
+                    stop_reason: None,
                 });
             }
             chunks
@@ -332,7 +365,12 @@ impl StreamAccumulator {
                     self.content_parts.push(text.clone());
                 }
             }
-            LlmStreamChunkType::ContentEnd => {}
+            LlmStreamChunkType::ContentEnd => {
+                // 捕获 stop_reason（来自 OpenAI finish_reason 或 Anthropic message_delta）
+                if let Some(ref reason) = chunk.stop_reason {
+                    self.stop_reason = Some(reason.clone());
+                }
+            }
             LlmStreamChunkType::ToolCallStart => {
                 if let Some(ref tc) = chunk.tool_call {
                     self.active_tool_calls.push(ActiveToolCall {
@@ -349,8 +387,16 @@ impl StreamAccumulator {
                             Value::String(s) => s.clone(),
                             other => other.to_string(),
                         };
-                        if let Some(active) = self.active_tool_calls.last_mut() {
-                            active.arguments_buffer.push_str(&fragment);
+                        // 使用 index 路由到正确的 tool call（OpenAI 并行调用），
+                        // 无 index 时回退到最后一个（Anthropic 顺序调用）
+                        let target_idx = tc.index
+                            .filter(|idx| *idx < self.active_tool_calls.len())
+                            .or_else(|| {
+                                if self.active_tool_calls.is_empty() { None }
+                                else { Some(self.active_tool_calls.len() - 1) }
+                            });
+                        if let Some(idx) = target_idx {
+                            self.active_tool_calls[idx].arguments_buffer.push_str(&fragment);
                         }
                     }
                 }
@@ -615,6 +661,7 @@ mod tests {
             tool_call: None,
             thinking: None,
             usage: None,
+            stop_reason: None,
         });
         acc.apply(&LlmStreamChunk {
             kind: LlmStreamChunkType::ContentDelta,
@@ -622,6 +669,7 @@ mod tests {
             tool_call: None,
             thinking: None,
             usage: None,
+            stop_reason: None,
         });
 
         assert_eq!(acc.accumulated_content(), "Hello world");
@@ -641,9 +689,11 @@ mod tests {
                 id: Some("call_1".to_string()),
                 name: Some("search".to_string()),
                 arguments: None,
+                index: None,
             }),
             thinking: None,
             usage: None,
+            stop_reason: None,
         });
         acc.apply(&LlmStreamChunk {
             kind: LlmStreamChunkType::ToolCallDelta,
@@ -652,9 +702,11 @@ mod tests {
                 id: None,
                 name: None,
                 arguments: Some(Value::String(r#"{"q":"#.to_string())),
+                index: None,
             }),
             thinking: None,
             usage: None,
+            stop_reason: None,
         });
         acc.apply(&LlmStreamChunk {
             kind: LlmStreamChunkType::ToolCallDelta,
@@ -663,9 +715,11 @@ mod tests {
                 id: None,
                 name: None,
                 arguments: Some(Value::String(r#""test"}"#.to_string())),
+                index: None,
             }),
             thinking: None,
             usage: None,
+            stop_reason: None,
         });
 
         assert_eq!(acc.pending_tool_call_count(), 1);
@@ -691,6 +745,7 @@ mod tests {
                 cache_read_tokens: Some(50),
                 cache_write_tokens: None,
             }),
+            stop_reason: None,
         });
         acc.apply(&LlmStreamChunk {
             kind: LlmStreamChunkType::Usage,
@@ -703,6 +758,7 @@ mod tests {
                 cache_read_tokens: None,
                 cache_write_tokens: None,
             }),
+            stop_reason: None,
         });
 
         let result = acc.finalize();
@@ -806,6 +862,7 @@ mod tests {
             tool_call: None,
             thinking: Some("Let me think...".to_string()),
             usage: None,
+            stop_reason: None,
         });
         acc.apply(&LlmStreamChunk {
             kind: LlmStreamChunkType::Thinking,
@@ -813,6 +870,7 @@ mod tests {
             tool_call: None,
             thinking: Some(" about this.".to_string()),
             usage: None,
+            stop_reason: None,
         });
         assert_eq!(acc.accumulated_thinking(), "Let me think... about this.");
     }

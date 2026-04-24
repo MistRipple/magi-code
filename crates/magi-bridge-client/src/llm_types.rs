@@ -228,6 +228,10 @@ pub struct LlmStreamChunk {
     pub thinking: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<LlmUsage>,
+    /// LLM 返回的停止原因（如 "stop"、"length"、"tool_calls"、"end_turn" 等）。
+    /// 仅在 ContentEnd 类型的 chunk 中出现。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -238,6 +242,9 @@ pub struct PartialToolCall {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arguments: Option<Value>,
+    /// OpenAI tool_call 在并行调用时通过 index 区分不同的 tool call。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
 }
 
 use once_cell::sync::Lazy;

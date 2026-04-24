@@ -374,6 +374,16 @@ pub trait ModelBridgeClient: Send + Sync {
         &self,
         request: ModelInvocationRequest,
     ) -> Result<BridgeResponse, BridgeClientError>;
+
+    /// 流式调用 LLM，每次收到内容增量时调用 `on_delta` 回调并传入已累积的完整文本。
+    /// 默认实现回退到非流式 `invoke`。
+    fn invoke_streaming(
+        &self,
+        request: ModelInvocationRequest,
+        _on_delta: &dyn Fn(&str),
+    ) -> Result<BridgeResponse, BridgeClientError> {
+        self.invoke(request)
+    }
 }
 
 pub trait McpBridgeClient: Send + Sync {
