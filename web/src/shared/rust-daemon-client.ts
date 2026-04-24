@@ -52,7 +52,6 @@ import type {
   RepositoriesResponseDto,
   RepositoryIdRequestDto,
   RepositoryRefreshResponseDto,
-  ResetResponseDto,
   ResetStatsResponseDto,
   RevertAllChangesResponseDto,
   RevertChangeRequestDto,
@@ -293,10 +292,6 @@ export class RustDaemonClient {
 
   public async saveUserRules(rules: unknown): Promise<SavedResponseDto> {
     return this.postJson<SavedResponseDto>('/api/settings/user-rules/save', rules);
-  }
-
-  public async resetUserRules(): Promise<ResetResponseDto> {
-    return this.postJson<ResetResponseDto>('/api/settings/user-rules/reset', {});
   }
 
   public async saveSafeguardConfig(config: unknown): Promise<SavedResponseDto> {

@@ -568,17 +568,21 @@ function resolveAgentBindingContext(): AgentBindingContext {
     __INITIAL_WORKSPACE_PATH__?: string;
   };
   const storedBinding = readStoredBrowserWorkspaceBinding();
+  const urlWorkspaceId = currentUrl.searchParams.get('workspaceId')?.trim() || '';
+  const urlWorkspacePath = currentUrl.searchParams.get('workspacePath')?.trim() || '';
+  const urlSessionId = currentUrl.searchParams.get('sessionId')?.trim() || '';
+  const hasExplicitUrlWorkspace = Boolean(urlWorkspaceId || urlWorkspacePath);
   return {
-    workspaceId: currentUrl.searchParams.get('workspaceId')?.trim()
+    workspaceId: urlWorkspaceId
       || bootstrapWindow.__INITIAL_WORKSPACE_ID__?.trim()
       || storedBinding.workspaceId
       || '',
-    workspacePath: currentUrl.searchParams.get('workspacePath')?.trim()
+    workspacePath: urlWorkspacePath
       || bootstrapWindow.__INITIAL_WORKSPACE_PATH__?.trim()
       || storedBinding.workspacePath
       || '',
-    sessionId: currentUrl.searchParams.get('sessionId')?.trim()
-      || storedBinding.sessionId
+    sessionId: urlSessionId
+      || (hasExplicitUrlWorkspace ? '' : storedBinding.sessionId)
       || '',
   };
 }
@@ -838,6 +842,10 @@ export async function loadAgentSessionTimelinePage(
       sessionId: sessionId.trim(),
       limit: String(options.limit ?? 50),
     });
+    const binding = readStoredBrowserWorkspaceBinding();
+    if (binding.workspaceId?.trim()) {
+      query.set('workspaceId', binding.workspaceId.trim());
+    }
     if (options.beforeCursor?.trim()) {
       query.set('beforeCursor', options.beforeCursor.trim());
     }
@@ -1016,10 +1024,6 @@ export async function saveAgentWorkerConfig(worker: string, config: Record<strin
 
 export async function saveAgentUserRules(data: Record<string, unknown>): Promise<Record<string, unknown>> {
   return await postBoundJson<Record<string, unknown>>('/api/settings/user-rules/save', data, 'save user rules');
-}
-
-export async function resetAgentUserRules(): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/user-rules/reset', {}, 'reset user rules');
 }
 
 export async function saveAgentOrchestratorConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {

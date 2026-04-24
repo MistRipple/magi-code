@@ -21,9 +21,12 @@ import { resolveTimelineWorkerId } from '../shared/timeline-worker-lifecycle';
 export function safeParseJson(value?: string): Record<string, unknown> | null {
   if (!value || typeof value !== 'string') return null;
   try {
-    return JSON.parse(value) as Record<string, unknown>;
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : { raw: parsed };
   } catch {
-    return null;
+    return { raw: value };
   }
 }
 
@@ -183,7 +186,7 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
         const toolCall: ToolCall = {
           id: block.toolCallId,
           name: block.standardized?.toolName || 'tool_result',
-          arguments: {},
+          arguments: safeParseJson(block.input) || {},
           status: toolStatus,
           result: toolStatus === 'error' ? undefined : (resolvedContent || undefined),
           error: toolStatus === 'error' ? (resolvedContent || undefined) : undefined,

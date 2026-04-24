@@ -45,6 +45,21 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
+function parseToolInput(value: unknown): Record<string, unknown> {
+  if (isPlainRecord(value)) {
+    return value;
+  }
+  if (typeof value !== 'string' || !value.trim()) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return isPlainRecord(parsed) ? parsed : { raw: parsed };
+  } catch {
+    return { raw: value };
+  }
+}
+
 function sanitizeSerializableValue(
   value: unknown,
   options: { preserveUndefined?: boolean } = {},
@@ -269,15 +284,10 @@ function adaptFlatToolCallBlock(block: Record<string, unknown>): import('../type
     ? (typeof standardized.message === 'string' ? standardized.message : undefined)
     : undefined;
 
-  let parsedArgs: Record<string, unknown> = {};
-  if (typeof block.input === 'string' && block.input.trim()) {
-    try { parsedArgs = JSON.parse(block.input); } catch { /* ignore */ }
-  }
-
   return {
     id: typeof block.toolId === 'string' ? block.toolId : '',
     name: typeof block.toolName === 'string' ? block.toolName : 'Tool',
-    arguments: parsedArgs,
+    arguments: parseToolInput(block.input),
     status: resolvedStatus,
     result: output || undefined,
     error: error || standardizedError || undefined,
@@ -303,7 +313,7 @@ function adaptFlatToolResultBlock(block: Record<string, unknown>): import('../ty
     name: typeof standardized?.toolName === 'string' && standardized.toolName.trim().length > 0
       ? standardized.toolName
       : 'tool_result',
-    arguments: {},
+    arguments: parseToolInput(block.input),
     status: isError ? 'error' : 'success',
     result: isError ? undefined : (resolvedContent || undefined),
     error: isError ? (resolvedContent || undefined) : undefined,

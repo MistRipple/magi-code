@@ -8,18 +8,15 @@
   import SettingsPanel from './components/SettingsPanel.svelte';
   import ToastContainer from './components/ToastContainer.svelte';
   import Icon from './components/Icon.svelte';
-  import { getState, setCurrentTopTab, messagesState } from './stores/messages.svelte';
+  import { setCurrentTopTab, messagesState } from './stores/messages.svelte';
   import { i18n } from './stores/i18n.svelte';
 
   type TopTabType = 'thread' | 'tasks' | 'edits' | 'knowledge';
 
-  // 当前激活的顶部 Tab
-  const appState = getState();
-
   // 安全获取顶部 Tab（映射非顶部 Tab 到默认值）
   const currentTopTab = $derived<TopTabType>(
-    ['thread', 'tasks', 'edits', 'knowledge'].includes(appState.currentTopTab as string)
-      ? (appState.currentTopTab as TopTabType)
+    ['thread', 'tasks', 'edits', 'knowledge'].includes(messagesState.currentTopTab as string)
+      ? (messagesState.currentTopTab as TopTabType)
       : 'thread'
   );
 

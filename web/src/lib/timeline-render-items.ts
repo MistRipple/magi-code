@@ -25,7 +25,8 @@ function shouldRenderNodeHostMessage(
 ): boolean {
   void displayContext;
   if (Array.isArray(node.executionItems) && node.executionItems.length > 0) {
-    return false;
+    return Array.isArray(node.message?.blocks)
+      && node.message.blocks.some((block) => block.type === 'dispatch_group');
   }
   return true;
 }

@@ -69,7 +69,9 @@
   function collectCurrentTurnWorkerRoles(): CurrentTurnWorkerRoleTab[] {
     const roleById = new Map<string, CurrentTurnWorkerRoleTab>();
     const upsertRole = (role: Partial<CurrentTurnWorkerRoleTab> & { roleId?: string; order?: number }) => {
-      const roleId = typeof role.roleId === 'string' ? role.roleId.trim() : '';
+      const rawRoleId = typeof role.roleId === 'string' ? role.roleId.trim() : '';
+      const roleSource = resolveWorkerRoleSource(rawRoleId, enabledAgents, registrySnapshot);
+      const roleId = roleSource?.templateId || rawRoleId;
       if (!roleId) {
         return;
       }

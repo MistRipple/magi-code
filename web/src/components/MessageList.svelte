@@ -465,6 +465,17 @@
     }
   }
 
+  function handleWheel(event: WheelEvent) {
+    if (
+      event.deltaY < 0
+      && displayContext === 'thread'
+      && containerRef
+      && containerRef.scrollTop <= HISTORY_LOAD_THRESHOLD_PX
+    ) {
+      void loadOlderHistory();
+    }
+  }
+
   // 滚动到底部
   function scrollToBottom() {
     updatePanelScrollState(panelKey, { autoScrollEnabled: true }, { persist: false });
@@ -486,6 +497,7 @@
     class="message-list"
     bind:this={containerRef}
     onscroll={handleScroll}
+    onwheel={handleWheel}
     data-panel-id={displayContext === 'thread' ? 'thread' : (workerName || 'worker')}
     data-display-context={displayContext}
     data-panel-active={isActive ? 'true' : 'false'}

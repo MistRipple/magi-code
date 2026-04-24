@@ -150,7 +150,7 @@ import { getAgentColor } from '../lib/agent-colors';
         />
       {:else if store.activeTab === 'rules'}
         <!-- 规则 Tab -->
-        <SettingsRulesTab bind:userRules={store.userRules} bind:newCustomRule={store.newCustomRule} SAFEGUARD_CATEGORIES={store.SAFEGUARD_CATEGORIES} getRulesForCategory={store.getRulesForCategory} toggleSafeguardRule={store.toggleSafeguardRule} removeCustomRule={store.removeCustomRule} addCustomRule={store.addCustomRule} userRulesResetStatus={store.userRulesResetStatus} resetUserRules={store.resetUserRules} userRulesSaveStatus={store.userRulesSaveStatus} saveUserRules={store.saveUserRules}
+        <SettingsRulesTab bind:userRules={store.userRules} bind:newCustomRule={store.newCustomRule} SAFEGUARD_CATEGORIES={store.SAFEGUARD_CATEGORIES} getRulesForCategory={store.getRulesForCategory} toggleSafeguardRule={store.toggleSafeguardRule} removeCustomRule={store.removeCustomRule} addCustomRule={store.addCustomRule} userRulesSaveStatus={store.userRulesSaveStatus}
         />
       {:else if store.activeTab === 'tools'}
         <!-- 工具 Tab -->

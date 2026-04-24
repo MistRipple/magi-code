@@ -9,6 +9,7 @@ import {
   patchThreadPlaceholderMessage,
   setIsProcessing,
   setCurrentSessionId,
+  getQueuedMessages,
   updateSessions,
   setQueuedMessages,
   setAppState,
@@ -16,6 +17,7 @@ import {
   clearAllMessages,
   setTimelineProjection,
   restoreTimelineProjectionIfNewer,
+  prependTimelineProjectionPage,
   addToast,
   clearPendingRequest,
   setProcessingActor,
@@ -32,10 +34,13 @@ import {
   updateRequestBinding,
   applyTimelineStreamPatch,
   settleProcessingAfterResponseCompletion,
+  settleAuthoritativeIdleState,
   applySessionNotifications,
   batchWebviewStatePersistence,
   setEnabledAgents,
   setSessionHistoryState,
+  messagesState,
+  timelineProjectionConfirmsLocalAssistantResponse,
 } from '../stores/messages.svelte';
 import type {
   AppState, Message, Session,
@@ -75,6 +80,13 @@ function shouldApplyStateSlice(params: {
     return false;
   }
   return true;
+}
+
+function applyQueuedMessagesFromAuthoritativeSnapshot(queuedMessages: QueuedMessage[]) {
+  const incoming = ensureArray<QueuedMessage>(queuedMessages);
+  if (incoming.length > 0 || getQueuedMessages().length === 0) {
+    setQueuedMessages(incoming);
+  }
 }
 
 function normalizeIncomingEdits(state: AppState): Edit[] {
@@ -447,6 +459,32 @@ export function handleUnifiedData(standard: StandardMessage) {
       }));
       break;
 
+    case 'workspaceSessionCleared':
+      batchWebviewStatePersistence(() => {
+        const hasPendingLocalTurn = messagesState.pendingRequests.size > 0;
+        if (!hasPendingLocalTurn) {
+          clearAllMessages({
+            persist: false,
+            resetTimelineView: true,
+            resetPanelState: true,
+            skipAntiLiftBack: true,
+          });
+          clearAllRequestBindings();
+          clearPendingInteractions();
+          clearProcessingState({ skipAntiLiftBack: true });
+        }
+        setCurrentSessionId(null);
+        if (!hasPendingLocalTurn) {
+          setQueuedMessages([]);
+        }
+        setOrchestratorRuntimeState(null);
+        setAppState({
+          ...buildEmptyWorkspaceAppState(Date.now()),
+          currentSessionId: '',
+        });
+      });
+      break;
+
     case 'sessionBootstrapLoaded':
       handleSessionBootstrapLoaded(asMessage({
         sessionId: payload.sessionId,
@@ -456,6 +494,8 @@ export function handleUnifiedData(standard: StandardMessage) {
         notifications: payload.notifications,
         queuedMessages: payload.queuedMessages,
         orchestratorRuntimeState: payload.orchestratorRuntimeState,
+        hasMoreBefore: payload.hasMoreBefore,
+        beforeCursor: payload.beforeCursor,
       }));
       break;
 
@@ -589,17 +629,20 @@ function handleSessionsUpdated(message: ClientBridgeMessage) {
 
 function handleEmptyWorkspaceStateLoaded(message: ClientBridgeMessage) {
   const state = (message.state as AppState | undefined) ?? buildEmptyWorkspaceAppState(Date.now());
+  const hasPendingLocalTurn = messagesState.pendingRequests.size > 0;
 
   batchWebviewStatePersistence(() => {
-    clearAllMessages({
-      persist: false,
-      resetTimelineView: true,
-      resetPanelState: true,
-      skipAntiLiftBack: true,
-    });
-    clearAllRequestBindings();
-    clearPendingInteractions();
-    clearProcessingState({ skipAntiLiftBack: true });
+    if (!hasPendingLocalTurn) {
+      clearAllMessages({
+        persist: false,
+        resetTimelineView: true,
+        resetPanelState: true,
+        skipAntiLiftBack: true,
+      });
+      clearAllRequestBindings();
+      clearPendingInteractions();
+      clearProcessingState({ skipAntiLiftBack: true });
+    }
     updateSessions([]);
     setCurrentSessionId(null);
     setAppState({
@@ -613,7 +656,9 @@ function handleEmptyWorkspaceStateLoaded(message: ClientBridgeMessage) {
       processingState: null,
     });
     setOrchestratorRuntimeState(null);
-    setQueuedMessages([]);
+    if (!hasPendingLocalTurn) {
+      setQueuedMessages([]);
+    }
   });
 }
 
@@ -842,16 +887,29 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       if (snapshot.notifications) {
         applySessionNotifications(sessionId, snapshot.notifications.notifications);
       }
-      setQueuedMessages(ensureArray<QueuedMessage>(snapshot.queuedMessages));
+      applyQueuedMessagesFromAuthoritativeSnapshot(ensureArray<QueuedMessage>(snapshot.queuedMessages));
       setSessionHistoryState(sessionId, {
         hasMoreBefore,
         beforeCursor,
         isLoadingBefore: false,
       });
-      restoreTimelineProjectionIfNewer(timelineProjection, {
-        source: 'authoritative',
-      });
-      reconcileRequestBindingsFromAuthoritativeThread(sessionId);
+      const hasLiveTurn = messagesState.pendingRequests.size > 0 || messagesState.activeMessageIds.size > 0;
+      const authoritativeSnapshotIsIdle = state.isProcessing !== true
+        && state.processingState?.isProcessing !== true;
+      const canAuthoritativeProjectionSettleLiveTurn = (
+        hasLiveTurn
+        && (
+          authoritativeSnapshotIsIdle
+          || timelineProjectionConfirmsLocalAssistantResponse(timelineProjection)
+        )
+      );
+      if (!hasLiveTurn || canAuthoritativeProjectionSettleLiveTurn) {
+        prependTimelineProjectionPage(sessionId, timelineProjection);
+        reconcileRequestBindingsFromAuthoritativeThread(sessionId);
+        if (authoritativeSnapshotIsIdle) {
+          settleAuthoritativeIdleState();
+        }
+      }
     });
     return;
   }
@@ -892,7 +950,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     if (snapshot.notifications) {
       applySessionNotifications(sessionId, snapshot.notifications.notifications);
     }
-    setQueuedMessages(ensureArray<QueuedMessage>(snapshot.queuedMessages));
+    applyQueuedMessagesFromAuthoritativeSnapshot(ensureArray<QueuedMessage>(snapshot.queuedMessages));
     setSessionHistoryState(sessionId, {
       hasMoreBefore,
       beforeCursor,

@@ -692,6 +692,8 @@ export interface BootstrapDto {
   bridgePreflight: BridgePreflightSnapshotDto;
   notifications: NotificationDto[];
   recentEvents: EventEnvelope[];
+  hasMoreBefore: boolean;
+  beforeCursor?: string | null;
 }
 
 // ─── Session management endpoints ───────────────────────────────────
@@ -856,10 +858,6 @@ export interface ResetStatsResponseDto {
 
 export interface SavedResponseDto {
   saved: boolean;
-}
-
-export interface ResetResponseDto {
-  reset: boolean;
 }
 
 // ─── Knowledge endpoints ────────────────────────────────────────────

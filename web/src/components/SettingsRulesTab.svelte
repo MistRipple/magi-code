@@ -10,10 +10,7 @@
     removeCustomRule,
     newCustomRule = $bindable(),
     addCustomRule,
-    userRulesResetStatus,
-    resetUserRules,
     userRulesSaveStatus,
-    saveUserRules
   } = $props<{
     userRules: string;
     SAFEGUARD_CATEGORIES: any[];
@@ -22,11 +19,21 @@
     removeCustomRule: (index: number) => void;
     newCustomRule: string;
     addCustomRule: () => void;
-    userRulesResetStatus: string;
-    resetUserRules: () => void;
     userRulesSaveStatus: string;
-    saveUserRules: () => void;
   }>();
+
+  const userRulesStatusText = $derived.by(() => {
+    switch (userRulesSaveStatus) {
+      case 'saving':
+        return i18n.t('settings.profile.autoSaving');
+      case 'saved':
+        return i18n.t('settings.profile.autoSaved');
+      case 'error':
+        return i18n.t('settings.profile.autoSaveFailed');
+      default:
+        return '';
+    }
+  });
 </script>
 
 <div class="apple-manager">
@@ -35,6 +42,18 @@
 <div class="settings-section">
   <div class="settings-section-header">
     <div class="settings-section-title">{i18n.t('settings.profile.userRules')}</div>
+    {#if userRulesStatusText}
+      <div class="rules-save-status" class:error={userRulesSaveStatus === 'error'}>
+        {#if userRulesSaveStatus === 'saving'}
+          <Icon name="refresh" size={13} />
+        {:else if userRulesSaveStatus === 'saved'}
+          <Icon name="check" size={13} />
+        {:else}
+          <Icon name="close" size={13} />
+        {/if}
+        <span>{userRulesStatusText}</span>
+      </div>
+    {/if}
   </div>
   <div class="settings-section-desc">{i18n.t('settings.profile.userRulesDesc')}</div>
   <div class="profile-editor">
@@ -100,51 +119,6 @@
   </div>
 </div>
 
-<!-- 保存/重置 -->
-<div class="settings-section profile-save-section" style="border-bottom: none; background: transparent; box-shadow: none; padding-top: 0;">
-  <div class="apple-dashboard-bar" style="display: flex; justify-content: flex-end; align-items: center;">
-    <div class="settings-section-actions">
-      <button
-        class="apple-action-btn danger"
-        class:saving={userRulesResetStatus === 'saving'}
-        onclick={resetUserRules}
-        disabled={userRulesResetStatus === 'saving' || userRulesSaveStatus === 'saving'}
-      >
-        {#if userRulesResetStatus === 'saving'}
-          <Icon name="refresh" size={14} />
-          {i18n.t('settings.profile.processing')}
-        {:else if userRulesResetStatus === 'saved'}
-          <Icon name="check" size={14} />
-          {i18n.t('settings.profile.resetDone')}
-        {:else if userRulesResetStatus === 'error'}
-          <Icon name="close" size={14} />
-          {i18n.t('settings.profile.resetFailed')}
-        {:else}
-          {i18n.t('settings.profile.resetAll')}
-        {/if}
-      </button>
-      <button
-        class="apple-action-btn primary"
-        class:saving={userRulesSaveStatus === 'saving'}
-        onclick={saveUserRules}
-        disabled={userRulesSaveStatus === 'saving' || userRulesResetStatus === 'saving'}
-      >
-        {#if userRulesSaveStatus === 'saving'}
-          <Icon name="refresh" size={14} />
-          {i18n.t('settings.profile.savingProfile')}
-        {:else if userRulesSaveStatus === 'saved'}
-          <Icon name="check" size={14} />
-          {i18n.t('settings.profile.savedProfile')}
-        {:else if userRulesSaveStatus === 'error'}
-          <Icon name="close" size={14} />
-          {i18n.t('settings.profile.saveFailed')}
-        {:else}
-          {i18n.t('settings.profile.saveAll')}
-        {/if}
-      </button>
-    </div>
-  </div>
-</div>
 </div>
 </div>
 
@@ -157,7 +131,18 @@
   }
   .user-rules-textarea { resize: none; min-height: 140px; width: 100%; box-sizing: border-box; }
 
+  .rules-save-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    white-space: nowrap;
+  }
 
+  .rules-save-status.error {
+    color: var(--danger);
+  }
 
   /* ── 安全防护 ── */
   .safeguard-categories {

@@ -12,6 +12,7 @@ import type {
   Task,
   TimelineProjectionArtifact,
   TimelineProjectionRenderEntry,
+  WorkerLaneStatus,
 } from '../../types/message';
 import { buildEmptyWorkspaceAppState } from './empty-workspace-state';
 import { isRuntimeInternalTool } from '../tool-visibility';
@@ -154,6 +155,7 @@ interface RustSessionRuntimeTurnItemSummary {
   tool_call_id?: string | null;
   tool_name?: string | null;
   tool_status?: string | null;
+  tool_arguments?: string | null;
   tool_result?: string | null;
   tool_error?: string | null;
   thread_visible?: boolean;
@@ -249,6 +251,19 @@ function normalizeObjectRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
+}
+
+function parseToolArguments(rawArguments: unknown): Record<string, unknown> {
+  const text = normalizeString(rawArguments);
+  if (!text) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return normalizeObjectRecord(parsed) || { raw: parsed };
+  } catch {
+    return { raw: text };
+  }
 }
 
 function getRuntimeDetailEntries(
@@ -361,6 +376,7 @@ function normalizeSessionRuntimeEntries(
             tool_call_id: normalizeString(item.tool_call_id) || undefined,
             tool_name: normalizeString(item.tool_name) || undefined,
             tool_status: normalizeString(item.tool_status) || undefined,
+            tool_arguments: normalizeString(item.tool_arguments) || undefined,
             tool_result: normalizeString(item.tool_result) || undefined,
             tool_error: normalizeString(item.tool_error) || undefined,
             thread_visible: item.thread_visible !== false,
@@ -613,6 +629,16 @@ function normalizeTaskStatus(status: string, failedCount = 0): Task['status'] {
   return 'pending';
 }
 
+function isActiveRuntimeStatus(status: string): boolean {
+  return status === 'accepted'
+    || status === 'pending'
+    || status === 'running'
+    || status === 'waiting'
+    || status === 'paused'
+    || status === 'awaiting_approval'
+    || status === 'review_required';
+}
+
 function normalizeSubTaskStatus(status: string, failedDispatchCount = 0): SubTaskItem['status'] {
   const normalized = status.toLowerCase();
   if (normalized.includes('approval')) {
@@ -791,7 +817,8 @@ function deriveProcessingState(
   sessionId: string,
 ): AppState['processingState'] {
   const { activeSession, runningTaskIds } = buildSessionTaskStatusSummary(runtimeReadModel, sessionId);
-  const isProcessing = runningTaskIds.length > 0;
+  const turnStatus = normalizeString(activeSession?.current_turn?.status);
+  const isProcessing = runningTaskIds.length > 0 || isActiveRuntimeStatus(turnStatus);
 
   if (!isProcessing) {
     return null;
@@ -801,7 +828,10 @@ function deriveProcessingState(
     isProcessing: true,
     source: 'orchestrator',
     agent: 'orchestrator',
-    startedAt: normalizeNumber(activeSession?.root_task_created_at, 0),
+    startedAt: normalizeNumber(
+      activeSession?.current_turn?.accepted_at,
+      normalizeNumber(activeSession?.root_task_created_at, 0),
+    ),
     pendingRequestIds: [],
   };
 }
@@ -825,7 +855,9 @@ function deriveRuntimeState(
     ? activeSession.recoverable_branch_count
     : 0;
   const canContinueCurrentSession = hasRecoverableChain && recoverableBranchCount > 0;
-  const status = runningTaskIds.length > 0
+  const turnStatus = normalizeString(activeSession?.current_turn?.status);
+  const hasActiveTurn = isActiveRuntimeStatus(turnStatus);
+  const status = runningTaskIds.length > 0 || hasActiveTurn
     ? 'running'
     : canContinueCurrentSession
       ? 'paused'
@@ -840,10 +872,16 @@ function deriveRuntimeState(
   return {
     sessionId: sessionId || undefined,
     status,
-    phase: runningTaskIds.length > 0 ? 'execute' : (canContinueCurrentSession ? 'paused' : 'idle'),
+    phase: runningTaskIds.length > 0 ? 'execute' : (hasActiveTurn ? 'chat' : (canContinueCurrentSession ? 'paused' : 'idle')),
     errors: failedTaskIds.length > 0 ? failedTaskIds.map((id) => `task_failed:${id}`) : [],
-    statusChangedAt: normalizeNumber(activeSession?.last_update, generatedAt),
-    lastEventAt: normalizeNumber(activeSession?.last_update, generatedAt),
+    statusChangedAt: normalizeNumber(
+      activeSession?.last_update,
+      normalizeNumber(activeSession?.current_turn?.accepted_at, generatedAt),
+    ),
+    lastEventAt: normalizeNumber(
+      activeSession?.last_update,
+      normalizeNumber(activeSession?.current_turn?.accepted_at, generatedAt),
+    ),
     canResume: canContinueCurrentSession,
     runtimeReason: activeSession?.latest_event_type || undefined,
     assignments,
@@ -916,13 +954,16 @@ function createRustTimelineMessage(input: {
   source?: Message['source'];
   metadata?: Record<string, unknown>;
 }): Message {
-  const blocks: ContentBlock[] = input.blocks && input.blocks.length > 0
-    ? input.blocks
-    : [{ type: 'text', content: input.content }];
+  const parsedContent = input.blocks && input.blocks.length > 0
+    ? { content: input.content, blocks: input.blocks }
+    : parseRustSerializedMessageContent(input.content);
+  const blocks: ContentBlock[] = parsedContent.blocks && parsedContent.blocks.length > 0
+    ? parsedContent.blocks
+    : [{ type: 'text', content: parsedContent.content }];
   const displayContent = blocks
     .filter((b) => b.type === 'text')
     .map((b) => b.content)
-    .join('\n') || input.content;
+    .join('\n') || parsedContent.content;
   return {
     id: input.id,
     role: input.role,
@@ -994,7 +1035,7 @@ function normalizeSerializedContentBlock(block: unknown): ContentBlock | null {
   }
 }
 
-function parseSerializedMessageContent(rawContent: string): {
+export function parseRustSerializedMessageContent(rawContent: string): {
   content: string;
   blocks?: ContentBlock[];
 } {
@@ -1044,6 +1085,7 @@ function buildCurrentTurnItemMessage(
   item: RustSessionRuntimeTurnItemSummary,
   lane: RustSessionRuntimeTurnLaneSummary | undefined,
   workerId: string,
+  roleId: string,
   streamingFallbackItemId: string,
 ): Message {
   const itemId = normalizeString(item.item_id) || `turn-item:${turnId}:${Math.random()}`;
@@ -1052,6 +1094,10 @@ function buildCurrentTurnItemMessage(
   const normalizedSource = normalizeString(item.source);
   const toolName = normalizeString(item.tool_name) || 'tool';
   const toolStatus = normalizeString(item.tool_status) || normalizedStatus || 'pending';
+  const normalizedRoleId = normalizeString(roleId)
+    || normalizeString(item.role_id)
+    || normalizeString(lane?.role_id);
+  const workerIdentity = normalizedRoleId || workerId;
   const usesPhaseStreamingFallback = streamingFallbackItemId === itemId
     && (turnStatus === 'accepted' || turnStatus === 'running')
     && (normalizedStatus === 'running' || normalizedStatus === 'pending')
@@ -1073,12 +1119,12 @@ function buildCurrentTurnItemMessage(
     laneStatus: normalizeString(lane?.status) || undefined,
     laneTitle: normalizeString(lane?.title) || undefined,
     taskId: normalizeString(item.task_id) || undefined,
-    worker: workerId || undefined,
-    roleId: normalizeString(item.role_id) || normalizeString(lane?.role_id) || undefined,
+    worker: workerIdentity || undefined,
+    roleId: normalizedRoleId || undefined,
     blockSeq: typeof item.item_seq === 'number' ? item.item_seq : 0,
   };
   const displaySource = itemKind.startsWith('worker_')
-    ? (workerId || normalizedSource || 'orchestrator')
+    ? (workerIdentity || normalizedSource || 'orchestrator')
     : (normalizedSource || 'orchestrator');
 
   if (itemKind === 'tool_call_started' || itemKind === 'worker_tool_call_started') {
@@ -1097,7 +1143,7 @@ function buildCurrentTurnItemMessage(
         toolCall: {
           id: normalizeString(item.tool_call_id) || itemId,
           name: toolName,
-          arguments: {},
+          arguments: parseToolArguments(item.tool_arguments),
           status: (toolStatus as 'pending' | 'running' | 'success' | 'error') || 'running',
         },
       }],
@@ -1122,7 +1168,7 @@ function buildCurrentTurnItemMessage(
         toolCall: {
           id: normalizeString(item.tool_call_id) || itemId,
           name: toolName,
-          arguments: {},
+          arguments: parseToolArguments(item.tool_arguments),
           status: normalizedStatus,
           result: normalizeString(item.tool_result) || undefined,
           error: normalizeString(item.tool_error) || undefined,
@@ -1261,6 +1307,153 @@ function buildCurrentTurnWorkerLaneMetadata(
   });
 }
 
+function normalizeWorkerLaneStatus(status: string): WorkerLaneStatus {
+  switch (status) {
+    case 'running':
+    case 'blocked':
+    case 'awaiting_approval':
+    case 'review_required':
+    case 'completed':
+    case 'failed':
+    case 'cancelled':
+      return status;
+    case 'success':
+    case 'idle':
+    case 'skipped':
+      return 'completed';
+    case 'error':
+      return 'failed';
+    case 'pending':
+    case 'ready':
+    default:
+      return 'pending';
+  }
+}
+
+function buildCurrentTurnDispatchGroupBlock(
+  sessionEntry: RustSessionRuntimeSummary | undefined,
+  turnId: string,
+  timestamp: number,
+): ContentBlock | null {
+  const laneGroups = new Map<string, {
+    worker: string;
+    laneSeq: number;
+    laneVersion: number;
+    statuses: WorkerLaneStatus[];
+    tasks: Array<{
+      taskId?: string;
+      title: string;
+      status: WorkerLaneStatus;
+      isCurrent?: boolean;
+      seq?: number;
+    }>;
+  }>();
+
+  for (const lane of buildCurrentTurnWorkerLaneMetadata(sessionEntry)) {
+    if (lane.isPrimary === true) {
+      continue;
+    }
+    const worker = normalizeString(lane.roleId) || normalizeString(lane.worker);
+    const title = normalizeString(lane.title) || normalizeString(lane.taskId) || worker;
+    if (!worker || !title) {
+      continue;
+    }
+    const laneSeq = typeof lane.laneSeq === 'number' ? lane.laneSeq : Number.MAX_SAFE_INTEGER;
+    const status = normalizeWorkerLaneStatus(normalizeString(lane.status));
+    const existing = laneGroups.get(worker);
+    const task = {
+      taskId: normalizeString(lane.taskId) || undefined,
+      title,
+      status,
+      isCurrent: status === 'running',
+      seq: typeof lane.laneSeq === 'number' ? lane.laneSeq : undefined,
+    };
+    if (existing) {
+      existing.laneSeq = Math.min(existing.laneSeq, laneSeq);
+      existing.laneVersion = Math.max(existing.laneVersion, typeof lane.laneSeq === 'number' ? lane.laneSeq : 0);
+      existing.statuses.push(status);
+      existing.tasks.push(task);
+      continue;
+    }
+    laneGroups.set(worker, {
+      worker,
+      laneSeq,
+      laneVersion: typeof lane.laneSeq === 'number' ? lane.laneSeq : 0,
+      statuses: [status],
+      tasks: [task],
+    });
+  }
+
+  const resolveGroupStatus = (statuses: WorkerLaneStatus[]): WorkerLaneStatus => {
+    if (statuses.some((status) => status === 'running')) return 'running';
+    if (statuses.some((status) => status === 'awaiting_approval')) return 'awaiting_approval';
+    if (statuses.some((status) => status === 'review_required')) return 'review_required';
+    if (statuses.some((status) => status === 'blocked')) return 'blocked';
+    if (statuses.some((status) => status === 'failed')) return 'failed';
+    if (statuses.some((status) => status === 'pending')) return 'pending';
+    if (statuses.some((status) => status === 'cancelled')) return 'cancelled';
+    return 'completed';
+  };
+
+  const lanes = Array.from(laneGroups.values())
+    .sort((left, right) => {
+      if (left.laneSeq !== right.laneSeq) {
+        return left.laneSeq - right.laneSeq;
+      }
+      return left.worker.localeCompare(right.worker);
+    })
+    .map((group) => {
+      const tasks = group.tasks.sort((left, right) => {
+        const leftSeq = typeof left.seq === 'number' ? left.seq : Number.MAX_SAFE_INTEGER;
+        const rightSeq = typeof right.seq === 'number' ? right.seq : Number.MAX_SAFE_INTEGER;
+        if (leftSeq !== rightSeq) {
+          return leftSeq - rightSeq;
+        }
+        return left.title.localeCompare(right.title);
+      });
+      const status = resolveGroupStatus(group.statuses);
+      const currentTask = tasks.find((task) => task.status === 'running')
+        || tasks.find((task) => task.status === 'pending')
+        || tasks[0];
+      return {
+        laneId: `${turnId}:${group.worker}`,
+        laneVersion: group.laneVersion,
+        worker: group.worker,
+        title: currentTask?.title || group.worker,
+        description: 'worker_task_queue',
+        status,
+        startedAt: timestamp,
+        jumpTarget: { workerTabId: group.worker },
+        tasks,
+        progressSummary: {
+          totalTaskCount: tasks.length,
+          completedTaskCount: tasks.filter((task) => task.status === 'completed').length,
+        },
+      };
+    });
+
+  if (lanes.length === 0) {
+    return null;
+  }
+
+  const groupStatus = lanes.some((lane) => lane.status === 'running')
+    ? 'running'
+    : (lanes.some((lane) => lane.status === 'failed' || lane.status === 'blocked')
+      ? 'failed'
+      : (lanes.every((lane) => lane.status === 'completed') ? 'completed' : 'pending'));
+
+  return {
+    id: `current-turn-dispatch-group:${turnId}`,
+    type: 'dispatch_group',
+    content: '',
+    blockId: `current-turn-dispatch-group:${turnId}`,
+    dispatchWaveId: `current-turn:${turnId}`,
+    status: groupStatus,
+    summaryText: '',
+    lanes,
+  };
+}
+
 function extractReadableTextFromTurnContent(rawContent: unknown): string {
   const rawText = normalizeString(rawContent);
   if (!rawText) {
@@ -1320,6 +1513,13 @@ function buildSuppressedCurrentTurnItemIds(
   const completedWorkerTextBySlot = new Map<string, string>();
   const resolvedToolCallIds = new Set<string>();
   let assistantFinalText = '';
+  const hasToolTurnItems = turnItems.some((item) => {
+    const itemKind = normalizeString(item.kind);
+    return itemKind === 'tool_call_started'
+      || itemKind === 'tool_call_result'
+      || itemKind === 'worker_tool_call_started'
+      || itemKind === 'worker_tool_call_result';
+  });
 
   for (const item of turnItems) {
     const itemKind = normalizeString(item.kind);
@@ -1351,6 +1551,10 @@ function buildSuppressedCurrentTurnItemIds(
     const itemKind = normalizeString(item.kind);
     if (itemKind === 'assistant_stream') {
       const streamText = normalizeComparableTurnText(item.content);
+      if (assistantFinalText && !hasToolTurnItems) {
+        suppressedItemIds.add(itemId);
+        continue;
+      }
       if (
         streamText
         && assistantFinalText
@@ -1402,14 +1606,14 @@ function buildCurrentTurnArtifacts(
   }
   const sessionEntry = resolveSessionRuntimeEntry(runtimeReadModel, sessionId);
   const turn = sessionEntry?.current_turn;
-  const turnId = normalizeString(turn?.turn_id);
-  if (!turnId || !Array.isArray(sessionEntry?.turn_items) || sessionEntry.turn_items.length === 0) {
+  const hasWorkerLanes = Array.isArray(sessionEntry?.worker_lanes) && sessionEntry.worker_lanes.length > 0;
+  const turnId = normalizeString(turn?.turn_id) || (hasWorkerLanes ? `worker-lanes:${sessionId}` : '');
+  if (!turnId || (!Array.isArray(sessionEntry?.turn_items) && !hasWorkerLanes)) {
     return [];
   }
 
   const acceptedAt = typeof turn?.accepted_at === 'number' ? turn.accepted_at : generatedAt;
   const turnStatus = normalizeString(turn?.status);
-  const userMessage = normalizeString(turn?.user_message);
   const laneById = new Map(
     (sessionEntry?.worker_lanes || [])
       .map((lane) => [normalizeString(lane.lane_id), lane] as const)
@@ -1429,7 +1633,10 @@ function buildCurrentTurnArtifacts(
     return (itemKind === 'assistant_stream' || itemKind === 'worker_stream')
       && (itemStatus === 'running' || itemStatus === 'pending');
   });
-  const turnStillActive = turnStatus === 'accepted' || turnStatus === 'running';
+  const turnStillActive = (
+    (turnStatus === 'accepted' || turnStatus === 'running')
+    && sessionRuntimeStillActive(sessionEntry)
+  );
   const streamingFallbackItemId = !turnStillActive || hasLiveStreamItem
     ? ''
     : [...turnItems]
@@ -1491,6 +1698,7 @@ function buildCurrentTurnArtifacts(
           item,
           lane,
           workerId,
+          roleId,
           streamingFallbackItemId,
         ),
       };
@@ -1499,38 +1707,14 @@ function buildCurrentTurnArtifacts(
     .filter((item) => item.threadVisible || item.workerTabs.length > 0);
 
   const artifacts: TimelineProjectionArtifact[] = [];
-  if (userMessage) {
-    artifacts.push({
-      artifactId: `rust-turn-user:${turnId}`,
-      kind: 'message',
-      displayOrder: 1,
-      anchorEventSeq: 0,
-      latestEventSeq: 0,
-      cardStreamSeq: 0,
-      timestamp: acceptedAt,
-      threadVisible: true,
-      workerTabs: [],
-      messageIds: [`rust-turn-user:${turnId}`],
-      message: createRustTimelineMessage({
-        id: `rust-turn-user:${turnId}`,
-        content: userMessage,
-        timestamp: acceptedAt,
-        sessionId,
-        eventSeq: 0,
-        role: 'user',
-        type: 'user_input',
-        metadata: {
-          turnId,
-          turnSeq: typeof turn?.turn_seq === 'number' ? turn.turn_seq : undefined,
-        },
-      }),
-    });
-  }
-
-  if (executionItems.length === 0) {
+  const dispatchGroupBlock = buildCurrentTurnDispatchGroupBlock(sessionEntry, turnId, acceptedAt);
+  if (executionItems.length === 0 && !dispatchGroupBlock) {
     return artifacts;
   }
 
+  const dispatchGroupWorkerTabs = dispatchGroupBlock?.lanes
+    ?.map((lane) => normalizeString(lane.jumpTarget?.workerTabId) || normalizeString(lane.worker))
+    .filter(Boolean) || [];
   artifacts.push({
     artifactId: `rust-turn:${turnId}`,
     kind: 'message',
@@ -1540,7 +1724,10 @@ function buildCurrentTurnArtifacts(
     cardStreamSeq: 0,
     timestamp: acceptedAt,
     threadVisible: true,
-    workerTabs: Array.from(new Set(executionItems.flatMap((item) => item.workerTabs))),
+    workerTabs: Array.from(new Set([
+      ...executionItems.flatMap((item) => item.workerTabs),
+      ...dispatchGroupWorkerTabs,
+    ])),
     messageIds: [`rust-turn:${turnId}`],
     message: createRustTimelineMessage({
       id: `rust-turn:${turnId}`,
@@ -1550,6 +1737,7 @@ function buildCurrentTurnArtifacts(
       eventSeq: 0,
       role: 'assistant',
       type: 'progress',
+      blocks: dispatchGroupBlock ? [dispatchGroupBlock] : undefined,
       metadata: {
         turnId,
         turnSeq: typeof turn?.turn_seq === 'number' ? turn.turn_seq : undefined,
@@ -1560,6 +1748,16 @@ function buildCurrentTurnArtifacts(
   });
 
   return artifacts;
+}
+
+function shouldKeepTimelineArtifactDuringCurrentTurn(
+  artifact: TimelineProjectionArtifact,
+  currentTurnAcceptedAt: number,
+): boolean {
+  if (artifact.message?.role === 'user' || artifact.message?.type === 'user_input') {
+    return true;
+  }
+  return artifact.timestamp < currentTurnAcceptedAt;
 }
 
 function resolveTimelineMessageRole(kind: string): Pick<Message, 'role' | 'type'> | null {
@@ -1586,7 +1784,7 @@ function buildTimelineMessageArtifacts(
         return null;
       }
       const messageShape = resolveTimelineMessageRole(normalizeString(entry.kind));
-      const parsedContent = parseSerializedMessageContent(normalizeString(entry.message));
+      const parsedContent = parseRustSerializedMessageContent(normalizeString(entry.message));
       if (!messageShape || (!parsedContent.content && (!parsedContent.blocks || parsedContent.blocks.length === 0))) {
         return null;
       }
@@ -1628,7 +1826,7 @@ function shouldIncludeCurrentTurnArtifacts(
 ): boolean {
   const sessionEntry = resolveSessionRuntimeEntry(runtimeReadModel, sessionId);
   const turnStatus = normalizeString(sessionEntry?.current_turn?.status);
-  if (turnStatus === 'accepted' || turnStatus === 'running') {
+  if ((turnStatus === 'accepted' || turnStatus === 'running') && sessionRuntimeStillActive(sessionEntry)) {
     return true;
   }
   const hasWorkerLane = Array.isArray(sessionEntry?.worker_lanes) && sessionEntry.worker_lanes.length > 0;
@@ -1644,6 +1842,25 @@ function shouldIncludeCurrentTurnArtifacts(
       || itemKind === 'worker_tool_call_result'
       || itemKind === 'worker_completed';
   });
+}
+
+function sessionRuntimeStillActive(sessionEntry: RustSessionRuntimeSummary | undefined): boolean {
+  if (!sessionEntry) {
+    return false;
+  }
+  const turnStatus = normalizeString(sessionEntry.current_turn?.status);
+  if (isActiveRuntimeStatus(turnStatus)) {
+    return true;
+  }
+  if ((sessionEntry.active_task_ids || []).some((taskId) => normalizeString(taskId))) {
+    return true;
+  }
+  if ((sessionEntry.active_execution_group_ids || []).some((groupId) => normalizeString(groupId))) {
+    return true;
+  }
+  const sessionStatus = normalizeString(sessionEntry.current_status);
+  const rootStatus = normalizeString(sessionEntry.root_task_status);
+  return [sessionStatus, rootStatus].some(isActiveRuntimeStatus);
 }
 
 function resolveCurrentTurnAcceptedAt(
@@ -1678,8 +1895,10 @@ function buildContractProjectionRenderEntries(
       ? artifact.threadVisible
       : Boolean(panelKey && artifact.workerTabs.includes(panelKey));
     const executionItems = Array.isArray(artifact.executionItems) ? artifact.executionItems : [];
+    const hasStandaloneDispatchGroup = Array.isArray(artifact.message?.blocks)
+      && artifact.message.blocks.some((block) => block.type === 'dispatch_group');
 
-    if (artifactVisible && executionItems.length === 0) {
+    if (artifactVisible && (executionItems.length === 0 || hasStandaloneDispatchGroup)) {
       renderEntries.push({
         entryId: `artifact:${artifact.artifactId}`,
         artifactId: artifact.artifactId,
@@ -1741,7 +1960,9 @@ function buildTimelineProjection(
     : null;
   const historyArtifacts = currentTurnAcceptedAt === null
     ? timelineArtifacts
-    : timelineArtifacts.filter((artifact) => artifact.timestamp < currentTurnAcceptedAt);
+    : timelineArtifacts.filter((artifact) => (
+      shouldKeepTimelineArtifactDuringCurrentTurn(artifact, currentTurnAcceptedAt)
+    ));
   const artifacts = [...historyArtifacts, ...currentTurnArtifacts];
   const panelKeys = new Set<string>();
   for (const artifact of artifacts) {

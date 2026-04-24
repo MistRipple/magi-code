@@ -30,6 +30,20 @@ export interface WorkerRoleRegistrySnapshot {
   }>;
 }
 
+const BUILTIN_ROLE_TEMPLATE_IDS = [
+  'frontend-dev',
+  'backend-dev',
+  'reviewer',
+  'test-engineer',
+  'doc-writer',
+  'debugger',
+  'integration-dev',
+  'data-engineer',
+  'devops-engineer',
+  'security-analyst',
+  'architect',
+];
+
 function normalizeWorkerId(value: unknown): string {
   if (typeof value !== 'string') return '';
   return value.trim();
@@ -58,6 +72,32 @@ function resolveTemplateDisplayMeta(
   };
 }
 
+function collectKnownRoleTemplateIds(registrySnapshot?: WorkerRoleRegistrySnapshot | null): string[] {
+  const roleTemplates = Array.isArray(registrySnapshot?.roleTemplates)
+    ? registrySnapshot.roleTemplates
+    : [];
+  return Array.from(new Set([
+    ...roleTemplates.map((template) => normalizeWorkerId(template.templateId)).filter(Boolean),
+    ...BUILTIN_ROLE_TEMPLATE_IDS,
+  ])).sort((left, right) => right.length - left.length);
+}
+
+function resolveRuntimeWorkerTemplateId(
+  workerId: string,
+  registrySnapshot?: WorkerRoleRegistrySnapshot | null,
+): string {
+  const normalizedWorkerId = normalizeWorkerId(workerId);
+  if (!normalizedWorkerId) {
+    return '';
+  }
+  for (const templateId of collectKnownRoleTemplateIds(registrySnapshot)) {
+    if (normalizedWorkerId === templateId || normalizedWorkerId === `task-worker-${templateId}`) {
+      return templateId;
+    }
+  }
+  return '';
+}
+
 export function resolveTaskCardWorkerSlot(meta: Record<string, unknown> | undefined): string | null {
   if (!meta || typeof meta !== 'object') {
     return null;
@@ -79,11 +119,13 @@ export function resolveWorkerRoleSource(
   if (!normalizedWorkerId) {
     return null;
   }
+  const normalizedRoleId = resolveRuntimeWorkerTemplateId(normalizedWorkerId, registrySnapshot);
+  const lookupWorkerId = normalizedRoleId || normalizedWorkerId;
 
   const matchedEnabledAgent = enabledAgents.find((agent) => {
     const templateId = normalizeWorkerId(agent.templateId);
     const engineId = normalizeWorkerId(agent.engineId);
-    return templateId === normalizedWorkerId || engineId === normalizedWorkerId;
+    return templateId === lookupWorkerId || engineId === lookupWorkerId;
   });
   if (matchedEnabledAgent) {
     const templateMeta = resolveTemplateDisplayMeta(
@@ -104,14 +146,14 @@ export function resolveWorkerRoleSource(
   const matchedBinding = registryAgents.find((binding) => {
     const templateId = normalizeWorkerId(binding.templateId);
     const engineId = normalizeWorkerId(binding.engineId);
-    return templateId === normalizedWorkerId || engineId === normalizedWorkerId;
+    return templateId === lookupWorkerId || engineId === lookupWorkerId;
   });
   if (!matchedBinding) {
-    const templateMeta = resolveTemplateDisplayMeta(normalizedWorkerId, registrySnapshot);
-    if (templateMeta.displayName || templateMeta.colorToken) {
+    const templateMeta = resolveTemplateDisplayMeta(lookupWorkerId, registrySnapshot);
+    if (normalizedRoleId || templateMeta.displayName || templateMeta.colorToken) {
       return {
-        templateId: normalizedWorkerId,
-        displayName: templateMeta.displayName || normalizedWorkerId,
+        templateId: lookupWorkerId,
+        displayName: templateMeta.displayName || lookupWorkerId,
         displayNameKey: templateMeta.displayNameKey,
         colorToken: templateMeta.colorToken,
       };

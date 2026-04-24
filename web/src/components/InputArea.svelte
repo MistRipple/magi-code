@@ -5,6 +5,7 @@
     addToast,
     getActiveInteractionType,
     getQueuedMessages,
+    hasRunningExecutionContent,
     messagesState,
   } from '../stores/messages.svelte';
   import type { StandardMessage } from '../shared/protocol/message-protocol';
@@ -59,7 +60,6 @@
 
   // 深度任务模式
   let deepTaskEnabled = $state(false);
-
   // 增强按钮状态
   let isEnhancing = $state(false);
 
@@ -69,7 +69,13 @@
   const MAX_IMAGE_SIZE = 10 * 1024 * 1024;  // 单张图片最大 10MB
 
   // 发送/停止态只认 store 内已经收敛好的处理状态，避免多真相源互相抬升。
-  const isSending = $derived(messagesState.isProcessing);
+  const isSending = $derived(
+    messagesState.isProcessing
+    || messagesState.backendProcessing
+    || messagesState.pendingRequests.size > 0
+    || messagesState.activeMessageIds.size > 0
+    || hasRunningExecutionContent(),
+  );
   const activeInteraction = $derived.by(() => getActiveInteractionType());
   const isInteractionBlocking = $derived.by(() => Boolean(activeInteraction));
   const queuedMessages = $derived.by(() => getQueuedMessages());
@@ -79,6 +85,9 @@
   const MAX_INPUT_CHARS = 10000;
   let inputTextareaEl = $state<HTMLTextAreaElement | null>(null);
   const sendButtonTitle = $derived.by(() => {
+    if (isSending) {
+      return i18n.t('input.followUp.queueTitle');
+    }
     return i18n.t('input.send');
   });
   const sendDisabled = $derived.by(() => (
@@ -141,13 +150,16 @@
   }
 
   // 发送消息（支持图片附件）
-  // 单会话单活跃任务：执行中禁止把新问题挂进旧执行链
+  // 运行中再次发送不会打断当前轮，而是按当前 session 的队列/引导模式串行提交。
   function sendMessage() {
     const rawContent = inputValue;
     const normalizedContent = rawContent.trim();
     // 允许只发送图片（无文字）或只发送文字，或只发送已选技能
-    // 执行中允许发送，后端将执行"打断并重启"
     if ((!normalizedContent && !selectedSkill && selectedImages.length === 0) || isInteractionBlocking) return;
+    if (isSending && selectedImages.length > 0) {
+      addToast('warning', i18n.t('input.noImageDuringExecution'));
+      return;
+    }
     // P1-1: 限频检查
     const now = Date.now();
     const minInterval = isSending ? RATE_LIMIT_PROCESSING : RATE_LIMIT_IDLE;
@@ -167,13 +179,9 @@
       return;
     }
 
-    if (isSending) {
-      addToast('warning', i18n.t('input.stopBeforeNewTurn'));
-      return;
-    }
-
     const shouldContinueCurrentSession = (
-      canContinueCurrentSession
+      !isSending
+      && canContinueCurrentSession
       && !selectedSkill
       && selectedImages.length === 0
       && submissionText !== null
@@ -199,6 +207,7 @@
       requestId,
       deepTask: deepTaskEnabled,
       skillName: selectedSkill?.name ?? null,
+      followUpMode: isSending ? 'queue' : undefined,
       images: selectedImages.map((img) => ({
         name: img.name,
         dataUrl: img.dataUrl,
@@ -255,6 +264,15 @@
   // 停止任务
   function stopTask() {
     vscode.postMessage({ type: 'interruptTask' });
+  }
+
+  function guideQueuedMessage(queuedMessageId: string) {
+    const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
+    if (!normalizedId) return;
+    vscode.postMessage({
+      type: 'guideQueuedMessage',
+      queuedMessageId: normalizedId,
+    });
   }
 
   function focusInputTextareaToEnd() {
@@ -442,7 +460,21 @@
         {#each queuedMessages as queued, index (queued.id)}
           <div class="ia-queue-item">
             <span class="ia-queue-index">{index + 1}</span>
+            <span class="ia-queue-mode" class:guide={queued.mode === 'guide'}>
+              {queued.mode === 'guide' ? i18n.t('input.queue.modeGuide') : i18n.t('input.queue.modeQueue')}
+            </span>
             <div class="ia-queue-content" title={queued.content}>{queued.content}</div>
+            {#if queued.mode !== 'guide'}
+              <button
+                type="button"
+                class="ia-queue-guide"
+                onclick={() => guideQueuedMessage(queued.id)}
+                title={i18n.t('messageItem.guideQueuedTitle')}
+              >
+                <Icon name="send" size={11} />
+                <span>{i18n.t('messageItem.guideQueued')}</span>
+              </button>
+            {/if}
           </div>
         {/each}
       </div>
@@ -560,6 +592,7 @@
           <Icon name="infinity" size={12} />
           <span class="ia-deep-label">{i18n.t('input.deepLabel')}</span>
         </button>
+
       </div>
 
       <div class="ia-right">
@@ -577,7 +610,17 @@
         </button>
 
         {#if isSending}
-          <!-- 执行中：始终显示停止按钮，禁止把新问题挂进旧执行链 -->
+          {#if hasContent}
+            <button
+              class="ia-send ready"
+              data-testid="input-followup-send-button"
+              onclick={sendMessage}
+              disabled={sendDisabled}
+              title={sendButtonTitle}
+            >
+              <Icon name="send" size={14} />
+            </button>
+          {/if}
           <button class="ia-send stop" data-testid="input-stop-button" onclick={stopTask} title={i18n.t('input.stop')}>
             <Icon name="stop" size={14} />
           </button>
@@ -1044,7 +1087,7 @@
 
   .ia-queue-item {
     display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
     align-items: start;
     gap: 8px;
     padding: 6px 8px;
@@ -1052,6 +1095,28 @@
     border: 1px solid color-mix(in srgb, var(--border-subtle) 70%, transparent);
     background: color-mix(in srgb, var(--surface-2) 40%, var(--surface-1));
     min-height: 32px;
+  }
+
+  .ia-queue-mode {
+    display: inline-flex;
+    align-items: center;
+    height: 17px;
+    margin-top: 1px;
+    padding: 0 6px;
+    border-radius: var(--radius-full);
+    border: 1px solid color-mix(in srgb, var(--primary) 28%, transparent);
+    background: color-mix(in srgb, var(--primary) 8%, transparent);
+    color: var(--primary);
+    font-size: 10px;
+    font-weight: var(--font-semibold);
+    line-height: 1;
+    white-space: nowrap;
+  }
+
+  .ia-queue-mode.guide {
+    border-color: color-mix(in srgb, var(--warning) 34%, transparent);
+    background: color-mix(in srgb, var(--warning) 10%, transparent);
+    color: var(--warning);
   }
 
   .ia-queue-index {
@@ -1080,6 +1145,43 @@
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
     line-clamp: 2;
+  }
+
+  .ia-queue-guide {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 22px;
+    margin-top: 0;
+    padding: 0 7px;
+    border: 1px solid color-mix(in srgb, var(--primary) 35%, transparent);
+    border-radius: var(--radius-full);
+    background: color-mix(in srgb, var(--primary) 8%, transparent);
+    color: var(--primary);
+    font-size: 10px;
+    font-weight: var(--font-semibold);
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0;
+    transform: translateX(3px);
+    transition: opacity 120ms ease, transform 120ms ease, background 120ms ease;
+  }
+
+  .ia-queue-item:hover .ia-queue-guide,
+  .ia-queue-item:focus-within .ia-queue-guide {
+    opacity: 1;
+    transform: translateX(0);
+  }
+
+  .ia-queue-guide:hover {
+    background: color-mix(in srgb, var(--primary) 14%, transparent);
+  }
+
+  @media (hover: none) {
+    .ia-queue-guide {
+      opacity: 1;
+      transform: none;
+    }
   }
 
 </style>

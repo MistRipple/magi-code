@@ -30,7 +30,6 @@ import {
   removeAgentRegistryEngine,
   scanAgentLocalSkillDirectory,
   resetAgentExecutionStats,
-  resetAgentUserRules,
   saveAgentAuxiliaryConfig,
   saveAgentUserRules,
   saveAgentSafeguardConfig,
@@ -443,11 +442,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     mcp: "idle",
   });
 
-  // 用户规则保存/重置状态
+  // 用户规则自动保存状态
   let userRulesSaveStatus = $state<"idle" | "saving" | "saved" | "error">("idle");
-  let userRulesResetStatus = $state<"idle" | "saving" | "saved" | "error">(
-    "idle",
-  );
+  let userRulesSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  let userRulesStatusTimer: ReturnType<typeof setTimeout> | null = null;
+  let persistedUserRules = "";
+  let userRulesSaveVersion = 0;
 
   // Skill 安装/更新状态
   let installingSkills = $state<Set<string>>(new Set());
@@ -1278,41 +1278,46 @@ function createSettingsStore(props: { onClose?: () => void }) {
     await loadRegistryData();
   }
 
-  async function saveUserRules() {
+  async function saveUserRulesNow(value = userRules) {
+    const normalized = value;
+    if (normalized === persistedUserRules) {
+      return;
+    }
+    const saveVersion = ++userRulesSaveVersion;
     userRulesSaveStatus = "saving";
     try {
-      const result = await saveAgentUserRules({ userRules });
+      const result = await saveAgentUserRules({ userRules: normalized });
+      if (saveVersion !== userRulesSaveVersion) {
+        return;
+      }
       userRulesSaveStatus =
         (result as any)?.success !== false ? "saved" : "error";
       if ((result as any)?.success !== false) {
-      notifySettingsSuccess("用户规则已保存", { displayMode: "notification_center" });
+        persistedUserRules = normalized;
       }
     } catch (e) {
+      if (saveVersion !== userRulesSaveVersion) {
+        return;
+      }
       console.error("[SettingsPanel] 保存规则失败:", e);
       userRulesSaveStatus = "error";
       notifySettingsError("保存用户规则", e);
     }
-    resetUserRulesStatus("save");
+    clearUserRulesSaveStatusLater();
   }
 
-  async function resetUserRules() {
-    userRulesResetStatus = "saving";
-    try {
-      const result = await resetAgentUserRules();
-      userRulesResetStatus =
-        (result as any)?.success !== false ? "saved" : "error";
-      // 重新加载配置
-      if ((result as any)?.success !== false) {
-        const payload = await getAgentSettingsBootstrap();
-        applyUserRulesConfig(payload.userRulesConfig);
-        notifySettingsSuccess("用户规则已重置", { displayMode: "notification_center" });
-      }
-    } catch (e) {
-      console.error("[SettingsPanel] 重置规则失败:", e);
-      userRulesResetStatus = "error";
-      notifySettingsError("重置用户规则", e);
+  function scheduleUserRulesSave(value = userRules) {
+    if (value === persistedUserRules) {
+      return;
     }
-    resetUserRulesStatus("reset");
+    if (userRulesSaveTimer) {
+      clearTimeout(userRulesSaveTimer);
+    }
+    userRulesSaveStatus = "saving";
+    userRulesSaveTimer = setTimeout(() => {
+      userRulesSaveTimer = null;
+      void saveUserRulesNow(value);
+    }, 700);
   }
 
   async function testModelConnection(
@@ -1442,13 +1447,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
     }, 2000);
   }
 
-  function resetUserRulesStatus(kind: "save" | "reset") {
-    setTimeout(() => {
-      if (kind === "save") {
-        userRulesSaveStatus = "idle";
-      } else {
-        userRulesResetStatus = "idle";
-      }
+  function clearUserRulesSaveStatusLater() {
+    if (userRulesStatusTimer) {
+      clearTimeout(userRulesStatusTimer);
+    }
+    userRulesStatusTimer = setTimeout(() => {
+      userRulesSaveStatus = "idle";
+      userRulesStatusTimer = null;
     }, 2000);
   }
 
@@ -2214,6 +2219,16 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   function applyUserRulesConfig(config: any): void {
     userRules = typeof config?.userRules === "string" ? config.userRules : "";
+    persistedUserRules = userRules;
+    userRulesSaveStatus = "idle";
+    if (userRulesSaveTimer) {
+      clearTimeout(userRulesSaveTimer);
+      userRulesSaveTimer = null;
+    }
+    if (userRulesStatusTimer) {
+      clearTimeout(userRulesStatusTimer);
+      userRulesStatusTimer = null;
+    }
   }
 
   function applyWorkerConfigs(configs: Record<string, any> | undefined): void {
@@ -2525,6 +2540,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     set userRules(v) {
       userRules = v;
+      scheduleUserRulesSave(v);
     },
     get modelConfigTab() {
       return modelConfigTab;
@@ -2558,9 +2574,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     get userRulesSaveStatus() {
       return userRulesSaveStatus;
-    },
-    get userRulesResetStatus() {
-      return userRulesResetStatus;
     },
     get installingSkills() {
       return installingSkills;
@@ -2731,8 +2744,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
     logout,
     closeSettings,
     reloadRoleTemplates,
-    saveUserRules,
-    resetUserRules,
     testModelConnection,
     fetchModelList,
     selectModel,

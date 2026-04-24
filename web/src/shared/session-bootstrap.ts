@@ -8,8 +8,17 @@
 
 export interface BootstrapQueuedMessage {
   id: string;
+  requestId?: string;
   content: string;
+  text?: string | null;
   createdAt: number;
+  mode?: 'queue' | 'guide';
+  deepTask?: boolean;
+  skillName?: string | null;
+  images?: Array<{
+    name: string;
+    dataUrl: string;
+  }>;
 }
 
 /**

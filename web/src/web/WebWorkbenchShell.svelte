@@ -5,7 +5,7 @@
   import Modal from '../components/Modal.svelte';
   import { runActionWithFeedback } from '../lib/action-feedback';
   import type { IconName } from '../lib/icons';
-  import { addToast, messagesState } from '../stores/messages.svelte';
+  import { addToast, messagesState, setCurrentSessionId } from '../stores/messages.svelte';
   import { getClientBridge } from '../shared/bridges/bridge-runtime';
   import { i18n } from '../stores/i18n.svelte';
   import type { Session } from '../types/message';
@@ -107,6 +107,14 @@
       ? messagesState.currentSessionId.trim()
       : '';
     if (!bootstrapSessionId || bootstrapSessionId === currentSessionId) {
+      return;
+    }
+    const belongsToSelectedWorkspace = (sessionsByWorkspace[selectedWorkspaceId] ?? [])
+      .some((session) => session.id === bootstrapSessionId);
+    if (!belongsToSelectedWorkspace) {
+      return;
+    }
+    if (urlExplicitlyClearsWorkspaceSession(selectedWorkspaceId, selectedWorkspace?.rootPath || '')) {
       return;
     }
 
@@ -277,7 +285,25 @@
     }
   }
 
-  function resolveWorkspacePreferredSessionId(workspaceId: string, workspacePath: string): string {
+  function urlExplicitlyClearsWorkspaceSession(workspaceId: string, workspacePath: string): boolean {
+    if (typeof window === 'undefined') {
+      return false;
+    }
+    const currentUrl = new URL(window.location.href);
+    const queryWorkspaceId = currentUrl.searchParams.get('workspaceId')?.trim() || '';
+    const queryWorkspacePath = currentUrl.searchParams.get('workspacePath')?.trim() || '';
+    const querySessionId = currentUrl.searchParams.get('sessionId')?.trim() || '';
+    return !querySessionId && (queryWorkspaceId === workspaceId || queryWorkspacePath === workspacePath);
+  }
+
+  function resolveWorkspacePreferredSessionId(
+    workspaceId: string,
+    workspacePath: string,
+    options: {
+      preserveCurrentSession?: boolean;
+      allowStoredSession?: boolean;
+    } = {},
+  ): string {
     if (typeof window === 'undefined') {
       return '';
     }
@@ -289,27 +315,53 @@
     if (querySessionId && (queryWorkspaceId === workspaceId || queryWorkspacePath === workspacePath)) {
       return querySessionId;
     }
-
-    const storedBinding = readStoredBrowserWorkspaceBinding();
-    const storedWorkspaceId = storedBinding.workspaceId;
-    const storedWorkspacePath = storedBinding.workspacePath;
-    const storedSessionId = storedBinding.sessionId;
-    if (storedSessionId && (storedWorkspaceId === workspaceId || storedWorkspacePath === workspacePath)) {
-      return storedSessionId;
+    if (!querySessionId && (queryWorkspaceId === workspaceId || queryWorkspacePath === workspacePath)) {
+      return '';
     }
 
-    if (selectedWorkspaceId === workspaceId && typeof currentSessionId === 'string' && currentSessionId.trim()) {
+    if (options.allowStoredSession !== false) {
+      const storedBinding = readStoredBrowserWorkspaceBinding();
+      const storedWorkspaceId = storedBinding.workspaceId;
+      const storedWorkspacePath = storedBinding.workspacePath;
+      const storedSessionId = storedBinding.sessionId;
+      if (storedSessionId && (storedWorkspaceId === workspaceId || storedWorkspacePath === workspacePath)) {
+        return storedSessionId;
+      }
+    }
+
+    if (
+      options.preserveCurrentSession !== false
+      && selectedWorkspaceId === workspaceId
+      && typeof currentSessionId === 'string'
+      && currentSessionId.trim()
+    ) {
       return currentSessionId.trim();
     }
 
     return '';
   }
 
+  function requestWorkspaceBindingSync(workspace: AgentWorkspaceSummary, sessionId: string | null): void {
+    getClientBridge().postMessage({
+      type: 'workspaceBindingChanged',
+      workspaceId: workspace.workspaceId,
+      workspacePath: workspace.rootPath,
+      sessionId: sessionId || '',
+    });
+  }
+
+  function requestCurrentSessionState(): void {
+    if (!currentSessionId) {
+      return;
+    }
+    getClientBridge().postMessage({ type: 'requestState' });
+  }
+
   function applyWorkspaceSessionsSnapshot(
     workspaceId: string,
     snapshot: Awaited<ReturnType<typeof getWorkspaceSessions>>,
     preferredSessionId = '',
-  ): void {
+  ): string {
     sessionsByWorkspace = {
       ...sessionsByWorkspace,
       [workspaceId]: snapshot.sessions,
@@ -325,10 +377,15 @@
     const preservedSessionId = candidateSessionIds.find((sessionId) => (
       snapshot.sessions.some((session) => session.id === sessionId)
     )) || '';
-    const resolvedSessionId = requestedSessionId || preservedSessionId || snapshot.sessionId;
+    const resolvedSessionId = preservedSessionId;
 
     currentSessionId = resolvedSessionId || null;
+    if (selectedWorkspaceId === workspaceId) {
+      setCurrentSessionId(resolvedSessionId || null);
+    }
     syncBrowserSessionBinding(snapshot.workspace.workspaceId, snapshot.workspace.rootPath, resolvedSessionId || null);
+    requestWorkspaceBindingSync(snapshot.workspace, resolvedSessionId || null);
+    return resolvedSessionId;
   }
 
   function notifyWorkbenchError(actionLabel: string, error: unknown): void {
@@ -343,17 +400,19 @@
     });
   }
 
-  async function refreshWorkspaceSessions(workspaceId: string, preferredSessionId = ''): Promise<void> {
+  async function refreshWorkspaceSessions(workspaceId: string, preferredSessionId = ''): Promise<string> {
     if (!workspaceId) {
       currentSessionId = null;
-      return;
+      setCurrentSessionId(null);
+      return '';
     }
     loadingWorkspaceIds = { ...loadingWorkspaceIds, [workspaceId]: true };
     try {
       const snapshot = await getWorkspaceSessions(workspaceId, preferredSessionId);
-      applyWorkspaceSessionsSnapshot(workspaceId, snapshot, preferredSessionId);
+      return applyWorkspaceSessionsSnapshot(workspaceId, snapshot, preferredSessionId);
     } catch (error) {
       notifyWorkbenchError('加载工作区会话', error);
+      return '';
     } finally {
       loadingWorkspaceIds = { ...loadingWorkspaceIds, [workspaceId]: false };
     }
@@ -398,7 +457,7 @@
         resolveWorkspacePreferredSessionId(selectedWorkspaceId, selectedWorkspacePath),
       );
       if (selectedWorkspaceId) {
-        getClientBridge().postMessage({ type: 'requestState' });
+        requestCurrentSessionState();
       }
     } catch (error) {
       loadError = error instanceof Error ? error.message : String(error);
@@ -445,7 +504,7 @@
             addedWorkspace?.rootPath || '',
           ),
         );
-        getClientBridge().postMessage({ type: 'requestState' });
+        requestCurrentSessionState();
       }
     } finally {
       workspaceActionPending = false;
@@ -536,7 +595,7 @@
             selectedWorkspaceId,
             resolveWorkspacePreferredSessionId(selectedWorkspaceId, nextWorkspacePath),
           );
-          getClientBridge().postMessage({ type: 'requestState' });
+          requestCurrentSessionState();
         }
       }
     } finally {
@@ -556,11 +615,25 @@
         };
         const shouldLoad = !wasSelected || !isExpanded || getWorkspaceSessionList(workspace.workspaceId).length === 0;
         if (shouldLoad) {
-          await refreshWorkspaceSessions(
+          const resolvedSessionId = await refreshWorkspaceSessions(
             workspace.workspaceId,
-            resolveWorkspacePreferredSessionId(workspace.workspaceId, workspace.rootPath),
+            resolveWorkspacePreferredSessionId(workspace.workspaceId, workspace.rootPath, {
+              preserveCurrentSession: wasSelected,
+              allowStoredSession: wasSelected,
+            }),
           );
-          getClientBridge().postMessage({ type: 'requestState' });
+          if (resolvedSessionId) {
+            requestCurrentSessionState();
+          }
+        } else {
+          const anchoredSessionId = (sessionsByWorkspace[workspace.workspaceId] ?? [])
+            .some((session) => session.id === currentSessionId)
+            ? currentSessionId
+            : null;
+          currentSessionId = anchoredSessionId;
+          setCurrentSessionId(anchoredSessionId);
+          syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, anchoredSessionId);
+          requestWorkspaceBindingSync(workspace, anchoredSessionId);
         }
       } catch (error) {
         loadError = error instanceof Error ? error.message : String(error);

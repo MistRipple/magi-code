@@ -6,7 +6,7 @@
   import Icon from './Icon.svelte';
   import { getAgentVisualInfo } from '../lib/agent-colors';
   import { formatDuration } from '../lib/utils';
-  import { resolveWorkerDisplayName } from '../lib/worker-role-utils';
+  import { resolveWorkerDisplayName, resolveWorkerRoleSource } from '../lib/worker-role-utils';
 
 
 
@@ -35,7 +35,7 @@
 
 
   const appState = getState();
-  const enabledAgents = getEnabledAgents();
+  const enabledAgents = $derived(getEnabledAgents());
   const registrySnapshot = $derived(appState.settingsRegistrySnapshot);
   const currentLocale = $derived(i18n.locale);
 
@@ -98,15 +98,24 @@
     normalizeText(card.worker)
     || 'orchestrator'
   ));
+  const workerRoleSource = $derived.by(() => (
+    rawWorker === 'orchestrator'
+      ? null
+      : resolveWorkerRoleSource(rawWorker, enabledAgents, registrySnapshot)
+  ));
+  const displayWorkerId = $derived.by(() => (
+    normalizeText(workerRoleSource?.templateId)
+    || rawWorker
+  ));
 
   const workerDisplayName = $derived.by(() => {
     const locale = currentLocale;
     if (rawWorker === 'orchestrator') {
       return locale === 'en-US' ? 'Orchestrator' : i18n.t('workerBadge.role.orchestrator');
     }
-    return resolveWorkerDisplayName(rawWorker, enabledAgents, registrySnapshot, (key) => i18n.t(key));
+    return resolveWorkerDisplayName(displayWorkerId, enabledAgents, registrySnapshot, (key) => i18n.t(key));
   });
-  const visualInfo = $derived.by(() => getAgentVisualInfo(rawWorker));
+  const visualInfo = $derived.by(() => getAgentVisualInfo(displayWorkerId, workerRoleSource?.colorToken));
 
   const titleText = $derived.by(() => (
     normalizeText(card.title)
@@ -250,8 +259,9 @@
 
 
   const targetWorkerTab = $derived.by(() => (
-    normalizeText(card.workerTabId)
-    || rawWorker
+    normalizeText(resolveWorkerRoleSource(normalizeText(card.workerTabId), enabledAgents, registrySnapshot)?.templateId)
+    || normalizeText(card.workerTabId)
+    || displayWorkerId
   ));
 
   const isClickable = $derived(targetWorkerTab !== 'orchestrator' && targetWorkerTab.length > 0);

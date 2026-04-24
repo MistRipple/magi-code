@@ -30,6 +30,7 @@ import type {
   QueuedMessage,
   OrchestratorRuntimeState,
   SessionNotificationRecord,
+  ContentBlock,
 } from '../types/message';
 import { vscode } from '../lib/vscode-bridge';
 import { ensureArray } from '../lib/utils';
@@ -237,6 +238,92 @@ function normalizePersistedAutoScrollConfig(value: unknown): AutoScrollConfig {
   return result;
 }
 
+type QueuedMessageImageItem = NonNullable<QueuedMessage['images']>[number];
+
+function normalizeQueuedMessageImage(image: unknown): QueuedMessageImageItem | null {
+  if (!image || typeof image !== 'object') {
+    return null;
+  }
+  const item = image as { name?: unknown; dataUrl?: unknown };
+  if (typeof item.dataUrl !== 'string' || item.dataUrl.trim().length === 0) {
+    return null;
+  }
+  return {
+    name: typeof item.name === 'string' && item.name.trim() ? item.name.trim() : 'image',
+    dataUrl: item.dataUrl,
+  };
+}
+
+function normalizeQueuedMessageList(value: unknown): QueuedMessage[] {
+  const seen = new Set<string>();
+  return ensureArray<QueuedMessage>(value)
+    .filter((item): item is QueuedMessage => (
+      !!item
+      && typeof item === 'object'
+      && typeof item.id === 'string'
+      && item.id.trim().length > 0
+      && typeof item.content === 'string'
+      && typeof item.createdAt === 'number'
+      && Number.isFinite(item.createdAt)
+    ))
+    .filter((item) => {
+      const id = item.id.trim();
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    })
+    .map((item) => ({
+      id: item.id.trim(),
+      requestId: typeof item.requestId === 'string' && item.requestId.trim()
+        ? item.requestId.trim()
+        : undefined,
+      localMessageId: typeof item.localMessageId === 'string' && item.localMessageId.trim()
+        ? item.localMessageId.trim()
+        : undefined,
+      blockedByUserMessageId: typeof item.blockedByUserMessageId === 'string' && item.blockedByUserMessageId.trim()
+        ? item.blockedByUserMessageId.trim()
+        : undefined,
+      blockedByUserContent: typeof item.blockedByUserContent === 'string' && item.blockedByUserContent.trim()
+        ? item.blockedByUserContent.trim()
+        : undefined,
+      content: item.content,
+      text: typeof item.text === 'string' ? item.text : null,
+      createdAt: item.createdAt,
+      mode: item.mode === 'guide' ? 'guide' : 'queue',
+      deepTask: item.deepTask === true,
+      skillName: typeof item.skillName === 'string' && item.skillName.trim()
+        ? item.skillName.trim()
+        : null,
+      images: ensureArray(item.images)
+        .map(normalizeQueuedMessageImage)
+        .filter((image): image is QueuedMessageImageItem => image !== null),
+    }));
+}
+
+function normalizePersistedQueuedMessageMap(value: unknown): Record<string, QueuedMessage[]> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  const normalized: Record<string, QueuedMessage[]> = {};
+  let count = 0;
+  for (const [rawSessionId, rawMessages] of Object.entries(value as Record<string, unknown>)) {
+    if (count >= MAX_PERSISTED_ARRAY_LENGTH) {
+      break;
+    }
+    const sessionId = normalizeSessionId(rawSessionId);
+    if (!sessionId) {
+      continue;
+    }
+    const queued = normalizeQueuedMessageList(rawMessages);
+    if (queued.length === 0) {
+      continue;
+    }
+    normalized[sessionId] = queued;
+    count += 1;
+  }
+  return normalized;
+}
+
 function normalizePersistedSessionViewState(
   sessionId: string,
   value: unknown,
@@ -319,6 +406,7 @@ interface PersistedSessionExecutionState {
   activePlan: AppState['activePlan'] | null;
 }
 let sessionExecutionStateBySession = $state<Record<string, PersistedSessionExecutionState>>({});
+let sessionQueuedMessagesBySession = $state<Record<string, QueuedMessage[]>>({});
 let webviewStateBatchDepth = 0;
 let webviewStateBatchPending = false;
 let timelineProjectionSource: 'none' | 'persisted' | 'live' | 'authoritative' = 'none';
@@ -382,9 +470,552 @@ function isValidPersistedArray(value: unknown, max: number): value is unknown[] 
 let edits = $state<Array<{ filePath: string; snapshotId?: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string; executionGroupId?: string }>>([]);
 let timelineProjectionDirty = false;
 // 统一 Worker 运行态（唯一权威来源）
-// 当前主线只从 authoritative projection 读取消息视图。
+// 当前主线以 authoritative projection 为准，仅叠加尚未被后端接纳的本地乐观节点。
+function collectProjectionKnownMessageIds(
+  projection: SessionTimelineProjection | null | undefined,
+): Set<string> {
+  const ids = new Set<string>();
+  const add = (value: unknown): void => {
+    if (typeof value !== 'string') return;
+    const normalized = value.trim();
+    if (normalized) ids.add(normalized);
+  };
+  for (const artifact of ensureArray<TimelineProjectionArtifact>(projection?.artifacts)) {
+    add(artifact.artifactId);
+    add(artifact.message?.id);
+    for (const alias of ensureArray<string>(artifact.messageIds)) add(alias);
+    for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
+      add(item.itemId);
+      add(item.message?.id);
+      for (const alias of ensureArray<string>(item.messageIds)) add(alias);
+    }
+  }
+  return ids;
+}
+
+function normalizeComparableMessageText(message: Message | undefined): string {
+  if (!message) {
+    return '';
+  }
+  const content = typeof message.content === 'string' ? message.content.trim() : '';
+  if (content) {
+    return content.replace(/\s+/g, ' ');
+  }
+  return ensureArray<ContentBlock>(message.blocks)
+    .map((block) => {
+      if (!block || typeof block !== 'object') {
+        return '';
+      }
+      if (block.type === 'text' && typeof block.content === 'string') {
+        return block.content.trim();
+      }
+      return '';
+    })
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function comparableTextsMatch(left: string, right: string): boolean {
+  if (!left || !right) {
+    return false;
+  }
+  return left === right || left.includes(right) || right.includes(left);
+}
+
+function messageTurnItemKind(message: Message | undefined): string {
+  const metadata = resolveMessageMetadataRecord(message);
+  return typeof metadata?.turnItemKind === 'string' ? metadata.turnItemKind.trim() : '';
+}
+
+function isAssistantTurnMessage(message: Message | undefined): boolean {
+  if (!message || message.role !== 'assistant') {
+    return false;
+  }
+  const turnItemKind = messageTurnItemKind(message);
+  return turnItemKind === 'assistant_stream'
+    || turnItemKind === 'assistant_final'
+    || turnItemKind === 'assistant_phase';
+}
+
+function isLocalAssistantEchoMessage(message: Message | undefined): boolean {
+  if (!message || message.role !== 'assistant') {
+    return false;
+  }
+  const metadata = resolveMessageMetadataRecord(message);
+  return Boolean(
+    typeof metadata?.requestId === 'string' && metadata.requestId.trim()
+    || metadata?.wasPlaceholder === true
+    || metadata?.isPlaceholder === true,
+  );
+}
+
+function isAssistantDuplicateCandidate(message: Message | undefined): boolean {
+  if (!message || message.role !== 'assistant' || message.isStreaming === true) {
+    return false;
+  }
+  return isAssistantTurnMessage(message) || isLocalAssistantEchoMessage(message);
+}
+
+function hasRenderableProjectionHost(message: Message | undefined): boolean {
+  if (!message) {
+    return false;
+  }
+  if (normalizeComparableMessageText(message)) {
+    return true;
+  }
+  return ensureArray<ContentBlock>(message.blocks).some((block) => {
+    if (!block || typeof block !== 'object') {
+      return false;
+    }
+    if (block.type === 'dispatch_group' || block.type === 'tool_call' || block.type === 'tool_result') {
+      return true;
+    }
+    return typeof block.content === 'string' && block.content.trim().length > 0;
+  });
+}
+
+function collectDurableAssistantTexts(artifacts: TimelineProjectionArtifact[]): string[] {
+  const texts: string[] = [];
+  for (const artifact of artifacts) {
+    const message = artifact.message;
+    if (!message || message.role !== 'assistant' || isAssistantDuplicateCandidate(message)) {
+      continue;
+    }
+    const text = normalizeComparableMessageText(message);
+    if (text) {
+      texts.push(text);
+    }
+  }
+  return texts;
+}
+
+function isDuplicateOfDurableAssistant(message: Message | undefined, durableTexts: string[]): boolean {
+  if (!isAssistantDuplicateCandidate(message)) {
+    return false;
+  }
+  const text = normalizeComparableMessageText(message);
+  if (!text) {
+    return false;
+  }
+  return durableTexts.some((durableText) => comparableTextsMatch(durableText, text));
+}
+
+function dedupeProjectionAssistantArtifacts(
+  artifacts: TimelineProjectionArtifact[],
+): TimelineProjectionArtifact[] {
+  const durableAssistantTexts = collectDurableAssistantTexts(artifacts);
+  if (durableAssistantTexts.length === 0) {
+    return artifacts;
+  }
+
+  const nextArtifacts: TimelineProjectionArtifact[] = [];
+  for (const artifact of artifacts) {
+    const messageDuplicate = isDuplicateOfDurableAssistant(artifact.message, durableAssistantTexts);
+    const originalExecutionItems = ensureArray<TimelineExecutionItem>(artifact.executionItems);
+    const executionItems = ensureArray<TimelineExecutionItem>(artifact.executionItems)
+      .filter((item) => !isDuplicateOfDurableAssistant(item.message, durableAssistantTexts));
+
+    if (messageDuplicate) {
+      if (executionItems.length > 0) {
+        nextArtifacts.push({
+          ...artifact,
+          executionItems,
+        });
+      }
+      continue;
+    }
+
+    if (
+      executionItems.length === 0
+      && originalExecutionItems.length > 0
+      && !hasRenderableProjectionHost(artifact.message)
+    ) {
+      continue;
+    }
+
+    nextArtifacts.push({
+      ...artifact,
+      executionItems,
+    });
+  }
+  return nextArtifacts;
+}
+
+function projectionHasAcceptedUserEcho(
+  projection: SessionTimelineProjection | null | undefined,
+  node: TimelineNode,
+): boolean {
+  const localMessage = node.message;
+  if (localMessage.role !== 'user' && localMessage.type !== 'user_input') {
+    return false;
+  }
+  const localText = normalizeComparableMessageText(localMessage);
+  if (!localText) {
+    return false;
+  }
+  const matches = (message: Message | undefined, timestamp: number | undefined): boolean => {
+    if (!message || (message.role !== 'user' && message.type !== 'user_input')) {
+      return false;
+    }
+    void timestamp;
+    return normalizeComparableMessageText(message) === localText;
+  };
+
+  for (const artifact of ensureArray<TimelineProjectionArtifact>(projection?.artifacts)) {
+    if (matches(artifact.message, artifact.timestamp)) {
+      return true;
+    }
+    for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
+      if (matches(item.message, item.timestamp)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function projectionHasAcceptedAssistantEcho(
+  projection: SessionTimelineProjection | null | undefined,
+  node: TimelineNode,
+): boolean {
+  const localMessage = node.message;
+  if (localMessage.role !== 'assistant' || localMessage.isStreaming === true) {
+    return false;
+  }
+  const metadata = resolveMessageMetadataRecord(localMessage);
+  const isLocalResponse = Boolean(
+    typeof metadata?.requestId === 'string' && metadata.requestId.trim()
+    || metadata?.wasPlaceholder === true
+    || metadata?.isPlaceholder === true,
+  );
+  if (!isLocalResponse) {
+    return false;
+  }
+  const localText = normalizeComparableMessageText(localMessage);
+  if (!localText) {
+    return false;
+  }
+  const matches = (message: Message | undefined): boolean => {
+    if (!message || message.role !== 'assistant') {
+      return false;
+    }
+    const projectedText = normalizeComparableMessageText(message);
+    return comparableTextsMatch(projectedText, localText);
+  };
+
+  for (const artifact of ensureArray<TimelineProjectionArtifact>(projection?.artifacts)) {
+    if (matches(artifact.message)) {
+      return true;
+    }
+    for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
+      if (matches(item.message)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isNodeKnownByProjection(node: TimelineNode, knownIds: Set<string>): boolean {
+  if (knownIds.has(node.nodeId) || knownIds.has(node.message.id)) {
+    return true;
+  }
+  for (const alias of node.messageIds || []) {
+    if (knownIds.has(alias)) {
+      return true;
+    }
+  }
+  for (const item of node.executionItems || []) {
+    if (knownIds.has(item.itemId) || knownIds.has(item.message?.id)) {
+      return true;
+    }
+    for (const alias of item.messageIds || []) {
+      if (knownIds.has(alias)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function timelineNodeLatestEventSeq(node: TimelineNode): number {
+  return Math.max(
+    node.latestEventSeq || 0,
+    getMessageEventSeq(node.message) || 0,
+    ...ensureArray<TimelineExecutionItem>(node.executionItems).map((item) => Math.max(
+      item.latestEventSeq || 0,
+      getMessageEventSeq(item.message) || 0,
+    )),
+  );
+}
+
+function timelineProjectionLatestEventSeq(
+  projection: SessionTimelineProjection | null | undefined,
+): number {
+  return typeof projection?.lastAppliedEventSeq === 'number'
+    ? projection.lastAppliedEventSeq
+    : 0;
+}
+
+function messageBelongsToLocalLiveTurn(message: Message | undefined): boolean {
+  if (!message) {
+    return false;
+  }
+  const metadata = resolveMessageMetadataRecord(message);
+  return message.isStreaming === true
+    || Boolean(
+      typeof metadata?.requestId === 'string' && metadata.requestId.trim()
+      || metadata?.isPlaceholder === true
+      || metadata?.wasPlaceholder === true,
+    );
+}
+
+function timelineNodeBelongsToLocalLiveTurn(node: TimelineNode): boolean {
+  if (messageBelongsToLocalLiveTurn(node.message)) {
+    return true;
+  }
+  return ensureArray<TimelineExecutionItem>(node.executionItems)
+    .some((item) => messageBelongsToLocalLiveTurn(item.message));
+}
+
+function shouldOverlayLocalTimelineNode(
+  node: TimelineNode,
+  projection: SessionTimelineProjection | null | undefined,
+  knownIds: Set<string>,
+): boolean {
+  const nodeSeq = timelineNodeLatestEventSeq(node);
+  const projectionSeq = timelineProjectionLatestEventSeq(projection);
+  const isNewerThanProjection = nodeSeq > projectionSeq;
+  const belongsToLocalLiveTurn = timelineNodeBelongsToLocalLiveTurn(node);
+
+  if (!messagesState.backendProcessing && messagesState.pendingRequests.size === 0 && belongsToLocalLiveTurn) {
+    return false;
+  }
+
+  if (isNodeKnownByProjection(node, knownIds)) {
+    // 后端 bootstrap 可能在流式中途带回一个 current_turn 快照。
+    // 该快照会让节点 id 变成“已知”，但只代表当时的旧内容；
+    // 后续 SSE 增量仍然必须由本地 live 节点接管，否则 UI 会卡在早期 token。
+    return belongsToLocalLiveTurn && isNewerThanProjection;
+  }
+  if (projectionHasAcceptedUserEcho(projection, node)) {
+    return false;
+  }
+  if (projectionHasAcceptedAssistantEcho(projection, node)) {
+    return false;
+  }
+  const metadata = resolveMessageMetadataRecord(node.message);
+  const requestId = typeof metadata?.requestId === 'string' ? metadata.requestId.trim() : '';
+  if (requestId || metadata?.isPlaceholder === true) {
+    return true;
+  }
+  return isNewerThanProjection;
+}
+
+function isLocalUserEchoArtifact(artifact: TimelineProjectionArtifact): boolean {
+  const metadata = resolveMessageMetadataRecord(artifact.message);
+  const requestId = typeof metadata?.requestId === 'string' ? metadata.requestId.trim() : '';
+  if (!requestId) {
+    return false;
+  }
+  const message = artifact.message;
+  return message.role === 'user' || message.type === 'user_input';
+}
+
+function isLocalAssistantEchoArtifact(artifact: TimelineProjectionArtifact): boolean {
+  const message = artifact.message;
+  if (message.role !== 'assistant') {
+    return false;
+  }
+  const metadata = resolveMessageMetadataRecord(message);
+  return Boolean(
+    typeof metadata?.requestId === 'string' && metadata.requestId.trim()
+    || metadata?.wasPlaceholder === true
+    || metadata?.isPlaceholder === true,
+  );
+}
+
+function isSessionTurnAssistantArtifact(artifact: TimelineProjectionArtifact): boolean {
+  const isAssistantTurnMessage = (message: Message | undefined): boolean => {
+    if (!message || message.role !== 'assistant') {
+      return false;
+    }
+    const metadata = resolveMessageMetadataRecord(message);
+    const turnItemKind = typeof metadata?.turnItemKind === 'string'
+      ? metadata.turnItemKind.trim()
+      : '';
+    return turnItemKind === 'assistant_stream'
+      || turnItemKind === 'assistant_final'
+      || turnItemKind === 'assistant_phase';
+  };
+  if (isAssistantTurnMessage(artifact.message)) {
+    return true;
+  }
+  return ensureArray<TimelineExecutionItem>(artifact.executionItems)
+    .some((item) => isAssistantTurnMessage(item.message));
+}
+
+function projectionHasUserMessageText(
+  projection: SessionTimelineProjection | null | undefined,
+  text: string,
+): boolean {
+  if (!text) {
+    return false;
+  }
+  const matches = (message: Message | undefined): boolean => {
+    if (!message || (message.role !== 'user' && message.type !== 'user_input')) {
+      return false;
+    }
+    return normalizeComparableMessageText(message) === text;
+  };
+  for (const artifact of ensureArray<TimelineProjectionArtifact>(projection?.artifacts)) {
+    if (matches(artifact.message)) {
+      return true;
+    }
+    for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
+      if (matches(item.message)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function projectionHasAssistantMessageText(
+  projection: SessionTimelineProjection | null | undefined,
+  text: string,
+): boolean {
+  if (!text) {
+    return false;
+  }
+  const matches = (message: Message | undefined): boolean => {
+    if (!message || message.role !== 'assistant') {
+      return false;
+    }
+    const projectedText = normalizeComparableMessageText(message);
+    return comparableTextsMatch(projectedText, text);
+  };
+  for (const artifact of ensureArray<TimelineProjectionArtifact>(projection?.artifacts)) {
+    if (matches(artifact.message)) {
+      return true;
+    }
+    for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
+      if (matches(item.message)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+export function timelineProjectionConfirmsLocalAssistantResponse(
+  projection: SessionTimelineProjection | null | undefined,
+): boolean {
+  if (!projection) {
+    return false;
+  }
+  const localAssistantTexts = messagesState.timelineNodes
+    .filter((node) => isLocalAssistantEchoArtifact({
+      artifactId: node.nodeId,
+      kind: node.kind,
+      displayOrder: node.displayOrder,
+      anchorEventSeq: node.anchorEventSeq,
+      latestEventSeq: node.latestEventSeq,
+      cardStreamSeq: node.cardStreamSeq,
+      timestamp: node.timestamp,
+      threadVisible: node.visibleInThread,
+      workerTabs: node.workerTabs,
+      messageIds: node.messageIds,
+      message: node.message,
+      executionItems: node.executionItems,
+    } as TimelineProjectionArtifact))
+    .map((node) => normalizeComparableMessageText(node.message))
+    .filter((text) => text.length > 0);
+  if (localAssistantTexts.length === 0) {
+    return false;
+  }
+  const authoritativeTexts: string[] = [];
+  for (const artifact of ensureArray<TimelineProjectionArtifact>(projection.artifacts)) {
+    if (artifact.message?.role === 'assistant') {
+      const text = normalizeComparableMessageText(artifact.message);
+      if (text) authoritativeTexts.push(text);
+    }
+    for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
+      if (item.message?.role === 'assistant') {
+        const text = normalizeComparableMessageText(item.message);
+        if (text) authoritativeTexts.push(text);
+      }
+    }
+  }
+  return localAssistantTexts.some((localText) => authoritativeTexts.some((authoritativeText) => (
+    comparableTextsMatch(authoritativeText, localText)
+  )));
+}
+
+function collectMessageIdentityKeys(message: Message | undefined): Set<string> {
+  const keys = new Set<string>();
+  const add = (value: unknown): void => {
+    if (typeof value !== 'string') return;
+    const normalized = value.trim();
+    if (normalized) keys.add(normalized);
+  };
+  add(message?.id);
+  const metadata = resolveMessageMetadataRecord(message);
+  add(metadata?.requestId);
+  add(metadata?.rustStreamItemId);
+  add(metadata?.rustEventItemId);
+  add(metadata?.turnItemId);
+  return keys;
+}
+
+function messagesShareIdentity(left: Message | undefined, right: Message | undefined): boolean {
+  const leftKeys = collectMessageIdentityKeys(left);
+  if (leftKeys.size === 0) {
+    return false;
+  }
+  for (const key of collectMessageIdentityKeys(right)) {
+    if (leftKeys.has(key)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function appendUniqueMessages(base: Message[], overlay: Message[]): Message[] {
+  if (overlay.length === 0) {
+    return base;
+  }
+  const seen = new Set<string>();
+  const next: Message[] = [];
+  const add = (message: Message): void => {
+    const id = typeof message.id === 'string' ? message.id.trim() : '';
+    if (id && seen.has(id)) {
+      return;
+    }
+    if (id) {
+      seen.add(id);
+    }
+    next.push(message);
+  };
+  for (const message of base) {
+    if (overlay.some((overlayMessage) => messagesShareIdentity(message, overlayMessage))) {
+      continue;
+    }
+    add(message);
+  }
+  for (const message of overlay) add(message);
+  return next;
+}
+
 const messageProjection = $derived.by(() => {
-  const projection = messagesState.timelineProjection;
+  const currentSessionId = normalizeSessionId(messagesState.currentSessionId);
+  const liveProjectionSessionId = currentSessionId || '__pending-session__';
+  const projection = messagesState.timelineProjection
+    || (messagesState.timelineNodes.length > 0
+      ? buildLiveTimelineProjection(liveProjectionSessionId, messagesState.timelineNodes, null)
+      : null);
   const workers: Record<string, Message[]> = {};
   if (!projection) {
     return {
@@ -409,6 +1040,41 @@ const messageProjection = $derived.by(() => {
   }
   for (const workerId of workerKeys) {
     workers[workerId] = buildTimelinePanelMessages(projection, 'worker', workerId);
+  }
+
+  const knownIds = collectProjectionKnownMessageIds(projection);
+  const overlayNodes = messagesState.timelineNodes.filter((node) => (
+    shouldOverlayLocalTimelineNode(node, projection, knownIds)
+  ));
+  if (overlayNodes.length > 0) {
+    const overlayProjection = buildLiveTimelineProjection(projection.sessionId, overlayNodes, null);
+    for (const artifact of overlayProjection.artifacts || []) {
+      for (const workerId of artifact.workerTabs || []) {
+        if (typeof workerId === 'string' && workerId.trim()) {
+          workerKeys.add(workerId.trim());
+        }
+      }
+      for (const item of artifact.executionItems || []) {
+        for (const workerId of item.workerTabs || []) {
+          if (typeof workerId === 'string' && workerId.trim()) {
+            workerKeys.add(workerId.trim());
+          }
+        }
+      }
+    }
+    for (const workerId of workerKeys) {
+      workers[workerId] = appendUniqueMessages(
+        workers[workerId] || [],
+        buildTimelinePanelMessages(overlayProjection, 'worker', workerId),
+      );
+    }
+    return {
+      thread: appendUniqueMessages(
+        buildTimelinePanelMessages(projection, 'thread'),
+        buildTimelinePanelMessages(overlayProjection, 'thread'),
+      ),
+      workers,
+    };
   }
   return {
     thread: buildTimelinePanelMessages(projection, 'thread'),
@@ -1114,7 +1780,7 @@ function canonicalizeProjectionExecutionItems(
 function canonicalizeTimelineProjection(
   projection: SessionTimelineProjection,
 ): SessionTimelineProjection {
-  const artifacts = ensureArray(projection.artifacts)
+  const normalizedArtifacts = ensureArray(projection.artifacts)
     .filter(isProjectionArtifact)
     .map((artifact) => {
       const message = normalizeProjectionRestoredMessage(artifact.message);
@@ -1166,6 +1832,7 @@ function canonicalizeTimelineProjection(
       ...artifact,
       displayOrder: artifact.displayOrder || 0,
     }));
+  const artifacts = dedupeProjectionAssistantArtifacts(normalizedArtifacts);
   const containsCurrentTurn = projectionArtifactsContainCurrentTurn(artifacts);
 
   const artifactById = new Map<string, TimelineProjectionArtifact>();
@@ -1284,7 +1951,9 @@ function syncTimelineProjectionFromNodes(
   options: { persist?: boolean } = {},
 ): void {
   const normalizedSessionId = normalizeSessionId(sessionId);
-  if (!normalizedSessionId) {
+  const projectionSessionId = normalizedSessionId
+    || (messagesState.timelineNodes.length > 0 ? '__pending-session__' : '');
+  if (!projectionSessionId) {
     return;
   }
   if (projectionContainsCurrentTurn(messagesState.timelineProjection)) {
@@ -1295,13 +1964,15 @@ function syncTimelineProjectionFromNodes(
     return;
   }
   messagesState.timelineProjection = buildLiveTimelineProjection(
-    normalizedSessionId,
+    projectionSessionId,
     messagesState.timelineNodes,
     messagesState.timelineProjection,
   );
   timelineProjectionSource = 'live';
   timelineProjectionDirty = false;
-  upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(normalizedSessionId));
+  if (normalizedSessionId) {
+    upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(normalizedSessionId));
+  }
   if (options.persist !== false) {
     scheduleSaveWebviewState();
   }
@@ -1880,12 +2551,19 @@ function shouldReplaceOrchestratorRuntimeState(
 
 export function applyAuthoritativeProcessingState(input: AppState['processingState']): void {
   const snapshot = normalizeProcessingStateSnapshot(input);
+  const hasLocalLiveTurn = messagesState.pendingRequests.size > 0 || messagesState.activeMessageIds.size > 0;
   if (!snapshot) {
     messagesState.backendProcessing = false;
+    if (hasLocalLiveTurn) {
+      updateProcessingState();
+      return;
+    }
     messagesState.pendingRequests = new Set();
     messagesState.activeMessageIds = new Set();
-    messagesState.thinkingStartAt = null;
-    messagesState.isProcessing = false;
+    if (!runtimeStateIndicatesProcessing()) {
+      sealAllStreamingMessages();
+    }
+    updateProcessingState();
     return;
   }
   // 防回抬保护：如果在 forced idle 冷却期内，拒绝后端权威状态覆盖
@@ -1898,12 +2576,25 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
     return;
   }
   const pendingRequestIds = new Set(snapshot.pendingRequestIds);
+  if (!snapshot.isProcessing && pendingRequestIds.size === 0 && hasLocalLiveTurn) {
+    messagesState.backendProcessing = false;
+    if (snapshot.source) {
+      setProcessingActor(snapshot.source, snapshot.agent || undefined);
+    }
+    updateProcessingState();
+    return;
+  }
+  const activeMessageIds = snapshot.isProcessing
+    ? messagesState.activeMessageIds
+    : new Set<string>();
   const nextIsProcessing = snapshot.isProcessing
-    || messagesState.activeMessageIds.size > 0
+    || runtimeStateIndicatesProcessing()
+    || activeMessageIds.size > 0
     || pendingRequestIds.size > 0;
 
   messagesState.backendProcessing = snapshot.isProcessing;
   messagesState.pendingRequests = pendingRequestIds;
+  messagesState.activeMessageIds = activeMessageIds;
   if (snapshot.source) {
     setProcessingActor(snapshot.source, snapshot.agent || undefined);
   }
@@ -1913,6 +2604,7 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
       || Date.now();
   } else {
     messagesState.thinkingStartAt = null;
+    sealAllStreamingMessages();
   }
   messagesState.isProcessing = nextIsProcessing;
 }
@@ -1940,6 +2632,55 @@ export function getThreadMessages() {
 
 export function getAgentOutputs() {
   return messageProjection.workers as AgentOutputs;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function normalizeRuntimeStatus(value: unknown): string {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function isActiveRuntimeStatus(value: unknown): boolean {
+  return ['pending', 'running', 'executing', 'inflight', 'waiting_deps'].includes(normalizeRuntimeStatus(value));
+}
+
+function blockHasRunningExecutionContent(block: unknown): boolean {
+  if (!isRecord(block)) {
+    return false;
+  }
+  const blockType = typeof block.type === 'string' ? block.type : '';
+  if (blockType === 'tool_call') {
+    const nestedToolCall = isRecord(block.toolCall) ? block.toolCall : null;
+    return isActiveRuntimeStatus(nestedToolCall?.status ?? block.status);
+  }
+  if (blockType === 'dispatch_group') {
+    if (isActiveRuntimeStatus(block.status)) {
+      return true;
+    }
+    const lanes = ensureArray<Record<string, unknown>>(block.lanes);
+    return lanes.some((lane) => (
+      isActiveRuntimeStatus(lane.status)
+      || ensureArray<Record<string, unknown>>(lane.tasks).some((task) => isActiveRuntimeStatus(task.status))
+    ));
+  }
+  return false;
+}
+
+function messageHasRunningExecutionContent(message: unknown): boolean {
+  if (!isRecord(message)) {
+    return false;
+  }
+  return ensureArray(message.blocks).some(blockHasRunningExecutionContent);
+}
+
+export function hasRunningExecutionContent(): boolean {
+  if (messageProjection.thread.some(messageHasRunningExecutionContent)) {
+    return true;
+  }
+  return Object.values(messageProjection.workers)
+    .some((messages) => ensureArray(messages).some(messageHasRunningExecutionContent));
 }
 
 export function getCurrentBottomTab() {
@@ -2037,7 +2778,7 @@ export function getState() {
     get currentSessionId() { return messagesState.currentSessionId; },
     get sessionHistory() { return messagesState.sessionHistory; },
     get queuedMessages() { return messagesState.queuedMessages; },
-    set queuedMessages(v) { messagesState.queuedMessages = ensureArray<QueuedMessage>(v) as QueuedMessage[]; },
+    set queuedMessages(v) { setQueuedMessages(ensureArray<QueuedMessage>(v)); },
     get isProcessing() { return messagesState.isProcessing; },
     get thinkingStartAt() { return messagesState.thinkingStartAt; },
     get processingActor() { return messagesState.processingActor; },
@@ -2138,6 +2879,13 @@ function getSessionViewState(sessionId: string | null | undefined): PersistedSes
   return sessionViewStateBySession[normalizedSessionId] || null;
 }
 
+function restoreQueuedMessagesForSession(sessionId: string | null | undefined): void {
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  messagesState.queuedMessages = normalizedSessionId
+    ? normalizeQueuedMessageList(sessionQueuedMessagesBySession[normalizedSessionId])
+    : [];
+}
+
 function pruneSessionViewStateByKnownSessions(): void {
   const knownSessionIds = new Set<string>();
   for (const session of messagesState.sessions) {
@@ -2163,6 +2911,11 @@ function pruneSessionViewStateByKnownSessions(): void {
     .filter(([sessionId]) => knownSessionIds.has(sessionId));
   if (nextExecutionEntries.length !== Object.keys(sessionExecutionStateBySession).length) {
     sessionExecutionStateBySession = Object.fromEntries(nextExecutionEntries);
+  }
+  const nextQueuedEntries = Object.entries(sessionQueuedMessagesBySession)
+    .filter(([sessionId]) => knownSessionIds.has(sessionId) && sessionQueuedMessagesBySession[sessionId].length > 0);
+  if (nextQueuedEntries.length !== Object.keys(sessionQueuedMessagesBySession).length) {
+    sessionQueuedMessagesBySession = Object.fromEntries(nextQueuedEntries);
   }
 }
 
@@ -2234,6 +2987,7 @@ function saveWebviewState() {
       scrollAnchors: messagesState.scrollAnchors,
       autoScrollEnabled: messagesState.autoScrollEnabled,
       sessionViewStateBySession,
+      sessionQueuedMessagesBySession,
     };
     vscode.setState(state);
   } catch (error) {
@@ -2272,10 +3026,19 @@ export function setOrchestratorRuntimeState(input: OrchestratorRuntimeState | nu
     return;
   }
   messagesState.orchestratorRuntimeState = next;
+  if (runtimeStateIsTerminal(next)) {
+    sealAllStreamingMessages();
+  }
+  updateProcessingState();
 }
 
 export function replaceOrchestratorRuntimeState(input: OrchestratorRuntimeState | null): void {
-  messagesState.orchestratorRuntimeState = normalizeOrchestratorRuntimeState(input);
+  const next = normalizeOrchestratorRuntimeState(input);
+  messagesState.orchestratorRuntimeState = next;
+  if (runtimeStateIsTerminal(next)) {
+    sealAllStreamingMessages();
+  }
+  updateProcessingState();
 }
 
 export function updatePanelScrollState(
@@ -2375,25 +3138,16 @@ export function setCurrentSessionId(id: string | null) {
     // 造成“主线/worker 边界混淆”的产品错觉。
     messagesState.currentBottomTab = 'thread';
     resetSessionScopedExecutionState();
+    // 会话切换时消息内容以后端分页快照为唯一真相源。
+    // 本地只恢复滚动/定位等轻量视图状态，避免旧 session 的主线或 worker 内容短暂残留。
+    replaceTimelineNodes([]);
+    messagesState.timelineProjection = null;
+    timelineProjectionDirty = false;
     restoredSessionView = applySessionViewState(nextSessionId);
     if (!restoredSessionView) {
-      replaceTimelineNodes([]);
-      messagesState.timelineProjection = null;
-      timelineProjectionDirty = false;
       resetPanelScrollRuntimeState();
-    } else if (nextSessionId) {
-      // 多会话并行：清洗恢复的 timeline 中不属于当前 session 的节点
-      // 防止 SSE 竞态窗口导致的跨 session 消息泄漏
-      const cleaned = messagesState.timelineNodes.filter((node) => {
-        const msgSessionId = typeof node.message?.metadata?.sessionId === 'string'
-          ? node.message.metadata.sessionId.trim()
-          : '';
-        return !msgSessionId || msgSessionId === nextSessionId;
-      });
-      if (cleaned.length !== messagesState.timelineNodes.length) {
-        replaceTimelineNodes(cleaned);
-      }
     }
+    restoreQueuedMessagesForSession(nextSessionId);
   }
   syncNotificationsFromSession(nextSessionId);
   saveWebviewState();
@@ -2413,27 +3167,70 @@ export function updateSessions(newSessions: Session[]) {
 }
 
 export function setQueuedMessages(newQueuedMessages: QueuedMessage[]) {
-  const seen = new Set<string>();
-  messagesState.queuedMessages = ensureArray<QueuedMessage>(newQueuedMessages)
-    .filter((item): item is QueuedMessage => (
-      !!item
-      && typeof item === 'object'
-      && typeof item.id === 'string'
-      && item.id.trim().length > 0
-      && typeof item.content === 'string'
-      && typeof item.createdAt === 'number'
-      && Number.isFinite(item.createdAt)
-    ))
-    .filter((item) => {
-      if (seen.has(item.id)) return false;
-      seen.add(item.id);
-      return true;
-    })
-    .map((item) => ({
-      id: item.id,
-      content: item.content,
-      createdAt: item.createdAt,
-    }));
+  const normalized = normalizeQueuedMessageList(newQueuedMessages);
+  messagesState.queuedMessages = normalized;
+  const sessionId = normalizeSessionId(messagesState.currentSessionId);
+  if (sessionId) {
+    sessionQueuedMessagesBySession = {
+      ...sessionQueuedMessagesBySession,
+      ...(normalized.length > 0 ? { [sessionId]: normalized } : {}),
+    };
+    if (normalized.length === 0 && sessionQueuedMessagesBySession[sessionId]) {
+      const { [sessionId]: _removed, ...rest } = sessionQueuedMessagesBySession;
+      sessionQueuedMessagesBySession = rest;
+    }
+  }
+  scheduleSaveWebviewState();
+}
+
+export function enqueueQueuedMessage(message: QueuedMessage) {
+  setQueuedMessages([
+    ...messagesState.queuedMessages,
+    message,
+  ]);
+}
+
+export function prependQueuedMessage(message: QueuedMessage) {
+  setQueuedMessages([
+    message,
+    ...messagesState.queuedMessages,
+  ]);
+}
+
+export function dequeueQueuedMessage(): QueuedMessage | null {
+  const [next, ...rest] = messagesState.queuedMessages;
+  setQueuedMessages(rest);
+  return next || null;
+}
+
+export function removeQueuedMessage(id: string) {
+  const normalizedId = typeof id === 'string' ? id.trim() : '';
+  if (!normalizedId) {
+    return;
+  }
+  setQueuedMessages(messagesState.queuedMessages.filter((message) => message.id !== normalizedId));
+}
+
+export function markQueuedMessageAsGuide(id: string): boolean {
+  const normalizedId = typeof id === 'string' ? id.trim() : '';
+  if (!normalizedId) {
+    return false;
+  }
+  const index = messagesState.queuedMessages.findIndex((message) => (
+    message.id === normalizedId || message.requestId === normalizedId
+  ));
+  if (index < 0) {
+    return false;
+  }
+  const target = {
+    ...messagesState.queuedMessages[index],
+    mode: 'guide' as const,
+  };
+  setQueuedMessages([
+    target,
+    ...messagesState.queuedMessages.filter((_, itemIndex) => itemIndex !== index),
+  ]);
+  return true;
 }
 
 // 处理状态操作
@@ -2466,8 +3263,22 @@ export function setAppState(nextState: AppState | null) {
 const ANTI_LIFT_BACK_COOLDOWN_MS = 2000;
 
 // Worker 执行状态操作
+function runtimeStateIndicatesProcessing(): boolean {
+  const status = messagesState.orchestratorRuntimeState?.status;
+  return status === 'running' || status === 'waiting' || status === 'paused';
+}
+
+function runtimeStateIsTerminal(runtimeState: OrchestratorRuntimeState | null): boolean {
+  const status = runtimeState?.status;
+  return status === 'idle'
+    || status === 'completed'
+    || status === 'failed'
+    || status === 'cancelled';
+}
+
 function updateProcessingState() {
   const nextIsProcessing = messagesState.backendProcessing
+    || runtimeStateIndicatesProcessing()
     || messagesState.activeMessageIds.size > 0
     || messagesState.pendingRequests.size > 0;
 
@@ -2523,6 +3334,14 @@ export function clearPendingRequest(id: string) {
     const next = new Set(messagesState.pendingRequests);
     next.delete(id);
     messagesState.pendingRequests = next;
+    if (
+      next.size === 0
+      && !messagesState.backendProcessing
+      && !runtimeStateIndicatesProcessing()
+      && messagesState.activeMessageIds.size === 0
+    ) {
+      sealAllStreamingMessages();
+    }
     updateProcessingState();
   }
 }
@@ -2532,7 +3351,20 @@ export function settleProcessingAfterResponseCompletion() {
     return;
   }
   messagesState.backendProcessing = false;
+  if (runtimeStateIndicatesProcessing()) {
+    updateProcessingState();
+    return;
+  }
   messagesState.lastForcedIdleAt = Date.now();
+  updateProcessingState();
+}
+
+export function settleAuthoritativeIdleState() {
+  messagesState.backendProcessing = false;
+  messagesState.pendingRequests = new Set();
+  messagesState.activeMessageIds = new Set();
+  messagesState.thinkingStartAt = null;
+  sealAllStreamingMessages();
   updateProcessingState();
 }
 
@@ -2545,6 +3377,7 @@ export function clearProcessingState(options?: {
   messagesState.backendProcessing = false;
   messagesState.activeMessageIds = new Set();
   messagesState.pendingRequests = new Set();
+  messagesState.orchestratorRuntimeState = null;
   clearAllRetryRuntime();
   if (options?.skipAntiLiftBack) {
     // 会话切换：清除防回抬标记，允许新会话的权威状态正常写入
@@ -3134,15 +3967,36 @@ export function prependTimelineProjectionPage(
   if (incomingProjection.artifacts.length === 0) {
     return false;
   }
+  const retainedCurrentArtifacts = currentProjection.artifacts.filter((artifact) => {
+    if (isLocalUserEchoArtifact(artifact)) {
+      const text = normalizeComparableMessageText(artifact.message);
+      return !projectionHasUserMessageText(incomingProjection, text);
+    }
+    if (isLocalAssistantEchoArtifact(artifact)) {
+      const text = normalizeComparableMessageText(artifact.message);
+      return !projectionHasAssistantMessageText(incomingProjection, text);
+    }
+    if (isSessionTurnAssistantArtifact(artifact)) {
+      const text = normalizeComparableMessageText(artifact.message);
+      return !projectionHasAssistantMessageText(incomingProjection, text);
+    }
+    if (artifact.message?.role === 'assistant') {
+      const text = normalizeComparableMessageText(artifact.message);
+      if (text.length >= 24 && projectionHasAssistantMessageText(incomingProjection, text)) {
+        return false;
+      }
+    }
+    return true;
+  });
   const mergedArtifacts = [
+    ...retainedCurrentArtifacts,
     ...incomingProjection.artifacts,
-    ...currentProjection.artifacts,
   ];
   const artifactById = new Map<string, TimelineProjectionArtifact>();
   for (const artifact of mergedArtifacts) {
     artifactById.set(artifact.artifactId, artifact);
   }
-  setTimelineProjection({
+  const mergedProjection = canonicalizeTimelineProjection({
     ...currentProjection,
     sessionId: normalizedSessionId,
     updatedAt: Math.max(currentProjection.updatedAt, incomingProjection.updatedAt),
@@ -3151,6 +4005,16 @@ export function prependTimelineProjectionPage(
       incomingProjection.lastAppliedEventSeq,
     ),
     artifacts: [...artifactById.values()],
+    threadRenderEntries: [],
+    workerRenderEntries: {},
+  });
+  setTimelineProjection({
+    ...mergedProjection,
+    threadRenderEntries: buildProjectionRenderEntriesFromArtifacts(
+      mergedProjection.artifacts,
+      'thread',
+    ),
+    workerRenderEntries: buildDynamicWorkerRenderEntries(mergedProjection.artifacts),
   }, { source: 'authoritative' });
   return true;
 }
@@ -3251,6 +4115,7 @@ export function initializeState() {
   resetPanelScrollRuntimeState();
   sessionViewStateBySession = {};
   sessionExecutionStateBySession = {};
+  sessionQueuedMessagesBySession = {};
   timelineProjectionSource = 'none';
   const persisted = vscode.getState<WebviewPersistedState>();
   if (persisted) {
@@ -3278,6 +4143,7 @@ export function initializeState() {
     messagesState.currentBottomTab = 'thread';
     replaceTimelineNodes([]);
     sessionViewStateBySession = normalizePersistedSessionViewStateMap(persisted.sessionViewStateBySession);
+    sessionQueuedMessagesBySession = normalizePersistedQueuedMessageMap(persisted.sessionQueuedMessagesBySession);
     const sessionSeen = new Set<string>();
     messagesState.sessions = ensureArray<Session>(persisted.sessions)
       .filter((session) => !!session && typeof session.id === 'string' && session.id.trim().length > 0)
@@ -3297,6 +4163,7 @@ export function initializeState() {
       messagesState.scrollAnchors = normalizePersistedScrollAnchors(persisted.scrollAnchors);
       messagesState.autoScrollEnabled = normalizePersistedAutoScrollConfig(persisted.autoScrollEnabled);
     }
+    restoreQueuedMessagesForSession(messagesState.currentSessionId);
     notificationsBySession = {};
     messagesState.orchestratorRuntimeState = null;
     syncNotificationsFromSession(messagesState.currentSessionId);

@@ -47,7 +47,6 @@ import {
   removeAgentInstructionSkill,
   renameAgentSession,
   resetAgentExecutionStats,
-  resetAgentUserRules,
   saveAgentCurrentSession,
   saveAgentAuxiliaryConfig,
   saveAgentOrchestratorConfig,
@@ -89,6 +88,7 @@ import type {
   SettingsBootstrapPayload,
   SettingsBootstrapSnapshot,
 } from '../settings-bootstrap';
+import type { QueuedMessage, QueuedMessageMode } from '../../types/message';
 import {
   persistStoredBrowserWorkspaceBinding,
   readStoredBrowserWorkspaceBinding,
@@ -96,6 +96,7 @@ import {
 import { buildEmptyWorkspaceAppState } from './empty-workspace-state';
 import {
   normalizeRustBootstrapPayload,
+  parseRustSerializedMessageContent,
   parseRustEventEnvelope,
   readRustTimelinePageMeta,
   type BootstrapPayload,
@@ -113,6 +114,18 @@ import {
   addPendingRequest,
   clearPendingRequest,
   clearRequestBinding,
+  dequeueQueuedMessage,
+  enqueueQueuedMessage,
+  applyTimelineStreamPatch,
+  getState,
+  getTimelineMessageById,
+  hasRunningExecutionContent,
+  listRequestBindings,
+  markMessageActive,
+  markMessageComplete,
+  markQueuedMessageAsGuide,
+  messagesState,
+  prependQueuedMessage,
   setProcessingActor,
 } from '../../stores/messages.svelte';
 import { RustDaemonClient } from '../rust-daemon-client';
@@ -145,11 +158,27 @@ let recoveryAttempt = 0;
 let recoveryTimer: number | null = null;
 let recoveryInFlight: Promise<void> | null = null;
 let rustEventBootstrapRefreshTimer: number | null = null;
+let rustEventBootstrapRefreshNeedsFresh = false;
+let activeTurnReconcileTimer: number | null = null;
+let activeTurnReconcileAttempts = 0;
+let activeTurnReconcileSessionId = '';
+let queuedMessageDrainRunning = false;
+let queuedMessageDrainTimer: number | null = null;
+const rustStreamItemAnchors = new Map<string, { messageId: string; requestId?: string }>();
+const rustLastAssistantStreamBySession = new Map<string, {
+  messageId: string;
+  requestId?: string;
+  content: string;
+}>();
+const rustToolCallAnchors = new Map<string, string>();
+const QUEUED_MESSAGE_DRAIN_RETRY_MS = 250;
 
 const RECOVERY_BASE_DELAY_MS = 1000;
 const RECOVERY_MAX_DELAY_MS = 10_000;
 const EVENT_STREAM_PARSE_ERROR_DEBOUNCE_MS = 5000;
 const EVENT_STREAM_OPEN_TIMEOUT_MS = 4000;
+const ACTIVE_TURN_RECONCILE_INTERVAL_MS = 1200;
+const ACTIVE_TURN_RECONCILE_MAX_ATTEMPTS = 45;
 const SESSION_TIMELINE_PAGE_SIZE = 50;
 const WEBVIEW_STATE_STORAGE_KEY = 'webview-state';
 const WEBVIEW_STATE_WRITE_INTERVAL_MS = 1200;
@@ -707,6 +736,27 @@ function emitMessage(message: ClientBridgeMessage): void {
       console.error('[web-client-bridge] 消息处理错误:', error);
     }
   });
+  maybeScheduleQueuedMessageDrainFromBridgeMessage(message);
+}
+
+function maybeScheduleQueuedMessageDrainFromBridgeMessage(message: ClientBridgeMessage): void {
+  if (message.type !== 'unifiedMessage') {
+    return;
+  }
+  const standard = message.message as StandardMessage | undefined;
+  if (!standard || standard.category !== MessageCategory.DATA) {
+    return;
+  }
+  if (standard.data?.dataType !== 'processingStateChanged') {
+    return;
+  }
+  const payload = standard.data?.payload;
+  if (!payload || typeof payload !== 'object') {
+    return;
+  }
+  if ((payload as { isProcessing?: unknown }).isProcessing === false) {
+    scheduleQueuedMessageDrain('processing_idle');
+  }
 }
 
 function emitDataMessage(dataType: DataMessageType, payload: Record<string, unknown>): void {
@@ -735,16 +785,83 @@ function scheduleBootstrapRefreshFromRustEvent(reason: string, forceFresh = fals
   if (typeof window === 'undefined') {
     return;
   }
+  rustEventBootstrapRefreshNeedsFresh = rustEventBootstrapRefreshNeedsFresh || forceFresh;
   if (rustEventBootstrapRefreshTimer !== null) {
     return;
   }
   rustEventBootstrapRefreshTimer = window.setTimeout(() => {
     rustEventBootstrapRefreshTimer = null;
-    void fetchBootstrap(forceFresh ? { forceFresh: true } : {}).catch((error) => {
+    const shouldForceFresh = rustEventBootstrapRefreshNeedsFresh;
+    rustEventBootstrapRefreshNeedsFresh = false;
+    void fetchBootstrap(shouldForceFresh ? { forceFresh: true } : {}).catch((error) => {
       reportExpectedRecoveryFailure('事件驱动同步', `[web-client-bridge] ${reason} 后 bootstrap 同步失败:`, error);
       scheduleRecovery('rust_event_bootstrap_failed', error, true);
     });
   }, 50);
+}
+
+function hasPendingActiveSessionTurn(): boolean {
+  return messagesState.pendingRequests.size > 0 || messagesState.activeMessageIds.size > 0;
+}
+
+function clearActiveTurnReconciliation(): void {
+  if (activeTurnReconcileTimer !== null) {
+    window.clearTimeout(activeTurnReconcileTimer);
+    activeTurnReconcileTimer = null;
+  }
+  activeTurnReconcileAttempts = 0;
+  activeTurnReconcileSessionId = '';
+}
+
+function scheduleActiveTurnReconciliation(
+  reason: string,
+  options: { reset?: boolean; delayMs?: number } = {},
+): void {
+  if (typeof window === 'undefined' || !currentSessionId) {
+    return;
+  }
+  if (options.reset === true || activeTurnReconcileSessionId !== currentSessionId) {
+    if (activeTurnReconcileTimer !== null) {
+      window.clearTimeout(activeTurnReconcileTimer);
+      activeTurnReconcileTimer = null;
+    }
+    activeTurnReconcileAttempts = 0;
+    activeTurnReconcileSessionId = currentSessionId;
+  }
+  if (!hasPendingActiveSessionTurn() || activeTurnReconcileTimer !== null) {
+    return;
+  }
+  const delayMs = Math.max(50, options.delayMs ?? ACTIVE_TURN_RECONCILE_INTERVAL_MS);
+  activeTurnReconcileTimer = window.setTimeout(() => {
+    activeTurnReconcileTimer = null;
+    void reconcileActiveTurnFromAuthoritativeState(reason);
+  }, delayMs);
+}
+
+async function reconcileActiveTurnFromAuthoritativeState(reason: string): Promise<void> {
+  if (!currentSessionId || activeTurnReconcileSessionId !== currentSessionId) {
+    clearActiveTurnReconciliation();
+    return;
+  }
+  if (!hasPendingActiveSessionTurn()) {
+    clearActiveTurnReconciliation();
+    return;
+  }
+  if (activeTurnReconcileAttempts >= ACTIVE_TURN_RECONCILE_MAX_ATTEMPTS) {
+    clearActiveTurnReconciliation();
+    return;
+  }
+  activeTurnReconcileAttempts += 1;
+  try {
+    await fetchBootstrap({ forceFresh: true });
+  } catch (error) {
+    reportExpectedRecoveryFailure('会话输出同步', `[web-client-bridge] ${reason} 后 turn 同步失败:`, error);
+  }
+  if (hasPendingActiveSessionTurn()) {
+    scheduleActiveTurnReconciliation(reason);
+  } else {
+    clearActiveTurnReconciliation();
+  }
 }
 
 function shouldRefreshFromRustEvent(event: RustEventEnvelope): boolean {
@@ -769,11 +886,503 @@ function shouldRefreshFromRustEvent(event: RustEventEnvelope): boolean {
   return true;
 }
 
+function maybeAdoptPendingSessionFromRustEvent(event: RustEventEnvelope): void {
+  if (currentSessionId || messagesState.pendingRequests.size === 0) {
+    return;
+  }
+  const eventType = trimBridgeString(event.event_type);
+  if (eventType !== 'session.turn.accepted' && eventType !== 'session.turn.task.accepted') {
+    return;
+  }
+  const payload = asBridgeRecord(event.payload);
+  const eventSessionId = trimBridgeString(event.session_id)
+    || trimBridgeString(payload?.session_id)
+    || trimBridgeString(payload?.sessionId);
+  if (!eventSessionId) {
+    return;
+  }
+  const eventWorkspaceId = trimBridgeString(event.workspace_id)
+    || trimBridgeString(payload?.workspace_id)
+    || trimBridgeString(payload?.workspaceId);
+  if (!currentWorkspaceId || !eventWorkspaceId || eventWorkspaceId !== currentWorkspaceId) {
+    return;
+  }
+  persistWorkspaceBinding(currentWorkspaceId, currentWorkspacePath, eventSessionId);
+}
+
+function buildLifecycleFromRustTurnItemStatus(status: string): MessageLifecycle {
+  switch (status) {
+    case 'completed':
+    case 'success':
+      return MessageLifecycle.COMPLETED;
+    case 'failed':
+    case 'error':
+      return MessageLifecycle.FAILED;
+    case 'cancelled':
+    case 'canceled':
+      return MessageLifecycle.CANCELLED;
+    default:
+      return MessageLifecycle.STREAMING;
+  }
+}
+
+function buildRustTurnItemBlocks(rawContent: string): {
+  content: string;
+  blocks: StandardMessage['blocks'];
+} {
+  const parsed = parseRustSerializedMessageContent(rawContent);
+  const blocks = parsed.blocks && parsed.blocks.length > 0
+    ? parsed.blocks
+    : [{ type: 'text', content: parsed.content }];
+  return {
+    content: parsed.content,
+    blocks: blocks as StandardMessage['blocks'],
+  };
+}
+
+function normalizeComparableRustText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function parseRustToolArguments(value: unknown): Record<string, unknown> {
+  if (!value) {
+    return {};
+  }
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== 'string' || !value.trim()) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function mapRustToolStatus(status: string): 'pending' | 'running' | 'success' | 'error' {
+  switch (status) {
+    case 'pending':
+      return 'pending';
+    case 'running':
+      return 'running';
+    case 'failed':
+    case 'error':
+    case 'cancelled':
+    case 'canceled':
+      return 'error';
+    case 'success':
+    case 'completed':
+      return 'success';
+    default:
+      return 'running';
+  }
+}
+
+function buildRustToolCallBlocks(
+  payload: Record<string, unknown>,
+  itemId: string,
+  itemKind: string,
+  status: string,
+  rawContent: string,
+): StandardMessage['blocks'] {
+  const toolCallId = trimBridgeString(payload.tool_call_id)
+    || trimBridgeString(payload.toolCallId)
+    || itemId;
+  const toolName = trimBridgeString(payload.tool_name)
+    || trimBridgeString(payload.toolName)
+    || trimBridgeString(payload.title)
+    || 'tool';
+  const toolStatus = mapRustToolStatus(
+    trimBridgeString(payload.tool_status)
+      || trimBridgeString(payload.toolStatus)
+      || status,
+  );
+  const result = trimBridgeString(payload.tool_result)
+    || trimBridgeString(payload.toolResult)
+    || (itemKind.includes('result') && toolStatus !== 'error' ? rawContent : '');
+  const error = trimBridgeString(payload.tool_error)
+    || trimBridgeString(payload.toolError)
+    || (toolStatus === 'error' ? rawContent : '');
+  const content = trimBridgeString(payload.content) || rawContent || toolName;
+  return [{
+    type: 'tool_call',
+    content,
+    toolCall: {
+      id: toolCallId,
+      name: toolName,
+      arguments: parseRustToolArguments(
+        payload.tool_arguments
+          ?? payload.toolArguments
+          ?? payload.arguments,
+      ),
+      status: toolStatus,
+      result: result || undefined,
+      error: error || undefined,
+    },
+  }] as unknown as StandardMessage['blocks'];
+}
+
+function resolveRustEventSessionId(
+  event: RustEventEnvelope,
+  payload: Record<string, unknown>,
+): string {
+  return trimBridgeString(event.session_id)
+    || trimBridgeString(payload.session_id)
+    || trimBridgeString(payload.sessionId)
+    || currentSessionId;
+}
+
+function resolveLatestPendingAssistantAnchor(): { messageId: string; requestId?: string } | null {
+  const binding = listRequestBindings()
+    .filter((candidate) => {
+      const placeholder = getTimelineMessageById(candidate.placeholderMessageId);
+      return Boolean(placeholder?.isStreaming);
+    })
+    .sort((a, b) => b.createdAt - a.createdAt)[0];
+  if (!binding) {
+    return null;
+  }
+  return {
+    messageId: binding.placeholderMessageId,
+    requestId: binding.requestId,
+  };
+}
+
+function clearRequestForRustAnchor(anchor: { messageId: string; requestId?: string } | null | undefined): void {
+  if (!anchor?.requestId) {
+    return;
+  }
+  clearPendingRequest(anchor.requestId);
+  clearRequestBinding(anchor.requestId);
+}
+
+function resolveRustStreamPatchAnchor(
+  itemId: string,
+  itemKind: string,
+): { messageId: string; requestId?: string } | null {
+  const mapped = rustStreamItemAnchors.get(itemId);
+  if (mapped) {
+    if (getTimelineMessageById(mapped.messageId)) {
+      return mapped;
+    }
+    rustStreamItemAnchors.delete(itemId);
+  }
+
+  // 普通 assistant 回复需要接管“发送后立即显示”的本地占位消息，
+  // 这样计时器、停止按钮和流式正文都绑定在同一条消息上，不再靠 bootstrap 重建。
+  if (itemKind !== 'assistant_stream') {
+    return null;
+  }
+
+  const binding = resolveLatestPendingAssistantAnchor();
+  if (!binding) {
+    return null;
+  }
+
+  const anchor = {
+    messageId: binding.messageId,
+    requestId: binding.requestId,
+  };
+  rustStreamItemAnchors.set(itemId, anchor);
+  return anchor;
+}
+
+function maybePatchRustAssistantPhase(
+  event: RustEventEnvelope,
+  payload: Record<string, unknown>,
+  itemId: string,
+  itemKind: string,
+): boolean {
+  if (itemKind !== 'assistant_phase') {
+    return false;
+  }
+  const anchor = resolveLatestPendingAssistantAnchor();
+  if (!anchor) {
+    return true;
+  }
+  const existing = getTimelineMessageById(anchor.messageId);
+  applyTimelineStreamPatch(anchor.messageId, {
+    isStreaming: true,
+    isComplete: false,
+    metadata: {
+      ...(existing?.metadata || {}),
+      isPlaceholder: true,
+      placeholderState: 'thinking',
+      requestId: anchor.requestId,
+      rustEventType: 'session.turn.item.updated',
+      turnItemKind: itemKind,
+      rustStreamItemId: itemId,
+      sessionId: resolveRustEventSessionId(event, payload),
+    },
+  });
+  markMessageActive(anchor.messageId);
+  return true;
+}
+
+function formatRustSessionTurnFailure(error: string): string {
+  const detail = error.trim();
+  return detail
+    ? `生成失败：${detail}`
+    : '生成失败：后端执行本轮会话时未返回可展示内容，请检查模型配置后重试。';
+}
+
+function settleLatestPendingAssistantFailure(error: string): void {
+  const anchor = resolveLatestPendingAssistantAnchor();
+  if (!anchor) {
+    return;
+  }
+  const existing = getTimelineMessageById(anchor.messageId);
+  if (!existing) {
+    clearRequestForRustAnchor(anchor);
+    return;
+  }
+  const content = formatRustSessionTurnFailure(error);
+  applyTimelineStreamPatch(anchor.messageId, {
+    content,
+    blocks: [{ type: 'text', content }] as unknown as typeof existing.blocks,
+    isStreaming: false,
+    isComplete: true,
+    updatedAt: Date.now(),
+    type: MessageType.ERROR,
+    metadata: {
+      ...(existing.metadata || {}),
+      isPlaceholder: false,
+      wasPlaceholder: true,
+      placeholderState: undefined,
+      requestId: anchor.requestId,
+      sessionTurnFailed: true,
+      error,
+    },
+  });
+  markMessageComplete(anchor.messageId);
+  clearRequestForRustAnchor(anchor);
+  scheduleQueuedMessageDrain('rust_session_turn_failed');
+}
+
+function maybeApplyRustSessionTurnItemEvent(event: RustEventEnvelope, eventType: string): boolean {
+  if (eventType !== 'session.turn.item.updated' && eventType !== 'task.llm.delta') {
+    return false;
+  }
+  const payload = asBridgeRecord(event.payload);
+  if (!payload) {
+    return false;
+  }
+  const itemKind = trimBridgeString(payload.item_kind) || trimBridgeString(payload.itemKind);
+  const supportedKinds = new Set([
+    'assistant_phase',
+    'assistant_stream',
+    'assistant_final',
+    'worker_stream',
+    'tool_call_started',
+    'tool_call_result',
+    'worker_tool_call_started',
+    'worker_tool_call_result',
+  ]);
+  if (!supportedKinds.has(itemKind)) {
+    return false;
+  }
+  const itemId = trimBridgeString(payload.item_id) || trimBridgeString(payload.itemId);
+  const rawContent = typeof payload.content === 'string' ? payload.content : '';
+  if (!itemId) {
+    return false;
+  }
+
+  const status = trimBridgeString(payload.status);
+  const lifecycle = buildLifecycleFromRustTurnItemStatus(status);
+  const isStreaming = lifecycle === MessageLifecycle.STREAMING;
+  const timestamp = typeof event.occurred_at === 'number' && Number.isFinite(event.occurred_at)
+    ? event.occurred_at
+    : Date.now();
+  const eventSeq = typeof event.sequence === 'number' && Number.isFinite(event.sequence)
+    ? event.sequence
+    : undefined;
+  const sessionId = resolveRustEventSessionId(event, payload);
+
+  if (maybePatchRustAssistantPhase(event, payload, itemId, itemKind)) {
+    return true;
+  }
+
+  const isToolItem = itemKind === 'tool_call_started'
+    || itemKind === 'tool_call_result'
+    || itemKind === 'worker_tool_call_started'
+    || itemKind === 'worker_tool_call_result';
+  const { content, blocks } = isToolItem
+    ? {
+      content: rawContent,
+      blocks: buildRustToolCallBlocks(payload, itemId, itemKind, status, rawContent),
+    }
+    : buildRustTurnItemBlocks(rawContent);
+
+  const metadata = {
+    sessionId,
+    eventId: trimBridgeString(event.event_id) || undefined,
+    eventSeq,
+    rustEventType: eventType,
+    turnItemKind: itemKind,
+    rustStreamItemId: itemId,
+    taskId: trimBridgeString(payload.task_id) || trimBridgeString(payload.taskId) || undefined,
+    worker: trimBridgeString(payload.role_id)
+      || trimBridgeString(payload.roleId)
+      || trimBridgeString(payload.worker_id)
+      || trimBridgeString(payload.workerId)
+      || undefined,
+    roleId: trimBridgeString(payload.role_id) || trimBridgeString(payload.roleId) || undefined,
+    laneId: trimBridgeString(payload.lane_id) || trimBridgeString(payload.laneId) || undefined,
+    laneSeq: typeof payload.lane_seq === 'number' ? payload.lane_seq : undefined,
+    timelineAnchorTimestamp: timestamp,
+  };
+  if (itemKind === 'assistant_final') {
+    const lastStream = sessionId ? rustLastAssistantStreamBySession.get(sessionId) : undefined;
+    const finalText = normalizeComparableRustText(content);
+    const streamText = normalizeComparableRustText(lastStream?.content || '');
+    const anchor = (
+      lastStream && finalText && streamText && (finalText === streamText || finalText.includes(streamText) || streamText.includes(finalText))
+        ? { messageId: lastStream.messageId, requestId: lastStream.requestId }
+        : resolveLatestPendingAssistantAnchor()
+    );
+    const existing = anchor?.messageId ? getTimelineMessageById(anchor.messageId) : undefined;
+    if (anchor?.messageId && existing) {
+      applyTimelineStreamPatch(anchor.messageId, {
+        content,
+        blocks: blocks as unknown as typeof existing.blocks,
+        isStreaming: false,
+        isComplete: true,
+        updatedAt: Date.now(),
+        type: 'text',
+        metadata: {
+          ...(existing.metadata || {}),
+          ...metadata,
+          isPlaceholder: false,
+          wasPlaceholder: true,
+          requestId: anchor.requestId,
+        },
+      });
+      markMessageComplete(anchor.messageId);
+      clearRequestForRustAnchor(anchor);
+      if (sessionId) {
+        rustLastAssistantStreamBySession.delete(sessionId);
+      }
+      scheduleBootstrapRefreshFromRustEvent('rust_assistant_final', true);
+      scheduleQueuedMessageDrain('rust_assistant_final');
+      return true;
+    }
+  }
+
+  const toolCallId = trimBridgeString(payload.tool_call_id) || trimBridgeString(payload.toolCallId);
+  const toolAnchorKey = isToolItem && sessionId && toolCallId ? `${sessionId}:${toolCallId}` : '';
+  const streamAnchor = isToolItem
+    ? null
+    : resolveRustStreamPatchAnchor(itemId, itemKind);
+  const toolPatchTargetId = toolAnchorKey && itemKind.includes('result')
+    ? rustToolCallAnchors.get(toolAnchorKey)
+    : undefined;
+  const patchTargetId = streamAnchor?.messageId || itemId;
+  const existing = getTimelineMessageById(toolPatchTargetId || patchTargetId);
+  if (existing) {
+    const nextMetadata = {
+      ...(existing.metadata || {}),
+      ...metadata,
+      ...(streamAnchor ? {
+        isPlaceholder: false,
+        wasPlaceholder: true,
+        requestId: streamAnchor.requestId,
+      } : {}),
+    };
+    const targetId = toolPatchTargetId || patchTargetId;
+    applyTimelineStreamPatch(targetId, {
+      content,
+      blocks: blocks as unknown as typeof existing.blocks,
+      isStreaming,
+      isComplete: !isStreaming,
+      updatedAt: Date.now(),
+      type: 'text',
+      metadata: nextMetadata,
+    });
+    if (isStreaming) {
+      markMessageActive(targetId);
+    } else {
+      markMessageComplete(targetId);
+      clearRequestForRustAnchor(streamAnchor);
+      rustStreamItemAnchors.delete(itemId);
+      if (itemKind === 'assistant_stream' || itemKind === 'assistant_final') {
+        scheduleBootstrapRefreshFromRustEvent('rust_turn_item_completed', true);
+      }
+      scheduleQueuedMessageDrain('rust_stream_completed');
+    }
+    if (itemKind === 'assistant_stream' && sessionId) {
+      rustLastAssistantStreamBySession.set(sessionId, {
+        messageId: targetId,
+        requestId: streamAnchor?.requestId,
+        content,
+      });
+    }
+    return true;
+  }
+
+  const workerAgent = metadata.roleId || metadata.worker || trimBridgeString(payload.source) || 'worker';
+  const standard: StandardMessage = {
+    id: itemId,
+    eventId: trimBridgeString(event.event_id) || undefined,
+    eventSeq,
+    traceId: `rust:${eventType}:${itemId}`,
+    category: MessageCategory.CONTENT,
+    type: MessageType.TEXT,
+    source: itemKind.startsWith('worker_') ? 'worker' : 'orchestrator',
+    agent: itemKind.startsWith('worker_') ? workerAgent : 'orchestrator',
+    lifecycle,
+    blocks,
+    metadata,
+    timestamp,
+    updatedAt: timestamp,
+  };
+  emitMessage({ type: 'unifiedMessage', message: standard });
+  if (isStreaming) {
+    markMessageActive(standard.id);
+  }
+  if (toolAnchorKey && itemKind.includes('started')) {
+    rustToolCallAnchors.set(toolAnchorKey, itemId);
+  }
+  if (!isStreaming) {
+    markMessageComplete(standard.id);
+    if (toolAnchorKey && itemKind.includes('result')) {
+      rustToolCallAnchors.delete(toolAnchorKey);
+    }
+    if (itemKind === 'assistant_stream' || itemKind === 'assistant_final') {
+      scheduleBootstrapRefreshFromRustEvent('rust_turn_item_completed', true);
+      scheduleQueuedMessageDrain('rust_stream_completed');
+    }
+  }
+  if (itemKind === 'assistant_stream' && sessionId) {
+    rustLastAssistantStreamBySession.set(sessionId, {
+      messageId: standard.id,
+      content,
+    });
+  }
+  return true;
+}
+
 function handleRustEventStreamMessage(event: RustEventEnvelope): void {
+  maybeAdoptPendingSessionFromRustEvent(event);
   if (!shouldRefreshFromRustEvent(event)) {
     return;
   }
   const eventType = trimBridgeString(event.event_type);
+  if (maybeApplyRustSessionTurnItemEvent(event, eventType)) {
+    return;
+  }
+  if (eventType === 'session.turn.failed') {
+    const error = trimBridgeString(asBridgeRecord(event.payload)?.error);
+    settleLatestPendingAssistantFailure(error);
+    emitForcedProcessingIdle('session_turn_failed', {
+      error: error || undefined,
+    });
+    return;
+  }
   if (eventType === 'session.turn.task.accepted' && event.payload) {
     const acceptedSessionId = trimBridgeString(event.payload.session_id) || trimBridgeString(event.session_id);
     const acceptedActionTaskId = trimBridgeString(event.payload.action_task_id)
@@ -797,7 +1406,8 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
   scheduleBootstrapRefreshFromRustEvent(
     eventType || 'rust_event',
-    eventType === 'task.interrupt.requested',
+    eventType === 'task.interrupt.requested'
+      || eventType === 'session.turn.item.updated',
   );
 
   // Notify listeners about task-domain SSE events so lightweight stores
@@ -962,17 +1572,24 @@ function resolveWorkspaceQuery(): { workspaceId: string; workspacePath: string; 
     ? (window as unknown as { __INITIAL_SESSION_ID__?: string }).__INITIAL_SESSION_ID__?.trim() || ''
     : '';
   const storedBinding = readStoredBrowserWorkspaceBinding();
-  const workspaceId = currentUrl?.searchParams.get('workspaceId')?.trim()
+  const urlWorkspaceId = currentUrl?.searchParams.get('workspaceId')?.trim() || '';
+  const urlWorkspacePath = currentUrl?.searchParams.get('workspacePath')?.trim() || '';
+  const urlSessionId = currentUrl?.searchParams.get('sessionId')?.trim() || '';
+  const hasExplicitUrlWorkspace = Boolean(urlWorkspaceId || urlWorkspacePath);
+  const workspaceId = urlWorkspaceId
     || currentWorkspaceId
     || injectedBinding.workspaceId
     || storedBinding.workspaceId
     || '';
-  const workspacePath = currentUrl?.searchParams.get('workspacePath')?.trim()
+  const workspacePath = urlWorkspacePath
     || currentWorkspacePath
     || injectedBinding.workspacePath
     || storedBinding.workspacePath
     || '';
-  const sessionId = currentUrl?.searchParams.get('sessionId')?.trim()
+  if (hasExplicitUrlWorkspace && !urlSessionId) {
+    return { workspaceId, workspacePath, sessionId: '' };
+  }
+  const sessionId = urlSessionId
     || currentSessionId
     || injectedSessionId
     || storedBinding.sessionId
@@ -991,6 +1608,9 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
   const normalizedWorkspaceId = workspaceId.trim();
   const normalizedWorkspacePath = workspacePath.trim();
   const incomingSessionId = sessionId.trim();
+  const previousWorkspaceId = currentWorkspaceId;
+  const previousWorkspacePath = currentWorkspacePath;
+  const previousSessionId = currentSessionId;
   const workspaceChanged = (
     (normalizedWorkspaceId && normalizedWorkspaceId !== currentWorkspaceId)
     || (normalizedWorkspacePath && normalizedWorkspacePath !== currentWorkspacePath)
@@ -1005,6 +1625,17 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
     workspacePath: normalizedWorkspacePath,
     sessionId: nextSessionId,
   });
+  if (
+    previousWorkspaceId !== currentWorkspaceId
+    || previousWorkspacePath !== currentWorkspacePath
+    || previousSessionId !== currentSessionId
+  ) {
+    rustStreamItemAnchors.clear();
+    rustLastAssistantStreamBySession.clear();
+    rustToolCallAnchors.clear();
+    clearCurrentInterruptTaskId();
+    clearTaskGraph(currentSessionId || undefined);
+  }
 
   const currentUrl = getCurrentUrl();
   if (!currentUrl) {
@@ -1279,7 +1910,13 @@ async function dispatchBootstrap(
   if (!taskTrackingHints.rootTaskId && taskTrackingHints.activeTaskIds.length === 0) {
     clearTaskGraph(payload.sessionId);
   }
-  emitDataMessage('sessionBootstrapLoaded', payload as unknown as Record<string, unknown>);
+  const pageMeta = readRustTimelinePageMeta(options.rawPayload);
+  emitDataMessage('sessionBootstrapLoaded', {
+    ...payload,
+    hasMoreBefore: pageMeta.hasMoreBefore,
+    beforeCursor: pageMeta.beforeCursor,
+  } as Record<string, unknown>);
+  scheduleQueuedMessageDrain('bootstrap_loaded');
   void ensureEventStream({
     forceReconnect: options.forceEventStreamReconnect === true,
     waitUntilOpen: false,
@@ -1295,6 +1932,15 @@ async function dispatchBootstrap(
       console.warn('[web-client-bridge] Auto-connect task tracking on bootstrap failed (non-critical):', error);
     });
   }
+}
+
+function dispatchWorkspaceSessionCleared(): void {
+  clearCurrentInterruptTaskId();
+  clearTaskGraph();
+  emitDataMessage('workspaceSessionCleared', {
+    workspaceId: currentWorkspaceId,
+    workspacePath: currentWorkspacePath,
+  });
 }
 
 async function fetchBootstrap(
@@ -1340,6 +1986,26 @@ async function fetchBootstrap(
       workspacePath,
       sessionId,
     });
+    if (!sessionId && payload.sessionId) {
+      persistWorkspaceBinding(
+        payload.workspace.workspaceId || workspaceId,
+        payload.workspace.rootPath || workspacePath,
+        '',
+      );
+      dispatchWorkspaceSessionCleared();
+      if (payload.workspace.workspaceId) {
+        void emitKnowledgePayload().catch((error) => {
+          console.warn('[web-client-bridge] 无会话工作区 bootstrap 后项目知识同步失败:', error);
+        });
+      }
+      void ensureEventStream({
+        forceReconnect: options.forceEventStreamReconnect === true,
+        waitUntilOpen: false,
+      }).catch((error) => {
+        reportExpectedRecoveryFailure('事件流连接', '[web-client-bridge] 无会话工作区事件流连接失败:', error);
+      });
+      return;
+    }
     await dispatchBootstrap(payload, { ...options, rawPayload });
   };
   bootstrapInFlight = doFetch().finally(() => {
@@ -1431,6 +2097,12 @@ async function dispatchRegistryAgents(): Promise<void> {
 }
 
 async function dispatchProjectKnowledge(): Promise<void> {
+  const binding = resolveWorkspaceQuery();
+  if (binding.workspaceId || binding.workspacePath) {
+    currentWorkspaceId = binding.workspaceId;
+    currentWorkspacePath = binding.workspacePath;
+    currentSessionId = binding.sessionId;
+  }
   const query = new URLSearchParams();
   if (currentWorkspaceId) {
     query.set('workspaceId', currentWorkspaceId);
@@ -1485,6 +2157,7 @@ async function dispatchSessionSnapshot(
     hasMoreBefore: pageMeta.hasMoreBefore,
     beforeCursor: pageMeta.beforeCursor,
   } as Record<string, unknown>);
+  scheduleQueuedMessageDrain('session_snapshot_loaded');
   void ensureEventStream({
     forceReconnect: options.forceEventStreamReconnect === true,
     waitUntilOpen: false,
@@ -1719,15 +2392,240 @@ export async function autoConnectTaskTracking(
 interface ExecuteTaskInput {
   text?: string | null;
   requestId?: string;
+  optimisticUserMessageId?: string;
+  skipOptimisticUser?: boolean;
   deepTask: boolean;
   skillName?: string | null;
+  followUpMode?: QueuedMessageMode;
   images: Array<{
     name: string;
     dataUrl: string;
   }>;
 }
 
-async function executeTask(input: ExecuteTaskInput): Promise<void> {
+function isExecutionBusyForQueue(): boolean {
+  return messagesState.isProcessing
+    || messagesState.backendProcessing
+    || messagesState.pendingRequests.size > 0
+    || messagesState.activeMessageIds.size > 0
+    || hasRunningExecutionContent();
+}
+
+function normalizeFollowUpMode(value: unknown): QueuedMessageMode | undefined {
+  return value === 'guide' ? 'guide' : value === 'queue' ? 'queue' : undefined;
+}
+
+function buildQueuedMessageContent(
+  normalizedText: string,
+  skillName: string | null,
+  imageCount: number,
+): string {
+  const parts: string[] = [];
+  if (skillName) {
+    parts.push(`/${skillName}`);
+  }
+  if (normalizedText) {
+    parts.push(normalizedText);
+  }
+  if (imageCount > 0) {
+    parts.push(`[图片 ${imageCount} 张]`);
+  }
+  return parts.join('\n') || '新消息';
+}
+
+function isThreadUserMessage(message: unknown): message is { id: string; role: string } {
+  return !!message
+    && typeof message === 'object'
+    && typeof (message as { id?: unknown }).id === 'string'
+    && (message as { id: string }).id.trim().length > 0
+    && (message as { role?: unknown }).role === 'user';
+}
+
+function normalizeQueueComparableText(value: unknown): string {
+  return typeof value === 'string'
+    ? value.trim().replace(/\s+/g, ' ')
+    : '';
+}
+
+function resolveLatestThreadUserMessage(): { id: string; content: string } | undefined {
+  const threadMessages = getState().threadMessages;
+  for (let index = threadMessages.length - 1; index >= 0; index -= 1) {
+    const message = threadMessages[index];
+    if (isThreadUserMessage(message)) {
+      return {
+        id: message.id.trim(),
+        content: normalizeQueueComparableText((message as { content?: unknown }).content),
+      };
+    }
+  }
+  return undefined;
+}
+
+function findThreadUserIndexByQueueBlocker(
+  userMessageId: string | undefined,
+  userContent: string | undefined,
+): number {
+  const normalizedUserMessageId = typeof userMessageId === 'string' ? userMessageId.trim() : '';
+  const normalizedUserContent = normalizeQueueComparableText(userContent);
+  const threadMessages = getState().threadMessages;
+  const userIndexById = normalizedUserMessageId
+    ? threadMessages.findIndex((message) => message.id === normalizedUserMessageId)
+    : -1;
+  if (userIndexById >= 0) {
+    return userIndexById;
+  }
+  if (!normalizedUserContent) {
+    return -1;
+  }
+  for (let index = threadMessages.length - 1; index >= 0; index -= 1) {
+    const message = threadMessages[index];
+    if (!isThreadUserMessage(message)) {
+      continue;
+    }
+    if (normalizeQueueComparableText((message as { content?: unknown }).content) === normalizedUserContent) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function hasCompletedAssistantAfterUserMessage(
+  userMessageId: string | undefined,
+  userContent: string | undefined,
+): boolean {
+  if (!userMessageId && !userContent) {
+    return true;
+  }
+  const threadMessages = getState().threadMessages;
+  const userIndex = findThreadUserIndexByQueueBlocker(userMessageId, userContent);
+  if (userIndex < 0) {
+    return false;
+  }
+  return threadMessages.slice(userIndex + 1).some((message) => (
+    message.role === 'assistant'
+    && message.isComplete === true
+    && message.isStreaming !== true
+  ));
+}
+
+function isQueuedMessageReadyToDrain(queued: QueuedMessage): boolean {
+  if (isExecutionBusyForQueue()) {
+    return false;
+  }
+  return hasCompletedAssistantAfterUserMessage(
+    queued.blockedByUserMessageId,
+    queued.blockedByUserContent,
+  );
+}
+
+function enqueueFollowUpTask(input: ExecuteTaskInput, normalizedText: string, skillName: string | null): void {
+  const mode = input.followUpMode || 'queue';
+  const requestId = typeof input.requestId === 'string' && input.requestId.trim()
+    ? input.requestId.trim()
+    : generateMessageId();
+  const localMessageId = generateMessageId();
+  const blockedByUserMessage = resolveLatestThreadUserMessage();
+  const text = typeof input.text === 'string' ? input.text : null;
+  const queued: QueuedMessage = {
+    id: requestId,
+    requestId,
+    localMessageId,
+    blockedByUserMessageId: blockedByUserMessage?.id,
+    blockedByUserContent: blockedByUserMessage?.content,
+    content: buildQueuedMessageContent(normalizedText, skillName, input.images.length),
+    text,
+    createdAt: Date.now(),
+    mode,
+    deepTask: input.deepTask === true,
+    skillName,
+    images: input.images,
+  };
+  const queuedUserMessage = createUserInputMessage(queued.content, `queued-user-input-${requestId}`, {
+    id: localMessageId,
+    metadata: {
+      requestId,
+      extra: {
+        queued: true,
+        queueMode: mode,
+        queuedAt: queued.createdAt,
+      },
+    },
+  });
+  emitMessage({ type: 'unifiedMessage', message: queuedUserMessage });
+  enqueueQueuedMessage(queued);
+}
+
+function scheduleQueuedMessageDrain(_reason: string, delayMs = 0): void {
+  if (queuedMessageDrainTimer !== null || queuedMessageDrainRunning) {
+    return;
+  }
+  queuedMessageDrainTimer = window.setTimeout(() => {
+    queuedMessageDrainTimer = null;
+    void drainNextQueuedMessage();
+  }, delayMs);
+}
+
+async function drainNextQueuedMessage(): Promise<void> {
+  if (queuedMessageDrainRunning) {
+    return;
+  }
+  if (isExecutionBusyForQueue()) {
+    if (messagesState.queuedMessages.length > 0) {
+      scheduleQueuedMessageDrain('waiting_execution_idle', QUEUED_MESSAGE_DRAIN_RETRY_MS);
+    }
+    return;
+  }
+  const queued = messagesState.queuedMessages[0];
+  if (!queued) {
+    return;
+  }
+  if (!isQueuedMessageReadyToDrain(queued)) {
+    scheduleQueuedMessageDrain('waiting_previous_assistant', QUEUED_MESSAGE_DRAIN_RETRY_MS);
+    return;
+  }
+  const dequeued = dequeueQueuedMessage();
+  if (!dequeued) {
+    return;
+  }
+  queuedMessageDrainRunning = true;
+  let accepted = false;
+  try {
+    const queuedText = typeof dequeued.text === 'string'
+      ? dequeued.text
+      : (dequeued.skillName ? null : dequeued.content);
+    accepted = await executeTask({
+      text: queuedText,
+      requestId: dequeued.requestId || dequeued.id,
+      optimisticUserMessageId: dequeued.localMessageId,
+      skipOptimisticUser: true,
+      deepTask: dequeued.deepTask === true,
+      skillName: dequeued.skillName ?? null,
+      images: dequeued.images || [],
+    });
+  } finally {
+    if (!accepted) {
+      prependQueuedMessage(dequeued);
+    }
+    queuedMessageDrainRunning = false;
+    if (accepted && messagesState.queuedMessages.length > 0 && !isExecutionBusyForQueue()) {
+      scheduleQueuedMessageDrain('queued_message_drained', QUEUED_MESSAGE_DRAIN_RETRY_MS);
+    }
+  }
+}
+
+function guideQueuedMessage(queuedMessageId: string): void {
+  const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
+  if (!normalizedId) {
+    return;
+  }
+  const marked = markQueuedMessageAsGuide(normalizedId);
+  if (!marked) {
+    return;
+  }
+  scheduleQueuedMessageDrain('queued_message_marked_guide', QUEUED_MESSAGE_DRAIN_RETRY_MS);
+}
+
+async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
   const text = typeof input.text === 'string' ? input.text : null;
   const normalizedText = text?.trim() || '';
   const skillName = typeof input.skillName === 'string' && input.skillName.trim()
@@ -1742,26 +2640,31 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
       }))
     : [];
   if (!normalizedText && !skillName && images.length === 0) {
-    return;
+    return false;
+  }
+  if (input.followUpMode && isExecutionBusyForQueue()) {
+    enqueueFollowUpTask({ ...input, images }, normalizedText, skillName);
+    return true;
   }
 
   const requestId = input.requestId || generateMessageId();
-  const userMessageId = generateMessageId();
+  const userMessageId = input.optimisticUserMessageId || generateMessageId();
   const placeholderMessageId = generateMessageId();
 
-  // 乐观显示用户消息
-  const userMsg = createUserInputMessage(normalizedText, `user-input-${requestId}`, {
-    metadata: {
-      requestId,
-      placeholderMessageId,
-      sendingAnimation: true,
-      images: images.length > 0 ? images : undefined,
-    },
-    id: userMessageId,
-  });
-  emitMessage({ type: 'unifiedMessage', message: userMsg });
+  if (!input.skipOptimisticUser) {
+    // 用户发送后必须立即进入消息列表；bridge 预检异步执行，不能阻塞本地反馈。
+    const userMsg = createUserInputMessage(normalizedText, `user-input-${requestId}`, {
+      metadata: {
+        requestId,
+        placeholderMessageId,
+        sendingAnimation: true,
+        images: images.length > 0 ? images : undefined,
+      },
+      id: userMessageId,
+    });
+    emitMessage({ type: 'unifiedMessage', message: userMsg });
+  }
 
-  // 显示 thinking 占位消息
   const placeholderMsg = createStreamingMessage('orchestrator', 'orchestrator', `placeholder-${requestId}`, {
     id: placeholderMessageId,
     type: MessageType.THINKING,
@@ -1779,7 +2682,10 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
 
   try {
     clearCurrentInterruptTaskId();
-    await ensureFreshLiveBridge('execute_task_preflight');
+    void ensureFreshLiveBridge('execute_task_preflight').catch((error) => {
+      reportExpectedRecoveryFailure('execute_task_preflight', '[web-client-bridge] 发送预检失败:', error);
+      scheduleRecovery('execute_task_preflight_failed', error, true);
+    });
     const binding = {
       workspaceId: currentWorkspaceId,
       workspacePath: currentWorkspacePath,
@@ -1807,9 +2713,18 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
       initTaskTracking(resolvedSessionId, rootTaskId);
     }
 
-    await fetchBootstrap({ forceFresh: true });
-    clearPendingRequest(requestId);
-    clearRequestBinding(requestId);
+    if (turnResult.route === 'task' || turnResult.route === 'continue') {
+      markMessageComplete(placeholderMessageId);
+      clearPendingRequest(requestId);
+      clearRequestBinding(requestId);
+      scheduleQueuedMessageDrain('execute_task_finished');
+    } else {
+      scheduleActiveTurnReconciliation('session_turn_submitted', {
+        reset: true,
+        delayMs: ACTIVE_TURN_RECONCILE_INTERVAL_MS,
+      });
+    }
+    return true;
   } catch (error) {
     clearCurrentInterruptTaskId();
     console.error('[web-client-bridge] 执行任务失败:', error);
@@ -1822,6 +2737,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
       closeEventStream();
       scheduleRecovery('execute_task_failed', error, true);
     }
+    return false;
   }
 }
 
@@ -1846,6 +2762,7 @@ async function interruptTask(): Promise<void> {
     ) {
       await fetchBootstrap({ forceFresh: true });
     }
+    scheduleQueuedMessageDrain('interrupt_task_confirmed');
   } catch (error) {
     console.error('[web-client-bridge] 中断任务失败:', error);
     emitBridgeErrorToast('停止任务', error);
@@ -2016,13 +2933,6 @@ async function saveWorkerConfig(worker: string, config: Record<string, unknown>)
 async function saveUserRules(data: Record<string, unknown>): Promise<void> {
   await saveAgentUserRules(data);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('保存用户规则', '用户规则已保存', { displayMode: 'notification_center' });
-}
-
-async function resetUserRules(): Promise<void> {
-  await resetAgentUserRules();
-  await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('重置用户规则', '用户规则已重置');
 }
 
 async function saveOrchestratorConfig(config: Record<string, unknown>): Promise<void> {
@@ -2282,11 +3192,6 @@ export function createWebClientBridge(): ClientBridge {
             });
           }
           return;
-        case 'resetUserRules':
-          void resetUserRules().catch((error) => {
-            logBridgeOperationFailure('重置用户规则', '[web-client-bridge] 重置用户规则失败:', error);
-          });
-          return;
         case 'saveWorkerConfig':
           if (typeof message.worker === 'string' && message.config && typeof message.config === 'object') {
             void saveWorkerConfig(message.worker, message.config as Record<string, unknown>).catch((error) => {
@@ -2487,6 +3392,7 @@ export function createWebClientBridge(): ClientBridge {
               requestId: typeof message.requestId === 'string' ? message.requestId : undefined,
               deepTask: message.deepTask === true,
               skillName: typeof message.skillName === 'string' ? message.skillName : null,
+              followUpMode: normalizeFollowUpMode(message.followUpMode),
               images: Array.isArray(message.images)
                 ? message.images as Array<{ name: string; dataUrl: string }>
                 : [],
@@ -2495,6 +3401,11 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'interruptTask':
           void interruptTask();
+          return;
+        case 'guideQueuedMessage':
+          if (typeof message.queuedMessageId === 'string' && message.queuedMessageId.trim()) {
+            guideQueuedMessage(message.queuedMessageId);
+          }
           return;
         case 'continueTask':
           void continueSessionExecution({
@@ -2546,6 +3457,24 @@ export function createWebClientBridge(): ClientBridge {
         case 'requestExecutionStats':
           void dispatchExecutionStats().catch((error) => {
             logBridgeOperationFailure('执行统计加载', '[web-client-bridge] 执行统计加载失败:', error);
+          });
+          return;
+        case 'workspaceBindingChanged':
+          persistWorkspaceBinding(
+            typeof message.workspaceId === 'string' ? message.workspaceId : '',
+            typeof message.workspacePath === 'string' ? message.workspacePath : '',
+            typeof message.sessionId === 'string' ? message.sessionId : '',
+          );
+          if (typeof message.sessionId !== 'string' || !message.sessionId.trim()) {
+            dispatchWorkspaceSessionCleared();
+          }
+          void emitKnowledgePayload().catch((error) => {
+            logBridgeOperationFailure('项目知识加载', '[web-client-bridge] 工作区切换后项目知识加载失败:', error, {
+              suppressToast: true,
+            });
+          });
+          void ensureEventStream({ forceReconnect: true, waitUntilOpen: false }).catch((error) => {
+            reportExpectedRecoveryFailure('事件流连接', '[web-client-bridge] 工作区切换后事件流连接失败:', error);
           });
           return;
         case 'resetExecutionStats':

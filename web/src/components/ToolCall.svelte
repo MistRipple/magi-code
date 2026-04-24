@@ -47,9 +47,22 @@
     onOpenFile
   }: Props = $props();
 
-  // 折叠状态 - Mermaid 卡片默认展开，其他由 initialExpanded 控制
-  let collapsed = $state(untrack(() => !initialExpanded && status !== 'error' && name !== 'mermaid_diagram'));
+  // 工具执行中默认展开，进入终态后自动折叠，避免完成结果长期占满主线。
+  let collapsed = $state(untrack(() => !(initialExpanded || status === 'running' || status === 'pending')));
+  let previousStatus = $state(untrack(() => status));
   let copySuccess = $state(false);
+
+  $effect(() => {
+    if (status === previousStatus) {
+      return;
+    }
+    if (status === 'running' || status === 'pending') {
+      collapsed = false;
+    } else if (status === 'success' || status === 'error') {
+      collapsed = true;
+    }
+    previousStatus = status;
+  });
 
   interface ParsedToolIdentity {
     source: 'builtin' | 'mcp';
@@ -214,7 +227,7 @@
         return {
           code: data.code as string,
           title: (data.title || '') as string,
-          diagramType: (data.diagramType || '') as string,
+          diagramType: (data.diagramType || data.diagram_type || '') as string,
         };
       }
     } catch {

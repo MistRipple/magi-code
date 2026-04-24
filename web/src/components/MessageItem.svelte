@@ -7,6 +7,7 @@
   import Icon from './Icon.svelte';
   import RetryRuntimeIndicator from './RetryRuntimeIndicator.svelte';
   import ErrorDetailPopover from './ErrorDetailPopover.svelte';
+  import { vscode } from '../lib/vscode-bridge';
   import { i18n } from '../stores/i18n.svelte';
   import { retryRuntimeState } from '../stores/messages.svelte';
   import { getAgentColor } from '../lib/agent-colors';
@@ -57,6 +58,23 @@
   const wasPlaceholder = $derived(Boolean(message.metadata?.wasPlaceholder));
   const sendingAnimation = $derived(Boolean(message.metadata?.sendingAnimation));
   const isSupplementary = $derived(Boolean(message.metadata?.isSupplementary));
+  const queuedExtra = $derived.by(() => {
+    const extra = message.metadata?.extra;
+    return extra && typeof extra === 'object' && !Array.isArray(extra)
+      ? extra as Record<string, unknown>
+      : null;
+  });
+  const isQueuedUserMessage = $derived.by(() => (
+    isUser
+    && queuedExtra?.queued === true
+    && queuedExtra?.queueMode !== 'guide'
+  ));
+  const queuedRequestId = $derived.by(() => (
+    typeof message.metadata?.requestId === 'string' && message.metadata.requestId.trim()
+      ? message.metadata.requestId.trim()
+      : ''
+  ));
+  let guideRequested = $state(false);
 
   // 动态 agent 颜色：为消息左侧色带和流式动画提供颜色
   const agentColorStyle = $derived.by(() => {
@@ -81,7 +99,11 @@
       if (block.type === 'tool_result') return true;
       if (block.type === 'file_change') return true;
       if (block.type === 'plan') return true;
-      if (block.type === 'thinking' && block.thinking?.content && block.thinking.content.trim().length > 0) return true;
+      if (block.type === 'dispatch_group') return true;
+      if (block.type === 'thinking') {
+        const thinkingText = block.thinking?.content || block.content || '';
+        if (thinkingText.trim().length > 0) return true;
+      }
       if (block.type === 'text' && block.content && block.content.trim().length > 0) return true;
     }
     return false;
@@ -261,6 +283,18 @@
     previewImageUrl = '';
   }
 
+  function guideQueuedMessage() {
+    if (!queuedRequestId || guideRequested) {
+      return;
+    }
+    guideRequested = true;
+    vscode.postMessage({
+      type: 'guideQueuedMessage',
+      queuedMessageId: queuedRequestId,
+      localMessageId: message.id,
+    });
+  }
+
 </script>
 
 <!-- 系统通知消息：居中显示（必须有实际文本内容才渲染） -->
@@ -287,8 +321,24 @@
         {/each}
       </div>
     {/if}
-    <div class="user-content">
-      <MarkdownContent content={message.content || ''} isStreaming={false} />
+    <div class="user-row">
+      <div class="user-content">
+        <MarkdownContent content={message.content || ''} isStreaming={false} />
+      </div>
+      {#if isQueuedUserMessage}
+        <div class="queued-user-actions" aria-label={i18n.t('messageItem.queuedActions')}>
+          <button
+            type="button"
+            class="queued-user-action guide"
+            onclick={guideQueuedMessage}
+            disabled={guideRequested}
+            title={i18n.t('messageItem.guideQueuedTitle')}
+          >
+            <Icon name="send" size={12} />
+            <span>{i18n.t('messageItem.guideQueued')}</span>
+          </button>
+        </div>
+      {/if}
     </div>
     <div class="user-time">
       {#if isSupplementary}<span class="supplementary-tag">{i18n.t('messageItem.supplementaryTag')}</span>{/if}
@@ -445,6 +495,15 @@
     margin-left: auto;
     max-width: 85%;
   }
+
+  .user-row {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-2);
+    max-width: 100%;
+  }
+
   .user-content {
     background: var(--primary);
     color: white;
@@ -453,6 +512,60 @@
     font-size: var(--text-base);
     line-height: var(--leading-relaxed);
     word-wrap: break-word;
+    min-width: 0;
+  }
+
+  .queued-user-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    opacity: 0;
+    transform: translateX(4px);
+    pointer-events: none;
+    transition: opacity 120ms ease, transform 120ms ease;
+  }
+
+  .message-item.user:hover .queued-user-actions,
+  .message-item.user:focus-within .queued-user-actions {
+    opacity: 1;
+    transform: translateX(0);
+    pointer-events: auto;
+  }
+
+  .queued-user-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 28px;
+    padding: 0 9px;
+    border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+    border-radius: var(--radius-full);
+    background: color-mix(in srgb, var(--surface-1) 90%, transparent);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    line-height: 1;
+    cursor: pointer;
+    box-shadow: var(--shadow-sm);
+    transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+  }
+
+  .queued-user-action:hover:not(:disabled) {
+    color: var(--primary);
+    border-color: color-mix(in srgb, var(--primary) 50%, transparent);
+    background: color-mix(in srgb, var(--primary) 10%, var(--surface-1));
+  }
+
+  .queued-user-action:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+
+  @media (hover: none) {
+    .queued-user-actions {
+      opacity: 1;
+      transform: none;
+      pointer-events: auto;
+    }
   }
   .user-content :global(.markdown-content) {
     color: inherit;

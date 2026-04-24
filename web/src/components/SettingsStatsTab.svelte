@@ -77,7 +77,8 @@ import { getAgentColor } from '../lib/agent-colors';
           {@const workerStats = getWorkerStats(worker)}
           {@const statusClass = getStatusClass(status?.status || 'checking')}
           {@const agentColorPair = getAgentColor(worker)}
-          {@const modelLabel = status?.model
+          {@const modelLabel = workerStats?.resolvedModel
+            || status?.model
             || (status?.status === 'not_configured'
               ? i18n.t('settings.stats.notConfigured')
               : status?.status === 'disabled'

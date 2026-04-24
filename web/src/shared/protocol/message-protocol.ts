@@ -121,6 +121,7 @@ export type DataMessageType =
   | 'workerQuestionRequest'
   | 'workerSessionCreated'
   | 'workerSessionResumed'
+  | 'workspaceSessionCleared'
   | 'executionChainInterrupted'
   | 'messageCreated';
 
@@ -202,6 +203,7 @@ export interface ToolResultBlock {
   type: 'tool_result';
   toolCallId: string;
   content: string;
+  input?: string;
   isError?: boolean;
   standardized?: StandardizedToolResultPayload;
   fileChange?: {

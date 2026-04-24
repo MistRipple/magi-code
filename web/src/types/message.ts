@@ -682,10 +682,26 @@ export interface Session {
   };
 }
 
+export type QueuedMessageMode = 'queue' | 'guide';
+
+export interface QueuedMessageImage {
+  name: string;
+  dataUrl: string;
+}
+
 export interface QueuedMessage {
   id: string;
+  requestId?: string;
+  localMessageId?: string;
+  blockedByUserMessageId?: string;
+  blockedByUserContent?: string;
   content: string;
+  text?: string | null;
   createdAt: number;
+  mode?: QueuedMessageMode;
+  deepTask?: boolean;
+  skillName?: string | null;
+  images?: QueuedMessageImage[];
 }
 
 // 处理中的 Actor
@@ -925,6 +941,7 @@ export interface WebviewPersistedState {
   scrollAnchors?: ScrollAnchors;
   autoScrollEnabled?: AutoScrollConfig;
   sessionViewStateBySession?: Record<string, PersistedSessionViewState>;
+  sessionQueuedMessagesBySession?: Record<string, QueuedMessage[]>;
 }
 
 export interface PersistedSessionViewState {
