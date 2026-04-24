@@ -19,11 +19,7 @@
   interface ADR {
     id: string;
     title: string;
-    status?: string;
-    date?: string;
-    context?: string;
-    decision?: string;
-    consequences?: string;
+    content?: string;
     tags?: string[];
   }
 
@@ -31,7 +27,6 @@
     id: string;
     question: string;
     answer?: string;
-    category?: string;
     tags?: string[];
   }
 
@@ -55,29 +50,47 @@
   let faqs = $state<FAQ[]>([]);
   let learnings = $state<Learning[]>([]);
   let searchQuery = $state('');
-  let adrFilter = $state<'all' | 'proposed' | 'accepted' | 'archived' | 'superseded'>('all');
+  type EditableKnowledgeKind = 'adr' | 'faq' | 'learning';
+
   let expandedAdrId = $state<string | null>(null);
   let expandedFaqId = $state<string | null>(null);
   let expandedLearningId = $state<string | null>(null);
   let showClearConfirm = $state(false);
+  let editorKind = $state<EditableKnowledgeKind | null>(null);
+  let editorId = $state<string | null>(null);
+  let formTitle = $state('');
+  let formContent = $state('');
+  let formContext = $state('');
+  let formTags = $state('');
+  let formError = $state('');
+  let isSaving = $state(false);
 
   // 统计信息
-  const fileCount = $derived(codeIndex?.files?.length || 0);
+  const normalizedCodeIndex = $derived(codeIndex
+    ? {
+        ...codeIndex,
+        files: ensureArray(codeIndex.files) as NonNullable<CodeIndex['files']>,
+        techStack: ensureArray(codeIndex.techStack) as string[],
+        entryPoints: ensureArray(codeIndex.entryPoints) as string[]
+      }
+    : null
+  );
+  const fileCount = $derived(normalizedCodeIndex?.files.length || 0);
   const totalLines = $derived(
-    codeIndex?.files?.reduce((sum, f) => sum + (f.lines || 0), 0) || 0
+    normalizedCodeIndex?.files.reduce((sum, f) => sum + (Number(f.lines) || 0), 0) || 0
+  );
+  const hasKnowledgeContent = $derived(
+    fileCount > 0 || adrs.length > 0 || faqs.length > 0 || learnings.length > 0
   );
 
   // 过滤后的 ADR 列表（安全过滤，跳过无效数据）
   const filteredAdrs = $derived.by(() => {
     let result = adrs.filter(adr => adr.title && typeof adr.title === 'string');
-    if (adrFilter !== 'all') {
-      result = result.filter(adr => adr.status === adrFilter);
-    }
     if (searchQuery.trim()) {
       const query = searchQuery.toLowerCase();
       result = result.filter(adr =>
         adr.title.toLowerCase().includes(query) ||
-        adr.context?.toLowerCase().includes(query) ||
+        adr.content?.toLowerCase().includes(query) ||
         adr.tags?.some(t => t.toLowerCase().includes(query))
       );
     }
@@ -113,6 +126,149 @@
     expandedAdrId = null;
     expandedFaqId = null;
     expandedLearningId = null;
+    closeEditor();
+  }
+
+  function splitTags(value: string): string[] {
+    const tags: string[] = [];
+    for (const raw of value.split(',')) {
+      const tag = raw.trim();
+      if (tag && !tags.includes(tag)) {
+        tags.push(tag);
+      }
+      if (tags.length >= 8) break;
+    }
+    return tags;
+  }
+
+  function joinTags(tags?: string[]): string {
+    return ensureArray(tags).join(', ');
+  }
+
+  function closeEditor() {
+    editorKind = null;
+    editorId = null;
+    formTitle = '';
+    formContent = '';
+    formContext = '';
+    formTags = '';
+    formError = '';
+    isSaving = false;
+  }
+
+  function openCreateEditor(kind: EditableKnowledgeKind) {
+    editorKind = kind;
+    editorId = null;
+    formTitle = '';
+    formContent = '';
+    formContext = '';
+    formTags = '';
+    formError = '';
+  }
+
+  function editAdr(adr: ADR, e: Event) {
+    e.stopPropagation();
+    editorKind = 'adr';
+    editorId = adr.id;
+    formTitle = adr.title || '';
+    formContent = adr.content || '';
+    formContext = '';
+    formTags = joinTags(adr.tags);
+    formError = '';
+  }
+
+  function editFaq(faq: FAQ, e: Event) {
+    e.stopPropagation();
+    editorKind = 'faq';
+    editorId = faq.id;
+    formTitle = faq.question || '';
+    formContent = faq.answer || '';
+    formContext = '';
+    formTags = joinTags(faq.tags);
+    formError = '';
+  }
+
+  function editLearning(learning: Learning, e: Event) {
+    e.stopPropagation();
+    editorKind = 'learning';
+    editorId = learning.id;
+    formTitle = '';
+    formContent = learning.content || '';
+    formContext = learning.context || '';
+    formTags = joinTags(learning.tags);
+    formError = '';
+  }
+
+  function editorTitle(): string {
+    if (editorKind === 'adr') return editorId ? i18n.t('knowledge.adr.editTitle') : i18n.t('knowledge.adr.addTitle');
+    if (editorKind === 'faq') return editorId ? i18n.t('knowledge.faq.editTitle') : i18n.t('knowledge.faq.addTitle');
+    if (editorKind === 'learning') return editorId ? i18n.t('knowledge.learning.editTitle') : i18n.t('knowledge.learning.addTitle');
+    return '';
+  }
+
+  async function postKnowledgeMutation(path: string, body: Record<string, unknown>) {
+    const response = await fetch(`${resolveAgentBaseUrl()}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      const message = typeof payload?.message === 'string' ? payload.message : `${response.status}`;
+      throw new Error(message);
+    }
+  }
+
+  async function saveEditor() {
+    if (!editorKind || isSaving) return;
+    const title = formTitle.trim();
+    const content = formContent.trim();
+    const context = formContext.trim();
+    const tags = splitTags(formTags);
+
+    if ((editorKind === 'adr' || editorKind === 'faq') && !title) {
+      formError = i18n.t('knowledge.form.titleRequired');
+      return;
+    }
+    if (!content) {
+      formError = i18n.t('knowledge.form.contentRequired');
+      return;
+    }
+    if (editorKind === 'learning' && content.length < 12) {
+      formError = i18n.t('knowledge.form.learningTooShort');
+      return;
+    }
+
+    isSaving = true;
+    formError = '';
+    try {
+      if (editorKind === 'adr') {
+        if (isWebMode) {
+          await postKnowledgeMutation(editorId ? '/api/knowledge/adr/update' : '/api/knowledge/adr/add', editorId ? { id: editorId, updates: { title, content, tags } } : { adr: { title, content, tags } });
+        } else {
+          vscode.postMessage(editorId ? { type: 'updateADR', id: editorId, updates: { title, content, tags } } : { type: 'addADR', adr: { title, content, tags } });
+        }
+      } else if (editorKind === 'faq') {
+        if (isWebMode) {
+          await postKnowledgeMutation(editorId ? '/api/knowledge/faq/update' : '/api/knowledge/faq/add', editorId ? { id: editorId, updates: { title, content, tags } } : { faq: { title, content, tags } });
+        } else {
+          vscode.postMessage(editorId ? { type: 'updateFAQ', id: editorId, updates: { title, content, tags } } : { type: 'addFAQ', faq: { title, content, tags } });
+        }
+      } else {
+        const learning = { content, context, tags };
+        if (isWebMode) {
+          await postKnowledgeMutation(editorId ? '/api/knowledge/learning/update' : '/api/knowledge/learning/add', editorId ? { id: editorId, updates: { content, sourceRef: context, tags } } : { learning });
+        } else {
+          vscode.postMessage(editorId ? { type: 'updateLearning', id: editorId, updates: { content, sourceRef: context, tags } } : { type: 'addLearning', learning });
+        }
+      }
+      closeEditor();
+      refresh();
+    } catch (error) {
+      formError = error instanceof Error ? error.message : i18n.t('knowledge.form.saveFailed');
+    } finally {
+      isSaving = false;
+    }
   }
 
   async function fetchKnowledgeViaApi() {
@@ -138,7 +294,14 @@
       createdAt: l.createdAt,
       tags: ensureArray(l.tags)
     }));
-    codeIndex = res?.codeIndex || null;
+    codeIndex = res?.codeIndex
+      ? {
+          ...res.codeIndex,
+          files: ensureArray(res.codeIndex.files) as NonNullable<CodeIndex['files']>,
+          techStack: ensureArray(res.codeIndex.techStack) as string[],
+          entryPoints: ensureArray(res.codeIndex.entryPoints) as string[]
+        }
+      : null;
     isLoading = false;
   }
 
@@ -217,17 +380,6 @@
     }
   }
 
-  // ADR 状态的显示文本
-  function statusLabel(status?: string): string {
-    const map: Record<string, string> = {
-      proposed: i18n.t('knowledge.adr.statusProposed'),
-      accepted: i18n.t('knowledge.adr.statusAccepted'),
-      archived: i18n.t('knowledge.adr.statusArchived'),
-      superseded: i18n.t('knowledge.adr.statusSuperseded'),
-    };
-    return status ? (map[status] || status) : '';
-  }
-
   $effect(() => {
     if (!isKnowledgeActive || hasRequestedKnowledge) {
       return;
@@ -253,9 +405,9 @@
       codeIndex = payload?.codeIndex
         ? {
             ...payload.codeIndex,
-            files: ensureArray(payload.codeIndex.files),
-            techStack: ensureArray(payload.codeIndex.techStack),
-            entryPoints: ensureArray(payload.codeIndex.entryPoints)
+            files: ensureArray(payload.codeIndex.files) as NonNullable<CodeIndex['files']>,
+            techStack: ensureArray(payload.codeIndex.techStack) as string[],
+            entryPoints: ensureArray(payload.codeIndex.entryPoints) as string[]
           }
         : null;
       adrs = ensureArray(payload?.adrs).map((a: any) => ({
@@ -319,7 +471,7 @@
       <button
         class="kp-icon-btn kp-icon-btn--danger"
         onclick={confirmClear}
-        disabled={isLoading || (adrs.length === 0 && faqs.length === 0 && learnings.length === 0)}
+        disabled={isLoading || !hasKnowledgeContent}
         title={i18n.t('knowledge.actions.clearTitle')}
       >
         <Icon name="delete" size={14} />
@@ -342,6 +494,43 @@
           <Icon name="close" size={12} />
         </button>
       {/if}
+      <button class="kp-add-btn" onclick={() => openCreateEditor(currentTab as EditableKnowledgeKind)}>
+        <Icon name="plus" size={12} />
+        <span>{i18n.t('knowledge.actions.add')}</span>
+      </button>
+    </div>
+  {/if}
+
+  {#if editorKind}
+    <div class="kp-editor-card">
+      <div class="kp-editor-title">{editorTitle()}</div>
+      {#if editorKind !== 'learning'}
+        <label class="kp-editor-field">
+          <span>{editorKind === 'faq' ? i18n.t('knowledge.form.question') : i18n.t('knowledge.form.title')}</span>
+          <input class="kp-editor-input" bind:value={formTitle} />
+        </label>
+      {/if}
+      <label class="kp-editor-field">
+        <span>{editorKind === 'faq' ? i18n.t('knowledge.form.answer') : i18n.t('knowledge.form.content')}</span>
+        <textarea class="kp-editor-textarea" bind:value={formContent} rows="4"></textarea>
+      </label>
+      {#if editorKind === 'learning'}
+        <label class="kp-editor-field">
+          <span>{i18n.t('knowledge.form.context')}</span>
+          <input class="kp-editor-input" bind:value={formContext} />
+        </label>
+      {/if}
+      <label class="kp-editor-field">
+        <span>{i18n.t('knowledge.form.tags')}</span>
+        <input class="kp-editor-input" bind:value={formTags} placeholder={i18n.t('knowledge.form.tagsPlaceholder')} />
+      </label>
+      {#if formError}
+        <div class="kp-editor-error">{formError}</div>
+      {/if}
+      <div class="kp-editor-actions">
+        <button class="kp-editor-btn" onclick={closeEditor} disabled={isSaving}>{i18n.t('knowledge.actions.cancel')}</button>
+        <button class="kp-editor-btn kp-editor-btn--primary" onclick={saveEditor} disabled={isSaving}>{i18n.t('knowledge.actions.save')}</button>
+      </div>
     </div>
   {/if}
 
@@ -354,7 +543,7 @@
         </div>
         <div class="kp-confirm-title">{i18n.t('knowledge.confirm.title')}</div>
         <p class="kp-confirm-desc">
-          {i18n.t('knowledge.confirm.desc', { adrCount: adrs.length, faqCount: faqs.length })}
+          {i18n.t('knowledge.confirm.desc', { fileCount, adrCount: adrs.length, faqCount: faqs.length, learningCount: learnings.length })}
         </p>
         <div class="kp-confirm-actions">
           <button class="kp-confirm-btn kp-confirm-btn--cancel" onclick={cancelClear}>{i18n.t('knowledge.confirm.cancel')}</button>
@@ -402,28 +591,28 @@
           </div>
         </div>
 
-        {#if codeIndex?.techStack && codeIndex.techStack.length > 0}
+        {#if normalizedCodeIndex?.techStack && normalizedCodeIndex.techStack.length > 0}
           <div class="kp-section">
             <h4 class="kp-section-title">
               <Icon name="code" size={13} />
               <span>{i18n.t('knowledge.overview.techStack')}</span>
             </h4>
             <div class="kp-tech-grid">
-              {#each codeIndex.techStack as tech}
+              {#each normalizedCodeIndex.techStack as tech}
                 <span class="kp-tech-badge">{tech}</span>
               {/each}
             </div>
           </div>
         {/if}
 
-        {#if codeIndex?.entryPoints && codeIndex.entryPoints.length > 0}
+        {#if normalizedCodeIndex?.entryPoints && normalizedCodeIndex.entryPoints.length > 0}
           <div class="kp-section">
             <h4 class="kp-section-title">
               <Icon name="target" size={13} />
               <span>{i18n.t('knowledge.overview.entryPoints')}</span>
             </h4>
             <div class="kp-entry-list">
-              {#each codeIndex.entryPoints as entry}
+              {#each normalizedCodeIndex.entryPoints as entry}
                 <div class="kp-entry-item">
                   <Icon name="file-text" size={12} />
                   <span>{entry}</span>
@@ -443,11 +632,8 @@
             </h4>
             {#each adrs.slice(0, 3) as adr (adr.id)}
               <div class="kp-preview-item">
-                <span class="kp-preview-dot {adr.status || 'default'}"></span>
+                <span class="kp-preview-dot default"></span>
                 <span class="kp-preview-text">{adr.title}</span>
-                {#if adr.status}
-                  <span class="kp-preview-status">{statusLabel(adr.status)}</span>
-                {/if}
               </div>
             {/each}
           </div>
@@ -456,11 +642,6 @@
 
     {:else if currentTab === 'adr'}
       <!-- ADR Tab -->
-      <div class="kp-filter-bar">
-        {#each [['all', i18n.t('knowledge.adr.filterAll')], ['proposed', i18n.t('knowledge.adr.statusProposed')], ['accepted', i18n.t('knowledge.adr.statusAccepted')], ['archived', i18n.t('knowledge.adr.statusArchived')], ['superseded', i18n.t('knowledge.adr.statusSuperseded')]] as [value, label]}
-          <button class="kp-filter-chip" class:active={adrFilter === value} onclick={() => adrFilter = value as any}>{label}</button>
-        {/each}
-      </div>
       <div class="kp-list">
         {#if filteredAdrs.length === 0}
           <div class="kp-empty">
@@ -473,17 +654,17 @@
             {@const isExpanded = expandedAdrId === adr.id}
             <div class="kp-card" class:expanded={isExpanded}>
               <div class="kp-card-header" role="button" tabindex="0" onclick={() => toggleAdr(adr)} onkeydown={(e) => e.key === 'Enter' && toggleAdr(adr)}>
-                <span class="kp-card-indicator {adr.status || 'default'}"></span>
+                <span class="kp-card-indicator default"></span>
                 <div class="kp-card-main">
                   <span class="kp-card-title">{adr.title}</span>
-                  {#if !isExpanded && adr.context}
-                    <p class="kp-card-preview">{adr.context}</p>
+                  {#if !isExpanded && adr.content}
+                    <p class="kp-card-preview">{adr.content}</p>
                   {/if}
                 </div>
                 <div class="kp-card-meta">
-                  {#if adr.status}
-                    <span class="kp-status-badge {adr.status}">{statusLabel(adr.status)}</span>
-                  {/if}
+                  <button class="kp-card-action" title={i18n.t('knowledge.actions.edit')} onclick={(e) => editAdr(adr, e)}>
+                    <Icon name="edit" size={12} />
+                  </button>
                   <button class="kp-card-delete" title={i18n.t('knowledge.adr.deleteTitle')} onclick={(e) => deleteAdr(adr.id, e)}>
                     <Icon name="trash" size={12} />
                   </button>
@@ -492,28 +673,9 @@
               </div>
               {#if isExpanded}
                 <div class="kp-card-body">
-                  {#if adr.date}
-                    <div class="kp-detail-meta">
-                      <Icon name="clock" size={12} />
-                      <span>{adr.date}</span>
-                    </div>
-                  {/if}
-                  {#if adr.context}
+                  {#if adr.content}
                     <div class="kp-detail-block">
-                      <h5>{i18n.t('knowledge.adr.context')}</h5>
-                      <p>{adr.context}</p>
-                    </div>
-                  {/if}
-                  {#if adr.decision}
-                    <div class="kp-detail-block">
-                      <h5>{i18n.t('knowledge.adr.decision')}</h5>
-                      <p>{adr.decision}</p>
-                    </div>
-                  {/if}
-                  {#if adr.consequences}
-                    <div class="kp-detail-block">
-                      <h5>{i18n.t('knowledge.adr.consequences')}</h5>
-                      <p>{adr.consequences}</p>
+                      <p>{adr.content}</p>
                     </div>
                   {/if}
                   {#if adr.tags && adr.tags.length > 0}
@@ -552,9 +714,9 @@
                   {/if}
                 </div>
                 <div class="kp-card-meta">
-                  {#if faq.category}
-                    <span class="kp-category-badge">{faq.category}</span>
-                  {/if}
+                  <button class="kp-card-action" title={i18n.t('knowledge.actions.edit')} onclick={(e) => editFaq(faq, e)}>
+                    <Icon name="edit" size={12} />
+                  </button>
                   <button class="kp-card-delete" title={i18n.t('knowledge.faq.deleteTitle')} onclick={(e) => deleteFaq(faq.id, e)}>
                     <Icon name="trash" size={12} />
                   </button>
@@ -607,6 +769,9 @@
                   {#if learning.createdAt}
                     <span class="kp-category-badge">{new Date(learning.createdAt).toLocaleDateString()}</span>
                   {/if}
+                  <button class="kp-card-action" title={i18n.t('knowledge.actions.edit')} onclick={(e) => editLearning(learning, e)}>
+                    <Icon name="edit" size={12} />
+                  </button>
                   <button class="kp-card-delete" title={i18n.t('knowledge.learning.deleteTitle')} onclick={(e) => deleteLearning(learning.id, e)}>
                     <Icon name="trash" size={12} />
                   </button>
@@ -805,6 +970,105 @@
     color: var(--foreground);
   }
 
+  .kp-add-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: 3px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
+    background: var(--surface-1);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+  }
+
+  .kp-add-btn:hover {
+    background: var(--surface-hover);
+    color: var(--foreground);
+    border-color: var(--foreground-muted);
+  }
+
+  .kp-editor-card {
+    margin: 0 var(--space-3) var(--space-3);
+    padding: var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface-1);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .kp-editor-title {
+    font-size: var(--text-sm);
+    font-weight: var(--font-semibold);
+    color: var(--foreground);
+  }
+
+  .kp-editor-field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+  }
+
+  .kp-editor-input,
+  .kp-editor-textarea {
+    width: 100%;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    color: var(--foreground);
+    font-size: var(--text-sm);
+    padding: 6px 8px;
+    outline: none;
+  }
+
+  .kp-editor-textarea {
+    resize: vertical;
+    min-height: 86px;
+  }
+
+  .kp-editor-input:focus,
+  .kp-editor-textarea:focus {
+    border-color: var(--primary);
+  }
+
+  .kp-editor-error {
+    color: var(--error);
+    font-size: var(--text-xs);
+  }
+
+  .kp-editor-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+  }
+
+  .kp-editor-btn {
+    padding: 5px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+
+  .kp-editor-btn--primary {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: white;
+  }
+
+  .kp-editor-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
 
   /* ---- 主内容区 ---- */
   .kp-content {
@@ -959,10 +1223,6 @@
     flex-shrink: 0;
   }
 
-  .kp-preview-dot.proposed { background: var(--info); }
-  .kp-preview-dot.accepted { background: var(--success); }
-  .kp-preview-dot.archived { background: var(--foreground-muted); }
-  .kp-preview-dot.superseded { background: var(--warning); }
   .kp-preview-dot.default { background: var(--foreground-muted); opacity: 0.4; }
 
   .kp-preview-text {
@@ -972,42 +1232,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  .kp-preview-status {
-    font-size: var(--text-2xs);
-    color: var(--foreground-muted);
-    flex-shrink: 0;
-  }
-
-  /* ---- 过滤栏 ---- */
-  .kp-filter-bar {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-1);
-    margin-bottom: var(--space-3);
-  }
-
-  .kp-filter-chip {
-    padding: 2px 10px;
-    font-size: var(--text-xs);
-    background: transparent;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-full);
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: all var(--transition-fast);
-  }
-
-  .kp-filter-chip:hover {
-    background: var(--surface-hover);
-    color: var(--foreground);
-  }
-
-  .kp-filter-chip.active {
-    background: var(--primary);
-    border-color: var(--primary);
-    color: white;
   }
 
   /* ---- 列表 ---- */
@@ -1072,7 +1296,8 @@
     color: inherit;
   }
 
-  .kp-card-header:hover .kp-card-delete {
+  .kp-card-header:hover .kp-card-delete,
+  .kp-card-header:hover .kp-card-action {
     opacity: 1;
   }
 
@@ -1084,10 +1309,6 @@
     margin-top: 2px;
   }
 
-  .kp-card-indicator.proposed { background: var(--info); }
-  .kp-card-indicator.accepted { background: var(--success); }
-  .kp-card-indicator.archived { background: var(--foreground-muted); }
-  .kp-card-indicator.superseded { background: var(--warning); }
   .kp-card-indicator.default { background: var(--border); }
   .kp-card-indicator.faq { background: var(--color-gemini); }
   .kp-card-indicator.learning { background: var(--warning); }
@@ -1124,7 +1345,8 @@
     color: var(--foreground-muted);
   }
 
-  .kp-card-delete {
+  .kp-card-delete,
+  .kp-card-action {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -1141,6 +1363,11 @@
     transition: all var(--transition-fast);
   }
 
+  .kp-card-action:hover {
+    background: var(--surface-hover);
+    color: var(--foreground);
+  }
+
   .kp-card-delete:hover {
     background: var(--error-muted);
     color: var(--error);
@@ -1150,15 +1377,6 @@
   .kp-card-body {
     padding: 0 var(--space-3) var(--space-3) calc(var(--space-3) + 3px + var(--space-2));
     border-top: 1px solid var(--border);
-  }
-
-  .kp-detail-meta {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    padding: var(--space-2) 0;
   }
 
   .kp-detail-block {
@@ -1199,19 +1417,7 @@
     color: var(--foreground-muted);
   }
 
-  /* ---- 状态/分类徽章 ---- */
-  .kp-status-badge {
-    font-size: 10px;
-    padding: 1px 6px;
-    border-radius: var(--radius-sm);
-    white-space: nowrap;
-  }
-
-  .kp-status-badge.proposed { background: var(--info-muted); color: var(--info); }
-  .kp-status-badge.accepted { background: var(--success-muted); color: var(--success); }
-  .kp-status-badge.archived { background: var(--surface-3); color: var(--foreground-muted); }
-  .kp-status-badge.superseded { background: var(--warning-muted); color: var(--warning); }
-
+  /* ---- 分类徽章 ---- */
   .kp-category-badge {
     font-size: 10px;
     padding: 1px 6px;
