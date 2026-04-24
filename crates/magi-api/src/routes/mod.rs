@@ -310,31 +310,6 @@ fn resolve_dispatch_session(
             resolve_session_workspace_binding(state, &session, requested_workspace_id.as_ref())?;
         return Ok((session_id, false, workspace_id));
     }
-    if let Some(current_session) = state.session_store.current_session() {
-        let current_workspace_id =
-            resolve_session_workspace_binding(state, &current_session, None)?;
-        if let (Some(requested_workspace_id), Some(bound_workspace_id)) = (
-            requested_workspace_id.as_ref(),
-            current_workspace_id.as_ref(),
-        ) && requested_workspace_id != bound_workspace_id
-        {
-            let session_id = new_session_id();
-            state
-                .session_store
-                .create_session_for_workspace(
-                    session_id.clone(),
-                    mission_title.to_string(),
-                    Some(requested_workspace_id.to_string()),
-                )
-                .map_err(|err| ApiError::internal_assembly("创建会话失败", err))?;
-            return Ok((session_id, true, Some(requested_workspace_id.clone())));
-        }
-        return Ok((
-            current_session.session_id,
-            false,
-            requested_workspace_id.or(current_workspace_id),
-        ));
-    }
 
     let session_id = new_session_id();
     state
@@ -893,6 +868,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_history_routes_reject_cross_workspace_session_binding() {
+        let state = test_state();
+        for workspace_id in ["workspace-history-a", "workspace-history-b"] {
+            state
+                .workspace_registry
+                .register(
+                    WorkspaceId::new(workspace_id),
+                    AbsolutePath::new(format!("/tmp/{workspace_id}")),
+                )
+                .expect("workspace should register");
+        }
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-history-a"),
+                "History A",
+                Some("workspace-history-a".to_string()),
+            )
+            .expect("session a should create");
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-history-b"),
+                "History B",
+                Some("workspace-history-b".to_string()),
+            )
+            .expect("session b should create");
+        let app = build_router(state);
+
+        let bootstrap = get_json(
+            app.clone(),
+            "/bootstrap?workspaceId=workspace-history-a&sessionId=session-history-b",
+        )
+        .await;
+        assert_eq!(
+            bootstrap["currentSession"]["sessionId"],
+            "session-history-a"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(
+                        "/api/messages?workspaceId=workspace-history-a&sessionId=session-history-b",
+                    )
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn session_switch_rejects_cross_workspace_session_binding() {
+        let state = test_state();
+        for workspace_id in ["workspace-switch-a", "workspace-switch-b"] {
+            state
+                .workspace_registry
+                .register(
+                    WorkspaceId::new(workspace_id),
+                    AbsolutePath::new(format!("/tmp/{workspace_id}")),
+                )
+                .expect("workspace should register");
+        }
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-switch-a"),
+                "Switch A",
+                Some("workspace-switch-a".to_string()),
+            )
+            .expect("session a should create");
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-switch-b"),
+                "Switch B",
+                Some("workspace-switch-b".to_string()),
+            )
+            .expect("session b should create");
+        let app = build_router(state);
+
+        let (status, _) = post_json(
+            app,
+            "/api/session/switch",
+            json!({
+                "workspaceId": "workspace-switch-a",
+                "sessionId": "session-switch-b",
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn session_chat_does_not_create_task_graph() {
         let app = build_router(test_state_with_shadow_execution_pipeline());
 
@@ -930,21 +1003,21 @@ mod tests {
         assert_eq!(session_summary["current_turn"]["mission_id"], Value::Null);
         assert_eq!(session_summary["current_turn"]["root_task_id"], Value::Null);
 
-        let messages = get_json(app, "/api/messages?sessionId=session-route-shadow").await;
-        let message_items = messages["messages"]
+        let messages_page = get_json(app, "/api/messages?sessionId=session-route-shadow").await;
+        let timeline_items = messages_page["timeline"]
             .as_array()
-            .expect("messages should serialize as array");
+            .expect("timeline should serialize as array");
         assert_eq!(
-            message_items
+            timeline_items
                 .iter()
-                .filter(|message| message["role"] == "user")
+                .filter(|entry| entry["kind"] == "UserMessage")
                 .count(),
             1
         );
         assert_eq!(
-            message_items
+            timeline_items
                 .iter()
-                .filter(|message| message["role"] == "assistant")
+                .filter(|entry| entry["kind"] == "AssistantMessage")
                 .count(),
             1
         );
@@ -1592,6 +1665,7 @@ mod tests {
                                 tool_call_id: None,
                                 tool_name: None,
                                 tool_status: None,
+                                tool_arguments: None,
                                 tool_result: None,
                                 tool_error: None,
                                 thread_visible: false,
@@ -1613,6 +1687,7 @@ mod tests {
                                 tool_call_id: None,
                                 tool_name: None,
                                 tool_status: None,
+                                tool_arguments: None,
                                 tool_result: None,
                                 tool_error: None,
                                 thread_visible: true,
@@ -1744,6 +1819,7 @@ mod tests {
                             tool_call_id: None,
                             tool_name: None,
                             tool_status: None,
+                            tool_arguments: None,
                             tool_result: None,
                             tool_error: None,
                             thread_visible: true,
@@ -1874,6 +1950,7 @@ mod tests {
                             tool_call_id: None,
                             tool_name: None,
                             tool_status: None,
+                            tool_arguments: None,
                             tool_result: None,
                             tool_error: None,
                             thread_visible: true,

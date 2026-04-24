@@ -127,7 +127,11 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
                 let func = &tc["function"];
                 let id = tc["id"].as_str().map(str::to_string);
                 let name = func["name"].as_str().map(str::to_string);
-                let args = func["arguments"].as_str().map(str::to_string);
+                let args = match func.get("arguments") {
+                    Some(Value::String(value)) => Some(Value::String(value.clone())),
+                    Some(Value::Null) | None => None,
+                    Some(value) => Some(Value::String(value.to_string())),
+                };
 
                 let kind = if id.is_some() || name.is_some() {
                     LlmStreamChunkType::ToolCallStart
@@ -141,7 +145,7 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
                     tool_call: Some(PartialToolCall {
                         id,
                         name,
-                        arguments: args.map(|a| Value::String(a)),
+                        arguments: args,
                     }),
                     thinking: None,
                     usage: None,
@@ -330,20 +334,22 @@ impl StreamAccumulator {
             LlmStreamChunkType::ContentEnd => {}
             LlmStreamChunkType::ToolCallStart => {
                 if let Some(ref tc) = chunk.tool_call {
+                    let arguments_buffer = tc
+                        .arguments
+                        .as_ref()
+                        .map(tool_call_argument_fragment)
+                        .unwrap_or_default();
                     self.active_tool_calls.push(ActiveToolCall {
                         id: tc.id.clone().unwrap_or_default(),
                         name: tc.name.clone().unwrap_or_default(),
-                        arguments_buffer: String::new(),
+                        arguments_buffer,
                     });
                 }
             }
             LlmStreamChunkType::ToolCallDelta => {
                 if let Some(ref tc) = chunk.tool_call {
                     if let Some(args) = &tc.arguments {
-                        let fragment = match args {
-                            Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        };
+                        let fragment = tool_call_argument_fragment(args);
                         if let Some(active) = self.active_tool_calls.last_mut() {
                             active.arguments_buffer.push_str(&fragment);
                         }
@@ -421,6 +427,13 @@ impl StreamAccumulator {
 
     pub fn pending_tool_call_count(&self) -> usize {
         self.active_tool_calls.len()
+    }
+}
+
+fn tool_call_argument_fragment(value: &Value) -> String {
+    match value {
+        Value::String(fragment) => fragment.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -670,6 +683,46 @@ mod tests {
         assert_eq!(result.tool_calls[0].name, "search");
         assert_eq!(result.tool_calls[0].arguments["q"], "test");
         assert_eq!(result.stop_reason, "tool_use");
+    }
+
+    #[test]
+    fn accumulator_keeps_arguments_from_tool_call_start_chunk() {
+        let mut acc = StreamAccumulator::new();
+        acc.apply(&LlmStreamChunk {
+            kind: LlmStreamChunkType::ToolCallStart,
+            content: None,
+            tool_call: Some(PartialToolCall {
+                id: Some("call_shell".to_string()),
+                name: Some("shell_exec".to_string()),
+                arguments: Some(Value::String(
+                    r#"{"command":"echo hello","cwd":"/tmp"}"#.to_string(),
+                )),
+            }),
+            thinking: None,
+            usage: None,
+        });
+
+        let result = acc.finalize();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "shell_exec");
+        assert_eq!(result.tool_calls[0].arguments["command"], "echo hello");
+        assert_eq!(result.tool_calls[0].arguments["cwd"], "/tmp");
+    }
+
+    #[test]
+    fn openai_stream_parses_object_arguments_from_tool_call_start_chunk() {
+        let chunks = parse_openai_stream_data(
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_shell","function":{"name":"shell_exec","arguments":{"command":"echo hello"}}}]},"finish_reason":null}]}"#,
+        );
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].kind, LlmStreamChunkType::ToolCallStart);
+        let tool_call = chunks[0].tool_call.as_ref().expect("tool call chunk");
+        assert_eq!(tool_call.name.as_deref(), Some("shell_exec"));
+        assert_eq!(
+            tool_call.arguments.as_ref().and_then(Value::as_str),
+            Some(r#"{"command":"echo hello"}"#)
+        );
     }
 
     #[test]

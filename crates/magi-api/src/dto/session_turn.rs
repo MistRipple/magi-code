@@ -58,10 +58,6 @@ impl SessionTurnRequestDto {
         if !self.images.is_empty() {
             message_lines.push(format!("[图片 {} 张]", self.images.len()));
         }
-        if self.deep_task {
-            message_lines.push("[深度任务]".to_string());
-        }
-
         if message_lines.is_empty() {
             "[空输入]".to_string()
         } else {
@@ -136,4 +132,26 @@ pub(crate) fn normalize_task_title(value: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeline_message_does_not_append_deep_task_marker_to_user_text() {
+        let request = SessionTurnRequestDto {
+            session_id: Some("session-a".to_string()),
+            workspace_id: Some("workspace-a".to_string()),
+            text: Some("请分析项目".to_string()),
+            deep_task: true,
+            skill_name: None,
+            images: Vec::new(),
+        };
+
+        assert_eq!(
+            request.timeline_message(request.trimmed_text().as_deref()),
+            "请分析项目"
+        );
+    }
 }

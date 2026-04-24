@@ -28,11 +28,19 @@ use magi_session_store::{
 use magi_tool_runtime::{
     BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
 };
+use magi_usage_authority::{
+    UsageAuthority, UsageCallStatus, UsageSourceRole, UsageTokenInput,
+    build_execution_binding_identity, build_usage_call_identity,
+    types::{
+        LlmConfig as UsageLlmConfig, OpenAiProtocol as UsageOpenAiProtocol,
+        ReasoningEffort as UsageReasoningEffort, UrlMode as UsageUrlMode,
+    },
+};
 use magi_worker_runtime::WorkerStage;
 use magi_workspace::RecoveryStatus;
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -565,6 +573,7 @@ pub struct ShadowTaskDispatcher {
     result_receiver: Arc<EventBasedResultReceiver>,
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
     settings_store: Option<Arc<crate::settings_store::SettingsStore>>,
+    usage_authority: Option<Arc<Mutex<UsageAuthority>>>,
     context_runtime: Option<Arc<ContextRuntime>>,
     tool_registry: Option<ToolRegistry>,
     skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
@@ -634,6 +643,123 @@ fn resolve_session_safeguard_prompt(
     ))
 }
 
+fn usage_u64(value: Option<&serde_json::Value>) -> u64 {
+    value.and_then(|value| value.as_u64()).unwrap_or(0)
+}
+
+fn usage_value_to_token_input(usage: Option<&serde_json::Value>) -> UsageTokenInput {
+    let Some(usage) = usage else {
+        return UsageTokenInput {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        };
+    };
+    let cache_read_tokens = usage
+        .get("cacheReadTokens")
+        .or_else(|| usage.get("cache_read_tokens"))
+        .and_then(|value| value.as_u64())
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(|value| value.as_u64())
+        });
+    let cache_write_tokens = usage
+        .get("cacheWriteTokens")
+        .or_else(|| usage.get("cache_write_tokens"))
+        .and_then(|value| value.as_u64());
+
+    UsageTokenInput {
+        input_tokens: usage_u64(
+            usage
+                .get("inputTokens")
+                .or_else(|| usage.get("input_tokens"))
+                .or_else(|| usage.get("prompt_tokens")),
+        ),
+        output_tokens: usage_u64(
+            usage
+                .get("outputTokens")
+                .or_else(|| usage.get("output_tokens"))
+                .or_else(|| usage.get("completion_tokens")),
+        ),
+        cache_read_tokens,
+        cache_write_tokens,
+    }
+}
+
+fn resolve_usage_model_config(
+    store: Option<&crate::settings_store::SettingsStore>,
+) -> UsageLlmConfig {
+    let config = store
+        .map(|store| store.get_section("orchestrator"))
+        .unwrap_or_else(|| serde_json::json!({}));
+    let provider = config
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("openai")
+        .to_string();
+    let model = config
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("gpt-4")
+        .to_string();
+    let base_url = config
+        .get("baseUrl")
+        .or_else(|| config.get("base_url"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    let url_mode = match config
+        .get("urlMode")
+        .or_else(|| config.get("url_mode"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("default")
+    {
+        "full" => UsageUrlMode::Full,
+        "proxy" => UsageUrlMode::Proxy,
+        _ => UsageUrlMode::Default,
+    };
+    let openai_protocol = match config
+        .get("openaiProtocol")
+        .or_else(|| config.get("openai_protocol"))
+        .and_then(|value| value.as_str())
+    {
+        Some("responses") => Some(UsageOpenAiProtocol::Responses),
+        Some("chat") => Some(UsageOpenAiProtocol::Chat),
+        _ => None,
+    };
+    let reasoning_effort = match config
+        .get("reasoningEffort")
+        .or_else(|| config.get("reasoning_effort"))
+        .and_then(|value| value.as_str())
+    {
+        Some("low") => Some(UsageReasoningEffort::Low),
+        Some("medium") => Some(UsageReasoningEffort::Medium),
+        Some("high") => Some(UsageReasoningEffort::High),
+        Some("xhigh") => Some(UsageReasoningEffort::Xhigh),
+        _ => None,
+    };
+    UsageLlmConfig {
+        provider,
+        model,
+        base_url,
+        api_key: None,
+        url_mode,
+        openai_protocol,
+        reasoning_effort,
+        enable_thinking: config
+            .get("enableThinking")
+            .and_then(|value| value.as_bool()),
+    }
+}
+
 impl ShadowTaskDispatcher {
     pub fn new(
         event_bus: Arc<InMemoryEventBus>,
@@ -650,6 +776,7 @@ impl ShadowTaskDispatcher {
             result_receiver,
             model_bridge_client: None,
             settings_store: None,
+            usage_authority: None,
             context_runtime: None,
             tool_registry: None,
             skill_runtime: None,
@@ -666,6 +793,11 @@ impl ShadowTaskDispatcher {
         self
     }
 
+    pub fn with_usage_authority(mut self, authority: Arc<Mutex<UsageAuthority>>) -> Self {
+        self.usage_authority = Some(authority);
+        self
+    }
+
     pub fn with_context_runtime(mut self, runtime: Arc<ContextRuntime>) -> Self {
         self.context_runtime = Some(runtime);
         self
@@ -679,6 +811,46 @@ impl ShadowTaskDispatcher {
     pub fn with_skill_runtime(mut self, runtime: Arc<magi_skill_runtime::SkillRuntime>) -> Self {
         self.skill_runtime = Some(runtime);
         self
+    }
+
+    fn record_llm_usage(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+        turn_id: Option<String>,
+        assignment_id: Option<String>,
+        template_id: &str,
+        role: UsageSourceRole,
+        usage: Option<&serde_json::Value>,
+        status: UsageCallStatus,
+    ) {
+        let Some(authority) = &self.usage_authority else {
+            return;
+        };
+        let workspace_id = workspace_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "default-workspace".to_string());
+        let timestamp = UtcMillis::now().0;
+        let call_id = format!("{session_id}:{template_id}:{timestamp}");
+        let input = magi_usage_authority::UsageCallRecordInput {
+            workspace_id,
+            session_id: session_id.to_string(),
+            turn_id,
+            dispatch_wave_id: None,
+            assignment_id,
+            event_id: None,
+            timestamp: Some(timestamp),
+            execution_binding: build_execution_binding_identity(template_id, template_id, 0, role),
+            model_config: resolve_usage_model_config(self.settings_store.as_deref()),
+            call_identity: build_usage_call_identity(&call_id, None, role, None),
+            usage: usage_value_to_token_input(usage),
+            status,
+            error_code: None,
+        };
+        if let Ok(mut authority) = authority.lock() {
+            authority.append_call_record(input);
+        }
     }
 
     fn append_turn_item(&self, session_id: &SessionId, item: ActiveExecutionTurnItem) {
@@ -743,6 +915,7 @@ impl ShadowTaskDispatcher {
             tool_call_id: None,
             tool_name: None,
             tool_status: None,
+            tool_arguments: None,
             tool_result: None,
             tool_error: None,
             thread_visible,
@@ -775,6 +948,7 @@ impl ShadowTaskDispatcher {
             tool_call_id: tool_call.map(|call| call.id.clone()),
             tool_name: tool_call.map(|call| call.function.name.clone()),
             tool_status: None,
+            tool_arguments: tool_call.map(|call| call.function.arguments.clone()),
             tool_result: None,
             tool_error: None,
             thread_visible,
@@ -882,23 +1056,29 @@ impl ShadowTaskDispatcher {
             tool_call_id: None,
         }];
 
-        self.append_turn_item(
+        let phase_content = if request.use_tools {
+            "正在理解请求并准备调用工具。".to_string()
+        } else {
+            "正在理解请求并生成回复。".to_string()
+        };
+        let phase_item = self.build_session_turn_item(
+            "assistant_phase",
+            "running",
+            Some("理解请求".to_string()),
+            Some(phase_content.clone()),
+            None,
+            true,
+        );
+        self.append_turn_item(&request.session_id, phase_item.clone());
+        self.publish_session_turn_item_event(
             &request.session_id,
-            self.build_session_turn_item(
-                "assistant_phase",
-                "running",
-                Some("理解请求".to_string()),
-                Some(if request.use_tools {
-                    "正在理解请求并准备调用工具。".to_string()
-                } else {
-                    "正在理解请求并生成回复。".to_string()
-                }),
-                None,
-                true,
-            ),
+            &request.workspace_id,
+            None,
+            &phase_item,
         );
 
         let mut final_content = String::new();
+        let mut final_thinking = String::new();
         for round in 0..MAX_TOOL_CALL_ROUNDS {
             let stream_item_id = format!(
                 "turn-item-assistant-stream-{}-{}",
@@ -906,20 +1086,21 @@ impl ShadowTaskDispatcher {
                 UtcMillis::now().0
             );
             let mut streamed_content = String::new();
-            let mut last_persisted_content = String::new();
+            let mut streamed_thinking = String::new();
+            let mut last_persisted_visible_len = 0usize;
+            let mut last_persisted_thinking_len = 0usize;
             let mut last_flush_at = Instant::now();
             let mut stream_item_created = false;
 
-            let response = client
-                .invoke_stream(
-                    ModelInvocationRequest {
-                        provider: SHADOW_MODEL_PROVIDER.to_string(),
-                        prompt: prompt.clone(),
-                        messages: Some(messages.clone()),
-                        tools: tools.clone(),
-                        tool_choice: None,
-                    },
-                    &mut |event| match event {
+            let response = match client.invoke_stream(
+                ModelInvocationRequest {
+                    provider: SHADOW_MODEL_PROVIDER.to_string(),
+                    prompt: prompt.clone(),
+                    messages: Some(messages.clone()),
+                    tools: tools.clone(),
+                    tool_choice: None,
+                },
+                &mut |event| match event {
                         ModelStreamEvent::ContentDelta { delta } => {
                             if delta.is_empty() {
                                 return;
@@ -931,48 +1112,145 @@ impl ShadowTaskDispatcher {
                                 || delta.contains('\n')
                                 || visible_content
                                     .len()
-                                    .saturating_sub(last_persisted_content.len())
+                                    .saturating_sub(last_persisted_visible_len)
                                     >= 32
                                 || last_flush_at.elapsed() >= Duration::from_millis(120);
                             if should_flush {
+                                let item_content = build_stream_message_content(
+                                    &visible_content,
+                                    &streamed_thinking,
+                                    &stream_item_id,
+                                );
                                 let mut item = self.build_session_turn_item(
                                     "assistant_stream",
                                     "running",
                                     Some("生成回复".to_string()),
-                                    Some(visible_content.clone()),
+                                    Some(item_content.clone()),
                                     None,
                                     true,
                                 );
                                 item.item_id = stream_item_id.clone();
-                                self.upsert_turn_item(&request.session_id, item);
-                                last_persisted_content = visible_content;
+                                self.upsert_turn_item(&request.session_id, item.clone());
+                                self.publish_session_turn_item_event(
+                                    &request.session_id,
+                                    &request.workspace_id,
+                                    Some(round + 1),
+                                    &item,
+                                );
+                                last_persisted_visible_len = visible_content.len();
+                                last_persisted_thinking_len = streamed_thinking.len();
                                 stream_item_created = true;
                                 last_flush_at = Instant::now();
                             }
                         }
-                        ModelStreamEvent::ThinkingDelta { .. } => {}
+                        ModelStreamEvent::ThinkingDelta { delta } => {
+                            if delta.is_empty() {
+                                return;
+                            }
+                            streamed_thinking.push_str(&delta);
+                            let visible_content =
+                                normalize_shadow_model_visible_content(&streamed_content);
+                            let should_flush = !stream_item_created
+                                || delta.contains('\n')
+                                || streamed_thinking
+                                    .len()
+                                    .saturating_sub(last_persisted_thinking_len)
+                                    >= 32
+                                || last_flush_at.elapsed() >= Duration::from_millis(120);
+                            if should_flush {
+                                let item_content = build_stream_message_content(
+                                    &visible_content,
+                                    &streamed_thinking,
+                                    &stream_item_id,
+                                );
+                                let mut item = self.build_session_turn_item(
+                                    "assistant_stream",
+                                    "running",
+                                    Some("思考过程".to_string()),
+                                    Some(item_content.clone()),
+                                    None,
+                                    true,
+                                );
+                                item.item_id = stream_item_id.clone();
+                                self.upsert_turn_item(&request.session_id, item.clone());
+                                self.publish_session_turn_item_event(
+                                    &request.session_id,
+                                    &request.workspace_id,
+                                    Some(round + 1),
+                                    &item,
+                                );
+                                last_persisted_visible_len = visible_content.len();
+                                last_persisted_thinking_len = streamed_thinking.len();
+                                stream_item_created = true;
+                                last_flush_at = Instant::now();
+                            }
+                        }
                     },
-                )
-                .map_err(|error| ApiError::internal_assembly("执行 session turn 失败", error))?;
+            ) {
+                Ok(response) => response,
+                Err(error) => {
+                    let failure_content = format!("生成失败：{error}");
+                    let failure_item = self.build_session_turn_item(
+                        "assistant_final",
+                        "failed",
+                        Some("生成失败".to_string()),
+                        Some(failure_content),
+                        None,
+                        true,
+                    );
+                    self.append_turn_item(&request.session_id, failure_item.clone());
+                    self.publish_session_turn_item_event(
+                        &request.session_id,
+                        &request.workspace_id,
+                        Some(round + 1),
+                        &failure_item,
+                    );
+                    return Err(ApiError::internal_assembly("执行 session turn 失败", error));
+                }
+            };
 
             let parsed = response.parse_chat_payload();
+            self.record_llm_usage(
+                &request.session_id,
+                &request.workspace_id,
+                None,
+                None,
+                "orchestrator",
+                UsageSourceRole::Orchestrator,
+                parsed.usage.as_ref(),
+                UsageCallStatus::Success,
+            );
             if let Some(content) = parsed.content.clone() {
                 final_content = normalize_shadow_model_visible_content(&content);
                 streamed_content = content;
             }
+            if !streamed_thinking.trim().is_empty() {
+                final_thinking = streamed_thinking.clone();
+            }
 
             let visible_content = normalize_shadow_model_visible_content(&streamed_content);
-            if !visible_content.is_empty() {
+            if !visible_content.is_empty() || !streamed_thinking.trim().is_empty() {
+                let item_content = build_stream_message_content(
+                    &visible_content,
+                    &streamed_thinking,
+                    &stream_item_id,
+                );
                 let mut item = self.build_session_turn_item(
                     "assistant_stream",
                     "completed",
                     Some("生成回复".to_string()),
-                    Some(visible_content),
+                    Some(item_content.clone()),
                     None,
                     true,
                 );
-                item.item_id = stream_item_id;
-                self.upsert_turn_item(&request.session_id, item);
+                item.item_id = stream_item_id.clone();
+                self.upsert_turn_item(&request.session_id, item.clone());
+                self.publish_session_turn_item_event(
+                    &request.session_id,
+                    &request.workspace_id,
+                    Some(round + 1),
+                    &item,
+                );
             }
 
             if parsed.tool_calls.is_empty() {
@@ -994,7 +1272,13 @@ impl ShadowTaskDispatcher {
                     true,
                 );
                 started.tool_status = Some("running".to_string());
-                self.append_turn_item(&request.session_id, started);
+                self.append_turn_item(&request.session_id, started.clone());
+                self.publish_session_turn_item_event(
+                    &request.session_id,
+                    &request.workspace_id,
+                    Some(round + 1),
+                    &started,
+                );
 
                 let result = self.execute_session_tool_call(
                     tool_call,
@@ -1017,7 +1301,13 @@ impl ShadowTaskDispatcher {
                 completed.tool_status = Some(status.to_string());
                 completed.tool_result = Some(summarize_tool_result(&result));
                 completed.tool_error = (status == "error").then(|| summarize_tool_result(&result));
-                self.append_turn_item(&request.session_id, completed);
+                self.append_turn_item(&request.session_id, completed.clone());
+                self.publish_session_turn_item_event(
+                    &request.session_id,
+                    &request.workspace_id,
+                    Some(round + 1),
+                    &completed,
+                );
 
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
@@ -1029,26 +1319,50 @@ impl ShadowTaskDispatcher {
         }
 
         if final_content.trim().is_empty() {
+            let failure_item = self.build_session_turn_item(
+                "assistant_final",
+                "failed",
+                Some("生成失败".to_string()),
+                Some("模型没有返回可展示内容。".to_string()),
+                None,
+                true,
+            );
+            self.append_turn_item(&request.session_id, failure_item.clone());
+            self.publish_session_turn_item_event(
+                &request.session_id,
+                &request.workspace_id,
+                None,
+                &failure_item,
+            );
+            self.update_turn_status(&request.session_id, "failed");
             return Err(ApiError::internal_assembly(
                 "执行 session turn 失败",
                 "模型没有返回可展示内容",
             ));
         }
 
-        self.append_turn_item(
+        let final_message_content =
+            build_stream_message_content(&final_content, &final_thinking, "assistant-final");
+        let final_item = self.build_session_turn_item(
+            "assistant_final",
+            "completed",
+            Some("最终回复".to_string()),
+            Some(final_message_content.clone()),
+            None,
+            true,
+        );
+        self.append_turn_item(&request.session_id, final_item.clone());
+        self.publish_session_turn_item_event(
             &request.session_id,
-            self.build_session_turn_item(
-                "assistant_final",
-                "completed",
-                Some("最终回复".to_string()),
-                Some(final_content.clone()),
-                None,
-                true,
-            ),
+            &request.workspace_id,
+            None,
+            &final_item,
         );
         self.update_turn_status(&request.session_id, "completed");
 
-        Ok(SessionTurnExecutionOutput { final_content })
+        Ok(SessionTurnExecutionOutput {
+            final_content: final_message_content,
+        })
     }
 
     fn publish_task_dispatched_event(
@@ -1092,8 +1406,19 @@ impl ShadowTaskDispatcher {
         workspace_id: &Option<WorkspaceId>,
         round: usize,
         item_id: &str,
-        content_len: usize,
+        item_kind: &str,
+        status: &str,
+        source: &str,
+        worker_id: Option<&WorkerId>,
+        role_id: Option<&str>,
+        lane_id: Option<&str>,
+        lane_seq: Option<usize>,
+        title: Option<&str>,
+        thread_visible: bool,
+        worker_visible: bool,
+        content: &str,
     ) {
+        let content_len = content.chars().count();
         let _ = self.event_bus.publish(
             EventEnvelope::domain(
                 EventId::new(format!("event-task-llm-delta-{}", UtcMillis::now().0)),
@@ -1105,7 +1430,18 @@ impl ShadowTaskDispatcher {
                     "workspace_id": workspace_id.as_ref().map(ToString::to_string),
                     "round": round,
                     "item_id": item_id,
+                    "item_kind": item_kind,
+                    "status": status,
+                    "source": source,
+                    "worker_id": worker_id.map(ToString::to_string),
+                    "role_id": role_id,
+                    "lane_id": lane_id,
+                    "lane_seq": lane_seq,
+                    "title": title,
+                    "thread_visible": thread_visible,
+                    "worker_visible": worker_visible,
                     "content_length": content_len,
+                    "content": content,
                 }),
             )
             .with_context(EventContext {
@@ -1113,6 +1449,62 @@ impl ShadowTaskDispatcher {
                 session_id: Some(session_id.clone()),
                 mission_id: Some(task.mission_id.clone()),
                 task_id: Some(task.task_id.clone()),
+                ..EventContext::default()
+            }),
+        );
+    }
+
+    fn publish_session_turn_item_event(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+        round: Option<usize>,
+        item: &ActiveExecutionTurnItem,
+    ) {
+        let content_len = item
+            .content
+            .as_deref()
+            .map(|value| value.chars().count())
+            .unwrap_or(0);
+        let _ = self.event_bus.publish(
+            EventEnvelope::domain(
+                EventId::new(format!(
+                    "event-session-turn-item-{}-{}",
+                    item.item_id.as_str(),
+                    UtcMillis::now().0
+                )),
+                "session.turn.item.updated",
+                serde_json::json!({
+                    "session_id": session_id.to_string(),
+                    "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+                    "round": round,
+                    "item_id": item.item_id.as_str(),
+                    "item_seq": item.item_seq,
+                    "item_kind": item.kind.as_str(),
+                    "kind": item.kind.as_str(),
+                    "status": item.status.as_str(),
+                    "source": item.source.as_str(),
+                    "title": item.title.as_deref(),
+                    "lane_id": item.lane_id.as_deref(),
+                    "lane_seq": item.lane_seq,
+                    "task_id": item.task_id.as_ref().map(ToString::to_string),
+                    "worker_id": item.worker_id.as_ref().map(ToString::to_string),
+                    "role_id": item.role_id.as_deref(),
+                    "tool_call_id": item.tool_call_id.as_deref(),
+                    "tool_name": item.tool_name.as_deref(),
+                    "tool_status": item.tool_status.as_deref(),
+                    "tool_arguments": item.tool_arguments.as_deref(),
+                    "tool_result": item.tool_result.as_deref(),
+                    "tool_error": item.tool_error.as_deref(),
+                    "thread_visible": item.thread_visible,
+                    "worker_visible": item.worker_visible,
+                    "content_length": content_len,
+                    "content": item.content.as_deref(),
+                }),
+            )
+            .with_context(EventContext {
+                workspace_id: workspace_id.clone(),
+                session_id: Some(session_id.clone()),
                 ..EventContext::default()
             }),
         );
@@ -1160,6 +1552,10 @@ impl ShadowTaskDispatcher {
             !is_primary,
         );
         item.item_id = stream_item_id.to_string();
+        let item_source = item.source.clone();
+        let item_role_id = item.role_id.clone();
+        let item_title = item.title.clone();
+        let item_worker_id = item.worker_id.clone();
         self.upsert_turn_item(session_id, item);
         if force_publish || streamed_content != last_persisted_content.as_str() {
             self.publish_llm_delta_event(
@@ -1168,7 +1564,17 @@ impl ShadowTaskDispatcher {
                 workspace_id,
                 round,
                 stream_item_id,
-                streamed_content.chars().count(),
+                stream_item_kind,
+                status,
+                &item_source,
+                item_worker_id.as_ref(),
+                item_role_id.as_deref(),
+                lane_id,
+                lane_seq,
+                item_title.as_deref(),
+                thread_visible,
+                !is_primary,
+                streamed_content,
             );
             *last_persisted_content = streamed_content.to_string();
         }
@@ -1715,11 +2121,19 @@ impl ShadowTaskDispatcher {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "gpt-4".to_string());
-                return Some(Arc::new(HttpModelBridgeClient::new(
-                    base_url.to_string(),
-                    api_key,
-                    model,
-                )));
+                let reasoning_effort = config
+                    .get("reasoningEffort")
+                    .or_else(|| config.get("reasoning_effort"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                let enable_thinking = config
+                    .get("enableThinking")
+                    .or_else(|| config.get("enable_thinking"))
+                    .and_then(|value| value.as_bool());
+                return Some(Arc::new(
+                    HttpModelBridgeClient::new(base_url.to_string(), api_key, model)
+                        .with_generation_options(reasoning_effort, enable_thinking),
+                ));
             }
         }
         self.model_bridge_client.clone()
@@ -1861,7 +2275,10 @@ impl ShadowTaskDispatcher {
                 task.title.clone()
             });
             let mut streamed_content = String::new();
+            let mut streamed_thinking = String::new();
             let mut last_persisted_content = String::new();
+            let mut last_persisted_visible_len = 0usize;
+            let mut last_persisted_thinking_len = 0usize;
             let mut stream_item_created = false;
             let mut last_flush_at = Instant::now();
 
@@ -1877,10 +2294,15 @@ impl ShadowTaskDispatcher {
                         || delta.contains('\n')
                         || visible_streamed_content
                             .len()
-                            .saturating_sub(last_persisted_content.len())
+                            .saturating_sub(last_persisted_visible_len)
                             >= 32
                         || last_flush_at.elapsed() >= Duration::from_millis(120);
                     if should_flush {
+                        let stream_payload = build_stream_message_content(
+                            &visible_streamed_content,
+                            &streamed_thinking,
+                            &stream_item_id,
+                        );
                         self.sync_stream_turn_item(
                             task,
                             session_id,
@@ -1893,17 +2315,62 @@ impl ShadowTaskDispatcher {
                             lane_id,
                             lane_seq,
                             is_primary,
-                            &visible_streamed_content,
+                            &stream_payload,
                             "running",
                             true,
                             &mut last_persisted_content,
                             &mut stream_item_created,
                             true,
                         );
+                        last_persisted_visible_len = visible_streamed_content.len();
+                        last_persisted_thinking_len = streamed_thinking.len();
                         last_flush_at = Instant::now();
                     }
                 }
-                ModelStreamEvent::ThinkingDelta { .. } => {}
+                ModelStreamEvent::ThinkingDelta { delta } => {
+                    if delta.is_empty() {
+                        return;
+                    }
+                    streamed_thinking.push_str(&delta);
+                    let visible_streamed_content =
+                        normalize_shadow_model_visible_content(&streamed_content);
+                    let should_flush = !stream_item_created
+                        || delta.contains('\n')
+                        || streamed_thinking
+                            .len()
+                            .saturating_sub(last_persisted_thinking_len)
+                            >= 32
+                        || last_flush_at.elapsed() >= Duration::from_millis(120);
+                    if should_flush {
+                        let stream_payload = build_stream_message_content(
+                            &visible_streamed_content,
+                            &streamed_thinking,
+                            &stream_item_id,
+                        );
+                        self.sync_stream_turn_item(
+                            task,
+                            session_id,
+                            workspace_id,
+                            round + 1,
+                            &stream_item_id,
+                            stream_item_kind,
+                            Some("思考过程".to_string()),
+                            worker_id,
+                            lane_id,
+                            lane_seq,
+                            is_primary,
+                            &stream_payload,
+                            "running",
+                            true,
+                            &mut last_persisted_content,
+                            &mut stream_item_created,
+                            true,
+                        );
+                        last_persisted_visible_len = visible_streamed_content.len();
+                        last_persisted_thinking_len = streamed_thinking.len();
+                        last_flush_at = Instant::now();
+                    }
+                }
             }) {
                 Ok(resp) => resp,
                 Err(error) => {
@@ -1918,6 +2385,26 @@ impl ShadowTaskDispatcher {
             };
 
             let parsed = response.parse_chat_payload();
+            let usage_role = if is_primary {
+                UsageSourceRole::Orchestrator
+            } else {
+                UsageSourceRole::Worker
+            };
+            let usage_template = if is_primary {
+                "orchestrator".to_string()
+            } else {
+                worker_id.to_string()
+            };
+            self.record_llm_usage(
+                session_id,
+                workspace_id,
+                Some(task.task_id.to_string()),
+                (!is_primary).then(|| task.task_id.to_string()),
+                &usage_template,
+                usage_role,
+                parsed.usage.as_ref(),
+                UsageCallStatus::Success,
+            );
 
             if let Some(ref content) = parsed.content {
                 final_content = normalize_shadow_model_visible_content(content);
@@ -1929,7 +2416,12 @@ impl ShadowTaskDispatcher {
             if parsed.tool_calls.is_empty() {
                 let visible_streamed_content =
                     normalize_shadow_model_visible_content(&streamed_content);
-                if !visible_streamed_content.is_empty() {
+                if !visible_streamed_content.is_empty() || !streamed_thinking.trim().is_empty() {
+                    let stream_payload = build_stream_message_content(
+                        &visible_streamed_content,
+                        &streamed_thinking,
+                        &stream_item_id,
+                    );
                     self.sync_stream_turn_item(
                         task,
                         session_id,
@@ -1942,7 +2434,7 @@ impl ShadowTaskDispatcher {
                         lane_id,
                         lane_seq,
                         is_primary,
-                        &visible_streamed_content,
+                        &stream_payload,
                         "completed",
                         false,
                         &mut last_persisted_content,
@@ -1970,8 +2462,13 @@ impl ShadowTaskDispatcher {
 
             let visible_streamed_content =
                 normalize_shadow_model_visible_content(&streamed_content);
-            if !visible_streamed_content.is_empty() {
+            if !visible_streamed_content.is_empty() || !streamed_thinking.trim().is_empty() {
                 let should_force_publish = !stream_item_created;
+                let stream_payload = build_stream_message_content(
+                    &visible_streamed_content,
+                    &streamed_thinking,
+                    &stream_item_id,
+                );
                 self.sync_stream_turn_item(
                     task,
                     session_id,
@@ -1984,7 +2481,7 @@ impl ShadowTaskDispatcher {
                     lane_id,
                     lane_seq,
                     is_primary,
-                    &visible_streamed_content,
+                    &stream_payload,
                     "completed",
                     true,
                     &mut last_persisted_content,
@@ -2007,6 +2504,7 @@ impl ShadowTaskDispatcher {
                         tool_call_id: Some(tc.id.clone()),
                         tool_name: Some(tc.function.name.clone()),
                         tool_status: Some("running".to_string()),
+                        tool_arguments: Some(tc.function.arguments.clone()),
                         ..self.build_turn_item(
                             if is_primary {
                                 "tool_call_started"
@@ -2050,6 +2548,7 @@ impl ShadowTaskDispatcher {
                         tool_call_id: Some(tc.id.clone()),
                         tool_name: Some(tc.function.name.clone()),
                         tool_status: Some(status.to_string()),
+                        tool_arguments: Some(tc.function.arguments.clone()),
                         tool_result: Some(summarize_tool_result(&result)),
                         tool_error: (status == "error").then(|| summarize_tool_result(&result)),
                         ..self.build_turn_item(
@@ -2435,7 +2934,12 @@ fn builtin_tool_description(name: &str) -> String {
     match name {
         "file_read" => "Read the contents of a file at a given path".to_string(),
         "search_text" => "Search for text patterns in files within a directory".to_string(),
-        "shell_exec" => "Execute a shell command and return stdout/stderr".to_string(),
+        "shell_exec" => "Execute a bounded shell command and return stdout/stderr. Use process_launch for long-running background processes.".to_string(),
+        "process_launch" => "Start a long-running shell process in the background and return a terminal_id.".to_string(),
+        "process_read" => "Read buffered stdout/stderr from a background process.".to_string(),
+        "process_write" => "Write input to a background process.".to_string(),
+        "process_kill" => "Stop a background process by terminal_id.".to_string(),
+        "process_list" => "List background processes for the current session/workspace.".to_string(),
         "process_inspect" => "Inspect running processes by PID or name".to_string(),
         "diff_preview" => "Generate a unified diff between two text inputs".to_string(),
         _ => format!("Builtin tool: {name}"),
@@ -2464,9 +2968,48 @@ fn builtin_tool_parameters(name: &str) -> serde_json::Value {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "Shell command to execute" },
-                "cwd": { "type": "string", "description": "Working directory" }
+                "cwd": { "type": "string", "description": "Working directory" },
+                "access_mode": { "type": "string", "enum": ["read_only", "maybe_write", "explicit_write"], "description": "Use read_only for inspection commands; maybe_write/explicit_write hold write protection for the working directory." },
+                "timeout_ms": { "type": "integer", "description": "Maximum execution time in milliseconds for bounded commands. Long-running processes should use process_launch instead." },
+                "background": { "type": "boolean", "description": "When true, launch as a background process and return terminal_id immediately." }
             },
             "required": ["command"]
+        }),
+        "process_launch" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "Long-running shell command to start in the background" },
+                "cwd": { "type": "string", "description": "Working directory" },
+                "access_mode": { "type": "string", "enum": ["read_only", "maybe_write", "explicit_write"], "description": "Use read_only for non-mutating watchers; maybe_write/explicit_write briefly checks launch write scope." }
+            },
+            "required": ["command"]
+        }),
+        "process_read" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "terminal_id": { "type": "integer", "description": "Background process terminal id" },
+                "max_bytes": { "type": "integer", "description": "Maximum output bytes to return" }
+            },
+            "required": ["terminal_id"]
+        }),
+        "process_write" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "terminal_id": { "type": "integer", "description": "Background process terminal id" },
+                "input": { "type": "string", "description": "Text to write to stdin" }
+            },
+            "required": ["terminal_id", "input"]
+        }),
+        "process_kill" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "terminal_id": { "type": "integer", "description": "Background process terminal id" }
+            },
+            "required": ["terminal_id"]
+        }),
+        "process_list" => serde_json::json!({
+            "type": "object",
+            "properties": {}
         }),
         "process_inspect" => serde_json::json!({
             "type": "object",
@@ -2531,6 +3074,33 @@ fn normalize_shadow_model_visible_content(content: &str) -> String {
         }
     }
     value.to_string()
+}
+
+fn build_stream_message_content(
+    visible_content: &str,
+    thinking_content: &str,
+    item_id: &str,
+) -> String {
+    let visible_content = visible_content.trim();
+    let thinking_content = thinking_content.trim();
+    if thinking_content.is_empty() {
+        return visible_content.to_string();
+    }
+
+    let mut blocks = Vec::new();
+    blocks.push(json!({
+        "type": "thinking",
+        "blockId": format!("{item_id}-thinking"),
+        "content": thinking_content,
+    }));
+    if !visible_content.is_empty() {
+        blocks.push(json!({
+            "type": "text",
+            "content": visible_content,
+        }));
+    }
+
+    json!({ "blocks": blocks }).to_string()
 }
 
 fn summarize_tool_result(result: &str) -> String {

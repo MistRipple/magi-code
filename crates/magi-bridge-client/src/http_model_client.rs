@@ -23,6 +23,8 @@ pub struct HttpModelBridgeClient {
     base_url: String,
     api_key: Option<String>,
     model: String,
+    reasoning_effort: Option<String>,
+    enable_thinking: Option<bool>,
 }
 
 impl HttpModelBridgeClient {
@@ -42,7 +44,21 @@ impl HttpModelBridgeClient {
             base_url,
             api_key,
             model,
+            reasoning_effort: None,
+            enable_thinking: None,
         }
+    }
+
+    pub fn with_generation_options(
+        mut self,
+        reasoning_effort: Option<String>,
+        enable_thinking: Option<bool>,
+    ) -> Self {
+        self.reasoning_effort = reasoning_effort
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.enable_thinking = enable_thinking;
+        self
     }
 
     fn chat_completions_url(&self) -> Result<String, BridgeClientError> {
@@ -75,6 +91,18 @@ impl HttpModelBridgeClient {
             "messages": messages,
             "stream": stream,
         });
+        if let Some(ref reasoning_effort) = self.reasoning_effort {
+            body["reasoning_effort"] = json!(reasoning_effort);
+        }
+        if let Some(enable_thinking) = self.enable_thinking {
+            body["enable_thinking"] = json!(enable_thinking);
+            body["thinking"] = json!({
+                "type": if enable_thinking { "enabled" } else { "disabled" },
+            });
+            if enable_thinking {
+                body["max_tokens"] = json!(32_768);
+            }
+        }
         if let Some(ref tools) = request.tools {
             if !tools.is_empty() {
                 body["tools"] = serde_json::to_value(tools).unwrap_or_else(|_| json!([]));
@@ -194,10 +222,14 @@ fn build_stream_bridge_response(
     content: String,
     finish_reason: String,
     tool_calls: Vec<crate::llm_types::ToolCall>,
+    usage: crate::llm_types::LlmUsage,
 ) -> Result<BridgeResponse, BridgeClientError> {
     let payload = ChatCompletionPayload {
         content: (!content.is_empty()).then_some(content),
         finish_reason: (!finish_reason.is_empty()).then_some(finish_reason),
+        usage: Some(serde_json::to_value(usage).map_err(|error| {
+            build_protocol_error(format!("serialize stream usage failed: {error}"))
+        })?),
         tool_calls: tool_calls
             .into_iter()
             .map(convert_stream_tool_call)
@@ -388,7 +420,12 @@ fn execute_openai_stream_request(
     }
 
     let adapted = accumulator.finalize();
-    build_stream_bridge_response(adapted.content, adapted.stop_reason, adapted.tool_calls)
+    build_stream_bridge_response(
+        adapted.content,
+        adapted.stop_reason,
+        adapted.tool_calls,
+        adapted.usage,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -680,6 +717,29 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "hello world");
         assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn build_request_body_includes_thinking_options_when_enabled() {
+        let client = HttpModelBridgeClient::new(
+            "https://api.example.com/v1".to_string(),
+            None,
+            "reasoning-model".to_string(),
+        )
+        .with_generation_options(Some("medium".to_string()), Some(true));
+
+        let body = client.build_request_body(&ModelInvocationRequest {
+            provider: "openai".to_string(),
+            prompt: "hello world".to_string(),
+            messages: None,
+            tools: None,
+            tool_choice: None,
+        });
+
+        assert_eq!(body["reasoning_effort"], "medium");
+        assert_eq!(body["enable_thinking"], true);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["max_tokens"], 32_768);
     }
 
     #[test]

@@ -111,7 +111,9 @@ impl ToolRegistry {
     }
 
     pub(crate) fn resolve_access_mode(&self, input: &ToolExecutionInput) -> BuiltinToolAccessMode {
-        if input.tool_name == crate::BuiltinToolName::ShellExec.as_str() {
+        if input.tool_name == crate::BuiltinToolName::ShellExec.as_str()
+            || input.tool_name == crate::BuiltinToolName::ProcessLaunch.as_str()
+        {
             self.parse_requested_access_mode(&input.input)
                 .unwrap_or(BuiltinToolAccessMode::MaybeWrite)
         } else {

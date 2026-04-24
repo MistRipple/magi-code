@@ -118,7 +118,11 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                     if let (Some(id), Some(name)) =
                         (item["call_id"].as_str(), item["name"].as_str())
                     {
-                        let args_str = item["arguments"].as_str().unwrap_or("{}").to_string();
+                        let args_str = match item.get("arguments") {
+                            Some(Value::String(value)) => value.clone(),
+                            Some(Value::Null) | None => "{}".to_string(),
+                            Some(value) => value.to_string(),
+                        };
                         let arguments = serde_json::from_str(&args_str).unwrap_or(json!({}));
                         tool_calls.push(ToolCall {
                             id: id.to_string(),
@@ -168,5 +172,37 @@ fn truncate(s: &str, max: usize) -> String {
         trimmed.to_string()
     } else {
         format!("{}...", &trimmed[..max])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_object_function_call_arguments() {
+        let body = json!({
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_shell",
+                "name": "shell_exec",
+                "arguments": { "command": "echo hello", "cwd": "/tmp" }
+            }]
+        })
+        .to_string();
+
+        let parsed = OpenAiResponsesAdapter
+            .parse_response(200, &body)
+            .expect("object arguments should be accepted");
+
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "shell_exec");
+        assert_eq!(parsed.tool_calls[0].arguments["command"], "echo hello");
+        assert_eq!(
+            serde_json::from_str::<Value>(parsed.tool_calls[0].raw_arguments.as_deref().unwrap())
+                .expect("raw arguments should stay valid json")["cwd"],
+            "/tmp"
+        );
     }
 }

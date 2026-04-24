@@ -295,6 +295,7 @@ pub struct SessionRuntimeTurnItemSummaryEntry {
     pub tool_call_id: Option<String>,
     pub tool_name: Option<String>,
     pub tool_status: Option<String>,
+    pub tool_arguments: Option<String>,
     pub tool_result: Option<String>,
     pub tool_error: Option<String>,
     pub thread_visible: bool,

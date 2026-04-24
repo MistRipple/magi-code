@@ -3,10 +3,6 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
-use magi_bridge_client::{
-    ChatCompletionPayload, ChatToolChoice, ChatToolDefinition, ChatToolFunctionDefinition,
-    HttpModelBridgeClient, ModelBridgeClient, ModelInvocationRequest, SHADOW_MODEL_PROVIDER,
-};
 use magi_core::TaskStatus;
 use magi_core::{DomainError, EventId, SessionId, UtcMillis, WorkerId};
 use magi_event_bus::{EventContext, EventEnvelope};
@@ -15,10 +11,7 @@ use magi_session_store::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use super::append_session_user_message;
 use crate::{
@@ -29,12 +22,9 @@ use crate::{
     errors::ApiError,
     state::ApiState,
     task_execution::{
-        SessionTurnExecutionRequest, active_execution_branch_is_continue_recoverable,
-        continue_shadow_execution_chain,
+        SessionTurnExecutionRequest, continue_shadow_execution_chain,
     },
 };
-
-const SESSION_TURN_CLASSIFIER_TOOL_NAME: &str = "classify_session_turn";
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -92,7 +82,7 @@ async fn submit_session_turn(
 ) -> Result<Json<SessionTurnResponseDto>, ApiError> {
     validate_session_turn_input(&request)?;
     let accepted_at = super::monotonic_accepted_at();
-    let decision = classify_session_turn(&state, &request)?;
+    let decision = decide_session_turn_locally(&request);
     match decision.route {
         SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute => {
             submit_regular_session_turn(state, request, accepted_at, decision).map(Json)
@@ -183,13 +173,11 @@ fn append_session_assistant_message(
     );
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
 struct SessionTurnIntentDecision {
     route: SessionTurnRouteDto,
     task_title: Option<String>,
     execution_goal: Option<String>,
-    #[serde(default)]
     required_workers: Vec<String>,
     tool_intent: Option<String>,
 }
@@ -209,192 +197,26 @@ fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), Ap
     Ok(())
 }
 
-fn classify_session_turn(
-    state: &ApiState,
-    request: &SessionTurnRequestDto,
-) -> Result<SessionTurnIntentDecision, ApiError> {
-    let session_id = request.requested_session_id().or_else(|| {
-        state
-            .session_store
-            .current_session()
-            .map(|session| session.session_id)
-    });
-    let has_recoverable_chain = session_id
-        .as_ref()
-        .and_then(|session_id| state.session_store.runtime_sidecar(session_id))
-        .and_then(|sidecar| sidecar.active_execution_chain)
-        .is_some_and(|chain| {
-            chain.branches.iter().any(|branch| {
-                active_execution_branch_is_continue_recoverable(state, &chain, branch)
-            })
-        });
-    let client = resolve_session_turn_model_client(state)?;
-    let prompt = build_session_turn_classifier_prompt(request, has_recoverable_chain);
-    let response = client
-        .invoke(ModelInvocationRequest {
-            provider: SHADOW_MODEL_PROVIDER.to_string(),
-            prompt,
-            messages: None,
-            tools: Some(session_turn_classifier_tools()),
-            tool_choice: Some(ChatToolChoice::force_function(
-                SESSION_TURN_CLASSIFIER_TOOL_NAME,
-            )),
-        })
-        .map_err(|error| ApiError::internal_assembly("session turn 分类失败", error))?;
-    if !response.ok {
-        return Err(ApiError::internal_assembly(
-            "session turn 分类失败",
-            "模型返回非成功状态",
-        ));
-    }
-    let decision = parse_session_turn_intent_decision(&response.payload)?;
-    if matches!(decision.route, SessionTurnRouteDto::Continue) && !has_recoverable_chain {
-        return Err(ApiError::InvalidInput(
-            "模型判定继续会话，但当前 session 没有可继续的执行链".to_string(),
-        ));
-    }
-    Ok(decision)
-}
-
-fn resolve_session_turn_model_client(
-    state: &ApiState,
-) -> Result<Arc<dyn ModelBridgeClient>, ApiError> {
-    let config = state.settings_store.get_section("orchestrator");
-    let base_url = config
-        .get("baseUrl")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if let Some(base_url) = base_url {
-        let api_key = config
-            .get("apiKey")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let model = config
-            .get("model")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("gpt-4")
-            .to_string();
-        return Ok(Arc::new(HttpModelBridgeClient::new(
-            base_url.to_string(),
-            api_key,
-            model,
-        )));
+fn decide_session_turn_locally(request: &SessionTurnRequestDto) -> SessionTurnIntentDecision {
+    if request.deep_task {
+        let trimmed_text = request.trimmed_text();
+        let task_title = request.mission_title(trimmed_text.as_deref());
+        return SessionTurnIntentDecision {
+            route: SessionTurnRouteDto::Task,
+            task_title: Some(task_title),
+            execution_goal: trimmed_text,
+            required_workers: Vec::new(),
+            tool_intent: None,
+        };
     }
 
-    if state.model_bridge_client_is_real() {
-        if let Some(client) = state.model_bridge_client() {
-            return Ok(client.clone());
-        }
+    SessionTurnIntentDecision {
+        route: SessionTurnRouteDto::Chat,
+        task_title: None,
+        execution_goal: None,
+        required_workers: Vec::new(),
+        tool_intent: None,
     }
-
-    #[cfg(test)]
-    if let Some(client) = state.model_bridge_client() {
-        return Ok(client.clone());
-    }
-
-    Err(ApiError::InvalidInput(
-        "session turn 分类需要先配置真实编排模型".to_string(),
-    ))
-}
-
-fn build_session_turn_classifier_prompt(
-    request: &SessionTurnRequestDto,
-    has_recoverable_chain: bool,
-) -> String {
-    let text = request.trimmed_text().unwrap_or_default();
-    let skill_name = request
-        .skill_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("");
-    format!(
-        r#"你是 Magi 的 Session Turn 编排分类器，只能返回一个严格 JSON 对象，不要输出任何解释。
-
-字段：
-- route: 必填，只能是 "chat" | "execute" | "task" | "continue"
-- taskTitle: route=task 时可选，产品化任务标题
-- executionGoal: route=task 时可选，执行目标
-- requiredWorkers: 可选字符串数组
-- toolIntent: route=execute 时可选，工具执行意图
-
-判定原则：
-- chat: 普通对话、解释、问答、讨论，不创建任务
-- execute: 需要即时工具调用，但不需要产品级任务编排
-- task: 需要拆解、长流程、多 worker、可中断续接、持续跟踪的产品级任务
-- continue: 用户表达继续/恢复/接着执行，且 hasRecoverableChain=true
-
-状态：
-hasRecoverableChain={has_recoverable_chain}
-deepTask={}
-skillName={}
-imageCount={}
-userText={}
-
-只返回 JSON。"#,
-        request.deep_task,
-        serde_json::to_string(skill_name).unwrap_or_else(|_| "\"\"".to_string()),
-        request.images.len(),
-        serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string())
-    )
-}
-
-fn parse_session_turn_intent_decision(
-    payload: &str,
-) -> Result<SessionTurnIntentDecision, ApiError> {
-    let payload =
-        serde_json::from_str::<ChatCompletionPayload>(payload.trim()).map_err(|error| {
-            ApiError::InvalidInput(format!(
-                "session turn 分类响应不是合法工具调用载荷: {error}"
-            ))
-        })?;
-    let tool_call = payload
-        .tool_calls
-        .iter()
-        .find(|call| call.function.name == SESSION_TURN_CLASSIFIER_TOOL_NAME)
-        .ok_or_else(|| {
-            ApiError::InvalidInput("session turn 分类响应缺少结构化工具调用".to_string())
-        })?;
-    if tool_call.function.arguments.trim().is_empty() {
-        return Err(ApiError::InvalidInput(
-            "session turn 分类工具参数为空".to_string(),
-        ));
-    }
-    serde_json::from_str::<SessionTurnIntentDecision>(&tool_call.function.arguments)
-        .map_err(|error| ApiError::InvalidInput(format!("session turn 分类结构不合法: {error}")))
-}
-
-fn session_turn_classifier_tools() -> Vec<ChatToolDefinition> {
-    vec![ChatToolDefinition {
-        kind: "function".to_string(),
-        function: ChatToolFunctionDefinition {
-            name: SESSION_TURN_CLASSIFIER_TOOL_NAME.to_string(),
-            description: "输出 Magi session turn 编排路线".to_string(),
-            parameters: json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "route": {
-                        "type": "string",
-                        "enum": ["chat", "execute", "task", "continue"]
-                    },
-                    "taskTitle": { "type": "string" },
-                    "executionGoal": { "type": "string" },
-                    "requiredWorkers": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "toolIntent": { "type": "string" }
-                },
-                "required": ["route"]
-            }),
-        },
-    }]
 }
 
 fn submit_regular_session_turn(
@@ -439,6 +261,7 @@ fn submit_regular_session_turn(
             tool_call_id: None,
             tool_name: None,
             tool_status: None,
+            tool_arguments: None,
             tool_result: None,
             tool_error: None,
             thread_visible: false,
@@ -451,44 +274,34 @@ fn submit_regular_session_turn(
         .session_store
         .upsert_current_turn(session_id.clone(), turn)
         .map_err(|error| ApiError::internal_assembly("写入 session turn 失败", error))?;
-    let dispatcher = state.session_turn_dispatcher().ok_or_else(|| {
-        ApiError::internal_assembly("执行 session turn 失败", "session turn dispatcher 未配置")
-    })?;
+    let event_id = publish_regular_session_turn_accepted_event(
+        &state,
+        &session_id,
+        workspace_id.as_ref(),
+        accepted_at,
+        created_session,
+        decision.route,
+    )?;
     let prompt = decision
         .tool_intent
         .as_deref()
         .filter(|intent| !intent.trim().is_empty())
         .map(|intent| format!("{}\n\n用户原始输入：{}", intent.trim(), message))
         .unwrap_or_else(|| message.clone());
-    let output = dispatcher.execute_session_turn(SessionTurnExecutionRequest {
-        session_id: session_id.clone(),
-        workspace_id,
-        prompt,
-        use_tools: matches!(decision.route, SessionTurnRouteDto::Execute),
-        skill_name: request.skill_name.clone(),
-    })?;
-    append_session_assistant_message(&state, &session_id, accepted_at, &output.final_content);
-    state.persist_session_durable_state()?;
-    let event_id = EventId::new(format!("event-session-turn-{}", accepted_at.0));
-    state
-        .event_bus
-        .publish(
-            EventEnvelope::domain(
-                event_id.clone(),
-                "session.turn.completed",
-                json!({
-                    "session_id": session_id.to_string(),
-                    "route": decision.route,
-                    "created_session": created_session,
-                    "required_workers": decision.required_workers,
-                }),
-            )
-            .with_context(EventContext {
-                session_id: Some(session_id.clone()),
-                ..EventContext::default()
-            }),
-        )
-        .map_err(|err| ApiError::event_publish_failed("session turn 事件发布失败", err))?;
+    spawn_regular_session_turn_execution(
+        state.clone(),
+        SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            workspace_id: workspace_id.clone(),
+            prompt,
+            use_tools: true,
+            skill_name: request.skill_name.clone(),
+        },
+        accepted_at,
+        decision.route,
+        created_session,
+        decision.required_workers,
+    );
 
     Ok(SessionTurnResponseDto::new(
         session_id,
@@ -501,6 +314,135 @@ fn submit_regular_session_turn(
         None,
         None,
     ))
+}
+
+fn spawn_regular_session_turn_execution(
+    state: ApiState,
+    execution_request: SessionTurnExecutionRequest,
+    accepted_at: UtcMillis,
+    route: SessionTurnRouteDto,
+    created_session: bool,
+    required_workers: Vec<String>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let session_id = execution_request.session_id.clone();
+        let workspace_id = execution_request.workspace_id.clone();
+        let dispatcher = match state.session_turn_dispatcher() {
+            Some(dispatcher) => dispatcher.clone(),
+            None => {
+                tracing::error!(
+                    session_id = %session_id,
+                    "regular session turn background execution failed: dispatcher missing"
+                );
+                let _ = state
+                    .session_store
+                    .update_current_turn_status(&session_id, "failed");
+                let _ = state.persist_session_durable_state();
+                return;
+            }
+        };
+
+        match dispatcher.execute_session_turn(execution_request) {
+            Ok(output) => {
+                append_session_assistant_message(
+                    &state,
+                    &session_id,
+                    accepted_at,
+                    &output.final_content,
+                );
+                if let Err(error) = state.persist_session_durable_state() {
+                    tracing::error!(
+                        session_id = %session_id,
+                        ?error,
+                        "regular session turn background persist failed"
+                    );
+                }
+                let event_id = EventId::new(format!("event-session-turn-{}", accepted_at.0));
+                if let Err(error) = state.event_bus.publish(
+                    EventEnvelope::domain(
+                        event_id,
+                        "session.turn.completed",
+                        json!({
+                            "session_id": session_id.to_string(),
+                            "route": route,
+                            "created_session": created_session,
+                            "required_workers": required_workers,
+                        }),
+                    )
+                    .with_context(EventContext {
+                        session_id: Some(session_id.clone()),
+                        workspace_id,
+                        ..EventContext::default()
+                    }),
+                ) {
+                    tracing::error!(
+                        session_id = %session_id,
+                        ?error,
+                        "regular session turn completed event publish failed"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    session_id = %session_id,
+                    ?error,
+                    "regular session turn background execution failed"
+                );
+                let _ = state
+                    .session_store
+                    .update_current_turn_status(&session_id, "failed");
+                let _ = state.persist_session_durable_state();
+                let event_id = EventId::new(format!("event-session-turn-failed-{}", accepted_at.0));
+                let _ = state.event_bus.publish(
+                    EventEnvelope::domain(
+                        event_id,
+                        "session.turn.failed",
+                        json!({
+                            "session_id": session_id.to_string(),
+                            "route": route,
+                            "error": format!("{error:?}"),
+                        }),
+                    )
+                    .with_context(EventContext {
+                        session_id: Some(session_id),
+                        workspace_id,
+                        ..EventContext::default()
+                    }),
+                );
+            }
+        }
+    });
+}
+
+fn publish_regular_session_turn_accepted_event(
+    state: &ApiState,
+    session_id: &SessionId,
+    workspace_id: Option<&magi_core::WorkspaceId>,
+    accepted_at: UtcMillis,
+    created_session: bool,
+    route: SessionTurnRouteDto,
+) -> Result<EventId, ApiError> {
+    let event_id = EventId::new(format!("event-session-turn-accepted-{}", accepted_at.0));
+    let event = EventEnvelope::domain(
+        event_id.clone(),
+        "session.turn.accepted",
+        json!({
+            "session_id": session_id.to_string(),
+            "workspace_id": workspace_id.map(ToString::to_string),
+            "created_session": created_session,
+            "route": route,
+        }),
+    )
+    .with_context(EventContext {
+        workspace_id: workspace_id.cloned(),
+        session_id: Some(session_id.clone()),
+        ..EventContext::default()
+    });
+    state
+        .event_bus
+        .publish(event)
+        .map_err(|err| ApiError::event_publish_failed("session turn 接受事件发布失败", err))?;
+    Ok(event_id)
 }
 
 fn publish_session_turn_continue_event(
@@ -538,6 +480,8 @@ fn publish_session_turn_continue_event(
 #[serde(rename_all = "camelCase")]
 struct SwitchSessionRequest {
     session_id: String,
+    #[serde(default, alias = "workspace_id")]
+    workspace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -575,6 +519,23 @@ async fn switch_session(
     Json(request): Json<SwitchSessionRequest>,
 ) -> Result<Json<SessionSelectionResponseDto>, ApiError> {
     let session_id = SessionId::new(&request.session_id);
+    if let Some(workspace_id) = request
+        .workspace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        let session = state
+            .session_store
+            .session(&session_id)
+            .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+        if session.workspace_id.as_deref() != Some(workspace_id) {
+            return Err(ApiError::InvalidInput(format!(
+                "会话 {} 不属于 workspace {}",
+                session_id, workspace_id
+            )));
+        }
+    }
     state
         .session_store
         .switch_session(&session_id)

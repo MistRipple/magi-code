@@ -2175,21 +2175,24 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
         wait_for_task_projection_completed(app.clone(), root_task_id, session_id).await;
     assert_completed_two_task_projection(&projection);
 
-    let messages = get_json(
+    let messages_page = get_json(
         app.clone(),
         &format!("/api/messages?sessionId={session_id}"),
     )
     .await;
-    let msg_list = messages["messages"]
+    let timeline = messages_page["timeline"]
         .as_array()
-        .expect("messages should be an array");
+        .expect("timeline should be an array");
     assert!(
-        msg_list.iter().any(|m| m["role"] == "user"),
+        timeline.iter().any(|entry| entry["kind"] == "UserMessage"),
         "timeline should contain user message"
     );
-    let user_msg = msg_list.iter().find(|m| m["role"] == "user").unwrap();
+    let user_msg = timeline
+        .iter()
+        .find(|entry| entry["kind"] == "UserMessage")
+        .unwrap();
     assert!(
-        user_msg["content"]
+        user_msg["message"]
             .as_str()
             .unwrap()
             .contains("Hello integration test"),
@@ -2259,11 +2262,11 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
     )
     .await;
     assert_eq!(
-        before_restart_messages["messages"]
+        before_restart_messages["timeline"]
             .as_array()
-            .expect("messages should be an array")
+            .expect("timeline should be an array")
             .iter()
-            .filter(|message| message["role"] == "user")
+            .filter(|entry| entry["kind"] == "UserMessage")
             .count(),
         1,
         "restart 前应存在 1 条用户消息"
@@ -2283,11 +2286,11 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
     )
     .await;
     assert_eq!(
-        after_restart_messages["messages"]
+        after_restart_messages["timeline"]
             .as_array()
-            .expect("messages should be an array after restart")
+            .expect("timeline should be an array after restart")
             .iter()
-            .filter(|message| message["role"] == "user")
+            .filter(|entry| entry["kind"] == "UserMessage")
             .count(),
         1,
         "restart 后用户消息不应丢失"
@@ -2988,16 +2991,19 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
         wait_for_task_projection_completed(app.clone(), &second_root_task_id, &session_id).await;
     assert_completed_two_task_projection(&second_projection);
 
-    let messages = get_json(
+    let messages_page = get_json(
         app.clone(),
         &format!("/api/messages?sessionId={session_id}"),
     )
     .await;
-    let msg_list = messages["messages"]
+    let timeline = messages_page["timeline"]
         .as_array()
-        .expect("messages should be an array");
+        .expect("timeline should be an array");
 
-    let user_messages: Vec<_> = msg_list.iter().filter(|m| m["role"] == "user").collect();
+    let user_messages: Vec<_> = timeline
+        .iter()
+        .filter(|entry| entry["kind"] == "UserMessage")
+        .collect();
     assert_eq!(user_messages.len(), 2, "should have 2 user messages");
 
     let first_accepted_at = first_body["acceptedAt"].as_u64().unwrap();

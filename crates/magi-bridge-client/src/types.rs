@@ -144,6 +144,8 @@ pub struct ChatCompletionPayload {
     #[serde(default)]
     pub finish_reason: Option<String>,
     #[serde(default)]
+    pub usage: Option<Value>,
+    #[serde(default)]
     pub tool_calls: Vec<ChatToolCall>,
 }
 
@@ -280,6 +282,7 @@ impl BridgeResponse {
             ChatCompletionPayload {
                 content: Some(self.payload.clone()),
                 finish_reason: None,
+                usage: None,
                 tool_calls: Vec::new(),
             },
         )

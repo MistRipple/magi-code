@@ -1,11 +1,48 @@
-use crate::{BuiltinTool, BuiltinToolAccessMode, BuiltinToolName, BuiltinToolSpec};
-use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel};
+use crate::{
+    BuiltinTool, BuiltinToolAccessMode, BuiltinToolName, BuiltinToolSpec, ToolExecutionContext,
+};
+use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel, UtcMillis};
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
+
+const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
+const MAX_SHELL_TIMEOUT_MS: u64 = 120_000;
+const SHELL_TIMEOUT_POLL_MS: u64 = 20;
+
+struct ShellExecOutput {
+    status: Option<ExitStatus>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    timed_out: bool,
+}
+
+struct ManagedProcess {
+    terminal_id: u64,
+    command: String,
+    cwd: String,
+    session_id: Option<String>,
+    workspace_id: Option<String>,
+    child: Child,
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    started_at_ms: u64,
+}
+
+static NEXT_TERMINAL_ID: AtomicU64 = AtomicU64::new(1);
+static PROCESS_TABLE: LazyLock<Mutex<HashMap<u64, ManagedProcess>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Debug)]
 pub(crate) struct NormalizedBuiltinTool {
@@ -33,7 +70,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
         self.name.as_str()
     }
 
-    fn execute(&self, input: &str) -> String {
+    fn execute(&self, input: &str, context: &ToolExecutionContext) -> String {
         match self.name {
             BuiltinToolName::FileRead => execute_file_read(input),
             BuiltinToolName::FileWrite => execute_file_write(input),
@@ -44,7 +81,12 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::FileMove => execute_file_move(input),
             BuiltinToolName::SearchText => execute_search_text(input),
             BuiltinToolName::SearchSemantic => execute_search_semantic(input),
-            BuiltinToolName::ShellExec => execute_shell_exec(input),
+            BuiltinToolName::ShellExec => execute_shell_exec(input, context),
+            BuiltinToolName::ProcessLaunch => execute_process_launch(input, context),
+            BuiltinToolName::ProcessRead => execute_process_read(input, context),
+            BuiltinToolName::ProcessWrite => execute_process_write(input, context),
+            BuiltinToolName::ProcessKill => execute_process_kill(input, context),
+            BuiltinToolName::ProcessList => execute_process_list(context),
             BuiltinToolName::ProcessInspect => execute_process_inspect(input),
             BuiltinToolName::DiffPreview => execute_diff_preview(input),
             BuiltinToolName::WebSearch => execute_web_search(input),
@@ -288,7 +330,7 @@ fn execute_search_text(input: &str) -> String {
     .to_string()
 }
 
-fn execute_shell_exec(input: &str) -> String {
+fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
     let request = parse_json_object(input);
     let command = request
         .as_ref()
@@ -296,6 +338,13 @@ fn execute_shell_exec(input: &str) -> String {
         .unwrap_or_else(|| input.trim().to_string());
     if command.is_empty() {
         return builtin_error("shell_exec", "缺少 shell 命令");
+    }
+    if request
+        .as_ref()
+        .and_then(|object| field_bool(object, &["background", "long_running", "longRunning"]))
+        .unwrap_or(false)
+    {
+        return execute_process_launch(input, context);
     }
     let access_mode = request
         .as_ref()
@@ -321,24 +370,28 @@ fn execute_shell_exec(input: &str) -> String {
         .as_ref()
         .and_then(|object| field_string(object, &["shell"]))
         .unwrap_or_else(default_shell_binary);
+    let timeout_ms = request
+        .as_ref()
+        .and_then(|object| field_usize(object, &["timeout_ms", "timeoutMs", "timeout"]))
+        .map(|value| value as u64)
+        .unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)
+        .clamp(SHELL_TIMEOUT_POLL_MS, MAX_SHELL_TIMEOUT_MS);
 
-    let output = match Command::new(&shell)
-        .arg(shell_arg())
-        .arg(&command)
-        .current_dir(&cwd)
-        .output()
-    {
+    let output = match execute_shell_command_with_timeout(&shell, &command, &cwd, timeout_ms) {
         Ok(output) => output,
         Err(error) => return builtin_error("shell_exec", format!("命令执行失败: {error}")),
     };
 
-    let status = if output.status.success() {
-        "succeeded"
-    } else {
-        "failed"
-    };
+    let succeeded = output
+        .status
+        .as_ref()
+        .map(ExitStatus::success)
+        .unwrap_or(false)
+        && !output.timed_out;
+    let status = if succeeded { "succeeded" } else { "failed" };
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.as_ref().and_then(ExitStatus::code);
 
     serde_json::json!({
         "tool": "shell_exec",
@@ -346,16 +399,336 @@ fn execute_shell_exec(input: &str) -> String {
         "command": command,
         "cwd": cwd.display().to_string(),
         "access_mode": access_mode.as_str(),
-        "exit_code": output.status.code(),
+        "timeout_ms": timeout_ms,
+        "timed_out": output.timed_out,
+        "exit_code": exit_code,
         "stdout": stdout,
         "stderr": stderr,
-        "summary": if output.status.success() {
+        "summary": if output.timed_out {
+            format!("命令执行超时({timeout_ms}ms): {command}")
+        } else if succeeded {
             format!("命令执行成功: {}", command)
         } else {
-            format!("命令执行失败(退出码 {:?}): {}", output.status.code(), command)
+            format!("命令执行失败(退出码 {:?}): {}", exit_code, command)
         }
     })
     .to_string()
+}
+
+fn execute_shell_command_with_timeout(
+    shell: &str,
+    command: &str,
+    cwd: &Path,
+    timeout_ms: u64,
+) -> Result<ShellExecOutput, String> {
+    let mut child = Command::new(shell)
+        .arg(shell_arg())
+        .arg(command)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader = thread::spawn(move || read_child_pipe(stdout));
+    let stderr_reader = thread::spawn(move || read_child_pipe(stderr));
+    let started_at = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait().map_err(|error| error.to_string())? {
+            Some(status) => break Some(status),
+            None if started_at.elapsed() >= timeout => {
+                timed_out = true;
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+            None => thread::sleep(Duration::from_millis(SHELL_TIMEOUT_POLL_MS)),
+        }
+    };
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(ShellExecOutput {
+        status,
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+fn read_child_pipe<T: Read>(pipe: Option<T>) -> Vec<u8> {
+    let Some(mut pipe) = pipe else {
+        return Vec::new();
+    };
+    let mut buffer = Vec::new();
+    let _ = pipe.read_to_end(&mut buffer);
+    buffer
+}
+
+fn execute_process_launch(input: &str, context: &ToolExecutionContext) -> String {
+    let request = parse_json_object(input);
+    let command = request
+        .as_ref()
+        .and_then(|object| field_string(object, &["command", "script", "line"]))
+        .unwrap_or_else(|| input.trim().to_string());
+    if command.is_empty() {
+        return builtin_error("process_launch", "缺少 shell 命令");
+    }
+    let cwd_input = request
+        .as_ref()
+        .and_then(|object| field_string(object, &["cwd", "working_directory", "workdir"]));
+    let cwd = match cwd_input {
+        Some(value) => match resolve_path(&value) {
+            Ok(path) => path,
+            Err(error) => return builtin_error("process_launch", error),
+        },
+        None => match std::env::current_dir() {
+            Ok(path) => path,
+            Err(error) => {
+                return builtin_error("process_launch", format!("无法解析当前目录: {error}"));
+            }
+        },
+    };
+    let shell = request
+        .as_ref()
+        .and_then(|object| field_string(object, &["shell"]))
+        .unwrap_or_else(default_shell_binary);
+
+    let mut child = match Command::new(&shell)
+        .arg(shell_arg())
+        .arg(&command)
+        .current_dir(&cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return builtin_error("process_launch", format!("命令启动失败: {error}")),
+    };
+
+    let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
+    spawn_managed_process_reader(child.stdout.take(), Arc::clone(&stdout_buffer));
+    spawn_managed_process_reader(child.stderr.take(), Arc::clone(&stderr_buffer));
+    let terminal_id = NEXT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
+    let process = ManagedProcess {
+        terminal_id,
+        command: command.clone(),
+        cwd: cwd.display().to_string(),
+        session_id: context.session_id.as_ref().map(ToString::to_string),
+        workspace_id: context.workspace_id.as_ref().map(ToString::to_string),
+        child,
+        stdout: stdout_buffer,
+        stderr: stderr_buffer,
+        started_at_ms: UtcMillis::now().0,
+    };
+    PROCESS_TABLE
+        .lock()
+        .expect("process table lock poisoned")
+        .insert(terminal_id, process);
+
+    serde_json::json!({
+        "tool": "process_launch",
+        "status": "succeeded",
+        "terminal_id": terminal_id,
+        "command": command,
+        "cwd": cwd.display().to_string(),
+        "session_id": context.session_id.as_ref().map(ToString::to_string),
+        "workspace_id": context.workspace_id.as_ref().map(ToString::to_string),
+        "startup_status": "running",
+        "summary": format!("已在后台启动进程 #{terminal_id}: {command}")
+    })
+    .to_string()
+}
+
+fn execute_process_read(input: &str, context: &ToolExecutionContext) -> String {
+    let request = match parse_json_object(input) {
+        Some(request) => request,
+        None => return builtin_error("process_read", "输入必须为 JSON 对象，包含 terminal_id"),
+    };
+    let Some(terminal_id) = field_usize(&request, &["terminal_id", "terminalId", "id"]) else {
+        return builtin_error("process_read", "缺少 terminal_id");
+    };
+    let max_bytes = field_usize(&request, &["max_bytes", "preview_bytes", "limit"])
+        .unwrap_or(12_000)
+        .clamp(512, 200_000);
+
+    let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
+    let Some(process) = table.get_mut(&(terminal_id as u64)) else {
+        return builtin_error("process_read", format!("进程不存在: {terminal_id}"));
+    };
+    if !process_belongs_to_context(process, context) {
+        return builtin_error("process_read", "进程不属于当前 session/workspace");
+    }
+    let running = process
+        .child
+        .try_wait()
+        .ok()
+        .flatten()
+        .map(|_| false)
+        .unwrap_or(true);
+    let stdout = tail_utf8(
+        &process.stdout.lock().expect("stdout lock poisoned"),
+        max_bytes,
+    );
+    let stderr = tail_utf8(
+        &process.stderr.lock().expect("stderr lock poisoned"),
+        max_bytes,
+    );
+
+    serde_json::json!({
+        "tool": "process_read",
+        "status": "succeeded",
+        "terminal_id": terminal_id,
+        "running": running,
+        "stdout": stdout,
+        "stderr": stderr,
+        "summary": if running {
+            format!("进程 #{terminal_id} 正在运行")
+        } else {
+            format!("进程 #{terminal_id} 已结束")
+        }
+    })
+    .to_string()
+}
+
+fn execute_process_write(input: &str, context: &ToolExecutionContext) -> String {
+    let request = match parse_json_object(input) {
+        Some(request) => request,
+        None => return builtin_error("process_write", "输入必须为 JSON 对象，包含 terminal_id"),
+    };
+    let Some(terminal_id) = field_usize(&request, &["terminal_id", "terminalId", "id"]) else {
+        return builtin_error("process_write", "缺少 terminal_id");
+    };
+    let content = field_string(&request, &["input", "content", "text"]).unwrap_or_default();
+    let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
+    let Some(process) = table.get_mut(&(terminal_id as u64)) else {
+        return builtin_error("process_write", format!("进程不存在: {terminal_id}"));
+    };
+    if !process_belongs_to_context(process, context) {
+        return builtin_error("process_write", "进程不属于当前 session/workspace");
+    }
+    let Some(stdin) = process.child.stdin.as_mut() else {
+        return builtin_error("process_write", format!("进程 #{terminal_id} 不接受输入"));
+    };
+    if let Err(error) = stdin.write_all(content.as_bytes()) {
+        return builtin_error("process_write", format!("写入进程失败: {error}"));
+    }
+    let _ = stdin.flush();
+    serde_json::json!({
+        "tool": "process_write",
+        "status": "succeeded",
+        "terminal_id": terminal_id,
+        "written_bytes": content.len(),
+        "summary": format!("已写入进程 #{terminal_id}")
+    })
+    .to_string()
+}
+
+fn execute_process_kill(input: &str, context: &ToolExecutionContext) -> String {
+    let request = match parse_json_object(input) {
+        Some(request) => request,
+        None => return builtin_error("process_kill", "输入必须为 JSON 对象，包含 terminal_id"),
+    };
+    let Some(terminal_id) = field_usize(&request, &["terminal_id", "terminalId", "id"]) else {
+        return builtin_error("process_kill", "缺少 terminal_id");
+    };
+    let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
+    let Some(process) = table.get_mut(&(terminal_id as u64)) else {
+        return builtin_error("process_kill", format!("进程不存在: {terminal_id}"));
+    };
+    if !process_belongs_to_context(process, context) {
+        return builtin_error("process_kill", "进程不属于当前 session/workspace");
+    }
+    let _ = process.child.kill();
+    let _ = process.child.wait();
+    table.remove(&(terminal_id as u64));
+    serde_json::json!({
+        "tool": "process_kill",
+        "status": "succeeded",
+        "terminal_id": terminal_id,
+        "summary": format!("已停止进程 #{terminal_id}")
+    })
+    .to_string()
+}
+
+fn execute_process_list(context: &ToolExecutionContext) -> String {
+    let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
+    let mut processes = Vec::new();
+    for process in table.values_mut() {
+        if !process_belongs_to_context(process, context) {
+            continue;
+        }
+        let running = process
+            .child
+            .try_wait()
+            .ok()
+            .flatten()
+            .map(|_| false)
+            .unwrap_or(true);
+        processes.push(serde_json::json!({
+            "terminal_id": process.terminal_id,
+            "command": process.command,
+            "cwd": process.cwd,
+            "running": running,
+            "session_id": process.session_id,
+            "workspace_id": process.workspace_id,
+            "started_at": process.started_at_ms,
+        }));
+    }
+    serde_json::json!({
+        "tool": "process_list",
+        "status": "succeeded",
+        "processes": processes,
+        "summary": "已列出当前上下文后台进程"
+    })
+    .to_string()
+}
+
+fn spawn_managed_process_reader<T: Read + Send + 'static>(
+    pipe: Option<T>,
+    target: Arc<Mutex<Vec<u8>>>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let Some(mut pipe) = pipe else {
+            return;
+        };
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(size) => {
+                    let mut buffer = target.lock().expect("process output lock poisoned");
+                    buffer.extend_from_slice(&chunk[..size]);
+                    const MAX_BUFFER: usize = 1_000_000;
+                    if buffer.len() > MAX_BUFFER {
+                        let drain = buffer.len() - MAX_BUFFER;
+                        buffer.drain(0..drain);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn process_belongs_to_context(process: &ManagedProcess, context: &ToolExecutionContext) -> bool {
+    if let Some(session_id) = context.session_id.as_ref().map(ToString::to_string) {
+        return process.session_id.as_deref() == Some(session_id.as_str());
+    }
+    if let Some(workspace_id) = context.workspace_id.as_ref().map(ToString::to_string) {
+        return process.workspace_id.as_deref() == Some(workspace_id.as_str());
+    }
+    true
+}
+
+fn tail_utf8(bytes: &[u8], max_bytes: usize) -> String {
+    let start = bytes.len().saturating_sub(max_bytes);
+    String::from_utf8_lossy(&bytes[start..]).to_string()
 }
 
 fn execute_process_inspect(input: &str) -> String {

@@ -31,6 +31,11 @@ pub enum BuiltinToolName {
     SearchSemantic,
     // ── Shell / 进程 ──
     ShellExec,
+    ProcessLaunch,
+    ProcessRead,
+    ProcessWrite,
+    ProcessKill,
+    ProcessList,
     ProcessInspect,
     // ── Diff ──
     DiffPreview,
@@ -65,6 +70,11 @@ impl BuiltinToolName {
             Self::SearchText => "search_text",
             Self::SearchSemantic => "search_semantic",
             Self::ShellExec => "shell_exec",
+            Self::ProcessLaunch => "process_launch",
+            Self::ProcessRead => "process_read",
+            Self::ProcessWrite => "process_write",
+            Self::ProcessKill => "process_kill",
+            Self::ProcessList => "process_list",
             Self::ProcessInspect => "process_inspect",
             Self::DiffPreview => "diff_preview",
             Self::WebSearch => "web_search",
@@ -93,6 +103,11 @@ impl BuiltinToolName {
             "search_text" | "code_search_regex" => Some(Self::SearchText),
             "search_semantic" | "code_search_semantic" => Some(Self::SearchSemantic),
             "shell_exec" | "shell" => Some(Self::ShellExec),
+            "process_launch" => Some(Self::ProcessLaunch),
+            "process_read" => Some(Self::ProcessRead),
+            "process_write" => Some(Self::ProcessWrite),
+            "process_kill" => Some(Self::ProcessKill),
+            "process_list" => Some(Self::ProcessList),
             "process_inspect" => Some(Self::ProcessInspect),
             "diff_preview" => Some(Self::DiffPreview),
             "web_search" => Some(Self::WebSearch),
@@ -242,7 +257,7 @@ pub struct ToolExecutionSummary {
 
 pub trait BuiltinTool: Send + Sync {
     fn name(&self) -> &'static str;
-    fn execute(&self, input: &str) -> String;
+    fn execute(&self, input: &str, context: &ToolExecutionContext) -> String;
     fn spec(&self) -> BuiltinToolSpec;
 }
 
@@ -324,6 +339,31 @@ impl ToolRegistry {
                 BuiltinToolName::ShellExec,
                 RiskLevel::High,
                 ApprovalRequirement::Required,
+            ),
+            (
+                BuiltinToolName::ProcessLaunch,
+                RiskLevel::High,
+                ApprovalRequirement::Required,
+            ),
+            (
+                BuiltinToolName::ProcessRead,
+                RiskLevel::Low,
+                ApprovalRequirement::None,
+            ),
+            (
+                BuiltinToolName::ProcessWrite,
+                RiskLevel::Medium,
+                ApprovalRequirement::None,
+            ),
+            (
+                BuiltinToolName::ProcessKill,
+                RiskLevel::Medium,
+                ApprovalRequirement::None,
+            ),
+            (
+                BuiltinToolName::ProcessList,
+                RiskLevel::Low,
+                ApprovalRequirement::None,
             ),
             (
                 BuiltinToolName::ProcessInspect,
@@ -413,7 +453,10 @@ impl ToolRegistry {
         self.builtin_tools
             .get(tool_name)
             .map(|_| match BuiltinToolName::from_str(tool_name) {
-                Some(name) if name == BuiltinToolName::ShellExec => {
+                Some(name)
+                    if name == BuiltinToolName::ShellExec
+                        || name == BuiltinToolName::ProcessLaunch =>
+                {
                     BuiltinToolAccessMode::MaybeWrite
                 }
                 Some(name) if name.is_write_operation() => BuiltinToolAccessMode::ExplicitWrite,
@@ -479,7 +522,7 @@ impl ToolRegistry {
                             return output;
                         }
                     };
-                    let payload = tool.execute(&input.input);
+                    let payload = tool.execute(&input.input, &context);
                     drop(write_guard);
                     ToolExecutionOutput {
                         tool_call_id: input.tool_call_id.clone(),
@@ -861,6 +904,7 @@ mod tests {
         assert_eq!(payload["tool"], "shell_exec");
         assert_eq!(payload["access_mode"], "maybe_write");
         assert_eq!(payload["stdout"], "hello");
+        assert_eq!(payload["timed_out"], false);
 
         let blocked = tool_registry.execute_with_policy(
             ToolExecutionInput {
@@ -875,6 +919,120 @@ mod tests {
             &ToolExecutionPolicy::default(),
         );
         assert_eq!(blocked.status, ExecutionResultStatus::NeedsApproval);
+    }
+
+    #[test]
+    fn shell_exec_times_out_bounded_commands() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+
+        let started_at = std::time::Instant::now();
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-shell-timeout"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "sleep 2",
+                    "timeout_ms": 100
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext::default(),
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert!(
+            started_at.elapsed() < std::time::Duration::from_secs(2),
+            "shell_exec timeout should stop long-running commands before they block the turn"
+        );
+        assert_eq!(output.status, ExecutionResultStatus::Failed);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], "shell_exec");
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["timed_out"], true);
+    }
+
+    #[test]
+    fn process_launch_keeps_long_running_shell_from_blocking_followup_tools() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+        let context = ToolExecutionContext {
+            worker_id: None,
+            task_id: Some(TaskId::new("task-process-launch")),
+            session_id: Some(SessionId::new("session-process-launch")),
+            workspace_id: Some(WorkspaceId::new("workspace-process-launch")),
+        };
+
+        let started_at = std::time::Instant::now();
+        let launch = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-process-launch"),
+                tool_name: BuiltinToolName::ProcessLaunch.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "printf ready && sleep 2",
+                    "access_mode": "read_only"
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context.clone(),
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert!(
+            started_at.elapsed() < std::time::Duration::from_secs(1),
+            "process_launch should return immediately for long-running commands"
+        );
+        assert_eq!(launch.status, ExecutionResultStatus::Succeeded);
+        let launch_payload: Value = serde_json::from_str(&launch.payload).expect("launch json");
+        let terminal_id = launch_payload["terminal_id"]
+            .as_u64()
+            .expect("terminal id should be returned");
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let read = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-process-read"),
+                tool_name: BuiltinToolName::ProcessRead.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "terminal_id": terminal_id }).to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context.clone(),
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(read.status, ExecutionResultStatus::Succeeded);
+        let read_payload: Value = serde_json::from_str(&read.payload).expect("read json");
+        assert!(
+            read_payload["stdout"]
+                .as_str()
+                .expect("stdout")
+                .contains("ready")
+        );
+
+        let kill = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-process-kill"),
+                tool_name: BuiltinToolName::ProcessKill.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "terminal_id": terminal_id }).to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context,
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(kill.status, ExecutionResultStatus::Succeeded);
     }
 
     #[test]
@@ -1995,6 +2153,11 @@ mod tests {
             ("search_text", BuiltinToolName::SearchText),
             ("search_semantic", BuiltinToolName::SearchSemantic),
             ("shell_exec", BuiltinToolName::ShellExec),
+            ("process_launch", BuiltinToolName::ProcessLaunch),
+            ("process_read", BuiltinToolName::ProcessRead),
+            ("process_write", BuiltinToolName::ProcessWrite),
+            ("process_kill", BuiltinToolName::ProcessKill),
+            ("process_list", BuiltinToolName::ProcessList),
             ("process_inspect", BuiltinToolName::ProcessInspect),
             ("diff_preview", BuiltinToolName::DiffPreview),
             ("web_search", BuiltinToolName::WebSearch),
@@ -2066,6 +2229,11 @@ mod tests {
             BuiltinToolName::SearchText,
             BuiltinToolName::SearchSemantic,
             BuiltinToolName::ShellExec,
+            BuiltinToolName::ProcessLaunch,
+            BuiltinToolName::ProcessRead,
+            BuiltinToolName::ProcessWrite,
+            BuiltinToolName::ProcessKill,
+            BuiltinToolName::ProcessList,
             BuiltinToolName::ProcessInspect,
             BuiltinToolName::DiffPreview,
             BuiltinToolName::WebSearch,
@@ -2301,13 +2469,13 @@ mod tests {
         );
     }
 
-    // ── 23 工具全覆盖注册验证 ──
+    // ── 28 工具全覆盖注册验证 ──
 
     #[test]
-    fn all_23_tools_are_registered() {
+    fn all_28_tools_are_registered() {
         let registry = make_registry();
         let specs = registry.builtin_specs();
-        assert_eq!(specs.len(), 23, "应注册 23 个内置工具");
+        assert_eq!(specs.len(), 28, "应注册 28 个内置工具");
         let all_tools = [
             BuiltinToolName::FileRead,
             BuiltinToolName::FileWrite,
@@ -2319,6 +2487,11 @@ mod tests {
             BuiltinToolName::SearchText,
             BuiltinToolName::SearchSemantic,
             BuiltinToolName::ShellExec,
+            BuiltinToolName::ProcessLaunch,
+            BuiltinToolName::ProcessRead,
+            BuiltinToolName::ProcessWrite,
+            BuiltinToolName::ProcessKill,
+            BuiltinToolName::ProcessList,
             BuiltinToolName::ProcessInspect,
             BuiltinToolName::DiffPreview,
             BuiltinToolName::WebSearch,
@@ -2375,6 +2548,10 @@ mod tests {
         );
         assert_eq!(
             registry.builtin_access_mode(BuiltinToolName::ShellExec.as_str()),
+            Some(BuiltinToolAccessMode::MaybeWrite)
+        );
+        assert_eq!(
+            registry.builtin_access_mode(BuiltinToolName::ProcessLaunch.as_str()),
             Some(BuiltinToolAccessMode::MaybeWrite)
         );
     }

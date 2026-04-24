@@ -392,6 +392,7 @@ impl ShadowDaemonRuntime {
             shadow_task_dispatcher
                 .with_model_bridge_client(dispatcher_model_client)
                 .with_settings_store(state.settings_store.clone())
+                .with_usage_authority(state.usage_authority())
                 .with_context_runtime(context_runtime_for_dispatcher)
                 .with_tool_registry(tool_registry_for_dispatcher)
                 .with_skill_runtime(app_skill_runtime),
