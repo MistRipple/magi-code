@@ -246,25 +246,21 @@ export interface AgentChangeDiffPayload {
   currentExists?: boolean;
 }
 
-export interface AgentSessionTurnImagePayload {
+export interface AgentSessionActionImagePayload {
   name: string;
   dataUrl: string;
 }
 
-export type AgentSessionTurnRoute = 'chat' | 'execute' | 'task' | 'continue';
-
-export interface AgentSessionTurnResult {
+export interface AgentSessionActionResult {
   sessionId: string;
   entryId: string;
   eventId: string;
   acceptedAt: number;
   createdSession: boolean;
-  route: AgentSessionTurnRoute;
   /** Root task ID when the backend created a task graph for this action. */
   rootTaskId?: string | null;
   /** 当前轮次实际执行的 action task ID。 */
   actionTaskId?: string | null;
-  executionChainRef?: string | null;
 }
 
 export class AgentApiError extends Error {
@@ -447,27 +443,9 @@ async function parseAgentJson<T>(response: Response, action: string): Promise<T>
     const contentType = response.headers.get('content-type') || '';
     if (contentType.includes('application/json')) {
       try {
-        const payload = await response.json() as {
-          error?: unknown;
-          message?: unknown;
-          detail?: unknown;
-          details?: unknown;
-        };
-        const nestedError = payload?.error;
-        const candidates = [
-          nestedError,
-          typeof nestedError === 'object' && nestedError !== null
-            ? (nestedError as { message?: unknown }).message
-            : undefined,
-          payload?.message,
-          payload?.detail,
-          payload?.details,
-        ];
-        for (const candidate of candidates) {
-          if (typeof candidate === 'string' && candidate.trim()) {
-            backendError = candidate.trim();
-            break;
-          }
+        const payload = await response.json() as { error?: string };
+        if (typeof payload?.error === 'string' && payload.error.trim()) {
+          backendError = payload.error.trim();
         }
       } catch {
         // ignore malformed error payload and fallback to generic message
@@ -568,21 +546,17 @@ function resolveAgentBindingContext(): AgentBindingContext {
     __INITIAL_WORKSPACE_PATH__?: string;
   };
   const storedBinding = readStoredBrowserWorkspaceBinding();
-  const urlWorkspaceId = currentUrl.searchParams.get('workspaceId')?.trim() || '';
-  const urlWorkspacePath = currentUrl.searchParams.get('workspacePath')?.trim() || '';
-  const urlSessionId = currentUrl.searchParams.get('sessionId')?.trim() || '';
-  const hasExplicitUrlWorkspace = Boolean(urlWorkspaceId || urlWorkspacePath);
   return {
-    workspaceId: urlWorkspaceId
+    workspaceId: currentUrl.searchParams.get('workspaceId')?.trim()
       || bootstrapWindow.__INITIAL_WORKSPACE_ID__?.trim()
       || storedBinding.workspaceId
       || '',
-    workspacePath: urlWorkspacePath
+    workspacePath: currentUrl.searchParams.get('workspacePath')?.trim()
       || bootstrapWindow.__INITIAL_WORKSPACE_PATH__?.trim()
       || storedBinding.workspacePath
       || '',
-    sessionId: urlSessionId
-      || (hasExplicitUrlWorkspace ? '' : storedBinding.sessionId)
+    sessionId: currentUrl.searchParams.get('sessionId')?.trim()
+      || storedBinding.sessionId
       || '',
   };
 }
@@ -842,10 +816,6 @@ export async function loadAgentSessionTimelinePage(
       sessionId: sessionId.trim(),
       limit: String(options.limit ?? 50),
     });
-    const binding = readStoredBrowserWorkspaceBinding();
-    if (binding.workspaceId?.trim()) {
-      query.set('workspaceId', binding.workspaceId.trim());
-    }
     if (options.beforeCursor?.trim()) {
       query.set('beforeCursor', options.beforeCursor.trim());
     }
@@ -905,26 +875,63 @@ export async function removeAgentNotification(notificationId: string): Promise<A
   );
 }
 
-export async function submitAgentSessionTurn(
+export async function submitAgentSessionAction(
   payload: {
     text?: string | null;
     deepTask: boolean;
     skillName?: string | null;
-    images: AgentSessionTurnImagePayload[];
+    images: AgentSessionActionImagePayload[];
   },
   bindingOverride?: Partial<AgentBindingContext>,
-): Promise<AgentSessionTurnResult> {
-  return await postBoundJson<AgentSessionTurnResult>(
-    '/api/session/turn',
-    {
-      text: payload.text ?? null,
-      deepTask: payload.deepTask,
-      skillName: payload.skillName ?? null,
-      images: payload.images,
-    },
-    'submit session turn',
-    bindingOverride,
-  );
+): Promise<AgentSessionActionResult> {
+  try {
+    const resolvedBinding = resolveAgentBindingContext();
+    const binding: AgentBindingContext = {
+      workspaceId: bindingOverride?.workspaceId?.trim() || resolvedBinding.workspaceId,
+      workspacePath: bindingOverride?.workspacePath?.trim() || resolvedBinding.workspacePath,
+      sessionId: bindingOverride?.sessionId?.trim() || resolvedBinding.sessionId,
+    };
+    const response = await getTransport().request(agentUrl('/session/action'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: binding.sessionId || null,
+        workspace_id: binding.workspaceId || null,
+        text: payload.text ?? null,
+        deep_task: payload.deepTask,
+        skill_name: payload.skillName ?? null,
+        images: payload.images.map((image) => ({
+          name: image.name,
+          data_url: image.dataUrl,
+        })),
+      }),
+    });
+    const raw = await parseAgentJson<{
+      session_id: string;
+      entry_id: string;
+      event_id: string;
+      accepted_at: number;
+      created_session: boolean;
+      root_task_id?: string | null;
+      action_task_id?: string | null;
+    }>(response, 'submit session action');
+    return {
+      sessionId: raw.session_id,
+      entryId: raw.entry_id,
+      eventId: raw.event_id,
+      acceptedAt: raw.accepted_at,
+      createdSession: raw.created_session,
+      rootTaskId: typeof raw.root_task_id === 'string' && raw.root_task_id.trim() ? raw.root_task_id.trim() : null,
+      actionTaskId: typeof raw.action_task_id === 'string' && raw.action_task_id.trim()
+        ? raw.action_task_id.trim()
+        : null,
+    };
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
+    }
+    throw error;
+  }
 }
 
 export async function interruptAgentTask(
@@ -933,38 +940,26 @@ export async function interruptAgentTask(
   return await postBoundJson<Record<string, unknown>>('/api/task/interrupt', payload, 'interrupt task');
 }
 
+export async function clearAgentAllTasks(): Promise<Record<string, unknown>> {
+  return await postBoundJson<Record<string, unknown>>('/api/task/clear-all', {}, 'clear all tasks');
+}
+
+export async function startAgentTask(taskId: string): Promise<Record<string, unknown>> {
+  return await postBoundJson<Record<string, unknown>>('/api/task/start', { taskId }, 'start task');
+}
+
 export async function continueAgentSession(
   sessionId: string,
-  options: { promptText?: string | null } = {},
-): Promise<{
-  sessionId: string;
-  missionId: string;
-  rootTaskId: string;
-  executionChainRef: string;
-  resumedBranchCount: number;
-  status: string;
-  runnerStarted: boolean;
-  eventId: string;
-  continuedAt: number;
-}> {
-  return await postBoundJson<{
-    sessionId: string;
-    missionId: string;
-    rootTaskId: string;
-    executionChainRef: string;
-    resumedBranchCount: number;
-    status: string;
-    runnerStarted: boolean;
-    eventId: string;
-    continuedAt: number;
-  }>(
+): Promise<Record<string, unknown>> {
+  return await postBoundJson<Record<string, unknown>>(
     '/api/session/continue',
-    {
-      sessionId,
-      ...(typeof options.promptText === 'string' ? { promptText: options.promptText } : {}),
-    },
+    { sessionId },
     'continue session',
   );
+}
+
+export async function deleteAgentTask(taskId: string): Promise<Record<string, unknown>> {
+  return await postBoundJson<Record<string, unknown>>('/api/task/delete', { taskId }, 'delete task');
 }
 
 export async function getAgentSettingsBootstrap(
@@ -1024,6 +1019,10 @@ export async function saveAgentWorkerConfig(worker: string, config: Record<strin
 
 export async function saveAgentUserRules(data: Record<string, unknown>): Promise<Record<string, unknown>> {
   return await postBoundJson<Record<string, unknown>>('/api/settings/user-rules/save', data, 'save user rules');
+}
+
+export async function resetAgentUserRules(): Promise<Record<string, unknown>> {
+  return await postBoundJson<Record<string, unknown>>('/api/settings/user-rules/reset', {}, 'reset user rules');
 }
 
 export async function saveAgentOrchestratorConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -1097,28 +1096,39 @@ export async function clearAgentProjectKnowledge(): Promise<AgentKnowledgeMutati
   return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/clear', {}, 'clear project knowledge');
 }
 
-export async function getAgentProjectKnowledge(): Promise<Record<string, unknown>> {
+export async function getAgentAdrs(): Promise<Record<string, unknown>> {
   const query = buildBoundQuery({});
-  const response = await getTransport().request(agentUrl('/api/knowledge', query));
-  return await parseAgentJson<Record<string, unknown>>(response, 'load project knowledge');
-}
-
-export async function getAgentAdrs(filter?: { status?: string }): Promise<Record<string, unknown>> {
-  const query = buildBoundQuery(filter?.status ? { status: filter.status } : {});
   const response = await getTransport().request(agentUrl(`/api/knowledge/adrs`, query));
   return await parseAgentJson<Record<string, unknown>>(response, 'load adrs');
 }
 
-export async function getAgentFaqs(filter?: { category?: string }): Promise<Record<string, unknown>> {
-  const query = buildBoundQuery(filter?.category ? { category: filter.category } : {});
+export async function getAgentFaqs(): Promise<Record<string, unknown>> {
+  const query = buildBoundQuery({});
   const response = await getTransport().request(agentUrl(`/api/knowledge/faqs`, query));
   return await parseAgentJson<Record<string, unknown>>(response, 'load faqs');
+}
+
+export async function searchAgentAdrs(keyword: string): Promise<Record<string, unknown>> {
+  const query = buildBoundQuery({ q: keyword });
+  const response = await getTransport().request(agentUrl(`/api/knowledge/adrs/search`, query));
+  return await parseAgentJson<Record<string, unknown>>(response, 'search adrs');
 }
 
 export async function searchAgentFaqs(keyword: string): Promise<Record<string, unknown>> {
   const query = buildBoundQuery({ q: keyword });
   const response = await getTransport().request(agentUrl(`/api/knowledge/faqs/search`, query));
   return await parseAgentJson<Record<string, unknown>>(response, 'search faqs');
+}
+
+export async function getAgentLearnings(): Promise<Record<string, unknown>> {
+  const response = await getTransport().request(agentUrl(`/api/knowledge/learnings`, buildBoundQuery({})));
+  return await parseAgentJson<Record<string, unknown>>(response, 'load learnings');
+}
+
+export async function searchAgentLearnings(keyword: string): Promise<Record<string, unknown>> {
+  const query = buildBoundQuery({ q: keyword });
+  const response = await getTransport().request(agentUrl(`/api/knowledge/learnings/search`, query));
+  return await parseAgentJson<Record<string, unknown>>(response, 'search learnings');
 }
 
 export async function addAgentAdr(adr: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
@@ -1135,6 +1145,14 @@ export async function addAgentFaq(faq: Record<string, unknown>): Promise<AgentKn
 
 export async function updateAgentFaq(id: string, updates: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
   return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/faq/update', { id, updates }, 'update faq');
+}
+
+export async function addAgentLearning(learning: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
+  return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/learning/add', { learning }, 'add learning');
+}
+
+export async function updateAgentLearning(id: string, updates: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
+  return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/learning/update', { id, updates }, 'update learning');
 }
 
 export async function deleteAgentAdr(id: string): Promise<AgentKnowledgeMutationPayload> {

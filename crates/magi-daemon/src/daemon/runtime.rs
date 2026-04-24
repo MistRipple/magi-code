@@ -5,69 +5,35 @@ use super::{
     maintenance::{ShadowRuntimeMaintenance, ShadowRuntimeMaintenanceConfig},
     persistence::{ShadowRuntimeSidecarPersistence, ShadowStateRepository},
 };
-use magi_api::task_execution::ShadowTaskDispatcher;
 use magi_api::{
-    ApiState, DirectHttpModelProbeConfig, RunnerManager, RuntimeStatePersistence, SettingsStore,
-    build_router,
+    build_router, ApiState, DirectHttpModelProbeConfig, RunnerManager,
+    RuntimeStatePersistence, SettingsStore,
 };
-#[cfg(not(test))]
-use magi_bridge_client::JsonRpcModelBridgeClient;
+use magi_api::task_execution::ShadowTaskDispatcher;
 use magi_bridge_client::{
     BridgeDispatchRuntime, BridgeServerKind, BridgeTransport, HttpModelBridgeClient,
-    JsonRpcHostBridgeClient, JsonRpcMcpBridgeClient, JsonRpcStdioTransport, StdioMcpBridgeClient,
+    JsonRpcHostBridgeClient, JsonRpcMcpBridgeClient, JsonRpcModelBridgeClient,
+    JsonRpcStdioTransport, StdioMcpBridgeClient,
 };
-use magi_context_runtime::{ContextBudget, ContextRuntime};
 use magi_core::EventId;
 use magi_core::{LeaseId, TaskStatus};
+use magi_context_runtime::{ContextBudget, ContextRuntime};
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
-use magi_knowledge_store::KnowledgeStore;
+use magi_knowledge_store::{code_scanner::ingest_workspace_code_index, KnowledgeStore};
 use magi_memory_store::MemoryStore;
-use magi_orchestrator::task_runner::{EventBasedResultReceiver, TaskOutcome, TaskResult};
 use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
+use magi_orchestrator::task_runner::{EventBasedResultReceiver, TaskResult, TaskOutcome};
 use magi_session_store::SessionStore;
 use magi_skill_runtime::SkillDispatchRuntime;
 use magi_tool_runtime::ToolRegistry;
-use magi_worker_runtime::{WorkerRuntime, WorkerRuntimeBranchSnapshot};
+use magi_worker_runtime::WorkerRuntime;
 use magi_workspace::WorkspaceStore;
-use std::{env, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, env, path::PathBuf, sync::Arc};
 use tracing::warn;
 
 #[cfg(test)]
 struct StaticTestModelBridgeClient;
-
-#[cfg(test)]
-fn classifier_payload_for_prompt(prompt: &str) -> Option<String> {
-    if !prompt.contains("Session Turn 编排分类器") {
-        return None;
-    }
-    let user_text = prompt
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("userText="))
-        .unwrap_or("");
-    let arguments = serde_json::json!({
-        "route": "task",
-        "taskTitle": "模型判定任务",
-        "executionGoal": user_text.trim_matches('"'),
-        "requiredWorkers": [],
-        "toolIntent": null,
-    });
-    Some(
-        serde_json::json!({
-            "content": null,
-            "finish_reason": "tool_calls",
-            "tool_calls": [{
-                "id": "call-classify-session-turn",
-                "type": "function",
-                "function": {
-                    "name": "classify_session_turn",
-                    "arguments": arguments.to_string(),
-                }
-            }]
-        })
-        .to_string(),
-    )
-}
 
 #[cfg(test)]
 impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
@@ -75,27 +41,10 @@ impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
         &self,
         request: magi_bridge_client::ModelInvocationRequest,
     ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError> {
-        if let Some(payload) = classifier_payload_for_prompt(&request.prompt) {
-            return Ok(magi_bridge_client::BridgeResponse { ok: true, payload });
-        }
         Ok(magi_bridge_client::BridgeResponse {
             ok: true,
             payload: format!("shadow-model::{}", request.prompt.trim()),
         })
-    }
-
-    fn invoke_stream(
-        &self,
-        request: magi_bridge_client::ModelInvocationRequest,
-        on_event: &mut dyn FnMut(magi_bridge_client::ModelStreamEvent),
-    ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError> {
-        let response = self.invoke(request)?;
-        if !response.payload.is_empty() {
-            on_event(magi_bridge_client::ModelStreamEvent::ContentDelta {
-                delta: response.payload.clone(),
-            });
-        }
-        Ok(response)
     }
 }
 
@@ -106,7 +55,6 @@ pub(crate) struct ShadowDaemonRuntime {
     session_store: Arc<SessionStore>,
     workspace_store: Arc<WorkspaceStore>,
     knowledge_store: Arc<KnowledgeStore>,
-    worker_runtime: WorkerRuntime,
     governance: Arc<GovernanceService>,
     runtime_maintenance: ShadowRuntimeMaintenance,
 }
@@ -125,12 +73,7 @@ impl ShadowDaemonRuntime {
         let workspace_roots: Vec<(String, std::path::PathBuf)> = workspace_store
             .workspaces()
             .into_iter()
-            .map(|w| {
-                (
-                    w.workspace_id.to_string(),
-                    std::path::PathBuf::from(w.root_path.as_str()),
-                )
-            })
+            .map(|w| (w.workspace_id.to_string(), std::path::PathBuf::from(w.root_path.as_str())))
             .collect();
 
         // 从各工作区 .magi/sessions.json 加载会话（含迁移旧全局 sessions.json）
@@ -143,20 +86,10 @@ impl ShadowDaemonRuntime {
             state_repository.load_knowledge_state()?,
         ));
         let event_bus = Arc::new(InMemoryEventBus::new(2048));
-        let worker_runtime = WorkerRuntime::new(event_bus.clone());
-        let session_store_for_worker = session_store.clone();
-        worker_runtime.set_branch_snapshot_observer(Some(Arc::new(move |snapshot| {
-            let _ = Self::apply_worker_branch_snapshot(&session_store_for_worker, &snapshot);
-        })));
-        worker_runtime.restore_durable_snapshot(state_repository.load_worker_runtime_snapshot()?);
-        for snapshot in worker_runtime.branch_snapshots() {
-            let _ = Self::apply_worker_branch_snapshot(&session_store, &snapshot);
-        }
         let runtime_persistence = ShadowRuntimeSidecarPersistence::new(
             state_repository.clone(),
             session_store.clone(),
             workspace_store.clone(),
-            worker_runtime.clone(),
         );
 
         Self::restore_ledger(&state_repository, &event_bus)?;
@@ -167,6 +100,38 @@ impl ShadowDaemonRuntime {
             &session_store,
             &workspace_store,
         )?;
+
+        // 引导阶段：若知识库尚无代码索引，扫描工作区代码
+        if knowledge_store.code_index_summary().is_none() {
+            let scan_root = workspace_store
+                .active_workspace_id()
+                .and_then(|ws_id| {
+                    workspace_store
+                        .workspaces()
+                        .into_iter()
+                        .find(|w| w.workspace_id == ws_id)
+                        .map(|w| std::path::PathBuf::from(w.root_path.as_str()))
+                })
+                .unwrap_or_else(|| config.bootstrap_workspace_root.clone());
+
+            ingest_workspace_code_index(&knowledge_store, &scan_root);
+
+            // 若扫描结果为空（引导工作区可能是空目录），回退到当前工作目录
+            if knowledge_store
+                .code_index_summary()
+                .map(|s| s.files.is_empty())
+                .unwrap_or(true)
+            {
+                if let Ok(cwd) = std::env::current_dir() {
+                    if cwd != scan_root {
+                        ingest_workspace_code_index(&knowledge_store, &cwd);
+                    }
+                }
+            }
+
+            // 持久化知识库状态
+            let _ = state_repository.save_knowledge_state(&knowledge_store.export_state());
+        }
 
         let runtime_maintenance = ShadowRuntimeMaintenance::new(
             ShadowRuntimeMaintenanceConfig::default(),
@@ -183,7 +148,6 @@ impl ShadowDaemonRuntime {
             session_store,
             workspace_store,
             knowledge_store,
-            worker_runtime,
             governance: Arc::new(GovernanceService::default()),
             runtime_maintenance,
         })
@@ -233,31 +197,18 @@ impl ShadowDaemonRuntime {
         let direct_http_probe_config = direct_http_result
             .as_ref()
             .map(|(_, config)| config.clone());
-        let direct_http_model_configured = direct_http_probe_config.is_some();
 
         // Use StdioMcpBridgeClient for direct MCP server connections when
         // MAGI_MCP_SERVER_COMMAND is configured, falling back to the
         // JSON-RPC subprocess loopback.
         let direct_mcp_client = StdioMcpBridgeClient::from_env();
 
-        let default_model_bridge_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
+        let model_bridge_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
             if let Some((http_client, _)) = direct_http_result {
                 Arc::new(http_client)
             } else {
-                #[cfg(test)]
-                {
-                    Arc::new(StaticTestModelBridgeClient)
-                }
-                #[cfg(not(test))]
-                {
-                    Arc::new(JsonRpcModelBridgeClient::new(model_transport.clone()))
-                }
+                Arc::new(JsonRpcModelBridgeClient::new(model_transport.clone()))
             };
-        let model_bridge_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
-            model_bridge_override
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| default_model_bridge_client.clone());
         let dispatcher_model_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
             model_bridge_override.unwrap_or_else(|| model_bridge_client.clone());
         let bridge_runtime = BridgeDispatchRuntime::new()
@@ -268,13 +219,17 @@ impl ShadowDaemonRuntime {
             .with_mcp_client(if let Some(mcp_client) = direct_mcp_client {
                 Arc::new(mcp_client)
             } else {
-                Arc::new(JsonRpcMcpBridgeClient::new(mcp_transport.clone()))
+                Arc::new(JsonRpcMcpBridgeClient::new(
+                    mcp_transport.clone(),
+                ))
             });
-        let skill_runtime = SkillDispatchRuntime::new(tool_registry.clone(), bridge_runtime);
-        let worker_runtime = self.worker_runtime.clone();
+        let skill_runtime = SkillDispatchRuntime::new(
+            tool_registry.clone(),
+            bridge_runtime,
+        );
+        let worker_runtime = WorkerRuntime::new(self.event_bus.clone());
         let memory_store = MemoryStore::new();
-        let context_runtime =
-            ContextRuntime::new((*self.knowledge_store).clone(), memory_store.clone());
+        let context_runtime = ContextRuntime::new((*self.knowledge_store).clone(), memory_store.clone());
         let context_runtime_for_dispatcher = Arc::new(context_runtime.clone());
         let tool_registry_for_dispatcher = tool_registry.clone();
         let task_store_checkpoint_path = self.state_root.join("task-store.json");
@@ -284,19 +239,21 @@ impl ShadowDaemonRuntime {
             Ok(Some(restored)) => {
                 let eb = event_bus_for_task_store.clone();
                 let receiver = runner_result_receiver.clone();
-                restored.set_status_change_callback(Box::new(move |task_id, new_status, task| {
-                    let event = magi_event_bus::task_events::task_status_changed_event(
-                        &task_id.to_string(),
-                        &task.mission_id.to_string(),
-                        "",
-                        &format!("{:?}", new_status),
-                        &format!("{:?}", task.kind),
-                    );
-                    let _ = eb.publish(event);
-                    push_terminal_task_result(&receiver, task_id, new_status);
-                }));
-                let (revoked_leases, blocked_tasks) = restored
-                    .reconcile_volatile_runtime_after_restore(&worker_runtime.durable_snapshot());
+                restored.set_status_change_callback(Box::new(
+                    move |task_id, new_status, task| {
+                        let event = magi_event_bus::task_events::task_status_changed_event(
+                            &task_id.to_string(),
+                            &task.mission_id.to_string(),
+                            "",
+                            &format!("{:?}", new_status),
+                            &format!("{:?}", task.kind),
+                        );
+                        let _ = eb.publish(event);
+                        push_terminal_task_result(&receiver, task_id, new_status);
+                    },
+                ));
+                let (revoked_leases, blocked_tasks) =
+                    restored.reconcile_volatile_runtime_after_restore();
                 if revoked_leases > 0 || blocked_tasks > 0 {
                     warn!(
                         revoked_leases,
@@ -323,14 +280,14 @@ impl ShadowDaemonRuntime {
                 )))
             }
         };
-        {
-            let checkpoint_path = task_store_checkpoint_path.clone();
-            task_store.set_checkpoint_callback(Box::new(move |store| {
-                let _ = store.checkpoint_to_file(&checkpoint_path);
-            }));
-        }
         let execution_runtime = orchestrator
-            .execution_runtime(worker_runtime, tool_registry, skill_runtime)
+            .execution_runtime_with_recovery_support(
+                worker_runtime,
+                tool_registry,
+                skill_runtime,
+                self.session_store.clone(),
+                self.workspace_store.clone(),
+            )
             .with_task_store(Arc::clone(&task_store))
             .with_context_runtime(
                 context_runtime,
@@ -378,6 +335,12 @@ impl ShadowDaemonRuntime {
         .with_shadow_execution_pipeline(orchestrator, execution_runtime, memory_store);
 
         let state_for_task_workers = state.clone();
+        let state_for_knowledge_persist = state.clone();
+        let knowledge_persist_callback = Arc::new(move || {
+            if let Err(error) = state_for_knowledge_persist.persist_knowledge_state() {
+                tracing::warn!(?error, "自动知识沉淀持久化失败");
+            }
+        });
         let shadow_task_dispatcher = ShadowTaskDispatcher::new(
             self.event_bus.clone(),
             state
@@ -391,8 +354,9 @@ impl ShadowDaemonRuntime {
         let shadow_task_dispatcher = Arc::new(
             shadow_task_dispatcher
                 .with_model_bridge_client(dispatcher_model_client)
+                .with_knowledge_store(state.knowledge_store.clone())
+                .with_knowledge_persist_callback(knowledge_persist_callback)
                 .with_settings_store(state.settings_store.clone())
-                .with_usage_authority(state.usage_authority())
                 .with_context_runtime(context_runtime_for_dispatcher)
                 .with_tool_registry(tool_registry_for_dispatcher)
                 .with_skill_runtime(app_skill_runtime),
@@ -400,66 +364,20 @@ impl ShadowDaemonRuntime {
         let runner_manager = RunnerManager::with_dispatcher_and_worker_catalog(
             Arc::clone(&task_store),
             Arc::new(move || state_for_task_workers.task_worker_catalog()),
-            shadow_task_dispatcher.clone(),
+            shadow_task_dispatcher,
             runner_result_receiver,
         )
         .with_checkpoint_path(task_store_checkpoint_path);
         state = state
-            .with_session_turn_dispatcher(shadow_task_dispatcher)
             .with_task_store(task_store)
-            .with_runner_manager(runner_manager);
-
-        state = if direct_http_model_configured || cfg!(test) {
-            state.with_real_model_bridge_client(model_bridge_client.clone())
-        } else {
-            state.with_model_bridge_client(model_bridge_client.clone())
-        };
+            .with_runner_manager(runner_manager)
+            .with_model_bridge_client(model_bridge_client.clone());
 
         if let Some(probe_config) = direct_http_probe_config {
             state = state.with_direct_http_model_probe(probe_config);
         }
 
         state
-    }
-
-    fn apply_worker_branch_snapshot(
-        session_store: &Arc<SessionStore>,
-        snapshot: &WorkerRuntimeBranchSnapshot,
-    ) -> Result<(), magi_core::DomainError> {
-        session_store.update_active_execution_branch_snapshot(
-            &snapshot.task_id,
-            snapshot.worker_id.clone(),
-            snapshot.stage.label().to_string(),
-            snapshot
-                .lease_id
-                .as_ref()
-                .map(|lease_id| LeaseId::new(lease_id.clone())),
-            snapshot.execution_intent_ref.clone(),
-            snapshot
-                .binding_lifecycle
-                .map(|binding_lifecycle| binding_lifecycle.label().to_string()),
-            snapshot
-                .checkpoint_cursor
-                .as_ref()
-                .map(|cursor| cursor.checkpoint_stage.label().to_string()),
-            snapshot
-                .checkpoint_cursor
-                .as_ref()
-                .map(|cursor| cursor.next_step_index),
-            snapshot
-                .checkpoint_cursor
-                .as_ref()
-                .map(|cursor| cursor.checkpoint_at),
-            snapshot
-                .checkpoint_cursor
-                .as_ref()
-                .map(|cursor| cursor.resume_mode.label().to_string()),
-            snapshot
-                .checkpoint_cursor
-                .as_ref()
-                .and_then(|cursor| cursor.resume_token.clone()),
-        )?;
-        Ok(())
     }
 
     pub(crate) fn router(&self, service_name: String) -> axum::Router {
@@ -520,23 +438,36 @@ impl ShadowDaemonRuntime {
             &config.bootstrap_workspace_root,
             &config.bootstrap_worktree_root,
         );
+        // 会话保存到各工作区的 .magi/sessions.json，不再写全局路径
         let durable = session_store.durable_state();
-        let (global_state, mut workspace_states) = durable.partition_by_workspace();
         for workspace in workspace_store.workspaces() {
             let root = std::path::PathBuf::from(workspace.root_path.as_str());
             let ws_id = workspace.workspace_id.to_string();
-            let ws_state = workspace_states.remove(&ws_id).unwrap_or_default();
+            let ws_sessions: Vec<_> = durable.sessions.iter()
+                .filter(|s| s.workspace_id.as_deref() == Some(&ws_id))
+                .cloned()
+                .collect();
+            let session_ids = ws_sessions
+                .iter()
+                .map(|session| session.session_id.clone())
+                .collect::<HashSet<_>>();
+            let ws_state = magi_session_store::SessionDurableState {
+                sessions: ws_sessions,
+                current_session_id: durable.current_session_id.clone(),
+                timeline: durable
+                    .timeline
+                    .iter()
+                    .filter(|entry| session_ids.contains(&entry.session_id))
+                    .cloned()
+                    .collect(),
+                notifications: durable
+                    .notifications
+                    .iter()
+                    .filter(|notification| session_ids.contains(&notification.session_id))
+                    .cloned()
+                    .collect(),
+            };
             state_repository.save_workspace_session_state(&root, &ws_state)?;
-        }
-        if let Some((workspace_id, _)) = workspace_states.into_iter().next() {
-            return Err(DaemonError::internal(format!(
-                "检测到未注册工作区的会话状态: {workspace_id}"
-            )));
-        }
-        if global_state.is_empty() {
-            let _ = std::fs::remove_file(state_repository.session_durable_state_path());
-        } else {
-            state_repository.save_session_durable_state(&global_state)?;
         }
         state_repository.save_workspace_durable_state(&workspace_store.durable_state())?;
         runtime_persistence.flush_runtime_sidecars()?;
@@ -581,17 +512,15 @@ impl ShadowDaemonRuntime {
 
         let base_url = find_env("MAGI_OPENAI_COMPAT_BASE_URL")?;
         let api_key = find_env("MAGI_OPENAI_COMPAT_API_KEY");
-        let model = find_env("MAGI_OPENAI_COMPAT_MODEL").unwrap_or_else(|| "gpt-4".to_string());
+        let model = find_env("MAGI_OPENAI_COMPAT_MODEL")
+            .unwrap_or_else(|| "gpt-4".to_string());
 
         let probe_config = DirectHttpModelProbeConfig {
             base_url: base_url.clone(),
             api_key: api_key.clone(),
             model: model.clone(),
         };
-        Some((
-            HttpModelBridgeClient::new(base_url, api_key, model),
-            probe_config,
-        ))
+        Some((HttpModelBridgeClient::new(base_url, api_key, model), probe_config))
     }
 
     fn bridge_loopback_executable(binary_name: &str) -> String {
@@ -665,7 +594,7 @@ mod tests {
         path::PathBuf,
         sync::mpsc,
         thread::{self, JoinHandle},
-        time::{Duration, Instant},
+        time::Duration,
     };
     use tower::util::ServiceExt;
 
@@ -705,7 +634,54 @@ mod tests {
         assert!(ledger.usage_entries.is_empty());
     }
 
-    async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
+    #[tokio::test]
+    async fn knowledge_endpoint_returns_code_index_after_bootstrap_scan() {
+        let state_root = temp_state_root("knowledge-code-index");
+        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root.clone());
+        let workspace_root = config.bootstrap_workspace_root.clone();
+
+        // 在引导工作区中创建模拟源文件，供代码扫描器发现
+        fs::create_dir_all(workspace_root.join("src")).unwrap();
+        fs::write(workspace_root.join("src/main.rs"), "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+        fs::write(workspace_root.join("src/lib.rs"), "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n").unwrap();
+        fs::write(workspace_root.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
+
+        let runtime = ShadowDaemonRuntime::restore(&config)
+            .expect("runtime restore should bootstrap and scan code");
+
+        // 验证知识存储中有代码索引摘要
+        let summary = runtime
+            .knowledge_store
+            .code_index_summary()
+            .expect("code index summary should exist after bootstrap scan");
+        assert!(!summary.files.is_empty(), "code index should contain scanned files");
+        assert!(summary.tech_stack.iter().any(|t| t == "Rust"), "tech stack should detect Rust");
+        assert!(
+            summary.entry_points.iter().any(|e| e.ends_with("main.rs")),
+            "entry points should detect main.rs"
+        );
+
+        // 通过 API 路由验证返回结构
+        let app = runtime.router("shadow-test".to_string());
+        let knowledge = get_json(app, "/api/knowledge").await;
+        assert!(
+            knowledge.get("codeIndex").is_some_and(|v| !v.is_null()),
+            "API should return non-null codeIndex"
+        );
+        let code_index = knowledge["codeIndex"].as_object().expect("codeIndex should be an object");
+        let files = code_index["files"].as_array().expect("files should be an array");
+        assert!(!files.is_empty(), "codeIndex.files should not be empty");
+        assert!(
+            code_index["techStack"].as_array().is_some_and(|t| !t.is_empty()),
+            "codeIndex.techStack should not be empty"
+        );
+    }
+
+    async fn post_json(
+        app: axum::Router,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
         let response = app
             .oneshot(
                 Request::builder()
@@ -755,60 +731,6 @@ mod tests {
         .await
     }
 
-    async fn wait_for_task_projection_completed(
-        app: axum::Router,
-        root_task_id: &str,
-        session_id: &str,
-    ) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            let projection = get_task_projection(app.clone(), root_task_id, session_id).await;
-            let total_tasks = projection["progress_summary"]["total_tasks"]
-                .as_u64()
-                .unwrap_or(0);
-            let completed_tasks = projection["progress_summary"]["completed_tasks"]
-                .as_u64()
-                .unwrap_or(0);
-            if total_tasks >= 2
-                && completed_tasks == total_tasks
-                && projection["root_task"]["status"] == "Completed"
-            {
-                return projection;
-            }
-            if Instant::now() >= deadline {
-                return projection;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    async fn wait_for_execution_group(
-        app: axum::Router,
-        mission_id: &str,
-        mut is_ready: impl FnMut(&Value) -> bool,
-    ) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            let read_model = get_json(app.clone(), "/runtime/read-model").await;
-            if let Some(group) = read_model["details"]["execution_groups"]
-                .as_array()
-                .and_then(|groups| {
-                    groups
-                        .iter()
-                        .find(|entry| entry["mission_id"] == mission_id)
-                })
-            {
-                if is_ready(group) || Instant::now() >= deadline {
-                    return group.clone();
-                }
-            }
-            if Instant::now() >= deadline {
-                panic!("execution group {mission_id} did not appear before timeout");
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
     fn assert_completed_two_task_projection(projection: &Value) {
         let total_tasks = projection["progress_summary"]["total_tasks"]
             .as_u64()
@@ -816,10 +738,7 @@ mod tests {
         let completed_tasks = projection["progress_summary"]["completed_tasks"]
             .as_u64()
             .expect("completed_tasks should serialize as integer");
-        assert!(
-            total_tasks >= 2,
-            "task projection should include at least root + action"
-        );
+        assert!(total_tasks >= 2, "task projection should include at least root + action");
         assert_eq!(completed_tasks, total_tasks);
         assert_eq!(projection["progress_summary"]["failed_tasks"], 0);
         assert_eq!(projection["root_task"]["status"], "Completed");
@@ -920,7 +839,10 @@ mod tests {
         let header_text =
             String::from_utf8(buffer[..header_end].to_vec()).expect("headers should be utf-8");
         let mut lines = header_text.split("\r\n");
-        let request_line = lines.next().expect("request line should exist").to_string();
+        let request_line = lines
+            .next()
+            .expect("request line should exist")
+            .to_string();
         let mut headers = BTreeMap::new();
         for line in lines {
             if line.is_empty() {
@@ -993,7 +915,7 @@ mod tests {
 
         let (status, first_body) = post_json(
             app.clone(),
-            "/api/session/turn",
+            "/session/action",
             json!({
                 "session_id": "shadow-session-001",
                 "text": "remember parser constraint",
@@ -1005,22 +927,20 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "unexpected body: {first_body:?}");
 
-        let first_accepted_at = first_body["acceptedAt"]
+        let first_accepted_at = first_body["accepted_at"]
             .as_u64()
             .expect("accepted_at should serialize as integer");
         let first_mission_id = format!("mission-session-action-{first_accepted_at}");
-        let first_root_task_id = first_body["rootTaskId"]
+        let first_root_task_id = first_body["root_task_id"]
             .as_str()
             .expect("root_task_id should serialize as string");
-        let first_projection = wait_for_task_projection_completed(
-            app.clone(),
-            first_root_task_id,
-            "shadow-session-001",
-        )
-        .await;
-        assert_completed_two_task_projection(&first_projection);
-        let first_execution_group =
-            wait_for_execution_group(app.clone(), &first_mission_id, |_| true).await;
+        let read_model = get_json(app.clone(), "/runtime/read-model").await;
+        let first_execution_group = read_model["details"]["execution_groups"]
+            .as_array()
+            .expect("execution groups should be an array")
+            .iter()
+            .find(|entry| entry["mission_id"] == first_mission_id)
+            .expect("first execution group should exist");
         assert_eq!(first_execution_group["context_used_memory_count"], 0);
         assert_eq!(
             first_execution_group["context_memory_extraction_refs"]
@@ -1029,10 +949,13 @@ mod tests {
                 .len(),
             0
         );
+        let first_projection =
+            get_task_projection(app.clone(), first_root_task_id, "shadow-session-001").await;
+        assert_completed_two_task_projection(&first_projection);
 
         let (status, second_body) = post_json(
             app.clone(),
-            "/api/session/turn",
+            "/session/action",
             json!({
                 "session_id": "shadow-session-001",
                 "text": "follow up parser work",
@@ -1044,20 +967,22 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "unexpected body: {second_body:?}");
 
-        let second_accepted_at = second_body["acceptedAt"]
+        let second_accepted_at = second_body["accepted_at"]
             .as_u64()
             .expect("accepted_at should serialize as integer");
         let second_mission_id = format!("mission-session-action-{second_accepted_at}");
-        let second_root_task_id = second_body["rootTaskId"]
+        let second_root_task_id = second_body["root_task_id"]
             .as_str()
             .expect("root_task_id should serialize as string");
         let expected_extraction_id = format!("extract-session-action-{first_accepted_at}");
 
-        let second_execution_group =
-            wait_for_execution_group(app.clone(), &second_mission_id, |entry| {
-                entry["context_memory_extraction_refs"] == json!([expected_extraction_id])
-            })
-            .await;
+        let read_model = get_json(app.clone(), "/runtime/read-model").await;
+        let second_execution_group = read_model["details"]["execution_groups"]
+            .as_array()
+            .expect("execution groups should be an array")
+            .iter()
+            .find(|entry| entry["mission_id"] == second_mission_id)
+            .expect("second execution group should exist");
         assert_eq!(second_execution_group["context_used_memory_count"], 1);
         assert_eq!(second_execution_group["context_extracted_memory_count"], 1);
         assert_eq!(
@@ -1065,8 +990,7 @@ mod tests {
             json!([expected_extraction_id])
         );
         let second_projection =
-            wait_for_task_projection_completed(app, second_root_task_id, "shadow-session-001")
-                .await;
+            get_task_projection(app, second_root_task_id, "shadow-session-001").await;
         assert_completed_two_task_projection(&second_projection);
     }
 
@@ -1098,7 +1022,7 @@ mod tests {
 
         let (status, seed_body) = post_json(
             app.clone(),
-            "/api/session/turn",
+            "/session/action",
             json!({
                 "session_id": "shadow-session-001",
                 "text": "seed recovery route state",
@@ -1108,11 +1032,7 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "unexpected seed body: {seed_body:?}"
-        );
+        assert_eq!(status, StatusCode::OK, "unexpected seed body: {seed_body:?}");
 
         let session_id = magi_core::SessionId::new("shadow-session-001");
         let ownership = runtime
@@ -1172,7 +1092,7 @@ mod tests {
 
         let (status, followup_body) = post_json(
             app.clone(),
-            "/api/session/turn",
+            "/session/action",
             json!({
                 "session_id": "shadow-session-001",
                 "text": "consume recovery memory",
@@ -1188,28 +1108,25 @@ mod tests {
             "unexpected followup body: {followup_body:?}"
         );
 
-        let followup_accepted_at = followup_body["acceptedAt"]
+        let followup_accepted_at = followup_body["accepted_at"]
             .as_u64()
             .expect("accepted_at should serialize as integer");
         let followup_mission_id = format!("mission-session-action-{followup_accepted_at}");
-        let followup_execution_group =
-            wait_for_execution_group(app, &followup_mission_id, |entry| {
-                entry["context_memory_extraction_refs"]
-                    .as_array()
-                    .is_some_and(|refs| {
-                        refs.iter()
-                            .any(|value| value == "extract-session-continue-recovery-daemon-route")
-                    })
-            })
-            .await;
+        let read_model = get_json(app, "/runtime/read-model").await;
+        let followup_execution_group = read_model["details"]["execution_groups"]
+            .as_array()
+            .expect("execution groups should be an array")
+            .iter()
+            .find(|entry| entry["mission_id"] == followup_mission_id)
+            .expect("followup execution group should exist");
         let extraction_refs = followup_execution_group["context_memory_extraction_refs"]
             .as_array()
             .expect("refs should be array");
         assert!(
             extraction_refs
                 .iter()
-                .any(|value| value == "extract-session-continue-recovery-daemon-route"),
-            "followup execution group should consume session continue extraction, got {extraction_refs:?}"
+                .any(|value| value == "extract-recovery-recovery-daemon-route"),
+            "followup execution group should consume recovery extraction, got {extraction_refs:?}"
         );
     }
 
@@ -1236,15 +1153,9 @@ mod tests {
 
         let snapshot = get_json(app, "/bridges/services").await;
         let services = service_entries_by_kind(&snapshot);
-        assert_eq!(
-            services.len(),
-            3,
-            "unexpected bridge snapshot: {snapshot:?}"
-        );
+        assert_eq!(services.len(), 3, "unexpected bridge snapshot: {snapshot:?}");
 
-        let host = services
-            .get("host")
-            .expect("host bridge snapshot should exist");
+        let host = services.get("host").expect("host bridge snapshot should exist");
         assert_eq!(host["health"]["status"], "ok");
         assert_eq!(host["health"]["ok"], true);
         assert_eq!(
@@ -1274,9 +1185,7 @@ mod tests {
             "model catalog should include openai-compatible: {model:?}"
         );
 
-        let mcp = services
-            .get("mcp")
-            .expect("mcp bridge snapshot should exist");
+        let mcp = services.get("mcp").expect("mcp bridge snapshot should exist");
         assert_eq!(mcp["health"]["status"], "ok");
         assert_eq!(mcp["health"]["ok"], true);
         assert_eq!(
@@ -1309,17 +1218,15 @@ mod tests {
 
         let snapshot = get_json(app, "/bridges/preflight").await;
         let services = service_entries_by_kind(&snapshot);
-        assert_eq!(
-            services.len(),
-            3,
-            "unexpected bridge preflight: {snapshot:?}"
-        );
+        assert_eq!(services.len(), 3, "unexpected bridge preflight: {snapshot:?}");
 
         let host = services.get("host").expect("host preflight should exist");
         assert_eq!(host["checks"][0]["check_name"], "workspace_roots");
         assert_eq!(host["checks"][0]["ok"], true);
 
-        let model = services.get("model").expect("model preflight should exist");
+        let model = services
+            .get("model")
+            .expect("model preflight should exist");
         assert!(
             model["checks"]
                 .as_array()
@@ -1403,11 +1310,7 @@ mod tests {
         let services_snapshot = get_json(app.clone(), "/bridges/services").await;
         let snapshot = get_json(app, "/bridges/cutover-smoke").await;
         let services = service_entries_by_kind(&snapshot);
-        assert_eq!(
-            services.len(),
-            3,
-            "unexpected bridge cutover snapshot: {snapshot:?}"
-        );
+        assert_eq!(services.len(), 3, "unexpected bridge cutover snapshot: {snapshot:?}");
         assert_eq!(snapshot["checked_service_count"], 3);
         let blocking_issues = snapshot["blocking_issues"]
             .as_array()
@@ -1619,7 +1522,8 @@ mod tests {
                 );
                 assert!(
                     blocking_issues.iter().any(|issue| {
-                        issue["server_kind"] == serde_json::Value::String("mcp".to_string())
+                        issue["server_kind"]
+                            == serde_json::Value::String("mcp".to_string())
                             && issue["reason_code"]
                                 == serde_json::Value::String(
                                     if route_status == "fallback-only" {
@@ -1627,7 +1531,7 @@ mod tests {
                                     } else {
                                         "mcp_default_route_status_unavailable"
                                     }
-                                    .to_string(),
+                                    .to_string()
                                 )
                     }),
                     "blocking issues should retain the mcp route failure: {snapshot:?}"
@@ -1682,10 +1586,7 @@ mod tests {
                 ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
                 ("MAGI_OPENAI_COMPAT_MODEL", "gpt-test"),
                 ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
-                (
-                    "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "shadow-mcp-observability",
-                ),
+                ("MAGI_MCP_MANAGER_ENABLED_SERVERS", "shadow-mcp-observability"),
                 ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
                 (
                     "MAGI_MCP_MANAGER_SERVER_HEALTHS",
@@ -1697,10 +1598,7 @@ mod tests {
         let snapshot = get_json(app, "/bridges/cutover-smoke").await;
         let services = service_entries_by_kind(&snapshot);
 
-        assert_eq!(
-            snapshot["overall_ok"], true,
-            "unexpected cutover snapshot: {snapshot:?}"
-        );
+        assert_eq!(snapshot["overall_ok"], true, "unexpected cutover snapshot: {snapshot:?}");
         assert!(
             snapshot["blocking_issue_counts_by_reason_code"]
                 .as_object()
@@ -1740,9 +1638,7 @@ mod tests {
         let body: Value = serde_json::from_str(&request.body).expect("request body should be json");
         assert_eq!(body["model"], "gpt-test");
 
-        let mcp = services
-            .get("mcp")
-            .expect("mcp cutover snapshot should exist");
+        let mcp = services.get("mcp").expect("mcp cutover snapshot should exist");
         assert_eq!(mcp["service_ok"], true);
         assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "ready");
         assert_eq!(
@@ -1757,8 +1653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_router_bridge_cutover_smoke_surfaces_env_backed_provider_failure_with_ready_mcp_route()
-     {
+    async fn daemon_router_bridge_cutover_smoke_surfaces_env_backed_provider_failure_with_ready_mcp_route() {
         for binary_name in [
             "host_bridge_loopback",
             "model_bridge_loopback",
@@ -1794,10 +1689,7 @@ mod tests {
                 ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
                 ("MAGI_OPENAI_COMPAT_MODEL", "gpt-test"),
                 ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
-                (
-                    "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "shadow-mcp-observability",
-                ),
+                ("MAGI_MCP_MANAGER_ENABLED_SERVERS", "shadow-mcp-observability"),
                 ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
                 (
                     "MAGI_MCP_MANAGER_SERVER_HEALTHS",
@@ -1809,10 +1701,7 @@ mod tests {
         let snapshot = get_json(app, "/bridges/cutover-smoke").await;
         let services = service_entries_by_kind(&snapshot);
 
-        assert_eq!(
-            snapshot["overall_ok"], false,
-            "unexpected cutover snapshot: {snapshot:?}"
-        );
+        assert_eq!(snapshot["overall_ok"], false, "unexpected cutover snapshot: {snapshot:?}");
         assert_eq!(snapshot["blocking_check_count"], 2);
         assert_eq!(
             snapshot["blocking_issue_counts_by_reason_code"]["model_provider_rejected"],
@@ -1833,10 +1722,7 @@ mod tests {
                 .any(|service| service == "model"),
             "blocking summary should include model: {snapshot:?}"
         );
-        assert_eq!(
-            snapshot["blocking_issues"].as_array().map(Vec::len),
-            Some(2)
-        );
+        assert_eq!(snapshot["blocking_issues"].as_array().map(Vec::len), Some(2));
 
         let model = services
             .get("model")
@@ -1869,15 +1755,10 @@ mod tests {
         handle.join().expect("http stub should join");
         assert_eq!(request.request_line, "POST /v1/chat/completions HTTP/1.1");
 
-        let mcp = services
-            .get("mcp")
-            .expect("mcp cutover snapshot should exist");
+        let mcp = services.get("mcp").expect("mcp cutover snapshot should exist");
         assert_eq!(mcp["service_ok"], true);
         assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "ready");
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["route_target"],
-            "shadow-mcp-observability"
-        );
+        assert_eq!(mcp["mcp_default_route_gate"]["route_target"], "shadow-mcp-observability");
         assert_eq!(
             mcp["mcp_default_route_gate"]["resolved_server"],
             "shadow-mcp-observability"
@@ -1887,8 +1768,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_router_bridge_cutover_smoke_surfaces_cataloged_degraded_provider_with_ready_mcp_route()
-     {
+    async fn daemon_router_bridge_cutover_smoke_surfaces_cataloged_degraded_provider_with_ready_mcp_route() {
         for binary_name in [
             "host_bridge_loopback",
             "model_bridge_loopback",
@@ -1910,10 +1790,7 @@ mod tests {
             "shadow-test".to_string(),
             &[
                 ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
-                (
-                    "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "shadow-mcp-observability",
-                ),
+                ("MAGI_MCP_MANAGER_ENABLED_SERVERS", "shadow-mcp-observability"),
                 ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
                 (
                     "MAGI_MCP_MANAGER_SERVER_HEALTHS",
@@ -1925,10 +1802,7 @@ mod tests {
         let snapshot = get_json(app, "/bridges/cutover-smoke").await;
         let services = service_entries_by_kind(&snapshot);
 
-        assert_eq!(
-            snapshot["overall_ok"], false,
-            "unexpected cutover snapshot: {snapshot:?}"
-        );
+        assert_eq!(snapshot["overall_ok"], false, "unexpected cutover snapshot: {snapshot:?}");
         assert_eq!(snapshot["blocking_check_count"], 1);
         assert_eq!(
             snapshot["blocking_issue_counts_by_reason_code"]["model_provider_unavailable"],
@@ -1972,15 +1846,10 @@ mod tests {
             "degraded provider should keep unavailable error detail: {openai:?}"
         );
 
-        let mcp = services
-            .get("mcp")
-            .expect("mcp cutover snapshot should exist");
+        let mcp = services.get("mcp").expect("mcp cutover snapshot should exist");
         assert_eq!(mcp["service_ok"], true);
         assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "ready");
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["route_target"],
-            "shadow-mcp-observability"
-        );
+        assert_eq!(mcp["mcp_default_route_gate"]["route_target"], "shadow-mcp-observability");
         assert_eq!(
             mcp["mcp_default_route_gate"]["resolved_server"],
             "shadow-mcp-observability"
@@ -1990,8 +1859,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_router_bridge_cutover_smoke_surfaces_env_backed_provider_invalid_response_with_ready_mcp_route()
-     {
+    async fn daemon_router_bridge_cutover_smoke_surfaces_env_backed_provider_invalid_response_with_ready_mcp_route() {
         for binary_name in [
             "host_bridge_loopback",
             "model_bridge_loopback",
@@ -2025,10 +1893,7 @@ mod tests {
                 ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
                 ("MAGI_OPENAI_COMPAT_MODEL", "gpt-test"),
                 ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
-                (
-                    "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "shadow-mcp-observability",
-                ),
+                ("MAGI_MCP_MANAGER_ENABLED_SERVERS", "shadow-mcp-observability"),
                 ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
                 (
                     "MAGI_MCP_MANAGER_SERVER_HEALTHS",
@@ -2040,10 +1905,7 @@ mod tests {
         let snapshot = get_json(app, "/bridges/cutover-smoke").await;
         let services = service_entries_by_kind(&snapshot);
 
-        assert_eq!(
-            snapshot["overall_ok"], false,
-            "unexpected cutover snapshot: {snapshot:?}"
-        );
+        assert_eq!(snapshot["overall_ok"], false, "unexpected cutover snapshot: {snapshot:?}");
         assert_eq!(snapshot["blocking_check_count"], 2);
         assert_eq!(
             snapshot["blocking_issue_counts_by_reason_code"]["model_provider_invalid_response"],
@@ -2064,10 +1926,7 @@ mod tests {
                 .any(|service| service == "model"),
             "blocking summary should include model: {snapshot:?}"
         );
-        assert_eq!(
-            snapshot["blocking_issues"].as_array().map(Vec::len),
-            Some(2)
-        );
+        assert_eq!(snapshot["blocking_issues"].as_array().map(Vec::len), Some(2));
 
         let model = services
             .get("model")
@@ -2100,15 +1959,10 @@ mod tests {
         handle.join().expect("http stub should join");
         assert_eq!(request.request_line, "POST /v1/chat/completions HTTP/1.1");
 
-        let mcp = services
-            .get("mcp")
-            .expect("mcp cutover snapshot should exist");
+        let mcp = services.get("mcp").expect("mcp cutover snapshot should exist");
         assert_eq!(mcp["service_ok"], true);
         assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "ready");
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["route_target"],
-            "shadow-mcp-observability"
-        );
+        assert_eq!(mcp["mcp_default_route_gate"]["route_target"], "shadow-mcp-observability");
         assert_eq!(
             mcp["mcp_default_route_gate"]["resolved_server"],
             "shadow-mcp-observability"
@@ -2169,13 +2023,12 @@ mod tests {
         let snapshot = get_json(app, "/bridges/cutover-smoke").await;
         let services = service_entries_by_kind(&snapshot);
 
-        assert_eq!(
-            snapshot["overall_ok"], false,
-            "unexpected cutover snapshot: {snapshot:?}"
-        );
+        assert_eq!(snapshot["overall_ok"], false, "unexpected cutover snapshot: {snapshot:?}");
         assert_eq!(snapshot["blocking_check_count"], 1);
         assert_eq!(
-            snapshot["blocking_issue_counts_by_reason_code"]["mcp_default_route_status_fallback_only"],
+            snapshot["blocking_issue_counts_by_reason_code"][
+                "mcp_default_route_status_fallback_only"
+            ],
             1
         );
         assert_eq!(snapshot["blocking_issue_counts_by_server_kind"]["mcp"], 1);
@@ -2193,10 +2046,7 @@ mod tests {
                 .any(|service| service == "mcp"),
             "blocking summary should include mcp: {snapshot:?}"
         );
-        assert_eq!(
-            snapshot["blocking_issues"].as_array().map(Vec::len),
-            Some(1)
-        );
+        assert_eq!(snapshot["blocking_issues"].as_array().map(Vec::len), Some(1));
 
         let model = services
             .get("model")
@@ -2217,14 +2067,9 @@ mod tests {
         handle.join().expect("http stub should join");
         assert_eq!(request.request_line, "POST /v1/chat/completions HTTP/1.1");
 
-        let mcp = services
-            .get("mcp")
-            .expect("mcp cutover snapshot should exist");
+        let mcp = services.get("mcp").expect("mcp cutover snapshot should exist");
         assert_eq!(mcp["service_ok"], false);
-        assert_eq!(
-            mcp["mcp_default_route_gate"]["route_status"],
-            "fallback-only"
-        );
+        assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "fallback-only");
         assert_eq!(
             mcp["mcp_default_route_gate"]["route_target"],
             "shadow-mcp-observability"
@@ -2278,10 +2123,7 @@ mod tests {
                 ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
                 ("MAGI_OPENAI_COMPAT_MODEL", "gpt-test"),
                 ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
-                (
-                    "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "shadow-mcp-observability",
-                ),
+                ("MAGI_MCP_MANAGER_ENABLED_SERVERS", "shadow-mcp-observability"),
                 ("MAGI_MCP_MANAGER_DISABLED_SERVERS", "shadow-mcp"),
                 (
                     "MAGI_MCP_MANAGER_SERVER_HEALTHS",
@@ -2293,13 +2135,12 @@ mod tests {
         let snapshot = get_json(app, "/bridges/cutover-smoke").await;
         let services = service_entries_by_kind(&snapshot);
 
-        assert_eq!(
-            snapshot["overall_ok"], false,
-            "unexpected cutover snapshot: {snapshot:?}"
-        );
+        assert_eq!(snapshot["overall_ok"], false, "unexpected cutover snapshot: {snapshot:?}");
         assert_eq!(snapshot["blocking_check_count"], 1);
         assert_eq!(
-            snapshot["blocking_issue_counts_by_reason_code"]["mcp_default_route_status_unavailable"],
+            snapshot["blocking_issue_counts_by_reason_code"][
+                "mcp_default_route_status_unavailable"
+            ],
             1
         );
         assert_eq!(snapshot["blocking_issue_counts_by_server_kind"]["mcp"], 1);
@@ -2317,10 +2158,7 @@ mod tests {
                 .any(|service| service == "mcp"),
             "blocking summary should include mcp: {snapshot:?}"
         );
-        assert_eq!(
-            snapshot["blocking_issues"].as_array().map(Vec::len),
-            Some(1)
-        );
+        assert_eq!(snapshot["blocking_issues"].as_array().map(Vec::len), Some(1));
 
         let model = services
             .get("model")
@@ -2341,9 +2179,7 @@ mod tests {
         handle.join().expect("http stub should join");
         assert_eq!(request.request_line, "POST /v1/chat/completions HTTP/1.1");
 
-        let mcp = services
-            .get("mcp")
-            .expect("mcp cutover snapshot should exist");
+        let mcp = services.get("mcp").expect("mcp cutover snapshot should exist");
         assert_eq!(mcp["service_ok"], false);
         assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "unavailable");
         assert_eq!(mcp["mcp_default_route_gate"]["route_target"], "<none>");
@@ -2359,7 +2195,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_router_bridge_cutover_smoke_surfaces_env_backed_provider_transport_failure_with_ready_mcp_route()
-     {
+    {
         for binary_name in [
             "host_bridge_loopback",
             "model_bridge_loopback",
@@ -2376,7 +2212,8 @@ mod tests {
         // Bind a port, capture the address, then drop the listener so nothing
         // is listening — any connection attempt will be refused.
         let unreachable_address = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral bind should succeed");
+            let listener =
+                TcpListener::bind("127.0.0.1:0").expect("ephemeral bind should succeed");
             let address = listener.local_addr().expect("bound address should exist");
             drop(listener);
             address
@@ -2418,7 +2255,10 @@ mod tests {
             snapshot["blocking_issue_counts_by_reason_code"]["model_provider_transport_failed"],
             2
         );
-        assert_eq!(snapshot["blocking_issue_counts_by_server_kind"]["model"], 2);
+        assert_eq!(
+            snapshot["blocking_issue_counts_by_server_kind"]["model"],
+            2
+        );
         assert!(
             snapshot["blocking_issue_counts_by_server_kind"]
                 .get("mcp")
@@ -2487,12 +2327,10 @@ mod tests {
 
         let before_runtime_read_model = serde_json::to_value(state.runtime_read_model_dto())
             .expect("runtime read model should serialize");
-        let before_session_sidecars =
-            serde_json::to_value(state.session_store.execution_sidecar_exports())
-                .expect("session sidecars should serialize");
-        let before_workspace_sidecars =
-            serde_json::to_value(state.workspace_registry.recovery_sidecar_exports())
-                .expect("workspace sidecars should serialize");
+        let before_session_sidecars = serde_json::to_value(state.session_store.execution_sidecar_exports())
+            .expect("session sidecars should serialize");
+        let before_workspace_sidecars = serde_json::to_value(state.workspace_registry.recovery_sidecar_exports())
+            .expect("workspace sidecars should serialize");
 
         let _ = get_json(app.clone(), "/bridges/preflight").await;
         let _ = get_json(app, "/bridges/cutover-smoke").await;
@@ -2552,11 +2390,7 @@ mod tests {
         assert_eq!(bootstrap["bridgePreflight"], bridge_preflight);
 
         let services = service_entries_by_kind(&bootstrap["bridgeServices"]);
-        assert_eq!(
-            services.len(),
-            3,
-            "unexpected bootstrap bridge services: {bootstrap:?}"
-        );
+        assert_eq!(services.len(), 3, "unexpected bootstrap bridge services: {bootstrap:?}");
 
         let preflight = service_entries_by_kind(&bootstrap["bridgePreflight"]);
         assert_eq!(

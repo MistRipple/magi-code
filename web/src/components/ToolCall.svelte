@@ -47,22 +47,8 @@
     onOpenFile
   }: Props = $props();
 
-  // 工具执行中默认展开，进入终态后自动折叠，避免完成结果长期占满主线。
-  let collapsed = $state(untrack(() => !(initialExpanded || status === 'running' || status === 'pending')));
-  let previousStatus = $state(untrack(() => status));
+  let collapsed = $state(untrack(() => !initialExpanded && name !== 'mermaid_diagram'));
   let copySuccess = $state(false);
-
-  $effect(() => {
-    if (status === previousStatus) {
-      return;
-    }
-    if (status === 'running' || status === 'pending') {
-      collapsed = false;
-    } else if (status === 'success' || status === 'error') {
-      collapsed = true;
-    }
-    previousStatus = status;
-  });
 
   interface ParsedToolIdentity {
     source: 'builtin' | 'mcp';
@@ -147,7 +133,7 @@
     const baseToolName = parsedTool.baseName;
 
     const iconMap: Record<string, IconName> = {
-      // ToolManager 内置工具
+      // ToolManager 内置工具（前端别名）
       'shell': 'terminal',
       'file_view': 'eye',
       'file_create': 'file-plus',
@@ -172,6 +158,20 @@
       'process_kill': 'stop',
       'process_list': 'terminal',
       'code_intel_query': 'search',
+      // 后端规范名（LLM 工具调用使用的名称）
+      'shell_exec': 'terminal',
+      'file_read': 'eye',
+      'file_write': 'file-plus',
+      'file_patch': 'pencil',
+      'file_mkdir': 'folder',
+      'file_copy': 'file-plus',
+      'file_move': 'file-plus',
+      'search_text': 'search',
+      'search_semantic': 'search',
+      'process_inspect': 'terminal',
+      'diff_preview': 'file-text',
+      'knowledge_query': 'question',
+      'worker_send_message': 'tools',
     };
 
     if (iconMap[baseToolName]) {
@@ -227,7 +227,7 @@
         return {
           code: data.code as string,
           title: (data.title || '') as string,
-          diagramType: (data.diagramType || data.diagram_type || '') as string,
+          diagramType: (data.diagramType || '') as string,
         };
       }
     } catch {
@@ -283,6 +283,20 @@
       'process_list': 'process_list',
       'code_intel_query': 'code_intel_query',
       'list_files': i18n.t('toolCall.displayName.listFiles'),
+      // 后端规范名
+      'shell_exec': i18n.t('toolCall.displayName.shell'),
+      'file_read': i18n.t('toolCall.displayName.fileView'),
+      'file_write': i18n.t('toolCall.displayName.fileCreate'),
+      'file_patch': i18n.t('toolCall.displayName.fileEdit'),
+      'file_mkdir': 'file_mkdir',
+      'file_copy': 'file_copy',
+      'file_move': 'file_move',
+      'search_text': i18n.t('toolCall.displayName.grepSearch'),
+      'search_semantic': i18n.t('toolCall.displayName.codebaseRetrieval'),
+      'process_inspect': 'process_inspect',
+      'diff_preview': 'diff_preview',
+      'knowledge_query': 'project_knowledge_query',
+      'worker_send_message': i18n.t('toolCall.displayName.sendWorkerMessage'),
     };
 
     return displayNameMap[baseToolName] ?? baseToolName;
@@ -294,19 +308,27 @@
     const args = toolInput as Record<string, unknown>;
     switch (toolName) {
       case 'shell':
+      case 'shell_exec':
         return typeof args.command === 'string' ? args.command : '';
       case 'file_view':
       case 'file_create':
       case 'file_edit':
       case 'file_insert':
+      case 'file_read':
+      case 'file_write':
+      case 'file_patch':
       case 'list_files': {
         const p = typeof args.path === 'string' ? args.path : '';
         return p;
       }
       case 'code_search_regex':
-        return typeof args.pattern === 'string' ? args.pattern : '';
+      case 'search_text':
+        return typeof args.pattern === 'string' ? args.pattern
+          : typeof args.query === 'string' ? args.query : '';
       case 'code_search_semantic':
+      case 'search_semantic':
       case 'project_knowledge_query':
+      case 'knowledge_query':
         return typeof args.query === 'string' ? args.query : '';
       case 'task_list':
         return (typeof args.mission_id === 'string' ? args.mission_id : '')
@@ -361,6 +383,14 @@
         return typeof args.terminal_id === 'number' ? String(args.terminal_id) : '';
       case 'process_list':
         return typeof args.agent === 'string' ? args.agent : '';
+      case 'process_inspect':
+        return typeof args.pid === 'string' ? args.pid : '';
+      case 'diff_preview':
+        return '';
+      case 'file_mkdir':
+      case 'file_copy':
+      case 'file_move':
+        return typeof args.path === 'string' ? args.path : '';
       default:
         // MCP 或其他未知工具：尝试提取常见字段
         return (typeof args.command === 'string' ? args.command : '')
@@ -372,7 +402,7 @@
 
   // 判断 file_view 是否为目录查看模式
   const isDirectoryView = $derived.by(() => {
-    if (name !== 'file_view') return false;
+    if (name !== 'file_view' && name !== 'file_read') return false;
     if (!input || typeof input !== 'object') return false;
     const args = input as Record<string, unknown>;
     if (args.type === 'directory') return true;

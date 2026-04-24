@@ -467,7 +467,7 @@ function isValidPersistedArray(value: unknown, max: number): value is unknown[] 
 }
 
 // 新增状态：变更、阶段、Toast、模型状态
-let edits = $state<Array<{ filePath: string; snapshotId?: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string; executionGroupId?: string }>>([]);
+let edits = $state<Array<{ filePath: string; snapshotId?: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string; executionGroupId?: string; diff?: string; originalContent?: string; previewContent?: string; previewAbsolutePath?: string; previewCanOpenWorkspaceFile?: boolean }>>([]);
 let timelineProjectionDirty = false;
 // 统一 Worker 运行态（唯一权威来源）
 // 当前主线以 authoritative projection 为准，仅叠加尚未被后端接纳的本地乐观节点。
@@ -1976,6 +1976,50 @@ function syncTimelineProjectionFromNodes(
   if (options.persist !== false) {
     scheduleSaveWebviewState();
   }
+}
+
+/**
+ * 增量补丁投影：仅更新指定节点对应的 artifact，跳过全量 normalize + sort。
+ * 前提：内容性更新不改变排序位置（由 frozenSemanticStage 保证）。
+ */
+function patchProjectionArtifactsInPlace(
+  patchedNodes: Map<string, TimelineNode>,
+): void {
+  const projection = messagesState.timelineProjection;
+  if (!projection || patchedNodes.size === 0) {
+    return;
+  }
+  let maxEventSeq = projection.lastAppliedEventSeq;
+  let maxUpdatedAt = projection.updatedAt;
+  const nextArtifacts = projection.artifacts.map((artifact) => {
+    const patchedNode = patchedNodes.get(artifact.artifactId);
+    if (!patchedNode) {
+      return artifact;
+    }
+    const nextMessage = normalizeIncomingMessage(patchedNode.message);
+    const nextLatestEventSeq = Math.max(artifact.latestEventSeq, patchedNode.latestEventSeq);
+    const nextCardStreamSeq = Math.max(artifact.cardStreamSeq, patchedNode.cardStreamSeq);
+    maxEventSeq = Math.max(maxEventSeq, nextLatestEventSeq);
+    const messageUpdatedAt = Math.max(
+      nextMessage.updatedAt || 0,
+      nextMessage.timestamp || 0,
+      artifact.timestamp,
+    );
+    maxUpdatedAt = Math.max(maxUpdatedAt, messageUpdatedAt);
+    return {
+      ...artifact,
+      message: nextMessage,
+      latestEventSeq: nextLatestEventSeq,
+      cardStreamSeq: nextCardStreamSeq,
+    };
+  });
+  messagesState.timelineProjection = {
+    ...projection,
+    artifacts: nextArtifacts,
+    lastAppliedEventSeq: maxEventSeq,
+    updatedAt: maxUpdatedAt,
+  };
+  timelineProjectionDirty = false;
 }
 
 function ensureTimelineProjectionSnapshotCurrent(
@@ -3733,7 +3777,8 @@ function flushAllStreamUpdates(): void {
   if (pendingTimelineFlushes.size > 0) {
     const entries = Array.from(pendingTimelineFlushes.entries());
     pendingTimelineFlushes.clear();
-    let usedIncrementalPatchPath = false;
+    let hadCanonicalUpdate = false;
+    const incrementalPatchedNodes = new Map<string, TimelineNode>();
     for (const [, flush] of entries) {
       const target = findTimelineMessageTargetByAlias(flush.messageId);
       if (!target) continue;
@@ -3744,18 +3789,16 @@ function flushAllStreamUpdates(): void {
       );
 
       if (shouldUseCanonicalUpdatePath || isStructuralTimelineUpdate(target.node, flush.updates)) {
-        // 结构性变更：走全量路径
+        hadCanonicalUpdate = true;
         updateTimelineNodeByAlias(flush.messageId, flush.updates);
       } else {
-        // 内容性变更：走增量路径，跳过 normalize-sort-reindex
-        usedIncrementalPatchPath = true;
         patchTimelineNodeInPlace(target.node.nodeId, (node) => {
           const nextMessage = normalizeIncomingMessage({
             ...node.message,
             ...flush.updates,
             id: node.nodeId,
           });
-          return {
+          const patched = {
             ...node,
             message: nextMessage,
             latestEventSeq: Math.max(
@@ -3767,11 +3810,19 @@ function flushAllStreamUpdates(): void {
               getMessageCardStreamSeq(nextMessage) || node.cardStreamSeq,
             ),
           };
+          incrementalPatchedNodes.set(node.nodeId, patched);
+          return patched;
         });
       }
     }
-    if (usedIncrementalPatchPath) {
-      syncTimelineProjectionFromNodes(messagesState.currentSessionId, { persist: false });
+    if (incrementalPatchedNodes.size > 0) {
+      if (hadCanonicalUpdate) {
+        // canonical 路径已重建 projection，但后续增量节点未被包含，需全量同步
+        syncTimelineProjectionFromNodes(messagesState.currentSessionId, { persist: false });
+      } else {
+        // 纯增量：仅补丁变更的 artifact，跳过全量 normalize + sort
+        patchProjectionArtifactsInPlace(incrementalPatchedNodes);
+      }
     }
     scheduleSaveWebviewState();
   }
@@ -3855,6 +3906,210 @@ export function applyTimelineStreamPatch(messageId: string, updates: Partial<Mes
   patchTimelineMessageByAlias(messageId, updates);
 }
 
+// ────────────────────────────────────────────────────────────────
+// 流式文本收集器（设计参考 Codex: MarkdownStreamCollector + StreamState）
+//
+// 核心思路：将"数据累积"和"渲染决策"分离。
+//   - delta 追加到 buffer（纯字符串拼接，零渲染开销）
+//   - 只在遇到 '\n' 时 commit 完整行，触发一次渲染更新
+//   - finalize 时 flush 所有剩余内容
+// 这避免了每个小 token 都触发一次 DOM 更新，保证 Markdown 渲染的结构完整性。
+// ────────────────────────────────────────────────────────────────
+
+class StreamingTextCollector {
+  /** 累积的完整原始文本 */
+  private buffer = '';
+  /** 已 commit 到渲染层的文本长度（游标） */
+  private committedLength = 0;
+
+  /** 追加增量文本到缓冲区（不触发渲染） */
+  pushDelta(delta: string): void {
+    this.buffer += delta;
+  }
+
+  /**
+   * Newline-gated commit：提交截至最后一个换行符的完整文本。
+   * 返回当前应渲染的完整累积文本（从头到最后一个 '\n'）。
+   * 如果没有新的完整行，返回 null（表示无需更新渲染）。
+   */
+  commitCompleteLines(): string | null {
+    const lastNewline = this.buffer.lastIndexOf('\n');
+    if (lastNewline < 0) {
+      // 没有换行符，不 commit
+      return null;
+    }
+    const commitEnd = lastNewline + 1;
+    if (commitEnd <= this.committedLength) {
+      // 没有新的完整行
+      return null;
+    }
+    this.committedLength = commitEnd;
+    // 返回从头到 commit 游标的完整文本
+    return this.buffer.slice(0, this.committedLength);
+  }
+
+  /**
+   * 流结束时 finalize：返回完整的最终文本（包含未换行的尾部）。
+   */
+  finalize(): string {
+    const result = this.buffer;
+    this.buffer = '';
+    this.committedLength = 0;
+    return result;
+  }
+
+  /** 获取当前已 commit 的文本（用于中途状态恢复） */
+  getCommittedText(): string {
+    return this.buffer.slice(0, this.committedLength);
+  }
+
+  /** 获取完整缓冲区文本 */
+  getFullBuffer(): string {
+    return this.buffer;
+  }
+
+  /** 当前是否有未 commit 的 pending 内容 */
+  hasPending(): boolean {
+    return this.committedLength < this.buffer.length;
+  }
+}
+
+/** 活跃的流式收集器实例，按 entryId 索引 */
+const activeStreamCollectors = new Map<string, StreamingTextCollector>();
+
+/**
+ * 处理后端 task.llm.delta SSE 事件推送的流式文本增量。
+ *
+ * 设计参考 Codex 的 MarkdownStreamCollector + StreamController：
+ * 1. delta 追加到 collector buffer（纯内存操作，无渲染开销）
+ * 2. 只在 delta 包含 '\n' 时，commit 完整行并触发 RAF 渲染更新
+ * 3. 连续小 token（无换行）不会触发任何渲染，减少 DOM 重建次数
+ *
+ * @param entryId 后端 timeline entry ID
+ * @param delta 本次新增的增量文本片段
+ * @param sessionId 会话 ID，用于过滤
+ */
+export function applyStreamingDelta(
+  entryId: string | number,
+  delta: string,
+  sessionId?: string,
+): void {
+  if (sessionId && messagesState.currentSessionId && sessionId !== messagesState.currentSessionId) {
+    return;
+  }
+
+  const nodeId = `rust-timeline:${entryId}`;
+  const collectorKey = String(entryId);
+
+  // 获取或创建收集器
+  let collector = activeStreamCollectors.get(collectorKey);
+  if (!collector) {
+    collector = new StreamingTextCollector();
+    activeStreamCollectors.set(collectorKey, collector);
+  }
+
+  // 追加 delta 到缓冲区
+  collector.pushDelta(delta);
+
+  // Newline-gated：只在有完整行时才 commit 渲染
+  const hasNewline = delta.includes('\n');
+  const committedText = hasNewline ? collector.commitCompleteLines() : null;
+
+  if (committedText !== null) {
+    // 有新的完整行 → 触发渲染更新
+    const existingNode = messagesState.timelineNodes.find((n) => n.nodeId === nodeId);
+    if (existingNode) {
+      enqueueTimelineStreamUpdate(nodeId, {
+        content: committedText,
+        blocks: [{ type: 'text', content: committedText }],
+        isStreaming: true,
+        isComplete: false,
+        updatedAt: Date.now(),
+      });
+    } else {
+      // 节点尚不存在：创建节点
+      const now = Date.now();
+      upsertTimelineNode({
+        id: nodeId,
+        role: 'assistant',
+        source: 'orchestrator',
+        content: committedText,
+        blocks: [{ type: 'text', content: committedText }],
+        timestamp: now,
+        updatedAt: now,
+        isStreaming: true,
+        isComplete: false,
+        type: 'text',
+        metadata: {
+          sessionId: sessionId || messagesState.currentSessionId || '',
+          eventSeq: 0,
+          timelineAnchorTimestamp: now,
+        },
+      } as Message, { thread: true }, { displayOrder: undefined });
+    }
+  } else if (!messagesState.timelineNodes.find((n) => n.nodeId === nodeId)) {
+    // 第一个 delta 还没有换行，但节点不存在：创建空的流式占位节点
+    const bufferText = collector.getFullBuffer();
+    if (bufferText.length > 0) {
+      const now = Date.now();
+      upsertTimelineNode({
+        id: nodeId,
+        role: 'assistant',
+        source: 'orchestrator',
+        content: bufferText,
+        blocks: [{ type: 'text', content: bufferText }],
+        timestamp: now,
+        updatedAt: now,
+        isStreaming: true,
+        isComplete: false,
+        type: 'text',
+        metadata: {
+          sessionId: sessionId || messagesState.currentSessionId || '',
+          eventSeq: 0,
+          timelineAnchorTimestamp: now,
+        },
+      } as Message, { thread: true }, { displayOrder: undefined });
+    }
+  }
+}
+
+/**
+ * 流式结束：finalize 收集器，flush 所有剩余内容（含未换行的尾部），
+ * 标记 isStreaming=false。
+ * 参考 Codex: StreamController.finalize() → collector.finalize_and_drain()
+ */
+export function sealStreamingDelta(entryId: string | number): void {
+  const nodeId = `rust-timeline:${entryId}`;
+  const collectorKey = String(entryId);
+  const collector = activeStreamCollectors.get(collectorKey);
+
+  if (collector) {
+    const finalText = collector.finalize();
+    activeStreamCollectors.delete(collectorKey);
+
+    if (finalText.length > 0) {
+      enqueueTimelineStreamUpdate(nodeId, {
+        content: finalText,
+        blocks: [{ type: 'text', content: finalText }],
+        isStreaming: false,
+        isComplete: true,
+        updatedAt: Date.now(),
+      });
+      return;
+    }
+  }
+
+  // 没有收集器但节点存在：直接标记完成
+  const existingNode = messagesState.timelineNodes.find((n) => n.nodeId === nodeId);
+  if (existingNode) {
+    enqueueTimelineStreamUpdate(nodeId, {
+      isStreaming: false,
+      isComplete: true,
+      updatedAt: Date.now(),
+    });
+  }
+}
+
 /**
  * 根据 messageId 获取当前时间线中的消息（包含 RAF 队列中的 pending 更新）。
  */
@@ -3872,6 +4127,7 @@ export function clearAllMessages(options: {
 } = {}) {
   captureCurrentSessionViewState();
   pendingTimelineFlushes.clear();
+  activeStreamCollectors.clear();
   if (streamFlushRAF !== undefined) {
     cancelAnimationFrame(streamFlushRAF);
     streamFlushRAF = undefined;

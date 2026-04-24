@@ -7,7 +7,14 @@
   import Icon from './Icon.svelte';
   import WorkerBadge from './WorkerBadge.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { isWebAgentMode } from '../web/agent-api';
+  import {
+    isWebAgentMode,
+    approveAgentChange,
+    revertAgentChange,
+    approveAllAgentChanges,
+    revertAllAgentChanges,
+    revertAgentExecutionGroupChanges,
+  } from '../web/agent-api';
 
   const appState = getState();
   const isWebMode = isWebAgentMode();
@@ -33,7 +40,7 @@
     if (!isWebMode || typeof window === 'undefined') {
       return;
     }
-    const media = window.matchMedia('(max-width: 960px)');
+    const media = window.matchMedia('(max-width: 1120px)');
     const updateViewport = () => {
       isCompactViewport = media.matches;
     };
@@ -146,11 +153,19 @@
   }
   function approveChange(filePath: string) {
     const sessionId = getCurrentSessionId() || undefined;
-    vscode.postMessage({ type: 'approveChange', filePath, sessionId });
+    if (isWebMode) {
+      void approveAgentChange(filePath, sessionId).catch(console.error);
+    } else {
+      vscode.postMessage({ type: 'approveChange', filePath, sessionId });
+    }
   }
   function revertChange(filePath: string) {
     const sessionId = getCurrentSessionId() || undefined;
-    vscode.postMessage({ type: 'revertChange', filePath, sessionId });
+    if (isWebMode) {
+      void revertAgentChange(filePath, sessionId).catch(console.error);
+    } else {
+      vscode.postMessage({ type: 'revertChange', filePath, sessionId });
+    }
   }
   async function viewDiff(filePath: string) {
     const edit = edits.find((candidate) => candidate.filePath === filePath) ?? null;
@@ -183,16 +198,28 @@
   }
   function approveAllChanges() {
     const sessionId = getCurrentSessionId() || undefined;
-    vscode.postMessage({ type: 'approveAllChanges', sessionId });
+    if (isWebMode) {
+      void approveAllAgentChanges(sessionId).catch(console.error);
+    } else {
+      vscode.postMessage({ type: 'approveAllChanges', sessionId });
+    }
   }
   function revertAllChanges() {
     const sessionId = getCurrentSessionId() || undefined;
-    vscode.postMessage({ type: 'revertAllChanges', sessionId });
+    if (isWebMode) {
+      void revertAllAgentChanges(sessionId).catch(console.error);
+    } else {
+      vscode.postMessage({ type: 'revertAllChanges', sessionId });
+    }
   }
   function revertExecutionGroup() {
     if (!latestExecutionGroupId) return;
     const sessionId = getCurrentSessionId() || undefined;
-    vscode.postMessage({ type: 'revertExecutionGroup', executionGroupId: latestExecutionGroupId, sessionId });
+    if (isWebMode) {
+      void revertAgentExecutionGroupChanges(latestExecutionGroupId, sessionId).catch(console.error);
+    } else {
+      vscode.postMessage({ type: 'revertExecutionGroup', executionGroupId: latestExecutionGroupId, sessionId });
+    }
   }
 
   function getEditKey(edit: Edit): string {
@@ -573,17 +600,17 @@
   :global(.theme-light) .edits-panel,
   :global(body.vscode-light) .edits-panel,
   :global(:root.theme-light) .edits-panel {
-    --edits-card-bg: color-mix(in srgb, white 90%, var(--surface-1));
-    --edits-card-bg-strong: color-mix(in srgb, white 78%, var(--surface-2));
-    --edits-card-border: color-mix(in srgb, var(--border-subtle) 88%, rgba(15, 23, 42, 0.05));
+    --edits-card-bg: #f6f8fa;
+    --edits-card-bg-strong: #eef1f5;
+    --edits-card-border: #d7dce5;
     --edits-card-shadow:
-      0 1px 0 rgba(255, 255, 255, 0.75),
-      0 10px 24px rgba(15, 23, 42, 0.04);
-    --edits-row-bg: color-mix(in srgb, white 92%, var(--surface-1));
-    --edits-row-bg-hover: color-mix(in srgb, white 82%, var(--surface-hover));
-    --edits-row-border: color-mix(in srgb, var(--border-subtle) 88%, rgba(15, 23, 42, 0.06));
-    --edits-header-bg: color-mix(in srgb, white 80%, var(--surface-1));
-    --edits-line-number-bg: color-mix(in srgb, white 76%, var(--surface-2));
+      0 1px 2px rgba(15, 23, 42, 0.06),
+      0 4px 12px rgba(15, 23, 42, 0.04);
+    --edits-row-bg: #f9fafb;
+    --edits-row-bg-hover: #eef1f5;
+    --edits-row-border: #e2e6ed;
+    --edits-header-bg: #f0f3f6;
+    --edits-line-number-bg: #eef1f5;
     --edits-overlay-bg: rgba(15, 23, 42, 0.24);
   }
 
@@ -875,7 +902,8 @@
     font-weight: var(--font-medium);
     color: var(--foreground);
     white-space: nowrap;
-    flex-shrink: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .file-dir {
@@ -955,7 +983,7 @@
   :global(.theme-light) .file-row,
   :global(body.vscode-light) .file-row,
   :global(:root.theme-light) .file-row {
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5);
   }
 
   .action-icon {
@@ -985,11 +1013,6 @@
   /* ─── 轮次分组 ─── */
   .group-section {
     margin-bottom: var(--space-3);
-    padding: var(--space-2);
-    background: var(--edits-card-bg);
-    border: 1px solid var(--edits-card-border);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--edits-card-shadow);
   }
 
   .group-section:last-child {
@@ -1000,11 +1023,8 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
-    padding: var(--space-2);
+    padding: var(--space-1) var(--space-2);
     margin-bottom: var(--space-2);
-    border-radius: var(--radius-md);
-    background: var(--edits-header-bg);
-    border: 1px solid color-mix(in srgb, var(--edits-card-border) 85%, transparent);
   }
 
   .group-label {
@@ -1065,9 +1085,9 @@
 
     .edits-panel.web-mode .file-row,
     .file-row {
-      align-items: flex-start;
-      flex-wrap: wrap;
-      row-gap: var(--space-2);
+      align-items: center;
+      flex-wrap: nowrap;
+      gap: var(--space-2);
     }
 
     .edits-panel.web-mode .file-row {
@@ -1075,7 +1095,7 @@
     }
 
     .file-info {
-      width: calc(100% - 52px);
+      flex: 1 1 0;
       min-width: 0;
       flex-direction: column;
       align-items: flex-start;
@@ -1084,18 +1104,25 @@
 
     .file-name,
     .file-dir {
-      white-space: normal;
-      word-break: break-all;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
-    .file-workers,
-    .file-stats,
+    .file-workers {
+      display: none;
+    }
+
+    .file-stats {
+      flex-shrink: 0;
+    }
+
     .file-actions {
-      margin-left: 24px;
+      flex-shrink: 0;
     }
   }
 
-  @media (max-width: 960px) {
+  @media (max-width: 1120px) {
     .edits-shell.has-docked-preview {
       grid-template-columns: 1fr;
     }
@@ -1106,9 +1133,9 @@
   }
 
   .preview-overlay {
-    position: fixed;
+    position: absolute;
     inset: 0;
-    z-index: 80;
+    z-index: 300;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1226,6 +1253,7 @@
   .preview-action.revert:hover { color: var(--error); }
 
   .preview-body {
+    flex: 1;
     min-height: 0;
     overflow: auto;
     padding: var(--space-3);
@@ -1350,8 +1378,55 @@
     color: var(--error);
   }
 
+  :global(.theme-light) .preview-diff-line.meta,
+  :global(:root.theme-light) .preview-diff-line.meta {
+    background: #f1f8ff;
+  }
+  :global(.theme-light) .preview-diff-line.meta .preview-line-number,
+  :global(:root.theme-light) .preview-diff-line.meta .preview-line-number {
+    background: #dbedff;
+    color: #1a56db;
+  }
+  :global(.theme-light) .preview-diff-line.meta code,
+  :global(:root.theme-light) .preview-diff-line.meta code {
+    color: #1e40af;
+  }
+
+  :global(.theme-light) .preview-diff-line.add,
+  :global(:root.theme-light) .preview-diff-line.add {
+    background: #dafbe1;
+  }
+  :global(.theme-light) .preview-diff-line.add .preview-line-number,
+  :global(:root.theme-light) .preview-diff-line.add .preview-line-number {
+    background: #aceebb;
+    color: #116329;
+  }
+  :global(.theme-light) .preview-diff-line.add code,
+  :global(:root.theme-light) .preview-diff-line.add code {
+    color: #1f2937;
+  }
+
+  :global(.theme-light) .preview-diff-line.del,
+  :global(:root.theme-light) .preview-diff-line.del {
+    background: #ffeef0;
+  }
+  :global(.theme-light) .preview-diff-line.del .preview-line-number,
+  :global(:root.theme-light) .preview-diff-line.del .preview-line-number {
+    background: #ffdce0;
+    color: #b91c1c;
+  }
+  :global(.theme-light) .preview-diff-line.del code,
+  :global(:root.theme-light) .preview-diff-line.del code {
+    color: #1f2937;
+  }
+
   .preview-footer-actions {
-    display: none;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-2);
+    padding: var(--space-3);
+    border-top: 1px solid var(--edits-card-border);
+    background: var(--edits-card-bg);
   }
 
   .footer-action {
@@ -1387,7 +1462,7 @@
     background: color-mix(in srgb, var(--error-muted) 66%, var(--edits-card-bg));
   }
 
-  @media (max-width: 768px) {
+  @media (max-width: 900px) {
     .preview-overlay {
       padding: 0;
       align-items: stretch;
@@ -1420,12 +1495,6 @@
     }
 
     .preview-footer-actions {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: var(--space-2);
-      padding: var(--space-3);
-      border-top: 1px solid var(--edits-card-border);
-      background: var(--edits-card-bg);
       box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.08);
     }
   }

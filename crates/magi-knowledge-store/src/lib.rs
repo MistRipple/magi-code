@@ -1,3 +1,4 @@
+pub mod code_scanner;
 pub mod code_tokenizer;
 pub mod dependency_graph;
 mod governed_output;
@@ -257,6 +258,20 @@ impl KnowledgeStore {
             &state.audit_links,
             &state.governance_links,
         )
+    }
+
+    /// 获取代码索引摘要（用于 API 返回前端所需格式）
+    pub fn code_index_summary(&self) -> Option<crate::code_scanner::CodeIndexSummary> {
+        let state = self
+            .state
+            .read()
+            .expect("knowledge store read lock poisoned");
+
+        let record = state.entries.values().find(|r| {
+            r.kind == KnowledgeKind::CodeIndex && r.knowledge_id == "project-code-index"
+        })?;
+
+        serde_json::from_str(&record.content).ok()
     }
 
     pub fn delete(&self, knowledge_id: &str) -> Result<(), DomainError> {

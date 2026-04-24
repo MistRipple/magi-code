@@ -34,6 +34,6 @@
     duration={typeof block.toolCall?.durationMs === 'number'
       ? block.toolCall.durationMs
       : (block.toolCall?.endTime && block.toolCall?.startTime ? block.toolCall.endTime - block.toolCall.startTime : undefined)}
-    initialExpanded={Boolean(toolStatus === 'running' || toolStatus === 'pending')}
+    initialExpanded={false}
   />
 {/if}
