@@ -429,11 +429,23 @@ button {
   border: none;
   background: transparent;
   color: inherit;
+  white-space: nowrap;
+  flex-wrap: nowrap;
   transition:
     background var(--transition-fast),
     color var(--transition-fast),
     border-color var(--transition-fast),
     box-shadow var(--transition-fast);
+}
+
+[role="button"] {
+  white-space: nowrap;
+  flex-wrap: nowrap;
+}
+
+button :where(svg, .icon),
+[role="button"] :where(svg, .icon) {
+  flex-shrink: 0;
 }
 
 button:disabled {
