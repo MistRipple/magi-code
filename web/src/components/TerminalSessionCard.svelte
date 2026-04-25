@@ -178,7 +178,7 @@
     || typeof outputCursor === 'number'
     || typeof returnCode === 'number'
   ));
-  const canToggle = $derived(isExpandable && isActiveStatus);
+  const canToggle = $derived(isExpandable);
   const isExpanded = $derived(canToggle && !collapsed);
 
   let outputElement = $state<HTMLPreElement | null>(null);

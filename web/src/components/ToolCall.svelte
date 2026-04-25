@@ -100,8 +100,6 @@
     userToggled = false;
   });
 
-  const isActiveStatus = $derived(status === 'running' || status === 'pending');
-
   // 格式化内容
   function formatContent(content: unknown): string {
     if (content === null || content === undefined) return '';
@@ -257,7 +255,7 @@
     return toolPolicy as ToolPolicyPayload;
   });
   const hasContent = $derived(hasInput || hasOutput || hasError);
-  const canExpand = $derived(hasContent && !isCompactReadOnlyTool && !isCompactMutation && isActiveStatus);
+  const canExpand = $derived(hasContent && !isCompactReadOnlyTool && !isCompactMutation);
   const shouldRenderCard = $derived(hasContent || isCompactReadOnlyTool || isCompactMutation);
 
   // 获取工具显示名

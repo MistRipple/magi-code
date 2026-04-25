@@ -1291,18 +1291,19 @@ async function dispatchBootstrap(
   payload: BootstrapPayload,
   options: { forceEventStreamReconnect?: boolean; rawPayload?: unknown } = {},
 ): Promise<void> {
- const previousSessionId = currentSessionId;
- // 检测 runtimeEpoch 代际变化：后端重启后执行无刷新状态重建，不允许整页刷新打断用户会话。
- const incomingEpoch = payload.agent?.runtimeEpoch || '';
- if (incomingEpoch && currentRuntimeEpoch && incomingEpoch !== currentRuntimeEpoch) {
-   console.warn('[web-client-bridge] runtimeEpoch 变化，后端已重启，执行无刷新状态重建', {
-     previous: currentRuntimeEpoch,
-     current: incomingEpoch,
-   });
- }
- if (incomingEpoch) {
-   currentRuntimeEpoch = incomingEpoch;
- }
+  const previousSessionId = currentSessionId;
+  const pageMeta = readRustTimelinePageMeta(options.rawPayload ?? payload);
+  // 检测 runtimeEpoch 代际变化：后端重启后执行无刷新状态重建，不允许整页刷新打断用户会话。
+  const incomingEpoch = payload.agent?.runtimeEpoch || '';
+  if (incomingEpoch && currentRuntimeEpoch && incomingEpoch !== currentRuntimeEpoch) {
+    console.warn('[web-client-bridge] runtimeEpoch 变化，后端已重启，执行无刷新状态重建', {
+      previous: currentRuntimeEpoch,
+      current: incomingEpoch,
+    });
+  }
+  if (incomingEpoch) {
+    currentRuntimeEpoch = incomingEpoch;
+  }
   persistWorkspaceBinding(payload.workspace.workspaceId, payload.workspace.rootPath, payload.sessionId);
   const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, options.rawPayload);
   if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
@@ -1312,7 +1313,11 @@ async function dispatchBootstrap(
   if (!taskTrackingHints.rootTaskId && taskTrackingHints.activeTaskIds.length === 0) {
     clearTaskGraph(payload.sessionId);
   }
-  emitDataMessage('sessionBootstrapLoaded', payload as unknown as Record<string, unknown>);
+  emitDataMessage('sessionBootstrapLoaded', {
+    ...payload,
+    hasMoreBefore: pageMeta.hasMoreBefore,
+    beforeCursor: pageMeta.beforeCursor,
+  } as Record<string, unknown>);
   void ensureEventStream({
     forceReconnect: options.forceEventStreamReconnect === true,
     waitUntilOpen: false,
