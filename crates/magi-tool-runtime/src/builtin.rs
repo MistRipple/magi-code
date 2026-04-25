@@ -93,12 +93,6 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::WebFetch => execute_web_fetch(input),
             BuiltinToolName::MermaidDiagram => execute_mermaid_diagram(input),
             BuiltinToolName::KnowledgeQuery => execute_knowledge_query(input),
-            BuiltinToolName::WorkerSendMessage => execute_orchestration_stub(self.name, input),
-            BuiltinToolName::TaskSplit => execute_orchestration_stub(self.name, input),
-            BuiltinToolName::TaskList => execute_orchestration_stub(self.name, input),
-            BuiltinToolName::TaskUpdate => execute_orchestration_stub(self.name, input),
-            BuiltinToolName::TaskClaimNext => execute_orchestration_stub(self.name, input),
-            BuiltinToolName::ContextCompact => execute_orchestration_stub(self.name, input),
         }
     }
 
@@ -2363,18 +2357,4 @@ fn truncate_section(text: &str, max_chars: usize) -> String {
         end -= 1;
     }
     format!("{}…", &text[..end].trim())
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// orchestration.* — 编排工具（需要 OrchestratorService 注入）
-// ══════════════════════════════════════════════════════════════════════════════
-
-fn execute_orchestration_stub(name: BuiltinToolName, _input: &str) -> String {
-    serde_json::json!({
-        "tool": name.as_str(),
-        "status": "failed",
-        "error": format!("编排工具 {} 需要 Orchestrator 运行时上下文，当前未在编排循环中执行。", name.as_str()),
-        "hint": "此工具仅在 Orchestrator/Worker LLM 交互循环中由运行时注入后可用"
-    })
-    .to_string()
 }

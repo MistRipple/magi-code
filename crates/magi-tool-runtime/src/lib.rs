@@ -46,13 +46,6 @@ pub enum BuiltinToolName {
     MermaidDiagram,
     // ── 知识库 ──
     KnowledgeQuery,
-    // ── 编排 ──
-    WorkerSendMessage,
-    TaskSplit,
-    TaskList,
-    TaskUpdate,
-    TaskClaimNext,
-    ContextCompact,
 }
 
 impl BuiltinToolName {
@@ -79,12 +72,6 @@ impl BuiltinToolName {
             Self::WebFetch => "web_fetch",
             Self::MermaidDiagram => "mermaid_diagram",
             Self::KnowledgeQuery => "knowledge_query",
-            Self::WorkerSendMessage => "worker_send_message",
-            Self::TaskSplit => "task_split",
-            Self::TaskList => "task_list",
-            Self::TaskUpdate => "task_update",
-            Self::TaskClaimNext => "task_claim_next",
-            Self::ContextCompact => "context_compact",
         }
     }
 
@@ -111,26 +98,8 @@ impl BuiltinToolName {
             "web_fetch" => Some(Self::WebFetch),
             "mermaid_diagram" => Some(Self::MermaidDiagram),
             "knowledge_query" | "project_knowledge_query" => Some(Self::KnowledgeQuery),
-            "worker_send_message" => Some(Self::WorkerSendMessage),
-            "task_split" => Some(Self::TaskSplit),
-            "task_list" => Some(Self::TaskList),
-            "task_update" => Some(Self::TaskUpdate),
-            "task_claim_next" => Some(Self::TaskClaimNext),
-            "context_compact" => Some(Self::ContextCompact),
             _ => None,
         }
-    }
-
-    pub fn is_orchestration(&self) -> bool {
-        matches!(
-            self,
-            Self::WorkerSendMessage
-                | Self::TaskSplit
-                | Self::TaskList
-                | Self::TaskUpdate
-                | Self::TaskClaimNext
-                | Self::ContextCompact
-        )
     }
 
     pub fn is_write_operation(&self) -> bool {
@@ -394,37 +363,6 @@ impl ToolRegistry {
             (
                 BuiltinToolName::KnowledgeQuery,
                 RiskLevel::Low,
-                ApprovalRequirement::None,
-            ),
-            // 编排
-            (
-                BuiltinToolName::WorkerSendMessage,
-                RiskLevel::Medium,
-                ApprovalRequirement::None,
-            ),
-            (
-                BuiltinToolName::TaskSplit,
-                RiskLevel::Low,
-                ApprovalRequirement::None,
-            ),
-            (
-                BuiltinToolName::TaskList,
-                RiskLevel::Low,
-                ApprovalRequirement::None,
-            ),
-            (
-                BuiltinToolName::TaskUpdate,
-                RiskLevel::Low,
-                ApprovalRequirement::None,
-            ),
-            (
-                BuiltinToolName::TaskClaimNext,
-                RiskLevel::Low,
-                ApprovalRequirement::None,
-            ),
-            (
-                BuiltinToolName::ContextCompact,
-                RiskLevel::Medium,
                 ApprovalRequirement::None,
             ),
         ];
@@ -726,7 +664,7 @@ mod tests {
         path
     }
 
-    fn all_builtin_tools() -> [BuiltinToolName; 27] {
+    fn all_builtin_tools() -> [BuiltinToolName; 21] {
         [
             BuiltinToolName::FileRead,
             BuiltinToolName::FileWrite,
@@ -749,12 +687,6 @@ mod tests {
             BuiltinToolName::WebFetch,
             BuiltinToolName::MermaidDiagram,
             BuiltinToolName::KnowledgeQuery,
-            BuiltinToolName::WorkerSendMessage,
-            BuiltinToolName::TaskSplit,
-            BuiltinToolName::TaskList,
-            BuiltinToolName::TaskUpdate,
-            BuiltinToolName::TaskClaimNext,
-            BuiltinToolName::ContextCompact,
         ]
     }
 
@@ -2167,12 +2099,6 @@ mod tests {
             ("web_fetch", BuiltinToolName::WebFetch),
             ("mermaid_diagram", BuiltinToolName::MermaidDiagram),
             ("project_knowledge_query", BuiltinToolName::KnowledgeQuery),
-            ("worker_send_message", BuiltinToolName::WorkerSendMessage),
-            ("task_split", BuiltinToolName::TaskSplit),
-            ("task_list", BuiltinToolName::TaskList),
-            ("task_update", BuiltinToolName::TaskUpdate),
-            ("task_claim_next", BuiltinToolName::TaskClaimNext),
-            ("context_compact", BuiltinToolName::ContextCompact),
         ];
         for (alias, expected) in &aliases {
             assert_eq!(
@@ -2192,39 +2118,6 @@ mod tests {
                 BuiltinToolName::from_str(tool.as_str()),
                 Some(tool),
                 "{:?} roundtrip failed",
-                tool
-            );
-        }
-    }
-
-    #[test]
-    fn is_orchestration_identifies_correct_tools() {
-        let orchestration = [
-            BuiltinToolName::WorkerSendMessage,
-            BuiltinToolName::TaskSplit,
-            BuiltinToolName::TaskList,
-            BuiltinToolName::TaskUpdate,
-            BuiltinToolName::TaskClaimNext,
-            BuiltinToolName::ContextCompact,
-        ];
-        let non_orchestration = [
-            BuiltinToolName::FileRead,
-            BuiltinToolName::ShellExec,
-            BuiltinToolName::WebSearch,
-            BuiltinToolName::MermaidDiagram,
-            BuiltinToolName::SearchText,
-        ];
-        for tool in &orchestration {
-            assert!(
-                tool.is_orchestration(),
-                "{:?} should be orchestration",
-                tool
-            );
-        }
-        for tool in &non_orchestration {
-            assert!(
-                !tool.is_orchestration(),
-                "{:?} should not be orchestration",
                 tool
             );
         }
@@ -2348,29 +2241,6 @@ mod tests {
     }
 
     #[test]
-    fn orchestration_stubs_return_error() {
-        let registry = make_registry();
-        let orchestration_tools = [
-            BuiltinToolName::WorkerSendMessage,
-            BuiltinToolName::TaskSplit,
-            BuiltinToolName::TaskList,
-            BuiltinToolName::TaskUpdate,
-            BuiltinToolName::TaskClaimNext,
-            BuiltinToolName::ContextCompact,
-        ];
-        for tool in &orchestration_tools {
-            let output = exec_tool(&registry, *tool, "{}");
-            assert_eq!(output.status, ExecutionResultStatus::Failed, "{:?}", tool);
-            let payload: Value = serde_json::from_str(&output.payload).unwrap();
-            assert!(
-                payload["error"].as_str().unwrap().contains("Orchestrator"),
-                "{:?} error should mention Orchestrator",
-                tool
-            );
-        }
-    }
-
-    #[test]
     fn skill_apply_is_not_registered_as_builtin() {
         let registry = make_registry();
         assert!(registry.builtin_access_mode("skill_apply").is_none());
@@ -2380,6 +2250,29 @@ mod tests {
                 .iter()
                 .all(|spec| spec.name != "skill_apply")
         );
+    }
+
+    #[test]
+    fn orchestration_tools_are_not_registered_as_builtins() {
+        let registry = make_registry();
+        for tool_name in [
+            "worker_send_message",
+            "task_split",
+            "task_list",
+            "task_update",
+            "task_claim_next",
+            "context_compact",
+        ] {
+            assert!(BuiltinToolName::from_str(tool_name).is_none(), "{tool_name}");
+            assert!(registry.builtin_access_mode(tool_name).is_none(), "{tool_name}");
+            assert!(
+                registry
+                    .builtin_specs()
+                    .iter()
+                    .all(|spec| spec.name != tool_name),
+                "{tool_name}"
+            );
+        }
     }
 
     // ── web 工具 access mode ──
