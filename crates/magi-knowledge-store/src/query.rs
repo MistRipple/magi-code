@@ -20,10 +20,10 @@ impl KnowledgeQueryService {
         let mut matches = entries
             .values()
             .filter(|record| {
-                query
-                    .workspace_id
-                    .as_ref()
-                    .is_none_or(|workspace_id| record.workspace_id.as_ref() == Some(workspace_id))
+                query.workspace_id.as_ref().is_none_or(|workspace_id| {
+                    record.workspace_id.as_ref() == Some(workspace_id)
+                        || record.workspace_id.is_none()
+                })
             })
             .filter(|record| query.kind.is_none_or(|kind| record.kind == kind))
             .filter_map(|record| {
