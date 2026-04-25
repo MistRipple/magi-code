@@ -127,6 +127,8 @@ async fn pick_workspace(State(state): State<ApiState>) -> Json<serde_json::Value
 struct WorkspaceSessionsQuery {
     #[serde(rename = "workspaceId", alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(rename = "sessionId", alias = "session_id")]
+    session_id: Option<String>,
 }
 
 async fn workspace_sessions(
@@ -166,10 +168,19 @@ async fn workspace_sessions(
             .then_with(|| right.session_id.cmp(&left.session_id))
     });
 
-    let current_session_id = scoped_sessions
-        .first()
-        .map(|session| session.session_id.clone())
-        .unwrap_or_default();
+    let requested_session_id = query
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let current_session_id = requested_session_id
+        .filter(|session_id| {
+            scoped_sessions
+                .iter()
+                .any(|session| session.session_id == *session_id)
+        })
+        .unwrap_or_default()
+        .to_string();
 
     Json(WorkspaceSessionsResponse {
         session_id: current_session_id,
@@ -255,7 +266,7 @@ mod tests {
             .with_state(state)
             .oneshot(
                 Request::builder()
-                    .uri("/workspaces/sessions?workspaceId=workspace-count")
+                    .uri("/workspaces/sessions?workspaceId=workspace-count&sessionId=session-counted")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -304,7 +315,7 @@ mod tests {
             .with_state(state)
             .oneshot(
                 Request::builder()
-                    .uri("/workspaces/sessions?workspaceId=workspace-session-list")
+                    .uri("/workspaces/sessions?workspaceId=workspace-session-list&sessionId=session-workspace-bound")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -457,7 +468,7 @@ mod tests {
             .with_state(state)
             .oneshot(
                 Request::builder()
-                    .uri("/workspaces/sessions?workspaceId=workspace-session-order")
+                    .uri("/workspaces/sessions?workspaceId=workspace-session-order&sessionId=session-newer")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -477,5 +488,52 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0]["sessionId"], "session-newer");
         assert_eq!(sessions[1]["sessionId"], "session-older");
+    }
+
+    #[tokio::test]
+    async fn workspace_sessions_does_not_select_first_session_without_explicit_session() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-no-auto-select");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-workspace-no-auto-select"),
+            )
+            .expect("workspace should register");
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-no-auto-select"),
+                "不应自动选中",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/workspaces/sessions?workspaceId=workspace-no-auto-select")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        assert_eq!(payload["sessionId"], "");
+        assert_eq!(
+            payload["sessions"]
+                .as_array()
+                .expect("sessions should be an array")
+                .len(),
+            1
+        );
     }
 }

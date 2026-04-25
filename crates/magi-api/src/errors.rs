@@ -23,6 +23,8 @@ pub enum ApiError {
     NotFound(String),
     /// 事件发布失败（event bus 内部异常）
     EventPublishFailed(String),
+    /// 模型或外部执行器调用失败
+    ModelInvocationFailed(String),
     /// 内部组装错误（bootstrap / projection / sidecar 合并等）
     InternalAssemblyError(String),
     /// 资源状态冲突（如 runner 已启动）
@@ -49,6 +51,10 @@ impl ApiError {
         Self::EventPublishFailed(format!("{}: {}", context, err))
     }
 
+    pub fn model_invocation_failed(context: &str, err: impl Display) -> Self {
+        Self::ModelInvocationFailed(format!("{}: {}", context, err))
+    }
+
     pub fn recovery_not_found(recovery_id: &str) -> Self {
         Self::RecoveryNotFound(format!("恢复入口不存在: {}", recovery_id))
     }
@@ -72,6 +78,7 @@ impl ApiError {
             ApiError::RecoveryNotFound(_) => "RECOVERY_NOT_FOUND",
             ApiError::NotFound(_) => "NOT_FOUND",
             ApiError::EventPublishFailed(_) => "EVENT_PUBLISH_FAILED",
+            ApiError::ModelInvocationFailed(_) => "MODEL_INVOCATION_FAILED",
             ApiError::InternalAssemblyError(_) => "INTERNAL_ASSEMBLY_ERROR",
             ApiError::Conflict(_) => "CONFLICT",
         }
@@ -84,6 +91,7 @@ impl ApiError {
             ApiError::RecoveryNotFound(_) => StatusCode::NOT_FOUND,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::EventPublishFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::ModelInvocationFailed(_) => StatusCode::BAD_GATEWAY,
             ApiError::InternalAssemblyError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
         }
@@ -96,6 +104,7 @@ impl ApiError {
             ApiError::RecoveryNotFound(message) => message,
             ApiError::NotFound(message) => message,
             ApiError::EventPublishFailed(message) => message,
+            ApiError::ModelInvocationFailed(message) => message,
             ApiError::InternalAssemblyError(message) => message,
             ApiError::Conflict(message) => message,
         }
@@ -146,6 +155,10 @@ mod tests {
             "EVENT_PUBLISH_FAILED"
         );
         assert_eq!(
+            ApiError::ModelInvocationFailed("model down".into()).error_code(),
+            "MODEL_INVOCATION_FAILED"
+        );
+        assert_eq!(
             ApiError::InternalAssemblyError("boom".into()).error_code(),
             "INTERNAL_ASSEMBLY_ERROR"
         );
@@ -168,6 +181,10 @@ mod tests {
         assert_eq!(
             ApiError::EventPublishFailed("fail".into()).status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            ApiError::ModelInvocationFailed("fail".into()).status_code(),
+            StatusCode::BAD_GATEWAY
         );
         assert_eq!(
             ApiError::InternalAssemblyError("err".into()).status_code(),
@@ -202,6 +219,7 @@ mod tests {
     fn helper_constructors_keep_error_variants_and_context() {
         let internal = ApiError::internal_assembly("创建会话失败", "boom");
         let publish = ApiError::event_publish_failed("事件发布失败", "down");
+        let model = ApiError::model_invocation_failed("模型调用失败", "down");
         let recovery = ApiError::recovery_not_found("recovery-1");
 
         match internal {
@@ -216,6 +234,13 @@ mod tests {
                 assert_eq!(message, "事件发布失败: down");
             }
             other => panic!("unexpected publish variant: {:?}", other),
+        }
+
+        match model {
+            ApiError::ModelInvocationFailed(message) => {
+                assert_eq!(message, "模型调用失败: down");
+            }
+            other => panic!("unexpected model variant: {:?}", other),
         }
 
         match recovery {

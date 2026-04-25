@@ -204,10 +204,7 @@ impl ShadowStateRepository {
         self.read_json_or_default(self.knowledge_state_path())
     }
 
-    pub(crate) fn save_knowledge_state(
-        &self,
-        state: &KnowledgeState,
-    ) -> Result<(), DaemonError> {
+    pub(crate) fn save_knowledge_state(&self, state: &KnowledgeState) -> Result<(), DaemonError> {
         self.write_json_atomically(self.knowledge_state_path(), state)
     }
 

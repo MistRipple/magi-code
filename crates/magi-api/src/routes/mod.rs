@@ -311,6 +311,19 @@ fn resolve_dispatch_session(
         return Ok((session_id, false, workspace_id));
     }
 
+    if let Some(session) = state.session_store.current_session() {
+        if requested_workspace_id.as_ref().is_none_or(|workspace_id| {
+            session_workspace_id(state, &session).as_ref() == Some(workspace_id)
+        }) {
+            let workspace_id = resolve_session_workspace_binding(
+                state,
+                &session,
+                requested_workspace_id.as_ref(),
+            )?;
+            return Ok((session.session_id, false, workspace_id));
+        }
+    }
+
     let session_id = new_session_id();
     state
         .session_store
@@ -323,12 +336,8 @@ fn resolve_dispatch_session(
     Ok((session_id, true, requested_workspace_id))
 }
 
-fn resolve_session_workspace_binding(
-    state: &ApiState,
-    session: &SessionRecord,
-    requested_workspace_id: Option<&WorkspaceId>,
-) -> Result<Option<WorkspaceId>, ApiError> {
-    let bound_workspace_id = session
+fn session_workspace_id(state: &ApiState, session: &SessionRecord) -> Option<WorkspaceId> {
+    session
         .workspace_id
         .as_deref()
         .map(WorkspaceId::new)
@@ -337,7 +346,15 @@ fn resolve_session_workspace_binding(
                 .session_store
                 .execution_ownership(&session.session_id)
                 .and_then(|ownership| ownership.workspace_id)
-        });
+        })
+}
+
+fn resolve_session_workspace_binding(
+    state: &ApiState,
+    session: &SessionRecord,
+    requested_workspace_id: Option<&WorkspaceId>,
+) -> Result<Option<WorkspaceId>, ApiError> {
+    let bound_workspace_id = session_workspace_id(state, session);
 
     if let (Some(requested_workspace_id), Some(bound_workspace_id)) =
         (requested_workspace_id, bound_workspace_id.as_ref())
@@ -398,17 +415,31 @@ fn append_dispatch_assistant_message(state: &ApiState, accepted: &DispatchSubmis
     let current_turn_matches = current_turn
         .as_ref()
         .is_some_and(|turn| turn_matches_accepted_dispatch(turn, accepted));
+    let is_followup_on_existing_turn = current_turn
+        .as_ref()
+        .is_some_and(|turn| current_turn_matches && turn.accepted_at != accepted.accepted_at);
     let response_text = current_turn_matches
-        .then(|| current_turn.and_then(|turn| assistant_final_from_turn(turn, accepted)))
+        .then(|| {
+            current_turn
+                .clone()
+                .and_then(|turn| assistant_final_from_turn(turn, accepted))
+        })
         .flatten();
 
     let Some(response_text) = response_text else {
         return;
     };
 
-    // 使用与 invoke_llm_with_tools 中一致的确定性 entry_id，
-    // 若流式输出已创建该条目则更新为最终内容，否则插入新条目。
-    let streaming_entry_id = format!("timeline-streaming-{}", accepted.action_task_id);
+    // 首次执行使用任务维度的稳定 entry，继续同一任务链时使用轮次维度 entry，
+    // 避免覆盖中断前已经完成的主线回复。
+    let streaming_entry_id = if is_followup_on_existing_turn {
+        format!(
+            "timeline-streaming-{}-{}",
+            accepted.action_task_id, accepted.accepted_at.0
+        )
+    } else {
+        format!("timeline-streaming-{}", accepted.action_task_id)
+    };
     state.session_store.upsert_timeline_entry(
         accepted.session_id.clone(),
         &streaming_entry_id,
@@ -893,7 +924,11 @@ mod tests {
         );
         let app = build_router(state);
 
-        let bootstrap = get_json(app, "/bootstrap?workspaceId=workspace-bootstrap-query").await;
+        let bootstrap = get_json(
+            app,
+            "/bootstrap?workspaceId=workspace-bootstrap-query&sessionId=session-bootstrap-query",
+        )
+        .await;
 
         assert_eq!(
             bootstrap["currentSession"]["sessionId"],
@@ -941,10 +976,7 @@ mod tests {
             "/bootstrap?workspaceId=workspace-history-a&sessionId=session-history-b",
         )
         .await;
-        assert_eq!(
-            bootstrap["currentSession"]["sessionId"],
-            "session-history-a"
-        );
+        assert!(bootstrap["currentSession"].is_null());
 
         let response = app
             .oneshot(
@@ -1006,7 +1038,8 @@ mod tests {
 
     #[tokio::test]
     async fn session_chat_does_not_create_task_graph() {
-        let app = build_router(test_state_with_shadow_execution_pipeline());
+        let state = test_state_with_shadow_execution_pipeline();
+        let app = build_router(state.clone());
 
         let (status, body) = post_json(
             app.clone(),
@@ -1024,6 +1057,22 @@ mod tests {
             "普通对话响应不应暴露任务根 ID: {body:?}"
         );
 
+        wait_for_condition(
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+            || {
+                state
+                    .runtime_read_model_dto()
+                    .details
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == "session-route-shadow")
+                    .and_then(|session| session.current_turn.as_ref())
+                    .is_some_and(|turn| turn.status == "completed")
+            },
+            "普通对话应在后台流式执行完成后标记 turn completed",
+        )
+        .await;
         let runtime_read_model = get_json(app.clone(), "/runtime/read-model").await;
         assert!(
             runtime_read_model["details"]["tasks"]
@@ -1059,6 +1108,133 @@ mod tests {
                 .filter(|entry| entry["kind"] == "AssistantMessage")
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn session_turn_classifier_requires_tool_call_payload() {
+        let state = build_shadow_execution_state(
+            WorkerRuntime::new_compare,
+            Arc::new(PlainJsonClassifierModelBridgeClient),
+        );
+        let app = build_router(state);
+
+        let (status, body) = post_json(
+            app,
+            "/api/session/turn",
+            json!({
+                "sessionId": "session-route-shadow",
+                "text": "你好，这只是普通对话",
+                "deepTask": false,
+                "skillName": null,
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["message"],
+            "Session Turn 分类器未调用 classify_session_turn 工具"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_turn_classifier_failure_returns_model_error_not_internal_500() {
+        let app = build_router(test_state_with_unhealthy_shadow_execution_pipeline());
+
+        let (status, body) = post_json(
+            app,
+            "/api/session/turn",
+            json!({
+                "sessionId": "session-route-shadow",
+                "text": "你好，这只是普通对话",
+                "deepTask": false,
+                "skillName": null,
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error_code"], "MODEL_INVOCATION_FAILED");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Session Turn 分类失败")),
+            "分类器调用失败应返回明确的模型调用错误: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_execute_route_runs_tool_without_task_graph() {
+        let state = build_shadow_execution_state(
+            WorkerRuntime::new_compare,
+            Arc::new(ExecuteToolModelBridgeClient {
+                invoke_count: AtomicUsize::new(0),
+            }),
+        );
+        let app = build_router(state.clone());
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/api/session/turn",
+            json!({
+                "sessionId": "session-route-shadow",
+                "text": "请搜索 Route Shadow Session 并说明结果",
+                "deepTask": false,
+                "skillName": null,
+                "images": [],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "execute turn 应提交成功: {body:?}");
+        assert_eq!(body["route"], "execute");
+        assert!(
+            body.get("rootTaskId").is_none(),
+            "execute 只执行工具，不应创建任务图: {body:?}"
+        );
+
+        wait_for_condition(
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+            || {
+                state
+                    .runtime_read_model_dto()
+                    .details
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == "session-route-shadow")
+                    .is_some_and(|session| {
+                        session
+                            .current_turn
+                            .as_ref()
+                            .is_some_and(|turn| turn.status == "completed")
+                            && session
+                                .turn_items
+                                .iter()
+                                .any(|item| item.kind == "tool_call_started")
+                            && session
+                                .turn_items
+                                .iter()
+                                .any(|item| item.kind == "tool_call_result")
+                            && session
+                                .turn_items
+                                .iter()
+                                .any(|item| item.kind == "assistant_final")
+                    })
+            },
+            "execute turn 应执行工具、写入工具项并生成最终回复",
+        )
+        .await;
+
+        let runtime_read_model = get_json(app, "/runtime/read-model").await;
+        assert!(
+            runtime_read_model["details"]["tasks"]
+                .as_array()
+                .expect("tasks should serialize as array")
+                .is_empty(),
+            "execute route 不能创建 TaskStore 任务"
         );
     }
 
@@ -2284,7 +2460,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_action_route_does_not_write_extraction_or_bind_mission_when_dispatch_fails() {
+    async fn session_turn_does_not_write_extraction_or_bind_mission_when_model_classification_fails()
+     {
         let state = test_state_with_unhealthy_shadow_execution_pipeline();
         let app = build_router(state.clone());
 
@@ -2301,8 +2478,8 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body["error_code"], "INTERNAL_ASSEMBLY_ERROR");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error_code"], "MODEL_INVOCATION_FAILED");
 
         let extraction_history = state
             .shadow_execution_pipeline()
@@ -2588,6 +2765,10 @@ mod tests {
             .iter()
             .map(|branch| branch.worker_id.to_string())
             .collect::<Vec<_>>();
+        let preferred_worker = original_workers
+            .first()
+            .expect("seed dispatch should create at least one branch")
+            .clone();
         let ownership = state
             .session_store
             .execution_ownership(&session_id)
@@ -2606,7 +2787,7 @@ mod tests {
             "/api/session/continue",
             json!({
                 "sessionId": session_id.to_string(),
-                "requestedWorkerIds": ["worker-route-override"],
+                "requestedWorkerIds": [preferred_worker],
             }),
         )
         .await;
@@ -2872,6 +3053,12 @@ mod tests {
 
     struct StaticModelBridgeClient;
 
+    struct PlainJsonClassifierModelBridgeClient;
+
+    struct ExecuteToolModelBridgeClient {
+        invoke_count: AtomicUsize,
+    }
+
     struct DelayedModelBridgeClient {
         delay: Duration,
         payload: String,
@@ -2890,19 +3077,78 @@ mod tests {
                 payload: format!("shadow-model::{}", request.prompt.trim()),
             })
         }
+    }
 
-        fn invoke_stream(
+    impl ModelBridgeClient for PlainJsonClassifierModelBridgeClient {
+        fn invoke(
             &self,
             request: ModelInvocationRequest,
-            on_event: &mut dyn FnMut(magi_bridge_client::ModelStreamEvent),
         ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
-            let response = self.invoke(request)?;
-            if !response.payload.is_empty() {
-                on_event(magi_bridge_client::ModelStreamEvent::ContentDelta {
-                    delta: response.payload.clone(),
+            if request.prompt.contains("Session Turn 编排分类器") {
+                return Ok(BridgeResponse {
+                    ok: true,
+                    payload: serde_json::json!({
+                        "route": "chat",
+                        "taskTitle": null,
+                        "executionGoal": null,
+                        "requiredWorkers": [],
+                        "toolIntent": null,
+                    })
+                    .to_string(),
                 });
             }
-            Ok(response)
+            Ok(BridgeResponse {
+                ok: true,
+                payload: "shadow-model::ok".to_string(),
+            })
+        }
+    }
+
+    impl ModelBridgeClient for ExecuteToolModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            if request.prompt.contains("Session Turn 编排分类器") {
+                return Ok(BridgeResponse {
+                    ok: true,
+                    payload: classifier_tool_payload(serde_json::json!({
+                        "route": "execute",
+                        "taskTitle": null,
+                        "executionGoal": null,
+                        "requiredWorkers": [],
+                        "toolIntent": null,
+                    })),
+                });
+            }
+            let index = self.invoke_count.fetch_add(1, Ordering::SeqCst);
+            let payload = if index == 0 {
+                serde_json::json!({
+                    "content": null,
+                    "finish_reason": "tool_calls",
+                    "tool_calls": [{
+                        "id": "call-search-text",
+                        "type": "function",
+                        "function": {
+                            "name": "search_text",
+                            "arguments": serde_json::json!({
+                                "query": "Route Shadow Session",
+                                "root": ".",
+                                "limit": 1
+                            }).to_string(),
+                        }
+                    }]
+                })
+            } else {
+                serde_json::json!({
+                    "content": "工具执行完成，已根据搜索结果给出回复。",
+                    "finish_reason": "stop"
+                })
+            };
+            Ok(BridgeResponse {
+                ok: true,
+                payload: payload.to_string(),
+            })
         }
     }
 
@@ -2919,20 +3165,6 @@ mod tests {
                 ok: true,
                 payload: self.payload.clone(),
             })
-        }
-
-        fn invoke_stream(
-            &self,
-            request: ModelInvocationRequest,
-            on_event: &mut dyn FnMut(magi_bridge_client::ModelStreamEvent),
-        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
-            let response = self.invoke(request)?;
-            if !response.payload.is_empty() {
-                on_event(magi_bridge_client::ModelStreamEvent::ContentDelta {
-                    delta: response.payload.clone(),
-                });
-            }
-            Ok(response)
         }
     }
 
@@ -3006,14 +3238,6 @@ mod tests {
                 message: "model bridge unavailable".to_string(),
             })
         }
-
-        fn invoke_stream(
-            &self,
-            request: ModelInvocationRequest,
-            _on_event: &mut dyn FnMut(magi_bridge_client::ModelStreamEvent),
-        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
-            self.invoke(request)
-        }
     }
 
     impl ModelBridgeClient for ContinueClassifierExpectingNoRecoverableChain {
@@ -3044,20 +3268,6 @@ mod tests {
                 ok: true,
                 payload: "shadow-model::ok".to_string(),
             })
-        }
-
-        fn invoke_stream(
-            &self,
-            request: ModelInvocationRequest,
-            on_event: &mut dyn FnMut(magi_bridge_client::ModelStreamEvent),
-        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
-            let response = self.invoke(request)?;
-            if !response.payload.is_empty() {
-                on_event(magi_bridge_client::ModelStreamEvent::ContentDelta {
-                    delta: response.payload.clone(),
-                });
-            }
-            Ok(response)
         }
     }
 
@@ -3111,19 +3321,6 @@ mod tests {
                 })
                 .to_string(),
             })
-        }
-
-        fn invoke_stream(
-            &self,
-            request: ModelInvocationRequest,
-            on_event: &mut dyn FnMut(magi_bridge_client::ModelStreamEvent),
-        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
-            let response = self.invoke(request)?;
-            let parsed = response.parse_chat_payload();
-            if let Some(content) = parsed.content.filter(|content| !content.is_empty()) {
-                on_event(magi_bridge_client::ModelStreamEvent::ContentDelta { delta: content });
-            }
-            Ok(response)
         }
     }
 

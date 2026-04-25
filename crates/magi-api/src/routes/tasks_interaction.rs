@@ -82,6 +82,10 @@ async fn interrupt_task(
         if let Some(lease) = store.get_active_lease(&subtree_task_id) {
             store.revoke_lease(&subtree_task_id, &lease.lease_id);
         }
+        state.session_store.remove_timeline_entry(
+            &session_id,
+            &format!("timeline-streaming-{}", subtree_task_id),
+        );
     }
     finalize_terminal_worker_branches(&state, &session_id)?;
     let _ = state

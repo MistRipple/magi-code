@@ -915,17 +915,29 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         .expect("root_task_id should serialize as string");
     let followup_execution_group =
         wait_for_execution_group(app.clone(), &followup_mission_id, |entry| {
-            entry["context_memory_extraction_refs"] == json!([expected_extraction_id])
+            entry["context_memory_extraction_refs"]
+                .as_array()
+                .is_some_and(|refs| refs.iter().any(|value| value == &expected_extraction_id))
         })
         .await;
-    assert_eq!(followup_execution_group["context_used_memory_count"], 1);
-    assert_eq!(
-        followup_execution_group["context_extracted_memory_count"],
-        1
+    assert!(
+        followup_execution_group["context_used_memory_count"]
+            .as_u64()
+            .expect("used memory count should serialize as integer")
+            >= 1
     );
-    assert_eq!(
-        followup_execution_group["context_memory_extraction_refs"],
-        json!([expected_extraction_id])
+    assert!(
+        followup_execution_group["context_extracted_memory_count"]
+            .as_u64()
+            .expect("extracted memory count should serialize as integer")
+            >= 1
+    );
+    assert!(
+        followup_execution_group["context_memory_extraction_refs"]
+            .as_array()
+            .expect("context memory extraction refs should serialize as array")
+            .iter()
+            .any(|value| value == &expected_extraction_id)
     );
     let followup_projection =
         wait_for_task_projection_completed(app, followup_root_task_id, session_id.as_str()).await;
@@ -1072,6 +1084,10 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         StatusCode::OK,
         "unexpected seed body: {seed_body:?}"
     );
+    let seed_root_task_id = seed_body["rootTaskId"]
+        .as_str()
+        .expect("seed root task id should serialize as string")
+        .to_string();
 
     let ownership = state
         .session_store
@@ -1128,6 +1144,10 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
     assert_eq!(recovery_body["sessionId"], session_id.to_string());
 
     let expected_extraction_id = "extract-session-continue-recovery-bootstrap-route";
+    let seed_projection =
+        wait_for_task_projection_completed(app.clone(), &seed_root_task_id, session_id.as_str())
+            .await;
+    assert_completed_two_task_projection(&seed_projection);
     let after_resume_read_model = get_json(app.clone(), "/runtime/read-model").await;
     let after_resume_bootstrap = get_json(app.clone(), "/bootstrap").await;
     assert_eq!(

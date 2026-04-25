@@ -26,6 +26,7 @@ const DEFAULT_WEB_DEV_HOST: &str = "127.0.0.1";
 const DEFAULT_WEB_DEV_PORT: u16 = 3000;
 const WEB_DEV_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const WEB_DEV_READY_INTERVAL: Duration = Duration::from_millis(250);
+const WEB_DEV_READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct Daemon {
@@ -42,8 +43,8 @@ impl Daemon {
         runtime.start_background_tasks();
         runtime.publish_started_event(&self.config.service_name);
 
-        let listener = TcpListener::bind(self.config.socket_addr()?).await?;
         let frontend = resolve_frontend_mode(&self.config).await?;
+        let listener = TcpListener::bind(self.config.socket_addr()?).await?;
         let app =
             build_application_router(runtime.router(self.config.service_name.clone()), &frontend);
         info!(
@@ -135,12 +136,9 @@ async fn resolve_frontend_mode(config: &DaemonConfig) -> Result<FrontendMode, Da
         .spawn()
         .map_err(|error| DaemonError::internal(format!("启动 Vite 前端热加载服务失败: {error}")))?;
 
-    if !wait_for_web_dev_server(&origin).await {
+    if let Err(error) = wait_for_spawned_web_dev_server(&origin, &mut child).await {
         let _ = child.start_kill();
-        return Err(DaemonError::internal(format!(
-            "Vite 前端热加载服务未在 {} 秒内就绪: {origin}",
-            WEB_DEV_READY_TIMEOUT.as_secs()
-        )));
+        return Err(DaemonError::internal(error));
     }
 
     Ok(FrontendMode::Dev(WebDevServer {
@@ -236,21 +234,42 @@ fn build_web_dev_html(vite_origin: &str, agent_origin: &str) -> String {
 
 async fn is_web_dev_server_ready(origin: &str) -> bool {
     let url = format!("{}/web.html", origin.trim_end_matches('/'));
-    match reqwest::Client::new().get(url).send().await {
+    let client = match reqwest::Client::builder()
+        .timeout(WEB_DEV_READY_REQUEST_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    match client.get(url).send().await {
         Ok(response) => response.status().is_success(),
         Err(_) => false,
     }
 }
 
-async fn wait_for_web_dev_server(origin: &str) -> bool {
+async fn wait_for_spawned_web_dev_server(origin: &str, child: &mut Child) -> Result<(), String> {
     let started_at = Instant::now();
     while started_at.elapsed() < WEB_DEV_READY_TIMEOUT {
         if is_web_dev_server_ready(origin).await {
-            return true;
+            return Ok(());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "Vite 前端热加载服务启动后提前退出，状态: {status}；请确认 {origin} 未被其他进程占用，且该端口返回可用的 /web.html"
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(format!("检查 Vite 前端热加载服务状态失败: {error}"));
+            }
         }
         tokio::time::sleep(WEB_DEV_READY_INTERVAL).await;
     }
-    false
+    Err(format!(
+        "Vite 前端热加载服务未在 {} 秒内就绪: {origin}",
+        WEB_DEV_READY_TIMEOUT.as_secs()
+    ))
 }
 
 fn env_flag_enabled(name: &str) -> bool {

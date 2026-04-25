@@ -3,6 +3,9 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
+use magi_bridge_client::{
+    ChatToolChoice, ChatToolDefinition, ChatToolFunctionDefinition, ModelInvocationRequest,
+};
 use magi_core::TaskStatus;
 use magi_core::{DomainError, EventId, SessionId, UtcMillis, WorkerId};
 use magi_event_bus::{EventContext, EventEnvelope};
@@ -11,7 +14,6 @@ use magi_session_store::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::time::{Duration, Instant};
 
 use super::append_session_user_message;
 use crate::{
@@ -21,7 +23,11 @@ use crate::{
     },
     errors::ApiError,
     state::ApiState,
-    task_execution::{SessionTurnExecutionRequest, continue_shadow_execution_chain},
+    task_execution::{
+        BUSINESS_MODEL_PROVIDER, SessionTurnExecutionRequest,
+        active_execution_branch_is_continue_recoverable, continue_shadow_execution_chain,
+        drive_shadow_task_graph, resolve_configured_model_client,
+    },
 };
 
 pub fn routes() -> Router<ApiState> {
@@ -80,7 +86,7 @@ async fn submit_session_turn(
 ) -> Result<Json<SessionTurnResponseDto>, ApiError> {
     validate_session_turn_input(&request)?;
     let accepted_at = super::monotonic_accepted_at();
-    let decision = decide_session_turn_locally(&request);
+    let decision = decide_session_turn_with_model(&state, &request)?;
     match decision.route {
         SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute => {
             submit_regular_session_turn(state, request, accepted_at, decision).map(Json)
@@ -195,26 +201,200 @@ fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), Ap
     Ok(())
 }
 
-fn decide_session_turn_locally(request: &SessionTurnRequestDto) -> SessionTurnIntentDecision {
-    if request.deep_task {
-        let trimmed_text = request.trimmed_text();
-        let task_title = request.mission_title(trimmed_text.as_deref());
-        return SessionTurnIntentDecision {
-            route: SessionTurnRouteDto::Task,
-            task_title: Some(task_title),
-            execution_goal: trimmed_text,
-            required_workers: Vec::new(),
-            tool_intent: None,
-        };
+fn decide_session_turn_with_model(
+    state: &ApiState,
+    request: &SessionTurnRequestDto,
+) -> Result<SessionTurnIntentDecision, ApiError> {
+    let client = resolve_configured_model_client(
+        Some(&state.settings_store),
+        state.model_bridge_client().cloned(),
+    )
+    .ok_or_else(|| ApiError::InvalidInput("Session Turn 分类器未配置模型客户端".to_string()))?;
+    let has_recoverable_chain = request
+        .requested_session_id()
+        .or_else(|| {
+            state
+                .session_store
+                .current_session()
+                .map(|session| session.session_id)
+        })
+        .map(|session_id| session_has_recoverable_chain(state, &session_id))
+        .unwrap_or(false);
+    let prompt = build_session_turn_classifier_prompt(request, has_recoverable_chain);
+    let response = client
+        .invoke(ModelInvocationRequest {
+            provider: BUSINESS_MODEL_PROVIDER.to_string(),
+            prompt,
+            messages: None,
+            tools: Some(vec![session_turn_classifier_tool()]),
+            tool_choice: Some(ChatToolChoice::force_function("classify_session_turn")),
+        })
+        .map_err(|error| ApiError::model_invocation_failed("Session Turn 分类失败", error))?;
+    if !response.ok {
+        return Err(ApiError::ModelInvocationFailed(
+            "Session Turn 分类器返回失败状态".to_string(),
+        ));
     }
+    let decision = parse_session_turn_decision(&response.payload)?;
+    if matches!(decision.route, SessionTurnRouteDto::Continue) && !has_recoverable_chain {
+        return Err(ApiError::InvalidInput(
+            "当前会话没有可继续的执行链".to_string(),
+        ));
+    }
+    Ok(decision)
+}
 
-    SessionTurnIntentDecision {
-        route: SessionTurnRouteDto::Chat,
-        task_title: None,
-        execution_goal: None,
-        required_workers: Vec::new(),
-        tool_intent: None,
+fn session_has_recoverable_chain(state: &ApiState, session_id: &SessionId) -> bool {
+    let Some(chain) = state.session_store.active_execution_chain(session_id) else {
+        return false;
+    };
+    chain
+        .branches
+        .iter()
+        .any(|branch| active_execution_branch_is_continue_recoverable(state, &chain, branch))
+}
+
+fn build_session_turn_classifier_prompt(
+    request: &SessionTurnRequestDto,
+    has_recoverable_chain: bool,
+) -> String {
+    let user_text = request.trimmed_text().unwrap_or_default();
+    let skill_name = request
+        .skill_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+    format!(
+        "Session Turn 编排分类器\n\
+         请只调用 classify_session_turn 工具，输出本轮 route。\n\
+         route 只能是 chat、execute、task、continue。\n\
+         普通问答使用 chat；需要工具但不创建任务图使用 execute；需要产品级任务编排使用 task；用户要求继续且存在可恢复链时使用 continue。\n\
+         userText={user_text}\n\
+         deepTask={}\n\
+         skillName=\"{skill_name}\"\n\
+         imageCount={}\n\
+         hasRecoverableChain={has_recoverable_chain}",
+        request.deep_task,
+        request.images.len()
+    )
+}
+
+fn session_turn_classifier_tool() -> ChatToolDefinition {
+    ChatToolDefinition {
+        kind: "function".to_string(),
+        function: ChatToolFunctionDefinition {
+            name: "classify_session_turn".to_string(),
+            description: "判断当前 Session Turn 应进入普通对话、工具执行、任务编排或继续会话。"
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["route"],
+                "properties": {
+                    "route": {
+                        "type": "string",
+                        "enum": ["chat", "execute", "task", "continue"]
+                    },
+                    "taskTitle": { "type": ["string", "null"] },
+                    "executionGoal": { "type": ["string", "null"] },
+                    "requiredWorkers": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "toolIntent": { "type": ["string", "null"] }
+                }
+            }),
+        },
     }
+}
+
+fn parse_session_turn_decision(payload: &str) -> Result<SessionTurnIntentDecision, ApiError> {
+    let parsed = serde_json::from_str::<serde_json::Value>(payload).map_err(|error| {
+        ApiError::InvalidInput(format!("Session Turn 分类器输出不是有效 JSON: {error}"))
+    })?;
+    let calls = parsed
+        .get("tool_calls")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            ApiError::InvalidInput(
+                "Session Turn 分类器未调用 classify_session_turn 工具".to_string(),
+            )
+        })?;
+    for call in calls {
+        if let Some(arguments) = classifier_arguments_from_tool_call(call) {
+            return session_turn_decision_from_value(arguments?);
+        }
+    }
+    Err(ApiError::InvalidInput(
+        "Session Turn 分类器未调用 classify_session_turn 工具".to_string(),
+    ))
+}
+
+fn classifier_arguments_from_tool_call(
+    call: &serde_json::Value,
+) -> Option<Result<serde_json::Value, ApiError>> {
+    let function = call.get("function")?;
+    if function.get("name").and_then(|value| value.as_str())? != "classify_session_turn" {
+        return None;
+    }
+    let Some(arguments) = function.get("arguments").and_then(|value| value.as_str()) else {
+        return Some(Err(ApiError::InvalidInput(
+            "Session Turn 分类器工具参数缺失".to_string(),
+        )));
+    };
+    Some(serde_json::from_str(arguments).map_err(|error| {
+        ApiError::InvalidInput(format!("Session Turn 分类器工具参数不是有效 JSON: {error}"))
+    }))
+}
+
+fn session_turn_decision_from_value(
+    value: serde_json::Value,
+) -> Result<SessionTurnIntentDecision, ApiError> {
+    let route = match value.get("route").and_then(|value| value.as_str()) {
+        Some("chat") => SessionTurnRouteDto::Chat,
+        Some("execute") => SessionTurnRouteDto::Execute,
+        Some("task") => SessionTurnRouteDto::Task,
+        Some("continue") => SessionTurnRouteDto::Continue,
+        Some(other) => {
+            return Err(ApiError::InvalidInput(format!(
+                "Session Turn 分类器返回未知 route: {other}"
+            )));
+        }
+        None => {
+            return Err(ApiError::InvalidInput(
+                "Session Turn 分类器缺少 route".to_string(),
+            ));
+        }
+    };
+    Ok(SessionTurnIntentDecision {
+        route,
+        task_title: optional_trimmed_string(&value, "taskTitle"),
+        execution_goal: optional_trimmed_string(&value, "executionGoal"),
+        required_workers: value
+            .get("requiredWorkers")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        tool_intent: optional_trimmed_string(&value, "toolIntent"),
+    })
+}
+
+fn optional_trimmed_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn submit_regular_session_turn(
@@ -292,7 +472,7 @@ fn submit_regular_session_turn(
             session_id: session_id.clone(),
             workspace_id: workspace_id.clone(),
             prompt,
-            use_tools: true,
+            use_tools: matches!(decision.route, SessionTurnRouteDto::Execute),
             skill_name: request.skill_name.clone(),
         },
         accepted_at,
@@ -620,33 +800,26 @@ fn spawn_continue_session_finalize(
             return;
         };
 
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let Some(task) = task_store.get_task(&accepted.action_task_id) else {
-                return;
-            };
-            if matches!(
-                task.status,
-                TaskStatus::Completed
-                    | TaskStatus::Failed
-                    | TaskStatus::Cancelled
-                    | TaskStatus::Blocked
-                    | TaskStatus::Skipped
-            ) {
-                break;
-            }
-            if Instant::now() >= deadline {
-                tracing::warn!(
+        if let Err(error) = drive_shadow_task_graph(
+            &state,
+            &accepted.root_task_id,
+            &accepted.action_task_id,
+            "继续会话执行失败",
+        ) {
+            let interrupted = task_store
+                .get_task(&accepted.action_task_id)
+                .is_some_and(|task| task.status == TaskStatus::Blocked);
+            if !interrupted {
+                tracing::error!(
                     session_id = %accepted.session_id,
                     root_task_id = %accepted.root_task_id,
                     action_task_id = %accepted.action_task_id,
-                    "session continue finalize timed out waiting for action task terminal state"
+                    ?error,
+                    "session continue graph drive failed"
                 );
                 return;
             }
-            std::thread::sleep(Duration::from_millis(20));
         }
-
         super::append_dispatch_assistant_message(
             &state,
             &crate::task_execution::DispatchSubmissionAccepted {

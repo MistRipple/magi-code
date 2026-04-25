@@ -59,10 +59,20 @@ impl BootstrapDto {
         state: &ApiState,
         requested_session_id: Option<&SessionId>,
     ) -> Self {
+        Self::from_state_with_session_projection(
+            state,
+            select_session_projection(state.session_store.projection_input(), requested_session_id),
+        )
+    }
+
+    pub(crate) fn from_state_with_session_projection(
+        state: &ApiState,
+        session_projection: SessionProjectionInput,
+    ) -> Self {
         let mut dto = Self::from_projection(
             state.runtime_epoch().to_string(),
             state.service_info.clone(),
-            select_session_projection(state.session_store.projection_input(), requested_session_id),
+            session_projection,
             state.workspace_registry.projection_input(),
             state.session_store.execution_sidecar_exports(),
             state.workspace_registry.recovery_sidecar_exports(),

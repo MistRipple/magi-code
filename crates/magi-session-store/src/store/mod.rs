@@ -348,6 +348,18 @@ impl SessionStore {
         }
     }
 
+    pub fn remove_timeline_entry(&self, session_id: &SessionId, entry_id: &str) -> bool {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        let before_len = state.timeline.len();
+        state
+            .timeline
+            .retain(|entry| !(entry.session_id == *session_id && entry.entry_id == entry_id));
+        before_len != state.timeline.len()
+    }
+
     pub fn append_notification(
         &self,
         session_id: SessionId,

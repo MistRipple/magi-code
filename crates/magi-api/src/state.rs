@@ -31,7 +31,6 @@ use magi_orchestrator::{
     task_worker_catalog::build_worker_catalog_for_roles,
 };
 use magi_session_store::SessionStore;
-use magi_usage_authority::UsageAuthority;
 use magi_workspace::WorkspaceStore;
 use std::collections::HashMap;
 use std::fs;
@@ -409,7 +408,6 @@ pub struct ApiState {
     task_store: Option<Arc<TaskStore>>,
     runner_manager: Option<RunnerManager>,
     session_turn_dispatcher: Option<Arc<ShadowTaskDispatcher>>,
-    usage_authority: Arc<Mutex<UsageAuthority>>,
     mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
     model_bridge_client_is_real: bool,
@@ -516,7 +514,6 @@ impl ApiState {
             task_store: None,
             runner_manager: None,
             session_turn_dispatcher: None,
-            usage_authority: Arc::new(Mutex::new(UsageAuthority::new())),
             mcp_connections: Arc::new(RwLock::new(HashMap::new())),
             model_bridge_client: None,
             model_bridge_client_is_real: false,
@@ -609,45 +606,34 @@ impl ApiState {
         workspace_id: Option<&str>,
         requested_session_id: Option<&SessionId>,
     ) -> BootstrapDto {
-        let projection = self.session_store.projection_input();
-        let session_belongs_to_workspace = |session_id: &SessionId, workspace_id: &str| {
-            projection.sessions.iter().any(|session| {
-                &session.session_id == session_id
-                    && session.workspace_id.as_deref() == Some(workspace_id)
+        let Some(ws_id) = workspace_id else {
+            return BootstrapDto::from_state_with_selected_session(self, requested_session_id);
+        };
+        let mut projection = self.session_store.projection_input();
+        projection
+            .sessions
+            .retain(|session| session.workspace_id.as_deref() == Some(ws_id));
+        let selected_session_id = requested_session_id
+            .filter(|session_id| {
+                projection
+                    .sessions
+                    .iter()
+                    .any(|session| session.session_id == **session_id)
             })
-        };
-        let effective_session_id = if let Some(workspace_id) = workspace_id {
-            requested_session_id
-                .filter(|session_id| session_belongs_to_workspace(session_id, workspace_id))
-                .cloned()
-                .or_else(|| {
-                    projection
-                        .current_session_id
-                        .as_ref()
-                        .filter(|session_id| session_belongs_to_workspace(session_id, workspace_id))
-                        .cloned()
-                })
-                .or_else(|| {
-                    projection
-                        .sessions
-                        .iter()
-                        .find(|session| session.workspace_id.as_deref() == Some(workspace_id))
-                        .map(|session| session.session_id.clone())
-                })
+            .cloned();
+        projection.current_session_id = selected_session_id.clone();
+        if let Some(session_id) = selected_session_id.as_ref() {
+            projection
+                .timeline
+                .retain(|entry| entry.session_id == *session_id);
+            projection
+                .notifications
+                .retain(|notification| notification.session_id == *session_id);
         } else {
-            requested_session_id.cloned()
-        };
-        let mut dto =
-            BootstrapDto::from_state_with_selected_session(self, effective_session_id.as_ref());
-        // 按 workspace_id 过滤会话列表
-        if let Some(ws_id) = workspace_id {
-            dto.sessions = dto
-                .sessions
-                .into_iter()
-                .filter(|s| s.workspace_id.as_deref() == Some(ws_id))
-                .collect();
+            projection.timeline.clear();
+            projection.notifications.clear();
         }
-        dto
+        BootstrapDto::from_state_with_session_projection(self, projection)
     }
 
     pub fn runtime_read_model_dto(&self) -> RuntimeReadModelDto {
@@ -697,31 +683,9 @@ impl ApiState {
 
     pub fn settings_snapshot_json_for_session(
         &self,
-        session_id: Option<&SessionId>,
+        _session_id: Option<&SessionId>,
     ) -> serde_json::Value {
         let mut snapshot = self.settings_store.public_snapshot();
-        snapshot.remove("userRules");
-        snapshot.remove("safeguard");
-        snapshot.remove("safeguardConfig");
-        if let Some(session_id) = session_id {
-            snapshot.insert(
-                "userRulesConfig".to_string(),
-                settings_section_or_empty(
-                    self.settings_store
-                        .get_session_section(session_id, "userRules"),
-                ),
-            );
-            snapshot.insert(
-                "safeguardConfig".to_string(),
-                settings_section_or_empty(
-                    self.settings_store
-                        .get_session_section(session_id, "safeguardConfig"),
-                ),
-            );
-        } else {
-            snapshot.insert("userRulesConfig".to_string(), serde_json::json!({}));
-            snapshot.insert("safeguardConfig".to_string(), serde_json::json!({}));
-        }
         normalize_settings_snapshot_sections(&mut snapshot);
         self.enrich_mcp_servers_with_connection_status(&mut snapshot);
         serde_json::json!({
@@ -927,10 +891,6 @@ impl ApiState {
         self.session_turn_dispatcher.as_ref()
     }
 
-    pub fn usage_authority(&self) -> Arc<Mutex<UsageAuthority>> {
-        self.usage_authority.clone()
-    }
-
     pub fn with_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
         self.model_bridge_client = Some(client);
         self
@@ -984,21 +944,11 @@ fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_jso
     }
     merge_legacy_custom_tools_into_skills_config(snapshot);
     merge_legacy_instruction_skills_into_skills_config(snapshot);
+    seed_user_rules_config(snapshot);
     normalize_workers_section(snapshot);
     normalize_mcp_servers_section(snapshot);
     seed_default_safeguard_rules(snapshot);
     alias_snapshot_keys(snapshot);
-}
-
-pub(crate) fn normalize_safeguard_config_value(
-    safeguard_config: serde_json::Value,
-) -> serde_json::Value {
-    let mut snapshot = HashMap::new();
-    snapshot.insert("safeguardConfig".to_string(), safeguard_config);
-    normalize_settings_snapshot_sections(&mut snapshot);
-    snapshot
-        .remove("safeguardConfig")
-        .unwrap_or_else(|| serde_json::json!({}))
 }
 
 fn alias_snapshot_keys(snapshot: &mut HashMap<String, serde_json::Value>) {
@@ -1013,14 +963,6 @@ fn alias_snapshot_keys(snapshot: &mut HashMap<String, serde_json::Value>) {
                 snapshot.insert(to.to_string(), value);
             }
         }
-    }
-}
-
-fn settings_section_or_empty(value: serde_json::Value) -> serde_json::Value {
-    if value.is_null() {
-        serde_json::json!({})
-    } else {
-        value
     }
 }
 
@@ -1070,6 +1012,26 @@ fn normalize_wrapped_section_value(value: &mut serde_json::Value) {
     let nested = object.get("config").or_else(|| object.get("data")).cloned();
     if let Some(nested) = nested {
         *value = nested;
+    }
+}
+
+fn seed_user_rules_config(snapshot: &mut HashMap<String, serde_json::Value>) {
+    let raw = snapshot
+        .remove("userRulesConfig")
+        .or_else(|| snapshot.remove("userRules"))
+        .unwrap_or_else(|| serde_json::json!({}));
+    snapshot.insert(
+        "userRulesConfig".to_string(),
+        normalize_user_rules_config_value(raw),
+    );
+}
+
+fn normalize_user_rules_config_value(mut value: serde_json::Value) -> serde_json::Value {
+    normalize_wrapped_section_value(&mut value);
+    match value {
+        serde_json::Value::String(user_rules) => serde_json::json!({ "userRules": user_rules }),
+        serde_json::Value::Object(_) => value,
+        _ => serde_json::json!({}),
     }
 }
 
