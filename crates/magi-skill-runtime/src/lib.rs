@@ -449,7 +449,7 @@ mod tests {
             "file_read"
         }
 
-        fn execute(&self, input: &str) -> String {
+        fn execute(&self, input: &str, _context: &ToolExecutionContext) -> String {
             format!("echo:{input}")
         }
 

@@ -99,7 +99,6 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::TaskUpdate => execute_orchestration_stub(self.name, input),
             BuiltinToolName::TaskClaimNext => execute_orchestration_stub(self.name, input),
             BuiltinToolName::ContextCompact => execute_orchestration_stub(self.name, input),
-            BuiltinToolName::SkillApply => execute_skill_apply_stub(input),
         }
     }
 
@@ -1931,20 +1930,20 @@ fn execute_search_semantic(input: &str) -> String {
 
     // 将查询拆分为关键词（小写化），过滤停用词
     let stop_words: std::collections::HashSet<&str> = [
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "can", "shall", "must", "need", "dare",
-        "to", "of", "in", "for", "on", "with", "at", "by", "from", "as",
-        "into", "through", "during", "before", "after", "above", "below",
-        "between", "out", "off", "over", "under", "again", "further", "then",
-        "once", "here", "there", "when", "where", "why", "how", "all", "each",
-        "every", "both", "few", "more", "most", "other", "some", "such", "no",
-        "not", "only", "own", "same", "so", "than", "too", "very", "just",
-        "and", "but", "or", "nor", "if", "that", "this", "what", "which",
-        "who", "whom", "whose", "it", "its", "i", "me", "my", "we", "our",
-        "you", "your", "he", "she", "they", "them", "his", "her", "their",
-        "find", "search", "look", "show", "get", "code", "function", "file",
-    ].iter().cloned().collect();
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "shall",
+        "must", "need", "dare", "to", "of", "in", "for", "on", "with", "at", "by", "from", "as",
+        "into", "through", "during", "before", "after", "above", "below", "between", "out", "off",
+        "over", "under", "again", "further", "then", "once", "here", "there", "when", "where",
+        "why", "how", "all", "each", "every", "both", "few", "more", "most", "other", "some",
+        "such", "no", "not", "only", "own", "same", "so", "than", "too", "very", "just", "and",
+        "but", "or", "nor", "if", "that", "this", "what", "which", "who", "whom", "whose", "it",
+        "its", "i", "me", "my", "we", "our", "you", "your", "he", "she", "they", "them", "his",
+        "her", "their", "find", "search", "look", "show", "get", "code", "function", "file",
+    ]
+    .iter()
+    .cloned()
+    .collect();
 
     let keywords: Vec<String> = query
         .to_lowercase()
@@ -1959,15 +1958,24 @@ fn execute_search_semantic(input: &str) -> String {
 
     // 代码文件扩展名
     let code_extensions: std::collections::HashSet<&str> = [
-        "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "cpp", "h",
-        "hpp", "cs", "rb", "swift", "kt", "scala", "lua", "sh", "bash", "zsh",
-        "sql", "toml", "yaml", "yml", "json", "xml", "html", "css", "scss",
-        "svelte", "vue", "md", "txt",
-    ].iter().cloned().collect();
+        "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "cpp", "h", "hpp", "cs", "rb",
+        "swift", "kt", "scala", "lua", "sh", "bash", "zsh", "sql", "toml", "yaml", "yml", "json",
+        "xml", "html", "css", "scss", "svelte", "vue", "md", "txt",
+    ]
+    .iter()
+    .cloned()
+    .collect();
 
     let mut scored_results: Vec<(f64, String, String, Vec<String>)> = Vec::new();
     let mut scanned = 0usize;
-    semantic_walk_dir(&root_path, &code_extensions, &keywords, &mut scored_results, &mut scanned, 5000);
+    semantic_walk_dir(
+        &root_path,
+        &code_extensions,
+        &keywords,
+        &mut scored_results,
+        &mut scanned,
+        5000,
+    );
 
     // 按分数降序排序
     scored_results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -2022,9 +2030,14 @@ fn semantic_walk_dir(
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         // 跳过隐藏目录和常见忽略目录
-        if name.starts_with('.') || name == "node_modules" || name == "target"
-            || name == "dist" || name == "build" || name == "__pycache__"
-            || name == "vendor" || name == ".git"
+        if name.starts_with('.')
+            || name == "node_modules"
+            || name == "target"
+            || name == "dist"
+            || name == "build"
+            || name == "__pycache__"
+            || name == "vendor"
+            || name == ".git"
         {
             continue;
         }
@@ -2036,23 +2049,29 @@ fn semantic_walk_dir(
                 if let Ok(content) = fs::read_to_string(&path) {
                     let (score, matched, snippet) = score_file_content(&content, &name, keywords);
                     if score > 0.0 {
-                        results.push((
-                            score,
-                            path.display().to_string(),
-                            snippet,
-                            matched,
-                        ));
+                        results.push((score, path.display().to_string(), snippet, matched));
                     }
                 }
             }
         }
     }
     for subdir in dirs {
-        semantic_walk_dir(&subdir, code_extensions, keywords, results, scanned, max_files);
+        semantic_walk_dir(
+            &subdir,
+            code_extensions,
+            keywords,
+            results,
+            scanned,
+            max_files,
+        );
     }
 }
 
-fn score_file_content(content: &str, filename: &str, keywords: &[String]) -> (f64, Vec<String>, String) {
+fn score_file_content(
+    content: &str,
+    filename: &str,
+    keywords: &[String],
+) -> (f64, Vec<String>, String) {
     let content_lower = content.to_lowercase();
     let filename_lower = filename.to_lowercase();
     let mut score = 0.0f64;
@@ -2086,7 +2105,8 @@ fn score_file_content(content: &str, filename: &str, keywords: &[String]) -> (f6
     let lines: Vec<&str> = content.lines().collect();
     for (i, line) in lines.iter().enumerate() {
         let line_lower = line.to_lowercase();
-        let line_score: f64 = keywords.iter()
+        let line_score: f64 = keywords
+            .iter()
             .filter(|kw| line_lower.contains(kw.as_str()))
             .count() as f64;
         if line_score > best_line_score {
@@ -2102,7 +2122,9 @@ fn score_file_content(content: &str, filename: &str, keywords: &[String]) -> (f6
     // 截断过长 snippet
     let snippet = if snippet.len() > 500 {
         let mut end = 500;
-        while !snippet.is_char_boundary(end) { end -= 1; }
+        while !snippet.is_char_boundary(end) {
+            end -= 1;
+        }
         format!("{}…", &snippet[..end])
     } else {
         snippet
@@ -2136,10 +2158,19 @@ fn execute_knowledge_query(input: &str) -> String {
     let mut doc_files: Vec<PathBuf> = Vec::new();
     let doc_patterns: &[&str] = match category.as_str() {
         "readme" => &["README.md", "README", "README.txt", "README.rst"],
-        "docs" => &[],  // 只扫描 docs/ 目录
-        "code" => &[],   // 只扫描代码注释
-        _ => &["README.md", "README", "README.txt", "CLAUDE.md", "CONTRIBUTING.md",
-               "CHANGELOG.md", "LICENSE", "Cargo.toml", "package.json"],
+        "docs" => &[], // 只扫描 docs/ 目录
+        "code" => &[], // 只扫描代码注释
+        _ => &[
+            "README.md",
+            "README",
+            "README.txt",
+            "CLAUDE.md",
+            "CONTRIBUTING.md",
+            "CHANGELOG.md",
+            "LICENSE",
+            "Cargo.toml",
+            "package.json",
+        ],
     };
 
     // 添加根目录下的文档文件
@@ -2195,7 +2226,8 @@ fn execute_knowledge_query(input: &str) -> String {
         if let Ok(content) = fs::read_to_string(doc_path) {
             let sections = extract_matching_sections(&content, &keywords);
             if !sections.is_empty() {
-                let rel_path = doc_path.strip_prefix(&root)
+                let rel_path = doc_path
+                    .strip_prefix(&root)
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| doc_path.display().to_string());
                 for section in sections {
@@ -2316,7 +2348,9 @@ fn section_relevance(heading: &str, body: &str, keywords: &[String]) -> f64 {
             }
         }
     }
-    if matched == 0 { return 0.0; }
+    if matched == 0 {
+        return 0.0;
+    }
     score * (matched as f64 / keywords.len() as f64)
 }
 
@@ -2325,7 +2359,9 @@ fn truncate_section(text: &str, max_chars: usize) -> String {
         return text.trim().to_string();
     }
     let mut end = max_chars;
-    while !text.is_char_boundary(end) { end -= 1; }
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
     format!("{}…", &text[..end].trim())
 }
 
@@ -2339,104 +2375,6 @@ fn execute_orchestration_stub(name: BuiltinToolName, _input: &str) -> String {
         "status": "failed",
         "error": format!("编排工具 {} 需要 Orchestrator 运行时上下文，当前未在编排循环中执行。", name.as_str()),
         "hint": "此工具仅在 Orchestrator/Worker LLM 交互循环中由运行时注入后可用"
-    })
-    .to_string()
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// skill.apply — Skill 加载与应用
-// ══════════════════════════════════════════════════════════════════════════════
-
-fn execute_skill_apply_stub(input: &str) -> String {
-    let request = parse_json_object(input);
-    let skill_name = request
-        .as_ref()
-        .and_then(|obj| field_string(obj, &["skill_name", "name"]));
-    let context = request
-        .as_ref()
-        .and_then(|obj| field_string(obj, &["context"]));
-
-    let skill_id = match skill_name {
-        Some(name) => name,
-        None => return builtin_error("skill_apply", "缺少 skill_name 字段"),
-    };
-
-    // 在 .claude/skills/ 目录下查找 skill 定义文件
-    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let skills_dir = root.join(".claude").join("skills");
-
-    // 尝试多种文件名格式
-    let candidates = [
-        skills_dir.join(format!("{}.md", skill_id)),
-        skills_dir.join(format!("{}.yaml", skill_id)),
-        skills_dir.join(format!("{}.yml", skill_id)),
-        skills_dir.join(format!("{}.json", skill_id)),
-        skills_dir.join(&skill_id).join("SKILL.md"),
-        skills_dir.join(&skill_id).join("skill.md"),
-    ];
-
-    for candidate in &candidates {
-        if candidate.exists() {
-            if let Ok(content) = fs::read_to_string(candidate) {
-                let instruction = if candidate.extension().and_then(|e| e.to_str()) == Some("md") {
-                    // Markdown 文件：提取正文作为 instruction
-                    content.clone()
-                } else {
-                    // YAML/JSON：尝试提取 instruction 字段
-                    parse_json_object(&content)
-                        .and_then(|obj| field_string(&obj, &["instruction", "body", "content"]))
-                        .unwrap_or(content.clone())
-                };
-
-                return serde_json::json!({
-                    "tool": "skill_apply",
-                    "status": "succeeded",
-                    "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
-                    "skill_name": skill_id,
-                    "source": candidate.display().to_string(),
-                    "instruction": instruction,
-                    "context": context,
-                    "summary": format!("已加载 skill: {}", skill_id)
-                })
-                .to_string();
-            }
-        }
-    }
-
-    // 列出可用的 skills
-    let mut available_skills: Vec<String> = Vec::new();
-    if skills_dir.exists() {
-        if let Ok(entries) = fs::read_dir(&skills_dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if entry.path().is_dir() {
-                    // 目录形式的 skill
-                    if entry.path().join("SKILL.md").exists() || entry.path().join("skill.md").exists() {
-                        available_skills.push(name);
-                    }
-                } else {
-                    let path = entry.path();
-                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    if matches!(ext, "md" | "yaml" | "yml" | "json") {
-                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                            available_skills.push(stem.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    available_skills.sort();
-    available_skills.dedup();
-
-    serde_json::json!({
-        "tool": "skill_apply",
-        "status": "failed",
-        "error": format!("未找到名为 \"{}\" 的 skill", skill_id),
-        "skill_name": skill_id,
-        "available_skills": available_skills,
-        "search_paths": candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-        "hint": "请检查 skill 名称是否正确，或在 .claude/skills/ 目录下创建对应的 skill 定义文件"
     })
     .to_string()
 }

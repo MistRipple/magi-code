@@ -240,6 +240,7 @@ impl ToolRegistry {
 
         Some(WriteProtectionScope {
             workspace_id: context.workspace_id.clone(),
+            session_id: context.session_id.clone(),
             task_id: context.task_id.clone(),
             working_directory,
             paths,
@@ -254,9 +255,10 @@ impl ToolRegistry {
         conflict: WriteProtectionClaim,
     ) -> ToolExecutionOutput {
         let reason = format!(
-            "检测到并发写冲突: tool={} workspace={:?} task={:?} cwd={:?} paths={}",
+            "检测到并发写冲突: tool={} workspace={:?} session={:?} task={:?} cwd={:?} paths={}",
             input.tool_name,
             scope.workspace_id.as_ref().map(ToString::to_string),
+            scope.session_id.as_ref().map(ToString::to_string),
             scope.task_id.as_ref().map(ToString::to_string),
             scope
                 .working_directory
@@ -279,6 +281,7 @@ impl ToolRegistry {
                 "access_mode": access_mode.as_str(),
                 "write_scope": {
                     "workspace_id": scope.workspace_id.as_ref().map(ToString::to_string),
+                    "session_id": scope.session_id.as_ref().map(ToString::to_string),
                     "task_id": scope.task_id.as_ref().map(ToString::to_string),
                     "working_directory": scope.working_directory.as_ref().map(|path| path.display().to_string()),
                     "paths": scope.paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
@@ -287,6 +290,7 @@ impl ToolRegistry {
                     "tool_call_id": conflict.tool_call_id.to_string(),
                     "access_mode": conflict.access_mode.as_str(),
                     "workspace_id": conflict.scope.workspace_id.as_ref().map(ToString::to_string),
+                    "session_id": conflict.scope.session_id.as_ref().map(ToString::to_string),
                     "task_id": conflict.scope.task_id.as_ref().map(ToString::to_string),
                     "working_directory": conflict.scope.working_directory.as_ref().map(|path| path.display().to_string()),
                     "paths": conflict.scope.paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
@@ -320,9 +324,15 @@ impl WriteProtectionClaim {
     fn conflicts_with(&self, other: &WriteProtectionScope) -> bool {
         if self.scope.workspace_id.is_some()
             && other.workspace_id.is_some()
-            && self.scope.workspace_id == other.workspace_id
+            && self.scope.workspace_id != other.workspace_id
         {
-            return true;
+            return false;
+        }
+        if self.scope.session_id.is_some()
+            && other.session_id.is_some()
+            && self.scope.session_id != other.session_id
+        {
+            return false;
         }
         if self.scope.task_id.is_some()
             && other.task_id.is_some()
