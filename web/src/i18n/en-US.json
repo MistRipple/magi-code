@@ -1027,7 +1027,6 @@
   "dispatch.errors.writeTaskRequiresGitWorkspace": "Write tasks require a Git workspace (isolated worktree). Current workspace is not a Git repository: {workspaceRoot}",
   "dispatch.errors.splitDepthExceeded": "Maximum split depth reached (3 levels), cannot split further",
   "dispatch.errors.taskNameOrGoalRequired": "task_name or goal must provide at least one non-empty string",
-  "dispatch.errors.updateTaskMissingTaskId": "task_update contains entries missing task_id",
   "dispatch.insight.notification": "[{workerId}] {label}: {content}",
   "dispatch.insight.type.constraint": "Constraint",
   "dispatch.insight.type.contract": "Contract",

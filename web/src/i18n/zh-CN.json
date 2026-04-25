@@ -1022,7 +1022,6 @@
   "dispatch.errors.writeTaskRequiresGitWorkspace": "写任务必须在 Git 工作区中执行（隔离 worktree），当前工作区不是 Git 仓库：{workspaceRoot}",
   "dispatch.errors.splitDepthExceeded": "已达最大拆分深度（3 级），不可再次拆分",
   "dispatch.errors.taskNameOrGoalRequired": "task_name 或 goal 至少需要一个非空字符串",
-  "dispatch.errors.updateTaskMissingTaskId": "task_update 存在缺少 task_id 的条目",
   "dispatch.insight.notification": "[{workerId}] {label}: {content}",
   "dispatch.insight.type.constraint": "约束",
   "dispatch.insight.type.contract": "契约",
