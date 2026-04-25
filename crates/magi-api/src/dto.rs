@@ -1,4 +1,7 @@
 mod bootstrap;
+mod bridge_contracts;
+mod bridge_reason_codes;
+mod bridge_snapshot_providers;
 mod bridges;
 mod read_model;
 mod service;
