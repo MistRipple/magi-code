@@ -35,7 +35,7 @@ pub use clients::{
 };
 pub use dispatch::BridgeDispatchRuntime;
 pub use host_loopback::{run_host_bridge_loopback_server, run_vscode_host_shell_server};
-pub use http_model_client::HttpModelBridgeClient;
+pub use http_model_client::{HttpModelBridgeClient, HttpModelBridgeProtocol};
 pub use local_process_protocol::{
     BridgeServerCommandCapabilityProfile, BridgeServerContextResolutionBoundary,
     BridgeServerHandshake, BridgeServerHealth, BridgeServerKind, BridgeServerServiceCatalog,

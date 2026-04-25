@@ -1,5 +1,5 @@
 use crate::errors::ApiError;
-use magi_bridge_client::HttpModelBridgeClient;
+use magi_bridge_client::{HttpModelBridgeClient, HttpModelBridgeProtocol};
 use magi_usage_authority::{LlmConfig, OpenAiProtocol, ReasoningEffort, UrlMode};
 use serde_json::{Value, json};
 
@@ -47,6 +47,13 @@ impl ModelOpenAiProtocol {
         match self {
             Self::Responses => OpenAiProtocol::Responses,
             Self::Chat => OpenAiProtocol::Chat,
+        }
+    }
+
+    fn to_http_protocol(self) -> HttpModelBridgeProtocol {
+        match self {
+            Self::Responses => HttpModelBridgeProtocol::Responses,
+            Self::Chat => HttpModelBridgeProtocol::ChatCompletions,
         }
     }
 }
@@ -151,15 +158,16 @@ impl NormalizedModelConfig {
         &self,
         default_model: &str,
     ) -> Option<HttpModelBridgeClient> {
-        let base_url = self.base_url.as_ref()?;
+        let base_url = self.http_client_base_url()?;
         let model = self
             .model
             .clone()
             .unwrap_or_else(|| default_model.to_string());
-        Some(HttpModelBridgeClient::new(
-            base_url.clone(),
+        Some(HttpModelBridgeClient::new_with_protocol(
+            base_url,
             self.api_key.clone(),
             model,
+            self.execution_openai_protocol().to_http_protocol(),
         ))
     }
 
@@ -276,6 +284,24 @@ impl NormalizedModelConfig {
     fn effective_openai_protocol(&self) -> ModelOpenAiProtocol {
         self.openai_protocol
             .unwrap_or(ModelOpenAiProtocol::Responses)
+    }
+
+    fn execution_openai_protocol(&self) -> ModelOpenAiProtocol {
+        if self.provider_key() == "openai" {
+            self.effective_openai_protocol()
+        } else {
+            self.openai_protocol.unwrap_or(ModelOpenAiProtocol::Chat)
+        }
+    }
+
+    fn http_client_base_url(&self) -> Option<String> {
+        let base_url = self.base_url.as_deref()?.trim().trim_end_matches('/');
+        if matches!(self.url_mode, ModelUrlMode::Full)
+            && let Some(endpoint) = self.protocol_endpoint.as_deref()
+        {
+            return Some(format!("{base_url}{endpoint}"));
+        }
+        Some(base_url.to_string())
     }
 }
 

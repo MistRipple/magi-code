@@ -13,6 +13,13 @@ const OPENAI_BASE_URL_ENV: &str = "MAGI_OPENAI_COMPAT_BASE_URL";
 const OPENAI_API_KEY_ENV: &str = "MAGI_OPENAI_COMPAT_API_KEY";
 const OPENAI_MODEL_ENV: &str = "MAGI_OPENAI_COMPAT_MODEL";
 const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
+const OPENAI_RESPONSES_PATH: &str = "/v1/responses";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpModelBridgeProtocol {
+    ChatCompletions,
+    Responses,
+}
 
 /// A `ModelBridgeClient` implementation that makes direct HTTP calls to an
 /// OpenAI-compatible API endpoint, bypassing the JSON-RPC subprocess loopback.
@@ -23,6 +30,7 @@ pub struct HttpModelBridgeClient {
     base_url: String,
     api_key: Option<String>,
     model: String,
+    protocol: HttpModelBridgeProtocol,
 }
 
 impl HttpModelBridgeClient {
@@ -38,13 +46,39 @@ impl HttpModelBridgeClient {
 
     /// Create with explicit configuration.
     pub fn new(base_url: String, api_key: Option<String>, model: String) -> Self {
+        Self::new_with_protocol(
+            base_url,
+            api_key,
+            model,
+            HttpModelBridgeProtocol::ChatCompletions,
+        )
+    }
+
+    pub fn new_with_protocol(
+        base_url: String,
+        api_key: Option<String>,
+        model: String,
+        protocol: HttpModelBridgeProtocol,
+    ) -> Self {
         Self {
             base_url,
             api_key,
             model,
+            protocol,
         }
     }
 
+    fn request_url(&self) -> Result<String, BridgeClientError> {
+        build_openai_protocol_url(&self.base_url, self.protocol).map_err(|reason| {
+            BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::Protocol,
+                code: None,
+                message: format!("invalid base_url: {reason}"),
+            }
+        })
+    }
+
+    #[cfg(test)]
     fn chat_completions_url(&self) -> Result<String, BridgeClientError> {
         build_openai_chat_completions_url(&self.base_url).map_err(|reason| {
             BridgeClientError::CallFailed {
@@ -55,8 +89,22 @@ impl HttpModelBridgeClient {
         })
     }
 
-    /// Build the JSON body for a chat completions request.
+    fn provider_family(&self) -> ProviderFamily {
+        match self.protocol {
+            HttpModelBridgeProtocol::ChatCompletions => ProviderFamily::OpenAiChat,
+            HttpModelBridgeProtocol::Responses => ProviderFamily::OpenAiResponses,
+        }
+    }
+
     pub(crate) fn build_request_body(&self, request: &ModelInvocationRequest) -> serde_json::Value {
+        match self.protocol {
+            HttpModelBridgeProtocol::ChatCompletions => self.build_chat_request_body(request),
+            HttpModelBridgeProtocol::Responses => self.build_responses_request_body(request),
+        }
+    }
+
+    /// Build the JSON body for a chat completions request.
+    fn build_chat_request_body(&self, request: &ModelInvocationRequest) -> serde_json::Value {
         let messages = if let Some(ref msgs) = request.messages {
             serde_json::to_value(msgs).unwrap_or_else(|_| json!([]))
         } else {
@@ -74,6 +122,27 @@ impl HttpModelBridgeClient {
                     .tool_choice
                     .as_ref()
                     .and_then(|tool_choice| serde_json::to_value(tool_choice).ok())
+                    .unwrap_or_else(|| json!("auto"));
+            }
+        }
+        body
+    }
+
+    /// Build the JSON body for an OpenAI Responses API request.
+    fn build_responses_request_body(&self, request: &ModelInvocationRequest) -> serde_json::Value {
+        let input = responses_input_items(request);
+        let mut body = json!({
+            "model": self.model,
+            "input": input,
+            "stream": false,
+        });
+        if let Some(ref tools) = request.tools {
+            if !tools.is_empty() {
+                body["tools"] = json!(responses_tool_definitions(tools));
+                body["tool_choice"] = request
+                    .tool_choice
+                    .as_ref()
+                    .map(responses_tool_choice)
                     .unwrap_or_else(|| json!("auto"));
             }
         }
@@ -167,12 +236,13 @@ fn execute_streaming_http_post(
     url: String,
     body: serde_json::Value,
     api_key: Option<String>,
+    provider_family: ProviderFamily,
     on_chunk: &dyn Fn(&str),
 ) -> Result<(u16, String), BridgeClientError> {
     let (tx, rx) = std::sync::mpsc::channel::<StreamMessage>();
 
     std::thread::spawn(move || {
-        let result = streaming_http_io(url, body, api_key, &tx);
+        let result = streaming_http_io(url, body, api_key, provider_family, &tx);
         // 无论成功失败，都通过 Done 发送最终结果
         let _ = tx.send(StreamMessage::Done(result));
     });
@@ -202,6 +272,7 @@ fn streaming_http_io(
     url: String,
     body: serde_json::Value,
     api_key: Option<String>,
+    provider_family: ProviderFamily,
     tx: &std::sync::mpsc::Sender<StreamMessage>,
 ) -> Result<(u16, String), BridgeClientError> {
     let client = reqwest::blocking::Client::builder()
@@ -289,7 +360,7 @@ fn streaming_http_io(
                 continue;
             }
 
-            let llm_chunks = parse_stream_event(ProviderFamily::OpenAiChat, sse_event);
+            let llm_chunks = parse_stream_event(provider_family, sse_event);
             accumulator.apply_all(&llm_chunks);
         }
 
@@ -312,6 +383,92 @@ fn streaming_http_io(
     Ok((status, payload))
 }
 
+fn responses_input_items(request: &ModelInvocationRequest) -> Vec<serde_json::Value> {
+    if let Some(messages) = request.messages.as_ref() {
+        return messages
+            .iter()
+            .flat_map(responses_input_items_from_chat_message)
+            .collect();
+    }
+
+    vec![json!({
+        "role": "user",
+        "content": request.prompt,
+    })]
+}
+
+fn responses_input_items_from_chat_message(
+    message: &crate::types::ChatMessage,
+) -> Vec<serde_json::Value> {
+    if let Some(tool_call_id) = message.tool_call_id.as_ref() {
+        return vec![json!({
+            "type": "function_call_output",
+            "call_id": tool_call_id,
+            "output": message.content.as_deref().unwrap_or_default(),
+        })];
+    }
+
+    let mut items = Vec::new();
+    if let Some(content) = message
+        .content
+        .as_ref()
+        .filter(|content| !content.is_empty())
+    {
+        items.push(json!({
+            "role": responses_message_role(&message.role),
+            "content": content,
+        }));
+    }
+
+    for tool_call in &message.tool_calls {
+        items.push(json!({
+            "type": "function_call",
+            "call_id": tool_call.id,
+            "name": tool_call.function.name,
+            "arguments": tool_call.function.arguments,
+        }));
+    }
+
+    if items.is_empty() {
+        items.push(json!({
+            "role": responses_message_role(&message.role),
+            "content": "",
+        }));
+    }
+    items
+}
+
+fn responses_message_role(role: &str) -> &str {
+    if role == "system" { "developer" } else { role }
+}
+
+fn responses_tool_definitions(
+    tools: &[crate::types::ChatToolDefinition],
+) -> Vec<serde_json::Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "name": tool.function.name,
+                "description": tool.function.description,
+                "parameters": tool.function.parameters,
+            })
+        })
+        .collect()
+}
+
+fn responses_tool_choice(tool_choice: &crate::types::ChatToolChoice) -> serde_json::Value {
+    if tool_choice.kind == "function" {
+        json!({
+            "type": "function",
+            "name": tool_choice.function.name,
+        })
+    } else {
+        json!("auto")
+    }
+}
+
 impl ModelBridgeClient for HttpModelBridgeClient {
     fn invoke(&self, request: ModelInvocationRequest) -> Result<BridgeResponse, BridgeClientError> {
         if request.prompt.trim().is_empty() && request.messages.is_none() {
@@ -322,7 +479,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
             });
         }
 
-        let url = self.chat_completions_url()?;
+        let url = self.request_url()?;
         let body = self.build_request_body(&request);
 
         let (status, response_body) = execute_http_post(url, body, self.api_key.clone())?;
@@ -351,23 +508,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
             });
         }
 
-        let envelope: OpenAiCompatibleChatCompletionEnvelope = serde_json::from_str(&response_body)
-            .map_err(|error| BridgeClientError::CallFailed {
-                layer: BridgeErrorLayer::RemoteBusiness,
-                code: Some(-32007),
-                message: format!(
-                    "provider response invalid: decode chat completion failed: {error}"
-                ),
-            })?;
-
-        let payload =
-            select_openai_bridge_payload(envelope.choices, envelope.usage).map_err(|reason| {
-                BridgeClientError::CallFailed {
-                    layer: BridgeErrorLayer::RemoteBusiness,
-                    code: Some(-32007),
-                    message: format!("provider response invalid: {reason}"),
-                }
-            })?;
+        let payload = self.parse_success_payload(&response_body)?;
 
         Ok(BridgeResponse { ok: true, payload })
     }
@@ -385,11 +526,16 @@ impl ModelBridgeClient for HttpModelBridgeClient {
             });
         }
 
-        let url = self.chat_completions_url()?;
+        let url = self.request_url()?;
         let body = self.build_streaming_request_body(&request);
 
-        let (status, response_body) =
-            execute_streaming_http_post(url, body, self.api_key.clone(), on_delta)?;
+        let (status, response_body) = execute_streaming_http_post(
+            url,
+            body,
+            self.api_key.clone(),
+            self.provider_family(),
+            on_delta,
+        )?;
 
         if !(200..300).contains(&status) {
             if let Ok(error_envelope) =
@@ -420,6 +566,51 @@ impl ModelBridgeClient for HttpModelBridgeClient {
             ok: true,
             payload: response_body,
         })
+    }
+}
+
+impl HttpModelBridgeClient {
+    fn parse_success_payload(&self, response_body: &str) -> Result<String, BridgeClientError> {
+        match self.protocol {
+            HttpModelBridgeProtocol::ChatCompletions => {
+                let envelope: OpenAiCompatibleChatCompletionEnvelope =
+                    serde_json::from_str(response_body).map_err(|error| {
+                        BridgeClientError::CallFailed {
+                            layer: BridgeErrorLayer::RemoteBusiness,
+                            code: Some(-32007),
+                            message: format!(
+                                "provider response invalid: decode chat completion failed: {error}"
+                            ),
+                        }
+                    })?;
+
+                select_openai_bridge_payload(envelope.choices, envelope.usage).map_err(|reason| {
+                    BridgeClientError::CallFailed {
+                        layer: BridgeErrorLayer::RemoteBusiness,
+                        code: Some(-32007),
+                        message: format!("provider response invalid: {reason}"),
+                    }
+                })
+            }
+            HttpModelBridgeProtocol::Responses => {
+                let envelope: serde_json::Value = serde_json::from_str(response_body).map_err(
+                    |error| BridgeClientError::CallFailed {
+                        layer: BridgeErrorLayer::RemoteBusiness,
+                        code: Some(-32007),
+                        message: format!(
+                            "provider response invalid: decode responses payload failed: {error}"
+                        ),
+                    },
+                )?;
+                select_openai_responses_bridge_payload(&envelope).map_err(|reason| {
+                    BridgeClientError::CallFailed {
+                        layer: BridgeErrorLayer::RemoteBusiness,
+                        code: Some(-32007),
+                        message: format!("provider response invalid: {reason}"),
+                    }
+                })
+            }
+        }
     }
 }
 
@@ -628,7 +819,35 @@ fn read_non_empty_env(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn build_openai_protocol_url(
+    base_url: &str,
+    protocol: HttpModelBridgeProtocol,
+) -> Result<String, String> {
+    match protocol {
+        HttpModelBridgeProtocol::ChatCompletions => {
+            build_openai_endpoint_url(base_url, OPENAI_CHAT_COMPLETIONS_PATH, "chat/completions")
+        }
+        HttpModelBridgeProtocol::Responses => {
+            build_openai_endpoint_url(base_url, OPENAI_RESPONSES_PATH, "responses")
+        }
+    }
+}
+
+#[cfg(test)]
 fn build_openai_chat_completions_url(base_url: &str) -> Result<String, String> {
+    build_openai_protocol_url(base_url, HttpModelBridgeProtocol::ChatCompletions)
+}
+
+#[cfg(test)]
+fn build_openai_responses_url(base_url: &str) -> Result<String, String> {
+    build_openai_protocol_url(base_url, HttpModelBridgeProtocol::Responses)
+}
+
+fn build_openai_endpoint_url(
+    base_url: &str,
+    endpoint_path: &str,
+    endpoint_leaf: &str,
+) -> Result<String, String> {
     let normalized = base_url.trim().trim_end_matches('/');
     if normalized.is_empty() {
         return Err("base_url must not be empty".to_string());
@@ -636,17 +855,107 @@ fn build_openai_chat_completions_url(base_url: &str) -> Result<String, String> {
     if !normalized.starts_with("http://") && !normalized.starts_with("https://") {
         return Err("base_url must start with http:// or https://".to_string());
     }
-    if normalized.ends_with(OPENAI_CHAT_COMPLETIONS_PATH) {
+    if normalized.ends_with(endpoint_path) {
         return Ok(normalized.to_string());
     }
-    if normalized.ends_with("/chat/completions") {
+    if normalized.ends_with(&format!("/{endpoint_leaf}")) {
         return Ok(normalized.to_string());
     }
     if normalized.ends_with("/v1") {
-        return Ok(format!("{normalized}/chat/completions"));
+        return Ok(format!("{normalized}/{endpoint_leaf}"));
     }
 
-    Ok(format!("{normalized}{OPENAI_CHAT_COMPLETIONS_PATH}"))
+    Ok(format!("{normalized}{endpoint_path}"))
+}
+
+fn select_openai_responses_bridge_payload(envelope: &serde_json::Value) -> Result<String, String> {
+    let output = envelope
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "missing output array".to_string())?;
+
+    let mut text_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+    for item in output {
+        match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("message") => collect_responses_message_text(item, &mut text_parts),
+            Some("function_call") => {
+                if let Some(tool_call) = responses_function_call_item(item) {
+                    tool_calls.push(tool_call);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    OpenAiCompatibleSuccessPayload {
+        content: if text_parts.is_empty() {
+            None
+        } else {
+            Some(text_parts.join(""))
+        },
+        finish_reason: envelope
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        usage: envelope
+            .get("usage")
+            .map(responses_usage_to_openai_compatible),
+        tool_calls,
+    }
+    .into_bridge_payload()
+}
+
+fn collect_responses_message_text(item: &serde_json::Value, text_parts: &mut Vec<String>) {
+    let Some(content) = item.get("content").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for block in content {
+        let block_type = block.get("type").and_then(serde_json::Value::as_str);
+        if matches!(block_type, Some("output_text" | "text")) {
+            if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
+                text_parts.push(text.to_string());
+            }
+        }
+    }
+}
+
+fn responses_function_call_item(item: &serde_json::Value) -> Option<OpenAiCompatibleToolCall> {
+    Some(OpenAiCompatibleToolCall {
+        id: item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        kind: Some("function".to_string()),
+        function: OpenAiCompatibleToolFunction {
+            name: item
+                .get("name")
+                .and_then(serde_json::Value::as_str)?
+                .to_string(),
+            arguments: match item.get("arguments") {
+                Some(serde_json::Value::String(value)) => value.clone(),
+                Some(value) => value.to_string(),
+                None => "{}".to_string(),
+            },
+        },
+    })
+}
+
+fn responses_usage_to_openai_compatible(usage: &serde_json::Value) -> OpenAiCompatibleUsage {
+    OpenAiCompatibleUsage {
+        prompt_tokens: usage
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64),
+        completion_tokens: usage
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64),
+        total_tokens: usage
+            .get("total_tokens")
+            .and_then(serde_json::Value::as_u64),
+        prompt_tokens_details: usage.get("input_tokens_details").cloned(),
+        completion_tokens_details: usage.get("output_tokens_details").cloned(),
+    }
 }
 
 /// 将 `AdaptedResponse` 直接转换为 `BridgeResponse.payload` 格式，
@@ -818,6 +1127,47 @@ mod tests {
     }
 
     #[test]
+    fn build_responses_request_body_uses_responses_contract() {
+        let client = HttpModelBridgeClient::new_with_protocol(
+            "https://api.example.com/v1".to_string(),
+            Some("test-key".to_string()),
+            "gpt-4.1".to_string(),
+            HttpModelBridgeProtocol::Responses,
+        );
+
+        let body = client.build_request_body(&ModelInvocationRequest {
+            provider: "openai".to_string(),
+            prompt: "classify".to_string(),
+            messages: None,
+            tools: Some(vec![crate::types::ChatToolDefinition {
+                kind: "function".to_string(),
+                function: crate::types::ChatToolFunctionDefinition {
+                    name: "classify_session_turn".to_string(),
+                    description: "分类当前会话 turn".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "route": { "type": "string" }
+                        },
+                        "required": ["route"]
+                    }),
+                },
+            }]),
+            tool_choice: Some(crate::types::ChatToolChoice::force_function(
+                "classify_session_turn",
+            )),
+        });
+
+        assert_eq!(body["model"], "gpt-4.1");
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"], "classify");
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "classify_session_turn");
+        assert_eq!(body["tool_choice"]["type"], "function");
+        assert_eq!(body["tool_choice"]["name"], "classify_session_turn");
+    }
+
+    #[test]
     fn adapted_payload_preserves_cached_prompt_tokens() {
         let payload = adapted_response_to_bridge_payload(&AdaptedResponse {
             content: "hello".to_string(),
@@ -898,6 +1248,22 @@ mod tests {
         assert_eq!(
             client4.chat_completions_url().unwrap(),
             "http://example.com:8320/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn responses_url_builds_correctly() {
+        assert_eq!(
+            build_openai_responses_url("https://api.example.com/v1").unwrap(),
+            "https://api.example.com/v1/responses"
+        );
+        assert_eq!(
+            build_openai_responses_url("https://api.example.com/v1/responses").unwrap(),
+            "https://api.example.com/v1/responses"
+        );
+        assert_eq!(
+            build_openai_responses_url("http://example.com:8320/").unwrap(),
+            "http://example.com:8320/v1/responses"
         );
     }
 
@@ -1105,6 +1471,69 @@ mod tests {
         assert_eq!(payload["usage"]["prompt_tokens"], 5);
         assert_eq!(payload["usage"]["completion_tokens"], 3);
         assert_eq!(payload["usage"]["total_tokens"], 8);
+    }
+
+    #[test]
+    fn invoke_against_mock_server_uses_responses_protocol_when_configured() {
+        let server = spawn_mock_server(
+            200,
+            serde_json::json!({
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 7,
+                    "output_tokens": 4,
+                    "total_tokens": 11,
+                    "input_tokens_details": {
+                        "cached_tokens": 2
+                    }
+                },
+                "output": [{
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "responses reply"
+                    }]
+                }]
+            }),
+        );
+
+        let client = HttpModelBridgeClient::new_with_protocol(
+            server.address.clone(),
+            Some("sk-test".to_string()),
+            "gpt-4.1".to_string(),
+            HttpModelBridgeProtocol::Responses,
+        );
+
+        let response = client
+            .invoke(ModelInvocationRequest {
+                provider: "openai".to_string(),
+                prompt: "hello".to_string(),
+                messages: None,
+                tools: None,
+                tool_choice: None,
+            })
+            .expect("invoke should succeed");
+
+        assert!(response.ok);
+        let payload: serde_json::Value =
+            serde_json::from_str(&response.payload).expect("payload should be json");
+        assert_eq!(payload["content"], "responses reply");
+        assert_eq!(payload["usage"]["prompt_tokens"], 7);
+        assert_eq!(payload["usage"]["completion_tokens"], 4);
+        assert_eq!(
+            payload["usage"]["prompt_tokens_details"]["cached_tokens"],
+            2
+        );
+
+        let recorded = server
+            .request_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mock server should receive request");
+        assert_eq!(recorded.path, "/v1/responses");
+        let body: serde_json::Value =
+            serde_json::from_str(&recorded.body).expect("body should be json");
+        assert_eq!(body["input"][0]["content"], "hello");
+        assert_eq!(body["stream"], false);
     }
 
     #[test]
