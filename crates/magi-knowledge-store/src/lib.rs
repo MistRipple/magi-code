@@ -31,6 +31,8 @@ pub use source_model::{
 };
 pub use state::KnowledgeState;
 
+const PROJECT_CODE_INDEX_ID: &str = "project-code-index";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KnowledgeKind {
     Adr,
@@ -153,7 +155,12 @@ impl KnowledgeStore {
         ingestion: CodeIndexIngestion,
         workspace_id: Option<WorkspaceId>,
     ) {
-        let normalized = normalize_code_index_ingestion(ingestion);
+        let mut normalized = normalize_code_index_ingestion(ingestion);
+        if let Some(workspace_id) = workspace_id.as_ref()
+            && normalized.knowledge_id == PROJECT_CODE_INDEX_ID
+        {
+            normalized.knowledge_id = workspace_project_code_index_id(workspace_id);
+        }
         let record = KnowledgeRecord {
             knowledge_id: normalized.knowledge_id,
             kind: KnowledgeKind::CodeIndex,
@@ -268,10 +275,37 @@ impl KnowledgeStore {
             .expect("knowledge store read lock poisoned");
 
         let record = state.entries.values().find(|r| {
-            r.kind == KnowledgeKind::CodeIndex && r.knowledge_id == "project-code-index"
+            r.kind == KnowledgeKind::CodeIndex
+                && r.workspace_id.is_none()
+                && r.knowledge_id == PROJECT_CODE_INDEX_ID
         })?;
 
         serde_json::from_str(&record.content).ok()
+    }
+
+    pub fn code_index_summary_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Option<crate::code_scanner::CodeIndexSummary> {
+        let state = self
+            .state
+            .read()
+            .expect("knowledge store read lock poisoned");
+
+        state
+            .entries
+            .values()
+            .filter(|record| {
+                record.kind == KnowledgeKind::CodeIndex
+                    && record.workspace_id.as_ref() == Some(workspace_id)
+            })
+            .filter_map(|record| {
+                serde_json::from_str::<crate::code_scanner::CodeIndexSummary>(&record.content)
+                    .ok()
+                    .map(|summary| (record.updated_at, record.knowledge_id.clone(), summary))
+            })
+            .max_by(|left, right| left.0.0.cmp(&right.0.0).then_with(|| left.1.cmp(&right.1)))
+            .map(|(_, _, summary)| summary)
     }
 
     pub fn delete(&self, knowledge_id: &str) -> Result<(), DomainError> {
@@ -333,4 +367,8 @@ impl KnowledgeStore {
             let _ = self.delete(&knowledge_id);
         }
     }
+}
+
+fn workspace_project_code_index_id(workspace_id: &WorkspaceId) -> String {
+    format!("{PROJECT_CODE_INDEX_ID}:{}", workspace_id.as_str())
 }

@@ -129,6 +129,14 @@ impl SettingsStore {
         self.auto_persist();
     }
 
+    pub fn remove_section(&self, section: &str) {
+        {
+            let mut sections = self.sections.write().unwrap();
+            sections.remove(section);
+        }
+        self.auto_persist();
+    }
+
     pub fn get_session_section(&self, session_id: &SessionId, section: &str) -> Value {
         self.get_section(&session_section_key(session_id, section))
     }

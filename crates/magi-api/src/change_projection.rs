@@ -117,6 +117,25 @@ pub(crate) fn resolve_session_change_scope(
     })
 }
 
+pub(crate) fn resolve_workspace_root_or_active(
+    state: &ApiState,
+    workspace_id: Option<&str>,
+) -> Result<PathBuf, ApiError> {
+    let ws_id = match workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(id) => WorkspaceId::new(id),
+        None => state
+            .workspace_registry
+            .active_workspace_id()
+            .ok_or_else(|| {
+                ApiError::InvalidInput("未指定 workspace_id 且没有活动 workspace".to_string())
+            })?,
+    };
+    resolve_workspace_root(state, &ws_id)
+}
+
 pub(crate) fn collect_session_pending_changes(
     state: &ApiState,
     session_id: &SessionId,
@@ -779,7 +798,7 @@ mod tests {
                             "content": "new file\\nsecond line\\n",
                         },
                         "result": serde_json::json!({
-                            "tool": "file.write",
+                            "tool": "file_write",
                             "status": "succeeded",
                             "path": Path::new(&repo_root).join("tmp/new-a.txt").to_string_lossy().to_string(),
                         }).to_string(),
@@ -793,7 +812,7 @@ mod tests {
                             "path": Path::new(&repo_root).join("tracked-a.txt").to_string_lossy().to_string(),
                         },
                         "result": serde_json::json!({
-                            "tool": "file.patch",
+                            "tool": "file_patch",
                             "status": "succeeded",
                             "path": Path::new(&repo_root).join("tracked-a.txt").to_string_lossy().to_string(),
                         }).to_string(),

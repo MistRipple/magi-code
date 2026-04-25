@@ -20,7 +20,10 @@ use magi_core::EventId;
 use magi_core::{LeaseId, TaskStatus};
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
-use magi_knowledge_store::{KnowledgeStore, code_scanner::ingest_workspace_code_index};
+use magi_knowledge_store::{
+    KnowledgeStore,
+    code_scanner::{ingest_workspace_code_index, ingest_workspace_code_index_in_workspace},
+};
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::task_runner::{EventBasedResultReceiver, TaskOutcome, TaskResult};
 use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
@@ -161,35 +164,35 @@ impl ShadowDaemonRuntime {
             &workspace_store,
         )?;
 
-        // 引导阶段：若知识库尚无代码索引，扫描工作区代码
-        if knowledge_store.code_index_summary().is_none() {
-            let scan_root = workspace_store
-                .active_workspace_id()
-                .and_then(|ws_id| {
-                    workspace_store
-                        .workspaces()
-                        .into_iter()
-                        .find(|w| w.workspace_id == ws_id)
-                        .map(|w| std::path::PathBuf::from(w.root_path.as_str()))
-                })
-                .unwrap_or_else(|| config.bootstrap_workspace_root.clone());
-
-            ingest_workspace_code_index(&knowledge_store, &scan_root);
-
-            // 若扫描结果为空（引导工作区可能是空目录），回退到当前工作目录
+        // 引导阶段：代码索引与 workspace 绑定，避免多个工作区共用同一份上下文摘要。
+        let active_workspace = workspace_store.active_workspace_id().and_then(|ws_id| {
+            workspace_store
+                .workspaces()
+                .into_iter()
+                .find(|workspace| workspace.workspace_id == ws_id)
+        });
+        let ingested_code_index = if let Some(workspace) = active_workspace {
             if knowledge_store
-                .code_index_summary()
-                .map(|s| s.files.is_empty())
-                .unwrap_or(true)
+                .code_index_summary_for_workspace(&workspace.workspace_id)
+                .is_none()
             {
-                if let Ok(cwd) = std::env::current_dir() {
-                    if cwd != scan_root {
-                        ingest_workspace_code_index(&knowledge_store, &cwd);
-                    }
-                }
+                let scan_root = PathBuf::from(workspace.root_path.as_str());
+                ingest_workspace_code_index_in_workspace(
+                    &knowledge_store,
+                    &workspace.workspace_id,
+                    &scan_root,
+                );
+                true
+            } else {
+                false
             }
-
-            // 持久化知识库状态
+        } else if knowledge_store.code_index_summary().is_none() {
+            ingest_workspace_code_index(&knowledge_store, &config.bootstrap_workspace_root);
+            true
+        } else {
+            false
+        };
+        if ingested_code_index {
             let _ = state_repository.save_knowledge_state(&knowledge_store.export_state());
         }
 
@@ -360,8 +363,9 @@ impl ShadowDaemonRuntime {
             warn!(error = %error, "设置文件加载失败，使用空默认值");
         }
 
-        let skill_registry = magi_api::skill_loader::load_skills_into_registry(&settings_store);
-        let app_skill_runtime = Arc::new(magi_skill_runtime::SkillRuntime::new(skill_registry));
+        let app_skill_runtime = Arc::new(
+            magi_api::skill_loader::build_skill_runtime_from_settings(&settings_store),
+        );
 
         let mut state = ApiState::new(
             service_name,
@@ -638,7 +642,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use magi_core::TaskStatus;
+    use magi_core::{TaskStatus, WorkspaceId};
     use magi_event_bus::AuditUsageLedgerSnapshot;
     use serde_json::{Value, json};
     use std::{
@@ -719,7 +723,7 @@ mod tests {
         // 验证知识存储中有代码索引摘要
         let summary = runtime
             .knowledge_store
-            .code_index_summary()
+            .code_index_summary_for_workspace(&WorkspaceId::new("shadow-workspace-001"))
             .expect("code index summary should exist after bootstrap scan");
         assert!(
             !summary.files.is_empty(),

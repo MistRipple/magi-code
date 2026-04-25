@@ -7,7 +7,7 @@ use magi_bridge_client::{McpServerConfig, StdioMcpBridgeClient};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::{errors::ApiError, state::ApiState};
+use crate::{errors::ApiError, skill_loader, state::ApiState};
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -90,32 +90,20 @@ fn normalize_mcp_server_entry(request: &serde_json::Value) -> Result<serde_json:
 }
 
 fn load_skills_config_object(state: &ApiState) -> serde_json::Map<String, serde_json::Value> {
-    state
-        .settings_store
-        .get_section("skillsConfig")
-        .as_object()
-        .cloned()
-        .unwrap_or_default()
+    skill_loader::skills_config_object(&state.settings_store)
 }
 
 fn persist_skills_config_object(
     state: &ApiState,
     config: serde_json::Map<String, serde_json::Value>,
 ) {
-    state
-        .settings_store
-        .set_section("skillsConfig", serde_json::Value::Object(config));
+    skill_loader::save_skills_config_object(&state.settings_store, config);
     reload_skill_registry(state);
 }
 
 fn reload_skill_registry(state: &ApiState) {
     if let Some(ref skill_rt) = state.skill_runtime {
-        let registry = skill_rt.registry();
-        registry.clear();
-        let loaded = crate::skill_loader::load_skills_into_registry(&state.settings_store);
-        for skill in loaded.list() {
-            registry.register(skill);
-        }
+        skill_loader::reload_skill_runtime_from_settings(skill_rt, &state.settings_store);
     }
 }
 
@@ -935,8 +923,8 @@ async fn save_skills_config(
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let section = unwrap_request_value(&request, &["config"]).clone();
-    state.settings_store.set_section("skillsConfig", section);
-    reload_skill_registry(&state);
+    let config = section.as_object().cloned().unwrap_or_default();
+    persist_skills_config_object(&state, config);
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 

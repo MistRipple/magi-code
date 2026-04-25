@@ -2,6 +2,7 @@ use crate::{
     CodeIndexIngestion, CodeIndexSource, CodeIndexSymbol, CodeSymbolKind, KnowledgeAuditLink,
     KnowledgeGovernanceLink, KnowledgeGovernanceOutcome, KnowledgeKind, KnowledgeQuery,
     KnowledgeRecord, KnowledgeStore,
+    code_scanner::{CodeIndexFile, CodeIndexSummary},
 };
 use magi_core::{UtcMillis, WorkspaceId};
 
@@ -281,6 +282,34 @@ fn query_filters_records_by_workspace_id() {
 }
 
 #[test]
+fn project_code_index_summary_is_scoped_by_workspace() {
+    let store = KnowledgeStore::new();
+    let workspace_a = WorkspaceId::new("workspace-a");
+    let workspace_b = WorkspaceId::new("workspace-b");
+
+    store.ingest_code_index_in_workspace(
+        workspace_a.clone(),
+        project_code_index_summary("src/a.rs", UtcMillis(10)),
+    );
+    store.ingest_code_index_in_workspace(
+        workspace_b.clone(),
+        project_code_index_summary("src/b.rs", UtcMillis(20)),
+    );
+
+    assert!(store.get("project-code-index").is_none());
+    let summary_a = store
+        .code_index_summary_for_workspace(&workspace_a)
+        .expect("workspace a summary should exist");
+    let summary_b = store
+        .code_index_summary_for_workspace(&workspace_b)
+        .expect("workspace b summary should exist");
+
+    assert_eq!(summary_a.files[0].path, "src/a.rs");
+    assert_eq!(summary_b.files[0].path, "src/b.rs");
+    assert!(store.code_index_summary().is_none());
+}
+
+#[test]
 fn clear_workspace_and_delete_in_workspace_are_scoped() {
     let store = KnowledgeStore::new();
     let workspace_a = WorkspaceId::new("workspace-a");
@@ -315,4 +344,36 @@ fn clear_workspace_and_delete_in_workspace_are_scoped() {
 
     store.clear_workspace(&workspace_b);
     assert!(store.get("kb-b").is_none());
+}
+
+fn project_code_index_summary(path: &str, updated_at: UtcMillis) -> CodeIndexIngestion {
+    let summary = CodeIndexSummary {
+        files: vec![CodeIndexFile {
+            path: path.to_string(),
+            lines: Some(12),
+            size: Some(240),
+        }],
+        tech_stack: vec!["Rust".to_string()],
+        entry_points: vec![path.to_string()],
+        last_indexed: updated_at.0,
+    };
+    CodeIndexIngestion {
+        knowledge_id: "project-code-index".to_string(),
+        title: format!("Project Code Index: {path}"),
+        content: serde_json::to_string(&summary).expect("summary should serialize"),
+        tags: vec!["Rust".to_string()],
+        source_ref: Some(path.to_string()),
+        updated_at,
+        source: CodeIndexSource {
+            path: path.to_string(),
+            language: Some("Rust".to_string()),
+            repo_ref: None,
+            commit_ref: None,
+            start_line: Some(1),
+            end_line: Some(12),
+            symbol: None,
+        },
+        audit: None,
+        governance: None,
+    }
 }

@@ -155,9 +155,6 @@ async fn clear_knowledge(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct KnowledgeListQuery {
-    #[allow(dead_code)]
-    session_id: Option<String>,
-    #[allow(dead_code)]
     workspace_id: Option<String>,
 }
 
@@ -216,7 +213,7 @@ async fn get_project_knowledge(
         kind: Some(KnowledgeKind::Learning),
         text: None,
         tags: vec![],
-        workspace_id: Some(workspace_id),
+        workspace_id: Some(workspace_id.clone()),
         limit: 1000,
     };
     let learnings_result = state.knowledge_store.query(&learnings_query);
@@ -229,7 +226,7 @@ async fn get_project_knowledge(
     // 从知识存储中获取代码索引摘要
     let code_index = state
         .knowledge_store
-        .code_index_summary()
+        .code_index_summary_for_workspace(&workspace_id)
         .map(|summary| {
             serde_json::json!({
                 "files": summary.files.iter().map(|f| serde_json::json!({
@@ -291,9 +288,6 @@ async fn list_learnings(
 #[serde(rename_all = "camelCase")]
 struct KnowledgeSearchQuery {
     q: Option<String>,
-    #[allow(dead_code)]
-    session_id: Option<String>,
-    #[allow(dead_code)]
     workspace_id: Option<String>,
 }
 
@@ -630,5 +624,84 @@ fn map_knowledge_delete_error(error: DomainError, id: &str) -> ApiError {
             ApiError::not_found("知识记录不存在", id)
         }
         other => ApiError::internal_assembly("删除知识记录失败", other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use magi_event_bus::InMemoryEventBus;
+    use magi_governance::GovernanceService;
+    use magi_knowledge_store::KnowledgeStore;
+    use magi_session_store::SessionStore;
+    use magi_workspace::WorkspaceStore;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn state_with_knowledge_store(knowledge_store: KnowledgeStore) -> ApiState {
+        ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_knowledge_store(Arc::new(knowledge_store))
+    }
+
+    fn insert_code_index(store: &KnowledgeStore, workspace_id: &WorkspaceId, path: &str) {
+        let summary = magi_knowledge_store::code_scanner::CodeIndexSummary {
+            files: vec![magi_knowledge_store::code_scanner::CodeIndexFile {
+                path: path.to_string(),
+                lines: Some(10),
+                size: Some(100),
+            }],
+            tech_stack: vec!["Rust".to_string()],
+            entry_points: vec![path.to_string()],
+            last_indexed: UtcMillis::now().0,
+        };
+        store.upsert(KnowledgeRecord {
+            knowledge_id: format!("project-code-index:{}", workspace_id.as_str()),
+            kind: KnowledgeKind::CodeIndex,
+            title: format!("Project Code Index: {path}"),
+            content: serde_json::to_string(&summary).expect("summary should serialize"),
+            tags: vec!["rust".to_string()],
+            workspace_id: Some(workspace_id.clone()),
+            source_ref: Some(path.to_string()),
+            updated_at: UtcMillis::now(),
+        });
+    }
+
+    #[tokio::test]
+    async fn project_knowledge_returns_workspace_scoped_code_index() {
+        let knowledge_store = KnowledgeStore::new();
+        let workspace_a = WorkspaceId::new("workspace-knowledge-a");
+        let workspace_b = WorkspaceId::new("workspace-knowledge-b");
+        insert_code_index(&knowledge_store, &workspace_a, "src/a.rs");
+        insert_code_index(&knowledge_store, &workspace_b, "src/b.rs");
+        let state = state_with_knowledge_store(knowledge_store);
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/knowledge?workspaceId=workspace-knowledge-a")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        assert_eq!(payload["codeIndex"]["files"][0]["path"], "src/a.rs");
     }
 }

@@ -3,7 +3,6 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
-use magi_core::SessionId;
 use magi_core::UtcMillis;
 use magi_usage_authority::{UsageAuthority, UsageCallRecordInput};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -32,16 +31,6 @@ fn strip_scope_binding_fields(mut request: serde_json::Value) -> serde_json::Val
 
 fn scoped_settings_section_request(request: &serde_json::Value) -> serde_json::Value {
     strip_scope_binding_fields(unwrap_settings_section_request(request))
-}
-
-fn parse_optional_session_id_from_query(query: &HashMap<String, String>) -> Option<SessionId> {
-    query
-        .get("sessionId")
-        .or_else(|| query.get("session_id"))
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(SessionId::new)
 }
 
 fn parse_optional_query_string(
@@ -936,10 +925,9 @@ pub(crate) fn enabled_registry_agent_roles(state: &ApiState) -> Vec<String> {
 
 async fn settings_bootstrap(
     State(state): State<ApiState>,
-    Query(query): Query<HashMap<String, String>>,
+    _query: Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    let session_id = parse_optional_session_id_from_query(&query);
-    Json(state.settings_snapshot_json_for_session(session_id.as_ref()))
+    Json(state.settings_snapshot_json())
 }
 
 async fn runtime_status(State(state): State<ApiState>) -> Json<serde_json::Value> {
@@ -1425,7 +1413,7 @@ async fn reset_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_core::{EventId, WorkspaceId};
+    use magi_core::{EventId, SessionId, WorkspaceId};
     use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
     use magi_governance::GovernanceService;
     use magi_session_store::SessionStore;

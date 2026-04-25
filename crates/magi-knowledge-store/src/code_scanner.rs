@@ -1,5 +1,5 @@
 use crate::{CodeIndexIngestion, CodeIndexSource, KnowledgeStore};
-use magi_core::UtcMillis;
+use magi_core::{UtcMillis, WorkspaceId};
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -153,14 +153,34 @@ pub fn scan_workspace(workspace_root: &Path) -> CodeIndexSummary {
 /// 将扫描结果摄取到知识存储中
 pub fn ingest_workspace_code_index(store: &KnowledgeStore, workspace_root: &Path) {
     let summary = scan_workspace(workspace_root);
+    let Some(ingestion) = code_index_ingestion_for_summary(workspace_root, &summary) else {
+        return;
+    };
+    store.ingest_code_index(ingestion);
+}
 
-    // 将摘要作为单个 CodeIndex 记录摄取
+pub fn ingest_workspace_code_index_in_workspace(
+    store: &KnowledgeStore,
+    workspace_id: &WorkspaceId,
+    workspace_root: &Path,
+) {
+    let summary = scan_workspace(workspace_root);
+    let Some(ingestion) = code_index_ingestion_for_summary(workspace_root, &summary) else {
+        return;
+    };
+    store.ingest_code_index_in_workspace(workspace_id.clone(), ingestion);
+}
+
+fn code_index_ingestion_for_summary(
+    workspace_root: &Path,
+    summary: &CodeIndexSummary,
+) -> Option<CodeIndexIngestion> {
     let content = match serde_json::to_string(&summary) {
         Ok(json) => json,
-        Err(_) => return,
+        Err(_) => return None,
     };
 
-    let ingestion = CodeIndexIngestion {
+    Some(CodeIndexIngestion {
         knowledge_id: "project-code-index".to_string(),
         title: format!("Project Code Index: {}", workspace_root.display()),
         content,
@@ -178,9 +198,7 @@ pub fn ingest_workspace_code_index(store: &KnowledgeStore, workspace_root: &Path
         },
         audit: None,
         governance: None,
-    };
-
-    store.ingest_code_index(ingestion);
+    })
 }
 
 fn scan_directory(root: &Path, current: &Path, files: &mut Vec<ScannedFile>) {

@@ -11,6 +11,7 @@ use crate::routes::settings::{
     resolve_registry_agents,
 };
 use crate::settings_store::SettingsStore;
+use crate::skill_loader;
 use crate::task_execution::{ShadowTaskDispatcher, ShadowTaskExecutionRegistry};
 use magi_bridge_client::{
     BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerConfig,
@@ -610,9 +611,7 @@ impl ApiState {
             return BootstrapDto::from_state_with_selected_session(self, requested_session_id);
         };
         let mut projection = self.session_store.projection_input();
-        projection
-            .sessions
-            .retain(|session| session.workspace_id.as_deref() == Some(ws_id));
+        projection.sessions = self.session_records_for_workspace(Some(ws_id));
         let selected_session_id = requested_session_id
             .filter(|session_id| {
                 projection
@@ -634,6 +633,23 @@ impl ApiState {
             projection.notifications.clear();
         }
         BootstrapDto::from_state_with_session_projection(self, projection)
+    }
+
+    pub(crate) fn session_records_for_workspace(
+        &self,
+        workspace_id: Option<&str>,
+    ) -> Vec<magi_session_store::SessionRecord> {
+        let Some(workspace_id) = workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return self.session_store.sessions();
+        };
+        self.session_store
+            .sessions()
+            .into_iter()
+            .filter(|session| session.workspace_id.as_deref() == Some(workspace_id))
+            .collect()
     }
 
     pub fn runtime_read_model_dto(&self) -> RuntimeReadModelDto {
@@ -678,13 +694,6 @@ impl ApiState {
     }
 
     pub fn settings_snapshot_json(&self) -> serde_json::Value {
-        self.settings_snapshot_json_for_session(None)
-    }
-
-    pub fn settings_snapshot_json_for_session(
-        &self,
-        _session_id: Option<&SessionId>,
-    ) -> serde_json::Value {
         let mut snapshot = self.settings_store.public_snapshot();
         normalize_settings_snapshot_sections(&mut snapshot);
         self.enrich_mcp_servers_with_connection_status(&mut snapshot);
@@ -936,14 +945,12 @@ fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_jso
         "userRulesConfig",
         "safeguard",
         "safeguardConfig",
-        "skillsConfig",
     ] {
         if let Some(value) = snapshot.get_mut(key) {
             normalize_wrapped_section_value(value);
         }
     }
-    merge_legacy_custom_tools_into_skills_config(snapshot);
-    merge_legacy_instruction_skills_into_skills_config(snapshot);
+    skill_loader::normalize_skills_config_sections(snapshot);
     seed_user_rules_config(snapshot);
     normalize_workers_section(snapshot);
     normalize_mcp_servers_section(snapshot);
@@ -1160,123 +1167,6 @@ fn normalize_mcp_servers_section(snapshot: &mut HashMap<String, serde_json::Valu
             object.insert("name".to_string(), serde_json::json!(server_id));
         }
         *entry = serde_json::Value::Object(object);
-    }
-}
-
-fn merge_legacy_custom_tools_into_skills_config(snapshot: &mut HashMap<String, serde_json::Value>) {
-    let legacy_custom_tools = snapshot
-        .get("customTools")
-        .and_then(|value| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if legacy_custom_tools.is_empty() {
-        return;
-    }
-    let skills_config = snapshot
-        .entry("skillsConfig".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    let Some(config) = skills_config.as_object_mut() else {
-        return;
-    };
-    let custom_tools = config
-        .entry("customTools".to_string())
-        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-    let Some(custom_tools_array) = custom_tools.as_array_mut() else {
-        return;
-    };
-    for entry in legacy_custom_tools {
-        let Some(mut object) = entry.as_object().cloned() else {
-            continue;
-        };
-        let tool_name = object
-            .get("name")
-            .and_then(|value| value.as_str())
-            .or_else(|| object.get("toolName").and_then(|value| value.as_str()))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_default()
-            .to_string();
-        if tool_name.is_empty() {
-            continue;
-        }
-        object.insert("name".to_string(), serde_json::json!(tool_name));
-        object.insert("toolName".to_string(), serde_json::json!(tool_name));
-        if let Some(position) = custom_tools_array.iter().position(|item| {
-            ["toolName", "name"].iter().any(|field| {
-                item.get(*field)
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|value| value == tool_name)
-            })
-        }) {
-            custom_tools_array[position] = serde_json::Value::Object(object);
-        } else {
-            custom_tools_array.push(serde_json::Value::Object(object));
-        }
-    }
-}
-
-fn merge_legacy_instruction_skills_into_skills_config(
-    snapshot: &mut HashMap<String, serde_json::Value>,
-) {
-    let legacy_skills = snapshot
-        .get("skills")
-        .and_then(|value| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if legacy_skills.is_empty() {
-        return;
-    }
-    let skills_config = snapshot
-        .entry("skillsConfig".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    let Some(config) = skills_config.as_object_mut() else {
-        return;
-    };
-    let instruction_skills = config
-        .entry("instructionSkills".to_string())
-        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-    let Some(instruction_skills_array) = instruction_skills.as_array_mut() else {
-        return;
-    };
-    for entry in legacy_skills {
-        let Some(mut object) = entry.as_object().cloned() else {
-            continue;
-        };
-        let skill_name = object
-            .get("name")
-            .and_then(|value| value.as_str())
-            .or_else(|| object.get("skillName").and_then(|value| value.as_str()))
-            .or_else(|| object.get("skillId").and_then(|value| value.as_str()))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_default()
-            .to_string();
-        if skill_name.is_empty() {
-            continue;
-        }
-        object.insert("name".to_string(), serde_json::json!(skill_name));
-        object.insert("skillName".to_string(), serde_json::json!(skill_name));
-        object.insert("skillId".to_string(), serde_json::json!(skill_name));
-        if object
-            .get("fullName")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .unwrap_or_default()
-            .is_empty()
-        {
-            object.insert("fullName".to_string(), serde_json::json!(skill_name));
-        }
-        if let Some(position) = instruction_skills_array.iter().position(|item| {
-            ["skillId", "skillName", "name"].iter().any(|field| {
-                item.get(*field)
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|value| value == skill_name)
-            })
-        }) {
-            instruction_skills_array[position] = serde_json::Value::Object(object);
-        } else {
-            instruction_skills_array.push(serde_json::Value::Object(object));
-        }
     }
 }
 

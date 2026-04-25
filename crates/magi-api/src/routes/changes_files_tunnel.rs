@@ -3,16 +3,16 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
-use magi_core::{SessionId, WorkspaceId};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 use magi_bridge_client::{ModelInvocationRequest, SHADOW_MODEL_PROVIDER};
 
+use super::session_scope::parse_session_id;
 use crate::{
     change_projection::{
-        SessionChangeScope, resolve_session_change_scope, run_git, run_git_add_files,
-        run_git_restore_files, safe_relative_path,
+        SessionChangeScope, resolve_session_change_scope, resolve_workspace_root_or_active,
+        run_git, run_git_add_files, run_git_restore_files, safe_relative_path,
     },
     errors::ApiError,
     state::ApiState,
@@ -36,14 +36,6 @@ pub fn routes() -> Router<ApiState> {
         .route("/tunnel/status", get(tunnel_status))
         .route("/lan-access", get(lan_access_status))
         .route("/prompt/enhance", post(enhance_prompt))
-}
-
-fn parse_session_id(value: Option<&str>) -> Result<SessionId, ApiError> {
-    let session_id = value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("sessionId 不能为空".to_string()))?;
-    Ok(SessionId::new(session_id))
 }
 
 fn require_session_scoped_file<'a>(
@@ -75,7 +67,6 @@ async fn get_diff(
     State(state): State<ApiState>,
     Query(query): Query<DiffQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let root = resolve_workspace_root_fallback(&state, query.workspace_id.as_deref())?;
     let diff = if query
         .session_id
         .as_deref()
@@ -111,6 +102,7 @@ async fn get_diff(
             }
         }
     } else {
+        let root = resolve_workspace_root_or_active(&state, query.workspace_id.as_deref())?;
         match query.file_path.as_deref() {
             Some(fp) => {
                 let rel = safe_relative_path(fp)?;
@@ -141,7 +133,7 @@ async fn approve_change(
     let scope =
         resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
     let rel = require_session_scoped_file(&scope, &request.file_path)?;
-    run_git(&scope.workspace_root, &["add", "--", rel])?;
+    run_git_add_files(&scope.workspace_root, &[rel.to_string()])?;
     Ok(Json(serde_json::json!({
         "approved": true,
         "filePath": request.file_path,
@@ -164,17 +156,7 @@ async fn revert_change(
     let scope =
         resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
     let rel = require_session_scoped_file(&scope, &request.file_path)?;
-    run_git(
-        &scope.workspace_root,
-        &[
-            "restore",
-            "--source=HEAD",
-            "--staged",
-            "--worktree",
-            "--",
-            rel,
-        ],
-    )?;
+    run_git_restore_files(&scope.workspace_root, &[rel.to_string()])?;
     Ok(Json(serde_json::json!({
         "reverted": true,
         "filePath": request.file_path,
@@ -287,7 +269,7 @@ async fn get_file_content(
             let rel = require_session_scoped_file(&scope, path)?;
             scope.workspace_root.join(rel)
         } else {
-            let root = resolve_workspace_root_fallback(&state, query.workspace_id.as_deref())?;
+            let root = resolve_workspace_root_or_active(&state, query.workspace_id.as_deref())?;
             let rel = safe_relative_path(path)?;
             root.join(rel)
         };
@@ -324,12 +306,13 @@ async fn list_filesystem(
             if p_path.is_absolute() {
                 p_path.to_path_buf()
             } else {
-                let root = resolve_workspace_root_fallback(&state, query.workspace_id.as_deref())?;
+                let root = resolve_workspace_root_or_active(&state, query.workspace_id.as_deref())?;
                 root.join(safe_relative_path(p)?)
             }
         }
         None => {
-            if let Ok(root) = resolve_workspace_root_fallback(&state, query.workspace_id.as_deref())
+            if let Ok(root) =
+                resolve_workspace_root_or_active(&state, query.workspace_id.as_deref())
             {
                 root
             } else {
@@ -353,27 +336,6 @@ async fn list_filesystem(
         })
         .unwrap_or_default();
     Ok(Json(serde_json::json!({ "entries": entries })))
-}
-
-fn resolve_workspace_root_fallback(
-    state: &ApiState,
-    workspace_id: Option<&str>,
-) -> Result<PathBuf, ApiError> {
-    let ws_id = match workspace_id.filter(|value| !value.is_empty()) {
-        Some(id) => WorkspaceId::new(id),
-        None => state
-            .workspace_registry
-            .active_workspace_id()
-            .ok_or_else(|| {
-                ApiError::InvalidInput("未指定 workspace_id 且没有活动 workspace".to_string())
-            })?,
-    };
-    let workspaces = state.workspace_registry.workspaces();
-    let workspace = workspaces
-        .iter()
-        .find(|workspace| workspace.workspace_id == ws_id)
-        .ok_or_else(|| ApiError::not_found("workspace 不存在", ws_id.as_str()))?;
-    Ok(PathBuf::from(workspace.root_path.as_str()))
 }
 
 // ─── Tunnel ──────────────────────────────────────────────────────────────────
@@ -414,7 +376,7 @@ async fn lan_access_status(
     let ip = resolve_preferred_lan_ipv4();
     let port = 38123;
 
-    // 从 query 参数或 state 获取 workspaceId/sessionId，构造完整的 web 访问 URL
+    // 从 query 参数获取 workspaceId，构造完整的 web 访问 URL
     let workspace_id = query.get("workspaceId").cloned().unwrap_or_default();
     let mut url = format!("http://{}:{}/web.html", ip, port);
     if !workspace_id.is_empty() {
@@ -596,7 +558,7 @@ mod tests {
     };
     use magi_core::{
         AbsolutePath, ExecutionOwnership, MissionId, SessionId, TaskId, TaskKind, TaskStatus,
-        UtcMillis,
+        UtcMillis, WorkspaceId,
     };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
@@ -883,6 +845,71 @@ mod tests {
             serde_json::from_slice(&body).expect("payload should deserialize");
         let message = payload["message"].as_str().unwrap_or_default();
         assert!(message.contains("不属于当前会话"));
+    }
+
+    #[tokio::test]
+    async fn revert_change_removes_untracked_session_file() {
+        let repo_root = build_test_repo();
+        let state = build_state_with_repo(&repo_root);
+        fs::create_dir_all(Path::new(&repo_root).join("tmp")).expect("tmp dir should create");
+        fs::write(
+            Path::new(&repo_root).join("tmp/new-single-a.txt"),
+            "new file\n",
+        )
+        .expect("untracked file should write");
+
+        state
+            .task_store()
+            .expect("task store should exist")
+            .insert_task(magi_core::Task {
+                task_id: TaskId::new("task-a-untracked-single"),
+                mission_id: MissionId::new("mission-a"),
+                root_task_id: TaskId::new("task-a-untracked-single"),
+                parent_task_id: None,
+                kind: TaskKind::Action,
+                title: "A-untracked-single".to_string(),
+                goal: "A-untracked-single".to_string(),
+                status: TaskStatus::Completed,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                context_refs: Vec::new(),
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: vec!["file:tmp/new-single-a.txt".to_string()],
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                repair_count: 0,
+                decision_payload: None,
+                created_at: UtcMillis::now(),
+                updated_at: UtcMillis::now(),
+            });
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/changes/revert")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sessionId": "session-a",
+                            "workspaceId": "workspace-session-scope",
+                            "filePath": "tmp/new-single-a.txt"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!Path::new(&repo_root).join("tmp/new-single-a.txt").exists());
     }
 
     #[tokio::test]
