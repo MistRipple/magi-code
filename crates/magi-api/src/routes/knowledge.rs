@@ -1,9 +1,9 @@
 use axum::{
+    Json, Router,
     extract::{Query, State},
     routing::{get, post},
-    Json, Router,
 };
-use magi_core::UtcMillis;
+use magi_core::{DomainError, UtcMillis, WorkspaceId};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeQuery, KnowledgeRecord};
 use serde::{Deserialize, Serialize};
 
@@ -40,10 +40,15 @@ struct KnowledgeMutationResponse {
     knowledge_count: usize,
 }
 
-fn mutation_response(state: &ApiState) -> KnowledgeMutationResponse {
+fn mutation_response(state: &ApiState, workspace_id: &WorkspaceId) -> KnowledgeMutationResponse {
     KnowledgeMutationResponse {
         success: true,
-        knowledge_count: state.knowledge_store.list().len(),
+        knowledge_count: state
+            .knowledge_store
+            .list()
+            .into_iter()
+            .filter(|record| record.workspace_id.as_ref() == Some(workspace_id))
+            .count(),
     }
 }
 
@@ -66,7 +71,21 @@ fn normalize_learning_content(value: impl Into<String>) -> Result<String, ApiErr
 }
 
 fn normalize_optional_text(value: Option<String>) -> Option<String> {
-    value.map(|text| text.trim().to_string()).filter(|text| !text.is_empty())
+    value
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn normalize_workspace_id(value: Option<&str>) -> Option<WorkspaceId> {
+    value
+        .map(str::trim)
+        .filter(|workspace_id| !workspace_id.is_empty())
+        .map(WorkspaceId::new)
+}
+
+fn require_workspace_id(value: Option<&str>) -> Result<WorkspaceId, ApiError> {
+    normalize_workspace_id(value)
+        .ok_or_else(|| ApiError::InvalidInput("workspaceId 不能为空".to_string()))
 }
 
 fn normalize_tags(tags: Vec<String>) -> Vec<String> {
@@ -117,12 +136,20 @@ fn title_from_learning(content: &str) -> String {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeWorkspaceRequest {
+    workspace_id: Option<String>,
+}
+
 async fn clear_knowledge(
     State(state): State<ApiState>,
+    Json(request): Json<KnowledgeWorkspaceRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    state.knowledge_store.clear();
+    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
+    state.knowledge_store.clear_workspace(&workspace_id);
     state.persist_knowledge_state()?;
-    Ok(Json(mutation_response(&state)))
+    Ok(Json(mutation_response(&state, &workspace_id)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,28 +163,32 @@ struct KnowledgeListQuery {
 
 async fn list_adrs(
     State(state): State<ApiState>,
-    Query(_query): Query<KnowledgeListQuery>,
-) -> Json<serde_json::Value> {
+    Query(query): Query<KnowledgeListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
     let query = KnowledgeQuery {
         kind: Some(KnowledgeKind::Adr),
         text: None,
         tags: vec![],
+        workspace_id: Some(workspace_id),
         limit: 1000,
     };
     let result = state.knowledge_store.query(&query);
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "adrs": result.matches.iter().map(|m| knowledge_record_json(&m.record)).collect::<Vec<_>>(),
-    }))
+    })))
 }
 
 async fn get_project_knowledge(
     State(state): State<ApiState>,
-    Query(_query): Query<KnowledgeListQuery>,
-) -> Json<serde_json::Value> {
+    Query(query): Query<KnowledgeListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
     let adrs_query = KnowledgeQuery {
         kind: Some(KnowledgeKind::Adr),
         text: None,
         tags: vec![],
+        workspace_id: Some(workspace_id.clone()),
         limit: 1000,
     };
     let adrs_result = state.knowledge_store.query(&adrs_query);
@@ -171,6 +202,7 @@ async fn get_project_knowledge(
         kind: Some(KnowledgeKind::Faq),
         text: None,
         tags: vec![],
+        workspace_id: Some(workspace_id.clone()),
         limit: 1000,
     };
     let faqs_result = state.knowledge_store.query(&faqs_query);
@@ -184,6 +216,7 @@ async fn get_project_knowledge(
         kind: Some(KnowledgeKind::Learning),
         text: None,
         tags: vec![],
+        workspace_id: Some(workspace_id),
         limit: 1000,
     };
     let learnings_result = state.knowledge_store.query(&learnings_query);
@@ -210,44 +243,48 @@ async fn get_project_knowledge(
         })
         .unwrap_or(serde_json::Value::Null);
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "adrs": adrs,
         "faqs": faqs,
         "learnings": learnings,
         "codeIndex": code_index,
-    }))
+    })))
 }
 
 async fn list_faqs(
     State(state): State<ApiState>,
-    Query(_query): Query<KnowledgeListQuery>,
-) -> Json<serde_json::Value> {
+    Query(query): Query<KnowledgeListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
     let query = KnowledgeQuery {
         kind: Some(KnowledgeKind::Faq),
         text: None,
         tags: vec![],
+        workspace_id: Some(workspace_id),
         limit: 1000,
     };
     let result = state.knowledge_store.query(&query);
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "faqs": result.matches.iter().map(|m| knowledge_record_json(&m.record)).collect::<Vec<_>>(),
-    }))
+    })))
 }
 
 async fn list_learnings(
     State(state): State<ApiState>,
-    Query(_query): Query<KnowledgeListQuery>,
-) -> Json<serde_json::Value> {
+    Query(query): Query<KnowledgeListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
     let query = KnowledgeQuery {
         kind: Some(KnowledgeKind::Learning),
         text: None,
         tags: vec![],
+        workspace_id: Some(workspace_id),
         limit: 1000,
     };
     let result = state.knowledge_store.query(&query);
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "learnings": result.matches.iter().map(|m| learning_record_json(&m.record)).collect::<Vec<_>>(),
-    }))
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -271,33 +308,53 @@ impl KnowledgeSearchQuery {
 async fn search_adrs(
     State(state): State<ApiState>,
     Query(query): Query<KnowledgeSearchQuery>,
-) -> Json<serde_json::Value> {
-    search_knowledge(&state, KnowledgeKind::Adr, query.text())
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
+    Ok(search_knowledge(
+        &state,
+        KnowledgeKind::Adr,
+        query.text(),
+        workspace_id,
+    ))
 }
 
 async fn search_faqs(
     State(state): State<ApiState>,
     Query(query): Query<KnowledgeSearchQuery>,
-) -> Json<serde_json::Value> {
-    search_knowledge(&state, KnowledgeKind::Faq, query.text())
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
+    Ok(search_knowledge(
+        &state,
+        KnowledgeKind::Faq,
+        query.text(),
+        workspace_id,
+    ))
 }
 
 async fn search_learnings(
     State(state): State<ApiState>,
     Query(query): Query<KnowledgeSearchQuery>,
-) -> Json<serde_json::Value> {
-    search_knowledge(&state, KnowledgeKind::Learning, query.text())
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
+    Ok(search_knowledge(
+        &state,
+        KnowledgeKind::Learning,
+        query.text(),
+        workspace_id,
+    ))
 }
 
 fn search_knowledge(
     state: &ApiState,
     kind: KnowledgeKind,
     text: Option<String>,
+    workspace_id: WorkspaceId,
 ) -> Json<serde_json::Value> {
     let kq = KnowledgeQuery {
         kind: Some(kind),
         text,
         tags: vec![],
+        workspace_id: Some(workspace_id),
         limit: 100,
     };
     let result = state.knowledge_store.query(&kq);
@@ -320,6 +377,7 @@ fn search_knowledge(
 #[serde(rename_all = "camelCase")]
 struct AddAdrRequest {
     adr: AdrInput,
+    workspace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,6 +393,7 @@ async fn add_adr(
     State(state): State<ApiState>,
     Json(request): Json<AddAdrRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
+    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
     let id = format!("adr-{}", UtcMillis::now().0);
     let record = KnowledgeRecord {
         knowledge_id: id,
@@ -342,12 +401,13 @@ async fn add_adr(
         title: normalize_text(request.adr.title, "ADR 标题")?,
         content: normalize_text(request.adr.content, "ADR 内容")?,
         tags: normalize_tags(request.adr.tags),
+        workspace_id: Some(workspace_id.clone()),
         source_ref: None,
         updated_at: UtcMillis::now(),
     };
     state.knowledge_store.upsert(record);
     state.persist_knowledge_state()?;
-    Ok(Json(mutation_response(&state)))
+    Ok(Json(mutation_response(&state, &workspace_id)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -355,6 +415,7 @@ async fn add_adr(
 struct UpdateKnowledgeRequest {
     id: String,
     updates: KnowledgeUpdates,
+    workspace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,28 +431,32 @@ async fn update_adr(
     State(state): State<ApiState>,
     Json(request): Json<UpdateKnowledgeRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    update_knowledge_record(&state, &request.id, &request.updates)?;
-    Ok(Json(mutation_response(&state)))
+    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
+    update_knowledge_record(&state, &workspace_id, &request.id, &request.updates)?;
+    Ok(Json(mutation_response(&state, &workspace_id)))
 }
 
 async fn update_faq(
     State(state): State<ApiState>,
     Json(request): Json<UpdateKnowledgeRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    update_knowledge_record(&state, &request.id, &request.updates)?;
-    Ok(Json(mutation_response(&state)))
+    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
+    update_knowledge_record(&state, &workspace_id, &request.id, &request.updates)?;
+    Ok(Json(mutation_response(&state, &workspace_id)))
 }
 
 async fn update_learning(
     State(state): State<ApiState>,
     Json(request): Json<UpdateKnowledgeRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    update_knowledge_record(&state, &request.id, &request.updates)?;
-    Ok(Json(mutation_response(&state)))
+    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
+    update_knowledge_record(&state, &workspace_id, &request.id, &request.updates)?;
+    Ok(Json(mutation_response(&state, &workspace_id)))
 }
 
 fn update_knowledge_record(
     state: &ApiState,
+    workspace_id: &WorkspaceId,
     id: &str,
     updates: &KnowledgeUpdates,
 ) -> Result<(), ApiError> {
@@ -399,6 +464,9 @@ fn update_knowledge_record(
         .knowledge_store
         .get(id)
         .ok_or_else(|| ApiError::not_found("知识记录不存在", id))?;
+    if existing.workspace_id.as_ref() != Some(workspace_id) {
+        return Err(ApiError::not_found("知识记录不存在", id));
+    }
     let kind = existing.kind;
     let next_content = match updates.content.clone() {
         Some(content) if kind == KnowledgeKind::Learning => normalize_learning_content(content)?,
@@ -421,7 +489,12 @@ fn update_knowledge_record(
         kind,
         title: next_title,
         content: next_content,
-        tags: updates.tags.clone().map(normalize_tags).unwrap_or(existing.tags),
+        tags: updates
+            .tags
+            .clone()
+            .map(normalize_tags)
+            .unwrap_or(existing.tags),
+        workspace_id: Some(workspace_id.clone()),
         source_ref: next_source_ref,
         updated_at: UtcMillis::now(),
     };
@@ -434,6 +507,7 @@ fn update_knowledge_record(
 #[serde(rename_all = "camelCase")]
 struct AddFaqRequest {
     faq: FaqInput,
+    workspace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -449,6 +523,7 @@ async fn add_faq(
     State(state): State<ApiState>,
     Json(request): Json<AddFaqRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
+    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
     let id = format!("faq-{}", UtcMillis::now().0);
     let record = KnowledgeRecord {
         knowledge_id: id,
@@ -456,18 +531,20 @@ async fn add_faq(
         title: normalize_text(request.faq.title, "FAQ 问题")?,
         content: normalize_text(request.faq.content, "FAQ 答案")?,
         tags: normalize_tags(request.faq.tags),
+        workspace_id: Some(workspace_id.clone()),
         source_ref: None,
         updated_at: UtcMillis::now(),
     };
     state.knowledge_store.upsert(record);
     state.persist_knowledge_state()?;
-    Ok(Json(mutation_response(&state)))
+    Ok(Json(mutation_response(&state, &workspace_id)))
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AddLearningRequest {
     learning: LearningInput,
+    workspace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -483,6 +560,7 @@ async fn add_learning(
     State(state): State<ApiState>,
     Json(request): Json<AddLearningRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
+    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
     let content = normalize_learning_content(request.learning.content)?;
     let id = format!("learning-{}", UtcMillis::now().0);
     let record = KnowledgeRecord {
@@ -491,52 +569,66 @@ async fn add_learning(
         title: title_from_learning(&content),
         content,
         tags: normalize_tags(request.learning.tags),
+        workspace_id: Some(workspace_id.clone()),
         source_ref: normalize_optional_text(request.learning.context),
         updated_at: UtcMillis::now(),
     };
     state.knowledge_store.upsert(record);
     state.persist_knowledge_state()?;
-    Ok(Json(mutation_response(&state)))
+    Ok(Json(mutation_response(&state, &workspace_id)))
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeleteKnowledgeRequest {
     id: String,
+    workspace_id: Option<String>,
 }
 
 async fn delete_adr(
     State(state): State<ApiState>,
     Json(request): Json<DeleteKnowledgeRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
+    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
     state
         .knowledge_store
-        .delete(&request.id)
-        .map_err(|e| ApiError::internal_assembly("删除 ADR 失败", e))?;
+        .delete_in_workspace(&request.id, &workspace_id)
+        .map_err(|error| map_knowledge_delete_error(error, &request.id))?;
     state.persist_knowledge_state()?;
-    Ok(Json(mutation_response(&state)))
+    Ok(Json(mutation_response(&state, &workspace_id)))
 }
 
 async fn delete_faq(
     State(state): State<ApiState>,
     Json(request): Json<DeleteKnowledgeRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
+    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
     state
         .knowledge_store
-        .delete(&request.id)
-        .map_err(|e| ApiError::internal_assembly("删除 FAQ 失败", e))?;
+        .delete_in_workspace(&request.id, &workspace_id)
+        .map_err(|error| map_knowledge_delete_error(error, &request.id))?;
     state.persist_knowledge_state()?;
-    Ok(Json(mutation_response(&state)))
+    Ok(Json(mutation_response(&state, &workspace_id)))
 }
 
 async fn delete_learning(
     State(state): State<ApiState>,
     Json(request): Json<DeleteKnowledgeRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
+    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
     state
         .knowledge_store
-        .delete(&request.id)
-        .map_err(|e| ApiError::internal_assembly("删除 Learning 失败", e))?;
+        .delete_in_workspace(&request.id, &workspace_id)
+        .map_err(|error| map_knowledge_delete_error(error, &request.id))?;
     state.persist_knowledge_state()?;
-    Ok(Json(mutation_response(&state)))
+    Ok(Json(mutation_response(&state, &workspace_id)))
+}
+
+fn map_knowledge_delete_error(error: DomainError, id: &str) -> ApiError {
+    match error {
+        DomainError::NotFound { .. } | DomainError::InvalidState { .. } => {
+            ApiError::not_found("知识记录不存在", id)
+        }
+        other => ApiError::internal_assembly("删除知识记录失败", other),
+    }
 }

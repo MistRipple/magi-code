@@ -6,13 +6,9 @@ use std::path::Path;
 
 /// 可索引的源代码扩展名集合（含点号，小写）
 const INDEXED_EXTENSIONS: &[&str] = &[
-    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
-    ".py", ".go", ".java", ".rs",
-    ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh",
-    ".cs", ".php", ".rb", ".swift", ".kt", ".kts",
-    ".m", ".mm",
-    ".vue", ".svelte",
-    ".json", ".md", ".toml", ".yml", ".yaml",
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".java", ".rs", ".c", ".h", ".cpp",
+    ".cc", ".cxx", ".hpp", ".hh", ".cs", ".php", ".rb", ".swift", ".kt", ".kts", ".m", ".mm",
+    ".vue", ".svelte", ".json", ".md", ".toml", ".yml", ".yaml",
 ];
 
 /// 默认忽略模式（目录和文件）
@@ -38,10 +34,20 @@ const IGNORE_PATTERNS: &[&str] = &[
 
 /// 入口文件检测模式
 const ENTRY_PATTERNS: &[&str] = &[
-    "index.ts", "index.js", "main.ts", "main.js",
-    "app.ts", "app.js", "lib.rs", "main.rs",
-    "src/index.ts", "src/index.js", "src/main.ts", "src/main.js",
-    "src/lib.rs", "src/main.rs",
+    "index.ts",
+    "index.js",
+    "main.ts",
+    "main.js",
+    "app.ts",
+    "app.js",
+    "lib.rs",
+    "main.rs",
+    "src/index.ts",
+    "src/index.js",
+    "src/main.ts",
+    "src/main.js",
+    "src/lib.rs",
+    "src/main.rs",
 ];
 
 /// 技术栈检测映射：(配置文件, 技术栈名称)
@@ -57,22 +63,36 @@ const TECH_STACK_DETECTORS: &[(&str, &str)] = &[
 
 /// package.json 依赖到框架/工具的映射
 const FRAMEWORK_DEPS: &[(&str, &str)] = &[
-    ("react", "React"), ("vue", "Vue"), ("svelte", "Svelte"),
-    ("next", "Next.js"), ("nuxt", "Nuxt"),
-    ("express", "Express"), ("fastify", "Fastify"),
-    ("nestjs", "NestJS"), ("@nestjs/core", "NestJS"),
+    ("react", "React"),
+    ("vue", "Vue"),
+    ("svelte", "Svelte"),
+    ("next", "Next.js"),
+    ("nuxt", "Nuxt"),
+    ("express", "Express"),
+    ("fastify", "Fastify"),
+    ("nestjs", "NestJS"),
+    ("@nestjs/core", "NestJS"),
     ("electron", "Electron"),
 ];
 
 const BUILD_TOOL_DEPS: &[(&str, &str)] = &[
-    ("webpack", "Webpack"), ("vite", "Vite"), ("rollup", "Rollup"),
-    ("esbuild", "esbuild"), ("turbo", "Turborepo"), ("tsup", "tsup"),
-    ("parcel", "Parcel"), ("swc", "SWC"), ("@swc/core", "SWC"),
+    ("webpack", "Webpack"),
+    ("vite", "Vite"),
+    ("rollup", "Rollup"),
+    ("esbuild", "esbuild"),
+    ("turbo", "Turborepo"),
+    ("tsup", "tsup"),
+    ("parcel", "Parcel"),
+    ("swc", "SWC"),
+    ("@swc/core", "SWC"),
 ];
 
 const TEST_DEPS: &[(&str, &str)] = &[
-    ("jest", "Jest"), ("mocha", "Mocha"), ("vitest", "Vitest"),
-    ("@playwright/test", "Playwright"), ("cypress", "Cypress"),
+    ("jest", "Jest"),
+    ("mocha", "Mocha"),
+    ("vitest", "Vitest"),
+    ("@playwright/test", "Playwright"),
+    ("cypress", "Cypress"),
     ("ava", "AVA"),
 ];
 

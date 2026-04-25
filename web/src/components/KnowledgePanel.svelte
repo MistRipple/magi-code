@@ -7,7 +7,20 @@
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { getState } from '../stores/messages.svelte';
-  import { isWebAgentMode, resolveAgentBaseUrl } from '../web/agent-api';
+  import {
+    addAgentAdr,
+    addAgentFaq,
+    addAgentLearning,
+    clearAgentProjectKnowledge,
+    deleteAgentAdr,
+    deleteAgentFaq,
+    deleteAgentLearning,
+    getAgentProjectKnowledge,
+    isWebAgentMode,
+    updateAgentAdr,
+    updateAgentFaq,
+    updateAgentLearning,
+  } from '../web/agent-api';
 
   // 知识类型定义
   interface CodeIndex {
@@ -206,19 +219,6 @@
     return '';
   }
 
-  async function postKnowledgeMutation(path: string, body: Record<string, unknown>) {
-    const response = await fetch(`${resolveAgentBaseUrl()}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) {
-      const payload = await response.json().catch(() => null);
-      const message = typeof payload?.message === 'string' ? payload.message : `${response.status}`;
-      throw new Error(message);
-    }
-  }
-
   async function saveEditor() {
     if (!editorKind || isSaving) return;
     const title = formTitle.trim();
@@ -244,20 +244,32 @@
     try {
       if (editorKind === 'adr') {
         if (isWebMode) {
-          await postKnowledgeMutation(editorId ? '/api/knowledge/adr/update' : '/api/knowledge/adr/add', editorId ? { id: editorId, updates: { title, content, tags } } : { adr: { title, content, tags } });
+          if (editorId) {
+            await updateAgentAdr(editorId, { title, content, tags });
+          } else {
+            await addAgentAdr({ title, content, tags });
+          }
         } else {
           vscode.postMessage(editorId ? { type: 'updateADR', id: editorId, updates: { title, content, tags } } : { type: 'addADR', adr: { title, content, tags } });
         }
       } else if (editorKind === 'faq') {
         if (isWebMode) {
-          await postKnowledgeMutation(editorId ? '/api/knowledge/faq/update' : '/api/knowledge/faq/add', editorId ? { id: editorId, updates: { title, content, tags } } : { faq: { title, content, tags } });
+          if (editorId) {
+            await updateAgentFaq(editorId, { title, content, tags });
+          } else {
+            await addAgentFaq({ title, content, tags });
+          }
         } else {
           vscode.postMessage(editorId ? { type: 'updateFAQ', id: editorId, updates: { title, content, tags } } : { type: 'addFAQ', faq: { title, content, tags } });
         }
       } else {
         const learning = { content, context, tags };
         if (isWebMode) {
-          await postKnowledgeMutation(editorId ? '/api/knowledge/learning/update' : '/api/knowledge/learning/add', editorId ? { id: editorId, updates: { content, sourceRef: context, tags } } : { learning });
+          if (editorId) {
+            await updateAgentLearning(editorId, { content, sourceRef: context, tags });
+          } else {
+            await addAgentLearning(learning);
+          }
         } else {
           vscode.postMessage(editorId ? { type: 'updateLearning', id: editorId, updates: { content, sourceRef: context, tags } } : { type: 'addLearning', learning });
         }
@@ -272,8 +284,10 @@
   }
 
   async function fetchKnowledgeViaApi() {
-    const base = resolveAgentBaseUrl();
-    const res = await fetch(`${base}/api/knowledge`).then(r => r.json());
+    const res = await getAgentProjectKnowledge();
+    const codeIndexPayload = res?.codeIndex && typeof res.codeIndex === 'object'
+      ? res.codeIndex as Record<string, unknown>
+      : null;
     
     adrs = ensureArray(res?.adrs).map((a: any) => ({
       id: a.id,
@@ -294,12 +308,12 @@
       createdAt: l.createdAt,
       tags: ensureArray(l.tags)
     }));
-    codeIndex = res?.codeIndex
+    codeIndex = codeIndexPayload
       ? {
-          ...res.codeIndex,
-          files: ensureArray(res.codeIndex.files) as NonNullable<CodeIndex['files']>,
-          techStack: ensureArray(res.codeIndex.techStack) as string[],
-          entryPoints: ensureArray(res.codeIndex.entryPoints) as string[]
+          ...codeIndexPayload,
+          files: ensureArray(codeIndexPayload.files) as NonNullable<CodeIndex['files']>,
+          techStack: ensureArray(codeIndexPayload.techStack) as string[],
+          entryPoints: ensureArray(codeIndexPayload.entryPoints) as string[]
         }
       : null;
     isLoading = false;
@@ -326,9 +340,7 @@
   function deleteAdr(id: string, e: Event) {
     e.stopPropagation();
     if (isWebMode) {
-      fetch(`${resolveAgentBaseUrl()}/api/knowledge/adr/delete`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }),
-      }).then(() => refresh()).catch(console.error);
+      deleteAgentAdr(id).then(() => refresh()).catch(console.error);
     } else {
       vscode.postMessage({ type: 'deleteADR', id });
     }
@@ -337,9 +349,7 @@
   function deleteFaq(id: string, e: Event) {
     e.stopPropagation();
     if (isWebMode) {
-      fetch(`${resolveAgentBaseUrl()}/api/knowledge/faq/delete`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }),
-      }).then(() => refresh()).catch(console.error);
+      deleteAgentFaq(id).then(() => refresh()).catch(console.error);
     } else {
       vscode.postMessage({ type: 'deleteFAQ', id });
     }
@@ -352,9 +362,7 @@
   function deleteLearning(id: string, e: Event) {
     e.stopPropagation();
     if (isWebMode) {
-      fetch(`${resolveAgentBaseUrl()}/api/knowledge/learning/delete`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }),
-      }).then(() => refresh()).catch(console.error);
+      deleteAgentLearning(id).then(() => refresh()).catch(console.error);
     } else {
       vscode.postMessage({ type: 'deleteLearning', id });
     }
@@ -372,9 +380,7 @@
     showClearConfirm = false;
     isLoading = true;
     if (isWebMode) {
-      fetch(`${resolveAgentBaseUrl()}/api/knowledge/clear`, { method: 'POST' })
-        .then(() => refresh())
-        .catch(() => { isLoading = false; });
+      clearAgentProjectKnowledge().then(() => refresh()).catch(() => { isLoading = false; });
     } else {
       vscode.postMessage({ type: 'clearProjectKnowledge' });
     }
