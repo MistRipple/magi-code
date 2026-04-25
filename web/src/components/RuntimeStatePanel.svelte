@@ -1702,7 +1702,6 @@
       padding: 10px 12px;
       gap: 6px;
       align-items: flex-start;
-      flex-wrap: wrap;
     }
 
     .summary__time {

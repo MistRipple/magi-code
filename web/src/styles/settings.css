@@ -75,6 +75,11 @@
     padding-bottom: 6px;
   }
 
+  .apple-dashboard-bar {
+    flex-wrap: wrap;
+    gap: var(--space-3);
+  }
+
   .apple-tile {
     background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 0.85);
     backdrop-filter: blur(16px);
@@ -437,6 +442,8 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
+    flex-wrap: wrap;
+    justify-content: flex-end;
   }
 
   .settings-hint {
@@ -452,6 +459,7 @@
   .settings-btn-group {
     display: flex;
     gap: var(--space-2);
+    flex-wrap: wrap;
   }
 
   /* 统一按钮样式 */
