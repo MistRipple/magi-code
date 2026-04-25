@@ -3,6 +3,7 @@ mod change_projection;
 mod dto;
 mod errors;
 pub(crate) mod execution_chain_recovery;
+mod model_config;
 mod prompt_utils;
 mod routes;
 mod session_turn_execution;
