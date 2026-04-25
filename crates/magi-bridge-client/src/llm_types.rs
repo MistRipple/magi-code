@@ -188,6 +188,8 @@ pub struct CircuitBreakerConfig {
 #[serde(rename_all = "camelCase")]
 pub struct LlmResponse {
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
     pub usage: LlmUsage,

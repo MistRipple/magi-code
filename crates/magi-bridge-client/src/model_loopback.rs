@@ -628,20 +628,27 @@ struct OpenAiCompatibleChatChoice {
 
 impl OpenAiCompatibleChatChoice {
     fn into_payload(self, usage: Option<OpenAiCompatibleUsage>) -> OpenAiCompatibleSuccessPayload {
-        let (content, tool_calls) = match self.message {
-            Some(message) => (
-                message
-                    .content
-                    .map(OpenAiCompatibleMessageContent::into_text)
-                    .filter(|content| !content.trim().is_empty())
-                    .or(message.refusal),
-                message.tool_calls,
-            ),
-            None => (None, Vec::new()),
+        let (content, reasoning_content, tool_calls) = match self.message {
+            Some(message) => {
+                let reasoning_content = message
+                    .reasoning_content
+                    .filter(|content| !content.trim().is_empty());
+                (
+                    message
+                        .content
+                        .map(OpenAiCompatibleMessageContent::into_text)
+                        .filter(|content| !content.trim().is_empty())
+                        .or(message.refusal),
+                    reasoning_content,
+                    message.tool_calls,
+                )
+            }
+            None => (None, None, Vec::new()),
         };
 
         OpenAiCompatibleSuccessPayload {
             content: content.or(self.text),
+            reasoning_content,
             finish_reason: self.finish_reason,
             usage,
             tool_calls,
@@ -653,6 +660,8 @@ impl OpenAiCompatibleChatChoice {
 struct OpenAiCompatibleChatMessage {
     #[serde(default)]
     content: Option<OpenAiCompatibleMessageContent>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     refusal: Option<String>,
     #[serde(default)]
@@ -688,6 +697,8 @@ struct OpenAiCompatibleSuccessPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<OpenAiCompatibleUsage>,
@@ -697,11 +708,19 @@ struct OpenAiCompatibleSuccessPayload {
 
 impl OpenAiCompatibleSuccessPayload {
     fn into_bridge_payload(self) -> Result<String, String> {
-        if self.content.is_none() && self.tool_calls.is_empty() {
-            return Err("missing message.content/text or message.tool_calls".to_string());
+        if self.content.is_none() && self.reasoning_content.is_none() && self.tool_calls.is_empty()
+        {
+            return Err(
+                "missing message.content/text, message.reasoning_content or message.tool_calls"
+                    .to_string(),
+            );
         }
 
-        if self.finish_reason.is_none() && self.usage.is_none() && self.tool_calls.is_empty() {
+        if self.finish_reason.is_none()
+            && self.usage.is_none()
+            && self.reasoning_content.is_none()
+            && self.tool_calls.is_empty()
+        {
             return Ok(self.content.unwrap_or_default());
         }
 

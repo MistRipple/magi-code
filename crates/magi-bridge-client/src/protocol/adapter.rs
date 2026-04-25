@@ -37,6 +37,7 @@ pub struct AdaptedRequest {
 #[derive(Clone, Debug)]
 pub struct AdaptedResponse {
     pub content: String,
+    pub thinking: Option<String>,
     pub tool_calls: Vec<crate::llm_types::ToolCall>,
     pub usage: LlmUsage,
     pub stop_reason: String,
@@ -47,6 +48,7 @@ impl From<AdaptedResponse> for LlmResponse {
     fn from(r: AdaptedResponse) -> Self {
         LlmResponse {
             content: r.content,
+            thinking: r.thinking,
             tool_calls: r.tool_calls,
             usage: r.usage,
             stop_reason: r.stop_reason,

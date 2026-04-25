@@ -58,6 +58,6 @@ pub use types::{
     McpManagerListServersResponse, McpManagerServerHealthUpdateRequest,
     McpManagerServerLifecycleState, McpManagerServerOperationResponse,
     McpManagerServerRegistrationRequest, McpManagerServerSelectionRequest, McpToolCallRequest,
-    ModelBridgeClient, ModelInvocationRequest, SHADOW_MCP_SERVER_NAME, SHADOW_MCP_TOOL_NAME,
-    SHADOW_MODEL_PROVIDER,
+    ModelBridgeClient, ModelInvocationRequest, ModelStreamingDelta, SHADOW_MCP_SERVER_NAME,
+    SHADOW_MCP_TOOL_NAME, SHADOW_MODEL_PROVIDER,
 };

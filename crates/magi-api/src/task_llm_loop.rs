@@ -9,7 +9,7 @@ use crate::{
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolCall, ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest,
-    SHADOW_MODEL_PROVIDER,
+    ModelStreamingDelta, SHADOW_MODEL_PROVIDER,
 };
 use magi_core::{
     ApprovalRequirement, EventId, LeaseId, RiskLevel, SessionId, TaskId, ToolCallId, UtcMillis,
@@ -102,7 +102,7 @@ pub(crate) fn run_task_llm_loop(
             let last_sent_len = std::cell::Cell::new(0usize);
             let task_id_str = task.task_id.to_string();
             let mission_id_str = task.mission_id.to_string();
-            let on_delta = |accumulated_text: &str| {
+            let on_delta = |delta: &ModelStreamingDelta| {
                 publish_stream_delta(
                     event_bus,
                     session_store,
@@ -112,7 +112,7 @@ pub(crate) fn run_task_llm_loop(
                     &task_id_str,
                     &mission_id_str,
                     &last_sent_len,
-                    accumulated_text,
+                    &delta.content,
                 );
             };
 

@@ -360,6 +360,7 @@ fn apply_micro_compaction(messages: &mut Vec<LlmMessage>) {
 fn default_response() -> LlmResponse {
     LlmResponse {
         content: String::new(),
+        thinking: None,
         tool_calls: Vec::new(),
         usage: LlmUsage::default(),
         stop_reason: "none".to_string(),

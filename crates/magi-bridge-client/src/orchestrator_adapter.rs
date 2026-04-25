@@ -485,6 +485,7 @@ fn last_response_or_default(rounds: &[RoundResult]) -> LlmResponse {
         .map(|r| r.response.clone())
         .unwrap_or(LlmResponse {
             content: String::new(),
+            thinking: None,
             tool_calls: Vec::new(),
             usage: LlmUsage::default(),
             stop_reason: "none".to_string(),

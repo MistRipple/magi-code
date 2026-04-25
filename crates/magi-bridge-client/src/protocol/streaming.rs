@@ -100,6 +100,21 @@ fn parse_openai_responses_stream_event(event: &SseEvent) -> Vec<LlmStreamChunk> 
                 }]
             })
             .unwrap_or_default(),
+        "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => envelope
+            .get("delta")
+            .and_then(Value::as_str)
+            .filter(|delta| !delta.is_empty())
+            .map(|delta| {
+                vec![LlmStreamChunk {
+                    kind: LlmStreamChunkType::Thinking,
+                    content: None,
+                    tool_call: None,
+                    thinking: Some(delta.to_string()),
+                    usage: None,
+                    stop_reason: None,
+                }]
+            })
+            .unwrap_or_default(),
         "response.output_item.added" => {
             let Some(item) = envelope.get("item") else {
                 return Vec::new();
@@ -579,6 +594,10 @@ impl StreamAccumulator {
 
         AdaptedResponse {
             content: self.content_parts.join(""),
+            thinking: {
+                let thinking = self.thinking_parts.join("");
+                (!thinking.trim().is_empty()).then_some(thinking)
+            },
             tool_calls,
             usage: self.usage,
             stop_reason,

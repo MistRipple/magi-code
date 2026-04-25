@@ -117,6 +117,7 @@ import {
   applyStreamingDelta,
   dequeueQueuedMessage,
   enqueueQueuedMessage,
+  markMessageComplete,
   markQueuedMessageAsGuide,
   messagesState,
   sealStreamingDelta,
@@ -160,6 +161,8 @@ interface ActiveTurnLiveContext {
   userMessageId: string;
   placeholderMessageId: string;
   assistantMessageId: string;
+  assistantThinkingContent: string;
+  assistantTextContent: string;
   route: 'chat' | 'execute' | 'task' | 'continue' | null;
 }
 let activeTurnLiveContext: ActiveTurnLiveContext | null = null;
@@ -776,6 +779,75 @@ function resolveActiveAssistantMessageId(sessionId: string, itemId: string): str
   return activeTurnLiveContext.assistantMessageId;
 }
 
+function updateAssistantTurnThinkingContent(content: string): void {
+  if (!activeTurnLiveContext || !content.trim()) {
+    return;
+  }
+  const current = activeTurnLiveContext.assistantThinkingContent.trim();
+  const next = content.trim();
+  if (!current) {
+    activeTurnLiveContext.assistantThinkingContent = next;
+    return;
+  }
+  if (next.startsWith(current)) {
+    activeTurnLiveContext.assistantThinkingContent = next;
+    return;
+  }
+  if (current.startsWith(next)) {
+    return;
+  }
+  activeTurnLiveContext.assistantThinkingContent = `${current}\n\n${next}`;
+}
+
+function updateAssistantTurnTextContent(content: string): void {
+  if (!activeTurnLiveContext || !content.trim()) {
+    return;
+  }
+  const current = activeTurnLiveContext.assistantTextContent.trim();
+  const next = content.trim();
+  if (!current) {
+    activeTurnLiveContext.assistantTextContent = next;
+    return;
+  }
+  if (next.startsWith(current)) {
+    activeTurnLiveContext.assistantTextContent = next;
+    return;
+  }
+  if (current.startsWith(next)) {
+    return;
+  }
+  activeTurnLiveContext.assistantTextContent = next;
+}
+
+function buildAssistantTurnBlocks(
+  content: string,
+  itemId: string,
+  thinkingContent?: string,
+  thinkingComplete = false,
+): StandardMessage['blocks'] {
+  const blocks: StandardMessage['blocks'] = [];
+  const thinking = (thinkingContent ?? activeTurnLiveContext?.assistantThinkingContent ?? '').trim();
+  if (thinking) {
+    blocks.push({
+      type: 'thinking',
+      content: thinking,
+      isComplete: thinkingComplete,
+      blockId: activeTurnLiveContext?.requestId
+        ? `thinking:${activeTurnLiveContext.requestId}`
+        : `thinking:${itemId}`,
+    });
+  }
+  const text = content.trim();
+  if (text) {
+    blocks.push({
+      type: 'text',
+      content: text,
+      isMarkdown: true,
+    });
+  }
+  return blocks;
+}
+
 function createSessionTurnItemStandardMessage(
   event: RustEventEnvelope,
   item: Record<string, unknown>,
@@ -822,23 +894,51 @@ function createSessionTurnItemStandardMessage(
     ? 'unifiedComplete'
     : 'unifiedMessage';
 
-  if (kind === 'assistant_stream' || kind === 'assistant_final') {
+  if (kind === 'assistant_phase') {
+    return null;
+  }
+
+  if (kind === 'assistant_thinking' || kind === 'assistant_stream' || kind === 'assistant_final') {
     if (
       activeTurnLiveContext?.route === 'task'
       || activeTurnLiveContext?.route === 'continue'
     ) {
       return null;
     }
-    const text = content || title;
-    if (!text) {
+    if (kind === 'assistant_thinking') {
+      updateAssistantTurnThinkingContent(content || title || '');
+    } else {
+      updateAssistantTurnTextContent(content || title || '');
+    }
+    const assistantText = activeTurnLiveContext?.assistantTextContent || (kind === 'assistant_stream' || kind === 'assistant_final'
+      ? (content || title || '')
+      : '');
+    const assistantThinking = activeTurnLiveContext?.assistantThinkingContent || (kind === 'assistant_thinking'
+      ? (content || title || '')
+      : '');
+    const hasVisibleText = Boolean(assistantText.trim());
+    const hasThinking = Boolean(assistantThinking.trim());
+    if (!hasVisibleText && !hasThinking) {
       return null;
     }
     id = resolveActiveAssistantMessageId(sessionId, itemId);
+    const resolvedItemLifecycle = resolveTurnItemLifecycle(status);
     lifecycle = kind === 'assistant_final'
       ? MessageLifecycle.COMPLETED
-      : resolveTurnItemLifecycle(status);
+      : (activeTurnLiveContext ? MessageLifecycle.STREAMING : resolvedItemLifecycle);
     bridgeType = lifecycle === MessageLifecycle.COMPLETED ? 'unifiedComplete' : 'unifiedMessage';
-    blocks = [{ type: 'text', content: text, isMarkdown: true }];
+    blocks = buildAssistantTurnBlocks(
+      hasVisibleText ? assistantText : '',
+      itemId,
+      assistantThinking,
+      kind === 'assistant_final'
+        || (!activeTurnLiveContext
+          && kind === 'assistant_thinking'
+          && resolvedItemLifecycle === MessageLifecycle.COMPLETED),
+    );
+    if (!hasVisibleText && hasThinking) {
+      type = MessageType.THINKING;
+    }
     if (activeTurnLiveContext) {
       metadata.requestId = activeTurnLiveContext.requestId;
       metadata.userMessageId = activeTurnLiveContext.userMessageId;
@@ -964,6 +1064,12 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     if (typeof deltaText === 'string' && rawEntryId != null) {
       const entryId = typeof rawEntryId === 'number' ? rawEntryId : String(rawEntryId);
       applyStreamingDelta(entryId, deltaText, deltaSessionId || undefined);
+      if (activeTurnLiveContext && !activeTurnLiveContext.assistantMessageId) {
+        activeTurnLiveContext.assistantMessageId = `rust-timeline:${entryId}`;
+        if (activeTurnLiveContext.placeholderMessageId) {
+          markMessageComplete(activeTurnLiveContext.placeholderMessageId);
+        }
+      }
       emitMessage({ type: 'rustTaskEvent', eventType, payload: event.payload ?? {} } as ClientBridgeMessage);
       return;
     }
@@ -2140,6 +2246,8 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
     userMessageId,
     placeholderMessageId,
     assistantMessageId: '',
+    assistantThinkingContent: '',
+    assistantTextContent: '',
     route: null,
   };
   activeTurnInFlight = true;

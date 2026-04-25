@@ -11,11 +11,11 @@ use crate::{
     },
 };
 use magi_bridge_client::{
-    ChatMessage, ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest,
+    ChatMessage, ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest, ModelStreamingDelta,
 };
-use magi_core::{SessionId, UtcMillis, WorkspaceId};
-use magi_event_bus::InMemoryEventBus;
-use magi_session_store::SessionStore;
+use magi_core::{EventId, SessionId, UtcMillis, WorkspaceId};
+use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
+use magi_session_store::{SessionStore, TimelineEntryKind};
 use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
 use std::sync::Arc;
@@ -151,14 +151,46 @@ fn stream_session_turn_round(
         UtcMillis::now().0,
         round
     );
+    let thinking_item_id = format!(
+        "turn-item-assistant-thinking-{}-{}",
+        UtcMillis::now().0,
+        round
+    );
     let streamed_content = std::cell::RefCell::new(String::new());
-    let last_len = std::cell::Cell::new(0usize);
-    let on_delta = |accumulated: &str| {
-        let previous = last_len.get();
+    let streamed_thinking = std::cell::RefCell::new(String::new());
+    let last_content_len = std::cell::Cell::new(0usize);
+    let last_thinking_len = std::cell::Cell::new(0usize);
+    let on_delta = |delta: &ModelStreamingDelta| {
+        let accumulated_thinking = delta.thinking.as_str();
+        if accumulated_thinking.len() > last_thinking_len.get() {
+            last_thinking_len.set(accumulated_thinking.len());
+            {
+                let mut thinking = streamed_thinking.borrow_mut();
+                thinking.clear();
+                thinking.push_str(accumulated_thinking);
+            }
+            let item = session_turn_item(
+                "assistant_thinking",
+                "running",
+                Some("模型思考".to_string()),
+                Some(accumulated_thinking.to_string()),
+                Some(thinking_item_id.clone()),
+            );
+            upsert_session_turn_item(session_store, &request.session_id, item.clone());
+            publish_session_turn_item_event(
+                event_bus,
+                &request.session_id,
+                &request.workspace_id,
+                &item,
+            );
+        }
+
+        let accumulated = delta.content.as_str();
+        let previous = last_content_len.get();
         if accumulated.len() == previous {
             return;
         }
-        last_len.set(accumulated.len());
+        last_content_len.set(accumulated.len());
         {
             let mut content = streamed_content.borrow_mut();
             content.clear();
@@ -171,12 +203,32 @@ fn stream_session_turn_round(
             Some(accumulated.to_string()),
             Some(stream_item_id.clone()),
         );
-        upsert_session_turn_item(session_store, &request.session_id, item.clone());
-        publish_session_turn_item_event(
-            event_bus,
-            &request.session_id,
-            &request.workspace_id,
-            &item,
+        upsert_session_turn_item(session_store, &request.session_id, item);
+        session_store.upsert_timeline_entry(
+            request.session_id.clone(),
+            &stream_item_id,
+            TimelineEntryKind::AssistantMessage,
+            accumulated,
+        );
+        let delta = &accumulated[previous..];
+        if delta.is_empty() {
+            return;
+        }
+        let _ = event_bus.publish(
+            EventEnvelope::domain(
+                EventId::new(format!("event-session-delta-{}", UtcMillis::now().0)),
+                "task.llm.delta",
+                serde_json::json!({
+                    "session_id": request.session_id.to_string(),
+                    "entry_id": &stream_item_id,
+                    "delta": delta,
+                }),
+            )
+            .with_context(EventContext {
+                workspace_id: request.workspace_id.clone(),
+                session_id: Some(request.session_id.clone()),
+                ..EventContext::default()
+            }),
         );
     };
 
@@ -207,13 +259,36 @@ fn stream_session_turn_round(
         None,
     );
     let streamed_content = streamed_content.into_inner();
+    let streamed_thinking = streamed_thinking.into_inner();
+    let final_thinking = parsed
+        .thinking
+        .as_ref()
+        .filter(|thinking| !thinking.trim().is_empty())
+        .cloned()
+        .or_else(|| (!streamed_thinking.trim().is_empty()).then_some(streamed_thinking));
+    if let Some(thinking) = final_thinking {
+        let thinking_item = session_turn_item(
+            "assistant_thinking",
+            "completed",
+            Some("模型思考".to_string()),
+            Some(thinking),
+            Some(thinking_item_id.clone()),
+        );
+        upsert_session_turn_item(session_store, &request.session_id, thinking_item.clone());
+        publish_session_turn_item_event(
+            event_bus,
+            &request.session_id,
+            &request.workspace_id,
+            &thinking_item,
+        );
+    }
     if !streamed_content.trim().is_empty() {
         let stream_item = session_turn_item(
             "assistant_stream",
             "completed",
             Some("生成回复".to_string()),
             Some(streamed_content.clone()),
-            Some(stream_item_id),
+            Some(stream_item_id.clone()),
         );
         upsert_session_turn_item(session_store, &request.session_id, stream_item.clone());
         publish_session_turn_item_event(
@@ -221,6 +296,22 @@ fn stream_session_turn_round(
             &request.session_id,
             &request.workspace_id,
             &stream_item,
+        );
+        let _ = event_bus.publish(
+            EventEnvelope::domain(
+                EventId::new(format!("event-session-seal-{}", UtcMillis::now().0)),
+                "task.llm.completed",
+                serde_json::json!({
+                    "session_id": request.session_id.to_string(),
+                    "entry_id": &stream_item_id,
+                    "response_length": streamed_content.len(),
+                }),
+            )
+            .with_context(EventContext {
+                workspace_id: request.workspace_id.clone(),
+                session_id: Some(request.session_id.clone()),
+                ..EventContext::default()
+            }),
         );
     }
 

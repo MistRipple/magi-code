@@ -103,6 +103,7 @@ impl BaseAdapter {
 
         Ok(LlmResponse {
             content: payload.content.unwrap_or_default(),
+            thinking: payload.thinking,
             tool_calls: payload
                 .tool_calls
                 .into_iter()
@@ -137,6 +138,7 @@ impl BaseAdapter {
                     .map(|r: &RoundResult| r.response.clone())
                     .unwrap_or(LlmResponse {
                         content: "max rounds exceeded".to_string(),
+                        thinking: None,
                         tool_calls: Vec::new(),
                         usage: LlmUsage::default(),
                         stop_reason: "max_rounds".to_string(),

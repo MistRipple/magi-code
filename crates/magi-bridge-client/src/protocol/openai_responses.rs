@@ -99,6 +99,7 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
         let output = envelope["output"].as_array().cloned().unwrap_or_default();
 
         let mut text_parts = Vec::new();
+        let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
         for item in &output {
@@ -113,6 +114,9 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                             }
                         }
                     }
+                }
+                Some("reasoning") => {
+                    collect_response_reasoning_text(item, &mut thinking_parts);
                 }
                 Some("function_call") => {
                     if let (Some(id), Some(name)) =
@@ -158,6 +162,10 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
 
         Ok(AdaptedResponse {
             content: text_parts.join(""),
+            thinking: {
+                let thinking = thinking_parts.join("");
+                (!thinking.trim().is_empty()).then_some(thinking)
+            },
             tool_calls,
             usage,
             stop_reason,
@@ -167,6 +175,20 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
 
     fn max_output_tokens_field(&self) -> &str {
         "max_output_tokens"
+    }
+}
+
+fn collect_response_reasoning_text(item: &Value, thinking_parts: &mut Vec<String>) {
+    if let Some(text) = item["text"].as_str() {
+        thinking_parts.push(text.to_string());
+    }
+    let Some(summary) = item["summary"].as_array() else {
+        return;
+    };
+    for block in summary {
+        if let Some(text) = block["text"].as_str() {
+            thinking_parts.push(text.to_string());
+        }
     }
 }
 

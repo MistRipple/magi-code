@@ -1727,13 +1727,26 @@ function buildCurrentTurnArtifacts(
   const toolResultItemIds = new Set(
     [...toolItemsByCallId.values()].map((item) => normalizeString(item.item_id)),
   );
+  const latestAssistantThinkingByTurn = new Map<string, string>();
 
   const artifacts: TimelineProjectionArtifact[] = [];
   for (const item of items) {
     const kind = normalizeString(item.kind);
     const itemId = normalizeString(item.item_id);
+    const content = normalizeString(item.content) || normalizeString(item.title);
     if (!itemId) {
       continue;
+    }
+    if (kind === 'assistant_phase') {
+      continue;
+    }
+    if (kind === 'assistant_thinking') {
+      if (content) {
+        latestAssistantThinkingByTurn.set(turnId, content);
+      }
+      if (hasAssistantFinal) {
+        continue;
+      }
     }
     if (kind === 'assistant_stream' && hasAssistantFinal) {
       continue;
@@ -1747,9 +1760,9 @@ function buildCurrentTurnArtifacts(
     const timestamp = normalizeNumber(turn?.accepted_at, generatedAt) + normalizeNumber(item.item_seq, 0);
     const threadVisible = kind === 'user_message'
       || item.thread_visible === true
+      || kind === 'assistant_thinking'
       || kind === 'assistant_stream'
       || kind === 'assistant_final'
-      || kind === 'assistant_phase'
       || kind === 'tool_call_started'
       || kind === 'tool_call_result';
     const workerVisible = item.worker_visible === true || Boolean(workerId && laneId);
@@ -1758,17 +1771,35 @@ function buildCurrentTurnArtifacts(
     let type: Message['type'] = 'text';
     let source: Message['source'] = 'orchestrator';
     let blocks: ContentBlock[] | undefined;
-    const content = normalizeString(item.content) || normalizeString(item.title);
 
     if (kind === 'user_message') {
       role = 'user';
       type = 'user_input';
       source = 'user';
-    } else if (kind === 'assistant_phase') {
+    } else if (kind === 'assistant_thinking') {
+      type = 'thinking';
       blocks = [{
         type: 'thinking',
         content,
-        thinking: { content, isComplete: normalizeString(item.status) !== 'running' },
+        thinking: {
+          content,
+          isComplete: normalizeString(item.status) !== 'running',
+          blockId: `thinking:${itemId}`,
+        },
+      }];
+    } else if (kind === 'assistant_final' && latestAssistantThinkingByTurn.get(turnId)) {
+      const thinkingContent = latestAssistantThinkingByTurn.get(turnId) || '';
+      blocks = [{
+        type: 'thinking',
+        content: thinkingContent,
+        thinking: {
+          content: thinkingContent,
+          isComplete: true,
+          blockId: `thinking:${turnId}`,
+        },
+      }, {
+        type: 'text',
+        content,
       }];
     } else if (kind === 'tool_call_started' || kind === 'tool_call_result') {
       const toolName = normalizeString(item.tool_name) || normalizeString(item.title) || 'tool';

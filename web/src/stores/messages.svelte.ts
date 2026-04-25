@@ -536,7 +536,7 @@ function isAssistantTurnMessage(message: Message | undefined): boolean {
   const turnItemKind = messageTurnItemKind(message);
   return turnItemKind === 'assistant_stream'
     || turnItemKind === 'assistant_final'
-    || turnItemKind === 'assistant_phase';
+    || turnItemKind === 'assistant_thinking';
 }
 
 function isLocalAssistantEchoMessage(message: Message | undefined): boolean {
@@ -848,7 +848,7 @@ function isSessionTurnAssistantArtifact(artifact: TimelineProjectionArtifact): b
       : '';
     return turnItemKind === 'assistant_stream'
       || turnItemKind === 'assistant_final'
-      || turnItemKind === 'assistant_phase';
+      || turnItemKind === 'assistant_thinking';
   };
   if (isAssistantTurnMessage(artifact.message)) {
     return true;

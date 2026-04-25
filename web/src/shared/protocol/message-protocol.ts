@@ -161,6 +161,7 @@ export interface CodeBlock {
 export interface ThinkingBlock {
   type: 'thinking';
   content: string;
+  isComplete?: boolean;
   summary?: string;
   blockId?: string;
 }

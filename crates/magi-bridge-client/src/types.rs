@@ -141,12 +141,25 @@ pub struct ChatToolFunctionDefinition {
 pub struct ChatCompletionPayload {
     #[serde(default)]
     pub content: Option<String>,
+    #[serde(
+        default,
+        rename = "reasoning_content",
+        alias = "thinking",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub thinking: Option<String>,
     #[serde(default)]
     pub finish_reason: Option<String>,
     #[serde(default)]
     pub usage: Option<Value>,
     #[serde(default)]
     pub tool_calls: Vec<ChatToolCall>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelStreamingDelta {
+    pub content: String,
+    pub thinking: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -281,6 +294,7 @@ impl BridgeResponse {
         serde_json::from_str::<ChatCompletionPayload>(&self.payload).unwrap_or(
             ChatCompletionPayload {
                 content: Some(self.payload.clone()),
+                thinking: None,
                 finish_reason: None,
                 usage: None,
                 tool_calls: Vec::new(),
@@ -398,12 +412,12 @@ pub trait HostBridgeClient: Send + Sync {
 pub trait ModelBridgeClient: Send + Sync {
     fn invoke(&self, request: ModelInvocationRequest) -> Result<BridgeResponse, BridgeClientError>;
 
-    /// 流式调用 LLM，每次收到内容增量时调用 `on_delta` 回调并传入已累积的完整文本。
+    /// 流式调用 LLM，每次收到内容或 thinking 增量时调用 `on_delta` 回调并传入已累积快照。
     /// 默认实现回退到非流式 `invoke`。
     fn invoke_streaming(
         &self,
         request: ModelInvocationRequest,
-        _on_delta: &dyn Fn(&str),
+        _on_delta: &dyn Fn(&ModelStreamingDelta),
     ) -> Result<BridgeResponse, BridgeClientError> {
         self.invoke(request)
     }

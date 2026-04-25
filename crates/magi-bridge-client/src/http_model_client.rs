@@ -3,6 +3,7 @@ use crate::protocol::ProviderFamily;
 use crate::protocol::streaming::{SseLineParser, StreamAccumulator, parse_stream_event};
 use crate::types::{
     BridgeClientError, BridgeErrorLayer, BridgeResponse, ModelBridgeClient, ModelInvocationRequest,
+    ModelStreamingDelta,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -221,8 +222,8 @@ fn execute_http_post(
 
 /// 流式 HTTP 线程发回的消息类型。
 enum StreamMessage {
-    /// LLM 内容增量——携带已累积的完整文本。
-    Chunk(String),
+    /// LLM 增量快照——携带已累积的正文与上游 thinking。
+    Chunk(ModelStreamingDelta),
     /// HTTP I/O 结束——携带最终结果。
     Done(Result<(u16, String), BridgeClientError>),
 }
@@ -231,13 +232,13 @@ enum StreamMessage {
 ///
 /// HTTP I/O 在独立线程完成（与 `execute_http_post` 一致），避免在 tokio
 /// 异步运行时中创建 `reqwest::blocking::Client` 导致 panic。
-/// 增量文本通过 channel 发回调用线程，由 `on_chunk` 回调处理。
+/// 增量快照通过 channel 发回调用线程，由 `on_chunk` 回调处理。
 fn execute_streaming_http_post(
     url: String,
     body: serde_json::Value,
     api_key: Option<String>,
     provider_family: ProviderFamily,
-    on_chunk: &dyn Fn(&str),
+    on_chunk: &dyn Fn(&ModelStreamingDelta),
 ) -> Result<(u16, String), BridgeClientError> {
     let (tx, rx) = std::sync::mpsc::channel::<StreamMessage>();
 
@@ -250,8 +251,8 @@ fn execute_streaming_http_post(
     // 在调用线程上处理增量和最终结果
     for msg in rx {
         match msg {
-            StreamMessage::Chunk(accumulated_text) => {
-                on_chunk(&accumulated_text);
+            StreamMessage::Chunk(delta) => {
+                on_chunk(&delta);
             }
             StreamMessage::Done(result) => {
                 return result;
@@ -326,7 +327,8 @@ fn streaming_http_io(
     // 用于累积跨 read 调用的不完整 UTF-8 字节，防止多字节字符（如中文 3 字节）
     // 被 4096 buffer 边界切割后 lossy 替换为 U+FFFD 导致数据损坏。
     let mut utf8_remainder: Vec<u8> = Vec::new();
-    let mut last_delta_len = 0usize;
+    let mut last_content_delta_len = 0usize;
+    let mut last_thinking_delta_len = 0usize;
 
     loop {
         let bytes_read =
@@ -364,12 +366,22 @@ fn streaming_http_io(
             accumulator.apply_all(&llm_chunks);
         }
 
-        // 当内容有增长时通过 channel 发送增量
-        let accumulated = accumulator.accumulated_content();
-        if accumulated.len() > last_delta_len {
-            last_delta_len = accumulated.len();
+        // 当正文或上游 thinking 有增长时通过 channel 发送完整快照。
+        let accumulated_content = accumulator.accumulated_content();
+        let accumulated_thinking = accumulator.accumulated_thinking();
+        if accumulated_content.len() > last_content_delta_len
+            || accumulated_thinking.len() > last_thinking_delta_len
+        {
+            last_content_delta_len = accumulated_content.len();
+            last_thinking_delta_len = accumulated_thinking.len();
             // 若 receiver 已断开（调用方提前退出），静默忽略
-            if tx.send(StreamMessage::Chunk(accumulated.clone())).is_err() {
+            if tx
+                .send(StreamMessage::Chunk(ModelStreamingDelta {
+                    content: accumulated_content,
+                    thinking: accumulated_thinking,
+                }))
+                .is_err()
+            {
                 break;
             }
         }
@@ -516,7 +528,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
     fn invoke_streaming(
         &self,
         request: ModelInvocationRequest,
-        on_delta: &dyn Fn(&str),
+        on_delta: &dyn Fn(&ModelStreamingDelta),
     ) -> Result<BridgeResponse, BridgeClientError> {
         if request.prompt.trim().is_empty() && request.messages.is_none() {
             return Err(BridgeClientError::CallFailed {
@@ -637,21 +649,27 @@ struct OpenAiCompatibleChatChoice {
 
 impl OpenAiCompatibleChatChoice {
     fn into_payload(self, usage: Option<OpenAiCompatibleUsage>) -> OpenAiCompatibleSuccessPayload {
-        let (content, tool_calls) = match self.message {
-            Some(message) => (
-                message
-                    .content
-                    .map(OpenAiCompatibleMessageContent::into_text)
-                    .filter(|content| !content.trim().is_empty())
-                    .or(message.reasoning_content.filter(|s| !s.trim().is_empty()))
-                    .or(message.refusal),
-                message.tool_calls,
-            ),
-            None => (None, Vec::new()),
+        let (content, reasoning_content, tool_calls) = match self.message {
+            Some(message) => {
+                let reasoning_content = message
+                    .reasoning_content
+                    .filter(|content| !content.trim().is_empty());
+                (
+                    message
+                        .content
+                        .map(OpenAiCompatibleMessageContent::into_text)
+                        .filter(|content| !content.trim().is_empty())
+                        .or(message.refusal),
+                    reasoning_content,
+                    message.tool_calls,
+                )
+            }
+            None => (None, None, Vec::new()),
         };
 
         OpenAiCompatibleSuccessPayload {
             content: content.or(self.text),
+            reasoning_content,
             finish_reason: self.finish_reason,
             usage,
             tool_calls,
@@ -700,6 +718,8 @@ struct OpenAiCompatibleSuccessPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<OpenAiCompatibleUsage>,
@@ -709,11 +729,19 @@ struct OpenAiCompatibleSuccessPayload {
 
 impl OpenAiCompatibleSuccessPayload {
     fn into_bridge_payload(self) -> Result<String, String> {
-        if self.content.is_none() && self.tool_calls.is_empty() {
-            return Err("missing message.content/text or message.tool_calls".to_string());
+        if self.content.is_none() && self.reasoning_content.is_none() && self.tool_calls.is_empty()
+        {
+            return Err(
+                "missing message.content/text, message.reasoning_content or message.tool_calls"
+                    .to_string(),
+            );
         }
 
-        if self.finish_reason.is_none() && self.usage.is_none() && self.tool_calls.is_empty() {
+        if self.finish_reason.is_none()
+            && self.usage.is_none()
+            && self.reasoning_content.is_none()
+            && self.tool_calls.is_empty()
+        {
             return Ok(self.content.unwrap_or_default());
         }
 
@@ -894,6 +922,10 @@ fn select_openai_responses_bridge_payload(envelope: &serde_json::Value) -> Resul
         } else {
             Some(text_parts.join(""))
         },
+        reasoning_content: {
+            let reasoning = collect_responses_reasoning_text(output);
+            (!reasoning.trim().is_empty()).then_some(reasoning)
+        },
         finish_reason: envelope
             .get("status")
             .and_then(serde_json::Value::as_str)
@@ -904,6 +936,26 @@ fn select_openai_responses_bridge_payload(envelope: &serde_json::Value) -> Resul
         tool_calls,
     }
     .into_bridge_payload()
+}
+
+fn collect_responses_reasoning_text(output: &[serde_json::Value]) -> String {
+    let mut parts = Vec::new();
+    for item in output {
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("reasoning") {
+            continue;
+        }
+        if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
+            parts.push(text.to_string());
+        }
+        if let Some(summary) = item.get("summary").and_then(serde_json::Value::as_array) {
+            for block in summary {
+                if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
+                    parts.push(text.to_string());
+                }
+            }
+        }
+    }
+    parts.join("")
 }
 
 fn collect_responses_message_text(item: &serde_json::Value, text_parts: &mut Vec<String>) {
@@ -988,6 +1040,11 @@ fn adapted_response_to_bridge_payload(adapted: &AdaptedResponse) -> String {
         } else {
             Some(adapted.content.clone())
         },
+        reasoning_content: adapted
+            .thinking
+            .as_ref()
+            .filter(|thinking| !thinking.trim().is_empty())
+            .cloned(),
         finish_reason: Some(adapted.stop_reason.clone()),
         usage: Some(OpenAiCompatibleUsage {
             prompt_tokens: Some(adapted.usage.input_tokens),
@@ -1171,6 +1228,7 @@ mod tests {
     fn adapted_payload_preserves_cached_prompt_tokens() {
         let payload = adapted_response_to_bridge_payload(&AdaptedResponse {
             content: "hello".to_string(),
+            thinking: None,
             tool_calls: Vec::new(),
             usage: crate::llm_types::LlmUsage {
                 input_tokens: 10,

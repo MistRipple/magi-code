@@ -135,7 +135,7 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
         const blockId = typeof block.blockId === 'string' ? block.blockId : undefined;
         const thinking: ThinkingBlock = {
           content: typeof block.content === 'string' ? block.content : '',
-          isComplete: true,
+          isComplete: typeof block.isComplete === 'boolean' ? block.isComplete : true,
           summary: typeof block.summary === 'string' ? block.summary : undefined,
           blockId,
         };

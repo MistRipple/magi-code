@@ -237,7 +237,7 @@ export function sanitizeMessageBlocks(blocks: unknown, errorPrefix = '[MessagePa
         content,
         thinking: {
           content,
-          isComplete: true,
+          isComplete: typeof sanitized.isComplete === 'boolean' ? sanitized.isComplete : true,
           summary: typeof sanitized.summary === 'string' ? sanitized.summary : undefined,
           blockId,
         },

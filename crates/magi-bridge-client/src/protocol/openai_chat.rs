@@ -83,9 +83,12 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
         let content = message["content"]
             .as_str()
             .map(|s| s.to_string())
-            .or_else(|| message["reasoning_content"].as_str().map(|s| s.to_string()))
             .or_else(|| message["refusal"].as_str().map(|s| s.to_string()))
             .unwrap_or_default();
+        let thinking = message["reasoning_content"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned);
 
         let tool_calls = parse_openai_tool_calls(&message["tool_calls"]);
 
@@ -96,6 +99,7 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
 
         Ok(AdaptedResponse {
             content,
+            thinking,
             tool_calls,
             usage,
             stop_reason: finish_reason,

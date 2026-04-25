@@ -91,6 +91,7 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         let content_blocks = envelope["content"].as_array().cloned().unwrap_or_default();
 
         let mut text_parts = Vec::new();
+        let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
         for block in &content_blocks {
@@ -98,6 +99,11 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
                 Some("text") => {
                     if let Some(text) = block["text"].as_str() {
                         text_parts.push(text.to_string());
+                    }
+                }
+                Some("thinking") => {
+                    if let Some(thinking) = block["thinking"].as_str() {
+                        thinking_parts.push(thinking.to_string());
                     }
                 }
                 Some("tool_use") => {
@@ -124,6 +130,10 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
 
         Ok(AdaptedResponse {
             content: text_parts.join(""),
+            thinking: {
+                let thinking = thinking_parts.join("");
+                (!thinking.trim().is_empty()).then_some(thinking)
+            },
             tool_calls,
             usage,
             stop_reason,
