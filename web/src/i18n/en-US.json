@@ -764,6 +764,7 @@
   "tasks.deliveryStatus.skipped": "Acceptance skipped",
   "thinkingBlock.title": "Thinking Process",
   "thinkingBlock.defaultSummary": "Thinking...",
+  "thinkingBlock.completedSummary": "Thinking complete",
   "thinkingBlock.badge": "{count} steps",
   "toast.extractedAdrs": "Automatically extracted {count} architecture decision records",
   "toast.extractedFaqs": "Automatically extracted {count} FAQs",

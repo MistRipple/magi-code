@@ -759,6 +759,7 @@
   "tasks.deliveryStatus.skipped": "未验收",
   "thinkingBlock.title": "思考过程",
   "thinkingBlock.defaultSummary": "正在思考...",
+  "thinkingBlock.completedSummary": "思考已完成",
   "thinkingBlock.badge": "{count} 步",
   "toast.extractedAdrs": "自动提取了 {count} 条架构决策记录",
   "toast.extractedFaqs": "自动提取了 {count} 条常见问题",

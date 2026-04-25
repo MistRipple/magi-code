@@ -31,6 +31,7 @@
   // 生成摘要
   const summary = $derived.by(() => {
     if (!thinkingContent) return i18n.t('thinkingBlock.defaultSummary');
+    if (!isStreaming) return i18n.t('thinkingBlock.completedSummary');
     const plain = thinkingContent
       .replace(/[#*_`~\[\]()]/g, '')
       .replace(/\s+/g, ' ')
