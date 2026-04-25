@@ -87,7 +87,6 @@ pub(crate) struct NormalizedModelConfig {
     api_key: Option<String>,
     model: Option<String>,
     url_mode: ModelUrlMode,
-    url_mode_label: String,
     openai_protocol: Option<ModelOpenAiProtocol>,
     protocol_endpoint: Option<String>,
     reasoning_effort: Option<ModelReasoningEffort>,
@@ -108,7 +107,6 @@ impl NormalizedModelConfig {
             api_key: string_field(value, "apiKey"),
             model: string_field(value, "model"),
             url_mode: ModelUrlMode::from_label(&url_mode_label),
-            url_mode_label,
             openai_protocol: ModelOpenAiProtocol::from_label(&openai_protocol_label),
             protocol_endpoint: string_field(value, "protocolEndpoint"),
             reasoning_effort: value
@@ -128,22 +126,6 @@ impl NormalizedModelConfig {
 
     pub(crate) fn provider_key(&self) -> String {
         self.provider.trim().to_ascii_lowercase()
-    }
-
-    pub(crate) fn base_url(&self) -> Option<&str> {
-        self.base_url.as_deref()
-    }
-
-    pub(crate) fn api_key(&self) -> Option<&str> {
-        self.api_key.as_deref()
-    }
-
-    pub(crate) fn url_mode_label(&self) -> &str {
-        &self.url_mode_label
-    }
-
-    pub(crate) fn is_full_url_mode(&self) -> bool {
-        matches!(self.url_mode, ModelUrlMode::Full)
     }
 
     pub(crate) fn require_base_url(&self) -> Result<&str, ApiError> {
@@ -198,11 +180,7 @@ impl NormalizedModelConfig {
     }
 
     pub(crate) fn openai_models_url(&self) -> Result<String, ApiError> {
-        if matches!(self.url_mode, ModelUrlMode::Full) {
-            return Err(ApiError::InvalidInput(
-                "完整路径模式下不支持自动获取模型列表，请手动填写模型名".to_string(),
-            ));
-        }
+        self.require_openai_models_listable()?;
         let normalized = self.normalized_http_base_url()?;
         if normalized.ends_with("/models") {
             return Ok(normalized);
@@ -211,6 +189,15 @@ impl NormalizedModelConfig {
             return Ok(format!("{normalized}/models"));
         }
         Ok(format!("{normalized}/v1/models"))
+    }
+
+    pub(crate) fn require_openai_models_listable(&self) -> Result<(), ApiError> {
+        if matches!(self.url_mode, ModelUrlMode::Full) {
+            return Err(ApiError::InvalidInput(
+                "完整路径模式下不支持自动获取模型列表，请手动填写模型名".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn openai_probe_url(&self) -> Result<String, ApiError> {
@@ -317,9 +304,14 @@ mod tests {
         );
 
         assert_eq!(config.provider(), "anthropic");
-        assert_eq!(config.base_url(), Some("http://127.0.0.1:8320/"));
-        assert_eq!(config.api_key(), Some("test-key"));
-        assert_eq!(config.url_mode_label(), "standard");
+        assert_eq!(
+            config.require_base_url().expect("baseUrl"),
+            "http://127.0.0.1:8320/"
+        );
+        assert_eq!(config.require_api_key().expect("apiKey"), "test-key");
+        config
+            .require_openai_models_listable()
+            .expect("standard url mode can list models");
         assert_eq!(
             config.openai_models_url().expect("models url"),
             "http://127.0.0.1:8320/v1/models"

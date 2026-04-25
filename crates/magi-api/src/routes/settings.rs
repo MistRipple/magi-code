@@ -60,11 +60,7 @@ fn parse_fetch_models_config(
     let config = NormalizedModelConfig::from_settings_value(&request.config, "openai");
     config.require_base_url()?;
     config.require_api_key()?;
-    if config.is_full_url_mode() {
-        return Err(ApiError::InvalidInput(
-            "完整路径模式下不支持自动获取模型列表，请手动填写模型名".to_string(),
-        ));
-    }
+    config.require_openai_models_listable()?;
     Ok((config, request.target))
 }
 
@@ -1307,9 +1303,14 @@ mod tests {
         .expect("openai-compatible gateways may keep their provider label");
 
         assert_eq!(config.provider(), "anthropic");
-        assert_eq!(config.base_url(), Some("http://127.0.0.1:8320/"));
-        assert_eq!(config.api_key(), Some("test-key"));
-        assert_eq!(config.url_mode_label(), "standard");
+        assert_eq!(
+            config.require_base_url().expect("baseUrl"),
+            "http://127.0.0.1:8320/"
+        );
+        assert_eq!(config.require_api_key().expect("apiKey"), "test-key");
+        config
+            .require_openai_models_listable()
+            .expect("standard url mode can list models");
         assert_eq!(target, "orch");
     }
 
