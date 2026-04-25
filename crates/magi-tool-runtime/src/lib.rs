@@ -49,6 +49,30 @@ pub enum BuiltinToolName {
 }
 
 impl BuiltinToolName {
+    pub const ALL: [Self; 21] = [
+        Self::FileRead,
+        Self::FileWrite,
+        Self::FilePatch,
+        Self::FileRemove,
+        Self::FileMkdir,
+        Self::FileCopy,
+        Self::FileMove,
+        Self::SearchText,
+        Self::SearchSemantic,
+        Self::ShellExec,
+        Self::ProcessLaunch,
+        Self::ProcessRead,
+        Self::ProcessWrite,
+        Self::ProcessKill,
+        Self::ProcessList,
+        Self::ProcessInspect,
+        Self::DiffPreview,
+        Self::WebSearch,
+        Self::WebFetch,
+        Self::MermaidDiagram,
+        Self::KnowledgeQuery,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::FileRead => "file_read",
@@ -112,6 +136,274 @@ impl BuiltinToolName {
                 | Self::FileCopy
                 | Self::FileMove
         )
+    }
+
+    pub fn default_risk_level(&self) -> RiskLevel {
+        match self {
+            Self::FileRead
+            | Self::FileMkdir
+            | Self::SearchText
+            | Self::SearchSemantic
+            | Self::ProcessRead
+            | Self::ProcessList
+            | Self::DiffPreview
+            | Self::WebSearch
+            | Self::WebFetch
+            | Self::MermaidDiagram
+            | Self::KnowledgeQuery => RiskLevel::Low,
+            Self::FileWrite
+            | Self::FilePatch
+            | Self::FileCopy
+            | Self::FileMove
+            | Self::ProcessWrite => RiskLevel::Medium,
+            Self::FileRemove | Self::ShellExec | Self::ProcessLaunch => RiskLevel::High,
+            Self::ProcessKill | Self::ProcessInspect => RiskLevel::Medium,
+        }
+    }
+
+    pub fn default_approval_requirement(&self) -> ApprovalRequirement {
+        match self {
+            Self::FileRemove | Self::ShellExec | Self::ProcessLaunch => {
+                ApprovalRequirement::Required
+            }
+            _ => ApprovalRequirement::None,
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::FileRead => "Read the contents of a file at a given path",
+            Self::FileWrite => "Create or overwrite a file with the given content",
+            Self::FilePatch => "Apply targeted text replacements to a file (find-and-replace)",
+            Self::FileRemove => "Delete a file or directory",
+            Self::FileMkdir => "Create a directory (including parent directories)",
+            Self::FileCopy => "Copy a file or directory to a new location",
+            Self::FileMove => "Move or rename a file or directory",
+            Self::SearchText => "Search for text patterns in files within a directory",
+            Self::SearchSemantic => {
+                "Semantic code search: find code by natural language description"
+            }
+            Self::ShellExec => "Execute a shell command and return stdout/stderr",
+            Self::ProcessLaunch => "Launch a background process in the current session/workspace",
+            Self::ProcessRead => "Read stdout/stderr from a managed background process",
+            Self::ProcessWrite => "Write input to a managed background process",
+            Self::ProcessKill => "Stop a managed background process",
+            Self::ProcessList => "List managed background processes in the current context",
+            Self::ProcessInspect => "Inspect running processes by PID or name",
+            Self::DiffPreview => "Generate a unified diff between two text inputs",
+            Self::WebSearch => "Search the web using DuckDuckGo and return results",
+            Self::WebFetch => "Fetch content from a URL and convert HTML to markdown",
+            Self::MermaidDiagram => "Generate a Mermaid diagram from code",
+            Self::KnowledgeQuery => {
+                "Query project knowledge base: search README, docs, and code documentation"
+            }
+        }
+    }
+
+    pub fn parameters_schema(&self) -> serde_json::Value {
+        match self {
+            Self::FileRead => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute path to the file to read" },
+                    "max_bytes": { "type": "integer", "description": "Maximum number of bytes to read from a file preview" }
+                },
+                "required": ["path"]
+            }),
+            Self::FileWrite => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute path to the file to write" },
+                    "content": { "type": "string", "description": "Content to write to the file" },
+                    "overwrite": { "type": "boolean", "description": "Whether to overwrite existing file (default: true)" },
+                    "create_dirs": { "type": "boolean", "description": "Whether to create parent directories (default: true)" }
+                },
+                "required": ["path", "content"]
+            }),
+            Self::FilePatch => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute path to the file to patch" },
+                    "old_string": { "type": "string", "description": "Text to find (must match exactly once)" },
+                    "new_string": { "type": "string", "description": "Replacement text" },
+                    "patches": {
+                        "type": "array",
+                        "description": "Array of patches to apply (alternative to old_string/new_string)",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": { "type": "string" },
+                                "new_string": { "type": "string" }
+                            },
+                            "required": ["old_string", "new_string"]
+                        }
+                    }
+                },
+                "required": ["path"]
+            }),
+            Self::FileRemove => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute path to the file or directory to delete" },
+                    "recursive": { "type": "boolean", "description": "Whether to recursively delete directories (default: false)" }
+                },
+                "required": ["path"]
+            }),
+            Self::FileMkdir => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute path of the directory to create" }
+                },
+                "required": ["path"]
+            }),
+            Self::FileCopy => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "Absolute path of the source file or directory" },
+                    "destination": { "type": "string", "description": "Absolute path of the destination" },
+                    "overwrite": { "type": "boolean", "description": "Whether to overwrite if destination exists (default: false)" }
+                },
+                "required": ["source", "destination"]
+            }),
+            Self::FileMove => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "Absolute path of the source file or directory" },
+                    "destination": { "type": "string", "description": "Absolute path of the destination" },
+                    "overwrite": { "type": "boolean", "description": "Whether to overwrite if destination exists (default: false)" }
+                },
+                "required": ["source", "destination"]
+            }),
+            Self::SearchText => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "root": { "type": "string", "description": "Root directory to search in" },
+                    "query": { "type": "string", "description": "Text pattern to search for" },
+                    "limit": { "type": "integer", "description": "Maximum number of results" },
+                    "case_sensitive": { "type": "boolean", "description": "Whether the search is case sensitive" },
+                    "include_hidden": { "type": "boolean", "description": "Whether hidden files and directories are included" }
+                },
+                "required": ["root", "query"]
+            }),
+            Self::SearchSemantic => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Natural language description of the code to find" },
+                    "root": { "type": "string", "description": "Root directory to search in" },
+                    "limit": { "type": "integer", "description": "Maximum number of results (default: 10)" }
+                },
+                "required": ["query"]
+            }),
+            Self::ShellExec => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "Shell command to execute" },
+                    "cwd": { "type": "string", "description": "Working directory" },
+                    "shell": { "type": "string", "description": "Shell binary to use" },
+                    "timeout_ms": { "type": "integer", "description": "Execution timeout in milliseconds" },
+                    "background": { "type": "boolean", "description": "Launch in the background instead of waiting for completion" }
+                },
+                "required": ["command"]
+            }),
+            Self::ProcessLaunch => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "Shell command to launch in the background" },
+                    "cwd": { "type": "string", "description": "Working directory" },
+                    "shell": { "type": "string", "description": "Shell binary to use" }
+                },
+                "required": ["command"]
+            }),
+            Self::ProcessRead => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "terminal_id": { "type": "integer", "description": "Managed terminal/process ID" },
+                    "max_bytes": { "type": "integer", "description": "Maximum number of bytes to preview from stdout/stderr" }
+                },
+                "required": ["terminal_id"]
+            }),
+            Self::ProcessWrite => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "terminal_id": { "type": "integer", "description": "Managed terminal/process ID" },
+                    "input": { "type": "string", "description": "Text to write to the process stdin" },
+                    "content": { "type": "string", "description": "Alias for input" },
+                    "text": { "type": "string", "description": "Alias for input" }
+                },
+                "required": ["terminal_id"]
+            }),
+            Self::ProcessKill => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "terminal_id": { "type": "integer", "description": "Managed terminal/process ID" }
+                },
+                "required": ["terminal_id"]
+            }),
+            Self::ProcessList => serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+            Self::ProcessInspect => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pid": { "type": "string", "description": "Process ID to inspect" },
+                    "query": { "type": "string", "description": "Process name or search query" },
+                    "name": { "type": "string", "description": "Alias for query" },
+                    "pattern": { "type": "string", "description": "Alias for query" },
+                    "limit": { "type": "integer", "description": "Maximum number of matches" }
+                }
+            }),
+            Self::DiffPreview => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "before": { "type": "string", "description": "Original text" },
+                    "after": { "type": "string", "description": "Modified text" },
+                    "before_path": { "type": "string", "description": "Path to the original file" },
+                    "after_path": { "type": "string", "description": "Path to the updated file" },
+                    "before_label": { "type": "string", "description": "Label for the original side" },
+                    "after_label": { "type": "string", "description": "Label for the updated side" },
+                    "left": { "type": "string", "description": "Alias for before" },
+                    "right": { "type": "string", "description": "Alias for after" },
+                    "left_path": { "type": "string", "description": "Alias for before_path" },
+                    "right_path": { "type": "string", "description": "Alias for after_path" },
+                    "left_label": { "type": "string", "description": "Alias for before_label" },
+                    "right_label": { "type": "string", "description": "Alias for after_label" }
+                },
+                "required": ["before", "after"]
+            }),
+            Self::WebSearch => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query keywords" }
+                },
+                "required": ["query"]
+            }),
+            Self::WebFetch => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "URL to fetch content from" },
+                    "prompt": { "type": "string", "description": "Optional prompt or extraction hint for the fetched page" }
+                },
+                "required": ["url"]
+            }),
+            Self::MermaidDiagram => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "code": { "type": "string", "description": "Mermaid diagram code" },
+                    "title": { "type": "string", "description": "Optional diagram title" },
+                    "theme": { "type": "string", "description": "Diagram theme (default: default)" }
+                },
+                "required": ["code"]
+            }),
+            Self::KnowledgeQuery => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Natural language query to search project documentation" },
+                    "category": { "type": "string", "description": "Knowledge category: all, readme, docs, code (default: all)" }
+                },
+                "required": ["query"]
+            }),
+        }
     }
 }
 
@@ -252,122 +544,12 @@ impl ToolRegistry {
     }
 
     pub fn register_default_builtins(&mut self) {
-        let tools: &[(BuiltinToolName, RiskLevel, ApprovalRequirement)] = &[
-            // 文件系统
-            (
-                BuiltinToolName::FileRead,
-                RiskLevel::Low,
-                ApprovalRequirement::None,
-            ),
-            (
-                BuiltinToolName::FileWrite,
-                RiskLevel::Medium,
-                ApprovalRequirement::None,
-            ),
-            (
-                BuiltinToolName::FilePatch,
-                RiskLevel::Medium,
-                ApprovalRequirement::None,
-            ),
-            (
-                BuiltinToolName::FileRemove,
-                RiskLevel::High,
-                ApprovalRequirement::Required,
-            ),
-            (
-                BuiltinToolName::FileMkdir,
-                RiskLevel::Low,
-                ApprovalRequirement::None,
-            ),
-            (
-                BuiltinToolName::FileCopy,
-                RiskLevel::Medium,
-                ApprovalRequirement::None,
-            ),
-            (
-                BuiltinToolName::FileMove,
-                RiskLevel::Medium,
-                ApprovalRequirement::None,
-            ),
-            // 搜索
-            (
-                BuiltinToolName::SearchText,
-                RiskLevel::Low,
-                ApprovalRequirement::None,
-            ),
-            (
-                BuiltinToolName::SearchSemantic,
-                RiskLevel::Low,
-                ApprovalRequirement::None,
-            ),
-            // Shell / 进程
-            (
-                BuiltinToolName::ShellExec,
-                RiskLevel::High,
-                ApprovalRequirement::Required,
-            ),
-            (
-                BuiltinToolName::ProcessLaunch,
-                RiskLevel::High,
-                ApprovalRequirement::Required,
-            ),
-            (
-                BuiltinToolName::ProcessRead,
-                RiskLevel::Low,
-                ApprovalRequirement::None,
-            ),
-            (
-                BuiltinToolName::ProcessWrite,
-                RiskLevel::Medium,
-                ApprovalRequirement::None,
-            ),
-            (
-                BuiltinToolName::ProcessKill,
-                RiskLevel::Medium,
-                ApprovalRequirement::None,
-            ),
-            (
-                BuiltinToolName::ProcessList,
-                RiskLevel::Low,
-                ApprovalRequirement::None,
-            ),
-            (
-                BuiltinToolName::ProcessInspect,
-                RiskLevel::Medium,
-                ApprovalRequirement::None,
-            ),
-            // Diff
-            (
-                BuiltinToolName::DiffPreview,
-                RiskLevel::Low,
-                ApprovalRequirement::None,
-            ),
-            // Web
-            (
-                BuiltinToolName::WebSearch,
-                RiskLevel::Low,
-                ApprovalRequirement::None,
-            ),
-            (
-                BuiltinToolName::WebFetch,
-                RiskLevel::Low,
-                ApprovalRequirement::None,
-            ),
-            // 可视化
-            (
-                BuiltinToolName::MermaidDiagram,
-                RiskLevel::Low,
-                ApprovalRequirement::None,
-            ),
-            // 知识库
-            (
-                BuiltinToolName::KnowledgeQuery,
-                RiskLevel::Low,
-                ApprovalRequirement::None,
-            ),
-        ];
-        for &(name, risk, approval) in tools {
-            self.register_builtin(Arc::new(NormalizedBuiltinTool::new(name, risk, approval)));
+        for name in BuiltinToolName::ALL {
+            self.register_builtin(Arc::new(NormalizedBuiltinTool::new(
+                name,
+                name.default_risk_level(),
+                name.default_approval_requirement(),
+            )));
         }
     }
 
@@ -665,29 +847,7 @@ mod tests {
     }
 
     fn all_builtin_tools() -> [BuiltinToolName; 21] {
-        [
-            BuiltinToolName::FileRead,
-            BuiltinToolName::FileWrite,
-            BuiltinToolName::FilePatch,
-            BuiltinToolName::FileRemove,
-            BuiltinToolName::FileMkdir,
-            BuiltinToolName::FileCopy,
-            BuiltinToolName::FileMove,
-            BuiltinToolName::SearchText,
-            BuiltinToolName::SearchSemantic,
-            BuiltinToolName::ShellExec,
-            BuiltinToolName::ProcessLaunch,
-            BuiltinToolName::ProcessRead,
-            BuiltinToolName::ProcessWrite,
-            BuiltinToolName::ProcessKill,
-            BuiltinToolName::ProcessList,
-            BuiltinToolName::ProcessInspect,
-            BuiltinToolName::DiffPreview,
-            BuiltinToolName::WebSearch,
-            BuiltinToolName::WebFetch,
-            BuiltinToolName::MermaidDiagram,
-            BuiltinToolName::KnowledgeQuery,
-        ]
+        BuiltinToolName::ALL
     }
 
     #[test]
@@ -1801,6 +1961,10 @@ mod tests {
             .to_string(),
         );
         assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).unwrap();
+        assert_eq!(payload["tool"], BuiltinToolName::FileWrite.as_str());
+        assert_eq!(payload["created"], true);
+        assert_eq!(payload["overwritten"], false);
         assert_eq!(fs::read_to_string(&file).unwrap(), "hello world");
 
         let output2 = exec_tool(
@@ -1813,6 +1977,9 @@ mod tests {
             .to_string(),
         );
         assert_eq!(output2.status, ExecutionResultStatus::Succeeded);
+        let payload2: Value = serde_json::from_str(&output2.payload).unwrap();
+        assert_eq!(payload2["created"], false);
+        assert_eq!(payload2["overwritten"], true);
         assert_eq!(fs::read_to_string(&file).unwrap(), "updated");
     }
 

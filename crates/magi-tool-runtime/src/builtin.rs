@@ -1113,7 +1113,7 @@ fn execute_file_write(input: &str) -> String {
         Some(obj) => obj,
         None => {
             return builtin_error(
-                "file.write",
+                "file_write",
                 "输入必须为 JSON 对象，包含 path 和 content 字段",
             );
         }
@@ -1121,24 +1121,25 @@ fn execute_file_write(input: &str) -> String {
 
     let path_input = match field_string(&request, &["path", "file_path"]) {
         Some(p) => p,
-        None => return builtin_error("file.write", "缺少 path 字段"),
+        None => return builtin_error("file_write", "缺少 path 字段"),
     };
     let content = match field_string(&request, &["content", "text", "data"]) {
         Some(c) => c,
-        None => return builtin_error("file.write", "缺少 content 字段"),
+        None => return builtin_error("file_write", "缺少 content 字段"),
     };
 
     let path = match resolve_path(&path_input) {
         Ok(p) => p,
-        Err(e) => return builtin_error("file.write", e),
+        Err(e) => return builtin_error("file_write", e),
     };
 
     let overwrite = field_bool(&request, &["overwrite", "force"]).unwrap_or(true);
     let create_dirs = field_bool(&request, &["create_dirs", "mkdir"]).unwrap_or(true);
+    let existed_before = path.exists();
 
-    if path.exists() && !overwrite {
+    if existed_before && !overwrite {
         return builtin_error(
-            "file.write",
+            "file_write",
             format!("文件已存在且 overwrite=false: {}", path.display()),
         );
     }
@@ -1147,7 +1148,7 @@ fn execute_file_write(input: &str) -> String {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
                 if let Err(e) = fs::create_dir_all(parent) {
-                    return builtin_error("file.write", format!("创建父目录失败: {e}"));
+                    return builtin_error("file_write", format!("创建父目录失败: {e}"));
                 }
             }
         }
@@ -1155,16 +1156,17 @@ fn execute_file_write(input: &str) -> String {
 
     let bytes = content.len();
     if let Err(e) = fs::write(&path, &content) {
-        return builtin_error("file.write", format!("写入文件失败: {e}"));
+        return builtin_error("file_write", format!("写入文件失败: {e}"));
     }
 
     serde_json::json!({
-        "tool": "file.write",
+        "tool": "file_write",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ExplicitWrite.as_str(),
         "path": path.display().to_string(),
         "bytes_written": bytes,
-        "created": !path.exists() || overwrite,
+        "created": !existed_before,
+        "overwritten": existed_before,
         "summary": format!("已写入 {} ({} 字节)", path.display(), bytes)
     })
     .to_string()
@@ -1173,21 +1175,21 @@ fn execute_file_write(input: &str) -> String {
 fn execute_file_patch(input: &str) -> String {
     let request = match parse_json_object(input) {
         Some(obj) => obj,
-        None => return builtin_error("file.patch", "输入必须为 JSON 对象"),
+        None => return builtin_error("file_patch", "输入必须为 JSON 对象"),
     };
 
     let path_input = match field_string(&request, &["path", "file_path"]) {
         Some(p) => p,
-        None => return builtin_error("file.patch", "缺少 path 字段"),
+        None => return builtin_error("file_patch", "缺少 path 字段"),
     };
     let path = match resolve_path(&path_input) {
         Ok(p) => p,
-        Err(e) => return builtin_error("file.patch", e),
+        Err(e) => return builtin_error("file_patch", e),
     };
 
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(e) => return builtin_error("file.patch", format!("读取文件失败: {e}")),
+        Err(e) => return builtin_error("file_patch", format!("读取文件失败: {e}")),
     };
 
     let patches: Vec<(String, String)> =
@@ -1212,13 +1214,13 @@ fn execute_file_patch(input: &str) -> String {
             vec![(old, new)]
         } else {
             return builtin_error(
-                "file.patch",
+                "file_patch",
                 "缺少 patches 数组或 old_string/new_string 字段",
             );
         };
 
     if patches.is_empty() {
-        return builtin_error("file.patch", "patches 为空");
+        return builtin_error("file_patch", "patches 为空");
     }
 
     let mut result = content.clone();
@@ -1244,7 +1246,7 @@ fn execute_file_patch(input: &str) -> String {
 
     if applied == 0 {
         return serde_json::json!({
-            "tool": "file.patch",
+            "tool": "file_patch",
             "status": "failed",
             "access_mode": BuiltinToolAccessMode::ExplicitWrite.as_str(),
             "path": path.display().to_string(),
@@ -1257,11 +1259,11 @@ fn execute_file_patch(input: &str) -> String {
     }
 
     if let Err(e) = fs::write(&path, &result) {
-        return builtin_error("file.patch", format!("写回文件失败: {e}"));
+        return builtin_error("file_patch", format!("写回文件失败: {e}"));
     }
 
     serde_json::json!({
-        "tool": "file.patch",
+        "tool": "file_patch",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ExplicitWrite.as_str(),
         "path": path.display().to_string(),
@@ -1280,12 +1282,12 @@ fn execute_file_remove(input: &str) -> String {
         .and_then(|obj| field_string(obj, &["path", "file_path"]))
         .unwrap_or_else(|| input.trim().to_string());
     if path_input.is_empty() {
-        return builtin_error("file.remove", "缺少文件路径");
+        return builtin_error("file_remove", "缺少文件路径");
     }
 
     let path = match resolve_path(&path_input) {
         Ok(p) => p,
-        Err(e) => return builtin_error("file.remove", e),
+        Err(e) => return builtin_error("file_remove", e),
     };
 
     let recursive = request
@@ -1294,7 +1296,7 @@ fn execute_file_remove(input: &str) -> String {
         .unwrap_or(false);
 
     if !path.exists() {
-        return builtin_error("file.remove", format!("路径不存在: {}", path.display()));
+        return builtin_error("file_remove", format!("路径不存在: {}", path.display()));
     }
 
     let is_dir = path.is_dir();
@@ -1309,11 +1311,11 @@ fn execute_file_remove(input: &str) -> String {
     };
 
     if let Err(e) = result {
-        return builtin_error("file.remove", format!("删除失败: {e}"));
+        return builtin_error("file_remove", format!("删除失败: {e}"));
     }
 
     serde_json::json!({
-        "tool": "file.remove",
+        "tool": "file_remove",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ExplicitWrite.as_str(),
         "path": path.display().to_string(),
@@ -1331,18 +1333,18 @@ fn execute_file_mkdir(input: &str) -> String {
         .and_then(|obj| field_string(obj, &["path", "dir_path"]))
         .unwrap_or_else(|| input.trim().to_string());
     if path_input.is_empty() {
-        return builtin_error("file.mkdir", "缺少目录路径");
+        return builtin_error("file_mkdir", "缺少目录路径");
     }
 
     let path = match resolve_path(&path_input) {
         Ok(p) => p,
-        Err(e) => return builtin_error("file.mkdir", e),
+        Err(e) => return builtin_error("file_mkdir", e),
     };
 
     if path.exists() {
         if path.is_dir() {
             return serde_json::json!({
-                "tool": "file.mkdir",
+                "tool": "file_mkdir",
                 "status": "succeeded",
                 "access_mode": BuiltinToolAccessMode::ExplicitWrite.as_str(),
                 "path": path.display().to_string(),
@@ -1352,17 +1354,17 @@ fn execute_file_mkdir(input: &str) -> String {
             .to_string();
         }
         return builtin_error(
-            "file.mkdir",
+            "file_mkdir",
             format!("路径已存在且不是目录: {}", path.display()),
         );
     }
 
     if let Err(e) = fs::create_dir_all(&path) {
-        return builtin_error("file.mkdir", format!("创建目录失败: {e}"));
+        return builtin_error("file_mkdir", format!("创建目录失败: {e}"));
     }
 
     serde_json::json!({
-        "tool": "file.mkdir",
+        "tool": "file_mkdir",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ExplicitWrite.as_str(),
         "path": path.display().to_string(),
@@ -1377,7 +1379,7 @@ fn execute_file_copy(input: &str) -> String {
         Some(obj) => obj,
         None => {
             return builtin_error(
-                "file.copy",
+                "file_copy",
                 "输入必须为 JSON 对象，包含 source 和 destination 字段",
             );
         }
@@ -1385,31 +1387,31 @@ fn execute_file_copy(input: &str) -> String {
 
     let src_input = match field_string(&request, &["source", "src", "from"]) {
         Some(p) => p,
-        None => return builtin_error("file.copy", "缺少 source 字段"),
+        None => return builtin_error("file_copy", "缺少 source 字段"),
     };
     let dst_input = match field_string(&request, &["destination", "dst", "dest", "to"]) {
         Some(p) => p,
-        None => return builtin_error("file.copy", "缺少 destination 字段"),
+        None => return builtin_error("file_copy", "缺少 destination 字段"),
     };
 
     let src = match resolve_path(&src_input) {
         Ok(p) => p,
-        Err(e) => return builtin_error("file.copy", e),
+        Err(e) => return builtin_error("file_copy", e),
     };
     let dst = match resolve_path(&dst_input) {
         Ok(p) => p,
-        Err(e) => return builtin_error("file.copy", e),
+        Err(e) => return builtin_error("file_copy", e),
     };
 
     let overwrite = field_bool(&request, &["overwrite", "force"]).unwrap_or(false);
 
     if !src.exists() {
-        return builtin_error("file.copy", format!("源路径不存在: {}", src.display()));
+        return builtin_error("file_copy", format!("源路径不存在: {}", src.display()));
     }
 
     if dst.exists() && !overwrite {
         return builtin_error(
-            "file.copy",
+            "file_copy",
             format!("目标路径已存在且 overwrite=false: {}", dst.display()),
         );
     }
@@ -1417,23 +1419,23 @@ fn execute_file_copy(input: &str) -> String {
     if let Some(parent) = dst.parent() {
         if !parent.exists() {
             if let Err(e) = fs::create_dir_all(parent) {
-                return builtin_error("file.copy", format!("创建目标父目录失败: {e}"));
+                return builtin_error("file_copy", format!("创建目标父目录失败: {e}"));
             }
         }
     }
 
     if src.is_dir() {
         if let Err(e) = copy_dir_recursive(&src, &dst) {
-            return builtin_error("file.copy", format!("复制目录失败: {e}"));
+            return builtin_error("file_copy", format!("复制目录失败: {e}"));
         }
     } else {
         if let Err(e) = fs::copy(&src, &dst) {
-            return builtin_error("file.copy", format!("复制文件失败: {e}"));
+            return builtin_error("file_copy", format!("复制文件失败: {e}"));
         }
     }
 
     serde_json::json!({
-        "tool": "file.copy",
+        "tool": "file_copy",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ExplicitWrite.as_str(),
         "source": src.display().to_string(),
@@ -1463,7 +1465,7 @@ fn execute_file_move(input: &str) -> String {
         Some(obj) => obj,
         None => {
             return builtin_error(
-                "file.move",
+                "file_move",
                 "输入必须为 JSON 对象，包含 source 和 destination 字段",
             );
         }
@@ -1471,31 +1473,31 @@ fn execute_file_move(input: &str) -> String {
 
     let src_input = match field_string(&request, &["source", "src", "from"]) {
         Some(p) => p,
-        None => return builtin_error("file.move", "缺少 source 字段"),
+        None => return builtin_error("file_move", "缺少 source 字段"),
     };
     let dst_input = match field_string(&request, &["destination", "dst", "dest", "to"]) {
         Some(p) => p,
-        None => return builtin_error("file.move", "缺少 destination 字段"),
+        None => return builtin_error("file_move", "缺少 destination 字段"),
     };
 
     let src = match resolve_path(&src_input) {
         Ok(p) => p,
-        Err(e) => return builtin_error("file.move", e),
+        Err(e) => return builtin_error("file_move", e),
     };
     let dst = match resolve_path(&dst_input) {
         Ok(p) => p,
-        Err(e) => return builtin_error("file.move", e),
+        Err(e) => return builtin_error("file_move", e),
     };
 
     let overwrite = field_bool(&request, &["overwrite", "force"]).unwrap_or(false);
 
     if !src.exists() {
-        return builtin_error("file.move", format!("源路径不存在: {}", src.display()));
+        return builtin_error("file_move", format!("源路径不存在: {}", src.display()));
     }
 
     if dst.exists() && !overwrite {
         return builtin_error(
-            "file.move",
+            "file_move",
             format!("目标路径已存在且 overwrite=false: {}", dst.display()),
         );
     }
@@ -1503,7 +1505,7 @@ fn execute_file_move(input: &str) -> String {
     if let Some(parent) = dst.parent() {
         if !parent.exists() {
             if let Err(e) = fs::create_dir_all(parent) {
-                return builtin_error("file.move", format!("创建目标父目录失败: {e}"));
+                return builtin_error("file_move", format!("创建目标父目录失败: {e}"));
             }
         }
     }
@@ -1519,23 +1521,23 @@ fn execute_file_move(input: &str) -> String {
     if let Err(_) = fs::rename(&src, &dst) {
         if src.is_dir() {
             if let Err(e) = copy_dir_recursive(&src, &dst) {
-                return builtin_error("file.move", format!("跨设备移动目录失败: {e}"));
+                return builtin_error("file_move", format!("跨设备移动目录失败: {e}"));
             }
             if let Err(e) = fs::remove_dir_all(&src) {
-                return builtin_error("file.move", format!("删除源目录失败: {e}"));
+                return builtin_error("file_move", format!("删除源目录失败: {e}"));
             }
         } else {
             if let Err(e) = fs::copy(&src, &dst) {
-                return builtin_error("file.move", format!("跨设备移动文件失败: {e}"));
+                return builtin_error("file_move", format!("跨设备移动文件失败: {e}"));
             }
             if let Err(e) = fs::remove_file(&src) {
-                return builtin_error("file.move", format!("删除源文件失败: {e}"));
+                return builtin_error("file_move", format!("删除源文件失败: {e}"));
             }
         }
     }
 
     serde_json::json!({
-        "tool": "file.move",
+        "tool": "file_move",
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ExplicitWrite.as_str(),
         "source": src.display().to_string(),
