@@ -126,7 +126,10 @@ function normalizeIncomingEdits(state: AppState): Edit[] {
 }
 
 
-function handleStateUpdate(message: ClientBridgeMessage) {
+function handleStateUpdate(
+  message: ClientBridgeMessage,
+  options: { preserveLocalProcessing?: boolean } = {},
+) {
   const state = message.state as AppState;
   if (!state) return;
   const incomingSessionId = typeof state.currentSessionId === 'string' ? state.currentSessionId.trim() : '';
@@ -170,7 +173,9 @@ function handleStateUpdate(message: ClientBridgeMessage) {
   };
 
   setAppState(mergedState);
-  applyAuthoritativeProcessingState(state.processingState ?? null);
+  if (!options.preserveLocalProcessing) {
+    applyAuthoritativeProcessingState(state.processingState ?? null);
+  }
   if (state.sessions) {
     updateSessions(ensureArray(state.sessions) as Session[]);
   }
@@ -771,6 +776,32 @@ function findAssistantByThreadOrder(
   return undefined;
 }
 
+function oldestRequestBindingCreatedAt(): number | null {
+  let oldest: number | null = null;
+  for (const binding of listRequestBindings()) {
+    if (typeof binding.createdAt !== 'number' || !Number.isFinite(binding.createdAt)) {
+      continue;
+    }
+    oldest = oldest === null ? binding.createdAt : Math.min(oldest, binding.createdAt);
+  }
+  return oldest;
+}
+
+function isAuthoritativeSnapshotOlderThanLocalTurn(
+  state: AppState,
+  timelineProjection: SessionTimelineProjection,
+): boolean {
+  const oldestBindingCreatedAt = oldestRequestBindingCreatedAt();
+  if (oldestBindingCreatedAt === null) {
+    return false;
+  }
+  const snapshotUpdatedAt = Math.max(
+    typeof state.stateUpdatedAt === 'number' && Number.isFinite(state.stateUpdatedAt) ? state.stateUpdatedAt : 0,
+    typeof timelineProjection.updatedAt === 'number' && Number.isFinite(timelineProjection.updatedAt) ? timelineProjection.updatedAt : 0,
+  );
+  return snapshotUpdatedAt > 0 && snapshotUpdatedAt < oldestBindingCreatedAt;
+}
+
 function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): void {
   const currentSessionId = getState().currentSessionId || '';
   if (!sessionId || !currentSessionId || currentSessionId !== sessionId) {
@@ -872,7 +903,17 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       if (sessions.length > 0) {
         updateSessions(sessions);
       }
-      // 运行态同步：只更新 authoritative snapshot 与非时间轴补充数据。
+      const hadLiveTurnBeforeSnapshot = messagesState.pendingRequests.size > 0
+        || messagesState.activeMessageIds.size > 0;
+      const authoritativeSnapshotIsIdle = state.isProcessing !== true
+        && state.processingState?.isProcessing !== true;
+      const projectionConfirmsLocalAssistant = timelineProjectionConfirmsLocalAssistantResponse(timelineProjection);
+      const authoritativeSnapshotIsOlderThanLocalTurn = isAuthoritativeSnapshotOlderThanLocalTurn(state, timelineProjection);
+      const preserveLocalProcessing = hadLiveTurnBeforeSnapshot
+        && authoritativeSnapshotIsIdle
+        && !projectionConfirmsLocalAssistant
+        && authoritativeSnapshotIsOlderThanLocalTurn;
+
       handleStateUpdate({
         ...message,
         state: {
@@ -880,10 +921,14 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
           currentSessionId: sessionId,
           sessions: sessions.length > 0 ? sessions : state.sessions,
         },
-      });
-      replaceOrchestratorRuntimeState(
-        (snapshot.orchestratorRuntimeState as OrchestratorRuntimeState | null | undefined) ?? null,
-      );
+      }, { preserveLocalProcessing });
+
+      if (!preserveLocalProcessing) {
+        replaceOrchestratorRuntimeState(
+          (snapshot.orchestratorRuntimeState as OrchestratorRuntimeState | null | undefined) ?? null,
+        );
+      }
+
       if (snapshot.notifications) {
         applySessionNotifications(sessionId, snapshot.notifications.notifications);
       }
@@ -893,20 +938,11 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         beforeCursor,
         isLoadingBefore: false,
       });
-      const hasLiveTurn = messagesState.pendingRequests.size > 0 || messagesState.activeMessageIds.size > 0;
-      const authoritativeSnapshotIsIdle = state.isProcessing !== true
-        && state.processingState?.isProcessing !== true;
-      const canAuthoritativeProjectionSettleLiveTurn = (
-        hasLiveTurn
-        && (
-          authoritativeSnapshotIsIdle
-          || timelineProjectionConfirmsLocalAssistantResponse(timelineProjection)
-        )
-      );
-      if (!hasLiveTurn || canAuthoritativeProjectionSettleLiveTurn) {
+
+      if (!hadLiveTurnBeforeSnapshot || !preserveLocalProcessing) {
         prependTimelineProjectionPage(sessionId, timelineProjection);
         reconcileRequestBindingsFromAuthoritativeThread(sessionId);
-        if (authoritativeSnapshotIsIdle) {
+        if (authoritativeSnapshotIsIdle && !preserveLocalProcessing) {
           settleAuthoritativeIdleState();
         }
       }

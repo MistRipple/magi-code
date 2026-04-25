@@ -48,6 +48,7 @@
   }: Props = $props();
 
   let collapsed = $state(untrack(() => !initialExpanded && name !== 'mermaid_diagram'));
+  let lastStatus = $state(untrack(() => status));
   let copySuccess = $state(false);
 
   interface ParsedToolIdentity {
@@ -84,6 +85,20 @@
       displayName: toolName,
     };
   }
+
+  $effect(() => {
+    if (status === lastStatus) {
+      return;
+    }
+    lastStatus = status;
+    if (status === 'running' || status === 'pending' || status === 'error') {
+      collapsed = false;
+      return;
+    }
+    if (name !== 'mermaid_diagram') {
+      collapsed = true;
+    }
+  });
 
   // 格式化内容
   function formatContent(content: unknown): string {

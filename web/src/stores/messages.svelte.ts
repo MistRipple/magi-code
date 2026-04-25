@@ -1228,7 +1228,9 @@ function normalizeSessionNotificationRecord(raw: unknown): Notification | null {
   const timestamp = typeof item.createdAt === 'number' && Number.isFinite(item.createdAt)
     ? item.createdAt
     : Date.now();
-  const read = Boolean(item.read);
+  const read = typeof item.read === 'boolean'
+    ? item.read
+    : Boolean(item.handled);
   const title = typeof item.title === 'string' ? item.title : undefined;
   const source = typeof item.source === 'string' ? item.source : undefined;
   const actionRequired = typeof item.actionRequired === 'boolean' ? item.actionRequired : undefined;

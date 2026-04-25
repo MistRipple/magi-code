@@ -406,6 +406,7 @@
       const rawPayload = await loadAgentSessionTimelinePage(sessionId, {
         limit: HISTORY_PAGE_SIZE,
         beforeCursor: historyState.beforeCursor,
+        workspaceId: readStoredBrowserWorkspaceBinding().workspaceId,
       });
       if ((messagesState.currentSessionId || '').trim() !== sessionId) {
         return;

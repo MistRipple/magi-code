@@ -127,6 +127,51 @@ interface RustSessionRuntimeSummary {
   has_recoverable_chain?: boolean;
   recoverable_branch_count?: number;
   active_branches?: RustSessionRuntimeBranchSummary[];
+  current_turn?: RustSessionRuntimeTurnSummary | null;
+  turn_items?: RustSessionRuntimeTurnItemSummary[];
+  worker_lanes?: RustSessionRuntimeTurnLaneSummary[];
+}
+
+interface RustSessionRuntimeTurnSummary {
+  turn_id?: string;
+  turn_seq?: number;
+  accepted_at?: number | null;
+  status?: string | null;
+  user_message?: string | null;
+}
+
+interface RustSessionRuntimeTurnItemSummary {
+  item_id?: string;
+  item_seq?: number;
+  lane_id?: string | null;
+  lane_seq?: number | null;
+  kind?: string;
+  status?: string;
+  source?: string;
+  title?: string | null;
+  content?: string | null;
+  task_id?: string | null;
+  worker_id?: string | null;
+  role_id?: string | null;
+  tool_call_id?: string | null;
+  tool_name?: string | null;
+  tool_status?: string | null;
+  tool_arguments?: unknown;
+  tool_result?: string | null;
+  tool_error?: string | null;
+  thread_visible?: boolean;
+  worker_visible?: boolean;
+}
+
+interface RustSessionRuntimeTurnLaneSummary {
+  lane_id?: string;
+  lane_seq?: number;
+  task_id?: string;
+  worker_id?: string;
+  role_id?: string | null;
+  title?: string;
+  status?: string;
+  is_primary?: boolean;
 }
 
 interface RustSessionRuntimeBranchSummary {
@@ -416,6 +461,19 @@ function normalizeSessionRuntimeEntries(
               : undefined,
             is_primary: branch.is_primary === true,
           }))
+        : [],
+      current_turn: normalizeObjectRecord(entry.current_turn) as RustSessionRuntimeTurnSummary | null,
+      turn_items: Array.isArray(entry.turn_items)
+        ? entry.turn_items
+          .map((item) => normalizeObjectRecord(item))
+          .filter((item): item is Record<string, unknown> => item !== null)
+          .map((item) => item as RustSessionRuntimeTurnItemSummary)
+        : [],
+      worker_lanes: Array.isArray(entry.worker_lanes)
+        ? entry.worker_lanes
+          .map((lane) => normalizeObjectRecord(lane))
+          .filter((lane): lane is Record<string, unknown> => lane !== null)
+          .map((lane) => lane as RustSessionRuntimeTurnLaneSummary)
         : [],
     }));
 }
@@ -1522,6 +1580,243 @@ function buildDispatchArtifacts(
   return artifacts;
 }
 
+function buildProjectionRenderEntries(
+  artifacts: TimelineProjectionArtifact[],
+  displayContext: 'thread' | 'worker',
+  workerId?: string,
+): Array<{ entryId: string; artifactId: string }> {
+  return artifacts
+    .filter((artifact) => displayContext === 'thread'
+      ? artifact.threadVisible
+      : Boolean(workerId && artifact.workerTabs.includes(workerId)))
+    .map((artifact) => ({
+      entryId: `artifact:${artifact.artifactId}`,
+      artifactId: artifact.artifactId,
+    }));
+}
+
+function buildWorkerRenderEntriesFromArtifacts(
+  artifacts: TimelineProjectionArtifact[],
+): Record<string, Array<{ entryId: string; artifactId: string }>> {
+  const workers = new Set<string>();
+  for (const artifact of artifacts) {
+    for (const workerId of artifact.workerTabs) {
+      if (workerId) {
+        workers.add(workerId);
+      }
+    }
+  }
+  return Object.fromEntries(
+    [...workers].map((workerId) => [
+      workerId,
+      buildProjectionRenderEntries(artifacts, 'worker', workerId),
+    ]),
+  );
+}
+
+function turnItemStatusToToolStatus(status: string): 'pending' | 'running' | 'success' | 'error' {
+  const normalized = status.toLowerCase();
+  if (normalized.includes('fail') || normalized.includes('error') || normalized.includes('cancel')) {
+    return 'error';
+  }
+  if (normalized.includes('running') || normalized.includes('pending')) {
+    return normalized.includes('running') ? 'running' : 'pending';
+  }
+  return 'success';
+}
+
+function turnWorkerStatusToLaneStatus(status: string): DispatchGroupLane['status'] {
+  switch (status.toLowerCase()) {
+    case 'running':
+    case 'verifying':
+    case 'repairing':
+      return 'running';
+    case 'blocked':
+    case 'awaiting_approval':
+      return 'awaiting_approval';
+    case 'completed':
+    case 'skipped':
+      return 'completed';
+    case 'failed':
+      return 'failed';
+    case 'cancelled':
+      return 'cancelled';
+    default:
+      return 'pending';
+  }
+}
+
+function buildCurrentTurnArtifacts(
+  sessionId: string,
+  runtimeReadModel: RustRuntimeReadModelDto | undefined,
+  generatedAt: number,
+): TimelineProjectionArtifact[] {
+  const session = normalizeSessionRuntimeEntries(runtimeReadModel)
+    .find((entry) => normalizeString(entry.session_id) === sessionId);
+  const turn = session?.current_turn;
+  const turnId = normalizeString(turn?.turn_id);
+  if (!turnId) {
+    return [];
+  }
+  const items = Array.isArray(session?.turn_items)
+    ? session.turn_items
+      .filter((item) => normalizeString(item.item_id).length > 0)
+      .sort((left, right) => normalizeNumber(left.item_seq, 0) - normalizeNumber(right.item_seq, 0))
+    : [];
+  if (items.length === 0) {
+    return [];
+  }
+  const finalItemIds = new Set(
+    items
+      .filter((item) => normalizeString(item.kind) === 'assistant_final')
+      .map((item) => normalizeString(item.item_id)),
+  );
+  const hasAssistantFinal = finalItemIds.size > 0;
+  const workerLaneById = new Map(
+    (Array.isArray(session?.worker_lanes) ? session.worker_lanes : [])
+      .map((lane) => [normalizeString(lane.lane_id), lane] as const)
+      .filter(([laneId]) => laneId.length > 0),
+  );
+  const toolItemsByCallId = new Map<string, RustSessionRuntimeTurnItemSummary>();
+  for (const item of items) {
+    const kind = normalizeString(item.kind);
+    if (kind !== 'tool_call_started' && kind !== 'tool_call_result') {
+      continue;
+    }
+    const toolCallId = normalizeString(item.tool_call_id) || normalizeString(item.item_id);
+    const current = toolItemsByCallId.get(toolCallId);
+    if (!current || kind === 'tool_call_result') {
+      toolItemsByCallId.set(toolCallId, item);
+    }
+  }
+  const toolResultItemIds = new Set(
+    [...toolItemsByCallId.values()].map((item) => normalizeString(item.item_id)),
+  );
+
+  const artifacts: TimelineProjectionArtifact[] = [];
+  for (const item of items) {
+    const kind = normalizeString(item.kind);
+    const itemId = normalizeString(item.item_id);
+    if (!itemId) {
+      continue;
+    }
+    if (kind === 'assistant_stream' && hasAssistantFinal) {
+      continue;
+    }
+    if ((kind === 'tool_call_started' || kind === 'tool_call_result') && !toolResultItemIds.has(itemId)) {
+      continue;
+    }
+    const laneId = normalizeString(item.lane_id);
+    const workerId = normalizeString(item.worker_id)
+      || normalizeString(workerLaneById.get(laneId)?.worker_id);
+    const timestamp = normalizeNumber(turn?.accepted_at, generatedAt) + normalizeNumber(item.item_seq, 0);
+    const threadVisible = kind === 'user_message'
+      || item.thread_visible === true
+      || kind === 'assistant_stream'
+      || kind === 'assistant_final'
+      || kind === 'assistant_phase'
+      || kind === 'tool_call_started'
+      || kind === 'tool_call_result';
+    const workerVisible = item.worker_visible === true || Boolean(workerId && laneId);
+    const workerTabs = workerVisible && workerId ? [workerId] : [];
+    let role: Message['role'] = 'assistant';
+    let type: Message['type'] = 'text';
+    let source: Message['source'] = 'orchestrator';
+    let blocks: ContentBlock[] | undefined;
+    const content = normalizeString(item.content) || normalizeString(item.title);
+
+    if (kind === 'user_message') {
+      role = 'user';
+      type = 'user_input';
+      source = 'user';
+    } else if (kind === 'assistant_phase') {
+      blocks = [{
+        type: 'thinking',
+        content,
+        thinking: { content, isComplete: normalizeString(item.status) !== 'running' },
+      }];
+    } else if (kind === 'tool_call_started' || kind === 'tool_call_result') {
+      const toolName = normalizeString(item.tool_name) || normalizeString(item.title) || 'tool';
+      const status = turnItemStatusToToolStatus(normalizeString(item.tool_status) || normalizeString(item.status));
+      blocks = [{
+        type: 'tool_call',
+        content: '',
+        toolCall: {
+          id: normalizeString(item.tool_call_id) || itemId,
+          name: toolName,
+          arguments: item.tool_arguments && typeof item.tool_arguments === 'object'
+            ? item.tool_arguments as Record<string, unknown>
+            : {},
+          status,
+          result: normalizeString(item.tool_result) || undefined,
+          error: normalizeString(item.tool_error) || undefined,
+        },
+      }];
+    } else if (kind.startsWith('worker_') && workerId) {
+      const lane = workerLaneById.get(laneId);
+      const laneTitle = normalizeString(lane?.title) || normalizeString(item.title) || workerId;
+      blocks = [{
+        type: 'dispatch_group',
+        content: '',
+        blockId: `turn-worker-${itemId}`,
+        dispatchWaveId: turnId,
+        status: turnWorkerStatusToLaneStatus(normalizeString(item.status)),
+        summaryText: laneTitle,
+        lanes: [{
+          laneId: laneId || `lane-${workerId}`,
+          laneVersion: 1,
+          worker: workerId,
+          title: laneTitle,
+          status: turnWorkerStatusToLaneStatus(normalizeString(lane?.status) || normalizeString(item.status)),
+          tasks: [{
+            taskId: normalizeString(item.task_id) || normalizeString(lane?.task_id),
+            title: laneTitle,
+            status: turnWorkerStatusToLaneStatus(normalizeString(lane?.status) || normalizeString(item.status)),
+            isCurrent: true,
+            seq: normalizeNumber(item.lane_seq, 0),
+          }],
+          jumpTarget: { workerTabId: workerId },
+        }],
+      }];
+    }
+
+    const artifactId = `turn:${turnId}:${itemId}`;
+    artifacts.push({
+      artifactId,
+      kind: kind.includes('tool') ? 'tool' : 'message',
+      displayOrder: normalizeNumber(turn?.turn_seq, 0) * 1000 + normalizeNumber(item.item_seq, 0),
+      anchorEventSeq: 0,
+      latestEventSeq: 0,
+      cardStreamSeq: normalizeNumber(item.item_seq, 0),
+      timestamp,
+      laneId: laneId || undefined,
+      worker: workerId || undefined,
+      threadVisible,
+      workerTabs,
+      messageIds: [artifactId],
+      message: createRustTimelineMessage({
+        id: artifactId,
+        content,
+        timestamp,
+        sessionId,
+        eventSeq: 0,
+        role,
+        type,
+        blocks,
+        source,
+        metadata: {
+          turnId,
+          turnItemId: itemId,
+          turnItemKind: kind,
+          laneId: laneId || undefined,
+          workerId: workerId || undefined,
+        },
+      }),
+    });
+  }
+  return artifacts;
+}
+
 function summarizeRustEvent(event: RustEventEnvelope): string {
   const eventType = normalizeString(event.event_type);
   const payload = event.payload || {};
@@ -1851,6 +2146,22 @@ function buildTimelineProjection(
   generatedAt: number,
   payload: RustBootstrapDto,
 ): SessionTimelineProjection {
+  const currentTurnArtifacts = buildCurrentTurnArtifacts(sessionId, payload.runtimeReadModel, generatedAt);
+  if (currentTurnArtifacts.length > 0) {
+    const maxItemSeq = currentTurnArtifacts.reduce(
+      (max, artifact) => Math.max(max, artifact.cardStreamSeq),
+      0,
+    );
+    return {
+      schemaVersion: 'session-timeline-projection.v2',
+      sessionId,
+      updatedAt: generatedAt,
+      lastAppliedEventSeq: maxItemSeq,
+      artifacts: currentTurnArtifacts,
+      threadRenderEntries: buildProjectionRenderEntries(currentTurnArtifacts, 'thread'),
+      workerRenderEntries: buildWorkerRenderEntriesFromArtifacts(currentTurnArtifacts),
+    };
+  }
   const recentEvents = Array.isArray(payload.recentEvents)
     ? payload.recentEvents.map((event) => normalizeEventEnvelope(event)).filter((event): event is RustEventEnvelope => event !== null)
     : [];
@@ -1908,9 +2219,10 @@ export function normalizeRustBootstrapPayload(
   const sessions = normalizeRustSessions(payload, generatedAt);
   const selectedSessionId = normalizeString(options.sessionId)
     || normalizeString(payload.currentSession?.sessionId)
-    || sessions[0]?.id
     || '';
-  const currentSession = sessions.find((session) => session.id === selectedSessionId) ?? sessions[0];
+  const currentSession = selectedSessionId
+    ? sessions.find((session) => session.id === selectedSessionId)
+    : undefined;
   const workspace = resolveSelectedWorkspace(payload, options);
   const normalizedEvents = Array.isArray(payload.recentEvents)
     ? payload.recentEvents.map((event) => normalizeEventEnvelope(event)).filter((event): event is RustEventEnvelope => event !== null)

@@ -50,16 +50,15 @@ import {
   removeAgentInstructionSkill,
   renameAgentSession,
   resetAgentExecutionStats,
-  resetAgentUserRules,
   saveAgentCurrentSession,
   saveAgentAuxiliaryConfig,
   saveAgentOrchestratorConfig,
   saveAgentUserRules,
   saveAgentSafeguardConfig,
   saveAgentSkillsConfig,
-    saveAgentWorkerConfig,
-  submitAgentSessionAction,
-    revertAgentChange,
+  saveAgentWorkerConfig,
+  submitSessionTurn,
+  revertAgentChange,
   revertAgentExecutionGroupChanges,
   revertAllAgentChanges,
   testAgentAuxiliaryConnection,
@@ -116,8 +115,13 @@ import {
 import { RustDaemonClient } from '../rust-daemon-client';
 import {
   applyStreamingDelta,
+  dequeueQueuedMessage,
+  enqueueQueuedMessage,
+  markQueuedMessageAsGuide,
+  messagesState,
   sealStreamingDelta,
 } from '../../stores/messages.svelte';
+import type { QueuedMessage } from '../../types/message';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
 let bridgeListenerRegistered = false;
@@ -128,6 +132,8 @@ let currentInterruptTaskId = '';
 let currentRuntimeEpoch = '';
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
 let cachedSettingsBootstrapScope: 'none' | 'core' | 'full' = 'none';
+let queueDrainTimer: ReturnType<typeof setTimeout> | null = null;
+let queueDrainActive = false;
 /** 传输层维护的 SSE 连接句柄（统一管理 Web EventSource 和宿主代理两种模式） */
 let activeSseConnection: SseConnection | null = null;
 let activeEventStreamKey = '';
@@ -146,6 +152,9 @@ let recoveryAttempt = 0;
 let recoveryTimer: number | null = null;
 let recoveryInFlight: Promise<void> | null = null;
 let rustEventBootstrapRefreshTimer: number | null = null;
+// 活跃 turn 标记：从前端创建本地 live turn 到 session.turn.completed/failed 期间为 true。
+// 活跃期间禁止 SSE 事件触发 fetchBootstrap 轮询，仅允许终结事件做最终状态对齐。
+let activeTurnInFlight = false;
 
 const RECOVERY_BASE_DELAY_MS = 1000;
 const RECOVERY_MAX_DELAY_MS = 10_000;
@@ -514,6 +523,7 @@ function emitForcedProcessingIdle(reason: string, extra?: Record<string, unknown
     timestamp: Date.now(),
     ...(extra || {}),
   });
+  scheduleQueuedTurnDrain('forced_idle');
 }
 
 function emitRecoveringState(reason: string, error?: unknown): void {
@@ -711,6 +721,12 @@ function shouldRefreshFromRustEvent(event: RustEventEnvelope): boolean {
   return true;
 }
 
+// turn 终结事件：收到后结束活跃 turn，触发最终 bootstrap 对齐
+const TURN_TERMINAL_EVENTS = new Set([
+  'session.turn.completed',
+  'session.turn.failed',
+]);
+
 function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   if (!shouldRefreshFromRustEvent(event)) {
     return;
@@ -726,13 +742,12 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     if (typeof deltaText === 'string' && rawEntryId != null) {
       const entryId = typeof rawEntryId === 'number' ? rawEntryId : String(rawEntryId);
       applyStreamingDelta(entryId, deltaText, deltaSessionId || undefined);
-      // delta 事件仍然通知 task-graph 等轻量监听器
       emitMessage({ type: 'rustTaskEvent', eventType, payload: event.payload ?? {} } as ClientBridgeMessage);
-      return; // 跳过 fetchBootstrap
+      return;
     }
   }
 
-  // ── 流式完成事件：标记 streaming 结束 ──
+  // ── 流式完成事件：封口流式节点，不触发 bootstrap ──
   if (eventType === 'task.llm.completed' && event.payload) {
     const rawCompletedEntryId = event.payload.entry_id;
     if (rawCompletedEntryId != null) {
@@ -741,7 +756,9 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
         : String(rawCompletedEntryId);
       sealStreamingDelta(completedEntryId);
     }
-    // 完成事件仍需触发 bootstrap 以同步最终状态，继续走下方逻辑
+    // 封口后不触发 bootstrap——最终状态对齐由 session.turn.completed 负责
+    emitMessage({ type: 'rustTaskEvent', eventType, payload: event.payload ?? {} } as ClientBridgeMessage);
+    return;
   }
 
   if (eventType === 'session.action.accepted' && event.payload) {
@@ -762,7 +779,16 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       }
     }
   }
-  scheduleBootstrapRefreshFromRustEvent(eventType || 'rust_event');
+
+  // ── turn 终结事件：结束活跃 turn，触发最终 bootstrap 状态对齐 ──
+  if (TURN_TERMINAL_EVENTS.has(eventType)) {
+    activeTurnInFlight = false;
+    scheduleBootstrapRefreshFromRustEvent(eventType);
+  } else if (!activeTurnInFlight) {
+    // 非活跃 turn 期间，保持原有行为
+    scheduleBootstrapRefreshFromRustEvent(eventType || 'rust_event');
+  }
+  // 活跃 turn 期间的非终结事件：不触发 bootstrap，依赖增量事件更新 UI
 
   // Notify listeners about task-domain SSE events so lightweight stores
   // (e.g. task-graph-store) can react without waiting for a full bootstrap refresh.
@@ -772,8 +798,6 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   if (isTaskGraphRelevantEvent) {
     emitMessage({ type: 'rustTaskEvent', eventType, payload: event.payload ?? {} } as ClientBridgeMessage);
 
-    // Emit a data message for task status changes so data-message-handlers
-    // can inject system messages into the chat (e.g. Completed / Failed).
     if (eventType === 'task.status.changed' && event.payload) {
       emitDataMessage('taskStatusChanged', {
         taskId: event.payload.task_id ?? event.payload.taskId ?? '',
@@ -926,20 +950,24 @@ function resolveWorkspaceQuery(): { workspaceId: string; workspacePath: string; 
     ? (window as unknown as { __INITIAL_SESSION_ID__?: string }).__INITIAL_SESSION_ID__?.trim() || ''
     : '';
   const storedBinding = readStoredBrowserWorkspaceBinding();
-  const workspaceId = currentUrl?.searchParams.get('workspaceId')?.trim()
+  const queryWorkspaceId = currentUrl?.searchParams.get('workspaceId')?.trim() || '';
+  const queryWorkspacePath = currentUrl?.searchParams.get('workspacePath')?.trim() || '';
+  const querySessionId = currentUrl?.searchParams.get('sessionId')?.trim() || '';
+  const queryHasWorkspaceBinding = Boolean(queryWorkspaceId || queryWorkspacePath);
+  const workspaceId = queryWorkspaceId
     || currentWorkspaceId
     || injectedBinding.workspaceId
     || storedBinding.workspaceId
     || '';
-  const workspacePath = currentUrl?.searchParams.get('workspacePath')?.trim()
+  const workspacePath = queryWorkspacePath
     || currentWorkspacePath
     || injectedBinding.workspacePath
     || storedBinding.workspacePath
     || '';
-  const sessionId = currentUrl?.searchParams.get('sessionId')?.trim()
-    || currentSessionId
-    || injectedSessionId
-    || storedBinding.sessionId
+  const sessionId = querySessionId
+    || (queryHasWorkspaceBinding ? '' : currentSessionId)
+    || (queryHasWorkspaceBinding ? '' : injectedSessionId)
+    || (queryHasWorkspaceBinding ? '' : storedBinding.sessionId)
     || '';
   return { workspaceId, workspacePath, sessionId };
 }
@@ -995,6 +1023,50 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
   }
 }
 
+function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string): void {
+  const normalizedWorkspaceId = workspaceId.trim();
+  const normalizedWorkspacePath = workspacePath.trim();
+  currentWorkspaceId = normalizedWorkspaceId;
+  currentWorkspacePath = normalizedWorkspacePath;
+  currentSessionId = '';
+  clearCurrentInterruptTaskId();
+  clearTaskGraph();
+  persistStoredBrowserWorkspaceBinding({
+    workspaceId: normalizedWorkspaceId,
+    workspacePath: normalizedWorkspacePath,
+    sessionId: '',
+  });
+
+  const currentUrl = getCurrentUrl();
+  if (!currentUrl) {
+    return;
+  }
+  const nextUrl = new URL(currentUrl.toString());
+  if (normalizedWorkspaceId) {
+    nextUrl.searchParams.set('workspaceId', normalizedWorkspaceId);
+  } else {
+    nextUrl.searchParams.delete('workspaceId');
+  }
+  if (normalizedWorkspacePath) {
+    nextUrl.searchParams.set('workspacePath', normalizedWorkspacePath);
+  } else {
+    nextUrl.searchParams.delete('workspacePath');
+  }
+  nextUrl.searchParams.delete('sessionId');
+  if (nextUrl.toString() !== currentUrl.toString()) {
+    window.history.replaceState(window.history.state, '', nextUrl);
+  }
+}
+
+function dispatchWorkspaceSessionCleared(workspaceId: string, workspacePath: string): void {
+  closeEventStream();
+  clearWorkspaceSessionBinding(workspaceId, workspacePath);
+  emitDataMessage('workspaceSessionCleared', {
+    workspaceId: workspaceId.trim(),
+    workspacePath: workspacePath.trim(),
+  });
+}
+
 function clearPersistedWorkspaceBinding(): void {
   currentWorkspaceId = '';
   currentWorkspacePath = '';
@@ -1032,6 +1104,8 @@ function dispatchEmptyWorkspaceState(): void {
 
 function closeEventStream(): void {
   clearEventStreamOpenTimeout();
+  // SSE 断开后无法接收增量事件，结束活跃 turn 防护
+  activeTurnInFlight = false;
   if (activeSseConnection) {
     activeSseConnection.close();
     activeSseConnection = null;
@@ -1254,6 +1328,9 @@ async function dispatchBootstrap(
       console.warn('[web-client-bridge] Auto-connect task tracking on bootstrap failed (non-critical):', error);
     });
   }
+  if ((payload.state as { isProcessing?: boolean } | undefined)?.isProcessing !== true) {
+    scheduleQueuedTurnDrain('bootstrap_idle');
+  }
 }
 
 async function fetchBootstrap(
@@ -1272,6 +1349,10 @@ async function fetchBootstrap(
   }
   const doFetch = async (): Promise<void> => {
     const { workspaceId, workspacePath, sessionId } = resolveWorkspaceQuery();
+    if ((workspaceId || workspacePath) && !sessionId) {
+      dispatchWorkspaceSessionCleared(workspaceId, workspacePath);
+      return;
+    }
     const query = new URLSearchParams();
     if (workspaceId) {
       query.set('workspaceId', workspaceId);
@@ -1446,6 +1527,9 @@ async function dispatchSessionSnapshot(
     reportExpectedRecoveryFailure('事件流连接', '[web-client-bridge] 会话快照后事件流连接失败:', error);
     scheduleRecovery('session_snapshot_event_stream_connect', error, true);
   });
+  if ((payload.state as { isProcessing?: boolean } | undefined)?.isProcessing !== true) {
+    scheduleQueuedTurnDrain('session_snapshot_idle');
+  }
 }
 
 async function loadLatestSessionSnapshot(
@@ -1454,6 +1538,7 @@ async function loadLatestSessionSnapshot(
 ): Promise<void> {
   const rawPayload = await loadAgentSessionTimelinePage(sessionId, {
     limit: SESSION_TIMELINE_PAGE_SIZE,
+    workspaceId: options.workspaceId || currentWorkspaceId,
   });
   const targetWorkspaceId = typeof options.workspaceId === 'string' && options.workspaceId.trim()
     ? options.workspaceId.trim()
@@ -1675,10 +1760,90 @@ interface ExecuteTaskInput {
   requestId?: string;
   deepTask: boolean;
   skillName?: string | null;
+  followUpMode?: 'queue' | 'guide';
   images: Array<{
     name: string;
     dataUrl: string;
   }>;
+}
+
+function bridgeRuntimeIsBusy(): boolean {
+  return Boolean(
+    messagesState.isProcessing
+      || messagesState.backendProcessing
+      || messagesState.pendingRequests.size > 0
+      || messagesState.activeMessageIds.size > 0,
+  );
+}
+
+function emitQueuedUserMessage(queued: QueuedMessage): void {
+  const userMessage = createUserInputMessage(queued.content, `queued-user-${queued.id}`, {
+    id: `queued-user-${queued.id}`,
+    metadata: {
+      requestId: queued.id,
+      extra: {
+        queued: true,
+        queueMode: queued.mode || 'queue',
+      },
+      images: queued.images && queued.images.length > 0 ? queued.images : undefined,
+    },
+  });
+  emitMessage({ type: 'unifiedMessage', message: userMessage });
+}
+
+function enqueueFollowUpTurn(input: ExecuteTaskInput, normalizedText: string, mode: 'queue' | 'guide' = 'queue'): void {
+  const queued: QueuedMessage = {
+    id: input.requestId || generateMessageId(),
+    requestId: input.requestId,
+    content: normalizedText || input.skillName || '后续消息',
+    text: input.text ?? null,
+    createdAt: Date.now(),
+    mode,
+    deepTask: input.deepTask,
+    skillName: input.skillName ?? null,
+    images: input.images,
+  };
+  enqueueQueuedMessage(queued);
+  emitQueuedUserMessage(queued);
+}
+
+function scheduleQueuedTurnDrain(reason: string): void {
+  if (queueDrainTimer) {
+    clearTimeout(queueDrainTimer);
+  }
+  queueDrainTimer = setTimeout(() => {
+    queueDrainTimer = null;
+    void drainQueuedTurns(reason);
+  }, 120);
+}
+
+async function drainQueuedTurns(_reason: string): Promise<void> {
+  if (queueDrainActive || bridgeRuntimeIsBusy()) {
+    return;
+  }
+  const next = dequeueQueuedMessage();
+  if (!next) {
+    return;
+  }
+  queueDrainActive = true;
+  try {
+    await executeTask({
+      text: next.text ?? next.content,
+      requestId: next.requestId || next.id,
+      deepTask: next.deepTask === true,
+      skillName: next.skillName ?? null,
+      images: next.images ?? [],
+    });
+  } finally {
+    queueDrainActive = false;
+  }
+}
+
+function guideQueuedTurn(queuedMessageId: string): void {
+  if (!markQueuedMessageAsGuide(queuedMessageId)) {
+    return;
+  }
+  scheduleQueuedTurnDrain('guide_queued_message');
 }
 
 async function executeTask(input: ExecuteTaskInput): Promise<void> {
@@ -1696,6 +1861,14 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
       }))
     : [];
   if (!normalizedText && !skillName && images.length === 0) {
+    return;
+  }
+  if (input.followUpMode === 'queue' && bridgeRuntimeIsBusy() && !queueDrainActive) {
+    enqueueFollowUpTurn(
+      { ...input, skillName, images },
+      normalizedText,
+      'queue',
+    );
     return;
   }
 
@@ -1735,10 +1908,11 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
     startedAt: Date.now(),
     pendingRequestIds: [requestId],
   });
+  activeTurnInFlight = true;
 
   try {
     await ensureFreshLiveBridge('execute_task_preflight');
-    const actionResult = await submitAgentSessionAction({
+    const turnResult = await submitSessionTurn({
       text,
       deepTask: input.deepTask,
       skillName,
@@ -1748,22 +1922,31 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
       workspacePath: currentWorkspacePath,
       sessionId: currentSessionId,
     });
-    const resolvedSessionId = typeof actionResult.sessionId === 'string' && actionResult.sessionId.trim()
-      ? actionResult.sessionId.trim()
+    const resolvedSessionId = typeof turnResult.sessionId === 'string' && turnResult.sessionId.trim()
+      ? turnResult.sessionId.trim()
       : currentSessionId;
     if (resolvedSessionId) {
       persistWorkspaceBinding(currentWorkspaceId, currentWorkspacePath, resolvedSessionId);
     }
-    emitBridgeSuccessToast('发送消息', '任务已提交', { displayMode: 'notification_center' });
+    const successMessage = turnResult.route === 'task'
+      ? '任务已提交'
+      : turnResult.route === 'continue'
+        ? '继续请求已提交'
+        : '消息已发送';
+    emitBridgeSuccessToast('发送消息', successMessage, { displayMode: 'notification_center' });
 
-    setCurrentInterruptTaskId(actionResult.actionTaskId || '');
-    const rootTaskId = actionResult.rootTaskId;
+    setCurrentInterruptTaskId(turnResult.actionTaskId || '');
+    const rootTaskId = turnResult.rootTaskId;
     if (rootTaskId && resolvedSessionId) {
       initTaskTracking(resolvedSessionId, rootTaskId);
     }
 
-    await fetchBootstrap({ forceFresh: true });
+    // 确保 SSE 连接存活以接收增量事件
+    void ensureEventStream({ forceReconnect: false, waitUntilOpen: false }).catch((err) => {
+      console.warn('[web-client-bridge] executeTask 后 SSE 连接确认失败:', err);
+    });
   } catch (error) {
+    activeTurnInFlight = false;
     clearCurrentInterruptTaskId();
     console.error('[web-client-bridge] 执行任务失败:', error);
     emitBridgeErrorToast('发送消息', error);
@@ -1784,6 +1967,7 @@ async function interruptTask(trigger: 'user_pause' | 'pause_task' = 'user_pause'
     emitBridgeErrorToast('停止任务', new Error('当前轮次缺少可中断任务 ID，请等待任务初始化完成后再试。'));
     return;
   }
+  activeTurnInFlight = false;
   // 目标 task 已确认后，前端立即收敛到 idle，避免停止按钮卡死。
   emitForcedProcessingIdle('user_interrupt_requested', { trigger, taskId });
   try {
@@ -1969,12 +2153,6 @@ async function saveUserRules(data: Record<string, unknown>): Promise<void> {
   await saveAgentUserRules(data);
   await dispatchSettingsBootstrap(true);
   emitBridgeSuccessToast('保存用户规则', '用户规则已保存', { displayMode: 'notification_center' });
-}
-
-async function resetUserRules(): Promise<void> {
-  await resetAgentUserRules();
-  await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('重置用户规则', '用户规则已重置');
 }
 
 async function saveOrchestratorConfig(config: Record<string, unknown>): Promise<void> {
@@ -2226,6 +2404,17 @@ export function createWebClientBridge(): ClientBridge {
     kind: 'web',
     postMessage(message: ClientBridgeMessage): void {
       switch (message.type) {
+        case 'workspaceBindingChanged': {
+          const workspaceId = typeof message.workspaceId === 'string' ? message.workspaceId : '';
+          const workspacePath = typeof message.workspacePath === 'string' ? message.workspacePath : '';
+          const sessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
+          if (!sessionId) {
+            dispatchWorkspaceSessionCleared(workspaceId, workspacePath);
+          } else {
+            persistWorkspaceBinding(workspaceId, workspacePath, sessionId);
+          }
+          return;
+        }
         case 'webviewReady':
         case 'getState':
         case 'requestState':
@@ -2245,11 +2434,6 @@ export function createWebClientBridge(): ClientBridge {
               logBridgeOperationFailure('保存用户规则', '[web-client-bridge] 保存用户规则失败:', error);
             });
           }
-          return;
-        case 'resetUserRules':
-          void resetUserRules().catch((error) => {
-            logBridgeOperationFailure('重置用户规则', '[web-client-bridge] 重置用户规则失败:', error);
-          });
           return;
         case 'saveWorkerConfig':
           if (typeof message.worker === 'string' && message.config && typeof message.config === 'object') {
@@ -2451,10 +2635,18 @@ export function createWebClientBridge(): ClientBridge {
               requestId: typeof message.requestId === 'string' ? message.requestId : undefined,
               deepTask: message.deepTask === true,
               skillName: typeof message.skillName === 'string' ? message.skillName : null,
+              followUpMode: message.followUpMode === 'queue' || message.followUpMode === 'guide'
+                ? message.followUpMode
+                : undefined,
               images: Array.isArray(message.images)
                 ? message.images as Array<{ name: string; dataUrl: string }>
                 : [],
             });
+          }
+          return;
+        case 'guideQueuedMessage':
+          if (typeof message.queuedMessageId === 'string' && message.queuedMessageId.trim()) {
+            guideQueuedTurn(message.queuedMessageId.trim());
           }
           return;
         case 'interruptTask':

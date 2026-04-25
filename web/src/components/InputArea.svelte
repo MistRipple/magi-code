@@ -5,7 +5,6 @@
     addToast,
     getActiveInteractionType,
     getQueuedMessages,
-    hasRunningExecutionContent,
     messagesState,
   } from '../stores/messages.svelte';
   import type { StandardMessage } from '../shared/protocol/message-protocol';
@@ -68,20 +67,16 @@
   const MAX_IMAGES = 5;  // 最多支持 5 张图片
   const MAX_IMAGE_SIZE = 10 * 1024 * 1024;  // 单张图片最大 10MB
 
-  // 发送/停止态只认 store 内已经收敛好的处理状态，避免多真相源互相抬升。
+  // 发送/停止态只认 store 内已经收敛好的处理状态，避免历史工具卡片把空闲会话抬回执行态。
   const isSending = $derived(
     messagesState.isProcessing
     || messagesState.backendProcessing
     || messagesState.pendingRequests.size > 0
-    || messagesState.activeMessageIds.size > 0
-    || hasRunningExecutionContent(),
+    || messagesState.activeMessageIds.size > 0,
   );
   const activeInteraction = $derived.by(() => getActiveInteractionType());
   const isInteractionBlocking = $derived.by(() => Boolean(activeInteraction));
   const queuedMessages = $derived.by(() => getQueuedMessages());
-  const canContinueCurrentSession = $derived.by(() => (
-    messagesState.orchestratorRuntimeState?.canResume === true
-  ));
   const MAX_INPUT_CHARS = 10000;
   let inputTextareaEl = $state<HTMLTextAreaElement | null>(null);
   const sendButtonTitle = $derived.by(() => {
@@ -111,42 +106,6 @@
     inputValue = '';
     selectedImages = [];
     selectedSkill = null;
-  }
-
-  function normalizeContinueIntentText(value: string): string {
-    return value
-      .trim()
-      .toLowerCase()
-      .replace(/[\s\u3000，。！？、,.!?;；:："'“”‘’()`{}\[\]<>《》【】`~/_-]+/g, '');
-  }
-
-  function isNaturalContinueIntent(value: string): boolean {
-    const normalized = normalizeContinueIntentText(value);
-    if (!normalized) {
-      return false;
-    }
-    const prefixes = [
-      '继续',
-      '接着',
-      '继续刚才',
-      '继续之前',
-      '继续上次',
-      '继续当前',
-      '继续会话',
-      '继续任务',
-      '继续执行',
-      '接着做',
-      '接着刚才',
-      '恢复刚才',
-      '恢复之前',
-      '恢复上次',
-      '恢复会话',
-      '恢复任务',
-      'resume',
-      'continue',
-      'pickupwhereyouleftoff',
-    ];
-    return prefixes.some((prefix) => normalized === prefix || normalized.startsWith(prefix));
   }
 
   // 发送消息（支持图片附件）
@@ -179,27 +138,6 @@
       return;
     }
 
-    const shouldContinueCurrentSession = (
-      !isSending
-      && canContinueCurrentSession
-      && !selectedSkill
-      && selectedImages.length === 0
-      && submissionText !== null
-      && isNaturalContinueIntent(submissionText)
-    );
-
-    if (shouldContinueCurrentSession) {
-      const requestId = generateId();
-      vscode.postMessage({
-        type: 'continueTask',
-        text: submissionText,
-        requestId,
-      });
-      clearComposerState();
-      return;
-    }
-
-    // 空闲状态：发送新任务
     const requestId = generateId();
     vscode.postMessage({
       type: 'executeTask',
