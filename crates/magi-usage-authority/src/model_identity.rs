@@ -62,11 +62,7 @@ pub fn build_model_resolution_identity(
     .to_string();
     let account_fingerprint = fingerprint_secret(model_config.api_key.as_deref());
     let openai_protocol = if model_config.provider == "openai" {
-        Some(
-            model_config
-                .openai_protocol
-                .unwrap_or(OpenAiProtocol::Responses),
-        )
+        model_config.openai_protocol
     } else {
         None
     };
