@@ -208,7 +208,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
   let isRefreshing = $state(false);
   let totalInputTokens = $state(0);
   let totalOutputTokens = $state(0);
-  let totalTokens = $derived(totalInputTokens + totalOutputTokens);
+  let totalCacheReadTokens = $state(0);
+  let totalCacheWriteTokens = $state(0);
+  let totalTokens = $derived(totalInputTokens + totalOutputTokens + totalCacheReadTokens + totalCacheWriteTokens);
   let userInfo = $state("");
   let showResetConfirm = $state(false);
 
@@ -893,6 +895,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
       successRate: stats.successRate,
       totalInputTokens: stats.totalInputTokens,
       totalOutputTokens: stats.totalOutputTokens,
+      totalCacheReadTokens: stats.totalCacheReadTokens,
+      totalCacheWriteTokens: stats.totalCacheWriteTokens,
       totalTokens: stats.totalTokens,
       resolvedModel: stats.resolvedModel,
     };
@@ -916,6 +920,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
   function recomputeTokenStatsSummary() {
     totalInputTokens = executionStats.reduce((sum, stats) => sum + toSafeTokenCount(stats.netInputTokens), 0);
     totalOutputTokens = executionStats.reduce((sum, stats) => sum + toSafeTokenCount(stats.netOutputTokens), 0);
+    totalCacheReadTokens = executionStats.reduce((sum, stats) => sum + toSafeTokenCount(stats.cacheReadTokens), 0);
+    totalCacheWriteTokens = executionStats.reduce((sum, stats) => sum + toSafeTokenCount(stats.cacheWriteTokens), 0);
   }
 
   function applySettingsBootstrapPayload(
@@ -2494,6 +2500,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
           totalOutputTokens = toSafeTokenCount(
             payload.totals.netOutputTokens,
           );
+          totalCacheReadTokens = toSafeTokenCount(
+            payload.totals.cacheReadTokens,
+          );
+          totalCacheWriteTokens = toSafeTokenCount(
+            payload.totals.cacheWriteTokens,
+          );
         }
       }
     });
@@ -2552,6 +2564,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     get totalOutputTokens() {
       return totalOutputTokens;
+    },
+    get totalCacheReadTokens() {
+      return totalCacheReadTokens;
+    },
+    get totalCacheWriteTokens() {
+      return totalCacheWriteTokens;
     },
     get totalTokens() {
       return totalTokens;

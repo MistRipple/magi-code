@@ -53,6 +53,7 @@ fn make_call_record_input(
             output_tokens,
             cache_read_tokens: Some(100),
             cache_write_tokens: Some(50),
+            cache_read_included_in_input: false,
         },
         status: UsageCallStatus::Success,
         error_code: None,
@@ -66,15 +67,30 @@ fn test_normalize_usage_delta() {
         raw_output_tokens: 500,
         cache_read_tokens: Some(200),
         cache_write_tokens: Some(100),
+        cache_read_included_in_input: false,
     };
     let normalized = normalize_usage_delta(&delta);
     assert_eq!(normalized.raw_input_tokens, 1000);
     assert_eq!(normalized.raw_output_tokens, 500);
     assert_eq!(normalized.cache_read_tokens, 200);
     assert_eq!(normalized.cache_write_tokens, 100);
-    assert_eq!(normalized.net_input_tokens, 800);
+    assert_eq!(normalized.net_input_tokens, 1000);
     assert_eq!(normalized.net_output_tokens, 500);
-    assert_eq!(normalized.total_tokens, 1300);
+    assert_eq!(normalized.total_tokens, 1800);
+}
+
+#[test]
+fn test_normalize_usage_delta_subtracts_included_cache_read() {
+    let delta = UsageEventUsageDelta {
+        raw_input_tokens: 1000,
+        raw_output_tokens: 500,
+        cache_read_tokens: Some(200),
+        cache_write_tokens: Some(100),
+        cache_read_included_in_input: true,
+    };
+    let normalized = normalize_usage_delta(&delta);
+    assert_eq!(normalized.net_input_tokens, 800);
+    assert_eq!(normalized.total_tokens, 1600);
 }
 
 #[test]
@@ -84,6 +100,7 @@ fn test_normalize_zero_cache() {
         raw_output_tokens: 300,
         cache_read_tokens: None,
         cache_write_tokens: None,
+        cache_read_included_in_input: false,
     };
     let normalized = normalize_usage_delta(&delta);
     assert_eq!(normalized.net_input_tokens, 500);
@@ -258,6 +275,7 @@ fn test_rebuild_session_from_events() {
                 raw_output_tokens: 200,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                cache_read_included_in_input: false,
             }),
             status: Some(UsageCallStatus::Success),
             error_code: None,
@@ -285,6 +303,7 @@ fn test_rebuild_session_from_events() {
                 raw_output_tokens: 100,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                cache_read_included_in_input: false,
             }),
             status: Some(UsageCallStatus::Success),
             error_code: None,
@@ -399,6 +418,7 @@ fn test_session_reset_rebuilds_from_events() {
                 raw_output_tokens: 200,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                cache_read_included_in_input: false,
             }),
             status: Some(UsageCallStatus::Success),
             error_code: None,
@@ -443,6 +463,7 @@ fn test_session_reset_rebuilds_from_events() {
                 raw_output_tokens: 100,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                cache_read_included_in_input: false,
             }),
             status: Some(UsageCallStatus::Success),
             error_code: None,

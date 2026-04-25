@@ -103,6 +103,8 @@ pub struct UsageEventUsageDelta {
     pub cache_read_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_included_in_input: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +295,8 @@ pub struct UsageTokenInput {
     pub cache_read_tokens: Option<u64>,
     #[serde(default)]
     pub cache_write_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_included_in_input: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

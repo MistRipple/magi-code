@@ -15,7 +15,11 @@ pub fn normalize_usage_delta(delta: &UsageEventUsageDelta) -> NormalizedUsageTot
     let raw_output_tokens = delta.raw_output_tokens;
     let cache_read_tokens = delta.cache_read_tokens.unwrap_or(0);
     let cache_write_tokens = delta.cache_write_tokens.unwrap_or(0);
-    let net_input_tokens = raw_input_tokens.saturating_sub(cache_read_tokens);
+    let net_input_tokens = if delta.cache_read_included_in_input {
+        raw_input_tokens.saturating_sub(cache_read_tokens)
+    } else {
+        raw_input_tokens
+    };
     let net_output_tokens = raw_output_tokens;
     NormalizedUsageTotals {
         raw_input_tokens,
@@ -24,6 +28,9 @@ pub fn normalize_usage_delta(delta: &UsageEventUsageDelta) -> NormalizedUsageTot
         cache_write_tokens,
         net_input_tokens,
         net_output_tokens,
-        total_tokens: net_input_tokens + net_output_tokens,
+        total_tokens: net_input_tokens
+            .saturating_add(net_output_tokens)
+            .saturating_add(cache_read_tokens)
+            .saturating_add(cache_write_tokens),
     }
 }

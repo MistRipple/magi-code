@@ -103,6 +103,7 @@ impl UsageAuthority {
                 } else {
                     None
                 },
+                cache_read_included_in_input: input.usage.cache_read_included_in_input,
             }),
             status: Some(input.status),
             error_code: input.error_code,

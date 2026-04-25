@@ -136,7 +136,7 @@ import { getAgentColor } from '../lib/agent-colors';
       <div class="settings-tab-content scroll-content" onscroll={() => { store.closeAllModelDropdowns(); }}>
       {#if store.activeTab === 'stats'}
         <!-- 统计 Tab -->
-        <SettingsStatsTab totalInputTokens={store.totalInputTokens} totalOutputTokens={store.totalOutputTokens} totalTokens={store.totalTokens} isRefreshing={store.isRefreshing} refreshConnections={store.refreshConnections} showResetConfirmDialog={store.showResetConfirmDialog} modelStatuses={store.modelStatuses} statsDisplayKeys={store.statsDisplayKeys} getWorkerStats={store.getWorkerStats} getStatusClass={store.getStatusClass} getWorkerDisplayName={store.getWorkerDisplayName} statusTexts={store.statusTexts}
+        <SettingsStatsTab totalInputTokens={store.totalInputTokens} totalOutputTokens={store.totalOutputTokens} totalCacheReadTokens={store.totalCacheReadTokens} totalCacheWriteTokens={store.totalCacheWriteTokens} totalTokens={store.totalTokens} isRefreshing={store.isRefreshing} refreshConnections={store.refreshConnections} showResetConfirmDialog={store.showResetConfirmDialog} modelStatuses={store.modelStatuses} statsDisplayKeys={store.statsDisplayKeys} getWorkerStats={store.getWorkerStats} getStatusClass={store.getStatusClass} getWorkerDisplayName={store.getWorkerDisplayName} statusTexts={store.statusTexts}
         />
       {:else if store.activeTab === 'model'}
         <!-- 模型配置 Tab -->

@@ -7,6 +7,8 @@ import { getAgentColor } from '../lib/agent-colors';
   let {
     totalInputTokens,
     totalOutputTokens,
+    totalCacheReadTokens,
+    totalCacheWriteTokens,
     totalTokens,
     isRefreshing,
     refreshConnections,
@@ -20,6 +22,8 @@ import { getAgentColor } from '../lib/agent-colors';
   } = $props<{
     totalInputTokens: number;
     totalOutputTokens: number;
+    totalCacheReadTokens: number;
+    totalCacheWriteTokens: number;
     totalTokens: number;
     isRefreshing: boolean;
     refreshConnections: () => void;
@@ -56,6 +60,16 @@ import { getAgentColor } from '../lib/agent-colors';
             <span class="summary-label">{i18n.t('settings.stats.outputTokens', { count: '' }).replace(/[:：]/g, '').trim()}</span>
           </div>
           <div class="summary-divider"></div>
+          <div class="summary-item">
+            <span class="summary-value">{formatTokens(totalCacheReadTokens)}</span>
+            <span class="summary-label">{i18n.t('settings.stats.cacheReadTokens', { count: '' }).replace(/[:：]/g, '').trim()}</span>
+          </div>
+          <div class="summary-divider"></div>
+          <div class="summary-item">
+            <span class="summary-value">{formatTokens(totalCacheWriteTokens)}</span>
+            <span class="summary-label">{i18n.t('settings.stats.cacheWriteTokens', { count: '' }).replace(/[:：]/g, '').trim()}</span>
+          </div>
+          <div class="summary-divider"></div>
           <div class="summary-item primary">
             <span class="summary-value">{formatTokens(totalTokens)}</span>
             <span class="summary-label">{i18n.t('settings.stats.totalTokens', { count: '' }).replace(/[:：]/g, '').trim()}</span>
@@ -68,6 +82,7 @@ import { getAgentColor } from '../lib/agent-colors';
             {isRefreshing ? i18n.t('settings.stats.checking') : i18n.t('settings.stats.check')}
           </button>
           <button class="apple-action-btn danger" onclick={showResetConfirmDialog}>
+            <Icon name="trash" size={13} />
             {i18n.t('settings.stats.resetTokens')}
           </button>
         </div>
@@ -131,6 +146,14 @@ import { getAgentColor } from '../lib/agent-colors';
               <div class="metric-block">
                 <div class="metric-value">{formatTokens(workerStats?.totalOutputTokens ?? 0)}</div>
                 <div class="metric-label">{i18n.t('settings.stats.output', { count: '' }).replace(/[:：\s]/g, '')}</div>
+              </div>
+              <div class="metric-block">
+                <div class="metric-value">{formatTokens(workerStats?.totalCacheReadTokens ?? 0)}</div>
+                <div class="metric-label">{i18n.t('settings.stats.cacheRead', { count: '' }).replace(/[:：\s]/g, '')}</div>
+              </div>
+              <div class="metric-block">
+                <div class="metric-value">{formatTokens(workerStats?.totalCacheWriteTokens ?? 0)}</div>
+                <div class="metric-label">{i18n.t('settings.stats.cacheWrite', { count: '' }).replace(/[:：\s]/g, '')}</div>
               </div>
             </div>
           </div>
@@ -208,7 +231,7 @@ import { getAgentColor } from '../lib/agent-colors';
     flex-direction: column;
     box-sizing: border-box;
     transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
-    min-height: 103px;
+    min-height: 136px;
   }
 
   .apple-widget-card:hover {
@@ -341,9 +364,10 @@ import { getAgentColor } from '../lib/agent-colors';
   }
 
   .widget-metrics-grid {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-end;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    column-gap: 8px;
+    row-gap: 6px;
     margin-top: auto;
   }
 
@@ -352,6 +376,7 @@ import { getAgentColor } from '../lib/agent-colors';
     flex-direction: column;
     align-items: flex-start;
     gap: 1px;
+    min-width: 0;
   }
 
   .metric-value {
@@ -381,6 +406,10 @@ import { getAgentColor } from '../lib/agent-colors';
     .stats-overview-panel {
       flex-wrap: wrap;
       gap: 12px;
+    }
+
+    .widget-metrics-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
   }
 

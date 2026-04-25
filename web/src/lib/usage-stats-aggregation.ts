@@ -22,6 +22,8 @@ export interface AggregatedUsageStats {
   successRate: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+  totalCacheReadTokens: number;
+  totalCacheWriteTokens: number;
   totalTokens: number;
   resolvedModel?: string;
 }
@@ -51,6 +53,8 @@ export function aggregateUsageStatsForDisplay(
   const failureCount = matched.reduce((sum, item) => sum + item.failureCount, 0);
   const totalInputTokens = matched.reduce((sum, item) => sum + item.netInputTokens, 0);
   const totalOutputTokens = matched.reduce((sum, item) => sum + item.netOutputTokens, 0);
+  const totalCacheReadTokens = matched.reduce((sum, item) => sum + item.cacheReadTokens, 0);
+  const totalCacheWriteTokens = matched.reduce((sum, item) => sum + item.cacheWriteTokens, 0);
   const totalTokens = matched.reduce((sum, item) => sum + item.totalTokens, 0);
   const resolvedModels = Array.from(new Set(matched.map((item) => item.resolvedModel).filter((value): value is string => typeof value === 'string' && value.trim().length > 0)));
 
@@ -62,8 +66,9 @@ export function aggregateUsageStatsForDisplay(
     successRate: totalExecutions > 0 ? successCount / totalExecutions : 1,
     totalInputTokens,
     totalOutputTokens,
+    totalCacheReadTokens,
+    totalCacheWriteTokens,
     totalTokens,
     resolvedModel: resolvedModels.length === 1 ? resolvedModels[0] : undefined,
   };
 }
-
