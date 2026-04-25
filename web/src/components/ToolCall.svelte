@@ -160,11 +160,6 @@
       'web_fetch': 'globe',
       'mermaid_diagram': 'git-branch',
       'code_search_semantic': 'search',
-      'task_split': 'tools',
-      'task_list': 'document',
-      'task_update': 'edit',
-      'task_claim_next': 'skip-forward',
-      'context_compact': 'minimize',
       'skill_apply': 'skill',
       'project_knowledge_query': 'question',
       'process_launch': 'terminal',
@@ -186,7 +181,6 @@
       'process_inspect': 'terminal',
       'diff_preview': 'file-text',
       'knowledge_query': 'question',
-      'worker_send_message': 'tools',
     };
 
     if (iconMap[baseToolName]) {
@@ -284,11 +278,6 @@
       'web_fetch': i18n.t('toolCall.displayName.webFetch'),
       'mermaid_diagram': i18n.t('toolCall.displayName.mermaidDiagram'),
       'code_search_semantic': i18n.t('toolCall.displayName.codebaseRetrieval'),
-      'task_split': 'task_split',
-      'task_list': 'task_list',
-      'task_update': 'task_update',
-      'task_claim_next': 'task_claim_next',
-      'context_compact': 'context_compact',
       'skill_apply': 'skill_apply',
       'project_knowledge_query': 'project_knowledge_query',
       'process_launch': 'process_launch',
@@ -311,7 +300,6 @@
       'process_inspect': 'process_inspect',
       'diff_preview': 'diff_preview',
       'knowledge_query': 'project_knowledge_query',
-      'worker_send_message': i18n.t('toolCall.displayName.sendWorkerMessage'),
     };
 
     return displayNameMap[baseToolName] ?? baseToolName;
@@ -345,26 +333,6 @@
       case 'project_knowledge_query':
       case 'knowledge_query':
         return typeof args.query === 'string' ? args.query : '';
-      case 'task_list':
-        return (typeof args.mission_id === 'string' ? args.mission_id : '')
-          || (typeof args.session_id === 'string' ? args.session_id : '');
-      case 'task_update': {
-        const updates = Array.isArray(args.updates) ? args.updates : [];
-        if (updates.length === 0) return '';
-        const firstUpdate = updates[0] as Record<string, unknown>;
-        const firstTaskId = typeof firstUpdate?.task_id === 'string' ? firstUpdate.task_id : '';
-        return updates.length === 1 ? firstTaskId : `${firstTaskId || 'task'} +${updates.length - 1}`;
-      }
-      case 'task_split': {
-        const childTasks = Array.isArray(args.child_tasks) ? args.child_tasks : [];
-        if (childTasks.length === 0) return '';
-        const firstChild = childTasks[0] as Record<string, unknown>;
-        return typeof firstChild?.content === 'string' ? firstChild.content : '';
-      }
-      case 'task_claim_next':
-        return typeof args.assignment_id === 'string' ? args.assignment_id : '';
-      case 'context_compact':
-        return typeof args.mode === 'string' ? args.mode : '';
       case 'skill_apply':
         return typeof args.skill_name === 'string' ? args.skill_name : '';
       case 'read_file':

@@ -16,7 +16,6 @@
  *  15  — 编排器主线回复（text）
  *  20  — 编排器派发（worker_dispatch）
  *  25  — Worker 指令/完成卡片（instruction / task_card）
- *  30  — 编排器追加消息（worker_send_message）
  *  40  — 编排器收集结果（worker_wait）
  *  50  — 其他（默认）
  */
@@ -39,12 +38,8 @@ export function resolveMessageSemanticStage(
   if (messageType === 'instruction' || messageType === 'task_card') {
     return 25;
   }
-  if (primaryToolName === 'worker_send_message') {
-    return 30;
-  }
   if (primaryToolName === 'worker_wait') {
     return 40;
   }
   return 50;
 }
-
