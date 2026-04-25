@@ -170,11 +170,13 @@
 
   // 容器引用
   let containerRef: HTMLDivElement | null = $state(null);
+  let historySentinelRef: HTMLDivElement | null = $state(null);
   const showScrollBtn = $derived(!shouldAutoScroll && safeRenderMessages.length > 0);
   let wasActive = $state(false);
   let lastObservedScrollTop = $state(0);
   let activationRestoreNonce = 0;
   let restoreAttemptTimers: Array<ReturnType<typeof setTimeout>> = [];
+  let historyObserver: IntersectionObserver | null = null;
   let programmaticScrollDepth = 0;
   let pendingHistoryRestore = $state<{
     sessionId: string;
@@ -184,6 +186,12 @@
 
   const HISTORY_LOAD_THRESHOLD_PX = 120;
   const HISTORY_PAGE_SIZE = 50;
+
+  function disconnectHistoryObserver() {
+    if (!historyObserver) return;
+    historyObserver.disconnect();
+    historyObserver = null;
+  }
 
   function clearRestoreAttemptTimers() {
     if (restoreAttemptTimers.length === 0) return;
@@ -384,6 +392,47 @@
     });
   });
 
+  $effect(() => {
+    const container = containerRef;
+    const sentinel = historySentinelRef;
+    const sessionId = currentSessionId;
+    const historyState = sessionHistory;
+    const canObserveHistory = Boolean(
+      container
+      && sentinel
+      && displayContext === 'thread'
+      && isActive
+      && sessionId
+      && historyState.sessionId === sessionId
+      && historyState.hasMoreBefore
+      && historyState.beforeCursor
+    );
+
+    disconnectHistoryObserver();
+    if (!canObserveHistory || !container || !sentinel) {
+      return;
+    }
+
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        void loadOlderHistory();
+      }
+    }, {
+      root: container,
+      rootMargin: `${HISTORY_LOAD_THRESHOLD_PX}px 0px 0px 0px`,
+      threshold: 0,
+    });
+    observer.observe(sentinel);
+    historyObserver = observer;
+
+    return () => {
+      if (historyObserver === observer) {
+        historyObserver = null;
+      }
+      observer.disconnect();
+    };
+  });
+
   async function loadOlderHistory(): Promise<void> {
     if (!containerRef || displayContext !== 'thread' || !isActive) {
       return;
@@ -396,6 +445,7 @@
       || !historyState.hasMoreBefore
       || !historyState.beforeCursor
       || historyState.isLoadingBefore
+      || pendingHistoryRestore !== null
     ) {
       return;
     }
@@ -486,6 +536,7 @@
   onDestroy(() => {
     activationRestoreNonce += 1;
     clearRestoreAttemptTimers();
+    disconnectHistoryObserver();
     if (!containerRef) {
       return;
     }
@@ -503,6 +554,9 @@
     data-display-context={displayContext}
     data-panel-active={isActive ? 'true' : 'false'}
   >
+    {#if displayContext === 'thread' && safeRenderItems.length > 0}
+      <div class="history-sentinel" bind:this={historySentinelRef} aria-hidden="true"></div>
+    {/if}
     {#if safeRenderItems.length === 0}
       <div class="empty-state">
         <div class="empty-icon">
@@ -554,6 +608,14 @@
     padding-right: var(--space-2);
     /* 🔧 优化：禁用浏览器默认的滚动锚定，防止与自动滚动逻辑冲突导致抖动 */
     overflow-anchor: none;
+  }
+
+  .history-sentinel {
+    flex: 0 0 1px;
+    width: 100%;
+    height: 1px;
+    margin-bottom: calc(-1 * var(--space-3));
+    pointer-events: none;
   }
 
   .empty-state {
