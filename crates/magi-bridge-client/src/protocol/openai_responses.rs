@@ -144,11 +144,15 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
 
         let usage = envelope
             .get("usage")
-            .map(|u| LlmUsage {
-                input_tokens: u["input_tokens"].as_u64().unwrap_or(0),
-                output_tokens: u["output_tokens"].as_u64().unwrap_or(0),
-                cache_read_tokens: None,
-                cache_write_tokens: None,
+            .map(|u| {
+                let cache_read_tokens = u["input_tokens_details"]["cached_tokens"].as_u64();
+                LlmUsage {
+                    input_tokens: u["input_tokens"].as_u64().unwrap_or(0),
+                    output_tokens: u["output_tokens"].as_u64().unwrap_or(0),
+                    cache_read_tokens,
+                    cache_write_tokens: None,
+                    cache_read_included_in_input: cache_read_tokens.is_some(),
+                }
             })
             .unwrap_or_default();
 
@@ -204,5 +208,32 @@ mod tests {
                 .expect("raw arguments should stay valid json")["cwd"],
             "/tmp"
         );
+    }
+
+    #[test]
+    fn parses_cached_input_usage() {
+        let body = json!({
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "hello" }]
+            }],
+            "usage": {
+                "input_tokens": 10,
+                "input_tokens_details": { "cached_tokens": 4 },
+                "output_tokens": 3,
+                "total_tokens": 13
+            }
+        })
+        .to_string();
+
+        let parsed = OpenAiResponsesAdapter
+            .parse_response(200, &body)
+            .expect("usage should parse");
+
+        assert_eq!(parsed.usage.input_tokens, 10);
+        assert_eq!(parsed.usage.output_tokens, 3);
+        assert_eq!(parsed.usage.cache_read_tokens, Some(4));
+        assert!(parsed.usage.cache_read_included_in_input);
     }
 }

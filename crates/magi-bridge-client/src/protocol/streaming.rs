@@ -315,11 +315,13 @@ fn parse_anthropic_stream_event(event_type: Option<&str>, data: &str) -> Vec<Llm
 }
 
 fn parse_openai_usage_value(usage: &Value) -> LlmUsage {
+    let cache_read_tokens = usage["prompt_tokens_details"]["cached_tokens"].as_u64();
     LlmUsage {
         input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
         output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
-        cache_read_tokens: usage["prompt_tokens_details"]["cached_tokens"].as_u64(),
+        cache_read_tokens,
         cache_write_tokens: None,
+        cache_read_included_in_input: cache_read_tokens.is_some(),
     }
 }
 
@@ -329,6 +331,7 @@ fn parse_anthropic_usage_value(usage: &Value) -> LlmUsage {
         output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
         cache_read_tokens: usage["cache_read_input_tokens"].as_u64(),
         cache_write_tokens: usage["cache_creation_input_tokens"].as_u64(),
+        cache_read_included_in_input: false,
     }
 }
 
@@ -418,6 +421,7 @@ impl StreamAccumulator {
                     if u.cache_write_tokens.is_some() {
                         self.usage.cache_write_tokens = u.cache_write_tokens;
                     }
+                    self.usage.cache_read_included_in_input |= u.cache_read_included_in_input;
                 }
             }
         }
@@ -745,6 +749,7 @@ mod tests {
                 output_tokens: 0,
                 cache_read_tokens: Some(50),
                 cache_write_tokens: None,
+                cache_read_included_in_input: true,
             }),
             stop_reason: None,
         });
@@ -758,6 +763,7 @@ mod tests {
                 output_tokens: 42,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                cache_read_included_in_input: false,
             }),
             stop_reason: None,
         });

@@ -664,6 +664,14 @@ fn adapted_response_to_bridge_payload(adapted: &AdaptedResponse) -> String {
             },
         })
         .collect();
+    let prompt_tokens_details = if adapted.usage.cache_read_included_in_input {
+        adapted
+            .usage
+            .cache_read_tokens
+            .map(|cached_tokens| json!({ "cached_tokens": cached_tokens }))
+    } else {
+        None
+    };
 
     let payload = OpenAiCompatibleSuccessPayload {
         content: if adapted.content.is_empty() {
@@ -676,7 +684,7 @@ fn adapted_response_to_bridge_payload(adapted: &AdaptedResponse) -> String {
             prompt_tokens: Some(adapted.usage.input_tokens),
             completion_tokens: Some(adapted.usage.output_tokens),
             total_tokens: Some(adapted.usage.input_tokens + adapted.usage.output_tokens),
-            prompt_tokens_details: None,
+            prompt_tokens_details,
             completion_tokens_details: None,
         }),
         tool_calls,
@@ -807,6 +815,28 @@ mod tests {
             body["tool_choice"]["function"]["name"],
             "classify_session_turn"
         );
+    }
+
+    #[test]
+    fn adapted_payload_preserves_cached_prompt_tokens() {
+        let payload = adapted_response_to_bridge_payload(&AdaptedResponse {
+            content: "hello".to_string(),
+            tool_calls: Vec::new(),
+            usage: crate::llm_types::LlmUsage {
+                input_tokens: 10,
+                output_tokens: 3,
+                cache_read_tokens: Some(4),
+                cache_write_tokens: None,
+                cache_read_included_in_input: true,
+            },
+            stop_reason: "stop".to_string(),
+            raw: None,
+        });
+        let value: serde_json::Value =
+            serde_json::from_str(&payload).expect("payload should stay json");
+
+        assert_eq!(value["usage"]["prompt_tokens"], 10);
+        assert_eq!(value["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
     }
 
     #[test]

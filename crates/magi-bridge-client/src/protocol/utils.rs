@@ -212,11 +212,13 @@ pub fn convert_messages_to_anthropic(messages: &[LlmMessage]) -> Vec<Value> {
 }
 
 pub fn parse_openai_usage(usage: &Value) -> LlmUsage {
+    let cache_read_tokens = usage["prompt_tokens_details"]["cached_tokens"].as_u64();
     LlmUsage {
         input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
         output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
-        cache_read_tokens: usage["prompt_tokens_details"]["cached_tokens"].as_u64(),
+        cache_read_tokens,
         cache_write_tokens: None,
+        cache_read_included_in_input: cache_read_tokens.is_some(),
     }
 }
 
@@ -226,5 +228,6 @@ pub fn parse_anthropic_usage(usage: &Value) -> LlmUsage {
         output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
         cache_read_tokens: usage["cache_read_input_tokens"].as_u64(),
         cache_write_tokens: usage["cache_creation_input_tokens"].as_u64(),
+        cache_read_included_in_input: false,
     }
 }
