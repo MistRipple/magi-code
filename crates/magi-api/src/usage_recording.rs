@@ -307,6 +307,23 @@ mod tests {
     }
 
     #[test]
+    fn usage_tokens_from_payload_preserves_zero_cache_reports() {
+        let usage = usage_tokens_from_payload(Some(&json!({
+            "input_tokens": 11,
+            "output_tokens": 13,
+            "input_tokens_details": { "cached_tokens": 0 },
+            "cache_creation_input_tokens": 0
+        })))
+        .expect("usage tokens");
+
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 13);
+        assert_eq!(usage.cache_read_tokens, Some(0));
+        assert_eq!(usage.cache_write_tokens, Some(0));
+        assert!(usage.cache_read_included_in_input);
+    }
+
+    #[test]
     fn usage_tokens_from_payload_keeps_anthropic_cache_separate() {
         let usage = usage_tokens_from_payload(Some(&json!({
             "input_tokens": 11,

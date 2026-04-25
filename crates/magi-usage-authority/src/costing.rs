@@ -28,9 +28,6 @@ pub fn normalize_usage_delta(delta: &UsageEventUsageDelta) -> NormalizedUsageTot
         cache_write_tokens,
         net_input_tokens,
         net_output_tokens,
-        total_tokens: net_input_tokens
-            .saturating_add(net_output_tokens)
-            .saturating_add(cache_read_tokens)
-            .saturating_add(cache_write_tokens),
+        total_tokens: net_input_tokens.saturating_add(net_output_tokens),
     }
 }

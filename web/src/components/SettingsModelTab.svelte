@@ -22,6 +22,8 @@
     modelLists,
     getBaseUrlPlaceholder,
     shouldRecommendStandardUrlMode,
+    getOpenAiProtocolValue,
+    setOpenAiProtocolValue,
     openModelDropdown,
     fetchModelList,
     selectModel,
@@ -51,6 +53,8 @@
     modelLists: Record<string, string[]>;
     getBaseUrlPlaceholder: (provider: string) => string;
     shouldRecommendStandardUrlMode: (provider: any, baseUrl: string) => boolean;
+    getOpenAiProtocolValue: (config: any) => 'responses' | 'chat';
+    setOpenAiProtocolValue: (config: any, value: unknown) => void;
     openModelDropdown: (type: string, target: HTMLElement) => void;
     fetchModelList: (type: 'orch' | 'comp' | 'worker') => void;
     selectModel: (type: 'orch' | 'comp' | 'worker', model: string) => void;
@@ -116,7 +120,7 @@
           <div class="apple-scroller-proxy">
         <div class="settings-section">
           <div class="model-config-stack">
-            <div class="segmented-control" style="max-width: 400px; margin: 0 auto 24px 0;">
+            <div class="segmented-control model-primary-tabs">
               <button class="segmented-control__option" class:active={modelConfigTab === 'orch'} onclick={() => modelConfigTab = 'orch'}>
                 <span class="model-status-dot {getStatusClass(resolveModelConfigTabStatus('orch', modelStatuses, workerConfigs))}" title={getStatusText(resolveModelConfigTabStatus('orch', modelStatuses, workerConfigs))}></span>
                 {i18n.t('settings.model.orchestratorModel')}
@@ -219,7 +223,7 @@
                     {#if orchConfig.provider === 'openai'}
                     <div class="llm-config-field">
                       <label class="llm-config-label">{i18n.t('settings.model.field.protocol')}</label>
-                      <select class="llm-config-select" bind:value={orchConfig.openaiProtocol}>
+                      <select class="llm-config-select" value={getOpenAiProtocolValue(orchConfig)} onchange={(event) => setOpenAiProtocolValue(orchConfig, (event.currentTarget as HTMLSelectElement).value)}>
                         <option value="responses">{i18n.t('settings.model.protocol.responses')}</option>
                         <option value="chat">{i18n.t('settings.model.protocol.chat')}</option>
                       </select>
@@ -240,9 +244,9 @@
                       </select>
                     </div>
                     {/if}
-                    <div class="llm-config-field">
+                    <div class="llm-config-field llm-config-field--toggle">
                       <label class="llm-config-label">{i18n.t('settings.model.field.thinking')}</label>
-                      <div style="height: 28px; display: flex; align-items: center;">
+                      <div class="llm-toggle-control">
                         <Toggle
                           size="small"
                           checked={orchConfig.thinking}
@@ -254,8 +258,8 @@
                       </div>
                     </div>
                   </div>
-                  <div class="apple-dashboard-bar" style="display: flex; justify-content: space-between; align-items: center; margin-top: 24px;">
-                    <span style="font-size: 12px; color: var(--foreground-muted);">{i18n.t('settings.model.orchestratorDesc')}</span>
+                  <div class="apple-dashboard-bar model-form-actions">
+                    <span class="model-form-action-desc">{i18n.t('settings.model.orchestratorDesc')}</span>
                     <div class="settings-section-actions">
                       <button
                         class="apple-action-btn secondary"
@@ -390,7 +394,7 @@
                     {#if compConfig.provider === 'openai'}
                     <div class="llm-config-field">
                       <label class="llm-config-label">{i18n.t('settings.model.field.protocol')}</label>
-                      <select class="llm-config-select" bind:value={compConfig.openaiProtocol}>
+                      <select class="llm-config-select" value={getOpenAiProtocolValue(compConfig)} onchange={(event) => setOpenAiProtocolValue(compConfig, (event.currentTarget as HTMLSelectElement).value)}>
                         <option value="responses">{i18n.t('settings.model.protocol.responses')}</option>
                         <option value="chat">{i18n.t('settings.model.protocol.chat')}</option>
                       </select>
@@ -403,8 +407,8 @@
                     {/if}
                     {/if}
                   </div>
-                  <div class="apple-dashboard-bar" style="display: flex; justify-content: space-between; align-items: center; margin-top: 24px;">
-                    <span style="font-size: 12px; color: var(--foreground-muted);">{i18n.t('settings.model.auxiliaryDesc')}</span>
+                  <div class="apple-dashboard-bar model-form-actions">
+                    <span class="model-form-action-desc">{i18n.t('settings.model.auxiliaryDesc')}</span>
                     <div class="settings-section-actions">
                       <button
                         class="apple-action-btn secondary"
@@ -524,9 +528,9 @@
                     </div>
                   {/if}
                 </div>
-                <div class="llm-config-field">
+                <div class="llm-config-field llm-config-field--toggle">
                   <label class="llm-config-label">{i18n.t('settings.model.enable')}</label>
-                  <div style="height: 28px; display: flex; align-items: center;">
+                  <div class="llm-toggle-control">
                     <Toggle
                       size="small"
                       checked={workerConfigs[workerModelTab].enabled}
@@ -587,7 +591,7 @@
                 {#if workerConfigs[workerModelTab].provider === 'openai'}
                 <div class="llm-config-field">
                   <label class="llm-config-label">{i18n.t('settings.model.field.protocol')}</label>
-                  <select class="llm-config-select" bind:value={workerConfigs[workerModelTab].openaiProtocol}>
+                  <select class="llm-config-select" value={getOpenAiProtocolValue(workerConfigs[workerModelTab])} onchange={(event) => setOpenAiProtocolValue(workerConfigs[workerModelTab], (event.currentTarget as HTMLSelectElement).value)}>
                     <option value="responses">{i18n.t('settings.model.protocol.responses')}</option>
                     <option value="chat">{i18n.t('settings.model.protocol.chat')}</option>
                   </select>
@@ -608,9 +612,9 @@
                   </select>
                 </div>
                 {/if}
-                <div class="llm-config-field">
+                <div class="llm-config-field llm-config-field--toggle">
                   <label class="llm-config-label">{i18n.t('settings.model.field.thinking')}</label>
-                  <div style="height: 28px; display: flex; align-items: center;">
+                  <div class="llm-toggle-control">
                     <Toggle
                       size="small"
                       checked={workerConfigs[workerModelTab].thinking}
@@ -622,7 +626,7 @@
                   </div>
                 </div>
               </div>
-              <div class="apple-dashboard-bar" style="display: flex; justify-content: flex-end; align-items: center; margin-top: 24px;">
+              <div class="apple-dashboard-bar model-form-actions model-form-actions--buttons-only">
                 <div class="settings-section-actions">
                   <button
                     class="apple-action-btn secondary"
@@ -723,7 +727,7 @@
     padding-bottom: 2px;
   }
   .worker-model-tabs::-webkit-scrollbar { display: none; }
-  .worker-model-tab { display: flex; align-items: center; gap: var(--space-2); height: var(--btn-height-sm); padding: 0 var(--space-3); font-size: var(--text-sm); background: transparent; border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--foreground-muted); cursor: pointer; transition: all var(--transition-fast); }
+  .worker-model-tab { display: flex; align-items: center; gap: var(--space-2); height: var(--btn-height-sm); padding: 0 var(--space-3); font-size: var(--text-sm); background: transparent; border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--foreground-muted); cursor: pointer; transition: all var(--transition-fast); flex: 0 0 auto; white-space: nowrap; }
   .worker-model-tab:hover { background: var(--surface-hover); color: var(--foreground); }
   .worker-model-tab.active { background: var(--primary); border-color: var(--primary); color: var(--primary-foreground); }
   .worker-model-tab--add { padding: 0 var(--space-2); min-width: var(--btn-height-sm); justify-content: center; border-style: dashed; }
@@ -753,7 +757,16 @@
   
 
   /* 模型配置顶部 Tab 切换 */
+  .apple-manager {
+    container: settings-model / inline-size;
+    --model-toggle-column-width: 100px;
+  }
+
   .model-config-stack { display: flex; flex-direction: column; gap: var(--space-4); }
+  .model-primary-tabs {
+    width: min(100%, 400px);
+    margin: 0 auto 24px 0;
+  }
   .model-config-tabs { display: flex; gap: var(--space-1); border-bottom: 1px solid var(--border); margin-bottom: var(--space-4); }
   .model-config-tab {
     display: inline-flex;
@@ -785,13 +798,45 @@
   .model-status-dot.error { background: var(--error, #dc2626); }
   .model-status-dot.disabled { background: var(--foreground-subtle, #94a3b8); }
 
+  .model-form-actions {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--space-3);
+    margin-top: 24px;
+  }
+
+  .model-form-actions--buttons-only {
+    justify-content: flex-end;
+  }
+
+  .model-form-actions .settings-section-actions {
+    flex: 0 0 auto;
+  }
+
+  .model-form-action-desc {
+    min-width: 0;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--foreground-muted);
+  }
+
   .llm-config-form { display: flex; flex-direction: column; gap: var(--space-3); }
   .llm-config-field { display: flex; flex-direction: column; gap: var(--space-2); }
+  .llm-config-field--toggle {
+    width: var(--model-toggle-column-width);
+    min-width: var(--model-toggle-column-width);
+  }
+  .llm-toggle-control {
+    height: 28px;
+    display: flex;
+    align-items: center;
+  }
   .llm-config-field-row { display: grid; grid-template-columns: 1fr 96px; gap: var(--space-3); }
-  .llm-config-field-row.has-thinking { grid-template-columns: 1fr 96px 72px; }
-  .llm-config-field-row.has-thinking.has-level { grid-template-columns: 1fr 96px 88px 88px 72px; }
+  .llm-config-field-row.has-thinking { grid-template-columns: 1fr 96px var(--model-toggle-column-width); }
+  .llm-config-field-row.has-thinking.has-level { grid-template-columns: 1fr 96px 88px 88px var(--model-toggle-column-width); }
   .llm-config-field-row.url-mode-row { grid-template-columns: minmax(0, 1fr) 180px; align-items: end; }
-  .llm-config-field-row.worker-url-mode-row { grid-template-columns: minmax(0, 1fr) 180px 88px; align-items: end; }
+  .llm-config-field-row.worker-url-mode-row { grid-template-columns: minmax(0, 1fr) 180px var(--model-toggle-column-width); align-items: end; }
   .llm-config-label { font-size: var(--text-sm); color: var(--foreground-muted); }
   .llm-config-field--compact { min-width: 0; }
   .llm-config-hint {
@@ -960,8 +1005,91 @@
   .toggle-switch.active::after { transform: translateX(14px); }
 
 
+  @container settings-model (max-width: 640px) {
+    .model-primary-tabs {
+      width: 100%;
+      margin: 0 0 var(--space-4) 0;
+    }
+
+    .model-form-actions {
+      flex-direction: column;
+      align-items: stretch;
+      gap: var(--space-3);
+      margin-top: var(--space-4);
+    }
+
+    .model-form-actions .settings-section-actions {
+      width: 100%;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: var(--space-2);
+    }
+
+    .model-form-actions .apple-action-btn {
+      width: 100%;
+      justify-content: center;
+    }
+
+    .model-form-actions--buttons-only {
+      align-items: stretch;
+    }
+
+    .worker-model-tab {
+      min-width: max-content;
+    }
+
+    .worker-tab-delete {
+      opacity: 0.7;
+    }
+
+    .llm-config-field-row,
+    .llm-config-field-row.has-thinking,
+    .llm-config-field-row.has-thinking.has-level,
+    .llm-config-field-row.url-mode-row,
+    .llm-config-field-row.worker-url-mode-row {
+      grid-template-columns: 1fr;
+    }
+  }
+
 
   @media (max-width: 768px) {
+    .model-primary-tabs {
+      width: 100%;
+      max-width: none;
+      margin: 0 0 var(--space-4) 0;
+    }
+
+    .model-form-actions {
+      flex-direction: column;
+      align-items: stretch;
+      gap: var(--space-3);
+      margin-top: var(--space-4);
+    }
+
+    .model-form-actions .settings-section-actions {
+      width: 100%;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: var(--space-2);
+    }
+
+    .model-form-actions .apple-action-btn {
+      width: 100%;
+      justify-content: center;
+    }
+
+    .model-form-actions--buttons-only {
+      align-items: stretch;
+    }
+
+    .worker-model-tab {
+      min-width: max-content;
+    }
+
+    .worker-tab-delete {
+      opacity: 0.7;
+    }
+
     .llm-config-field-row,
     .llm-config-field-row.has-thinking,
     .llm-config-field-row.has-thinking.has-level,

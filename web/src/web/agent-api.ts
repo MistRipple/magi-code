@@ -186,8 +186,6 @@ export interface AgentExecutionStatsItem {
   totalTokens: number;
   netInputTokens: number;
   netOutputTokens: number;
-  cacheReadTokens: number;
-  cacheWriteTokens: number;
 }
 
 export interface AgentExecutionStatsPayload {
@@ -204,8 +202,6 @@ export interface AgentExecutionStatsPayload {
     totalTokens: number;
     netInputTokens: number;
     netOutputTokens: number;
-    cacheReadTokens: number;
-    cacheWriteTokens: number;
     successCount: number;
     failureCount: number;
   };

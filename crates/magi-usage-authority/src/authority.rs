@@ -70,9 +70,6 @@ impl UsageAuthority {
             None,
         );
 
-        let cache_read = input.usage.cache_read_tokens.unwrap_or(0);
-        let cache_write = input.usage.cache_write_tokens.unwrap_or(0);
-
         let event = UsageEvent {
             event_id: event_id.clone(),
             ledger_seq,
@@ -93,16 +90,8 @@ impl UsageAuthority {
             usage_delta: Some(UsageEventUsageDelta {
                 raw_input_tokens: input.usage.input_tokens,
                 raw_output_tokens: input.usage.output_tokens,
-                cache_read_tokens: if cache_read > 0 {
-                    Some(cache_read)
-                } else {
-                    None
-                },
-                cache_write_tokens: if cache_write > 0 {
-                    Some(cache_write)
-                } else {
-                    None
-                },
+                cache_read_tokens: input.usage.cache_read_tokens,
+                cache_write_tokens: input.usage.cache_write_tokens,
                 cache_read_included_in_input: input.usage.cache_read_included_in_input,
             }),
             status: Some(input.status),

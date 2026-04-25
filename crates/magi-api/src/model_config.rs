@@ -99,15 +99,16 @@ impl NormalizedModelConfig {
             string_field(value, "provider").unwrap_or_else(|| default_provider.trim().to_string());
         let url_mode_label =
             string_field(value, "urlMode").unwrap_or_else(|| "standard".to_string());
-        let openai_protocol_label =
-            string_field(value, "openaiProtocol").unwrap_or_else(|| "responses".to_string());
         Self {
             provider,
             base_url: string_field(value, "baseUrl"),
             api_key: string_field(value, "apiKey"),
             model: string_field(value, "model"),
             url_mode: ModelUrlMode::from_label(&url_mode_label),
-            openai_protocol: ModelOpenAiProtocol::from_label(&openai_protocol_label),
+            openai_protocol: value
+                .get("openaiProtocol")
+                .and_then(Value::as_str)
+                .and_then(ModelOpenAiProtocol::from_label),
             protocol_endpoint: string_field(value, "protocolEndpoint"),
             reasoning_effort: value
                 .get("reasoningEffort")
@@ -354,5 +355,22 @@ mod tests {
         assert_eq!(usage.model, "gpt-test");
         assert_eq!(usage.url_mode, UrlMode::Default);
         assert_eq!(usage.openai_protocol, None);
+    }
+
+    #[test]
+    fn normalized_model_config_preserves_explicit_chat_protocol_for_usage() {
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "provider": "openai",
+                "baseUrl": "https://example.test",
+                "model": "gpt-test",
+                "urlMode": "standard",
+                "openaiProtocol": "chat"
+            }),
+            "openai",
+        );
+
+        let usage = config.to_usage_llm_config().expect("usage config");
+        assert_eq!(usage.openai_protocol, Some(OpenAiProtocol::Chat));
     }
 }

@@ -1,14 +1,12 @@
 <script lang="ts">
 import { i18n } from '../stores/i18n.svelte';
 import { getAgentColor } from '../lib/agent-colors';
-  import Icon from './Icon.svelte';
-  import type { ModelStatusMap } from '../types/message';
+import Icon from './Icon.svelte';
+import type { ModelStatusMap } from '../types/message';
 
   let {
     totalInputTokens,
     totalOutputTokens,
-    totalCacheReadTokens,
-    totalCacheWriteTokens,
     totalTokens,
     isRefreshing,
     refreshConnections,
@@ -22,8 +20,6 @@ import { getAgentColor } from '../lib/agent-colors';
   } = $props<{
     totalInputTokens: number;
     totalOutputTokens: number;
-    totalCacheReadTokens: number;
-    totalCacheWriteTokens: number;
     totalTokens: number;
     isRefreshing: boolean;
     refreshConnections: () => void;
@@ -61,16 +57,6 @@ import { getAgentColor } from '../lib/agent-colors';
           </div>
           <div class="summary-divider"></div>
           <div class="summary-item">
-            <span class="summary-value">{formatTokens(totalCacheReadTokens)}</span>
-            <span class="summary-label">{i18n.t('settings.stats.cacheReadTokens', { count: '' }).replace(/[:：]/g, '').trim()}</span>
-          </div>
-          <div class="summary-divider"></div>
-          <div class="summary-item">
-            <span class="summary-value">{formatTokens(totalCacheWriteTokens)}</span>
-            <span class="summary-label">{i18n.t('settings.stats.cacheWriteTokens', { count: '' }).replace(/[:：]/g, '').trim()}</span>
-          </div>
-          <div class="summary-divider"></div>
-          <div class="summary-item primary">
             <span class="summary-value">{formatTokens(totalTokens)}</span>
             <span class="summary-label">{i18n.t('settings.stats.totalTokens', { count: '' }).replace(/[:：]/g, '').trim()}</span>
           </div>
@@ -147,14 +133,6 @@ import { getAgentColor } from '../lib/agent-colors';
                 <div class="metric-value">{formatTokens(workerStats?.totalOutputTokens ?? 0)}</div>
                 <div class="metric-label">{i18n.t('settings.stats.output', { count: '' }).replace(/[:：\s]/g, '')}</div>
               </div>
-              <div class="metric-block">
-                <div class="metric-value">{formatTokens(workerStats?.totalCacheReadTokens ?? 0)}</div>
-                <div class="metric-label">{i18n.t('settings.stats.cacheRead', { count: '' }).replace(/[:：\s]/g, '')}</div>
-              </div>
-              <div class="metric-block">
-                <div class="metric-value">{formatTokens(workerStats?.totalCacheWriteTokens ?? 0)}</div>
-                <div class="metric-label">{i18n.t('settings.stats.cacheWrite', { count: '' }).replace(/[:：\s]/g, '')}</div>
-              </div>
             </div>
           </div>
         {/each}
@@ -170,6 +148,7 @@ import { getAgentColor } from '../lib/agent-colors';
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 14px;
     background: rgba(var(--foreground-rgb), 0.04);
     border: 1px solid rgba(var(--foreground-rgb), 0.08);
     border-radius: 12px;
@@ -183,6 +162,14 @@ import { getAgentColor } from '../lib/agent-colors';
     align-items: center;
     gap: 20px;
     flex-wrap: wrap;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .settings-section-actions {
+    margin-left: auto;
+    justify-content: flex-end;
+    flex: 0 0 auto;
   }
 
   .summary-divider {
@@ -211,14 +198,6 @@ import { getAgentColor } from '../lib/agent-colors';
     color: var(--foreground-muted);
     text-transform: uppercase;
   }
-
-
-
-  .summary-item.primary .summary-value {
-    color: var(--primary);
-  }
-
-
 
   /* Apple Widget Card Style */
   .apple-widget-card {
@@ -365,7 +344,7 @@ import { getAgentColor } from '../lib/agent-colors';
 
   .widget-metrics-grid {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     column-gap: 8px;
     row-gap: 6px;
     margin-top: auto;
@@ -406,6 +385,16 @@ import { getAgentColor } from '../lib/agent-colors';
     .stats-overview-panel {
       flex-wrap: wrap;
       gap: 12px;
+    }
+
+    .apple-dashboard-bar {
+      align-items: flex-start;
+    }
+
+    .settings-section-actions {
+      width: 100%;
+      margin-left: 0;
+      justify-content: flex-end;
     }
 
     .widget-metrics-grid {

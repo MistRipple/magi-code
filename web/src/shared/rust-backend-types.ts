@@ -848,8 +848,65 @@ export interface FetchModelsResponseDto {
   requestedAt: number;
 }
 
+export interface SessionStatsTotalsDto {
+  llmCallCount: number;
+  assignmentCount: number;
+  turnCount: number;
+  totalTokens: number;
+  netInputTokens: number;
+  netOutputTokens: number;
+  successCount: number;
+  failureCount: number;
+}
+
+export interface SessionStatsItemDto {
+  templateId: string;
+  engineId: string;
+  bindingRevision: number;
+  role: 'worker' | 'orchestrator' | 'auxiliary';
+  displayName: string;
+  provider?: string | null;
+  declaredModelSpec?: string | null;
+  resolvedModel?: string | null;
+  modelIdentityKey?: string | null;
+  llmCallCount: number;
+  assignmentCount: number;
+  successCount: number;
+  failureCount: number;
+  totalTokens: number;
+  netInputTokens: number;
+  netOutputTokens: number;
+}
+
+export interface SessionStatsModelDto {
+  modelIdentityKey: string;
+  provider: string;
+  declaredModelSpec: string;
+  resolvedModel: string;
+  baseUrlFingerprint: string;
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | null;
+  enableThinking?: boolean | null;
+  totals: SessionStatsTotalsDto;
+}
+
+export interface SessionStatsSessionDto {
+  sessionId: string;
+  version: number;
+  updatedAt: number;
+  totals: SessionStatsTotalsDto;
+}
+
 export interface SessionStatsResponseDto {
-  stats: unknown;
+  scope: 'session' | 'workspace';
+  workspaceId: string;
+  sessionId?: string | null;
+  version: number;
+  lastAppliedLedgerSeq?: number;
+  updatedAt: number;
+  totals: SessionStatsTotalsDto;
+  items: SessionStatsItemDto[];
+  models?: SessionStatsModelDto[];
+  sessions?: SessionStatsSessionDto[];
 }
 
 export interface ResetStatsResponseDto {

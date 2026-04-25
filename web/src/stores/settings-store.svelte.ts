@@ -48,6 +48,7 @@ import type {
   ModelEngine,
   AgentBinding,
 } from "../shared/types/registry-types";
+import type { LLMConfig } from "../shared/types/agent-types";
 import type { ModelStatus, ModelStatusMap } from "../types/message";
 import { setEnabledAgents, getState } from "../stores/messages.svelte";
 import type { EnabledAgent } from "../stores/messages.svelte";
@@ -58,6 +59,8 @@ import {
 
 export type UrlMode = "standard" | "full";
 export type ProviderName = "openai" | "anthropic";
+export type OpenAiProtocol = "responses" | "chat";
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
 export interface BaseModelFormConfig {
   baseUrl: string;
@@ -65,18 +68,35 @@ export interface BaseModelFormConfig {
   apiKey: string;
   model: string;
   provider: ProviderName;
-  openaiProtocol: "responses" | "chat";
+  openaiProtocol?: OpenAiProtocol;
   protocolEndpoint: string;
 }
 
 export interface InteractiveModelFormConfig extends BaseModelFormConfig {
   thinking: boolean;
-  reasoningEffort: "low" | "medium" | "high" | "xhigh";
+  reasoningEffort: ReasoningEffort;
 }
 
 export interface WorkerModelFormConfig extends InteractiveModelFormConfig {
   enabled: boolean;
 }
+
+type BaseModelConfigPayload = Record<string, unknown> & {
+  baseUrl: string;
+  urlMode: UrlMode;
+  apiKey: string;
+  model: string;
+  provider: ProviderName;
+  protocolEndpoint: string;
+  openaiProtocol?: OpenAiProtocol;
+};
+
+type InteractiveModelConfigPayload = BaseModelConfigPayload & {
+  enableThinking: boolean;
+  reasoningEffort: ReasoningEffort;
+};
+
+type WorkerModelConfigPayload = InteractiveModelConfigPayload & LLMConfig;
 
 export type SafeguardCategory =
   | "git_history"
@@ -208,9 +228,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   let isRefreshing = $state(false);
   let totalInputTokens = $state(0);
   let totalOutputTokens = $state(0);
-  let totalCacheReadTokens = $state(0);
-  let totalCacheWriteTokens = $state(0);
-  let totalTokens = $derived(totalInputTokens + totalOutputTokens + totalCacheReadTokens + totalCacheWriteTokens);
+  let totalTokens = $derived(totalInputTokens + totalOutputTokens);
   let userInfo = $state("");
   let showResetConfirm = $state(false);
 
@@ -244,33 +262,35 @@ function createSettingsStore(props: { onClose?: () => void }) {
     provider: ProviderName,
     overrides: Partial<InteractiveModelFormConfig> = {},
   ): InteractiveModelFormConfig {
-    return {
+    const config: InteractiveModelFormConfig = {
       baseUrl: "",
       urlMode: "standard",
       apiKey: "",
       model: "",
       provider,
-      openaiProtocol: "responses",
       protocolEndpoint: "",
       thinking: false,
       reasoningEffort: "medium",
       ...overrides,
     };
+    normalizeFormOpenAiProtocol(config);
+    return config;
   }
 
   function createAuxiliaryConfig(
     overrides: Partial<BaseModelFormConfig> = {},
   ): BaseModelFormConfig {
-    return {
+    const config: BaseModelFormConfig = {
       baseUrl: "",
       urlMode: "standard",
       apiKey: "",
       model: "",
       provider: "anthropic",
-      openaiProtocol: "responses",
       protocolEndpoint: "",
       ...overrides,
     };
+    normalizeFormOpenAiProtocol(config);
+    return config;
   }
 
   function createWorkerConfig(
@@ -286,6 +306,72 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   function normalizeUrlMode(value: unknown): UrlMode {
     return value === "full" ? "full" : "standard";
+  }
+
+  function normalizeOpenAiProtocol(value: unknown): OpenAiProtocol | undefined {
+    return value === "chat" || value === "responses" ? value : undefined;
+  }
+
+  function getOpenAiProtocolValue(
+    config: Partial<BaseModelFormConfig> | undefined,
+  ): OpenAiProtocol {
+    return normalizeOpenAiProtocol(config?.openaiProtocol) || "responses";
+  }
+
+  function setOpenAiProtocolValue(
+    config: BaseModelFormConfig | undefined,
+    value: unknown,
+  ): void {
+    if (!config) {
+      return;
+    }
+    const normalized = normalizeOpenAiProtocol(value);
+    if (normalized === "chat") {
+      config.openaiProtocol = "chat";
+      return;
+    }
+    delete config.openaiProtocol;
+  }
+
+  function normalizeFormOpenAiProtocol(config: BaseModelFormConfig): void {
+    setOpenAiProtocolValue(config, config.openaiProtocol);
+  }
+
+  function buildBaseModelConfigPayload(
+    config: BaseModelFormConfig,
+  ): BaseModelConfigPayload {
+    const payload: BaseModelConfigPayload = {
+      baseUrl: config.baseUrl,
+      urlMode: config.urlMode,
+      apiKey: config.apiKey,
+      model: config.model,
+      provider: config.provider,
+      protocolEndpoint: config.protocolEndpoint,
+    };
+    const protocol = normalizeOpenAiProtocol(config.openaiProtocol);
+    if (config.provider === "openai" && protocol === "chat") {
+      payload.openaiProtocol = protocol;
+    }
+    return payload;
+  }
+
+  function buildInteractiveModelConfigPayload(
+    config: InteractiveModelFormConfig,
+  ): InteractiveModelConfigPayload {
+    return {
+      ...buildBaseModelConfigPayload(config),
+      enableThinking: config.thinking,
+      reasoningEffort: config.reasoningEffort,
+    };
+  }
+
+  function buildWorkerModelConfigPayload(
+    config: WorkerModelFormConfig,
+  ): WorkerModelConfigPayload {
+    return {
+      ...buildInteractiveModelConfigPayload(config),
+      enabled: config.enabled,
+    };
   }
 
   function getBaseUrlPlaceholder(provider: string): string {
@@ -382,7 +468,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       apiKey: typeof config.apiKey === "string" ? config.apiKey.trim() : "",
       provider: config.provider || "",
       urlMode: config.urlMode || "standard",
-      openaiProtocol: config.openaiProtocol || "responses",
+      openaiProtocol: getOpenAiProtocolValue(config),
       protocolEndpoint: config.protocolEndpoint || "",
     });
   }
@@ -860,11 +946,18 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
     try {
       if (target === "worker") {
-        await testAgentWorkerConnection(workerKey, { ...config });
+        await testAgentWorkerConnection(
+          workerKey,
+          buildWorkerModelConfigPayload(config as WorkerModelFormConfig),
+        );
       } else if (target === "orch") {
-        await testAgentOrchestratorConnection({ ...config });
+        await testAgentOrchestratorConnection(
+          buildInteractiveModelConfigPayload(config as InteractiveModelFormConfig),
+        );
       } else {
-        await testAgentAuxiliaryConnection({ ...config });
+        await testAgentAuxiliaryConnection(
+          buildBaseModelConfigPayload(config as BaseModelFormConfig),
+        );
       }
       return {
         key: statusKey,
@@ -895,8 +988,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
       successRate: stats.successRate,
       totalInputTokens: stats.totalInputTokens,
       totalOutputTokens: stats.totalOutputTokens,
-      totalCacheReadTokens: stats.totalCacheReadTokens,
-      totalCacheWriteTokens: stats.totalCacheWriteTokens,
       totalTokens: stats.totalTokens,
       resolvedModel: stats.resolvedModel,
     };
@@ -920,8 +1011,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
   function recomputeTokenStatsSummary() {
     totalInputTokens = executionStats.reduce((sum, stats) => sum + toSafeTokenCount(stats.netInputTokens), 0);
     totalOutputTokens = executionStats.reduce((sum, stats) => sum + toSafeTokenCount(stats.netOutputTokens), 0);
-    totalCacheReadTokens = executionStats.reduce((sum, stats) => sum + toSafeTokenCount(stats.cacheReadTokens), 0);
-    totalCacheWriteTokens = executionStats.reduce((sum, stats) => sum + toSafeTokenCount(stats.cacheWriteTokens), 0);
   }
 
   function applySettingsBootstrapPayload(
@@ -1425,8 +1514,20 @@ function createSettingsStore(props: { onClose?: () => void }) {
       config = compConfig;
     }
 
+    if (!config) {
+      fetchingModels[key] = false;
+      fetchingModels = { ...fetchingModels };
+      return;
+    }
+
     try {
-      const result = await fetchAgentModelList(config, key);
+      const payload =
+        target === "worker"
+          ? buildWorkerModelConfigPayload(config as WorkerModelFormConfig)
+          : target === "orch"
+            ? buildInteractiveModelConfigPayload(config as InteractiveModelFormConfig)
+            : buildBaseModelConfigPayload(config as BaseModelFormConfig);
+      const result = await fetchAgentModelList(payload, key);
       fetchingModels[key] = false;
       fetchingModels = { ...fetchingModels };
       if ((result as any)?.success && Array.isArray((result as any)?.models)) {
@@ -1511,53 +1612,24 @@ function createSettingsStore(props: { onClose?: () => void }) {
         // 如果是未保存的新引擎，先持久化到 Registry + LLM Config
         if (unsavedEngines.has(workerKey)) {
           const displayName = engineDisplayNames.get(workerKey) || workerKey;
+          const workerPayload = buildWorkerModelConfigPayload(wc);
           await upsertAgentRegistryEngine({
             id: workerKey,
             displayName,
-            llm: {
-              baseUrl: wc.baseUrl,
-              urlMode: wc.urlMode as "standard" | "full",
-              apiKey: wc.apiKey,
-              model: wc.model,
-              provider: wc.provider,
-              openaiProtocol: wc.openaiProtocol,
-              protocolEndpoint: wc.protocolEndpoint,
-              enabled: wc.enabled,
-              enableThinking: wc.thinking,
-              reasoningEffort: wc.reasoningEffort,
-            },
+            llm: workerPayload,
           });
         }
-        await saveAgentWorkerConfig(workerKey, {
-          baseUrl: wc.baseUrl,
-          urlMode: wc.urlMode,
-          apiKey: wc.apiKey,
-          model: wc.model,
-          provider: wc.provider,
-          openaiProtocol: wc.openaiProtocol,
-          protocolEndpoint: wc.protocolEndpoint,
-          enabled: wc.enabled,
-          enableThinking: wc.thinking,
-          reasoningEffort: wc.reasoningEffort,
-        });
+        await saveAgentWorkerConfig(workerKey, buildWorkerModelConfigPayload(wc));
         // 保存成功后标记为已持久化
         unsavedEngines.delete(workerKey);
         engineDisplayNames.delete(workerKey);
         await loadRegistryData();
       } else if (target === "orch") {
-        await saveAgentOrchestratorConfig({
-          baseUrl: orchConfig.baseUrl,
-          urlMode: orchConfig.urlMode,
-          apiKey: orchConfig.apiKey,
-          model: orchConfig.model,
-          provider: orchConfig.provider,
-          openaiProtocol: orchConfig.openaiProtocol,
-          protocolEndpoint: orchConfig.protocolEndpoint,
-          enableThinking: orchConfig.thinking,
-          reasoningEffort: orchConfig.reasoningEffort,
-        });
+        await saveAgentOrchestratorConfig(
+          buildInteractiveModelConfigPayload(orchConfig),
+        );
       } else if (target === "comp") {
-        await saveAgentAuxiliaryConfig({ ...compConfig });
+        await saveAgentAuxiliaryConfig(buildBaseModelConfigPayload(compConfig));
       }
 
       saveStatus[key] = "saved";
@@ -2242,8 +2314,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
       totalTokens: number;
       netInputTokens: number;
       netOutputTokens: number;
-      cacheReadTokens: number;
-      cacheWriteTokens: number;
     }>
   >([]);
 
@@ -2275,7 +2345,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           apiKey: config.apiKey || "",
           model: config.model || "",
           provider: config.provider || "anthropic",
-          openaiProtocol: config.openaiProtocol || "responses",
+          openaiProtocol: normalizeOpenAiProtocol(config.openaiProtocol),
           protocolEndpoint: config.protocolEndpoint || "",
           enabled: config.enabled !== false,
           thinking: config.enableThinking === true,
@@ -2302,7 +2372,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       apiKey: config.apiKey || "",
       model: config.model || "",
       provider: config.provider || "anthropic",
-      openaiProtocol: config.openaiProtocol || "responses",
+      openaiProtocol: normalizeOpenAiProtocol(config.openaiProtocol),
       protocolEndpoint: config.protocolEndpoint || "",
       thinking: config.enableThinking === true,
       reasoningEffort: config.reasoningEffort || "medium",
@@ -2319,7 +2389,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       apiKey: config.apiKey || "",
       model: config.model || "",
       provider: config.provider || "anthropic",
-      openaiProtocol: config.openaiProtocol || "responses",
+      openaiProtocol: normalizeOpenAiProtocol(config.openaiProtocol),
       protocolEndpoint: config.protocolEndpoint || "",
     });
   }
@@ -2489,8 +2559,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
             totalTokens: toSafeTokenCount(item?.totalTokens),
             netInputTokens: toSafeTokenCount(item?.netInputTokens),
             netOutputTokens: toSafeTokenCount(item?.netOutputTokens),
-            cacheReadTokens: toSafeTokenCount(item?.cacheReadTokens),
-            cacheWriteTokens: toSafeTokenCount(item?.cacheWriteTokens),
           }));
           recomputeTokenStatsSummary();
         } else if (payload?.totals) {
@@ -2499,12 +2567,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
           );
           totalOutputTokens = toSafeTokenCount(
             payload.totals.netOutputTokens,
-          );
-          totalCacheReadTokens = toSafeTokenCount(
-            payload.totals.cacheReadTokens,
-          );
-          totalCacheWriteTokens = toSafeTokenCount(
-            payload.totals.cacheWriteTokens,
           );
         }
       }
@@ -2520,8 +2582,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
             totalTokens: toSafeTokenCount(item?.totalTokens),
             netInputTokens: toSafeTokenCount(item?.netInputTokens),
             netOutputTokens: toSafeTokenCount(item?.netOutputTokens),
-            cacheReadTokens: toSafeTokenCount(item?.cacheReadTokens),
-            cacheWriteTokens: toSafeTokenCount(item?.cacheWriteTokens),
           }));
           recomputeTokenStatsSummary();
         }
@@ -2564,12 +2624,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     get totalOutputTokens() {
       return totalOutputTokens;
-    },
-    get totalCacheReadTokens() {
-      return totalCacheReadTokens;
-    },
-    get totalCacheWriteTokens() {
-      return totalCacheWriteTokens;
     },
     get totalTokens() {
       return totalTokens;
@@ -2772,6 +2826,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     getBaseUrlPlaceholder,
     shouldRecommendStandardUrlMode,
+    getOpenAiProtocolValue,
+    setOpenAiProtocolValue,
     openModelDropdown,
     closeAllModelDropdowns,
     handleConfirmYes,

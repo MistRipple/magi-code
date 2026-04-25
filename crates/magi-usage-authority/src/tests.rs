@@ -76,7 +76,7 @@ fn test_normalize_usage_delta() {
     assert_eq!(normalized.cache_write_tokens, 100);
     assert_eq!(normalized.net_input_tokens, 1000);
     assert_eq!(normalized.net_output_tokens, 500);
-    assert_eq!(normalized.total_tokens, 1800);
+    assert_eq!(normalized.total_tokens, 1500);
 }
 
 #[test]
@@ -90,7 +90,7 @@ fn test_normalize_usage_delta_subtracts_included_cache_read() {
     };
     let normalized = normalize_usage_delta(&delta);
     assert_eq!(normalized.net_input_tokens, 800);
-    assert_eq!(normalized.total_tokens, 1600);
+    assert_eq!(normalized.total_tokens, 1300);
 }
 
 #[test]
@@ -159,6 +159,11 @@ fn test_append_and_get_session_snapshot() {
     assert_eq!(snapshot.totals.llm_call_count, 1);
     assert_eq!(snapshot.totals.raw_input_tokens, 1000);
     assert_eq!(snapshot.totals.raw_output_tokens, 500);
+    assert_eq!(snapshot.totals.cache_read_tokens, 100);
+    assert_eq!(snapshot.totals.cache_write_tokens, 50);
+    assert_eq!(snapshot.totals.net_input_tokens, 1000);
+    assert_eq!(snapshot.totals.net_output_tokens, 500);
+    assert_eq!(snapshot.totals.total_tokens, 1500);
     assert_eq!(snapshot.totals.success_count, 1);
     assert_eq!(snapshot.totals.failure_count, 0);
 }

@@ -4,7 +4,9 @@ use axum::{
     routing::{get, post},
 };
 use magi_core::UtcMillis;
-use magi_usage_authority::{UsageAuthority, UsageCallRecordInput};
+use magi_usage_authority::{
+    SessionSummary, UsageAuthority, UsageCallRecordInput, UsageModelSnapshot, UsageTotals,
+};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -1090,9 +1092,9 @@ async fn session_stats(
             "version": snapshot.version,
             "lastAppliedLedgerSeq": snapshot.last_applied_ledger_seq,
             "updatedAt": snapshot.updated_at,
-            "totals": snapshot.totals,
+            "totals": usage_totals_json(&snapshot.totals),
             "items": snapshot.by_execution_binding.into_iter().map(usage_binding_item_json).collect::<Vec<_>>(),
-            "models": snapshot.by_model_identity,
+            "models": snapshot.by_model_identity.into_iter().map(usage_model_item_json).collect::<Vec<_>>(),
         }))
     } else {
         let snapshot = authority.get_workspace_snapshot(&workspace_id);
@@ -1103,10 +1105,10 @@ async fn session_stats(
             "version": snapshot.version,
             "lastAppliedLedgerSeq": snapshot.version,
             "updatedAt": snapshot.updated_at,
-            "totals": snapshot.totals,
+            "totals": usage_totals_json(&snapshot.totals),
             "items": snapshot.by_execution_binding.into_iter().map(usage_binding_item_json).collect::<Vec<_>>(),
-            "models": snapshot.by_model_identity,
-            "sessions": snapshot.by_session,
+            "models": snapshot.by_model_identity.into_iter().map(usage_model_item_json).collect::<Vec<_>>(),
+            "sessions": snapshot.by_session.into_iter().map(usage_session_summary_json).collect::<Vec<_>>(),
         }))
     }
 }
@@ -1156,8 +1158,41 @@ fn usage_binding_item_json(
         "totalTokens": binding.totals.total_tokens,
         "netInputTokens": binding.totals.net_input_tokens,
         "netOutputTokens": binding.totals.net_output_tokens,
-        "cacheReadTokens": binding.totals.cache_read_tokens,
-        "cacheWriteTokens": binding.totals.cache_write_tokens,
+    })
+}
+
+fn usage_totals_json(totals: &UsageTotals) -> serde_json::Value {
+    serde_json::json!({
+        "llmCallCount": totals.llm_call_count,
+        "assignmentCount": totals.assignment_count,
+        "turnCount": totals.turn_count,
+        "totalTokens": totals.total_tokens,
+        "netInputTokens": totals.net_input_tokens,
+        "netOutputTokens": totals.net_output_tokens,
+        "successCount": totals.success_count,
+        "failureCount": totals.failure_count,
+    })
+}
+
+fn usage_model_item_json(model: UsageModelSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "modelIdentityKey": model.model_identity_key,
+        "provider": model.provider,
+        "declaredModelSpec": model.declared_model_spec,
+        "resolvedModel": model.resolved_model,
+        "baseUrlFingerprint": model.base_url_fingerprint,
+        "reasoningEffort": model.reasoning_effort,
+        "enableThinking": model.enable_thinking,
+        "totals": usage_totals_json(&model.totals),
+    })
+}
+
+fn usage_session_summary_json(summary: SessionSummary) -> serde_json::Value {
+    serde_json::json!({
+        "sessionId": summary.session_id,
+        "version": summary.version,
+        "updatedAt": summary.updated_at,
+        "totals": usage_totals_json(&summary.totals),
     })
 }
 
@@ -1387,7 +1422,9 @@ mod tests {
             },
             "usage": {
                 "inputTokens": 12,
-                "outputTokens": 5
+                "outputTokens": 5,
+                "cacheReadTokens": 4,
+                "cacheWriteTokens": 3
             },
             "status": "success"
         });
@@ -1420,10 +1457,24 @@ mod tests {
         assert_eq!(payload["totals"]["netInputTokens"], serde_json::json!(12));
         assert_eq!(payload["totals"]["netOutputTokens"], serde_json::json!(5));
         assert_eq!(payload["totals"]["totalTokens"], serde_json::json!(17));
+        assert!(payload["totals"].get("cacheReadTokens").is_none());
+        assert!(payload["totals"].get("cacheWriteTokens").is_none());
+        assert!(
+            payload["models"][0]["totals"]
+                .get("cacheReadTokens")
+                .is_none()
+        );
+        assert!(
+            payload["models"][0]["totals"]
+                .get("cacheWriteTokens")
+                .is_none()
+        );
         assert_eq!(
             payload["items"][0]["templateId"],
             serde_json::json!("orchestrator")
         );
+        assert!(payload["items"][0].get("cacheReadTokens").is_none());
+        assert!(payload["items"][0].get("cacheWriteTokens").is_none());
 
         let _ = reset_stats(
             State(state.clone()),
