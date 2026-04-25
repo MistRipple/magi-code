@@ -16,6 +16,7 @@ import { getAgentColor } from '../lib/agent-colors';
     getStatusClass,
     getWorkerDisplayName,
     statusTexts,
+    statsDisplayKeys,
   } = $props<{
     totalInputTokens: number;
     totalOutputTokens: number;
@@ -28,6 +29,7 @@ import { getAgentColor } from '../lib/agent-colors';
     getStatusClass: (status: string) => string;
     getWorkerDisplayName: (worker: string) => string;
     statusTexts: Record<string, () => string>;
+    statsDisplayKeys: string[];
   }>();
 
   function formatTokens(tokens: number | undefined): string {
@@ -72,9 +74,9 @@ import { getAgentColor } from '../lib/agent-colors';
       </div>
 
       <div class="apple-grid">
-        {#each Object.keys(modelStatuses) as worker}
-          {@const status = modelStatuses[worker]}
+        {#each statsDisplayKeys as worker}
           {@const workerStats = getWorkerStats(worker)}
+          {@const status = modelStatuses[worker] || { status: workerStats ? 'configured' : 'checking', model: workerStats?.resolvedModel }}
           {@const statusClass = getStatusClass(status?.status || 'checking')}
           {@const agentColorPair = getAgentColor(worker)}
           {@const modelLabel = workerStats?.resolvedModel
