@@ -10,20 +10,39 @@ export function mergeCompleteBlocksForFinalization(
   const safeComplete = ensureArray(completeBlocks).filter((block): block is ContentBlock => !!block && typeof block === 'object' && 'type' in block);
 
   if (safeExisting.length > 0 && safeComplete.length > 0) {
+    const completeTextCodeBlocks = safeComplete.filter(isRenderableTextOrCodeBlock);
+    const completeHasTextCode = completeTextCodeBlocks.length > 0;
+    let insertedCompleteTextCode = false;
+    const baseBlocks = completeHasTextCode
+      ? safeExisting.flatMap((block) => {
+          if (block.type !== 'text' && block.type !== 'code') {
+            return [block];
+          }
+          if (insertedCompleteTextCode) {
+            return [];
+          }
+          insertedCompleteTextCode = true;
+          return completeTextCodeBlocks;
+        })
+      : safeExisting;
+    if (completeHasTextCode && !insertedCompleteTextCode) {
+      baseBlocks.push(...completeTextCodeBlocks);
+    }
+
     const existingToolIds = new Set(
-      safeExisting
+      baseBlocks
         .filter(block => block.type === 'tool_call' && block.toolCall?.id)
         .map(block => block.toolCall!.id),
     );
     const existingThinkingIds = new Set(
-      safeExisting
+      baseBlocks
         .filter(block => block.type === 'thinking' && (block.id || block.thinking?.blockId))
         .map(block => block.id || block.thinking!.blockId),
     );
 
     const supplements: ContentBlock[] = [];
     const existingStructuredFingerprints = new Set(
-      safeExisting
+      baseBlocks
         .map((block) => buildStructuredBlockFingerprint(block))
         .filter((fingerprint): fingerprint is string => Boolean(fingerprint)),
     );
@@ -47,7 +66,7 @@ export function mergeCompleteBlocksForFinalization(
       }
     }
 
-    return supplements.length > 0 ? [...safeExisting, ...supplements] : safeExisting;
+    return supplements.length > 0 ? [...baseBlocks, ...supplements] : baseBlocks;
   }
 
   if (safeExisting.length > 0) {
@@ -59,6 +78,12 @@ export function mergeCompleteBlocksForFinalization(
 
   const safeBase = ensureArray(baseBlocks).filter((block): block is ContentBlock => !!block && typeof block === 'object' && 'type' in block);
   return safeBase.length > 0 ? safeBase : undefined;
+}
+
+function isRenderableTextOrCodeBlock(block: ContentBlock): boolean {
+  return (block.type === 'text' || block.type === 'code')
+    && typeof block.content === 'string'
+    && block.content.length > 0;
 }
 
 function buildStructuredBlockFingerprint(block: ContentBlock): string | null {

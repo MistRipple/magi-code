@@ -416,6 +416,8 @@ export interface MessageMetadata {
   requestId?: string;
   timelineAnchorTimestamp?: number;
   turnId?: string;
+  turnItemId?: string;
+  turnItemKind?: string;
   eventId?: string;
   eventSeq?: number;
   cardId?: string;

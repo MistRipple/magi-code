@@ -3909,45 +3909,27 @@ export function applyTimelineStreamPatch(messageId: string, updates: Partial<Mes
 }
 
 // ────────────────────────────────────────────────────────────────
-// 流式文本收集器（设计参考 Codex: MarkdownStreamCollector + StreamState）
+// 流式文本收集器
 //
 // 核心思路：将"数据累积"和"渲染决策"分离。
 //   - delta 追加到 buffer（纯字符串拼接，零渲染开销）
-//   - 只在遇到 '\n' 时 commit 完整行，触发一次渲染更新
+//   - 每次 delta 都提供完整可渲染快照；RAF 合并层负责把同帧更新压成一次状态写入
 //   - finalize 时 flush 所有剩余内容
-// 这避免了每个小 token 都触发一次 DOM 更新，保证 Markdown 渲染的结构完整性。
+// 不能按换行符截断渲染，否则没有换行的长句会持续收流但 UI 不继续更新。
 // ────────────────────────────────────────────────────────────────
 
 class StreamingTextCollector {
   /** 累积的完整原始文本 */
   private buffer = '';
-  /** 已 commit 到渲染层的文本长度（游标） */
-  private committedLength = 0;
 
   /** 追加增量文本到缓冲区（不触发渲染） */
   pushDelta(delta: string): void {
     this.buffer += delta;
   }
 
-  /**
-   * Newline-gated commit：提交截至最后一个换行符的完整文本。
-   * 返回当前应渲染的完整累积文本（从头到最后一个 '\n'）。
-   * 如果没有新的完整行，返回 null（表示无需更新渲染）。
-   */
-  commitCompleteLines(): string | null {
-    const lastNewline = this.buffer.lastIndexOf('\n');
-    if (lastNewline < 0) {
-      // 没有换行符，不 commit
-      return null;
-    }
-    const commitEnd = lastNewline + 1;
-    if (commitEnd <= this.committedLength) {
-      // 没有新的完整行
-      return null;
-    }
-    this.committedLength = commitEnd;
-    // 返回从头到 commit 游标的完整文本
-    return this.buffer.slice(0, this.committedLength);
+  /** 当前可交给渲染层的完整快照 */
+  getRenderableText(): string {
+    return this.buffer;
   }
 
   /**
@@ -3956,23 +3938,7 @@ class StreamingTextCollector {
   finalize(): string {
     const result = this.buffer;
     this.buffer = '';
-    this.committedLength = 0;
     return result;
-  }
-
-  /** 获取当前已 commit 的文本（用于中途状态恢复） */
-  getCommittedText(): string {
-    return this.buffer.slice(0, this.committedLength);
-  }
-
-  /** 获取完整缓冲区文本 */
-  getFullBuffer(): string {
-    return this.buffer;
-  }
-
-  /** 当前是否有未 commit 的 pending 内容 */
-  hasPending(): boolean {
-    return this.committedLength < this.buffer.length;
   }
 }
 
@@ -3984,8 +3950,8 @@ const activeStreamCollectors = new Map<string, StreamingTextCollector>();
  *
  * 设计参考 Codex 的 MarkdownStreamCollector + StreamController：
  * 1. delta 追加到 collector buffer（纯内存操作，无渲染开销）
- * 2. 只在 delta 包含 '\n' 时，commit 完整行并触发 RAF 渲染更新
- * 3. 连续小 token（无换行）不会触发任何渲染，减少 DOM 重建次数
+ * 2. 立即生成完整可渲染快照并交给 RAF 合并层
+ * 3. MarkdownContent 内部还有自适应节流，避免长文本全量解析过频
  *
  * @param entryId 后端 timeline entry ID
  * @param delta 本次新增的增量文本片段
@@ -4012,66 +3978,39 @@ export function applyStreamingDelta(
 
   // 追加 delta 到缓冲区
   collector.pushDelta(delta);
+  const renderableText = collector.getRenderableText();
+  if (renderableText.length === 0) {
+    return;
+  }
 
-  // Newline-gated：只在有完整行时才 commit 渲染
-  const hasNewline = delta.includes('\n');
-  const committedText = hasNewline ? collector.commitCompleteLines() : null;
-
-  if (committedText !== null) {
-    // 有新的完整行 → 触发渲染更新
-    const existingNode = messagesState.timelineNodes.find((n) => n.nodeId === nodeId);
-    if (existingNode) {
-      enqueueTimelineStreamUpdate(nodeId, {
-        content: committedText,
-        blocks: [{ type: 'text', content: committedText }],
-        isStreaming: true,
-        isComplete: false,
-        updatedAt: Date.now(),
-      });
-    } else {
-      // 节点尚不存在：创建节点
-      const now = Date.now();
-      upsertTimelineNode({
-        id: nodeId,
-        role: 'assistant',
-        source: 'orchestrator',
-        content: committedText,
-        blocks: [{ type: 'text', content: committedText }],
-        timestamp: now,
-        updatedAt: now,
-        isStreaming: true,
-        isComplete: false,
-        type: 'text',
-        metadata: {
-          sessionId: sessionId || messagesState.currentSessionId || '',
-          eventSeq: 0,
-          timelineAnchorTimestamp: now,
-        },
-      } as Message, { thread: true }, { displayOrder: undefined });
-    }
-  } else if (!messagesState.timelineNodes.find((n) => n.nodeId === nodeId)) {
-    // 第一个 delta 还没有换行，但节点不存在：创建空的流式占位节点
-    const bufferText = collector.getFullBuffer();
-    if (bufferText.length > 0) {
-      const now = Date.now();
-      upsertTimelineNode({
-        id: nodeId,
-        role: 'assistant',
-        source: 'orchestrator',
-        content: bufferText,
-        blocks: [{ type: 'text', content: bufferText }],
-        timestamp: now,
-        updatedAt: now,
-        isStreaming: true,
-        isComplete: false,
-        type: 'text',
-        metadata: {
-          sessionId: sessionId || messagesState.currentSessionId || '',
-          eventSeq: 0,
-          timelineAnchorTimestamp: now,
-        },
-      } as Message, { thread: true }, { displayOrder: undefined });
-    }
+  const existingNode = messagesState.timelineNodes.find((n) => n.nodeId === nodeId);
+  if (existingNode) {
+    enqueueTimelineStreamUpdate(nodeId, {
+      content: renderableText,
+      blocks: [{ type: 'text', content: renderableText }],
+      isStreaming: true,
+      isComplete: false,
+      updatedAt: Date.now(),
+    });
+  } else {
+    const now = Date.now();
+    upsertTimelineNode({
+      id: nodeId,
+      role: 'assistant',
+      source: 'orchestrator',
+      content: renderableText,
+      blocks: [{ type: 'text', content: renderableText }],
+      timestamp: now,
+      updatedAt: now,
+      isStreaming: true,
+      isComplete: false,
+      type: 'text',
+      metadata: {
+        sessionId: sessionId || messagesState.currentSessionId || '',
+        eventSeq: 0,
+        timelineAnchorTimestamp: now,
+      },
+    } as Message, { thread: true }, { displayOrder: undefined });
   }
 }
 
