@@ -4,18 +4,13 @@ use magi_event_bus::EventEnvelope;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{errors::ApiError, state::ApiState, task_execution::finalize_terminal_worker_branches};
+use super::session_scope::parse_session_id;
+use crate::{
+    errors::ApiError, execution_chain_recovery::finalize_terminal_worker_branches, state::ApiState,
+};
 
 pub fn routes() -> Router<ApiState> {
     Router::new().route("/task/interrupt", post(interrupt_task))
-}
-
-fn parse_session_id(value: Option<&str>) -> Result<SessionId, ApiError> {
-    let session_id = value
-        .map(str::trim)
-        .filter(|session_id| !session_id.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("sessionId 不能为空".to_string()))?;
-    Ok(SessionId::new(session_id))
 }
 
 fn require_session_owned_task(

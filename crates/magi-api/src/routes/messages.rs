@@ -3,10 +3,14 @@ use axum::{
     extract::{Query, State},
     routing::get,
 };
-use magi_core::{SessionId, UtcMillis};
+use magi_core::UtcMillis;
 use magi_session_store::{NotificationRecord, SessionRecord, TimelineEntry};
 use serde::{Deserialize, Serialize};
 
+use super::session_scope::{
+    parse_session_id, require_current_session_record_in_workspace,
+    require_session_record_in_workspace,
+};
 use crate::{errors::ApiError, state::ApiState};
 
 pub fn routes() -> Router<ApiState> {
@@ -40,38 +44,27 @@ async fn get_messages(
     State(state): State<ApiState>,
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<MessagesResponseDto>, ApiError> {
-    let session_id = match query
+    let requested_workspace_id = query
+        .workspace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|workspace_id| !workspace_id.is_empty());
+    let current_session = match query
         .session_id
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
         Some(id) => {
-            let sid = SessionId::new(id);
-            let Some(session) = state.session_store.session(&sid) else {
-                return Err(ApiError::session_not_found(id));
-            };
-            let requested_workspace_id = query
-                .workspace_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            if let Some(workspace_id) = requested_workspace_id {
-                if session.workspace_id.as_deref() != Some(workspace_id) {
-                    return Err(ApiError::InvalidInput(format!(
-                        "会话 {} 不属于 workspace {}",
-                        sid, workspace_id
-                    )));
-                }
-            }
-            sid
+            let sid = parse_session_id(Some(id))?;
+            require_session_record_in_workspace(&state, &sid, requested_workspace_id)?
         }
-        None => state
-            .session_store
-            .current_session()
-            .map(|s| s.session_id)
-            .ok_or_else(|| ApiError::InvalidInput("当前没有活动 session".to_string()))?,
+        None => require_current_session_record_in_workspace(&state, requested_workspace_id)?,
     };
+    let session_id = current_session.session_id.clone();
+    let scope_workspace_id = requested_workspace_id
+        .map(str::to_string)
+        .or_else(|| current_session.workspace_id.clone());
 
     let timeline = state.session_store.timeline_for_session(&session_id);
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
@@ -89,13 +82,13 @@ async fn get_messages(
     };
     let start = end.saturating_sub(limit);
     let page = timeline[start..end].to_vec();
-    let current_session = state.session_store.session(&session_id);
+    let sessions = state.session_records_for_workspace(scope_workspace_id.as_deref());
     let before_cursor = page.first().map(|entry| entry.entry_id.clone());
 
     Ok(Json(MessagesResponseDto {
         generated_at: UtcMillis::now(),
-        current_session,
-        sessions: state.session_store.sessions(),
+        current_session: Some(current_session),
+        sessions,
         timeline: page,
         notifications: state.session_store.notifications_for_session(&session_id),
         session_id: session_id.to_string(),

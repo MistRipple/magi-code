@@ -3,9 +3,10 @@ use axum::{
     extract::{Path, Query, State},
     routing::{get, post},
 };
-use magi_core::{SessionId, TaskId};
+use magi_core::TaskId;
 use serde::Deserialize;
 
+use super::session_scope::parse_session_id;
 use crate::{errors::ApiError, state::ApiState};
 
 pub fn routes() -> Router<ApiState> {
@@ -27,14 +28,6 @@ fn require_task_store(
 #[serde(rename_all = "camelCase")]
 struct SessionScopedTaskQuery {
     session_id: Option<String>,
-}
-
-fn parse_session_id(value: Option<&str>) -> Result<SessionId, ApiError> {
-    let session_id = value
-        .map(str::trim)
-        .filter(|session_id| !session_id.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("sessionId 不能为空".to_string()))?;
-    Ok(SessionId::new(session_id))
 }
 
 fn require_session_task(

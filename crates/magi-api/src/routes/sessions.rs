@@ -15,18 +15,21 @@ use magi_session_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::append_session_user_message;
+use super::{append_session_user_message, session_scope::require_session_record_in_workspace};
 use crate::{
     dto::{
         BootstrapDto, SessionNotificationsResponseDto, SessionTurnRequestDto,
         SessionTurnResponseDto, SessionTurnRouteDto,
     },
     errors::ApiError,
+    execution_chain_recovery::{
+        SessionContinueAccepted, active_execution_branch_is_continue_recoverable,
+        continue_shadow_execution_chain,
+    },
     state::ApiState,
     task_execution::{
-        BUSINESS_MODEL_PROVIDER, SessionTurnExecutionRequest,
-        active_execution_branch_is_continue_recoverable, continue_shadow_execution_chain,
-        drive_shadow_task_graph, resolve_configured_model_client,
+        BUSINESS_MODEL_PROVIDER, SessionTurnExecutionRequest, drive_shadow_task_graph,
+        resolve_configured_model_client,
     },
 };
 
@@ -625,7 +628,7 @@ fn publish_regular_session_turn_accepted_event(
 
 fn publish_session_turn_continue_event(
     state: &ApiState,
-    accepted: &crate::task_execution::SessionContinueAccepted,
+    accepted: &SessionContinueAccepted,
     continued_at: UtcMillis,
 ) -> Result<EventId, ApiError> {
     let event_id = EventId::new(format!("event-session-turn-continue-{}", continued_at.0));
@@ -697,22 +700,13 @@ async fn switch_session(
     Json(request): Json<SwitchSessionRequest>,
 ) -> Result<Json<SessionSelectionResponseDto>, ApiError> {
     let session_id = SessionId::new(&request.session_id);
-    if let Some(workspace_id) = request
+    if request
         .workspace_id
         .as_deref()
         .map(str::trim)
-        .filter(|id| !id.is_empty())
+        .is_some_and(|id| !id.is_empty())
     {
-        let session = state
-            .session_store
-            .session(&session_id)
-            .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
-        if session.workspace_id.as_deref() != Some(workspace_id) {
-            return Err(ApiError::InvalidInput(format!(
-                "会话 {} 不属于 workspace {}",
-                session_id, workspace_id
-            )));
-        }
+        require_session_record_in_workspace(&state, &session_id, request.workspace_id.as_deref())?;
     }
     state
         .session_store
@@ -792,7 +786,7 @@ async fn continue_session(
 
 fn spawn_continue_session_finalize(
     state: ApiState,
-    accepted: crate::task_execution::SessionContinueAccepted,
+    accepted: SessionContinueAccepted,
     continued_at: UtcMillis,
 ) {
     tokio::task::spawn_blocking(move || {
