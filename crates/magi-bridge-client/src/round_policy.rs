@@ -13,7 +13,7 @@ pub fn build_continue_prompt(snapshot: &TerminationSnapshot) -> String {
             EXECUTION_OUTCOME_START,
             r#"{"status":"completed","next_steps":[]}"#,
             EXECUTION_OUTCOME_END,
-            "- 如果还需继续工作，请先输出结构化 Assignment Dispatch JSON，或通过 task_update 建立任务轨道。",
+            "- 如果还需继续工作，请先输出结构化 Assignment Dispatch JSON 建立任务轨道。",
         ]
         .join("\n");
     }
@@ -50,7 +50,7 @@ pub fn build_no_task_tool_loop_prompt(
         "[System] 你已在未建立任务轨道下连续执行 {} 轮工具调用（重复模式 {} 轮）。\n\
          - 下一轮已强制禁用工具，请直接二选一：\n\
          \x20 1) 给出最终结论与证据；\n\
-         \x20 2) 立即输出结构化 Assignment Dispatch JSON，或通过 task_update 建立必需任务轨道后再继续。\n\
+         \x20 2) 立即输出结构化 Assignment Dispatch JSON 建立必需任务轨道后再继续。\n\
          - 不要继续重复检索。",
         no_task_tool_round_streak, repeated_signature_streak,
     )

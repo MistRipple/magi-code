@@ -2263,8 +2263,14 @@ mod tests {
             "task_claim_next",
             "context_compact",
         ] {
-            assert!(BuiltinToolName::from_str(tool_name).is_none(), "{tool_name}");
-            assert!(registry.builtin_access_mode(tool_name).is_none(), "{tool_name}");
+            assert!(
+                BuiltinToolName::from_str(tool_name).is_none(),
+                "{tool_name}"
+            );
+            assert!(
+                registry.builtin_access_mode(tool_name).is_none(),
+                "{tool_name}"
+            );
             assert!(
                 registry
                     .builtin_specs()

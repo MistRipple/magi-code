@@ -12,7 +12,6 @@ fn concurrent_safe_tools() -> HashSet<&'static str> {
         "code_search_semantic",
         "process_read",
         "process_list",
-        "task_list",
         "project_knowledge_query",
     ]
     .into_iter()

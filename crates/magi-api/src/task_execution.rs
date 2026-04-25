@@ -28,7 +28,7 @@ use magi_session_store::{
     TimelineEntryKind,
 };
 use magi_tool_runtime::{
-    BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
+    ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
 };
 use magi_usage_authority::{
     ExecutionBindingIdentity, LlmConfig, OpenAiProtocol, ReasoningEffort, UrlMode,
@@ -1002,24 +1002,14 @@ impl ShadowTaskDispatcher {
         let _ = self.event_bus.publish(event);
     }
 
-    fn build_tool_definitions(&self, include_orchestration_tools: bool) -> Vec<ChatToolDefinition> {
+    fn build_tool_definitions(&self) -> Vec<ChatToolDefinition> {
         let Some(ref registry) = self.tool_registry else {
             return Vec::new();
         };
         let mut definitions = registry
             .builtin_specs()
             .into_iter()
-            .filter(|spec| {
-                if spec.name == SKILL_APPLY_TOOL_NAME {
-                    return false;
-                }
-                if include_orchestration_tools {
-                    return true;
-                }
-                !BuiltinToolName::from_str(&spec.name)
-                    .map(|tool_name| tool_name.is_orchestration())
-                    .unwrap_or(false)
-            })
+            .filter(|spec| spec.name != SKILL_APPLY_TOOL_NAME)
             .map(|spec| ChatToolDefinition {
                 kind: "function".to_string(),
                 function: ChatToolFunctionDefinition {
@@ -1571,7 +1561,7 @@ impl ShadowTaskDispatcher {
         );
 
         let tools = if request.use_tools {
-            let tool_defs = self.build_tool_definitions(false);
+            let tool_defs = self.build_tool_definitions();
             (!tool_defs.is_empty()).then_some(tool_defs)
         } else {
             None
@@ -1759,7 +1749,7 @@ impl ShadowTaskDispatcher {
         }
 
         let tools = if use_tools {
-            let tool_defs = self.build_tool_definitions(false);
+            let tool_defs = self.build_tool_definitions();
             if tool_defs.is_empty() {
                 None
             } else {
