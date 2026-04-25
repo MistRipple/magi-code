@@ -89,7 +89,6 @@ pub(crate) struct NormalizedModelConfig {
     url_mode: ModelUrlMode,
     url_mode_label: String,
     openai_protocol: Option<ModelOpenAiProtocol>,
-    openai_protocol_label: String,
     protocol_endpoint: Option<String>,
     reasoning_effort: Option<ModelReasoningEffort>,
     enable_thinking: Option<bool>,
@@ -97,9 +96,10 @@ pub(crate) struct NormalizedModelConfig {
 
 impl NormalizedModelConfig {
     pub(crate) fn from_settings_value(value: &Value, default_provider: &str) -> Self {
-        let provider = string_field(value, "provider")
-            .unwrap_or_else(|| default_provider.trim().to_string());
-        let url_mode_label = string_field(value, "urlMode").unwrap_or_else(|| "standard".to_string());
+        let provider =
+            string_field(value, "provider").unwrap_or_else(|| default_provider.trim().to_string());
+        let url_mode_label =
+            string_field(value, "urlMode").unwrap_or_else(|| "standard".to_string());
         let openai_protocol_label =
             string_field(value, "openaiProtocol").unwrap_or_else(|| "responses".to_string());
         Self {
@@ -110,7 +110,6 @@ impl NormalizedModelConfig {
             url_mode: ModelUrlMode::from_label(&url_mode_label),
             url_mode_label,
             openai_protocol: ModelOpenAiProtocol::from_label(&openai_protocol_label),
-            openai_protocol_label,
             protocol_endpoint: string_field(value, "protocolEndpoint"),
             reasoning_effort: value
                 .get("reasoningEffort")
@@ -287,7 +286,8 @@ impl NormalizedModelConfig {
     }
 
     fn effective_openai_protocol(&self) -> ModelOpenAiProtocol {
-        self.openai_protocol.unwrap_or(ModelOpenAiProtocol::Responses)
+        self.openai_protocol
+            .unwrap_or(ModelOpenAiProtocol::Responses)
     }
 }
 
@@ -340,7 +340,9 @@ mod tests {
         let error = config
             .openai_models_url()
             .expect_err("full path has no canonical models endpoint");
-        assert!(matches!(error, ApiError::InvalidInput(message) if message.contains("完整路径模式下不支持自动获取模型列表")));
+        assert!(
+            matches!(error, ApiError::InvalidInput(message) if message.contains("完整路径模式下不支持自动获取模型列表"))
+        );
     }
 
     #[test]

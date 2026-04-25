@@ -438,14 +438,13 @@ button {
     box-shadow var(--transition-fast);
 }
 
-[role="button"] {
+:where(button, [role="button"], .btn, .settings-btn, .apple-action-btn, .modal-btn) {
   white-space: nowrap;
   flex-wrap: nowrap;
 }
 
-button :where(svg, .icon),
-[role="button"] :where(svg, .icon) {
-  flex-shrink: 0;
+:where(button, [role="button"], .btn, .settings-btn, .apple-action-btn, .modal-btn) :where(svg, img, .icon) {
+  flex: 0 0 auto;
 }
 
 button:disabled {
@@ -1038,6 +1037,10 @@ pre code {
 
 /* 模态框按钮 */
 .modal-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
   height: var(--btn-height-md);
   padding: 0 var(--space-4);
   border-radius: var(--radius-md);

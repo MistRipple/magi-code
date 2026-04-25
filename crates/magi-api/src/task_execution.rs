@@ -4,6 +4,7 @@ pub use crate::session_turn_execution::{
 use crate::{
     builtin_tool_schema::builtin_tool_definition,
     errors::ApiError,
+    model_config::NormalizedModelConfig,
     prompt_utils::prepend_session_instructions,
     session_turn_execution::{SessionTurnExecutionRuntime, run_session_turn_execution},
     settings_store::SettingsStore,
@@ -12,7 +13,7 @@ use crate::{
     state::{ApiState, ShadowExecutionPipeline},
     usage_recording::{ModelUsageBinding, model_usage_binding_for_worker},
 };
-use magi_bridge_client::{ChatToolDefinition, HttpModelBridgeClient, ModelBridgeClient};
+use magi_bridge_client::{ChatToolDefinition, ModelBridgeClient};
 use magi_context_runtime::{
     ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
 };
@@ -121,30 +122,9 @@ pub fn resolve_configured_model_client(
 ) -> Option<Arc<dyn ModelBridgeClient>> {
     if let Some(store) = settings_store {
         let config = store.get_section("orchestrator");
-        let base_url = config
-            .get("baseUrl")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        if let Some(base_url) = base_url {
-            let api_key = config
-                .get("apiKey")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned);
-            let model = config
-                .get("model")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| "gpt-4".to_string());
-            return Some(Arc::new(HttpModelBridgeClient::new(
-                base_url.to_string(),
-                api_key,
-                model,
-            )));
+        let normalized = NormalizedModelConfig::from_settings_value(&config, "openai");
+        if let Some(client) = normalized.to_http_model_client("gpt-4") {
+            return Some(Arc::new(client));
         }
     }
     fallback

@@ -1,12 +1,11 @@
-use crate::settings_store::SettingsStore;
+use crate::{model_config::NormalizedModelConfig, settings_store::SettingsStore};
 use magi_core::{EventId, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::task_runner::WorkerInfo;
 use magi_session_store::SessionStore;
 use magi_usage_authority::{
-    ExecutionBindingIdentity, LlmConfig, OpenAiProtocol, ReasoningEffort, UrlMode,
-    UsageCallIdentity, UsageCallRecordInput, UsageCallStatus, UsagePhase, UsageSourceRole,
-    UsageTokenInput,
+    ExecutionBindingIdentity, LlmConfig, UsageCallIdentity, UsageCallRecordInput, UsageCallStatus,
+    UsagePhase, UsageSourceRole, UsageTokenInput,
 };
 use std::sync::Arc;
 
@@ -158,79 +157,14 @@ fn usage_model_config_for_binding(
         if let Some(config) = workers
             .get(&binding.engine_id)
             .or_else(|| workers.get(&binding.template_id))
-            .and_then(usage_model_config_from_settings)
+            .map(|value| NormalizedModelConfig::from_settings_value(value, "openai"))
+            .and_then(|config| config.to_usage_llm_config())
         {
             return Some(config);
         }
     }
-    usage_model_config_from_settings(&store.get_section("orchestrator"))
-}
-
-fn parse_usage_url_mode(value: Option<&str>) -> UrlMode {
-    match value {
-        Some("full") => UrlMode::Full,
-        Some("proxy") => UrlMode::Proxy,
-        _ => UrlMode::Default,
-    }
-}
-
-fn parse_usage_openai_protocol(value: Option<&str>) -> Option<OpenAiProtocol> {
-    match value {
-        Some("chat") => Some(OpenAiProtocol::Chat),
-        Some("responses") => Some(OpenAiProtocol::Responses),
-        _ => None,
-    }
-}
-
-fn parse_usage_reasoning_effort(value: Option<&str>) -> Option<ReasoningEffort> {
-    match value {
-        Some("low") => Some(ReasoningEffort::Low),
-        Some("medium") => Some(ReasoningEffort::Medium),
-        Some("high") => Some(ReasoningEffort::High),
-        Some("xhigh") => Some(ReasoningEffort::Xhigh),
-        _ => None,
-    }
-}
-
-fn usage_model_config_from_settings(value: &serde_json::Value) -> Option<LlmConfig> {
-    let base_url = value
-        .get("baseUrl")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())?;
-    let model = value
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())?;
-    Some(LlmConfig {
-        provider: value
-            .get("provider")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .unwrap_or("openai")
-            .to_string(),
-        model: model.to_string(),
-        base_url: base_url.to_string(),
-        api_key: value
-            .get("apiKey")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(ToOwned::to_owned),
-        url_mode: parse_usage_url_mode(value.get("urlMode").and_then(|v| v.as_str())),
-        openai_protocol: parse_usage_openai_protocol(
-            value.get("openaiProtocol").and_then(|v| v.as_str()),
-        ),
-        reasoning_effort: parse_usage_reasoning_effort(
-            value.get("reasoningEffort").and_then(|v| v.as_str()),
-        ),
-        enable_thinking: value
-            .get("enableThinking")
-            .and_then(|v| v.as_bool())
-            .or_else(|| value.get("thinking").and_then(|v| v.as_bool())),
-    })
+    let orchestrator = store.get_section("orchestrator");
+    NormalizedModelConfig::from_settings_value(&orchestrator, "openai").to_usage_llm_config()
 }
 
 fn usage_tokens_from_payload(usage: Option<&serde_json::Value>) -> Option<UsageTokenInput> {

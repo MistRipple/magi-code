@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 
-use crate::{errors::ApiError, state::ApiState};
+use crate::{errors::ApiError, model_config::NormalizedModelConfig, state::ApiState};
 
 fn unwrap_settings_section_request(request: &serde_json::Value) -> serde_json::Value {
     request
@@ -54,92 +54,18 @@ struct FetchModelsRequest {
     target: String,
 }
 
-#[derive(Debug)]
-struct FetchModelsConfig {
-    provider: String,
-    base_url: String,
-    api_key: String,
-    url_mode: String,
-}
-
-#[derive(Debug)]
-struct ConnectionProbeConfig {
-    provider: String,
-    base_url: String,
-    api_key: String,
-    model: String,
-    url_mode: String,
-    openai_protocol: String,
-    protocol_endpoint: String,
-}
-
 fn parse_fetch_models_config(
     request: FetchModelsRequest,
-) -> Result<(FetchModelsConfig, String), ApiError> {
-    let config = request.config;
-    let provider = config
-        .get("provider")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("openai")
-        .to_string();
-    let base_url = config
-        .get("baseUrl")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("模型配置缺少 baseUrl".to_string()))?
-        .to_string();
-    let api_key = config
-        .get("apiKey")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("模型配置缺少 apiKey".to_string()))?
-        .to_string();
-    let url_mode = config
-        .get("urlMode")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("standard")
-        .to_string();
-    if url_mode == "full" {
+) -> Result<(NormalizedModelConfig, String), ApiError> {
+    let config = NormalizedModelConfig::from_settings_value(&request.config, "openai");
+    config.require_base_url()?;
+    config.require_api_key()?;
+    if config.is_full_url_mode() {
         return Err(ApiError::InvalidInput(
             "完整路径模式下不支持自动获取模型列表，请手动填写模型名".to_string(),
         ));
     }
-    Ok((
-        FetchModelsConfig {
-            provider,
-            base_url,
-            api_key,
-            url_mode,
-        },
-        request.target,
-    ))
-}
-
-fn build_openai_models_url(base_url: &str) -> Result<String, ApiError> {
-    let normalized = base_url.trim().trim_end_matches('/');
-    if normalized.is_empty() {
-        return Err(ApiError::InvalidInput(
-            "模型配置缺少有效的 baseUrl".to_string(),
-        ));
-    }
-    if !normalized.starts_with("http://") && !normalized.starts_with("https://") {
-        return Err(ApiError::InvalidInput(
-            "baseUrl 必须以 http:// 或 https:// 开头".to_string(),
-        ));
-    }
-    if normalized.ends_with("/models") {
-        return Ok(normalized.to_string());
-    }
-    if normalized.ends_with("/v1") || normalized.ends_with("/v3") {
-        return Ok(format!("{normalized}/models"));
-    }
-    Ok(format!("{normalized}/v1/models"))
+    Ok((config, request.target))
 }
 
 fn parse_model_ids(payload: &Value) -> Vec<String> {
@@ -185,158 +111,34 @@ fn parse_model_ids(payload: &Value) -> Vec<String> {
     models
 }
 
-fn parse_connection_probe_config(request: Value) -> Result<ConnectionProbeConfig, ApiError> {
+fn parse_connection_probe_config(request: Value) -> Result<NormalizedModelConfig, ApiError> {
     let config = unwrap_settings_section_request(&request);
-    let provider = config
-        .get("provider")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("anthropic")
-        .to_ascii_lowercase();
-    let base_url = config
-        .get("baseUrl")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("模型配置缺少 baseUrl".to_string()))?
-        .to_string();
-    let api_key = config
-        .get("apiKey")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("模型配置缺少 apiKey".to_string()))?
-        .to_string();
-    let model = config
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("模型配置缺少 model".to_string()))?
-        .to_string();
-    let url_mode = config
-        .get("urlMode")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("standard")
-        .to_string();
-    let openai_protocol = config
-        .get("openaiProtocol")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("responses")
-        .to_string();
-    let protocol_endpoint = config
-        .get("protocolEndpoint")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("")
-        .to_string();
-
-    Ok(ConnectionProbeConfig {
-        provider,
-        base_url,
-        api_key,
-        model,
-        url_mode,
-        openai_protocol,
-        protocol_endpoint,
-    })
-}
-
-fn ensure_http_url(base_url: &str) -> Result<String, ApiError> {
-    let normalized = base_url.trim().trim_end_matches('/');
-    if normalized.is_empty() {
-        return Err(ApiError::InvalidInput(
-            "模型配置缺少有效的 baseUrl".to_string(),
-        ));
-    }
-    if !normalized.starts_with("http://") && !normalized.starts_with("https://") {
-        return Err(ApiError::InvalidInput(
-            "baseUrl 必须以 http:// 或 https:// 开头".to_string(),
-        ));
-    }
-    Ok(normalized.to_string())
-}
-
-fn build_openai_probe_url(config: &ConnectionProbeConfig) -> Result<String, ApiError> {
-    let normalized = ensure_http_url(&config.base_url)?;
-    if config.url_mode == "full" {
-        if config.protocol_endpoint.is_empty() {
-            return Ok(normalized);
-        }
-        return Ok(format!("{normalized}{}", config.protocol_endpoint));
-    }
-    let suffix = if config.openai_protocol == "chat" {
-        "/v1/chat/completions"
-    } else {
-        "/v1/responses"
-    };
-    Ok(format!("{normalized}{suffix}"))
-}
-
-fn build_anthropic_probe_url(config: &ConnectionProbeConfig) -> Result<String, ApiError> {
-    let normalized = ensure_http_url(&config.base_url)?;
-    if config.url_mode == "full" {
-        return Ok(normalized);
-    }
-    Ok(format!("{normalized}/v1/messages"))
-}
-
-fn build_openai_probe_body(config: &ConnectionProbeConfig) -> Value {
-    if config.openai_protocol == "chat" {
-        json!({
-            "model": config.model,
-            "messages": [{
-                "role": "user",
-                "content": "ping"
-            }],
-            "max_tokens": 1,
-            "stream": false,
-        })
-    } else {
-        json!({
-            "model": config.model,
-            "input": "ping",
-            "max_output_tokens": 1,
-        })
-    }
-}
-
-fn build_anthropic_probe_body(config: &ConnectionProbeConfig) -> Value {
-    json!({
-        "model": config.model,
-        "max_tokens": 1,
-        "messages": [{
-            "role": "user",
-            "content": "ping"
-        }]
-    })
+    let normalized = NormalizedModelConfig::from_settings_value(&config, "anthropic");
+    normalized.require_base_url()?;
+    normalized.require_api_key()?;
+    normalized.require_model()?;
+    Ok(normalized)
 }
 
 async fn execute_connection_probe(
-    config: &ConnectionProbeConfig,
+    config: &NormalizedModelConfig,
 ) -> Result<(u16, Value), ApiError> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-    let (url, body) = match config.provider.as_str() {
+    let provider_key = config.provider_key();
+    let (url, body) = match provider_key.as_str() {
         "openai" => {
-            let auth_value = HeaderValue::from_str(&format!("Bearer {}", config.api_key))
-                .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
+            let auth_value =
+                HeaderValue::from_str(&format!("Bearer {}", config.require_api_key()?))
+                    .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
             headers.insert(AUTHORIZATION, auth_value);
-            (
-                build_openai_probe_url(config)?,
-                build_openai_probe_body(config),
-            )
+            (config.openai_probe_url()?, config.openai_probe_body()?)
         }
         "anthropic" => {
             let api_key_name = HeaderName::from_static("x-api-key");
-            let api_key_value = HeaderValue::from_str(&config.api_key)
+            let api_key_value = HeaderValue::from_str(config.require_api_key()?)
                 .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
             headers.insert(api_key_name, api_key_value);
             headers.insert(
@@ -344,14 +146,14 @@ async fn execute_connection_probe(
                 HeaderValue::from_static("2023-06-01"),
             );
             (
-                build_anthropic_probe_url(config)?,
-                build_anthropic_probe_body(config),
+                config.anthropic_probe_url()?,
+                config.anthropic_probe_body()?,
             )
         }
         _ => {
             return Err(ApiError::InvalidInput(format!(
                 "暂不支持 {} 提供方的真实连接测试",
-                config.provider
+                config.provider()
             )));
         }
     };
@@ -1230,13 +1032,12 @@ async fn fetch_models(
     Json(request): Json<FetchModelsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (config, target) = parse_fetch_models_config(request)?;
-    let _ = (&config.provider, &config.url_mode);
-    let url = build_openai_models_url(&config.base_url)?;
+    let url = config.openai_models_url()?;
     let now = UtcMillis::now();
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let auth_value = HeaderValue::from_str(&format!("Bearer {}", config.api_key))
+    let auth_value = HeaderValue::from_str(&format!("Bearer {}", config.require_api_key()?))
         .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
     headers.insert(AUTHORIZATION, auth_value);
 
@@ -1505,10 +1306,10 @@ mod tests {
         })
         .expect("openai-compatible gateways may keep their provider label");
 
-        assert_eq!(config.provider, "anthropic");
-        assert_eq!(config.base_url, "http://127.0.0.1:8320/");
-        assert_eq!(config.api_key, "test-key");
-        assert_eq!(config.url_mode, "standard");
+        assert_eq!(config.provider(), "anthropic");
+        assert_eq!(config.base_url(), Some("http://127.0.0.1:8320/"));
+        assert_eq!(config.api_key(), Some("test-key"));
+        assert_eq!(config.url_mode_label(), "standard");
         assert_eq!(target, "orch");
     }
 
