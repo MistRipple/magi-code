@@ -224,6 +224,12 @@
                         <option value="chat">{i18n.t('settings.model.protocol.chat')}</option>
                       </select>
                     </div>
+                    {#if orchConfig.urlMode === 'full'}
+                    <div class="llm-config-field">
+                      <label class="llm-config-label">{i18n.t('settings.model.field.protocolEndpoint')}</label>
+                      <input type="text" class="llm-config-input" bind:value={orchConfig.protocolEndpoint} placeholder="/v1/chat/completions" />
+                    </div>
+                    {/if}
                     <div class="llm-config-field">
                       <label class="llm-config-label">{i18n.t('settings.model.field.level')}</label>
                       <select class="llm-config-select" bind:value={orchConfig.reasoningEffort}>
@@ -389,6 +395,12 @@
                         <option value="chat">{i18n.t('settings.model.protocol.chat')}</option>
                       </select>
                     </div>
+                    {#if compConfig.urlMode === 'full'}
+                    <div class="llm-config-field">
+                      <label class="llm-config-label">{i18n.t('settings.model.field.protocolEndpoint')}</label>
+                      <input type="text" class="llm-config-input" bind:value={compConfig.protocolEndpoint} placeholder="/v1/chat/completions" />
+                    </div>
+                    {/if}
                     {/if}
                   </div>
                   <div class="apple-dashboard-bar" style="display: flex; justify-content: space-between; align-items: center; margin-top: 24px;">
@@ -580,6 +592,12 @@
                     <option value="chat">{i18n.t('settings.model.protocol.chat')}</option>
                   </select>
                 </div>
+                {#if workerConfigs[workerModelTab].urlMode === 'full'}
+                <div class="llm-config-field">
+                  <label class="llm-config-label">{i18n.t('settings.model.field.protocolEndpoint')}</label>
+                  <input type="text" class="llm-config-input" bind:value={workerConfigs[workerModelTab].protocolEndpoint} placeholder="/v1/chat/completions" />
+                </div>
+                {/if}
                 <div class="llm-config-field">
                   <label class="llm-config-label">{i18n.t('settings.model.field.level')}</label>
                   <select class="llm-config-select" bind:value={workerConfigs[workerModelTab].reasoningEffort}>

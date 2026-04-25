@@ -66,6 +66,7 @@ export interface BaseModelFormConfig {
   model: string;
   provider: ProviderName;
   openaiProtocol: "responses" | "chat";
+  protocolEndpoint: string;
 }
 
 export interface InteractiveModelFormConfig extends BaseModelFormConfig {
@@ -248,6 +249,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       model: "",
       provider,
       openaiProtocol: "responses",
+      protocolEndpoint: "",
       thinking: false,
       reasoningEffort: "medium",
       ...overrides,
@@ -264,6 +266,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       model: "",
       provider: "anthropic",
       openaiProtocol: "responses",
+      protocolEndpoint: "",
       ...overrides,
     };
   }
@@ -378,6 +381,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       provider: config.provider || "",
       urlMode: config.urlMode || "standard",
       openaiProtocol: config.openaiProtocol || "responses",
+      protocolEndpoint: config.protocolEndpoint || "",
     });
   }
 
@@ -894,6 +898,21 @@ function createSettingsStore(props: { onClose?: () => void }) {
     };
   }
 
+  function getStatsDisplayKeys(): string[] {
+    const keys = new Set<string>();
+    for (const key of Object.keys(modelStatuses)) {
+      keys.add(key);
+    }
+    for (const item of executionStats) {
+      if (item.role === "orchestrator" || item.role === "auxiliary") {
+        keys.add(item.role);
+      } else {
+        keys.add(item.templateId || item.engineId);
+      }
+    }
+    return Array.from(keys).filter((key) => key.trim().length > 0);
+  }
+
   function recomputeTokenStatsSummary() {
     totalInputTokens = executionStats.reduce((sum, stats) => sum + toSafeTokenCount(stats.netInputTokens), 0);
     totalOutputTokens = executionStats.reduce((sum, stats) => sum + toSafeTokenCount(stats.netOutputTokens), 0);
@@ -1204,6 +1223,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
   function getWorkerDisplayName(workerId: string): string {
     const displayName = engineDisplayNames.get(workerId);
     if (displayName) return displayName;
+    const roleTemplate = roleTemplates.find((template) => template.templateId === workerId);
+    if (roleTemplate?.displayName) return roleTemplate.displayName;
     const engine = registryEngines.find((e) => e.id === workerId);
     if (engine?.displayName) return engine.displayName;
     return workerId.charAt(0).toUpperCase() + workerId.slice(1);
@@ -1247,10 +1268,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   async function confirmResetStats() {
     showResetConfirm = false;
-    totalInputTokens = 0;
-    totalOutputTokens = 0;
     try {
       await resetAgentExecutionStats();
+      executionStats = [];
+      recomputeTokenStatsSummary();
       notifySettingsSuccess("执行统计已重置");
     } catch (e) {
       console.error("[SettingsPanel] 重置统计失败:", e);
@@ -1431,12 +1452,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     modelDropdownOpen = { ...modelDropdownOpen };
   }
 
-  // 重置测试状态（3秒后自动重置为 idle）
+  // 重置测试状态（5秒后自动重置为 idle）
   function resetTestStatus(key: string) {
     setTimeout(() => {
       testStatus[key] = "idle";
       testStatus = { ...testStatus };
-    }, 3000);
+    }, 5000);
   }
 
   // 重置保存状态（2秒后自动重置为 idle）
@@ -1494,6 +1515,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
               model: wc.model,
               provider: wc.provider,
               openaiProtocol: wc.openaiProtocol,
+              protocolEndpoint: wc.protocolEndpoint,
               enabled: wc.enabled,
               enableThinking: wc.thinking,
               reasoningEffort: wc.reasoningEffort,
@@ -1507,6 +1529,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           model: wc.model,
           provider: wc.provider,
           openaiProtocol: wc.openaiProtocol,
+          protocolEndpoint: wc.protocolEndpoint,
           enabled: wc.enabled,
           enableThinking: wc.thinking,
           reasoningEffort: wc.reasoningEffort,
@@ -1523,6 +1546,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           model: orchConfig.model,
           provider: orchConfig.provider,
           openaiProtocol: orchConfig.openaiProtocol,
+          protocolEndpoint: orchConfig.protocolEndpoint,
           enableThinking: orchConfig.thinking,
           reasoningEffort: orchConfig.reasoningEffort,
         });
@@ -2246,6 +2270,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           model: config.model || "",
           provider: config.provider || "anthropic",
           openaiProtocol: config.openaiProtocol || "responses",
+          protocolEndpoint: config.protocolEndpoint || "",
           enabled: config.enabled !== false,
           thinking: config.enableThinking === true,
           reasoningEffort: config.reasoningEffort || "medium",
@@ -2272,6 +2297,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       model: config.model || "",
       provider: config.provider || "anthropic",
       openaiProtocol: config.openaiProtocol || "responses",
+      protocolEndpoint: config.protocolEndpoint || "",
       thinking: config.enableThinking === true,
       reasoningEffort: config.reasoningEffort || "medium",
     });
@@ -2288,6 +2314,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       model: config.model || "",
       provider: config.provider || "anthropic",
       openaiProtocol: config.openaiProtocol || "responses",
+      protocolEndpoint: config.protocolEndpoint || "",
     });
   }
 
@@ -2528,6 +2555,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     get totalTokens() {
       return totalTokens;
+    },
+    get statsDisplayKeys() {
+      return getStatsDisplayKeys();
     },
     get userInfo() {
       return userInfo;

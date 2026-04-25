@@ -246,21 +246,23 @@ export interface AgentChangeDiffPayload {
   currentExists?: boolean;
 }
 
-export interface AgentSessionActionImagePayload {
+export interface AgentSessionTurnImagePayload {
   name: string;
   dataUrl: string;
 }
 
-export interface AgentSessionActionResult {
+export interface AgentSessionTurnResult {
   sessionId: string;
   entryId: string;
   eventId: string;
   acceptedAt: number;
   createdSession: boolean;
+  route: 'chat' | 'execute' | 'task' | 'continue';
   /** Root task ID when the backend created a task graph for this action. */
   rootTaskId?: string | null;
   /** 当前轮次实际执行的 action task ID。 */
   actionTaskId?: string | null;
+  executionChainRef?: string | null;
 }
 
 export class AgentApiError extends Error {
@@ -546,17 +548,21 @@ function resolveAgentBindingContext(): AgentBindingContext {
     __INITIAL_WORKSPACE_PATH__?: string;
   };
   const storedBinding = readStoredBrowserWorkspaceBinding();
+  const queryWorkspaceId = currentUrl.searchParams.get('workspaceId')?.trim() || '';
+  const queryWorkspacePath = currentUrl.searchParams.get('workspacePath')?.trim() || '';
+  const querySessionId = currentUrl.searchParams.get('sessionId')?.trim() || '';
+  const queryHasWorkspaceBinding = Boolean(queryWorkspaceId || queryWorkspacePath);
   return {
-    workspaceId: currentUrl.searchParams.get('workspaceId')?.trim()
+    workspaceId: queryWorkspaceId
       || bootstrapWindow.__INITIAL_WORKSPACE_ID__?.trim()
       || storedBinding.workspaceId
       || '',
-    workspacePath: currentUrl.searchParams.get('workspacePath')?.trim()
+    workspacePath: queryWorkspacePath
       || bootstrapWindow.__INITIAL_WORKSPACE_PATH__?.trim()
       || storedBinding.workspacePath
       || '',
-    sessionId: currentUrl.searchParams.get('sessionId')?.trim()
-      || storedBinding.sessionId
+    sessionId: querySessionId
+      || (queryHasWorkspaceBinding ? '' : storedBinding.sessionId)
       || '',
   };
 }
@@ -796,7 +802,7 @@ export async function getWorkspaceSessions(
       workspace: payload.workspace
         ? normalizeWorkspaceSummary(payload.workspace)
         : findCachedWorkspaceSummary(workspaceId),
-      sessionId: payload.sessionId?.trim() || preferredSessionId?.trim() || sessions[0]?.id || '',
+      sessionId: payload.sessionId?.trim() || '',
       sessions,
     };
   } catch (error) {
@@ -809,13 +815,18 @@ export async function getWorkspaceSessions(
 
 export async function loadAgentSessionTimelinePage(
   sessionId: string,
-  options: { limit?: number; beforeCursor?: string } = {},
+  options: { limit?: number; beforeCursor?: string; workspaceId?: string } = {},
 ): Promise<MessagesResponseDto> {
   try {
+    const binding = resolveAgentBindingContext();
     const query = new URLSearchParams({
       sessionId: sessionId.trim(),
       limit: String(options.limit ?? 50),
     });
+    const workspaceId = options.workspaceId?.trim() || binding.workspaceId;
+    if (workspaceId) {
+      query.set('workspaceId', workspaceId);
+    }
     if (options.beforeCursor?.trim()) {
       query.set('beforeCursor', options.beforeCursor.trim());
     }
@@ -875,15 +886,15 @@ export async function removeAgentNotification(notificationId: string): Promise<A
   );
 }
 
-export async function submitAgentSessionAction(
+export async function submitSessionTurn(
   payload: {
     text?: string | null;
     deepTask: boolean;
     skillName?: string | null;
-    images: AgentSessionActionImagePayload[];
+    images: AgentSessionTurnImagePayload[];
   },
   bindingOverride?: Partial<AgentBindingContext>,
-): Promise<AgentSessionActionResult> {
+): Promise<AgentSessionTurnResult> {
   try {
     const resolvedBinding = resolveAgentBindingContext();
     const binding: AgentBindingContext = {
@@ -891,39 +902,45 @@ export async function submitAgentSessionAction(
       workspacePath: bindingOverride?.workspacePath?.trim() || resolvedBinding.workspacePath,
       sessionId: bindingOverride?.sessionId?.trim() || resolvedBinding.sessionId,
     };
-    const response = await getTransport().request(agentUrl('/session/action'), {
+    const response = await getTransport().request(agentUrl('/api/session/turn'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        session_id: binding.sessionId || null,
-        workspace_id: binding.workspaceId || null,
+        sessionId: binding.sessionId || null,
+        workspaceId: binding.workspaceId || null,
         text: payload.text ?? null,
-        deep_task: payload.deepTask,
-        skill_name: payload.skillName ?? null,
+        deepTask: payload.deepTask,
+        skillName: payload.skillName ?? null,
         images: payload.images.map((image) => ({
           name: image.name,
-          data_url: image.dataUrl,
+          dataUrl: image.dataUrl,
         })),
       }),
     });
     const raw = await parseAgentJson<{
-      session_id: string;
-      entry_id: string;
-      event_id: string;
-      accepted_at: number;
-      created_session: boolean;
-      root_task_id?: string | null;
-      action_task_id?: string | null;
-    }>(response, 'submit session action');
+      sessionId: string;
+      entryId: string;
+      eventId: string;
+      acceptedAt: number;
+      createdSession: boolean;
+      route: 'chat' | 'execute' | 'task' | 'continue';
+      rootTaskId?: string | null;
+      actionTaskId?: string | null;
+      executionChainRef?: string | null;
+    }>(response, 'submit session turn');
     return {
-      sessionId: raw.session_id,
-      entryId: raw.entry_id,
-      eventId: raw.event_id,
-      acceptedAt: raw.accepted_at,
-      createdSession: raw.created_session,
-      rootTaskId: typeof raw.root_task_id === 'string' && raw.root_task_id.trim() ? raw.root_task_id.trim() : null,
-      actionTaskId: typeof raw.action_task_id === 'string' && raw.action_task_id.trim()
-        ? raw.action_task_id.trim()
+      sessionId: raw.sessionId,
+      entryId: raw.entryId,
+      eventId: raw.eventId,
+      acceptedAt: raw.acceptedAt,
+      createdSession: raw.createdSession,
+      route: raw.route,
+      rootTaskId: typeof raw.rootTaskId === 'string' && raw.rootTaskId.trim() ? raw.rootTaskId.trim() : null,
+      actionTaskId: typeof raw.actionTaskId === 'string' && raw.actionTaskId.trim()
+        ? raw.actionTaskId.trim()
+        : null,
+      executionChainRef: typeof raw.executionChainRef === 'string' && raw.executionChainRef.trim()
+        ? raw.executionChainRef.trim()
         : null,
     };
   } catch (error) {
@@ -1021,10 +1038,6 @@ export async function saveAgentUserRules(data: Record<string, unknown>): Promise
   return await postBoundJson<Record<string, unknown>>('/api/settings/user-rules/save', data, 'save user rules');
 }
 
-export async function resetAgentUserRules(): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/user-rules/reset', {}, 'reset user rules');
-}
-
 export async function saveAgentOrchestratorConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
   return await postBoundJson<Record<string, unknown>>('/api/settings/orchestrator/save', config, 'save orchestrator config');
 }
@@ -1094,6 +1107,11 @@ export async function fetchAgentModelList(config: Record<string, unknown>, targe
 
 export async function clearAgentProjectKnowledge(): Promise<AgentKnowledgeMutationPayload> {
   return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/clear', {}, 'clear project knowledge');
+}
+
+export async function getAgentProjectKnowledge(): Promise<Record<string, unknown>> {
+  const response = await getTransport().request(agentUrl('/api/knowledge', buildBoundQuery({})));
+  return await parseAgentJson<Record<string, unknown>>(response, 'load project knowledge');
 }
 
 export async function getAgentAdrs(): Promise<Record<string, unknown>> {

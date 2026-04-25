@@ -236,6 +236,45 @@
     background: rgba(var(--error-rgb, 255, 59, 48), 0.15);
   }
 
+  /* 测试连接按钮状态 —— 醒目高对比 */
+  .apple-action-btn.testing {
+    background: var(--primary, #007aff);
+    color: white;
+    border-color: var(--primary, #007aff);
+    opacity: 1 !important;
+    filter: none !important;
+    cursor: wait;
+    animation: btn-testing-pulse 1.4s ease-in-out infinite;
+  }
+
+  .apple-action-btn.testing svg {
+    animation: btn-testing-spin 0.8s linear infinite;
+  }
+
+  .apple-action-btn.success {
+    background: var(--success, #34c759);
+    color: white;
+    border-color: var(--success, #34c759);
+    box-shadow: 0 0 10px rgba(var(--success-rgb, 52, 199, 89), 0.45);
+  }
+
+  .apple-action-btn.error {
+    background: var(--error, #ff3b30);
+    color: white;
+    border-color: var(--error, #ff3b30);
+    box-shadow: 0 0 10px rgba(var(--error-rgb, 255, 59, 48), 0.45);
+  }
+
+  @keyframes btn-testing-spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+  }
+
+  @keyframes btn-testing-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(var(--primary-rgb, 0, 122, 255), 0.35); }
+    50%      { box-shadow: 0 0 0 5px rgba(var(--primary-rgb, 0, 122, 255), 0.08); }
+  }
+
   /* Apple Style Modal Form Fields */
   .form-field input[type="text"],
   .form-field textarea {
