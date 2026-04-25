@@ -8,12 +8,11 @@
   interface Props {
     toolCall?: ToolCall;
     status?: 'pending' | 'running' | 'success' | 'error';
-    initialExpanded?: boolean;
   }
 
-  let { toolCall, status = 'running', initialExpanded = true }: Props = $props();
-  let collapsed = $state(untrack(() => !initialExpanded && status !== 'error'));
-  // 用户是否手动操作过折叠状态
+  let { toolCall, status = 'running' }: Props = $props();
+  let collapsed = $state(untrack(() => !(status === 'running' || status === 'pending')));
+  let lastStatusClass = $state(untrack(() => status));
   let userToggled = $state(false);
 
   function parseJson(content?: string): Record<string, unknown> | null {
@@ -54,6 +53,9 @@
 
 
   function toggle(): void {
+    if (!canToggle) {
+      return;
+    }
     collapsed = !collapsed;
     userToggled = true;
   }
@@ -124,23 +126,44 @@
   const normalizedStatus = $derived(String(displayStatus || '').toLowerCase());
 
   const statusClass = $derived.by(() => {
-    if (normalizedStatus === 'failed' || normalizedStatus === 'error' || normalizedStatus === 'timeout' || normalizedStatus === 'killed') return 'error';
-    if (normalizedStatus === 'completed' || normalizedStatus === 'success' || normalizedStatus === 'ready') return 'success';
-    if (normalizedStatus === 'pending' || normalizedStatus === 'starting') return 'pending';
+    if (
+      normalizedStatus.includes('fail')
+      || normalizedStatus.includes('error')
+      || normalizedStatus.includes('timeout')
+      || normalizedStatus.includes('kill')
+      || normalizedStatus.includes('reject')
+      || normalizedStatus.includes('block')
+      || normalizedStatus.includes('approval')
+      || normalizedStatus.includes('cancel')
+      || normalizedStatus.includes('abort')
+    ) return 'error';
+    if (
+      normalizedStatus.includes('complete')
+      || normalizedStatus.includes('success')
+      || normalizedStatus.includes('succeed')
+      || normalizedStatus === 'ready'
+      || normalizedStatus === 'done'
+    ) return 'success';
+    if (normalizedStatus.includes('pending') || normalizedStatus.includes('starting')) return 'pending';
     return 'running';
   });
 
   const showStatusPulse = $derived(statusClass === 'running' || statusClass === 'pending');
+  const isActiveStatus = $derived(statusClass === 'running' || statusClass === 'pending');
 
-  // 运行时自动展开，完成后自动折叠（用户手动操作过则不干预）
   $effect(() => {
-    const sc = statusClass;
-    if (userToggled) return;
-    if (sc === 'running' || sc === 'pending') {
-      collapsed = false;
-    } else if (sc === 'success' || sc === 'error') {
-      collapsed = true;
+    if (statusClass === lastStatusClass) {
+      return;
     }
+    lastStatusClass = statusClass;
+    if (isActiveStatus) {
+      if (!userToggled) {
+        collapsed = false;
+      }
+      return;
+    }
+    collapsed = true;
+    userToggled = false;
   });
   const titleText = $derived(i18n.t('terminalSession.title', { id: terminalId ?? '-' }));
   const toolNameLabel = $derived(getTerminalToolDisplayName(toolCall?.name));
@@ -155,7 +178,8 @@
     || typeof outputCursor === 'number'
     || typeof returnCode === 'number'
   ));
-  const isExpanded = $derived(isExpandable && !collapsed);
+  const canToggle = $derived(isExpandable && isActiveStatus);
+  const isExpanded = $derived(canToggle && !collapsed);
 
   let outputElement = $state<HTMLPreElement | null>(null);
   let followTail = $state(true);
@@ -184,30 +208,47 @@
 {#if isExpandable}
   <div
     class="tool-call terminal-call"
-    class:collapsed={collapsed}
+    class:collapsed={canToggle && collapsed}
     data-status={statusClass}
     data-tool-name={toolCall?.name || ''}
     data-terminal-id={typeof terminalId === 'number' ? String(terminalId) : undefined}
   >
-    <button class="tool-header" onclick={toggle}>
-      <span class="chevron">
-        <Icon name="chevron-right" size={12} />
-      </span>
-      <span class="tool-icon"><Icon name="terminal" size={14} /></span>
-      <span class="tool-title">
-        <span class="tool-name">{toolNameLabel}</span>
-        <span class="tool-summary" title={toolSummary || titleText}>{toolSummary || titleText}</span>
-      </span>
-      <span class="tool-status status-{statusClass}">
-        {#if showStatusPulse}
-          <span class="status-dot pulsing"></span>
-        {:else}
-          <span class="status-dot"></span>
-        {/if}
-      </span>
-    </button>
+    {#if canToggle}
+      <button class="tool-header" onclick={toggle}>
+        <span class="chevron">
+          <Icon name="chevron-right" size={12} />
+        </span>
+        <span class="tool-icon"><Icon name="terminal" size={14} /></span>
+        <span class="tool-title">
+          <span class="tool-name">{toolNameLabel}</span>
+          <span class="tool-summary" title={toolSummary || titleText}>{toolSummary || titleText}</span>
+        </span>
+        <span class="tool-status status-{statusClass}">
+          {#if showStatusPulse}
+            <span class="status-dot pulsing"></span>
+          {:else}
+            <span class="status-dot"></span>
+          {/if}
+        </span>
+      </button>
+    {:else}
+      <div class="tool-header terminal-header-flat">
+        <span class="tool-icon"><Icon name="terminal" size={14} /></span>
+        <span class="tool-title">
+          <span class="tool-name">{toolNameLabel}</span>
+          <span class="tool-summary" title={toolSummary || titleText}>{toolSummary || titleText}</span>
+        </span>
+        <span class="tool-status status-{statusClass}">
+          {#if showStatusPulse}
+            <span class="status-dot pulsing"></span>
+          {:else}
+            <span class="status-dot"></span>
+          {/if}
+        </span>
+      </div>
+    {/if}
 
-    {#if !collapsed}
+    {#if canToggle && !collapsed}
       <div class="tool-content terminal-content">
         <div class="terminal-meta-grid">
           <div class="terminal-meta-item">{i18n.t('terminalSession.title', { id: terminalId ?? '-' })}</div>

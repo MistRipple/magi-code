@@ -193,7 +193,7 @@ export interface AgentExecutionStatsItem {
 export interface AgentExecutionStatsPayload {
   scope: 'session' | 'workspace';
   workspaceId: string;
-  sessionId?: string;
+  sessionId?: string | null;
   version: number;
   lastAppliedLedgerSeq?: number;
   updatedAt: number;
@@ -567,18 +567,36 @@ function resolveAgentBindingContext(): AgentBindingContext {
   };
 }
 
-function buildBoundQuery(extra: Record<string, string>): string {
+function buildBoundQuery(
+  extra: Record<string, string>,
+  options: { includeSession?: boolean } = {},
+): string {
   const binding = resolveAgentBindingContext();
   const query = new URLSearchParams();
   if (binding.workspaceId) query.set('workspaceId', binding.workspaceId);
   if (binding.workspacePath) query.set('workspacePath', binding.workspacePath);
-  if (binding.sessionId) query.set('sessionId', binding.sessionId);
+  if (options.includeSession !== false && binding.sessionId) query.set('sessionId', binding.sessionId);
   for (const [key, value] of Object.entries(extra)) {
     if (value) {
       query.set(key, value);
     }
   }
   return query.toString();
+}
+
+function buildWorkspaceBoundQuery(extra: Record<string, string>): string {
+  return buildBoundQuery(extra, { includeSession: false });
+}
+
+function resolveBindingOverrideValue(
+  bindingOverride: Partial<AgentBindingContext> | undefined,
+  key: keyof AgentBindingContext,
+  fallback: string,
+): string {
+  if (bindingOverride && Object.prototype.hasOwnProperty.call(bindingOverride, key)) {
+    return bindingOverride[key]?.trim() || '';
+  }
+  return fallback;
 }
 
 async function postBoundJson<T>(
@@ -590,9 +608,9 @@ async function postBoundJson<T>(
   try {
     const resolvedBinding = resolveAgentBindingContext();
     const binding: AgentBindingContext = {
-      workspaceId: bindingOverride?.workspaceId?.trim() || resolvedBinding.workspaceId,
-      workspacePath: bindingOverride?.workspacePath?.trim() || resolvedBinding.workspacePath,
-      sessionId: bindingOverride?.sessionId?.trim() || resolvedBinding.sessionId,
+      workspaceId: resolveBindingOverrideValue(bindingOverride, 'workspaceId', resolvedBinding.workspaceId),
+      workspacePath: resolveBindingOverrideValue(bindingOverride, 'workspacePath', resolvedBinding.workspacePath),
+      sessionId: resolveBindingOverrideValue(bindingOverride, 'sessionId', resolvedBinding.sessionId),
     };
     const response = await getTransport().request(agentUrl(pathname), {
       method: 'POST',
@@ -840,6 +858,14 @@ export async function loadAgentSessionTimelinePage(
   }
 }
 
+async function postWorkspaceBoundJson<T>(
+  pathname: string,
+  payload: Record<string, unknown>,
+  action: string,
+): Promise<T> {
+  return await postBoundJson<T>(pathname, payload, action, { sessionId: '' });
+}
+
 export async function deleteAgentSession(sessionId: string): Promise<AgentBootstrapSnapshot> {
   return await postBoundJson<AgentBootstrapSnapshot>('/api/session/delete', { sessionId }, 'delete session');
 }
@@ -983,7 +1009,7 @@ export async function getAgentSettingsBootstrap(
   options: { scope?: 'core' | 'full' } = {},
 ): Promise<AgentSettingsBootstrapSnapshot> {
   try {
-    const query = buildBoundQuery(options.scope === 'core' ? { scope: 'core' } : {});
+    const query = buildWorkspaceBoundQuery(options.scope === 'core' ? { scope: 'core' } : {});
     const response = await getTransport().request(agentUrl('/api/settings/bootstrap', query));
     const payload = await parseAgentJson<Record<string, unknown>>(response, 'load settings bootstrap');
     return normalizeSettingsBootstrapPayload(payload);
@@ -1001,12 +1027,16 @@ export async function getAgentStatus(): Promise<Record<string, unknown>> {
 }
 
 export async function resetAgentExecutionStats(): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/stats/reset', {}, 'reset execution stats');
+  return await postWorkspaceBoundJson<Record<string, unknown>>(
+    '/api/settings/stats/reset',
+    {},
+    'reset execution stats',
+  );
 }
 
 export async function getAgentExecutionStats(): Promise<AgentExecutionStatsPayload> {
   try {
-    const query = buildBoundQuery({});
+    const query = buildWorkspaceBoundQuery({});
     const response = await getTransport().request(agentUrl('/api/settings/stats/session', query));
     return await parseAgentJson<AgentExecutionStatsPayload>(response, 'load execution stats');
   } catch (error) {
@@ -1022,7 +1052,7 @@ export async function enhanceAgentPrompt(prompt: string): Promise<{ enhancedProm
 }
 
 export async function updateAgentRuntimeSetting(key: string, value: unknown): Promise<AgentRuntimeSettings> {
-  const payload = await postBoundJson<AgentRuntimeSettings>('/api/settings/update', { key, value }, 'update runtime setting');
+  const payload = await postWorkspaceBoundJson<AgentRuntimeSettings>('/api/settings/update', { key, value }, 'update runtime setting');
   if (key === 'locale' && (payload?.locale === 'zh-CN' || payload?.locale === 'en-US')) {
     safeWriteLocalStorage('magi-locale', payload.locale);
     i18n.setLocale(payload.locale);
@@ -1031,171 +1061,171 @@ export async function updateAgentRuntimeSetting(key: string, value: unknown): Pr
 }
 
 export async function saveAgentWorkerConfig(worker: string, config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/worker/save', { worker, config }, 'save worker config');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/worker/save', { worker, config }, 'save worker config');
 }
 
 export async function saveAgentUserRules(data: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/user-rules/save', data, 'save user rules');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/user-rules/save', data, 'save user rules');
 }
 
 export async function saveAgentOrchestratorConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/orchestrator/save', config, 'save orchestrator config');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/orchestrator/save', config, 'save orchestrator config');
 }
 
 export async function saveAgentAuxiliaryConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/auxiliary/save', config, 'save auxiliary config');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/auxiliary/save', config, 'save auxiliary config');
 }
 
 export async function removeAgentWorkerConfig(worker: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/worker/remove', { worker }, 'remove worker config');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/worker/remove', { worker }, 'remove worker config');
 }
 
 export async function testAgentWorkerConnection(worker: string, config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/worker/test', { worker, config }, 'test worker connection');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/worker/test', { worker, config }, 'test worker connection');
 }
 
 export async function testAgentOrchestratorConnection(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/orchestrator/test', config, 'test orchestrator connection');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/orchestrator/test', config, 'test orchestrator connection');
 }
 
 export async function testAgentAuxiliaryConnection(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/auxiliary/test', config, 'test auxiliary connection');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/auxiliary/test', config, 'test auxiliary connection');
 }
 
 
 export async function listAgentRoleTemplates(): Promise<RoleTemplate[]> {
-  const response = await getTransport().request(agentUrl('/api/settings/registry/role-templates', buildBoundQuery({})));
+  const response = await getTransport().request(agentUrl('/api/settings/registry/role-templates', buildWorkspaceBoundQuery({})));
   const payload = await parseAgentJson<{ templates?: RoleTemplate[] }>(response, 'load role templates');
   return Array.isArray(payload.templates) ? payload.templates : [];
 }
 
 export async function listAgentRegistryEngines(): Promise<ModelEngine[]> {
-  const response = await getTransport().request(agentUrl('/api/settings/registry/engines', buildBoundQuery({})));
+  const response = await getTransport().request(agentUrl('/api/settings/registry/engines', buildWorkspaceBoundQuery({})));
   const payload = await parseAgentJson<{ engines?: ModelEngine[] }>(response, 'load registry engines');
   return Array.isArray(payload.engines) ? payload.engines : [];
 }
 
 export async function listAgentRegistryAgents(): Promise<AgentBinding[]> {
-  const response = await getTransport().request(agentUrl('/api/settings/registry/agents', buildBoundQuery({})));
+  const response = await getTransport().request(agentUrl('/api/settings/registry/agents', buildWorkspaceBoundQuery({})));
   const payload = await parseAgentJson<{ agents?: AgentBinding[] }>(response, 'load registry agents');
   return Array.isArray(payload.agents) ? payload.agents : [];
 }
 
 export async function upsertAgentRegistryEngine(engine: ModelEngine): Promise<ModelEngine[]> {
-  const payload = await postBoundJson<{ engines?: ModelEngine[] }>('/api/settings/registry/engines/upsert', engine as unknown as Record<string, unknown>, 'upsert registry engine');
+  const payload = await postWorkspaceBoundJson<{ engines?: ModelEngine[] }>('/api/settings/registry/engines/upsert', engine as unknown as Record<string, unknown>, 'upsert registry engine');
   return Array.isArray(payload.engines) ? payload.engines : [];
 }
 
 export async function removeAgentRegistryEngine(engineId: string): Promise<ModelEngine[]> {
-  const payload = await postBoundJson<{ engines?: ModelEngine[] }>('/api/settings/registry/engines/remove', { engineId }, 'remove registry engine');
+  const payload = await postWorkspaceBoundJson<{ engines?: ModelEngine[] }>('/api/settings/registry/engines/remove', { engineId }, 'remove registry engine');
   return Array.isArray(payload.engines) ? payload.engines : [];
 }
 
 export async function upsertAgentRegistryBinding(agent: AgentBinding): Promise<AgentBinding[]> {
-  const payload = await postBoundJson<{ agents?: AgentBinding[] }>('/api/settings/registry/agents/upsert', agent as unknown as Record<string, unknown>, 'upsert registry agent');
+  const payload = await postWorkspaceBoundJson<{ agents?: AgentBinding[] }>('/api/settings/registry/agents/upsert', agent as unknown as Record<string, unknown>, 'upsert registry agent');
   return Array.isArray(payload.agents) ? payload.agents : [];
 }
 
 export async function removeAgentRegistryBinding(templateId: string): Promise<AgentBinding[]> {
-  const payload = await postBoundJson<{ agents?: AgentBinding[] }>('/api/settings/registry/agents/remove', { templateId }, 'remove registry agent');
+  const payload = await postWorkspaceBoundJson<{ agents?: AgentBinding[] }>('/api/settings/registry/agents/remove', { templateId }, 'remove registry agent');
   return Array.isArray(payload.agents) ? payload.agents : [];
 }
 
 export async function fetchAgentModelList(config: Record<string, unknown>, target: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/models/fetch', { config, target }, 'fetch model list');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/models/fetch', { config, target }, 'fetch model list');
 }
 
 export async function clearAgentProjectKnowledge(): Promise<AgentKnowledgeMutationPayload> {
-  return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/clear', {}, 'clear project knowledge');
+  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/clear', {}, 'clear project knowledge');
 }
 
 export async function getAgentProjectKnowledge(): Promise<Record<string, unknown>> {
-  const response = await getTransport().request(agentUrl('/api/knowledge', buildBoundQuery({})));
+  const response = await getTransport().request(agentUrl('/api/knowledge', buildWorkspaceBoundQuery({})));
   return await parseAgentJson<Record<string, unknown>>(response, 'load project knowledge');
 }
 
 export async function getAgentAdrs(): Promise<Record<string, unknown>> {
-  const query = buildBoundQuery({});
+  const query = buildWorkspaceBoundQuery({});
   const response = await getTransport().request(agentUrl(`/api/knowledge/adrs`, query));
   return await parseAgentJson<Record<string, unknown>>(response, 'load adrs');
 }
 
 export async function getAgentFaqs(): Promise<Record<string, unknown>> {
-  const query = buildBoundQuery({});
+  const query = buildWorkspaceBoundQuery({});
   const response = await getTransport().request(agentUrl(`/api/knowledge/faqs`, query));
   return await parseAgentJson<Record<string, unknown>>(response, 'load faqs');
 }
 
 export async function searchAgentAdrs(keyword: string): Promise<Record<string, unknown>> {
-  const query = buildBoundQuery({ q: keyword });
+  const query = buildWorkspaceBoundQuery({ q: keyword });
   const response = await getTransport().request(agentUrl(`/api/knowledge/adrs/search`, query));
   return await parseAgentJson<Record<string, unknown>>(response, 'search adrs');
 }
 
 export async function searchAgentFaqs(keyword: string): Promise<Record<string, unknown>> {
-  const query = buildBoundQuery({ q: keyword });
+  const query = buildWorkspaceBoundQuery({ q: keyword });
   const response = await getTransport().request(agentUrl(`/api/knowledge/faqs/search`, query));
   return await parseAgentJson<Record<string, unknown>>(response, 'search faqs');
 }
 
 export async function getAgentLearnings(): Promise<Record<string, unknown>> {
-  const response = await getTransport().request(agentUrl(`/api/knowledge/learnings`, buildBoundQuery({})));
+  const response = await getTransport().request(agentUrl(`/api/knowledge/learnings`, buildWorkspaceBoundQuery({})));
   return await parseAgentJson<Record<string, unknown>>(response, 'load learnings');
 }
 
 export async function searchAgentLearnings(keyword: string): Promise<Record<string, unknown>> {
-  const query = buildBoundQuery({ q: keyword });
+  const query = buildWorkspaceBoundQuery({ q: keyword });
   const response = await getTransport().request(agentUrl(`/api/knowledge/learnings/search`, query));
   return await parseAgentJson<Record<string, unknown>>(response, 'search learnings');
 }
 
 export async function addAgentAdr(adr: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
-  return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/adr/add', { adr }, 'add adr');
+  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/adr/add', { adr }, 'add adr');
 }
 
 export async function updateAgentAdr(id: string, updates: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
-  return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/adr/update', { id, updates }, 'update adr');
+  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/adr/update', { id, updates }, 'update adr');
 }
 
 export async function addAgentFaq(faq: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
-  return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/faq/add', { faq }, 'add faq');
+  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/faq/add', { faq }, 'add faq');
 }
 
 export async function updateAgentFaq(id: string, updates: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
-  return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/faq/update', { id, updates }, 'update faq');
+  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/faq/update', { id, updates }, 'update faq');
 }
 
 export async function addAgentLearning(learning: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
-  return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/learning/add', { learning }, 'add learning');
+  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/learning/add', { learning }, 'add learning');
 }
 
 export async function updateAgentLearning(id: string, updates: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
-  return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/learning/update', { id, updates }, 'update learning');
+  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/learning/update', { id, updates }, 'update learning');
 }
 
 export async function deleteAgentAdr(id: string): Promise<AgentKnowledgeMutationPayload> {
-  return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/adr/delete', { id }, 'delete adr');
+  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/adr/delete', { id }, 'delete adr');
 }
 
 export async function deleteAgentFaq(id: string): Promise<AgentKnowledgeMutationPayload> {
-  return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/faq/delete', { id }, 'delete faq');
+  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/faq/delete', { id }, 'delete faq');
 }
 
 export async function deleteAgentLearning(id: string): Promise<AgentKnowledgeMutationPayload> {
-  return await postBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/learning/delete', { id }, 'delete learning');
+  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/learning/delete', { id }, 'delete learning');
 }
 
 export async function loadAgentMcpServers(): Promise<Record<string, unknown>> {
-  const response = await getTransport().request(agentUrl('/api/settings/mcp'));
+  const response = await getTransport().request(agentUrl('/api/settings/mcp', buildWorkspaceBoundQuery({})));
   return await parseAgentJson<Record<string, unknown>>(response, 'load mcp servers');
 }
 
 export async function addAgentMcpServer(server: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/mcp/add', normalizeMcpServerConfig(server), 'add mcp server');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/mcp/add', normalizeMcpServerConfig(server), 'add mcp server');
 }
 
 export async function updateAgentMcpServer(serverId: string, updates: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>(
+  return await postWorkspaceBoundJson<Record<string, unknown>>(
     '/api/settings/mcp/update',
     normalizeMcpServerConfig({ ...updates, id: serverId, serverId }),
     'update mcp server',
@@ -1203,53 +1233,53 @@ export async function updateAgentMcpServer(serverId: string, updates: Record<str
 }
 
 export async function deleteAgentMcpServer(serverId: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/mcp/delete', { serverId }, 'delete mcp server');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/mcp/delete', { serverId }, 'delete mcp server');
 }
 
 export async function getAgentMcpServerTools(serverId: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/mcp/tools', { serverId }, 'get mcp server tools');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/mcp/tools', { serverId }, 'get mcp server tools');
 }
 
 export async function refreshAgentMcpTools(serverId: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/mcp/tools/refresh', { serverId }, 'refresh mcp tools');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/mcp/tools/refresh', { serverId }, 'refresh mcp tools');
 }
 
 export async function connectAgentMcpServer(serverId: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/mcp/connect', { serverId }, 'connect mcp server');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/mcp/connect', { serverId }, 'connect mcp server');
 }
 
 export async function disconnectAgentMcpServer(serverId: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/mcp/disconnect', { serverId }, 'disconnect mcp server');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/mcp/disconnect', { serverId }, 'disconnect mcp server');
 }
 
 export async function loadAgentRepositories(): Promise<Record<string, unknown>> {
-  const response = await getTransport().request(agentUrl('/api/settings/repositories'));
+  const response = await getTransport().request(agentUrl('/api/settings/repositories', buildWorkspaceBoundQuery({})));
   return await parseAgentJson<Record<string, unknown>>(response, 'load repositories');
 }
 
 export async function addAgentRepository(url: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/repositories/add', { url }, 'add repository');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/repositories/add', { url }, 'add repository');
 }
 
 export async function updateAgentRepository(repositoryId: string, updates: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/repositories/update', { repositoryId, updates }, 'update repository');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/repositories/update', { repositoryId, updates }, 'update repository');
 }
 
 export async function deleteAgentRepository(repositoryId: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/repositories/delete', { repositoryId }, 'delete repository');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/repositories/delete', { repositoryId }, 'delete repository');
 }
 
 export async function refreshAgentRepository(repositoryId: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/repositories/refresh', { repositoryId }, 'refresh repository');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/repositories/refresh', { repositoryId }, 'refresh repository');
 }
 
 export async function loadAgentSkillLibrary(): Promise<Record<string, unknown>> {
-  const response = await getTransport().request(agentUrl('/api/settings/skills/library'));
+  const response = await getTransport().request(agentUrl('/api/settings/skills/library', buildWorkspaceBoundQuery({})));
   return await parseAgentJson<Record<string, unknown>>(response, 'load skill library');
 }
 
 export async function installAgentSkill(skillId: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/skills/install', { skillId }, 'install skill');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/install', { skillId }, 'install skill');
 }
 
 export async function installAgentLocalSkill(directoryPath?: string): Promise<Record<string, unknown>> {
@@ -1257,39 +1287,39 @@ export async function installAgentLocalSkill(directoryPath?: string): Promise<Re
   if (directoryPath) {
     payload.directoryPath = directoryPath;
   }
-  return await postBoundJson<Record<string, unknown>>('/api/settings/skills/install-local', payload, 'install local skill');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/install-local', payload, 'install local skill');
 }
 
 export async function scanAgentLocalSkillDirectory(directoryPath: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/skills/scan-local', { directoryPath }, 'scan local skill directory');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/scan-local', { directoryPath }, 'scan local skill directory');
 }
 
 export async function saveAgentSkillsConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/skills/config/save', config, 'save skills config');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/config/save', config, 'save skills config');
 }
 
 export async function saveAgentSafeguardConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/safeguard/save', config, 'save safeguard config');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/safeguard/save', config, 'save safeguard config');
 }
 
 export async function addAgentCustomTool(tool: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/skills/custom-tool/add', tool, 'add custom tool');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/custom-tool/add', tool, 'add custom tool');
 }
 
 export async function removeAgentCustomTool(toolName: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/skills/custom-tool/remove', { toolName }, 'remove custom tool');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/custom-tool/remove', { toolName }, 'remove custom tool');
 }
 
 export async function removeAgentInstructionSkill(skillName: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/skills/instruction/remove', { skillName }, 'remove instruction skill');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/instruction/remove', { skillName }, 'remove instruction skill');
 }
 
 export async function updateAgentSkill(skillName: string): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/skills/update', { skillName }, 'update skill');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/update', { skillName }, 'update skill');
 }
 
 export async function updateAllAgentSkills(): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/settings/skills/update-all', {}, 'update all skills');
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/update-all', {}, 'update all skills');
 }
 
 export async function getAgentChangeDiff(filePath: string): Promise<AgentChangeDiffPayload> {

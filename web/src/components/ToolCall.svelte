@@ -28,7 +28,6 @@
     standardized?: StandardizedToolResult;
     status?: 'pending' | 'running' | 'success' | 'error';
     duration?: number;
-    initialExpanded?: boolean;
     filepath?: string;
     onOpenFile?: (filepath: string) => void;
   }
@@ -42,13 +41,13 @@
     standardized,
     status = 'success',
     duration,
-    initialExpanded = false,
     filepath,
     onOpenFile
   }: Props = $props();
 
-  let collapsed = $state(untrack(() => !initialExpanded && name !== 'mermaid_diagram'));
+  let collapsed = $state(untrack(() => !(status === 'running' || status === 'pending')));
   let lastStatus = $state(untrack(() => status));
+  let userToggled = $state(false);
   let copySuccess = $state(false);
 
   interface ParsedToolIdentity {
@@ -91,14 +90,17 @@
       return;
     }
     lastStatus = status;
-    if (status === 'running' || status === 'pending' || status === 'error') {
-      collapsed = false;
+    if (status === 'running' || status === 'pending') {
+      if (!userToggled) {
+        collapsed = false;
+      }
       return;
     }
-    if (name !== 'mermaid_diagram') {
-      collapsed = true;
-    }
+    collapsed = true;
+    userToggled = false;
   });
+
+  const isActiveStatus = $derived(status === 'running' || status === 'pending');
 
   // 格式化内容
   function formatContent(content: unknown): string {
@@ -215,6 +217,7 @@
   const isFileMutationTool = $derived(
     name === 'file_edit' || name === 'file_create' || name === 'file_insert' || name === 'file_remove'
   );
+  const isCompactMutation = $derived(isFileMutationTool && (status === 'running' || status === 'pending'));
 
   // 目录/文件只读工具：只需紧凑 header
   const isCompactReadOnlyTool = $derived(name === 'file_view' || name === 'list_files');
@@ -254,6 +257,8 @@
     return toolPolicy as ToolPolicyPayload;
   });
   const hasContent = $derived(hasInput || hasOutput || hasError);
+  const canExpand = $derived(hasContent && !isCompactReadOnlyTool && !isCompactMutation && isActiveStatus);
+  const shouldRenderCard = $derived(hasContent || isCompactReadOnlyTool || isCompactMutation);
 
   // 获取工具显示名
   function getToolDisplayName(toolName: string): string {
@@ -546,7 +551,11 @@
   const errorDiagnosis = $derived.by(() => detectErrorDiagnosis(error, standardized));
 
   function toggle() {
+    if (!canExpand) {
+      return;
+    }
     collapsed = !collapsed;
+    userToggled = true;
   }
 
   async function copyOutput() {
@@ -627,20 +636,18 @@
 {#if isFileMutationTool && status === 'success'}
   <!-- 文件变更工具完成：由 FileChangeCard 全权展示 -->
 {:else}
-  {@const isCompactMutation = isFileMutationTool && (status === 'running' || status === 'pending')}
-  {@const isExpandable = hasContent && !isCompactReadOnlyTool && !isCompactMutation}
-  {#if isExpandable || isCompactReadOnlyTool || isCompactMutation}
+  {#if shouldRenderCard}
     <div
       class="tool-call"
-      class:collapsed={isExpandable && collapsed}
-      class:has-error={isExpandable && hasError}
+      class:collapsed={canExpand && collapsed}
+      class:has-error={hasError}
       class:file-mutation={isCompactMutation}
       class:compact-readonly={isCompactReadOnlyTool}
       data-status={statusInfo.class}
       data-tool-name={name}
       data-tool-call-id={id || undefined}
     >
-      {#if isExpandable}
+      {#if canExpand}
         <button class="tool-header" onclick={toggle}>
           <span class="chevron">
             <Icon name="chevron-right" size={12} />
@@ -667,7 +674,7 @@
         </div>
       {/if}
 
-      {#if isExpandable && !collapsed}
+      {#if canExpand && !collapsed}
         <div class="tool-content">
           {#if hasInput && !isMermaidTool}
             <div class="tool-section">

@@ -345,22 +345,18 @@ export class RustDaemonClient {
   }
 
   public async fetchAdrs(
-    sessionId?: string,
     workspaceId?: string,
   ): Promise<KnowledgeAdrsResponseDto> {
     const params = new URLSearchParams();
-    if (sessionId) params.set('sessionId', sessionId);
     if (workspaceId) params.set('workspaceId', workspaceId);
     const qs = params.toString();
     return this.getJson<KnowledgeAdrsResponseDto>(`/api/knowledge/adrs${qs ? `?${qs}` : ''}`);
   }
 
   public async fetchFaqs(
-    sessionId?: string,
     workspaceId?: string,
   ): Promise<KnowledgeFaqsResponseDto> {
     const params = new URLSearchParams();
-    if (sessionId) params.set('sessionId', sessionId);
     if (workspaceId) params.set('workspaceId', workspaceId);
     const qs = params.toString();
     return this.getJson<KnowledgeFaqsResponseDto>(`/api/knowledge/faqs${qs ? `?${qs}` : ''}`);
@@ -368,12 +364,10 @@ export class RustDaemonClient {
 
   public async searchFaqs(
     q?: string,
-    sessionId?: string,
     workspaceId?: string,
   ): Promise<KnowledgeFaqSearchResponseDto> {
     const params = new URLSearchParams();
     if (q) params.set('q', q);
-    if (sessionId) params.set('sessionId', sessionId);
     if (workspaceId) params.set('workspaceId', workspaceId);
     const qs = params.toString();
     return this.getJson<KnowledgeFaqSearchResponseDto>(

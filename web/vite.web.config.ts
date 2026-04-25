@@ -38,9 +38,9 @@ export default defineConfig(({ mode }) => {
           web: resolve(__dirname, 'web.html'),
         },
         output: {
-          entryFileNames: 'assets/[name].js',
-          chunkFileNames: 'assets/[name].js',
-          assetFileNames: 'assets/[name].[ext]',
+          entryFileNames: 'assets/[name]-[hash].js',
+          chunkFileNames: 'assets/[name]-[hash].js',
+          assetFileNames: 'assets/[name]-[hash].[ext]',
           manualChunks: {
             mermaid: ['mermaid'],
             highlight: ['highlight.js'],

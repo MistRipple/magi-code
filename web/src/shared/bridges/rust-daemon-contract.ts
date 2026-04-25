@@ -335,6 +335,25 @@ function normalizeObjectRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+function parseJsonObjectLike(value: unknown): Record<string, unknown> | null {
+  const direct = normalizeObjectRecord(value);
+  if (direct) {
+    return direct;
+  }
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  try {
+    return normalizeObjectRecord(JSON.parse(trimmed));
+  } catch {
+    return null;
+  }
+}
+
 function getRuntimeDetailEntries(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
   key: string,
@@ -1357,6 +1376,10 @@ function tryParseStructuredBlocks(raw: string): ContentBlock[] | undefined {
       const content = typeof block.content === 'string' ? block.content : '';
       if (blockType === 'tool_call' && block.toolCall && typeof block.toolCall === 'object') {
         const tc = block.toolCall as Record<string, unknown>;
+        const toolArguments = parseJsonObjectLike(tc.arguments) || {};
+        const toolStatus = turnItemStatusToToolStatus(
+          typeof tc.status === 'string' ? tc.status : 'success',
+        );
         return {
           type: 'tool_call' as const,
           content,
@@ -1364,11 +1387,10 @@ function tryParseStructuredBlocks(raw: string): ContentBlock[] | undefined {
           toolCall: {
             id: typeof tc.id === 'string' ? tc.id : `tc-${i}`,
             name: typeof tc.name === 'string' ? tc.name : 'unknown',
-            arguments: (typeof tc.arguments === 'object' && tc.arguments !== null
-              ? tc.arguments
-              : {}) as Record<string, unknown>,
-            status: (typeof tc.status === 'string' ? tc.status : 'success') as 'success' | 'error',
+            arguments: toolArguments,
+            status: toolStatus,
             result: typeof tc.result === 'string' ? tc.result : undefined,
+            error: typeof tc.error === 'string' ? tc.error : undefined,
           },
         };
       }
@@ -1614,9 +1636,22 @@ function buildWorkerRenderEntriesFromArtifacts(
   );
 }
 
+function toolStatusLooksTerminalError(normalizedStatus: string): boolean {
+  return normalizedStatus.includes('fail')
+    || normalizedStatus.includes('error')
+    || normalizedStatus.includes('cancel')
+    || normalizedStatus.includes('reject')
+    || normalizedStatus.includes('block')
+    || normalizedStatus.includes('deny')
+    || normalizedStatus.includes('approval')
+    || normalizedStatus.includes('abort')
+    || normalizedStatus.includes('kill')
+    || normalizedStatus.includes('timeout');
+}
+
 function turnItemStatusToToolStatus(status: string): 'pending' | 'running' | 'success' | 'error' {
   const normalized = status.toLowerCase();
-  if (normalized.includes('fail') || normalized.includes('error') || normalized.includes('cancel')) {
+  if (toolStatusLooksTerminalError(normalized)) {
     return 'error';
   }
   if (normalized.includes('running') || normalized.includes('pending')) {
@@ -1738,15 +1773,14 @@ function buildCurrentTurnArtifacts(
     } else if (kind === 'tool_call_started' || kind === 'tool_call_result') {
       const toolName = normalizeString(item.tool_name) || normalizeString(item.title) || 'tool';
       const status = turnItemStatusToToolStatus(normalizeString(item.tool_status) || normalizeString(item.status));
+      const toolArguments = parseJsonObjectLike(item.tool_arguments) || {};
       blocks = [{
         type: 'tool_call',
         content: '',
         toolCall: {
           id: normalizeString(item.tool_call_id) || itemId,
           name: toolName,
-          arguments: item.tool_arguments && typeof item.tool_arguments === 'object'
-            ? item.tool_arguments as Record<string, unknown>
-            : {},
+          arguments: toolArguments,
           status,
           result: normalizeString(item.tool_result) || undefined,
           error: normalizeString(item.tool_error) || undefined,
@@ -1855,12 +1889,7 @@ function summarizeRustEvent(event: RustEventEnvelope): string {
 
 function normalizeToolArtifactStatus(status: string, eventType: string): 'pending' | 'running' | 'success' | 'error' {
   const normalized = status.toLowerCase();
-  if (normalized.includes('fail')
-    || normalized.includes('error')
-    || normalized.includes('reject')
-    || normalized.includes('abort')
-    || normalized.includes('kill')
-    || normalized.includes('timeout')) {
+  if (toolStatusLooksTerminalError(normalized)) {
     return 'error';
   }
   if (normalized.includes('success') || normalized.includes('complete') || normalized.includes('succeed')) {
