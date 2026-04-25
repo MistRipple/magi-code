@@ -289,12 +289,6 @@ impl BridgeResponse {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ModelStreamEvent {
-    ContentDelta { delta: String },
-    ThinkingDelta { delta: String },
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BridgeTransportRequest {
     pub method: String,
@@ -403,12 +397,6 @@ pub trait HostBridgeClient: Send + Sync {
 
 pub trait ModelBridgeClient: Send + Sync {
     fn invoke(&self, request: ModelInvocationRequest) -> Result<BridgeResponse, BridgeClientError>;
-
-    fn invoke_stream(
-        &self,
-        request: ModelInvocationRequest,
-        on_event: &mut dyn FnMut(ModelStreamEvent),
-    ) -> Result<BridgeResponse, BridgeClientError>;
 
     /// 流式调用 LLM，每次收到内容增量时调用 `on_delta` 回调并传入已累积的完整文本。
     /// 默认实现回退到非流式 `invoke`。

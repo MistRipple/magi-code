@@ -1,13 +1,13 @@
 use crate::protocol::AdaptedResponse;
-use crate::protocol::streaming::{SseLineParser, StreamAccumulator, parse_stream_event};
 use crate::protocol::ProviderFamily;
+use crate::protocol::streaming::{SseLineParser, StreamAccumulator, parse_stream_event};
 use crate::types::{
     BridgeClientError, BridgeErrorLayer, BridgeResponse, ModelBridgeClient, ModelInvocationRequest,
 };
 use serde::Deserialize;
 use serde_json::json;
-use std::io::Read as IoRead;
 use std::env;
+use std::io::Read as IoRead;
 
 const OPENAI_BASE_URL_ENV: &str = "MAGI_OPENAI_COMPAT_BASE_URL";
 const OPENAI_API_KEY_ENV: &str = "MAGI_OPENAI_COMPAT_API_KEY";
@@ -32,8 +32,7 @@ impl HttpModelBridgeClient {
     pub fn from_env() -> Option<Self> {
         let base_url = read_non_empty_env(OPENAI_BASE_URL_ENV)?;
         let api_key = read_non_empty_env(OPENAI_API_KEY_ENV);
-        let model = read_non_empty_env(OPENAI_MODEL_ENV)
-            .unwrap_or_else(|| "gpt-4".to_string());
+        let model = read_non_empty_env(OPENAI_MODEL_ENV).unwrap_or_else(|| "gpt-4".to_string());
         Some(Self::new(base_url, api_key, model))
     }
 
@@ -71,14 +70,21 @@ impl HttpModelBridgeClient {
         if let Some(ref tools) = request.tools {
             if !tools.is_empty() {
                 body["tools"] = serde_json::to_value(tools).unwrap_or_else(|_| json!([]));
-                body["tool_choice"] = json!("auto");
+                body["tool_choice"] = request
+                    .tool_choice
+                    .as_ref()
+                    .and_then(|tool_choice| serde_json::to_value(tool_choice).ok())
+                    .unwrap_or_else(|| json!("auto"));
             }
         }
         body
     }
 
     /// 构建流式请求体（`stream: true`）。
-    pub(crate) fn build_streaming_request_body(&self, request: &ModelInvocationRequest) -> serde_json::Value {
+    pub(crate) fn build_streaming_request_body(
+        &self,
+        request: &ModelInvocationRequest,
+    ) -> serde_json::Value {
         let mut body = self.build_request_body(request);
         body["stream"] = json!(true);
         body
@@ -117,22 +123,22 @@ fn execute_http_post(
             req_builder = req_builder.header("Authorization", format!("Bearer {key}"));
         }
 
-        let response = req_builder.send().map_err(|error| {
-            BridgeClientError::CallFailed {
+        let response = req_builder
+            .send()
+            .map_err(|error| BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::Transport,
                 code: Some(-32005),
                 message: format!("provider transport failed: {error}"),
-            }
-        })?;
+            })?;
 
         let status = response.status().as_u16();
-        let response_body = response.text().map_err(|error| {
-            BridgeClientError::CallFailed {
+        let response_body = response
+            .text()
+            .map_err(|error| BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::Transport,
                 code: Some(-32005),
                 message: format!("reading response body failed: {error}"),
-            }
-        })?;
+            })?;
 
         Ok((status, response_body))
     })
@@ -220,25 +226,25 @@ fn streaming_http_io(
         req_builder = req_builder.header("Authorization", format!("Bearer {key}"));
     }
 
-    let mut response = req_builder.send().map_err(|error| {
-        BridgeClientError::CallFailed {
+    let mut response = req_builder
+        .send()
+        .map_err(|error| BridgeClientError::CallFailed {
             layer: BridgeErrorLayer::Transport,
             code: Some(-32005),
             message: format!("provider transport failed: {error}"),
-        }
-    })?;
+        })?;
 
     let status = response.status().as_u16();
 
     // 非 2xx 状态码时直接读取完整响应体
     if !(200..300).contains(&status) {
-        let response_body = response.text().map_err(|error| {
-            BridgeClientError::CallFailed {
+        let response_body = response
+            .text()
+            .map_err(|error| BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::Transport,
                 code: Some(-32005),
                 message: format!("reading error response body failed: {error}"),
-            }
-        })?;
+            })?;
         return Ok((status, response_body));
     }
 
@@ -252,13 +258,14 @@ fn streaming_http_io(
     let mut last_delta_len = 0usize;
 
     loop {
-        let bytes_read = response.read(&mut chunk_buf).map_err(|error| {
-            BridgeClientError::CallFailed {
-                layer: BridgeErrorLayer::Transport,
-                code: Some(-32005),
-                message: format!("reading stream chunk failed: {error}"),
-            }
-        })?;
+        let bytes_read =
+            response
+                .read(&mut chunk_buf)
+                .map_err(|error| BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::Transport,
+                    code: Some(-32005),
+                    message: format!("reading stream chunk failed: {error}"),
+                })?;
 
         if bytes_read == 0 {
             break;
@@ -306,10 +313,7 @@ fn streaming_http_io(
 }
 
 impl ModelBridgeClient for HttpModelBridgeClient {
-    fn invoke(
-        &self,
-        request: ModelInvocationRequest,
-    ) -> Result<BridgeResponse, BridgeClientError> {
+    fn invoke(&self, request: ModelInvocationRequest) -> Result<BridgeResponse, BridgeClientError> {
         if request.prompt.trim().is_empty() && request.messages.is_none() {
             return Err(BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::RemoteBusiness,
@@ -321,8 +325,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         let url = self.chat_completions_url()?;
         let body = self.build_request_body(&request);
 
-        let (status, response_body) =
-            execute_http_post(url, body, self.api_key.clone())?;
+        let (status, response_body) = execute_http_post(url, body, self.api_key.clone())?;
 
         if !(200..300).contains(&status) {
             // Attempt to extract OpenAI-style error details
@@ -348,15 +351,13 @@ impl ModelBridgeClient for HttpModelBridgeClient {
             });
         }
 
-        let envelope: OpenAiCompatibleChatCompletionEnvelope =
-            serde_json::from_str(&response_body).map_err(|error| {
-                BridgeClientError::CallFailed {
-                    layer: BridgeErrorLayer::RemoteBusiness,
-                    code: Some(-32007),
-                    message: format!(
-                        "provider response invalid: decode chat completion failed: {error}"
-                    ),
-                }
+        let envelope: OpenAiCompatibleChatCompletionEnvelope = serde_json::from_str(&response_body)
+            .map_err(|error| BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::RemoteBusiness,
+                code: Some(-32007),
+                message: format!(
+                    "provider response invalid: decode chat completion failed: {error}"
+                ),
             })?;
 
         let payload =
@@ -415,7 +416,10 @@ impl ModelBridgeClient for HttpModelBridgeClient {
 
         // 流式路径的 response_body 已经是 BridgeResponse payload 格式，
         // 由 adapted_response_to_bridge_payload 直接生成，无需再反序列化。
-        Ok(BridgeResponse { ok: true, payload: response_body })
+        Ok(BridgeResponse {
+            ok: true,
+            payload: response_body,
+        })
     }
 }
 
@@ -441,10 +445,7 @@ struct OpenAiCompatibleChatChoice {
 }
 
 impl OpenAiCompatibleChatChoice {
-    fn into_payload(
-        self,
-        usage: Option<OpenAiCompatibleUsage>,
-    ) -> OpenAiCompatibleSuccessPayload {
+    fn into_payload(self, usage: Option<OpenAiCompatibleUsage>) -> OpenAiCompatibleSuccessPayload {
         let (content, tool_calls) = match self.message {
             Some(message) => (
                 message
@@ -651,19 +652,25 @@ fn build_openai_chat_completions_url(base_url: &str) -> Result<String, String> {
 /// 将 `AdaptedResponse` 直接转换为 `BridgeResponse.payload` 格式，
 /// 跳过自构造 OpenAI choices[] envelope → 再反序列化的冗余链路。
 fn adapted_response_to_bridge_payload(adapted: &AdaptedResponse) -> String {
-    let tool_calls: Vec<OpenAiCompatibleToolCall> = adapted.tool_calls.iter().map(|tc| {
-        OpenAiCompatibleToolCall {
+    let tool_calls: Vec<OpenAiCompatibleToolCall> = adapted
+        .tool_calls
+        .iter()
+        .map(|tc| OpenAiCompatibleToolCall {
             id: Some(tc.id.clone()),
             kind: Some("function".to_string()),
             function: OpenAiCompatibleToolFunction {
                 name: tc.name.clone(),
                 arguments: tc.raw_arguments.as_deref().unwrap_or("{}").to_string(),
             },
-        }
-    }).collect();
+        })
+        .collect();
 
     let payload = OpenAiCompatibleSuccessPayload {
-        content: if adapted.content.is_empty() { None } else { Some(adapted.content.clone()) },
+        content: if adapted.content.is_empty() {
+            None
+        } else {
+            Some(adapted.content.clone())
+        },
         finish_reason: Some(adapted.stop_reason.clone()),
         usage: Some(OpenAiCompatibleUsage {
             prompt_tokens: Some(adapted.usage.input_tokens),
@@ -675,7 +682,9 @@ fn adapted_response_to_bridge_payload(adapted: &AdaptedResponse) -> String {
         tool_calls,
     };
 
-    payload.into_bridge_payload().unwrap_or_else(|_| adapted.content.clone())
+    payload
+        .into_bridge_payload()
+        .unwrap_or_else(|_| adapted.content.clone())
 }
 
 /// 安全地将字节切片解码为 UTF-8 字符串，不丢弃尾部不完整的多字节序列。
@@ -729,7 +738,10 @@ mod tests {
         unsafe { env::remove_var(OPENAI_BASE_URL_ENV) };
 
         let result = HttpModelBridgeClient::from_env();
-        assert!(result.is_none(), "from_env() should return None without BASE_URL");
+        assert!(
+            result.is_none(),
+            "from_env() should return None without BASE_URL"
+        );
 
         // Restore if it was set.
         if let Some(value) = saved {
@@ -751,11 +763,50 @@ mod tests {
             prompt: "hello world".to_string(),
             messages: None,
             tools: None,
+            tool_choice: None,
         });
         assert_eq!(body["model"], "gpt-4.1-mini");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "hello world");
         assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn build_request_body_preserves_forced_tool_choice() {
+        let client = HttpModelBridgeClient::new(
+            "https://api.example.com/v1".to_string(),
+            Some("test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+
+        let body = client.build_request_body(&ModelInvocationRequest {
+            provider: "openai".to_string(),
+            prompt: "classify".to_string(),
+            messages: None,
+            tools: Some(vec![crate::types::ChatToolDefinition {
+                kind: "function".to_string(),
+                function: crate::types::ChatToolFunctionDefinition {
+                    name: "classify_session_turn".to_string(),
+                    description: "分类当前会话 turn".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "route": { "type": "string" }
+                        },
+                        "required": ["route"]
+                    }),
+                },
+            }]),
+            tool_choice: Some(crate::types::ChatToolChoice::force_function(
+                "classify_session_turn",
+            )),
+        });
+
+        assert_eq!(body["tool_choice"]["type"], "function");
+        assert_eq!(
+            body["tool_choice"]["function"]["name"],
+            "classify_session_turn"
+        );
     }
 
     #[test]
@@ -771,6 +822,7 @@ mod tests {
             prompt: "   ".to_string(),
             messages: None,
             tools: None,
+            tool_choice: None,
         });
 
         let error = result.expect_err("empty prompt should fail");
@@ -804,11 +856,8 @@ mod tests {
             "https://api.example.com/v1/chat/completions"
         );
 
-        let client3 = HttpModelBridgeClient::new(
-            "not-a-url".to_string(),
-            None,
-            "gpt-4".to_string(),
-        );
+        let client3 =
+            HttpModelBridgeClient::new("not-a-url".to_string(), None, "gpt-4".to_string());
         assert!(client3.chat_completions_url().is_err());
 
         let client4 = HttpModelBridgeClient::new(
@@ -856,16 +905,13 @@ mod tests {
                 let read = stream.read(&mut chunk).expect("should read");
                 assert!(read > 0, "should receive data");
                 buffer.extend_from_slice(&chunk[..read]);
-                if let Some(pos) = buffer
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                {
+                if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
                     break pos + 4;
                 }
             };
 
-            let header_text = String::from_utf8(buffer[..header_end].to_vec())
-                .expect("headers should be utf-8");
+            let header_text =
+                String::from_utf8(buffer[..header_end].to_vec()).expect("headers should be utf-8");
             let mut lines = header_text.split("\r\n");
             let request_line = lines.next().expect("request line should exist").to_string();
             let mut authorization = None;
@@ -891,9 +937,8 @@ mod tests {
                 buffer.extend_from_slice(&chunk[..read]);
             }
 
-            let body =
-                String::from_utf8(buffer[header_end..header_end + content_length].to_vec())
-                    .expect("body should be utf-8");
+            let body = String::from_utf8(buffer[header_end..header_end + content_length].to_vec())
+                .expect("body should be utf-8");
 
             // Parse method and path from request line
             let parts: Vec<&str> = request_line.split_whitespace().collect();
@@ -961,6 +1006,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect("invoke should succeed against mock server");
 
@@ -1017,6 +1063,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect("invoke should succeed");
 
@@ -1055,6 +1102,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect_err("rejected request should return error");
 
@@ -1076,8 +1124,7 @@ mod tests {
     fn invoke_against_unreachable_server_returns_transport_error() {
         // Bind and immediately drop to get an unreachable port.
         let address = {
-            let listener =
-                TcpListener::bind("127.0.0.1:0").expect("ephemeral bind should succeed");
+            let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral bind should succeed");
             let addr = listener.local_addr().expect("address should exist");
             drop(listener);
             addr
@@ -1095,6 +1142,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect_err("unreachable server should return error");
 
@@ -1131,6 +1179,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 messages: None,
                 tools: None,
+                tool_choice: None,
             })
             .expect("invoke should succeed without API key");
 

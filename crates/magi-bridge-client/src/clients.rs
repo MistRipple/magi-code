@@ -241,19 +241,6 @@ impl ModelBridgeClient for JsonRpcModelBridgeClient {
             .map_err(transport_call_failed)?;
         decode_bridge_response(response.payload)
     }
-
-    fn invoke_stream(
-        &self,
-        request: ModelInvocationRequest,
-        on_event: &mut dyn FnMut(crate::ModelStreamEvent),
-    ) -> Result<BridgeResponse, BridgeClientError> {
-        let response = self.invoke(request)?;
-        let parsed = response.parse_chat_payload();
-        if let Some(content) = parsed.content.filter(|content| !content.is_empty()) {
-            on_event(crate::ModelStreamEvent::ContentDelta { delta: content });
-        }
-        Ok(response)
-    }
 }
 
 impl McpBridgeClient for JsonRpcMcpBridgeClient {
