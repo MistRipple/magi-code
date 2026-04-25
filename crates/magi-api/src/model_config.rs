@@ -143,6 +143,10 @@ impl NormalizedModelConfig {
         &self.url_mode_label
     }
 
+    pub(crate) fn is_full_url_mode(&self) -> bool {
+        matches!(self.url_mode, ModelUrlMode::Full)
+    }
+
     pub(crate) fn require_base_url(&self) -> Result<&str, ApiError> {
         self.base_url
             .as_deref()
