@@ -673,6 +673,127 @@ fn full_recovery_lifecycle_bind_resume_input_dispatch_with_consistency_checks() 
 }
 
 #[test]
+fn resumed_status_survives_follow_up_binding_and_chain_refresh() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-resume-preserve");
+    let workspace_id = WorkspaceId::new("workspace-resume-preserve");
+    let mission_id = MissionId::new("mission-resume-preserve");
+    let root_task_id = TaskId::new("task-root-resume-preserve");
+    let worker_id = WorkerId::new("worker-resume-preserve");
+    let execution_chain_ref = "chain-resume-preserve".to_string();
+
+    store
+        .create_session(session_id.clone(), "Resume Preserve")
+        .expect("session should be creatable");
+    store.bind_execution_ownership(
+        session_id.clone(),
+        ExecutionOwnership {
+            session_id: Some(session_id.clone()),
+            workspace_id: Some(workspace_id.clone()),
+            execution_chain_ref: Some(execution_chain_ref.clone()),
+            ..ExecutionOwnership::default()
+        },
+    );
+    store
+        .apply_recovery_resume_input(
+            session_id.clone(),
+            RecoveryResumeInput {
+                recovery_id: "recovery-resume-preserve".to_string(),
+                snapshot_id: "snapshot-resume-preserve".to_string(),
+                ownership: ExecutionOwnership {
+                    session_id: Some(session_id.clone()),
+                    workspace_id: Some(workspace_id.clone()),
+                    execution_chain_ref: Some(execution_chain_ref.clone()),
+                    ..ExecutionOwnership::default()
+                },
+                diagnostic_summary: None,
+                created_at: UtcMillis::now(),
+                updated_at: UtcMillis::now(),
+            },
+        )
+        .expect("recovery input should apply");
+    store
+        .apply_resume_execution_target(
+            &session_id,
+            &TaskExecutionTarget {
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                task_id: TaskId::new("task-resume-preserve"),
+                requested_worker_id: Some(worker_id.clone()),
+                recovery_id: Some("recovery-resume-preserve".to_string()),
+                execution_chain_ref: Some(execution_chain_ref.clone()),
+            },
+        )
+        .expect("resume execution target should apply");
+
+    store.bind_execution_ownership(
+        session_id.clone(),
+        ExecutionOwnership {
+            session_id: Some(session_id.clone()),
+            workspace_id: Some(workspace_id.clone()),
+            mission_id: Some(mission_id.clone()),
+            task_id: Some(TaskId::new("task-resume-preserve-follow-up")),
+            worker_id: Some(WorkerId::new("worker-resume-preserve-follow-up")),
+            execution_chain_ref: Some(execution_chain_ref.clone()),
+        },
+    );
+    assert_eq!(
+        store
+            .runtime_sidecar(&session_id)
+            .expect("sidecar should exist after follow-up bind")
+            .status,
+        SessionExecutionSidecarStatus::Resumed
+    );
+
+    store
+        .upsert_active_execution_chain(
+            session_id.clone(),
+            ActiveExecutionChain {
+                session_id: session_id.clone(),
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                execution_chain_ref: execution_chain_ref.clone(),
+                workspace_id: Some(workspace_id.clone()),
+                active_branch_task_ids: vec![TaskId::new("task-resume-preserve-follow-up")],
+                active_worker_bindings: vec![WorkerId::new("worker-resume-preserve-follow-up")],
+                branches: vec![ActiveExecutionBranch {
+                    task_id: TaskId::new("task-resume-preserve-follow-up"),
+                    worker_id: WorkerId::new("worker-resume-preserve-follow-up"),
+                    stage: "execute".to_string(),
+                    lease_id: None,
+                    execution_intent_ref: None,
+                    binding_lifecycle: None,
+                    checkpoint_stage: None,
+                    next_step_index: None,
+                    checkpoint_at: None,
+                    resume_mode: None,
+                    resume_token: None,
+                    use_tools: false,
+                    skill_name: None,
+                    is_primary: true,
+                }],
+                recovery_ref: None,
+                dispatch_context: ActiveExecutionDispatchContext {
+                    accepted_at: UtcMillis::now(),
+                    entry_id: "timeline-resume-preserve".to_string(),
+                    trimmed_text: Some("resume preserve".to_string()),
+                    deep_task: true,
+                    skill_name: None,
+                },
+                current_turn: None,
+            },
+        )
+        .expect("active execution chain should upsert");
+    assert_eq!(
+        store
+            .runtime_sidecar(&session_id)
+            .expect("sidecar should exist after chain refresh")
+            .status,
+        SessionExecutionSidecarStatus::Resumed
+    );
+}
+
+#[test]
 fn clear_ownership_after_resume_resets_to_recovery_linked_or_detached() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-clear-ownership");

@@ -68,23 +68,30 @@ impl SessionStore {
     fn derive_sidecar_status(
         ownership: &ExecutionOwnership,
         recovery_id: Option<&str>,
+        existing_status: Option<&SessionExecutionSidecarStatus>,
     ) -> SessionExecutionSidecarStatus {
-        if matches!(
-            (
-                ownership.session_id.is_some(),
-                ownership.workspace_id.is_some(),
-                ownership.mission_id.is_some(),
-                ownership.task_id.is_some(),
-                ownership.worker_id.is_some(),
-                ownership.execution_chain_ref.is_some()
-            ),
-            (false, false, false, false, false, false)
-        ) {
+        let has_ownership = [
+            ownership.session_id.is_some(),
+            ownership.workspace_id.is_some(),
+            ownership.mission_id.is_some(),
+            ownership.task_id.is_some(),
+            ownership.worker_id.is_some(),
+            ownership.execution_chain_ref.is_some(),
+        ]
+        .into_iter()
+        .any(|field| field);
+
+        if !has_ownership {
             if recovery_id.is_some() {
                 SessionExecutionSidecarStatus::RecoveryLinked
             } else {
                 SessionExecutionSidecarStatus::Detached
             }
+        } else if matches!(
+            existing_status,
+            Some(SessionExecutionSidecarStatus::Resumed)
+        ) {
+            SessionExecutionSidecarStatus::Resumed
         } else if recovery_id.is_some() {
             SessionExecutionSidecarStatus::RecoveryLinked
         } else {
@@ -133,7 +140,11 @@ impl SessionStore {
                 ..ownership
             }
         };
-        let status = Self::derive_sidecar_status(&ownership, recovery_id.as_deref());
+        let status = Self::derive_sidecar_status(
+            &ownership,
+            recovery_id.as_deref(),
+            existing.as_ref().map(|sidecar| &sidecar.status),
+        );
         self.upsert_runtime_sidecar_with_reason(
             SessionRuntimeSidecar {
                 session_id,
@@ -190,7 +201,11 @@ impl SessionStore {
             .as_ref()
             .map(Self::ownership_from_active_execution_chain)
             .unwrap_or_default();
-        let status = Self::derive_sidecar_status(&ownership, recovery_id.as_deref());
+        let status = Self::derive_sidecar_status(
+            &ownership,
+            recovery_id.as_deref(),
+            existing.as_ref().map(|sidecar| &sidecar.status),
+        );
         let updated = SessionRuntimeSidecar {
             session_id,
             ownership,
@@ -374,7 +389,11 @@ impl SessionStore {
             .ok_or(DomainError::NotFound {
                 entity: "session_runtime_sidecar",
             })?;
-        let status = Self::derive_sidecar_status(&existing.ownership, recovery_id.as_deref());
+        let status = Self::derive_sidecar_status(
+            &existing.ownership,
+            recovery_id.as_deref(),
+            Some(&existing.status),
+        );
         let active_execution_chain = existing.active_execution_chain.map(|mut chain| {
             chain.recovery_ref = recovery_id.clone();
             chain
@@ -466,9 +485,11 @@ impl SessionStore {
                         .collect();
                     chain.normalize();
                     sidecar.ownership = Self::ownership_from_active_execution_chain(chain);
+                    let existing_status = sidecar.status.clone();
                     sidecar.status = Self::derive_sidecar_status(
                         &sidecar.ownership,
                         sidecar.recovery_id.as_deref(),
+                        Some(&existing_status),
                     );
                     sidecar.updated_at = UtcMillis::now();
                     break 'updated Some(sidecar.clone());
@@ -684,7 +705,8 @@ impl SessionStore {
             .as_ref()
             .map(Self::ownership_from_active_execution_chain)
             .unwrap_or_default();
-        let status = Self::derive_sidecar_status(&ownership, recovery_id.as_deref());
+        let status =
+            Self::derive_sidecar_status(&ownership, recovery_id.as_deref(), Some(&existing.status));
         self.upsert_runtime_sidecar_with_reason(
             SessionRuntimeSidecar {
                 session_id: session_id.clone(),
