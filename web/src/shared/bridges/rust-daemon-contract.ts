@@ -136,6 +136,8 @@ interface RustSessionRuntimeTurnSummary {
   turn_id?: string;
   turn_seq?: number;
   accepted_at?: number | null;
+  completed_at?: number | null;
+  response_duration_ms?: number | null;
   status?: string | null;
   user_message?: string | null;
 }
@@ -184,6 +186,19 @@ interface RustSessionRuntimeBranchSummary {
   binding_lifecycle?: string | null;
   last_checkpoint_at?: number | null;
   is_primary?: boolean;
+}
+
+interface RustCompletedTurnTimelineSnapshot {
+  session_id?: string;
+  mission_id?: string | null;
+  root_task_id?: string | null;
+  execution_chain_ref?: string | null;
+  final_text?: string | null;
+  streaming_entry_id?: string | null;
+  is_historical_turn_snapshot?: boolean;
+  current_turn?: RustSessionRuntimeTurnSummary | null;
+  turn_items?: RustSessionRuntimeTurnItemSummary[];
+  worker_lanes?: RustSessionRuntimeTurnLaneSummary[];
 }
 
 /** 后端 RecoveryDiagnosticSummaryEntry 的 TS 映射 */
@@ -440,6 +455,42 @@ function normalizeWorkerRuntimeEntries(
     }));
 }
 
+function normalizeRuntimeTurnSummary(raw: unknown): RustSessionRuntimeTurnSummary | null {
+  const turn = normalizeObjectRecord(raw);
+  if (!turn) {
+    return null;
+  }
+  return {
+    turn_id: normalizeString(turn.turn_id) || undefined,
+    turn_seq: typeof turn.turn_seq === 'number' ? Math.floor(turn.turn_seq) : undefined,
+    accepted_at: typeof turn.accepted_at === 'number' ? Math.floor(turn.accepted_at) : undefined,
+    completed_at: typeof turn.completed_at === 'number' ? Math.floor(turn.completed_at) : undefined,
+    response_duration_ms: typeof turn.response_duration_ms === 'number'
+      ? Math.floor(turn.response_duration_ms)
+      : undefined,
+    status: normalizeString(turn.status) || undefined,
+    user_message: normalizeString(turn.user_message) || undefined,
+  };
+}
+
+function normalizeRuntimeTurnItems(raw: unknown): RustSessionRuntimeTurnItemSummary[] {
+  return Array.isArray(raw)
+    ? raw
+      .map((item) => normalizeObjectRecord(item))
+      .filter((item): item is Record<string, unknown> => item !== null)
+      .map((item) => item as RustSessionRuntimeTurnItemSummary)
+    : [];
+}
+
+function normalizeRuntimeTurnLanes(raw: unknown): RustSessionRuntimeTurnLaneSummary[] {
+  return Array.isArray(raw)
+    ? raw
+      .map((lane) => normalizeObjectRecord(lane))
+      .filter((lane): lane is Record<string, unknown> => lane !== null)
+      .map((lane) => lane as RustSessionRuntimeTurnLaneSummary)
+    : [];
+}
+
 function normalizeSessionRuntimeEntries(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
 ): RustSessionRuntimeSummary[] {
@@ -481,19 +532,9 @@ function normalizeSessionRuntimeEntries(
             is_primary: branch.is_primary === true,
           }))
         : [],
-      current_turn: normalizeObjectRecord(entry.current_turn) as RustSessionRuntimeTurnSummary | null,
-      turn_items: Array.isArray(entry.turn_items)
-        ? entry.turn_items
-          .map((item) => normalizeObjectRecord(item))
-          .filter((item): item is Record<string, unknown> => item !== null)
-          .map((item) => item as RustSessionRuntimeTurnItemSummary)
-        : [],
-      worker_lanes: Array.isArray(entry.worker_lanes)
-        ? entry.worker_lanes
-          .map((lane) => normalizeObjectRecord(lane))
-          .filter((lane): lane is Record<string, unknown> => lane !== null)
-          .map((lane) => lane as RustSessionRuntimeTurnLaneSummary)
-        : [],
+      current_turn: normalizeRuntimeTurnSummary(entry.current_turn),
+      turn_items: normalizeRuntimeTurnItems(entry.turn_items),
+      worker_lanes: normalizeRuntimeTurnLanes(entry.worker_lanes),
     }));
 }
 
@@ -1362,6 +1403,37 @@ function createRustTimelineMessage(input: {
   };
 }
 
+function tryParseCompletedTurnTimelineSnapshot(raw: string): RustCompletedTurnTimelineSnapshot | null {
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('{')) {
+    return null;
+  }
+  try {
+    const record = normalizeObjectRecord(JSON.parse(trimmed));
+    if (!record || record.is_historical_turn_snapshot !== true) {
+      return null;
+    }
+    const currentTurn = normalizeRuntimeTurnSummary(record.current_turn);
+    if (!normalizeString(currentTurn?.turn_id)) {
+      return null;
+    }
+    return {
+      session_id: normalizeString(record.session_id) || undefined,
+      mission_id: normalizeString(record.mission_id) || undefined,
+      root_task_id: normalizeString(record.root_task_id) || undefined,
+      execution_chain_ref: normalizeString(record.execution_chain_ref) || undefined,
+      final_text: normalizeString(record.final_text) || undefined,
+      streaming_entry_id: normalizeString(record.streaming_entry_id) || undefined,
+      is_historical_turn_snapshot: true,
+      current_turn: currentTurn,
+      turn_items: normalizeRuntimeTurnItems(record.turn_items),
+      worker_lanes: normalizeRuntimeTurnLanes(record.worker_lanes),
+    };
+  } catch {
+    return null;
+  }
+}
+
 function tryParseStructuredBlocks(raw: string): ContentBlock[] | undefined {
   if (!raw.startsWith('{')) {
     return undefined;
@@ -1426,6 +1498,21 @@ function buildTimelineEntryArtifacts(
     } else if (kind === 'AssistantMessage') {
       role = 'assistant';
       type = 'text';
+    }
+    if (kind === 'AssistantMessage') {
+      const completedTurnSnapshot = tryParseCompletedTurnTimelineSnapshot(message);
+      if (completedTurnSnapshot) {
+        artifacts.push(...buildTurnArtifactsFromSummary(
+          sessionId,
+          completedTurnSnapshot.current_turn,
+          completedTurnSnapshot.turn_items,
+          completedTurnSnapshot.worker_lanes,
+          timestamp,
+          completedTurnSnapshot.final_text,
+          completedTurnSnapshot.streaming_entry_id || entryId,
+        ));
+        continue;
+      }
     }
     const parsedBlocks = kind === 'AssistantMessage' ? tryParseStructuredBlocks(message) : undefined;
     artifacts.push({
@@ -1602,38 +1689,85 @@ function buildDispatchArtifacts(
   return artifacts;
 }
 
-function buildProjectionRenderEntries(
-  artifacts: TimelineProjectionArtifact[],
-  displayContext: 'thread' | 'worker',
-  workerId?: string,
-): Array<{ entryId: string; artifactId: string }> {
-  return artifacts
-    .filter((artifact) => displayContext === 'thread'
-      ? artifact.threadVisible
-      : Boolean(workerId && artifact.workerTabs.includes(workerId)))
-    .map((artifact) => ({
-      entryId: `artifact:${artifact.artifactId}`,
-      artifactId: artifact.artifactId,
-    }));
+function compareProjectionArtifactOrder(
+  left: TimelineProjectionArtifact,
+  right: TimelineProjectionArtifact,
+): number {
+  const timestampDelta = normalizeNumber(left.timestamp, 0) - normalizeNumber(right.timestamp, 0);
+  if (timestampDelta !== 0) {
+    return timestampDelta;
+  }
+  const displayOrderDelta = normalizeNumber(left.displayOrder, 0) - normalizeNumber(right.displayOrder, 0);
+  if (displayOrderDelta !== 0) {
+    return displayOrderDelta;
+  }
+  const streamSeqDelta = normalizeNumber(left.cardStreamSeq, 0) - normalizeNumber(right.cardStreamSeq, 0);
+  if (streamSeqDelta !== 0) {
+    return streamSeqDelta;
+  }
+  return left.artifactId.localeCompare(right.artifactId);
 }
 
-function buildWorkerRenderEntriesFromArtifacts(
-  artifacts: TimelineProjectionArtifact[],
-): Record<string, Array<{ entryId: string; artifactId: string }>> {
-  const workers = new Set<string>();
-  for (const artifact of artifacts) {
-    for (const workerId of artifact.workerTabs) {
-      if (workerId) {
-        workers.add(workerId);
+function mergeProjectionArtifacts(
+  groups: TimelineProjectionArtifact[][],
+): TimelineProjectionArtifact[] {
+  const artifactById = new Map<string, TimelineProjectionArtifact>();
+  for (const group of groups) {
+    for (const artifact of group) {
+      if (!artifact.artifactId) {
+        continue;
       }
+      artifactById.set(artifact.artifactId, artifact);
     }
   }
-  return Object.fromEntries(
-    [...workers].map((workerId) => [
-      workerId,
-      buildProjectionRenderEntries(artifacts, 'worker', workerId),
-    ]),
-  );
+  return [...artifactById.values()].sort(compareProjectionArtifactOrder);
+}
+
+function collectProjectionArtifactIdentityIds(
+  artifacts: TimelineProjectionArtifact[],
+): Set<string> {
+  const ids = new Set<string>();
+  const add = (value: unknown): void => {
+    const normalized = normalizeString(value);
+    if (normalized) {
+      ids.add(normalized);
+    }
+  };
+  for (const artifact of artifacts) {
+    add(artifact.artifactId);
+    add(artifact.message?.id);
+    for (const messageId of artifact.messageIds || []) add(messageId);
+    for (const item of artifact.executionItems || []) {
+      add(item.itemId);
+      add(item.message?.id);
+      for (const messageId of item.messageIds || []) add(messageId);
+    }
+  }
+  return ids;
+}
+
+function projectionArtifactHasKnownIdentity(
+  artifact: TimelineProjectionArtifact,
+  knownIds: Set<string>,
+): boolean {
+  if (knownIds.size === 0) {
+    return false;
+  }
+  const matches = (value: unknown): boolean => {
+    const normalized = normalizeString(value);
+    return normalized.length > 0 && knownIds.has(normalized);
+  };
+  if (matches(artifact.artifactId) || matches(artifact.message?.id)) {
+    return true;
+  }
+  if ((artifact.messageIds || []).some(matches)) {
+    return true;
+  }
+  return (artifact.executionItems || []).some((item) => (
+    matches(item.itemId)
+    || matches(item.message?.id)
+    || (item.messageIds || []).some(matches)
+  ));
 }
 
 function toolStatusLooksTerminalError(normalizedStatus: string): boolean {
@@ -1681,20 +1815,21 @@ function turnWorkerStatusToLaneStatus(status: string): DispatchGroupLane['status
   }
 }
 
-function buildCurrentTurnArtifacts(
+function buildTurnArtifactsFromSummary(
   sessionId: string,
-  runtimeReadModel: RustRuntimeReadModelDto | undefined,
+  turn: RustSessionRuntimeTurnSummary | null | undefined,
+  turnItems: RustSessionRuntimeTurnItemSummary[] | undefined,
+  workerLanes: RustSessionRuntimeTurnLaneSummary[] | undefined,
   generatedAt: number,
+  finalText?: string | null,
+  streamingEntryId?: string | null,
 ): TimelineProjectionArtifact[] {
-  const session = normalizeSessionRuntimeEntries(runtimeReadModel)
-    .find((entry) => normalizeString(entry.session_id) === sessionId);
-  const turn = session?.current_turn;
   const turnId = normalizeString(turn?.turn_id);
   if (!turnId) {
     return [];
   }
-  const items = Array.isArray(session?.turn_items)
-    ? session.turn_items
+  const items = Array.isArray(turnItems)
+    ? turnItems
       .filter((item) => normalizeString(item.item_id).length > 0)
       .sort((left, right) => normalizeNumber(left.item_seq, 0) - normalizeNumber(right.item_seq, 0))
     : [];
@@ -1708,7 +1843,7 @@ function buildCurrentTurnArtifacts(
   );
   const hasAssistantFinal = finalItemIds.size > 0;
   const workerLaneById = new Map(
-    (Array.isArray(session?.worker_lanes) ? session.worker_lanes : [])
+    (Array.isArray(workerLanes) ? workerLanes : [])
       .map((lane) => [normalizeString(lane.lane_id), lane] as const)
       .filter(([laneId]) => laneId.length > 0),
   );
@@ -1727,26 +1862,28 @@ function buildCurrentTurnArtifacts(
   const toolResultItemIds = new Set(
     [...toolItemsByCallId.values()].map((item) => normalizeString(item.item_id)),
   );
-  const latestAssistantThinkingByTurn = new Map<string, string>();
-
   const artifacts: TimelineProjectionArtifact[] = [];
   for (const item of items) {
     const kind = normalizeString(item.kind);
     const itemId = normalizeString(item.item_id);
-    const content = normalizeString(item.content) || normalizeString(item.title);
+    const itemContent = normalizeString(item.content);
+    const assistantKind = kind === 'assistant_thinking'
+      || kind === 'assistant_stream'
+      || kind === 'assistant_final';
+    const content = itemContent
+      || (kind === 'assistant_final' ? normalizeString(finalText) : '')
+      || (assistantKind ? '' : normalizeString(item.title));
     if (!itemId) {
       continue;
     }
-    if (kind === 'assistant_phase') {
+    if (kind === 'assistant_phase' || kind === 'user_message') {
+      continue;
+    }
+    if (assistantKind && !content) {
       continue;
     }
     if (kind === 'assistant_thinking') {
-      if (content) {
-        latestAssistantThinkingByTurn.set(turnId, content);
-      }
-      if (hasAssistantFinal) {
-        continue;
-      }
+      // thinking 必须独立保留，不能在有 final 时被吞掉，否则刷新后会丢失真实 reasoning 轨迹。
     }
     if (kind === 'assistant_stream' && hasAssistantFinal) {
       continue;
@@ -1757,9 +1894,11 @@ function buildCurrentTurnArtifacts(
     const laneId = normalizeString(item.lane_id);
     const workerId = normalizeString(item.worker_id)
       || normalizeString(workerLaneById.get(laneId)?.worker_id);
-    const timestamp = normalizeNumber(turn?.accepted_at, generatedAt) + normalizeNumber(item.item_seq, 0);
-    const threadVisible = kind === 'user_message'
-      || item.thread_visible === true
+    // 使用 snapshot 条目的实际 occurredAt(generatedAt)作为基准时间戳，避免 turn.accepted_at
+    // 比 user 消息 timeline entry 的 occurredAt 还早导致整个 turn 的助手卡片被排到用户消息之前。
+    // 同一 turn 内的相对顺序由 item_seq 保证。
+    const timestamp = generatedAt + normalizeNumber(item.item_seq, 0);
+    const threadVisible = item.thread_visible === true
       || kind === 'assistant_thinking'
       || kind === 'assistant_stream'
       || kind === 'assistant_final'
@@ -1772,11 +1911,7 @@ function buildCurrentTurnArtifacts(
     let source: Message['source'] = 'orchestrator';
     let blocks: ContentBlock[] | undefined;
 
-    if (kind === 'user_message') {
-      role = 'user';
-      type = 'user_input';
-      source = 'user';
-    } else if (kind === 'assistant_thinking') {
+    if (kind === 'assistant_thinking') {
       type = 'thinking';
       blocks = [{
         type: 'thinking',
@@ -1787,17 +1922,8 @@ function buildCurrentTurnArtifacts(
           blockId: `thinking:${itemId}`,
         },
       }];
-    } else if (kind === 'assistant_final' && latestAssistantThinkingByTurn.get(turnId)) {
-      const thinkingContent = latestAssistantThinkingByTurn.get(turnId) || '';
+    } else if (kind === 'assistant_final') {
       blocks = [{
-        type: 'thinking',
-        content: thinkingContent,
-        thinking: {
-          content: thinkingContent,
-          isComplete: true,
-          blockId: `thinking:${turnId}`,
-        },
-      }, {
         type: 'text',
         content,
       }];
@@ -1846,6 +1972,20 @@ function buildCurrentTurnArtifacts(
     }
 
     const artifactId = `turn:${turnId}:${itemId}`;
+    const messageIdAliases = new Set<string>([artifactId, itemId, `rust-timeline:${itemId}`]);
+    if (kind === 'assistant_final' || kind === 'assistant_stream') {
+      const streamingAlias = normalizeString(streamingEntryId);
+      if (streamingAlias) {
+        messageIdAliases.add(`rust-timeline:${streamingAlias}`);
+      }
+    }
+    if (kind === 'tool_call_started' || kind === 'tool_call_result') {
+      const toolCallId = normalizeString(item.tool_call_id);
+      if (toolCallId) {
+        messageIdAliases.add(`rust-timeline:turn-item-tool-result-${toolCallId}`);
+        messageIdAliases.add(`rust-timeline:turn-item-tool-started-${toolCallId}`);
+      }
+    }
     artifacts.push({
       artifactId,
       kind: kind.includes('tool') ? 'tool' : 'message',
@@ -1858,7 +1998,7 @@ function buildCurrentTurnArtifacts(
       worker: workerId || undefined,
       threadVisible,
       workerTabs,
-      messageIds: [artifactId],
+      messageIds: Array.from(messageIdAliases),
       message: createRustTimelineMessage({
         id: artifactId,
         content,
@@ -1875,11 +2015,30 @@ function buildCurrentTurnArtifacts(
           turnItemKind: kind,
           laneId: laneId || undefined,
           workerId: workerId || undefined,
+          ...(kind === 'assistant_final' && typeof turn?.response_duration_ms === 'number'
+            ? { responseDurationMs: Math.max(0, Math.floor(turn.response_duration_ms)) }
+            : {}),
         },
       }),
     });
   }
   return artifacts;
+}
+
+function buildCurrentTurnArtifacts(
+  sessionId: string,
+  runtimeReadModel: RustRuntimeReadModelDto | undefined,
+  generatedAt: number,
+): TimelineProjectionArtifact[] {
+  const session = normalizeSessionRuntimeEntries(runtimeReadModel)
+    .find((entry) => normalizeString(entry.session_id) === sessionId);
+  return buildTurnArtifactsFromSummary(
+    sessionId,
+    session?.current_turn,
+    session?.turn_items,
+    session?.worker_lanes,
+    generatedAt,
+  );
 }
 
 function summarizeRustEvent(event: RustEventEnvelope): string {
@@ -2206,45 +2365,48 @@ function buildTimelineProjection(
   generatedAt: number,
   payload: RustBootstrapDto,
 ): SessionTimelineProjection {
-  const currentTurnArtifacts = buildCurrentTurnArtifacts(sessionId, payload.runtimeReadModel, generatedAt);
-  if (currentTurnArtifacts.length > 0) {
-    const maxItemSeq = currentTurnArtifacts.reduce(
-      (max, artifact) => Math.max(max, artifact.cardStreamSeq),
-      0,
-    );
-    return {
-      schemaVersion: 'session-timeline-projection.v2',
-      sessionId,
-      updatedAt: generatedAt,
-      lastAppliedEventSeq: maxItemSeq,
-      artifacts: currentTurnArtifacts,
-      threadRenderEntries: buildProjectionRenderEntries(currentTurnArtifacts, 'thread'),
-      workerRenderEntries: buildWorkerRenderEntriesFromArtifacts(currentTurnArtifacts),
-    };
-  }
   const recentEvents = Array.isArray(payload.recentEvents)
     ? payload.recentEvents.map((event) => normalizeEventEnvelope(event)).filter((event): event is RustEventEnvelope => event !== null)
     : [];
   const timelineArtifacts = buildTimelineEntryArtifacts(sessionId, payload.timeline);
+  const currentTurnArtifacts = buildCurrentTurnArtifacts(sessionId, payload.runtimeReadModel, generatedAt);
+  const currentTurnIdentityIds = collectProjectionArtifactIdentityIds(currentTurnArtifacts);
+  const visibleTimelineArtifacts = timelineArtifacts.filter((artifact) => (
+    !projectionArtifactHasKnownIdentity(artifact, currentTurnIdentityIds)
+  ));
   const eventArtifacts = buildEventArtifacts(sessionId, payload.runtimeReadModel, recentEvents);
   const toolArtifacts = buildToolArtifacts(
     sessionId,
     payload.runtimeReadModel,
     recentEvents,
-    timelineArtifacts.length + eventArtifacts.length,
+    visibleTimelineArtifacts.length + eventArtifacts.length,
   );
   const dispatchArtifacts = buildDispatchArtifacts(
     sessionId,
     payload.runtimeReadModel,
     recentEvents,
     generatedAt,
-    timelineArtifacts.length + eventArtifacts.length + toolArtifacts.length,
+    visibleTimelineArtifacts.length + eventArtifacts.length + toolArtifacts.length,
   );
-  const artifacts = [...timelineArtifacts, ...eventArtifacts, ...toolArtifacts, ...dispatchArtifacts];
+  const artifacts = mergeProjectionArtifacts([
+    visibleTimelineArtifacts,
+    eventArtifacts,
+    toolArtifacts,
+    dispatchArtifacts,
+    currentTurnArtifacts,
+  ]);
   const maxEventSeq = recentEvents.reduce((max, event) => Math.max(max, normalizeNumber(event.sequence, 0)), 0);
+  const maxArtifactSeq = artifacts.reduce((max, artifact) => {
+    const itemSeq = (artifact.executionItems || []).reduce(
+      (currentMax, item) => Math.max(currentMax, normalizeNumber(item.latestEventSeq, 0)),
+      0,
+    );
+    return Math.max(max, normalizeNumber(artifact.latestEventSeq, 0), itemSeq);
+  }, 0);
   const latestSequence = Math.max(
     normalizeNumber(payload.runtimeReadModel?.meta?.latest_sequence, 0),
     maxEventSeq,
+    maxArtifactSeq,
   );
 
   return {

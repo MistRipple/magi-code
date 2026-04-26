@@ -369,6 +369,7 @@ export interface MessageMetadata {
   createdFiles?: string[];
   phase?: string;
   duration?: number;
+  responseDurationMs?: number;
   error?: string;
   recoverable?: boolean;
   questionId?: string;
@@ -437,6 +438,8 @@ export interface MessageMetadata {
   wasPlaceholder?: boolean;
   images?: Array<{ dataUrl: string }>;
   isSupplementary?: boolean;
+  toolCallId?: string;
+  toolName?: string;
 }
 
 export interface StandardMessage {

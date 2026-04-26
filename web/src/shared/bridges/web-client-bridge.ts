@@ -161,7 +161,6 @@ interface ActiveTurnLiveContext {
   userMessageId: string;
   placeholderMessageId: string;
   assistantMessageId: string;
-  assistantThinkingContent: string;
   assistantTextContent: string;
   route: 'chat' | 'execute' | 'task' | 'continue' | null;
 }
@@ -779,26 +778,6 @@ function resolveActiveAssistantMessageId(sessionId: string, itemId: string): str
   return activeTurnLiveContext.assistantMessageId;
 }
 
-function updateAssistantTurnThinkingContent(content: string): void {
-  if (!activeTurnLiveContext || !content.trim()) {
-    return;
-  }
-  const current = activeTurnLiveContext.assistantThinkingContent.trim();
-  const next = content.trim();
-  if (!current) {
-    activeTurnLiveContext.assistantThinkingContent = next;
-    return;
-  }
-  if (next.startsWith(current)) {
-    activeTurnLiveContext.assistantThinkingContent = next;
-    return;
-  }
-  if (current.startsWith(next)) {
-    return;
-  }
-  activeTurnLiveContext.assistantThinkingContent = `${current}\n\n${next}`;
-}
-
 function updateAssistantTurnTextContent(content: string): void {
   if (!activeTurnLiveContext || !content.trim()) {
     return;
@@ -819,33 +798,33 @@ function updateAssistantTurnTextContent(content: string): void {
   activeTurnLiveContext.assistantTextContent = next;
 }
 
-function buildAssistantTurnBlocks(
-  content: string,
-  itemId: string,
-  thinkingContent?: string,
-  thinkingComplete = false,
-): StandardMessage['blocks'] {
-  const blocks: StandardMessage['blocks'] = [];
-  const thinking = (thinkingContent ?? activeTurnLiveContext?.assistantThinkingContent ?? '').trim();
-  if (thinking) {
-    blocks.push({
-      type: 'thinking',
-      content: thinking,
-      isComplete: thinkingComplete,
-      blockId: activeTurnLiveContext?.requestId
-        ? `thinking:${activeTurnLiveContext.requestId}`
-        : `thinking:${itemId}`,
-    });
-  }
+function buildAssistantTurnTextBlocks(content: string): StandardMessage['blocks'] {
   const text = content.trim();
-  if (text) {
-    blocks.push({
-      type: 'text',
-      content: text,
-      isMarkdown: true,
-    });
+  if (!text) {
+    return [];
   }
-  return blocks;
+  return [{
+    type: 'text',
+    content: text,
+    isMarkdown: true,
+  }];
+}
+
+function buildAssistantThinkingBlocks(
+  itemId: string,
+  content: string,
+  isComplete: boolean,
+): StandardMessage['blocks'] {
+  const thinking = content.trim();
+  if (!thinking) {
+    return [];
+  }
+  return [{
+    type: 'thinking',
+    content: thinking,
+    isComplete,
+    blockId: `thinking:${itemId}`,
+  }];
 }
 
 function createSessionTurnItemStandardMessage(
@@ -898,27 +877,37 @@ function createSessionTurnItemStandardMessage(
     return null;
   }
 
-  if (kind === 'assistant_thinking' || kind === 'assistant_stream' || kind === 'assistant_final') {
+  if (kind === 'assistant_thinking') {
+    const thinkingContent = (content || title || '').trim();
+    if (!thinkingContent) {
+      return null;
+    }
+    const resolvedItemLifecycle = resolveTurnItemLifecycle(status);
+    id = `rust-timeline:${itemId}`;
+    type = MessageType.THINKING;
+    lifecycle = resolvedItemLifecycle === MessageLifecycle.COMPLETED
+      ? MessageLifecycle.COMPLETED
+      : MessageLifecycle.STREAMING;
+    bridgeType = lifecycle === MessageLifecycle.COMPLETED ? 'unifiedComplete' : 'unifiedMessage';
+    blocks = buildAssistantThinkingBlocks(
+      itemId,
+      thinkingContent,
+      lifecycle === MessageLifecycle.COMPLETED,
+    );
+    if (activeTurnLiveContext) {
+      metadata.requestId = activeTurnLiveContext.requestId;
+      metadata.userMessageId = activeTurnLiveContext.userMessageId;
+    }
+  } else if (kind === 'assistant_stream' || kind === 'assistant_final') {
     if (
       activeTurnLiveContext?.route === 'task'
       || activeTurnLiveContext?.route === 'continue'
     ) {
       return null;
     }
-    if (kind === 'assistant_thinking') {
-      updateAssistantTurnThinkingContent(content || title || '');
-    } else {
-      updateAssistantTurnTextContent(content || title || '');
-    }
-    const assistantText = activeTurnLiveContext?.assistantTextContent || (kind === 'assistant_stream' || kind === 'assistant_final'
-      ? (content || title || '')
-      : '');
-    const assistantThinking = activeTurnLiveContext?.assistantThinkingContent || (kind === 'assistant_thinking'
-      ? (content || title || '')
-      : '');
-    const hasVisibleText = Boolean(assistantText.trim());
-    const hasThinking = Boolean(assistantThinking.trim());
-    if (!hasVisibleText && !hasThinking) {
+    updateAssistantTurnTextContent(content);
+    const assistantText = activeTurnLiveContext?.assistantTextContent || content;
+    if (!assistantText.trim()) {
       return null;
     }
     id = resolveActiveAssistantMessageId(sessionId, itemId);
@@ -927,18 +916,7 @@ function createSessionTurnItemStandardMessage(
       ? MessageLifecycle.COMPLETED
       : (activeTurnLiveContext ? MessageLifecycle.STREAMING : resolvedItemLifecycle);
     bridgeType = lifecycle === MessageLifecycle.COMPLETED ? 'unifiedComplete' : 'unifiedMessage';
-    blocks = buildAssistantTurnBlocks(
-      hasVisibleText ? assistantText : '',
-      itemId,
-      assistantThinking,
-      kind === 'assistant_final'
-        || (!activeTurnLiveContext
-          && kind === 'assistant_thinking'
-          && resolvedItemLifecycle === MessageLifecycle.COMPLETED),
-    );
-    if (!hasVisibleText && hasThinking) {
-      type = MessageType.THINKING;
-    }
+    blocks = buildAssistantTurnTextBlocks(assistantText);
     if (activeTurnLiveContext) {
       metadata.requestId = activeTurnLiveContext.requestId;
       metadata.userMessageId = activeTurnLiveContext.userMessageId;
@@ -950,7 +928,7 @@ function createSessionTurnItemStandardMessage(
     const toolStatus = resolveTurnToolStatus(
       readTurnItemString(item, 'toolStatus', 'tool_status') || status,
     );
-    id = `turn-tool:${sessionId}:${toolCallId}`;
+    id = `rust-timeline:turn-item-tool-result-${toolCallId}`;
     type = MessageType.TOOL_CALL;
     lifecycle = toolStatus === 'running' || toolStatus === 'pending'
       ? MessageLifecycle.STREAMING
@@ -966,6 +944,11 @@ function createSessionTurnItemStandardMessage(
       error: stringifyTurnItemPayload(readTurnItemValue(item, 'toolError', 'tool_error')),
     }];
     metadata.isStatusMessage = true;
+    metadata.toolCallId = toolCallId;
+    metadata.toolName = toolName;
+    if (activeTurnLiveContext) {
+      metadata.requestId = activeTurnLiveContext.requestId;
+    }
   } else {
     return null;
   }
@@ -1063,12 +1046,16 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     const deltaSessionId = trimBridgeString(event.payload.session_id);
     if (typeof deltaText === 'string' && rawEntryId != null) {
       const entryId = typeof rawEntryId === 'number' ? rawEntryId : String(rawEntryId);
-      applyStreamingDelta(entryId, deltaText, deltaSessionId || undefined);
       if (activeTurnLiveContext && !activeTurnLiveContext.assistantMessageId) {
         activeTurnLiveContext.assistantMessageId = `rust-timeline:${entryId}`;
-        if (activeTurnLiveContext.placeholderMessageId) {
-          markMessageComplete(activeTurnLiveContext.placeholderMessageId);
-        }
+      }
+      applyStreamingDelta(entryId, deltaText, deltaSessionId || undefined, activeTurnLiveContext ? {
+        replaceMessageId: activeTurnLiveContext.placeholderMessageId,
+        requestId: activeTurnLiveContext.requestId,
+        userMessageId: activeTurnLiveContext.userMessageId,
+      } : {});
+      if (activeTurnLiveContext?.placeholderMessageId) {
+        markMessageComplete(activeTurnLiveContext.placeholderMessageId);
       }
       emitMessage({ type: 'rustTaskEvent', eventType, payload: event.payload ?? {} } as ClientBridgeMessage);
       return;
@@ -2221,13 +2208,12 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
   });
   emitMessage({ type: 'unifiedMessage', message: userMsg });
 
-  // 显示 thinking 占位消息
+  // 显示请求占位消息
   const placeholderMsg = createStreamingMessage('orchestrator', 'orchestrator', `placeholder-${requestId}`, {
     id: placeholderMessageId,
-    type: MessageType.THINKING,
     metadata: {
       isPlaceholder: true,
-      placeholderState: 'thinking',
+      placeholderState: 'pending',
       requestId,
       userMessageId,
     },
@@ -2246,7 +2232,6 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
     userMessageId,
     placeholderMessageId,
     assistantMessageId: '',
-    assistantThinkingContent: '',
     assistantTextContent: '',
     route: null,
   };
