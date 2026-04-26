@@ -1,3 +1,4 @@
+use crate::RunnerStartError;
 pub use crate::session_turn_execution::{
     BUSINESS_MODEL_PROVIDER, SessionTurnExecutionOutput, SessionTurnExecutionRequest,
 };
@@ -27,7 +28,7 @@ use magi_orchestrator::{
     ExecutionContextSummary, ExecutionWritebackPlans,
     task_runner::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult, WorkerInfo},
 };
-use magi_session_store::{SessionStore, TimelineEntryKind};
+use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
 use magi_tool_runtime::ToolRegistry;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -101,6 +102,7 @@ impl ShadowTaskExecutionRegistry {
     }
 }
 
+#[derive(Clone)]
 pub struct ShadowTaskDispatcher {
     event_bus: Arc<InMemoryEventBus>,
     pipeline: ShadowExecutionPipeline,
@@ -114,6 +116,8 @@ pub struct ShadowTaskDispatcher {
     context_runtime: Option<Arc<ContextRuntime>>,
     tool_registry: Option<ToolRegistry>,
     skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
+    /// 强制同步执行 dispatch，用于普通模式的同步 for 循环（设计 §1.3）。
+    force_sync_dispatch: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub fn resolve_configured_model_client(
@@ -151,7 +155,12 @@ impl ShadowTaskDispatcher {
             context_runtime: None,
             tool_registry: None,
             skill_runtime: None,
+            force_sync_dispatch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    pub fn set_force_sync_dispatch(&self, force: bool) {
+        self.force_sync_dispatch.store(force, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn with_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
@@ -246,6 +255,7 @@ impl ShadowTaskDispatcher {
         use_tools: bool,
         skill_name: Option<String>,
         usage_binding: ModelUsageBinding,
+        system_prompt: Option<String>,
     ) {
         // 仅在有 writebacks 时（即主 action task）才生成 streaming entry_id。
         // sub-task 的 writebacks 为空，不需要在 timeline 中创建流式条目。
@@ -264,6 +274,7 @@ impl ShadowTaskDispatcher {
             skill_name,
             &usage_binding,
             streaming_entry_id.as_deref(),
+            system_prompt,
         );
         if matches!(&outcome, TaskOutcome::Completed { .. }) {
             self.session_store
@@ -303,7 +314,7 @@ impl ShadowTaskDispatcher {
                 )
             })
             .take(12)
-            .map(|entry| entry.message)
+            .filter_map(|entry| timeline_entry_visible_text(&entry.message))
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -608,6 +619,7 @@ impl ShadowTaskDispatcher {
         skill_name: Option<String>,
         usage_binding: &ModelUsageBinding,
         streaming_entry_id: Option<&str>,
+        system_prompt: Option<String>,
     ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
         let Some(client) = self.resolve_model_client() else {
             tracing::error!(task_id = %task.task_id, "invoke_llm_with_tools: no model bridge client configured");
@@ -654,7 +666,90 @@ impl ShadowTaskDispatcher {
             usage_binding,
             streaming_entry_id,
             context_summary,
+            system_prompt,
         })
+    }
+
+    /// Synchronous inner dispatch logic; invoked either directly or inside
+    /// `tokio::task::spawn_blocking` so the LLM call does not starve the
+    /// async runtime (design §1.3).
+    fn dispatch_inner(
+        &self,
+        task: &magi_core::Task,
+        worker: &WorkerInfo,
+        lease: &magi_core::AssignmentLease,
+    ) -> Result<(), String> {
+        let Some(plan) = self.execution_registry.remove(&task.task_id) else {
+            let session_id = self
+                .session_store
+                .current_session()
+                .map(|s| s.session_id)
+                .unwrap_or_else(|| SessionId::new("default"));
+            self.publish_task_dispatched_event(
+                &task.task_id,
+                &task.mission_id,
+                worker,
+                &lease.lease_id,
+                task.kind,
+                Some(&session_id),
+                None,
+            );
+            let (outcome, _) = self.invoke_llm_with_tools(
+                task,
+                &task.task_id,
+                &lease.lease_id,
+                &session_id,
+                &None,
+                false,
+                None,
+                &model_usage_binding_for_worker(worker, false),
+                None,
+                worker.system_prompt_template.clone(),
+            );
+            self.push_result(&task.task_id, &lease.lease_id, outcome);
+            return Ok(());
+        };
+
+        match plan {
+            ShadowTaskExecutionPlan::Dispatch {
+                target: _,
+                worker_id: _,
+                lane_id: _,
+                lane_seq: _,
+                is_primary,
+                session_id,
+                workspace_id,
+                ownership,
+                writebacks,
+                use_tools,
+                skill_name,
+            } => {
+                self.publish_task_dispatched_event(
+                    &task.task_id,
+                    &task.mission_id,
+                    worker,
+                    &lease.lease_id,
+                    task.kind,
+                    Some(&session_id),
+                    workspace_id.as_ref(),
+                );
+                self.execute_dispatch_plan(
+                    task,
+                    &task.task_id,
+                    &lease.lease_id,
+                    session_id,
+                    workspace_id,
+                    ownership,
+                    writebacks,
+                    use_tools,
+                    skill_name,
+                    model_usage_binding_for_worker(worker, is_primary),
+                    worker.system_prompt_template.clone(),
+                );
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -748,75 +843,41 @@ impl TaskDispatcher for ShadowTaskDispatcher {
         worker: &WorkerInfo,
         lease: &magi_core::AssignmentLease,
     ) -> Result<(), String> {
-        let Some(plan) = self.execution_registry.remove(&task.task_id) else {
-            let session_id = self
-                .session_store
-                .current_session()
-                .map(|s| s.session_id)
-                .unwrap_or_else(|| SessionId::new("default"));
-            self.publish_task_dispatched_event(
-                &task.task_id,
-                &task.mission_id,
-                worker,
-                &lease.lease_id,
-                task.kind,
-                Some(&session_id),
-                None,
-            );
-            let (outcome, _) = self.invoke_llm_with_tools(
-                task,
-                &task.task_id,
-                &lease.lease_id,
-                &session_id,
-                &None,
-                false,
-                None,
-                &model_usage_binding_for_worker(worker, false),
-                None,
-            );
-            self.push_result(&task.task_id, &lease.lease_id, outcome);
-            return Ok(());
-        };
-
-        match plan {
-            ShadowTaskExecutionPlan::Dispatch {
-                target: _,
-                worker_id: _,
-                lane_id: _,
-                lane_seq: _,
-                is_primary,
-                session_id,
-                workspace_id,
-                ownership,
-                writebacks,
-                use_tools,
-                skill_name,
-            } => {
-                self.publish_task_dispatched_event(
-                    &task.task_id,
-                    &task.mission_id,
-                    worker,
-                    &lease.lease_id,
-                    task.kind,
-                    Some(&session_id),
-                    workspace_id.as_ref(),
-                );
-                self.execute_dispatch_plan(
-                    task,
-                    &task.task_id,
-                    &lease.lease_id,
-                    session_id,
-                    workspace_id,
-                    ownership,
-                    writebacks,
-                    use_tools,
-                    skill_name,
-                    model_usage_binding_for_worker(worker, is_primary),
-                );
-            }
+        // 普通模式的同步 for 循环要求 dispatch 同步完成，直接走 inner。
+        if self.force_sync_dispatch.load(std::sync::atomic::Ordering::Relaxed) {
+            return self.dispatch_inner(task, worker, lease);
         }
 
-        Ok(())
+        let dispatcher = self.clone();
+        let task = task.clone();
+        let worker = worker.clone();
+        let lease = lease.clone();
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.clone().spawn(async move {
+                let result = handle
+                    .spawn_blocking(move || {
+                        if let Err(err) = dispatcher.dispatch_inner(&task, &worker, &lease) {
+                            tracing::error!("dispatch_inner failed: {}", err);
+                            dispatcher.push_result(
+                                &task.task_id,
+                                &lease.lease_id,
+                                TaskOutcome::Failed {
+                                    error: format!("dispatch failed: {}", err),
+                                },
+                            );
+                        }
+                    })
+                    .await;
+                if let Err(err) = result {
+                    tracing::error!("dispatch spawn_blocking panicked: {:?}", err);
+                }
+            });
+            Ok(())
+        } else {
+            // 不在 tokio 运行时中（例如同步测试环境），直接同步执行。
+            self.dispatch_inner(&task, &worker, &lease)
+        }
     }
 }
 
@@ -854,74 +915,123 @@ pub fn drive_shadow_dispatch_submission(
     state: &ApiState,
     accepted: &mut DispatchSubmissionAccepted,
 ) -> Result<(), ApiError> {
-    let execution = drive_shadow_task_graph(
-        state,
-        &accepted.root_task_id,
-        &accepted.action_task_id,
-        "执行 shadow dispatch 失败",
-    )?;
-    accepted.runner_started = execution.runner_started;
-    Ok(())
+    let manager = state.runner_manager().ok_or_else(|| {
+        ApiError::internal_assembly("执行 shadow dispatch 失败", "runner_manager 未配置")
+    })?;
+    let task_store = state.task_store().ok_or_else(|| {
+        ApiError::internal_assembly("执行 shadow dispatch 失败", "task_store 未配置")
+    })?;
+
+    let root_task = task_store.get_task(&accepted.root_task_id).ok_or_else(|| {
+        ApiError::internal_assembly("执行 shadow dispatch 失败", "root task 不存在")
+    })?;
+    let background_allowed = root_task
+        .policy_snapshot
+        .as_ref()
+        .map(|policy| policy.background_allowed)
+        .unwrap_or(false);
+
+    if background_allowed {
+        match manager.start(
+            accepted.root_task_id.as_str(),
+            Some(accepted.session_id.clone()),
+        ) {
+            Ok(_) | Err(RunnerStartError::AlreadyRunning) => {
+                accepted.runner_started = true;
+                Ok(())
+            }
+            Err(RunnerStartError::NotFound) => Err(ApiError::internal_assembly(
+                "执行 shadow dispatch 失败",
+                "root task 不存在",
+            )),
+        }
+    } else {
+        let execution = drive_shadow_task_graph(
+            state,
+            &accepted.root_task_id,
+            &accepted.action_task_id,
+            Some(accepted.session_id.clone()),
+            "执行 shadow dispatch 失败",
+        )?;
+        accepted.runner_started = execution.runner_started;
+        Ok(())
+    }
 }
 
 pub fn drive_shadow_task_graph(
     state: &ApiState,
     root_task_id: &TaskId,
     action_task_id: &TaskId,
+    session_id: Option<SessionId>,
     failure_title: &'static str,
 ) -> Result<ShadowGraphDriveResult, ApiError> {
-    let manager = state
-        .runner_manager()
-        .ok_or_else(|| ApiError::internal_assembly(failure_title, "runner_manager 未配置"))?;
-    let task_store = state
-        .task_store()
-        .ok_or_else(|| ApiError::internal_assembly(failure_title, "task_store 未配置"))?;
+    // 普通模式使用同步 for 循环，要求 dispatch 同步完成，否则结果来不及被收集。
+    if let Some(dispatcher) = state.session_turn_dispatcher() {
+        dispatcher.set_force_sync_dispatch(true);
+    }
 
-    let mut executed = false;
-    for _ in 0..8 {
-        executed = true;
-        let outcome = manager
-            .run_single_cycle(root_task_id.as_str())
-            .map_err(|error| ApiError::internal_assembly(failure_title, error))?;
-        match outcome {
-            magi_orchestrator::task_runner::RunCycleOutcome::Continue => continue,
-            magi_orchestrator::task_runner::RunCycleOutcome::AllComplete => break,
-            magi_orchestrator::task_runner::RunCycleOutcome::Blocked(task_ids) => {
-                if task_store
-                    .get_task(action_task_id)
-                    .is_some_and(|task| task.status == TaskStatus::Blocked)
-                {
-                    break;
+    let result = (|| {
+        let manager = state
+            .runner_manager()
+            .ok_or_else(|| ApiError::internal_assembly(failure_title, "runner_manager 未配置"))?;
+        let task_store = state
+            .task_store()
+            .ok_or_else(|| ApiError::internal_assembly(failure_title, "task_store 未配置"))?;
+
+        let mut executed = false;
+        for _ in 0..32 {
+            executed = true;
+            let outcome = manager
+                .run_single_cycle(root_task_id.as_str())
+                .map_err(|error| ApiError::internal_assembly(failure_title, error))?;
+            match outcome {
+                magi_orchestrator::task_runner::RunCycleOutcome::Continue => continue,
+                magi_orchestrator::task_runner::RunCycleOutcome::AllComplete => break,
+                magi_orchestrator::task_runner::RunCycleOutcome::Blocked(task_ids) => {
+                    if task_store
+                        .get_task(action_task_id)
+                        .is_some_and(|task| task.status == TaskStatus::Blocked)
+                    {
+                        break;
+                    }
+                    return Err(ApiError::internal_assembly(
+                        failure_title,
+                        format!("task runner blocked: {:?}", task_ids),
+                    ));
                 }
-                return Err(ApiError::internal_assembly(
-                    failure_title,
-                    format!("task runner blocked: {:?}", task_ids),
-                ));
-            }
-            magi_orchestrator::task_runner::RunCycleOutcome::Error(error) => {
-                return Err(ApiError::internal_assembly(failure_title, error));
+                magi_orchestrator::task_runner::RunCycleOutcome::Error(error) => {
+                    return Err(ApiError::internal_assembly(failure_title, error));
+                }
             }
         }
+
+        let action_status = task_store
+            .get_task(action_task_id)
+            .ok_or_else(|| ApiError::internal_assembly(failure_title, "action task 不存在"))?
+            .status;
+        if action_status != TaskStatus::Completed
+            && action_status != TaskStatus::Failed
+            && action_status != TaskStatus::Blocked
+        {
+            // 同步窗口内仍未完成，自动启动后台 runner 继续推进，避免任务丢失
+            if let Err(start_err) = manager.start(root_task_id.as_str(), session_id.clone()) {
+                tracing::warn!(
+                    root_task_id = %root_task_id,
+                    action_status = ?action_status,
+                    ?start_err,
+                    "同步驱动未在窗口内完成，尝试启动后台 runner 失败"
+                );
+            }
+        }
+
+        Ok(ShadowGraphDriveResult {
+            runner_started: executed,
+        })
+    })();
+
+    if let Some(dispatcher) = state.session_turn_dispatcher() {
+        dispatcher.set_force_sync_dispatch(false);
     }
 
-    let action_status = task_store
-        .get_task(action_task_id)
-        .ok_or_else(|| ApiError::internal_assembly(failure_title, "action task 不存在"))?
-        .status;
-    if action_status != TaskStatus::Completed
-        && action_status != TaskStatus::Failed
-        && action_status != TaskStatus::Blocked
-    {
-        return Err(ApiError::internal_assembly(
-            failure_title,
-            format!(
-                "task runner did not complete action task: {:?}",
-                action_status
-            ),
-        ));
-    }
-
-    Ok(ShadowGraphDriveResult {
-        runner_started: executed,
-    })
+    result
 }

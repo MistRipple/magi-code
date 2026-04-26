@@ -1,6 +1,7 @@
 use crate::{
     session_turn_writeback::{
-        append_session_turn_item, publish_session_turn_item_event, session_turn_item,
+        append_session_turn_item, build_completed_turn_timeline_snapshot,
+        publish_session_turn_item_event, session_turn_item, upsert_session_turn_item,
     },
     settings_store::SettingsStore,
     skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime},
@@ -45,6 +46,7 @@ pub(crate) struct TaskLlmLoopRequest<'a> {
     pub usage_binding: &'a ModelUsageBinding,
     pub streaming_entry_id: Option<&'a str>,
     pub context_summary: Option<ExecutionContextSummary>,
+    pub system_prompt: Option<String>,
 }
 
 pub(crate) fn run_task_llm_loop(
@@ -68,14 +70,24 @@ pub(crate) fn run_task_llm_loop(
         usage_binding,
         streaming_entry_id,
         context_summary,
+        system_prompt,
     } = request;
 
-    let mut messages = vec![ChatMessage {
+    let mut messages = Vec::new();
+    if let Some(system) = system_prompt {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(system),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+    }
+    messages.push(ChatMessage {
         role: "user".to_string(),
         content: Some(prompt.clone()),
         tool_calls: Vec::new(),
         tool_call_id: None,
-    }];
+    });
     let task_context = task_event_context(task, session_id, workspace_id);
     publish_task_llm_started(
         event_bus,
@@ -90,6 +102,11 @@ pub(crate) fn run_task_llm_loop(
     let mut tool_call_records: Vec<serde_json::Value> = Vec::new();
 
     for round in 0..MAX_TOOL_CALL_ROUNDS {
+        let should_record_turn_artifacts = streaming_entry_id.is_some()
+            || task_is_thread_visible_turn_owner(session_store, session_id, task_id);
+        let thinking_item_id = format!("turn-item-assistant-thinking-{task_id}-{round}");
+        let streamed_thinking = std::cell::RefCell::new(String::new());
+        let last_thinking_len = std::cell::Cell::new(0usize);
         let invocation_request = ModelInvocationRequest {
             provider: SHADOW_MODEL_PROVIDER.to_string(),
             prompt: prompt.clone(),
@@ -103,6 +120,19 @@ pub(crate) fn run_task_llm_loop(
             let task_id_str = task.task_id.to_string();
             let mission_id_str = task.mission_id.to_string();
             let on_delta = |delta: &ModelStreamingDelta| {
+                if should_record_turn_artifacts {
+                    publish_task_thinking_delta(
+                        event_bus,
+                        session_store,
+                        task,
+                        session_id,
+                        workspace_id,
+                        &thinking_item_id,
+                        &last_thinking_len,
+                        &streamed_thinking,
+                        &delta.thinking,
+                    );
+                }
                 publish_stream_delta(
                     event_bus,
                     session_store,
@@ -144,6 +174,31 @@ pub(crate) fn run_task_llm_loop(
         };
 
         let parsed = response.parse_chat_payload();
+        if should_record_turn_artifacts {
+            let final_thinking = parsed
+                .thinking
+                .as_deref()
+                .map(str::trim)
+                .filter(|thinking| !thinking.is_empty())
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    let thinking = streamed_thinking.borrow();
+                    let trimmed = thinking.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                });
+            if let Some(thinking) = final_thinking {
+                upsert_task_thinking_turn_item(
+                    event_bus,
+                    session_store,
+                    task,
+                    session_id,
+                    workspace_id,
+                    &thinking_item_id,
+                    "completed",
+                    &thinking,
+                );
+            }
+        }
         publish_model_usage_record(
             event_bus,
             session_store,
@@ -225,6 +280,7 @@ pub(crate) fn run_task_llm_loop(
             session_id,
             workspace_id,
             &final_content,
+            streaming_entry_id,
         );
     }
 
@@ -313,6 +369,64 @@ fn publish_stream_delta(
         )
         .with_context(task_context.clone()),
     );
+}
+
+fn publish_task_thinking_delta(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    item_id: &str,
+    last_sent_len: &std::cell::Cell<usize>,
+    streamed_thinking: &std::cell::RefCell<String>,
+    accumulated_thinking: &str,
+) {
+    if accumulated_thinking.len() <= last_sent_len.get() {
+        return;
+    }
+    last_sent_len.set(accumulated_thinking.len());
+    {
+        let mut thinking = streamed_thinking.borrow_mut();
+        thinking.clear();
+        thinking.push_str(accumulated_thinking);
+    }
+    upsert_task_thinking_turn_item(
+        event_bus,
+        session_store,
+        task,
+        session_id,
+        workspace_id,
+        item_id,
+        "running",
+        accumulated_thinking,
+    );
+}
+
+fn upsert_task_thinking_turn_item(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    item_id: &str,
+    status: &str,
+    thinking: &str,
+) {
+    let trimmed = thinking.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut item = session_turn_item(
+        "assistant_thinking",
+        status,
+        Some("模型思考".to_string()),
+        Some(trimmed.to_string()),
+        Some(item_id.to_string()),
+    );
+    item.task_id = Some(task.task_id.clone());
+    upsert_session_turn_item(session_store, session_id, item.clone());
+    publish_session_turn_item_event(event_bus, session_id, workspace_id, &item);
 }
 
 fn publish_task_llm_completed(
@@ -428,6 +542,7 @@ fn append_task_final_turn_item(
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     final_content: &str,
+    streaming_entry_id: Option<&str>,
 ) {
     let mut final_item = session_turn_item(
         "assistant_final",
@@ -440,6 +555,17 @@ fn append_task_final_turn_item(
     append_session_turn_item(session_store, session_id, final_item.clone());
     publish_session_turn_item_event(event_bus, session_id, workspace_id, &final_item);
     let _ = session_store.update_current_turn_status(session_id, "completed");
+    let timeline_message =
+        build_completed_turn_timeline_snapshot(session_store, session_id, Some(final_content), streaming_entry_id)
+            .unwrap_or_else(|| final_content.to_string());
+    let fallback_entry_id = format!("timeline-turn-snapshot-{}", task.task_id);
+    let entry_id = streaming_entry_id.unwrap_or(fallback_entry_id.as_str());
+    session_store.upsert_timeline_entry(
+        session_id.clone(),
+        entry_id,
+        TimelineEntryKind::AssistantMessage,
+        timeline_message,
+    );
 }
 
 fn build_output_content(

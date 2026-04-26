@@ -14,6 +14,11 @@ pub fn routes() -> Router<ApiState> {
         .route("/tasks/graph/{root_task_id}", get(get_task_projection))
         .route("/tasks/{task_id}", get(get_task))
         .route("/tasks/{task_id}/decision", post(resolve_decision))
+        .route("/tasks/{root_task_id}/replan", post(replan_task_graph))
+        .route(
+            "/tasks/{root_task_id}/delivery-package",
+            get(get_delivery_package),
+        )
 }
 
 fn require_task_store(
@@ -67,8 +72,17 @@ async fn get_task_projection(
     let projection = store
         .build_projection(&root_id)
         .ok_or_else(|| ApiError::not_found("任务不存在", &root_task_id))?;
-    let value = serde_json::to_value(&projection)
+    let mut value = serde_json::to_value(&projection)
         .map_err(|err| ApiError::internal_assembly("序列化任务投影失败", err))?;
+    if let Some(manager) = state.runner_manager()
+        && let Some(snapshot) = manager.status(&root_task_id)
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "runner_status".to_string(),
+            serde_json::Value::String(snapshot.status),
+        );
+    }
     Ok(Json(value))
 }
 
@@ -112,4 +126,43 @@ async fn resolve_decision(
         "resolved": true,
         "chosenOption": request.chosen_option,
     })))
+}
+
+async fn replan_task_graph(
+    State(state): State<ApiState>,
+    Path(root_task_id): Path<String>,
+    Query(query): Query<SessionScopedTaskQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let root_id = TaskId::new(&root_task_id);
+    require_session_task(&state, query.session_id.as_deref(), &root_id)?;
+
+    let manager = state
+        .runner_manager()
+        .ok_or_else(|| ApiError::internal_assembly("重规划失败", "runner_manager 未配置"))?;
+
+    let cancelled = manager
+        .replan(&root_task_id)
+        .map_err(|error| ApiError::internal_assembly("重规划失败", error))?;
+
+    Ok(Json(serde_json::json!({
+        "rootTaskId": root_task_id,
+        "replan": true,
+        "cancelledTaskIds": cancelled.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+    })))
+}
+
+async fn get_delivery_package(
+    State(state): State<ApiState>,
+    Path(root_task_id): Path<String>,
+    Query(query): Query<SessionScopedTaskQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = require_task_store(&state)?;
+    let root_id = TaskId::new(&root_task_id);
+    require_session_task(&state, query.session_id.as_deref(), &root_id)?;
+
+    let package = store
+        .build_delivery_package(&root_id)
+        .ok_or_else(|| ApiError::not_found("任务不存在", &root_task_id))?;
+
+    Ok(Json(package))
 }

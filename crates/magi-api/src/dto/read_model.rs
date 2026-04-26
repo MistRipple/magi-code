@@ -134,10 +134,19 @@ fn merge_session_sidecars(
             clear_session_runtime_live_ids(entry);
         }
         if let Some(turn) = export.current_turn.as_ref() {
+            let completed_at =
+                if matches!(turn.status.as_str(), "completed" | "failed" | "cancelled") {
+                    turn.completed_at.or(Some(export.last_update))
+                } else {
+                    turn.completed_at
+                };
             entry.current_turn = Some(SessionRuntimeTurnSummaryEntry {
                 turn_id: turn.turn_id.clone(),
                 turn_seq: turn.turn_seq,
                 accepted_at: Some(turn.accepted_at),
+                completed_at,
+                response_duration_ms: completed_at
+                    .map(|completed_at| completed_at.0.saturating_sub(turn.accepted_at.0)),
                 status: turn.status.clone(),
                 user_message: turn.user_message.clone(),
                 mission_id: entry.mission_id.clone(),
@@ -1232,6 +1241,7 @@ mod tests {
                     turn_id: "turn-session-action-completed".to_string(),
                     turn_seq: accepted_at.0,
                     accepted_at,
+                    completed_at: None,
                     status: "completed".to_string(),
                     user_message: Some("请继续整理结果".to_string()),
                     items: vec![magi_session_store::ActiveExecutionTurnItem {
@@ -1302,6 +1312,7 @@ mod tests {
                         turn_id: "turn-session-action-completed".to_string(),
                         turn_seq: accepted_at.0,
                         accepted_at,
+                        completed_at: None,
                         status: "completed".to_string(),
                         user_message: Some("请继续整理结果".to_string()),
                         items: vec![magi_session_store::ActiveExecutionTurnItem {

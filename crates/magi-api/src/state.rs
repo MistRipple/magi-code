@@ -25,8 +25,8 @@ use magi_memory_store::MemoryStore;
 use magi_orchestrator::{
     OrchestratedExecutionRuntime, OrchestratorService,
     task_runner::{
-        EventBasedResultReceiver, EventBasedTaskDispatcher, RunCycleOutcome, TaskDispatcher,
-        TaskResultReceiver, TaskRunner, WorkerExecutionDispatcher, WorkerInfo,
+        EventBasedResultReceiver, EventBasedTaskDispatcher, LlmGraphReflector, RunCycleOutcome,
+        TaskDispatcher, TaskResultReceiver, TaskRunner, WorkerExecutionDispatcher, WorkerInfo,
     },
     task_store::TaskStore,
     task_worker_catalog::build_worker_catalog_for_roles,
@@ -66,6 +66,11 @@ pub struct RunnerManager {
     result_receiver: Arc<EventBasedResultReceiver>,
     /// Optional path for periodic task-store checkpoints.
     checkpoint_path: Option<PathBuf>,
+    /// Maps a session to the root task IDs whose runners should be cancelled
+    /// when the session is closed (design 1.5: Session-Runner linkage).
+    session_runner_index: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
+    /// Optional model bridge client for LLM-based graph reflection.
+    model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
 }
 
 /// Number of runner cycles between periodic checkpoints.
@@ -89,6 +94,8 @@ impl RunnerManager {
             event_bus: None,
             result_receiver: Arc::new(EventBasedResultReceiver::new()),
             checkpoint_path: None,
+            model_bridge_client: None,
+            session_runner_index: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -124,6 +131,8 @@ impl RunnerManager {
             event_bus: Some(event_bus),
             result_receiver,
             checkpoint_path: None,
+            model_bridge_client: None,
+            session_runner_index: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -141,6 +150,8 @@ impl RunnerManager {
             event_bus: None,
             result_receiver,
             checkpoint_path: None,
+            model_bridge_client: None,
+            session_runner_index: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -164,6 +175,8 @@ impl RunnerManager {
             event_bus,
             result_receiver,
             checkpoint_path: None,
+            model_bridge_client: None,
+            session_runner_index: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -173,7 +186,7 @@ impl RunnerManager {
 
     fn build_task_runner(&self) -> TaskRunner {
         let workers = self.resolved_workers();
-        if let Some(ref dispatcher) = self.dispatcher {
+        let runner = if let Some(ref dispatcher) = self.dispatcher {
             TaskRunner::with_dispatcher(
                 Arc::clone(&self.task_store),
                 workers,
@@ -189,12 +202,28 @@ impl RunnerManager {
             )
         } else {
             TaskRunner::new(Arc::clone(&self.task_store), workers)
+        };
+        let runner = if let Some(ref client) = self.model_bridge_client {
+            runner.with_reflector(Arc::new(LlmGraphReflector::new(Arc::clone(client))))
+        } else {
+            runner
+        };
+        if let Some(ref event_bus) = self.event_bus {
+            runner.with_event_bus(Arc::clone(event_bus))
+        } else {
+            runner
         }
     }
 
     /// Set the file path used for periodic task-store checkpoints.
     pub fn with_checkpoint_path(mut self, path: PathBuf) -> Self {
         self.checkpoint_path = Some(path);
+        self
+    }
+
+    /// Attach a model bridge client for LLM-based graph reflection.
+    pub fn with_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
+        self.model_bridge_client = Some(client);
         self
     }
 
@@ -209,7 +238,11 @@ impl RunnerManager {
 
     /// Attempt to start a runner for the given root task.
     /// Returns Err if the root task doesn't exist or a runner is already active.
-    pub fn start(&self, root_task_id: &str) -> Result<Arc<RunnerHandle>, RunnerStartError> {
+    pub fn start(
+        &self,
+        root_task_id: &str,
+        session_id: Option<SessionId>,
+    ) -> Result<Arc<RunnerHandle>, RunnerStartError> {
         let tid = TaskId::new(root_task_id);
         // Verify the root task exists.
         self.task_store
@@ -232,6 +265,11 @@ impl RunnerManager {
         });
 
         runners.insert(root_task_id.to_string(), Arc::clone(&handle));
+        drop(runners);
+
+        if let Some(session_id) = session_id {
+            self.bind_session(session_id, root_task_id);
+        }
 
         // Spawn the background loop.
         let task_runner = self.build_task_runner();
@@ -240,6 +278,8 @@ impl RunnerManager {
         let bg_task_store = Arc::clone(&self.task_store);
         let bg_checkpoint_path = self.checkpoint_path.clone();
         tokio::spawn(async move {
+            let mut blocked_streak = 0u32;
+            let max_blocked_streak = 20u32;
             loop {
                 if bg_handle.cancel.load(Ordering::Relaxed) {
                     let mut status = bg_handle.status.lock().expect("status lock should hold");
@@ -250,9 +290,21 @@ impl RunnerManager {
                 let outcome = task_runner.run_cycle(&root_id);
                 let cycle = bg_handle.cycle_count.fetch_add(1, Ordering::Relaxed) + 1;
 
-                // Periodic checkpoint every N cycles.
+                // Checkpoint policy consumption (design 3.2).
                 if let Some(ref path) = bg_checkpoint_path {
-                    let should_checkpoint = cycle % CHECKPOINT_INTERVAL_CYCLES == 0;
+                    let should_checkpoint = if let Some(root_task) = bg_task_store.get_task(&root_id) {
+                        if let Some(ref policy) = root_task.policy_snapshot {
+                            match policy.checkpoint_mode.as_str() {
+                                "turn" => true,
+                                "task_or_phase" => task_runner.take_checkpoint_signal(),
+                                _ => cycle % CHECKPOINT_INTERVAL_CYCLES == 0,
+                            }
+                        } else {
+                            cycle % CHECKPOINT_INTERVAL_CYCLES == 0
+                        }
+                    } else {
+                        cycle % CHECKPOINT_INTERVAL_CYCLES == 0
+                    };
                     if should_checkpoint {
                         let _ = bg_task_store.checkpoint_to_file(path);
                     }
@@ -260,11 +312,10 @@ impl RunnerManager {
 
                 match outcome {
                     RunCycleOutcome::Continue => {
-                        // Brief yield before next cycle.
+                        blocked_streak = 0;
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                     RunCycleOutcome::AllComplete => {
-                        // Checkpoint on terminal state.
                         if let Some(ref path) = bg_checkpoint_path {
                             let _ = bg_task_store.checkpoint_to_file(path);
                         }
@@ -273,11 +324,20 @@ impl RunnerManager {
                         break;
                     }
                     RunCycleOutcome::Blocked(_) => {
-                        // Wait longer before retrying when blocked.
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        blocked_streak += 1;
+                        if blocked_streak >= max_blocked_streak {
+                            if let Some(ref path) = bg_checkpoint_path {
+                                let _ = bg_task_store.checkpoint_to_file(path);
+                            }
+                            let mut status =
+                                bg_handle.status.lock().expect("status lock should hold");
+                            *status = "blocked".to_string();
+                            break;
+                        }
+                        let backoff_ms = 200u64.saturating_mul(blocked_streak as u64).min(2_000);
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     }
                     RunCycleOutcome::Error(err) => {
-                        // Checkpoint on error so we don't lose state.
                         if let Some(ref path) = bg_checkpoint_path {
                             let _ = bg_task_store.checkpoint_to_file(path);
                         }
@@ -307,6 +367,34 @@ impl RunnerManager {
         }
         handle.cancel.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Bind a session to a root task so that when the session closes the
+    /// runner is automatically cancelled (design 1.5).
+    pub fn bind_session(&self, session_id: SessionId, root_task_id: &str) {
+        let mut index = self
+            .session_runner_index
+            .lock()
+            .expect("session_runner_index lock should hold");
+        index
+            .entry(session_id)
+            .or_default()
+            .push(root_task_id.to_string());
+    }
+
+    /// Cancel all runners bound to the given session and remove the binding.
+    /// Called when a session is closed.
+    pub fn unbind_session(&self, session_id: &SessionId) {
+        let root_task_ids = {
+            let mut index = self
+                .session_runner_index
+                .lock()
+                .expect("session_runner_index lock should hold");
+            index.remove(session_id).unwrap_or_default()
+        };
+        for root_task_id in root_task_ids {
+            let _ = self.stop(&root_task_id);
+        }
     }
 
     /// Get the status of a runner.
@@ -357,6 +445,16 @@ impl RunnerManager {
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
         self.build_task_runner().resume_task(&tid)
+    }
+
+    /// Request a replan for the given root task: cancel all non-terminal,
+    /// non-completed subtrees and return the cancelled task IDs.
+    pub fn replan(&self, root_task_id: &str) -> Result<Vec<TaskId>, String> {
+        let tid = TaskId::new(root_task_id);
+        self.task_store
+            .get_task(&tid)
+            .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
+        self.build_task_runner().request_replan(&tid)
     }
 }
 
