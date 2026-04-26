@@ -1379,35 +1379,6 @@ function normalizeTimelineNode(node: TimelineNode): TimelineNode {
   };
 }
 
-function getLaneOrderBaseTimestamp(node: Pick<TimelineNode, 'timestamp' | 'anchorEventSeq' | 'message'>): number {
-  const messageTimestamp = resolveTimelineSortTimestamp(node.timestamp, resolveMessageMetadataRecord(node.message));
-  const anchorEventSeq = node.anchorEventSeq || getMessageEventSeq(node.message) || 0;
-  if (anchorEventSeq > 0 && messageTimestamp > 0) {
-    return messageTimestamp;
-  }
-  return messageTimestamp;
-}
-
-function mergeTimelineLaneOrder(
-  current: TimelineNode['laneOrder'] | undefined,
-  node: Pick<TimelineNode, 'timestamp' | 'anchorEventSeq' | 'message' | 'workerTabs'>,
-): TimelineNode['laneOrder'] | undefined {
-  const normalized = normalizeTimelineLaneOrder(current);
-  const baseTimestamp = getLaneOrderBaseTimestamp(node);
-  const workers = Object.fromEntries(
-    normalizeWorkerTabList(node.workerTabs).map((workerId, index) => [workerId, Math.max(1, index + 1)]),
-  );
-  if (!normalized && workers && Object.keys(workers).length === 0) {
-    return undefined;
-  }
-  return {
-    thread: typeof normalized?.thread === 'number' && Number.isFinite(normalized.thread)
-      ? Math.max(1, Math.floor(normalized.thread))
-      : Math.max(1, Math.floor(baseTimestamp || 1)),
-    ...(Object.keys(workers).length > 0 ? { workers } : (normalized?.workers ? { workers: normalized.workers } : {})),
-  };
-}
-
 function rebuildTimelineIndexes(): void {
   timelineNodeIdByMessageId.clear();
   timelineNodeIdByCardId.clear();
