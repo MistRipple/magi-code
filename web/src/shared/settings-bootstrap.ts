@@ -15,6 +15,14 @@ export type SettingsWorkerStatusSnapshot = Record<string, {
 
 export type SettingsWorkerStatusMap = SettingsWorkerStatusSnapshot;
 
+export interface SettingsBuiltinTool {
+  name: string;
+  riskLevel?: string;
+  approvalRequirement?: string;
+  accessMode?: 'read_only' | 'maybe_write' | 'explicit_write' | string;
+  enabled?: boolean;
+}
+
 export interface SettingsRuntimeSnapshot {
   locale: string;
   deepTask: boolean;
@@ -29,6 +37,7 @@ export interface SettingsBootstrapPayload {
   safeguardConfig: Record<string, unknown>;
   repositories: unknown[];
   mcpServers: unknown[];
+  builtinTools?: SettingsBuiltinTool[];
   workerStatuses: SettingsWorkerStatusSnapshot;
   runtimeSettings: SettingsRuntimeSnapshot;
   roleTemplates?: RoleTemplate[];

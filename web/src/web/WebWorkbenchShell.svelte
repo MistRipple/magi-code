@@ -76,16 +76,16 @@
   const normalizedSidebarSearch = $derived(sidebarSearchQuery.trim().toLowerCase());
 
   $effect(() => {
-    if (!selectedWorkspaceId) {
+    const authoritativeWorkspaceId = typeof messagesState.currentWorkspaceId === 'string'
+      ? messagesState.currentWorkspaceId.trim()
+      : '';
+    if (!authoritativeWorkspaceId) {
       return;
     }
 
-    const currentSessions = messagesState.sessions;
-    if (!Array.isArray(currentSessions) || currentSessions.length === 0) {
-      return;
-    }
+    const currentSessions = Array.isArray(messagesState.sessions) ? messagesState.sessions : [];
 
-    const existingSessions = sessionsByWorkspace[selectedWorkspaceId] ?? [];
+    const existingSessions = sessionsByWorkspace[authoritativeWorkspaceId] ?? [];
     const sessionsChanged = existingSessions.length !== currentSessions.length
       || existingSessions.some((session, index) => {
         const next = currentSessions[index];
@@ -99,8 +99,12 @@
     if (sessionsChanged) {
       sessionsByWorkspace = {
         ...sessionsByWorkspace,
-        [selectedWorkspaceId]: currentSessions,
+        [authoritativeWorkspaceId]: currentSessions,
       };
+    }
+
+    if (selectedWorkspaceId !== authoritativeWorkspaceId) {
+      return;
     }
 
     const bootstrapSessionId = typeof messagesState.currentSessionId === 'string'
@@ -613,6 +617,12 @@
           ...expandedWorkspaceIds,
           [workspace.workspaceId]: wasSelected ? !isExpanded : true,
         };
+        if (!wasSelected) {
+          currentSessionId = null;
+          setCurrentSessionId(null);
+          syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, null);
+          requestWorkspaceBindingSync(workspace, null);
+        }
         const shouldLoad = !wasSelected || !isExpanded || getWorkspaceSessionList(workspace.workspaceId).length === 0;
         if (shouldLoad) {
           const resolvedSessionId = await refreshWorkspaceSessions(

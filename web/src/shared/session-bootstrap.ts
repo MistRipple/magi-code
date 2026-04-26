@@ -37,6 +37,10 @@ export interface SessionTimelineProjection {
 }
 
 export interface SessionBootstrapSnapshot {
+  workspace?: {
+    workspaceId?: string;
+    rootPath?: string;
+  };
   sessionId: string;
   sessions: unknown[];
   state: unknown;

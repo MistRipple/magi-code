@@ -640,7 +640,7 @@ export class RustDaemonClient {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
     return this.getJson<DeliveryPackageDto>(
-      `/api/tasks/graph/${encodeURIComponent(rootTaskId)}/delivery?${query.toString()}`,
+      `/api/tasks/${encodeURIComponent(rootTaskId)}/delivery-package?${query.toString()}`,
     );
   }
 

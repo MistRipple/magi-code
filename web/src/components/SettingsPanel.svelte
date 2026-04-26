@@ -39,23 +39,53 @@ import { getAgentColor } from '../lib/agent-colors';
         <span class="settings-title">{i18n.t('settings.title')}</span>
       </div>
       <nav class="sidebar-nav">
-        <button class="nav-item" class:active={store.activeTab === 'stats'} onclick={() => store.activeTab = 'stats'}>
+        <button
+          type="button"
+          class="nav-item"
+          class:active={store.activeTab === 'stats'}
+          aria-label={i18n.t('settings.tabStats')}
+          onclick={() => store.activeTab = 'stats'}
+        >
           <Icon name="stats" size={16} />
           <span>{i18n.t('settings.tabStats')}</span>
         </button>
-        <button class="nav-item" class:active={store.activeTab === 'model'} onclick={() => store.activeTab = 'model'}>
+        <button
+          type="button"
+          class="nav-item"
+          class:active={store.activeTab === 'model'}
+          aria-label={i18n.t('settings.tabModel')}
+          onclick={() => store.activeTab = 'model'}
+        >
           <Icon name="model" size={16} />
           <span>{i18n.t('settings.tabModel')}</span>
         </button>
-        <button class="nav-item" class:active={store.activeTab === 'agents'} onclick={() => store.activeTab = 'agents'}>
+        <button
+          type="button"
+          class="nav-item"
+          class:active={store.activeTab === 'agents'}
+          aria-label={i18n.t('settings.tabAgents')}
+          onclick={() => store.activeTab = 'agents'}
+        >
           <Icon name="bot" size={16} />
           <span>{i18n.t('settings.tabAgents')}</span>
         </button>
-        <button class="nav-item" class:active={store.activeTab === 'tools'} onclick={() => store.activeTab = 'tools'}>
+        <button
+          type="button"
+          class="nav-item"
+          class:active={store.activeTab === 'tools'}
+          aria-label={i18n.t('settings.tabTools')}
+          onclick={() => store.activeTab = 'tools'}
+        >
           <Icon name="tools" size={16} />
           <span>{i18n.t('settings.tabTools')}</span>
         </button>
-        <button class="nav-item" class:active={store.activeTab === 'rules'} onclick={() => store.activeTab = 'rules'}>
+        <button
+          type="button"
+          class="nav-item"
+          class:active={store.activeTab === 'rules'}
+          aria-label={i18n.t('settings.tabRules')}
+          onclick={() => store.activeTab = 'rules'}
+        >
           <Icon name="shield" size={16} />
           <span>{i18n.t('settings.tabRules')}</span>
         </button>
@@ -154,7 +184,7 @@ import { getAgentColor } from '../lib/agent-colors';
         />
       {:else if store.activeTab === 'tools'}
         <!-- 工具 Tab -->
-        <SettingsToolsTab mcpServersHydrated={store.mcpServersHydrated} mcpServersLoading={store.mcpServersLoading} mcpServers={store.mcpServers} mcpExpandedServer={store.mcpExpandedServer} mcpServerTools={store.mcpServerTools} mcpRefreshingServers={store.mcpRefreshingServers} mcpExpandedTool={store.mcpExpandedTool} skills={store.skills} openMCPDialog={store.openMCPDialog} toggleMCPExpand={store.toggleMCPExpand} getMCPHealthLabel={store.getMCPHealthLabel} toggleMCPServer={store.toggleMCPServer} deleteMCPServer={store.deleteMCPServer} refreshMCPTools={store.refreshMCPTools} toggleMCPToolDesc={store.toggleMCPToolDesc} openSkillLibraryDialog={store.openSkillLibraryDialog} openRepoDialog={store.openRepoDialog} deleteSkill={store.deleteSkill}
+        <SettingsToolsTab mcpServersHydrated={store.mcpServersHydrated} mcpServersLoading={store.mcpServersLoading} mcpServers={store.mcpServers} mcpExpandedServer={store.mcpExpandedServer} mcpServerTools={store.mcpServerTools} mcpRefreshingServers={store.mcpRefreshingServers} mcpExpandedTool={store.mcpExpandedTool} builtinTools={store.builtinTools} skills={store.skills} openMCPDialog={store.openMCPDialog} toggleMCPExpand={store.toggleMCPExpand} getMCPHealthLabel={store.getMCPHealthLabel} toggleMCPServer={store.toggleMCPServer} deleteMCPServer={store.deleteMCPServer} refreshMCPTools={store.refreshMCPTools} toggleMCPToolDesc={store.toggleMCPToolDesc} openSkillLibraryDialog={store.openSkillLibraryDialog} openRepoDialog={store.openRepoDialog} deleteSkill={store.deleteSkill}
         />
       {/if}
     </div>

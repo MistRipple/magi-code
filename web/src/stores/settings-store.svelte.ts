@@ -137,6 +137,14 @@ export interface SkillItem {
   source: "custom" | "instruction";
 }
 
+export interface BuiltinToolItem {
+  name: string;
+  riskLevel: string;
+  approvalRequirement: string;
+  accessMode: string;
+  enabled: boolean;
+}
+
 function notifySettingsSuccess(
   message: string,
   options: {
@@ -642,6 +650,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   // Skills 完整结构（内置工具已迁移到 ToolManager，不再通过 Skills 配置）
   let skills = $state<SkillItem[]>([]);
+  let builtinTools = $state<BuiltinToolItem[]>([]);
 
   // 仓库管理
   let repositories = $state<Repository[]>([]);
@@ -1030,6 +1039,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     applyOrchestratorConfig(payload.orchestratorConfig);
     applyAuxiliaryConfig(payload.auxiliaryConfig);
     applyMcpServersPayload(payload.mcpServers);
+    applyBuiltinToolsPayload(payload.builtinTools);
     applySkillsConfig(payload.skillsConfig);
     applyRepositoriesPayload(payload.repositories);
     applySafeguardConfig(payload.safeguardConfig);
@@ -2443,6 +2453,24 @@ function createSettingsStore(props: { onClose?: () => void }) {
     });
   }
 
+  function applyBuiltinToolsPayload(toolsPayload: unknown): void {
+    builtinTools = ensureArray<any>(toolsPayload)
+      .map((tool) => {
+        const name = typeof tool?.name === "string" ? tool.name.trim() : "";
+        if (!name) {
+          return null;
+        }
+        return {
+          name,
+          riskLevel: typeof tool?.riskLevel === "string" ? tool.riskLevel : "",
+          approvalRequirement: typeof tool?.approvalRequirement === "string" ? tool.approvalRequirement : "",
+          accessMode: typeof tool?.accessMode === "string" ? tool.accessMode : "read_only",
+          enabled: tool?.enabled !== false,
+        } satisfies BuiltinToolItem;
+      })
+      .filter((tool): tool is BuiltinToolItem => tool !== null);
+  }
+
   function applySkillsConfig(config: any): void {
     const skillList: SkillItem[] = [];
     if (Array.isArray(config?.customTools)) {
@@ -2730,6 +2758,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     get skills() {
       return skills;
+    },
+    get builtinTools() {
+      return builtinTools;
     },
     get repositories() {
       return repositories;

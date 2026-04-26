@@ -159,8 +159,7 @@ interface ActiveTurnLiveContext {
   requestId: string;
   userMessageId: string;
   placeholderMessageId: string;
-  assistantMessageId: string;
-  assistantTextContent: string;
+  currentAssistantMessageId: string;
   route: 'chat' | 'execute' | 'task' | 'continue' | null;
 }
 let activeTurnLiveContext: ActiveTurnLiveContext | null = null;
@@ -766,38 +765,6 @@ function resolveTurnToolStatus(status: string): 'pending' | 'running' | 'complet
   return 'completed';
 }
 
-function resolveActiveAssistantMessageId(sessionId: string, itemId: string): string {
-  void sessionId;
-  const fallbackId = `rust-timeline:${itemId}`;
-  if (!activeTurnLiveContext) {
-    return fallbackId;
-  }
-  if (!activeTurnLiveContext.assistantMessageId) {
-    activeTurnLiveContext.assistantMessageId = fallbackId;
-  }
-  return activeTurnLiveContext.assistantMessageId;
-}
-
-function updateAssistantTurnTextContent(content: string): void {
-  if (!activeTurnLiveContext || !content.trim()) {
-    return;
-  }
-  const current = activeTurnLiveContext.assistantTextContent.trim();
-  const next = content.trim();
-  if (!current) {
-    activeTurnLiveContext.assistantTextContent = next;
-    return;
-  }
-  if (next.startsWith(current)) {
-    activeTurnLiveContext.assistantTextContent = next;
-    return;
-  }
-  if (current.startsWith(next)) {
-    return;
-  }
-  activeTurnLiveContext.assistantTextContent = next;
-}
-
 function buildAssistantTurnTextBlocks(content: string): StandardMessage['blocks'] {
   const text = content.trim();
   if (!text) {
@@ -905,22 +872,19 @@ function createSessionTurnItemStandardMessage(
     ) {
       return null;
     }
-    updateAssistantTurnTextContent(content);
-    const assistantText = activeTurnLiveContext?.assistantTextContent || content;
-    if (!assistantText.trim()) {
+    const assistantText = content.trim();
+    if (!assistantText) {
       return null;
     }
-    id = resolveActiveAssistantMessageId(sessionId, itemId);
+    id = `rust-timeline:${itemId}`;
     const resolvedItemLifecycle = resolveTurnItemLifecycle(status);
-    lifecycle = kind === 'assistant_final'
-      ? MessageLifecycle.COMPLETED
-      : (activeTurnLiveContext ? MessageLifecycle.STREAMING : resolvedItemLifecycle);
+    lifecycle = resolvedItemLifecycle;
     bridgeType = lifecycle === MessageLifecycle.COMPLETED ? 'unifiedComplete' : 'unifiedMessage';
     blocks = buildAssistantTurnTextBlocks(assistantText);
     if (activeTurnLiveContext) {
       metadata.requestId = activeTurnLiveContext.requestId;
       metadata.userMessageId = activeTurnLiveContext.userMessageId;
-      metadata.placeholderMessageId = activeTurnLiveContext.placeholderMessageId;
+      activeTurnLiveContext.currentAssistantMessageId = id;
     }
   } else if (kind === 'tool_call_started' || kind === 'tool_call_result') {
     const toolCallId = readTurnItemString(item, 'toolCallId', 'tool_call_id') || itemId;
@@ -1047,11 +1011,8 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     const deltaSessionId = trimBridgeString(event.payload.session_id);
     if (typeof deltaText === 'string' && rawEntryId != null) {
       const entryId = typeof rawEntryId === 'number' ? rawEntryId : String(rawEntryId);
-      if (activeTurnLiveContext && !activeTurnLiveContext.assistantMessageId) {
-        activeTurnLiveContext.assistantMessageId = `rust-timeline:${entryId}`;
-      }
       applyStreamingDelta(entryId, deltaText, deltaSessionId || undefined, activeTurnLiveContext ? {
-        replaceMessageId: activeTurnLiveContext.placeholderMessageId,
+        replaceMessageId: activeTurnLiveContext.currentAssistantMessageId || activeTurnLiveContext.placeholderMessageId,
         requestId: activeTurnLiveContext.requestId,
         userMessageId: activeTurnLiveContext.userMessageId,
       } : {});
@@ -2231,8 +2192,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
     requestId,
     userMessageId,
     placeholderMessageId,
-    assistantMessageId: '',
-    assistantTextContent: '',
+    currentAssistantMessageId: '',
     route: null,
   };
   activeTurnInFlight = true;

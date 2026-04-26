@@ -1341,13 +1341,16 @@ export interface SessionIntakeResponseDto {
   /** Pause */
   paused?: boolean;
   rootTaskId?: string;
+  pausedTaskId?: string;
   contextTaskId?: string;
   /** Replan */
   replan?: boolean;
+  targetTaskId?: string;
   cancelledTaskIds?: string[];
   /** SupplementContext */
   contextRef?: string;
   note?: string;
   /** AppendTask */
   addedTaskId?: string;
+  parentTaskId?: string;
 }

@@ -133,10 +133,12 @@ export function compareTimelineSemanticOrder(
     return leftAnchorEventSeq - rightAnchorEventSeq;
   }
 
-  const leftBlockSeq = normalizeNonNegativeInteger(left.blockSeq) || 0;
-  const rightBlockSeq = normalizeNonNegativeInteger(right.blockSeq) || 0;
-  if (leftBlockSeq !== rightBlockSeq) {
-    return leftBlockSeq - rightBlockSeq;
+  if (leftAnchorEventSeq !== null && rightAnchorEventSeq !== null) {
+    const leftBlockSeq = normalizeNonNegativeInteger(left.blockSeq) || 0;
+    const rightBlockSeq = normalizeNonNegativeInteger(right.blockSeq) || 0;
+    if (leftBlockSeq !== rightBlockSeq) {
+      return leftBlockSeq - rightBlockSeq;
+    }
   }
 
   if (left.timestamp !== right.timestamp) {

@@ -461,6 +461,8 @@ export function handleUnifiedData(standard: StandardMessage) {
     case 'emptyWorkspaceStateLoaded':
       handleEmptyWorkspaceStateLoaded(asMessage({
         state: payload.state,
+        workspaceId: payload.workspaceId,
+        workspacePath: payload.workspacePath,
       }));
       break;
 
@@ -479,6 +481,10 @@ export function handleUnifiedData(standard: StandardMessage) {
           clearProcessingState({ skipAntiLiftBack: true });
         }
         setCurrentSessionId(null);
+        messagesState.currentWorkspaceId = typeof payload.workspaceId === 'string' && payload.workspaceId.trim()
+          ? payload.workspaceId.trim()
+          : messagesState.currentWorkspaceId;
+        messagesState.currentWorkspacePath = typeof payload.workspacePath === 'string' ? payload.workspacePath.trim() : '';
         if (!hasPendingLocalTurn) {
           setQueuedMessages([]);
         }
@@ -493,6 +499,7 @@ export function handleUnifiedData(standard: StandardMessage) {
     case 'sessionBootstrapLoaded':
       handleSessionBootstrapLoaded(asMessage({
         sessionId: payload.sessionId,
+        workspace: payload.workspace,
         sessions: payload.sessions,
         state: payload.state,
         timelineProjection: payload.timelineProjection,
@@ -635,6 +642,12 @@ function handleSessionsUpdated(message: ClientBridgeMessage) {
 function handleEmptyWorkspaceStateLoaded(message: ClientBridgeMessage) {
   const state = (message.state as AppState | undefined) ?? buildEmptyWorkspaceAppState(Date.now());
   const hasPendingLocalTurn = messagesState.pendingRequests.size > 0;
+  const workspaceId = typeof (message as Record<string, unknown>).workspaceId === 'string'
+    ? ((message as Record<string, unknown>).workspaceId as string).trim()
+    : '';
+  const workspacePath = typeof (message as Record<string, unknown>).workspacePath === 'string'
+    ? ((message as Record<string, unknown>).workspacePath as string).trim()
+    : '';
 
   batchWebviewStatePersistence(() => {
     if (!hasPendingLocalTurn) {
@@ -650,6 +663,8 @@ function handleEmptyWorkspaceStateLoaded(message: ClientBridgeMessage) {
     }
     updateSessions([]);
     setCurrentSessionId(null);
+    messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
+    messagesState.currentWorkspacePath = workspacePath;
     setAppState({
       ...state,
       sessions: [],
@@ -868,6 +883,12 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
   const sessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
   const timelineProjection = message.timelineProjection as SessionTimelineProjection | undefined;
   const state = message.state as AppState | undefined;
+  const workspaceRecord = (message as Record<string, unknown>).workspace;
+  const workspace = workspaceRecord && typeof workspaceRecord === 'object'
+    ? workspaceRecord as Record<string, unknown>
+    : null;
+  const workspaceId = typeof workspace?.workspaceId === 'string' ? workspace.workspaceId.trim() : '';
+  const workspacePath = typeof workspace?.rootPath === 'string' ? workspace.rootPath.trim() : '';
   const hasMoreBefore = message.hasMoreBefore === true;
   const beforeCursor = typeof message.beforeCursor === 'string' && message.beforeCursor.trim()
     ? message.beforeCursor.trim()
@@ -889,6 +910,8 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       if (sessions.length > 0) {
         updateSessions(sessions);
       }
+      messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
+      messagesState.currentWorkspacePath = workspacePath || messagesState.currentWorkspacePath;
       const hadLiveTurnBeforeSnapshot = hasActiveLocalTurn();
       const authoritativeSnapshotIsIdle = state.isProcessing !== true
         && state.processingState?.isProcessing !== true;
@@ -950,6 +973,8 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     if (sessions.length > 0) {
       updateSessions(sessions);
     }
+    messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
+    messagesState.currentWorkspacePath = workspacePath || messagesState.currentWorkspacePath;
 
     setCurrentSessionId(sessionId);
     applyTimelineProjectionSnapshot(sessionId, timelineProjection, { hydrateNodes: true });

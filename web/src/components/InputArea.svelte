@@ -85,6 +85,16 @@
     const status = projection.runner_status;
     return status === 'running' || status === 'blocked';
   });
+  const intakeContextTaskId = $derived.by(() => {
+    const projection = taskGraph.projection;
+    if (!projection) return null;
+    const priorityStatuses = ['AwaitingApproval', 'Blocked', 'Repairing', 'Verifying', 'Running', 'Ready'];
+    for (const status of priorityStatuses) {
+      const task = projection.tasks.find((item) => item.kind !== 'Objective' && item.status === status);
+      if (task) return task.task_id;
+    }
+    return projection.root_task?.task_id ?? taskGraph.rootTaskId ?? null;
+  });
 
   // 发送/停止态只认 store 内已经收敛好的处理状态，避免历史工具卡片把空闲会话抬回执行态。
   const isSending = $derived(
@@ -116,11 +126,6 @@
     return selectedImages.length > 0;
   });
 
-  // P1-1: 限频机制 - 执行中 1 秒/条，空闲 300ms/条
-  let lastSendTime = $state(0);
-  const RATE_LIMIT_IDLE = 300;      // 空闲状态：300ms
-  const RATE_LIMIT_PROCESSING = 1000;  // 执行中：1 秒
-
   function clearComposerState() {
     inputValue = '';
     selectedImages = [];
@@ -138,14 +143,6 @@
       addToast('warning', i18n.t('input.noImageDuringExecution'));
       return;
     }
-    // P1-1: 限频检查
-    const now = Date.now();
-    const minInterval = isSending ? RATE_LIMIT_PROCESSING : RATE_LIMIT_IDLE;
-    if (now - lastSendTime < minInterval) {
-      addToast('warning', i18n.t('input.sendTooFast'));
-      return;
-    }
-    lastSendTime = now;
 
     const submissionText = normalizedContent
       ? rawContent
@@ -187,6 +184,7 @@
       const response = await client.postIntake({
         sessionId: messagesState.currentSessionId,
         message,
+        contextTaskId: intakeContextTaskId,
       });
       handleIntakeResponse(response);
       clearComposerState();

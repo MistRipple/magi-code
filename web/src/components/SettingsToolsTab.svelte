@@ -11,6 +11,7 @@
     mcpServerTools,
     mcpRefreshingServers,
     mcpExpandedTool,
+    builtinTools,
     skills,
     openMCPDialog,
     toggleMCPExpand,
@@ -30,6 +31,13 @@
     mcpServerTools: Record<string, any[]>;
     mcpRefreshingServers: Set<string>;
     mcpExpandedTool: string | null;
+    builtinTools: Array<{
+      name: string;
+      riskLevel: string;
+      approvalRequirement: string;
+      accessMode: string;
+      enabled: boolean;
+    }>;
     skills: any[];
     openMCPDialog: (server: any) => void;
     toggleMCPExpand: (sid: string) => void;
@@ -42,11 +50,102 @@
     openRepoDialog: () => void;
     deleteSkill: (skill: any) => void;
   }>();
+
+  const BUILTIN_TOOL_LABELS: Record<string, string> = {
+    shell_exec: 'Shell 命令',
+    process_launch: '长任务启动',
+    process_read: '进程输出读取',
+    process_write: '进程输入写入',
+    process_kill: '进程终止',
+    process_list: '进程列表',
+    process_inspect: '进程检查',
+    file_read: '读取文件',
+    file_write: '写入文件',
+    file_patch: '修改文件',
+    file_remove: '删除文件',
+    file_mkdir: '创建目录',
+    file_copy: '复制文件',
+    file_move: '移动文件',
+    search_text: '文本搜索',
+    search_semantic: '语义搜索',
+    diff_preview: '差异预览',
+    web_search: '网页搜索',
+    web_fetch: '网页读取',
+    mermaid_diagram: 'Mermaid 图表',
+    knowledge_query: '知识库检索',
+  };
+
+  function getBuiltinToolLabel(name: string): string {
+    return BUILTIN_TOOL_LABELS[name] ?? name;
+  }
+
+  function getBuiltinToolAccessLabel(accessMode: string): string {
+    switch (accessMode) {
+      case 'explicit_write':
+        return i18n.t('settings.tools.accessWrite');
+      case 'maybe_write':
+        return i18n.t('settings.tools.accessMaybeWrite');
+      default:
+        return i18n.t('settings.tools.accessReadOnly');
+    }
+  }
+
+  function getBuiltinToolRiskLabel(riskLevel: string): string {
+    switch (riskLevel.toLowerCase()) {
+      case 'high':
+        return i18n.t('settings.tools.riskHigh');
+      case 'medium':
+        return i18n.t('settings.tools.riskMedium');
+      case 'low':
+        return i18n.t('settings.tools.riskLow');
+      default:
+        return riskLevel || i18n.t('settings.tools.unknown');
+    }
+  }
 </script>
 
 <div class="apple-manager" style="flex: 1; min-height: 0; display: flex; flex-direction: column;">
   <div class="apple-scroller-proxy" style="flex: 1; display: flex; flex-direction: column; padding: 0;">
       <div style="display: flex; flex-direction: column; min-height: 100%; flex: 1; padding: 0 4px 12px 4px; box-sizing: border-box;">
+        <!-- 内置工具 -->
+        <div class="settings-section tools-section">
+          <div class="settings-section-header" style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 16px;">
+            <div class="header-title-group" style="display: flex; align-items: baseline; gap: 10px;">
+              <div class="settings-section-title" style="margin-bottom: 0;">{i18n.t('settings.tools.builtinTools')}</div>
+              <div class="settings-section-desc" style="margin-bottom: 0;">{i18n.t('settings.tools.builtinDesc')}</div>
+            </div>
+          </div>
+          <div class="tools-fixed-panel tools-fixed-panel--builtin">
+            {#if builtinTools.length === 0}
+              <div class="empty-state">
+                <Icon name="tools" size={48} />
+                <p>{i18n.t('settings.tools.noBuiltinTools')}</p>
+              </div>
+            {:else}
+              <div class="builtin-tool-list">
+                {#each builtinTools as tool (tool.name)}
+                  <div class="builtin-tool-row">
+                    <div class="brand-group">
+                      <div class="avatar-squircle" style="background: rgba(var(--primary-rgb, 0, 122, 255), 0.12); color: var(--primary);">
+                        <Icon name={tool.name.includes('process') || tool.name.includes('shell') ? 'terminal' : 'tools'} size={13} />
+                      </div>
+                      <div class="identity-stack">
+                        <span class="main-label">{getBuiltinToolLabel(tool.name)}</span>
+                        <span class="tool-code">{tool.name}</span>
+                      </div>
+                    </div>
+                    <div class="builtin-tool-badges">
+                      <span class="tool-badge">{getBuiltinToolAccessLabel(tool.accessMode)}</span>
+                      <span class="tool-badge" class:tool-badge--risk={tool.riskLevel.toLowerCase() === 'high'}>{getBuiltinToolRiskLabel(tool.riskLevel)}</span>
+                      <span class="apple-indicator" class:success={tool.enabled} title={tool.enabled ? i18n.t('settings.tools.enabled') : i18n.t('settings.tools.disabledLabel')}></span>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        </div>
+
         <!-- MCP 工具 -->
         <div class="settings-section tools-section">
           <div class="settings-section-header" style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 16px;">
@@ -247,6 +346,52 @@
   }
   .tools-fixed-panel .apple-grid {
     min-height: 0;
+  }
+
+  .builtin-tool-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 8px;
+  }
+
+  .builtin-tool-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    min-width: 0;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: rgba(var(--foreground-rgb), 0.035);
+  }
+
+  .tool-code {
+    font-size: 10px;
+    color: var(--foreground-muted);
+    font-family: var(--font-mono);
+  }
+
+  .builtin-tool-badges {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .tool-badge {
+    padding: 2px 6px;
+    border-radius: 999px;
+    background: rgba(var(--foreground-rgb), 0.06);
+    color: var(--foreground-muted);
+    font-size: 10px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  .tool-badge--risk {
+    color: var(--warning, #b7791f);
+    background: rgba(181, 118, 20, 0.12);
   }
 
   .mcp-tools-popover {

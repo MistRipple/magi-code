@@ -539,17 +539,19 @@ function bindMessageToUserAnchor(
   if (!anchorTimestamp) {
     return message;
   }
+  // 响应消息必须排在用户消息之后，否则同锚点时会被 stableId 反转到上方。
+  const responseTimestamp = anchorTimestamp + 1;
   const metadata = message.metadata && typeof message.metadata === 'object'
     ? message.metadata as Record<string, unknown>
     : undefined;
-  if (metadata?.timelineAnchorTimestamp === anchorTimestamp) {
+  if (metadata?.timelineAnchorTimestamp === responseTimestamp) {
     return message;
   }
   return {
     ...message,
     metadata: {
       ...(metadata || {}),
-      timelineAnchorTimestamp: anchorTimestamp,
+      timelineAnchorTimestamp: responseTimestamp,
     },
   };
 }

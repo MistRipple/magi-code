@@ -150,6 +150,7 @@ function normalizeSettingsBootstrapPayload(
     safeguardConfig: normalizeSettingsSectionConfig(payload.safeguardConfig ?? payload.safeguard),
     repositories: Array.isArray(payload.repositories) ? payload.repositories : [],
     mcpServers: Array.isArray(payload.mcpServers) ? payload.mcpServers : [],
+    builtinTools: Array.isArray(payload.builtinTools) ? payload.builtinTools : [],
     workerStatuses: (
       payload.workerStatuses
       && typeof payload.workerStatuses === 'object'

@@ -106,6 +106,8 @@ export const messagesState = $state({
   timelineProjection: null as SessionTimelineProjection | null,
 
   // 会话状态
+  currentWorkspaceId: null as string | null,
+  currentWorkspacePath: '' as string,
   sessions: [] as Session[],
   currentSessionId: null as string | null,
   sessionHistory: {
@@ -671,9 +673,25 @@ function shouldOverlayLocalTimelineNode(
   const isStreaming = timelineNodeIsActivelyStreaming(node);
   const isRequestPlaceholder = timelineNodeIsRequestPlaceholder(node);
   const backendActive = messagesState.backendProcessing || messagesState.pendingRequests.size > 0;
+  const metadata = resolveMessageMetadataRecord(node.message);
+  const requestId = typeof metadata?.requestId === 'string' ? metadata.requestId.trim() : '';
+  const requestBinding = requestId ? getRequestBinding(requestId) : undefined;
+  const isLocalEchoMessage = (node.message.role === 'user' || node.message.type === 'user_input')
+    || (node.message.role === 'assistant'
+      && Boolean(
+        requestId
+        || metadata?.wasPlaceholder === true
+        || metadata?.isPlaceholder === true,
+      ));
 
   // 占位节点在后端不再处理时让位 projection,避免发送按钮永远卡在“已发送”状态。
   if (!backendActive && isRequestPlaceholder) {
+    return false;
+  }
+
+  // 没有活跃 request binding 的本地 echo 必须让位给权威投影。
+  // 这样刷新或断链后不会把前一轮的乐观气泡误当成真实历史消息。
+  if (isLocalEchoMessage && !backendActive && !requestBinding) {
     return false;
   }
 
@@ -1323,6 +1341,7 @@ function normalizeTimelineNode(node: TimelineNode): TimelineNode {
   const laneId = typeof stableMessage.metadata?.laneId === 'string'
     ? stableMessage.metadata.laneId.trim()
     : (typeof node.laneId === 'string' ? node.laneId.trim() : '');
+  const laneOrder = normalizeTimelineLaneOrder(node.laneOrder);
   const worker = resolveTimelineWorker(stableMessage) || node.worker;
   const workerTabs = normalizeWorkerTabList(node.workerTabs);
   const messageIds = Array.from(new Set([
@@ -1333,7 +1352,6 @@ function normalizeTimelineNode(node: TimelineNode): TimelineNode {
   const executionItems = ensureArray<TimelineExecutionItem>(node.executionItems)
     .map((item) => normalizeTimelineExecutionItem(item))
     .sort((a, b) => compareTimelineSemanticOrder(executionItemToOrderInput(a), executionItemToOrderInput(b)));
-  const laneOrder = normalizeTimelineLaneOrder(node.laneOrder);
   return {
     nodeId: stableNodeId,
     kind: node.kind || resolveTimelineNodeKind(stableMessage),
@@ -1358,6 +1376,35 @@ function normalizeTimelineNode(node: TimelineNode): TimelineNode {
     messageIds,
     message: stableMessage,
     executionItems,
+  };
+}
+
+function getLaneOrderBaseTimestamp(node: Pick<TimelineNode, 'timestamp' | 'anchorEventSeq' | 'message'>): number {
+  const messageTimestamp = resolveTimelineSortTimestamp(node.timestamp, resolveMessageMetadataRecord(node.message));
+  const anchorEventSeq = node.anchorEventSeq || getMessageEventSeq(node.message) || 0;
+  if (anchorEventSeq > 0 && messageTimestamp > 0) {
+    return messageTimestamp;
+  }
+  return messageTimestamp;
+}
+
+function mergeTimelineLaneOrder(
+  current: TimelineNode['laneOrder'] | undefined,
+  node: Pick<TimelineNode, 'timestamp' | 'anchorEventSeq' | 'message' | 'workerTabs'>,
+): TimelineNode['laneOrder'] | undefined {
+  const normalized = normalizeTimelineLaneOrder(current);
+  const baseTimestamp = getLaneOrderBaseTimestamp(node);
+  const workers = Object.fromEntries(
+    normalizeWorkerTabList(node.workerTabs).map((workerId, index) => [workerId, Math.max(1, index + 1)]),
+  );
+  if (!normalized && workers && Object.keys(workers).length === 0) {
+    return undefined;
+  }
+  return {
+    thread: typeof normalized?.thread === 'number' && Number.isFinite(normalized.thread)
+      ? Math.max(1, Math.floor(normalized.thread))
+      : Math.max(1, Math.floor(baseTimestamp || 1)),
+    ...(Object.keys(workers).length > 0 ? { workers } : (normalized?.workers ? { workers: normalized.workers } : {})),
   };
 }
 
@@ -1413,12 +1460,9 @@ interface LocalProjectionFlatRenderEntry {
   groupId: string;
   message: Message;
   timestamp: number;
-  displayOrder?: number;
-  itemOrder?: number;
   anchorEventSeq: number;
   blockSeq: number;
   cardStreamSeq: number;
-  frozenSemanticStage?: number;
 }
 
 function shouldRenderTimelineNodeHost(
@@ -1495,7 +1539,6 @@ function buildProjectionRenderEntriesFromArtifacts(
         groupId: artifact.artifactId,
         message: artifact.message,
         timestamp: artifact.timestamp,
-        displayOrder: artifact.displayOrder,
         anchorEventSeq: artifact.anchorEventSeq,
         blockSeq: getMessageBlockSeq(artifact.message),
         cardStreamSeq: artifact.cardStreamSeq,
@@ -1516,8 +1559,6 @@ function buildProjectionRenderEntriesFromArtifacts(
         groupId: artifact.artifactId,
         message: item.message,
         timestamp: item.timestamp,
-        displayOrder: artifact.displayOrder,
-        itemOrder: item.itemOrder,
         anchorEventSeq: item.anchorEventSeq,
         blockSeq: getMessageBlockSeq(item.message),
         cardStreamSeq: item.cardStreamSeq,
@@ -3854,10 +3895,20 @@ export function prependTimelineProjectionPage(
   }
   const retainedCurrentArtifacts = currentProjection.artifacts.filter((artifact) => {
     if (isLocalUserEchoArtifact(artifact)) {
+      const metadata = resolveMessageMetadataRecord(artifact.message);
+      const requestId = typeof metadata?.requestId === 'string' ? metadata.requestId.trim() : '';
+      if (!requestId || !getRequestBinding(requestId)) {
+        return false;
+      }
       const text = normalizeComparableMessageText(artifact.message);
       return !projectionHasUserMessageText(incomingProjection, text);
     }
     if (isLocalAssistantEchoArtifact(artifact)) {
+      const metadata = resolveMessageMetadataRecord(artifact.message);
+      const requestId = typeof metadata?.requestId === 'string' ? metadata.requestId.trim() : '';
+      if (!requestId || !getRequestBinding(requestId)) {
+        return false;
+      }
       const text = normalizeComparableMessageText(artifact.message);
       return !projectionHasAssistantMessageText(incomingProjection, text);
     }

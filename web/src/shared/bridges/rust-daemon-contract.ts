@@ -1473,6 +1473,62 @@ function tryParseStructuredBlocks(raw: string): ContentBlock[] | undefined {
   }
 }
 
+function extractTimelineMillisFromId(rawId: unknown): number | null {
+  const id = normalizeString(rawId);
+  if (!id) {
+    return null;
+  }
+  const matches = id.match(/\d{13,}/g);
+  if (!matches || matches.length === 0) {
+    return null;
+  }
+  const timestamps = matches
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .map((value) => Math.floor(value));
+  return timestamps.length > 0 ? Math.min(...timestamps) : null;
+}
+
+function resolveTurnTimelineBase(
+  turn: RustSessionRuntimeTurnSummary | null | undefined,
+  items: RustSessionRuntimeTurnItemSummary[],
+  fallbackTimestamp: number,
+): number {
+  const parsedBases = items
+    .filter((item) => normalizeString(item.kind) !== 'user_message')
+    .map((item) => {
+      const timestamp = extractTimelineMillisFromId(item.item_id);
+      if (timestamp === null) {
+        return null;
+      }
+      return timestamp - Math.max(0, normalizeNumber(item.item_seq, 0));
+    })
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0);
+  if (parsedBases.length > 0) {
+    return Math.min(...parsedBases);
+  }
+  const acceptedAt = normalizeNumber(turn?.accepted_at, 0);
+  if (acceptedAt > 0) {
+    return acceptedAt;
+  }
+  const completedAt = normalizeNumber(turn?.completed_at, 0);
+  if (completedAt > 0) {
+    return completedAt;
+  }
+  return fallbackTimestamp;
+}
+
+function resolveTurnItemTimestamp(
+  item: RustSessionRuntimeTurnItemSummary,
+  timelineBase: number,
+): number {
+  const parsedTimestamp = extractTimelineMillisFromId(item.item_id);
+  if (parsedTimestamp !== null) {
+    return parsedTimestamp;
+  }
+  return timelineBase + Math.max(0, normalizeNumber(item.item_seq, 0));
+}
+
 function buildTimelineEntryArtifacts(
   sessionId: string,
   timeline: RustTimelineEntry[] | undefined,
@@ -1724,7 +1780,10 @@ function projectionArtifactDedupKey(artifact: TimelineProjectionArtifact): strin
   if (toolCallId) {
     return `tool:${toolCallId}`;
   }
-  return artifact.artifactId;
+  const timelineAlias = (artifact.messageIds || [])
+    .map((messageId) => normalizeString(messageId))
+    .find((messageId) => messageId.startsWith('rust-timeline:'));
+  return timelineAlias || artifact.artifactId;
 }
 
 function projectionArtifactPreferenceScore(artifact: TimelineProjectionArtifact): number {
@@ -1888,12 +1947,13 @@ function buildTurnArtifactsFromSummary(
   if (items.length === 0) {
     return [];
   }
-  const finalItemIds = new Set(
-    items
-      .filter((item) => normalizeString(item.kind) === 'assistant_final')
-      .map((item) => normalizeString(item.item_id)),
-  );
-  const hasAssistantFinal = finalItemIds.size > 0;
+  const timelineBase = resolveTurnTimelineBase(turn, items, generatedAt);
+  const turnAnchorEventSeq = Math.max(1, Math.floor(normalizeNumber(turn?.turn_seq, timelineBase)));
+  const finalStreamingEntryId = normalizeString(streamingEntryId);
+  const hasRenderableAssistantFinalItem = items.some((item) => (
+    normalizeString(item.kind) === 'assistant_final'
+    && Boolean(normalizeString(item.content) || normalizeString(finalText))
+  ));
   const workerLaneById = new Map(
     (Array.isArray(workerLanes) ? workerLanes : [])
       .map((lane) => [normalizeString(lane.lane_id), lane] as const)
@@ -1937,7 +1997,9 @@ function buildTurnArtifactsFromSummary(
     if (kind === 'assistant_thinking') {
       // thinking 必须独立保留，不能在有 final 时被吞掉，否则刷新后会丢失真实 reasoning 轨迹。
     }
-    if (kind === 'assistant_stream' && hasAssistantFinal) {
+    // completed turn 的 stream/final 在历史快照里常常同时存在；
+    // 线程视图只保留一个可见的主回复，避免同一轮被渲染两次。
+    if (kind === 'assistant_stream' && (hasRenderableAssistantFinalItem || (finalStreamingEntryId && itemId === finalStreamingEntryId))) {
       continue;
     }
     if ((kind === 'tool_call_started' || kind === 'tool_call_result') && !toolResultItemIds.has(itemId)) {
@@ -1946,10 +2008,7 @@ function buildTurnArtifactsFromSummary(
     const laneId = normalizeString(item.lane_id);
     const workerId = normalizeString(item.worker_id)
       || normalizeString(workerLaneById.get(laneId)?.worker_id);
-    // 使用 snapshot 条目的实际 occurredAt(generatedAt)作为基准时间戳，避免 turn.accepted_at
-    // 比 user 消息 timeline entry 的 occurredAt 还早导致整个 turn 的助手卡片被排到用户消息之前。
-    // 同一 turn 内的相对顺序由 item_seq 保证。
-    const timestamp = generatedAt + normalizeNumber(item.item_seq, 0);
+    const timestamp = resolveTurnItemTimestamp(item, timelineBase);
     const threadVisible = item.thread_visible === true
       || kind === 'assistant_thinking'
       || kind === 'assistant_stream'
@@ -2042,8 +2101,8 @@ function buildTurnArtifactsFromSummary(
       artifactId,
       kind: kind.includes('tool') ? 'tool' : 'message',
       displayOrder: normalizeNumber(turn?.turn_seq, 0) * 1000 + normalizeNumber(item.item_seq, 0),
-      anchorEventSeq: 0,
-      latestEventSeq: 0,
+      anchorEventSeq: turnAnchorEventSeq,
+      latestEventSeq: turnAnchorEventSeq,
       cardStreamSeq: normalizeNumber(item.item_seq, 0),
       timestamp,
       laneId: laneId || undefined,
@@ -2065,6 +2124,7 @@ function buildTurnArtifactsFromSummary(
           turnId,
           turnItemId: itemId,
           turnItemKind: kind,
+          blockSeq: normalizeNumber(item.item_seq, 0),
           laneId: laneId || undefined,
           workerId: workerId || undefined,
           ...(kind === 'assistant_final' && typeof turn?.response_duration_ms === 'number'
@@ -2077,6 +2137,18 @@ function buildTurnArtifactsFromSummary(
   return artifacts;
 }
 
+function isTerminalTurnStatus(status: string | null | undefined): boolean {
+  const normalized = normalizeString(status).toLowerCase();
+  return normalized === 'completed'
+    || normalized === 'complete'
+    || normalized === 'succeeded'
+    || normalized === 'success'
+    || normalized === 'failed'
+    || normalized === 'error'
+    || normalized === 'cancelled'
+    || normalized === 'canceled';
+}
+
 function buildCurrentTurnArtifacts(
   sessionId: string,
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
@@ -2084,11 +2156,14 @@ function buildCurrentTurnArtifacts(
 ): TimelineProjectionArtifact[] {
   const session = normalizeSessionRuntimeEntries(runtimeReadModel)
     .find((entry) => normalizeString(entry.session_id) === sessionId);
+  if (!session?.current_turn || isTerminalTurnStatus(session.current_turn.status)) {
+    return [];
+  }
   return buildTurnArtifactsFromSummary(
     sessionId,
-    session?.current_turn,
-    session?.turn_items,
-    session?.worker_lanes,
+    session.current_turn,
+    session.turn_items,
+    session.worker_lanes,
     generatedAt,
   );
 }
