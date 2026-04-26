@@ -2,8 +2,9 @@ use crate::{
     errors::ApiError,
     prompt_utils::normalize_model_visible_content,
     session_turn_writeback::{
-        append_session_tool_call_items, append_session_turn_item, publish_session_turn_item_event,
-        session_turn_item, upsert_session_turn_item,
+        append_session_tool_call_items, append_session_turn_item,
+        build_completed_turn_timeline_snapshot, publish_session_turn_item_event, session_turn_item,
+        upsert_session_turn_item,
     },
     settings_store::SettingsStore,
     usage_recording::{
@@ -71,6 +72,7 @@ pub(crate) fn run_session_turn_execution(
         tool_call_id: None,
     }];
     let mut final_content: Option<String> = None;
+    let mut last_streaming_entry_id: Option<String> = None;
     let usage_binding = session_turn_model_usage_binding(request.use_tools);
 
     for round in 0..MAX_TOOL_CALL_ROUNDS {
@@ -90,6 +92,7 @@ pub(crate) fn run_session_turn_execution(
             tool_registry,
             skill_runtime,
         )?;
+        last_streaming_entry_id = streamed_content.streaming_entry_id.clone();
 
         if let Some(content) = streamed_content.final_content {
             final_content = Some(content);
@@ -106,6 +109,7 @@ pub(crate) fn run_session_turn_execution(
         &request.session_id,
         &request.workspace_id,
         &final_content,
+        last_streaming_entry_id.as_deref(),
     );
 
     Ok(SessionTurnExecutionOutput { final_content })
@@ -126,6 +130,7 @@ struct SessionTurnRoundRuntime<'a> {
 
 struct SessionTurnRoundOutput {
     final_content: Option<String>,
+    streaming_entry_id: Option<String>,
 }
 
 fn stream_session_turn_round(
@@ -336,6 +341,7 @@ fn stream_session_turn_round(
         }
         return Ok(SessionTurnRoundOutput {
             final_content: None,
+            streaming_entry_id: Some(stream_item_id),
         });
     }
 
@@ -346,7 +352,10 @@ fn stream_session_turn_round(
         .map(normalize_model_visible_content)
         .or_else(|| (!request.use_tools).then(|| "[LLM 未返回文本响应]".to_string()));
 
-    Ok(SessionTurnRoundOutput { final_content })
+    Ok(SessionTurnRoundOutput {
+        final_content,
+        streaming_entry_id: Some(stream_item_id),
+    })
 }
 
 fn append_phase_item(
@@ -380,6 +389,7 @@ fn append_final_item(
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     final_content: &str,
+    streaming_entry_id: Option<&str>,
 ) {
     let final_item = session_turn_item(
         "assistant_final",
@@ -391,4 +401,23 @@ fn append_final_item(
     append_session_turn_item(session_store, session_id, final_item.clone());
     publish_session_turn_item_event(event_bus, session_id, workspace_id, &final_item);
     let _ = session_store.update_current_turn_status(session_id, "completed");
+    let timeline_message =
+        build_completed_turn_timeline_snapshot(session_store, session_id, Some(final_content), streaming_entry_id)
+            .unwrap_or_else(|| final_content.to_string());
+    let fallback_entry_id = session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| {
+            sidecar
+                .current_turn
+                .as_ref()
+                .map(|turn| format!("timeline-turn-snapshot-{}-{}", session_id, turn.turn_id))
+        })
+        .unwrap_or_else(|| format!("timeline-turn-snapshot-{}", session_id));
+    let entry_id = streaming_entry_id.unwrap_or(fallback_entry_id.as_str());
+    session_store.upsert_timeline_entry(
+        session_id.clone(),
+        entry_id,
+        TimelineEntryKind::AssistantMessage,
+        timeline_message,
+    );
 }

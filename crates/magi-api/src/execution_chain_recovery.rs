@@ -1,4 +1,4 @@
-use crate::{errors::ApiError, state::ApiState, task_execution::ShadowTaskExecutionPlan};
+use crate::{errors::ApiError, state::{ApiState, RunnerStartError}, task_execution::ShadowTaskExecutionPlan};
 use magi_core::{
     ExecutionOwnership, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskId, TaskStatus,
     WorkerId,
@@ -460,6 +460,25 @@ pub(crate) fn continue_shadow_execution_chain(
                 .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?;
         }
     }
+
+    // 深度模式：恢复任务状态后需要重新启动后台 runner，避免退化为同步执行
+    let background_allowed = root_task
+        .policy_snapshot
+        .as_ref()
+        .map(|policy| policy.background_allowed)
+        .unwrap_or(false);
+    if background_allowed {
+        match manager.start(chain.root_task_id.as_str(), Some(session_id.clone())) {
+            Ok(_) | Err(RunnerStartError::AlreadyRunning) => {}
+            Err(RunnerStartError::NotFound) => {
+                return Err(ApiError::internal_assembly(
+                    "继续会话失败",
+                    "根任务不存在",
+                ));
+            }
+        }
+    }
+
     Ok(SessionContinueAccepted {
         session_id: session_id.clone(),
         mission_id: chain.mission_id,

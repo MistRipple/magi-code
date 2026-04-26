@@ -10,6 +10,7 @@ use super::{
 use crate::{
     dto::SessionTurnRequestDto,
     errors::ApiError,
+    session_turn_writeback::build_completed_turn_timeline_snapshot,
     state::ApiState,
     task_execution::{
         DispatchSubmissionAccepted, DispatchSubmissionRequest, drive_shadow_dispatch_submission,
@@ -281,11 +282,21 @@ pub(super) fn append_dispatch_assistant_message(
     } else {
         format!("timeline-streaming-{}", accepted.action_task_id)
     };
+    let _ = state
+        .session_store
+        .update_current_turn_status(&accepted.session_id, "completed");
+    let timeline_message = build_completed_turn_timeline_snapshot(
+        state.session_store.as_ref(),
+        &accepted.session_id,
+        Some(&response_text),
+        Some(&streaming_entry_id),
+    )
+    .unwrap_or_else(|| response_text.clone());
     state.session_store.upsert_timeline_entry(
         accepted.session_id.clone(),
         &streaming_entry_id,
         TimelineEntryKind::AssistantMessage,
-        response_text.clone(),
+        timeline_message,
     );
     let _ = state.event_bus.publish(
         EventEnvelope::domain(

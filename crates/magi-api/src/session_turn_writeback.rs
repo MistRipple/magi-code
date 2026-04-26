@@ -9,13 +9,17 @@ use magi_core::{
     ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId, ToolCallId,
     UtcMillis, WorkspaceId,
 };
-use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
+use magi_event_bus::{
+    EventContext, EventEnvelope, InMemoryEventBus, SessionRuntimeTurnItemSummaryEntry,
+    SessionRuntimeTurnLaneSummaryEntry, SessionRuntimeTurnSummaryEntry,
+};
 use magi_governance::ToolKind;
 use magi_session_store::{ActiveExecutionTurnItem, SessionStore};
 use magi_skill_runtime::SkillRuntime;
 use magi_tool_runtime::{
     ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
 };
+use serde::Serialize;
 
 pub(crate) fn session_turn_item(
     kind: &str,
@@ -86,6 +90,140 @@ pub(crate) fn publish_session_turn_item_event(
             ..EventContext::default()
         }),
     );
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct CompletedTurnTimelineSnapshot {
+    session_id: String,
+    mission_id: Option<String>,
+    root_task_id: Option<String>,
+    execution_chain_ref: Option<String>,
+    final_text: Option<String>,
+    streaming_entry_id: Option<String>,
+    is_historical_turn_snapshot: bool,
+    current_turn: SessionRuntimeTurnSummaryEntry,
+    turn_items: Vec<SessionRuntimeTurnItemSummaryEntry>,
+    worker_lanes: Vec<SessionRuntimeTurnLaneSummaryEntry>,
+}
+
+fn to_turn_item_summary(item: &ActiveExecutionTurnItem) -> SessionRuntimeTurnItemSummaryEntry {
+    SessionRuntimeTurnItemSummaryEntry {
+        item_id: item.item_id.clone(),
+        item_seq: item.item_seq,
+        lane_id: item.lane_id.clone(),
+        lane_seq: item.lane_seq,
+        kind: item.kind.clone(),
+        status: item.status.clone(),
+        source: item.source.clone(),
+        title: item.title.clone(),
+        content: item.content.clone(),
+        task_id: item.task_id.as_ref().map(ToString::to_string),
+        worker_id: item.worker_id.as_ref().map(ToString::to_string),
+        role_id: item.role_id.clone(),
+        tool_call_id: item.tool_call_id.clone(),
+        tool_name: item.tool_name.clone(),
+        tool_status: item.tool_status.clone(),
+        tool_arguments: item.tool_arguments.clone(),
+        tool_result: item.tool_result.clone(),
+        tool_error: item.tool_error.clone(),
+        thread_visible: item.thread_visible,
+        worker_visible: item.worker_visible,
+    }
+}
+
+fn to_turn_lane_summary(
+    lane: &magi_session_store::ActiveExecutionTurnLane,
+    status: &str,
+) -> SessionRuntimeTurnLaneSummaryEntry {
+    SessionRuntimeTurnLaneSummaryEntry {
+        lane_id: lane.lane_id.clone(),
+        lane_seq: lane.lane_seq,
+        task_id: lane.task_id.to_string(),
+        worker_id: lane.worker_id.to_string(),
+        role_id: lane.role_id.clone(),
+        title: lane.title.clone(),
+        status: status.to_string(),
+        is_primary: lane.is_primary,
+    }
+}
+
+pub(crate) fn build_completed_turn_timeline_snapshot(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    fallback_final_text: Option<&str>,
+    streaming_entry_id: Option<&str>,
+) -> Option<String> {
+    let sidecar = session_store.runtime_sidecar(session_id)?;
+    let turn = sidecar.current_turn.as_ref()?;
+    let chain = sidecar.active_execution_chain.as_ref();
+    let completed_at = turn.completed_at.unwrap_or_else(UtcMillis::now);
+    let response_duration_ms = Some(completed_at.0.saturating_sub(turn.accepted_at.0));
+    let final_text = fallback_final_text
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .or_else(|| {
+            turn.items
+                .iter()
+                .rev()
+                .find(|item| item.kind == "assistant_final")
+                .and_then(|item| item.content.clone())
+                .filter(|text| !text.trim().is_empty())
+                .or_else(|| {
+                    turn.items
+                        .iter()
+                        .rev()
+                        .find(|item| item.kind == "assistant_stream")
+                        .and_then(|item| item.content.clone())
+                        .filter(|text| !text.trim().is_empty())
+                })
+        });
+
+    let lane_status_by_id = turn
+        .items
+        .iter()
+        .filter_map(|item| {
+            item.lane_id
+                .as_ref()
+                .map(|lane_id| (lane_id.clone(), item.status.clone()))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let snapshot = CompletedTurnTimelineSnapshot {
+        session_id: session_id.to_string(),
+        mission_id: chain.map(|chain| chain.mission_id.to_string()),
+        root_task_id: chain.map(|chain| chain.root_task_id.to_string()),
+        execution_chain_ref: chain.map(|chain| chain.execution_chain_ref.clone()),
+        final_text,
+        streaming_entry_id: streaming_entry_id.map(str::to_string),
+        is_historical_turn_snapshot: true,
+        current_turn: SessionRuntimeTurnSummaryEntry {
+            turn_id: turn.turn_id.clone(),
+            turn_seq: turn.turn_seq,
+            accepted_at: Some(turn.accepted_at),
+            completed_at: Some(completed_at),
+            response_duration_ms,
+            status: turn.status.clone(),
+            user_message: turn.user_message.clone(),
+            mission_id: chain.map(|chain| chain.mission_id.to_string()),
+            root_task_id: chain.map(|chain| chain.root_task_id.to_string()),
+            execution_chain_ref: chain.map(|chain| chain.execution_chain_ref.clone()),
+        },
+        turn_items: turn.items.iter().map(to_turn_item_summary).collect(),
+        worker_lanes: turn
+            .worker_lanes
+            .iter()
+            .map(|lane| {
+                let status = lane_status_by_id
+                    .get(&lane.lane_id)
+                    .map(String::as_str)
+                    .unwrap_or(turn.status.as_str());
+                to_turn_lane_summary(lane, status)
+            })
+            .collect(),
+    };
+
+    serde_json::to_string(&snapshot).ok()
 }
 
 pub(crate) fn append_session_tool_call_items(

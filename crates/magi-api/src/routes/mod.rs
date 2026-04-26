@@ -170,8 +170,8 @@ mod tests {
         BridgeServerKind, BridgeServerServiceCatalog, BridgeTransport, BridgeTransportError,
         BridgeTransportRequest, BridgeTransportResponse, LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD,
         LOCAL_BRIDGE_HANDSHAKE_METHOD, LOCAL_BRIDGE_HEALTH_METHOD, McpManagerListServersResponse,
-        ModelBridgeClient, ModelInvocationRequest, SHADOW_MCP_SERVER_NAME, SHADOW_MCP_TOOL_NAME,
-        SHADOW_MODEL_PROVIDER,
+        ModelBridgeClient, ModelInvocationRequest, ModelStreamingDelta, SHADOW_MCP_SERVER_NAME,
+        SHADOW_MCP_TOOL_NAME, SHADOW_MODEL_PROVIDER,
     };
     use magi_context_runtime::{ContextBudget, ContextRuntime};
     use magi_core::{
@@ -187,6 +187,7 @@ mod tests {
     use magi_session_store::{
         ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
         ActiveExecutionTurn, ActiveExecutionTurnItem, SessionStore, TimelineEntryKind,
+        timeline_entry_visible_text,
     };
     use magi_skill_runtime::SkillDispatchRuntime;
     use magi_tool_runtime::ToolRegistry;
@@ -1148,7 +1149,7 @@ mod tests {
             json!({
                 "sessionId": "session-route-shadow",
                 "text": "Route parser refresh",
-                "deepTask": true,
+                "deepTask": false,
                 "skillName": "refactor",
                 "images": [],
             }),
@@ -1257,7 +1258,7 @@ mod tests {
             json!({
                 "sessionId": "session-route-shadow",
                 "text": "Route parser refresh followup",
-                "deepTask": true,
+                "deepTask": false,
                 "skillName": "refactor",
                 "images": [],
             }),
@@ -1542,6 +1543,7 @@ mod tests {
                         turn_id: "turn-output-refs".to_string(),
                         turn_seq: 1,
                         accepted_at,
+                        completed_at: None,
                         status: "completed".to_string(),
                         user_message: Some("请输出完整总结".to_string()),
                         items: vec![
@@ -1653,8 +1655,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(assistant_messages.len(), 1);
         assert_eq!(
-            assistant_messages[0].message,
-            "这是来自 assistant_final 的最终总结"
+            timeline_entry_visible_text(&assistant_messages[0].message).as_deref(),
+            Some("这是来自 assistant_final 的最终总结")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&assistant_messages[0].message)
+                .expect("assistant timeline should store completed turn snapshot")["is_historical_turn_snapshot"],
+            Value::Bool(true)
         );
     }
 
@@ -1697,6 +1704,7 @@ mod tests {
                         turn_id: "turn-no-assistant-final".to_string(),
                         turn_seq: 1,
                         accepted_at,
+                        completed_at: None,
                         status: "completed".to_string(),
                         user_message: Some("请不要回退到 output refs".to_string()),
                         items: vec![ActiveExecutionTurnItem {
@@ -1828,6 +1836,7 @@ mod tests {
                         turn_id: "turn-replaced-second".to_string(),
                         turn_seq: 2,
                         accepted_at: second_accepted_at,
+                        completed_at: None,
                         status: "running".to_string(),
                         user_message: Some("第二轮已经替换 current_turn".to_string()),
                         items: vec![ActiveExecutionTurnItem {
@@ -2236,7 +2245,7 @@ mod tests {
             json!({
                 "sessionId": "session-route-shadow",
                 "text": "seed recovery route state",
-                "deepTask": true,
+                "deepTask": false,
                 "skillName": "refactor",
                 "images": [],
             }),
@@ -2753,10 +2762,61 @@ mod tests {
             if let Some(payload) = classifier_payload_for_prompt(&request.prompt) {
                 return Ok(BridgeResponse { ok: true, payload });
             }
+            if request.prompt.contains("深度任务图") {
+                return Ok(BridgeResponse {
+                    ok: true,
+                    payload: serde_json::json!({
+                        "phases": [
+                            {
+                                "title": "Phase 1",
+                                "workPackages": [
+                                    {
+                                        "title": "WP 1",
+                                        "actions": [
+                                            { "title": "Action 1", "goal": "Do first thing", "dependsOn": [], "writeScope": null }
+                                        ]
+                                    }
+                                ]
+                            },
+                            {
+                                "title": "Phase 2",
+                                "workPackages": [
+                                    {
+                                        "title": "WP 2",
+                                        "actions": [
+                                            { "title": "Action 2", "goal": "Do second thing", "dependsOn": [], "writeScope": null }
+                                        ]
+                                    }
+                                ]
+                            },
+                            {
+                                "title": "Phase 3",
+                                "workPackages": [
+                                    {
+                                        "title": "WP 3",
+                                        "actions": [
+                                            { "title": "Action 3", "goal": "Do third thing", "dependsOn": [], "writeScope": null }
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    })
+                    .to_string(),
+                });
+            }
             Ok(BridgeResponse {
                 ok: true,
                 payload: format!("shadow-model::{}", request.prompt.trim()),
             })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            self.invoke(request)
         }
     }
 
@@ -2782,6 +2842,14 @@ mod tests {
                 ok: true,
                 payload: "shadow-model::ok".to_string(),
             })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            self.invoke(request)
         }
     }
 
@@ -2831,6 +2899,14 @@ mod tests {
                 payload: payload.to_string(),
             })
         }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            self.invoke(request)
+        }
     }
 
     impl ModelBridgeClient for DelayedModelBridgeClient {
@@ -2841,11 +2917,62 @@ mod tests {
             if let Some(payload) = classifier_payload_for_prompt(&request.prompt) {
                 return Ok(BridgeResponse { ok: true, payload });
             }
+            if request.prompt.contains("深度任务图") {
+                return Ok(BridgeResponse {
+                    ok: true,
+                    payload: serde_json::json!({
+                        "phases": [
+                            {
+                                "title": "P1",
+                                "workPackages": [
+                                    {
+                                        "title": "WP1",
+                                        "actions": [
+                                            { "title": "A1", "goal": "g1", "dependsOn": [], "writeScope": null }
+                                        ]
+                                    }
+                                ]
+                            },
+                            {
+                                "title": "P2",
+                                "workPackages": [
+                                    {
+                                        "title": "WP2",
+                                        "actions": [
+                                            { "title": "A2", "goal": "g2", "dependsOn": [], "writeScope": null }
+                                        ]
+                                    }
+                                ]
+                            },
+                            {
+                                "title": "P3",
+                                "workPackages": [
+                                    {
+                                        "title": "WP3",
+                                        "actions": [
+                                            { "title": "A3", "goal": "g3", "dependsOn": [], "writeScope": null }
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    })
+                    .to_string(),
+                });
+            }
             thread::sleep(self.delay);
             Ok(BridgeResponse {
                 ok: true,
                 payload: self.payload.clone(),
             })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            self.invoke(request)
         }
     }
 
@@ -2919,6 +3046,14 @@ mod tests {
                 message: "model bridge unavailable".to_string(),
             })
         }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            self.invoke(request)
+        }
     }
 
     impl ModelBridgeClient for ContinueClassifierExpectingNoRecoverableChain {
@@ -2950,6 +3085,14 @@ mod tests {
                 payload: "shadow-model::ok".to_string(),
             })
         }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            self.invoke(request)
+        }
     }
 
     impl ModelBridgeClient for SessionSwitchingToolModelBridgeClient {
@@ -2964,6 +3107,49 @@ mod tests {
                 return Ok(BridgeResponse {
                     ok: true,
                     payload: "读取配置文件\n总结配置内容".to_string(),
+                });
+            }
+            if request.prompt.contains("深度任务图") {
+                return Ok(BridgeResponse {
+                    ok: true,
+                    payload: serde_json::json!({
+                        "phases": [
+                            {
+                                "title": "P1",
+                                "workPackages": [
+                                    {
+                                        "title": "WP1",
+                                        "actions": [
+                                            { "title": "A1", "goal": "g1", "dependsOn": [], "writeScope": null }
+                                        ]
+                                    }
+                                ]
+                            },
+                            {
+                                "title": "P2",
+                                "workPackages": [
+                                    {
+                                        "title": "WP2",
+                                        "actions": [
+                                            { "title": "A2", "goal": "g2", "dependsOn": [], "writeScope": null }
+                                        ]
+                                    }
+                                ]
+                            },
+                            {
+                                "title": "P3",
+                                "workPackages": [
+                                    {
+                                        "title": "WP3",
+                                        "actions": [
+                                            { "title": "A3", "goal": "g3", "dependsOn": [], "writeScope": null }
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    })
+                    .to_string(),
                 });
             }
 
@@ -3002,6 +3188,14 @@ mod tests {
                 })
                 .to_string(),
             })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            self.invoke(request)
         }
     }
 
@@ -4620,6 +4814,7 @@ mod tests {
             Some(DecisionTaskPayload {
                 decision_context: "任务失败后需要选择处理方式".to_string(),
                 blocked_reason: "等待用户选择失败任务处理方式".to_string(),
+                target_task_id: Some(TaskId::new("task-decision-root")),
                 options: vec![
                     DecisionOption {
                         option_id: "retry".to_string(),
@@ -4669,7 +4864,8 @@ mod tests {
         let root = store
             .get_task(&TaskId::new("task-decision-root"))
             .expect("root task should remain queryable");
-        assert_eq!(root.status, TaskStatus::Running);
+        // Decision resolve 后 release_open_branch 把 root 从 Blocked 释放为 Ready
+        assert_eq!(root.status, TaskStatus::Ready);
     }
 
     #[tokio::test]

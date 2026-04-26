@@ -9,9 +9,7 @@ use magi_bridge_client::{
 use magi_core::TaskStatus;
 use magi_core::{DomainError, EventId, SessionId, UtcMillis, WorkerId};
 use magi_event_bus::{EventContext, EventEnvelope};
-use magi_session_store::{
-    ActiveExecutionTurn, ActiveExecutionTurnItem, SessionRecord, TimelineEntryKind,
-};
+use magi_session_store::{ActiveExecutionTurn, ActiveExecutionTurnItem, SessionRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -149,35 +147,6 @@ async fn submit_session_turn(
             )))
         }
     }
-}
-
-fn append_session_assistant_message(
-    state: &ApiState,
-    session_id: &SessionId,
-    accepted_at: UtcMillis,
-    message: &str,
-) {
-    state.session_store.append_timeline_entry(
-        session_id.clone(),
-        TimelineEntryKind::AssistantMessage,
-        message.to_string(),
-    );
-
-    let _ = state.event_bus.publish(
-        EventEnvelope::domain(
-            EventId::new(format!("event-message-assistant-{}", accepted_at.0)),
-            "message.created",
-            json!({
-                "session_id": session_id.to_string(),
-                "role": "assistant",
-                "content": message,
-            }),
-        )
-        .with_context(EventContext {
-            session_id: Some(session_id.clone()),
-            ..EventContext::default()
-        }),
-    );
 }
 
 #[derive(Debug)]
@@ -425,6 +394,7 @@ fn submit_regular_session_turn(
         turn_seq: accepted_at.0 as u64,
         accepted_at,
         status: "running".to_string(),
+        completed_at: None,
         user_message: Some(message.clone()),
         items: vec![ActiveExecutionTurnItem {
             item_id: format!("turn-item-user-{}", accepted_at.0),
@@ -525,12 +495,7 @@ fn spawn_regular_session_turn_execution(
 
         match dispatcher.execute_session_turn(execution_request) {
             Ok(output) => {
-                append_session_assistant_message(
-                    &state,
-                    &session_id,
-                    accepted_at,
-                    &output.final_content,
-                );
+                drop(output);
                 if let Err(error) = state.persist_session_durable_state() {
                     tracing::error!(
                         session_id = %session_id,
@@ -794,26 +759,39 @@ fn spawn_continue_session_finalize(
             return;
         };
 
-        if let Err(error) = drive_shadow_task_graph(
-            &state,
-            &accepted.root_task_id,
-            &accepted.action_task_id,
-            "继续会话执行失败",
-        ) {
-            let interrupted = task_store
-                .get_task(&accepted.action_task_id)
-                .is_some_and(|task| task.status == TaskStatus::Blocked);
-            if !interrupted {
-                tracing::error!(
-                    session_id = %accepted.session_id,
-                    root_task_id = %accepted.root_task_id,
-                    action_task_id = %accepted.action_task_id,
-                    ?error,
-                    "session continue graph drive failed"
-                );
-                return;
+        let background_allowed = task_store
+            .get_task(&accepted.root_task_id)
+            .and_then(|root| root.policy_snapshot)
+            .map(|policy| policy.background_allowed)
+            .unwrap_or(false);
+
+        // 普通模式：同步 drive shadow task graph（后台 runner 未启动）
+        // 深度模式：后台 runner 已在 continue_shadow_execution_chain 中重新启动，
+        // 此处不再调用同步 drive，避免与后台 runner 竞争
+        if !background_allowed {
+            if let Err(error) = drive_shadow_task_graph(
+                &state,
+                &accepted.root_task_id,
+                &accepted.action_task_id,
+                Some(accepted.session_id.clone()),
+                "继续会话执行失败",
+            ) {
+                let interrupted = task_store
+                    .get_task(&accepted.action_task_id)
+                    .is_some_and(|task| task.status == TaskStatus::Blocked);
+                if !interrupted {
+                    tracing::error!(
+                        session_id = %accepted.session_id,
+                        root_task_id = %accepted.root_task_id,
+                        action_task_id = %accepted.action_task_id,
+                        ?error,
+                        "session continue graph drive failed"
+                    );
+                    return;
+                }
             }
         }
+
         super::append_dispatch_assistant_message(
             &state,
             &crate::task_execution::DispatchSubmissionAccepted {
@@ -887,6 +865,9 @@ async fn close_session(
         .session_store
         .archive_session(&session_id)
         .map_err(|e| ApiError::internal_assembly("关闭会话失败", e))?;
+    if let Some(manager) = state.runner_manager() {
+        manager.unbind_session(&session_id);
+    }
     state.persist_session_durable_state()?;
     Ok(Json(state.bootstrap_dto()))
 }
