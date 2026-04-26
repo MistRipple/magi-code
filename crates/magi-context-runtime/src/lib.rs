@@ -605,7 +605,7 @@ mod tests {
         let knowledge_store = KnowledgeStore::new();
         for i in 1..=4 {
             knowledge_store.upsert(magi_knowledge_store::KnowledgeRecord {
-            workspace_id: None,
+                workspace_id: None,
                 knowledge_id: format!("kb-{i}"),
                 kind: magi_knowledge_store::KnowledgeKind::Faq,
                 title: format!("Knowledge item {i}"),

@@ -252,8 +252,9 @@ impl ModelBridgeClient for JsonRpcModelBridgeClient {
         Err(BridgeClientError::CallFailed {
             layer: BridgeErrorLayer::Protocol,
             code: None,
-            message: "JsonRpcModelBridgeClient 不支持流式调用,仅用于桥探测;请改用 HttpModelBridgeClient"
-                .to_string(),
+            message:
+                "JsonRpcModelBridgeClient 不支持流式调用,仅用于桥探测;请改用 HttpModelBridgeClient"
+                    .to_string(),
         })
     }
 }

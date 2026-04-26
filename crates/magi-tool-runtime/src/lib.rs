@@ -579,10 +579,14 @@ impl ToolRegistry {
     pub fn filtered_clone(&self, allowed: &[String], denied: &[String]) -> Self {
         let mut filtered = self.clone();
         if !allowed.is_empty() {
-            filtered.builtin_tools.retain(|name, _| allowed.contains(name));
+            filtered
+                .builtin_tools
+                .retain(|name, _| allowed.contains(name));
         }
         if !denied.is_empty() {
-            filtered.builtin_tools.retain(|name, _| !denied.contains(name));
+            filtered
+                .builtin_tools
+                .retain(|name, _| !denied.contains(name));
         }
         filtered
     }
