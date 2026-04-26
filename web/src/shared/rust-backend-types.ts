@@ -1189,6 +1189,7 @@ export interface DecisionOptionDto {
 export interface DecisionTaskPayloadDto {
   decision_context: string;
   blocked_reason: string;
+  target_task_id?: string | null;
   options: DecisionOptionDto[];
   risk_notes: string[];
   recommended_option?: string | null;
@@ -1231,6 +1232,16 @@ export interface ProgressSummaryDto {
   blocked_tasks: number;
 }
 
+export interface WorkPackageSummaryDto {
+  task_id: string;
+  title: string;
+  aggregate_status: TaskStatus;
+  display_status: string;
+  progress_ratio: number;
+  recent_evidence: string[];
+  recent_issues: string[];
+}
+
 export interface TaskProjectionDto {
   root_task: TaskDto;
   tasks: TaskDto[];
@@ -1238,10 +1249,58 @@ export interface TaskProjectionDto {
   running_tasks: string[];
   blocked_tasks: string[];
   pending_decisions: string[];
+  workpackage_summaries: WorkPackageSummaryDto[];
   validation_summary?: string | null;
   progress_summary: ProgressSummaryDto;
   aggregate_status: TaskStatus;
   display_status: string;
+  execution_mode: 'normal' | 'deep';
+  runner_status: 'idle' | 'running' | 'blocked' | 'completed' | 'error';
+}
+
+export interface DeliveryPackageProgressDto {
+  total: number;
+  completed: number;
+  failed: number;
+  running: number;
+  blocked: number;
+}
+
+export interface DeliveryPackageValidationResultDto {
+  task_id: string;
+  title: string;
+  result: string;
+  evidence: string[];
+}
+
+export interface DeliveryPackageRepairRecordDto {
+  task_id: string;
+  title: string;
+  goal: string;
+  evidence: string[];
+}
+
+export interface DeliveryPackageKeyDecisionDto {
+  task_id: string;
+  context: string;
+  blocked_reason: string;
+  chosen_option?: string | null;
+}
+
+export interface DeliveryPackageDto {
+  goal: string;
+  scope?: string | null;
+  execution_mode: 'normal' | 'deep';
+  aggregate_status: string;
+  current_phase?: string | null;
+  progress: DeliveryPackageProgressDto;
+  file_changes: string[];
+  evidence_list: string[];
+  validation_results: DeliveryPackageValidationResultDto[];
+  repair_records: DeliveryPackageRepairRecordDto[];
+  key_decisions: DeliveryPackageKeyDecisionDto[];
+  remaining_risks: string[];
+  completed_task_count: number;
 }
 
 export interface ResolveTaskDecisionRequestDto {
@@ -1253,4 +1312,42 @@ export interface ResolveTaskDecisionResponseDto {
   taskId: string;
   resolved: boolean;
   chosenOption: string;
+}
+
+// ─── Intake (design 8) ──────────────────────────────────────────────
+
+export interface SessionIntakeRequestDto {
+  sessionId?: string | null;
+  message: string;
+  contextTaskId?: string | null;
+}
+
+export type IntakeClassificationDto =
+  | 'decision_answer'
+  | 'pause'
+  | 'replan'
+  | 'supplement_context'
+  | 'append_task'
+  | 'new_objective'
+  | 'general_chat';
+
+export interface SessionIntakeResponseDto {
+  classification: IntakeClassificationDto;
+  /** DecisionAnswer */
+  resolved?: boolean;
+  decisionTaskId?: string;
+  chosenOption?: string;
+  reason?: string;
+  /** Pause */
+  paused?: boolean;
+  rootTaskId?: string;
+  contextTaskId?: string;
+  /** Replan */
+  replan?: boolean;
+  cancelledTaskIds?: string[];
+  /** SupplementContext */
+  contextRef?: string;
+  note?: string;
+  /** AppendTask */
+  addedTaskId?: string;
 }

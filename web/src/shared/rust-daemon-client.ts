@@ -20,6 +20,7 @@ import type {
   CustomToolNameRequestDto,
   DeletedResponseDto,
   DeleteKnowledgeRequestDto,
+  DeliveryPackageDto,
   DiffResponseDto,
   EngineIdRequestDto,
   EnginesResponseDto,
@@ -68,6 +69,8 @@ import type {
   SessionNotificationsResponseDto,
   SessionRenameRequestDto,
   SessionStatsResponseDto,
+  SessionIntakeRequestDto,
+  SessionIntakeResponseDto,
   SessionTurnRequestDto,
   SessionTurnResponseDto,
   SettingsUpdateRequestDto,
@@ -147,6 +150,12 @@ export class RustDaemonClient {
     request: SessionTurnRequestDto,
   ): Promise<SessionTurnResponseDto> {
     return this.postJson<SessionTurnResponseDto>('/api/session/turn', request);
+  }
+
+  public async postIntake(
+    request: SessionIntakeRequestDto,
+  ): Promise<SessionIntakeResponseDto> {
+    return this.postJson<SessionIntakeResponseDto>('/api/session/intake', request);
   }
 
   public async continueSession(
@@ -624,6 +633,14 @@ export class RustDaemonClient {
     query.set('sessionId', sessionId);
     return this.getJson<TaskDto>(
       `/api/tasks/${encodeURIComponent(taskId)}?${query.toString()}`,
+    );
+  }
+
+  public async getDeliveryPackage(rootTaskId: string, sessionId: string): Promise<DeliveryPackageDto> {
+    const query = new URLSearchParams();
+    query.set('sessionId', sessionId);
+    return this.getJson<DeliveryPackageDto>(
+      `/api/tasks/graph/${encodeURIComponent(rootTaskId)}/delivery?${query.toString()}`,
     );
   }
 
