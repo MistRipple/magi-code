@@ -4,7 +4,7 @@
   import type { ActivePlanState, PlanLedgerRecord, Message } from '../types/message';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import type { DecisionOptionDto, TaskDto, TaskStatus } from '../shared/rust-backend-types';
+  import type { DecisionOptionDto, DeliveryPackageDto, TaskDto, TaskStatus } from '../shared/rust-backend-types';
   import type { IconName } from '../lib/icons';
   import {
     getTaskGraphState,
@@ -43,6 +43,32 @@
   // 记录任务树节点展开状态。
   let expandedGraphNodes = $state<Set<string>>(new Set());
 
+  // ─── 交付包视图（深度模式完成后展示） ─────────────────
+  let deliveryPackage = $state<DeliveryPackageDto | null>(null);
+  let deliveryPackageLoading = $state(false);
+
+  const shouldFetchDelivery = $derived.by(() => {
+    const proj = taskGraph.projection;
+    if (!proj) return false;
+    return proj.execution_mode === 'deep' && proj.runner_status === 'completed';
+  });
+
+  $effect(() => {
+    if (!shouldFetchDelivery) {
+      deliveryPackage = null;
+      return;
+    }
+    const rootTaskId = taskGraph.projection?.root_task.task_id;
+    const sid = currentSessionId;
+    if (!rootTaskId || !sid || deliveryPackageLoading || deliveryPackage) return;
+    deliveryPackageLoading = true;
+    const client = createClient();
+    client.getDeliveryPackage(rootTaskId, sid)
+      .then((pkg) => { deliveryPackage = pkg; })
+      .catch((err) => { console.error('Failed to fetch delivery package:', err); })
+      .finally(() => { deliveryPackageLoading = false; });
+  });
+
   const childrenByParentId = $derived.by(() => {
     const grouped = new Map<string, TaskDto[]>();
     for (const task of projectionTasks) {
@@ -62,6 +88,7 @@
     buildTaskTreeRows(taskGraph.projection?.root_task, childrenByParentId, expandedGraphNodes)
   ));
   const taskSummary = $derived.by(() => buildTaskSummary(projectionTasks));
+  const workpackageSummaries = $derived(taskGraph.projection?.workpackage_summaries ?? []);
   const currentFocusTask = $derived.by(() => resolveCurrentFocusTask(projectionTasks));
   const attentionTasks = $derived.by(() => {
     const projection = taskGraph.projection;
@@ -177,6 +204,16 @@
     if (status === 'Completed' || status === 'Skipped') return '已收束';
     if (status === 'Failed') return '需要修复';
     return '等待执行';
+  }
+
+  function getRunnerStatusLabel(status: string): string {
+    switch (status) {
+      case 'running': return '运行中';
+      case 'blocked': return '已阻塞';
+      case 'completed': return '已完成';
+      case 'error': return '异常';
+      default: return '空闲';
+    }
   }
 
   // 自动展开根节点和活跃分支，确保任务树能直接反映执行状态。
@@ -468,9 +505,17 @@
               <p class="task-overview-goal">{proj.root_task.goal}</p>
             {/if}
           </div>
-          <span class="tg-status-badge tg-status--{getTaskStatusModifier(proj.aggregate_status)}">
-            {getTaskStatusLabel(proj.aggregate_status)}
-          </span>
+          <div class="task-overview-badges">
+            <span class="tg-mode-badge tg-mode--{proj.execution_mode}">
+              {proj.execution_mode === 'deep' ? '深度模式' : '普通模式'}
+            </span>
+            <span class="tg-runner-badge tg-runner--{proj.runner_status}">
+              {getRunnerStatusLabel(proj.runner_status)}
+            </span>
+            <span class="tg-status-badge tg-status--{getTaskStatusModifier(proj.aggregate_status)}">
+              {proj.display_status}
+            </span>
+          </div>
         </div>
 
         {#if projectionProgress}
@@ -510,7 +555,112 @@
         {#if proj.validation_summary}
           <div class="tg-validation-summary">{proj.validation_summary}</div>
         {/if}
+
+        {#if workpackageSummaries.length > 0}
+          <div class="wp-summaries">
+            <div class="wp-summaries-label">工作包进度</div>
+            {#each workpackageSummaries as wp (wp.task_id)}
+              <div class="wp-summary-row">
+                <div class="wp-summary-header">
+                  <span class="wp-summary-title">{wp.title}</span>
+                  <span class="wp-summary-badge tg-status--{getTaskStatusModifier(wp.aggregate_status)}">
+                    {getTaskStatusLabel(wp.aggregate_status)}
+                  </span>
+                </div>
+                <div class="wp-progress-wrap">
+                  <div class="wp-progress-bar">
+                    <div class="wp-progress-fill" style="width: {Math.round(wp.progress_ratio * 100)}%"></div>
+                  </div>
+                  <span class="wp-progress-label">{Math.round(wp.progress_ratio * 100)}%</span>
+                </div>
+                {#if wp.recent_issues.length > 0}
+                  <div class="wp-summary-issues">
+                    <Icon name="alert-circle" size={10} />
+                    <span>{wp.recent_issues.length} 项异常: {wp.recent_issues.join('、')}</span>
+                  </div>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
       </section>
+
+      {#if deliveryPackage}
+        <section class="delivery-package-card" aria-label="交付概览">
+          <div class="dp-header">
+            <Icon name="taskComplete" size={14} />
+            <span class="dp-title">交付概览</span>
+            <span class="dp-mode">{deliveryPackage.execution_mode === 'deep' ? '深度模式' : '普通模式'}</span>
+          </div>
+
+          {#if deliveryPackage.file_changes.length > 0}
+            <div class="dp-section">
+              <span class="dp-section-label">文件变更 ({deliveryPackage.file_changes.length})</span>
+              <div class="dp-chip-list">
+                {#each deliveryPackage.file_changes as ref}
+                  <span class="dp-chip">{ref}</span>
+                {/each}
+              </div>
+            </div>
+          {/if}
+
+          {#if deliveryPackage.evidence_list.length > 0}
+            <div class="dp-section">
+              <span class="dp-section-label">证据 ({deliveryPackage.evidence_list.length})</span>
+              <div class="dp-chip-list">
+                {#each deliveryPackage.evidence_list as ref}
+                  <span class="dp-chip">{ref}</span>
+                {/each}
+              </div>
+            </div>
+          {/if}
+
+          {#if deliveryPackage.validation_results.length > 0}
+            <div class="dp-section">
+              <span class="dp-section-label">验证结果 ({deliveryPackage.validation_results.length})</span>
+              {#each deliveryPackage.validation_results as vr}
+                <div class="dp-validation-row">
+                  <Icon name="check-circle" size={12} />
+                  <span class="dp-validation-title">{vr.title}</span>
+                  <span class="dp-validation-result">{vr.result}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          {#if deliveryPackage.key_decisions.length > 0}
+            <div class="dp-section">
+              <span class="dp-section-label">关键决策 ({deliveryPackage.key_decisions.length})</span>
+              {#each deliveryPackage.key_decisions as kd}
+                <div class="dp-decision-row">
+                  <Icon name="shield" size={12} />
+                  <span class="dp-decision-context">{kd.context}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          {#if deliveryPackage.remaining_risks.length > 0}
+            <div class="dp-section">
+              <span class="dp-section-label">剩余风险 ({deliveryPackage.remaining_risks.length})</span>
+              {#each deliveryPackage.remaining_risks as risk}
+                <div class="dp-risk-row">
+                  <Icon name="alert-triangle" size={12} />
+                  <span>{risk}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          <div class="dp-progress">
+            <span class="dp-progress-label">完成度</span>
+            <div class="dp-progress-bar">
+              <div class="dp-progress-fill" style="width: {Math.round(((deliveryPackage.progress.completed || 0) / (deliveryPackage.progress.total || 1)) * 100)}%"></div>
+            </div>
+            <span class="dp-progress-value">{deliveryPackage.progress.completed}/{deliveryPackage.progress.total || 1}</span>
+          </div>
+        </section>
+      {/if}
 
       <div class="task-section-header">
         <span>执行结构</span>
@@ -722,6 +872,97 @@
 </div>
 
 <style>
+  /* ========== WorkPackage 进度概览 ========== */
+  .wp-summaries {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--border);
+  }
+
+  .wp-summaries-label {
+    font-size: var(--text-2xs);
+    font-weight: var(--font-medium);
+    color: var(--foreground-muted);
+    letter-spacing: 0.04em;
+  }
+
+  .wp-summary-row {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    background: var(--surface-2);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+  }
+
+  .wp-summary-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+
+  .wp-summary-title {
+    font-size: var(--text-xs);
+    font-weight: var(--font-semibold);
+    color: var(--foreground);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .wp-summary-badge {
+    font-size: var(--text-2xs);
+    border-radius: 999px;
+    padding: 1px 6px;
+    border: 1px solid transparent;
+    flex-shrink: 0;
+  }
+
+  .wp-progress-wrap {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .wp-progress-bar {
+    flex: 1;
+    height: 6px;
+    background: var(--surface-hover);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+
+  .wp-progress-fill {
+    height: 100%;
+    background: var(--primary);
+    border-radius: inherit;
+    transition: width 200ms ease;
+  }
+
+  .wp-progress-label {
+    font-size: var(--text-2xs);
+    font-weight: var(--font-medium);
+    color: var(--foreground-muted);
+    flex-shrink: 0;
+    min-width: 28px;
+    text-align: right;
+  }
+
+  .wp-summary-issues {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--text-2xs);
+    color: var(--warning);
+    margin-top: var(--space-1);
+  }
+
   /* ========== 面板容器 ========== */
   .tasks-panel {
     /* panel-content-scrollable 已经包含了 padding, flex, overflow */
@@ -1004,6 +1245,13 @@
     min-width: 0;
   }
 
+  .task-overview-badges {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--space-2);
+  }
+
   .task-overview-kicker {
     display: block;
     margin-bottom: var(--space-1);
@@ -1087,7 +1335,9 @@
     color: var(--foreground-muted);
   }
 
-  .tg-status-badge {
+  .tg-status-badge,
+  .tg-mode-badge,
+  .tg-runner-badge {
     font-size: var(--text-2xs);
     border-radius: 999px;
     padding: 2px 8px;
@@ -1096,25 +1346,29 @@
     flex-shrink: 0;
   }
 
-  .tg-status--running {
+  .tg-status--running,
+  .tg-runner--running {
     color: var(--primary);
     background: var(--primary-muted);
     border-color: color-mix(in srgb, var(--primary) 30%, var(--border));
   }
 
-  .tg-status--completed {
+  .tg-status--completed,
+  .tg-runner--completed {
     color: var(--success);
     background: var(--success-muted);
     border-color: color-mix(in srgb, var(--success) 32%, var(--border));
   }
 
-  .tg-status--failed {
+  .tg-status--failed,
+  .tg-runner--error {
     color: var(--error);
     background: var(--error-muted);
     border-color: color-mix(in srgb, var(--error) 32%, var(--border));
   }
 
-  .tg-status--blocked {
+  .tg-status--blocked,
+  .tg-runner--blocked {
     color: var(--warning);
     background: var(--warning-muted);
     border-color: color-mix(in srgb, var(--warning) 30%, var(--border));
@@ -1464,6 +1718,153 @@
     background: var(--error-muted);
     border: 1px solid color-mix(in srgb, var(--error) 32%, var(--border));
     border-radius: var(--radius-md);
+  }
+
+  /* ========== Delivery Package ========== */
+  .delivery-package-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    padding: var(--space-4);
+    border: 1px solid color-mix(in srgb, var(--success) 22%, var(--border));
+    border-radius: var(--radius-lg);
+    background: color-mix(in srgb, var(--success) 4%, var(--surface-1));
+  }
+
+  .dp-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .dp-title {
+    font-size: var(--text-sm);
+    font-weight: var(--font-semibold);
+    color: var(--foreground);
+  }
+
+  .dp-mode {
+    margin-left: auto;
+    font-size: var(--text-2xs);
+    color: var(--success);
+    background: var(--success-muted);
+    border: 1px solid color-mix(in srgb, var(--success) 32%, var(--border));
+    border-radius: 999px;
+    padding: 2px 8px;
+  }
+
+  .dp-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .dp-section-label {
+    font-size: var(--text-2xs);
+    font-weight: var(--font-medium);
+    color: var(--foreground-muted);
+    letter-spacing: 0.04em;
+  }
+
+  .dp-chip-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+
+  .dp-chip {
+    font-size: var(--text-2xs);
+    color: var(--foreground-muted);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 1px 5px;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .dp-validation-row,
+  .dp-decision-row,
+  .dp-risk-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+    font-size: var(--text-xs);
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--radius-sm);
+  }
+
+  .dp-validation-row {
+    color: var(--success);
+    background: var(--success-muted);
+  }
+
+  .dp-decision-row {
+    color: var(--primary);
+    background: var(--primary-muted);
+  }
+
+  .dp-risk-row {
+    color: var(--warning);
+    background: var(--warning-muted);
+  }
+
+  .dp-validation-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .dp-validation-result {
+    font-size: var(--text-2xs);
+    text-transform: uppercase;
+    opacity: 0.8;
+  }
+
+  .dp-decision-context {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .dp-progress {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-top: var(--space-1);
+  }
+
+  .dp-progress-label {
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    white-space: nowrap;
+  }
+
+  .dp-progress-bar {
+    flex: 1;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    overflow: hidden;
+  }
+
+  .dp-progress-fill {
+    height: 100%;
+    border-radius: inherit;
+    background: var(--success);
+    transition: width 200ms ease;
+  }
+
+  .dp-progress-value {
+    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    font-variant-numeric: tabular-nums;
   }
 
 </style>
