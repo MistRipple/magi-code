@@ -88,28 +88,11 @@ async function refreshTrackedSessions(): Promise<void> {
 
 export function getTaskGraphState(sessionId: string | null | undefined): TaskGraphState {
   const normalizedSessionId = normalizeSessionKey(sessionId);
-  return {
-    get projection() {
-      return normalizedSessionId
-        ? (readSessionState(normalizedSessionId)?.projection ?? EMPTY_TASK_GRAPH_STATE.projection)
-        : EMPTY_TASK_GRAPH_STATE.projection;
-    },
-    get loading() {
-      return normalizedSessionId
-        ? (readSessionState(normalizedSessionId)?.loading ?? EMPTY_TASK_GRAPH_STATE.loading)
-        : EMPTY_TASK_GRAPH_STATE.loading;
-    },
-    get error() {
-      return normalizedSessionId
-        ? (readSessionState(normalizedSessionId)?.error ?? EMPTY_TASK_GRAPH_STATE.error)
-        : EMPTY_TASK_GRAPH_STATE.error;
-    },
-    get rootTaskId() {
-      return normalizedSessionId
-        ? (readSessionState(normalizedSessionId)?.rootTaskId ?? EMPTY_TASK_GRAPH_STATE.rootTaskId)
-        : EMPTY_TASK_GRAPH_STATE.rootTaskId;
-    },
-  };
+  if (!normalizedSessionId) {
+    return EMPTY_TASK_GRAPH_STATE;
+  }
+  // 直接返回 sessionStates 中的引用，使 Svelte 响应性系统能追踪字段变化
+  return readSessionState(normalizedSessionId) ?? EMPTY_TASK_GRAPH_STATE;
 }
 
 export async function fetchTaskProjection(
@@ -282,3 +265,4 @@ export function getTaskStatusModifier(status: TaskStatus): string {
     default: return 'unknown';
   }
 }
+
