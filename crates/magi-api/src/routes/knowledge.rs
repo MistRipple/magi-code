@@ -4,8 +4,12 @@ use axum::{
     routing::{get, post},
 };
 use magi_core::{DomainError, UtcMillis, WorkspaceId};
-use magi_knowledge_store::{KnowledgeKind, KnowledgeQuery, KnowledgeRecord};
+use magi_knowledge_store::{
+    KnowledgeKind, KnowledgeQuery, KnowledgeRecord,
+    code_scanner::ingest_workspace_code_index_in_workspace,
+};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use crate::{errors::ApiError, state::ApiState};
 
@@ -181,6 +185,7 @@ async fn get_project_knowledge(
     Query(query): Query<KnowledgeListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
+    ensure_workspace_code_index(&state, &workspace_id)?;
     let adrs_query = KnowledgeQuery {
         kind: Some(KnowledgeKind::Adr),
         text: None,
@@ -282,6 +287,35 @@ async fn list_learnings(
     Ok(Json(serde_json::json!({
         "learnings": result.matches.iter().map(|m| learning_record_json(&m.record)).collect::<Vec<_>>(),
     })))
+}
+
+fn ensure_workspace_code_index(
+    state: &ApiState,
+    workspace_id: &WorkspaceId,
+) -> Result<(), ApiError> {
+    if state
+        .knowledge_store
+        .code_index_summary_for_workspace(workspace_id)
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let Some(workspace) = state
+        .workspace_registry
+        .workspaces()
+        .into_iter()
+        .find(|workspace| workspace.workspace_id == *workspace_id)
+    else {
+        return Ok(());
+    };
+
+    ingest_workspace_code_index_in_workspace(
+        &state.knowledge_store,
+        workspace_id,
+        &PathBuf::from(workspace.root_path.as_str()),
+    );
+    state.persist_knowledge_state()
 }
 
 #[derive(Debug, Deserialize)]
@@ -634,12 +668,13 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
+    use magi_core::AbsolutePath;
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_knowledge_store::KnowledgeStore;
     use magi_session_store::SessionStore;
     use magi_workspace::WorkspaceStore;
-    use std::sync::Arc;
+    use std::{fs, sync::Arc};
     use tower::ServiceExt;
 
     fn state_with_knowledge_store(knowledge_store: KnowledgeStore) -> ApiState {
@@ -703,5 +738,50 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_slice(&body).expect("payload should deserialize");
         assert_eq!(payload["codeIndex"]["files"][0]["path"], "src/a.rs");
+    }
+
+    #[tokio::test]
+    async fn project_knowledge_lazily_indexes_registered_workspace_when_missing() {
+        let state = state_with_knowledge_store(KnowledgeStore::new());
+        let workspace_id = WorkspaceId::new("workspace-lazy-index");
+        let root =
+            std::env::temp_dir().join(format!("magi-knowledge-lazy-index-{}", UtcMillis::now().0));
+        fs::create_dir_all(root.join("src")).expect("workspace dir should create");
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("source file should write");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new(root.to_string_lossy().to_string()),
+            )
+            .expect("workspace should register");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/knowledge?workspaceId=workspace-lazy-index")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        let files = payload["codeIndex"]["files"]
+            .as_array()
+            .expect("code index files should exist");
+
+        assert!(
+            files
+                .iter()
+                .any(|file| file["path"].as_str() == Some("src/main.rs")),
+            "knowledge endpoint should index the requested registered workspace"
+        );
     }
 }

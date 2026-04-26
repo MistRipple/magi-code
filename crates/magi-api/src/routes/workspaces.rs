@@ -3,7 +3,9 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
+use magi_knowledge_store::code_scanner::ingest_workspace_code_index_in_workspace;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use crate::{errors::ApiError, state::ApiState};
 
@@ -82,9 +84,15 @@ async fn register_workspace(
     let path = magi_core::AbsolutePath::new(&request.path);
     state
         .workspace_registry
-        .register(workspace_id.clone(), path)
+        .register(workspace_id.clone(), path.clone())
         .map_err(|e| ApiError::internal_assembly("工作区注册失败", e))?;
+    ingest_workspace_code_index_in_workspace(
+        &state.knowledge_store,
+        &workspace_id,
+        &PathBuf::from(path.as_str()),
+    );
     state.persist_workspace_durable_state()?;
+    state.persist_knowledge_state()?;
     Ok(Json(serde_json::json!({
         "workspaceId": workspace_id.to_string(),
         "registered": true
@@ -204,7 +212,7 @@ mod tests {
         SessionRecord, SessionRuntimeSidecar, SessionStore, TimelineEntryKind,
     };
     use magi_workspace::WorkspaceStore;
-    use std::{sync::Arc, time::Duration};
+    use std::{fs, sync::Arc, time::Duration};
     use tower::ServiceExt;
 
     fn test_state() -> ApiState {
@@ -215,6 +223,56 @@ mod tests {
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
         )
+    }
+
+    #[tokio::test]
+    async fn register_workspace_ingests_workspace_code_index() {
+        let state = test_state();
+        let root = std::env::temp_dir().join(format!(
+            "magi-register-workspace-index-{}",
+            UtcMillis::now().0
+        ));
+        fs::create_dir_all(root.join("src")).expect("workspace dir should create");
+        fs::write(root.join("src/index.ts"), "export const value = 1;\n")
+            .expect("source file should write");
+
+        let body = serde_json::json!({ "path": root.to_string_lossy() }).to_string();
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workspaces/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        let workspace_id = WorkspaceId::new(
+            payload["workspaceId"]
+                .as_str()
+                .expect("workspaceId should exist"),
+        );
+        let code_index = state
+            .knowledge_store
+            .code_index_summary_for_workspace(&workspace_id)
+            .expect("registered workspace should have a code index");
+
+        assert!(
+            code_index
+                .files
+                .iter()
+                .any(|file| file.path == "src/index.ts"),
+            "workspace code index should include the registered workspace files"
+        );
     }
 
     #[tokio::test]
