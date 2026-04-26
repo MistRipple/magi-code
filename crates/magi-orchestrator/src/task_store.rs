@@ -152,13 +152,40 @@ impl TaskStore {
     /// 迁移任务到新的父节点，同时修正 children 索引。
     pub fn reparent_task(&self, task_id: &TaskId, new_parent_id: &TaskId) -> DomainResult<()> {
         let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
+        let old_parent = tasks
+            .get(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?
+            .parent_task_id
+            .clone();
+        let was_required = old_parent.as_ref().is_some_and(|parent_id| {
+            tasks
+                .get(parent_id)
+                .is_some_and(|parent| parent.required_children.contains(task_id))
+        });
         let task = tasks
             .get_mut(task_id)
             .ok_or(DomainError::NotFound { entity: "Task" })?;
-        let old_parent = task.parent_task_id.clone();
         task.parent_task_id = Some(new_parent_id.clone());
         task.updated_at = UtcMillis::now();
         drop(tasks);
+
+        if let Some(old_parent_id) = old_parent.clone() {
+            let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
+            if let Some(parent) = tasks.get_mut(&old_parent_id) {
+                parent.required_children.retain(|id| id != task_id);
+                parent.updated_at = UtcMillis::now();
+            }
+        }
+
+        if was_required {
+            let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
+            if let Some(parent) = tasks.get_mut(new_parent_id) {
+                if !parent.required_children.iter().any(|id| id == task_id) {
+                    parent.required_children.push(task_id.clone());
+                    parent.updated_at = UtcMillis::now();
+                }
+            }
+        }
 
         if let Some(old_parent_id) = old_parent {
             let mut children_index = self
@@ -279,6 +306,34 @@ impl TaskStore {
             .ok_or(DomainError::NotFound { entity: "Task" })?;
         task.input_refs.push(input_ref);
         task.updated_at = UtcMillis::now();
+        Ok(())
+    }
+
+    pub fn append_context_ref(&self, task_id: &TaskId, context_ref: String) -> DomainResult<()> {
+        let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
+        if !task.context_refs.iter().any(|item| item == &context_ref) {
+            task.context_refs.push(context_ref);
+            task.updated_at = UtcMillis::now();
+        }
+        Ok(())
+    }
+
+    pub fn append_required_child(
+        &self,
+        task_id: &TaskId,
+        child_task_id: &TaskId,
+    ) -> DomainResult<()> {
+        let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
+        if !task.required_children.iter().any(|id| id == child_task_id) {
+            task.required_children.push(child_task_id.clone());
+            task.updated_at = UtcMillis::now();
+        }
         Ok(())
     }
 
@@ -557,11 +612,9 @@ impl TaskStore {
                 children_index
                     .get(&task.task_id)
                     .map(|child_ids| {
-                        child_ids.iter().all(|cid| {
-                            tasks
-                                .get(cid)
-                                .is_some_and(|c| is_terminal_status(c.status))
-                        })
+                        child_ids
+                            .iter()
+                            .all(|cid| tasks.get(cid).is_some_and(|c| is_terminal_status(c.status)))
                     })
                     .unwrap_or(true)
             })
@@ -634,6 +687,15 @@ impl TaskStore {
                 for lease in leases.values_mut() {
                     if lease.task_id == *task_id && lease.lease_status == LeaseStatus::Active {
                         lease.lease_status = LeaseStatus::Revoked;
+                    }
+                }
+            }
+            if let Ok(mut tasks) = self.tasks.write() {
+                let now = UtcMillis::now();
+                for parent in tasks.values_mut() {
+                    if parent.required_children.iter().any(|id| id == task_id) {
+                        parent.required_children.retain(|id| id != task_id);
+                        parent.updated_at = now;
                     }
                 }
             }
@@ -787,10 +849,8 @@ impl TaskStore {
             .filter(|t| t.kind == magi_core::TaskKind::WorkPackage)
             .filter_map(|wp| {
                 let child_ids = children_index.get(&wp.task_id)?;
-                let children: Vec<&magi_core::Task> = child_ids
-                    .iter()
-                    .filter_map(|cid| tasks.get(cid))
-                    .collect();
+                let children: Vec<&magi_core::Task> =
+                    child_ids.iter().filter_map(|cid| tasks.get(cid)).collect();
                 let total = children.len() as u32;
                 if total == 0 {
                     return Some(magi_core::WorkPackageSummary {
@@ -803,15 +863,18 @@ impl TaskStore {
                         recent_issues: Vec::new(),
                     });
                 }
-                let terminal = children.iter().filter(|c| {
-                    matches!(
-                        c.status,
-                        magi_core::TaskStatus::Completed
-                            | magi_core::TaskStatus::Failed
-                            | magi_core::TaskStatus::Skipped
-                            | magi_core::TaskStatus::Cancelled
-                    )
-                }).count() as u32;
+                let terminal = children
+                    .iter()
+                    .filter(|c| {
+                        matches!(
+                            c.status,
+                            magi_core::TaskStatus::Completed
+                                | magi_core::TaskStatus::Failed
+                                | magi_core::TaskStatus::Skipped
+                                | magi_core::TaskStatus::Cancelled
+                        )
+                    })
+                    .count() as u32;
                 let progress_ratio = terminal as f32 / total as f32;
                 let recent_evidence: Vec<String> = children
                     .iter()
@@ -878,7 +941,10 @@ impl TaskStore {
             if completed_tasks == total_tasks {
                 "全部完成".to_string()
             } else if failed_tasks > 0 && blocked_count > 0 {
-                format!("{}% 已完成，{} 项失败、{} 项阻塞", pct, failed_tasks, blocked_count)
+                format!(
+                    "{}% 已完成，{} 项失败、{} 项阻塞",
+                    pct, failed_tasks, blocked_count
+                )
             } else if failed_tasks > 0 {
                 format!("{}% 已完成，{} 项失败待修复", pct, failed_tasks)
             } else if blocked_count > 0 {
@@ -1569,6 +1635,155 @@ mod tests {
         assert!(root_children.is_empty());
     }
 
+    #[test]
+    fn append_context_ref_updates_existing_task_without_duplication() {
+        let store = TaskStore::new();
+
+        let task = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Ready,
+        );
+        store.insert_task(task);
+
+        let task_id = TaskId::new("obj-1");
+        store
+            .append_context_ref(&task_id, "ctx-1".to_string())
+            .expect("first context ref append should succeed");
+        store
+            .append_context_ref(&task_id, "ctx-1".to_string())
+            .expect("duplicate context ref append should be idempotent");
+
+        let updated = store.get_task(&task_id).unwrap();
+        assert_eq!(updated.context_refs, vec!["ctx-1".to_string()]);
+        assert_eq!(store.get_tasks_by_mission(&MissionId::new("m-1")).len(), 1);
+    }
+
+    #[test]
+    fn append_required_child_updates_parent_aggregation() {
+        let store = TaskStore::new();
+
+        let parent = make_task(
+            "parent-1",
+            "m-1",
+            "parent-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let child = make_task(
+            "child-1",
+            "m-1",
+            "parent-1",
+            Some("parent-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
+        store.insert_task(parent);
+        store.insert_task(child);
+
+        let parent_id = TaskId::new("parent-1");
+        let child_id = TaskId::new("child-1");
+        store
+            .append_required_child(&parent_id, &child_id)
+            .expect("append required child should succeed");
+        store
+            .append_required_child(&parent_id, &child_id)
+            .expect("duplicate required child append should be idempotent");
+
+        let updated_parent = store.get_task(&parent_id).unwrap();
+        assert_eq!(updated_parent.required_children, vec![child_id]);
+    }
+
+    #[test]
+    fn remove_task_cleans_required_children_references() {
+        let store = TaskStore::new();
+
+        let parent = make_task(
+            "parent-2",
+            "m-1",
+            "parent-2",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let child = make_task(
+            "child-2",
+            "m-1",
+            "parent-2",
+            Some("parent-2"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
+        store.insert_task(parent);
+        store.insert_task(child);
+        store
+            .append_required_child(&TaskId::new("parent-2"), &TaskId::new("child-2"))
+            .expect("required child append should succeed");
+
+        let removed = store.remove_task(&TaskId::new("child-2"));
+        assert!(removed.is_some());
+
+        let updated_parent = store.get_task(&TaskId::new("parent-2")).unwrap();
+        assert!(updated_parent.required_children.is_empty());
+    }
+
+    #[test]
+    fn reparent_task_moves_required_child_marker() {
+        let store = TaskStore::new();
+
+        let old_parent = make_task(
+            "parent-old",
+            "m-1",
+            "parent-old",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let new_parent = make_task(
+            "parent-new",
+            "m-1",
+            "parent-old",
+            Some("parent-old"),
+            TaskKind::Phase,
+            TaskStatus::Running,
+        );
+        let child = make_task(
+            "child-3",
+            "m-1",
+            "parent-old",
+            Some("parent-old"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
+        store.insert_task(old_parent);
+        store.insert_task(new_parent);
+        store.insert_task(child);
+        store
+            .append_required_child(&TaskId::new("parent-old"), &TaskId::new("child-3"))
+            .expect("required child append should succeed");
+
+        store
+            .reparent_task(&TaskId::new("child-3"), &TaskId::new("parent-new"))
+            .expect("reparent should succeed");
+
+        let old_parent_updated = store.get_task(&TaskId::new("parent-old")).unwrap();
+        let new_parent_updated = store.get_task(&TaskId::new("parent-new")).unwrap();
+        assert!(old_parent_updated.required_children.is_empty());
+        assert_eq!(
+            new_parent_updated.required_children,
+            vec![TaskId::new("child-3")]
+        );
+        let child_updated = store.get_task(&TaskId::new("child-3")).unwrap();
+        assert_eq!(
+            child_updated.parent_task_id,
+            Some(TaskId::new("parent-new"))
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Test 2: Status transitions (Draft -> Ready -> Running -> Completed)
     // -----------------------------------------------------------------------
@@ -1588,33 +1803,27 @@ mod tests {
         store.insert_task(task);
 
         // Draft -> Ready
-        assert!(
-            store
-                .update_status(&TaskId::new("t-1"), TaskStatus::Ready)
-                .is_ok()
-        );
+        assert!(store
+            .update_status(&TaskId::new("t-1"), TaskStatus::Ready)
+            .is_ok());
         assert_eq!(
             store.get_task(&TaskId::new("t-1")).unwrap().status,
             TaskStatus::Ready
         );
 
         // Ready -> Running
-        assert!(
-            store
-                .update_status(&TaskId::new("t-1"), TaskStatus::Running)
-                .is_ok()
-        );
+        assert!(store
+            .update_status(&TaskId::new("t-1"), TaskStatus::Running)
+            .is_ok());
         assert_eq!(
             store.get_task(&TaskId::new("t-1")).unwrap().status,
             TaskStatus::Running
         );
 
         // Running -> Completed
-        assert!(
-            store
-                .update_status(&TaskId::new("t-1"), TaskStatus::Completed)
-                .is_ok()
-        );
+        assert!(store
+            .update_status(&TaskId::new("t-1"), TaskStatus::Completed)
+            .is_ok());
         assert_eq!(
             store.get_task(&TaskId::new("t-1")).unwrap().status,
             TaskStatus::Completed
@@ -1787,11 +1996,9 @@ mod tests {
         assert_eq!(projection.aggregate_status, TaskStatus::Running);
 
         // Nonexistent root returns None
-        assert!(
-            store
-                .build_projection(&TaskId::new("nonexistent"))
-                .is_none()
-        );
+        assert!(store
+            .build_projection(&TaskId::new("nonexistent"))
+            .is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -2071,7 +2278,13 @@ mod tests {
         store.insert_task(task);
 
         let worker_id = WorkerId::new("worker-1");
-        let lease = store.grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker_id, "executor", 60_000);
+        let lease = store.grant_lease(
+            &TaskId::new("t-1"),
+            &TaskId::new("t-1"),
+            &worker_id,
+            "executor",
+            60_000,
+        );
         assert!(lease.is_some());
 
         let lease = lease.unwrap();
@@ -2101,12 +2314,24 @@ mod tests {
         store.insert_task(task);
 
         let worker_id = WorkerId::new("worker-1");
-        let first = store.grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker_id, "executor", 60_000);
+        let first = store.grant_lease(
+            &TaskId::new("t-1"),
+            &TaskId::new("t-1"),
+            &worker_id,
+            "executor",
+            60_000,
+        );
         assert!(first.is_some());
 
         // Second grant should fail
         let worker_id2 = WorkerId::new("worker-2");
-        let second = store.grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker_id2, "executor", 60_000);
+        let second = store.grant_lease(
+            &TaskId::new("t-1"),
+            &TaskId::new("t-1"),
+            &worker_id2,
+            "executor",
+            60_000,
+        );
         assert!(second.is_none());
     }
 
@@ -2129,7 +2354,13 @@ mod tests {
 
         let worker_id = WorkerId::new("worker-1");
         let lease = store
-            .grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker_id, "executor", 60_000)
+            .grant_lease(
+                &TaskId::new("t-1"),
+                &TaskId::new("t-1"),
+                &worker_id,
+                "executor",
+                60_000,
+            )
             .unwrap();
 
         let result = store.complete_lease(&TaskId::new("t-1"), &lease.lease_id);
@@ -2143,7 +2374,13 @@ mod tests {
         assert!(!result2);
 
         // After completing, a new lease can be granted
-        let new_lease = store.grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker_id, "executor", 60_000);
+        let new_lease = store.grant_lease(
+            &TaskId::new("t-1"),
+            &TaskId::new("t-1"),
+            &worker_id,
+            "executor",
+            60_000,
+        );
         assert!(new_lease.is_some());
     }
 
@@ -2166,7 +2403,13 @@ mod tests {
 
         let worker_id = WorkerId::new("worker-1");
         let lease = store
-            .grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker_id, "executor", 60_000)
+            .grant_lease(
+                &TaskId::new("t-1"),
+                &TaskId::new("t-1"),
+                &worker_id,
+                "executor",
+                60_000,
+            )
             .unwrap();
 
         let result = store.revoke_lease(&TaskId::new("t-1"), &lease.lease_id);
@@ -2180,7 +2423,13 @@ mod tests {
         assert!(!result2);
 
         // A new lease can be granted after revocation
-        let new_lease = store.grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker_id, "executor", 60_000);
+        let new_lease = store.grant_lease(
+            &TaskId::new("t-1"),
+            &TaskId::new("t-1"),
+            &worker_id,
+            "executor",
+            60_000,
+        );
         assert!(new_lease.is_some());
     }
 
@@ -2203,7 +2452,13 @@ mod tests {
 
         let worker_id = WorkerId::new("worker-1");
         let lease = store
-            .grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker_id, "executor", 60_000)
+            .grant_lease(
+                &TaskId::new("t-1"),
+                &TaskId::new("t-1"),
+                &worker_id,
+                "executor",
+                60_000,
+            )
             .unwrap();
         let original_heartbeat = lease.heartbeat_at;
 
@@ -2264,7 +2519,13 @@ mod tests {
 
         // Insert a lease that is NOT expired (far future)
         let worker_id = WorkerId::new("worker-2");
-        let _valid = store.grant_lease(&TaskId::new("t-2"), &TaskId::new("t-2"), &worker_id, "executor", 600_000);
+        let _valid = store.grant_lease(
+            &TaskId::new("t-2"),
+            &TaskId::new("t-2"),
+            &worker_id,
+            "executor",
+            600_000,
+        );
 
         let expired = store.collect_expired_leases(&TaskId::new("t-1"));
         assert_eq!(expired.len(), 1);
@@ -2311,19 +2572,35 @@ mod tests {
         let worker2 = WorkerId::new("worker-2");
 
         // Worker 1 gets two leases
-        store.grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker1, "executor", 60_000);
-        store.grant_lease(&TaskId::new("t-2"), &TaskId::new("t-2"), &worker1, "validator", 60_000);
+        store.grant_lease(
+            &TaskId::new("t-1"),
+            &TaskId::new("t-1"),
+            &worker1,
+            "executor",
+            60_000,
+        );
+        store.grant_lease(
+            &TaskId::new("t-2"),
+            &TaskId::new("t-2"),
+            &worker1,
+            "validator",
+            60_000,
+        );
 
         // Worker 2 gets one lease
-        store.grant_lease(&TaskId::new("t-3"), &TaskId::new("t-3"), &worker2, "executor", 60_000);
+        store.grant_lease(
+            &TaskId::new("t-3"),
+            &TaskId::new("t-3"),
+            &worker2,
+            "executor",
+            60_000,
+        );
 
         let w1_leases = store.get_leases_by_worker(&worker1);
         assert_eq!(w1_leases.len(), 2);
-        assert!(
-            w1_leases
-                .iter()
-                .all(|l| l.worker_id.to_string() == "worker-1")
-        );
+        assert!(w1_leases
+            .iter()
+            .all(|l| l.worker_id.to_string() == "worker-1"));
 
         let w2_leases = store.get_leases_by_worker(&worker2);
         assert_eq!(w2_leases.len(), 1);
@@ -2382,7 +2659,13 @@ mod tests {
         // Grant a lease
         let worker_id = WorkerId::new("worker-1");
         let lease = store
-            .grant_lease(&TaskId::new("act-2"), &TaskId::new("obj-1"), &worker_id, "executor", 60_000)
+            .grant_lease(
+                &TaskId::new("act-2"),
+                &TaskId::new("obj-1"),
+                &worker_id,
+                "executor",
+                60_000,
+            )
             .unwrap();
 
         // Checkpoint
@@ -2456,7 +2739,13 @@ mod tests {
         store.insert_task(act);
 
         let worker_id = WorkerId::new("worker-1");
-        store.grant_lease(&TaskId::new("act-1"), &TaskId::new("act-1"), &worker_id, "executor", 60_000);
+        store.grant_lease(
+            &TaskId::new("act-1"),
+            &TaskId::new("act-1"),
+            &worker_id,
+            "executor",
+            60_000,
+        );
 
         // Write checkpoint
         store
@@ -2613,11 +2902,9 @@ mod tests {
         store.insert_task(task);
 
         // Draft -> Ready: valid
-        assert!(
-            store
-                .update_status_checked(&TaskId::new("t-1"), TaskStatus::Ready)
-                .is_ok()
-        );
+        assert!(store
+            .update_status_checked(&TaskId::new("t-1"), TaskStatus::Ready)
+            .is_ok());
         assert_eq!(
             store.get_task(&TaskId::new("t-1")).unwrap().status,
             TaskStatus::Ready
@@ -2813,8 +3100,8 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_volatile_runtime_after_restore_blocks_snapshot_tracked_branch_without_active_lease()
-     {
+    fn reconcile_volatile_runtime_after_restore_blocks_snapshot_tracked_branch_without_active_lease(
+    ) {
         let store = TaskStore::new();
 
         let root = make_task(
@@ -3204,7 +3491,14 @@ mod tests {
     fn build_projection_execution_mode_and_runner_status() {
         let store = TaskStore::new();
 
-        let mut root = make_task("root-1", "m-1", "root-1", None, TaskKind::Objective, TaskStatus::Running);
+        let mut root = make_task(
+            "root-1",
+            "m-1",
+            "root-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
         root.policy_snapshot = Some(TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
             approval_mode: "DecisionOnly".to_string(),
@@ -3224,11 +3518,24 @@ mod tests {
         store.insert_task(root);
 
         let projection = store.build_projection(&TaskId::new("root-1")).unwrap();
-        assert_eq!(projection.execution_mode, "deep", "background_allowed=true 时应为 deep");
-        assert_eq!(projection.runner_status, "running", "有 Running 任务时应为 running");
+        assert_eq!(
+            projection.execution_mode, "deep",
+            "background_allowed=true 时应为 deep"
+        );
+        assert_eq!(
+            projection.runner_status, "running",
+            "有 Running 任务时应为 running"
+        );
 
         // 改为普通模式
-        let mut root2 = make_task("root-2", "m-1", "root-2", None, TaskKind::Objective, TaskStatus::Blocked);
+        let mut root2 = make_task(
+            "root-2",
+            "m-1",
+            "root-2",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Blocked,
+        );
         root2.policy_snapshot = Some(TaskPolicy {
             autonomy_level: "Assisted".to_string(),
             approval_mode: "Interactive".to_string(),
@@ -3248,8 +3555,14 @@ mod tests {
         store.insert_task(root2);
 
         let projection2 = store.build_projection(&TaskId::new("root-2")).unwrap();
-        assert_eq!(projection2.execution_mode, "normal", "background_allowed=false 时应为 normal");
-        assert_eq!(projection2.runner_status, "blocked", "Blocked 状态时应为 blocked");
+        assert_eq!(
+            projection2.execution_mode, "normal",
+            "background_allowed=false 时应为 normal"
+        );
+        assert_eq!(
+            projection2.runner_status, "blocked",
+            "Blocked 状态时应为 blocked"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3260,7 +3573,14 @@ mod tests {
     fn build_delivery_package_aggregates_correctly() {
         let store = TaskStore::new();
 
-        let mut root = make_task("root-1", "m-1", "root-1", None, TaskKind::Objective, TaskStatus::Running);
+        let mut root = make_task(
+            "root-1",
+            "m-1",
+            "root-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
         root.goal = "实现用户登录功能".to_string();
         root.workspace_scope = Some("src/auth".to_string());
         root.policy_snapshot = Some(TaskPolicy {
@@ -3281,17 +3601,38 @@ mod tests {
         });
         store.insert_task(root);
 
-        let mut action = make_task("act-1", "m-1", "root-1", Some("root-1"), TaskKind::Action, TaskStatus::Completed);
+        let mut action = make_task(
+            "act-1",
+            "m-1",
+            "root-1",
+            Some("root-1"),
+            TaskKind::Action,
+            TaskStatus::Completed,
+        );
         action.output_refs = vec!["src/auth/login.rs".to_string()];
         action.evidence_refs = vec!["test://login-passed".to_string()];
         store.insert_task(action);
 
-        let mut validation = make_task("val-1", "m-1", "root-1", Some("root-1"), TaskKind::Validation, TaskStatus::Completed);
+        let mut validation = make_task(
+            "val-1",
+            "m-1",
+            "root-1",
+            Some("root-1"),
+            TaskKind::Validation,
+            TaskStatus::Completed,
+        );
         validation.title = "验证登录模块".to_string();
         validation.evidence_refs = vec!["test://login-validation-passed".to_string()];
         store.insert_task(validation);
 
-        let mut decision = make_task("dec-1", "m-1", "root-1", Some("root-1"), TaskKind::Decision, TaskStatus::Completed);
+        let mut decision = make_task(
+            "dec-1",
+            "m-1",
+            "root-1",
+            Some("root-1"),
+            TaskKind::Decision,
+            TaskStatus::Completed,
+        );
         decision.decision_payload = Some(magi_core::DecisionTaskPayload {
             decision_context: "是否引入第三方库".to_string(),
             blocked_reason: "需要确认依赖方案".to_string(),
@@ -3309,32 +3650,53 @@ mod tests {
         decision.output_refs = vec!["use-oauth".to_string()];
         store.insert_task(decision);
 
-        let package = store.build_delivery_package(&TaskId::new("root-1")).unwrap();
+        let package = store
+            .build_delivery_package(&TaskId::new("root-1"))
+            .unwrap();
         let pkg = package.as_object().unwrap();
 
-        assert_eq!(pkg.get("goal").and_then(|v| v.as_str()), Some("实现用户登录功能"));
+        assert_eq!(
+            pkg.get("goal").and_then(|v| v.as_str()),
+            Some("实现用户登录功能")
+        );
         assert_eq!(pkg.get("scope").and_then(|v| v.as_str()), Some("src/auth"));
-        assert_eq!(pkg.get("execution_mode").and_then(|v| v.as_str()), Some("deep"));
-        assert_eq!(pkg.get("aggregate_status").and_then(|v| v.as_str()), Some("Running"));
+        assert_eq!(
+            pkg.get("execution_mode").and_then(|v| v.as_str()),
+            Some("deep")
+        );
+        assert_eq!(
+            pkg.get("aggregate_status").and_then(|v| v.as_str()),
+            Some("Running")
+        );
 
         let file_changes = pkg.get("file_changes").unwrap().as_array().unwrap();
-        assert!(file_changes.iter().any(|v| v.as_str() == Some("src/auth/login.rs")));
+        assert!(file_changes
+            .iter()
+            .any(|v| v.as_str() == Some("src/auth/login.rs")));
 
         let evidence_list = pkg.get("evidence_list").unwrap().as_array().unwrap();
-        assert!(evidence_list.iter().any(|v| v.as_str() == Some("test://login-passed")));
-        assert!(evidence_list.iter().any(|v| v.as_str() == Some("test://login-validation-passed")));
+        assert!(evidence_list
+            .iter()
+            .any(|v| v.as_str() == Some("test://login-passed")));
+        assert!(evidence_list
+            .iter()
+            .any(|v| v.as_str() == Some("test://login-validation-passed")));
 
         let validation_results = pkg.get("validation_results").unwrap().as_array().unwrap();
         assert_eq!(validation_results.len(), 1);
         assert_eq!(
-            validation_results[0].get("task_id").and_then(|v| v.as_str()),
+            validation_results[0]
+                .get("task_id")
+                .and_then(|v| v.as_str()),
             Some("val-1")
         );
 
         let key_decisions = pkg.get("key_decisions").unwrap().as_array().unwrap();
         assert_eq!(key_decisions.len(), 1);
         assert_eq!(
-            key_decisions[0].get("chosen_option").and_then(|v| v.as_str()),
+            key_decisions[0]
+                .get("chosen_option")
+                .and_then(|v| v.as_str()),
             Some("use-oauth")
         );
 
