@@ -7,8 +7,12 @@
     getQueuedMessages,
     messagesState,
   } from '../stores/messages.svelte';
+  import { getTaskGraphState } from '../stores/task-graph-store.svelte';
   import type { StandardMessage } from '../shared/protocol/message-protocol';
   import { MessageCategory } from '../shared/protocol/message-protocol';
+  import type { SessionIntakeResponseDto } from '../shared/rust-backend-types';
+  import { RustDaemonClient } from '../shared/rust-daemon-client';
+  import { resolveAgentBaseUrl } from '../web/agent-api';
   import Icon from './Icon.svelte';
   import { generateId, ensureArray } from '../lib/utils';
   import { i18n } from '../stores/i18n.svelte';
@@ -67,6 +71,21 @@
   const MAX_IMAGES = 5;  // 最多支持 5 张图片
   const MAX_IMAGE_SIZE = 10 * 1024 * 1024;  // 单张图片最大 10MB
 
+  // Intake 路由状态
+  let intakeLoading = $state(false);
+
+  const currentSessionId = $derived(messagesState.currentSessionId);
+  const taskGraph = $derived(getTaskGraphState(currentSessionId));
+
+  // 深度模式任务图运行中：将用户输入路由到 Intake API
+  const shouldUseIntake = $derived.by(() => {
+    const projection = taskGraph.projection;
+    if (!projection || projection.execution_mode !== 'deep') return false;
+    if (!taskGraph.rootTaskId) return false;
+    const status = projection.runner_status;
+    return status === 'running' || status === 'blocked';
+  });
+
   // 发送/停止态只认 store 内已经收敛好的处理状态，避免历史工具卡片把空闲会话抬回执行态。
   const isSending = $derived(
     messagesState.isProcessing
@@ -86,7 +105,7 @@
     return i18n.t('input.send');
   });
   const sendDisabled = $derived.by(() => (
-    isInteractionBlocking
+    isInteractionBlocking || intakeLoading
   ));
   // 按钮双态状态 - 使用 $derived 计算
   const hasContent = $derived.by(() => {
@@ -110,12 +129,12 @@
 
   // 发送消息（支持图片附件）
   // 运行中再次发送不会打断当前轮，而是按当前 session 的队列/引导模式串行提交。
-  function sendMessage() {
+  async function sendMessage() {
     const rawContent = inputValue;
     const normalizedContent = rawContent.trim();
     // 允许只发送图片（无文字）或只发送文字，或只发送已选技能
     if ((!normalizedContent && !selectedSkill && selectedImages.length === 0) || isInteractionBlocking) return;
-    if (isSending && selectedImages.length > 0) {
+    if ((isSending || shouldUseIntake) && selectedImages.length > 0) {
       addToast('warning', i18n.t('input.noImageDuringExecution'));
       return;
     }
@@ -138,6 +157,12 @@
       return;
     }
 
+    // 深度模式任务图运行中：路由到 Intake API
+    if (shouldUseIntake && submissionText) {
+      await sendIntake(submissionText);
+      return;
+    }
+
     const requestId = generateId();
     vscode.postMessage({
       type: 'executeTask',
@@ -152,6 +177,57 @@
       })),
     });
     clearComposerState();
+  }
+
+  async function sendIntake(message: string) {
+    if (intakeLoading) return;
+    intakeLoading = true;
+    try {
+      const client = new RustDaemonClient(resolveAgentBaseUrl());
+      const response = await client.postIntake({
+        sessionId: messagesState.currentSessionId,
+        message,
+      });
+      handleIntakeResponse(response);
+      clearComposerState();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast('error', `Intake 失败: ${msg}`);
+    } finally {
+      intakeLoading = false;
+    }
+  }
+
+  function handleIntakeResponse(response: SessionIntakeResponseDto) {
+    switch (response.classification) {
+      case 'decision_answer':
+        if (response.resolved) {
+          addToast('success', `已确认选择: ${response.chosenOption}`);
+        } else {
+          addToast('warning', response.reason || '没有待处理的决策任务');
+        }
+        break;
+      case 'pause':
+        addToast('info', '任务已暂停');
+        break;
+      case 'replan':
+        addToast('info', `已触发重规划，取消 ${response.cancelledTaskIds?.length ?? 0} 个任务`);
+        break;
+      case 'supplement_context':
+        addToast('success', '补充上下文已接收');
+        break;
+      case 'append_task':
+        addToast('success', '已追加新任务');
+        break;
+      case 'new_objective':
+        addToast('info', response.note || '新目标请通过新 session 提交');
+        break;
+      case 'general_chat':
+        addToast('info', response.note || '普通聊天消息暂不写入任务图');
+        break;
+      default:
+        addToast('info', '输入已处理');
+    }
   }
 
   function insertNewlineAtCursor() {
