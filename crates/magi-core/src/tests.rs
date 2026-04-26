@@ -171,6 +171,7 @@ fn assignment_lease_serialization_roundtrip() {
     let lease = AssignmentLease {
         lease_id: LeaseId::new("lease-1"),
         task_id: TaskId::new("task-1"),
+        root_task_id: TaskId::new("task-1"),
         worker_id: WorkerId::new("worker-1"),
         role: "executor".to_string(),
         granted_at: UtcMillis(1000),
@@ -191,6 +192,7 @@ fn decision_option_and_payload_serialization() {
     let payload = DecisionTaskPayload {
         decision_context: "需要选择实现方案".to_string(),
         blocked_reason: "存在多个可行方案".to_string(),
+        target_task_id: Some(TaskId::new("target-1")),
         options: vec![
             DecisionOption {
                 option_id: "opt-1".to_string(),

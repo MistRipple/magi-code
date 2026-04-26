@@ -53,6 +53,20 @@ pub struct ExecutorBinding {
 }
 
 // ---------------------------------------------------------------------------
+// PolicyDispatchDecision
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PolicyDispatchDecision {
+    /// 允许派发。
+    Allow,
+    /// 拒绝派发，附带原因。
+    Reject(String),
+    /// 需要审批，创建 Decision Task。
+    NeedsApproval(String),
+}
+
+// ---------------------------------------------------------------------------
 // TaskPolicy
 // ---------------------------------------------------------------------------
 
@@ -115,6 +129,7 @@ pub struct Task {
 pub struct AssignmentLease {
     pub lease_id: LeaseId,
     pub task_id: TaskId,
+    pub root_task_id: TaskId,
     pub worker_id: WorkerId,
     pub role: String,
     pub granted_at: UtcMillis,
@@ -139,6 +154,7 @@ pub enum LeaseStatus {
 pub struct DecisionTaskPayload {
     pub decision_context: String,
     pub blocked_reason: String,
+    pub target_task_id: Option<TaskId>,
     pub options: Vec<DecisionOption>,
     pub risk_notes: Vec<String>,
     pub recommended_option: Option<String>,
@@ -165,10 +181,13 @@ pub struct TaskProjection {
     pub running_tasks: Vec<TaskId>,
     pub blocked_tasks: Vec<TaskId>,
     pub pending_decisions: Vec<TaskId>,
+    pub workpackage_summaries: Vec<WorkPackageSummary>,
     pub validation_summary: Option<String>,
     pub progress_summary: ProgressSummary,
     pub aggregate_status: TaskStatus,
     pub display_status: String,
+    pub execution_mode: String,
+    pub runner_status: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -178,4 +197,15 @@ pub struct ProgressSummary {
     pub failed_tasks: u32,
     pub running_tasks: u32,
     pub blocked_tasks: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkPackageSummary {
+    pub task_id: String,
+    pub title: String,
+    pub aggregate_status: TaskStatus,
+    pub display_status: String,
+    pub progress_ratio: f32,
+    pub recent_evidence: Vec<String>,
+    pub recent_issues: Vec<String>,
 }
