@@ -10,7 +10,7 @@ use crate::{
         McpManagerDescribeServerResponse, McpManagerListServersResponse,
         McpManagerServerHealthUpdateRequest, McpManagerServerOperationResponse,
         McpManagerServerRegistrationRequest, McpManagerServerSelectionRequest, McpToolCallRequest,
-        ModelBridgeClient, ModelInvocationRequest, SharedBridgeTransport,
+        ModelBridgeClient, ModelInvocationRequest, ModelStreamingDelta, SharedBridgeTransport,
     },
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -240,6 +240,21 @@ impl ModelBridgeClient for JsonRpcModelBridgeClient {
             })
             .map_err(transport_call_failed)?;
         decode_bridge_response(response.payload)
+    }
+
+    /// JsonRpc 子进程桥不支持真流式增量,仅用于桥探测/冒烟。
+    /// 调用方若需流式输出必须改用 `HttpModelBridgeClient`。
+    fn invoke_streaming(
+        &self,
+        _request: ModelInvocationRequest,
+        _on_delta: &dyn Fn(&ModelStreamingDelta),
+    ) -> Result<BridgeResponse, BridgeClientError> {
+        Err(BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Protocol,
+            code: None,
+            message: "JsonRpcModelBridgeClient 不支持流式调用,仅用于桥探测;请改用 HttpModelBridgeClient"
+                .to_string(),
+        })
     }
 }
 

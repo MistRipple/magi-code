@@ -4,6 +4,7 @@ use super::{
     SharedContextQuery,
 };
 use magi_core::UtcMillis;
+use magi_session_store::timeline_entry_visible_text;
 use std::collections::HashSet;
 
 pub(super) struct RuntimeAssemblySources {
@@ -90,10 +91,12 @@ fn resolve_recent_turns(
             .into_iter()
             .rev()
             .take(session_limit)
-            .map(|entry| RecentTurnRecord {
-                source: RecentTurnSource::Session,
-                content: entry.message,
-                updated_at: entry.occurred_at,
+            .filter_map(|entry| {
+                timeline_entry_visible_text(&entry.message).map(|content| RecentTurnRecord {
+                    source: RecentTurnSource::Session,
+                    content,
+                    updated_at: entry.occurred_at,
+                })
             })
             .collect::<Vec<_>>();
         merged.extend(session_turns);

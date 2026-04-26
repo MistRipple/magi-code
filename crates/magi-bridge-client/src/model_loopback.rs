@@ -1670,7 +1670,7 @@ mod tests {
         let data = error.data().expect("error data should exist");
         assert_eq!(
             data["reason"],
-            "no bridgeable choices in response: choices[0]: missing message.content/text or message.tool_calls; choices[1]: missing message.content/text or message.tool_calls"
+            "no bridgeable choices in response: choices[0]: missing message.content/text, message.reasoning_content or message.tool_calls; choices[1]: missing message.content/text, message.reasoning_content or message.tool_calls"
         );
     }
 

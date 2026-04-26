@@ -476,6 +476,15 @@ mod tests {
                 payload: format!("model:{}", request.prompt),
             })
         }
+
+        fn invoke_streaming(
+            &self,
+            request: magi_bridge_client::ModelInvocationRequest,
+            _on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
+        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        {
+            self.invoke(request)
+        }
     }
 
     #[derive(Clone, Debug, Default)]
@@ -492,6 +501,15 @@ mod tests {
                 code: None,
                 message: "remote denied".to_string(),
             })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: magi_bridge_client::ModelInvocationRequest,
+            _on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
+        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        {
+            self.invoke(request)
         }
     }
 

@@ -516,6 +516,7 @@ mod tests {
                     deduplicate: true,
                 },
                 knowledge_query: KnowledgeQuery {
+                    workspace_id: None,
                     kind: None,
                     text: None,
                     tags: vec![],
@@ -567,6 +568,7 @@ mod tests {
             ContextAssemblyInput {
                 recent_turns: vec!["manual turn".to_string()],
                 knowledge_query: KnowledgeQuery {
+                    workspace_id: None,
                     kind: None,
                     text: None,
                     tags: vec![],
@@ -603,6 +605,7 @@ mod tests {
         let knowledge_store = KnowledgeStore::new();
         for i in 1..=4 {
             knowledge_store.upsert(magi_knowledge_store::KnowledgeRecord {
+            workspace_id: None,
                 knowledge_id: format!("kb-{i}"),
                 kind: magi_knowledge_store::KnowledgeKind::Faq,
                 title: format!("Knowledge item {i}"),
@@ -724,6 +727,7 @@ mod tests {
                     deduplicate: false,
                 },
                 knowledge_query: KnowledgeQuery {
+                    workspace_id: None,
                     kind: None,
                     text: Some("topic".to_string()),
                     tags: vec!["rust".to_string()],
@@ -855,6 +859,7 @@ mod tests {
 
         let knowledge_store = KnowledgeStore::new();
         knowledge_store.upsert(magi_knowledge_store::KnowledgeRecord {
+            workspace_id: None,
             knowledge_id: "kb-parser-diagnostics".to_string(),
             kind: magi_knowledge_store::KnowledgeKind::Adr,
             title: "Parser diagnostics cutover notes".to_string(),
@@ -1011,6 +1016,7 @@ mod tests {
         let long_content = "a]".repeat(60); // 120 chars, will be truncated to 96 + "…"
 
         knowledge_store.upsert(magi_knowledge_store::KnowledgeRecord {
+            workspace_id: None,
             knowledge_id: "kb-adr-1".to_string(),
             kind: magi_knowledge_store::KnowledgeKind::Adr,
             title: "Architecture decision about caching".to_string(),
@@ -1020,6 +1026,7 @@ mod tests {
             updated_at: UtcMillis(100),
         });
         knowledge_store.upsert(magi_knowledge_store::KnowledgeRecord {
+            workspace_id: None,
             knowledge_id: "kb-faq-1".to_string(),
             kind: magi_knowledge_store::KnowledgeKind::Faq,
             title: "FAQ about caching strategies".to_string(),
@@ -1029,6 +1036,7 @@ mod tests {
             updated_at: UtcMillis(200),
         });
         knowledge_store.upsert(magi_knowledge_store::KnowledgeRecord {
+            workspace_id: None,
             knowledge_id: "kb-learning-1".to_string(),
             kind: magi_knowledge_store::KnowledgeKind::Learning,
             title: "Unrelated learning".to_string(),
@@ -1051,6 +1059,7 @@ mod tests {
             ContextAssemblyInput {
                 recent_turns: vec![],
                 knowledge_query: KnowledgeQuery {
+                    workspace_id: None,
                     kind: None,
                     text: Some("caching".to_string()),
                     tags: vec![],
@@ -1157,6 +1166,7 @@ mod tests {
             ContextAssemblyInput {
                 recent_turns: vec![],
                 knowledge_query: KnowledgeQuery {
+                    workspace_id: None,
                     kind: Some(magi_knowledge_store::KnowledgeKind::CodeIndex),
                     text: Some("parse_manifest allowed".to_string()),
                     tags: vec!["parser".to_string()],
@@ -1284,6 +1294,7 @@ mod tests {
             ContextAssemblyInput {
                 recent_turns: vec![],
                 knowledge_query: KnowledgeQuery {
+                    workspace_id: None,
                     kind: None,
                     text: None,
                     tags: vec![],
@@ -1365,6 +1376,7 @@ mod tests {
             ContextAssemblyInput {
                 recent_turns: vec![],
                 knowledge_query: KnowledgeQuery {
+                    workspace_id: None,
                     kind: None,
                     text: None,
                     tags: vec![],
@@ -1486,6 +1498,7 @@ mod tests {
                     deduplicate: true,
                 },
                 knowledge_query: KnowledgeQuery {
+                    workspace_id: None,
                     kind: None,
                     text: None,
                     tags: vec![],
@@ -1644,6 +1657,7 @@ mod tests {
                     deduplicate: false,
                 },
                 knowledge_query: KnowledgeQuery {
+                    workspace_id: None,
                     kind: None,
                     text: None,
                     tags: vec![],
@@ -1697,6 +1711,7 @@ mod tests {
         let session_id = SessionId::new("session-1");
         let knowledge_store = KnowledgeStore::new();
         knowledge_store.upsert(magi_knowledge_store::KnowledgeRecord {
+            workspace_id: None,
             knowledge_id: "kb-1".to_string(),
             kind: magi_knowledge_store::KnowledgeKind::Faq,
             title: "Some knowledge".to_string(),
@@ -1730,6 +1745,7 @@ mod tests {
             ContextAssemblyInput {
                 recent_turns: vec!["a turn".to_string()],
                 knowledge_query: KnowledgeQuery {
+                    workspace_id: None,
                     kind: None,
                     text: None,
                     tags: vec![],

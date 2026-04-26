@@ -575,6 +575,18 @@ impl ToolRegistry {
             })
     }
 
+    /// 根据允许/拒绝列表创建过滤后的工具注册表副本。
+    pub fn filtered_clone(&self, allowed: &[String], denied: &[String]) -> Self {
+        let mut filtered = self.clone();
+        if !allowed.is_empty() {
+            filtered.builtin_tools.retain(|name, _| allowed.contains(name));
+        }
+        if !denied.is_empty() {
+            filtered.builtin_tools.retain(|name, _| !denied.contains(name));
+        }
+        filtered
+    }
+
     pub fn execute(&self, input: ToolExecutionInput) -> ToolExecutionOutput {
         self.execute_with_context(input, ToolExecutionContext::default())
     }

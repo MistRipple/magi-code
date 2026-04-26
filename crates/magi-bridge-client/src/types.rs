@@ -412,15 +412,13 @@ pub trait HostBridgeClient: Send + Sync {
 pub trait ModelBridgeClient: Send + Sync {
     fn invoke(&self, request: ModelInvocationRequest) -> Result<BridgeResponse, BridgeClientError>;
 
-    /// 流式调用 LLM，每次收到内容或 thinking 增量时调用 `on_delta` 回调并传入已累积快照。
-    /// 默认实现回退到非流式 `invoke`。
+    /// 流式调用 LLM,每次收到内容或 thinking 增量时调用 `on_delta` 回调并传入已累积快照。
+    /// 实现方必须显式声明流式行为:真流式实现接收 SSE 增量,非流式实现必须返回错误而非静默降级。
     fn invoke_streaming(
         &self,
         request: ModelInvocationRequest,
-        _on_delta: &dyn Fn(&ModelStreamingDelta),
-    ) -> Result<BridgeResponse, BridgeClientError> {
-        self.invoke(request)
-    }
+        on_delta: &dyn Fn(&ModelStreamingDelta),
+    ) -> Result<BridgeResponse, BridgeClientError>;
 }
 
 pub trait McpBridgeClient: Send + Sync {
