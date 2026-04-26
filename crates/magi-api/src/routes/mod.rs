@@ -367,6 +367,7 @@ mod tests {
         )
         .with_shadow_execution_pipeline(orchestrator, execution_runtime, memory_store)
         .with_model_bridge_client(model_bridge_client.clone())
+        .with_tool_registry(tool_registry_for_dispatcher.clone())
         .with_task_store(Arc::clone(&task_store));
 
         let state_for_task_workers = state.clone();
@@ -2191,6 +2192,11 @@ mod tests {
     async fn session_action_route_skips_extraction_for_blank_text_inputs() {
         let state = test_state_with_shadow_execution_pipeline();
         let app = build_router(state.clone());
+        let initial_execution_group_count = state
+            .runtime_read_model_dto()
+            .details
+            .execution_groups
+            .len();
         state
             .session_store
             .create_session(SessionId::new("session-route-blank"), "blank route session")
@@ -2209,8 +2215,13 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::OK, "unexpected response body: {body:?}");
-        assert!(body["actionTaskId"].is_string());
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "unexpected response body: {body:?}"
+        );
+        assert_eq!(body["error_code"], "INPUT_INVALID");
+        assert_eq!(body["message"], "深度任务必须提供非空 execution_goal");
 
         let extraction_history = state
             .shadow_execution_pipeline()
@@ -2219,19 +2230,12 @@ mod tests {
             .extraction_results_for_session(&SessionId::new("session-route-blank"));
         assert!(extraction_history.is_empty());
 
-        let accepted_at = body["acceptedAt"]
-            .as_u64()
-            .expect("accepted_at should serialize as integer");
-        let mission_id = format!("mission-session-action-{accepted_at}");
         let runtime_read_model = state.runtime_read_model_dto();
-        let mission_entry = runtime_read_model
-            .details
-            .execution_groups
-            .iter()
-            .find(|entry| entry.mission_id == mission_id)
-            .expect("execution group entry should exist");
-        assert_eq!(mission_entry.context_used_memory_count, 0);
-        assert!(mission_entry.context_memory_extraction_refs.is_empty());
+        assert_eq!(
+            runtime_read_model.details.execution_groups.len(),
+            initial_execution_group_count,
+            "拒绝的深度任务不应生成新的执行图"
+        );
     }
 
     #[tokio::test]
@@ -4591,7 +4595,7 @@ mod tests {
                 mission_title: "deep interrupt delayed completion".to_string(),
                 task_title: "执行: deep interrupt delayed completion".to_string(),
                 trimmed_text: Some("deep interrupt delayed completion".to_string()),
-                execution_goal: None,
+                execution_goal: Some("deep interrupt delayed completion".to_string()),
                 deep_task: true,
                 skill_name: None,
                 target_role: None,

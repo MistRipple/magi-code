@@ -954,7 +954,6 @@ pub fn drive_shadow_dispatch_submission(
             state,
             &accepted.root_task_id,
             &accepted.action_task_id,
-            Some(accepted.session_id.clone()),
             "执行 shadow dispatch 失败",
         )?;
         accepted.runner_started = execution.runner_started;
@@ -966,7 +965,6 @@ pub fn drive_shadow_task_graph(
     state: &ApiState,
     root_task_id: &TaskId,
     action_task_id: &TaskId,
-    session_id: Option<SessionId>,
     failure_title: &'static str,
 ) -> Result<ShadowGraphDriveResult, ApiError> {
     // 普通模式使用同步 for 循环，要求 dispatch 同步完成，否则结果来不及被收集。
@@ -1017,15 +1015,10 @@ pub fn drive_shadow_task_graph(
             && action_status != TaskStatus::Failed
             && action_status != TaskStatus::Blocked
         {
-            // 同步窗口内仍未完成，自动启动后台 runner 继续推进，避免任务丢失
-            if let Err(start_err) = manager.start(root_task_id.as_str(), session_id.clone()) {
-                tracing::warn!(
-                    root_task_id = %root_task_id,
-                    action_status = ?action_status,
-                    ?start_err,
-                    "同步驱动未在窗口内完成，尝试启动后台 runner 失败"
-                );
-            }
+            return Err(ApiError::internal_assembly(
+                failure_title,
+                format!("同步任务未在窗口内完成: {:?}", action_status),
+            ));
         }
 
         Ok(ShadowGraphDriveResult {

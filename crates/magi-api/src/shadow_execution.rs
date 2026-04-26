@@ -51,7 +51,16 @@ pub(crate) fn run_shadow_dispatch_submission(
     let session_id = &request.session_id;
     let entry_id = request.entry_id.as_str();
     let trimmed_text = request.trimmed_text.as_deref();
-    let execution_goal = request.execution_goal.as_deref().or(trimmed_text);
+    let execution_goal = request
+        .execution_goal
+        .as_deref()
+        .map(str::trim)
+        .filter(|goal| !goal.is_empty());
+    if request.deep_task && execution_goal.is_none() {
+        return Err(ApiError::InvalidInput(
+            "深度任务必须提供非空 execution_goal".to_string(),
+        ));
+    }
 
     let mission_id = MissionId::new(format!("mission-session-action-{}", accepted_at.0));
     let worker_id = WorkerId::new(format!("worker-session-action-{}", accepted_at.0));
@@ -60,7 +69,7 @@ pub(crate) fn run_shadow_dispatch_submission(
     let act_task_id = TaskId::new(format!("task-act-{}", accepted_at.0));
 
     let now = UtcMillis::now();
-    let task_goal_text = execution_goal.unwrap_or("").to_string();
+    let task_goal_text = execution_goal.or(trimmed_text).unwrap_or("").to_string();
     let objective = make_shadow_task(
         obj_task_id.clone(),
         mission_id.clone(),
@@ -77,11 +86,7 @@ pub(crate) fn run_shadow_dispatch_submission(
     );
     task_store.insert_task(objective);
 
-    // 深度模式但 execution_goal 为空时回退到普通模式（避免无法分解任务图）
-    let effective_deep_task =
-        request.deep_task && execution_goal.map_or(false, |g| !g.trim().is_empty());
-
-    if !effective_deep_task {
+    if !request.deep_task {
         let action = make_shadow_task(
             act_task_id.clone(),
             mission_id.clone(),
@@ -104,7 +109,7 @@ pub(crate) fn run_shadow_dispatch_submission(
         task_store.insert_task(action);
     }
 
-    let deep_graph = if effective_deep_task {
+    let deep_graph = if request.deep_task {
         match build_deep_task_graph(
             state,
             &mission_id,
@@ -114,8 +119,8 @@ pub(crate) fn run_shadow_dispatch_submission(
             request
                 .target_role
                 .as_deref()
-                .or_else(|| Some(infer_dispatch_task_role(request.skill_name.as_deref()))),
-            execution_goal,
+                .unwrap_or_else(|| infer_dispatch_task_role(request.skill_name.as_deref())),
+            execution_goal.expect("deep_task execution_goal 已在建图前校验"),
             &now,
         ) {
             Ok(graph) => Some(graph),
@@ -495,13 +500,17 @@ fn build_deep_task_graph(
     root_task_id: &TaskId,
     primary_action_task_id: &TaskId,
     accepted_at: UtcMillis,
-    target_role: Option<&str>,
-    prompt: Option<&str>,
+    target_role: &str,
+    prompt: &str,
     now: &UtcMillis,
 ) -> Result<DeepTaskGraphBuildResult, ApiError> {
-    let prompt_text = prompt
-        .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| ApiError::internal_assembly("构建深度任务图失败", "prompt 为空"))?;
+    let prompt_text = prompt.trim();
+    if prompt_text.is_empty() {
+        return Err(ApiError::internal_assembly(
+            "构建深度任务图失败",
+            "prompt 为空",
+        ));
+    }
     let plan = decompose_mission(state, Some(prompt_text), now).ok_or_else(|| {
         ApiError::internal_assembly("构建深度任务图失败", "无法生成结构化深度计划")
     })?;
@@ -588,7 +597,7 @@ fn build_deep_task_graph(
                 }
 
                 let action_role = if is_primary_action {
-                    target_role.unwrap_or_else(|| infer_dispatch_task_role(None))
+                    target_role
                 } else {
                     infer_dispatch_task_role(Some(action_plan.goal.as_str()))
                 };
@@ -1191,6 +1200,45 @@ mod tests {
                     && item.content.as_deref() == Some("用户原始任务描述")
                     && !item.thread_visible),
             "turn ordered items 必须保留用户原文，但不能进入响应区渲染"
+        );
+    }
+
+    #[test]
+    fn deep_task_requires_non_empty_execution_goal() {
+        let (state, task_store) = build_test_state();
+        let session_id = SessionId::new("session-deep-empty-goal");
+        state
+            .session_store
+            .create_session(session_id.clone(), "deep empty goal")
+            .expect("session should be creatable");
+
+        let accepted_at = UtcMillis::now();
+        let result = run_shadow_dispatch_submission(
+            &state,
+            &DispatchSubmissionRequest {
+                accepted_at,
+                session_id,
+                workspace_id: None,
+                entry_id: "entry-deep-empty-goal".to_string(),
+                created_session: false,
+                mission_title: "深度任务".to_string(),
+                task_title: "执行: 深度任务".to_string(),
+                trimmed_text: Some("用户原始深度任务".to_string()),
+                execution_goal: Some("   ".to_string()),
+                deep_task: true,
+                skill_name: None,
+                target_role: None,
+            },
+        );
+
+        assert!(
+            matches!(result, Err(ApiError::InvalidInput(message)) if message.contains("execution_goal")),
+            "深度任务空 execution_goal 必须直接拒绝"
+        );
+        let mission_id = MissionId::new(format!("mission-session-action-{}", accepted_at.0));
+        assert!(
+            task_store.get_tasks_by_mission(&mission_id).is_empty(),
+            "拒绝的深度任务不能留下半截任务图"
         );
     }
 

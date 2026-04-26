@@ -1,5 +1,5 @@
-use axum::{Json, Router, extract::State, routing::post};
-use magi_core::{EventId, SessionId, TaskId, UtcMillis};
+use axum::{extract::State, routing::post, Json, Router};
+use magi_core::{EventId, MissionId, SessionId, Task, TaskId, TaskKind, TaskStatus, UtcMillis};
 use magi_event_bus::EventEnvelope;
 use serde::Deserialize;
 use serde_json::json;
@@ -26,7 +26,7 @@ struct IntakeRequest {
 enum IntakeClassification {
     DecisionAnswer,
     Pause,
-    Replin,
+    Replan,
     SupplementContext,
     AppendTask,
     NewObjective,
@@ -60,7 +60,7 @@ fn classify_intake(message: &str) -> IntakeClassification {
         || lower.contains("修改目标")
         || lower.contains("调整")
     {
-        return IntakeClassification::Replin;
+        return IntakeClassification::Replan;
     }
     // 补充上下文
     if lower.contains("补充")
@@ -84,6 +84,60 @@ fn classify_intake(message: &str) -> IntakeClassification {
         return IntakeClassification::NewObjective;
     }
     IntakeClassification::GeneralChat
+}
+
+fn resolve_context_task(
+    store: &magi_orchestrator::task_store::TaskStore,
+    mission_id: &MissionId,
+    root_task: &Task,
+    context_task_id: Option<&str>,
+) -> Result<Task, ApiError> {
+    let Some(raw_context_task_id) = context_task_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(root_task.clone());
+    };
+    let context_task_id = TaskId::new(raw_context_task_id);
+    let context_task = store.get_task(&context_task_id).ok_or_else(|| {
+        ApiError::InvalidInput(format!("上下文任务不存在: {}", raw_context_task_id))
+    })?;
+    if context_task.mission_id != *mission_id {
+        return Err(ApiError::InvalidInput(format!(
+            "任务 {} 不属于当前会话",
+            raw_context_task_id
+        )));
+    }
+    Ok(context_task)
+}
+
+fn is_pending_decision(task: &Task) -> bool {
+    task.kind == TaskKind::Decision && task.status == TaskStatus::AwaitingApproval
+}
+
+fn decision_matches_context(task: &Task, context_task_id: &TaskId) -> bool {
+    task.task_id == *context_task_id
+        || task
+            .parent_task_id
+            .as_ref()
+            .is_some_and(|parent_task_id| parent_task_id == context_task_id)
+        || task
+            .decision_payload
+            .as_ref()
+            .and_then(|payload| payload.target_task_id.as_ref())
+            .is_some_and(|target_task_id| target_task_id == context_task_id)
+}
+
+fn resolve_structural_context_task_id(root_task: &Task, context_task: &Task) -> TaskId {
+    match context_task.kind {
+        TaskKind::Objective | TaskKind::Phase | TaskKind::WorkPackage => {
+            context_task.task_id.clone()
+        }
+        _ => context_task
+            .parent_task_id
+            .clone()
+            .unwrap_or_else(|| root_task.task_id.clone()),
+    }
 }
 
 /// 处理深度模式运行中的用户中途输入（design 8）。
@@ -113,19 +167,26 @@ async fn handle_intake(
         .find(|t| t.parent_task_id.is_none())
         .ok_or_else(|| ApiError::InvalidInput("当前 Mission 没有根任务".to_string()))?;
     let root_task_id = root_task.task_id.clone();
+    let context_task = resolve_context_task(
+        store,
+        &mission_id,
+        &root_task,
+        request.context_task_id.as_deref(),
+    )?;
+    let context_task_id = context_task.task_id.clone();
 
     let classification = classify_intake(&request.message);
 
     match classification {
         IntakeClassification::DecisionAnswer => {
-            // 查找当前 pending 的 Decision task
-            let pending_decision = store
-                .get_tasks_by_mission(&mission_id)
-                .into_iter()
-                .find(|t| {
-                    t.kind == magi_core::TaskKind::Decision
-                        && t.status == magi_core::TaskStatus::AwaitingApproval
-                });
+            let tasks = store.get_tasks_by_mission(&mission_id);
+            let pending_decision = tasks
+                .iter()
+                .find(|task| {
+                    is_pending_decision(task) && decision_matches_context(task, &context_task_id)
+                })
+                .or_else(|| tasks.iter().find(|task| is_pending_decision(task)))
+                .cloned();
             if let Some(decision) = pending_decision {
                 // 简单匹配：取消息中第一个包含的 option_id
                 let chosen = decision
@@ -151,29 +212,37 @@ async fn handle_intake(
                     "resolved": true,
                     "decisionTaskId": decision.task_id.to_string(),
                     "chosenOption": chosen,
+                    "contextTaskId": context_task_id.to_string(),
                 })));
             }
             return Ok(Json(json!({
                 "classification": "decision_answer",
                 "resolved": false,
                 "reason": "没有待处理的 Decision 任务",
+                "contextTaskId": context_task_id.to_string(),
             })));
         }
         IntakeClassification::Pause => {
             let manager = state.runner_manager().ok_or_else(|| {
                 ApiError::internal_assembly("intake pause", "runner_manager 未配置")
             })?;
+            let pause_target_id = if context_task.status == TaskStatus::Running {
+                &context_task_id
+            } else {
+                &root_task_id
+            };
             manager
-                .pause_tree(root_task_id.as_str())
+                .pause_task(pause_target_id.as_str())
                 .map_err(|e| ApiError::internal_assembly("暂停失败", e))?;
             return Ok(Json(json!({
                 "classification": "pause",
                 "paused": true,
                 "rootTaskId": root_task_id.to_string(),
-                "contextTaskId": request.context_task_id,
+                "pausedTaskId": pause_target_id.to_string(),
+                "contextTaskId": context_task_id.to_string(),
             })));
         }
-        IntakeClassification::Replin => {
+        IntakeClassification::Replan => {
             let manager = state.runner_manager().ok_or_else(|| {
                 ApiError::internal_assembly("intake replan", "runner_manager 未配置")
             })?;
@@ -183,44 +252,47 @@ async fn handle_intake(
             return Ok(Json(json!({
                 "classification": "replan",
                 "replan": true,
+                "rootTaskId": root_task_id.to_string(),
+                "targetTaskId": root_task_id.to_string(),
                 "cancelledTaskIds": cancelled.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
-                "contextTaskId": request.context_task_id,
+                "contextTaskId": context_task_id.to_string(),
             })));
         }
         IntakeClassification::SupplementContext => {
-            // 将补充信息写入 root task 的 context_refs
             let context_ref = format!("intake-context-{}", UtcMillis::now().0);
-            let mut root = root_task;
-            root.context_refs.push(context_ref.clone());
-            root.updated_at = UtcMillis::now();
-            store.insert_task(root);
+            store
+                .append_context_ref(&context_task_id, context_ref.clone())
+                .map_err(|e| ApiError::internal_assembly("补充上下文失败", e.to_string()))?;
             return Ok(Json(json!({
                 "classification": "supplement_context",
                 "contextRef": context_ref,
-                "note": "补充上下文已写入 Mission context",
-                "contextTaskId": request.context_task_id,
+                "note": "补充上下文已写入当前任务上下文",
+                "contextTaskId": context_task_id.to_string(),
             })));
         }
         IntakeClassification::AppendTask => {
-            // 在 root 下追加一个新的 Action task（Draft 状态，由 Runner 后续推进）
+            let parent_task_id = resolve_structural_context_task_id(&root_task, &context_task);
+            let parent_task = store
+                .get_task(&parent_task_id)
+                .unwrap_or_else(|| root_task.clone());
             let new_task_id =
-                TaskId::new(format!("{}-intake-{}", root_task_id, UtcMillis::now().0));
+                TaskId::new(format!("{}-intake-{}", parent_task_id, UtcMillis::now().0));
             let new_task = magi_core::Task {
                 task_id: new_task_id.clone(),
                 mission_id: mission_id.clone(),
                 root_task_id: root_task_id.clone(),
-                parent_task_id: Some(root_task_id.clone()),
+                parent_task_id: Some(parent_task_id.clone()),
                 kind: magi_core::TaskKind::Action,
                 title: request.message.clone(),
                 goal: request.message.clone(),
-                status: magi_core::TaskStatus::Draft,
+                status: magi_core::TaskStatus::Ready,
                 dependency_ids: Vec::new(),
                 required_children: Vec::new(),
-                policy_snapshot: root_task.policy_snapshot.clone(),
+                policy_snapshot: parent_task.policy_snapshot.clone(),
                 executor_binding: None,
                 context_refs: Vec::new(),
                 knowledge_refs: Vec::new(),
-                workspace_scope: root_task.workspace_scope.clone(),
+                workspace_scope: parent_task.workspace_scope.clone(),
                 write_scope: None,
                 input_refs: Vec::new(),
                 output_refs: Vec::new(),
@@ -232,9 +304,14 @@ async fn handle_intake(
                 updated_at: UtcMillis::now(),
             };
             store.insert_task(new_task);
+            store
+                .append_required_child(&parent_task_id, &new_task_id)
+                .map_err(|e| ApiError::internal_assembly("追加任务失败", e.to_string()))?;
             return Ok(Json(json!({
                 "classification": "append_task",
                 "addedTaskId": new_task_id.to_string(),
+                "parentTaskId": parent_task_id.to_string(),
+                "contextTaskId": context_task_id.to_string(),
             })));
         }
         IntakeClassification::NewObjective => {
@@ -358,6 +435,40 @@ async fn interrupt_task(
 mod tests {
     use super::*;
 
+    fn make_intake_task(
+        task_id: &str,
+        root_task_id: &str,
+        parent_task_id: Option<&str>,
+        kind: TaskKind,
+    ) -> Task {
+        Task {
+            task_id: TaskId::new(task_id),
+            mission_id: MissionId::new("mission-1"),
+            root_task_id: TaskId::new(root_task_id),
+            parent_task_id: parent_task_id.map(TaskId::new),
+            kind,
+            title: format!("Task {task_id}"),
+            goal: format!("Goal for {task_id}"),
+            status: TaskStatus::Ready,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: UtcMillis::now(),
+            updated_at: UtcMillis::now(),
+        }
+    }
+
     #[test]
     fn classify_intake_decision_answer() {
         assert_eq!(
@@ -396,13 +507,33 @@ mod tests {
 
     #[test]
     fn classify_intake_replan() {
-        assert_eq!(classify_intake("重新规划"), IntakeClassification::Replin);
-        assert_eq!(classify_intake("改一下目标"), IntakeClassification::Replin);
+        assert_eq!(classify_intake("重新规划"), IntakeClassification::Replan);
+        assert_eq!(classify_intake("改一下目标"), IntakeClassification::Replan);
         assert_eq!(
             classify_intake("修改目标方向"),
-            IntakeClassification::Replin
+            IntakeClassification::Replan
         );
-        assert_eq!(classify_intake("调整方案"), IntakeClassification::Replin);
+        assert_eq!(classify_intake("调整方案"), IntakeClassification::Replan);
+    }
+
+    #[test]
+    fn resolve_structural_context_task_id_uses_parent_for_leaf_context() {
+        let root = make_intake_task("obj-1", "obj-1", None, TaskKind::Objective);
+        let phase = make_intake_task("phase-1", "obj-1", Some("obj-1"), TaskKind::Phase);
+        let action = make_intake_task("act-1", "obj-1", Some("phase-1"), TaskKind::Action);
+
+        assert_eq!(
+            resolve_structural_context_task_id(&root, &root),
+            TaskId::new("obj-1")
+        );
+        assert_eq!(
+            resolve_structural_context_task_id(&root, &phase),
+            TaskId::new("phase-1")
+        );
+        assert_eq!(
+            resolve_structural_context_task_id(&root, &action),
+            TaskId::new("phase-1")
+        );
     }
 
     #[test]

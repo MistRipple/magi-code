@@ -773,7 +773,6 @@ fn spawn_continue_session_finalize(
                 &state,
                 &accepted.root_task_id,
                 &accepted.action_task_id,
-                Some(accepted.session_id.clone()),
                 "继续会话执行失败",
             ) {
                 let interrupted = task_store
