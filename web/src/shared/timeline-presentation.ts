@@ -53,11 +53,16 @@ export function collectTimelineAliasIds(
   const toolCallId = normalizeTimelineAliasCandidate(metadata.toolCallId);
   const userMessageId = normalizeTimelineAliasCandidate(metadata.userMessageId);
   const placeholderMessageId = normalizeTimelineAliasCandidate(metadata.placeholderMessageId);
+  const normalizedRole = typeof message.role === 'string' ? message.role.trim().toLowerCase() : '';
+  const normalizedType = typeof message.type === 'string' ? message.type.trim().toLowerCase() : '';
+  const isUserMessage = normalizedRole === 'user' || normalizedType === 'user_input';
+  const isAssistantTextMessage = normalizedRole === 'assistant' && normalizedType === 'text';
+  const isRequestPlaceholder = metadata.isPlaceholder === true || metadata.wasPlaceholder === true;
 
-  if (userMessageId) {
+  if (userMessageId && isUserMessage) {
     addAlias(userMessageId);
   }
-  if (placeholderMessageId) {
+  if (placeholderMessageId && !isUserMessage && (isRequestPlaceholder || isAssistantTextMessage)) {
     addAlias(placeholderMessageId);
   }
 

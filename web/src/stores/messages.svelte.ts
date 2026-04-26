@@ -479,14 +479,7 @@ function collectProjectionKnownMessageIds(
     if (normalized) ids.add(normalized);
   };
   for (const artifact of ensureArray<TimelineProjectionArtifact>(projection?.artifacts)) {
-    add(artifact.artifactId);
-    add(artifact.message?.id);
-    for (const alias of ensureArray<string>(artifact.messageIds)) add(alias);
-    for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
-      add(item.itemId);
-      add(item.message?.id);
-      for (const alias of ensureArray<string>(item.messageIds)) add(alias);
-    }
+    for (const key of collectArtifactIdentityKeys(artifact)) add(key);
   }
   return ids;
 }
@@ -674,7 +667,17 @@ function collectMessageIdentityKeys(message: Message | undefined): Set<string> {
   };
   add(message?.id);
   const metadata = resolveMessageMetadataRecord(message);
-  add(metadata?.requestId);
+  const role = typeof message?.role === 'string' ? message.role.trim().toLowerCase() : '';
+  const type = typeof message?.type === 'string' ? message.type.trim().toLowerCase() : '';
+  const isUserMessage = role === 'user' || type === 'user_input';
+  const isAssistantTextMessage = role === 'assistant' && type === 'text';
+  const isRequestPlaceholder = metadata?.isPlaceholder === true || metadata?.wasPlaceholder === true;
+
+  if (isUserMessage) {
+    add(metadata?.userMessageId);
+  } else if (isRequestPlaceholder || isAssistantTextMessage) {
+    add(metadata?.placeholderMessageId);
+  }
   add(metadata?.rustStreamItemId);
   add(metadata?.rustEventItemId);
   add(metadata?.turnItemId);
@@ -2452,6 +2455,9 @@ function restoreQueuedMessagesForSession(sessionId: string | null | undefined): 
   messagesState.queuedMessages = normalizedSessionId
     ? normalizeQueuedMessageList(sessionQueuedMessagesBySession[normalizedSessionId])
     : [];
+  if (!normalizedSessionId) {
+    sessionQueuedMessagesBySession = {};
+  }
 }
 
 function pruneSessionViewStateByKnownSessions(): void {

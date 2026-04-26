@@ -507,77 +507,6 @@ function hasVisibleUserContent(message: Message): boolean {
   });
 }
 
-function resolveBoundUserAnchorTimestamp(userMessageId: string | undefined): number | null {
-  if (!userMessageId) {
-    return null;
-  }
-  const userMessage = getTimelineMessageById(userMessageId);
-  if (!userMessage) {
-    return null;
-  }
-  const metadata = userMessage.metadata && typeof userMessage.metadata === 'object'
-    ? userMessage.metadata as Record<string, unknown>
-    : undefined;
-  const metadataAnchor = typeof metadata?.timelineAnchorTimestamp === 'number'
-    && Number.isFinite(metadata.timelineAnchorTimestamp)
-    && metadata.timelineAnchorTimestamp > 0
-    ? Math.floor(metadata.timelineAnchorTimestamp)
-    : 0;
-  if (metadataAnchor > 0) {
-    return metadataAnchor;
-  }
-  return typeof userMessage.timestamp === 'number' && Number.isFinite(userMessage.timestamp) && userMessage.timestamp > 0
-    ? Math.floor(userMessage.timestamp)
-    : null;
-}
-
-function bindMessageToUserAnchor(
-  message: Message,
-  userMessageId: string | undefined,
-): Message {
-  const anchorTimestamp = resolveBoundUserAnchorTimestamp(userMessageId);
-  if (!anchorTimestamp) {
-    return message;
-  }
-  // 响应消息必须排在用户消息之后，否则同锚点时会被 stableId 反转到上方。
-  const responseTimestamp = anchorTimestamp + 1;
-  const metadata = message.metadata && typeof message.metadata === 'object'
-    ? message.metadata as Record<string, unknown>
-    : undefined;
-  if (metadata?.timelineAnchorTimestamp === responseTimestamp) {
-    return message;
-  }
-  return {
-    ...message,
-    metadata: {
-      ...(metadata || {}),
-      timelineAnchorTimestamp: responseTimestamp,
-    },
-  };
-}
-
-function shouldPreserveExistingThreadAnchor(message: Message): boolean {
-  const metadata = message.metadata && typeof message.metadata === 'object'
-    ? message.metadata as Record<string, unknown>
-    : undefined;
-  if (!metadata) {
-    return false;
-  }
-  const hasExplicitAnchor = typeof metadata.timelineAnchorTimestamp === 'number'
-    && Number.isFinite(metadata.timelineAnchorTimestamp)
-    && metadata.timelineAnchorTimestamp > 0;
-  if (!hasExplicitAnchor) {
-    return false;
-  }
-  if (typeof metadata.dispatchWaveId === 'string' && metadata.dispatchWaveId.trim()) {
-    return true;
-  }
-  if (typeof metadata.laneId === 'string' && metadata.laneId.trim()) {
-    return true;
-  }
-  return false;
-}
-
 function buildPlaceholderTakeoverMessage(
   baseMessage: Message,
   placeholderMessage: Message | undefined,
@@ -746,13 +675,12 @@ function handleContentMessage(standard: StandardMessage) {
       updateRequestBinding(requestId, { placeholderMessageId: standard.id, userMessageId });
     }
     addPendingRequest(requestId);
-    const anchoredPlaceholder = bindMessageToUserAnchor(uiMessage, userMessageId);
-    if (!getTimelineMessageById(anchoredPlaceholder.id)) {
-      const timelineMessage = upsertTimelineNode(anchoredPlaceholder, visibility);
+    if (!getTimelineMessageById(uiMessage.id)) {
+      const timelineMessage = upsertTimelineNode(uiMessage, visibility);
       applyPendingTimelineUpdatesForAnchor(timelineMessage, [standard.id]);
     }
-    if (anchoredPlaceholder.isStreaming) {
-      markMessageActive(anchoredPlaceholder.id);
+    if (uiMessage.isStreaming) {
+      markMessageActive(uiMessage.id);
     }
     return;
   }
@@ -798,11 +726,7 @@ function handleContentMessage(standard: StandardMessage) {
   const effectiveMessageBase = (requestId && replaceMessageId)
     ? buildPlaceholderTakeoverMessage(uiMessage, placeholderMessage, requestId)
     : uiMessage;
-  const boundUserMessageId = requestBinding?.userMessageId
-    || (typeof meta?.userMessageId === 'string' ? meta.userMessageId : undefined);
-  const effectiveMessage = (requestId && visibility.thread && !shouldPreserveExistingThreadAnchor(effectiveMessageBase))
-    ? bindMessageToUserAnchor(effectiveMessageBase, boundUserMessageId)
-    : effectiveMessageBase;
+  const effectiveMessage = effectiveMessageBase;
 
   if (requestId && canStandardMessageTakeOverRequestPlaceholder(standard) && requestBinding) {
     if (requestBinding.timeoutId) {
@@ -960,13 +884,7 @@ function handleStandardComplete(message: ClientBridgeMessage) {
   const completedMessageBaseWithPlaceholder = (requestId && replaceMessageId)
     ? buildPlaceholderTakeoverMessage(completedMessageBase, placeholderMessage, requestId)
     : completedMessageBase;
-  const boundUserMessageId = requestBinding?.userMessageId
-    || (typeof (standard.metadata as Record<string, unknown> | undefined)?.userMessageId === 'string'
-      ? (standard.metadata as Record<string, unknown>).userMessageId as string
-      : undefined);
-  const completedMessage = (requestId && visibility.thread && !shouldPreserveExistingThreadAnchor(completedMessageBaseWithPlaceholder))
-    ? bindMessageToUserAnchor(completedMessageBaseWithPlaceholder, boundUserMessageId)
-    : completedMessageBaseWithPlaceholder;
+  const completedMessage = completedMessageBaseWithPlaceholder;
 
   if (replaceMessageId) {
     markMessageComplete(replaceMessageId);
