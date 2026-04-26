@@ -548,7 +548,6 @@ function resolveAgentBindingContext(): AgentBindingContext {
   const queryWorkspaceId = currentUrl.searchParams.get('workspaceId')?.trim() || '';
   const queryWorkspacePath = currentUrl.searchParams.get('workspacePath')?.trim() || '';
   const querySessionId = currentUrl.searchParams.get('sessionId')?.trim() || '';
-  const queryHasWorkspaceBinding = Boolean(queryWorkspaceId || queryWorkspacePath);
   return {
     workspaceId: queryWorkspaceId
       || bootstrapWindow.__INITIAL_WORKSPACE_ID__?.trim()
@@ -558,9 +557,7 @@ function resolveAgentBindingContext(): AgentBindingContext {
       || bootstrapWindow.__INITIAL_WORKSPACE_PATH__?.trim()
       || storedBinding.workspacePath
       || '',
-    sessionId: querySessionId
-      || (queryHasWorkspaceBinding ? '' : storedBinding.sessionId)
-      || '',
+    sessionId: querySessionId,
   };
 }
 

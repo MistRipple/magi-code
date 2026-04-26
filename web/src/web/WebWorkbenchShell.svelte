@@ -273,7 +273,6 @@
     persistStoredBrowserWorkspaceBinding({
       workspaceId: normalizedWorkspaceId,
       workspacePath: normalizedWorkspacePath,
-      sessionId: normalizedSessionId,
     });
     nextUrl.searchParams.set('workspaceId', normalizedWorkspaceId);
     nextUrl.searchParams.set('workspacePath', normalizedWorkspacePath);
@@ -305,7 +304,6 @@
     workspacePath: string,
     options: {
       preserveCurrentSession?: boolean;
-      allowStoredSession?: boolean;
     } = {},
   ): string {
     if (typeof window === 'undefined') {
@@ -321,16 +319,6 @@
     }
     if (!querySessionId && (queryWorkspaceId === workspaceId || queryWorkspacePath === workspacePath)) {
       return '';
-    }
-
-    if (options.allowStoredSession !== false) {
-      const storedBinding = readStoredBrowserWorkspaceBinding();
-      const storedWorkspaceId = storedBinding.workspaceId;
-      const storedWorkspacePath = storedBinding.workspacePath;
-      const storedSessionId = storedBinding.sessionId;
-      if (storedSessionId && (storedWorkspaceId === workspaceId || storedWorkspacePath === workspacePath)) {
-        return storedSessionId;
-      }
     }
 
     if (
@@ -629,7 +617,6 @@
             workspace.workspaceId,
             resolveWorkspacePreferredSessionId(workspace.workspaceId, workspace.rootPath, {
               preserveCurrentSession: wasSelected,
-              allowStoredSession: wasSelected,
             }),
           );
           if (resolvedSessionId) {

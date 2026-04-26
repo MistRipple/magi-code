@@ -1222,14 +1222,10 @@ function resolveInjectedWorkspaceBinding(): { workspaceId: string; workspacePath
 function resolveWorkspaceQuery(): { workspaceId: string; workspacePath: string; sessionId: string } {
   const currentUrl = getCurrentUrl();
   const injectedBinding = resolveInjectedWorkspaceBinding();
-  const injectedSessionId = typeof window !== 'undefined'
-    ? (window as unknown as { __INITIAL_SESSION_ID__?: string }).__INITIAL_SESSION_ID__?.trim() || ''
-    : '';
   const storedBinding = readStoredBrowserWorkspaceBinding();
   const queryWorkspaceId = currentUrl?.searchParams.get('workspaceId')?.trim() || '';
   const queryWorkspacePath = currentUrl?.searchParams.get('workspacePath')?.trim() || '';
   const querySessionId = currentUrl?.searchParams.get('sessionId')?.trim() || '';
-  const queryHasWorkspaceBinding = Boolean(queryWorkspaceId || queryWorkspacePath);
   const workspaceId = queryWorkspaceId
     || currentWorkspaceId
     || injectedBinding.workspaceId
@@ -1240,11 +1236,7 @@ function resolveWorkspaceQuery(): { workspaceId: string; workspacePath: string; 
     || injectedBinding.workspacePath
     || storedBinding.workspacePath
     || '';
-  const sessionId = querySessionId
-    || (queryHasWorkspaceBinding ? '' : currentSessionId)
-    || (queryHasWorkspaceBinding ? '' : injectedSessionId)
-    || (queryHasWorkspaceBinding ? '' : storedBinding.sessionId)
-    || '';
+  const sessionId = querySessionId;
   return { workspaceId, workspacePath, sessionId };
 }
 
@@ -1259,19 +1251,13 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
   const normalizedWorkspaceId = workspaceId.trim();
   const normalizedWorkspacePath = workspacePath.trim();
   const incomingSessionId = sessionId.trim();
-  const workspaceChanged = (
-    (normalizedWorkspaceId && normalizedWorkspaceId !== currentWorkspaceId)
-    || (normalizedWorkspacePath && normalizedWorkspacePath !== currentWorkspacePath)
-  );
-  const nextSessionId = incomingSessionId || (workspaceChanged ? '' : currentSessionId);
 
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
-  currentSessionId = nextSessionId;
+  currentSessionId = incomingSessionId;
   persistStoredBrowserWorkspaceBinding({
     workspaceId: normalizedWorkspaceId,
     workspacePath: normalizedWorkspacePath,
-    sessionId: nextSessionId,
   });
 
   const currentUrl = getCurrentUrl();
@@ -1289,8 +1275,8 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
   } else {
     nextUrl.searchParams.delete('workspacePath');
   }
-  if (nextSessionId) {
-    nextUrl.searchParams.set('sessionId', nextSessionId);
+  if (incomingSessionId) {
+    nextUrl.searchParams.set('sessionId', incomingSessionId);
   } else {
     nextUrl.searchParams.delete('sessionId');
   }
@@ -1307,10 +1293,14 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
   currentSessionId = '';
   clearCurrentInterruptTaskId();
   clearTaskGraph();
+  if (queueDrainTimer) {
+    clearTimeout(queueDrainTimer);
+    queueDrainTimer = null;
+  }
+  queueDrainActive = false;
   persistStoredBrowserWorkspaceBinding({
     workspaceId: normalizedWorkspaceId,
     workspacePath: normalizedWorkspacePath,
-    sessionId: '',
   });
 
   const currentUrl = getCurrentUrl();
@@ -1352,7 +1342,6 @@ function clearPersistedWorkspaceBinding(): void {
   persistStoredBrowserWorkspaceBinding({
     workspaceId: '',
     workspacePath: '',
-    sessionId: '',
   });
   const currentUrl = getCurrentUrl();
   if (!currentUrl) {

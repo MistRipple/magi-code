@@ -1,12 +1,11 @@
 export interface BrowserWorkspaceBinding {
   workspaceId: string;
   workspacePath: string;
-  sessionId: string;
 }
 
 export const WORKSPACE_ID_STORAGE_KEY = 'magi-workspace-id';
 export const WORKSPACE_PATH_STORAGE_KEY = 'magi-workspace-path';
-export const SESSION_ID_STORAGE_KEY = 'magi-session-id';
+const SESSION_ID_STORAGE_KEY = 'magi-session-id';
 
 function safeSessionStorageGetItem(key: string): string {
   if (typeof window === 'undefined') {
@@ -46,14 +45,12 @@ export function readStoredBrowserWorkspaceBinding(): BrowserWorkspaceBinding {
   return {
     workspaceId: safeSessionStorageGetItem(WORKSPACE_ID_STORAGE_KEY),
     workspacePath: safeSessionStorageGetItem(WORKSPACE_PATH_STORAGE_KEY),
-    sessionId: safeSessionStorageGetItem(SESSION_ID_STORAGE_KEY),
   };
 }
 
 export function persistStoredBrowserWorkspaceBinding(binding: BrowserWorkspaceBinding): void {
   const workspaceId = binding.workspaceId.trim();
   const workspacePath = binding.workspacePath.trim();
-  const sessionId = binding.sessionId.trim();
 
   if (workspaceId) {
     safeSessionStorageSetItem(WORKSPACE_ID_STORAGE_KEY, workspaceId);
@@ -67,11 +64,7 @@ export function persistStoredBrowserWorkspaceBinding(binding: BrowserWorkspaceBi
     safeSessionStorageRemoveItem(WORKSPACE_PATH_STORAGE_KEY);
   }
 
-  if (sessionId) {
-    safeSessionStorageSetItem(SESSION_ID_STORAGE_KEY, sessionId);
-  } else {
-    safeSessionStorageRemoveItem(SESSION_ID_STORAGE_KEY);
-  }
+  safeSessionStorageRemoveItem(SESSION_ID_STORAGE_KEY);
 }
 
 export function clearStoredBrowserWorkspaceBinding(): void {
