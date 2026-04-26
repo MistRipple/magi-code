@@ -555,9 +555,13 @@ fn append_task_final_turn_item(
     append_session_turn_item(session_store, session_id, final_item.clone());
     publish_session_turn_item_event(event_bus, session_id, workspace_id, &final_item);
     let _ = session_store.update_current_turn_status(session_id, "completed");
-    let timeline_message =
-        build_completed_turn_timeline_snapshot(session_store, session_id, Some(final_content), streaming_entry_id)
-            .unwrap_or_else(|| final_content.to_string());
+    let timeline_message = build_completed_turn_timeline_snapshot(
+        session_store,
+        session_id,
+        Some(final_content),
+        streaming_entry_id,
+    )
+    .unwrap_or_else(|| final_content.to_string());
     let fallback_entry_id = format!("timeline-turn-snapshot-{}", task.task_id);
     let entry_id = streaming_entry_id.unwrap_or(fallback_entry_id.as_str());
     session_store.upsert_timeline_entry(

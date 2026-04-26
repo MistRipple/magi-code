@@ -78,7 +78,8 @@ pub(crate) fn run_shadow_dispatch_submission(
     task_store.insert_task(objective);
 
     // 深度模式但 execution_goal 为空时回退到普通模式（避免无法分解任务图）
-    let effective_deep_task = request.deep_task && execution_goal.map_or(false, |g| !g.trim().is_empty());
+    let effective_deep_task =
+        request.deep_task && execution_goal.map_or(false, |g| !g.trim().is_empty());
 
     if !effective_deep_task {
         let action = make_shadow_task(

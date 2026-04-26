@@ -36,32 +36,44 @@ enum IntakeClassification {
 fn classify_intake(message: &str) -> IntakeClassification {
     let lower = message.trim().to_lowercase();
     // 决策回答
-    if lower.starts_with("选择") || lower.starts_with("选 ") || lower.starts_with("确认")
-        || lower.starts_with("同意") || lower.starts_with("驳回")
-        || lower.starts_with("跳过") || lower.starts_with("取消")
+    if lower.starts_with("选择")
+        || lower.starts_with("选 ")
+        || lower.starts_with("确认")
+        || lower.starts_with("同意")
+        || lower.starts_with("驳回")
+        || lower.starts_with("跳过")
+        || lower.starts_with("取消")
     {
         return IntakeClassification::DecisionAnswer;
     }
     // 暂停
-    if lower.contains("暂停") || lower.contains("停止") || lower.contains("先停")
+    if lower.contains("暂停")
+        || lower.contains("停止")
+        || lower.contains("先停")
         || lower.contains("中断")
     {
         return IntakeClassification::Pause;
     }
     // 重规划
-    if lower.contains("重新规划") || lower.contains("改一下") || lower.contains("修改目标")
+    if lower.contains("重新规划")
+        || lower.contains("改一下")
+        || lower.contains("修改目标")
         || lower.contains("调整")
     {
         return IntakeClassification::Replin;
     }
     // 补充上下文
-    if lower.contains("补充") || lower.contains("上下文") || lower.contains("补充信息")
+    if lower.contains("补充")
+        || lower.contains("上下文")
+        || lower.contains("补充信息")
         || lower.contains("补充说明")
     {
         return IntakeClassification::SupplementContext;
     }
     // 新增任务
-    if lower.contains("顺便") || lower.contains("再加") || lower.contains("追加")
+    if lower.contains("顺便")
+        || lower.contains("再加")
+        || lower.contains("追加")
         || lower.contains("另外")
     {
         return IntakeClassification::AppendTask;
@@ -148,9 +160,9 @@ async fn handle_intake(
             })));
         }
         IntakeClassification::Pause => {
-            let manager = state
-                .runner_manager()
-                .ok_or_else(|| ApiError::internal_assembly("intake pause", "runner_manager 未配置"))?;
+            let manager = state.runner_manager().ok_or_else(|| {
+                ApiError::internal_assembly("intake pause", "runner_manager 未配置")
+            })?;
             manager
                 .pause_tree(root_task_id.as_str())
                 .map_err(|e| ApiError::internal_assembly("暂停失败", e))?;
@@ -162,9 +174,9 @@ async fn handle_intake(
             })));
         }
         IntakeClassification::Replin => {
-            let manager = state
-                .runner_manager()
-                .ok_or_else(|| ApiError::internal_assembly("intake replan", "runner_manager 未配置"))?;
+            let manager = state.runner_manager().ok_or_else(|| {
+                ApiError::internal_assembly("intake replan", "runner_manager 未配置")
+            })?;
             let cancelled = manager
                 .replan(root_task_id.as_str())
                 .map_err(|e| ApiError::internal_assembly("重规划失败", e))?;
@@ -191,7 +203,8 @@ async fn handle_intake(
         }
         IntakeClassification::AppendTask => {
             // 在 root 下追加一个新的 Action task（Draft 状态，由 Runner 后续推进）
-            let new_task_id = TaskId::new(format!("{}-intake-{}", root_task_id, UtcMillis::now().0));
+            let new_task_id =
+                TaskId::new(format!("{}-intake-{}", root_task_id, UtcMillis::now().0));
             let new_task = magi_core::Task {
                 task_id: new_task_id.clone(),
                 mission_id: mission_id.clone(),
@@ -347,12 +360,30 @@ mod tests {
 
     #[test]
     fn classify_intake_decision_answer() {
-        assert_eq!(classify_intake("选择 A"), IntakeClassification::DecisionAnswer);
-        assert_eq!(classify_intake("确认"), IntakeClassification::DecisionAnswer);
-        assert_eq!(classify_intake("同意继续"), IntakeClassification::DecisionAnswer);
-        assert_eq!(classify_intake("驳回方案"), IntakeClassification::DecisionAnswer);
-        assert_eq!(classify_intake("跳过此步骤"), IntakeClassification::DecisionAnswer);
-        assert_eq!(classify_intake("取消操作"), IntakeClassification::DecisionAnswer);
+        assert_eq!(
+            classify_intake("选择 A"),
+            IntakeClassification::DecisionAnswer
+        );
+        assert_eq!(
+            classify_intake("确认"),
+            IntakeClassification::DecisionAnswer
+        );
+        assert_eq!(
+            classify_intake("同意继续"),
+            IntakeClassification::DecisionAnswer
+        );
+        assert_eq!(
+            classify_intake("驳回方案"),
+            IntakeClassification::DecisionAnswer
+        );
+        assert_eq!(
+            classify_intake("跳过此步骤"),
+            IntakeClassification::DecisionAnswer
+        );
+        assert_eq!(
+            classify_intake("取消操作"),
+            IntakeClassification::DecisionAnswer
+        );
     }
 
     #[test]
@@ -367,36 +398,75 @@ mod tests {
     fn classify_intake_replan() {
         assert_eq!(classify_intake("重新规划"), IntakeClassification::Replin);
         assert_eq!(classify_intake("改一下目标"), IntakeClassification::Replin);
-        assert_eq!(classify_intake("修改目标方向"), IntakeClassification::Replin);
+        assert_eq!(
+            classify_intake("修改目标方向"),
+            IntakeClassification::Replin
+        );
         assert_eq!(classify_intake("调整方案"), IntakeClassification::Replin);
     }
 
     #[test]
     fn classify_intake_supplement_context() {
-        assert_eq!(classify_intake("补充上下文"), IntakeClassification::SupplementContext);
-        assert_eq!(classify_intake("补充一些信息"), IntakeClassification::SupplementContext);
-        assert_eq!(classify_intake("这里需要补充说明"), IntakeClassification::SupplementContext);
+        assert_eq!(
+            classify_intake("补充上下文"),
+            IntakeClassification::SupplementContext
+        );
+        assert_eq!(
+            classify_intake("补充一些信息"),
+            IntakeClassification::SupplementContext
+        );
+        assert_eq!(
+            classify_intake("这里需要补充说明"),
+            IntakeClassification::SupplementContext
+        );
     }
 
     #[test]
     fn classify_intake_append_task() {
-        assert_eq!(classify_intake("顺便加个任务"), IntakeClassification::AppendTask);
-        assert_eq!(classify_intake("再加一个功能"), IntakeClassification::AppendTask);
-        assert_eq!(classify_intake("追加需求"), IntakeClassification::AppendTask);
-        assert_eq!(classify_intake("另外还需要"), IntakeClassification::AppendTask);
+        assert_eq!(
+            classify_intake("顺便加个任务"),
+            IntakeClassification::AppendTask
+        );
+        assert_eq!(
+            classify_intake("再加一个功能"),
+            IntakeClassification::AppendTask
+        );
+        assert_eq!(
+            classify_intake("追加需求"),
+            IntakeClassification::AppendTask
+        );
+        assert_eq!(
+            classify_intake("另外还需要"),
+            IntakeClassification::AppendTask
+        );
     }
 
     #[test]
     fn classify_intake_new_objective() {
-        assert_eq!(classify_intake("新任务：优化性能"), IntakeClassification::NewObjective);
-        assert_eq!(classify_intake("换个方向做"), IntakeClassification::NewObjective);
-        assert_eq!(classify_intake("设定新目标"), IntakeClassification::NewObjective);
+        assert_eq!(
+            classify_intake("新任务：优化性能"),
+            IntakeClassification::NewObjective
+        );
+        assert_eq!(
+            classify_intake("换个方向做"),
+            IntakeClassification::NewObjective
+        );
+        assert_eq!(
+            classify_intake("设定新目标"),
+            IntakeClassification::NewObjective
+        );
     }
 
     #[test]
     fn classify_intake_general_chat() {
         assert_eq!(classify_intake("你好"), IntakeClassification::GeneralChat);
-        assert_eq!(classify_intake("今天天气不错"), IntakeClassification::GeneralChat);
-        assert_eq!(classify_intake("帮我看看这个代码"), IntakeClassification::GeneralChat);
+        assert_eq!(
+            classify_intake("今天天气不错"),
+            IntakeClassification::GeneralChat
+        );
+        assert_eq!(
+            classify_intake("帮我看看这个代码"),
+            IntakeClassification::GeneralChat
+        );
     }
 }

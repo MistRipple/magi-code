@@ -292,19 +292,20 @@ impl RunnerManager {
 
                 // Checkpoint policy consumption (design 3.2).
                 if let Some(ref path) = bg_checkpoint_path {
-                    let should_checkpoint = if let Some(root_task) = bg_task_store.get_task(&root_id) {
-                        if let Some(ref policy) = root_task.policy_snapshot {
-                            match policy.checkpoint_mode.as_str() {
-                                "turn" => true,
-                                "task_or_phase" => task_runner.take_checkpoint_signal(),
-                                _ => cycle % CHECKPOINT_INTERVAL_CYCLES == 0,
+                    let should_checkpoint =
+                        if let Some(root_task) = bg_task_store.get_task(&root_id) {
+                            if let Some(ref policy) = root_task.policy_snapshot {
+                                match policy.checkpoint_mode.as_str() {
+                                    "turn" => true,
+                                    "task_or_phase" => task_runner.take_checkpoint_signal(),
+                                    _ => cycle % CHECKPOINT_INTERVAL_CYCLES == 0,
+                                }
+                            } else {
+                                cycle % CHECKPOINT_INTERVAL_CYCLES == 0
                             }
                         } else {
                             cycle % CHECKPOINT_INTERVAL_CYCLES == 0
-                        }
-                    } else {
-                        cycle % CHECKPOINT_INTERVAL_CYCLES == 0
-                    };
+                        };
                     if should_checkpoint {
                         let _ = bg_task_store.checkpoint_to_file(path);
                     }

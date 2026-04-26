@@ -401,9 +401,13 @@ fn append_final_item(
     append_session_turn_item(session_store, session_id, final_item.clone());
     publish_session_turn_item_event(event_bus, session_id, workspace_id, &final_item);
     let _ = session_store.update_current_turn_status(session_id, "completed");
-    let timeline_message =
-        build_completed_turn_timeline_snapshot(session_store, session_id, Some(final_content), streaming_entry_id)
-            .unwrap_or_else(|| final_content.to_string());
+    let timeline_message = build_completed_turn_timeline_snapshot(
+        session_store,
+        session_id,
+        Some(final_content),
+        streaming_entry_id,
+    )
+    .unwrap_or_else(|| final_content.to_string());
     let fallback_entry_id = session_store
         .runtime_sidecar(session_id)
         .and_then(|sidecar| {

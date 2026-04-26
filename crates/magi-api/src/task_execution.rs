@@ -160,7 +160,8 @@ impl ShadowTaskDispatcher {
     }
 
     pub fn set_force_sync_dispatch(&self, force: bool) {
-        self.force_sync_dispatch.store(force, std::sync::atomic::Ordering::Relaxed);
+        self.force_sync_dispatch
+            .store(force, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn with_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
@@ -844,7 +845,10 @@ impl TaskDispatcher for ShadowTaskDispatcher {
         lease: &magi_core::AssignmentLease,
     ) -> Result<(), String> {
         // 普通模式的同步 for 循环要求 dispatch 同步完成，直接走 inner。
-        if self.force_sync_dispatch.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .force_sync_dispatch
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return self.dispatch_inner(task, worker, lease);
         }
 
