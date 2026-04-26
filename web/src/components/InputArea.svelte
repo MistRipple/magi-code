@@ -1,12 +1,13 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
-  import {
-    addToast,
-    getActiveInteractionType,
-    getQueuedMessages,
-    messagesState,
-  } from '../stores/messages.svelte';
+	  import {
+	    addToast,
+	    getActiveInteractionType,
+	    getQueuedMessages,
+	    markQueuedMessageAsGuide,
+	    messagesState,
+	  } from '../stores/messages.svelte';
   import { getTaskGraphState } from '../stores/task-graph-store.svelte';
   import type { StandardMessage } from '../shared/protocol/message-protocol';
   import { MessageCategory } from '../shared/protocol/message-protocol';
@@ -278,14 +279,15 @@
     vscode.postMessage({ type: 'interruptTask' });
   }
 
-  function guideQueuedMessage(queuedMessageId: string) {
-    const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
-    if (!normalizedId) return;
-    vscode.postMessage({
-      type: 'guideQueuedMessage',
-      queuedMessageId: normalizedId,
-    });
-  }
+	  function guideQueuedMessage(queuedMessageId: string) {
+	    const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
+	    if (!normalizedId) return;
+	    markQueuedMessageAsGuide(normalizedId);
+	    vscode.postMessage({
+	      type: 'guideQueuedMessage',
+	      queuedMessageId: normalizedId,
+	    });
+	  }
 
   function focusInputTextareaToEnd() {
     requestAnimationFrame(() => {

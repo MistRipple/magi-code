@@ -9,7 +9,7 @@
   import ErrorDetailPopover from './ErrorDetailPopover.svelte';
   import { vscode } from '../lib/vscode-bridge';
   import { i18n } from '../stores/i18n.svelte';
-  import { retryRuntimeState } from '../stores/messages.svelte';
+  import { markQueuedMessageAsGuide, retryRuntimeState } from '../stores/messages.svelte';
   import { getAgentColor } from '../lib/agent-colors';
   import { formatDuration, formatElapsed as formatElapsedMmSs } from '../lib/utils';
 
@@ -69,11 +69,17 @@
     && queuedExtra?.queued === true
     && queuedExtra?.queueMode !== 'guide'
   ));
-  const queuedRequestId = $derived.by(() => (
-    typeof message.metadata?.requestId === 'string' && message.metadata.requestId.trim()
+  const queuedMessageId = $derived.by(() => {
+    const metadataQueuedId = typeof queuedExtra?.queuedMessageId === 'string'
+      ? queuedExtra.queuedMessageId.trim()
+      : '';
+    if (metadataQueuedId) {
+      return metadataQueuedId;
+    }
+    return typeof message.metadata?.requestId === 'string' && message.metadata.requestId.trim()
       ? message.metadata.requestId.trim()
-      : ''
-  ));
+      : '';
+  });
   let guideRequested = $state(false);
 
   // 动态 agent 颜色：为消息左侧色带和流式动画提供颜色
@@ -339,13 +345,14 @@
   }
 
   function guideQueuedMessage() {
-    if (!queuedRequestId || guideRequested) {
+    if (!queuedMessageId || guideRequested) {
       return;
     }
+    markQueuedMessageAsGuide(queuedMessageId);
     guideRequested = true;
     vscode.postMessage({
       type: 'guideQueuedMessage',
-      queuedMessageId: queuedRequestId,
+      queuedMessageId,
       localMessageId: message.id,
     });
   }

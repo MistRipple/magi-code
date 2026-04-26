@@ -30,6 +30,9 @@ export interface SessionTurnRequestDto {
   deepTask: boolean;
   skillName?: string | null;
   images: SessionTurnImageDto[];
+  requestId?: string | null;
+  userMessageId?: string | null;
+  placeholderMessageId?: string | null;
 }
 
 export interface SessionTurnResponseDto {
@@ -1227,6 +1230,7 @@ export interface TaskDto {
 export interface ProgressSummaryDto {
   total_tasks: number;
   completed_tasks: number;
+  settled_tasks: number;
   failed_tasks: number;
   running_tasks: number;
   blocked_tasks: number;

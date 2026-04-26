@@ -915,6 +915,9 @@ export async function submitSessionTurn(
     deepTask: boolean;
     skillName?: string | null;
     images: AgentSessionTurnImagePayload[];
+    requestId?: string | null;
+    userMessageId?: string | null;
+    placeholderMessageId?: string | null;
   },
   bindingOverride?: Partial<AgentBindingContext>,
 ): Promise<AgentSessionTurnResult> {
@@ -934,6 +937,9 @@ export async function submitSessionTurn(
         text: payload.text ?? null,
         deepTask: payload.deepTask,
         skillName: payload.skillName ?? null,
+        requestId: payload.requestId ?? null,
+        userMessageId: payload.userMessageId ?? null,
+        placeholderMessageId: payload.placeholderMessageId ?? null,
         images: payload.images.map((image) => ({
           name: image.name,
           dataUrl: image.dataUrl,

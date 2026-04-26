@@ -30,7 +30,6 @@ import type {
   QueuedMessage,
   OrchestratorRuntimeState,
   SessionNotificationRecord,
-  ContentBlock,
 } from '../types/message';
 import { vscode } from '../lib/vscode-bridge';
 import { ensureArray } from '../lib/utils';
@@ -492,115 +491,6 @@ function collectProjectionKnownMessageIds(
   return ids;
 }
 
-function normalizeComparableMessageText(message: Message | undefined): string {
-  if (!message) {
-    return '';
-  }
-  const content = typeof message.content === 'string' ? message.content.trim() : '';
-  if (content) {
-    return content.replace(/\s+/g, ' ');
-  }
-  return ensureArray<ContentBlock>(message.blocks)
-    .map((block) => {
-      if (!block || typeof block !== 'object') {
-        return '';
-      }
-      if ((block.type === 'text' || block.type === 'thinking') && typeof block.content === 'string') {
-        return block.content.trim();
-      }
-      if (block.type === 'thinking' && typeof block.thinking?.content === 'string') {
-        return block.thinking.content.trim();
-      }
-      return '';
-    })
-    .filter(Boolean)
-    .join(' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function comparableTextsMatch(left: string, right: string): boolean {
-  if (!left || !right) {
-    return false;
-  }
-  return left === right || left.includes(right) || right.includes(left);
-}
-
-function projectionHasAcceptedUserEcho(
-  projection: SessionTimelineProjection | null | undefined,
-  node: TimelineNode,
-): boolean {
-  const localMessage = node.message;
-  if (localMessage.role !== 'user' && localMessage.type !== 'user_input') {
-    return false;
-  }
-  const localText = normalizeComparableMessageText(localMessage);
-  if (!localText) {
-    return false;
-  }
-  const matches = (message: Message | undefined, timestamp: number | undefined): boolean => {
-    if (!message || (message.role !== 'user' && message.type !== 'user_input')) {
-      return false;
-    }
-    void timestamp;
-    return normalizeComparableMessageText(message) === localText;
-  };
-
-  for (const artifact of ensureArray<TimelineProjectionArtifact>(projection?.artifacts)) {
-    if (matches(artifact.message, artifact.timestamp)) {
-      return true;
-    }
-    for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
-      if (matches(item.message, item.timestamp)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-function projectionHasAcceptedAssistantEcho(
-  projection: SessionTimelineProjection | null | undefined,
-  node: TimelineNode,
-): boolean {
-  const localMessage = node.message;
-  if (localMessage.role !== 'assistant' || localMessage.isStreaming === true) {
-    return false;
-  }
-  const metadata = resolveMessageMetadataRecord(localMessage);
-  const isLocalResponse = Boolean(
-    typeof metadata?.requestId === 'string' && metadata.requestId.trim()
-    || metadata?.wasPlaceholder === true
-    || metadata?.isPlaceholder === true,
-  );
-  if (!isLocalResponse) {
-    return false;
-  }
-  const localText = normalizeComparableMessageText(localMessage);
-  if (!localText) {
-    return false;
-  }
-  const matches = (message: Message | undefined): boolean => {
-    if (!message || message.role !== 'assistant') {
-      return false;
-    }
-    const projectedText = normalizeComparableMessageText(message);
-    return comparableTextsMatch(projectedText, localText);
-  };
-
-  for (const artifact of ensureArray<TimelineProjectionArtifact>(projection?.artifacts)) {
-    if (matches(artifact.message)) {
-      return true;
-    }
-    for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
-      if (matches(item.message)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 function isNodeKnownByProjection(node: TimelineNode, knownIds: Set<string>): boolean {
   if (knownIds.has(node.nodeId) || knownIds.has(node.message.id)) {
     return true;
@@ -699,12 +589,6 @@ function shouldOverlayLocalTimelineNode(
     // projection 已经认领该节点(通过 messageIds 别名匹配),只在仍在流式且本地更新更新时覆盖。
     return isStreaming && isNewerThanProjection;
   }
-  if (projectionHasAcceptedUserEcho(projection, node)) {
-    return false;
-  }
-  if (projectionHasAcceptedAssistantEcho(projection, node)) {
-    return false;
-  }
   if (isStreaming) {
     return true;
   }
@@ -737,72 +621,17 @@ function isLocalAssistantEchoArtifact(artifact: TimelineProjectionArtifact): boo
   );
 }
 
-function isSessionTurnAssistantArtifact(artifact: TimelineProjectionArtifact): boolean {
-  const isAssistantTurnMessage = (message: Message | undefined): boolean => {
-    if (!message || message.role !== 'assistant') {
-      return false;
-    }
-    const metadata = resolveMessageMetadataRecord(message);
-    const turnItemKind = typeof metadata?.turnItemKind === 'string'
-      ? metadata.turnItemKind.trim()
-      : '';
-    return turnItemKind === 'assistant_stream'
-      || turnItemKind === 'assistant_final'
-      || turnItemKind === 'assistant_thinking';
-  };
-  if (isAssistantTurnMessage(artifact.message)) {
-    return true;
-  }
-  return ensureArray<TimelineExecutionItem>(artifact.executionItems)
-    .some((item) => isAssistantTurnMessage(item.message));
-}
-
-function projectionHasUserMessageText(
+function projectionSharesArtifactIdentity(
   projection: SessionTimelineProjection | null | undefined,
-  text: string,
+  artifact: TimelineProjectionArtifact,
 ): boolean {
-  if (!text) {
+  const identityKeys = collectArtifactIdentityKeys(artifact);
+  if (identityKeys.size === 0) {
     return false;
   }
-  const matches = (message: Message | undefined): boolean => {
-    if (!message || (message.role !== 'user' && message.type !== 'user_input')) {
-      return false;
-    }
-    return normalizeComparableMessageText(message) === text;
-  };
-  for (const artifact of ensureArray<TimelineProjectionArtifact>(projection?.artifacts)) {
-    if (matches(artifact.message)) {
-      return true;
-    }
-    for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
-      if (matches(item.message)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-function projectionHasAssistantMessageText(
-  projection: SessionTimelineProjection | null | undefined,
-  text: string,
-): boolean {
-  if (!text) {
-    return false;
-  }
-  const matches = (message: Message | undefined): boolean => {
-    if (!message || message.role !== 'assistant') {
-      return false;
-    }
-    const projectedText = normalizeComparableMessageText(message);
-    return comparableTextsMatch(projectedText, text);
-  };
-  for (const artifact of ensureArray<TimelineProjectionArtifact>(projection?.artifacts)) {
-    if (matches(artifact.message)) {
-      return true;
-    }
-    for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
-      if (matches(item.message)) {
+  for (const projectedArtifact of ensureArray<TimelineProjectionArtifact>(projection?.artifacts)) {
+    for (const key of collectArtifactIdentityKeys(projectedArtifact)) {
+      if (identityKeys.has(key)) {
         return true;
       }
     }
@@ -816,8 +645,8 @@ export function timelineProjectionConfirmsLocalAssistantResponse(
   if (!projection) {
     return false;
   }
-  const localAssistantTexts = messagesState.timelineNodes
-    .filter((node) => isLocalAssistantEchoArtifact({
+  return messagesState.timelineNodes.some((node) => {
+    const artifact = {
       artifactId: node.nodeId,
       kind: node.kind,
       displayOrder: node.displayOrder,
@@ -830,28 +659,10 @@ export function timelineProjectionConfirmsLocalAssistantResponse(
       messageIds: node.messageIds,
       message: node.message,
       executionItems: node.executionItems,
-    } as TimelineProjectionArtifact))
-    .map((node) => normalizeComparableMessageText(node.message))
-    .filter((text) => text.length > 0);
-  if (localAssistantTexts.length === 0) {
-    return false;
-  }
-  const authoritativeTexts: string[] = [];
-  for (const artifact of ensureArray<TimelineProjectionArtifact>(projection.artifacts)) {
-    if (artifact.message?.role === 'assistant') {
-      const text = normalizeComparableMessageText(artifact.message);
-      if (text) authoritativeTexts.push(text);
-    }
-    for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
-      if (item.message?.role === 'assistant') {
-        const text = normalizeComparableMessageText(item.message);
-        if (text) authoritativeTexts.push(text);
-      }
-    }
-  }
-  return localAssistantTexts.some((localText) => authoritativeTexts.some((authoritativeText) => (
-    comparableTextsMatch(authoritativeText, localText)
-  )));
+    } as TimelineProjectionArtifact;
+    return isLocalAssistantEchoArtifact(artifact)
+      && projectionSharesArtifactIdentity(projection, artifact);
+  });
 }
 
 function collectMessageIdentityKeys(message: Message | undefined): Set<string> {
@@ -872,6 +683,24 @@ function collectMessageIdentityKeys(message: Message | undefined): Set<string> {
   const turnItemId = typeof metadata?.turnItemId === 'string' ? metadata.turnItemId.trim() : '';
   if (turnId && turnItemId) {
     add(`turn:${turnId}:${turnItemId}`);
+  }
+  return keys;
+}
+
+function collectArtifactIdentityKeys(artifact: TimelineProjectionArtifact | undefined): Set<string> {
+  const keys = new Set<string>();
+  const add = (value: unknown): void => {
+    if (typeof value !== 'string') return;
+    const normalized = value.trim();
+    if (normalized) keys.add(normalized);
+  };
+  add(artifact?.artifactId);
+  for (const alias of ensureArray<string>(artifact?.messageIds)) add(alias);
+  for (const key of collectMessageIdentityKeys(artifact?.message)) add(key);
+  for (const item of ensureArray<TimelineExecutionItem>(artifact?.executionItems)) {
+    add(item.itemId);
+    for (const alias of ensureArray<string>(item.messageIds)) add(alias);
+    for (const key of collectMessageIdentityKeys(item.message)) add(key);
   }
   return keys;
 }
@@ -1466,19 +1295,18 @@ function compareRenderEntryOrder(
   );
 }
 
-/**
- * 动态构建所有 Worker 的 render entries
- *
- * 从 artifacts 的 workerTabs 集合中自动发现所有 workerId，
- * 然后为每个 workerId 构建对应的 render entries。
- */
 function buildDynamicWorkerRenderEntries(
   artifacts: TimelineProjectionArtifact[],
 ): Record<string, TimelineProjectionRenderEntry[]> {
   const workerIds = new Set<string>();
   for (const artifact of artifacts) {
-    for (const w of artifact.workerTabs) {
-      workerIds.add(w);
+    for (const workerId of ensureArray<AgentId>(artifact.workerTabs)) {
+      workerIds.add(workerId);
+    }
+    for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
+      for (const workerId of ensureArray<AgentId>(item.workerTabs)) {
+        workerIds.add(workerId);
+      }
     }
   }
   const entries: Record<string, TimelineProjectionRenderEntry[]> = {};
@@ -2944,6 +2772,42 @@ export function removeQueuedMessage(id: string) {
   setQueuedMessages(messagesState.queuedMessages.filter((message) => message.id !== normalizedId));
 }
 
+function markQueuedUserEchoAsGuide(id: string): void {
+  mutateTimelineNodes((nodes) => nodes.map((node) => {
+    const message = node.message;
+    if (message.type !== 'user_input') {
+      return node;
+    }
+    const metadata = message.metadata && typeof message.metadata === 'object'
+      ? message.metadata
+      : {};
+    const extra = metadata.extra && typeof metadata.extra === 'object' && !Array.isArray(metadata.extra)
+      ? metadata.extra as Record<string, unknown>
+      : null;
+    if (!extra || extra.queued !== true || extra.queueMode === 'guide') {
+      return node;
+    }
+    const requestId = typeof metadata.requestId === 'string' ? metadata.requestId.trim() : '';
+    const queuedMessageId = typeof extra.queuedMessageId === 'string' ? extra.queuedMessageId.trim() : '';
+    if (message.id !== id && requestId !== id && queuedMessageId !== id) {
+      return node;
+    }
+    return {
+      ...node,
+      message: {
+        ...message,
+        metadata: {
+          ...metadata,
+          extra: {
+            ...extra,
+            queueMode: 'guide',
+          },
+        },
+      },
+    };
+  }));
+}
+
 export function markQueuedMessageAsGuide(id: string): boolean {
   const normalizedId = typeof id === 'string' ? id.trim() : '';
   if (!normalizedId) {
@@ -2963,6 +2827,7 @@ export function markQueuedMessageAsGuide(id: string): boolean {
     target,
     ...messagesState.queuedMessages.filter((_, itemIndex) => itemIndex !== index),
   ]);
+  markQueuedUserEchoAsGuide(normalizedId);
   return true;
 }
 
@@ -3865,33 +3730,13 @@ export function prependTimelineProjectionPage(
     return false;
   }
   const retainedCurrentArtifacts = currentProjection.artifacts.filter((artifact) => {
-    if (isLocalUserEchoArtifact(artifact)) {
+    if (projectionSharesArtifactIdentity(incomingProjection, artifact)) {
+      return false;
+    }
+    if (isLocalUserEchoArtifact(artifact) || isLocalAssistantEchoArtifact(artifact)) {
       const metadata = resolveMessageMetadataRecord(artifact.message);
       const requestId = typeof metadata?.requestId === 'string' ? metadata.requestId.trim() : '';
-      if (!requestId || !getRequestBinding(requestId)) {
-        return false;
-      }
-      const text = normalizeComparableMessageText(artifact.message);
-      return !projectionHasUserMessageText(incomingProjection, text);
-    }
-    if (isLocalAssistantEchoArtifact(artifact)) {
-      const metadata = resolveMessageMetadataRecord(artifact.message);
-      const requestId = typeof metadata?.requestId === 'string' ? metadata.requestId.trim() : '';
-      if (!requestId || !getRequestBinding(requestId)) {
-        return false;
-      }
-      const text = normalizeComparableMessageText(artifact.message);
-      return !projectionHasAssistantMessageText(incomingProjection, text);
-    }
-    if (isSessionTurnAssistantArtifact(artifact)) {
-      const text = normalizeComparableMessageText(artifact.message);
-      return !projectionHasAssistantMessageText(incomingProjection, text);
-    }
-    if (artifact.message?.role === 'assistant') {
-      const text = normalizeComparableMessageText(artifact.message);
-      if (text.length >= 24 && projectionHasAssistantMessageText(incomingProjection, text)) {
-        return false;
-      }
+      return Boolean(requestId && getRequestBinding(requestId));
     }
     return true;
   });

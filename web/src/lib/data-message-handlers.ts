@@ -47,6 +47,7 @@ import type {
   Edit,
   ModelStatusMap, ActivePlanState, PlanLedgerRecord, PlanLedgerAttempt,
   QueuedMessage, OrchestratorRuntimeState, SessionTimelineProjection,
+  TimelineExecutionItem, TimelineProjectionArtifact,
 } from '../types/message';
 import type { StandardMessage, ContentBlock as StandardContentBlock } from '../shared/protocol/message-protocol';
 import type { SessionBootstrapSnapshot } from '../shared/session-bootstrap';
@@ -768,6 +769,42 @@ function hasRenderableAssistantContent(message: Message): boolean {
   return Array.isArray(message?.blocks) && message.blocks.length > 0;
 }
 
+function projectionHasStreamingContent(projection: SessionTimelineProjection | null | undefined): boolean {
+  if (!projection) {
+    return false;
+  }
+  for (const artifact of ensureArray<TimelineProjectionArtifact>(projection.artifacts)) {
+    if (artifact.message?.isStreaming === true) {
+      return true;
+    }
+    for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
+      if (item.message?.isStreaming === true) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isSettlingAssistantResponse(message: Message): boolean {
+  if (
+    message.role !== 'assistant'
+    || message.source === 'system'
+    || message.metadata?.isPlaceholder === true
+    || message.isStreaming === true
+    || !hasRenderableAssistantContent(message)
+  ) {
+    return false;
+  }
+  const turnItemKind = typeof message.metadata?.turnItemKind === 'string'
+    ? message.metadata.turnItemKind.trim()
+    : '';
+  if (!turnItemKind) {
+    return true;
+  }
+  return turnItemKind === 'assistant_stream' || turnItemKind === 'assistant_final';
+}
+
 function findAssistantByThreadOrder(
   threadMessages: Message[],
   binding: ReturnType<typeof listRequestBindings>[number],
@@ -778,13 +815,7 @@ function findAssistantByThreadOrder(
   }
   for (let index = threadMessages.length - 1; index > userIndex; index -= 1) {
     const message = threadMessages[index];
-    if (
-      message.role === 'assistant'
-      && message.source === 'orchestrator'
-      && message.metadata?.isPlaceholder !== true
-      && message.isStreaming !== true
-      && hasRenderableAssistantContent(message)
-    ) {
+    if (isSettlingAssistantResponse(message)) {
       return message;
     }
   }
@@ -817,13 +848,9 @@ function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): voi
         ? threadMessages.find((message) => message.id === binding.realMessageId)
         : undefined)
       || [...threadMessages].reverse().find((message) => (
-        message.role === 'assistant'
-        && message.source === 'orchestrator'
-        && message.metadata?.isPlaceholder !== true
-        && message.isStreaming !== true
+        isSettlingAssistantResponse(message)
         && typeof message.timestamp === 'number'
         && message.timestamp >= lowerBoundTimestamp
-        && hasRenderableAssistantContent(message)
       ))
       || findAssistantByThreadOrder(threadMessages, binding)
     );
@@ -916,9 +943,11 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       const authoritativeSnapshotIsIdle = state.isProcessing !== true
         && state.processingState?.isProcessing !== true;
       const projectionConfirmsLocalAssistant = timelineProjectionConfirmsLocalAssistantResponse(timelineProjection);
+      const projectionStillStreaming = projectionHasStreamingContent(timelineProjection);
       const preserveLocalTurnDuringStaleIdle = hadLiveTurnBeforeSnapshot
         && authoritativeSnapshotIsIdle
-        && !projectionConfirmsLocalAssistant;
+        && !projectionConfirmsLocalAssistant
+        && projectionStillStreaming;
 
       handleStateUpdate({
         ...message,
@@ -947,7 +976,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
 
       prependTimelineProjectionPage(sessionId, timelineProjection);
       reconcileRequestBindingsFromAuthoritativeThread(sessionId);
-      if (authoritativeSnapshotIsIdle && !preserveLocalTurnDuringStaleIdle) {
+      if (authoritativeSnapshotIsIdle) {
         settleAuthoritativeIdleState();
       }
     });

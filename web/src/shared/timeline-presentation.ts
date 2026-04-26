@@ -51,6 +51,15 @@ export function collectTimelineAliasIds(
   const rustStreamItemId = normalizeTimelineAliasCandidate(metadata.rustStreamItemId);
   const rustEventItemId = normalizeTimelineAliasCandidate(metadata.rustEventItemId);
   const toolCallId = normalizeTimelineAliasCandidate(metadata.toolCallId);
+  const userMessageId = normalizeTimelineAliasCandidate(metadata.userMessageId);
+  const placeholderMessageId = normalizeTimelineAliasCandidate(metadata.placeholderMessageId);
+
+  if (userMessageId) {
+    addAlias(userMessageId);
+  }
+  if (placeholderMessageId) {
+    addAlias(placeholderMessageId);
+  }
 
   if (turnItemId) {
     addAlias(turnItemId);

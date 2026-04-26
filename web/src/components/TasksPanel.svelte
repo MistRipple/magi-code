@@ -4,7 +4,7 @@
   import type { ActivePlanState, PlanLedgerRecord, Message } from '../types/message';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import type { DecisionOptionDto, DeliveryPackageDto, TaskDto, TaskStatus } from '../shared/rust-backend-types';
+  import type { DecisionOptionDto, DeliveryPackageDto, TaskDto, TaskProjectionDto, TaskStatus } from '../shared/rust-backend-types';
   import type { IconName } from '../lib/icons';
   import {
     getTaskGraphState,
@@ -21,6 +21,7 @@
     depth: number;
     hasChildren: boolean;
     childCount: number;
+    activeChildCount: number;
   }
 
   const appPayload = $derived((appState.appState || {}) as Record<string, unknown>);
@@ -35,7 +36,7 @@
   const projectionProgress = $derived.by(() => {
     const p = taskGraph.projection?.progress_summary;
     if (!p || p.total_tasks === 0) return null;
-    const percent = Math.round((p.completed_tasks / p.total_tasks) * 100);
+    const percent = Math.round((p.settled_tasks / p.total_tasks) * 100);
     return { ...p, percent };
   });
   const projectionTasks = $derived(taskGraph.projection?.tasks ?? []);
@@ -87,7 +88,7 @@
   const taskTreeRows = $derived.by(() => (
     buildTaskTreeRows(taskGraph.projection?.root_task, childrenByParentId, expandedGraphNodes)
   ));
-  const taskSummary = $derived.by(() => buildTaskSummary(projectionTasks));
+  const taskSummary = $derived.by(() => buildTaskSummary(taskGraph.projection, projectionTasks));
   const workpackageSummaries = $derived(taskGraph.projection?.workpackage_summaries ?? []);
   const currentFocusTask = $derived.by(() => resolveCurrentFocusTask(projectionTasks));
   const attentionTasks = $derived.by(() => {
@@ -129,11 +130,13 @@
     const rows: TaskTreeRow[] = [];
     const visit = (task: TaskDto, depth: number) => {
       const children = childrenByParentId.get(task.task_id) ?? [];
+      const activeChildren = children.filter((child) => child.status !== 'Cancelled');
       rows.push({
         task,
         depth,
         hasChildren: children.length > 0,
         childCount: children.length,
+        activeChildCount: activeChildren.length,
       });
       if (children.length > 0 && expandedNodeIds.has(task.task_id)) {
         for (const child of children) visit(child, depth + 1);
@@ -143,16 +146,18 @@
     return rows;
   }
 
-  function completedChildCount(taskId: string): number {
+  function settledChildCount(taskId: string): number {
     return (childrenByParentId.get(taskId) ?? [])
-      .filter((child) => child.status === 'Completed')
+      .filter((child) => child.status !== 'Cancelled')
+      .filter((child) => child.status === 'Completed' || child.status === 'Skipped')
       .length;
   }
 
-  function buildTaskSummary(tasks: TaskDto[]) {
+  function buildTaskSummary(projection: TaskProjectionDto | null, tasks: TaskDto[]) {
+    const progress = projection?.progress_summary;
     return {
-      total: tasks.length,
-      completed: tasks.filter((task) => task.status === 'Completed' || task.status === 'Skipped').length,
+      total: progress?.total_tasks ?? 0,
+      completed: progress?.settled_tasks ?? 0,
       active: tasks.filter((task) => ['Running', 'Verifying', 'Repairing'].includes(task.status)).length,
       blocked: tasks.filter((task) => task.status === 'Blocked' || task.status === 'AwaitingApproval').length,
       failed: tasks.filter((task) => task.status === 'Failed').length,
@@ -202,6 +207,7 @@
     if (status === 'AwaitingApproval' || status === 'Blocked') return '需要处理';
     if (status === 'Running' || status === 'Verifying' || status === 'Repairing') return '正在推进';
     if (status === 'Completed' || status === 'Skipped') return '已收束';
+    if (status === 'Cancelled') return '已取消';
     if (status === 'Failed') return '需要修复';
     return '等待执行';
   }
@@ -709,8 +715,12 @@
             </span>
             <span class="tg-tree-side">
               <span class="tg-tree-state">{getTaskStatusLabel(row.task.status)}</span>
-              {#if row.task.kind === 'WorkPackage' && row.childCount > 0}
-                <span class="tg-tree-count">{completedChildCount(row.task.task_id)}/{row.childCount}</span>
+              {#if row.task.kind === 'WorkPackage'}
+                {#if row.activeChildCount > 0}
+                  <span class="tg-tree-count">{settledChildCount(row.task.task_id)}/{row.activeChildCount}</span>
+                {:else if row.childCount > 0}
+                  <span class="tg-tree-count">0</span>
+                {/if}
               {:else if row.childCount > 0}
                 <span class="tg-tree-count">{row.childCount}</span>
               {/if}

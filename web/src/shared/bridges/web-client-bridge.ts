@@ -132,6 +132,8 @@ let currentInterruptTaskId = '';
 let currentRuntimeEpoch = '';
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
 let cachedSettingsBootstrapScope: 'none' | 'core' | 'full' = 'none';
+const QUEUE_DRAIN_DELAY_MS = 120;
+const QUEUE_DRAIN_BUSY_RETRY_MS = 1000;
 let queueDrainTimer: ReturnType<typeof setTimeout> | null = null;
 let queueDrainActive = false;
 /** 传输层维护的 SSE 连接句柄（统一管理 Web EventSource 和宿主代理两种模式） */
@@ -2062,6 +2064,7 @@ function emitQueuedUserMessage(queued: QueuedMessage): void {
       requestId: queued.id,
       extra: {
         queued: true,
+        queuedMessageId: queued.id,
         queueMode: queued.mode || 'queue',
       },
       images: queued.images && queued.images.length > 0 ? queued.images : undefined,
@@ -2084,20 +2087,27 @@ function enqueueFollowUpTurn(input: ExecuteTaskInput, normalizedText: string, mo
   };
   enqueueQueuedMessage(queued);
   emitQueuedUserMessage(queued);
+  scheduleQueuedTurnDrain('enqueue_follow_up', QUEUE_DRAIN_BUSY_RETRY_MS);
 }
 
-function scheduleQueuedTurnDrain(reason: string): void {
+function scheduleQueuedTurnDrain(reason: string, delayMs = QUEUE_DRAIN_DELAY_MS): void {
   if (queueDrainTimer) {
     clearTimeout(queueDrainTimer);
   }
   queueDrainTimer = setTimeout(() => {
     queueDrainTimer = null;
     void drainQueuedTurns(reason);
-  }, 120);
+  }, delayMs);
 }
 
-async function drainQueuedTurns(_reason: string): Promise<void> {
-  if (queueDrainActive || bridgeRuntimeIsBusy()) {
+async function drainQueuedTurns(reason: string): Promise<void> {
+  if (queueDrainActive) {
+    return;
+  }
+  if (bridgeRuntimeIsBusy()) {
+    if (messagesState.queuedMessages.length > 0) {
+      scheduleQueuedTurnDrain(`${reason}:busy_retry`, QUEUE_DRAIN_BUSY_RETRY_MS);
+    }
     return;
   }
   const next = dequeueQueuedMessage();
@@ -2115,6 +2125,9 @@ async function drainQueuedTurns(_reason: string): Promise<void> {
     });
   } finally {
     queueDrainActive = false;
+    if (messagesState.queuedMessages.length > 0) {
+      scheduleQueuedTurnDrain('after_queued_turn_submit', QUEUE_DRAIN_BUSY_RETRY_MS);
+    }
   }
 }
 
@@ -2204,6 +2217,9 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
       deepTask: input.deepTask,
       skillName,
       images,
+      requestId,
+      userMessageId,
+      placeholderMessageId,
     }, {
       workspaceId: currentWorkspaceId,
       workspacePath: currentWorkspacePath,

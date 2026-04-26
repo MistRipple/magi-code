@@ -161,6 +161,9 @@ interface RustSessionRuntimeTurnItemSummary {
   tool_arguments?: unknown;
   tool_result?: string | null;
   tool_error?: string | null;
+  request_id?: string | null;
+  user_message_id?: string | null;
+  placeholder_message_id?: string | null;
   thread_visible?: boolean;
   worker_visible?: boolean;
 }
@@ -2083,7 +2086,13 @@ function buildTurnArtifactsFromSummary(
     }
 
     const artifactId = `turn:${turnId}:${itemId}`;
+    const requestId = normalizeString(item.request_id);
+    const userMessageId = normalizeString(item.user_message_id);
+    const placeholderMessageId = normalizeString(item.placeholder_message_id);
     const messageIdAliases = new Set<string>([artifactId, itemId, `rust-timeline:${itemId}`]);
+    if (requestId) messageIdAliases.add(requestId);
+    if (userMessageId) messageIdAliases.add(userMessageId);
+    if (placeholderMessageId) messageIdAliases.add(placeholderMessageId);
     if (kind === 'assistant_final' || kind === 'assistant_stream') {
       const streamingAlias = normalizeString(streamingEntryId);
       if (streamingAlias) {
@@ -2127,6 +2136,9 @@ function buildTurnArtifactsFromSummary(
           blockSeq: normalizeNumber(item.item_seq, 0),
           laneId: laneId || undefined,
           workerId: workerId || undefined,
+          requestId: requestId || undefined,
+          userMessageId: userMessageId || undefined,
+          placeholderMessageId: placeholderMessageId || undefined,
           ...(kind === 'assistant_final' && typeof turn?.response_duration_ms === 'number'
             ? { responseDurationMs: Math.max(0, Math.floor(turn.response_duration_ms)) }
             : {}),
