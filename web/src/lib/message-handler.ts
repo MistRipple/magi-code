@@ -19,6 +19,7 @@ import {
   getRequestBinding,
   createRequestBinding,
   updateRequestBinding,
+  clearRequestBinding,
   settleProcessingForManualInteraction,
   sealAllStreamingMessages,
   applyTimelineStreamPatch,
@@ -773,8 +774,9 @@ function handleContentMessage(standard: StandardMessage) {
         updateRequestBinding(requestId, { userMessageId: standard.id });
       }
     }
-    if (!getTimelineMessageById(uiMessage.id)) {
-      const timelineMessage = upsertTimelineNode(uiMessage, visibility);
+    const existingTimelineMessage = getTimelineMessageById(uiMessage.id);
+    const timelineMessage = upsertTimelineNode(uiMessage, visibility);
+    if (!existingTimelineMessage) {
       applyPendingTimelineUpdatesForAnchor(timelineMessage, [standard.id]);
     }
     return;
@@ -993,6 +995,7 @@ function handleStandardComplete(message: ClientBridgeMessage) {
         realMessageId: actualMessageId,
         timeoutId: undefined,
       });
+      clearRequestBinding(requestId);
     }
   }
   settleProcessingAfterResponseCompletion();

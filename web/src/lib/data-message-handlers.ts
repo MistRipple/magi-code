@@ -776,30 +776,9 @@ function findAssistantByThreadOrder(
   return undefined;
 }
 
-function oldestRequestBindingCreatedAt(): number | null {
-  let oldest: number | null = null;
-  for (const binding of listRequestBindings()) {
-    if (typeof binding.createdAt !== 'number' || !Number.isFinite(binding.createdAt)) {
-      continue;
-    }
-    oldest = oldest === null ? binding.createdAt : Math.min(oldest, binding.createdAt);
-  }
-  return oldest;
-}
 
-function isAuthoritativeSnapshotOlderThanLocalTurn(
-  state: AppState,
-  timelineProjection: SessionTimelineProjection,
-): boolean {
-  const oldestBindingCreatedAt = oldestRequestBindingCreatedAt();
-  if (oldestBindingCreatedAt === null) {
-    return false;
-  }
-  const snapshotUpdatedAt = Math.max(
-    typeof state.stateUpdatedAt === 'number' && Number.isFinite(state.stateUpdatedAt) ? state.stateUpdatedAt : 0,
-    typeof timelineProjection.updatedAt === 'number' && Number.isFinite(timelineProjection.updatedAt) ? timelineProjection.updatedAt : 0,
-  );
-  return snapshotUpdatedAt > 0 && snapshotUpdatedAt < oldestBindingCreatedAt;
+function hasActiveLocalTurn(): boolean {
+  return messagesState.pendingRequests.size > 0 || messagesState.activeMessageIds.size > 0;
 }
 
 function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): void {
@@ -863,6 +842,7 @@ function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): voi
     if (binding.timeoutId) {
       clearTimeout(binding.timeoutId);
     }
+    clearRequestBinding(binding.requestId);
   }
 
   settleProcessingAfterResponseCompletion();
@@ -909,16 +889,13 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       if (sessions.length > 0) {
         updateSessions(sessions);
       }
-      const hadLiveTurnBeforeSnapshot = messagesState.pendingRequests.size > 0
-        || messagesState.activeMessageIds.size > 0;
+      const hadLiveTurnBeforeSnapshot = hasActiveLocalTurn();
       const authoritativeSnapshotIsIdle = state.isProcessing !== true
         && state.processingState?.isProcessing !== true;
       const projectionConfirmsLocalAssistant = timelineProjectionConfirmsLocalAssistantResponse(timelineProjection);
-      const authoritativeSnapshotIsOlderThanLocalTurn = isAuthoritativeSnapshotOlderThanLocalTurn(state, timelineProjection);
-      const preserveLocalProcessing = hadLiveTurnBeforeSnapshot
+      const preserveLocalTurnDuringStaleIdle = hadLiveTurnBeforeSnapshot
         && authoritativeSnapshotIsIdle
-        && !projectionConfirmsLocalAssistant
-        && authoritativeSnapshotIsOlderThanLocalTurn;
+        && !projectionConfirmsLocalAssistant;
 
       handleStateUpdate({
         ...message,
@@ -927,9 +904,9 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
           currentSessionId: sessionId,
           sessions: sessions.length > 0 ? sessions : state.sessions,
         },
-      }, { preserveLocalProcessing });
+      }, { preserveLocalProcessing: preserveLocalTurnDuringStaleIdle });
 
-      if (!preserveLocalProcessing) {
+      if (!preserveLocalTurnDuringStaleIdle) {
         replaceOrchestratorRuntimeState(
           (snapshot.orchestratorRuntimeState as OrchestratorRuntimeState | null | undefined) ?? null,
         );
@@ -945,12 +922,10 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         isLoadingBefore: false,
       });
 
-      if (!hadLiveTurnBeforeSnapshot || !preserveLocalProcessing) {
-        prependTimelineProjectionPage(sessionId, timelineProjection);
-        reconcileRequestBindingsFromAuthoritativeThread(sessionId);
-        if (authoritativeSnapshotIsIdle && !preserveLocalProcessing) {
-          settleAuthoritativeIdleState();
-        }
+      prependTimelineProjectionPage(sessionId, timelineProjection);
+      reconcileRequestBindingsFromAuthoritativeThread(sessionId);
+      if (authoritativeSnapshotIsIdle && !preserveLocalTurnDuringStaleIdle) {
+        settleAuthoritativeIdleState();
       }
     });
     return;

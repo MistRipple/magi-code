@@ -117,7 +117,6 @@ import {
   applyStreamingDelta,
   dequeueQueuedMessage,
   enqueueQueuedMessage,
-  markMessageComplete,
   markQueuedMessageAsGuide,
   messagesState,
   sealStreamingDelta,
@@ -768,7 +767,8 @@ function resolveTurnToolStatus(status: string): 'pending' | 'running' | 'complet
 }
 
 function resolveActiveAssistantMessageId(sessionId: string, itemId: string): string {
-  const fallbackId = `turn-live:${sessionId}:${itemId}`;
+  void sessionId;
+  const fallbackId = `rust-timeline:${itemId}`;
   if (!activeTurnLiveContext) {
     return fallbackId;
   }
@@ -948,6 +948,7 @@ function createSessionTurnItemStandardMessage(
     metadata.toolName = toolName;
     if (activeTurnLiveContext) {
       metadata.requestId = activeTurnLiveContext.requestId;
+      metadata.userMessageId = activeTurnLiveContext.userMessageId;
     }
   } else {
     return null;
@@ -1054,9 +1055,6 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
         requestId: activeTurnLiveContext.requestId,
         userMessageId: activeTurnLiveContext.userMessageId,
       } : {});
-      if (activeTurnLiveContext?.placeholderMessageId) {
-        markMessageComplete(activeTurnLiveContext.placeholderMessageId);
-      }
       emitMessage({ type: 'rustTaskEvent', eventType, payload: event.payload ?? {} } as ClientBridgeMessage);
       return;
     }
@@ -2193,7 +2191,9 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
   }
 
   const requestId = input.requestId || generateMessageId();
-  const userMessageId = generateMessageId();
+  const userMessageId = queueDrainActive && input.requestId
+    ? `queued-user-${requestId}`
+    : generateMessageId();
   const placeholderMessageId = generateMessageId();
 
   // 乐观显示用户消息

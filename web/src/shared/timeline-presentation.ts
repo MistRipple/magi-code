@@ -26,7 +26,7 @@ function normalizeTimelineAliasCandidate(value: unknown): string {
 }
 
 export function collectTimelineAliasIds(
-  message: Pick<TimelinePresentationMessageLike, 'id' | 'metadata'>,
+  message: Pick<TimelinePresentationMessageLike, 'id' | 'metadata' | 'role' | 'type'>,
 ): string[] {
   const aliases = new Set<string>();
   const addAlias = (value: unknown): void => {
@@ -45,6 +45,41 @@ export function collectTimelineAliasIds(
     return Array.from(aliases);
   }
 
+  const sessionId = normalizeTimelineAliasCandidate(metadata.sessionId);
+  const turnId = normalizeTimelineAliasCandidate(metadata.turnId);
+  const turnItemId = normalizeTimelineAliasCandidate(metadata.turnItemId);
+  const rustStreamItemId = normalizeTimelineAliasCandidate(metadata.rustStreamItemId);
+  const rustEventItemId = normalizeTimelineAliasCandidate(metadata.rustEventItemId);
+  const toolCallId = normalizeTimelineAliasCandidate(metadata.toolCallId);
+
+  if (turnItemId) {
+    addAlias(turnItemId);
+    addAlias(`rust-timeline:${turnItemId}`);
+    if (turnId) {
+      addAlias(`turn:${turnId}:${turnItemId}`);
+    }
+    if (sessionId) {
+      addAlias(`turn-live:${sessionId}:${turnItemId}`);
+    }
+  }
+  if (rustStreamItemId) {
+    addAlias(rustStreamItemId);
+    addAlias(`rust-timeline:${rustStreamItemId}`);
+    if (sessionId) {
+      addAlias(`turn-live:${sessionId}:${rustStreamItemId}`);
+    }
+  }
+  if (rustEventItemId) {
+    addAlias(rustEventItemId);
+    addAlias(`rust-timeline:${rustEventItemId}`);
+    if (sessionId) {
+      addAlias(`turn-live:${sessionId}:${rustEventItemId}`);
+    }
+  }
+  if (toolCallId) {
+    addAlias(`rust-timeline:turn-item-tool-started-${toolCallId}`);
+    addAlias(`rust-timeline:turn-item-tool-result-${toolCallId}`);
+  }
 
   return Array.from(aliases);
 }

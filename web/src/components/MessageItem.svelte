@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Message, PlaceholderState } from '../types/message';
+  import type { ContentBlock, Message, PlaceholderState } from '../types/message';
   import type { IconName } from '../lib/icons';
   import MarkdownContent from './MarkdownContent.svelte';
   import WorkerBadge from './WorkerBadge.svelte';
@@ -84,17 +84,72 @@
     return `border-left-color: ${color}; --stream-accent: ${color};`;
   });
   const safeBlocks = $derived(
-    (message.blocks || []).filter((b): b is import('../types/message').ContentBlock =>
+    (message.blocks || []).filter((b): b is ContentBlock =>
       !!b && typeof b === 'object' && 'type' in b
     )
   );
+  const presentationBlocks = $derived.by(() => {
+    const merged: ContentBlock[] = [];
+    const toolCallIndexById = new Map<string, number>();
+
+    const mergeToolCallBlock = (callBlock: ContentBlock, incomingBlock: ContentBlock): ContentBlock => {
+      const previousCall = callBlock.toolCall;
+      const incomingCall = incomingBlock.toolCall;
+      return {
+        ...callBlock,
+        type: 'tool_call',
+        content: callBlock.content || incomingBlock.content || '',
+        toolCall: {
+          ...previousCall,
+          ...incomingCall,
+          id: incomingCall?.id ?? previousCall?.id ?? '',
+          name: incomingCall?.name ?? previousCall?.name ?? 'Tool',
+          status: incomingCall?.status ?? previousCall?.status ?? 'running',
+          arguments: incomingCall?.arguments ?? previousCall?.arguments ?? {},
+          result: incomingCall?.result ?? previousCall?.result ?? (incomingBlock.content || undefined),
+          error: incomingCall?.error ?? previousCall?.error,
+          standardized: incomingCall?.standardized ?? previousCall?.standardized,
+          durationMs: incomingCall?.durationMs ?? previousCall?.durationMs,
+          startTime: incomingCall?.startTime ?? previousCall?.startTime,
+          endTime: incomingCall?.endTime ?? previousCall?.endTime,
+        },
+      };
+    };
+
+    for (const block of safeBlocks) {
+      if (block.type === 'tool_call' || block.type === 'tool_result') {
+        const toolId = typeof block.toolCall?.id === 'string' ? block.toolCall.id.trim() : '';
+        const normalizedBlock = block.type === 'tool_result'
+          ? {
+              ...block,
+              type: 'tool_call' as const,
+            }
+          : block;
+        if (toolId && toolCallIndexById.has(toolId)) {
+          const index = toolCallIndexById.get(toolId)!;
+          const previous = merged[index];
+          merged[index] = mergeToolCallBlock(previous, normalizedBlock);
+          continue;
+        }
+        if (toolId) {
+          toolCallIndexById.set(toolId, merged.length);
+        }
+        merged.push(normalizedBlock);
+        continue;
+      }
+
+      merged.push(block);
+    }
+
+    return merged;
+  });
   // 检查是否真的有可见内容（防止虽然有 blocks 但全是空字符串导致 UI 假死）
   const hasVisibleContent = $derived.by(() => {
     if (message.content && message.content.trim().length > 0) return true;
-    if (safeBlocks.length === 0) return false;
+    if (presentationBlocks.length === 0) return false;
 
     // 遍历 blocks，只要有一个包含实质内容就认为有可见内容
-    for (const block of safeBlocks) {
+    for (const block of presentationBlocks) {
       if (block.type === 'tool_call') return true;
       if (block.type === 'tool_result') return true;
       if (block.type === 'file_change') return true;
@@ -401,10 +456,10 @@
               <MarkdownContent content={message.content} isStreaming={false} />
             </div>
           </details>
-        {:else if safeBlocks.length > 0}
-          {#each safeBlocks as block, i (resolveBlockRenderKey(block, i))}
+        {:else if presentationBlocks.length > 0}
+          {#each presentationBlocks as block, i (resolveBlockRenderKey(block, i))}
             {@const blockIsStreaming = block.type === 'thinking'
-              ? (isStreaming && i === safeBlocks.length - 1)
+              ? (isStreaming && i === presentationBlocks.length - 1)
               : isStreaming}
             <BlockRenderer {block} isStreaming={blockIsStreaming} {readOnly} />
           {/each}
@@ -426,9 +481,8 @@
         {/if}
 
         {#if showResponseDuration}
-          <div class="message-runtime-summary">
-            <span class="message-runtime-summary__label">{i18n.t('messageItem.responseDurationLabel')}</span>
-            <span class="message-runtime-summary__value">{formatDurationMs(responseDurationMs ?? 0)}</span>
+          <div class="message-runtime-text">
+            {i18n.t('messageItem.responseDurationLabel')} {formatDurationMs(responseDurationMs ?? 0)}
           </div>
         {/if}
 
@@ -830,28 +884,12 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .message-runtime-summary {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
+  .message-runtime-text {
     margin-top: var(--space-2);
-    padding: 4px 8px;
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--surface-2) 88%, transparent);
-    border: 1px solid color-mix(in srgb, var(--border) 92%, transparent);
     color: var(--foreground-muted);
     font-size: var(--text-xs);
-    line-height: 1;
+    line-height: 1.4;
     font-variant-numeric: tabular-nums;
-  }
-
-  .message-runtime-summary__label {
-    color: var(--foreground-muted);
-  }
-
-  .message-runtime-summary__value {
-    color: var(--foreground);
-    font-weight: var(--font-medium);
   }
 
   @keyframes streamingBounce {

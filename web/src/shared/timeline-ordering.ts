@@ -1,19 +1,8 @@
-import { resolveMessageSemanticStage } from './timeline-semantic-stage';
-
 export interface TimelineSemanticOrderInput {
   timestamp: number;
   stableId: string;
-  messageType?: string;
-  primaryToolCallName?: string;
-  displayOrder?: number | null;
-  itemOrder?: number | null;
   anchorEventSeq?: number;
   blockSeq?: number;
-  /**
-   * 冻结的语义阶段号。节点首次落位时计算并固化，后续流式更新不再重算。
-   * 若提供此值，排序时优先使用，忽略 messageType/primaryToolCallName 的动态计算。
-   */
-  frozenSemanticStage?: number;
 }
 
 function normalizeNonNegativeInteger(value: number | null | undefined): number | null {
@@ -134,30 +123,6 @@ export function compareTimelineSemanticOrder(
   left: TimelineSemanticOrderInput,
   right: TimelineSemanticOrderInput,
 ): number {
-  const leftDisplayOrder = normalizeNonNegativeInteger(left.displayOrder);
-  const rightDisplayOrder = normalizeNonNegativeInteger(right.displayOrder);
-  if (leftDisplayOrder !== null && rightDisplayOrder !== null && leftDisplayOrder !== rightDisplayOrder) {
-    return leftDisplayOrder - rightDisplayOrder;
-  }
-
-  const leftItemOrder = normalizePositiveInteger(left.itemOrder);
-  const rightItemOrder = normalizePositiveInteger(right.itemOrder);
-  if (leftItemOrder !== null && rightItemOrder !== null && leftItemOrder !== rightItemOrder) {
-    return leftItemOrder - rightItemOrder;
-  }
-
-  if (left.timestamp !== right.timestamp) {
-    return left.timestamp - right.timestamp;
-  }
-
-  const leftStage = left.frozenSemanticStage
-    ?? resolveMessageSemanticStage(left.messageType, left.primaryToolCallName || '');
-  const rightStage = right.frozenSemanticStage
-    ?? resolveMessageSemanticStage(right.messageType, right.primaryToolCallName || '');
-  if (leftStage !== rightStage) {
-    return leftStage - rightStage;
-  }
-
   const leftAnchorEventSeq = normalizePositiveInteger(left.anchorEventSeq);
   const rightAnchorEventSeq = normalizePositiveInteger(right.anchorEventSeq);
   if (
@@ -172,6 +137,10 @@ export function compareTimelineSemanticOrder(
   const rightBlockSeq = normalizeNonNegativeInteger(right.blockSeq) || 0;
   if (leftBlockSeq !== rightBlockSeq) {
     return leftBlockSeq - rightBlockSeq;
+  }
+
+  if (left.timestamp !== right.timestamp) {
+    return left.timestamp - right.timestamp;
   }
 
   return left.stableId.localeCompare(right.stableId);

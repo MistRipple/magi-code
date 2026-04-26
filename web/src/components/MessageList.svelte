@@ -400,7 +400,6 @@
     const canObserveHistory = Boolean(
       container
       && sentinel
-      && displayContext === 'thread'
       && isActive
       && sessionId
       && historyState.sessionId === sessionId
@@ -434,7 +433,7 @@
   });
 
   async function loadOlderHistory(): Promise<void> {
-    if (!containerRef || displayContext !== 'thread' || !isActive) {
+    if (!containerRef || !isActive) {
       return;
     }
     const sessionId = (messagesState.currentSessionId || '').trim();
@@ -511,7 +510,7 @@
     }
     lastObservedScrollTop = scrollTop;
     syncPanelScrollState(scrollTop, nextAutoScroll);
-    if (displayContext === 'thread' && scrollTop <= HISTORY_LOAD_THRESHOLD_PX) {
+    if (scrollTop <= HISTORY_LOAD_THRESHOLD_PX) {
       void loadOlderHistory();
     }
   }
@@ -519,7 +518,6 @@
   function handleWheel(event: WheelEvent) {
     if (
       event.deltaY < 0
-      && displayContext === 'thread'
       && containerRef
       && containerRef.scrollTop <= HISTORY_LOAD_THRESHOLD_PX
     ) {
@@ -554,7 +552,7 @@
     data-display-context={displayContext}
     data-panel-active={isActive ? 'true' : 'false'}
   >
-    {#if displayContext === 'thread' && safeRenderItems.length > 0}
+    {#if safeRenderItems.length > 0}
       <div class="history-sentinel" bind:this={historySentinelRef} aria-hidden="true"></div>
     {/if}
     {#if safeRenderItems.length === 0}

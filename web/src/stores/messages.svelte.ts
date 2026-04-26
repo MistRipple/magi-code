@@ -50,18 +50,15 @@ import {
   resolveTimelineBlockSeqFromMetadata,
   resolveTimelineCardStreamSeqFromMetadata,
   resolveTimelineEventSeqFromMetadata,
-  resolveTimelineSemanticMessageType,
   resolveStableTimelinePlacementTimestamp,
   resolveTimelineSortTimestamp,
   resolveTimelineVersionFromMetadata,
 } from '../shared/timeline-ordering';
 import {
   collectTimelineAliasIds,
-  resolveTimelinePrimaryToolCallName,
   resolveTimelinePresentationKind,
   resolveTimelineWorkerVisibility as resolveSharedTimelineWorkerVisibility,
 } from '../shared/timeline-presentation';
-import { resolveMessageSemanticStage } from '../shared/timeline-semantic-stage';
 import {
   resolveTimelineWorkerId,
 } from '../shared/timeline-worker-lifecycle';
@@ -506,8 +503,11 @@ function normalizeComparableMessageText(message: Message | undefined): string {
       if (!block || typeof block !== 'object') {
         return '';
       }
-      if (block.type === 'text' && typeof block.content === 'string') {
+      if ((block.type === 'text' || block.type === 'thinking') && typeof block.content === 'string') {
         return block.content.trim();
+      }
+      if (block.type === 'thinking' && typeof block.thinking?.content === 'string') {
+        return block.thinking.content.trim();
       }
       return '';
     })
@@ -849,6 +849,12 @@ function collectMessageIdentityKeys(message: Message | undefined): Set<string> {
   add(metadata?.rustStreamItemId);
   add(metadata?.rustEventItemId);
   add(metadata?.turnItemId);
+  add(metadata?.toolCallId);
+  const turnId = typeof metadata?.turnId === 'string' ? metadata.turnId.trim() : '';
+  const turnItemId = typeof metadata?.turnItemId === 'string' ? metadata.turnItemId.trim() : '';
+  if (turnId && turnItemId) {
+    add(`turn:${turnId}:${turnItemId}`);
+  }
   return keys;
 }
 
@@ -1273,9 +1279,6 @@ function executionItemToOrderInput(item: TimelineExecutionItem): TimelineSemanti
   return {
     timestamp: item.timestamp,
     stableId: item.itemId,
-    itemOrder: item.itemOrder,
-    messageType: item.message?.type,
-    primaryToolCallName: resolveTimelinePrimaryToolCallName(item.message?.blocks),
     anchorEventSeq: item.anchorEventSeq,
     blockSeq: getMessageBlockSeq(item.message),
   };
@@ -1288,10 +1291,7 @@ function buildFragmentExecutionItems(
   return messages
     .map((message) => buildExecutionItemFromMessage(message, visibility))
     .sort((a, b) => compareTimelineSemanticOrder(executionItemToOrderInput(a), executionItemToOrderInput(b)))
-    .map((item, index) => normalizeTimelineExecutionItem({
-      ...item,
-      itemOrder: index + 1,
-    }));
+    .map((item) => normalizeTimelineExecutionItem(item));
 }
 
 function normalizeTimelineNode(node: TimelineNode): TimelineNode {
@@ -1334,11 +1334,6 @@ function normalizeTimelineNode(node: TimelineNode): TimelineNode {
     .map((item) => normalizeTimelineExecutionItem(item))
     .sort((a, b) => compareTimelineSemanticOrder(executionItemToOrderInput(a), executionItemToOrderInput(b)));
   const laneOrder = normalizeTimelineLaneOrder(node.laneOrder);
-  const frozenSemanticStage = node.frozenSemanticStage
-    ?? resolveMessageSemanticStage(
-      stableMessage.type,
-      resolveTimelinePrimaryToolCallName(stableMessage.blocks),
-    );
   return {
     nodeId: stableNodeId,
     kind: node.kind || resolveTimelineNodeKind(stableMessage),
@@ -1353,7 +1348,6 @@ function normalizeTimelineNode(node: TimelineNode): TimelineNode {
     latestEventSeq,
     cardStreamSeq,
     timestamp: mergeTimelineSortTimestamp(node.timestamp, stableMessage),
-    frozenSemanticStage,
     ...(cardId ? { cardId } : {}),
     ...(dispatchWaveId ? { dispatchWaveId } : {}),
     ...(laneId ? { laneId } : {}),
@@ -1400,18 +1394,11 @@ function rebuildTimelineIndexes(): void {
 }
 
 function nodeToOrderInput(node: TimelineNode): TimelineSemanticOrderInput {
-  // 跨节点排序不使用 displayOrder：
-  // displayOrder 按消息到达顺序递增分配，如果 Worker 卡片在 orchestrator 消息之后到达，
-  // 它会获得更大的 displayOrder 值而被压到底部——即使它的 anchor timestamp 更早。
-  // 与 render entry 排序保持一致：displayOrder 只在 sameGroup 内使用。
   return {
     timestamp: node.timestamp,
     stableId: node.nodeId,
-    messageType: node.message?.type,
-    primaryToolCallName: resolveTimelinePrimaryToolCallName(node.message?.blocks),
     anchorEventSeq: node.anchorEventSeq,
     blockSeq: getMessageBlockSeq(node.message),
-    frozenSemanticStage: node.frozenSemanticStage,
   };
 }
 
@@ -1445,25 +1432,12 @@ function shouldRenderTimelineNodeHost(
   return true;
 }
 
-function renderEntryToOrderInput(
-  entry: LocalProjectionFlatRenderEntry,
-  sameGroup: boolean,
-): TimelineSemanticOrderInput {
+function renderEntryToOrderInput(entry: LocalProjectionFlatRenderEntry): TimelineSemanticOrderInput {
   return {
     timestamp: entry.timestamp,
     stableId: entry.entryId,
-    displayOrder: sameGroup ? entry.displayOrder : undefined,
-    itemOrder: sameGroup ? entry.itemOrder : undefined,
-    messageType: resolveTimelineSemanticMessageType(
-      entry.message?.type,
-      entry.message?.metadata && typeof entry.message.metadata === 'object'
-        ? entry.message.metadata as Record<string, unknown>
-        : undefined,
-    ),
-    primaryToolCallName: resolveTimelinePrimaryToolCallName(entry.message?.blocks),
     anchorEventSeq: entry.anchorEventSeq,
-    blockSeq: sameGroup ? entry.blockSeq : undefined,
-    frozenSemanticStage: entry.frozenSemanticStage,
+    blockSeq: entry.blockSeq,
   };
 }
 
@@ -1471,10 +1445,9 @@ function compareRenderEntryOrder(
   left: LocalProjectionFlatRenderEntry,
   right: LocalProjectionFlatRenderEntry,
 ): number {
-  const sameGroup = left.groupId === right.groupId;
   return compareTimelineSemanticOrder(
-    renderEntryToOrderInput(left, sameGroup),
-    renderEntryToOrderInput(right, sameGroup),
+    renderEntryToOrderInput(left),
+    renderEntryToOrderInput(right),
   );
 }
 
@@ -1617,8 +1590,6 @@ function artifactToOrderInput(artifact: TimelineProjectionArtifact): TimelineSem
   return {
     timestamp: artifact.timestamp,
     stableId: artifact.artifactId,
-    messageType: artifact.message?.type,
-    primaryToolCallName: resolveTimelinePrimaryToolCallName(artifact.message?.blocks),
     anchorEventSeq: artifact.anchorEventSeq,
     blockSeq: getMessageBlockSeq(artifact.message),
   };
@@ -1632,11 +1603,7 @@ function canonicalizeProjectionExecutionItems(
       ...item,
       message: normalizeProjectionRestoredMessage(item.message),
     }))
-    .sort((a, b) => compareTimelineSemanticOrder(executionItemToOrderInput(a), executionItemToOrderInput(b)))
-    .map((item, index) => normalizeTimelineExecutionItem({
-      ...item,
-      itemOrder: index + 1,
-    }));
+    .sort((a, b) => compareTimelineSemanticOrder(executionItemToOrderInput(a), executionItemToOrderInput(b)));
 }
 
 function canonicalizeTimelineProjection(
@@ -1735,11 +1702,7 @@ function buildLiveTimelineProjection(
   const artifacts: TimelineProjectionArtifact[] = normalizedNodes.map((node, index) => {
     const executionItems = ensureArray<TimelineExecutionItem>(node.executionItems)
       .map((item) => normalizeTimelineExecutionItem(item))
-      .sort((a, b) => compareTimelineSemanticOrder(executionItemToOrderInput(a), executionItemToOrderInput(b)))
-      .map((item, itemIndex) => normalizeTimelineExecutionItem({
-        ...item,
-        itemOrder: item.itemOrder || (itemIndex + 1),
-      }));
+      .sort((a, b) => compareTimelineSemanticOrder(executionItemToOrderInput(a), executionItemToOrderInput(b)));
 
     return {
       artifactId: node.nodeId,
@@ -1828,7 +1791,7 @@ function syncTimelineProjectionFromNodes(
 
 /**
  * 增量补丁投影：仅更新指定节点对应的 artifact，跳过全量 normalize + sort。
- * 前提：内容性更新不改变排序位置（由 frozenSemanticStage 保证）。
+ * 前提：内容性更新不改变后端事件序列。
  */
 function patchProjectionArtifactsInPlace(
   patchedNodes: Map<string, TimelineNode>,
@@ -1919,15 +1882,6 @@ function isStructuralTimelineUpdate(
     return true;
   }
 
-  // blocks 变化 → 检查是否改变了 primaryToolCallName
-  if (updates.blocks !== undefined) {
-    const currentPrimaryTool = resolveTimelinePrimaryToolCallName(currentMessage.blocks);
-    const newPrimaryTool = resolveTimelinePrimaryToolCallName(updates.blocks);
-    if (currentPrimaryTool !== newPrimaryTool) {
-      return true;
-    }
-  }
-
   // lifecycleKey 变化 → 结构性
   if (updates.metadata !== undefined) {
     const currentCardId = currentNode.cardId;
@@ -1950,7 +1904,7 @@ function isStructuralTimelineUpdate(
 /**
  * 增量更新路径：直接更新目标节点的消息内容，跳过全量 normalize-sort-reindex。
  *
- * 前提：RC2 的 frozenSemanticStage 保证内容性更新不改变排序位置。
+ * 前提：后端事件序列保证内容性更新不改变排序位置。
  * 此函数仅更新节点消息，不触发 sortAndSyncTimelineNodes，
  * 通过 Svelte 5 $state 代理的数组索引赋值触发响应式更新。
  */
@@ -2088,7 +2042,6 @@ export function upsertTimelineNode(
     displayOrder: existingNode?.displayOrder ?? options.displayOrder ?? (++timelineDisplayOrderCounter),
     laneOrder: existingNode?.laneOrder,
     artifactVersion: existingNode?.artifactVersion,
-    frozenSemanticStage: existingNode?.frozenSemanticStage,
     anchorEventSeq: existingNode?.anchorEventSeq || nextAnchorEventSeq,
     latestEventSeq: Math.max(existingNode?.latestEventSeq || 0, nextLatestEventSeq),
     cardStreamSeq: Math.max(existingNode?.cardStreamSeq || 0, nextCardStreamSeq),
@@ -2514,87 +2467,6 @@ export const retryRuntimeState = $state({
 // 🔧 修复响应式追踪问题：通过 messagesState 对象属性访问
 // Svelte 5 官方推荐：导出对象属性读取，确保响应式追踪正常
 
-export function getThreadMessages() {
-  return messageProjection.thread;
-}
-
-export function getAgentOutputs() {
-  return messageProjection.workers as AgentOutputs;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && !Array.isArray(value);
-}
-
-function normalizeRuntimeStatus(value: unknown): string {
-  return typeof value === 'string' ? value.trim().toLowerCase() : '';
-}
-
-function isActiveRuntimeStatus(value: unknown): boolean {
-  return ['pending', 'running', 'executing', 'inflight', 'waiting_deps'].includes(normalizeRuntimeStatus(value));
-}
-
-function blockHasRunningExecutionContent(block: unknown): boolean {
-  if (!isRecord(block)) {
-    return false;
-  }
-  const blockType = typeof block.type === 'string' ? block.type : '';
-  if (blockType === 'tool_call') {
-    const nestedToolCall = isRecord(block.toolCall) ? block.toolCall : null;
-    return isActiveRuntimeStatus(nestedToolCall?.status ?? block.status);
-  }
-  if (blockType === 'dispatch_group') {
-    if (isActiveRuntimeStatus(block.status)) {
-      return true;
-    }
-    const lanes = ensureArray<Record<string, unknown>>(block.lanes);
-    return lanes.some((lane) => (
-      isActiveRuntimeStatus(lane.status)
-      || ensureArray<Record<string, unknown>>(lane.tasks).some((task) => isActiveRuntimeStatus(task.status))
-    ));
-  }
-  return false;
-}
-
-function messageHasRunningExecutionContent(message: unknown): boolean {
-  if (!isRecord(message)) {
-    return false;
-  }
-  return ensureArray(message.blocks).some(blockHasRunningExecutionContent);
-}
-
-export function hasRunningExecutionContent(): boolean {
-  if (messageProjection.thread.some(messageHasRunningExecutionContent)) {
-    return true;
-  }
-  return Object.values(messageProjection.workers)
-    .some((messages) => ensureArray(messages).some(messageHasRunningExecutionContent));
-}
-
-export function getCurrentBottomTab() {
-  return messagesState.currentBottomTab;
-}
-
-export function getCurrentTopTab() {
-  return messagesState.currentTopTab;
-}
-
-export function getIsProcessing() {
-  return messagesState.isProcessing;
-}
-
-export function getThinkingStartAt() {
-  return messagesState.thinkingStartAt;
-}
-
-export function getProcessingActor() {
-  return messagesState.processingActor;
-}
-
-export function getSessions() {
-  return messagesState.sessions;
-}
-
 export function getCurrentSessionId() {
   return messagesState.currentSessionId;
 }
@@ -2603,36 +2475,8 @@ export function getQueuedMessages() {
   return messagesState.queuedMessages;
 }
 
-export function getAppState() {
-  return messagesState.appState;
-}
-
-export function getScrollPositions() {
-  return messagesState.scrollPositions;
-}
-
-export function getScrollAnchors() {
-  return messagesState.scrollAnchors;
-}
-
-export function getAutoScrollEnabled() {
-  return messagesState.autoScrollEnabled;
-}
-
-export function getEdits() {
-  return edits;
-}
-
-export function getOrchestratorRuntimeState() {
-  return messagesState.orchestratorRuntimeState;
-}
-
 export function getToasts() {
   return toasts;
-}
-
-export function getModelStatus() {
-  return modelStatus;
 }
 
 export function getEnabledAgents() {
@@ -2641,10 +2485,6 @@ export function getEnabledAgents() {
 
 export function setEnabledAgents(agents: EnabledAgent[]) {
   enabledAgents = agents;
-}
-
-export function getWaveState() {
-  return waveState;
 }
 
 // ============ getState() 仅用于现有调用方（Svelte 5 迁移中）============
@@ -3078,13 +2918,6 @@ export function enqueueQueuedMessage(message: QueuedMessage) {
   ]);
 }
 
-export function prependQueuedMessage(message: QueuedMessage) {
-  setQueuedMessages([
-    message,
-    ...messagesState.queuedMessages,
-  ]);
-}
-
 export function dequeueQueuedMessage(): QueuedMessage | null {
   const [next, ...rest] = messagesState.queuedMessages;
   setQueuedMessages(rest);
@@ -3125,10 +2958,6 @@ export function markQueuedMessageAsGuide(id: string): boolean {
 export function setIsProcessing(value: boolean) {
   messagesState.backendProcessing = value;
   updateProcessingState();
-}
-
-export function setThinkingStartAt(value: number | null) {
-  messagesState.thinkingStartAt = value;
 }
 
 export function setProcessingActor(source: string, agent?: string) {
@@ -3278,12 +3107,7 @@ export function clearProcessingState(options?: {
 }
 
 export function settleProcessingForManualInteraction() {
-  for (const binding of requestBindings.values()) {
-    if (binding.timeoutId) {
-      clearTimeout(binding.timeoutId);
-    }
-  }
-  requestBindings = new Map();
+  clearPendingInteractions();
   clearProcessingState();
 }
 
@@ -3380,6 +3204,13 @@ export function getBackendProcessing(): boolean {
 }
 
 export function clearPendingInteractions() {
+  for (const binding of requestBindings.values()) {
+    if (binding.timeoutId) {
+      clearTimeout(binding.timeoutId);
+    }
+  }
+  requestBindings = new Map();
+  messagesState.pendingRequests = new Set();
 }
 
 function recomputeUnreadNotificationCount() {
@@ -3839,6 +3670,7 @@ export function applyStreamingDelta(
       isComplete: false,
       updatedAt: Date.now(),
     });
+    markMessageActive(nodeId);
   } else {
     const now = Date.now();
     upsertTimelineNode({
@@ -3856,6 +3688,8 @@ export function applyStreamingDelta(
         sessionId: sessionId || messagesState.currentSessionId || '',
         eventSeq: 0,
         timelineAnchorTimestamp: now,
+        turnItemId: collectorKey,
+        rustStreamItemId: collectorKey,
         requestId: options.requestId || undefined,
         userMessageId: options.userMessageId || undefined,
         placeholderMessageId: options.replaceMessageId || undefined,
@@ -3864,6 +3698,7 @@ export function applyStreamingDelta(
       displayOrder: undefined,
       replaceMessageId: options.replaceMessageId,
     });
+    markMessageActive(nodeId);
   }
 }
 

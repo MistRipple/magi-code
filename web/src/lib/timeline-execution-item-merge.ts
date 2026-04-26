@@ -1,9 +1,7 @@
 import {
   compareTimelineSemanticOrder,
   resolveTimelineBlockSeqFromMetadata,
-  resolveTimelineSemanticMessageType,
 } from '../shared/timeline-ordering';
-import { resolveTimelinePrimaryToolCallName } from '../shared/timeline-presentation';
 import type { Message, TimelineExecutionItem } from '../types/message';
 import { mergeCompleteBlocksForFinalization } from './streaming-complete-merge';
 
@@ -19,18 +17,12 @@ function compareExecutionItems(left: TimelineExecutionItem, right: TimelineExecu
     {
       timestamp: left.timestamp,
       stableId: left.itemId,
-      itemOrder: left.itemOrder,
-      messageType: resolveTimelineSemanticMessageType(left.message.type, left.message.metadata as Record<string, unknown> | undefined),
-      primaryToolCallName: resolveTimelinePrimaryToolCallName(left.message.blocks),
       anchorEventSeq: left.anchorEventSeq,
       blockSeq: resolveMessageBlockSeq(left.message),
     },
     {
       timestamp: right.timestamp,
       stableId: right.itemId,
-      itemOrder: right.itemOrder,
-      messageType: resolveTimelineSemanticMessageType(right.message.type, right.message.metadata as Record<string, unknown> | undefined),
-      primaryToolCallName: resolveTimelinePrimaryToolCallName(right.message.blocks),
       anchorEventSeq: right.anchorEventSeq,
       blockSeq: resolveMessageBlockSeq(right.message),
     },
@@ -44,10 +36,10 @@ export function mergeFragmentExecutionItems(params: {
   const existingItems = Array.isArray(params.existingItems) ? params.existingItems : [];
   const nextItems = Array.isArray(params.nextItems) ? params.nextItems : [];
   if (existingItems.length === 0) {
-    return nextItems.map((item, index) => ({ ...item, itemOrder: index + 1 }));
+    return nextItems.slice().sort(compareExecutionItems);
   }
   if (nextItems.length === 0) {
-    return existingItems.map((item, index) => ({ ...item, itemOrder: index + 1 }));
+    return existingItems.slice().sort(compareExecutionItems);
   }
 
   const existingById = new Map(existingItems.map((item) => [item.itemId, item]));
@@ -94,7 +86,5 @@ export function mergeFragmentExecutionItems(params: {
     }
   }
 
-  return merged
-    .sort(compareExecutionItems)
-    .map((item, index) => ({ ...item, itemOrder: index + 1 }));
+  return merged.sort(compareExecutionItems);
 }

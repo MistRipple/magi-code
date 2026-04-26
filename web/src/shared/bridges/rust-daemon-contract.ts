@@ -1708,6 +1708,39 @@ function compareProjectionArtifactOrder(
   return left.artifactId.localeCompare(right.artifactId);
 }
 
+function resolveProjectionArtifactToolCallId(
+  artifact: TimelineProjectionArtifact,
+): string {
+  const message = artifact.message as { metadata?: Record<string, unknown> } | undefined;
+  const metadata = message?.metadata;
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    return '';
+  }
+  return normalizeString(metadata.toolCallId || metadata.tool_call_id);
+}
+
+function projectionArtifactDedupKey(artifact: TimelineProjectionArtifact): string {
+  const toolCallId = resolveProjectionArtifactToolCallId(artifact);
+  if (toolCallId) {
+    return `tool:${toolCallId}`;
+  }
+  return artifact.artifactId;
+}
+
+function projectionArtifactPreferenceScore(artifact: TimelineProjectionArtifact): number {
+  let score = 0;
+  if (artifact.artifactId.startsWith('turn:')) {
+    score += 100;
+  } else if (artifact.artifactId.startsWith('rust-tool:')) {
+    score += 50;
+  }
+  score += normalizeNumber(artifact.message?.blocks?.length, 0);
+  score += normalizeNumber(artifact.executionItems?.length, 0);
+  score += normalizeString(artifact.message?.content).trim().length > 0 ? 5 : 0;
+  score += normalizeNumber(artifact.latestEventSeq, 0) / 1_000_000_000;
+  return score;
+}
+
 function mergeProjectionArtifacts(
   groups: TimelineProjectionArtifact[][],
 ): TimelineProjectionArtifact[] {
@@ -1717,7 +1750,20 @@ function mergeProjectionArtifacts(
       if (!artifact.artifactId) {
         continue;
       }
-      artifactById.set(artifact.artifactId, artifact);
+      const dedupKey = projectionArtifactDedupKey(artifact);
+      const existing = artifactById.get(dedupKey);
+      if (!existing) {
+        artifactById.set(dedupKey, artifact);
+        continue;
+      }
+      const existingScore = projectionArtifactPreferenceScore(existing);
+      const candidateScore = projectionArtifactPreferenceScore(artifact);
+      if (
+        candidateScore > existingScore
+        || (candidateScore === existingScore && compareProjectionArtifactOrder(existing, artifact) < 0)
+      ) {
+        artifactById.set(dedupKey, artifact);
+      }
     }
   }
   return [...artifactById.values()].sort(compareProjectionArtifactOrder);
@@ -1736,10 +1782,12 @@ function collectProjectionArtifactIdentityIds(
   for (const artifact of artifacts) {
     add(artifact.artifactId);
     add(artifact.message?.id);
+    add(resolveProjectionArtifactToolCallId(artifact));
     for (const messageId of artifact.messageIds || []) add(messageId);
     for (const item of artifact.executionItems || []) {
       add(item.itemId);
       add(item.message?.id);
+      add(normalizeString((item.message as { metadata?: Record<string, unknown> } | undefined)?.metadata?.toolCallId));
       for (const messageId of item.messageIds || []) add(messageId);
     }
   }
@@ -1760,12 +1808,16 @@ function projectionArtifactHasKnownIdentity(
   if (matches(artifact.artifactId) || matches(artifact.message?.id)) {
     return true;
   }
+  if (matches(resolveProjectionArtifactToolCallId(artifact))) {
+    return true;
+  }
   if ((artifact.messageIds || []).some(matches)) {
     return true;
   }
   return (artifact.executionItems || []).some((item) => (
     matches(item.itemId)
     || matches(item.message?.id)
+    || matches(normalizeString((item.message as { metadata?: Record<string, unknown> } | undefined)?.metadata?.toolCallId))
     || (item.messageIds || []).some(matches)
   ));
 }
@@ -2041,39 +2093,32 @@ function buildCurrentTurnArtifacts(
   );
 }
 
+const USER_VISIBLE_RUNTIME_NOTICE_EVENT_TYPES = new Set([
+  'session.turn.failed',
+  'task.failed',
+]);
+
+function resolveEventTextPayload(payload: Record<string, unknown>): string {
+  return normalizeString(payload.text)
+    || normalizeString(payload.message)
+    || normalizeString(payload.error)
+    || normalizeString(payload.reason);
+}
+
 function summarizeRustEvent(event: RustEventEnvelope): string {
   const eventType = normalizeString(event.event_type);
   const payload = event.payload || {};
-  const text = normalizeString(payload.text);
+  const text = resolveEventTextPayload(payload);
+  if (!USER_VISIBLE_RUNTIME_NOTICE_EVENT_TYPES.has(eventType)) {
+    return '';
+  }
   switch (eventType) {
-    case 'session.action.accepted':
-      return text || '已提交会话消息';
-    case 'session.continue.executed':
-      return '已继续当前会话执行链';
-    case 'recovery.resume.executed':
-      return '已执行恢复流程';
-    case 'mission.created':
-      return '已创建任务链';
-    case 'assignment.created':
-      return '已创建执行分配';
-    case 'task.created':
-      return '已创建任务';
-    case 'task.dispatched':
-      return '任务开始执行';
-    case 'task.completed':
-      return '任务已完成';
     case 'task.failed':
-      return '任务执行失败';
-    case 'mission.execution.overview':
-      return '执行概览已更新';
-    case 'mission.resumed.from_recovery':
-      return '任务链已从恢复继续';
-    case 'worker.resumed.from_recovery':
-      return 'Worker 已从恢复继续';
-    case 'worker.resumed.from_dispatch':
-      return 'Worker 已接入执行链';
+      return text || '任务执行失败';
+    case 'session.turn.failed':
+      return text || '回复生成失败';
     default:
-      return `事件：${eventType}`;
+      return text;
   }
 }
 
@@ -2240,6 +2285,12 @@ function buildToolArtifacts(
         });
       }
       const artifactId = `rust-tool:${entry.toolCallId}`;
+      const messageIds = Array.from(new Set([
+        artifactId,
+        entry.toolCallId,
+        `rust-timeline:turn-item-tool-started-${entry.toolCallId}`,
+        `rust-timeline:turn-item-tool-result-${entry.toolCallId}`,
+      ]));
       return {
         artifactId,
         kind: 'message',
@@ -2251,7 +2302,7 @@ function buildToolArtifacts(
         dispatchWaveId: entry.missionId || undefined,
         threadVisible: true,
         workerTabs: entry.workerId ? [entry.workerId] : [],
-        messageIds: [artifactId],
+        messageIds,
         message: createRustTimelineMessage({
           id: artifactId,
           content: '',
@@ -2267,6 +2318,8 @@ function buildToolArtifacts(
             taskId: entry.taskId || undefined,
             missionId: entry.missionId || undefined,
             worker: entry.workerId || undefined,
+            toolCallId: entry.toolCallId,
+            toolName: entry.toolName,
           },
         }),
       };
@@ -2313,23 +2366,8 @@ function buildEventArtifacts(
       const sequence = normalizeNumber(event.sequence, 0);
       const artifacts: TimelineProjectionArtifact[] = [];
 
-      const eventType = normalizeString(event.event_type);
-      const suppressedTypes = [
-        'session.action.accepted',
-        'tool.invoked', 'tool.usage.recorded',
-        'task.llm.started', 'task.llm.completed', 'task.llm.delta',
-        'task.tool.invoked',
-        'task.lease.granted', 'task.lease.completed',
-        'task.ready', 'task.started',
-        'task.status.changed',
-        'task.graph.created',
-        'task.dispatched', 'task.completed', 'task.failed',
-        'message.created',
-        'mission.execution.overview',
-        'mission.created', 'assignment.created',
-        'task.created',
-      ];
-      if (suppressedTypes.some((t) => eventType === t)) {
+      const content = summarizeRustEvent(event);
+      if (!content) {
         return artifacts;
       }
 
@@ -2346,7 +2384,7 @@ function buildEventArtifacts(
         messageIds: [`rust-event:${eventId}`],
         message: createRustTimelineMessage({
           id: `rust-event:${eventId}`,
-          content: summarizeRustEvent(event),
+          content,
           timestamp,
           sessionId,
           eventSeq: sequence,
