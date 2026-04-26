@@ -25,13 +25,14 @@ use magi_memory_store::MemoryStore;
 use magi_orchestrator::{
     OrchestratedExecutionRuntime, OrchestratorService,
     task_runner::{
-        EventBasedResultReceiver, EventBasedTaskDispatcher, LlmGraphReflector, RunCycleOutcome,
-        TaskDispatcher, TaskResultReceiver, TaskRunner, WorkerExecutionDispatcher, WorkerInfo,
+        EventBasedResultReceiver, EventBasedTaskDispatcher, RunCycleOutcome, TaskDispatcher,
+        TaskResultReceiver, TaskRunner, WorkerExecutionDispatcher, WorkerInfo,
     },
     task_store::TaskStore,
     task_worker_catalog::build_worker_catalog_for_roles,
 };
 use magi_session_store::SessionStore;
+use magi_tool_runtime::ToolRegistry;
 use magi_workspace::WorkspaceStore;
 use std::collections::HashMap;
 use std::fs;
@@ -69,8 +70,6 @@ pub struct RunnerManager {
     /// Maps a session to the root task IDs whose runners should be cancelled
     /// when the session is closed (design 1.5: Session-Runner linkage).
     session_runner_index: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
-    /// Optional model bridge client for LLM-based graph reflection.
-    model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
 }
 
 /// Number of runner cycles between periodic checkpoints.
@@ -94,7 +93,6 @@ impl RunnerManager {
             event_bus: None,
             result_receiver: Arc::new(EventBasedResultReceiver::new()),
             checkpoint_path: None,
-            model_bridge_client: None,
             session_runner_index: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -131,7 +129,6 @@ impl RunnerManager {
             event_bus: Some(event_bus),
             result_receiver,
             checkpoint_path: None,
-            model_bridge_client: None,
             session_runner_index: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -150,7 +147,6 @@ impl RunnerManager {
             event_bus: None,
             result_receiver,
             checkpoint_path: None,
-            model_bridge_client: None,
             session_runner_index: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -175,7 +171,6 @@ impl RunnerManager {
             event_bus,
             result_receiver,
             checkpoint_path: None,
-            model_bridge_client: None,
             session_runner_index: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -203,11 +198,6 @@ impl RunnerManager {
         } else {
             TaskRunner::new(Arc::clone(&self.task_store), workers)
         };
-        let runner = if let Some(ref client) = self.model_bridge_client {
-            runner.with_reflector(Arc::new(LlmGraphReflector::new(Arc::clone(client))))
-        } else {
-            runner
-        };
         if let Some(ref event_bus) = self.event_bus {
             runner.with_event_bus(Arc::clone(event_bus))
         } else {
@@ -218,12 +208,6 @@ impl RunnerManager {
     /// Set the file path used for periodic task-store checkpoints.
     pub fn with_checkpoint_path(mut self, path: PathBuf) -> Self {
         self.checkpoint_path = Some(path);
-        self
-    }
-
-    /// Attach a model bridge client for LLM-based graph reflection.
-    pub fn with_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
-        self.model_bridge_client = Some(client);
         self
     }
 
@@ -440,6 +424,14 @@ impl RunnerManager {
         self.build_task_runner().pause_task(&tid)
     }
 
+    pub fn pause_task(&self, task_id: &str) -> Result<(), String> {
+        let tid = TaskId::new(task_id);
+        self.task_store
+            .get_task(&tid)
+            .ok_or_else(|| format!("任务不存在: {}", task_id))?;
+        self.build_task_runner().pause_task(&tid)
+    }
+
     pub fn resume_tree(&self, root_task_id: &str) -> Result<(), String> {
         let tid = TaskId::new(root_task_id);
         self.task_store
@@ -511,6 +503,7 @@ pub struct ApiState {
     mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
     model_bridge_client_is_real: bool,
+    tool_registry: Option<ToolRegistry>,
     pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     pub tunnel_manager: crate::tunnel::TunnelManager,
 }
@@ -617,6 +610,7 @@ impl ApiState {
             mcp_connections: Arc::new(RwLock::new(HashMap::new())),
             model_bridge_client: None,
             model_bridge_client_is_real: false,
+            tool_registry: None,
             skill_runtime: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
         }
@@ -675,6 +669,11 @@ impl ApiState {
             execution_runtime,
             memory_store,
         });
+        self
+    }
+
+    pub fn with_tool_registry(mut self, tool_registry: ToolRegistry) -> Self {
+        self.tool_registry = Some(tool_registry);
         self
     }
 
@@ -805,6 +804,7 @@ impl ApiState {
             "safeguardConfig": object_section(&snapshot, "safeguardConfig"),
             "repositories": array_section(&snapshot, "repositories"),
             "mcpServers": array_section(&snapshot, "mcpServers"),
+            "builtinTools": self.builtin_tools_json(),
             "workerStatuses": object_section(&snapshot, "workerStatuses"),
             "runtimeSettings": runtime_settings_from_snapshot(&snapshot),
             "roleTemplates": builtin_role_templates(),
@@ -813,6 +813,41 @@ impl ApiState {
             "bootstrapScope": "full",
             "mcpServersHydrated": true,
         })
+    }
+
+    fn builtin_tools_json(&self) -> serde_json::Value {
+        let Some(registry) = &self.tool_registry else {
+            return serde_json::Value::Array(Vec::new());
+        };
+        let mut tools = registry
+            .builtin_specs()
+            .into_iter()
+            .map(|spec| {
+                let access_mode = registry
+                    .builtin_access_mode(&spec.name)
+                    .map(|mode| mode.as_str())
+                    .unwrap_or("read_only");
+                serde_json::json!({
+                    "name": spec.name,
+                    "riskLevel": spec.risk_level,
+                    "approvalRequirement": spec.approval_requirement,
+                    "accessMode": access_mode,
+                    "enabled": true,
+                })
+            })
+            .collect::<Vec<_>>();
+        tools.sort_by(|left, right| {
+            left.get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .cmp(
+                    right
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                )
+        });
+        serde_json::Value::Array(tools)
     }
 
     pub fn settings_runtime_json(&self) -> serde_json::Value {

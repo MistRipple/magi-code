@@ -369,17 +369,19 @@ impl ShadowDaemonRuntime {
             Ok(Some(restored)) => {
                 let eb = event_bus_for_task_store.clone();
                 let receiver = runner_result_receiver.clone();
-                restored.set_status_change_callback(Box::new(move |task_id, new_status, task: magi_core::Task| {
-                    let event = magi_event_bus::task_events::task_status_changed_event(
-                        &task_id.to_string(),
-                        &task.mission_id.to_string(),
-                        "",
-                        &format!("{:?}", new_status),
-                        &format!("{:?}", task.kind),
-                    );
-                    let _ = eb.publish(event);
-                    push_terminal_task_result(&receiver, task_id, new_status);
-                }));
+                restored.set_status_change_callback(Box::new(
+                    move |task_id, new_status, task: magi_core::Task| {
+                        let event = magi_event_bus::task_events::task_status_changed_event(
+                            &task_id.to_string(),
+                            &task.mission_id.to_string(),
+                            "",
+                            &format!("{:?}", new_status),
+                            &format!("{:?}", task.kind),
+                        );
+                        let _ = eb.publish(event);
+                        push_terminal_task_result(&receiver, task_id, new_status);
+                    },
+                ));
                 let (revoked_leases, blocked_tasks) = restored
                     .reconcile_volatile_runtime_after_restore(&worker_runtime.durable_snapshot());
                 if revoked_leases > 0 || blocked_tasks > 0 {
@@ -439,6 +441,7 @@ impl ShadowDaemonRuntime {
         .with_knowledge_store(self.knowledge_store.clone())
         .with_settings_store(settings_store.clone())
         .with_skill_runtime(app_skill_runtime.clone())
+        .with_tool_registry(tool_registry_for_dispatcher.clone())
         .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
             self.state_root.join("sessions.json"),
             self.state_root.join("workspaces.json"),
@@ -483,8 +486,7 @@ impl ShadowDaemonRuntime {
             shadow_task_dispatcher,
             runner_result_receiver,
         )
-        .with_checkpoint_path(task_store_checkpoint_path)
-        .with_model_bridge_client(Arc::clone(&business_model_client));
+        .with_checkpoint_path(task_store_checkpoint_path);
         state = state
             .with_task_store(task_store)
             .with_runner_manager(runner_manager)
@@ -642,10 +644,8 @@ impl ShadowDaemonRuntime {
                 })
         };
 
-        let base_url =
-            find_env("MAGI_OPENAI_COMPAT_BASE_URL").or_else(|| aux_string("baseUrl"))?;
-        let api_key =
-            find_env("MAGI_OPENAI_COMPAT_API_KEY").or_else(|| aux_string("apiKey"));
+        let base_url = find_env("MAGI_OPENAI_COMPAT_BASE_URL").or_else(|| aux_string("baseUrl"))?;
+        let api_key = find_env("MAGI_OPENAI_COMPAT_API_KEY").or_else(|| aux_string("apiKey"));
         let model = find_env("MAGI_OPENAI_COMPAT_MODEL")
             .or_else(|| aux_string("model"))
             .unwrap_or_else(|| "gpt-4".to_string());

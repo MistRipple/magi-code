@@ -1249,17 +1249,23 @@ mod tests {
     use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
     use magi_governance::GovernanceService;
     use magi_session_store::SessionStore;
+    use magi_tool_runtime::ToolRegistry;
     use magi_workspace::WorkspaceStore;
     use std::sync::Arc;
 
     fn test_state() -> ApiState {
+        let event_bus = Arc::new(InMemoryEventBus::new(32));
+        let governance = Arc::new(GovernanceService::default());
+        let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
+        tool_registry.register_default_builtins();
         ApiState::new(
             "magi-test",
-            Arc::new(InMemoryEventBus::new(32)),
+            event_bus,
             Arc::new(SessionStore::default()),
             Arc::new(WorkspaceStore::default()),
-            Arc::new(GovernanceService::default()),
+            governance,
         )
+        .with_tool_registry(tool_registry)
     }
 
     #[tokio::test]
@@ -1295,12 +1301,23 @@ mod tests {
         for key in [
             "repositories",
             "mcpServers",
+            "builtinTools",
             "roleTemplates",
             "registryEngines",
             "registryAgents",
         ] {
             assert!(bootstrap[key].is_array(), "{key} should be an array");
         }
+        let builtin_tools = bootstrap["builtinTools"]
+            .as_array()
+            .expect("builtin tools should be an array");
+        assert_eq!(builtin_tools.len(), 21);
+        assert!(
+            builtin_tools
+                .iter()
+                .any(|tool| tool["name"] == serde_json::json!("shell_exec")),
+            "builtin tools should expose shell_exec"
+        );
         assert_eq!(bootstrap["userRulesConfig"], serde_json::json!({}));
         assert_eq!(
             bootstrap["runtimeSettings"]["locale"],
