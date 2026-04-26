@@ -813,3 +813,17 @@ TaskProjection summary
 后续所有设计和实现都按这句话校验：
 
 > 普通模式处理当前问题；深度模式持续交付目标；团队始终是底层编排形态，通过 AgentTab 可观察；所有执行进度、分工、验证、修复和交付都必须落到统一 Task 系统。
+
+## 19. 补充设计
+
+针对方案审视中发现的 5 个关键盲区（Runner 同步问题、Task Graph 生成简陋、Worker 虚拟角色、TaskPolicy 死代码、分阶段顺序），已输出补充设计文档：
+
+→ [supplementary-design.md](supplementary-design.md)
+
+补充设计的核心修订：
+
+1. **Runner 异步化**：`RunnerManager::start()` 基础设施已存在，深度模式只需调用 `start()` 替代同步 `for` 循环
+2. **Phase 合并**：原 Phase 1（policy 映射）+ Phase 3（Runner 持续推进）合并为 Phase 0，确保 policy 写了就有人消费
+3. **Task Graph 两阶段生成**：先用规则化骨架（固定 3 Phase），后续再叠加 LLM 结构化图
+4. **TaskPolicy 消费逻辑**：明确每个 policy 字段的消费位置和行为差异
+5. **Worker 差异化**：第一版只做 system prompt 差异化，工具过滤和模型差异后续迭代
