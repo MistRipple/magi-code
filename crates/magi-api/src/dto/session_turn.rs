@@ -24,6 +24,12 @@ pub struct SessionTurnRequestDto {
     pub skill_name: Option<String>,
     #[serde(default)]
     pub images: Vec<SessionTurnImageDto>,
+    #[serde(alias = "request_id")]
+    pub request_id: Option<String>,
+    #[serde(alias = "user_message_id")]
+    pub user_message_id: Option<String>,
+    #[serde(alias = "placeholder_message_id")]
+    pub placeholder_message_id: Option<String>,
 }
 
 impl SessionTurnRequestDto {
@@ -44,6 +50,18 @@ impl SessionTurnRequestDto {
 
     pub fn trimmed_text(&self) -> Option<String> {
         trimmed_non_empty(self.text.as_deref())
+    }
+
+    pub fn request_id(&self) -> Option<String> {
+        trimmed_non_empty(self.request_id.as_deref())
+    }
+
+    pub fn user_message_id(&self) -> Option<String> {
+        trimmed_non_empty(self.user_message_id.as_deref())
+    }
+
+    pub fn placeholder_message_id(&self) -> Option<String> {
+        trimmed_non_empty(self.placeholder_message_id.as_deref())
     }
 
     pub fn timeline_message(&self, trimmed_text: Option<&str>) -> String {
@@ -147,6 +165,9 @@ mod tests {
             deep_task: true,
             skill_name: None,
             images: Vec::new(),
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
         };
 
         assert_eq!(

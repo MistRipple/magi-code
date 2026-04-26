@@ -439,16 +439,6 @@ impl RunnerManager {
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
         self.build_task_runner().resume_task(&tid)
     }
-
-    /// Request a replan for the given root task: cancel all non-terminal,
-    /// non-completed subtrees and return the cancelled task IDs.
-    pub fn replan(&self, root_task_id: &str) -> Result<Vec<TaskId>, String> {
-        let tid = TaskId::new(root_task_id);
-        self.task_store
-            .get_task(&tid)
-            .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
-        self.build_task_runner().request_replan(&tid)
-    }
 }
 
 #[derive(Debug)]

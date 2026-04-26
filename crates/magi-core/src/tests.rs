@@ -224,6 +224,7 @@ fn progress_summary_default() {
     let summary = ProgressSummary::default();
     assert_eq!(summary.total_tasks, 0);
     assert_eq!(summary.completed_tasks, 0);
+    assert_eq!(summary.settled_tasks, 0);
     assert_eq!(summary.failed_tasks, 0);
     assert_eq!(summary.running_tasks, 0);
     assert_eq!(summary.blocked_tasks, 0);

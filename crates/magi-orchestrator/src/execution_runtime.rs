@@ -5,7 +5,8 @@ use crate::{
 };
 use magi_context_runtime::{ExecutionContextAssemblyRequest, ExecutionContextClues};
 use magi_core::{
-    ExecutionResultStatus, SessionId, TaskExecutionTarget, TaskStatus, WorkerId, WorkspaceId,
+    DomainError, ExecutionResultStatus, SessionId, TaskExecutionTarget, TaskStatus, WorkerId,
+    WorkspaceId,
 };
 use magi_event_bus::{EventCategory, EventContext};
 use magi_memory_store::MemoryStore;
@@ -364,8 +365,24 @@ impl OrchestratedExecutionRuntime {
         };
         self.task_store
             .update_status(&report.task_id, next_status)
-            .map_err(|_| OrchestratorCommandError::TaskNotFound {
-                task_id: report.task_id.clone(),
+            .map_err(|error| match error {
+                DomainError::NotFound { .. } => OrchestratorCommandError::TaskNotFound {
+                    task_id: report.task_id.clone(),
+                },
+                DomainError::AlreadyExists { entity } => {
+                    OrchestratorCommandError::TaskStateViolation {
+                        task_id: report.task_id.clone(),
+                        message: format!(
+                            "unexpected existing entity while applying report: {entity}"
+                        ),
+                    }
+                }
+                DomainError::InvalidState { message } | DomainError::Validation { message } => {
+                    OrchestratorCommandError::TaskStateViolation {
+                        task_id: report.task_id.clone(),
+                        message,
+                    }
+                }
             })?;
         let assignment_id = execution_overview::assignment_id_for_task(
             &self.task_store,

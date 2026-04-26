@@ -56,6 +56,16 @@ fn default_frozen_policy() -> TaskPolicy {
     }
 }
 
+fn task_requires_delivery_evidence(task: &Task) -> bool {
+    matches!(
+        task.kind,
+        TaskKind::Action | TaskKind::Validation | TaskKind::Repair
+    ) && task
+        .policy_snapshot
+        .as_ref()
+        .is_some_and(|policy| policy.validation_profile.is_some() && policy.background_allowed)
+}
+
 impl TaskStore {
     pub fn new() -> Self {
         Self {
@@ -215,6 +225,15 @@ impl TaskStore {
         let task = tasks
             .get_mut(task_id)
             .ok_or(DomainError::NotFound { entity: "Task" })?;
+        if status == TaskStatus::Completed
+            && task.status != TaskStatus::Completed
+            && task_requires_delivery_evidence(task)
+            && task.evidence_refs.is_empty()
+        {
+            return Err(DomainError::Validation {
+                message: format!("任务 {task_id} 在完成前必须写入 evidence_refs"),
+            });
+        }
         task.status = status;
         task.updated_at = UtcMillis::now();
         let cloned_task = task.clone();
@@ -253,19 +272,14 @@ impl TaskStore {
                 task.policy_snapshot = Some(default_frozen_policy());
             }
         }
-        // G13: Evidence check — require non-empty evidence_refs for terminal transitions.
-        if is_terminal_status(new_status)
-            && !is_terminal_status(task.status)
+        if new_status == TaskStatus::Completed
+            && task.status != TaskStatus::Completed
+            && task_requires_delivery_evidence(task)
             && task.evidence_refs.is_empty()
-            && matches!(
-                task.kind,
-                TaskKind::Action | TaskKind::Validation | TaskKind::Repair
-            )
         {
-            tracing::warn!(
-                task_id = %task_id,
-                "transitioning to terminal state without evidence_refs"
-            );
+            return Err(DomainError::Validation {
+                message: format!("任务 {task_id} 在完成前必须写入 evidence_refs"),
+            });
         }
         task.status = new_status;
         task.updated_at = UtcMillis::now();
@@ -774,20 +788,25 @@ impl TaskStore {
             .filter_map(|task_id| tasks.get(task_id))
             .collect();
         let projection_tasks: Vec<Task> = all_tasks.iter().map(|task| (*task).clone()).collect();
+        let active_tasks: Vec<&Task> = all_tasks
+            .iter()
+            .copied()
+            .filter(|task| task.status != TaskStatus::Cancelled)
+            .collect();
 
-        let running_tasks: Vec<TaskId> = all_tasks
+        let running_tasks: Vec<TaskId> = active_tasks
             .iter()
             .filter(|t| t.status == TaskStatus::Running)
             .map(|t| t.task_id.clone())
             .collect();
 
-        let blocked_tasks: Vec<TaskId> = all_tasks
+        let blocked_tasks: Vec<TaskId> = active_tasks
             .iter()
             .filter(|t| t.status == TaskStatus::Blocked)
             .map(|t| t.task_id.clone())
             .collect();
 
-        let pending_decisions: Vec<TaskId> = all_tasks
+        let pending_decisions: Vec<TaskId> = active_tasks
             .iter()
             .filter(|t| t.kind == TaskKind::Decision && t.status == TaskStatus::AwaitingApproval)
             .map(|t| t.task_id.clone())
@@ -808,18 +827,22 @@ impl TaskStore {
             })
         });
 
-        let total_tasks = all_tasks.len() as u32;
-        let completed_tasks = all_tasks
+        let total_tasks = active_tasks.len() as u32;
+        let completed_tasks = active_tasks
             .iter()
             .filter(|t| t.status == TaskStatus::Completed)
             .count() as u32;
-        let failed_tasks = all_tasks
+        let settled_tasks = active_tasks
+            .iter()
+            .filter(|t| matches!(t.status, TaskStatus::Completed | TaskStatus::Skipped))
+            .count() as u32;
+        let failed_tasks = active_tasks
             .iter()
             .filter(|t| t.status == TaskStatus::Failed)
             .count() as u32;
         let running_count = running_tasks.len() as u32;
         let blocked_count = blocked_tasks.len() as u32;
-        let validation_tasks: Vec<&Task> = all_tasks
+        let validation_tasks: Vec<&Task> = active_tasks
             .iter()
             .filter(|task| task.kind == TaskKind::Validation)
             .copied()
@@ -828,7 +851,7 @@ impl TaskStore {
             .iter()
             .filter(|task| task.status == TaskStatus::Completed)
             .count();
-        let evidence_tasks = all_tasks
+        let evidence_tasks = active_tasks
             .iter()
             .filter(|task| !task.evidence_refs.is_empty())
             .count();
@@ -844,13 +867,16 @@ impl TaskStore {
         };
 
         // Build WorkPackage summaries (design 8.2)
-        let workpackage_summaries: Vec<magi_core::WorkPackageSummary> = all_tasks
+        let workpackage_summaries: Vec<magi_core::WorkPackageSummary> = active_tasks
             .iter()
             .filter(|t| t.kind == magi_core::TaskKind::WorkPackage)
             .filter_map(|wp| {
                 let child_ids = children_index.get(&wp.task_id)?;
-                let children: Vec<&magi_core::Task> =
-                    child_ids.iter().filter_map(|cid| tasks.get(cid)).collect();
+                let children: Vec<&magi_core::Task> = child_ids
+                    .iter()
+                    .filter_map(|cid| tasks.get(cid))
+                    .filter(|child| child.status != TaskStatus::Cancelled)
+                    .collect();
                 let total = children.len() as u32;
                 if total == 0 {
                     return Some(magi_core::WorkPackageSummary {
@@ -871,7 +897,6 @@ impl TaskStore {
                             magi_core::TaskStatus::Completed
                                 | magi_core::TaskStatus::Failed
                                 | magi_core::TaskStatus::Skipped
-                                | magi_core::TaskStatus::Cancelled
                         )
                     })
                     .count() as u32;
@@ -905,13 +930,15 @@ impl TaskStore {
             })
             .collect();
 
-        let aggregate_status = if failed_tasks > 0 {
+        let aggregate_status = if root_task.status == TaskStatus::Cancelled {
+            TaskStatus::Cancelled
+        } else if failed_tasks > 0 {
             TaskStatus::Failed
         } else if running_count > 0 {
             TaskStatus::Running
         } else if blocked_count > 0 {
             TaskStatus::Blocked
-        } else if completed_tasks == total_tasks {
+        } else if total_tasks > 0 && settled_tasks == total_tasks {
             TaskStatus::Completed
         } else {
             root_task.status
@@ -934,11 +961,13 @@ impl TaskStore {
             TaskStatus::Failed => "error".to_string(),
             _ => "idle".to_string(),
         };
-        let display_status = if total_tasks == 0 {
+        let display_status = if root_task.status == TaskStatus::Cancelled {
+            "已取消".to_string()
+        } else if total_tasks == 0 {
             "待启动".to_string()
         } else {
-            let pct = (completed_tasks as f32 / total_tasks as f32 * 100.0).round() as u32;
-            if completed_tasks == total_tasks {
+            let pct = (settled_tasks as f32 / total_tasks as f32 * 100.0).round() as u32;
+            if settled_tasks == total_tasks {
                 "全部完成".to_string()
             } else if failed_tasks > 0 && blocked_count > 0 {
                 format!(
@@ -968,6 +997,7 @@ impl TaskStore {
             progress_summary: ProgressSummary {
                 total_tasks,
                 completed_tasks,
+                settled_tasks,
                 failed_tasks,
                 running_tasks: running_count,
                 blocked_tasks: blocked_count,
@@ -983,10 +1013,15 @@ impl TaskStore {
     /// 目标、范围、变更、证据、验证结果等交付摘要。
     pub fn build_delivery_package(&self, root_task_id: &TaskId) -> Option<serde_json::Value> {
         let projection = self.build_projection(root_task_id)?;
-
-        let completed_tasks: Vec<&Task> = projection
+        let active_tasks: Vec<&Task> = projection
             .tasks
             .iter()
+            .filter(|task| task.status != TaskStatus::Cancelled)
+            .collect();
+
+        let completed_tasks: Vec<&Task> = active_tasks
+            .iter()
+            .copied()
             .filter(|t| t.status == TaskStatus::Completed)
             .collect();
 
@@ -996,7 +1031,7 @@ impl TaskStore {
         let mut repair_records: Vec<serde_json::Value> = Vec::new();
         let mut key_decisions: Vec<serde_json::Value> = Vec::new();
 
-        for task in &projection.tasks {
+        for task in &active_tasks {
             for output in &task.output_refs {
                 if !file_changes.contains(output) {
                     file_changes.push(output.clone());
@@ -1035,8 +1070,7 @@ impl TaskStore {
             }
         }
 
-        let remaining_risks: Vec<String> = projection
-            .tasks
+        let remaining_risks: Vec<String> = active_tasks
             .iter()
             .filter(|t| {
                 t.status == TaskStatus::Failed
@@ -1054,7 +1088,7 @@ impl TaskStore {
             "current_phase": projection.current_phase,
             "progress": {
                 "total": projection.progress_summary.total_tasks,
-                "completed": projection.progress_summary.completed_tasks,
+                "completed": projection.progress_summary.settled_tasks,
                 "failed": projection.progress_summary.failed_tasks,
                 "running": projection.progress_summary.running_tasks,
                 "blocked": projection.progress_summary.blocked_tasks,
@@ -1803,27 +1837,33 @@ mod tests {
         store.insert_task(task);
 
         // Draft -> Ready
-        assert!(store
-            .update_status(&TaskId::new("t-1"), TaskStatus::Ready)
-            .is_ok());
+        assert!(
+            store
+                .update_status(&TaskId::new("t-1"), TaskStatus::Ready)
+                .is_ok()
+        );
         assert_eq!(
             store.get_task(&TaskId::new("t-1")).unwrap().status,
             TaskStatus::Ready
         );
 
         // Ready -> Running
-        assert!(store
-            .update_status(&TaskId::new("t-1"), TaskStatus::Running)
-            .is_ok());
+        assert!(
+            store
+                .update_status(&TaskId::new("t-1"), TaskStatus::Running)
+                .is_ok()
+        );
         assert_eq!(
             store.get_task(&TaskId::new("t-1")).unwrap().status,
             TaskStatus::Running
         );
 
         // Running -> Completed
-        assert!(store
-            .update_status(&TaskId::new("t-1"), TaskStatus::Completed)
-            .is_ok());
+        assert!(
+            store
+                .update_status(&TaskId::new("t-1"), TaskStatus::Completed)
+                .is_ok()
+        );
         assert_eq!(
             store.get_task(&TaskId::new("t-1")).unwrap().status,
             TaskStatus::Completed
@@ -1990,15 +2030,91 @@ mod tests {
         assert_eq!(projection.blocked_tasks.len(), 1);
         assert_eq!(projection.progress_summary.total_tasks, 6);
         assert_eq!(projection.progress_summary.completed_tasks, 1);
+        assert_eq!(projection.progress_summary.settled_tasks, 1);
         assert_eq!(projection.progress_summary.failed_tasks, 0);
         assert_eq!(projection.progress_summary.running_tasks, 4);
         assert_eq!(projection.progress_summary.blocked_tasks, 1);
         assert_eq!(projection.aggregate_status, TaskStatus::Running);
 
         // Nonexistent root returns None
-        assert!(store
-            .build_projection(&TaskId::new("nonexistent"))
-            .is_none());
+        assert!(
+            store
+                .build_projection(&TaskId::new("nonexistent"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn build_projection_excludes_cancelled_history_from_progress() {
+        let store = TaskStore::new();
+
+        store.insert_task(make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        ));
+        store.insert_task(make_task(
+            "phase-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Phase,
+            TaskStatus::Running,
+        ));
+        store.insert_task(make_task(
+            "wp-1",
+            "m-1",
+            "obj-1",
+            Some("phase-1"),
+            TaskKind::WorkPackage,
+            TaskStatus::Running,
+        ));
+        store.insert_task(make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("wp-1"),
+            TaskKind::Action,
+            TaskStatus::Completed,
+        ));
+        store.insert_task(make_task(
+            "act-2",
+            "m-1",
+            "obj-1",
+            Some("wp-1"),
+            TaskKind::Action,
+            TaskStatus::Running,
+        ));
+        store.insert_task(make_task(
+            "act-3",
+            "m-1",
+            "obj-1",
+            Some("wp-1"),
+            TaskKind::Action,
+            TaskStatus::Cancelled,
+        ));
+
+        let projection = store.build_projection(&TaskId::new("obj-1")).unwrap();
+
+        assert_eq!(projection.tasks.len(), 6);
+        assert_eq!(projection.progress_summary.total_tasks, 5);
+        assert_eq!(projection.progress_summary.completed_tasks, 1);
+        assert_eq!(projection.progress_summary.settled_tasks, 1);
+        assert_eq!(projection.progress_summary.running_tasks, 4);
+        assert_eq!(projection.progress_summary.blocked_tasks, 0);
+        assert_eq!(projection.display_status, "20% 已完成，4 项执行中");
+        assert_eq!(projection.aggregate_status, TaskStatus::Running);
+
+        let wp_summary = projection
+            .workpackage_summaries
+            .iter()
+            .find(|wp| wp.task_id == "wp-1")
+            .expect("workpackage summary must exist");
+        assert_eq!(wp_summary.progress_ratio, 0.5);
+        assert!(wp_summary.recent_issues.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -2598,9 +2714,11 @@ mod tests {
 
         let w1_leases = store.get_leases_by_worker(&worker1);
         assert_eq!(w1_leases.len(), 2);
-        assert!(w1_leases
-            .iter()
-            .all(|l| l.worker_id.to_string() == "worker-1"));
+        assert!(
+            w1_leases
+                .iter()
+                .all(|l| l.worker_id.to_string() == "worker-1")
+        );
 
         let w2_leases = store.get_leases_by_worker(&worker2);
         assert_eq!(w2_leases.len(), 1);
@@ -2902,9 +3020,11 @@ mod tests {
         store.insert_task(task);
 
         // Draft -> Ready: valid
-        assert!(store
-            .update_status_checked(&TaskId::new("t-1"), TaskStatus::Ready)
-            .is_ok());
+        assert!(
+            store
+                .update_status_checked(&TaskId::new("t-1"), TaskStatus::Ready)
+                .is_ok()
+        );
         assert_eq!(
             store.get_task(&TaskId::new("t-1")).unwrap().status,
             TaskStatus::Ready
@@ -3100,8 +3220,8 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_volatile_runtime_after_restore_blocks_snapshot_tracked_branch_without_active_lease(
-    ) {
+    fn reconcile_volatile_runtime_after_restore_blocks_snapshot_tracked_branch_without_active_lease()
+     {
         let store = TaskStore::new();
 
         let root = make_task(
@@ -3670,17 +3790,23 @@ mod tests {
         );
 
         let file_changes = pkg.get("file_changes").unwrap().as_array().unwrap();
-        assert!(file_changes
-            .iter()
-            .any(|v| v.as_str() == Some("src/auth/login.rs")));
+        assert!(
+            file_changes
+                .iter()
+                .any(|v| v.as_str() == Some("src/auth/login.rs"))
+        );
 
         let evidence_list = pkg.get("evidence_list").unwrap().as_array().unwrap();
-        assert!(evidence_list
-            .iter()
-            .any(|v| v.as_str() == Some("test://login-passed")));
-        assert!(evidence_list
-            .iter()
-            .any(|v| v.as_str() == Some("test://login-validation-passed")));
+        assert!(
+            evidence_list
+                .iter()
+                .any(|v| v.as_str() == Some("test://login-passed"))
+        );
+        assert!(
+            evidence_list
+                .iter()
+                .any(|v| v.as_str() == Some("test://login-validation-passed"))
+        );
 
         let validation_results = pkg.get("validation_results").unwrap().as_array().unwrap();
         assert_eq!(validation_results.len(), 1);

@@ -128,6 +128,12 @@ pub struct ActiveExecutionTurnItem {
     pub tool_result: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder_message_id: Option<String>,
     #[serde(default = "default_true")]
     pub thread_visible: bool,
     #[serde(default)]

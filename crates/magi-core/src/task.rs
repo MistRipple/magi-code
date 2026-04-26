@@ -194,6 +194,7 @@ pub struct TaskProjection {
 pub struct ProgressSummary {
     pub total_tasks: u32,
     pub completed_tasks: u32,
+    pub settled_tasks: u32,
     pub failed_tasks: u32,
     pub running_tasks: u32,
     pub blocked_tasks: u32,

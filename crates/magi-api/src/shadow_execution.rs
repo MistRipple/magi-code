@@ -12,6 +12,7 @@ use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     ActiveExecutionTurn, ActiveExecutionTurnItem, ActiveExecutionTurnLane,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
 use crate::dto::SessionTurnRequestDto;
@@ -27,10 +28,17 @@ pub(crate) struct ShadowTaskGraphSubmission {
     pub active_execution_chain: Option<ActiveExecutionChain>,
 }
 
+static REPLAN_GRAPH_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Debug)]
-struct DeepTaskGraphBuildResult {
-    leaf_action_task_ids: Vec<TaskId>,
-    total_task_count: usize,
+pub(crate) struct DeepTaskGraphBuildResult {
+    pub leaf_action_task_ids: Vec<TaskId>,
+    pub total_task_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DeepTaskGraphReplanResult {
+    pub cancelled_task_ids: Vec<TaskId>,
 }
 
 pub(crate) fn run_shadow_dispatch_submission(
@@ -305,6 +313,9 @@ pub(crate) fn run_shadow_dispatch_submission(
                 tool_arguments: None,
                 tool_result: None,
                 tool_error: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
                 thread_visible: false,
                 worker_visible: false,
             },
@@ -327,6 +338,9 @@ pub(crate) fn run_shadow_dispatch_submission(
                 tool_arguments: None,
                 tool_result: None,
                 tool_error: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
                 thread_visible: true,
                 worker_visible: false,
             },
@@ -376,6 +390,9 @@ pub(crate) fn run_shadow_dispatch_submission(
             tool_arguments: None,
             tool_result: None,
             tool_error: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
             thread_visible: false,
             worker_visible: true,
         });
@@ -524,6 +541,28 @@ fn build_deep_task_graph(
     let task_store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("构建深度任务图失败", "task_store 未配置"))?;
+    insert_deep_task_graph(
+        task_store,
+        mission_id,
+        root_task_id,
+        primary_action_task_id,
+        accepted_at,
+        target_role,
+        now,
+        &plan,
+    )
+}
+
+fn insert_deep_task_graph(
+    task_store: &magi_orchestrator::task_store::TaskStore,
+    mission_id: &MissionId,
+    root_task_id: &TaskId,
+    primary_action_task_id: &TaskId,
+    accepted_at: UtcMillis,
+    target_role: &str,
+    now: &UtcMillis,
+    plan: &DeepTaskGraphPlan,
+) -> Result<DeepTaskGraphBuildResult, ApiError> {
     let root_policy = Some(build_policy_for_mode(true));
     let mut total_task_count = 1usize;
     let mut leaf_action_task_ids = Vec::new();
@@ -697,7 +736,7 @@ fn build_deep_task_graph(
     validate_deep_task_graph(
         task_store,
         root_task_id,
-        &plan,
+        plan,
         &phase_ids,
         &leaf_action_task_ids,
     )?;
@@ -706,6 +745,144 @@ fn build_deep_task_graph(
         leaf_action_task_ids,
         total_task_count,
     })
+}
+
+pub(crate) fn replan_deep_task_graph(
+    state: &ApiState,
+    root_task_id: &TaskId,
+    prompt: &str,
+    context_task: Option<&Task>,
+    reason: &str,
+) -> Result<DeepTaskGraphReplanResult, ApiError> {
+    let task_store = state
+        .task_store()
+        .ok_or_else(|| ApiError::internal_assembly("重规划深度任务图失败", "task_store 未配置"))?;
+    let root_task = task_store
+        .get_task(root_task_id)
+        .ok_or_else(|| ApiError::internal_assembly("重规划深度任务图失败", "root task 不存在"))?;
+    if root_task.kind != TaskKind::Objective {
+        return Err(ApiError::internal_assembly(
+            "重规划深度任务图失败",
+            "root 必须是 Objective",
+        ));
+    }
+    if !root_task
+        .policy_snapshot
+        .as_ref()
+        .is_some_and(|policy| policy.background_allowed)
+    {
+        return Err(ApiError::InvalidInput(
+            "当前任务不是深度模式，不能重规划任务图".to_string(),
+        ));
+    }
+
+    let prompt_text = prompt.trim();
+    if prompt_text.is_empty() {
+        return Err(ApiError::internal_assembly(
+            "重规划深度任务图失败",
+            "prompt 为空",
+        ));
+    }
+
+    let build_seed_base = UtcMillis::now();
+    let build_seed = UtcMillis(
+        build_seed_base
+            .0
+            .saturating_add(REPLAN_GRAPH_COUNTER.fetch_add(1, Ordering::Relaxed)),
+    );
+    let plan = decompose_mission(state, Some(prompt_text), &build_seed).ok_or_else(|| {
+        ApiError::internal_assembly("重规划深度任务图失败", "无法生成结构化深度计划")
+    })?;
+    if plan.phases.len() != 3 {
+        return Err(ApiError::internal_assembly(
+            "重规划深度任务图失败",
+            "深度模式必须包含 3 个 phase",
+        ));
+    }
+
+    let replan_cancel_candidates = task_store
+        .collect_subtree_ids(root_task_id)
+        .into_iter()
+        .filter(|task_id| task_id != root_task_id)
+        .filter(|task_id| {
+            task_store.get_task(task_id).is_some_and(|task| {
+                !matches!(
+                    task.status,
+                    TaskStatus::Completed
+                        | TaskStatus::Failed
+                        | TaskStatus::Cancelled
+                        | TaskStatus::Skipped
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let target_role = context_task
+        .and_then(|task| {
+            task.executor_binding
+                .as_ref()
+                .map(|binding| binding.target_role.trim().to_string())
+        })
+        .filter(|role| !role.is_empty())
+        .unwrap_or_else(|| infer_dispatch_task_role(Some(prompt_text)).to_string());
+
+    let primary_action_task_id =
+        TaskId::new(format!("task-act-replan-{}-{}", root_task_id, build_seed.0));
+    let build = insert_deep_task_graph(
+        task_store,
+        &root_task.mission_id,
+        root_task_id,
+        &primary_action_task_id,
+        build_seed,
+        &target_role,
+        &build_seed,
+        &plan,
+    )?;
+
+    let mut cancelled_task_ids = Vec::new();
+    for task_id in &replan_cancel_candidates {
+        if let Some(task) = task_store.get_task(task_id) {
+            if matches!(
+                task.status,
+                TaskStatus::Completed
+                    | TaskStatus::Failed
+                    | TaskStatus::Cancelled
+                    | TaskStatus::Skipped
+            ) {
+                continue;
+            }
+            task_store
+                .update_status(task_id, TaskStatus::Cancelled)
+                .map_err(|err| {
+                    ApiError::internal_assembly("重规划深度任务图失败", err.to_string())
+                })?;
+            if let Some(lease) = task_store.get_active_lease(task_id) {
+                task_store.revoke_lease(task_id, &lease.lease_id);
+            }
+            cancelled_task_ids.push(task_id.clone());
+        }
+    }
+
+    if root_task.status != TaskStatus::Running {
+        task_store
+            .update_status(root_task_id, TaskStatus::Running)
+            .map_err(|err| ApiError::internal_assembly("重规划深度任务图失败", err.to_string()))?;
+    }
+
+    let event = task_events::task_graph_replanned_event(
+        root_task.mission_id.as_str(),
+        root_task_id.as_str(),
+        build.total_task_count,
+        reason,
+    )
+    .with_context(EventContext {
+        mission_id: Some(root_task.mission_id.clone()),
+        task_id: Some(root_task_id.clone()),
+        ..EventContext::default()
+    });
+    let _ = state.event_bus.publish(event);
+
+    Ok(DeepTaskGraphReplanResult { cancelled_task_ids })
 }
 
 fn validate_deep_task_graph(
@@ -1112,6 +1289,9 @@ mod tests {
             workspace_id: None,
             text: Some("Hello world".to_string()),
             skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
             deep_task: false,
             images: Vec::new(),
         };
@@ -1262,6 +1442,9 @@ mod tests {
             workspace_id: None,
             text: Some("Run a failing action".to_string()),
             skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
             deep_task: false,
             images: Vec::new(),
         };
@@ -1342,6 +1525,9 @@ mod tests {
             workspace_id: None,
             text: Some("test".to_string()),
             skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
             deep_task: false,
             images: Vec::new(),
         };

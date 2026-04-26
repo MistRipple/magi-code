@@ -47,6 +47,9 @@ pub(crate) fn session_turn_item(
         tool_arguments: None,
         tool_result: None,
         tool_error: None,
+        request_id: None,
+        user_message_id: None,
+        placeholder_message_id: None,
         thread_visible: true,
         worker_visible: false,
     }
@@ -127,6 +130,9 @@ fn to_turn_item_summary(item: &ActiveExecutionTurnItem) -> SessionRuntimeTurnIte
         tool_arguments: item.tool_arguments.clone(),
         tool_result: item.tool_result.clone(),
         tool_error: item.tool_error.clone(),
+        request_id: item.request_id.clone(),
+        user_message_id: item.user_message_id.clone(),
+        placeholder_message_id: item.placeholder_message_id.clone(),
         thread_visible: item.thread_visible,
         worker_visible: item.worker_visible,
     }

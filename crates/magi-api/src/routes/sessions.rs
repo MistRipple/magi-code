@@ -389,6 +389,9 @@ fn submit_regular_session_turn(
     )?;
     let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     append_session_user_message(&state, &session_id, accepted_at, &message);
+    let request_id = request.request_id();
+    let user_message_id = request.user_message_id();
+    let placeholder_message_id = request.placeholder_message_id();
     let mut turn = ActiveExecutionTurn {
         turn_id: format!("turn-session-{}", accepted_at.0),
         turn_seq: accepted_at.0 as u64,
@@ -415,6 +418,9 @@ fn submit_regular_session_turn(
             tool_arguments: None,
             tool_result: None,
             tool_error: None,
+            request_id: request_id.clone(),
+            user_message_id: user_message_id.clone(),
+            placeholder_message_id: placeholder_message_id.clone(),
             thread_visible: false,
             worker_visible: false,
         }],
@@ -447,6 +453,9 @@ fn submit_regular_session_turn(
             prompt,
             use_tools: matches!(decision.route, SessionTurnRouteDto::Execute),
             skill_name: request.skill_name.clone(),
+            request_id: request_id.clone(),
+            user_message_id: user_message_id.clone(),
+            placeholder_message_id: placeholder_message_id.clone(),
         },
         accepted_at,
         decision.route,

@@ -142,7 +142,7 @@ pub(crate) fn build_runtime_snapshot_from_projection(
         mission_id: projection.root_task.mission_id.clone(),
         total_assignments,
         total_tasks: projection.progress_summary.total_tasks as usize,
-        completed_tasks: projection.progress_summary.completed_tasks as usize,
+        completed_tasks: projection.progress_summary.settled_tasks as usize,
         failed_tasks: (projection.progress_summary.failed_tasks
             + projection.progress_summary.blocked_tasks) as usize,
     }

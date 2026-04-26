@@ -30,10 +30,22 @@ pub struct SessionTurnExecutionRequest {
     pub prompt: String,
     pub use_tools: bool,
     pub skill_name: Option<String>,
+    pub request_id: Option<String>,
+    pub user_message_id: Option<String>,
+    pub placeholder_message_id: Option<String>,
 }
 
 pub struct SessionTurnExecutionOutput {
     pub final_content: String,
+}
+
+fn apply_request_aliases(
+    item: &mut magi_session_store::ActiveExecutionTurnItem,
+    request: &SessionTurnExecutionRequest,
+) {
+    item.request_id = request.request_id.clone();
+    item.user_message_id = request.user_message_id.clone();
+    item.placeholder_message_id = request.placeholder_message_id.clone();
 }
 
 pub(crate) struct SessionTurnExecutionRuntime<'a> {
@@ -106,8 +118,7 @@ pub(crate) fn run_session_turn_execution(
     append_final_item(
         event_bus,
         session_store,
-        &request.session_id,
-        &request.workspace_id,
+        &request,
         &final_content,
         last_streaming_entry_id.as_deref(),
     );
@@ -174,13 +185,14 @@ fn stream_session_turn_round(
                 thinking.clear();
                 thinking.push_str(accumulated_thinking);
             }
-            let item = session_turn_item(
+            let mut item = session_turn_item(
                 "assistant_thinking",
                 "running",
                 Some("模型思考".to_string()),
                 Some(accumulated_thinking.to_string()),
                 Some(thinking_item_id.clone()),
             );
+            apply_request_aliases(&mut item, request);
             upsert_session_turn_item(session_store, &request.session_id, item.clone());
             publish_session_turn_item_event(
                 event_bus,
@@ -201,13 +213,14 @@ fn stream_session_turn_round(
             content.clear();
             content.push_str(accumulated);
         }
-        let item = session_turn_item(
+        let mut item = session_turn_item(
             "assistant_stream",
             "running",
             Some("生成回复".to_string()),
             Some(accumulated.to_string()),
             Some(stream_item_id.clone()),
         );
+        apply_request_aliases(&mut item, request);
         upsert_session_turn_item(session_store, &request.session_id, item);
         session_store.upsert_timeline_entry(
             request.session_id.clone(),
@@ -272,13 +285,14 @@ fn stream_session_turn_round(
         .cloned()
         .or_else(|| (!streamed_thinking.trim().is_empty()).then_some(streamed_thinking));
     if let Some(thinking) = final_thinking {
-        let thinking_item = session_turn_item(
+        let mut thinking_item = session_turn_item(
             "assistant_thinking",
             "completed",
             Some("模型思考".to_string()),
             Some(thinking),
             Some(thinking_item_id.clone()),
         );
+        apply_request_aliases(&mut thinking_item, request);
         upsert_session_turn_item(session_store, &request.session_id, thinking_item.clone());
         publish_session_turn_item_event(
             event_bus,
@@ -288,13 +302,14 @@ fn stream_session_turn_round(
         );
     }
     if !streamed_content.trim().is_empty() {
-        let stream_item = session_turn_item(
+        let mut stream_item = session_turn_item(
             "assistant_stream",
             "completed",
             Some("生成回复".to_string()),
             Some(streamed_content.clone()),
             Some(stream_item_id.clone()),
         );
+        apply_request_aliases(&mut stream_item, request);
         upsert_session_turn_item(session_store, &request.session_id, stream_item.clone());
         publish_session_turn_item_event(
             event_bus,
@@ -363,7 +378,7 @@ fn append_phase_item(
     session_store: &SessionStore,
     request: &SessionTurnExecutionRequest,
 ) {
-    let phase_item = session_turn_item(
+    let mut phase_item = session_turn_item(
         "assistant_phase",
         "running",
         Some("理解请求".to_string()),
@@ -374,6 +389,7 @@ fn append_phase_item(
         }),
         None,
     );
+    apply_request_aliases(&mut phase_item, request);
     append_session_turn_item(session_store, &request.session_id, phase_item.clone());
     publish_session_turn_item_event(
         event_bus,
@@ -386,40 +402,51 @@ fn append_phase_item(
 fn append_final_item(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
+    request: &SessionTurnExecutionRequest,
     final_content: &str,
     streaming_entry_id: Option<&str>,
 ) {
-    let final_item = session_turn_item(
+    let mut final_item = session_turn_item(
         "assistant_final",
         "completed",
         Some("最终回复".to_string()),
         Some(final_content.to_string()),
-        None,
+        streaming_entry_id.map(str::to_string),
     );
-    append_session_turn_item(session_store, session_id, final_item.clone());
-    publish_session_turn_item_event(event_bus, session_id, workspace_id, &final_item);
-    let _ = session_store.update_current_turn_status(session_id, "completed");
+    apply_request_aliases(&mut final_item, request);
+    if streaming_entry_id.is_some() {
+        upsert_session_turn_item(session_store, &request.session_id, final_item.clone());
+    } else {
+        append_session_turn_item(session_store, &request.session_id, final_item.clone());
+    }
+    publish_session_turn_item_event(
+        event_bus,
+        &request.session_id,
+        &request.workspace_id,
+        &final_item,
+    );
+    let _ = session_store.update_current_turn_status(&request.session_id, "completed");
     let timeline_message = build_completed_turn_timeline_snapshot(
         session_store,
-        session_id,
+        &request.session_id,
         Some(final_content),
         streaming_entry_id,
     )
     .unwrap_or_else(|| final_content.to_string());
     let fallback_entry_id = session_store
-        .runtime_sidecar(session_id)
+        .runtime_sidecar(&request.session_id)
         .and_then(|sidecar| {
-            sidecar
-                .current_turn
-                .as_ref()
-                .map(|turn| format!("timeline-turn-snapshot-{}-{}", session_id, turn.turn_id))
+            sidecar.current_turn.as_ref().map(|turn| {
+                format!(
+                    "timeline-turn-snapshot-{}-{}",
+                    &request.session_id, turn.turn_id
+                )
+            })
         })
-        .unwrap_or_else(|| format!("timeline-turn-snapshot-{}", session_id));
+        .unwrap_or_else(|| format!("timeline-turn-snapshot-{}", &request.session_id));
     let entry_id = streaming_entry_id.unwrap_or(fallback_entry_id.as_str());
     session_store.upsert_timeline_entry(
-        session_id.clone(),
+        request.session_id.clone(),
         entry_id,
         TimelineEntryKind::AssistantMessage,
         timeline_message,

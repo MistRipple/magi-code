@@ -7,7 +7,7 @@ use magi_core::TaskId;
 use serde::Deserialize;
 
 use super::session_scope::parse_session_id;
-use crate::{errors::ApiError, state::ApiState};
+use crate::{errors::ApiError, shadow_execution::replan_deep_task_graph, state::ApiState};
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -135,19 +135,27 @@ async fn replan_task_graph(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let root_id = TaskId::new(&root_task_id);
     require_session_task(&state, query.session_id.as_deref(), &root_id)?;
-
-    let manager = state
-        .runner_manager()
-        .ok_or_else(|| ApiError::internal_assembly("重规划失败", "runner_manager 未配置"))?;
-
-    let cancelled = manager
-        .replan(&root_task_id)
-        .map_err(|error| ApiError::internal_assembly("重规划失败", error))?;
+    let store = require_task_store(&state)?;
+    let root_task = store
+        .get_task(&root_id)
+        .ok_or_else(|| ApiError::not_found("任务不存在", &root_task_id))?;
+    let root_goal = root_task.goal.trim();
+    let objective_text = if root_goal.is_empty() {
+        root_task.title.as_str()
+    } else {
+        root_goal
+    };
+    let prompt = format!(
+        "当前任务目标：{}\n请基于当前已完成任务重规划剩余任务图，保留已完成节点，不重写已完成工作。",
+        objective_text
+    );
+    let replan =
+        replan_deep_task_graph(&state, &root_id, &prompt, None, "manual task graph replan")?;
 
     Ok(Json(serde_json::json!({
         "rootTaskId": root_task_id,
         "replan": true,
-        "cancelledTaskIds": cancelled.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        "cancelledTaskIds": replan.cancelled_task_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
     })))
 }
 

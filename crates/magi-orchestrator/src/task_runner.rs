@@ -1,6 +1,5 @@
 use crate::task_store::TaskStore;
 use crate::task_worker_catalog::resolve_task_role;
-use magi_bridge_client::{ChatMessage, ModelBridgeClient, ModelInvocationRequest};
 use magi_core::{
     AssignmentLease, DecisionOption, DecisionTaskPayload, EventId, LeaseId, PolicyDispatchDecision,
     Task, TaskId, TaskKind, TaskResultKind, TaskStatus, UtcMillis, WorkerId,
@@ -485,7 +484,6 @@ pub struct TaskRunner {
     workers: Vec<WorkerInfo>,
     dispatcher: Arc<dyn TaskDispatcher>,
     result_receiver: Arc<dyn TaskResultReceiver>,
-    decomposer: Option<Arc<dyn MissionDecomposer>>,
     /// Optional event bus for publishing domain events such as DecisionCreated.
     event_bus: Option<Arc<InMemoryEventBus>>,
     /// Checkpoint 信号：当 cycle 中有任务到达终态时置为 true，供外部消费。
@@ -503,7 +501,6 @@ impl TaskRunner {
             workers,
             dispatcher: Arc::new(NoOpDispatcher),
             result_receiver: Arc::new(NoOpResultReceiver),
-            decomposer: None,
             event_bus: None,
             checkpoint_signal: AtomicBool::new(false),
         }
@@ -522,16 +519,9 @@ impl TaskRunner {
             workers,
             dispatcher,
             result_receiver,
-            decomposer: None,
             event_bus: None,
             checkpoint_signal: AtomicBool::new(false),
         }
-    }
-
-    /// Attach a mission decomposer for LLM-based task graph generation.
-    pub fn with_decomposer(mut self, decomposer: Arc<dyn MissionDecomposer>) -> Self {
-        self.decomposer = Some(decomposer);
-        self
     }
 
     /// Attach an event bus for publishing domain events (e.g. DecisionCreated).
@@ -548,25 +538,6 @@ impl TaskRunner {
     /// 设置 checkpoint 信号（内部使用）。
     fn set_checkpoint_signal(&self) {
         self.checkpoint_signal.store(true, Ordering::Relaxed);
-    }
-
-    /// Decompose a mission goal into a task graph and insert it into the store.
-    pub fn decompose_mission(
-        &self,
-        mission_id: &magi_core::MissionId,
-        root_task_id: &TaskId,
-        goal: &str,
-    ) -> Result<Vec<TaskId>, String> {
-        let decomposer = self
-            .decomposer
-            .as_ref()
-            .ok_or_else(|| "MissionDecomposer 未配置".to_string())?;
-        let tasks = decomposer.decompose(mission_id, root_task_id, goal)?;
-        let ids: Vec<TaskId> = tasks.iter().map(|t| t.task_id.clone()).collect();
-        for task in tasks {
-            self.store.insert_task(task);
-        }
-        Ok(ids)
     }
 
     /// Run one scheduling cycle for the task graph rooted at `root_task_id`.
@@ -1561,198 +1532,6 @@ impl TaskRunner {
             }
         }
         Ok(cancelled)
-    }
-
-    /// Request a replan: cancel all non-terminal, non-completed tasks under root,
-    /// returning the cancelled IDs so the caller can rebuild the graph (design 6.x).
-    pub fn request_replan(&self, root_task_id: &TaskId) -> Result<Vec<TaskId>, String> {
-        let all_ids = self.collect_all_task_ids(root_task_id);
-        let mut cancelled_ids = Vec::new();
-        for id in &all_ids {
-            if id == root_task_id {
-                continue; // Keep root alive.
-            }
-            if let Some(task) = self.store.get_task(id) {
-                if !is_terminal(task.status) && task.status != TaskStatus::Completed {
-                    self.store
-                        .update_status(id, TaskStatus::Cancelled)
-                        .map_err(|e| format!("replan cancel failed for {id}: {e}"))?;
-                    if let Some(lease) = self.store.get_active_lease(id) {
-                        self.store.revoke_lease(id, &lease.lease_id);
-                    }
-                    cancelled_ids.push(id.clone());
-                }
-            }
-        }
-        // Reset root to Running so new children can be added.
-        let root = self.store.get_task(root_task_id);
-        if let Some(r) = root {
-            if r.status != TaskStatus::Running {
-                let _ = self.store.update_status(root_task_id, TaskStatus::Running);
-            }
-        }
-        Ok(cancelled_ids)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// G10: Mission decomposition trait (design 4.2.1)
-// ---------------------------------------------------------------------------
-
-/// Trait for decomposing a mission into a task graph.
-///
-/// Implementations typically use an LLM to analyze the user request and
-/// generate a structured task graph.
-pub trait MissionDecomposer: Send + Sync {
-    /// Analyze the mission goal and produce a set of tasks forming the
-    /// execution graph. The returned tasks should have `parent_task_id`
-    /// and `dependency_ids` set correctly.
-    fn decompose(
-        &self,
-        mission_id: &magi_core::MissionId,
-        root_task_id: &TaskId,
-        goal: &str,
-    ) -> Result<Vec<Task>, String>;
-}
-
-// ---------------------------------------------------------------------------
-// G10.1: LLM-based MissionDecomposer (design 4.2.1)
-// ---------------------------------------------------------------------------
-
-pub struct LlmMissionDecomposer {
-    client: Arc<dyn ModelBridgeClient>,
-}
-
-impl LlmMissionDecomposer {
-    pub fn new(client: Arc<dyn ModelBridgeClient>) -> Self {
-        Self { client }
-    }
-
-    fn build_decomposition_prompt(goal: &str) -> String {
-        format!(
-            r#"你是一个任务分解器。请将以下目标分解为可执行的任务图。
-
-目标: {goal}
-
-请以 JSON 数组形式返回任务列表，每个任务包含:
-- "id": 任务编号（如 "phase-1", "wp-1-1", "act-1-1-1"）
-- "kind": 任务类型（"Phase" / "WorkPackage" / "Action" / "Validation"）
-- "parent_id": 父任务编号（根节点留空）
-- "title": 任务标题
-- "goal": 任务目标描述
-- "dependency_ids": 依赖的任务编号数组
-- "write_scope": 文件写入范围（可选）
-
-只返回 JSON 数组，不要其他内容。"#
-        )
-    }
-
-    fn parse_decomposition_response(
-        response_text: &str,
-        mission_id: &magi_core::MissionId,
-        root_task_id: &TaskId,
-    ) -> Result<Vec<Task>, String> {
-        let json_text = response_text
-            .trim()
-            .trim_start_matches("```json")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim();
-
-        let items: Vec<serde_json::Value> =
-            serde_json::from_str(json_text).map_err(|e| format!("JSON 解析失败: {e}"))?;
-
-        if items.is_empty() {
-            return Err("LLM 返回了空任务列表".to_string());
-        }
-
-        let mut tasks = Vec::new();
-        for item in &items {
-            let id_suffix = item["id"].as_str().unwrap_or("unknown");
-            let task_id = TaskId::new(format!("{}-{}", root_task_id, id_suffix));
-            let kind = match item["kind"].as_str().unwrap_or("Action") {
-                "Phase" => TaskKind::Phase,
-                "WorkPackage" => TaskKind::WorkPackage,
-                "Validation" => TaskKind::Validation,
-                _ => TaskKind::Action,
-            };
-            let parent_task_id = item["parent_id"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .map(|pid| TaskId::new(format!("{}-{}", root_task_id, pid)))
-                .or_else(|| Some(root_task_id.clone()));
-            let dependency_ids: Vec<TaskId> = item["dependency_ids"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str())
-                        .map(|did| TaskId::new(format!("{}-{}", root_task_id, did)))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            tasks.push(Task {
-                task_id,
-                mission_id: mission_id.clone(),
-                root_task_id: root_task_id.clone(),
-                parent_task_id,
-                kind,
-                title: item["title"].as_str().unwrap_or("Untitled").to_string(),
-                goal: item["goal"].as_str().unwrap_or("").to_string(),
-                status: TaskStatus::Draft,
-                dependency_ids,
-                required_children: Vec::new(),
-                policy_snapshot: None,
-                executor_binding: None,
-                context_refs: Vec::new(),
-                knowledge_refs: Vec::new(),
-                workspace_scope: None,
-                write_scope: item["write_scope"].as_str().map(|s| s.to_string()),
-                input_refs: Vec::new(),
-                output_refs: Vec::new(),
-                evidence_refs: Vec::new(),
-                retry_count: 0,
-                repair_count: 0,
-                decision_payload: None,
-                created_at: UtcMillis::now(),
-                updated_at: UtcMillis::now(),
-            });
-        }
-
-        Ok(tasks)
-    }
-}
-
-impl MissionDecomposer for LlmMissionDecomposer {
-    fn decompose(
-        &self,
-        mission_id: &magi_core::MissionId,
-        root_task_id: &TaskId,
-        goal: &str,
-    ) -> Result<Vec<Task>, String> {
-        let prompt = Self::build_decomposition_prompt(goal);
-        let request = ModelInvocationRequest {
-            provider: "openai-compat".to_string(),
-            prompt: String::new(),
-            messages: Some(vec![ChatMessage {
-                role: "user".to_string(),
-                content: Some(prompt),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            }]),
-            tools: None,
-            tool_choice: None,
-        };
-        let response = self
-            .client
-            .invoke(request)
-            .map_err(|e| format!("LLM 调用失败: {e}"))?;
-        if !response.ok {
-            return Err(format!("LLM 返回错误: {}", response.payload));
-        }
-        let payload = response.parse_chat_payload();
-        let text = payload.content.unwrap_or_default();
-        Self::parse_decomposition_response(&text, mission_id, root_task_id)
     }
 }
 

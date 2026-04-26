@@ -1,4 +1,4 @@
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{Json, Router, extract::State, routing::post};
 use magi_core::{EventId, MissionId, SessionId, Task, TaskId, TaskKind, TaskStatus, UtcMillis};
 use magi_event_bus::EventEnvelope;
 use serde::Deserialize;
@@ -6,7 +6,8 @@ use serde_json::json;
 
 use super::session_scope::parse_session_id;
 use crate::{
-    errors::ApiError, execution_chain_recovery::finalize_terminal_worker_branches, state::ApiState,
+    errors::ApiError, execution_chain_recovery::finalize_terminal_worker_branches,
+    shadow_execution::replan_deep_task_graph, state::ApiState,
 };
 
 // ---------------------------------------------------------------------------
@@ -140,6 +141,28 @@ fn resolve_structural_context_task_id(root_task: &Task, context_task: &Task) -> 
     }
 }
 
+fn build_intake_replan_prompt(root_task: &Task, context_task: &Task, message: &str) -> String {
+    let root_goal = root_task.goal.trim();
+    let objective_text = if root_goal.is_empty() {
+        root_task.title.as_str()
+    } else {
+        root_goal
+    };
+    let context_goal = context_task.goal.trim();
+    let context_text = if context_goal.is_empty() {
+        context_task.title.as_str()
+    } else {
+        context_goal
+    };
+    format!(
+        "当前任务目标：{}\n当前上下文任务：{} ({:?})\n用户重规划约束：{}\n请基于最新约束重规划剩余任务图，保留已完成节点，不重写已完成工作。",
+        objective_text,
+        context_text,
+        context_task.kind,
+        message.trim()
+    )
+}
+
 /// 处理深度模式运行中的用户中途输入（design 8）。
 /// 先进行 Intake 分类，再根据分类结果写入 Mission context、触发 replan、
 /// resolve Decision 或追加子任务，禁止直接塞给当前 worker。
@@ -243,18 +266,20 @@ async fn handle_intake(
             })));
         }
         IntakeClassification::Replan => {
-            let manager = state.runner_manager().ok_or_else(|| {
-                ApiError::internal_assembly("intake replan", "runner_manager 未配置")
-            })?;
-            let cancelled = manager
-                .replan(root_task_id.as_str())
-                .map_err(|e| ApiError::internal_assembly("重规划失败", e))?;
+            let prompt = build_intake_replan_prompt(&root_task, &context_task, &request.message);
+            let replan = replan_deep_task_graph(
+                &state,
+                &root_task_id,
+                &prompt,
+                Some(&context_task),
+                request.message.trim(),
+            )?;
             return Ok(Json(json!({
                 "classification": "replan",
                 "replan": true,
                 "rootTaskId": root_task_id.to_string(),
                 "targetTaskId": root_task_id.to_string(),
-                "cancelledTaskIds": cancelled.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                "cancelledTaskIds": replan.cancelled_task_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
                 "contextTaskId": context_task_id.to_string(),
             })));
         }

@@ -46,6 +46,10 @@ pub enum OrchestratorCommandError {
     TaskNotFound {
         task_id: TaskId,
     },
+    TaskStateViolation {
+        task_id: TaskId,
+        message: String,
+    },
     NoDispatchTarget {
         mission_id: MissionId,
     },
