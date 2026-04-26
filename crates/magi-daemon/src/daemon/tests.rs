@@ -894,7 +894,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         json!({
             "session_id": session_id.to_string(),
             "text": "follow up recovery task",
-            "deep_task": true,
+            "deep_task": false,
             "skill_name": "resume",
             "images": [],
         }),
@@ -971,7 +971,7 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         json!({
             "session_id": "shadow-session-bootstrap",
             "text": "Route parser refresh",
-            "deep_task": true,
+            "deep_task": false,
             "skill_name": "refactor",
             "images": [],
         }),
@@ -1001,7 +1001,7 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         json!({
             "session_id": "shadow-session-bootstrap",
             "text": "Route parser refresh followup",
-            "deep_task": true,
+            "deep_task": false,
             "skill_name": "refactor",
             "images": [],
         }),
@@ -1073,7 +1073,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         json!({
             "session_id": "shadow-session-bootstrap-recovery",
             "text": "seed bootstrap recovery state",
-            "deep_task": true,
+            "deep_task": false,
             "skill_name": "resume",
             "images": [],
         }),
@@ -1172,7 +1172,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         json!({
             "session_id": "shadow-session-bootstrap-recovery",
             "text": "consume resumed bootstrap memory",
-            "deep_task": true,
+            "deep_task": false,
             "skill_name": "resume",
             "images": [],
         }),
@@ -2165,7 +2165,7 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
         "/api/session/turn",
         json!({
             "text": "Hello integration test",
-            "deep_task": true,
+            "deep_task": false,
             "skill_name": "code",
             "images": [],
         }),
@@ -2345,7 +2345,8 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         "/api/session/turn",
         json!({
             "text": "Restart continue verification",
-            "deep_task": true,
+            "deep_task": false,
+            "skill_name": "refactor",
             "images": [],
         }),
     )
@@ -2785,7 +2786,8 @@ async fn unbound_session_continue_survives_runtime_restart() {
         "/api/session/turn",
         json!({
             "text": "Unbound session restart verification",
-            "deep_task": true,
+            "deep_task": false,
+            "skill_name": "refactor",
             "images": [],
         }),
     )
@@ -2974,7 +2976,8 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
         "/api/session/turn",
         json!({
             "text": "first action",
-            "deep_task": true,
+            "deep_task": false,
+            "skill_name": "refactor",
             "images": [],
         }),
     )
@@ -2996,7 +2999,8 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
         json!({
             "session_id": session_id,
             "text": "second action",
-            "deep_task": true,
+            "deep_task": false,
+            "skill_name": "refactor",
             "images": [],
         }),
     )

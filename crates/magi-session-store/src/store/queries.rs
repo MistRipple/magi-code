@@ -152,7 +152,7 @@ impl SessionStore {
         let mut messages = entries
             .into_iter()
             .take(limit)
-            .map(|entry| entry.message)
+            .filter_map(|entry| crate::timeline_entry_visible_text(&entry.message))
             .collect::<Vec<_>>();
         messages.reverse();
         messages

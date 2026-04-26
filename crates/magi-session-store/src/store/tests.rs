@@ -240,6 +240,7 @@ fn active_execution_chain_turn_replaces_stale_session_turn() {
                 user_message: Some("普通问答".to_string()),
                 items: Vec::new(),
                 worker_lanes: Vec::new(),
+                completed_at: None,
             },
         )
         .expect("chat turn should upsert");
@@ -252,6 +253,7 @@ fn active_execution_chain_turn_replaces_stale_session_turn() {
         user_message: Some("创建产品级任务".to_string()),
         items: Vec::new(),
         worker_lanes: Vec::new(),
+        completed_at: None,
     };
 
     store
@@ -318,6 +320,7 @@ fn active_execution_chain_does_not_reuse_turn_from_different_chain() {
                 user_message: Some("普通问答".to_string()),
                 items: Vec::new(),
                 worker_lanes: Vec::new(),
+                completed_at: None,
             },
         )
         .expect("chat turn should upsert");

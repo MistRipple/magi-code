@@ -140,6 +140,8 @@ pub struct ActiveExecutionTurn {
     pub turn_id: String,
     pub turn_seq: u64,
     pub accepted_at: UtcMillis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<UtcMillis>,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_message: Option<String>,
@@ -373,6 +375,60 @@ pub struct TimelineEntry {
     pub message: String,
     #[serde(alias = "occurred_at")]
     pub occurred_at: UtcMillis,
+}
+
+pub fn timeline_entry_visible_text(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if value
+            .get("is_historical_turn_snapshot")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            if let Some(text) = extract_snapshot_visible_text(&value) {
+                return Some(text);
+            }
+            return None;
+        }
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn extract_snapshot_visible_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value
+        .get("final_text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+
+    let items = value.get("turn_items")?.as_array()?;
+    for item in items.iter().rev() {
+        let kind = item
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim);
+        if !matches!(kind, Some("assistant_final" | "assistant_stream")) {
+            continue;
+        }
+        if let Some(text) = item
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            return Some(text.to_string());
+        }
+    }
+
+    None
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

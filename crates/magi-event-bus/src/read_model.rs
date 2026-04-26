@@ -271,6 +271,8 @@ pub struct SessionRuntimeTurnSummaryEntry {
     pub turn_id: String,
     pub turn_seq: u64,
     pub accepted_at: Option<UtcMillis>,
+    pub completed_at: Option<UtcMillis>,
+    pub response_duration_ms: Option<u64>,
     pub status: String,
     pub user_message: Option<String>,
     pub mission_id: Option<String>,

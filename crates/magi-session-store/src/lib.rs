@@ -7,6 +7,6 @@ pub use models::{
     SessionDurableState, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
     SessionProjectionInput, SessionRecord, SessionRuntimeSidecar, SessionRuntimeSidecarExport,
     SessionSidecarFlushMetadata, SessionSidecarFlushReason, SessionStoreState, TimelineEntry,
-    TimelineEntryKind,
+    TimelineEntryKind, timeline_entry_visible_text,
 };
 pub use store::SessionStore;

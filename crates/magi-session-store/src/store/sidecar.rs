@@ -678,6 +678,11 @@ impl SessionStore {
                 return Ok(None);
             };
             turn.status = status.into();
+            if turn.completed_at.is_none()
+                && matches!(turn.status.as_str(), "completed" | "failed" | "cancelled")
+            {
+                turn.completed_at = Some(UtcMillis::now());
+            }
             turn.normalize();
             if let Some(chain) = sidecar.active_execution_chain.as_mut() {
                 chain.current_turn = sidecar.current_turn.clone();

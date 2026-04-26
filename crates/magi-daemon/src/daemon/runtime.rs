@@ -12,7 +12,7 @@ use magi_api::{
 };
 use magi_bridge_client::{
     BridgeDispatchRuntime, BridgeServerKind, BridgeTransport, HttpModelBridgeClient,
-    JsonRpcHostBridgeClient, JsonRpcMcpBridgeClient, JsonRpcModelBridgeClient,
+    HttpModelBridgeProtocol, JsonRpcHostBridgeClient, JsonRpcMcpBridgeClient,
     JsonRpcStdioTransport, StdioMcpBridgeClient,
 };
 use magi_context_runtime::{ContextBudget, ContextRuntime};
@@ -47,10 +47,61 @@ impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
         if let Some(payload) = classifier_payload_for_prompt(&request.prompt) {
             return Ok(magi_bridge_client::BridgeResponse { ok: true, payload });
         }
+        if request.prompt.contains("深度任务图") {
+            return Ok(magi_bridge_client::BridgeResponse {
+                ok: true,
+                payload: serde_json::json!({
+                    "phases": [
+                        {
+                            "title": "P1",
+                            "workPackages": [
+                                {
+                                    "title": "WP1",
+                                    "actions": [
+                                        { "title": "A1", "goal": "g1", "dependsOn": [], "writeScope": null }
+                                    ]
+                                }
+                            ]
+                        },
+                        {
+                            "title": "P2",
+                            "workPackages": [
+                                {
+                                    "title": "WP2",
+                                    "actions": [
+                                        { "title": "A2", "goal": "g2", "dependsOn": [], "writeScope": null }
+                                    ]
+                                }
+                            ]
+                        },
+                        {
+                            "title": "P3",
+                            "workPackages": [
+                                {
+                                    "title": "WP3",
+                                    "actions": [
+                                        { "title": "A3", "goal": "g3", "dependsOn": [], "writeScope": null }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                })
+                .to_string(),
+            });
+        }
         Ok(magi_bridge_client::BridgeResponse {
             ok: true,
             payload: format!("shadow-model::{}", request.prompt.trim()),
         })
+    }
+
+    fn invoke_streaming(
+        &self,
+        request: magi_bridge_client::ModelInvocationRequest,
+        _on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
+    ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError> {
+        self.invoke(request)
     }
 }
 
@@ -255,9 +306,22 @@ impl ShadowDaemonRuntime {
         let mcp_transport =
             Self::bridge_loopback_transport_with_env("mcp_bridge_loopback", bridge_env);
 
-        // Use HttpModelBridgeClient for direct HTTP calls when env vars are
-        // configured, falling back to the JSON-RPC subprocess loopback.
-        let direct_http_result = Self::try_build_http_model_client(bridge_env);
+        // 创建带持久化路径的设置存储，并从磁盘恢复已有设置
+        let settings_store = Arc::new(SettingsStore::with_persistence_path(
+            self.state_root.join("settings.json"),
+        ));
+        if let Err(error) = settings_store.load_from_disk() {
+            warn!(error = %error, "设置文件加载失败，使用空默认值");
+        }
+
+        // 模型桥唯一实现：HttpModelBridgeClient(直连 OpenAI 兼容 API)
+        // 配置来源优先级: bridge_env override → 进程 env → settings.json auxiliary 段
+        // 测试场景下允许通过 model_bridge_override 注入 stub
+        let direct_http_result = if model_bridge_override.is_some() {
+            None
+        } else {
+            Self::try_build_http_model_client(bridge_env, settings_store.as_ref())
+        };
         let direct_http_probe_config = direct_http_result
             .as_ref()
             .map(|(_, config)| config.clone());
@@ -268,13 +332,19 @@ impl ShadowDaemonRuntime {
         let direct_mcp_client = StdioMcpBridgeClient::from_env();
 
         let model_bridge_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
-            if let Some((http_client, _)) = direct_http_result {
-                Arc::new(http_client)
-            } else {
-                Arc::new(JsonRpcModelBridgeClient::new(model_transport.clone()))
+            match (model_bridge_override.clone(), direct_http_result) {
+                (Some(client), _) => client,
+                (None, Some((http_client, _))) => Arc::new(http_client),
+                (None, None) => {
+                    panic!(
+                        "未找到模型桥配置:请在环境变量 MAGI_OPENAI_COMPAT_BASE_URL 或 \
+                         {}/settings.json 的 auxiliary 段配置 baseUrl",
+                        self.state_root.display()
+                    );
+                }
             };
         let business_model_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
-            model_bridge_override.unwrap_or_else(|| model_bridge_client.clone());
+            model_bridge_client.clone();
         let bridge_runtime = BridgeDispatchRuntime::new()
             .with_host_client(Arc::new(JsonRpcHostBridgeClient::new(
                 host_transport.clone(),
@@ -299,7 +369,7 @@ impl ShadowDaemonRuntime {
             Ok(Some(restored)) => {
                 let eb = event_bus_for_task_store.clone();
                 let receiver = runner_result_receiver.clone();
-                restored.set_status_change_callback(Box::new(move |task_id, new_status, task| {
+                restored.set_status_change_callback(Box::new(move |task_id, new_status, task: magi_core::Task| {
                     let event = magi_event_bus::task_events::task_status_changed_event(
                         &task_id.to_string(),
                         &task.mission_id.to_string(),
@@ -324,7 +394,7 @@ impl ShadowDaemonRuntime {
             _ => {
                 let receiver = runner_result_receiver.clone();
                 Arc::new(TaskStore::with_status_change_callback(Box::new(
-                    move |task_id, new_status, task| {
+                    move |task_id, new_status, task: magi_core::Task| {
                         let event = magi_event_bus::task_events::task_status_changed_event(
                             &task_id.to_string(),
                             &task.mission_id.to_string(),
@@ -354,14 +424,6 @@ impl ShadowDaemonRuntime {
                     project_key: None,
                 },
             );
-
-        // 创建带持久化路径的设置存储，并从磁盘恢复已有设置
-        let settings_store = Arc::new(SettingsStore::with_persistence_path(
-            self.state_root.join("settings.json"),
-        ));
-        if let Err(error) = settings_store.load_from_disk() {
-            warn!(error = %error, "设置文件加载失败，使用空默认值");
-        }
 
         let app_skill_runtime = Arc::new(
             magi_api::skill_loader::build_skill_runtime_from_settings(&settings_store),
@@ -421,7 +483,8 @@ impl ShadowDaemonRuntime {
             shadow_task_dispatcher,
             runner_result_receiver,
         )
-        .with_checkpoint_path(task_store_checkpoint_path);
+        .with_checkpoint_path(task_store_checkpoint_path)
+        .with_model_bridge_client(Arc::clone(&business_model_client));
         state = state
             .with_task_store(task_store)
             .with_runner_manager(runner_manager)
@@ -542,18 +605,30 @@ impl ShadowDaemonRuntime {
         Arc::new(transport)
     }
 
-    /// Build an `HttpModelBridgeClient` when env vars are configured.
+    /// Build an `HttpModelBridgeClient` from configuration.
     ///
-    /// When `bridge_env` overrides are provided (test mode), the overrides
-    /// take priority over process-level env vars.
+    /// 配置来源优先级:
+    /// 1. `bridge_env` overrides (测试场景)
+    /// 2. 进程级 env (`MAGI_OPENAI_COMPAT_*`)
+    /// 3. `settings.json` 的 `auxiliary` 段(生产配置)
+    ///
+    /// 任一字段(baseUrl/apiKey/model/protocol)按上述顺序解析,允许跨源混合。
     ///
     /// Returns the client together with a [`DirectHttpModelProbeConfig`] that
     /// the cutover-smoke provider can use for its own independent probe.
     fn try_build_http_model_client(
         bridge_env: &[(&str, &str)],
+        settings_store: &SettingsStore,
     ) -> Option<(HttpModelBridgeClient, DirectHttpModelProbeConfig)> {
+        let auxiliary = settings_store.get_section("auxiliary");
+        let aux_string = |field: &str| -> Option<String> {
+            auxiliary
+                .get(field)
+                .and_then(|v| v.as_str())
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
         let find_env = |key: &str| -> Option<String> {
-            // Check bridge_env overrides first, then fall back to process env.
             bridge_env
                 .iter()
                 .find(|(k, _)| *k == key)
@@ -567,9 +642,20 @@ impl ShadowDaemonRuntime {
                 })
         };
 
-        let base_url = find_env("MAGI_OPENAI_COMPAT_BASE_URL")?;
-        let api_key = find_env("MAGI_OPENAI_COMPAT_API_KEY");
-        let model = find_env("MAGI_OPENAI_COMPAT_MODEL").unwrap_or_else(|| "gpt-4".to_string());
+        let base_url =
+            find_env("MAGI_OPENAI_COMPAT_BASE_URL").or_else(|| aux_string("baseUrl"))?;
+        let api_key =
+            find_env("MAGI_OPENAI_COMPAT_API_KEY").or_else(|| aux_string("apiKey"));
+        let model = find_env("MAGI_OPENAI_COMPAT_MODEL")
+            .or_else(|| aux_string("model"))
+            .unwrap_or_else(|| "gpt-4".to_string());
+        let protocol = match find_env("MAGI_OPENAI_COMPAT_PROTOCOL")
+            .or_else(|| aux_string("openaiProtocol"))
+            .as_deref()
+        {
+            Some("responses") => HttpModelBridgeProtocol::Responses,
+            _ => HttpModelBridgeProtocol::ChatCompletions,
+        };
 
         let probe_config = DirectHttpModelProbeConfig {
             base_url: base_url.clone(),
@@ -577,7 +663,7 @@ impl ShadowDaemonRuntime {
             model: model.clone(),
         };
         Some((
-            HttpModelBridgeClient::new(base_url, api_key, model),
+            HttpModelBridgeClient::new_with_protocol(base_url, api_key, model, protocol),
             probe_config,
         ))
     }
@@ -1052,7 +1138,7 @@ mod tests {
             json!({
                 "sessionId": "shadow-session-001",
                 "text": "remember parser constraint",
-                "deepTask": true,
+                "deepTask": false,
                 "skillName": "refactor",
                 "images": [],
             }),
@@ -1096,7 +1182,7 @@ mod tests {
             json!({
                 "sessionId": "shadow-session-001",
                 "text": "follow up parser work",
-                "deepTask": true,
+                "deepTask": false,
                 "skillName": "refactor",
                 "images": [],
             }),
@@ -1240,7 +1326,7 @@ mod tests {
             json!({
                 "sessionId": "shadow-session-001",
                 "text": "seed recovery route state",
-                "deepTask": true,
+                "deepTask": false,
                 "skillName": "refactor",
                 "images": [],
             }),
@@ -1314,7 +1400,7 @@ mod tests {
             json!({
                 "sessionId": "shadow-session-001",
                 "text": "consume recovery memory",
-                "deepTask": true,
+                "deepTask": false,
                 "skillName": "refactor",
                 "images": [],
             }),
