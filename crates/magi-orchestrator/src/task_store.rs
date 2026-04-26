@@ -16,7 +16,7 @@ static CHECKPOINT_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Receives the task ID, the new status, and a snapshot of the task after the
 /// status change.  The callback runs while the tasks write lock is still held,
 /// so implementations should be lightweight (e.g. publish an event).
-pub type StatusChangeCallback = Box<dyn Fn(&TaskId, TaskStatus, &Task) + Send + Sync>;
+pub type StatusChangeCallback = Box<dyn Fn(&TaskId, TaskStatus, Task) + Send + Sync>;
 
 /// 任务图的内存存储，维护任务、租约及其索引。
 pub struct TaskStore {
@@ -35,6 +35,25 @@ pub struct TaskStore {
     /// Optional callback fired on every successful status change for checkpoint
     /// persistence (design 6.8).
     on_checkpoint: Mutex<Option<Box<dyn Fn(&TaskStore) + Send + Sync>>>,
+}
+
+fn default_frozen_policy() -> TaskPolicy {
+    TaskPolicy {
+        autonomy_level: "Assisted".to_string(),
+        approval_mode: "Interactive".to_string(),
+        allowed_tools: Vec::new(),
+        denied_tools: Vec::new(),
+        allowed_paths: Vec::new(),
+        denied_paths: Vec::new(),
+        network_mode: "full".to_string(),
+        command_mode: "full".to_string(),
+        retry_limit: 1,
+        repair_limit: 1,
+        validation_profile: None,
+        checkpoint_mode: "turn".to_string(),
+        background_allowed: false,
+        escalation_conditions: Vec::new(),
+    }
 }
 
 impl TaskStore {
@@ -130,6 +149,39 @@ impl TaskStore {
             .cloned()
     }
 
+    /// 迁移任务到新的父节点，同时修正 children 索引。
+    pub fn reparent_task(&self, task_id: &TaskId, new_parent_id: &TaskId) -> DomainResult<()> {
+        let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
+        let old_parent = task.parent_task_id.clone();
+        task.parent_task_id = Some(new_parent_id.clone());
+        task.updated_at = UtcMillis::now();
+        drop(tasks);
+
+        if let Some(old_parent_id) = old_parent {
+            let mut children_index = self
+                .children_index
+                .write()
+                .expect("children_index write lock poisoned");
+            if let Some(children) = children_index.get_mut(&old_parent_id) {
+                children.retain(|id| id != task_id);
+                if children.is_empty() {
+                    children_index.remove(&old_parent_id);
+                }
+            }
+        }
+
+        self.children_index
+            .write()
+            .expect("children_index write lock poisoned")
+            .entry(new_parent_id.clone())
+            .or_default()
+            .push(task_id.clone());
+        Ok(())
+    }
+
     /// 更新任务状态（不做迁移合法性校验，兼容内部传播场景）。
     pub fn update_status(&self, task_id: &TaskId, status: TaskStatus) -> DomainResult<()> {
         let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
@@ -138,15 +190,16 @@ impl TaskStore {
             .ok_or(DomainError::NotFound { entity: "Task" })?;
         task.status = status;
         task.updated_at = UtcMillis::now();
+        let cloned_task = task.clone();
+        drop(tasks);
         let callback = self
             .on_status_change
             .lock()
             .expect("on_status_change lock poisoned");
         if let Some(ref cb) = *callback {
-            cb(task_id, status, task);
+            cb(task_id, status, cloned_task);
         }
         drop(callback);
-        drop(tasks);
         self.fire_checkpoint();
         Ok(())
     }
@@ -170,22 +223,7 @@ impl TaskStore {
         // G9: Policy freeze — snapshot policy on Draft→Ready transition.
         if task.status == TaskStatus::Draft && new_status == TaskStatus::Ready {
             if task.policy_snapshot.is_none() {
-                task.policy_snapshot = Some(TaskPolicy {
-                    autonomy_level: "Autonomous".to_string(),
-                    approval_mode: "auto".to_string(),
-                    allowed_tools: Vec::new(),
-                    denied_tools: Vec::new(),
-                    allowed_paths: Vec::new(),
-                    denied_paths: Vec::new(),
-                    network_mode: "full".to_string(),
-                    command_mode: "full".to_string(),
-                    retry_limit: 3,
-                    repair_limit: 3,
-                    validation_profile: None,
-                    checkpoint_mode: "auto".to_string(),
-                    background_allowed: false,
-                    escalation_conditions: Vec::new(),
-                });
+                task.policy_snapshot = Some(default_frozen_policy());
             }
         }
         // G13: Evidence check — require non-empty evidence_refs for terminal transitions.
@@ -204,15 +242,16 @@ impl TaskStore {
         }
         task.status = new_status;
         task.updated_at = UtcMillis::now();
+        let cloned_task = task.clone();
+        drop(tasks);
         let callback = self
             .on_status_change
             .lock()
             .expect("on_status_change lock poisoned");
         if let Some(ref cb) = *callback {
-            cb(task_id, new_status, task);
+            cb(task_id, new_status, cloned_task);
         }
         drop(callback);
-        drop(tasks);
         self.fire_checkpoint();
         Ok(())
     }
@@ -304,17 +343,121 @@ impl TaskStore {
         self.update_status(decision_task_id, TaskStatus::Completed)
             .map_err(|e| format!("failed to complete decision: {e}"))?;
 
-        if let Some(ref parent_id) = decision.parent_task_id {
-            let siblings = self.get_children(parent_id);
-            let still_blocked = siblings.iter().any(|s| {
-                s.task_id != *decision_task_id
-                    && (s.status == TaskStatus::Blocked || s.status == TaskStatus::AwaitingApproval)
-            });
-            if !still_blocked {
-                if let Some(parent) = self.get_task(parent_id) {
-                    if parent.status == TaskStatus::Blocked {
-                        self.update_status(parent_id, TaskStatus::Running)
-                            .map_err(|e| format!("failed to unblock parent: {e}"))?;
+        match chosen_option {
+            "abort" | "cancel" => {
+                self.cancel_open_subtree(&decision.root_task_id, Some(decision_task_id))?;
+            }
+            "skip" => {
+                if let Some(target_task_id) = payload.target_task_id.as_ref() {
+                    self.skip_open_subtree(target_task_id, Some(decision_task_id))?;
+                } else if let Some(ref parent_id) = decision.parent_task_id {
+                    self.skip_open_subtree(parent_id, Some(decision_task_id))?;
+                }
+            }
+            _ => {
+                self.release_decision_gate(
+                    &decision,
+                    decision_task_id,
+                    payload.target_task_id.as_ref(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn release_decision_gate(
+        &self,
+        decision: &Task,
+        decision_task_id: &TaskId,
+        target_task_id: Option<&TaskId>,
+    ) -> Result<(), String> {
+        if let Some(target_task_id) = target_task_id {
+            self.release_open_branch(target_task_id, decision_task_id)?;
+        } else if let Some(ref parent_id) = decision.parent_task_id {
+            self.release_open_branch(parent_id, decision_task_id)?;
+        }
+
+        let all_tasks = self.get_tasks_by_mission(&decision.mission_id);
+        for task in all_tasks {
+            if task.task_id == *decision_task_id || task.kind == TaskKind::Decision {
+                continue;
+            }
+            if (task.status == TaskStatus::Blocked || task.status == TaskStatus::AwaitingApproval)
+                && task
+                    .dependency_ids
+                    .iter()
+                    .any(|dependency_id| dependency_id == decision_task_id)
+                && task.dependency_ids.iter().all(|dependency_id| {
+                    self.get_task(dependency_id)
+                        .is_some_and(|dependency| dependency.status == TaskStatus::Completed)
+                })
+            {
+                self.update_status(&task.task_id, TaskStatus::Ready)
+                    .map_err(|e| format!("failed to release decision dependent: {e}"))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn release_open_branch(
+        &self,
+        branch_task_id: &TaskId,
+        decision_task_id: &TaskId,
+    ) -> Result<(), String> {
+        for task_id in self.collect_subtree_ids(branch_task_id) {
+            if task_id == *decision_task_id {
+                continue;
+            }
+            if let Some(task) = self.get_task(&task_id) {
+                if task.kind != TaskKind::Decision && task.status == TaskStatus::Blocked {
+                    self.update_status(&task_id, TaskStatus::Ready)
+                        .map_err(|e| {
+                            format!("failed to release blocked branch task {task_id}: {e}")
+                        })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cancel_open_subtree(
+        &self,
+        root_task_id: &TaskId,
+        keep_completed_task_id: Option<&TaskId>,
+    ) -> Result<(), String> {
+        for task_id in self.collect_subtree_ids(root_task_id) {
+            if keep_completed_task_id.is_some_and(|keep_id| keep_id == &task_id) {
+                continue;
+            }
+            if let Some(task) = self.get_task(&task_id) {
+                if !is_terminal_status(task.status) {
+                    self.update_status(&task_id, TaskStatus::Cancelled)
+                        .map_err(|e| format!("failed to cancel task {task_id}: {e}"))?;
+                    if let Some(lease) = self.get_active_lease(&task_id) {
+                        self.revoke_lease(&task_id, &lease.lease_id);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn skip_open_subtree(
+        &self,
+        root_task_id: &TaskId,
+        keep_completed_task_id: Option<&TaskId>,
+    ) -> Result<(), String> {
+        for task_id in self.collect_subtree_ids(root_task_id) {
+            if keep_completed_task_id.is_some_and(|keep_id| keep_id == &task_id) {
+                continue;
+            }
+            if let Some(task) = self.get_task(&task_id) {
+                if !is_terminal_status(task.status) {
+                    self.update_status(&task_id, TaskStatus::Skipped)
+                        .map_err(|e| format!("failed to skip task {task_id}: {e}"))?;
+                    if let Some(lease) = self.get_active_lease(&task_id) {
+                        self.revoke_lease(&task_id, &lease.lease_id);
                     }
                 }
             }
@@ -376,6 +519,18 @@ impl TaskStore {
             .unwrap_or_default()
     }
 
+    pub fn has_validation_dependent(&self, task_id: &TaskId) -> bool {
+        self.tasks
+            .read()
+            .expect("tasks read lock poisoned")
+            .values()
+            .any(|task| {
+                task.kind == TaskKind::Validation
+                    && (task.parent_task_id.as_ref() == Some(task_id)
+                        || task.dependency_ids.iter().any(|dep_id| dep_id == task_id))
+            })
+    }
+
     /// 获取根任务下所有处于 Ready 状态且依赖已满足的叶子任务。
     pub fn get_runnable_leaves(&self, root_task_id: &TaskId) -> Vec<Task> {
         let tasks = self.tasks.read().expect("tasks read lock poisoned");
@@ -394,11 +549,22 @@ impl TaskStore {
             }
         }
 
-        // A leaf is a task with no children
+        // A leaf is a task with no children, or whose children are all terminal.
         let leaves: Vec<&Task> = all_ids
             .iter()
             .filter_map(|id| tasks.get(id))
-            .filter(|task| !children_index.contains_key(&task.task_id))
+            .filter(|task| {
+                children_index
+                    .get(&task.task_id)
+                    .map(|child_ids| {
+                        child_ids.iter().all(|cid| {
+                            tasks
+                                .get(cid)
+                                .is_some_and(|c| is_terminal_status(c.status))
+                        })
+                    })
+                    .unwrap_or(true)
+            })
             .collect();
 
         // Runnable: status == Ready && all dependencies are Completed
@@ -422,7 +588,8 @@ impl TaskStore {
         let mut current = task.parent_task_id.as_ref();
         while let Some(pid) = current {
             if let Some(parent) = tasks.get(pid) {
-                if parent.status == TaskStatus::Blocked
+                if parent.status == TaskStatus::Draft
+                    || parent.status == TaskStatus::Blocked
                     || parent.status == TaskStatus::AwaitingApproval
                 {
                     return true;
@@ -590,6 +757,90 @@ impl TaskStore {
             .count() as u32;
         let running_count = running_tasks.len() as u32;
         let blocked_count = blocked_tasks.len() as u32;
+        let validation_tasks: Vec<&Task> = all_tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Validation)
+            .copied()
+            .collect();
+        let completed_validations = validation_tasks
+            .iter()
+            .filter(|task| task.status == TaskStatus::Completed)
+            .count();
+        let evidence_tasks = all_tasks
+            .iter()
+            .filter(|task| !task.evidence_refs.is_empty())
+            .count();
+        let validation_summary = if validation_tasks.is_empty() && evidence_tasks == 0 {
+            None
+        } else {
+            Some(format!(
+                "验证 {}/{}，证据 {} 项",
+                completed_validations,
+                validation_tasks.len(),
+                evidence_tasks
+            ))
+        };
+
+        // Build WorkPackage summaries (design 8.2)
+        let workpackage_summaries: Vec<magi_core::WorkPackageSummary> = all_tasks
+            .iter()
+            .filter(|t| t.kind == magi_core::TaskKind::WorkPackage)
+            .filter_map(|wp| {
+                let child_ids = children_index.get(&wp.task_id)?;
+                let children: Vec<&magi_core::Task> = child_ids
+                    .iter()
+                    .filter_map(|cid| tasks.get(cid))
+                    .collect();
+                let total = children.len() as u32;
+                if total == 0 {
+                    return Some(magi_core::WorkPackageSummary {
+                        task_id: wp.task_id.to_string(),
+                        title: wp.title.clone(),
+                        aggregate_status: wp.status.clone(),
+                        display_status: format!("{:?}", wp.status),
+                        progress_ratio: 0.0,
+                        recent_evidence: Vec::new(),
+                        recent_issues: Vec::new(),
+                    });
+                }
+                let terminal = children.iter().filter(|c| {
+                    matches!(
+                        c.status,
+                        magi_core::TaskStatus::Completed
+                            | magi_core::TaskStatus::Failed
+                            | magi_core::TaskStatus::Skipped
+                            | magi_core::TaskStatus::Cancelled
+                    )
+                }).count() as u32;
+                let progress_ratio = terminal as f32 / total as f32;
+                let recent_evidence: Vec<String> = children
+                    .iter()
+                    .filter(|c| !c.evidence_refs.is_empty())
+                    .flat_map(|c| c.evidence_refs.iter().cloned())
+                    .collect::<std::collections::HashSet<String>>()
+                    .into_iter()
+                    .collect();
+                let recent_issues: Vec<String> = children
+                    .iter()
+                    .filter(|c| {
+                        matches!(
+                            c.status,
+                            magi_core::TaskStatus::Failed | magi_core::TaskStatus::Blocked
+                        )
+                    })
+                    .map(|c| c.title.clone())
+                    .collect();
+                Some(magi_core::WorkPackageSummary {
+                    task_id: wp.task_id.to_string(),
+                    title: wp.title.clone(),
+                    aggregate_status: wp.status.clone(),
+                    display_status: format!("{:?}", wp.status),
+                    progress_ratio,
+                    recent_evidence,
+                    recent_issues,
+                })
+            })
+            .collect();
 
         let aggregate_status = if failed_tasks > 0 {
             TaskStatus::Failed
@@ -603,7 +854,41 @@ impl TaskStore {
             root_task.status
         };
 
-        let display_status = format!("{:?}", aggregate_status);
+        let execution_mode = if root_task
+            .policy_snapshot
+            .as_ref()
+            .map(|policy| policy.background_allowed)
+            .unwrap_or(false)
+        {
+            "deep".to_string()
+        } else {
+            "normal".to_string()
+        };
+        let runner_status = match aggregate_status {
+            TaskStatus::Running => "running".to_string(),
+            TaskStatus::Blocked | TaskStatus::AwaitingApproval => "blocked".to_string(),
+            TaskStatus::Completed => "completed".to_string(),
+            TaskStatus::Failed => "error".to_string(),
+            _ => "idle".to_string(),
+        };
+        let display_status = if total_tasks == 0 {
+            "待启动".to_string()
+        } else {
+            let pct = (completed_tasks as f32 / total_tasks as f32 * 100.0).round() as u32;
+            if completed_tasks == total_tasks {
+                "全部完成".to_string()
+            } else if failed_tasks > 0 && blocked_count > 0 {
+                format!("{}% 已完成，{} 项失败、{} 项阻塞", pct, failed_tasks, blocked_count)
+            } else if failed_tasks > 0 {
+                format!("{}% 已完成，{} 项失败待修复", pct, failed_tasks)
+            } else if blocked_count > 0 {
+                format!("{}% 已完成，{} 项阻塞", pct, blocked_count)
+            } else if running_count > 0 {
+                format!("{}% 已完成，{} 项执行中", pct, running_count)
+            } else {
+                format!("{}% 已完成", pct)
+            }
+        };
 
         Some(TaskProjection {
             root_task,
@@ -612,7 +897,8 @@ impl TaskStore {
             running_tasks,
             blocked_tasks,
             pending_decisions,
-            validation_summary: None,
+            workpackage_summaries,
+            validation_summary,
             progress_summary: ProgressSummary {
                 total_tasks,
                 completed_tasks,
@@ -622,7 +908,99 @@ impl TaskStore {
             },
             aggregate_status,
             display_status,
+            execution_mode,
+            runner_status,
         })
+    }
+
+    /// 聚合交付包（design 12）：从 TaskProjection 和已完成任务中提取
+    /// 目标、范围、变更、证据、验证结果等交付摘要。
+    pub fn build_delivery_package(&self, root_task_id: &TaskId) -> Option<serde_json::Value> {
+        let projection = self.build_projection(root_task_id)?;
+
+        let completed_tasks: Vec<&Task> = projection
+            .tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Completed)
+            .collect();
+
+        let mut file_changes: Vec<String> = Vec::new();
+        let mut evidence_list: Vec<String> = Vec::new();
+        let mut validation_results: Vec<serde_json::Value> = Vec::new();
+        let mut repair_records: Vec<serde_json::Value> = Vec::new();
+        let mut key_decisions: Vec<serde_json::Value> = Vec::new();
+
+        for task in &projection.tasks {
+            for output in &task.output_refs {
+                if !file_changes.contains(output) {
+                    file_changes.push(output.clone());
+                }
+            }
+            for evidence in &task.evidence_refs {
+                if !evidence_list.contains(evidence) {
+                    evidence_list.push(evidence.clone());
+                }
+            }
+            if task.kind == TaskKind::Validation && task.status == TaskStatus::Completed {
+                validation_results.push(serde_json::json!({
+                    "task_id": task.task_id.to_string(),
+                    "title": task.title,
+                    "result": "passed",
+                    "evidence": task.evidence_refs,
+                }));
+            }
+            if task.kind == TaskKind::Repair && task.status == TaskStatus::Completed {
+                repair_records.push(serde_json::json!({
+                    "task_id": task.task_id.to_string(),
+                    "title": task.title,
+                    "goal": task.goal,
+                    "evidence": task.evidence_refs,
+                }));
+            }
+            if task.kind == TaskKind::Decision && task.status == TaskStatus::Completed {
+                if let Some(ref payload) = task.decision_payload {
+                    key_decisions.push(serde_json::json!({
+                        "task_id": task.task_id.to_string(),
+                        "context": payload.decision_context,
+                        "blocked_reason": payload.blocked_reason,
+                        "chosen_option": task.output_refs.first(),
+                    }));
+                }
+            }
+        }
+
+        let remaining_risks: Vec<String> = projection
+            .tasks
+            .iter()
+            .filter(|t| {
+                t.status == TaskStatus::Failed
+                    || t.status == TaskStatus::Blocked
+                    || t.status == TaskStatus::AwaitingApproval
+            })
+            .map(|t| format!("{}: {:?} - {}", t.task_id, t.status, t.title))
+            .collect();
+
+        Some(serde_json::json!({
+            "goal": projection.root_task.goal,
+            "scope": projection.root_task.workspace_scope,
+            "execution_mode": projection.execution_mode,
+            "aggregate_status": projection.aggregate_status,
+            "current_phase": projection.current_phase,
+            "progress": {
+                "total": projection.progress_summary.total_tasks,
+                "completed": projection.progress_summary.completed_tasks,
+                "failed": projection.progress_summary.failed_tasks,
+                "running": projection.progress_summary.running_tasks,
+                "blocked": projection.progress_summary.blocked_tasks,
+            },
+            "file_changes": file_changes,
+            "evidence_list": evidence_list,
+            "validation_results": validation_results,
+            "repair_records": repair_records,
+            "key_decisions": key_decisions,
+            "remaining_risks": remaining_risks,
+            "completed_task_count": completed_tasks.len(),
+        }))
     }
 
     /// 创建执行租约。
@@ -648,6 +1026,7 @@ impl TaskStore {
     pub fn grant_lease(
         &self,
         task_id: &TaskId,
+        root_task_id: &TaskId,
         worker_id: &WorkerId,
         role: &str,
         duration_ms: u64,
@@ -669,6 +1048,7 @@ impl TaskStore {
         let lease = AssignmentLease {
             lease_id: lease_id.clone(),
             task_id: task_id.clone(),
+            root_task_id: root_task_id.clone(),
             worker_id: worker_id.clone(),
             role: role.to_string(),
             granted_at: now,
@@ -717,20 +1097,40 @@ impl TaskStore {
         false
     }
 
-    /// 扫描所有租约，返回已过期（Active 且 expires_at < now）的租约。
+    /// 扫描指定 root_task_id 下的租约，返回已过期（Active 且 expires_at < now）的租约。
     /// 不修改其状态，由调用方决定恢复策略后处理。
-    pub fn collect_expired_leases(&self) -> Vec<(TaskId, LeaseId)> {
+    pub fn collect_expired_leases(&self, root_task_id: &TaskId) -> Vec<(TaskId, LeaseId)> {
         let now = UtcMillis::now();
         let leases = self.leases.read().expect("leases read lock poisoned");
         leases
             .values()
-            .filter(|l| l.lease_status == LeaseStatus::Active && l.expires_at < now)
+            .filter(|l| {
+                l.lease_status == LeaseStatus::Active
+                    && l.expires_at < now
+                    && l.root_task_id == *root_task_id
+            })
             .map(|l| (l.task_id.clone(), l.lease_id.clone()))
             .collect()
     }
 
-    /// 获取所有未过期的活跃租约（Active 且 expires_at >= now）。
-    pub fn collect_active_leases(&self) -> Vec<(TaskId, LeaseId)> {
+    /// 获取指定 root_task_id 下所有未过期的活跃租约（Active 且 expires_at >= now）。
+    pub fn collect_active_leases(&self, root_task_id: &TaskId) -> Vec<(TaskId, LeaseId)> {
+        let now = UtcMillis::now();
+        let leases = self.leases.read().expect("leases read lock poisoned");
+        leases
+            .values()
+            .filter(|l| {
+                l.lease_status == LeaseStatus::Active
+                    && l.expires_at >= now
+                    && l.root_task_id == *root_task_id
+            })
+            .map(|l| (l.task_id.clone(), l.lease_id.clone()))
+            .collect()
+    }
+
+    /// 获取所有未过期的活跃租约（不区分 root_task_id）。
+    /// 仅在 reconcile / checkpoint restore 等全量收敛场景使用。
+    pub fn collect_all_active_leases(&self) -> Vec<(TaskId, LeaseId)> {
         let now = UtcMillis::now();
         let leases = self.leases.read().expect("leases read lock poisoned");
         leases
@@ -749,7 +1149,7 @@ impl TaskStore {
         &self,
         worker_snapshot: &WorkerRuntimeDurableSnapshot,
     ) -> (usize, usize) {
-        let active_leases = self.collect_active_leases();
+        let active_leases = self.collect_all_active_leases();
         let recoverable_branch_task_ids: Vec<_> = worker_snapshot
             .branches
             .iter()
@@ -1075,8 +1475,8 @@ fn is_valid_parent_child_kind(parent: TaskKind, child: TaskKind) -> bool {
 mod tests {
     use super::*;
     use magi_core::{
-        AssignmentLease, LeaseId, LeaseStatus, MissionId, Task, TaskId, TaskKind, TaskStatus,
-        UtcMillis, WorkerId,
+        AssignmentLease, DecisionOption, DecisionTaskPayload, LeaseId, LeaseStatus, MissionId,
+        Task, TaskId, TaskKind, TaskStatus, UtcMillis, WorkerId,
     };
 
     fn make_task(
@@ -1416,6 +1816,7 @@ mod tests {
         let lease = AssignmentLease {
             lease_id: LeaseId::new("lease-1"),
             task_id: TaskId::new("t-1"),
+            root_task_id: TaskId::new("t-1"),
             worker_id: WorkerId::new("worker-1"),
             role: "executor".to_string(),
             granted_at: now,
@@ -1569,6 +1970,89 @@ mod tests {
         assert_eq!(projection.pending_decisions[0].to_string(), "dec-1");
     }
 
+    #[test]
+    fn resolve_decision_releases_blocked_siblings() {
+        let store = TaskStore::new();
+
+        let parent = make_task(
+            "parent-1",
+            "m-1",
+            "root-1",
+            Some("root-1"),
+            TaskKind::Action,
+            TaskStatus::Blocked,
+        );
+        let decision = make_task(
+            "decision-1",
+            "m-1",
+            "root-1",
+            Some("parent-1"),
+            TaskKind::Decision,
+            TaskStatus::AwaitingApproval,
+        );
+        let mut decision = decision;
+        decision.decision_payload = Some(DecisionTaskPayload {
+            decision_context: "选择修复路径".to_string(),
+            blocked_reason: "需要用户确认".to_string(),
+            target_task_id: Some(TaskId::new("parent-1")),
+            options: vec![DecisionOption {
+                option_id: "retry".to_string(),
+                label: "重试".to_string(),
+                description: "重新执行".to_string(),
+            }],
+            risk_notes: vec![],
+            recommended_option: Some("retry".to_string()),
+            required_user_input: true,
+            decision_evidence: None,
+        });
+
+        store.insert_task(make_task(
+            "root-1",
+            "m-1",
+            "root-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        ));
+        let sibling = make_task(
+            "sibling-1",
+            "m-1",
+            "root-1",
+            Some("parent-1"),
+            TaskKind::Action,
+            TaskStatus::Blocked,
+        );
+
+        store.insert_task(parent);
+        store.insert_task(decision);
+        store.insert_task(sibling);
+
+        store
+            .resolve_decision(&TaskId::new("decision-1"), "retry", None)
+            .expect("decision should resolve");
+
+        assert_eq!(
+            store.get_task(&TaskId::new("decision-1")).unwrap().status,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            store.get_task(&TaskId::new("sibling-1")).unwrap().status,
+            TaskStatus::Ready
+        );
+        // Decision 释放后 parent 从 Blocked 变为 Ready（由 Runner 再调度为 Running）
+        assert_eq!(
+            store.get_task(&TaskId::new("parent-1")).unwrap().status,
+            TaskStatus::Ready
+        );
+        assert_eq!(
+            store
+                .get_task(&TaskId::new("decision-1"))
+                .unwrap()
+                .output_refs,
+            vec!["decision_chosen:retry".to_string()]
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Test 9: grant_lease succeeds on fresh task
     // -----------------------------------------------------------------------
@@ -1587,7 +2071,7 @@ mod tests {
         store.insert_task(task);
 
         let worker_id = WorkerId::new("worker-1");
-        let lease = store.grant_lease(&TaskId::new("t-1"), &worker_id, "executor", 60_000);
+        let lease = store.grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker_id, "executor", 60_000);
         assert!(lease.is_some());
 
         let lease = lease.unwrap();
@@ -1617,12 +2101,12 @@ mod tests {
         store.insert_task(task);
 
         let worker_id = WorkerId::new("worker-1");
-        let first = store.grant_lease(&TaskId::new("t-1"), &worker_id, "executor", 60_000);
+        let first = store.grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker_id, "executor", 60_000);
         assert!(first.is_some());
 
         // Second grant should fail
         let worker_id2 = WorkerId::new("worker-2");
-        let second = store.grant_lease(&TaskId::new("t-1"), &worker_id2, "executor", 60_000);
+        let second = store.grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker_id2, "executor", 60_000);
         assert!(second.is_none());
     }
 
@@ -1645,7 +2129,7 @@ mod tests {
 
         let worker_id = WorkerId::new("worker-1");
         let lease = store
-            .grant_lease(&TaskId::new("t-1"), &worker_id, "executor", 60_000)
+            .grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker_id, "executor", 60_000)
             .unwrap();
 
         let result = store.complete_lease(&TaskId::new("t-1"), &lease.lease_id);
@@ -1659,7 +2143,7 @@ mod tests {
         assert!(!result2);
 
         // After completing, a new lease can be granted
-        let new_lease = store.grant_lease(&TaskId::new("t-1"), &worker_id, "executor", 60_000);
+        let new_lease = store.grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker_id, "executor", 60_000);
         assert!(new_lease.is_some());
     }
 
@@ -1682,7 +2166,7 @@ mod tests {
 
         let worker_id = WorkerId::new("worker-1");
         let lease = store
-            .grant_lease(&TaskId::new("t-1"), &worker_id, "executor", 60_000)
+            .grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker_id, "executor", 60_000)
             .unwrap();
 
         let result = store.revoke_lease(&TaskId::new("t-1"), &lease.lease_id);
@@ -1696,7 +2180,7 @@ mod tests {
         assert!(!result2);
 
         // A new lease can be granted after revocation
-        let new_lease = store.grant_lease(&TaskId::new("t-1"), &worker_id, "executor", 60_000);
+        let new_lease = store.grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker_id, "executor", 60_000);
         assert!(new_lease.is_some());
     }
 
@@ -1719,7 +2203,7 @@ mod tests {
 
         let worker_id = WorkerId::new("worker-1");
         let lease = store
-            .grant_lease(&TaskId::new("t-1"), &worker_id, "executor", 60_000)
+            .grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker_id, "executor", 60_000)
             .unwrap();
         let original_heartbeat = lease.heartbeat_at;
 
@@ -1768,6 +2252,7 @@ mod tests {
         let expired_lease = AssignmentLease {
             lease_id: LeaseId::new("lease-expired"),
             task_id: TaskId::new("t-1"),
+            root_task_id: TaskId::new("t-1"),
             worker_id: WorkerId::new("worker-1"),
             role: "executor".to_string(),
             granted_at: UtcMillis(now.0.saturating_sub(120_000)),
@@ -1779,9 +2264,9 @@ mod tests {
 
         // Insert a lease that is NOT expired (far future)
         let worker_id = WorkerId::new("worker-2");
-        let _valid = store.grant_lease(&TaskId::new("t-2"), &worker_id, "executor", 600_000);
+        let _valid = store.grant_lease(&TaskId::new("t-2"), &TaskId::new("t-2"), &worker_id, "executor", 600_000);
 
-        let expired = store.collect_expired_leases();
+        let expired = store.collect_expired_leases(&TaskId::new("t-1"));
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].0.to_string(), "t-1");
         assert_eq!(expired[0].1.to_string(), "lease-expired");
@@ -1826,11 +2311,11 @@ mod tests {
         let worker2 = WorkerId::new("worker-2");
 
         // Worker 1 gets two leases
-        store.grant_lease(&TaskId::new("t-1"), &worker1, "executor", 60_000);
-        store.grant_lease(&TaskId::new("t-2"), &worker1, "validator", 60_000);
+        store.grant_lease(&TaskId::new("t-1"), &TaskId::new("t-1"), &worker1, "executor", 60_000);
+        store.grant_lease(&TaskId::new("t-2"), &TaskId::new("t-2"), &worker1, "validator", 60_000);
 
         // Worker 2 gets one lease
-        store.grant_lease(&TaskId::new("t-3"), &worker2, "executor", 60_000);
+        store.grant_lease(&TaskId::new("t-3"), &TaskId::new("t-3"), &worker2, "executor", 60_000);
 
         let w1_leases = store.get_leases_by_worker(&worker1);
         assert_eq!(w1_leases.len(), 2);
@@ -1897,7 +2382,7 @@ mod tests {
         // Grant a lease
         let worker_id = WorkerId::new("worker-1");
         let lease = store
-            .grant_lease(&TaskId::new("act-2"), &worker_id, "executor", 60_000)
+            .grant_lease(&TaskId::new("act-2"), &TaskId::new("obj-1"), &worker_id, "executor", 60_000)
             .unwrap();
 
         // Checkpoint
@@ -1971,7 +2456,7 @@ mod tests {
         store.insert_task(act);
 
         let worker_id = WorkerId::new("worker-1");
-        store.grant_lease(&TaskId::new("act-1"), &worker_id, "executor", 60_000);
+        store.grant_lease(&TaskId::new("act-1"), &TaskId::new("act-1"), &worker_id, "executor", 60_000);
 
         // Write checkpoint
         store
@@ -2301,6 +2786,7 @@ mod tests {
         let lease = store
             .grant_lease(
                 &TaskId::new("act-1"),
+                &TaskId::new("obj-1"),
                 &WorkerId::new("worker-1"),
                 "executor",
                 60_000,
@@ -2457,5 +2943,403 @@ mod tests {
                 .expect("completed task should remain in store");
             assert_eq!(task.status, TaskStatus::Completed);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: resolve_decision abort 取消整棵根任务子树
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_decision_abort_cancels_root_subtree() {
+        let store = TaskStore::new();
+
+        // root -> phase -> [action, decision]
+        store.insert_task(make_task(
+            "root-1",
+            "m-1",
+            "root-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        ));
+        store.insert_task(make_task(
+            "phase-1",
+            "m-1",
+            "root-1",
+            Some("root-1"),
+            TaskKind::Phase,
+            TaskStatus::Running,
+        ));
+        store.insert_task(make_task(
+            "action-1",
+            "m-1",
+            "root-1",
+            Some("phase-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        ));
+
+        let mut decision = make_task(
+            "dec-1",
+            "m-1",
+            "root-1",
+            Some("phase-1"),
+            TaskKind::Decision,
+            TaskStatus::AwaitingApproval,
+        );
+        decision.decision_payload = Some(DecisionTaskPayload {
+            decision_context: "需要中止".to_string(),
+            blocked_reason: "任务失败".to_string(),
+            target_task_id: Some(TaskId::new("action-1")),
+            options: vec![DecisionOption {
+                option_id: "abort".to_string(),
+                label: "中止".to_string(),
+                description: "中止整个任务树".to_string(),
+            }],
+            risk_notes: vec![],
+            recommended_option: Some("abort".to_string()),
+            required_user_input: true,
+            decision_evidence: None,
+        });
+        store.insert_task(decision);
+
+        store
+            .resolve_decision(&TaskId::new("dec-1"), "abort", None)
+            .expect("abort should resolve");
+
+        // Decision 本身应已 Completed
+        assert_eq!(
+            store.get_task(&TaskId::new("dec-1")).unwrap().status,
+            TaskStatus::Completed,
+        );
+        // 其余非终态节点全部 Cancelled
+        assert_eq!(
+            store.get_task(&TaskId::new("root-1")).unwrap().status,
+            TaskStatus::Cancelled,
+        );
+        assert_eq!(
+            store.get_task(&TaskId::new("phase-1")).unwrap().status,
+            TaskStatus::Cancelled,
+        );
+        assert_eq!(
+            store.get_task(&TaskId::new("action-1")).unwrap().status,
+            TaskStatus::Cancelled,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: resolve_decision skip 跳过目标子树
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_decision_skip_skips_target_subtree() {
+        let store = TaskStore::new();
+
+        // root -> [action-1(Ready), action-2(Running), decision]
+        store.insert_task(make_task(
+            "root-1",
+            "m-1",
+            "root-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        ));
+        store.insert_task(make_task(
+            "action-1",
+            "m-1",
+            "root-1",
+            Some("root-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        ));
+        store.insert_task(make_task(
+            "action-2",
+            "m-1",
+            "root-1",
+            Some("root-1"),
+            TaskKind::Action,
+            TaskStatus::Running,
+        ));
+
+        let mut decision = make_task(
+            "dec-1",
+            "m-1",
+            "root-1",
+            Some("root-1"),
+            TaskKind::Decision,
+            TaskStatus::AwaitingApproval,
+        );
+        decision.decision_payload = Some(DecisionTaskPayload {
+            decision_context: "跳过失败动作".to_string(),
+            blocked_reason: "action-1 可跳过".to_string(),
+            target_task_id: Some(TaskId::new("action-1")),
+            options: vec![DecisionOption {
+                option_id: "skip".to_string(),
+                label: "跳过".to_string(),
+                description: "跳过此任务".to_string(),
+            }],
+            risk_notes: vec![],
+            recommended_option: Some("skip".to_string()),
+            required_user_input: true,
+            decision_evidence: None,
+        });
+        store.insert_task(decision);
+
+        store
+            .resolve_decision(&TaskId::new("dec-1"), "skip", None)
+            .expect("skip should resolve");
+
+        // Decision 完成
+        assert_eq!(
+            store.get_task(&TaskId::new("dec-1")).unwrap().status,
+            TaskStatus::Completed,
+        );
+        // 目标 action-1 被跳过
+        assert_eq!(
+            store.get_task(&TaskId::new("action-1")).unwrap().status,
+            TaskStatus::Skipped,
+        );
+        // 不相关的 action-2 不受影响
+        assert_eq!(
+            store.get_task(&TaskId::new("action-2")).unwrap().status,
+            TaskStatus::Running,
+        );
+        // root 不受影响
+        assert_eq!(
+            store.get_task(&TaskId::new("root-1")).unwrap().status,
+            TaskStatus::Running,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: resolve_decision 普通选项释放直接依赖 Decision 的下游任务
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_decision_releases_direct_dependents() {
+        let store = TaskStore::new();
+
+        // root -> [decision, downstream(Blocked, depends on decision)]
+        store.insert_task(make_task(
+            "root-1",
+            "m-1",
+            "root-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        ));
+
+        let mut decision = make_task(
+            "dec-1",
+            "m-1",
+            "root-1",
+            Some("root-1"),
+            TaskKind::Decision,
+            TaskStatus::AwaitingApproval,
+        );
+        decision.decision_payload = Some(DecisionTaskPayload {
+            decision_context: "选择方案".to_string(),
+            blocked_reason: "需要确认".to_string(),
+            target_task_id: None,
+            options: vec![DecisionOption {
+                option_id: "continue".to_string(),
+                label: "继续".to_string(),
+                description: "继续执行".to_string(),
+            }],
+            risk_notes: vec![],
+            recommended_option: Some("continue".to_string()),
+            required_user_input: true,
+            decision_evidence: None,
+        });
+        store.insert_task(decision);
+
+        let mut downstream = make_task(
+            "downstream-1",
+            "m-1",
+            "root-1",
+            Some("root-1"),
+            TaskKind::Action,
+            TaskStatus::Blocked,
+        );
+        downstream.dependency_ids = vec![TaskId::new("dec-1")];
+        store.insert_task(downstream);
+
+        store
+            .resolve_decision(&TaskId::new("dec-1"), "continue", None)
+            .expect("continue should resolve");
+
+        // Decision 完成
+        assert_eq!(
+            store.get_task(&TaskId::new("dec-1")).unwrap().status,
+            TaskStatus::Completed,
+        );
+        // 下游依赖 Decision 且所有依赖均 Completed → 释放为 Ready
+        assert_eq!(
+            store.get_task(&TaskId::new("downstream-1")).unwrap().status,
+            TaskStatus::Ready,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: default_frozen_policy 返回保守默认值
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_frozen_policy_values() {
+        let policy = default_frozen_policy();
+        assert_eq!(policy.autonomy_level, "Assisted");
+        assert_eq!(policy.approval_mode, "Interactive");
+        assert!(!policy.background_allowed);
+        assert_eq!(policy.retry_limit, 1);
+        assert_eq!(policy.repair_limit, 1);
+        assert!(policy.validation_profile.is_none());
+        assert!(policy.escalation_conditions.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: build_projection 正确填充 execution_mode 和 runner_status
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_projection_execution_mode_and_runner_status() {
+        let store = TaskStore::new();
+
+        let mut root = make_task("root-1", "m-1", "root-1", None, TaskKind::Objective, TaskStatus::Running);
+        root.policy_snapshot = Some(TaskPolicy {
+            autonomy_level: "Autonomous".to_string(),
+            approval_mode: "DecisionOnly".to_string(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "full".to_string(),
+            retry_limit: 3,
+            repair_limit: 3,
+            validation_profile: Some("Required".to_string()),
+            checkpoint_mode: "task_or_phase".to_string(),
+            background_allowed: true,
+            escalation_conditions: vec!["on_failure".to_string()],
+        });
+        store.insert_task(root);
+
+        let projection = store.build_projection(&TaskId::new("root-1")).unwrap();
+        assert_eq!(projection.execution_mode, "deep", "background_allowed=true 时应为 deep");
+        assert_eq!(projection.runner_status, "running", "有 Running 任务时应为 running");
+
+        // 改为普通模式
+        let mut root2 = make_task("root-2", "m-1", "root-2", None, TaskKind::Objective, TaskStatus::Blocked);
+        root2.policy_snapshot = Some(TaskPolicy {
+            autonomy_level: "Assisted".to_string(),
+            approval_mode: "Interactive".to_string(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "full".to_string(),
+            retry_limit: 1,
+            repair_limit: 1,
+            validation_profile: None,
+            checkpoint_mode: "turn".to_string(),
+            background_allowed: false,
+            escalation_conditions: Vec::new(),
+        });
+        store.insert_task(root2);
+
+        let projection2 = store.build_projection(&TaskId::new("root-2")).unwrap();
+        assert_eq!(projection2.execution_mode, "normal", "background_allowed=false 时应为 normal");
+        assert_eq!(projection2.runner_status, "blocked", "Blocked 状态时应为 blocked");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: build_delivery_package 聚合交付包字段
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_delivery_package_aggregates_correctly() {
+        let store = TaskStore::new();
+
+        let mut root = make_task("root-1", "m-1", "root-1", None, TaskKind::Objective, TaskStatus::Running);
+        root.goal = "实现用户登录功能".to_string();
+        root.workspace_scope = Some("src/auth".to_string());
+        root.policy_snapshot = Some(TaskPolicy {
+            autonomy_level: "Autonomous".to_string(),
+            approval_mode: "DecisionOnly".to_string(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "full".to_string(),
+            retry_limit: 3,
+            repair_limit: 3,
+            validation_profile: Some("Required".to_string()),
+            checkpoint_mode: "task_or_phase".to_string(),
+            background_allowed: true,
+            escalation_conditions: vec!["on_failure".to_string()],
+        });
+        store.insert_task(root);
+
+        let mut action = make_task("act-1", "m-1", "root-1", Some("root-1"), TaskKind::Action, TaskStatus::Completed);
+        action.output_refs = vec!["src/auth/login.rs".to_string()];
+        action.evidence_refs = vec!["test://login-passed".to_string()];
+        store.insert_task(action);
+
+        let mut validation = make_task("val-1", "m-1", "root-1", Some("root-1"), TaskKind::Validation, TaskStatus::Completed);
+        validation.title = "验证登录模块".to_string();
+        validation.evidence_refs = vec!["test://login-validation-passed".to_string()];
+        store.insert_task(validation);
+
+        let mut decision = make_task("dec-1", "m-1", "root-1", Some("root-1"), TaskKind::Decision, TaskStatus::Completed);
+        decision.decision_payload = Some(magi_core::DecisionTaskPayload {
+            decision_context: "是否引入第三方库".to_string(),
+            blocked_reason: "需要确认依赖方案".to_string(),
+            target_task_id: None,
+            options: vec![magi_core::DecisionOption {
+                option_id: "use-oauth".to_string(),
+                label: "使用 OAuth".to_string(),
+                description: "集成 OAuth 登录".to_string(),
+            }],
+            risk_notes: vec![],
+            recommended_option: Some("use-oauth".to_string()),
+            required_user_input: true,
+            decision_evidence: None,
+        });
+        decision.output_refs = vec!["use-oauth".to_string()];
+        store.insert_task(decision);
+
+        let package = store.build_delivery_package(&TaskId::new("root-1")).unwrap();
+        let pkg = package.as_object().unwrap();
+
+        assert_eq!(pkg.get("goal").and_then(|v| v.as_str()), Some("实现用户登录功能"));
+        assert_eq!(pkg.get("scope").and_then(|v| v.as_str()), Some("src/auth"));
+        assert_eq!(pkg.get("execution_mode").and_then(|v| v.as_str()), Some("deep"));
+        assert_eq!(pkg.get("aggregate_status").and_then(|v| v.as_str()), Some("Running"));
+
+        let file_changes = pkg.get("file_changes").unwrap().as_array().unwrap();
+        assert!(file_changes.iter().any(|v| v.as_str() == Some("src/auth/login.rs")));
+
+        let evidence_list = pkg.get("evidence_list").unwrap().as_array().unwrap();
+        assert!(evidence_list.iter().any(|v| v.as_str() == Some("test://login-passed")));
+        assert!(evidence_list.iter().any(|v| v.as_str() == Some("test://login-validation-passed")));
+
+        let validation_results = pkg.get("validation_results").unwrap().as_array().unwrap();
+        assert_eq!(validation_results.len(), 1);
+        assert_eq!(
+            validation_results[0].get("task_id").and_then(|v| v.as_str()),
+            Some("val-1")
+        );
+
+        let key_decisions = pkg.get("key_decisions").unwrap().as_array().unwrap();
+        assert_eq!(key_decisions.len(), 1);
+        assert_eq!(
+            key_decisions[0].get("chosen_option").and_then(|v| v.as_str()),
+            Some("use-oauth")
+        );
+
+        let progress = pkg.get("progress").unwrap().as_object().unwrap();
+        assert_eq!(progress.get("total").and_then(|v| v.as_u64()), Some(4));
+        assert_eq!(progress.get("completed").and_then(|v| v.as_u64()), Some(3));
     }
 }

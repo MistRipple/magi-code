@@ -2,8 +2,8 @@ use crate::task_store::TaskStore;
 use crate::task_worker_catalog::resolve_task_role;
 use magi_bridge_client::{ChatMessage, ModelBridgeClient, ModelInvocationRequest};
 use magi_core::{
-    AssignmentLease, DecisionOption, DecisionTaskPayload, EventId, LeaseId, Task, TaskId, TaskKind,
-    TaskResultKind, TaskStatus, UtcMillis, WorkerId,
+    AssignmentLease, DecisionOption, DecisionTaskPayload, EventId, LeaseId, PolicyDispatchDecision,
+    Task, TaskId, TaskKind, TaskResultKind, TaskStatus, UtcMillis, WorkerId,
 };
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_skill_runtime::SkillDispatchRuntime;
@@ -13,6 +13,7 @@ use magi_worker_runtime::{
     WorkerExecutionProfile, WorkerLoopAction, WorkerLoopOutcomeKind, WorkerRuntime,
 };
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Describes a worker's capabilities for task matching.
@@ -26,6 +27,8 @@ pub struct WorkerInfo {
     /// Maximum number of concurrent tasks this worker can handle (design 5.4).
     /// None means unlimited.
     pub parallelism_limit: Option<u32>,
+    /// Role-specific system prompt template injected at LLM invocation (design 8.1).
+    pub system_prompt_template: Option<String>,
 }
 
 /// The outcome of a single `run_cycle` iteration.
@@ -312,6 +315,12 @@ impl WorkerExecutionDispatcher {
                 "knowledge_refs": task.knowledge_refs,
                 "input_refs": task.input_refs,
                 "write_scope": task.write_scope,
+                "policy": task.policy_snapshot.as_ref().map(|p| serde_json::json!({
+                    "allowed_paths": p.allowed_paths,
+                    "denied_paths": p.denied_paths,
+                    "network_mode": p.network_mode,
+                    "command_mode": p.command_mode,
+                })),
             })
             .to_string(),
             approval_requirement: magi_core::ApprovalRequirement::None,
@@ -406,8 +415,17 @@ impl TaskDispatcher for WorkerExecutionDispatcher {
         let intent = self.build_intent_from_task(task, worker);
         self.worker_runtime.register_execution_intent(intent);
 
+        // Apply task policy tool filtering (design 3.2 / 4.5).
+        let filtered_tool_registry = self.tool_registry.as_ref().map(|reg| {
+            if let Some(ref policy) = task.policy_snapshot {
+                reg.filtered_clone(&policy.allowed_tools, &policy.denied_tools)
+            } else {
+                reg.clone()
+            }
+        });
+
         let loop_controller = if let (Some(tool_registry), Some(skill_dispatch)) =
-            (&self.tool_registry, &self.skill_dispatch_runtime)
+            (&filtered_tool_registry, &self.skill_dispatch_runtime)
         {
             self.worker_runtime
                 .loop_controller()
@@ -469,6 +487,12 @@ pub struct TaskRunner {
     result_receiver: Arc<dyn TaskResultReceiver>,
     decomposer: Option<Arc<dyn MissionDecomposer>>,
     reflector: Arc<dyn GraphReflector>,
+    /// Optional event bus for publishing domain events such as DecisionCreated.
+    event_bus: Option<Arc<InMemoryEventBus>>,
+    /// 已触发过图反思的任务 ID 集合，防止对同一节点重复触发。
+    reflected_task_ids: Mutex<HashSet<TaskId>>,
+    /// Checkpoint 信号：当 cycle 中有任务到达终态时置为 true，供外部消费。
+    checkpoint_signal: AtomicBool,
 }
 
 impl TaskRunner {
@@ -484,6 +508,9 @@ impl TaskRunner {
             result_receiver: Arc::new(NoOpResultReceiver),
             decomposer: None,
             reflector: Arc::new(DefaultGraphReflector),
+            event_bus: None,
+            reflected_task_ids: Mutex::new(HashSet::new()),
+            checkpoint_signal: AtomicBool::new(false),
         }
     }
 
@@ -502,6 +529,9 @@ impl TaskRunner {
             result_receiver,
             decomposer: None,
             reflector: Arc::new(DefaultGraphReflector),
+            event_bus: None,
+            reflected_task_ids: Mutex::new(HashSet::new()),
+            checkpoint_signal: AtomicBool::new(false),
         }
     }
 
@@ -517,9 +547,25 @@ impl TaskRunner {
         self
     }
 
+    /// Attach an event bus for publishing domain events (e.g. DecisionCreated).
+    pub fn with_event_bus(mut self, event_bus: Arc<InMemoryEventBus>) -> Self {
+        self.event_bus = Some(event_bus);
+        self
+    }
+
     /// Access the graph reflector for runtime graph mutations.
     pub fn reflector(&self) -> &dyn GraphReflector {
         self.reflector.as_ref()
+    }
+
+    /// 消费并返回 checkpoint 信号，随后重置为 false。
+    pub fn take_checkpoint_signal(&self) -> bool {
+        self.checkpoint_signal.swap(false, Ordering::Relaxed)
+    }
+
+    /// 设置 checkpoint 信号（内部使用）。
+    fn set_checkpoint_signal(&self) {
+        self.checkpoint_signal.store(true, Ordering::Relaxed);
     }
 
     /// Decompose a mission goal into a task graph and insert it into the store.
@@ -551,20 +597,26 @@ impl TaskRunner {
             return RunCycleOutcome::Error(e);
         }
 
-        // Step 1: Collect and handle expired leases
-        let expired = self.store.collect_expired_leases();
+        // Step 1: Collect and handle expired leases (isolated by root_task_id).
+        let expired = self.store.collect_expired_leases(root_task_id);
         for (task_id, lease_id) in &expired {
             self.store.revoke_lease(task_id, lease_id);
-            // Reset the task back to Ready so it can be re-dispatched.
-            if let Err(e) = self.store.update_status(task_id, TaskStatus::Ready) {
-                return RunCycleOutcome::Error(format!(
-                    "failed to reset expired-lease task {task_id}: {e}"
-                ));
+            if let Some(task) = self.store.get_task(task_id) {
+                let next_status = if self.task_needs_evidence_after_lease_expiry(&task) {
+                    TaskStatus::Blocked
+                } else {
+                    TaskStatus::Ready
+                };
+                if let Err(e) = self.store.update_status(task_id, next_status) {
+                    return RunCycleOutcome::Error(format!(
+                        "failed to reset expired-lease task {task_id}: {e}"
+                    ));
+                }
             }
         }
 
         // Step 1.5: Heartbeat all active leases to prevent premature expiry.
-        let active_leases = self.store.collect_active_leases();
+        let active_leases = self.store.collect_active_leases(root_task_id);
         for (task_id, lease_id) in &active_leases {
             self.store.heartbeat_lease(task_id, lease_id);
         }
@@ -573,6 +625,9 @@ impl TaskRunner {
         if let Err(e) = self.propagate_parent_completion(root_task_id) {
             return RunCycleOutcome::Error(e);
         }
+
+        // Step 2.5: Graph reflection — trigger after WorkPackage completion (design 4.2.2).
+        self.trigger_workpackage_reflection(root_task_id);
 
         // Step 3: Check termination — are all tasks in a terminal state?
         if self.all_tasks_terminal(root_task_id) {
@@ -641,9 +696,46 @@ impl TaskRunner {
             ) && task.policy_snapshot.is_some()
             {
                 let policy = task.policy_snapshot.as_ref().unwrap();
-                if !self.check_policy_allows_dispatch(policy, task) {
-                    unmatched_ids.push(task.task_id.clone());
-                    continue;
+                match self.check_policy_allows_dispatch(policy, task) {
+                    PolicyDispatchDecision::Allow => {}
+                    PolicyDispatchDecision::Reject(_) => {
+                        unmatched_ids.push(task.task_id.clone());
+                        continue;
+                    }
+                    PolicyDispatchDecision::NeedsApproval(ref reason) => {
+                        // 交互模式下等待用户确认：创建 Decision Task 阻塞当前任务。
+                        if let Some(parent_id) = &task.parent_task_id {
+                            let payload = magi_core::DecisionTaskPayload {
+                                decision_context: reason.clone(),
+                                blocked_reason: format!("任务 {} 等待继续执行确认", task.title),
+                                target_task_id: Some(task.task_id.clone()),
+                                options: vec![
+                                    magi_core::DecisionOption {
+                                        option_id: "continue".to_string(),
+                                        label: "继续执行".to_string(),
+                                        description: "继续执行后续任务".to_string(),
+                                    },
+                                    magi_core::DecisionOption {
+                                        option_id: "skip".to_string(),
+                                        label: "跳过此任务".to_string(),
+                                        description: "跳过此任务继续后续流程".to_string(),
+                                    },
+                                    magi_core::DecisionOption {
+                                        option_id: "cancel".to_string(),
+                                        label: "取消整个任务".to_string(),
+                                        description: "取消整个任务树".to_string(),
+                                    },
+                                ],
+                                risk_notes: vec!["交互模式要求用户确认每一步".to_string()],
+                                recommended_option: Some("continue".to_string()),
+                                required_user_input: true,
+                                decision_evidence: None,
+                            };
+                            let _ = self.escalate_to_decision(parent_id, payload);
+                        }
+                        unmatched_ids.push(task.task_id.clone());
+                        continue;
+                    }
                 }
             }
 
@@ -681,6 +773,7 @@ impl TaskRunner {
                 // Grant a lease.
                 let lease = self.store.grant_lease(
                     &task.task_id,
+                    &task.root_task_id,
                     &worker.worker_id,
                     &worker.role,
                     DEFAULT_LEASE_DURATION_MS,
@@ -757,14 +850,19 @@ impl TaskRunner {
                     if !output_refs.is_empty() {
                         self.store
                             .set_output_refs(&result.task_id, output_refs.clone());
+                        self.record_result_evidence(&result.task_id, output_refs);
                     }
-                    // If task has a validation_profile, route through Verifying (design 3.3.3).
                     if let Some(task) = self.store.get_task(&result.task_id) {
-                        if task
-                            .policy_snapshot
-                            .as_ref()
-                            .and_then(|p| p.validation_profile.as_ref())
-                            .is_some()
+                        if self.requires_delivery_evidence(&task) && output_refs.is_empty() {
+                            self.escalate_missing_evidence(&task)?;
+                            TaskStatus::Blocked
+                        } else if task.kind != TaskKind::Validation
+                            && task
+                                .policy_snapshot
+                                .as_ref()
+                                .and_then(|p| p.validation_profile.as_ref())
+                                .is_some()
+                            && !self.store.has_validation_dependent(&result.task_id)
                         {
                             TaskStatus::Verifying
                         } else {
@@ -778,6 +876,7 @@ impl TaskRunner {
                     if !output_refs.is_empty() {
                         self.store
                             .set_output_refs(&result.task_id, output_refs.clone());
+                        self.record_result_evidence(&result.task_id, output_refs);
                     }
                     TaskStatus::Verifying
                 }
@@ -843,6 +942,7 @@ impl TaskRunner {
                                 repair_limit,
                                 "repair budget exhausted, marking as Failed"
                             );
+                            self.trigger_repair_reflection(&result.task_id);
                             TaskStatus::Failed
                         }
                     } else {
@@ -853,10 +953,46 @@ impl TaskRunner {
             self.store
                 .update_status(&result.task_id, next_status)
                 .map_err(|e| format!("failed to apply result for task {}: {e}", result.task_id))?;
+            if is_terminal(next_status) {
+                self.set_checkpoint_signal();
+            }
 
             // Auto-create Validation child when entering Verifying state.
             if next_status == TaskStatus::Verifying {
                 self.create_validation_child(&result.task_id);
+            }
+
+            // Repair 子任务完成后，释放父任务从 Repairing 回到 Ready/Verifying。
+            if next_status == TaskStatus::Completed || next_status == TaskStatus::Verifying {
+                if let Some(task) = self.store.get_task(&result.task_id) {
+                    if task.kind == TaskKind::Repair {
+                        if let Some(parent_id) = &task.parent_task_id {
+                            if let Some(parent) = self.store.get_task(parent_id) {
+                                if parent.status == TaskStatus::Repairing {
+                                    let parent_next = if parent
+                                        .policy_snapshot
+                                        .as_ref()
+                                        .and_then(|p| p.validation_profile.as_ref())
+                                        .is_some()
+                                        && !self.store.has_validation_dependent(parent_id)
+                                    {
+                                        TaskStatus::Verifying
+                                    } else {
+                                        TaskStatus::Ready
+                                    };
+                                    if let Err(e) = self.store.update_status(parent_id, parent_next)
+                                    {
+                                        tracing::warn!(
+                                            parent_id = %parent_id,
+                                            error = %e,
+                                            "failed to release parent from Repairing"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Evaluate escalation_conditions on failure.
@@ -870,6 +1006,77 @@ impl TaskRunner {
     // ------------------------------------------------------------------
     // Internal helpers
     // ------------------------------------------------------------------
+
+    fn record_result_evidence(&self, task_id: &TaskId, output_refs: &[String]) {
+        if output_refs.is_empty() {
+            return;
+        }
+        let evidence_refs = output_refs
+            .iter()
+            .enumerate()
+            .map(|(index, output_ref)| {
+                format!("evidence://task/{task_id}/output/{index}?ref={output_ref}")
+            })
+            .collect();
+        self.store.set_evidence_refs(task_id, evidence_refs);
+    }
+
+    /// 深度模式下，Action/Validation/Repair 完成时必须产出交付证据。
+    fn requires_delivery_evidence(&self, task: &Task) -> bool {
+        matches!(
+            task.kind,
+            TaskKind::Action | TaskKind::Validation | TaskKind::Repair
+        ) && task
+            .policy_snapshot
+            .as_ref()
+            .is_some_and(|policy| policy.validation_profile.is_some() && policy.background_allowed)
+    }
+
+    fn task_needs_evidence_after_lease_expiry(&self, task: &Task) -> bool {
+        matches!(
+            task.kind,
+            TaskKind::Action | TaskKind::Validation | TaskKind::Repair
+        ) && task
+            .policy_snapshot
+            .as_ref()
+            .is_some_and(|policy| policy.validation_profile.is_some())
+            && task.output_refs.is_empty()
+            && task.evidence_refs.is_empty()
+    }
+
+    fn escalate_missing_evidence(&self, task: &Task) -> Result<(), String> {
+        let Some(parent_id) = &task.parent_task_id else {
+            return Ok(());
+        };
+        let payload = DecisionTaskPayload {
+            decision_context: format!("验证任务 {} 缺少交付证据", task.title),
+            blocked_reason: "深度模式验证任务完成时未产出 output_refs，无法确认交付质量"
+                .to_string(),
+            target_task_id: Some(task.task_id.clone()),
+            options: vec![
+                DecisionOption {
+                    option_id: "provide_evidence".to_string(),
+                    label: "补充证据".to_string(),
+                    description: "补充验证证据后继续推进".to_string(),
+                },
+                DecisionOption {
+                    option_id: "rerun_validation".to_string(),
+                    label: "重新验证".to_string(),
+                    description: "重新执行验证任务以生成证据".to_string(),
+                },
+                DecisionOption {
+                    option_id: "abort".to_string(),
+                    label: "中止".to_string(),
+                    description: "中止当前任务链".to_string(),
+                },
+            ],
+            risk_notes: vec!["缺少验证证据会导致深度模式交付不可审计".to_string()],
+            recommended_option: Some("rerun_validation".to_string()),
+            required_user_input: true,
+            decision_evidence: None,
+        };
+        self.escalate_to_decision(parent_id, payload).map(|_| ())
+    }
 
     /// Auto-create a Validation child task when a task enters Verifying state.
     fn create_validation_child(&self, task_id: &TaskId) {
@@ -928,9 +1135,19 @@ impl TaskRunner {
         if conditions.is_empty() {
             return;
         }
-        let should_escalate = conditions
-            .iter()
-            .any(|c| c == "on_failure" || c == "high_risk" || c == "on_repair_exhausted");
+        let should_escalate = conditions.iter().any(|condition| {
+            matches!(
+                condition.as_str(),
+                "on_failure"
+                    | "high_risk"
+                    | "on_repair_exhausted"
+                    | "repair_budget_exhausted"
+                    | "conflicting_requirements"
+                    | "architecture_fork"
+                    | "missing_acceptance_criteria"
+                    | "unsafe_or_destructive_action"
+            )
+        });
         if !should_escalate {
             return;
         }
@@ -940,6 +1157,7 @@ impl TaskRunner {
         let payload = DecisionTaskPayload {
             decision_context: format!("任务 {} 执行失败，需要决策后续操作", task.title),
             blocked_reason: format!("任务 {} 失败 (escalation: {:?})", task_id, conditions),
+            target_task_id: Some(task.task_id.clone()),
             options: vec![
                 DecisionOption {
                     option_id: "retry".to_string(),
@@ -985,7 +1203,8 @@ impl TaskRunner {
                     None => continue,
                 };
 
-                if is_terminal(task.status) {
+                if is_terminal(task.status) || task.status == TaskStatus::Ready {
+                    // Ready 任务尚未被调度或刚从 Repairing 释放，不应被自动完成。
                     continue;
                 }
 
@@ -1014,6 +1233,9 @@ impl TaskRunner {
                         .map_err(|e| {
                             format!("failed to propagate completion for {task_id}: {e}")
                         })?;
+                    if is_terminal(next_status) {
+                        self.set_checkpoint_signal();
+                    }
                     changed = true;
                     continue;
                 }
@@ -1037,6 +1259,68 @@ impl TaskRunner {
         }
 
         Ok(())
+    }
+
+    /// 图反思触发点 1：任一 WorkPackage 完成后，对其 parent 进行反思。
+    fn trigger_workpackage_reflection(&self, root_task_id: &TaskId) {
+        let all_ids = self.collect_all_task_ids(root_task_id);
+        let mut reflected = self.reflected_task_ids.lock().expect("reflected lock");
+        for id in &all_ids {
+            if let Some(task) = self.store.get_task(id) {
+                if task.kind == TaskKind::WorkPackage && task.status == TaskStatus::Completed {
+                    if let Some(ref parent_id) = task.parent_task_id {
+                        if reflected.insert(parent_id.clone()) {
+                            match self.reflector.reflect_and_replan(&self.store, parent_id) {
+                                Ok(decision) => {
+                                    tracing::info!(
+                                        parent_id = %parent_id,
+                                        action = ?decision.action,
+                                        reason = %decision.reason,
+                                        "graph reflection completed after WorkPackage"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        parent_id = %parent_id,
+                                        error = %e,
+                                        "graph reflection failed after WorkPackage"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 图反思触发点 2：repair budget 耗尽后，对失败任务的 parent 进行反思。
+    fn trigger_repair_reflection(&self, failed_task_id: &TaskId) {
+        if let Some(task) = self.store.get_task(failed_task_id) {
+            if let Some(ref parent_id) = task.parent_task_id {
+                let mut reflected = self.reflected_task_ids.lock().expect("reflected lock");
+                if reflected.insert(parent_id.clone()) {
+                    drop(reflected);
+                    match self.reflector.reflect_and_replan(&self.store, parent_id) {
+                        Ok(decision) => {
+                            tracing::info!(
+                                parent_id = %parent_id,
+                                action = ?decision.action,
+                                reason = %decision.reason,
+                                "graph reflection completed after repair exhausted"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                parent_id = %parent_id,
+                                error = %e,
+                                "graph reflection failed after repair exhausted"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Returns `true` when every task in the tree is in a terminal state.
@@ -1136,12 +1420,56 @@ impl TaskRunner {
     }
 
     /// Check if the task's policy allows dispatch.
-    fn check_policy_allows_dispatch(&self, policy: &magi_core::TaskPolicy, _task: &Task) -> bool {
-        // Reject tasks that require manual approval but are in auto-dispatch flow.
-        if policy.autonomy_level == "Manual" {
-            return false;
+    fn check_policy_allows_dispatch(
+        &self,
+        policy: &magi_core::TaskPolicy,
+        task: &Task,
+    ) -> PolicyDispatchDecision {
+        // Manual  autonomy_level: 完全禁止自动派发。
+        if policy.autonomy_level.eq_ignore_ascii_case("manual") {
+            return PolicyDispatchDecision::Reject(
+                "autonomy_level 为 Manual，不允许自动派发".to_string(),
+            );
         }
-        true
+
+        // DecisionOnly: 只允许 Action/Validation/Repair 自动派发，
+        // 但需要检查同级前序 Action 是否需要交互确认。
+        if policy.approval_mode.eq_ignore_ascii_case("decisiononly") {
+            return PolicyDispatchDecision::Allow;
+        }
+
+        // Interactive: Action 完成后下一个同级 Action 需要用户确认。
+        // 这里检查"同级前序 Action 是否刚完成"，如果是则创建 Decision。
+        if policy.approval_mode.eq_ignore_ascii_case("interactive")
+            && matches!(
+                task.kind,
+                TaskKind::Action | TaskKind::Validation | TaskKind::Repair
+            )
+        {
+            // 检查同级前序 Action 是否有最近完成的
+            if let Some(ref parent_id) = task.parent_task_id {
+                let siblings = self.store.get_children(parent_id);
+                let has_recent_completed_sibling = siblings.iter().any(|sibling| {
+                    if sibling.task_id == task.task_id {
+                        return false;
+                    }
+                    matches!(
+                        sibling.kind,
+                        TaskKind::Action | TaskKind::Validation | TaskKind::Repair
+                    ) && matches!(
+                        sibling.status,
+                        TaskStatus::Completed | TaskStatus::Verifying
+                    )
+                });
+                if has_recent_completed_sibling {
+                    return PolicyDispatchDecision::NeedsApproval(
+                        "交互模式：等待用户确认继续".to_string(),
+                    );
+                }
+            }
+        }
+
+        PolicyDispatchDecision::Allow
     }
 
     // ------------------------------------------------------------------
@@ -1165,6 +1493,12 @@ impl TaskRunner {
             parent_task_id,
             UtcMillis::now().0
         ));
+        let event_context = payload.decision_context.clone();
+        let event_options: Vec<String> = payload
+            .options
+            .iter()
+            .map(|o| o.option_id.clone())
+            .collect();
         let decision_task = Task {
             task_id: decision_id.clone(),
             mission_id: parent.mission_id.clone(),
@@ -1195,6 +1529,21 @@ impl TaskRunner {
         self.store
             .update_status(parent_task_id, TaskStatus::Blocked)
             .map_err(|e| format!("failed to block parent {parent_task_id}: {e}"))?;
+
+        if let Some(ref event_bus) = self.event_bus {
+            let event = EventEnvelope::domain(
+                EventId::new(format!("event-decision-created-{}", UtcMillis::now().0)),
+                "task.decision.created",
+                serde_json::json!({
+                    "session_id": parent.mission_id.to_string(),
+                    "task_id": decision_id.to_string(),
+                    "parent_task_id": parent_task_id.to_string(),
+                    "context": event_context,
+                    "options": event_options,
+                }),
+            );
+            let _ = event_bus.publish(event);
+        }
 
         Ok(decision_id)
     }
@@ -1349,6 +1698,21 @@ pub trait GraphReflector: Send + Sync {
         store: &TaskStore,
         subtree_root_id: &TaskId,
     ) -> Result<Vec<TaskId>, String>;
+
+    /// 对指定父任务下的子树执行一次图反思，决定是否需要重规划。
+    /// 默认实现直接返回 Keep（接受当前图）。
+    fn reflect_and_replan(
+        &self,
+        _store: &TaskStore,
+        _parent_task_id: &TaskId,
+    ) -> Result<ReplanDecision, String> {
+        Ok(ReplanDecision {
+            action: ReplanAction::Keep,
+            reason: "default reflector: always keep".to_string(),
+            added_tasks: Vec::new(),
+            removed_tasks: Vec::new(),
+        })
+    }
 }
 
 /// Default graph reflector that directly manipulates the TaskStore.
@@ -1428,7 +1792,7 @@ impl LlmGraphReflector {
             .collect();
 
         Some(format!(
-            r#"当前任务图需要重规划。请分析以下父任务及其子任务，提出优化建议。
+            r#"当前任务图需要图反思。请分析以下父任务及其子任务，决定下一步动作。
 
 父任务: {} (kind={:?}, goal={})
 当前子任务:
@@ -1436,10 +1800,18 @@ impl LlmGraphReflector {
 
 请以 JSON 对象返回:
 {{
-  "action": "keep" | "replace",
-  "reason": "重规划原因",
-  "new_tasks": [仅当 action=replace 时提供新任务列表，格式同 MissionDecomposer]
+  "action": "keep" | "refine" | "shrink" | "replace" | "derive_objective",
+  "reason": "决策原因",
+  "new_tasks": [当 action=refine/replace/derive_objective 时提供新任务列表],
+  "remove_task_ids": [当 action=shrink 时提供要移除的子任务 ID 列表]
 }}
+
+action 说明:
+- keep: 接受当前图，继续执行
+- refine: 保留现有子树，追加 new_tasks 细化
+- shrink: 取消 remove_task_ids 指定的非终端子任务
+- replace: 移除所有非终端子任务，用 new_tasks 替换
+- derive_objective: 在同一 Mission 下追加新的 Objective（new_tasks 中 kind=Objective）
 
 只返回 JSON，不要其他内容。"#,
             parent.task_id,
@@ -1467,12 +1839,8 @@ impl GraphReflector for LlmGraphReflector {
     ) -> Result<Vec<TaskId>, String> {
         self.inner.remove_subtree(store, subtree_root_id)
     }
-}
 
-impl LlmGraphReflector {
-    /// 使用 LLM 分析当前子树并决定是否需要重规划。
-    /// 如果返回 replace，自动移除旧子树并插入新子树。
-    pub fn reflect_and_replan(
+    fn reflect_and_replan(
         &self,
         store: &TaskStore,
         parent_task_id: &TaskId,
@@ -1520,78 +1888,206 @@ impl LlmGraphReflector {
         let action = value["action"].as_str().unwrap_or("keep");
         let reason = value["reason"].as_str().unwrap_or("no reason").to_string();
 
-        if action == "keep" {
-            return Ok(ReplanDecision {
+        match action {
+            "keep" => Ok(ReplanDecision {
                 action: ReplanAction::Keep,
                 reason,
                 added_tasks: Vec::new(),
                 removed_tasks: Vec::new(),
-            });
-        }
+            }),
+            "derive_objective" => {
+                // derive_objective 在 parent 下追加新任务，其中应包含 Objective
+                let new_task_items = value["new_tasks"].as_array().cloned().unwrap_or_default();
+                let mut added_tasks = Vec::new();
+                for item in &new_task_items {
+                    let id_suffix = item["id"].as_str().unwrap_or("unknown");
+                    let task_id = TaskId::new(format!("{}-replan-{}", parent_task_id, id_suffix));
+                    let kind = match item["kind"].as_str().unwrap_or("Action") {
+                        "Objective" => TaskKind::Objective,
+                        "Phase" => TaskKind::Phase,
+                        "WorkPackage" => TaskKind::WorkPackage,
+                        "Validation" => TaskKind::Validation,
+                        _ => TaskKind::Action,
+                    };
+                    let task = Task {
+                        task_id: task_id.clone(),
+                        mission_id: parent.mission_id.clone(),
+                        root_task_id: parent.root_task_id.clone(),
+                        parent_task_id: Some(parent_task_id.clone()),
+                        kind,
+                        title: item["title"].as_str().unwrap_or("Untitled").to_string(),
+                        goal: item["goal"].as_str().unwrap_or("").to_string(),
+                        status: TaskStatus::Draft,
+                        dependency_ids: Vec::new(),
+                        required_children: Vec::new(),
+                        policy_snapshot: parent.policy_snapshot.clone(),
+                        executor_binding: None,
+                        context_refs: Vec::new(),
+                        knowledge_refs: Vec::new(),
+                        workspace_scope: parent.workspace_scope.clone(),
+                        write_scope: item["write_scope"].as_str().map(|s| s.to_string()),
+                        input_refs: Vec::new(),
+                        output_refs: Vec::new(),
+                        evidence_refs: Vec::new(),
+                        retry_count: 0,
+                        repair_count: 0,
+                        decision_payload: None,
+                        created_at: UtcMillis::now(),
+                        updated_at: UtcMillis::now(),
+                    };
+                    store.insert_task(task);
+                    added_tasks.push(task_id);
+                }
+                Ok(ReplanDecision {
+                    action: ReplanAction::DeriveObjective,
+                    reason,
+                    added_tasks,
+                    removed_tasks: Vec::new(),
+                })
+            }
+            "shrink" => {
+                let remove_ids = value["remove_task_ids"].as_array().cloned().unwrap_or_default();
+                let mut removed_tasks = Vec::new();
+                for id_value in &remove_ids {
+                    if let Some(id_str) = id_value.as_str() {
+                        let tid = TaskId::new(id_str.to_string());
+                        if store.get_task(&tid).is_some() {
+                            let removed = self.inner.remove_subtree(store, &tid)?;
+                            removed_tasks.extend(removed);
+                        }
+                    }
+                }
+                Ok(ReplanDecision {
+                    action: ReplanAction::Shrink,
+                    reason,
+                    added_tasks: Vec::new(),
+                    removed_tasks,
+                })
+            }
+            "refine" => {
+                // refine: 只追加新任务，不删除现有子树
+                let new_task_items = value["new_tasks"].as_array().cloned().unwrap_or_default();
+                let mut added_tasks = Vec::new();
+                for item in &new_task_items {
+                    let id_suffix = item["id"].as_str().unwrap_or("unknown");
+                    let task_id = TaskId::new(format!("{}-replan-{}", parent_task_id, id_suffix));
+                    let kind = match item["kind"].as_str().unwrap_or("Action") {
+                        "Phase" => TaskKind::Phase,
+                        "WorkPackage" => TaskKind::WorkPackage,
+                        "Validation" => TaskKind::Validation,
+                        _ => TaskKind::Action,
+                    };
+                    let task = Task {
+                        task_id: task_id.clone(),
+                        mission_id: parent.mission_id.clone(),
+                        root_task_id: parent.root_task_id.clone(),
+                        parent_task_id: Some(parent_task_id.clone()),
+                        kind,
+                        title: item["title"].as_str().unwrap_or("Untitled").to_string(),
+                        goal: item["goal"].as_str().unwrap_or("").to_string(),
+                        status: TaskStatus::Draft,
+                        dependency_ids: Vec::new(),
+                        required_children: Vec::new(),
+                        policy_snapshot: parent.policy_snapshot.clone(),
+                        executor_binding: None,
+                        context_refs: Vec::new(),
+                        knowledge_refs: Vec::new(),
+                        workspace_scope: parent.workspace_scope.clone(),
+                        write_scope: item["write_scope"].as_str().map(|s| s.to_string()),
+                        input_refs: Vec::new(),
+                        output_refs: Vec::new(),
+                        evidence_refs: Vec::new(),
+                        retry_count: 0,
+                        repair_count: 0,
+                        decision_payload: None,
+                        created_at: UtcMillis::now(),
+                        updated_at: UtcMillis::now(),
+                    };
+                    store.insert_task(task);
+                    added_tasks.push(task_id);
+                }
+                Ok(ReplanDecision {
+                    action: ReplanAction::Refine,
+                    reason,
+                    added_tasks,
+                    removed_tasks: Vec::new(),
+                })
+            }
+            _ => {
+                // replace（默认）: 移除所有非终端子任务并替换
+                let children = store.get_children(parent_task_id);
+                let mut removed_tasks = Vec::new();
+                for child in &children {
+                    if !is_terminal(child.status) {
+                        let removed = self.inner.remove_subtree(store, &child.task_id)?;
+                        removed_tasks.extend(removed);
+                    }
+                }
 
-        let children = store.get_children(parent_task_id);
-        let mut removed_tasks = Vec::new();
-        for child in &children {
-            if !is_terminal(child.status) {
-                let removed = self.inner.remove_subtree(store, &child.task_id)?;
-                removed_tasks.extend(removed);
+                let new_task_items = value["new_tasks"].as_array().cloned().unwrap_or_default();
+                let mut added_tasks = Vec::new();
+                for item in &new_task_items {
+                    let id_suffix = item["id"].as_str().unwrap_or("unknown");
+                    let task_id = TaskId::new(format!("{}-replan-{}", parent_task_id, id_suffix));
+                    let kind = match item["kind"].as_str().unwrap_or("Action") {
+                        "Phase" => TaskKind::Phase,
+                        "WorkPackage" => TaskKind::WorkPackage,
+                        "Validation" => TaskKind::Validation,
+                        _ => TaskKind::Action,
+                    };
+                    let task = Task {
+                        task_id: task_id.clone(),
+                        mission_id: parent.mission_id.clone(),
+                        root_task_id: parent.root_task_id.clone(),
+                        parent_task_id: Some(parent_task_id.clone()),
+                        kind,
+                        title: item["title"].as_str().unwrap_or("Untitled").to_string(),
+                        goal: item["goal"].as_str().unwrap_or("").to_string(),
+                        status: TaskStatus::Draft,
+                        dependency_ids: Vec::new(),
+                        required_children: Vec::new(),
+                        policy_snapshot: parent.policy_snapshot.clone(),
+                        executor_binding: None,
+                        context_refs: Vec::new(),
+                        knowledge_refs: Vec::new(),
+                        workspace_scope: parent.workspace_scope.clone(),
+                        write_scope: item["write_scope"].as_str().map(|s| s.to_string()),
+                        input_refs: Vec::new(),
+                        output_refs: Vec::new(),
+                        evidence_refs: Vec::new(),
+                        retry_count: 0,
+                        repair_count: 0,
+                        decision_payload: None,
+                        created_at: UtcMillis::now(),
+                        updated_at: UtcMillis::now(),
+                    };
+                    store.insert_task(task);
+                    added_tasks.push(task_id);
+                }
+
+                Ok(ReplanDecision {
+                    action: ReplanAction::Replace,
+                    reason,
+                    added_tasks,
+                    removed_tasks,
+                })
             }
         }
-
-        let new_task_items = value["new_tasks"].as_array().cloned().unwrap_or_default();
-        let mut added_tasks = Vec::new();
-        for item in &new_task_items {
-            let id_suffix = item["id"].as_str().unwrap_or("unknown");
-            let task_id = TaskId::new(format!("{}-replan-{}", parent_task_id, id_suffix));
-            let kind = match item["kind"].as_str().unwrap_or("Action") {
-                "Phase" => TaskKind::Phase,
-                "WorkPackage" => TaskKind::WorkPackage,
-                "Validation" => TaskKind::Validation,
-                _ => TaskKind::Action,
-            };
-            let task = Task {
-                task_id: task_id.clone(),
-                mission_id: parent.mission_id.clone(),
-                root_task_id: parent.root_task_id.clone(),
-                parent_task_id: Some(parent_task_id.clone()),
-                kind,
-                title: item["title"].as_str().unwrap_or("Untitled").to_string(),
-                goal: item["goal"].as_str().unwrap_or("").to_string(),
-                status: TaskStatus::Draft,
-                dependency_ids: Vec::new(),
-                required_children: Vec::new(),
-                policy_snapshot: parent.policy_snapshot.clone(),
-                executor_binding: None,
-                context_refs: Vec::new(),
-                knowledge_refs: Vec::new(),
-                workspace_scope: parent.workspace_scope.clone(),
-                write_scope: item["write_scope"].as_str().map(|s| s.to_string()),
-                input_refs: Vec::new(),
-                output_refs: Vec::new(),
-                evidence_refs: Vec::new(),
-                retry_count: 0,
-                repair_count: 0,
-                decision_payload: None,
-                created_at: UtcMillis::now(),
-                updated_at: UtcMillis::now(),
-            };
-            store.insert_task(task);
-            added_tasks.push(task_id);
-        }
-
-        Ok(ReplanDecision {
-            action: ReplanAction::Replace,
-            reason,
-            added_tasks,
-            removed_tasks,
-        })
     }
 }
 
 #[derive(Clone, Debug)]
 pub enum ReplanAction {
+    /// 接受当前图，继续执行。
     Keep,
+    /// 细化剩余子树（在现有结构下追加子任务）。
+    Refine,
+    /// 收缩剩余子树（取消部分未完成的子任务）。
+    Shrink,
+    /// 对剩余图重规划（移除旧子树并替换为新子树）。
     Replace,
+    /// 在同一 Mission 下派生新的 Objective。
+    DeriveObjective,
 }
 
 #[derive(Clone, Debug)]
@@ -1794,8 +2290,8 @@ fn scopes_conflict(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use magi_core::{
-        AssignmentLease, LeaseId, LeaseStatus, MissionId, Task, TaskId, TaskKind, TaskStatus,
-        UtcMillis, WorkerId,
+        AssignmentLease, LeaseId, LeaseStatus, MissionId, Task, TaskId, TaskKind, TaskPolicy,
+        TaskStatus, UtcMillis, WorkerId,
     };
 
     fn make_task(
@@ -1840,6 +2336,7 @@ mod tests {
             role: role.to_string(),
             supported_kinds: kinds,
             parallelism_limit: None,
+            system_prompt_template: None,
         }
     }
 
@@ -1979,6 +2476,7 @@ mod tests {
         let expired_lease = AssignmentLease {
             lease_id: LeaseId::new("lease-expired"),
             task_id: TaskId::new("act-1"),
+            root_task_id: TaskId::new("obj-1"),
             worker_id: WorkerId::new("w-1"),
             role: "executor".to_string(),
             granted_at: UtcMillis(now.0.saturating_sub(120_000)),
@@ -2505,6 +3003,7 @@ mod tests {
         let lease = AssignmentLease {
             lease_id: LeaseId::new("lease-act-1"),
             task_id: TaskId::new("act-1"),
+            root_task_id: TaskId::new("obj-1"),
             worker_id: WorkerId::new("w-1"),
             role: "executor".to_string(),
             granted_at: now,
@@ -2568,6 +3067,7 @@ mod tests {
         let lease = AssignmentLease {
             lease_id: LeaseId::new("lease-act-1"),
             task_id: TaskId::new("act-1"),
+            root_task_id: TaskId::new("obj-1"),
             worker_id: WorkerId::new("w-1"),
             role: "executor".to_string(),
             granted_at: now,
@@ -2642,6 +3142,7 @@ mod tests {
         let lease = AssignmentLease {
             lease_id: LeaseId::new("lease-act-1"),
             task_id: TaskId::new("act-1"),
+            root_task_id: TaskId::new("obj-1"),
             worker_id: WorkerId::new("w-1"),
             role: "executor".to_string(),
             granted_at: now,
@@ -3017,6 +3518,7 @@ mod tests {
         let lease = AssignmentLease {
             lease_id: LeaseId::new("lease-act-1"),
             task_id: TaskId::new("act-1"),
+            root_task_id: TaskId::new("obj-1"),
             worker_id: WorkerId::new("w-1"),
             role: "executor".to_string(),
             granted_at: now,
@@ -3105,6 +3607,7 @@ mod tests {
         let lease = AssignmentLease {
             lease_id: LeaseId::new("lease-act-1"),
             task_id: TaskId::new("act-1"),
+            root_task_id: TaskId::new("obj-1"),
             worker_id: WorkerId::new("w-1"),
             role: "executor".to_string(),
             granted_at: now,
@@ -3450,5 +3953,504 @@ mod tests {
             "obj-1 should be terminal after all children complete, got {:?}",
             obj.status
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: Repair 子任务完成后释放父任务从 Repairing → Ready
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn repair_completion_releases_parent_from_repairing() {
+        let store = Arc::new(TaskStore::new());
+        let _runner = TaskRunner::new(
+            store.clone(),
+            vec![
+                WorkerInfo {
+                    worker_id: WorkerId::new("worker-debugger"),
+                    role: "debugger".to_string(),
+                    supported_kinds: vec![TaskKind::Repair],
+                    parallelism_limit: None,
+                    system_prompt_template: None,
+                },
+                WorkerInfo {
+                    worker_id: WorkerId::new("worker-dev"),
+                    role: "integration-dev".to_string(),
+                    supported_kinds: vec![TaskKind::Action],
+                    parallelism_limit: None,
+                    system_prompt_template: None,
+                },
+            ],
+        );
+
+        let parent = Task {
+            task_id: TaskId::new("parent-1"),
+            mission_id: MissionId::new("m-1"),
+            root_task_id: TaskId::new("parent-1"),
+            parent_task_id: None,
+            kind: TaskKind::Action,
+            title: "Parent action".to_string(),
+            goal: "Do something".to_string(),
+            status: TaskStatus::Repairing,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 1,
+            decision_payload: None,
+            created_at: UtcMillis::now(),
+            updated_at: UtcMillis::now(),
+        };
+        store.insert_task(parent);
+
+        let repair = Task {
+            task_id: TaskId::new("repair-1"),
+            mission_id: MissionId::new("m-1"),
+            root_task_id: TaskId::new("parent-1"),
+            parent_task_id: Some(TaskId::new("parent-1")),
+            kind: TaskKind::Repair,
+            title: "Repair task".to_string(),
+            goal: "Fix failure".to_string(),
+            status: TaskStatus::Running,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: UtcMillis::now(),
+            updated_at: UtcMillis::now(),
+        };
+        store.insert_task(repair);
+
+        // Grant lease so apply_results can complete it.
+        let lease = store
+            .grant_lease(
+                &TaskId::new("repair-1"),
+                &TaskId::new("parent-1"),
+                &WorkerId::new("worker-debugger"),
+                "debugger",
+                60_000,
+            )
+            .unwrap();
+
+        // Push a Completed result for the repair task.
+        let receiver = Arc::new(EventBasedResultReceiver::new());
+        let runner = TaskRunner::with_dispatcher(
+            store.clone(),
+            vec![
+                WorkerInfo {
+                    worker_id: WorkerId::new("worker-debugger"),
+                    role: "debugger".to_string(),
+                    supported_kinds: vec![TaskKind::Repair],
+                    parallelism_limit: None,
+                    system_prompt_template: None,
+                },
+                WorkerInfo {
+                    worker_id: WorkerId::new("worker-dev"),
+                    role: "integration-dev".to_string(),
+                    supported_kinds: vec![TaskKind::Action],
+                    parallelism_limit: None,
+                    system_prompt_template: None,
+                },
+            ],
+            Arc::new(NoOpDispatcher),
+            receiver.clone(),
+        );
+
+        receiver.push_result(TaskResult {
+            task_id: TaskId::new("repair-1"),
+            lease_id: lease.lease_id,
+            outcome: TaskOutcome::Completed {
+                output_refs: vec!["fixed".to_string()],
+            },
+        });
+
+        let outcome = runner.run_cycle(&TaskId::new("parent-1"));
+        assert_eq!(outcome, RunCycleOutcome::Continue);
+
+        // Repair task should be Completed.
+        assert_eq!(
+            store.get_task(&TaskId::new("repair-1")).unwrap().status,
+            TaskStatus::Completed
+        );
+        // Parent should be released from Repairing → Ready → Running (dispatched in same cycle).
+        assert_eq!(
+            store.get_task(&TaskId::new("parent-1")).unwrap().status,
+            TaskStatus::Running
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: approval_mode == "Interactive" 时，下一个同级 Action 触发 Decision
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn approval_mode_interactive_creates_decision_for_next_action() {
+        let store = Arc::new(TaskStore::new());
+        let policy = TaskPolicy {
+            autonomy_level: "Assisted".to_string(),
+            approval_mode: "Interactive".to_string(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "full".to_string(),
+            retry_limit: 1,
+            repair_limit: 1,
+            validation_profile: None,
+            checkpoint_mode: "turn".to_string(),
+            background_allowed: false,
+            escalation_conditions: vec!["on_failure".to_string()],
+        };
+
+        let parent = make_task("parent-1", "m-1", "parent-1", None, TaskKind::Objective, TaskStatus::Running);
+        store.insert_task(parent);
+
+        let mut action1 = make_task("action-1", "m-1", "parent-1", Some("parent-1"), TaskKind::Action, TaskStatus::Ready);
+        action1.policy_snapshot = Some(policy.clone());
+        store.insert_task(action1);
+
+        let mut action2 = make_task("action-2", "m-1", "parent-1", Some("parent-1"), TaskKind::Action, TaskStatus::Ready);
+        action2.policy_snapshot = Some(policy.clone());
+        store.insert_task(action2);
+
+        let receiver = Arc::new(EventBasedResultReceiver::new());
+        let runner = TaskRunner::with_dispatcher(
+            store.clone(),
+            vec![make_worker("worker-dev", "integration-dev", vec![TaskKind::Action])],
+            Arc::new(NoOpDispatcher),
+            receiver.clone(),
+        );
+
+        // action-1 完成
+        let lease1 = store.grant_lease(
+            &TaskId::new("action-1"), &TaskId::new("parent-1"),
+            &WorkerId::new("worker-dev"), "integration-dev", 60_000,
+        ).unwrap();
+        receiver.push_result(TaskResult {
+            task_id: TaskId::new("action-1"),
+            lease_id: lease1.lease_id,
+            outcome: TaskOutcome::Completed { output_refs: vec!["out1".to_string()] },
+        });
+
+        // 一个 cycle 内：处理 action-1 完成，然后尝试 dispatch action-2，
+        // Interactive 模式下触发 NeedsApproval，创建 Decision 并 Block parent
+        let outcome = runner.run_cycle(&TaskId::new("parent-1"));
+        assert!(
+            matches!(outcome, RunCycleOutcome::Blocked(ref ids) if ids.contains(&TaskId::new("action-2"))),
+            "Interactive 模式下 action-2 应被拦截，返回 Blocked"
+        );
+        assert_eq!(store.get_task(&TaskId::new("action-1")).unwrap().status, TaskStatus::Completed);
+
+        let parent_task = store.get_task(&TaskId::new("parent-1")).unwrap();
+        assert_eq!(parent_task.status, TaskStatus::Blocked);
+
+        let children = store.get_children(&TaskId::new("parent-1"));
+        let decision = children.iter().find(|t| t.kind == TaskKind::Decision);
+        assert!(decision.is_some(), "Interactive 模式下应创建 Decision Task");
+        let decision = decision.unwrap();
+        assert_eq!(decision.status, TaskStatus::AwaitingApproval);
+        assert!(decision.decision_payload.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: approval_mode == "DecisionOnly" 时，同级 Action 直接允许 dispatch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn approval_mode_decision_only_allows_dispatch_without_decision() {
+        let store = Arc::new(TaskStore::new());
+        let policy = TaskPolicy {
+            autonomy_level: "Autonomous".to_string(),
+            approval_mode: "DecisionOnly".to_string(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "full".to_string(),
+            retry_limit: 3,
+            repair_limit: 3,
+            validation_profile: Some("Required".to_string()),
+            checkpoint_mode: "task_or_phase".to_string(),
+            background_allowed: true,
+            escalation_conditions: vec!["on_failure".to_string(), "repair_budget_exhausted".to_string()],
+        };
+
+        let parent = make_task("parent-1", "m-1", "parent-1", None, TaskKind::Objective, TaskStatus::Running);
+        store.insert_task(parent);
+
+        let mut action1 = make_task("action-1", "m-1", "parent-1", Some("parent-1"), TaskKind::Action, TaskStatus::Ready);
+        action1.policy_snapshot = Some(policy.clone());
+        store.insert_task(action1);
+
+        let mut action2 = make_task("action-2", "m-1", "parent-1", Some("parent-1"), TaskKind::Action, TaskStatus::Ready);
+        action2.policy_snapshot = Some(policy.clone());
+        store.insert_task(action2);
+
+        let receiver = Arc::new(EventBasedResultReceiver::new());
+        let runner = TaskRunner::with_dispatcher(
+            store.clone(),
+            vec![
+                make_worker("worker-dev", "integration-dev", vec![TaskKind::Action]),
+                make_worker("worker-reviewer", "reviewer", vec![TaskKind::Validation]),
+            ],
+            Arc::new(NoOpDispatcher),
+            receiver.clone(),
+        );
+
+        // action-1 完成
+        let lease1 = store.grant_lease(
+            &TaskId::new("action-1"), &TaskId::new("parent-1"),
+            &WorkerId::new("worker-dev"), "integration-dev", 60_000,
+        ).unwrap();
+        receiver.push_result(TaskResult {
+            task_id: TaskId::new("action-1"),
+            lease_id: lease1.lease_id,
+            outcome: TaskOutcome::Completed { output_refs: vec!["out1".to_string()] },
+        });
+
+        // 一个 cycle 内处理 action-1 完成并 dispatch action-2
+        let outcome = runner.run_cycle(&TaskId::new("parent-1"));
+        assert_eq!(outcome, RunCycleOutcome::Continue);
+        assert_eq!(store.get_task(&TaskId::new("action-1")).unwrap().status, TaskStatus::Verifying);
+        assert_eq!(store.get_task(&TaskId::new("action-2")).unwrap().status, TaskStatus::Running);
+
+        let children = store.get_children(&TaskId::new("parent-1"));
+        let decision_count = children.iter().filter(|t| t.kind == TaskKind::Decision).count();
+        assert_eq!(decision_count, 0, "DecisionOnly 模式下不应创建 Decision Task");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: 深度模式 evidence 约束 — 无 output_refs 时 Blocked
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deep_mode_evidence_required_blocks_without_output_refs() {
+        let store = Arc::new(TaskStore::new());
+        let policy = TaskPolicy {
+            autonomy_level: "Autonomous".to_string(),
+            approval_mode: "DecisionOnly".to_string(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "full".to_string(),
+            retry_limit: 3,
+            repair_limit: 3,
+            validation_profile: Some("Required".to_string()),
+            checkpoint_mode: "task_or_phase".to_string(),
+            background_allowed: true,
+            escalation_conditions: vec!["on_failure".to_string()],
+        };
+
+        let parent = make_task("parent-1", "m-1", "parent-1", None, TaskKind::Objective, TaskStatus::Running);
+        store.insert_task(parent);
+
+        let mut action = make_task("action-1", "m-1", "parent-1", Some("parent-1"), TaskKind::Action, TaskStatus::Ready);
+        action.policy_snapshot = Some(policy);
+        store.insert_task(action);
+
+        let receiver = Arc::new(EventBasedResultReceiver::new());
+        let runner = TaskRunner::with_dispatcher(
+            store.clone(),
+            vec![make_worker("worker-dev", "integration-dev", vec![TaskKind::Action])],
+            Arc::new(NoOpDispatcher),
+            receiver.clone(),
+        );
+
+        // action-1 完成但无 output_refs
+        let lease = store.grant_lease(
+            &TaskId::new("action-1"), &TaskId::new("parent-1"),
+            &WorkerId::new("worker-dev"), "integration-dev", 60_000,
+        ).unwrap();
+        receiver.push_result(TaskResult {
+            task_id: TaskId::new("action-1"),
+            lease_id: lease.lease_id,
+            outcome: TaskOutcome::Completed { output_refs: vec![] },
+        });
+
+        let outcome = runner.run_cycle(&TaskId::new("parent-1"));
+        assert!(
+            matches!(outcome, RunCycleOutcome::Blocked(_)),
+            "深度模式 Required 且无 output_refs 应返回 Blocked"
+        );
+
+        let action_task = store.get_task(&TaskId::new("action-1")).unwrap();
+        assert_eq!(action_task.status, TaskStatus::Blocked, "深度模式 Required 且无 output_refs 应 Blocked");
+
+        let parent_task = store.get_task(&TaskId::new("parent-1")).unwrap();
+        assert_eq!(parent_task.status, TaskStatus::Blocked);
+
+        let children = store.get_children(&TaskId::new("parent-1"));
+        let decision = children.iter().find(|t| t.kind == TaskKind::Decision);
+        assert!(decision.is_some(), "应创建 Decision Task 要求补充证据");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: 普通模式 validation_profile Required — 无 output_refs 时 Verifying
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normal_mode_validation_profile_verifying_without_output_refs() {
+        let store = Arc::new(TaskStore::new());
+        let policy = TaskPolicy {
+            autonomy_level: "Assisted".to_string(),
+            approval_mode: "Interactive".to_string(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "full".to_string(),
+            retry_limit: 1,
+            repair_limit: 1,
+            validation_profile: Some("Required".to_string()),
+            checkpoint_mode: "turn".to_string(),
+            background_allowed: false,
+            escalation_conditions: vec!["on_failure".to_string()],
+        };
+
+        let parent = make_task("parent-1", "m-1", "parent-1", None, TaskKind::Objective, TaskStatus::Running);
+        store.insert_task(parent);
+
+        let mut action = make_task("action-1", "m-1", "parent-1", Some("parent-1"), TaskKind::Action, TaskStatus::Ready);
+        action.policy_snapshot = Some(policy);
+        store.insert_task(action);
+
+        let receiver = Arc::new(EventBasedResultReceiver::new());
+        let runner = TaskRunner::with_dispatcher(
+            store.clone(),
+            vec![
+                make_worker("worker-dev", "integration-dev", vec![TaskKind::Action]),
+                make_worker("worker-reviewer", "reviewer", vec![TaskKind::Validation]),
+            ],
+            Arc::new(NoOpDispatcher),
+            receiver.clone(),
+        );
+
+        let lease = store.grant_lease(
+            &TaskId::new("action-1"), &TaskId::new("parent-1"),
+            &WorkerId::new("worker-dev"), "integration-dev", 60_000,
+        ).unwrap();
+        receiver.push_result(TaskResult {
+            task_id: TaskId::new("action-1"),
+            lease_id: lease.lease_id,
+            outcome: TaskOutcome::Completed { output_refs: vec![] },
+        });
+
+        let outcome = runner.run_cycle(&TaskId::new("parent-1"));
+        assert_eq!(outcome, RunCycleOutcome::Continue);
+
+        let action_task = store.get_task(&TaskId::new("action-1")).unwrap();
+        assert_eq!(action_task.status, TaskStatus::Verifying, "普通模式 Required 且无 output_refs 且无 validation dependent 应 Verifying");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: escalate_to_decision 通过 event_bus 发布 task.decision.created
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn escalate_to_decision_publishes_event_via_event_bus() {
+        let store = Arc::new(TaskStore::new());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(64));
+
+        let parent = make_task("parent-1", "m-1", "parent-1", None, TaskKind::Objective, TaskStatus::Running);
+        store.insert_task(parent);
+
+        let runner = TaskRunner::new(store.clone(), vec![make_worker("worker-dev", "integration-dev", vec![TaskKind::Action])])
+            .with_event_bus(Arc::clone(&event_bus));
+
+        let payload = magi_core::DecisionTaskPayload {
+            decision_context: "测试决策".to_string(),
+            blocked_reason: "需要确认".to_string(),
+            target_task_id: None,
+            options: vec![magi_core::DecisionOption {
+                option_id: "yes".to_string(),
+                label: "是".to_string(),
+                description: "确认".to_string(),
+            }],
+            risk_notes: vec![],
+            recommended_option: Some("yes".to_string()),
+            required_user_input: true,
+            decision_evidence: None,
+        };
+
+        let decision_id = runner.escalate_to_decision(&TaskId::new("parent-1"), payload).unwrap();
+
+        let events = event_bus.snapshot().recent_events;
+        let decision_event = events.iter().find(|e| e.event_type == "task.decision.created");
+        assert!(decision_event.is_some(), "escalate_to_decision 应发布 task.decision.created 事件");
+        let decision_event = decision_event.unwrap();
+        let payload = decision_event.payload.as_object().expect("payload 应为 object");
+        assert_eq!(payload.get("task_id").and_then(|v| v.as_str()), Some(decision_id.as_str()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Graph Reflection tests (design 4.2.2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_graph_reflector_returns_keep() {
+        let store = Arc::new(TaskStore::new());
+        let reflector = DefaultGraphReflector;
+        let parent = make_task("parent-1", "m-1", "parent-1", None, TaskKind::Phase, TaskStatus::Running);
+        store.insert_task(parent);
+
+        let decision = reflector.reflect_and_replan(&store, &TaskId::new("parent-1")).unwrap();
+        assert!(matches!(decision.action, ReplanAction::Keep));
+    }
+
+    #[test]
+    fn workpackage_completion_triggers_reflection_once() {
+        let store = Arc::new(TaskStore::new());
+        let parent = make_task("parent-1", "m-1", "parent-1", None, TaskKind::Phase, TaskStatus::Running);
+        let wp = make_task("wp-1", "m-1", "parent-1", Some("parent-1"), TaskKind::WorkPackage, TaskStatus::Completed);
+        store.insert_task(parent);
+        store.insert_task(wp);
+
+        let runner = TaskRunner::new(store.clone(), vec![]);
+        runner.trigger_workpackage_reflection(&TaskId::new("parent-1"));
+
+        // 第一次触发应把 parent 加入 reflected 集合
+        let reflected = runner.reflected_task_ids.lock().unwrap();
+        assert!(reflected.contains(&TaskId::new("parent-1")));
+        drop(reflected);
+
+        // 第二次触发不应重复处理（不会 panic，只是静默跳过）
+        runner.trigger_workpackage_reflection(&TaskId::new("parent-1"));
+    }
+
+    #[test]
+    fn repair_budget_exhausted_triggers_reflection() {
+        let store = Arc::new(TaskStore::new());
+        let parent = make_task("parent-1", "m-1", "parent-1", None, TaskKind::WorkPackage, TaskStatus::Running);
+        let action = make_task("action-1", "m-1", "parent-1", Some("parent-1"), TaskKind::Action, TaskStatus::Running);
+        store.insert_task(parent);
+        store.insert_task(action);
+
+        let runner = TaskRunner::new(store.clone(), vec![]);
+        runner.trigger_repair_reflection(&TaskId::new("action-1"));
+
+        let reflected = runner.reflected_task_ids.lock().unwrap();
+        assert!(reflected.contains(&TaskId::new("parent-1")));
     }
 }

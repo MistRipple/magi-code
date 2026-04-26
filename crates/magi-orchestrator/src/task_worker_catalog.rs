@@ -38,11 +38,39 @@ pub fn build_worker_info_for_role(role: &str) -> Option<WorkerInfo> {
     if supported_kinds.is_empty() {
         return None;
     }
+    let system_prompt_template = match role {
+        "architect" => Some(
+            "你是系统架构师。你的职责是理解高层目标，将其分解为可执行的 Phase 和 WorkPackage。\
+重点关注模块边界、接口契约和依赖关系。输出必须包含清晰的任务分解和验收标准。".to_string(),
+        ),
+        "integration-dev" => Some(
+            "你是全栈集成开发工程师。你的职责是执行具体的 WorkPackage 和 Action，编写代码、修复缺陷、运行测试。\
+遵循项目编码规范，确保代码可编译、测试通过。输出必须包含修改的文件列表和关键代码片段。".to_string(),
+        ),
+        "reviewer" => Some(
+            "你是代码审查与验证工程师。你的职责是验证任务输出是否符合验收标准，检查代码质量、安全性和可维护性。\
+对发现的问题给出明确的通过/不通过结论及修复建议。".to_string(),
+        ),
+        "debugger" => Some(
+            "你是调试与修复工程师。你的职责是分析失败原因，定位根因，实施修复并验证。\
+优先最小化改动范围，避免引入回归。输出必须包含根因分析和修复方案。".to_string(),
+        ),
+        "frontend-dev" => Some(
+            "你是前端开发工程师。你的职责是实现用户界面、交互逻辑和前端状态管理。\
+确保响应式设计、可访问性和性能。输出必须包含组件结构和关键样式/逻辑代码。".to_string(),
+        ),
+        "backend-dev" => Some(
+            "你是后端开发工程师。你的职责是实现 API、业务逻辑、数据访问层和基础设施代码。\
+确保接口稳定、数据一致性和安全性。输出必须包含接口定义和关键业务逻辑代码。".to_string(),
+        ),
+        _ => None,
+    };
     Some(WorkerInfo {
         worker_id: WorkerId::new(format!("task-worker-{role}")),
         role: role.to_string(),
         supported_kinds,
         parallelism_limit: None,
+        system_prompt_template,
     })
 }
 
@@ -111,12 +139,14 @@ impl DynamicWorkerCatalog {
         role: String,
         supported_kinds: Vec<TaskKind>,
         parallelism_limit: Option<u32>,
+        system_prompt_template: Option<String>,
     ) {
         self.register(WorkerInfo {
             worker_id,
             role,
             supported_kinds,
             parallelism_limit,
+            system_prompt_template,
         });
     }
 
@@ -193,6 +223,7 @@ mod tests {
             role: "ml-engineer".to_string(),
             supported_kinds: vec![TaskKind::Action],
             parallelism_limit: Some(2),
+            system_prompt_template: None,
         };
         catalog.register(worker);
         assert_eq!(catalog.worker_count(), 1);
@@ -252,10 +283,15 @@ mod tests {
             "ml-engineer".to_string(),
             vec![TaskKind::Action, TaskKind::Validation],
             Some(4),
+            Some("GPU 加速机器学习工程师提示词".to_string()),
         );
         let w = catalog.get(&WorkerId::new("gpu-worker-1")).unwrap();
         assert_eq!(w.role, "ml-engineer");
         assert_eq!(w.parallelism_limit, Some(4));
         assert_eq!(w.supported_kinds.len(), 2);
+        assert_eq!(
+            w.system_prompt_template,
+            Some("GPU 加速机器学习工程师提示词".to_string())
+        );
     }
 }
