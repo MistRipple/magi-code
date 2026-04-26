@@ -1,17 +1,17 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
-	  import {
-	    addToast,
-	    getActiveInteractionType,
-	    getQueuedMessages,
-	    markQueuedMessageAsGuide,
-	    messagesState,
-	  } from '../stores/messages.svelte';
-  import { getTaskGraphState } from '../stores/task-graph-store.svelte';
+  import {
+    addToast,
+    getActiveInteractionType,
+    getQueuedMessages,
+    markQueuedMessageAsGuide,
+    messagesState,
+  } from '../stores/messages.svelte';
+  import { getTaskGraphState, refreshTaskProjection } from '../stores/task-graph-store.svelte';
   import type { StandardMessage } from '../shared/protocol/message-protocol';
   import { MessageCategory } from '../shared/protocol/message-protocol';
-  import type { SessionIntakeResponseDto } from '../shared/rust-backend-types';
+  import type { SessionIntakeResponseDto, TaskDto, TaskStatus } from '../shared/rust-backend-types';
   import { RustDaemonClient } from '../shared/rust-daemon-client';
   import { resolveAgentBaseUrl } from '../web/agent-api';
   import Icon from './Icon.svelte';
@@ -30,6 +30,12 @@
     id: string;
     dataUrl: string;
     name: string;
+  }
+
+  interface IntakeTaskOption {
+    taskId: string;
+    label: string;
+    title: string;
   }
 
   // 输入内容
@@ -74,6 +80,8 @@
 
   // Intake 路由状态
   let intakeLoading = $state(false);
+  let selectedIntakeTaskId = $state('');
+  let stopLoading = $state(false);
 
   const currentSessionId = $derived(messagesState.currentSessionId);
   const taskGraph = $derived(getTaskGraphState(currentSessionId));
@@ -86,7 +94,7 @@
     const status = projection.runner_status;
     return status === 'running' || status === 'blocked';
   });
-  const intakeContextTaskId = $derived.by(() => {
+  const defaultIntakeContextTaskId = $derived.by(() => {
     const projection = taskGraph.projection;
     if (!projection) return null;
     const priorityStatuses = ['AwaitingApproval', 'Blocked', 'Repairing', 'Verifying', 'Running', 'Ready'];
@@ -95,6 +103,52 @@
       if (task) return task.task_id;
     }
     return projection.root_task?.task_id ?? taskGraph.rootTaskId ?? null;
+  });
+  const intakeTaskOptions = $derived.by((): IntakeTaskOption[] => {
+    const projection = taskGraph.projection;
+    if (!projection) return [];
+    const seen = new Set<string>();
+    return projection.tasks
+      .filter((task) => {
+        if (seen.has(task.task_id)) return false;
+        seen.add(task.task_id);
+        return task.kind === 'Objective' || task.parent_task_id || task.task_id === projection.root_task.task_id;
+      })
+      .map((task) => ({
+        taskId: task.task_id,
+        label: formatIntakeTaskOptionLabel(task),
+        title: `${task.title}\n${task.goal || task.task_id}`,
+      }));
+  });
+  const intakeContextTaskId = $derived.by(() => {
+    const available = new Set(intakeTaskOptions.map((option) => option.taskId));
+    const selectedTaskId = selectedIntakeTaskId.trim();
+    if (selectedTaskId && available.has(selectedTaskId)) {
+      return selectedTaskId;
+    }
+    return defaultIntakeContextTaskId;
+  });
+  const showIntakeTaskTargetBar = $derived(shouldUseIntake && intakeTaskOptions.length > 0);
+  const selectedIntakeTaskOption = $derived.by(() => (
+    intakeTaskOptions.find((option) => option.taskId === intakeContextTaskId) ?? null
+  ));
+  const shouldPauseTaskGraphFromComposer = $derived.by(() => {
+    const projection = taskGraph.projection;
+    const sessionId = currentSessionId?.trim();
+    const rootTaskId = projection?.root_task.task_id ?? taskGraph.rootTaskId;
+    if (!projection || !sessionId || !rootTaskId) return false;
+    return projection.runner_status === 'running' || projection.runner_status === 'blocked';
+  });
+
+  $effect(() => {
+    if (intakeTaskOptions.length === 0) {
+      if (selectedIntakeTaskId !== '') selectedIntakeTaskId = '';
+      return;
+    }
+    const available = new Set(intakeTaskOptions.map((option) => option.taskId));
+    if (!selectedIntakeTaskId || !available.has(selectedIntakeTaskId)) {
+      selectedIntakeTaskId = defaultIntakeContextTaskId ?? '';
+    }
   });
 
   // 发送/停止态只认 store 内已经收敛好的处理状态，避免历史工具卡片把空闲会话抬回执行态。
@@ -131,6 +185,40 @@
     inputValue = '';
     selectedImages = [];
     selectedSkill = null;
+  }
+
+  function getIntakeTaskKindLabel(kind: TaskDto['kind']): string {
+    switch (kind) {
+      case 'Objective': return '目标';
+      case 'Phase': return '阶段';
+      case 'WorkPackage': return '工作包';
+      case 'Action': return '步骤';
+      case 'Validation': return '验证';
+      case 'Repair': return '修复';
+      case 'Decision': return '决策';
+      default: return kind;
+    }
+  }
+
+  function getIntakeTaskStatusLabel(status: TaskStatus): string {
+    switch (status) {
+      case 'Draft': return '待规划';
+      case 'Ready': return '待执行';
+      case 'Running': return '执行中';
+      case 'Blocked': return '已暂停';
+      case 'AwaitingApproval': return '等待确认';
+      case 'Verifying': return '验证中';
+      case 'Repairing': return '修复中';
+      case 'Completed': return '已完成';
+      case 'Failed': return '失败';
+      case 'Cancelled': return '已取消';
+      case 'Skipped': return '已跳过';
+      default: return status;
+    }
+  }
+
+  function formatIntakeTaskOptionLabel(task: TaskDto): string {
+    return `${getIntakeTaskKindLabel(task.kind)} · ${task.title} · ${getIntakeTaskStatusLabel(task.status)}`;
   }
 
   // 发送消息（支持图片附件）
@@ -188,6 +276,7 @@
         contextTaskId: intakeContextTaskId,
       });
       handleIntakeResponse(response);
+      await refreshTaskProjection(messagesState.currentSessionId);
       clearComposerState();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -274,20 +363,41 @@
     }
   }
 
-  // 停止任务
-  function stopTask() {
-    vscode.postMessage({ type: 'interruptTask' });
+  // 任务图运行时，输入框停止入口与任务面板共用同一条暂停链路。
+  async function stopTask() {
+    if (stopLoading) return;
+    stopLoading = true;
+    try {
+      if (shouldPauseTaskGraphFromComposer) {
+        const projection = taskGraph.projection;
+        const sessionId = currentSessionId?.trim();
+        const rootTaskId = projection?.root_task.task_id ?? taskGraph.rootTaskId;
+        if (sessionId && rootTaskId) {
+          const client = new RustDaemonClient(resolveAgentBaseUrl());
+          await client.pauseTask({ taskId: rootTaskId, sessionId });
+          await refreshTaskProjection(sessionId);
+          addToast('info', '任务链已暂停');
+        }
+        return;
+      }
+      vscode.postMessage({ type: 'interruptTask' });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      addToast('error', `停止失败: ${message}`);
+    } finally {
+      stopLoading = false;
+    }
   }
 
-	  function guideQueuedMessage(queuedMessageId: string) {
-	    const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
-	    if (!normalizedId) return;
-	    markQueuedMessageAsGuide(normalizedId);
-	    vscode.postMessage({
-	      type: 'guideQueuedMessage',
-	      queuedMessageId: normalizedId,
-	    });
-	  }
+  function guideQueuedMessage(queuedMessageId: string) {
+    const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
+    if (!normalizedId) return;
+    markQueuedMessageAsGuide(normalizedId);
+    vscode.postMessage({
+      type: 'guideQueuedMessage',
+      queuedMessageId: normalizedId,
+    });
+  }
 
   function focusInputTextareaToEnd() {
     requestAnimationFrame(() => {
@@ -513,6 +623,25 @@
       </div>
     {/if}
 
+    {#if showIntakeTaskTargetBar}
+      <div class="ia-task-target-bar">
+        <span class="ia-task-target-label">
+          <Icon name="target" size={11} />
+          <span>目标任务</span>
+        </span>
+        <select
+          class="ia-task-target-select"
+          bind:value={selectedIntakeTaskId}
+          title={selectedIntakeTaskOption?.title || '目标任务'}
+          aria-label="目标任务"
+        >
+          {#each intakeTaskOptions as option (option.taskId)}
+            <option value={option.taskId}>{option.label}</option>
+          {/each}
+        </select>
+      </div>
+    {/if}
+
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <textarea
       bind:value={inputValue}
@@ -635,8 +764,14 @@
               <Icon name="send" size={14} />
             </button>
           {/if}
-          <button class="ia-send stop" data-testid="input-stop-button" onclick={stopTask} title={i18n.t('input.stop')}>
-            <Icon name="stop" size={14} />
+          <button
+            class="ia-send stop"
+            data-testid="input-stop-button"
+            onclick={stopTask}
+            disabled={stopLoading}
+            title={shouldPauseTaskGraphFromComposer ? '暂停当前任务链' : i18n.t('input.stop')}
+          >
+            <Icon name={stopLoading ? 'loader' : 'stop'} size={14} class={stopLoading ? 'spinning' : ''} />
           </button>
         {:else if hasContent}
           <!-- 空闲且有内容：显示发送按钮 -->
@@ -792,6 +927,43 @@
     flex-shrink: 0;
   }
   .ia-skill-badge-remove:hover { color: var(--error); background: var(--error-muted); }
+
+  .ia-task-target-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: 6px var(--space-2) 0;
+    flex-shrink: 0;
+  }
+
+  .ia-task-target-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+    font-size: var(--text-2xs);
+    color: var(--foreground-muted);
+    white-space: nowrap;
+  }
+
+  .ia-task-target-select {
+    min-width: 0;
+    flex: 1;
+    height: 28px;
+    padding: 0 var(--space-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface-1);
+    color: var(--foreground);
+    font: inherit;
+    font-size: var(--text-xs);
+    outline: none;
+  }
+
+  .ia-task-target-select:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 2px var(--primary-muted);
+  }
 
   /* 操作栏 */
   .ia-actions {

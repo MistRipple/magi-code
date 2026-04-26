@@ -55,6 +55,13 @@ export interface TaskInterruptResponseDto {
   requestedAt: number;
 }
 
+export interface TaskResumeResponseDto {
+  resumed: boolean;
+  eventId: string;
+  requestedAt: number;
+  rootTaskId: string;
+}
+
 export interface ServiceInfoDto {
   serviceName: string;
   apiVersion: string;
@@ -1316,6 +1323,12 @@ export interface ResolveTaskDecisionResponseDto {
   taskId: string;
   resolved: boolean;
   chosenOption: string;
+}
+
+export interface TaskReplanResponseDto {
+  rootTaskId: string;
+  replan: boolean;
+  cancelledTaskIds: string[];
 }
 
 // ─── Intake (design 8) ──────────────────────────────────────────────

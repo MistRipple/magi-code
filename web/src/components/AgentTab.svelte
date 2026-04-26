@@ -2,9 +2,12 @@
   import type { TimelineRenderItem } from '../types/message';
   import MessageList from './MessageList.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { messagesState } from '../stores/messages.svelte';
+  import { addToast, messagesState } from '../stores/messages.svelte';
   import { getTaskGraphState, getTaskStatusModifier } from '../stores/task-graph-store.svelte';
   import type { TaskDto, TaskStatus } from '../shared/rust-backend-types';
+  import { describeTaskReference, type TaskReferenceDescriptor } from '../lib/task-reference';
+  import type { IconName } from '../lib/icons';
+  import { vscode } from '../lib/vscode-bridge';
   import Icon from './Icon.svelte';
 
   // Props
@@ -45,6 +48,16 @@
   const completedTasks = $derived(
     boundTasks.filter((t) => t.status === 'Completed' || t.status === 'Skipped')
   );
+  const activeTaskOutputReferences = $derived.by(() => (
+    (activeTask?.output_refs ?? [])
+      .map((ref) => describeTaskReference(ref, 'auto'))
+      .filter((ref): ref is TaskReferenceDescriptor => Boolean(ref))
+  ));
+  const activeTaskEvidenceReferences = $derived.by(() => (
+    (activeTask?.evidence_refs ?? [])
+      .map((ref) => describeTaskReference(ref, 'auto'))
+      .filter((ref): ref is TaskReferenceDescriptor => Boolean(ref))
+  ));
 
   const emptyState = $derived({
     icon: 'message-square',
@@ -97,6 +110,42 @@
       default: return { name: 'circleOutline' as const, spinning: false };
     }
   });
+
+  function currentSessionIdValue(): string | null {
+    const sessionId = currentSessionId?.trim();
+    return sessionId || null;
+  }
+
+  function getReferenceIconName(reference: TaskReferenceDescriptor): IconName {
+    if (reference.actionKind === 'diff') return 'file-edit';
+    if (reference.actionKind === 'file') return 'file-text';
+    return 'copy';
+  }
+
+  async function activateTaskReference(reference: TaskReferenceDescriptor) {
+    if (reference.actionKind === 'diff') {
+      vscode.postMessage({
+        type: 'viewDiff',
+        filePath: reference.actionTarget,
+        sessionId: currentSessionIdValue() || undefined,
+      });
+      return;
+    }
+    if (reference.actionKind === 'file') {
+      vscode.postMessage({
+        type: 'openFile',
+        filepath: reference.actionTarget,
+        sessionId: currentSessionIdValue() || undefined,
+      });
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(reference.actionTarget);
+      addToast('info', '引用已复制');
+    } catch {
+      addToast('error', '复制引用失败');
+    }
+  }
 </script>
 
 <div class="agent-tab">
@@ -118,24 +167,40 @@
         <div class="atb-goal">{activeTask.goal}</div>
       {/if}
 
-      {#if activeTask.output_refs.length > 0 || activeTask.evidence_refs.length > 0}
+      {#if activeTaskOutputReferences.length > 0 || activeTaskEvidenceReferences.length > 0}
         <div class="atb-outputs">
-          {#if activeTask.output_refs.length > 0}
+          {#if activeTaskOutputReferences.length > 0}
             <div class="atb-output-group">
               <span class="atb-output-label">产出</span>
               <div class="atb-output-list">
-                {#each activeTask.output_refs as ref}
-                  <span class="atb-output-chip">{ref}</span>
+                {#each activeTaskOutputReferences as reference, index (`${reference.raw}:${index}`)}
+                  <button
+                    type="button"
+                    class="atb-output-chip atb-output-chip--interactive"
+                    title={reference.title}
+                    onclick={() => activateTaskReference(reference)}
+                  >
+                    <Icon name={getReferenceIconName(reference)} size={10} />
+                    <span>{reference.displayLabel}</span>
+                  </button>
                 {/each}
               </div>
             </div>
           {/if}
-          {#if activeTask.evidence_refs.length > 0}
+          {#if activeTaskEvidenceReferences.length > 0}
             <div class="atb-output-group">
               <span class="atb-output-label">证据</span>
               <div class="atb-output-list">
-                {#each activeTask.evidence_refs as ref}
-                  <span class="atb-output-chip">{ref}</span>
+                {#each activeTaskEvidenceReferences as reference, index (`${reference.raw}:${index}`)}
+                  <button
+                    type="button"
+                    class="atb-output-chip atb-output-chip--interactive"
+                    title={reference.title}
+                    onclick={() => activateTaskReference(reference)}
+                  >
+                    <Icon name={getReferenceIconName(reference)} size={10} />
+                    <span>{reference.displayLabel}</span>
+                  </button>
                 {/each}
               </div>
             </div>
@@ -322,6 +387,9 @@
   }
 
   .atb-output-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
     font-size: var(--text-2xs);
     color: var(--foreground-muted);
     background: var(--surface-2);
@@ -332,6 +400,27 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .atb-output-chip--interactive {
+    cursor: pointer;
+    font: inherit;
+    transition:
+      background var(--transition-fast),
+      border-color var(--transition-fast),
+      color var(--transition-fast);
+  }
+
+  .atb-output-chip--interactive:hover {
+    color: var(--primary);
+    background: color-mix(in srgb, var(--primary) 8%, var(--surface-2));
+    border-color: color-mix(in srgb, var(--primary) 30%, var(--border));
+  }
+
+  .atb-output-chip > span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .atb-blocked {

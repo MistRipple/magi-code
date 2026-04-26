@@ -81,6 +81,8 @@ import type {
   TaskDto,
   TaskInterruptResponseDto,
   TaskProjectionDto,
+  TaskReplanResponseDto,
+  TaskResumeResponseDto,
   UpdatedResponseDto,
   UpdateKnowledgeRequestDto,
   VersionHandshakeDto,
@@ -168,6 +170,18 @@ export class RustDaemonClient {
     request: unknown,
   ): Promise<TaskInterruptResponseDto> {
     return this.postJson<TaskInterruptResponseDto>('/api/task/interrupt', request);
+  }
+
+  public async pauseTask(
+    request: { taskId: string; sessionId?: string | null },
+  ): Promise<TaskInterruptResponseDto> {
+    return this.interruptTask(request);
+  }
+
+  public async resumeTask(
+    request: { taskId: string; sessionId?: string | null },
+  ): Promise<TaskResumeResponseDto> {
+    return this.postJson<TaskResumeResponseDto>('/api/task/resume', request);
   }
 
   // ─── Session management ───────────────────────────────────────────
@@ -641,6 +655,15 @@ export class RustDaemonClient {
     query.set('sessionId', sessionId);
     return this.getJson<DeliveryPackageDto>(
       `/api/tasks/${encodeURIComponent(rootTaskId)}/delivery-package?${query.toString()}`,
+    );
+  }
+
+  public async replanTaskGraph(rootTaskId: string, sessionId: string): Promise<TaskReplanResponseDto> {
+    const query = new URLSearchParams();
+    query.set('sessionId', sessionId);
+    return this.postJson<TaskReplanResponseDto>(
+      `/api/tasks/${encodeURIComponent(rootTaskId)}/replan?${query.toString()}`,
+      {},
     );
   }
 

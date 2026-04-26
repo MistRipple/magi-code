@@ -357,6 +357,7 @@ async fn handle_intake(
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/task/interrupt", post(interrupt_task))
+        .route("/task/resume", post(resume_task))
         .route("/session/intake", post(handle_intake))
 }
 
@@ -453,6 +454,54 @@ async fn interrupt_task(
         "storeUpdated": true,
         "eventId": event_id.to_string(),
         "requestedAt": now.0,
+    })))
+}
+
+/// 恢复暂停的任务链，作为 `/api/task/interrupt` 的同一控制面出口。
+async fn resume_task(
+    State(state): State<ApiState>,
+    Json(request): Json<TaskIdRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let now = UtcMillis::now();
+    let event_id = EventId::new(format!("event-task-resume-{}", now.0));
+
+    let task_id = request.task_id.trim();
+    if task_id.is_empty() {
+        return Err(ApiError::InvalidInput("taskId 不能为空".to_string()));
+    }
+    let (session_id, task) =
+        require_session_owned_task(&state, request.session_id.as_deref(), task_id)?;
+    let root_task_id = task.root_task_id.clone();
+    let manager = state
+        .runner_manager()
+        .ok_or_else(|| ApiError::internal_assembly("resume task", "runner_manager 未配置"))?;
+    manager
+        .resume_tree(root_task_id.as_str())
+        .map_err(|error| ApiError::internal_assembly("恢复任务状态更新失败", error))?;
+    let _ = state
+        .session_store
+        .update_current_turn_status(&session_id, "running");
+
+    let event = EventEnvelope::domain(
+        event_id.clone(),
+        "task.resume.requested",
+        json!({
+            "taskId": task_id,
+            "rootTaskId": root_task_id.to_string(),
+            "requestedAt": now.0,
+        }),
+    );
+    state
+        .event_bus
+        .publish(event)
+        .map_err(|err| ApiError::event_publish_failed("恢复事件发布失败", err))?;
+
+    Ok(Json(json!({
+        "resumed": true,
+        "storeUpdated": true,
+        "eventId": event_id.to_string(),
+        "requestedAt": now.0,
+        "rootTaskId": root_task_id.to_string(),
     })))
 }
 
