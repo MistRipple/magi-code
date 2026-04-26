@@ -524,125 +524,6 @@ function comparableTextsMatch(left: string, right: string): boolean {
   return left === right || left.includes(right) || right.includes(left);
 }
 
-function messageTurnItemKind(message: Message | undefined): string {
-  const metadata = resolveMessageMetadataRecord(message);
-  return typeof metadata?.turnItemKind === 'string' ? metadata.turnItemKind.trim() : '';
-}
-
-function isAssistantTurnMessage(message: Message | undefined): boolean {
-  if (!message || message.role !== 'assistant') {
-    return false;
-  }
-  const turnItemKind = messageTurnItemKind(message);
-  return turnItemKind === 'assistant_stream'
-    || turnItemKind === 'assistant_final'
-    || turnItemKind === 'assistant_thinking';
-}
-
-function isLocalAssistantEchoMessage(message: Message | undefined): boolean {
-  if (!message || message.role !== 'assistant') {
-    return false;
-  }
-  const metadata = resolveMessageMetadataRecord(message);
-  return Boolean(
-    typeof metadata?.requestId === 'string' && metadata.requestId.trim()
-    || metadata?.wasPlaceholder === true
-    || metadata?.isPlaceholder === true,
-  );
-}
-
-function isAssistantDuplicateCandidate(message: Message | undefined): boolean {
-  if (!message || message.role !== 'assistant' || message.isStreaming === true) {
-    return false;
-  }
-  return isAssistantTurnMessage(message) || isLocalAssistantEchoMessage(message);
-}
-
-function hasRenderableProjectionHost(message: Message | undefined): boolean {
-  if (!message) {
-    return false;
-  }
-  if (normalizeComparableMessageText(message)) {
-    return true;
-  }
-  return ensureArray<ContentBlock>(message.blocks).some((block) => {
-    if (!block || typeof block !== 'object') {
-      return false;
-    }
-    if (block.type === 'dispatch_group' || block.type === 'tool_call' || block.type === 'tool_result') {
-      return true;
-    }
-    return typeof block.content === 'string' && block.content.trim().length > 0;
-  });
-}
-
-function collectDurableAssistantTexts(artifacts: TimelineProjectionArtifact[]): string[] {
-  const texts: string[] = [];
-  for (const artifact of artifacts) {
-    const message = artifact.message;
-    if (!message || message.role !== 'assistant' || isAssistantDuplicateCandidate(message)) {
-      continue;
-    }
-    const text = normalizeComparableMessageText(message);
-    if (text) {
-      texts.push(text);
-    }
-  }
-  return texts;
-}
-
-function isDuplicateOfDurableAssistant(message: Message | undefined, durableTexts: string[]): boolean {
-  if (!isAssistantDuplicateCandidate(message)) {
-    return false;
-  }
-  const text = normalizeComparableMessageText(message);
-  if (!text) {
-    return false;
-  }
-  return durableTexts.some((durableText) => comparableTextsMatch(durableText, text));
-}
-
-function dedupeProjectionAssistantArtifacts(
-  artifacts: TimelineProjectionArtifact[],
-): TimelineProjectionArtifact[] {
-  const durableAssistantTexts = collectDurableAssistantTexts(artifacts);
-  if (durableAssistantTexts.length === 0) {
-    return artifacts;
-  }
-
-  const nextArtifacts: TimelineProjectionArtifact[] = [];
-  for (const artifact of artifacts) {
-    const messageDuplicate = isDuplicateOfDurableAssistant(artifact.message, durableAssistantTexts);
-    const originalExecutionItems = ensureArray<TimelineExecutionItem>(artifact.executionItems);
-    const executionItems = ensureArray<TimelineExecutionItem>(artifact.executionItems)
-      .filter((item) => !isDuplicateOfDurableAssistant(item.message, durableAssistantTexts));
-
-    if (messageDuplicate) {
-      if (executionItems.length > 0) {
-        nextArtifacts.push({
-          ...artifact,
-          executionItems,
-        });
-      }
-      continue;
-    }
-
-    if (
-      executionItems.length === 0
-      && originalExecutionItems.length > 0
-      && !hasRenderableProjectionHost(artifact.message)
-    ) {
-      continue;
-    }
-
-    nextArtifacts.push({
-      ...artifact,
-      executionItems,
-    });
-  }
-  return nextArtifacts;
-}
-
 function projectionHasAcceptedUserEcho(
   projection: SessionTimelineProjection | null | undefined,
   node: TimelineNode,
@@ -759,25 +640,24 @@ function timelineProjectionLatestEventSeq(
     : 0;
 }
 
-function messageBelongsToLocalLiveTurn(message: Message | undefined): boolean {
-  if (!message) {
-    return false;
-  }
-  const metadata = resolveMessageMetadataRecord(message);
-  return message.isStreaming === true
-    || Boolean(
-      typeof metadata?.requestId === 'string' && metadata.requestId.trim()
-      || metadata?.isPlaceholder === true
-      || metadata?.wasPlaceholder === true,
-    );
-}
-
-function timelineNodeBelongsToLocalLiveTurn(node: TimelineNode): boolean {
-  if (messageBelongsToLocalLiveTurn(node.message)) {
+function timelineNodeIsActivelyStreaming(node: TimelineNode): boolean {
+  if (node.message?.isStreaming === true) {
     return true;
   }
   return ensureArray<TimelineExecutionItem>(node.executionItems)
-    .some((item) => messageBelongsToLocalLiveTurn(item.message));
+    .some((item) => item.message?.isStreaming === true);
+}
+
+function timelineNodeIsRequestPlaceholder(node: TimelineNode): boolean {
+  const isPlaceholderMessage = (message: Message | undefined): boolean => {
+    const metadata = resolveMessageMetadataRecord(message);
+    return metadata?.isPlaceholder === true;
+  };
+  if (isPlaceholderMessage(node.message)) {
+    return true;
+  }
+  return ensureArray<TimelineExecutionItem>(node.executionItems)
+    .some((item) => isPlaceholderMessage(item.message));
 }
 
 function shouldOverlayLocalTimelineNode(
@@ -788,17 +668,18 @@ function shouldOverlayLocalTimelineNode(
   const nodeSeq = timelineNodeLatestEventSeq(node);
   const projectionSeq = timelineProjectionLatestEventSeq(projection);
   const isNewerThanProjection = nodeSeq > projectionSeq;
-  const belongsToLocalLiveTurn = timelineNodeBelongsToLocalLiveTurn(node);
+  const isStreaming = timelineNodeIsActivelyStreaming(node);
+  const isRequestPlaceholder = timelineNodeIsRequestPlaceholder(node);
+  const backendActive = messagesState.backendProcessing || messagesState.pendingRequests.size > 0;
 
-  if (!messagesState.backendProcessing && messagesState.pendingRequests.size === 0 && belongsToLocalLiveTurn) {
+  // 占位节点在后端不再处理时让位 projection,避免发送按钮永远卡在“已发送”状态。
+  if (!backendActive && isRequestPlaceholder) {
     return false;
   }
 
   if (isNodeKnownByProjection(node, knownIds)) {
-    // 后端 bootstrap 可能在流式中途带回一个 current_turn 快照。
-    // 该快照会让节点 id 变成“已知”，但只代表当时的旧内容；
-    // 后续 SSE 增量仍然必须由本地 live 节点接管，否则 UI 会卡在早期 token。
-    return belongsToLocalLiveTurn && isNewerThanProjection;
+    // projection 已经认领该节点(通过 messageIds 别名匹配),只在仍在流式且本地更新更新时覆盖。
+    return isStreaming && isNewerThanProjection;
   }
   if (projectionHasAcceptedUserEcho(projection, node)) {
     return false;
@@ -806,9 +687,10 @@ function shouldOverlayLocalTimelineNode(
   if (projectionHasAcceptedAssistantEcho(projection, node)) {
     return false;
   }
-  const metadata = resolveMessageMetadataRecord(node.message);
-  const requestId = typeof metadata?.requestId === 'string' ? metadata.requestId.trim() : '';
-  if (requestId || metadata?.isPlaceholder === true) {
+  if (isStreaming) {
+    return true;
+  }
+  if (isRequestPlaceholder && backendActive) {
     return true;
   }
   return isNewerThanProjection;
@@ -1187,28 +1069,6 @@ function mergeTimelineSortTimestamp(
 
 function normalizeProjectionRestoredMessage(message: Message): Message {
   return normalizeMessagePayload(message, '[MessagesStore] 投影消息');
-}
-
-function projectionArtifactsContainCurrentTurn(
-  artifacts: TimelineProjectionArtifact[] | undefined,
-): boolean {
-  return ensureArray<TimelineProjectionArtifact>(artifacts).some((artifact) => {
-    const metadata = resolveMessageMetadataRecord(artifact.message);
-    const turnId = typeof metadata?.turnId === 'string' ? metadata.turnId.trim() : '';
-    if (turnId) {
-      return true;
-    }
-    return ensureArray<TimelineExecutionItem>(artifact.executionItems).some((item) => {
-      const itemMetadata = resolveMessageMetadataRecord(item.message);
-      return typeof itemMetadata?.turnId === 'string' && itemMetadata.turnId.trim().length > 0;
-    });
-  });
-}
-
-function projectionContainsCurrentTurn(
-  projection: SessionTimelineProjection | null | undefined,
-): boolean {
-  return projectionArtifactsContainCurrentTurn(projection?.artifacts);
 }
 
 function normalizeSessionNotificationRecord(raw: unknown): Notification | null {
@@ -1782,7 +1642,7 @@ function canonicalizeProjectionExecutionItems(
 function canonicalizeTimelineProjection(
   projection: SessionTimelineProjection,
 ): SessionTimelineProjection {
-  const normalizedArtifacts = ensureArray(projection.artifacts)
+  const artifacts = ensureArray(projection.artifacts)
     .filter(isProjectionArtifact)
     .map((artifact) => {
       const message = normalizeProjectionRestoredMessage(artifact.message);
@@ -1834,9 +1694,6 @@ function canonicalizeTimelineProjection(
       ...artifact,
       displayOrder: artifact.displayOrder || 0,
     }));
-  const artifacts = dedupeProjectionAssistantArtifacts(normalizedArtifacts);
-  const containsCurrentTurn = projectionArtifactsContainCurrentTurn(artifacts);
-
   const artifactById = new Map<string, TimelineProjectionArtifact>();
   for (const artifact of artifacts) {
     artifactById.set(artifact.artifactId, artifact);
@@ -1857,14 +1714,10 @@ function canonicalizeTimelineProjection(
     ...projection,
     sessionId: normalizeSessionId(projection.sessionId) || projection.sessionId,
     artifacts,
-    threadRenderEntries: containsCurrentTurn
-      ? normalizedThreadRenderEntries
-      : normalizedThreadRenderEntries.length > 0
+    threadRenderEntries: normalizedThreadRenderEntries.length > 0
       ? normalizedThreadRenderEntries
       : buildProjectionRenderEntriesFromArtifacts(artifacts, 'thread'),
-    workerRenderEntries: containsCurrentTurn
-      ? normalizedWorkerRenderEntries
-      : Object.keys(normalizedWorkerRenderEntries).length > 0
+    workerRenderEntries: Object.keys(normalizedWorkerRenderEntries).length > 0
       ? normalizedWorkerRenderEntries
       : buildDynamicWorkerRenderEntries(artifacts),
   };
@@ -1958,13 +1811,6 @@ function syncTimelineProjectionFromNodes(
   if (!projectionSessionId) {
     return;
   }
-  if (projectionContainsCurrentTurn(messagesState.timelineProjection)) {
-    timelineProjectionDirty = false;
-    if (options.persist !== false) {
-      scheduleSaveWebviewState();
-    }
-    return;
-  }
   messagesState.timelineProjection = buildLiveTimelineProjection(
     projectionSessionId,
     messagesState.timelineNodes,
@@ -2028,10 +1874,6 @@ function ensureTimelineProjectionSnapshotCurrent(
   sessionId: string | null | undefined,
 ): SessionTimelineProjection | null {
   if (!timelineProjectionDirty) {
-    return messagesState.timelineProjection;
-  }
-  if (projectionContainsCurrentTurn(messagesState.timelineProjection)) {
-    timelineProjectionDirty = false;
     return messagesState.timelineProjection;
   }
   const normalizedSessionId = normalizeSessionId(sessionId);
@@ -3961,6 +3803,11 @@ export function applyStreamingDelta(
   entryId: string | number,
   delta: string,
   sessionId?: string,
+  options: {
+    replaceMessageId?: string;
+    requestId?: string;
+    userMessageId?: string;
+  } = {},
 ): void {
   if (sessionId && messagesState.currentSessionId && sessionId !== messagesState.currentSessionId) {
     return;
@@ -3983,8 +3830,8 @@ export function applyStreamingDelta(
     return;
   }
 
-  const existingNode = messagesState.timelineNodes.find((n) => n.nodeId === nodeId);
-  if (existingNode) {
+  const existingMessage = getEffectiveTimelineMessage(nodeId);
+  if (existingMessage) {
     enqueueTimelineStreamUpdate(nodeId, {
       content: renderableText,
       blocks: [{ type: 'text', content: renderableText }],
@@ -4009,8 +3856,14 @@ export function applyStreamingDelta(
         sessionId: sessionId || messagesState.currentSessionId || '',
         eventSeq: 0,
         timelineAnchorTimestamp: now,
+        requestId: options.requestId || undefined,
+        userMessageId: options.userMessageId || undefined,
+        placeholderMessageId: options.replaceMessageId || undefined,
       },
-    } as Message, { thread: true }, { displayOrder: undefined });
+    } as Message, { thread: true }, {
+      displayOrder: undefined,
+      replaceMessageId: options.replaceMessageId,
+    });
   }
 }
 
@@ -4041,8 +3894,8 @@ export function sealStreamingDelta(entryId: string | number): void {
   }
 
   // 没有收集器但节点存在：直接标记完成
-  const existingNode = messagesState.timelineNodes.find((n) => n.nodeId === nodeId);
-  if (existingNode) {
+  const existingMessage = getEffectiveTimelineMessage(nodeId);
+  if (existingMessage) {
     enqueueTimelineStreamUpdate(nodeId, {
       isStreaming: false,
       isComplete: true,
