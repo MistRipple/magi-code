@@ -466,7 +466,7 @@ function buildRequestPlaceholderMetadata(
       ? existingMetadata.placeholderState.trim()
       : (typeof incomingMetadata?.placeholderState === 'string' && incomingMetadata.placeholderState.trim()
           ? incomingMetadata.placeholderState.trim()
-          : 'thinking')
+          : 'pending')
   );
 
   return {
@@ -721,7 +721,7 @@ function handleContentMessage(standard: StandardMessage) {
   const isPlaceholder = Boolean(meta?.isPlaceholder);
   const isUserMessage = standard.type === MessageType.USER_INPUT;
 
-  // === 占位消息：先展示 thinking 卡片，等后续真实消息接管同一时间轴位置 ===
+  // === 占位消息：只展示 pending/connecting 状态，等待后续真实消息原位接管 ===
   // 占位消息也需要创建 timeline node 锚点，确保后续真实消息能够原位接管。
   if (isPlaceholder) {
     if (!requestId) {
@@ -912,9 +912,18 @@ function handleStandardComplete(message: ClientBridgeMessage) {
   const uiMessage = mapStandardMessage(standard);
   const visibility = resolveTimelineVisibilityForStandard(standard);
   const requestBinding = requestId ? getRequestBinding(requestId) : undefined;
-  const responseDurationMs = requestBinding?.createdAt
+  const computedResponseDurationMs = requestBinding?.createdAt
     ? Math.max(0, (standard.timestamp || Date.now()) - requestBinding.createdAt)
     : undefined;
+  const uiMetadata = uiMessage.metadata && typeof uiMessage.metadata === 'object'
+    ? uiMessage.metadata
+    : {};
+  const authoritativeResponseDurationMs = typeof uiMetadata.responseDurationMs === 'number'
+    ? uiMetadata.responseDurationMs
+    : undefined;
+  const responseDurationMs = typeof authoritativeResponseDurationMs === 'number'
+    ? authoritativeResponseDurationMs
+    : computedResponseDurationMs;
   const replaceMessageId = (
     requestId
     && shouldTakeOverRequestPlaceholder(standard, requestBinding)
@@ -936,7 +945,7 @@ function handleStandardComplete(message: ClientBridgeMessage) {
     isStreaming: false,
     isComplete: true,
     metadata: {
-      ...(uiMessage.metadata || {}),
+      ...uiMetadata,
       ...(typeof responseDurationMs === 'number' ? { responseDurationMs } : {}),
     },
     ...(mergedBlocks ? {

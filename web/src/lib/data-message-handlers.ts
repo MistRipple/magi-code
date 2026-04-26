@@ -332,7 +332,7 @@ export function handleUnifiedControlMessage(standard: StandardMessage) {
               metadata: {
                 ...baseMetadata,
                 isPlaceholder: true,
-                placeholderState: 'thinking',
+                placeholderState: 'pending',
                 requestId,
               },
             });
@@ -838,14 +838,20 @@ function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): voi
       continue;
     }
 
-    const responseDurationMs = Math.max(0, matchedAssistant.timestamp - binding.createdAt);
     const existingMetadata = matchedAssistant.metadata && typeof matchedAssistant.metadata === 'object'
       ? matchedAssistant.metadata
       : {};
+    const authoritativeResponseDurationMs = typeof existingMetadata.responseDurationMs === 'number'
+      ? existingMetadata.responseDurationMs
+      : undefined;
+    const computedResponseDurationMs = Math.max(0, matchedAssistant.timestamp - binding.createdAt);
+    const responseDurationMs = typeof authoritativeResponseDurationMs === 'number'
+      ? authoritativeResponseDurationMs
+      : computedResponseDurationMs;
     applyTimelineStreamPatch(matchedAssistant.id, {
       metadata: {
         ...existingMetadata,
-        responseDurationMs,
+        ...(typeof responseDurationMs === 'number' ? { responseDurationMs } : {}),
       },
     });
     markMessageComplete(binding.placeholderMessageId);
