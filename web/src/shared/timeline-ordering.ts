@@ -4,15 +4,6 @@ export interface TimelineSemanticOrderInput {
   displayOrder: number;
 }
 
-function normalizeNonNegativeInteger(value: number | null | undefined): number | null {
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    return null;
-  }
-  const normalized = Math.floor(value);
-  return normalized >= 0 ? normalized : null;
-}
-
-
 export function resolveTimelineEventSeqFromMetadata(
   metadata: Record<string, unknown> | undefined,
 ): number {
@@ -106,6 +97,14 @@ export function resolveTimelineVersionFromMetadata(
   return resolveTimelineEventSeqFromMetadata(metadata);
 }
 
+function normalizeTimelineSequence(value: number | null | undefined): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return null;
+  }
+  const normalized = Math.floor(value);
+  return normalized > 0 ? normalized : null;
+}
+
 function compareSharedFactOrder(
   left: number | null,
   right: number | null,
@@ -121,16 +120,16 @@ export function compareTimelineSemanticOrder(
   right: TimelineSemanticOrderInput,
 ): number {
   const turnOrder = compareSharedFactOrder(
-    normalizePositiveInteger(left.turnSeq),
-    normalizePositiveInteger(right.turnSeq),
+    normalizeTimelineSequence(left.turnSeq),
+    normalizeTimelineSequence(right.turnSeq),
   );
   if (turnOrder !== null) {
     return turnOrder;
   }
 
   const itemOrder = compareSharedFactOrder(
-    normalizePositiveInteger(left.itemSeq),
-    normalizePositiveInteger(right.itemSeq),
+    normalizeTimelineSequence(left.itemSeq),
+    normalizeTimelineSequence(right.itemSeq),
   );
   if (itemOrder !== null) {
     return itemOrder;
