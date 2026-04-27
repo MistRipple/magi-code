@@ -1,8 +1,7 @@
 use crate::{
     session_turn_writeback::{
         append_session_turn_item, build_completed_turn_timeline_snapshot,
-        current_session_turn_identity, publish_session_turn_item_event, session_turn_item,
-        upsert_session_turn_item,
+        publish_session_turn_item_event, session_turn_item, upsert_session_turn_item,
     },
     settings_store::SettingsStore,
     skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime},
@@ -145,7 +144,6 @@ pub(crate) fn run_task_llm_loop(
     let mut final_content = String::new();
     let mut tool_call_records: Vec<serde_json::Value> = Vec::new();
     let mut last_stream_item_id: Option<String> = None;
-    let turn_identity = current_session_turn_identity(session_store, session_id);
     let mut had_tool_calls = false;
     let turn_visibility = task_turn_visibility(
         task,
@@ -170,9 +168,6 @@ pub(crate) fn run_task_llm_loop(
         };
 
         let response = if streaming_entry_id.is_some() {
-            let last_sent_len = std::cell::Cell::new(0usize);
-            let task_id_str = task.task_id.to_string();
-            let mission_id_str = task.mission_id.to_string();
             let on_delta = |delta: &ModelStreamingDelta| {
                 if should_record_turn_artifacts {
                     publish_task_thinking_delta(
@@ -195,12 +190,7 @@ pub(crate) fn run_task_llm_loop(
                     session_id,
                     workspace_id,
                     &stream_item_id,
-                    turn_identity.as_ref(),
-                    &task_context,
                     &turn_visibility,
-                    &task_id_str,
-                    &mission_id_str,
-                    &last_sent_len,
                     &delta.content,
                 );
             };
@@ -435,12 +425,7 @@ fn publish_stream_delta(
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     entry_id: &str,
-    turn_identity: Option<&crate::session_turn_writeback::SessionTurnIdentity>,
-    task_context: &EventContext,
     turn_visibility: &TaskTurnVisibility,
-    task_id: &str,
-    mission_id: &str,
-    last_sent_len: &std::cell::Cell<usize>,
     accumulated_text: &str,
 ) {
     if turn_visibility.thread_visible {

@@ -30,12 +30,6 @@ pub(crate) struct PublishedSessionTurnItem {
     pub item: ActiveExecutionTurnItem,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct SessionTurnIdentity {
-    pub turn_id: String,
-    pub turn_seq: u64,
-}
-
 fn published_session_turn_item_from_sidecar(
     sidecar: SessionRuntimeSidecar,
     item_id: &str,
@@ -50,18 +44,6 @@ fn published_session_turn_item_from_sidecar(
         turn_id: turn.turn_id,
         turn_seq: turn.turn_seq,
         item,
-    })
-}
-
-pub(crate) fn current_session_turn_identity(
-    session_store: &SessionStore,
-    session_id: &SessionId,
-) -> Option<SessionTurnIdentity> {
-    let sidecar = session_store.runtime_sidecar(session_id)?;
-    let turn = sidecar.current_turn.as_ref()?;
-    Some(SessionTurnIdentity {
-        turn_id: turn.turn_id.clone(),
-        turn_seq: turn.turn_seq,
     })
 }
 

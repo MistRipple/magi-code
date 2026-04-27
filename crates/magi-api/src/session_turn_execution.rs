@@ -3,8 +3,8 @@ use crate::{
     prompt_utils::normalize_model_visible_content,
     session_turn_writeback::{
         append_session_tool_call_items, append_session_turn_error_item, append_session_turn_item,
-        build_completed_turn_timeline_snapshot, current_session_turn_identity,
-        publish_session_turn_item_event, session_turn_item, upsert_session_turn_item,
+        build_completed_turn_timeline_snapshot, publish_session_turn_item_event, session_turn_item,
+        upsert_session_turn_item,
     },
     settings_store::SettingsStore,
     usage_recording::{
@@ -14,8 +14,8 @@ use crate::{
 use magi_bridge_client::{
     ChatMessage, ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest, ModelStreamingDelta,
 };
-use magi_core::{EventId, SessionId, UtcMillis, WorkspaceId};
-use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
+use magi_core::{SessionId, UtcMillis, WorkspaceId};
+use magi_event_bus::InMemoryEventBus;
 use magi_session_store::{SessionStore, TimelineEntryKind};
 use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
@@ -76,11 +76,6 @@ pub(crate) fn run_session_turn_execution(
     } = runtime;
 
     append_phase_item(event_bus, session_store, &request);
-    let turn_identity = current_session_turn_identity(session_store, &request.session_id)
-        .ok_or_else(|| {
-            ApiError::internal_assembly("执行 session turn 失败", "current turn identity missing")
-        })?;
-
     let mut messages = vec![ChatMessage {
         role: "user".to_string(),
         content: Some(prompt.clone()),
@@ -105,7 +100,6 @@ pub(crate) fn run_session_turn_execution(
                 tools: tools.clone(),
                 messages: &mut messages,
                 round,
-                turn_identity: &turn_identity,
             },
             tool_registry,
             skill_runtime,
@@ -184,7 +178,6 @@ struct SessionTurnRoundRuntime<'a> {
     tools: Option<Vec<ChatToolDefinition>>,
     messages: &'a mut Vec<ChatMessage>,
     round: usize,
-    turn_identity: &'a crate::session_turn_writeback::SessionTurnIdentity,
 }
 
 struct SessionTurnRoundOutput {
@@ -209,7 +202,6 @@ fn stream_session_turn_round(
         tools,
         messages,
         round,
-        turn_identity,
     } = runtime;
 
     let stream_item_id = format!(
