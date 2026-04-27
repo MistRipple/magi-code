@@ -12,10 +12,6 @@ function normalizeNonNegativeInteger(value: number | null | undefined): number |
   return normalized >= 0 ? normalized : null;
 }
 
-function normalizePositiveInteger(value: number | null | undefined): number | null {
-  const normalized = normalizeNonNegativeInteger(value);
-  return normalized !== null && normalized > 0 ? normalized : null;
-}
 
 export function resolveTimelineEventSeqFromMetadata(
   metadata: Record<string, unknown> | undefined,
@@ -83,25 +79,6 @@ export function resolveTimelineSemanticMessageType(
     ? metadata.originMessageType.trim()
     : '';
   return originMessageType || messageType;
-}
-
-export function resolveStableTimelinePlacementTimestamp(
-  currentTimestamp: number | undefined,
-  incomingTimestamp: number | undefined,
-): number {
-  const existing = normalizePositiveInteger(currentTimestamp) || 0;
-  if (existing > 0) {
-    return existing;
-  }
-  return normalizePositiveInteger(incomingTimestamp) || 0;
-}
-
-export function resolveTimelineDetailedVersionFromMetadata(
-  metadata: Record<string, unknown> | undefined,
-): number {
-  const eventSeq = resolveTimelineEventSeqFromMetadata(metadata);
-  const blockSeq = resolveTimelineBlockSeqFromMetadata(metadata);
-  return (eventSeq * 1_000_000) + blockSeq;
 }
 
 export function resolveTimelineAnchorTimestampFromMetadata(
