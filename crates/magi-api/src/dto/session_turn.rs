@@ -108,6 +108,8 @@ pub struct SessionTurnResponseDto {
     pub action_task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution_chain_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_message_item_id: Option<String>,
 }
 
 impl SessionTurnResponseDto {
@@ -121,6 +123,7 @@ impl SessionTurnResponseDto {
         root_task_id: Option<TaskId>,
         action_task_id: Option<TaskId>,
         execution_chain_ref: Option<String>,
+        user_message_item_id: Option<String>,
     ) -> Self {
         Self {
             session_id: session_id.to_string(),
@@ -132,6 +135,7 @@ impl SessionTurnResponseDto {
             root_task_id: root_task_id.map(|task_id| task_id.to_string()),
             action_task_id: action_task_id.map(|task_id| task_id.to_string()),
             execution_chain_ref,
+            user_message_item_id,
         }
     }
 }

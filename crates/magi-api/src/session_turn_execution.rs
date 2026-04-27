@@ -2,10 +2,9 @@ use crate::{
     errors::ApiError,
     prompt_utils::normalize_model_visible_content,
     session_turn_writeback::{
-        append_session_tool_call_items, append_session_turn_error_item,
-        append_session_turn_item, current_session_turn_identity,
-        build_completed_turn_timeline_snapshot, publish_session_turn_item_event, session_turn_item,
-        upsert_session_turn_item,
+        append_session_tool_call_items, append_session_turn_error_item, append_session_turn_item,
+        build_completed_turn_timeline_snapshot, current_session_turn_identity,
+        publish_session_turn_item_event, session_turn_item, upsert_session_turn_item,
     },
     settings_store::SettingsStore,
     usage_recording::{
@@ -158,7 +157,10 @@ pub(crate) fn run_session_turn_execution(
             failure_reason,
             last_streaming_entry_id.as_deref(),
         );
-        return Err(ApiError::model_invocation_failed("执行 session turn 失败", failure_reason));
+        return Err(ApiError::model_invocation_failed(
+            "执行 session turn 失败",
+            failure_reason,
+        ));
     };
     append_final_item(
         event_bus,
@@ -287,28 +289,6 @@ fn stream_session_turn_round(
             TimelineEntryKind::AssistantMessage,
             accumulated,
         );
-        let delta = &accumulated[previous..];
-        if delta.is_empty() {
-            return;
-        }
-        let _ = event_bus.publish(
-            EventEnvelope::domain(
-                EventId::new(format!("event-session-delta-{}", UtcMillis::now().0)),
-                "task.llm.delta",
-                serde_json::json!({
-                    "session_id": request.session_id.to_string(),
-                    "entry_id": &stream_item_id,
-                    "turn_id": turn_identity.turn_id.clone(),
-                    "turn_seq": turn_identity.turn_seq,
-                    "delta": delta,
-                }),
-            )
-            .with_context(EventContext {
-                workspace_id: request.workspace_id.clone(),
-                session_id: Some(request.session_id.clone()),
-                ..EventContext::default()
-            }),
-        );
     };
 
     let response = client
@@ -384,24 +364,6 @@ fn stream_session_turn_round(
                 &published,
             );
         }
-        let _ = event_bus.publish(
-            EventEnvelope::domain(
-                EventId::new(format!("event-session-seal-{}", UtcMillis::now().0)),
-                "task.llm.completed",
-                serde_json::json!({
-                    "session_id": request.session_id.to_string(),
-                    "entry_id": &stream_item_id,
-                    "turn_id": turn_identity.turn_id.clone(),
-                    "turn_seq": turn_identity.turn_seq,
-                    "response_length": streamed_content.len(),
-                }),
-            )
-            .with_context(EventContext {
-                workspace_id: request.workspace_id.clone(),
-                session_id: Some(request.session_id.clone()),
-                ..EventContext::default()
-            }),
-        );
     }
 
     if request.use_tools && !parsed.tool_calls.is_empty() {

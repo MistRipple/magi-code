@@ -1547,8 +1547,14 @@ mod tests {
                     return false;
                 };
                 turn.status == "failed"
-                    && turn.items.iter().any(|item| item.kind == "tool_call_started")
-                    && turn.items.iter().any(|item| item.kind == "tool_call_result")
+                    && turn
+                        .items
+                        .iter()
+                        .any(|item| item.kind == "tool_call_started")
+                    && turn
+                        .items
+                        .iter()
+                        .any(|item| item.kind == "tool_call_result")
                     && turn.items.iter().any(|item| item.kind == "assistant_error")
                     && !turn.items.iter().any(|item| item.kind == "assistant_final")
             },
@@ -2257,12 +2263,6 @@ mod tests {
             .expect("tool.invoked event should exist");
         assert_eq!(tool_audit_event.session_id, owning_session);
         assert_ne!(tool_audit_event.session_id, switched_session);
-
-        let llm_completed_event = events
-            .iter()
-            .find(|event| event.event_type == "task.llm.completed")
-            .expect("task.llm.completed event should exist");
-        assert_eq!(llm_completed_event.session_id, owning_session);
     }
 
     #[tokio::test]

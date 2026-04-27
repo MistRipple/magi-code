@@ -320,7 +320,7 @@ pub(crate) fn run_shadow_dispatch_submission(
                 user_message_id: None,
                 placeholder_message_id: None,
                 timeline_entry_id: Some(entry_id.to_string()),
-                thread_visible: true,
+                thread_visible: !request.deep_task,
                 worker_visible: false,
             },
             ActiveExecutionTurnItem {

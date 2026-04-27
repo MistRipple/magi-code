@@ -6,8 +6,8 @@ use crate::{
 };
 use magi_bridge_client::{ChatMessage, ChatToolCall};
 use magi_core::{
-    ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId, TaskId,
-    ToolCallId, UtcMillis, WorkspaceId,
+    ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId, TaskId, ToolCallId,
+    UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{
     EventContext, EventEnvelope, InMemoryEventBus, SessionRuntimeTurnItemSummaryEntry,

@@ -1,12 +1,15 @@
 use crate::{
     session_turn_writeback::{
-        append_session_turn_error_item, append_session_turn_item,
-        build_completed_turn_timeline_snapshot, current_session_turn_identity,
-        publish_session_turn_item_event, session_turn_item, upsert_session_turn_item,
+        append_session_turn_item, build_completed_turn_timeline_snapshot,
+        current_session_turn_identity, publish_session_turn_item_event, session_turn_item,
+        upsert_session_turn_item,
     },
     settings_store::SettingsStore,
     skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime},
-    tool_result_utils::{infer_tool_call_status, summarize_tool_result},
+    tool_result_utils::{
+        infer_tool_call_status, summarize_tool_result, tool_execution_status_label,
+        turn_item_status_for_tool_result,
+    },
     usage_recording::{ModelUsageBinding, publish_model_usage_record},
 };
 use magi_bridge_client::{
@@ -14,13 +17,16 @@ use magi_bridge_client::{
     ModelStreamingDelta, SHADOW_MODEL_PROVIDER,
 };
 use magi_core::{
-    ApprovalRequirement, EventId, LeaseId, RiskLevel, SessionId, TaskId, ToolCallId, UtcMillis,
-    WorkspaceId,
+    ApprovalRequirement, EventId, ExecutionResultStatus, LeaseId, RiskLevel, SessionId, TaskId,
+    ToolCallId, UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::ToolKind;
-use magi_orchestrator::{ExecutionContextSummary, task_runner::TaskOutcome, task_store::TaskStore};
-use magi_session_store::{SessionStore, TimelineEntryKind};
+use magi_orchestrator::{
+    ExecutionContextSummary, task_runner::TaskOutcome, task_store::TaskStore,
+    task_worker_catalog::resolve_task_role,
+};
+use magi_session_store::{ActiveExecutionTurnItem, SessionStore, TimelineEntryKind};
 use magi_tool_runtime::{
     ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
 };
@@ -48,6 +54,43 @@ pub(crate) struct TaskLlmLoopRequest<'a> {
     pub streaming_entry_id: Option<&'a str>,
     pub context_summary: Option<ExecutionContextSummary>,
     pub system_prompt: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct TaskTurnVisibility {
+    thread_visible: bool,
+    worker_visible: bool,
+    role_id: Option<String>,
+}
+
+fn task_turn_visibility(task: &magi_core::Task, thread_visible: bool) -> TaskTurnVisibility {
+    let role_id = resolve_task_role(task)
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+        .map(ToOwned::to_owned);
+    TaskTurnVisibility {
+        thread_visible,
+        worker_visible: role_id.is_some(),
+        role_id,
+    }
+}
+
+fn apply_task_turn_visibility(
+    item: &mut ActiveExecutionTurnItem,
+    task: &magi_core::Task,
+    visibility: &TaskTurnVisibility,
+) {
+    item.task_id = Some(task.task_id.clone());
+    item.thread_visible = visibility.thread_visible;
+    item.worker_visible = visibility.worker_visible;
+    if visibility.worker_visible {
+        item.lane_id = Some(format!("lane-{}", task.task_id));
+        item.lane_seq = Some(1);
+    }
+    if let Some(role_id) = visibility.role_id.as_ref() {
+        item.role_id = Some(role_id.clone());
+        item.source = role_id.clone();
+    }
 }
 
 pub(crate) fn run_task_llm_loop(
@@ -104,10 +147,15 @@ pub(crate) fn run_task_llm_loop(
     let mut last_stream_item_id: Option<String> = None;
     let turn_identity = current_session_turn_identity(session_store, session_id);
     let mut had_tool_calls = false;
+    let turn_visibility = task_turn_visibility(
+        task,
+        streaming_entry_id.is_some()
+            || task_is_thread_visible_turn_owner(session_store, session_id, task_id),
+    );
 
     for round in 0..MAX_TOOL_CALL_ROUNDS {
-        let should_record_turn_artifacts = streaming_entry_id.is_some()
-            || task_is_thread_visible_turn_owner(session_store, session_id, task_id);
+        let should_record_turn_artifacts =
+            turn_visibility.thread_visible || turn_visibility.worker_visible;
         let thinking_item_id = format!("turn-item-assistant-thinking-{task_id}-{round}");
         let stream_item_id = format!("turn-item-assistant-stream-{task_id}-{round}");
         last_stream_item_id = Some(stream_item_id.clone());
@@ -136,6 +184,7 @@ pub(crate) fn run_task_llm_loop(
                         &thinking_item_id,
                         &last_thinking_len,
                         &streamed_thinking,
+                        &turn_visibility,
                         &delta.thinking,
                     );
                 }
@@ -148,6 +197,7 @@ pub(crate) fn run_task_llm_loop(
                     &stream_item_id,
                     turn_identity.as_ref(),
                     &task_context,
+                    &turn_visibility,
                     &task_id_str,
                     &mission_id_str,
                     &last_sent_len,
@@ -203,6 +253,7 @@ pub(crate) fn run_task_llm_loop(
                     session_id,
                     workspace_id,
                     &thinking_item_id,
+                    &turn_visibility,
                     "completed",
                     &thinking,
                 );
@@ -230,17 +281,6 @@ pub(crate) fn run_task_llm_loop(
         }
 
         if parsed.tool_calls.is_empty() {
-            publish_task_llm_completed(
-                event_bus,
-                task,
-                session_id,
-                workspace_id,
-                turn_identity.as_ref(),
-                streaming_entry_id.or(last_stream_item_id.as_deref()),
-                final_content.len(),
-                round + 1,
-                &task_context,
-            );
             break;
         }
 
@@ -252,7 +292,18 @@ pub(crate) fn run_task_llm_loop(
         });
 
         for tool_call in &parsed.tool_calls {
-            let result = execute_task_tool_call(
+            if should_record_turn_artifacts {
+                append_task_tool_call_started_turn_item(
+                    event_bus,
+                    session_store,
+                    task,
+                    session_id,
+                    workspace_id,
+                    &turn_visibility,
+                    tool_call,
+                );
+            }
+            let (result, tool_status) = execute_task_tool_call(
                 event_bus,
                 tool_registry,
                 skill_runtime,
@@ -261,6 +312,19 @@ pub(crate) fn run_task_llm_loop(
                 workspace_id,
                 tool_call,
             );
+            if should_record_turn_artifacts {
+                append_task_tool_call_result_turn_item(
+                    event_bus,
+                    session_store,
+                    task,
+                    session_id,
+                    workspace_id,
+                    &turn_visibility,
+                    tool_call,
+                    &result,
+                    tool_status,
+                );
+            }
             tool_call_records.push(tool_call_record(tool_call, &result));
             messages.push(ChatMessage {
                 role: "tool".to_string(),
@@ -277,16 +341,14 @@ pub(crate) fn run_task_llm_loop(
         } else {
             "模型未返回可显示回复"
         };
-        if streaming_entry_id.is_some() || task_is_thread_visible_turn_owner(session_store, session_id, task_id) {
-            append_session_turn_error_item(
+        if turn_visibility.thread_visible || turn_visibility.worker_visible {
+            append_task_error_turn_item(
                 event_bus,
                 session_store,
+                task,
                 session_id,
                 workspace_id,
-                Some(task_id),
-                None,
-                None,
-                None,
+                &turn_visibility,
                 failure_reason,
                 streaming_entry_id.or(last_stream_item_id.as_deref()),
             );
@@ -307,9 +369,7 @@ pub(crate) fn run_task_llm_loop(
             context_summary,
         );
     }
-    if streaming_entry_id.is_some()
-        || task_is_thread_visible_turn_owner(session_store, session_id, task_id)
-    {
+    if turn_visibility.thread_visible || turn_visibility.worker_visible {
         append_task_final_turn_item(
             event_bus,
             session_store,
@@ -318,6 +378,7 @@ pub(crate) fn run_task_llm_loop(
             workspace_id,
             &final_content,
             streaming_entry_id.or(last_stream_item_id.as_deref()),
+            &turn_visibility,
         );
     }
 
@@ -376,17 +437,20 @@ fn publish_stream_delta(
     entry_id: &str,
     turn_identity: Option<&crate::session_turn_writeback::SessionTurnIdentity>,
     task_context: &EventContext,
+    turn_visibility: &TaskTurnVisibility,
     task_id: &str,
     mission_id: &str,
     last_sent_len: &std::cell::Cell<usize>,
     accumulated_text: &str,
 ) {
-    session_store.upsert_timeline_entry(
-        session_id.clone(),
-        entry_id,
-        TimelineEntryKind::AssistantMessage,
-        accumulated_text,
-    );
+    if turn_visibility.thread_visible {
+        session_store.upsert_timeline_entry(
+            session_id.clone(),
+            entry_id,
+            TimelineEntryKind::AssistantMessage,
+            accumulated_text,
+        );
+    }
     let mut item = session_turn_item(
         "assistant_stream",
         "running",
@@ -394,34 +458,10 @@ fn publish_stream_delta(
         Some(accumulated_text.to_string()),
         Some(entry_id.to_string()),
     );
-    item.task_id = Some(task.task_id.clone());
+    apply_task_turn_visibility(&mut item, task, turn_visibility);
     if let Some(published) = upsert_session_turn_item(session_store, session_id, item) {
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
-
-    let previous_len = last_sent_len.get();
-    let delta = &accumulated_text[previous_len..];
-    if delta.is_empty() {
-        return;
-    }
-    last_sent_len.set(accumulated_text.len());
-
-    let _ = event_bus.publish(
-        EventEnvelope::domain(
-            EventId::new(format!("event-task-llm-delta-{}", UtcMillis::now().0)),
-            "task.llm.delta",
-            serde_json::json!({
-                "task_id": task_id,
-                "mission_id": mission_id,
-                "session_id": session_id.to_string(),
-                "entry_id": entry_id,
-                "turn_id": turn_identity.map(|turn| turn.turn_id.clone()),
-                "turn_seq": turn_identity.map(|turn| turn.turn_seq),
-                "delta": delta,
-            }),
-        )
-        .with_context(task_context.clone()),
-    );
 }
 
 fn publish_task_thinking_delta(
@@ -433,6 +473,7 @@ fn publish_task_thinking_delta(
     item_id: &str,
     last_sent_len: &std::cell::Cell<usize>,
     streamed_thinking: &std::cell::RefCell<String>,
+    turn_visibility: &TaskTurnVisibility,
     accumulated_thinking: &str,
 ) {
     if accumulated_thinking.len() <= last_sent_len.get() {
@@ -451,6 +492,7 @@ fn publish_task_thinking_delta(
         session_id,
         workspace_id,
         item_id,
+        turn_visibility,
         "running",
         accumulated_thinking,
     );
@@ -463,6 +505,7 @@ fn upsert_task_thinking_turn_item(
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     item_id: &str,
+    turn_visibility: &TaskTurnVisibility,
     status: &str,
     thinking: &str,
 ) {
@@ -477,41 +520,68 @@ fn upsert_task_thinking_turn_item(
         Some(trimmed.to_string()),
         Some(item_id.to_string()),
     );
-    item.task_id = Some(task.task_id.clone());
+    apply_task_turn_visibility(&mut item, task, turn_visibility);
     if let Some(published) = upsert_session_turn_item(session_store, session_id, item) {
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
 }
 
-fn publish_task_llm_completed(
+fn append_task_tool_call_started_turn_item(
     event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
-    turn_identity: Option<&crate::session_turn_writeback::SessionTurnIdentity>,
-    streaming_entry_id: Option<&str>,
-    response_length: usize,
-    rounds: usize,
-    task_context: &EventContext,
+    turn_visibility: &TaskTurnVisibility,
+    tool_call: &ChatToolCall,
 ) {
-    let _ = event_bus.publish(
-        EventEnvelope::domain(
-            EventId::new(format!("event-task-llm-completed-{}", UtcMillis::now().0)),
-            "task.llm.completed",
-            serde_json::json!({
-                "task_id": task.task_id.to_string(),
-                "mission_id": task.mission_id.to_string(),
-                "session_id": session_id.to_string(),
-                "workspace_id": workspace_id.as_ref().map(ToString::to_string),
-                "entry_id": streaming_entry_id,
-                "turn_id": turn_identity.map(|turn| turn.turn_id.clone()),
-                "turn_seq": turn_identity.map(|turn| turn.turn_seq),
-                "response_length": response_length,
-                "rounds": rounds,
-            }),
-        )
-        .with_context(task_context.clone()),
+    let mut item = session_turn_item(
+        "tool_call_started",
+        "running",
+        Some(tool_call.function.name.clone()),
+        Some(format!("正在调用工具：{}", tool_call.function.name)),
+        Some(format!("turn-item-tool-started-{}", tool_call.id)),
     );
+    apply_task_turn_visibility(&mut item, task, turn_visibility);
+    item.tool_call_id = Some(tool_call.id.clone());
+    item.tool_name = Some(tool_call.function.name.clone());
+    item.tool_arguments = Some(tool_call.function.arguments.clone());
+    if let Some(published) = append_session_turn_item(session_store, session_id, item) {
+        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+    }
+}
+
+fn append_task_tool_call_result_turn_item(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    turn_visibility: &TaskTurnVisibility,
+    tool_call: &ChatToolCall,
+    tool_result: &str,
+    tool_status: ExecutionResultStatus,
+) {
+    let status_label = tool_execution_status_label(tool_status);
+    let mut item = session_turn_item(
+        "tool_call_result",
+        turn_item_status_for_tool_result(tool_status),
+        Some(tool_call.function.name.clone()),
+        Some(summarize_tool_result(tool_result)),
+        Some(format!("turn-item-tool-result-{}", tool_call.id)),
+    );
+    apply_task_turn_visibility(&mut item, task, turn_visibility);
+    item.tool_call_id = Some(tool_call.id.clone());
+    item.tool_name = Some(tool_call.function.name.clone());
+    item.tool_status = Some(status_label.to_string());
+    item.tool_arguments = Some(tool_call.function.arguments.clone());
+    item.tool_result = Some(tool_result.to_string());
+    if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
+        item.tool_error = Some(tool_result.to_string());
+    }
+    if let Some(published) = append_session_turn_item(session_store, session_id, item) {
+        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+    }
 }
 
 fn execute_task_tool_call(
@@ -522,9 +592,12 @@ fn execute_task_tool_call(
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     tool_call: &ChatToolCall,
-) -> String {
+) -> (String, ExecutionResultStatus) {
     let Some(registry) = tool_registry else {
-        return serde_json::json!({ "error": "tool registry not available" }).to_string();
+        return (
+            serde_json::json!({ "error": "tool registry not available" }).to_string(),
+            ExecutionResultStatus::Failed,
+        );
     };
 
     let _ = event_bus.publish(
@@ -550,9 +623,7 @@ fn execute_task_tool_call(
     );
 
     if tool_call.function.name == SKILL_APPLY_TOOL_NAME {
-        let (payload, _) =
-            execute_skill_apply_from_runtime(&tool_call.function.arguments, skill_runtime);
-        return payload;
+        return execute_skill_apply_from_runtime(&tool_call.function.arguments, skill_runtime);
     }
 
     let output = registry.execute_with_policy(
@@ -573,7 +644,7 @@ fn execute_task_tool_call(
         &ToolExecutionPolicy::default(),
     );
 
-    output.payload
+    (output.payload, output.status)
 }
 
 fn tool_call_record(tool_call: &ChatToolCall, result: &str) -> serde_json::Value {
@@ -600,6 +671,7 @@ fn append_task_final_turn_item(
     workspace_id: &Option<WorkspaceId>,
     final_content: &str,
     streaming_entry_id: Option<&str>,
+    turn_visibility: &TaskTurnVisibility,
 ) {
     let mut final_item = session_turn_item(
         "assistant_final",
@@ -608,7 +680,7 @@ fn append_task_final_turn_item(
         Some(final_content.to_string()),
         streaming_entry_id.map(str::to_string),
     );
-    final_item.task_id = Some(task.task_id.clone());
+    apply_task_turn_visibility(&mut final_item, task, turn_visibility);
     if streaming_entry_id.is_some() {
         if let Some(published) = upsert_session_turn_item(session_store, session_id, final_item) {
             publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
@@ -617,22 +689,65 @@ fn append_task_final_turn_item(
     {
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
-    let _ = session_store.update_current_turn_status(session_id, "completed");
-    let timeline_message = build_completed_turn_timeline_snapshot(
-        session_store,
-        session_id,
-        Some(final_content),
-        streaming_entry_id,
-    )
-    .unwrap_or_else(|| final_content.to_string());
-    let fallback_entry_id = format!("timeline-turn-snapshot-{}", task.task_id);
-    let entry_id = streaming_entry_id.unwrap_or(fallback_entry_id.as_str());
-    session_store.upsert_timeline_entry(
-        session_id.clone(),
-        entry_id,
-        TimelineEntryKind::AssistantMessage,
-        timeline_message,
+    if turn_visibility.thread_visible {
+        let _ = session_store.update_current_turn_status(session_id, "completed");
+        let timeline_message = build_completed_turn_timeline_snapshot(
+            session_store,
+            session_id,
+            Some(final_content),
+            streaming_entry_id,
+        )
+        .unwrap_or_else(|| final_content.to_string());
+        let fallback_entry_id = format!("timeline-turn-snapshot-{}", task.task_id);
+        let entry_id = streaming_entry_id.unwrap_or(fallback_entry_id.as_str());
+        session_store.upsert_timeline_entry(
+            session_id.clone(),
+            entry_id,
+            TimelineEntryKind::AssistantMessage,
+            timeline_message,
+        );
+    }
+}
+
+fn append_task_error_turn_item(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    turn_visibility: &TaskTurnVisibility,
+    error_text: &str,
+    streaming_entry_id: Option<&str>,
+) {
+    let mut error_item = session_turn_item(
+        "assistant_error",
+        "failed",
+        Some("回复生成失败".to_string()),
+        Some(error_text.to_string()),
+        Some(format!("turn-item-assistant-error-{}", UtcMillis::now().0)),
     );
+    apply_task_turn_visibility(&mut error_item, task, turn_visibility);
+    if let Some(published) = append_session_turn_item(session_store, session_id, error_item) {
+        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+    }
+    if turn_visibility.thread_visible {
+        let _ = session_store.update_current_turn_status(session_id, "failed");
+        let timeline_message = build_completed_turn_timeline_snapshot(
+            session_store,
+            session_id,
+            Some(error_text),
+            streaming_entry_id,
+        )
+        .unwrap_or_else(|| error_text.to_string());
+        let fallback_entry_id = format!("timeline-turn-snapshot-error-{}", task.task_id);
+        let entry_id = streaming_entry_id.unwrap_or(fallback_entry_id.as_str());
+        session_store.upsert_timeline_entry(
+            session_id.clone(),
+            entry_id,
+            TimelineEntryKind::AssistantMessage,
+            timeline_message,
+        );
+    }
 }
 
 fn build_output_content(

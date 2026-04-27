@@ -97,7 +97,7 @@ impl ApiError {
         }
     }
 
-    fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         match self {
             ApiError::InvalidInput(message) => message,
             ApiError::SessionNotFound(message) => message,

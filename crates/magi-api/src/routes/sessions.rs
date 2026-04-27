@@ -102,6 +102,7 @@ async fn submit_session_turn(
                 .session_store
                 .runtime_sidecar(&accepted.session_id)
                 .and_then(|sidecar| sidecar.ownership.execution_chain_ref);
+            let user_message_item_id = format!("turn-item-user-{}", accepted.accepted_at.0);
             Ok(Json(SessionTurnResponseDto::new(
                 accepted.session_id,
                 accepted.entry_id,
@@ -112,6 +113,7 @@ async fn submit_session_turn(
                 Some(accepted.root_task_id),
                 Some(accepted.action_task_id),
                 execution_chain_ref,
+                Some(user_message_item_id),
             )))
         }
         SessionTurnRouteDto::Continue => {
@@ -132,6 +134,9 @@ async fn submit_session_turn(
             finalize_continue_session(state.clone(), accepted.clone(), accepted_at);
             state.persist_runtime_durable_state()?;
             let event_id = publish_session_turn_continue_event(&state, &accepted, accepted_at)?;
+            let user_message_item_id = prompt_text
+                .as_ref()
+                .map(|_| format!("turn-item-user-{}", accepted_at.0));
             Ok(Json(SessionTurnResponseDto::new(
                 accepted.session_id,
                 format!("timeline-{}-{}", session_id, accepted_at.0),
@@ -142,6 +147,7 @@ async fn submit_session_turn(
                 Some(accepted.root_task_id),
                 Some(accepted.action_task_id),
                 Some(accepted.execution_chain_ref),
+                user_message_item_id,
             )))
         }
     }
@@ -393,6 +399,10 @@ fn submit_regular_session_turn(
     let request_id = request.request_id();
     let user_message_id = request.user_message_id();
     let placeholder_message_id = request.placeholder_message_id();
+    // 使用前端传入的 userMessageId 作为 canonical item_id，确保前端乐观节点与后端流式更新使用同一 ID
+    let user_message_item_id = user_message_id
+        .clone()
+        .unwrap_or_else(|| format!("turn-item-user-{}", accepted_at.0));
     let mut turn = ActiveExecutionTurn {
         turn_id: format!("turn-session-{}", accepted_at.0),
         turn_seq: accepted_at.0 as u64,
@@ -401,7 +411,7 @@ fn submit_regular_session_turn(
         completed_at: None,
         user_message: Some(message.clone()),
         items: vec![ActiveExecutionTurnItem {
-            item_id: format!("turn-item-user-{}", accepted_at.0),
+            item_id: user_message_item_id.clone(),
             item_seq: 1,
             lane_id: None,
             lane_seq: None,
@@ -475,6 +485,7 @@ fn submit_regular_session_turn(
         None,
         None,
         None,
+        Some(user_message_item_id),
     ))
 }
 
@@ -557,7 +568,7 @@ fn spawn_regular_session_turn_execution(
                         json!({
                             "session_id": session_id.to_string(),
                             "route": route,
-                            "error": format!("{error:?}"),
+                            "error": error.message().to_string(),
                         }),
                     )
                     .with_context(EventContext {
