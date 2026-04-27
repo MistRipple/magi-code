@@ -194,8 +194,6 @@ export interface RequestResponseBinding {
   requestId: string;
   /** 用户消息 ID */
   userMessageId: string;
-  /** 占位消息 ID（前端生成） */
-  placeholderMessageId: string;
   /** 真实响应消息 ID（后端生成） */
   realMessageId?: string;
   /** 创建时间戳 */

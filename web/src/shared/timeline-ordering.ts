@@ -1,11 +1,7 @@
 export interface TimelineSemanticOrderInput {
-  timestamp: number;
-  stableId: string;
-  turnSeq?: number;
-  itemSeq?: number;
-  laneSeq?: number;
-  anchorEventSeq?: number;
-  blockSeq?: number;
+  turnSeq: number;
+  itemSeq: number;
+  displayOrder: number;
 }
 
 function normalizeNonNegativeInteger(value: number | null | undefined): number | null {
@@ -19,16 +15,6 @@ function normalizeNonNegativeInteger(value: number | null | undefined): number |
 function normalizePositiveInteger(value: number | null | undefined): number | null {
   const normalized = normalizeNonNegativeInteger(value);
   return normalized !== null && normalized > 0 ? normalized : null;
-}
-
-export function resolveTimelineAnchorTimestampFromMetadata(
-  metadata: Record<string, unknown> | undefined,
-): number | null {
-  const direct = metadata?.timelineAnchorTimestamp;
-  if (typeof direct === 'number' && Number.isFinite(direct) && direct > 0) {
-    return Math.floor(direct);
-  }
-  return null;
 }
 
 export function resolveTimelineEventSeqFromMetadata(
@@ -78,16 +64,6 @@ export function resolveTimelineBlockSeqFromMetadata(
   return resolveNonNegativeMetadataNumber(metadata, 'blockSeq');
 }
 
-export function resolveTimelineSemanticMessageType(
-  messageType: string | undefined,
-  metadata: Record<string, unknown> | undefined,
-): string | undefined {
-  const originMessageType = typeof metadata?.originMessageType === 'string'
-    ? metadata.originMessageType.trim()
-    : '';
-  return originMessageType || messageType;
-}
-
 export function resolveTimelineCardStreamSeqFromMetadata(
   metadata: Record<string, unknown> | undefined,
 ): number {
@@ -99,29 +75,16 @@ export function resolveTimelineCardStreamSeqFromMetadata(
   return normalized > 0 ? normalized : 0;
 }
 
-export function resolveTimelineSortTimestamp(
-  timestamp: number | undefined,
+export function resolveTimelineSemanticMessageType(
+  messageType: string | undefined,
   metadata: Record<string, unknown> | undefined,
-): number {
-  const anchorTimestamp = resolveTimelineAnchorTimestampFromMetadata(metadata);
-  if (anchorTimestamp !== null) {
-    return anchorTimestamp;
-  }
-  return typeof timestamp === 'number' && Number.isFinite(timestamp)
-    ? Math.floor(timestamp)
-    : 0;
+): string | undefined {
+  const originMessageType = typeof metadata?.originMessageType === 'string'
+    ? metadata.originMessageType.trim()
+    : '';
+  return originMessageType || messageType;
 }
 
-/**
- * 时间轴节点一旦首次落位，就必须冻结其排序时间锚点。
- *
- * 这里不再做“取更早时间”的回溯修正，因为那会导致节点在 live 过程中
- * 因后续消息到达而发生重新排序，破坏“首次落位即定点”的产品约束。
- *
- * 规则：
- * - 已有有效时间锚点：直接保留
- * - 尚未建立有效时间锚点：采用本次 incoming 时间
- */
 export function resolveStableTimelinePlacementTimestamp(
   currentTimestamp: number | undefined,
   incomingTimestamp: number | undefined,
@@ -133,18 +96,37 @@ export function resolveStableTimelinePlacementTimestamp(
   return normalizePositiveInteger(incomingTimestamp) || 0;
 }
 
-export function resolveTimelineVersionFromMetadata(
-  metadata: Record<string, unknown> | undefined,
-): number {
-  return resolveTimelineEventSeqFromMetadata(metadata);
-}
-
 export function resolveTimelineDetailedVersionFromMetadata(
   metadata: Record<string, unknown> | undefined,
 ): number {
   const eventSeq = resolveTimelineEventSeqFromMetadata(metadata);
   const blockSeq = resolveTimelineBlockSeqFromMetadata(metadata);
   return (eventSeq * 1_000_000) + blockSeq;
+}
+
+export function resolveTimelineAnchorTimestampFromMetadata(
+  metadata: Record<string, unknown> | undefined,
+): number | null {
+  const direct = metadata?.timelineAnchorTimestamp;
+  if (typeof direct === 'number' && Number.isFinite(direct) && direct > 0) {
+    return Math.floor(direct);
+  }
+  return null;
+}
+
+export function resolveTimelineSortTimestamp(
+  timestamp: number | undefined,
+  _metadata?: Record<string, unknown> | undefined,
+): number {
+  return typeof timestamp === 'number' && Number.isFinite(timestamp)
+    ? Math.floor(timestamp)
+    : 0;
+}
+
+export function resolveTimelineVersionFromMetadata(
+  metadata: Record<string, unknown> | undefined,
+): number {
+  return resolveTimelineEventSeqFromMetadata(metadata);
 }
 
 function compareSharedFactOrder(
@@ -177,31 +159,10 @@ export function compareTimelineSemanticOrder(
     return itemOrder;
   }
 
-  const laneOrder = compareSharedFactOrder(
-    normalizePositiveInteger(left.laneSeq),
-    normalizePositiveInteger(right.laneSeq),
-  );
-  if (laneOrder !== null) {
-    return laneOrder;
+  // displayOrder 作为最终稳定排序键（本地创建序号，永不重算）
+  if (left.displayOrder !== right.displayOrder) {
+    return left.displayOrder - right.displayOrder;
   }
 
-  const leftAnchorEventSeq = normalizePositiveInteger(left.anchorEventSeq);
-  const rightAnchorEventSeq = normalizePositiveInteger(right.anchorEventSeq);
-  if (
-    leftAnchorEventSeq !== null
-    && rightAnchorEventSeq !== null
-    && leftAnchorEventSeq !== rightAnchorEventSeq
-  ) {
-    return leftAnchorEventSeq - rightAnchorEventSeq;
-  }
-
-  if (leftAnchorEventSeq !== null && rightAnchorEventSeq !== null) {
-    const leftBlockSeq = normalizeNonNegativeInteger(left.blockSeq) || 0;
-    const rightBlockSeq = normalizeNonNegativeInteger(right.blockSeq) || 0;
-    if (leftBlockSeq !== rightBlockSeq) {
-      return leftBlockSeq - rightBlockSeq;
-    }
-  }
-
-  return left.stableId.localeCompare(right.stableId);
+  return 0;
 }

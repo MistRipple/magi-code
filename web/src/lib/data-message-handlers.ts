@@ -6,7 +6,6 @@
 import type { ClientBridgeMessage } from '../shared/bridges/client-bridge';
 import {
   getState,
-  patchThreadPlaceholderMessage,
   setIsProcessing,
   setCurrentSessionId,
   getQueuedMessages,
@@ -40,7 +39,6 @@ import {
   setEnabledAgents,
   setSessionHistoryState,
   messagesState,
-  timelineProjectionConfirmsLocalAssistantResponse,
 } from '../stores/messages.svelte';
 import type {
   AppState, Message, Session,
@@ -236,27 +234,8 @@ export function handleUnifiedControlMessage(standard: StandardMessage) {
       break;
 
     case 'task_accepted': {
-      // 任务已被接受，但当前轮仍保持 pending request，
-      // 等权威 bootstrap / 流式消息接管后再自然清空，避免接受瞬间出现 processing 空窗。
-      const requestId = payload?.requestId as string | undefined;
-      if (requestId) {
-        // 更新占位消息状态：pending → received
-        const binding = getRequestBinding(requestId);
-        if (binding) {
-          const placeholder = getState().threadMessages.find(m => m.id === binding.placeholderMessageId);
-          const baseMetadata = (placeholder?.metadata && typeof placeholder.metadata === 'object')
-            ? placeholder.metadata
-            : {};
-          patchThreadPlaceholderMessage(binding.placeholderMessageId, {
-            metadata: {
-              ...baseMetadata,
-              isPlaceholder: true,
-              placeholderState: 'received',
-              requestId,
-            },
-          });
-        }
-      }
+      // 任务已被接受，当前轮保持 pending request，
+      // 等权威 bootstrap / 流式消息接管后再自然清空
       break;
     }
 
@@ -270,42 +249,11 @@ export function handleUnifiedControlMessage(standard: StandardMessage) {
 
       if (requestId) {
         clearPendingRequest(requestId);
-
         const binding = getRequestBinding(requestId);
         if (binding?.timeoutId) {
           clearTimeout(binding.timeoutId);
         }
-
         if (binding) {
-          const placeholderId = binding.placeholderMessageId;
-          const placeholder = getState().threadMessages.find((m) => m.id === placeholderId);
-
-          if (placeholder && placeholder.metadata?.isPlaceholder) {
-            const baseMetadata = (placeholder.metadata && typeof placeholder.metadata === 'object')
-              ? placeholder.metadata
-              : {};
-            patchThreadPlaceholderMessage(placeholderId, {
-              ...placeholder,
-              role: 'system',
-              source: 'orchestrator',
-              content: finalReason,
-              blocks: [{ type: 'text', content: finalReason }],
-              type: 'error',
-              noticeType: toastLevel,
-              isStreaming: false,
-              isComplete: true,
-              metadata: {
-                ...baseMetadata,
-                isPlaceholder: false,
-                wasPlaceholder: true,
-                placeholderState: undefined,
-                requestId,
-                ...(modelOriginIssue ? { modelOriginIssue: true } : {}),
-              },
-            });
-            markMessageComplete(placeholderId);
-          }
-
           clearRequestBinding(requestId);
         }
       }
@@ -319,42 +267,13 @@ export function handleUnifiedControlMessage(standard: StandardMessage) {
     }
 
     case 'task_started':
-      // 任务开始执行后由权威快照和实时流接管，不在这里额外抬升 processing。
-      {
-        const requestId = payload?.requestId as string | undefined;
-        if (requestId) {
-          const binding = getRequestBinding(requestId);
-          if (binding) {
-            const placeholder = getState().threadMessages.find(m => m.id === binding.placeholderMessageId);
-            const baseMetadata = (placeholder?.metadata && typeof placeholder.metadata === 'object')
-              ? placeholder.metadata
-              : {};
-            patchThreadPlaceholderMessage(binding.placeholderMessageId, {
-              metadata: {
-                ...baseMetadata,
-                isPlaceholder: true,
-                placeholderState: 'pending',
-                requestId,
-              },
-            });
-          }
-        }
-      }
+      // 任务开始执行后由权威快照和实时流接管
       break;
 
     case 'task_completed':
-    case 'task_failed': {
-      // 请求级终态不能再触发“全局封口”。
-      // 否则主线 placeholder 会在真实首答尚未到达时被前端提前删除，
-      // 造成线程里只剩 worker 卡、刷新后又从 restore 投影里重新出现的 live/restore 分叉。
-      //
-      // 统一约束：
-      // 1. 真实消息的结束由 unifiedComplete 负责；
-      // 2. 整个界面/会话的强制收口由 processingStateChanged(false, forced)
-      //    与恢复/切会话等显式场景负责；
-      // 3. task_rejected / 错误正文等用户可见消息可显式接管 placeholder。
+    case 'task_failed':
+      // 请求级终态由 unifiedComplete 和 processingStateChanged 处理
       break;
-    }
 
     case 'worker_status': {
       // Worker 状态更新：从控制消息同步状态到 UI
@@ -790,7 +709,6 @@ function isSettlingAssistantResponse(message: Message): boolean {
   if (
     message.role !== 'assistant'
     || message.source === 'system'
-    || message.metadata?.isPlaceholder === true
     || message.isStreaming === true
     || !hasRenderableAssistantContent(message)
   ) {
@@ -877,7 +795,7 @@ function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): voi
         ...(typeof responseDurationMs === 'number' ? { responseDurationMs } : {}),
       },
     });
-    markMessageComplete(binding.placeholderMessageId);
+    markMessageComplete(matchedAssistant.id);
     clearPendingRequest(binding.requestId);
     updateRequestBinding(binding.requestId, {
       realMessageId: matchedAssistant.id,
@@ -944,11 +862,9 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       const hadLiveTurnBeforeSnapshot = hasActiveLocalTurn();
       const authoritativeSnapshotIsIdle = state.isProcessing !== true
         && state.processingState?.isProcessing !== true;
-      const projectionConfirmsLocalAssistant = timelineProjectionConfirmsLocalAssistantResponse(timelineProjection);
       const projectionStillStreaming = projectionHasStreamingContent(timelineProjection);
       const preserveLocalTurnDuringStaleIdle = hadLiveTurnBeforeSnapshot
         && authoritativeSnapshotIsIdle
-        && !projectionConfirmsLocalAssistant
         && projectionStillStreaming;
 
       handleStateUpdate({

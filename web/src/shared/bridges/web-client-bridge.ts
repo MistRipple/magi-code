@@ -81,7 +81,6 @@ import type { ClientBridge, ClientBridgeMessage, SupportedLocale } from './clien
 import {
   createNotifyMessage,
   createUserInputMessage,
-  createStreamingMessage,
   generateMessageId,
   MessageCategory,
   MessageLifecycle,
@@ -114,12 +113,10 @@ import {
 } from '../../stores/task-graph-store.svelte';
 import { RustDaemonClient } from '../rust-daemon-client';
 import {
-  applyStreamingDelta,
   dequeueQueuedMessage,
   enqueueQueuedMessage,
   markQueuedMessageAsGuide,
   messagesState,
-  sealStreamingDelta,
 } from '../../stores/messages.svelte';
 import type { QueuedMessage } from '../../types/message';
 
@@ -153,21 +150,13 @@ let settingsBootstrapInFlight: Promise<void> | null = null;
 let recoveryAttempt = 0;
 let recoveryTimer: number | null = null;
 let recoveryInFlight: Promise<void> | null = null;
-let rustEventBootstrapRefreshTimer: number | null = null;
-// 活跃 turn 标记：从前端创建本地 live turn 到 session.turn.completed/failed 期间为 true。
-// 活跃期间禁止 SSE 事件触发 fetchBootstrap 轮询，仅允许终结事件做最终状态对齐。
-let activeTurnInFlight = false;
 interface ActiveTurnLiveContext {
   requestId: string;
   userMessageId: string;
-  placeholderMessageId: string;
-  currentAssistantMessageId: string;
-  route: 'chat' | 'execute' | 'task' | 'continue' | null;
 }
 let activeTurnLiveContext: ActiveTurnLiveContext | null = null;
 
 function clearActiveTurnInFlight(): void {
-  activeTurnInFlight = false;
   activeTurnLiveContext = null;
 }
 
@@ -943,12 +932,6 @@ function createSessionTurnItemStandardMessage(
       metadata.userMessageId = activeTurnLiveContext.userMessageId;
     }
   } else if (kind === 'assistant_stream' || kind === 'assistant_final') {
-    if (
-      activeTurnLiveContext?.route === 'task'
-      || activeTurnLiveContext?.route === 'continue'
-    ) {
-      return null;
-    }
     const assistantText = content.trim();
     if (!assistantText) {
       return null;
@@ -961,7 +944,6 @@ function createSessionTurnItemStandardMessage(
     if (activeTurnLiveContext) {
       metadata.requestId = activeTurnLiveContext.requestId;
       metadata.userMessageId = activeTurnLiveContext.userMessageId;
-      activeTurnLiveContext.currentAssistantMessageId = id;
     }
   } else if (kind === 'assistant_error') {
     const errorText = (content || title || '').trim();
@@ -976,7 +958,6 @@ function createSessionTurnItemStandardMessage(
     if (activeTurnLiveContext) {
       metadata.requestId = activeTurnLiveContext.requestId;
       metadata.userMessageId = activeTurnLiveContext.userMessageId;
-      activeTurnLiveContext.currentAssistantMessageId = id;
     }
   } else if (kind === 'tool_call_started' || kind === 'tool_call_result') {
     const toolCallId = readTurnItemString(item, 'toolCallId', 'tool_call_id') || itemId;
@@ -1049,22 +1030,6 @@ function handleSessionTurnItemEvent(event: RustEventEnvelope): boolean {
   return true;
 }
 
-function scheduleBootstrapRefreshFromRustEvent(reason: string): void {
-  if (typeof window === 'undefined') {
-    return;
-  }
-  if (rustEventBootstrapRefreshTimer !== null) {
-    return;
-  }
-  rustEventBootstrapRefreshTimer = window.setTimeout(() => {
-    rustEventBootstrapRefreshTimer = null;
-    void fetchBootstrap().catch((error) => {
-      reportExpectedRecoveryFailure('事件驱动同步', `[web-client-bridge] ${reason} 后 bootstrap 同步失败:`, error);
-      scheduleRecovery('rust_event_bootstrap_failed', error, true);
-    });
-  }, 50);
-}
-
 function shouldRefreshFromRustEvent(event: RustEventEnvelope): boolean {
   const eventWorkspaceId = trimBridgeString(event.workspace_id);
   if (eventWorkspaceId && currentWorkspaceId && eventWorkspaceId !== currentWorkspaceId) {
@@ -1094,51 +1059,6 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     }
   }
 
-  // ── 流式 delta 快速路径 ──
-  // 后端推送增量文本片段，前端追加到现有 timeline 节点，跳过 fetchBootstrap 轮询。
-  if (eventType === 'task.llm.delta' && event.payload) {
-    const deltaText = event.payload.delta;
-    const rawEntryId = event.payload.entry_id;
-    const deltaSessionId = trimBridgeString(event.payload.session_id);
-    const turnId = trimBridgeString(event.payload.turn_id) || trimBridgeString(event.payload.turnId);
-    const turnSeq = typeof event.payload.turn_seq === 'number' && Number.isFinite(event.payload.turn_seq)
-      ? Math.floor(event.payload.turn_seq)
-      : (typeof event.payload.turnSeq === 'number' && Number.isFinite(event.payload.turnSeq)
-        ? Math.floor(event.payload.turnSeq)
-        : undefined);
-    if (typeof deltaText === 'string' && rawEntryId != null) {
-      const entryId = typeof rawEntryId === 'number' ? rawEntryId : String(rawEntryId);
-      applyStreamingDelta(entryId, deltaText, deltaSessionId || undefined, {
-        turnId: turnId || undefined,
-        turnSeq,
-      });
-      emitMessage({ type: 'rustTaskEvent', eventType, payload: event.payload ?? {} } as ClientBridgeMessage);
-      return;
-    }
-  }
-
-  // ── 流式完成事件：封口流式节点，不触发 bootstrap ──
-  if (eventType === 'task.llm.completed' && event.payload) {
-    const rawCompletedEntryId = event.payload.entry_id;
-    if (rawCompletedEntryId != null) {
-      const completedEntryId = typeof rawCompletedEntryId === 'number'
-        ? rawCompletedEntryId
-        : String(rawCompletedEntryId);
-      const turnId = trimBridgeString(event.payload.turn_id) || trimBridgeString(event.payload.turnId);
-      const turnSeq = typeof event.payload.turn_seq === 'number' && Number.isFinite(event.payload.turn_seq)
-        ? Math.floor(event.payload.turn_seq)
-        : (typeof event.payload.turnSeq === 'number' && Number.isFinite(event.payload.turnSeq)
-          ? Math.floor(event.payload.turnSeq)
-          : undefined);
-      sealStreamingDelta(completedEntryId, {
-        turnId: turnId || undefined,
-        turnSeq,
-      });
-    }
-    emitMessage({ type: 'rustTaskEvent', eventType, payload: event.payload ?? {} } as ClientBridgeMessage);
-    return;
-  }
-
   if (eventType === 'session.action.accepted' && event.payload) {
     const acceptedSessionId = trimBridgeString(event.payload.session_id) || trimBridgeString(event.session_id);
     const acceptedActionTaskId = trimBridgeString(event.payload.action_task_id)
@@ -1160,11 +1080,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
 
   if (TURN_TERMINAL_EVENTS.has(eventType)) {
     clearActiveTurnInFlight();
-  } else if (!activeTurnInFlight) {
-    // 非活跃 turn 期间，保持原有行为
-    scheduleBootstrapRefreshFromRustEvent(eventType || 'rust_event');
   }
-  // 活跃 turn 期间的非终结事件：不触发 bootstrap，依赖增量事件更新 UI
 
   // Notify listeners about task-domain SSE events so lightweight stores
   // (e.g. task-graph-store) can react without waiting for a full bootstrap refresh.
@@ -2257,31 +2173,6 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
   const userMessageId = queueDrainActive && input.requestId
     ? `queued-user-${requestId}`
     : generateMessageId();
-  const placeholderMessageId = generateMessageId();
-
-  // 乐观显示用户消息
-  const userMsg = createUserInputMessage(normalizedText, `user-input-${requestId}`, {
-    metadata: {
-      requestId,
-      placeholderMessageId,
-      sendingAnimation: true,
-      images: images.length > 0 ? images : undefined,
-    },
-    id: userMessageId,
-  });
-  emitMessage({ type: 'unifiedMessage', message: userMsg });
-
-  // 显示请求占位消息
-  const placeholderMsg = createStreamingMessage('orchestrator', 'orchestrator', `placeholder-${requestId}`, {
-    id: placeholderMessageId,
-    metadata: {
-      isPlaceholder: true,
-      placeholderState: 'pending',
-      requestId,
-      userMessageId,
-    },
-  });
-  emitMessage({ type: 'unifiedMessage', message: placeholderMsg });
 
   emitDataMessage('processingStateChanged', {
     isProcessing: true,
@@ -2293,11 +2184,17 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
   activeTurnLiveContext = {
     requestId,
     userMessageId,
-    placeholderMessageId,
-    currentAssistantMessageId: '',
-    route: null,
   };
-  activeTurnInFlight = true;
+
+  // 立即创建本地用户消息节点（不等后端返回），确保发送后用户消息立即显示在最终位置
+  const localUserMsg = createUserInputMessage(normalizedText, `user-input-${requestId}`, {
+    metadata: {
+      requestId,
+      userMessageId,
+    },
+    id: userMessageId,
+  });
+  emitMessage({ type: 'unifiedMessage', message: localUserMsg });
 
   try {
     await ensureFreshLiveBridge('execute_task_preflight');
@@ -2308,12 +2205,25 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
       images,
       requestId,
       userMessageId,
-      placeholderMessageId,
+      placeholderMessageId: null,
     }, {
       workspaceId: currentWorkspaceId,
       workspacePath: currentWorkspacePath,
       sessionId: currentSessionId,
     });
+
+    // 后端返回 canonical userMessageItemId，emit 更新消息以替换前端临时节点
+    const canonicalUserMessageId = turnResult.userMessageItemId || userMessageId;
+    const userMsg = createUserInputMessage(normalizedText, `user-input-${requestId}`, {
+      metadata: {
+        requestId,
+        userMessageId,
+        turnItemId: canonicalUserMessageId,
+        images: images.length > 0 ? images : undefined,
+      },
+      id: canonicalUserMessageId,
+    });
+    emitMessage({ type: 'unifiedMessage', message: userMsg });
     const resolvedSessionId = typeof turnResult.sessionId === 'string' && turnResult.sessionId.trim()
       ? turnResult.sessionId.trim()
       : currentSessionId;
@@ -2325,9 +2235,6 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
       : turnResult.route === 'continue'
         ? '继续请求已提交'
         : '消息已发送';
-    if (activeTurnLiveContext?.requestId === requestId) {
-      activeTurnLiveContext.route = turnResult.route;
-    }
     emitBridgeSuccessToast('发送消息', successMessage, { displayMode: 'notification_center' });
 
     setCurrentInterruptTaskId(turnResult.actionTaskId || '');

@@ -88,9 +88,11 @@
     };
 
     const artifacts = Array.isArray(timelineProjection?.artifacts) ? timelineProjection.artifacts : [];
+    let hasStructuredTurnLanes = false;
     for (const artifact of artifacts) {
       const laneMeta = artifact.message?.metadata?.currentTurnWorkerLanes;
       if (Array.isArray(laneMeta) && laneMeta.length > 0) {
+        hasStructuredTurnLanes = true;
         for (const lane of laneMeta as CurrentTurnWorkerRoleMeta[]) {
           const roleId = typeof lane?.roleId === 'string' ? lane.roleId.trim() : '';
           if (!roleId || lane?.isPrimary === true) {
@@ -104,6 +106,17 @@
           upsertRole({ roleId, order, workerId, status });
         }
       }
+    }
+    if (hasStructuredTurnLanes) {
+      return Array.from(roleById.values()).sort((left, right) => {
+        if (left.order !== right.order) {
+          return left.order - right.order;
+        }
+        return left.roleId.localeCompare(right.roleId);
+      });
+    }
+
+    for (const artifact of artifacts) {
       for (const roleId of artifact.workerTabs || []) {
         upsertRole({
           roleId,

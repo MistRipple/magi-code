@@ -37,10 +37,6 @@ import { ensureArray } from '../lib/utils';
 import { deriveWorkerRuntimeMap } from '../lib/worker-panel-state';
 import { normalizeWorkerSlot } from '../lib/message-classifier';
 import {
-  compareTimelineProjectionFreshness,
-  shouldPreferRicherAuthoritativeProjection,
-} from '../lib/timeline-projection-freshness';
-import {
   buildTimelinePanelMessages,
 } from '../lib/timeline-render-items';
 import {
@@ -51,13 +47,11 @@ import {
   resolveTimelineEventSeqFromMetadata,
   resolveTimelineItemSeqFromMetadata,
   resolveTimelineLaneSeqFromMetadata,
-  resolveStableTimelinePlacementTimestamp,
   resolveTimelineSortTimestamp,
   resolveTimelineTurnSeqFromMetadata,
   resolveTimelineVersionFromMetadata,
 } from '../shared/timeline-ordering';
 import {
-  collectTimelineAliasIds,
   resolveTimelinePresentationKind,
   resolveTimelineWorkerVisibility as resolveSharedTimelineWorkerVisibility,
 } from '../shared/timeline-presentation';
@@ -545,18 +539,6 @@ function timelineNodeIsActivelyStreaming(node: TimelineNode): boolean {
     .some((item) => item.message?.isStreaming === true);
 }
 
-function timelineNodeIsRequestPlaceholder(node: TimelineNode): boolean {
-  const isPlaceholderMessage = (message: Message | undefined): boolean => {
-    const metadata = resolveMessageMetadataRecord(message);
-    return metadata?.isPlaceholder === true;
-  };
-  if (isPlaceholderMessage(node.message)) {
-    return true;
-  }
-  return ensureArray<TimelineExecutionItem>(node.executionItems)
-    .some((item) => isPlaceholderMessage(item.message));
-}
-
 function shouldOverlayLocalTimelineNode(
   node: TimelineNode,
   projection: SessionTimelineProjection | null | undefined,
@@ -566,23 +548,12 @@ function shouldOverlayLocalTimelineNode(
   const projectionSeq = timelineProjectionLatestEventSeq(projection);
   const isNewerThanProjection = nodeSeq > projectionSeq;
   const isStreaming = timelineNodeIsActivelyStreaming(node);
-  const isRequestPlaceholder = timelineNodeIsRequestPlaceholder(node);
   const backendActive = messagesState.backendProcessing || messagesState.pendingRequests.size > 0;
   const metadata = resolveMessageMetadataRecord(node.message);
   const requestId = typeof metadata?.requestId === 'string' ? metadata.requestId.trim() : '';
   const requestBinding = requestId ? getRequestBinding(requestId) : undefined;
   const isLocalEchoMessage = (node.message.role === 'user' || node.message.type === 'user_input')
-    || (node.message.role === 'assistant'
-      && Boolean(
-        requestId
-        || metadata?.wasPlaceholder === true
-        || metadata?.isPlaceholder === true,
-      ));
-
-  // 占位节点在后端不再处理时让位 projection,避免发送按钮永远卡在“已发送”状态。
-  if (!backendActive && isRequestPlaceholder) {
-    return false;
-  }
+    || (node.message.role === 'assistant' && Boolean(requestId));
 
   // 没有活跃 request binding 的本地 echo 必须让位给权威投影。
   // 这样刷新或断链后不会把前一轮的乐观气泡误当成真实历史消息。
@@ -595,9 +566,6 @@ function shouldOverlayLocalTimelineNode(
     return isStreaming && isNewerThanProjection;
   }
   if (isStreaming) {
-    return true;
-  }
-  if (isRequestPlaceholder && backendActive) {
     return true;
   }
   return isNewerThanProjection;
@@ -620,9 +588,7 @@ function isLocalAssistantEchoArtifact(artifact: TimelineProjectionArtifact): boo
   }
   const metadata = resolveMessageMetadataRecord(message);
   return Boolean(
-    typeof metadata?.requestId === 'string' && metadata.requestId.trim()
-    || metadata?.wasPlaceholder === true
-    || metadata?.isPlaceholder === true,
+    typeof metadata?.requestId === 'string' && metadata.requestId.trim(),
   );
 }
 
@@ -682,13 +648,9 @@ function collectMessageIdentityKeys(message: Message | undefined): Set<string> {
   const role = typeof message?.role === 'string' ? message.role.trim().toLowerCase() : '';
   const type = typeof message?.type === 'string' ? message.type.trim().toLowerCase() : '';
   const isUserMessage = role === 'user' || type === 'user_input';
-  const isAssistantTextMessage = role === 'assistant' && type === 'text';
-  const isRequestPlaceholder = metadata?.isPlaceholder === true || metadata?.wasPlaceholder === true;
 
   if (isUserMessage) {
     add(metadata?.userMessageId);
-  } else if (isRequestPlaceholder || isAssistantTextMessage) {
-    add(metadata?.placeholderMessageId);
   }
   add(metadata?.rustStreamItemId);
   add(metadata?.rustEventItemId);
@@ -933,10 +895,11 @@ function mergeTimelineSortTimestamp(
   currentTimestamp: number | undefined,
   message: Pick<Message, 'timestamp' | 'metadata' | 'type'>,
 ): number {
-  return resolveStableTimelinePlacementTimestamp(
-    currentTimestamp,
-    resolveMessageSortTimestamp(message),
-  );
+  const existing = currentTimestamp ?? 0;
+  if (existing > 0) {
+    return existing;
+  }
+  return resolveMessageSortTimestamp(message) || 0;
 }
 
 function normalizeProjectionRestoredMessage(message: Message): Message {
@@ -1133,7 +1096,6 @@ function normalizeTimelineExecutionItem(item: TimelineExecutionItem): TimelineEx
     threadVisible: item.threadVisible !== false,
     workerTabs,
     messageIds: Array.from(new Set([
-      ...collectTimelineAliasIds(normalizedMessage),
       itemId,
       ...ensureArray<string>(item.messageIds),
     ])),
@@ -1144,13 +1106,9 @@ function normalizeTimelineExecutionItem(item: TimelineExecutionItem): TimelineEx
 function executionItemToOrderInput(item: TimelineExecutionItem): TimelineSemanticOrderInput {
   const metadata = resolveMessageMetadataRecord(item.message);
   return {
-    timestamp: item.timestamp,
-    stableId: item.itemId,
     turnSeq: resolveTimelineTurnSeqFromMetadata(metadata),
     itemSeq: resolveTimelineItemSeqFromMetadata(metadata) || item.cardStreamSeq || item.itemOrder,
-    laneSeq: resolveTimelineLaneSeqFromMetadata(metadata),
-    anchorEventSeq: item.anchorEventSeq,
-    blockSeq: getMessageBlockSeq(item.message),
+    displayOrder: item.itemOrder || 0,
   };
 }
 
@@ -1197,7 +1155,6 @@ function normalizeTimelineNode(node: TimelineNode): TimelineNode {
   const worker = resolveTimelineWorker(stableMessage) || node.worker;
   const workerTabs = normalizeWorkerTabList(node.workerTabs);
   const messageIds = Array.from(new Set([
-    ...collectTimelineAliasIds(stableMessage),
     stableNodeId,
     ...ensureArray<string>(node.messageIds),
   ]));
@@ -1266,13 +1223,9 @@ function rebuildTimelineIndexes(): void {
 function nodeToOrderInput(node: TimelineNode): TimelineSemanticOrderInput {
   const metadata = resolveMessageMetadataRecord(node.message);
   return {
-    timestamp: node.timestamp,
-    stableId: node.nodeId,
     turnSeq: resolveTimelineTurnSeqFromMetadata(metadata),
     itemSeq: node.cardStreamSeq,
-    laneSeq: resolveTimelineLaneSeqFromMetadata(metadata),
-    anchorEventSeq: node.anchorEventSeq,
-    blockSeq: getMessageBlockSeq(node.message),
+    displayOrder: node.displayOrder || 0,
   };
 }
 
@@ -1308,13 +1261,9 @@ function shouldRenderTimelineNodeHost(
 
 function renderEntryToOrderInput(entry: LocalProjectionFlatRenderEntry): TimelineSemanticOrderInput {
   return {
-    timestamp: entry.timestamp,
-    stableId: entry.entryId,
     turnSeq: entry.turnSeq,
     itemSeq: entry.itemSeq,
-    laneSeq: entry.laneSeq,
-    anchorEventSeq: entry.anchorEventSeq,
-    blockSeq: entry.blockSeq,
+    displayOrder: entry.cardStreamSeq || 0,
   };
 }
 
@@ -1471,13 +1420,9 @@ function isProjectionArtifact(
 function artifactToOrderInput(artifact: TimelineProjectionArtifact): TimelineSemanticOrderInput {
   const metadata = resolveMessageMetadataRecord(artifact.message);
   return {
-    timestamp: artifact.timestamp,
-    stableId: artifact.artifactId,
     turnSeq: resolveTimelineTurnSeqFromMetadata(metadata),
     itemSeq: resolveTimelineItemSeqFromMetadata(metadata),
-    laneSeq: resolveTimelineLaneSeqFromMetadata(metadata),
-    anchorEventSeq: artifact.anchorEventSeq,
-    blockSeq: getMessageBlockSeq(artifact.message),
+    displayOrder: artifact.displayOrder || 0,
   };
 }
 
@@ -1531,7 +1476,6 @@ function canonicalizeTimelineProjection(
         threadVisible: artifact.threadVisible !== false,
       workerTabs: normalizeWorkerTabList(artifact.workerTabs),
       messageIds: Array.from(new Set([
-          ...collectTimelineAliasIds(message),
           artifactMessageId,
           ...ensureArray<string>(artifact.messageIds),
       ])),
@@ -2113,6 +2057,7 @@ function updateTimelineNodeByAlias(messageId: string, updates: Partial<Message>)
   )));
   return nextNode.message;
 }
+
 
 
 function normalizeOrchestratorRuntimeState(
@@ -3073,43 +3018,14 @@ export function sealAllStreamingMessages() {
   let threadChanged = false;
   let agentChanged = false;
 
-  // 判断消息是否有可渲染内容
-  const hasContent = (m: Message): boolean => {
-    if (m.content && m.content.trim().length > 0) return true;
-    if (m.blocks && m.blocks.length > 0) {
-      return m.blocks.some(b => {
-        if (!b || typeof b !== 'object') return false;
-        if ('content' in b && typeof b.content === 'string' && b.content.trim().length > 0) return true;
-        if (b.type === 'thinking' && b.thinking?.content && b.thinking.content.trim().length > 0) return true;
-        if (b.type === 'tool_call') return true;
-        if (b.type === 'plan' || b.type === 'file_change') return true;
-        return false;
-      });
-    }
-    return false;
-  };
-
   // 处理单条消息：返回 null 表示应移除，返回新对象表示应更新
   const sealMessage = (m: Message): Message | null => {
-    const isPlaceholder = Boolean(m.metadata?.isPlaceholder);
-    const isStreaming = m.isStreaming;
+    if (!m.isStreaming) return m; // 无需处理
 
-    if (!isPlaceholder && !isStreaming) return m; // 无需处理
-
-    // 空占位消息（无内容）→ 移除
-    if (isPlaceholder && !hasContent(m)) return null;
-
-    // 有内容的流式消息 / 有内容的占位消息 → 标记完成，保留内容
     return {
       ...m,
       isStreaming: false,
       isComplete: true,
-      metadata: {
-        ...(m.metadata || {}),
-        isPlaceholder: false,
-        placeholderState: undefined,
-        wasPlaceholder: isPlaceholder ? true : m.metadata?.wasPlaceholder,
-      },
     };
   };
 
@@ -3510,14 +3426,6 @@ function patchTimelineMessageByAlias(messageId: string, updates: Partial<Message
   return updateTimelineNodeByAlias(messageId, normalizedUpdates);
 }
 
-export function patchThreadPlaceholderMessage(messageId: string, updates: Partial<Message>) {
-  const target = findTimelineMessageTargetByAlias(messageId);
-  if (target?.node.visibleInThread) {
-    // 仅允许请求占位消息在后端 projection 快照到达前做局部状态补丁。
-    patchTimelineMessageByAlias(messageId, updates);
-  }
-}
-
 /**
  * 应用流式增量更新到时间线消息。
  * 由 message-handler 的 handleStandardUpdate 调用，
@@ -3525,157 +3433,6 @@ export function patchThreadPlaceholderMessage(messageId: string, updates: Partia
  */
 export function applyTimelineStreamPatch(messageId: string, updates: Partial<Message>): void {
   patchTimelineMessageByAlias(messageId, updates);
-}
-
-// ────────────────────────────────────────────────────────────────
-// 流式文本收集器
-//
-// 核心思路：将"数据累积"和"渲染决策"分离。
-//   - delta 追加到 buffer（纯字符串拼接，零渲染开销）
-//   - 每次 delta 都提供完整可渲染快照；RAF 合并层负责把同帧更新压成一次状态写入
-//   - finalize 时 flush 所有剩余内容
-// 不能按换行符截断渲染，否则没有换行的长句会持续收流但 UI 不继续更新。
-// ────────────────────────────────────────────────────────────────
-
-class StreamingTextCollector {
-  /** 累积的完整原始文本 */
-  private buffer = '';
-
-  /** 当前流式增量实际命中的消息目标 */
-  targetMessageId: string | null = null;
-
-  setTargetMessageId(messageId: string): void {
-    const normalized = typeof messageId === 'string' ? messageId.trim() : '';
-    if (normalized) {
-      this.targetMessageId = normalized;
-    }
-  }
-
-  /** 追加增量文本到缓冲区（不触发渲染） */
-  pushDelta(delta: string): void {
-    this.buffer += delta;
-  }
-
-  /** 当前可交给渲染层的完整快照 */
-  getRenderableText(): string {
-    return this.buffer;
-  }
-
-  /**
-   * 流结束时 finalize：返回完整的最终文本（包含未换行的尾部）。
-   */
-  finalize(): string {
-    const result = this.buffer;
-    this.buffer = '';
-    return result;
-  }
-}
-
-/** 活跃的流式收集器实例，按 entryId 索引 */
-const activeStreamCollectors = new Map<string, StreamingTextCollector>();
-
-/**
- * 处理后端 task.llm.delta SSE 事件推送的流式文本增量。
- *
- * 设计参考 Codex 的 MarkdownStreamCollector + StreamController：
- * 1. delta 追加到 collector buffer（纯内存操作，无渲染开销）
- * 2. 立即生成完整可渲染快照并交给 RAF 合并层
- * 3. MarkdownContent 内部还有自适应节流，避免长文本全量解析过频
- *
- * @param entryId 后端 timeline entry ID
- * @param delta 本次新增的增量文本片段
- * @param sessionId 会话 ID，用于过滤
- */
-export function applyStreamingDelta(
-  entryId: string | number,
-  delta: string,
-  sessionId?: string,
-  options: {
-    turnId?: string;
-    turnSeq?: number;
-  } = {},
-): void {
-  if (sessionId && messagesState.currentSessionId && sessionId !== messagesState.currentSessionId) {
-    return;
-  }
-
-  const normalizedTurnId = typeof options.turnId === 'string' ? options.turnId.trim() : '';
-  const canonicalNodeId = normalizedTurnId
-    ? `turn:${normalizedTurnId}:${entryId}`
-    : `rust-timeline:${entryId}`;
-  const collectorKey = normalizedTurnId ? `${normalizedTurnId}:${entryId}` : String(entryId);
-  const targetId = canonicalNodeId;
-
-  let collector = activeStreamCollectors.get(collectorKey);
-  if (!collector) {
-    collector = new StreamingTextCollector();
-    activeStreamCollectors.set(collectorKey, collector);
-  }
-
-  collector.setTargetMessageId(targetId);
-  collector.pushDelta(delta);
-  const renderableText = collector.getRenderableText();
-  if (renderableText.length === 0) {
-    return;
-  }
-  const existingMessage = getEffectiveTimelineMessage(targetId);
-  if (existingMessage) {
-    enqueueTimelineStreamUpdate(targetId, {
-      content: renderableText,
-      blocks: [{ type: 'text', content: renderableText }],
-      isStreaming: true,
-      isComplete: false,
-      updatedAt: Date.now(),
-    });
-    markMessageActive(targetId);
-    return;
-  }
-}
-
-/**
- * 流式结束：finalize 收集器，flush 所有剩余内容（含未换行的尾部），
- * 标记 isStreaming=false。
- * 参考 Codex: StreamController.finalize() → collector.finalize_and_drain()
- */
-export function sealStreamingDelta(
-  entryId: string | number,
-  options: {
-    turnId?: string;
-    turnSeq?: number;
-  } = {},
-): void {
-  const normalizedTurnId = typeof options.turnId === 'string' ? options.turnId.trim() : '';
-  const nodeId = normalizedTurnId
-    ? `turn:${normalizedTurnId}:${entryId}`
-    : `rust-timeline:${entryId}`;
-  const collectorKey = normalizedTurnId ? `${normalizedTurnId}:${entryId}` : String(entryId);
-  const collector = activeStreamCollectors.get(collectorKey);
-
-  if (collector) {
-    const finalText = collector.finalize();
-    const targetMessageId = collector.targetMessageId || nodeId;
-    activeStreamCollectors.delete(collectorKey);
-
-    if (finalText.length > 0) {
-      enqueueTimelineStreamUpdate(targetMessageId, {
-        content: finalText,
-        blocks: [{ type: 'text', content: finalText }],
-        isStreaming: false,
-        isComplete: true,
-        updatedAt: Date.now(),
-      });
-      return;
-    }
-  }
-
-  const existingMessage = getEffectiveTimelineMessage(nodeId);
-  if (existingMessage) {
-    enqueueTimelineStreamUpdate(nodeId, {
-      isStreaming: false,
-      isComplete: true,
-      updatedAt: Date.now(),
-    });
-  }
 }
 
 /**
@@ -3695,7 +3452,6 @@ export function clearAllMessages(options: {
 } = {}) {
   captureCurrentSessionViewState();
   pendingTimelineFlushes.clear();
-  activeStreamCollectors.clear();
   if (streamFlushRAF !== undefined) {
     cancelAnimationFrame(streamFlushRAF);
     streamFlushRAF = undefined;
@@ -3911,8 +3667,9 @@ export function restoreTimelineProjectionIfNewer(
     return false;
   }
   const currentProjection = ensureTimelineProjectionSnapshotCurrent(normalizedSessionId);
-  const isStrictlyNewer = compareTimelineProjectionFreshness(projection, currentProjection) > 0;
-  if (!isStrictlyNewer && !shouldPreferRicherAuthoritativeProjection(projection, currentProjection)) {
+  const incomingSeq = typeof projection.lastAppliedEventSeq === 'number' ? projection.lastAppliedEventSeq : 0;
+  const currentSeq = currentProjection && typeof currentProjection.lastAppliedEventSeq === 'number' ? currentProjection.lastAppliedEventSeq : 0;
+  if (incomingSeq <= currentSeq) {
     return false;
   }
   setTimelineProjection(projection, options);
@@ -4081,15 +3838,6 @@ export function clearRequestBinding(requestId: string): void {
 /**
  * 根据占位消息 ID 查找请求绑定
  */
-export function findBindingByPlaceholder(placeholderMessageId: string): RequestResponseBinding | undefined {
-  for (const binding of requestBindings.values()) {
-    if (binding.placeholderMessageId === placeholderMessageId) {
-      return binding;
-    }
-  }
-  return undefined;
-}
-
 /**
  * 清除所有请求绑定（会话切换时使用）
  */

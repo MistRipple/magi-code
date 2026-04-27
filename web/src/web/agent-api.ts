@@ -260,6 +260,8 @@ export interface AgentSessionTurnResult {
   /** 当前轮次实际执行的 action task ID。 */
   actionTaskId?: string | null;
   executionChainRef?: string | null;
+  /** 后端生成的 canonical 用户消息 item ID。 */
+  userMessageItemId?: string | null;
 }
 
 export class AgentApiError extends Error {

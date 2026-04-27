@@ -47,6 +47,8 @@ export interface SessionTurnResponseDto {
   /** 当前轮次实际执行的 action task ID。 */
   actionTaskId?: string | null;
   executionChainRef?: string | null;
+  /** 后端生成的用户消息 turnItemId，前端应使用此 ID 创建 canonical 节点 */
+  userMessageItemId?: string | null;
 }
 
 export interface TaskInterruptResponseDto {

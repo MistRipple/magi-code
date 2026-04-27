@@ -21,97 +21,6 @@ export interface TimelinePresentationMessageLike {
   metadata?: Record<string, unknown>;
 }
 
-function normalizeTimelineAliasCandidate(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-export function collectTimelineAliasIds(
-  message: Pick<TimelinePresentationMessageLike, 'id' | 'metadata' | 'role' | 'type'>,
-): string[] {
-  const aliases = new Set<string>();
-  const addAlias = (value: unknown): void => {
-    const normalized = normalizeTimelineAliasCandidate(value);
-    if (normalized) {
-      aliases.add(normalized);
-    }
-  };
-
-  addAlias(message.id);
-
-  const metadata = message.metadata && typeof message.metadata === 'object' && !Array.isArray(message.metadata)
-    ? message.metadata
-    : undefined;
-  if (!metadata) {
-    return Array.from(aliases);
-  }
-
-  const sessionId = normalizeTimelineAliasCandidate(metadata.sessionId);
-  const turnId = normalizeTimelineAliasCandidate(metadata.turnId);
-  const turnItemId = normalizeTimelineAliasCandidate(metadata.turnItemId);
-  const rustStreamItemId = normalizeTimelineAliasCandidate(metadata.rustStreamItemId);
-  const rustEventItemId = normalizeTimelineAliasCandidate(metadata.rustEventItemId);
-  const toolCallId = normalizeTimelineAliasCandidate(metadata.toolCallId);
-  const userMessageId = normalizeTimelineAliasCandidate(metadata.userMessageId);
-  const placeholderMessageId = normalizeTimelineAliasCandidate(metadata.placeholderMessageId);
-  const timelineEntryId = normalizeTimelineAliasCandidate(metadata.timelineEntryId);
-  const normalizedRole = typeof message.role === 'string' ? message.role.trim().toLowerCase() : '';
-  const normalizedType = typeof message.type === 'string' ? message.type.trim().toLowerCase() : '';
-  const isUserMessage = normalizedRole === 'user' || normalizedType === 'user_input';
-  const isAssistantTextMessage = normalizedRole === 'assistant' && normalizedType === 'text';
-  const isRequestPlaceholder = metadata.isPlaceholder === true || metadata.wasPlaceholder === true;
-
-  if (userMessageId && isUserMessage) {
-    addAlias(userMessageId);
-  }
-  if (placeholderMessageId && !isUserMessage && (isRequestPlaceholder || isAssistantTextMessage)) {
-    addAlias(placeholderMessageId);
-  }
-
-  if (turnItemId) {
-    addAlias(turnItemId);
-    addAlias(`rust-timeline:${turnItemId}`);
-    if (turnId) {
-      addAlias(`turn:${turnId}:${turnItemId}`);
-    }
-    if (sessionId) {
-      addAlias(`turn-live:${sessionId}:${turnItemId}`);
-    }
-  }
-  if (rustStreamItemId) {
-    addAlias(rustStreamItemId);
-    addAlias(`rust-timeline:${rustStreamItemId}`);
-    if (sessionId) {
-      addAlias(`turn-live:${sessionId}:${rustStreamItemId}`);
-    }
-  }
-  if (rustEventItemId) {
-    addAlias(rustEventItemId);
-    addAlias(`rust-timeline:${rustEventItemId}`);
-    if (sessionId) {
-      addAlias(`turn-live:${sessionId}:${rustEventItemId}`);
-    }
-  }
-  if (toolCallId) {
-    if (turnId) {
-      addAlias(`turn:${turnId}:${toolCallId}`);
-    }
-    addAlias(`rust-timeline:turn-item-tool-started-${toolCallId}`);
-    addAlias(`rust-timeline:turn-item-tool-result-${toolCallId}`);
-  }
-  if (timelineEntryId) {
-    addAlias(`rust-timeline:${timelineEntryId}`);
-  }
-
-  return Array.from(aliases);
-}
-
-function resolveTimelineMetadata(message: Pick<TimelinePresentationMessageLike, 'metadata'>): Record<string, unknown> | undefined {
-  return message.metadata && typeof message.metadata === 'object' && !Array.isArray(message.metadata)
-    ? message.metadata
-    : undefined;
-}
-
-
 function hasToolBlock(blocks: TimelinePresentationBlockLike[] | undefined): boolean {
   return Array.isArray(blocks) && blocks.some((block) => block?.type === 'tool_call' || block?.type === 'tool_result');
 }
@@ -146,15 +55,7 @@ export function resolveTimelinePresentationKind(
 export function messageHasRenderableTimelineContent(
   message: TimelinePresentationMessageLike,
 ): boolean {
-  const metadata = resolveTimelineMetadata(message);
   const normalizedRole = typeof message.role === 'string' ? message.role.trim().toLowerCase() : '';
-
-  // request placeholder 是主线响应的固定锚点。
-  // 即使尚未收到正文/thinking/tool_call，也必须先落到时间轴中，
-  // 后续所有流式更新才能原位接管，live/restore 才能保持一致。
-  if (metadata?.isPlaceholder === true) {
-    return true;
-  }
 
   // thinking 消息即使 content 暂时为空也应保留占位（流式场景）
   if (message.type === 'thinking') {

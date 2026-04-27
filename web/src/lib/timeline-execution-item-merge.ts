@@ -1,32 +1,11 @@
-import {
-  compareTimelineSemanticOrder,
-  resolveTimelineBlockSeqFromMetadata,
-} from '../shared/timeline-ordering';
 import type { Message, TimelineExecutionItem } from '../types/message';
 import { mergeCompleteBlocksForFinalization } from './streaming-complete-merge';
 
-function resolveMessageBlockSeq(message: Pick<Message, 'metadata'> | undefined): number {
-  const metadata = message?.metadata && typeof message.metadata === 'object'
-    ? message.metadata as Record<string, unknown>
-    : undefined;
-  return resolveTimelineBlockSeqFromMetadata(metadata);
-}
-
 function compareExecutionItems(left: TimelineExecutionItem, right: TimelineExecutionItem): number {
-  return compareTimelineSemanticOrder(
-    {
-      timestamp: left.timestamp,
-      stableId: left.itemId,
-      anchorEventSeq: left.anchorEventSeq,
-      blockSeq: resolveMessageBlockSeq(left.message),
-    },
-    {
-      timestamp: right.timestamp,
-      stableId: right.itemId,
-      anchorEventSeq: right.anchorEventSeq,
-      blockSeq: resolveMessageBlockSeq(right.message),
-    },
-  );
+  if (left.anchorEventSeq !== right.anchorEventSeq) {
+    return left.anchorEventSeq - right.anchorEventSeq;
+  }
+  return left.itemId.localeCompare(right.itemId);
 }
 
 export function mergeFragmentExecutionItems(params: {

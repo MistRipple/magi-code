@@ -2005,6 +2005,17 @@ function buildTurnArtifactsFromSummary(
       .map((lane) => [normalizeString(lane.lane_id), lane] as const)
       .filter(([laneId]) => laneId.length > 0),
   );
+  const currentTurnWorkerLanes = [...workerLaneById.values()]
+    .map((lane) => ({
+      laneId: normalizeString(lane.lane_id),
+      laneSeq: normalizeNumber(lane.lane_seq, 0),
+      worker: normalizeString(lane.worker_id) || undefined,
+      roleId: normalizeString(lane.role_id) || undefined,
+      title: normalizeString(lane.title) || undefined,
+      status: turnWorkerStatusToLaneStatus(normalizeString(lane.status)),
+      isPrimary: lane.is_primary === true,
+    }))
+    .filter((lane) => lane.laneId.length > 0);
   const toolItemsByCallId = new Map<string, RustSessionRuntimeTurnItemSummary>();
   for (const item of items) {
     const kind = normalizeString(item.kind);
@@ -2056,20 +2067,26 @@ function buildTurnArtifactsFromSummary(
     const laneId = normalizeString(item.lane_id);
     const workerId = normalizeString(item.worker_id)
       || normalizeString(workerLaneById.get(laneId)?.worker_id);
+    const roleId = normalizeString(item.role_id)
+      || normalizeString(workerLaneById.get(laneId)?.role_id);
+    const workerTabId = roleId || workerId;
     const timestamp = resolveTurnItemTimestamp(item, timelineBase);
+    const workerVisible = item.worker_visible === true || Boolean(workerTabId && laneId);
+    const threadHidden = item.thread_visible === false;
     const threadVisible = item.thread_visible === true
-      || kind === 'user_message'
-      || kind === 'assistant_thinking'
-      || kind === 'assistant_stream'
-      || kind === 'assistant_final'
-      || kind === 'assistant_error'
-      || kind === 'tool_call_started'
-      || kind === 'tool_call_result';
-    const workerVisible = item.worker_visible === true || Boolean(workerId && laneId);
-    const workerTabs = workerVisible && workerId ? [workerId] : [];
+      || (!threadHidden && kind === 'user_message')
+      || (!threadHidden && !workerVisible && (
+        kind === 'assistant_thinking'
+        || kind === 'assistant_stream'
+        || kind === 'assistant_final'
+        || kind === 'assistant_error'
+        || kind === 'tool_call_started'
+        || kind === 'tool_call_result'
+      ));
+    const workerTabs = workerVisible && workerTabId ? [workerTabId] : [];
     let role: Message['role'] = 'assistant';
     let type: Message['type'] = 'text';
-    let source: Message['source'] = 'orchestrator';
+    let source: Message['source'] = workerVisible && workerTabId ? workerTabId : 'orchestrator';
     let blocks: ContentBlock[] | undefined;
 
     if (kind === 'user_message') {
@@ -2142,7 +2159,7 @@ function buildTurnArtifactsFromSummary(
             isCurrent: true,
             seq: normalizeNumber(item.lane_seq, 0),
           }],
-          jumpTarget: { workerTabId: workerId },
+          jumpTarget: { workerTabId },
         }],
       }];
     }
@@ -2155,11 +2172,9 @@ function buildTurnArtifactsFromSummary(
       : `turn:${turnId}:${itemId}`;
     const requestId = normalizeString(item.request_id);
     const userMessageId = normalizeString(item.user_message_id);
-    const placeholderMessageId = normalizeString(item.placeholder_message_id);
     const timelineEntryId = normalizeString(item.timeline_entry_id);
     const messageIdAliases = new Set<string>([artifactId, itemId, `rust-timeline:${itemId}`]);
     if (userMessageId) messageIdAliases.add(userMessageId);
-    if (placeholderMessageId) messageIdAliases.add(placeholderMessageId);
     if (timelineEntryId) messageIdAliases.add(`rust-timeline:${timelineEntryId}`);
     if (kind === 'assistant_final' || kind === 'assistant_stream') {
       const streamingAlias = normalizeString(streamingEntryId);
@@ -2209,9 +2224,10 @@ function buildTurnArtifactsFromSummary(
           laneSeq: normalizeNumber(item.lane_seq, 0) || undefined,
           cardStreamSeq: normalizeNumber(item.item_seq, 0),
           workerId: workerId || undefined,
+          roleId: roleId || undefined,
+          currentTurnWorkerLanes,
           requestId: requestId || undefined,
           userMessageId: userMessageId || undefined,
-          placeholderMessageId: placeholderMessageId || undefined,
           timelineEntryId: timelineEntryId || undefined,
           ...(kind === 'tool_call_started' || kind === 'tool_call_result'
             ? {
@@ -2259,35 +2275,6 @@ function buildCurrentTurnArtifacts(
     session.worker_lanes,
     generatedAt,
   );
-}
-
-const USER_VISIBLE_RUNTIME_NOTICE_EVENT_TYPES = new Set([
-  'session.turn.failed',
-  'task.failed',
-]);
-
-function resolveEventTextPayload(payload: Record<string, unknown>): string {
-  return normalizeString(payload.text)
-    || normalizeString(payload.message)
-    || normalizeString(payload.error)
-    || normalizeString(payload.reason);
-}
-
-function summarizeRustEvent(event: RustEventEnvelope): string {
-  const eventType = normalizeString(event.event_type);
-  const payload = event.payload || {};
-  const text = resolveEventTextPayload(payload);
-  if (!USER_VISIBLE_RUNTIME_NOTICE_EVENT_TYPES.has(eventType)) {
-    return '';
-  }
-  switch (eventType) {
-    case 'task.failed':
-      return text || '任务执行失败';
-    case 'session.turn.failed':
-      return text || '回复生成失败';
-    default:
-      return text;
-  }
 }
 
 function normalizeToolArtifactStatus(status: string, eventType: string): 'pending' | 'running' | 'success' | 'error' {
@@ -2506,75 +2493,14 @@ function buildToolArtifacts(
 }
 
 function buildEventArtifacts(
-  sessionId: string,
-  runtimeReadModel: RustRuntimeReadModelDto | undefined,
-  events: RustEventEnvelope[],
+  _sessionId: string,
+  _runtimeReadModel: RustRuntimeReadModelDto | undefined,
+  _events: RustEventEnvelope[],
 ): TimelineProjectionArtifact[] {
-  const { taskEntries } = resolveSessionTaskEntries(runtimeReadModel, sessionId);
-  const relevantTaskIds = new Set(
-    taskEntries
-      .map((entry) => normalizeString(entry.task_id))
-      .filter((taskId) => taskId.length > 0),
-  );
-  const relevantMissionIds = new Set(
-    taskEntries
-      .map((entry) => normalizeString(entry.mission_id))
-      .filter((missionId) => missionId.length > 0),
-  );
-
-  return events
-    .filter((event) => {
-      const eventSessionId = resolveEventSessionId(event);
-      if (eventSessionId) {
-        return eventSessionId === sessionId;
-      }
-      const missionId = resolveEventMissionId(event);
-      if (missionId && relevantMissionIds.has(missionId)) {
-        return true;
-      }
-      const taskId = resolveEventTaskId(event);
-      return Boolean(taskId && relevantTaskIds.has(taskId));
-    })
-    .sort((left, right) => normalizeNumber(left.sequence, 0) - normalizeNumber(right.sequence, 0))
-    .flatMap((event, index) => {
-      const eventId = normalizeString(event.event_id);
-      if (!eventId) {
-        return [];
-      }
-      const timestamp = normalizeNumber(event.occurred_at, Date.now());
-      const sequence = normalizeNumber(event.sequence, 0);
-      const artifacts: TimelineProjectionArtifact[] = [];
-
-      const content = summarizeRustEvent(event);
-      if (!content) {
-        return artifacts;
-      }
-
-      artifacts.push({
-        artifactId: `rust-event:${eventId}`,
-        kind: 'message',
-        displayOrder: index + 1,
-        anchorEventSeq: sequence,
-        latestEventSeq: sequence,
-        cardStreamSeq: 0,
-        timestamp,
-        threadVisible: true,
-        workerTabs: [],
-        messageIds: [`rust-event:${eventId}`],
-        message: createRustTimelineMessage({
-          id: `rust-event:${eventId}`,
-          content,
-          timestamp,
-          sessionId,
-          eventSeq: sequence,
-          role: 'system',
-          type: 'system-notice',
-          rustEventType: event.event_type,
-        }),
-      });
-
-      return artifacts;
-    });
+  // 失败事件只保留为运行态事实，不再投影成主线可见消息。
+  // canonical 的 session.turn.item / assistant_error 已经承载可见失败态，
+  // 再渲染 session.turn.failed/task.failed 只会制造重复和平台包装文本。
+  return [];
 }
 
 function buildTimelineProjection(
