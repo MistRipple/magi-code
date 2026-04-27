@@ -28,7 +28,7 @@ import {
 } from '../stores/messages.svelte';
 import type { Message, ContentBlock, SessionTimelineProjection } from '../types/message';
 import type { StandardMessage, StreamUpdate } from '../shared/protocol/message-protocol';
-import { MessageType, MessageCategory } from '../shared/protocol/message-protocol';
+import { MessageType, MessageCategory, MessageLifecycle } from '../shared/protocol/message-protocol';
 import { resolveTaskCardWorkerSlot } from './worker-role-utils';
 import { ensureArray } from './utils';
 import { i18n } from '../stores/i18n.svelte';
@@ -781,7 +781,7 @@ function handleStandardUpdate(message: ClientBridgeMessage) {
   const updateAnchorId = update.messageId;
 
   // 处理 lifecycle 变更
-  if (update.updateType === 'lifecycle' && update.lifecycle === 'completed') {
+  if (update.updateType === 'lifecycle' && isTerminalLifecycle(update.lifecycle)) {
     markMessageComplete(updateAnchorId);
     if (updateAnchorId !== update.messageId) {
       markMessageComplete(update.messageId);
@@ -927,11 +927,21 @@ function handleStandardComplete(message: ClientBridgeMessage) {
  *
  * 控制消息通过 MessageHub.sendControl() 发送，包含 controlType 和 payload
  */
+function isTerminalLifecycle(lifecycle: StandardMessage['lifecycle'] | undefined): boolean {
+  return lifecycle === MessageLifecycle.COMPLETED
+    || lifecycle === MessageLifecycle.FAILED
+    || lifecycle === MessageLifecycle.CANCELLED;
+}
+
+function isStreamingLifecycle(lifecycle: StandardMessage['lifecycle'] | undefined): boolean {
+  return lifecycle === MessageLifecycle.STREAMING || lifecycle === MessageLifecycle.STARTED;
+}
+
 function mapStandardMessage(standard: StandardMessage): Message {
   const blocks = mapStandardBlocks(standard.blocks || []);
   const content = blocksToContent(blocks);
-  const isStreaming = standard.lifecycle === 'streaming' || standard.lifecycle === 'started';
-  const isComplete = standard.lifecycle === 'completed';
+  const isStreaming = isStreamingLifecycle(standard.lifecycle);
+  const isComplete = isTerminalLifecycle(standard.lifecycle);
   const isSystemNotice = standard.type === MessageType.SYSTEM;
 
   // 区分消息来源与展示来源：
@@ -967,7 +977,7 @@ function mapStandardMessage(standard: StandardMessage): Message {
     isStreaming,
     isComplete,
     type: resolvedType,
-    noticeType: isSystemNotice ? 'info' : undefined,
+    noticeType: standard.type === MessageType.ERROR ? 'error' : (isSystemNotice ? 'info' : undefined),
     metadata: {
       ...baseMetadata,
       eventId: standard.eventId,
@@ -1022,8 +1032,8 @@ function applyStreamUpdate(message: Message, update: StreamUpdate): Partial<Mess
       }
       break;
     case 'lifecycle':
-      updates.isStreaming = update.lifecycle === 'streaming' || update.lifecycle === 'started';
-      updates.isComplete = update.lifecycle === 'completed';
+      updates.isStreaming = isStreamingLifecycle(update.lifecycle);
+      updates.isComplete = isTerminalLifecycle(update.lifecycle);
       break;
     case 'block_insert':
       updates.blocks = [...(message.blocks || []), update.block as unknown as ContentBlock];

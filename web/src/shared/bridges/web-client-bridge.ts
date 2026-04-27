@@ -505,6 +505,9 @@ function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload
 
 function shouldRecoverFromBridgeError(error: unknown): boolean {
   if (error instanceof AgentApiError) {
+    if (error.errorCode === 'MODEL_INVOCATION_FAILED') {
+      return false;
+    }
     return error.status >= 500;
   }
   return true;
@@ -747,10 +750,57 @@ function stringifyTurnItemPayload(value: unknown): string | undefined {
 
 function resolveTurnItemLifecycle(status: string): MessageLifecycle {
   const normalized = status.trim().toLowerCase();
-  if (normalized === 'running' || normalized === 'pending' || normalized === 'started') {
+  if (!normalized) {
+    return MessageLifecycle.COMPLETED;
+  }
+  if (
+    normalized === 'cancelled'
+    || normalized === 'canceled'
+    || normalized === 'aborted'
+  ) {
+    return MessageLifecycle.CANCELLED;
+  }
+  if (
+    normalized === 'failed'
+    || normalized === 'error'
+    || normalized === 'timeout'
+    || normalized === 'killed'
+    || normalized === 'rejected'
+    || normalized === 'denied'
+  ) {
+    return MessageLifecycle.FAILED;
+  }
+  if (
+    normalized === 'running'
+    || normalized === 'pending'
+    || normalized === 'started'
+    || normalized === 'queued'
+    || normalized === 'blocked'
+    || normalized === 'awaiting_approval'
+    || normalized === 'review_required'
+    || normalized === 'repairing'
+    || normalized === 'verifying'
+  ) {
     return MessageLifecycle.STREAMING;
   }
+  if (
+    normalized === 'completed'
+    || normalized === 'complete'
+    || normalized === 'succeeded'
+    || normalized === 'success'
+    || normalized === 'done'
+    || normalized === 'finished'
+    || normalized === 'skipped'
+  ) {
+    return MessageLifecycle.COMPLETED;
+  }
   return MessageLifecycle.COMPLETED;
+}
+
+function isTerminalTurnLifecycle(lifecycle: MessageLifecycle): boolean {
+  return lifecycle === MessageLifecycle.COMPLETED
+    || lifecycle === MessageLifecycle.FAILED
+    || lifecycle === MessageLifecycle.CANCELLED;
 }
 
 function resolveTurnToolStatus(status: string): 'pending' | 'running' | 'completed' | 'failed' {
@@ -761,7 +811,19 @@ function resolveTurnToolStatus(status: string): 'pending' | 'running' | 'complet
   if (normalized === 'running' || normalized === 'started') {
     return 'running';
   }
-  if (normalized === 'failed' || normalized === 'error' || normalized === 'timeout' || normalized === 'killed') {
+  if (
+    normalized === 'failed'
+    || normalized === 'error'
+    || normalized === 'timeout'
+    || normalized === 'killed'
+    || normalized === 'rejected'
+    || normalized === 'blocked'
+    || normalized === 'needs_approval'
+    || normalized === 'cancelled'
+    || normalized === 'canceled'
+    || normalized === 'aborted'
+    || normalized === 'denied'
+  ) {
     return 'failed';
   }
   return 'completed';
@@ -818,7 +880,14 @@ function createSessionTurnItemStandardMessage(
   const title = readTurnItemString(item, 'title');
   const content = readTurnItemString(item, 'content');
   const status = readTurnItemString(item, 'status') || 'completed';
+  const turnId = trimBridgeString(payload.turn_id) || trimBridgeString(payload.turnId);
+  const turnSeq = typeof payload.turn_seq === 'number' && Number.isFinite(payload.turn_seq)
+    ? Math.floor(payload.turn_seq)
+    : (typeof payload.turnSeq === 'number' && Number.isFinite(payload.turnSeq) ? Math.floor(payload.turnSeq) : undefined);
   const itemSeq = readTurnItemNumber(item, 'itemSeq', 'item_seq');
+  const laneId = readTurnItemString(item, 'laneId', 'lane_id');
+  const laneSeq = readTurnItemNumber(item, 'laneSeq', 'lane_seq');
+  const timelineEntryId = readTurnItemString(item, 'timelineEntryId', 'timeline_entry_id');
   const timestamp = typeof event.occurred_at === 'number' && Number.isFinite(event.occurred_at)
     ? Math.floor(event.occurred_at)
     : Date.now();
@@ -827,18 +896,26 @@ function createSessionTurnItemStandardMessage(
     : undefined;
   const metadata: StandardMessage['metadata'] = {
     sessionId,
+    ...(turnId ? { turnId } : {}),
+    ...(typeof turnSeq === 'number' ? { turnSeq } : {}),
     turnItemId: itemId,
     turnItemKind: kind,
-    ...(typeof itemSeq === 'number' ? { cardStreamSeq: itemSeq } : {}),
+    ...(typeof itemSeq === 'number' ? { itemSeq, blockSeq: itemSeq, cardStreamSeq: itemSeq } : {}),
+    ...(laneId ? { laneId } : {}),
+    ...(typeof laneSeq === 'number' ? { laneSeq } : {}),
+    ...(timelineEntryId ? { timelineEntryId } : {}),
+    rustStreamItemId: itemId,
+    rustEventItemId: itemId,
     ...(event.event_id ? { eventId: event.event_id } : {}),
     ...(typeof eventSeq === 'number' ? { eventSeq } : {}),
   };
 
-  let id = `turn-live:${sessionId}:${itemId}`;
+  const canonicalItemId = turnId ? `turn:${turnId}:${itemId}` : `rust-timeline:${itemId}`;
+  let id = canonicalItemId;
   let type = MessageType.TEXT;
   let lifecycle = resolveTurnItemLifecycle(status);
   let blocks: StandardMessage['blocks'] = [];
-  let bridgeType: 'unifiedMessage' | 'unifiedComplete' = lifecycle === MessageLifecycle.COMPLETED
+  let bridgeType: 'unifiedMessage' | 'unifiedComplete' = isTerminalTurnLifecycle(lifecycle)
     ? 'unifiedComplete'
     : 'unifiedMessage';
 
@@ -852,16 +929,14 @@ function createSessionTurnItemStandardMessage(
       return null;
     }
     const resolvedItemLifecycle = resolveTurnItemLifecycle(status);
-    id = `rust-timeline:${itemId}`;
+    id = canonicalItemId;
     type = MessageType.THINKING;
-    lifecycle = resolvedItemLifecycle === MessageLifecycle.COMPLETED
-      ? MessageLifecycle.COMPLETED
-      : MessageLifecycle.STREAMING;
-    bridgeType = lifecycle === MessageLifecycle.COMPLETED ? 'unifiedComplete' : 'unifiedMessage';
+    lifecycle = resolvedItemLifecycle;
+    bridgeType = isTerminalTurnLifecycle(lifecycle) ? 'unifiedComplete' : 'unifiedMessage';
     blocks = buildAssistantThinkingBlocks(
       itemId,
       thinkingContent,
-      lifecycle === MessageLifecycle.COMPLETED,
+      isTerminalTurnLifecycle(lifecycle),
     );
     if (activeTurnLiveContext) {
       metadata.requestId = activeTurnLiveContext.requestId;
@@ -878,11 +953,26 @@ function createSessionTurnItemStandardMessage(
     if (!assistantText) {
       return null;
     }
-    id = `rust-timeline:${itemId}`;
+    id = canonicalItemId;
     const resolvedItemLifecycle = resolveTurnItemLifecycle(status);
     lifecycle = resolvedItemLifecycle;
-    bridgeType = lifecycle === MessageLifecycle.COMPLETED ? 'unifiedComplete' : 'unifiedMessage';
+    bridgeType = isTerminalTurnLifecycle(lifecycle) ? 'unifiedComplete' : 'unifiedMessage';
     blocks = buildAssistantTurnTextBlocks(assistantText);
+    if (activeTurnLiveContext) {
+      metadata.requestId = activeTurnLiveContext.requestId;
+      metadata.userMessageId = activeTurnLiveContext.userMessageId;
+      activeTurnLiveContext.currentAssistantMessageId = id;
+    }
+  } else if (kind === 'assistant_error') {
+    const errorText = (content || title || '').trim();
+    if (!errorText) {
+      return null;
+    }
+    id = canonicalItemId;
+    type = MessageType.ERROR;
+    lifecycle = resolveTurnItemLifecycle(status);
+    bridgeType = 'unifiedComplete';
+    blocks = buildAssistantTurnTextBlocks(errorText);
     if (activeTurnLiveContext) {
       metadata.requestId = activeTurnLiveContext.requestId;
       metadata.userMessageId = activeTurnLiveContext.userMessageId;
@@ -894,12 +984,12 @@ function createSessionTurnItemStandardMessage(
     const toolStatus = resolveTurnToolStatus(
       readTurnItemString(item, 'toolStatus', 'tool_status') || status,
     );
-    id = `rust-timeline:turn-item-tool-result-${toolCallId}`;
+    id = turnId ? `turn:${turnId}:${toolCallId}` : `rust-timeline:turn-item-tool-result-${toolCallId}`;
     type = MessageType.TOOL_CALL;
     lifecycle = toolStatus === 'running' || toolStatus === 'pending'
       ? MessageLifecycle.STREAMING
-      : MessageLifecycle.COMPLETED;
-    bridgeType = lifecycle === MessageLifecycle.COMPLETED ? 'unifiedComplete' : 'unifiedMessage';
+      : (toolStatus === 'failed' ? MessageLifecycle.FAILED : MessageLifecycle.COMPLETED);
+    bridgeType = isTerminalTurnLifecycle(lifecycle) ? 'unifiedComplete' : 'unifiedMessage';
     blocks = [{
       type: 'tool_call',
       toolName,
@@ -987,7 +1077,6 @@ function shouldRefreshFromRustEvent(event: RustEventEnvelope): boolean {
   return true;
 }
 
-// turn 终结事件：收到后结束活跃 turn，触发最终 bootstrap 对齐
 const TURN_TERMINAL_EVENTS = new Set([
   'session.turn.completed',
   'session.turn.failed',
@@ -1011,13 +1100,18 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     const deltaText = event.payload.delta;
     const rawEntryId = event.payload.entry_id;
     const deltaSessionId = trimBridgeString(event.payload.session_id);
+    const turnId = trimBridgeString(event.payload.turn_id) || trimBridgeString(event.payload.turnId);
+    const turnSeq = typeof event.payload.turn_seq === 'number' && Number.isFinite(event.payload.turn_seq)
+      ? Math.floor(event.payload.turn_seq)
+      : (typeof event.payload.turnSeq === 'number' && Number.isFinite(event.payload.turnSeq)
+        ? Math.floor(event.payload.turnSeq)
+        : undefined);
     if (typeof deltaText === 'string' && rawEntryId != null) {
       const entryId = typeof rawEntryId === 'number' ? rawEntryId : String(rawEntryId);
-      applyStreamingDelta(entryId, deltaText, deltaSessionId || undefined, activeTurnLiveContext ? {
-        replaceMessageId: activeTurnLiveContext.currentAssistantMessageId || activeTurnLiveContext.placeholderMessageId,
-        requestId: activeTurnLiveContext.requestId,
-        userMessageId: activeTurnLiveContext.userMessageId,
-      } : {});
+      applyStreamingDelta(entryId, deltaText, deltaSessionId || undefined, {
+        turnId: turnId || undefined,
+        turnSeq,
+      });
       emitMessage({ type: 'rustTaskEvent', eventType, payload: event.payload ?? {} } as ClientBridgeMessage);
       return;
     }
@@ -1030,9 +1124,17 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       const completedEntryId = typeof rawCompletedEntryId === 'number'
         ? rawCompletedEntryId
         : String(rawCompletedEntryId);
-      sealStreamingDelta(completedEntryId);
+      const turnId = trimBridgeString(event.payload.turn_id) || trimBridgeString(event.payload.turnId);
+      const turnSeq = typeof event.payload.turn_seq === 'number' && Number.isFinite(event.payload.turn_seq)
+        ? Math.floor(event.payload.turn_seq)
+        : (typeof event.payload.turnSeq === 'number' && Number.isFinite(event.payload.turnSeq)
+          ? Math.floor(event.payload.turnSeq)
+          : undefined);
+      sealStreamingDelta(completedEntryId, {
+        turnId: turnId || undefined,
+        turnSeq,
+      });
     }
-    // 封口后不触发 bootstrap——最终状态对齐由 session.turn.completed 负责
     emitMessage({ type: 'rustTaskEvent', eventType, payload: event.payload ?? {} } as ClientBridgeMessage);
     return;
   }
@@ -1056,10 +1158,8 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     }
   }
 
-  // ── turn 终结事件：结束活跃 turn，触发最终 bootstrap 状态对齐 ──
   if (TURN_TERMINAL_EVENTS.has(eventType)) {
     clearActiveTurnInFlight();
-    scheduleBootstrapRefreshFromRustEvent(eventType);
   } else if (!activeTurnInFlight) {
     // 非活跃 turn 期间，保持原有行为
     scheduleBootstrapRefreshFromRustEvent(eventType || 'rust_event');

@@ -164,6 +164,7 @@ interface RustSessionRuntimeTurnItemSummary {
   request_id?: string | null;
   user_message_id?: string | null;
   placeholder_message_id?: string | null;
+  timeline_entry_id?: string | null;
   thread_visible?: boolean;
   worker_visible?: boolean;
 }
@@ -1597,7 +1598,7 @@ function buildTimelineEntryArtifacts(
       }),
     });
   }
-  return artifacts;
+  return filterArtifactsCoveredByCanonicalTurnArtifacts(artifacts);
 }
 
 function buildDispatchArtifacts(
@@ -1793,8 +1794,6 @@ function projectionArtifactPreferenceScore(artifact: TimelineProjectionArtifact)
   let score = 0;
   if (artifact.artifactId.startsWith('turn:')) {
     score += 100;
-  } else if (artifact.artifactId.startsWith('rust-tool:')) {
-    score += 50;
   }
   score += normalizeNumber(artifact.message?.blocks?.length, 0);
   score += normalizeNumber(artifact.executionItems?.length, 0);
@@ -1882,6 +1881,50 @@ function projectionArtifactHasKnownIdentity(
     || matches(normalizeString((item.message as { metadata?: Record<string, unknown> } | undefined)?.metadata?.toolCallId))
     || (item.messageIds || []).some(matches)
   ));
+}
+
+function isCanonicalTurnArtifact(artifact: TimelineProjectionArtifact): boolean {
+  const metadata = artifact.message?.metadata;
+  const turnId = metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+    ? normalizeString((metadata as Record<string, unknown>).turnId)
+    : '';
+  return artifact.artifactId.startsWith('turn:') && Boolean(turnId);
+}
+
+function isCanonicalTurnUserArtifact(artifact: TimelineProjectionArtifact): boolean {
+  if (!isCanonicalTurnArtifact(artifact)) {
+    return false;
+  }
+  const metadata = artifact.message?.metadata;
+  const kind = metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+    ? normalizeString((metadata as Record<string, unknown>).turnItemKind)
+    : '';
+  return kind === 'user_message';
+}
+
+function isLegacyTimelineUserArtifact(artifact: TimelineProjectionArtifact): boolean {
+  return artifact.artifactId.startsWith('rust-timeline:')
+    && (artifact.message?.role === 'user' || artifact.message?.type === 'user_input');
+}
+
+function filterArtifactsCoveredByCanonicalTurnArtifacts(
+  artifacts: TimelineProjectionArtifact[],
+): TimelineProjectionArtifact[] {
+  const canonicalArtifacts = artifacts.filter(isCanonicalTurnArtifact);
+  if (canonicalArtifacts.length === 0) {
+    return artifacts;
+  }
+  const knownIds = collectProjectionArtifactIdentityIds(canonicalArtifacts);
+  const hasCanonicalUserArtifacts = canonicalArtifacts.some(isCanonicalTurnUserArtifact);
+  return artifacts.filter((artifact) => {
+    if (isCanonicalTurnArtifact(artifact)) {
+      return true;
+    }
+    if (hasCanonicalUserArtifacts && isLegacyTimelineUserArtifact(artifact)) {
+      return false;
+    }
+    return !projectionArtifactHasKnownIdentity(artifact, knownIds);
+  });
 }
 
 function toolStatusLooksTerminalError(normalizedStatus: string): boolean {
@@ -1984,17 +2027,19 @@ function buildTurnArtifactsFromSummary(
     const itemContent = normalizeString(item.content);
     const assistantKind = kind === 'assistant_thinking'
       || kind === 'assistant_stream'
-      || kind === 'assistant_final';
+      || kind === 'assistant_final'
+      || kind === 'assistant_error';
     const content = itemContent
+      || (kind === 'user_message' ? normalizeString(turn?.user_message) : '')
       || (kind === 'assistant_final' ? normalizeString(finalText) : '')
       || (assistantKind ? '' : normalizeString(item.title));
     if (!itemId) {
       continue;
     }
-    if (kind === 'assistant_phase' || kind === 'user_message') {
+    if (kind === 'assistant_phase') {
       continue;
     }
-    if (assistantKind && !content) {
+    if ((assistantKind || kind === 'user_message') && !content) {
       continue;
     }
     if (kind === 'assistant_thinking') {
@@ -2013,9 +2058,11 @@ function buildTurnArtifactsFromSummary(
       || normalizeString(workerLaneById.get(laneId)?.worker_id);
     const timestamp = resolveTurnItemTimestamp(item, timelineBase);
     const threadVisible = item.thread_visible === true
+      || kind === 'user_message'
       || kind === 'assistant_thinking'
       || kind === 'assistant_stream'
       || kind === 'assistant_final'
+      || kind === 'assistant_error'
       || kind === 'tool_call_started'
       || kind === 'tool_call_result';
     const workerVisible = item.worker_visible === true || Boolean(workerId && laneId);
@@ -2025,7 +2072,15 @@ function buildTurnArtifactsFromSummary(
     let source: Message['source'] = 'orchestrator';
     let blocks: ContentBlock[] | undefined;
 
-    if (kind === 'assistant_thinking') {
+    if (kind === 'user_message') {
+      role = 'user';
+      type = 'user_input';
+      source = 'user';
+      blocks = [{
+        type: 'text',
+        content,
+      }];
+    } else if (kind === 'assistant_thinking') {
       type = 'thinking';
       blocks = [{
         type: 'thinking',
@@ -2041,7 +2096,14 @@ function buildTurnArtifactsFromSummary(
         type: 'text',
         content,
       }];
+    } else if (kind === 'assistant_error') {
+      type = 'error';
+      blocks = [{
+        type: 'text',
+        content,
+      }];
     } else if (kind === 'tool_call_started' || kind === 'tool_call_result') {
+      const toolCallId = normalizeString(item.tool_call_id) || itemId;
       const toolName = normalizeString(item.tool_name) || normalizeString(item.title) || 'tool';
       const status = turnItemStatusToToolStatus(normalizeString(item.tool_status) || normalizeString(item.status));
       const toolArguments = parseJsonObjectLike(item.tool_arguments) || {};
@@ -2049,7 +2111,7 @@ function buildTurnArtifactsFromSummary(
         type: 'tool_call',
         content: '',
         toolCall: {
-          id: normalizeString(item.tool_call_id) || itemId,
+          id: toolCallId,
           name: toolName,
           arguments: toolArguments,
           status,
@@ -2085,14 +2147,20 @@ function buildTurnArtifactsFromSummary(
       }];
     }
 
-    const artifactId = `turn:${turnId}:${itemId}`;
+    const toolCallId = (kind === 'tool_call_started' || kind === 'tool_call_result')
+      ? (normalizeString(item.tool_call_id) || itemId)
+      : '';
+    const artifactId = (kind === 'tool_call_started' || kind === 'tool_call_result')
+      ? `turn:${turnId}:${toolCallId}`
+      : `turn:${turnId}:${itemId}`;
     const requestId = normalizeString(item.request_id);
     const userMessageId = normalizeString(item.user_message_id);
     const placeholderMessageId = normalizeString(item.placeholder_message_id);
+    const timelineEntryId = normalizeString(item.timeline_entry_id);
     const messageIdAliases = new Set<string>([artifactId, itemId, `rust-timeline:${itemId}`]);
-    if (requestId) messageIdAliases.add(requestId);
     if (userMessageId) messageIdAliases.add(userMessageId);
     if (placeholderMessageId) messageIdAliases.add(placeholderMessageId);
+    if (timelineEntryId) messageIdAliases.add(`rust-timeline:${timelineEntryId}`);
     if (kind === 'assistant_final' || kind === 'assistant_stream') {
       const streamingAlias = normalizeString(streamingEntryId);
       if (streamingAlias) {
@@ -2100,8 +2168,9 @@ function buildTurnArtifactsFromSummary(
       }
     }
     if (kind === 'tool_call_started' || kind === 'tool_call_result') {
-      const toolCallId = normalizeString(item.tool_call_id);
       if (toolCallId) {
+        messageIdAliases.add(`turn:${turnId}:${toolCallId}`);
+        messageIdAliases.add(`turn:${turnId}:${itemId}`);
         messageIdAliases.add(`rust-timeline:turn-item-tool-result-${toolCallId}`);
         messageIdAliases.add(`rust-timeline:turn-item-tool-started-${toolCallId}`);
       }
@@ -2131,15 +2200,27 @@ function buildTurnArtifactsFromSummary(
         source,
         metadata: {
           turnId,
+          turnSeq: normalizeNumber(turn?.turn_seq, 0),
           turnItemId: itemId,
           turnItemKind: kind,
+          itemSeq: normalizeNumber(item.item_seq, 0),
           blockSeq: normalizeNumber(item.item_seq, 0),
           laneId: laneId || undefined,
+          laneSeq: normalizeNumber(item.lane_seq, 0) || undefined,
+          cardStreamSeq: normalizeNumber(item.item_seq, 0),
           workerId: workerId || undefined,
           requestId: requestId || undefined,
           userMessageId: userMessageId || undefined,
           placeholderMessageId: placeholderMessageId || undefined,
-          ...(kind === 'assistant_final' && typeof turn?.response_duration_ms === 'number'
+          timelineEntryId: timelineEntryId || undefined,
+          ...(kind === 'tool_call_started' || kind === 'tool_call_result'
+            ? {
+                toolCallId: toolCallId || itemId,
+                toolName: normalizeString(item.tool_name) || normalizeString(item.title) || 'tool',
+              }
+            : {}),
+          ...((kind === 'assistant_final' || kind === 'assistant_error')
+            && typeof turn?.response_duration_ms === 'number'
             ? { responseDurationMs: Math.max(0, Math.floor(turn.response_duration_ms)) }
             : {}),
         },
@@ -2331,7 +2412,17 @@ function buildToolArtifacts(
   }
 
   return [...groups.values()]
-    .sort((left, right) => left.timestamp - right.timestamp)
+    .sort((left, right) => {
+      const anchorOrder = left.anchorEventSeq - right.anchorEventSeq;
+      if (anchorOrder !== 0) {
+        return anchorOrder;
+      }
+      const latestOrder = left.latestEventSeq - right.latestEventSeq;
+      if (latestOrder !== 0) {
+        return latestOrder;
+      }
+      return left.toolCallId.localeCompare(right.toolCallId);
+    })
     .map((entry, index): TimelineProjectionArtifact => {
       const resultSummary = summarizeToolArtifactResult(entry.toolName, entry.status);
       const standardized = entry.status === 'success' || entry.status === 'error'
@@ -2371,16 +2462,17 @@ function buildToolArtifacts(
           },
         });
       }
-      const artifactId = `rust-tool:${entry.toolCallId}`;
+      const artifactId = `event-tool:${entry.toolCallId}`;
       const messageIds = Array.from(new Set([
         artifactId,
         entry.toolCallId,
+        `rust-timeline:${entry.toolCallId}`,
         `rust-timeline:turn-item-tool-started-${entry.toolCallId}`,
         `rust-timeline:turn-item-tool-result-${entry.toolCallId}`,
       ]));
       return {
         artifactId,
-        kind: 'message',
+        kind: 'tool',
         displayOrder: displayOrderOffset + index + 1,
         anchorEventSeq: entry.anchorEventSeq,
         latestEventSeq: entry.latestEventSeq,
@@ -2496,9 +2588,16 @@ function buildTimelineProjection(
   const timelineArtifacts = buildTimelineEntryArtifacts(sessionId, payload.timeline);
   const currentTurnArtifacts = buildCurrentTurnArtifacts(sessionId, payload.runtimeReadModel, generatedAt);
   const currentTurnIdentityIds = collectProjectionArtifactIdentityIds(currentTurnArtifacts);
-  const visibleTimelineArtifacts = timelineArtifacts.filter((artifact) => (
-    !projectionArtifactHasKnownIdentity(artifact, currentTurnIdentityIds)
-  ));
+  const currentTurnHasCanonicalUser = currentTurnArtifacts.some(isCanonicalTurnUserArtifact);
+  const visibleTimelineArtifacts = timelineArtifacts.filter((artifact) => {
+    if (projectionArtifactHasKnownIdentity(artifact, currentTurnIdentityIds)) {
+      return false;
+    }
+    if (currentTurnHasCanonicalUser && isLegacyTimelineUserArtifact(artifact)) {
+      return false;
+    }
+    return true;
+  });
   const eventArtifacts = buildEventArtifacts(sessionId, payload.runtimeReadModel, recentEvents);
   const toolArtifacts = buildToolArtifacts(
     sessionId,

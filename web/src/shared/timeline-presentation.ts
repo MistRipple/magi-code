@@ -53,6 +53,7 @@ export function collectTimelineAliasIds(
   const toolCallId = normalizeTimelineAliasCandidate(metadata.toolCallId);
   const userMessageId = normalizeTimelineAliasCandidate(metadata.userMessageId);
   const placeholderMessageId = normalizeTimelineAliasCandidate(metadata.placeholderMessageId);
+  const timelineEntryId = normalizeTimelineAliasCandidate(metadata.timelineEntryId);
   const normalizedRole = typeof message.role === 'string' ? message.role.trim().toLowerCase() : '';
   const normalizedType = typeof message.type === 'string' ? message.type.trim().toLowerCase() : '';
   const isUserMessage = normalizedRole === 'user' || normalizedType === 'user_input';
@@ -91,8 +92,14 @@ export function collectTimelineAliasIds(
     }
   }
   if (toolCallId) {
+    if (turnId) {
+      addAlias(`turn:${turnId}:${toolCallId}`);
+    }
     addAlias(`rust-timeline:turn-item-tool-started-${toolCallId}`);
     addAlias(`rust-timeline:turn-item-tool-result-${toolCallId}`);
+  }
+  if (timelineEntryId) {
+    addAlias(`rust-timeline:${timelineEntryId}`);
   }
 
   return Array.from(aliases);

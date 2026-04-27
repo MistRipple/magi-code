@@ -1,9 +1,9 @@
 /**
  * 时间轴投影排序的语义阶段号（兜底排序因子）。
  *
- * 排序主逻辑按 timelineAnchorTimestamp / timestamp 自然时序排列。
- * 本函数仅在多条消息恰好具有相同 timestamp 时，作为兜底依据
- * 决定它们的相对顺序。数字越小越靠前。
+ * 排序主逻辑按 turnSeq / itemSeq / laneSeq / eventSeq 等事实序号排列。
+ * 本函数仅用于旧消息缺少事实序号时的语义分层，不参与用时间戳猜顺序。
+ * 数字越小越靠前。
  *
  * 此函数由后端投影构建（session-timeline-projection.ts）
  * 和前端渲染排序（timeline-render-items.ts、messages.svelte.ts）共同使用。

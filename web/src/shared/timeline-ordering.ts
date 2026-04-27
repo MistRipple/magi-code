@@ -1,6 +1,9 @@
 export interface TimelineSemanticOrderInput {
   timestamp: number;
   stableId: string;
+  turnSeq?: number;
+  itemSeq?: number;
+  laneSeq?: number;
   anchorEventSeq?: number;
   blockSeq?: number;
 }
@@ -39,15 +42,40 @@ export function resolveTimelineEventSeqFromMetadata(
   return normalized > 0 ? normalized : 0;
 }
 
-export function resolveTimelineBlockSeqFromMetadata(
+function resolveNonNegativeMetadataNumber(
   metadata: Record<string, unknown> | undefined,
+  key: string,
 ): number {
-  const raw = metadata?.blockSeq;
+  const raw = metadata?.[key];
   if (typeof raw !== 'number' || !Number.isFinite(raw)) {
     return 0;
   }
   const normalized = Math.floor(raw);
   return normalized >= 0 ? normalized : 0;
+}
+
+export function resolveTimelineTurnSeqFromMetadata(
+  metadata: Record<string, unknown> | undefined,
+): number {
+  return resolveNonNegativeMetadataNumber(metadata, 'turnSeq');
+}
+
+export function resolveTimelineItemSeqFromMetadata(
+  metadata: Record<string, unknown> | undefined,
+): number {
+  return resolveNonNegativeMetadataNumber(metadata, 'itemSeq');
+}
+
+export function resolveTimelineLaneSeqFromMetadata(
+  metadata: Record<string, unknown> | undefined,
+): number {
+  return resolveNonNegativeMetadataNumber(metadata, 'laneSeq');
+}
+
+export function resolveTimelineBlockSeqFromMetadata(
+  metadata: Record<string, unknown> | undefined,
+): number {
+  return resolveNonNegativeMetadataNumber(metadata, 'blockSeq');
 }
 
 export function resolveTimelineSemanticMessageType(
@@ -119,10 +147,44 @@ export function resolveTimelineDetailedVersionFromMetadata(
   return (eventSeq * 1_000_000) + blockSeq;
 }
 
+function compareSharedFactOrder(
+  left: number | null,
+  right: number | null,
+): number | null {
+  if (left !== null && right !== null && left !== right) {
+    return left - right;
+  }
+  return null;
+}
+
 export function compareTimelineSemanticOrder(
   left: TimelineSemanticOrderInput,
   right: TimelineSemanticOrderInput,
 ): number {
+  const turnOrder = compareSharedFactOrder(
+    normalizePositiveInteger(left.turnSeq),
+    normalizePositiveInteger(right.turnSeq),
+  );
+  if (turnOrder !== null) {
+    return turnOrder;
+  }
+
+  const itemOrder = compareSharedFactOrder(
+    normalizePositiveInteger(left.itemSeq),
+    normalizePositiveInteger(right.itemSeq),
+  );
+  if (itemOrder !== null) {
+    return itemOrder;
+  }
+
+  const laneOrder = compareSharedFactOrder(
+    normalizePositiveInteger(left.laneSeq),
+    normalizePositiveInteger(right.laneSeq),
+  );
+  if (laneOrder !== null) {
+    return laneOrder;
+  }
+
   const leftAnchorEventSeq = normalizePositiveInteger(left.anchorEventSeq);
   const rightAnchorEventSeq = normalizePositiveInteger(right.anchorEventSeq);
   if (
@@ -139,10 +201,6 @@ export function compareTimelineSemanticOrder(
     if (leftBlockSeq !== rightBlockSeq) {
       return leftBlockSeq - rightBlockSeq;
     }
-  }
-
-  if (left.timestamp !== right.timestamp) {
-    return left.timestamp - right.timestamp;
   }
 
   return left.stableId.localeCompare(right.stableId);

@@ -802,7 +802,9 @@ function isSettlingAssistantResponse(message: Message): boolean {
   if (!turnItemKind) {
     return true;
   }
-  return turnItemKind === 'assistant_stream' || turnItemKind === 'assistant_final';
+  return turnItemKind === 'assistant_stream'
+    || turnItemKind === 'assistant_final'
+    || turnItemKind === 'assistant_error';
 }
 
 function findAssistantByThreadOrder(

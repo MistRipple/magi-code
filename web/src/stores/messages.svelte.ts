@@ -49,8 +49,11 @@ import {
   resolveTimelineBlockSeqFromMetadata,
   resolveTimelineCardStreamSeqFromMetadata,
   resolveTimelineEventSeqFromMetadata,
+  resolveTimelineItemSeqFromMetadata,
+  resolveTimelineLaneSeqFromMetadata,
   resolveStableTimelinePlacementTimestamp,
   resolveTimelineSortTimestamp,
+  resolveTimelineTurnSeqFromMetadata,
   resolveTimelineVersionFromMetadata,
 } from '../shared/timeline-ordering';
 import {
@@ -78,6 +81,14 @@ interface SettingsRegistrySnapshot {
   roleTemplates: RoleTemplate[];
   registryEngines: ModelEngine[];
   registryAgents: AgentBinding[];
+}
+
+export type TaskComposerIntent = 'supplement_context' | 'append_task' | 'replan';
+
+export interface TaskComposerDraft {
+  intent: TaskComposerIntent;
+  taskId: string | null;
+  text: string;
 }
 
 // ============ 状态定义 ============
@@ -116,6 +127,7 @@ export const messagesState = $state({
     isLoadingBefore: false,
   },
   queuedMessages: [] as QueuedMessage[],
+  taskComposerDraft: null as TaskComposerDraft | null,
 
   // 处理状态
   isProcessing: false,
@@ -682,6 +694,10 @@ function collectMessageIdentityKeys(message: Message | undefined): Set<string> {
   add(metadata?.rustEventItemId);
   add(metadata?.turnItemId);
   add(metadata?.toolCallId);
+  const timelineEntryId = typeof metadata?.timelineEntryId === 'string' ? metadata.timelineEntryId.trim() : '';
+  if (timelineEntryId) {
+    add(`rust-timeline:${timelineEntryId}`);
+  }
   const turnId = typeof metadata?.turnId === 'string' ? metadata.turnId.trim() : '';
   const turnItemId = typeof metadata?.turnItemId === 'string' ? metadata.turnItemId.trim() : '';
   if (turnId && turnItemId) {
@@ -1126,9 +1142,13 @@ function normalizeTimelineExecutionItem(item: TimelineExecutionItem): TimelineEx
 }
 
 function executionItemToOrderInput(item: TimelineExecutionItem): TimelineSemanticOrderInput {
+  const metadata = resolveMessageMetadataRecord(item.message);
   return {
     timestamp: item.timestamp,
     stableId: item.itemId,
+    turnSeq: resolveTimelineTurnSeqFromMetadata(metadata),
+    itemSeq: resolveTimelineItemSeqFromMetadata(metadata) || item.cardStreamSeq || item.itemOrder,
+    laneSeq: resolveTimelineLaneSeqFromMetadata(metadata),
     anchorEventSeq: item.anchorEventSeq,
     blockSeq: getMessageBlockSeq(item.message),
   };
@@ -1244,9 +1264,13 @@ function rebuildTimelineIndexes(): void {
 }
 
 function nodeToOrderInput(node: TimelineNode): TimelineSemanticOrderInput {
+  const metadata = resolveMessageMetadataRecord(node.message);
   return {
     timestamp: node.timestamp,
     stableId: node.nodeId,
+    turnSeq: resolveTimelineTurnSeqFromMetadata(metadata),
+    itemSeq: node.cardStreamSeq,
+    laneSeq: resolveTimelineLaneSeqFromMetadata(metadata),
     anchorEventSeq: node.anchorEventSeq,
     blockSeq: getMessageBlockSeq(node.message),
   };
@@ -1263,6 +1287,9 @@ interface LocalProjectionFlatRenderEntry {
   groupId: string;
   message: Message;
   timestamp: number;
+  turnSeq: number;
+  itemSeq: number;
+  laneSeq: number;
   anchorEventSeq: number;
   blockSeq: number;
   cardStreamSeq: number;
@@ -1283,6 +1310,9 @@ function renderEntryToOrderInput(entry: LocalProjectionFlatRenderEntry): Timelin
   return {
     timestamp: entry.timestamp,
     stableId: entry.entryId,
+    turnSeq: entry.turnSeq,
+    itemSeq: entry.itemSeq,
+    laneSeq: entry.laneSeq,
     anchorEventSeq: entry.anchorEventSeq,
     blockSeq: entry.blockSeq,
   };
@@ -1327,6 +1357,7 @@ function buildProjectionRenderEntriesFromArtifacts(
   const flatEntries: LocalProjectionFlatRenderEntry[] = [];
 
   for (const artifact of artifacts) {
+    const artifactMetadata = resolveMessageMetadataRecord(artifact.message);
     const artifactVisible = displayContext === 'thread'
       ? artifact.threadVisible
       : Boolean(worker && artifact.workerTabs.includes(worker));
@@ -1341,6 +1372,9 @@ function buildProjectionRenderEntriesFromArtifacts(
         groupId: artifact.artifactId,
         message: artifact.message,
         timestamp: artifact.timestamp,
+        turnSeq: resolveTimelineTurnSeqFromMetadata(artifactMetadata),
+        itemSeq: resolveTimelineItemSeqFromMetadata(artifactMetadata),
+        laneSeq: resolveTimelineLaneSeqFromMetadata(artifactMetadata),
         anchorEventSeq: artifact.anchorEventSeq,
         blockSeq: getMessageBlockSeq(artifact.message),
         cardStreamSeq: artifact.cardStreamSeq,
@@ -1361,6 +1395,11 @@ function buildProjectionRenderEntriesFromArtifacts(
         groupId: artifact.artifactId,
         message: item.message,
         timestamp: item.timestamp,
+        turnSeq: resolveTimelineTurnSeqFromMetadata(resolveMessageMetadataRecord(item.message)),
+        itemSeq: resolveTimelineItemSeqFromMetadata(resolveMessageMetadataRecord(item.message))
+          || item.cardStreamSeq
+          || item.itemOrder,
+        laneSeq: resolveTimelineLaneSeqFromMetadata(resolveMessageMetadataRecord(item.message)),
         anchorEventSeq: item.anchorEventSeq,
         blockSeq: getMessageBlockSeq(item.message),
         cardStreamSeq: item.cardStreamSeq,
@@ -1430,9 +1469,13 @@ function isProjectionArtifact(
 }
 
 function artifactToOrderInput(artifact: TimelineProjectionArtifact): TimelineSemanticOrderInput {
+  const metadata = resolveMessageMetadataRecord(artifact.message);
   return {
     timestamp: artifact.timestamp,
     stableId: artifact.artifactId,
+    turnSeq: resolveTimelineTurnSeqFromMetadata(metadata),
+    itemSeq: resolveTimelineItemSeqFromMetadata(metadata),
+    laneSeq: resolveTimelineLaneSeqFromMetadata(metadata),
     anchorEventSeq: artifact.anchorEventSeq,
     blockSeq: getMessageBlockSeq(artifact.message),
   };
@@ -2527,6 +2570,7 @@ function applySessionViewState(sessionId: string | null | undefined): boolean {
 
 function resetSessionScopedExecutionState(): void {
   edits = [];
+  messagesState.taskComposerDraft = null;
   messagesState.orchestratorRuntimeState = null;
   if (messagesState.appState) {
     messagesState.appState = {
@@ -2686,6 +2730,25 @@ export function clearMessageJump(): void {
     messageId: null,
     nonce: messagesState.messageJump.nonce,
   };
+}
+
+export function setTaskComposerDraft(input: {
+  intent: TaskComposerIntent;
+  taskId?: string | null;
+  text: string;
+}): void {
+  const normalizedText = typeof input.text === 'string' ? input.text.trim() : '';
+  if (!normalizedText) return;
+  messagesState.taskComposerDraft = {
+    intent: input.intent,
+    taskId: normalizeSessionId(input.taskId),
+    text: normalizedText,
+  };
+}
+
+export function clearTaskComposerDraft(): void {
+  if (!messagesState.taskComposerDraft) return;
+  messagesState.taskComposerDraft = null;
 }
 
 // 会话操作
@@ -3478,6 +3541,16 @@ class StreamingTextCollector {
   /** 累积的完整原始文本 */
   private buffer = '';
 
+  /** 当前流式增量实际命中的消息目标 */
+  targetMessageId: string | null = null;
+
+  setTargetMessageId(messageId: string): void {
+    const normalized = typeof messageId === 'string' ? messageId.trim() : '';
+    if (normalized) {
+      this.targetMessageId = normalized;
+    }
+  }
+
   /** 追加增量文本到缓冲区（不触发渲染） */
   pushDelta(delta: string): void {
     this.buffer += delta;
@@ -3518,70 +3591,44 @@ export function applyStreamingDelta(
   delta: string,
   sessionId?: string,
   options: {
-    replaceMessageId?: string;
-    requestId?: string;
-    userMessageId?: string;
+    turnId?: string;
+    turnSeq?: number;
   } = {},
 ): void {
   if (sessionId && messagesState.currentSessionId && sessionId !== messagesState.currentSessionId) {
     return;
   }
 
-  const nodeId = `rust-timeline:${entryId}`;
-  const collectorKey = String(entryId);
+  const normalizedTurnId = typeof options.turnId === 'string' ? options.turnId.trim() : '';
+  const canonicalNodeId = normalizedTurnId
+    ? `turn:${normalizedTurnId}:${entryId}`
+    : `rust-timeline:${entryId}`;
+  const collectorKey = normalizedTurnId ? `${normalizedTurnId}:${entryId}` : String(entryId);
+  const targetId = canonicalNodeId;
 
-  // 获取或创建收集器
   let collector = activeStreamCollectors.get(collectorKey);
   if (!collector) {
     collector = new StreamingTextCollector();
     activeStreamCollectors.set(collectorKey, collector);
   }
 
-  // 追加 delta 到缓冲区
+  collector.setTargetMessageId(targetId);
   collector.pushDelta(delta);
   const renderableText = collector.getRenderableText();
   if (renderableText.length === 0) {
     return;
   }
-
-  const existingMessage = getEffectiveTimelineMessage(nodeId);
+  const existingMessage = getEffectiveTimelineMessage(targetId);
   if (existingMessage) {
-    enqueueTimelineStreamUpdate(nodeId, {
+    enqueueTimelineStreamUpdate(targetId, {
       content: renderableText,
       blocks: [{ type: 'text', content: renderableText }],
       isStreaming: true,
       isComplete: false,
       updatedAt: Date.now(),
     });
-    markMessageActive(nodeId);
-  } else {
-    const now = Date.now();
-    upsertTimelineNode({
-      id: nodeId,
-      role: 'assistant',
-      source: 'orchestrator',
-      content: renderableText,
-      blocks: [{ type: 'text', content: renderableText }],
-      timestamp: now,
-      updatedAt: now,
-      isStreaming: true,
-      isComplete: false,
-      type: 'text',
-      metadata: {
-        sessionId: sessionId || messagesState.currentSessionId || '',
-        eventSeq: 0,
-        timelineAnchorTimestamp: now,
-        turnItemId: collectorKey,
-        rustStreamItemId: collectorKey,
-        requestId: options.requestId || undefined,
-        userMessageId: options.userMessageId || undefined,
-        placeholderMessageId: options.replaceMessageId || undefined,
-      },
-    } as Message, { thread: true }, {
-      displayOrder: undefined,
-      replaceMessageId: options.replaceMessageId,
-    });
-    markMessageActive(nodeId);
+    markMessageActive(targetId);
+    return;
   }
 }
 
@@ -3590,17 +3637,27 @@ export function applyStreamingDelta(
  * 标记 isStreaming=false。
  * 参考 Codex: StreamController.finalize() → collector.finalize_and_drain()
  */
-export function sealStreamingDelta(entryId: string | number): void {
-  const nodeId = `rust-timeline:${entryId}`;
-  const collectorKey = String(entryId);
+export function sealStreamingDelta(
+  entryId: string | number,
+  options: {
+    turnId?: string;
+    turnSeq?: number;
+  } = {},
+): void {
+  const normalizedTurnId = typeof options.turnId === 'string' ? options.turnId.trim() : '';
+  const nodeId = normalizedTurnId
+    ? `turn:${normalizedTurnId}:${entryId}`
+    : `rust-timeline:${entryId}`;
+  const collectorKey = normalizedTurnId ? `${normalizedTurnId}:${entryId}` : String(entryId);
   const collector = activeStreamCollectors.get(collectorKey);
 
   if (collector) {
     const finalText = collector.finalize();
+    const targetMessageId = collector.targetMessageId || nodeId;
     activeStreamCollectors.delete(collectorKey);
 
     if (finalText.length > 0) {
-      enqueueTimelineStreamUpdate(nodeId, {
+      enqueueTimelineStreamUpdate(targetMessageId, {
         content: finalText,
         blocks: [{ type: 'text', content: finalText }],
         isStreaming: false,
@@ -3611,7 +3668,6 @@ export function sealStreamingDelta(entryId: string | number): void {
     }
   }
 
-  // 没有收集器但节点存在：直接标记完成
   const existingMessage = getEffectiveTimelineMessage(nodeId);
   if (existingMessage) {
     enqueueTimelineStreamUpdate(nodeId, {

@@ -418,12 +418,18 @@ export interface MessageMetadata {
   requestId?: string;
   timelineAnchorTimestamp?: number;
   turnId?: string;
+  turnSeq?: number;
   turnItemId?: string;
   turnItemKind?: string;
+  itemSeq?: number;
+  laneSeq?: number;
+  rustStreamItemId?: string;
+  rustEventItemId?: string;
   eventId?: string;
   eventSeq?: number;
   cardId?: string;
   parentCardId?: string;
+  blockSeq?: number;
   cardStreamSeq?: number;
   finalStreamSeq?: number;
   lateArrival?: boolean;
