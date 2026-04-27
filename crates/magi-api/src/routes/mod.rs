@@ -48,7 +48,7 @@ use crate::{
 
 use dispatch_flow::{
     accept_session_task_submission, append_dispatch_assistant_message, append_session_user_message,
-    resolve_dispatch_session, spawn_session_task_dispatch,
+    finalize_session_task_dispatch, resolve_dispatch_session,
 };
 
 pub fn build_router(state: ApiState) -> Router {
@@ -366,6 +366,7 @@ mod tests {
             governance,
         )
         .with_shadow_execution_pipeline(orchestrator, execution_runtime, memory_store)
+        .with_task_planning_model_bridge_client(model_bridge_client.clone())
         .with_model_bridge_client(model_bridge_client.clone())
         .with_tool_registry(tool_registry_for_dispatcher.clone())
         .with_task_store(Arc::clone(&task_store));
@@ -410,6 +411,7 @@ mod tests {
             WorkerRuntime::new_compare,
             Arc::new(FailingModelBridgeClient),
         )
+        .with_task_planning_model_bridge_client(Arc::new(StaticModelBridgeClient))
     }
 
     async fn get_json(app: Router, path: &str) -> serde_json::Value {
@@ -823,7 +825,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_turn_classifier_failure_returns_model_error_not_internal_500() {
+    async fn session_turn_classifier_uses_planning_client_when_business_model_unhealthy() {
         let app = build_router(test_state_with_unhealthy_shadow_execution_pipeline());
 
         let (status, body) = post_json(
@@ -839,14 +841,12 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert_eq!(body["error_code"], "MODEL_INVOCATION_FAILED");
-        assert!(
-            body["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("Session Turn 分类失败")),
-            "分类器调用失败应返回明确的模型调用错误: {body:?}"
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "分类器不应被业务模型失败阻断: {body:?}"
         );
+        assert_eq!(body["route"], "chat");
     }
 
     #[tokio::test]
@@ -1506,6 +1506,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_turn_tool_round_missing_final_reply_fails_with_visible_turn_item() {
+        let state = build_shadow_execution_state(
+            WorkerRuntime::new_compare,
+            Arc::new(ExecuteToolMissingFinalModelBridgeClient {
+                invoke_count: AtomicUsize::new(0),
+            }),
+        );
+        let app = build_router(state.clone());
+        let session_id = SessionId::new("session-turn-tool-missing-final");
+        state
+            .session_store
+            .create_session(session_id.clone(), "tool missing final session")
+            .expect("session should create");
+
+        let (status, body) = post_json(
+            app,
+            "/api/session/turn",
+            json!({
+                "sessionId": session_id.to_string(),
+                "text": "请搜索当前仓库里的路由实现",
+                "deepTask": false,
+                "skillName": "",
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected response body: {body:?}");
+
+        wait_for_condition(
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+            || {
+                let Some(turn) = state
+                    .session_store
+                    .runtime_sidecar(&session_id)
+                    .and_then(|sidecar| sidecar.current_turn)
+                else {
+                    return false;
+                };
+                turn.status == "failed"
+                    && turn.items.iter().any(|item| item.kind == "tool_call_started")
+                    && turn.items.iter().any(|item| item.kind == "tool_call_result")
+                    && turn.items.iter().any(|item| item.kind == "assistant_error")
+                    && !turn.items.iter().any(|item| item.kind == "assistant_final")
+            },
+            "tool round without final reply should fail through canonical turn items",
+        )
+        .await;
+
+        let turn = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("failed current turn should remain inspectable");
+        let error_item = turn
+            .items
+            .iter()
+            .find(|item| item.kind == "assistant_error")
+            .expect("assistant_error turn item should be appended");
+        assert!(
+            error_item
+                .content
+                .as_deref()
+                .is_some_and(|text| text.contains("模型在工具调用后未返回最终回复")),
+            "assistant_error must expose the real missing-final-reply reason: {error_item:?}"
+        );
+
+        let assistant_snapshots = state
+            .session_store
+            .timeline()
+            .into_iter()
+            .filter(|entry| {
+                entry.session_id == session_id
+                    && matches!(
+                        entry.kind,
+                        magi_session_store::TimelineEntryKind::AssistantMessage
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            assistant_snapshots.iter().any(|entry| {
+                timeline_entry_visible_text(&entry.message)
+                    .as_deref()
+                    .is_some_and(|text| text.contains("模型在工具调用后未返回最终回复"))
+            }),
+            "assistant_error snapshot must restore as visible failure text"
+        );
+
+        let events = state.event_bus.snapshot().recent_events;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "session.turn.failed"),
+            "terminal route event should be a failed turn, not an internal assembly completion"
+        );
+    }
+
+    #[tokio::test]
     async fn append_dispatch_assistant_message_uses_current_turn_assistant_final_as_authoritative_source()
      {
         let state = test_state_with_shadow_execution_pipeline();
@@ -1570,6 +1669,7 @@ mod tests {
                                 request_id: None,
                                 user_message_id: None,
                                 placeholder_message_id: None,
+                                timeline_entry_id: None,
                                 thread_visible: false,
                                 worker_visible: false,
                             },
@@ -1595,6 +1695,7 @@ mod tests {
                                 request_id: None,
                                 user_message_id: None,
                                 placeholder_message_id: None,
+                                timeline_entry_id: None,
                                 thread_visible: true,
                                 worker_visible: false,
                             },
@@ -1736,6 +1837,7 @@ mod tests {
                             request_id: None,
                             user_message_id: None,
                             placeholder_message_id: None,
+                            timeline_entry_id: None,
                             thread_visible: true,
                             worker_visible: false,
                         }],
@@ -1871,6 +1973,7 @@ mod tests {
                             request_id: None,
                             user_message_id: None,
                             placeholder_message_id: None,
+                            timeline_entry_id: None,
                             thread_visible: true,
                             worker_visible: false,
                         }],
@@ -2163,8 +2266,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_turn_does_not_write_extraction_or_bind_mission_when_model_classification_fails()
-     {
+    async fn session_turn_deep_task_builds_graph_when_business_model_is_unhealthy() {
         let state = test_state_with_unhealthy_shadow_execution_pipeline();
         let app = build_router(state.clone());
 
@@ -2181,23 +2283,43 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert_eq!(body["error_code"], "MODEL_INVOCATION_FAILED");
-
-        let extraction_history = state
-            .shadow_execution_pipeline()
-            .expect("shadow execution pipeline should exist")
-            .memory_store
-            .extraction_results_for_session(&SessionId::new("session-route-shadow"));
-        assert!(extraction_history.is_empty());
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "深度任务建图不应被业务模型失败阻断: {body:?}"
+        );
+        assert_eq!(body["route"], "task");
+        let root_task_id = body["rootTaskId"]
+            .as_str()
+            .expect("深度任务应返回 rootTaskId");
+        let action_task_id = body["actionTaskId"]
+            .as_str()
+            .expect("深度任务应返回 actionTaskId");
+        let projection = state
+            .task_store()
+            .expect("task store should exist")
+            .build_projection(&TaskId::new(root_task_id))
+            .expect("深度任务应生成可投影任务图");
+        assert_eq!(projection.execution_mode, "deep");
+        assert!(
+            projection.progress_summary.total_tasks > 1,
+            "深度任务应生成多节点任务图: {projection:?}"
+        );
 
         let ownership = state
             .session_store
             .execution_ownership(&SessionId::new("session-route-shadow"))
-            .expect("base session ownership should remain present");
-        assert!(ownership.mission_id.is_none());
-        assert!(ownership.task_id.is_none());
-        assert!(ownership.worker_id.is_none());
+            .expect("深度任务应写入 session 执行 ownership");
+        assert!(ownership.mission_id.is_some());
+        assert_eq!(
+            ownership
+                .task_id
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some(action_task_id)
+        );
+        assert!(ownership.worker_id.is_some());
     }
 
     #[tokio::test]
@@ -2765,6 +2887,10 @@ mod tests {
         invoke_count: AtomicUsize,
     }
 
+    struct ExecuteToolMissingFinalModelBridgeClient {
+        invoke_count: AtomicUsize,
+    }
+
     struct DelayedModelBridgeClient {
         delay: Duration,
         payload: String,
@@ -2908,6 +3034,63 @@ mod tests {
                 serde_json::json!({
                     "content": "工具执行完成，已根据搜索结果给出回复。",
                     "finish_reason": "stop"
+                })
+            };
+            Ok(BridgeResponse {
+                ok: true,
+                payload: payload.to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for ExecuteToolMissingFinalModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            if request.prompt.contains("Session Turn 编排分类器") {
+                return Ok(BridgeResponse {
+                    ok: true,
+                    payload: classifier_tool_payload(serde_json::json!({
+                        "route": "execute",
+                        "taskTitle": null,
+                        "executionGoal": null,
+                        "requiredWorkers": [],
+                        "toolIntent": null,
+                    })),
+                });
+            }
+            let index = self.invoke_count.fetch_add(1, Ordering::SeqCst);
+            let payload = if index == 0 {
+                serde_json::json!({
+                    "content": null,
+                    "finish_reason": "tool_calls",
+                    "tool_calls": [{
+                        "id": "call-search-text",
+                        "type": "function",
+                        "function": {
+                            "name": "search_text",
+                            "arguments": serde_json::json!({
+                                "query": "Route Shadow Session",
+                                "root": ".",
+                                "limit": 1
+                            }).to_string(),
+                        }
+                    }]
+                })
+            } else {
+                serde_json::json!({
+                    "content": null,
+                    "finish_reason": "stop",
+                    "tool_calls": []
                 })
             };
             Ok(BridgeResponse {

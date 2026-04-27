@@ -134,6 +134,8 @@ pub struct ActiveExecutionTurnItem {
     pub user_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeholder_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline_entry_id: Option<String>,
     #[serde(default = "default_true")]
     pub thread_visible: bool,
     #[serde(default)]
@@ -421,7 +423,10 @@ fn extract_snapshot_visible_text(value: &serde_json::Value) -> Option<String> {
             .get("kind")
             .and_then(serde_json::Value::as_str)
             .map(str::trim);
-        if !matches!(kind, Some("assistant_final" | "assistant_stream")) {
+        if !matches!(
+            kind,
+            Some("assistant_final" | "assistant_error" | "assistant_stream")
+        ) {
             continue;
         }
         if let Some(text) = item

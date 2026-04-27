@@ -13,7 +13,7 @@ use magi_api::{
 use magi_bridge_client::{
     BridgeDispatchRuntime, BridgeServerKind, BridgeTransport, HttpModelBridgeClient,
     HttpModelBridgeProtocol, JsonRpcHostBridgeClient, JsonRpcMcpBridgeClient,
-    JsonRpcStdioTransport, StdioMcpBridgeClient,
+    JsonRpcModelBridgeClient, JsonRpcStdioTransport, StdioMcpBridgeClient,
 };
 use magi_context_runtime::{ContextBudget, ContextRuntime};
 use magi_core::EventId;
@@ -37,6 +37,45 @@ use tracing::warn;
 
 #[cfg(test)]
 struct StaticTestModelBridgeClient;
+
+#[derive(Clone)]
+struct UnavailableBusinessModelBridgeClient {
+    state_root: PathBuf,
+}
+
+impl UnavailableBusinessModelBridgeClient {
+    fn new(state_root: PathBuf) -> Self {
+        Self { state_root }
+    }
+
+    fn error(&self) -> magi_bridge_client::BridgeClientError {
+        magi_bridge_client::BridgeClientError::CallFailed {
+            layer: magi_bridge_client::BridgeErrorLayer::RemoteBusiness,
+            code: Some(-32004),
+            message: format!(
+                "业务模型桥未配置:请在环境变量 MAGI_OPENAI_COMPAT_BASE_URL 或 {}/settings.json 的 auxiliary 段配置 baseUrl",
+                self.state_root.display()
+            ),
+        }
+    }
+}
+
+impl magi_bridge_client::ModelBridgeClient for UnavailableBusinessModelBridgeClient {
+    fn invoke(
+        &self,
+        _request: magi_bridge_client::ModelInvocationRequest,
+    ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError> {
+        Err(self.error())
+    }
+
+    fn invoke_streaming(
+        &self,
+        _request: magi_bridge_client::ModelInvocationRequest,
+        _on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
+    ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError> {
+        Err(self.error())
+    }
+}
 
 #[cfg(test)]
 impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
@@ -314,9 +353,9 @@ impl ShadowDaemonRuntime {
             warn!(error = %error, "设置文件加载失败，使用空默认值");
         }
 
-        // 模型桥唯一实现：HttpModelBridgeClient(直连 OpenAI 兼容 API)
-        // 配置来源优先级: bridge_env override → 进程 env → settings.json auxiliary 段
-        // 测试场景下允许通过 model_bridge_override 注入 stub
+        // 业务模型桥用于会话正文生成和任务执行；任务规划/分类另走本地 shadow-model。
+        // 业务模型配置来源优先级: bridge_env override → 进程 env → settings.json auxiliary 段
+        // 测试场景下允许通过 model_bridge_override 注入业务模型 stub。
         let direct_http_result = if model_bridge_override.is_some() {
             None
         } else {
@@ -331,20 +370,22 @@ impl ShadowDaemonRuntime {
         // JSON-RPC subprocess loopback.
         let direct_mcp_client = StdioMcpBridgeClient::from_env();
 
-        let model_bridge_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
+        let business_model_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
             match (model_bridge_override.clone(), direct_http_result) {
                 (Some(client), _) => client,
                 (None, Some((http_client, _))) => Arc::new(http_client),
                 (None, None) => {
-                    panic!(
-                        "未找到模型桥配置:请在环境变量 MAGI_OPENAI_COMPAT_BASE_URL 或 \
-                         {}/settings.json 的 auxiliary 段配置 baseUrl",
-                        self.state_root.display()
+                    warn!(
+                        state_root = %self.state_root.display(),
+                        "业务模型桥未配置，已启用明确失败客户端"
                     );
+                    Arc::new(UnavailableBusinessModelBridgeClient::new(
+                        self.state_root.clone(),
+                    ))
                 }
             };
-        let business_model_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
-            model_bridge_client.clone();
+        let task_planning_model_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
+            Arc::new(JsonRpcModelBridgeClient::new(model_transport.clone()));
         let bridge_runtime = BridgeDispatchRuntime::new()
             .with_host_client(Arc::new(JsonRpcHostBridgeClient::new(
                 host_transport.clone(),
@@ -491,6 +532,7 @@ impl ShadowDaemonRuntime {
             .with_task_store(task_store)
             .with_runner_manager(runner_manager)
             .with_session_turn_dispatcher(session_turn_dispatcher)
+            .with_task_planning_model_bridge_client(task_planning_model_client)
             .with_model_bridge_client(business_model_client);
 
         if let Some(probe_config) = direct_http_probe_config {

@@ -1,5 +1,7 @@
-use magi_bridge_client::ModelInvocationRequest;
-use magi_bridge_client::SHADOW_MODEL_PROVIDER;
+use magi_bridge_client::{
+    ChatCompletionPayload, ChatToolChoice, ChatToolDefinition, ChatToolFunctionDefinition,
+    ModelInvocationRequest, SHADOW_MODEL_PROVIDER,
+};
 #[cfg(test)]
 use magi_core::SessionId;
 use magi_core::{
@@ -29,6 +31,7 @@ pub(crate) struct ShadowTaskGraphSubmission {
 }
 
 static REPLAN_GRAPH_COUNTER: AtomicU64 = AtomicU64::new(1);
+const DEEP_TASK_PLAN_TOOL_NAME: &str = "create_deep_task_plan";
 
 #[derive(Clone, Debug)]
 pub(crate) struct DeepTaskGraphBuildResult {
@@ -316,7 +319,8 @@ pub(crate) fn run_shadow_dispatch_submission(
                 request_id: None,
                 user_message_id: None,
                 placeholder_message_id: None,
-                thread_visible: false,
+                timeline_entry_id: Some(entry_id.to_string()),
+                thread_visible: true,
                 worker_visible: false,
             },
             ActiveExecutionTurnItem {
@@ -341,6 +345,7 @@ pub(crate) fn run_shadow_dispatch_submission(
                 request_id: None,
                 user_message_id: None,
                 placeholder_message_id: None,
+                timeline_entry_id: None,
                 thread_visible: true,
                 worker_visible: false,
             },
@@ -393,6 +398,7 @@ pub(crate) fn run_shadow_dispatch_submission(
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
+            timeline_entry_id: None,
             thread_visible: false,
             worker_visible: true,
         });
@@ -1048,22 +1054,105 @@ struct DeepTaskActionPlan {
     write_scope: Option<String>,
 }
 
+fn deep_task_plan_tool() -> ChatToolDefinition {
+    ChatToolDefinition {
+        kind: "function".to_string(),
+        function: ChatToolFunctionDefinition {
+            name: DEEP_TASK_PLAN_TOOL_NAME.to_string(),
+            description: "创建严格结构化的深度任务图计划，供 Task Graph 构建器直接消费。"
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["phases"],
+                "properties": {
+                    "phases": {
+                        "type": "array",
+                        "minItems": 3,
+                        "maxItems": 3,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["title", "workPackages"],
+                            "properties": {
+                                "title": {
+                                    "type": "string",
+                                    "description": "阶段标题，建议依次覆盖规划、执行、交付。"
+                                },
+                                "workPackages": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "required": ["title", "actions"],
+                                        "properties": {
+                                            "title": {
+                                                "type": "string",
+                                                "description": "工作包标题，表达一组可交付的相关动作。"
+                                            },
+                                            "actions": {
+                                                "type": "array",
+                                                "minItems": 1,
+                                                "items": {
+                                                    "type": "object",
+                                                    "additionalProperties": false,
+                                                    "required": ["title", "goal"],
+                                                    "properties": {
+                                                        "title": {
+                                                            "type": "string",
+                                                            "description": "动作标题，必须短小且可执行。"
+                                                        },
+                                                        "goal": {
+                                                            "type": "string",
+                                                            "description": "动作目标，必须说明完成标准或产出。"
+                                                        },
+                                                        "dependsOn": {
+                                                            "type": "array",
+                                                            "items": { "type": "string" },
+                                                            "description": "同一阶段内已定义动作的标题。"
+                                                        },
+                                                        "writeScope": {
+                                                            "type": ["string", "null"],
+                                                            "description": "可选写入范围，例如 crates/magi-api 或 web/src。"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+        },
+    }
+}
+
 fn decompose_mission(
     state: &ApiState,
     prompt: Option<&str>,
     _now: &UtcMillis,
 ) -> Option<DeepTaskGraphPlan> {
     let prompt_text = prompt.filter(|s| !s.trim().is_empty())?;
-    let client = state.model_bridge_client()?;
+    let client = state.task_planning_model_client()?;
     let request = ModelInvocationRequest {
         provider: SHADOW_MODEL_PROVIDER.to_string(),
         prompt: format!(
-            "请输出严格 JSON，描述 3 个 phase 的深度任务图。只允许返回 JSON，不要 Markdown，不要解释。\n\nJSON 结构：\n{{\n  \"phases\": [\n    {{\n      \"title\": \"规划\",\n      \"workPackages\": [\n        {{\n          \"title\": \"规划工作包\",\n          \"actions\": [\n            {{\n              \"title\": \"动作标题\",\n              \"goal\": \"动作目标\",\n              \"dependsOn\": [\"其他动作标题\"],\n              \"writeScope\": \"可选\"\n            }}\n          ]\n        }}\n      ]\n    }}\n  ]\n}}\n\n必须满足：phase 恰好 3 个，workPackages 和 actions 不能为空，actions 的 dependsOn 只能引用同一 phase 内已定义的 action 标题。任务：{}",
+            "深度任务图规划器。\n\
+             请只调用 {DEEP_TASK_PLAN_TOOL_NAME} 工具输出结构化计划，不要返回自然语言正文。\n\
+             计划必须恰好包含 3 个 phase，分别覆盖规划、执行、交付。\n\
+             每个 phase 至少 1 个 workPackage，每个 workPackage 至少 1 个 action。\n\
+             action 的 dependsOn 只能引用同一 phase 内已定义的较早 action 标题。\n\
+             action goal 必须描述可验证产出或完成标准。\n\
+             任务目标：{}",
             prompt_text
         ),
         messages: None,
-        tools: None,
-        tool_choice: None,
+        tools: Some(vec![deep_task_plan_tool()]),
+        tool_choice: Some(ChatToolChoice::force_function(DEEP_TASK_PLAN_TOOL_NAME)),
     };
     let response = client.invoke(request).ok()?;
     if !response.ok {
@@ -1077,12 +1166,32 @@ fn parse_decomposition_response(
     original_prompt: &str,
 ) -> Option<DeepTaskGraphPlan> {
     let trimmed = response.trim();
-    let json_text = if let Some(start) = trimmed.find('{') {
-        &trimmed[start..]
-    } else {
-        trimmed
-    };
-    let mut plan: DeepTaskGraphPlan = serde_json::from_str(json_text).ok()?;
+    let normalized = trimmed
+        .strip_prefix("shadow-model::")
+        .unwrap_or(trimmed)
+        .trim();
+
+    if let Ok(payload) = serde_json::from_str::<ChatCompletionPayload>(normalized)
+        && let Some(arguments) = payload
+            .tool_calls
+            .iter()
+            .find(|call| call.function.name == DEEP_TASK_PLAN_TOOL_NAME)
+            .map(|call| call.function.arguments.as_str())
+        && let Ok(plan_value) = serde_json::from_str::<serde_json::Value>(arguments)
+        && let Some(plan) = parse_decomposition_plan(plan_value, original_prompt)
+    {
+        return Some(plan);
+    }
+
+    let plan_value: serde_json::Value = serde_json::from_str(normalized).ok()?;
+    parse_decomposition_plan(plan_value, original_prompt)
+}
+
+fn parse_decomposition_plan(
+    plan_value: serde_json::Value,
+    original_prompt: &str,
+) -> Option<DeepTaskGraphPlan> {
+    let mut plan: DeepTaskGraphPlan = serde_json::from_value(plan_value).ok()?;
     if plan.phases.len() != 3 {
         return None;
     }
@@ -1378,8 +1487,8 @@ mod tests {
                 .first()
                 .is_some_and(|item| item.kind == "user_message"
                     && item.content.as_deref() == Some("用户原始任务描述")
-                    && !item.thread_visible),
-            "turn ordered items 必须保留用户原文，但不能进入响应区渲染"
+                    && item.thread_visible),
+            "turn ordered items 必须保留用户原文，并作为 canonical 用户消息进入响应区渲染"
         );
     }
 
@@ -1543,68 +1652,133 @@ mod tests {
         assert!(result.is_err());
     }
 
+    fn deep_task_plan_response(arguments: serde_json::Value) -> String {
+        serde_json::json!({
+            "content": null,
+            "finish_reason": "tool_calls",
+            "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": DEEP_TASK_PLAN_TOOL_NAME,
+                    "arguments": arguments.to_string(),
+                }
+            }]
+        })
+        .to_string()
+    }
+
     #[test]
     fn decomposition_parser_rejects_prompt_echo_lines() {
-        let response = "shadow-model::请将以下任务分解为 2-5 个具体的子任务。每行一个子任务标题，不要编号，不要额外说明。\n\n任务：请分析并拆分这个复杂任务";
+        let response = deep_task_plan_response(serde_json::json!({
+            "phases": [
+                {
+                    "title": "规划",
+                    "workPackages": [
+                        {
+                            "title": "规划工作包",
+                            "actions": [
+                                {
+                                    "title": "请分析并拆分这个复杂任务",
+                                    "goal": "梳理约束"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "title": "执行",
+                    "workPackages": [
+                        {
+                            "title": "执行工作包",
+                            "actions": [
+                                {
+                                    "title": "实现方案",
+                                    "goal": "落地实现",
+                                    "dependsOn": ["请分析并拆分这个复杂任务"]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "title": "交付",
+                    "workPackages": [
+                        {
+                            "title": "交付工作包",
+                            "actions": [
+                                {
+                                    "title": "验证结果",
+                                    "goal": "确认交付",
+                                    "dependsOn": ["实现方案"],
+                                    "writeScope": "src/"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }));
 
-        let plan = parse_decomposition_response(response, "请分析并拆分这个复杂任务");
+        let plan = parse_decomposition_response(response.as_str(), "请分析并拆分这个复杂任务");
 
         assert!(plan.is_none(), "提示词回显不能被当成结构化计划");
     }
 
     #[test]
-    fn decomposition_parser_accepts_structured_json_plan() {
-        let response = r#"{
-  "phases": [
-    {
-      "title": "规划",
-      "workPackages": [
-        {
-          "title": "规划工作包",
-          "actions": [
-            {
-              "title": "分析目标",
-              "goal": "梳理约束"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "title": "执行",
-      "workPackages": [
-        {
-          "title": "执行工作包",
-          "actions": [
-            {
-              "title": "实现方案",
-              "goal": "落地实现",
-              "dependsOn": ["分析目标"]
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "title": "交付",
-      "workPackages": [
-        {
-          "title": "交付工作包",
-          "actions": [
-            {
-              "title": "验证结果",
-              "goal": "确认交付",
-              "dependsOn": ["实现方案"],
-              "writeScope": "src/"
-            }
-          ]
-        }
-      ]
-    }
-  ]
-}"#;
+    fn decomposition_parser_accepts_structured_tool_plan() {
+        let plan_value = serde_json::json!({
+            "phases": [
+                {
+                    "title": "规划",
+                    "workPackages": [
+                        {
+                            "title": "规划工作包",
+                            "actions": [
+                                {
+                                    "title": "分析目标",
+                                    "goal": "梳理约束"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "title": "执行",
+                    "workPackages": [
+                        {
+                            "title": "执行工作包",
+                            "actions": [
+                                {
+                                    "title": "实现方案",
+                                    "goal": "落地实现",
+                                    "dependsOn": ["分析目标"]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "title": "交付",
+                    "workPackages": [
+                        {
+                            "title": "交付工作包",
+                            "actions": [
+                                {
+                                    "title": "验证结果",
+                                    "goal": "确认交付",
+                                    "dependsOn": ["实现方案"],
+                                    "writeScope": "src/"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+        let response = deep_task_plan_response(plan_value.clone());
 
-        let plan = parse_decomposition_response(response, "请分析并拆分这个复杂任务");
+        let plan = parse_decomposition_response(response.as_str(), "请分析并拆分这个复杂任务");
 
         let plan = plan.expect("structured plan should parse");
         assert_eq!(plan.phases.len(), 3);
@@ -1614,6 +1788,15 @@ mod tests {
                 .write_scope
                 .as_deref(),
             Some("src/")
+        );
+
+        let prefixed_response = format!("shadow-model::{}", plan_value);
+        let prefixed_plan =
+            parse_decomposition_response(prefixed_response.as_str(), "请分析并拆分这个复杂任务")
+                .expect("prefixed structured plan should parse");
+        assert_eq!(
+            prefixed_plan.phases[1].work_packages[0].actions[0].title,
+            "实现方案"
         );
     }
 }

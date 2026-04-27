@@ -6,20 +6,64 @@ use crate::{
 };
 use magi_bridge_client::{ChatMessage, ChatToolCall};
 use magi_core::{
-    ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId, ToolCallId,
-    UtcMillis, WorkspaceId,
+    ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId, TaskId,
+    ToolCallId, UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{
     EventContext, EventEnvelope, InMemoryEventBus, SessionRuntimeTurnItemSummaryEntry,
     SessionRuntimeTurnLaneSummaryEntry, SessionRuntimeTurnSummaryEntry,
 };
 use magi_governance::ToolKind;
-use magi_session_store::{ActiveExecutionTurnItem, SessionStore};
+use magi_session_store::{
+    ActiveExecutionTurnItem, SessionRuntimeSidecar, SessionStore, TimelineEntryKind,
+};
 use magi_skill_runtime::SkillRuntime;
 use magi_tool_runtime::{
     ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
 };
 use serde::Serialize;
+
+#[derive(Clone, Debug)]
+pub(crate) struct PublishedSessionTurnItem {
+    pub turn_id: String,
+    pub turn_seq: u64,
+    pub item: ActiveExecutionTurnItem,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SessionTurnIdentity {
+    pub turn_id: String,
+    pub turn_seq: u64,
+}
+
+fn published_session_turn_item_from_sidecar(
+    sidecar: SessionRuntimeSidecar,
+    item_id: &str,
+) -> Option<PublishedSessionTurnItem> {
+    let turn = sidecar.current_turn?;
+    let item = turn
+        .items
+        .iter()
+        .find(|candidate| candidate.item_id == item_id)?
+        .clone();
+    Some(PublishedSessionTurnItem {
+        turn_id: turn.turn_id,
+        turn_seq: turn.turn_seq,
+        item,
+    })
+}
+
+pub(crate) fn current_session_turn_identity(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+) -> Option<SessionTurnIdentity> {
+    let sidecar = session_store.runtime_sidecar(session_id)?;
+    let turn = sidecar.current_turn.as_ref()?;
+    Some(SessionTurnIdentity {
+        turn_id: turn.turn_id.clone(),
+        turn_seq: turn.turn_seq,
+    })
+}
 
 pub(crate) fn session_turn_item(
     kind: &str,
@@ -50,6 +94,7 @@ pub(crate) fn session_turn_item(
         request_id: None,
         user_message_id: None,
         placeholder_message_id: None,
+        timeline_entry_id: None,
         thread_visible: true,
         worker_visible: false,
     }
@@ -59,23 +104,33 @@ pub(crate) fn append_session_turn_item(
     session_store: &SessionStore,
     session_id: &SessionId,
     item: ActiveExecutionTurnItem,
-) {
-    let _ = session_store.append_current_turn_item(session_id, item);
+) -> Option<PublishedSessionTurnItem> {
+    let item_id = item.item_id.clone();
+    let sidecar = session_store
+        .append_current_turn_item(session_id, item)
+        .ok()
+        .flatten()?;
+    published_session_turn_item_from_sidecar(sidecar, &item_id)
 }
 
 pub(crate) fn upsert_session_turn_item(
     session_store: &SessionStore,
     session_id: &SessionId,
     item: ActiveExecutionTurnItem,
-) {
-    let _ = session_store.upsert_current_turn_item(session_id, item);
+) -> Option<PublishedSessionTurnItem> {
+    let item_id = item.item_id.clone();
+    let sidecar = session_store
+        .upsert_current_turn_item(session_id, item)
+        .ok()
+        .flatten()?;
+    published_session_turn_item_from_sidecar(sidecar, &item_id)
 }
 
 pub(crate) fn publish_session_turn_item_event(
     event_bus: &InMemoryEventBus,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
-    item: &ActiveExecutionTurnItem,
+    published: &PublishedSessionTurnItem,
 ) {
     let _ = event_bus.publish(
         EventEnvelope::domain(
@@ -84,7 +139,9 @@ pub(crate) fn publish_session_turn_item_event(
             serde_json::json!({
                 "session_id": session_id.to_string(),
                 "workspace_id": workspace_id.as_ref().map(ToString::to_string),
-                "item": item,
+                "turn_id": published.turn_id,
+                "turn_seq": published.turn_seq,
+                "item": published.item,
             }),
         )
         .with_context(EventContext {
@@ -92,6 +149,62 @@ pub(crate) fn publish_session_turn_item_event(
             session_id: Some(session_id.clone()),
             ..EventContext::default()
         }),
+    );
+}
+
+pub(crate) fn append_session_turn_error_item(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    task_id: Option<&TaskId>,
+    request_id: Option<&str>,
+    user_message_id: Option<&str>,
+    placeholder_message_id: Option<&str>,
+    error_text: &str,
+    streaming_entry_id: Option<&str>,
+) {
+    let mut error_item = session_turn_item(
+        "assistant_error",
+        "failed",
+        Some("回复生成失败".to_string()),
+        Some(error_text.to_string()),
+        Some(format!("turn-item-assistant-error-{}", UtcMillis::now().0)),
+    );
+    if let Some(task_id) = task_id {
+        error_item.task_id = Some(task_id.clone());
+    }
+    error_item.request_id = request_id.map(str::to_string);
+    error_item.user_message_id = user_message_id.map(str::to_string);
+    error_item.placeholder_message_id = placeholder_message_id.map(str::to_string);
+    if let Some(published) = append_session_turn_item(session_store, session_id, error_item) {
+        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+    }
+    let _ = session_store.update_current_turn_status(session_id, "failed");
+    let timeline_message = build_completed_turn_timeline_snapshot(
+        session_store,
+        session_id,
+        Some(error_text),
+        streaming_entry_id,
+    )
+    .unwrap_or_else(|| error_text.to_string());
+    let fallback_entry_id = session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| {
+            sidecar.current_turn.as_ref().map(|turn| {
+                format!(
+                    "timeline-turn-snapshot-error-{}-{}",
+                    session_id, turn.turn_id
+                )
+            })
+        })
+        .unwrap_or_else(|| format!("timeline-turn-snapshot-error-{}", session_id));
+    let entry_id = streaming_entry_id.unwrap_or(fallback_entry_id.as_str());
+    session_store.upsert_timeline_entry(
+        session_id.clone(),
+        entry_id,
+        TimelineEntryKind::AssistantMessage,
+        timeline_message,
     );
 }
 
@@ -133,6 +246,7 @@ fn to_turn_item_summary(item: &ActiveExecutionTurnItem) -> SessionRuntimeTurnIte
         request_id: item.request_id.clone(),
         user_message_id: item.user_message_id.clone(),
         placeholder_message_id: item.placeholder_message_id.clone(),
+        timeline_entry_id: item.timeline_entry_id.clone(),
         thread_visible: item.thread_visible,
         worker_visible: item.worker_visible,
     }
@@ -179,9 +293,17 @@ pub(crate) fn build_completed_turn_timeline_snapshot(
                     turn.items
                         .iter()
                         .rev()
-                        .find(|item| item.kind == "assistant_stream")
+                        .find(|item| item.kind == "assistant_error")
                         .and_then(|item| item.content.clone())
                         .filter(|text| !text.trim().is_empty())
+                        .or_else(|| {
+                            turn.items
+                                .iter()
+                                .rev()
+                                .find(|item| item.kind == "assistant_stream")
+                                .and_then(|item| item.content.clone())
+                                .filter(|text| !text.trim().is_empty())
+                        })
                 })
         });
 
@@ -253,8 +375,9 @@ pub(crate) fn append_session_tool_call_items(
     started_item.tool_call_id = Some(tool_call.id.clone());
     started_item.tool_name = Some(tool_call.function.name.clone());
     started_item.tool_arguments = Some(tool_call.function.arguments.clone());
-    append_session_turn_item(session_store, session_id, started_item.clone());
-    publish_session_turn_item_event(event_bus, session_id, workspace_id, &started_item);
+    if let Some(published) = append_session_turn_item(session_store, session_id, started_item) {
+        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+    }
 
     let (tool_result, tool_status) = execute_session_turn_tool_call(
         event_bus,
@@ -281,8 +404,9 @@ pub(crate) fn append_session_tool_call_items(
     if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
         result_item.tool_error = Some(tool_result.clone());
     }
-    append_session_turn_item(session_store, session_id, result_item.clone());
-    publish_session_turn_item_event(event_bus, session_id, workspace_id, &result_item);
+    if let Some(published) = append_session_turn_item(session_store, session_id, result_item) {
+        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+    }
 
     messages.push(ChatMessage {
         role: "tool".to_string(),

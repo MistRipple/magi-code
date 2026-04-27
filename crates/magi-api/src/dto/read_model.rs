@@ -130,7 +130,9 @@ fn merge_session_sidecars(
             );
             push_unique(&mut entry.recovery_ids, export.recovery_ref.clone());
         }
-        if session_root_task_is_terminal(entry.root_task_status.as_deref()) {
+        if session_root_task_is_terminal(entry.root_task_status.as_deref())
+            && !entry.has_recoverable_chain
+        {
             clear_session_runtime_live_ids(entry);
         }
         if let Some(turn) = export.current_turn.as_ref() {
@@ -184,6 +186,7 @@ fn merge_session_sidecars(
                         request_id: item.request_id.clone(),
                         user_message_id: item.user_message_id.clone(),
                         placeholder_message_id: item.placeholder_message_id.clone(),
+                        timeline_entry_id: item.timeline_entry_id.clone(),
                         thread_visible: item.thread_visible,
                         worker_visible: item.worker_visible,
                     }
@@ -1269,6 +1272,7 @@ mod tests {
                         request_id: None,
                         user_message_id: None,
                         placeholder_message_id: None,
+                        timeline_entry_id: None,
                         thread_visible: true,
                         worker_visible: false,
                     }],
@@ -1343,6 +1347,7 @@ mod tests {
                             request_id: None,
                             user_message_id: None,
                             placeholder_message_id: None,
+                            timeline_entry_id: None,
                             thread_visible: true,
                             worker_visible: false,
                         }],

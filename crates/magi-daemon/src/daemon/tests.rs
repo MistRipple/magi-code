@@ -177,7 +177,11 @@ fn assert_completed_two_task_projection(projection: &Value) {
         total_tasks >= 2,
         "task projection should include at least root + action"
     );
-    assert_eq!(completed_tasks, total_tasks);
+    assert_eq!(
+        completed_tasks, total_tasks,
+        "task projection should be fully completed, got summary={:?}, root_status={}, tasks={:?}",
+        projection["progress_summary"], projection["root_task"]["status"], projection["tasks"]
+    );
     assert_eq!(projection["progress_summary"]["failed_tasks"], 0);
     assert_eq!(projection["root_task"]["status"], "Completed");
 }

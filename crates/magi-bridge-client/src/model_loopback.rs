@@ -122,6 +122,10 @@ fn shadow_loopback_visible_prompt(prompt: &str) -> String {
         return String::new();
     }
 
+    if let Some(classification) = shadow_loopback_classifier_response(trimmed) {
+        return classification;
+    }
+
     if let Some(decomposition) = shadow_loopback_decomposition_response(trimmed) {
         return decomposition;
     }
@@ -158,15 +162,170 @@ fn shadow_loopback_visible_prompt(prompt: &str) -> String {
     trimmed.to_string()
 }
 
-fn shadow_loopback_decomposition_response(prompt: &str) -> Option<String> {
-    if !prompt.starts_with("请将以下任务分解为 2-5 个具体的子任务。") {
+fn shadow_loopback_classifier_response(prompt: &str) -> Option<String> {
+    if !prompt.contains("Session Turn 编排分类器") {
         return None;
     }
-    let _task_text = prompt
-        .rsplit_once("\n\n任务：")
-        .map(|(_, task)| task.trim())
-        .filter(|task| !task.is_empty())?;
-    Some("分析目标与约束\n制定执行步骤\n汇总执行结果".to_string())
+
+    let has_recoverable_chain = prompt
+        .lines()
+        .any(|line| line.trim() == "hasRecoverableChain=true");
+    let user_text = prompt
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("userText="))
+        .unwrap_or("")
+        .trim();
+    let deep_task = prompt.lines().any(|line| line.trim() == "deepTask=true");
+    let skill_name = prompt
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("skillName=\""))
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or("")
+        .trim();
+    let image_count = prompt
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("imageCount="))
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+
+    let route = if has_recoverable_chain && contains_any(user_text, &["继续", "resume", "continue"])
+    {
+        "continue"
+    } else if deep_task
+        || !skill_name.is_empty()
+        || image_count > 0
+        || contains_any(
+            user_text,
+            &[
+                "复杂任务",
+                "分析并拆分",
+                "拆分任务",
+                "重新规划",
+                "规划",
+                "实现",
+                "开发",
+                "修复",
+                "重构",
+                "收口",
+                "迭代",
+                "推进",
+            ],
+        )
+    {
+        "task"
+    } else if contains_any(
+        user_text,
+        &[
+            "搜索", "查找", "查询", "读取", "打开", "查看", "执行", "运行", "列出", "search",
+            "find", "grep", "rg", "ls", "cat", "git", "npm", "cargo", "test",
+        ],
+    ) {
+        "execute"
+    } else {
+        "chat"
+    };
+
+    let task_goal = if route == "task" {
+        Some(if user_text.is_empty() {
+            "完成本轮深度任务".to_string()
+        } else {
+            user_text.to_string()
+        })
+    } else {
+        None
+    };
+    let tool_intent = (route == "execute").then(|| user_text.to_string());
+    let arguments = json!({
+        "route": route,
+        "taskTitle": (route == "task").then_some("模型判定任务"),
+        "executionGoal": task_goal,
+        "requiredWorkers": [],
+        "toolIntent": tool_intent,
+    });
+
+    Some(
+        json!({
+            "content": null,
+            "finish_reason": "tool_calls",
+            "tool_calls": [{
+                "id": "call-classify-session-turn",
+                "type": "function",
+                "function": {
+                    "name": "classify_session_turn",
+                    "arguments": arguments.to_string(),
+                }
+            }]
+        })
+        .to_string(),
+    )
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    let lower = value.to_lowercase();
+    needles
+        .iter()
+        .any(|needle| lower.contains(&needle.to_lowercase()))
+}
+
+fn shadow_loopback_decomposition_response(prompt: &str) -> Option<String> {
+    if !prompt.starts_with("深度任务图规划器。") {
+        return None;
+    }
+    Some(
+        serde_json::json!({
+            "phases": [
+                {
+                    "title": "规划",
+                    "workPackages": [
+                        {
+                            "title": "规划工作包",
+                            "actions": [
+                                {
+                                    "title": "梳理约束",
+                                    "goal": "明确目标、边界和验收标准",
+                                    "dependsOn": [],
+                                    "writeScope": null,
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "title": "执行",
+                    "workPackages": [
+                        {
+                            "title": "执行工作包",
+                            "actions": [
+                                {
+                                    "title": "落实方案",
+                                    "goal": "完成任务系统收口相关修改",
+                                    "dependsOn": [],
+                                    "writeScope": "crates/magi-api",
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "title": "交付",
+                    "workPackages": [
+                        {
+                            "title": "交付工作包",
+                            "actions": [
+                                {
+                                    "title": "验证结果",
+                                    "goal": "确认端到端链路可用",
+                                    "dependsOn": [],
+                                    "writeScope": "web/src",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        })
+        .to_string(),
+    )
 }
 
 fn shadow_loopback_instruction_chunk(chunk: &str) -> bool {
@@ -1142,13 +1301,44 @@ mod tests {
     }
 
     #[test]
-    fn shadow_loopback_visible_prompt_returns_clean_decomposition_lines() {
-        let prompt = "请将以下任务分解为 2-5 个具体的子任务。每行一个子任务标题，不要编号，不要额外说明。\n\n任务：请分析并拆分这个复杂任务";
+    fn shadow_loopback_visible_prompt_returns_structured_deep_plan() {
+        let prompt = "深度任务图规划器。\n请只调用 create_deep_task_plan 工具输出结构化计划，不要返回自然语言正文。\n任务目标：请分析并拆分这个复杂任务";
 
+        let visible = super::shadow_loopback_visible_prompt(prompt);
+        let parsed: Value = serde_json::from_str(&visible).expect("deep plan should be json");
+
+        assert_eq!(parsed["phases"].as_array().map(Vec::len), Some(3));
+        assert_eq!(parsed["phases"][0]["title"], "规划");
         assert_eq!(
-            super::shadow_loopback_visible_prompt(prompt),
-            "分析目标与约束\n制定执行步骤\n汇总执行结果"
+            parsed["phases"][1]["workPackages"][0]["actions"][0]["title"],
+            "落实方案"
         );
+    }
+
+    #[test]
+    fn shadow_loopback_visible_prompt_returns_session_turn_classifier_tool_call() {
+        let prompt = "Session Turn 编排分类器\n\
+            请只调用 classify_session_turn 工具，输出本轮 route。\n\
+            userText=请搜索 Route Shadow Session 并说明结果\n\
+            deepTask=false\n\
+            skillName=\"\"\n\
+            imageCount=0\n\
+            hasRecoverableChain=false";
+
+        let visible = super::shadow_loopback_visible_prompt(prompt);
+        let parsed: Value =
+            serde_json::from_str(&visible).expect("classifier payload should be json");
+        let calls = parsed["tool_calls"]
+            .as_array()
+            .expect("classifier should return tool call payload");
+        assert_eq!(calls[0]["function"]["name"], "classify_session_turn");
+        let args: Value = serde_json::from_str(
+            calls[0]["function"]["arguments"]
+                .as_str()
+                .expect("arguments should be string json"),
+        )
+        .expect("arguments should parse");
+        assert_eq!(args["route"], "execute");
     }
 
     #[test]

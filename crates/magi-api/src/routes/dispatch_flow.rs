@@ -74,14 +74,15 @@ fn execute_dispatch_submission(
         &mission_title,
         accepted_at,
     )?;
-    append_session_user_message(state, &session_id, accepted_at, &message);
+    let user_timeline_entry_id =
+        append_session_user_message(state, &session_id, accepted_at, &message);
     let action_task_title = format!("执行: {}", mission_title);
 
     let dispatch = DispatchSubmissionRequest {
         accepted_at,
         session_id: session_id.clone(),
         workspace_id: workspace_id.clone(),
-        entry_id: format!("timeline-{}-{}", session_id, accepted_at.0),
+        entry_id: user_timeline_entry_id,
         created_session,
         mission_title,
         task_title: action_task_title,
@@ -97,30 +98,31 @@ fn execute_dispatch_submission(
     Ok((accepted, event_id))
 }
 
-pub(super) fn spawn_session_task_dispatch(state: ApiState, accepted: DispatchSubmissionAccepted) {
-    tokio::task::spawn_blocking(move || {
-        let mut accepted = accepted;
-        if let Err(error) = drive_shadow_dispatch_submission(&state, &mut accepted) {
-            tracing::error!(
-                session_id = %accepted.session_id,
-                root_task_id = %accepted.root_task_id,
-                action_task_id = %accepted.action_task_id,
-                ?error,
-                "session turn task background dispatch failed"
-            );
-            let _ = state.persist_session_durable_state();
-            return;
-        }
-        append_dispatch_assistant_message(&state, &accepted);
-        if let Err(error) = state.persist_session_durable_state() {
-            tracing::error!(
-                session_id = %accepted.session_id,
-                root_task_id = %accepted.root_task_id,
-                ?error,
-                "session turn task background dispatch persist failed"
-            );
-        }
-    });
+pub(super) fn finalize_session_task_dispatch(
+    state: ApiState,
+    accepted: DispatchSubmissionAccepted,
+) {
+    let mut accepted = accepted;
+    if let Err(error) = drive_shadow_dispatch_submission(&state, &mut accepted) {
+        tracing::error!(
+            session_id = %accepted.session_id,
+            root_task_id = %accepted.root_task_id,
+            action_task_id = %accepted.action_task_id,
+            ?error,
+            "session turn task dispatch failed"
+        );
+        let _ = state.persist_session_durable_state();
+        return;
+    }
+    append_dispatch_assistant_message(&state, &accepted);
+    if let Err(error) = state.persist_session_durable_state() {
+        tracing::error!(
+            session_id = %accepted.session_id,
+            root_task_id = %accepted.root_task_id,
+            ?error,
+            "session turn task dispatch persist failed"
+        );
+    }
 }
 
 fn publish_session_turn_task_accepted_event(
@@ -213,9 +215,11 @@ pub(super) fn append_session_user_message(
     session_id: &SessionId,
     accepted_at: UtcMillis,
     message: &str,
-) {
-    state.session_store.append_timeline_entry(
+) -> String {
+    let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
+    state.session_store.upsert_timeline_entry(
         session_id.clone(),
+        &entry_id,
         TimelineEntryKind::UserMessage,
         message.to_string(),
     );
@@ -235,6 +239,7 @@ pub(super) fn append_session_user_message(
             ..EventContext::default()
         }),
     );
+    entry_id
 }
 
 pub(super) fn append_dispatch_assistant_message(

@@ -303,6 +303,7 @@ pub struct SessionRuntimeTurnItemSummaryEntry {
     pub request_id: Option<String>,
     pub user_message_id: Option<String>,
     pub placeholder_message_id: Option<String>,
+    pub timeline_entry_id: Option<String>,
     pub thread_visible: bool,
     pub worker_visible: bool,
 }

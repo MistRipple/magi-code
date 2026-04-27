@@ -1,6 +1,7 @@
 use crate::{
     session_turn_writeback::{
-        append_session_turn_item, build_completed_turn_timeline_snapshot,
+        append_session_turn_error_item, append_session_turn_item,
+        build_completed_turn_timeline_snapshot, current_session_turn_identity,
         publish_session_turn_item_event, session_turn_item, upsert_session_turn_item,
     },
     settings_store::SettingsStore,
@@ -101,6 +102,8 @@ pub(crate) fn run_task_llm_loop(
     let mut final_content = String::new();
     let mut tool_call_records: Vec<serde_json::Value> = Vec::new();
     let mut last_stream_item_id: Option<String> = None;
+    let turn_identity = current_session_turn_identity(session_store, session_id);
+    let mut had_tool_calls = false;
 
     for round in 0..MAX_TOOL_CALL_ROUNDS {
         let should_record_turn_artifacts = streaming_entry_id.is_some()
@@ -143,6 +146,7 @@ pub(crate) fn run_task_llm_loop(
                     session_id,
                     workspace_id,
                     &stream_item_id,
+                    turn_identity.as_ref(),
                     &task_context,
                     &task_id_str,
                     &mission_id_str,
@@ -221,6 +225,9 @@ pub(crate) fn run_task_llm_loop(
         if let Some(ref content) = parsed.content {
             final_content = content.clone();
         }
+        if !parsed.tool_calls.is_empty() {
+            had_tool_calls = true;
+        }
 
         if parsed.tool_calls.is_empty() {
             publish_task_llm_completed(
@@ -228,6 +235,7 @@ pub(crate) fn run_task_llm_loop(
                 task,
                 session_id,
                 workspace_id,
+                turn_identity.as_ref(),
                 streaming_entry_id.or(last_stream_item_id.as_deref()),
                 final_content.len(),
                 round + 1,
@@ -263,8 +271,32 @@ pub(crate) fn run_task_llm_loop(
         }
     }
 
-    if final_content.is_empty() {
-        final_content = "[LLM 未返回文本响应]".to_string();
+    if final_content.trim().is_empty() {
+        let failure_reason = if had_tool_calls {
+            "模型在工具调用后未返回最终回复"
+        } else {
+            "模型未返回可显示回复"
+        };
+        if streaming_entry_id.is_some() || task_is_thread_visible_turn_owner(session_store, session_id, task_id) {
+            append_session_turn_error_item(
+                event_bus,
+                session_store,
+                session_id,
+                workspace_id,
+                Some(task_id),
+                None,
+                None,
+                None,
+                failure_reason,
+                streaming_entry_id.or(last_stream_item_id.as_deref()),
+            );
+        }
+        return (
+            TaskOutcome::Failed {
+                error: failure_reason.to_string(),
+            },
+            context_summary,
+        );
     }
     final_content = crate::prompt_utils::normalize_model_visible_content(final_content);
     if !task_lease_is_current(task_store, task_id, lease_id) {
@@ -342,6 +374,7 @@ fn publish_stream_delta(
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     entry_id: &str,
+    turn_identity: Option<&crate::session_turn_writeback::SessionTurnIdentity>,
     task_context: &EventContext,
     task_id: &str,
     mission_id: &str,
@@ -362,8 +395,9 @@ fn publish_stream_delta(
         Some(entry_id.to_string()),
     );
     item.task_id = Some(task.task_id.clone());
-    upsert_session_turn_item(session_store, session_id, item.clone());
-    publish_session_turn_item_event(event_bus, session_id, workspace_id, &item);
+    if let Some(published) = upsert_session_turn_item(session_store, session_id, item) {
+        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+    }
 
     let previous_len = last_sent_len.get();
     let delta = &accumulated_text[previous_len..];
@@ -381,6 +415,8 @@ fn publish_stream_delta(
                 "mission_id": mission_id,
                 "session_id": session_id.to_string(),
                 "entry_id": entry_id,
+                "turn_id": turn_identity.map(|turn| turn.turn_id.clone()),
+                "turn_seq": turn_identity.map(|turn| turn.turn_seq),
                 "delta": delta,
             }),
         )
@@ -442,8 +478,9 @@ fn upsert_task_thinking_turn_item(
         Some(item_id.to_string()),
     );
     item.task_id = Some(task.task_id.clone());
-    upsert_session_turn_item(session_store, session_id, item.clone());
-    publish_session_turn_item_event(event_bus, session_id, workspace_id, &item);
+    if let Some(published) = upsert_session_turn_item(session_store, session_id, item) {
+        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+    }
 }
 
 fn publish_task_llm_completed(
@@ -451,6 +488,7 @@ fn publish_task_llm_completed(
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
+    turn_identity: Option<&crate::session_turn_writeback::SessionTurnIdentity>,
     streaming_entry_id: Option<&str>,
     response_length: usize,
     rounds: usize,
@@ -466,6 +504,8 @@ fn publish_task_llm_completed(
                 "session_id": session_id.to_string(),
                 "workspace_id": workspace_id.as_ref().map(ToString::to_string),
                 "entry_id": streaming_entry_id,
+                "turn_id": turn_identity.map(|turn| turn.turn_id.clone()),
+                "turn_seq": turn_identity.map(|turn| turn.turn_seq),
                 "response_length": response_length,
                 "rounds": rounds,
             }),
@@ -570,11 +610,13 @@ fn append_task_final_turn_item(
     );
     final_item.task_id = Some(task.task_id.clone());
     if streaming_entry_id.is_some() {
-        upsert_session_turn_item(session_store, session_id, final_item.clone());
-    } else {
-        append_session_turn_item(session_store, session_id, final_item.clone());
+        if let Some(published) = upsert_session_turn_item(session_store, session_id, final_item) {
+            publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+        }
+    } else if let Some(published) = append_session_turn_item(session_store, session_id, final_item)
+    {
+        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
-    publish_session_turn_item_event(event_bus, session_id, workspace_id, &final_item);
     let _ = session_store.update_current_turn_status(session_id, "completed");
     let timeline_message = build_completed_turn_timeline_snapshot(
         session_store,

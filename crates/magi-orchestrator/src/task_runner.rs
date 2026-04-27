@@ -956,6 +956,63 @@ impl TaskRunner {
     // Internal helpers
     // ------------------------------------------------------------------
 
+    fn escalation_condition_label(condition: &str) -> Option<&'static str> {
+        match condition {
+            "on_failure" => Some("执行失败"),
+            "high_risk" => Some("高风险操作"),
+            "on_repair_exhausted" => Some("修复次数耗尽"),
+            "repair_budget_exhausted" => Some("修复预算耗尽"),
+            "conflicting_requirements" => Some("需求冲突"),
+            "architecture_fork" => Some("架构分歧"),
+            "missing_acceptance_criteria" => Some("验收标准缺失"),
+            "unsafe_or_destructive_action" => Some("安全或破坏性风险"),
+            "permission_boundary" => Some("权限边界"),
+            "irreversible_action" => Some("不可逆操作"),
+            _ => None,
+        }
+    }
+
+    fn join_condition_labels(labels: &[&'static str]) -> String {
+        match labels {
+            [] => String::new(),
+            [only] => (*only).to_string(),
+            [left, right] => format!("{left}和{right}"),
+            _ => {
+                let mut joined = labels[..labels.len() - 1].join("、");
+                joined.push_str("和");
+                joined.push_str(labels[labels.len() - 1]);
+                joined
+            }
+        }
+    }
+
+    fn summarize_escalation_conditions(conditions: &[String]) -> String {
+        let labels: Vec<&'static str> = conditions
+            .iter()
+            .filter_map(|condition| Self::escalation_condition_label(condition))
+            .collect();
+        if labels.is_empty() {
+            return "任务执行失败，需要确认后续处理方式。".to_string();
+        }
+        format!(
+            "涉及{}，需要确认后续处理方式。",
+            Self::join_condition_labels(&labels)
+        )
+    }
+
+    fn build_decision_task_title(decision_context: &str) -> String {
+        let context = decision_context
+            .trim()
+            .strip_prefix("Decision:")
+            .unwrap_or(decision_context)
+            .trim();
+        if context.starts_with("需要决策") {
+            context.to_string()
+        } else {
+            format!("需要决策：{context}")
+        }
+    }
+
     fn record_result_evidence(&self, task_id: &TaskId, output_refs: &[String]) {
         if output_refs.is_empty() {
             return;
@@ -1095,6 +1152,8 @@ impl TaskRunner {
                     | "architecture_fork"
                     | "missing_acceptance_criteria"
                     | "unsafe_or_destructive_action"
+                    | "permission_boundary"
+                    | "irreversible_action"
             )
         });
         if !should_escalate {
@@ -1103,9 +1162,19 @@ impl TaskRunner {
         let Some(parent_id) = &task.parent_task_id else {
             return;
         };
+        let risk_notes: Vec<String> = conditions
+            .iter()
+            .filter_map(|condition| {
+                Self::escalation_condition_label(condition)
+                    .map(|label| format!("触发风险：{label}"))
+            })
+            .collect();
         let payload = DecisionTaskPayload {
-            decision_context: format!("任务 {} 执行失败，需要决策后续操作", task.title),
-            blocked_reason: format!("任务 {} 失败 (escalation: {:?})", task_id, conditions),
+            decision_context: format!("{} 执行失败，需要选择后续处理方式", task.title),
+            blocked_reason: format!(
+                "失败原因：{}",
+                Self::summarize_escalation_conditions(&conditions)
+            ),
             target_task_id: Some(task.task_id.clone()),
             options: vec![
                 DecisionOption {
@@ -1124,7 +1193,7 @@ impl TaskRunner {
                     description: "中止整个任务树".to_string(),
                 },
             ],
-            risk_notes: vec![format!("触发条件: {:?}", conditions)],
+            risk_notes,
             recommended_option: Some("retry".to_string()),
             required_user_input: true,
             decision_evidence: None,
@@ -1392,7 +1461,7 @@ impl TaskRunner {
             root_task_id: parent.root_task_id.clone(),
             parent_task_id: Some(parent_task_id.clone()),
             kind: TaskKind::Decision,
-            title: format!("Decision: {}", payload.decision_context),
+            title: Self::build_decision_task_title(&payload.decision_context),
             goal: payload.blocked_reason.clone(),
             status: TaskStatus::AwaitingApproval,
             dependency_ids: Vec::new(),

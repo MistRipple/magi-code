@@ -2,7 +2,8 @@ use crate::{
     errors::ApiError,
     prompt_utils::normalize_model_visible_content,
     session_turn_writeback::{
-        append_session_tool_call_items, append_session_turn_item,
+        append_session_tool_call_items, append_session_turn_error_item,
+        append_session_turn_item, current_session_turn_identity,
         build_completed_turn_timeline_snapshot, publish_session_turn_item_event, session_turn_item,
         upsert_session_turn_item,
     },
@@ -76,6 +77,10 @@ pub(crate) fn run_session_turn_execution(
     } = runtime;
 
     append_phase_item(event_bus, session_store, &request);
+    let turn_identity = current_session_turn_identity(session_store, &request.session_id)
+        .ok_or_else(|| {
+            ApiError::internal_assembly("执行 session turn 失败", "current turn identity missing")
+        })?;
 
     let mut messages = vec![ChatMessage {
         role: "user".to_string(),
@@ -85,10 +90,11 @@ pub(crate) fn run_session_turn_execution(
     }];
     let mut final_content: Option<String> = None;
     let mut last_streaming_entry_id: Option<String> = None;
+    let mut had_tool_calls = false;
     let usage_binding = session_turn_model_usage_binding(request.use_tools);
 
     for round in 0..MAX_TOOL_CALL_ROUNDS {
-        let streamed_content = stream_session_turn_round(
+        let streamed_content = match stream_session_turn_round(
             SessionTurnRoundRuntime {
                 client,
                 event_bus,
@@ -100,11 +106,31 @@ pub(crate) fn run_session_turn_execution(
                 tools: tools.clone(),
                 messages: &mut messages,
                 round,
+                turn_identity: &turn_identity,
             },
             tool_registry,
             skill_runtime,
-        )?;
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                let error_text = session_turn_failure_text(&error);
+                append_session_turn_error_item(
+                    event_bus,
+                    session_store,
+                    &request.session_id,
+                    &request.workspace_id,
+                    None,
+                    request.request_id.as_deref(),
+                    request.user_message_id.as_deref(),
+                    request.placeholder_message_id.as_deref(),
+                    &error_text,
+                    last_streaming_entry_id.as_deref(),
+                );
+                return Err(error);
+            }
+        };
         last_streaming_entry_id = streamed_content.streaming_entry_id.clone();
+        had_tool_calls |= streamed_content.encountered_tool_calls;
 
         if let Some(content) = streamed_content.final_content {
             final_content = Some(content);
@@ -112,9 +138,28 @@ pub(crate) fn run_session_turn_execution(
         }
     }
 
-    let final_content = final_content.ok_or_else(|| {
-        ApiError::internal_assembly("执行 session turn 失败", "模型未在工具调用后返回最终回复")
-    })?;
+    let final_content = if let Some(content) = final_content {
+        content
+    } else {
+        let failure_reason = if had_tool_calls {
+            "模型在工具调用后未返回最终回复"
+        } else {
+            "模型未返回可显示回复"
+        };
+        append_session_turn_error_item(
+            event_bus,
+            session_store,
+            &request.session_id,
+            &request.workspace_id,
+            None,
+            request.request_id.as_deref(),
+            request.user_message_id.as_deref(),
+            request.placeholder_message_id.as_deref(),
+            failure_reason,
+            last_streaming_entry_id.as_deref(),
+        );
+        return Err(ApiError::model_invocation_failed("执行 session turn 失败", failure_reason));
+    };
     append_final_item(
         event_bus,
         session_store,
@@ -137,11 +182,13 @@ struct SessionTurnRoundRuntime<'a> {
     tools: Option<Vec<ChatToolDefinition>>,
     messages: &'a mut Vec<ChatMessage>,
     round: usize,
+    turn_identity: &'a crate::session_turn_writeback::SessionTurnIdentity,
 }
 
 struct SessionTurnRoundOutput {
     final_content: Option<String>,
     streaming_entry_id: Option<String>,
+    encountered_tool_calls: bool,
 }
 
 fn stream_session_turn_round(
@@ -160,6 +207,7 @@ fn stream_session_turn_round(
         tools,
         messages,
         round,
+        turn_identity,
     } = runtime;
 
     let stream_item_id = format!(
@@ -193,13 +241,16 @@ fn stream_session_turn_round(
                 Some(thinking_item_id.clone()),
             );
             apply_request_aliases(&mut item, request);
-            upsert_session_turn_item(session_store, &request.session_id, item.clone());
-            publish_session_turn_item_event(
-                event_bus,
-                &request.session_id,
-                &request.workspace_id,
-                &item,
-            );
+            if let Some(published) =
+                upsert_session_turn_item(session_store, &request.session_id, item)
+            {
+                publish_session_turn_item_event(
+                    event_bus,
+                    &request.session_id,
+                    &request.workspace_id,
+                    &published,
+                );
+            }
         }
 
         let accumulated = delta.content.as_str();
@@ -221,7 +272,15 @@ fn stream_session_turn_round(
             Some(stream_item_id.clone()),
         );
         apply_request_aliases(&mut item, request);
-        upsert_session_turn_item(session_store, &request.session_id, item);
+        if let Some(published) = upsert_session_turn_item(session_store, &request.session_id, item)
+        {
+            publish_session_turn_item_event(
+                event_bus,
+                &request.session_id,
+                &request.workspace_id,
+                &published,
+            );
+        }
         session_store.upsert_timeline_entry(
             request.session_id.clone(),
             &stream_item_id,
@@ -239,6 +298,8 @@ fn stream_session_turn_round(
                 serde_json::json!({
                     "session_id": request.session_id.to_string(),
                     "entry_id": &stream_item_id,
+                    "turn_id": turn_identity.turn_id.clone(),
+                    "turn_seq": turn_identity.turn_seq,
                     "delta": delta,
                 }),
             )
@@ -261,7 +322,7 @@ fn stream_session_turn_round(
             },
             &on_delta,
         )
-        .map_err(|error| ApiError::internal_assembly("执行 session turn 失败", error))?;
+        .map_err(|error| ApiError::model_invocation_failed("执行 session turn 失败", error))?;
     let parsed = response.parse_chat_payload();
     publish_model_usage_record(
         event_bus,
@@ -293,13 +354,16 @@ fn stream_session_turn_round(
             Some(thinking_item_id.clone()),
         );
         apply_request_aliases(&mut thinking_item, request);
-        upsert_session_turn_item(session_store, &request.session_id, thinking_item.clone());
-        publish_session_turn_item_event(
-            event_bus,
-            &request.session_id,
-            &request.workspace_id,
-            &thinking_item,
-        );
+        if let Some(published) =
+            upsert_session_turn_item(session_store, &request.session_id, thinking_item)
+        {
+            publish_session_turn_item_event(
+                event_bus,
+                &request.session_id,
+                &request.workspace_id,
+                &published,
+            );
+        }
     }
     if !streamed_content.trim().is_empty() {
         let mut stream_item = session_turn_item(
@@ -310,13 +374,16 @@ fn stream_session_turn_round(
             Some(stream_item_id.clone()),
         );
         apply_request_aliases(&mut stream_item, request);
-        upsert_session_turn_item(session_store, &request.session_id, stream_item.clone());
-        publish_session_turn_item_event(
-            event_bus,
-            &request.session_id,
-            &request.workspace_id,
-            &stream_item,
-        );
+        if let Some(published) =
+            upsert_session_turn_item(session_store, &request.session_id, stream_item)
+        {
+            publish_session_turn_item_event(
+                event_bus,
+                &request.session_id,
+                &request.workspace_id,
+                &published,
+            );
+        }
         let _ = event_bus.publish(
             EventEnvelope::domain(
                 EventId::new(format!("event-session-seal-{}", UtcMillis::now().0)),
@@ -324,6 +391,8 @@ fn stream_session_turn_round(
                 serde_json::json!({
                     "session_id": request.session_id.to_string(),
                     "entry_id": &stream_item_id,
+                    "turn_id": turn_identity.turn_id.clone(),
+                    "turn_seq": turn_identity.turn_seq,
                     "response_length": streamed_content.len(),
                 }),
             )
@@ -357,6 +426,7 @@ fn stream_session_turn_round(
         return Ok(SessionTurnRoundOutput {
             final_content: None,
             streaming_entry_id: Some(stream_item_id),
+            encountered_tool_calls: true,
         });
     }
 
@@ -364,12 +434,12 @@ fn stream_session_turn_round(
         .content
         .filter(|content| !content.trim().is_empty())
         .or_else(|| (!streamed_content.trim().is_empty()).then_some(streamed_content))
-        .map(normalize_model_visible_content)
-        .or_else(|| (!request.use_tools).then(|| "[LLM 未返回文本响应]".to_string()));
+        .map(normalize_model_visible_content);
 
     Ok(SessionTurnRoundOutput {
         final_content,
         streaming_entry_id: Some(stream_item_id),
+        encountered_tool_calls: false,
     })
 }
 
@@ -390,13 +460,29 @@ fn append_phase_item(
         None,
     );
     apply_request_aliases(&mut phase_item, request);
-    append_session_turn_item(session_store, &request.session_id, phase_item.clone());
-    publish_session_turn_item_event(
-        event_bus,
-        &request.session_id,
-        &request.workspace_id,
-        &phase_item,
-    );
+    if let Some(published) =
+        append_session_turn_item(session_store, &request.session_id, phase_item)
+    {
+        publish_session_turn_item_event(
+            event_bus,
+            &request.session_id,
+            &request.workspace_id,
+            &published,
+        );
+    }
+}
+
+fn session_turn_failure_text(error: &ApiError) -> String {
+    match error {
+        ApiError::InvalidInput(message)
+        | ApiError::SessionNotFound(message)
+        | ApiError::RecoveryNotFound(message)
+        | ApiError::NotFound(message)
+        | ApiError::EventPublishFailed(message)
+        | ApiError::ModelInvocationFailed(message)
+        | ApiError::InternalAssemblyError(message)
+        | ApiError::Conflict(message) => message.clone(),
+    }
 }
 
 fn append_final_item(
@@ -415,16 +501,26 @@ fn append_final_item(
     );
     apply_request_aliases(&mut final_item, request);
     if streaming_entry_id.is_some() {
-        upsert_session_turn_item(session_store, &request.session_id, final_item.clone());
-    } else {
-        append_session_turn_item(session_store, &request.session_id, final_item.clone());
+        if let Some(published) =
+            upsert_session_turn_item(session_store, &request.session_id, final_item)
+        {
+            publish_session_turn_item_event(
+                event_bus,
+                &request.session_id,
+                &request.workspace_id,
+                &published,
+            );
+        }
+    } else if let Some(published) =
+        append_session_turn_item(session_store, &request.session_id, final_item)
+    {
+        publish_session_turn_item_event(
+            event_bus,
+            &request.session_id,
+            &request.workspace_id,
+            &published,
+        );
     }
-    publish_session_turn_item_event(
-        event_bus,
-        &request.session_id,
-        &request.workspace_id,
-        &final_item,
-    );
     let _ = session_store.update_current_turn_status(&request.session_id, "completed");
     let timeline_message = build_completed_turn_timeline_snapshot(
         session_store,
