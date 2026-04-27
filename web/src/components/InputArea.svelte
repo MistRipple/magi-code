@@ -3,20 +3,23 @@
   import { vscode } from '../lib/vscode-bridge';
   import {
     addToast,
+    clearTaskComposerDraft,
     getActiveInteractionType,
     getQueuedMessages,
     markQueuedMessageAsGuide,
     messagesState,
+    type TaskComposerDraft,
   } from '../stores/messages.svelte';
-  import { getTaskGraphState, refreshTaskProjection } from '../stores/task-graph-store.svelte';
+  import { getTaskGraphState, refreshTaskProjection, selectTaskGraphTask } from '../stores/task-graph-store.svelte';
   import type { StandardMessage } from '../shared/protocol/message-protocol';
   import { MessageCategory } from '../shared/protocol/message-protocol';
-  import type { SessionIntakeResponseDto, TaskDto, TaskStatus } from '../shared/rust-backend-types';
+  import type { SessionIntakeResponseDto, TaskDto } from '../shared/rust-backend-types';
   import { RustDaemonClient } from '../shared/rust-daemon-client';
   import { resolveAgentBaseUrl } from '../web/agent-api';
   import Icon from './Icon.svelte';
   import { generateId, ensureArray } from '../lib/utils';
   import { i18n } from '../stores/i18n.svelte';
+  import { getTaskKindLabel, getTaskStatusLabel } from '../lib/task-labels';
 
   // 技能类型
   interface InstructionSkill {
@@ -40,6 +43,7 @@
 
   // 输入内容
   let inputValue = $state('');
+  let appliedTaskComposerDraft = $state<TaskComposerDraft | null>(null);
 
   // 技能下拉列表状态
   let skillDropdownOpen = $state(false);
@@ -80,7 +84,6 @@
 
   // Intake 路由状态
   let intakeLoading = $state(false);
-  let selectedIntakeTaskId = $state('');
   let stopLoading = $state(false);
 
   const currentSessionId = $derived(messagesState.currentSessionId);
@@ -110,6 +113,7 @@
     const seen = new Set<string>();
     return projection.tasks
       .filter((task) => {
+        if (task.status === 'Cancelled') return false;
         if (seen.has(task.task_id)) return false;
         seen.add(task.task_id);
         return task.kind === 'Objective' || task.parent_task_id || task.task_id === projection.root_task.task_id;
@@ -122,7 +126,7 @@
   });
   const intakeContextTaskId = $derived.by(() => {
     const available = new Set(intakeTaskOptions.map((option) => option.taskId));
-    const selectedTaskId = selectedIntakeTaskId.trim();
+    const selectedTaskId = taskGraph.selectedTaskId?.trim();
     if (selectedTaskId && available.has(selectedTaskId)) {
       return selectedTaskId;
     }
@@ -138,17 +142,6 @@
     const rootTaskId = projection?.root_task.task_id ?? taskGraph.rootTaskId;
     if (!projection || !sessionId || !rootTaskId) return false;
     return projection.runner_status === 'running' || projection.runner_status === 'blocked';
-  });
-
-  $effect(() => {
-    if (intakeTaskOptions.length === 0) {
-      if (selectedIntakeTaskId !== '') selectedIntakeTaskId = '';
-      return;
-    }
-    const available = new Set(intakeTaskOptions.map((option) => option.taskId));
-    if (!selectedIntakeTaskId || !available.has(selectedIntakeTaskId)) {
-      selectedIntakeTaskId = defaultIntakeContextTaskId ?? '';
-    }
   });
 
   // 发送/停止态只认 store 内已经收敛好的处理状态，避免历史工具卡片把空闲会话抬回执行态。
@@ -187,38 +180,13 @@
     selectedSkill = null;
   }
 
-  function getIntakeTaskKindLabel(kind: TaskDto['kind']): string {
-    switch (kind) {
-      case 'Objective': return '目标';
-      case 'Phase': return '阶段';
-      case 'WorkPackage': return '工作包';
-      case 'Action': return '步骤';
-      case 'Validation': return '验证';
-      case 'Repair': return '修复';
-      case 'Decision': return '决策';
-      default: return kind;
-    }
-  }
-
-  function getIntakeTaskStatusLabel(status: TaskStatus): string {
-    switch (status) {
-      case 'Draft': return '待规划';
-      case 'Ready': return '待执行';
-      case 'Running': return '执行中';
-      case 'Blocked': return '已暂停';
-      case 'AwaitingApproval': return '等待确认';
-      case 'Verifying': return '验证中';
-      case 'Repairing': return '修复中';
-      case 'Completed': return '已完成';
-      case 'Failed': return '失败';
-      case 'Cancelled': return '已取消';
-      case 'Skipped': return '已跳过';
-      default: return status;
-    }
-  }
-
   function formatIntakeTaskOptionLabel(task: TaskDto): string {
-    return `${getIntakeTaskKindLabel(task.kind)} · ${task.title} · ${getIntakeTaskStatusLabel(task.status)}`;
+    return `${getTaskKindLabel(task.kind)} · ${task.title} · ${getTaskStatusLabel(task.status)}`;
+  }
+
+  function selectIntakeTaskTarget(event: Event) {
+    const select = event.currentTarget as HTMLSelectElement | null;
+    selectTaskGraphTask(currentSessionId, select?.value ?? null);
   }
 
   // 发送消息（支持图片附件）
@@ -406,6 +374,18 @@
       inputTextareaEl?.setSelectionRange(length, length);
     });
   }
+
+  $effect(() => {
+    const draft = messagesState.taskComposerDraft;
+    if (!draft || draft === appliedTaskComposerDraft) return;
+    appliedTaskComposerDraft = draft;
+    inputValue = draft.text;
+    if (draft.taskId) {
+      selectTaskGraphTask(currentSessionId, draft.taskId);
+    }
+    clearTaskComposerDraft();
+    focusInputTextareaToEnd();
+  });
 
   // 增强提示词 - 直接替换输入框内容
   function enhancePrompt() {
@@ -631,7 +611,8 @@
         </span>
         <select
           class="ia-task-target-select"
-          bind:value={selectedIntakeTaskId}
+          value={intakeContextTaskId ?? ''}
+          onchange={selectIntakeTaskTarget}
           title={selectedIntakeTaskOption?.title || '目标任务'}
           aria-label="目标任务"
         >

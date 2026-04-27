@@ -20,6 +20,7 @@ export interface TaskGraphState {
   loading: boolean;
   error: string | null;
   rootTaskId: string | null;
+  selectedTaskId: string | null;
 }
 
 interface InternalSessionTaskGraphState extends TaskGraphState {
@@ -32,6 +33,7 @@ const EMPTY_TASK_GRAPH_STATE: TaskGraphState = {
   loading: false,
   error: null,
   rootTaskId: null,
+  selectedTaskId: null,
 };
 const SSE_DEBOUNCE_MS = 300;
 const SETTLE_REFRESH_DELAY_MS = 1500;
@@ -56,6 +58,7 @@ function createEmptyInternalState(): InternalSessionTaskGraphState {
     loading: false,
     error: null,
     rootTaskId: null,
+    selectedTaskId: null,
     fetchGeneration: 0,
     refreshAfterLoad: false,
   };
@@ -106,7 +109,11 @@ export async function fetchTaskProjection(
   const state = ensureSessionState(normalizedSessionId);
   const fetchGeneration = state.fetchGeneration + 1;
   state.fetchGeneration = fetchGeneration;
+  const rootChanged = state.rootTaskId !== rootTaskId;
   state.rootTaskId = rootTaskId;
+  if (rootChanged) {
+    state.selectedTaskId = null;
+  }
   state.loading = true;
   state.error = null;
 
@@ -122,6 +129,12 @@ export async function fetchTaskProjection(
     }
     latestState.projection = projection;
     latestState.error = null;
+    if (latestState.selectedTaskId) {
+      const selectedTask = projection.tasks.find((task) => task.task_id === latestState.selectedTaskId);
+      if (!selectedTask || selectedTask.status === 'Cancelled') {
+        latestState.selectedTaskId = null;
+      }
+    }
   } catch (err) {
     const latestState = ensureSessionState(normalizedSessionId);
     if (
@@ -249,6 +262,19 @@ export function clearTaskGraph(sessionId?: string | null): void {
   }
 }
 
+export function selectTaskGraphTask(
+  sessionId: string | null | undefined,
+  taskId: string | null | undefined,
+): void {
+  const normalizedSessionId = normalizeSessionKey(sessionId);
+  if (!normalizedSessionId) {
+    return;
+  }
+  const state = ensureSessionState(normalizedSessionId);
+  const normalizedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
+  state.selectedTaskId = normalizedTaskId || null;
+}
+
 export function getTaskStatusModifier(status: TaskStatus): string {
   switch (status) {
     case 'Ready': return 'ready';
@@ -265,4 +291,3 @@ export function getTaskStatusModifier(status: TaskStatus): string {
     default: return 'unknown';
   }
 }
-

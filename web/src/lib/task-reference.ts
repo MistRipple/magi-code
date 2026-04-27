@@ -1,3 +1,6 @@
+import type { IconName } from './icons';
+import type { ClientBridgeMessage } from '../shared/bridges/client-bridge';
+
 export type TaskReferenceActionKind = 'file' | 'diff' | 'copy';
 
 export interface TaskReferenceDescriptor {
@@ -6,6 +9,14 @@ export interface TaskReferenceDescriptor {
   title: string;
   actionKind: TaskReferenceActionKind;
   actionTarget: string;
+}
+
+export interface TaskReferenceActionRuntime {
+  sessionId?: string | null;
+  postMessage: (message: ClientBridgeMessage) => void;
+  writeClipboard: (text: string) => Promise<void>;
+  onCopySuccess?: () => void;
+  onCopyFailure?: () => void;
 }
 
 interface ParsedTaskReference {
@@ -150,4 +161,45 @@ export function describeTaskReference(
     actionKind: 'copy',
     actionTarget: normalized,
   };
+}
+
+export function getTaskReferenceIconName(reference: TaskReferenceDescriptor): IconName {
+  if (reference.actionKind === 'diff') return 'file-edit';
+  if (reference.actionKind === 'file') return 'file-text';
+  return 'copy';
+}
+
+export function getTaskReferenceActionLabel(reference: TaskReferenceDescriptor): string {
+  if (reference.actionKind === 'diff') return '查看变更';
+  if (reference.actionKind === 'file') return '打开文件';
+  return '复制引用';
+}
+
+export async function executeTaskReferenceAction(
+  reference: TaskReferenceDescriptor,
+  runtime: TaskReferenceActionRuntime,
+): Promise<void> {
+  const sessionId = runtime.sessionId || undefined;
+  if (reference.actionKind === 'diff') {
+    runtime.postMessage({
+      type: 'viewDiff',
+      filePath: reference.actionTarget,
+      sessionId,
+    });
+    return;
+  }
+  if (reference.actionKind === 'file') {
+    runtime.postMessage({
+      type: 'openFile',
+      filepath: reference.actionTarget,
+      sessionId,
+    });
+    return;
+  }
+  try {
+    await runtime.writeClipboard(reference.actionTarget);
+    runtime.onCopySuccess?.();
+  } catch {
+    runtime.onCopyFailure?.();
+  }
 }

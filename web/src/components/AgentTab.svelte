@@ -5,8 +5,19 @@
   import { addToast, messagesState } from '../stores/messages.svelte';
   import { getTaskGraphState, getTaskStatusModifier } from '../stores/task-graph-store.svelte';
   import type { TaskDto, TaskStatus } from '../shared/rust-backend-types';
-  import { describeTaskReference, type TaskReferenceDescriptor } from '../lib/task-reference';
-  import type { IconName } from '../lib/icons';
+  import {
+    describeTaskReference,
+    executeTaskReferenceAction,
+    getTaskReferenceIconName,
+    type TaskReferenceDescriptor,
+  } from '../lib/task-reference';
+  import {
+    getTaskDisplayBlockedReason,
+    getTaskDisplayGoal,
+    getTaskDisplayTitle,
+    getTaskKindLabel,
+    getTaskStatusLabel,
+  } from '../lib/task-labels';
   import { vscode } from '../lib/vscode-bridge';
   import Icon from './Icon.svelte';
 
@@ -65,36 +76,6 @@
     hint: i18n.t('agentTab.empty.hint'),
   });
 
-  function getTaskStatusLabel(status: TaskStatus): string {
-    switch (status) {
-      case 'Draft': return '待规划';
-      case 'Ready': return '待执行';
-      case 'Running': return '执行中';
-      case 'Blocked': return '已暂停';
-      case 'AwaitingApproval': return '等待确认';
-      case 'Verifying': return '验证中';
-      case 'Repairing': return '修复中';
-      case 'Completed': return '已完成';
-      case 'Failed': return '失败';
-      case 'Cancelled': return '已取消';
-      case 'Skipped': return '已跳过';
-      default: return status;
-    }
-  }
-
-  function getTaskKindLabel(kind: TaskDto['kind']): string {
-    switch (kind) {
-      case 'Objective': return '目标';
-      case 'Phase': return '阶段';
-      case 'WorkPackage': return '工作包';
-      case 'Action': return '步骤';
-      case 'Validation': return '验证';
-      case 'Repair': return '修复';
-      case 'Decision': return '决策';
-      default: return kind;
-    }
-  }
-
   const activeTaskStatusIcon = $derived.by(() => {
     if (!activeTask) return { name: 'circleOutline' as const, spinning: false };
     switch (activeTask.status) {
@@ -116,35 +97,14 @@
     return sessionId || null;
   }
 
-  function getReferenceIconName(reference: TaskReferenceDescriptor): IconName {
-    if (reference.actionKind === 'diff') return 'file-edit';
-    if (reference.actionKind === 'file') return 'file-text';
-    return 'copy';
-  }
-
   async function activateTaskReference(reference: TaskReferenceDescriptor) {
-    if (reference.actionKind === 'diff') {
-      vscode.postMessage({
-        type: 'viewDiff',
-        filePath: reference.actionTarget,
-        sessionId: currentSessionIdValue() || undefined,
-      });
-      return;
-    }
-    if (reference.actionKind === 'file') {
-      vscode.postMessage({
-        type: 'openFile',
-        filepath: reference.actionTarget,
-        sessionId: currentSessionIdValue() || undefined,
-      });
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(reference.actionTarget);
-      addToast('info', '引用已复制');
-    } catch {
-      addToast('error', '复制引用失败');
-    }
+    await executeTaskReferenceAction(reference, {
+      sessionId: currentSessionIdValue(),
+      postMessage: (message) => vscode.postMessage(message),
+      writeClipboard: (text) => navigator.clipboard.writeText(text),
+      onCopySuccess: () => addToast('info', '引用已复制'),
+      onCopyFailure: () => addToast('error', '复制引用失败'),
+    });
   }
 </script>
 
@@ -162,9 +122,9 @@
           {getTaskStatusLabel(activeTask.status)}
         </span>
       </div>
-      <div class="atb-title">{activeTask.title}</div>
-      {#if activeTask.goal && activeTask.goal !== activeTask.title}
-        <div class="atb-goal">{activeTask.goal}</div>
+      <div class="atb-title">{getTaskDisplayTitle(activeTask)}</div>
+      {#if getTaskDisplayGoal(activeTask) && getTaskDisplayGoal(activeTask) !== getTaskDisplayTitle(activeTask)}
+        <div class="atb-goal">{getTaskDisplayGoal(activeTask)}</div>
       {/if}
 
       {#if activeTaskOutputReferences.length > 0 || activeTaskEvidenceReferences.length > 0}
@@ -180,7 +140,7 @@
                     title={reference.title}
                     onclick={() => activateTaskReference(reference)}
                   >
-                    <Icon name={getReferenceIconName(reference)} size={10} />
+                    <Icon name={getTaskReferenceIconName(reference)} size={10} />
                     <span>{reference.displayLabel}</span>
                   </button>
                 {/each}
@@ -198,7 +158,7 @@
                     title={reference.title}
                     onclick={() => activateTaskReference(reference)}
                   >
-                    <Icon name={getReferenceIconName(reference)} size={10} />
+                    <Icon name={getTaskReferenceIconName(reference)} size={10} />
                     <span>{reference.displayLabel}</span>
                   </button>
                 {/each}
@@ -211,7 +171,7 @@
       {#if activeTask.status === 'Blocked' && activeTask.decision_payload}
         <div class="atb-blocked">
           <Icon name="alert-circle" size={12} />
-          <span>{activeTask.decision_payload.blocked_reason || '任务被阻塞'}</span>
+          <span>{getTaskDisplayBlockedReason(activeTask) || '任务被阻塞'}</span>
         </div>
       {:else if activeTask.status === 'Blocked'}
         <div class="atb-blocked">
@@ -240,7 +200,7 @@
       {#each completedTasks as task (task.task_id)}
         <div class="atb-completed-row">
           <Icon name="check-circle" size={12} />
-          <span class="atb-completed-title">{task.title}</span>
+          <span class="atb-completed-title">{getTaskDisplayTitle(task)}</span>
           <span class="atb-completed-kind">{getTaskKindLabel(task.kind)}</span>
         </div>
       {/each}

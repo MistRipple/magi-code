@@ -1,16 +1,42 @@
 <script lang="ts">
-  import { addToast, getState, requestMessageJump, setCurrentBottomTab, setCurrentTopTab } from '../stores/messages.svelte';
+  import { onDestroy } from 'svelte';
+  import {
+    addToast,
+    getState,
+    requestMessageJump,
+    setCurrentBottomTab,
+    setCurrentTopTab,
+    setTaskComposerDraft,
+    type TaskComposerIntent,
+  } from '../stores/messages.svelte';
   import { ensureArray } from '../lib/utils';
   import type { ActivePlanState, PlanLedgerRecord, Message } from '../types/message';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import type { DecisionOptionDto, DeliveryPackageDto, TaskDto, TaskProjectionDto, TaskStatus } from '../shared/rust-backend-types';
   import type { IconName } from '../lib/icons';
-  import { describeTaskReference, type TaskReferenceDescriptor } from '../lib/task-reference';
+  import {
+    describeTaskReference,
+    executeTaskReferenceAction,
+    getTaskReferenceActionLabel,
+    getTaskReferenceIconName,
+    type TaskReferenceDescriptor,
+  } from '../lib/task-reference';
+  import {
+    getRunnerStatusLabel,
+    getTaskDisplayBlockedReason,
+    getTaskDisplayGoal,
+    getTaskDisplayText,
+    getTaskDisplayTitle,
+    getTaskKindLabel,
+    getTaskStatusLabel,
+    getTaskStatusTone,
+  } from '../lib/task-labels';
   import {
     getTaskGraphState,
     getTaskStatusModifier,
     refreshTaskProjection,
+    selectTaskGraphTask,
   } from '../stores/task-graph-store.svelte';
   import { RustDaemonClient } from '../shared/rust-daemon-client';
   import { resolveAgentBaseUrl } from '../web/agent-api';
@@ -67,10 +93,23 @@
   // ─── 交付包视图（深度模式完成后展示） ─────────────────
   let deliveryPackage = $state<DeliveryPackageDto | null>(null);
   let deliveryPackageLoading = $state(false);
+  let deliverySummaryCopied = $state(false);
+  let deliverySummaryCopyTimer: ReturnType<typeof setTimeout> | null = null;
   let taskActionLoading = $state<'pause' | 'resume' | 'replan' | 'delivery' | null>(null);
   let selectedTaskReference = $state<SelectedTaskReference | null>(null);
   let referenceDetailEl = $state<HTMLElement | null>(null);
   let referenceSelectionScope = $state('');
+
+  function clearDeliverySummaryCopyTimer() {
+    if (deliverySummaryCopyTimer !== null) {
+      clearTimeout(deliverySummaryCopyTimer);
+      deliverySummaryCopyTimer = null;
+    }
+  }
+
+  onDestroy(() => {
+    clearDeliverySummaryCopyTimer();
+  });
 
   const shouldFetchDelivery = $derived.by(() => {
     const proj = taskGraph.projection;
@@ -81,6 +120,8 @@
   $effect(() => {
     if (!shouldFetchDelivery) {
       deliveryPackage = null;
+      deliverySummaryCopied = false;
+      clearDeliverySummaryCopyTimer();
       return;
     }
     const rootTaskId = taskGraph.projection?.root_task.task_id;
@@ -130,15 +171,19 @@
       .filter((ref): ref is TaskReferenceDescriptor => Boolean(ref))
   ));
   const currentFocusTask = $derived.by(() => resolveCurrentFocusTask(activeProjectionTasks));
-  let selectedGraphTaskId = $state<string | null>(null);
   const selectedGraphTask = $derived.by(() => {
-    if (selectedGraphTaskId) {
-      const matched = activeProjectionTasks.find((task) => task.task_id === selectedGraphTaskId);
+    if (taskGraph.selectedTaskId) {
+      const matched = activeProjectionTasks.find((task) => task.task_id === taskGraph.selectedTaskId);
       if (matched) return matched;
     }
     return currentFocusTask;
   });
   const selectedGraphReferenceGroups = $derived.by(() => buildTaskReferenceGroups(selectedGraphTask));
+  const canUseTaskIntake = $derived.by(() => {
+    const projection = taskGraph.projection;
+    if (!projection || projection.execution_mode !== 'deep') return false;
+    return projection.runner_status === 'running' || projection.runner_status === 'blocked';
+  });
   const selectedHistoryTask = $derived.by(() => {
     if (cancelledHistoryTasks.length === 0) return null;
     if (selectedHistoryTaskId) {
@@ -172,10 +217,14 @@
       .map((id) => taskById.get(id))
       .filter((task): task is TaskDto => Boolean(task));
   });
+  const pendingDecisionTask = $derived.by(() => (
+    attentionTasks.find((task) => task.kind === 'Decision') ?? null
+  ));
 
   function getTaskParentTitle(task: TaskDto): string {
     if (!task.parent_task_id) return '根任务';
-    return taskById.get(task.parent_task_id)?.title || task.parent_task_id;
+    const parent = taskById.get(task.parent_task_id);
+    return parent ? getTaskDisplayTitle(parent) : task.parent_task_id;
   }
 
   function buildTaskReferences(
@@ -212,10 +261,38 @@
       seen.add(current.task_id);
       const parent = taskById.get(current.parent_task_id);
       if (!parent) break;
-      lineage.unshift(parent.title);
+      lineage.unshift(getTaskDisplayTitle(parent));
       current = parent;
     }
     return lineage.length > 0 ? lineage.join(' / ') : '根任务';
+  }
+
+  function buildTaskComposerDraftText(task: TaskDto, intent: TaskComposerIntent): string {
+    const taskTitle = getTaskDisplayTitle(task);
+    const taskGoal = getTaskDisplayGoal(task);
+    const taskLabel = `${getTaskKindLabel(task.kind)} · ${taskTitle}`;
+    const goalLine = taskGoal && taskGoal !== taskTitle ? `\n当前目标：${taskGoal}` : '';
+    if (intent === 'supplement_context') {
+      return `补充上下文：\n${taskLabel}${goalLine}\n\n请补充这个任务接下来执行需要的上下文、约束、证据或前置条件。`;
+    }
+    if (intent === 'append_task') {
+      return `追加任务：\n${taskLabel}${goalLine}\n\n请追加一个可以直接纳入当前任务图的新子任务。`;
+    }
+    return `重新规划：\n${taskLabel}${goalLine}\n\n请基于这个任务所在的上下文，重新规划剩余任务图。`;
+  }
+
+  function openTaskComposerDraft(task: TaskDto, intent: TaskComposerIntent) {
+    const sessionId = currentSessionIdValue();
+    if (!sessionId) return;
+    setTaskComposerDraft({
+      intent,
+      taskId: task.task_id,
+      text: buildTaskComposerDraftText(task, intent),
+    });
+    selectTaskGraphTask(sessionId, task.task_id);
+    setCurrentTopTab('thread');
+    setCurrentBottomTab('thread');
+    addToast('info', '已放入输入框，可编辑后发送');
   }
 
   function resolveVisibleParentTaskId(
@@ -293,6 +370,61 @@
     };
   }
 
+  function appendDeliverySummaryList(
+    lines: string[],
+    label: string,
+    items: string[],
+    limit = 10,
+  ) {
+    if (items.length === 0) return;
+    lines.push('', `${label}（${items.length}）`);
+    for (const item of items.slice(0, limit)) {
+      lines.push(`- ${item}`);
+    }
+    const remaining = items.length - limit;
+    if (remaining > 0) {
+      lines.push(`- 另有 ${remaining} 项`);
+    }
+  }
+
+  function buildDeliveryPackageSummary(pkg: DeliveryPackageDto): string {
+    const total = pkg.progress.total || 0;
+    const completed = pkg.progress.completed || 0;
+    const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
+    const lines = [
+      '交付概览',
+      `目标：${getTaskDisplayText(pkg.goal) || '--'}`,
+      `模式：${pkg.execution_mode === 'deep' ? '深度模式' : '普通模式'}`,
+      `状态：${getTaskStatusLabel(pkg.aggregate_status as TaskStatus)}`,
+      pkg.current_phase ? `阶段：${pkg.current_phase}` : null,
+      `进度：${completed}/${total}（${percent}%）`,
+      `执行态：失败 ${pkg.progress.failed || 0} · 执行中 ${pkg.progress.running || 0} · 阻塞 ${pkg.progress.blocked || 0}`,
+      `完成任务：${pkg.completed_task_count}`,
+      `资产：文件 ${pkg.file_changes.length} · 证据 ${pkg.evidence_list.length} · 验证 ${pkg.validation_results.length} · 修复 ${pkg.repair_records.length} · 决策 ${pkg.key_decisions.length} · 风险 ${pkg.remaining_risks.length}`,
+    ].filter((line): line is string => Boolean(line));
+
+    appendDeliverySummaryList(lines, '文件变更', pkg.file_changes);
+    appendDeliverySummaryList(lines, '证据', pkg.evidence_list);
+
+    if (pkg.validation_results.length > 0) {
+      lines.push('', `验证结果（${pkg.validation_results.length}）`);
+      for (const result of pkg.validation_results.slice(0, 10)) {
+        lines.push(`- ${getTaskDisplayText(result.title)}: ${getTaskDisplayText(result.result)}`);
+      }
+    }
+
+    if (pkg.key_decisions.length > 0) {
+      lines.push('', `关键决策（${pkg.key_decisions.length}）`);
+      for (const decision of pkg.key_decisions.slice(0, 8)) {
+        const chosen = decision.chosen_option ? ` · ${decision.chosen_option}` : '';
+        lines.push(`- ${getTaskDisplayText(decision.context)}${chosen}`);
+      }
+    }
+
+    appendDeliverySummaryList(lines, '剩余风险', pkg.remaining_risks.map(getTaskDisplayText), 8);
+    return lines.join('\n');
+  }
+
   function resolveCurrentFocusTask(tasks: TaskDto[]): TaskDto | null {
     const priority: TaskStatus[] = ['AwaitingApproval', 'Blocked', 'Repairing', 'Verifying', 'Running', 'Ready'];
     for (const status of priority) {
@@ -300,55 +432,6 @@
       if (matched) return matched;
     }
     return tasks.find((task) => task.kind === 'Objective') ?? null;
-  }
-
-  function getTaskKindProductLabel(kind: TaskDto['kind']): string {
-    switch (kind) {
-      case 'Objective': return '目标';
-      case 'Phase': return '阶段';
-      case 'WorkPackage': return '工作包';
-      case 'Action': return '步骤';
-      case 'Validation': return '验证';
-      case 'Repair': return '修复';
-      case 'Decision': return '决策';
-      default: return kind;
-    }
-  }
-
-  function getTaskStatusLabel(status: TaskStatus): string {
-    switch (status) {
-      case 'Draft': return '待规划';
-      case 'Ready': return '待执行';
-      case 'Running': return '执行中';
-      case 'Blocked': return '已暂停';
-      case 'AwaitingApproval': return '等待确认';
-      case 'Verifying': return '验证中';
-      case 'Repairing': return '修复中';
-      case 'Completed': return '已完成';
-      case 'Failed': return '失败';
-      case 'Cancelled': return '已取消';
-      case 'Skipped': return '已跳过';
-      default: return status;
-    }
-  }
-
-  function getTaskStatusTone(status: TaskStatus): string {
-    if (status === 'AwaitingApproval' || status === 'Blocked') return '需要处理';
-    if (status === 'Running' || status === 'Verifying' || status === 'Repairing') return '正在推进';
-    if (status === 'Completed' || status === 'Skipped') return '已收束';
-    if (status === 'Cancelled') return '已取消';
-    if (status === 'Failed') return '需要修复';
-    return '等待执行';
-  }
-
-  function getRunnerStatusLabel(status: string): string {
-    switch (status) {
-      case 'running': return '运行中';
-      case 'blocked': return '已阻塞';
-      case 'completed': return '已完成';
-      case 'error': return '异常';
-      default: return '空闲';
-    }
   }
 
   // 自动展开根节点和活跃分支，确保任务树能直接反映执行状态。
@@ -401,15 +484,7 @@
     if (referenceSelectionScope !== nextScope) {
       referenceSelectionScope = nextScope;
       selectedTaskReference = null;
-      selectedGraphTaskId = null;
-    }
-  });
-
-  $effect(() => {
-    if (!selectedGraphTaskId) return;
-    const activeTaskIds = new Set(activeProjectionTasks.map((task) => task.task_id));
-    if (!activeTaskIds.has(selectedGraphTaskId)) {
-      selectedGraphTaskId = currentFocusTask?.task_id ?? null;
+      selectTaskGraphTask(currentSessionId, null);
     }
   });
 
@@ -512,20 +587,26 @@
     await runTaskAction('delivery', async () => {
       await refreshTaskProjection(sessionId);
       deliveryPackage = null;
+      deliverySummaryCopied = false;
+      clearDeliverySummaryCopyTimer();
       selectedTaskReference = null;
     });
   }
 
-  function getReferenceIconName(reference: TaskReferenceDescriptor): IconName {
-    if (reference.actionKind === 'diff') return 'file-edit';
-    if (reference.actionKind === 'file') return 'file-text';
-    return 'copy';
-  }
-
-  function getReferenceActionLabel(reference: TaskReferenceDescriptor): string {
-    if (reference.actionKind === 'diff') return '查看变更';
-    if (reference.actionKind === 'file') return '打开文件';
-    return '复制引用';
+  async function copyDeliveryPackageSummary() {
+    if (!deliveryPackage) return;
+    try {
+      await navigator.clipboard.writeText(buildDeliveryPackageSummary(deliveryPackage));
+      deliverySummaryCopied = true;
+      clearDeliverySummaryCopyTimer();
+      deliverySummaryCopyTimer = setTimeout(() => {
+        deliverySummaryCopied = false;
+        deliverySummaryCopyTimer = null;
+      }, 1800);
+      addToast('info', '交付摘要已复制');
+    } catch {
+      addToast('error', '复制交付摘要失败');
+    }
   }
 
   function taskReferenceKey(sourceLabel: string, reference: TaskReferenceDescriptor): string {
@@ -551,10 +632,15 @@
   }
 
   function selectGraphTask(taskId: string) {
-    selectedGraphTaskId = taskId;
+    selectTaskGraphTask(currentSessionId, taskId);
     if (selectedTaskReference?.sourceLabel.startsWith('任务详情 ·')) {
       selectedTaskReference = null;
     }
+  }
+
+  function focusPendingDecision() {
+    if (!pendingDecisionTask) return;
+    selectGraphTask(pendingDecisionTask.task_id);
   }
 
   function selectHistoryTask(taskId: string) {
@@ -570,28 +656,13 @@
   }
 
   async function activateTaskReference(reference: TaskReferenceDescriptor) {
-    if (reference.actionKind === 'diff') {
-      vscode.postMessage({
-        type: 'viewDiff',
-        filePath: reference.actionTarget,
-        sessionId: currentSessionIdValue() || undefined,
-      });
-      return;
-    }
-    if (reference.actionKind === 'file') {
-      vscode.postMessage({
-        type: 'openFile',
-        filepath: reference.actionTarget,
-        sessionId: currentSessionIdValue() || undefined,
-      });
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(reference.actionTarget);
-      addToast('info', '引用已复制');
-    } catch {
-      addToast('error', '复制引用失败');
-    }
+    await executeTaskReferenceAction(reference, {
+      sessionId: currentSessionIdValue(),
+      postMessage: (message) => vscode.postMessage(message),
+      writeClipboard: (text) => navigator.clipboard.writeText(text),
+      onCopySuccess: () => addToast('info', '引用已复制'),
+      onCopyFailure: () => addToast('error', '复制引用失败'),
+    });
   }
 
   // ─── 决策任务处理 ──────────────────────────────────────
@@ -713,12 +784,6 @@
     return message?.metadata?.isSupplementary !== true;
   }
 
-  function getTemporalAnchorScore(messageTimestamp: number, anchorTimestamp: number): number {
-    const delta = anchorTimestamp - messageTimestamp;
-    const isFuture = delta < -2000;
-    return Math.abs(delta) + (isFuture ? 200000 : 0);
-  }
-
   function matchUserInputByPromptDigest(messages: Message[], plan: PlanLedgerRecord): Message | null {
     const normalizedDigest = normalizeAnchorText(plan.promptDigest);
     if (!normalizedDigest || normalizedDigest === 'empty') {
@@ -731,10 +796,6 @@
       return null;
     }
 
-    const anchorTs = Number.isFinite(plan.createdAt) ? plan.createdAt : Date.now();
-    let bestMatch: Message | null = null;
-    let bestScore = Number.POSITIVE_INFINITY;
-
     for (const message of messages) {
       const text = extractUserInputText(message);
       if (!text) {
@@ -744,34 +805,12 @@
       const exact = text === digestPrefix;
       const prefix = text.startsWith(digestPrefix);
       const include = !hasEllipsis && text.includes(digestPrefix);
-      if (!exact && !prefix && !include) {
-        continue;
-      }
-
-      const textScore = exact ? 0 : prefix ? 1 : 2;
-      const score = textScore * 100000 + getTemporalAnchorScore(message.timestamp, anchorTs);
-      if (score < bestScore) {
-        bestScore = score;
-        bestMatch = message;
+      if (exact || prefix || include) {
+        return message;
       }
     }
 
-    return bestMatch;
-  }
-
-  function matchUserInputByTimestamp(messages: Message[], anchorTimestamp: number): Message | null {
-    let bestMatch: Message | null = null;
-    let bestScore = Number.POSITIVE_INFINITY;
-
-    for (const message of messages) {
-      const score = getTemporalAnchorScore(message.timestamp, anchorTimestamp);
-      if (score < bestScore) {
-        bestScore = score;
-        bestMatch = message;
-      }
-    }
-
-    return bestMatch;
+    return null;
   }
 
   function resolvePlanAnchorMessageId(plan: PlanLedgerRecord): string | null {
@@ -780,7 +819,6 @@
       return null;
     }
 
-    const anchorTs = Number.isFinite(plan.createdAt) ? plan.createdAt : Date.now();
     const normalizedTurnId = typeof plan.turnId === 'string' ? plan.turnId.trim() : '';
     if (normalizedTurnId) {
       const byTurn = userInputs.filter((message) => {
@@ -794,10 +832,7 @@
         if (digestMatch?.id) {
           return digestMatch.id;
         }
-        const byTurnTime = matchUserInputByTimestamp(byTurn, anchorTs);
-        if (byTurnTime?.id) {
-          return byTurnTime.id;
-        }
+        return byTurn[0]?.id || null;
       }
     }
 
@@ -806,7 +841,7 @@
       return digestMatch.id;
     }
 
-    return matchUserInputByTimestamp(userInputs, anchorTs)?.id || null;
+    return null;
   }
 
   function jumpToPlanConversation(plan: PlanLedgerRecord): void {
@@ -828,9 +863,9 @@
         <div class="task-overview-top">
           <div class="task-overview-main">
             <span class="task-overview-kicker">当前任务</span>
-            <h3 class="task-overview-title">{proj.root_task.title}</h3>
-            {#if proj.root_task.goal && proj.root_task.goal !== proj.root_task.title}
-              <p class="task-overview-goal">{proj.root_task.goal}</p>
+            <h3 class="task-overview-title">{getTaskDisplayTitle(proj.root_task)}</h3>
+            {#if getTaskDisplayGoal(proj.root_task) && getTaskDisplayGoal(proj.root_task) !== getTaskDisplayTitle(proj.root_task)}
+              <p class="task-overview-goal">{getTaskDisplayGoal(proj.root_task)}</p>
             {/if}
           </div>
           <div class="task-overview-badges">
@@ -859,6 +894,17 @@
               <span>暂停</span>
             </button>
           {:else if proj.runner_status === 'blocked'}
+            {#if pendingDecisionTask}
+              <button
+                type="button"
+                class="task-action-btn"
+                onclick={focusPendingDecision}
+                title="查看待处理决策"
+              >
+                <Icon name="shield" size={12} />
+                <span>处理决策</span>
+              </button>
+            {:else}
             <button
               type="button"
               class="task-action-btn"
@@ -869,6 +915,7 @@
               <Icon name={taskActionLoading === 'resume' ? 'loader' : 'play'} size={12} class={taskActionLoading === 'resume' ? 'spinning' : ''} />
               <span>恢复</span>
             </button>
+            {/if}
           {/if}
 
           {#if proj.execution_mode === 'deep' && proj.runner_status !== 'completed'}
@@ -926,7 +973,7 @@
           <div class="task-focus-card">
             <span class="task-focus-label">当前焦点</span>
             <div class="task-focus-main">
-              <span class="task-focus-title">{currentFocusTask.title}</span>
+              <span class="task-focus-title">{getTaskDisplayTitle(currentFocusTask)}</span>
               <span class="task-focus-status">{getTaskStatusTone(currentFocusTask.status)}</span>
             </div>
             {#if proj.current_phase}
@@ -945,7 +992,7 @@
             {#each workpackageSummaries as wp (wp.task_id)}
               <div class="wp-summary-row">
                 <div class="wp-summary-header">
-                  <span class="wp-summary-title">{wp.title}</span>
+                  <span class="wp-summary-title">{getTaskDisplayText(wp.title)}</span>
                   <span class="wp-summary-badge tg-status--{getTaskStatusModifier(wp.aggregate_status)}">
                     {getTaskStatusLabel(wp.aggregate_status)}
                   </span>
@@ -959,7 +1006,7 @@
                 {#if wp.recent_issues.length > 0}
                   <div class="wp-summary-issues">
                     <Icon name="alert-circle" size={10} />
-                    <span>{wp.recent_issues.length} 项异常: {wp.recent_issues.join('、')}</span>
+                    <span>{wp.recent_issues.length} 项异常: {wp.recent_issues.map(getTaskDisplayText).join('、')}</span>
                   </div>
                 {/if}
               </div>
@@ -974,6 +1021,15 @@
             <Icon name="taskComplete" size={14} />
             <span class="dp-title">交付概览</span>
             <span class="dp-mode">{deliveryPackage.execution_mode === 'deep' ? '深度模式' : '普通模式'}</span>
+            <button
+              type="button"
+              class="dp-summary-copy"
+              title={deliverySummaryCopied ? '交付摘要已复制' : '复制交付摘要'}
+              onclick={copyDeliveryPackageSummary}
+            >
+              <Icon name={deliverySummaryCopied ? 'check' : 'copy'} size={11} />
+              <span>{deliverySummaryCopied ? '已复制' : '复制摘要'}</span>
+            </button>
           </div>
 
           {#if deliveryPackage.file_changes.length > 0}
@@ -988,7 +1044,7 @@
                     title={reference.title}
                     onclick={() => selectTaskReference('交付 · 文件变更', reference)}
                   >
-                    <Icon name={getReferenceIconName(reference)} size={11} />
+                    <Icon name={getTaskReferenceIconName(reference)} size={11} />
                     <span>{reference.displayLabel}</span>
                   </button>
                 {/each}
@@ -1008,7 +1064,7 @@
                     title={reference.title}
                     onclick={() => selectTaskReference('交付 · 证据', reference)}
                   >
-                    <Icon name={getReferenceIconName(reference)} size={11} />
+                    <Icon name={getTaskReferenceIconName(reference)} size={11} />
                     <span>{reference.displayLabel}</span>
                   </button>
                 {/each}
@@ -1022,8 +1078,8 @@
               {#each deliveryPackage.validation_results as vr}
                 <div class="dp-validation-row">
                   <Icon name="check-circle" size={12} />
-                  <span class="dp-validation-title">{vr.title}</span>
-                  <span class="dp-validation-result">{vr.result}</span>
+                  <span class="dp-validation-title">{getTaskDisplayText(vr.title)}</span>
+                  <span class="dp-validation-result">{getTaskDisplayText(vr.result)}</span>
                 </div>
               {/each}
             </div>
@@ -1035,7 +1091,7 @@
               {#each deliveryPackage.key_decisions as kd}
                 <div class="dp-decision-row">
                   <Icon name="shield" size={12} />
-                  <span class="dp-decision-context">{kd.context}</span>
+                  <span class="dp-decision-context">{getTaskDisplayText(kd.context)}</span>
                 </div>
               {/each}
             </div>
@@ -1047,7 +1103,7 @@
               {#each deliveryPackage.remaining_risks as risk}
                 <div class="dp-risk-row">
                   <Icon name="alert-triangle" size={12} />
-                  <span>{risk}</span>
+                  <span>{getTaskDisplayText(risk)}</span>
                 </div>
               {/each}
             </div>
@@ -1067,7 +1123,7 @@
         <section bind:this={referenceDetailEl} class="task-reference-detail-card" aria-label="引用详情">
           <div class="task-reference-detail-top">
             <span class="task-reference-detail-title">
-              <Icon name={getReferenceIconName(selectedTaskReference.reference)} size={12} />
+              <Icon name={getTaskReferenceIconName(selectedTaskReference.reference)} size={12} />
               <span>{selectedTaskReference.reference.displayLabel}</span>
             </span>
             <button
@@ -1081,7 +1137,7 @@
           </div>
           <div class="task-reference-detail-meta">
             <span>来源：{selectedTaskReference.sourceLabel}</span>
-            <span>动作：{getReferenceActionLabel(selectedTaskReference.reference)}</span>
+            <span>动作：{getTaskReferenceActionLabel(selectedTaskReference.reference)}</span>
           </div>
           <div class="task-reference-detail-field">
             <span class="task-reference-detail-label">目标</span>
@@ -1099,8 +1155,8 @@
           {/if}
           <div class="task-reference-detail-actions">
             <button type="button" class="task-reference-detail-action" onclick={executeSelectedTaskReference}>
-              <Icon name={getReferenceIconName(selectedTaskReference.reference)} size={12} />
-              <span>{getReferenceActionLabel(selectedTaskReference.reference)}</span>
+              <Icon name={getTaskReferenceIconName(selectedTaskReference.reference)} size={12} />
+              <span>{getTaskReferenceActionLabel(selectedTaskReference.reference)}</span>
             </button>
           </div>
         </section>
@@ -1122,7 +1178,7 @@
             role="treeitem"
             aria-level={row.depth + 1}
             aria-expanded={row.hasChildren ? isExpanded : undefined}
-            aria-selected="false"
+            aria-selected={selectedGraphTask?.task_id === row.task.task_id}
             style={`--task-indent: ${row.depth * 18}px;`}
           >
             {#if row.hasChildren}
@@ -1138,7 +1194,7 @@
             {:else}
               <span class="tg-tree-toggle tg-tree-toggle--empty" aria-hidden="true"></span>
             {/if}
-            <span class="tg-kind-badge">{getTaskKindProductLabel(row.task.kind)}</span>
+            <span class="tg-kind-badge">{getTaskKindLabel(row.task.kind)}</span>
             <span class="tg-tree-status-icon tg-status-icon--{getTaskStatusModifier(row.task.status)}">
               {#if statusIcon.spinning}
                 <Icon name={statusIcon.name} size={14} class="spinning" />
@@ -1147,9 +1203,9 @@
               {/if}
             </span>
             <span class="tg-tree-content">
-              <span class="tg-tree-title">{row.task.title}</span>
-              {#if row.task.goal && row.task.goal !== row.task.title}
-                <span class="tg-tree-goal">{row.task.goal}</span>
+              <span class="tg-tree-title">{getTaskDisplayTitle(row.task)}</span>
+              {#if getTaskDisplayGoal(row.task) && getTaskDisplayGoal(row.task) !== getTaskDisplayTitle(row.task)}
+                <span class="tg-tree-goal">{getTaskDisplayGoal(row.task)}</span>
               {/if}
             </span>
             <span class="tg-tree-side">
@@ -1180,16 +1236,16 @@
       {#if selectedGraphTask}
         <section class="task-detail-card" aria-label="任务详情">
           <div class="task-detail-top">
-            <span class="task-detail-title">{selectedGraphTask.title}</span>
+            <span class="task-detail-title">{getTaskDisplayTitle(selectedGraphTask)}</span>
             <span class="task-detail-status tg-status--{getTaskStatusModifier(selectedGraphTask.status)}">
               {getTaskStatusLabel(selectedGraphTask.status)}
             </span>
           </div>
-          {#if selectedGraphTask.goal && selectedGraphTask.goal !== selectedGraphTask.title}
-            <p class="task-detail-goal">{selectedGraphTask.goal}</p>
+          {#if selectedGraphTask.kind !== 'Decision' && getTaskDisplayGoal(selectedGraphTask) && getTaskDisplayGoal(selectedGraphTask) !== getTaskDisplayTitle(selectedGraphTask)}
+            <p class="task-detail-goal">{getTaskDisplayGoal(selectedGraphTask)}</p>
           {/if}
           <div class="task-detail-meta">
-            <span>{getTaskKindProductLabel(selectedGraphTask.kind)}</span>
+            <span>{getTaskKindLabel(selectedGraphTask.kind)}</span>
             <span>路径：{getTaskLineageLabel(selectedGraphTask)}</span>
             {#if selectedGraphTask.executor_binding?.target_role}
               <span>执行者：{selectedGraphTask.executor_binding.target_role}</span>
@@ -1204,10 +1260,41 @@
               <span>重试 {selectedGraphTask.retry_count} · 修复 {selectedGraphTask.repair_count}</span>
             {/if}
           </div>
-          {#if selectedGraphTask.decision_payload?.blocked_reason}
+          {#if canUseTaskIntake}
+            <div class="task-detail-actions">
+              <button
+                type="button"
+                class="tg-attention-action"
+                onclick={() => openTaskComposerDraft(selectedGraphTask, 'supplement_context')}
+                title="补充当前任务的上下文"
+              >
+                <Icon name="sparkles" size={11} />
+                <span>补充上下文</span>
+              </button>
+              <button
+                type="button"
+                class="tg-attention-action"
+                onclick={() => openTaskComposerDraft(selectedGraphTask, 'append_task')}
+                title="追加一个新子任务"
+              >
+                <Icon name="plus" size={11} />
+                <span>追加任务</span>
+              </button>
+              <button
+                type="button"
+                class="tg-attention-action"
+                onclick={() => openTaskComposerDraft(selectedGraphTask, 'replan')}
+                title="基于当前任务上下文重新规划"
+              >
+                <Icon name="refresh" size={11} />
+                <span>重新规划</span>
+              </button>
+            </div>
+          {/if}
+          {#if selectedGraphTask.kind === 'Decision' && getTaskDisplayBlockedReason(selectedGraphTask)}
             <div class="task-detail-blocker">
               <Icon name="alert-circle" size={12} />
-              <span>{selectedGraphTask.decision_payload.blocked_reason}</span>
+              <span>{getTaskDisplayBlockedReason(selectedGraphTask)}</span>
             </div>
           {/if}
           {#if selectedGraphReferenceGroups.length > 0}
@@ -1224,7 +1311,7 @@
                         title={reference.title}
                         onclick={() => selectTaskReference(group.sourceLabel, reference)}
                       >
-                        <Icon name={getReferenceIconName(reference)} size={10} />
+                        <Icon name={getTaskReferenceIconName(reference)} size={10} />
                         <span>{reference.displayLabel}</span>
                       </button>
                     {/each}
@@ -1248,10 +1335,10 @@
             <div class="tg-attention-item tg-attention--{task.kind === 'Decision' ? 'decision' : 'blocked'}">
               <Icon name={task.kind === 'Decision' ? 'shield' : 'alert-circle'} size={12} />
               <div class="tg-attention-copy">
-                <span class="tg-attention-title">{task.title}</span>
+                <span class="tg-attention-title">{getTaskDisplayTitle(task)}</span>
                 <span class="tg-attention-meta">
-                  {#if task.kind === 'Decision' && task.decision_payload?.blocked_reason}
-                    {task.decision_payload.blocked_reason}
+                  {#if task.kind === 'Decision' && getTaskDisplayBlockedReason(task)}
+                    {getTaskDisplayBlockedReason(task)}
                   {:else}
                     {getTaskStatusLabel(task.status)}
                   {/if}
@@ -1330,13 +1417,13 @@
                 type="button"
                 class="task-history-row"
                 class:task-history-row--selected={selectedHistoryTask?.task_id === task.task_id}
-                title={`${getTaskLineageLabel(task)} / ${task.title}`}
+                title={`${getTaskLineageLabel(task)} / ${getTaskDisplayTitle(task)}`}
                 onclick={() => selectHistoryTask(task.task_id)}
               >
                 <Icon name="skip-forward" size={12} />
-                <span class="task-history-kind">{getTaskKindProductLabel(task.kind)}</span>
+                <span class="task-history-kind">{getTaskKindLabel(task.kind)}</span>
                 <span class="task-history-main">
-                  <span class="task-history-row-title">{task.title}</span>
+                  <span class="task-history-row-title">{getTaskDisplayTitle(task)}</span>
                   <span class="task-history-row-meta">父级：{getTaskParentTitle(task)} · {formatTimestamp(task.updated_at)}</span>
                 </span>
               </button>
@@ -1346,14 +1433,14 @@
           {#if selectedHistoryTask}
             <div class="task-history-detail">
               <div class="task-history-detail-top">
-                <span class="task-history-detail-title">{selectedHistoryTask.title}</span>
+                <span class="task-history-detail-title">{getTaskDisplayTitle(selectedHistoryTask)}</span>
                 <span class="task-history-detail-status">{getTaskStatusLabel(selectedHistoryTask.status)}</span>
               </div>
-              {#if selectedHistoryTask.goal && selectedHistoryTask.goal !== selectedHistoryTask.title}
-                <p class="task-history-detail-goal">{selectedHistoryTask.goal}</p>
+              {#if getTaskDisplayGoal(selectedHistoryTask) && getTaskDisplayGoal(selectedHistoryTask) !== getTaskDisplayTitle(selectedHistoryTask)}
+                <p class="task-history-detail-goal">{getTaskDisplayGoal(selectedHistoryTask)}</p>
               {/if}
               <div class="task-history-detail-meta">
-                <span>{getTaskKindProductLabel(selectedHistoryTask.kind)}</span>
+                <span>{getTaskKindLabel(selectedHistoryTask.kind)}</span>
                 <span>路径：{getTaskLineageLabel(selectedHistoryTask)}</span>
                 <span>更新：{formatTimestamp(selectedHistoryTask.updated_at)}</span>
               </div>
@@ -1376,7 +1463,7 @@
                             title={reference.title}
                             onclick={() => selectTaskReference('历史 · 上下文', reference)}
                           >
-                            <Icon name={getReferenceIconName(reference)} size={10} />
+                            <Icon name={getTaskReferenceIconName(reference)} size={10} />
                             <span>{reference.displayLabel}</span>
                           </button>
                         {/each}
@@ -1395,7 +1482,7 @@
                             title={reference.title}
                             onclick={() => selectTaskReference('历史 · 产出', reference)}
                           >
-                            <Icon name={getReferenceIconName(reference)} size={10} />
+                            <Icon name={getTaskReferenceIconName(reference)} size={10} />
                             <span>{reference.displayLabel}</span>
                           </button>
                         {/each}
@@ -1414,7 +1501,7 @@
                             title={reference.title}
                             onclick={() => selectTaskReference('历史 · 证据', reference)}
                           >
-                            <Icon name={getReferenceIconName(reference)} size={10} />
+                            <Icon name={getTaskReferenceIconName(reference)} size={10} />
                             <span>{reference.displayLabel}</span>
                           </button>
                         {/each}
@@ -1516,15 +1603,24 @@
 
   {#if !hasTaskProjection}
     <div class="empty-state">
-      <div class="empty-icon-wrap">
-        <Icon name="circleOutline" size={32} class="empty-icon" />
+      <div class="task-empty-card">
+        <div class="empty-icon-wrap">
+          <Icon name="circleOutline" size={32} class="empty-icon" />
+        </div>
+        <div class="empty-text">{i18n.t('tasks.empty.title')}</div>
+        <div class="empty-hint">
+          {#if activePlanState || archivedPlans.length > 0}
+            {i18n.t('tasks.empty.hintWithPlan')}
+          {:else}
+            {i18n.t('tasks.empty.hintNoPlan')}
+          {/if}
+        </div>
+        <div class="task-empty-points" aria-label="任务面板说明">
+          <span class="task-empty-point">{i18n.t('tasks.empty.pointGoal')}</span>
+          <span class="task-empty-point">{i18n.t('tasks.empty.pointFlow')}</span>
+          <span class="task-empty-point">{i18n.t('tasks.empty.pointDelivery')}</span>
+        </div>
       </div>
-      <div class="empty-text">{i18n.t('tasks.empty.title')}</div>
-      {#if activePlanState || archivedPlans.length > 0}
-        <div class="empty-hint">{i18n.t('tasks.empty.hintWithPlan')}</div>
-      {:else}
-        <div class="empty-hint">{i18n.t('tasks.empty.hintNoPlan')}</div>
-      {/if}
     </div>
   {/if}
 </div>
@@ -1844,31 +1940,64 @@
   /* ========== 空状态 ========== */
   .empty-state {
     display: flex;
-    flex-direction: column;
     align-items: center;
     justify-content: center;
     padding: var(--space-8) var(--space-5);
+    width: 100%;
+    min-height: 320px;
+    box-sizing: border-box;
+  }
+
+  .task-empty-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-3);
+    width: min(100%, 420px);
+    padding: var(--space-5) var(--space-4);
+    border: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
+    border-radius: var(--radius-lg);
+    background: var(--surface-1);
+    box-shadow: var(--shadow-sm);
     color: var(--foreground-muted);
     text-align: center;
-    width: 100%;
     box-sizing: border-box;
   }
 
   .empty-icon-wrap {
-    opacity: 0.2;
-    margin-bottom: var(--space-4);
+    opacity: 0.34;
   }
 
   .empty-text {
     font-size: var(--text-base);
     font-weight: var(--font-medium);
     color: var(--foreground);
-    margin-bottom: var(--space-2);
   }
 
   .empty-hint {
     font-size: var(--text-sm);
-    opacity: 0.6;
+    color: var(--foreground-muted);
+    line-height: var(--leading-normal);
+  }
+
+  .task-empty-points {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: var(--space-2);
+  }
+
+  .task-empty-point {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
+    padding: 0 var(--space-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
+    background: var(--surface-2);
+    color: var(--foreground-muted);
+    font-size: var(--text-2xs);
+    white-space: nowrap;
   }
 
   :global(.spinning) {
@@ -2379,6 +2508,13 @@
     gap: var(--space-2);
     color: var(--foreground-muted);
     font-size: var(--text-2xs);
+  }
+
+  .task-detail-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1);
   }
 
   .task-detail-blocker {
@@ -2973,6 +3109,30 @@
     border: 1px solid color-mix(in srgb, var(--success) 32%, var(--border));
     border-radius: 999px;
     padding: 2px 8px;
+  }
+
+  .dp-summary-copy {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 24px;
+    padding: 0 var(--space-2);
+    border: 1px solid color-mix(in srgb, var(--success) 28%, var(--border));
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--success) 7%, var(--surface-2));
+    color: var(--success);
+    font-size: var(--text-2xs);
+    font-weight: var(--font-medium);
+    cursor: pointer;
+    white-space: nowrap;
+    transition:
+      background var(--transition-fast),
+      border-color var(--transition-fast);
+  }
+
+  .dp-summary-copy:hover {
+    background: color-mix(in srgb, var(--success) 12%, var(--surface-2));
+    border-color: color-mix(in srgb, var(--success) 42%, var(--border));
   }
 
   .dp-section {

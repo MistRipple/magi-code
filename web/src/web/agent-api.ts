@@ -265,12 +265,14 @@ export interface AgentSessionTurnResult {
 export class AgentApiError extends Error {
   readonly status: number;
   readonly action: string;
+  readonly errorCode?: string;
 
-  constructor(status: number, message: string, action: string) {
+  constructor(status: number, message: string, action: string, errorCode?: string) {
     super(message);
     this.name = 'AgentApiError';
     this.status = status;
     this.action = action;
+    this.errorCode = errorCode;
   }
 }
 
@@ -439,12 +441,21 @@ export function dispatchAgentConnectionEvent(detail: AgentConnectionEventDetail)
 async function parseAgentJson<T>(response: Response, action: string): Promise<T> {
   if (!response.ok) {
     let backendError: string | null = null;
+    let backendErrorCode: string | undefined;
     const contentType = response.headers.get('content-type') || '';
     if (contentType.includes('application/json')) {
       try {
-        const payload = await response.json() as { error?: string };
+        const payload = await response.json() as { error?: string; message?: string; error_code?: string; code?: string };
         if (typeof payload?.error === 'string' && payload.error.trim()) {
           backendError = payload.error.trim();
+        } else if (typeof payload?.message === 'string' && payload.message.trim()) {
+          backendError = payload.message.trim();
+        }
+        const rawErrorCode = typeof payload?.error_code === 'string' && payload.error_code.trim()
+          ? payload.error_code.trim()
+          : (typeof payload?.code === 'string' && payload.code.trim() ? payload.code.trim() : '');
+        if (rawErrorCode) {
+          backendErrorCode = rawErrorCode;
         }
       } catch {
         // ignore malformed error payload and fallback to generic message
@@ -454,6 +465,7 @@ async function parseAgentJson<T>(response: Response, action: string): Promise<T>
       response.status,
       backendError || `${action} failed: ${response.status}`,
       action,
+      backendErrorCode,
     );
   }
 
