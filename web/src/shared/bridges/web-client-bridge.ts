@@ -1847,11 +1847,13 @@ async function dispatchRegistryAgents(): Promise<void> {
 
 async function dispatchProjectKnowledge(): Promise<void> {
   const query = new URLSearchParams();
-  if (currentWorkspaceId) {
-    query.set('workspaceId', currentWorkspaceId);
+  const requestWorkspaceId = currentWorkspaceId;
+  const requestWorkspacePath = currentWorkspacePath;
+  if (requestWorkspaceId) {
+    query.set('workspaceId', requestWorkspaceId);
   }
-  if (currentWorkspacePath) {
-    query.set('workspacePath', currentWorkspacePath);
+  if (requestWorkspacePath) {
+    query.set('workspacePath', requestWorkspacePath);
   }
   const response = await getTransport().request(agentUrl('/api/knowledge', query.toString()));
   if (!response.ok) {
@@ -1860,8 +1862,8 @@ async function dispatchProjectKnowledge(): Promise<void> {
   const payload = await response.json() as Record<string, unknown>;
   emitDataMessage('projectKnowledgeLoaded', {
     ...payload,
-    workspaceId: currentWorkspaceId,
-    workspacePath: currentWorkspacePath,
+    workspaceId: requestWorkspaceId,
+    workspacePath: requestWorkspacePath,
   });
 }
 
@@ -2750,7 +2752,7 @@ async function fetchModelList(config: Record<string, unknown>, target: string): 
     return;
   }
   const payload = await fetchAgentModelList(config, target);
-  emitDataMessage('modelListFetched', payload);
+  emitDataMessage('modelListFetched', { ...payload });
   emitBridgeSuccessToast('获取模型列表', `${target} 模型列表已刷新`, { displayMode: 'notification_center' });
 }
 

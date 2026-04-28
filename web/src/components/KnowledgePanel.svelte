@@ -356,7 +356,11 @@
   }
 
   async function fetchKnowledgeViaApi() {
+    const requestWorkspaceKey = currentWorkspaceKey;
     const res = await getAgentProjectKnowledge();
+    if (requestWorkspaceKey !== currentWorkspaceKey) {
+      return;
+    }
     applyKnowledgePayload(res);
   }
 
