@@ -2,6 +2,7 @@
   import type { ContentBlock, DispatchGroupLane } from '../types/message';
   import {
     buildDispatchLaneCardData,
+    mergeDispatchLanesByWorkerTab,
     resolveDispatchLaneMessageTimestamp,
   } from '../lib/worker-card-view-model';
   import SubTaskSummaryCard from './SubTaskSummaryCard.svelte';
@@ -15,9 +16,11 @@
   let { block, readOnly = false }: Props = $props();
 
   const lanes = $derived.by(() => (
-    Array.isArray(block.lanes)
-      ? block.lanes.filter((lane): lane is DispatchGroupLane => Boolean(lane && typeof lane === 'object' && typeof lane.laneId === 'string'))
-      : []
+    mergeDispatchLanesByWorkerTab(
+      Array.isArray(block.lanes)
+        ? block.lanes.filter((lane): lane is DispatchGroupLane => Boolean(lane && typeof lane === 'object' && typeof lane.laneId === 'string'))
+        : [],
+    )
   ));
 
   const fallbackTimestamp = $derived.by(() => Date.now());

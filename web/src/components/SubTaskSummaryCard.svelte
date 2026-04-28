@@ -95,7 +95,8 @@
   }
 
   const rawWorker = $derived.by(() => (
-    normalizeText(card.worker)
+    normalizeText(card.workerTabId)
+    || normalizeText(card.worker)
     || 'orchestrator'
   ));
   const workerRoleSource = $derived.by(() => (

@@ -285,6 +285,12 @@ interface AgentBindingContext {
   sessionId: string;
 }
 
+export interface AgentNotificationScope {
+  workspaceId?: string;
+  workspacePath?: string;
+  sessionId: string;
+}
+
 function safeReadLocalStorage(key: string): string {
   if (typeof window === 'undefined') {
     return '';
@@ -580,17 +586,7 @@ function buildBoundQuery(
   extra: Record<string, string>,
   options: { includeSession?: boolean } = {},
 ): string {
-  const binding = resolveAgentBindingContext();
-  const query = new URLSearchParams();
-  if (binding.workspaceId) query.set('workspaceId', binding.workspaceId);
-  if (binding.workspacePath) query.set('workspacePath', binding.workspacePath);
-  if (options.includeSession !== false && binding.sessionId) query.set('sessionId', binding.sessionId);
-  for (const [key, value] of Object.entries(extra)) {
-    if (value) {
-      query.set(key, value);
-    }
-  }
-  return query.toString();
+  return buildBoundQueryWithOverride(extra, undefined, options);
 }
 
 function buildWorkspaceBoundQuery(extra: Record<string, string>): string {
@@ -606,6 +602,37 @@ function resolveBindingOverrideValue(
     return bindingOverride[key]?.trim() || '';
   }
   return fallback;
+}
+
+function buildBoundQueryWithOverride(
+  extra: Record<string, string>,
+  bindingOverride?: Partial<AgentBindingContext>,
+  options: { includeSession?: boolean } = {},
+): string {
+  const resolvedBinding = resolveAgentBindingContext();
+  const binding: AgentBindingContext = {
+    workspaceId: resolveBindingOverrideValue(bindingOverride, 'workspaceId', resolvedBinding.workspaceId),
+    workspacePath: resolveBindingOverrideValue(bindingOverride, 'workspacePath', resolvedBinding.workspacePath),
+    sessionId: resolveBindingOverrideValue(bindingOverride, 'sessionId', resolvedBinding.sessionId),
+  };
+  const query = new URLSearchParams();
+  if (binding.workspaceId) query.set('workspaceId', binding.workspaceId);
+  if (binding.workspacePath) query.set('workspacePath', binding.workspacePath);
+  if (options.includeSession !== false && binding.sessionId) query.set('sessionId', binding.sessionId);
+  for (const [key, value] of Object.entries(extra)) {
+    if (value) {
+      query.set(key, value);
+    }
+  }
+  return query.toString();
+}
+
+function createNotificationBindingOverride(scope: AgentNotificationScope): Partial<AgentBindingContext> {
+  return {
+    sessionId: scope.sessionId.trim(),
+    workspaceId: scope.workspaceId?.trim() || '',
+    workspacePath: scope.workspacePath?.trim() || '',
+  };
 }
 
 async function postBoundJson<T>(
@@ -891,33 +918,39 @@ export async function saveAgentCurrentSession(): Promise<AgentBootstrapSnapshot>
   return await postBoundJson<AgentBootstrapSnapshot>('/api/session/save', {}, 'save current session');
 }
 
-export async function getAgentSessionNotifications(): Promise<AgentSessionNotificationsPayload> {
-  const query = buildBoundQuery({});
+export async function getAgentSessionNotifications(scope: AgentNotificationScope): Promise<AgentSessionNotificationsPayload> {
+  const query = buildBoundQueryWithOverride({}, createNotificationBindingOverride(scope));
   const response = await getTransport().request(agentUrl('/api/session/notifications', query));
   return await parseAgentJson<AgentSessionNotificationsPayload>(response, 'load session notifications');
 }
 
-export async function markAllAgentNotificationsRead(): Promise<AgentSessionNotificationsPayload> {
+export async function markAllAgentNotificationsRead(scope: AgentNotificationScope): Promise<AgentSessionNotificationsPayload> {
   return await postBoundJson<AgentSessionNotificationsPayload>(
     '/api/session/notifications/mark-all-read',
     {},
     'mark all notifications read',
+    createNotificationBindingOverride(scope),
   );
 }
 
-export async function clearAgentNotifications(): Promise<AgentSessionNotificationsPayload> {
+export async function clearAgentNotifications(scope: AgentNotificationScope): Promise<AgentSessionNotificationsPayload> {
   return await postBoundJson<AgentSessionNotificationsPayload>(
     '/api/session/notifications/clear',
     {},
     'clear notifications',
+    createNotificationBindingOverride(scope),
   );
 }
 
-export async function removeAgentNotification(notificationId: string): Promise<AgentSessionNotificationsPayload> {
+export async function removeAgentNotification(
+  notificationId: string,
+  scope: AgentNotificationScope,
+): Promise<AgentSessionNotificationsPayload> {
   return await postBoundJson<AgentSessionNotificationsPayload>(
     '/api/session/notifications/remove',
     { notificationId },
     'remove notification',
+    createNotificationBindingOverride(scope),
   );
 }
 

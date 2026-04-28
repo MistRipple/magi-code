@@ -363,10 +363,13 @@
       [workspaceId]: snapshot.sessions,
     };
 
+    const isStillSelectedWorkspace = selectedWorkspaceId === workspaceId;
+    if (!isStillSelectedWorkspace) {
+      return '';
+    }
+
     const requestedSessionId = preferredSessionId.trim();
-    const currentAnchoredSessionId = selectedWorkspaceId === workspaceId
-      ? (typeof currentSessionId === 'string' ? currentSessionId.trim() : '')
-      : '';
+    const currentAnchoredSessionId = typeof currentSessionId === 'string' ? currentSessionId.trim() : '';
     const candidateSessionIds = [requestedSessionId, currentAnchoredSessionId].filter((value, index, arr) => (
       value.length > 0 && arr.indexOf(value) === index
     ));
@@ -376,9 +379,7 @@
     const resolvedSessionId = preservedSessionId;
 
     currentSessionId = resolvedSessionId || null;
-    if (selectedWorkspaceId === workspaceId) {
-      setCurrentSessionId(resolvedSessionId || null);
-    }
+    setCurrentSessionId(resolvedSessionId || null);
     syncBrowserSessionBinding(snapshot.workspace.workspaceId, snapshot.workspace.rootPath, resolvedSessionId || null);
     requestWorkspaceBindingSync(snapshot.workspace, resolvedSessionId || null);
     return resolvedSessionId;

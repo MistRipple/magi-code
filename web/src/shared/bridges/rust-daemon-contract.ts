@@ -464,6 +464,15 @@ function normalizeWorkerRuntimeEntries(
     }));
 }
 
+function resolveRuntimeWorkerTabId(workerId: string): string {
+  const normalizedWorkerId = normalizeString(workerId);
+  const taskWorkerPrefix = 'task-worker-';
+  if (normalizedWorkerId.startsWith(taskWorkerPrefix)) {
+    return normalizedWorkerId.slice(taskWorkerPrefix.length).trim() || normalizedWorkerId;
+  }
+  return normalizedWorkerId;
+}
+
 function normalizeRuntimeTurnSummary(raw: unknown): RustSessionRuntimeTurnSummary | null {
   const turn = normalizeObjectRecord(raw);
   if (!turn) {
@@ -1673,6 +1682,7 @@ function buildDispatchArtifacts(
       .sort((left, right) => normalizeString(left.worker_id).localeCompare(normalizeString(right.worker_id)))
       .map((worker): DispatchGroupLane => {
         const workerId = normalizeString(worker.worker_id);
+        const workerTabId = resolveRuntimeWorkerTabId(workerId);
         const currentTaskId = normalizeString(worker.current_task_id);
         const currentTask = currentTaskId ? taskById.get(currentTaskId) : undefined;
         const status = currentTask
@@ -1695,7 +1705,7 @@ function buildDispatchArtifacts(
           status,
           liveActivity: normalizeWorkerLiveActivity(worker),
           toolUseCount: typeof worker.tool_call_count === 'number' ? worker.tool_call_count : undefined,
-          jumpTarget: { workerTabId: workerId },
+          jumpTarget: { workerTabId },
         };
       });
 
@@ -1706,6 +1716,9 @@ function buildDispatchArtifacts(
     const workerIds = lanes
       .map((lane) => normalizeString(lane.worker))
       .filter((workerId) => workerId.length > 0);
+    const workerTabIds = lanes
+      .map((lane) => normalizeString(lane.jumpTarget?.workerTabId))
+      .filter((workerTabId, index, all) => workerTabId.length > 0 && all.indexOf(workerTabId) === index);
     const summaryTitle = lookups.missionTitles.get(missionId) || shortenId(missionId, 'mission');
     const timestamp = resolveDispatchArtifactTimestamp(
       missionId,
@@ -1739,7 +1752,7 @@ function buildDispatchArtifacts(
       timestamp,
       dispatchWaveId: missionId,
       threadVisible: true,
-      workerTabs: workerIds,
+      workerTabs: workerTabIds,
       messageIds: [messageId],
       message: createRustTimelineMessage({
         id: messageId,
@@ -2473,6 +2486,7 @@ function buildToolArtifacts(
       return left.toolCallId.localeCompare(right.toolCallId);
     })
     .map((entry, index): TimelineProjectionArtifact => {
+      const workerTabId = entry.workerId ? resolveRuntimeWorkerTabId(entry.workerId) : '';
       const resultSummary = summarizeToolArtifactResult(entry.toolName, entry.status);
       const standardized = entry.status === 'success' || entry.status === 'error'
         ? {
@@ -2529,7 +2543,7 @@ function buildToolArtifacts(
         timestamp: entry.timestamp,
         dispatchWaveId: entry.missionId || undefined,
         threadVisible: true,
-        workerTabs: entry.workerId ? [entry.workerId] : [],
+        workerTabs: workerTabId ? [workerTabId] : [],
         messageIds,
         message: createRustTimelineMessage({
           id: artifactId,
@@ -2540,12 +2554,13 @@ function buildToolArtifacts(
           role: 'assistant',
           type: 'text',
           blocks,
-          source: entry.workerId || 'orchestrator',
+          source: workerTabId || 'orchestrator',
           rustEventType: entry.rustEventType,
           metadata: {
             taskId: entry.taskId || undefined,
             missionId: entry.missionId || undefined,
             worker: entry.workerId || undefined,
+            workerTabId: workerTabId || undefined,
             toolCallId: entry.toolCallId,
             toolName: entry.toolName,
           },

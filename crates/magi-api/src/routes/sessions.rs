@@ -137,20 +137,36 @@ async fn submit_session_turn(
                 .ok_or_else(|| ApiError::InvalidInput("继续会话需要明确的 session".to_string()))?;
             let prompt_text = request.trimmed_text();
             let accepted = continue_shadow_execution_chain(&state, &session_id, &[])?;
-            if let Some(prompt_text) = prompt_text.as_deref() {
-                append_session_user_message(&state, &session_id, accepted_at, prompt_text);
-            }
+            let (entry_id, user_message_item_id) = match prompt_text.as_deref() {
+                Some(prompt_text) => {
+                    let entry_id =
+                        append_session_user_message(&state, &session_id, accepted_at, prompt_text);
+                    let (user_message_item_id, user_message_item) = build_user_message_turn_item(
+                        accepted_at,
+                        prompt_text,
+                        &entry_id,
+                        request.request_id(),
+                        request.user_message_id(),
+                        request.placeholder_message_id(),
+                        Some(accepted.action_task_id.clone()),
+                        true,
+                    );
+                    state
+                        .session_store
+                        .append_current_turn_item(&session_id, user_message_item)
+                        .map_err(|error| {
+                            ApiError::internal_assembly("写入 continue 用户消息失败", error)
+                        })?;
+                    (entry_id, Some(user_message_item_id))
+                }
+                None => (format!("timeline-{}-{}", session_id, accepted_at.0), None),
+            };
             finalize_continue_session(state.clone(), accepted.clone(), accepted_at);
             state.persist_runtime_durable_state()?;
             let event_id = publish_session_turn_continue_event(&state, &accepted, accepted_at)?;
-            let user_message_item_id = prompt_text.as_ref().map(|_| {
-                request
-                    .user_message_id()
-                    .unwrap_or_else(|| format!("turn-item-user-{}", accepted_at.0))
-            });
             Ok(Json(SessionTurnResponseDto::new(
                 accepted.session_id,
-                format!("timeline-{}-{}", session_id, accepted_at.0),
+                entry_id,
                 event_id,
                 accepted_at,
                 false,
@@ -388,6 +404,50 @@ fn optional_trimmed_string(value: &serde_json::Value, key: &str) -> Option<Strin
         .map(ToOwned::to_owned)
 }
 
+fn build_user_message_turn_item(
+    accepted_at: UtcMillis,
+    message: &str,
+    entry_id: &str,
+    request_id: Option<String>,
+    user_message_id: Option<String>,
+    placeholder_message_id: Option<String>,
+    task_id: Option<magi_core::TaskId>,
+    thread_visible: bool,
+) -> (String, ActiveExecutionTurnItem) {
+    let user_message_item_id = user_message_id
+        .clone()
+        .unwrap_or_else(|| format!("turn-item-user-{}", accepted_at.0));
+    (
+        user_message_item_id.clone(),
+        ActiveExecutionTurnItem {
+            item_id: user_message_item_id,
+            item_seq: 1,
+            lane_id: None,
+            lane_seq: None,
+            kind: "user_message".to_string(),
+            status: "completed".to_string(),
+            source: "user".to_string(),
+            title: None,
+            content: Some(message.to_string()),
+            task_id,
+            worker_id: None,
+            role_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            tool_status: None,
+            tool_arguments: None,
+            tool_result: None,
+            tool_error: None,
+            request_id,
+            user_message_id,
+            placeholder_message_id,
+            timeline_entry_id: Some(entry_id.to_string()),
+            thread_visible,
+            worker_visible: false,
+        },
+    )
+}
+
 fn submit_regular_session_turn(
     state: ApiState,
     request: SessionTurnRequestDto,
@@ -411,9 +471,16 @@ fn submit_regular_session_turn(
     let user_message_id = request.user_message_id();
     let placeholder_message_id = request.placeholder_message_id();
     // 使用前端传入的 userMessageId 作为 canonical item_id，确保前端乐观节点与后端流式更新使用同一 ID
-    let user_message_item_id = user_message_id
-        .clone()
-        .unwrap_or_else(|| format!("turn-item-user-{}", accepted_at.0));
+    let (user_message_item_id, user_message_item) = build_user_message_turn_item(
+        accepted_at,
+        &message,
+        &entry_id,
+        request_id.clone(),
+        user_message_id.clone(),
+        placeholder_message_id.clone(),
+        None,
+        true,
+    );
     let turn_id = format!("turn-session-{}", accepted_at.0);
     let mut turn = ActiveExecutionTurn {
         turn_id: turn_id.clone(),
@@ -422,32 +489,7 @@ fn submit_regular_session_turn(
         status: "running".to_string(),
         completed_at: None,
         user_message: Some(message.clone()),
-        items: vec![ActiveExecutionTurnItem {
-            item_id: user_message_item_id.clone(),
-            item_seq: 1,
-            lane_id: None,
-            lane_seq: None,
-            kind: "user_message".to_string(),
-            status: "completed".to_string(),
-            source: "user".to_string(),
-            title: None,
-            content: Some(message.clone()),
-            task_id: None,
-            worker_id: None,
-            role_id: None,
-            tool_call_id: None,
-            tool_name: None,
-            tool_status: None,
-            tool_arguments: None,
-            tool_result: None,
-            tool_error: None,
-            request_id: request_id.clone(),
-            user_message_id: user_message_id.clone(),
-            placeholder_message_id: placeholder_message_id.clone(),
-            timeline_entry_id: Some(entry_id.clone()),
-            thread_visible: true,
-            worker_visible: false,
-        }],
+        items: vec![user_message_item],
         worker_lanes: Vec::new(),
     };
     turn.normalize();
@@ -674,6 +716,12 @@ struct ContinueSessionRequest {
     prompt_text: Option<String>,
     #[serde(default)]
     requested_worker_ids: Vec<String>,
+    #[serde(alias = "request_id")]
+    request_id: Option<String>,
+    #[serde(alias = "user_message_id")]
+    user_message_id: Option<String>,
+    #[serde(alias = "placeholder_message_id")]
+    placeholder_message_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -885,6 +933,10 @@ async fn continue_session(
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(str::to_string);
+    let request_id = trimmed_non_empty(request.request_id.as_deref()).map(str::to_string);
+    let user_message_id = trimmed_non_empty(request.user_message_id.as_deref()).map(str::to_string);
+    let placeholder_message_id =
+        trimmed_non_empty(request.placeholder_message_id.as_deref()).map(str::to_string);
     let requested_worker_ids = request
         .requested_worker_ids
         .into_iter()
@@ -895,7 +947,21 @@ async fn continue_session(
     let continued_at = UtcMillis::now();
     let accepted = continue_shadow_execution_chain(&state, &session_id, &requested_worker_ids)?;
     if let Some(prompt_text) = prompt_text.as_deref() {
-        append_session_user_message(&state, &session_id, continued_at, prompt_text);
+        let entry_id = append_session_user_message(&state, &session_id, continued_at, prompt_text);
+        let (_, user_message_item) = build_user_message_turn_item(
+            continued_at,
+            prompt_text,
+            &entry_id,
+            request_id,
+            user_message_id,
+            placeholder_message_id,
+            Some(accepted.action_task_id.clone()),
+            true,
+        );
+        state
+            .session_store
+            .append_current_turn_item(&session_id, user_message_item)
+            .map_err(|error| ApiError::internal_assembly("写入 continue 用户消息失败", error))?;
     }
     finalize_continue_session(state.clone(), accepted.clone(), continued_at);
     state.persist_runtime_durable_state()?;

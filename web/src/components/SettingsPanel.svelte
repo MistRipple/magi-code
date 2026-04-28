@@ -92,7 +92,7 @@ import { getAgentColor } from '../lib/agent-colors';
       </nav>
       <div class="sidebar-footer">
         {#if store.userInfo && store.clientKind === 'vscode'}
-          <div class="store.logout-section">
+          <div class="logout-section">
             <span class="user-info-text" title={store.userInfo}>{store.userInfo}</span>
             <button class="settings-btn secondary" onclick={store.logout}>{i18n.t('settings.logout')}</button>
           </div>

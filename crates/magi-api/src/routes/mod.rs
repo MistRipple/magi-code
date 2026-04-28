@@ -2584,6 +2584,9 @@ mod tests {
             json!({
                 "sessionId": session_id.to_string(),
                 "promptText": "继续刚才的恢复链",
+                "requestId": "request-continue-route",
+                "userMessageId": "local-user-continue-route",
+                "placeholderMessageId": "local-assistant-continue-route",
             }),
         )
         .await;
@@ -2633,6 +2636,40 @@ mod tests {
                     && entry.message == "继续刚才的恢复链"
             }),
             "自然语言 continue 应写入当前 session timeline"
+        );
+        let continue_user_entry = timeline
+            .iter()
+            .find(|entry| {
+                matches!(entry.kind, TimelineEntryKind::UserMessage)
+                    && entry.message == "继续刚才的恢复链"
+            })
+            .expect("continue 用户消息应存在");
+        let current_turn = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("continue 后 current turn 应保留");
+        let continue_user_item = current_turn
+            .items
+            .iter()
+            .find(|item| item.item_id == "local-user-continue-route")
+            .expect("continue 用户消息应写入 current turn item");
+        assert_eq!(continue_user_item.kind, "user_message");
+        assert_eq!(
+            continue_user_item.request_id.as_deref(),
+            Some("request-continue-route")
+        );
+        assert_eq!(
+            continue_user_item.user_message_id.as_deref(),
+            Some("local-user-continue-route")
+        );
+        assert_eq!(
+            continue_user_item.placeholder_message_id.as_deref(),
+            Some("local-assistant-continue-route")
+        );
+        assert_eq!(
+            continue_user_item.timeline_entry_id.as_deref(),
+            Some(continue_user_entry.entry_id.as_str())
         );
         wait_for_condition(
             Duration::from_secs(2),

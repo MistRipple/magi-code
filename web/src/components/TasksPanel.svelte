@@ -85,6 +85,8 @@
   // ─── 交付包视图（深度模式完成后展示） ─────────────────
   let deliveryPackage = $state<DeliveryPackageDto | null>(null);
   let deliveryPackageLoading = $state(false);
+  let deliveryPackageScope = $state('');
+  let deliveryPackageRequestScope = $state('');
   let deliverySummaryCopied = $state(false);
   let deliverySummaryCopyTimer: ReturnType<typeof setTimeout> | null = null;
   let taskActionLoading = $state<'pause' | 'resume' | 'replan' | 'delivery' | null>(null);
@@ -99,6 +101,13 @@
     }
   }
 
+  function clearDeliveryPackageViewState() {
+    deliveryPackage = null;
+    deliverySummaryCopied = false;
+    clearDeliverySummaryCopyTimer();
+    selectedTaskReference = null;
+  }
+
   onDestroy(() => {
     clearDeliverySummaryCopyTimer();
   });
@@ -110,21 +119,44 @@
   });
 
   $effect(() => {
-    if (!shouldFetchDelivery) {
-      deliveryPackage = null;
-      deliverySummaryCopied = false;
-      clearDeliverySummaryCopyTimer();
+    const rootTaskId = taskGraph.projection?.root_task.task_id;
+    const sid = currentSessionId?.trim() || '';
+    const nextScope = rootTaskId && sid ? `${sid}:${rootTaskId}` : '';
+
+    if (deliveryPackageScope !== nextScope) {
+      deliveryPackageScope = nextScope;
+      deliveryPackageRequestScope = '';
+      deliveryPackageLoading = false;
+      clearDeliveryPackageViewState();
+    }
+
+    if (!shouldFetchDelivery || !rootTaskId || !sid) {
+      if (deliveryPackage || deliverySummaryCopied || selectedTaskReference) {
+        clearDeliveryPackageViewState();
+      }
       return;
     }
-    const rootTaskId = taskGraph.projection?.root_task.task_id;
-    const sid = currentSessionId;
-    if (!rootTaskId || !sid || deliveryPackageLoading || deliveryPackage) return;
+    if (deliveryPackageLoading || deliveryPackage) return;
     deliveryPackageLoading = true;
+    deliveryPackageRequestScope = nextScope;
     const client = createClient();
     client.getDeliveryPackage(rootTaskId, sid)
-      .then((pkg) => { deliveryPackage = pkg; })
-      .catch((err) => { console.error('Failed to fetch delivery package:', err); })
-      .finally(() => { deliveryPackageLoading = false; });
+      .then((pkg) => {
+        if (deliveryPackageScope === nextScope && deliveryPackageRequestScope === nextScope) {
+          deliveryPackage = pkg;
+        }
+      })
+      .catch((err) => {
+        if (deliveryPackageScope === nextScope && deliveryPackageRequestScope === nextScope) {
+          console.error('Failed to fetch delivery package:', err);
+        }
+      })
+      .finally(() => {
+        if (deliveryPackageRequestScope === nextScope) {
+          deliveryPackageRequestScope = '';
+          deliveryPackageLoading = false;
+        }
+      });
   });
 
   const childrenByParentId = $derived.by(() => {
@@ -529,8 +561,7 @@
     await runTaskAction('pause', async () => {
       const client = createClient();
       await client.pauseTask({ taskId: rootTaskId, sessionId });
-      deliveryPackage = null;
-      selectedTaskReference = null;
+      clearDeliveryPackageViewState();
       await refreshTaskProjection(sessionId);
       addToast('info', '任务链已暂停');
     }).catch((err) => {
@@ -546,8 +577,7 @@
     await runTaskAction('resume', async () => {
       const client = createClient();
       await client.continueSession({ sessionId });
-      deliveryPackage = null;
-      selectedTaskReference = null;
+      clearDeliveryPackageViewState();
       await refreshTaskProjection(sessionId);
       addToast('success', '任务链已恢复');
     }).catch((err) => {
@@ -563,8 +593,7 @@
     await runTaskAction('replan', async () => {
       const client = createClient();
       const result = await client.replanTaskGraph(rootTaskId, sessionId);
-      deliveryPackage = null;
-      selectedTaskReference = null;
+      clearDeliveryPackageViewState();
       await refreshTaskProjection(sessionId);
       addToast('info', `已重规划，取消 ${result.cancelledTaskIds.length} 个旧任务`);
     }).catch((err) => {
@@ -578,10 +607,7 @@
     if (!sessionId) return;
     await runTaskAction('delivery', async () => {
       await refreshTaskProjection(sessionId);
-      deliveryPackage = null;
-      deliverySummaryCopied = false;
-      clearDeliverySummaryCopyTimer();
-      selectedTaskReference = null;
+      clearDeliveryPackageViewState();
     });
   }
 

@@ -95,6 +95,12 @@ export interface NotificationCenterStatus {
   updatedAt: number | null;
 }
 
+interface NotificationOperationScope {
+  sessionId: string;
+  workspaceId: string;
+  workspacePath: string;
+}
+
 // ============ 状态定义 ============
 // 🔧 修复：使用对象属性模式确保跨模块响应式正常工作
 // Svelte 5 官方推荐：导出对象并修改其属性，而非重新赋值独立变量
@@ -2843,6 +2849,7 @@ export function setCurrentSessionId(id: string | null) {
       beforeCursor: null,
       isLoadingBefore: false,
     };
+    resetNotificationCenterStatus();
   }
   if (hasChanged) {
     // 底部 worker 面板是“当前会话内的执行细节视图”，不能跨会话继承。
@@ -2884,6 +2891,7 @@ export function adoptCurrentSessionIdForLiveTurn(id: string | null | undefined):
     beforeCursor: null,
     isLoadingBefore: false,
   };
+  resetNotificationCenterStatus();
   syncNotificationsFromSession(nextSessionId);
   saveWebviewState();
   return true;
@@ -3244,6 +3252,35 @@ function getCurrentNotificationSessionId(): string {
   return resolveNotificationSessionId(messagesState.currentSessionId);
 }
 
+function createNotificationCenterIdleStatus(): NotificationCenterStatus {
+  return {
+    isLoading: false,
+    operation: null,
+    error: null,
+    updatedAt: null,
+  };
+}
+
+function resetNotificationCenterStatus(): void {
+  messagesState.notificationCenter = createNotificationCenterIdleStatus();
+}
+
+function getCurrentNotificationOperationScope(): NotificationOperationScope | null {
+  const sessionId = getCurrentNotificationSessionId();
+  if (!sessionId) {
+    return null;
+  }
+  return {
+    sessionId,
+    workspaceId: typeof messagesState.currentWorkspaceId === 'string'
+      ? messagesState.currentWorkspaceId.trim()
+      : '',
+    workspacePath: typeof messagesState.currentWorkspacePath === 'string'
+      ? messagesState.currentWorkspacePath.trim()
+      : '',
+  };
+}
+
 function applyNotificationList(nextList: Notification[]): Notification[] {
   const trimmed = nextList.slice(0, MAX_NOTIFICATIONS_PER_SESSION);
   notifications = trimmed;
@@ -3381,15 +3418,27 @@ export function removeToast(id: string) {
 }
 
 export function loadSessionNotifications() {
-  vscode.postMessage({ type: 'loadSessionNotifications' });
+  const scope = getCurrentNotificationOperationScope();
+  if (!scope) {
+    return;
+  }
+  vscode.postMessage({ type: 'loadSessionNotifications', ...scope });
 }
 
 export function markAllNotificationsRead() {
-  vscode.postMessage({ type: 'markAllNotificationsRead' });
+  const scope = getCurrentNotificationOperationScope();
+  if (!scope) {
+    return;
+  }
+  vscode.postMessage({ type: 'markAllNotificationsRead', ...scope });
 }
 
 export function clearAllNotifications() {
-  vscode.postMessage({ type: 'clearAllNotifications' });
+  const scope = getCurrentNotificationOperationScope();
+  if (!scope) {
+    return;
+  }
+  vscode.postMessage({ type: 'clearAllNotifications', ...scope });
 }
 
 export function removeNotification(id: string) {
@@ -3397,7 +3446,11 @@ export function removeNotification(id: string) {
   if (!normalizedId) {
     return;
   }
-  vscode.postMessage({ type: 'removeNotification', notificationId: normalizedId });
+  const scope = getCurrentNotificationOperationScope();
+  if (!scope) {
+    return;
+  }
+  vscode.postMessage({ type: 'removeNotification', notificationId: normalizedId, ...scope });
 }
 
 export function applySessionNotifications(
@@ -3424,6 +3477,12 @@ export function applySessionNotificationsStatus(rawStatus: unknown): void {
     return;
   }
   const status = rawStatus as Record<string, unknown>;
+  const statusSessionId = resolveNotificationSessionId(
+    typeof status.sessionId === 'string' ? status.sessionId : null,
+  );
+  if (!statusSessionId || statusSessionId !== getCurrentNotificationSessionId()) {
+    return;
+  }
   const operation = typeof status.operation === 'string'
     && ['load', 'mark-read', 'clear', 'remove'].includes(status.operation)
     ? status.operation as NotificationCenterOperation

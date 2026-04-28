@@ -734,6 +734,9 @@ export interface SessionContinueRequestDto {
   sessionId: string;
   promptText?: string | null;
   requestedWorkerIds?: string[];
+  requestId?: string | null;
+  userMessageId?: string | null;
+  placeholderMessageId?: string | null;
 }
 
 export interface SessionContinueResponseDto {

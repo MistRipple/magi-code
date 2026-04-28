@@ -2616,24 +2616,41 @@ async function updateSetting(key: string, value: unknown): Promise<void> {
   }
 }
 
+type NotificationCenterOperation = 'load' | 'mark-read' | 'clear' | 'remove';
+
+interface NotificationOperationScope {
+  sessionId: string;
+  workspaceId: string;
+  workspacePath: string;
+}
+
 async function resetExecutionStats(): Promise<void> {
   await resetAgentExecutionStats();
   await dispatchExecutionStats();
 }
 
-function hasCurrentSessionScope(): boolean {
-  return currentSessionId.trim().length > 0;
+function resolveNotificationOperationScope(message: ClientBridgeMessage): NotificationOperationScope | null {
+  const sessionId = trimBridgeString(message.sessionId);
+  if (!sessionId) {
+    return null;
+  }
+  return {
+    sessionId,
+    workspaceId: trimBridgeString(message.workspaceId),
+    workspacePath: trimBridgeString(message.workspacePath),
+  };
 }
-
-type NotificationCenterOperation = 'load' | 'mark-read' | 'clear' | 'remove';
 
 function emitSessionNotificationsStatus(
   operation: NotificationCenterOperation,
+  scope: NotificationOperationScope,
   isLoading: boolean,
   error?: unknown,
 ): void {
   emitDataMessage('sessionNotificationsStatus', {
-    sessionId: currentSessionId.trim(),
+    sessionId: scope.sessionId,
+    workspaceId: scope.workspaceId,
+    workspacePath: scope.workspacePath,
     operation,
     isLoading,
     error: error === undefined ? null : normalizeErrorMessage(error),
@@ -2643,43 +2660,41 @@ function emitSessionNotificationsStatus(
 
 async function runNotificationOperation(
   operation: NotificationCenterOperation,
-  task: () => Promise<Record<string, unknown>>,
+  scope: NotificationOperationScope,
+  task: (scope: NotificationOperationScope) => Promise<Record<string, unknown>>,
 ): Promise<void> {
-  if (!hasCurrentSessionScope()) {
-    return;
-  }
-  emitSessionNotificationsStatus(operation, true);
+  emitSessionNotificationsStatus(operation, scope, true);
   try {
-    const payload = await task();
+    const payload = await task(scope);
     emitDataMessage('sessionNotificationsLoaded', payload);
-    emitSessionNotificationsStatus(operation, false);
+    emitSessionNotificationsStatus(operation, scope, false);
   } catch (error) {
-    emitSessionNotificationsStatus(operation, false, error);
+    emitSessionNotificationsStatus(operation, scope, false, error);
     throw error;
   }
 }
 
-async function loadSessionNotifications(): Promise<void> {
-  await runNotificationOperation('load', async () => (
-    await getAgentSessionNotifications() as unknown as Record<string, unknown>
+async function loadSessionNotifications(scope: NotificationOperationScope): Promise<void> {
+  await runNotificationOperation('load', scope, async (operationScope) => (
+    await getAgentSessionNotifications(operationScope) as unknown as Record<string, unknown>
   ));
 }
 
-async function markAllNotificationsRead(): Promise<void> {
-  await runNotificationOperation('mark-read', async () => (
-    await markAllAgentNotificationsRead() as unknown as Record<string, unknown>
+async function markAllNotificationsRead(scope: NotificationOperationScope): Promise<void> {
+  await runNotificationOperation('mark-read', scope, async (operationScope) => (
+    await markAllAgentNotificationsRead(operationScope) as unknown as Record<string, unknown>
   ));
 }
 
-async function clearAllNotifications(): Promise<void> {
-  await runNotificationOperation('clear', async () => (
-    await clearAgentNotifications() as unknown as Record<string, unknown>
+async function clearAllNotifications(scope: NotificationOperationScope): Promise<void> {
+  await runNotificationOperation('clear', scope, async (operationScope) => (
+    await clearAgentNotifications(operationScope) as unknown as Record<string, unknown>
   ));
 }
 
-async function removeNotification(notificationId: string): Promise<void> {
-  await runNotificationOperation('remove', async () => (
-    await removeAgentNotification(notificationId) as unknown as Record<string, unknown>
+async function removeNotification(scope: NotificationOperationScope, notificationId: string): Promise<void> {
+  await runNotificationOperation('remove', scope, async (operationScope) => (
+    await removeAgentNotification(notificationId, operationScope) as unknown as Record<string, unknown>
   ));
 }
 
@@ -3164,25 +3179,43 @@ export function createWebClientBridge(): ClientBridge {
           });
           return;
         case 'loadSessionNotifications':
-          void loadSessionNotifications().catch((error) => {
-            reportExpectedRecoveryFailure('加载通知', '[web-client-bridge] 加载通知失败:', error);
-          });
+          {
+            const scope = resolveNotificationOperationScope(message);
+            if (scope) {
+              void loadSessionNotifications(scope).catch((error) => {
+                reportExpectedRecoveryFailure('加载通知', '[web-client-bridge] 加载通知失败:', error);
+              });
+            }
+          }
           return;
         case 'markAllNotificationsRead':
-          void markAllNotificationsRead().catch((error) => {
-            reportExpectedRecoveryFailure('标记通知已读', '[web-client-bridge] 标记通知已读失败:', error);
-          });
+          {
+            const scope = resolveNotificationOperationScope(message);
+            if (scope) {
+              void markAllNotificationsRead(scope).catch((error) => {
+                reportExpectedRecoveryFailure('标记通知已读', '[web-client-bridge] 标记通知已读失败:', error);
+              });
+            }
+          }
           return;
         case 'clearAllNotifications':
-          void clearAllNotifications().catch((error) => {
-            reportExpectedRecoveryFailure('清空通知', '[web-client-bridge] 清空通知失败:', error);
-          });
+          {
+            const scope = resolveNotificationOperationScope(message);
+            if (scope) {
+              void clearAllNotifications(scope).catch((error) => {
+                reportExpectedRecoveryFailure('清空通知', '[web-client-bridge] 清空通知失败:', error);
+              });
+            }
+          }
           return;
         case 'removeNotification':
           if (typeof message.notificationId === 'string' && message.notificationId.trim()) {
-            void removeNotification(message.notificationId).catch((error) => {
-              reportExpectedRecoveryFailure('删除通知', '[web-client-bridge] 删除通知失败:', error);
-            });
+            const scope = resolveNotificationOperationScope(message);
+            if (scope) {
+              void removeNotification(scope, message.notificationId).catch((error) => {
+                reportExpectedRecoveryFailure('删除通知', '[web-client-bridge] 删除通知失败:', error);
+              });
+            }
           }
           return;
         case 'executeTask':

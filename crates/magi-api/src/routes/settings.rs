@@ -1341,6 +1341,42 @@ mod tests {
         assert!(!object.contains_key("agents"));
     }
 
+    #[tokio::test]
+    async fn settings_bootstrap_filters_mcp_servers_without_id() {
+        let state = test_state();
+        state.settings_store.set_section(
+            "mcpServers",
+            json!([
+                { "name": "broken", "command": "npx", "enabled": false },
+                { "server": { "serverId": "wrapped-server", "command": "npx", "enabled": false } },
+                { "id": "valid-server", "command": "npx", "enabled": false },
+                "invalid-entry"
+            ]),
+        );
+
+        let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
+            .await
+            .0;
+        let servers = bootstrap["mcpServers"]
+            .as_array()
+            .expect("mcpServers should be an array");
+        assert_eq!(servers.len(), 2);
+        assert!(
+            servers
+                .iter()
+                .all(|server| server["id"].as_str().is_some_and(|id| !id.is_empty())),
+            "bootstrap must not expose MCP server entries without id"
+        );
+        assert!(servers.iter().any(|server| {
+            server["id"] == json!("wrapped-server")
+                && server["serverId"] == json!("wrapped-server")
+                && server["name"] == json!("wrapped-server")
+        }));
+        assert!(servers.iter().any(|server| {
+            server["id"] == json!("valid-server") && server["serverId"] == json!("valid-server")
+        }));
+    }
+
     #[test]
     fn fetch_models_config_allows_openai_compatible_gateway_provider_labels() {
         let (config, target) = parse_fetch_models_config(FetchModelsRequest {

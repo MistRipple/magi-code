@@ -1272,40 +1272,40 @@ fn normalize_mcp_servers_section(snapshot: &mut HashMap<String, serde_json::Valu
     let Some(entries) = servers.as_array_mut() else {
         return;
     };
-    for entry in entries.iter_mut() {
-        let raw = entry
-            .get("server")
-            .or_else(|| entry.get("updates"))
-            .cloned()
-            .unwrap_or_else(|| entry.clone());
-        let Some(mut object) = raw.as_object().cloned() else {
-            continue;
-        };
-        let server_id = object
-            .get("id")
-            .and_then(|value| value.as_str())
-            .or_else(|| object.get("serverId").and_then(|value| value.as_str()))
-            .or_else(|| entry.get("serverId").and_then(|value| value.as_str()))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_default()
-            .to_string();
-        if server_id.is_empty() {
-            continue;
-        }
-        object.insert("id".to_string(), serde_json::json!(server_id));
-        object.insert("serverId".to_string(), serde_json::json!(server_id));
-        if object
-            .get("name")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .unwrap_or_default()
-            .is_empty()
-        {
-            object.insert("name".to_string(), serde_json::json!(server_id));
-        }
-        *entry = serde_json::Value::Object(object);
+    let normalized_entries = entries
+        .iter()
+        .filter_map(normalize_mcp_server_snapshot_entry)
+        .collect();
+    *entries = normalized_entries;
+}
+
+fn normalize_mcp_server_snapshot_entry(entry: &serde_json::Value) -> Option<serde_json::Value> {
+    let raw = entry
+        .get("server")
+        .or_else(|| entry.get("updates"))
+        .cloned()
+        .unwrap_or_else(|| entry.clone());
+    let mut object = raw.as_object().cloned()?;
+    let server_id = object
+        .get("id")
+        .and_then(|value| value.as_str())
+        .or_else(|| object.get("serverId").and_then(|value| value.as_str()))
+        .or_else(|| entry.get("serverId").and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    object.insert("id".to_string(), serde_json::json!(server_id));
+    object.insert("serverId".to_string(), serde_json::json!(server_id));
+    if object
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        object.insert("name".to_string(), serde_json::json!(server_id));
     }
+    Some(serde_json::Value::Object(object))
 }
 
 pub(crate) fn build_mcp_config_from_entry(entry: &serde_json::Value) -> Option<McpServerConfig> {
