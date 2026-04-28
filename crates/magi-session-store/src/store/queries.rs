@@ -1,31 +1,10 @@
-use super::SessionStore;
+use super::{SessionStore, with_session_message_count};
 use crate::models::{
     ActiveExecutionChain, NotificationRecord, SessionDurableState,
     SessionExecutionSidecarStoreState, SessionProjectionInput, SessionRecord,
     SessionRuntimeSidecar, SessionRuntimeSidecarExport, SessionSidecarFlushMetadata, TimelineEntry,
-    TimelineEntryKind,
 };
 use magi_core::{ExecutionOwnership, SessionId};
-
-fn user_message_count_for_session(timeline: &[TimelineEntry], session_id: &SessionId) -> usize {
-    timeline
-        .iter()
-        .filter(|entry| {
-            &entry.session_id == session_id && matches!(entry.kind, TimelineEntryKind::UserMessage)
-        })
-        .count()
-}
-
-fn with_session_message_count(
-    mut session: SessionRecord,
-    timeline: &[TimelineEntry],
-) -> SessionRecord {
-    session.message_count = Some(user_message_count_for_session(
-        timeline,
-        &session.session_id,
-    ));
-    session
-}
 
 impl SessionStore {
     pub fn export_state(&self) -> crate::models::SessionStoreState {

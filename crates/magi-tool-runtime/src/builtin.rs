@@ -328,6 +328,7 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
     let command = request
         .as_ref()
         .and_then(|object| field_string(object, &["command", "script", "line"]))
+        .map(|command| command.trim().to_string())
         .unwrap_or_else(|| input.trim().to_string());
     if command.is_empty() {
         return builtin_error("shell_exec", "缺少 shell 命令");
@@ -466,6 +467,7 @@ fn execute_process_launch(input: &str, context: &ToolExecutionContext) -> String
     let command = request
         .as_ref()
         .and_then(|object| field_string(object, &["command", "script", "line"]))
+        .map(|command| command.trim().to_string())
         .unwrap_or_else(|| input.trim().to_string());
     if command.is_empty() {
         return builtin_error("process_launch", "缺少 shell 命令");

@@ -5,9 +5,18 @@ use crate::{
     HostBridgeClient, HostBridgeCommand, HostBridgeRequest, HostKind, JsonRpcHostBridgeClient,
     JsonRpcMcpBridgeClient, JsonRpcModelBridgeClient, JsonRpcStdioTransport, McpBridgeClient,
     McpToolCallRequest, ModelBridgeClient, ModelInvocationRequest,
+    base_adapter::ToolExecutor,
+    llm_types::{ToolCall, ToolResult},
 };
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 struct DummyHostClient;
 
@@ -619,7 +628,11 @@ fn pending_terminal_synthesis_finalizes_on_max() {
 fn tool_concurrency_read_only_safe() {
     assert!(crate::tool_concurrency::is_concurrency_safe("file_view"));
     assert!(crate::tool_concurrency::is_concurrency_safe("web_search"));
-    assert!(!crate::tool_concurrency::is_concurrency_safe("shell"));
+    assert!(crate::tool_concurrency::is_concurrency_safe("shell"));
+    assert!(crate::tool_concurrency::is_concurrency_safe("shell_exec"));
+    assert!(crate::tool_concurrency::is_concurrency_safe(
+        "process_launch"
+    ));
     assert!(!crate::tool_concurrency::is_concurrency_safe("file_edit"));
 }
 
@@ -633,7 +646,7 @@ fn tool_concurrency_partition_mixed() {
         "shell",
     ];
     let batches = crate::tool_concurrency::partition_tool_calls(&tools);
-    assert_eq!(batches.len(), 4);
+    assert_eq!(batches.len(), 3);
     assert!(matches!(
         batches[0].kind,
         crate::tool_concurrency::ToolBatchKind::Concurrent
@@ -648,12 +661,83 @@ fn tool_concurrency_partition_mixed() {
         batches[2].kind,
         crate::tool_concurrency::ToolBatchKind::Concurrent
     ));
-    assert_eq!(batches[2].tool_indices, vec![3]);
-    assert!(matches!(
-        batches[3].kind,
-        crate::tool_concurrency::ToolBatchKind::Serial
-    ));
-    assert_eq!(batches[3].tool_indices, vec![4]);
+    assert_eq!(batches[2].tool_indices, vec![3, 4]);
+}
+
+struct SleepingToolExecutor {
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+    delay: Duration,
+}
+
+impl SleepingToolExecutor {
+    fn new(delay: Duration) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            delay,
+        }
+    }
+
+    fn max_active(&self) -> usize {
+        self.max_active.load(Ordering::SeqCst)
+    }
+}
+
+impl ToolExecutor for SleepingToolExecutor {
+    fn execute(&self, tool_call: &ToolCall) -> ToolResult {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        thread::sleep(self.delay);
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        ToolResult {
+            tool_call_id: tool_call.id.clone(),
+            content: format!("{} done", tool_call.name),
+            is_error: false,
+            standardized: None,
+            file_change: None,
+        }
+    }
+}
+
+#[test]
+fn shell_tool_calls_execute_concurrently_and_preserve_order() {
+    let executor = SleepingToolExecutor::new(Duration::from_millis(220));
+    let tool_calls = vec![
+        ToolCall {
+            id: "call-shell-a".to_string(),
+            name: "shell_exec".to_string(),
+            arguments: json!({ "command": "printf a" }),
+            argument_parse_error: None,
+            raw_arguments: None,
+        },
+        ToolCall {
+            id: "call-shell-b".to_string(),
+            name: "shell".to_string(),
+            arguments: json!({ "command": "printf b" }),
+            argument_parse_error: None,
+            raw_arguments: None,
+        },
+    ];
+
+    let started_at = Instant::now();
+    let results = crate::base_adapter::execute_tool_calls(&tool_calls, &executor);
+
+    assert!(
+        started_at.elapsed() < Duration::from_millis(350),
+        "两个 shell 调用应并发执行，而不是串行等待"
+    );
+    assert!(
+        executor.max_active() > 1,
+        "并发执行时同时活跃的 shell 调用数应大于 1"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.tool_call_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["call-shell-a", "call-shell-b"]
+    );
 }
 
 // ============================================================================

@@ -217,6 +217,7 @@ fn build_web_dev_html(vite_origin: &str, agent_origin: &str) -> String {
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <link rel="icon" href="data:," />
     <title>Magi Web</title>
     <script>
       window.__AGENT_BASE_URL__ = {agent_origin_json};

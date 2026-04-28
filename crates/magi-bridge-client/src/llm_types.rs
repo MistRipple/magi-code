@@ -29,6 +29,28 @@ pub struct ToolCall {
     pub raw_arguments: Option<String>,
 }
 
+impl ToolCall {
+    pub fn arguments_for_wire(&self) -> String {
+        self.raw_arguments
+            .clone()
+            .unwrap_or_else(|| self.arguments.to_string())
+    }
+}
+
+pub fn parse_tool_arguments(raw_arguments: &str) -> (Value, Option<String>) {
+    if raw_arguments.trim().is_empty() {
+        return (serde_json::json!({}), None);
+    }
+
+    match serde_json::from_str::<Value>(raw_arguments) {
+        Ok(arguments) => (arguments, None),
+        Err(error) => (
+            Value::String(raw_arguments.to_string()),
+            Some(error.to_string()),
+        ),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileChangeMetadata {
@@ -148,6 +170,33 @@ pub enum ToolChoice {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tool_arguments_preserves_non_empty_malformed_input() {
+        let raw = r#"{"command":"printf hello""#;
+        let (arguments, parse_error) = parse_tool_arguments(raw);
+
+        assert_eq!(arguments, Value::String(raw.to_string()));
+        assert!(parse_error.is_some());
+    }
+
+    #[test]
+    fn tool_call_arguments_for_wire_prefers_raw_arguments() {
+        let call = ToolCall {
+            id: "tool-call-raw".to_string(),
+            name: "shell_exec".to_string(),
+            arguments: Value::String("parsed fallback".to_string()),
+            argument_parse_error: Some("parse failed".to_string()),
+            raw_arguments: Some(r#"{"command":"printf hello""#.to_string()),
+        };
+
+        assert_eq!(call.arguments_for_wire(), r#"{"command":"printf hello""#);
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

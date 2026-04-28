@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 
 use super::adapter::{AdaptedRequest, AdaptedResponse, ProviderAdapter, ProviderFamily};
 use super::utils::{convert_messages_to_openai, parse_openai_usage, serialize_tool_definitions};
-use crate::llm_types::{LlmMessageParams, ToolCall};
+use crate::llm_types::{LlmMessageParams, ToolCall, parse_tool_arguments};
 
 pub struct OpenAiChatCompletionsAdapter;
 
@@ -121,12 +121,12 @@ fn parse_openai_tool_calls(value: &Value) -> Vec<ToolCall> {
                 Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            let arguments = serde_json::from_str(&args_raw).unwrap_or(json!({}));
+            let (arguments, argument_parse_error) = parse_tool_arguments(&args_raw);
             Some(ToolCall {
                 id,
                 name,
                 arguments,
-                argument_parse_error: None,
+                argument_parse_error,
                 raw_arguments: Some(args_raw),
             })
         })

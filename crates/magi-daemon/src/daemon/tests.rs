@@ -2335,6 +2335,117 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
 }
 
 #[tokio::test]
+async fn runtime_restore_detaches_session_chain_when_root_task_checkpoint_is_missing() {
+    let state_root = temp_state_root("stale-session-chain-root-missing");
+    let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root.clone());
+    let workspace_root = state_root.join("workspace");
+    let repository = ShadowStateRepository::new(state_root);
+    let session_store = SessionStore::new();
+    let workspace_store = WorkspaceStore::new();
+    let session_id = SessionId::new("session-stale-chain-root-missing");
+    let workspace_id = WorkspaceId::new("workspace-stale-chain-root-missing");
+    let mission_id = MissionId::new("mission-stale-chain-root-missing");
+    let root_task_id = TaskId::new("task-root-stale-chain-root-missing");
+    let branch_task_id = TaskId::new("task-branch-stale-chain-root-missing");
+    let worker_id = WorkerId::new("worker-stale-chain-root-missing");
+
+    session_store
+        .create_session(session_id.clone(), "stale chain")
+        .expect("session should be creatable");
+    workspace_store
+        .register(
+            workspace_id,
+            AbsolutePath::new(workspace_root.to_string_lossy().to_string()),
+        )
+        .expect("workspace should be registrable");
+    session_store
+        .upsert_active_execution_chain(
+            session_id.clone(),
+            ActiveExecutionChain {
+                session_id: session_id.clone(),
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                execution_chain_ref: "chain-stale-root-missing".to_string(),
+                workspace_id: None,
+                active_branch_task_ids: vec![branch_task_id.clone()],
+                active_worker_bindings: vec![worker_id.clone()],
+                branches: vec![ActiveExecutionBranch {
+                    task_id: branch_task_id,
+                    worker_id,
+                    stage: "execute".to_string(),
+                    lease_id: None,
+                    execution_intent_ref: Some("intent-stale-root-missing".to_string()),
+                    binding_lifecycle: Some("requested".to_string()),
+                    checkpoint_stage: Some("execute".to_string()),
+                    next_step_index: Some(1),
+                    checkpoint_at: Some(UtcMillis::now()),
+                    resume_mode: Some("step-checkpoint".to_string()),
+                    resume_token: None,
+                    use_tools: true,
+                    skill_name: None,
+                    is_primary: true,
+                }],
+                recovery_ref: None,
+                dispatch_context: ActiveExecutionDispatchContext {
+                    accepted_at: UtcMillis::now(),
+                    entry_id: "timeline-stale-root-missing".to_string(),
+                    trimmed_text: Some("stale root should detach".to_string()),
+                    deep_task: true,
+                    skill_name: None,
+                },
+                current_turn: None,
+            },
+        )
+        .expect("active execution chain should persist to sidecar");
+    repository
+        .save_session_durable_state(&session_store.durable_state())
+        .expect("session durable state should save");
+    repository
+        .save_workspace_durable_state(&workspace_store.durable_state())
+        .expect("workspace durable state should save");
+    repository
+        .save_session_sidecars(&session_store.execution_sidecar_store_state())
+        .expect("session sidecars should save");
+
+    let runtime =
+        ShadowDaemonRuntime::restore(&config).expect("runtime restore should load stale sidecar");
+    let (_app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+
+    let sidecar = state
+        .session_store
+        .runtime_sidecar(&session_id)
+        .expect("session sidecar should still exist");
+    assert_eq!(sidecar.status, SessionExecutionSidecarStatus::Detached);
+    assert!(sidecar.active_execution_chain.is_none());
+    assert!(sidecar.ownership.mission_id.is_none());
+    assert!(sidecar.ownership.task_id.is_none());
+    assert!(sidecar.ownership.execution_chain_ref.is_none());
+
+    let read_model = state.runtime_read_model_dto();
+    let session_summary = read_model
+        .details
+        .sessions
+        .iter()
+        .find(|entry| entry.session_id == session_id.to_string())
+        .expect("runtime read model should contain session summary");
+    assert_eq!(session_summary.current_status.as_deref(), Some("detached"));
+    assert!(session_summary.root_task_id.is_none());
+    assert!(session_summary.active_task_ids.is_empty());
+    assert!(session_summary.active_execution_group_ids.is_empty());
+
+    let persisted_sidecars = repository
+        .load_session_sidecars()
+        .expect("reconciled sidecars should persist");
+    let persisted = persisted_sidecars
+        .runtime_sidecars
+        .iter()
+        .find(|sidecar| sidecar.session_id == session_id)
+        .expect("persisted sidecar should exist");
+    assert_eq!(persisted.status, SessionExecutionSidecarStatus::Detached);
+    assert!(persisted.active_execution_chain.is_none());
+}
+
+#[tokio::test]
 async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_branches() {
     let state_root = temp_state_root("e2e-session-continue-restart-chain");
     let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root.clone());

@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::base_adapter::{AdapterConfig, BaseAdapter, RoundResult, ToolExecutor};
+use crate::base_adapter::{
+    AdapterConfig, BaseAdapter, RoundResult, ToolExecutor, execute_tool_calls,
+};
 use crate::conversation_compaction::{ConversationCompactionConfig, ConversationCompactor};
 use crate::decision_engine::{OrchestratorDecisionPolicy, OrchestratorExecutionBudget};
 use crate::execution_outcome::{ExecutionOutcomeStatus, extract_execution_outcome};
@@ -455,21 +457,20 @@ fn append_tool_round(
     });
 
     let mut error_count = 0u32;
-    let result_blocks: Vec<LlmContentBlock> = response
-        .tool_calls
-        .iter()
-        .map(|tc| {
-            let result = tool_executor.execute(tc);
-            if result.is_error {
-                error_count += 1;
-            }
-            LlmContentBlock::ToolResult {
-                tool_use_id: result.tool_call_id,
-                content: result.content,
-                is_error: result.is_error,
-            }
-        })
-        .collect();
+    let result_blocks: Vec<LlmContentBlock> =
+        execute_tool_calls(&response.tool_calls, tool_executor)
+            .into_iter()
+            .map(|result| {
+                if result.is_error {
+                    error_count += 1;
+                }
+                LlmContentBlock::ToolResult {
+                    tool_use_id: result.tool_call_id,
+                    content: result.content,
+                    is_error: result.is_error,
+                }
+            })
+            .collect();
 
     messages.push(LlmMessage {
         role: "user".to_string(),

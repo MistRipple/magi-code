@@ -4,7 +4,10 @@ use crate::{
         summarize_tool_result, tool_execution_status_label, turn_item_status_for_tool_result,
     },
 };
-use magi_bridge_client::{ChatMessage, ChatToolCall};
+use magi_bridge_client::{
+    ChatMessage, ChatToolCall,
+    tool_concurrency::{ToolBatchKind, partition_tool_calls},
+};
 use magi_core::{
     ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId, TaskId, ToolCallId,
     UtcMillis, WorkspaceId,
@@ -22,6 +25,7 @@ use magi_tool_runtime::{
     ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
 };
 use serde::Serialize;
+use std::thread;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PublishedSessionTurnItem {
@@ -336,45 +340,83 @@ pub(crate) fn build_completed_turn_timeline_snapshot(
     serde_json::to_string(&snapshot).ok()
 }
 
-pub(crate) fn append_session_tool_call_items(
+pub(crate) fn append_session_tool_call_items_batch(
     session_store: &SessionStore,
     event_bus: &InMemoryEventBus,
     tool_registry: Option<&ToolRegistry>,
     skill_runtime: Option<&SkillRuntime>,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
-    tool_call: &ChatToolCall,
+    tool_calls: &[ChatToolCall],
     messages: &mut Vec<ChatMessage>,
-) {
-    let mut started_item = session_turn_item(
-        "tool_call_started",
-        "running",
-        Some(tool_call.function.name.clone()),
-        Some(format!("正在调用工具：{}", tool_call.function.name)),
-        Some(format!("turn-item-tool-started-{}", tool_call.id)),
-    );
-    started_item.source = "tool".to_string();
-    started_item.tool_call_id = Some(tool_call.id.clone());
-    started_item.tool_name = Some(tool_call.function.name.clone());
-    started_item.tool_arguments = Some(tool_call.function.arguments.clone());
-    if let Some(published) = append_session_turn_item(session_store, session_id, started_item) {
-        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+    write_allowed: impl Fn() -> bool,
+) -> bool {
+    for tool_call in tool_calls {
+        if !write_allowed() {
+            return false;
+        }
+        let mut started_item = session_turn_item(
+            "tool_call_started",
+            "running",
+            Some(tool_call.function.name.clone()),
+            Some(format!("正在调用工具：{}", tool_call.function.name)),
+            Some(format!("turn-item-tool-started-{}", tool_call.id)),
+        );
+        started_item.source = "tool".to_string();
+        started_item.tool_call_id = Some(tool_call.id.clone());
+        started_item.tool_name = Some(tool_call.function.name.clone());
+        started_item.tool_arguments = Some(tool_call.function.arguments.clone());
+        if let Some(published) = append_session_turn_item(session_store, session_id, started_item) {
+            publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+        }
     }
 
-    let (tool_result, tool_status) = execute_session_turn_tool_call(
+    let tool_results = execute_session_turn_tool_call_batch(
         event_bus,
         tool_registry,
         skill_runtime,
-        tool_call,
+        tool_calls,
         session_id,
         workspace_id,
     );
+    for (tool_call, (tool_result, tool_status)) in tool_calls.iter().zip(tool_results.into_iter()) {
+        if !write_allowed() {
+            return false;
+        }
+        append_session_tool_call_result_item(
+            session_store,
+            event_bus,
+            session_id,
+            workspace_id,
+            tool_call,
+            &tool_result,
+            tool_status,
+        );
+        messages.push(ChatMessage {
+            role: "tool".to_string(),
+            content: Some(tool_result),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call.id.clone()),
+        });
+    }
+    true
+}
+
+fn append_session_tool_call_result_item(
+    session_store: &SessionStore,
+    event_bus: &InMemoryEventBus,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    tool_call: &ChatToolCall,
+    tool_result: &str,
+    tool_status: ExecutionResultStatus,
+) {
     let status_label = tool_execution_status_label(tool_status);
     let mut result_item = session_turn_item(
         "tool_call_result",
         turn_item_status_for_tool_result(tool_status),
         Some(tool_call.function.name.clone()),
-        Some(summarize_tool_result(&tool_result)),
+        Some(summarize_tool_result(tool_result)),
         Some(format!("turn-item-tool-result-{}", tool_call.id)),
     );
     result_item.source = "tool".to_string();
@@ -382,20 +424,103 @@ pub(crate) fn append_session_tool_call_items(
     result_item.tool_name = Some(tool_call.function.name.clone());
     result_item.tool_status = Some(status_label.to_string());
     result_item.tool_arguments = Some(tool_call.function.arguments.clone());
-    result_item.tool_result = Some(tool_result.clone());
+    result_item.tool_result = Some(tool_result.to_string());
     if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
-        result_item.tool_error = Some(tool_result.clone());
+        result_item.tool_error = Some(tool_result.to_string());
     }
     if let Some(published) = append_session_turn_item(session_store, session_id, result_item) {
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
+}
 
-    messages.push(ChatMessage {
-        role: "tool".to_string(),
-        content: Some(tool_result),
-        tool_calls: Vec::new(),
-        tool_call_id: Some(tool_call.id.clone()),
-    });
+fn execute_session_turn_tool_call_batch(
+    event_bus: &InMemoryEventBus,
+    tool_registry: Option<&ToolRegistry>,
+    skill_runtime: Option<&SkillRuntime>,
+    tool_calls: &[ChatToolCall],
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+) -> Vec<(String, ExecutionResultStatus)> {
+    let tool_names = tool_calls
+        .iter()
+        .map(|tool_call| tool_call.function.name.as_str())
+        .collect::<Vec<_>>();
+    let mut results = vec![None; tool_calls.len()];
+
+    for batch in partition_tool_calls(&tool_names) {
+        match batch.kind {
+            ToolBatchKind::Serial => {
+                for tool_index in batch.tool_indices {
+                    results[tool_index] = Some(execute_session_turn_tool_call(
+                        event_bus,
+                        tool_registry,
+                        skill_runtime,
+                        &tool_calls[tool_index],
+                        session_id,
+                        workspace_id,
+                    ));
+                }
+            }
+            ToolBatchKind::Concurrent => {
+                thread::scope(|scope| {
+                    let handles = batch
+                        .tool_indices
+                        .iter()
+                        .copied()
+                        .map(|tool_index| {
+                            let tool_call = &tool_calls[tool_index];
+                            (
+                                tool_index,
+                                scope.spawn(move || {
+                                    execute_session_turn_tool_call(
+                                        event_bus,
+                                        tool_registry,
+                                        skill_runtime,
+                                        tool_call,
+                                        session_id,
+                                        workspace_id,
+                                    )
+                                }),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+
+                    for (tool_index, handle) in handles {
+                        let result = handle.join().unwrap_or_else(|_| {
+                            (
+                                serde_json::json!({
+                                    "tool": tool_calls[tool_index].function.name,
+                                    "status": "failed",
+                                    "error": "工具执行线程异常"
+                                })
+                                .to_string(),
+                                ExecutionResultStatus::Failed,
+                            )
+                        });
+                        results[tool_index] = Some(result);
+                    }
+                });
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(tool_index, result)| {
+            result.unwrap_or_else(|| {
+                (
+                    serde_json::json!({
+                        "tool": tool_calls[tool_index].function.name,
+                        "status": "failed",
+                        "error": "工具执行结果缺失"
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                )
+            })
+        })
+        .collect()
 }
 
 fn execute_session_turn_tool_call(
@@ -460,8 +585,80 @@ mod tests {
     use super::*;
     use magi_bridge_client::ChatToolFunction;
     use magi_governance::GovernanceService;
+    use magi_session_store::ActiveExecutionTurn;
     use magi_skill_runtime::{SkillDefinition, SkillMetadata, SkillRegistry};
-    use std::sync::Arc;
+    use magi_tool_runtime::{BuiltinTool, BuiltinToolSpec};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+
+    struct ConcurrentToolProbe {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        delay: Duration,
+    }
+
+    impl ConcurrentToolProbe {
+        fn new(delay: Duration) -> Self {
+            Self {
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                delay,
+            }
+        }
+
+        fn max_active(&self) -> usize {
+            self.max_active.load(Ordering::SeqCst)
+        }
+
+        fn record_active_call(&self) {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            thread::sleep(self.delay);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ProbeBuiltinTool {
+        name: &'static str,
+        probe: Arc<ConcurrentToolProbe>,
+    }
+
+    impl ProbeBuiltinTool {
+        fn new(name: &'static str, probe: Arc<ConcurrentToolProbe>) -> Self {
+            Self { name, probe }
+        }
+    }
+
+    impl BuiltinTool for ProbeBuiltinTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn execute(&self, input: &str, _context: &ToolExecutionContext) -> String {
+            self.probe.record_active_call();
+            serde_json::json!({
+                "tool": self.name,
+                "status": "succeeded",
+                "stdout": format!("{} done", self.name),
+                "input": input,
+            })
+            .to_string()
+        }
+
+        fn spec(&self) -> BuiltinToolSpec {
+            BuiltinToolSpec {
+                name: self.name.to_string(),
+                risk_level: RiskLevel::Low,
+                approval_requirement: ApprovalRequirement::None,
+            }
+        }
+    }
 
     #[test]
     fn session_turn_item_uses_expected_defaults() {
@@ -549,5 +746,123 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
         assert_eq!(parsed["skill_name"], "code-review");
         assert_eq!(event_bus.snapshot().recent_events.len(), 1);
+    }
+
+    #[test]
+    fn session_turn_shell_tool_batch_executes_concurrently_and_preserves_order() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(32);
+        let session_id = SessionId::new("session-turn-shell-batch");
+        let workspace_id = Some(WorkspaceId::new("workspace-turn-shell-batch"));
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "shell batch session",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-shell-batch".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("并发执行 shell".to_string()),
+                    items: Vec::new(),
+                    worker_lanes: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("turn should be creatable");
+
+        let probe = Arc::new(ConcurrentToolProbe::new(Duration::from_millis(180)));
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_builtin(Arc::new(ProbeBuiltinTool::new(
+            "shell_exec",
+            Arc::clone(&probe),
+        )));
+        tool_registry
+            .register_builtin(Arc::new(ProbeBuiltinTool::new("shell", Arc::clone(&probe))));
+
+        let tool_calls = vec![
+            ChatToolCall {
+                id: "tool-call-shell-a".to_string(),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: "shell_exec".to_string(),
+                    arguments: serde_json::json!({
+                        "command": "printf a",
+                        "access_mode": "read_only"
+                    })
+                    .to_string(),
+                },
+            },
+            ChatToolCall {
+                id: "tool-call-shell-b".to_string(),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: "shell".to_string(),
+                    arguments: serde_json::json!({
+                        "command": "printf b",
+                        "access_mode": "read_only"
+                    })
+                    .to_string(),
+                },
+            },
+        ];
+        let mut messages = Vec::new();
+
+        append_session_tool_call_items_batch(
+            &session_store,
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &session_id,
+            &workspace_id,
+            &tool_calls,
+            &mut messages,
+            || true,
+        );
+
+        assert!(
+            probe.max_active() > 1,
+            "session turn 中的多个 shell 工具调用必须并发执行"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.tool_call_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("tool-call-shell-a"), Some("tool-call-shell-b")]
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool", "tool"]
+        );
+
+        let sidecar = session_store
+            .runtime_sidecar(&session_id)
+            .expect("sidecar should exist");
+        let turn = sidecar.current_turn.expect("turn should exist");
+        assert_eq!(
+            turn.items
+                .iter()
+                .map(|item| (item.kind.as_str(), item.tool_call_id.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("tool_call_started", Some("tool-call-shell-a")),
+                ("tool_call_started", Some("tool-call-shell-b")),
+                ("tool_call_result", Some("tool-call-shell-a")),
+                ("tool_call_result", Some("tool-call-shell-b")),
+            ]
+        );
     }
 }

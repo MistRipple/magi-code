@@ -1,9 +1,10 @@
-use std::sync::Arc;
+use std::{sync::Arc, thread};
 
 use crate::llm_types::{
     LlmContentBlock, LlmMessage, LlmMessageContent, LlmMessageParams, LlmResponse, LlmUsage,
-    ToolCall, ToolResult,
+    ToolCall, ToolResult, parse_tool_arguments,
 };
+use crate::tool_concurrency::{ToolBatchKind, partition_tool_calls};
 use crate::types::{BridgeClientError, ModelBridgeClient, ModelInvocationRequest};
 
 #[derive(Clone, Debug)]
@@ -37,6 +38,68 @@ pub struct RoundResult {
 
 pub trait ToolExecutor: Send + Sync {
     fn execute(&self, tool_call: &ToolCall) -> ToolResult;
+}
+
+pub(crate) fn execute_tool_calls(
+    tool_calls: &[ToolCall],
+    tool_executor: &dyn ToolExecutor,
+) -> Vec<ToolResult> {
+    let tool_names = tool_calls
+        .iter()
+        .map(|tool_call| tool_call.name.as_str())
+        .collect::<Vec<_>>();
+    let mut results = vec![None; tool_calls.len()];
+
+    for batch in partition_tool_calls(&tool_names) {
+        match batch.kind {
+            ToolBatchKind::Serial => {
+                for tool_index in batch.tool_indices {
+                    results[tool_index] = Some(tool_executor.execute(&tool_calls[tool_index]));
+                }
+            }
+            ToolBatchKind::Concurrent => {
+                thread::scope(|scope| {
+                    let handles = batch
+                        .tool_indices
+                        .iter()
+                        .copied()
+                        .map(|tool_index| {
+                            let tool_call = &tool_calls[tool_index];
+                            (
+                                tool_index,
+                                scope.spawn(move || tool_executor.execute(tool_call)),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+
+                    for (tool_index, handle) in handles {
+                        let result = handle.join().unwrap_or_else(|_| ToolResult {
+                            tool_call_id: tool_calls[tool_index].id.clone(),
+                            content: "工具执行线程异常".to_string(),
+                            is_error: true,
+                            standardized: None,
+                            file_change: None,
+                        });
+                        results[tool_index] = Some(result);
+                    }
+                });
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(tool_index, result)| {
+            result.unwrap_or_else(|| ToolResult {
+                tool_call_id: tool_calls[tool_index].id.clone(),
+                content: "工具执行结果缺失".to_string(),
+                is_error: true,
+                standardized: None,
+                file_change: None,
+            })
+        })
+        .collect()
 }
 
 pub struct BaseAdapter {
@@ -90,7 +153,11 @@ impl BaseAdapter {
                         function: crate::types::ChatToolFunctionDefinition {
                             name: t.name.clone(),
                             description: t.description.clone(),
-                            parameters: t.input_schema.properties.clone(),
+                            parameters: serde_json::json!({
+                                "type": t.input_schema.kind,
+                                "properties": t.input_schema.properties,
+                                "required": t.input_schema.required,
+                            }),
                         },
                     })
                     .collect()
@@ -107,13 +174,16 @@ impl BaseAdapter {
             tool_calls: payload
                 .tool_calls
                 .into_iter()
-                .map(|tc| ToolCall {
-                    id: tc.id,
-                    name: tc.function.name,
-                    arguments: serde_json::from_str(&tc.function.arguments)
-                        .unwrap_or(serde_json::json!({})),
-                    argument_parse_error: None,
-                    raw_arguments: Some(tc.function.arguments),
+                .map(|tc| {
+                    let raw_arguments = tc.function.arguments;
+                    let (arguments, argument_parse_error) = parse_tool_arguments(&raw_arguments);
+                    ToolCall {
+                        id: tc.id,
+                        name: tc.function.name,
+                        arguments,
+                        argument_parse_error,
+                        raw_arguments: Some(raw_arguments),
+                    }
                 })
                 .collect(),
             usage: LlmUsage::default(),
@@ -183,18 +253,15 @@ impl BaseAdapter {
                 content: LlmMessageContent::Blocks(assistant_blocks),
             });
 
-            let result_blocks: Vec<LlmContentBlock> = response
-                .tool_calls
-                .iter()
-                .map(|tc| {
-                    let result = tool_executor.execute(tc);
-                    LlmContentBlock::ToolResult {
+            let result_blocks: Vec<LlmContentBlock> =
+                execute_tool_calls(&response.tool_calls, tool_executor)
+                    .into_iter()
+                    .map(|result| LlmContentBlock::ToolResult {
                         tool_use_id: result.tool_call_id,
                         content: result.content,
                         is_error: result.is_error,
-                    }
-                })
-                .collect();
+                    })
+                    .collect();
 
             params.messages.push(LlmMessage {
                 role: "user".to_string(),

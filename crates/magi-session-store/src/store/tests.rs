@@ -77,6 +77,36 @@ fn append_timeline_entry_updates_session_timestamp_and_user_message_count() {
 }
 
 #[test]
+fn sessions_for_workspace_returns_user_message_count() {
+    let store = SessionStore::new();
+    let workspace_id = "workspace-message-count".to_string();
+    let session_id = SessionId::new("session-workspace-message-count");
+    store
+        .create_session_for_workspace(
+            session_id.clone(),
+            "workspace message count session",
+            Some(workspace_id.clone()),
+        )
+        .expect("session should be creatable");
+
+    store.append_timeline_entry(
+        session_id.clone(),
+        TimelineEntryKind::UserMessage,
+        "第一条用户消息",
+    );
+    store.append_timeline_entry(
+        session_id.clone(),
+        TimelineEntryKind::AssistantMessage,
+        "助手消息不计入用户消息数",
+    );
+    store.append_timeline_entry(session_id, TimelineEntryKind::UserMessage, "第二条用户消息");
+
+    let sessions = store.sessions_for_workspace(&workspace_id);
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].message_count, Some(2));
+}
+
+#[test]
 fn session_sidecar_store_keeps_status_and_recovery_alias() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-1");

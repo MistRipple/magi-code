@@ -2,9 +2,9 @@ use crate::{
     errors::ApiError,
     prompt_utils::normalize_model_visible_content,
     session_turn_writeback::{
-        append_session_tool_call_items, append_session_turn_error_item, append_session_turn_item,
-        build_completed_turn_timeline_snapshot, publish_session_turn_item_event, session_turn_item,
-        upsert_session_turn_item,
+        append_session_tool_call_items_batch, append_session_turn_error_item,
+        append_session_turn_item, build_completed_turn_timeline_snapshot,
+        publish_session_turn_item_event, session_turn_item, upsert_session_turn_item,
     },
     settings_store::SettingsStore,
     usage_recording::{
@@ -26,6 +26,7 @@ pub const BUSINESS_MODEL_PROVIDER: &str = "openai-compatible";
 
 pub struct SessionTurnExecutionRequest {
     pub session_id: SessionId,
+    pub turn_id: String,
     pub workspace_id: Option<WorkspaceId>,
     pub prompt: String,
     pub use_tools: bool,
@@ -37,6 +38,23 @@ pub struct SessionTurnExecutionRequest {
 
 pub struct SessionTurnExecutionOutput {
     pub final_content: String,
+    pub interrupted: bool,
+}
+
+impl SessionTurnExecutionOutput {
+    fn completed(final_content: String) -> Self {
+        Self {
+            final_content,
+            interrupted: false,
+        }
+    }
+
+    fn interrupted() -> Self {
+        Self {
+            final_content: String::new(),
+            interrupted: true,
+        }
+    }
 }
 
 fn apply_request_aliases(
@@ -46,6 +64,32 @@ fn apply_request_aliases(
     item.request_id = request.request_id.clone();
     item.user_message_id = request.user_message_id.clone();
     item.placeholder_message_id = request.placeholder_message_id.clone();
+}
+
+fn current_turn_status_is_writable(status: &str) -> bool {
+    !matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "completed"
+            | "complete"
+            | "succeeded"
+            | "success"
+            | "failed"
+            | "error"
+            | "cancelled"
+            | "canceled"
+    )
+}
+
+fn request_turn_is_writable(
+    session_store: &SessionStore,
+    request: &SessionTurnExecutionRequest,
+) -> bool {
+    session_store
+        .runtime_sidecar(&request.session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .is_some_and(|turn| {
+            turn.turn_id == request.turn_id && current_turn_status_is_writable(&turn.status)
+        })
 }
 
 pub(crate) struct SessionTurnExecutionRuntime<'a> {
@@ -74,6 +118,10 @@ pub(crate) fn run_session_turn_execution(
         prompt,
         tools,
     } = runtime;
+
+    if !request_turn_is_writable(session_store, &request) {
+        return Ok(SessionTurnExecutionOutput::interrupted());
+    }
 
     append_phase_item(event_bus, session_store, &request);
     let mut messages = vec![ChatMessage {
@@ -106,6 +154,9 @@ pub(crate) fn run_session_turn_execution(
         ) {
             Ok(output) => output,
             Err(error) => {
+                if !request_turn_is_writable(session_store, &request) {
+                    return Ok(SessionTurnExecutionOutput::interrupted());
+                }
                 let error_text = session_turn_failure_text(&error);
                 append_session_turn_error_item(
                     event_bus,
@@ -122,6 +173,9 @@ pub(crate) fn run_session_turn_execution(
                 return Err(error);
             }
         };
+        if streamed_content.interrupted || !request_turn_is_writable(session_store, &request) {
+            return Ok(SessionTurnExecutionOutput::interrupted());
+        }
         last_streaming_entry_id = streamed_content.streaming_entry_id.clone();
         had_tool_calls |= streamed_content.encountered_tool_calls;
 
@@ -134,6 +188,9 @@ pub(crate) fn run_session_turn_execution(
     let final_content = if let Some(content) = final_content {
         content
     } else {
+        if !request_turn_is_writable(session_store, &request) {
+            return Ok(SessionTurnExecutionOutput::interrupted());
+        }
         let failure_reason = if had_tool_calls {
             "模型在工具调用后未返回最终回复"
         } else {
@@ -156,6 +213,9 @@ pub(crate) fn run_session_turn_execution(
             failure_reason,
         ));
     };
+    if !request_turn_is_writable(session_store, &request) {
+        return Ok(SessionTurnExecutionOutput::interrupted());
+    }
     append_final_item(
         event_bus,
         session_store,
@@ -164,7 +224,7 @@ pub(crate) fn run_session_turn_execution(
         last_streaming_entry_id.as_deref(),
     );
 
-    Ok(SessionTurnExecutionOutput { final_content })
+    Ok(SessionTurnExecutionOutput::completed(final_content))
 }
 
 struct SessionTurnRoundRuntime<'a> {
@@ -184,6 +244,7 @@ struct SessionTurnRoundOutput {
     final_content: Option<String>,
     streaming_entry_id: Option<String>,
     encountered_tool_calls: bool,
+    interrupted: bool,
 }
 
 fn stream_session_turn_round(
@@ -218,7 +279,12 @@ fn stream_session_turn_round(
     let streamed_thinking = std::cell::RefCell::new(String::new());
     let last_content_len = std::cell::Cell::new(0usize);
     let last_thinking_len = std::cell::Cell::new(0usize);
+    let writeback_aborted = std::cell::Cell::new(false);
     let on_delta = |delta: &ModelStreamingDelta| {
+        if !request_turn_is_writable(session_store, request) {
+            writeback_aborted.set(true);
+            return;
+        }
         let accumulated_thinking = delta.thinking.as_str();
         if accumulated_thinking.len() > last_thinking_len.get() {
             last_thinking_len.set(accumulated_thinking.len());
@@ -309,6 +375,14 @@ fn stream_session_turn_round(
         None,
         None,
     );
+    if writeback_aborted.get() || !request_turn_is_writable(session_store, request) {
+        return Ok(SessionTurnRoundOutput {
+            final_content: None,
+            streaming_entry_id: Some(stream_item_id),
+            encountered_tool_calls: false,
+            interrupted: true,
+        });
+    }
     let streamed_content = streamed_content.into_inner();
     let streamed_thinking = streamed_thinking.into_inner();
     let final_thinking = parsed
@@ -318,6 +392,14 @@ fn stream_session_turn_round(
         .cloned()
         .or_else(|| (!streamed_thinking.trim().is_empty()).then_some(streamed_thinking));
     if let Some(thinking) = final_thinking {
+        if !request_turn_is_writable(session_store, request) {
+            return Ok(SessionTurnRoundOutput {
+                final_content: None,
+                streaming_entry_id: Some(stream_item_id),
+                encountered_tool_calls: false,
+                interrupted: true,
+            });
+        }
         let mut thinking_item = session_turn_item(
             "assistant_thinking",
             "completed",
@@ -338,6 +420,14 @@ fn stream_session_turn_round(
         }
     }
     if !streamed_content.trim().is_empty() {
+        if !request_turn_is_writable(session_store, request) {
+            return Ok(SessionTurnRoundOutput {
+                final_content: None,
+                streaming_entry_id: Some(stream_item_id),
+                encountered_tool_calls: false,
+                interrupted: true,
+            });
+        }
         let mut stream_item = session_turn_item(
             "assistant_stream",
             "completed",
@@ -359,28 +449,44 @@ fn stream_session_turn_round(
     }
 
     if request.use_tools && !parsed.tool_calls.is_empty() {
+        if !request_turn_is_writable(session_store, request) {
+            return Ok(SessionTurnRoundOutput {
+                final_content: None,
+                streaming_entry_id: Some(stream_item_id),
+                encountered_tool_calls: false,
+                interrupted: true,
+            });
+        }
         messages.push(ChatMessage {
             role: "assistant".to_string(),
             content: parsed.content.clone(),
             tool_calls: parsed.tool_calls.clone(),
             tool_call_id: None,
         });
-        for tool_call in parsed.tool_calls {
-            append_session_tool_call_items(
-                session_store,
-                event_bus,
-                tool_registry,
-                skill_runtime,
-                &request.session_id,
-                &request.workspace_id,
-                &tool_call,
-                messages,
-            );
+        append_session_tool_call_items_batch(
+            session_store,
+            event_bus,
+            tool_registry,
+            skill_runtime,
+            &request.session_id,
+            &request.workspace_id,
+            &parsed.tool_calls,
+            messages,
+            || request_turn_is_writable(session_store, request),
+        );
+        if !request_turn_is_writable(session_store, request) {
+            return Ok(SessionTurnRoundOutput {
+                final_content: None,
+                streaming_entry_id: Some(stream_item_id),
+                encountered_tool_calls: false,
+                interrupted: true,
+            });
         }
         return Ok(SessionTurnRoundOutput {
             final_content: None,
             streaming_entry_id: Some(stream_item_id),
             encountered_tool_calls: true,
+            interrupted: false,
         });
     }
 
@@ -394,6 +500,7 @@ fn stream_session_turn_round(
         final_content,
         streaming_entry_id: Some(stream_item_id),
         encountered_tool_calls: false,
+        interrupted: false,
     })
 }
 

@@ -42,6 +42,26 @@ fn unique_timeline_entry_id(existing: &[TimelineEntry], base: String) -> String 
     }
 }
 
+fn user_message_count_for_session(timeline: &[TimelineEntry], session_id: &SessionId) -> usize {
+    timeline
+        .iter()
+        .filter(|entry| {
+            &entry.session_id == session_id && matches!(entry.kind, TimelineEntryKind::UserMessage)
+        })
+        .count()
+}
+
+fn with_session_message_count(
+    mut session: SessionRecord,
+    timeline: &[TimelineEntry],
+) -> SessionRecord {
+    session.message_count = Some(user_message_count_for_session(
+        timeline,
+        &session.session_id,
+    ));
+    session
+}
+
 impl Default for SessionStore {
     fn default() -> Self {
         Self {
@@ -142,6 +162,7 @@ impl SessionStore {
             .iter()
             .filter(|s| s.workspace_id.as_deref() == Some(workspace_id))
             .cloned()
+            .map(|session| with_session_message_count(session, &state.timeline))
             .collect()
     }
 

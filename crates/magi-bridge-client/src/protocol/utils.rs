@@ -44,7 +44,11 @@ pub fn serialize_tool_definitions(tools: &[ToolDefinition]) -> Vec<Value> {
                 "function": {
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": tool.input_schema.properties,
+                    "parameters": {
+                        "type": tool.input_schema.kind,
+                        "properties": tool.input_schema.properties,
+                        "required": tool.input_schema.required,
+                    },
                 }
             })
         })
@@ -77,7 +81,7 @@ pub fn convert_tool_calls_to_openai(tool_calls: &[ToolCall]) -> Vec<Value> {
                 "type": "function",
                 "function": {
                     "name": tc.name,
-                    "arguments": tc.arguments.to_string(),
+                    "arguments": tc.arguments_for_wire(),
                 }
             })
         })
@@ -229,5 +233,35 @@ pub fn parse_anthropic_usage(usage: &Value) -> LlmUsage {
         cache_read_tokens: usage["cache_read_input_tokens"].as_u64(),
         cache_write_tokens: usage["cache_creation_input_tokens"].as_u64(),
         cache_read_included_in_input: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm_types::ToolInputSchema;
+
+    #[test]
+    fn serialize_tool_definitions_preserves_required_schema() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".to_string(),
+            description: "Run a shell command".to_string(),
+            input_schema: ToolInputSchema {
+                kind: "object".to_string(),
+                properties: json!({
+                    "command": {
+                        "type": "string"
+                    }
+                }),
+                required: Some(vec!["command".to_string()]),
+            },
+        }];
+
+        let serialized = serialize_tool_definitions(&tools);
+        let parameters = &serialized[0]["function"]["parameters"];
+
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(parameters["properties"]["command"]["type"], "string");
+        assert_eq!(parameters["required"][0], "command");
     }
 }

@@ -28,6 +28,36 @@ fn inherit_current_turn_aliases(turn: &ActiveExecutionTurn, item: &mut ActiveExe
     }
 }
 
+fn current_turn_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "completed"
+            | "complete"
+            | "succeeded"
+            | "success"
+            | "failed"
+            | "error"
+            | "cancelled"
+            | "canceled"
+    )
+}
+
+fn current_turn_item_status_is_active(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "pending"
+            | "queued"
+            | "running"
+            | "started"
+            | "streaming"
+            | "blocked"
+            | "awaiting_approval"
+            | "review_required"
+            | "repairing"
+            | "verifying"
+    )
+}
+
 impl SessionStore {
     fn sync_session_workspace_binding(
         &self,
@@ -712,6 +742,61 @@ impl SessionStore {
                 && matches!(turn.status.as_str(), "completed" | "failed" | "cancelled")
             {
                 turn.completed_at = Some(UtcMillis::now());
+            }
+            turn.normalize();
+            if let Some(chain) = sidecar.active_execution_chain.as_mut() {
+                chain.current_turn = sidecar.current_turn.clone();
+                chain.normalize();
+            }
+            sidecar.updated_at = UtcMillis::now();
+            Some(sidecar.clone())
+        };
+        if updated.is_some() {
+            self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateCurrentTurnStatus);
+        }
+        Ok(updated)
+    }
+
+    pub fn cancel_current_turn(
+        &self,
+        session_id: &SessionId,
+    ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        let updated = {
+            let mut state = self
+                .state
+                .write()
+                .expect("session state write lock poisoned");
+            let Some(sidecar) = state
+                .execution_sidecar_store
+                .runtime_sidecars
+                .iter_mut()
+                .find(|sidecar| &sidecar.session_id == session_id)
+            else {
+                return Err(DomainError::NotFound {
+                    entity: "session_runtime_sidecar",
+                });
+            };
+            let Some(turn) = sidecar.current_turn.as_mut() else {
+                return Ok(None);
+            };
+            if !current_turn_status_is_terminal(&turn.status) {
+                let now = UtcMillis::now();
+                for item in &mut turn.items {
+                    if current_turn_item_status_is_active(&item.status) {
+                        item.status = "cancelled".to_string();
+                    }
+                    if item
+                        .tool_status
+                        .as_deref()
+                        .is_some_and(current_turn_item_status_is_active)
+                    {
+                        item.tool_status = Some("cancelled".to_string());
+                    }
+                }
+                turn.status = "cancelled".to_string();
+                if turn.completed_at.is_none() {
+                    turn.completed_at = Some(now);
+                }
             }
             turn.normalize();
             if let Some(chain) = sidecar.active_execution_chain.as_mut() {

@@ -1052,6 +1052,30 @@ mod tests {
     }
 
     #[test]
+    fn shell_exec_rejects_blank_json_command() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-shell-blank"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "command": "   " }).to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext::default(),
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Failed);
+        assert!(output.payload.contains("缺少 shell 命令"));
+    }
+
+    #[test]
     fn shell_exec_blocks_conflicting_write_scope_until_guard_drops() {
         let root = unique_temp_dir("magi-tool-shell-write");
         let governance = Arc::new(GovernanceService::default());
@@ -1312,6 +1336,30 @@ mod tests {
             &ToolExecutionPolicy::default(),
         );
         assert_eq!(kill.status, ExecutionResultStatus::Succeeded);
+    }
+
+    #[test]
+    fn process_launch_rejects_blank_json_command() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-process-blank"),
+                tool_name: BuiltinToolName::ProcessLaunch.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "command": "   " }).to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext::default(),
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Failed);
+        assert!(output.payload.contains("缺少 shell 命令"));
     }
 
     #[test]

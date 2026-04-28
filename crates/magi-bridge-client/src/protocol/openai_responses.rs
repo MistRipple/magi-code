@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 
 use super::adapter::{AdaptedRequest, AdaptedResponse, ProviderAdapter, ProviderFamily};
 use super::utils::convert_messages_to_openai;
-use crate::llm_types::{LlmMessageParams, LlmUsage, ToolCall};
+use crate::llm_types::{LlmMessageParams, LlmUsage, ToolCall, parse_tool_arguments};
 
 pub struct OpenAiResponsesAdapter;
 
@@ -127,12 +127,12 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                             Some(Value::Null) | None => "{}".to_string(),
                             Some(value) => value.to_string(),
                         };
-                        let arguments = serde_json::from_str(&args_str).unwrap_or(json!({}));
+                        let (arguments, argument_parse_error) = parse_tool_arguments(&args_str);
                         tool_calls.push(ToolCall {
                             id: id.to_string(),
                             name: name.to_string(),
                             arguments,
-                            argument_parse_error: None,
+                            argument_parse_error,
                             raw_arguments: Some(args_str),
                         });
                     }

@@ -16,8 +16,7 @@ use magi_bridge_client::{
     JsonRpcModelBridgeClient, JsonRpcStdioTransport, StdioMcpBridgeClient,
 };
 use magi_context_runtime::{ContextBudget, ContextRuntime};
-use magi_core::EventId;
-use magi_core::{LeaseId, TaskStatus};
+use magi_core::{EventId, ExecutionOwnership, LeaseId, TaskStatus, UtcMillis};
 use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
 use magi_knowledge_store::{
@@ -27,7 +26,7 @@ use magi_knowledge_store::{
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::task_runner::{EventBasedResultReceiver, TaskOutcome, TaskResult};
 use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
-use magi_session_store::SessionStore;
+use magi_session_store::{SessionExecutionSidecarStatus, SessionStore};
 use magi_skill_runtime::SkillDispatchRuntime;
 use magi_tool_runtime::ToolRegistry;
 use magi_worker_runtime::WorkerRuntime;
@@ -451,6 +450,7 @@ impl ShadowDaemonRuntime {
                 )))
             }
         };
+        self.reconcile_stale_session_task_chains(task_store.as_ref());
         let execution_runtime = orchestrator
             .execution_runtime(worker_runtime.clone(), tool_registry, skill_runtime)
             .with_task_store(Arc::clone(&task_store))
@@ -540,6 +540,54 @@ impl ShadowDaemonRuntime {
         }
 
         state
+    }
+
+    fn reconcile_stale_session_task_chains(&self, task_store: &TaskStore) {
+        let stale_sidecars = self
+            .session_store
+            .runtime_sidecars()
+            .into_iter()
+            .filter(|sidecar| {
+                let Some(chain) = sidecar.active_execution_chain.as_ref() else {
+                    return false;
+                };
+                !task_store
+                    .get_task(&chain.root_task_id)
+                    .is_some_and(|root_task| {
+                        root_task.root_task_id == chain.root_task_id
+                            && root_task.mission_id == chain.mission_id
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        if stale_sidecars.is_empty() {
+            return;
+        }
+
+        let stale_count = stale_sidecars.len();
+        for mut sidecar in stale_sidecars {
+            sidecar.active_execution_chain = None;
+            sidecar.ownership = ExecutionOwnership::default();
+            sidecar.status = if sidecar.recovery_id.is_some() {
+                SessionExecutionSidecarStatus::RecoveryLinked
+            } else {
+                SessionExecutionSidecarStatus::Detached
+            };
+            sidecar.updated_at = UtcMillis::now();
+            self.session_store.upsert_runtime_sidecar(sidecar);
+        }
+
+        let repository = ShadowStateRepository::new(self.state_root.clone());
+        if let Err(error) = self
+            .session_store
+            .flush_execution_sidecars_with(|state| repository.save_session_sidecars(state))
+        {
+            warn!(?error, "清理失效 session task chain 后持久化 sidecar 失败");
+        }
+        warn!(
+            stale_count,
+            "已清理指向缺失 root task 的 session task chain"
+        );
     }
 
     pub(crate) fn router(&self, service_name: String) -> axum::Router {

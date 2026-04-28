@@ -1,7 +1,9 @@
 use serde_json::Value;
 
 use super::adapter::{AdaptedResponse, ProviderFamily};
-use crate::llm_types::{LlmStreamChunk, LlmStreamChunkType, LlmUsage, PartialToolCall, ToolCall};
+use crate::llm_types::{
+    LlmStreamChunk, LlmStreamChunkType, LlmUsage, PartialToolCall, ToolCall, parse_tool_arguments,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct SseLineParser {
@@ -572,13 +574,12 @@ impl StreamAccumulator {
             .active_tool_calls
             .into_iter()
             .map(|tc| {
-                let args_parsed = serde_json::from_str::<Value>(&tc.arguments_buffer)
-                    .unwrap_or(serde_json::json!({}));
+                let (arguments, argument_parse_error) = parse_tool_arguments(&tc.arguments_buffer);
                 ToolCall {
                     id: tc.id,
                     name: tc.name,
-                    arguments: args_parsed,
-                    argument_parse_error: None,
+                    arguments,
+                    argument_parse_error,
                     raw_arguments: Some(tc.arguments_buffer),
                 }
             })

@@ -92,6 +92,23 @@ fn require_workspace_id(value: Option<&str>) -> Result<WorkspaceId, ApiError> {
         .ok_or_else(|| ApiError::InvalidInput("workspaceId 不能为空".to_string()))
 }
 
+fn require_registered_workspace_id(
+    state: &ApiState,
+    value: Option<&str>,
+) -> Result<WorkspaceId, ApiError> {
+    let workspace_id = require_workspace_id(value)?;
+    if state
+        .workspace_registry
+        .workspaces()
+        .into_iter()
+        .any(|workspace| workspace.workspace_id == workspace_id)
+    {
+        Ok(workspace_id)
+    } else {
+        Err(ApiError::not_found("工作区不存在", workspace_id.as_str()))
+    }
+}
+
 fn normalize_tags(tags: Vec<String>) -> Vec<String> {
     let mut normalized = Vec::new();
     for tag in tags {
@@ -150,7 +167,7 @@ async fn clear_knowledge(
     State(state): State<ApiState>,
     Json(request): Json<KnowledgeWorkspaceRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
     state.knowledge_store.clear_workspace(&workspace_id);
     state.persist_knowledge_state()?;
     Ok(Json(mutation_response(&state, &workspace_id)))
@@ -166,7 +183,7 @@ async fn list_adrs(
     State(state): State<ApiState>,
     Query(query): Query<KnowledgeListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
     let query = KnowledgeQuery {
         kind: Some(KnowledgeKind::Adr),
         text: None,
@@ -184,7 +201,7 @@ async fn get_project_knowledge(
     State(state): State<ApiState>,
     Query(query): Query<KnowledgeListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
     ensure_workspace_code_index(&state, &workspace_id)?;
     let adrs_query = KnowledgeQuery {
         kind: Some(KnowledgeKind::Adr),
@@ -257,7 +274,7 @@ async fn list_faqs(
     State(state): State<ApiState>,
     Query(query): Query<KnowledgeListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
     let query = KnowledgeQuery {
         kind: Some(KnowledgeKind::Faq),
         text: None,
@@ -275,7 +292,7 @@ async fn list_learnings(
     State(state): State<ApiState>,
     Query(query): Query<KnowledgeListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
     let query = KnowledgeQuery {
         kind: Some(KnowledgeKind::Learning),
         text: None,
@@ -307,7 +324,7 @@ fn ensure_workspace_code_index(
         .into_iter()
         .find(|workspace| workspace.workspace_id == *workspace_id)
     else {
-        return Ok(());
+        return Err(ApiError::not_found("工作区不存在", workspace_id.as_str()));
     };
 
     ingest_workspace_code_index_in_workspace(
@@ -337,7 +354,7 @@ async fn search_adrs(
     State(state): State<ApiState>,
     Query(query): Query<KnowledgeSearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
     Ok(search_knowledge(
         &state,
         KnowledgeKind::Adr,
@@ -350,7 +367,7 @@ async fn search_faqs(
     State(state): State<ApiState>,
     Query(query): Query<KnowledgeSearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
     Ok(search_knowledge(
         &state,
         KnowledgeKind::Faq,
@@ -363,7 +380,7 @@ async fn search_learnings(
     State(state): State<ApiState>,
     Query(query): Query<KnowledgeSearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = require_workspace_id(query.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
     Ok(search_knowledge(
         &state,
         KnowledgeKind::Learning,
@@ -421,7 +438,7 @@ async fn add_adr(
     State(state): State<ApiState>,
     Json(request): Json<AddAdrRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
     let id = format!("adr-{}", UtcMillis::now().0);
     let record = KnowledgeRecord {
         knowledge_id: id,
@@ -459,7 +476,7 @@ async fn update_adr(
     State(state): State<ApiState>,
     Json(request): Json<UpdateKnowledgeRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
     update_knowledge_record(&state, &workspace_id, &request.id, &request.updates)?;
     Ok(Json(mutation_response(&state, &workspace_id)))
 }
@@ -468,7 +485,7 @@ async fn update_faq(
     State(state): State<ApiState>,
     Json(request): Json<UpdateKnowledgeRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
     update_knowledge_record(&state, &workspace_id, &request.id, &request.updates)?;
     Ok(Json(mutation_response(&state, &workspace_id)))
 }
@@ -477,7 +494,7 @@ async fn update_learning(
     State(state): State<ApiState>,
     Json(request): Json<UpdateKnowledgeRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
     update_knowledge_record(&state, &workspace_id, &request.id, &request.updates)?;
     Ok(Json(mutation_response(&state, &workspace_id)))
 }
@@ -551,7 +568,7 @@ async fn add_faq(
     State(state): State<ApiState>,
     Json(request): Json<AddFaqRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
     let id = format!("faq-{}", UtcMillis::now().0);
     let record = KnowledgeRecord {
         knowledge_id: id,
@@ -588,7 +605,7 @@ async fn add_learning(
     State(state): State<ApiState>,
     Json(request): Json<AddLearningRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
     let content = normalize_learning_content(request.learning.content)?;
     let id = format!("learning-{}", UtcMillis::now().0);
     let record = KnowledgeRecord {
@@ -617,7 +634,7 @@ async fn delete_adr(
     State(state): State<ApiState>,
     Json(request): Json<DeleteKnowledgeRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
     state
         .knowledge_store
         .delete_in_workspace(&request.id, &workspace_id)
@@ -630,7 +647,7 @@ async fn delete_faq(
     State(state): State<ApiState>,
     Json(request): Json<DeleteKnowledgeRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
     state
         .knowledge_store
         .delete_in_workspace(&request.id, &workspace_id)
@@ -643,7 +660,7 @@ async fn delete_learning(
     State(state): State<ApiState>,
     Json(request): Json<DeleteKnowledgeRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_workspace_id(request.workspace_id.as_deref())?;
+    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
     state
         .knowledge_store
         .delete_in_workspace(&request.id, &workspace_id)
@@ -711,6 +728,17 @@ mod tests {
         });
     }
 
+    fn register_test_workspace(state: &ApiState, workspace_id: &WorkspaceId) {
+        let root = std::env::temp_dir().join(format!("magi-knowledge-{}", workspace_id.as_str()));
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new(root.to_string_lossy().to_string()),
+            )
+            .expect("workspace should register");
+    }
+
     #[tokio::test]
     async fn project_knowledge_returns_workspace_scoped_code_index() {
         let knowledge_store = KnowledgeStore::new();
@@ -719,6 +747,8 @@ mod tests {
         insert_code_index(&knowledge_store, &workspace_a, "src/a.rs");
         insert_code_index(&knowledge_store, &workspace_b, "src/b.rs");
         let state = state_with_knowledge_store(knowledge_store);
+        register_test_workspace(&state, &workspace_a);
+        register_test_workspace(&state, &workspace_b);
 
         let response = routes()
             .with_state(state)
@@ -738,6 +768,35 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_slice(&body).expect("payload should deserialize");
         assert_eq!(payload["codeIndex"]["files"][0]["path"], "src/a.rs");
+    }
+
+    #[tokio::test]
+    async fn project_knowledge_rejects_unknown_workspace() {
+        let knowledge_store = KnowledgeStore::new();
+        knowledge_store.upsert(KnowledgeRecord {
+            knowledge_id: "learning-global".to_string(),
+            kind: KnowledgeKind::Learning,
+            title: "Legacy global learning".to_string(),
+            content: "legacy global learning should stay hidden".to_string(),
+            tags: vec![],
+            workspace_id: None,
+            source_ref: None,
+            updated_at: UtcMillis::now(),
+        });
+        let state = state_with_knowledge_store(knowledge_store);
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/knowledge?workspaceId=workspace-missing")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

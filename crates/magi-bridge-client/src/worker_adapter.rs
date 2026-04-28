@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::base_adapter::{AdapterConfig, BaseAdapter, RoundResult, ToolExecutor};
+use crate::base_adapter::{
+    AdapterConfig, BaseAdapter, RoundResult, ToolExecutor, execute_tool_calls,
+};
 use crate::llm_types::{
     LlmContentBlock, LlmMessage, LlmMessageContent, LlmMessageParams, LlmResponse, LlmUsage,
 };
@@ -196,70 +198,94 @@ impl WorkerAdapter {
                 .unwrap_or_default()
                 .as_millis() as u64;
 
-            let result_blocks: Vec<LlmContentBlock> = response
-                .tool_calls
-                .iter()
-                .map(|tc| {
-                    let tool_info = ToolCallInfo {
-                        name: tc.name.clone(),
-                        arguments: tc.arguments.clone(),
-                    };
+            let mut result_blocks: Vec<Option<LlmContentBlock>> =
+                vec![None; response.tool_calls.len()];
+            let mut pending_tool_indices = Vec::new();
+            let mut pending_tool_infos = Vec::new();
+            let mut pending_tool_calls = Vec::new();
 
-                    if let Some(ref mut guard) = dup_guard {
-                        if guard.is_read_only_tool(&tc.name) {
-                            if let Some(reason) =
-                                guard.check_read_only_duplicate(&tool_info, now_ms)
-                            {
-                                duplicate_guard_blocks += 1;
-                                return LlmContentBlock::ToolResult {
-                                    tool_use_id: tc.id.clone(),
-                                    content: format!(
-                                        "[duplicate guard] 重复只读调用已拦截: {}",
-                                        reason
-                                    ),
-                                    is_error: false,
-                                };
-                            }
-                        }
+            for (tool_index, tc) in response.tool_calls.iter().enumerate() {
+                let tool_info = ToolCallInfo {
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                };
 
-                        if guard.is_write_dedup_tool(&tc.name) {
-                            if let Some(reason) =
-                                guard.check_failed_write_duplicate(&tool_info, now_ms)
-                            {
-                                duplicate_guard_blocks += 1;
-                                return LlmContentBlock::ToolResult {
-                                    tool_use_id: tc.id.clone(),
-                                    content: format!(
-                                        "[duplicate guard] 重复失败写入已拦截: {}",
-                                        reason
-                                    ),
-                                    is_error: true,
-                                };
-                            }
+                if let Some(ref mut guard) = dup_guard {
+                    if guard.is_read_only_tool(&tc.name) {
+                        if let Some(reason) = guard.check_read_only_duplicate(&tool_info, now_ms) {
+                            duplicate_guard_blocks += 1;
+                            result_blocks[tool_index] = Some(LlmContentBlock::ToolResult {
+                                tool_use_id: tc.id.clone(),
+                                content: format!(
+                                    "[duplicate guard] 重复只读调用已拦截: {}",
+                                    reason
+                                ),
+                                is_error: false,
+                            });
+                            continue;
                         }
                     }
 
-                    let result = tool_executor.execute(tc);
-
-                    if let Some(ref mut guard) = dup_guard {
-                        if result.is_error {
-                            guard.record_failed_write(&tool_info, &result.content, now_ms);
-                        } else if guard.is_read_only_tool(&tc.name) {
-                            guard.record_read_only_call(&tool_info, now_ms);
-                        } else if guard.is_write_dedup_tool(&tc.name) {
-                            guard.record_success_write(&tool_info, now_ms);
+                    if guard.is_write_dedup_tool(&tc.name) {
+                        if let Some(reason) = guard.check_failed_write_duplicate(&tool_info, now_ms)
+                        {
+                            duplicate_guard_blocks += 1;
+                            result_blocks[tool_index] = Some(LlmContentBlock::ToolResult {
+                                tool_use_id: tc.id.clone(),
+                                content: format!(
+                                    "[duplicate guard] 重复失败写入已拦截: {}",
+                                    reason
+                                ),
+                                is_error: true,
+                            });
+                            continue;
                         }
                     }
+                }
 
+                pending_tool_indices.push(tool_index);
+                pending_tool_infos.push(tool_info);
+                pending_tool_calls.push(tc.clone());
+            }
+
+            let pending_results = execute_tool_calls(&pending_tool_calls, tool_executor);
+            for ((tool_index, tool_info), result) in pending_tool_indices
+                .into_iter()
+                .zip(pending_tool_infos.into_iter())
+                .zip(pending_results.into_iter())
+            {
+                let tc = &response.tool_calls[tool_index];
+
+                if let Some(ref mut guard) = dup_guard {
                     if result.is_error {
-                        tool_error_count += 1;
+                        guard.record_failed_write(&tool_info, &result.content, now_ms);
+                    } else if guard.is_read_only_tool(&tc.name) {
+                        guard.record_read_only_call(&tool_info, now_ms);
+                    } else if guard.is_write_dedup_tool(&tc.name) {
+                        guard.record_success_write(&tool_info, now_ms);
                     }
+                }
 
-                    LlmContentBlock::ToolResult {
-                        tool_use_id: result.tool_call_id,
-                        content: result.content,
-                        is_error: result.is_error,
-                    }
+                if result.is_error {
+                    tool_error_count += 1;
+                }
+
+                result_blocks[tool_index] = Some(LlmContentBlock::ToolResult {
+                    tool_use_id: result.tool_call_id,
+                    content: result.content,
+                    is_error: result.is_error,
+                });
+            }
+
+            let result_blocks: Vec<LlmContentBlock> = result_blocks
+                .into_iter()
+                .enumerate()
+                .map(|(tool_index, block)| {
+                    block.unwrap_or_else(|| LlmContentBlock::ToolResult {
+                        tool_use_id: response.tool_calls[tool_index].id.clone(),
+                        content: "工具执行结果缺失".to_string(),
+                        is_error: true,
+                    })
                 })
                 .collect();
 

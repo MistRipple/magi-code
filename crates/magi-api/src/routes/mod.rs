@@ -112,11 +112,35 @@ async fn bootstrap(
     Query(query): Query<BootstrapQuery>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
     let requested_session_id = query.requested_session_id();
-    let workspace_id = query.requested_workspace_id();
+    let workspace_id = resolve_bootstrap_workspace_id(
+        &state,
+        query.requested_workspace_id(),
+        requested_session_id.as_ref(),
+    );
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         workspace_id.as_deref(),
         requested_session_id.as_ref(),
     )))
+}
+
+fn resolve_bootstrap_workspace_id(
+    state: &ApiState,
+    requested_workspace_id: Option<String>,
+    requested_session_id: Option<&SessionId>,
+) -> Option<String> {
+    if requested_workspace_id.is_some() {
+        return requested_workspace_id;
+    }
+    if let Some(session_id) = requested_session_id
+        && let Some(session) = state.session_store.session(session_id)
+        && let Some(workspace_id) = session_scope::session_workspace_id(state, &session)
+    {
+        return Some(workspace_id.to_string());
+    }
+    state
+        .workspace_registry
+        .active_workspace_id()
+        .map(|workspace_id| workspace_id.to_string())
 }
 
 async fn runtime_read_model(State(state): State<ApiState>) -> Json<RuntimeReadModelDto> {
@@ -549,6 +573,100 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_without_query_scopes_to_active_workspace_instead_of_global_current_session()
+    {
+        let state = test_state();
+        state
+            .workspace_registry
+            .register(
+                WorkspaceId::new("workspace-bootstrap-active"),
+                AbsolutePath::new("/tmp/workspace-bootstrap-active"),
+            )
+            .expect("active workspace should register first");
+        state
+            .workspace_registry
+            .register(
+                WorkspaceId::new("workspace-bootstrap-other"),
+                AbsolutePath::new("/tmp/workspace-bootstrap-other"),
+            )
+            .expect("other workspace should register");
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-bootstrap-active"),
+                "Active Workspace Session",
+                Some("workspace-bootstrap-active".to_string()),
+            )
+            .expect("active workspace session should create");
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-bootstrap-other"),
+                "Other Workspace Current Session",
+                Some("workspace-bootstrap-other".to_string()),
+            )
+            .expect("other workspace session should create and become global current");
+
+        let app = build_router(state);
+        let bootstrap = get_json(app, "/bootstrap").await;
+
+        assert_eq!(bootstrap["currentSession"], Value::Null);
+        let sessions = bootstrap["sessions"]
+            .as_array()
+            .expect("sessions should serialize as array");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "session-bootstrap-active");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_session_query_infers_session_workspace_when_workspace_missing() {
+        let state = test_state();
+        state
+            .workspace_registry
+            .register(
+                WorkspaceId::new("workspace-bootstrap-active"),
+                AbsolutePath::new("/tmp/workspace-bootstrap-active"),
+            )
+            .expect("active workspace should register first");
+        state
+            .workspace_registry
+            .register(
+                WorkspaceId::new("workspace-bootstrap-other"),
+                AbsolutePath::new("/tmp/workspace-bootstrap-other"),
+            )
+            .expect("other workspace should register");
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-bootstrap-active"),
+                "Active Workspace Session",
+                Some("workspace-bootstrap-active".to_string()),
+            )
+            .expect("active workspace session should create");
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-bootstrap-other"),
+                "Other Workspace Session",
+                Some("workspace-bootstrap-other".to_string()),
+            )
+            .expect("other workspace session should create");
+
+        let app = build_router(state);
+        let bootstrap = get_json(app, "/bootstrap?sessionId=session-bootstrap-other").await;
+
+        assert_eq!(
+            bootstrap["currentSession"]["sessionId"],
+            "session-bootstrap-other"
+        );
+        let sessions = bootstrap["sessions"]
+            .as_array()
+            .expect("sessions should serialize as array");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "session-bootstrap-other");
     }
 
     #[tokio::test]
@@ -1585,7 +1703,7 @@ mod tests {
             .timeline()
             .into_iter()
             .filter(|entry| {
-                entry.session_id == session_id
+                entry.session_id.as_str() == session_id.as_str()
                     && matches!(
                         entry.kind,
                         magi_session_store::TimelineEntryKind::AssistantMessage
@@ -4764,6 +4882,117 @@ mod tests {
         assert!(
             assistant_messages.is_empty(),
             "interrupted session action must not append assistant message from stale completion"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn regular_session_turn_interrupt_cancels_turn_and_discards_late_completion() {
+        let state = build_shadow_execution_state(
+            WorkerRuntime::new_compare,
+            Arc::new(DelayedModelBridgeClient {
+                delay: Duration::from_millis(200),
+                payload: "shadow-model::普通会话晚到回复".to_string(),
+            }),
+        );
+        let app = build_router(state.clone());
+        let session_id = SessionId::new("session-route-shadow");
+
+        let submit_app = app.clone();
+        let submit_handle = tokio::spawn(async move {
+            post_json(
+                submit_app,
+                "/api/session/turn",
+                json!({
+                    "sessionId": "session-route-shadow",
+                    "text": "ordinary interrupt delayed completion",
+                    "deepTask": false,
+                    "skillName": "",
+                    "images": [],
+                }),
+            )
+            .await
+        });
+
+        wait_for_condition(
+            Duration::from_secs(1),
+            Duration::from_millis(20),
+            || {
+                state
+                    .session_store
+                    .runtime_sidecar(&session_id)
+                    .and_then(|sidecar| sidecar.current_turn)
+                    .is_some_and(|turn| turn.status == "running")
+            },
+            "普通 session turn 应先进入 running 状态，才能验证中断",
+        )
+        .await;
+
+        let (interrupt_status, interrupt_body) = post_json(
+            app,
+            "/api/session/interrupt",
+            json!({
+                "sessionId": "session-route-shadow",
+            }),
+        )
+        .await;
+        assert_eq!(
+            interrupt_status,
+            StatusCode::OK,
+            "unexpected response body: {interrupt_body:?}"
+        );
+        assert_eq!(interrupt_body["interrupted"], true);
+
+        let (submit_status, submit_body) = submit_handle
+            .await
+            .expect("regular session turn submit should join successfully");
+        assert_eq!(
+            submit_status,
+            StatusCode::OK,
+            "unexpected response body: {submit_body:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(260)).await;
+
+        let turn = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("interrupted regular turn should remain inspectable");
+        assert_eq!(turn.status, "cancelled");
+        assert!(turn.completed_at.is_some());
+        assert!(
+            !turn.items.iter().any(|item| item.kind == "assistant_final"),
+            "late completion must not append assistant_final after session interrupt"
+        );
+
+        let assistant_messages = state
+            .session_store
+            .timeline()
+            .into_iter()
+            .filter(|entry| {
+                entry.session_id == session_id
+                    && matches!(
+                        entry.kind,
+                        magi_session_store::TimelineEntryKind::AssistantMessage
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            assistant_messages.is_empty(),
+            "interrupted regular turn must not append assistant message from stale completion"
+        );
+
+        let events = state.event_bus.snapshot().recent_events;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "session.turn.interrupted"),
+            "session interrupt should publish a terminal interrupted event"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event_type == "session.turn.completed"),
+            "interrupted regular turn must not later publish completed"
         );
     }
 

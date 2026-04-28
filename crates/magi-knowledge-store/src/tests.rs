@@ -268,6 +268,16 @@ fn query_filters_records_by_workspace_id() {
         source_ref: None,
         updated_at: UtcMillis(2),
     });
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "kb-global".to_string(),
+        kind: KnowledgeKind::Faq,
+        title: "Legacy Global".to_string(),
+        content: "legacy".to_string(),
+        tags: vec!["faq".to_string()],
+        workspace_id: None,
+        source_ref: None,
+        updated_at: UtcMillis(3),
+    });
 
     let scoped = store.query(&KnowledgeQuery {
         kind: None,
