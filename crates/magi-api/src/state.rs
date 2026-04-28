@@ -17,7 +17,7 @@ use magi_bridge_client::{
     BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerConfig,
     ModelBridgeClient, StdioMcpBridgeClient,
 };
-use magi_core::{SessionId, TaskId, UtcMillis};
+use magi_core::{SessionId, TaskId, UtcMillis, WorkspaceId};
 use magi_event_bus::InMemoryEventBus;
 use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
@@ -31,7 +31,7 @@ use magi_orchestrator::{
     task_store::TaskStore,
     task_worker_catalog::build_worker_catalog_for_roles,
 };
-use magi_session_store::SessionStore;
+use magi_session_store::{SessionRecord, SessionStore};
 use magi_tool_runtime::ToolRegistry;
 use magi_workspace::WorkspaceStore;
 use std::collections::HashMap;
@@ -728,7 +728,7 @@ impl ApiState {
     pub(crate) fn session_records_for_workspace(
         &self,
         workspace_id: Option<&str>,
-    ) -> Vec<magi_session_store::SessionRecord> {
+    ) -> Vec<SessionRecord> {
         let Some(workspace_id) = workspace_id
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -738,8 +738,17 @@ impl ApiState {
         self.session_store
             .sessions()
             .into_iter()
-            .filter(|session| session.workspace_id.as_deref() == Some(workspace_id))
+            .filter(|session| {
+                self.session_workspace_id(session)
+                    .as_ref()
+                    .map(|bound_workspace_id| bound_workspace_id.as_str())
+                    == Some(workspace_id)
+            })
             .collect()
+    }
+
+    pub(crate) fn session_workspace_id(&self, session: &SessionRecord) -> Option<WorkspaceId> {
+        session.workspace_id.as_deref().map(WorkspaceId::new)
     }
 
     pub fn runtime_read_model_dto(&self) -> RuntimeReadModelDto {
@@ -784,9 +793,18 @@ impl ApiState {
     }
 
     pub fn settings_snapshot_json(&self) -> serde_json::Value {
+        self.settings_snapshot_json_with_mcp_hydration(true)
+    }
+
+    pub fn settings_snapshot_json_with_mcp_hydration(
+        &self,
+        hydrate_mcp_servers: bool,
+    ) -> serde_json::Value {
         let mut snapshot = self.settings_store.public_snapshot();
         normalize_settings_snapshot_sections(&mut snapshot);
-        self.enrich_mcp_servers_with_connection_status(&mut snapshot);
+        if hydrate_mcp_servers {
+            self.enrich_mcp_servers_with_connection_status(&mut snapshot);
+        }
         serde_json::json!({
             "workerConfigs": object_section(&snapshot, "workerConfigs"),
             "orchestratorConfig": object_section(&snapshot, "orchestratorConfig"),
@@ -802,8 +820,8 @@ impl ApiState {
             "roleTemplates": builtin_role_templates(),
             "registryEngines": load_registry_engines(self),
             "registryAgents": resolve_registry_agents(self),
-            "bootstrapScope": "full",
-            "mcpServersHydrated": true,
+            "bootstrapScope": if hydrate_mcp_servers { "full" } else { "core" },
+            "mcpServersHydrated": hydrate_mcp_servers,
         })
     }
 
@@ -1151,12 +1169,27 @@ fn runtime_settings_from_snapshot(
 }
 
 fn normalize_wrapped_section_value(value: &mut serde_json::Value) {
-    let Some(object) = value.as_object() else {
-        return;
-    };
-    let nested = object.get("config").or_else(|| object.get("data")).cloned();
-    if let Some(nested) = nested {
-        *value = nested;
+    if let Some(object) = value.as_object() {
+        let nested = object.get("config").or_else(|| object.get("data")).cloned();
+        if let Some(nested) = nested {
+            *value = nested;
+        }
+    }
+    strip_scope_binding_fields(value);
+}
+
+fn strip_scope_binding_fields(value: &mut serde_json::Value) {
+    if let Some(object) = value.as_object_mut() {
+        for key in [
+            "workspaceId",
+            "workspace_id",
+            "workspacePath",
+            "workspace_path",
+            "sessionId",
+            "session_id",
+        ] {
+            object.remove(key);
+        }
     }
 }
 

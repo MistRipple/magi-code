@@ -115,12 +115,10 @@ export interface SafeguardRule {
 export interface MCPServer {
   id: string;
   name: string;
-  type: "stdio" | "sse" | "streamable-http";
+  type: "stdio";
   command?: string;
   args?: string[];
   env?: Record<string, string>;
-  url?: string;
-  headers?: Record<string, string>;
   enabled: boolean;
   connected?: boolean;
   health?: "connected" | "degraded" | "disconnected";
@@ -646,9 +644,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
   });
 
   // Tools Tab 状态 - MCP 服务器完整结构（与后端 MCPServerConfig 对齐）
-  let mcpServers = <MCPServer[]>[];
-  let mcpServersHydrated = true;
-  let mcpServersLoading = false;
+  let mcpServers = $state<MCPServer[]>([]);
+  let mcpServersHydrated = $state(true);
+  let mcpServersLoading = $state(false);
   let mcpExpandedServer = $state<string | null>(null);
   let mcpServerTools = $state<
     Record<
@@ -1051,6 +1049,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
     applyOrchestratorConfig(payload.orchestratorConfig);
     applyAuxiliaryConfig(payload.auxiliaryConfig);
     applyMcpServersPayload(payload.mcpServers);
+    mcpServersHydrated = payload.mcpServersHydrated !== false;
+    mcpServersLoading = false;
     applyBuiltinToolsPayload(payload.builtinTools);
     applySkillsConfig(payload.skillsConfig);
     applyRepositoriesPayload(payload.repositories);
@@ -1078,7 +1078,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   async function refreshSettingsBootstrapFromApi(): Promise<void> {
     try {
-      const payload = await getAgentSettingsBootstrap();
+      const payload = await getAgentSettingsBootstrap({ scope: "core" });
       applySettingsBootstrapPayload(payload);
     } catch (e) {
       console.error("[SettingsPanel] 加载设置数据失败:", e);
@@ -1287,11 +1287,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     };
     try {
       const result = await upsertAgentRegistryBinding(updated);
-      if (Array.isArray((result as any)?.agents)) {
-        registryAgents = (result as any).agents;
-      } else {
-        await loadRegistryData();
-      }
+      registryAgents = result;
       syncEnabledAgentsToStore();
       notifySettingsSuccess(enabled ? "角色已启用" : "角色已暂停");
     } catch (e) {
@@ -1319,11 +1315,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     };
     try {
       const result = await upsertAgentRegistryBinding(updated);
-      if (Array.isArray((result as any)?.agents)) {
-        registryAgents = (result as any).agents;
-      } else {
-        await loadRegistryData();
-      }
+      registryAgents = result;
       syncEnabledAgentsToStore();
       notifySettingsSuccess("角色绑定已更新", { displayMode: "notification_center" });
     } catch (e) {
@@ -1404,7 +1396,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
     vscode.postMessage({ type: "logout" });
   }
 
-  function closeSettings() {
+  async function closeSettings() {
+    await flushUserRulesSave();
     // 关闭面板前清理所有未保存的引擎（只存在于前端的幽灵引擎）
     for (const engineId of unsavedEngines) {
       purgeEngineFromFrontend(engineId);
@@ -1416,12 +1409,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     await loadRegistryData();
   }
 
-  async function saveUserRulesNow(value = userRules) {
+  async function saveUserRulesNow(value = userRules, saveVersion = ++userRulesSaveVersion, force = false) {
     const normalized = value;
-    if (normalized === persistedUserRules) {
+    if (!force && normalized === persistedUserRules) {
+      userRulesSaveStatus = "idle";
       return;
     }
-    const saveVersion = ++userRulesSaveVersion;
     userRulesSaveStatus = "saving";
     try {
       const result = await saveAgentUserRules({ userRules: normalized });
@@ -1445,17 +1438,33 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   function scheduleUserRulesSave(value = userRules) {
-    if (value === persistedUserRules) {
-      return;
-    }
+    const hadUnsettledSave =
+      userRulesSaveTimer !== null || userRulesSaveStatus === "saving";
     if (userRulesSaveTimer) {
       clearTimeout(userRulesSaveTimer);
+      userRulesSaveTimer = null;
+    }
+    const saveVersion = ++userRulesSaveVersion;
+    const forceSave = hadUnsettledSave && value === persistedUserRules;
+    if (!forceSave && value === persistedUserRules) {
+      userRulesSaveStatus = "idle";
+      return;
     }
     userRulesSaveStatus = "saving";
     userRulesSaveTimer = setTimeout(() => {
       userRulesSaveTimer = null;
-      void saveUserRulesNow(value);
+      void saveUserRulesNow(value, saveVersion, forceSave);
     }, 700);
+  }
+
+  async function flushUserRulesSave(): Promise<void> {
+    if (userRulesSaveTimer) {
+      clearTimeout(userRulesSaveTimer);
+      userRulesSaveTimer = null;
+    }
+    if (userRules !== persistedUserRules || userRulesSaveStatus === "saving") {
+      await saveUserRulesNow(userRules, ++userRulesSaveVersion, userRulesSaveStatus === "saving");
+    }
   }
 
   async function testModelConnection(
@@ -1542,6 +1551,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
       notifySettingsInfo(
         blockReason === "full_url_mode"
           ? i18n.t("config.toast.modelListUnsupportedInFullMode")
+          : blockReason === "endpoint_base_url"
+            ? i18n.t("config.toast.modelListEndpointBaseUrl")
           : blockReason === "unsupported_provider"
             ? i18n.t("config.toast.modelListUnsupportedProvider")
             : i18n.t("config.toast.fillBaseUrlFirst"),
@@ -1717,9 +1728,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
       if (server.args && server.args.length > 0) cfg.args = server.args;
       if (server.env && Object.keys(server.env).length > 0)
         cfg.env = server.env;
-      if (server.url) cfg.url = server.url;
-      if (server.headers && Object.keys(server.headers).length > 0)
-        cfg.headers = server.headers;
       defaultJSON = JSON.stringify(
         { mcpServers: { [server.name]: cfg } },
         null,
@@ -1806,56 +1814,33 @@ function createSettingsStore(props: { onClose?: () => void }) {
       }
 
       const command = String(cfg.command || "").trim();
-      const url = String(cfg.url || "").trim();
 
-      // command 和 url 至少要有一个
-      if (!command && !url) {
-        mcpDialogError = i18n.t("settings.mcp.missingCommandOrUrl", { name });
+      if (!command) {
+        mcpDialogError = i18n.t("settings.mcp.missingCommand", { name });
         return false;
       }
 
-      let serverData: any;
-
-      if (url) {
-        // HTTP (SSE / Streamable HTTP) 类型
-        const headers = cfg.headers ?? {};
-        if (typeof headers !== "object" || Array.isArray(headers)) {
-          mcpDialogError = i18n.t("settings.mcp.headersMustBeObject", { name });
-          return false;
-        }
-
-        serverData = {
-          id: name,
-          name,
-          url,
-          headers: Object.keys(headers).length > 0 ? headers : undefined,
-          enabled: cfg.enabled !== false,
-          type: "streamable-http",
-        };
-      } else {
-        // stdio 类型
-        const args = cfg.args ?? [];
-        if (!Array.isArray(args)) {
-          mcpDialogError = i18n.t("settings.mcp.argsMustBeArray", { name });
-          return false;
-        }
-
-        const env = cfg.env ?? {};
-        if (typeof env !== "object" || Array.isArray(env)) {
-          mcpDialogError = i18n.t("settings.mcp.envMustBeObject", { name });
-          return false;
-        }
-
-        serverData = {
-          id: name,
-          name,
-          command,
-          args,
-          env,
-          enabled: cfg.enabled !== false,
-          type: "stdio",
-        };
+      const args = cfg.args ?? [];
+      if (!Array.isArray(args)) {
+        mcpDialogError = i18n.t("settings.mcp.argsMustBeArray", { name });
+        return false;
       }
+
+      const env = cfg.env ?? {};
+      if (typeof env !== "object" || Array.isArray(env)) {
+        mcpDialogError = i18n.t("settings.mcp.envMustBeObject", { name });
+        return false;
+      }
+
+      const serverData: any = {
+        id: name,
+        name,
+        command,
+        args,
+        env,
+        enabled: cfg.enabled !== false,
+        type: "stdio",
+      };
 
       if (isUpdate && currentEditingMCPServer) {
         await updateAgentMcpServer(currentEditingMCPServer.id, {
@@ -2350,6 +2335,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
   >([]);
 
   function applyUserRulesConfig(config: any): void {
+    if (
+      userRulesSaveTimer
+      || userRulesSaveStatus === "saving"
+      || userRules !== persistedUserRules
+    ) {
+      return;
+    }
     userRules = typeof config?.userRules === "string" ? config.userRules : "";
     persistedUserRules = userRules;
     userRulesSaveStatus = "idle";
@@ -2441,12 +2433,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
       return {
         id,
         name,
-        type: s.type || "stdio",
+        type: "stdio",
         command: s.command || "",
         args: s.args || [],
         env: s.env || {},
-        url: s.url || "",
-        headers: s.headers || {},
         enabled: s.enabled !== false,
         connected: s.connected === true,
         health:

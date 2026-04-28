@@ -185,7 +185,7 @@
                       </div>
                       <div class="identity-stack">
                         <span class="main-label">{server.name}</span>
-                        <span style="font-size: 10px; color: var(--foreground-muted); font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px;">{server.type === 'stdio' ? (server.command || '') : (server.url || '')}</span>
+                        <span style="font-size: 10px; color: var(--foreground-muted); font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px;">{server.command || ''}</span>
                       </div>
                     </div>
                     <div class="header-action" style="display: flex; align-items: center; gap: 6px;">

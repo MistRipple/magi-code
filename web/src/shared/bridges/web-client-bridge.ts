@@ -2233,8 +2233,69 @@ function openPreviewWindow(title: string, subtitle: string, content: string, mod
   popup.document.close();
 }
 
-function openMermaidPreview(code: string, title?: string): void {
-  openPreviewWindow(title?.trim() || 'Mermaid 图表', 'Mermaid 源码预览', code, 'file');
+function sanitizeMermaidSvgContent(svgContent: string): string {
+  const trimmed = svgContent.trim();
+  if (!trimmed) {
+    return '';
+  }
+  const template = document.createElement('template');
+  template.innerHTML = trimmed;
+  const svg = template.content.querySelector('svg');
+  if (!svg) {
+    return '';
+  }
+  svg.querySelectorAll('script, foreignObject').forEach((node) => node.remove());
+  [svg, ...Array.from(svg.querySelectorAll('*'))].forEach((element) => {
+    for (const attribute of Array.from(element.attributes)) {
+      const name = attribute.name.toLowerCase();
+      const value = attribute.value.trim().toLowerCase();
+      if (name.startsWith('on') || value.startsWith('javascript:')) {
+        element.removeAttribute(attribute.name);
+      }
+    }
+  });
+  return svg.outerHTML;
+}
+
+function openMermaidSvgPreview(title: string, svgContent: string): void {
+  const popup = window.open('', '_blank', 'noopener,noreferrer');
+  if (!popup) {
+    throw new Error('浏览器阻止了预览窗口，请允许当前站点打开新窗口。');
+  }
+  const escapedTitle = escapePreviewHtml(title);
+  popup.document.write(`<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapedTitle}</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { margin: 0; min-height: 100vh; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f172a; color: #e2e8f0; }
+    .wrap { min-height: 100vh; display: flex; flex-direction: column; padding: 20px; box-sizing: border-box; }
+    .title { font-size: 20px; font-weight: 700; margin: 0 0 16px; }
+    .diagram { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: auto; padding: 16px; border: 1px solid rgba(148,163,184,.18); border-radius: 12px; background: #111827; }
+    .diagram svg { max-width: 100%; height: auto; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1 class="title">${escapedTitle}</h1>
+    <div class="diagram">${svgContent}</div>
+  </div>
+</body>
+</html>`);
+  popup.document.close();
+}
+
+function openMermaidPreview(code: string, title?: string, svgContent?: string): void {
+  const resolvedTitle = title?.trim() || 'Mermaid 图表';
+  const sanitizedSvg = typeof svgContent === 'string' ? sanitizeMermaidSvgContent(svgContent) : '';
+  if (sanitizedSvg) {
+    openMermaidSvgPreview(resolvedTitle, sanitizedSvg);
+    return;
+  }
+  openPreviewWindow(resolvedTitle, 'Mermaid 源码预览', code, 'file');
 }
 
 async function openFilePreview(filePath: string, previewContent?: string): Promise<void> {
@@ -2430,6 +2491,8 @@ async function fetchModelList(config: Record<string, unknown>, target: string): 
       '获取模型列表',
       blockReason === 'full_url_mode'
         ? '完整路径模式下不支持自动获取模型列表，请手动填写模型名'
+        : blockReason === 'endpoint_base_url'
+          ? '当前 Base URL 是对话执行端点，请改为服务根地址或 /v1 后再获取模型列表'
         : blockReason === 'unsupported_provider'
           ? '当前 provider 不支持自动获取模型列表，请手动填写模型名'
           : '请先填写 Base URL 和 API Key',
@@ -3011,7 +3074,11 @@ export function createWebClientBridge(): ClientBridge {
             return;
           }
           if (typeof message.code === 'string' && message.code.trim()) {
-            openMermaidPreview(message.code, typeof message.title === 'string' ? message.title : undefined);
+            openMermaidPreview(
+              message.code,
+              typeof message.title === 'string' ? message.title : undefined,
+              typeof message.svgContent === 'string' ? message.svgContent : undefined,
+            );
           }
           return;
         case 'openFile':

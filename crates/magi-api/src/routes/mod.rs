@@ -208,8 +208,9 @@ mod tests {
     };
     use magi_context_runtime::{ContextBudget, ContextRuntime};
     use magi_core::{
-        AbsolutePath, DecisionOption, DecisionTaskPayload, EventId, ExecutionOwnership, LeaseId,
-        MissionId, SessionId, Task, TaskId, TaskKind, TaskStatus, UtcMillis, WorkerId, WorkspaceId,
+        AbsolutePath, DecisionOption, DecisionTaskPayload, EventId, ExecutionOwnership,
+        ExecutorBinding, LeaseId, MissionId, SessionId, Task, TaskId, TaskKind, TaskStatus,
+        UtcMillis, WorkerId, WorkspaceId,
     };
     use magi_event_bus::{EventEnvelope, InMemoryEventBus};
     use magi_governance::GovernanceService;
@@ -924,7 +925,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_turn_downgrades_model_task_route_without_task_signal() {
+    async fn session_turn_uses_model_task_route_without_frontend_task_signal() {
         let state = build_shadow_execution_state(
             WorkerRuntime::new_compare,
             Arc::new(TaskRouteClassifierModelBridgeClient),
@@ -944,15 +945,14 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::OK, "误判任务应降级为普通对话: {body:?}");
-        assert_eq!(body["route"], "chat");
+        assert_eq!(status, StatusCode::OK, "模型判定 task 应创建任务图: {body:?}");
+        assert_eq!(body["route"], "task");
+        let root_task_id = body["rootTaskId"]
+            .as_str()
+            .expect("模型判定 task 应返回 root task id");
         assert!(
-            body.get("rootTaskId").is_none(),
-            "降级后的普通对话不能暴露任务根 ID: {body:?}"
-        );
-        assert!(
-            body.get("actionTaskId").is_none(),
-            "降级后的普通对话不能暴露 action task ID: {body:?}"
+            body["actionTaskId"].as_str().is_some(),
+            "模型判定 task 应返回 action task id: {body:?}"
         );
 
         wait_for_condition(
@@ -972,13 +972,14 @@ mod tests {
         )
         .await;
 
-        let runtime_read_model = get_json(app, "/runtime/read-model").await;
+        let runtime_read_model = get_json(app.clone(), "/runtime/read-model").await;
         assert!(
             runtime_read_model["details"]["tasks"]
                 .as_array()
                 .expect("tasks should serialize as array")
-                .is_empty(),
-            "没有任务准入信号时，模型误判 task 也不能创建 TaskStore 任务"
+                .iter()
+                .any(|task| task["task_id"] == root_task_id),
+            "模型判定 task 后 TaskStore 应包含 root task"
         );
         let session_summary = runtime_read_model["details"]["sessions"]
             .as_array()
@@ -986,8 +987,14 @@ mod tests {
             .iter()
             .find(|session| session["session_id"] == "session-route-shadow")
             .expect("chat session should exist in read model");
-        assert_eq!(session_summary["current_turn"]["mission_id"], Value::Null);
-        assert_eq!(session_summary["current_turn"]["root_task_id"], Value::Null);
+        assert_eq!(session_summary["current_turn"]["root_task_id"], root_task_id);
+
+        let projection = get_json(
+            app,
+            &format!("/api/tasks/graph/{root_task_id}?sessionId=session-route-shadow"),
+        )
+        .await;
+        assert_eq!(projection["root_task"]["task_id"], root_task_id);
     }
 
     #[tokio::test]

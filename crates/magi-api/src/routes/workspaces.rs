@@ -143,22 +143,15 @@ async fn workspace_sessions(
     State(state): State<ApiState>,
     Query(query): Query<WorkspaceSessionsQuery>,
 ) -> Json<WorkspaceSessionsResponse> {
-    let sessions = state.session_store.sessions();
     let workspace_id = query
         .workspace_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let session_matches_workspace = |session: &magi_session_store::SessionRecord| {
-        let Some(workspace_id) = workspace_id else {
-            return true;
-        };
-        session.workspace_id.as_deref() == Some(workspace_id)
-    };
 
-    let mut scoped_sessions = sessions
+    let mut scoped_sessions = state
+        .session_records_for_workspace(workspace_id)
         .iter()
-        .filter(|session| session_matches_workspace(session))
         .map(|session| WorkspaceSessionDto {
             session_id: session.session_id.to_string(),
             title: session.title.clone(),

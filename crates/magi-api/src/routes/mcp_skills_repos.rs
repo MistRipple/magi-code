@@ -86,6 +86,17 @@ fn normalize_mcp_server_entry(request: &serde_json::Value) -> Result<serde_json:
     {
         entry.insert("name".to_string(), serde_json::json!(server_id));
     }
+    let command = entry
+        .get("command")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| ApiError::InvalidInput("MCP server 配置中缺少 command".to_string()))?;
+    entry.insert("command".to_string(), serde_json::json!(command));
+    entry.insert("type".to_string(), serde_json::json!("stdio"));
+    entry.remove("url");
+    entry.remove("headers");
     Ok(serde_json::Value::Object(entry))
 }
 
@@ -1191,4 +1202,44 @@ async fn download_github_skill(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_mcp_server_entry_rejects_url_only_server() {
+        let error = normalize_mcp_server_entry(&serde_json::json!({
+            "id": "remote-server",
+            "url": "https://example.test/mcp"
+        }))
+        .expect_err("当前运行时没有 HTTP MCP client，不应保存 URL-only 配置");
+
+        match error {
+            ApiError::InvalidInput(message) => {
+                assert!(message.contains("缺少 command"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_mcp_server_entry_canonicalizes_stdio_server() {
+        let entry = normalize_mcp_server_entry(&serde_json::json!({
+            "id": "stdio-server",
+            "command": " npx ",
+            "url": "https://example.test/mcp",
+            "headers": { "Authorization": "Bearer test" },
+            "type": "streamable-http"
+        }))
+        .expect("stdio MCP server should normalize");
+
+        assert_eq!(entry["id"], serde_json::json!("stdio-server"));
+        assert_eq!(entry["serverId"], serde_json::json!("stdio-server"));
+        assert_eq!(entry["command"], serde_json::json!("npx"));
+        assert_eq!(entry["type"], serde_json::json!("stdio"));
+        assert!(entry.get("url").is_none());
+        assert!(entry.get("headers").is_none());
+    }
 }

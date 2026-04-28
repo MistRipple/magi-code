@@ -19,7 +19,7 @@ pub(super) fn require_session_record_in_workspace(
         .session_store
         .session(session_id)
         .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
-    require_session_workspace_match(&session, requested_workspace_id)?;
+    require_session_workspace_match(state, &session, requested_workspace_id)?;
     Ok(session)
 }
 
@@ -31,7 +31,7 @@ pub(super) fn require_current_session_record_in_workspace(
         .session_store
         .current_session()
         .ok_or_else(|| ApiError::InvalidInput("当前没有活动 session".to_string()))?;
-    require_session_workspace_match(&session, requested_workspace_id)?;
+    require_session_workspace_match(state, &session, requested_workspace_id)?;
     Ok(session)
 }
 
@@ -39,16 +39,7 @@ pub(super) fn session_workspace_id(
     state: &ApiState,
     session: &SessionRecord,
 ) -> Option<WorkspaceId> {
-    session
-        .workspace_id
-        .as_deref()
-        .map(WorkspaceId::new)
-        .or_else(|| {
-            state
-                .session_store
-                .execution_ownership(&session.session_id)
-                .and_then(|ownership| ownership.workspace_id)
-        })
+    state.session_workspace_id(session)
 }
 
 pub(super) fn resolve_session_workspace_binding(
@@ -76,11 +67,15 @@ fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {
 }
 
 fn require_session_workspace_match(
+    state: &ApiState,
     session: &SessionRecord,
     requested_workspace_id: Option<&str>,
 ) -> Result<(), ApiError> {
     if let Some(requested_workspace_id) = trimmed_non_empty(requested_workspace_id)
-        && session.workspace_id.as_deref() != Some(requested_workspace_id)
+        && session_workspace_id(state, session)
+            .as_ref()
+            .map(|workspace_id| workspace_id.as_str())
+            != Some(requested_workspace_id)
     {
         return Err(session_workspace_mismatch(
             &session.session_id,

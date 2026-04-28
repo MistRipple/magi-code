@@ -250,30 +250,13 @@ fn decide_session_turn_with_task_planner(
             "Session Turn 分类器返回失败状态".to_string(),
         ));
     }
-    let mut decision = parse_session_turn_decision(&response.payload)?;
+    let decision = parse_session_turn_decision(&response.payload)?;
     if matches!(decision.route, SessionTurnRouteDto::Continue) && !has_recoverable_chain {
         return Err(ApiError::InvalidInput(
             "当前会话没有可继续的执行链".to_string(),
         ));
     }
-    if matches!(decision.route, SessionTurnRouteDto::Task) && !request_allows_task_route(request) {
-        decision.route = SessionTurnRouteDto::Chat;
-        decision.task_title = None;
-        decision.execution_goal = None;
-        decision.required_workers.clear();
-        decision.tool_intent = None;
-    }
     Ok(decision)
-}
-
-fn request_allows_task_route(request: &SessionTurnRequestDto) -> bool {
-    request.deep_task
-        || request
-            .skill_name
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-        || !request.images.is_empty()
 }
 
 fn session_has_recoverable_chain(state: &ApiState, session_id: &SessionId) -> bool {
@@ -1126,8 +1109,12 @@ async fn delete_session(
         require_session_record_in_workspace(&state, &session_id, request.requested_workspace_id())?;
     let response_workspace_id = request
         .requested_workspace_id()
-        .or(session.workspace_id.as_deref())
-        .map(str::to_string);
+        .map(str::to_string)
+        .or_else(|| {
+            state
+                .session_workspace_id(&session)
+                .map(|workspace_id| workspace_id.to_string())
+        });
     state
         .session_store
         .delete_session(&session_id)
@@ -1163,8 +1150,12 @@ async fn rename_session(
         require_session_record_in_workspace(&state, &session_id, request.requested_workspace_id())?;
     let response_workspace_id = request
         .requested_workspace_id()
-        .or(session.workspace_id.as_deref())
-        .map(str::to_string);
+        .map(str::to_string)
+        .or_else(|| {
+            state
+                .session_workspace_id(&session)
+                .map(|workspace_id| workspace_id.to_string())
+        });
     state
         .session_store
         .rename_session(&session_id, &request.name)
@@ -1199,8 +1190,12 @@ async fn close_session(
         require_session_record_in_workspace(&state, &session_id, request.requested_workspace_id())?;
     let response_workspace_id = request
         .requested_workspace_id()
-        .or(session.workspace_id.as_deref())
-        .map(str::to_string);
+        .map(str::to_string)
+        .or_else(|| {
+            state
+                .session_workspace_id(&session)
+                .map(|workspace_id| workspace_id.to_string())
+        });
     state
         .session_store
         .archive_session(&session_id)
@@ -1265,6 +1260,7 @@ async fn get_notifications(
     Ok(Json(build_notifications_response(
         &state,
         session_id.as_ref(),
+        query.requested_workspace_id(),
     )))
 }
 
@@ -1349,6 +1345,7 @@ async fn append_session_notification(
         return Ok(Json(build_notifications_response(
             &state,
             Some(&session_id),
+            request.requested_workspace_id(),
         )));
     }
     let message = trimmed_non_empty(Some(request.message.as_str()))
@@ -1381,6 +1378,7 @@ async fn append_session_notification(
     Ok(Json(build_notifications_response(
         &state,
         Some(&session_id),
+        request.requested_workspace_id(),
     )))
 }
 
@@ -1400,6 +1398,7 @@ async fn mark_all_notifications_read(
     Ok(Json(build_notifications_response(
         &state,
         Some(&session_id),
+        request.requested_workspace_id(),
     )))
 }
 
@@ -1437,6 +1436,7 @@ async fn clear_notifications(
     Ok(Json(build_notifications_response(
         &state,
         Some(&session_id),
+        request.requested_workspace_id(),
     )))
 }
 
@@ -1486,19 +1486,27 @@ async fn remove_notification(
     Ok(Json(build_notifications_response(
         &state,
         Some(&session_id),
+        request.requested_workspace_id(),
     )))
 }
 
 fn build_notifications_response(
     state: &ApiState,
     session_id: Option<&SessionId>,
+    requested_workspace_id: Option<&str>,
 ) -> SessionNotificationsResponseDto {
+    let workspace_id = session_id
+        .and_then(|session_id| state.session_store.session(session_id))
+        .and_then(|session| session_workspace_id(state, &session))
+        .map(|workspace_id| workspace_id.to_string())
+        .or_else(|| trimmed_non_empty(requested_workspace_id).map(str::to_string));
     match session_id {
         Some(session_id) => SessionNotificationsResponseDto::from_records(
             session_id,
+            workspace_id,
             state.session_store.notifications_for_session(session_id),
         ),
-        None => SessionNotificationsResponseDto::empty(None),
+        None => SessionNotificationsResponseDto::empty(None, workspace_id),
     }
 }
 
@@ -1517,7 +1525,10 @@ fn resolve_notifications_session_id(
         return Ok(None);
     };
     if let Some(workspace_id) = requested_workspace_id
-        && current_session.workspace_id.as_deref() != Some(workspace_id)
+        && session_workspace_id(state, &current_session)
+            .as_ref()
+            .map(|current_workspace_id| current_workspace_id.as_str())
+            != Some(workspace_id)
     {
         return Ok(None);
     }
@@ -1554,7 +1565,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use magi_core::UtcMillis;
+    use magi_core::{ExecutionOwnership, UtcMillis, WorkspaceId};
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_session_store::SessionStore;
@@ -1946,6 +1957,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notifications_workspace_query_uses_execution_ownership_for_current_session() {
+        let state = test_state();
+        let session_id = SessionId::new("session-notification-owned-current");
+        state
+            .session_store
+            .create_session(session_id.clone(), "ownership 绑定当前会话")
+            .expect("session should create");
+        state.session_store.bind_execution_ownership(
+            session_id.clone(),
+            ExecutionOwnership {
+                session_id: Some(session_id.clone()),
+                workspace_id: Some(WorkspaceId::new("workspace-owned-notifications")),
+                ..ExecutionOwnership::default()
+            },
+        );
+        state.session_store.append_notification(
+            session_id.clone(),
+            "notification-owned-current",
+            "incident",
+            "应按 execution ownership 归属加载",
+        );
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/session/notifications?workspaceId=workspace-owned-notifications")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        let status = response.status();
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should read"),
+        )
+        .expect("response should be json");
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["sessionId"], session_id.as_str());
+        assert_eq!(body["workspaceId"], "workspace-owned-notifications");
+        assert_eq!(
+            body["notifications"]["records"]
+                .as_array()
+                .expect("records should be array")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn mark_all_notifications_read_rejects_workspace_mismatched_session() {
         let state = test_state();
         let session_id = SessionId::new("session-notification-workspace-a");
@@ -2001,6 +2065,92 @@ mod tests {
         assert_eq!(
             state.session_store.notifications_for_session(&session_id)[0].handled,
             false
+        );
+    }
+
+    #[tokio::test]
+    async fn notifications_actions_accept_execution_owned_unbound_workspace_session() {
+        let state = test_state();
+        let session_id = SessionId::new("session-notification-owned-actions");
+        state
+            .session_store
+            .create_session(session_id.clone(), "ownership 绑定通知操作")
+            .expect("session should create");
+        state.session_store.bind_execution_ownership(
+            session_id.clone(),
+            ExecutionOwnership {
+                session_id: Some(session_id.clone()),
+                workspace_id: Some(WorkspaceId::new("workspace-owned-actions")),
+                ..ExecutionOwnership::default()
+            },
+        );
+        for notification_id in ["notification-owned-read", "notification-owned-remove"] {
+            state.session_store.append_notification(
+                session_id.clone(),
+                notification_id,
+                "incident",
+                "应允许归属 workspace 的通知操作",
+            );
+        }
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/notifications/mark-all-read",
+            serde_json::json!({
+                "workspaceId": "workspace-owned-actions",
+                "sessionId": session_id.as_str(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["workspaceId"], "workspace-owned-actions");
+        assert!(
+            state
+                .session_store
+                .notifications_for_session(&session_id)
+                .iter()
+                .all(|notification| notification.handled)
+        );
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/notifications/remove",
+            serde_json::json!({
+                "workspaceId": "workspace-owned-actions",
+                "sessionId": session_id.as_str(),
+                "notificationId": "notification-owned-remove",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        let records = body["notifications"]["records"]
+            .as_array()
+            .expect("records should be array");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["notificationId"], "notification-owned-read");
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/notifications/clear",
+            serde_json::json!({
+                "workspaceId": "workspace-owned-actions",
+                "sessionId": session_id.as_str(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(
+            body["notifications"]["records"]
+                .as_array()
+                .expect("records should be array")
+                .len(),
+            0
+        );
+        assert!(
+            state
+                .session_store
+                .notifications_for_session(&session_id)
+                .is_empty()
         );
     }
 

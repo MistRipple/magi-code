@@ -321,6 +321,7 @@
     postMessage({
       type: 'openMermaidPanel',
       code: code,
+      svgContent,
       title: extractedTitle || typeDisplayName
     });
   }
@@ -337,10 +338,10 @@
       {/if}
     </div>
     <div class="header-actions">
-      <button class="header-btn" onclick={copySvg} title={i18n.t('mermaidRenderer.copySvg')}>
+      <button class="header-btn" onclick={copySvg} disabled={isRendering || !!error || !svgContent} title={i18n.t('mermaidRenderer.copySvg')}>
         <Icon name="copy" size={14} />
       </button>
-      <button class="header-btn" onclick={openInNewTab} title={i18n.t('mermaidRenderer.openInNewTab')}>
+      <button class="header-btn" onclick={openInNewTab} disabled={isRendering || !!error || !svgContent} title={i18n.t('mermaidRenderer.openInNewTab')}>
         <Icon name="external-link" size={14} />
       </button>
     </div>
@@ -469,6 +470,16 @@
   .header-btn:hover {
     background: var(--surface-hover);
     color: var(--foreground);
+  }
+
+  .header-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+
+  .header-btn:disabled:hover {
+    background: transparent;
+    color: var(--foreground-muted);
   }
 
   .mermaid-content {

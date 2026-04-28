@@ -606,6 +606,7 @@ fn append_final_item(
         &request.session_id,
         Some(final_content),
         streaming_entry_id,
+        None,
     )
     .unwrap_or_else(|| final_content.to_string());
     let fallback_entry_id = session_store

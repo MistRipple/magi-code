@@ -62,9 +62,11 @@ async fn get_messages(
         None => require_current_session_record_in_workspace(&state, requested_workspace_id)?,
     };
     let session_id = current_session.session_id.clone();
-    let scope_workspace_id = requested_workspace_id
-        .map(str::to_string)
-        .or_else(|| current_session.workspace_id.clone());
+    let scope_workspace_id = requested_workspace_id.map(str::to_string).or_else(|| {
+        state
+            .session_workspace_id(&current_session)
+            .map(|workspace_id| workspace_id.to_string())
+    });
 
     let timeline = state.session_store.timeline_for_session(&session_id);
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
@@ -95,4 +97,179 @@ async fn get_messages(
         has_more_before: start > 0,
         before_cursor,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use magi_core::{ExecutionOwnership, SessionId, UtcMillis, WorkspaceId};
+    use magi_event_bus::InMemoryEventBus;
+    use magi_governance::GovernanceService;
+    use magi_session_store::{
+        SessionDurableState, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
+        SessionRuntimeSidecar, SessionStore, TimelineEntryKind,
+    };
+    use magi_workspace::WorkspaceStore;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn test_state(session_store: SessionStore) -> ApiState {
+        ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(session_store),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+    }
+
+    #[tokio::test]
+    async fn messages_reject_sidecar_only_workspace_binding() {
+        let session_id = SessionId::new("session-messages-sidecar-only");
+        let now = UtcMillis::now();
+        let store = SessionStore::from_persisted_parts(
+            SessionDurableState {
+                current_session_id: Some(session_id.clone()),
+                sessions: vec![SessionRecord {
+                    session_id: session_id.clone(),
+                    title: "仅执行侧归属".to_string(),
+                    status: magi_core::SessionLifecycleStatus::Active,
+                    created_at: now,
+                    updated_at: now,
+                    message_count: None,
+                    workspace_id: None,
+                }],
+                timeline: Vec::new(),
+                notifications: Vec::new(),
+            },
+            SessionExecutionSidecarStoreState {
+                runtime_sidecars: vec![SessionRuntimeSidecar {
+                    session_id: session_id.clone(),
+                    ownership: ExecutionOwnership {
+                        workspace_id: Some(WorkspaceId::new("workspace-sidecar-only")),
+                        ..ExecutionOwnership::default()
+                    },
+                    recovery_id: None,
+                    current_turn: None,
+                    active_execution_chain: None,
+                    status: SessionExecutionSidecarStatus::Bound,
+                    updated_at: now,
+                }],
+            },
+        );
+        let state = test_state(store);
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/messages?workspaceId=workspace-sidecar-only&sessionId=session-messages-sidecar-only",
+                    )
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should read"),
+        )
+        .expect("body should be json");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("不属于 workspace workspace-sidecar-only"),
+            "unexpected body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_paginates_without_overlap() {
+        let session_id = SessionId::new("session-messages-pagination");
+        let store = SessionStore::default();
+        store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "分页会话",
+                Some("workspace-messages-pagination".to_string()),
+            )
+            .expect("session should create");
+        for index in 0..6 {
+            store.append_timeline_entry(
+                session_id.clone(),
+                TimelineEntryKind::UserMessage,
+                format!("用户消息 {index}"),
+            );
+        }
+        let state = test_state(store);
+
+        let first = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/messages?workspaceId=workspace-messages-pagination&sessionId=session-messages-pagination&limit=3",
+                    )
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(first.into_body(), usize::MAX)
+                .await
+                .expect("body should read"),
+        )
+        .expect("body should be json");
+        let before_cursor = first_body["beforeCursor"]
+            .as_str()
+            .expect("first page should expose cursor");
+
+        let second = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/messages?workspaceId=workspace-messages-pagination&sessionId=session-messages-pagination&limit=3&beforeCursor={before_cursor}",
+                    ))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(second.into_body(), usize::MAX)
+                .await
+                .expect("body should read"),
+        )
+        .expect("body should be json");
+
+        let first_ids = first_body["timeline"]
+            .as_array()
+            .expect("timeline should be array")
+            .iter()
+            .filter_map(|entry| entry["entryId"].as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let second_ids = second_body["timeline"]
+            .as_array()
+            .expect("timeline should be array")
+            .iter()
+            .filter_map(|entry| entry["entryId"].as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            first_ids.is_disjoint(&second_ids),
+            "分页结果不应重复: first={first_ids:?}, second={second_ids:?}"
+        );
+    }
 }

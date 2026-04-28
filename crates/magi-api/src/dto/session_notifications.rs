@@ -67,13 +67,16 @@ pub struct SessionNotificationSnapshotDto {
 #[serde(rename_all = "camelCase")]
 pub struct SessionNotificationsResponseDto {
     pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
     pub notifications: SessionNotificationSnapshotDto,
 }
 
 impl SessionNotificationsResponseDto {
-    pub fn empty(session_id: Option<&SessionId>) -> Self {
+    pub fn empty(session_id: Option<&SessionId>, workspace_id: Option<String>) -> Self {
         Self {
             session_id: session_id.map(ToString::to_string).unwrap_or_default(),
+            workspace_id,
             notifications: SessionNotificationSnapshotDto {
                 last_updated_at: UtcMillis::now(),
                 records: Vec::new(),
@@ -81,9 +84,14 @@ impl SessionNotificationsResponseDto {
         }
     }
 
-    pub fn from_records(session_id: &SessionId, records: Vec<NotificationRecord>) -> Self {
+    pub fn from_records(
+        session_id: &SessionId,
+        workspace_id: Option<String>,
+        records: Vec<NotificationRecord>,
+    ) -> Self {
         Self {
             session_id: session_id.to_string(),
+            workspace_id,
             notifications: SessionNotificationSnapshotDto {
                 last_updated_at: UtcMillis::now(),
                 records: records

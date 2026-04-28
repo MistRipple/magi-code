@@ -17,7 +17,6 @@
   } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { loadAgentSessionTimelinePage } from '../web/agent-api';
-  import { readStoredBrowserWorkspaceBinding } from '../shared/bridges/browser-workspace-binding';
   import {
     normalizeRustBootstrapPayload,
     readRustTimelinePageMeta,
@@ -452,10 +451,13 @@
       return;
     }
     const sessionId = (messagesState.currentSessionId || '').trim();
+    const workspaceId = (messagesState.currentWorkspaceId || '').trim();
+    const workspacePath = (messagesState.currentWorkspacePath || '').trim();
     const historyState = messagesState.sessionHistory;
     if (
       !sessionId
       || historyState.sessionId !== sessionId
+      || (historyState.workspaceId || '') !== workspaceId
       || !historyState.hasMoreBefore
       || !historyState.beforeCursor
       || historyState.isLoadingBefore
@@ -465,20 +467,22 @@
     }
     const previousScrollTop = containerRef.scrollTop;
     const previousScrollHeight = containerRef.scrollHeight;
-    setSessionHistoryState(sessionId, { isLoadingBefore: true });
+    setSessionHistoryState(sessionId, { workspaceId, isLoadingBefore: true });
     try {
       const rawPayload = await loadAgentSessionTimelinePage(sessionId, {
         limit: HISTORY_PAGE_SIZE,
         beforeCursor: historyState.beforeCursor,
-        workspaceId: readStoredBrowserWorkspaceBinding().workspaceId,
+        workspaceId,
       });
-      if ((messagesState.currentSessionId || '').trim() !== sessionId) {
+      if (
+        (messagesState.currentSessionId || '').trim() !== sessionId
+        || (messagesState.currentWorkspaceId || '').trim() !== workspaceId
+      ) {
         return;
       }
-      const binding = readStoredBrowserWorkspaceBinding();
       const payload = normalizeRustBootstrapPayload(rawPayload, {
-        workspaceId: binding.workspaceId,
-        workspacePath: binding.workspacePath,
+        workspaceId,
+        workspacePath,
         sessionId,
       });
       const pageMeta = readRustTimelinePageMeta(rawPayload);
@@ -487,6 +491,7 @@
         payload.timelineProjection as unknown as SessionTimelineProjection,
       );
       setSessionHistoryState(sessionId, {
+        workspaceId,
         hasMoreBefore: pageMeta.hasMoreBefore,
         beforeCursor: pageMeta.beforeCursor,
         isLoadingBefore: false,

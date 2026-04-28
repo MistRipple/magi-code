@@ -341,6 +341,7 @@ pub(crate) fn run_task_llm_loop(
             append_task_error_turn_item(
                 event_bus,
                 session_store,
+                task_store,
                 task,
                 session_id,
                 workspace_id,
@@ -363,6 +364,7 @@ pub(crate) fn run_task_llm_loop(
             append_task_error_turn_item(
                 event_bus,
                 session_store,
+                task_store,
                 task,
                 session_id,
                 workspace_id,
@@ -390,6 +392,7 @@ pub(crate) fn run_task_llm_loop(
         append_task_final_turn_item(
             event_bus,
             session_store,
+            task_store,
             task,
             session_id,
             workspace_id,
@@ -785,6 +788,7 @@ fn tool_call_record(tool_call: &ChatToolCall, result: &str) -> serde_json::Value
 fn append_task_final_turn_item(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
+    task_store: &TaskStore,
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -815,6 +819,7 @@ fn append_task_final_turn_item(
             session_id,
             Some(final_content),
             streaming_entry_id,
+            Some(task_store),
         )
         .unwrap_or_else(|| final_content.to_string());
         let fallback_entry_id = format!("timeline-turn-snapshot-{}", task.task_id);
@@ -831,6 +836,7 @@ fn append_task_final_turn_item(
 fn append_task_error_turn_item(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
+    task_store: &TaskStore,
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -856,6 +862,7 @@ fn append_task_error_turn_item(
             session_id,
             Some(error_text),
             streaming_entry_id,
+            Some(task_store),
         )
         .unwrap_or_else(|| error_text.to_string());
         let fallback_entry_id = format!("timeline-turn-snapshot-error-{}", task.task_id);

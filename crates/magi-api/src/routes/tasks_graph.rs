@@ -72,17 +72,8 @@ async fn get_task_projection(
     let projection = store
         .build_projection(&root_id)
         .ok_or_else(|| ApiError::not_found("任务不存在", &root_task_id))?;
-    let mut value = serde_json::to_value(&projection)
+    let value = serde_json::to_value(&projection)
         .map_err(|err| ApiError::internal_assembly("序列化任务投影失败", err))?;
-    if let Some(manager) = state.runner_manager()
-        && let Some(snapshot) = manager.status(&root_task_id)
-        && let Some(object) = value.as_object_mut()
-    {
-        object.insert(
-            "runner_status".to_string(),
-            serde_json::Value::String(snapshot.status),
-        );
-    }
     Ok(Json(value))
 }
 

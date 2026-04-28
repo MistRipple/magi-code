@@ -32,6 +32,7 @@ export interface ModelStatusLike {
 
 export type ModelListFetchBlockReason =
   | 'full_url_mode'
+  | 'endpoint_base_url'
   | 'missing_base_url_or_api_key'
   | 'unsupported_provider';
 
@@ -44,6 +45,14 @@ export interface ModelListFetchConfigLike {
 
 function trimmedConfigString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function isOpenAiExecutionEndpoint(value: string): boolean {
+  const withoutQuery = value.split(/[?#]/, 1)[0]?.trim().replace(/\/+$/, '').toLowerCase() || '';
+  if (!withoutQuery) {
+    return false;
+  }
+  return /(^|\/)(chat\/completions|responses|messages)$/.test(withoutQuery);
 }
 
 export function resolveModelListFetchBlockReason(
@@ -63,8 +72,12 @@ export function resolveModelListFetchBlockReason(
     return 'unsupported_provider';
   }
 
-  if (!trimmedConfigString(config.baseUrl) || !trimmedConfigString(config.apiKey)) {
+  const baseUrl = trimmedConfigString(config.baseUrl);
+  if (!baseUrl || !trimmedConfigString(config.apiKey)) {
     return 'missing_base_url_or_api_key';
+  }
+  if (isOpenAiExecutionEndpoint(baseUrl)) {
+    return 'endpoint_base_url';
   }
 
   return null;

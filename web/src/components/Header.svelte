@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { addToast, getState, messagesState, setCurrentSessionId } from '../stores/messages.svelte';
+  import { addToast, getState, messagesState } from '../stores/messages.svelte';
   import { ensureArray } from '../lib/utils';
   import { vscode } from '../lib/vscode-bridge';
   import Icon from './Icon.svelte';
@@ -77,8 +77,12 @@
         displayMode: 'toast',
         duration: 1800,
       });
-      setCurrentSessionId(pendingSwitchSessionId);
-      vscode.postMessage({ type: 'switchSession', sessionId: pendingSwitchSessionId });
+      vscode.postMessage({
+        type: 'switchSession',
+        sessionId: pendingSwitchSessionId,
+        workspaceId: messagesState.currentWorkspaceId || undefined,
+        workspacePath: messagesState.currentWorkspacePath || undefined,
+      });
     }
     closeSwitchConfirm();
     dropdownOpen = false;

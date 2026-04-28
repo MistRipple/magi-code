@@ -17,6 +17,7 @@ use magi_event_bus::{
     SessionRuntimeTurnLaneSummaryEntry, SessionRuntimeTurnSummaryEntry,
 };
 use magi_governance::ToolKind;
+use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{
     ActiveExecutionTurnItem, SessionRuntimeSidecar, SessionStore, TimelineEntryKind,
 };
@@ -76,7 +77,11 @@ fn published_session_turn_item_from_sidecar(
             root_task_id: chain.map(|chain| chain.root_task_id.to_string()),
             execution_chain_ref: chain.map(|chain| chain.execution_chain_ref.clone()),
         },
-        turn_items: turn.items.iter().map(to_turn_item_summary).collect(),
+        turn_items: turn
+            .items
+            .iter()
+            .map(|item| to_turn_item_summary(item, None))
+            .collect(),
         worker_lanes: turn
             .worker_lanes
             .iter()
@@ -85,7 +90,7 @@ fn published_session_turn_item_from_sidecar(
                     .get(&lane.lane_id)
                     .map(String::as_str)
                     .unwrap_or(turn.status.as_str());
-                to_turn_lane_summary(lane, status)
+                to_turn_lane_summary(lane, status, None)
             })
             .collect(),
     })
@@ -215,6 +220,7 @@ pub(crate) fn append_session_turn_error_item(
         session_id,
         Some(error_text),
         streaming_entry_id,
+        None,
     )
     .unwrap_or_else(|| error_text.to_string());
     let fallback_entry_id = session_store
@@ -252,7 +258,23 @@ struct CompletedTurnTimelineSnapshot {
     worker_lanes: Vec<SessionRuntimeTurnLaneSummaryEntry>,
 }
 
-fn to_turn_item_summary(item: &ActiveExecutionTurnItem) -> SessionRuntimeTurnItemSummaryEntry {
+fn task_role_id(task_store: Option<&TaskStore>, task_id: &TaskId) -> Option<String> {
+    task_store
+        .and_then(|store| store.get_task(task_id))
+        .and_then(|task| task.executor_binding)
+        .map(|binding| binding.target_role)
+        .filter(|role_id| !role_id.trim().is_empty())
+}
+
+fn to_turn_item_summary(
+    item: &ActiveExecutionTurnItem,
+    task_store: Option<&TaskStore>,
+) -> SessionRuntimeTurnItemSummaryEntry {
+    let role_id = item.role_id.clone().or_else(|| {
+        item.task_id
+            .as_ref()
+            .and_then(|task_id| task_role_id(task_store, task_id))
+    });
     SessionRuntimeTurnItemSummaryEntry {
         item_id: item.item_id.clone(),
         item_seq: item.item_seq,
@@ -265,7 +287,7 @@ fn to_turn_item_summary(item: &ActiveExecutionTurnItem) -> SessionRuntimeTurnIte
         content: item.content.clone(),
         task_id: item.task_id.as_ref().map(ToString::to_string),
         worker_id: item.worker_id.as_ref().map(ToString::to_string),
-        role_id: item.role_id.clone(),
+        role_id,
         tool_call_id: item.tool_call_id.clone(),
         tool_name: item.tool_name.clone(),
         tool_status: item.tool_status.clone(),
@@ -284,13 +306,18 @@ fn to_turn_item_summary(item: &ActiveExecutionTurnItem) -> SessionRuntimeTurnIte
 fn to_turn_lane_summary(
     lane: &magi_session_store::ActiveExecutionTurnLane,
     status: &str,
+    task_store: Option<&TaskStore>,
 ) -> SessionRuntimeTurnLaneSummaryEntry {
+    let role_id = lane
+        .role_id
+        .clone()
+        .or_else(|| task_role_id(task_store, &lane.task_id));
     SessionRuntimeTurnLaneSummaryEntry {
         lane_id: lane.lane_id.clone(),
         lane_seq: lane.lane_seq,
         task_id: lane.task_id.to_string(),
         worker_id: lane.worker_id.to_string(),
-        role_id: lane.role_id.clone(),
+        role_id,
         title: lane.title.clone(),
         status: status.to_string(),
         is_primary: lane.is_primary,
@@ -302,6 +329,7 @@ pub(crate) fn build_completed_turn_timeline_snapshot(
     session_id: &SessionId,
     fallback_final_text: Option<&str>,
     streaming_entry_id: Option<&str>,
+    task_store: Option<&TaskStore>,
 ) -> Option<String> {
     let sidecar = session_store.runtime_sidecar(session_id)?;
     let turn = sidecar.current_turn.as_ref()?;
@@ -366,7 +394,11 @@ pub(crate) fn build_completed_turn_timeline_snapshot(
             root_task_id: chain.map(|chain| chain.root_task_id.to_string()),
             execution_chain_ref: chain.map(|chain| chain.execution_chain_ref.clone()),
         },
-        turn_items: turn.items.iter().map(to_turn_item_summary).collect(),
+        turn_items: turn
+            .items
+            .iter()
+            .map(|item| to_turn_item_summary(item, task_store))
+            .collect(),
         worker_lanes: turn
             .worker_lanes
             .iter()
@@ -375,7 +407,7 @@ pub(crate) fn build_completed_turn_timeline_snapshot(
                     .get(&lane.lane_id)
                     .map(String::as_str)
                     .unwrap_or(turn.status.as_str());
-                to_turn_lane_summary(lane, status)
+                to_turn_lane_summary(lane, status, task_store)
             })
             .collect(),
     };

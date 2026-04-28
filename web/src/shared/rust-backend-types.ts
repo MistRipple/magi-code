@@ -792,6 +792,7 @@ export interface SessionNotificationSnapshotDto {
 
 export interface SessionNotificationsResponseDto {
   sessionId: string;
+  workspaceId?: string | null;
   notifications: SessionNotificationSnapshotDto;
 }
 

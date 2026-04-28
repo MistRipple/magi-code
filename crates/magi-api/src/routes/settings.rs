@@ -24,7 +24,14 @@ fn unwrap_settings_section_request(request: &serde_json::Value) -> serde_json::V
 
 fn strip_scope_binding_fields(mut request: serde_json::Value) -> serde_json::Value {
     if let Some(object) = request.as_object_mut() {
-        for key in ["workspaceId", "workspace_id", "sessionId", "session_id"] {
+        for key in [
+            "workspaceId",
+            "workspace_id",
+            "workspacePath",
+            "workspace_path",
+            "sessionId",
+            "session_id",
+        ] {
             object.remove(key);
         }
     }
@@ -725,9 +732,13 @@ pub(crate) fn enabled_registry_agent_roles(state: &ApiState) -> Vec<String> {
 
 async fn settings_bootstrap(
     State(state): State<ApiState>,
-    _query: Query<HashMap<String, String>>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    Json(state.settings_snapshot_json())
+    let hydrate_mcp_servers = query
+        .get("scope")
+        .map(|value| value.trim())
+        .is_none_or(|scope| scope != "core");
+    Json(state.settings_snapshot_json_with_mcp_hydration(hydrate_mcp_servers))
 }
 
 async fn runtime_status(State(state): State<ApiState>) -> Json<serde_json::Value> {
@@ -1377,6 +1388,50 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn settings_bootstrap_core_scope_defers_mcp_hydration() {
+        let state = test_state();
+        let bootstrap = settings_bootstrap(
+            State(state),
+            Query(HashMap::from([("scope".to_string(), "core".to_string())])),
+        )
+        .await
+        .0;
+
+        assert_eq!(bootstrap["bootstrapScope"], json!("core"));
+        assert_eq!(bootstrap["mcpServersHydrated"], json!(false));
+    }
+
+    #[test]
+    fn scoped_settings_section_request_strips_all_scope_binding_fields() {
+        let cleaned = scoped_settings_section_request(&json!({
+            "config": {
+                "provider": "openai",
+                "workspaceId": "workspace-a",
+                "workspace_id": "workspace-b",
+                "workspacePath": "/tmp/a",
+                "workspace_path": "/tmp/b",
+                "sessionId": "session-a",
+                "session_id": "session-b"
+            }
+        }));
+
+        assert_eq!(cleaned["provider"], json!("openai"));
+        for key in [
+            "workspaceId",
+            "workspace_id",
+            "workspacePath",
+            "workspace_path",
+            "sessionId",
+            "session_id",
+        ] {
+            assert!(
+                cleaned.get(key).is_none(),
+                "{key} should not be persisted in settings sections"
+            );
+        }
+    }
+
     #[test]
     fn fetch_models_config_rejects_non_openai_provider() {
         let error = parse_fetch_models_config(FetchModelsRequest {
@@ -1441,6 +1496,27 @@ mod tests {
                 assert!(message.contains("完整路径模式下不支持自动获取模型列表"));
             }
             other => panic!("expected invalid input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_models_config_rejects_standard_execution_endpoint() {
+        let error = parse_fetch_models_config(FetchModelsRequest {
+            config: serde_json::json!({
+                "provider": "openai",
+                "baseUrl": "http://127.0.0.1:8320/v1/chat/completions",
+                "apiKey": "test-key",
+                "urlMode": "standard"
+            }),
+            target: "orch".to_string(),
+        })
+        .expect_err("standard mode should reject execution endpoints for /models");
+
+        match error {
+            ApiError::InvalidInput(message) => {
+                assert!(message.contains("当前 Base URL 是对话执行端点"));
+            }
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 

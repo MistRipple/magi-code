@@ -302,6 +302,7 @@ pub(super) fn append_dispatch_assistant_message(
         &accepted.session_id,
         Some(&response_text),
         Some(&streaming_entry_id),
+        state.task_store(),
     )
     .unwrap_or_else(|| response_text.clone());
     state.session_store.upsert_timeline_entry(

@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite --config vite.web.config.ts",
-    "dev:rust": "VITE_AGENT_BASE_URL=http://127.0.0.1:38123 VITE_AGENT_PROXY_TARGET=http://127.0.0.1:38123 vite --config vite.web.config.ts",
+    "dev": "node -e \"console.error('请使用 MAGI_WEB_DEV=1 cargo run -p magi-daemon-app，并访问 http://127.0.0.1:38123/web.html'); process.exit(1)\"",
+    "dev:rust": "node -e \"console.error('请使用 MAGI_WEB_DEV=1 cargo run -p magi-daemon-app，并访问 http://127.0.0.1:38123/web.html'); process.exit(1)\"",
     "dev:daemon": "vite --config vite.web.config.ts",
     "build": "vite build --config vite.web.config.ts",
     "preview": "vite preview",

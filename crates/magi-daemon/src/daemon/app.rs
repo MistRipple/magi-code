@@ -90,7 +90,7 @@ async fn resolve_frontend_mode(config: &DaemonConfig) -> Result<FrontendMode, Da
     let agent_origin = format!("http://{}:{}", browser_host(&config.host), config.port);
     let web_root = resolve_web_root();
 
-    if is_web_dev_server_ready(&origin).await {
+    if is_web_dev_server_ready(&origin, &agent_origin, &web_root).await {
         info!(
             web_dev_origin = %origin,
             "已复用运行中的 Vite 前端热加载服务"
@@ -136,7 +136,9 @@ async fn resolve_frontend_mode(config: &DaemonConfig) -> Result<FrontendMode, Da
         .spawn()
         .map_err(|error| DaemonError::internal(format!("启动 Vite 前端热加载服务失败: {error}")))?;
 
-    if let Err(error) = wait_for_spawned_web_dev_server(&origin, &mut child).await {
+    if let Err(error) =
+        wait_for_spawned_web_dev_server(&origin, &agent_origin, &web_root, &mut child).await
+    {
         let _ = child.start_kill();
         return Err(DaemonError::internal(error));
     }
@@ -233,8 +235,8 @@ fn build_web_dev_html(vite_origin: &str, agent_origin: &str) -> String {
     )
 }
 
-async fn is_web_dev_server_ready(origin: &str) -> bool {
-    let url = format!("{}/web.html", origin.trim_end_matches('/'));
+async fn is_web_dev_server_ready(origin: &str, agent_origin: &str, web_root: &PathBuf) -> bool {
+    let origin = origin.trim_end_matches('/');
     let client = match reqwest::Client::builder()
         .timeout(WEB_DEV_READY_REQUEST_TIMEOUT)
         .build()
@@ -242,16 +244,57 @@ async fn is_web_dev_server_ready(origin: &str) -> bool {
         Ok(client) => client,
         Err(_) => return false,
     };
-    match client.get(url).send().await {
-        Ok(response) => response.status().is_success(),
-        Err(_) => false,
+    let ready_payload = match client
+        .get(format!("{origin}/__magi_vite_ready"))
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            match response.json::<serde_json::Value>().await {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            }
+        }
+        _ => return false,
+    };
+    let expected_web_root = normalize_ready_path(web_root);
+    let actual_web_root = ready_payload
+        .get("webRoot")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .map(|path| normalize_ready_path(&path))
+        .unwrap_or_default();
+    if ready_payload.get("app").and_then(serde_json::Value::as_str) != Some("magi-web")
+        || ready_payload
+            .get("entry")
+            .and_then(serde_json::Value::as_str)
+            != Some("/src/main-web.ts")
+        || ready_payload
+            .get("agentOrigin")
+            .and_then(serde_json::Value::as_str)
+            != Some(agent_origin)
+        || actual_web_root != expected_web_root
+    {
+        return false;
     }
+    for path in ["/@vite/client", "/src/main-web.ts"] {
+        match client.get(format!("{origin}{path}")).send().await {
+            Ok(response) if response.status().is_success() => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
-async fn wait_for_spawned_web_dev_server(origin: &str, child: &mut Child) -> Result<(), String> {
+async fn wait_for_spawned_web_dev_server(
+    origin: &str,
+    agent_origin: &str,
+    web_root: &PathBuf,
+    child: &mut Child,
+) -> Result<(), String> {
     let started_at = Instant::now();
     while started_at.elapsed() < WEB_DEV_READY_TIMEOUT {
-        if is_web_dev_server_ready(origin).await {
+        if is_web_dev_server_ready(origin, agent_origin, web_root).await {
             return Ok(());
         }
         match child.try_wait() {
@@ -271,6 +314,14 @@ async fn wait_for_spawned_web_dev_server(origin: &str, child: &mut Child) -> Res
         "Vite 前端热加载服务未在 {} 秒内就绪: {origin}",
         WEB_DEV_READY_TIMEOUT.as_secs()
     ))
+}
+
+fn normalize_ready_path(path: &PathBuf) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.clone())
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn env_flag_enabled(name: &str) -> bool {

@@ -131,6 +131,7 @@ export const messagesState = $state({
   sessions: [] as Session[],
   currentSessionId: null as string | null,
   sessionHistory: {
+    workspaceId: null as string | null,
     sessionId: null as string | null,
     hasMoreBefore: false,
     beforeCursor: null as string | null,
@@ -2853,6 +2854,7 @@ export function setCurrentSessionId(id: string | null) {
   messagesState.currentSessionId = nextSessionId;
   if (hasChanged) {
     messagesState.sessionHistory = {
+      workspaceId: messagesState.currentWorkspaceId,
       sessionId: nextSessionId,
       hasMoreBefore: false,
       beforeCursor: null,
@@ -2895,6 +2897,7 @@ export function adoptCurrentSessionIdForLiveTurn(id: string | null | undefined):
   }
   messagesState.currentSessionId = nextSessionId;
   messagesState.sessionHistory = {
+    workspaceId: messagesState.currentWorkspaceId,
     sessionId: nextSessionId,
     hasMoreBefore: false,
     beforeCursor: null,
@@ -3261,6 +3264,25 @@ function getCurrentNotificationSessionId(): string {
   return resolveNotificationSessionId(messagesState.currentSessionId);
 }
 
+function resolveNotificationWorkspaceId(workspaceId: string | null | undefined): string {
+  return typeof workspaceId === 'string' ? workspaceId.trim() : '';
+}
+
+function getCurrentNotificationWorkspaceId(): string {
+  return resolveNotificationWorkspaceId(messagesState.currentWorkspaceId);
+}
+
+function notificationScopeMatchesCurrentSession(
+  sessionId: string,
+  workspaceId: string | null | undefined,
+): boolean {
+  const normalizedSessionId = resolveNotificationSessionId(sessionId);
+  if (!normalizedSessionId || normalizedSessionId !== getCurrentNotificationSessionId()) {
+    return false;
+  }
+  return resolveNotificationWorkspaceId(workspaceId) === getCurrentNotificationWorkspaceId();
+}
+
 function createNotificationCenterIdleStatus(): NotificationCenterStatus {
   return {
     isLoading: false,
@@ -3281,9 +3303,7 @@ function getCurrentNotificationOperationScope(): NotificationOperationScope | nu
   }
   return {
     sessionId,
-    workspaceId: typeof messagesState.currentWorkspaceId === 'string'
-      ? messagesState.currentWorkspaceId.trim()
-      : '',
+    workspaceId: getCurrentNotificationWorkspaceId(),
     workspacePath: typeof messagesState.currentWorkspacePath === 'string'
       ? messagesState.currentWorkspacePath.trim()
       : '',
@@ -3460,9 +3480,10 @@ export function removeNotification(id: string) {
 export function applySessionNotifications(
   sessionId: string,
   rawNotifications: { records?: SessionNotificationRecord[] } | unknown,
+  workspaceId?: string | null,
 ): void {
   const normalizedSessionId = resolveNotificationSessionId(sessionId);
-  if (!normalizedSessionId) {
+  if (!notificationScopeMatchesCurrentSession(normalizedSessionId, workspaceId)) {
     return;
   }
   const normalized = normalizeSessionNotificationList(
@@ -3471,9 +3492,7 @@ export function applySessionNotifications(
       : undefined,
   );
   replaceSessionNotificationList(normalizedSessionId, normalized);
-  if (normalizedSessionId === getCurrentNotificationSessionId()) {
-    applyNotificationList(normalized);
-  }
+  applyNotificationList(normalized);
 }
 
 export function applySessionNotificationsStatus(rawStatus: unknown): void {
@@ -3484,7 +3503,10 @@ export function applySessionNotificationsStatus(rawStatus: unknown): void {
   const statusSessionId = resolveNotificationSessionId(
     typeof status.sessionId === 'string' ? status.sessionId : null,
   );
-  if (!statusSessionId || statusSessionId !== getCurrentNotificationSessionId()) {
+  const statusWorkspaceId = resolveNotificationWorkspaceId(
+    typeof status.workspaceId === 'string' ? status.workspaceId : null,
+  );
+  if (!notificationScopeMatchesCurrentSession(statusSessionId, statusWorkspaceId)) {
     return;
   }
   const operation = typeof status.operation === 'string'
@@ -3710,6 +3732,7 @@ export function clearAllMessages(options: {
   }
   messagesState.orchestratorRuntimeState = null;
   messagesState.sessionHistory = {
+    workspaceId: messagesState.currentWorkspaceId,
     sessionId: messagesState.currentSessionId,
     hasMoreBefore: false,
     beforeCursor: null,
@@ -3735,6 +3758,7 @@ export function clearAllMessages(options: {
 export function setSessionHistoryState(
   sessionId: string | null | undefined,
   input: {
+    workspaceId?: string | null;
     hasMoreBefore?: boolean;
     beforeCursor?: string | null;
     isLoadingBefore?: boolean;
@@ -3744,6 +3768,7 @@ export function setSessionHistoryState(
   const normalizedSessionId = normalizeSessionId(sessionId);
   if (!normalizedSessionId) {
     messagesState.sessionHistory = {
+      workspaceId: null,
       sessionId: null,
       hasMoreBefore: false,
       beforeCursor: null,
@@ -3752,11 +3777,18 @@ export function setSessionHistoryState(
     return;
   }
   const current = messagesState.sessionHistory;
+  const normalizedWorkspaceId = typeof input.workspaceId === 'string'
+    ? input.workspaceId.trim() || null
+    : (messagesState.currentWorkspaceId || null);
   const inputBeforeCursor = typeof input.beforeCursor === 'string' && input.beforeCursor.trim()
     ? input.beforeCursor.trim()
     : null;
-  if (current.sessionId && current.sessionId !== normalizedSessionId) {
+  if (
+    (current.sessionId && current.sessionId !== normalizedSessionId)
+    || (current.workspaceId && current.workspaceId !== normalizedWorkspaceId)
+  ) {
     messagesState.sessionHistory = {
+      workspaceId: normalizedWorkspaceId,
       sessionId: normalizedSessionId,
       hasMoreBefore: input.hasMoreBefore === true,
       beforeCursor: inputBeforeCursor,
@@ -3766,8 +3798,10 @@ export function setSessionHistoryState(
   }
   const shouldPreserveLoadedWindow = input.preserveLoadedWindow === true
     && current.sessionId === normalizedSessionId
+    && current.workspaceId === normalizedWorkspaceId
     && (current.beforeCursor !== null || current.hasMoreBefore);
   messagesState.sessionHistory = {
+    workspaceId: normalizedWorkspaceId,
     sessionId: normalizedSessionId,
     hasMoreBefore: shouldPreserveLoadedWindow
       ? current.hasMoreBefore

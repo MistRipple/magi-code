@@ -211,6 +211,11 @@ impl NormalizedModelConfig {
                 "完整路径模式下不支持自动获取模型列表，请手动填写模型名".to_string(),
             ));
         }
+        if is_openai_execution_endpoint(self.normalized_http_base_url()?.as_str()) {
+            return Err(ApiError::InvalidInput(
+                "当前 Base URL 是对话执行端点，请改为服务根地址或 /v1 后再获取模型列表".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -326,6 +331,23 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn is_openai_execution_endpoint(value: &str) -> bool {
+    let normalized = value
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    normalized.ends_with("/chat/completions")
+        || normalized.ends_with("/responses")
+        || normalized.ends_with("/messages")
+        || matches!(
+            normalized.as_str(),
+            "chat/completions" | "responses" | "messages"
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +418,26 @@ mod tests {
             .expect_err("full path has no canonical models endpoint");
         assert!(
             matches!(error, ApiError::InvalidInput(message) if message.contains("完整路径模式下不支持自动获取模型列表"))
+        );
+    }
+
+    #[test]
+    fn normalized_model_config_rejects_standard_execution_endpoint_models_url() {
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "provider": "openai",
+                "baseUrl": "http://127.0.0.1:8320/v1/chat/completions",
+                "apiKey": "test-key",
+                "urlMode": "standard"
+            }),
+            "openai",
+        );
+
+        let error = config
+            .openai_models_url()
+            .expect_err("standard mode should still reject execution endpoints");
+        assert!(
+            matches!(error, ApiError::InvalidInput(message) if message.contains("当前 Base URL 是对话执行端点"))
         );
     }
 

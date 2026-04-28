@@ -334,7 +334,12 @@ impl ShadowTaskDispatcher {
         let existing = store.list();
         let mut inserted = 0usize;
         for (index, learning) in learnings.into_iter().enumerate() {
-            if knowledge_duplicate(&existing, KnowledgeKind::Learning, &learning.content) {
+            if knowledge_duplicate(
+                &existing,
+                KnowledgeKind::Learning,
+                workspace_id.as_ref(),
+                &learning.content,
+            ) {
                 continue;
             }
             let now = UtcMillis::now();
@@ -808,10 +813,15 @@ fn normalized_text(text: &str) -> String {
         .collect()
 }
 
-fn knowledge_duplicate(existing: &[KnowledgeRecord], kind: KnowledgeKind, content: &str) -> bool {
+fn knowledge_duplicate(
+    existing: &[KnowledgeRecord],
+    kind: KnowledgeKind,
+    workspace_id: Option<&WorkspaceId>,
+    content: &str,
+) -> bool {
     let normalized = normalized_text(content);
     existing.iter().any(|record| {
-        record.kind == kind && {
+        record.kind == kind && record.workspace_id.as_ref() == workspace_id && {
             let record_text = normalized_text(&record.content);
             record_text == normalized
                 || record_text.contains(&normalized)
@@ -826,6 +836,53 @@ fn title_from_learning_content(content: &str) -> String {
         title.push('…');
     }
     title
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn learning_record(id: &str, workspace_id: Option<&str>, content: &str) -> KnowledgeRecord {
+        KnowledgeRecord {
+            knowledge_id: id.to_string(),
+            kind: KnowledgeKind::Learning,
+            title: content.to_string(),
+            content: content.to_string(),
+            tags: Vec::new(),
+            workspace_id: workspace_id.map(WorkspaceId::new),
+            source_ref: None,
+            updated_at: UtcMillis::now(),
+        }
+    }
+
+    #[test]
+    fn learning_duplicate_detection_is_workspace_scoped() {
+        let content = "最佳实践：同一条经验可以在不同 workspace 分别沉淀";
+        let existing = vec![learning_record(
+            "learning-workspace-a",
+            Some("workspace-a"),
+            content,
+        )];
+
+        assert!(knowledge_duplicate(
+            &existing,
+            KnowledgeKind::Learning,
+            Some(&WorkspaceId::new("workspace-a")),
+            content,
+        ));
+        assert!(!knowledge_duplicate(
+            &existing,
+            KnowledgeKind::Learning,
+            Some(&WorkspaceId::new("workspace-b")),
+            content,
+        ));
+        assert!(!knowledge_duplicate(
+            &existing,
+            KnowledgeKind::Learning,
+            None,
+            content,
+        ));
+    }
 }
 
 impl TaskDispatcher for ShadowTaskDispatcher {

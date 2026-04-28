@@ -431,6 +431,7 @@ export function handleUnifiedData(standard: StandardMessage) {
     case 'sessionNotificationsLoaded':
       handleSessionNotificationsLoaded(asMessage({
         sessionId: payload.sessionId,
+        workspaceId: payload.workspaceId,
         notifications: payload.notifications,
       }));
       break;
@@ -814,9 +815,10 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       }
 
       if (snapshot.notifications) {
-        applySessionNotifications(sessionId, snapshot.notifications.notifications);
+        applySessionNotifications(sessionId, snapshot.notifications.notifications, workspaceId);
       }
       setSessionHistoryState(sessionId, {
+        workspaceId,
         hasMoreBefore,
         beforeCursor,
         isLoadingBefore: false,
@@ -870,9 +872,10 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       (snapshot.orchestratorRuntimeState as OrchestratorRuntimeState | null | undefined) ?? null,
     );
     if (snapshot.notifications) {
-      applySessionNotifications(sessionId, snapshot.notifications.notifications);
+      applySessionNotifications(sessionId, snapshot.notifications.notifications, workspaceId);
     }
     setSessionHistoryState(sessionId, {
+      workspaceId,
       hasMoreBefore,
       beforeCursor,
       isLoadingBefore: false,
@@ -883,10 +886,11 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
 
 function handleSessionNotificationsLoaded(message: ClientBridgeMessage) {
   const sessionId = typeof message.sessionId === 'string' ? message.sessionId : '';
+  const workspaceId = typeof message.workspaceId === 'string' ? message.workspaceId : '';
   if (!sessionId) {
     return;
   }
-  applySessionNotifications(sessionId, message.notifications);
+  applySessionNotifications(sessionId, message.notifications, workspaceId);
 }
 
 
