@@ -912,6 +912,11 @@ export interface FetchModelsResponseDto {
   requestedAt: number;
 }
 
+export interface FetchModelsRequestDto {
+  config: Record<string, unknown>;
+  target: string;
+}
+
 export interface SessionStatsTotalsDto {
   llmCallCount: number;
   assignmentCount: number;

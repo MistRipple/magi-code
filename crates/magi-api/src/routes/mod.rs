@@ -189,7 +189,7 @@ mod tests {
         BridgeProbeErrorDto, BridgeServiceSnapshotDto, BridgeServicesSnapshotDto,
         BridgeSnapshotProvider,
     };
-    use crate::state::RunnerManager;
+    use crate::state::{RunnerManager, RunnerStartError};
     use crate::task_execution::{
         DispatchSubmissionAccepted, ShadowTaskDispatcher, drive_shadow_dispatch_submission,
         submit_shadow_dispatch_submission,
@@ -925,7 +925,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_turn_uses_model_task_route_without_frontend_task_signal() {
+    async fn session_turn_downgrades_low_evidence_task_route_to_chat() {
         let state = build_shadow_execution_state(
             WorkerRuntime::new_compare,
             Arc::new(TaskRouteClassifierModelBridgeClient),
@@ -945,15 +945,14 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::OK, "模型判定 task 应创建任务图: {body:?}");
-        assert_eq!(body["route"], "task");
-        let root_task_id = body["rootTaskId"]
-            .as_str()
-            .expect("模型判定 task 应返回 root task id");
-        assert!(
-            body["actionTaskId"].as_str().is_some(),
-            "模型判定 task 应返回 action task id: {body:?}"
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "低证据 task 误判应降级为普通对话: {body:?}"
         );
+        assert_eq!(body["route"], "chat");
+        assert!(body["rootTaskId"].is_null());
+        assert!(body["actionTaskId"].is_null());
 
         wait_for_condition(
             Duration::from_secs(2),
@@ -972,14 +971,13 @@ mod tests {
         )
         .await;
 
-        let runtime_read_model = get_json(app.clone(), "/runtime/read-model").await;
+        let runtime_read_model = get_json(app, "/runtime/read-model").await;
         assert!(
             runtime_read_model["details"]["tasks"]
                 .as_array()
                 .expect("tasks should serialize as array")
-                .iter()
-                .any(|task| task["task_id"] == root_task_id),
-            "模型判定 task 后 TaskStore 应包含 root task"
+                .is_empty(),
+            "低证据 task 误判不能写入 TaskStore"
         );
         let session_summary = runtime_read_model["details"]["sessions"]
             .as_array()
@@ -987,8 +985,36 @@ mod tests {
             .iter()
             .find(|session| session["session_id"] == "session-route-shadow")
             .expect("chat session should exist in read model");
-        assert_eq!(session_summary["current_turn"]["root_task_id"], root_task_id);
+        assert_eq!(session_summary["current_turn"]["root_task_id"], Value::Null);
+    }
 
+    #[tokio::test]
+    async fn session_turn_uses_high_evidence_model_task_route_without_frontend_task_signal() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let app = build_router(state.clone());
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/api/session/turn",
+            json!({
+                "sessionId": "session-route-shadow",
+                "text": "请分析并拆分这个复杂任务",
+                "deepTask": false,
+                "skillName": null,
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "高证据 task route 应创建任务图: {body:?}"
+        );
+        assert_eq!(body["route"], "task");
+        let root_task_id = body["rootTaskId"]
+            .as_str()
+            .expect("模型判定 task 应返回 root task id");
         let projection = get_json(
             app,
             &format!("/api/tasks/graph/{root_task_id}?sessionId=session-route-shadow"),
@@ -1421,6 +1447,119 @@ mod tests {
                 .status,
             TaskStatus::Blocked,
             "分类阶段不能把 finish 分支当成 continue 调度来改写"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_turn_natural_language_continue_resumes_recoverable_chain() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let app = build_router(state.clone());
+        let session_id = SessionId::new("session-route-shadow");
+        let mission_id = MissionId::new("mission-natural-continue");
+        let root_task_id = TaskId::new("task-root-natural-continue");
+        let branch_task_id = TaskId::new("task-branch-natural-continue");
+        let worker_id = WorkerId::new("worker-natural-continue");
+        let accepted_at = UtcMillis::now();
+        let task_store = state.task_store().expect("task store should exist");
+        for (task_id, parent_task_id, kind) in [
+            (root_task_id.clone(), None, TaskKind::Objective),
+            (
+                branch_task_id.clone(),
+                Some(root_task_id.clone()),
+                TaskKind::Action,
+            ),
+        ] {
+            task_store.insert_task(Task {
+                task_id,
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                parent_task_id,
+                kind,
+                title: "自然语言继续".to_string(),
+                goal: "验证用户说继续时恢复可继续链".to_string(),
+                status: TaskStatus::Blocked,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                context_refs: Vec::new(),
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                repair_count: 0,
+                decision_payload: None,
+                created_at: accepted_at,
+                updated_at: accepted_at,
+            });
+        }
+        state
+            .session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-natural-continue".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![branch_task_id.clone()],
+                    active_worker_bindings: vec![worker_id.clone()],
+                    branches: vec![ActiveExecutionBranch {
+                        task_id: branch_task_id.clone(),
+                        worker_id,
+                        stage: "execute".to_string(),
+                        lease_id: None,
+                        execution_intent_ref: None,
+                        binding_lifecycle: Some("requested".to_string()),
+                        checkpoint_stage: Some("execute".to_string()),
+                        next_step_index: Some(0),
+                        checkpoint_at: Some(accepted_at),
+                        resume_mode: Some("stage-restart".to_string()),
+                        resume_token: None,
+                        use_tools: false,
+                        skill_name: None,
+                        is_primary: true,
+                    }],
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at,
+                        entry_id: "timeline-natural-continue".to_string(),
+                        trimmed_text: Some("原任务".to_string()),
+                        deep_task: false,
+                        skill_name: None,
+                    },
+                    current_turn: None,
+                },
+            )
+            .expect("active chain should upsert");
+
+        let task_count_before = task_store.get_tasks_by_mission(&mission_id).len();
+        let (status, body) = post_json(
+            app,
+            "/api/session/turn",
+            json!({
+                "sessionId": session_id.to_string(),
+                "text": "继续刚刚的任务",
+                "deepTask": false,
+                "skillName": null,
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body:?}");
+        assert_eq!(body["route"], "continue");
+        assert_eq!(body["rootTaskId"], root_task_id.to_string());
+        assert_eq!(body["actionTaskId"], branch_task_id.to_string());
+        assert_eq!(body["executionChainRef"], "chain-natural-continue");
+        assert_eq!(
+            task_store.get_tasks_by_mission(&mission_id).len(),
+            task_count_before,
+            "自然语言继续不能创建新的 task graph"
         );
     }
 
@@ -1991,7 +2130,15 @@ mod tests {
                                 worker_visible: false,
                             },
                         ],
-                        worker_lanes: vec![],
+                        worker_lanes: vec![magi_session_store::ActiveExecutionTurnLane {
+                            lane_id: "lane-turn-output-refs".to_string(),
+                            lane_seq: 1,
+                            task_id: action_task_id.clone(),
+                            worker_id: WorkerId::new("task-worker-reviewer"),
+                            role_id: None,
+                            title: "评审最终总结".to_string(),
+                            is_primary: false,
+                        }],
                     }),
                 },
             )
@@ -2012,7 +2159,13 @@ mod tests {
                 dependency_ids: vec![],
                 required_children: vec![],
                 policy_snapshot: None,
-                executor_binding: None,
+                executor_binding: Some(ExecutorBinding {
+                    target_role: "reviewer".to_string(),
+                    capability_requirements: vec![],
+                    parallelism_group: None,
+                    exclusive_scope: None,
+                    worker_selector: None,
+                }),
                 context_refs: vec![],
                 knowledge_refs: vec![],
                 workspace_scope: None,
@@ -2061,6 +2214,16 @@ mod tests {
             serde_json::from_str::<Value>(&assistant_messages[0].message)
                 .expect("assistant timeline should store completed turn snapshot")["is_historical_turn_snapshot"],
             Value::Bool(true)
+        );
+        let snapshot = serde_json::from_str::<Value>(&assistant_messages[0].message)
+            .expect("assistant timeline should store completed turn snapshot");
+        assert_eq!(
+            snapshot["turn_items"][0]["role_id"], "reviewer",
+            "completed snapshot turn_items 应回填 task executor role"
+        );
+        assert_eq!(
+            snapshot["worker_lanes"][0]["role_id"], "reviewer",
+            "completed snapshot worker_lanes 应回填 task executor role"
         );
     }
 
@@ -2914,6 +3077,13 @@ mod tests {
             chain.branches.len() >= 2,
             "seed dispatch should create multiple worker branches for scoped continue"
         );
+        chain.branches[0].checkpoint_stage = Some("execute".to_string());
+        chain.branches[0].next_step_index = Some(2);
+        chain.branches[0].resume_mode = Some("step-checkpoint".to_string());
+        chain.branches[0].checkpoint_at = Some(UtcMillis::now());
+        chain.branches[0].execution_intent_ref =
+            Some("worker-intent-scoped-continue-preferred".to_string());
+        chain.branches[0].binding_lifecycle = Some("requested".to_string());
         chain.branches[1].worker_id = WorkerId::new("worker-route-held");
         chain.active_worker_bindings = chain
             .branches
@@ -2954,18 +3124,59 @@ mod tests {
             .task_id
             .clone()
             .expect("seed dispatch should bind task");
+        let mut preferred_ancestor_ids = Vec::new();
+        let mut current_parent = task_store
+            .get_task(&preferred_branch.task_id)
+            .expect("preferred branch task should exist")
+            .parent_task_id;
+        while let Some(parent_id) = current_parent {
+            if parent_id == chain.root_task_id {
+                break;
+            }
+            let parent_task = task_store
+                .get_task(&parent_id)
+                .expect("preferred branch ancestor should exist");
+            preferred_ancestor_ids.push(parent_id);
+            current_parent = parent_task.parent_task_id;
+        }
+        assert!(
+            !preferred_ancestor_ids.is_empty(),
+            "scoped continue regression must cover a deep task path"
+        );
         task_store
             .update_status(&chain.root_task_id, TaskStatus::Blocked)
             .expect("root task should become recoverable");
         task_store
             .update_status(&recovery_task_id, TaskStatus::Blocked)
             .expect("seed task should become recoverable");
+        for ancestor_id in &preferred_ancestor_ids {
+            task_store
+                .update_status(ancestor_id, TaskStatus::Blocked)
+                .expect("preferred branch ancestor should become recoverable");
+        }
         task_store
             .update_status(&preferred_branch.task_id, TaskStatus::Blocked)
             .expect("preferred branch should become recoverable");
         task_store
             .update_status(&held_branch.task_id, TaskStatus::Blocked)
             .expect("held branch should remain blocked until explicitly requested");
+        let worker_runtime = state
+            .shadow_execution_pipeline()
+            .expect("shadow execution pipeline should exist")
+            .execution_runtime
+            .worker_runtime()
+            .clone();
+        worker_runtime.restore_durable_snapshot(
+            magi_worker_runtime::WorkerRuntimeDurableSnapshot {
+                branches: Vec::new(),
+            },
+        );
+        assert!(
+            worker_runtime
+                .branch_snapshot_for_task(&preferred_branch.task_id)
+                .is_none(),
+            "测试前先模拟 worker runtime snapshot 缺失"
+        );
 
         let (status, body) = post_json(
             app,
@@ -2984,6 +3195,31 @@ mod tests {
             .get_task(&preferred_branch.task_id)
             .expect("preferred branch should remain queryable");
         assert_ne!(resumed_task.status, TaskStatus::Blocked);
+        for ancestor_id in &preferred_ancestor_ids {
+            let ancestor = task_store
+                .get_task(ancestor_id)
+                .expect("preferred branch ancestor should remain queryable");
+            assert_ne!(
+                ancestor.status,
+                TaskStatus::Blocked,
+                "requested worker 的祖先任务也必须被释放: {}",
+                ancestor_id
+            );
+        }
+        let worker_snapshot = worker_runtime
+            .branch_snapshot_for_task(&preferred_branch.task_id)
+            .expect("continue 应从 session sidecar 回填 worker runtime checkpoint");
+        let checkpoint = worker_snapshot
+            .checkpoint_cursor
+            .expect("scoped continue 应恢复 checkpoint cursor");
+        assert_eq!(
+            checkpoint.next_step_index, 2,
+            "sidecar checkpoint 的 next_step_index 必须回填到 worker runtime"
+        );
+        assert_eq!(
+            checkpoint.resume_mode,
+            magi_worker_runtime::WorkerCheckpointResumeMode::StepCheckpoint
+        );
         let held_task = task_store
             .get_task(&held_branch.task_id)
             .expect("held branch should remain queryable");
@@ -3380,6 +3616,10 @@ mod tests {
                         "executionGoal": "这个普通对话不应该进入任务图",
                         "requiredWorkers": ["integration-dev"],
                         "toolIntent": "不应泄漏到普通对话 prompt",
+                        "confidence": 0.41,
+                        "reasonCode": "plain_chat",
+                        "routeReason": "普通对话缺少任务证据",
+                        "taskEvidence": [],
                     })),
                 });
             }
@@ -3669,11 +3909,30 @@ mod tests {
             "executionGoal": (route == "task").then_some(user_text.trim_matches('"')),
             "requiredWorkers": [],
             "toolIntent": null,
+            "confidence": if route == "task" { 0.93 } else { 0.88 },
+            "reasonCode": match route {
+                "task" => "explicit_task_request",
+                "execute" => "tool_request",
+                "continue" => "continue_requested",
+                _ => "plain_chat",
+            },
+            "routeReason": match route {
+                "task" => "用户请求需要结构化任务执行",
+                "execute" => "用户请求需要工具执行但不需要任务图",
+                "continue" => "用户要求继续且存在可恢复链",
+                _ => "普通对话",
+            },
+            "taskEvidence": if route == "task" {
+                vec!["需要结构化执行".to_string()]
+            } else {
+                Vec::<String>::new()
+            },
         });
         Some(classifier_tool_payload(arguments))
     }
 
     fn classifier_tool_payload(arguments: serde_json::Value) -> String {
+        let arguments = normalize_classifier_tool_arguments(arguments);
         serde_json::json!({
             "content": null,
             "finish_reason": "tool_calls",
@@ -3687,6 +3946,43 @@ mod tests {
             }]
         })
         .to_string()
+    }
+
+    fn normalize_classifier_tool_arguments(mut arguments: serde_json::Value) -> serde_json::Value {
+        let Some(map) = arguments.as_object_mut() else {
+            return arguments;
+        };
+        let route = map
+            .get("route")
+            .and_then(|value| value.as_str())
+            .unwrap_or("chat")
+            .to_string();
+        map.entry("confidence".to_string())
+            .or_insert_with(|| serde_json::json!(if route == "task" { 0.93 } else { 0.88 }));
+        map.entry("reasonCode".to_string()).or_insert_with(|| {
+            serde_json::json!(match route.as_str() {
+                "task" => "explicit_task_request",
+                "execute" => "tool_request",
+                "continue" => "continue_requested",
+                _ => "plain_chat",
+            })
+        });
+        map.entry("routeReason".to_string()).or_insert_with(|| {
+            serde_json::json!(match route.as_str() {
+                "task" => "用户请求需要结构化任务执行",
+                "execute" => "用户请求需要工具执行但不需要任务图",
+                "continue" => "用户要求继续且存在可恢复链",
+                _ => "普通对话",
+            })
+        });
+        map.entry("taskEvidence".to_string()).or_insert_with(|| {
+            if route == "task" {
+                serde_json::json!(["需要结构化执行"])
+            } else {
+                serde_json::json!([])
+            }
+        });
+        arguments
     }
 
     fn assignment_dispatch_visible_leak_fixture() -> String {
@@ -5586,6 +5882,109 @@ mod tests {
         assert_eq!(projection["progress_summary"]["completed_tasks"], 1);
         assert_eq!(projection["progress_summary"]["running_tasks"], 3);
         assert_eq!(projection["aggregate_status"], "Running");
+    }
+
+    #[tokio::test]
+    async fn task_graph_projection_uses_runner_manager_status_as_authority() {
+        let task_store = Arc::new(TaskStore::new());
+        let runner_manager = RunnerManager::new(Arc::clone(&task_store), Vec::new());
+        runner_manager.set_status_for_test("obj-live-runner", "running");
+        let state = test_state()
+            .with_task_store(task_store)
+            .with_runner_manager(runner_manager);
+        insert_test_task(
+            &state,
+            "obj-live-runner",
+            "mission-live-runner",
+            "obj-live-runner",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Completed,
+            None,
+        );
+        bind_test_session_mission(
+            &state,
+            "session-live-runner",
+            "mission-live-runner",
+            "obj-live-runner",
+        );
+        let app = build_router(state);
+
+        let projection = get_json(
+            app,
+            "/api/tasks/graph/obj-live-runner?sessionId=session-live-runner",
+        )
+        .await;
+        assert_eq!(projection["aggregate_status"], "Completed");
+        assert_eq!(projection["runner_status"], "running");
+    }
+
+    #[test]
+    fn runner_manager_pause_tree_updates_live_status_without_restarting_runner() {
+        let task_store = Arc::new(TaskStore::new());
+        let runner_manager = RunnerManager::new(Arc::clone(&task_store), Vec::new());
+        runner_manager.set_status_for_test("obj-pause-live", "running");
+        let state = test_state().with_task_store(task_store);
+        insert_test_task(
+            &state,
+            "obj-pause-live",
+            "mission-pause-live",
+            "obj-pause-live",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+            None,
+        );
+
+        runner_manager
+            .pause_tree("obj-pause-live")
+            .expect("running task graph should pause");
+
+        let status = runner_manager
+            .status("obj-pause-live")
+            .expect("runner status should exist");
+        assert_eq!(status.status, "blocked");
+        assert!(
+            matches!(
+                runner_manager.start("obj-pause-live", None),
+                Err(RunnerStartError::AlreadyRunning)
+            ),
+            "active paused runner must not be replaced before its loop exits"
+        );
+    }
+
+    #[test]
+    fn runner_manager_stop_updates_live_status_immediately() {
+        let task_store = Arc::new(TaskStore::new());
+        let runner_manager = RunnerManager::new(Arc::clone(&task_store), Vec::new());
+        runner_manager.set_status_for_test("obj-stop-live", "running");
+        let state = test_state().with_task_store(task_store);
+        insert_test_task(
+            &state,
+            "obj-stop-live",
+            "mission-stop-live",
+            "obj-stop-live",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+            None,
+        );
+
+        runner_manager
+            .stop("obj-stop-live")
+            .expect("running task graph should stop");
+
+        let status = runner_manager
+            .status("obj-stop-live")
+            .expect("runner status should exist");
+        assert_eq!(status.status, "stopped");
+        assert!(
+            matches!(
+                runner_manager.start("obj-stop-live", None),
+                Err(RunnerStartError::AlreadyRunning)
+            ),
+            "stopping runner must not be replaced before its loop exits"
+        );
     }
 
     #[tokio::test]

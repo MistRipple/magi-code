@@ -213,6 +213,7 @@ export interface LibrarySkill {
 
 function createSettingsStore(props: { onClose?: () => void }) {
   const isWebMode = isWebAgentMode();
+  type SettingsBootstrapScope = "core" | "full";
 
   interface Props {
     onClose?: () => void;
@@ -1051,6 +1052,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
     applyMcpServersPayload(payload.mcpServers);
     mcpServersHydrated = payload.mcpServersHydrated !== false;
     mcpServersLoading = false;
+    if (activeTab === "tools" && !mcpServersHydrated) {
+      ensureToolsBootstrapHydrated();
+    }
     applyBuiltinToolsPayload(payload.builtinTools);
     applySkillsConfig(payload.skillsConfig);
     applyRepositoriesPayload(payload.repositories);
@@ -1076,18 +1080,28 @@ function createSettingsStore(props: { onClose?: () => void }) {
     );
   }
 
-  async function refreshSettingsBootstrapFromApi(): Promise<void> {
+  async function refreshSettingsBootstrapFromApi(scope: SettingsBootstrapScope = "core"): Promise<void> {
+    const hydratesMcpState = scope === "full";
+    if (hydratesMcpState) {
+      mcpServersLoading = true;
+    }
     try {
-      const payload = await getAgentSettingsBootstrap({ scope: "core" });
+      const payload = await getAgentSettingsBootstrap({ scope });
       applySettingsBootstrapPayload(payload);
     } catch (e) {
+      if (hydratesMcpState) {
+        mcpServersLoading = false;
+      }
       console.error("[SettingsPanel] 加载设置数据失败:", e);
       notifySettingsError("加载设置数据", e);
     }
   }
 
-  async function requestSettingsBootstrap(force = false) {
-    const cachedSnapshot = !force
+  async function requestSettingsBootstrap(
+    force = false,
+    scope: SettingsBootstrapScope = "core",
+  ) {
+    const cachedSnapshot = scope === "core" && !force
       ? (appState.settingsBootstrapSnapshot as AgentSettingsBootstrapSnapshot | null)
       : null;
 
@@ -1097,7 +1111,14 @@ function createSettingsStore(props: { onClose?: () => void }) {
       return;
     }
 
-    await refreshSettingsBootstrapFromApi();
+    await refreshSettingsBootstrapFromApi(scope);
+  }
+
+  function ensureToolsBootstrapHydrated() {
+    if (mcpServersHydrated || mcpServersLoading) {
+      return;
+    }
+    void requestSettingsBootstrap(true, "full");
   }
 
   // ============================================
@@ -2643,6 +2664,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     set activeTab(v) {
       activeTab = v;
+      if (v === "tools") {
+        ensureToolsBootstrapHydrated();
+      }
     },
     get roleTemplates() {
       return roleTemplates;

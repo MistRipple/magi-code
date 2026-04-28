@@ -201,6 +201,10 @@ struct SessionTurnIntentDecision {
     execution_goal: Option<String>,
     required_workers: Vec<String>,
     tool_intent: Option<String>,
+    confidence: f64,
+    reason_code: Option<String>,
+    route_reason: Option<String>,
+    task_evidence: Vec<String>,
 }
 
 fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), ApiError> {
@@ -250,7 +254,7 @@ fn decide_session_turn_with_task_planner(
             "Session Turn 分类器返回失败状态".to_string(),
         ));
     }
-    let decision = parse_session_turn_decision(&response.payload)?;
+    let decision = normalize_session_turn_decision(parse_session_turn_decision(&response.payload)?);
     if matches!(decision.route, SessionTurnRouteDto::Continue) && !has_recoverable_chain {
         return Err(ApiError::InvalidInput(
             "当前会话没有可继续的执行链".to_string(),
@@ -285,6 +289,8 @@ fn build_session_turn_classifier_prompt(
          请只调用 classify_session_turn 工具，输出本轮 route。\n\
          route 只能是 chat、execute、task、continue。\n\
          普通问答使用 chat；需要工具但不创建任务图使用 execute；需要产品级任务编排使用 task；用户要求继续且存在可恢复链时使用 continue。\n\
+         如果选择 task，必须给出 confidence、reasonCode、routeReason 和至少 1 条 taskEvidence；只有明确需要多步骤结构化执行、实现/修复/重构、深度任务或多 worker 协作时才选择 task。\n\
+         普通问答、状态追问、简单解释和寒暄必须选择 chat，不能只因为措辞模糊就创建任务图。\n\
          userText={user_text}\n\
          deepTask={}\n\
          skillName=\"{skill_name}\"\n\
@@ -305,11 +311,37 @@ fn session_turn_classifier_tool() -> ChatToolDefinition {
             parameters: json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["route"],
+                "required": ["route", "confidence", "reasonCode", "routeReason", "taskEvidence"],
                 "properties": {
                     "route": {
                         "type": "string",
                         "enum": ["chat", "execute", "task", "continue"]
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                    },
+                    "reasonCode": {
+                        "type": ["string", "null"],
+                        "enum": [
+                            "plain_chat",
+                            "tool_request",
+                            "continue_requested",
+                            "explicit_task_request",
+                            "deep_task_requested",
+                            "multi_step_task",
+                            "implementation_or_fix",
+                            "requires_structured_execution",
+                            "image_task",
+                            "skill_task",
+                            null
+                        ]
+                    },
+                    "routeReason": { "type": ["string", "null"] },
+                    "taskEvidence": {
+                        "type": "array",
+                        "items": { "type": "string" }
                     },
                     "taskTitle": { "type": ["string", "null"] },
                     "executionGoal": { "type": ["string", "null"] },
@@ -406,7 +438,72 @@ fn session_turn_decision_from_value(
             })
             .unwrap_or_default(),
         tool_intent: optional_trimmed_string(&value, "toolIntent"),
+        confidence: value
+            .get("confidence")
+            .and_then(|value| value.as_f64())
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+        reason_code: optional_trimmed_string(&value, "reasonCode"),
+        route_reason: optional_trimmed_string(&value, "routeReason"),
+        task_evidence: value
+            .get("taskEvidence")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
+}
+
+fn normalize_session_turn_decision(
+    mut decision: SessionTurnIntentDecision,
+) -> SessionTurnIntentDecision {
+    if matches!(decision.route, SessionTurnRouteDto::Task)
+        && !session_turn_task_route_has_creation_evidence(&decision)
+    {
+        decision.route = SessionTurnRouteDto::Chat;
+        decision.task_title = None;
+        decision.execution_goal = None;
+        decision.required_workers.clear();
+        decision.tool_intent = None;
+    }
+    decision
+}
+
+fn session_turn_task_route_has_creation_evidence(decision: &SessionTurnIntentDecision) -> bool {
+    const MIN_TASK_CONFIDENCE: f64 = 0.72;
+    if decision.confidence < MIN_TASK_CONFIDENCE {
+        return false;
+    }
+    let Some(reason_code) = decision.reason_code.as_deref() else {
+        return false;
+    };
+    if !matches!(
+        reason_code,
+        "explicit_task_request"
+            | "deep_task_requested"
+            | "multi_step_task"
+            | "implementation_or_fix"
+            | "requires_structured_execution"
+            | "image_task"
+            | "skill_task"
+    ) {
+        return false;
+    }
+    if decision.task_evidence.is_empty() {
+        return false;
+    }
+    if decision.route_reason.is_none() {
+        return false;
+    }
+    decision.task_title.is_some() || decision.execution_goal.is_some()
 }
 
 fn optional_trimmed_string(value: &serde_json::Value, key: &str) -> Option<String> {

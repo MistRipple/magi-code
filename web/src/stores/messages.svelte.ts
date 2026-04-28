@@ -659,10 +659,7 @@ function normalizeSessionNotificationRecord(raw: unknown): Notification | null {
   if (!message) return null;
   const category = item.kind === 'incident'
     ? 'incident'
-    : item.kind === 'audit' || item.kind === 'center' || item.kind === 'toast' || item.kind === 'info'
-      ? 'audit'
-      : null;
-  if (!category) return null;
+    : 'audit';
   const persistToCenter = item.persistToCenter !== false;
   if (!persistToCenter) {
     return null;

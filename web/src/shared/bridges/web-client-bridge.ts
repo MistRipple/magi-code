@@ -124,6 +124,7 @@ import {
   markQueuedMessageAsGuide,
   messagesState,
   allocateTurnOrderSeq,
+  setQueuedMessages,
 } from '../../stores/messages.svelte';
 import { resolveModelListFetchBlockReason } from '../model-governance';
 import type { QueuedMessage } from '../../types/message';
@@ -1894,17 +1895,22 @@ async function drainQueuedTurns(reason: string): Promise<void> {
     return;
   }
   queueDrainActive = true;
+  let shouldScheduleNextDrain = true;
   try {
-    await executeTask({
+    const submitted = await executeTask({
       text: next.text ?? next.content,
       requestId: next.requestId || next.id,
       deepTask: next.deepTask === true,
       skillName: next.skillName ?? null,
       images: next.images ?? [],
     });
+    if (!submitted) {
+      restoreQueuedTurnToFront(next);
+      shouldScheduleNextDrain = false;
+    }
   } finally {
     queueDrainActive = false;
-    if (messagesState.queuedMessages.length > 0) {
+    if (shouldScheduleNextDrain && messagesState.queuedMessages.length > 0) {
       scheduleQueuedTurnDrain('after_queued_turn_submit', QUEUE_DRAIN_BUSY_RETRY_MS);
     }
   }
@@ -1917,7 +1923,17 @@ function guideQueuedTurn(queuedMessageId: string): void {
   scheduleQueuedTurnDrain('guide_queued_message');
 }
 
-async function executeTask(input: ExecuteTaskInput): Promise<void> {
+function restoreQueuedTurnToFront(queued: QueuedMessage): void {
+  const exists = messagesState.queuedMessages.some((message) => (
+    message.id === queued.id || (queued.requestId && message.requestId === queued.requestId)
+  ));
+  if (exists) {
+    return;
+  }
+  setQueuedMessages([queued, ...messagesState.queuedMessages]);
+}
+
+async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
   const text = typeof input.text === 'string' ? input.text : null;
   const normalizedText = text?.trim() || '';
   const skillName = typeof input.skillName === 'string' && input.skillName.trim()
@@ -1932,7 +1948,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
       }))
     : [];
   if (!normalizedText && !skillName && images.length === 0) {
-    return;
+    return false;
   }
   if (input.followUpMode === 'queue' && bridgeRuntimeIsBusy() && !queueDrainActive) {
     enqueueFollowUpTurn(
@@ -1940,11 +1956,12 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
       normalizedText,
       'queue',
     );
-    return;
+    return true;
   }
 
   const requestId = input.requestId || generateMessageId();
-  const userMessageId = queueDrainActive && input.requestId
+  const isQueuedDrainSubmission = queueDrainActive && Boolean(input.requestId);
+  const userMessageId = isQueuedDrainSubmission
     ? `queued-user-${requestId}`
     : generateMessageId();
   const placeholderMessageId = `assistant-placeholder-${requestId}`;
@@ -1957,38 +1974,40 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
     startedAt: Date.now(),
     pendingRequestIds: [requestId],
   });
-  // 立即创建本地用户消息节点（不等后端返回），确保发送后用户消息立即显示在最终位置
-  const localUserMsg = createUserInputMessage(normalizedText, `user-input-${requestId}`, {
-    metadata: {
-      requestId,
-      userMessageId,
-      placeholderMessageId,
-      turnOrderSeq,
-      itemSeq: 1,
-      blockSeq: 1,
-      cardStreamSeq: 1,
-      turnItemKind: 'user_message',
-      ...(currentSessionId ? { sessionId: currentSessionId } : {}),
-    },
-    id: userMessageId,
-  });
-  emitMessage({ type: 'unifiedMessage', message: localUserMsg });
-  const localPlaceholder = createStreamingMessage('orchestrator', 'orchestrator', `assistant-placeholder-${requestId}`, {
-    id: placeholderMessageId,
-    metadata: {
-      requestId,
-      userMessageId,
-      placeholderMessageId,
-      isPlaceholder: true,
-      placeholderState: 'pending',
-      turnOrderSeq,
-      itemSeq: 2,
-      blockSeq: 2,
-      cardStreamSeq: 2,
-      ...(currentSessionId ? { sessionId: currentSessionId } : {}),
-    },
-  });
-  emitMessage({ type: 'unifiedMessage', message: localPlaceholder });
+  if (!isQueuedDrainSubmission) {
+    // 普通发送必须立即入列；排队消息已有 queued echo，提交成功前不改写主线。
+    const localUserMsg = createUserInputMessage(normalizedText, `user-input-${requestId}`, {
+      metadata: {
+        requestId,
+        userMessageId,
+        placeholderMessageId,
+        turnOrderSeq,
+        itemSeq: 1,
+        blockSeq: 1,
+        cardStreamSeq: 1,
+        turnItemKind: 'user_message',
+        ...(currentSessionId ? { sessionId: currentSessionId } : {}),
+      },
+      id: userMessageId,
+    });
+    emitMessage({ type: 'unifiedMessage', message: localUserMsg });
+    const localPlaceholder = createStreamingMessage('orchestrator', 'orchestrator', `assistant-placeholder-${requestId}`, {
+      id: placeholderMessageId,
+      metadata: {
+        requestId,
+        userMessageId,
+        placeholderMessageId,
+        isPlaceholder: true,
+        placeholderState: 'pending',
+        turnOrderSeq,
+        itemSeq: 2,
+        blockSeq: 2,
+        cardStreamSeq: 2,
+        ...(currentSessionId ? { sessionId: currentSessionId } : {}),
+      },
+    });
+    emitMessage({ type: 'unifiedMessage', message: localPlaceholder });
+  }
 
   try {
     await ensureFreshLiveBridge('execute_task_preflight');
@@ -2032,7 +2051,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
       id: canonicalUserMessageId,
     });
     emitMessage({ type: 'unifiedMessage', message: userMsg });
-    if (typeof canonicalTurnSeq === 'number') {
+    if (isQueuedDrainSubmission || typeof canonicalTurnSeq === 'number') {
       const canonicalPlaceholder = createStreamingMessage('orchestrator', 'orchestrator', `assistant-placeholder-${requestId}`, {
         id: placeholderMessageId,
         metadata: {
@@ -2042,7 +2061,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
           isPlaceholder: true,
           placeholderState: 'pending',
           turnOrderSeq,
-          turnSeq: canonicalTurnSeq,
+          ...(typeof canonicalTurnSeq === 'number' ? { turnSeq: canonicalTurnSeq } : {}),
           itemSeq: 2,
           blockSeq: 2,
           cardStreamSeq: 2,
@@ -2071,34 +2090,37 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
     void ensureEventStream({ forceReconnect: false, waitUntilOpen: false }).catch((err) => {
       console.warn('[web-client-bridge] executeTask 后 SSE 连接确认失败:', err);
     });
+    return true;
   } catch (error) {
     clearActiveTurnInFlight();
     clearCurrentInterruptTaskId();
     console.error('[web-client-bridge] 执行任务失败:', error);
     const errorText = normalizeErrorMessage(error) || '发送消息失败';
-    const localErrorMessage = createErrorMessage(
-      errorText,
-      'orchestrator',
-      'orchestrator',
-      `assistant-error-${requestId}`,
-      {
-        id: placeholderMessageId,
-        metadata: {
-          error: errorText,
-          requestId,
-          userMessageId,
-          placeholderMessageId,
-          wasPlaceholder: true,
-          turnItemKind: 'assistant_error',
-          turnOrderSeq,
-          itemSeq: 2,
-          blockSeq: 2,
-          cardStreamSeq: 2,
-          ...(currentSessionId ? { sessionId: currentSessionId } : {}),
+    if (!isQueuedDrainSubmission) {
+      const localErrorMessage = createErrorMessage(
+        errorText,
+        'orchestrator',
+        'orchestrator',
+        `assistant-error-${requestId}`,
+        {
+          id: placeholderMessageId,
+          metadata: {
+            error: errorText,
+            requestId,
+            userMessageId,
+            placeholderMessageId,
+            wasPlaceholder: true,
+            turnItemKind: 'assistant_error',
+            turnOrderSeq,
+            itemSeq: 2,
+            blockSeq: 2,
+            cardStreamSeq: 2,
+            ...(currentSessionId ? { sessionId: currentSessionId } : {}),
+          },
         },
-      },
-    );
-    emitMessage({ type: 'unifiedComplete', message: localErrorMessage });
+      );
+      emitMessage({ type: 'unifiedComplete', message: localErrorMessage });
+    }
     emitBridgeErrorToast('发送消息', error);
     emitForcedProcessingIdle('execute_task_failed', {
       error: normalizeErrorMessage(error),
@@ -2108,6 +2130,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
       closeEventStream();
       scheduleRecovery('execute_task_failed', error, true);
     }
+    return false;
   }
 }
 

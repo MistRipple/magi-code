@@ -162,8 +162,6 @@
       }
       return;
     }
-    collapsed = true;
-    userToggled = false;
   });
   const titleText = $derived(i18n.t('terminalSession.title', { id: terminalId ?? '-' }));
   const toolNameLabel = $derived(getTerminalToolDisplayName(toolCall?.name));

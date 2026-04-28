@@ -241,6 +241,24 @@ fn shadow_loopback_classifier_response(prompt: &str) -> Option<String> {
         "executionGoal": task_goal,
         "requiredWorkers": [],
         "toolIntent": tool_intent,
+        "confidence": if route == "task" { 0.93 } else { 0.88 },
+        "reasonCode": match route {
+            "task" => "explicit_task_request",
+            "execute" => "tool_request",
+            "continue" => "continue_requested",
+            _ => "plain_chat",
+        },
+        "routeReason": match route {
+            "task" => "用户请求需要结构化任务执行",
+            "execute" => "用户请求需要工具执行但不需要任务图",
+            "continue" => "用户要求继续且存在可恢复链",
+            _ => "普通对话",
+        },
+        "taskEvidence": if route == "task" {
+            vec!["需要结构化执行".to_string()]
+        } else {
+            Vec::<String>::new()
+        },
     });
 
     Some(

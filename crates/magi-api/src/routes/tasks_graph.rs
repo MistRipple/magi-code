@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, Query, State},
     routing::{get, post},
 };
-use magi_core::TaskId;
+use magi_core::{TaskId, TaskProjection};
 use serde::Deserialize;
 
 use super::session_scope::parse_session_id;
@@ -69,12 +69,40 @@ async fn get_task_projection(
     let store = require_task_store(&state)?;
     let root_id = TaskId::new(&root_task_id);
     require_session_task(&state, query.session_id.as_deref(), &root_id)?;
-    let projection = store
+    let mut projection = store
         .build_projection(&root_id)
         .ok_or_else(|| ApiError::not_found("任务不存在", &root_task_id))?;
+    apply_authoritative_runner_status(&state, &root_id, &mut projection);
     let value = serde_json::to_value(&projection)
         .map_err(|err| ApiError::internal_assembly("序列化任务投影失败", err))?;
     Ok(Json(value))
+}
+
+fn apply_authoritative_runner_status(
+    state: &ApiState,
+    root_task_id: &TaskId,
+    projection: &mut TaskProjection,
+) {
+    let Some(snapshot) = state
+        .runner_manager()
+        .and_then(|manager| manager.status(root_task_id.as_str()))
+    else {
+        return;
+    };
+    if let Some(status) = normalize_runner_status(&snapshot.status) {
+        projection.runner_status = status.to_string();
+    }
+}
+
+fn normalize_runner_status(status: &str) -> Option<&'static str> {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "running" => Some("running"),
+        "blocked" => Some("blocked"),
+        "completed" => Some("completed"),
+        "error" => Some("error"),
+        "idle" | "stopped" => Some("idle"),
+        _ => None,
+    }
 }
 
 async fn get_task(

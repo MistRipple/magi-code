@@ -114,6 +114,9 @@
       openModelDropdown(key, input);
       return;
     }
+    if (input) {
+      openModelDropdown(key, input);
+    }
     void fetchModelList(type);
   }
 

@@ -27,6 +27,7 @@ import type {
   EnhancePromptRequestDto,
   EnhancePromptResponseDto,
   EventEnvelope,
+  FetchModelsRequestDto,
   FetchModelsResponseDto,
   FileContentResponseDto,
   FilesystemListResponseDto,
@@ -365,8 +366,8 @@ export class RustDaemonClient {
     return this.postJson<AgentsResponseDto>('/api/settings/registry/agents/remove', request);
   }
 
-  public async fetchModels(request?: unknown): Promise<FetchModelsResponseDto> {
-    return this.postJson<FetchModelsResponseDto>('/api/settings/models/fetch', request ?? {});
+  public async fetchModels(request: FetchModelsRequestDto): Promise<FetchModelsResponseDto> {
+    return this.postJson<FetchModelsResponseDto>('/api/settings/models/fetch', request);
   }
 
   public async fetchSessionStats(): Promise<SessionStatsResponseDto> {

@@ -46,9 +46,11 @@ use std::sync::{
 pub struct RunnerHandle {
     /// Whether the runner has been signalled to stop.
     pub cancel: Arc<AtomicBool>,
+    /// 后台 runner 循环是否仍未退出，用于避免暂停/停止中的任务链被重复启动。
+    pub active: Arc<AtomicBool>,
     /// Number of cycles executed so far.
     pub cycle_count: Arc<AtomicU64>,
-    /// Current status: "running", "stopped", "completed", "error".
+    /// 当前 runner 展示状态："running"、"blocked"、"stopped"、"completed"、"error"。
     pub status: Arc<Mutex<String>>,
     /// Last error message, if any.
     pub last_error: Arc<Mutex<Option<String>>>,
@@ -235,14 +237,14 @@ impl RunnerManager {
 
         let mut runners = self.runners.lock().expect("runners lock should hold");
         if let Some(existing) = runners.get(root_task_id) {
-            let status = existing.status.lock().expect("status lock should hold");
-            if *status == "running" {
+            if existing.active.load(Ordering::Relaxed) {
                 return Err(RunnerStartError::AlreadyRunning);
             }
         }
 
         let handle = Arc::new(RunnerHandle {
             cancel: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicBool::new(true)),
             cycle_count: Arc::new(AtomicU64::new(0)),
             status: Arc::new(Mutex::new("running".to_string())),
             last_error: Arc::new(Mutex::new(None)),
@@ -259,6 +261,7 @@ impl RunnerManager {
         let task_runner = self.build_task_runner();
         let root_id = tid;
         let bg_handle = Arc::clone(&handle);
+        let bg_active = Arc::clone(&handle.active);
         let bg_task_store = Arc::clone(&self.task_store);
         let bg_checkpoint_path = self.checkpoint_path.clone();
         tokio::spawn(async move {
@@ -268,6 +271,7 @@ impl RunnerManager {
                 if bg_handle.cancel.load(Ordering::Relaxed) {
                     let mut status = bg_handle.status.lock().expect("status lock should hold");
                     *status = "stopped".to_string();
+                    bg_active.store(false, Ordering::Relaxed);
                     break;
                 }
 
@@ -306,6 +310,7 @@ impl RunnerManager {
                         }
                         let mut status = bg_handle.status.lock().expect("status lock should hold");
                         *status = "completed".to_string();
+                        bg_active.store(false, Ordering::Relaxed);
                         break;
                     }
                     RunCycleOutcome::Blocked(_) => {
@@ -317,6 +322,7 @@ impl RunnerManager {
                             let mut status =
                                 bg_handle.status.lock().expect("status lock should hold");
                             *status = "blocked".to_string();
+                            bg_active.store(false, Ordering::Relaxed);
                             break;
                         }
                         let backoff_ms = 200u64.saturating_mul(blocked_streak as u64).min(2_000);
@@ -333,6 +339,7 @@ impl RunnerManager {
                             .lock()
                             .expect("last_error lock should hold");
                         *last_error = Some(err);
+                        bg_active.store(false, Ordering::Relaxed);
                         break;
                     }
                 }
@@ -346,11 +353,12 @@ impl RunnerManager {
     pub fn stop(&self, root_task_id: &str) -> Result<(), RunnerStopError> {
         let runners = self.runners.lock().expect("runners lock should hold");
         let handle = runners.get(root_task_id).ok_or(RunnerStopError::NotFound)?;
-        let status = handle.status.lock().expect("status lock should hold");
+        let mut status = handle.status.lock().expect("status lock should hold");
         if *status != "running" {
             return Err(RunnerStopError::NotRunning);
         }
         handle.cancel.store(true, Ordering::Relaxed);
+        *status = "stopped".to_string();
         Ok(())
     }
 
@@ -406,6 +414,21 @@ impl RunnerManager {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_status_for_test(&self, root_task_id: &str, status: &str) {
+        let handle = Arc::new(RunnerHandle {
+            cancel: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicBool::new(status == "running")),
+            cycle_count: Arc::new(AtomicU64::new(0)),
+            status: Arc::new(Mutex::new(status.to_string())),
+            last_error: Arc::new(Mutex::new(None)),
+        });
+        self.runners
+            .lock()
+            .expect("runners lock should hold")
+            .insert(root_task_id.to_string(), handle);
+    }
+
     /// Run a single cycle synchronously (for testing / manual trigger).
     pub fn run_single_cycle(&self, root_task_id: &str) -> Result<RunCycleOutcome, String> {
         let tid = TaskId::new(root_task_id);
@@ -421,15 +444,20 @@ impl RunnerManager {
         self.task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
-        self.build_task_runner().pause_task(&tid)
+        self.build_task_runner().pause_task(&tid)?;
+        self.set_runner_status_if_present(root_task_id, "blocked");
+        Ok(())
     }
 
     pub fn pause_task(&self, task_id: &str) -> Result<(), String> {
         let tid = TaskId::new(task_id);
-        self.task_store
+        let task = self
+            .task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", task_id))?;
-        self.build_task_runner().pause_task(&tid)
+        self.build_task_runner().pause_task(&tid)?;
+        self.set_runner_status_if_present(task.root_task_id.as_str(), "blocked");
+        Ok(())
     }
 
     pub fn resume_tree(&self, root_task_id: &str) -> Result<(), String> {
@@ -438,6 +466,15 @@ impl RunnerManager {
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
         self.build_task_runner().resume_task(&tid)
+    }
+
+    fn set_runner_status_if_present(&self, root_task_id: &str, status: &str) {
+        let runners = self.runners.lock().expect("runners lock should hold");
+        let Some(handle) = runners.get(root_task_id) else {
+            return;
+        };
+        let mut current = handle.status.lock().expect("status lock should hold");
+        *current = status.to_string();
     }
 }
 

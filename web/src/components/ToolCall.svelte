@@ -96,8 +96,6 @@
       }
       return;
     }
-    collapsed = true;
-    userToggled = false;
   });
 
   // 格式化内容

@@ -1,4 +1,8 @@
 use axum::{Json, Router, extract::State, routing::post};
+use magi_bridge_client::{
+    ChatToolChoice, ChatToolDefinition, ChatToolFunctionDefinition, ModelInvocationRequest,
+    SHADOW_MODEL_PROVIDER,
+};
 use magi_core::{EventId, MissionId, SessionId, Task, TaskId, TaskKind, TaskStatus, UtcMillis};
 use magi_event_bus::EventEnvelope;
 use serde::Deserialize;
@@ -39,57 +43,190 @@ enum IntakeClassification {
     GeneralChat,
 }
 
-fn classify_intake(message: &str) -> IntakeClassification {
-    let lower = message.trim().to_lowercase();
-    // 决策回答
-    if lower.starts_with("选择")
-        || lower.starts_with("选 ")
-        || lower.starts_with("确认")
-        || lower.starts_with("同意")
-        || lower.starts_with("驳回")
-        || lower.starts_with("跳过")
-        || lower.starts_with("取消")
-    {
-        return IntakeClassification::DecisionAnswer;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IntakeIntentDecision {
+    classification: IntakeClassification,
+    task_title: Option<String>,
+    task_goal: Option<String>,
+}
+
+fn decide_intake_with_task_planner(
+    state: &ApiState,
+    message: &str,
+    root_task: &Task,
+    context_task: &Task,
+) -> Result<IntakeIntentDecision, ApiError> {
+    let client = state.task_planning_model_client().cloned().ok_or_else(|| {
+        ApiError::InvalidInput("Intake 分类器未配置任务规划模型客户端".to_string())
+    })?;
+    let response = client
+        .invoke(ModelInvocationRequest {
+            provider: SHADOW_MODEL_PROVIDER.to_string(),
+            prompt: build_intake_classifier_prompt(message, root_task, context_task),
+            messages: None,
+            tools: Some(vec![intake_classifier_tool()]),
+            tool_choice: Some(ChatToolChoice::force_function("classify_session_intake")),
+        })
+        .map_err(|error| ApiError::model_invocation_failed("Intake 分类失败", error))?;
+    if !response.ok {
+        return Err(ApiError::ModelInvocationFailed(
+            "Intake 分类器返回失败状态".to_string(),
+        ));
     }
-    // 暂停
-    if lower.contains("暂停")
-        || lower.contains("停止")
-        || lower.contains("先停")
-        || lower.contains("中断")
+    validate_intake_decision(parse_intake_decision(&response.payload)?)
+}
+
+fn validate_intake_decision(
+    decision: IntakeIntentDecision,
+) -> Result<IntakeIntentDecision, ApiError> {
+    if matches!(decision.classification, IntakeClassification::AppendTask)
+        && (decision.task_title.is_none() || decision.task_goal.is_none())
     {
-        return IntakeClassification::Pause;
+        return Err(ApiError::InvalidInput(
+            "Intake 分类器判定追加任务但缺少 taskTitle/taskGoal".to_string(),
+        ));
     }
-    // 重规划
-    if lower.contains("重新规划")
-        || lower.contains("改一下")
-        || lower.contains("修改目标")
-        || lower.contains("调整")
-    {
-        return IntakeClassification::Replan;
+    Ok(decision)
+}
+
+fn build_intake_classifier_prompt(message: &str, root_task: &Task, context_task: &Task) -> String {
+    format!(
+        "Session Intake 编排分类器\n\
+         请只调用 classify_session_intake 工具，输出运行中任务链收到用户中途输入后的处理方式。\n\
+         classification 只能是 decision_answer、pause、replan、supplement_context、append_task、new_objective、general_chat。\n\
+         decision_answer：用户在回答待确认 Decision。\n\
+         pause：用户明确要求暂停、中断或停止当前任务链。\n\
+         replan：用户明确要求改变现有目标、约束或执行方案，并希望重规划剩余任务。\n\
+         supplement_context：用户补充上下文、事实、限制或说明，应写入当前任务上下文。\n\
+         append_task：用户明确要求向当前任务图追加一个新的、可执行、可验证的子任务；不要仅因为“顺便、另外、再加、追加”等连接词选择 append_task。\n\
+         new_objective：用户提出与当前任务链并列的新目标，应让用户通过新 session action 提交。\n\
+         general_chat：普通聊天、追问、状态询问、表达偏好但没有改变任务图的输入。\n\
+         当选择 append_task 时必须给出 taskTitle 与 taskGoal；其他分类设为 null。\n\
+         rootTaskTitle=\"{}\"\n\
+         rootTaskGoal=\"{}\"\n\
+         contextTaskId=\"{}\"\n\
+         contextTaskKind=\"{:?}\"\n\
+         contextTaskTitle=\"{}\"\n\
+         contextTaskGoal=\"{}\"\n\
+         userText=\"{}\"",
+        root_task.title,
+        root_task.goal,
+        context_task.task_id,
+        context_task.kind,
+        context_task.title,
+        context_task.goal,
+        message.trim()
+    )
+}
+
+fn intake_classifier_tool() -> ChatToolDefinition {
+    ChatToolDefinition {
+        kind: "function".to_string(),
+        function: ChatToolFunctionDefinition {
+            name: "classify_session_intake".to_string(),
+            description: "判断运行中任务链收到用户中途输入后的处理方式。".to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["classification", "taskTitle", "taskGoal"],
+                "properties": {
+                    "classification": {
+                        "type": "string",
+                        "enum": [
+                            "decision_answer",
+                            "pause",
+                            "replan",
+                            "supplement_context",
+                            "append_task",
+                            "new_objective",
+                            "general_chat"
+                        ]
+                    },
+                    "taskTitle": { "type": ["string", "null"] },
+                    "taskGoal": { "type": ["string", "null"] }
+                }
+            }),
+        },
     }
-    // 补充上下文
-    if lower.contains("补充")
-        || lower.contains("上下文")
-        || lower.contains("补充信息")
-        || lower.contains("补充说明")
-    {
-        return IntakeClassification::SupplementContext;
+}
+
+fn parse_intake_decision(payload: &str) -> Result<IntakeIntentDecision, ApiError> {
+    let normalized_payload = payload
+        .trim()
+        .strip_prefix("shadow-model::")
+        .unwrap_or_else(|| payload.trim())
+        .trim();
+    let parsed =
+        serde_json::from_str::<serde_json::Value>(normalized_payload).map_err(|error| {
+            ApiError::InvalidInput(format!("Intake 分类器输出不是有效 JSON: {error}"))
+        })?;
+    let calls = parsed
+        .get("tool_calls")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            ApiError::InvalidInput("Intake 分类器未调用 classify_session_intake 工具".to_string())
+        })?;
+    for call in calls {
+        if let Some(arguments) = intake_arguments_from_tool_call(call) {
+            return intake_decision_from_value(arguments?);
+        }
     }
-    // 新增任务
-    if lower.contains("顺便")
-        || lower.contains("再加")
-        || lower.contains("追加")
-        || lower.contains("另外")
-    {
-        return IntakeClassification::AppendTask;
+    Err(ApiError::InvalidInput(
+        "Intake 分类器未调用 classify_session_intake 工具".to_string(),
+    ))
+}
+
+fn intake_arguments_from_tool_call(
+    call: &serde_json::Value,
+) -> Option<Result<serde_json::Value, ApiError>> {
+    let function = call.get("function")?;
+    if function.get("name").and_then(|value| value.as_str())? != "classify_session_intake" {
+        return None;
     }
-    // 新目标
-    if lower.contains("新任务") || lower.contains("新目标") || lower.contains("换个方向")
-    {
-        return IntakeClassification::NewObjective;
-    }
-    IntakeClassification::GeneralChat
+    let Some(arguments) = function.get("arguments").and_then(|value| value.as_str()) else {
+        return Some(Err(ApiError::InvalidInput(
+            "Intake 分类器工具参数缺失".to_string(),
+        )));
+    };
+    Some(serde_json::from_str(arguments).map_err(|error| {
+        ApiError::InvalidInput(format!("Intake 分类器工具参数不是有效 JSON: {error}"))
+    }))
+}
+
+fn intake_decision_from_value(value: serde_json::Value) -> Result<IntakeIntentDecision, ApiError> {
+    let classification = match value.get("classification").and_then(|value| value.as_str()) {
+        Some("decision_answer") => IntakeClassification::DecisionAnswer,
+        Some("pause") => IntakeClassification::Pause,
+        Some("replan") => IntakeClassification::Replan,
+        Some("supplement_context") => IntakeClassification::SupplementContext,
+        Some("append_task") => IntakeClassification::AppendTask,
+        Some("new_objective") => IntakeClassification::NewObjective,
+        Some("general_chat") => IntakeClassification::GeneralChat,
+        Some(other) => {
+            return Err(ApiError::InvalidInput(format!(
+                "Intake 分类器返回未知 classification: {other}"
+            )));
+        }
+        None => {
+            return Err(ApiError::InvalidInput(
+                "Intake 分类器缺少 classification".to_string(),
+            ));
+        }
+    };
+    Ok(IntakeIntentDecision {
+        classification,
+        task_title: optional_trimmed_field(&value, "taskTitle"),
+        task_goal: optional_trimmed_field(&value, "taskGoal"),
+    })
+}
+
+fn optional_trimmed_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn resolve_context_task(
@@ -203,7 +340,9 @@ async fn handle_intake(
     )?;
     let context_task_id = context_task.task_id.clone();
 
-    let classification = classify_intake(&request.message);
+    let decision =
+        decide_intake_with_task_planner(&state, &request.message, &root_task, &context_task)?;
+    let classification = decision.classification.clone();
 
     match classification {
         IntakeClassification::DecisionAnswer => {
@@ -315,6 +454,12 @@ async fn handle_intake(
             let parent_task = store
                 .get_task(&parent_task_id)
                 .unwrap_or_else(|| root_task.clone());
+            let task_title = decision.task_title.ok_or_else(|| {
+                ApiError::InvalidInput("Intake 分类器判定追加任务但缺少 taskTitle".to_string())
+            })?;
+            let task_goal = decision.task_goal.ok_or_else(|| {
+                ApiError::InvalidInput("Intake 分类器判定追加任务但缺少 taskGoal".to_string())
+            })?;
             let new_task_id =
                 TaskId::new(format!("{}-intake-{}", parent_task_id, UtcMillis::now().0));
             let new_task = magi_core::Task {
@@ -323,8 +468,8 @@ async fn handle_intake(
                 root_task_id: root_task_id.clone(),
                 parent_task_id: Some(parent_task_id.clone()),
                 kind: magi_core::TaskKind::Action,
-                title: request.message.clone(),
-                goal: request.message.clone(),
+                title: task_title,
+                goal: task_goal,
                 status: magi_core::TaskStatus::Ready,
                 dependency_ids: Vec::new(),
                 required_children: Vec::new(),
@@ -511,53 +656,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_intake_decision_answer() {
-        assert_eq!(
-            classify_intake("选择 A"),
-            IntakeClassification::DecisionAnswer
-        );
-        assert_eq!(
-            classify_intake("确认"),
-            IntakeClassification::DecisionAnswer
-        );
-        assert_eq!(
-            classify_intake("同意继续"),
-            IntakeClassification::DecisionAnswer
-        );
-        assert_eq!(
-            classify_intake("驳回方案"),
-            IntakeClassification::DecisionAnswer
-        );
-        assert_eq!(
-            classify_intake("跳过此步骤"),
-            IntakeClassification::DecisionAnswer
-        );
-        assert_eq!(
-            classify_intake("取消操作"),
-            IntakeClassification::DecisionAnswer
-        );
-    }
-
-    #[test]
-    fn classify_intake_pause() {
-        assert_eq!(classify_intake("暂停一下"), IntakeClassification::Pause);
-        assert_eq!(classify_intake("停止当前任务"), IntakeClassification::Pause);
-        assert_eq!(classify_intake("先停一下"), IntakeClassification::Pause);
-        assert_eq!(classify_intake("中断执行"), IntakeClassification::Pause);
-    }
-
-    #[test]
-    fn classify_intake_replan() {
-        assert_eq!(classify_intake("重新规划"), IntakeClassification::Replan);
-        assert_eq!(classify_intake("改一下目标"), IntakeClassification::Replan);
-        assert_eq!(
-            classify_intake("修改目标方向"),
-            IntakeClassification::Replan
-        );
-        assert_eq!(classify_intake("调整方案"), IntakeClassification::Replan);
-    }
-
-    #[test]
     fn resolve_structural_context_task_id_uses_parent_for_leaf_context() {
         let root = make_intake_task("obj-1", "obj-1", None, TaskKind::Objective);
         let phase = make_intake_task("phase-1", "obj-1", Some("obj-1"), TaskKind::Phase);
@@ -577,68 +675,76 @@ mod tests {
         );
     }
 
+    fn intake_classifier_payload(arguments: serde_json::Value) -> String {
+        serde_json::json!({
+            "content": null,
+            "finish_reason": "tool_calls",
+            "tool_calls": [{
+                "id": "call-classify-session-intake",
+                "type": "function",
+                "function": {
+                    "name": "classify_session_intake",
+                    "arguments": arguments.to_string(),
+                }
+            }]
+        })
+        .to_string()
+    }
+
     #[test]
-    fn classify_intake_supplement_context() {
+    fn parse_intake_decision_reads_tool_call_payload() {
+        let decision = parse_intake_decision(&intake_classifier_payload(json!({
+            "classification": "append_task",
+            "taskTitle": "补充移动端验收",
+            "taskGoal": "完成移动端视口真实验收并记录结论",
+        })))
+        .expect("tool payload should parse");
+
+        assert_eq!(decision.classification, IntakeClassification::AppendTask);
+        assert_eq!(decision.task_title.as_deref(), Some("补充移动端验收"));
         assert_eq!(
-            classify_intake("补充上下文"),
-            IntakeClassification::SupplementContext
-        );
-        assert_eq!(
-            classify_intake("补充一些信息"),
-            IntakeClassification::SupplementContext
-        );
-        assert_eq!(
-            classify_intake("这里需要补充说明"),
-            IntakeClassification::SupplementContext
+            decision.task_goal.as_deref(),
+            Some("完成移动端视口真实验收并记录结论")
         );
     }
 
     #[test]
-    fn classify_intake_append_task() {
-        assert_eq!(
-            classify_intake("顺便加个任务"),
-            IntakeClassification::AppendTask
-        );
-        assert_eq!(
-            classify_intake("再加一个功能"),
-            IntakeClassification::AppendTask
-        );
-        assert_eq!(
-            classify_intake("追加需求"),
-            IntakeClassification::AppendTask
-        );
-        assert_eq!(
-            classify_intake("另外还需要"),
-            IntakeClassification::AppendTask
+    fn parse_intake_decision_requires_tool_call_payload() {
+        let error = parse_intake_decision(
+            r#"{"classification":"append_task","taskTitle":"误建任务","taskGoal":"不应接受裸 JSON"}"#,
+        )
+        .expect_err("裸 JSON 不能绕过强制 tool call");
+
+        assert!(
+            error
+                .message()
+                .contains("Intake 分类器未调用 classify_session_intake 工具")
         );
     }
 
     #[test]
-    fn classify_intake_new_objective() {
-        assert_eq!(
-            classify_intake("新任务：优化性能"),
-            IntakeClassification::NewObjective
-        );
-        assert_eq!(
-            classify_intake("换个方向做"),
-            IntakeClassification::NewObjective
-        );
-        assert_eq!(
-            classify_intake("设定新目标"),
-            IntakeClassification::NewObjective
-        );
+    fn validate_intake_decision_requires_append_task_fields() {
+        let error = validate_intake_decision(IntakeIntentDecision {
+            classification: IntakeClassification::AppendTask,
+            task_title: Some("补充验收".to_string()),
+            task_goal: None,
+        })
+        .expect_err("append_task 必须携带结构化目标");
+
+        assert!(error.message().contains("缺少 taskTitle/taskGoal"));
     }
 
     #[test]
-    fn classify_intake_general_chat() {
-        assert_eq!(classify_intake("你好"), IntakeClassification::GeneralChat);
+    fn intake_classifier_prompt_blocks_keyword_only_task_creation() {
+        let root = make_intake_task("obj-1", "obj-1", None, TaskKind::Objective);
+        let action = make_intake_task("act-1", "obj-1", Some("obj-1"), TaskKind::Action);
+        let prompt = build_intake_classifier_prompt("顺便看看当前状态", &root, &action);
+
         assert_eq!(
-            classify_intake("今天天气不错"),
-            IntakeClassification::GeneralChat
-        );
-        assert_eq!(
-            classify_intake("帮我看看这个代码"),
-            IntakeClassification::GeneralChat
+            prompt
+                .matches("不要仅因为“顺便、另外、再加、追加”等连接词选择 append_task")
+                .count(),
+            1
         );
     }
 }

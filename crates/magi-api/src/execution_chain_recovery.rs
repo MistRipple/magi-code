@@ -5,10 +5,14 @@ use crate::{
 };
 use magi_core::{
     ExecutionOwnership, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskId, TaskStatus,
-    WorkerId,
+    UtcMillis, WorkerId,
 };
-use magi_orchestrator::ExecutionWritebackPlans;
+use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
 use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain};
+use magi_worker_runtime::{
+    WorkerCheckpointResumeMode, WorkerExecutionBindingLifecycle, WorkerExecutionCheckpointCursor,
+    WorkerStage,
+};
 use magi_workspace::RecoveryStatus;
 
 #[derive(Clone, Debug)]
@@ -187,6 +191,96 @@ fn rebuild_dispatch_plan_for_branch(
         use_tools: branch.use_tools,
         skill_name: branch.skill_name.clone(),
     }
+}
+
+fn release_resumed_branch_path(
+    task_store: &TaskStore,
+    chain: &ActiveExecutionChain,
+    branch: &ActiveExecutionBranch,
+) -> Result<(), ApiError> {
+    let mut current_task_id = Some(branch.task_id.clone());
+    while let Some(task_id) = current_task_id {
+        if task_id == chain.root_task_id {
+            break;
+        }
+        let task = task_store
+            .get_task(&task_id)
+            .ok_or_else(|| ApiError::not_found("继续 branch 任务不存在", task_id.as_str()))?;
+        if task.mission_id != chain.mission_id || task.root_task_id != chain.root_task_id {
+            return Err(ApiError::internal_assembly(
+                "继续会话失败",
+                format!("branch 路径任务不属于当前执行链: {}", task_id),
+            ));
+        }
+        current_task_id = task.parent_task_id.clone();
+        if task.status == TaskStatus::Blocked {
+            task_store
+                .update_status(&task_id, TaskStatus::Ready)
+                .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_branch_worker_stage(value: &str) -> WorkerStage {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "review" => WorkerStage::Review,
+        "verify" => WorkerStage::Verify,
+        "repair" => WorkerStage::Repair,
+        "finish" | "finished" => WorkerStage::Finish,
+        _ => WorkerStage::Execute,
+    }
+}
+
+fn parse_branch_resume_mode(value: Option<&str>) -> WorkerCheckpointResumeMode {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("step-checkpoint") => WorkerCheckpointResumeMode::StepCheckpoint,
+        _ => WorkerCheckpointResumeMode::StageRestart,
+    }
+}
+
+fn parse_branch_binding_lifecycle(value: Option<&str>) -> Option<WorkerExecutionBindingLifecycle> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("bound") => Some(WorkerExecutionBindingLifecycle::Bound),
+        Some("released") => Some(WorkerExecutionBindingLifecycle::Released),
+        Some("none") => Some(WorkerExecutionBindingLifecycle::None),
+        Some("requested") => Some(WorkerExecutionBindingLifecycle::Requested),
+        Some(_) => Some(WorkerExecutionBindingLifecycle::Requested),
+        None => None,
+    }
+}
+
+fn branch_checkpoint_cursor(
+    branch: &ActiveExecutionBranch,
+) -> Option<WorkerExecutionCheckpointCursor> {
+    branch
+        .checkpoint_stage
+        .as_deref()
+        .map(|checkpoint_stage| WorkerExecutionCheckpointCursor {
+            checkpoint_stage: parse_branch_worker_stage(checkpoint_stage),
+            next_step_index: branch.next_step_index.unwrap_or(0),
+            checkpoint_at: branch.checkpoint_at.unwrap_or_else(UtcMillis::now),
+            resume_mode: parse_branch_resume_mode(branch.resume_mode.as_deref()),
+            resume_token: branch.resume_token.clone(),
+        })
+}
+
+fn sync_branch_checkpoint_to_worker_runtime(state: &ApiState, branch: &ActiveExecutionBranch) {
+    let Some(pipeline) = state.shadow_execution_pipeline() else {
+        return;
+    };
+    pipeline
+        .execution_runtime
+        .worker_runtime()
+        .record_branch_checkpoint(
+            &branch.task_id,
+            &branch.worker_id,
+            parse_branch_worker_stage(&branch.stage),
+            branch.lease_id.as_ref().map(ToString::to_string),
+            branch.execution_intent_ref.clone(),
+            parse_branch_binding_lifecycle(branch.binding_lifecycle.as_deref()),
+            branch_checkpoint_cursor(branch),
+        );
 }
 
 fn validate_recovery_status(state: &ApiState, recovery_id: &str) -> Result<(), ApiError> {
@@ -441,6 +535,7 @@ pub(crate) fn continue_shadow_execution_chain(
             branch.task_id.clone(),
             rebuild_dispatch_plan_for_branch(&chain, branch),
         );
+        sync_branch_checkpoint_to_worker_runtime(state, branch);
     }
 
     state
@@ -478,15 +573,7 @@ pub(crate) fn continue_shadow_execution_chain(
         }
     }
     for branch in &branches_to_resume {
-        if branch.task_id != chain.root_task_id
-            && task_store
-                .get_task(&branch.task_id)
-                .is_some_and(|task| task.status == TaskStatus::Blocked)
-        {
-            task_store
-                .update_status(&branch.task_id, TaskStatus::Ready)
-                .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?;
-        }
+        release_resumed_branch_path(task_store, &chain, branch)?;
     }
 
     // 深度模式：恢复任务状态后需要重新启动后台 runner，避免退化为同步执行
