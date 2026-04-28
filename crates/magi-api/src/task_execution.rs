@@ -684,33 +684,21 @@ impl ShadowTaskDispatcher {
         lease: &magi_core::AssignmentLease,
     ) -> Result<(), String> {
         let Some(plan) = self.execution_registry.remove(&task.task_id) else {
-            let session_id = self
-                .session_store
-                .current_session()
-                .map(|s| s.session_id)
-                .unwrap_or_else(|| SessionId::new("default"));
-            self.publish_task_dispatched_event(
-                &task.task_id,
-                &task.mission_id,
-                worker,
-                &lease.lease_id,
-                task.kind,
-                Some(&session_id),
-                None,
+            let error = format!(
+                "任务 {} 缺少结构化执行计划，已拒绝无计划执行路径",
+                task.task_id
             );
-            let (outcome, _) = self.invoke_llm_with_tools(
-                task,
+            tracing::error!(
+                task_id = %task.task_id,
+                mission_id = %task.mission_id,
+                worker_id = %worker.worker_id,
+                "shadow task dispatch missing execution plan"
+            );
+            self.push_result(
                 &task.task_id,
                 &lease.lease_id,
-                &session_id,
-                &None,
-                false,
-                None,
-                &model_usage_binding_for_worker(worker, false),
-                None,
-                worker.system_prompt_template.clone(),
+                TaskOutcome::Failed { error },
             );
-            self.push_result(&task.task_id, &lease.lease_id, outcome);
             return Ok(());
         };
 

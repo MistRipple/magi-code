@@ -2,6 +2,12 @@ use std::collections::HashSet;
 
 const MAX_CONCURRENT: usize = 10;
 
+#[derive(Clone, Copy, Debug)]
+pub struct ToolConcurrencyInput<'a> {
+    pub tool_name: &'a str,
+    pub arguments: Option<&'a serde_json::Value>,
+}
+
 fn concurrent_safe_tools() -> HashSet<&'static str> {
     [
         "file_view",
@@ -10,9 +16,6 @@ fn concurrent_safe_tools() -> HashSet<&'static str> {
         "web_fetch",
         "mermaid_diagram",
         "code_search_semantic",
-        "shell",
-        "shell_exec",
-        "process_launch",
         "process_read",
         "process_list",
         "project_knowledge_query",
@@ -22,7 +25,32 @@ fn concurrent_safe_tools() -> HashSet<&'static str> {
 }
 
 pub fn is_concurrency_safe(tool_name: &str) -> bool {
-    concurrent_safe_tools().contains(tool_name)
+    is_concurrency_safe_call(&ToolConcurrencyInput {
+        tool_name,
+        arguments: None,
+    })
+}
+
+pub fn is_concurrency_safe_call(input: &ToolConcurrencyInput<'_>) -> bool {
+    if is_shell_like_tool(input.tool_name) {
+        return input
+            .arguments
+            .and_then(read_access_mode)
+            .is_some_and(|mode| mode == "read_only" || mode == "readonly" || mode == "read-only");
+    }
+    concurrent_safe_tools().contains(input.tool_name)
+}
+
+fn is_shell_like_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "shell" | "shell_exec" | "process_launch")
+}
+
+fn read_access_mode(arguments: &serde_json::Value) -> Option<String> {
+    let object = arguments.as_object()?;
+    ["access_mode", "write_mode", "intent"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+        .map(|value| value.trim().to_ascii_lowercase())
 }
 
 #[derive(Clone, Debug)]
@@ -38,12 +66,23 @@ pub struct ToolBatch {
 }
 
 pub fn partition_tool_calls(tool_names: &[&str]) -> Vec<ToolBatch> {
-    if tool_names.is_empty() {
+    let inputs = tool_names
+        .iter()
+        .map(|tool_name| ToolConcurrencyInput {
+            tool_name,
+            arguments: None,
+        })
+        .collect::<Vec<_>>();
+    partition_tool_calls_with_inputs(&inputs)
+}
+
+pub fn partition_tool_calls_with_inputs(tool_calls: &[ToolConcurrencyInput<'_>]) -> Vec<ToolBatch> {
+    if tool_calls.is_empty() {
         return Vec::new();
     }
-    if tool_names.len() == 1 {
+    if tool_calls.len() == 1 {
         return vec![ToolBatch {
-            kind: if is_concurrency_safe(tool_names[0]) {
+            kind: if is_concurrency_safe_call(&tool_calls[0]) {
                 ToolBatchKind::Concurrent
             } else {
                 ToolBatchKind::Serial
@@ -52,7 +91,6 @@ pub fn partition_tool_calls(tool_names: &[&str]) -> Vec<ToolBatch> {
         }];
     }
 
-    let safe_set = concurrent_safe_tools();
     let mut batches = Vec::new();
     let mut current_read_only: Vec<usize> = Vec::new();
 
@@ -69,8 +107,8 @@ pub fn partition_tool_calls(tool_names: &[&str]) -> Vec<ToolBatch> {
         buf.clear();
     };
 
-    for (i, name) in tool_names.iter().enumerate() {
-        if safe_set.contains(name) {
+    for (i, tool_call) in tool_calls.iter().enumerate() {
+        if is_concurrency_safe_call(tool_call) {
             current_read_only.push(i);
         } else {
             flush_read_only(&mut batches, &mut current_read_only);

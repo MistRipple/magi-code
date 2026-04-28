@@ -4,7 +4,9 @@ use crate::llm_types::{
     LlmContentBlock, LlmMessage, LlmMessageContent, LlmMessageParams, LlmResponse, LlmUsage,
     ToolCall, ToolResult, parse_tool_arguments,
 };
-use crate::tool_concurrency::{ToolBatchKind, partition_tool_calls};
+use crate::tool_concurrency::{
+    ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs,
+};
 use crate::types::{BridgeClientError, ModelBridgeClient, ModelInvocationRequest};
 
 #[derive(Clone, Debug)]
@@ -44,13 +46,16 @@ pub(crate) fn execute_tool_calls(
     tool_calls: &[ToolCall],
     tool_executor: &dyn ToolExecutor,
 ) -> Vec<ToolResult> {
-    let tool_names = tool_calls
+    let tool_inputs = tool_calls
         .iter()
-        .map(|tool_call| tool_call.name.as_str())
+        .map(|tool_call| ToolConcurrencyInput {
+            tool_name: tool_call.name.as_str(),
+            arguments: Some(&tool_call.arguments),
+        })
         .collect::<Vec<_>>();
     let mut results = vec![None; tool_calls.len()];
 
-    for batch in partition_tool_calls(&tool_names) {
+    for batch in partition_tool_calls_with_inputs(&tool_inputs) {
         match batch.kind {
             ToolBatchKind::Serial => {
                 for tool_index in batch.tool_indices {

@@ -2,14 +2,12 @@ use magi_bridge_client::{
     ChatCompletionPayload, ChatToolChoice, ChatToolDefinition, ChatToolFunctionDefinition,
     ModelInvocationRequest, SHADOW_MODEL_PROVIDER,
 };
-#[cfg(test)]
-use magi_core::SessionId;
 use magi_core::{
-    ExecutionOwnership, ExecutorBinding, MissionId, Task, TaskExecutionTarget, TaskId, TaskKind,
-    TaskPolicy, TaskStatus, UtcMillis, WorkerId,
+    ExecutionOwnership, ExecutorBinding, MissionId, SessionId, Task, TaskExecutionTarget, TaskId,
+    TaskKind, TaskPolicy, TaskStatus, UtcMillis, WorkerId,
 };
 use magi_event_bus::{EventContext, task_events};
-use magi_orchestrator::ExecutionWritebackPlans;
+use magi_orchestrator::{ExecutionWritebackPlans, task_worker_catalog::resolve_task_role};
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     ActiveExecutionTurn, ActiveExecutionTurnItem, ActiveExecutionTurnLane,
@@ -42,6 +40,20 @@ pub(crate) struct DeepTaskGraphBuildResult {
 #[derive(Clone, Debug)]
 pub(crate) struct DeepTaskGraphReplanResult {
     pub cancelled_task_ids: Vec<TaskId>,
+    pub primary_action_task_id: TaskId,
+    pub leaf_action_task_ids: Vec<TaskId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionExecutionBranchUpdateMode {
+    Append,
+    Replace,
+}
+
+#[derive(Clone, Debug)]
+struct SessionExecutionBranchSpec {
+    task_id: TaskId,
+    is_primary: bool,
 }
 
 pub(crate) fn run_shadow_dispatch_submission(
@@ -897,7 +909,314 @@ pub(crate) fn replan_deep_task_graph(
     });
     let _ = state.event_bus.publish(event);
 
-    Ok(DeepTaskGraphReplanResult { cancelled_task_ids })
+    Ok(DeepTaskGraphReplanResult {
+        cancelled_task_ids,
+        primary_action_task_id,
+        leaf_action_task_ids: build.leaf_action_task_ids,
+    })
+}
+
+pub(crate) fn ensure_session_active_execution_chain(
+    state: &ApiState,
+    session_id: &SessionId,
+) -> Result<(), ApiError> {
+    let has_active_chain = state
+        .session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.active_execution_chain)
+        .is_some();
+    if has_active_chain {
+        return Ok(());
+    }
+    Err(ApiError::InvalidInput(
+        "当前会话没有可注册任务的活跃执行链".to_string(),
+    ))
+}
+
+pub(crate) fn register_appended_task_execution_branch(
+    state: &ApiState,
+    session_id: &SessionId,
+    task_id: &TaskId,
+) -> Result<(), ApiError> {
+    update_session_execution_branches(
+        state,
+        session_id,
+        &[SessionExecutionBranchSpec {
+            task_id: task_id.clone(),
+            is_primary: false,
+        }],
+        SessionExecutionBranchUpdateMode::Append,
+    )
+}
+
+pub(crate) fn replace_replanned_task_execution_branches(
+    state: &ApiState,
+    session_id: &SessionId,
+    primary_action_task_id: &TaskId,
+    leaf_action_task_ids: &[TaskId],
+) -> Result<(), ApiError> {
+    let mut branch_specs = Vec::with_capacity(leaf_action_task_ids.len() + 1);
+    branch_specs.push(SessionExecutionBranchSpec {
+        task_id: primary_action_task_id.clone(),
+        is_primary: true,
+    });
+    branch_specs.extend(leaf_action_task_ids.iter().cloned().map(|task_id| {
+        SessionExecutionBranchSpec {
+            task_id,
+            is_primary: false,
+        }
+    }));
+    update_session_execution_branches(
+        state,
+        session_id,
+        &branch_specs,
+        SessionExecutionBranchUpdateMode::Replace,
+    )
+}
+
+fn update_session_execution_branches(
+    state: &ApiState,
+    session_id: &SessionId,
+    branch_specs: &[SessionExecutionBranchSpec],
+    mode: SessionExecutionBranchUpdateMode,
+) -> Result<(), ApiError> {
+    if branch_specs.is_empty() {
+        return Ok(());
+    }
+    let task_store = state
+        .task_store()
+        .ok_or_else(|| ApiError::internal_assembly("注册任务执行分支失败", "task_store 未配置"))?;
+    let mut active_chain = state
+        .session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.active_execution_chain)
+        .ok_or_else(|| ApiError::InvalidInput("当前会话没有可注册任务的活跃执行链".to_string()))?;
+    if active_chain.session_id != *session_id {
+        return Err(ApiError::InvalidInput(
+            "活跃执行链不属于当前会话".to_string(),
+        ));
+    }
+
+    let worker_id = active_chain
+        .branches
+        .first()
+        .map(|branch| branch.worker_id.clone())
+        .or_else(|| active_chain.active_worker_bindings.first().cloned())
+        .unwrap_or_else(|| {
+            WorkerId::new(format!(
+                "worker-session-action-{}",
+                active_chain.dispatch_context.accepted_at.0
+            ))
+        });
+    let workspace_id = active_chain.workspace_id.clone();
+    let mission_id = active_chain.mission_id.clone();
+    let root_task_id = active_chain.root_task_id.clone();
+    let execution_chain_ref = active_chain.execution_chain_ref.clone();
+    let skill_name = active_chain.dispatch_context.skill_name.clone();
+    let now = UtcMillis::now();
+
+    let existing_task_ids = active_chain
+        .branches
+        .iter()
+        .map(|branch| branch.task_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let new_task_ids = branch_specs
+        .iter()
+        .map(|spec| spec.task_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    if mode == SessionExecutionBranchUpdateMode::Replace {
+        for task_id in existing_task_ids.difference(&new_task_ids) {
+            let _ = state.shadow_task_execution_registry().remove(task_id);
+        }
+    }
+
+    let next_lane_seq = active_chain
+        .current_turn
+        .as_ref()
+        .and_then(|turn| turn.worker_lanes.iter().map(|lane| lane.lane_seq).max())
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut appended_lane_count = 0usize;
+    let mut new_branches = Vec::with_capacity(branch_specs.len());
+    let mut new_lanes = Vec::new();
+
+    for spec in branch_specs {
+        let task = task_store
+            .get_task(&spec.task_id)
+            .ok_or_else(|| ApiError::InvalidInput(format!("待注册任务不存在: {}", spec.task_id)))?;
+        if task.mission_id != mission_id || task.root_task_id != root_task_id {
+            return Err(ApiError::InvalidInput(format!(
+                "任务 {} 不属于当前执行链",
+                spec.task_id
+            )));
+        }
+        let role_id = resolve_task_role(&task)
+            .map(str::trim)
+            .filter(|role| !role.is_empty())
+            .map(ToOwned::to_owned);
+        let lane_seq = if spec.is_primary {
+            None
+        } else {
+            let seq = if mode == SessionExecutionBranchUpdateMode::Replace {
+                appended_lane_count + 1
+            } else {
+                next_lane_seq + appended_lane_count
+            };
+            appended_lane_count += 1;
+            Some(seq)
+        };
+        let lane_id = lane_seq.map(|_| format!("lane-{}", spec.task_id));
+        let ownership = ExecutionOwnership {
+            session_id: Some(session_id.clone()),
+            workspace_id: workspace_id.clone(),
+            mission_id: Some(mission_id.clone()),
+            task_id: Some(spec.task_id.clone()),
+            worker_id: Some(worker_id.clone()),
+            execution_chain_ref: Some(execution_chain_ref.clone()),
+            ..ExecutionOwnership::default()
+        };
+        state.shadow_task_execution_registry().insert(
+            spec.task_id.clone(),
+            ShadowTaskExecutionPlan::Dispatch {
+                target: TaskExecutionTarget {
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    task_id: spec.task_id.clone(),
+                    requested_worker_id: Some(worker_id.clone()),
+                    recovery_id: None,
+                    execution_chain_ref: Some(execution_chain_ref.clone()),
+                },
+                worker_id: worker_id.clone(),
+                lane_id: lane_id.clone(),
+                lane_seq,
+                is_primary: spec.is_primary,
+                session_id: session_id.clone(),
+                workspace_id: workspace_id.clone(),
+                ownership,
+                writebacks: ExecutionWritebackPlans::default(),
+                use_tools: true,
+                skill_name: skill_name.clone(),
+            },
+        );
+        new_branches.push(ActiveExecutionBranch {
+            task_id: spec.task_id.clone(),
+            worker_id: worker_id.clone(),
+            stage: "execute".to_string(),
+            lease_id: None,
+            execution_intent_ref: None,
+            binding_lifecycle: None,
+            checkpoint_stage: Some("execute".to_string()),
+            next_step_index: Some(0),
+            checkpoint_at: Some(now),
+            resume_mode: Some("stage-restart".to_string()),
+            resume_token: None,
+            use_tools: true,
+            skill_name: skill_name.clone(),
+            is_primary: spec.is_primary,
+        });
+        if let (Some(lane_id), Some(lane_seq)) = (lane_id, lane_seq) {
+            new_lanes.push(ActiveExecutionTurnLane {
+                lane_id,
+                lane_seq,
+                task_id: spec.task_id.clone(),
+                worker_id: worker_id.clone(),
+                role_id,
+                title: task.title,
+                is_primary: false,
+            });
+        }
+    }
+
+    match mode {
+        SessionExecutionBranchUpdateMode::Append => {
+            active_chain
+                .branches
+                .retain(|branch| !new_task_ids.contains(&branch.task_id));
+            active_chain.branches.extend(new_branches.clone());
+        }
+        SessionExecutionBranchUpdateMode::Replace => {
+            active_chain.branches = new_branches.clone();
+        }
+    }
+    active_chain.active_branch_task_ids = active_chain
+        .branches
+        .iter()
+        .map(|branch| branch.task_id.clone())
+        .collect();
+    active_chain.active_worker_bindings = active_chain
+        .branches
+        .iter()
+        .map(|branch| branch.worker_id.clone())
+        .collect();
+
+    if let Some(turn) = active_chain.current_turn.as_mut() {
+        match mode {
+            SessionExecutionBranchUpdateMode::Append => {
+                turn.worker_lanes
+                    .retain(|lane| !new_task_ids.contains(&lane.task_id));
+                turn.worker_lanes.extend(new_lanes.clone());
+            }
+            SessionExecutionBranchUpdateMode::Replace => {
+                turn.worker_lanes = new_lanes.clone();
+                turn.items.retain(|item| {
+                    item.kind != "worker_spawned"
+                        || item
+                            .task_id
+                            .as_ref()
+                            .is_some_and(|task_id| new_task_ids.contains(task_id))
+                });
+            }
+        }
+        let mut next_item_seq = turn
+            .items
+            .iter()
+            .map(|item| item.item_seq)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        for lane in &new_lanes {
+            let already_has_spawned = turn.items.iter().any(|item| {
+                item.kind == "worker_spawned" && item.task_id.as_ref() == Some(&lane.task_id)
+            });
+            if already_has_spawned {
+                continue;
+            }
+            turn.items.push(ActiveExecutionTurnItem {
+                item_id: format!("turn-item-worker-spawned-{}-{}", now.0, lane.lane_seq),
+                item_seq: next_item_seq,
+                lane_id: Some(lane.lane_id.clone()),
+                lane_seq: Some(lane.lane_seq),
+                kind: "worker_spawned".to_string(),
+                status: "pending".to_string(),
+                source: lane.worker_id.to_string(),
+                title: Some(lane.title.clone()),
+                content: Some(format!("已为 {} 创建执行分支。", lane.title)),
+                task_id: Some(lane.task_id.clone()),
+                worker_id: Some(lane.worker_id.clone()),
+                role_id: lane.role_id.clone(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_status: None,
+                tool_arguments: None,
+                tool_result: None,
+                tool_error: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+                timeline_entry_id: None,
+                thread_visible: false,
+                worker_visible: true,
+            });
+            next_item_seq = next_item_seq.saturating_add(1);
+        }
+        turn.normalize();
+    }
+    active_chain.normalize();
+    state
+        .session_store
+        .upsert_active_execution_chain(session_id.clone(), active_chain)
+        .map_err(|error| ApiError::internal_assembly("注册任务执行分支失败", error))?;
+    Ok(())
 }
 
 fn validate_deep_task_graph(
@@ -1611,6 +1930,229 @@ mod tests {
                 .is_some(),
             "action task should have a registered execution plan",
         );
+    }
+
+    #[test]
+    fn intake_append_task_registers_execution_plan_and_worker_lane() {
+        let (state, task_store) = build_test_state();
+
+        let session_id = SessionId::new("session-intake-append-registers");
+        state
+            .session_store
+            .create_session(session_id.clone(), "intake append")
+            .expect("session should be creatable");
+
+        let accepted_at = UtcMillis::now();
+        let submission = run_shadow_dispatch_submission(
+            &state,
+            &DispatchSubmissionRequest {
+                accepted_at,
+                session_id: session_id.clone(),
+                workspace_id: None,
+                entry_id: "entry-intake-append".to_string(),
+                created_session: false,
+                mission_title: "初始任务".to_string(),
+                task_title: "执行: 初始任务".to_string(),
+                trimmed_text: Some("初始任务".to_string()),
+                execution_goal: None,
+                deep_task: false,
+                skill_name: None,
+                target_role: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+            },
+        )
+        .expect("shadow dispatch should create active chain");
+        state
+            .session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                submission
+                    .active_execution_chain
+                    .expect("active chain should exist"),
+            )
+            .expect("active chain should be stored");
+
+        let root_task = task_store
+            .get_task(&submission.root_task_id)
+            .expect("root task should exist");
+        let appended_task_id = TaskId::new("task-intake-appended");
+        task_store.insert_task(make_shadow_task(
+            appended_task_id.clone(),
+            root_task.mission_id.clone(),
+            submission.root_task_id.clone(),
+            Some(submission.root_task_id.clone()),
+            TaskKind::Action,
+            "追加验证任务".to_string(),
+            "验证追加任务注册执行链".to_string(),
+            TaskStatus::Ready,
+            UtcMillis::now(),
+            Some("integration-dev"),
+            None,
+            root_task.policy_snapshot.clone(),
+        ));
+        task_store
+            .append_required_child(&submission.root_task_id, &appended_task_id)
+            .expect("child should be appended");
+
+        register_appended_task_execution_branch(&state, &session_id, &appended_task_id)
+            .expect("appended task should register execution branch");
+
+        assert!(
+            state
+                .shadow_task_execution_registry()
+                .remove(&appended_task_id)
+                .is_some(),
+            "追加任务必须注册 execution plan"
+        );
+        let sidecar = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .expect("sidecar should exist");
+        let chain = sidecar
+            .active_execution_chain
+            .expect("active chain should exist");
+        assert!(
+            chain.active_branch_task_ids.contains(&appended_task_id),
+            "追加任务必须进入 active branch 列表"
+        );
+        let turn = chain.current_turn.expect("current turn should exist");
+        assert!(
+            turn.worker_lanes
+                .iter()
+                .any(|lane| lane.task_id == appended_task_id
+                    && lane.role_id.as_deref() == Some("integration-dev")),
+            "追加任务必须进入 worker lane，并保留产品可见角色"
+        );
+        assert!(
+            turn.items.iter().any(|item| {
+                item.kind == "worker_spawned"
+                    && item.task_id.as_ref() == Some(&appended_task_id)
+                    && item.worker_visible
+            }),
+            "追加任务必须产生 worker 可见的分支卡片事件"
+        );
+    }
+
+    #[test]
+    fn intake_replan_registers_new_branches_and_replaces_active_chain() {
+        let (state, task_store) = build_test_state();
+
+        let session_id = SessionId::new("session-intake-replan-registers");
+        state
+            .session_store
+            .create_session(session_id.clone(), "intake replan")
+            .expect("session should be creatable");
+
+        let accepted_at = UtcMillis::now();
+        let submission = run_shadow_dispatch_submission(
+            &state,
+            &DispatchSubmissionRequest {
+                accepted_at,
+                session_id: session_id.clone(),
+                workspace_id: None,
+                entry_id: "entry-intake-replan".to_string(),
+                created_session: false,
+                mission_title: "旧任务".to_string(),
+                task_title: "执行: 旧任务".to_string(),
+                trimmed_text: Some("旧任务".to_string()),
+                execution_goal: None,
+                deep_task: false,
+                skill_name: None,
+                target_role: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+            },
+        )
+        .expect("shadow dispatch should create active chain");
+        state
+            .session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                submission
+                    .active_execution_chain
+                    .expect("active chain should exist"),
+            )
+            .expect("active chain should be stored");
+
+        let root_task = task_store
+            .get_task(&submission.root_task_id)
+            .expect("root task should exist");
+        let primary_task_id = TaskId::new("task-replan-primary");
+        let leaf_task_id = TaskId::new("task-replan-leaf");
+        for (task_id, title, is_primary) in [
+            (&primary_task_id, "重规划主任务", true),
+            (&leaf_task_id, "重规划 worker 任务", false),
+        ] {
+            task_store.insert_task(make_shadow_task(
+                task_id.clone(),
+                root_task.mission_id.clone(),
+                submission.root_task_id.clone(),
+                Some(submission.root_task_id.clone()),
+                TaskKind::Action,
+                title.to_string(),
+                title.to_string(),
+                TaskStatus::Ready,
+                UtcMillis::now(),
+                Some(if is_primary {
+                    "integration-dev"
+                } else {
+                    "reviewer"
+                }),
+                None,
+                root_task.policy_snapshot.clone(),
+            ));
+        }
+
+        replace_replanned_task_execution_branches(
+            &state,
+            &session_id,
+            &primary_task_id,
+            &[leaf_task_id.clone()],
+        )
+        .expect("replanned branches should replace active chain");
+
+        assert!(
+            state
+                .shadow_task_execution_registry()
+                .remove(&submission.action_task_id)
+                .is_none(),
+            "重规划后旧 action plan 不能继续留在 registry"
+        );
+        assert!(
+            state
+                .shadow_task_execution_registry()
+                .remove(&primary_task_id)
+                .is_some(),
+            "重规划主任务必须注册 execution plan"
+        );
+        assert!(
+            state
+                .shadow_task_execution_registry()
+                .remove(&leaf_task_id)
+                .is_some(),
+            "重规划 worker 任务必须注册 execution plan"
+        );
+        let sidecar = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .expect("sidecar should exist");
+        let chain = sidecar
+            .active_execution_chain
+            .expect("active chain should exist");
+        assert!(chain.active_branch_task_ids.contains(&primary_task_id));
+        assert!(chain.active_branch_task_ids.contains(&leaf_task_id));
+        assert!(
+            !chain
+                .active_branch_task_ids
+                .contains(&submission.action_task_id)
+        );
+        let turn = chain.current_turn.expect("current turn should exist");
+        assert_eq!(turn.worker_lanes.len(), 1);
+        assert_eq!(turn.worker_lanes[0].task_id, leaf_task_id);
+        assert_eq!(turn.worker_lanes[0].role_id.as_deref(), Some("reviewer"));
     }
 
     // -----------------------------------------------------------------------

@@ -6,7 +6,7 @@ use crate::{
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolCall,
-    tool_concurrency::{ToolBatchKind, partition_tool_calls},
+    tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
 use magi_core::{
     ApprovalRequirement, EventId, ExecutionResultStatus, RiskLevel, SessionId, TaskId, ToolCallId,
@@ -32,22 +32,62 @@ pub(crate) struct PublishedSessionTurnItem {
     pub turn_id: String,
     pub turn_seq: u64,
     pub item: ActiveExecutionTurnItem,
+    pub current_turn: SessionRuntimeTurnSummaryEntry,
+    pub turn_items: Vec<SessionRuntimeTurnItemSummaryEntry>,
+    pub worker_lanes: Vec<SessionRuntimeTurnLaneSummaryEntry>,
 }
 
 fn published_session_turn_item_from_sidecar(
     sidecar: SessionRuntimeSidecar,
     item_id: &str,
 ) -> Option<PublishedSessionTurnItem> {
-    let turn = sidecar.current_turn?;
+    let turn = sidecar.current_turn.as_ref()?;
     let item = turn
         .items
         .iter()
         .find(|candidate| candidate.item_id == item_id)?
         .clone();
+    let chain = sidecar.active_execution_chain.as_ref();
+    let response_duration_ms = turn
+        .completed_at
+        .map(|completed_at| completed_at.0.saturating_sub(turn.accepted_at.0));
+    let lane_status_by_id = turn
+        .items
+        .iter()
+        .filter_map(|item| {
+            item.lane_id
+                .as_ref()
+                .map(|lane_id| (lane_id.clone(), item.status.clone()))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
     Some(PublishedSessionTurnItem {
-        turn_id: turn.turn_id,
+        turn_id: turn.turn_id.clone(),
         turn_seq: turn.turn_seq,
         item,
+        current_turn: SessionRuntimeTurnSummaryEntry {
+            turn_id: turn.turn_id.clone(),
+            turn_seq: turn.turn_seq,
+            accepted_at: Some(turn.accepted_at),
+            completed_at: turn.completed_at,
+            response_duration_ms,
+            status: turn.status.clone(),
+            user_message: turn.user_message.clone(),
+            mission_id: chain.map(|chain| chain.mission_id.to_string()),
+            root_task_id: chain.map(|chain| chain.root_task_id.to_string()),
+            execution_chain_ref: chain.map(|chain| chain.execution_chain_ref.clone()),
+        },
+        turn_items: turn.items.iter().map(to_turn_item_summary).collect(),
+        worker_lanes: turn
+            .worker_lanes
+            .iter()
+            .map(|lane| {
+                let status = lane_status_by_id
+                    .get(&lane.lane_id)
+                    .map(String::as_str)
+                    .unwrap_or(turn.status.as_str());
+                to_turn_lane_summary(lane, status)
+            })
+            .collect(),
     })
 }
 
@@ -128,6 +168,9 @@ pub(crate) fn publish_session_turn_item_event(
                 "turn_id": published.turn_id,
                 "turn_seq": published.turn_seq,
                 "item": published.item,
+                "current_turn": published.current_turn,
+                "turn_items": published.turn_items,
+                "worker_lanes": published.worker_lanes,
             }),
         )
         .with_context(EventContext {
@@ -441,13 +484,23 @@ fn execute_session_turn_tool_call_batch(
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
 ) -> Vec<(String, ExecutionResultStatus)> {
-    let tool_names = tool_calls
+    let parsed_arguments = tool_calls
         .iter()
-        .map(|tool_call| tool_call.function.name.as_str())
+        .map(|tool_call| {
+            serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments).ok()
+        })
+        .collect::<Vec<_>>();
+    let tool_inputs = tool_calls
+        .iter()
+        .zip(parsed_arguments.iter())
+        .map(|(tool_call, arguments)| ToolConcurrencyInput {
+            tool_name: tool_call.function.name.as_str(),
+            arguments: arguments.as_ref(),
+        })
         .collect::<Vec<_>>();
     let mut results = vec![None; tool_calls.len()];
 
-    for batch in partition_tool_calls(&tool_names) {
+    for batch in partition_tool_calls_with_inputs(&tool_inputs) {
         match batch.kind {
             ToolBatchKind::Serial => {
                 for tool_index in batch.tool_indices {
@@ -863,6 +916,31 @@ mod tests {
                 ("tool_call_result", Some("tool-call-shell-a")),
                 ("tool_call_result", Some("tool-call-shell-b")),
             ]
+        );
+
+        let snapshot_event = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .rev()
+            .find(|event| event.event_type == "session.turn.item")
+            .expect("session.turn.item event should be published");
+        assert!(
+            snapshot_event.payload.get("current_turn").is_some(),
+            "实时 turn item 事件必须携带完整 current_turn 快照"
+        );
+        assert_eq!(
+            snapshot_event
+                .payload
+                .get("turn_items")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(4),
+            "实时 turn item 事件必须携带当前 turn 的全部 item"
+        );
+        assert!(
+            snapshot_event.payload.get("worker_lanes").is_some(),
+            "实时 turn item 事件必须携带 worker_lanes，供前端走 canonical projection"
         );
     }
 }

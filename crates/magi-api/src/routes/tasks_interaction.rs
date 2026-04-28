@@ -6,8 +6,13 @@ use serde_json::json;
 
 use super::session_scope::parse_session_id;
 use crate::{
-    errors::ApiError, execution_chain_recovery::finalize_terminal_worker_branches,
-    shadow_execution::replan_deep_task_graph, state::ApiState,
+    errors::ApiError,
+    execution_chain_recovery::finalize_terminal_worker_branches,
+    shadow_execution::{
+        ensure_session_active_execution_chain, register_appended_task_execution_branch,
+        replace_replanned_task_execution_branches, replan_deep_task_graph,
+    },
+    state::ApiState,
 };
 
 // ---------------------------------------------------------------------------
@@ -266,6 +271,7 @@ async fn handle_intake(
             })));
         }
         IntakeClassification::Replan => {
+            ensure_session_active_execution_chain(&state, &session_id)?;
             let prompt = build_intake_replan_prompt(&root_task, &context_task, &request.message);
             let replan = replan_deep_task_graph(
                 &state,
@@ -274,12 +280,20 @@ async fn handle_intake(
                 Some(&context_task),
                 request.message.trim(),
             )?;
+            replace_replanned_task_execution_branches(
+                &state,
+                &session_id,
+                &replan.primary_action_task_id,
+                &replan.leaf_action_task_ids,
+            )?;
             return Ok(Json(json!({
                 "classification": "replan",
                 "replan": true,
                 "rootTaskId": root_task_id.to_string(),
                 "targetTaskId": root_task_id.to_string(),
                 "cancelledTaskIds": replan.cancelled_task_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                "primaryActionTaskId": replan.primary_action_task_id.to_string(),
+                "leafActionTaskIds": replan.leaf_action_task_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
                 "contextTaskId": context_task_id.to_string(),
             })));
         }
@@ -296,6 +310,7 @@ async fn handle_intake(
             })));
         }
         IntakeClassification::AppendTask => {
+            ensure_session_active_execution_chain(&state, &session_id)?;
             let parent_task_id = resolve_structural_context_task_id(&root_task, &context_task);
             let parent_task = store
                 .get_task(&parent_task_id)
@@ -332,6 +347,7 @@ async fn handle_intake(
             store
                 .append_required_child(&parent_task_id, &new_task_id)
                 .map_err(|e| ApiError::internal_assembly("追加任务失败", e.to_string()))?;
+            register_appended_task_execution_branch(&state, &session_id, &new_task_id)?;
             return Ok(Json(json!({
                 "classification": "append_task",
                 "addedTaskId": new_task_id.to_string(),

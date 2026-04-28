@@ -756,20 +756,17 @@ fn spawn_managed_process_reader<T: Read + Send + 'static>(
 }
 
 fn process_belongs_to_context(process: &ManagedProcess, context: &ToolExecutionContext) -> bool {
-    let mut has_scope = false;
-    if let Some(session_id) = context.session_id.as_ref().map(ToString::to_string) {
-        has_scope = true;
-        if process.session_id.as_deref() != Some(session_id.as_str()) {
+    if let Some(session_id) = process.session_id.as_deref() {
+        if context.session_id.as_ref().map(|id| id.as_str()) != Some(session_id) {
             return false;
         }
     }
-    if let Some(workspace_id) = context.workspace_id.as_ref().map(ToString::to_string) {
-        has_scope = true;
-        if process.workspace_id.as_deref() != Some(workspace_id.as_str()) {
+    if let Some(workspace_id) = process.workspace_id.as_deref() {
+        if context.workspace_id.as_ref().map(|id| id.as_str()) != Some(workspace_id) {
             return false;
         }
     }
-    has_scope
+    process.session_id.is_some() || process.workspace_id.is_some()
 }
 
 fn require_process_context(tool: &str, context: &ToolExecutionContext) -> Option<String> {

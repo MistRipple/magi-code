@@ -628,10 +628,16 @@ fn pending_terminal_synthesis_finalizes_on_max() {
 fn tool_concurrency_read_only_safe() {
     assert!(crate::tool_concurrency::is_concurrency_safe("file_view"));
     assert!(crate::tool_concurrency::is_concurrency_safe("web_search"));
-    assert!(crate::tool_concurrency::is_concurrency_safe("shell"));
-    assert!(crate::tool_concurrency::is_concurrency_safe("shell_exec"));
-    assert!(crate::tool_concurrency::is_concurrency_safe(
+    assert!(!crate::tool_concurrency::is_concurrency_safe("shell"));
+    assert!(!crate::tool_concurrency::is_concurrency_safe("shell_exec"));
+    assert!(!crate::tool_concurrency::is_concurrency_safe(
         "process_launch"
+    ));
+    assert!(crate::tool_concurrency::is_concurrency_safe_call(
+        &crate::tool_concurrency::ToolConcurrencyInput {
+            tool_name: "shell_exec",
+            arguments: Some(&json!({ "access_mode": "read_only" })),
+        }
     ));
     assert!(!crate::tool_concurrency::is_concurrency_safe("file_edit"));
 }
@@ -646,7 +652,7 @@ fn tool_concurrency_partition_mixed() {
         "shell",
     ];
     let batches = crate::tool_concurrency::partition_tool_calls(&tools);
-    assert_eq!(batches.len(), 3);
+    assert_eq!(batches.len(), 4);
     assert!(matches!(
         batches[0].kind,
         crate::tool_concurrency::ToolBatchKind::Concurrent
@@ -661,7 +667,35 @@ fn tool_concurrency_partition_mixed() {
         batches[2].kind,
         crate::tool_concurrency::ToolBatchKind::Concurrent
     ));
-    assert_eq!(batches[2].tool_indices, vec![3, 4]);
+    assert_eq!(batches[2].tool_indices, vec![3]);
+    assert!(matches!(
+        batches[3].kind,
+        crate::tool_concurrency::ToolBatchKind::Serial
+    ));
+    assert_eq!(batches[3].tool_indices, vec![4]);
+}
+
+#[test]
+fn tool_concurrency_partitions_read_only_shells_concurrently() {
+    let shell_a = json!({ "command": "printf a", "access_mode": "read_only" });
+    let shell_b = json!({ "command": "printf b", "access_mode": "read_only" });
+    let tools = [
+        crate::tool_concurrency::ToolConcurrencyInput {
+            tool_name: "shell_exec",
+            arguments: Some(&shell_a),
+        },
+        crate::tool_concurrency::ToolConcurrencyInput {
+            tool_name: "shell",
+            arguments: Some(&shell_b),
+        },
+    ];
+    let batches = crate::tool_concurrency::partition_tool_calls_with_inputs(&tools);
+    assert_eq!(batches.len(), 1);
+    assert!(matches!(
+        batches[0].kind,
+        crate::tool_concurrency::ToolBatchKind::Concurrent
+    ));
+    assert_eq!(batches[0].tool_indices, vec![0, 1]);
 }
 
 struct SleepingToolExecutor {
@@ -707,14 +741,14 @@ fn shell_tool_calls_execute_concurrently_and_preserve_order() {
         ToolCall {
             id: "call-shell-a".to_string(),
             name: "shell_exec".to_string(),
-            arguments: json!({ "command": "printf a" }),
+            arguments: json!({ "command": "printf a", "access_mode": "read_only" }),
             argument_parse_error: None,
             raw_arguments: None,
         },
         ToolCall {
             id: "call-shell-b".to_string(),
             name: "shell".to_string(),
-            arguments: json!({ "command": "printf b" }),
+            arguments: json!({ "command": "printf b", "access_mode": "read_only" }),
             argument_parse_error: None,
             raw_arguments: None,
         },

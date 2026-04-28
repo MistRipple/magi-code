@@ -15,6 +15,7 @@ use crate::{
 use magi_bridge_client::{
     ChatMessage, ChatToolCall, ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest,
     ModelStreamingDelta, SHADOW_MODEL_PROVIDER,
+    tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
 use magi_core::{
     ApprovalRequirement, EventId, ExecutionResultStatus, LeaseId, RiskLevel, SessionId, TaskId,
@@ -31,7 +32,7 @@ use magi_tool_runtime::{
     ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
 };
 use magi_usage_authority::UsageCallStatus;
-use std::sync::Arc;
+use std::{sync::Arc, thread};
 
 const MAX_TOOL_CALL_ROUNDS: usize = 8;
 
@@ -294,15 +295,19 @@ pub(crate) fn run_task_llm_loop(
                     tool_call,
                 );
             }
-            let (result, tool_status) = execute_task_tool_call(
-                event_bus,
-                tool_registry,
-                skill_runtime,
-                task,
-                session_id,
-                workspace_id,
-                tool_call,
-            );
+        }
+
+        let tool_results = execute_task_tool_call_batch(
+            event_bus,
+            tool_registry,
+            skill_runtime,
+            task,
+            session_id,
+            workspace_id,
+            &parsed.tool_calls,
+        );
+
+        for (tool_call, (result, tool_status)) in parsed.tool_calls.iter().zip(tool_results) {
             if should_record_turn_artifacts {
                 append_task_tool_call_result_turn_item(
                     event_bus,
@@ -595,6 +600,109 @@ fn append_task_tool_call_result_turn_item(
     }
 }
 
+fn execute_task_tool_call_batch(
+    event_bus: &InMemoryEventBus,
+    tool_registry: Option<&ToolRegistry>,
+    skill_runtime: Option<&magi_skill_runtime::SkillRuntime>,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    tool_calls: &[ChatToolCall],
+) -> Vec<(String, ExecutionResultStatus)> {
+    let parsed_arguments = tool_calls
+        .iter()
+        .map(|tool_call| {
+            serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments).ok()
+        })
+        .collect::<Vec<_>>();
+    let tool_inputs = tool_calls
+        .iter()
+        .zip(parsed_arguments.iter())
+        .map(|(tool_call, arguments)| ToolConcurrencyInput {
+            tool_name: tool_call.function.name.as_str(),
+            arguments: arguments.as_ref(),
+        })
+        .collect::<Vec<_>>();
+    let mut results = vec![None; tool_calls.len()];
+
+    for batch in partition_tool_calls_with_inputs(&tool_inputs) {
+        match batch.kind {
+            ToolBatchKind::Serial => {
+                for tool_index in batch.tool_indices {
+                    results[tool_index] = Some(execute_task_tool_call(
+                        event_bus,
+                        tool_registry,
+                        skill_runtime,
+                        task,
+                        session_id,
+                        workspace_id,
+                        &tool_calls[tool_index],
+                    ));
+                }
+            }
+            ToolBatchKind::Concurrent => {
+                thread::scope(|scope| {
+                    let handles = batch
+                        .tool_indices
+                        .iter()
+                        .copied()
+                        .map(|tool_index| {
+                            let tool_call = &tool_calls[tool_index];
+                            (
+                                tool_index,
+                                scope.spawn(move || {
+                                    execute_task_tool_call(
+                                        event_bus,
+                                        tool_registry,
+                                        skill_runtime,
+                                        task,
+                                        session_id,
+                                        workspace_id,
+                                        tool_call,
+                                    )
+                                }),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+
+                    for (tool_index, handle) in handles {
+                        let result = handle.join().unwrap_or_else(|_| {
+                            (
+                                serde_json::json!({
+                                    "tool": tool_calls[tool_index].function.name,
+                                    "status": "failed",
+                                    "error": "任务工具执行线程异常"
+                                })
+                                .to_string(),
+                                ExecutionResultStatus::Failed,
+                            )
+                        });
+                        results[tool_index] = Some(result);
+                    }
+                });
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(tool_index, result)| {
+            result.unwrap_or_else(|| {
+                (
+                    serde_json::json!({
+                        "tool": tool_calls[tool_index].function.name,
+                        "status": "failed",
+                        "error": "任务工具未产生执行结果"
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                )
+            })
+        })
+        .collect()
+}
+
 fn execute_task_tool_call(
     event_bus: &InMemoryEventBus,
     tool_registry: Option<&ToolRegistry>,
@@ -807,6 +915,182 @@ fn task_is_thread_visible_turn_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magi_bridge_client::{BridgeClientError, BridgeResponse};
+    use magi_core::{MissionId, Task, TaskKind, TaskStatus, WorkerId};
+    use magi_governance::GovernanceService;
+    use magi_session_store::ActiveExecutionTurn;
+    use magi_tool_runtime::{BuiltinTool, BuiltinToolSpec};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    struct TaskToolBatchModelBridgeClient {
+        invoke_count: AtomicUsize,
+    }
+
+    impl ModelBridgeClient for TaskToolBatchModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            let index = self.invoke_count.fetch_add(1, Ordering::SeqCst);
+            let payload = if index == 0 {
+                serde_json::json!({
+                    "content": null,
+                    "finish_reason": "tool_calls",
+                    "tool_calls": [
+                        {
+                            "id": "task-tool-shell-a",
+                            "type": "function",
+                            "function": {
+                                "name": "shell_exec",
+                                "arguments": serde_json::json!({
+                                    "command": "printf a",
+                                    "access_mode": "read_only"
+                                }).to_string()
+                            }
+                        },
+                        {
+                            "id": "task-tool-shell-b",
+                            "type": "function",
+                            "function": {
+                                "name": "shell",
+                                "arguments": serde_json::json!({
+                                    "command": "printf b",
+                                    "access_mode": "read_only"
+                                }).to_string()
+                            }
+                        }
+                    ]
+                })
+            } else {
+                let tool_message_ids = request
+                    .messages
+                    .as_ref()
+                    .expect("工具响应轮次必须携带消息上下文")
+                    .iter()
+                    .filter(|message| message.role == "tool")
+                    .map(|message| message.tool_call_id.as_deref())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    tool_message_ids,
+                    vec![Some("task-tool-shell-a"), Some("task-tool-shell-b")]
+                );
+                serde_json::json!({
+                    "content": "任务工具调用完成",
+                    "finish_reason": "stop"
+                })
+            };
+            Ok(BridgeResponse {
+                ok: true,
+                payload: payload.to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            self.invoke(request)
+        }
+    }
+
+    struct ConcurrentTaskToolProbe {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        delay: Duration,
+    }
+
+    impl ConcurrentTaskToolProbe {
+        fn new(delay: Duration) -> Self {
+            Self {
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                delay,
+            }
+        }
+
+        fn max_active(&self) -> usize {
+            self.max_active.load(Ordering::SeqCst)
+        }
+
+        fn record_active_call(&self) {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            thread::sleep(self.delay);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ProbeTaskBuiltinTool {
+        name: &'static str,
+        probe: Arc<ConcurrentTaskToolProbe>,
+    }
+
+    impl ProbeTaskBuiltinTool {
+        fn new(name: &'static str, probe: Arc<ConcurrentTaskToolProbe>) -> Self {
+            Self { name, probe }
+        }
+    }
+
+    impl BuiltinTool for ProbeTaskBuiltinTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn execute(&self, input: &str, _context: &ToolExecutionContext) -> String {
+            self.probe.record_active_call();
+            serde_json::json!({
+                "tool": self.name,
+                "status": "succeeded",
+                "stdout": format!("{} done", self.name),
+                "input": input,
+            })
+            .to_string()
+        }
+
+        fn spec(&self) -> BuiltinToolSpec {
+            BuiltinToolSpec {
+                name: self.name.to_string(),
+                risk_level: RiskLevel::Low,
+                approval_requirement: ApprovalRequirement::None,
+            }
+        }
+    }
+
+    fn make_task_loop_test_task(task_id: &str) -> Task {
+        Task {
+            task_id: TaskId::new(task_id),
+            mission_id: MissionId::new("mission-task-loop"),
+            root_task_id: TaskId::new(task_id),
+            parent_task_id: None,
+            kind: TaskKind::Action,
+            title: "验证 worker 工具并发".to_string(),
+            goal: "同一轮只读 shell 工具需要并发执行，并保持消息顺序".to_string(),
+            status: TaskStatus::Running,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: UtcMillis::now(),
+            updated_at: UtcMillis::now(),
+        }
+    }
 
     #[test]
     fn task_stream_item_id_reuses_main_timeline_streaming_entry() {
@@ -829,6 +1113,125 @@ mod tests {
         assert_eq!(
             task_stream_item_id(&task_id, 2, None),
             "turn-item-assistant-stream-task-stream-worker-2"
+        );
+    }
+
+    #[test]
+    fn task_llm_loop_read_only_shell_tools_execute_concurrently_and_preserve_order() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(64);
+        let session_id = SessionId::new("session-task-tool-batch");
+        let workspace_id = Some(WorkspaceId::new("workspace-task-tool-batch"));
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "task tool batch session",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-task-tool-batch".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("验证 worker 工具并发".to_string()),
+                    items: Vec::new(),
+                    worker_lanes: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("turn should be creatable");
+
+        let task_store = TaskStore::new();
+        let task = make_task_loop_test_task("task-tool-batch");
+        task_store.insert_task(task.clone());
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &WorkerId::new("worker-task-tool-batch"),
+                "integration-dev",
+                60_000,
+            )
+            .expect("lease should be granted");
+
+        let probe = Arc::new(ConcurrentTaskToolProbe::new(Duration::from_millis(180)));
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_builtin(Arc::new(ProbeTaskBuiltinTool::new(
+            "shell_exec",
+            Arc::clone(&probe),
+        )));
+        tool_registry.register_builtin(Arc::new(ProbeTaskBuiltinTool::new(
+            "shell",
+            Arc::clone(&probe),
+        )));
+        let client = TaskToolBatchModelBridgeClient {
+            invoke_count: AtomicUsize::new(0),
+        };
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+
+        let (outcome, _) = run_task_llm_loop(TaskLlmLoopRequest {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            tool_registry: Some(&tool_registry),
+            skill_runtime: None,
+            task_store: &task_store,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: "请执行两个只读 shell 工具".to_string(),
+            tools: None,
+            usage_binding: &usage_binding,
+            streaming_entry_id: None,
+            context_summary: None,
+            system_prompt: None,
+        });
+
+        assert!(
+            probe.max_active() > 1,
+            "task worker 中的多个只读 shell 工具调用必须并发执行"
+        );
+        let output_refs = match outcome {
+            TaskOutcome::Completed { output_refs } => output_refs,
+            other => panic!("task loop should complete, got {other:?}"),
+        };
+        let output: serde_json::Value =
+            serde_json::from_str(&output_refs[0]).expect("output blocks json");
+        assert_eq!(
+            output["blocks"][0]["toolCall"]["id"],
+            serde_json::Value::String("task-tool-shell-a".to_string())
+        );
+        assert_eq!(
+            output["blocks"][1]["toolCall"]["id"],
+            serde_json::Value::String("task-tool-shell-b".to_string())
+        );
+
+        let sidecar = session_store
+            .runtime_sidecar(&session_id)
+            .expect("sidecar should exist");
+        let turn = sidecar.current_turn.expect("turn should exist");
+        assert_eq!(
+            turn.items
+                .iter()
+                .take(4)
+                .map(|item| (item.kind.as_str(), item.tool_call_id.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("tool_call_started", Some("task-tool-shell-a")),
+                ("tool_call_started", Some("task-tool-shell-b")),
+                ("tool_call_result", Some("task-tool-shell-a")),
+                ("tool_call_result", Some("task-tool-shell-b")),
+            ]
         );
     }
 }

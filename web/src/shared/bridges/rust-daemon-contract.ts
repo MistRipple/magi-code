@@ -2748,6 +2748,54 @@ function buildTimelineProjection(
   };
 }
 
+export function buildRustTurnTimelineProjectionFromEventPayload(
+  rawPayload: unknown,
+  options: { eventSeq?: number; generatedAt?: number } = {},
+): SessionTimelineProjection | null {
+  const payload = rawPayload && typeof rawPayload === 'object' && !Array.isArray(rawPayload)
+    ? rawPayload as Record<string, unknown>
+    : {};
+  const sessionId = normalizeString(payload.session_id) || normalizeString(payload.sessionId);
+  const currentTurn = (payload.current_turn || payload.currentTurn) as RustSessionRuntimeTurnSummary | null | undefined;
+  const turnItems = (payload.turn_items || payload.turnItems) as RustSessionRuntimeTurnItemSummary[] | undefined;
+  const workerLanes = (payload.worker_lanes || payload.workerLanes) as RustSessionRuntimeTurnLaneSummary[] | undefined;
+  if (!sessionId || !currentTurn || !Array.isArray(turnItems)) {
+    return null;
+  }
+
+  const generatedAt = normalizeNumber(options.generatedAt, Date.now());
+  const eventSeq = normalizeNumber(options.eventSeq, 0);
+  const artifacts = buildTurnArtifactsFromSummary(
+    sessionId,
+    currentTurn,
+    turnItems,
+    Array.isArray(workerLanes) ? workerLanes : [],
+    generatedAt,
+    normalizeString(payload.final_text) || normalizeString(payload.finalText) || null,
+    normalizeString(payload.streaming_entry_id) || normalizeString(payload.streamingEntryId) || null,
+  ).map((artifact) => ({
+    ...artifact,
+    latestEventSeq: Math.max(normalizeNumber(artifact.latestEventSeq, 0), eventSeq),
+  }));
+  if (artifacts.length === 0) {
+    return null;
+  }
+
+  const latestArtifactSeq = artifacts.reduce(
+    (max, artifact) => Math.max(max, normalizeNumber(artifact.latestEventSeq, 0)),
+    0,
+  );
+  return {
+    schemaVersion: 'session-timeline-projection.v2',
+    sessionId,
+    updatedAt: generatedAt,
+    lastAppliedEventSeq: Math.max(eventSeq, latestArtifactSeq),
+    artifacts,
+    threadRenderEntries: [],
+    workerRenderEntries: {},
+  };
+}
+
 export function isRustEventEnvelope(value: unknown): value is RustEventEnvelope {
   return normalizeEventEnvelope(value) !== null;
 }

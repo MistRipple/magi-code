@@ -1531,6 +1531,129 @@ mod tests {
     }
 
     #[test]
+    fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
+        let root = unique_temp_dir("magi-tool-process-session-scope");
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+
+        let owner_context = ToolExecutionContext {
+            worker_id: None,
+            task_id: Some(TaskId::new("task-process-owner")),
+            session_id: Some(SessionId::new("session-process-owner")),
+            workspace_id: Some(WorkspaceId::new("workspace-process-shared")),
+        };
+        let workspace_only_context = ToolExecutionContext {
+            worker_id: None,
+            task_id: Some(TaskId::new("task-process-workspace-only")),
+            session_id: None,
+            workspace_id: Some(WorkspaceId::new("workspace-process-shared")),
+        };
+        let other_session_context = ToolExecutionContext {
+            worker_id: None,
+            task_id: Some(TaskId::new("task-process-other")),
+            session_id: Some(SessionId::new("session-process-other")),
+            workspace_id: Some(WorkspaceId::new("workspace-process-shared")),
+        };
+
+        let launch = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-process-launch-owner"),
+                tool_name: BuiltinToolName::ProcessLaunch.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "sleep 2",
+                    "cwd": root.to_string_lossy()
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            owner_context.clone(),
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(launch.status, ExecutionResultStatus::Succeeded);
+        let launch_payload: Value =
+            serde_json::from_str(&launch.payload).expect("launch payload json");
+        let terminal_id = launch_payload["terminal_id"].as_u64().expect("terminal id");
+
+        let read_workspace_only = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-process-read-workspace-only"),
+                tool_name: BuiltinToolName::ProcessRead.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "terminal_id": terminal_id }).to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            workspace_only_context.clone(),
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(read_workspace_only.status, ExecutionResultStatus::Failed);
+        assert!(
+            read_workspace_only
+                .payload
+                .contains("进程不属于当前 session/workspace")
+        );
+
+        let read_other_session = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-process-read-other-session"),
+                tool_name: BuiltinToolName::ProcessRead.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "terminal_id": terminal_id }).to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            other_session_context,
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(read_other_session.status, ExecutionResultStatus::Failed);
+        assert!(
+            read_other_session
+                .payload
+                .contains("进程不属于当前 session/workspace")
+        );
+
+        let process_list = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-process-list-workspace-only"),
+                tool_name: BuiltinToolName::ProcessList.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({}).to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            workspace_only_context,
+            &ToolExecutionPolicy::default(),
+        );
+        let list_payload: Value =
+            serde_json::from_str(&process_list.payload).expect("list payload json");
+        assert_eq!(process_list.status, ExecutionResultStatus::Succeeded);
+        assert!(
+            list_payload["processes"]
+                .as_array()
+                .expect("processes should be array")
+                .is_empty()
+        );
+
+        let kill = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-process-kill-owner"),
+                tool_name: BuiltinToolName::ProcessKill.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "terminal_id": terminal_id }).to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            owner_context,
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(kill.status, ExecutionResultStatus::Succeeded);
+    }
+
+    #[test]
     fn diff_preview_reports_text_deltas() {
         let governance = Arc::new(GovernanceService::default());
         let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
