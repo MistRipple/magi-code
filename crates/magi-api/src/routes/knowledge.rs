@@ -6,7 +6,10 @@ use axum::{
 use magi_core::{DomainError, UtcMillis, WorkspaceId};
 use magi_knowledge_store::{
     KnowledgeKind, KnowledgeQuery, KnowledgeRecord,
-    code_scanner::ingest_workspace_code_index_in_workspace,
+    code_scanner::{
+        CodeIndexScanOutcome, CodeIndexScanStatus, CodeIndexSummary,
+        ingest_workspace_code_index_in_workspace,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -202,7 +205,7 @@ async fn get_project_knowledge(
     Query(query): Query<KnowledgeListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
-    ensure_workspace_code_index(&state, &workspace_id)?;
+    let scan_outcome = ensure_workspace_code_index(&state, &workspace_id)?;
     let adrs_query = KnowledgeQuery {
         kind: Some(KnowledgeKind::Adr),
         text: None,
@@ -246,9 +249,11 @@ async fn get_project_knowledge(
         .collect::<Vec<_>>();
 
     // 从知识存储中获取代码索引摘要
-    let code_index = state
+    let code_index_summary = state
         .knowledge_store
-        .code_index_summary_for_workspace(&workspace_id)
+        .code_index_summary_for_workspace(&workspace_id);
+    let code_index_status = code_index_status_json(code_index_summary.as_ref(), &scan_outcome);
+    let code_index = code_index_summary
         .map(|summary| {
             serde_json::json!({
                 "files": summary.files.iter().map(|f| serde_json::json!({
@@ -267,6 +272,7 @@ async fn get_project_knowledge(
         "faqs": faqs,
         "learnings": learnings,
         "codeIndex": code_index,
+        "codeIndexStatus": code_index_status,
     })))
 }
 
@@ -309,13 +315,13 @@ async fn list_learnings(
 fn ensure_workspace_code_index(
     state: &ApiState,
     workspace_id: &WorkspaceId,
-) -> Result<(), ApiError> {
+) -> Result<CodeIndexScanOutcome, ApiError> {
     if state
         .knowledge_store
         .code_index_summary_for_workspace(workspace_id)
-        .is_some()
+        .is_some_and(|summary| !summary.files.is_empty())
     {
-        return Ok(());
+        return Ok(CodeIndexScanOutcome::indexed_existing());
     }
 
     let Some(workspace) = state
@@ -327,12 +333,31 @@ fn ensure_workspace_code_index(
         return Err(ApiError::not_found("工作区不存在", workspace_id.as_str()));
     };
 
-    ingest_workspace_code_index_in_workspace(
+    let outcome = ingest_workspace_code_index_in_workspace(
         &state.knowledge_store,
         workspace_id,
         &PathBuf::from(workspace.root_path.as_str()),
     );
-    state.persist_knowledge_state()
+    state.persist_knowledge_state()?;
+    Ok(outcome)
+}
+
+fn code_index_status_json(
+    summary: Option<&CodeIndexSummary>,
+    scan_outcome: &CodeIndexScanOutcome,
+) -> serde_json::Value {
+    if summary.is_some_and(|summary| !summary.files.is_empty()) {
+        return serde_json::json!({
+            "status": CodeIndexScanStatus::Indexed.as_str(),
+            "reasonCode": serde_json::Value::Null,
+            "detail": serde_json::Value::Null,
+        });
+    }
+    serde_json::json!({
+        "status": scan_outcome.status.as_str(),
+        "reasonCode": scan_outcome.reason_code.as_ref().map(|reason| reason.as_str()),
+        "detail": scan_outcome.detail.as_deref(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -841,6 +866,56 @@ mod tests {
                 .iter()
                 .any(|file| file["path"].as_str() == Some("src/main.rs")),
             "knowledge endpoint should index the requested registered workspace"
+        );
+        assert_eq!(payload["codeIndexStatus"]["status"], "indexed");
+    }
+
+    #[tokio::test]
+    async fn project_knowledge_reports_empty_workspace_without_persisting_zero_index() {
+        let state = state_with_knowledge_store(KnowledgeStore::new());
+        let workspace_id = WorkspaceId::new("workspace-empty-index");
+        let root =
+            std::env::temp_dir().join(format!("magi-knowledge-empty-index-{}", UtcMillis::now().0));
+        fs::create_dir_all(root.join(".magi")).expect("workspace dir should create");
+        fs::write(root.join(".magi/sessions.json"), "{}\n").expect("ignored file should write");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new(root.to_string_lossy().to_string()),
+            )
+            .expect("workspace should register");
+
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/knowledge?workspaceId=workspace-empty-index")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+
+        assert!(payload["codeIndex"].is_null());
+        assert_eq!(payload["codeIndexStatus"]["status"], "empty");
+        assert_eq!(
+            payload["codeIndexStatus"]["reasonCode"],
+            "no_indexable_files"
+        );
+        assert!(
+            state
+                .knowledge_store
+                .code_index_summary_for_workspace(&workspace_id)
+                .is_none(),
+            "空 workspace 不应被持久化为成功的 0 文件代码索引"
         );
     }
 }

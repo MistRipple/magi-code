@@ -570,6 +570,7 @@ impl TaskRunner {
 
         // Step 1.5: Heartbeat all active leases to prevent premature expiry.
         let active_leases = self.store.collect_active_leases(root_task_id);
+        let has_active_leases = !active_leases.is_empty();
         for (task_id, lease_id) in &active_leases {
             self.store.heartbeat_lease(task_id, lease_id);
         }
@@ -587,7 +588,10 @@ impl TaskRunner {
         // Step 4: Compute runnable leaves.
         let runnable = self.store.get_runnable_leaves(root_task_id);
         if runnable.is_empty() {
-            // Nothing runnable but not all complete — we're blocked.
+            if has_active_leases {
+                return RunCycleOutcome::Continue;
+            }
+            // Nothing runnable, no active worker lease, and not all complete — we're blocked.
             let blocked_ids = self.collect_non_terminal_task_ids(root_task_id);
             return RunCycleOutcome::Blocked(blocked_ids);
         }
@@ -776,6 +780,9 @@ impl TaskRunner {
         }
 
         if dispatched == 0 && !unmatched_ids.is_empty() {
+            if has_active_leases {
+                return RunCycleOutcome::Continue;
+            }
             return RunCycleOutcome::Blocked(unmatched_ids);
         }
 
@@ -2042,6 +2049,49 @@ mod tests {
             }
             other => panic!("expected Blocked, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn runner_does_not_block_while_active_lease_is_in_flight() {
+        let store = Arc::new(TaskStore::new());
+
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let action = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Running,
+        );
+
+        store.insert_task(root);
+        store.insert_task(action);
+        store
+            .grant_lease(
+                &TaskId::new("act-1"),
+                &TaskId::new("obj-1"),
+                &WorkerId::new("worker-dev"),
+                "integration-dev",
+                60_000,
+            )
+            .expect("running task should hold an active lease");
+
+        let runner = TaskRunner::new(Arc::clone(&store), Vec::new());
+
+        let outcome = runner.run_cycle(&TaskId::new("obj-1"));
+        assert_eq!(
+            outcome,
+            RunCycleOutcome::Continue,
+            "已有活跃租约代表 worker 仍在执行，runner 不应误判为 blocked"
+        );
     }
 
     // -----------------------------------------------------------------------

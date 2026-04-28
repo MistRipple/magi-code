@@ -169,8 +169,17 @@ async fn version(State(state): State<ApiState>) -> Json<VersionHandshakeDto> {
     Json(state.version_handshake_dto())
 }
 
-async fn stream_events(State(state): State<ApiState>) -> impl axum::response::IntoResponse {
-    sse::events(state).await
+#[derive(Debug, Deserialize)]
+struct EventStreamQuery {
+    #[serde(rename = "workspaceId", alias = "workspace_id")]
+    workspace_id: Option<String>,
+}
+
+async fn stream_events(
+    State(state): State<ApiState>,
+    Query(query): Query<EventStreamQuery>,
+) -> impl axum::response::IntoResponse {
+    sse::events(state, query.workspace_id).await
 }
 
 #[cfg(test)]
@@ -245,6 +254,98 @@ mod tests {
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
         )
+    }
+
+    async fn read_sse_event_payloads(response: axum::response::Response) -> Vec<Value> {
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should read")
+                .to_vec(),
+        )
+        .expect("sse body should be utf8");
+        body.split("\n\n")
+            .filter_map(|block| {
+                let data = block
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data:"))
+                    .map(str::trim_start)
+                    .collect::<Vec<_>>();
+                if data.is_empty() {
+                    return None;
+                }
+                serde_json::from_str::<Value>(&data.join("\n")).ok()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn events_stream_filters_recent_events_by_workspace_scope() {
+        let state = test_state();
+        let session_a = SessionId::new("session-sse-workspace-a");
+        let session_b = SessionId::new("session-sse-workspace-b");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_a.clone(),
+                "workspace A",
+                Some("workspace-a".to_string()),
+            )
+            .expect("session should create");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_b.clone(),
+                "workspace B",
+                Some("workspace-b".to_string()),
+            )
+            .expect("session should create");
+        state
+            .event_bus
+            .publish(
+                EventEnvelope::domain(
+                    EventId::new("event-sse-a"),
+                    "message.created",
+                    json!({ "session_id": session_a.as_str(), "content": "A" }),
+                )
+                .with_context(magi_event_bus::EventContext {
+                    session_id: Some(session_a),
+                    ..magi_event_bus::EventContext::default()
+                }),
+            )
+            .expect("event should publish");
+        state
+            .event_bus
+            .publish(
+                EventEnvelope::domain(
+                    EventId::new("event-sse-b"),
+                    "message.created",
+                    json!({ "session_id": session_b.as_str(), "content": "B" }),
+                )
+                .with_context(magi_event_bus::EventContext {
+                    session_id: Some(session_b),
+                    ..magi_event_bus::EventContext::default()
+                }),
+            )
+            .expect("event should publish");
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/events?workspaceId=workspace-a")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        let payloads = read_sse_event_payloads(response).await;
+        let event_ids = payloads
+            .iter()
+            .filter_map(|payload| payload["event_id"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(event_ids.contains(&"event-sse-a"));
+        assert!(!event_ids.contains(&"event-sse-b"));
     }
 
     fn build_shadow_execution_state(
@@ -915,6 +1016,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_turn_downgrades_model_task_route_without_task_signal() {
+        let state = build_shadow_execution_state(
+            WorkerRuntime::new_compare,
+            Arc::new(TaskRouteClassifierModelBridgeClient),
+        );
+        let app = build_router(state.clone());
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/api/session/turn",
+            json!({
+                "sessionId": "session-route-shadow",
+                "text": "你好，这只是普通对话",
+                "deepTask": false,
+                "skillName": null,
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "误判任务应降级为普通对话: {body:?}");
+        assert_eq!(body["route"], "chat");
+        assert!(
+            body.get("rootTaskId").is_none(),
+            "降级后的普通对话不能暴露任务根 ID: {body:?}"
+        );
+        assert!(
+            body.get("actionTaskId").is_none(),
+            "降级后的普通对话不能暴露 action task ID: {body:?}"
+        );
+
+        wait_for_condition(
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+            || {
+                state
+                    .runtime_read_model_dto()
+                    .details
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == "session-route-shadow")
+                    .and_then(|session| session.current_turn.as_ref())
+                    .is_some_and(|turn| turn.status == "completed")
+            },
+            "误判任务降级后仍应按普通对话完成",
+        )
+        .await;
+
+        let runtime_read_model = get_json(app, "/runtime/read-model").await;
+        assert!(
+            runtime_read_model["details"]["tasks"]
+                .as_array()
+                .expect("tasks should serialize as array")
+                .is_empty(),
+            "没有任务准入信号时，模型误判 task 也不能创建 TaskStore 任务"
+        );
+        let session_summary = runtime_read_model["details"]["sessions"]
+            .as_array()
+            .expect("sessions should serialize as array")
+            .iter()
+            .find(|session| session["session_id"] == "session-route-shadow")
+            .expect("chat session should exist in read model");
+        assert_eq!(session_summary["current_turn"]["mission_id"], Value::Null);
+        assert_eq!(session_summary["current_turn"]["root_task_id"], Value::Null);
+    }
+
+    #[tokio::test]
     async fn session_turn_classifier_requires_tool_call_payload() {
         let state = build_shadow_execution_state(
             WorkerRuntime::new_compare,
@@ -1036,6 +1204,90 @@ mod tests {
                 .expect("tasks should serialize as array")
                 .is_empty(),
             "execute route 不能创建 TaskStore 任务"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_turn_sanitizes_assignment_dispatch_from_stream_and_final() {
+        let state = build_shadow_execution_state(
+            WorkerRuntime::new_compare,
+            Arc::new(AssignmentDispatchStreamingModelBridgeClient),
+        );
+        let app = build_router(state.clone());
+        let session_id = "session-route-shadow";
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/api/session/turn",
+            json!({
+                "sessionId": session_id,
+                "text": "请先分析，再给我一个普通回复",
+                "deepTask": false,
+                "skillName": null,
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "session turn 应提交成功: {body:?}");
+        assert_eq!(body["route"], "chat");
+
+        wait_for_condition(
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+            || {
+                state
+                    .runtime_read_model_dto()
+                    .details
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == session_id)
+                    .and_then(|session| session.current_turn.as_ref())
+                    .is_some_and(|turn| turn.status == "completed")
+            },
+            "含 assignment dispatch 的普通回复应完成并写入净化后的 turn item",
+        )
+        .await;
+
+        let runtime_read_model = get_json(app.clone(), "/runtime/read-model").await;
+        let session_summary = runtime_read_model["details"]["sessions"]
+            .as_array()
+            .expect("sessions should serialize as array")
+            .iter()
+            .find(|session| session["session_id"] == session_id)
+            .expect("session summary should exist");
+        let turn_items = session_summary["turn_items"]
+            .as_array()
+            .expect("turn items should serialize as array");
+        let assistant_final = turn_items
+            .iter()
+            .find(|item| item["kind"] == "assistant_final")
+            .expect("assistant final should exist");
+        assert_eq!(assistant_final["content"], "分析完成。");
+        for item in turn_items {
+            if let Some(content) = item["content"].as_str() {
+                assert_no_assignment_dispatch_leak(content);
+            }
+        }
+
+        let messages_page = get_json(app, "/api/messages?sessionId=session-route-shadow").await;
+        let assistant_entries = messages_page["timeline"]
+            .as_array()
+            .expect("timeline should serialize as array")
+            .iter()
+            .filter(|entry| entry["kind"] == "AssistantMessage")
+            .collect::<Vec<_>>();
+        assert_eq!(assistant_entries.len(), 1);
+        let visible_text = timeline_entry_visible_text(
+            assistant_entries[0]["message"]
+                .as_str()
+                .expect("assistant timeline message should be stored as string"),
+        );
+        assert_eq!(visible_text.as_deref(), Some("分析完成。"));
+        assert_no_assignment_dispatch_leak(
+            assistant_entries[0]["message"]
+                .as_str()
+                .expect("assistant timeline message should be stored as string"),
         );
     }
 
@@ -3038,6 +3290,10 @@ mod tests {
 
     struct PlainJsonClassifierModelBridgeClient;
 
+    struct TaskRouteClassifierModelBridgeClient;
+
+    struct AssignmentDispatchStreamingModelBridgeClient;
+
     struct ExecuteToolModelBridgeClient {
         invoke_count: AtomicUsize,
     }
@@ -3146,6 +3402,90 @@ mod tests {
             request: ModelInvocationRequest,
             _on_delta: &dyn Fn(&ModelStreamingDelta),
         ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for TaskRouteClassifierModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            if request.prompt.contains("Session Turn 编排分类器") {
+                return Ok(BridgeResponse {
+                    ok: true,
+                    payload: classifier_tool_payload(serde_json::json!({
+                        "route": "task",
+                        "taskTitle": "误判任务",
+                        "executionGoal": "这个普通对话不应该进入任务图",
+                        "requiredWorkers": ["integration-dev"],
+                        "toolIntent": "不应泄漏到普通对话 prompt",
+                    })),
+                });
+            }
+            Ok(BridgeResponse {
+                ok: true,
+                payload: "shadow-model::普通对话回复".to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for AssignmentDispatchStreamingModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            if request.prompt.contains("Session Turn 编排分类器") {
+                return Ok(BridgeResponse {
+                    ok: true,
+                    payload: classifier_tool_payload(serde_json::json!({
+                        "route": "chat",
+                        "taskTitle": null,
+                        "executionGoal": null,
+                        "requiredWorkers": [],
+                        "toolIntent": null,
+                    })),
+                });
+            }
+            Ok(BridgeResponse {
+                ok: true,
+                payload: serde_json::json!({
+                    "content": assignment_dispatch_visible_leak_fixture(),
+                    "finish_reason": "stop",
+                })
+                .to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, magi_bridge_client::BridgeClientError> {
+            let content = assignment_dispatch_visible_leak_fixture();
+            on_delta(&ModelStreamingDelta {
+                content: "分析完成。".to_string(),
+                thinking: String::new(),
+            });
+            on_delta(&ModelStreamingDelta {
+                content: content[..content
+                    .find("\"tasks\"")
+                    .expect("fixture should contain tasks")]
+                    .to_string(),
+                thinking: String::new(),
+            });
+            on_delta(&ModelStreamingDelta {
+                content,
+                thinking: String::new(),
+            });
             self.invoke(request)
         }
     }
@@ -3387,6 +3727,36 @@ mod tests {
             }]
         })
         .to_string()
+    }
+
+    fn assignment_dispatch_visible_leak_fixture() -> String {
+        r#"分析完成。
+我将安排以下任务：
+```json
+{
+  "mission_title": "实现用户认证",
+  "tasks": [{
+    "task_name": "实现 JWT 验证",
+    "ownership_hint": "backend",
+    "mode_hint": "implement",
+    "goal": "实现 JWT token 验证中间件",
+    "acceptance": ["通过单元测试"],
+    "constraints": ["使用现有模块"],
+    "context": ["auth"],
+    "requires_modification": true
+  }]
+}
+```"#
+            .to_string()
+    }
+
+    fn assert_no_assignment_dispatch_leak(content: &str) {
+        assert!(
+            !content.contains("\"tasks\"")
+                && !content.contains("\"mission_title\"")
+                && !content.contains("```json"),
+            "用户可见内容不能泄漏 assignment dispatch JSON: {content}"
+        );
     }
 
     impl ModelBridgeClient for FailingModelBridgeClient {

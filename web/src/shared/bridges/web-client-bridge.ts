@@ -12,6 +12,7 @@ import {
   approveAgentChange,
   approveAllAgentChanges,
   addAgentAdr,
+  appendAgentNotification,
   addAgentCustomTool,
   addAgentFaq,
   addAgentLearning,
@@ -742,6 +743,11 @@ function readTurnItemNumber(item: Record<string, unknown>, camelKey: string, sna
   return undefined;
 }
 
+function readTurnItemBoolean(item: Record<string, unknown>, camelKey: string, snakeKey?: string): boolean | undefined {
+  const value = readTurnItemValue(item, camelKey, snakeKey);
+  return typeof value === 'boolean' ? value : undefined;
+}
+
 function stringifyTurnItemPayload(value: unknown): string | undefined {
   const stringValue = trimBridgeString(value);
   if (stringValue) {
@@ -898,6 +904,12 @@ function createSessionTurnItemStandardMessage(
   const itemSeq = readTurnItemNumber(item, 'itemSeq', 'item_seq');
   const laneId = readTurnItemString(item, 'laneId', 'lane_id');
   const laneSeq = readTurnItemNumber(item, 'laneSeq', 'lane_seq');
+  const workerId = readTurnItemString(item, 'workerId', 'worker_id');
+  const roleId = readTurnItemString(item, 'roleId', 'role_id');
+  const workerTabId = roleId || workerId;
+  const itemSource = readTurnItemString(item, 'source');
+  const threadVisible = readTurnItemBoolean(item, 'threadVisible', 'thread_visible');
+  const workerVisible = readTurnItemBoolean(item, 'workerVisible', 'worker_visible');
   const timelineEntryId = readTurnItemString(item, 'timelineEntryId', 'timeline_entry_id');
   const itemRequestId = readTurnItemString(item, 'requestId', 'request_id');
   const itemUserMessageId = readTurnItemString(item, 'userMessageId', 'user_message_id');
@@ -932,6 +944,11 @@ function createSessionTurnItemStandardMessage(
     ...(typeof itemSeq === 'number' ? { itemSeq, blockSeq: itemSeq, cardStreamSeq: itemSeq } : {}),
     ...(laneId ? { laneId } : {}),
     ...(typeof laneSeq === 'number' ? { laneSeq } : {}),
+    ...(workerId ? { workerId } : {}),
+    ...(roleId ? { roleId } : {}),
+    ...(workerTabId ? { worker: workerTabId } : {}),
+    ...(typeof threadVisible === 'boolean' ? { threadVisible } : {}),
+    ...(typeof workerVisible === 'boolean' ? { workerVisible } : {}),
     ...(timelineEntryId ? { timelineEntryId } : {}),
     ...(liveRequestId ? { requestId: liveRequestId } : {}),
     ...(liveUserMessageId ? { userMessageId: liveUserMessageId } : {}),
@@ -1018,17 +1035,17 @@ function createSessionTurnItemStandardMessage(
     return null;
   }
 
-  return {
-    bridgeType,
-    message: {
+	  return {
+	    bridgeType,
+	    message: {
       id,
       eventId: event.event_id,
       eventSeq,
       traceId: `rust-session-turn:${sessionId}:${itemId}`,
       category: MessageCategory.CONTENT,
       type,
-      source: 'orchestrator',
-      agent: 'orchestrator',
+	      source: workerVisible === true ? 'worker' : 'orchestrator',
+	      agent: workerVisible === true && workerTabId ? workerTabId : (itemSource || 'orchestrator'),
       lifecycle,
       blocks,
       metadata,
@@ -2616,7 +2633,7 @@ async function updateSetting(key: string, value: unknown): Promise<void> {
   }
 }
 
-type NotificationCenterOperation = 'load' | 'mark-read' | 'clear' | 'remove';
+type NotificationCenterOperation = 'load' | 'append' | 'mark-read' | 'clear' | 'remove';
 
 interface NotificationOperationScope {
   sessionId: string;
@@ -2677,6 +2694,15 @@ async function runNotificationOperation(
 async function loadSessionNotifications(scope: NotificationOperationScope): Promise<void> {
   await runNotificationOperation('load', scope, async (operationScope) => (
     await getAgentSessionNotifications(operationScope) as unknown as Record<string, unknown>
+  ));
+}
+
+async function appendSessionNotification(
+  scope: NotificationOperationScope,
+  notification: Record<string, unknown>,
+): Promise<void> {
+  await runNotificationOperation('append', scope, async (operationScope) => (
+    await appendAgentNotification(notification, operationScope) as unknown as Record<string, unknown>
   ));
 }
 
@@ -3184,6 +3210,16 @@ export function createWebClientBridge(): ClientBridge {
             if (scope) {
               void loadSessionNotifications(scope).catch((error) => {
                 reportExpectedRecoveryFailure('加载通知', '[web-client-bridge] 加载通知失败:', error);
+              });
+            }
+          }
+          return;
+        case 'appendSessionNotification':
+          if (message.notification && typeof message.notification === 'object') {
+            const scope = resolveNotificationOperationScope(message);
+            if (scope) {
+              void appendSessionNotification(scope, message.notification as Record<string, unknown>).catch((error) => {
+                reportExpectedRecoveryFailure('写入通知', '[web-client-bridge] 写入通知失败:', error);
               });
             }
           }

@@ -472,6 +472,9 @@ fn execute_process_launch(input: &str, context: &ToolExecutionContext) -> String
     if command.is_empty() {
         return builtin_error("process_launch", "缺少 shell 命令");
     }
+    if let Some(error) = require_process_context("process_launch", context) {
+        return error;
+    }
     let cwd_input = request
         .as_ref()
         .and_then(|object| field_string(object, &["cwd", "working_directory", "workdir"]));
@@ -548,6 +551,9 @@ fn execute_process_read(input: &str, context: &ToolExecutionContext) -> String {
     let Some(terminal_id) = field_usize(&request, &["terminal_id", "terminalId", "id"]) else {
         return builtin_error("process_read", "缺少 terminal_id");
     };
+    if let Some(error) = require_process_context("process_read", context) {
+        return error;
+    }
     let max_bytes = field_usize(&request, &["max_bytes", "preview_bytes", "limit"])
         .unwrap_or(12_000)
         .clamp(512, 200_000);
@@ -599,6 +605,9 @@ fn execute_process_write(input: &str, context: &ToolExecutionContext) -> String 
     let Some(terminal_id) = field_usize(&request, &["terminal_id", "terminalId", "id"]) else {
         return builtin_error("process_write", "缺少 terminal_id");
     };
+    if let Some(error) = require_process_context("process_write", context) {
+        return error;
+    }
     let content = field_string(&request, &["input", "content", "text"]).unwrap_or_default();
     let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
     let Some(process) = table.get_mut(&(terminal_id as u64)) else {
@@ -632,6 +641,9 @@ fn execute_process_kill(input: &str, context: &ToolExecutionContext) -> String {
     let Some(terminal_id) = field_usize(&request, &["terminal_id", "terminalId", "id"]) else {
         return builtin_error("process_kill", "缺少 terminal_id");
     };
+    if let Some(error) = require_process_context("process_kill", context) {
+        return error;
+    }
     let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
     let Some(process) = table.get_mut(&(terminal_id as u64)) else {
         return builtin_error("process_kill", format!("进程不存在: {terminal_id}"));
@@ -652,6 +664,9 @@ fn execute_process_kill(input: &str, context: &ToolExecutionContext) -> String {
 }
 
 fn execute_process_list(context: &ToolExecutionContext) -> String {
+    if let Some(error) = require_process_context("process_list", context) {
+        return error;
+    }
     let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
     let mut processes = Vec::new();
     for process in table.values_mut() {
@@ -712,13 +727,30 @@ fn spawn_managed_process_reader<T: Read + Send + 'static>(
 }
 
 fn process_belongs_to_context(process: &ManagedProcess, context: &ToolExecutionContext) -> bool {
+    let mut has_scope = false;
     if let Some(session_id) = context.session_id.as_ref().map(ToString::to_string) {
-        return process.session_id.as_deref() == Some(session_id.as_str());
+        has_scope = true;
+        if process.session_id.as_deref() != Some(session_id.as_str()) {
+            return false;
+        }
     }
     if let Some(workspace_id) = context.workspace_id.as_ref().map(ToString::to_string) {
-        return process.workspace_id.as_deref() == Some(workspace_id.as_str());
+        has_scope = true;
+        if process.workspace_id.as_deref() != Some(workspace_id.as_str()) {
+            return false;
+        }
     }
-    true
+    has_scope
+}
+
+fn require_process_context(tool: &str, context: &ToolExecutionContext) -> Option<String> {
+    if context.session_id.is_some() || context.workspace_id.is_some() {
+        return None;
+    }
+    Some(builtin_error(
+        tool,
+        "后台进程工具需要 session 或 workspace 上下文",
+    ))
 }
 
 fn tail_utf8(bytes: &[u8], max_bytes: usize) -> String {

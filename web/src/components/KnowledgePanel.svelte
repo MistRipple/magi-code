@@ -29,6 +29,19 @@
     entryPoints?: string[];
   }
 
+  type CodeIndexStatusValue = 'indexed' | 'empty' | 'failed';
+  type CodeIndexReasonCode =
+    | 'workspace_missing'
+    | 'workspace_not_directory'
+    | 'workspace_unreadable'
+    | 'no_indexable_files';
+
+  interface CodeIndexStatus {
+    status: CodeIndexStatusValue;
+    reasonCode?: CodeIndexReasonCode;
+    detail?: string;
+  }
+
   interface ADR {
     id: string;
     title: string;
@@ -66,6 +79,7 @@
   let lastWorkspaceKey = $state('');
   let loadError = $state('');
   let codeIndex = $state<CodeIndex | null>(null);
+  let codeIndexStatus = $state<CodeIndexStatus | null>(null);
   let adrs = $state<ADR[]>([]);
   let faqs = $state<FAQ[]>([]);
   let learnings = $state<Learning[]>([]);
@@ -102,6 +116,14 @@
   const hasKnowledgeContent = $derived(
     fileCount > 0 || adrs.length > 0 || faqs.length > 0 || learnings.length > 0
   );
+  const codeIndexNotice = $derived.by(() => {
+    if (!codeIndexStatus || codeIndexStatus.status === 'indexed') return null;
+    const title = codeIndexStatus.status === 'failed'
+      ? i18n.t('knowledge.overview.indexFailed')
+      : i18n.t('knowledge.overview.indexEmpty');
+    const hint = codeIndexNoticeHint(codeIndexStatus);
+    return { title, hint, status: codeIndexStatus.status };
+  });
 
   // 过滤后的 ADR 列表（安全过滤，跳过无效数据）
   const filteredAdrs = $derived.by(() => {
@@ -292,6 +314,7 @@
 
   function clearKnowledgeContent() {
     codeIndex = null;
+    codeIndexStatus = null;
     adrs = [];
     faqs = [];
     learnings = [];
@@ -311,6 +334,7 @@
     const codeIndexPayload = payload?.codeIndex && typeof payload.codeIndex === 'object'
       ? payload.codeIndex as Record<string, unknown>
       : null;
+    codeIndexStatus = normalizeCodeIndexStatus(payload?.codeIndexStatus);
 
     adrs = ensureArray(payload?.adrs).map((a: any) => ({
       id: a.id,
@@ -341,6 +365,49 @@
       : null;
     loadError = '';
     isLoading = false;
+  }
+
+  function normalizeCodeIndexStatus(value: unknown): CodeIndexStatus | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    const status = typeof record.status === 'string' ? record.status : '';
+    if (status !== 'indexed' && status !== 'empty' && status !== 'failed') return null;
+    const reasonCode = normalizeCodeIndexReasonCode(record.reasonCode);
+    const detail = typeof record.detail === 'string' && record.detail.trim()
+      ? record.detail.trim()
+      : undefined;
+    return { status, reasonCode, detail };
+  }
+
+  function normalizeCodeIndexReasonCode(value: unknown): CodeIndexReasonCode | undefined {
+    if (typeof value !== 'string') return undefined;
+    if (
+      value === 'workspace_missing' ||
+      value === 'workspace_not_directory' ||
+      value === 'workspace_unreadable' ||
+      value === 'no_indexable_files'
+    ) {
+      return value;
+    }
+    return undefined;
+  }
+
+  function codeIndexNoticeHint(status: CodeIndexStatus): string {
+    if (status.reasonCode === 'no_indexable_files') {
+      return i18n.t('knowledge.overview.indexEmptyNoIndexableFiles');
+    }
+    if (status.reasonCode === 'workspace_missing') {
+      return i18n.t('knowledge.overview.indexFailedWorkspaceMissing');
+    }
+    if (status.reasonCode === 'workspace_not_directory') {
+      return i18n.t('knowledge.overview.indexFailedWorkspaceNotDirectory');
+    }
+    if (status.reasonCode === 'workspace_unreadable') {
+      return i18n.t('knowledge.overview.indexFailedWorkspaceUnreadable');
+    }
+    return status.status === 'failed'
+      ? i18n.t('knowledge.overview.indexFailedHint')
+      : i18n.t('knowledge.overview.indexEmptyHint');
   }
 
   function handleKnowledgeLoadError(error: unknown) {
@@ -639,6 +706,16 @@
             <span class="kp-stat-label">{i18n.t('knowledge.tabs.learning')}</span>
           </div>
         </div>
+
+        {#if codeIndexNotice}
+          <div class="kp-index-notice" class:failed={codeIndexNotice.status === 'failed'}>
+            <Icon name={codeIndexNotice.status === 'failed' ? 'warning' : 'info'} size={14} />
+            <div class="kp-index-notice-text">
+              <span class="kp-index-notice-title">{codeIndexNotice.title}</span>
+              <span class="kp-index-notice-hint">{codeIndexNotice.hint}</span>
+            </div>
+          </div>
+        {/if}
 
         {#if normalizedCodeIndex?.techStack && normalizedCodeIndex.techStack.length > 0}
           <div class="kp-section">
@@ -1200,6 +1277,41 @@
     width: 1px;
     height: 24px;
     background: var(--border);
+  }
+
+  .kp-index-notice {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    border: 1px solid color-mix(in srgb, var(--primary) 22%, var(--border));
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--primary) 8%, var(--surface-1));
+    color: var(--foreground-muted);
+  }
+
+  .kp-index-notice.failed {
+    border-color: color-mix(in srgb, var(--warning) 28%, var(--border));
+    background: color-mix(in srgb, var(--warning) 9%, var(--surface-1));
+  }
+
+  .kp-index-notice-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .kp-index-notice-title {
+    color: var(--foreground);
+    font-size: var(--text-xs);
+    font-weight: var(--font-semibold);
+  }
+
+  .kp-index-notice-hint {
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    line-height: 1.4;
   }
 
   .kp-section {

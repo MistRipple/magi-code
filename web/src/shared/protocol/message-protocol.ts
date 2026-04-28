@@ -378,6 +378,10 @@ export interface MessageMetadata {
   isStatusMessage?: boolean;
   assignedWorker?: string;
   worker?: string;
+  workerId?: string;
+  roleId?: string;
+  threadVisible?: boolean;
+  workerVisible?: boolean;
   dispatchToWorker?: boolean;
   dispatchWaveId?: string;
   laneId?: string;

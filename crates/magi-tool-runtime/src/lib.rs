@@ -1363,6 +1363,94 @@ mod tests {
     }
 
     #[test]
+    fn process_tools_reject_missing_session_or_workspace_context() {
+        let root = unique_temp_dir("magi-tool-process-context");
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-process-launch-no-context"),
+                tool_name: BuiltinToolName::ProcessLaunch.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "sleep 1",
+                    "cwd": root.to_string_lossy()
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext::default(),
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(output.status, ExecutionResultStatus::Failed);
+        assert!(output.payload.contains("需要 session 或 workspace 上下文"));
+
+        let context = ToolExecutionContext {
+            worker_id: None,
+            task_id: Some(TaskId::new("task-process-context")),
+            session_id: Some(SessionId::new("session-process-context")),
+            workspace_id: Some(WorkspaceId::new("workspace-process-context")),
+        };
+        let launch = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-process-launch-context"),
+                tool_name: BuiltinToolName::ProcessLaunch.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "sleep 2",
+                    "cwd": root.to_string_lossy()
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context.clone(),
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(launch.status, ExecutionResultStatus::Succeeded);
+        let launch_payload: Value =
+            serde_json::from_str(&launch.payload).expect("launch payload json");
+        let terminal_id = launch_payload["terminal_id"].as_u64().expect("terminal id");
+
+        let read_without_context = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-process-read-no-context"),
+                tool_name: BuiltinToolName::ProcessRead.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "terminal_id": terminal_id }).to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext::default(),
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(read_without_context.status, ExecutionResultStatus::Failed);
+        assert!(
+            read_without_context
+                .payload
+                .contains("需要 session 或 workspace 上下文")
+        );
+
+        let kill = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-process-kill-context"),
+                tool_name: BuiltinToolName::ProcessKill.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "terminal_id": terminal_id }).to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context,
+            &ToolExecutionPolicy::default(),
+        );
+        assert_eq!(kill.status, ExecutionResultStatus::Succeeded);
+    }
+
+    #[test]
     fn diff_preview_reports_text_deltas() {
         let governance = Arc::new(GovernanceService::default());
         let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));

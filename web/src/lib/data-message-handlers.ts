@@ -813,13 +813,14 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         );
       }
 
-    if (snapshot.notifications) {
-      applySessionNotifications(sessionId, snapshot.notifications.notifications);
-    }
-    setSessionHistoryState(sessionId, {
-      hasMoreBefore,
-      beforeCursor,
+      if (snapshot.notifications) {
+        applySessionNotifications(sessionId, snapshot.notifications.notifications);
+      }
+      setSessionHistoryState(sessionId, {
+        hasMoreBefore,
+        beforeCursor,
         isLoadingBefore: false,
+        preserveLoadedWindow: true,
       });
 
       // 权威投影始终回灌到时间线：本地活跃轮次只能保留处理态，

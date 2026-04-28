@@ -10,7 +10,9 @@ use magi_bridge_client::{
 use magi_core::TaskStatus;
 use magi_core::{DomainError, EventId, SessionId, UtcMillis, WorkerId};
 use magi_event_bus::{EventContext, EventEnvelope};
-use magi_session_store::{ActiveExecutionTurn, ActiveExecutionTurnItem, SessionRecord};
+use magi_session_store::{
+    ActiveExecutionTurn, ActiveExecutionTurnItem, NotificationRecord, SessionRecord,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -48,6 +50,10 @@ pub fn routes() -> Router<ApiState> {
         .route("/session/save", post(save_session))
         .route("/session/notifications", get(get_notifications))
         .route(
+            "/session/notifications/append",
+            post(append_session_notification),
+        )
+        .route(
             "/session/notifications/mark-all-read",
             post(mark_all_notifications_read),
         )
@@ -59,6 +65,14 @@ pub fn routes() -> Router<ApiState> {
 #[serde(rename_all = "camelCase")]
 struct DeleteSessionRequest {
     session_id: String,
+    #[serde(default, alias = "workspace_id")]
+    workspace_id: Option<String>,
+}
+
+impl DeleteSessionRequest {
+    fn requested_workspace_id(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_id.as_deref())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,13 +250,30 @@ fn decide_session_turn_with_task_planner(
             "Session Turn 分类器返回失败状态".to_string(),
         ));
     }
-    let decision = parse_session_turn_decision(&response.payload)?;
+    let mut decision = parse_session_turn_decision(&response.payload)?;
     if matches!(decision.route, SessionTurnRouteDto::Continue) && !has_recoverable_chain {
         return Err(ApiError::InvalidInput(
             "当前会话没有可继续的执行链".to_string(),
         ));
     }
+    if matches!(decision.route, SessionTurnRouteDto::Task) && !request_allows_task_route(request) {
+        decision.route = SessionTurnRouteDto::Chat;
+        decision.task_title = None;
+        decision.execution_goal = None;
+        decision.required_workers.clear();
+        decision.tool_intent = None;
+    }
     Ok(decision)
+}
+
+fn request_allows_task_route(request: &SessionTurnRequestDto) -> bool {
+    request.deep_task
+        || request
+            .skill_name
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || !request.images.is_empty()
 }
 
 fn session_has_recoverable_chain(state: &ApiState, session_id: &SessionId) -> bool {
@@ -709,6 +740,30 @@ struct SwitchSessionRequest {
     workspace_id: Option<String>,
 }
 
+impl SwitchSessionRequest {
+    fn requested_workspace_id(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_id.as_deref())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveSessionRequest {
+    session_id: Option<String>,
+    #[serde(default, alias = "workspace_id")]
+    workspace_id: Option<String>,
+}
+
+impl SaveSessionRequest {
+    fn requested_session_id(&self) -> Option<SessionId> {
+        parse_requested_session_id(self.session_id.as_deref())
+    }
+
+    fn requested_workspace_id(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_id.as_deref())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ContinueSessionRequest {
@@ -899,14 +954,10 @@ async fn switch_session(
     Json(request): Json<SwitchSessionRequest>,
 ) -> Result<Json<SessionSelectionResponseDto>, ApiError> {
     let session_id = SessionId::new(&request.session_id);
-    if request
-        .workspace_id
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|id| !id.is_empty())
-    {
-        require_session_record_in_workspace(&state, &session_id, request.workspace_id.as_deref())?;
-    }
+    let workspace_id = request
+        .requested_workspace_id()
+        .ok_or_else(|| ApiError::InvalidInput("workspaceId 不能为空".to_string()))?;
+    require_session_record_in_workspace(&state, &session_id, Some(workspace_id))?;
     state
         .session_store
         .switch_session(&session_id)
@@ -1071,12 +1122,21 @@ async fn delete_session(
     Json(request): Json<DeleteSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
     let session_id = SessionId::new(&request.session_id);
+    let session =
+        require_session_record_in_workspace(&state, &session_id, request.requested_workspace_id())?;
+    let response_workspace_id = request
+        .requested_workspace_id()
+        .or(session.workspace_id.as_deref())
+        .map(str::to_string);
     state
         .session_store
         .delete_session(&session_id)
         .map_err(|e| ApiError::internal_assembly("删除会话失败", e))?;
     state.persist_session_durable_state()?;
-    Ok(Json(state.bootstrap_dto()))
+    Ok(Json(state.bootstrap_dto_for_workspace_session(
+        response_workspace_id.as_deref(),
+        None,
+    )))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1084,6 +1144,14 @@ async fn delete_session(
 struct RenameSessionRequest {
     session_id: String,
     name: String,
+    #[serde(default, alias = "workspace_id")]
+    workspace_id: Option<String>,
+}
+
+impl RenameSessionRequest {
+    fn requested_workspace_id(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_id.as_deref())
+    }
 }
 
 async fn rename_session(
@@ -1091,18 +1159,35 @@ async fn rename_session(
     Json(request): Json<RenameSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
     let session_id = SessionId::new(&request.session_id);
+    let session =
+        require_session_record_in_workspace(&state, &session_id, request.requested_workspace_id())?;
+    let response_workspace_id = request
+        .requested_workspace_id()
+        .or(session.workspace_id.as_deref())
+        .map(str::to_string);
     state
         .session_store
         .rename_session(&session_id, &request.name)
         .map_err(|e| ApiError::internal_assembly("重命名会话失败", e))?;
     state.persist_session_durable_state()?;
-    Ok(Json(state.bootstrap_dto()))
+    Ok(Json(state.bootstrap_dto_for_workspace_session(
+        response_workspace_id.as_deref(),
+        Some(&session_id),
+    )))
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CloseSessionRequest {
     session_id: String,
+    #[serde(default, alias = "workspace_id")]
+    workspace_id: Option<String>,
+}
+
+impl CloseSessionRequest {
+    fn requested_workspace_id(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_id.as_deref())
+    }
 }
 
 async fn close_session(
@@ -1110,6 +1195,12 @@ async fn close_session(
     Json(request): Json<CloseSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
     let session_id = SessionId::new(&request.session_id);
+    let session =
+        require_session_record_in_workspace(&state, &session_id, request.requested_workspace_id())?;
+    let response_workspace_id = request
+        .requested_workspace_id()
+        .or(session.workspace_id.as_deref())
+        .map(str::to_string);
     state
         .session_store
         .archive_session(&session_id)
@@ -1118,12 +1209,30 @@ async fn close_session(
         manager.unbind_session(&session_id);
     }
     state.persist_session_durable_state()?;
-    Ok(Json(state.bootstrap_dto()))
+    Ok(Json(state.bootstrap_dto_for_workspace_session(
+        response_workspace_id.as_deref(),
+        None,
+    )))
 }
 
-async fn save_session(State(state): State<ApiState>) -> Result<Json<BootstrapDto>, ApiError> {
+async fn save_session(
+    State(state): State<ApiState>,
+    Json(request): Json<SaveSessionRequest>,
+) -> Result<Json<BootstrapDto>, ApiError> {
+    let workspace_id = request
+        .requested_workspace_id()
+        .ok_or_else(|| ApiError::InvalidInput("workspaceId 不能为空".to_string()))?;
+    let selected_session_id = if let Some(session_id) = request.requested_session_id() {
+        require_session_record_in_workspace(&state, &session_id, Some(workspace_id))?;
+        Some(session_id)
+    } else {
+        None
+    };
     state.persist_session_durable_state()?;
-    Ok(Json(state.bootstrap_dto()))
+    Ok(Json(state.bootstrap_dto_for_workspace_session(
+        Some(workspace_id),
+        selected_session_id.as_ref(),
+    )))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1175,6 +1284,104 @@ impl NotificationScopeRequest {
     fn requested_workspace_id(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_id.as_deref())
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppendNotificationRequest {
+    session_id: Option<String>,
+    #[serde(default, alias = "workspace_id")]
+    workspace_id: Option<String>,
+    notification_id: Option<String>,
+    kind: Option<String>,
+    level: Option<String>,
+    title: Option<String>,
+    message: String,
+    source: Option<String>,
+    persist_to_center: Option<bool>,
+    action_required: Option<bool>,
+    count_unread: Option<bool>,
+    display_mode: Option<String>,
+    duration: Option<u64>,
+}
+
+impl AppendNotificationRequest {
+    fn requested_session_id(&self) -> Option<SessionId> {
+        parse_requested_session_id(self.session_id.as_deref())
+    }
+
+    fn requested_workspace_id(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_id.as_deref())
+    }
+
+    fn requested_notification_id(&self) -> Option<String> {
+        trimmed_non_empty(self.notification_id.as_deref()).map(str::to_string)
+    }
+
+    fn normalized_kind(&self) -> String {
+        match trimmed_non_empty(self.kind.as_deref()) {
+            Some("incident") => "incident".to_string(),
+            Some("audit") | Some("center") | Some("toast") => "audit".to_string(),
+            _ => "audit".to_string(),
+        }
+    }
+
+    fn normalized_display_mode(&self) -> Option<String> {
+        match trimmed_non_empty(self.display_mode.as_deref()) {
+            Some("toast") => Some("toast".to_string()),
+            Some("notification_center") => Some("notification_center".to_string()),
+            Some("silent") => Some("silent".to_string()),
+            _ => None,
+        }
+    }
+}
+
+async fn append_session_notification(
+    State(state): State<ApiState>,
+    Json(request): Json<AppendNotificationRequest>,
+) -> Result<Json<SessionNotificationsResponseDto>, ApiError> {
+    let session_id = require_notifications_session_id(
+        &state,
+        request.requested_session_id(),
+        request.requested_workspace_id(),
+    )?;
+    if request.persist_to_center == Some(false) {
+        return Ok(Json(build_notifications_response(
+            &state,
+            Some(&session_id),
+        )));
+    }
+    let message = trimmed_non_empty(Some(request.message.as_str()))
+        .ok_or_else(|| ApiError::InvalidInput("通知内容不能为空".to_string()))?
+        .to_string();
+    let kind = request.normalized_kind();
+    let count_unread = request.count_unread.unwrap_or(kind == "incident");
+    let notification_id = request
+        .requested_notification_id()
+        .unwrap_or_else(|| format!("notification-{}", UtcMillis::now().0));
+    state
+        .session_store
+        .append_notification_record(NotificationRecord {
+            notification_id,
+            session_id: session_id.clone(),
+            kind,
+            level: trimmed_non_empty(request.level.as_deref()).map(str::to_string),
+            title: trimmed_non_empty(request.title.as_deref()).map(str::to_string),
+            message,
+            source: trimmed_non_empty(request.source.as_deref()).map(str::to_string),
+            created_at: UtcMillis::now(),
+            handled: !count_unread,
+            persist_to_center: Some(true),
+            action_required: request.action_required,
+            count_unread: Some(count_unread),
+            display_mode: request.normalized_display_mode(),
+            duration: request.duration,
+        });
+    state.persist_session_durable_state()?;
+    Ok(Json(build_notifications_response(
+        &state,
+        Some(&session_id),
+    )))
 }
 
 async fn mark_all_notifications_read(
@@ -1375,6 +1582,319 @@ mod tests {
         path
     }
 
+    async fn post_json(
+        state: ApiState,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        let status = response.status();
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should read"),
+        )
+        .expect("response should be json");
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn delete_session_rejects_workspace_mismatched_session() {
+        let state = test_state();
+        let session_id = SessionId::new("session-delete-workspace-a");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "工作区 A 删除保护",
+                Some("workspace-a".to_string()),
+            )
+            .expect("session should create");
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/delete",
+            serde_json::json!({
+                "workspaceId": "workspace-b",
+                "sessionId": session_id.as_str(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("不属于 workspace workspace-b"),
+            "unexpected body: {body}"
+        );
+        assert!(
+            state.session_store.session(&session_id).is_some(),
+            "workspace 不匹配时不应删除原会话"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_returns_workspace_scoped_bootstrap() {
+        let state = test_state();
+        let deleted_session_id = SessionId::new("session-delete-scoped-a1");
+        let sibling_session_id = SessionId::new("session-delete-scoped-a2");
+        let foreign_session_id = SessionId::new("session-delete-scoped-b1");
+        state
+            .session_store
+            .create_session_for_workspace(
+                deleted_session_id.clone(),
+                "待删除 A1",
+                Some("workspace-a".to_string()),
+            )
+            .expect("session should create");
+        state
+            .session_store
+            .create_session_for_workspace(
+                sibling_session_id.clone(),
+                "保留 A2",
+                Some("workspace-a".to_string()),
+            )
+            .expect("session should create");
+        state
+            .session_store
+            .create_session_for_workspace(
+                foreign_session_id.clone(),
+                "外部 B1",
+                Some("workspace-b".to_string()),
+            )
+            .expect("session should create");
+
+        let (status, body) = post_json(
+            state,
+            "/session/delete",
+            serde_json::json!({
+                "workspaceId": "workspace-a",
+                "sessionId": deleted_session_id.as_str(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        let session_ids = body["sessions"]
+            .as_array()
+            .expect("sessions should be array")
+            .iter()
+            .map(|session| session["sessionId"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(session_ids, vec![sibling_session_id.as_str()]);
+        assert_eq!(body["currentSession"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn rename_session_rejects_workspace_mismatched_session() {
+        let state = test_state();
+        let session_id = SessionId::new("session-rename-workspace-a");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "原始名称",
+                Some("workspace-a".to_string()),
+            )
+            .expect("session should create");
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/rename",
+            serde_json::json!({
+                "workspaceId": "workspace-b",
+                "sessionId": session_id.as_str(),
+                "name": "错误改名",
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("不属于 workspace workspace-b"),
+            "unexpected body: {body}"
+        );
+        assert_eq!(
+            state
+                .session_store
+                .session(&session_id)
+                .expect("session should remain")
+                .title,
+            "原始名称"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_session_rejects_workspace_mismatched_session() {
+        let state = test_state();
+        let session_id = SessionId::new("session-close-workspace-a");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "工作区 A 关闭保护",
+                Some("workspace-a".to_string()),
+            )
+            .expect("session should create");
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/close",
+            serde_json::json!({
+                "workspaceId": "workspace-b",
+                "sessionId": session_id.as_str(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("不属于 workspace workspace-b"),
+            "unexpected body: {body}"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                state
+                    .session_store
+                    .session(&session_id)
+                    .expect("session should remain")
+                    .status
+            ),
+            "Active"
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_session_requires_workspace_scope() {
+        let state = test_state();
+        let session_id = SessionId::new("session-switch-requires-workspace");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "需要 workspace 的切换",
+                Some("workspace-a".to_string()),
+            )
+            .expect("session should create");
+
+        let (status, body) = post_json(
+            state,
+            "/session/switch",
+            serde_json::json!({
+                "sessionId": session_id.as_str(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspaceId 不能为空"),
+            "unexpected body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_session_returns_workspace_scoped_bootstrap() {
+        let state = test_state();
+        let selected_session_id = SessionId::new("session-save-scoped-a");
+        let foreign_session_id = SessionId::new("session-save-scoped-b");
+        state
+            .session_store
+            .create_session_for_workspace(
+                selected_session_id.clone(),
+                "保存 A",
+                Some("workspace-a".to_string()),
+            )
+            .expect("session should create");
+        state
+            .session_store
+            .create_session_for_workspace(
+                foreign_session_id,
+                "外部 B",
+                Some("workspace-b".to_string()),
+            )
+            .expect("session should create");
+
+        let (status, body) = post_json(
+            state,
+            "/session/save",
+            serde_json::json!({
+                "workspaceId": "workspace-a",
+                "sessionId": selected_session_id.as_str(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(
+            body["currentSession"]["sessionId"].as_str().unwrap_or_default(),
+            selected_session_id.as_str()
+        );
+        let session_ids = body["sessions"]
+            .as_array()
+            .expect("sessions should be array")
+            .iter()
+            .map(|session| session["sessionId"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(session_ids, vec![selected_session_id.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn save_session_rejects_workspace_mismatched_session() {
+        let state = test_state();
+        let session_id = SessionId::new("session-save-workspace-a");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "保存 workspace A",
+                Some("workspace-a".to_string()),
+            )
+            .expect("session should create");
+
+        let (status, body) = post_json(
+            state,
+            "/session/save",
+            serde_json::json!({
+                "workspaceId": "workspace-b",
+                "sessionId": session_id.as_str(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("不属于 workspace workspace-b"),
+            "unexpected body: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn notifications_workspace_query_does_not_fall_back_to_foreign_current_session() {
         let state = test_state();
@@ -1480,6 +2000,79 @@ mod tests {
             state.session_store.notifications_for_session(&session_id)[0].handled,
             false
         );
+    }
+
+    #[tokio::test]
+    async fn append_session_notification_persists_backend_snapshot() {
+        let state = test_state();
+        let session_id = SessionId::new("session-notification-append");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "通知 append 会话",
+                Some("workspace-a".to_string()),
+            )
+            .expect("session should create");
+
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/session/notifications/append")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workspaceId": "workspace-a",
+                            "sessionId": session_id.as_str(),
+                            "notificationId": "notification-append-audit",
+                            "kind": "audit",
+                            "level": "success",
+                            "title": "保存完成",
+                            "message": "设置已经保存",
+                            "source": "web-action",
+                            "persistToCenter": true,
+                            "actionRequired": false,
+                            "countUnread": false,
+                            "displayMode": "toast",
+                            "duration": 3000,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        let status = response.status();
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should read"),
+        )
+        .expect("response should be json");
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["sessionId"], session_id.as_str());
+        let records = body["notifications"]["records"]
+            .as_array()
+            .expect("records should be array");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["notificationId"], "notification-append-audit");
+        assert_eq!(records[0]["kind"], "audit");
+        assert_eq!(records[0]["level"], "success");
+        assert_eq!(records[0]["title"], "保存完成");
+        assert_eq!(records[0]["source"], "web-action");
+        assert_eq!(records[0]["read"], true);
+        assert_eq!(records[0]["handled"], true);
+        assert_eq!(records[0]["persistToCenter"], true);
+        assert_eq!(records[0]["countUnread"], false);
+        assert_eq!(records[0]["displayMode"], "toast");
+
+        let stored = state.session_store.notifications_for_session(&session_id);
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].notification_id, "notification-append-audit");
+        assert_eq!(stored[0].handled, true);
     }
 
     #[tokio::test]

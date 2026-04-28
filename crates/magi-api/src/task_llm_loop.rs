@@ -1,4 +1,5 @@
 use crate::{
+    prompt_utils::{normalize_model_stream_preview_content, normalize_model_visible_content},
     session_turn_writeback::{
         append_session_turn_item, build_completed_turn_timeline_snapshot,
         publish_session_turn_item_event, session_turn_item, upsert_session_turn_item,
@@ -155,7 +156,7 @@ pub(crate) fn run_task_llm_loop(
         let should_record_turn_artifacts =
             turn_visibility.thread_visible || turn_visibility.worker_visible;
         let thinking_item_id = format!("turn-item-assistant-thinking-{task_id}-{round}");
-        let stream_item_id = format!("turn-item-assistant-stream-{task_id}-{round}");
+        let stream_item_id = task_stream_item_id(task_id, round, streaming_entry_id);
         last_stream_item_id = Some(stream_item_id.clone());
         let streamed_thinking = std::cell::RefCell::new(String::new());
         let last_thinking_len = std::cell::Cell::new(0usize);
@@ -350,7 +351,28 @@ pub(crate) fn run_task_llm_loop(
             context_summary,
         );
     }
-    final_content = crate::prompt_utils::normalize_model_visible_content(final_content);
+    final_content = normalize_model_visible_content(final_content);
+    if final_content.trim().is_empty() {
+        let failure_reason = "模型未返回可显示回复";
+        if turn_visibility.thread_visible || turn_visibility.worker_visible {
+            append_task_error_turn_item(
+                event_bus,
+                session_store,
+                task,
+                session_id,
+                workspace_id,
+                &turn_visibility,
+                failure_reason,
+                streaming_entry_id.or(last_stream_item_id.as_deref()),
+            );
+        }
+        return (
+            TaskOutcome::Failed {
+                error: failure_reason.to_string(),
+            },
+            context_summary,
+        );
+    }
     if !task_lease_is_current(task_store, task_id, lease_id) {
         return (
             TaskOutcome::Failed {
@@ -428,19 +450,23 @@ fn publish_stream_delta(
     turn_visibility: &TaskTurnVisibility,
     accumulated_text: &str,
 ) {
+    let visible_text = normalize_model_stream_preview_content(accumulated_text);
+    if visible_text.trim().is_empty() {
+        return;
+    }
     if turn_visibility.thread_visible {
         session_store.upsert_timeline_entry(
             session_id.clone(),
             entry_id,
             TimelineEntryKind::AssistantMessage,
-            accumulated_text,
+            &visible_text,
         );
     }
     let mut item = session_turn_item(
         "assistant_stream",
         "running",
         Some("生成回复".to_string()),
-        Some(accumulated_text.to_string()),
+        Some(visible_text),
         Some(entry_id.to_string()),
     );
     apply_task_turn_visibility(&mut item, task, turn_visibility);
@@ -755,6 +781,16 @@ fn task_lease_is_current(task_store: &TaskStore, task_id: &TaskId, lease_id: &Le
         .is_some_and(|lease| lease.lease_id == *lease_id)
 }
 
+fn task_stream_item_id(
+    task_id: &TaskId,
+    round: usize,
+    streaming_entry_id: Option<&str>,
+) -> String {
+    streaming_entry_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("turn-item-assistant-stream-{task_id}-{round}"))
+}
+
 fn task_is_thread_visible_turn_owner(
     session_store: &SessionStore,
     session_id: &SessionId,
@@ -770,4 +806,33 @@ fn task_is_thread_visible_turn_owner(
                     && item.kind == "assistant_phase"
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_stream_item_id_reuses_main_timeline_streaming_entry() {
+        let task_id = TaskId::new("task-stream-main");
+
+        assert_eq!(
+            task_stream_item_id(&task_id, 0, Some("timeline-streaming-task-stream-main")),
+            "timeline-streaming-task-stream-main"
+        );
+        assert_eq!(
+            task_stream_item_id(&task_id, 3, Some("timeline-streaming-task-stream-main")),
+            "timeline-streaming-task-stream-main"
+        );
+    }
+
+    #[test]
+    fn task_stream_item_id_keeps_round_scope_without_main_streaming_entry() {
+        let task_id = TaskId::new("task-stream-worker");
+
+        assert_eq!(
+            task_stream_item_id(&task_id, 2, None),
+            "turn-item-assistant-stream-task-stream-worker-2"
+        );
+    }
 }

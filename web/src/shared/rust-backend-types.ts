@@ -719,15 +719,27 @@ export interface BootstrapDto {
 
 export interface SessionDeleteRequestDto {
   sessionId: string;
+  workspaceId?: string | null;
+  workspace_id?: string | null;
 }
 
 export interface SessionRenameRequestDto {
   sessionId: string;
   name: string;
+  workspaceId?: string | null;
+  workspace_id?: string | null;
 }
 
 export interface SessionCloseRequestDto {
   sessionId: string;
+  workspaceId?: string | null;
+  workspace_id?: string | null;
+}
+
+export interface SessionSaveRequestDto {
+  sessionId?: string | null;
+  workspaceId?: string | null;
+  workspace_id?: string | null;
 }
 
 export interface SessionContinueRequestDto {
@@ -760,8 +772,17 @@ export interface SessionNotificationItemDto {
   notificationId: string;
   message: string;
   kind: string;
+  level: string;
+  title?: string | null;
+  source?: string | null;
   handled: boolean;
+  read: boolean;
   createdAt: number;
+  persistToCenter: boolean;
+  actionRequired: boolean;
+  countUnread: boolean;
+  displayMode?: 'toast' | 'notification_center' | 'silent' | null;
+  duration?: number | null;
 }
 
 export interface SessionNotificationSnapshotDto {
@@ -785,9 +806,26 @@ export interface RemoveNotificationRequestDto {
   notificationId: string;
 }
 
+export interface AppendNotificationRequestDto {
+  workspaceId?: string | null;
+  sessionId?: string | null;
+  notificationId?: string | null;
+  kind?: 'incident' | 'audit' | 'center' | 'toast' | string | null;
+  level?: string | null;
+  title?: string | null;
+  message: string;
+  source?: string | null;
+  persistToCenter?: boolean | null;
+  actionRequired?: boolean | null;
+  countUnread?: boolean | null;
+  displayMode?: 'toast' | 'notification_center' | 'silent' | null;
+  duration?: number | null;
+}
+
 export type MarkAllNotificationsReadResponseDto = SessionNotificationsResponseDto;
 export type ClearNotificationsResponseDto = SessionNotificationsResponseDto;
 export type RemoveNotificationResponseDto = SessionNotificationsResponseDto;
+export type AppendNotificationResponseDto = SessionNotificationsResponseDto;
 
 // ─── Workspace management endpoints ─────────────────────────────────
 

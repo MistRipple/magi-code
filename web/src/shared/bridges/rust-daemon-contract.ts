@@ -2027,6 +2027,96 @@ function turnWorkerStatusToLaneStatus(status: string): DispatchGroupLane['status
   }
 }
 
+interface TurnWorkerDispatchLaneAggregate {
+  lane: DispatchGroupLane;
+  latestItemSeq: number;
+}
+
+interface TurnWorkerDispatchGroup {
+  firstItemId: string;
+  firstItemSeq: number;
+  workerTabId: string;
+  threadVisible: boolean;
+  lanesByTaskKey: Map<string, TurnWorkerDispatchLaneAggregate>;
+  itemIds: Set<string>;
+}
+
+function buildTurnWorkerDispatchGroups(
+  items: RustSessionRuntimeTurnItemSummary[],
+  workerLaneById: Map<string, RustSessionRuntimeTurnLaneSummary>,
+): Map<string, TurnWorkerDispatchGroup> {
+  const groups = new Map<string, TurnWorkerDispatchGroup>();
+
+  for (const item of items) {
+    const kind = normalizeString(item.kind);
+    if (!kind.startsWith('worker_')) {
+      continue;
+    }
+    const itemId = normalizeString(item.item_id);
+    if (!itemId) {
+      continue;
+    }
+    const laneId = normalizeString(item.lane_id);
+    const lane = workerLaneById.get(laneId);
+    const workerId = normalizeString(item.worker_id) || normalizeString(lane?.worker_id);
+    if (!workerId) {
+      continue;
+    }
+    const roleId = normalizeString(item.role_id) || normalizeString(lane?.role_id);
+    const workerTabId = roleId || workerId;
+    const itemSeq = normalizeNumber(item.item_seq, 0);
+    const laneSeq = normalizeNumber(item.lane_seq, normalizeNumber(lane?.lane_seq, itemSeq));
+    const taskId = normalizeString(item.task_id) || normalizeString(lane?.task_id);
+    const taskKey = taskId || laneId || itemId;
+    const laneTitle = normalizeString(lane?.title) || normalizeString(item.title) || workerId;
+    const taskStatus = turnWorkerStatusToLaneStatus(normalizeString(item.status) || normalizeString(lane?.status));
+    let group = groups.get(workerTabId);
+    if (!group) {
+      group = {
+        firstItemId: itemId,
+        firstItemSeq: itemSeq,
+        workerTabId,
+        threadVisible: item.thread_visible === true,
+        lanesByTaskKey: new Map(),
+        itemIds: new Set(),
+      };
+      groups.set(workerTabId, group);
+    } else {
+      group.threadVisible ||= item.thread_visible === true;
+      if (itemSeq < group.firstItemSeq) {
+        group.firstItemId = itemId;
+        group.firstItemSeq = itemSeq;
+      }
+    }
+
+    group.itemIds.add(itemId);
+    const current = group.lanesByTaskKey.get(taskKey);
+    if (current && itemSeq < current.latestItemSeq) {
+      continue;
+    }
+    group.lanesByTaskKey.set(taskKey, {
+      latestItemSeq: itemSeq,
+      lane: {
+        laneId: laneId || `lane-${workerTabId}-${taskKey}`,
+        laneVersion: Math.max(1, itemSeq),
+        worker: workerTabId,
+        title: laneTitle,
+        status: taskStatus,
+        tasks: [{
+          taskId: taskId || undefined,
+          title: laneTitle,
+          status: taskStatus,
+          isCurrent: taskStatus === 'running' || taskStatus === 'pending',
+          seq: laneSeq,
+        }],
+        jumpTarget: { workerTabId },
+      },
+    });
+  }
+
+  return groups;
+}
+
 function buildTurnArtifactsFromSummary(
   sessionId: string,
   turn: RustSessionRuntimeTurnSummary | null | undefined,
@@ -2090,6 +2180,10 @@ function buildTurnArtifactsFromSummary(
   const toolResultItemIds = new Set(
     [...toolItemsByCallId.values()].map((item) => normalizeString(item.item_id)),
   );
+  const workerDispatchGroups = buildTurnWorkerDispatchGroups(items, workerLaneById);
+  const workerDispatchGroupByFirstItemId = new Map(
+    [...workerDispatchGroups.values()].map((group) => [group.firstItemId, group] as const),
+  );
   const artifacts: TimelineProjectionArtifact[] = [];
   for (const item of items) {
     const kind = normalizeString(item.kind);
@@ -2129,20 +2223,30 @@ function buildTurnArtifactsFromSummary(
     const roleId = normalizeString(item.role_id)
       || normalizeString(workerLaneById.get(laneId)?.role_id);
     const workerTabId = roleId || workerId;
+    const workerDispatchGroup = kind.startsWith('worker_') && workerTabId
+      ? workerDispatchGroupByFirstItemId.get(itemId)
+      : undefined;
+    if (kind.startsWith('worker_') && !workerDispatchGroup) {
+      continue;
+    }
     const timestamp = resolveTurnItemTimestamp(item, timelineBase);
-    const workerVisible = item.worker_visible === true || Boolean(workerTabId && laneId);
+    const workerVisible = Boolean(workerDispatchGroup) || item.worker_visible === true || Boolean(workerTabId && laneId);
     const threadHidden = item.thread_visible === false;
-    const threadVisible = item.thread_visible === true
-      || (!threadHidden && kind === 'user_message')
-      || (!threadHidden && !workerVisible && (
-        kind === 'assistant_thinking'
-        || kind === 'assistant_stream'
-        || kind === 'assistant_final'
-        || kind === 'assistant_error'
-        || kind === 'tool_call_started'
-        || kind === 'tool_call_result'
-      ));
-    const workerTabs = workerVisible && workerTabId ? [workerTabId] : [];
+    const threadVisible = workerDispatchGroup
+      ? workerDispatchGroup.threadVisible
+      : (item.thread_visible === true
+        || (!threadHidden && kind === 'user_message')
+        || (!threadHidden && !workerVisible && (
+          kind === 'assistant_thinking'
+          || kind === 'assistant_stream'
+          || kind === 'assistant_final'
+          || kind === 'assistant_error'
+          || kind === 'tool_call_started'
+          || kind === 'tool_call_result'
+        )));
+    const workerTabs = workerDispatchGroup
+      ? [workerDispatchGroup.workerTabId]
+      : (workerVisible && workerTabId ? [workerTabId] : []);
     let role: Message['role'] = 'assistant';
     let type: Message['type'] = 'text';
     let source: Message['source'] = workerVisible && workerTabId ? workerTabId : 'orchestrator';
@@ -2195,31 +2299,23 @@ function buildTurnArtifactsFromSummary(
           error: normalizeString(item.tool_error) || undefined,
         },
       }];
-    } else if (kind.startsWith('worker_') && workerId) {
-      const lane = workerLaneById.get(laneId);
-      const laneTitle = normalizeString(lane?.title) || normalizeString(item.title) || workerId;
+    } else if (workerDispatchGroup) {
+      const lanes = [...workerDispatchGroup.lanesByTaskKey.values()]
+        .map((entry) => entry.lane)
+        .sort((left, right) => {
+          const leftSeq = normalizeNumber(left.tasks?.[0]?.seq, 0);
+          const rightSeq = normalizeNumber(right.tasks?.[0]?.seq, 0);
+          return leftSeq - rightSeq;
+        });
+      const laneTitle = normalizeString(lanes[0]?.title) || normalizeString(item.title) || workerDispatchGroup.workerTabId;
       blocks = [{
         type: 'dispatch_group',
         content: '',
-        blockId: `turn-worker-${itemId}`,
-        dispatchWaveId: turnId,
-        status: turnWorkerStatusToLaneStatus(normalizeString(item.status)),
-        summaryText: laneTitle,
-        lanes: [{
-          laneId: laneId || `lane-${workerId}`,
-          laneVersion: 1,
-          worker: workerId,
-          title: laneTitle,
-          status: turnWorkerStatusToLaneStatus(normalizeString(lane?.status) || normalizeString(item.status)),
-          tasks: [{
-            taskId: normalizeString(item.task_id) || normalizeString(lane?.task_id),
-            title: laneTitle,
-            status: turnWorkerStatusToLaneStatus(normalizeString(lane?.status) || normalizeString(item.status)),
-            isCurrent: true,
-            seq: normalizeNumber(item.lane_seq, 0),
-          }],
-          jumpTarget: { workerTabId },
-        }],
+        blockId: `turn-worker-group-${turnId}-${workerDispatchGroup.workerTabId}`,
+        dispatchWaveId: `${turnId}:${workerDispatchGroup.workerTabId}`,
+        status: deriveDispatchGroupStatus(lanes, normalizeString(item.status)),
+        summaryText: lanes.length > 1 ? `${laneTitle} · ${lanes.length} 个任务` : laneTitle,
+        lanes,
       }];
     }
 
@@ -2233,7 +2329,9 @@ function buildTurnArtifactsFromSummary(
     const orderItemSeq = normalizeNumber(orderItem.item_seq, normalizeNumber(item.item_seq, 0));
     const artifactId = (kind === 'tool_call_started' || kind === 'tool_call_result')
       ? `turn:${turnId}:${toolCallId}`
-      : `turn:${turnId}:${itemId}`;
+      : (workerDispatchGroup
+        ? `turn:${turnId}:worker-group:${workerDispatchGroup.workerTabId}`
+        : `turn:${turnId}:${itemId}`);
     const requestId = normalizeString(item.request_id);
     const userMessageId = normalizeString(item.user_message_id);
     const placeholderMessageId = normalizeString(item.placeholder_message_id);
@@ -2264,6 +2362,13 @@ function buildTurnArtifactsFromSummary(
         messageIdAliases.add(`rust-timeline:turn-item-tool-started-${toolCallId}`);
       }
     }
+    if (workerDispatchGroup) {
+      for (const groupedItemId of workerDispatchGroup.itemIds) {
+        messageIdAliases.add(groupedItemId);
+        messageIdAliases.add(`turn:${turnId}:${groupedItemId}`);
+        messageIdAliases.add(`rust-timeline:${groupedItemId}`);
+      }
+    }
     artifacts.push({
       artifactId,
       kind: kind.includes('tool') ? 'tool' : 'message',
@@ -2272,8 +2377,8 @@ function buildTurnArtifactsFromSummary(
       latestEventSeq: turnAnchorEventSeq,
       cardStreamSeq: orderItemSeq,
       timestamp,
-      laneId: laneId || undefined,
-      worker: workerId || undefined,
+      laneId: workerDispatchGroup ? undefined : (laneId || undefined),
+      worker: workerDispatchGroup?.workerTabId || workerId || undefined,
       threadVisible,
       workerTabs,
       messageIds: Array.from(messageIdAliases),

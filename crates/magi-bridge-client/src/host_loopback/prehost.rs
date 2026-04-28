@@ -7,7 +7,14 @@ use super::{
 };
 use crate::{BridgeResponse, HostBridgeCommand};
 use serde_json::json;
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    process::{Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 impl HostServiceShim {
     pub(super) fn execute(
@@ -231,25 +238,23 @@ fn execute_vscode_terminal_exec(
         );
     }
 
-    let output = Command::new("sh")
-        .arg("-lc")
-        .arg(command)
-        .current_dir(&requested_directory)
-        .output()
-        .map_err(|error| {
-            crate::local_process_protocol::LocalProcessBridgeRpcError::remote_business(
-                -32029,
-                "terminal exec failed",
-                Some(json!({
-                    "command": command,
-                    "working_directory": requested_directory.to_string_lossy().to_string(),
-                    "reason": error.to_string(),
-                })),
-            )
-        })?;
+    let output =
+        execute_terminal_command_with_timeout(command, &requested_directory, policy.timeout_ms)
+            .map_err(|error| {
+                crate::local_process_protocol::LocalProcessBridgeRpcError::remote_business(
+                    -32029,
+                    "terminal exec failed",
+                    Some(json!({
+                        "command": command,
+                        "working_directory": requested_directory.to_string_lossy().to_string(),
+                        "reason": error.to_string(),
+                    })),
+                )
+            })?;
+    let succeeded = output.status.as_ref().is_some_and(ExitStatus::success) && !output.timed_out;
 
     Ok(BridgeResponse {
-        ok: output.status.success(),
+        ok: succeeded,
         payload: super::descriptors::shadow_host_payload(
             shim,
             "TerminalExec",
@@ -262,15 +267,76 @@ fn execute_vscode_terminal_exec(
                     .map(|root| root.to_string_lossy().to_string())
                     .collect::<Vec<_>>(),
                 "allowed_commands": policy.allowed_commands,
+                "timeout_ms": policy.timeout_ms,
+                "timed_out": output.timed_out,
                 "stdout": String::from_utf8_lossy(&output.stdout).trim().to_string(),
                 "stderr": String::from_utf8_lossy(&output.stderr).trim().to_string(),
-                "exit_code": output.status.code(),
+                "exit_code": output.status.as_ref().and_then(ExitStatus::code),
                 "implementation_mode": "allowlisted-terminal-prehost",
                 "terminal_mode": policy.mode,
                 "policy_source": policy.source,
             }),
         ),
     })
+}
+
+struct TerminalExecOutput {
+    status: Option<ExitStatus>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    timed_out: bool,
+}
+
+fn execute_terminal_command_with_timeout(
+    command: &str,
+    cwd: &Path,
+    timeout_ms: u64,
+) -> Result<TerminalExecOutput, std::io::Error> {
+    let mut child = Command::new("sh")
+        .arg("-lc")
+        .arg(command)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader = thread::spawn(move || read_child_pipe(stdout));
+    let stderr_reader = thread::spawn(move || read_child_pipe(stderr));
+    let timeout = Duration::from_millis(timeout_ms);
+    let started_at = Instant::now();
+    let mut timed_out = false;
+
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break Some(status),
+            None if started_at.elapsed() >= timeout => {
+                timed_out = true;
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    };
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(TerminalExecOutput {
+        status,
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+fn read_child_pipe<T: Read>(pipe: Option<T>) -> Vec<u8> {
+    let Some(mut pipe) = pipe else {
+        return Vec::new();
+    };
+    let mut buffer = Vec::new();
+    let _ = pipe.read_to_end(&mut buffer);
+    buffer
 }
 
 fn canonical_workspace_roots(

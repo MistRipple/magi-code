@@ -4,7 +4,7 @@ use magi_bridge_client::{
     JsonRpcBridgeServerProbeClient, JsonRpcHostBridgeClient, JsonRpcStdioTransport,
 };
 use serde_json::{Value, json};
-use std::{fs, sync::Arc};
+use std::{fs, sync::Arc, time::Instant};
 
 fn loopback_transport() -> JsonRpcStdioTransport {
     let mut path = std::env::current_exe().expect("current exe should exist");
@@ -665,6 +665,36 @@ fn vscode_terminal_exec_can_run_allowlisted_command_when_enabled() {
     assert_eq!(payload["details"]["stdout"], current_workspace_root());
     assert_eq!(payload["details"]["stderr"], "");
     assert_eq!(payload["details"]["exit_code"], 0);
+}
+
+#[test]
+fn vscode_terminal_exec_times_out_long_running_command() {
+    let client = JsonRpcHostBridgeClient::new(Arc::new(loopback_transport_with_env(&[
+        ("MAGI_VSCODE_PREHOST_TERMINAL_MODE", "allowlisted"),
+        ("MAGI_VSCODE_PREHOST_ALLOWED_COMMANDS", "sleep"),
+        ("MAGI_VSCODE_PREHOST_TERMINAL_TIMEOUT_MS", "100"),
+    ])));
+
+    let started = Instant::now();
+    let response = client
+        .call(HostBridgeRequest {
+            host_kind: HostKind::Vscode,
+            command: HostBridgeCommand::TerminalExec {
+                command: "sleep 2".to_string(),
+                working_directory: current_workspace_root(),
+            },
+        })
+        .expect("timed out terminal exec should return a bridge response");
+
+    assert!(
+        started.elapsed().as_millis() < 1_500,
+        "terminal exec timeout should prevent long blocking calls"
+    );
+    assert!(!response.ok);
+    let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
+    assert_eq!(payload["details"]["command_name"], "sleep");
+    assert_eq!(payload["details"]["timeout_ms"], 100);
+    assert_eq!(payload["details"]["timed_out"], true);
 }
 
 #[test]

@@ -167,16 +167,24 @@ function resolveTimelineVisibilityForStandard(standard: StandardMessage): {
   workerTabs?: string[];
 } {
   const workerSlot = resolveLaneWorkerSlot(standard);
+  const metadata = standard.metadata as Record<string, unknown> | undefined;
   const visibility = resolveSharedTimelineWorkerVisibility({
     hasWorker: Boolean(workerSlot),
     type: standard.type,
     source: standard.source,
     blocks: standard.blocks,
-    metadata: standard.metadata as Record<string, unknown> | undefined,
+    metadata,
   });
+  const explicitThreadVisible = typeof metadata?.threadVisible === 'boolean'
+    ? metadata.threadVisible
+    : undefined;
+  const explicitWorkerVisible = typeof metadata?.workerVisible === 'boolean'
+    ? metadata.workerVisible
+    : undefined;
+  const includeWorkerTab = explicitWorkerVisible ?? visibility.includeWorkerTab;
   return {
-    thread: visibility.threadVisible,
-    workerTabs: visibility.includeWorkerTab && workerSlot ? [workerSlot] : undefined,
+    thread: explicitThreadVisible ?? visibility.threadVisible,
+    workerTabs: includeWorkerTab && workerSlot ? [workerSlot] : undefined,
   };
 }
 
@@ -639,6 +647,7 @@ function handleStandardComplete(message: ClientBridgeMessage) {
   const responseDurationMs = typeof authoritativeResponseDurationMs === 'number'
     ? authoritativeResponseDurationMs
     : computedResponseDurationMs;
+  const { responseDurationMs: _nonTerminalResponseDurationMs, ...uiMetadataWithoutResponseDuration } = uiMetadata;
 
   const existingMessage = getTimelineMessageById(actualMessageId)
     || (placeholderReplacementId ? getTimelineMessageById(placeholderReplacementId) : undefined);
@@ -651,17 +660,22 @@ function handleStandardComplete(message: ClientBridgeMessage) {
     ...uiMessage,
     isStreaming: false,
     isComplete: true,
-    metadata: {
-      ...uiMetadata,
-      ...(typeof responseDurationMs === 'number' ? { responseDurationMs } : {}),
-    },
+    metadata: uiMetadata,
     ...(mergedBlocks ? {
       blocks: mergedBlocks,
       content: blocksToContent(mergedBlocks),
     } : {}),
   };
-  const completedMessage = completedMessageBase;
-  const isTerminalRequestResponse = isRequestTerminalAssistantResponse(completedMessage);
+  const isTerminalRequestResponse = isRequestTerminalAssistantResponse(completedMessageBase);
+  const completedMessage = {
+    ...completedMessageBase,
+    metadata: isTerminalRequestResponse
+      ? {
+          ...uiMetadata,
+          ...(typeof responseDurationMs === 'number' ? { responseDurationMs } : {}),
+        }
+      : uiMetadataWithoutResponseDuration,
+  };
 
   if (
     hasRenderableContent(completedMessage)

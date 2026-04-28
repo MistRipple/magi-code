@@ -175,6 +175,13 @@
   const persistedScrollAnchor = $derived(messagesState.scrollAnchors[panelKey]);
   const shouldAutoScroll = $derived(messagesState.autoScrollEnabled[panelKey]);
   const sessionHistory = $derived(messagesState.sessionHistory);
+  const canLoadOlderHistory = $derived(Boolean(
+    currentSessionId
+    && sessionHistory.sessionId === currentSessionId
+    && sessionHistory.hasMoreBefore
+    && sessionHistory.beforeCursor
+    && !sessionHistory.isLoadingBefore
+  ));
 
   // 容器引用
   let containerRef: HTMLDivElement | null = $state(null);
@@ -560,7 +567,7 @@
     data-display-context={displayContext}
     data-panel-active={isActive ? 'true' : 'false'}
   >
-    {#if safeRenderItems.length > 0}
+    {#if safeRenderItems.length > 0 && (canLoadOlderHistory || sessionHistory.isLoadingBefore)}
       <div class="history-sentinel" bind:this={historySentinelRef} aria-hidden="true"></div>
     {/if}
     {#if safeRenderItems.length === 0}
@@ -570,6 +577,17 @@
         </div>
         <p class="empty-text">{emptyTitle}</p>
         <p class="empty-hint">{emptyHint}</p>
+        {#if canLoadOlderHistory || sessionHistory.isLoadingBefore}
+          <button
+            type="button"
+            class="empty-history-load"
+            onclick={() => void loadOlderHistory()}
+            disabled={!canLoadOlderHistory}
+          >
+            <Icon name={sessionHistory.isLoadingBefore ? 'loader' : 'chevron-up'} size={14} />
+            <span>{sessionHistory.isLoadingBefore ? i18n.t('messageList.loadingOlder') : i18n.t('messageList.loadOlder')}</span>
+          </button>
+        {/if}
       </div>
     {:else}
       {#each safeRenderItems as item (item.key)}
@@ -653,6 +671,33 @@
   .empty-hint {
     font-size: var(--text-sm);
     opacity: 0.7;
+  }
+
+  .empty-history-load {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    min-height: 32px;
+    margin-top: var(--space-4);
+    padding: 0 var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface-2);
+    color: var(--foreground);
+    font-size: var(--text-sm);
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .empty-history-load:hover:not(:disabled) {
+    border-color: var(--primary);
+    color: var(--primary);
+  }
+
+  .empty-history-load:disabled {
+    cursor: default;
+    opacity: 0.65;
   }
 
   /* 滚动按钮 - 绝对定位在消息列表右下角 */

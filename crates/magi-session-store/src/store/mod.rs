@@ -388,14 +388,26 @@ impl SessionStore {
         kind: impl Into<String>,
         message: impl Into<String>,
     ) {
-        let notification = NotificationRecord {
+        self.append_notification_record(NotificationRecord {
             notification_id: notification_id.into(),
             session_id: session_id.clone(),
             kind: kind.into(),
+            level: None,
+            title: None,
             message: message.into(),
+            source: None,
             created_at: UtcMillis::now(),
             handled: false,
-        };
+            persist_to_center: Some(true),
+            action_required: None,
+            count_unread: None,
+            display_mode: None,
+            duration: None,
+        });
+    }
+
+    pub fn append_notification_record(&self, notification: NotificationRecord) {
+        let session_id = notification.session_id.clone();
         let mut state = self
             .state
             .write()

@@ -1,6 +1,6 @@
 use crate::{
     errors::ApiError,
-    prompt_utils::normalize_model_visible_content,
+    prompt_utils::{normalize_model_stream_preview_content, normalize_model_visible_content},
     session_turn_writeback::{
         append_session_tool_call_items_batch, append_session_turn_error_item,
         append_session_turn_item, build_completed_turn_timeline_snapshot,
@@ -277,6 +277,7 @@ fn stream_session_turn_round(
     );
     let streamed_content = std::cell::RefCell::new(String::new());
     let streamed_thinking = std::cell::RefCell::new(String::new());
+    let streamed_visible_content = std::cell::RefCell::new(String::new());
     let last_content_len = std::cell::Cell::new(0usize);
     let last_thinking_len = std::cell::Cell::new(0usize);
     let writeback_aborted = std::cell::Cell::new(false);
@@ -324,11 +325,26 @@ fn stream_session_turn_round(
             content.clear();
             content.push_str(accumulated);
         }
+        let visible_content = normalize_model_stream_preview_content(accumulated);
+        {
+            let current_visible = streamed_visible_content.borrow();
+            if *current_visible == visible_content {
+                return;
+            }
+        }
+        {
+            let mut current_visible = streamed_visible_content.borrow_mut();
+            current_visible.clear();
+            current_visible.push_str(&visible_content);
+        }
+        if visible_content.trim().is_empty() {
+            return;
+        }
         let mut item = session_turn_item(
             "assistant_stream",
             "running",
             Some("生成回复".to_string()),
-            Some(accumulated.to_string()),
+            Some(visible_content.clone()),
             Some(stream_item_id.clone()),
         );
         apply_request_aliases(&mut item, request);
@@ -345,7 +361,7 @@ fn stream_session_turn_round(
             request.session_id.clone(),
             &stream_item_id,
             TimelineEntryKind::AssistantMessage,
-            accumulated,
+            visible_content,
         );
     };
 
@@ -385,6 +401,7 @@ fn stream_session_turn_round(
     }
     let streamed_content = streamed_content.into_inner();
     let streamed_thinking = streamed_thinking.into_inner();
+    let streamed_visible_content = streamed_visible_content.into_inner();
     let final_thinking = parsed
         .thinking
         .as_ref()
@@ -419,7 +436,7 @@ fn stream_session_turn_round(
             );
         }
     }
-    if !streamed_content.trim().is_empty() {
+    if !streamed_visible_content.trim().is_empty() {
         if !request_turn_is_writable(session_store, request) {
             return Ok(SessionTurnRoundOutput {
                 final_content: None,
@@ -432,7 +449,7 @@ fn stream_session_turn_round(
             "assistant_stream",
             "completed",
             Some("生成回复".to_string()),
-            Some(streamed_content.clone()),
+            Some(streamed_visible_content.clone()),
             Some(stream_item_id.clone()),
         );
         apply_request_aliases(&mut stream_item, request);
@@ -494,7 +511,8 @@ fn stream_session_turn_round(
         .content
         .filter(|content| !content.trim().is_empty())
         .or_else(|| (!streamed_content.trim().is_empty()).then_some(streamed_content))
-        .map(normalize_model_visible_content);
+        .map(normalize_model_visible_content)
+        .filter(|content| !content.trim().is_empty());
 
     Ok(SessionTurnRoundOutput {
         final_content,

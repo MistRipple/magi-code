@@ -276,8 +276,7 @@ impl StdioMcpBridgeClient {
 
 impl McpBridgeClient for StdioMcpBridgeClient {
     fn call_tool(&self, request: McpToolCallRequest) -> Result<BridgeResponse, BridgeClientError> {
-        let input: Value =
-            serde_json::from_str(&request.input).unwrap_or(Value::Object(serde_json::Map::new()));
+        let input = parse_mcp_tool_arguments(&request.input)?;
 
         let params = json!({
             "name": request.tool_name,
@@ -304,6 +303,34 @@ impl McpBridgeClient for StdioMcpBridgeClient {
             payload,
         })
     }
+}
+
+fn parse_mcp_tool_arguments(input: &str) -> Result<Value, BridgeClientError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Protocol,
+            code: None,
+            message: "MCP tool arguments must be a JSON object, got empty input".to_string(),
+        });
+    }
+
+    let value =
+        serde_json::from_str::<Value>(trimmed).map_err(|error| BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Protocol,
+            code: None,
+            message: format!("MCP tool arguments must be valid JSON: {error}"),
+        })?;
+
+    if !value.is_object() {
+        return Err(BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Protocol,
+            code: None,
+            message: "MCP tool arguments must be a JSON object".to_string(),
+        });
+    }
+
+    Ok(value)
 }
 
 impl Drop for StdioMcpBridgeClient {
@@ -670,6 +697,33 @@ done
                 assert_eq!(layer, BridgeErrorLayer::Transport);
             }
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stdio_mcp_client_rejects_invalid_tool_arguments_before_dispatch() {
+        let config = McpServerConfig::new("sh", vec!["-c".to_string(), "exit 99".to_string()]);
+        let client = StdioMcpBridgeClient::new(config);
+
+        for input in ["", "not json", "[]"] {
+            let error = client
+                .call_tool(McpToolCallRequest {
+                    server_name: "mock-mcp".to_string(),
+                    tool_name: "mock.echo".to_string(),
+                    input: input.to_string(),
+                })
+                .expect_err("invalid MCP arguments should be rejected locally");
+
+            match error {
+                BridgeClientError::CallFailed { layer, message, .. } => {
+                    assert_eq!(layer, BridgeErrorLayer::Protocol);
+                    assert!(
+                        message.contains("MCP tool arguments"),
+                        "message was: {message}"
+                    );
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
         }
     }
 

@@ -86,7 +86,7 @@ export interface TaskComposerDraft {
   text: string;
 }
 
-type NotificationCenterOperation = 'load' | 'mark-read' | 'clear' | 'remove';
+type NotificationCenterOperation = 'load' | 'append' | 'mark-read' | 'clear' | 'remove';
 
 export interface NotificationCenterStatus {
   isLoading: boolean;
@@ -655,7 +655,11 @@ function normalizeSessionNotificationRecord(raw: unknown): Notification | null {
   const type = typeof item.level === 'string' ? item.level : 'info';
   const message = typeof item.message === 'string' ? item.message : '';
   if (!message) return null;
-  const category = item.kind === 'incident' ? 'incident' : item.kind === 'audit' || item.kind === 'center' ? 'audit' : null;
+  const category = item.kind === 'incident'
+    ? 'incident'
+    : item.kind === 'audit' || item.kind === 'center' || item.kind === 'toast' || item.kind === 'info'
+      ? 'audit'
+      : null;
   if (!category) return null;
   const persistToCenter = item.persistToCenter !== false;
   if (!persistToCenter) {
@@ -3306,20 +3310,6 @@ function replaceSessionNotificationList(sessionId: string, nextList: Notificatio
   };
 }
 
-function updateCurrentSessionNotifications(updater: (current: Notification[]) => Notification[]): void {
-  const sessionId = getCurrentNotificationSessionId();
-  if (!sessionId) {
-    applyNotificationList([]);
-    return;
-  }
-  const current = ensureArray<Notification>(notificationsBySession[sessionId]);
-  const next = applyNotificationList(updater(current));
-  notificationsBySession = {
-    ...notificationsBySession,
-    [sessionId]: next,
-  };
-}
-
 function resolveToastPolicy(options?: ToastOptions): {
   category: ToastCategory;
   persistToCenter: boolean;
@@ -3383,18 +3373,27 @@ export function addToast(type: string, message: string, title?: string, options?
 
   // 仅归档高价值通知到通知历史
   const notificationCategory: NotificationCategory = policy.category === 'incident' ? 'incident' : 'audit';
-  const notification: Notification = {
-    id,
-    type,
-    title,
-    message,
-    category: notificationCategory,
-    source: policy.source,
-    actionRequired: policy.actionRequired,
-    timestamp: Date.now(),
-    read: !policy.countUnread,
-  };
-  updateCurrentSessionNotifications((current) => [notification, ...current]);
+  const scope = getCurrentNotificationOperationScope();
+  if (!scope) {
+    return;
+  }
+  vscode.postMessage({
+    type: 'appendSessionNotification',
+    ...scope,
+    notification: {
+      notificationId: id,
+      kind: notificationCategory,
+      level: type,
+      title,
+      message,
+      source: policy.source,
+      persistToCenter: true,
+      actionRequired: policy.actionRequired,
+      countUnread: policy.countUnread,
+      displayMode: policy.displayMode,
+      duration: policy.duration,
+    },
+  });
 }
 
 export function getNotifications() {
@@ -3484,7 +3483,7 @@ export function applySessionNotificationsStatus(rawStatus: unknown): void {
     return;
   }
   const operation = typeof status.operation === 'string'
-    && ['load', 'mark-read', 'clear', 'remove'].includes(status.operation)
+    && ['load', 'append', 'mark-read', 'clear', 'remove'].includes(status.operation)
     ? status.operation as NotificationCenterOperation
     : null;
   messagesState.notificationCenter = {
@@ -3734,6 +3733,7 @@ export function setSessionHistoryState(
     hasMoreBefore?: boolean;
     beforeCursor?: string | null;
     isLoadingBefore?: boolean;
+    preserveLoadedWindow?: boolean;
   },
 ): void {
   const normalizedSessionId = normalizeSessionId(sessionId);
@@ -3747,23 +3747,29 @@ export function setSessionHistoryState(
     return;
   }
   const current = messagesState.sessionHistory;
+  const inputBeforeCursor = typeof input.beforeCursor === 'string' && input.beforeCursor.trim()
+    ? input.beforeCursor.trim()
+    : null;
   if (current.sessionId && current.sessionId !== normalizedSessionId) {
     messagesState.sessionHistory = {
       sessionId: normalizedSessionId,
       hasMoreBefore: input.hasMoreBefore === true,
-      beforeCursor: typeof input.beforeCursor === 'string' && input.beforeCursor.trim()
-        ? input.beforeCursor.trim()
-        : null,
+      beforeCursor: inputBeforeCursor,
       isLoadingBefore: input.isLoadingBefore === true,
     };
     return;
   }
+  const shouldPreserveLoadedWindow = input.preserveLoadedWindow === true
+    && current.sessionId === normalizedSessionId
+    && (current.beforeCursor !== null || current.hasMoreBefore);
   messagesState.sessionHistory = {
     sessionId: normalizedSessionId,
-    hasMoreBefore: input.hasMoreBefore ?? current.hasMoreBefore,
-    beforeCursor: input.beforeCursor !== undefined
-      ? (typeof input.beforeCursor === 'string' && input.beforeCursor.trim() ? input.beforeCursor.trim() : null)
-      : current.beforeCursor,
+    hasMoreBefore: shouldPreserveLoadedWindow
+      ? current.hasMoreBefore
+      : (input.hasMoreBefore ?? current.hasMoreBefore),
+    beforeCursor: shouldPreserveLoadedWindow
+      ? current.beforeCursor
+      : (input.beforeCursor !== undefined ? inputBeforeCursor : current.beforeCursor),
     isLoadingBefore: input.isLoadingBefore ?? current.isLoadingBefore,
   };
 }

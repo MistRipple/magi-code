@@ -450,10 +450,26 @@ pub struct NotificationRecord {
     #[serde(alias = "session_id")]
     pub session_id: SessionId,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(alias = "created_at")]
     pub created_at: UtcMillis,
     pub handled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist_to_center: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_required: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_unread: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

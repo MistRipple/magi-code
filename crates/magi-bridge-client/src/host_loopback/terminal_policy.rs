@@ -5,11 +5,15 @@ pub(super) struct TerminalPolicy {
     pub(super) mode: String,
     pub(super) source: String,
     pub(super) allowed_commands: Vec<String>,
+    pub(super) timeout_ms: u64,
     denied_argument_patterns: Vec<String>,
 }
 
 const TERMINAL_DENIED_ARG_PATTERNS_DEFAULT: &[&str] =
     &["--force", "-rf", "--no-preserve-root", "sudo", "rm -rf /"];
+const TERMINAL_EXEC_TIMEOUT_MS_DEFAULT: u64 = 10_000;
+const TERMINAL_EXEC_TIMEOUT_MS_MIN: u64 = 100;
+const TERMINAL_EXEC_TIMEOUT_MS_MAX: u64 = 120_000;
 
 impl TerminalPolicy {
     pub(super) fn from_env() -> Self {
@@ -45,10 +49,16 @@ impl TerminalPolicy {
                     .map(|pattern| pattern.to_string())
                     .collect()
             });
+        let timeout_ms = env::var("MAGI_VSCODE_PREHOST_TERMINAL_TIMEOUT_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(TERMINAL_EXEC_TIMEOUT_MS_DEFAULT)
+            .clamp(TERMINAL_EXEC_TIMEOUT_MS_MIN, TERMINAL_EXEC_TIMEOUT_MS_MAX);
         Self {
             mode,
             source,
             allowed_commands,
+            timeout_ms,
             denied_argument_patterns,
         }
     }
@@ -92,6 +102,7 @@ mod tests {
             mode: "disabled".to_string(),
             source: "default:disabled".to_string(),
             allowed_commands: vec!["pwd".to_string()],
+            timeout_ms: TERMINAL_EXEC_TIMEOUT_MS_DEFAULT,
             denied_argument_patterns: TERMINAL_DENIED_ARG_PATTERNS_DEFAULT
                 .iter()
                 .map(|p| p.to_string())
@@ -101,6 +112,7 @@ mod tests {
         assert!(!policy.is_enabled());
         assert_eq!(policy.source, "default:disabled");
         assert_eq!(policy.allowed_commands, vec!["pwd"]);
+        assert_eq!(policy.timeout_ms, TERMINAL_EXEC_TIMEOUT_MS_DEFAULT);
         assert!(!policy.denied_argument_patterns.is_empty());
     }
 
@@ -110,6 +122,7 @@ mod tests {
             mode: "allowlisted".to_string(),
             source: "test".to_string(),
             allowed_commands: vec!["git".to_string(), "ls".to_string()],
+            timeout_ms: TERMINAL_EXEC_TIMEOUT_MS_DEFAULT,
             denied_argument_patterns: vec![
                 "--force".to_string(),
                 "-rf".to_string(),
@@ -143,6 +156,7 @@ mod tests {
             mode: "allowlisted".to_string(),
             source: "test".to_string(),
             allowed_commands: vec!["pwd".to_string(), "ls".to_string(), "git".to_string()],
+            timeout_ms: TERMINAL_EXEC_TIMEOUT_MS_DEFAULT,
             denied_argument_patterns: vec![],
         };
 

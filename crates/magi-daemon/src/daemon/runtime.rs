@@ -263,7 +263,7 @@ impl ShadowDaemonRuntime {
         let ingested_code_index = if let Some(workspace) = active_workspace {
             if knowledge_store
                 .code_index_summary_for_workspace(&workspace.workspace_id)
-                .is_none()
+                .is_none_or(|summary| summary.files.is_empty())
             {
                 let scan_root = PathBuf::from(workspace.root_path.as_str());
                 ingest_workspace_code_index_in_workspace(
@@ -275,7 +275,10 @@ impl ShadowDaemonRuntime {
             } else {
                 false
             }
-        } else if knowledge_store.code_index_summary().is_none() {
+        } else if knowledge_store
+            .code_index_summary()
+            .is_none_or(|summary| summary.files.is_empty())
+        {
             ingest_workspace_code_index(&knowledge_store, &config.bootstrap_workspace_root);
             true
         } else {

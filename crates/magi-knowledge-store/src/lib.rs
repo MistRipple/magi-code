@@ -344,6 +344,14 @@ impl KnowledgeStore {
         self.delete(knowledge_id)
     }
 
+    pub fn delete_project_code_index(&self) {
+        let _ = self.delete(PROJECT_CODE_INDEX_ID);
+    }
+
+    pub fn delete_code_index_for_workspace(&self, workspace_id: &WorkspaceId) {
+        let _ = self.delete(&workspace_project_code_index_id(workspace_id));
+    }
+
     pub fn clear(&self) {
         let mut state = self
             .state

@@ -924,6 +924,18 @@ export async function getAgentSessionNotifications(scope: AgentNotificationScope
   return await parseAgentJson<AgentSessionNotificationsPayload>(response, 'load session notifications');
 }
 
+export async function appendAgentNotification(
+  notification: Record<string, unknown>,
+  scope: AgentNotificationScope,
+): Promise<AgentSessionNotificationsPayload> {
+  return await postBoundJson<AgentSessionNotificationsPayload>(
+    '/api/session/notifications/append',
+    { ...notification },
+    'append notification',
+    createNotificationBindingOverride(scope),
+  );
+}
+
 export async function markAllAgentNotificationsRead(scope: AgentNotificationScope): Promise<AgentSessionNotificationsPayload> {
   return await postBoundJson<AgentSessionNotificationsPayload>(
     '/api/session/notifications/mark-all-read',

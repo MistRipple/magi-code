@@ -123,8 +123,103 @@ pub struct CodeIndexFile {
     pub size: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodeIndexScanStatus {
+    Indexed,
+    Empty,
+    Failed,
+}
+
+impl CodeIndexScanStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Indexed => "indexed",
+            Self::Empty => "empty",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodeIndexScanReasonCode {
+    WorkspaceMissing,
+    WorkspaceNotDirectory,
+    WorkspaceUnreadable,
+    NoIndexableFiles,
+}
+
+impl CodeIndexScanReasonCode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::WorkspaceMissing => "workspace_missing",
+            Self::WorkspaceNotDirectory => "workspace_not_directory",
+            Self::WorkspaceUnreadable => "workspace_unreadable",
+            Self::NoIndexableFiles => "no_indexable_files",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CodeIndexScanOutcome {
+    pub status: CodeIndexScanStatus,
+    pub reason_code: Option<CodeIndexScanReasonCode>,
+    pub detail: Option<String>,
+    pub summary: Option<CodeIndexSummary>,
+}
+
+impl CodeIndexScanOutcome {
+    fn indexed(summary: CodeIndexSummary) -> Self {
+        Self {
+            status: CodeIndexScanStatus::Indexed,
+            reason_code: None,
+            detail: None,
+            summary: Some(summary),
+        }
+    }
+
+    pub fn indexed_existing() -> Self {
+        Self {
+            status: CodeIndexScanStatus::Indexed,
+            reason_code: None,
+            detail: None,
+            summary: None,
+        }
+    }
+
+    fn empty(reason_code: CodeIndexScanReasonCode) -> Self {
+        Self {
+            status: CodeIndexScanStatus::Empty,
+            reason_code: Some(reason_code),
+            detail: None,
+            summary: None,
+        }
+    }
+
+    fn failed(reason_code: CodeIndexScanReasonCode, detail: Option<String>) -> Self {
+        Self {
+            status: CodeIndexScanStatus::Failed,
+            reason_code: Some(reason_code),
+            detail,
+            summary: None,
+        }
+    }
+}
+
 /// 扫描工作区代码并生成代码索引
-pub fn scan_workspace(workspace_root: &Path) -> CodeIndexSummary {
+pub fn scan_workspace(workspace_root: &Path) -> CodeIndexScanOutcome {
+    if !workspace_root.exists() {
+        return CodeIndexScanOutcome::failed(CodeIndexScanReasonCode::WorkspaceMissing, None);
+    }
+    if !workspace_root.is_dir() {
+        return CodeIndexScanOutcome::failed(CodeIndexScanReasonCode::WorkspaceNotDirectory, None);
+    }
+    if let Err(error) = std::fs::read_dir(workspace_root) {
+        return CodeIndexScanOutcome::failed(
+            CodeIndexScanReasonCode::WorkspaceUnreadable,
+            Some(error.to_string()),
+        );
+    }
+
     let mut files: Vec<ScannedFile> = Vec::new();
     let mut tech_stack = Vec::new();
     let mut entry_points = Vec::new();
@@ -142,33 +237,48 @@ pub fn scan_workspace(workspace_root: &Path) -> CodeIndexSummary {
         })
         .collect();
 
-    CodeIndexSummary {
+    if index_files.is_empty() {
+        return CodeIndexScanOutcome::empty(CodeIndexScanReasonCode::NoIndexableFiles);
+    }
+
+    CodeIndexScanOutcome::indexed(CodeIndexSummary {
         files: index_files,
         tech_stack,
         entry_points,
         last_indexed: UtcMillis::now().0,
-    }
+    })
 }
 
 /// 将扫描结果摄取到知识存储中
-pub fn ingest_workspace_code_index(store: &KnowledgeStore, workspace_root: &Path) {
-    let summary = scan_workspace(workspace_root);
-    let Some(ingestion) = code_index_ingestion_for_summary(workspace_root, &summary) else {
-        return;
+pub fn ingest_workspace_code_index(
+    store: &KnowledgeStore,
+    workspace_root: &Path,
+) -> CodeIndexScanOutcome {
+    let outcome = scan_workspace(workspace_root);
+    let Some(summary) = outcome.summary.as_ref() else {
+        store.delete_project_code_index();
+        return outcome;
     };
-    store.ingest_code_index(ingestion);
+    if let Some(ingestion) = code_index_ingestion_for_summary(workspace_root, summary) {
+        store.ingest_code_index(ingestion);
+    }
+    outcome
 }
 
 pub fn ingest_workspace_code_index_in_workspace(
     store: &KnowledgeStore,
     workspace_id: &WorkspaceId,
     workspace_root: &Path,
-) {
-    let summary = scan_workspace(workspace_root);
-    let Some(ingestion) = code_index_ingestion_for_summary(workspace_root, &summary) else {
-        return;
+) -> CodeIndexScanOutcome {
+    let outcome = scan_workspace(workspace_root);
+    let Some(summary) = outcome.summary.as_ref() else {
+        store.delete_code_index_for_workspace(workspace_id);
+        return outcome;
     };
-    store.ingest_code_index_in_workspace(workspace_id.clone(), ingestion);
+    if let Some(ingestion) = code_index_ingestion_for_summary(workspace_root, summary) {
+        store.ingest_code_index_in_workspace(workspace_id.clone(), ingestion);
+    }
+    outcome
 }
 
 fn code_index_ingestion_for_summary(
