@@ -425,7 +425,6 @@ interface PersistedSessionExecutionState {
   }>;
   orchestratorRuntimeState: OrchestratorRuntimeState | null;
   pendingChanges: unknown[];
-  activePlan: AppState['activePlan'] | null;
 }
 let sessionExecutionStateBySession = $state<Record<string, PersistedSessionExecutionState>>({});
 let sessionQueuedMessagesBySession = $state<Record<string, QueuedMessage[]>>({});
@@ -2456,6 +2455,8 @@ export function getState() {
       return messageProjection.workers as AgentOutputs;
     },
     get sessions() { return messagesState.sessions; },
+    get currentWorkspaceId() { return messagesState.currentWorkspaceId; },
+    get currentWorkspacePath() { return messagesState.currentWorkspacePath; },
     get currentSessionId() { return messagesState.currentSessionId; },
     get sessionHistory() { return messagesState.sessionHistory; },
     get queuedMessages() { return messagesState.queuedMessages; },
@@ -2536,7 +2537,6 @@ function createSessionExecutionStateSnapshot(
     edits: clonePersistablePayload(edits) as PersistedSessionExecutionState['edits'],
     orchestratorRuntimeState: clonePersistablePayload(messagesState.orchestratorRuntimeState) as OrchestratorRuntimeState | null,
     pendingChanges: ensureArray(clonePersistablePayload(messagesState.appState?.pendingChanges)),
-    activePlan: clonePersistablePayload(messagesState.appState?.activePlan ?? null) as AppState['activePlan'] | null,
   };
 }
 
@@ -2638,7 +2638,6 @@ function applySessionViewState(sessionId: string | null | undefined): boolean {
       messagesState.appState = {
         ...messagesState.appState,
         pendingChanges: ensureArray(clonePersistablePayload(executionSnapshot.pendingChanges)),
-        activePlan: clonePersistablePayload(executionSnapshot.activePlan) as AppState['activePlan'] | null,
       };
     }
   }
@@ -2653,7 +2652,6 @@ function resetSessionScopedExecutionState(): void {
     messagesState.appState = {
       ...messagesState.appState,
       pendingChanges: [],
-      activePlan: null,
     };
   }
 }
@@ -2918,7 +2916,7 @@ export function setQueuedMessages(newQueuedMessages: QueuedMessage[]) {
       sessionQueuedMessagesBySession = rest;
     }
   }
-  scheduleSaveWebviewState();
+  saveWebviewState();
 }
 
 export function enqueueQueuedMessage(message: QueuedMessage) {
@@ -3015,9 +3013,11 @@ export function setProcessingActor(source: string, agent?: string) {
 }
 
 export function setAppState(nextState: AppState | null) {
-  messagesState.appState = nextState;
   if (nextState) {
+    messagesState.appState = nextState;
     messagesState.bootstrapped = true;
+  } else {
+    messagesState.appState = null;
   }
 }
 

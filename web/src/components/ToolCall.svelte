@@ -234,10 +234,11 @@
     try {
       const data = typeof output === 'string' ? JSON.parse(output) : output;
       if (data && (data.type === 'mermaid' || data.type === 'mermaid_diagram') && data.code) {
+        const rawDiagramType = data.diagramType ?? data.diagram_type ?? '';
         return {
           code: data.code as string,
           title: (data.title || '') as string,
-          diagramType: (data.diagramType || '') as string,
+          diagramType: (typeof rawDiagramType === 'string' ? rawDiagramType : '') as string,
         };
       }
     } catch {

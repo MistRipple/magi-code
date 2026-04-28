@@ -55,9 +55,16 @@
   const appState = getState();
   const isWebMode = isWebAgentMode();
   const isKnowledgeActive = $derived(appState.currentTopTab === 'knowledge');
+  const currentWorkspaceKey = $derived.by(() => {
+    const workspaceId = typeof appState.currentWorkspaceId === 'string' ? appState.currentWorkspaceId.trim() : '';
+    const workspacePath = typeof appState.currentWorkspacePath === 'string' ? appState.currentWorkspacePath.trim() : '';
+    return `${workspaceId}::${workspacePath}`;
+  });
   let currentTab = $state<'overview' | 'adr' | 'faq' | 'learning'>('overview');
   let isLoading = $state(false);
   let hasRequestedKnowledge = $state(false);
+  let lastWorkspaceKey = $state('');
+  let loadError = $state('');
   let codeIndex = $state<CodeIndex | null>(null);
   let adrs = $state<ADR[]>([]);
   let faqs = $state<FAQ[]>([]);
@@ -283,25 +290,41 @@
     }
   }
 
-  async function fetchKnowledgeViaApi() {
-    const res = await getAgentProjectKnowledge();
-    const codeIndexPayload = res?.codeIndex && typeof res.codeIndex === 'object'
-      ? res.codeIndex as Record<string, unknown>
+  function clearKnowledgeContent() {
+    codeIndex = null;
+    adrs = [];
+    faqs = [];
+    learnings = [];
+    searchQuery = '';
+    expandedAdrId = null;
+    expandedFaqId = null;
+    expandedLearningId = null;
+    showClearConfirm = false;
+    closeEditor();
+  }
+
+  function formatLoadError(error: unknown): string {
+    return error instanceof Error ? error.message : String(error || i18n.t('mermaid.unknownError'));
+  }
+
+  function applyKnowledgePayload(payload: Record<string, unknown> | null | undefined) {
+    const codeIndexPayload = payload?.codeIndex && typeof payload.codeIndex === 'object'
+      ? payload.codeIndex as Record<string, unknown>
       : null;
-    
-    adrs = ensureArray(res?.adrs).map((a: any) => ({
+
+    adrs = ensureArray(payload?.adrs).map((a: any) => ({
       id: a.id,
       title: a.title,
       content: a.content,
       tags: ensureArray(a.tags)
     }));
-    faqs = ensureArray(res?.faqs).map((f: any) => ({
+    faqs = ensureArray(payload?.faqs).map((f: any) => ({
       id: f.id,
       question: f.title || f.question,
       answer: f.content || f.answer,
       tags: ensureArray(f.tags)
     }));
-    learnings = ensureArray(res?.learnings).map((l: any) => ({
+    learnings = ensureArray(payload?.learnings).map((l: any) => ({
       id: l.id,
       content: l.content,
       context: l.context,
@@ -316,17 +339,40 @@
           entryPoints: ensureArray(codeIndexPayload.entryPoints) as string[]
         }
       : null;
+    loadError = '';
     isLoading = false;
   }
 
-  function refresh() {
+  function handleKnowledgeLoadError(error: unknown) {
+    clearKnowledgeContent();
+    loadError = i18n.t('knowledge.toast.loadFailed', { error: formatLoadError(error) });
+    isLoading = false;
+  }
+
+  function resolvePayloadWorkspaceKey(payload: Record<string, unknown> | null | undefined): string {
+    const workspaceId = typeof payload?.workspaceId === 'string' ? payload.workspaceId.trim() : '';
+    const workspacePath = typeof payload?.workspacePath === 'string' ? payload.workspacePath.trim() : '';
+    return workspaceId || workspacePath ? `${workspaceId}::${workspacePath}` : '';
+  }
+
+  async function fetchKnowledgeViaApi() {
+    const res = await getAgentProjectKnowledge();
+    applyKnowledgePayload(res);
+  }
+
+  function requestKnowledgeLoad() {
     hasRequestedKnowledge = true;
     isLoading = true;
+    loadError = '';
     if (isWebMode) {
-      fetchKnowledgeViaApi().catch(() => { isLoading = false; });
+      fetchKnowledgeViaApi().catch(handleKnowledgeLoadError);
     } else {
       vscode.postMessage({ type: 'getProjectKnowledge' });
     }
+  }
+
+  function refresh() {
+    requestKnowledgeLoad();
   }
 
   function toggleAdr(adr: ADR) {
@@ -380,23 +426,32 @@
     showClearConfirm = false;
     isLoading = true;
     if (isWebMode) {
-      clearAgentProjectKnowledge().then(() => refresh()).catch(() => { isLoading = false; });
+      clearAgentProjectKnowledge().then(() => refresh()).catch(handleKnowledgeLoadError);
     } else {
       vscode.postMessage({ type: 'clearProjectKnowledge' });
     }
   }
 
   $effect(() => {
+    const nextWorkspaceKey = currentWorkspaceKey;
+    if (lastWorkspaceKey === nextWorkspaceKey) {
+      return;
+    }
+    lastWorkspaceKey = nextWorkspaceKey;
+    hasRequestedKnowledge = false;
+    isLoading = false;
+    loadError = '';
+    clearKnowledgeContent();
+    if (isKnowledgeActive) {
+      requestKnowledgeLoad();
+    }
+  });
+
+  $effect(() => {
     if (!isKnowledgeActive || hasRequestedKnowledge) {
       return;
     }
-    hasRequestedKnowledge = true;
-    isLoading = true;
-    if (isWebMode) {
-      fetchKnowledgeViaApi().catch(() => { isLoading = false; });
-    } else {
-      vscode.postMessage({ type: 'getProjectKnowledge' });
-    }
+    requestKnowledgeLoad();
   });
 
   // 监听来自扩展的消息
@@ -407,35 +462,12 @@
       if (!standard || standard.category !== MessageCategory.DATA || !standard.data) return;
       if (standard.data.dataType !== 'projectKnowledgeLoaded') return;
 
-      const payload = standard.data.payload as { codeIndex?: any; adrs?: any[]; faqs?: any[]; learnings?: any[] };
-      codeIndex = payload?.codeIndex
-        ? {
-            ...payload.codeIndex,
-            files: ensureArray(payload.codeIndex.files) as NonNullable<CodeIndex['files']>,
-            techStack: ensureArray(payload.codeIndex.techStack) as string[],
-            entryPoints: ensureArray(payload.codeIndex.entryPoints) as string[]
-          }
-        : null;
-      adrs = ensureArray(payload?.adrs).map((a: any) => ({
-        id: a.id,
-        title: a.title,
-        content: a.content,
-        tags: ensureArray(a.tags)
-      }));
-      faqs = ensureArray(payload?.faqs).map((f: any) => ({
-        id: f.id,
-        question: f.title || f.question,
-        answer: f.content || f.answer,
-        tags: ensureArray(f.tags)
-      }));
-      learnings = ensureArray(payload?.learnings).map((l: any) => ({
-        id: l.id,
-        content: l.content,
-        context: l.context,
-        createdAt: l.createdAt,
-        tags: ensureArray(l.tags)
-      }));
-      isLoading = false;
+      const payload = standard.data.payload as Record<string, unknown>;
+      const payloadWorkspaceKey = resolvePayloadWorkspaceKey(payload);
+      if (payloadWorkspaceKey && payloadWorkspaceKey !== currentWorkspaceKey) {
+        return;
+      }
+      applyKnowledgePayload(payload);
     });
 
     return () => unsubscribe();
@@ -537,6 +569,13 @@
         <button class="kp-editor-btn" onclick={closeEditor} disabled={isSaving}>{i18n.t('knowledge.actions.cancel')}</button>
         <button class="kp-editor-btn kp-editor-btn--primary" onclick={saveEditor} disabled={isSaving}>{i18n.t('knowledge.actions.save')}</button>
       </div>
+    </div>
+  {/if}
+
+  {#if loadError}
+    <div class="kp-load-error">
+      <Icon name="warning" size={14} />
+      <span>{loadError}</span>
     </div>
   {/if}
 
@@ -1044,6 +1083,18 @@
   }
 
   .kp-editor-error {
+    color: var(--error);
+    font-size: var(--text-xs);
+  }
+
+  .kp-load-error {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid color-mix(in srgb, var(--error) 26%, var(--border));
+    border-radius: var(--radius-sm);
+    background: var(--error-muted);
     color: var(--error);
     font-size: var(--text-xs);
   }

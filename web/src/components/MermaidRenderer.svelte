@@ -82,6 +82,12 @@
       [/^\s*gitGraph/mi, 'git'],
       [/^\s*mindmap/mi, 'mindmap'],
       [/^\s*timeline/mi, 'timeline'],
+      [/^\s*quadrantChart/mi, 'quadrant'],
+      [/^\s*requirementDiagram/mi, 'requirement'],
+      [/^\s*C4Context/mi, 'c4'],
+      [/^\s*sankey/mi, 'sankey'],
+      [/^\s*xychart/mi, 'xychart'],
+      [/^\s*block-beta/mi, 'block'],
     ];
 
     for (const [pattern, type] of typePatterns) {
@@ -104,6 +110,12 @@
       git: 'mermaidRenderer.diagramType.git',
       mindmap: 'mermaidRenderer.diagramType.mindmap',
       timeline: 'mermaidRenderer.diagramType.timeline',
+      quadrant: 'mermaidRenderer.diagramType.quadrant',
+      requirement: 'mermaidRenderer.diagramType.requirement',
+      c4: 'mermaidRenderer.diagramType.c4',
+      sankey: 'mermaidRenderer.diagramType.sankey',
+      xychart: 'mermaidRenderer.diagramType.xychart',
+      block: 'mermaidRenderer.diagramType.block',
     };
     const key = typeMap[detectedType];
     return key ? i18n.t(key) : 'Mermaid';

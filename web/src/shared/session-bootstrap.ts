@@ -6,21 +6,6 @@
  * 服务端专用逻辑和重量级依赖。
  */
 
-export interface BootstrapQueuedMessage {
-  id: string;
-  requestId?: string;
-  content: string;
-  text?: string | null;
-  createdAt: number;
-  mode?: 'queue' | 'guide';
-  deepTask?: boolean;
-  skillName?: string | null;
-  images?: Array<{
-    name: string;
-    dataUrl: string;
-  }>;
-}
-
 /**
  * Session Timeline Projection 的前端表示
  * 原版定义在 session/session-timeline-projection.ts，
@@ -49,6 +34,5 @@ export interface SessionBootstrapSnapshot {
     sessionId: string;
     notifications: unknown;
   };
-  queuedMessages: BootstrapQueuedMessage[];
   orchestratorRuntimeState?: unknown;
 }

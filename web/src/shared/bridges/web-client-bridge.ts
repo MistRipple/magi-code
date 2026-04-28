@@ -1858,7 +1858,11 @@ async function dispatchProjectKnowledge(): Promise<void> {
     throw new Error(`project knowledge failed: ${response.status}`);
   }
   const payload = await response.json() as Record<string, unknown>;
-  emitDataMessage('projectKnowledgeLoaded', payload);
+  emitDataMessage('projectKnowledgeLoaded', {
+    ...payload,
+    workspaceId: currentWorkspaceId,
+    workspacePath: currentWorkspacePath,
+  });
 }
 
 async function emitKnowledgePayload(): Promise<void> {
@@ -2140,7 +2144,7 @@ interface ExecuteTaskInput {
   requestId?: string;
   deepTask: boolean;
   skillName?: string | null;
-  followUpMode?: 'queue' | 'guide';
+  followUpMode?: 'queue';
   images: Array<{
     name: string;
     dataUrl: string;
@@ -3190,9 +3194,7 @@ export function createWebClientBridge(): ClientBridge {
               requestId: typeof message.requestId === 'string' ? message.requestId : undefined,
               deepTask: message.deepTask === true,
               skillName: typeof message.skillName === 'string' ? message.skillName : null,
-              followUpMode: message.followUpMode === 'queue' || message.followUpMode === 'guide'
-                ? message.followUpMode
-                : undefined,
+              followUpMode: message.followUpMode === 'queue' ? 'queue' : undefined,
               images: Array.isArray(message.images)
                 ? message.images as Array<{ name: string; dataUrl: string }>
                 : [],

@@ -2699,7 +2699,6 @@ export function normalizeRustBootstrapPayload(
           },
         }
       : undefined,
-    queuedMessages: [],
     orchestratorRuntimeState: deriveRuntimeState(
       payload.runtimeReadModel,
       assignments,

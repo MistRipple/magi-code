@@ -53,39 +53,9 @@ fn protocol_serialize_error() {
 fn session_context_basic_lifecycle() {
     let mut ctx = SessionExecutionContext::new("s1");
     assert_eq!(ctx.session_id(), "s1");
-    assert_eq!(ctx.queue_length(), 0);
 
-    ctx.enqueue_message(QueuedUserTurn {
-        id: "t1".to_string(),
-        content: "hello".to_string(),
-        created_at: 1000,
-    });
-    assert_eq!(ctx.queue_length(), 1);
-
-    let msg = ctx.dequeue_message().unwrap();
-    assert_eq!(msg.id, "t1");
-    assert_eq!(ctx.queue_length(), 0);
-}
-
-#[test]
-fn session_context_remove_queued_message() {
-    let mut ctx = SessionExecutionContext::new("s1");
-    ctx.enqueue_message(QueuedUserTurn {
-        id: "t1".to_string(),
-        content: "a".to_string(),
-        created_at: 1000,
-    });
-    ctx.enqueue_message(QueuedUserTurn {
-        id: "t2".to_string(),
-        content: "b".to_string(),
-        created_at: 2000,
-    });
-    assert!(ctx.remove_queued_message("t1"));
-    assert!(!ctx.remove_queued_message("t1"));
-    assert_eq!(ctx.queue_length(), 1);
-
-    let msg = ctx.dequeue_message().unwrap();
-    assert_eq!(msg.id, "t2");
+    ctx.touch();
+    assert!(ctx.last_touched_at() >= ctx.created_at());
 }
 
 #[test]
@@ -129,11 +99,6 @@ fn session_context_plan_approval() {
 #[test]
 fn session_context_clear_transient() {
     let mut ctx = SessionExecutionContext::new("s1");
-    ctx.enqueue_message(QueuedUserTurn {
-        id: "t1".to_string(),
-        content: "a".to_string(),
-        created_at: 1000,
-    });
     ctx.set_pending_recovery(Some(PendingRecoveryContext {
         task_id: "task-1".to_string(),
         prompt: "x".to_string(),
@@ -144,11 +109,8 @@ fn session_context_clear_transient() {
         can_retry: false,
         can_rollback: false,
     }));
-    ctx.set_drain_running(true);
     ctx.clear_transient_state();
-    assert_eq!(ctx.queue_length(), 0);
     assert!(ctx.pending_recovery().is_none());
-    assert!(!ctx.is_drain_running());
 }
 
 #[test]
@@ -156,7 +118,6 @@ fn session_context_stats() {
     let ctx = SessionExecutionContext::new("s1");
     let stats = ctx.stats();
     assert_eq!(stats.session_id, "s1");
-    assert_eq!(stats.queue_length, 0);
     assert!(!stats.has_pending_recovery);
     assert_eq!(stats.pending_approval_count, 0);
 }
@@ -168,18 +129,22 @@ fn session_registry_basic() {
 
     {
         let ctx = reg.get_or_create("s1");
-        ctx.enqueue_message(QueuedUserTurn {
-            id: "t1".to_string(),
-            content: "hello".to_string(),
-            created_at: 1000,
-        });
+        ctx.set_pending_plan_approval(
+            "req-1".to_string(),
+            PendingPlanApprovalContext {
+                plan_id: "plan-1".to_string(),
+                session_id: "s1".to_string(),
+                prompt: "approve?".to_string(),
+                chain_id: None,
+            },
+        );
     }
     assert_eq!(reg.size(), 1);
     assert!(reg.has("s1"));
     assert!(!reg.has("s2"));
 
     assert!(reg.get("s1").is_some());
-    assert_eq!(reg.get("s1").unwrap().queue_length(), 1);
+    assert!(reg.get("s1").unwrap().get_pending_plan_approval("req-1").is_some());
 }
 
 #[test]

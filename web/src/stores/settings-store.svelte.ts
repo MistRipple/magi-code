@@ -1560,10 +1560,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
       const result = await fetchAgentModelList(payload, key);
       fetchingModels[key] = false;
       fetchingModels = { ...fetchingModels };
-      if ((result as any)?.success && Array.isArray((result as any)?.models)) {
-        modelLists[key] = (result as any).models as string[];
+      if (result.success && Array.isArray(result.models)) {
+        modelLists[key] = result.models;
         modelLists = { ...modelLists };
-        if (((result as any).models as string[]).length > 0) {
+        if (result.models.length > 0) {
           modelDropdownOpen[key] = true;
           modelDropdownOpen = { ...modelDropdownOpen };
         }

@@ -9,7 +9,6 @@ import {
   setIsProcessing,
   setCurrentSessionId,
   adoptCurrentSessionIdForLiveTurn,
-  getQueuedMessages,
   updateSessions,
   setQueuedMessages,
   setAppState,
@@ -46,8 +45,7 @@ import {
 import type {
   AppState, Message, Session,
   Edit,
-  ModelStatusMap, ActivePlanState, PlanLedgerRecord, PlanLedgerAttempt,
-  QueuedMessage, OrchestratorRuntimeState, SessionTimelineProjection,
+  ModelStatusMap, OrchestratorRuntimeState, SessionTimelineProjection,
 } from '../types/message';
 import type { StandardMessage, ContentBlock as StandardContentBlock } from '../shared/protocol/message-protocol';
 import type { SessionBootstrapSnapshot } from '../shared/session-bootstrap';
@@ -81,13 +79,6 @@ function shouldApplyStateSlice(params: {
     return false;
   }
   return true;
-}
-
-function applyQueuedMessagesFromAuthoritativeSnapshot(queuedMessages: QueuedMessage[]) {
-  const incoming = ensureArray<QueuedMessage>(queuedMessages);
-  if (incoming.length > 0 || getQueuedMessages().length === 0) {
-    setQueuedMessages(incoming);
-  }
 }
 
 function normalizeIncomingEdits(state: AppState): Edit[] {
@@ -366,16 +357,6 @@ export function handleUnifiedData(standard: StandardMessage) {
       break;
     }
 
-    case 'queuedMessagesUpdated': {
-      const currentSessionId = getState().currentSessionId || '';
-      const incomingSessionId = typeof payload.sessionId === 'string' ? payload.sessionId : '';
-      if (incomingSessionId && currentSessionId && incomingSessionId !== currentSessionId) {
-        break;
-      }
-      setQueuedMessages(ensureArray<QueuedMessage>(payload.queuedMessages));
-      break;
-    }
-
     case 'sessionsUpdated':
       handleSessionsUpdated(asMessage({ sessions: payload.sessions }));
       break;
@@ -426,7 +407,6 @@ export function handleUnifiedData(standard: StandardMessage) {
         state: payload.state,
         timelineProjection: payload.timelineProjection,
         notifications: payload.notifications,
-        queuedMessages: payload.queuedMessages,
         orchestratorRuntimeState: payload.orchestratorRuntimeState,
         hasMoreBefore: payload.hasMoreBefore,
         beforeCursor: payload.beforeCursor,
@@ -457,11 +437,6 @@ export function handleUnifiedData(standard: StandardMessage) {
 
     case 'sessionNotificationsStatus':
       applySessionNotificationsStatus(payload);
-      break;
-
-    case 'planLedgerLoaded':
-    case 'planLedgerUpdated':
-      applyPlanLedgerSnapshot(payload);
       break;
 
     case 'orchestratorRuntimeState':
@@ -614,73 +589,6 @@ function handleEmptyWorkspaceStateLoaded(message: ClientBridgeMessage) {
       setQueuedMessages([]);
     }
   });
-}
-
-function applyPlanLedgerSnapshot(payload: Record<string, unknown>) {
-  const store = getState();
-  const incomingSessionId = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : '';
-  const currentSessionId = store.currentSessionId?.trim() || '';
-  if (incomingSessionId && currentSessionId && incomingSessionId !== currentSessionId) {
-    console.warn('[MessageHandler] 忽略非当前会话的计划账本快照', {
-      incomingSessionId,
-      currentSessionId,
-    });
-    return;
-  }
-
-  const rawActivePlan = payload.activePlan;
-  const normalizedActivePlan: ActivePlanState | null = (
-    rawActivePlan
-    && typeof rawActivePlan === 'object'
-    && typeof (rawActivePlan as ActivePlanState).planId === 'string'
-    && typeof (rawActivePlan as ActivePlanState).formattedPlan === 'string'
-    && typeof (rawActivePlan as ActivePlanState).updatedAt === 'number'
-  )
-    ? (rawActivePlan as ActivePlanState)
-    : null;
-
-  const normalizedPlanHistory = ensureArray(payload.plans)
-    .map((plan) => normalizePlanLedgerRecord(plan))
-    .filter((plan): plan is PlanLedgerRecord => Boolean(plan));
-
-  const currentState = (store.appState || {}) as AppState;
-  const nextState: AppState = {
-    ...currentState,
-    activePlan: normalizedActivePlan,
-    planHistory: normalizedPlanHistory,
-  };
-  setAppState(nextState);
-}
-
-function normalizePlanLedgerRecord(plan: unknown): PlanLedgerRecord | null {
-  if (!plan || typeof plan !== 'object') {
-    return null;
-  }
-  const candidate = plan as PlanLedgerRecord & { missionId?: string; executionGroupId?: string };
-  if (typeof candidate.planId !== 'string' || typeof candidate.sessionId !== 'string') {
-    return null;
-  }
-  const { missionId: _legacyMissionId, ...rest } = candidate;
-  const normalizedAttempts = ensureArray((candidate as { attempts?: unknown[] }).attempts)
-    .filter((attempt): attempt is PlanLedgerAttempt => {
-      if (!attempt || typeof attempt !== 'object') return false;
-      const a = attempt as PlanLedgerAttempt;
-      return typeof a.attemptId === 'string'
-        && typeof a.scope === 'string'
-        && typeof a.targetId === 'string'
-        && typeof a.sequence === 'number'
-        && typeof a.status === 'string';
-    });
-  return {
-    ...rest,
-    executionGroupId: (typeof candidate.executionGroupId === 'string'
-      ? candidate.executionGroupId
-      : undefined)
-      || (typeof _legacyMissionId === 'string'
-        ? _legacyMissionId
-        : undefined),
-    attempts: normalizedAttempts,
-  };
 }
 
 function applyTimelineProjectionSnapshot(
@@ -905,13 +813,12 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         );
       }
 
-      if (snapshot.notifications) {
-        applySessionNotifications(sessionId, snapshot.notifications.notifications);
-      }
-      applyQueuedMessagesFromAuthoritativeSnapshot(ensureArray<QueuedMessage>(snapshot.queuedMessages));
-      setSessionHistoryState(sessionId, {
-        hasMoreBefore,
-        beforeCursor,
+    if (snapshot.notifications) {
+      applySessionNotifications(sessionId, snapshot.notifications.notifications);
+    }
+    setSessionHistoryState(sessionId, {
+      hasMoreBefore,
+      beforeCursor,
         isLoadingBefore: false,
       });
 
@@ -964,7 +871,6 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     if (snapshot.notifications) {
       applySessionNotifications(sessionId, snapshot.notifications.notifications);
     }
-    applyQueuedMessagesFromAuthoritativeSnapshot(ensureArray<QueuedMessage>(snapshot.queuedMessages));
     setSessionHistoryState(sessionId, {
       hasMoreBefore,
       beforeCursor,

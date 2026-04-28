@@ -9,6 +9,7 @@ import type {
   SessionNotificationSnapshotDto,
   SessionNotificationsResponseDto,
   MessagesResponseDto,
+  FetchModelsResponseDto,
 } from '../shared/rust-backend-types';
 import { i18n } from '../stores/i18n.svelte';
 
@@ -1160,8 +1161,8 @@ export async function removeAgentRegistryBinding(templateId: string): Promise<Ag
   return Array.isArray(payload.agents) ? payload.agents : [];
 }
 
-export async function fetchAgentModelList(config: Record<string, unknown>, target: string): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/models/fetch', { config, target }, 'fetch model list');
+export async function fetchAgentModelList(config: Record<string, unknown>, target: string): Promise<FetchModelsResponseDto> {
+  return await postWorkspaceBoundJson<FetchModelsResponseDto>('/api/settings/models/fetch', { config, target }, 'fetch model list');
 }
 
 export async function clearAgentProjectKnowledge(): Promise<AgentKnowledgeMutationPayload> {

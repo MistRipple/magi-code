@@ -864,8 +864,9 @@ export interface AgentTemplateIdRequestDto {
 }
 
 export interface FetchModelsResponseDto {
-  models: unknown[];
-  eventId: string;
+  success: boolean;
+  target: string;
+  models: string[];
   requestedAt: number;
 }
 

@@ -798,66 +798,6 @@ export interface Task {
   failureReason?: string;
 }
 
-export interface PlanLedgerItem {
-  itemId: string;
-  title: string;
-  owner: string;
-  status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped' | 'cancelled';
-  progress: number;
-}
-
-export interface PlanLedgerAttempt {
-  attemptId: string;
-  scope: 'orchestrator' | 'assignment' | 'task';
-  targetId: string;
-  assignmentId?: string;
-  taskId?: string;
-  sequence: number;
-  status: 'created' | 'inflight' | 'succeeded' | 'failed' | 'timeout' | 'cancelled';
-  reason?: string;
-  error?: string;
-  evidenceIds: string[];
-  createdAt: number;
-  startedAt?: number;
-  endedAt?: number;
-  updatedAt: number;
-}
-
-export interface PlanLedgerRecord {
-  planId: string;
-  sessionId: string;
-  executionGroupId?: string;
-  turnId: string;
-  version: number;
-  promptDigest?: string;
-  mode: 'standard' | 'deep';
-  status:
-    | 'draft'
-    | 'awaiting_confirmation'
-    | 'approved'
-    | 'rejected'
-    | 'executing'
-    | 'partially_completed'
-    | 'completed'
-    | 'failed'
-    | 'cancelled'
-    | 'superseded';
-  summary: string;
-  analysis?: string;
-  formattedPlan?: string;
-  items: PlanLedgerItem[];
-  attempts?: PlanLedgerAttempt[];
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface ActivePlanState {
-  planId: string;
-  formattedPlan: string;
-  updatedAt: number;
-  review?: { status: 'approved' | 'rejected' | 'skipped'; summary: string };
-}
-
 // 编辑/变更记录
 export type EditType = 'add' | 'modify' | 'delete';
 
@@ -925,8 +865,6 @@ export interface AppState {
   processingState?: UIProcessingState | null;
   pendingChanges?: unknown[];
   locale?: LocaleCode;
-  activePlan?: ActivePlanState | null;
-  planHistory?: PlanLedgerRecord[];
   edits?: Edit[];
   pendingChangesStateVersion?: number;
   toasts?: Toast[];
