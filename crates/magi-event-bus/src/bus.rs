@@ -82,6 +82,21 @@ impl InMemoryEventBus {
         self.sender.subscribe()
     }
 
+    pub fn snapshot_and_subscribe(
+        &self,
+    ) -> (EventStreamSnapshot, broadcast::Receiver<EventEnvelope>) {
+        let recent_events = self
+            .recent_events
+            .read()
+            .expect("event bus recent events read lock poisoned");
+        let snapshot = EventStreamSnapshot {
+            next_sequence: self.sequence.load(Ordering::SeqCst) + 1,
+            recent_events: recent_events.clone(),
+        };
+        let receiver = self.sender.subscribe();
+        (snapshot, receiver)
+    }
+
     pub fn snapshot(&self) -> EventStreamSnapshot {
         EventStreamSnapshot {
             next_sequence: self.sequence.load(Ordering::SeqCst) + 1,
@@ -342,6 +357,22 @@ mod tests {
 
         assert_eq!(sequence, 1);
         assert_eq!(bus.snapshot().recent_events.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_and_subscribe_delivers_events_after_snapshot() {
+        let bus = InMemoryEventBus::new(8);
+        bus.publish(event(EventCategory::Domain, "event.before", 1))
+            .expect("publish before snapshot");
+
+        let (snapshot, mut receiver) = bus.snapshot_and_subscribe();
+        bus.publish(event(EventCategory::Domain, "event.after", 2))
+            .expect("publish after snapshot");
+
+        assert_eq!(snapshot.recent_events.len(), 1);
+        assert_eq!(snapshot.recent_events[0].event_type, "event.before");
+        let live_event = receiver.try_recv().expect("live event should arrive");
+        assert_eq!(live_event.event_type, "event.after");
     }
 
     #[test]

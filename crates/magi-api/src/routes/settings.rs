@@ -1378,19 +1378,40 @@ mod tests {
     }
 
     #[test]
-    fn fetch_models_config_allows_openai_compatible_gateway_provider_labels() {
-        let (config, target) = parse_fetch_models_config(FetchModelsRequest {
+    fn fetch_models_config_rejects_non_openai_provider() {
+        let error = parse_fetch_models_config(FetchModelsRequest {
             config: serde_json::json!({
                 "provider": "anthropic",
+                "baseUrl": "https://api.anthropic.com",
+                "apiKey": "test-key",
+                "urlMode": "standard"
+            }),
+            target: "orch".to_string(),
+        })
+        .expect_err("non OpenAI-compatible provider should not reuse OpenAI /models");
+
+        match error {
+            ApiError::InvalidInput(message) => {
+                assert!(message.contains("当前 provider 不支持自动获取模型列表"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_models_config_allows_openai_compatible_provider() {
+        let (config, target) = parse_fetch_models_config(FetchModelsRequest {
+            config: serde_json::json!({
+                "provider": "openai",
                 "baseUrl": "http://127.0.0.1:8320/",
                 "apiKey": "test-key",
                 "urlMode": "standard"
             }),
             target: "orch".to_string(),
         })
-        .expect("openai-compatible gateways may keep their provider label");
+        .expect("openai-compatible provider can list models");
 
-        assert_eq!(config.provider(), "anthropic");
+        assert_eq!(config.provider(), "openai");
         assert_eq!(
             config.require_base_url().expect("baseUrl"),
             "http://127.0.0.1:8320/"
@@ -1406,7 +1427,7 @@ mod tests {
     fn fetch_models_config_rejects_full_url_mode() {
         let error = parse_fetch_models_config(FetchModelsRequest {
             config: serde_json::json!({
-                "provider": "anthropic",
+                "provider": "openai",
                 "baseUrl": "http://127.0.0.1:8320/v1/chat/completions",
                 "apiKey": "test-key",
                 "urlMode": "full"

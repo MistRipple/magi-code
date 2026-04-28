@@ -130,6 +130,9 @@
     if (blockReason === 'full_url_mode') {
       return i18n.t('config.toast.modelListUnsupportedInFullMode');
     }
+    if (blockReason === 'unsupported_provider') {
+      return i18n.t('config.toast.modelListUnsupportedProvider');
+    }
     if (blockReason === 'missing_base_url_or_api_key') {
       return i18n.t('config.toast.fillBaseUrlFirst');
     }

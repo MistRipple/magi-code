@@ -2788,7 +2788,9 @@ async function fetchModelList(config: Record<string, unknown>, target: string): 
       '获取模型列表',
       blockReason === 'full_url_mode'
         ? '完整路径模式下不支持自动获取模型列表，请手动填写模型名'
-        : '请先填写 Base URL 和 API Key',
+        : blockReason === 'unsupported_provider'
+          ? '当前 provider 不支持自动获取模型列表，请手动填写模型名'
+          : '请先填写 Base URL 和 API Key',
     );
     return;
   }

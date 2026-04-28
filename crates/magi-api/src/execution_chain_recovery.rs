@@ -393,16 +393,35 @@ pub(crate) fn continue_shadow_execution_chain(
         }
     }
 
-    let primary_branch = resumable_branches
+    let branches_to_resume = if requested_worker_ids.is_empty() {
+        resumable_branches.clone()
+    } else {
+        resumable_branches
+            .iter()
+            .filter(|branch| {
+                requested_worker_ids
+                    .iter()
+                    .any(|worker_id| worker_id == &branch.worker_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if branches_to_resume.is_empty() {
+        return Err(ApiError::InvalidInput(
+            "请求继续的 worker 当前不可继续".to_string(),
+        ));
+    }
+
+    let primary_branch = branches_to_resume
         .iter()
         .find(|branch| {
             requested_worker_ids
                 .iter()
                 .any(|worker_id| worker_id == &branch.worker_id)
         })
-        .or_else(|| resumable_branches.iter().find(|branch| branch.is_primary))
-        .or_else(|| resumable_branches.first())
-        .expect("resumable_branches checked as non-empty");
+        .or_else(|| branches_to_resume.iter().find(|branch| branch.is_primary))
+        .or_else(|| branches_to_resume.first())
+        .expect("branches_to_resume checked as non-empty");
     apply_chain_recovery_if_needed(state, session_id, &mut chain, primary_branch)?;
 
     let mut root_status = root_task.status;
@@ -417,7 +436,7 @@ pub(crate) fn continue_shadow_execution_chain(
         ));
     }
 
-    for branch in &resumable_branches {
+    for branch in &branches_to_resume {
         state.shadow_task_execution_registry().insert(
             branch.task_id.clone(),
             rebuild_dispatch_plan_for_branch(&chain, branch),
@@ -443,9 +462,14 @@ pub(crate) fn continue_shadow_execution_chain(
         .runner_manager()
         .ok_or_else(|| ApiError::internal_assembly("继续会话失败", "runner_manager 未配置"))?;
     match root_status {
-        TaskStatus::Blocked => manager
+        TaskStatus::Blocked if requested_worker_ids.is_empty() => manager
             .resume_tree(chain.root_task_id.as_str())
             .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?,
+        TaskStatus::Blocked => {
+            task_store
+                .update_status(&chain.root_task_id, TaskStatus::Running)
+                .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?;
+        }
         TaskStatus::Running => {}
         other => {
             return Err(ApiError::InvalidInput(format!(
@@ -453,7 +477,7 @@ pub(crate) fn continue_shadow_execution_chain(
             )));
         }
     }
-    for branch in &resumable_branches {
+    for branch in &branches_to_resume {
         if branch.task_id != chain.root_task_id
             && task_store
                 .get_task(&branch.task_id)
@@ -486,7 +510,7 @@ pub(crate) fn continue_shadow_execution_chain(
         root_task_id: chain.root_task_id,
         action_task_id: primary_branch.task_id.clone(),
         execution_chain_ref: chain.execution_chain_ref,
-        resumed_branch_count: resumable_branches.len(),
+        resumed_branch_count: branches_to_resume.len(),
         runner_started: true,
     })
 }

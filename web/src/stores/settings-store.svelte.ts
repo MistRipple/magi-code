@@ -1542,7 +1542,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
       notifySettingsInfo(
         blockReason === "full_url_mode"
           ? i18n.t("config.toast.modelListUnsupportedInFullMode")
-          : i18n.t("config.toast.fillBaseUrlFirst"),
+          : blockReason === "unsupported_provider"
+            ? i18n.t("config.toast.modelListUnsupportedProvider")
+            : i18n.t("config.toast.fillBaseUrlFirst"),
       );
       return;
     }

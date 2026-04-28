@@ -32,9 +32,11 @@ export interface ModelStatusLike {
 
 export type ModelListFetchBlockReason =
   | 'full_url_mode'
-  | 'missing_base_url_or_api_key';
+  | 'missing_base_url_or_api_key'
+  | 'unsupported_provider';
 
 export interface ModelListFetchConfigLike {
+  provider?: unknown;
   baseUrl?: unknown;
   apiKey?: unknown;
   urlMode?: unknown;
@@ -54,6 +56,11 @@ export function resolveModelListFetchBlockReason(
   const urlMode = trimmedConfigString(config.urlMode).toLowerCase();
   if (urlMode === 'full') {
     return 'full_url_mode';
+  }
+
+  const provider = trimmedConfigString(config.provider).toLowerCase();
+  if (provider && provider !== 'openai' && provider !== 'openai-compatible' && provider !== 'openai_compatible') {
+    return 'unsupported_provider';
   }
 
   if (!trimmedConfigString(config.baseUrl) || !trimmedConfigString(config.apiKey)) {

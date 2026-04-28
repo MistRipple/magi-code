@@ -781,11 +781,7 @@ fn task_lease_is_current(task_store: &TaskStore, task_id: &TaskId, lease_id: &Le
         .is_some_and(|lease| lease.lease_id == *lease_id)
 }
 
-fn task_stream_item_id(
-    task_id: &TaskId,
-    round: usize,
-    streaming_entry_id: Option<&str>,
-) -> String {
+fn task_stream_item_id(task_id: &TaskId, round: usize, streaming_entry_id: Option<&str>) -> String {
     streaming_entry_id
         .map(str::to_string)
         .unwrap_or_else(|| format!("turn-item-assistant-stream-{task_id}-{round}"))

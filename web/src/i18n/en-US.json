@@ -55,6 +55,7 @@
   "config.toast.modelsFetched": "Fetched {count} models",
   "config.toast.fillBaseUrlFirst": "Please fill in Base URL and API Key first",
   "config.toast.modelListUnsupportedInFullMode": "Model list is unavailable in Full mode. Please enter the model name manually",
+  "config.toast.modelListUnsupportedProvider": "The current provider does not support model list fetching. Please enter the model name manually",
   "config.toast.invalidApiKey": "Invalid API Key",
   "config.toast.apiNotSupportModelList": "This API does not support model list queries",
   "config.toast.connectionTimeout": "Connection timeout",

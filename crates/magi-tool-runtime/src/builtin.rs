@@ -152,6 +152,25 @@ pub(crate) fn field_string(
     })
 }
 
+fn required_string_or_raw(
+    input: &str,
+    request: Option<&serde_json::Map<String, Value>>,
+    keys: &[&str],
+    tool: &str,
+    missing_message: &str,
+) -> Result<String, String> {
+    let value = match request {
+        Some(object) => field_string(object, keys).unwrap_or_default(),
+        None => input.trim().to_string(),
+    }
+    .trim()
+    .to_string();
+    if value.is_empty() {
+        return Err(builtin_error(tool, missing_message));
+    }
+    Ok(value)
+}
+
 fn field_usize(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<usize> {
     keys.iter().find_map(|key| {
         object.get(*key).and_then(|value| {
@@ -186,13 +205,16 @@ pub(crate) fn resolve_path(input: &str) -> Result<PathBuf, String> {
 
 fn execute_file_read(input: &str) -> String {
     let request = parse_json_object(input);
-    let path_input = request
-        .as_ref()
-        .and_then(|object| field_string(object, &["path", "file_path"]))
-        .unwrap_or_else(|| input.trim().to_string());
-    if path_input.is_empty() {
-        return builtin_error("file_read", "缺少文件路径");
-    }
+    let path_input = match required_string_or_raw(
+        input,
+        request.as_ref(),
+        &["path", "file_path"],
+        "file_read",
+        "缺少文件路径",
+    ) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
 
     let max_bytes = request
         .as_ref()
@@ -266,13 +288,16 @@ fn execute_file_read(input: &str) -> String {
 
 fn execute_search_text(input: &str) -> String {
     let request = parse_json_object(input);
-    let query = request
-        .as_ref()
-        .and_then(|object| field_string(object, &["query", "text", "needle"]))
-        .unwrap_or_else(|| input.trim().to_string());
-    if query.is_empty() {
-        return builtin_error("search_text", "缺少搜索关键词");
-    }
+    let query = match required_string_or_raw(
+        input,
+        request.as_ref(),
+        &["query", "text", "needle"],
+        "search_text",
+        "缺少搜索关键词",
+    ) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
     let root_input = request
         .as_ref()
         .and_then(|object| field_string(object, &["root", "path", "workspace"]))
@@ -325,14 +350,16 @@ fn execute_search_text(input: &str) -> String {
 
 fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
     let request = parse_json_object(input);
-    let command = request
-        .as_ref()
-        .and_then(|object| field_string(object, &["command", "script", "line"]))
-        .map(|command| command.trim().to_string())
-        .unwrap_or_else(|| input.trim().to_string());
-    if command.is_empty() {
-        return builtin_error("shell_exec", "缺少 shell 命令");
-    }
+    let command = match required_string_or_raw(
+        input,
+        request.as_ref(),
+        &["command", "script", "line"],
+        "shell_exec",
+        "缺少 shell 命令",
+    ) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
     if request
         .as_ref()
         .and_then(|object| field_bool(object, &["background", "long_running", "longRunning"]))
@@ -464,14 +491,16 @@ fn read_child_pipe<T: Read>(pipe: Option<T>) -> Vec<u8> {
 
 fn execute_process_launch(input: &str, context: &ToolExecutionContext) -> String {
     let request = parse_json_object(input);
-    let command = request
-        .as_ref()
-        .and_then(|object| field_string(object, &["command", "script", "line"]))
-        .map(|command| command.trim().to_string())
-        .unwrap_or_else(|| input.trim().to_string());
-    if command.is_empty() {
-        return builtin_error("process_launch", "缺少 shell 命令");
-    }
+    let command = match required_string_or_raw(
+        input,
+        request.as_ref(),
+        &["command", "script", "line"],
+        "process_launch",
+        "缺少 shell 命令",
+    ) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
     if let Some(error) = require_process_context("process_launch", context) {
         return error;
     }
@@ -1311,13 +1340,16 @@ fn execute_file_patch(input: &str) -> String {
 
 fn execute_file_remove(input: &str) -> String {
     let request = parse_json_object(input);
-    let path_input = request
-        .as_ref()
-        .and_then(|obj| field_string(obj, &["path", "file_path"]))
-        .unwrap_or_else(|| input.trim().to_string());
-    if path_input.is_empty() {
-        return builtin_error("file_remove", "缺少文件路径");
-    }
+    let path_input = match required_string_or_raw(
+        input,
+        request.as_ref(),
+        &["path", "file_path"],
+        "file_remove",
+        "缺少文件路径",
+    ) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
 
     let path = match resolve_path(&path_input) {
         Ok(p) => p,
@@ -1362,13 +1394,16 @@ fn execute_file_remove(input: &str) -> String {
 
 fn execute_file_mkdir(input: &str) -> String {
     let request = parse_json_object(input);
-    let path_input = request
-        .as_ref()
-        .and_then(|obj| field_string(obj, &["path", "dir_path"]))
-        .unwrap_or_else(|| input.trim().to_string());
-    if path_input.is_empty() {
-        return builtin_error("file_mkdir", "缺少目录路径");
-    }
+    let path_input = match required_string_or_raw(
+        input,
+        request.as_ref(),
+        &["path", "dir_path"],
+        "file_mkdir",
+        "缺少目录路径",
+    ) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
 
     let path = match resolve_path(&path_input) {
         Ok(p) => p,
@@ -1587,13 +1622,16 @@ fn execute_file_move(input: &str) -> String {
 
 fn execute_web_search(input: &str) -> String {
     let request = parse_json_object(input);
-    let query = request
-        .as_ref()
-        .and_then(|obj| field_string(obj, &["query", "q", "search"]))
-        .unwrap_or_else(|| input.trim().to_string());
-    if query.is_empty() {
-        return builtin_error("web_search", "缺少搜索关键词 query");
-    }
+    let query = match required_string_or_raw(
+        input,
+        request.as_ref(),
+        &["query", "q", "search"],
+        "web_search",
+        "缺少搜索关键词 query",
+    ) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
 
     let encoded = urlencoding::encode(&query);
     let search_url = format!("https://html.duckduckgo.com/html/?q={encoded}");
@@ -1700,13 +1738,16 @@ fn decode_html_entities(text: &str) -> String {
 
 fn execute_web_fetch(input: &str) -> String {
     let request = parse_json_object(input);
-    let url = request
-        .as_ref()
-        .and_then(|obj| field_string(obj, &["url", "href", "link"]))
-        .unwrap_or_else(|| input.trim().to_string());
-    if url.is_empty() {
-        return builtin_error("web_fetch", "缺少 URL");
-    }
+    let url = match required_string_or_raw(
+        input,
+        request.as_ref(),
+        &["url", "href", "link"],
+        "web_fetch",
+        "缺少 URL",
+    ) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
 
     let prompt = request
         .as_ref()
@@ -1931,13 +1972,16 @@ fn execute_mermaid_diagram(input: &str) -> String {
 
 fn execute_search_semantic(input: &str) -> String {
     let request = parse_json_object(input);
-    let query = request
-        .as_ref()
-        .and_then(|obj| field_string(obj, &["query"]))
-        .unwrap_or_else(|| input.trim().to_string());
-    if query.is_empty() {
-        return builtin_error("search_semantic", "缺少 query 字段");
-    }
+    let query = match required_string_or_raw(
+        input,
+        request.as_ref(),
+        &["query"],
+        "search_semantic",
+        "缺少 query 字段",
+    ) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
 
     let root = request
         .as_ref()
@@ -2169,18 +2213,20 @@ fn score_file_content(
 
 fn execute_knowledge_query(input: &str) -> String {
     let request = parse_json_object(input);
-    let query = request
-        .as_ref()
-        .and_then(|obj| field_string(obj, &["query", "q"]))
-        .unwrap_or_else(|| input.trim().to_string());
+    let query = match required_string_or_raw(
+        input,
+        request.as_ref(),
+        &["query", "q"],
+        "knowledge_query",
+        "缺少 query 字段",
+    ) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
     let category = request
         .as_ref()
         .and_then(|obj| field_string(obj, &["category"]))
         .unwrap_or_else(|| "all".to_string());
-
-    if query.is_empty() {
-        return builtin_error("knowledge_query", "缺少 query 字段");
-    }
 
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 

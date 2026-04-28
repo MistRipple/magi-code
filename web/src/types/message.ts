@@ -837,6 +837,7 @@ export interface PersistedNotification {
   category: 'incident' | 'audit';
   source?: string;
   actionRequired?: boolean;
+  countUnread: boolean;
   timestamp: number;
   read: boolean;
 }

@@ -1850,7 +1850,9 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
         assert_eq!(
-            body["currentSession"]["sessionId"].as_str().unwrap_or_default(),
+            body["currentSession"]["sessionId"]
+                .as_str()
+                .unwrap_or_default(),
             selected_session_id.as_str()
         );
         let session_ids = body["sessions"]

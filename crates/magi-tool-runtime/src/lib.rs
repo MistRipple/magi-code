@@ -605,10 +605,15 @@ impl ToolRegistry {
 
     pub fn execute_with_policy(
         &self,
-        input: ToolExecutionInput,
+        mut input: ToolExecutionInput,
         context: ToolExecutionContext,
         policy: &ToolExecutionPolicy,
     ) -> ToolExecutionOutput {
+        if input.tool_kind == ToolKind::Builtin
+            && let Some(canonical_name) = BuiltinToolName::from_str(input.tool_name.trim())
+        {
+            input.tool_name = canonical_name.as_str().to_string();
+        }
         if let Some(output) = self.enforce_execution_policy(&input, policy) {
             self.record_invocation(&input, &context, &output);
             return output;
@@ -1073,6 +1078,81 @@ mod tests {
 
         assert_eq!(output.status, ExecutionResultStatus::Failed);
         assert!(output.payload.contains("缺少 shell 命令"));
+    }
+
+    #[test]
+    fn builtin_required_fields_reject_empty_json_objects() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+
+        let cases = [
+            ("file_read", "缺少文件路径"),
+            ("search_text", "缺少搜索关键词"),
+            ("shell_exec", "缺少 shell 命令"),
+            ("process_launch", "缺少 shell 命令"),
+            ("file_remove", "缺少文件路径"),
+            ("file_mkdir", "缺少目录路径"),
+            ("web_search", "缺少搜索关键词 query"),
+            ("web_fetch", "缺少 URL"),
+            ("search_semantic", "缺少 query 字段"),
+            ("knowledge_query", "缺少 query 字段"),
+        ];
+
+        for (tool_name, expected_error) in cases {
+            let output = tool_registry.execute_with_policy(
+                ToolExecutionInput {
+                    tool_call_id: ToolCallId::new(format!("tool-call-empty-{tool_name}")),
+                    tool_name: tool_name.to_string(),
+                    tool_kind: ToolKind::Builtin,
+                    input: serde_json::json!({}).to_string(),
+                    approval_requirement: ApprovalRequirement::None,
+                    risk_level: RiskLevel::Low,
+                },
+                ToolExecutionContext::default(),
+                &ToolExecutionPolicy::default(),
+            );
+
+            assert_eq!(
+                output.status,
+                ExecutionResultStatus::Failed,
+                "{tool_name} should reject empty JSON object"
+            );
+            assert!(
+                output.payload.contains(expected_error),
+                "{tool_name} payload should contain {expected_error}, got {}",
+                output.payload
+            );
+        }
+    }
+
+    #[test]
+    fn registry_executes_builtin_aliases_via_canonical_name() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-shell-alias"),
+                tool_name: "shell".to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: "printf alias-ok".to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext::default(),
+            &ToolExecutionPolicy::default(),
+        );
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload should parse");
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        assert_eq!(payload["tool"], "shell_exec");
+        assert_eq!(payload["stdout"], "alias-ok");
+        let invocations = tool_registry.invocations();
+        assert_eq!(invocations[0].tool_name, "shell_exec");
     }
 
     #[test]

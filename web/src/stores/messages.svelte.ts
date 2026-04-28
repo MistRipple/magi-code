@@ -581,6 +581,7 @@ export interface Notification {
   category: NotificationCategory;
   source?: string;
   actionRequired?: boolean;
+  countUnread: boolean;
   timestamp: number;
   read: boolean;
 }
@@ -671,6 +672,9 @@ function normalizeSessionNotificationRecord(raw: unknown): Notification | null {
   const read = typeof item.read === 'boolean'
     ? item.read
     : Boolean(item.handled);
+  const countUnread = typeof item.countUnread === 'boolean'
+    ? item.countUnread
+    : category === 'incident';
   const title = typeof item.title === 'string' ? item.title : undefined;
   const source = typeof item.source === 'string' ? item.source : undefined;
   const actionRequired = typeof item.actionRequired === 'boolean' ? item.actionRequired : undefined;
@@ -682,6 +686,7 @@ function normalizeSessionNotificationRecord(raw: unknown): Notification | null {
     category,
     source,
     actionRequired,
+    countUnread,
     timestamp,
     read,
   };
@@ -3244,7 +3249,7 @@ export function clearPendingInteractions() {
 }
 
 function recomputeUnreadNotificationCount() {
-  unreadNotificationCount = notifications.filter((n) => !n.read).length;
+  unreadNotificationCount = notifications.filter((n) => n.countUnread && !n.read).length;
 }
 
 function resolveNotificationSessionId(sessionId: string | null | undefined): string {

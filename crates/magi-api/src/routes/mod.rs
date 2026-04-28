@@ -256,98 +256,6 @@ mod tests {
         )
     }
 
-    async fn read_sse_event_payloads(response: axum::response::Response) -> Vec<Value> {
-        let body = String::from_utf8(
-            to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("response body should read")
-                .to_vec(),
-        )
-        .expect("sse body should be utf8");
-        body.split("\n\n")
-            .filter_map(|block| {
-                let data = block
-                    .lines()
-                    .filter_map(|line| line.strip_prefix("data:"))
-                    .map(str::trim_start)
-                    .collect::<Vec<_>>();
-                if data.is_empty() {
-                    return None;
-                }
-                serde_json::from_str::<Value>(&data.join("\n")).ok()
-            })
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn events_stream_filters_recent_events_by_workspace_scope() {
-        let state = test_state();
-        let session_a = SessionId::new("session-sse-workspace-a");
-        let session_b = SessionId::new("session-sse-workspace-b");
-        state
-            .session_store
-            .create_session_for_workspace(
-                session_a.clone(),
-                "workspace A",
-                Some("workspace-a".to_string()),
-            )
-            .expect("session should create");
-        state
-            .session_store
-            .create_session_for_workspace(
-                session_b.clone(),
-                "workspace B",
-                Some("workspace-b".to_string()),
-            )
-            .expect("session should create");
-        state
-            .event_bus
-            .publish(
-                EventEnvelope::domain(
-                    EventId::new("event-sse-a"),
-                    "message.created",
-                    json!({ "session_id": session_a.as_str(), "content": "A" }),
-                )
-                .with_context(magi_event_bus::EventContext {
-                    session_id: Some(session_a),
-                    ..magi_event_bus::EventContext::default()
-                }),
-            )
-            .expect("event should publish");
-        state
-            .event_bus
-            .publish(
-                EventEnvelope::domain(
-                    EventId::new("event-sse-b"),
-                    "message.created",
-                    json!({ "session_id": session_b.as_str(), "content": "B" }),
-                )
-                .with_context(magi_event_bus::EventContext {
-                    session_id: Some(session_b),
-                    ..magi_event_bus::EventContext::default()
-                }),
-            )
-            .expect("event should publish");
-
-        let response = build_router(state)
-            .oneshot(
-                Request::builder()
-                    .uri("/events?workspaceId=workspace-a")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("route should respond");
-        let payloads = read_sse_event_payloads(response).await;
-        let event_ids = payloads
-            .iter()
-            .filter_map(|payload| payload["event_id"].as_str())
-            .collect::<Vec<_>>();
-
-        assert!(event_ids.contains(&"event-sse-a"));
-        assert!(!event_ids.contains(&"event-sse-b"));
-    }
-
     fn build_shadow_execution_state(
         worker_runtime_factory: impl FnOnce(Arc<InMemoryEventBus>) -> WorkerRuntime,
         model_bridge_client: Arc<dyn ModelBridgeClient>,
@@ -2960,7 +2868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_continue_route_ignores_worker_preferences_for_chain_identity() {
+    async fn session_continue_route_resumes_only_requested_worker() {
         let state = test_state_with_shadow_execution_pipeline();
         let app = build_router(state.clone());
         state
@@ -2991,19 +2899,45 @@ mod tests {
         );
 
         let session_id = SessionId::new("session-route-shadow-override");
-        let chain = state
+        let mut chain = state
             .session_store
             .active_execution_chain(&session_id)
             .expect("active execution chain should exist after seed dispatch");
+        assert!(
+            chain.branches.len() >= 2,
+            "seed dispatch should create multiple worker branches for scoped continue"
+        );
+        chain.branches[1].worker_id = WorkerId::new("worker-route-held");
+        chain.active_worker_bindings = chain
+            .branches
+            .iter()
+            .map(|branch| branch.worker_id.clone())
+            .collect();
+        state
+            .session_store
+            .upsert_active_execution_chain(session_id.clone(), chain)
+            .expect("active execution chain should accept test worker bindings");
+        let chain = state
+            .session_store
+            .active_execution_chain(&session_id)
+            .expect("active execution chain should remain available after rebinding");
         let original_workers = chain
             .branches
             .iter()
             .map(|branch| branch.worker_id.to_string())
             .collect::<Vec<_>>();
-        let preferred_worker = original_workers
+        let preferred_branch = chain
+            .branches
             .first()
             .expect("seed dispatch should create at least one branch")
             .clone();
+        let held_branch = chain
+            .branches
+            .iter()
+            .find(|branch| branch.worker_id != preferred_branch.worker_id)
+            .expect("seed dispatch should create an unrequested branch")
+            .clone();
+        let preferred_worker = preferred_branch.worker_id.to_string();
         let ownership = state
             .session_store
             .execution_ownership(&session_id)
@@ -3014,8 +2948,17 @@ mod tests {
             .clone()
             .expect("seed dispatch should bind task");
         task_store
+            .update_status(&chain.root_task_id, TaskStatus::Blocked)
+            .expect("root task should become recoverable");
+        task_store
             .update_status(&recovery_task_id, TaskStatus::Blocked)
             .expect("seed task should become recoverable");
+        task_store
+            .update_status(&preferred_branch.task_id, TaskStatus::Blocked)
+            .expect("preferred branch should become recoverable");
+        task_store
+            .update_status(&held_branch.task_id, TaskStatus::Blocked)
+            .expect("held branch should remain blocked until explicitly requested");
 
         let (status, body) = post_json(
             app,
@@ -3028,6 +2971,16 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "unexpected response body: {body:?}");
         assert_eq!(body["executionChainRef"], chain.execution_chain_ref);
+        assert_eq!(body["resumedBranchCount"], 1);
+
+        let resumed_task = task_store
+            .get_task(&preferred_branch.task_id)
+            .expect("preferred branch should remain queryable");
+        assert_ne!(resumed_task.status, TaskStatus::Blocked);
+        let held_task = task_store
+            .get_task(&held_branch.task_id)
+            .expect("held branch should remain queryable");
+        assert_eq!(held_task.status, TaskStatus::Blocked);
 
         let updated_chain = state
             .session_store

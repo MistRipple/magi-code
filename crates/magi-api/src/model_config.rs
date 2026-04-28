@@ -201,12 +201,24 @@ impl NormalizedModelConfig {
     }
 
     pub(crate) fn require_openai_models_listable(&self) -> Result<(), ApiError> {
+        if !self.uses_openai_compatible_provider() {
+            return Err(ApiError::InvalidInput(
+                "当前 provider 不支持自动获取模型列表，请手动填写模型名".to_string(),
+            ));
+        }
         if matches!(self.url_mode, ModelUrlMode::Full) {
             return Err(ApiError::InvalidInput(
                 "完整路径模式下不支持自动获取模型列表，请手动填写模型名".to_string(),
             ));
         }
         Ok(())
+    }
+
+    fn uses_openai_compatible_provider(&self) -> bool {
+        matches!(
+            self.provider_key().as_str(),
+            "openai" | "openai-compatible" | "openai_compatible"
+        )
     }
 
     pub(crate) fn openai_probe_url(&self) -> Result<String, ApiError> {
@@ -319,10 +331,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalized_model_config_preserves_fetch_models_contract() {
+    fn normalized_model_config_preserves_openai_fetch_models_contract() {
         let config = NormalizedModelConfig::from_settings_value(
             &json!({
-                "provider": "anthropic",
+                "provider": "openai",
                 "baseUrl": "http://127.0.0.1:8320/",
                 "apiKey": "test-key",
                 "urlMode": "standard"
@@ -330,7 +342,7 @@ mod tests {
             "openai",
         );
 
-        assert_eq!(config.provider(), "anthropic");
+        assert_eq!(config.provider(), "openai");
         assert_eq!(
             config.require_base_url().expect("baseUrl"),
             "http://127.0.0.1:8320/"
@@ -343,6 +355,29 @@ mod tests {
             config.openai_models_url().expect("models url"),
             "http://127.0.0.1:8320/v1/models"
         );
+    }
+
+    #[test]
+    fn normalized_model_config_rejects_non_openai_model_list_provider() {
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "provider": "anthropic",
+                "baseUrl": "https://api.anthropic.com",
+                "apiKey": "test-key",
+                "urlMode": "standard"
+            }),
+            "openai",
+        );
+
+        let error = config
+            .require_openai_models_listable()
+            .expect_err("anthropic provider does not expose OpenAI-compatible /models");
+        match error {
+            ApiError::InvalidInput(message) => {
+                assert!(message.contains("当前 provider 不支持自动获取模型列表"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
