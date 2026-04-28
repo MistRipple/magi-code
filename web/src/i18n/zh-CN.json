@@ -345,6 +345,7 @@
   "notification.clearAllTitle": "清空所有",
   "notification.closeTitle": "关闭",
   "notification.empty": "暂无通知",
+  "notification.loading": "正在加载通知",
   "notification.removeTitle": "删除",
   "notification.emptyFiltered": "当前筛选下暂无通知",
   "notification.filterAll": "全部",

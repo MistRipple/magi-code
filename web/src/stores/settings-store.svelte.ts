@@ -54,6 +54,7 @@ import { setEnabledAgents, getState } from "../stores/messages.svelte";
 import type { EnabledAgent } from "../stores/messages.svelte";
 import {
   isEngineEnabled,
+  resolveModelListFetchBlockReason,
   resolveEnabledRoleUsagesForEngine,
 } from "../shared/model-governance";
 
@@ -158,6 +159,17 @@ function notifySettingsSuccess(
     persistToCenter: true,
     countUnread: false,
     displayMode: options.displayMode || "toast",
+  });
+}
+
+function notifySettingsInfo(message: string): void {
+  addToast("info", message, undefined, {
+    category: "audit",
+    source: "settings-panel",
+    actionRequired: false,
+    persistToCenter: true,
+    countUnread: false,
+    displayMode: "toast",
   });
 }
 
@@ -1512,9 +1524,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   async function fetchModelList(target: "orch" | "comp" | "worker") {
     const key = target === "worker" ? workerModelTab : target;
-    fetchingModels[key] = true;
-    fetchingModels = { ...fetchingModels };
-
     let config: any;
     if (target === "worker") {
       config = workerConfigs[workerModelTab];
@@ -1525,10 +1534,21 @@ function createSettingsStore(props: { onClose?: () => void }) {
     }
 
     if (!config) {
-      fetchingModels[key] = false;
-      fetchingModels = { ...fetchingModels };
       return;
     }
+
+    const blockReason = resolveModelListFetchBlockReason(config);
+    if (blockReason) {
+      notifySettingsInfo(
+        blockReason === "full_url_mode"
+          ? i18n.t("config.toast.modelListUnsupportedInFullMode")
+          : i18n.t("config.toast.fillBaseUrlFirst"),
+      );
+      return;
+    }
+
+    fetchingModels[key] = true;
+    fetchingModels = { ...fetchingModels };
 
     try {
       const payload =

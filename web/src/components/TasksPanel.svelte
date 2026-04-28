@@ -553,7 +553,7 @@
     if (!sessionId || !rootTaskId) return;
     await runTaskAction('resume', async () => {
       const client = createClient();
-      await client.resumeTask({ taskId: rootTaskId, sessionId });
+      await client.continueSession({ sessionId });
       deliveryPackage = null;
       selectedTaskReference = null;
       await refreshTaskProjection(sessionId);

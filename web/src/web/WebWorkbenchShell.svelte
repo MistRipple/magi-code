@@ -83,6 +83,13 @@
       return;
     }
 
+    const bootstrapSessionId = typeof messagesState.currentSessionId === 'string'
+      ? messagesState.currentSessionId.trim()
+      : '';
+    if (!bootstrapSessionId) {
+      return;
+    }
+
     const currentSessions = Array.isArray(messagesState.sessions) ? messagesState.sessions : [];
 
     const existingSessions = sessionsByWorkspace[authoritativeWorkspaceId] ?? [];
@@ -107,10 +114,7 @@
       return;
     }
 
-    const bootstrapSessionId = typeof messagesState.currentSessionId === 'string'
-      ? messagesState.currentSessionId.trim()
-      : '';
-    if (!bootstrapSessionId || bootstrapSessionId === currentSessionId) {
+    if (bootstrapSessionId === currentSessionId) {
       return;
     }
     const belongsToSelectedWorkspace = (sessionsByWorkspace[selectedWorkspaceId] ?? [])

@@ -57,11 +57,18 @@ export interface TaskInterruptResponseDto {
   requestedAt: number;
 }
 
-export interface TaskResumeResponseDto {
-  resumed: boolean;
+export interface SessionInterruptRequestDto {
+  workspaceId?: string | null;
+  sessionId?: string | null;
+}
+
+export interface SessionInterruptResponseDto {
+  interrupted: boolean;
+  sessionId: string;
+  turnId?: string | null;
   eventId: string;
   requestedAt: number;
-  rootTaskId: string;
+  removedTimelineEntryIds: string[];
 }
 
 export interface ServiceInfoDto {
@@ -765,10 +772,12 @@ export interface SessionNotificationsResponseDto {
 }
 
 export interface ClearNotificationsRequestDto {
+  workspaceId?: string | null;
   sessionId?: string | null;
 }
 
 export interface RemoveNotificationRequestDto {
+  workspaceId?: string | null;
   sessionId?: string | null;
   notificationId: string;
 }

@@ -66,6 +66,8 @@ import type {
   SessionContinueResponseDto,
   SessionCloseRequestDto,
   SessionDeleteRequestDto,
+  SessionInterruptRequestDto,
+  SessionInterruptResponseDto,
   SessionNotificationsResponseDto,
   SessionRenameRequestDto,
   SessionStatsResponseDto,
@@ -82,7 +84,6 @@ import type {
   TaskInterruptResponseDto,
   TaskProjectionDto,
   TaskReplanResponseDto,
-  TaskResumeResponseDto,
   UpdatedResponseDto,
   UpdateKnowledgeRequestDto,
   VersionHandshakeDto,
@@ -166,6 +167,12 @@ export class RustDaemonClient {
     return this.postJson<SessionContinueResponseDto>('/api/session/continue', request);
   }
 
+  public async interruptSession(
+    request: SessionInterruptRequestDto = {},
+  ): Promise<SessionInterruptResponseDto> {
+    return this.postJson<SessionInterruptResponseDto>('/api/session/interrupt', request);
+  }
+
   public async interruptTask(
     request: unknown,
   ): Promise<TaskInterruptResponseDto> {
@@ -176,12 +183,6 @@ export class RustDaemonClient {
     request: { taskId: string; sessionId?: string | null },
   ): Promise<TaskInterruptResponseDto> {
     return this.interruptTask(request);
-  }
-
-  public async resumeTask(
-    request: { taskId: string; sessionId?: string | null },
-  ): Promise<TaskResumeResponseDto> {
-    return this.postJson<TaskResumeResponseDto>('/api/task/resume', request);
   }
 
   // ─── Session management ───────────────────────────────────────────
@@ -210,15 +211,27 @@ export class RustDaemonClient {
 
   public async fetchNotifications(
     sessionId?: string,
+    workspaceId?: string,
   ): Promise<SessionNotificationsResponseDto> {
-    const params = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : '';
-    return this.getJson<SessionNotificationsResponseDto>(`/api/session/notifications${params}`);
+    const params = new URLSearchParams();
+    if (workspaceId) {
+      params.set('workspaceId', workspaceId);
+    }
+    if (sessionId) {
+      params.set('sessionId', sessionId);
+    }
+    const query = params.toString();
+    return this.getJson<SessionNotificationsResponseDto>(
+      `/api/session/notifications${query ? `?${query}` : ''}`,
+    );
   }
 
-  public async markAllNotificationsRead(): Promise<SessionNotificationsResponseDto> {
+  public async markAllNotificationsRead(
+    request?: ClearNotificationsRequestDto,
+  ): Promise<SessionNotificationsResponseDto> {
     return this.postJson<SessionNotificationsResponseDto>(
       '/api/session/notifications/mark-all-read',
-      {},
+      request ?? {},
     );
   }
 

@@ -30,6 +30,45 @@ export interface ModelStatusLike {
   status?: string;
 }
 
+export type ModelListFetchBlockReason =
+  | 'full_url_mode'
+  | 'missing_base_url_or_api_key';
+
+export interface ModelListFetchConfigLike {
+  baseUrl?: unknown;
+  apiKey?: unknown;
+  urlMode?: unknown;
+}
+
+function trimmedConfigString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+export function resolveModelListFetchBlockReason(
+  config: ModelListFetchConfigLike | null | undefined,
+): ModelListFetchBlockReason | null {
+  if (!config) {
+    return 'missing_base_url_or_api_key';
+  }
+
+  const urlMode = trimmedConfigString(config.urlMode).toLowerCase();
+  if (urlMode === 'full') {
+    return 'full_url_mode';
+  }
+
+  if (!trimmedConfigString(config.baseUrl) || !trimmedConfigString(config.apiKey)) {
+    return 'missing_base_url_or_api_key';
+  }
+
+  return null;
+}
+
+export function canFetchModelList(
+  config: ModelListFetchConfigLike | null | undefined,
+): boolean {
+  return resolveModelListFetchBlockReason(config) === null;
+}
+
 export function isRegistryEngineEnabled(engine: Pick<ModelEngineLike, 'llm'> | null | undefined): boolean {
   if (!engine?.llm || typeof engine.llm !== 'object') {
     return false;

@@ -1555,6 +1555,9 @@ function buildTimelineEntryArtifacts(
     }
     const timestamp = normalizeNumber(entry.occurredAt, Date.now());
     const kind = normalizeString(entry.kind);
+    if (kind !== 'UserMessage' && kind !== 'AssistantMessage') {
+      continue;
+    }
     let role: 'user' | 'assistant' | 'system' = 'system';
     let type: 'user_input' | 'text' | 'system-notice' = 'system-notice';
     if (kind === 'UserMessage') {
@@ -1785,12 +1788,41 @@ function compareProjectionArtifactOrder(
 function resolveProjectionArtifactToolCallId(
   artifact: TimelineProjectionArtifact,
 ): string {
-  const message = artifact.message as { metadata?: Record<string, unknown> } | undefined;
-  const metadata = message?.metadata;
+  const metadata = resolveProjectionArtifactMetadata(artifact);
   if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
     return '';
   }
   return normalizeString(metadata.toolCallId || metadata.tool_call_id);
+}
+
+function resolveProjectionArtifactMetadata(
+  artifact: TimelineProjectionArtifact,
+): Record<string, unknown> | undefined {
+  const metadata = (artifact.message as { metadata?: Record<string, unknown> } | undefined)?.metadata;
+  return metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+    ? metadata
+    : undefined;
+}
+
+function resolveCanonicalAssistantResponseKey(artifact: TimelineProjectionArtifact): string {
+  const metadata = resolveProjectionArtifactMetadata(artifact);
+  const turnId = normalizeString(metadata?.turnId);
+  const turnItemKind = normalizeString(metadata?.turnItemKind);
+  if (
+    !turnId
+    || (turnItemKind !== 'assistant_stream'
+      && turnItemKind !== 'assistant_final'
+      && turnItemKind !== 'assistant_error')
+  ) {
+    return '';
+  }
+  const laneScope = normalizeString(metadata?.laneId)
+    || normalizeString(metadata?.roleId)
+    || normalizeString(metadata?.workerId)
+    || normalizeString(artifact.laneId)
+    || normalizeString(artifact.worker)
+    || 'thread';
+  return `turn-response:${turnId}:${laneScope}`;
 }
 
 function projectionArtifactDedupKey(artifact: TimelineProjectionArtifact): string {
@@ -1798,10 +1830,25 @@ function projectionArtifactDedupKey(artifact: TimelineProjectionArtifact): strin
   if (toolCallId) {
     return `tool:${toolCallId}`;
   }
+  const assistantResponseKey = resolveCanonicalAssistantResponseKey(artifact);
+  if (assistantResponseKey) {
+    return assistantResponseKey;
+  }
   const timelineAlias = (artifact.messageIds || [])
     .map((messageId) => normalizeString(messageId))
     .find((messageId) => messageId.startsWith('rust-timeline:'));
   return timelineAlias || artifact.artifactId;
+}
+
+function projectionArtifactTerminalityScore(artifact: TimelineProjectionArtifact): number {
+  const turnItemKind = normalizeString(resolveProjectionArtifactMetadata(artifact)?.turnItemKind);
+  if (turnItemKind === 'assistant_final' || turnItemKind === 'assistant_error') {
+    return 30;
+  }
+  if (turnItemKind === 'assistant_stream') {
+    return 10;
+  }
+  return 0;
 }
 
 function projectionArtifactPreferenceScore(artifact: TimelineProjectionArtifact): number {
@@ -1809,6 +1856,7 @@ function projectionArtifactPreferenceScore(artifact: TimelineProjectionArtifact)
   if (artifact.artifactId.startsWith('turn:')) {
     score += 100;
   }
+  score += projectionArtifactTerminalityScore(artifact);
   score += normalizeNumber(artifact.message?.blocks?.length, 0);
   score += normalizeNumber(artifact.executionItems?.length, 0);
   score += normalizeString(artifact.message?.content).trim().length > 0 ? 5 : 0;
@@ -1905,22 +1953,6 @@ function isCanonicalTurnArtifact(artifact: TimelineProjectionArtifact): boolean 
   return artifact.artifactId.startsWith('turn:') && Boolean(turnId);
 }
 
-function isCanonicalTurnUserArtifact(artifact: TimelineProjectionArtifact): boolean {
-  if (!isCanonicalTurnArtifact(artifact)) {
-    return false;
-  }
-  const metadata = artifact.message?.metadata;
-  const kind = metadata && typeof metadata === 'object' && !Array.isArray(metadata)
-    ? normalizeString((metadata as Record<string, unknown>).turnItemKind)
-    : '';
-  return kind === 'user_message';
-}
-
-function isLegacyTimelineUserArtifact(artifact: TimelineProjectionArtifact): boolean {
-  return artifact.artifactId.startsWith('rust-timeline:')
-    && (artifact.message?.role === 'user' || artifact.message?.type === 'user_input');
-}
-
 function filterArtifactsCoveredByCanonicalTurnArtifacts(
   artifacts: TimelineProjectionArtifact[],
 ): TimelineProjectionArtifact[] {
@@ -1929,13 +1961,9 @@ function filterArtifactsCoveredByCanonicalTurnArtifacts(
     return artifacts;
   }
   const knownIds = collectProjectionArtifactIdentityIds(canonicalArtifacts);
-  const hasCanonicalUserArtifacts = canonicalArtifacts.some(isCanonicalTurnUserArtifact);
   return artifacts.filter((artifact) => {
     if (isCanonicalTurnArtifact(artifact)) {
       return true;
-    }
-    if (hasCanonicalUserArtifacts && isLegacyTimelineUserArtifact(artifact)) {
-      return false;
     }
     return !projectionArtifactHasKnownIdentity(artifact, knownIds);
   });
@@ -2548,12 +2576,8 @@ function buildTimelineProjection(
   const timelineArtifacts = buildTimelineEntryArtifacts(sessionId, payload.timeline);
   const currentTurnArtifacts = buildCurrentTurnArtifacts(sessionId, payload.runtimeReadModel, generatedAt);
   const currentTurnIdentityIds = collectProjectionArtifactIdentityIds(currentTurnArtifacts);
-  const currentTurnHasCanonicalUser = currentTurnArtifacts.some(isCanonicalTurnUserArtifact);
   const visibleTimelineArtifacts = timelineArtifacts.filter((artifact) => {
     if (projectionArtifactHasKnownIdentity(artifact, currentTurnIdentityIds)) {
-      return false;
-    }
-    if (currentTurnHasCanonicalUser && isLegacyTimelineUserArtifact(artifact)) {
       return false;
     }
     return true;

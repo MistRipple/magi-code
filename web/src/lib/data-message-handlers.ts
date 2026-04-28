@@ -37,6 +37,7 @@ import {
   settleProcessingAfterResponseCompletion,
   settleAuthoritativeIdleState,
   applySessionNotifications,
+  applySessionNotificationsStatus,
   batchWebviewStatePersistence,
   setEnabledAgents,
   setSessionHistoryState,
@@ -454,6 +455,10 @@ export function handleUnifiedData(standard: StandardMessage) {
       }));
       break;
 
+    case 'sessionNotificationsStatus':
+      applySessionNotificationsStatus(payload);
+      break;
+
     case 'planLedgerLoaded':
     case 'planLedgerUpdated':
       applyPlanLedgerSnapshot(payload);
@@ -778,6 +783,10 @@ function hasActiveLocalTurn(): boolean {
   return messagesState.pendingRequests.size > 0 || messagesState.activeMessageIds.size > 0;
 }
 
+function hasPendingLocalRequest(): boolean {
+  return messagesState.pendingRequests.size > 0;
+}
+
 function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): void {
   const currentSessionId = getState().currentSessionId || '';
   if (!sessionId || !currentSessionId || currentSessionId !== sessionId) {
@@ -832,9 +841,6 @@ function handleTimelineProjectionUpdated(message: ClientBridgeMessage) {
   if (!currentSessionId || currentSessionId !== sessionId) {
     return;
   }
-  if (hasActiveLocalTurn()) {
-    return;
-  }
   const restored = restoreTimelineProjectionIfNewer(timelineProjection, {
     source: 'authoritative',
   });
@@ -877,9 +883,11 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
       messagesState.currentWorkspacePath = workspacePath || messagesState.currentWorkspacePath;
       const hadLiveTurnBeforeSnapshot = hasActiveLocalTurn();
+      const hadPendingLocalRequestBeforeSnapshot = hasPendingLocalRequest();
       const authoritativeSnapshotIsIdle = state.isProcessing !== true
         && state.processingState?.isProcessing !== true;
       const preserveLocalTurnDuringStaleIdle = hadLiveTurnBeforeSnapshot
+        && hadPendingLocalRequestBeforeSnapshot
         && authoritativeSnapshotIsIdle;
 
       handleStateUpdate({
@@ -907,10 +915,10 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         isLoadingBefore: false,
       });
 
-      if (!hadLiveTurnBeforeSnapshot) {
-        prependTimelineProjectionPage(sessionId, timelineProjection);
-        reconcileRequestBindingsFromAuthoritativeThread(sessionId);
-      }
+      // 权威投影始终回灌到时间线：本地活跃轮次只能保留处理态，
+      // 不能阻止 backend 已完成的 tool / assistant 结果合并回当前视图。
+      prependTimelineProjectionPage(sessionId, timelineProjection);
+      reconcileRequestBindingsFromAuthoritativeThread(sessionId);
       if (authoritativeSnapshotIsIdle && !hadLiveTurnBeforeSnapshot) {
         settleAuthoritativeIdleState();
       }

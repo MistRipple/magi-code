@@ -97,6 +97,14 @@
     if (!message) {
       return 0;
     }
+    const processingStartAt = messagesState.thinkingStartAt;
+    if (
+      typeof processingStartAt === 'number'
+      && Number.isFinite(processingStartAt)
+      && processingStartAt > 0
+    ) {
+      return processingStartAt;
+    }
     const timestamp = message.timestamp;
     if (typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0) {
       return timestamp;

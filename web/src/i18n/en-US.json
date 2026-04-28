@@ -345,6 +345,7 @@
   "notification.clearAllTitle": "Clear All",
   "notification.closeTitle": "Close",
   "notification.empty": "No Notifications",
+  "notification.loading": "Loading notifications",
   "notification.removeTitle": "Delete",
   "notification.emptyFiltered": "No notifications in this filter",
   "notification.filterAll": "All",

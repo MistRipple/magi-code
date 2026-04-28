@@ -473,7 +473,7 @@ async function parseAgentJson<T>(response: Response, action: string): Promise<T>
 
   const contentType = response.headers.get('content-type') || '';
   if (!contentType.includes('application/json')) {
-    throw new Error('` + i18n.t("bridge.notConnected") + `');
+    throw new Error(i18n.t('bridge.notConnected'));
   }
 
   return await response.json() as T;
@@ -633,7 +633,7 @@ async function postBoundJson<T>(
     return parseAgentJson<T>(response, action);
   } catch (error) {
     if (error instanceof TypeError) {
-      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
+      throw new Error(i18n.t('bridge.agentUnreachable'));
     }
     throw error;
   }
@@ -650,7 +650,7 @@ export async function listAgentWorkspaces(): Promise<AgentWorkspaceSummary[]> {
     );
   } catch (error) {
     if (error instanceof TypeError) {
-      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
+      throw new Error(i18n.t('bridge.agentUnreachable'));
     }
     throw error;
   }
@@ -675,7 +675,7 @@ export async function registerAgentWorkspace(rootPath: string): Promise<AgentWor
     return [];
   } catch (error) {
     if (error instanceof TypeError) {
-      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
+      throw new Error(i18n.t('bridge.agentUnreachable'));
     }
     throw error;
   }
@@ -701,7 +701,7 @@ export async function removeAgentWorkspace(workspaceId: string, workspacePath: s
     return [];
   } catch (error) {
     if (error instanceof TypeError) {
-      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
+      throw new Error(i18n.t('bridge.agentUnreachable'));
     }
     throw error;
   }
@@ -713,7 +713,7 @@ export async function pickAgentWorkspace(): Promise<AgentWorkspacePickResult> {
     return await parseAgentJson<AgentWorkspacePickResult>(response, 'pick workspace');
   } catch (error) {
     if (error instanceof TypeError) {
-      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
+      throw new Error(i18n.t('bridge.agentUnreachable'));
     }
     throw error;
   }
@@ -789,15 +789,15 @@ export async function listAgentDirectory(dirPath?: string, showHidden?: boolean)
     return result;
   } catch (error) {
     if (error instanceof TypeError) {
-      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
+      throw new Error(i18n.t('bridge.agentUnreachable'));
     }
     if (error instanceof AgentApiError) {
       const message = error.message.trim();
       if (message.includes('ENOENT')) {
-        throw new Error('` + i18n.t("bridge.dirNotFound") + `');
+        throw new Error(i18n.t('bridge.dirNotFound'));
       }
       if (message.includes('EACCES') || message.includes('EPERM')) {
-        throw new Error('` + i18n.t("bridge.dirNoAccess") + `');
+        throw new Error(i18n.t('bridge.dirNoAccess'));
       }
     }
     throw error;
@@ -833,7 +833,7 @@ export async function getWorkspaceSessions(
     };
   } catch (error) {
     if (error instanceof TypeError) {
-      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
+      throw new Error(i18n.t('bridge.agentUnreachable'));
     }
     throw error;
   }
@@ -860,7 +860,7 @@ export async function loadAgentSessionTimelinePage(
     return await parseAgentJson<MessagesResponseDto>(response, 'load session timeline');
   } catch (error) {
     if (error instanceof TypeError) {
-      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
+      throw new Error(i18n.t('bridge.agentUnreachable'));
     }
     throw error;
   }
@@ -989,7 +989,7 @@ export async function submitSessionTurn(
     };
   } catch (error) {
     if (error instanceof TypeError) {
-      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
+      throw new Error(i18n.t('bridge.agentUnreachable'));
     }
     throw error;
   }
@@ -999,6 +999,17 @@ export async function interruptAgentTask(
   payload: { taskId: string },
 ): Promise<Record<string, unknown>> {
   return await postBoundJson<Record<string, unknown>>('/api/task/interrupt', payload, 'interrupt task');
+}
+
+export async function interruptAgentSession(
+  sessionId?: string,
+): Promise<Record<string, unknown>> {
+  const normalizedSessionId = sessionId?.trim() || '';
+  return await postBoundJson<Record<string, unknown>>(
+    '/api/session/interrupt',
+    normalizedSessionId ? { sessionId: normalizedSessionId } : {},
+    'interrupt session turn',
+  );
 }
 
 export async function clearAgentAllTasks(): Promise<Record<string, unknown>> {
@@ -1033,7 +1044,7 @@ export async function getAgentSettingsBootstrap(
     return normalizeSettingsBootstrapPayload(payload);
   } catch (error) {
     if (error instanceof TypeError) {
-      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
+      throw new Error(i18n.t('bridge.agentUnreachable'));
     }
     throw error;
   }
@@ -1059,7 +1070,7 @@ export async function getAgentExecutionStats(): Promise<AgentExecutionStatsPaylo
     return await parseAgentJson<AgentExecutionStatsPayload>(response, 'load execution stats');
   } catch (error) {
     if (error instanceof TypeError) {
-      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
+      throw new Error(i18n.t('bridge.agentUnreachable'));
     }
     throw error;
   }
@@ -1347,7 +1358,7 @@ export async function getAgentChangeDiff(filePath: string): Promise<AgentChangeD
     return await parseAgentJson<AgentChangeDiffPayload>(response, 'load change diff');
   } catch (error) {
     if (error instanceof TypeError) {
-      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
+      throw new Error(i18n.t('bridge.agentUnreachable'));
     }
     throw error;
   }
@@ -1360,7 +1371,7 @@ export async function getAgentFilePreview(filePath: string): Promise<AgentFilePr
     return await parseAgentJson<AgentFilePreviewPayload>(response, 'load file preview');
   } catch (error) {
     if (error instanceof TypeError) {
-      throw new Error('` + i18n.t("bridge.agentUnreachable") + `');
+      throw new Error(i18n.t('bridge.agentUnreachable'));
     }
     throw error;
   }

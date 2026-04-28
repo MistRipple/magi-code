@@ -5,6 +5,7 @@
 
 import type {
   Message,
+  ContentBlock,
   AgentOutputs,
   AgentId,
   TimelineExecutionItem,
@@ -85,6 +86,15 @@ export interface TaskComposerDraft {
   text: string;
 }
 
+type NotificationCenterOperation = 'load' | 'mark-read' | 'clear' | 'remove';
+
+export interface NotificationCenterStatus {
+  isLoading: boolean;
+  operation: NotificationCenterOperation | null;
+  error: string | null;
+  updatedAt: number | null;
+}
+
 // ============ 状态定义 ============
 // 🔧 修复：使用对象属性模式确保跨模块响应式正常工作
 // Svelte 5 官方推荐：导出对象并修改其属性，而非重新赋值独立变量
@@ -122,6 +132,12 @@ export const messagesState = $state({
   },
   queuedMessages: [] as QueuedMessage[],
   taskComposerDraft: null as TaskComposerDraft | null,
+  notificationCenter: {
+    isLoading: false,
+    operation: null,
+    error: null,
+    updatedAt: null,
+  } as NotificationCenterStatus,
 
   // 处理状态
   isProcessing: false,
@@ -1306,6 +1322,328 @@ function canonicalizeTimelineProjection(
   };
 }
 
+function normalizeProjectionIdentity(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function resolveProjectionArtifactMetadata(
+  artifact: TimelineProjectionArtifact,
+): Record<string, unknown> | undefined {
+  return resolveMessageMetadataRecord(artifact.message);
+}
+
+function resolveCanonicalAssistantResponseKey(artifact: TimelineProjectionArtifact): string {
+  const metadata = resolveProjectionArtifactMetadata(artifact);
+  const turnId = normalizeProjectionIdentity(metadata?.turnId);
+  const turnItemKind = normalizeProjectionIdentity(metadata?.turnItemKind);
+  if (
+    !turnId
+    || (turnItemKind !== 'assistant_stream'
+      && turnItemKind !== 'assistant_final'
+      && turnItemKind !== 'assistant_error')
+  ) {
+    return '';
+  }
+  const laneScope = normalizeProjectionIdentity(metadata?.laneId)
+    || normalizeProjectionIdentity(metadata?.roleId)
+    || normalizeProjectionIdentity(metadata?.workerId)
+    || normalizeProjectionIdentity(artifact.laneId)
+    || normalizeProjectionIdentity(artifact.worker)
+    || 'thread';
+  return `turn-response:${turnId}:${laneScope}`;
+}
+
+function collectProjectionArtifactIdentityKeys(artifact: TimelineProjectionArtifact): string[] {
+  const keys = new Set<string>();
+  const add = (value: unknown): void => {
+    const normalized = normalizeProjectionIdentity(value);
+    if (normalized) {
+      keys.add(normalized);
+    }
+  };
+
+  add(artifact.artifactId);
+  add(artifact.cardId);
+  add(artifact.lifecycleKey);
+  add(artifact.message?.id);
+  add(resolveCanonicalAssistantResponseKey(artifact));
+  for (const messageId of ensureArray<string>(artifact.messageIds)) {
+    add(messageId);
+  }
+  for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
+    add(item.itemId);
+    add(item.message?.id);
+    for (const messageId of ensureArray<string>(item.messageIds)) {
+      add(messageId);
+    }
+  }
+  return Array.from(keys);
+}
+
+function projectionArtifactTerminalityScore(artifact: TimelineProjectionArtifact): number {
+  const turnItemKind = normalizeProjectionIdentity(resolveProjectionArtifactMetadata(artifact)?.turnItemKind);
+  let turnScore = 0;
+  if (turnItemKind === 'assistant_final' || turnItemKind === 'assistant_error') {
+    turnScore = 30;
+  } else if (turnItemKind === 'assistant_stream') {
+    turnScore = 10;
+  }
+  const toolScore = Math.max(
+    projectionToolBlockTerminalityScore(artifact.message?.blocks),
+    ...ensureArray<TimelineExecutionItem>(artifact.executionItems)
+      .map((item) => projectionToolBlockTerminalityScore(item.message?.blocks)),
+  );
+  return Math.max(turnScore, toolScore);
+}
+
+function projectionToolBlockTerminalityScore(blocks: ContentBlock[] | undefined): number {
+  return ensureArray<ContentBlock>(blocks).reduce((score, block) => {
+    const status = block.type === 'tool_call' || block.type === 'tool_result'
+      ? block.toolCall?.status
+      : undefined;
+    switch (status) {
+      case 'success':
+      case 'error':
+        return Math.max(score, 25);
+      case 'running':
+        return Math.max(score, 8);
+      case 'pending':
+        return Math.max(score, 4);
+      default:
+        return score;
+    }
+  }, 0);
+}
+
+function compareProjectionArtifactFreshness(
+  left: TimelineProjectionArtifact,
+  right: TimelineProjectionArtifact,
+): number {
+  const leftTerminality = projectionArtifactTerminalityScore(left);
+  const rightTerminality = projectionArtifactTerminalityScore(right);
+  if (leftTerminality !== rightTerminality) {
+    return leftTerminality - rightTerminality;
+  }
+  const leftVersion = Math.max(
+    left.latestEventSeq || 0,
+    left.artifactVersion || 0,
+    left.message?.updatedAt || 0,
+    left.message?.timestamp || 0,
+  );
+  const rightVersion = Math.max(
+    right.latestEventSeq || 0,
+    right.artifactVersion || 0,
+    right.message?.updatedAt || 0,
+    right.message?.timestamp || 0,
+  );
+  if (leftVersion !== rightVersion) {
+    return leftVersion - rightVersion;
+  }
+  const leftContentWeight = (left.message?.content || '').length + ensureArray(left.message?.blocks).length;
+  const rightContentWeight = (right.message?.content || '').length + ensureArray(right.message?.blocks).length;
+  return leftContentWeight - rightContentWeight;
+}
+
+function mergeProjectionExecutionItems(
+  left: TimelineExecutionItem[] | undefined,
+  right: TimelineExecutionItem[] | undefined,
+): TimelineExecutionItem[] {
+  const merged: TimelineExecutionItem[] = [];
+  const itemIndexByKey = new Map<string, number>();
+
+  const appendItem = (item: TimelineExecutionItem): void => {
+    const normalizedItem = normalizeTimelineExecutionItem(item);
+    const keys = new Set<string>();
+    const add = (value: unknown): void => {
+      const normalized = normalizeProjectionIdentity(value);
+      if (normalized) {
+        keys.add(normalized);
+      }
+    };
+    add(normalizedItem.itemId);
+    add(normalizedItem.message?.id);
+    for (const messageId of ensureArray<string>(normalizedItem.messageIds)) {
+      add(messageId);
+    }
+    const existingIndex = Array.from(keys)
+      .map((key) => itemIndexByKey.get(key))
+      .find((index): index is number => typeof index === 'number');
+    if (existingIndex === undefined) {
+      const nextIndex = merged.length;
+      merged.push(normalizedItem);
+      for (const key of keys) {
+        itemIndexByKey.set(key, nextIndex);
+      }
+      return;
+    }
+
+    const existing = merged[existingIndex];
+    const preferred = compareProjectionArtifactFreshness(
+      {
+        artifactId: existing.itemId,
+        kind: 'message',
+        displayOrder: existing.itemOrder,
+        anchorEventSeq: existing.anchorEventSeq,
+        latestEventSeq: existing.latestEventSeq,
+        cardStreamSeq: existing.cardStreamSeq,
+        timestamp: existing.timestamp,
+        threadVisible: existing.threadVisible,
+        workerTabs: existing.workerTabs,
+        messageIds: existing.messageIds,
+        message: existing.message,
+      },
+      {
+        artifactId: normalizedItem.itemId,
+        kind: 'message',
+        displayOrder: normalizedItem.itemOrder,
+        anchorEventSeq: normalizedItem.anchorEventSeq,
+        latestEventSeq: normalizedItem.latestEventSeq,
+        cardStreamSeq: normalizedItem.cardStreamSeq,
+        timestamp: normalizedItem.timestamp,
+        threadVisible: normalizedItem.threadVisible,
+        workerTabs: normalizedItem.workerTabs,
+        messageIds: normalizedItem.messageIds,
+        message: normalizedItem.message,
+      },
+    ) >= 0 ? existing : normalizedItem;
+    merged[existingIndex] = normalizeTimelineExecutionItem({
+      ...preferred,
+      anchorEventSeq: Math.min(
+        existing.anchorEventSeq || normalizedItem.anchorEventSeq || 0,
+        normalizedItem.anchorEventSeq || existing.anchorEventSeq || 0,
+      ),
+      latestEventSeq: Math.max(existing.latestEventSeq || 0, normalizedItem.latestEventSeq || 0),
+      messageIds: Array.from(new Set([
+        ...ensureArray<string>(existing.messageIds),
+        ...ensureArray<string>(normalizedItem.messageIds),
+      ])),
+      workerTabs: Array.from(new Set([
+        ...normalizeWorkerTabList(existing.workerTabs),
+        ...normalizeWorkerTabList(normalizedItem.workerTabs),
+      ])),
+    });
+    for (const key of keys) {
+      itemIndexByKey.set(key, existingIndex);
+    }
+  };
+
+  for (const item of ensureArray<TimelineExecutionItem>(left)) appendItem(item);
+  for (const item of ensureArray<TimelineExecutionItem>(right)) appendItem(item);
+
+  return merged.sort((a, b) => compareTimelineSemanticOrder(executionItemToOrderInput(a), executionItemToOrderInput(b)));
+}
+
+function mergeProjectionArtifact(
+  existing: TimelineProjectionArtifact,
+  incoming: TimelineProjectionArtifact,
+): TimelineProjectionArtifact {
+  const preferred = compareProjectionArtifactFreshness(existing, incoming) >= 0 ? existing : incoming;
+  return {
+    ...preferred,
+    displayOrder: Math.min(
+      existing.displayOrder || incoming.displayOrder || 0,
+      incoming.displayOrder || existing.displayOrder || 0,
+    ),
+    artifactVersion: Math.max(existing.artifactVersion || 0, incoming.artifactVersion || 0) || undefined,
+    anchorEventSeq: Math.min(
+      existing.anchorEventSeq || incoming.anchorEventSeq || 0,
+      incoming.anchorEventSeq || existing.anchorEventSeq || 0,
+    ),
+    latestEventSeq: Math.max(existing.latestEventSeq || 0, incoming.latestEventSeq || 0),
+    timestamp: Math.min(
+      existing.timestamp || incoming.timestamp || 0,
+      incoming.timestamp || existing.timestamp || 0,
+    ),
+    threadVisible: existing.threadVisible || incoming.threadVisible,
+    workerTabs: Array.from(new Set([
+      ...normalizeWorkerTabList(existing.workerTabs),
+      ...normalizeWorkerTabList(incoming.workerTabs),
+    ])),
+    messageIds: Array.from(new Set([
+      ...ensureArray<string>(existing.messageIds),
+      ...ensureArray<string>(incoming.messageIds),
+    ])),
+    executionItems: mergeProjectionExecutionItems(existing.executionItems, incoming.executionItems),
+  };
+}
+
+function compareProjectionArtifactsForPageMerge(
+  left: TimelineProjectionArtifact,
+  right: TimelineProjectionArtifact,
+): number {
+  const leftMetadata = resolveMessageMetadataRecord(left.message);
+  const rightMetadata = resolveMessageMetadataRecord(right.message);
+  const semanticOrder = compareTimelineSemanticOrder(
+    {
+      turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(leftMetadata),
+      itemSeq: left.cardStreamSeq || resolveTimelineItemSeqFromMetadata(leftMetadata),
+      displayOrder: left.timestamp || left.displayOrder || 0,
+    },
+    {
+      turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(rightMetadata),
+      itemSeq: right.cardStreamSeq || resolveTimelineItemSeqFromMetadata(rightMetadata),
+      displayOrder: right.timestamp || right.displayOrder || 0,
+    },
+  );
+  if (semanticOrder !== 0) {
+    return semanticOrder;
+  }
+  return left.artifactId.localeCompare(right.artifactId);
+}
+
+function mergeTimelineProjectionPage(
+  currentProjection: SessionTimelineProjection | null,
+  incomingProjection: SessionTimelineProjection,
+): SessionTimelineProjection {
+  if (!currentProjection) {
+    return canonicalizeTimelineProjection(incomingProjection);
+  }
+  const current = canonicalizeTimelineProjection(currentProjection);
+  const incoming = canonicalizeTimelineProjection(incomingProjection);
+  const artifacts: TimelineProjectionArtifact[] = [];
+  const artifactIndexByKey = new Map<string, number>();
+
+  const appendArtifact = (artifact: TimelineProjectionArtifact): void => {
+    const keys = collectProjectionArtifactIdentityKeys(artifact);
+    const existingIndex = keys
+      .map((key) => artifactIndexByKey.get(key))
+      .find((index): index is number => typeof index === 'number');
+    if (existingIndex === undefined) {
+      const nextIndex = artifacts.length;
+      artifacts.push(artifact);
+      for (const key of keys) {
+        artifactIndexByKey.set(key, nextIndex);
+      }
+      return;
+    }
+
+    artifacts[existingIndex] = mergeProjectionArtifact(artifacts[existingIndex], artifact);
+    for (const key of collectProjectionArtifactIdentityKeys(artifacts[existingIndex])) {
+      artifactIndexByKey.set(key, existingIndex);
+    }
+  };
+
+  for (const artifact of incoming.artifacts) appendArtifact(artifact);
+  for (const artifact of current.artifacts) appendArtifact(artifact);
+
+  const mergedArtifacts = artifacts
+    .sort(compareProjectionArtifactsForPageMerge)
+    .map((artifact, index) => ({
+      ...artifact,
+      displayOrder: index + 1,
+    }));
+
+  return canonicalizeTimelineProjection({
+    schemaVersion: 'session-timeline-projection.v2',
+    sessionId: incoming.sessionId || current.sessionId,
+    updatedAt: Math.max(current.updatedAt || 0, incoming.updatedAt || 0),
+    lastAppliedEventSeq: Math.max(current.lastAppliedEventSeq || 0, incoming.lastAppliedEventSeq || 0),
+    artifacts: mergedArtifacts,
+    threadRenderEntries: [],
+    workerRenderEntries: {},
+  });
+}
+
 function buildLiveTimelineProjection(
   sessionId: string,
   sourceNodes: TimelineNode[],
@@ -2007,10 +2345,10 @@ function shouldReplaceOrchestratorRuntimeState(
 
 export function applyAuthoritativeProcessingState(input: AppState['processingState']): void {
   const snapshot = normalizeProcessingStateSnapshot(input);
-  const hasLocalLiveTurn = messagesState.pendingRequests.size > 0 || messagesState.activeMessageIds.size > 0;
+  const hasLocalPendingRequest = messagesState.pendingRequests.size > 0;
   if (!snapshot) {
     messagesState.backendProcessing = false;
-    if (hasLocalLiveTurn) {
+    if (hasLocalPendingRequest) {
       updateProcessingState();
       return;
     }
@@ -2032,7 +2370,7 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
     return;
   }
   const pendingRequestIds = new Set(snapshot.pendingRequestIds);
-  if (!snapshot.isProcessing && pendingRequestIds.size === 0 && hasLocalLiveTurn) {
+  if (!snapshot.isProcessing && pendingRequestIds.size === 0 && hasLocalPendingRequest) {
     messagesState.backendProcessing = false;
     if (snapshot.source) {
       setProcessingActor(snapshot.source, snapshot.agent || undefined);
@@ -3030,12 +3368,20 @@ export function getUnreadNotificationCount() {
   return unreadNotificationCount;
 }
 
+export function getNotificationCenterStatus(): NotificationCenterStatus {
+  return messagesState.notificationCenter;
+}
+
 export function removeToast(id: string) {
   const normalizedId = typeof id === 'string' ? id.trim() : '';
   if (!normalizedId) {
     return;
   }
   toasts = toasts.filter((toast) => toast.id !== normalizedId);
+}
+
+export function loadSessionNotifications() {
+  vscode.postMessage({ type: 'loadSessionNotifications' });
 }
 
 export function markAllNotificationsRead() {
@@ -3071,6 +3417,27 @@ export function applySessionNotifications(
   if (normalizedSessionId === getCurrentNotificationSessionId()) {
     applyNotificationList(normalized);
   }
+}
+
+export function applySessionNotificationsStatus(rawStatus: unknown): void {
+  if (!rawStatus || typeof rawStatus !== 'object' || Array.isArray(rawStatus)) {
+    return;
+  }
+  const status = rawStatus as Record<string, unknown>;
+  const operation = typeof status.operation === 'string'
+    && ['load', 'mark-read', 'clear', 'remove'].includes(status.operation)
+    ? status.operation as NotificationCenterOperation
+    : null;
+  messagesState.notificationCenter = {
+    isLoading: status.isLoading === true,
+    operation,
+    error: typeof status.error === 'string' && status.error.trim()
+      ? status.error.trim()
+      : null,
+    updatedAt: typeof status.updatedAt === 'number' && Number.isFinite(status.updatedAt)
+      ? status.updatedAt
+      : Date.now(),
+  };
 }
 
 export function getActiveInteractionType(): string | null {
@@ -3354,7 +3721,8 @@ export function prependTimelineProjectionPage(
   if (!currentSessionId || currentSessionId !== normalizedSessionId) {
     return false;
   }
-  setTimelineProjection(projection, { source: 'authoritative' });
+  const currentProjection = ensureTimelineProjectionSnapshotCurrent(normalizedSessionId);
+  setTimelineProjection(mergeTimelineProjectionPage(currentProjection, projection), { source: 'authoritative' });
   return true;
 }
 

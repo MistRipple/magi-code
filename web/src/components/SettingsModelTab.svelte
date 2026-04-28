@@ -1,5 +1,8 @@
 <script lang="ts">
-  import { resolveModelConfigTabStatus } from '../shared/model-governance';
+  import {
+    resolveModelConfigTabStatus,
+    resolveModelListFetchBlockReason,
+  } from '../shared/model-governance';
   import { resolveAgentIndicatorVariant } from '../lib/agent-status-indicator';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
@@ -113,6 +116,25 @@
     }
     void fetchModelList(type);
   }
+
+  function modelListActionDisabled(config: any, key: string): boolean {
+    const hasModels = Array.isArray(modelLists[key]) && modelLists[key].length > 0;
+    return Boolean(fetchingModels[key] || (!hasModels && resolveModelListFetchBlockReason(config)));
+  }
+
+  function modelListActionTitle(config: any, key: string): string {
+    if (Array.isArray(modelLists[key]) && modelLists[key].length > 0) {
+      return i18n.t('settings.model.openModelList');
+    }
+    const blockReason = resolveModelListFetchBlockReason(config);
+    if (blockReason === 'full_url_mode') {
+      return i18n.t('config.toast.modelListUnsupportedInFullMode');
+    }
+    if (blockReason === 'missing_base_url_or_api_key') {
+      return i18n.t('config.toast.fillBaseUrlFirst');
+    }
+    return i18n.t('settings.model.fetchModelList');
+  }
 </script>
 
         <!-- 模型配置 Tab -->
@@ -191,9 +213,9 @@
                           <button
                             class="model-fetch-btn"
                             onclick={(event) => handleModelListAction('orch', event)}
-                            disabled={fetchingModels.orch || (modelLists.orch.length === 0 && (!orchConfig.baseUrl || !orchConfig.apiKey))}
-                            aria-label={modelLists.orch.length > 0 ? i18n.t('settings.model.openModelList') : i18n.t('settings.model.fetchModelList')}
-                            title={modelLists.orch.length > 0 ? i18n.t('settings.model.openModelList') : i18n.t('settings.model.fetchModelList')}
+                            disabled={modelListActionDisabled(orchConfig, 'orch')}
+                            aria-label={modelListActionTitle(orchConfig, 'orch')}
+                            title={modelListActionTitle(orchConfig, 'orch')}
                           >
                             {#if fetchingModels.orch}
                               <Icon name="refresh" size={12} />
@@ -362,9 +384,9 @@
                           <button
                             class="model-fetch-btn"
                             onclick={(event) => handleModelListAction('comp', event)}
-                            disabled={fetchingModels.comp || (modelLists.comp.length === 0 && (!compConfig.baseUrl || !compConfig.apiKey))}
-                            aria-label={modelLists.comp.length > 0 ? i18n.t('settings.model.openModelList') : i18n.t('settings.model.fetchModelList')}
-                            title={modelLists.comp.length > 0 ? i18n.t('settings.model.openModelList') : i18n.t('settings.model.fetchModelList')}
+                            disabled={modelListActionDisabled(compConfig, 'comp')}
+                            aria-label={modelListActionTitle(compConfig, 'comp')}
+                            title={modelListActionTitle(compConfig, 'comp')}
                           >
                             {#if fetchingModels.comp}
                               <Icon name="refresh" size={12} />
@@ -559,9 +581,9 @@
                       <button
                         class="model-fetch-btn"
                         onclick={(event) => handleModelListAction('worker', event)}
-                        disabled={fetchingModels[workerModelTab] || ((!modelLists[workerModelTab] || modelLists[workerModelTab].length === 0) && (!workerConfigs[workerModelTab].baseUrl || !workerConfigs[workerModelTab].apiKey))}
-                        aria-label={(modelLists[workerModelTab]?.length ?? 0) > 0 ? i18n.t('settings.model.openModelList') : i18n.t('settings.model.fetchModelList')}
-                        title={(modelLists[workerModelTab]?.length ?? 0) > 0 ? i18n.t('settings.model.openModelList') : i18n.t('settings.model.fetchModelList')}
+                        disabled={modelListActionDisabled(workerConfigs[workerModelTab], workerModelTab)}
+                        aria-label={modelListActionTitle(workerConfigs[workerModelTab], workerModelTab)}
+                        title={modelListActionTitle(workerConfigs[workerModelTab], workerModelTab)}
                       >
                         {#if fetchingModels[workerModelTab]}
                           <Icon name="refresh" size={12} />

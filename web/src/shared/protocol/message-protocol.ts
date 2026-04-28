@@ -110,6 +110,7 @@ export type DataMessageType =
   | 'sessionTurnAccepted'
   | 'timelineProjectionUpdated'
   | 'sessionNotificationsLoaded'
+  | 'sessionNotificationsStatus'
   | 'sessionsUpdated'
   | 'skillInstalled'
   | 'skillInstallFailed'

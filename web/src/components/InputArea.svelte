@@ -147,9 +147,7 @@
   // 发送/停止态只认 store 内已经收敛好的处理状态，避免历史工具卡片把空闲会话抬回执行态。
   const isSending = $derived(
     messagesState.isProcessing
-    || messagesState.backendProcessing
-    || messagesState.pendingRequests.size > 0
-    || messagesState.activeMessageIds.size > 0,
+    || messagesState.backendProcessing,
   );
   const activeInteraction = $derived.by(() => getActiveInteractionType());
   const isInteractionBlocking = $derived.by(() => Boolean(activeInteraction));

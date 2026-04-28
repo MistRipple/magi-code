@@ -36,7 +36,9 @@ import {
   getAgentExecutionStats,
   getAgentChangeDiff,
   getAgentFilePreview,
+  getAgentSessionNotifications,
   continueAgentSession,
+  interruptAgentSession,
   interruptAgentTask,
   installAgentLocalSkill,
   installAgentSkill,
@@ -121,6 +123,7 @@ import {
   messagesState,
   allocateTurnOrderSeq,
 } from '../../stores/messages.svelte';
+import { resolveModelListFetchBlockReason } from '../model-governance';
 import type { QueuedMessage } from '../../types/message';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
@@ -428,6 +431,15 @@ function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload
     const sessionId = trimBridgeString(entry.session_id);
     return expectedSessionId ? sessionId === expectedSessionId : sessionId.length > 0;
   });
+  const trackableRootTaskId = (candidate: unknown): string => {
+    const taskId = trimBridgeString(candidate);
+    if (!taskId) {
+      return '';
+    }
+    return runtimeTaskMap.has(taskId) ? taskId : '';
+  };
+  rootTaskId = trackableRootTaskId(activeRuntimeSession?.root_task_id)
+    || trackableRootTaskId(activeRuntimeSession?.rootTaskId);
   const overview = asBridgeRecord(rawRuntimeReadModel?.overview);
   const activity = asBridgeRecord(overview?.activity);
   const sessionTaskIds = normalizeBridgeStringArray(activeRuntimeSession?.active_task_ids);
@@ -487,8 +499,10 @@ function extractBootstrapTaskTrackingHints(payload: BootstrapPayload, rawPayload
         continue;
       }
     }
-    rootTaskId = trimBridgeString(eventPayload?.root_task_id) || trimBridgeString(eventPayload?.rootTaskId);
-    if (rootTaskId) {
+    const eventRootTaskId = trimBridgeString(eventPayload?.root_task_id) || trimBridgeString(eventPayload?.rootTaskId);
+    const trackableEventRootTaskId = trackableRootTaskId(eventRootTaskId);
+    if (trackableEventRootTaskId) {
+      rootTaskId = trackableEventRootTaskId;
       break;
     }
   }
@@ -1058,6 +1072,7 @@ function shouldRefreshFromRustEvent(event: RustEventEnvelope): boolean {
 const TURN_TERMINAL_EVENTS = new Set([
   'session.turn.completed',
   'session.turn.failed',
+  'session.turn.interrupted',
 ]);
 
 function handleRustEventStreamMessage(event: RustEventEnvelope): void {
@@ -1112,6 +1127,15 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
 
   if (TURN_TERMINAL_EVENTS.has(eventType)) {
     clearActiveTurnInFlight();
+    const terminalReason = eventType === 'session.turn.failed'
+      ? 'session_turn_failed'
+      : eventType === 'session.turn.interrupted'
+        ? 'session_turn_interrupted'
+        : 'session_turn_completed';
+    emitForcedProcessingIdle(
+      terminalReason,
+      { eventType },
+    );
   }
 
   // Notify listeners about task-domain SSE events so lightweight stores
@@ -1197,6 +1221,39 @@ function emitBridgeSuccessToast(
     },
     {
       id: `web-bridge-success-${now}`,
+      timestamp: now,
+      updatedAt: now,
+    },
+  );
+  emitMessage({ type: 'unifiedMessage', message });
+}
+
+function emitBridgeInfoToast(
+  action: string,
+  detail: string,
+  options: {
+    displayMode?: 'toast' | 'notification_center';
+  } = {},
+): void {
+  const normalizedAction = action.trim() || '提示';
+  const content = detail.trim() || normalizedAction;
+  const now = Date.now();
+  const message = createNotifyMessage(
+    content,
+    'info',
+    `web-bridge-info:${normalizedAction}`,
+    undefined,
+    {
+      title: '提示',
+      displayMode: options.displayMode || 'toast',
+      category: 'audit',
+      source: 'bridge-runtime',
+      actionRequired: false,
+      persistToCenter: true,
+      countUnread: false,
+    },
+    {
+      id: `web-bridge-info-${now}`,
       timestamp: now,
       updatedAt: now,
     },
@@ -1845,6 +1902,11 @@ async function dispatchSessionSnapshot(
     reportExpectedRecoveryFailure('事件流连接', '[web-client-bridge] 会话快照后事件流连接失败:', error);
     scheduleRecovery('session_snapshot_event_stream_connect', error, true);
   });
+  if (taskTrackingHints.rootTaskId || taskTrackingHints.activeTaskIds.length > 0) {
+    void autoConnectTaskTracking(payload.sessionId, taskTrackingHints.activeTaskIds, taskTrackingHints.rootTaskId).catch((error) => {
+      console.warn('[web-client-bridge] Auto-connect task tracking on session snapshot failed (non-critical):', error);
+    });
+  }
   if ((payload.state as { isProcessing?: boolean } | undefined)?.isProcessing !== true) {
     scheduleQueuedTurnDrain('session_snapshot_idle');
   }
@@ -2098,7 +2160,6 @@ function emitQueuedUserMessage(queued: QueuedMessage): void {
   const userMessage = createUserInputMessage(queued.content, `queued-user-${queued.id}`, {
     id: `queued-user-${queued.id}`,
     metadata: {
-      requestId: queued.id,
       extra: {
         queued: true,
         queuedMessageId: queued.id,
@@ -2387,21 +2448,29 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
 
 async function interruptTask(trigger: 'user_pause' | 'pause_task' = 'user_pause'): Promise<void> {
   const taskId = currentInterruptTaskId;
-  if (!taskId) {
-    emitBridgeErrorToast('停止任务', new Error('当前轮次缺少可中断任务 ID，请等待任务初始化完成后再试。'));
+  const sessionId = currentSessionId.trim();
+  clearActiveTurnInFlight();
+  if (!taskId && !sessionId) {
+    emitForcedProcessingIdle('user_interrupt_missing_session', { trigger });
+    emitBridgeErrorToast('停止任务', new Error('当前没有可停止的会话。'));
     return;
   }
-  clearActiveTurnInFlight();
-  // 目标 task 已确认后，前端立即收敛到 idle，避免停止按钮卡死。
-  emitForcedProcessingIdle('user_interrupt_requested', { trigger, taskId });
+  const idleReason = taskId ? 'user_interrupt_requested' : 'user_session_interrupt_requested';
+  // 中断请求已进入后端权威链路，前端先收敛到 idle，避免停止按钮卡死。
+  emitForcedProcessingIdle(idleReason, { trigger, taskId, sessionId });
   try {
-    await interruptAgentTask({ taskId });
+    if (taskId) {
+      await interruptAgentTask({ taskId });
+    } else {
+      await interruptAgentSession(sessionId);
+    }
   } catch (error) {
-    console.error('[web-client-bridge] 中断任务失败（已执行前端强制停止）:', error);
+    console.error('[web-client-bridge] 中断执行失败（已执行前端强制停止）:', error);
     emitBridgeErrorToast('停止任务', error);
     emitForcedProcessingIdle('user_interrupt_failed', {
       trigger,
       taskId,
+      sessionId,
       error: normalizeErrorMessage(error),
     });
   }
@@ -2546,19 +2615,66 @@ async function resetExecutionStats(): Promise<void> {
   await dispatchExecutionStats();
 }
 
+function hasCurrentSessionScope(): boolean {
+  return currentSessionId.trim().length > 0;
+}
+
+type NotificationCenterOperation = 'load' | 'mark-read' | 'clear' | 'remove';
+
+function emitSessionNotificationsStatus(
+  operation: NotificationCenterOperation,
+  isLoading: boolean,
+  error?: unknown,
+): void {
+  emitDataMessage('sessionNotificationsStatus', {
+    sessionId: currentSessionId.trim(),
+    operation,
+    isLoading,
+    error: error === undefined ? null : normalizeErrorMessage(error),
+    updatedAt: Date.now(),
+  });
+}
+
+async function runNotificationOperation(
+  operation: NotificationCenterOperation,
+  task: () => Promise<Record<string, unknown>>,
+): Promise<void> {
+  if (!hasCurrentSessionScope()) {
+    return;
+  }
+  emitSessionNotificationsStatus(operation, true);
+  try {
+    const payload = await task();
+    emitDataMessage('sessionNotificationsLoaded', payload);
+    emitSessionNotificationsStatus(operation, false);
+  } catch (error) {
+    emitSessionNotificationsStatus(operation, false, error);
+    throw error;
+  }
+}
+
+async function loadSessionNotifications(): Promise<void> {
+  await runNotificationOperation('load', async () => (
+    await getAgentSessionNotifications() as unknown as Record<string, unknown>
+  ));
+}
+
 async function markAllNotificationsRead(): Promise<void> {
-  const payload = await markAllAgentNotificationsRead();
-  emitDataMessage('sessionNotificationsLoaded', payload as unknown as Record<string, unknown>);
+  await runNotificationOperation('mark-read', async () => (
+    await markAllAgentNotificationsRead() as unknown as Record<string, unknown>
+  ));
 }
 
 async function clearAllNotifications(): Promise<void> {
-  const payload = await clearAgentNotifications();
-  emitDataMessage('sessionNotificationsLoaded', payload as unknown as Record<string, unknown>);
+  await runNotificationOperation('clear', async () => (
+    await clearAgentNotifications() as unknown as Record<string, unknown>
+  ));
 }
 
 async function removeNotification(notificationId: string): Promise<void> {
-  const payload = await removeAgentNotification(notificationId);
-  emitDataMessage('sessionNotificationsLoaded', payload as unknown as Record<string, unknown>);
+  await runNotificationOperation('remove', async () => (
+    await removeAgentNotification(notificationId) as unknown as Record<string, unknown>
+  ));
 }
 
 async function enhancePrompt(prompt: string): Promise<void> {
@@ -2619,6 +2735,16 @@ async function testAuxiliaryConnection(config: Record<string, unknown>): Promise
 }
 
 async function fetchModelList(config: Record<string, unknown>, target: string): Promise<void> {
+  const blockReason = resolveModelListFetchBlockReason(config);
+  if (blockReason) {
+    emitBridgeInfoToast(
+      '获取模型列表',
+      blockReason === 'full_url_mode'
+        ? '完整路径模式下不支持自动获取模型列表，请手动填写模型名'
+        : '请先填写 Base URL 和 API Key',
+    );
+    return;
+  }
   const payload = await fetchAgentModelList(config, target);
   emitDataMessage('modelListFetched', payload);
   emitBridgeSuccessToast('获取模型列表', `${target} 模型列表已刷新`, { displayMode: 'notification_center' });
@@ -3029,6 +3155,11 @@ export function createWebClientBridge(): ClientBridge {
         case 'saveCurrentSession':
           void saveCurrentSession().catch((error) => {
             logBridgeOperationFailure('保存会话', '[web-client-bridge] 保存当前会话失败:', error);
+          });
+          return;
+        case 'loadSessionNotifications':
+          void loadSessionNotifications().catch((error) => {
+            reportExpectedRecoveryFailure('加载通知', '[web-client-bridge] 加载通知失败:', error);
           });
           return;
         case 'markAllNotificationsRead':

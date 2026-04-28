@@ -2,6 +2,8 @@
   import {
     getNotifications,
     getUnreadNotificationCount,
+    getNotificationCenterStatus,
+    loadSessionNotifications,
     markAllNotificationsRead,
     clearAllNotifications,
     removeNotification,
@@ -16,6 +18,11 @@
 
   const notifications = $derived.by(() => getNotifications() as Notification[]);
   const unreadCount = $derived.by(() => getUnreadNotificationCount() as number);
+  const notificationStatus = $derived.by(() => getNotificationCenterStatus());
+  const hasCurrentSession = $derived.by(() => (
+    typeof messagesState.currentSessionId === 'string'
+    && messagesState.currentSessionId.trim().length > 0
+  ));
   const filteredNotifications = $derived.by(() => (
     activeFilter === 'all'
       ? notifications
@@ -24,8 +31,12 @@
 
   function togglePanel() {
     panelOpen = !panelOpen;
-    if (panelOpen && messagesState.bootstrapped) {
-      markAllNotificationsRead();
+    if (panelOpen && messagesState.bootstrapped && hasCurrentSession) {
+      if (unreadCount > 0) {
+        markAllNotificationsRead();
+      } else {
+        loadSessionNotifications();
+      }
     }
   }
 
@@ -34,14 +45,14 @@
   }
 
   function handleClearAll() {
-    if (!messagesState.bootstrapped) {
+    if (!messagesState.bootstrapped || !hasCurrentSession) {
       return;
     }
     clearAllNotifications();
   }
 
   function handleRemove(id: string) {
-    if (!messagesState.bootstrapped) {
+    if (!messagesState.bootstrapped || !hasCurrentSession) {
       return;
     }
     removeNotification(id);
@@ -83,7 +94,14 @@
         <span class="panel-title">{i18n.t('notification.title')}</span>
         <div class="panel-actions">
           {#if notifications.length > 0}
-            <button class="btn-text" onclick={handleClearAll} title={i18n.t('notification.clearAllTitle')}>{i18n.t('notification.clearAll')}</button>
+            <button
+              class="btn-text"
+              onclick={handleClearAll}
+              title={i18n.t('notification.clearAllTitle')}
+              disabled={notificationStatus.isLoading}
+            >
+              {i18n.t('notification.clearAll')}
+            </button>
           {/if}
           <button class="btn-icon btn-icon--xs" onclick={closePanel} title={i18n.t('notification.closeTitle')}>
             <Icon name="close" size={12} />
@@ -104,12 +122,28 @@
         </div>
       {/if}
       <div class="notification-list">
-        {#if filteredNotifications.length === 0}
+        {#if notificationStatus.isLoading && filteredNotifications.length === 0}
+          <div class="empty-state">
+            <Icon name="refresh" size={24} class="spin" />
+            <span>{i18n.t('notification.loading')}</span>
+          </div>
+        {:else if notificationStatus.error && filteredNotifications.length === 0}
+          <div class="empty-state empty-state--error">
+            <Icon name="warning" size={24} />
+            <span>{notificationStatus.error}</span>
+          </div>
+        {:else if filteredNotifications.length === 0}
           <div class="empty-state">
             <Icon name="bell" size={24} />
             <span>{activeFilter === 'all' ? i18n.t('notification.empty') : i18n.t('notification.emptyFiltered')}</span>
           </div>
         {:else}
+          {#if notificationStatus.error}
+            <div class="inline-error">
+              <Icon name="warning" size={12} />
+              <span>{notificationStatus.error}</span>
+            </div>
+          {/if}
           {#each filteredNotifications as notif (notif.id)}
             <div class="notification-item type-{notif.type}">
               <div class="notif-icon">
@@ -125,7 +159,12 @@
                   <span class="notif-time">{formatTime(notif.timestamp)}</span>
                 </div>
               </div>
-              <button class="notif-remove" onclick={() => handleRemove(notif.id)} title={i18n.t('notification.removeTitle')}>
+              <button
+                class="notif-remove"
+                onclick={() => handleRemove(notif.id)}
+                title={i18n.t('notification.removeTitle')}
+                disabled={notificationStatus.isLoading}
+              >
                 <Icon name="close" size={10} />
               </button>
             </div>
@@ -256,6 +295,11 @@
     color: var(--foreground);
   }
 
+  .btn-text:disabled {
+    cursor: default;
+    opacity: 0.45;
+  }
+
   .notification-list {
     overflow-y: auto;
     flex: 1;
@@ -272,6 +316,29 @@
     font-size: var(--text-sm, 13px);
     width: 100%;
     box-sizing: border-box;
+  }
+
+  .empty-state--error {
+    color: var(--error);
+  }
+
+  .inline-error {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2, 4px);
+    padding: var(--space-2, 6px) var(--space-4, 12px);
+    color: var(--error);
+    font-size: var(--text-xs, 11px);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .spin {
+    animation: notification-spin 0.9s linear infinite;
+  }
+
+  @keyframes notification-spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
   }
 
   .notification-item {
@@ -368,5 +435,10 @@
   .notif-remove:hover {
     background: var(--surface-hover);
     color: var(--foreground);
+  }
+
+  .notif-remove:disabled {
+    cursor: default;
+    opacity: 0.45;
   }
 </style>
