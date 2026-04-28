@@ -8,6 +8,7 @@ import {
   getState,
   setIsProcessing,
   setCurrentSessionId,
+  adoptCurrentSessionIdForLiveTurn,
   getQueuedMessages,
   updateSessions,
   setQueuedMessages,
@@ -32,6 +33,7 @@ import {
   markMessageComplete,
   updateRequestBinding,
   applyTimelineStreamPatch,
+  getTimelineMessageById,
   settleProcessingAfterResponseCompletion,
   settleAuthoritativeIdleState,
   applySessionNotifications,
@@ -45,7 +47,6 @@ import type {
   Edit,
   ModelStatusMap, ActivePlanState, PlanLedgerRecord, PlanLedgerAttempt,
   QueuedMessage, OrchestratorRuntimeState, SessionTimelineProjection,
-  TimelineExecutionItem, TimelineProjectionArtifact,
 } from '../types/message';
 import type { StandardMessage, ContentBlock as StandardContentBlock } from '../shared/protocol/message-protocol';
 import type { SessionBootstrapSnapshot } from '../shared/session-bootstrap';
@@ -431,6 +432,14 @@ export function handleUnifiedData(standard: StandardMessage) {
       }));
       break;
 
+    case 'sessionTurnAccepted': {
+      const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : '';
+      if (sessionId) {
+        adoptCurrentSessionIdForLiveTurn(sessionId);
+      }
+      break;
+    }
+
     case 'timelineProjectionUpdated':
       handleTimelineProjectionUpdated(asMessage({
         sessionId: payload.sessionId,
@@ -688,24 +697,15 @@ function hasRenderableAssistantContent(message: Message): boolean {
   return Array.isArray(message?.blocks) && message.blocks.length > 0;
 }
 
-function projectionHasStreamingContent(projection: SessionTimelineProjection | null | undefined): boolean {
-  if (!projection) {
-    return false;
-  }
-  for (const artifact of ensureArray<TimelineProjectionArtifact>(projection.artifacts)) {
-    if (artifact.message?.isStreaming === true) {
-      return true;
-    }
-    for (const item of ensureArray<TimelineExecutionItem>(artifact.executionItems)) {
-      if (item.message?.isStreaming === true) {
-        return true;
-      }
-    }
-  }
-  return false;
+function resolveMessageMetadataString(message: Message, key: string): string {
+  const metadata = message.metadata && typeof message.metadata === 'object'
+    ? message.metadata as Record<string, unknown>
+    : {};
+  const raw = metadata[key];
+  return typeof raw === 'string' ? raw.trim() : '';
 }
 
-function isSettlingAssistantResponse(message: Message): boolean {
+function isTerminalAssistantResponse(message: Message): boolean {
   if (
     message.role !== 'assistant'
     || message.source === 'system'
@@ -718,24 +718,55 @@ function isSettlingAssistantResponse(message: Message): boolean {
     ? message.metadata.turnItemKind.trim()
     : '';
   if (!turnItemKind) {
-    return true;
+    return message.type !== 'tool_call' && message.type !== 'thinking';
   }
-  return turnItemKind === 'assistant_stream'
-    || turnItemKind === 'assistant_final'
+  return turnItemKind === 'assistant_final'
     || turnItemKind === 'assistant_error';
 }
 
-function findAssistantByThreadOrder(
-  threadMessages: Message[],
+function messageMatchesRequestBinding(
+  message: Message,
+  binding: ReturnType<typeof listRequestBindings>[number],
+): boolean {
+  const messageRequestId = resolveMessageMetadataString(message, 'requestId');
+  if (messageRequestId && messageRequestId === binding.requestId) {
+    return true;
+  }
+  const exactIds = new Set(
+    [binding.realMessageId, binding.placeholderMessageId]
+      .map((id) => typeof id === 'string' ? id.trim() : '')
+      .filter((id) => id.length > 0),
+  );
+  return exactIds.has(message.id);
+}
+
+function findTerminalAssistantByRequestIdentity(
   binding: ReturnType<typeof listRequestBindings>[number],
 ): Message | undefined {
-  const userIndex = threadMessages.findIndex((message) => message.id === binding.userMessageId);
-  if (userIndex < 0) {
+  const directIds = [binding.realMessageId, binding.placeholderMessageId]
+    .map((id) => typeof id === 'string' ? id.trim() : '')
+    .filter((id) => id.length > 0);
+  for (const id of directIds) {
+    const directMessage = getTimelineMessageById(id);
+    if (
+      directMessage
+      && isTerminalAssistantResponse(directMessage)
+      && messageMatchesRequestBinding(directMessage, binding)
+    ) {
+      return directMessage;
+    }
+  }
+
+  const threadMessages = getState().threadMessages;
+  if (!Array.isArray(threadMessages) || threadMessages.length === 0) {
     return undefined;
   }
-  for (let index = threadMessages.length - 1; index > userIndex; index -= 1) {
+  for (let index = threadMessages.length - 1; index >= 0; index -= 1) {
     const message = threadMessages[index];
-    if (isSettlingAssistantResponse(message)) {
+    if (
+      isTerminalAssistantResponse(message)
+      && messageMatchesRequestBinding(message, binding)
+    ) {
       return message;
     }
   }
@@ -753,27 +784,8 @@ function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): voi
     return;
   }
 
-  const threadMessages = getState().threadMessages;
-  if (!Array.isArray(threadMessages) || threadMessages.length === 0) {
-    return;
-  }
-
   for (const binding of listRequestBindings()) {
-    const userMessage = threadMessages.find((message) => message.id === binding.userMessageId);
-    const lowerBoundTimestamp = typeof userMessage?.timestamp === 'number'
-      ? userMessage.timestamp
-      : binding.createdAt;
-    const matchedAssistant = (
-      (binding.realMessageId
-        ? threadMessages.find((message) => message.id === binding.realMessageId)
-        : undefined)
-      || [...threadMessages].reverse().find((message) => (
-        isSettlingAssistantResponse(message)
-        && typeof message.timestamp === 'number'
-        && message.timestamp >= lowerBoundTimestamp
-      ))
-      || findAssistantByThreadOrder(threadMessages, binding)
-    );
+    const matchedAssistant = findTerminalAssistantByRequestIdentity(binding);
 
     if (!matchedAssistant) {
       continue;
@@ -820,10 +832,15 @@ function handleTimelineProjectionUpdated(message: ClientBridgeMessage) {
   if (!currentSessionId || currentSessionId !== sessionId) {
     return;
   }
-  restoreTimelineProjectionIfNewer(timelineProjection, {
+  if (hasActiveLocalTurn()) {
+    return;
+  }
+  const restored = restoreTimelineProjectionIfNewer(timelineProjection, {
     source: 'authoritative',
   });
-  reconcileRequestBindingsFromAuthoritativeThread(sessionId);
+  if (restored) {
+    reconcileRequestBindingsFromAuthoritativeThread(sessionId);
+  }
 }
 
 function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
@@ -848,8 +865,8 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
   const currentSessionId = getState().currentSessionId || '';
   const isSameSession = currentSessionId === sessionId;
 
-  // 同 session 恢复（SSE 重连 / 后端重启）：优先保留当前 live 时间线。
-  // 仅当后端 bootstrap projection 明确比本地更新时，才允许用快照接管并修复断连期间丢失的节点。
+  // 同 session 恢复（SSE 重连 / 后端重启）：活跃轮次期间只同步非时间线状态，
+  // 避免 bootstrap 快照整包替换 live 过程态；空闲时再接管权威历史投影。
   if (isSameSession) {
     batchWebviewStatePersistence(() => {
       const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;
@@ -862,10 +879,8 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       const hadLiveTurnBeforeSnapshot = hasActiveLocalTurn();
       const authoritativeSnapshotIsIdle = state.isProcessing !== true
         && state.processingState?.isProcessing !== true;
-      const projectionStillStreaming = projectionHasStreamingContent(timelineProjection);
       const preserveLocalTurnDuringStaleIdle = hadLiveTurnBeforeSnapshot
-        && authoritativeSnapshotIsIdle
-        && projectionStillStreaming;
+        && authoritativeSnapshotIsIdle;
 
       handleStateUpdate({
         ...message,
@@ -892,9 +907,11 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         isLoadingBefore: false,
       });
 
-      prependTimelineProjectionPage(sessionId, timelineProjection);
-      reconcileRequestBindingsFromAuthoritativeThread(sessionId);
-      if (authoritativeSnapshotIsIdle) {
+      if (!hadLiveTurnBeforeSnapshot) {
+        prependTimelineProjectionPage(sessionId, timelineProjection);
+        reconcileRequestBindingsFromAuthoritativeThread(sessionId);
+      }
+      if (authoritativeSnapshotIsIdle && !hadLiveTurnBeforeSnapshot) {
         settleAuthoritativeIdleState();
       }
     });

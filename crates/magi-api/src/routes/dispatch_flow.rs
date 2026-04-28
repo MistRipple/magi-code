@@ -91,6 +91,9 @@ fn execute_dispatch_submission(
         deep_task,
         skill_name,
         target_role,
+        request_id: request.request_id(),
+        user_message_id: request.user_message_id(),
+        placeholder_message_id: request.placeholder_message_id(),
     };
     let accepted = submit_shadow_dispatch_submission(state, dispatch)?;
     let event_id = publish_session_turn_task_accepted_event(state, request, &accepted)?;
@@ -148,9 +151,13 @@ fn publish_session_turn_task_accepted_event(
             "workspace_id": request.requested_workspace_id(),
             "text": request.trimmed_text(),
             "skill_name": request.skill_name.clone(),
+            "request_id": request.request_id(),
+            "user_message_id": request.user_message_id(),
+            "placeholder_message_id": request.placeholder_message_id(),
             "image_count": request.images.len(),
             "deep_task": request.deep_task,
             "created_session": accepted.created_session,
+            "route": "task",
             "root_task_id": accepted.root_task_id.to_string(),
             "action_task_id": accepted.action_task_id.to_string(),
             "runner_started": accepted.runner_started,

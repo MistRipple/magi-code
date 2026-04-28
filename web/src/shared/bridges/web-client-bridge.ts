@@ -80,6 +80,8 @@ import {
 import type { ClientBridge, ClientBridgeMessage, SupportedLocale } from './client-bridge';
 import {
   createNotifyMessage,
+  createErrorMessage,
+  createStreamingMessage,
   createUserInputMessage,
   generateMessageId,
   MessageCategory,
@@ -117,6 +119,7 @@ import {
   enqueueQueuedMessage,
   markQueuedMessageAsGuide,
   messagesState,
+  allocateTurnOrderSeq,
 } from '../../stores/messages.svelte';
 import type { QueuedMessage } from '../../types/message';
 
@@ -153,6 +156,9 @@ let recoveryInFlight: Promise<void> | null = null;
 interface ActiveTurnLiveContext {
   requestId: string;
   userMessageId: string;
+  placeholderMessageId: string;
+  turnOrderSeq: number;
+  turnSeq?: number;
 }
 let activeTurnLiveContext: ActiveTurnLiveContext | null = null;
 
@@ -870,13 +876,32 @@ function createSessionTurnItemStandardMessage(
   const content = readTurnItemString(item, 'content');
   const status = readTurnItemString(item, 'status') || 'completed';
   const turnId = trimBridgeString(payload.turn_id) || trimBridgeString(payload.turnId);
-  const turnSeq = typeof payload.turn_seq === 'number' && Number.isFinite(payload.turn_seq)
+  const canonicalTurnSeq = typeof payload.turn_seq === 'number' && Number.isFinite(payload.turn_seq)
     ? Math.floor(payload.turn_seq)
-    : (typeof payload.turnSeq === 'number' && Number.isFinite(payload.turnSeq) ? Math.floor(payload.turnSeq) : undefined);
+    : (typeof payload.turnSeq === 'number' && Number.isFinite(payload.turnSeq)
+      ? Math.floor(payload.turnSeq)
+      : undefined);
   const itemSeq = readTurnItemNumber(item, 'itemSeq', 'item_seq');
   const laneId = readTurnItemString(item, 'laneId', 'lane_id');
   const laneSeq = readTurnItemNumber(item, 'laneSeq', 'lane_seq');
   const timelineEntryId = readTurnItemString(item, 'timelineEntryId', 'timeline_entry_id');
+  const itemRequestId = readTurnItemString(item, 'requestId', 'request_id');
+  const itemUserMessageId = readTurnItemString(item, 'userMessageId', 'user_message_id');
+  const itemPlaceholderMessageId = readTurnItemString(item, 'placeholderMessageId', 'placeholder_message_id');
+  const activeContextMatches = Boolean(activeTurnLiveContext)
+    && (!itemRequestId || itemRequestId === activeTurnLiveContext?.requestId);
+  const liveRequestId = itemRequestId || (activeContextMatches ? activeTurnLiveContext?.requestId : '') || '';
+  const turnOrderSeq = activeContextMatches ? activeTurnLiveContext?.turnOrderSeq : undefined;
+  const isUserTurnItem = kind === 'user_message';
+  const isAssistantResponseTurnItem = kind === 'assistant_stream'
+    || kind === 'assistant_final'
+    || kind === 'assistant_error';
+  const liveUserMessageId = isUserTurnItem
+    ? (itemUserMessageId || (activeContextMatches ? activeTurnLiveContext?.userMessageId : '') || '')
+    : '';
+  const livePlaceholderMessageId = isAssistantResponseTurnItem
+    ? (itemPlaceholderMessageId || (activeContextMatches ? activeTurnLiveContext?.placeholderMessageId : '') || '')
+    : '';
   const timestamp = typeof event.occurred_at === 'number' && Number.isFinite(event.occurred_at)
     ? Math.floor(event.occurred_at)
     : Date.now();
@@ -886,13 +911,17 @@ function createSessionTurnItemStandardMessage(
   const metadata: StandardMessage['metadata'] = {
     sessionId,
     ...(turnId ? { turnId } : {}),
-    ...(typeof turnSeq === 'number' ? { turnSeq } : {}),
+    ...(typeof turnOrderSeq === 'number' ? { turnOrderSeq } : {}),
+    ...(typeof canonicalTurnSeq === 'number' ? { turnSeq: canonicalTurnSeq } : {}),
     turnItemId: itemId,
     turnItemKind: kind,
     ...(typeof itemSeq === 'number' ? { itemSeq, blockSeq: itemSeq, cardStreamSeq: itemSeq } : {}),
     ...(laneId ? { laneId } : {}),
     ...(typeof laneSeq === 'number' ? { laneSeq } : {}),
     ...(timelineEntryId ? { timelineEntryId } : {}),
+    ...(liveRequestId ? { requestId: liveRequestId } : {}),
+    ...(liveUserMessageId ? { userMessageId: liveUserMessageId } : {}),
+    ...(livePlaceholderMessageId ? { placeholderMessageId: livePlaceholderMessageId } : {}),
     rustStreamItemId: itemId,
     rustEventItemId: itemId,
     ...(event.event_id ? { eventId: event.event_id } : {}),
@@ -927,10 +956,6 @@ function createSessionTurnItemStandardMessage(
       thinkingContent,
       isTerminalTurnLifecycle(lifecycle),
     );
-    if (activeTurnLiveContext) {
-      metadata.requestId = activeTurnLiveContext.requestId;
-      metadata.userMessageId = activeTurnLiveContext.userMessageId;
-    }
   } else if (kind === 'assistant_stream' || kind === 'assistant_final') {
     const assistantText = content.trim();
     if (!assistantText) {
@@ -941,10 +966,6 @@ function createSessionTurnItemStandardMessage(
     lifecycle = resolvedItemLifecycle;
     bridgeType = isTerminalTurnLifecycle(lifecycle) ? 'unifiedComplete' : 'unifiedMessage';
     blocks = buildAssistantTurnTextBlocks(assistantText);
-    if (activeTurnLiveContext) {
-      metadata.requestId = activeTurnLiveContext.requestId;
-      metadata.userMessageId = activeTurnLiveContext.userMessageId;
-    }
   } else if (kind === 'assistant_error') {
     const errorText = (content || title || '').trim();
     if (!errorText) {
@@ -955,10 +976,6 @@ function createSessionTurnItemStandardMessage(
     lifecycle = resolveTurnItemLifecycle(status);
     bridgeType = 'unifiedComplete';
     blocks = buildAssistantTurnTextBlocks(errorText);
-    if (activeTurnLiveContext) {
-      metadata.requestId = activeTurnLiveContext.requestId;
-      metadata.userMessageId = activeTurnLiveContext.userMessageId;
-    }
   } else if (kind === 'tool_call_started' || kind === 'tool_call_result') {
     const toolCallId = readTurnItemString(item, 'toolCallId', 'tool_call_id') || itemId;
     const toolName = readTurnItemString(item, 'toolName', 'tool_name') || title || 'tool';
@@ -983,10 +1000,6 @@ function createSessionTurnItemStandardMessage(
     metadata.isStatusMessage = true;
     metadata.toolCallId = toolCallId;
     metadata.toolName = toolName;
-    if (activeTurnLiveContext) {
-      metadata.requestId = activeTurnLiveContext.requestId;
-      metadata.userMessageId = activeTurnLiveContext.userMessageId;
-    }
   } else {
     return null;
   }
@@ -1052,6 +1065,25 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
   const eventType = trimBridgeString(event.event_type);
+
+  if ((eventType === 'session.turn.accepted' || eventType === 'session.turn.task.accepted') && event.payload) {
+    const acceptedSessionId = trimBridgeString(event.payload.session_id)
+      || trimBridgeString(event.payload.sessionId)
+      || trimBridgeString(event.session_id);
+    const acceptedWorkspaceId = trimBridgeString(event.payload.workspace_id)
+      || trimBridgeString(event.payload.workspaceId)
+      || trimBridgeString(event.workspace_id)
+      || currentWorkspaceId;
+    if (acceptedSessionId && (!currentSessionId || currentSessionId === acceptedSessionId)) {
+      persistWorkspaceBinding(acceptedWorkspaceId, currentWorkspacePath, acceptedSessionId);
+      emitDataMessage('sessionTurnAccepted', {
+        sessionId: acceptedSessionId,
+        workspaceId: acceptedWorkspaceId,
+        createdSession: event.payload.created_session ?? event.payload.createdSession ?? false,
+        route: event.payload.route ?? (eventType === 'session.turn.task.accepted' ? 'task' : ''),
+      });
+    }
+  }
 
   if (eventType === 'session.turn.item') {
     if (handleSessionTurnItemEvent(event)) {
@@ -2173,6 +2205,8 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
   const userMessageId = queueDrainActive && input.requestId
     ? `queued-user-${requestId}`
     : generateMessageId();
+  const placeholderMessageId = `assistant-placeholder-${requestId}`;
+  const turnOrderSeq = allocateTurnOrderSeq();
 
   emitDataMessage('processingStateChanged', {
     isProcessing: true,
@@ -2184,6 +2218,8 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
   activeTurnLiveContext = {
     requestId,
     userMessageId,
+    placeholderMessageId,
+    turnOrderSeq,
   };
 
   // 立即创建本地用户消息节点（不等后端返回），确保发送后用户消息立即显示在最终位置
@@ -2191,10 +2227,33 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
     metadata: {
       requestId,
       userMessageId,
+      placeholderMessageId,
+      turnOrderSeq,
+      itemSeq: 1,
+      blockSeq: 1,
+      cardStreamSeq: 1,
+      turnItemKind: 'user_message',
+      ...(currentSessionId ? { sessionId: currentSessionId } : {}),
     },
     id: userMessageId,
   });
   emitMessage({ type: 'unifiedMessage', message: localUserMsg });
+  const localPlaceholder = createStreamingMessage('orchestrator', 'orchestrator', `assistant-placeholder-${requestId}`, {
+    id: placeholderMessageId,
+    metadata: {
+      requestId,
+      userMessageId,
+      placeholderMessageId,
+      isPlaceholder: true,
+      placeholderState: 'pending',
+      turnOrderSeq,
+      itemSeq: 2,
+      blockSeq: 2,
+      cardStreamSeq: 2,
+      ...(currentSessionId ? { sessionId: currentSessionId } : {}),
+    },
+  });
+  emitMessage({ type: 'unifiedMessage', message: localPlaceholder });
 
   try {
     await ensureFreshLiveBridge('execute_task_preflight');
@@ -2205,7 +2264,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
       images,
       requestId,
       userMessageId,
-      placeholderMessageId: null,
+      placeholderMessageId,
     }, {
       workspaceId: currentWorkspaceId,
       workspacePath: currentWorkspacePath,
@@ -2214,19 +2273,58 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
 
     // 后端返回 canonical userMessageItemId，emit 更新消息以替换前端临时节点
     const canonicalUserMessageId = turnResult.userMessageItemId || userMessageId;
+    const canonicalTurnSeq = typeof turnResult.acceptedAt === 'number' && Number.isFinite(turnResult.acceptedAt)
+      ? Math.max(1, Math.floor(turnResult.acceptedAt))
+      : undefined;
+    if (typeof canonicalTurnSeq === 'number') {
+      activeTurnLiveContext = {
+        requestId,
+        userMessageId,
+        placeholderMessageId,
+        turnOrderSeq,
+        turnSeq: canonicalTurnSeq,
+      };
+    }
+    const resolvedSessionId = typeof turnResult.sessionId === 'string' && turnResult.sessionId.trim()
+      ? turnResult.sessionId.trim()
+      : currentSessionId;
     const userMsg = createUserInputMessage(normalizedText, `user-input-${requestId}`, {
       metadata: {
         requestId,
         userMessageId,
+        placeholderMessageId,
         turnItemId: canonicalUserMessageId,
+        turnOrderSeq,
+        ...(typeof canonicalTurnSeq === 'number' ? { turnSeq: canonicalTurnSeq } : {}),
+        itemSeq: 1,
+        blockSeq: 1,
+        cardStreamSeq: 1,
+        turnItemKind: 'user_message',
+        ...(resolvedSessionId ? { sessionId: resolvedSessionId } : {}),
         images: images.length > 0 ? images : undefined,
       },
       id: canonicalUserMessageId,
     });
     emitMessage({ type: 'unifiedMessage', message: userMsg });
-    const resolvedSessionId = typeof turnResult.sessionId === 'string' && turnResult.sessionId.trim()
-      ? turnResult.sessionId.trim()
-      : currentSessionId;
+    if (typeof canonicalTurnSeq === 'number') {
+      const canonicalPlaceholder = createStreamingMessage('orchestrator', 'orchestrator', `assistant-placeholder-${requestId}`, {
+        id: placeholderMessageId,
+        metadata: {
+          requestId,
+          userMessageId,
+          placeholderMessageId,
+          isPlaceholder: true,
+          placeholderState: 'pending',
+          turnOrderSeq,
+          turnSeq: canonicalTurnSeq,
+          itemSeq: 2,
+          blockSeq: 2,
+          cardStreamSeq: 2,
+          ...(resolvedSessionId ? { sessionId: resolvedSessionId } : {}),
+        },
+      });
+      emitMessage({ type: 'unifiedMessage', message: canonicalPlaceholder });
+    }
     if (resolvedSessionId) {
       persistWorkspaceBinding(currentWorkspaceId, currentWorkspacePath, resolvedSessionId);
     }
@@ -2251,6 +2349,30 @@ async function executeTask(input: ExecuteTaskInput): Promise<void> {
     clearActiveTurnInFlight();
     clearCurrentInterruptTaskId();
     console.error('[web-client-bridge] 执行任务失败:', error);
+    const errorText = normalizeErrorMessage(error) || '发送消息失败';
+    const localErrorMessage = createErrorMessage(
+      errorText,
+      'orchestrator',
+      'orchestrator',
+      `assistant-error-${requestId}`,
+      {
+        id: placeholderMessageId,
+        metadata: {
+          error: errorText,
+          requestId,
+          userMessageId,
+          placeholderMessageId,
+          wasPlaceholder: true,
+          turnItemKind: 'assistant_error',
+          turnOrderSeq,
+          itemSeq: 2,
+          blockSeq: 2,
+          cardStreamSeq: 2,
+          ...(currentSessionId ? { sessionId: currentSessionId } : {}),
+        },
+      },
+    );
+    emitMessage({ type: 'unifiedComplete', message: localErrorMessage });
     emitBridgeErrorToast('发送消息', error);
     emitForcedProcessingIdle('execute_task_failed', {
       error: normalizeErrorMessage(error),

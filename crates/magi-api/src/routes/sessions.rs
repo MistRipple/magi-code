@@ -102,7 +102,9 @@ async fn submit_session_turn(
                 .session_store
                 .runtime_sidecar(&accepted.session_id)
                 .and_then(|sidecar| sidecar.ownership.execution_chain_ref);
-            let user_message_item_id = format!("turn-item-user-{}", accepted.accepted_at.0);
+            let user_message_item_id = request
+                .user_message_id()
+                .unwrap_or_else(|| format!("turn-item-user-{}", accepted.accepted_at.0));
             Ok(Json(SessionTurnResponseDto::new(
                 accepted.session_id,
                 accepted.entry_id,
@@ -134,9 +136,11 @@ async fn submit_session_turn(
             finalize_continue_session(state.clone(), accepted.clone(), accepted_at);
             state.persist_runtime_durable_state()?;
             let event_id = publish_session_turn_continue_event(&state, &accepted, accepted_at)?;
-            let user_message_item_id = prompt_text
-                .as_ref()
-                .map(|_| format!("turn-item-user-{}", accepted_at.0));
+            let user_message_item_id = prompt_text.as_ref().map(|_| {
+                request
+                    .user_message_id()
+                    .unwrap_or_else(|| format!("turn-item-user-{}", accepted_at.0))
+            });
             Ok(Json(SessionTurnResponseDto::new(
                 accepted.session_id,
                 format!("timeline-{}-{}", session_id, accepted_at.0),

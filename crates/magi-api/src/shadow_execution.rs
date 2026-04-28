@@ -289,6 +289,12 @@ pub(crate) fn run_shadow_dispatch_submission(
             is_primary: false,
         });
     }
+    let request_id = request.request_id.clone();
+    let user_message_id = request.user_message_id.clone();
+    let placeholder_message_id = request.placeholder_message_id.clone();
+    let user_message_item_id = user_message_id
+        .clone()
+        .unwrap_or_else(|| format!("turn-item-user-{}", accepted_at.0));
     let mut current_turn = ActiveExecutionTurn {
         turn_id: format!("turn-session-action-{}", accepted_at.0),
         turn_seq: accepted_at.0,
@@ -298,7 +304,7 @@ pub(crate) fn run_shadow_dispatch_submission(
         user_message: trimmed_text.map(str::to_string),
         items: vec![
             ActiveExecutionTurnItem {
-                item_id: format!("turn-item-user-{}", accepted_at.0),
+                item_id: user_message_item_id,
                 item_seq: 1,
                 lane_id: None,
                 lane_seq: None,
@@ -316,9 +322,9 @@ pub(crate) fn run_shadow_dispatch_submission(
                 tool_arguments: None,
                 tool_result: None,
                 tool_error: None,
-                request_id: None,
-                user_message_id: None,
-                placeholder_message_id: None,
+                request_id: request_id.clone(),
+                user_message_id: user_message_id.clone(),
+                placeholder_message_id: placeholder_message_id.clone(),
                 timeline_entry_id: Some(entry_id.to_string()),
                 thread_visible: !request.deep_task,
                 worker_visible: false,
@@ -342,9 +348,9 @@ pub(crate) fn run_shadow_dispatch_submission(
                 tool_arguments: None,
                 tool_result: None,
                 tool_error: None,
-                request_id: None,
-                user_message_id: None,
-                placeholder_message_id: None,
+                request_id: request_id.clone(),
+                user_message_id: user_message_id.clone(),
+                placeholder_message_id: placeholder_message_id.clone(),
                 timeline_entry_id: None,
                 thread_visible: true,
                 worker_visible: false,
@@ -395,9 +401,9 @@ pub(crate) fn run_shadow_dispatch_submission(
             tool_arguments: None,
             tool_result: None,
             tool_error: None,
-            request_id: None,
-            user_message_id: None,
-            placeholder_message_id: None,
+            request_id: request_id.clone(),
+            user_message_id: user_message_id.clone(),
+            placeholder_message_id: placeholder_message_id.clone(),
             timeline_entry_id: None,
             thread_visible: false,
             worker_visible: true,
@@ -463,6 +469,9 @@ pub(crate) fn run_shadow_session_action(
             deep_task: request.deep_task,
             skill_name: request.skill_name.clone(),
             target_role: None,
+            request_id: request.request_id(),
+            user_message_id: request.user_message_id(),
+            placeholder_message_id: request.placeholder_message_id(),
         },
     )
 }
@@ -1467,6 +1476,9 @@ mod tests {
                 deep_task: false,
                 skill_name: None,
                 target_role: None,
+                request_id: Some("request-shadow-alias".to_string()),
+                user_message_id: Some("user-shadow-alias".to_string()),
+                placeholder_message_id: Some("assistant-placeholder-shadow-alias".to_string()),
             },
         )
         .expect("shadow dispatch should create task graph");
@@ -1482,13 +1494,25 @@ mod tests {
             .and_then(|chain| chain.current_turn.as_ref())
             .expect("current turn should exist");
         assert_eq!(turn.user_message.as_deref(), Some("用户原始任务描述"));
-        assert!(
-            turn.items
-                .first()
-                .is_some_and(|item| item.kind == "user_message"
-                    && item.content.as_deref() == Some("用户原始任务描述")
-                    && item.thread_visible),
-            "turn ordered items 必须保留用户原文，并作为 canonical 用户消息进入响应区渲染"
+        let user_item = turn
+            .items
+            .first()
+            .expect("turn 必须包含 canonical 用户消息");
+        assert_eq!(user_item.item_id, "user-shadow-alias");
+        assert_eq!(user_item.kind, "user_message");
+        assert_eq!(user_item.content.as_deref(), Some("用户原始任务描述"));
+        assert!(user_item.thread_visible);
+        assert_eq!(
+            user_item.request_id.as_deref(),
+            Some("request-shadow-alias")
+        );
+        assert_eq!(
+            user_item.user_message_id.as_deref(),
+            Some("user-shadow-alias")
+        );
+        assert_eq!(
+            user_item.placeholder_message_id.as_deref(),
+            Some("assistant-placeholder-shadow-alias")
         );
     }
 
@@ -1517,6 +1541,9 @@ mod tests {
                 deep_task: true,
                 skill_name: None,
                 target_role: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
             },
         );
 

@@ -1,11 +1,51 @@
 import type { Message, TimelineExecutionItem } from '../types/message';
 import { mergeCompleteBlocksForFinalization } from './streaming-complete-merge';
+import {
+  compareTimelineSemanticOrder,
+  resolveTimelineTurnOrderSeqFromMetadata,
+} from '../shared/timeline-ordering';
 
 function compareExecutionItems(left: TimelineExecutionItem, right: TimelineExecutionItem): number {
-  if (left.anchorEventSeq !== right.anchorEventSeq) {
-    return left.anchorEventSeq - right.anchorEventSeq;
+  const semanticOrder = compareTimelineSemanticOrder(
+    {
+      turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(left.message.metadata),
+      itemSeq: left.cardStreamSeq,
+      displayOrder: left.itemOrder || 0,
+    },
+    {
+      turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(right.message.metadata),
+      itemSeq: right.cardStreamSeq,
+      displayOrder: right.itemOrder || 0,
+    },
+  );
+  if (semanticOrder !== 0) {
+    return semanticOrder;
   }
   return left.itemId.localeCompare(right.itemId);
+}
+
+function readPositiveMetadataNumber(metadata: Record<string, unknown> | undefined, key: string): number {
+  const raw = metadata?.[key];
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+    return 0;
+  }
+  const normalized = Math.floor(raw);
+  return normalized > 0 ? normalized : 0;
+}
+
+function preserveStableTurnOrderFact(existingMessage: Message, nextMessage: Message): Message {
+  const existingTurnOrderSeq = readPositiveMetadataNumber(existingMessage.metadata, 'turnOrderSeq');
+  const nextTurnOrderSeq = readPositiveMetadataNumber(nextMessage.metadata, 'turnOrderSeq');
+  if (existingTurnOrderSeq <= 0 || nextTurnOrderSeq > 0) {
+    return nextMessage;
+  }
+  return {
+    ...nextMessage,
+    metadata: {
+      ...(nextMessage.metadata || {}),
+      turnOrderSeq: existingTurnOrderSeq,
+    },
+  };
 }
 
 export function mergeFragmentExecutionItems(params: {
@@ -38,19 +78,19 @@ export function mergeFragmentExecutionItems(params: {
       nextItem.message.blocks,
       nextItem.message.blocks,
     );
-    const mergedMessage: Message = {
+    const mergedMessage: Message = preserveStableTurnOrderFact(existingItem.message, {
       ...existingItem.message,
       ...nextItem.message,
       ...(mergedBlocks ? { blocks: mergedBlocks } : {}),
       content: nextItem.message.content || existingItem.message.content,
-    };
+    });
 
     merged.push({
       ...existingItem,
       ...nextItem,
       anchorEventSeq: existingItem.anchorEventSeq,
       latestEventSeq: Math.max(existingItem.latestEventSeq, nextItem.latestEventSeq),
-      cardStreamSeq: Math.max(existingItem.cardStreamSeq, nextItem.cardStreamSeq),
+      cardStreamSeq: existingItem.cardStreamSeq || nextItem.cardStreamSeq,
       timestamp: Math.min(existingItem.timestamp, nextItem.timestamp),
       workerTabs: Array.from(new Set([...(existingItem.workerTabs || []), ...(nextItem.workerTabs || [])])),
       messageIds: Array.from(new Set([...(existingItem.messageIds || []), ...(nextItem.messageIds || [])])),

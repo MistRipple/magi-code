@@ -4794,6 +4794,9 @@ mod tests {
                 deep_task: true,
                 skill_name: None,
                 target_role: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
             },
         )
         .expect("deep dispatch submission should succeed");

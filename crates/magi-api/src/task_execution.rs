@@ -68,6 +68,9 @@ pub struct DispatchSubmissionRequest {
     pub deep_task: bool,
     pub skill_name: Option<String>,
     pub target_role: Option<String>,
+    pub request_id: Option<String>,
+    pub user_message_id: Option<String>,
+    pub placeholder_message_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]

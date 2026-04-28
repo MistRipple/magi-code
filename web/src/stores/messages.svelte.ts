@@ -48,7 +48,7 @@ import {
   resolveTimelineItemSeqFromMetadata,
   resolveTimelineLaneSeqFromMetadata,
   resolveTimelineSortTimestamp,
-  resolveTimelineTurnSeqFromMetadata,
+  resolveTimelineTurnOrderSeqFromMetadata,
   resolveTimelineVersionFromMetadata,
 } from '../shared/timeline-ordering';
 import {
@@ -166,6 +166,8 @@ const WEBVIEW_STATE_SAVE_DEBOUNCE_MS = 120;
 
 /** 全局递增 displayOrder 计数器：节点首次创建时分配稳定序号，后续永不重算 */
 let timelineDisplayOrderCounter = 0;
+/** 本地 turnOrderSeq 计数器：发送意图创建时分配，作为 live 渲染轮次事实 */
+let localTimelineTurnOrderSeqCounter = 0;
 
 type ScrollPanelKey = keyof ScrollPositions;
 
@@ -684,6 +686,29 @@ function normalizeIncomingMessage(message: Message): Message {
   return normalizeMessagePayload(message, '[MessagesStore] 输入消息');
 }
 
+function preserveStableTurnOrderFact(
+  existingMessage: Message | undefined,
+  nextMessage: Message,
+): Message {
+  if (!existingMessage) {
+    return nextMessage;
+  }
+  const existingMetadata = resolveMessageMetadataRecord(existingMessage);
+  const nextMetadata = resolveMessageMetadataRecord(nextMessage);
+  const existingTurnOrderSeq = normalizePositiveSequence(existingMetadata?.turnOrderSeq);
+  const nextTurnOrderSeq = normalizePositiveSequence(nextMetadata?.turnOrderSeq);
+  if (existingTurnOrderSeq <= 0 || nextTurnOrderSeq > 0) {
+    return nextMessage;
+  }
+  return {
+    ...nextMessage,
+    metadata: {
+      ...nextMetadata,
+      turnOrderSeq: existingTurnOrderSeq,
+    },
+  };
+}
+
 function resolveTimelineFragmentMessages(message: Message): Message[] {
   const fragments = expandRenderableTimelineMessages(message as unknown as TimelineFragmentMessage) as unknown as Message[];
   if (fragments.length <= 1) {
@@ -775,6 +800,47 @@ function resolveTimelineNodeId(message: Message): string {
   return message.id;
 }
 
+function normalizePositiveSequence(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return 0;
+  }
+  const normalized = Math.floor(value);
+  return normalized > 0 ? normalized : 0;
+}
+
+function maxTimelineTurnOrderSeqFromMessage(message: Pick<Message, 'metadata'> | undefined): number {
+  return resolveTimelineTurnOrderSeqFromMetadata(resolveMessageMetadataRecord(message));
+}
+
+function maxTimelineTurnOrderSeqFromExecutionItems(items: TimelineExecutionItem[] | undefined): number {
+  return ensureArray<TimelineExecutionItem>(items).reduce(
+    (maxSeq, item) => Math.max(maxSeq, maxTimelineTurnOrderSeqFromMessage(item.message)),
+    0,
+  );
+}
+
+function maxTimelineTurnOrderSeqFromArtifacts(artifacts: TimelineProjectionArtifact[] | undefined): number {
+  return ensureArray<TimelineProjectionArtifact>(artifacts).reduce(
+    (maxSeq, artifact) => Math.max(
+      maxSeq,
+      maxTimelineTurnOrderSeqFromMessage(artifact.message),
+      maxTimelineTurnOrderSeqFromExecutionItems(artifact.executionItems),
+    ),
+    0,
+  );
+}
+
+function maxTimelineTurnOrderSeqFromNodes(nodes: TimelineNode[] | undefined): number {
+  return ensureArray<TimelineNode>(nodes).reduce(
+    (maxSeq, node) => Math.max(
+      maxSeq,
+      maxTimelineTurnOrderSeqFromMessage(node.message),
+      maxTimelineTurnOrderSeqFromExecutionItems(node.executionItems),
+    ),
+    0,
+  );
+}
+
 function resolveTimelineAliasId(rawId: string | undefined): string {
   const normalized = typeof rawId === 'string' ? rawId.trim() : '';
   if (!normalized) return '';
@@ -824,8 +890,8 @@ function normalizeTimelineExecutionItem(item: TimelineExecutionItem): TimelineEx
 function executionItemToOrderInput(item: TimelineExecutionItem): TimelineSemanticOrderInput {
   const metadata = resolveMessageMetadataRecord(item.message);
   return {
-    turnSeq: resolveTimelineTurnSeqFromMetadata(metadata),
-    itemSeq: resolveTimelineItemSeqFromMetadata(metadata) || item.cardStreamSeq || item.itemOrder,
+    turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(metadata),
+    itemSeq: item.cardStreamSeq || resolveTimelineItemSeqFromMetadata(metadata) || item.itemOrder,
     displayOrder: item.itemOrder || 0,
   };
 }
@@ -860,8 +926,10 @@ function normalizeTimelineNode(node: TimelineNode): TimelineNode {
     ? explicitAnchorEventSeq
     : (messageEventSeq ?? 0);
   const latestEventSeq = Math.max(anchorEventSeq, explicitLatestEventSeq, messageEventSeq ?? 0);
-  const cardStreamSeq = getMessageCardStreamSeq(stableMessage)
-    || (typeof node.cardStreamSeq === 'number' && Number.isFinite(node.cardStreamSeq) ? Math.floor(node.cardStreamSeq) : 0);
+  const explicitCardStreamSeq = typeof node.cardStreamSeq === 'number' && Number.isFinite(node.cardStreamSeq)
+    ? Math.max(0, Math.floor(node.cardStreamSeq))
+    : 0;
+  const cardStreamSeq = explicitCardStreamSeq || getMessageCardStreamSeq(stableMessage);
   const cardId = resolveTimelineCardId(stableMessage);
   const dispatchWaveId = typeof stableMessage.metadata?.dispatchWaveId === 'string'
     ? stableMessage.metadata.dispatchWaveId.trim()
@@ -941,7 +1009,7 @@ function rebuildTimelineIndexes(): void {
 function nodeToOrderInput(node: TimelineNode): TimelineSemanticOrderInput {
   const metadata = resolveMessageMetadataRecord(node.message);
   return {
-    turnSeq: resolveTimelineTurnSeqFromMetadata(metadata),
+    turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(metadata),
     itemSeq: node.cardStreamSeq,
     displayOrder: node.displayOrder || 0,
   };
@@ -958,7 +1026,7 @@ interface LocalProjectionFlatRenderEntry {
   groupId: string;
   message: Message;
   timestamp: number;
-  turnSeq: number;
+  turnOrderSeq: number;
   itemSeq: number;
   laneSeq: number;
   anchorEventSeq: number;
@@ -979,7 +1047,7 @@ function shouldRenderTimelineNodeHost(
 
 function renderEntryToOrderInput(entry: LocalProjectionFlatRenderEntry): TimelineSemanticOrderInput {
   return {
-    turnSeq: entry.turnSeq,
+    turnOrderSeq: entry.turnOrderSeq,
     itemSeq: entry.itemSeq,
     displayOrder: entry.cardStreamSeq || 0,
   };
@@ -1039,8 +1107,8 @@ function buildProjectionRenderEntriesFromArtifacts(
         groupId: artifact.artifactId,
         message: artifact.message,
         timestamp: artifact.timestamp,
-        turnSeq: resolveTimelineTurnSeqFromMetadata(artifactMetadata),
-        itemSeq: resolveTimelineItemSeqFromMetadata(artifactMetadata),
+        turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(artifactMetadata),
+        itemSeq: artifact.cardStreamSeq || resolveTimelineItemSeqFromMetadata(artifactMetadata) || artifact.displayOrder,
         laneSeq: resolveTimelineLaneSeqFromMetadata(artifactMetadata),
         anchorEventSeq: artifact.anchorEventSeq,
         blockSeq: getMessageBlockSeq(artifact.message),
@@ -1062,9 +1130,9 @@ function buildProjectionRenderEntriesFromArtifacts(
         groupId: artifact.artifactId,
         message: item.message,
         timestamp: item.timestamp,
-        turnSeq: resolveTimelineTurnSeqFromMetadata(resolveMessageMetadataRecord(item.message)),
-        itemSeq: resolveTimelineItemSeqFromMetadata(resolveMessageMetadataRecord(item.message))
-          || item.cardStreamSeq
+        turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(resolveMessageMetadataRecord(item.message)),
+        itemSeq: item.cardStreamSeq
+          || resolveTimelineItemSeqFromMetadata(resolveMessageMetadataRecord(item.message))
           || item.itemOrder,
         laneSeq: resolveTimelineLaneSeqFromMetadata(resolveMessageMetadataRecord(item.message)),
         anchorEventSeq: item.anchorEventSeq,
@@ -1138,8 +1206,8 @@ function isProjectionArtifact(
 function artifactToOrderInput(artifact: TimelineProjectionArtifact): TimelineSemanticOrderInput {
   const metadata = resolveMessageMetadataRecord(artifact.message);
   return {
-    turnSeq: resolveTimelineTurnSeqFromMetadata(metadata),
-    itemSeq: resolveTimelineItemSeqFromMetadata(metadata),
+    turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(metadata),
+    itemSeq: artifact.cardStreamSeq || resolveTimelineItemSeqFromMetadata(metadata) || artifact.displayOrder,
     displayOrder: artifact.displayOrder || 0,
   };
 }
@@ -1357,7 +1425,7 @@ function patchProjectionArtifactsInPlace(
     }
     const nextMessage = normalizeIncomingMessage(patchedNode.message);
     const nextLatestEventSeq = Math.max(artifact.latestEventSeq, patchedNode.latestEventSeq);
-    const nextCardStreamSeq = Math.max(artifact.cardStreamSeq, patchedNode.cardStreamSeq);
+    const nextCardStreamSeq = artifact.cardStreamSeq || patchedNode.cardStreamSeq;
     maxEventSeq = Math.max(maxEventSeq, nextLatestEventSeq);
     const messageUpdatedAt = Math.max(
       nextMessage.updatedAt || 0,
@@ -1550,23 +1618,27 @@ export function upsertTimelineNode(
     || (cardId ? timelineNodeIdByCardId.get(cardId) : undefined)
     || undefined;
   const stableNodeId = existingNodeId || explicitNodeId;
-  const stableMessage: Message = {
-    ...normalizedMessage,
-    id: stableNodeId,
-  };
-  const fragmentMessages = resolveTimelineFragmentMessages(stableMessage);
-  const usesFragmentExecutionItems = fragmentMessages.length > 1;
-  const hostMessage = stableMessage;
   const nextWorkerTabs = normalizeWorkerTabList(visibility.workerTabs);
   const existingNode = existingNodeId
     ? messagesState.timelineNodes.find((node) => node.nodeId === existingNodeId)
     : undefined;
+  const existingNodeIsPlaceholder = existingNode?.message.metadata?.isPlaceholder === true;
+  const stableMessage = preserveStableTurnOrderFact(existingNode?.message, {
+    ...normalizedMessage,
+    id: stableNodeId,
+  });
+  const fragmentMessages = resolveTimelineFragmentMessages(stableMessage);
+  const usesFragmentExecutionItems = fragmentMessages.length > 1;
+  const hostMessage = stableMessage;
 
   const nextAnchorEventSeq = getMessageEventSeq(stableMessage)
     ?? (existingNode?.anchorEventSeq || 0);
   const nextLatestEventSeq = getMessageEventSeq(stableMessage)
     ?? (existingNode?.latestEventSeq || nextAnchorEventSeq);
-  const nextCardStreamSeq = getMessageCardStreamSeq(stableMessage) || (existingNode?.cardStreamSeq || 0);
+  const incomingCardStreamSeq = getMessageCardStreamSeq(stableMessage);
+  const nextCardStreamSeq = existingNode && !existingNodeIsPlaceholder
+    ? (existingNode.cardStreamSeq || incomingCardStreamSeq)
+    : incomingCardStreamSeq;
   if (existingNode && compareIncomingMessageVersion(existingNode, stableMessage) < 0) {
     const aliasedNode = mergeTimelineNodeAliases(existingNode, stableMessage, visibility, options);
     mutateTimelineNodes((nodes) => nodes.map((node) => (
@@ -1592,7 +1664,7 @@ export function upsertTimelineNode(
     artifactVersion: existingNode?.artifactVersion,
     anchorEventSeq: existingNode?.anchorEventSeq || nextAnchorEventSeq,
     latestEventSeq: Math.max(existingNode?.latestEventSeq || 0, nextLatestEventSeq),
-    cardStreamSeq: Math.max(existingNode?.cardStreamSeq || 0, nextCardStreamSeq),
+    cardStreamSeq: nextCardStreamSeq,
     timestamp: mergeTimelineSortTimestamp(existingNode?.timestamp, mergedMessage),
     cardId: cardId || existingNode?.cardId,
     worker: resolveTimelineWorker(mergedMessage) || existingNode?.worker,
@@ -1685,11 +1757,11 @@ function updateTimelineNodeByAlias(messageId: string, updates: Partial<Message>)
     if (compareIncomingMessageVersion(target.executionItem, updates as Pick<Message, 'metadata'>) < 0) {
       return target.executionItem.message;
     }
-    const nextMessage = normalizeIncomingMessage({
+    const nextMessage = preserveStableTurnOrderFact(target.executionItem.message, normalizeIncomingMessage({
       ...target.executionItem.message,
       ...updates,
       id: target.executionItem.itemId,
-    });
+    }));
     const executionVisibility = resolveWorkerVisibility(nextMessage);
     const nextExecutionItem = normalizeTimelineExecutionItem({
       ...target.executionItem,
@@ -1697,10 +1769,7 @@ function updateTimelineNodeByAlias(messageId: string, updates: Partial<Message>)
         target.executionItem.latestEventSeq,
         getMessageEventSeq(nextMessage) ?? target.executionItem.latestEventSeq,
       ),
-      cardStreamSeq: Math.max(
-        target.executionItem.cardStreamSeq,
-        getMessageCardStreamSeq(nextMessage) || target.executionItem.cardStreamSeq,
-      ),
+      cardStreamSeq: target.executionItem.cardStreamSeq || getMessageCardStreamSeq(nextMessage),
       worker: resolveTimelineWorker(nextMessage) || target.executionItem.worker,
       threadVisible: target.executionItem.threadVisible || executionVisibility.threadVisible,
       workerTabs: [
@@ -1720,7 +1789,7 @@ function updateTimelineNodeByAlias(messageId: string, updates: Partial<Message>)
     const nextNode = normalizeTimelineNode({
       ...currentNode,
       latestEventSeq: Math.max(currentNode.latestEventSeq, nextExecutionItem.latestEventSeq),
-      cardStreamSeq: Math.max(currentNode.cardStreamSeq, nextExecutionItem.cardStreamSeq),
+      cardStreamSeq: currentNode.cardStreamSeq || nextExecutionItem.cardStreamSeq,
       workerTabs: [
         ...currentNode.workerTabs,
         ...nextExecutionItem.workerTabs,
@@ -1736,11 +1805,11 @@ function updateTimelineNodeByAlias(messageId: string, updates: Partial<Message>)
   if (compareIncomingMessageVersion(currentNode, updates as Pick<Message, 'metadata'>) < 0) {
     return currentNode.message;
   }
-  const nextMessage = normalizeIncomingMessage({
+  const nextMessage = preserveStableTurnOrderFact(currentNode.message, normalizeIncomingMessage({
     ...currentNode.message,
     ...updates,
     id: stableId,
-  });
+  }));
   const fragmentMessages = resolveTimelineFragmentMessages(nextMessage);
   const usesFragmentExecutionItems = fragmentMessages.length > 1;
   const nextVisibleMessage = nextMessage;
@@ -1750,10 +1819,7 @@ function updateTimelineNodeByAlias(messageId: string, updates: Partial<Message>)
       currentNode.latestEventSeq,
       getMessageEventSeq(nextMessage) ?? currentNode.latestEventSeq,
     ),
-    cardStreamSeq: Math.max(
-      currentNode.cardStreamSeq,
-      getMessageCardStreamSeq(nextMessage) || currentNode.cardStreamSeq,
-    ),
+    cardStreamSeq: currentNode.cardStreamSeq || getMessageCardStreamSeq(nextMessage),
     worker: resolveTimelineWorker(nextMessage) || currentNode.worker,
     cardId: resolveTimelineCardId(nextMessage) || currentNode.cardId,
     workerTabs: currentNode.workerTabs,
@@ -2085,6 +2151,16 @@ export function getState() {
     // Worker 运行态（统一入口）
     get workerRuntime() { return workerRuntime; },
   };
+}
+
+export function allocateTurnOrderSeq(): number {
+  localTimelineTurnOrderSeqCounter = Math.max(
+    normalizePositiveSequence(localTimelineTurnOrderSeqCounter),
+    maxTimelineTurnOrderSeqFromNodes(messagesState.timelineNodes),
+    maxTimelineTurnOrderSeqFromArtifacts(messagesState.timelineProjection?.artifacts),
+  );
+  localTimelineTurnOrderSeqCounter += 1;
+  return localTimelineTurnOrderSeqCounter;
 }
 
 // ============ 状态更新函数 ============
@@ -2451,6 +2527,30 @@ export function setCurrentSessionId(id: string | null) {
   }
   syncNotificationsFromSession(nextSessionId);
   saveWebviewState();
+}
+
+export function adoptCurrentSessionIdForLiveTurn(id: string | null | undefined): boolean {
+  const nextSessionId = normalizeSessionId(id);
+  if (!nextSessionId) {
+    return false;
+  }
+  const currentSessionId = normalizeSessionId(messagesState.currentSessionId);
+  if (currentSessionId === nextSessionId) {
+    return true;
+  }
+  if (currentSessionId) {
+    return false;
+  }
+  messagesState.currentSessionId = nextSessionId;
+  messagesState.sessionHistory = {
+    sessionId: nextSessionId,
+    hasMoreBefore: false,
+    beforeCursor: null,
+    isLoadingBefore: false,
+  };
+  syncNotificationsFromSession(nextSessionId);
+  saveWebviewState();
+  return true;
 }
 
 export function updateSessions(newSessions: Session[]) {
@@ -3048,11 +3148,11 @@ function flushAllStreamUpdates(): void {
         updateTimelineNodeByAlias(flush.messageId, flush.updates);
       } else {
         patchTimelineNodeInPlace(target.node.nodeId, (node) => {
-          const nextMessage = normalizeIncomingMessage({
+          const nextMessage = preserveStableTurnOrderFact(node.message, normalizeIncomingMessage({
             ...node.message,
             ...flush.updates,
             id: node.nodeId,
-          });
+          }));
           const patched = {
             ...node,
             message: nextMessage,
@@ -3060,10 +3160,7 @@ function flushAllStreamUpdates(): void {
               node.latestEventSeq,
               getMessageEventSeq(nextMessage) ?? node.latestEventSeq,
             ),
-            cardStreamSeq: Math.max(
-              node.cardStreamSeq,
-              getMessageCardStreamSeq(nextMessage) || node.cardStreamSeq,
-            ),
+            cardStreamSeq: node.cardStreamSeq || getMessageCardStreamSeq(nextMessage),
           };
           incrementalPatchedNodes.set(node.nodeId, patched);
           return patched;
@@ -3179,6 +3276,7 @@ export function clearAllMessages(options: {
     messagesState.timelineProjection = null;
     timelineProjectionDirty = false;
     timelineDisplayOrderCounter = 0;
+    localTimelineTurnOrderSeqCounter = 0;
   }
   messagesState.orchestratorRuntimeState = null;
   messagesState.sessionHistory = {
@@ -3316,6 +3414,10 @@ export function setTimelineProjection(
   timelineDisplayOrderCounter = canonicalProjection.artifacts.reduce(
     (max, a) => Math.max(max, a.displayOrder || 0),
     timelineDisplayOrderCounter,
+  );
+  localTimelineTurnOrderSeqCounter = Math.max(
+    localTimelineTurnOrderSeqCounter,
+    maxTimelineTurnOrderSeqFromArtifacts(canonicalProjection.artifacts),
   );
   messagesState.timelineProjection = canonicalProjection;
   timelineProjectionSource = options.source || 'authoritative';

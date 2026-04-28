@@ -107,6 +107,7 @@ export type DataMessageType =
   | 'repositoryRefreshed'
   | 'settingsBootstrapLoaded'
   | 'sessionBootstrapLoaded'
+  | 'sessionTurnAccepted'
   | 'timelineProjectionUpdated'
   | 'sessionNotificationsLoaded'
   | 'sessionsUpdated'
@@ -418,6 +419,7 @@ export interface MessageMetadata {
   requestId?: string;
   timelineAnchorTimestamp?: number;
   turnId?: string;
+  turnOrderSeq?: number;
   turnSeq?: number;
   turnItemId?: string;
   turnItemKind?: string;

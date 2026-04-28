@@ -18,6 +18,11 @@ import type {
   TimelineProjectionArtifact,
 } from '../../types/message';
 import { buildEmptyWorkspaceAppState } from './empty-workspace-state';
+import {
+  compareTimelineSemanticOrder,
+  resolveTimelineItemSeqFromMetadata,
+  resolveTimelineTurnOrderSeqFromMetadata,
+} from '../timeline-ordering';
 
 export type BootstrapPayload = SessionBootstrapSnapshot & {
   agent?: {
@@ -1753,17 +1758,26 @@ function compareProjectionArtifactOrder(
   left: TimelineProjectionArtifact,
   right: TimelineProjectionArtifact,
 ): number {
-  const timestampDelta = normalizeNumber(left.timestamp, 0) - normalizeNumber(right.timestamp, 0);
-  if (timestampDelta !== 0) {
-    return timestampDelta;
-  }
-  const displayOrderDelta = normalizeNumber(left.displayOrder, 0) - normalizeNumber(right.displayOrder, 0);
-  if (displayOrderDelta !== 0) {
-    return displayOrderDelta;
-  }
-  const streamSeqDelta = normalizeNumber(left.cardStreamSeq, 0) - normalizeNumber(right.cardStreamSeq, 0);
-  if (streamSeqDelta !== 0) {
-    return streamSeqDelta;
+  const leftMetadata = left.message?.metadata && typeof left.message.metadata === 'object'
+    ? left.message.metadata as Record<string, unknown>
+    : undefined;
+  const rightMetadata = right.message?.metadata && typeof right.message.metadata === 'object'
+    ? right.message.metadata as Record<string, unknown>
+    : undefined;
+  const semanticOrder = compareTimelineSemanticOrder(
+    {
+      turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(leftMetadata),
+      itemSeq: normalizeNumber(left.cardStreamSeq, 0) || resolveTimelineItemSeqFromMetadata(leftMetadata),
+      displayOrder: normalizeNumber(left.displayOrder, 0),
+    },
+    {
+      turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(rightMetadata),
+      itemSeq: normalizeNumber(right.cardStreamSeq, 0) || resolveTimelineItemSeqFromMetadata(rightMetadata),
+      displayOrder: normalizeNumber(right.displayOrder, 0),
+    },
+  );
+  if (semanticOrder !== 0) {
+    return semanticOrder;
   }
   return left.artifactId.localeCompare(right.artifactId);
 }
@@ -2017,12 +2031,16 @@ function buildTurnArtifactsFromSummary(
     }))
     .filter((lane) => lane.laneId.length > 0);
   const toolItemsByCallId = new Map<string, RustSessionRuntimeTurnItemSummary>();
+  const toolStartedItemsByCallId = new Map<string, RustSessionRuntimeTurnItemSummary>();
   for (const item of items) {
     const kind = normalizeString(item.kind);
     if (kind !== 'tool_call_started' && kind !== 'tool_call_result') {
       continue;
     }
     const toolCallId = normalizeString(item.tool_call_id) || normalizeString(item.item_id);
+    if (kind === 'tool_call_started' && !toolStartedItemsByCallId.has(toolCallId)) {
+      toolStartedItemsByCallId.set(toolCallId, item);
+    }
     const current = toolItemsByCallId.get(toolCallId);
     if (!current || kind === 'tool_call_result') {
       toolItemsByCallId.set(toolCallId, item);
@@ -2167,14 +2185,29 @@ function buildTurnArtifactsFromSummary(
     const toolCallId = (kind === 'tool_call_started' || kind === 'tool_call_result')
       ? (normalizeString(item.tool_call_id) || itemId)
       : '';
+    const orderItem = toolCallId
+      ? (toolStartedItemsByCallId.get(toolCallId) || item)
+      : item;
+    const orderItemId = normalizeString(orderItem.item_id);
+    const orderItemSeq = normalizeNumber(orderItem.item_seq, normalizeNumber(item.item_seq, 0));
     const artifactId = (kind === 'tool_call_started' || kind === 'tool_call_result')
       ? `turn:${turnId}:${toolCallId}`
       : `turn:${turnId}:${itemId}`;
     const requestId = normalizeString(item.request_id);
     const userMessageId = normalizeString(item.user_message_id);
+    const placeholderMessageId = normalizeString(item.placeholder_message_id);
     const timelineEntryId = normalizeString(item.timeline_entry_id);
+    const isUserTurnItem = kind === 'user_message';
+    const isAssistantResponseTurnItem = kind === 'assistant_stream'
+      || kind === 'assistant_final'
+      || kind === 'assistant_error';
     const messageIdAliases = new Set<string>([artifactId, itemId, `rust-timeline:${itemId}`]);
-    if (userMessageId) messageIdAliases.add(userMessageId);
+    if (orderItemId) {
+      messageIdAliases.add(orderItemId);
+      messageIdAliases.add(`rust-timeline:${orderItemId}`);
+    }
+    if (isUserTurnItem && userMessageId) messageIdAliases.add(userMessageId);
+    if (isAssistantResponseTurnItem && placeholderMessageId) messageIdAliases.add(placeholderMessageId);
     if (timelineEntryId) messageIdAliases.add(`rust-timeline:${timelineEntryId}`);
     if (kind === 'assistant_final' || kind === 'assistant_stream') {
       const streamingAlias = normalizeString(streamingEntryId);
@@ -2193,10 +2226,10 @@ function buildTurnArtifactsFromSummary(
     artifacts.push({
       artifactId,
       kind: kind.includes('tool') ? 'tool' : 'message',
-      displayOrder: normalizeNumber(turn?.turn_seq, 0) * 1000 + normalizeNumber(item.item_seq, 0),
+      displayOrder: normalizeNumber(turn?.turn_seq, 0) * 1000 + orderItemSeq,
       anchorEventSeq: turnAnchorEventSeq,
       latestEventSeq: turnAnchorEventSeq,
-      cardStreamSeq: normalizeNumber(item.item_seq, 0),
+      cardStreamSeq: orderItemSeq,
       timestamp,
       laneId: laneId || undefined,
       worker: workerId || undefined,
@@ -2218,16 +2251,17 @@ function buildTurnArtifactsFromSummary(
           turnSeq: normalizeNumber(turn?.turn_seq, 0),
           turnItemId: itemId,
           turnItemKind: kind,
-          itemSeq: normalizeNumber(item.item_seq, 0),
-          blockSeq: normalizeNumber(item.item_seq, 0),
+          itemSeq: orderItemSeq,
+          blockSeq: orderItemSeq,
           laneId: laneId || undefined,
           laneSeq: normalizeNumber(item.lane_seq, 0) || undefined,
-          cardStreamSeq: normalizeNumber(item.item_seq, 0),
+          cardStreamSeq: orderItemSeq,
           workerId: workerId || undefined,
           roleId: roleId || undefined,
           currentTurnWorkerLanes,
           requestId: requestId || undefined,
-          userMessageId: userMessageId || undefined,
+          userMessageId: isUserTurnItem && userMessageId ? userMessageId : undefined,
+          placeholderMessageId: isAssistantResponseTurnItem && placeholderMessageId ? placeholderMessageId : undefined,
           timelineEntryId: timelineEntryId || undefined,
           ...(kind === 'tool_call_started' || kind === 'tool_call_result'
             ? {

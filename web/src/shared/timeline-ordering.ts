@@ -1,5 +1,5 @@
 export interface TimelineSemanticOrderInput {
-  turnSeq: number;
+  turnOrderSeq: number;
   itemSeq: number;
   displayOrder: number;
 }
@@ -27,10 +27,17 @@ function resolveNonNegativeMetadataNumber(
   return normalized >= 0 ? normalized : 0;
 }
 
-export function resolveTimelineTurnSeqFromMetadata(
+export function resolveTimelineCanonicalTurnSeqFromMetadata(
   metadata: Record<string, unknown> | undefined,
 ): number {
   return resolveNonNegativeMetadataNumber(metadata, 'turnSeq');
+}
+
+export function resolveTimelineTurnOrderSeqFromMetadata(
+  metadata: Record<string, unknown> | undefined,
+): number {
+  return resolveNonNegativeMetadataNumber(metadata, 'turnOrderSeq')
+    || resolveTimelineCanonicalTurnSeqFromMetadata(metadata);
 }
 
 export function resolveTimelineItemSeqFromMetadata(
@@ -120,8 +127,8 @@ export function compareTimelineSemanticOrder(
   right: TimelineSemanticOrderInput,
 ): number {
   const turnOrder = compareSharedFactOrder(
-    normalizeTimelineSequence(left.turnSeq),
-    normalizeTimelineSequence(right.turnSeq),
+    normalizeTimelineSequence(left.turnOrderSeq),
+    normalizeTimelineSequence(right.turnOrderSeq),
   );
   if (turnOrder !== null) {
     return turnOrder;

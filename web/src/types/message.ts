@@ -194,8 +194,14 @@ export interface RequestResponseBinding {
   requestId: string;
   /** 用户消息 ID */
   userMessageId: string;
+  /** 本地响应占位消息 ID */
+  placeholderMessageId?: string;
   /** 真实响应消息 ID（后端生成） */
   realMessageId?: string;
+  /** 发送意图创建时分配的稳定渲染轮次序号，保证后端 accepted 前也按轮次排序 */
+  turnOrderSeq?: number;
+  /** 后端 accepted 后的 canonical turn 序号 */
+  turnSeq?: number;
   /** 创建时间戳 */
   createdAt: number;
   /** 首 token 超时定时器 ID */

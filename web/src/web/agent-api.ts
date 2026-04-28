@@ -967,6 +967,7 @@ export async function submitSessionTurn(
       rootTaskId?: string | null;
       actionTaskId?: string | null;
       executionChainRef?: string | null;
+      userMessageItemId?: string | null;
     }>(response, 'submit session turn');
     return {
       sessionId: raw.sessionId,
@@ -981,6 +982,9 @@ export async function submitSessionTurn(
         : null,
       executionChainRef: typeof raw.executionChainRef === 'string' && raw.executionChainRef.trim()
         ? raw.executionChainRef.trim()
+        : null,
+      userMessageItemId: typeof raw.userMessageItemId === 'string' && raw.userMessageItemId.trim()
+        ? raw.userMessageItemId.trim()
         : null,
     };
   } catch (error) {

@@ -9,6 +9,25 @@ use magi_core::{
     TaskExecutionTarget, TaskId, UtcMillis, WorkerId,
 };
 
+fn inherit_current_turn_aliases(turn: &ActiveExecutionTurn, item: &mut ActiveExecutionTurnItem) {
+    let Some(alias_source) = turn.items.iter().find(|existing| {
+        existing.request_id.is_some()
+            || existing.user_message_id.is_some()
+            || existing.placeholder_message_id.is_some()
+    }) else {
+        return;
+    };
+    if item.request_id.is_none() {
+        item.request_id = alias_source.request_id.clone();
+    }
+    if item.user_message_id.is_none() {
+        item.user_message_id = alias_source.user_message_id.clone();
+    }
+    if item.placeholder_message_id.is_none() {
+        item.placeholder_message_id = alias_source.placeholder_message_id.clone();
+    }
+}
+
 impl SessionStore {
     fn sync_session_workspace_binding(
         &self,
@@ -578,6 +597,7 @@ impl SessionStore {
             if item.item_seq == 0 {
                 item.item_seq = next_item_seq;
             }
+            inherit_current_turn_aliases(turn, &mut item);
             turn.items.push(item);
             turn.normalize();
             if let Some(chain) = sidecar.active_execution_chain.as_mut() {
@@ -625,6 +645,15 @@ impl SessionStore {
                 if item.item_seq == 0 {
                     item.item_seq = existing.item_seq;
                 }
+                if item.request_id.is_none() {
+                    item.request_id = existing.request_id.clone();
+                }
+                if item.user_message_id.is_none() {
+                    item.user_message_id = existing.user_message_id.clone();
+                }
+                if item.placeholder_message_id.is_none() {
+                    item.placeholder_message_id = existing.placeholder_message_id.clone();
+                }
                 *existing = item;
             } else {
                 let next_item_seq = turn
@@ -637,6 +666,7 @@ impl SessionStore {
                 if item.item_seq == 0 {
                     item.item_seq = next_item_seq;
                 }
+                inherit_current_turn_aliases(turn, &mut item);
                 turn.items.push(item);
             }
 
