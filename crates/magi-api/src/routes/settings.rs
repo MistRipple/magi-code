@@ -548,9 +548,53 @@ fn normalize_engine_entries(raw_engines: &Value) -> Vec<Value> {
     normalized
 }
 
+fn normalize_worker_model_config_entries(raw_workers: &Value) -> HashMap<String, Value> {
+    let mut normalized = HashMap::new();
+    let Some(workers) = raw_workers.as_object() else {
+        return normalized;
+    };
+    for (worker_id, worker_config) in workers {
+        let worker_id = worker_id.trim();
+        if worker_id.is_empty() {
+            continue;
+        }
+        normalized.insert(
+            worker_id.to_string(),
+            normalize_model_config_payload(worker_config.clone()),
+        );
+    }
+    normalized
+}
+
+fn align_engine_llm_with_worker_configs(
+    engines: &mut [Value],
+    worker_configs: &HashMap<String, Value>,
+) {
+    for engine in engines {
+        let Some(engine_id) = engine
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        let Some(worker_config) = worker_configs.get(&engine_id) else {
+            continue;
+        };
+        if let Some(engine_object) = engine.as_object_mut() {
+            engine_object.insert("llm".to_string(), worker_config.clone());
+        }
+    }
+}
+
 pub(crate) fn load_registry_engines(state: &ApiState) -> Vec<Value> {
     let raw_engines = state.settings_store.get_section("engines");
-    let normalized = normalize_engine_entries(&raw_engines);
+    let mut normalized = normalize_engine_entries(&raw_engines);
+    let worker_configs =
+        normalize_worker_model_config_entries(&state.settings_store.get_section("workers"));
+    align_engine_llm_with_worker_configs(&mut normalized, &worker_configs);
     if raw_engines != Value::Array(normalized.clone()) {
         state
             .settings_store
@@ -1421,6 +1465,50 @@ mod tests {
             bootstrap["registryEngines"][0]["llm"]["provider"],
             json!("anthropic")
         );
+    }
+
+    #[tokio::test]
+    async fn settings_bootstrap_aligns_registry_engine_llm_from_worker_config() {
+        let state = test_state();
+        state.settings_store.set_section(
+            "workers",
+            json!({
+                "sonnet-worker": {
+                    "provider": "anthropic",
+                    "baseUrl": "https://api.anthropic.com",
+                    "model": "claude-worker-test",
+                    "urlMode": "standard"
+                }
+            }),
+        );
+        state.settings_store.set_section(
+            "engines",
+            json!([{
+                "id": "sonnet-worker",
+                "displayName": "Sonnet Worker",
+                "llm": {
+                    "provider": "openai",
+                    "baseUrl": "https://api.openai.com",
+                    "model": "stale-openai-model",
+                    "urlMode": "standard"
+                }
+            }]),
+        );
+
+        let bootstrap = settings_bootstrap(State(state.clone()), Query(HashMap::new()))
+            .await
+            .0;
+
+        assert_eq!(
+            bootstrap["registryEngines"][0]["llm"]["provider"],
+            json!("anthropic")
+        );
+        assert_eq!(
+            bootstrap["registryEngines"][0]["llm"]["model"],
+            json!("claude-worker-test")
+        );
+        let persisted_engines = state.settings_store.get_section("engines");
+        assert_eq!(persisted_engines[0]["llm"]["provider"], json!("anthropic"));
     }
 
     #[test]
