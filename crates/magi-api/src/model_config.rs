@@ -263,6 +263,35 @@ impl NormalizedModelConfig {
         }
     }
 
+    pub(crate) fn anthropic_probe_url(&self) -> Result<String, ApiError> {
+        let normalized = self.normalized_http_base_url()?;
+        if matches!(self.url_mode, ModelUrlMode::Full) {
+            if let Some(endpoint) = self.protocol_endpoint.as_deref() {
+                return Ok(format!("{normalized}{endpoint}"));
+            }
+            return Ok(normalized);
+        }
+        if normalized.ends_with("/messages") {
+            return Ok(normalized);
+        }
+        if normalized.ends_with("/v1") {
+            return Ok(format!("{normalized}/messages"));
+        }
+        Ok(format!("{normalized}/v1/messages"))
+    }
+
+    pub(crate) fn anthropic_probe_body(&self) -> Result<Value, ApiError> {
+        Ok(json!({
+            "model": self.require_model()?,
+            "messages": [{
+                "role": "user",
+                "content": "ping"
+            }],
+            "max_tokens": 1,
+            "stream": false,
+        }))
+    }
+
     fn normalized_http_base_url(&self) -> Result<String, ApiError> {
         let normalized = self.require_base_url()?.trim().trim_end_matches('/');
         if normalized.is_empty() {
@@ -420,6 +449,37 @@ mod tests {
         assert_eq!(
             normalize_executable_model_provider(Some(" anthropic ")),
             "anthropic"
+        );
+    }
+
+    #[test]
+    fn normalized_model_config_builds_anthropic_probe_contract() {
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "provider": "anthropic",
+                "baseUrl": "https://api.anthropic.com",
+                "apiKey": "test-key",
+                "model": "claude-sonnet-test",
+                "urlMode": "standard"
+            }),
+            "openai",
+        );
+
+        assert_eq!(
+            config.anthropic_probe_url().expect("probe url"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            config.anthropic_probe_body().expect("probe body"),
+            json!({
+                "model": "claude-sonnet-test",
+                "messages": [{
+                    "role": "user",
+                    "content": "ping"
+                }],
+                "max_tokens": 1,
+                "stream": false
+            })
         );
     }
 

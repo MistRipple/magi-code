@@ -7,7 +7,7 @@ use magi_core::UtcMillis;
 use magi_usage_authority::{
     SessionSummary, UsageAuthority, UsageCallRecordInput, UsageModelSnapshot, UsageTotals,
 };
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -144,6 +144,19 @@ async fn execute_connection_probe(
                     .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
             headers.insert(AUTHORIZATION, auth_value);
             (config.openai_probe_url()?, config.openai_probe_body()?)
+        }
+        "anthropic" => {
+            let api_key = HeaderValue::from_str(config.require_api_key()?)
+                .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
+            headers.insert(HeaderName::from_static("x-api-key"), api_key);
+            headers.insert(
+                HeaderName::from_static("anthropic-version"),
+                HeaderValue::from_static("2023-06-01"),
+            );
+            (
+                config.anthropic_probe_url()?,
+                config.anthropic_probe_body()?,
+            )
         }
         _ => {
             return Err(ApiError::InvalidInput(format!(
@@ -1337,6 +1350,69 @@ mod tests {
             governance,
         )
         .with_tool_registry(tool_registry)
+    }
+
+    async fn anthropic_probe_stub(headers: HeaderMap, Json(payload): Json<Value>) -> Json<Value> {
+        assert_eq!(
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("test-key")
+        );
+        assert_eq!(
+            headers
+                .get("anthropic-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("2023-06-01")
+        );
+        assert_eq!(payload["model"], json!("claude-sonnet-test"));
+        assert_eq!(payload["messages"][0]["content"], json!("ping"));
+        Json(json!({
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "pong" }],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1
+            }
+        }))
+    }
+
+    #[tokio::test]
+    async fn connection_probe_supports_anthropic_messages_api() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stub listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("stub addr should exist")
+        );
+        let app = Router::new().route("/v1/messages", post(anthropic_probe_stub));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("stub server should run");
+        });
+
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "provider": "anthropic",
+                "baseUrl": base_url,
+                "apiKey": "test-key",
+                "model": "claude-sonnet-test",
+                "urlMode": "standard"
+            }),
+            "openai",
+        );
+        let (status, payload) = execute_connection_probe(&config)
+            .await
+            .expect("anthropic probe should succeed");
+
+        assert_eq!(status, 200);
+        assert_eq!(payload["content"][0]["text"], json!("pong"));
+        server.abort();
     }
 
     #[tokio::test]
