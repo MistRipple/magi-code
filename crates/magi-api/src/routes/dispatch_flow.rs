@@ -10,7 +10,9 @@ use super::{
 use crate::{
     dto::SessionTurnRequestDto,
     errors::ApiError,
-    session_turn_writeback::build_completed_turn_timeline_snapshot,
+    session_turn_writeback::{
+        build_completed_turn_timeline_snapshot, publish_current_session_turn_item_event,
+    },
     state::ApiState,
     task_execution::{
         DispatchSubmissionAccepted, DispatchSubmissionRequest, drive_shadow_dispatch_submission,
@@ -256,6 +258,12 @@ pub(super) fn append_dispatch_assistant_message(
     let Some(task_store) = state.task_store() else {
         return;
     };
+    let Some(root_task) = task_store.get_task(&accepted.root_task_id) else {
+        return;
+    };
+    if root_task.status != TaskStatus::Completed {
+        return;
+    }
     let Some(task) = task_store.get_task(&accepted.action_task_id) else {
         return;
     };
@@ -310,6 +318,18 @@ pub(super) fn append_dispatch_assistant_message(
         &streaming_entry_id,
         TimelineEntryKind::AssistantMessage,
         timeline_message,
+    );
+    let workspace_id = state
+        .session_store
+        .execution_ownership(&accepted.session_id)
+        .and_then(|ownership| ownership.workspace_id);
+    publish_current_session_turn_item_event(
+        &state.event_bus,
+        state.session_store.as_ref(),
+        &accepted.session_id,
+        &workspace_id,
+        &streaming_entry_id,
+        state.task_store(),
     );
     let _ = state.event_bus.publish(
         EventEnvelope::domain(

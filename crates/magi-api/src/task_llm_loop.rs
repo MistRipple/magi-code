@@ -20,7 +20,7 @@ use magi_bridge_client::{
 };
 use magi_core::{
     ApprovalRequirement, EventId, ExecutionResultStatus, LeaseId, RiskLevel, SessionId, TaskId,
-    ToolCallId, UtcMillis, WorkspaceId,
+    TaskStatus, ToolCallId, UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::ToolKind;
@@ -54,6 +54,9 @@ pub(crate) struct TaskLlmLoopRequest<'a> {
     pub tools: Option<Vec<ChatToolDefinition>>,
     pub usage_binding: &'a ModelUsageBinding,
     pub streaming_entry_id: Option<&'a str>,
+    pub worker_lane_id: Option<&'a str>,
+    pub worker_lane_seq: Option<usize>,
+    pub worker_id: Option<&'a magi_core::WorkerId>,
     pub context_summary: Option<ExecutionContextSummary>,
     pub system_prompt: Option<String>,
 }
@@ -63,17 +66,33 @@ struct TaskTurnVisibility {
     thread_visible: bool,
     worker_visible: bool,
     role_id: Option<String>,
+    worker_id: Option<magi_core::WorkerId>,
+    lane_id: Option<String>,
+    lane_seq: Option<usize>,
 }
 
-fn task_turn_visibility(task: &magi_core::Task, thread_visible: bool) -> TaskTurnVisibility {
+fn task_turn_visibility(
+    task: &magi_core::Task,
+    thread_visible: bool,
+    worker_lane_id: Option<&str>,
+    worker_lane_seq: Option<usize>,
+    worker_id: Option<&magi_core::WorkerId>,
+) -> TaskTurnVisibility {
     let role_id = resolve_task_role(task)
         .map(str::trim)
         .filter(|role| !role.is_empty())
         .map(ToOwned::to_owned);
+    let lane_id = worker_lane_id
+        .map(str::trim)
+        .filter(|lane| !lane.is_empty())
+        .map(ToOwned::to_owned);
     TaskTurnVisibility {
         thread_visible,
-        worker_visible: role_id.is_some(),
+        worker_visible: lane_id.is_some(),
         role_id,
+        worker_id: worker_id.cloned(),
+        lane_id,
+        lane_seq: worker_lane_seq,
     }
 }
 
@@ -86,8 +105,9 @@ fn apply_task_turn_visibility(
     item.thread_visible = visibility.thread_visible;
     item.worker_visible = visibility.worker_visible;
     if visibility.worker_visible {
-        item.lane_id = Some(format!("lane-{}", task.task_id));
-        item.lane_seq = Some(1);
+        item.lane_id = visibility.lane_id.clone();
+        item.lane_seq = visibility.lane_seq;
+        item.worker_id = visibility.worker_id.clone();
     }
     if let Some(role_id) = visibility.role_id.as_ref() {
         item.role_id = Some(role_id.clone());
@@ -115,6 +135,9 @@ pub(crate) fn run_task_llm_loop(
         tools,
         usage_binding,
         streaming_entry_id,
+        worker_lane_id,
+        worker_lane_seq,
+        worker_id,
         context_summary,
         system_prompt,
     } = request;
@@ -152,6 +175,9 @@ pub(crate) fn run_task_llm_loop(
         task,
         streaming_entry_id.is_some()
             || task_is_thread_visible_turn_owner(session_store, session_id, task_id),
+        worker_lane_id,
+        worker_lane_seq,
+        worker_id,
     );
 
     for round in 0..MAX_TOOL_CALL_ROUNDS {
@@ -841,7 +867,10 @@ fn append_task_final_turn_item(
     ) {
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
-    if turn_visibility.thread_visible {
+    let root_task_completed = task_store
+        .get_task(&task.root_task_id)
+        .is_some_and(|root_task| root_task.status == TaskStatus::Completed);
+    if turn_visibility.thread_visible && root_task_completed {
         let _ = session_store.update_current_turn_status(session_id, "completed");
         let timeline_message = build_completed_turn_timeline_snapshot(
             session_store,
@@ -959,7 +988,7 @@ mod tests {
     use magi_bridge_client::{BridgeClientError, BridgeResponse};
     use magi_core::{MissionId, Task, TaskKind, TaskStatus, WorkerId};
     use magi_governance::GovernanceService;
-    use magi_session_store::ActiveExecutionTurn;
+    use magi_session_store::{ActiveExecutionTurn, ActiveExecutionTurnLane, TimelineEntryKind};
     use magi_tool_runtime::{BuiltinTool, BuiltinToolSpec};
     use std::{
         sync::{
@@ -1158,11 +1187,126 @@ mod tests {
     }
 
     #[test]
+    fn task_turn_visibility_does_not_promote_primary_role_to_worker_lane() {
+        let task = make_task_loop_test_task("task-primary-role-only");
+
+        let visibility = task_turn_visibility(&task, true, None, None, None);
+
+        assert!(visibility.thread_visible);
+        assert!(!visibility.worker_visible);
+        assert_eq!(visibility.role_id.as_deref(), Some("integration-dev"));
+        assert!(visibility.lane_id.is_none());
+        assert!(visibility.lane_seq.is_none());
+    }
+
+    #[test]
+    fn task_turn_visibility_uses_authoritative_worker_lane_from_plan() {
+        let task = make_task_loop_test_task("task-worker-lane-order");
+        let worker_id = WorkerId::new("worker-worker-lane-order");
+        let visibility = task_turn_visibility(
+            &task,
+            false,
+            Some("lane-task-worker-lane-order"),
+            Some(3),
+            Some(&worker_id),
+        );
+        let mut item = session_turn_item(
+            "assistant_final",
+            "completed",
+            Some("最终回复".to_string()),
+            Some("worker 输出".to_string()),
+            Some("turn-item-worker-final".to_string()),
+        );
+
+        apply_task_turn_visibility(&mut item, &task, &visibility);
+
+        assert!(!item.thread_visible);
+        assert!(item.worker_visible);
+        assert_eq!(item.lane_id.as_deref(), Some("lane-task-worker-lane-order"));
+        assert_eq!(item.lane_seq, Some(3));
+        assert_eq!(item.worker_id.as_ref(), Some(&worker_id));
+        assert_eq!(item.role_id.as_deref(), Some("integration-dev"));
+    }
+
+    #[test]
+    fn task_final_turn_item_does_not_complete_turn_before_root_task_completes() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(16);
+        let session_id = SessionId::new("session-task-final-root-running");
+        session_store
+            .create_session(session_id.clone(), "task final root running")
+            .expect("session should be creatable");
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-task-final-root-running".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("执行深度任务".to_string()),
+                    items: Vec::new(),
+                    worker_lanes: Vec::new(),
+                },
+            )
+            .expect("turn should be stored");
+
+        let task_store = TaskStore::new();
+        let root_task_id = TaskId::new("task-root-final-root-running");
+        let task_id = TaskId::new("task-action-final-root-running");
+        let mut root_task = make_task_loop_test_task(root_task_id.as_str());
+        root_task.kind = TaskKind::Objective;
+        root_task.status = TaskStatus::Running;
+        task_store.insert_task(root_task);
+        let mut task = make_task_loop_test_task(task_id.as_str());
+        task.root_task_id = root_task_id;
+        task.status = TaskStatus::Completed;
+        task_store.insert_task(task.clone());
+        let visibility = task_turn_visibility(
+            &task,
+            true,
+            None,
+            None,
+            Some(&WorkerId::new("worker-final-root-running")),
+        );
+
+        append_task_final_turn_item(
+            &event_bus,
+            &session_store,
+            &task_store,
+            &task,
+            &session_id,
+            &None,
+            "primary action 已完成",
+            Some("timeline-streaming-task-action-final-root-running"),
+            &visibility,
+        );
+
+        let current_turn = session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("current turn should remain");
+        assert_eq!(current_turn.status, "running");
+        assert!(current_turn.completed_at.is_none());
+        assert!(
+            session_store
+                .timeline_for_session(&session_id)
+                .iter()
+                .all(|entry| !matches!(entry.kind, TimelineEntryKind::AssistantMessage)),
+            "root 未完成时不能写入 completed turn snapshot"
+        );
+    }
+
+    #[test]
     fn task_llm_loop_read_only_shell_tools_execute_concurrently_and_preserve_order() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(64);
         let session_id = SessionId::new("session-task-tool-batch");
         let workspace_id = Some(WorkspaceId::new("workspace-task-tool-batch"));
+        let task_id = TaskId::new("task-tool-batch");
+        let worker_id = WorkerId::new("worker-task-tool-batch");
+        let lane_id = "lane-task-tool-batch".to_string();
         session_store
             .create_session_for_workspace(
                 session_id.clone(),
@@ -1180,20 +1324,28 @@ mod tests {
                     status: "running".to_string(),
                     user_message: Some("验证 worker 工具并发".to_string()),
                     items: Vec::new(),
-                    worker_lanes: Vec::new(),
+                    worker_lanes: vec![ActiveExecutionTurnLane {
+                        lane_id: lane_id.clone(),
+                        lane_seq: 2,
+                        task_id: task_id.clone(),
+                        worker_id: worker_id.clone(),
+                        role_id: Some("integration-dev".to_string()),
+                        title: "验证 worker 工具并发".to_string(),
+                        is_primary: false,
+                    }],
                     completed_at: None,
                 },
             )
             .expect("turn should be creatable");
 
         let task_store = TaskStore::new();
-        let task = make_task_loop_test_task("task-tool-batch");
+        let task = make_task_loop_test_task(task_id.as_str());
         task_store.insert_task(task.clone());
         let lease = task_store
             .grant_lease(
                 &task.task_id,
                 &task.root_task_id,
-                &WorkerId::new("worker-task-tool-batch"),
+                &worker_id,
                 "integration-dev",
                 60_000,
             )
@@ -1234,6 +1386,9 @@ mod tests {
             tools: None,
             usage_binding: &usage_binding,
             streaming_entry_id: None,
+            worker_lane_id: Some(&lane_id),
+            worker_lane_seq: Some(2),
+            worker_id: Some(&worker_id),
             context_summary: None,
             system_prompt: None,
         });
@@ -1261,6 +1416,14 @@ mod tests {
             .runtime_sidecar(&session_id)
             .expect("sidecar should exist");
         let turn = sidecar.current_turn.expect("turn should exist");
+        assert!(
+            turn.items.iter().all(|item| {
+                item.worker_visible
+                    && item.lane_id.as_deref() == Some(lane_id.as_str())
+                    && item.lane_seq == Some(2)
+            }),
+            "worker 输出必须沿用执行计划中的 lane 归属与顺序"
+        );
         assert_eq!(
             turn.items
                 .iter()

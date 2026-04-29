@@ -1,6 +1,10 @@
 <script lang="ts">
   import { getState, getEnabledAgents } from '../stores/messages.svelte';
-  import { resolveAgentIndicatorVariant } from '../lib/agent-status-indicator';
+  import {
+    resolveAgentIndicatorVariant,
+    resolveWorkerRuntimeIndicatorVariant,
+  } from '../lib/agent-status-indicator';
+  import { isWorkerExecutingStatus, selectWorkerRuntime } from '../lib/worker-panel-state';
 
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
@@ -21,7 +25,6 @@
     roleId: string;
     order: number;
     workerId: string;
-    status: string;
   }
 
   interface Props {
@@ -37,34 +40,7 @@
   const enabledAgents = $derived(getEnabledAgents());
   const registrySnapshot = $derived(appState.settingsRegistrySnapshot);
   const timelineProjection = $derived(appState.timelineProjection);
-
-  const WORKER_STATUS_PRIORITY: Record<string, number> = {
-    running: 6,
-    pending: 5,
-    ready: 5,
-    awaiting_approval: 4,
-    review_required: 4,
-    repairing: 4,
-    verifying: 4,
-    blocked: 3,
-    failed: 3,
-    error: 3,
-    cancelled: 3,
-    completed: 1,
-    success: 1,
-    skipped: 1,
-    idle: 1,
-  };
-
-  function resolveStrongerStatus(existing: string, next: string): string {
-    const normalizedExisting = existing.trim();
-    const normalizedNext = next.trim();
-    if (!normalizedExisting) return normalizedNext;
-    if (!normalizedNext) return normalizedExisting;
-    const existingPriority = WORKER_STATUS_PRIORITY[normalizedExisting] ?? 0;
-    const nextPriority = WORKER_STATUS_PRIORITY[normalizedNext] ?? 0;
-    return nextPriority > existingPriority ? normalizedNext : normalizedExisting;
-  }
+  const workerRuntimeMap = $derived(appState.workerRuntime);
 
   function collectCurrentTurnWorkerRoles(): CurrentTurnWorkerRoleTab[] {
     const roleById = new Map<string, CurrentTurnWorkerRoleTab>();
@@ -83,7 +59,6 @@
         roleId,
         order: Math.min(existing?.order ?? Number.MAX_SAFE_INTEGER, order),
         workerId: existing?.workerId || role.workerId || '',
-        status: resolveStrongerStatus(existing?.status || '', role.status || ''),
       });
     };
 
@@ -102,8 +77,7 @@
             ? Math.max(0, Math.floor(lane.laneSeq))
             : Number.MAX_SAFE_INTEGER;
           const workerId = typeof lane?.worker === 'string' ? lane.worker.trim() : '';
-          const status = typeof lane?.status === 'string' ? lane.status.trim() : '';
-          upsertRole({ roleId, order, workerId, status });
+          upsertRole({ roleId, order, workerId });
         }
       }
     }
@@ -132,10 +106,7 @@
             ? Math.max(0, Math.floor(metadata.laneSeq))
             : Number.MAX_SAFE_INTEGER;
           const workerId = typeof metadata.worker === 'string' ? metadata.worker.trim() : (item.worker || '');
-          const status = typeof metadata.laneStatus === 'string'
-            ? metadata.laneStatus.trim()
-            : (typeof metadata.status === 'string' ? metadata.status.trim() : '');
-          upsertRole({ roleId, order, workerId, status });
+          upsertRole({ roleId, order, workerId });
         }
       }
     }
@@ -151,51 +122,8 @@
 
   const currentTurnWorkerRoles = $derived.by(() => collectCurrentTurnWorkerRoles());
 
-  // 底部 tab 只表达角色参与状态，lane/task 只在 worker 面板内容中展示。
-  const workerRoleStatusMap = $derived.by(() => {
-    const map = new Map<string, string>();
-    for (const role of currentTurnWorkerRoles) {
-      if (!role.status) continue;
-      map.set(role.roleId, role.status);
-    }
-    return map;
-  });
-
-  function resolveEffectiveWorkerExecuting(roleId: string): boolean {
-    const roleStatus = workerRoleStatusMap.get(roleId);
-    return roleStatus === 'running'
-      || roleStatus === 'pending'
-      || roleStatus === 'ready'
-      || roleStatus === 'repairing'
-      || roleStatus === 'verifying';
-  }
-
-  function resolveRoleIndicatorVariant(roleId: string): 'brand' | 'warning' | 'error' | 'disabled' | null {
-    const roleStatus = workerRoleStatusMap.get(roleId);
-    switch (roleStatus) {
-      case 'running':
-      case 'pending':
-      case 'ready':
-      case 'repairing':
-      case 'verifying':
-      case 'completed':
-      case 'success':
-      case 'skipped':
-      case 'idle':
-        return 'brand';
-      case 'awaiting_approval':
-      case 'review_required':
-        return 'warning';
-      case 'blocked':
-      case 'failed':
-      case 'error':
-      case 'cancelled':
-        return 'error';
-      case 'disabled':
-        return 'disabled';
-      default:
-        return null;
-    }
+  function resolveWorkerRuntime(roleId: string) {
+    return selectWorkerRuntime(workerRuntimeMap, roleId);
   }
 
   function getWorkerModelStatus(workerId: string): string {
@@ -233,12 +161,13 @@
   <div class="bt-workers-scroll">
     {#each currentTurnWorkerRoles as role (role.roleId)}
       {@const locale = i18n.locale}
-      {@const isExecuting = resolveEffectiveWorkerExecuting(role.roleId)}
       {@const roleSource = resolveWorkerRoleSource(role.roleId, enabledAgents, registrySnapshot)}
       {@const agentColorPair = getAgentColor(role.roleId, roleSource?.colorToken)}
       {@const workerStatus = getWorkerModelStatus(role.roleId)}
-      {@const roleIndicatorVariant = resolveRoleIndicatorVariant(role.roleId)}
-      {@const indicatorVariant = roleIndicatorVariant || resolveAgentIndicatorVariant(workerStatus)}
+      {@const runtime = resolveWorkerRuntime(role.roleId)}
+      {@const isExecuting = isWorkerExecutingStatus(runtime?.status)}
+      {@const runtimeIndicatorVariant = resolveWorkerRuntimeIndicatorVariant(runtime?.status)}
+      {@const indicatorVariant = runtimeIndicatorVariant || resolveAgentIndicatorVariant(workerStatus)}
 
 
       <button

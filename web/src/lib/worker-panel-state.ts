@@ -45,7 +45,7 @@ function normalizeWorkerName(workerName: unknown): string | null {
 }
 
 export function isWorkerExecutingStatus(status: WorkerRuntimeStatus | null | undefined): boolean {
-  return status === 'running';
+  return status === 'running' || status === 'pending';
 }
 
 export function selectWorkerRuntime(
@@ -162,7 +162,13 @@ function resolveAssignmentSemanticStatus(status: unknown): TaskSemanticStatus | 
   if (!normalized) {
     return null;
   }
-  if (normalized === 'running' || normalized === 'executing' || normalized === 'in_progress') {
+  if (
+    normalized === 'running'
+    || normalized === 'executing'
+    || normalized === 'in_progress'
+    || normalized === 'verifying'
+    || normalized === 'repairing'
+  ) {
     return 'running';
   }
   if (normalized === 'awaiting_approval') {
@@ -184,6 +190,7 @@ function resolveAssignmentSemanticStatus(status: unknown): TaskSemanticStatus | 
     || normalized === 'queued'
     || normalized === 'created'
     || normalized === 'planning'
+    || normalized === 'ready'
   ) {
     return 'pending';
   }
@@ -194,6 +201,51 @@ function resolveAssignmentSemanticStatus(status: unknown): TaskSemanticStatus | 
     return normalized === 'skipped' ? 'skipped' : 'completed';
   }
   return null;
+}
+
+function snapshotCanonicalWorkerLanes(
+  messages: Message[],
+  workerName?: AgentId,
+): WorkerAssignmentSnapshot {
+  const snapshot = createEmptyWorkerAssignmentSnapshot();
+  const worker = normalizeWorkerName(workerName);
+  if (!worker) return snapshot;
+
+  for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+    const message = messages[idx];
+    const lanes = message.metadata?.currentTurnWorkerLanes;
+    if (!Array.isArray(lanes) || lanes.length === 0) {
+      continue;
+    }
+
+    const laneStatuses: TaskSemanticStatus[] = [];
+    for (const lane of lanes) {
+      if (!lane || typeof lane !== 'object') {
+        continue;
+      }
+      const record = lane as Record<string, unknown>;
+      if (record.isPrimary === true) {
+        continue;
+      }
+      const roleId = normalizeWorkerName(record.roleId);
+      const laneWorker = normalizeWorkerName(record.worker);
+      if (roleId !== worker && laneWorker !== worker) {
+        continue;
+      }
+      const semanticStatus = resolveAssignmentSemanticStatus(record.status);
+      if (semanticStatus) {
+        laneStatuses.push(semanticStatus);
+      }
+    }
+
+    if (laneStatuses.length > 0) {
+      snapshot.hasAssignments = true;
+      snapshot.statuses.push(...laneStatuses);
+      return snapshot;
+    }
+  }
+
+  return snapshot;
 }
 
 function resolveLiveTaskSnapshotStatus(
@@ -358,9 +410,10 @@ export function deriveWorkerRuntimeState(
   context: WorkerMessageContext,
 ): WorkerRuntimeState {
   const worker = normalizeWorkerName(params.workerName || '');
+  const laneSnapshot = snapshotCanonicalWorkerLanes(params.messages, worker || undefined);
   const instructionSnapshot = snapshotInstructionLaneTasks(context.latestInstructionMessage);
   const assignmentSnapshot = snapshotRuntimeAssignments(params.runtimeState, worker || undefined);
-  const liveRuntimeSnapshot = mergeRuntimeSnapshots(instructionSnapshot, assignmentSnapshot);
+  const liveRuntimeSnapshot = mergeRuntimeSnapshots(laneSnapshot, instructionSnapshot, assignmentSnapshot);
   const liveTaskStatus = resolveLiveTaskSnapshotStatus(liveRuntimeSnapshot);
   const hasStreaming = context.hasAnyStreamingMessage;
   const hasPendingRequest = context.panelHasPendingRequest;

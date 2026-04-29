@@ -643,17 +643,14 @@
     })();
   }
 
-  function switchSession(sessionId: string): void {
+  function switchSession(workspace: AgentWorkspaceSummary, sessionId: string): void {
     if (!sessionId || sessionId === currentSessionId || pendingSessionSwitchId) {
       return;
     }
-    const workspace = workspaces.find((item) => item.workspaceId === selectedWorkspaceId) ?? null;
-    if (!workspace) {
-      return;
-    }
-    const nextSession = (sessionsByWorkspace[selectedWorkspaceId] ?? []).find((session) => session.id === sessionId);
+    const nextSession = (sessionsByWorkspace[workspace.workspaceId] ?? []).find((session) => session.id === sessionId);
     const nextSessionName = nextSession?.name || '未命名会话';
     const fallbackSessionId = typeof currentSessionId === 'string' ? currentSessionId : null;
+    selectedWorkspaceId = workspace.workspaceId;
     currentSessionId = sessionId;
     pendingSessionSwitchId = sessionId;
     syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, sessionId);
@@ -887,7 +884,7 @@
                           class:pending={session.id === pendingSessionSwitchId}
                           data-session-id={session.id}
                           disabled={pendingSessionSwitchId !== null}
-                          onclick={() => switchSession(session.id)}
+                          onclick={() => switchSession(workspace, session.id)}
                         >
                           <span class="session-name">{session.name || i18n.t('header.unnamedSession')}</span>
                           <span class="session-meta">{formatSessionMeta(session)}</span>

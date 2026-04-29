@@ -330,9 +330,9 @@ impl WorkerExecutionDispatcher {
         steps.push(WorkerExecutionIntentStep::FinalReport(
             WorkerExecutionFinalReport {
                 summary: format!("执行任务: {}", task.title),
-                result_kind: None,
-                termination_reason: None,
-                verification_status: magi_core::VerificationStatus::Pending,
+                result_kind: Some(TaskResultKind::Success),
+                termination_reason: Some(magi_core::TerminationReason::Completed),
+                verification_status: magi_core::VerificationStatus::Passed,
             },
         ));
 
@@ -609,6 +609,14 @@ impl TaskRunner {
             // Decision tasks are never dispatched to workers — they wait for
             // human input.
             if task.kind == TaskKind::Decision {
+                unmatched_ids.push(task.task_id.clone());
+                continue;
+            }
+
+            if !matches!(
+                task.kind,
+                TaskKind::Action | TaskKind::Validation | TaskKind::Repair
+            ) {
                 unmatched_ids.push(task.task_id.clone());
                 continue;
             }
@@ -1228,8 +1236,14 @@ impl TaskRunner {
                     None => continue,
                 };
 
-                if is_terminal(task.status) || task.status == TaskStatus::Ready {
-                    // Ready 任务尚未被调度或刚从 Repairing 释放，不应被自动完成。
+                if is_terminal(task.status)
+                    || (task.status == TaskStatus::Ready
+                        && !matches!(
+                            task.kind,
+                            TaskKind::Objective | TaskKind::Phase | TaskKind::WorkPackage
+                        ))
+                {
+                    // 可执行 Ready 任务尚未被调度或刚从 Repairing 释放，不应被自动完成。
                     continue;
                 }
 
@@ -1643,7 +1657,7 @@ mod tests {
     use super::*;
     use magi_core::{
         AssignmentLease, LeaseId, LeaseStatus, MissionId, Task, TaskId, TaskKind, TaskPolicy,
-        TaskStatus, UtcMillis, WorkerId,
+        TaskResultKind, TaskStatus, TerminationReason, UtcMillis, VerificationStatus, WorkerId,
     };
 
     fn make_task(
@@ -1690,6 +1704,40 @@ mod tests {
             parallelism_limit: None,
             system_prompt_template: None,
         }
+    }
+
+    #[test]
+    fn worker_execution_intent_final_report_is_success_when_generated_steps_succeed() {
+        let dispatcher = WorkerExecutionDispatcher::new(
+            WorkerRuntime::new(Arc::new(InMemoryEventBus::new(64))),
+            Arc::new(EventBasedResultReceiver::new()),
+        );
+        let task = make_task(
+            "validation-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Validation,
+            TaskStatus::Ready,
+        );
+        let worker = make_worker("worker-reviewer", "reviewer", vec![TaskKind::Validation]);
+
+        let intent = dispatcher.build_intent_from_task(&task, &worker);
+        let final_report = intent
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                WorkerExecutionIntentStep::FinalReport(report) => Some(report),
+                _ => None,
+            })
+            .expect("generated worker intent should include final report");
+
+        assert_eq!(final_report.result_kind, Some(TaskResultKind::Success));
+        assert_eq!(
+            final_report.termination_reason,
+            Some(TerminationReason::Completed)
+        );
+        assert_eq!(final_report.verification_status, VerificationStatus::Passed);
     }
 
     // -----------------------------------------------------------------------
@@ -1914,6 +1962,71 @@ mod tests {
         // The root objective should have been propagated to Completed.
         let obj = store.get_task(&TaskId::new("obj-1")).unwrap();
         assert_eq!(obj.status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn ready_structural_parent_completed_when_all_children_complete() {
+        let store = Arc::new(TaskStore::new());
+
+        let root = make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let phase = make_task(
+            "phase-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Phase,
+            TaskStatus::Ready,
+        );
+        let work_package = make_task(
+            "wp-1",
+            "m-1",
+            "obj-1",
+            Some("phase-1"),
+            TaskKind::WorkPackage,
+            TaskStatus::Ready,
+        );
+        let action = make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("wp-1"),
+            TaskKind::Action,
+            TaskStatus::Completed,
+        );
+        let validation = make_task(
+            "validation-1",
+            "m-1",
+            "obj-1",
+            Some("wp-1"),
+            TaskKind::Validation,
+            TaskStatus::Completed,
+        );
+
+        store.insert_task(root);
+        store.insert_task(phase);
+        store.insert_task(work_package);
+        store.insert_task(action);
+        store.insert_task(validation);
+
+        let runner = TaskRunner::new(Arc::clone(&store), Vec::new());
+
+        let outcome = runner.run_cycle(&TaskId::new("obj-1"));
+        assert_eq!(outcome, RunCycleOutcome::AllComplete);
+        assert_eq!(
+            store.get_task(&TaskId::new("wp-1")).unwrap().status,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            store.get_task(&TaskId::new("phase-1")).unwrap().status,
+            TaskStatus::Completed
+        );
     }
 
     // -----------------------------------------------------------------------

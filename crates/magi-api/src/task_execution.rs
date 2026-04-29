@@ -8,6 +8,9 @@ use crate::{
     model_config::NormalizedModelConfig,
     prompt_utils::prepend_session_instructions,
     session_turn_execution::{SessionTurnExecutionRuntime, run_session_turn_execution},
+    session_turn_writeback::{
+        build_completed_turn_timeline_snapshot, publish_current_session_turn_item_event,
+    },
     settings_store::SettingsStore,
     shadow_execution::{
         ShadowTaskGraphSubmission, cleanup_shadow_task_tree, run_shadow_dispatch_submission,
@@ -85,6 +88,109 @@ pub struct DispatchSubmissionAccepted {
     pub root_task_id: TaskId,
     pub action_task_id: TaskId,
     pub runner_started: bool,
+}
+
+pub fn finalize_background_session_task_turn_if_root_completed(
+    state: &ApiState,
+    session_id: &SessionId,
+    root_task_id: &TaskId,
+) -> bool {
+    let Some(task_store) = state.task_store() else {
+        return false;
+    };
+    let Some(root_task) = task_store.get_task(root_task_id) else {
+        return false;
+    };
+    if root_task.status != TaskStatus::Completed {
+        return false;
+    }
+
+    let Some(sidecar) = state.session_store.runtime_sidecar(session_id) else {
+        return false;
+    };
+    let Some(active_chain) = sidecar.active_execution_chain.as_ref() else {
+        return false;
+    };
+    if active_chain.root_task_id != *root_task_id {
+        return false;
+    }
+    let workspace_id = active_chain.workspace_id.clone();
+    let Some(turn) = sidecar.current_turn.as_ref() else {
+        return false;
+    };
+    let Some((response_text, streaming_entry_id)) = turn
+        .items
+        .iter()
+        .filter(|item| item.kind == "assistant_final" && item.thread_visible)
+        .filter_map(|item| {
+            let content = item.content.as_ref()?.trim();
+            if content.is_empty() {
+                return None;
+            }
+            let entry_id = item
+                .timeline_entry_id
+                .as_deref()
+                .filter(|entry_id| !entry_id.trim().is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    item.item_id
+                        .starts_with("timeline-")
+                        .then(|| item.item_id.clone())
+                })
+                .unwrap_or_else(|| format!("timeline-turn-snapshot-{}", root_task_id));
+            Some((item.item_seq, content.to_string(), entry_id))
+        })
+        .max_by_key(|(item_seq, _, _)| *item_seq)
+        .map(|(_, content, entry_id)| (content, entry_id))
+    else {
+        return false;
+    };
+
+    if state
+        .session_store
+        .update_current_turn_status(session_id, "completed")
+        .is_err()
+    {
+        return false;
+    }
+    let timeline_message = build_completed_turn_timeline_snapshot(
+        state.session_store.as_ref(),
+        session_id,
+        Some(&response_text),
+        Some(&streaming_entry_id),
+        state.task_store(),
+    )
+    .unwrap_or_else(|| response_text.clone());
+    state.session_store.upsert_timeline_entry(
+        session_id.clone(),
+        &streaming_entry_id,
+        TimelineEntryKind::AssistantMessage,
+        timeline_message,
+    );
+    publish_current_session_turn_item_event(
+        &state.event_bus,
+        state.session_store.as_ref(),
+        session_id,
+        &workspace_id,
+        &streaming_entry_id,
+        state.task_store(),
+    );
+    let _ = state.event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!("event-message-assistant-{}", UtcMillis::now().0)),
+            "message.created",
+            serde_json::json!({
+                "session_id": session_id.to_string(),
+                "role": "assistant",
+                "content": response_text,
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(session_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+    true
 }
 
 #[derive(Clone, Default)]
@@ -262,6 +368,9 @@ impl ShadowTaskDispatcher {
         use_tools: bool,
         skill_name: Option<String>,
         usage_binding: ModelUsageBinding,
+        worker_lane_id: Option<String>,
+        worker_lane_seq: Option<usize>,
+        worker_id: WorkerId,
         system_prompt: Option<String>,
     ) {
         // 仅在有 writebacks 时（即主 action task）才生成 streaming entry_id。
@@ -281,6 +390,9 @@ impl ShadowTaskDispatcher {
             skill_name,
             &usage_binding,
             streaming_entry_id.as_deref(),
+            worker_lane_id.as_deref(),
+            worker_lane_seq,
+            Some(&worker_id),
             system_prompt,
         );
         if matches!(&outcome, TaskOutcome::Completed { .. }) {
@@ -643,6 +755,9 @@ impl ShadowTaskDispatcher {
         skill_name: Option<String>,
         usage_binding: &ModelUsageBinding,
         streaming_entry_id: Option<&str>,
+        worker_lane_id: Option<&str>,
+        worker_lane_seq: Option<usize>,
+        worker_id: Option<&WorkerId>,
         system_prompt: Option<String>,
     ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
         let Some(client) = self.resolve_model_client() else {
@@ -689,6 +804,9 @@ impl ShadowTaskDispatcher {
             tools,
             usage_binding,
             streaming_entry_id,
+            worker_lane_id,
+            worker_lane_seq,
+            worker_id,
             context_summary,
             system_prompt,
         })
@@ -725,9 +843,9 @@ impl ShadowTaskDispatcher {
         match plan {
             ShadowTaskExecutionPlan::Dispatch {
                 target: _,
-                worker_id: _,
-                lane_id: _,
-                lane_seq: _,
+                worker_id,
+                lane_id,
+                lane_seq,
                 is_primary,
                 session_id,
                 workspace_id,
@@ -756,6 +874,9 @@ impl ShadowTaskDispatcher {
                     use_tools,
                     skill_name,
                     model_usage_binding_for_worker(worker, is_primary),
+                    lane_id,
+                    lane_seq,
+                    worker_id,
                     worker.system_prompt_template.clone(),
                 );
             }

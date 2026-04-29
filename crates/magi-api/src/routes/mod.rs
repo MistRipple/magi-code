@@ -406,6 +406,7 @@ mod tests {
         .with_task_store(Arc::clone(&task_store));
 
         let state_for_task_workers = state.clone();
+        let state_for_runner_terminal = state.clone();
         let dispatcher = Arc::new(
             ShadowTaskDispatcher::new(
                 event_bus,
@@ -426,7 +427,20 @@ mod tests {
             Arc::new(move || state_for_task_workers.task_worker_catalog()),
             dispatcher.clone(),
             runner_result_receiver,
-        );
+        )
+        .with_terminal_observer(move |root_task_id, session_id, status| {
+            if status != "completed" {
+                return;
+            }
+            let Some(session_id) = session_id else {
+                return;
+            };
+            crate::task_execution::finalize_background_session_task_turn_if_root_completed(
+                &state_for_runner_terminal,
+                &session_id,
+                &root_task_id,
+            );
+        });
         state = state
             .with_session_turn_dispatcher(dispatcher)
             .with_runner_manager(runner_manager);
@@ -2043,18 +2057,124 @@ mod tests {
                 session_entry
                     .worker_lanes
                     .iter()
-                    .all(|lane| lane.role_id.as_deref() == Some("integration-dev")),
-                "worker lane tabs must expose role ids, not internal lane/task ids"
+                    .all(|lane| lane.role_id.as_deref().is_some_and(|role_id| {
+                        !role_id.is_empty()
+                            && !role_id.starts_with("task-")
+                            && !role_id.starts_with("worker-")
+                            && !role_id.starts_with("lane-")
+                    })),
+                "worker lane tabs must expose product role ids, not internal lane/task ids"
             );
             assert!(
                 session_entry
                     .turn_items
                     .iter()
                     .filter(|item| item.worker_visible)
-                    .all(|item| item.role_id.as_deref() == Some("integration-dev")),
-                "worker-visible turn items must be grouped by role id"
+                    .all(|item| item.role_id.as_deref().is_some_and(|role_id| {
+                        !role_id.is_empty()
+                            && !role_id.starts_with("task-")
+                            && !role_id.starts_with("worker-")
+                            && !role_id.starts_with("lane-")
+                    })),
+                "worker-visible turn items must be grouped by product role id"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn deep_session_action_finalizes_turn_when_background_root_completes() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let app = build_router(state.clone());
+        let session_id = SessionId::new("session-deep-root-finalizes");
+        state
+            .session_store
+            .create_session(session_id.clone(), "deep root finalizes session")
+            .expect("session should create");
+
+        let (status, body) = post_json(
+            app,
+            "/api/session/turn",
+            json!({
+                "sessionId": session_id.to_string(),
+                "text": "请完整执行一个深度任务并交付",
+                "deepTask": true,
+                "skillName": "deep_task",
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected response body: {body:?}");
+        let root_task_id = body["rootTaskId"]
+            .as_str()
+            .expect("task route should expose root task id")
+            .to_string();
+
+        wait_for_condition(
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            || {
+                let root_completed = state
+                    .runner_manager()
+                    .and_then(|manager| manager.status(&root_task_id))
+                    .is_some_and(|status| status.status == "completed");
+                let turn_completed = state
+                    .session_store
+                    .runtime_sidecar(&session_id)
+                    .and_then(|sidecar| sidecar.current_turn)
+                    .is_some_and(|turn| turn.status == "completed" && turn.completed_at.is_some());
+                root_completed && turn_completed
+            },
+            "background deep runner should finalize the session turn after root completion",
+        )
+        .await;
+
+        let assistant_snapshot = state
+            .session_store
+            .timeline_for_session(&session_id)
+            .into_iter()
+            .find(|entry| matches!(entry.kind, TimelineEntryKind::AssistantMessage))
+            .expect("completed deep turn should write assistant snapshot");
+        let snapshot = serde_json::from_str::<Value>(&assistant_snapshot.message)
+            .expect("assistant message should be the completed turn snapshot");
+        assert_eq!(snapshot["is_historical_turn_snapshot"], Value::Bool(true));
+        let worker_lanes = snapshot["worker_lanes"]
+            .as_array()
+            .expect("completed snapshot should include worker lanes");
+        assert!(
+            !worker_lanes.is_empty(),
+            "deep task snapshot must preserve worker lanes for bootstrap"
+        );
+        assert!(
+            worker_lanes
+                .iter()
+                .all(|lane| lane["status"].as_str() == Some("completed")),
+            "root 完成后的 snapshot 必须刷新 worker lane 的最终状态: {worker_lanes:?}"
+        );
+        let terminal_turn_event = state
+            .event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event.event_type == "session.turn.item"
+                    && event.payload["session_id"].as_str() == Some(session_id.as_str())
+                    && event.payload["current_turn"]["status"].as_str() == Some("completed")
+            })
+            .expect("root completion should republish canonical completed turn item");
+        assert!(
+            terminal_turn_event.payload["current_turn"]["response_duration_ms"].is_number(),
+            "live terminal turn event must carry backend duration"
+        );
+        assert!(
+            terminal_turn_event.payload["worker_lanes"]
+                .as_array()
+                .expect("terminal turn event should include worker lanes")
+                .iter()
+                .all(|lane| lane["status"].as_str() == Some("completed")),
+            "live terminal turn event must refresh worker lane status"
+        );
     }
 
     #[tokio::test]
@@ -2352,6 +2472,167 @@ mod tests {
         assert_eq!(
             snapshot["worker_lanes"][0]["role_id"], "reviewer",
             "completed snapshot worker_lanes 应回填 task executor role"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_dispatch_assistant_message_waits_for_deep_root_completion() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let session_id = SessionId::new("session-deep-root-still-running");
+        state
+            .session_store
+            .create_session(session_id.clone(), "deep root still running session")
+            .expect("session should create");
+
+        let mission_id = MissionId::new("mission-deep-root-still-running");
+        let root_task_id = TaskId::new("task-root-deep-still-running");
+        let action_task_id = TaskId::new("task-action-deep-primary-done");
+        let accepted_at = UtcMillis::now();
+
+        state
+            .session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-deep-root-still-running".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![action_task_id.clone()],
+                    active_worker_bindings: vec![],
+                    branches: vec![],
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at,
+                        entry_id: format!("timeline-{session_id}-{}", accepted_at.0),
+                        trimmed_text: Some("执行深度任务".to_string()),
+                        deep_task: true,
+                        skill_name: Some("deep_task".to_string()),
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: "turn-deep-root-still-running".to_string(),
+                        turn_seq: accepted_at.0,
+                        accepted_at,
+                        completed_at: None,
+                        status: "running".to_string(),
+                        user_message: Some("执行深度任务".to_string()),
+                        items: vec![ActiveExecutionTurnItem {
+                            item_id: format!("timeline-streaming-{action_task_id}"),
+                            item_seq: 1,
+                            lane_id: None,
+                            lane_seq: None,
+                            kind: "assistant_final".to_string(),
+                            status: "completed".to_string(),
+                            source: "orchestrator".to_string(),
+                            title: Some("阶段性回复".to_string()),
+                            content: Some("primary action 已完成，但深度任务还没完成".to_string()),
+                            task_id: Some(action_task_id.clone()),
+                            worker_id: None,
+                            role_id: None,
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_status: None,
+                            tool_arguments: None,
+                            tool_result: None,
+                            tool_error: None,
+                            request_id: None,
+                            user_message_id: None,
+                            placeholder_message_id: None,
+                            timeline_entry_id: None,
+                            thread_visible: true,
+                            worker_visible: false,
+                        }],
+                        worker_lanes: vec![],
+                    }),
+                },
+            )
+            .expect("active execution chain should upsert");
+
+        let task_store = state.task_store().expect("task store should exist");
+        task_store.insert_task(Task {
+            task_id: root_task_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            parent_task_id: None,
+            kind: TaskKind::Objective,
+            title: "深度任务根节点".to_string(),
+            goal: "验证 root 未完成时不能封口 turn".to_string(),
+            status: TaskStatus::Running,
+            dependency_ids: vec![],
+            required_children: vec![action_task_id.clone()],
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: vec![],
+            knowledge_refs: vec![],
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: vec![],
+            output_refs: vec![],
+            evidence_refs: vec![],
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: accepted_at,
+            updated_at: accepted_at,
+        });
+        task_store.insert_task(Task {
+            task_id: action_task_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            parent_task_id: Some(root_task_id.clone()),
+            kind: TaskKind::Action,
+            title: "primary action".to_string(),
+            goal: "阶段性执行".to_string(),
+            status: TaskStatus::Completed,
+            dependency_ids: vec![],
+            required_children: vec![],
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: vec![],
+            knowledge_refs: vec![],
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: vec![],
+            output_refs: vec![],
+            evidence_refs: vec![],
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: accepted_at,
+            updated_at: accepted_at,
+        });
+
+        append_dispatch_assistant_message(
+            &state,
+            &DispatchSubmissionAccepted {
+                session_id: session_id.clone(),
+                entry_id: format!("timeline-{session_id}-{}", accepted_at.0),
+                accepted_at,
+                created_session: false,
+                root_task_id: root_task_id.clone(),
+                action_task_id,
+                runner_started: true,
+            },
+        );
+
+        let current_turn = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("current turn should remain");
+        assert_eq!(
+            current_turn.status, "running",
+            "deep root 仍在运行时，primary action 的 assistant_final 不能封口整轮"
+        );
+        assert!(
+            state
+                .session_store
+                .timeline()
+                .into_iter()
+                .filter(|entry| entry.session_id == session_id)
+                .all(|entry| !matches!(entry.kind, TimelineEntryKind::AssistantMessage)),
+            "deep root 未完成时不能写 completed turn snapshot"
         );
     }
 

@@ -34,6 +34,8 @@ const DEEP_TASK_PLAN_TOOL_NAME: &str = "create_deep_task_plan";
 #[derive(Clone, Debug)]
 pub(crate) struct DeepTaskGraphBuildResult {
     pub leaf_action_task_ids: Vec<TaskId>,
+    pub validation_task_ids: Vec<TaskId>,
+    pub dispatch_task_ids: Vec<TaskId>,
     pub total_task_count: usize,
 }
 
@@ -42,6 +44,8 @@ pub(crate) struct DeepTaskGraphReplanResult {
     pub cancelled_task_ids: Vec<TaskId>,
     pub primary_action_task_id: TaskId,
     pub leaf_action_task_ids: Vec<TaskId>,
+    pub validation_task_ids: Vec<TaskId>,
+    pub dispatch_task_ids: Vec<TaskId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,10 +160,10 @@ pub(crate) fn run_shadow_dispatch_submission(
         None
     };
     let mut total_task_count = 2usize;
-    let mut sub_task_ids: Vec<TaskId> = Vec::new();
+    let mut dispatch_task_ids: Vec<TaskId> = Vec::new();
     if let Some(graph) = deep_graph {
         total_task_count = graph.total_task_count;
-        sub_task_ids = graph.leaf_action_task_ids;
+        dispatch_task_ids = graph.dispatch_task_ids;
     }
 
     let event = task_events::task_graph_created_event(
@@ -218,7 +222,7 @@ pub(crate) fn run_shadow_dispatch_submission(
         },
     );
 
-    for sub_task_id in &sub_task_ids {
+    for sub_task_id in &dispatch_task_ids {
         let sub_ownership = ExecutionOwnership {
             session_id: Some(request.session_id.clone()),
             workspace_id: workspace_id.clone(),
@@ -242,7 +246,7 @@ pub(crate) fn run_shadow_dispatch_submission(
                 worker_id: worker_id.clone(),
                 lane_id: Some(format!("lane-{}", sub_task_id)),
                 lane_seq: Some(
-                    sub_task_ids
+                    dispatch_task_ids
                         .iter()
                         .position(|candidate| candidate == sub_task_id)
                         .unwrap_or(0)
@@ -283,7 +287,7 @@ pub(crate) fn run_shadow_dispatch_submission(
             .map(|role| role.trim().to_string())
             .filter(|role| !role.is_empty())
     };
-    for sub_task_id in &sub_task_ids {
+    for sub_task_id in &dispatch_task_ids {
         branches.push(ActiveExecutionBranch {
             task_id: sub_task_id.clone(),
             worker_id: worker_id.clone(),
@@ -368,7 +372,7 @@ pub(crate) fn run_shadow_dispatch_submission(
                 worker_visible: false,
             },
         ],
-        worker_lanes: sub_task_ids
+        worker_lanes: dispatch_task_ids
             .iter()
             .enumerate()
             .map(|(index, sub_task_id)| ActiveExecutionTurnLane {
@@ -386,7 +390,7 @@ pub(crate) fn run_shadow_dispatch_submission(
             })
             .collect(),
     };
-    for (index, sub_task_id) in sub_task_ids.iter().enumerate() {
+    for (index, sub_task_id) in dispatch_task_ids.iter().enumerate() {
         let lane_id = format!("lane-{}", sub_task_id);
         let lane_title = current_turn
             .worker_lanes
@@ -594,6 +598,8 @@ fn insert_deep_task_graph(
     let root_policy = Some(build_policy_for_mode(true));
     let mut total_task_count = 1usize;
     let mut leaf_action_task_ids = Vec::new();
+    let mut validation_task_ids = Vec::new();
+    let mut dispatch_task_ids = Vec::new();
     let mut phase_ids = Vec::with_capacity(plan.phases.len());
 
     for (phase_index, phase_plan) in plan.phases.iter().enumerate() {
@@ -689,6 +695,7 @@ fn insert_deep_task_graph(
                     .push((action_id.clone(), action_plan.depends_on.clone()));
                 if !is_primary_action {
                     leaf_action_task_ids.push(action_id.clone());
+                    dispatch_task_ids.push(action_id.clone());
                 }
                 phase_action_ids.push(action_id.clone());
             }
@@ -751,6 +758,8 @@ fn insert_deep_task_graph(
                     ApiError::internal_assembly("构建深度任务图失败", err.to_string())
                 })?;
         }
+        validation_task_ids.push(validation_id.clone());
+        dispatch_task_ids.push(validation_id);
         total_task_count += 1;
     }
 
@@ -771,6 +780,8 @@ fn insert_deep_task_graph(
 
     Ok(DeepTaskGraphBuildResult {
         leaf_action_task_ids,
+        validation_task_ids,
+        dispatch_task_ids,
         total_task_count,
     })
 }
@@ -914,6 +925,8 @@ pub(crate) fn replan_deep_task_graph(
         cancelled_task_ids,
         primary_action_task_id,
         leaf_action_task_ids: build.leaf_action_task_ids,
+        validation_task_ids: build.validation_task_ids,
+        dispatch_task_ids: build.dispatch_task_ids,
     })
 }
 
@@ -1658,6 +1671,10 @@ fn infer_dispatch_task_role(skill_name: Option<&str>) -> &'static str {
 mod tests {
     use super::*;
     use crate::state::ApiState;
+    use magi_bridge_client::{
+        BridgeClientError, BridgeErrorLayer, BridgeResponse, ModelBridgeClient,
+        ModelInvocationRequest, ModelStreamingDelta,
+    };
     use magi_core::SessionId;
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
@@ -1671,6 +1688,77 @@ mod tests {
     use std::sync::Arc;
 
     use crate::dto::SessionTurnRequestDto;
+
+    struct StaticDeepPlanModelBridgeClient;
+
+    impl ModelBridgeClient for StaticDeepPlanModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            Ok(BridgeResponse {
+                ok: true,
+                payload: deep_task_plan_response(serde_json::json!({
+                    "phases": [
+                        {
+                            "title": "规划",
+                            "workPackages": [
+                                {
+                                    "title": "规划工作包",
+                                    "actions": [
+                                        {
+                                            "title": "梳理目标",
+                                            "goal": "明确目标、边界和验收标准"
+                                        }
+                                    ]
+                                }
+                            ]
+                        },
+                        {
+                            "title": "执行",
+                            "workPackages": [
+                                {
+                                    "title": "执行工作包",
+                                    "actions": [
+                                        {
+                                            "title": "执行任务",
+                                            "goal": "完成用户目标"
+                                        }
+                                    ]
+                                }
+                            ]
+                        },
+                        {
+                            "title": "交付",
+                            "workPackages": [
+                                {
+                                    "title": "交付工作包",
+                                    "actions": [
+                                        {
+                                            "title": "验证交付",
+                                            "goal": "验证执行结果并交付"
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                })),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            _request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::RemoteBusiness,
+                code: None,
+                message: "static deep plan client does not stream".to_string(),
+            })
+        }
+    }
 
     /// Build a minimal ApiState with a shadow execution pipeline and task store.
     fn build_test_state() -> (ApiState, Arc<TaskStore>) {
@@ -1878,6 +1966,62 @@ mod tests {
             task_store.get_tasks_by_mission(&mission_id).is_empty(),
             "拒绝的深度任务不能留下半截任务图"
         );
+    }
+
+    #[test]
+    fn deep_task_registers_validation_execution_plans() {
+        let (state, task_store) = build_test_state();
+        let state =
+            state.with_task_planning_model_bridge_client(Arc::new(StaticDeepPlanModelBridgeClient));
+        let session_id = SessionId::new("session-deep-validation-plans");
+        state
+            .session_store
+            .create_session(session_id.clone(), "deep validation plans")
+            .expect("session should be creatable");
+
+        let accepted_at = UtcMillis::now();
+        let submission = run_shadow_dispatch_submission(
+            &state,
+            &DispatchSubmissionRequest {
+                accepted_at,
+                session_id,
+                workspace_id: None,
+                entry_id: "entry-deep-validation-plans".to_string(),
+                timeline_message: "执行深度验证计划".to_string(),
+                created_session: false,
+                mission_title: "深度验证计划".to_string(),
+                task_title: "执行: 深度验证计划".to_string(),
+                trimmed_text: Some("执行深度验证计划".to_string()),
+                execution_goal: Some("执行深度验证计划".to_string()),
+                deep_task: true,
+                skill_name: None,
+                target_role: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+            },
+        )
+        .expect("deep task should create graph");
+
+        let validation_ids = task_store
+            .collect_subtree_ids(&submission.root_task_id)
+            .into_iter()
+            .filter(|task_id| {
+                task_store
+                    .get_task(task_id)
+                    .is_some_and(|task| task.kind == TaskKind::Validation)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(validation_ids.len(), 3);
+        for validation_id in validation_ids {
+            assert!(
+                state
+                    .shadow_task_execution_registry()
+                    .remove(&validation_id)
+                    .is_some(),
+                "validation task {validation_id} should have a registered execution plan"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

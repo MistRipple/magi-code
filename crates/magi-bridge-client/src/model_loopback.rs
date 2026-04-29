@@ -289,6 +289,10 @@ fn shadow_loopback_decomposition_response(prompt: &str) -> Option<String> {
     if !prompt.starts_with("深度任务图规划器。") {
         return None;
     }
+    let goal = shadow_loopback_deep_task_goal(prompt);
+    let planning_goal = format!("明确目标、边界和验收标准：{goal}");
+    let execution_goal = format!("完成用户目标：{goal}");
+    let delivery_goal = format!("验证执行结果并交付：{goal}");
     Some(
         serde_json::json!({
             "phases": [
@@ -299,8 +303,8 @@ fn shadow_loopback_decomposition_response(prompt: &str) -> Option<String> {
                             "title": "规划工作包",
                             "actions": [
                                 {
-                                    "title": "梳理约束",
-                                    "goal": "明确目标、边界和验收标准",
+                                    "title": "梳理目标",
+                                    "goal": planning_goal,
                                     "dependsOn": [],
                                     "writeScope": null,
                                 }
@@ -315,10 +319,10 @@ fn shadow_loopback_decomposition_response(prompt: &str) -> Option<String> {
                             "title": "执行工作包",
                             "actions": [
                                 {
-                                    "title": "落实方案",
-                                    "goal": "完成任务系统收口相关修改",
+                                    "title": "执行任务",
+                                    "goal": execution_goal,
                                     "dependsOn": [],
-                                    "writeScope": "crates/magi-api",
+                                    "writeScope": null,
                                 }
                             ]
                         }
@@ -331,10 +335,10 @@ fn shadow_loopback_decomposition_response(prompt: &str) -> Option<String> {
                             "title": "交付工作包",
                             "actions": [
                                 {
-                                    "title": "验证结果",
-                                    "goal": "确认端到端链路可用",
+                                    "title": "验证交付",
+                                    "goal": delivery_goal,
                                     "dependsOn": [],
-                                    "writeScope": "web/src",
+                                    "writeScope": null,
                                 }
                             ]
                         }
@@ -344,6 +348,15 @@ fn shadow_loopback_decomposition_response(prompt: &str) -> Option<String> {
         })
         .to_string(),
     )
+}
+
+fn shadow_loopback_deep_task_goal(prompt: &str) -> String {
+    prompt
+        .split_once("任务目标：")
+        .map(|(_, goal)| goal.trim())
+        .filter(|goal| !goal.is_empty())
+        .unwrap_or("完成本轮深度任务")
+        .to_string()
 }
 
 fn shadow_loopback_instruction_chunk(chunk: &str) -> bool {
@@ -1319,18 +1332,23 @@ mod tests {
     }
 
     #[test]
-    fn shadow_loopback_visible_prompt_returns_structured_deep_plan() {
-        let prompt = "深度任务图规划器。\n请只调用 create_deep_task_plan 工具输出结构化计划，不要返回自然语言正文。\n任务目标：请分析并拆分这个复杂任务";
+    fn shadow_loopback_visible_prompt_builds_deep_plan_from_current_goal() {
+        let prompt = "深度任务图规划器。\n请只调用 create_deep_task_plan 工具输出结构化计划，不要返回自然语言正文。\n任务目标：SUPERPOWERS-PLAN：只做只读检查并最终回复 OK-SUPERPOWERS-PLAN";
 
         let visible = super::shadow_loopback_visible_prompt(prompt);
         let parsed: Value = serde_json::from_str(&visible).expect("deep plan should be json");
+        let execution_goal = parsed["phases"][1]["workPackages"][0]["actions"][0]["goal"]
+            .as_str()
+            .expect("execution action goal should be text");
 
         assert_eq!(parsed["phases"].as_array().map(Vec::len), Some(3));
         assert_eq!(parsed["phases"][0]["title"], "规划");
-        assert_eq!(
-            parsed["phases"][1]["workPackages"][0]["actions"][0]["title"],
-            "落实方案"
+        assert!(execution_goal.contains("SUPERPOWERS-PLAN"));
+        assert_ne!(
+            execution_goal,
+            "SUPERPOWERS-PLAN：只做只读检查并最终回复 OK-SUPERPOWERS-PLAN"
         );
+        assert!(!execution_goal.contains("任务系统收口"));
     }
 
     #[test]

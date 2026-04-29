@@ -2077,7 +2077,7 @@ function buildTurnWorkerDispatchGroups(
     const taskId = normalizeString(item.task_id) || normalizeString(lane?.task_id);
     const taskKey = taskId || laneId || itemId;
     const laneTitle = normalizeString(lane?.title) || normalizeString(item.title) || workerTabId;
-    const taskStatus = turnWorkerStatusToLaneStatus(normalizeString(item.status) || normalizeString(lane?.status));
+    const taskStatus = turnWorkerStatusToLaneStatus(normalizeString(lane?.status) || normalizeString(item.status));
     let group = groups.get(workerTabId);
     if (!group) {
       group = {
@@ -2229,10 +2229,12 @@ function buildTurnArtifactsFromSummary(
       continue;
     }
     const laneId = normalizeString(item.lane_id);
+    const authoritativeWorkerLane = laneId ? workerLaneById.get(laneId) : undefined;
+    const hasAuthoritativeWorkerLane = Boolean(authoritativeWorkerLane);
     const workerId = normalizeString(item.worker_id)
-      || normalizeString(workerLaneById.get(laneId)?.worker_id);
+      || normalizeString(authoritativeWorkerLane?.worker_id);
     const roleId = normalizeString(item.role_id)
-      || normalizeString(workerLaneById.get(laneId)?.role_id);
+      || normalizeString(authoritativeWorkerLane?.role_id);
     const workerTabId = resolveRuntimeWorkerRoleId(workerId, roleId);
     const workerDispatchGroup = kind.startsWith('worker_') && workerTabId
       ? workerDispatchGroupByFirstItemId.get(itemId)
@@ -2241,7 +2243,8 @@ function buildTurnArtifactsFromSummary(
       continue;
     }
     const timestamp = resolveTurnItemTimestamp(item, timelineBase);
-    const workerVisible = Boolean(workerDispatchGroup) || item.worker_visible === true || Boolean(workerTabId && laneId);
+    const workerVisible = Boolean(workerDispatchGroup)
+      || (item.worker_visible === true && hasAuthoritativeWorkerLane);
     const threadHidden = item.thread_visible === false;
     const threadVisible = workerDispatchGroup
       ? workerDispatchGroup.threadVisible
@@ -2258,9 +2261,12 @@ function buildTurnArtifactsFromSummary(
     const workerTabs = workerDispatchGroup
       ? [workerDispatchGroup.workerTabId]
       : (workerVisible && workerTabId ? [workerTabId] : []);
+    const projectedWorkerTabId = workerDispatchGroup
+      ? workerDispatchGroup.workerTabId
+      : (workerVisible ? workerTabId : '');
     let role: Message['role'] = 'assistant';
     let type: Message['type'] = 'text';
-    let source: Message['source'] = workerVisible && workerTabId ? workerTabId : 'orchestrator';
+    let source: Message['source'] = projectedWorkerTabId || 'orchestrator';
     let blocks: ContentBlock[] | undefined;
 
     if (kind === 'user_message') {
@@ -2359,7 +2365,7 @@ function buildTurnArtifactsFromSummary(
     if (isUserTurnItem && userMessageId) messageIdAliases.add(userMessageId);
     if (isAssistantResponseTurnItem && placeholderMessageId) messageIdAliases.add(placeholderMessageId);
     if (timelineEntryId) messageIdAliases.add(`rust-timeline:${timelineEntryId}`);
-    if (kind === 'assistant_final' || kind === 'assistant_stream') {
+    if ((kind === 'assistant_final' || kind === 'assistant_stream') && threadVisible && workerTabs.length === 0) {
       const streamingAlias = normalizeString(streamingEntryId);
       if (streamingAlias) {
         messageIdAliases.add(`rust-timeline:${streamingAlias}`);
@@ -2388,8 +2394,8 @@ function buildTurnArtifactsFromSummary(
       latestEventSeq: 0,
       cardStreamSeq: orderItemSeq,
       timestamp,
-      laneId: workerDispatchGroup ? undefined : (laneId || undefined),
-      worker: workerDispatchGroup?.workerTabId || workerTabId || undefined,
+      laneId: projectedWorkerTabId && !workerDispatchGroup ? (laneId || undefined) : undefined,
+      worker: projectedWorkerTabId || undefined,
       threadVisible,
       workerTabs,
       messageIds: Array.from(messageIdAliases),
@@ -2410,11 +2416,11 @@ function buildTurnArtifactsFromSummary(
           turnItemKind: kind,
           itemSeq: orderItemSeq,
           blockSeq: orderItemSeq,
-          laneId: laneId || undefined,
+          laneId: projectedWorkerTabId ? (laneId || undefined) : undefined,
           laneSeq: normalizeNumber(item.lane_seq, 0) || undefined,
           cardStreamSeq: orderItemSeq,
-          workerId: workerId || undefined,
-          roleId: workerTabId || undefined,
+          workerId: projectedWorkerTabId ? (workerId || undefined) : undefined,
+          roleId: projectedWorkerTabId || undefined,
           currentTurnWorkerLanes,
           requestId: requestId || undefined,
           userMessageId: isUserTurnItem && userMessageId ? userMessageId : undefined,

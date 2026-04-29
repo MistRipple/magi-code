@@ -57,6 +57,8 @@ pub struct RunnerHandle {
     pub last_error: Arc<Mutex<Option<String>>>,
 }
 
+type RunnerTerminalObserver = Arc<dyn Fn(TaskId, Option<SessionId>, String) + Send + Sync>;
+
 /// Manages active Runner instances keyed by root_task_id.
 #[derive(Clone)]
 pub struct RunnerManager {
@@ -73,6 +75,7 @@ pub struct RunnerManager {
     /// Maps a session to the root task IDs whose runners should be cancelled
     /// when the session is closed (design 1.5: Session-Runner linkage).
     session_runner_index: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
+    terminal_observer: Option<RunnerTerminalObserver>,
 }
 
 /// Number of runner cycles between periodic checkpoints.
@@ -97,6 +100,7 @@ impl RunnerManager {
             result_receiver: Arc::new(EventBasedResultReceiver::new()),
             checkpoint_path: None,
             session_runner_index: Arc::new(Mutex::new(HashMap::new())),
+            terminal_observer: None,
         }
     }
 
@@ -133,6 +137,7 @@ impl RunnerManager {
             result_receiver,
             checkpoint_path: None,
             session_runner_index: Arc::new(Mutex::new(HashMap::new())),
+            terminal_observer: None,
         }
     }
 
@@ -151,6 +156,7 @@ impl RunnerManager {
             result_receiver,
             checkpoint_path: None,
             session_runner_index: Arc::new(Mutex::new(HashMap::new())),
+            terminal_observer: None,
         }
     }
 
@@ -175,6 +181,7 @@ impl RunnerManager {
             result_receiver,
             checkpoint_path: None,
             session_runner_index: Arc::new(Mutex::new(HashMap::new())),
+            terminal_observer: None,
         }
     }
 
@@ -211,6 +218,14 @@ impl RunnerManager {
     /// Set the file path used for periodic task-store checkpoints.
     pub fn with_checkpoint_path(mut self, path: PathBuf) -> Self {
         self.checkpoint_path = Some(path);
+        self
+    }
+
+    pub fn with_terminal_observer(
+        mut self,
+        observer: impl Fn(TaskId, Option<SessionId>, String) + Send + Sync + 'static,
+    ) -> Self {
+        self.terminal_observer = Some(Arc::new(observer));
         self
     }
 
@@ -254,6 +269,7 @@ impl RunnerManager {
         runners.insert(root_task_id.to_string(), Arc::clone(&handle));
         drop(runners);
 
+        let observer_session_id = session_id.clone();
         if let Some(session_id) = session_id {
             self.bind_session(session_id, root_task_id);
         }
@@ -265,6 +281,7 @@ impl RunnerManager {
         let bg_active = Arc::clone(&handle.active);
         let bg_task_store = Arc::clone(&self.task_store);
         let bg_checkpoint_path = self.checkpoint_path.clone();
+        let terminal_observer = self.terminal_observer.clone();
         tokio::spawn(async move {
             let mut blocked_streak = 0u32;
             let max_blocked_streak = 20u32;
@@ -312,6 +329,13 @@ impl RunnerManager {
                         let mut status = bg_handle.status.lock().expect("status lock should hold");
                         *status = "completed".to_string();
                         bg_active.store(false, Ordering::Relaxed);
+                        if let Some(observer) = terminal_observer.as_ref() {
+                            observer(
+                                root_id.clone(),
+                                observer_session_id.clone(),
+                                "completed".to_string(),
+                            );
+                        }
                         break;
                     }
                     RunCycleOutcome::Blocked(_) => {

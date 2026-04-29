@@ -469,7 +469,7 @@ async fn handle_intake(
                 &state,
                 &session_id,
                 &replan.primary_action_task_id,
-                &replan.leaf_action_task_ids,
+                &replan.dispatch_task_ids,
             )?;
             return Ok(Json(json!({
                 "classification": "replan",
@@ -479,6 +479,7 @@ async fn handle_intake(
                 "cancelledTaskIds": replan.cancelled_task_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
                 "primaryActionTaskId": replan.primary_action_task_id.to_string(),
                 "leafActionTaskIds": replan.leaf_action_task_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                "validationTaskIds": replan.validation_task_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
                 "contextTaskId": context_task_id.to_string(),
             })));
         }

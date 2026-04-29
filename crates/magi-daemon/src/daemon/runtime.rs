@@ -557,7 +557,9 @@ impl ShadowDaemonRuntime {
         .with_bridge_probe_transport(BridgeServerKind::Mcp, mcp_transport)
         .with_shadow_execution_pipeline(orchestrator, execution_runtime, memory_store);
 
+        state = state.with_task_store(Arc::clone(&task_store));
         let state_for_task_workers = state.clone();
+        let state_for_runner_terminal = state.clone();
         let state_for_knowledge_persist = state.clone();
         let knowledge_persist_callback = Arc::new(move || {
             if let Err(error) = state_for_knowledge_persist.persist_knowledge_state() {
@@ -591,9 +593,23 @@ impl ShadowDaemonRuntime {
             shadow_task_dispatcher,
             runner_result_receiver,
         )
-        .with_checkpoint_path(task_store_checkpoint_path);
+        .with_checkpoint_path(task_store_checkpoint_path)
+        .with_terminal_observer(move |root_task_id, session_id, status| {
+            if status != "completed" {
+                return;
+            }
+            let Some(session_id) = session_id else {
+                return;
+            };
+            if magi_api::task_execution::finalize_background_session_task_turn_if_root_completed(
+                &state_for_runner_terminal,
+                &session_id,
+                &root_task_id,
+            ) {
+                let _ = state_for_runner_terminal.persist_session_durable_state();
+            }
+        });
         state = state
-            .with_task_store(task_store)
             .with_runner_manager(runner_manager)
             .with_session_turn_dispatcher(session_turn_dispatcher)
             .with_task_planning_model_bridge_client(task_planning_model_client)

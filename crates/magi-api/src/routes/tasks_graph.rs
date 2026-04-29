@@ -183,7 +183,7 @@ async fn replan_task_graph(
         &state,
         &session_id,
         &replan.primary_action_task_id,
-        &replan.leaf_action_task_ids,
+        &replan.dispatch_task_ids,
     )?;
 
     Ok(Json(serde_json::json!({
@@ -192,6 +192,7 @@ async fn replan_task_graph(
         "cancelledTaskIds": replan.cancelled_task_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
         "primaryActionTaskId": replan.primary_action_task_id.to_string(),
         "leafActionTaskIds": replan.leaf_action_task_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        "validationTaskIds": replan.validation_task_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
     })))
 }
 
