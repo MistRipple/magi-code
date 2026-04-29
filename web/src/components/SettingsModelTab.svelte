@@ -248,6 +248,7 @@
                       <label class="llm-config-label">{i18n.t('settings.model.field.provider')}</label>
                       <select class="llm-config-select" bind:value={orchConfig.provider}>
                         <option value="openai">{i18n.t('settings.model.provider.openai')}</option>
+                        <option value="anthropic">{i18n.t('settings.model.provider.anthropic')}</option>
                       </select>
                     </div>
                     {#if orchConfig.provider === 'openai'}
@@ -418,6 +419,7 @@
                       <label class="llm-config-label">{i18n.t('settings.model.field.provider')}</label>
                       <select class="llm-config-select" bind:value={compConfig.provider}>
                         <option value="openai">{i18n.t('settings.model.provider.openai')}</option>
+                        <option value="anthropic">{i18n.t('settings.model.provider.anthropic')}</option>
                       </select>
                     </div>
                     {#if compConfig.provider === 'openai'}
@@ -614,6 +616,7 @@
                   <label class="llm-config-label">{i18n.t('settings.model.field.provider')}</label>
                   <select class="llm-config-select" bind:value={workerConfigs[workerModelTab].provider}>
                     <option value="openai">{i18n.t('settings.model.provider.openai')}</option>
+                    <option value="anthropic">{i18n.t('settings.model.provider.anthropic')}</option>
                   </select>
                 </div>
                 {#if workerConfigs[workerModelTab].provider === 'openai'}

@@ -59,7 +59,7 @@ import {
 } from "../shared/model-governance";
 
 export type UrlMode = "standard" | "full";
-export type ProviderName = "openai";
+export type ProviderName = "openai" | "anthropic";
 export type OpenAiProtocol = "responses" | "chat";
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
@@ -331,7 +331,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
     return value === "chat" || value === "responses" ? value : undefined;
   }
 
-  function normalizeProviderName(_value: unknown): ProviderName {
+  function normalizeProviderName(value: unknown): ProviderName {
+    if (typeof value === "string" && value.trim().toLowerCase() === "anthropic") {
+      return "anthropic";
+    }
     return "openai";
   }
 
@@ -397,7 +400,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
     };
   }
 
-  function getBaseUrlPlaceholder(_provider: string): string {
+  function getBaseUrlPlaceholder(provider: string): string {
+    if (provider === "anthropic") {
+      return "https://api.anthropic.com";
+    }
     return "https://api.openai.com";
   }
 
@@ -408,9 +414,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   function shouldRecommendStandardUrlMode(
-    _provider: ProviderName,
+    provider: ProviderName,
     baseUrl: string,
   ): boolean {
+    if (provider !== "openai") {
+      return false;
+    }
     const normalized = normalizeBaseUrlForHint(baseUrl);
     if (!normalized) {
       return false;

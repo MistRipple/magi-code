@@ -32,7 +32,7 @@ export type AnyAgentId = SystemAgentId | AgentId;
 /**
  * LLM 提供商
  */
-export type LLMProvider = 'openai';
+export type LLMProvider = 'openai' | 'anthropic';
 
 /**
  * 模型自治能力等级

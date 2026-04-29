@@ -318,7 +318,9 @@ pub(crate) fn normalize_executable_model_provider(provider: Option<&str>) -> Str
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
+        Some("anthropic") => "anthropic".to_string(),
         Some("openai-compatible" | "openai_compatible") => "openai-compatible".to_string(),
+        Some("openai") => "openai".to_string(),
         _ => "openai".to_string(),
     }
 }
@@ -410,6 +412,14 @@ mod tests {
             .expect_err("full path has no canonical models endpoint");
         assert!(
             matches!(error, ApiError::InvalidInput(message) if message.contains("完整路径模式下不支持自动获取模型列表"))
+        );
+    }
+
+    #[test]
+    fn normalize_executable_model_provider_preserves_anthropic() {
+        assert_eq!(
+            normalize_executable_model_provider(Some(" anthropic ")),
+            "anthropic"
         );
     }
 

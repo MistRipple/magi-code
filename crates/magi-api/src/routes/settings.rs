@@ -1368,8 +1368,63 @@ mod tests {
         assert!(!object.contains_key("agents"));
     }
 
+    #[tokio::test]
+    async fn settings_bootstrap_preserves_anthropic_model_providers() {
+        let state = test_state();
+        state.settings_store.set_section(
+            "orchestrator",
+            json!({
+                "provider": "anthropic",
+                "baseUrl": "https://api.anthropic.com",
+                "model": "claude-sonnet-test",
+                "urlMode": "standard"
+            }),
+        );
+        state.settings_store.set_section(
+            "workers",
+            json!({
+                "sonnet-worker": {
+                    "provider": "anthropic",
+                    "baseUrl": "https://api.anthropic.com",
+                    "model": "claude-worker-test",
+                    "urlMode": "standard"
+                }
+            }),
+        );
+        state.settings_store.set_section(
+            "engines",
+            json!([{
+                "id": "sonnet-worker",
+                "displayName": "Sonnet Worker",
+                "llm": {
+                    "provider": "anthropic",
+                    "baseUrl": "https://api.anthropic.com",
+                    "model": "claude-worker-test",
+                    "urlMode": "standard"
+                }
+            }]),
+        );
+
+        let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
+            .await
+            .0;
+
+        assert_eq!(
+            bootstrap["orchestratorConfig"]["provider"],
+            json!("anthropic")
+        );
+        assert_eq!(
+            bootstrap["workerConfigs"]["sonnet-worker"]["provider"],
+            json!("anthropic")
+        );
+        assert_eq!(
+            bootstrap["registryEngines"][0]["llm"]["provider"],
+            json!("anthropic")
+        );
+    }
+
     #[test]
-    fn normalize_engine_entry_keeps_only_executable_model_provider() {
+    fn normalize_engine_entry_preserves_supported_model_provider() {
         let normalized = normalize_engine_entry(&json!({
             "id": "sonnet-4-5",
             "displayName": "sonnet-4.5",
@@ -1382,11 +1437,23 @@ mod tests {
         }))
         .expect("engine should normalize");
 
-        assert_eq!(normalized["llm"]["provider"], json!("openai"));
+        assert_eq!(normalized["llm"]["provider"], json!("anthropic"));
         assert_eq!(
             normalized["llm"]["model"],
             json!("kiro-claude-sonnet-4-5-agentic")
         );
+    }
+
+    #[test]
+    fn normalize_model_config_payload_preserves_anthropic_provider() {
+        let normalized = normalize_model_config_payload(json!({
+            "provider": "anthropic",
+            "baseUrl": "https://api.anthropic.com",
+            "model": "claude-sonnet-test",
+            "urlMode": "standard"
+        }));
+
+        assert_eq!(normalized["provider"], json!("anthropic"));
     }
 
     #[tokio::test]
