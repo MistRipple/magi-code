@@ -3936,28 +3936,6 @@ export function setTimelineProjection(
   saveWebviewState();
 }
 
-export function restoreTimelineProjectionIfNewer(
-  projection: SessionTimelineProjection,
-  options: { hydrateNodes?: boolean; source?: 'persisted' | 'authoritative' } = {},
-): boolean {
-  const normalizedSessionId = normalizeSessionId(projection.sessionId);
-  if (!normalizedSessionId) {
-    return false;
-  }
-  const currentSessionId = normalizeSessionId(messagesState.currentSessionId);
-  if (currentSessionId && currentSessionId !== normalizedSessionId) {
-    return false;
-  }
-  const currentProjection = ensureTimelineProjectionSnapshotCurrent(normalizedSessionId);
-  const incomingSeq = typeof projection.lastAppliedEventSeq === 'number' ? projection.lastAppliedEventSeq : 0;
-  const currentSeq = currentProjection && typeof currentProjection.lastAppliedEventSeq === 'number' ? currentProjection.lastAppliedEventSeq : 0;
-  if (incomingSeq <= currentSeq) {
-    return false;
-  }
-  setTimelineProjection(projection, options);
-  return true;
-}
-
 export function getTimelineProjectionSource(): 'none' | 'persisted' | 'live' | 'authoritative' {
   return timelineProjectionSource;
 }

@@ -16,12 +16,13 @@ use magi_bridge_client::{
 };
 use magi_core::{SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::InMemoryEventBus;
-use magi_session_store::{SessionStore, TimelineEntryKind};
+use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
 use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
 use std::sync::Arc;
 
 const MAX_TOOL_CALL_ROUNDS: usize = 8;
+const MAX_SESSION_CONTEXT_MESSAGES: usize = 12;
 pub const BUSINESS_MODEL_PROVIDER: &str = "openai-compatible";
 
 pub struct SessionTurnExecutionRequest {
@@ -92,6 +93,66 @@ fn request_turn_is_writable(
         })
 }
 
+fn build_session_turn_messages(
+    session_store: &SessionStore,
+    request: &SessionTurnExecutionRequest,
+    prompt: &str,
+) -> Vec<ChatMessage> {
+    let current_turn = session_store
+        .runtime_sidecar(&request.session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .filter(|turn| turn.turn_id == request.turn_id);
+    let accepted_at = current_turn.as_ref().map(|turn| turn.accepted_at);
+    let current_user_timeline_entry_id = current_turn.as_ref().and_then(|turn| {
+        turn.items
+            .iter()
+            .find(|item| item.kind == "user_message")
+            .and_then(|item| item.timeline_entry_id.clone())
+    });
+    let mut history = accepted_at
+        .map(|accepted_at| {
+            session_store
+                .timeline_for_session(&request.session_id)
+                .into_iter()
+                .filter(|entry| {
+                    if let Some(current_user_timeline_entry_id) =
+                        current_user_timeline_entry_id.as_deref()
+                    {
+                        entry.entry_id != current_user_timeline_entry_id
+                            && entry.occurred_at.0 <= accepted_at.0
+                    } else {
+                        entry.occurred_at.0 < accepted_at.0
+                    }
+                })
+                .filter_map(|entry| {
+                    let role = match entry.kind {
+                        TimelineEntryKind::UserMessage => "user",
+                        TimelineEntryKind::AssistantMessage => "assistant",
+                        _ => return None,
+                    };
+                    let content = timeline_entry_visible_text(&entry.message)?;
+                    Some(ChatMessage {
+                        role: role.to_string(),
+                        content: Some(content),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if history.len() > MAX_SESSION_CONTEXT_MESSAGES {
+        history = history.split_off(history.len() - MAX_SESSION_CONTEXT_MESSAGES);
+    }
+    history.push(ChatMessage {
+        role: "user".to_string(),
+        content: Some(prompt.to_string()),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    });
+    history
+}
+
 pub(crate) struct SessionTurnExecutionRuntime<'a> {
     pub client: &'a dyn ModelBridgeClient,
     pub event_bus: &'a InMemoryEventBus,
@@ -124,12 +185,7 @@ pub(crate) fn run_session_turn_execution(
     }
 
     append_phase_item(event_bus, session_store, &request);
-    let mut messages = vec![ChatMessage {
-        role: "user".to_string(),
-        content: Some(prompt.clone()),
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-    }];
+    let mut messages = build_session_turn_messages(session_store, &request, &prompt);
     let mut final_content: Option<String> = None;
     let mut last_streaming_entry_id: Option<String> = None;
     let mut had_tool_calls = false;
@@ -627,4 +683,129 @@ fn append_final_item(
         TimelineEntryKind::AssistantMessage,
         timeline_message,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magi_core::SessionLifecycleStatus;
+    use magi_session_store::{
+        ActiveExecutionTurn, SessionRecord, SessionStoreState, TimelineEntry,
+    };
+
+    fn ts(value: u64) -> UtcMillis {
+        UtcMillis(value)
+    }
+
+    #[test]
+    fn session_turn_messages_include_persisted_history_before_current_turn() {
+        let session_id = SessionId::new("session-context-history");
+        let assistant_snapshot = serde_json::json!({
+            "is_historical_turn_snapshot": true,
+            "current_turn": {
+                "turn_id": "turn-prev",
+                "turn_seq": 1000,
+                "accepted_at": 1000,
+                "completed_at": 1200,
+                "response_duration_ms": 200,
+                "status": "completed",
+                "user_message": "请用一句话回答：2+3 等于几？"
+            },
+            "turn_items": [{
+                "item_id": "turn-item-prev-final",
+                "item_seq": 2,
+                "kind": "assistant_final",
+                "status": "completed",
+                "source": "orchestrator",
+                "content": "2+3 等于 5。"
+            }]
+        })
+        .to_string();
+        let store = SessionStore::from_state(SessionStoreState {
+            current_session_id: Some(session_id.clone()),
+            sessions: vec![SessionRecord {
+                session_id: session_id.clone(),
+                title: "context history".to_string(),
+                status: SessionLifecycleStatus::Active,
+                created_at: ts(900),
+                updated_at: ts(2000),
+                message_count: None,
+                workspace_id: None,
+            }],
+            timeline: vec![
+                TimelineEntry {
+                    entry_id: "timeline-user-prev".to_string(),
+                    session_id: session_id.clone(),
+                    kind: TimelineEntryKind::UserMessage,
+                    message: "请用一句话回答：2+3 等于几？".to_string(),
+                    occurred_at: ts(1000),
+                },
+                TimelineEntry {
+                    entry_id: "timeline-assistant-prev".to_string(),
+                    session_id: session_id.clone(),
+                    kind: TimelineEntryKind::AssistantMessage,
+                    message: assistant_snapshot,
+                    occurred_at: ts(1200),
+                },
+                TimelineEntry {
+                    entry_id: "timeline-user-current".to_string(),
+                    session_id: session_id.clone(),
+                    kind: TimelineEntryKind::UserMessage,
+                    message: "请基于上一轮结果，用一句话回答：再加 4 等于几？".to_string(),
+                    occurred_at: ts(2000),
+                },
+            ],
+            notifications: Vec::new(),
+            execution_sidecar_store: Default::default(),
+        });
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-session-2000".to_string(),
+                    turn_seq: 2000,
+                    accepted_at: ts(2000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some(
+                        "请基于上一轮结果，用一句话回答：再加 4 等于几？".to_string(),
+                    ),
+                    items: Vec::new(),
+                    worker_lanes: Vec::new(),
+                },
+            )
+            .expect("current turn should be stored");
+
+        let request = SessionTurnExecutionRequest {
+            session_id,
+            turn_id: "turn-session-2000".to_string(),
+            workspace_id: None,
+            prompt: "请基于上一轮结果，用一句话回答：再加 4 等于几？".to_string(),
+            use_tools: false,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+        };
+        let messages = build_session_turn_messages(&store, &request, &request.prompt);
+
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user", "assistant", "user"]
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.content.as_deref().unwrap_or(""))
+                .collect::<Vec<_>>(),
+            vec![
+                "请用一句话回答：2+3 等于几？",
+                "2+3 等于 5。",
+                "请基于上一轮结果，用一句话回答：再加 4 等于几？",
+            ]
+        );
+    }
 }

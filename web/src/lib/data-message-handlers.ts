@@ -15,7 +15,6 @@ import {
   clearPendingInteractions,
   clearAllMessages,
   setTimelineProjection,
-  restoreTimelineProjectionIfNewer,
   prependTimelineProjectionPage,
   addToast,
   clearPendingRequest,
@@ -750,10 +749,10 @@ function handleTimelineProjectionUpdated(message: ClientBridgeMessage) {
   if (!currentSessionId || currentSessionId !== sessionId) {
     return;
   }
-  const restored = restoreTimelineProjectionIfNewer(timelineProjection, {
-    source: 'authoritative',
-  });
-  if (restored) {
+  // session.turn.item 携带的是当前轮次增量投影，不是整条会话快照。
+  // 必须合并进现有时间线，避免实时流式事件覆盖历史消息、thinking、工具卡片和耗时。
+  const merged = prependTimelineProjectionPage(sessionId, timelineProjection);
+  if (merged) {
     reconcileRequestBindingsFromAuthoritativeThread(sessionId);
   }
 }
