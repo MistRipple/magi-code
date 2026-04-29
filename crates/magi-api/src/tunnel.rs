@@ -62,6 +62,10 @@ impl TunnelManager {
         self.inner.lock().await.state.clone()
     }
 
+    pub async fn local_port(&self) -> u16 {
+        self.inner.lock().await.local_port
+    }
+
     pub async fn start(&self, workspace_id: Option<&str>) -> TunnelState {
         let mut inner = self.inner.lock().await;
         if inner.state.status == "running" || inner.state.status == "starting" {
@@ -106,17 +110,21 @@ impl TunnelManager {
                 let stderr = child.stderr.take();
                 inner.child = Some(child);
 
-                // 在后台任务中解析公网 URL
+                // 在后台任务中解析公网 URL，并持续监听 cloudflared 是否提前退出。
                 let inner_clone = self.inner.clone();
                 let token_clone = token.clone();
                 let ws_id_clone = ws_id.clone();
                 tokio::spawn(async move {
+                    let mut has_public_url = false;
                     if let Some(stderr) = stderr {
                         let reader = BufReader::new(stderr);
                         let mut lines = reader.lines();
                         while let Ok(Some(line)) = lines.next_line().await {
                             if let Some(url) = extract_tunnel_url(&line) {
                                 let mut inner = inner_clone.lock().await;
+                                if inner.state.status != "starting" {
+                                    continue;
+                                }
                                 inner.state.public_url = Some(url.clone());
                                 inner.state.status = "running".into();
                                 // 构造带 token 的访问 URL
@@ -127,9 +135,25 @@ impl TunnelManager {
                                 }
                                 access = format!("{access}?{}", params.join("&"));
                                 inner.state.access_url = Some(access);
-                                break;
+                                has_public_url = true;
                             }
                         }
+                    }
+
+                    let mut inner = inner_clone.lock().await;
+                    if inner.child.is_some()
+                        && (inner.state.status == "starting" || inner.state.status == "running")
+                    {
+                        inner.child = None;
+                        inner.state.status = "error".into();
+                        inner.state.public_url = None;
+                        inner.state.access_url = None;
+                        inner.state.token = None;
+                        inner.state.error = Some(if has_public_url {
+                            "cloudflared 已退出，公网映射已断开".to_string()
+                        } else {
+                            "cloudflared 未返回公网地址，公网映射启动失败".to_string()
+                        });
                     }
                 });
 

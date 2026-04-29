@@ -370,11 +370,11 @@ async fn tunnel_status(State(state): State<ApiState>) -> Json<serde_json::Value>
 }
 
 async fn lan_access_status(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
     let ip = resolve_preferred_lan_ipv4();
-    let port = 38123;
+    let port = state.tunnel_manager.local_port().await;
 
     // 从 query 参数获取 workspaceId，构造完整的 web 访问 URL
     let workspace_id = query.get("workspaceId").cloned().unwrap_or_default();
@@ -746,6 +746,38 @@ mod tests {
             .register(WorkspaceId::new(workspace_id), AbsolutePath::new(root))
             .expect("workspace should register");
         state
+    }
+
+    #[tokio::test]
+    async fn lan_access_uses_current_daemon_port() {
+        let state =
+            build_state_with_workspace_root("/tmp", "workspace-lan-access").with_tunnel_port(39219);
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/lan-access?workspaceId=workspace-lan-access")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        assert_eq!(payload["port"], 39219);
+        assert!(
+            payload["url"]
+                .as_str()
+                .expect("url should be string")
+                .contains(":39219/web.html?workspaceId=workspace-lan-access")
+        );
     }
 
     #[tokio::test]

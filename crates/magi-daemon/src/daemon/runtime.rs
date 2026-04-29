@@ -248,6 +248,7 @@ fn classifier_payload_for_prompt(prompt: &str) -> Option<String> {
 #[derive(Clone)]
 pub(crate) struct ShadowDaemonRuntime {
     state_root: PathBuf,
+    local_port: u16,
     event_bus: Arc<InMemoryEventBus>,
     session_store: Arc<SessionStore>,
     workspace_store: Arc<WorkspaceStore>,
@@ -353,6 +354,7 @@ impl ShadowDaemonRuntime {
 
         Ok(Self {
             state_root: config.state_root.clone(),
+            local_port: config.port,
             event_bus,
             session_store,
             workspace_store,
@@ -544,6 +546,7 @@ impl ShadowDaemonRuntime {
         .with_settings_store(settings_store.clone())
         .with_skill_runtime(app_skill_runtime.clone())
         .with_tool_registry(tool_registry_for_dispatcher.clone())
+        .with_tunnel_port(self.local_port)
         .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
             self.state_root.join("sessions.json"),
             self.state_root.join("workspaces.json"),

@@ -22,6 +22,10 @@
   let tunnelCopied = $state(false);
   let tunnelBusy = $state(false);
 
+  function currentWorkspaceId(): string {
+    return new URLSearchParams(window.location.search).get('workspaceId') || '';
+  }
+
   async function renderQR(url: string): Promise<string> {
     if (!url) return '';
     try {
@@ -32,7 +36,7 @@
   async function requestLanInfo() {
     loading = true; lanUrl = ''; qrSvg = ''; qrError = '';
     try {
-      const wsId = new URLSearchParams(window.location.search).get('workspaceId') || '';
+      const wsId = currentWorkspaceId();
       const res = await fetch(`${resolveAgentBaseUrl()}/api/lan-access?workspaceId=${encodeURIComponent(wsId)}`);
       const data = await res.json();
       if (data?.url) {
@@ -48,30 +52,65 @@
     loading = false;
   }
 
+  async function applyTunnelState(data: Record<string, unknown>) {
+    tunnelStatus = typeof data?.status === 'string' ? data.status : 'stopped';
+    tunnelAccessUrl = typeof data?.accessUrl === 'string' ? data.accessUrl : '';
+    tunnelError = typeof data?.error === 'string' ? data.error : '';
+    tunnelQrSvg = tunnelAccessUrl ? await renderQR(tunnelAccessUrl) : '';
+  }
+
   async function fetchTunnelStatus() {
     try {
       const res = await fetch(`${resolveAgentBaseUrl()}/api/tunnel/status`);
-      const data = await res.json();
-      tunnelStatus = data?.status || 'stopped';
-      tunnelAccessUrl = data?.accessUrl || '';
-      tunnelError = data?.error || '';
-      if (tunnelAccessUrl) {
-        tunnelQrSvg = await renderQR(tunnelAccessUrl);
-      } else {
+      if (!res.ok) {
+        tunnelStatus = 'error';
+        tunnelError = `获取公网映射状态失败：${res.status}`;
+        tunnelAccessUrl = '';
         tunnelQrSvg = '';
+        return;
       }
-    } catch { /* silent */ }
+      const data = await res.json();
+      await applyTunnelState(data);
+    } catch (error) {
+      tunnelStatus = 'error';
+      tunnelError = error instanceof Error ? error.message : '获取公网映射状态失败';
+      tunnelAccessUrl = '';
+      tunnelQrSvg = '';
+    }
   }
 
   async function toggleTunnel() {
     tunnelBusy = true;
     const action = tunnelStatus === 'running' ? 'stop' : 'start';
     try {
-      await fetch(`${resolveAgentBaseUrl()}/api/tunnel/${action}`, { method: 'POST' });
+      const init: RequestInit = action === 'start'
+        ? {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ workspaceId: currentWorkspaceId() }),
+          }
+        : { method: 'POST' };
+      const res = await fetch(`${resolveAgentBaseUrl()}/api/tunnel/${action}`, init);
+      if (!res.ok) {
+        tunnelStatus = 'error';
+        tunnelError = `${action === 'start' ? '启动' : '关闭'}公网映射失败：${res.status}`;
+        tunnelAccessUrl = '';
+        tunnelQrSvg = '';
+        return;
+      }
+      const data = await res.json();
+      await applyTunnelState(data);
       // 隧道启动是异步的，轮询直到状态稳定
       await pollTunnelUntilStable();
-    } catch { /* silent */ }
-    tunnelBusy = false;
+    } catch (error) {
+      tunnelStatus = 'error';
+      tunnelError = error instanceof Error ? error.message : '公网映射操作失败';
+      tunnelAccessUrl = '';
+      tunnelQrSvg = '';
+    }
+    finally {
+      tunnelBusy = false;
+    }
   }
 
   async function pollTunnelUntilStable() {

@@ -646,6 +646,11 @@ impl ApiState {
         }
     }
 
+    pub fn with_tunnel_port(mut self, port: u16) -> Self {
+        self.tunnel_manager = crate::tunnel::TunnelManager::new(port);
+        self
+    }
+
     pub fn with_bridge_probe_transport(
         mut self,
         server_kind: BridgeServerKind,
