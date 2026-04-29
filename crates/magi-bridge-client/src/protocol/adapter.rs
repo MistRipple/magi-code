@@ -20,10 +20,39 @@ impl ProviderFamily {
         } else if lower.contains("responses") {
             Self::OpenAiResponses
         } else if lower.contains("gemini") || lower.contains("google") {
-            Self::Anthropic
+            Self::Gemini
         } else {
             Self::OpenAiChat
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_family_detects_anthropic_aliases() {
+        assert_eq!(
+            ProviderFamily::from_provider_string("anthropic"),
+            ProviderFamily::Anthropic
+        );
+        assert_eq!(
+            ProviderFamily::from_provider_string("claude-sonnet"),
+            ProviderFamily::Anthropic
+        );
+    }
+
+    #[test]
+    fn provider_family_detects_google_aliases_as_gemini() {
+        assert_eq!(
+            ProviderFamily::from_provider_string("gemini"),
+            ProviderFamily::Gemini
+        );
+        assert_eq!(
+            ProviderFamily::from_provider_string("google-ai"),
+            ProviderFamily::Gemini
+        );
     }
 }
 
