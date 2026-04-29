@@ -3,6 +3,7 @@ use magi_core::{
     Task, TaskId, TaskKind, TaskPolicy, TaskProjection, TaskStatus, UtcMillis, WorkerId,
 };
 use magi_worker_runtime::WorkerRuntimeDurableSnapshot;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,10 +19,21 @@ static CHECKPOINT_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// so implementations should be lightweight (e.g. publish an event).
 pub type StatusChangeCallback = Box<dyn Fn(&TaskId, TaskStatus, Task) + Send + Sync>;
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskContextEntry {
+    pub context_ref: String,
+    pub task_id: TaskId,
+    pub mission_id: MissionId,
+    pub content: String,
+    pub created_at: UtcMillis,
+    pub updated_at: UtcMillis,
+}
+
 /// 任务图的内存存储，维护任务、租约及其索引。
 pub struct TaskStore {
     tasks: RwLock<HashMap<TaskId, Task>>,
     leases: RwLock<HashMap<LeaseId, AssignmentLease>>,
+    context_entries: RwLock<HashMap<String, TaskContextEntry>>,
     /// 索引: mission_id -> task_ids
     mission_index: RwLock<HashMap<MissionId, Vec<TaskId>>>,
     /// 索引: parent_task_id -> child task_ids
@@ -71,6 +83,7 @@ impl TaskStore {
         Self {
             tasks: RwLock::new(HashMap::new()),
             leases: RwLock::new(HashMap::new()),
+            context_entries: RwLock::new(HashMap::new()),
             mission_index: RwLock::new(HashMap::new()),
             children_index: RwLock::new(HashMap::new()),
             on_status_change: Mutex::new(None),
@@ -84,6 +97,7 @@ impl TaskStore {
         Self {
             tasks: RwLock::new(HashMap::new()),
             leases: RwLock::new(HashMap::new()),
+            context_entries: RwLock::new(HashMap::new()),
             mission_index: RwLock::new(HashMap::new()),
             children_index: RwLock::new(HashMap::new()),
             on_status_change: Mutex::new(Some(callback)),
@@ -333,6 +347,63 @@ impl TaskStore {
             task.updated_at = UtcMillis::now();
         }
         Ok(())
+    }
+
+    pub fn append_context_entry(
+        &self,
+        task_id: &TaskId,
+        context_ref: String,
+        content: String,
+    ) -> DomainResult<TaskContextEntry> {
+        let trimmed_ref = context_ref.trim();
+        if trimmed_ref.is_empty() {
+            return Err(DomainError::Validation {
+                message: "context_ref 不能为空".to_string(),
+            });
+        }
+        let trimmed_content = content.trim();
+        if trimmed_content.is_empty() {
+            return Err(DomainError::Validation {
+                message: "context content 不能为空".to_string(),
+            });
+        }
+
+        let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
+        let now = UtcMillis::now();
+        let context_ref = trimmed_ref.to_string();
+        if !task.context_refs.iter().any(|item| item == &context_ref) {
+            task.context_refs.push(context_ref.clone());
+        }
+        task.updated_at = now;
+
+        let entry = TaskContextEntry {
+            context_ref: context_ref.clone(),
+            task_id: task.task_id.clone(),
+            mission_id: task.mission_id.clone(),
+            content: trimmed_content.to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        self.context_entries
+            .write()
+            .expect("context_entries write lock poisoned")
+            .insert(context_ref, entry.clone());
+        drop(tasks);
+        self.fire_checkpoint();
+        Ok(entry)
+    }
+
+    pub fn context_entries_for_refs(&self, refs: &[String]) -> Vec<TaskContextEntry> {
+        let entries = self
+            .context_entries
+            .read()
+            .expect("context_entries read lock poisoned");
+        refs.iter()
+            .filter_map(|context_ref| entries.get(context_ref).cloned())
+            .collect()
     }
 
     pub fn append_required_child(
@@ -1328,9 +1399,14 @@ impl TaskStore {
     pub fn checkpoint(&self) -> serde_json::Value {
         let tasks = self.tasks.read().expect("tasks read lock poisoned");
         let leases = self.leases.read().expect("leases read lock poisoned");
+        let context_entries = self
+            .context_entries
+            .read()
+            .expect("context_entries read lock poisoned");
         serde_json::json!({
             "tasks": tasks.values().cloned().collect::<Vec<Task>>(),
             "leases": leases.values().cloned().collect::<Vec<AssignmentLease>>(),
+            "contextEntries": context_entries.values().cloned().collect::<Vec<TaskContextEntry>>(),
         })
     }
 
@@ -1348,6 +1424,11 @@ impl TaskStore {
             .get("leases")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
+        let context_entries: Vec<TaskContextEntry> = data
+            .get("contextEntries")
+            .or_else(|| data.get("context_entries"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
 
         let store = Self::new();
 
@@ -1361,6 +1442,15 @@ impl TaskStore {
             let mut lease_map = store.leases.write().expect("leases write lock poisoned");
             for lease in leases {
                 lease_map.insert(lease.lease_id.clone(), lease);
+            }
+        }
+        {
+            let mut entry_map = store
+                .context_entries
+                .write()
+                .expect("context_entries write lock poisoned");
+            for entry in context_entries {
+                entry_map.insert(entry.context_ref.clone(), entry);
             }
         }
 
@@ -1694,6 +1784,45 @@ mod tests {
         let updated = store.get_task(&task_id).unwrap();
         assert_eq!(updated.context_refs, vec!["ctx-1".to_string()]);
         assert_eq!(store.get_tasks_by_mission(&MissionId::new("m-1")).len(), 1);
+    }
+
+    #[test]
+    fn append_context_entry_persists_content_and_restores_from_checkpoint() {
+        let store = TaskStore::new();
+        let task_id = TaskId::new("obj-1");
+        store.insert_task(make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Ready,
+        ));
+
+        let entry = store
+            .append_context_entry(
+                &task_id,
+                "ctx-guide-1".to_string(),
+                "优先参考用户补充的真实约束".to_string(),
+            )
+            .expect("context entry should append");
+
+        assert_eq!(entry.context_ref, "ctx-guide-1");
+        assert_eq!(entry.content, "优先参考用户补充的真实约束");
+        assert_eq!(
+            store.get_task(&task_id).unwrap().context_refs,
+            vec!["ctx-guide-1".to_string()]
+        );
+        assert_eq!(
+            store.context_entries_for_refs(&["ctx-guide-1".to_string()]),
+            vec![entry.clone()]
+        );
+
+        let restored = TaskStore::restore(&store.checkpoint());
+        assert_eq!(
+            restored.context_entries_for_refs(&["ctx-guide-1".to_string()]),
+            vec![entry]
+        );
     }
 
     #[test]

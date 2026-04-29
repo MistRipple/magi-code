@@ -458,9 +458,15 @@ impl ShadowTaskDispatcher {
                 max_file_summaries: 2,
             },
         });
+        let task_context_entries = self
+            .pipeline
+            .execution_runtime
+            .task_store()
+            .context_entries_for_refs(&task.context_refs);
         let has_context = !result.selected_knowledge.is_empty()
             || !result.selected_memory.is_empty()
-            || !result.selected_shared_context.is_empty();
+            || !result.selected_shared_context.is_empty()
+            || !task_context_entries.is_empty();
 
         let context_summary = ExecutionContextSummary::from_context_assembly(&result);
 
@@ -483,6 +489,12 @@ impl ShadowTaskDispatcher {
         }
         for item in &result.selected_shared_context {
             ctx_parts.push(format!("[context] {}: {}", item.title, item.content));
+        }
+        for entry in &task_context_entries {
+            ctx_parts.push(format!(
+                "[task-context] {}: {}",
+                entry.context_ref, entry.content
+            ));
         }
         let ctx_text = ctx_parts.join("\n");
         (

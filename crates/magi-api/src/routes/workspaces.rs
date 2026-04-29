@@ -5,7 +5,7 @@ use axum::{
 };
 use magi_knowledge_store::code_scanner::ingest_workspace_code_index_in_workspace;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{errors::ApiError, state::ApiState};
 
@@ -79,17 +79,50 @@ async fn register_workspace(
     State(state): State<ApiState>,
     Json(request): Json<RegisterWorkspaceRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let canonical_path = canonical_workspace_path(&request.path)?;
+    let path = magi_core::AbsolutePath::new(canonical_path.to_string_lossy().to_string());
+    if let Some(workspace) = registered_workspace_for_path(&state, &canonical_path) {
+        ingest_workspace_code_index_in_workspace(
+            &state.knowledge_store,
+            &workspace.workspace_id,
+            &canonical_path,
+        );
+        state.persist_knowledge_state()?;
+        return Ok(Json(serde_json::json!({
+            "workspaceId": workspace.workspace_id.to_string(),
+            "registered": false,
+            "reused": true
+        })));
+    }
+
     let workspace_id =
         magi_core::WorkspaceId::new(format!("workspace-{}", magi_core::UtcMillis::now().0));
-    let path = magi_core::AbsolutePath::new(&request.path);
-    state
+    match state
         .workspace_registry
         .register(workspace_id.clone(), path.clone())
-        .map_err(|e| ApiError::internal_assembly("工作区注册失败", e))?;
+    {
+        Ok(_) => {}
+        Err(error) => {
+            if let Some(workspace) = registered_workspace_for_path(&state, &canonical_path) {
+                ingest_workspace_code_index_in_workspace(
+                    &state.knowledge_store,
+                    &workspace.workspace_id,
+                    &canonical_path,
+                );
+                state.persist_knowledge_state()?;
+                return Ok(Json(serde_json::json!({
+                    "workspaceId": workspace.workspace_id.to_string(),
+                    "registered": false,
+                    "reused": true
+                })));
+            }
+            return Err(ApiError::internal_assembly("工作区注册失败", error));
+        }
+    }
     ingest_workspace_code_index_in_workspace(
         &state.knowledge_store,
         &workspace_id,
-        &PathBuf::from(path.as_str()),
+        &canonical_path,
     );
     state.persist_workspace_durable_state()?;
     state.persist_knowledge_state()?;
@@ -97,6 +130,42 @@ async fn register_workspace(
         "workspaceId": workspace_id.to_string(),
         "registered": true
     })))
+}
+
+fn canonical_workspace_path(raw_path: &str) -> Result<PathBuf, ApiError> {
+    let trimmed_path = raw_path.trim();
+    if trimmed_path.is_empty() {
+        return Err(ApiError::InvalidInput("工作区路径不能为空".to_string()));
+    }
+    let canonical_path = PathBuf::from(trimmed_path)
+        .canonicalize()
+        .map_err(|error| ApiError::InvalidInput(format!("工作区路径不可访问: {error}")))?;
+    if !canonical_path.is_dir() {
+        return Err(ApiError::InvalidInput(format!(
+            "工作区路径必须是目录: {}",
+            canonical_path.display()
+        )));
+    }
+    Ok(canonical_path)
+}
+
+fn registered_workspace_for_path(
+    state: &ApiState,
+    canonical_path: &Path,
+) -> Option<magi_workspace::WorkspaceRecord> {
+    state
+        .workspace_registry
+        .workspaces()
+        .into_iter()
+        .find(|workspace| workspace_root_matches(&workspace.root_path, canonical_path))
+}
+
+fn workspace_root_matches(root_path: &magi_core::AbsolutePath, canonical_path: &Path) -> bool {
+    let stored_path = PathBuf::from(root_path.as_str());
+    stored_path
+        .canonicalize()
+        .map(|path| path == canonical_path)
+        .unwrap_or_else(|_| stored_path == canonical_path)
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,6 +335,65 @@ mod tests {
                 .any(|file| file.path == "src/index.ts"),
             "workspace code index should include the registered workspace files"
         );
+    }
+
+    #[tokio::test]
+    async fn register_workspace_reuses_existing_workspace_for_same_canonical_path() {
+        let state = test_state();
+        let root = std::env::temp_dir().join(format!(
+            "magi-register-workspace-reuse-{}",
+            UtcMillis::now().0
+        ));
+        fs::create_dir_all(root.join("src")).expect("workspace dir should create");
+        fs::write(root.join("src/lib.rs"), "pub fn value() -> i32 { 1 }\n")
+            .expect("source file should write");
+
+        let first_body = serde_json::json!({ "path": root.to_string_lossy() }).to_string();
+        let first_response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workspaces/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(first_body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_body = to_bytes(first_response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let first_payload: serde_json::Value =
+            serde_json::from_slice(&first_body).expect("payload should deserialize");
+        assert_eq!(first_payload["registered"], true);
+
+        let second_body =
+            serde_json::json!({ "path": root.join(".").to_string_lossy() }).to_string();
+        let second_response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workspaces/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(second_body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let second_body = to_bytes(second_response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let second_payload: serde_json::Value =
+            serde_json::from_slice(&second_body).expect("payload should deserialize");
+
+        assert_eq!(second_payload["registered"], false);
+        assert_eq!(second_payload["reused"], true);
+        assert_eq!(second_payload["workspaceId"], first_payload["workspaceId"]);
+        assert_eq!(state.workspace_registry.workspaces().len(), 1);
     }
 
     #[tokio::test]

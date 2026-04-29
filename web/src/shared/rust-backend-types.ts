@@ -848,6 +848,7 @@ export interface RegisterWorkspaceRequestDto {
 export interface RegisterWorkspaceResponseDto {
   workspaceId: string;
   registered: boolean;
+  reused?: boolean;
 }
 
 export interface RemoveWorkspaceRequestDto {
@@ -1396,6 +1397,7 @@ export interface SessionIntakeRequestDto {
   sessionId?: string | null;
   message: string;
   contextTaskId?: string | null;
+  forceSupplementContext?: boolean;
 }
 
 export type IntakeClassificationDto =
@@ -1425,6 +1427,7 @@ export interface SessionIntakeResponseDto {
   cancelledTaskIds?: string[];
   /** SupplementContext */
   contextRef?: string;
+  content?: string;
   note?: string;
   /** AppendTask */
   addedTaskId?: string;

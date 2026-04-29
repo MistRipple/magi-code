@@ -157,6 +157,15 @@ impl WorkspaceStore {
                 entity: "workspace",
             });
         }
+        if state
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.root_path == root_path)
+        {
+            return Err(DomainError::AlreadyExists {
+                entity: "workspace_root_path",
+            });
+        }
 
         let now = UtcMillis::now();
         let workspace = WorkspaceRecord {
@@ -472,6 +481,32 @@ mod tests {
             .expect("recovery handle should exist");
         assert_eq!(handle.recovery_id, "recovery-legacy");
         assert_eq!(handle.status, RecoveryStatus::Ready);
+    }
+
+    #[test]
+    fn register_rejects_duplicate_root_path_with_different_workspace_id() {
+        let store = WorkspaceStore::new();
+        store
+            .register(
+                WorkspaceId::new("workspace-original"),
+                AbsolutePath::new("/Users/xie/code/magi"),
+            )
+            .expect("first workspace should register");
+
+        let error = store
+            .register(
+                WorkspaceId::new("workspace-duplicate"),
+                AbsolutePath::new("/Users/xie/code/magi"),
+            )
+            .expect_err("same root path must not create another workspace identity");
+
+        assert!(matches!(
+            error,
+            DomainError::AlreadyExists {
+                entity: "workspace_root_path"
+            }
+        ));
+        assert_eq!(store.workspaces().len(), 1);
     }
 
     #[test]

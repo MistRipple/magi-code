@@ -60,6 +60,7 @@ import {
   saveAgentSafeguardConfig,
   saveAgentSkillsConfig,
   saveAgentWorkerConfig,
+  submitSessionIntake,
   submitSessionTurn,
   revertAgentChange,
   revertAgentExecutionGroupChanges,
@@ -1897,13 +1898,15 @@ async function drainQueuedTurns(reason: string): Promise<void> {
   queueDrainActive = true;
   let shouldScheduleNextDrain = true;
   try {
-    const submitted = await executeTask({
-      text: next.text ?? next.content,
-      requestId: next.requestId || next.id,
-      deepTask: next.deepTask === true,
-      skillName: next.skillName ?? null,
-      images: next.images ?? [],
-    });
+    const submitted = next.mode === 'guide'
+      ? await submitQueuedGuidance(next)
+      : await executeTask({
+        text: next.text ?? next.content,
+        requestId: next.requestId || next.id,
+        deepTask: next.deepTask === true,
+        skillName: next.skillName ?? null,
+        images: next.images ?? [],
+      });
     if (!submitted) {
       restoreQueuedTurnToFront(next);
       shouldScheduleNextDrain = false;
@@ -1931,6 +1934,58 @@ function restoreQueuedTurnToFront(queued: QueuedMessage): void {
     return;
   }
   setQueuedMessages([queued, ...messagesState.queuedMessages]);
+}
+
+function isMissingActiveTaskChainError(error: unknown): boolean {
+  if (!(error instanceof AgentApiError)) {
+    return false;
+  }
+  return error.status === 400 && error.message.includes('活跃任务链');
+}
+
+async function submitQueuedGuidance(next: QueuedMessage): Promise<boolean> {
+  const text = (next.text ?? next.content).trim();
+  const images = next.images ?? [];
+  const hasExecutablePayload = Boolean(text) || images.length > 0 || Boolean(next.skillName?.trim());
+  if (!hasExecutablePayload) {
+    return false;
+  }
+  if (images.length > 0 || next.skillName?.trim()) {
+    return executeTask({
+      text: next.text ?? next.content,
+      requestId: next.requestId || next.id,
+      deepTask: next.deepTask === true,
+      skillName: next.skillName ?? null,
+      images,
+    });
+  }
+
+  try {
+    await ensureFreshLiveBridge('queued_guidance_preflight');
+    await submitSessionIntake({
+      message: text,
+      forceSupplementContext: true,
+    }, {
+      workspaceId: currentWorkspaceId,
+      workspacePath: currentWorkspacePath,
+      sessionId: currentSessionId,
+    });
+    emitBridgeSuccessToast('补充上下文', '已写入当前任务上下文', { displayMode: 'notification_center' });
+    return true;
+  } catch (error) {
+    if (isMissingActiveTaskChainError(error)) {
+      return executeTask({
+        text: next.text ?? next.content,
+        requestId: next.requestId || next.id,
+        deepTask: next.deepTask === true,
+        skillName: next.skillName ?? null,
+        images,
+      });
+    }
+    console.error('[web-client-bridge] 提交排队引导失败:', error);
+    emitBridgeErrorToast('补充上下文', error);
+    return false;
+  }
 }
 
 async function executeTask(input: ExecuteTaskInput): Promise<boolean> {

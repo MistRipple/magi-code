@@ -5,8 +5,10 @@ use magi_bridge_client::{
 };
 use magi_core::{EventId, MissionId, SessionId, Task, TaskId, TaskKind, TaskStatus, UtcMillis};
 use magi_event_bus::EventEnvelope;
+use magi_session_store::TimelineEntryKind;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::session_scope::parse_session_id;
 use crate::{
@@ -23,6 +25,8 @@ use crate::{
 // Intake classification (design 8)
 // ---------------------------------------------------------------------------
 
+static INTAKE_CONTEXT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IntakeRequest {
@@ -30,6 +34,8 @@ struct IntakeRequest {
     message: String,
     #[serde(default)]
     context_task_id: Option<String>,
+    #[serde(default)]
+    force_supplement_context: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,6 +311,36 @@ fn build_intake_replan_prompt(root_task: &Task, context_task: &Task, message: &s
     )
 }
 
+fn record_supplement_context(
+    state: &ApiState,
+    store: &magi_orchestrator::task_store::TaskStore,
+    session_id: &SessionId,
+    context_task_id: &TaskId,
+    message: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let context_ref = format!(
+        "intake-context-{}-{}",
+        UtcMillis::now().0,
+        INTAKE_CONTEXT_COUNTER.fetch_add(1, Ordering::SeqCst)
+    );
+    let context_entry = store
+        .append_context_entry(context_task_id, context_ref.clone(), message.to_string())
+        .map_err(|e| ApiError::internal_assembly("补充上下文失败", e.to_string()))?;
+    state.session_store.append_timeline_entry(
+        session_id.clone(),
+        TimelineEntryKind::UserMessage,
+        format!("[补充上下文] {}", message.trim()),
+    );
+    state.persist_session_durable_state()?;
+    Ok(json!({
+        "classification": "supplement_context",
+        "contextRef": context_ref,
+        "content": context_entry.content,
+        "note": "补充上下文已写入当前任务上下文",
+        "contextTaskId": context_task_id.to_string(),
+    }))
+}
+
 /// 处理深度模式运行中的用户中途输入（design 8）。
 /// 先进行 Intake 分类，再根据分类结果写入 Mission context、触发 replan、
 /// resolve Decision 或追加子任务，禁止直接塞给当前 worker。
@@ -339,6 +375,16 @@ async fn handle_intake(
         request.context_task_id.as_deref(),
     )?;
     let context_task_id = context_task.task_id.clone();
+
+    if request.force_supplement_context {
+        return Ok(Json(record_supplement_context(
+            &state,
+            store,
+            &session_id,
+            &context_task_id,
+            &request.message,
+        )?));
+    }
 
     let decision =
         decide_intake_with_task_planner(&state, &request.message, &root_task, &context_task)?;
@@ -437,16 +483,13 @@ async fn handle_intake(
             })));
         }
         IntakeClassification::SupplementContext => {
-            let context_ref = format!("intake-context-{}", UtcMillis::now().0);
-            store
-                .append_context_ref(&context_task_id, context_ref.clone())
-                .map_err(|e| ApiError::internal_assembly("补充上下文失败", e.to_string()))?;
-            return Ok(Json(json!({
-                "classification": "supplement_context",
-                "contextRef": context_ref,
-                "note": "补充上下文已写入当前任务上下文",
-                "contextTaskId": context_task_id.to_string(),
-            })));
+            return Ok(Json(record_supplement_context(
+                &state,
+                store,
+                &session_id,
+                &context_task_id,
+                &request.message,
+            )?));
         }
         IntakeClassification::AppendTask => {
             ensure_session_active_execution_chain(&state, &session_id)?;
@@ -620,6 +663,19 @@ async fn interrupt_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::ApiState;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use magi_core::{ExecutionOwnership, WorkspaceId};
+    use magi_event_bus::InMemoryEventBus;
+    use magi_governance::GovernanceService;
+    use magi_orchestrator::task_store::TaskStore;
+    use magi_session_store::SessionStore;
+    use magi_workspace::WorkspaceStore;
+    use std::sync::Arc;
+    use tower::ServiceExt;
 
     fn make_intake_task(
         task_id: &str,
@@ -745,6 +801,96 @@ mod tests {
                 .matches("不要仅因为“顺便、另外、再加、追加”等连接词选择 append_task")
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_supplement_context_records_content_and_task_ref() {
+        let session_id = SessionId::new("session-intake-guide");
+        let mission_id = MissionId::new("mission-1");
+        let task_store = Arc::new(TaskStore::new());
+        task_store.insert_task(make_intake_task(
+            "obj-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+        ));
+        task_store.insert_task(make_intake_task(
+            "act-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+        ));
+
+        let session_store = Arc::new(SessionStore::default());
+        session_store
+            .create_session(session_id.clone(), "intake guide")
+            .expect("session should create");
+        session_store.bind_execution_ownership(
+            session_id.clone(),
+            ExecutionOwnership {
+                session_id: Some(session_id.clone()),
+                workspace_id: Some(WorkspaceId::new("workspace-guide")),
+                mission_id: Some(mission_id),
+                ..ExecutionOwnership::default()
+            },
+        );
+
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            session_store.clone(),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_task_store(task_store.clone());
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/session/intake")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "sessionId": session_id.to_string(),
+                            "message": "后续执行必须优先验证真实浏览器状态",
+                            "contextTaskId": "act-1",
+                            "forceSupplementContext": true,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        assert_eq!(payload["classification"], "supplement_context");
+        let context_ref = payload["contextRef"]
+            .as_str()
+            .expect("contextRef should exist")
+            .to_string();
+        assert_eq!(payload["content"], "后续执行必须优先验证真实浏览器状态");
+
+        let updated_task = task_store
+            .get_task(&TaskId::new("act-1"))
+            .expect("context task should exist");
+        assert_eq!(updated_task.context_refs, vec![context_ref.clone()]);
+        let entries = task_store.context_entries_for_refs(&[context_ref]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "后续执行必须优先验证真实浏览器状态");
+        assert!(
+            session_store
+                .timeline_for_session(&session_id)
+                .iter()
+                .any(|entry| entry.message.contains("后续执行必须优先验证真实浏览器状态"))
         );
     }
 }

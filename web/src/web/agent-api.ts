@@ -265,6 +265,23 @@ export interface AgentSessionTurnResult {
   userMessageItemId?: string | null;
 }
 
+export type AgentSessionIntakeClassification =
+  | 'decision_answer'
+  | 'pause'
+  | 'replan'
+  | 'supplement_context'
+  | 'append_task'
+  | 'new_objective'
+  | 'general_chat';
+
+export interface AgentSessionIntakeResult {
+  classification: AgentSessionIntakeClassification;
+  contextTaskId?: string | null;
+  contextRef?: string | null;
+  content?: string | null;
+  note?: string | null;
+}
+
 export class AgentApiError extends Error {
   readonly status: number;
   readonly action: string;
@@ -1039,6 +1056,43 @@ export async function submitSessionTurn(
     }
     throw error;
   }
+}
+
+export async function submitSessionIntake(
+  payload: {
+    message: string;
+    contextTaskId?: string | null;
+    forceSupplementContext?: boolean;
+  },
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<AgentSessionIntakeResult> {
+  const raw = await postBoundJson<{
+    classification: AgentSessionIntakeClassification;
+    contextTaskId?: string | null;
+    contextRef?: string | null;
+    content?: string | null;
+    note?: string | null;
+  }>(
+    '/api/session/intake',
+    {
+      message: payload.message,
+      contextTaskId: payload.contextTaskId ?? null,
+      forceSupplementContext: payload.forceSupplementContext === true,
+    },
+    'submit session intake',
+    bindingOverride,
+  );
+  return {
+    classification: raw.classification,
+    contextTaskId: typeof raw.contextTaskId === 'string' && raw.contextTaskId.trim()
+      ? raw.contextTaskId.trim()
+      : null,
+    contextRef: typeof raw.contextRef === 'string' && raw.contextRef.trim()
+      ? raw.contextRef.trim()
+      : null,
+    content: typeof raw.content === 'string' ? raw.content : null,
+    note: typeof raw.note === 'string' ? raw.note : null,
+  };
 }
 
 export async function interruptAgentTask(
