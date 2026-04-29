@@ -2147,7 +2147,6 @@ function buildTurnArtifactsFromSummary(
     return [];
   }
   const timelineBase = resolveTurnTimelineBase(turn, items, generatedAt);
-  const turnAnchorEventSeq = Math.max(1, Math.floor(normalizeNumber(turn?.turn_seq, timelineBase)));
   const finalStreamingEntryId = normalizeString(streamingEntryId);
   const hasRenderableAssistantFinalItem = items.some((item) => (
     normalizeString(item.kind) === 'assistant_final'
@@ -2385,8 +2384,8 @@ function buildTurnArtifactsFromSummary(
       artifactId,
       kind: kind.includes('tool') ? 'tool' : 'message',
       displayOrder: normalizeNumber(turn?.turn_seq, 0) * 1000 + orderItemSeq,
-      anchorEventSeq: turnAnchorEventSeq,
-      latestEventSeq: turnAnchorEventSeq,
+      anchorEventSeq: 0,
+      latestEventSeq: 0,
       cardStreamSeq: orderItemSeq,
       timestamp,
       laneId: workerDispatchGroup ? undefined : (laneId || undefined),
@@ -2787,6 +2786,7 @@ export function buildRustTurnTimelineProjectionFromEventPayload(
     normalizeString(payload.streaming_entry_id) || normalizeString(payload.streamingEntryId) || null,
   ).map((artifact) => ({
     ...artifact,
+    anchorEventSeq: eventSeq > 0 ? eventSeq : normalizeNumber(artifact.anchorEventSeq, 0),
     latestEventSeq: Math.max(normalizeNumber(artifact.latestEventSeq, 0), eventSeq),
   }));
   if (artifacts.length === 0) {
