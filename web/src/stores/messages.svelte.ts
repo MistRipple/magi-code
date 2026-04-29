@@ -1043,7 +1043,34 @@ function nodeToOrderInput(node: TimelineNode): TimelineSemanticOrderInput {
   };
 }
 
+function compareSameRequestMessageOrder(left: Message, right: Message): number | null {
+  const leftMetadata = resolveMessageMetadataRecord(left);
+  const rightMetadata = resolveMessageMetadataRecord(right);
+  const leftRequestId = typeof leftMetadata?.requestId === 'string' ? leftMetadata.requestId.trim() : '';
+  const rightRequestId = typeof rightMetadata?.requestId === 'string' ? rightMetadata.requestId.trim() : '';
+  if (!leftRequestId || leftRequestId !== rightRequestId) {
+    return null;
+  }
+  const leftItemSeq = resolveTimelineItemSeqFromMetadata(leftMetadata);
+  const rightItemSeq = resolveTimelineItemSeqFromMetadata(rightMetadata);
+  if (leftItemSeq > 0 && rightItemSeq > 0 && leftItemSeq !== rightItemSeq) {
+    return leftItemSeq - rightItemSeq;
+  }
+  const roleRank = (message: Message): number => {
+    if (message.role === 'user') return 0;
+    if (message.role === 'assistant') return 1;
+    return 2;
+  };
+  const leftRank = roleRank(left);
+  const rightRank = roleRank(right);
+  return leftRank === rightRank ? null : leftRank - rightRank;
+}
+
 function compareTimelineNodeOrder(left: TimelineNode, right: TimelineNode): number {
+  const sameRequestOrder = compareSameRequestMessageOrder(left.message, right.message);
+  if (sameRequestOrder !== null) {
+    return sameRequestOrder;
+  }
   return compareTimelineSemanticOrder(nodeToOrderInput(left), nodeToOrderInput(right));
 }
 
@@ -1085,6 +1112,10 @@ function compareRenderEntryOrder(
   left: LocalProjectionFlatRenderEntry,
   right: LocalProjectionFlatRenderEntry,
 ): number {
+  const sameRequestOrder = compareSameRequestMessageOrder(left.message, right.message);
+  if (sameRequestOrder !== null) {
+    return sameRequestOrder;
+  }
   return compareTimelineSemanticOrder(
     renderEntryToOrderInput(left),
     renderEntryToOrderInput(right),
@@ -1179,47 +1210,6 @@ function buildProjectionRenderEntriesFromArtifacts(
     }));
 }
 
-function normalizeProjectionRenderEntries(
-  entries: unknown,
-  artifactById: Map<string, TimelineProjectionArtifact>,
-): TimelineProjectionRenderEntry[] {
-  if (!Array.isArray(entries)) {
-    return [];
-  }
-  const normalized: TimelineProjectionRenderEntry[] = [];
-  for (const entry of entries) {
-    if (!entry || typeof entry !== 'object') {
-      continue;
-    }
-    const candidate = entry as Record<string, unknown>;
-    const entryId = typeof candidate.entryId === 'string' ? candidate.entryId.trim() : '';
-    const artifactId = typeof candidate.artifactId === 'string' ? candidate.artifactId.trim() : '';
-    const executionItemId = typeof candidate.executionItemId === 'string'
-      ? candidate.executionItemId.trim()
-      : '';
-    if (!entryId || !artifactId) {
-      continue;
-    }
-    const artifact = artifactById.get(artifactId);
-    if (!artifact) {
-      continue;
-    }
-    if (executionItemId) {
-      const hasExecutionItem = ensureArray<TimelineExecutionItem>(artifact.executionItems)
-        .some((item) => item.itemId === executionItemId);
-      if (!hasExecutionItem) {
-        continue;
-      }
-    }
-    normalized.push({
-      entryId,
-      artifactId,
-      ...(executionItemId ? { executionItemId } : {}),
-    });
-  }
-  return normalized;
-}
-
 function isProjectionArtifact(
   artifact: unknown,
 ): artifact is SessionTimelineProjection['artifacts'][number] {
@@ -1229,15 +1219,6 @@ function isProjectionArtifact(
     && typeof (artifact as SessionTimelineProjection['artifacts'][number]).artifactId === 'string'
     && (artifact as SessionTimelineProjection['artifacts'][number]).message,
   );
-}
-
-function artifactToOrderInput(artifact: TimelineProjectionArtifact): TimelineSemanticOrderInput {
-  const metadata = resolveMessageMetadataRecord(artifact.message);
-  return {
-    turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(metadata),
-    itemSeq: artifact.cardStreamSeq || resolveTimelineItemSeqFromMetadata(metadata) || artifact.displayOrder,
-    displayOrder: artifact.displayOrder || 0,
-  };
 }
 
 function canonicalizeProjectionExecutionItems(
@@ -1300,37 +1281,17 @@ function canonicalizeTimelineProjection(
         executionItems,
       } satisfies TimelineProjectionArtifact;
     })
-    .sort((a, b) => compareTimelineSemanticOrder(artifactToOrderInput(a), artifactToOrderInput(b)))
+    .sort(compareProjectionArtifactsForPageMerge)
     .map((artifact) => ({
       ...artifact,
       displayOrder: artifact.displayOrder || 0,
     }));
-  const artifactById = new Map<string, TimelineProjectionArtifact>();
-  for (const artifact of artifacts) {
-    artifactById.set(artifact.artifactId, artifact);
-  }
-
-  const normalizedThreadRenderEntries = normalizeProjectionRenderEntries(
-    projection.threadRenderEntries,
-    artifactById,
-  );
-  const normalizedWorkerRenderEntries = Object.fromEntries(
-    Object.entries(projection.workerRenderEntries || {}).map(([workerId, entries]) => [
-      workerId,
-      normalizeProjectionRenderEntries(entries, artifactById),
-    ]),
-  );
-
   return {
     ...projection,
     sessionId: normalizeSessionId(projection.sessionId) || projection.sessionId,
     artifacts,
-    threadRenderEntries: normalizedThreadRenderEntries.length > 0
-      ? normalizedThreadRenderEntries
-      : buildProjectionRenderEntriesFromArtifacts(artifacts, 'thread'),
-    workerRenderEntries: Object.keys(normalizedWorkerRenderEntries).length > 0
-      ? normalizedWorkerRenderEntries
-      : buildDynamicWorkerRenderEntries(artifacts),
+    threadRenderEntries: buildProjectionRenderEntriesFromArtifacts(artifacts, 'thread'),
+    workerRenderEntries: buildDynamicWorkerRenderEntries(artifacts),
   };
 }
 
@@ -1545,11 +1506,85 @@ function mergeProjectionExecutionItems(
   return merged.sort((a, b) => compareTimelineSemanticOrder(executionItemToOrderInput(a), executionItemToOrderInput(b)));
 }
 
+function mergeProjectionOrderingMetadata(
+  existingMessage: Message | undefined,
+  incomingMessage: Message | undefined,
+  preferredMessage: Message,
+): Message {
+  const preferredMetadata = resolveMessageMetadataRecord(preferredMessage);
+  const existingMetadata = resolveMessageMetadataRecord(existingMessage);
+  const incomingMetadata = resolveMessageMetadataRecord(incomingMessage);
+  const nextMetadata: Record<string, unknown> = {
+    ...(preferredMetadata || {}),
+  };
+  let changed = false;
+  const preserveStringFact = (key: string): void => {
+    if (typeof nextMetadata[key] === 'string' && nextMetadata[key].trim()) {
+      return;
+    }
+    const candidate = [existingMetadata, incomingMetadata]
+      .map((metadata) => metadata?.[key])
+      .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+    if (candidate) {
+      nextMetadata[key] = candidate;
+      changed = true;
+    }
+  };
+  const preservePositiveNumberFact = (key: string): void => {
+    if (normalizePositiveSequence(nextMetadata[key]) > 0) {
+      return;
+    }
+    const candidate = [existingMetadata, incomingMetadata]
+      .map((metadata) => normalizePositiveSequence(metadata?.[key]))
+      .find((value) => value > 0);
+    if (candidate && candidate > 0) {
+      nextMetadata[key] = candidate;
+      changed = true;
+    }
+  };
+
+  for (const key of [
+    'requestId',
+    'turnId',
+    'turnItemId',
+    'turnItemKind',
+    'userMessageId',
+    'placeholderMessageId',
+    'timelineEntryId',
+  ]) {
+    preserveStringFact(key);
+  }
+  for (const key of [
+    'turnOrderSeq',
+    'turnSeq',
+    'itemSeq',
+    'blockSeq',
+    'cardStreamSeq',
+    'laneSeq',
+    'responseDurationMs',
+  ]) {
+    preservePositiveNumberFact(key);
+  }
+
+  if (!changed) {
+    return preferredMessage;
+  }
+  return {
+    ...preferredMessage,
+    metadata: nextMetadata,
+  };
+}
+
 function mergeProjectionArtifact(
   existing: TimelineProjectionArtifact,
   incoming: TimelineProjectionArtifact,
 ): TimelineProjectionArtifact {
   const preferred = compareProjectionArtifactFreshness(existing, incoming) >= 0 ? existing : incoming;
+  const preferredMessage = mergeProjectionOrderingMetadata(
+    existing.message,
+    incoming.message,
+    preferred.message,
+  );
   return {
     ...preferred,
     displayOrder: Math.min(
@@ -1575,6 +1610,7 @@ function mergeProjectionArtifact(
       ...ensureArray<string>(existing.messageIds),
       ...ensureArray<string>(incoming.messageIds),
     ])),
+    message: preferredMessage,
     executionItems: mergeProjectionExecutionItems(existing.executionItems, incoming.executionItems),
   };
 }
@@ -1583,6 +1619,10 @@ function compareProjectionArtifactsForPageMerge(
   left: TimelineProjectionArtifact,
   right: TimelineProjectionArtifact,
 ): number {
+  const sameRequestOrder = compareSameRequestMessageOrder(left.message, right.message);
+  if (sameRequestOrder !== null) {
+    return sameRequestOrder;
+  }
   const leftMetadata = resolveMessageMetadataRecord(left.message);
   const rightMetadata = resolveMessageMetadataRecord(right.message);
   const semanticOrder = compareTimelineSemanticOrder(
@@ -1815,7 +1855,7 @@ function ensureTimelineProjectionSnapshotCurrent(
 
 function sortAndSyncTimelineNodes(nextNodes: TimelineNode[]): void {
   const normalized = nextNodes.map((node) => normalizeTimelineNode(node));
-  normalized.sort((a, b) => compareTimelineSemanticOrder(nodeToOrderInput(a), nodeToOrderInput(b)));
+  normalized.sort(compareTimelineNodeOrder);
   messagesState.timelineNodes = normalized;
   rebuildTimelineIndexes();
 }

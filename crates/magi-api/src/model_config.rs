@@ -242,14 +242,6 @@ impl NormalizedModelConfig {
         Ok(format!("{normalized}{suffix}"))
     }
 
-    pub(crate) fn anthropic_probe_url(&self) -> Result<String, ApiError> {
-        let normalized = self.normalized_http_base_url()?;
-        if matches!(self.url_mode, ModelUrlMode::Full) {
-            return Ok(normalized);
-        }
-        Ok(format!("{normalized}/v1/messages"))
-    }
-
     pub(crate) fn openai_probe_body(&self) -> Result<Value, ApiError> {
         let model = self.require_model()?;
         if self.effective_openai_protocol() == ModelOpenAiProtocol::Chat {
@@ -269,18 +261,6 @@ impl NormalizedModelConfig {
                 "max_output_tokens": 1,
             }))
         }
-    }
-
-    pub(crate) fn anthropic_probe_body(&self) -> Result<Value, ApiError> {
-        let model = self.require_model()?;
-        Ok(json!({
-            "model": model,
-            "max_tokens": 1,
-            "messages": [{
-                "role": "user",
-                "content": "ping"
-            }]
-        }))
     }
 
     fn normalized_http_base_url(&self) -> Result<String, ApiError> {
@@ -329,6 +309,18 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+pub(crate) fn normalize_executable_model_provider(provider: Option<&str>) -> String {
+    match provider
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("openai-compatible" | "openai_compatible") => "openai-compatible".to_string(),
+        _ => "openai".to_string(),
+    }
 }
 
 fn is_openai_execution_endpoint(value: &str) -> bool {

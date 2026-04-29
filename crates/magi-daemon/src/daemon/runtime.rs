@@ -76,6 +76,60 @@ impl magi_bridge_client::ModelBridgeClient for UnavailableBusinessModelBridgeCli
     }
 }
 
+#[derive(Clone)]
+struct SettingsBackedBusinessModelBridgeClient {
+    state_root: PathBuf,
+    settings_store: Arc<SettingsStore>,
+    bridge_env: Vec<(String, String)>,
+}
+
+impl SettingsBackedBusinessModelBridgeClient {
+    fn new(
+        state_root: PathBuf,
+        settings_store: Arc<SettingsStore>,
+        bridge_env: &[(&str, &str)],
+    ) -> Self {
+        Self {
+            state_root,
+            settings_store,
+            bridge_env: bridge_env
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        }
+    }
+
+    fn build_client(&self) -> Result<HttpModelBridgeClient, magi_bridge_client::BridgeClientError> {
+        let bridge_env = self
+            .bridge_env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        ShadowDaemonRuntime::try_build_http_model_client(&bridge_env, self.settings_store.as_ref())
+            .map(|(client, _)| client)
+            .ok_or_else(|| {
+                UnavailableBusinessModelBridgeClient::new(self.state_root.clone()).error()
+            })
+    }
+}
+
+impl magi_bridge_client::ModelBridgeClient for SettingsBackedBusinessModelBridgeClient {
+    fn invoke(
+        &self,
+        request: magi_bridge_client::ModelInvocationRequest,
+    ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError> {
+        self.build_client()?.invoke(request)
+    }
+
+    fn invoke_streaming(
+        &self,
+        request: magi_bridge_client::ModelInvocationRequest,
+        on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
+    ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError> {
+        self.build_client()?.invoke_streaming(request, on_delta)
+    }
+}
+
 #[cfg(test)]
 impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
     fn invoke(
@@ -356,14 +410,15 @@ impl ShadowDaemonRuntime {
         }
 
         // 业务模型桥用于会话正文生成和任务执行；任务规划/分类另走本地 shadow-model。
-        // 业务模型配置来源优先级: bridge_env override → 进程 env → settings.json auxiliary 段
+        // 业务模型配置来源优先级: bridge_env override → 进程 env → settings.json auxiliary 段。
+        // settings 是运行时可编辑的产品配置，业务调用必须按次读取，避免保存后仍使用启动快照。
         // 测试场景下允许通过 model_bridge_override 注入业务模型 stub。
-        let direct_http_result = if model_bridge_override.is_some() {
+        let direct_http_probe_result = if model_bridge_override.is_some() {
             None
         } else {
             Self::try_build_http_model_client(bridge_env, settings_store.as_ref())
         };
-        let direct_http_probe_config = direct_http_result
+        let direct_http_probe_config = direct_http_probe_result
             .as_ref()
             .map(|(_, config)| config.clone());
 
@@ -373,16 +428,19 @@ impl ShadowDaemonRuntime {
         let direct_mcp_client = StdioMcpBridgeClient::from_env();
 
         let business_model_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
-            match (model_bridge_override.clone(), direct_http_result) {
-                (Some(client), _) => client,
-                (None, Some((http_client, _))) => Arc::new(http_client),
-                (None, None) => {
-                    warn!(
-                        state_root = %self.state_root.display(),
-                        "业务模型桥未配置，已启用明确失败客户端"
-                    );
-                    Arc::new(UnavailableBusinessModelBridgeClient::new(
+            match model_bridge_override.clone() {
+                Some(client) => client,
+                None => {
+                    if direct_http_probe_result.is_none() {
+                        warn!(
+                            state_root = %self.state_root.display(),
+                            "业务模型桥未配置，已启用明确失败客户端"
+                        );
+                    }
+                    Arc::new(SettingsBackedBusinessModelBridgeClient::new(
                         self.state_root.clone(),
+                        settings_store.clone(),
+                        bridge_env,
                     ))
                 }
             };
@@ -413,11 +471,11 @@ impl ShadowDaemonRuntime {
                 let eb = event_bus_for_task_store.clone();
                 let receiver = runner_result_receiver.clone();
                 restored.set_status_change_callback(Box::new(
-                    move |task_id, new_status, task: magi_core::Task| {
+                    move |task_id, old_status, new_status, task: magi_core::Task| {
                         let event = magi_event_bus::task_events::task_status_changed_event(
                             &task_id.to_string(),
                             &task.mission_id.to_string(),
-                            "",
+                            &format!("{:?}", old_status),
                             &format!("{:?}", new_status),
                             &format!("{:?}", task.kind),
                         );
@@ -439,11 +497,11 @@ impl ShadowDaemonRuntime {
             _ => {
                 let receiver = runner_result_receiver.clone();
                 Arc::new(TaskStore::with_status_change_callback(Box::new(
-                    move |task_id, new_status, task: magi_core::Task| {
+                    move |task_id, old_status, new_status, task: magi_core::Task| {
                         let event = magi_event_bus::task_events::task_status_changed_event(
                             &task_id.to_string(),
                             &task.mission_id.to_string(),
-                            "",
+                            &format!("{:?}", old_status),
                             &format!("{:?}", new_status),
                             &format!("{:?}", task.kind),
                         );
@@ -979,6 +1037,74 @@ mod tests {
                 .expect("response body should read"),
         )
         .expect("response should be valid json")
+    }
+
+    #[tokio::test]
+    async fn business_model_client_reads_latest_auxiliary_settings_per_call() {
+        let (base_url, receiver, handle) = spawn_http_stub_multi(
+            200,
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": "hello from updated settings"
+                    }
+                }]
+            }),
+            1,
+        );
+
+        let state_root = temp_state_root("business-model-live-settings");
+        fs::write(
+            state_root.join("settings.json"),
+            json!({
+                "auxiliary": {
+                    "baseUrl": base_url,
+                    "apiKey": "test-key",
+                    "model": "stale-model",
+                    "provider": "openai",
+                    "openaiProtocol": "chat",
+                    "urlMode": "standard"
+                }
+            })
+            .to_string(),
+        )
+        .expect("settings should write");
+        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
+        let runtime =
+            ShadowDaemonRuntime::restore(&config).expect("runtime restore should load settings");
+        let (_app, state) =
+            runtime.router_with_bridge_env_for_tests("shadow-test".to_string(), &[]);
+
+        state.settings_store.set_section(
+            "auxiliary",
+            json!({
+                "baseUrl": base_url,
+                "apiKey": "test-key",
+                "model": "fresh-model",
+                "provider": "openai",
+                "openaiProtocol": "chat",
+                "urlMode": "standard"
+            }),
+        );
+        let response = state
+            .model_bridge_client()
+            .expect("business model client should be configured")
+            .invoke(magi_bridge_client::ModelInvocationRequest {
+                provider: "openai-compatible".to_string(),
+                prompt: "hello".to_string(),
+                messages: None,
+                tools: None,
+                tool_choice: None,
+            })
+            .expect("updated settings-backed model call should succeed");
+
+        assert!(response.payload.contains("hello from updated settings"));
+        let request = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("http stub should receive request");
+        handle.join().expect("http stub should join");
+        let body: Value = serde_json::from_str(&request.body).expect("request body should be json");
+        assert_eq!(body["model"], "fresh-model");
     }
 
     async fn get_task_projection(app: axum::Router, root_task_id: &str, session_id: &str) -> Value {

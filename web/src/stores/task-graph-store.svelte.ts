@@ -94,8 +94,16 @@ export function getTaskGraphState(sessionId: string | null | undefined): TaskGra
   if (!normalizedSessionId) {
     return EMPTY_TASK_GRAPH_STATE;
   }
-  // 直接返回 sessionStates 中的引用，使 Svelte 响应性系统能追踪字段变化
+  // 直接返回 sessionStates 中的引用，使 Svelte 响应性系统能追踪字段变化。
   return readSessionState(normalizedSessionId) ?? EMPTY_TASK_GRAPH_STATE;
+}
+
+export function ensureTaskGraphState(sessionId: string | null | undefined): void {
+  const normalizedSessionId = normalizeSessionKey(sessionId);
+  if (!normalizedSessionId) {
+    return;
+  }
+  ensureSessionState(normalizedSessionId);
 }
 
 export async function fetchTaskProjection(

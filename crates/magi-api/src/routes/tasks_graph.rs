@@ -7,7 +7,14 @@ use magi_core::{TaskId, TaskProjection};
 use serde::Deserialize;
 
 use super::session_scope::parse_session_id;
-use crate::{errors::ApiError, shadow_execution::replan_deep_task_graph, state::ApiState};
+use crate::{
+    errors::ApiError,
+    shadow_execution::{
+        ensure_session_active_execution_chain, replace_replanned_task_execution_branches,
+        replan_deep_task_graph,
+    },
+    state::ApiState,
+};
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -152,8 +159,10 @@ async fn replan_task_graph(
     Path(root_task_id): Path<String>,
     Query(query): Query<SessionScopedTaskQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let session_id = parse_session_id(query.session_id.as_deref())?;
     let root_id = TaskId::new(&root_task_id);
     require_session_task(&state, query.session_id.as_deref(), &root_id)?;
+    ensure_session_active_execution_chain(&state, &session_id)?;
     let store = require_task_store(&state)?;
     let root_task = store
         .get_task(&root_id)
@@ -170,11 +179,19 @@ async fn replan_task_graph(
     );
     let replan =
         replan_deep_task_graph(&state, &root_id, &prompt, None, "manual task graph replan")?;
+    replace_replanned_task_execution_branches(
+        &state,
+        &session_id,
+        &replan.primary_action_task_id,
+        &replan.leaf_action_task_ids,
+    )?;
 
     Ok(Json(serde_json::json!({
         "rootTaskId": root_task_id,
         "replan": true,
         "cancelledTaskIds": replan.cancelled_task_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        "primaryActionTaskId": replan.primary_action_task_id.to_string(),
+        "leafActionTaskIds": replan.leaf_action_task_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
     })))
 }
 

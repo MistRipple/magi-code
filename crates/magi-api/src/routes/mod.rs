@@ -351,7 +351,7 @@ mod tests {
         let runner_result_receiver = Arc::new(EventBasedResultReceiver::new());
         let receiver_for_status = runner_result_receiver.clone();
         let task_store = Arc::new(TaskStore::with_status_change_callback(Box::new(
-            move |task_id, new_status, _task| match new_status {
+            move |task_id, _old_status, new_status, _task| match new_status {
                 TaskStatus::Completed => {
                     receiver_for_status.push_result(TaskResult {
                         task_id: task_id.clone(),
@@ -2771,6 +2771,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_graph_manual_replan_replaces_active_execution_branches() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let app = build_router(state.clone());
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/api/session/turn",
+            json!({
+                "sessionId": "session-route-shadow",
+                "text": "Manual task graph replan coverage",
+                "deepTask": true,
+                "skillName": "refactor",
+                "images": [],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "深度任务提交应成功: {body:?}");
+        let root_task_id = body["rootTaskId"]
+            .as_str()
+            .expect("深度任务应返回 rootTaskId")
+            .to_string();
+        let old_action_task_id = body["actionTaskId"]
+            .as_str()
+            .expect("深度任务应返回 actionTaskId")
+            .to_string();
+
+        let (replan_status, replan_body) = post_json(
+            app,
+            &format!("/api/tasks/{root_task_id}/replan?sessionId=session-route-shadow"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            replan_status,
+            StatusCode::OK,
+            "手动重规划应成功并同步 active chain: {replan_body:?}"
+        );
+        let primary_action_task_id = replan_body["primaryActionTaskId"]
+            .as_str()
+            .expect("手动重规划应返回主 action")
+            .to_string();
+        let leaf_action_task_ids = replan_body["leafActionTaskIds"]
+            .as_array()
+            .expect("手动重规划应返回 leaf action 列表")
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .expect("leaf action id must be string")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !leaf_action_task_ids.is_empty(),
+            "重规划必须生成 worker 叶子任务"
+        );
+
+        let sidecar = state
+            .session_store
+            .runtime_sidecar(&SessionId::new("session-route-shadow"))
+            .expect("重规划后应保留 session sidecar");
+        let chain = sidecar
+            .active_execution_chain
+            .expect("重规划后应保留 active execution chain");
+        let active_branch_ids = chain
+            .active_branch_task_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            !active_branch_ids.contains(&old_action_task_id),
+            "手动重规划不能让旧 action 分支继续留在 active chain: {active_branch_ids:?}"
+        );
+        assert!(
+            active_branch_ids.contains(&primary_action_task_id),
+            "手动重规划主 action 必须进入 active chain: {active_branch_ids:?}"
+        );
+        for leaf_action_task_id in &leaf_action_task_ids {
+            assert!(
+                active_branch_ids.contains(leaf_action_task_id),
+                "手动重规划 leaf action 必须进入 active chain: {active_branch_ids:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn session_action_route_skips_extraction_for_blank_text_inputs() {
         let state = test_state_with_shadow_execution_pipeline();
         let app = build_router(state.clone());
@@ -3235,6 +3321,152 @@ mod tests {
             .map(|branch| branch.worker_id.to_string())
             .collect::<Vec<_>>();
         assert_eq!(updated_workers, original_workers);
+    }
+
+    #[tokio::test]
+    async fn session_continue_route_skips_runtime_finished_worker_even_when_sidecar_is_execute() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let app = build_router(state.clone());
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-runtime-finished-worker"),
+                "runtime finished worker session",
+                Some("workspace-route-shadow".to_string()),
+            )
+            .expect("runtime finished worker session should be creatable");
+
+        let (status, seed_body) = post_json(
+            app.clone(),
+            "/api/session/turn",
+            json!({
+                "sessionId": "session-runtime-finished-worker",
+                "text": "seed runtime finished worker state",
+                "deepTask": true,
+                "skillName": "refactor",
+                "images": [],
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "unexpected response body: {seed_body:?}"
+        );
+
+        let session_id = SessionId::new("session-runtime-finished-worker");
+        let mut chain = state
+            .session_store
+            .active_execution_chain(&session_id)
+            .expect("active execution chain should exist after seed dispatch");
+        assert!(
+            chain.branches.len() >= 2,
+            "seed dispatch should create multiple worker branches for runtime finish regression"
+        );
+        chain.branches.truncate(2);
+        for branch in &mut chain.branches {
+            branch.stage = "execute".to_string();
+            branch.checkpoint_stage = Some("execute".to_string());
+            branch.resume_mode = Some("stage-restart".to_string());
+            branch.checkpoint_at = Some(UtcMillis::now());
+        }
+        chain.branches[1].worker_id = WorkerId::new("worker-runtime-finished");
+        chain.active_worker_bindings = chain
+            .branches
+            .iter()
+            .map(|branch| branch.worker_id.clone())
+            .collect();
+        state
+            .session_store
+            .upsert_active_execution_chain(session_id.clone(), chain)
+            .expect("active execution chain should accept runtime finished fixture");
+        let chain = state
+            .session_store
+            .active_execution_chain(&session_id)
+            .expect("active execution chain should remain available after fixture update");
+        let resumable_branch = chain.branches[0].clone();
+        let finished_branch = chain.branches[1].clone();
+        let finished_worker = finished_branch.worker_id.to_string();
+
+        let task_store = state.task_store().expect("task store should be configured");
+        task_store
+            .update_status(&chain.root_task_id, TaskStatus::Blocked)
+            .expect("root task should become recoverable");
+        for branch in &chain.branches {
+            task_store
+                .update_status(&branch.task_id, TaskStatus::Blocked)
+                .expect("branch task should become recoverable");
+        }
+
+        let worker_runtime = state
+            .shadow_execution_pipeline()
+            .expect("shadow execution pipeline should exist")
+            .execution_runtime
+            .worker_runtime()
+            .clone();
+        worker_runtime.restore_durable_snapshot(
+            magi_worker_runtime::WorkerRuntimeDurableSnapshot {
+                branches: vec![magi_worker_runtime::WorkerRuntimeBranchSnapshot {
+                    task_id: finished_branch.task_id.clone(),
+                    worker_id: finished_branch.worker_id.clone(),
+                    stage: magi_worker_runtime::WorkerStage::Finish,
+                    lease_id: finished_branch.lease_id.as_ref().map(ToString::to_string),
+                    execution_intent_ref: finished_branch.execution_intent_ref.clone(),
+                    binding_lifecycle: None,
+                    checkpoint_cursor: None,
+                }],
+            },
+        );
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/api/session/continue",
+            json!({
+                "sessionId": session_id.to_string(),
+                "requestedWorkerIds": [finished_worker],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body:?}");
+        assert_eq!(body["message"], "请求继续的 worker 当前不可继续");
+        let finalized_task = task_store
+            .get_task(&finished_branch.task_id)
+            .expect("runtime finished branch task should remain queryable");
+        assert_eq!(
+            finalized_task.status,
+            TaskStatus::Completed,
+            "runtime snapshot 已 finish 时，continue 前必须先把 branch 收敛为终态"
+        );
+        assert!(
+            finalized_task
+                .evidence_refs
+                .iter()
+                .any(|evidence| evidence.starts_with("evidence://worker-runtime/")),
+            "runtime snapshot 作为终态来源时必须写入可追踪 evidence，不能绕过完成约束"
+        );
+
+        let (status, body) = post_json(
+            app,
+            "/api/session/continue",
+            json!({
+                "sessionId": session_id.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "unexpected response body: {body:?}");
+        assert_eq!(body["resumedBranchCount"], 1);
+        let resumed_task = task_store
+            .get_task(&resumable_branch.task_id)
+            .expect("remaining branch task should remain queryable");
+        assert_ne!(
+            resumed_task.status,
+            TaskStatus::Blocked,
+            "未完成 branch 应继续恢复，已完成 branch 不应重新进入恢复集合"
+        );
+        let finished_task = task_store
+            .get_task(&finished_branch.task_id)
+            .expect("runtime finished branch task should remain queryable after continue");
+        assert_eq!(finished_task.status, TaskStatus::Completed);
     }
 
     #[tokio::test]

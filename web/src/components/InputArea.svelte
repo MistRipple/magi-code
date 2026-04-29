@@ -178,6 +178,21 @@
     selectedSkill = null;
   }
 
+  function isNaturalContinueRequest(value: string | null): boolean {
+    if (!value) return false;
+    const text = value.trim().toLowerCase();
+    if (!text) return false;
+    return [
+      '继续',
+      '继续执行',
+      '继续任务',
+      '继续刚才的任务',
+      '继续刚刚的任务',
+      'resume',
+      'continue',
+    ].includes(text);
+  }
+
   function formatIntakeTaskOptionLabel(task: TaskDto): string {
     return `${getTaskKindLabel(task.kind)} · ${task.title} · ${getTaskStatusLabel(task.status)}`;
   }
@@ -209,8 +224,8 @@
       return;
     }
 
-    // 深度模式任务图运行中：路由到 Intake API
-    if (shouldUseIntake && submissionText) {
+    // 深度任务运行中默认走 Intake；继续意图必须交给 session turn 分类器恢复执行链。
+    if (shouldUseIntake && submissionText && !isNaturalContinueRequest(submissionText)) {
       await sendIntake(submissionText);
       return;
     }

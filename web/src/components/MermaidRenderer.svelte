@@ -4,6 +4,7 @@
   import Icon from './Icon.svelte';
   import { postMessage } from '../lib/vscode-bridge';
   import { i18n } from '../stores/i18n.svelte';
+  import { sanitizeMermaidSvgContent } from '../shared/mermaid-svg-sanitizer';
 
   // Props
   interface Props {
@@ -157,7 +158,7 @@
     mermaid.initialize({
       startOnLoad: false,
       theme: 'base',
-      securityLevel: 'loose',
+      securityLevel: 'strict',
       fontFamily: 'ui-sans-serif, system-ui, sans-serif',
       themeVariables: {
         darkMode: mode === 'dark',
@@ -187,7 +188,7 @@
         signalTextColor: foreground,
       },
       flowchart: {
-        htmlLabels: true,
+        htmlLabels: false,
         curve: 'basis',
         nodeSpacing: 50,
         rankSpacing: 50,
@@ -246,7 +247,11 @@
 
       const diagramId = getUniqueId();
       const { svg } = await mermaid.render(diagramId, code.trim());
-      svgContent = svg;
+      const sanitizedSvg = sanitizeMermaidSvgContent(svg);
+      if (!sanitizedSvg) {
+        throw new Error(i18n.t('mermaidRenderer.renderFailed'));
+      }
+      svgContent = sanitizedSvg;
       lastRenderedCode = code;
     } catch (e) {
       console.error('[MermaidRenderer] 渲染错误:', e);

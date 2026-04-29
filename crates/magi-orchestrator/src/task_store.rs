@@ -14,10 +14,10 @@ static CHECKPOINT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Callback invoked after a successful `update_status` call.
 ///
-/// Receives the task ID, the new status, and a snapshot of the task after the
-/// status change.  The callback runs while the tasks write lock is still held,
-/// so implementations should be lightweight (e.g. publish an event).
-pub type StatusChangeCallback = Box<dyn Fn(&TaskId, TaskStatus, Task) + Send + Sync>;
+/// Receives the task ID, old status, new status, and a snapshot of the task
+/// after the status change. Implementations should be lightweight (e.g.
+/// publish an event).
+pub type StatusChangeCallback = Box<dyn Fn(&TaskId, TaskStatus, TaskStatus, Task) + Send + Sync>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskContextEntry {
@@ -248,6 +248,7 @@ impl TaskStore {
                 message: format!("任务 {task_id} 在完成前必须写入 evidence_refs"),
             });
         }
+        let old_status = task.status;
         task.status = status;
         task.updated_at = UtcMillis::now();
         let cloned_task = task.clone();
@@ -257,7 +258,7 @@ impl TaskStore {
             .lock()
             .expect("on_status_change lock poisoned");
         if let Some(ref cb) = *callback {
-            cb(task_id, status, cloned_task);
+            cb(task_id, old_status, status, cloned_task);
         }
         drop(callback);
         self.fire_checkpoint();
@@ -275,19 +276,20 @@ impl TaskStore {
         let task = tasks
             .get_mut(task_id)
             .ok_or(DomainError::NotFound { entity: "Task" })?;
-        if !is_valid_transition(task.status, new_status) {
+        let old_status = task.status;
+        if !is_valid_transition(old_status, new_status) {
             return Err(DomainError::InvalidState {
-                message: format!("非法状态迁移: {:?} -> {:?}", task.status, new_status),
+                message: format!("非法状态迁移: {:?} -> {:?}", old_status, new_status),
             });
         }
         // G9: Policy freeze — snapshot policy on Draft→Ready transition.
-        if task.status == TaskStatus::Draft && new_status == TaskStatus::Ready {
+        if old_status == TaskStatus::Draft && new_status == TaskStatus::Ready {
             if task.policy_snapshot.is_none() {
                 task.policy_snapshot = Some(default_frozen_policy());
             }
         }
         if new_status == TaskStatus::Completed
-            && task.status != TaskStatus::Completed
+            && old_status != TaskStatus::Completed
             && task_requires_delivery_evidence(task)
             && task.evidence_refs.is_empty()
         {
@@ -304,7 +306,7 @@ impl TaskStore {
             .lock()
             .expect("on_status_change lock poisoned");
         if let Some(ref cb) = *callback {
-            cb(task_id, new_status, cloned_task);
+            cb(task_id, old_status, new_status, cloned_task);
         }
         drop(callback);
         self.fire_checkpoint();
@@ -1668,6 +1670,7 @@ mod tests {
         AssignmentLease, DecisionOption, DecisionTaskPayload, LeaseId, LeaseStatus, MissionId,
         Task, TaskId, TaskKind, TaskStatus, UtcMillis, WorkerId,
     };
+    use std::sync::{Arc, Mutex};
 
     fn make_task(
         task_id: &str,
@@ -2001,6 +2004,41 @@ mod tests {
         // Updating a nonexistent task should return an error
         let result = store.update_status(&TaskId::new("nonexistent"), TaskStatus::Running);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn status_change_callback_receives_old_and_new_status() {
+        let transitions = Arc::new(Mutex::new(Vec::new()));
+        let transitions_for_callback = Arc::clone(&transitions);
+        let store = TaskStore::with_status_change_callback(Box::new(
+            move |task_id, old_status, new_status, task| {
+                transitions_for_callback
+                    .lock()
+                    .expect("transitions lock should not be poisoned")
+                    .push((task_id.to_string(), old_status, new_status, task.status));
+            },
+        ));
+
+        store.insert_task(make_task(
+            "t-callback",
+            "m-callback",
+            "t-callback",
+            None,
+            TaskKind::Action,
+            TaskStatus::Ready,
+        ));
+        store
+            .update_status(&TaskId::new("t-callback"), TaskStatus::Running)
+            .expect("status update should succeed");
+
+        let recorded = transitions
+            .lock()
+            .expect("transitions lock should not be poisoned");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, "t-callback");
+        assert_eq!(recorded[0].1, TaskStatus::Ready);
+        assert_eq!(recorded[0].2, TaskStatus::Running);
+        assert_eq!(recorded[0].3, TaskStatus::Running);
     }
 
     // -----------------------------------------------------------------------

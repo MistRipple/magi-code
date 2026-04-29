@@ -1,8 +1,9 @@
 use crate::{
     prompt_utils::{normalize_model_stream_preview_content, normalize_model_visible_content},
     session_turn_writeback::{
-        append_session_turn_item, build_completed_turn_timeline_snapshot,
-        publish_session_turn_item_event, session_turn_item, upsert_session_turn_item,
+        append_session_turn_item_with_task_store, build_completed_turn_timeline_snapshot,
+        publish_session_turn_item_event, session_turn_item,
+        upsert_session_turn_item_with_task_store,
     },
     settings_store::SettingsStore,
     skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime},
@@ -175,6 +176,7 @@ pub(crate) fn run_task_llm_loop(
                     publish_task_thinking_delta(
                         event_bus,
                         session_store,
+                        task_store,
                         task,
                         session_id,
                         workspace_id,
@@ -188,6 +190,7 @@ pub(crate) fn run_task_llm_loop(
                 publish_stream_delta(
                     event_bus,
                     session_store,
+                    task_store,
                     task,
                     session_id,
                     workspace_id,
@@ -241,6 +244,7 @@ pub(crate) fn run_task_llm_loop(
                 upsert_task_thinking_turn_item(
                     event_bus,
                     session_store,
+                    task_store,
                     task,
                     session_id,
                     workspace_id,
@@ -288,6 +292,7 @@ pub(crate) fn run_task_llm_loop(
                 append_task_tool_call_started_turn_item(
                     event_bus,
                     session_store,
+                    task_store,
                     task,
                     session_id,
                     workspace_id,
@@ -312,6 +317,7 @@ pub(crate) fn run_task_llm_loop(
                 append_task_tool_call_result_turn_item(
                     event_bus,
                     session_store,
+                    task_store,
                     task,
                     session_id,
                     workspace_id,
@@ -451,6 +457,7 @@ fn publish_task_llm_started(
 fn publish_stream_delta(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
+    task_store: &TaskStore,
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -478,7 +485,9 @@ fn publish_stream_delta(
         Some(entry_id.to_string()),
     );
     apply_task_turn_visibility(&mut item, task, turn_visibility);
-    if let Some(published) = upsert_session_turn_item(session_store, session_id, item) {
+    if let Some(published) =
+        upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
+    {
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
 }
@@ -486,6 +495,7 @@ fn publish_stream_delta(
 fn publish_task_thinking_delta(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
+    task_store: &TaskStore,
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -507,6 +517,7 @@ fn publish_task_thinking_delta(
     upsert_task_thinking_turn_item(
         event_bus,
         session_store,
+        task_store,
         task,
         session_id,
         workspace_id,
@@ -520,6 +531,7 @@ fn publish_task_thinking_delta(
 fn upsert_task_thinking_turn_item(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
+    task_store: &TaskStore,
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -540,7 +552,9 @@ fn upsert_task_thinking_turn_item(
         Some(item_id.to_string()),
     );
     apply_task_turn_visibility(&mut item, task, turn_visibility);
-    if let Some(published) = upsert_session_turn_item(session_store, session_id, item) {
+    if let Some(published) =
+        upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
+    {
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
 }
@@ -548,6 +562,7 @@ fn upsert_task_thinking_turn_item(
 fn append_task_tool_call_started_turn_item(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
+    task_store: &TaskStore,
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -565,7 +580,9 @@ fn append_task_tool_call_started_turn_item(
     item.tool_call_id = Some(tool_call.id.clone());
     item.tool_name = Some(tool_call.function.name.clone());
     item.tool_arguments = Some(tool_call.function.arguments.clone());
-    if let Some(published) = append_session_turn_item(session_store, session_id, item) {
+    if let Some(published) =
+        append_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
+    {
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
 }
@@ -573,6 +590,7 @@ fn append_task_tool_call_started_turn_item(
 fn append_task_tool_call_result_turn_item(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
+    task_store: &TaskStore,
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
@@ -598,7 +616,9 @@ fn append_task_tool_call_result_turn_item(
     if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
         item.tool_error = Some(tool_result.to_string());
     }
-    if let Some(published) = append_session_turn_item(session_store, session_id, item) {
+    if let Some(published) =
+        append_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
+    {
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
 }
@@ -805,11 +825,20 @@ fn append_task_final_turn_item(
     );
     apply_task_turn_visibility(&mut final_item, task, turn_visibility);
     if streaming_entry_id.is_some() {
-        if let Some(published) = upsert_session_turn_item(session_store, session_id, final_item) {
+        if let Some(published) = upsert_session_turn_item_with_task_store(
+            session_store,
+            session_id,
+            final_item,
+            Some(task_store),
+        ) {
             publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
         }
-    } else if let Some(published) = append_session_turn_item(session_store, session_id, final_item)
-    {
+    } else if let Some(published) = append_session_turn_item_with_task_store(
+        session_store,
+        session_id,
+        final_item,
+        Some(task_store),
+    ) {
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
     if turn_visibility.thread_visible {
@@ -852,7 +881,12 @@ fn append_task_error_turn_item(
         Some(format!("turn-item-assistant-error-{}", UtcMillis::now().0)),
     );
     apply_task_turn_visibility(&mut error_item, task, turn_visibility);
-    if let Some(published) = append_session_turn_item(session_store, session_id, error_item) {
+    if let Some(published) = append_session_turn_item_with_task_store(
+        session_store,
+        session_id,
+        error_item,
+        Some(task_store),
+    ) {
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
     if turn_visibility.thread_visible {

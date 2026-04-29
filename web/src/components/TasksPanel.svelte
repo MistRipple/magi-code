@@ -30,6 +30,7 @@
     getTaskStatusTone,
   } from '../lib/task-labels';
   import {
+    ensureTaskGraphState,
     getTaskGraphState,
     getTaskStatusModifier,
     refreshTaskProjection,
@@ -64,6 +65,10 @@
   const currentSessionId = $derived(appState.currentSessionId);
   const taskGraph = $derived(getTaskGraphState(currentSessionId));
   const hasTaskProjection = $derived(taskGraph.projection !== null);
+
+  $effect(() => {
+    ensureTaskGraphState(currentSessionId);
+  });
   const projectionProgress = $derived.by(() => {
     const p = taskGraph.projection?.progress_summary;
     if (!p || p.total_tasks === 0) return null;
@@ -1387,10 +1392,11 @@
         </section>
       {/if}
 
-      {#if taskGraph.error}
-        <div class="tg-error">{taskGraph.error}</div>
-      {/if}
     {/if}
+  {/if}
+
+  {#if taskGraph.error}
+    <div class="tg-error">{taskGraph.error}</div>
   {/if}
 
   {#if !hasTaskProjection}

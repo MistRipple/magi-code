@@ -52,12 +52,30 @@ fn branch_stage_is_terminal(stage: &str) -> bool {
     )
 }
 
+fn branch_runtime_snapshot_is_terminal(state: &ApiState, branch: &ActiveExecutionBranch) -> bool {
+    state
+        .shadow_execution_pipeline()
+        .and_then(|pipeline| {
+            pipeline
+                .execution_runtime
+                .worker_runtime()
+                .branch_snapshot_for_task(&branch.task_id)
+        })
+        .is_some_and(|snapshot| {
+            snapshot.worker_id == branch.worker_id && matches!(snapshot.stage, WorkerStage::Finish)
+        })
+}
+
+fn branch_is_terminal_for_recovery(state: &ApiState, branch: &ActiveExecutionBranch) -> bool {
+    branch_stage_is_terminal(&branch.stage) || branch_runtime_snapshot_is_terminal(state, branch)
+}
+
 pub(crate) fn active_execution_branch_is_continue_recoverable(
     state: &ApiState,
     chain: &ActiveExecutionChain,
     branch: &ActiveExecutionBranch,
 ) -> bool {
-    if branch_stage_is_terminal(&branch.stage) {
+    if branch_is_terminal_for_recovery(state, branch) {
         return false;
     }
     let Some(task_store) = state.task_store() else {
@@ -94,6 +112,16 @@ fn terminal_status_for_branch(
             Some(magi_core::TerminationReason::Blocked) => TaskStatus::Blocked,
             Some(magi_core::TerminationReason::Completed) | None => TaskStatus::Completed,
         })
+        .or_else(|| {
+            branch_runtime_snapshot_is_terminal(state, branch).then_some(TaskStatus::Completed)
+        })
+}
+
+fn runtime_terminal_evidence_ref(branch: &ActiveExecutionBranch) -> String {
+    format!(
+        "evidence://worker-runtime/{}/finish?worker={}",
+        branch.task_id, branch.worker_id
+    )
 }
 
 pub(crate) fn finalize_terminal_worker_branches(
@@ -114,7 +142,7 @@ pub(crate) fn finalize_terminal_worker_branches(
     for branch in chain
         .branches
         .iter()
-        .filter(|branch| branch_stage_is_terminal(&branch.stage))
+        .filter(|branch| branch_is_terminal_for_recovery(state, branch))
     {
         let Some(task) = task_store.get_task(&branch.task_id) else {
             continue;
@@ -126,6 +154,10 @@ pub(crate) fn finalize_terminal_worker_branches(
             terminal_status_for_branch(state, branch).unwrap_or(TaskStatus::Completed);
         if matches!(terminal_status, TaskStatus::Blocked) {
             continue;
+        }
+        if matches!(terminal_status, TaskStatus::Completed) && task.evidence_refs.is_empty() {
+            task_store
+                .set_evidence_refs(&branch.task_id, vec![runtime_terminal_evidence_ref(branch)]);
         }
         task_store
             .update_status(&branch.task_id, terminal_status)

@@ -7,12 +7,16 @@ use magi_core::UtcMillis;
 use magi_usage_authority::{
     SessionSummary, UsageAuthority, UsageCallRecordInput, UsageModelSnapshot, UsageTotals,
 };
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 
-use crate::{errors::ApiError, model_config::NormalizedModelConfig, state::ApiState};
+use crate::{
+    errors::ApiError,
+    model_config::{NormalizedModelConfig, normalize_executable_model_provider},
+    state::ApiState,
+};
 
 fn unwrap_settings_section_request(request: &serde_json::Value) -> serde_json::Value {
     request
@@ -118,7 +122,7 @@ fn parse_model_ids(payload: &Value) -> Vec<String> {
 
 fn parse_connection_probe_config(request: Value) -> Result<NormalizedModelConfig, ApiError> {
     let config = unwrap_settings_section_request(&request);
-    let normalized = NormalizedModelConfig::from_settings_value(&config, "anthropic");
+    let normalized = NormalizedModelConfig::from_settings_value(&config, "openai");
     normalized.require_base_url()?;
     normalized.require_api_key()?;
     normalized.require_model()?;
@@ -140,20 +144,6 @@ async fn execute_connection_probe(
                     .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
             headers.insert(AUTHORIZATION, auth_value);
             (config.openai_probe_url()?, config.openai_probe_body()?)
-        }
-        "anthropic" => {
-            let api_key_name = HeaderName::from_static("x-api-key");
-            let api_key_value = HeaderValue::from_str(config.require_api_key()?)
-                .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
-            headers.insert(api_key_name, api_key_value);
-            headers.insert(
-                HeaderName::from_static("anthropic-version"),
-                HeaderValue::from_static("2023-06-01"),
-            );
-            (
-                config.anthropic_probe_url()?,
-                config.anthropic_probe_body()?,
-            )
         }
         _ => {
             return Err(ApiError::InvalidInput(format!(
@@ -483,6 +473,29 @@ fn default_agent_binding(template_id: &str, order: usize) -> Value {
     })
 }
 
+fn normalize_llm_config(raw_llm: Option<&Value>) -> Value {
+    let mut llm = raw_llm
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let provider = normalize_executable_model_provider(llm.get("provider").and_then(Value::as_str));
+    llm.insert("provider".to_string(), Value::String(provider));
+    Value::Object(llm)
+}
+
+fn normalize_model_config_payload(mut value: Value) -> Value {
+    if let Some(object) = value.as_object_mut()
+        && (object.contains_key("baseUrl")
+            || object.contains_key("model")
+            || object.contains_key("provider"))
+    {
+        let provider =
+            normalize_executable_model_provider(object.get("provider").and_then(Value::as_str));
+        object.insert("provider".to_string(), Value::String(provider));
+    }
+    value
+}
+
 fn normalize_engine_entry(entry: &Value) -> Option<Value> {
     let raw = entry.get("engine").unwrap_or(entry);
     let engine_id = raw
@@ -504,10 +517,7 @@ fn normalize_engine_entry(entry: &Value) -> Option<Value> {
                 .to_string(),
         ),
     );
-    normalized.insert(
-        "llm".to_string(),
-        raw.get("llm").cloned().unwrap_or_else(|| json!({})),
-    );
+    normalized.insert("llm".to_string(), normalize_llm_config(raw.get("llm")));
     if let Some(runtime) = raw.get("runtime").cloned() {
         normalized.insert("runtime".to_string(), runtime);
     }
@@ -780,14 +790,18 @@ async fn save_worker_config(
             .as_object()
             .cloned()
             .unwrap_or_default();
-        workers.insert(worker_id.to_string(), worker_config.clone());
+        workers.insert(
+            worker_id.to_string(),
+            normalize_model_config_payload(worker_config.clone()),
+        );
         state
             .settings_store
             .set_section("workers", serde_json::Value::Object(workers));
     } else {
-        state
-            .settings_store
-            .set_section("workers", scoped_settings_section_request(&request));
+        state.settings_store.set_section(
+            "workers",
+            normalize_model_config_payload(scoped_settings_section_request(&request)),
+        );
     }
     Ok(Json(serde_json::json!({ "saved": true })))
 }
@@ -815,9 +829,10 @@ async fn save_orchestrator_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state
-        .settings_store
-        .set_section("orchestrator", scoped_settings_section_request(&request));
+    state.settings_store.set_section(
+        "orchestrator",
+        normalize_model_config_payload(scoped_settings_section_request(&request)),
+    );
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -832,9 +847,10 @@ async fn save_auxiliary_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state
-        .settings_store
-        .set_section("auxiliary", scoped_settings_section_request(&request));
+    state.settings_store.set_section(
+        "auxiliary",
+        normalize_model_config_payload(scoped_settings_section_request(&request)),
+    );
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -1350,6 +1366,27 @@ mod tests {
         assert!(!object.contains_key("userRules"));
         assert!(!object.contains_key("engines"));
         assert!(!object.contains_key("agents"));
+    }
+
+    #[test]
+    fn normalize_engine_entry_keeps_only_executable_model_provider() {
+        let normalized = normalize_engine_entry(&json!({
+            "id": "sonnet-4-5",
+            "displayName": "sonnet-4.5",
+            "llm": {
+                "provider": "anthropic",
+                "baseUrl": "http://localhost:8317/",
+                "model": "kiro-claude-sonnet-4-5-agentic",
+                "urlMode": "standard"
+            }
+        }))
+        .expect("engine should normalize");
+
+        assert_eq!(normalized["llm"]["provider"], json!("openai"));
+        assert_eq!(
+            normalized["llm"]["model"],
+            json!("kiro-claude-sonnet-4-5-agentic")
+        );
     }
 
     #[tokio::test]

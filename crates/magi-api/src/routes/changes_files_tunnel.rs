@@ -12,7 +12,7 @@ use super::session_scope::parse_session_id;
 use crate::{
     change_projection::{
         SessionChangeScope, resolve_session_change_scope, resolve_workspace_root_or_active,
-        run_git, run_git_add_files, run_git_restore_files, safe_relative_path,
+        run_git_add_files, run_git_diff, run_git_restore_files, safe_relative_path,
     },
     errors::ApiError,
     state::ApiState,
@@ -84,7 +84,7 @@ async fn get_diff(
         match query.file_path.as_deref() {
             Some(fp) => {
                 let rel = require_session_scoped_file(&scope, fp)?;
-                run_git(&scope.workspace_root, &["diff", "HEAD", "--", rel])?
+                run_git_diff(&scope.workspace_root, &["diff", "HEAD", "--", rel])?
             }
             None => {
                 let files = scope
@@ -97,7 +97,7 @@ async fn get_diff(
                 } else {
                     let mut args = vec!["diff", "HEAD", "--"];
                     args.extend(files);
-                    run_git(&scope.workspace_root, &args)?
+                    run_git_diff(&scope.workspace_root, &args)?
                 }
             }
         }
@@ -106,9 +106,9 @@ async fn get_diff(
         match query.file_path.as_deref() {
             Some(fp) => {
                 let rel = safe_relative_path(fp)?;
-                run_git(&root, &["diff", "HEAD", "--", rel])?
+                run_git_diff(&root, &["diff", "HEAD", "--", rel])?
             }
-            None => run_git(&root, &["diff", "HEAD"])?,
+            None => run_git_diff(&root, &["diff", "HEAD"])?,
         }
     };
     Ok(Json(serde_json::json!({
@@ -727,6 +727,64 @@ mod tests {
         });
 
         state
+    }
+
+    fn build_state_with_workspace_root(root: &str, workspace_id: &str) -> ApiState {
+        let event_bus = Arc::new(InMemoryEventBus::new(32));
+        let session_store = Arc::new(SessionStore::default());
+        let workspace_store = Arc::new(WorkspaceStore::default());
+        let governance = Arc::new(GovernanceService::default());
+        let state = ApiState::new(
+            "magi-test",
+            event_bus,
+            session_store,
+            workspace_store,
+            governance,
+        );
+        state
+            .workspace_registry
+            .register(WorkspaceId::new(workspace_id), AbsolutePath::new(root))
+            .expect("workspace should register");
+        state
+    }
+
+    #[tokio::test]
+    async fn get_diff_returns_empty_for_non_git_workspace() {
+        let unique_suffix = TEST_REPO_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let workspace_root = std::env::temp_dir().join(format!(
+            "magi-changes-non-git-workspace-{}-{}-{}",
+            std::process::id(),
+            UtcMillis::now().0,
+            unique_suffix
+        ));
+        fs::create_dir_all(&workspace_root).expect("workspace root should create");
+        fs::write(workspace_root.join("notes.txt"), "not under git\n")
+            .expect("workspace file should write");
+        let state = build_state_with_workspace_root(
+            workspace_root.to_string_lossy().as_ref(),
+            "workspace-non-git-diff",
+        );
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/changes/diff?workspaceId=workspace-non-git-diff")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        assert_eq!(payload["diff"], "");
+        assert!(payload["filePath"].is_null());
     }
 
     #[tokio::test]

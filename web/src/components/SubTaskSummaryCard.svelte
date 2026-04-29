@@ -118,11 +118,6 @@
   });
   const visualInfo = $derived.by(() => getAgentVisualInfo(displayWorkerId, workerRoleSource?.colorToken));
 
-  const titleText = $derived.by(() => (
-    normalizeText(card.title)
-    || i18n.t('provider.subTaskFallbackTitle')
-  ));
-
   const instructionText = $derived.by(() => (
     normalizeText(card.instruction) === 'worker_task_queue'
       ? i18n.t('subTaskSummaryCard.workerTaskQueue')
@@ -133,6 +128,27 @@
           : normalizeText(card.description))
       )
   ));
+
+  const workerIdentifiers = $derived.by(() => new Set([
+    normalizeText(card.worker),
+    normalizeText(card.workerTabId),
+    rawWorker,
+    displayWorkerId,
+    normalizeText(workerRoleSource?.engineId),
+    displayWorkerId ? `task-worker-${displayWorkerId}` : '',
+  ].filter(Boolean)));
+
+  function resolveVisibleTaskText(value: unknown): string {
+    const text = normalizeText(value);
+    if (!text || workerIdentifiers.has(text) || text.startsWith('task-worker-')) {
+      return instructionText || i18n.t('provider.subTaskFallbackTitle');
+    }
+    return text;
+  }
+
+  const titleText = $derived.by(() => {
+    return resolveVisibleTaskText(card.title);
+  });
 
 
 
@@ -183,7 +199,7 @@
         .filter((item) => normalizeText(item?.title).length > 0)
         .map((item) => ({
           ...item,
-          title: normalizeText(item.title),
+          title: resolveVisibleTaskText(item.title),
           status: normalizeCardStatus(item.status) || 'pending',
         }))
       : []

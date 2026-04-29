@@ -473,6 +473,14 @@ function resolveRuntimeWorkerTabId(workerId: string): string {
   return normalizedWorkerId;
 }
 
+function resolveRuntimeWorkerRoleId(workerId: string, roleId: string): string {
+  const normalizedRoleId = normalizeString(roleId);
+  if (normalizedRoleId) {
+    return normalizedRoleId;
+  }
+  return resolveRuntimeWorkerTabId(workerId);
+}
+
 function normalizeRuntimeTurnSummary(raw: unknown): RustSessionRuntimeTurnSummary | null {
   const turn = normalizeObjectRecord(raw);
   if (!turn) {
@@ -2063,12 +2071,12 @@ function buildTurnWorkerDispatchGroups(
       continue;
     }
     const roleId = normalizeString(item.role_id) || normalizeString(lane?.role_id);
-    const workerTabId = roleId || workerId;
+    const workerTabId = resolveRuntimeWorkerRoleId(workerId, roleId);
     const itemSeq = normalizeNumber(item.item_seq, 0);
     const laneSeq = normalizeNumber(item.lane_seq, normalizeNumber(lane?.lane_seq, itemSeq));
     const taskId = normalizeString(item.task_id) || normalizeString(lane?.task_id);
     const taskKey = taskId || laneId || itemId;
-    const laneTitle = normalizeString(lane?.title) || normalizeString(item.title) || workerId;
+    const laneTitle = normalizeString(lane?.title) || normalizeString(item.title) || workerTabId;
     const taskStatus = turnWorkerStatusToLaneStatus(normalizeString(item.status) || normalizeString(lane?.status));
     let group = groups.get(workerTabId);
     if (!group) {
@@ -2151,15 +2159,19 @@ function buildTurnArtifactsFromSummary(
       .filter(([laneId]) => laneId.length > 0),
   );
   const currentTurnWorkerLanes = [...workerLaneById.values()]
-    .map((lane) => ({
-      laneId: normalizeString(lane.lane_id),
-      laneSeq: normalizeNumber(lane.lane_seq, 0),
-      worker: normalizeString(lane.worker_id) || undefined,
-      roleId: normalizeString(lane.role_id) || undefined,
-      title: normalizeString(lane.title) || undefined,
-      status: turnWorkerStatusToLaneStatus(normalizeString(lane.status)),
-      isPrimary: lane.is_primary === true,
-    }))
+    .map((lane) => {
+      const workerId = normalizeString(lane.worker_id);
+      const roleId = resolveRuntimeWorkerRoleId(workerId, normalizeString(lane.role_id));
+      return {
+        laneId: normalizeString(lane.lane_id),
+        laneSeq: normalizeNumber(lane.lane_seq, 0),
+        worker: workerId || undefined,
+        roleId: roleId || undefined,
+        title: normalizeString(lane.title) || undefined,
+        status: turnWorkerStatusToLaneStatus(normalizeString(lane.status)),
+        isPrimary: lane.is_primary === true,
+      };
+    })
     .filter((lane) => lane.laneId.length > 0);
   const toolItemsByCallId = new Map<string, RustSessionRuntimeTurnItemSummary>();
   const toolStartedItemsByCallId = new Map<string, RustSessionRuntimeTurnItemSummary>();
@@ -2222,7 +2234,7 @@ function buildTurnArtifactsFromSummary(
       || normalizeString(workerLaneById.get(laneId)?.worker_id);
     const roleId = normalizeString(item.role_id)
       || normalizeString(workerLaneById.get(laneId)?.role_id);
-    const workerTabId = roleId || workerId;
+    const workerTabId = resolveRuntimeWorkerRoleId(workerId, roleId);
     const workerDispatchGroup = kind.startsWith('worker_') && workerTabId
       ? workerDispatchGroupByFirstItemId.get(itemId)
       : undefined;
@@ -2378,7 +2390,7 @@ function buildTurnArtifactsFromSummary(
       cardStreamSeq: orderItemSeq,
       timestamp,
       laneId: workerDispatchGroup ? undefined : (laneId || undefined),
-      worker: workerDispatchGroup?.workerTabId || workerId || undefined,
+      worker: workerDispatchGroup?.workerTabId || workerTabId || undefined,
       threadVisible,
       workerTabs,
       messageIds: Array.from(messageIdAliases),
@@ -2403,7 +2415,7 @@ function buildTurnArtifactsFromSummary(
           laneSeq: normalizeNumber(item.lane_seq, 0) || undefined,
           cardStreamSeq: orderItemSeq,
           workerId: workerId || undefined,
-          roleId: roleId || undefined,
+          roleId: workerTabId || undefined,
           currentTurnWorkerLanes,
           requestId: requestId || undefined,
           userMessageId: isUserTurnItem && userMessageId ? userMessageId : undefined,
@@ -2647,7 +2659,7 @@ function buildToolArtifacts(
         cardStreamSeq: 0,
         timestamp: entry.timestamp,
         dispatchWaveId: entry.missionId || undefined,
-        threadVisible: true,
+        threadVisible: !workerTabId,
         workerTabs: workerTabId ? [workerTabId] : [],
         messageIds,
         message: createRustTimelineMessage({

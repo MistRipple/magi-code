@@ -59,7 +59,7 @@ import {
 } from "../shared/model-governance";
 
 export type UrlMode = "standard" | "full";
-export type ProviderName = "openai" | "anthropic";
+export type ProviderName = "openai";
 export type OpenAiProtocol = "responses" | "chat";
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
@@ -304,7 +304,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       urlMode: "standard",
       apiKey: "",
       model: "",
-      provider: "anthropic",
+      provider: "openai",
       protocolEndpoint: "",
       ...overrides,
     };
@@ -329,6 +329,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   function normalizeOpenAiProtocol(value: unknown): OpenAiProtocol | undefined {
     return value === "chat" || value === "responses" ? value : undefined;
+  }
+
+  function normalizeProviderName(_value: unknown): ProviderName {
+    return "openai";
   }
 
   function getOpenAiProtocolValue(
@@ -393,10 +397,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
     };
   }
 
-  function getBaseUrlPlaceholder(provider: string): string {
-    return provider === "openai"
-      ? "https://api.openai.com"
-      : "https://api.anthropic.com";
+  function getBaseUrlPlaceholder(_provider: string): string {
+    return "https://api.openai.com";
   }
 
   function normalizeBaseUrlForHint(baseUrl: string): string {
@@ -406,19 +408,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   function shouldRecommendStandardUrlMode(
-    provider: ProviderName,
+    _provider: ProviderName,
     baseUrl: string,
   ): boolean {
     const normalized = normalizeBaseUrlForHint(baseUrl);
     if (!normalized) {
       return false;
-    }
-
-    if (provider === "anthropic") {
-      return (
-        normalized === "https://api.anthropic.com" ||
-        normalized === "https://api.lkeap.cloud.tencent.com/coding/anthropic"
-      );
     }
 
     return (
@@ -576,7 +571,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   // 模型配置表单
   let orchConfig = $state<InteractiveModelFormConfig>(
-    createInteractiveConfig("anthropic"),
+    createInteractiveConfig("openai"),
   );
   let compConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
   let workerConfigs = $state<Record<string, WorkerModelFormConfig>>({});
@@ -2384,12 +2379,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
     const next: Record<string, any> = {};
     for (const [worker, config] of Object.entries(configs)) {
       if (config) {
-        next[worker] = createWorkerConfig(config.provider || "anthropic", {
+        const provider = normalizeProviderName(config.provider);
+        next[worker] = createWorkerConfig(provider, {
           baseUrl: config.baseUrl || "",
           urlMode: normalizeUrlMode(config.urlMode),
           apiKey: config.apiKey || "",
           model: config.model || "",
-          provider: config.provider || "anthropic",
+          provider,
           openaiProtocol: normalizeOpenAiProtocol(config.openaiProtocol),
           protocolEndpoint: config.protocolEndpoint || "",
           enabled: config.enabled !== false,
@@ -2411,12 +2407,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (!config) {
       return;
     }
-    orchConfig = createInteractiveConfig(config.provider || "anthropic", {
+    const provider = normalizeProviderName(config.provider);
+    orchConfig = createInteractiveConfig(provider, {
       baseUrl: config.baseUrl || "",
       urlMode: normalizeUrlMode(config.urlMode),
       apiKey: config.apiKey || "",
       model: config.model || "",
-      provider: config.provider || "anthropic",
+      provider,
       openaiProtocol: normalizeOpenAiProtocol(config.openaiProtocol),
       protocolEndpoint: config.protocolEndpoint || "",
       thinking: config.enableThinking === true,
@@ -2428,12 +2425,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (!config) {
       return;
     }
+    const provider = normalizeProviderName(config.provider);
     compConfig = createAuxiliaryConfig({
       baseUrl: config.baseUrl || "",
       urlMode: normalizeUrlMode(config.urlMode),
       apiKey: config.apiKey || "",
       model: config.model || "",
-      provider: config.provider || "anthropic",
+      provider,
       openaiProtocol: normalizeOpenAiProtocol(config.openaiProtocol),
       protocolEndpoint: config.protocolEndpoint || "",
     });

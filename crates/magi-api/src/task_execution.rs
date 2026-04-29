@@ -128,7 +128,7 @@ pub fn resolve_configured_model_client(
     fallback: Option<Arc<dyn ModelBridgeClient>>,
 ) -> Option<Arc<dyn ModelBridgeClient>> {
     if let Some(store) = settings_store {
-        let config = store.get_section("orchestrator");
+        let config = store.get_section("auxiliary");
         let normalized = NormalizedModelConfig::from_settings_value(&config, "openai");
         if let Some(client) = normalized.to_http_model_client("gpt-4") {
             return Some(Arc::new(client));

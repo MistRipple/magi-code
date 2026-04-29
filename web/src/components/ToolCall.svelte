@@ -96,6 +96,9 @@
       }
       return;
     }
+    if (!userToggled) {
+      collapsed = true;
+    }
   });
 
   // 格式化内容

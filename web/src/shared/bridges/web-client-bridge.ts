@@ -118,6 +118,7 @@ import {
   getTaskGraphState,
   clearTaskGraph,
 } from '../../stores/task-graph-store.svelte';
+import { sanitizeMermaidSvgContent } from '../mermaid-svg-sanitizer';
 import { RustDaemonClient } from '../rust-daemon-client';
 import {
   dequeueQueuedMessage,
@@ -141,8 +142,13 @@ let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
 let cachedSettingsBootstrapScope: 'none' | 'core' | 'full' = 'none';
 const QUEUE_DRAIN_DELAY_MS = 120;
 const QUEUE_DRAIN_BUSY_RETRY_MS = 1000;
+const LIVE_TURN_RECONCILE_INITIAL_DELAY_MS = 1000;
+const LIVE_TURN_RECONCILE_INTERVAL_MS = 1500;
+const LIVE_TURN_RECONCILE_MAX_ATTEMPTS = 80;
 let queueDrainTimer: ReturnType<typeof setTimeout> | null = null;
 let queueDrainActive = false;
+let liveTurnReconcileTimer: ReturnType<typeof setTimeout> | null = null;
+let liveTurnReconcileToken = 0;
 /** 传输层维护的 SSE 连接句柄（统一管理 Web EventSource 和宿主代理两种模式） */
 let activeSseConnection: SseConnection | null = null;
 let activeEventStreamKey = '';
@@ -162,6 +168,13 @@ let recoveryTimer: number | null = null;
 let recoveryInFlight: Promise<void> | null = null;
 function clearActiveTurnInFlight(): void {
   // 实时 turn 投影由后端 canonical snapshot 驱动，这里保留统一清理入口。
+}
+
+function clearLiveTurnReconcileTimer(): void {
+  if (liveTurnReconcileTimer) {
+    clearTimeout(liveTurnReconcileTimer);
+    liveTurnReconcileTimer = null;
+  }
 }
 
 const RECOVERY_BASE_DELAY_MS = 1000;
@@ -1074,6 +1087,7 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = '';
   clearCurrentInterruptTaskId();
+  clearLiveTurnReconcileTimer();
   clearTaskGraph();
   if (queueDrainTimer) {
     clearTimeout(queueDrainTimer);
@@ -1619,6 +1633,165 @@ async function loadLatestSessionSnapshot(
   });
 }
 
+function scheduleLiveTurnAuthoritativeReconcile(
+  sessionId: string,
+  options: {
+    workspaceId?: string;
+    workspacePath?: string;
+    requestId?: string;
+    delayMs?: number;
+    remainingAttempts?: number;
+    token?: number;
+  } = {},
+): void {
+  const targetSessionId = sessionId.trim();
+  if (!targetSessionId) {
+    return;
+  }
+  const targetWorkspaceId = options.workspaceId?.trim() || currentWorkspaceId;
+  const targetWorkspacePath = options.workspacePath?.trim() || currentWorkspacePath;
+  const requestId = options.requestId?.trim() || '';
+  const token = options.token ?? ++liveTurnReconcileToken;
+  const remainingAttempts = typeof options.remainingAttempts === 'number' && Number.isFinite(options.remainingAttempts)
+    ? Math.max(0, Math.floor(options.remainingAttempts))
+    : LIVE_TURN_RECONCILE_MAX_ATTEMPTS;
+  if (remainingAttempts <= 0) {
+    return;
+  }
+  clearLiveTurnReconcileTimer();
+  liveTurnReconcileTimer = setTimeout(() => {
+    liveTurnReconcileTimer = null;
+    void reconcileLiveTurnFromAuthoritativeSnapshot(
+      targetSessionId,
+      {
+        workspaceId: targetWorkspaceId,
+        workspacePath: targetWorkspacePath,
+        requestId,
+        remainingAttempts,
+        token,
+      },
+    );
+  }, options.delayMs ?? LIVE_TURN_RECONCILE_INITIAL_DELAY_MS);
+}
+
+function messageBelongsToRequest(message: unknown, requestId: string): boolean {
+  if (!message || typeof message !== 'object' || Array.isArray(message)) {
+    return false;
+  }
+  const metadata = (message as { metadata?: unknown }).metadata;
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    return false;
+  }
+  const messageRequestId = (metadata as Record<string, unknown>).requestId;
+  return typeof messageRequestId === 'string' && messageRequestId.trim() === requestId;
+}
+
+function messageIsTerminalAssistant(message: unknown): boolean {
+  if (!message || typeof message !== 'object' || Array.isArray(message)) {
+    return false;
+  }
+  const candidate = message as {
+    role?: unknown;
+    isStreaming?: unknown;
+    isComplete?: unknown;
+    content?: unknown;
+    metadata?: unknown;
+  };
+  if (candidate.role !== 'assistant' || candidate.isStreaming === true || candidate.isComplete !== true) {
+    return false;
+  }
+  const metadata = candidate.metadata && typeof candidate.metadata === 'object' && !Array.isArray(candidate.metadata)
+    ? candidate.metadata as Record<string, unknown>
+    : {};
+  const turnItemKind = typeof metadata.turnItemKind === 'string' ? metadata.turnItemKind.trim() : '';
+  if (turnItemKind && turnItemKind !== 'assistant_final' && turnItemKind !== 'assistant_error') {
+    return false;
+  }
+  return typeof candidate.content === 'string' && candidate.content.trim().length > 0;
+}
+
+function hasCanonicalRenderOrderForRequest(requestId: string): boolean {
+  const normalizedRequestId = requestId.trim();
+  const projection = messagesState.timelineProjection;
+  if (!normalizedRequestId || !projection) {
+    return false;
+  }
+  const artifactById = new Map((projection.artifacts || []).map((artifact) => [artifact.artifactId, artifact]));
+  let userIndex = -1;
+  let assistantIndex = -1;
+  for (const [index, entry] of (projection.threadRenderEntries || []).entries()) {
+    const artifact = artifactById.get(entry.artifactId);
+    if (!artifact) {
+      continue;
+    }
+    const message = entry.executionItemId
+      ? (artifact.executionItems || []).find((item) => item.itemId === entry.executionItemId)?.message
+      : artifact.message;
+    if (!messageBelongsToRequest(message, normalizedRequestId)) {
+      continue;
+    }
+    if ((message as { role?: unknown }).role === 'user') {
+      userIndex = userIndex < 0 ? index : Math.min(userIndex, index);
+    } else if (messageIsTerminalAssistant(message)) {
+      assistantIndex = assistantIndex < 0 ? index : Math.min(assistantIndex, index);
+    }
+  }
+  return userIndex >= 0 && assistantIndex >= 0 && userIndex < assistantIndex;
+}
+
+async function reconcileLiveTurnFromAuthoritativeSnapshot(
+  sessionId: string,
+  options: {
+    workspaceId: string;
+    workspacePath: string;
+    requestId: string;
+    remainingAttempts: number;
+    token: number;
+  },
+): Promise<void> {
+  if (options.token !== liveTurnReconcileToken) {
+    return;
+  }
+  if (currentSessionId !== sessionId) {
+    return;
+  }
+  if (options.requestId && hasCanonicalRenderOrderForRequest(options.requestId)) {
+    return;
+  }
+
+  try {
+    await loadLatestSessionSnapshot(sessionId, {
+      workspaceId: options.workspaceId,
+      workspacePath: options.workspacePath,
+    });
+  } catch (error) {
+    reportExpectedRecoveryFailure(
+      '会话执行快照同步',
+      '[web-client-bridge] 会话执行快照同步失败:',
+      error,
+    );
+    scheduleRecovery('live_turn_snapshot_reconcile_failed', error, true);
+    return;
+  }
+
+  if (options.token !== liveTurnReconcileToken || currentSessionId !== sessionId) {
+    return;
+  }
+  if (options.requestId && hasCanonicalRenderOrderForRequest(options.requestId)) {
+    return;
+  }
+  if (bridgeRuntimeIsBusy() || options.requestId) {
+    scheduleLiveTurnAuthoritativeReconcile(sessionId, {
+      workspaceId: options.workspaceId,
+      workspacePath: options.workspacePath,
+      requestId: options.requestId,
+      delayMs: LIVE_TURN_RECONCILE_INTERVAL_MS,
+      remainingAttempts: options.remainingAttempts - 1,
+      token: options.token,
+    });
+  }
+}
+
 async function createSession(): Promise<void> {
   const response = await getTransport().request(agentUrl('/api/session/new'), {
     method: 'POST',
@@ -2127,6 +2300,11 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     }
     if (resolvedSessionId) {
       persistWorkspaceBinding(currentWorkspaceId, currentWorkspacePath, resolvedSessionId);
+      scheduleLiveTurnAuthoritativeReconcile(resolvedSessionId, {
+        workspaceId: currentWorkspaceId,
+        workspacePath: currentWorkspacePath,
+        requestId,
+      });
     }
     const successMessage = turnResult.route === 'task'
       ? '任务已提交'
@@ -2309,30 +2487,6 @@ function openPreviewWindow(title: string, subtitle: string, content: string, mod
 </body>
 </html>`);
   popup.document.close();
-}
-
-function sanitizeMermaidSvgContent(svgContent: string): string {
-  const trimmed = svgContent.trim();
-  if (!trimmed) {
-    return '';
-  }
-  const template = document.createElement('template');
-  template.innerHTML = trimmed;
-  const svg = template.content.querySelector('svg');
-  if (!svg) {
-    return '';
-  }
-  svg.querySelectorAll('script, foreignObject').forEach((node) => node.remove());
-  [svg, ...Array.from(svg.querySelectorAll('*'))].forEach((element) => {
-    for (const attribute of Array.from(element.attributes)) {
-      const name = attribute.name.toLowerCase();
-      const value = attribute.value.trim().toLowerCase();
-      if (name.startsWith('on') || value.startsWith('javascript:')) {
-        element.removeAttribute(attribute.name);
-      }
-    }
-  });
-  return svg.outerHTML;
 }
 
 function openMermaidSvgPreview(title: string, svgContent: string): void {

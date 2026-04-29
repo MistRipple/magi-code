@@ -6,6 +6,7 @@ use crate::dto::{
     ServiceInfo, VersionHandshakeDto, runtime_read_model_dto,
 };
 use crate::errors::ApiError;
+use crate::model_config::normalize_executable_model_provider;
 use crate::routes::settings::{
     builtin_role_templates, enabled_registry_agent_roles, load_registry_engines,
     resolve_registry_agents,
@@ -1141,14 +1142,46 @@ fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_jso
     ] {
         if let Some(value) = snapshot.get_mut(key) {
             normalize_wrapped_section_value(value);
+            normalize_model_provider_in_section(value);
         }
     }
     skill_loader::normalize_skills_config_sections(snapshot);
     seed_user_rules_config(snapshot);
     normalize_workers_section(snapshot);
+    if let Some(value) = snapshot.get_mut("workers") {
+        normalize_worker_model_providers(value);
+    }
+    if let Some(value) = snapshot.get_mut("workerConfigs") {
+        normalize_worker_model_providers(value);
+    }
     normalize_mcp_servers_section(snapshot);
     seed_default_safeguard_rules(snapshot);
     alias_snapshot_keys(snapshot);
+}
+
+fn normalize_model_provider_in_section(value: &mut serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("baseUrl")
+        || object.contains_key("model")
+        || object.contains_key("provider")
+    {
+        let provider = normalize_executable_model_provider(
+            object.get("provider").and_then(serde_json::Value::as_str),
+        );
+        object.insert("provider".to_string(), serde_json::Value::String(provider));
+    }
+}
+
+fn normalize_worker_model_providers(value: &mut serde_json::Value) {
+    let Some(workers) = value.as_object_mut() else {
+        return;
+    };
+    for worker in workers.values_mut() {
+        normalize_wrapped_section_value(worker);
+        normalize_model_provider_in_section(worker);
+    }
 }
 
 fn alias_snapshot_keys(snapshot: &mut HashMap<String, serde_json::Value>) {

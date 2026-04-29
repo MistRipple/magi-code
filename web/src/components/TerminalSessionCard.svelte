@@ -162,6 +162,9 @@
       }
       return;
     }
+    if (!userToggled) {
+      collapsed = true;
+    }
   });
   const titleText = $derived(i18n.t('terminalSession.title', { id: terminalId ?? '-' }));
   const toolNameLabel = $derived(getTerminalToolDisplayName(toolCall?.name));
@@ -175,6 +178,9 @@
     || errorText
     || typeof outputCursor === 'number'
     || typeof returnCode === 'number'
+    || typeof accepted === 'boolean'
+    || typeof killed === 'boolean'
+    || typeof releasedLock === 'boolean'
   ));
   const canToggle = $derived(isExpandable);
   const isExpanded = $derived(canToggle && !collapsed);

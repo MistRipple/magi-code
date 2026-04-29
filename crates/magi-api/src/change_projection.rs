@@ -184,6 +184,10 @@ pub(crate) fn run_git(workspace_root: &Path, args: &[&str]) -> Result<String, Ap
     run_git_with_allowed_statuses(workspace_root, args, &[0])
 }
 
+pub(crate) fn run_git_diff(workspace_root: &Path, args: &[&str]) -> Result<String, ApiError> {
+    run_git_readonly_with_empty_baseline(workspace_root, args, &[0])
+}
+
 pub(crate) fn run_git_restore_files(
     workspace_root: &Path,
     files: &[String],
@@ -617,6 +621,34 @@ fn run_git_with_allowed_statuses(
     }
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     Err(ApiError::internal_assembly("git 命令执行出错", stderr))
+}
+
+fn run_git_readonly_with_empty_baseline(
+    workspace_root: &Path,
+    args: &[&str],
+    allowed_statuses: &[i32],
+) -> Result<String, ApiError> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(workspace_root)
+        .output()
+        .map_err(|error| ApiError::internal_assembly("执行 git 命令失败", error))?;
+    let status_code = output.status.code().unwrap_or(-1);
+    if allowed_statuses.contains(&status_code) {
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if is_missing_git_diff_baseline(&stderr) {
+        return Ok(String::new());
+    }
+    Err(ApiError::internal_assembly("git 命令执行出错", stderr))
+}
+
+fn is_missing_git_diff_baseline(stderr: &str) -> bool {
+    stderr.contains("Not a git repository")
+        || stderr.contains("unknown revision or path not in the working tree")
+        || stderr.contains("bad revision 'HEAD'")
+        || stderr.contains("ambiguous argument 'HEAD'")
 }
 
 #[cfg(test)]

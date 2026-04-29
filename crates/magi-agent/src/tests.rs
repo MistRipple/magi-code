@@ -144,7 +144,12 @@ fn session_registry_basic() {
     assert!(!reg.has("s2"));
 
     assert!(reg.get("s1").is_some());
-    assert!(reg.get("s1").unwrap().get_pending_plan_approval("req-1").is_some());
+    assert!(
+        reg.get("s1")
+            .unwrap()
+            .get_pending_plan_approval("req-1")
+            .is_some()
+    );
 }
 
 #[test]

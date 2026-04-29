@@ -1,10 +1,10 @@
 use magi_core::{TaskId, TaskStatus};
 use magi_event_bus::{
-    AuditUsageLedgerStatus, RecoveryActivityStage, RecoveryDiagnosticSummaryEntry,
-    RuntimeLedgerSummary, RuntimeReadModelInput, SessionRuntimeBranchSummaryEntry,
-    SessionRuntimeSummaryEntry, SessionRuntimeTurnItemSummaryEntry,
-    SessionRuntimeTurnLaneSummaryEntry, SessionRuntimeTurnSummaryEntry,
-    WorkspaceRuntimeSummaryEntry,
+    AuditUsageLedgerStatus, ExecutionGroupRuntimeSummaryEntry, RecoveryActivityStage,
+    RecoveryDiagnosticSummaryEntry, RuntimeLedgerSummary, RuntimeReadModelInput,
+    SessionRuntimeBranchSummaryEntry, SessionRuntimeSummaryEntry,
+    SessionRuntimeTurnItemSummaryEntry, SessionRuntimeTurnLaneSummaryEntry,
+    SessionRuntimeTurnSummaryEntry, WorkspaceRuntimeSummaryEntry,
 };
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecarExport};
@@ -216,12 +216,39 @@ fn merge_session_sidecars(
                 })
                 .collect();
         }
+        if let Some(chain) = export.active_execution_chain.as_ref() {
+            merge_task_store_projection(runtime_read_model, task_store, chain);
+        }
     }
 
     runtime_read_model
         .details
         .sessions
         .sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    runtime_read_model
+        .details
+        .execution_groups
+        .sort_by(|left, right| left.mission_id.cmp(&right.mission_id));
+    runtime_read_model
+        .details
+        .tasks
+        .sort_by(|left, right| left.task_id.cmp(&right.task_id));
+    runtime_read_model
+        .overview
+        .activity
+        .active_execution_group_ids
+        .sort();
+    runtime_read_model
+        .overview
+        .activity
+        .active_execution_group_ids
+        .dedup();
+    runtime_read_model.overview.activity.active_task_ids.sort();
+    runtime_read_model.overview.activity.active_task_ids.dedup();
+    for entry in &mut runtime_read_model.details.execution_groups {
+        entry.active_task_ids.sort();
+        entry.active_task_ids.dedup();
+    }
     for entry in &mut runtime_read_model.details.sessions {
         entry.active_execution_group_ids.sort();
         entry.active_execution_group_ids.dedup();
@@ -490,6 +517,104 @@ fn push_unique(values: &mut Vec<String>, value: Option<String>) {
     }
 }
 
+fn merge_task_store_projection(
+    runtime_read_model: &mut RuntimeReadModelInput,
+    task_store: Option<&TaskStore>,
+    chain: &magi_session_store::ActiveExecutionChain,
+) {
+    let Some(projection) = task_store.and_then(|store| store.build_projection(&chain.root_task_id))
+    else {
+        return;
+    };
+    let mission_id = projection.root_task.mission_id.to_string();
+    let active_task_ids = projection
+        .tasks
+        .iter()
+        .filter(|task| !task_status_is_terminal(&task.status))
+        .map(|task| task.task_id.to_string())
+        .collect::<Vec<_>>();
+
+    let group = runtime_read_model
+        .details
+        .execution_groups
+        .iter_mut()
+        .find(|entry| entry.mission_id == mission_id);
+    let group = match group {
+        Some(group) => group,
+        None => {
+            runtime_read_model
+                .details
+                .execution_groups
+                .push(ExecutionGroupRuntimeSummaryEntry {
+                    mission_id: mission_id.clone(),
+                    ..ExecutionGroupRuntimeSummaryEntry::default()
+                });
+            runtime_read_model
+                .details
+                .execution_groups
+                .last_mut()
+                .expect("execution group entry inserted above")
+        }
+    };
+    group.current_status = Some(task_status_label(&projection.root_task.status));
+    group.active_task_ids.clear();
+    for task_id in &active_task_ids {
+        push_unique(&mut group.active_task_ids, Some(task_id.clone()));
+    }
+
+    if !task_status_is_terminal(&projection.root_task.status) {
+        push_unique(
+            &mut runtime_read_model
+                .overview
+                .activity
+                .active_execution_group_ids,
+            Some(mission_id.clone()),
+        );
+    }
+    for task_id in &active_task_ids {
+        push_unique(
+            &mut runtime_read_model.overview.activity.active_task_ids,
+            Some(task_id.clone()),
+        );
+    }
+
+    for task in projection.tasks {
+        let task_id = task.task_id.to_string();
+        let task_entry = runtime_read_model
+            .details
+            .tasks
+            .iter_mut()
+            .find(|entry| entry.task_id == task_id);
+        let task_entry = match task_entry {
+            Some(task_entry) => task_entry,
+            None => {
+                runtime_read_model
+                    .details
+                    .tasks
+                    .push(magi_event_bus::TaskRuntimeSummaryEntry {
+                        task_id: task_id.clone(),
+                        mission_id: Some(mission_id.clone()),
+                        ..magi_event_bus::TaskRuntimeSummaryEntry::default()
+                    });
+                runtime_read_model
+                    .details
+                    .tasks
+                    .last_mut()
+                    .expect("task entry inserted above")
+            }
+        };
+        task_entry.mission_id = Some(mission_id.clone());
+        task_entry.current_status = Some(task_status_label(&task.status));
+    }
+}
+
+fn task_status_is_terminal(status: &TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Skipped
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,6 +684,156 @@ mod tests {
         );
         assert_eq!(runtime_read_model.meta.ledger.next_sequence, 12);
         assert_eq!(runtime_read_model.meta.ledger.usage_count, 7);
+    }
+
+    #[test]
+    fn runtime_read_model_uses_task_store_projection_for_active_execution_group() {
+        let task_store = TaskStore::new();
+        let mission_id = magi_core::MissionId::new("mission-projection-authority");
+        let root_task_id = TaskId::new("task-root-projection");
+        let running_task_id = TaskId::new("task-running-projection");
+        let ready_task_id = TaskId::new("task-ready-projection");
+        let completed_task_id = TaskId::new("task-completed-projection");
+        let now = UtcMillis::now();
+        for (task_id, parent_task_id, status) in [
+            (&root_task_id, None, TaskStatus::Running),
+            (
+                &running_task_id,
+                Some(root_task_id.clone()),
+                TaskStatus::Running,
+            ),
+            (
+                &ready_task_id,
+                Some(root_task_id.clone()),
+                TaskStatus::Ready,
+            ),
+            (
+                &completed_task_id,
+                Some(root_task_id.clone()),
+                TaskStatus::Completed,
+            ),
+        ] {
+            task_store.insert_task(magi_core::Task {
+                task_id: task_id.clone(),
+                mission_id: mission_id.clone(),
+                root_task_id: root_task_id.clone(),
+                parent_task_id,
+                kind: if task_id == &root_task_id {
+                    magi_core::TaskKind::Objective
+                } else {
+                    magi_core::TaskKind::Action
+                },
+                title: task_id.to_string(),
+                goal: task_id.to_string(),
+                status,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                context_refs: Vec::new(),
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                repair_count: 0,
+                decision_payload: None,
+                created_at: now,
+                updated_at: now,
+            });
+        }
+
+        let runtime_read_model = runtime_read_model_dto(
+            RuntimeReadModelInput::default(),
+            &[SessionRuntimeSidecarExport {
+                session_id: SessionId::new("session-projection-authority"),
+                current_status: SessionExecutionSidecarStatus::Bound,
+                last_update: now,
+                ownership: ExecutionOwnership {
+                    session_id: Some(SessionId::new("session-projection-authority")),
+                    mission_id: Some(mission_id.clone()),
+                    task_id: Some(running_task_id.clone()),
+                    execution_chain_ref: Some("chain-projection-authority".to_string()),
+                    ..ExecutionOwnership::default()
+                },
+                execution_chain_ref: Some("chain-projection-authority".to_string()),
+                recovery_ref: None,
+                current_turn: None,
+                active_execution_chain: Some(magi_session_store::ActiveExecutionChain {
+                    session_id: SessionId::new("session-projection-authority"),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-projection-authority".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![running_task_id.clone()],
+                    active_worker_bindings: vec![magi_core::WorkerId::new("worker-projection")],
+                    branches: vec![magi_session_store::ActiveExecutionBranch {
+                        task_id: running_task_id.clone(),
+                        worker_id: magi_core::WorkerId::new("worker-projection"),
+                        stage: "execute".to_string(),
+                        lease_id: None,
+                        execution_intent_ref: None,
+                        binding_lifecycle: None,
+                        checkpoint_stage: Some("execute".to_string()),
+                        next_step_index: Some(0),
+                        checkpoint_at: Some(now),
+                        resume_mode: Some("stage-restart".to_string()),
+                        resume_token: None,
+                        use_tools: true,
+                        skill_name: None,
+                        is_primary: true,
+                    }],
+                    recovery_ref: None,
+                    dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "entry-projection-authority".to_string(),
+                        trimmed_text: Some("projection authority".to_string()),
+                        deep_task: true,
+                        skill_name: None,
+                    },
+                    current_turn: None,
+                }),
+            }],
+            &[],
+            ledger_dto(AuditUsageLedgerStatus::default()),
+            Some(&task_store),
+        );
+
+        let group = runtime_read_model
+            .details
+            .execution_groups
+            .iter()
+            .find(|entry| entry.mission_id == mission_id.to_string())
+            .expect("TaskStore projection should create execution group entry");
+        assert_eq!(group.current_status.as_deref(), Some("running"));
+        assert!(group.active_task_ids.contains(&root_task_id.to_string()));
+        assert!(group.active_task_ids.contains(&ready_task_id.to_string()));
+        assert!(group.active_task_ids.contains(&running_task_id.to_string()));
+        assert!(
+            !group
+                .active_task_ids
+                .contains(&completed_task_id.to_string())
+        );
+
+        let task_statuses = runtime_read_model
+            .details
+            .tasks
+            .iter()
+            .map(|entry| (entry.task_id.as_str(), entry.current_status.as_deref()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            task_statuses.get(ready_task_id.as_str()).copied().flatten(),
+            Some("ready")
+        );
+        assert_eq!(
+            task_statuses
+                .get(completed_task_id.as_str())
+                .copied()
+                .flatten(),
+            Some("completed")
+        );
     }
 
     #[test]
