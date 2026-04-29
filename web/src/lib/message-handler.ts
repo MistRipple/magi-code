@@ -635,18 +635,12 @@ function handleStandardComplete(message: ClientBridgeMessage) {
   const placeholderReplacementId = isAssistantResponsePlaceholderTarget(uiMessage)
     ? resolvePlaceholderReplacementId(requestBinding, actualMessageId)
     : undefined;
-  const computedResponseDurationMs = requestBinding?.createdAt
-    ? Math.max(0, (standard.timestamp || Date.now()) - requestBinding.createdAt)
-    : undefined;
   const uiMetadata = uiMessage.metadata && typeof uiMessage.metadata === 'object'
     ? uiMessage.metadata
     : {};
   const authoritativeResponseDurationMs = typeof uiMetadata.responseDurationMs === 'number'
     ? uiMetadata.responseDurationMs
     : undefined;
-  const responseDurationMs = typeof authoritativeResponseDurationMs === 'number'
-    ? authoritativeResponseDurationMs
-    : computedResponseDurationMs;
   const { responseDurationMs: _nonTerminalResponseDurationMs, ...uiMetadataWithoutResponseDuration } = uiMetadata;
 
   const existingMessage = getTimelineMessageById(actualMessageId)
@@ -672,7 +666,7 @@ function handleStandardComplete(message: ClientBridgeMessage) {
     metadata: isTerminalRequestResponse
       ? {
           ...uiMetadata,
-          ...(typeof responseDurationMs === 'number' ? { responseDurationMs } : {}),
+          ...(typeof authoritativeResponseDurationMs === 'number' ? { responseDurationMs: authoritativeResponseDurationMs } : {}),
         }
       : uiMetadataWithoutResponseDuration,
   };

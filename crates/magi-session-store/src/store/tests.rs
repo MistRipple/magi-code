@@ -1,8 +1,8 @@
 use super::*;
 use crate::models::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
-    ActiveExecutionTurn, SessionExecutionSidecarStatus, SessionSidecarFlushReason,
-    SessionStoreState,
+    ActiveExecutionTurn, ActiveExecutionTurnItem, SessionExecutionSidecarStatus,
+    SessionSidecarFlushReason, SessionStoreState,
 };
 use magi_core::{
     ExecutionOwnership, MissionId, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskId,
@@ -10,6 +10,74 @@ use magi_core::{
 };
 use serde_json::json;
 use std::{thread, time::Duration};
+
+fn test_turn(turn_id: &str, status: &str, accepted_at: u64) -> ActiveExecutionTurn {
+    ActiveExecutionTurn {
+        turn_id: turn_id.to_string(),
+        turn_seq: accepted_at,
+        accepted_at: UtcMillis(accepted_at),
+        status: status.to_string(),
+        completed_at: None,
+        user_message: Some(format!("message for {turn_id}")),
+        items: Vec::new(),
+        worker_lanes: Vec::new(),
+    }
+}
+
+fn test_active_chain(
+    session_id: &SessionId,
+    chain_ref: &str,
+    turn: Option<ActiveExecutionTurn>,
+) -> ActiveExecutionChain {
+    ActiveExecutionChain {
+        session_id: session_id.clone(),
+        mission_id: MissionId::new(format!("mission-{chain_ref}")),
+        root_task_id: TaskId::new(format!("task-root-{chain_ref}")),
+        execution_chain_ref: chain_ref.to_string(),
+        workspace_id: None,
+        active_branch_task_ids: Vec::new(),
+        active_worker_bindings: Vec::new(),
+        branches: Vec::new(),
+        recovery_ref: None,
+        dispatch_context: ActiveExecutionDispatchContext {
+            accepted_at: UtcMillis(10),
+            entry_id: format!("timeline-{chain_ref}"),
+            trimmed_text: Some(format!("text for {chain_ref}")),
+            deep_task: false,
+            skill_name: None,
+        },
+        current_turn: turn,
+    }
+}
+
+fn test_turn_item(item_id: &str, content: &str) -> ActiveExecutionTurnItem {
+    ActiveExecutionTurnItem {
+        item_id: item_id.to_string(),
+        item_seq: 0,
+        lane_id: None,
+        lane_seq: None,
+        kind: "user_message".to_string(),
+        status: "completed".to_string(),
+        source: "user".to_string(),
+        title: None,
+        content: Some(content.to_string()),
+        task_id: None,
+        worker_id: None,
+        role_id: None,
+        tool_call_id: None,
+        tool_name: None,
+        tool_status: None,
+        tool_arguments: None,
+        tool_result: None,
+        tool_error: None,
+        request_id: None,
+        user_message_id: None,
+        placeholder_message_id: None,
+        timeline_entry_id: None,
+        thread_visible: true,
+        worker_visible: false,
+    }
+}
 
 #[test]
 fn unique_timeline_entry_id_appends_suffix_for_duplicate_base() {
@@ -394,6 +462,244 @@ fn active_execution_chain_does_not_reuse_turn_from_different_chain() {
             .and_then(|chain| chain.current_turn.as_ref())
             .is_none(),
         "active chain 内部也不能保留跨链 turn"
+    );
+}
+
+#[test]
+fn accept_current_turn_with_timeline_entry_rejects_running_turn_without_timeline_write() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-atomic-chat-reject");
+    store
+        .create_session(session_id.clone(), "Atomic Chat Reject")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(session_id.clone(), test_turn("turn-running", "running", 1))
+        .expect("running turn should upsert");
+
+    let result = store.accept_current_turn_with_timeline_entry(
+        session_id.clone(),
+        "timeline-rejected-chat",
+        TimelineEntryKind::UserMessage,
+        "不应写入的用户消息",
+        UtcMillis(2),
+        test_turn("turn-next", "running", 2),
+    );
+
+    assert!(matches!(
+        result,
+        Err(magi_core::DomainError::InvalidState { .. })
+    ));
+    assert!(
+        !store
+            .timeline_for_session(&session_id)
+            .iter()
+            .any(|entry| entry.entry_id == "timeline-rejected-chat"),
+        "拒绝新 turn 时不能留下用户 timeline"
+    );
+    assert_eq!(
+        store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .map(|turn| turn.turn_id),
+        Some("turn-running".to_string())
+    );
+}
+
+#[test]
+fn accept_active_execution_chain_with_timeline_entry_writes_timeline_and_turn_atomically() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-atomic-task-accept");
+    store
+        .create_session(session_id.clone(), "Atomic Task Accept")
+        .expect("session should be creatable");
+    let chain = test_active_chain(
+        &session_id,
+        "chain-atomic-task-accept",
+        Some(test_turn("turn-task", "accepted", 3)),
+    );
+
+    let (entry_id, sidecar) = store
+        .accept_active_execution_chain_with_timeline_entry(
+            session_id.clone(),
+            "timeline-atomic-task-accept",
+            TimelineEntryKind::UserMessage,
+            "任务用户消息",
+            UtcMillis(3),
+            chain,
+        )
+        .expect("task chain should be accepted");
+
+    assert_eq!(entry_id, "timeline-atomic-task-accept");
+    assert!(
+        store
+            .timeline_for_session(&session_id)
+            .iter()
+            .any(|entry| entry.entry_id == "timeline-atomic-task-accept"
+                && entry.message == "任务用户消息")
+    );
+    assert_eq!(
+        sidecar.current_turn.map(|turn| turn.turn_id),
+        Some("turn-task".to_string())
+    );
+    assert!(
+        sidecar
+            .active_execution_chain
+            .and_then(|chain| chain.current_turn)
+            .is_some(),
+        "active chain 内部必须同步携带当前 turn"
+    );
+}
+
+#[test]
+fn accept_active_execution_chain_rejects_running_turn_without_timeline_write() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-atomic-task-reject");
+    store
+        .create_session(session_id.clone(), "Atomic Task Reject")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(session_id.clone(), test_turn("turn-running", "running", 1))
+        .expect("running turn should upsert");
+    let chain = test_active_chain(
+        &session_id,
+        "chain-atomic-task-reject",
+        Some(test_turn("turn-task", "accepted", 4)),
+    );
+
+    let result = store.accept_active_execution_chain_with_timeline_entry(
+        session_id.clone(),
+        "timeline-rejected-task",
+        TimelineEntryKind::UserMessage,
+        "不应写入的任务消息",
+        UtcMillis(4),
+        chain,
+    );
+
+    assert!(matches!(
+        result,
+        Err(magi_core::DomainError::InvalidState { .. })
+    ));
+    assert!(
+        !store
+            .timeline_for_session(&session_id)
+            .iter()
+            .any(|entry| entry.entry_id == "timeline-rejected-task"),
+        "任务入口冲突时也不能留下用户 timeline"
+    );
+    assert_eq!(
+        store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .map(|turn| turn.turn_id),
+        Some("turn-running".to_string())
+    );
+}
+
+#[test]
+fn upsert_active_execution_chain_rejects_different_running_turn() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-upsert-chain-running-reject");
+    store
+        .create_session(session_id.clone(), "Upsert Chain Running Reject")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(session_id.clone(), test_turn("turn-running", "running", 1))
+        .expect("running turn should upsert");
+    let chain = test_active_chain(
+        &session_id,
+        "chain-reject-running",
+        Some(test_turn("turn-different", "accepted", 5)),
+    );
+
+    let result = store.upsert_active_execution_chain(session_id.clone(), chain);
+
+    assert!(matches!(
+        result,
+        Err(magi_core::DomainError::InvalidState { .. })
+    ));
+    assert_eq!(
+        store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .map(|turn| turn.turn_id),
+        Some("turn-running".to_string())
+    );
+}
+
+#[test]
+fn append_current_turn_item_with_timeline_entry_writes_item_and_timeline_atomically() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-append-item-timeline");
+    store
+        .create_session(session_id.clone(), "Append Item Timeline")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(session_id.clone(), test_turn("turn-running", "running", 1))
+        .expect("running turn should upsert");
+
+    let updated = store
+        .append_current_turn_item_with_timeline_entry(
+            &session_id,
+            "timeline-append-item",
+            TimelineEntryKind::UserMessage,
+            "继续用户消息",
+            UtcMillis(2),
+            test_turn_item("turn-item-continue-user", "继续用户消息"),
+        )
+        .expect("append should succeed")
+        .expect("current turn should exist");
+
+    assert!(
+        store
+            .timeline_for_session(&session_id)
+            .iter()
+            .any(
+                |entry| entry.entry_id == "timeline-append-item" && entry.message == "继续用户消息"
+            )
+    );
+    assert!(
+        updated
+            .current_turn
+            .expect("turn should remain")
+            .items
+            .iter()
+            .any(|item| item.item_id == "turn-item-continue-user")
+    );
+}
+
+#[test]
+fn append_current_turn_item_with_timeline_entry_does_not_write_timeline_without_turn() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-append-item-no-turn");
+    store
+        .create_session(session_id.clone(), "Append Item No Turn")
+        .expect("session should be creatable");
+    store.bind_execution_ownership(
+        session_id.clone(),
+        ExecutionOwnership {
+            session_id: Some(session_id.clone()),
+            ..ExecutionOwnership::default()
+        },
+    );
+
+    let updated = store
+        .append_current_turn_item_with_timeline_entry(
+            &session_id,
+            "timeline-no-turn",
+            TimelineEntryKind::UserMessage,
+            "不应写入的继续消息",
+            UtcMillis(2),
+            test_turn_item("turn-item-no-turn", "不应写入的继续消息"),
+        )
+        .expect("missing current turn is a non-mutating no-op");
+
+    assert!(updated.is_none());
+    assert!(
+        !store
+            .timeline_for_session(&session_id)
+            .iter()
+            .any(|entry| entry.entry_id == "timeline-no-turn"),
+        "current_turn 不存在时不能留下 continue 用户 timeline"
     );
 }
 

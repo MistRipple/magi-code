@@ -473,6 +473,7 @@ pub(crate) fn run_shadow_session_action(
                 .requested_workspace_id()
                 .map(magi_core::WorkspaceId::new),
             entry_id: entry_id.to_string(),
+            timeline_message: request.timeline_message(trimmed_text),
             created_session: false,
             mission_title: mission_title.clone(),
             task_title: format!("执行: {mission_title}"),
@@ -1612,7 +1613,7 @@ fn make_shadow_task(
     }
 }
 
-fn cleanup_shadow_task_tree(
+pub(crate) fn cleanup_shadow_task_tree(
     task_store: &magi_orchestrator::task_store::TaskStore,
     root_task_id: &TaskId,
 ) {
@@ -1787,6 +1788,7 @@ mod tests {
                 session_id: session_id.clone(),
                 workspace_id: None,
                 entry_id: "entry-execution-goal-split".to_string(),
+                timeline_message: "用户原始任务描述".to_string(),
                 created_session: false,
                 mission_title: "模型判定任务".to_string(),
                 task_title: "执行: 模型判定任务".to_string(),
@@ -1852,6 +1854,7 @@ mod tests {
                 session_id,
                 workspace_id: None,
                 entry_id: "entry-deep-empty-goal".to_string(),
+                timeline_message: "用户原始深度任务".to_string(),
                 created_session: false,
                 mission_title: "深度任务".to_string(),
                 task_title: "执行: 深度任务".to_string(),
@@ -1950,6 +1953,7 @@ mod tests {
                 session_id: session_id.clone(),
                 workspace_id: None,
                 entry_id: "entry-intake-append".to_string(),
+                timeline_message: "初始任务".to_string(),
                 created_session: false,
                 mission_title: "初始任务".to_string(),
                 task_title: "执行: 初始任务".to_string(),
@@ -2053,6 +2057,7 @@ mod tests {
                 session_id: session_id.clone(),
                 workspace_id: None,
                 entry_id: "entry-intake-replan".to_string(),
+                timeline_message: "旧任务".to_string(),
                 created_session: false,
                 mission_title: "旧任务".to_string(),
                 task_title: "执行: 旧任务".to_string(),

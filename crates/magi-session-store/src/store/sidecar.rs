@@ -2,7 +2,7 @@ use super::SessionStore;
 use crate::models::{
     ActiveExecutionChain, ActiveExecutionTurn, ActiveExecutionTurnItem,
     SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionRuntimeSidecar,
-    SessionSidecarFlushReason,
+    SessionSidecarFlushReason, SessionStoreState, TimelineEntry, TimelineEntryKind,
 };
 use magi_core::{
     DomainError, DomainResult, ExecutionOwnership, LeaseId, RecoveryResumeInput, SessionId,
@@ -56,6 +56,78 @@ fn current_turn_item_status_is_active(status: &str) -> bool {
             | "repairing"
             | "verifying"
     )
+}
+
+fn reject_conflicting_active_current_turn(
+    session_id: &SessionId,
+    existing_turn: Option<&ActiveExecutionTurn>,
+    incoming_turn_id: Option<&str>,
+) -> DomainResult<()> {
+    let Some(existing_turn) = existing_turn else {
+        return Ok(());
+    };
+    if current_turn_status_is_terminal(&existing_turn.status) {
+        return Ok(());
+    }
+    if incoming_turn_id == Some(existing_turn.turn_id.as_str()) {
+        return Ok(());
+    }
+    Err(DomainError::InvalidState {
+        message: format!(
+            "session {} already has active current_turn {}",
+            session_id, existing_turn.turn_id
+        ),
+    })
+}
+
+fn reject_duplicate_timeline_entry(timeline: &[TimelineEntry], entry_id: &str) -> DomainResult<()> {
+    if timeline.iter().any(|entry| entry.entry_id == entry_id) {
+        return Err(DomainError::InvalidState {
+            message: format!("timeline entry {} already exists", entry_id),
+        });
+    }
+    Ok(())
+}
+
+fn upsert_runtime_sidecar_in_state(state: &mut SessionStoreState, sidecar: SessionRuntimeSidecar) {
+    if let Some(existing) = state
+        .execution_sidecar_store
+        .runtime_sidecars
+        .iter_mut()
+        .find(|existing| existing.session_id == sidecar.session_id)
+    {
+        *existing = sidecar;
+    } else {
+        state.execution_sidecar_store.runtime_sidecars.push(sidecar);
+    }
+}
+
+fn append_item_to_current_turn(
+    sidecar: &mut SessionRuntimeSidecar,
+    mut item: ActiveExecutionTurnItem,
+) -> Option<SessionRuntimeSidecar> {
+    let Some(turn) = sidecar.current_turn.as_mut() else {
+        return None;
+    };
+    let next_item_seq = turn
+        .items
+        .iter()
+        .map(|existing| existing.item_seq)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    if item.item_seq == 0 {
+        item.item_seq = next_item_seq;
+    }
+    inherit_current_turn_aliases(turn, &mut item);
+    turn.items.push(item);
+    turn.normalize();
+    if let Some(chain) = sidecar.active_execution_chain.as_mut() {
+        chain.current_turn = sidecar.current_turn.clone();
+        chain.normalize();
+    }
+    sidecar.updated_at = UtcMillis::now();
+    Some(sidecar.clone())
 }
 
 impl SessionStore {
@@ -148,6 +220,71 @@ impl SessionStore {
         }
     }
 
+    fn build_active_execution_chain_sidecar(
+        session_id: SessionId,
+        mut active_execution_chain: ActiveExecutionChain,
+        existing: Option<SessionRuntimeSidecar>,
+    ) -> DomainResult<SessionRuntimeSidecar> {
+        if active_execution_chain.session_id != session_id {
+            return Err(DomainError::InvalidState {
+                message: format!(
+                    "session_runtime_sidecar 的 active_execution_chain.session_id 与 session_id 不一致: {} != {}",
+                    active_execution_chain.session_id, session_id
+                ),
+            });
+        }
+        active_execution_chain.normalize();
+        let recovery_id = active_execution_chain.recovery_ref.clone().or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|sidecar| sidecar.recovery_id.clone())
+        });
+        let incoming_execution_chain_ref = active_execution_chain.execution_chain_ref.clone();
+        let existing_current_turn = existing
+            .as_ref()
+            .and_then(|sidecar| sidecar.current_turn.clone());
+        let incoming_turn_id = active_execution_chain
+            .current_turn
+            .as_ref()
+            .map(|turn| turn.turn_id.as_str());
+        reject_conflicting_active_current_turn(
+            &session_id,
+            existing_current_turn.as_ref(),
+            incoming_turn_id,
+        )?;
+        let existing_execution_chain_ref = existing.as_ref().and_then(|sidecar| {
+            sidecar
+                .active_execution_chain
+                .as_ref()
+                .map(|chain| chain.execution_chain_ref.as_str())
+        });
+        let current_turn = active_execution_chain.current_turn.clone().or_else(|| {
+            (existing_execution_chain_ref == Some(incoming_execution_chain_ref.as_str()))
+                .then(|| existing_current_turn.clone())
+                .flatten()
+        });
+        active_execution_chain.current_turn = current_turn.clone();
+        let active_execution_chain = Some(active_execution_chain);
+        let ownership = active_execution_chain
+            .as_ref()
+            .map(Self::ownership_from_active_execution_chain)
+            .unwrap_or_default();
+        let status = Self::derive_sidecar_status(
+            &ownership,
+            recovery_id.as_deref(),
+            existing.as_ref().map(|sidecar| &sidecar.status),
+        );
+        Ok(SessionRuntimeSidecar {
+            session_id,
+            ownership,
+            recovery_id,
+            current_turn,
+            active_execution_chain,
+            status,
+            updated_at: UtcMillis::now(),
+        })
+    }
+
     pub fn upsert_runtime_sidecar(&self, sidecar: SessionRuntimeSidecar) {
         self.upsert_runtime_sidecar_with_reason(
             sidecar,
@@ -209,65 +346,195 @@ impl SessionStore {
         self.sync_session_workspace_binding(&session_key, ownership.workspace_id.as_ref());
     }
 
-    pub fn upsert_active_execution_chain(
+    pub fn accept_current_turn_with_timeline_entry(
         &self,
         session_id: SessionId,
-        mut active_execution_chain: ActiveExecutionChain,
-    ) -> DomainResult<SessionRuntimeSidecar> {
-        let existing = self.runtime_sidecar(&session_id);
-        if active_execution_chain.session_id != session_id {
-            return Err(DomainError::InvalidState {
-                message: format!(
-                    "session_runtime_sidecar 的 active_execution_chain.session_id 与 session_id 不一致: {} != {}",
-                    active_execution_chain.session_id, session_id
-                ),
-            });
+        entry_id: impl Into<String>,
+        kind: TimelineEntryKind,
+        message: impl Into<String>,
+        occurred_at: UtcMillis,
+        mut turn: ActiveExecutionTurn,
+    ) -> DomainResult<(String, SessionRuntimeSidecar)> {
+        let entry_id = entry_id.into();
+        turn.normalize();
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if !state
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id)
+        {
+            return Err(DomainError::NotFound { entity: "session" });
         }
-        active_execution_chain.normalize();
-        let recovery_id = active_execution_chain.recovery_ref.clone().or_else(|| {
+        let existing = state
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter()
+            .find(|sidecar| sidecar.session_id == session_id)
+            .cloned();
+        reject_conflicting_active_current_turn(
+            &session_id,
             existing
                 .as_ref()
-                .and_then(|sidecar| sidecar.recovery_id.clone())
+                .and_then(|sidecar| sidecar.current_turn.as_ref()),
+            Some(turn.turn_id.as_str()),
+        )?;
+        reject_duplicate_timeline_entry(&state.timeline, &entry_id)?;
+
+        state.timeline.push(TimelineEntry {
+            entry_id: entry_id.clone(),
+            session_id: session_id.clone(),
+            kind,
+            message: message.into(),
+            occurred_at,
         });
-        let incoming_execution_chain_ref = active_execution_chain.execution_chain_ref.clone();
-        let existing_current_turn = existing
-            .as_ref()
-            .and_then(|sidecar| sidecar.current_turn.clone());
-        let existing_execution_chain_ref = existing.as_ref().and_then(|sidecar| {
-            sidecar
-                .active_execution_chain
-                .as_ref()
-                .map(|chain| chain.execution_chain_ref.as_str())
-        });
-        let current_turn = active_execution_chain.current_turn.clone().or_else(|| {
-            (existing_execution_chain_ref == Some(incoming_execution_chain_ref.as_str()))
-                .then(|| existing_current_turn.clone())
-                .flatten()
-        });
-        active_execution_chain.current_turn = current_turn.clone();
-        let active_execution_chain = Some(active_execution_chain);
-        let ownership = active_execution_chain
-            .as_ref()
-            .map(Self::ownership_from_active_execution_chain)
-            .unwrap_or_default();
-        let status = Self::derive_sidecar_status(
-            &ownership,
-            recovery_id.as_deref(),
-            existing.as_ref().map(|sidecar| &sidecar.status),
-        );
+        if let Some(session) = state
+            .sessions
+            .iter_mut()
+            .find(|session| session.session_id == session_id)
+        {
+            session.updated_at = occurred_at;
+        }
+
+        let (ownership, recovery_id, active_execution_chain, status) =
+            if let Some(existing) = existing {
+                (
+                    existing.ownership,
+                    existing.recovery_id,
+                    existing.active_execution_chain,
+                    existing.status,
+                )
+            } else {
+                (
+                    ExecutionOwnership {
+                        session_id: Some(session_id.clone()),
+                        ..ExecutionOwnership::default()
+                    },
+                    None,
+                    None,
+                    SessionExecutionSidecarStatus::Detached,
+                )
+            };
         let updated = SessionRuntimeSidecar {
-            session_id,
+            session_id: session_id.clone(),
             ownership,
             recovery_id,
-            current_turn,
+            current_turn: Some(turn),
             active_execution_chain,
             status,
             updated_at: UtcMillis::now(),
         };
-        self.upsert_runtime_sidecar_with_reason(
-            updated.clone(),
-            SessionSidecarFlushReason::UpsertActiveExecutionChain,
+        upsert_runtime_sidecar_in_state(&mut state, updated.clone());
+        drop(state);
+        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertCurrentTurn);
+        Ok((entry_id, updated))
+    }
+
+    pub fn accept_active_execution_chain_with_timeline_entry(
+        &self,
+        session_id: SessionId,
+        entry_id: impl Into<String>,
+        kind: TimelineEntryKind,
+        message: impl Into<String>,
+        occurred_at: UtcMillis,
+        active_execution_chain: ActiveExecutionChain,
+    ) -> DomainResult<(String, SessionRuntimeSidecar)> {
+        let entry_id = entry_id.into();
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if !state
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id)
+        {
+            return Err(DomainError::NotFound { entity: "session" });
+        }
+        let existing = state
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter()
+            .find(|sidecar| sidecar.session_id == session_id)
+            .cloned();
+        let updated = Self::build_active_execution_chain_sidecar(
+            session_id.clone(),
+            active_execution_chain,
+            existing,
+        )?;
+        reject_duplicate_timeline_entry(&state.timeline, &entry_id)?;
+
+        state.timeline.push(TimelineEntry {
+            entry_id: entry_id.clone(),
+            session_id: session_id.clone(),
+            kind,
+            message: message.into(),
+            occurred_at,
+        });
+        if let Some(session) = state
+            .sessions
+            .iter_mut()
+            .find(|session| session.session_id == session_id)
+        {
+            session.updated_at = occurred_at;
+        }
+
+        upsert_runtime_sidecar_in_state(&mut state, updated.clone());
+        drop(state);
+        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertActiveExecutionChain);
+        self.sync_session_workspace_binding(
+            &updated.session_id,
+            updated.ownership.workspace_id.as_ref(),
         );
+        Ok((entry_id, updated))
+    }
+
+    pub fn ensure_current_turn_acceptance_available(
+        &self,
+        session_id: &SessionId,
+    ) -> DomainResult<()> {
+        let state = self.state.read().expect("session state read lock poisoned");
+        if !state
+            .sessions
+            .iter()
+            .any(|session| &session.session_id == session_id)
+        {
+            return Err(DomainError::NotFound { entity: "session" });
+        }
+        let existing_turn = state
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter()
+            .find(|sidecar| &sidecar.session_id == session_id)
+            .and_then(|sidecar| sidecar.current_turn.as_ref());
+        reject_conflicting_active_current_turn(session_id, existing_turn, None)
+    }
+
+    pub fn upsert_active_execution_chain(
+        &self,
+        session_id: SessionId,
+        active_execution_chain: ActiveExecutionChain,
+    ) -> DomainResult<SessionRuntimeSidecar> {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        let existing = state
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter()
+            .find(|sidecar| sidecar.session_id == session_id)
+            .cloned();
+        let updated = Self::build_active_execution_chain_sidecar(
+            session_id.clone(),
+            active_execution_chain,
+            existing,
+        )?;
+        upsert_runtime_sidecar_in_state(&mut state, updated.clone());
+        drop(state);
+        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertActiveExecutionChain);
         self.sync_session_workspace_binding(
             &updated.session_id,
             updated.ownership.workspace_id.as_ref(),
@@ -597,7 +864,7 @@ impl SessionStore {
     pub fn append_current_turn_item(
         &self,
         session_id: &SessionId,
-        mut item: ActiveExecutionTurnItem,
+        item: ActiveExecutionTurnItem,
     ) -> DomainResult<Option<SessionRuntimeSidecar>> {
         let updated = {
             let mut state = self
@@ -614,28 +881,65 @@ impl SessionStore {
                     entity: "session_runtime_sidecar",
                 });
             };
-            let Some(turn) = sidecar.current_turn.as_mut() else {
-                return Ok(None);
-            };
-            let next_item_seq = turn
-                .items
+            append_item_to_current_turn(sidecar, item)
+        };
+        if updated.is_some() {
+            self.mark_sidecar_dirty(SessionSidecarFlushReason::AppendCurrentTurnItem);
+        }
+        Ok(updated)
+    }
+
+    pub fn append_current_turn_item_with_timeline_entry(
+        &self,
+        session_id: &SessionId,
+        entry_id: impl Into<String>,
+        kind: TimelineEntryKind,
+        message: impl Into<String>,
+        occurred_at: UtcMillis,
+        item: ActiveExecutionTurnItem,
+    ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        let entry_id = entry_id.into();
+        let message = message.into();
+        let updated = {
+            let mut state = self
+                .state
+                .write()
+                .expect("session state write lock poisoned");
+            let Some(sidecar_index) = state
+                .execution_sidecar_store
+                .runtime_sidecars
                 .iter()
-                .map(|existing| existing.item_seq)
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1);
-            if item.item_seq == 0 {
-                item.item_seq = next_item_seq;
+                .position(|sidecar| &sidecar.session_id == session_id)
+            else {
+                return Err(DomainError::NotFound {
+                    entity: "session_runtime_sidecar",
+                });
+            };
+            if state.execution_sidecar_store.runtime_sidecars[sidecar_index]
+                .current_turn
+                .is_none()
+            {
+                return Ok(None);
             }
-            inherit_current_turn_aliases(turn, &mut item);
-            turn.items.push(item);
-            turn.normalize();
-            if let Some(chain) = sidecar.active_execution_chain.as_mut() {
-                chain.current_turn = sidecar.current_turn.clone();
-                chain.normalize();
+            reject_duplicate_timeline_entry(&state.timeline, &entry_id)?;
+            state.timeline.push(TimelineEntry {
+                entry_id,
+                session_id: session_id.clone(),
+                kind,
+                message,
+                occurred_at,
+            });
+            if let Some(session) = state
+                .sessions
+                .iter_mut()
+                .find(|session| &session.session_id == session_id)
+            {
+                session.updated_at = occurred_at;
             }
-            sidecar.updated_at = UtcMillis::now();
-            Some(sidecar.clone())
+            append_item_to_current_turn(
+                &mut state.execution_sidecar_store.runtime_sidecars[sidecar_index],
+                item,
+            )
         };
         if updated.is_some() {
             self.mark_sidecar_dirty(SessionSidecarFlushReason::AppendCurrentTurnItem);

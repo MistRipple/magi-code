@@ -1561,7 +1561,6 @@ function mergeProjectionOrderingMetadata(
     'blockSeq',
     'cardStreamSeq',
     'laneSeq',
-    'responseDurationMs',
   ]) {
     preservePositiveNumberFact(key);
   }

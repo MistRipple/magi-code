@@ -216,6 +216,24 @@ pub(crate) fn publish_session_turn_item_event(
     );
 }
 
+pub(crate) fn publish_current_session_turn_item_event(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    item_id: &str,
+    task_store: Option<&TaskStore>,
+) {
+    let Some(sidecar) = session_store.runtime_sidecar(session_id) else {
+        return;
+    };
+    let Some(published) = published_session_turn_item_from_sidecar(sidecar, item_id, task_store)
+    else {
+        return;
+    };
+    publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+}
+
 pub(crate) fn append_session_turn_error_item(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
@@ -235,16 +253,23 @@ pub(crate) fn append_session_turn_error_item(
         Some(error_text.to_string()),
         Some(format!("turn-item-assistant-error-{}", UtcMillis::now().0)),
     );
+    let error_item_id = error_item.item_id.clone();
     if let Some(task_id) = task_id {
         error_item.task_id = Some(task_id.clone());
     }
     error_item.request_id = request_id.map(str::to_string);
     error_item.user_message_id = user_message_id.map(str::to_string);
     error_item.placeholder_message_id = placeholder_message_id.map(str::to_string);
-    if let Some(published) = append_session_turn_item(session_store, session_id, error_item) {
-        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
-    }
+    let _ = append_session_turn_item(session_store, session_id, error_item);
     let _ = session_store.update_current_turn_status(session_id, "failed");
+    publish_current_session_turn_item_event(
+        event_bus,
+        session_store,
+        session_id,
+        workspace_id,
+        &error_item_id,
+        None,
+    );
     let timeline_message = build_completed_turn_timeline_snapshot(
         session_store,
         session_id,
@@ -401,7 +426,7 @@ pub(crate) fn build_completed_turn_timeline_snapshot(
     let sidecar = session_store.runtime_sidecar(session_id)?;
     let turn = sidecar.current_turn.as_ref()?;
     let chain = chain_for_turn_summary(&sidecar, turn);
-    let completed_at = turn.completed_at.unwrap_or_else(UtcMillis::now);
+    let completed_at = turn.completed_at?;
     let response_duration_ms = Some(completed_at.0.saturating_sub(turn.accepted_at.0));
     let final_text = fallback_final_text
         .map(|text| text.trim().to_string())

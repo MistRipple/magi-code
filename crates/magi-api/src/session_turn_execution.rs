@@ -4,7 +4,8 @@ use crate::{
     session_turn_writeback::{
         append_session_tool_call_items_batch, append_session_turn_error_item,
         append_session_turn_item, build_completed_turn_timeline_snapshot,
-        publish_session_turn_item_event, session_turn_item, upsert_session_turn_item,
+        publish_current_session_turn_item_event, publish_session_turn_item_event,
+        session_turn_item, upsert_session_turn_item,
     },
     settings_store::SettingsStore,
     usage_recording::{
@@ -635,6 +636,7 @@ fn append_final_item(
         streaming_entry_id.map(str::to_string),
     );
     apply_request_aliases(&mut final_item, request);
+    let final_item_id = final_item.item_id.clone();
     if streaming_entry_id.is_some() {
         if let Some(published) =
             upsert_session_turn_item(session_store, &request.session_id, final_item)
@@ -657,6 +659,14 @@ fn append_final_item(
         );
     }
     let _ = session_store.update_current_turn_status(&request.session_id, "completed");
+    publish_current_session_turn_item_event(
+        event_bus,
+        session_store,
+        &request.session_id,
+        &request.workspace_id,
+        &final_item_id,
+        None,
+    );
     let timeline_message = build_completed_turn_timeline_snapshot(
         session_store,
         &request.session_id,
@@ -806,6 +816,72 @@ mod tests {
                 "2+3 等于 5。",
                 "请基于上一轮结果，用一句话回答：再加 4 等于几？",
             ]
+        );
+    }
+
+    #[test]
+    fn append_final_item_publishes_terminal_duration_from_backend_turn() {
+        let session_id = SessionId::new("session-terminal-duration");
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "terminal duration")
+            .expect("session should be creatable");
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-terminal-duration".to_string(),
+                    turn_seq: 1,
+                    accepted_at: ts(1000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("请回答".to_string()),
+                    items: Vec::new(),
+                    worker_lanes: Vec::new(),
+                },
+            )
+            .expect("current turn should be stored");
+        let event_bus = InMemoryEventBus::new(16);
+        let request = SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            turn_id: "turn-terminal-duration".to_string(),
+            workspace_id: None,
+            prompt: "请回答".to_string(),
+            use_tools: false,
+            skill_name: None,
+            request_id: Some("request-terminal-duration".to_string()),
+            user_message_id: Some("user-terminal-duration".to_string()),
+            placeholder_message_id: Some("placeholder-terminal-duration".to_string()),
+        };
+
+        append_final_item(&event_bus, &store, &request, "最终回复", None);
+
+        let terminal_event = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .rev()
+            .find(|event| event.event_type == "session.turn.item")
+            .expect("terminal item event should be published");
+        assert_eq!(
+            terminal_event.payload["current_turn"]["status"],
+            "completed"
+        );
+        assert!(
+            terminal_event.payload["current_turn"]["response_duration_ms"]
+                .as_u64()
+                .is_some(),
+            "terminal session.turn.item 必须携带后端完成耗时"
+        );
+        assert!(
+            store
+                .timeline_for_session(&session_id)
+                .iter()
+                .any(
+                    |entry| matches!(entry.kind, TimelineEntryKind::AssistantMessage)
+                        && entry.message.contains("\"response_duration_ms\"")
+                ),
+            "持久 snapshot 必须携带后端完成耗时"
         );
     }
 }

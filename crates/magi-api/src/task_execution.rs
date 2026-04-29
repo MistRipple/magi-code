@@ -9,7 +9,9 @@ use crate::{
     prompt_utils::prepend_session_instructions,
     session_turn_execution::{SessionTurnExecutionRuntime, run_session_turn_execution},
     settings_store::SettingsStore,
-    shadow_execution::run_shadow_dispatch_submission,
+    shadow_execution::{
+        ShadowTaskGraphSubmission, cleanup_shadow_task_tree, run_shadow_dispatch_submission,
+    },
     skill_apply_tool::{SKILL_APPLY_TOOL_NAME, skill_apply_tool_definition},
     state::{ApiState, ShadowExecutionPipeline},
     usage_recording::{ModelUsageBinding, model_usage_binding_for_worker},
@@ -19,8 +21,8 @@ use magi_context_runtime::{
     ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
 };
 use magi_core::{
-    EventId, ExecutionOwnership, LeaseId, SessionId, TaskExecutionTarget, TaskId, TaskStatus,
-    UtcMillis, WorkerId, WorkspaceId,
+    DomainError, EventId, ExecutionOwnership, LeaseId, SessionId, TaskExecutionTarget, TaskId,
+    TaskStatus, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
@@ -60,6 +62,7 @@ pub struct DispatchSubmissionRequest {
     pub session_id: SessionId,
     pub workspace_id: Option<WorkspaceId>,
     pub entry_id: String,
+    pub timeline_message: String,
     pub created_session: bool,
     pub mission_title: String,
     pub task_title: String,
@@ -949,12 +952,26 @@ fn submit_shadow_task_submission(
     state: &ApiState,
     request: DispatchSubmissionRequest,
 ) -> Result<DispatchSubmissionAccepted, ApiError> {
+    state
+        .session_store
+        .ensure_current_turn_acceptance_available(&request.session_id)
+        .map_err(map_shadow_dispatch_store_error)?;
     let graph = run_shadow_dispatch_submission(state, &request)?;
     if let Some(active_execution_chain) = graph.active_execution_chain.clone() {
-        state
+        let accept_result = state
             .session_store
-            .upsert_active_execution_chain(request.session_id.clone(), active_execution_chain)
-            .map_err(|error| ApiError::internal_assembly("执行 shadow dispatch 失败", error))?;
+            .accept_active_execution_chain_with_timeline_entry(
+                request.session_id.clone(),
+                request.entry_id.clone(),
+                TimelineEntryKind::UserMessage,
+                request.timeline_message.clone(),
+                request.accepted_at,
+                active_execution_chain,
+            );
+        if let Err(error) = accept_result {
+            cleanup_rejected_shadow_dispatch(state, &graph);
+            return Err(map_shadow_dispatch_store_error(error));
+        }
     }
 
     Ok(DispatchSubmissionAccepted {
@@ -966,6 +983,27 @@ fn submit_shadow_task_submission(
         action_task_id: graph.action_task_id,
         runner_started: false,
     })
+}
+
+fn cleanup_rejected_shadow_dispatch(state: &ApiState, graph: &ShadowTaskGraphSubmission) {
+    if let Some(chain) = graph.active_execution_chain.as_ref() {
+        let registry = state.shadow_task_execution_registry();
+        for branch in &chain.branches {
+            let _ = registry.remove(&branch.task_id);
+        }
+    }
+    if let Some(task_store) = state.task_store() {
+        cleanup_shadow_task_tree(task_store, &graph.root_task_id);
+    }
+}
+
+fn map_shadow_dispatch_store_error(error: DomainError) -> ApiError {
+    match error {
+        DomainError::InvalidState { message } if message.contains("active current_turn") => {
+            ApiError::conflict("执行 shadow dispatch 失败", &message)
+        }
+        other => ApiError::internal_assembly("执行 shadow dispatch 失败", other),
+    }
 }
 
 pub fn submit_shadow_dispatch_submission(

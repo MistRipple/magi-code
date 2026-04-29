@@ -30,7 +30,6 @@ import {
   applyAuthoritativeProcessingState,
   markMessageComplete,
   updateRequestBinding,
-  applyTimelineStreamPatch,
   getTimelineMessageById,
   settleProcessingAfterResponseCompletion,
   settleAuthoritativeIdleState,
@@ -708,22 +707,6 @@ function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): voi
       continue;
     }
 
-    const existingMetadata = matchedAssistant.metadata && typeof matchedAssistant.metadata === 'object'
-      ? matchedAssistant.metadata
-      : {};
-    const authoritativeResponseDurationMs = typeof existingMetadata.responseDurationMs === 'number'
-      ? existingMetadata.responseDurationMs
-      : undefined;
-    const computedResponseDurationMs = Math.max(0, matchedAssistant.timestamp - binding.createdAt);
-    const responseDurationMs = typeof authoritativeResponseDurationMs === 'number'
-      ? authoritativeResponseDurationMs
-      : computedResponseDurationMs;
-    applyTimelineStreamPatch(matchedAssistant.id, {
-      metadata: {
-        ...existingMetadata,
-        ...(typeof responseDurationMs === 'number' ? { responseDurationMs } : {}),
-      },
-    });
     markMessageComplete(matchedAssistant.id);
     clearPendingRequest(binding.requestId);
     updateRequestBinding(binding.requestId, {
@@ -824,9 +807,11 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         preserveLoadedWindow: true,
       });
 
-      // 权威投影始终回灌到时间线：本地活跃轮次只能保留处理态，
-      // 不能阻止 backend 已完成的 tool / assistant 结果合并回当前视图。
-      prependTimelineProjectionPage(sessionId, timelineProjection);
+      if (preserveLocalTurnDuringStaleIdle) {
+        prependTimelineProjectionPage(sessionId, timelineProjection);
+      } else {
+        applyTimelineProjectionSnapshot(sessionId, timelineProjection, { hydrateNodes: true });
+      }
       reconcileRequestBindingsFromAuthoritativeThread(sessionId);
       if (authoritativeSnapshotIsIdle && !hadLiveTurnBeforeSnapshot) {
         settleAuthoritativeIdleState();

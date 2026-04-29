@@ -8,20 +8,18 @@ use magi_bridge_client::{
     SHADOW_MODEL_PROVIDER,
 };
 use magi_core::TaskStatus;
-use magi_core::{DomainError, EventId, SessionId, UtcMillis, WorkerId};
+use magi_core::{DomainError, EventId, SessionId, UtcMillis, WorkerId, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, NotificationRecord, SessionRecord,
+    TimelineEntryKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{
-    append_session_user_message,
-    session_scope::{
-        require_current_session_record_in_workspace, require_session_record_in_workspace,
-        session_workspace_id,
-    },
+use super::session_scope::{
+    require_current_session_record_in_workspace, require_session_record_in_workspace,
+    session_workspace_id,
 };
 use crate::{
     dto::{
@@ -153,8 +151,7 @@ async fn submit_session_turn(
             let accepted = continue_shadow_execution_chain(&state, &session_id, &[])?;
             let (entry_id, user_message_item_id) = match prompt_text.as_deref() {
                 Some(prompt_text) => {
-                    let entry_id =
-                        append_session_user_message(&state, &session_id, accepted_at, prompt_text);
+                    let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
                     let (user_message_item_id, user_message_item) = build_user_message_turn_item(
                         accepted_at,
                         prompt_text,
@@ -165,12 +162,32 @@ async fn submit_session_turn(
                         Some(accepted.action_task_id.clone()),
                         true,
                     );
-                    state
+                    let updated = state
                         .session_store
-                        .append_current_turn_item(&session_id, user_message_item)
+                        .append_current_turn_item_with_timeline_entry(
+                            &session_id,
+                            entry_id.clone(),
+                            TimelineEntryKind::UserMessage,
+                            prompt_text,
+                            accepted_at,
+                            user_message_item,
+                        )
                         .map_err(|error| {
                             ApiError::internal_assembly("写入 continue 用户消息失败", error)
                         })?;
+                    if updated.is_none() {
+                        return Err(ApiError::internal_assembly(
+                            "写入 continue 用户消息失败",
+                            "current_turn 不存在",
+                        ));
+                    }
+                    publish_session_user_message_created_event(
+                        &state,
+                        &session_id,
+                        session_workspace_for_event(&state, &session_id),
+                        accepted_at,
+                        prompt_text,
+                    );
                     (entry_id, Some(user_message_item_id))
                 }
                 None => (format!("timeline-{}-{}", session_id, accepted_at.0), None),
@@ -577,7 +594,7 @@ fn submit_regular_session_turn(
         title_seed,
         accepted_at,
     )?;
-    let entry_id = append_session_user_message(&state, &session_id, accepted_at, &message);
+    let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let request_id = request.request_id();
     let user_message_id = request.user_message_id();
     let placeholder_message_id = request.placeholder_message_id();
@@ -604,10 +621,24 @@ fn submit_regular_session_turn(
         worker_lanes: Vec::new(),
     };
     turn.normalize();
-    state
+    let (entry_id, _) = state
         .session_store
-        .upsert_current_turn(session_id.clone(), turn)
-        .map_err(|error| ApiError::internal_assembly("写入 session turn 失败", error))?;
+        .accept_current_turn_with_timeline_entry(
+            session_id.clone(),
+            entry_id,
+            TimelineEntryKind::UserMessage,
+            message.clone(),
+            accepted_at,
+            turn,
+        )
+        .map_err(|error| map_current_turn_accept_error("接受 session turn 失败", error))?;
+    publish_session_user_message_created_event(
+        &state,
+        &session_id,
+        workspace_id.clone(),
+        accepted_at,
+        &message,
+    );
     let event_id = publish_regular_session_turn_accepted_event(
         &state,
         &session_id,
@@ -937,6 +968,47 @@ fn turn_status_is_interruptible(status: &str) -> bool {
     )
 }
 
+fn map_current_turn_accept_error(context: &str, error: DomainError) -> ApiError {
+    match error {
+        DomainError::InvalidState { message } if message.contains("active current_turn") => {
+            ApiError::conflict(context, &message)
+        }
+        other => ApiError::internal_assembly(context, other),
+    }
+}
+
+fn session_workspace_for_event(state: &ApiState, session_id: &SessionId) -> Option<WorkspaceId> {
+    state
+        .session_store
+        .session(session_id)
+        .and_then(|session| session_workspace_id(state, &session))
+}
+
+fn publish_session_user_message_created_event(
+    state: &ApiState,
+    session_id: &SessionId,
+    workspace_id: Option<WorkspaceId>,
+    occurred_at: UtcMillis,
+    message: &str,
+) {
+    let _ = state.event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!("event-message-user-{}", occurred_at.0)),
+            "message.created",
+            json!({
+                "session_id": session_id.to_string(),
+                "role": "user",
+                "content": message,
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(session_id.clone()),
+            workspace_id,
+            ..EventContext::default()
+        }),
+    );
+}
+
 fn current_turn_streaming_timeline_entry_ids(
     state: &ApiState,
     session_id: &SessionId,
@@ -1078,7 +1150,7 @@ async fn continue_session(
     let continued_at = UtcMillis::now();
     let accepted = continue_shadow_execution_chain(&state, &session_id, &requested_worker_ids)?;
     if let Some(prompt_text) = prompt_text.as_deref() {
-        let entry_id = append_session_user_message(&state, &session_id, continued_at, prompt_text);
+        let entry_id = format!("timeline-{}-{}", session_id, continued_at.0);
         let (_, user_message_item) = build_user_message_turn_item(
             continued_at,
             prompt_text,
@@ -1089,10 +1161,30 @@ async fn continue_session(
             Some(accepted.action_task_id.clone()),
             true,
         );
-        state
+        let updated = state
             .session_store
-            .append_current_turn_item(&session_id, user_message_item)
+            .append_current_turn_item_with_timeline_entry(
+                &session_id,
+                entry_id,
+                TimelineEntryKind::UserMessage,
+                prompt_text,
+                continued_at,
+                user_message_item,
+            )
             .map_err(|error| ApiError::internal_assembly("写入 continue 用户消息失败", error))?;
+        if updated.is_none() {
+            return Err(ApiError::internal_assembly(
+                "写入 continue 用户消息失败",
+                "current_turn 不存在",
+            ));
+        }
+        publish_session_user_message_created_event(
+            &state,
+            &session_id,
+            session_workspace_for_event(&state, &session_id),
+            continued_at,
+            prompt_text,
+        );
     }
     finalize_continue_session(state.clone(), accepted.clone(), continued_at);
     state.persist_runtime_durable_state()?;

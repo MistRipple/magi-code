@@ -74,8 +74,7 @@ fn execute_dispatch_submission(
         &mission_title,
         accepted_at,
     )?;
-    let user_timeline_entry_id =
-        append_session_user_message(state, &session_id, accepted_at, &message);
+    let user_timeline_entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let action_task_title = format!("执行: {}", mission_title);
 
     let dispatch = DispatchSubmissionRequest {
@@ -83,6 +82,7 @@ fn execute_dispatch_submission(
         session_id: session_id.clone(),
         workspace_id: workspace_id.clone(),
         entry_id: user_timeline_entry_id,
+        timeline_message: message.clone(),
         created_session,
         mission_title,
         task_title: action_task_title,
@@ -96,6 +96,13 @@ fn execute_dispatch_submission(
         placeholder_message_id: request.placeholder_message_id(),
     };
     let accepted = submit_shadow_dispatch_submission(state, dispatch)?;
+    publish_session_user_message_event(
+        state,
+        &session_id,
+        workspace_id.clone(),
+        accepted_at,
+        &message,
+    );
     let event_id = publish_session_turn_task_accepted_event(state, request, &accepted)?;
     state.persist_session_durable_state()?;
     Ok((accepted, event_id))
@@ -217,20 +224,13 @@ pub(super) fn resolve_dispatch_session(
     Ok((session_id, true, requested_workspace_id))
 }
 
-pub(super) fn append_session_user_message(
+fn publish_session_user_message_event(
     state: &ApiState,
     session_id: &SessionId,
+    workspace_id: Option<WorkspaceId>,
     accepted_at: UtcMillis,
     message: &str,
-) -> String {
-    let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
-    state.session_store.upsert_timeline_entry(
-        session_id.clone(),
-        &entry_id,
-        TimelineEntryKind::UserMessage,
-        message.to_string(),
-    );
-
+) {
     let _ = state.event_bus.publish(
         EventEnvelope::domain(
             EventId::new(format!("event-message-user-{}", accepted_at.0)),
@@ -243,10 +243,10 @@ pub(super) fn append_session_user_message(
         )
         .with_context(EventContext {
             session_id: Some(session_id.clone()),
+            workspace_id,
             ..EventContext::default()
         }),
     );
-    entry_id
 }
 
 pub(super) fn append_dispatch_assistant_message(

@@ -136,12 +136,7 @@ fn merge_session_sidecars(
             clear_session_runtime_live_ids(entry);
         }
         if let Some(turn) = export.current_turn.as_ref() {
-            let completed_at =
-                if matches!(turn.status.as_str(), "completed" | "failed" | "cancelled") {
-                    turn.completed_at.or(Some(export.last_update))
-                } else {
-                    turn.completed_at
-                };
+            let completed_at = turn.completed_at;
             entry.current_turn = Some(SessionRuntimeTurnSummaryEntry {
                 turn_id: turn.turn_id.clone(),
                 turn_seq: turn.turn_seq,

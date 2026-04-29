@@ -47,7 +47,7 @@ use crate::{
 };
 
 use dispatch_flow::{
-    accept_session_task_submission, append_dispatch_assistant_message, append_session_user_message,
+    accept_session_task_submission, append_dispatch_assistant_message,
     finalize_session_task_dispatch, resolve_dispatch_session,
 };
 
@@ -1328,6 +1328,134 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["route"], "chat");
+    }
+
+    #[tokio::test]
+    async fn session_turn_rejects_active_current_turn_before_writing_user_message() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let session_id = SessionId::new("session-active-turn-conflict");
+        state
+            .session_store
+            .create_session(session_id.clone(), "Active turn conflict")
+            .expect("session should be creatable");
+        state
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-still-running".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis(1),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("上一轮仍在执行".to_string()),
+                    items: Vec::new(),
+                    worker_lanes: Vec::new(),
+                },
+            )
+            .expect("current turn should be stored");
+        let app = build_router(state.clone());
+
+        let (status, body) = post_json(
+            app,
+            "/api/session/turn",
+            json!({
+                "sessionId": session_id.to_string(),
+                "text": "这条消息不应覆盖正在运行的 turn",
+                "deepTask": false,
+                "skillName": null,
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("turn-still-running")
+        );
+        assert!(
+            !state
+                .session_store
+                .timeline_for_session(&session_id)
+                .iter()
+                .any(|entry| matches!(entry.kind, TimelineEntryKind::UserMessage)
+                    && entry.message == "这条消息不应覆盖正在运行的 turn"),
+            "冲突请求不能先写入用户消息"
+        );
+        let current_turn = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("current turn should remain");
+        assert_eq!(current_turn.turn_id, "turn-still-running");
+        assert_eq!(current_turn.status, "running");
+    }
+
+    #[tokio::test]
+    async fn session_task_turn_rejects_active_current_turn_before_writing_user_message() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let session_id = SessionId::new("session-active-task-conflict");
+        state
+            .session_store
+            .create_session(session_id.clone(), "Active task conflict")
+            .expect("session should be creatable");
+        state
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-task-still-running".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis(1),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("上一轮任务仍在执行".to_string()),
+                    items: Vec::new(),
+                    worker_lanes: Vec::new(),
+                },
+            )
+            .expect("current turn should be stored");
+        let app = build_router(state.clone());
+
+        let (status, body) = post_json(
+            app,
+            "/api/session/turn",
+            json!({
+                "sessionId": session_id.to_string(),
+                "text": "这条深度任务不应覆盖正在运行的 turn",
+                "deepTask": true,
+                "skillName": "deep_task",
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("turn-task-still-running")
+        );
+        assert!(
+            !state
+                .session_store
+                .timeline_for_session(&session_id)
+                .iter()
+                .any(|entry| matches!(entry.kind, TimelineEntryKind::UserMessage)
+                    && entry.message == "这条深度任务不应覆盖正在运行的 turn"),
+            "任务冲突请求不能先写入用户消息"
+        );
+        let current_turn = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("current turn should remain");
+        assert_eq!(current_turn.turn_id, "turn-task-still-running");
+        assert_eq!(current_turn.status, "running");
     }
 
     #[tokio::test]
@@ -5910,6 +6038,7 @@ mod tests {
                 session_id: session_id.clone(),
                 workspace_id: None,
                 entry_id: format!("timeline-{session_id}-{}", accepted_at.0),
+                timeline_message: "deep interrupt delayed completion".to_string(),
                 created_session: false,
                 mission_title: "deep interrupt delayed completion".to_string(),
                 task_title: "执行: deep interrupt delayed completion".to_string(),
