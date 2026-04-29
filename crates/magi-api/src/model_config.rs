@@ -167,7 +167,7 @@ impl NormalizedModelConfig {
             base_url,
             self.api_key.clone(),
             model,
-            self.execution_openai_protocol().to_http_protocol(),
+            self.execution_http_protocol(),
         ))
     }
 
@@ -318,6 +318,13 @@ impl NormalizedModelConfig {
         } else {
             self.openai_protocol.unwrap_or(ModelOpenAiProtocol::Chat)
         }
+    }
+
+    fn execution_http_protocol(&self) -> HttpModelBridgeProtocol {
+        if self.provider_key() == "anthropic" {
+            return HttpModelBridgeProtocol::AnthropicMessages;
+        }
+        self.execution_openai_protocol().to_http_protocol()
     }
 
     fn http_client_base_url(&self) -> Option<String> {
@@ -480,6 +487,25 @@ mod tests {
                 "max_tokens": 1,
                 "stream": false
             })
+        );
+    }
+
+    #[test]
+    fn normalized_model_config_builds_anthropic_execution_protocol() {
+        let config = NormalizedModelConfig::from_settings_value(
+            &json!({
+                "provider": "anthropic",
+                "baseUrl": "https://api.anthropic.com",
+                "apiKey": "test-key",
+                "model": "claude-sonnet-test",
+                "urlMode": "standard"
+            }),
+            "openai",
+        );
+
+        assert_eq!(
+            config.execution_http_protocol(),
+            HttpModelBridgeProtocol::AnthropicMessages
         );
     }
 

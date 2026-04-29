@@ -1,6 +1,9 @@
-use crate::protocol::AdaptedResponse;
-use crate::protocol::ProviderFamily;
+use crate::llm_types::{
+    LlmContentBlock, LlmMessage, LlmMessageContent, LlmMessageParams, ToolChoice, ToolDefinition,
+    ToolInputSchema,
+};
 use crate::protocol::streaming::{SseLineParser, StreamAccumulator, parse_stream_event};
+use crate::protocol::{AdaptedResponse, AnthropicMessagesAdapter, ProviderAdapter, ProviderFamily};
 use crate::types::{
     BridgeClientError, BridgeErrorLayer, BridgeResponse, ModelBridgeClient, ModelInvocationRequest,
     ModelStreamingDelta,
@@ -20,18 +23,23 @@ const OPENAI_RESPONSES_PATH: &str = "/v1/responses";
 pub enum HttpModelBridgeProtocol {
     ChatCompletions,
     Responses,
+    AnthropicMessages,
 }
 
-/// A `ModelBridgeClient` implementation that makes direct HTTP calls to an
-/// OpenAI-compatible API endpoint, bypassing the JSON-RPC subprocess loopback.
+/// 直接通过 HTTP 调用已配置的模型提供方，绕过 JSON-RPC 子进程 loopback。
 ///
-/// HTTP calls are dispatched on a dedicated thread to avoid conflicts with
-/// tokio async runtimes that may be active in the calling context.
+/// HTTP I/O 放在独立线程执行，避免与调用方已经存在的 tokio runtime 冲突。
 pub struct HttpModelBridgeClient {
     base_url: String,
     api_key: Option<String>,
     model: String,
     protocol: HttpModelBridgeProtocol,
+}
+
+struct HttpModelRequest {
+    url: String,
+    body: serde_json::Value,
+    headers: Vec<(String, String)>,
 }
 
 impl HttpModelBridgeClient {
@@ -69,8 +77,8 @@ impl HttpModelBridgeClient {
         }
     }
 
-    fn request_url(&self) -> Result<String, BridgeClientError> {
-        build_openai_protocol_url(&self.base_url, self.protocol).map_err(|reason| {
+    fn openai_request_url(&self, endpoint_path: &str) -> Result<String, BridgeClientError> {
+        build_protocol_endpoint_url(&self.base_url, endpoint_path).map_err(|reason| {
             BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::Protocol,
                 code: None,
@@ -94,14 +102,74 @@ impl HttpModelBridgeClient {
         match self.protocol {
             HttpModelBridgeProtocol::ChatCompletions => ProviderFamily::OpenAiChat,
             HttpModelBridgeProtocol::Responses => ProviderFamily::OpenAiResponses,
+            HttpModelBridgeProtocol::AnthropicMessages => ProviderFamily::Anthropic,
         }
     }
 
-    pub(crate) fn build_request_body(&self, request: &ModelInvocationRequest) -> serde_json::Value {
+    fn request_headers(&self) -> Vec<(String, String)> {
         match self.protocol {
-            HttpModelBridgeProtocol::ChatCompletions => self.build_chat_request_body(request),
-            HttpModelBridgeProtocol::Responses => self.build_responses_request_body(request),
+            HttpModelBridgeProtocol::ChatCompletions | HttpModelBridgeProtocol::Responses => self
+                .api_key
+                .as_ref()
+                .map(|key| vec![("Authorization".to_string(), format!("Bearer {key}"))])
+                .unwrap_or_default(),
+            HttpModelBridgeProtocol::AnthropicMessages => self
+                .api_key
+                .as_ref()
+                .map(|key| vec![("x-api-key".to_string(), key.clone())])
+                .unwrap_or_default(),
         }
+    }
+
+    fn build_http_request(
+        &self,
+        request: &ModelInvocationRequest,
+        stream: bool,
+    ) -> Result<HttpModelRequest, BridgeClientError> {
+        let mut headers = self.request_headers();
+        let (url, body) = match self.protocol {
+            HttpModelBridgeProtocol::ChatCompletions => {
+                let url = self.openai_request_url(OPENAI_CHAT_COMPLETIONS_PATH)?;
+                let mut body = self.build_chat_request_body(request);
+                body["stream"] = json!(stream);
+                (url, body)
+            }
+            HttpModelBridgeProtocol::Responses => {
+                let url = self.openai_request_url(OPENAI_RESPONSES_PATH)?;
+                let mut body = self.build_responses_request_body(request);
+                body["stream"] = json!(stream);
+                (url, body)
+            }
+            HttpModelBridgeProtocol::AnthropicMessages => {
+                let mut adapted = AnthropicMessagesAdapter
+                    .build_request(
+                        &llm_message_params_from_invocation(request, stream),
+                        &self.model,
+                    )
+                    .map_err(|reason| BridgeClientError::CallFailed {
+                        layer: BridgeErrorLayer::Protocol,
+                        code: None,
+                        message: format!("build anthropic request failed: {reason}"),
+                    })?;
+                let url = build_protocol_endpoint_url(&self.base_url, &adapted.url_path).map_err(
+                    |reason| BridgeClientError::CallFailed {
+                        layer: BridgeErrorLayer::Protocol,
+                        code: None,
+                        message: format!("invalid base_url: {reason}"),
+                    },
+                )?;
+                headers.append(&mut adapted.extra_headers);
+                (url, adapted.body)
+            }
+        };
+        Ok(HttpModelRequest { url, body, headers })
+    }
+
+    #[cfg(test)]
+    fn build_request_body(&self, request: &ModelInvocationRequest) -> serde_json::Value {
+        self.build_http_request(request, false)
+            .expect("model request should be buildable in tests")
+            .body
     }
 
     /// Build the JSON body for a chat completions request.
@@ -149,16 +217,6 @@ impl HttpModelBridgeClient {
         }
         body
     }
-
-    /// 构建流式请求体（`stream: true`）。
-    pub(crate) fn build_streaming_request_body(
-        &self,
-        request: &ModelInvocationRequest,
-    ) -> serde_json::Value {
-        let mut body = self.build_request_body(request);
-        body["stream"] = json!(true);
-        body
-    }
 }
 
 /// Execute a blocking HTTP POST on a dedicated thread so we never conflict
@@ -170,7 +228,7 @@ impl HttpModelBridgeClient {
 fn execute_http_post(
     url: String,
     body: serde_json::Value,
-    api_key: Option<String>,
+    headers: Vec<(String, String)>,
 ) -> Result<(u16, String), BridgeClientError> {
     std::thread::spawn(move || {
         let client = reqwest::blocking::Client::builder()
@@ -189,8 +247,8 @@ fn execute_http_post(
             .header("Accept", "application/json")
             .json(&body);
 
-        if let Some(ref key) = api_key {
-            req_builder = req_builder.header("Authorization", format!("Bearer {key}"));
+        for (name, value) in headers {
+            req_builder = req_builder.header(name.as_str(), value.as_str());
         }
 
         let response = req_builder
@@ -236,14 +294,14 @@ enum StreamMessage {
 fn execute_streaming_http_post(
     url: String,
     body: serde_json::Value,
-    api_key: Option<String>,
+    headers: Vec<(String, String)>,
     provider_family: ProviderFamily,
     on_chunk: &dyn Fn(&ModelStreamingDelta),
 ) -> Result<(u16, String), BridgeClientError> {
     let (tx, rx) = std::sync::mpsc::channel::<StreamMessage>();
 
     std::thread::spawn(move || {
-        let result = streaming_http_io(url, body, api_key, provider_family, &tx);
+        let result = streaming_http_io(url, body, headers, provider_family, &tx);
         // 无论成功失败，都通过 Done 发送最终结果
         let _ = tx.send(StreamMessage::Done(result));
     });
@@ -272,7 +330,7 @@ fn execute_streaming_http_post(
 fn streaming_http_io(
     url: String,
     body: serde_json::Value,
-    api_key: Option<String>,
+    headers: Vec<(String, String)>,
     provider_family: ProviderFamily,
     tx: &std::sync::mpsc::Sender<StreamMessage>,
 ) -> Result<(u16, String), BridgeClientError> {
@@ -294,8 +352,8 @@ fn streaming_http_io(
         .header("Accept", "text/event-stream")
         .json(&body);
 
-    if let Some(ref key) = api_key {
-        req_builder = req_builder.header("Authorization", format!("Bearer {key}"));
+    for (name, value) in headers {
+        req_builder = req_builder.header(name.as_str(), value.as_str());
     }
 
     let mut response = req_builder
@@ -491,10 +549,10 @@ impl ModelBridgeClient for HttpModelBridgeClient {
             });
         }
 
-        let url = self.request_url()?;
-        let body = self.build_request_body(&request);
+        let http_request = self.build_http_request(&request, false)?;
 
-        let (status, response_body) = execute_http_post(url, body, self.api_key.clone())?;
+        let (status, response_body) =
+            execute_http_post(http_request.url, http_request.body, http_request.headers)?;
 
         if !(200..300).contains(&status) {
             // Attempt to extract OpenAI-style error details
@@ -538,13 +596,12 @@ impl ModelBridgeClient for HttpModelBridgeClient {
             });
         }
 
-        let url = self.request_url()?;
-        let body = self.build_streaming_request_body(&request);
+        let http_request = self.build_http_request(&request, true)?;
 
         let (status, response_body) = execute_streaming_http_post(
-            url,
-            body,
-            self.api_key.clone(),
+            http_request.url,
+            http_request.body,
+            http_request.headers,
             self.provider_family(),
             on_delta,
         )?;
@@ -621,6 +678,16 @@ impl HttpModelBridgeClient {
                         message: format!("provider response invalid: {reason}"),
                     }
                 })
+            }
+            HttpModelBridgeProtocol::AnthropicMessages => {
+                let adapted = AnthropicMessagesAdapter
+                    .parse_response(200, response_body)
+                    .map_err(|reason| BridgeClientError::CallFailed {
+                        layer: BridgeErrorLayer::RemoteBusiness,
+                        code: Some(-32007),
+                        message: format!("provider response invalid: {reason}"),
+                    })?;
+                Ok(adapted_response_to_bridge_payload(&adapted))
             }
         }
     }
@@ -847,53 +914,179 @@ fn read_non_empty_env(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn build_openai_protocol_url(
-    base_url: &str,
-    protocol: HttpModelBridgeProtocol,
-) -> Result<String, String> {
-    match protocol {
-        HttpModelBridgeProtocol::ChatCompletions => {
-            build_openai_endpoint_url(base_url, OPENAI_CHAT_COMPLETIONS_PATH, "chat/completions")
-        }
-        HttpModelBridgeProtocol::Responses => {
-            build_openai_endpoint_url(base_url, OPENAI_RESPONSES_PATH, "responses")
-        }
-    }
-}
-
 #[cfg(test)]
 fn build_openai_chat_completions_url(base_url: &str) -> Result<String, String> {
-    build_openai_protocol_url(base_url, HttpModelBridgeProtocol::ChatCompletions)
+    build_protocol_endpoint_url(base_url, OPENAI_CHAT_COMPLETIONS_PATH)
 }
 
 #[cfg(test)]
 fn build_openai_responses_url(base_url: &str) -> Result<String, String> {
-    build_openai_protocol_url(base_url, HttpModelBridgeProtocol::Responses)
+    build_protocol_endpoint_url(base_url, OPENAI_RESPONSES_PATH)
 }
 
-fn build_openai_endpoint_url(
-    base_url: &str,
-    endpoint_path: &str,
-    endpoint_leaf: &str,
-) -> Result<String, String> {
+#[cfg(test)]
+fn build_anthropic_messages_url_for_test(base_url: &str) -> Result<String, String> {
+    let request = AnthropicMessagesAdapter
+        .build_request(
+            &LlmMessageParams {
+                messages: vec![LlmMessage {
+                    role: "user".to_string(),
+                    content: LlmMessageContent::Text("ping".to_string()),
+                }],
+                max_tokens: None,
+                temperature: None,
+                tools: None,
+                stream: None,
+                system_prompt: None,
+                tool_choice: None,
+                timeout_ms: None,
+                stream_idle_timeout_ms: None,
+                stream_hard_timeout_ms: None,
+                retry_policy: None,
+            },
+            "claude-test",
+        )
+        .expect("anthropic adapter should build test request");
+    build_protocol_endpoint_url(base_url, &request.url_path)
+}
+
+fn build_protocol_endpoint_url(base_url: &str, endpoint_path: &str) -> Result<String, String> {
     let normalized = base_url.trim().trim_end_matches('/');
+    let endpoint_path = endpoint_path.trim();
+    let endpoint_suffix = endpoint_path
+        .trim_matches('/')
+        .strip_prefix("v1/")
+        .unwrap_or_else(|| endpoint_path.trim_matches('/'))
+        .trim_matches('/');
+    let endpoint_suffix = (!endpoint_suffix.is_empty())
+        .then_some(endpoint_suffix)
+        .ok_or_else(|| "endpoint_path must include an endpoint leaf".to_string())?;
     if normalized.is_empty() {
         return Err("base_url must not be empty".to_string());
     }
     if !normalized.starts_with("http://") && !normalized.starts_with("https://") {
         return Err("base_url must start with http:// or https://".to_string());
     }
-    if normalized.ends_with(endpoint_path) {
-        return Ok(normalized.to_string());
-    }
-    if normalized.ends_with(&format!("/{endpoint_leaf}")) {
+    if normalized.ends_with(endpoint_path) || normalized.ends_with(&format!("/{endpoint_suffix}")) {
         return Ok(normalized.to_string());
     }
     if normalized.ends_with("/v1") {
-        return Ok(format!("{normalized}/{endpoint_leaf}"));
+        return Ok(format!("{normalized}/{endpoint_suffix}"));
     }
 
     Ok(format!("{normalized}{endpoint_path}"))
+}
+
+fn llm_message_params_from_invocation(
+    request: &ModelInvocationRequest,
+    stream: bool,
+) -> LlmMessageParams {
+    let messages = request
+        .messages
+        .as_ref()
+        .map(|messages| messages.iter().map(llm_message_from_chat_message).collect())
+        .unwrap_or_else(|| {
+            vec![LlmMessage {
+                role: "user".to_string(),
+                content: LlmMessageContent::Text(request.prompt.clone()),
+            }]
+        });
+    LlmMessageParams {
+        messages,
+        max_tokens: None,
+        temperature: None,
+        tools: request.tools.as_ref().map(|tools| {
+            tools
+                .iter()
+                .map(tool_definition_from_chat_tool)
+                .collect::<Vec<_>>()
+        }),
+        stream: Some(stream),
+        system_prompt: None,
+        tool_choice: request
+            .tool_choice
+            .as_ref()
+            .map(|choice| ToolChoice::Typed {
+                kind: "tool".to_string(),
+                name: Some(choice.function.name.clone()),
+            }),
+        timeout_ms: None,
+        stream_idle_timeout_ms: None,
+        stream_hard_timeout_ms: None,
+        retry_policy: None,
+    }
+}
+
+fn llm_message_from_chat_message(message: &crate::types::ChatMessage) -> LlmMessage {
+    if let Some(tool_call_id) = message.tool_call_id.as_ref() {
+        return LlmMessage {
+            role: "user".to_string(),
+            content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
+                tool_use_id: tool_call_id.clone(),
+                content: message.content.clone().unwrap_or_default(),
+                is_error: false,
+            }]),
+        };
+    }
+
+    let mut blocks = Vec::new();
+    if let Some(content) = message
+        .content
+        .as_ref()
+        .filter(|content| !content.is_empty())
+    {
+        blocks.push(LlmContentBlock::Text {
+            text: content.clone(),
+        });
+    }
+    for tool_call in &message.tool_calls {
+        let input = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+            .unwrap_or_else(|_| json!({}));
+        blocks.push(LlmContentBlock::ToolUse {
+            id: tool_call.id.clone(),
+            name: tool_call.function.name.clone(),
+            input,
+        });
+    }
+
+    let content = if blocks.is_empty() || (blocks.len() == 1 && message.tool_calls.is_empty()) {
+        LlmMessageContent::Text(message.content.clone().unwrap_or_default())
+    } else {
+        LlmMessageContent::Blocks(blocks)
+    };
+    LlmMessage {
+        role: message.role.clone(),
+        content,
+    }
+}
+
+fn tool_definition_from_chat_tool(tool: &crate::types::ChatToolDefinition) -> ToolDefinition {
+    let parameters = &tool.function.parameters;
+    ToolDefinition {
+        name: tool.function.name.clone(),
+        description: tool.function.description.clone(),
+        input_schema: ToolInputSchema {
+            kind: parameters
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("object")
+                .to_string(),
+            properties: parameters
+                .get("properties")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            required: parameters
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                }),
+        },
+    }
 }
 
 fn select_openai_responses_bridge_payload(envelope: &serde_json::Value) -> Result<String, String> {
@@ -1225,6 +1418,60 @@ mod tests {
     }
 
     #[test]
+    fn build_anthropic_request_body_uses_messages_contract() {
+        let client = HttpModelBridgeClient::new_with_protocol(
+            "https://api.anthropic.com".to_string(),
+            Some("sk-ant-test".to_string()),
+            "claude-sonnet-test".to_string(),
+            HttpModelBridgeProtocol::AnthropicMessages,
+        );
+
+        let body = client.build_request_body(&ModelInvocationRequest {
+            provider: "anthropic".to_string(),
+            prompt: "ignored when messages exist".to_string(),
+            messages: Some(vec![
+                crate::types::ChatMessage {
+                    role: "system".to_string(),
+                    content: Some("系统约束".to_string()),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                },
+                crate::types::ChatMessage {
+                    role: "user".to_string(),
+                    content: Some("你好".to_string()),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                },
+            ]),
+            tools: Some(vec![crate::types::ChatToolDefinition {
+                kind: "function".to_string(),
+                function: crate::types::ChatToolFunctionDefinition {
+                    name: "shell_exec".to_string(),
+                    description: "运行 shell 命令".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "cmd": { "type": "string" }
+                        },
+                        "required": ["cmd"]
+                    }),
+                },
+            }]),
+            tool_choice: Some(crate::types::ChatToolChoice::force_function("shell_exec")),
+        });
+
+        assert_eq!(body["model"], "claude-sonnet-test");
+        assert_eq!(body["system"], "系统约束");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "你好");
+        assert_eq!(body["tools"][0]["name"], "shell_exec");
+        assert_eq!(body["tools"][0]["input_schema"]["required"][0], "cmd");
+        assert_eq!(body["tool_choice"]["type"], "tool");
+        assert_eq!(body["tool_choice"]["name"], "shell_exec");
+        assert_eq!(body["stream"], false);
+    }
+
+    #[test]
     fn adapted_payload_preserves_cached_prompt_tokens() {
         let payload = adapted_response_to_bridge_payload(&AdaptedResponse {
             content: "hello".to_string(),
@@ -1325,6 +1572,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn anthropic_messages_url_builds_correctly() {
+        assert_eq!(
+            build_anthropic_messages_url_for_test("https://api.anthropic.com").unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            build_anthropic_messages_url_for_test("https://api.anthropic.com/v1").unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            build_anthropic_messages_url_for_test("https://api.anthropic.com/v1/messages").unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Integration test with a local mock HTTP server
     // -----------------------------------------------------------------------
@@ -1340,6 +1603,8 @@ mod tests {
         path: String,
         body: String,
         authorization: Option<String>,
+        x_api_key: Option<String>,
+        anthropic_version: Option<String>,
     }
 
     fn spawn_mock_server(status: u16, response_body: serde_json::Value) -> MockHttpServer {
@@ -1369,6 +1634,8 @@ mod tests {
             let mut lines = header_text.split("\r\n");
             let request_line = lines.next().expect("request line should exist").to_string();
             let mut authorization = None;
+            let mut x_api_key = None;
+            let mut anthropic_version = None;
             let mut content_length: usize = 0;
             for line in lines {
                 if line.is_empty() {
@@ -1381,6 +1648,12 @@ mod tests {
                     }
                     if name_lower == "authorization" {
                         authorization = Some(value.trim().to_string());
+                    }
+                    if name_lower == "x-api-key" {
+                        x_api_key = Some(value.trim().to_string());
+                    }
+                    if name_lower == "anthropic-version" {
+                        anthropic_version = Some(value.trim().to_string());
                     }
                 }
             }
@@ -1404,6 +1677,8 @@ mod tests {
                 path,
                 body,
                 authorization,
+                x_api_key,
+                anthropic_version,
             });
 
             let response_text = response_body.to_string();
@@ -1591,6 +1866,71 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&recorded.body).expect("body should be json");
         assert_eq!(body["input"][0]["content"], "hello");
+        assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn invoke_against_mock_server_uses_anthropic_messages_protocol_when_configured() {
+        let server = spawn_mock_server(
+            200,
+            serde_json::json!({
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "text",
+                    "text": "anthropic reply"
+                }],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 9,
+                    "output_tokens": 5,
+                    "cache_read_input_tokens": 2
+                }
+            }),
+        );
+
+        let client = HttpModelBridgeClient::new_with_protocol(
+            server.address.clone(),
+            Some("sk-ant-test".to_string()),
+            "claude-sonnet-test".to_string(),
+            HttpModelBridgeProtocol::AnthropicMessages,
+        );
+
+        let response = client
+            .invoke(ModelInvocationRequest {
+                provider: "anthropic".to_string(),
+                prompt: "hello".to_string(),
+                messages: None,
+                tools: None,
+                tool_choice: None,
+            })
+            .expect("invoke should succeed");
+
+        assert!(response.ok);
+        let payload: serde_json::Value =
+            serde_json::from_str(&response.payload).expect("payload should be json");
+        assert_eq!(payload["content"], "anthropic reply");
+        assert_eq!(payload["finish_reason"], "end_turn");
+        assert_eq!(payload["usage"]["prompt_tokens"], 9);
+        assert_eq!(payload["usage"]["completion_tokens"], 5);
+        assert!(payload["usage"]["prompt_tokens_details"].is_null());
+
+        let recorded = server
+            .request_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mock server should receive request");
+        assert_eq!(recorded.method, "POST");
+        assert_eq!(recorded.path, "/v1/messages");
+        assert_eq!(recorded.authorization, None);
+        assert_eq!(recorded.x_api_key.as_deref(), Some("sk-ant-test"));
+        assert_eq!(recorded.anthropic_version.as_deref(), Some("2023-06-01"));
+
+        let body: serde_json::Value =
+            serde_json::from_str(&recorded.body).expect("body should be json");
+        assert_eq!(body["model"], "claude-sonnet-test");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "hello");
         assert_eq!(body["stream"], false);
     }
 
