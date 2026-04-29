@@ -348,6 +348,13 @@ impl RunnerManager {
                                 bg_handle.status.lock().expect("status lock should hold");
                             *status = "blocked".to_string();
                             bg_active.store(false, Ordering::Relaxed);
+                            if let Some(observer) = terminal_observer.as_ref() {
+                                observer(
+                                    root_id.clone(),
+                                    observer_session_id.clone(),
+                                    "blocked".to_string(),
+                                );
+                            }
                             break;
                         }
                         let backoff_ms = 200u64.saturating_mul(blocked_streak as u64).min(2_000);
@@ -365,6 +372,13 @@ impl RunnerManager {
                             .expect("last_error lock should hold");
                         *last_error = Some(err);
                         bg_active.store(false, Ordering::Relaxed);
+                        if let Some(observer) = terminal_observer.as_ref() {
+                            observer(
+                                root_id.clone(),
+                                observer_session_id.clone(),
+                                "error".to_string(),
+                            );
+                        }
                         break;
                     }
                 }

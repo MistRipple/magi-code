@@ -9,7 +9,9 @@ use crate::{
     prompt_utils::prepend_session_instructions,
     session_turn_execution::{SessionTurnExecutionRuntime, run_session_turn_execution},
     session_turn_writeback::{
-        build_completed_turn_timeline_snapshot, publish_current_session_turn_item_event,
+        append_session_turn_item_with_task_store, build_completed_turn_timeline_snapshot,
+        publish_current_session_turn_item_event, publish_session_turn_item_event,
+        session_turn_item,
     },
     settings_store::SettingsStore,
     shadow_execution::{
@@ -193,6 +195,94 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     true
 }
 
+pub fn finalize_background_session_task_turn_if_root_terminal(
+    state: &ApiState,
+    session_id: &SessionId,
+    root_task_id: &TaskId,
+    runner_status: &str,
+) -> bool {
+    if finalize_background_session_task_turn_if_root_completed(state, session_id, root_task_id) {
+        return true;
+    }
+
+    let Some(task_store) = state.task_store() else {
+        return false;
+    };
+    let Some(root_task) = task_store.get_task(root_task_id) else {
+        return false;
+    };
+    let (turn_status, message) = match root_task.status {
+        TaskStatus::Failed => ("failed", "任务执行失败，未生成最终回复。"),
+        TaskStatus::Blocked => ("blocked", "任务执行已阻塞，等待进一步处理。"),
+        _ if runner_status == "error" => ("failed", "任务执行异常，未生成最终回复。"),
+        _ if runner_status == "blocked" => ("blocked", "任务执行已阻塞，等待进一步处理。"),
+        _ => return false,
+    };
+
+    let Some(sidecar) = state.session_store.runtime_sidecar(session_id) else {
+        return false;
+    };
+    let Some(active_chain) = sidecar.active_execution_chain.as_ref() else {
+        return false;
+    };
+    if active_chain.root_task_id != *root_task_id {
+        return false;
+    }
+    let workspace_id = active_chain.workspace_id.clone();
+    if sidecar.current_turn.as_ref().is_some_and(|turn| {
+        turn.status == turn_status
+            && turn
+                .items
+                .iter()
+                .any(|item| item.kind == "assistant_error" && item.thread_visible)
+    }) {
+        return true;
+    }
+
+    if state
+        .session_store
+        .update_current_turn_status(session_id, turn_status)
+        .is_err()
+    {
+        return false;
+    }
+
+    let item_id = format!("turn-item-assistant-error-{}", UtcMillis::now().0);
+    let mut error_item = session_turn_item(
+        "assistant_error",
+        turn_status,
+        Some("任务执行未完成".to_string()),
+        Some(message.to_string()),
+        Some(item_id.clone()),
+    );
+    error_item.task_id = Some(root_task_id.clone());
+    if let Some(published) = append_session_turn_item_with_task_store(
+        state.session_store.as_ref(),
+        session_id,
+        error_item,
+        Some(task_store),
+    ) {
+        publish_session_turn_item_event(&state.event_bus, session_id, &workspace_id, &published);
+    }
+
+    let entry_id = format!("timeline-turn-snapshot-error-{}", root_task_id);
+    let timeline_message = build_completed_turn_timeline_snapshot(
+        state.session_store.as_ref(),
+        session_id,
+        Some(message),
+        Some(&entry_id),
+        Some(task_store),
+    )
+    .unwrap_or_else(|| message.to_string());
+    state.session_store.upsert_timeline_entry(
+        session_id.clone(),
+        &entry_id,
+        TimelineEntryKind::AssistantMessage,
+        timeline_message,
+    );
+    true
+}
+
 #[derive(Clone, Default)]
 pub struct ShadowTaskExecutionRegistry {
     plans: Arc<RwLock<HashMap<TaskId, ShadowTaskExecutionPlan>>>,
@@ -229,7 +319,7 @@ pub struct ShadowTaskDispatcher {
     tool_registry: Option<ToolRegistry>,
     skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     /// 强制同步执行 dispatch，用于普通模式的同步 for 循环（设计 §1.3）。
-    force_sync_dispatch: Arc<std::sync::atomic::AtomicBool>,
+    force_sync_dispatch: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub fn resolve_configured_model_client(
@@ -267,13 +357,21 @@ impl ShadowTaskDispatcher {
             context_runtime: None,
             tool_registry: None,
             skill_runtime: None,
-            force_sync_dispatch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            force_sync_dispatch: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
     pub fn set_force_sync_dispatch(&self, force: bool) {
-        self.force_sync_dispatch
-            .store(force, std::sync::atomic::Ordering::Relaxed);
+        if force {
+            self.force_sync_dispatch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        let _ = self.force_sync_dispatch.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |current| Some(current.saturating_sub(1)),
+        );
     }
 
     pub fn with_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
@@ -977,6 +1075,13 @@ fn title_from_learning_content(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magi_core::{MissionId, Task, TaskKind};
+    use magi_governance::GovernanceService;
+    use magi_orchestrator::task_store::TaskStore;
+    use magi_session_store::{
+        ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
+    };
+    use magi_workspace::WorkspaceStore;
 
     fn learning_record(id: &str, workspace_id: Option<&str>, content: &str) -> KnowledgeRecord {
         KnowledgeRecord {
@@ -1019,6 +1124,128 @@ mod tests {
             content,
         ));
     }
+
+    #[test]
+    fn failed_background_finalizer_does_not_duplicate_existing_error_item() {
+        let event_bus = Arc::new(InMemoryEventBus::new(16));
+        let session_store = Arc::new(SessionStore::new());
+        let task_store = Arc::new(TaskStore::new());
+        let session_id = SessionId::new("session-background-finalizer-idempotent");
+        let mission_id = MissionId::new("mission-background-finalizer-idempotent");
+        let root_task_id = TaskId::new("task-background-finalizer-idempotent");
+        let now = UtcMillis::now();
+
+        session_store
+            .create_session(session_id.clone(), "background finalizer idempotent")
+            .expect("session should be creatable");
+        session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-background-finalizer-idempotent".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: Vec::new(),
+                    active_worker_bindings: Vec::new(),
+                    branches: Vec::new(),
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "timeline-background-finalizer-idempotent".to_string(),
+                        trimmed_text: Some("执行后台任务".to_string()),
+                        deep_task: true,
+                        skill_name: None,
+                    },
+                    current_turn: None,
+                },
+            )
+            .expect("active chain should be stored");
+        let mut error_item = session_turn_item(
+            "assistant_error",
+            "failed",
+            Some("回复生成失败".to_string()),
+            Some("model bridge unavailable".to_string()),
+            Some("turn-item-existing-error".to_string()),
+        );
+        error_item.task_id = Some(root_task_id.clone());
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-background-finalizer-idempotent".to_string(),
+                    turn_seq: 1,
+                    accepted_at: now,
+                    completed_at: Some(UtcMillis(now.0 + 42)),
+                    status: "failed".to_string(),
+                    user_message: Some("执行后台任务".to_string()),
+                    items: vec![error_item],
+                    worker_lanes: Vec::new(),
+                },
+            )
+            .expect("failed current turn should be stored");
+        task_store.insert_task(Task {
+            task_id: root_task_id.clone(),
+            mission_id,
+            root_task_id: root_task_id.clone(),
+            parent_task_id: None,
+            kind: TaskKind::Objective,
+            title: "后台任务".to_string(),
+            goal: "验证终态观察幂等".to_string(),
+            status: TaskStatus::Failed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: now,
+            updated_at: now,
+        });
+        let state = ApiState::new(
+            "test",
+            Arc::clone(&event_bus),
+            Arc::clone(&session_store),
+            Arc::new(WorkspaceStore::new()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_task_store(Arc::clone(&task_store));
+
+        assert!(finalize_background_session_task_turn_if_root_terminal(
+            &state,
+            &session_id,
+            &root_task_id,
+            "error",
+        ));
+
+        let turn = session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("failed turn should remain inspectable");
+        let error_items = turn
+            .items
+            .iter()
+            .filter(|item| item.kind == "assistant_error")
+            .collect::<Vec<_>>();
+        assert_eq!(error_items.len(), 1);
+        assert_eq!(
+            error_items[0].content.as_deref(),
+            Some("model bridge unavailable")
+        );
+        assert!(
+            event_bus.snapshot().recent_events.is_empty(),
+            "已有具体错误时 finalizer 不应再发布泛化失败卡"
+        );
+    }
 }
 
 impl TaskDispatcher for ShadowTaskDispatcher {
@@ -1031,7 +1258,8 @@ impl TaskDispatcher for ShadowTaskDispatcher {
         // 普通模式的同步 for 循环要求 dispatch 同步完成，直接走 inner。
         if self
             .force_sync_dispatch
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
         {
             return self.dispatch_inner(task, worker, lease);
         }

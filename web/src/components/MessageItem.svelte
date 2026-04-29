@@ -258,7 +258,10 @@
 
   function formatDurationMs(durationMs: number): string {
     const normalizedMs = Math.max(0, durationMs);
-    return formatDuration(Math.max(1000, normalizedMs));
+    if (normalizedMs > 0 && normalizedMs < 1000) {
+      return '<1s';
+    }
+    return formatDuration(normalizedMs);
   }
 
   // 获取 worker 信息（如果有）

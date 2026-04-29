@@ -1849,7 +1849,8 @@ function resolveCanonicalAssistantResponseKey(artifact: TimelineProjectionArtifa
 function projectionArtifactDedupKey(artifact: TimelineProjectionArtifact): string {
   const toolCallId = resolveProjectionArtifactToolCallId(artifact);
   if (toolCallId) {
-    return `tool:${toolCallId}`;
+    const turnId = normalizeString(resolveProjectionArtifactMetadata(artifact)?.turnId);
+    return turnId ? `tool:${turnId}:${toolCallId}` : `tool:${toolCallId}`;
   }
   const assistantResponseKey = resolveCanonicalAssistantResponseKey(artifact);
   if (assistantResponseKey) {
@@ -1926,7 +1927,7 @@ function collectProjectionArtifactIdentityIds(
   for (const artifact of artifacts) {
     add(artifact.artifactId);
     add(artifact.message?.id);
-    add(resolveProjectionArtifactToolCallId(artifact));
+    add(projectionArtifactDedupKey(artifact));
     for (const messageId of artifact.messageIds || []) add(messageId);
     for (const item of artifact.executionItems || []) {
       add(item.itemId);
@@ -1952,7 +1953,7 @@ function projectionArtifactHasKnownIdentity(
   if (matches(artifact.artifactId) || matches(artifact.message?.id)) {
     return true;
   }
-  if (matches(resolveProjectionArtifactToolCallId(artifact))) {
+  if (matches(projectionArtifactDedupKey(artifact))) {
     return true;
   }
   if ((artifact.messageIds || []).some(matches)) {
@@ -1987,6 +1988,27 @@ function filterArtifactsCoveredByCanonicalTurnArtifacts(
       return true;
     }
     return !projectionArtifactHasKnownIdentity(artifact, knownIds);
+  });
+}
+
+function filterUnscopedToolArtifactsCoveredByCanonical(
+  artifacts: TimelineProjectionArtifact[],
+): TimelineProjectionArtifact[] {
+  const canonicalToolCallIds = new Set(
+    artifacts
+      .filter(isCanonicalTurnArtifact)
+      .map((artifact) => resolveProjectionArtifactToolCallId(artifact))
+      .filter((toolCallId) => toolCallId.length > 0),
+  );
+  if (canonicalToolCallIds.size === 0) {
+    return artifacts;
+  }
+  return artifacts.filter((artifact) => {
+    if (isCanonicalTurnArtifact(artifact) || artifact.kind !== 'tool') {
+      return true;
+    }
+    const toolCallId = resolveProjectionArtifactToolCallId(artifact);
+    return !(toolCallId && canonicalToolCallIds.has(toolCallId));
   });
 }
 
@@ -2373,10 +2395,15 @@ function buildTurnArtifactsFromSummary(
     }
     if (kind === 'tool_call_started' || kind === 'tool_call_result') {
       if (toolCallId) {
+        messageIdAliases.delete(itemId);
+        messageIdAliases.delete(`rust-timeline:${itemId}`);
+        if (orderItemId) {
+          messageIdAliases.delete(orderItemId);
+          messageIdAliases.delete(`rust-timeline:${orderItemId}`);
+          messageIdAliases.add(`turn:${turnId}:${orderItemId}`);
+        }
         messageIdAliases.add(`turn:${turnId}:${toolCallId}`);
         messageIdAliases.add(`turn:${turnId}:${itemId}`);
-        messageIdAliases.add(`rust-timeline:turn-item-tool-result-${toolCallId}`);
-        messageIdAliases.add(`rust-timeline:turn-item-tool-started-${toolCallId}`);
       }
     }
     if (workerDispatchGroup) {
@@ -2451,6 +2478,7 @@ function isTerminalTurnStatus(status: string | null | undefined): boolean {
     || normalized === 'success'
     || normalized === 'failed'
     || normalized === 'error'
+    || normalized === 'blocked'
     || normalized === 'cancelled'
     || normalized === 'canceled';
 }
@@ -2733,13 +2761,13 @@ function buildTimelineProjection(
     generatedAt,
     visibleTimelineArtifacts.length + eventArtifacts.length + toolArtifacts.length,
   );
-  const artifacts = mergeProjectionArtifacts([
+  const artifacts = filterUnscopedToolArtifactsCoveredByCanonical(mergeProjectionArtifacts([
     visibleTimelineArtifacts,
     eventArtifacts,
     toolArtifacts,
     dispatchArtifacts,
     currentTurnArtifacts,
-  ]);
+  ]));
   const maxEventSeq = recentEvents.reduce((max, event) => Math.max(max, normalizeNumber(event.sequence, 0)), 0);
   const maxArtifactSeq = artifacts.reduce((max, artifact) => {
     const itemSeq = (artifact.executionItems || []).reduce(

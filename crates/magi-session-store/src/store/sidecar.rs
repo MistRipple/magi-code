@@ -1043,7 +1043,10 @@ impl SessionStore {
             };
             turn.status = status.into();
             if turn.completed_at.is_none()
-                && matches!(turn.status.as_str(), "completed" | "failed" | "cancelled")
+                && matches!(
+                    turn.status.as_str(),
+                    "completed" | "failed" | "blocked" | "error" | "cancelled"
+                )
             {
                 turn.completed_at = Some(UtcMillis::now());
             }

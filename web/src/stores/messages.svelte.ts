@@ -3233,6 +3233,11 @@ export function sealAllStreamingMessages() {
   // 处理单条消息：返回 null 表示应移除，返回新对象表示应更新
   const sealMessage = (m: Message): Message | null => {
     if (!m.isStreaming) return m; // 无需处理
+    const hasVisibleContent = (typeof m.content === 'string' && m.content.trim().length > 0)
+      || (Array.isArray(m.blocks) && m.blocks.length > 0);
+    if (m.metadata?.isPlaceholder === true && !hasVisibleContent) {
+      return null;
+    }
 
     return {
       ...m,

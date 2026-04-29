@@ -595,16 +595,14 @@ impl ShadowDaemonRuntime {
         )
         .with_checkpoint_path(task_store_checkpoint_path)
         .with_terminal_observer(move |root_task_id, session_id, status| {
-            if status != "completed" {
-                return;
-            }
             let Some(session_id) = session_id else {
                 return;
             };
-            if magi_api::task_execution::finalize_background_session_task_turn_if_root_completed(
+            if magi_api::task_execution::finalize_background_session_task_turn_if_root_terminal(
                 &state_for_runner_terminal,
                 &session_id,
                 &root_task_id,
+                &status,
             ) {
                 let _ = state_for_runner_terminal.persist_session_durable_state();
             }

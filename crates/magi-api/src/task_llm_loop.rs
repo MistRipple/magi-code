@@ -2,8 +2,8 @@ use crate::{
     prompt_utils::{normalize_model_stream_preview_content, normalize_model_visible_content},
     session_turn_writeback::{
         append_session_turn_item_with_task_store, build_completed_turn_timeline_snapshot,
-        publish_session_turn_item_event, session_turn_item,
-        upsert_session_turn_item_with_task_store,
+        publish_current_session_turn_item_event, publish_session_turn_item_event,
+        session_turn_item, upsert_session_turn_item_with_task_store,
     },
     settings_store::SettingsStore,
     skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime},
@@ -230,6 +230,21 @@ pub(crate) fn run_task_llm_loop(
                 Ok(response) => response,
                 Err(error) => {
                     tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM streaming invocation failed");
+                    if should_record_turn_artifacts
+                        && task_lease_is_current(task_store, task_id, lease_id)
+                    {
+                        append_task_error_turn_item(
+                            event_bus,
+                            session_store,
+                            task_store,
+                            task,
+                            session_id,
+                            workspace_id,
+                            &turn_visibility,
+                            &format!("LLM invocation failed (round {round}): {error:?}"),
+                            streaming_entry_id.or(last_stream_item_id.as_deref()),
+                        );
+                    }
                     return (
                         TaskOutcome::Failed {
                             error: format!("LLM invocation failed (round {round}): {error:?}"),
@@ -243,6 +258,21 @@ pub(crate) fn run_task_llm_loop(
                 Ok(response) => response,
                 Err(error) => {
                     tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM invocation failed");
+                    if should_record_turn_artifacts
+                        && task_lease_is_current(task_store, task_id, lease_id)
+                    {
+                        append_task_error_turn_item(
+                            event_bus,
+                            session_store,
+                            task_store,
+                            task,
+                            session_id,
+                            workspace_id,
+                            &turn_visibility,
+                            &format!("LLM invocation failed (round {round}): {error:?}"),
+                            streaming_entry_id.or(last_stream_item_id.as_deref()),
+                        );
+                    }
                     return (
                         TaskOutcome::Failed {
                             error: format!("LLM invocation failed (round {round}): {error:?}"),
@@ -335,6 +365,7 @@ pub(crate) fn run_task_llm_loop(
             task,
             session_id,
             workspace_id,
+            turn_visibility.worker_id.as_ref(),
             &parsed.tool_calls,
         );
 
@@ -656,6 +687,7 @@ fn execute_task_tool_call_batch(
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
+    worker_id: Option<&magi_core::WorkerId>,
     tool_calls: &[ChatToolCall],
 ) -> Vec<(String, ExecutionResultStatus)> {
     let parsed_arguments = tool_calls
@@ -685,6 +717,7 @@ fn execute_task_tool_call_batch(
                         task,
                         session_id,
                         workspace_id,
+                        worker_id,
                         &tool_calls[tool_index],
                     ));
                 }
@@ -707,6 +740,7 @@ fn execute_task_tool_call_batch(
                                         task,
                                         session_id,
                                         workspace_id,
+                                        worker_id,
                                         tool_call,
                                     )
                                 }),
@@ -759,6 +793,7 @@ fn execute_task_tool_call(
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
+    worker_id: Option<&magi_core::WorkerId>,
     tool_call: &ChatToolCall,
 ) -> (String, ExecutionResultStatus) {
     let Some(registry) = tool_registry else {
@@ -777,6 +812,7 @@ fn execute_task_tool_call(
                 "mission_id": task.mission_id.to_string(),
                 "session_id": session_id.to_string(),
                 "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+                "worker_id": worker_id.map(ToString::to_string),
                 "tool_name": tool_call.function.name,
                 "tool_call_id": tool_call.id,
             }),
@@ -804,7 +840,7 @@ fn execute_task_tool_call(
             risk_level: RiskLevel::Low,
         },
         ToolExecutionContext {
-            worker_id: None,
+            worker_id: worker_id.cloned(),
             task_id: Some(task.task_id.clone()),
             session_id: Some(session_id.clone()),
             workspace_id: workspace_id.clone(),
@@ -850,6 +886,7 @@ fn append_task_final_turn_item(
         streaming_entry_id.map(str::to_string),
     );
     apply_task_turn_visibility(&mut final_item, task, turn_visibility);
+    let final_item_id = final_item.item_id.clone();
     if streaming_entry_id.is_some() {
         if let Some(published) = upsert_session_turn_item_with_task_store(
             session_store,
@@ -872,6 +909,14 @@ fn append_task_final_turn_item(
         .is_some_and(|root_task| root_task.status == TaskStatus::Completed);
     if turn_visibility.thread_visible && root_task_completed {
         let _ = session_store.update_current_turn_status(session_id, "completed");
+        publish_current_session_turn_item_event(
+            event_bus,
+            session_store,
+            session_id,
+            workspace_id,
+            &final_item_id,
+            Some(task_store),
+        );
         let timeline_message = build_completed_turn_timeline_snapshot(
             session_store,
             session_id,
@@ -910,6 +955,7 @@ fn append_task_error_turn_item(
         Some(format!("turn-item-assistant-error-{}", UtcMillis::now().0)),
     );
     apply_task_turn_visibility(&mut error_item, task, turn_visibility);
+    let error_item_id = error_item.item_id.clone();
     if let Some(published) = append_session_turn_item_with_task_store(
         session_store,
         session_id,
@@ -920,6 +966,14 @@ fn append_task_error_turn_item(
     }
     if turn_visibility.thread_visible {
         let _ = session_store.update_current_turn_status(session_id, "failed");
+        publish_current_session_turn_item_event(
+            event_bus,
+            session_store,
+            session_id,
+            workspace_id,
+            &error_item_id,
+            Some(task_store),
+        );
         let timeline_message = build_completed_turn_timeline_snapshot(
             session_store,
             session_id,
@@ -985,7 +1039,7 @@ fn task_is_thread_visible_turn_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_bridge_client::{BridgeClientError, BridgeResponse};
+    use magi_bridge_client::{BridgeClientError, BridgeErrorLayer, BridgeResponse};
     use magi_core::{MissionId, Task, TaskKind, TaskStatus, WorkerId};
     use magi_governance::GovernanceService;
     use magi_session_store::{ActiveExecutionTurn, ActiveExecutionTurnLane, TimelineEntryKind};
@@ -1001,6 +1055,8 @@ mod tests {
     struct TaskToolBatchModelBridgeClient {
         invoke_count: AtomicUsize,
     }
+
+    struct FailingTaskModelBridgeClient;
 
     impl ModelBridgeClient for TaskToolBatchModelBridgeClient {
         fn invoke(
@@ -1058,6 +1114,27 @@ mod tests {
             Ok(BridgeResponse {
                 ok: true,
                 payload: payload.to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for FailingTaskModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::RemoteBusiness,
+                code: Some(-32099),
+                message: "model bridge unavailable".to_string(),
             })
         }
 
@@ -1299,6 +1376,140 @@ mod tests {
     }
 
     #[test]
+    fn task_llm_loop_model_failure_writes_failed_turn_item_and_snapshot() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(64);
+        let session_id = SessionId::new("session-task-model-failure");
+        let workspace_id = Some(WorkspaceId::new("workspace-task-model-failure"));
+        let task_id = TaskId::new("task-model-failure");
+        let worker_id = WorkerId::new("worker-task-model-failure");
+        let streaming_entry_id = "timeline-streaming-task-model-failure";
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "task model failure session",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-task-model-failure".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("验证模型失败写回".to_string()),
+                    items: Vec::new(),
+                    worker_lanes: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("turn should be creatable");
+
+        let task_store = TaskStore::new();
+        let task = make_task_loop_test_task(task_id.as_str());
+        task_store.insert_task(task.clone());
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "integration-dev",
+                60_000,
+            )
+            .expect("lease should be granted");
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+
+        let (outcome, _) = run_task_llm_loop(TaskLlmLoopRequest {
+            client: &FailingTaskModelBridgeClient,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            tool_registry: None,
+            skill_runtime: None,
+            task_store: &task_store,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: "请生成回复".to_string(),
+            tools: None,
+            usage_binding: &usage_binding,
+            streaming_entry_id: Some(streaming_entry_id),
+            worker_lane_id: None,
+            worker_lane_seq: None,
+            worker_id: None,
+            context_summary: None,
+            system_prompt: None,
+        });
+
+        match outcome {
+            TaskOutcome::Failed { error } => {
+                assert!(error.contains("model bridge unavailable"));
+            }
+            other => panic!("model failure must fail the task loop, got {other:?}"),
+        }
+
+        let turn = session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("failed turn should remain inspectable");
+        assert_eq!(turn.status, "failed");
+        assert!(turn.completed_at.is_some());
+        let error_item = turn
+            .items
+            .iter()
+            .find(|item| item.kind == "assistant_error")
+            .expect("assistant_error should be appended");
+        assert!(error_item.thread_visible);
+        assert_eq!(error_item.status, "failed");
+        assert_eq!(error_item.task_id.as_ref(), Some(&task_id));
+        assert!(
+            error_item
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("model bridge unavailable"))
+        );
+
+        let timeline = session_store.timeline_for_session(&session_id);
+        let failure_snapshot = timeline
+            .iter()
+            .find(|entry| entry.entry_id == streaming_entry_id)
+            .expect("failed turn snapshot should reuse streaming entry id");
+        assert!(matches!(
+            failure_snapshot.kind,
+            TimelineEntryKind::AssistantMessage
+        ));
+        assert!(failure_snapshot.message.contains("assistant_error"));
+        assert!(
+            failure_snapshot
+                .message
+                .contains("model bridge unavailable")
+        );
+
+        let terminal_error_event = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event.event_type == "session.turn.item"
+                    && event.payload["item"]["kind"] == "assistant_error"
+            })
+            .expect("assistant_error item event should be published");
+        assert_eq!(
+            terminal_error_event.payload["current_turn"]["status"],
+            serde_json::Value::String("failed".to_string())
+        );
+        assert!(
+            terminal_error_event.payload["current_turn"]["response_duration_ms"].is_number(),
+            "terminal error event must carry backend duration for live UI"
+        );
+    }
+
+    #[test]
     fn task_llm_loop_read_only_shell_tools_execute_concurrently_and_preserve_order() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(64);
@@ -1352,9 +1563,10 @@ mod tests {
             .expect("lease should be granted");
 
         let probe = Arc::new(ConcurrentTaskToolProbe::new(Duration::from_millis(180)));
+        let tool_event_bus = Arc::new(InMemoryEventBus::new(8));
         let mut tool_registry = ToolRegistry::new(
             Arc::new(GovernanceService::default()),
-            Arc::new(InMemoryEventBus::new(8)),
+            Arc::clone(&tool_event_bus),
         );
         tool_registry.register_builtin(Arc::new(ProbeTaskBuiltinTool::new(
             "shell_exec",
@@ -1436,6 +1648,28 @@ mod tests {
                 ("tool_call_result", Some("task-tool-shell-a")),
                 ("tool_call_result", Some("task-tool-shell-b")),
             ]
+        );
+        let tool_events = event_bus.snapshot().recent_events;
+        let invoked_events = tool_events
+            .iter()
+            .filter(|event| event.event_type == "task.tool.invoked")
+            .collect::<Vec<_>>();
+        assert_eq!(invoked_events.len(), 2);
+        assert!(
+            invoked_events.iter().all(|event| event.payload["worker_id"]
+                == serde_json::Value::String(worker_id.to_string())),
+            "worker 工具事件必须携带执行 worker，供 worker tab 和 runtime 归属使用"
+        );
+        let runtime_tool_events = tool_event_bus.snapshot().recent_events;
+        assert!(
+            runtime_tool_events
+                .iter()
+                .filter(|event| {
+                    event.event_type == "tool.invoked" || event.event_type == "tool.usage.recorded"
+                })
+                .all(|event| event.payload["worker_id"]
+                    == serde_json::Value::String(worker_id.to_string())),
+            "工具运行时事件也必须沿用同一个 worker 归属"
         );
     }
 }
