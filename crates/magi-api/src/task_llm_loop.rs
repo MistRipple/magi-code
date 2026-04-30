@@ -221,6 +221,7 @@ pub(crate) fn run_task_llm_loop(
                     session_id,
                     workspace_id,
                     &stream_item_id,
+                    (round == 0).then_some(stream_item_id.as_str()),
                     &turn_visibility,
                     &delta.content,
                 );
@@ -371,7 +372,7 @@ pub(crate) fn run_task_llm_loop(
 
         for (tool_call, (result, tool_status)) in parsed.tool_calls.iter().zip(tool_results) {
             if should_record_turn_artifacts {
-                append_task_tool_call_result_turn_item(
+                upsert_task_tool_call_result_turn_item(
                     event_bus,
                     session_store,
                     task_store,
@@ -460,7 +461,8 @@ pub(crate) fn run_task_llm_loop(
             session_id,
             workspace_id,
             &final_content,
-            streaming_entry_id.or(last_stream_item_id.as_deref()),
+            last_stream_item_id.as_deref().or(streaming_entry_id),
+            streaming_entry_id,
             &turn_visibility,
         );
     }
@@ -518,7 +520,8 @@ fn publish_stream_delta(
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
-    entry_id: &str,
+    item_id: &str,
+    timeline_entry_id: Option<&str>,
     turn_visibility: &TaskTurnVisibility,
     accumulated_text: &str,
 ) {
@@ -526,10 +529,10 @@ fn publish_stream_delta(
     if visible_text.trim().is_empty() {
         return;
     }
-    if turn_visibility.thread_visible {
+    if let Some(timeline_entry_id) = timeline_entry_id.filter(|_| turn_visibility.thread_visible) {
         session_store.upsert_timeline_entry(
             session_id.clone(),
-            entry_id,
+            timeline_entry_id,
             TimelineEntryKind::AssistantMessage,
             &visible_text,
         );
@@ -539,7 +542,7 @@ fn publish_stream_delta(
         "running",
         Some("生成回复".to_string()),
         Some(visible_text),
-        Some(entry_id.to_string()),
+        Some(item_id.to_string()),
     );
     apply_task_turn_visibility(&mut item, task, turn_visibility);
     if let Some(published) =
@@ -631,20 +634,21 @@ fn append_task_tool_call_started_turn_item(
         "running",
         Some(tool_call.function.name.clone()),
         Some(format!("正在调用工具：{}", tool_call.function.name)),
-        Some(format!("turn-item-tool-started-{}", tool_call.id)),
+        Some(format!("turn-item-tool-{}", tool_call.id)),
     );
     apply_task_turn_visibility(&mut item, task, turn_visibility);
     item.tool_call_id = Some(tool_call.id.clone());
     item.tool_name = Some(tool_call.function.name.clone());
+    item.tool_status = Some("running".to_string());
     item.tool_arguments = Some(tool_call.function.arguments.clone());
     if let Some(published) =
-        append_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
+        upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
     {
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
 }
 
-fn append_task_tool_call_result_turn_item(
+fn upsert_task_tool_call_result_turn_item(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
     task_store: &TaskStore,
@@ -662,7 +666,7 @@ fn append_task_tool_call_result_turn_item(
         turn_item_status_for_tool_result(tool_status),
         Some(tool_call.function.name.clone()),
         Some(summarize_tool_result(tool_result)),
-        Some(format!("turn-item-tool-result-{}", tool_call.id)),
+        Some(format!("turn-item-tool-{}", tool_call.id)),
     );
     apply_task_turn_visibility(&mut item, task, turn_visibility);
     item.tool_call_id = Some(tool_call.id.clone());
@@ -674,7 +678,7 @@ fn append_task_tool_call_result_turn_item(
         item.tool_error = Some(tool_result.to_string());
     }
     if let Some(published) =
-        append_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
+        upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
     {
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
@@ -875,19 +879,24 @@ fn append_task_final_turn_item(
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     final_content: &str,
-    streaming_entry_id: Option<&str>,
+    final_item_id: Option<&str>,
+    timeline_entry_id: Option<&str>,
     turn_visibility: &TaskTurnVisibility,
 ) {
+    let has_requested_final_item_id = final_item_id.is_some();
     let mut final_item = session_turn_item(
         "assistant_final",
         "completed",
         Some("最终回复".to_string()),
         Some(final_content.to_string()),
-        streaming_entry_id.map(str::to_string),
+        final_item_id.map(str::to_string),
     );
     apply_task_turn_visibility(&mut final_item, task, turn_visibility);
+    if let Some(timeline_entry_id) = timeline_entry_id {
+        final_item.timeline_entry_id = Some(timeline_entry_id.to_string());
+    }
     let final_item_id = final_item.item_id.clone();
-    if streaming_entry_id.is_some() {
+    if has_requested_final_item_id {
         if let Some(published) = upsert_session_turn_item_with_task_store(
             session_store,
             session_id,
@@ -917,16 +926,18 @@ fn append_task_final_turn_item(
             &final_item_id,
             Some(task_store),
         );
+        let snapshot_entry_id =
+            timeline_entry_id.or(has_requested_final_item_id.then_some(final_item_id.as_str()));
         let timeline_message = build_completed_turn_timeline_snapshot(
             session_store,
             session_id,
             Some(final_content),
-            streaming_entry_id,
+            snapshot_entry_id,
             Some(task_store),
         )
         .unwrap_or_else(|| final_content.to_string());
         let fallback_entry_id = format!("timeline-turn-snapshot-{}", task.task_id);
-        let entry_id = streaming_entry_id.unwrap_or(fallback_entry_id.as_str());
+        let entry_id = snapshot_entry_id.unwrap_or(fallback_entry_id.as_str());
         session_store.upsert_timeline_entry(
             session_id.clone(),
             entry_id,
@@ -1014,9 +1025,12 @@ fn task_lease_is_current(task_store: &TaskStore, task_id: &TaskId, lease_id: &Le
 }
 
 fn task_stream_item_id(task_id: &TaskId, round: usize, streaming_entry_id: Option<&str>) -> String {
-    streaming_entry_id
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("turn-item-assistant-stream-{task_id}-{round}"))
+    if round == 0 {
+        return streaming_entry_id
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("turn-item-assistant-stream-{task_id}-{round}"));
+    }
+    format!("turn-item-assistant-stream-{task_id}-{round}")
 }
 
 fn task_is_thread_visible_turn_owner(
@@ -1120,8 +1134,14 @@ mod tests {
         fn invoke_streaming(
             &self,
             request: ModelInvocationRequest,
-            _on_delta: &dyn Fn(&ModelStreamingDelta),
+            on_delta: &dyn Fn(&ModelStreamingDelta),
         ) -> Result<BridgeResponse, BridgeClientError> {
+            if self.invoke_count.load(Ordering::SeqCst) > 0 {
+                on_delta(&ModelStreamingDelta {
+                    content: "任务工具调用完成".to_string(),
+                    thinking: String::new(),
+                });
+            }
             self.invoke(request)
         }
     }
@@ -1240,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn task_stream_item_id_reuses_main_timeline_streaming_entry() {
+    fn task_stream_item_id_reuses_main_timeline_streaming_entry_only_for_first_round() {
         let task_id = TaskId::new("task-stream-main");
 
         assert_eq!(
@@ -1249,7 +1269,7 @@ mod tests {
         );
         assert_eq!(
             task_stream_item_id(&task_id, 3, Some("timeline-streaming-task-stream-main")),
-            "timeline-streaming-task-stream-main"
+            "turn-item-assistant-stream-task-stream-main-3"
         );
     }
 
@@ -1356,6 +1376,7 @@ mod tests {
             &session_id,
             &None,
             "primary action 已完成",
+            Some("timeline-streaming-task-action-final-root-running"),
             Some("timeline-streaming-task-action-final-root-running"),
             &visibility,
         );
@@ -1597,7 +1618,7 @@ mod tests {
             prompt: "请执行两个只读 shell 工具".to_string(),
             tools: None,
             usage_binding: &usage_binding,
-            streaming_entry_id: None,
+            streaming_entry_id: Some("timeline-streaming-task-tool-batch"),
             worker_lane_id: Some(&lane_id),
             worker_lane_seq: Some(2),
             worker_id: Some(&worker_id),
@@ -1639,15 +1660,20 @@ mod tests {
         assert_eq!(
             turn.items
                 .iter()
-                .take(4)
                 .map(|item| (item.kind.as_str(), item.tool_call_id.as_deref()))
                 .collect::<Vec<_>>(),
             vec![
-                ("tool_call_started", Some("task-tool-shell-a")),
-                ("tool_call_started", Some("task-tool-shell-b")),
                 ("tool_call_result", Some("task-tool-shell-a")),
                 ("tool_call_result", Some("task-tool-shell-b")),
+                ("assistant_final", None),
             ]
+        );
+        assert!(
+            session_store
+                .timeline_for_session(&session_id)
+                .iter()
+                .all(|entry| entry.entry_id != "turn-item-assistant-stream-task-tool-batch-1"),
+            "工具后的第二轮流式内容不能写成独立主线 timeline entry"
         );
         let tool_events = event_bus.snapshot().recent_events;
         let invoked_events = tool_events

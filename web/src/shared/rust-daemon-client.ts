@@ -42,7 +42,6 @@ import type {
   McpServerIdRequestDto,
   McpServersResponseDto,
   McpToolsResponseDto,
-  MessagesResponseDto,
   RegisterWorkspaceRequestDto,
   RegisterWorkspaceResponseDto,
   RemoveNotificationRequestDto,
@@ -637,16 +636,6 @@ export class RustDaemonClient {
     request: EnhancePromptRequestDto,
   ): Promise<EnhancePromptResponseDto> {
     return this.postJson<EnhancePromptResponseDto>('/api/prompt/enhance', request);
-  }
-
-  // ─── Messages ─────────────────────────────────────────────────────
-
-  public async getMessages(sessionId?: string, limit?: number): Promise<MessagesResponseDto> {
-    const params = new URLSearchParams();
-    if (sessionId) params.set('sessionId', sessionId);
-    if (limit !== undefined) params.set('limit', String(limit));
-    const qs = params.toString();
-    return this.getJson<MessagesResponseDto>(`/api/messages${qs ? `?${qs}` : ''}`);
   }
 
   // ─── Task Graph ────────────────────────────────────────────────────

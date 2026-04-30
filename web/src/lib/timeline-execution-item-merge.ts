@@ -1,7 +1,9 @@
 import type { Message, TimelineExecutionItem } from '../types/message';
-import { mergeCompleteBlocksForFinalization } from './streaming-complete-merge';
 import {
   compareTimelineSemanticOrder,
+  resolveTimelineBlockSeqFromMetadata,
+  resolveTimelineItemSeqFromMetadata,
+  resolveTimelineLaneSeqFromMetadata,
   resolveTimelineTurnOrderSeqFromMetadata,
 } from '../shared/timeline-ordering';
 
@@ -9,12 +11,16 @@ function compareExecutionItems(left: TimelineExecutionItem, right: TimelineExecu
   const semanticOrder = compareTimelineSemanticOrder(
     {
       turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(left.message.metadata),
-      itemSeq: left.cardStreamSeq,
+      itemSeq: resolveTimelineItemSeqFromMetadata(left.message.metadata) || left.itemOrder,
+      laneSeq: resolveTimelineLaneSeqFromMetadata(left.message.metadata),
+      blockSeq: resolveTimelineBlockSeqFromMetadata(left.message.metadata),
       displayOrder: left.itemOrder || 0,
     },
     {
       turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(right.message.metadata),
-      itemSeq: right.cardStreamSeq,
+      itemSeq: resolveTimelineItemSeqFromMetadata(right.message.metadata) || right.itemOrder,
+      laneSeq: resolveTimelineLaneSeqFromMetadata(right.message.metadata),
+      blockSeq: resolveTimelineBlockSeqFromMetadata(right.message.metadata),
       displayOrder: right.itemOrder || 0,
     },
   );
@@ -73,15 +79,13 @@ export function mergeFragmentExecutionItems(params: {
       continue;
     }
 
-    const mergedBlocks = mergeCompleteBlocksForFinalization(
-      existingItem.message.blocks,
-      nextItem.message.blocks,
-      nextItem.message.blocks,
-    );
+    const nextBlocks = Array.isArray(nextItem.message.blocks) && nextItem.message.blocks.length > 0
+      ? nextItem.message.blocks
+      : existingItem.message.blocks;
     const mergedMessage: Message = preserveStableTurnOrderFact(existingItem.message, {
       ...existingItem.message,
       ...nextItem.message,
-      ...(mergedBlocks ? { blocks: mergedBlocks } : {}),
+      blocks: nextBlocks,
       content: nextItem.message.content || existingItem.message.content,
     });
 

@@ -58,6 +58,28 @@ fn current_turn_item_status_is_active(status: &str) -> bool {
     )
 }
 
+fn current_turn_item_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "completed"
+            | "complete"
+            | "succeeded"
+            | "success"
+            | "failed"
+            | "error"
+            | "cancelled"
+            | "canceled"
+    )
+}
+
+fn current_turn_item_rejects_update(
+    existing: &ActiveExecutionTurnItem,
+    incoming: &ActiveExecutionTurnItem,
+) -> bool {
+    current_turn_item_status_is_terminal(&existing.status)
+        && current_turn_item_status_is_active(&incoming.status)
+}
+
 fn reject_conflicting_active_current_turn(
     session_id: &SessionId,
     existing_turn: Option<&ActiveExecutionTurn>,
@@ -109,18 +131,41 @@ fn append_item_to_current_turn(
     let Some(turn) = sidecar.current_turn.as_mut() else {
         return None;
     };
-    let next_item_seq = turn
+    if let Some(existing) = turn
         .items
-        .iter()
-        .map(|existing| existing.item_seq)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1);
-    if item.item_seq == 0 {
-        item.item_seq = next_item_seq;
+        .iter_mut()
+        .find(|existing| existing.item_id == item.item_id)
+    {
+        if current_turn_item_rejects_update(existing, &item) {
+            return None;
+        }
+        if item.item_seq == 0 {
+            item.item_seq = existing.item_seq;
+        }
+        if item.request_id.is_none() {
+            item.request_id = existing.request_id.clone();
+        }
+        if item.user_message_id.is_none() {
+            item.user_message_id = existing.user_message_id.clone();
+        }
+        if item.placeholder_message_id.is_none() {
+            item.placeholder_message_id = existing.placeholder_message_id.clone();
+        }
+        *existing = item;
+    } else {
+        let next_item_seq = turn
+            .items
+            .iter()
+            .map(|existing| existing.item_seq)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        if item.item_seq == 0 {
+            item.item_seq = next_item_seq;
+        }
+        inherit_current_turn_aliases(turn, &mut item);
+        turn.items.push(item);
     }
-    inherit_current_turn_aliases(turn, &mut item);
-    turn.items.push(item);
     turn.normalize();
     if let Some(chain) = sidecar.active_execution_chain.as_mut() {
         chain.current_turn = sidecar.current_turn.clone();
@@ -976,6 +1021,9 @@ impl SessionStore {
                 .iter_mut()
                 .find(|existing| existing.item_id == item.item_id)
             {
+                if current_turn_item_rejects_update(existing, &item) {
+                    return Ok(None);
+                }
                 if item.item_seq == 0 {
                     item.item_seq = existing.item_seq;
                 }

@@ -5,7 +5,6 @@
 
 import type {
   Message,
-  ContentBlock,
   AgentOutputs,
   AgentId,
   TimelineExecutionItem,
@@ -824,8 +823,16 @@ function resolveTimelineNodeKind(message: Message): TimelineNodeKind {
 }
 
 
+function resolveCanonicalTurnItemId(message: Pick<Message, 'id' | 'metadata'> | undefined): string {
+  const metadata = resolveMessageMetadataRecord(message);
+  const rawTurnItemId = metadata?.turnItemId;
+  return typeof rawTurnItemId === 'string' && rawTurnItemId.trim()
+    ? rawTurnItemId.trim()
+    : '';
+}
+
 function resolveTimelineNodeId(message: Message): string {
-  return message.id;
+  return resolveCanonicalTurnItemId(message) || message.id;
 }
 
 function normalizePositiveSequence(value: unknown): number {
@@ -892,9 +899,11 @@ function normalizeTimelineExecutionItem(item: TimelineExecutionItem): TimelineEx
     ? Math.max(0, Math.floor(item.cardStreamSeq))
     : getMessageCardStreamSeq(normalizedMessage);
   const workerTabs = normalizeWorkerTabList(item.workerTabs);
-  const itemId = typeof item.itemId === 'string' && item.itemId.trim()
-    ? item.itemId.trim()
-    : normalizedMessage.id;
+  const canonicalItemId = resolveCanonicalTurnItemId(normalizedMessage);
+  const itemId = canonicalItemId
+    || (typeof item.itemId === 'string' && item.itemId.trim()
+      ? item.itemId.trim()
+      : normalizedMessage.id);
   return {
     itemId,
     itemOrder: typeof item.itemOrder === 'number' && Number.isFinite(item.itemOrder)
@@ -919,7 +928,9 @@ function executionItemToOrderInput(item: TimelineExecutionItem): TimelineSemanti
   const metadata = resolveMessageMetadataRecord(item.message);
   return {
     turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(metadata),
-    itemSeq: item.cardStreamSeq || resolveTimelineItemSeqFromMetadata(metadata) || item.itemOrder,
+    itemSeq: resolveTimelineItemSeqFromMetadata(metadata) || item.itemOrder,
+    laneSeq: resolveTimelineLaneSeqFromMetadata(metadata),
+    blockSeq: resolveTimelineBlockSeqFromMetadata(metadata),
     displayOrder: item.itemOrder || 0,
   };
 }
@@ -1038,39 +1049,14 @@ function nodeToOrderInput(node: TimelineNode): TimelineSemanticOrderInput {
   const metadata = resolveMessageMetadataRecord(node.message);
   return {
     turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(metadata),
-    itemSeq: node.cardStreamSeq,
+    itemSeq: resolveTimelineItemSeqFromMetadata(metadata),
+    laneSeq: resolveTimelineLaneSeqFromMetadata(metadata),
+    blockSeq: resolveTimelineBlockSeqFromMetadata(metadata),
     displayOrder: node.displayOrder || 0,
   };
 }
 
-function compareSameRequestMessageOrder(left: Message, right: Message): number | null {
-  const leftMetadata = resolveMessageMetadataRecord(left);
-  const rightMetadata = resolveMessageMetadataRecord(right);
-  const leftRequestId = typeof leftMetadata?.requestId === 'string' ? leftMetadata.requestId.trim() : '';
-  const rightRequestId = typeof rightMetadata?.requestId === 'string' ? rightMetadata.requestId.trim() : '';
-  if (!leftRequestId || leftRequestId !== rightRequestId) {
-    return null;
-  }
-  const leftItemSeq = resolveTimelineItemSeqFromMetadata(leftMetadata);
-  const rightItemSeq = resolveTimelineItemSeqFromMetadata(rightMetadata);
-  if (leftItemSeq > 0 && rightItemSeq > 0 && leftItemSeq !== rightItemSeq) {
-    return leftItemSeq - rightItemSeq;
-  }
-  const roleRank = (message: Message): number => {
-    if (message.role === 'user') return 0;
-    if (message.role === 'assistant') return 1;
-    return 2;
-  };
-  const leftRank = roleRank(left);
-  const rightRank = roleRank(right);
-  return leftRank === rightRank ? null : leftRank - rightRank;
-}
-
 function compareTimelineNodeOrder(left: TimelineNode, right: TimelineNode): number {
-  const sameRequestOrder = compareSameRequestMessageOrder(left.message, right.message);
-  if (sameRequestOrder !== null) {
-    return sameRequestOrder;
-  }
   return compareTimelineSemanticOrder(nodeToOrderInput(left), nodeToOrderInput(right));
 }
 
@@ -1104,6 +1090,8 @@ function renderEntryToOrderInput(entry: LocalProjectionFlatRenderEntry): Timelin
   return {
     turnOrderSeq: entry.turnOrderSeq,
     itemSeq: entry.itemSeq,
+    laneSeq: entry.laneSeq,
+    blockSeq: entry.blockSeq,
     displayOrder: entry.cardStreamSeq || 0,
   };
 }
@@ -1112,10 +1100,6 @@ function compareRenderEntryOrder(
   left: LocalProjectionFlatRenderEntry,
   right: LocalProjectionFlatRenderEntry,
 ): number {
-  const sameRequestOrder = compareSameRequestMessageOrder(left.message, right.message);
-  if (sameRequestOrder !== null) {
-    return sameRequestOrder;
-  }
   return compareTimelineSemanticOrder(
     renderEntryToOrderInput(left),
     renderEntryToOrderInput(right),
@@ -1167,7 +1151,7 @@ function buildProjectionRenderEntriesFromArtifacts(
         message: artifact.message,
         timestamp: artifact.timestamp,
         turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(artifactMetadata),
-        itemSeq: artifact.cardStreamSeq || resolveTimelineItemSeqFromMetadata(artifactMetadata) || artifact.displayOrder,
+        itemSeq: resolveTimelineItemSeqFromMetadata(artifactMetadata) || artifact.displayOrder,
         laneSeq: resolveTimelineLaneSeqFromMetadata(artifactMetadata),
         anchorEventSeq: artifact.anchorEventSeq,
         blockSeq: getMessageBlockSeq(artifact.message),
@@ -1190,8 +1174,7 @@ function buildProjectionRenderEntriesFromArtifacts(
         message: item.message,
         timestamp: item.timestamp,
         turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(resolveMessageMetadataRecord(item.message)),
-        itemSeq: item.cardStreamSeq
-          || resolveTimelineItemSeqFromMetadata(resolveMessageMetadataRecord(item.message))
+        itemSeq: resolveTimelineItemSeqFromMetadata(resolveMessageMetadataRecord(item.message))
           || item.itemOrder,
         laneSeq: resolveTimelineLaneSeqFromMetadata(resolveMessageMetadataRecord(item.message)),
         anchorEventSeq: item.anchorEventSeq,
@@ -1299,33 +1282,6 @@ function normalizeProjectionIdentity(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function resolveProjectionArtifactMetadata(
-  artifact: TimelineProjectionArtifact,
-): Record<string, unknown> | undefined {
-  return resolveMessageMetadataRecord(artifact.message);
-}
-
-function resolveCanonicalAssistantResponseKey(artifact: TimelineProjectionArtifact): string {
-  const metadata = resolveProjectionArtifactMetadata(artifact);
-  const turnId = normalizeProjectionIdentity(metadata?.turnId);
-  const turnItemKind = normalizeProjectionIdentity(metadata?.turnItemKind);
-  if (
-    !turnId
-    || (turnItemKind !== 'assistant_stream'
-      && turnItemKind !== 'assistant_final'
-      && turnItemKind !== 'assistant_error')
-  ) {
-    return '';
-  }
-  const laneScope = normalizeProjectionIdentity(metadata?.laneId)
-    || normalizeProjectionIdentity(metadata?.roleId)
-    || normalizeProjectionIdentity(metadata?.workerId)
-    || normalizeProjectionIdentity(artifact.laneId)
-    || normalizeProjectionIdentity(artifact.worker)
-    || 'thread';
-  return `turn-response:${turnId}:${laneScope}`;
-}
-
 function collectProjectionArtifactIdentityKeys(artifact: TimelineProjectionArtifact): string[] {
   const keys = new Set<string>();
   const add = (value: unknown): void => {
@@ -1339,7 +1295,7 @@ function collectProjectionArtifactIdentityKeys(artifact: TimelineProjectionArtif
   add(artifact.cardId);
   add(artifact.lifecycleKey);
   add(artifact.message?.id);
-  add(resolveCanonicalAssistantResponseKey(artifact));
+  add(resolveCanonicalTurnItemId(artifact.message));
   for (const messageId of ensureArray<string>(artifact.messageIds)) {
     add(messageId);
   }
@@ -1353,68 +1309,19 @@ function collectProjectionArtifactIdentityKeys(artifact: TimelineProjectionArtif
   return Array.from(keys);
 }
 
-function projectionArtifactTerminalityScore(artifact: TimelineProjectionArtifact): number {
-  const turnItemKind = normalizeProjectionIdentity(resolveProjectionArtifactMetadata(artifact)?.turnItemKind);
-  let turnScore = 0;
-  if (turnItemKind === 'assistant_final' || turnItemKind === 'assistant_error') {
-    turnScore = 30;
-  } else if (turnItemKind === 'assistant_stream') {
-    turnScore = 10;
-  }
-  const toolScore = Math.max(
-    projectionToolBlockTerminalityScore(artifact.message?.blocks),
-    ...ensureArray<TimelineExecutionItem>(artifact.executionItems)
-      .map((item) => projectionToolBlockTerminalityScore(item.message?.blocks)),
-  );
-  return Math.max(turnScore, toolScore);
-}
-
-function projectionToolBlockTerminalityScore(blocks: ContentBlock[] | undefined): number {
-  return ensureArray<ContentBlock>(blocks).reduce((score, block) => {
-    const status = block.type === 'tool_call' || block.type === 'tool_result'
-      ? block.toolCall?.status
-      : undefined;
-    switch (status) {
-      case 'success':
-      case 'error':
-        return Math.max(score, 25);
-      case 'running':
-        return Math.max(score, 8);
-      case 'pending':
-        return Math.max(score, 4);
-      default:
-        return score;
-    }
-  }, 0);
-}
-
 function compareProjectionArtifactFreshness(
   left: TimelineProjectionArtifact,
   right: TimelineProjectionArtifact,
 ): number {
-  const leftTerminality = projectionArtifactTerminalityScore(left);
-  const rightTerminality = projectionArtifactTerminalityScore(right);
-  if (leftTerminality !== rightTerminality) {
-    return leftTerminality - rightTerminality;
-  }
   const leftVersion = Math.max(
     left.latestEventSeq || 0,
     left.artifactVersion || 0,
-    left.message?.updatedAt || 0,
-    left.message?.timestamp || 0,
   );
   const rightVersion = Math.max(
     right.latestEventSeq || 0,
     right.artifactVersion || 0,
-    right.message?.updatedAt || 0,
-    right.message?.timestamp || 0,
   );
-  if (leftVersion !== rightVersion) {
-    return leftVersion - rightVersion;
-  }
-  const leftContentWeight = (left.message?.content || '').length + ensureArray(left.message?.blocks).length;
-  const rightContentWeight = (right.message?.content || '').length + ensureArray(right.message?.blocks).length;
-  return leftContentWeight - rightContentWeight;
+  return leftVersion - rightVersion;
 }
 
 function mergeProjectionExecutionItems(
@@ -1618,22 +1525,22 @@ function compareProjectionArtifactsForPageMerge(
   left: TimelineProjectionArtifact,
   right: TimelineProjectionArtifact,
 ): number {
-  const sameRequestOrder = compareSameRequestMessageOrder(left.message, right.message);
-  if (sameRequestOrder !== null) {
-    return sameRequestOrder;
-  }
   const leftMetadata = resolveMessageMetadataRecord(left.message);
   const rightMetadata = resolveMessageMetadataRecord(right.message);
   const semanticOrder = compareTimelineSemanticOrder(
     {
       turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(leftMetadata),
-      itemSeq: left.cardStreamSeq || resolveTimelineItemSeqFromMetadata(leftMetadata),
-      displayOrder: left.timestamp || left.displayOrder || 0,
+      itemSeq: resolveTimelineItemSeqFromMetadata(leftMetadata),
+      laneSeq: resolveTimelineLaneSeqFromMetadata(leftMetadata),
+      blockSeq: resolveTimelineBlockSeqFromMetadata(leftMetadata),
+      displayOrder: left.displayOrder || 0,
     },
     {
       turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(rightMetadata),
-      itemSeq: right.cardStreamSeq || resolveTimelineItemSeqFromMetadata(rightMetadata),
-      displayOrder: right.timestamp || right.displayOrder || 0,
+      itemSeq: resolveTimelineItemSeqFromMetadata(rightMetadata),
+      laneSeq: resolveTimelineLaneSeqFromMetadata(rightMetadata),
+      blockSeq: resolveTimelineBlockSeqFromMetadata(rightMetadata),
+      displayOrder: right.displayOrder || 0,
     },
   );
   if (semanticOrder !== 0) {
@@ -1674,14 +1581,14 @@ function mergeTimelineProjectionPage(
     }
   };
 
-  for (const artifact of incoming.artifacts) appendArtifact(artifact);
   for (const artifact of current.artifacts) appendArtifact(artifact);
+  for (const artifact of incoming.artifacts) appendArtifact(artifact);
 
   const mergedArtifacts = artifacts
     .sort(compareProjectionArtifactsForPageMerge)
-    .map((artifact, index) => ({
+    .map((artifact) => ({
       ...artifact,
-      displayOrder: index + 1,
+      displayOrder: artifact.displayOrder || 0,
     }));
 
   return canonicalizeTimelineProjection({
@@ -1959,6 +1866,7 @@ function mergeTimelineNodeAliases(
     messageIds: Array.from(new Set([
       ...existingNode.messageIds,
       existingNode.nodeId,
+      resolveTimelineNodeId(nextMessage),
       nextMessage.id,
       ...(options.replaceMessageId ? [options.replaceMessageId] : []),
     ])),
@@ -1983,6 +1891,7 @@ function buildExecutionItemFromMessage(
     threadVisible: visibility.thread === true,
     workerTabs: nextWorkerTabs,
     messageIds: Array.from(new Set([
+      resolveTimelineNodeId(message),
       message.id,
       ...(options.replaceMessageId ? [options.replaceMessageId] : []),
     ])),
@@ -1993,7 +1902,7 @@ function buildExecutionItemFromMessage(
 export function upsertTimelineNode(
   message: Message,
   visibility: { thread?: boolean; workerTabs?: AgentId[] },
-  options: { replaceMessageId?: string; displayOrder?: number } = {},
+  options: { replaceMessageId?: string; displayOrder?: number; executionItems?: TimelineExecutionItem[] } = {},
 ): Message {
   const normalizedMessage = normalizeIncomingMessage(message);
 
@@ -2002,7 +1911,8 @@ export function upsertTimelineNode(
   const replaceNodeId = options.replaceMessageId
     ? resolveTimelineAliasId(options.replaceMessageId)
     : undefined;
-  const existingNodeId = replaceNodeId
+  const existingNodeId = timelineNodeIdByMessageId.get(explicitNodeId)
+    || replaceNodeId
     || timelineNodeIdByMessageId.get(normalizedMessage.id)
     || (cardId ? timelineNodeIdByCardId.get(cardId) : undefined)
     || undefined;
@@ -2037,11 +1947,15 @@ export function upsertTimelineNode(
   }
   const mergedMessage = hostMessage;
   const executionItems = (() => {
+    const optionExecutionItems = canonicalizeProjectionExecutionItems(options.executionItems);
     if (usesFragmentExecutionItems) {
       return mergeFragmentExecutionItems({
         existingItems: existingNode?.executionItems,
         nextItems: buildFragmentExecutionItems(fragmentMessages, visibility),
       });
+    }
+    if (optionExecutionItems.length > 0) {
+      return mergeProjectionExecutionItems(existingNode?.executionItems, optionExecutionItems);
     }
     return existingNode?.executionItems || [];
   })();
@@ -2065,6 +1979,7 @@ export function upsertTimelineNode(
     messageIds: Array.from(new Set([
       ...(existingNode?.messageIds || []),
       stableNodeId,
+      explicitNodeId,
       normalizedMessage.id,
       ...(options.replaceMessageId ? [options.replaceMessageId] : []),
     ])),
@@ -3117,6 +3032,25 @@ function updateProcessingState() {
   messagesState.isProcessing = nextIsProcessing;
 }
 
+function timelineHasStreamingMessage(): boolean {
+  return messagesState.timelineNodes.some((node) => {
+    if (node.message?.isStreaming === true) {
+      return true;
+    }
+    return ensureArray<TimelineExecutionItem>(node.executionItems)
+      .some((item) => item.message?.isStreaming === true);
+  });
+}
+
+export function hasActiveLocalTimelineTurn(): boolean {
+  return messagesState.isProcessing
+    || messagesState.backendProcessing
+    || runtimeStateIndicatesProcessing()
+    || messagesState.pendingRequests.size > 0
+    || messagesState.activeMessageIds.size > 0
+    || timelineHasStreamingMessage();
+}
+
 export function markMessageActive(id: string) {
   if (!id) return;
   if (!messagesState.activeMessageIds.has(id)) {
@@ -3159,6 +3093,7 @@ export function clearPendingRequest(id: string) {
       && !messagesState.backendProcessing
       && !runtimeStateIndicatesProcessing()
       && messagesState.activeMessageIds.size === 0
+      && !timelineHasStreamingMessage()
     ) {
       sealAllStreamingMessages();
     }
@@ -3590,6 +3525,10 @@ function compareIncomingMessageVersion(
   const currentVersion = resolveTimelineVersionFromMetadata({ eventSeq: currentEventSeq });
   const incomingVersion = resolveTimelineVersionFromMetadata(resolveMessageMetadataRecord(incoming));
 
+  if (currentVersion > 0 && incomingVersion === 0) {
+    return -1;
+  }
+
   if (currentVersion > 0 && incomingVersion > 0 && incomingVersion !== currentVersion) {
     return incomingVersion > currentVersion ? 1 : -1;
   }
@@ -3871,6 +3810,67 @@ export function prependTimelineProjectionPage(
   return true;
 }
 
+export function applyLiveTimelineProjectionUpdate(
+  sessionId: string,
+  projection: SessionTimelineProjection,
+): boolean {
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  if (!normalizedSessionId) {
+    return false;
+  }
+  const currentSessionId = normalizeSessionId(messagesState.currentSessionId);
+  if (!currentSessionId || currentSessionId !== normalizedSessionId) {
+    return false;
+  }
+  const canonicalProjection = canonicalizeTimelineProjection(projection);
+  const artifacts = ensureArray(canonicalProjection.artifacts).filter(isProjectionArtifact);
+  if (artifacts.length === 0) {
+    return false;
+  }
+
+  for (const artifact of artifacts) {
+    const rawMessage = normalizeProjectionRestoredMessage(artifact.message);
+    const rawMetadata = resolveMessageMetadataRecord(rawMessage) || {};
+    const artifactEventSeq = typeof artifact.latestEventSeq === 'number' && Number.isFinite(artifact.latestEventSeq)
+      ? Math.max(0, Math.floor(artifact.latestEventSeq))
+      : 0;
+    const rawEventSeq = typeof rawMetadata.eventSeq === 'number' && Number.isFinite(rawMetadata.eventSeq)
+      ? Math.max(0, Math.floor(rawMetadata.eventSeq))
+      : 0;
+    const message: Message = artifactEventSeq > 0
+      ? {
+          ...rawMessage,
+          metadata: {
+            ...rawMetadata,
+            eventSeq: rawEventSeq > 0 ? rawEventSeq : artifactEventSeq,
+          },
+        }
+      : rawMessage;
+    const metadata = resolveMessageMetadataRecord(message) || {};
+    const placeholderMessageId = typeof metadata.placeholderMessageId === 'string'
+      ? metadata.placeholderMessageId.trim()
+      : '';
+    const upsertedMessage = upsertTimelineNode(message, {
+      thread: artifact.threadVisible !== false,
+      workerTabs: normalizeWorkerTabList(artifact.workerTabs),
+    }, {
+      replaceMessageId: placeholderMessageId || undefined,
+      displayOrder: artifact.displayOrder,
+      executionItems: artifact.executionItems,
+    });
+    if (upsertedMessage.isStreaming === true) {
+      markMessageActive(upsertedMessage.id);
+    } else {
+      markMessageComplete(upsertedMessage.id);
+      if (placeholderMessageId) {
+        markMessageComplete(placeholderMessageId);
+      }
+    }
+  }
+
+  return true;
+}
+
 function buildTimelineNodesFromProjection(projection: SessionTimelineProjection): TimelineNode[] {
   const canonicalProjection = canonicalizeTimelineProjection(projection);
   const validArtifacts = ensureArray(canonicalProjection.artifacts).filter(isProjectionArtifact);
@@ -3910,6 +3910,13 @@ function buildTimelineNodesFromProjection(projection: SessionTimelineProjection)
       message: {
         ...message,
         id: artifact.artifactId,
+        metadata: {
+          ...(resolveMessageMetadataRecord(message) || {}),
+          eventSeq: getMessageEventSeq(message)
+            ?? (typeof artifact.latestEventSeq === 'number' && Number.isFinite(artifact.latestEventSeq)
+              ? Math.max(0, Math.floor(artifact.latestEventSeq))
+              : 0),
+        },
       },
       executionItems,
     }));

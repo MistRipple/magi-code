@@ -105,6 +105,7 @@ export type DataMessageType =
   | 'settingsBootstrapLoaded'
   | 'sessionBootstrapLoaded'
   | 'sessionTurnAccepted'
+  | 'sessionTurnItemProjectionUpdated'
   | 'timelineProjectionUpdated'
   | 'sessionNotificationsLoaded'
   | 'sessionNotificationsStatus'

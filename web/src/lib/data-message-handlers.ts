@@ -16,6 +16,7 @@ import {
   clearAllMessages,
   setTimelineProjection,
   prependTimelineProjectionPage,
+  applyLiveTimelineProjectionUpdate,
   addToast,
   clearPendingRequest,
   setProcessingActor,
@@ -39,6 +40,7 @@ import {
   setEnabledAgents,
   setSessionHistoryState,
   messagesState,
+  hasActiveLocalTimelineTurn,
 } from '../stores/messages.svelte';
 import type {
   AppState, Message, Session,
@@ -419,6 +421,13 @@ export function handleUnifiedData(standard: StandardMessage) {
       break;
     }
 
+    case 'sessionTurnItemProjectionUpdated':
+      handleSessionTurnItemProjectionUpdated(asMessage({
+        sessionId: payload.sessionId,
+        timelineProjection: payload.timelineProjection,
+      }));
+      break;
+
     case 'timelineProjectionUpdated':
       handleTimelineProjectionUpdated(asMessage({
         sessionId: payload.sessionId,
@@ -686,10 +695,6 @@ function findTerminalAssistantByRequestIdentity(
 }
 
 
-function hasActiveLocalTurn(): boolean {
-  return messagesState.pendingRequests.size > 0 || messagesState.activeMessageIds.size > 0;
-}
-
 function hasPendingLocalRequest(): boolean {
   return messagesState.pendingRequests.size > 0;
 }
@@ -722,18 +727,36 @@ function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): voi
   settleProcessingAfterResponseCompletion();
 }
 
+function readTimelineProjectionMessage(message: ClientBridgeMessage): {
+  sessionId: string;
+  timelineProjection: SessionTimelineProjection | undefined;
+} {
+  return {
+    sessionId: typeof message.sessionId === 'string' ? message.sessionId.trim() : '',
+    timelineProjection: message.timelineProjection as SessionTimelineProjection | undefined,
+  };
+}
+
+function handleSessionTurnItemProjectionUpdated(message: ClientBridgeMessage) {
+  const { sessionId, timelineProjection } = readTimelineProjectionMessage(message);
+  if (!sessionId || !timelineProjection) {
+    return;
+  }
+  const mergedLive = applyLiveTimelineProjectionUpdate(sessionId, timelineProjection);
+  if (mergedLive) {
+    reconcileRequestBindingsFromAuthoritativeThread(sessionId);
+  }
+}
+
 function handleTimelineProjectionUpdated(message: ClientBridgeMessage) {
-  const sessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
-  const timelineProjection = message.timelineProjection as SessionTimelineProjection | undefined;
+  const { sessionId, timelineProjection } = readTimelineProjectionMessage(message);
   if (!sessionId || !timelineProjection) {
     return;
   }
   const currentSessionId = getState().currentSessionId || '';
-  if (!currentSessionId || currentSessionId !== sessionId) {
+  if (!currentSessionId || currentSessionId !== sessionId || hasActiveLocalTimelineTurn()) {
     return;
   }
-  // session.turn.item 携带的是当前轮次增量投影，不是整条会话快照。
-  // 必须合并进现有时间线，避免实时流式事件覆盖历史消息、thinking、工具卡片和耗时。
   const merged = prependTimelineProjectionPage(sessionId, timelineProjection);
   if (merged) {
     reconcileRequestBindingsFromAuthoritativeThread(sessionId);
@@ -773,7 +796,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       }
       messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
       messagesState.currentWorkspacePath = workspacePath || messagesState.currentWorkspacePath;
-      const hadLiveTurnBeforeSnapshot = hasActiveLocalTurn();
+      const hadLiveTurnBeforeSnapshot = hasActiveLocalTimelineTurn();
       const hadPendingLocalRequestBeforeSnapshot = hasPendingLocalRequest();
       const authoritativeSnapshotIsIdle = state.isProcessing !== true
         && state.processingState?.isProcessing !== true;
@@ -807,12 +830,10 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         preserveLoadedWindow: true,
       });
 
-      if (preserveLocalTurnDuringStaleIdle) {
-        prependTimelineProjectionPage(sessionId, timelineProjection);
-      } else {
+      if (!hadLiveTurnBeforeSnapshot) {
         applyTimelineProjectionSnapshot(sessionId, timelineProjection, { hydrateNodes: true });
+        reconcileRequestBindingsFromAuthoritativeThread(sessionId);
       }
-      reconcileRequestBindingsFromAuthoritativeThread(sessionId);
       if (authoritativeSnapshotIsIdle && !hadLiveTurnBeforeSnapshot) {
         settleAuthoritativeIdleState();
       }

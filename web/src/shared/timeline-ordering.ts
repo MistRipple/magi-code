@@ -1,6 +1,8 @@
 export interface TimelineSemanticOrderInput {
   turnOrderSeq: number;
   itemSeq: number;
+  laneSeq?: number;
+  blockSeq?: number;
   displayOrder: number;
 }
 
@@ -142,7 +144,23 @@ export function compareTimelineSemanticOrder(
     return itemOrder;
   }
 
-  // displayOrder 作为最终稳定排序键（本地创建序号，永不重算）
+  const laneOrder = compareSharedFactOrder(
+    normalizeTimelineSequence(left.laneSeq),
+    normalizeTimelineSequence(right.laneSeq),
+  );
+  if (laneOrder !== null) {
+    return laneOrder;
+  }
+
+  const blockOrder = compareSharedFactOrder(
+    normalizeTimelineSequence(left.blockSeq),
+    normalizeTimelineSequence(right.blockSeq),
+  );
+  if (blockOrder !== null) {
+    return blockOrder;
+  }
+
+  // displayOrder 作为最终稳定本地落位序号，永不由时间戳重算。
   if (left.displayOrder !== right.displayOrder) {
     return left.displayOrder - right.displayOrder;
   }

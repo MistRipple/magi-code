@@ -193,7 +193,7 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
           standardized: block.standardized,
         };
         return {
-          type: 'tool_result',
+          type: 'tool_call',
           content: resolvedContent,
           toolCall,
           fileChange: block.fileChange

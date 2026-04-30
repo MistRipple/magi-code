@@ -14,6 +14,7 @@
     prependTimelineProjectionPage,
     setSessionHistoryState,
     updatePanelScrollState,
+    hasActiveLocalTimelineTurn,
   } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { loadAgentSessionTimelinePage } from '../web/agent-api';
@@ -77,19 +78,19 @@
     return streamingMsgs.map(m => `${m.id}:${resolveStreamingMessageVersion(m)}`).join('|');
   });
 
-  const currentStreamingMessage = $derived.by(() => {
-    for (let i = safeRenderMessages.length - 1; i >= 0; i -= 1) {
-      const message = safeRenderMessages[i];
-      if (message.isStreaming) {
-        return message;
+  const currentStreamingRenderItem = $derived.by(() => {
+    for (let i = safeRenderItems.length - 1; i >= 0; i -= 1) {
+      const item = safeRenderItems[i];
+      if (item.message.isStreaming) {
+        return item;
       }
     }
     return null;
   });
 
-  const streamingIndicatorMessageId = $derived.by(() => {
-    return currentStreamingMessage?.id || null;
-  });
+  const currentStreamingMessage = $derived.by(() => currentStreamingRenderItem?.message || null);
+
+  const streamingIndicatorRenderKey = $derived.by(() => currentStreamingRenderItem?.key || null);
 
   const resolvedStreamingStartAt = $derived.by(() => {
     const message = currentStreamingMessage;
@@ -462,6 +463,7 @@
       || !historyState.beforeCursor
       || historyState.isLoadingBefore
       || pendingHistoryRestore !== null
+      || hasActiveLocalTimelineTurn()
     ) {
       return;
     }
@@ -478,6 +480,10 @@
         (messagesState.currentSessionId || '').trim() !== sessionId
         || (messagesState.currentWorkspaceId || '').trim() !== workspaceId
       ) {
+        return;
+      }
+      if (hasActiveLocalTimelineTurn()) {
+        setSessionHistoryState(sessionId, { workspaceId, isLoadingBefore: false });
         return;
       }
       const payload = normalizeRustBootstrapPayload(rawPayload, {
@@ -505,8 +511,11 @@
       }
     } catch (error) {
       console.error('[MessageList] 加载更早会话历史失败:', error);
-      if ((messagesState.currentSessionId || '').trim() === sessionId) {
-        setSessionHistoryState(sessionId, { isLoadingBefore: false });
+      if (
+        (messagesState.currentSessionId || '').trim() === sessionId
+        && (messagesState.currentWorkspaceId || '').trim() === workspaceId
+      ) {
+        setSessionHistoryState(sessionId, { workspaceId, isLoadingBefore: false });
       }
     }
   }
@@ -600,8 +609,8 @@
           message={item.message}
           {readOnly}
           {displayContext}
-          showStreamingIndicator={item.message.id === streamingIndicatorMessageId}
-          streamingElapsedSeconds={item.message.id === streamingIndicatorMessageId ? elapsedSeconds : 0}
+          showStreamingIndicator={item.key === streamingIndicatorRenderKey}
+          streamingElapsedSeconds={item.key === streamingIndicatorRenderKey ? elapsedSeconds : 0}
         />
       {/each}
     {/if}

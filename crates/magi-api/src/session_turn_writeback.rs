@@ -519,13 +519,14 @@ pub(crate) fn append_session_tool_call_items_batch(
             "running",
             Some(tool_call.function.name.clone()),
             Some(format!("正在调用工具：{}", tool_call.function.name)),
-            Some(format!("turn-item-tool-started-{}", tool_call.id)),
+            Some(format!("turn-item-tool-{}", tool_call.id)),
         );
         started_item.source = "tool".to_string();
         started_item.tool_call_id = Some(tool_call.id.clone());
         started_item.tool_name = Some(tool_call.function.name.clone());
+        started_item.tool_status = Some("running".to_string());
         started_item.tool_arguments = Some(tool_call.function.arguments.clone());
-        if let Some(published) = append_session_turn_item(session_store, session_id, started_item) {
+        if let Some(published) = upsert_session_turn_item(session_store, session_id, started_item) {
             publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
         }
     }
@@ -542,7 +543,7 @@ pub(crate) fn append_session_tool_call_items_batch(
         if !write_allowed() {
             return false;
         }
-        append_session_tool_call_result_item(
+        upsert_session_tool_call_result_item(
             session_store,
             event_bus,
             session_id,
@@ -561,7 +562,7 @@ pub(crate) fn append_session_tool_call_items_batch(
     true
 }
 
-fn append_session_tool_call_result_item(
+fn upsert_session_tool_call_result_item(
     session_store: &SessionStore,
     event_bus: &InMemoryEventBus,
     session_id: &SessionId,
@@ -576,7 +577,7 @@ fn append_session_tool_call_result_item(
         turn_item_status_for_tool_result(tool_status),
         Some(tool_call.function.name.clone()),
         Some(summarize_tool_result(tool_result)),
-        Some(format!("turn-item-tool-result-{}", tool_call.id)),
+        Some(format!("turn-item-tool-{}", tool_call.id)),
     );
     result_item.source = "tool".to_string();
     result_item.tool_call_id = Some(tool_call.id.clone());
@@ -587,7 +588,7 @@ fn append_session_tool_call_result_item(
     if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
         result_item.tool_error = Some(tool_result.to_string());
     }
-    if let Some(published) = append_session_turn_item(session_store, session_id, result_item) {
+    if let Some(published) = upsert_session_turn_item(session_store, session_id, result_item) {
         publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
     }
 }

@@ -20,7 +20,9 @@ import type {
 import { buildEmptyWorkspaceAppState } from './empty-workspace-state';
 import {
   compareTimelineSemanticOrder,
+  resolveTimelineBlockSeqFromMetadata,
   resolveTimelineItemSeqFromMetadata,
+  resolveTimelineLaneSeqFromMetadata,
   resolveTimelineTurnOrderSeqFromMetadata,
 } from '../timeline-ordering';
 
@@ -1791,12 +1793,16 @@ function compareProjectionArtifactOrder(
   const semanticOrder = compareTimelineSemanticOrder(
     {
       turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(leftMetadata),
-      itemSeq: normalizeNumber(left.cardStreamSeq, 0) || resolveTimelineItemSeqFromMetadata(leftMetadata),
+      itemSeq: resolveTimelineItemSeqFromMetadata(leftMetadata),
+      laneSeq: resolveTimelineLaneSeqFromMetadata(leftMetadata),
+      blockSeq: resolveTimelineBlockSeqFromMetadata(leftMetadata),
       displayOrder: normalizeNumber(left.displayOrder, 0),
     },
     {
       turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(rightMetadata),
-      itemSeq: normalizeNumber(right.cardStreamSeq, 0) || resolveTimelineItemSeqFromMetadata(rightMetadata),
+      itemSeq: resolveTimelineItemSeqFromMetadata(rightMetadata),
+      laneSeq: resolveTimelineLaneSeqFromMetadata(rightMetadata),
+      blockSeq: resolveTimelineBlockSeqFromMetadata(rightMetadata),
       displayOrder: normalizeNumber(right.displayOrder, 0),
     },
   );
@@ -1825,36 +1831,15 @@ function resolveProjectionArtifactMetadata(
     : undefined;
 }
 
-function resolveCanonicalAssistantResponseKey(artifact: TimelineProjectionArtifact): string {
-  const metadata = resolveProjectionArtifactMetadata(artifact);
-  const turnId = normalizeString(metadata?.turnId);
-  const turnItemKind = normalizeString(metadata?.turnItemKind);
-  if (
-    !turnId
-    || (turnItemKind !== 'assistant_stream'
-      && turnItemKind !== 'assistant_final'
-      && turnItemKind !== 'assistant_error')
-  ) {
-    return '';
-  }
-  const laneScope = normalizeString(metadata?.laneId)
-    || normalizeString(metadata?.roleId)
-    || normalizeString(metadata?.workerId)
-    || normalizeString(artifact.laneId)
-    || normalizeString(artifact.worker)
-    || 'thread';
-  return `turn-response:${turnId}:${laneScope}`;
-}
-
 function projectionArtifactDedupKey(artifact: TimelineProjectionArtifact): string {
   const toolCallId = resolveProjectionArtifactToolCallId(artifact);
   if (toolCallId) {
     const turnId = normalizeString(resolveProjectionArtifactMetadata(artifact)?.turnId);
     return turnId ? `tool:${turnId}:${toolCallId}` : `tool:${toolCallId}`;
   }
-  const assistantResponseKey = resolveCanonicalAssistantResponseKey(artifact);
-  if (assistantResponseKey) {
-    return assistantResponseKey;
+  const turnItemId = normalizeString(resolveProjectionArtifactMetadata(artifact)?.turnItemId);
+  if (turnItemId) {
+    return turnItemId;
   }
   const timelineAlias = (artifact.messageIds || [])
     .map((messageId) => normalizeString(messageId))
@@ -1862,28 +1847,11 @@ function projectionArtifactDedupKey(artifact: TimelineProjectionArtifact): strin
   return timelineAlias || artifact.artifactId;
 }
 
-function projectionArtifactTerminalityScore(artifact: TimelineProjectionArtifact): number {
-  const turnItemKind = normalizeString(resolveProjectionArtifactMetadata(artifact)?.turnItemKind);
-  if (turnItemKind === 'assistant_final' || turnItemKind === 'assistant_error') {
-    return 30;
-  }
-  if (turnItemKind === 'assistant_stream') {
-    return 10;
-  }
-  return 0;
-}
-
 function projectionArtifactPreferenceScore(artifact: TimelineProjectionArtifact): number {
-  let score = 0;
-  if (artifact.artifactId.startsWith('turn:')) {
-    score += 100;
-  }
-  score += projectionArtifactTerminalityScore(artifact);
-  score += normalizeNumber(artifact.message?.blocks?.length, 0);
-  score += normalizeNumber(artifact.executionItems?.length, 0);
-  score += normalizeString(artifact.message?.content).trim().length > 0 ? 5 : 0;
-  score += normalizeNumber(artifact.latestEventSeq, 0) / 1_000_000_000;
-  return score;
+  return Math.max(
+    normalizeNumber(artifact.latestEventSeq, 0),
+    normalizeNumber(artifact.artifactVersion, 0),
+  );
 }
 
 function mergeProjectionArtifacts(
@@ -2413,6 +2381,8 @@ function buildTurnArtifactsFromSummary(
         messageIdAliases.add(`rust-timeline:${groupedItemId}`);
       }
     }
+    const isStreamingAssistantTurnItem = kind === 'assistant_stream'
+      && !isTerminalTurnStatus(item.status);
     artifacts.push({
       artifactId,
       kind: kind.includes('tool') ? 'tool' : 'message',
@@ -2426,45 +2396,49 @@ function buildTurnArtifactsFromSummary(
       threadVisible,
       workerTabs,
       messageIds: Array.from(messageIdAliases),
-      message: createRustTimelineMessage({
-        id: artifactId,
-        content,
-        timestamp,
-        sessionId,
-        eventSeq: 0,
-        role,
-        type,
-        blocks,
-        source,
-        metadata: {
-          turnId,
-          turnSeq: normalizeNumber(turn?.turn_seq, 0),
-          turnItemId: itemId,
-          turnItemKind: kind,
-          itemSeq: orderItemSeq,
-          blockSeq: orderItemSeq,
-          laneId: projectedWorkerTabId ? (laneId || undefined) : undefined,
-          laneSeq: normalizeNumber(item.lane_seq, 0) || undefined,
-          cardStreamSeq: orderItemSeq,
-          workerId: projectedWorkerTabId ? (workerId || undefined) : undefined,
-          roleId: projectedWorkerTabId || undefined,
-          currentTurnWorkerLanes,
-          requestId: requestId || undefined,
-          userMessageId: isUserTurnItem && userMessageId ? userMessageId : undefined,
-          placeholderMessageId: isAssistantResponseTurnItem && placeholderMessageId ? placeholderMessageId : undefined,
-          timelineEntryId: timelineEntryId || undefined,
-          ...(kind === 'tool_call_started' || kind === 'tool_call_result'
-            ? {
-                toolCallId: toolCallId || itemId,
-                toolName: normalizeString(item.tool_name) || normalizeString(item.title) || 'tool',
-              }
-            : {}),
-          ...((kind === 'assistant_final' || kind === 'assistant_error')
-            && typeof turn?.response_duration_ms === 'number'
-            ? { responseDurationMs: Math.max(0, Math.floor(turn.response_duration_ms)) }
-            : {}),
-        },
-      }),
+      message: {
+        ...createRustTimelineMessage({
+          id: artifactId,
+          content,
+          timestamp,
+          sessionId,
+          eventSeq: 0,
+          role,
+          type,
+          blocks,
+          source,
+          metadata: {
+            turnId,
+            turnSeq: normalizeNumber(turn?.turn_seq, 0),
+            turnItemId: itemId,
+            turnItemKind: kind,
+            itemSeq: orderItemSeq,
+            blockSeq: orderItemSeq,
+            laneId: projectedWorkerTabId ? (laneId || undefined) : undefined,
+            laneSeq: normalizeNumber(item.lane_seq, 0) || undefined,
+            cardStreamSeq: orderItemSeq,
+            workerId: projectedWorkerTabId ? (workerId || undefined) : undefined,
+            roleId: projectedWorkerTabId || undefined,
+            currentTurnWorkerLanes,
+            requestId: requestId || undefined,
+            userMessageId: isUserTurnItem && userMessageId ? userMessageId : undefined,
+            placeholderMessageId: isAssistantResponseTurnItem && placeholderMessageId ? placeholderMessageId : undefined,
+            timelineEntryId: timelineEntryId || undefined,
+            ...(kind === 'tool_call_started' || kind === 'tool_call_result'
+              ? {
+                  toolCallId: toolCallId || itemId,
+                  toolName: normalizeString(item.tool_name) || normalizeString(item.title) || 'tool',
+                }
+              : {}),
+            ...((kind === 'assistant_final' || kind === 'assistant_error')
+              && typeof turn?.response_duration_ms === 'number'
+              ? { responseDurationMs: Math.max(0, Math.floor(turn.response_duration_ms)) }
+              : {}),
+          },
+        }),
+        isStreaming: isStreamingAssistantTurnItem,
+        isComplete: !isStreamingAssistantTurnItem,
+      },
     });
   }
   return artifacts;
@@ -2659,29 +2633,21 @@ function buildToolArtifacts(
           standardized: standardized || undefined,
         },
       };
-      const blocks: ContentBlock[] = [toolCallBlock];
-      if (entry.status === 'success' || entry.status === 'error') {
-        blocks.push({
-          type: 'tool_result',
-          content: resultSummary,
-          toolCall: {
-            id: entry.toolCallId,
-            name: entry.toolName,
-            arguments: {},
-            status: entry.status,
-            result: entry.status === 'success' ? resultSummary : undefined,
-            error: entry.status === 'error' ? resultSummary : undefined,
-            standardized: standardized || undefined,
-          },
-        });
-      }
+      const blocks: ContentBlock[] = [{
+        ...toolCallBlock,
+        toolCall: {
+          ...toolCallBlock.toolCall!,
+          result: entry.status === 'success' ? resultSummary : undefined,
+          error: entry.status === 'error' ? resultSummary : undefined,
+        },
+      }];
       const artifactId = `event-tool:${entry.toolCallId}`;
       const messageIds = Array.from(new Set([
         artifactId,
         entry.toolCallId,
         `rust-timeline:${entry.toolCallId}`,
-        `rust-timeline:turn-item-tool-started-${entry.toolCallId}`,
-        `rust-timeline:turn-item-tool-result-${entry.toolCallId}`,
+        `turn-item-tool-${entry.toolCallId}`,
+        `rust-timeline:turn-item-tool-${entry.toolCallId}`,
       ]));
       return {
         artifactId,

@@ -24,13 +24,20 @@
   let _lastUpdateTime = 0;
   let _pendingTimer: ReturnType<typeof setTimeout> | null = null;
 
+  function updateProcessedSource(rawContent: string, streaming: boolean): void {
+    const nextSource = preprocessMarkdown(rawContent, streaming);
+    if (nextSource !== processedSource) {
+      processedSource = nextSource;
+    }
+  }
+
   $effect(() => {
     const rawContent = content || '';
     const streaming = isStreaming;
 
     if (!streaming) {
       if (_pendingTimer) { clearTimeout(_pendingTimer); _pendingTimer = null; }
-      processedSource = preprocessMarkdown(rawContent, false);
+      updateProcessedSource(rawContent, false);
       _lastUpdateTime = performance.now();
       return;
     }
@@ -43,14 +50,13 @@
 
     if (elapsed >= interval) {
       if (_pendingTimer) { clearTimeout(_pendingTimer); _pendingTimer = null; }
-      processedSource = preprocessMarkdown(rawContent, true);
+      updateProcessedSource(rawContent, true);
       _lastUpdateTime = now;
     } else {
       if (!_pendingTimer) {
         _pendingTimer = setTimeout(() => {
           if (isStreaming) {
-            // 利用闭包外最新 content
-            processedSource = preprocessMarkdown(content || '', true);
+            updateProcessedSource(content || '', true);
             _lastUpdateTime = performance.now();
           }
           _pendingTimer = null;
@@ -73,24 +79,17 @@
   };
 </script>
 
-<div class="markdown-content" class:streaming={isStreaming}>
+<div class="markdown-content">
   <SvelteMarkdown
     source={processedSource}
     {renderers}
     {options}
-    streaming={isStreaming}
   />
 </div>
 
 <style>
   .markdown-content {
     color: var(--foreground);
-  }
-
-  /* 流式状态下禁用某些动画以提高性能 */
-  .markdown-content.streaming :global(*) {
-    animation: none !important;
-    transition: none !important;
   }
 
   /* Markdown 元素样式 */

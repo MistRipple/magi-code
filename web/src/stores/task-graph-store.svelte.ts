@@ -39,6 +39,7 @@ const SSE_DEBOUNCE_MS = 300;
 const SETTLE_REFRESH_DELAY_MS = 1500;
 
 let sessionStates = $state<Record<string, InternalSessionTaskGraphState>>({});
+let activeTaskGraphSessionId = '';
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 let settleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let sseUnsubscribe: (() => void) | null = null;
@@ -79,9 +80,9 @@ function readSessionState(sessionId: string): InternalSessionTaskGraphState | nu
 }
 
 function trackedSessionIds(): string[] {
-  return Object.entries(sessionStates)
-    .filter(([, state]) => Boolean(state?.rootTaskId))
-    .map(([sessionId]) => sessionId);
+  const activeSessionId = normalizeSessionKey(activeTaskGraphSessionId);
+  const activeState = activeSessionId ? sessionStates[activeSessionId] : undefined;
+  return activeState?.rootTaskId ? [activeSessionId] : [];
 }
 
 async function refreshTrackedSessions(): Promise<void> {
@@ -104,6 +105,24 @@ export function ensureTaskGraphState(sessionId: string | null | undefined): void
     return;
   }
   ensureSessionState(normalizedSessionId);
+}
+
+export function activateTaskGraphSession(sessionId: string | null | undefined): void {
+  const normalizedSessionId = normalizeSessionKey(sessionId);
+  if (!normalizedSessionId) {
+    activeTaskGraphSessionId = '';
+    stopAutoRefresh();
+    return;
+  }
+  if (activeTaskGraphSessionId === normalizedSessionId) {
+    return;
+  }
+  activeTaskGraphSessionId = normalizedSessionId;
+  if (trackedSessionIds().length === 0) {
+    stopAutoRefresh();
+  } else {
+    startAutoRefresh();
+  }
 }
 
 export async function fetchTaskProjection(
@@ -176,6 +195,9 @@ export async function fetchTaskProjection(
 export async function refreshTaskProjection(sessionId: string | null | undefined): Promise<void> {
   const normalizedSessionId = normalizeSessionKey(sessionId);
   if (!normalizedSessionId) {
+    return;
+  }
+  if (activeTaskGraphSessionId !== normalizedSessionId) {
     return;
   }
   const state = ensureSessionState(normalizedSessionId);
@@ -256,10 +278,17 @@ export function clearTaskGraph(sessionId?: string | null): void {
   const normalizedSessionId = normalizeSessionKey(sessionId);
   if (!normalizedSessionId) {
     sessionStates = {};
+    activeTaskGraphSessionId = '';
     stopAutoRefresh();
     return;
   }
+  if (activeTaskGraphSessionId === normalizedSessionId) {
+    activeTaskGraphSessionId = '';
+  }
   if (!sessionStates[normalizedSessionId]) {
+    if (trackedSessionIds().length === 0) {
+      stopAutoRefresh();
+    }
     return;
   }
   const nextStates = { ...sessionStates };

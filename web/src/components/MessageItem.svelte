@@ -94,61 +94,7 @@
       !!b && typeof b === 'object' && 'type' in b
     )
   );
-  const presentationBlocks = $derived.by(() => {
-    const merged: ContentBlock[] = [];
-    const toolCallIndexById = new Map<string, number>();
-
-    const mergeToolCallBlock = (callBlock: ContentBlock, incomingBlock: ContentBlock): ContentBlock => {
-      const previousCall = callBlock.toolCall;
-      const incomingCall = incomingBlock.toolCall;
-      return {
-        ...callBlock,
-        type: 'tool_call',
-        content: callBlock.content || incomingBlock.content || '',
-        toolCall: {
-          ...previousCall,
-          ...incomingCall,
-          id: incomingCall?.id ?? previousCall?.id ?? '',
-          name: incomingCall?.name ?? previousCall?.name ?? 'Tool',
-          status: incomingCall?.status ?? previousCall?.status ?? 'running',
-          arguments: incomingCall?.arguments ?? previousCall?.arguments ?? {},
-          result: incomingCall?.result ?? previousCall?.result ?? (incomingBlock.content || undefined),
-          error: incomingCall?.error ?? previousCall?.error,
-          standardized: incomingCall?.standardized ?? previousCall?.standardized,
-          durationMs: incomingCall?.durationMs ?? previousCall?.durationMs,
-          startTime: incomingCall?.startTime ?? previousCall?.startTime,
-          endTime: incomingCall?.endTime ?? previousCall?.endTime,
-        },
-      };
-    };
-
-    for (const block of safeBlocks) {
-      if (block.type === 'tool_call' || block.type === 'tool_result') {
-        const toolId = typeof block.toolCall?.id === 'string' ? block.toolCall.id.trim() : '';
-        const normalizedBlock = block.type === 'tool_result'
-          ? {
-              ...block,
-              type: 'tool_call' as const,
-            }
-          : block;
-        if (toolId && toolCallIndexById.has(toolId)) {
-          const index = toolCallIndexById.get(toolId)!;
-          const previous = merged[index];
-          merged[index] = mergeToolCallBlock(previous, normalizedBlock);
-          continue;
-        }
-        if (toolId) {
-          toolCallIndexById.set(toolId, merged.length);
-        }
-        merged.push(normalizedBlock);
-        continue;
-      }
-
-      merged.push(block);
-    }
-
-    return merged;
-  });
+  const presentationBlocks = $derived(safeBlocks);
   // 检查是否真的有可见内容（防止虽然有 blocks 但全是空字符串导致 UI 假死）
   const hasVisibleContent = $derived.by(() => {
     if (message.content && message.content.trim().length > 0) return true;
@@ -482,23 +428,28 @@
           <MarkdownContent content={message.content} {isStreaming} />
         {/if}
 
-        {#if isStreaming && showStreamingIndicator}
-          <div class="streaming-indicator-bottom fallback" class:has-content={hasVisibleContent}>
-            <span class="streaming-dot"></span>
-            <span class="streaming-dot"></span>
-            <span class="streaming-dot"></span>
-            <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
+        {#if (isStreaming && showStreamingIndicator) || showResponseDuration}
+          <div
+            class="message-runtime-footer"
+            class:streaming={isStreaming && showStreamingIndicator}
+            class:completed={showResponseDuration && !(isStreaming && showStreamingIndicator)}
+            class:has-content={hasVisibleContent}
+          >
+            {#if isStreaming && showStreamingIndicator}
+              <span class="streaming-dot"></span>
+              <span class="streaming-dot"></span>
+              <span class="streaming-dot"></span>
+              <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
+            {:else if showResponseDuration}
+              <span class="message-runtime-text">
+                {i18n.t('messageItem.responseDurationLabel')} {formatDurationMs(responseDurationMs ?? 0)}
+              </span>
+            {/if}
           </div>
         {/if}
 
         {#if retryRuntime}
           <RetryRuntimeIndicator runtime={retryRuntime} />
-        {/if}
-
-        {#if showResponseDuration}
-          <div class="message-runtime-text">
-            {i18n.t('messageItem.responseDurationLabel')} {formatDurationMs(responseDurationMs ?? 0)}
-          </div>
         {/if}
 
       {/if}
@@ -732,8 +683,8 @@
     padding-bottom: var(--space-2);
   }
 
-  /* 当有内容时的加载指示器，增加上边距，和内容拉开距离 */
-  .streaming-indicator-bottom.fallback.has-content {
+  /* 底部运行态区域在 streaming 与完成态之间复用同一容器，避免完成瞬间高度跳变。 */
+  .message-runtime-footer.has-content {
     margin-top: var(--space-3);
     padding-top: var(--space-2);
   }
@@ -861,7 +812,8 @@
 
 
   /* 流式消息底部加载指示器：统一的三个点动画 */
-  .streaming-indicator-bottom {
+  .streaming-indicator-bottom,
+  .message-runtime-footer {
     display: flex;
     align-items: center;
     gap: 6px;
@@ -869,7 +821,8 @@
     margin-top: var(--space-3);
   }
 
-  .streaming-indicator-bottom.fallback {
+  .message-runtime-footer {
+    min-height: calc(var(--text-xs) * 1.4 + var(--space-2));
     margin-top: 0;
     padding: var(--space-1) 0;
   }
@@ -900,7 +853,6 @@
   }
 
   .message-runtime-text {
-    margin-top: var(--space-2);
     color: var(--foreground-muted);
     font-size: var(--text-xs);
     line-height: 1.4;

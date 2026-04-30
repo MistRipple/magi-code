@@ -46,7 +46,6 @@ import {
   mapStandardBlocks,
   formatPlanBlock,
 } from './message-utils';
-import { mergeCompleteBlocksForFinalization } from './streaming-complete-merge';
 import { resolveTimelineWorkerId } from '../shared/timeline-worker-lifecycle';
 import { resolveStandardMessageSessionBinding } from '../shared/standard-message-session-binding';
 import {
@@ -330,15 +329,13 @@ function shouldProcessByEventSeq(message: ClientBridgeMessage): boolean {
     eventSeqSessionId = incomingSessionId;
   }
   const { eventSeq, eventKey } = resolveEventSeqAndKey(message);
-  // SSE 单连接语义下，不应出现严格递减序号。
-  // 一旦出现，通常意味着后端 runtime 重启后序号重新起算，必须重置基线。
   if (eventSeq !== undefined && eventSeq < lastAppliedEventSeq) {
-    console.warn('[MessageHandler] 检测到 eventSeq 回退，重置追踪基线', {
+    console.warn('[MessageHandler] 丢弃回退的 eventSeq', {
       eventSeq,
       lastAppliedEventSeq,
       type: message.type,
     });
-    resetEventSeqTracking(eventSeq - 1, incomingSessionId || eventSeqSessionId);
+    return false;
   }
   if (eventSeq === undefined) {
     return true;
@@ -645,30 +642,40 @@ function handleStandardComplete(message: ClientBridgeMessage) {
 
   const existingMessage = getTimelineMessageById(actualMessageId)
     || (placeholderReplacementId ? getTimelineMessageById(placeholderReplacementId) : undefined);
-  const mergedBlocks = mergeCompleteBlocksForFinalization(
-    existingMessage?.blocks,
-    uiMessage.blocks,
-    uiMessage.blocks,
-  );
+  if (!existingMessage) {
+    const isTerminalRequestResponse = isRequestTerminalAssistantResponse(uiMessage);
+    markMessageComplete(actualMessageId);
+    if (placeholderReplacementId) {
+      markMessageComplete(placeholderReplacementId);
+    }
+    if (requestId && isTerminalRequestResponse) {
+      finalizeTerminalRequestResponse(requestId, actualMessageId);
+    }
+    settleProcessingAfterResponseCompletion();
+    return;
+  }
   const completedMessageBase: Message = {
-    ...uiMessage,
+    ...existingMessage,
     isStreaming: false,
     isComplete: true,
-    metadata: uiMetadata,
-    ...(mergedBlocks ? {
-      blocks: mergedBlocks,
-      content: blocksToContent(mergedBlocks),
-    } : {}),
+    metadata: {
+      ...(existingMessage.metadata || {}),
+      ...uiMetadata,
+    },
   };
   const isTerminalRequestResponse = isRequestTerminalAssistantResponse(completedMessageBase);
+  const completedMetadata = completedMessageBase.metadata || {};
   const completedMessage = {
     ...completedMessageBase,
     metadata: isTerminalRequestResponse
       ? {
-          ...uiMetadata,
+          ...completedMetadata,
           ...(typeof authoritativeResponseDurationMs === 'number' ? { responseDurationMs: authoritativeResponseDurationMs } : {}),
         }
-      : uiMetadataWithoutResponseDuration,
+      : {
+          ...completedMetadata,
+          ...uiMetadataWithoutResponseDuration,
+        },
   };
 
   if (
@@ -691,18 +698,7 @@ function handleStandardComplete(message: ClientBridgeMessage) {
   // 只有最终 assistant 回复或 assistant 错误才能结束本轮请求。
   // 工具卡、思考块和中途 assistant_stream 完成只更新原位节点，不能提前清理 pending 状态。
   if (requestId && isTerminalRequestResponse) {
-    clearPendingRequest(requestId);
-    const binding = getRequestBinding(requestId);
-    if (binding?.timeoutId) {
-      clearTimeout(binding.timeoutId);
-    }
-    if (binding) {
-      updateRequestBinding(requestId, {
-        realMessageId: actualMessageId,
-        timeoutId: undefined,
-      });
-      clearRequestBinding(requestId);
-    }
+    finalizeTerminalRequestResponse(requestId, actualMessageId);
   }
   settleProcessingAfterResponseCompletion();
 }
@@ -860,6 +856,21 @@ function resolvePlaceholderReplacementId(
   return placeholderMessageId;
 }
 
+function finalizeTerminalRequestResponse(requestId: string, actualMessageId: string): void {
+  clearPendingRequest(requestId);
+  const binding = getRequestBinding(requestId);
+  if (binding?.timeoutId) {
+    clearTimeout(binding.timeoutId);
+  }
+  if (binding) {
+    updateRequestBinding(requestId, {
+      realMessageId: actualMessageId,
+      timeoutId: undefined,
+    });
+    clearRequestBinding(requestId);
+  }
+}
+
 function mapStandardMessage(standard: StandardMessage): Message {
   const blocks = mapStandardBlocks(standard.blocks || []);
   const content = blocksToContent(blocks);
@@ -995,30 +1006,34 @@ function mergeBlocks(existing: ContentBlock[], incoming: ContentBlock[]): Conten
   const next = [...safeExisting];
   for (const block of safeIncoming) {
     if ((block.type === 'tool_call' || block.type === 'tool_result') && block.toolCall?.id) {
-      const idx = next.findIndex((b) => b.type === block.type && b.toolCall?.id === block.toolCall?.id);
+      const idx = next.findIndex((b) => (b.type === 'tool_call' || b.type === 'tool_result') && b.toolCall?.id === block.toolCall?.id);
+      const canonicalToolBlock: ContentBlock = {
+        ...block,
+        type: 'tool_call',
+      };
       if (idx >= 0) {
         const prev = next[idx];
         const prevToolCall = prev.toolCall;
-        const incomingToolCall = block.toolCall;
+        const incomingToolCall = canonicalToolBlock.toolCall!;
         next[idx] = {
           ...prev,
-          ...block,
+          ...canonicalToolBlock,
+          type: 'tool_call',
           toolCall: {
-            ...prevToolCall,
-            ...incomingToolCall,
-            // block_update 允许只传增量字段，缺失字段必须保留已有值，
-            // 否则会把 result/arguments 覆盖成 undefined，导致 terminalId 丢失（UI 显示 #-）
-            arguments: incomingToolCall?.arguments ?? prevToolCall?.arguments,
-            result: incomingToolCall?.result ?? prevToolCall?.result,
-            error: incomingToolCall?.error ?? prevToolCall?.error,
-            standardized: incomingToolCall?.standardized ?? prevToolCall?.standardized,
-            durationMs: incomingToolCall?.durationMs ?? prevToolCall?.durationMs,
-            startTime: incomingToolCall?.startTime ?? prevToolCall?.startTime,
-            endTime: incomingToolCall?.endTime ?? prevToolCall?.endTime,
+            id: incomingToolCall.id,
+            name: incomingToolCall.name || prevToolCall?.name || 'tool',
+            status: incomingToolCall.status || prevToolCall?.status || 'pending',
+            arguments: incomingToolCall.arguments ?? prevToolCall?.arguments ?? {},
+            result: incomingToolCall.result ?? prevToolCall?.result,
+            error: incomingToolCall.error ?? prevToolCall?.error,
+            standardized: incomingToolCall.standardized ?? prevToolCall?.standardized,
+            durationMs: incomingToolCall.durationMs ?? prevToolCall?.durationMs,
+            startTime: incomingToolCall.startTime ?? prevToolCall?.startTime,
+            endTime: incomingToolCall.endTime ?? prevToolCall?.endTime,
           },
         };
       } else {
-        next.push(block);
+        next.push(canonicalToolBlock);
       }
       continue;
     }
