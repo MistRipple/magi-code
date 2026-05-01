@@ -702,6 +702,7 @@ export interface BootstrapDto {
   currentSession?: SessionDto | null;
   sessions: SessionDto[];
   timeline: TimelineEntryDto[];
+  canonicalTurns?: unknown[];
   workspaces: WorkspaceDto[];
   snapshots: SnapshotDto[];
   recoveryHandles: RecoveryHandleDto[];
@@ -1195,6 +1196,7 @@ export interface MessagesResponseDto {
   currentSession?: SessionDto | null;
   sessions: SessionDto[];
   timeline: TimelineEntryDto[];
+  canonicalTurns?: unknown[];
   notifications: NotificationDto[];
   sessionId: string;
   hasMoreBefore: boolean;

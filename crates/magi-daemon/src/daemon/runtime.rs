@@ -5,7 +5,9 @@ use super::{
     maintenance::{ShadowRuntimeMaintenance, ShadowRuntimeMaintenanceConfig},
     persistence::{ShadowRuntimeSidecarPersistence, ShadowStateRepository},
 };
-use magi_api::task_execution::ShadowTaskDispatcher;
+use magi_api::task_execution::{
+    ShadowTaskDispatcher, publish_task_status_turn_item_for_active_sessions,
+};
 use magi_api::{
     ApiState, DirectHttpModelProbeConfig, RunnerManager, RuntimeStatePersistence, SettingsStore,
     build_router,
@@ -467,10 +469,12 @@ impl ShadowDaemonRuntime {
         let tool_registry_for_dispatcher = tool_registry.clone();
         let task_store_checkpoint_path = self.state_root.join("task-store.json");
         let event_bus_for_task_store = self.event_bus.clone();
+        let session_store_for_task_status = self.session_store.clone();
         let runner_result_receiver = Arc::new(EventBasedResultReceiver::new());
         let task_store = match TaskStore::restore_from_file(&task_store_checkpoint_path) {
             Ok(Some(restored)) => {
                 let eb = event_bus_for_task_store.clone();
+                let session_store = session_store_for_task_status.clone();
                 let receiver = runner_result_receiver.clone();
                 restored.set_status_change_callback(Box::new(
                     move |task_id, old_status, new_status, task: magi_core::Task| {
@@ -482,6 +486,13 @@ impl ShadowDaemonRuntime {
                             &format!("{:?}", task.kind),
                         );
                         let _ = eb.publish(event);
+                        publish_task_status_turn_item_for_active_sessions(
+                            &eb,
+                            session_store.as_ref(),
+                            None,
+                            &task,
+                            new_status,
+                        );
                         push_terminal_task_result(&receiver, task_id, new_status);
                     },
                 ));
@@ -498,6 +509,7 @@ impl ShadowDaemonRuntime {
             }
             _ => {
                 let receiver = runner_result_receiver.clone();
+                let session_store = session_store_for_task_status.clone();
                 Arc::new(TaskStore::with_status_change_callback(Box::new(
                     move |task_id, old_status, new_status, task: magi_core::Task| {
                         let event = magi_event_bus::task_events::task_status_changed_event(
@@ -508,6 +520,13 @@ impl ShadowDaemonRuntime {
                             &format!("{:?}", task.kind),
                         );
                         let _ = event_bus_for_task_store.publish(event);
+                        publish_task_status_turn_item_for_active_sessions(
+                            &event_bus_for_task_store,
+                            session_store.as_ref(),
+                            None,
+                            &task,
+                            new_status,
+                        );
                         push_terminal_task_result(&receiver, task_id, new_status);
                     },
                 )))
@@ -748,6 +767,12 @@ impl ShadowDaemonRuntime {
                     .timeline
                     .iter()
                     .filter(|entry| session_ids.contains(&entry.session_id))
+                    .cloned()
+                    .collect(),
+                canonical_turns: durable
+                    .canonical_turns
+                    .iter()
+                    .filter(|turn| session_ids.contains(&turn.session_id))
                     .cloned()
                     .collect(),
                 notifications: durable

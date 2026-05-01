@@ -19,15 +19,17 @@ use magi_event_bus::{
 use magi_governance::ToolKind;
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{
-    ActiveExecutionChain, ActiveExecutionTurn, ActiveExecutionTurnItem, SessionRuntimeSidecar,
-    SessionStore, TimelineEntryKind,
+    ActiveExecutionChain, ActiveExecutionTurn, ActiveExecutionTurnItem,
+    CANONICAL_TURN_SCHEMA_VERSION, CanonicalToolCall, CanonicalTurn, CanonicalTurnEventKind,
+    CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus,
+    CanonicalTurnVisibility, CanonicalWorkerRef, SessionRuntimeSidecar, SessionStore,
 };
 use magi_skill_runtime::SkillRuntime;
 use magi_tool_runtime::{
     ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
 };
-use serde::Serialize;
-use std::thread;
+use serde_json::Value;
+use std::{collections::HashMap, thread};
 
 #[derive(Clone, Debug)]
 pub(crate) struct PublishedSessionTurnItem {
@@ -37,6 +39,8 @@ pub(crate) struct PublishedSessionTurnItem {
     pub current_turn: SessionRuntimeTurnSummaryEntry,
     pub turn_items: Vec<SessionRuntimeTurnItemSummaryEntry>,
     pub worker_lanes: Vec<SessionRuntimeTurnLaneSummaryEntry>,
+    pub canonical_turn: Option<CanonicalTurn>,
+    pub canonical_item: Option<CanonicalTurnItem>,
 }
 
 fn published_session_turn_item_from_sidecar(
@@ -55,6 +59,8 @@ fn published_session_turn_item_from_sidecar(
         .completed_at
         .map(|completed_at| completed_at.0.saturating_sub(turn.accepted_at.0));
     let lane_status_by_id = turn_lane_status_by_id(turn, task_store);
+    let canonical_turn = to_canonical_turn(&sidecar.session_id, turn);
+    let canonical_item = to_canonical_turn_item(&sidecar.session_id, turn, &item);
     Some(PublishedSessionTurnItem {
         turn_id: turn.turn_id.clone(),
         turn_seq: turn.turn_seq,
@@ -87,6 +93,8 @@ fn published_session_turn_item_from_sidecar(
                 to_turn_lane_summary(lane, status, task_store)
             })
             .collect(),
+        canonical_turn,
+        canonical_item,
     })
 }
 
@@ -106,6 +114,169 @@ fn turn_has_execution_chain_items(turn: &ActiveExecutionTurn) -> bool {
         || turn.items.iter().any(|item| {
             item.task_id.is_some() || item.worker_id.is_some() || item.lane_id.is_some()
         })
+}
+
+fn canonical_turn_status(status: &str) -> Option<CanonicalTurnStatus> {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "pending" | "queued" | "accepted" => Some(CanonicalTurnStatus::Pending),
+        "running" | "started" | "streaming" | "blocked" | "awaiting_approval"
+        | "review_required" | "repairing" | "verifying" => Some(CanonicalTurnStatus::Running),
+        "completed" | "complete" | "succeeded" | "success" => Some(CanonicalTurnStatus::Completed),
+        "failed" | "error" => Some(CanonicalTurnStatus::Failed),
+        "cancelled" | "canceled" => Some(CanonicalTurnStatus::Cancelled),
+        _ => None,
+    }
+}
+
+fn canonical_item_status(status: &str) -> Option<CanonicalTurnItemStatus> {
+    match canonical_turn_status(status)? {
+        CanonicalTurnStatus::Pending => Some(CanonicalTurnItemStatus::Pending),
+        CanonicalTurnStatus::Running => Some(CanonicalTurnItemStatus::Running),
+        CanonicalTurnStatus::Completed => Some(CanonicalTurnItemStatus::Completed),
+        CanonicalTurnStatus::Failed => Some(CanonicalTurnItemStatus::Failed),
+        CanonicalTurnStatus::Cancelled => Some(CanonicalTurnItemStatus::Cancelled),
+    }
+}
+
+fn canonical_item_kind(kind: &str) -> Option<CanonicalTurnItemKind> {
+    match kind {
+        "user_message" => Some(CanonicalTurnItemKind::UserMessage),
+        "assistant_stream" | "assistant_final" | "assistant_error" => {
+            Some(CanonicalTurnItemKind::AssistantText)
+        }
+        "assistant_thinking" => Some(CanonicalTurnItemKind::AssistantThinking),
+        "assistant_phase" => Some(CanonicalTurnItemKind::SystemNotice),
+        "tool_call_started" | "tool_call_result" => Some(CanonicalTurnItemKind::ToolCall),
+        "worker_spawned" => Some(CanonicalTurnItemKind::WorkerDispatch),
+        "worker_status" => Some(CanonicalTurnItemKind::WorkerStatus),
+        "worker_result" => Some(CanonicalTurnItemKind::WorkerResult),
+        "task_status" => Some(CanonicalTurnItemKind::TaskStatus),
+        _ => None,
+    }
+}
+
+fn canonical_tool_arguments(arguments: &Option<String>) -> Option<Value> {
+    let arguments = arguments.as_ref()?.trim();
+    if arguments.is_empty() {
+        return None;
+    }
+    serde_json::from_str(arguments)
+        .ok()
+        .or_else(|| Some(Value::String(arguments.to_string())))
+}
+
+fn canonical_tool_result(result: &Option<String>) -> Option<Value> {
+    let result = result.as_ref()?.trim();
+    if result.is_empty() {
+        return None;
+    }
+    serde_json::from_str(result)
+        .ok()
+        .or_else(|| Some(Value::String(result.to_string())))
+}
+
+fn to_canonical_tool_call(item: &ActiveExecutionTurnItem) -> Option<CanonicalToolCall> {
+    let call_id = item.tool_call_id.clone()?;
+    let name = item.tool_name.clone()?;
+    Some(CanonicalToolCall {
+        call_id,
+        name,
+        arguments: canonical_tool_arguments(&item.tool_arguments),
+        result: canonical_tool_result(&item.tool_result),
+        error: item.tool_error.clone(),
+    })
+}
+
+fn to_canonical_worker_ref(item: &ActiveExecutionTurnItem) -> Option<CanonicalWorkerRef> {
+    if item.task_id.is_none() && item.worker_id.is_none() && item.role_id.is_none() {
+        return None;
+    }
+    Some(CanonicalWorkerRef {
+        task_id: item.task_id.clone(),
+        worker_id: item.worker_id.clone(),
+        role_id: item.role_id.clone(),
+        title: item.title.clone(),
+    })
+}
+
+fn to_canonical_turn_item(
+    session_id: &SessionId,
+    turn: &ActiveExecutionTurn,
+    item: &ActiveExecutionTurnItem,
+) -> Option<CanonicalTurnItem> {
+    let kind = canonical_item_kind(&item.kind)?;
+    let tool = to_canonical_tool_call(item);
+    if kind == CanonicalTurnItemKind::ToolCall && tool.is_none() {
+        return None;
+    }
+    Some(CanonicalTurnItem {
+        session_id: session_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        turn_seq: turn.turn_seq,
+        item_id: item.item_id.clone(),
+        item_seq: item.item_seq,
+        kind,
+        created_at: turn.accepted_at,
+        status: canonical_item_status(&item.status)?,
+        item_version: None,
+        updated_at: UtcMillis::now(),
+        lane_id: item.lane_id.clone(),
+        lane_seq: item.lane_seq,
+        title: item.title.clone(),
+        content: item.content.clone(),
+        blocks: Vec::new(),
+        tool,
+        worker: to_canonical_worker_ref(item),
+        visibility: CanonicalTurnVisibility {
+            thread_visible: item.thread_visible,
+            worker_visible: item.worker_visible,
+            renderable: item
+                .content
+                .as_ref()
+                .is_none_or(|content| !content.trim().is_empty())
+                || item.tool_call_id.is_some()
+                || item.worker_id.is_some()
+                || item.task_id.is_some(),
+            worker_tab_ids: item
+                .worker_id
+                .as_ref()
+                .map(|worker_id| vec![worker_id.to_string()])
+                .unwrap_or_default(),
+        },
+        metadata: HashMap::new(),
+    })
+}
+
+fn canonical_event_kind(turn: Option<&CanonicalTurn>) -> CanonicalTurnEventKind {
+    match turn.map(|turn| turn.status) {
+        Some(status) if status.is_terminal() => CanonicalTurnEventKind::TurnCompleted,
+        Some(CanonicalTurnStatus::Pending) => CanonicalTurnEventKind::TurnStarted,
+        _ => CanonicalTurnEventKind::TurnItemUpsert,
+    }
+}
+
+fn to_canonical_turn(session_id: &SessionId, turn: &ActiveExecutionTurn) -> Option<CanonicalTurn> {
+    let items = turn
+        .items
+        .iter()
+        .filter_map(|item| to_canonical_turn_item(session_id, turn, item))
+        .collect::<Vec<_>>();
+    let mut canonical_turn = CanonicalTurn {
+        session_id: session_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        turn_seq: turn.turn_seq,
+        accepted_at: turn.accepted_at,
+        completed_at: turn.completed_at,
+        status: canonical_turn_status(&turn.status)?,
+        response_duration_ms: turn
+            .completed_at
+            .map(|completed_at| completed_at.0.saturating_sub(turn.accepted_at.0)),
+        usage: None,
+        items,
+        metadata: HashMap::new(),
+    };
+    canonical_turn.normalize();
+    Some(canonical_turn)
 }
 
 pub(crate) fn session_turn_item(
@@ -206,6 +377,10 @@ pub(crate) fn publish_session_turn_item_event(
                 "current_turn": published.current_turn,
                 "turn_items": published.turn_items,
                 "worker_lanes": published.worker_lanes,
+                "canonical_schema_version": CANONICAL_TURN_SCHEMA_VERSION,
+                "canonical_event_kind": canonical_event_kind(published.canonical_turn.as_ref()),
+                "canonical_turn": published.canonical_turn,
+                "canonical_item": published.canonical_item,
             }),
         )
         .with_context(EventContext {
@@ -244,7 +419,7 @@ pub(crate) fn append_session_turn_error_item(
     user_message_id: Option<&str>,
     placeholder_message_id: Option<&str>,
     error_text: &str,
-    streaming_entry_id: Option<&str>,
+    _streaming_entry_id: Option<&str>,
 ) {
     let mut error_item = session_turn_item(
         "assistant_error",
@@ -270,47 +445,6 @@ pub(crate) fn append_session_turn_error_item(
         &error_item_id,
         None,
     );
-    let timeline_message = build_completed_turn_timeline_snapshot(
-        session_store,
-        session_id,
-        Some(error_text),
-        streaming_entry_id,
-        None,
-    )
-    .unwrap_or_else(|| error_text.to_string());
-    let fallback_entry_id = session_store
-        .runtime_sidecar(session_id)
-        .and_then(|sidecar| {
-            sidecar.current_turn.as_ref().map(|turn| {
-                format!(
-                    "timeline-turn-snapshot-error-{}-{}",
-                    session_id, turn.turn_id
-                )
-            })
-        })
-        .unwrap_or_else(|| format!("timeline-turn-snapshot-error-{}", session_id));
-    let entry_id = streaming_entry_id.unwrap_or(fallback_entry_id.as_str());
-    session_store.upsert_timeline_entry(
-        session_id.clone(),
-        entry_id,
-        TimelineEntryKind::AssistantMessage,
-        timeline_message,
-    );
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-struct CompletedTurnTimelineSnapshot {
-    session_id: String,
-    mission_id: Option<String>,
-    root_task_id: Option<String>,
-    execution_chain_ref: Option<String>,
-    final_text: Option<String>,
-    streaming_entry_id: Option<String>,
-    is_historical_turn_snapshot: bool,
-    current_turn: SessionRuntimeTurnSummaryEntry,
-    turn_items: Vec<SessionRuntimeTurnItemSummaryEntry>,
-    worker_lanes: Vec<SessionRuntimeTurnLaneSummaryEntry>,
 }
 
 fn task_role_id(task_store: Option<&TaskStore>, task_id: &TaskId) -> Option<String> {
@@ -414,89 +548,6 @@ fn to_turn_lane_summary(
         status: status.to_string(),
         is_primary: lane.is_primary,
     }
-}
-
-pub(crate) fn build_completed_turn_timeline_snapshot(
-    session_store: &SessionStore,
-    session_id: &SessionId,
-    fallback_final_text: Option<&str>,
-    streaming_entry_id: Option<&str>,
-    task_store: Option<&TaskStore>,
-) -> Option<String> {
-    let sidecar = session_store.runtime_sidecar(session_id)?;
-    let turn = sidecar.current_turn.as_ref()?;
-    let chain = chain_for_turn_summary(&sidecar, turn);
-    let completed_at = turn.completed_at?;
-    let response_duration_ms = Some(completed_at.0.saturating_sub(turn.accepted_at.0));
-    let final_text = fallback_final_text
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-        .or_else(|| {
-            turn.items
-                .iter()
-                .rev()
-                .find(|item| item.kind == "assistant_final")
-                .and_then(|item| item.content.clone())
-                .filter(|text| !text.trim().is_empty())
-                .or_else(|| {
-                    turn.items
-                        .iter()
-                        .rev()
-                        .find(|item| item.kind == "assistant_error")
-                        .and_then(|item| item.content.clone())
-                        .filter(|text| !text.trim().is_empty())
-                        .or_else(|| {
-                            turn.items
-                                .iter()
-                                .rev()
-                                .find(|item| item.kind == "assistant_stream")
-                                .and_then(|item| item.content.clone())
-                                .filter(|text| !text.trim().is_empty())
-                        })
-                })
-        });
-
-    let lane_status_by_id = turn_lane_status_by_id(turn, task_store);
-
-    let snapshot = CompletedTurnTimelineSnapshot {
-        session_id: session_id.to_string(),
-        mission_id: chain.map(|chain| chain.mission_id.to_string()),
-        root_task_id: chain.map(|chain| chain.root_task_id.to_string()),
-        execution_chain_ref: chain.map(|chain| chain.execution_chain_ref.clone()),
-        final_text,
-        streaming_entry_id: streaming_entry_id.map(str::to_string),
-        is_historical_turn_snapshot: true,
-        current_turn: SessionRuntimeTurnSummaryEntry {
-            turn_id: turn.turn_id.clone(),
-            turn_seq: turn.turn_seq,
-            accepted_at: Some(turn.accepted_at),
-            completed_at: Some(completed_at),
-            response_duration_ms,
-            status: turn.status.clone(),
-            user_message: turn.user_message.clone(),
-            mission_id: chain.map(|chain| chain.mission_id.to_string()),
-            root_task_id: chain.map(|chain| chain.root_task_id.to_string()),
-            execution_chain_ref: chain.map(|chain| chain.execution_chain_ref.clone()),
-        },
-        turn_items: turn
-            .items
-            .iter()
-            .map(|item| to_turn_item_summary(item, task_store))
-            .collect(),
-        worker_lanes: turn
-            .worker_lanes
-            .iter()
-            .map(|lane| {
-                let status = lane_status_by_id
-                    .get(&lane.lane_id)
-                    .map(String::as_str)
-                    .unwrap_or(turn.status.as_str());
-                to_turn_lane_summary(lane, status, task_store)
-            })
-            .collect(),
-    };
-
-    serde_json::to_string(&snapshot).ok()
 }
 
 pub(crate) fn append_session_tool_call_items_batch(
@@ -1182,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_plain_turn_snapshot_does_not_inherit_previous_execution_chain() {
+    fn completed_plain_turn_summary_does_not_inherit_previous_execution_chain() {
         let session_store = SessionStore::new();
         let session_id = SessionId::new("session-plain-after-task");
         let mission_id = MissionId::new("mission-previous-task");
@@ -1242,36 +1293,28 @@ mod tests {
             .update_current_turn_status(&session_id, "completed")
             .expect("plain turn should complete");
 
-        let snapshot = build_completed_turn_timeline_snapshot(
-            &session_store,
-            &session_id,
-            Some("OK-普通流式"),
-            Some("turn-item-plain-final"),
-            None,
-        )
-        .expect("snapshot should be built");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&snapshot).expect("snapshot should be valid json");
+        let sidecar = session_store
+            .runtime_sidecar(&session_id)
+            .expect("runtime sidecar should exist");
+        let published =
+            published_session_turn_item_from_sidecar(sidecar, "turn-item-plain-final", None)
+                .expect("plain final item should publish");
 
         assert_eq!(
-            parsed["mission_id"],
-            serde_json::Value::Null,
-            "普通 turn 快照不能继承上一轮任务 mission_id"
+            published.current_turn.mission_id, None,
+            "普通 turn summary 不能继承上一轮任务 mission_id"
         );
         assert_eq!(
-            parsed["root_task_id"],
-            serde_json::Value::Null,
-            "普通 turn 快照不能继承上一轮任务 root_task_id"
+            published.current_turn.root_task_id, None,
+            "普通 turn summary 不能继承上一轮任务 root_task_id"
         );
         assert_eq!(
-            parsed["execution_chain_ref"],
-            serde_json::Value::Null,
-            "普通 turn 快照不能继承上一轮任务 execution_chain_ref"
+            published.current_turn.execution_chain_ref, None,
+            "普通 turn summary 不能继承上一轮任务 execution_chain_ref"
         );
-        assert_eq!(
-            parsed["current_turn"]["mission_id"],
-            serde_json::Value::Null,
-            "current_turn 同样必须保持普通对话归属"
+        assert!(
+            published.worker_lanes.is_empty(),
+            "普通 turn summary 不应携带上一轮 worker lane"
         );
     }
 }

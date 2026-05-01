@@ -15,8 +15,6 @@ import {
   clearPendingInteractions,
   clearAllMessages,
   setTimelineProjection,
-  prependTimelineProjectionPage,
-  applyLiveTimelineProjectionUpdate,
   addToast,
   clearPendingRequest,
   setProcessingActor,
@@ -45,7 +43,7 @@ import {
 import type {
   AppState, Message, Session,
   Edit,
-  ModelStatusMap, OrchestratorRuntimeState, SessionTimelineProjection,
+  ModelStatusMap, OrchestratorRuntimeState,
 } from '../types/message';
 import type { StandardMessage, ContentBlock as StandardContentBlock } from '../shared/protocol/message-protocol';
 import type { SessionBootstrapSnapshot } from '../shared/session-bootstrap';
@@ -57,6 +55,12 @@ import {
   handleRetryRuntimePayload,
 } from './message-utils';
 import { buildEmptyWorkspaceAppState } from '../shared/bridges/empty-workspace-state';
+import type { CanonicalTurn, CanonicalTurnEvent } from '../shared/protocol/canonical-turn';
+import {
+  applyCanonicalTurnEvent,
+  clearCanonicalSessionTurns,
+  replaceCanonicalSessionTurns,
+} from '../stores/turn-store.svelte';
 
 function normalizeStateSliceVersion(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : 0;
@@ -179,7 +183,7 @@ function handleStateUpdate(
   // timelineProjection / runtime state 不再通过 stateUpdate 覆盖。
   // 当前统一约束：
   // 1. sessionBootstrapLoaded 负责 restore / switch 的原子恢复；
-  // 2. 活跃会话的实时内容只由 unified message/update/complete 驱动；
+  // 2. 活跃会话的实时内容只由 canonical turn event 驱动；
   // 3. stateUpdate 只同步非时间轴、非 runtime state 的运行态。
 
   store.edits = mergedEdits;
@@ -390,6 +394,7 @@ export function handleUnifiedData(standard: StandardMessage) {
         messagesState.currentWorkspacePath = typeof payload.workspacePath === 'string' ? payload.workspacePath.trim() : '';
         if (!hasPendingLocalTurn) {
           setQueuedMessages([]);
+          clearCanonicalSessionTurns();
         }
         setOrchestratorRuntimeState(null);
         setAppState({
@@ -406,6 +411,7 @@ export function handleUnifiedData(standard: StandardMessage) {
         sessions: payload.sessions,
         state: payload.state,
         timelineProjection: payload.timelineProjection,
+        canonicalTurns: payload.canonicalTurns,
         notifications: payload.notifications,
         orchestratorRuntimeState: payload.orchestratorRuntimeState,
         hasMoreBefore: payload.hasMoreBefore,
@@ -421,17 +427,10 @@ export function handleUnifiedData(standard: StandardMessage) {
       break;
     }
 
-    case 'sessionTurnItemProjectionUpdated':
-      handleSessionTurnItemProjectionUpdated(asMessage({
+    case 'sessionTurnCanonicalEventUpdated':
+      handleSessionTurnCanonicalEventUpdated(asMessage({
         sessionId: payload.sessionId,
-        timelineProjection: payload.timelineProjection,
-      }));
-      break;
-
-    case 'timelineProjectionUpdated':
-      handleTimelineProjectionUpdated(asMessage({
-        sessionId: payload.sessionId,
-        timelineProjection: payload.timelineProjection,
+        canonicalEvent: payload.canonicalEvent,
       }));
       break;
 
@@ -599,18 +598,6 @@ function handleEmptyWorkspaceStateLoaded(message: ClientBridgeMessage) {
   });
 }
 
-function applyTimelineProjectionSnapshot(
-  sessionId: string,
-  timelineProjection: SessionTimelineProjection,
-  options: { hydrateNodes?: boolean } = {},
-): void {
-  const currentSessionId = getState().currentSessionId || '';
-  if (currentSessionId && sessionId && currentSessionId !== sessionId) {
-    return;
-  }
-  setTimelineProjection(timelineProjection, options);
-}
-
 function hasRenderableAssistantContent(message: Message): boolean {
   if (typeof message?.content === 'string' && message.content.trim().length > 0) {
     return true;
@@ -641,7 +628,8 @@ function isTerminalAssistantResponse(message: Message): boolean {
   if (!turnItemKind) {
     return message.type !== 'tool_call' && message.type !== 'thinking';
   }
-  return turnItemKind === 'assistant_final'
+  return turnItemKind === 'assistant_text'
+    || turnItemKind === 'assistant_final'
     || turnItemKind === 'assistant_error';
 }
 
@@ -727,45 +715,37 @@ function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): voi
   settleProcessingAfterResponseCompletion();
 }
 
-function readTimelineProjectionMessage(message: ClientBridgeMessage): {
-  sessionId: string;
-  timelineProjection: SessionTimelineProjection | undefined;
-} {
-  return {
-    sessionId: typeof message.sessionId === 'string' ? message.sessionId.trim() : '',
-    timelineProjection: message.timelineProjection as SessionTimelineProjection | undefined,
-  };
-}
-
-function handleSessionTurnItemProjectionUpdated(message: ClientBridgeMessage) {
-  const { sessionId, timelineProjection } = readTimelineProjectionMessage(message);
-  if (!sessionId || !timelineProjection) {
+function handleSessionTurnCanonicalEventUpdated(message: ClientBridgeMessage) {
+  const sessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
+  const canonicalEvent = message.canonicalEvent as CanonicalTurnEvent | undefined;
+  if (!sessionId || !canonicalEvent || canonicalEvent.sessionId !== sessionId) {
     return;
   }
-  const mergedLive = applyLiveTimelineProjectionUpdate(sessionId, timelineProjection);
-  if (mergedLive) {
+  adoptCurrentSessionIdForLiveTurn(sessionId);
+  const projection = applyCanonicalTurnEvent(canonicalEvent);
+  if (projection) {
+    setTimelineProjection(projection);
     reconcileRequestBindingsFromAuthoritativeThread(sessionId);
   }
 }
 
-function handleTimelineProjectionUpdated(message: ClientBridgeMessage) {
-  const { sessionId, timelineProjection } = readTimelineProjectionMessage(message);
-  if (!sessionId || !timelineProjection) {
-    return;
+function applyCanonicalTurnsSnapshot(sessionId: string, turns: unknown): boolean {
+  if (!Array.isArray(turns)) {
+    return false;
   }
-  const currentSessionId = getState().currentSessionId || '';
-  if (!currentSessionId || currentSessionId !== sessionId || hasActiveLocalTimelineTurn()) {
-    return;
+  const canonicalTurns = (turns as CanonicalTurn[])
+    .filter((turn) => turn?.sessionId === sessionId)
+    .sort((left, right) => left.turnSeq - right.turnSeq || left.turnId.localeCompare(right.turnId));
+  const projection = replaceCanonicalSessionTurns(sessionId, canonicalTurns);
+  if (!projection) {
+    return false;
   }
-  const merged = prependTimelineProjectionPage(sessionId, timelineProjection);
-  if (merged) {
-    reconcileRequestBindingsFromAuthoritativeThread(sessionId);
-  }
+  setTimelineProjection(projection);
+  return true;
 }
 
 function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
   const sessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
-  const timelineProjection = message.timelineProjection as SessionTimelineProjection | undefined;
   const state = message.state as AppState | undefined;
   const workspaceRecord = (message as Record<string, unknown>).workspace;
   const workspace = workspaceRecord && typeof workspaceRecord === 'object'
@@ -777,8 +757,9 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
   const beforeCursor = typeof message.beforeCursor === 'string' && message.beforeCursor.trim()
     ? message.beforeCursor.trim()
     : null;
+  const canonicalTurns = (message as Record<string, unknown>).canonicalTurns;
 
-  if (!sessionId || !timelineProjection || !state) {
+  if (!sessionId || !state) {
     return;
   }
 
@@ -831,7 +812,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       });
 
       if (!hadLiveTurnBeforeSnapshot) {
-        applyTimelineProjectionSnapshot(sessionId, timelineProjection, { hydrateNodes: true });
+        applyCanonicalTurnsSnapshot(sessionId, canonicalTurns);
         reconcileRequestBindingsFromAuthoritativeThread(sessionId);
       }
       if (authoritativeSnapshotIsIdle && !hadLiveTurnBeforeSnapshot) {
@@ -854,6 +835,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     clearAllRequestBindings();
     clearPendingInteractions();
     clearProcessingState({ skipAntiLiftBack: true });
+    clearCanonicalSessionTurns(sessionId);
 
     const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;
     const sessions = ensureArray(snapshot.sessions) as Session[];
@@ -864,7 +846,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     messagesState.currentWorkspacePath = workspacePath || messagesState.currentWorkspacePath;
 
     setCurrentSessionId(sessionId);
-    applyTimelineProjectionSnapshot(sessionId, timelineProjection, { hydrateNodes: true });
+    applyCanonicalTurnsSnapshot(sessionId, canonicalTurns);
     handleStateUpdate({
       ...message,
       state: {
@@ -1089,4 +1071,4 @@ function handleConnectionTestResult(message: ClientBridgeMessage) {
 }
 
 // Named exports
-export { handleStateUpdate, handleSessionsUpdated, handleEmptyWorkspaceStateLoaded, handleSessionBootstrapLoaded, handleTimelineProjectionUpdated, handleOrchestratorRuntimeState, handleClarificationRequest, handleWorkerQuestionRequest, handleWorkerStatusUpdate, handleConnectionTestResult };
+export { handleStateUpdate, handleSessionsUpdated, handleEmptyWorkspaceStateLoaded, handleSessionBootstrapLoaded, handleOrchestratorRuntimeState, handleClarificationRequest, handleWorkerQuestionRequest, handleWorkerStatusUpdate, handleConnectionTestResult };

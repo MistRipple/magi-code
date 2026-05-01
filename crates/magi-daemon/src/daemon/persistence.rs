@@ -62,6 +62,9 @@ impl ShadowStateRepository {
                     if !workspace_state.sessions.is_empty() {
                         ws_state.sessions.extend(workspace_state.sessions);
                         ws_state.timeline.extend(workspace_state.timeline);
+                        ws_state
+                            .canonical_turns
+                            .extend(workspace_state.canonical_turns);
                         ws_state.notifications.extend(workspace_state.notifications);
                         if ws_state.current_session_id.is_none() {
                             ws_state.current_session_id = workspace_state.current_session_id;
@@ -85,6 +88,7 @@ impl ShadowStateRepository {
             let ws_state = self.load_workspace_session_state(root_path)?;
             merged.sessions.extend(ws_state.sessions);
             merged.timeline.extend(ws_state.timeline);
+            merged.canonical_turns.extend(ws_state.canonical_turns);
             merged.notifications.extend(ws_state.notifications);
             if merged.current_session_id.is_none() {
                 merged.current_session_id = ws_state.current_session_id;
@@ -428,6 +432,7 @@ mod tests {
                 message: "恢复后的用户消息".to_string(),
                 occurred_at: now,
             }],
+            canonical_turns: vec![],
             notifications: vec![NotificationRecord {
                 notification_id: "notification-persisted".to_string(),
                 session_id: session_id.clone(),
@@ -491,6 +496,7 @@ mod tests {
                     message: "未知工作区会话消息".to_string(),
                     occurred_at: now,
                 }],
+                canonical_turns: vec![],
                 notifications: vec![NotificationRecord {
                     notification_id: "notification-unknown-workspace".to_string(),
                     session_id: session_id.clone(),
@@ -558,6 +564,7 @@ mod tests {
                     message: "全局未绑定消息".to_string(),
                     occurred_at: now,
                 }],
+                canonical_turns: vec![],
                 notifications: vec![],
             })
             .expect("global session durable state should save");
@@ -583,6 +590,7 @@ mod tests {
                         message: "工作区绑定消息".to_string(),
                         occurred_at: now,
                     }],
+                    canonical_turns: vec![],
                     notifications: vec![],
                 },
             )
@@ -630,6 +638,7 @@ mod tests {
                     workspace_id: None,
                 }],
                 timeline: vec![],
+                canonical_turns: vec![],
                 notifications: vec![],
             })
             .expect("global session durable state should save");

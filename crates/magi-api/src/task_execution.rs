@@ -9,9 +9,8 @@ use crate::{
     prompt_utils::prepend_session_instructions,
     session_turn_execution::{SessionTurnExecutionRuntime, run_session_turn_execution},
     session_turn_writeback::{
-        append_session_turn_item_with_task_store, build_completed_turn_timeline_snapshot,
-        publish_current_session_turn_item_event, publish_session_turn_item_event,
-        session_turn_item,
+        append_session_turn_item_with_task_store, publish_current_session_turn_item_event,
+        publish_session_turn_item_event, session_turn_item,
     },
     settings_store::SettingsStore,
     shadow_execution::{
@@ -26,14 +25,15 @@ use magi_context_runtime::{
     ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
 };
 use magi_core::{
-    DomainError, EventId, ExecutionOwnership, LeaseId, SessionId, TaskExecutionTarget, TaskId,
-    TaskStatus, UtcMillis, WorkerId, WorkspaceId,
+    DomainError, EventId, ExecutionOwnership, LeaseId, SessionId, Task, TaskExecutionTarget,
+    TaskId, TaskStatus, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
 use magi_orchestrator::{
     ExecutionContextSummary, ExecutionWritebackPlans,
     task_runner::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult, WorkerInfo},
+    task_store::TaskStore,
 };
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
 use magi_tool_runtime::ToolRegistry;
@@ -92,6 +92,136 @@ pub struct DispatchSubmissionAccepted {
     pub runner_started: bool,
 }
 
+fn turn_item_status_for_task_status(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Draft => "pending",
+        TaskStatus::Ready
+        | TaskStatus::Running
+        | TaskStatus::AwaitingApproval
+        | TaskStatus::Blocked
+        | TaskStatus::Verifying
+        | TaskStatus::Repairing => "running",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled | TaskStatus::Skipped => "cancelled",
+    }
+}
+
+fn task_status_text(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Draft => "draft",
+        TaskStatus::Ready => "ready",
+        TaskStatus::Running => "running",
+        TaskStatus::AwaitingApproval => "awaiting_approval",
+        TaskStatus::Blocked => "blocked",
+        TaskStatus::Verifying => "verifying",
+        TaskStatus::Repairing => "repairing",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+        TaskStatus::Skipped => "skipped",
+    }
+}
+
+fn current_turn_status_accepts_task_status_item(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "pending"
+            | "queued"
+            | "running"
+            | "started"
+            | "streaming"
+            | "blocked"
+            | "awaiting_approval"
+            | "review_required"
+            | "repairing"
+            | "verifying"
+    )
+}
+
+pub fn publish_task_status_turn_item_for_active_sessions(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    task_store: Option<&TaskStore>,
+    task: &Task,
+    new_status: TaskStatus,
+) {
+    for sidecar in session_store.active_execution_sidecars() {
+        let Some(turn) = sidecar.current_turn.as_ref() else {
+            continue;
+        };
+        if !current_turn_status_accepts_task_status_item(&turn.status) {
+            continue;
+        }
+        let active_chain_matches = sidecar
+            .active_execution_chain
+            .as_ref()
+            .is_some_and(|chain| {
+                chain.root_task_id == task.root_task_id
+                    || chain.root_task_id == task.task_id
+                    || chain
+                        .active_branch_task_ids
+                        .iter()
+                        .any(|task_id| task_id == &task.task_id)
+            });
+        let turn_matches = turn
+            .items
+            .iter()
+            .any(|item| item.task_id.as_ref() == Some(&task.task_id))
+            || turn
+                .worker_lanes
+                .iter()
+                .any(|lane| lane.task_id == task.task_id);
+        if !active_chain_matches && !turn_matches {
+            continue;
+        }
+
+        let lane = turn
+            .worker_lanes
+            .iter()
+            .find(|lane| lane.task_id == task.task_id);
+        let item_id = format!("turn-item-task-status-{}-{}", turn.turn_id, task.task_id);
+        let mut item = session_turn_item(
+            "task_status",
+            turn_item_status_for_task_status(new_status),
+            Some(task.title.clone()),
+            Some(format!("{}：{}", task.title, task_status_text(new_status))),
+            Some(item_id),
+        );
+        item.source = "task".to_string();
+        item.task_id = Some(task.task_id.clone());
+        item.role_id = task
+            .executor_binding
+            .as_ref()
+            .map(|binding| binding.target_role.clone())
+            .filter(|role_id| !role_id.trim().is_empty());
+        item.thread_visible = false;
+        if let Some(lane) = lane {
+            item.lane_id = Some(lane.lane_id.clone());
+            item.lane_seq = Some(lane.lane_seq);
+            item.worker_id = Some(lane.worker_id.clone());
+            item.worker_visible = true;
+        }
+        if let Some(published) = append_session_turn_item_with_task_store(
+            session_store,
+            &sidecar.session_id,
+            item,
+            task_store,
+        ) {
+            let workspace_id = sidecar
+                .active_execution_chain
+                .as_ref()
+                .and_then(|chain| chain.workspace_id.clone());
+            publish_session_turn_item_event(
+                event_bus,
+                &sidecar.session_id,
+                &workspace_id,
+                &published,
+            );
+        }
+    }
+}
+
 pub fn finalize_background_session_task_turn_if_root_completed(
     state: &ApiState,
     session_id: &SessionId,
@@ -120,7 +250,7 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     let Some(turn) = sidecar.current_turn.as_ref() else {
         return false;
     };
-    let Some((response_text, streaming_entry_id)) = turn
+    let Some((response_text, final_item_id)) = turn
         .items
         .iter()
         .filter(|item| item.kind == "assistant_final" && item.thread_visible)
@@ -129,21 +259,10 @@ pub fn finalize_background_session_task_turn_if_root_completed(
             if content.is_empty() {
                 return None;
             }
-            let entry_id = item
-                .timeline_entry_id
-                .as_deref()
-                .filter(|entry_id| !entry_id.trim().is_empty())
-                .map(str::to_string)
-                .or_else(|| {
-                    item.item_id
-                        .starts_with("timeline-")
-                        .then(|| item.item_id.clone())
-                })
-                .unwrap_or_else(|| format!("timeline-turn-snapshot-{}", root_task_id));
-            Some((item.item_seq, content.to_string(), entry_id))
+            Some((item.item_seq, content.to_string(), item.item_id.clone()))
         })
         .max_by_key(|(item_seq, _, _)| *item_seq)
-        .map(|(_, content, entry_id)| (content, entry_id))
+        .map(|(_, content, item_id)| (content, item_id))
     else {
         return false;
     };
@@ -155,26 +274,12 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     {
         return false;
     }
-    let timeline_message = build_completed_turn_timeline_snapshot(
-        state.session_store.as_ref(),
-        session_id,
-        Some(&response_text),
-        Some(&streaming_entry_id),
-        state.task_store(),
-    )
-    .unwrap_or_else(|| response_text.clone());
-    state.session_store.upsert_timeline_entry(
-        session_id.clone(),
-        &streaming_entry_id,
-        TimelineEntryKind::AssistantMessage,
-        timeline_message,
-    );
     publish_current_session_turn_item_event(
         &state.event_bus,
         state.session_store.as_ref(),
         session_id,
         &workspace_id,
-        &streaming_entry_id,
+        &final_item_id,
         state.task_store(),
     );
     let _ = state.event_bus.publish(
@@ -265,21 +370,6 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         publish_session_turn_item_event(&state.event_bus, session_id, &workspace_id, &published);
     }
 
-    let entry_id = format!("timeline-turn-snapshot-error-{}", root_task_id);
-    let timeline_message = build_completed_turn_timeline_snapshot(
-        state.session_store.as_ref(),
-        session_id,
-        Some(message),
-        Some(&entry_id),
-        Some(task_store),
-    )
-    .unwrap_or_else(|| message.to_string());
-    state.session_store.upsert_timeline_entry(
-        session_id.clone(),
-        &entry_id,
-        TimelineEntryKind::AssistantMessage,
-        timeline_message,
-    );
     true
 }
 

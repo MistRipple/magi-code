@@ -668,6 +668,209 @@ fn append_current_turn_item_with_timeline_entry_writes_item_and_timeline_atomica
 }
 
 #[test]
+fn upsert_current_turn_item_allows_assistant_stream_to_final_canonical_update() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-canonical-assistant-update");
+    store
+        .create_session(session_id.clone(), "Canonical Assistant Update")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(session_id.clone(), test_turn("turn-running", "running", 1))
+        .expect("running turn should upsert");
+
+    let mut stream_item = test_turn_item("turn-item-assistant", "流式回复");
+    stream_item.kind = "assistant_stream".to_string();
+    stream_item.status = "running".to_string();
+    store
+        .upsert_current_turn_item(&session_id, stream_item)
+        .expect("stream item should upsert");
+
+    let mut final_item = test_turn_item("turn-item-assistant", "最终回复");
+    final_item.kind = "assistant_final".to_string();
+    final_item.status = "completed".to_string();
+    let updated = store
+        .upsert_current_turn_item(&session_id, final_item)
+        .expect("assistant_text canonical update should be accepted")
+        .expect("current turn should exist");
+
+    let item = updated
+        .current_turn
+        .expect("turn should remain")
+        .items
+        .into_iter()
+        .find(|item| item.item_id == "turn-item-assistant")
+        .expect("assistant item should remain");
+    assert_eq!(item.item_seq, 1);
+    assert_eq!(item.kind, "assistant_final");
+    assert_eq!(item.status, "completed");
+    assert_eq!(item.content.as_deref(), Some("最终回复"));
+}
+
+#[test]
+fn current_turn_writes_update_durable_canonical_turn_log() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-durable-canonical-log");
+    store
+        .create_session(session_id.clone(), "Durable Canonical Log")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(session_id.clone(), test_turn("turn-durable", "running", 10))
+        .expect("running turn should upsert");
+
+    let mut assistant_item = test_turn_item("turn-item-durable-assistant", "持久回复");
+    assistant_item.kind = "assistant_stream".to_string();
+    assistant_item.status = "running".to_string();
+    store
+        .upsert_current_turn_item(&session_id, assistant_item)
+        .expect("assistant item should upsert");
+
+    store
+        .update_current_turn_status(&session_id, "completed")
+        .expect("turn status should update");
+
+    let durable = store.durable_state();
+    let turn = durable
+        .canonical_turns
+        .iter()
+        .find(|turn| turn.turn_id == "turn-durable")
+        .expect("canonical turn should be durable");
+    assert_eq!(turn.status, crate::models::CanonicalTurnStatus::Completed);
+    assert_eq!(turn.items.len(), 1);
+    assert_eq!(turn.items[0].item_id, "turn-item-durable-assistant");
+    assert_eq!(
+        turn.items[0].kind,
+        crate::models::CanonicalTurnItemKind::AssistantText
+    );
+    assert_eq!(turn.items[0].content.as_deref(), Some("持久回复"));
+}
+
+#[test]
+fn upsert_current_turn_item_rejects_canonical_immutable_field_conflict() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-canonical-conflict");
+    store
+        .create_session(session_id.clone(), "Canonical Conflict")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(session_id.clone(), test_turn("turn-running", "running", 1))
+        .expect("running turn should upsert");
+
+    let mut stream_item = test_turn_item("turn-item-conflict", "流式回复");
+    stream_item.kind = "assistant_stream".to_string();
+    stream_item.status = "running".to_string();
+    store
+        .upsert_current_turn_item(&session_id, stream_item)
+        .expect("stream item should upsert");
+
+    let mut conflicting_item = test_turn_item("turn-item-conflict", "工具调用");
+    conflicting_item.kind = "tool_call_started".to_string();
+    conflicting_item.status = "running".to_string();
+    conflicting_item.tool_call_id = Some("tool-conflict".to_string());
+    conflicting_item.tool_name = Some("shell".to_string());
+    let result = store.upsert_current_turn_item(&session_id, conflicting_item);
+
+    assert!(matches!(
+        result,
+        Err(magi_core::DomainError::InvalidState { .. })
+    ));
+    let stored_item = store
+        .runtime_sidecar(&session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .and_then(|turn| {
+            turn.items
+                .into_iter()
+                .find(|item| item.item_id == "turn-item-conflict")
+        })
+        .expect("original item should remain");
+    assert_eq!(stored_item.kind, "assistant_stream");
+    assert_eq!(stored_item.content.as_deref(), Some("流式回复"));
+}
+
+#[test]
+fn upsert_current_turn_item_rejects_canonical_status_regression() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-canonical-status-regression");
+    store
+        .create_session(session_id.clone(), "Canonical Status Regression")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(session_id.clone(), test_turn("turn-running", "running", 1))
+        .expect("running turn should upsert");
+
+    let mut final_item = test_turn_item("turn-item-status", "最终回复");
+    final_item.kind = "assistant_final".to_string();
+    final_item.status = "completed".to_string();
+    store
+        .upsert_current_turn_item(&session_id, final_item)
+        .expect("final item should upsert");
+
+    let mut failed_item = test_turn_item("turn-item-status", "失败回复");
+    failed_item.kind = "assistant_error".to_string();
+    failed_item.status = "failed".to_string();
+    let result = store.upsert_current_turn_item(&session_id, failed_item);
+
+    assert!(matches!(
+        result,
+        Err(magi_core::DomainError::InvalidState { .. })
+    ));
+    let stored_item = store
+        .runtime_sidecar(&session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .and_then(|turn| {
+            turn.items
+                .into_iter()
+                .find(|item| item.item_id == "turn-item-status")
+        })
+        .expect("completed item should remain");
+    assert_eq!(stored_item.status, "completed");
+    assert_eq!(stored_item.content.as_deref(), Some("最终回复"));
+}
+
+#[test]
+fn append_current_turn_item_with_timeline_entry_rejects_conflict_without_timeline_write() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-canonical-conflict-timeline");
+    store
+        .create_session(session_id.clone(), "Canonical Conflict Timeline")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(session_id.clone(), test_turn("turn-running", "running", 1))
+        .expect("running turn should upsert");
+
+    let mut base_item = test_turn_item("turn-item-lane-conflict", "主线回复");
+    base_item.kind = "assistant_stream".to_string();
+    base_item.status = "running".to_string();
+    store
+        .upsert_current_turn_item(&session_id, base_item)
+        .expect("base item should upsert");
+
+    let mut conflicting_item = test_turn_item("turn-item-lane-conflict", "worker 回复");
+    conflicting_item.kind = "assistant_stream".to_string();
+    conflicting_item.status = "running".to_string();
+    conflicting_item.lane_id = Some("worker-lane".to_string());
+    let result = store.append_current_turn_item_with_timeline_entry(
+        &session_id,
+        "timeline-conflict-should-not-write",
+        TimelineEntryKind::AssistantMessage,
+        "不应写入的 timeline",
+        UtcMillis(2),
+        conflicting_item,
+    );
+
+    assert!(matches!(
+        result,
+        Err(magi_core::DomainError::InvalidState { .. })
+    ));
+    assert!(
+        !store
+            .timeline_for_session(&session_id)
+            .iter()
+            .any(|entry| entry.entry_id == "timeline-conflict-should-not-write"),
+        "canonical item 冲突时不能留下 timeline 写入"
+    );
+}
+
+#[test]
 fn append_current_turn_item_with_timeline_entry_does_not_write_timeline_without_turn() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-append-item-no-turn");

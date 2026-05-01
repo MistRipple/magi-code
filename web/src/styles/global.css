@@ -9,7 +9,7 @@
      🔧 支持浅色/深色主题自动适配
      ========================================== */
 
-  /* Web 回退主题变量：当不在 VS Code Webview 内运行时，仍然提供完整主题令牌 */
+  /* Web 默认主题变量：当不在 VS Code Webview 内运行时，仍然提供完整主题令牌 */
   --vscode-sideBar-background: #15181f;
   --vscode-sideBar-secondaryBackground: #11161d;
   --vscode-editor-background: #0f141b;

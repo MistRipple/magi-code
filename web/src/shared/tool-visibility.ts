@@ -9,8 +9,7 @@
  * - thread_visible：用户可见的工具调用（如搜索结果、文件变更摘要等），
  *   展示在主线
  *
- * 此模块替代 BaseNormalizer.USER_HIDDEN_TOOL_NAMES 静态黑名单
- * 和 timeline-message-fragmentation.ts 中的硬编码列表。
+ * 此模块替代 BaseNormalizer.USER_HIDDEN_TOOL_NAMES 静态黑名单。
  */
 
 export type ToolVisibility = 'thread_visible' | 'runtime_internal' | 'worker_sidechain';

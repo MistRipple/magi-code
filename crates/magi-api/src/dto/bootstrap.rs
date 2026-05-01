@@ -9,8 +9,8 @@ use crate::{
 use magi_core::{SessionId, UtcMillis};
 use magi_event_bus::{EventEnvelope, EventStreamSnapshot, RuntimeReadModelInput};
 use magi_session_store::{
-    NotificationRecord, SessionProjectionInput, SessionRecord, SessionRuntimeSidecarExport,
-    TimelineEntry,
+    CanonicalTurn, NotificationRecord, SessionProjectionInput, SessionRecord,
+    SessionRuntimeSidecarExport, TimelineEntry,
 };
 use magi_workspace::{
     RecoveryHandle, SnapshotRecord, WorkspaceProjectionInput, WorkspaceRecord,
@@ -35,6 +35,8 @@ pub struct BootstrapDto {
     pub current_session: Option<SessionRecord>,
     pub sessions: Vec<SessionRecord>,
     pub timeline: Vec<TimelineEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub canonical_turns: Vec<CanonicalTurn>,
     pub workspaces: Vec<WorkspaceRecord>,
     pub snapshots: Vec<SnapshotRecord>,
     pub recovery_handles: Vec<RecoveryHandle>,
@@ -143,6 +145,7 @@ impl BootstrapDto {
             current_session,
             sessions: session_projection.sessions,
             timeline: session_projection.timeline,
+            canonical_turns: session_projection.canonical_turns,
             workspaces: workspace_projection.workspaces,
             snapshots: workspace_projection.snapshots,
             recovery_handles: workspace_projection.recovery_handles,
@@ -191,6 +194,9 @@ fn select_session_projection(
             .timeline
             .retain(|entry| entry.session_id == *requested_session_id);
         session_projection
+            .canonical_turns
+            .retain(|turn| turn.session_id == *requested_session_id);
+        session_projection
             .notifications
             .retain(|notification| notification.session_id == *requested_session_id);
     }
@@ -227,6 +233,7 @@ mod tests {
             current_session_id: None,
             sessions: Vec::new(),
             timeline: Vec::new(),
+            canonical_turns: Vec::new(),
             notifications: Vec::new(),
         }
     }

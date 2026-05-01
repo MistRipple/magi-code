@@ -97,18 +97,6 @@
           workerId: artifact.worker || '',
         });
       }
-      for (const item of artifact.executionItems || []) {
-        const metadata = item.message?.metadata && typeof item.message.metadata === 'object'
-          ? item.message.metadata as Record<string, unknown>
-          : {};
-        for (const roleId of item.workerTabs || []) {
-          const order = typeof metadata.laneSeq === 'number' && Number.isFinite(metadata.laneSeq)
-            ? Math.max(0, Math.floor(metadata.laneSeq))
-            : Number.MAX_SAFE_INTEGER;
-          const workerId = typeof metadata.worker === 'string' ? metadata.worker.trim() : (item.worker || '');
-          upsertRole({ roleId, order, workerId });
-        }
-      }
     }
     return Array.from(roleById.values()).sort((left, right) => {
       if (left.order !== right.order) {

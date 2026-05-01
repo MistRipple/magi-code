@@ -3,7 +3,7 @@ import {
   agentUrl,
   dispatchAgentConnectionEvent,
   getAgentSettingsBootstrap,
-  loadAgentSessionTimelinePage,
+  loadAgentSessionSnapshot,
   probeReachableAgentBaseUrl,
   resolveAgentBaseUrl,
 } from '../../web/agent-api';
@@ -104,13 +104,13 @@ import {
 } from './browser-workspace-binding';
 import { buildEmptyWorkspaceAppState } from './empty-workspace-state';
 import {
-  buildRustTurnTimelineProjectionFromEventPayload,
   normalizeRustBootstrapPayload,
   parseRustEventEnvelope,
   readRustTimelinePageMeta,
   type BootstrapPayload,
   type RustEventEnvelope,
 } from './rust-daemon-contract';
+import { parseCanonicalTurnEventPayload } from '../protocol/canonical-turn';
 import type { SseConnection } from '../transport';
 import {
   activateTaskGraphSession,
@@ -719,20 +719,22 @@ function emitDataMessage(dataType: DataMessageType, payload: Record<string, unkn
 }
 
 function handleSessionTurnItemEvent(event: RustEventEnvelope): boolean {
-  const projection = buildRustTurnTimelineProjectionFromEventPayload(event.payload, {
+  const canonicalEvent = parseCanonicalTurnEventPayload(event.payload, {
+    eventId: trimBridgeString(event.event_id),
     eventSeq: typeof event.sequence === 'number' && Number.isFinite(event.sequence)
       ? Math.floor(event.sequence)
       : 0,
-    generatedAt: typeof event.occurred_at === 'number' && Number.isFinite(event.occurred_at)
+    occurredAt: typeof event.occurred_at === 'number' && Number.isFinite(event.occurred_at)
       ? Math.floor(event.occurred_at)
       : Date.now(),
   });
-  if (!projection) {
+  if (!canonicalEvent) {
+    console.error('[web-client-bridge] session.turn.item 缺少 canonical payload，已拒绝旧 projection live 写入');
     return false;
   }
-  emitDataMessage('sessionTurnItemProjectionUpdated', {
-    sessionId: projection.sessionId,
-    timelineProjection: projection,
+  emitDataMessage('sessionTurnCanonicalEventUpdated', {
+    sessionId: canonicalEvent.sessionId,
+    canonicalEvent,
   });
   return true;
 }
@@ -1567,7 +1569,6 @@ async function dispatchSessionSnapshot(
     workspaceId: options.workspaceId,
     workspacePath: options.workspacePath,
   });
-  const pageMeta = readRustTimelinePageMeta(rawPayload);
   persistWorkspaceBinding(payload.workspace.workspaceId, payload.workspace.rootPath, payload.sessionId);
   activateTaskGraphSession(payload.sessionId);
   const taskTrackingHints = extractBootstrapTaskTrackingHints(payload, rawPayload);
@@ -1580,8 +1581,8 @@ async function dispatchSessionSnapshot(
   }
   emitDataMessage('sessionBootstrapLoaded', {
     ...payload,
-    hasMoreBefore: pageMeta.hasMoreBefore,
-    beforeCursor: pageMeta.beforeCursor,
+    hasMoreBefore: false,
+    beforeCursor: null,
   } as Record<string, unknown>);
   void ensureEventStream({
     forceReconnect: options.forceEventStreamReconnect === true,
@@ -1611,7 +1612,7 @@ async function loadLatestSessionSnapshot(
   const targetWorkspacePath = typeof options.workspacePath === 'string' && options.workspacePath.trim()
     ? options.workspacePath.trim()
     : currentWorkspacePath;
-  const rawPayload = await loadAgentSessionTimelinePage(sessionId, {
+  const rawPayload = await loadAgentSessionSnapshot(sessionId, {
     limit: SESSION_TIMELINE_PAGE_SIZE,
     workspaceId: targetWorkspaceId,
   });

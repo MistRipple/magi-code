@@ -1,6 +1,6 @@
 use magi_core::{EventId, SessionId, TaskStatus, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
-use magi_session_store::{ActiveExecutionTurn, TimelineEntryKind};
+use magi_session_store::ActiveExecutionTurn;
 use serde_json::json;
 
 use super::{
@@ -10,9 +10,7 @@ use super::{
 use crate::{
     dto::SessionTurnRequestDto,
     errors::ApiError,
-    session_turn_writeback::{
-        build_completed_turn_timeline_snapshot, publish_current_session_turn_item_event,
-    },
+    session_turn_writeback::publish_current_session_turn_item_event,
     state::ApiState,
     task_execution::{
         DispatchSubmissionAccepted, DispatchSubmissionRequest, drive_shadow_dispatch_submission,
@@ -277,10 +275,7 @@ pub(super) fn append_dispatch_assistant_message(
     let current_turn_matches = current_turn
         .as_ref()
         .is_some_and(|turn| turn_matches_accepted_dispatch(turn, accepted));
-    let is_followup_on_existing_turn = current_turn
-        .as_ref()
-        .is_some_and(|turn| current_turn_matches && turn.accepted_at != accepted.accepted_at);
-    let response_text = current_turn_matches
+    let response = current_turn_matches
         .then(|| {
             current_turn
                 .clone()
@@ -288,37 +283,12 @@ pub(super) fn append_dispatch_assistant_message(
         })
         .flatten();
 
-    let Some(response_text) = response_text else {
+    let Some((response_text, final_item_id)) = response else {
         return;
-    };
-
-    // 首次执行使用任务维度的稳定 entry，继续同一任务链时使用轮次维度 entry，
-    // 避免覆盖中断前已经完成的主线回复。
-    let streaming_entry_id = if is_followup_on_existing_turn {
-        format!(
-            "timeline-streaming-{}-{}",
-            accepted.action_task_id, accepted.accepted_at.0
-        )
-    } else {
-        format!("timeline-streaming-{}", accepted.action_task_id)
     };
     let _ = state
         .session_store
         .update_current_turn_status(&accepted.session_id, "completed");
-    let timeline_message = build_completed_turn_timeline_snapshot(
-        state.session_store.as_ref(),
-        &accepted.session_id,
-        Some(&response_text),
-        Some(&streaming_entry_id),
-        state.task_store(),
-    )
-    .unwrap_or_else(|| response_text.clone());
-    state.session_store.upsert_timeline_entry(
-        accepted.session_id.clone(),
-        &streaming_entry_id,
-        TimelineEntryKind::AssistantMessage,
-        timeline_message,
-    );
     let workspace_id = state
         .session_store
         .execution_ownership(&accepted.session_id)
@@ -328,7 +298,7 @@ pub(super) fn append_dispatch_assistant_message(
         state.session_store.as_ref(),
         &accepted.session_id,
         &workspace_id,
-        &streaming_entry_id,
+        &final_item_id,
         state.task_store(),
     );
     let _ = state.event_bus.publish(
@@ -362,7 +332,7 @@ fn turn_matches_accepted_dispatch(
 fn assistant_final_from_turn(
     turn: ActiveExecutionTurn,
     accepted: &DispatchSubmissionAccepted,
-) -> Option<String> {
+) -> Option<(String, String)> {
     turn.items
         .into_iter()
         .filter(|item| item.kind == "assistant_final")
@@ -374,8 +344,8 @@ fn assistant_final_from_turn(
         .filter_map(|item| {
             item.content
                 .filter(|content| !content.trim().is_empty())
-                .map(|content| (item.item_seq, content))
+                .map(|content| (item.item_seq, content, item.item_id))
         })
-        .max_by_key(|(item_seq, _)| *item_seq)
-        .map(|(_, content)| content)
+        .max_by_key(|(item_seq, _, _)| *item_seq)
+        .map(|(_, content, item_id)| (content, item_id))
 }

@@ -19,18 +19,6 @@ function prepareRenderMessage(message: Message, displayContext: TimelineDisplayC
   return cloneMessagePayload(message);
 }
 
-function shouldRenderNodeHostMessage(
-  node: Pick<TimelineProjectionArtifact, 'kind' | 'message' | 'executionItems'>,
-  displayContext: TimelineDisplayContext
-): boolean {
-  void displayContext;
-  if (Array.isArray(node.executionItems) && node.executionItems.length > 0) {
-    return Array.isArray(node.message?.blocks)
-      && node.message.blocks.some((block) => block.type === 'dispatch_group');
-  }
-  return true;
-}
-
 function buildProjectionArtifactLookup(
   projection: SessionTimelineProjection,
 ): Map<string, TimelineProjectionArtifact> {
@@ -57,27 +45,7 @@ function buildProjectionPanelView(
 
   for (const entry of renderEntries) {
     const artifact = artifactById.get(entry.artifactId);
-    if (!artifact) {
-      continue;
-    }
-    if (entry.executionItemId) {
-      const executionItem = (artifact.executionItems || []).find((item) => item?.itemId === entry.executionItemId);
-      if (!executionItem?.message) {
-        continue;
-      }
-      const message = prepareRenderMessage(executionItem.message, displayContext);
-      items.push({
-        key: entry.entryId,
-        message,
-      });
-      messages.push(message);
-      continue;
-    }
-    if (!artifact.message || !shouldRenderNodeHostMessage({
-      kind: artifact.kind,
-      message: artifact.message,
-      executionItems: artifact.executionItems,
-    }, displayContext)) {
+    if (!artifact?.message) {
       continue;
     }
     const message = prepareRenderMessage(artifact.message, displayContext);

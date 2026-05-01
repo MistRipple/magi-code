@@ -31,6 +31,7 @@ use crate::{
         SessionContinueAccepted, active_execution_branch_is_continue_recoverable,
         continue_shadow_execution_chain,
     },
+    session_turn_writeback::publish_current_session_turn_item_event,
     state::ApiState,
     task_execution::{SessionTurnExecutionRequest, drive_shadow_task_graph},
 };
@@ -1056,14 +1057,27 @@ async fn interrupt_session_turn(
     };
 
     if interrupted {
-        state
+        let cancelled_item_id = state
             .session_store
             .cancel_current_turn(&session_id)
-            .map_err(|error| ApiError::internal_assembly("中断 session turn 失败", error))?;
+            .map_err(|error| ApiError::internal_assembly("中断 session turn 失败", error))?
+            .and_then(|sidecar| sidecar.current_turn)
+            .and_then(|turn| turn.items.last().map(|item| item.item_id.clone()));
         for entry_id in &streaming_entry_ids {
             state
                 .session_store
                 .remove_timeline_entry(&session_id, entry_id);
+        }
+        if let Some(item_id) = cancelled_item_id.as_deref() {
+            // 聊天 UI 只接受 canonical turn 事实，interrupt 事件只做运行态通知。
+            publish_current_session_turn_item_event(
+                &state.event_bus,
+                &state.session_store,
+                &session_id,
+                &workspace_id,
+                item_id,
+                None,
+            );
         }
     }
 

@@ -533,6 +533,7 @@ mod tests {
                 workspace_id: Some(workspace_a_id.to_string()),
             }],
             timeline: Vec::new(),
+            canonical_turns: Vec::new(),
             notifications: Vec::new(),
         };
         let sidecar_state = SessionExecutionSidecarStoreState {

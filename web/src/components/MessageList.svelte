@@ -2,7 +2,6 @@
   import type {
     Message,
     ScrollPositions,
-    SessionTimelineProjection,
     TimelineRenderItem,
   } from '../types/message';
   import MessageItem from './MessageItem.svelte';
@@ -11,17 +10,11 @@
   import {
     clearMessageJump,
     messagesState,
-    prependTimelineProjectionPage,
     setSessionHistoryState,
     updatePanelScrollState,
     hasActiveLocalTimelineTurn,
   } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { loadAgentSessionTimelinePage } from '../web/agent-api';
-  import {
-    normalizeRustBootstrapPayload,
-    readRustTimelinePageMeta,
-  } from '../shared/bridges/rust-daemon-contract';
 
   // Props - Svelte 5 语法
   interface Props {
@@ -193,14 +186,8 @@
   let restoreAttemptTimers: Array<ReturnType<typeof setTimeout>> = [];
   let historyObserver: IntersectionObserver | null = null;
   let programmaticScrollDepth = 0;
-  let pendingHistoryRestore = $state<{
-    sessionId: string;
-    previousScrollTop: number;
-    previousScrollHeight: number;
-  } | null>(null);
 
   const HISTORY_LOAD_THRESHOLD_PX = 120;
-  const HISTORY_PAGE_SIZE = 50;
 
   function disconnectHistoryObserver() {
     if (!historyObserver) return;
@@ -380,34 +367,6 @@
   });
 
   $effect(() => {
-    const pending = pendingHistoryRestore;
-    const loading = sessionHistory.isLoadingBefore;
-    const _len = safeRenderMessages.length;
-    void _len;
-    if (!pending || loading || !containerRef) {
-      return;
-    }
-    if ((messagesState.currentSessionId || '') !== pending.sessionId) {
-      pendingHistoryRestore = null;
-      return;
-    }
-    tick().then(() => {
-      if (!containerRef || !pendingHistoryRestore) {
-        return;
-      }
-      const latestPending = pendingHistoryRestore;
-      if ((messagesState.currentSessionId || '') !== latestPending.sessionId) {
-        pendingHistoryRestore = null;
-        return;
-      }
-      const delta = containerRef.scrollHeight - latestPending.previousScrollHeight;
-      setContainerScrollPosition(latestPending.previousScrollTop + delta);
-      syncPanelScrollState(containerRef.scrollTop, false, false);
-      pendingHistoryRestore = null;
-    });
-  });
-
-  $effect(() => {
     const container = containerRef;
     const sentinel = historySentinelRef;
     const sessionId = currentSessionId;
@@ -447,77 +406,18 @@
     };
   });
 
-  async function loadOlderHistory(): Promise<void> {
-    if (!containerRef || !isActive) {
-      return;
-    }
+  function loadOlderHistory(): void {
     const sessionId = (messagesState.currentSessionId || '').trim();
     const workspaceId = (messagesState.currentWorkspaceId || '').trim();
-    const workspacePath = (messagesState.currentWorkspacePath || '').trim();
-    const historyState = messagesState.sessionHistory;
-    if (
-      !sessionId
-      || historyState.sessionId !== sessionId
-      || (historyState.workspaceId || '') !== workspaceId
-      || !historyState.hasMoreBefore
-      || !historyState.beforeCursor
-      || historyState.isLoadingBefore
-      || pendingHistoryRestore !== null
-      || hasActiveLocalTimelineTurn()
-    ) {
+    if (!sessionId || hasActiveLocalTimelineTurn()) {
       return;
     }
-    const previousScrollTop = containerRef.scrollTop;
-    const previousScrollHeight = containerRef.scrollHeight;
-    setSessionHistoryState(sessionId, { workspaceId, isLoadingBefore: true });
-    try {
-      const rawPayload = await loadAgentSessionTimelinePage(sessionId, {
-        limit: HISTORY_PAGE_SIZE,
-        beforeCursor: historyState.beforeCursor,
-        workspaceId,
-      });
-      if (
-        (messagesState.currentSessionId || '').trim() !== sessionId
-        || (messagesState.currentWorkspaceId || '').trim() !== workspaceId
-      ) {
-        return;
-      }
-      if (hasActiveLocalTimelineTurn()) {
-        setSessionHistoryState(sessionId, { workspaceId, isLoadingBefore: false });
-        return;
-      }
-      const payload = normalizeRustBootstrapPayload(rawPayload, {
-        workspaceId,
-        workspacePath,
-        sessionId,
-      });
-      const pageMeta = readRustTimelinePageMeta(rawPayload);
-      const merged = prependTimelineProjectionPage(
-        sessionId,
-        payload.timelineProjection as unknown as SessionTimelineProjection,
-      );
-      setSessionHistoryState(sessionId, {
-        workspaceId,
-        hasMoreBefore: pageMeta.hasMoreBefore,
-        beforeCursor: pageMeta.beforeCursor,
-        isLoadingBefore: false,
-      });
-      if (merged) {
-        pendingHistoryRestore = {
-          sessionId,
-          previousScrollTop,
-          previousScrollHeight,
-        };
-      }
-    } catch (error) {
-      console.error('[MessageList] 加载更早会话历史失败:', error);
-      if (
-        (messagesState.currentSessionId || '').trim() === sessionId
-        && (messagesState.currentWorkspaceId || '').trim() === workspaceId
-      ) {
-        setSessionHistoryState(sessionId, { workspaceId, isLoadingBefore: false });
-      }
-    }
+    setSessionHistoryState(sessionId, {
+      workspaceId,
+      hasMoreBefore: false,
+      beforeCursor: null,
+      isLoadingBefore: false,
+    });
   }
 
   // 检测用户是否手动滚动

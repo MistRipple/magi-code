@@ -1,6 +1,8 @@
 use super::SessionStore;
 use crate::models::{
-    ActiveExecutionChain, ActiveExecutionTurn, ActiveExecutionTurnItem,
+    ActiveExecutionChain, ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalToolCall,
+    CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnItemStatus,
+    CanonicalTurnStatus, CanonicalTurnVisibility, CanonicalWorkerRef,
     SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionRuntimeSidecar,
     SessionSidecarFlushReason, SessionStoreState, TimelineEntry, TimelineEntryKind,
 };
@@ -8,6 +10,8 @@ use magi_core::{
     DomainError, DomainResult, ExecutionOwnership, LeaseId, RecoveryResumeInput, SessionId,
     TaskExecutionTarget, TaskId, UtcMillis, WorkerId,
 };
+use serde_json::Value;
+use std::collections::HashMap;
 
 fn inherit_current_turn_aliases(turn: &ActiveExecutionTurn, item: &mut ActiveExecutionTurnItem) {
     let Some(alias_source) = turn.items.iter().find(|existing| {
@@ -58,26 +62,284 @@ fn current_turn_item_status_is_active(status: &str) -> bool {
     )
 }
 
-fn current_turn_item_status_is_terminal(status: &str) -> bool {
-    matches!(
-        status.trim().to_ascii_lowercase().as_str(),
-        "completed"
-            | "complete"
-            | "succeeded"
-            | "success"
-            | "failed"
-            | "error"
-            | "cancelled"
-            | "canceled"
-    )
+fn terminal_item_status_for_turn_status(status: &str) -> Option<&'static str> {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "completed" | "complete" | "succeeded" | "success" => Some("completed"),
+        "failed" | "error" => Some("failed"),
+        "cancelled" | "canceled" => Some("cancelled"),
+        _ => None,
+    }
 }
 
-fn current_turn_item_rejects_update(
+fn canonical_current_turn_status(status: &str) -> DomainResult<CanonicalTurnStatus> {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "pending" | "queued" | "accepted" => Ok(CanonicalTurnStatus::Pending),
+        "running" | "started" | "streaming" | "blocked" | "awaiting_approval"
+        | "review_required" | "repairing" | "verifying" => Ok(CanonicalTurnStatus::Running),
+        "completed" | "complete" | "succeeded" | "success" => Ok(CanonicalTurnStatus::Completed),
+        "failed" | "error" => Ok(CanonicalTurnStatus::Failed),
+        "cancelled" | "canceled" => Ok(CanonicalTurnStatus::Cancelled),
+        _ => Err(DomainError::InvalidState {
+            message: format!("unknown current turn status: {status}"),
+        }),
+    }
+}
+
+fn canonical_current_turn_item_status(status: &str) -> DomainResult<CanonicalTurnItemStatus> {
+    Ok(match canonical_current_turn_status(status)? {
+        CanonicalTurnStatus::Pending => CanonicalTurnItemStatus::Pending,
+        CanonicalTurnStatus::Running => CanonicalTurnItemStatus::Running,
+        CanonicalTurnStatus::Completed => CanonicalTurnItemStatus::Completed,
+        CanonicalTurnStatus::Failed => CanonicalTurnItemStatus::Failed,
+        CanonicalTurnStatus::Cancelled => CanonicalTurnItemStatus::Cancelled,
+    })
+}
+
+fn canonical_current_turn_item_kind(kind: &str) -> DomainResult<CanonicalTurnItemKind> {
+    match kind {
+        "user_message" => Ok(CanonicalTurnItemKind::UserMessage),
+        "assistant_stream" | "assistant_final" | "assistant_error" => {
+            Ok(CanonicalTurnItemKind::AssistantText)
+        }
+        "assistant_thinking" => Ok(CanonicalTurnItemKind::AssistantThinking),
+        "assistant_phase" => Ok(CanonicalTurnItemKind::SystemNotice),
+        "tool_call_started" | "tool_call_result" => Ok(CanonicalTurnItemKind::ToolCall),
+        "worker_spawned" => Ok(CanonicalTurnItemKind::WorkerDispatch),
+        "worker_status" => Ok(CanonicalTurnItemKind::WorkerStatus),
+        "worker_result" => Ok(CanonicalTurnItemKind::WorkerResult),
+        "task_status" => Ok(CanonicalTurnItemKind::TaskStatus),
+        _ => Err(DomainError::InvalidState {
+            message: format!("unknown current turn item kind: {kind}"),
+        }),
+    }
+}
+
+fn canonical_tool_value(value: &Option<String>) -> Option<Value> {
+    let value = value.as_ref()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    serde_json::from_str(value)
+        .ok()
+        .or_else(|| Some(Value::String(value.to_string())))
+}
+
+fn current_turn_item_to_canonical_tool(
+    item: &ActiveExecutionTurnItem,
+) -> DomainResult<Option<CanonicalToolCall>> {
+    if item.tool_call_id.is_none() && item.tool_name.is_none() {
+        return Ok(None);
+    }
+    let Some(call_id) = item
+        .tool_call_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Err(DomainError::InvalidState {
+            message: format!("canonical tool item {} missing tool_call_id", item.item_id),
+        });
+    };
+    let Some(name) = item
+        .tool_name
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Err(DomainError::InvalidState {
+            message: format!("canonical tool item {} missing tool_name", item.item_id),
+        });
+    };
+    Ok(Some(CanonicalToolCall {
+        call_id,
+        name,
+        arguments: canonical_tool_value(&item.tool_arguments),
+        result: canonical_tool_value(&item.tool_result),
+        error: item.tool_error.clone(),
+    }))
+}
+
+fn current_turn_item_to_canonical_worker(
+    item: &ActiveExecutionTurnItem,
+) -> Option<CanonicalWorkerRef> {
+    if item.task_id.is_none() && item.worker_id.is_none() && item.role_id.is_none() {
+        return None;
+    }
+    Some(CanonicalWorkerRef {
+        task_id: item.task_id.clone(),
+        worker_id: item.worker_id.clone(),
+        role_id: item.role_id.clone(),
+        title: item.title.clone(),
+    })
+}
+
+fn current_turn_item_to_canonical_item(
+    session_id: &SessionId,
+    turn: &ActiveExecutionTurn,
+    item: &ActiveExecutionTurnItem,
+) -> DomainResult<CanonicalTurnItem> {
+    let kind = canonical_current_turn_item_kind(&item.kind)?;
+    let tool = current_turn_item_to_canonical_tool(item)?;
+    if kind == CanonicalTurnItemKind::ToolCall && tool.is_none() {
+        return Err(DomainError::InvalidState {
+            message: format!("canonical tool item {} missing tool payload", item.item_id),
+        });
+    }
+    let worker_tab_ids = item
+        .worker_id
+        .as_ref()
+        .map(|worker_id| vec![worker_id.to_string()])
+        .unwrap_or_default();
+    Ok(CanonicalTurnItem {
+        session_id: session_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        turn_seq: turn.turn_seq,
+        item_id: item.item_id.clone(),
+        item_seq: item.item_seq,
+        kind,
+        created_at: turn.accepted_at,
+        status: canonical_current_turn_item_status(&item.status)?,
+        item_version: None,
+        updated_at: UtcMillis::now(),
+        lane_id: item.lane_id.clone(),
+        lane_seq: item.lane_seq,
+        title: item.title.clone(),
+        content: item.content.clone(),
+        blocks: Vec::new(),
+        tool,
+        worker: current_turn_item_to_canonical_worker(item),
+        visibility: CanonicalTurnVisibility {
+            thread_visible: item.thread_visible,
+            worker_visible: item.worker_visible,
+            renderable: item
+                .content
+                .as_ref()
+                .is_none_or(|content| !content.trim().is_empty())
+                || item.tool_call_id.is_some()
+                || item.worker_id.is_some()
+                || item.task_id.is_some(),
+            worker_tab_ids,
+        },
+        metadata: HashMap::new(),
+    })
+}
+
+fn current_turn_to_canonical_turn(
+    session_id: &SessionId,
+    turn: &ActiveExecutionTurn,
+) -> DomainResult<CanonicalTurn> {
+    let items = turn
+        .items
+        .iter()
+        .map(|item| current_turn_item_to_canonical_item(session_id, turn, item))
+        .collect::<DomainResult<Vec<_>>>()?;
+    let mut canonical_turn = CanonicalTurn {
+        session_id: session_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        turn_seq: turn.turn_seq,
+        accepted_at: turn.accepted_at,
+        completed_at: turn.completed_at,
+        status: canonical_current_turn_status(&turn.status)?,
+        response_duration_ms: turn
+            .completed_at
+            .map(|completed_at| completed_at.0.saturating_sub(turn.accepted_at.0)),
+        usage: None,
+        items,
+        metadata: HashMap::new(),
+    };
+    canonical_turn.normalize();
+    Ok(canonical_turn)
+}
+
+fn upsert_canonical_turn_in_state(
+    state: &mut SessionStoreState,
+    session_id: &SessionId,
+    turn: &ActiveExecutionTurn,
+) -> DomainResult<()> {
+    let mut incoming = current_turn_to_canonical_turn(session_id, turn)?;
+    incoming.normalize();
+    if let Some(existing) = state
+        .canonical_turns
+        .iter_mut()
+        .find(|existing| existing.session_id == *session_id && existing.turn_id == incoming.turn_id)
+    {
+        incoming.validate_update_from(existing)?;
+        for incoming_item in &incoming.items {
+            if let Some(existing_item) = existing
+                .items
+                .iter()
+                .find(|existing_item| existing_item.item_id == incoming_item.item_id)
+            {
+                incoming_item.validate_update_from(existing_item)?;
+            }
+        }
+        *existing = incoming;
+    } else {
+        state.canonical_turns.push(incoming);
+    }
+    state.canonical_turns.sort_by(|left, right| {
+        left.turn_seq
+            .cmp(&right.turn_seq)
+            .then_with(|| left.turn_id.cmp(&right.turn_id))
+    });
+    Ok(())
+}
+
+fn reject_changed_current_turn_item_field(
+    item_id: &str,
+    field: &'static str,
+    unchanged: bool,
+) -> DomainResult<()> {
+    if unchanged {
+        return Ok(());
+    }
+    Err(DomainError::InvalidState {
+        message: format!(
+            "canonical turn item {item_id} attempted to change immutable field {field}"
+        ),
+    })
+}
+
+fn validate_current_turn_item_update(
     existing: &ActiveExecutionTurnItem,
     incoming: &ActiveExecutionTurnItem,
-) -> bool {
-    current_turn_item_status_is_terminal(&existing.status)
-        && current_turn_item_status_is_active(&incoming.status)
+) -> DomainResult<()> {
+    reject_changed_current_turn_item_field(
+        &incoming.item_id,
+        "itemSeq",
+        incoming.item_seq == 0 || existing.item_seq == incoming.item_seq,
+    )?;
+    reject_changed_current_turn_item_field(
+        &incoming.item_id,
+        "kind",
+        canonical_current_turn_item_kind(&existing.kind)?
+            == canonical_current_turn_item_kind(&incoming.kind)?,
+    )?;
+    reject_changed_current_turn_item_field(
+        &incoming.item_id,
+        "laneId",
+        existing.lane_id == incoming.lane_id,
+    )?;
+    reject_changed_current_turn_item_field(
+        &incoming.item_id,
+        "laneSeq",
+        existing.lane_seq == incoming.lane_seq,
+    )?;
+    reject_changed_current_turn_item_field(
+        &incoming.item_id,
+        "tool.callId",
+        existing.tool_call_id == incoming.tool_call_id,
+    )?;
+
+    let existing_status = canonical_current_turn_item_status(&existing.status)?;
+    let incoming_status = canonical_current_turn_item_status(&incoming.status)?;
+    if !existing_status.allows_transition_to(incoming_status) {
+        return Err(DomainError::InvalidState {
+            message: format!(
+                "canonical turn item {} illegal status transition: {:?} -> {:?}",
+                incoming.item_id, existing_status, incoming_status
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn reject_conflicting_active_current_turn(
@@ -127,18 +389,16 @@ fn upsert_runtime_sidecar_in_state(state: &mut SessionStoreState, sidecar: Sessi
 fn append_item_to_current_turn(
     sidecar: &mut SessionRuntimeSidecar,
     mut item: ActiveExecutionTurnItem,
-) -> Option<SessionRuntimeSidecar> {
+) -> DomainResult<Option<SessionRuntimeSidecar>> {
     let Some(turn) = sidecar.current_turn.as_mut() else {
-        return None;
+        return Ok(None);
     };
     if let Some(existing) = turn
         .items
         .iter_mut()
         .find(|existing| existing.item_id == item.item_id)
     {
-        if current_turn_item_rejects_update(existing, &item) {
-            return None;
-        }
+        validate_current_turn_item_update(existing, &item)?;
         if item.item_seq == 0 {
             item.item_seq = existing.item_seq;
         }
@@ -172,7 +432,7 @@ fn append_item_to_current_turn(
         chain.normalize();
     }
     sidecar.updated_at = UtcMillis::now();
-    Some(sidecar.clone())
+    Ok(Some(sidecar.clone()))
 }
 
 impl SessionStore {
@@ -471,6 +731,9 @@ impl SessionStore {
             status,
             updated_at: UtcMillis::now(),
         };
+        if let Some(turn) = updated.current_turn.as_ref() {
+            upsert_canonical_turn_in_state(&mut state, &session_id, turn)?;
+        }
         upsert_runtime_sidecar_in_state(&mut state, updated.clone());
         drop(state);
         self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertCurrentTurn);
@@ -526,6 +789,9 @@ impl SessionStore {
             session.updated_at = occurred_at;
         }
 
+        if let Some(turn) = updated.current_turn.as_ref() {
+            upsert_canonical_turn_in_state(&mut state, &session_id, turn)?;
+        }
         upsert_runtime_sidecar_in_state(&mut state, updated.clone());
         drop(state);
         self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertActiveExecutionChain);
@@ -577,6 +843,9 @@ impl SessionStore {
             active_execution_chain,
             existing,
         )?;
+        if let Some(turn) = updated.current_turn.as_ref() {
+            upsert_canonical_turn_in_state(&mut state, &session_id, turn)?;
+        }
         upsert_runtime_sidecar_in_state(&mut state, updated.clone());
         drop(state);
         self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertActiveExecutionChain);
@@ -802,7 +1071,7 @@ impl SessionStore {
                 .state
                 .write()
                 .expect("session state write lock poisoned");
-            'updated: {
+            let updated = 'updated: {
                 for sidecar in &mut state.execution_sidecar_store.runtime_sidecars {
                     let Some(chain) = sidecar.active_execution_chain.as_mut() else {
                         continue;
@@ -856,7 +1125,13 @@ impl SessionStore {
                     break 'updated Some(sidecar.clone());
                 }
                 None
+            };
+            if let Some(updated) = updated.as_ref()
+                && let Some(turn) = updated.current_turn.as_ref()
+            {
+                upsert_canonical_turn_in_state(&mut state, &updated.session_id, turn)?;
             }
+            updated
         };
         if updated.is_some() {
             self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateActiveExecutionBranchSnapshot);
@@ -891,7 +1166,7 @@ impl SessionStore {
                 )
             };
         let updated = SessionRuntimeSidecar {
-            session_id,
+            session_id: session_id.clone(),
             ownership,
             recovery_id,
             current_turn: Some(turn),
@@ -899,10 +1174,17 @@ impl SessionStore {
             status,
             updated_at: UtcMillis::now(),
         };
-        self.upsert_runtime_sidecar_with_reason(
-            updated.clone(),
-            SessionSidecarFlushReason::UpsertCurrentTurn,
-        );
+        {
+            let mut state = self
+                .state
+                .write()
+                .expect("session state write lock poisoned");
+            if let Some(turn) = updated.current_turn.as_ref() {
+                upsert_canonical_turn_in_state(&mut state, &session_id, turn)?;
+            }
+            upsert_runtime_sidecar_in_state(&mut state, updated.clone());
+        }
+        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertCurrentTurn);
         Ok(updated)
     }
 
@@ -916,17 +1198,25 @@ impl SessionStore {
                 .state
                 .write()
                 .expect("session state write lock poisoned");
-            let Some(sidecar) = state
-                .execution_sidecar_store
-                .runtime_sidecars
-                .iter_mut()
-                .find(|sidecar| &sidecar.session_id == session_id)
-            else {
-                return Err(DomainError::NotFound {
-                    entity: "session_runtime_sidecar",
-                });
+            let updated = {
+                let Some(sidecar) = state
+                    .execution_sidecar_store
+                    .runtime_sidecars
+                    .iter_mut()
+                    .find(|sidecar| &sidecar.session_id == session_id)
+                else {
+                    return Err(DomainError::NotFound {
+                        entity: "session_runtime_sidecar",
+                    });
+                };
+                append_item_to_current_turn(sidecar, item)?
             };
-            append_item_to_current_turn(sidecar, item)
+            if let Some(updated) = updated.as_ref()
+                && let Some(turn) = updated.current_turn.as_ref()
+            {
+                upsert_canonical_turn_in_state(&mut state, session_id, turn)?;
+            }
+            updated
         };
         if updated.is_some() {
             self.mark_sidecar_dirty(SessionSidecarFlushReason::AppendCurrentTurnItem);
@@ -960,11 +1250,18 @@ impl SessionStore {
                     entity: "session_runtime_sidecar",
                 });
             };
-            if state.execution_sidecar_store.runtime_sidecars[sidecar_index]
+            let Some(turn) = state.execution_sidecar_store.runtime_sidecars[sidecar_index]
                 .current_turn
-                .is_none()
-            {
+                .as_ref()
+            else {
                 return Ok(None);
+            };
+            if let Some(existing) = turn
+                .items
+                .iter()
+                .find(|existing| existing.item_id == item.item_id)
+            {
+                validate_current_turn_item_update(existing, &item)?;
             }
             reject_duplicate_timeline_entry(&state.timeline, &entry_id)?;
             state.timeline.push(TimelineEntry {
@@ -981,10 +1278,16 @@ impl SessionStore {
             {
                 session.updated_at = occurred_at;
             }
-            append_item_to_current_turn(
+            let updated = append_item_to_current_turn(
                 &mut state.execution_sidecar_store.runtime_sidecars[sidecar_index],
                 item,
-            )
+            )?;
+            if let Some(updated) = updated.as_ref()
+                && let Some(turn) = updated.current_turn.as_ref()
+            {
+                upsert_canonical_turn_in_state(&mut state, session_id, turn)?;
+            }
+            updated
         };
         if updated.is_some() {
             self.mark_sidecar_dirty(SessionSidecarFlushReason::AppendCurrentTurnItem);
@@ -1002,63 +1305,69 @@ impl SessionStore {
                 .state
                 .write()
                 .expect("session state write lock poisoned");
-            let Some(sidecar) = state
-                .execution_sidecar_store
-                .runtime_sidecars
-                .iter_mut()
-                .find(|sidecar| &sidecar.session_id == session_id)
-            else {
-                return Err(DomainError::NotFound {
-                    entity: "session_runtime_sidecar",
-                });
-            };
-            let Some(turn) = sidecar.current_turn.as_mut() else {
-                return Ok(None);
-            };
-
-            if let Some(existing) = turn
-                .items
-                .iter_mut()
-                .find(|existing| existing.item_id == item.item_id)
-            {
-                if current_turn_item_rejects_update(existing, &item) {
+            let updated = {
+                let Some(sidecar) = state
+                    .execution_sidecar_store
+                    .runtime_sidecars
+                    .iter_mut()
+                    .find(|sidecar| &sidecar.session_id == session_id)
+                else {
+                    return Err(DomainError::NotFound {
+                        entity: "session_runtime_sidecar",
+                    });
+                };
+                let Some(turn) = sidecar.current_turn.as_mut() else {
                     return Ok(None);
-                }
-                if item.item_seq == 0 {
-                    item.item_seq = existing.item_seq;
-                }
-                if item.request_id.is_none() {
-                    item.request_id = existing.request_id.clone();
-                }
-                if item.user_message_id.is_none() {
-                    item.user_message_id = existing.user_message_id.clone();
-                }
-                if item.placeholder_message_id.is_none() {
-                    item.placeholder_message_id = existing.placeholder_message_id.clone();
-                }
-                *existing = item;
-            } else {
-                let next_item_seq = turn
-                    .items
-                    .iter()
-                    .map(|existing| existing.item_seq)
-                    .max()
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                if item.item_seq == 0 {
-                    item.item_seq = next_item_seq;
-                }
-                inherit_current_turn_aliases(turn, &mut item);
-                turn.items.push(item);
-            }
+                };
 
-            turn.normalize();
-            if let Some(chain) = sidecar.active_execution_chain.as_mut() {
-                chain.current_turn = sidecar.current_turn.clone();
-                chain.normalize();
+                if let Some(existing) = turn
+                    .items
+                    .iter_mut()
+                    .find(|existing| existing.item_id == item.item_id)
+                {
+                    validate_current_turn_item_update(existing, &item)?;
+                    if item.item_seq == 0 {
+                        item.item_seq = existing.item_seq;
+                    }
+                    if item.request_id.is_none() {
+                        item.request_id = existing.request_id.clone();
+                    }
+                    if item.user_message_id.is_none() {
+                        item.user_message_id = existing.user_message_id.clone();
+                    }
+                    if item.placeholder_message_id.is_none() {
+                        item.placeholder_message_id = existing.placeholder_message_id.clone();
+                    }
+                    *existing = item;
+                } else {
+                    let next_item_seq = turn
+                        .items
+                        .iter()
+                        .map(|existing| existing.item_seq)
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    if item.item_seq == 0 {
+                        item.item_seq = next_item_seq;
+                    }
+                    inherit_current_turn_aliases(turn, &mut item);
+                    turn.items.push(item);
+                }
+
+                turn.normalize();
+                if let Some(chain) = sidecar.active_execution_chain.as_mut() {
+                    chain.current_turn = sidecar.current_turn.clone();
+                    chain.normalize();
+                }
+                sidecar.updated_at = UtcMillis::now();
+                Some(sidecar.clone())
+            };
+            if let Some(updated) = updated.as_ref()
+                && let Some(turn) = updated.current_turn.as_ref()
+            {
+                upsert_canonical_turn_in_state(&mut state, session_id, turn)?;
             }
-            sidecar.updated_at = UtcMillis::now();
-            Some(sidecar.clone())
+            updated
         };
         if updated.is_some() {
             self.mark_sidecar_dirty(SessionSidecarFlushReason::AppendCurrentTurnItem);
@@ -1076,35 +1385,57 @@ impl SessionStore {
                 .state
                 .write()
                 .expect("session state write lock poisoned");
-            let Some(sidecar) = state
-                .execution_sidecar_store
-                .runtime_sidecars
-                .iter_mut()
-                .find(|sidecar| &sidecar.session_id == session_id)
-            else {
-                return Err(DomainError::NotFound {
-                    entity: "session_runtime_sidecar",
-                });
+            let updated = {
+                let Some(sidecar) = state
+                    .execution_sidecar_store
+                    .runtime_sidecars
+                    .iter_mut()
+                    .find(|sidecar| &sidecar.session_id == session_id)
+                else {
+                    return Err(DomainError::NotFound {
+                        entity: "session_runtime_sidecar",
+                    });
+                };
+                let Some(turn) = sidecar.current_turn.as_mut() else {
+                    return Ok(None);
+                };
+                turn.status = status.into();
+                if let Some(item_status) = terminal_item_status_for_turn_status(&turn.status) {
+                    for item in &mut turn.items {
+                        if current_turn_item_status_is_active(&item.status) {
+                            item.status = item_status.to_string();
+                        }
+                        if item
+                            .tool_status
+                            .as_deref()
+                            .is_some_and(current_turn_item_status_is_active)
+                        {
+                            item.tool_status = Some(item_status.to_string());
+                        }
+                    }
+                }
+                if turn.completed_at.is_none()
+                    && matches!(
+                        turn.status.as_str(),
+                        "completed" | "failed" | "blocked" | "error" | "cancelled"
+                    )
+                {
+                    turn.completed_at = Some(UtcMillis::now());
+                }
+                turn.normalize();
+                if let Some(chain) = sidecar.active_execution_chain.as_mut() {
+                    chain.current_turn = sidecar.current_turn.clone();
+                    chain.normalize();
+                }
+                sidecar.updated_at = UtcMillis::now();
+                Some(sidecar.clone())
             };
-            let Some(turn) = sidecar.current_turn.as_mut() else {
-                return Ok(None);
-            };
-            turn.status = status.into();
-            if turn.completed_at.is_none()
-                && matches!(
-                    turn.status.as_str(),
-                    "completed" | "failed" | "blocked" | "error" | "cancelled"
-                )
+            if let Some(updated) = updated.as_ref()
+                && let Some(turn) = updated.current_turn.as_ref()
             {
-                turn.completed_at = Some(UtcMillis::now());
+                upsert_canonical_turn_in_state(&mut state, session_id, turn)?;
             }
-            turn.normalize();
-            if let Some(chain) = sidecar.active_execution_chain.as_mut() {
-                chain.current_turn = sidecar.current_turn.clone();
-                chain.normalize();
-            }
-            sidecar.updated_at = UtcMillis::now();
-            Some(sidecar.clone())
+            updated
         };
         if updated.is_some() {
             self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateCurrentTurnStatus);
@@ -1121,45 +1452,53 @@ impl SessionStore {
                 .state
                 .write()
                 .expect("session state write lock poisoned");
-            let Some(sidecar) = state
-                .execution_sidecar_store
-                .runtime_sidecars
-                .iter_mut()
-                .find(|sidecar| &sidecar.session_id == session_id)
-            else {
-                return Err(DomainError::NotFound {
-                    entity: "session_runtime_sidecar",
-                });
-            };
-            let Some(turn) = sidecar.current_turn.as_mut() else {
-                return Ok(None);
-            };
-            if !current_turn_status_is_terminal(&turn.status) {
-                let now = UtcMillis::now();
-                for item in &mut turn.items {
-                    if current_turn_item_status_is_active(&item.status) {
-                        item.status = "cancelled".to_string();
+            let updated = {
+                let Some(sidecar) = state
+                    .execution_sidecar_store
+                    .runtime_sidecars
+                    .iter_mut()
+                    .find(|sidecar| &sidecar.session_id == session_id)
+                else {
+                    return Err(DomainError::NotFound {
+                        entity: "session_runtime_sidecar",
+                    });
+                };
+                let Some(turn) = sidecar.current_turn.as_mut() else {
+                    return Ok(None);
+                };
+                if !current_turn_status_is_terminal(&turn.status) {
+                    let now = UtcMillis::now();
+                    for item in &mut turn.items {
+                        if current_turn_item_status_is_active(&item.status) {
+                            item.status = "cancelled".to_string();
+                        }
+                        if item
+                            .tool_status
+                            .as_deref()
+                            .is_some_and(current_turn_item_status_is_active)
+                        {
+                            item.tool_status = Some("cancelled".to_string());
+                        }
                     }
-                    if item
-                        .tool_status
-                        .as_deref()
-                        .is_some_and(current_turn_item_status_is_active)
-                    {
-                        item.tool_status = Some("cancelled".to_string());
+                    turn.status = "cancelled".to_string();
+                    if turn.completed_at.is_none() {
+                        turn.completed_at = Some(now);
                     }
                 }
-                turn.status = "cancelled".to_string();
-                if turn.completed_at.is_none() {
-                    turn.completed_at = Some(now);
+                turn.normalize();
+                if let Some(chain) = sidecar.active_execution_chain.as_mut() {
+                    chain.current_turn = sidecar.current_turn.clone();
+                    chain.normalize();
                 }
+                sidecar.updated_at = UtcMillis::now();
+                Some(sidecar.clone())
+            };
+            if let Some(updated) = updated.as_ref()
+                && let Some(turn) = updated.current_turn.as_ref()
+            {
+                upsert_canonical_turn_in_state(&mut state, session_id, turn)?;
             }
-            turn.normalize();
-            if let Some(chain) = sidecar.active_execution_chain.as_mut() {
-                chain.current_turn = sidecar.current_turn.clone();
-                chain.normalize();
-            }
-            sidecar.updated_at = UtcMillis::now();
-            Some(sidecar.clone())
+            updated
         };
         if updated.is_some() {
             self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateCurrentTurnStatus);

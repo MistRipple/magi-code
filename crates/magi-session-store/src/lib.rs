@@ -3,7 +3,10 @@ mod store;
 
 pub use models::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
-    ActiveExecutionTurn, ActiveExecutionTurnItem, ActiveExecutionTurnLane, NotificationRecord,
+    ActiveExecutionTurn, ActiveExecutionTurnItem, ActiveExecutionTurnLane,
+    CANONICAL_TURN_SCHEMA_VERSION, CanonicalToolCall, CanonicalTurn, CanonicalTurnEvent,
+    CanonicalTurnEventKind, CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnItemStatus,
+    CanonicalTurnStatus, CanonicalTurnVisibility, CanonicalWorkerRef, NotificationRecord,
     SessionDurableState, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
     SessionProjectionInput, SessionRecord, SessionRuntimeSidecar, SessionRuntimeSidecarExport,
     SessionSidecarFlushMetadata, SessionSidecarFlushReason, SessionStoreState, TimelineEntry,

@@ -947,7 +947,7 @@
   "messageHandler.toolAuthMissingRequestId": "工具授权请求缺少标识，已忽略该请求",
   "messageHandler.autoToolAuthorization": "自动模式已自动授权工具调用并继续",
   "messageHandler.toolAuthConflict": "当前有待处理交互，已自动拒绝本次工具授权请求",
-  "messageHandler.interactionModeSyncTimeout": "交互模式切换超时，已回退同步状态",
+  "messageHandler.interactionModeSyncTimeout": "交互模式切换超时，已恢复同步状态",
   "messageHandler.fileChange": "文件变更: {filePath} ({changeType})",
   "messageHandler.planGoal": "目标: {goal}",
   "messageHandler.planAnalysis": "分析: {analysis}",

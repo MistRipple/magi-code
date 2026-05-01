@@ -4,7 +4,7 @@ use axum::{
     routing::get,
 };
 use magi_core::UtcMillis;
-use magi_session_store::{NotificationRecord, SessionRecord, TimelineEntry};
+use magi_session_store::{CanonicalTurn, NotificationRecord, SessionRecord, TimelineEntry};
 use serde::{Deserialize, Serialize};
 
 use super::session_scope::{
@@ -34,6 +34,8 @@ struct MessagesResponseDto {
     current_session: Option<SessionRecord>,
     sessions: Vec<SessionRecord>,
     timeline: Vec<TimelineEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    canonical_turns: Vec<CanonicalTurn>,
     notifications: Vec<NotificationRecord>,
     session_id: String,
     has_more_before: bool,
@@ -85,6 +87,7 @@ async fn get_messages(
     let start = end.saturating_sub(limit);
     let page = timeline[start..end].to_vec();
     let sessions = state.session_records_for_workspace(scope_workspace_id.as_deref());
+    let canonical_turns = state.session_store.canonical_turns_for_session(&session_id);
     let before_cursor = page.first().map(|entry| entry.entry_id.clone());
 
     Ok(Json(MessagesResponseDto {
@@ -92,6 +95,7 @@ async fn get_messages(
         current_session: Some(current_session),
         sessions,
         timeline: page,
+        canonical_turns,
         notifications: state.session_store.notifications_for_session(&session_id),
         session_id: session_id.to_string(),
         has_more_before: start > 0,
@@ -144,6 +148,7 @@ mod tests {
                     workspace_id: None,
                 }],
                 timeline: Vec::new(),
+                canonical_turns: Vec::new(),
                 notifications: Vec::new(),
             },
             SessionExecutionSidecarStoreState {

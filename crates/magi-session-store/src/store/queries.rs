@@ -29,6 +29,11 @@ impl SessionStore {
                 .cmp(&right.occurred_at.0)
                 .then_with(|| left.entry_id.cmp(&right.entry_id))
         });
+        state.canonical_turns.sort_by(|left, right| {
+            left.turn_seq
+                .cmp(&right.turn_seq)
+                .then_with(|| left.turn_id.cmp(&right.turn_id))
+        });
         state.notifications.sort_by(|left, right| {
             left.created_at
                 .0
@@ -45,6 +50,7 @@ impl SessionStore {
             current_session_id: state.current_session_id,
             sessions,
             timeline,
+            canonical_turns: state.canonical_turns,
             notifications: state.notifications,
         }
     }
@@ -123,6 +129,30 @@ impl SessionStore {
             .collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.occurred_at.0);
         entries
+    }
+
+    pub fn canonical_turns_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Vec<crate::models::CanonicalTurn> {
+        let mut turns = self
+            .state
+            .read()
+            .expect("session state read lock poisoned")
+            .canonical_turns
+            .iter()
+            .filter(|turn| &turn.session_id == session_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for turn in &mut turns {
+            turn.normalize();
+        }
+        turns.sort_by(|left, right| {
+            left.turn_seq
+                .cmp(&right.turn_seq)
+                .then_with(|| left.turn_id.cmp(&right.turn_id))
+        });
+        turns
     }
 
     pub fn recent_turn_messages(&self, session_id: &SessionId, limit: usize) -> Vec<String> {

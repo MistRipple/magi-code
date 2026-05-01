@@ -1,9 +1,9 @@
 use crate::{
     prompt_utils::{normalize_model_stream_preview_content, normalize_model_visible_content},
     session_turn_writeback::{
-        append_session_turn_item_with_task_store, build_completed_turn_timeline_snapshot,
-        publish_current_session_turn_item_event, publish_session_turn_item_event,
-        session_turn_item, upsert_session_turn_item_with_task_store,
+        append_session_turn_item_with_task_store, publish_current_session_turn_item_event,
+        publish_session_turn_item_event, session_turn_item,
+        upsert_session_turn_item_with_task_store,
     },
     settings_store::SettingsStore,
     skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime},
@@ -926,24 +926,6 @@ fn append_task_final_turn_item(
             &final_item_id,
             Some(task_store),
         );
-        let snapshot_entry_id =
-            timeline_entry_id.or(has_requested_final_item_id.then_some(final_item_id.as_str()));
-        let timeline_message = build_completed_turn_timeline_snapshot(
-            session_store,
-            session_id,
-            Some(final_content),
-            snapshot_entry_id,
-            Some(task_store),
-        )
-        .unwrap_or_else(|| final_content.to_string());
-        let fallback_entry_id = format!("timeline-turn-snapshot-{}", task.task_id);
-        let entry_id = snapshot_entry_id.unwrap_or(fallback_entry_id.as_str());
-        session_store.upsert_timeline_entry(
-            session_id.clone(),
-            entry_id,
-            TimelineEntryKind::AssistantMessage,
-            timeline_message,
-        );
     }
 }
 
@@ -956,7 +938,7 @@ fn append_task_error_turn_item(
     workspace_id: &Option<WorkspaceId>,
     turn_visibility: &TaskTurnVisibility,
     error_text: &str,
-    streaming_entry_id: Option<&str>,
+    _streaming_entry_id: Option<&str>,
 ) {
     let mut error_item = session_turn_item(
         "assistant_error",
@@ -984,22 +966,6 @@ fn append_task_error_turn_item(
             workspace_id,
             &error_item_id,
             Some(task_store),
-        );
-        let timeline_message = build_completed_turn_timeline_snapshot(
-            session_store,
-            session_id,
-            Some(error_text),
-            streaming_entry_id,
-            Some(task_store),
-        )
-        .unwrap_or_else(|| error_text.to_string());
-        let fallback_entry_id = format!("timeline-turn-snapshot-error-{}", task.task_id);
-        let entry_id = streaming_entry_id.unwrap_or(fallback_entry_id.as_str());
-        session_store.upsert_timeline_entry(
-            session_id.clone(),
-            entry_id,
-            TimelineEntryKind::AssistantMessage,
-            timeline_message,
         );
     }
 }

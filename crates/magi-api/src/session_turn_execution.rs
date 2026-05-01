@@ -3,9 +3,8 @@ use crate::{
     prompt_utils::{normalize_model_stream_preview_content, normalize_model_visible_content},
     session_turn_writeback::{
         append_session_tool_call_items_batch, append_session_turn_error_item,
-        append_session_turn_item, build_completed_turn_timeline_snapshot,
-        publish_current_session_turn_item_event, publish_session_turn_item_event,
-        session_turn_item, upsert_session_turn_item,
+        append_session_turn_item, publish_current_session_turn_item_event,
+        publish_session_turn_item_event, session_turn_item, upsert_session_turn_item,
     },
     settings_store::SettingsStore,
     usage_recording::{
@@ -17,7 +16,7 @@ use magi_bridge_client::{
 };
 use magi_core::{SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::InMemoryEventBus;
-use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
+use magi_session_store::{CanonicalTurnItemKind, SessionStore, TimelineEntryKind};
 use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
 use std::sync::Arc;
@@ -104,34 +103,28 @@ fn build_session_turn_messages(
         .and_then(|sidecar| sidecar.current_turn)
         .filter(|turn| turn.turn_id == request.turn_id);
     let accepted_at = current_turn.as_ref().map(|turn| turn.accepted_at);
-    let current_user_timeline_entry_id = current_turn.as_ref().and_then(|turn| {
-        turn.items
-            .iter()
-            .find(|item| item.kind == "user_message")
-            .and_then(|item| item.timeline_entry_id.clone())
-    });
     let mut history = accepted_at
         .map(|accepted_at| {
             session_store
-                .timeline_for_session(&request.session_id)
+                .canonical_turns_for_session(&request.session_id)
                 .into_iter()
-                .filter(|entry| {
-                    if let Some(current_user_timeline_entry_id) =
-                        current_user_timeline_entry_id.as_deref()
-                    {
-                        entry.entry_id != current_user_timeline_entry_id
-                            && entry.occurred_at.0 <= accepted_at.0
-                    } else {
-                        entry.occurred_at.0 < accepted_at.0
-                    }
+                .filter(|turn| {
+                    turn.turn_id != request.turn_id && turn.accepted_at.0 < accepted_at.0
                 })
-                .filter_map(|entry| {
-                    let role = match entry.kind {
-                        TimelineEntryKind::UserMessage => "user",
-                        TimelineEntryKind::AssistantMessage => "assistant",
+                .flat_map(|turn| turn.items.into_iter())
+                .filter_map(|item| {
+                    let role = match item.kind {
+                        CanonicalTurnItemKind::UserMessage => "user",
+                        CanonicalTurnItemKind::AssistantText => "assistant",
                         _ => return None,
                     };
-                    let content = timeline_entry_visible_text(&entry.message)?;
+                    if item.visibility.thread_visible == false {
+                        return None;
+                    }
+                    let content = item.content?.trim().to_string();
+                    if content.is_empty() {
+                        return None;
+                    }
                     Some(ChatMessage {
                         role: role.to_string(),
                         content: Some(content),
@@ -188,7 +181,8 @@ pub(crate) fn run_session_turn_execution(
     append_phase_item(event_bus, session_store, &request);
     let mut messages = build_session_turn_messages(session_store, &request, &prompt);
     let mut final_content: Option<String> = None;
-    let mut last_streaming_entry_id: Option<String> = None;
+    let mut final_item_id: Option<String> = None;
+    let mut main_timeline_entry_id: Option<String> = None;
     let mut had_tool_calls = false;
     let usage_binding = session_turn_model_usage_binding(request.use_tools);
 
@@ -225,7 +219,7 @@ pub(crate) fn run_session_turn_execution(
                     request.user_message_id.as_deref(),
                     request.placeholder_message_id.as_deref(),
                     &error_text,
-                    last_streaming_entry_id.as_deref(),
+                    main_timeline_entry_id.as_deref(),
                 );
                 return Err(error);
             }
@@ -233,10 +227,13 @@ pub(crate) fn run_session_turn_execution(
         if streamed_content.interrupted || !request_turn_is_writable(session_store, &request) {
             return Ok(SessionTurnExecutionOutput::interrupted());
         }
-        last_streaming_entry_id = streamed_content.streaming_entry_id.clone();
+        if main_timeline_entry_id.is_none() {
+            main_timeline_entry_id = streamed_content.timeline_entry_id.clone();
+        }
         had_tool_calls |= streamed_content.encountered_tool_calls;
 
         if let Some(content) = streamed_content.final_content {
+            final_item_id = streamed_content.final_item_id;
             final_content = Some(content);
             break;
         }
@@ -263,7 +260,7 @@ pub(crate) fn run_session_turn_execution(
             request.user_message_id.as_deref(),
             request.placeholder_message_id.as_deref(),
             failure_reason,
-            last_streaming_entry_id.as_deref(),
+            main_timeline_entry_id.as_deref(),
         );
         return Err(ApiError::model_invocation_failed(
             "执行 session turn 失败",
@@ -278,7 +275,8 @@ pub(crate) fn run_session_turn_execution(
         session_store,
         &request,
         &final_content,
-        last_streaming_entry_id.as_deref(),
+        final_item_id.as_deref(),
+        main_timeline_entry_id.as_deref(),
     );
 
     Ok(SessionTurnExecutionOutput::completed(final_content))
@@ -299,7 +297,8 @@ struct SessionTurnRoundRuntime<'a> {
 
 struct SessionTurnRoundOutput {
     final_content: Option<String>,
-    streaming_entry_id: Option<String>,
+    final_item_id: Option<String>,
+    timeline_entry_id: Option<String>,
     encountered_tool_calls: bool,
     interrupted: bool,
 }
@@ -335,6 +334,7 @@ fn stream_session_turn_round(
     let streamed_content = std::cell::RefCell::new(String::new());
     let streamed_thinking = std::cell::RefCell::new(String::new());
     let streamed_visible_content = std::cell::RefCell::new(String::new());
+    let timeline_entry_written = std::cell::Cell::new(false);
     let last_content_len = std::cell::Cell::new(0usize);
     let last_thinking_len = std::cell::Cell::new(0usize);
     let writeback_aborted = std::cell::Cell::new(false);
@@ -414,12 +414,15 @@ fn stream_session_turn_round(
                 &published,
             );
         }
-        session_store.upsert_timeline_entry(
-            request.session_id.clone(),
-            &stream_item_id,
-            TimelineEntryKind::AssistantMessage,
-            visible_content,
-        );
+        if round == 0 {
+            session_store.upsert_timeline_entry(
+                request.session_id.clone(),
+                &stream_item_id,
+                TimelineEntryKind::AssistantMessage,
+                visible_content,
+            );
+            timeline_entry_written.set(true);
+        }
     };
 
     let response = client
@@ -448,10 +451,12 @@ fn stream_session_turn_round(
         None,
         None,
     );
+    let timeline_entry_id = timeline_entry_written.get().then(|| stream_item_id.clone());
     if writeback_aborted.get() || !request_turn_is_writable(session_store, request) {
         return Ok(SessionTurnRoundOutput {
             final_content: None,
-            streaming_entry_id: Some(stream_item_id),
+            final_item_id: None,
+            timeline_entry_id: timeline_entry_id.clone(),
             encountered_tool_calls: false,
             interrupted: true,
         });
@@ -469,7 +474,8 @@ fn stream_session_turn_round(
         if !request_turn_is_writable(session_store, request) {
             return Ok(SessionTurnRoundOutput {
                 final_content: None,
-                streaming_entry_id: Some(stream_item_id),
+                final_item_id: None,
+                timeline_entry_id: timeline_entry_id.clone(),
                 encountered_tool_calls: false,
                 interrupted: true,
             });
@@ -497,7 +503,8 @@ fn stream_session_turn_round(
         if !request_turn_is_writable(session_store, request) {
             return Ok(SessionTurnRoundOutput {
                 final_content: None,
-                streaming_entry_id: Some(stream_item_id),
+                final_item_id: None,
+                timeline_entry_id: timeline_entry_id.clone(),
                 encountered_tool_calls: false,
                 interrupted: true,
             });
@@ -526,7 +533,8 @@ fn stream_session_turn_round(
         if !request_turn_is_writable(session_store, request) {
             return Ok(SessionTurnRoundOutput {
                 final_content: None,
-                streaming_entry_id: Some(stream_item_id),
+                final_item_id: None,
+                timeline_entry_id: timeline_entry_id.clone(),
                 encountered_tool_calls: false,
                 interrupted: true,
             });
@@ -551,14 +559,16 @@ fn stream_session_turn_round(
         if !request_turn_is_writable(session_store, request) {
             return Ok(SessionTurnRoundOutput {
                 final_content: None,
-                streaming_entry_id: Some(stream_item_id),
+                final_item_id: None,
+                timeline_entry_id: timeline_entry_id.clone(),
                 encountered_tool_calls: false,
                 interrupted: true,
             });
         }
         return Ok(SessionTurnRoundOutput {
             final_content: None,
-            streaming_entry_id: Some(stream_item_id),
+            final_item_id: None,
+            timeline_entry_id: timeline_entry_id.clone(),
             encountered_tool_calls: true,
             interrupted: false,
         });
@@ -571,9 +581,14 @@ fn stream_session_turn_round(
         .map(normalize_model_visible_content)
         .filter(|content| !content.trim().is_empty());
 
+    let final_item_id = final_content
+        .as_ref()
+        .and_then(|_| (!streamed_visible_content.trim().is_empty()).then_some(stream_item_id));
+
     Ok(SessionTurnRoundOutput {
         final_content,
-        streaming_entry_id: Some(stream_item_id),
+        final_item_id,
+        timeline_entry_id,
         encountered_tool_calls: false,
         interrupted: false,
     })
@@ -595,6 +610,7 @@ fn append_phase_item(
         }),
         None,
     );
+    phase_item.thread_visible = false;
     apply_request_aliases(&mut phase_item, request);
     if let Some(published) =
         append_session_turn_item(session_store, &request.session_id, phase_item)
@@ -626,18 +642,23 @@ fn append_final_item(
     session_store: &SessionStore,
     request: &SessionTurnExecutionRequest,
     final_content: &str,
-    streaming_entry_id: Option<&str>,
+    final_item_id: Option<&str>,
+    timeline_entry_id: Option<&str>,
 ) {
+    let has_requested_final_item_id = final_item_id.is_some();
     let mut final_item = session_turn_item(
         "assistant_final",
         "completed",
         Some("最终回复".to_string()),
         Some(final_content.to_string()),
-        streaming_entry_id.map(str::to_string),
+        final_item_id.map(str::to_string),
     );
+    if let Some(timeline_entry_id) = timeline_entry_id {
+        final_item.timeline_entry_id = Some(timeline_entry_id.to_string());
+    }
     apply_request_aliases(&mut final_item, request);
     let final_item_id = final_item.item_id.clone();
-    if streaming_entry_id.is_some() {
+    if has_requested_final_item_id {
         if let Some(published) =
             upsert_session_turn_item(session_store, &request.session_id, final_item)
         {
@@ -667,32 +688,6 @@ fn append_final_item(
         &final_item_id,
         None,
     );
-    let timeline_message = build_completed_turn_timeline_snapshot(
-        session_store,
-        &request.session_id,
-        Some(final_content),
-        streaming_entry_id,
-        None,
-    )
-    .unwrap_or_else(|| final_content.to_string());
-    let fallback_entry_id = session_store
-        .runtime_sidecar(&request.session_id)
-        .and_then(|sidecar| {
-            sidecar.current_turn.as_ref().map(|turn| {
-                format!(
-                    "timeline-turn-snapshot-{}-{}",
-                    &request.session_id, turn.turn_id
-                )
-            })
-        })
-        .unwrap_or_else(|| format!("timeline-turn-snapshot-{}", &request.session_id));
-    let entry_id = streaming_entry_id.unwrap_or(fallback_entry_id.as_str());
-    session_store.upsert_timeline_entry(
-        request.session_id.clone(),
-        entry_id,
-        TimelineEntryKind::AssistantMessage,
-        timeline_message,
-    );
 }
 
 #[cfg(test)]
@@ -700,8 +695,11 @@ mod tests {
     use super::*;
     use magi_core::SessionLifecycleStatus;
     use magi_session_store::{
-        ActiveExecutionTurn, SessionRecord, SessionStoreState, TimelineEntry,
+        ActiveExecutionTurn, CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind,
+        CanonicalTurnItemStatus, CanonicalTurnStatus, CanonicalTurnVisibility, SessionRecord,
+        SessionStoreState, TimelineEntry,
     };
+    use std::collections::HashMap;
 
     fn ts(value: u64) -> UtcMillis {
         UtcMillis(value)
@@ -710,27 +708,6 @@ mod tests {
     #[test]
     fn session_turn_messages_include_persisted_history_before_current_turn() {
         let session_id = SessionId::new("session-context-history");
-        let assistant_snapshot = serde_json::json!({
-            "is_historical_turn_snapshot": true,
-            "current_turn": {
-                "turn_id": "turn-prev",
-                "turn_seq": 1000,
-                "accepted_at": 1000,
-                "completed_at": 1200,
-                "response_duration_ms": 200,
-                "status": "completed",
-                "user_message": "请用一句话回答：2+3 等于几？"
-            },
-            "turn_items": [{
-                "item_id": "turn-item-prev-final",
-                "item_seq": 2,
-                "kind": "assistant_final",
-                "status": "completed",
-                "source": "orchestrator",
-                "content": "2+3 等于 5。"
-            }]
-        })
-        .to_string();
         let store = SessionStore::from_state(SessionStoreState {
             current_session_id: Some(session_id.clone()),
             sessions: vec![SessionRecord {
@@ -754,7 +731,7 @@ mod tests {
                     entry_id: "timeline-assistant-prev".to_string(),
                     session_id: session_id.clone(),
                     kind: TimelineEntryKind::AssistantMessage,
-                    message: assistant_snapshot,
+                    message: "timeline snapshot 不应作为模型上下文事实源".to_string(),
                     occurred_at: ts(1200),
                 },
                 TimelineEntry {
@@ -765,6 +742,61 @@ mod tests {
                     occurred_at: ts(2000),
                 },
             ],
+            canonical_turns: vec![CanonicalTurn {
+                session_id: session_id.clone(),
+                turn_id: "turn-prev".to_string(),
+                turn_seq: 1000,
+                accepted_at: ts(1000),
+                completed_at: Some(ts(1200)),
+                status: CanonicalTurnStatus::Completed,
+                response_duration_ms: Some(200),
+                usage: None,
+                items: vec![
+                    CanonicalTurnItem {
+                        session_id: session_id.clone(),
+                        turn_id: "turn-prev".to_string(),
+                        turn_seq: 1000,
+                        item_id: "turn-item-prev-user".to_string(),
+                        item_seq: 1,
+                        kind: CanonicalTurnItemKind::UserMessage,
+                        created_at: ts(1000),
+                        status: CanonicalTurnItemStatus::Completed,
+                        item_version: None,
+                        updated_at: ts(1000),
+                        lane_id: None,
+                        lane_seq: None,
+                        title: None,
+                        content: Some("请用一句话回答：2+3 等于几？".to_string()),
+                        blocks: Vec::new(),
+                        tool: None,
+                        worker: None,
+                        visibility: CanonicalTurnVisibility::default(),
+                        metadata: HashMap::new(),
+                    },
+                    CanonicalTurnItem {
+                        session_id: session_id.clone(),
+                        turn_id: "turn-prev".to_string(),
+                        turn_seq: 1000,
+                        item_id: "turn-item-prev-final".to_string(),
+                        item_seq: 2,
+                        kind: CanonicalTurnItemKind::AssistantText,
+                        created_at: ts(1200),
+                        status: CanonicalTurnItemStatus::Completed,
+                        item_version: None,
+                        updated_at: ts(1200),
+                        lane_id: None,
+                        lane_seq: None,
+                        title: None,
+                        content: Some("2+3 等于 5。".to_string()),
+                        blocks: Vec::new(),
+                        tool: None,
+                        worker: None,
+                        visibility: CanonicalTurnVisibility::default(),
+                        metadata: HashMap::new(),
+                    },
+                ],
+                metadata: HashMap::new(),
+            }],
             notifications: Vec::new(),
             execution_sidecar_store: Default::default(),
         });
@@ -820,6 +852,105 @@ mod tests {
     }
 
     #[test]
+    fn append_final_item_keeps_post_tool_assistant_item_separate_from_main_timeline_entry() {
+        let session_id = SessionId::new("session-post-tool-final-item");
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "post tool final")
+            .expect("session should be creatable");
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-post-tool-final-item".to_string(),
+                    turn_seq: 1,
+                    accepted_at: ts(1000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("请调用工具后回答".to_string()),
+                    items: Vec::new(),
+                    worker_lanes: Vec::new(),
+                },
+            )
+            .expect("current turn should be stored");
+        let event_bus = InMemoryEventBus::new(16);
+        let request = SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            turn_id: "turn-post-tool-final-item".to_string(),
+            workspace_id: None,
+            prompt: "请调用工具后回答".to_string(),
+            use_tools: true,
+            skill_name: None,
+            request_id: Some("request-post-tool-final-item".to_string()),
+            user_message_id: Some("user-post-tool-final-item".to_string()),
+            placeholder_message_id: Some("placeholder-post-tool-final-item".to_string()),
+        };
+
+        let mut pre_tool_stream = session_turn_item(
+            "assistant_stream",
+            "completed",
+            Some("生成回复".to_string()),
+            Some("我先检查工具结果。".to_string()),
+            Some("turn-item-assistant-stream-main".to_string()),
+        );
+        pre_tool_stream.timeline_entry_id = Some("turn-item-assistant-stream-main".to_string());
+        append_session_turn_item(&store, &session_id, pre_tool_stream)
+            .expect("pre-tool stream item should be stored");
+        let post_tool_stream = session_turn_item(
+            "assistant_stream",
+            "completed",
+            Some("生成回复".to_string()),
+            Some("工具结果显示可以继续。".to_string()),
+            Some("turn-item-assistant-stream-post-tool".to_string()),
+        );
+        append_session_turn_item(&store, &session_id, post_tool_stream)
+            .expect("post-tool stream item should be stored");
+
+        append_final_item(
+            &event_bus,
+            &store,
+            &request,
+            "最终答案来自工具后轮次。",
+            Some("turn-item-assistant-stream-post-tool"),
+            Some("turn-item-assistant-stream-main"),
+        );
+
+        let turn = store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("current turn should remain available");
+        let pre_tool_item = turn
+            .items
+            .iter()
+            .find(|item| item.item_id == "turn-item-assistant-stream-main")
+            .expect("pre-tool item should remain stored");
+        assert_eq!(pre_tool_item.kind, "assistant_stream");
+        assert_eq!(pre_tool_item.content.as_deref(), Some("我先检查工具结果。"));
+        let post_tool_item = turn
+            .items
+            .iter()
+            .find(|item| item.item_id == "turn-item-assistant-stream-post-tool")
+            .expect("post-tool item should become final item");
+        assert_eq!(post_tool_item.kind, "assistant_final");
+        assert_eq!(
+            post_tool_item.timeline_entry_id.as_deref(),
+            Some("turn-item-assistant-stream-main")
+        );
+        assert_eq!(
+            post_tool_item.content.as_deref(),
+            Some("最终答案来自工具后轮次。")
+        );
+        assert!(
+            store
+                .timeline_for_session(&session_id)
+                .iter()
+                .any(|entry| entry.entry_id == "turn-item-assistant-stream-main"
+                    && entry.message.contains("最终答案来自工具后轮次。")),
+            "完成态 snapshot 必须写回主 timeline entry"
+        );
+    }
+
+    #[test]
     fn append_final_item_publishes_terminal_duration_from_backend_turn() {
         let session_id = SessionId::new("session-terminal-duration");
         let store = SessionStore::new();
@@ -854,7 +985,7 @@ mod tests {
             placeholder_message_id: Some("placeholder-terminal-duration".to_string()),
         };
 
-        append_final_item(&event_bus, &store, &request, "最终回复", None);
+        append_final_item(&event_bus, &store, &request, "最终回复", None, None);
 
         let terminal_event = event_bus
             .snapshot()

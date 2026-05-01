@@ -1,8 +1,9 @@
 use magi_core::{
-    ExecutionOwnership, LeaseId, MissionId, SessionId, SessionLifecycleStatus, TaskId, UtcMillis,
-    WorkerId, WorkspaceId,
+    DomainError, DomainResult, ExecutionOwnership, LeaseId, MissionId, SessionId,
+    SessionLifecycleStatus, TaskId, UtcMillis, WorkerId, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -92,6 +93,295 @@ pub struct ActiveExecutionTurnLane {
     pub title: String,
     #[serde(default)]
     pub is_primary: bool,
+}
+
+pub const CANONICAL_TURN_SCHEMA_VERSION: &str = "canonical-turn.v1";
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalTurnStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl CanonicalTurnStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+
+    pub fn allows_transition_to(self, next: Self) -> bool {
+        if self == next {
+            return true;
+        }
+        match self {
+            Self::Pending => matches!(
+                next,
+                Self::Running | Self::Completed | Self::Failed | Self::Cancelled
+            ),
+            Self::Running => matches!(next, Self::Completed | Self::Failed | Self::Cancelled),
+            Self::Completed | Self::Failed | Self::Cancelled => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalTurnItemKind {
+    UserMessage,
+    AssistantText,
+    AssistantThinking,
+    ToolCall,
+    WorkerDispatch,
+    WorkerStatus,
+    WorkerResult,
+    TaskStatus,
+    SystemNotice,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalTurnItemStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl CanonicalTurnItemStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+
+    pub fn allows_transition_to(self, next: Self) -> bool {
+        if self == next {
+            return true;
+        }
+        match self {
+            Self::Pending => matches!(
+                next,
+                Self::Running | Self::Completed | Self::Failed | Self::Cancelled
+            ),
+            Self::Running => matches!(next, Self::Completed | Self::Failed | Self::Cancelled),
+            Self::Completed | Self::Failed | Self::Cancelled => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalTurnEventKind {
+    TurnStarted,
+    TurnItemUpsert,
+    TurnCompleted,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalTurnVisibility {
+    #[serde(default = "default_true")]
+    pub thread_visible: bool,
+    #[serde(default)]
+    pub worker_visible: bool,
+    #[serde(default = "default_true")]
+    pub renderable: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_tab_ids: Vec<String>,
+}
+
+impl Default for CanonicalTurnVisibility {
+    fn default() -> Self {
+        Self {
+            thread_visible: true,
+            worker_visible: false,
+            renderable: true,
+            worker_tab_ids: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalToolCall {
+    pub call_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalWorkerRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<WorkerId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalTurnItem {
+    pub session_id: SessionId,
+    pub turn_id: String,
+    pub turn_seq: u64,
+    pub item_id: String,
+    pub item_seq: usize,
+    pub kind: CanonicalTurnItemKind,
+    pub created_at: UtcMillis,
+    pub status: CanonicalTurnItemStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_version: Option<u64>,
+    pub updated_at: UtcMillis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_seq: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<CanonicalToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<CanonicalWorkerRef>,
+    #[serde(default)]
+    pub visibility: CanonicalTurnVisibility,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, Value>,
+}
+
+impl CanonicalTurnItem {
+    pub fn validate_update_from(&self, existing: &Self) -> DomainResult<()> {
+        reject_changed_field(
+            "sessionId",
+            self.session_id == existing.session_id,
+            &self.item_id,
+        )?;
+        reject_changed_field("turnId", self.turn_id == existing.turn_id, &self.item_id)?;
+        reject_changed_field("turnSeq", self.turn_seq == existing.turn_seq, &self.item_id)?;
+        reject_changed_field("itemSeq", self.item_seq == existing.item_seq, &self.item_id)?;
+        reject_changed_field("kind", self.kind == existing.kind, &self.item_id)?;
+        reject_changed_field(
+            "createdAt",
+            self.created_at == existing.created_at,
+            &self.item_id,
+        )?;
+        reject_changed_field("laneId", self.lane_id == existing.lane_id, &self.item_id)?;
+        reject_changed_field("laneSeq", self.lane_seq == existing.lane_seq, &self.item_id)?;
+        reject_changed_field(
+            "tool.callId",
+            self.tool_call_id() == existing.tool_call_id(),
+            &self.item_id,
+        )?;
+        if !existing.status.allows_transition_to(self.status) {
+            return Err(DomainError::InvalidState {
+                message: format!(
+                    "canonical turn item {} illegal status transition: {:?} -> {:?}",
+                    self.item_id, existing.status, self.status
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn tool_call_id(&self) -> Option<&str> {
+        self.tool.as_ref().map(|tool| tool.call_id.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalTurn {
+    pub session_id: SessionId,
+    pub turn_id: String,
+    pub turn_seq: u64,
+    pub accepted_at: UtcMillis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<UtcMillis>,
+    pub status: CanonicalTurnStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Value>,
+    #[serde(default)]
+    pub items: Vec<CanonicalTurnItem>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, Value>,
+}
+
+impl CanonicalTurn {
+    pub fn normalize(&mut self) {
+        self.items.sort_by(|left, right| {
+            left.item_seq
+                .cmp(&right.item_seq)
+                .then_with(|| left.item_id.cmp(&right.item_id))
+        });
+    }
+
+    pub fn validate_update_from(&self, existing: &Self) -> DomainResult<()> {
+        reject_changed_field(
+            "sessionId",
+            self.session_id == existing.session_id,
+            &self.turn_id,
+        )?;
+        reject_changed_field("turnId", self.turn_id == existing.turn_id, &self.turn_id)?;
+        reject_changed_field("turnSeq", self.turn_seq == existing.turn_seq, &self.turn_id)?;
+        reject_changed_field(
+            "acceptedAt",
+            self.accepted_at == existing.accepted_at,
+            &self.turn_id,
+        )?;
+        if !existing.status.allows_transition_to(self.status) {
+            return Err(DomainError::InvalidState {
+                message: format!(
+                    "canonical turn {} illegal status transition: {:?} -> {:?}",
+                    self.turn_id, existing.status, self.status
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalTurnEvent {
+    pub schema_version: String,
+    pub event_id: String,
+    pub event_seq: u64,
+    pub kind: CanonicalTurnEventKind,
+    pub session_id: SessionId,
+    pub turn_id: String,
+    pub turn_seq: u64,
+    pub occurred_at: UtcMillis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<CanonicalTurn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<CanonicalTurnItem>,
+}
+
+fn reject_changed_field(field: &'static str, unchanged: bool, identity: &str) -> DomainResult<()> {
+    if unchanged {
+        return Ok(());
+    }
+    Err(DomainError::InvalidState {
+        message: format!(
+            "canonical turn fact {identity} attempted to change immutable field {field}"
+        ),
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -390,56 +680,7 @@ pub fn timeline_entry_visible_text(message: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        if value
-            .get("is_historical_turn_snapshot")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        {
-            if let Some(text) = extract_snapshot_visible_text(&value) {
-                return Some(text);
-            }
-            return None;
-        }
-    }
-
     Some(trimmed.to_string())
-}
-
-fn extract_snapshot_visible_text(value: &serde_json::Value) -> Option<String> {
-    if let Some(text) = value
-        .get("final_text")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-    {
-        return Some(text.to_string());
-    }
-
-    let items = value.get("turn_items")?.as_array()?;
-    for item in items.iter().rev() {
-        let kind = item
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim);
-        if !matches!(
-            kind,
-            Some("assistant_final" | "assistant_error" | "assistant_stream")
-        ) {
-            continue;
-        }
-        if let Some(text) = item
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-        {
-            return Some(text.to_string());
-        }
-    }
-
-    None
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -477,6 +718,8 @@ pub struct SessionStoreState {
     pub current_session_id: Option<SessionId>,
     pub sessions: Vec<SessionRecord>,
     pub timeline: Vec<TimelineEntry>,
+    #[serde(default)]
+    pub canonical_turns: Vec<CanonicalTurn>,
     pub notifications: Vec<NotificationRecord>,
     #[serde(default, flatten)]
     pub execution_sidecar_store: SessionExecutionSidecarStoreState,
@@ -487,6 +730,8 @@ pub struct SessionDurableState {
     pub current_session_id: Option<SessionId>,
     pub sessions: Vec<SessionRecord>,
     pub timeline: Vec<TimelineEntry>,
+    #[serde(default)]
+    pub canonical_turns: Vec<CanonicalTurn>,
     pub notifications: Vec<NotificationRecord>,
 }
 
@@ -495,6 +740,7 @@ impl SessionDurableState {
         self.current_session_id.is_none()
             && self.sessions.is_empty()
             && self.timeline.is_empty()
+            && self.canonical_turns.is_empty()
             && self.notifications.is_empty()
     }
 
@@ -504,6 +750,7 @@ impl SessionDurableState {
         }
         self.sessions.extend(other.sessions);
         self.timeline.extend(other.timeline);
+        self.canonical_turns.extend(other.canonical_turns);
         self.notifications.extend(other.notifications);
     }
 
@@ -543,6 +790,7 @@ impl SessionDurableState {
                     current_session_id: None,
                     sessions,
                     timeline: Vec::new(),
+                    canonical_turns: Vec::new(),
                     notifications: Vec::new(),
                 },
             );
@@ -555,6 +803,7 @@ impl SessionDurableState {
                 .filter(|session_id| global_session_ids.contains(session_id)),
             sessions: global_sessions,
             timeline: Vec::new(),
+            canonical_turns: Vec::new(),
             notifications: Vec::new(),
         };
 
@@ -570,6 +819,23 @@ impl SessionDurableState {
                         .expect("workspace durable state should exist")
                         .timeline
                         .push(entry.clone());
+                    break;
+                }
+            }
+        }
+
+        for turn in &self.canonical_turns {
+            if global_session_ids.contains(&turn.session_id) {
+                global_state.canonical_turns.push(turn.clone());
+                continue;
+            }
+            for (workspace_id, session_ids) in &workspace_session_ids {
+                if session_ids.contains(&turn.session_id) {
+                    workspace_states
+                        .get_mut(workspace_id)
+                        .expect("workspace durable state should exist")
+                        .canonical_turns
+                        .push(turn.clone());
                     break;
                 }
             }
@@ -629,10 +895,20 @@ impl SessionStoreState {
     ) -> Self {
         let mut timeline = durable_state.timeline;
         Self::normalize_timeline_entry_ids(&mut timeline);
+        let mut canonical_turns = durable_state.canonical_turns;
+        for turn in &mut canonical_turns {
+            turn.normalize();
+        }
+        canonical_turns.sort_by(|left, right| {
+            left.turn_seq
+                .cmp(&right.turn_seq)
+                .then_with(|| left.turn_id.cmp(&right.turn_id))
+        });
         Self {
             current_session_id: durable_state.current_session_id,
             sessions: durable_state.sessions,
             timeline,
+            canonical_turns,
             notifications: durable_state.notifications,
             execution_sidecar_store,
         }
@@ -643,6 +919,7 @@ impl SessionStoreState {
             current_session_id: self.current_session_id.clone(),
             sessions: self.sessions.clone(),
             timeline: self.timeline.clone(),
+            canonical_turns: self.canonical_turns.clone(),
             notifications: self.notifications.clone(),
         }
     }
@@ -653,5 +930,6 @@ pub struct SessionProjectionInput {
     pub current_session_id: Option<SessionId>,
     pub sessions: Vec<SessionRecord>,
     pub timeline: Vec<TimelineEntry>,
+    pub canonical_turns: Vec<CanonicalTurn>,
     pub notifications: Vec<NotificationRecord>,
 }

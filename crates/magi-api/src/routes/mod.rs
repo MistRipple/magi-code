@@ -350,28 +350,39 @@ mod tests {
         let context_runtime_for_dispatcher = Arc::new(context_runtime.clone());
         let runner_result_receiver = Arc::new(EventBasedResultReceiver::new());
         let receiver_for_status = runner_result_receiver.clone();
+        let event_bus_for_status = event_bus.clone();
+        let session_store_for_status = session_store.clone();
         let task_store = Arc::new(TaskStore::with_status_change_callback(Box::new(
-            move |task_id, _old_status, new_status, _task| match new_status {
-                TaskStatus::Completed => {
-                    receiver_for_status.push_result(TaskResult {
-                        task_id: task_id.clone(),
-                        lease_id: LeaseId::new(format!("lease-result-{}", task_id)),
-                        outcome: TaskOutcome::Completed {
-                            output_refs: Vec::new(),
-                        },
-                    });
-                }
-                TaskStatus::Failed => {
-                    receiver_for_status.push_result(TaskResult {
-                        task_id: task_id.clone(),
-                        lease_id: LeaseId::new(format!("lease-result-{}", task_id)),
-                        outcome: TaskOutcome::Failed {
-                            error: "task store reported terminal failure".to_string(),
-                        },
-                    });
-                }
-                _ => {
-                    receiver_for_status.clear_seen(task_id);
+            move |task_id, _old_status, new_status, task| {
+                crate::task_execution::publish_task_status_turn_item_for_active_sessions(
+                    event_bus_for_status.as_ref(),
+                    session_store_for_status.as_ref(),
+                    None,
+                    &task,
+                    new_status,
+                );
+                match new_status {
+                    TaskStatus::Completed => {
+                        receiver_for_status.push_result(TaskResult {
+                            task_id: task_id.clone(),
+                            lease_id: LeaseId::new(format!("lease-result-{}", task_id)),
+                            outcome: TaskOutcome::Completed {
+                                output_refs: Vec::new(),
+                            },
+                        });
+                    }
+                    TaskStatus::Failed => {
+                        receiver_for_status.push_result(TaskResult {
+                            task_id: task_id.clone(),
+                            lease_id: LeaseId::new(format!("lease-result-{}", task_id)),
+                            outcome: TaskOutcome::Failed {
+                                error: "task store reported terminal failure".to_string(),
+                            },
+                        });
+                    }
+                    _ => {
+                        receiver_for_status.clear_seen(task_id);
+                    }
                 }
             },
         )));
@@ -2127,27 +2138,18 @@ mod tests {
         )
         .await;
 
-        let assistant_snapshot = state
+        let canonical_turn = state
             .session_store
-            .timeline_for_session(&session_id)
+            .canonical_turns_for_session(&session_id)
             .into_iter()
-            .find(|entry| matches!(entry.kind, TimelineEntryKind::AssistantMessage))
-            .expect("completed deep turn should write assistant snapshot");
-        let snapshot = serde_json::from_str::<Value>(&assistant_snapshot.message)
-            .expect("assistant message should be the completed turn snapshot");
-        assert_eq!(snapshot["is_historical_turn_snapshot"], Value::Bool(true));
-        let worker_lanes = snapshot["worker_lanes"]
-            .as_array()
-            .expect("completed snapshot should include worker lanes");
+            .find(|turn| turn.status == magi_session_store::CanonicalTurnStatus::Completed)
+            .expect("completed deep turn should be stored as canonical turn");
         assert!(
-            !worker_lanes.is_empty(),
-            "deep task snapshot must preserve worker lanes for bootstrap"
-        );
-        assert!(
-            worker_lanes
+            canonical_turn
+                .items
                 .iter()
-                .all(|lane| lane["status"].as_str() == Some("completed")),
-            "root 完成后的 snapshot 必须刷新 worker lane 的最终状态: {worker_lanes:?}"
+                .any(|item| item.visibility.worker_visible),
+            "deep task canonical turn must preserve worker-visible items for bootstrap"
         );
         let terminal_turn_event = state
             .event_bus
@@ -2451,25 +2453,54 @@ mod tests {
                     )
             })
             .collect::<Vec<_>>();
-        assert_eq!(assistant_messages.len(), 1);
+        assert!(
+            assistant_messages.is_empty(),
+            "完成态不应再写 completed snapshot assistant timeline facts"
+        );
+
+        let canonical_turn = state
+            .session_store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .find(|turn| turn.turn_id == "turn-output-refs")
+            .expect("dispatch completion should persist canonical turn");
+        let final_item = canonical_turn
+            .items
+            .iter()
+            .find(|item| item.item_id == "turn-item-assistant-final")
+            .expect("canonical turn should keep assistant_final item");
         assert_eq!(
-            timeline_entry_visible_text(&assistant_messages[0].message).as_deref(),
+            final_item.content.as_deref(),
             Some("这是来自 assistant_final 的最终总结")
         );
         assert_eq!(
-            serde_json::from_str::<Value>(&assistant_messages[0].message)
-                .expect("assistant timeline should store completed turn snapshot")["is_historical_turn_snapshot"],
-            Value::Bool(true)
+            final_item
+                .worker
+                .as_ref()
+                .and_then(|worker| worker.task_id.as_ref()),
+            Some(&action_task_id),
+            "canonical worker ref 应保留 task 归属"
         );
-        let snapshot = serde_json::from_str::<Value>(&assistant_messages[0].message)
-            .expect("assistant timeline should store completed turn snapshot");
+
+        let terminal_turn_event = state
+            .event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event.event_type == "session.turn.item"
+                    && event.payload["session_id"].as_str() == Some(session_id.as_str())
+                    && event.payload["current_turn"]["status"].as_str() == Some("completed")
+            })
+            .expect("dispatch completion should publish terminal turn event");
         assert_eq!(
-            snapshot["turn_items"][0]["role_id"], "reviewer",
-            "completed snapshot turn_items 应回填 task executor role"
+            terminal_turn_event.payload["turn_items"][0]["role_id"], "reviewer",
+            "terminal event turn_items 应回填 task executor role"
         );
         assert_eq!(
-            snapshot["worker_lanes"][0]["role_id"], "reviewer",
-            "completed snapshot worker_lanes 应回填 task executor role"
+            terminal_turn_event.payload["worker_lanes"][0]["role_id"], "reviewer",
+            "terminal event worker_lanes 应回填 task executor role"
         );
     }
 

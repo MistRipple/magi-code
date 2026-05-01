@@ -9,7 +9,8 @@
     "dev:daemon": "vite --config vite.web.config.ts",
     "build": "vite build --config vite.web.config.ts",
     "preview": "vite preview",
-    "check": "svelte-check --tsconfig ./tsconfig.json"
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test:canonical": "node scripts/canonical-turn-golden.mjs"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.3",

@@ -22,7 +22,6 @@ import {
   addPendingRequest,
   settleProcessingForManualInteraction,
   sealAllStreamingMessages,
-  applyTimelineStreamPatch,
   getTimelineMessageById,
   upsertTimelineNode,
 } from '../stores/messages.svelte';
@@ -30,9 +29,7 @@ import type { Message, ContentBlock } from '../types/message';
 import type { StandardMessage, StreamUpdate } from '../shared/protocol/message-protocol';
 import { MessageType, MessageCategory, MessageLifecycle } from '../shared/protocol/message-protocol';
 import { resolveTaskCardWorkerSlot } from './worker-role-utils';
-import { ensureArray } from './utils';
 import { i18n } from '../stores/i18n.svelte';
-import { upsertDispatchGroupLane } from '../shared/dispatch-group-lane-upsert';
 import {
   messageHasRenderableTimelineContent,
   resolveTimelineWorkerVisibility as resolveSharedTimelineWorkerVisibility,
@@ -90,27 +87,6 @@ function shouldAcceptStandardMessageForCurrentSession(standard: StandardMessage)
   return binding.sessionId === currentSessionId;
 }
 
-function shouldAcceptUpdateForCurrentSession(
-  bridgeMessage: ClientBridgeMessage,
-  update: StreamUpdate,
-): boolean {
-  const currentSessionId = getState().currentSessionId?.trim() || '';
-  const bridgeSessionId = typeof bridgeMessage.sessionId === 'string' ? bridgeMessage.sessionId.trim() : '';
-  const updateSessionId = typeof (update as StreamUpdate & { sessionId?: unknown }).sessionId === 'string'
-    ? ((update as StreamUpdate & { sessionId?: string }).sessionId || '').trim()
-    : '';
-  const effectiveSessionId = bridgeSessionId || updateSessionId;
-  if (!currentSessionId) {
-    // 多会话并行：即使 currentSessionId 未设置，也只接受没有 sessionId 标记的更新
-    return !effectiveSessionId;
-  }
-  if (!effectiveSessionId) {
-    return false;
-  }
-  return effectiveSessionId === currentSessionId;
-}
-
-
 function isDebugMode(): boolean {
   if (typeof window === 'undefined') {
     return false;
@@ -135,6 +111,16 @@ function shouldHideFromUser(standard: StandardMessage): boolean {
   return visibility === 'debug' && !isDebugMode();
 }
 
+function isLocalUnifiedTimelineContent(standard: StandardMessage): boolean {
+  const metadata = standard.metadata && typeof standard.metadata === 'object'
+    ? standard.metadata as Record<string, unknown>
+    : {};
+  if (standard.type === MessageType.USER_INPUT) {
+    return true;
+  }
+  return metadata.isPlaceholder === true || metadata.wasPlaceholder === true;
+}
+
 function resolveLaneWorkerSlot(standard: StandardMessage): string | null {
   const metadata = standard.metadata as Record<string, unknown> | undefined;
   if (standard.type === MessageType.USER_INPUT) {
@@ -150,15 +136,6 @@ function resolveLaneWorkerSlot(standard: StandardMessage): string | null {
     return resolveTimelineWorkerId(metadata, { fallbacks: [standard.agent, standard.source] }) || null;
   }
   return null;
-}
-
-function requiresWorkerLane(standard: StandardMessage): boolean {
-  if (standard.type === MessageType.TASK_CARD && standard.source === 'orchestrator') {
-    return false;
-  }
-  return standard.source === 'worker'
-    || standard.type === MessageType.INSTRUCTION
-    || standard.type === MessageType.TASK_CARD;
 }
 
 function resolveTimelineVisibilityForStandard(standard: StandardMessage): {
@@ -330,7 +307,7 @@ function shouldProcessByEventSeq(message: ClientBridgeMessage): boolean {
   }
   const { eventSeq, eventKey } = resolveEventSeqAndKey(message);
   if (eventSeq !== undefined && eventSeq < lastAppliedEventSeq) {
-    console.warn('[MessageHandler] 丢弃回退的 eventSeq', {
+    console.warn('[MessageHandler] 丢弃逆序 eventSeq', {
       eventSeq,
       lastAppliedEventSeq,
       type: message.type,
@@ -467,7 +444,7 @@ function handleUnifiedMessage(message: ClientBridgeMessage) {
 }
 
 function handleContentMessage(standard: StandardMessage) {
-  if (shouldHideFromUser(standard)) {
+  if (shouldHideFromUser(standard) || !isLocalUnifiedTimelineContent(standard)) {
     return;
   }
   let uiMessage = mapStandardMessage(standard);
@@ -570,35 +547,7 @@ function handleContentMessage(standard: StandardMessage) {
 
 
 function handleStandardUpdate(message: ClientBridgeMessage) {
-  const rawUpdate = message.update as StreamUpdate;
-  if (!rawUpdate?.messageId || !rawUpdate.messageId.trim()) {
-    throw new Error('[MessageHandler] 流式更新缺少 messageId');
-  }
-  const update = rawUpdate;
-  if (!shouldAcceptUpdateForCurrentSession(message, update)) {
-    return;
-  }
-  const existingMessage = getTimelineMessageById(update.messageId);
-  const updateAnchorId = update.messageId;
-
-  // 处理 lifecycle 变更
-  if (update.updateType === 'lifecycle' && isTerminalLifecycle(update.lifecycle)) {
-    markMessageComplete(updateAnchorId);
-    if (updateAnchorId !== update.messageId) {
-      markMessageComplete(update.messageId);
-    }
-  }
-
-  // 应用增量内容更新（append/replace/block_update/lifecycle_change）
-  if (update.updateType) {
-    if (!existingMessage) {
-      return;
-    }
-    const patch = applyStreamUpdate(existingMessage, update);
-    if (Object.keys(patch).length > 0) {
-      applyTimelineStreamPatch(updateAnchorId, patch);
-    }
-  }
+  void message;
 }
 
 function handleStandardComplete(message: ClientBridgeMessage) {
@@ -611,7 +560,11 @@ function handleStandardComplete(message: ClientBridgeMessage) {
     return;
   }
 
-  if (standard.category !== MessageCategory.CONTENT || shouldHideFromUser(standard)) {
+  if (
+    standard.category !== MessageCategory.CONTENT
+    || shouldHideFromUser(standard)
+    || !isLocalUnifiedTimelineContent(standard)
+  ) {
     return;
   }
 
@@ -819,7 +772,9 @@ function isRequestTerminalAssistantResponse(message: Message): boolean {
   }
   const turnItemKind = resolveTurnItemKind(message);
   if (turnItemKind) {
-    return turnItemKind === 'assistant_final' || turnItemKind === 'assistant_error';
+    return turnItemKind === 'assistant_text'
+      || turnItemKind === 'assistant_final'
+      || turnItemKind === 'assistant_error';
   }
   return message.type !== MessageType.TOOL_CALL && message.type !== MessageType.THINKING;
 }
@@ -831,6 +786,7 @@ function isAssistantResponsePlaceholderTarget(message: Message): boolean {
   const turnItemKind = resolveTurnItemKind(message);
   if (turnItemKind) {
     return turnItemKind === 'assistant_stream'
+      || turnItemKind === 'assistant_text'
       || turnItemKind === 'assistant_final'
       || turnItemKind === 'assistant_error';
   }
@@ -882,9 +838,6 @@ function mapStandardMessage(standard: StandardMessage): Message {
   // 标准消息 source 为 orchestrator/worker，UI 展示具体 Worker 槽位
   const originSource = standard.source;
   const resolvedWorker = resolveLaneWorkerSlot(standard);
-  if (requiresWorkerLane(standard) && !resolvedWorker) {
-    console.warn(`[MessageHandler] TASK_CARD 消息无法解析 worker 槽位，回退至 source: ${standard.id}`);
-  }
   const displaySource: Message['source'] =
     originSource === 'orchestrator'
       ? 'orchestrator'
@@ -929,160 +882,6 @@ function hasRenderableContent(message: Message): boolean {
 }
 
 
-
-function applyStreamUpdate(message: Message, update: StreamUpdate): Partial<Message> {
-  const updates: Partial<Message> = {};
-  switch (update.updateType) {
-    case 'append_text': {
-      updates.content = (message.content || '') + update.text;
-      const nextBlocks = [...(message.blocks || [])];
-      const lastIndex = nextBlocks.length - 1;
-      const lastBlock = nextBlocks[nextBlocks.length - 1];
-      if (lastBlock?.type === 'text') {
-        const current = lastBlock;
-        nextBlocks[lastIndex] = {
-          ...current,
-          content: (current.content || '') + update.text,
-        };
-      } else {
-        nextBlocks.push({ type: 'text', content: update.text });
-      }
-      updates.blocks = nextBlocks;
-      break;
-    }
-    case 'replace_blocks':
-      if (update.blocks) {
-        const blocks = mapStandardBlocks(update.blocks);
-        updates.blocks = blocks;
-        updates.content = blocksToContent(blocks);
-      }
-      break;
-    case 'merge_block':
-      if (update.blocks) {
-        const incoming = mapStandardBlocks(update.blocks);
-        const merged = mergeBlocks(message.blocks || [], incoming);
-        updates.blocks = merged;
-        updates.content = blocksToContent(merged);
-      }
-      break;
-    case 'lifecycle':
-      updates.isStreaming = isStreamingLifecycle(update.lifecycle);
-      updates.isComplete = isTerminalLifecycle(update.lifecycle);
-      break;
-    case 'block_insert':
-      updates.blocks = [...(message.blocks || []), update.block as unknown as ContentBlock];
-      break;
-    case 'block_patch':
-      updates.blocks = (message.blocks || []).map(b =>
-        ('blockId' in b && b.blockId === update.blockId) ? { ...b, ...update.patch } as ContentBlock : b
-      );
-      break;
-    case 'dispatch_lane_patch':
-      updates.blocks = upsertDispatchGroupLane(message.blocks, update) as ContentBlock[];
-      break;
-    default: {
-      const _exhaustive: never = update;
-      void _exhaustive;
-    }
-  }
-
-  if (typeof update.timestamp === 'number' && Number.isFinite(update.timestamp)) {
-    updates.updatedAt = Math.floor(update.timestamp);
-  }
-
-  if (update.eventId || typeof update.eventSeq === 'number') {
-    updates.metadata = {
-      ...(message.metadata || {}),
-      ...(update.eventId ? { eventId: update.eventId } : {}),
-      ...(typeof update.eventSeq === 'number' ? { eventSeq: update.eventSeq } : {}),
-    };
-  }
-  return updates;
-}
-
-function mergeBlocks(existing: ContentBlock[], incoming: ContentBlock[]): ContentBlock[] {
-  const safeExisting = ensureArray(existing).filter((block): block is ContentBlock => !!block && typeof block === 'object' && 'type' in block);
-  const safeIncoming = ensureArray(incoming).filter((block): block is ContentBlock => !!block && typeof block === 'object' && 'type' in block);
-  const next = [...safeExisting];
-  for (const block of safeIncoming) {
-    if ((block.type === 'tool_call' || block.type === 'tool_result') && block.toolCall?.id) {
-      const idx = next.findIndex((b) => (b.type === 'tool_call' || b.type === 'tool_result') && b.toolCall?.id === block.toolCall?.id);
-      const canonicalToolBlock: ContentBlock = {
-        ...block,
-        type: 'tool_call',
-      };
-      if (idx >= 0) {
-        const prev = next[idx];
-        const prevToolCall = prev.toolCall;
-        const incomingToolCall = canonicalToolBlock.toolCall!;
-        next[idx] = {
-          ...prev,
-          ...canonicalToolBlock,
-          type: 'tool_call',
-          toolCall: {
-            id: incomingToolCall.id,
-            name: incomingToolCall.name || prevToolCall?.name || 'tool',
-            status: incomingToolCall.status || prevToolCall?.status || 'pending',
-            arguments: incomingToolCall.arguments ?? prevToolCall?.arguments ?? {},
-            result: incomingToolCall.result ?? prevToolCall?.result,
-            error: incomingToolCall.error ?? prevToolCall?.error,
-            standardized: incomingToolCall.standardized ?? prevToolCall?.standardized,
-            durationMs: incomingToolCall.durationMs ?? prevToolCall?.durationMs,
-            startTime: incomingToolCall.startTime ?? prevToolCall?.startTime,
-            endTime: incomingToolCall.endTime ?? prevToolCall?.endTime,
-          },
-        };
-      } else {
-        next.push(canonicalToolBlock);
-      }
-      continue;
-    }
-    if (block.type === 'thinking') {
-      const incomingBlockId = block.id || block.thinking?.blockId;
-      // 仅当双方都有 blockId 且匹配时才合并（更新同一个 thinking 块）
-      // 无 blockId 一律视为新块，避免不同 thinking 被错误合并
-      const idx = incomingBlockId
-        ? next.findIndex((b) => {
-            if (b.type !== 'thinking') return false;
-            const existingBlockId = b.id || b.thinking?.blockId;
-            return existingBlockId === incomingBlockId;
-          })
-        : -1;
-      if (idx >= 0) {
-        const prev = next[idx];
-        const prevThinking = prev.thinking || { content: '', isComplete: false };
-        const blockThinking = block.thinking || { content: '', isComplete: false };
-        const mergedThinking = {
-          content: blockThinking.content || prevThinking.content || block.content || prev.content || '',
-          isComplete: blockThinking.isComplete ?? prevThinking.isComplete ?? true,
-          summary: blockThinking.summary ?? prevThinking.summary,
-          blockId: incomingBlockId || prevThinking.blockId,
-        };
-        next[idx] = {
-          ...prev,
-          ...block,
-          ...(incomingBlockId ? { id: incomingBlockId } : {}),
-          thinking: mergedThinking,
-        };
-      } else {
-        next.push(block);
-      }
-      continue;
-    }
-    if (block.type === 'text') {
-      const lastIndex = next.length - 1;
-      const prev = next[next.length - 1];
-      if (prev?.type === 'text') {
-        next[lastIndex] = { ...prev, content: (prev.content || '') + (block.content || '') };
-      } else {
-        next.push(block);
-      }
-      continue;
-    }
-    next.push(block);
-  }
-  return next;
-}
 
 function blocksToContent(blocks: ContentBlock[]): string {
   const textParts: string[] = [];

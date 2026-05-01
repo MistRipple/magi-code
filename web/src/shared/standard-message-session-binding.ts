@@ -74,7 +74,7 @@ export function resolveStandardMessageSessionBinding(
     };
   }
 
-  // traceId 只允许回退到真实对话会话。
+  // traceId 只允许指向真实对话会话。
   // worker 内部恢复会话使用 ses_*，绝不能再冒充用户对话会话。
   if (traceSessionId) {
     return {

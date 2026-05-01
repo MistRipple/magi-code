@@ -610,24 +610,9 @@ export interface TimelineNode {
   workerTabs: AgentId[];
   messageIds: string[];
   message: Message;
-  executionItems?: TimelineExecutionItem[];
 }
 
 export type TimelineProjectionArtifactKind = 'message' | 'tool';
-
-export interface TimelineExecutionItem {
-  itemId: string;
-  itemOrder: number;
-  anchorEventSeq: number;
-  latestEventSeq: number;
-  cardStreamSeq: number;
-  timestamp: number;
-  worker?: AgentId;
-  threadVisible: boolean;
-  workerTabs: AgentId[];
-  messageIds: string[];
-  message: Message;
-}
 
 export interface TimelineProjectionArtifact {
   artifactId: string;
@@ -647,13 +632,11 @@ export interface TimelineProjectionArtifact {
   workerTabs: AgentId[];
   messageIds: string[];
   message: Message;
-  executionItems?: TimelineExecutionItem[];
 }
 
 export interface TimelineProjectionRenderEntry {
   entryId: string;
   artifactId: string;
-  executionItemId?: string;
 }
 
 export interface TimelineRenderItem {

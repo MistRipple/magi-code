@@ -415,11 +415,11 @@ function collectAgentBaseUrlCandidates(): string[] {
     ? currentUrl.origin
     : '';
   const candidates = [
+    servedByAgentOrigin,
+    queryBaseUrl,
     injectedBaseUrl,
     configuredProxyTarget && servedByAgentOrigin ? servedByAgentOrigin : '',
     configuredBaseUrl,
-    queryBaseUrl,
-    servedByAgentOrigin,
     getStoredAgentBaseUrl(),
     getDefaultAgentBaseUrl(),
   ].filter((value) => value && value.trim());
@@ -507,18 +507,21 @@ export function resolveAgentBaseUrl(): string {
   if (typeof window === 'undefined') {
     return getDefaultAgentBaseUrl();
   }
-  // VS Code webview 场景：由宿主注入 __AGENT_BASE_URL__
+  const currentUrl = new URL(window.location.href);
+  const servedByAgent = currentUrl.protocol.startsWith('http')
+    && (currentUrl.pathname === '/' || currentUrl.pathname === '/web.html' || currentUrl.pathname.startsWith('/assets/'));
+  if (servedByAgent) {
+    persistAgentBaseUrl(currentUrl.origin);
+    return currentUrl.origin;
+  }
   const injectedBaseUrl = (window as unknown as { __AGENT_BASE_URL__?: string }).__AGENT_BASE_URL__?.trim();
   if (injectedBaseUrl) {
     return injectedBaseUrl;
   }
-  const currentUrl = new URL(window.location.href);
-  const servedByAgent = currentUrl.protocol.startsWith('http')
-    && (currentUrl.pathname === '/' || currentUrl.pathname === '/web.html' || currentUrl.pathname.startsWith('/assets/'));
   const configuredProxyTarget = getConfiguredAgentProxyTarget();
-  if (configuredProxyTarget && servedByAgent) {
-    persistAgentBaseUrl(currentUrl.origin);
-    return currentUrl.origin;
+  if (configuredProxyTarget) {
+    persistAgentBaseUrl(configuredProxyTarget);
+    return configuredProxyTarget;
   }
   const configuredBaseUrl = getConfiguredAgentBaseUrl();
   if (configuredBaseUrl) {
@@ -884,7 +887,7 @@ export async function getWorkspaceSessions(
   }
 }
 
-export async function loadAgentSessionTimelinePage(
+export async function loadAgentSessionSnapshot(
   sessionId: string,
   options: { limit?: number; beforeCursor?: string; workspaceId?: string } = {},
 ): Promise<MessagesResponseDto> {
@@ -902,7 +905,7 @@ export async function loadAgentSessionTimelinePage(
       query.set('beforeCursor', options.beforeCursor.trim());
     }
     const response = await getTransport().request(agentUrl('/api/messages', query.toString()));
-    return await parseAgentJson<MessagesResponseDto>(response, 'load session timeline');
+    return await parseAgentJson<MessagesResponseDto>(response, 'load session snapshot');
   } catch (error) {
     if (error instanceof TypeError) {
       throw new Error(i18n.t('bridge.agentUnreachable'));
