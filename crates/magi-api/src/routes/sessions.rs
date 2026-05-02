@@ -595,7 +595,7 @@ fn session_turn_requests_diagram_render(request: &SessionTurnRequestDto) -> bool
 }
 
 fn diagram_render_tool_intent() -> String {
-    "用户请求生成可视化图表。必须直接调用 diagram_render 工具完成图表生成；不要要求用户自己调用工具，也不要只输出工具调用说明。根据用户原始输入选择合适的 kind：流程/步骤/登录流程优先使用 graph 或 flow 的结构化 nodes/edges；如果更适合 Mermaid 或 DOT，也可以使用 mermaid 或 dot。工具完成后只用一句话说明图表已生成。"
+    "用户请求生成可视化图表。必须直接调用 diagram_render 工具完成图表生成；不要要求用户自己调用工具，也不要只输出工具调用说明。根据用户原始输入选择合适的 kind：思维导图、层级结构、知识结构、流程/步骤/登录流程必须优先使用 flow 或 graph 的结构化 graph.nodes/edges；关系网络优先使用 graph；只有时序图、状态图、甘特图、饼图、类图、ER 图、timeline、C4、sankey 等 Mermaid 专属语法才使用 mermaid；不要使用 Mermaid mindmap。工具完成后只用一句话说明图表已生成。"
         .to_string()
 }
 
@@ -2115,6 +2115,19 @@ mod tests {
         let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
         assert!(tool_intent.contains("diagram_render"));
         assert!(tool_intent.contains("不要要求用户自己调用工具"));
+    }
+
+    #[test]
+    fn mind_map_creation_prefers_structured_flow_or_graph() {
+        let request = session_turn_request("画一个验证自动保存规则的思维导图");
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert_eq!(decision.forced_tool_name.as_deref(), Some("diagram_render"));
+        let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
+        assert!(tool_intent.contains("思维导图"));
+        assert!(tool_intent.contains("flow 或 graph"));
+        assert!(tool_intent.contains("不要使用 Mermaid mindmap"));
     }
 
     #[test]

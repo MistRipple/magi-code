@@ -2159,6 +2159,12 @@ fn execute_diagram_render(input: &str) -> String {
                     );
                 }
             };
+            if diagram_type == "mindmap" {
+                return builtin_error(
+                    "diagram_render",
+                    "思维导图必须使用 kind=flow 或 kind=graph 的 graph.nodes/edges 结构化输入；Mermaid mindmap 不是当前产品展示面",
+                );
+            }
             payload["source"] = serde_json::json!(source);
             payload["diagram_type"] = serde_json::json!(diagram_type);
             payload["summary"] =

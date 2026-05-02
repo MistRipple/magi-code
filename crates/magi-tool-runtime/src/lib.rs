@@ -208,7 +208,7 @@ impl BuiltinToolName {
             Self::WebSearch => "Search the web using DuckDuckGo and return results",
             Self::WebFetch => "Fetch content from a URL and convert HTML to markdown",
             Self::DiagramRender => {
-                "Render diagrams from Mermaid, DOT, graph nodes/edges, or flow nodes/edges"
+                "Render diagrams from Mermaid, DOT, structured graph nodes/edges, or structured flow nodes/edges"
             }
             Self::KnowledgeQuery => {
                 "Query project knowledge base: search README, docs, and code documentation"
@@ -407,12 +407,12 @@ impl BuiltinToolName {
                     "kind": {
                         "type": "string",
                         "enum": ["mermaid", "dot", "graph", "flow"],
-                        "description": "Diagram input kind. Use mermaid for Mermaid syntax, dot for DOT syntax, graph for interactive node-link graphs, and flow for process/node flow diagrams."
+                        "description": "Diagram input kind. Use flow for mind maps, hierarchical structures, steps, and process/node flow diagrams. Use graph for relationship/network diagrams. Use mermaid only for Mermaid-specific syntax such as sequence, state, gantt, pie, class, ER, timeline, quadrant, requirement, C4, sankey, xychart, or block diagrams; do not use Mermaid mindmap. Use dot for DOT syntax."
                     },
-                    "source": { "type": "string", "description": "Diagram source for mermaid or dot kinds" },
+                    "source": { "type": "string", "description": "Diagram source for mermaid or dot kinds. Mermaid mindmap is not supported on the product surface; represent mind maps with kind=flow or kind=graph and graph.nodes/edges." },
                     "graph": {
                         "type": "object",
-                        "description": "Structured graph payload for graph or flow kinds",
+                        "description": "Structured graph payload for graph or flow kinds. For mind maps, put the central topic as the first/root node and connect child topics with explicit edges.",
                         "properties": {
                             "nodes": {
                                 "type": "array",
@@ -2976,6 +2976,25 @@ mod tests {
     // ── diagram.render 验证 ──
 
     #[test]
+    fn diagram_render_schema_guides_mind_maps_to_structured_payload() {
+        let schema = BuiltinToolName::DiagramRender.parameters_schema();
+        let kind_description = schema["properties"]["kind"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        let source_description = schema["properties"]["source"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        let graph_description = schema["properties"]["graph"]["description"]
+            .as_str()
+            .unwrap_or_default();
+
+        assert!(kind_description.contains("mind maps"));
+        assert!(kind_description.contains("do not use Mermaid mindmap"));
+        assert!(source_description.contains("Mermaid mindmap is not supported"));
+        assert!(graph_description.contains("central topic"));
+    }
+
+    #[test]
     fn diagram_render_recognizes_mermaid_types() {
         let registry = make_registry();
         let valid_codes = [
@@ -2992,7 +3011,6 @@ mod tests {
             ("gantt\n  title Plan", "gantt"),
             ("pie\n  title Usage", "pie"),
             ("gitGraph\n  commit", "git"),
-            ("mindmap\n  root", "mindmap"),
             ("timeline\n  2024", "timeline"),
         ];
         for (code, expected_type) in &valid_codes {
@@ -3093,6 +3111,7 @@ mod tests {
         let registry = make_registry();
         for input in [
             serde_json::json!({ "kind": "mermaid", "source": "invalid_diagram\n  A --> B" }),
+            serde_json::json!({ "kind": "mermaid", "source": "mindmap\n  root\n    child" }),
             serde_json::json!({ "kind": "mermaid", "source": "  " }),
             serde_json::json!({ "kind": "dot", "source": "A -> B" }),
             serde_json::json!({ "kind": "graph", "graph": { "nodes": [] } }),
@@ -3105,6 +3124,54 @@ mod tests {
             );
             assert_eq!(output.status, ExecutionResultStatus::Failed, "{input}");
         }
+    }
+
+    #[test]
+    fn diagram_render_requires_structured_payload_for_mind_maps() {
+        let registry = make_registry();
+
+        let mermaid_mindmap = exec_tool(
+            &registry,
+            BuiltinToolName::DiagramRender,
+            &serde_json::json!({
+                "kind": "mermaid",
+                "source": "mindmap\n  root((验证自动保存规则))\n    目标\n      确认输出结果"
+            })
+            .to_string(),
+        );
+        assert_eq!(mermaid_mindmap.status, ExecutionResultStatus::Failed);
+        let failed_payload: Value = serde_json::from_str(&mermaid_mindmap.payload).unwrap();
+        assert!(
+            failed_payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("kind=flow 或 kind=graph"),
+            "{failed_payload}"
+        );
+
+        let flow_mindmap = exec_tool(
+            &registry,
+            BuiltinToolName::DiagramRender,
+            &serde_json::json!({
+                "kind": "flow",
+                "graph": {
+                    "nodes": [
+                        { "id": "root", "label": "验证自动保存规则" },
+                        { "id": "goal", "label": "目标" },
+                        { "id": "result", "label": "确认输出结果" }
+                    ],
+                    "edges": [
+                        { "source": "root", "target": "goal" },
+                        { "source": "goal", "target": "result" }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(flow_mindmap.status, ExecutionResultStatus::Succeeded);
+        let flow_payload: Value = serde_json::from_str(&flow_mindmap.payload).unwrap();
+        assert_eq!(flow_payload["kind"], "flow");
+        assert_eq!(flow_payload["interactive"], true);
     }
 
     // ── 实际工具行为验证 ──
