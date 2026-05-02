@@ -631,7 +631,14 @@ async fn interrupt_task(
     manager
         .pause_tree(root_task_id.as_str())
         .map_err(|error| ApiError::internal_assembly("中断任务状态更新失败", error))?;
-    for subtree_task_id in store.collect_subtree_ids(&root_task_id) {
+    let subtree_task_ids = store.collect_subtree_ids(&root_task_id);
+    let cancelled_tool_process_count = subtree_task_ids
+        .iter()
+        .map(|subtree_task_id| {
+            state.cancel_active_tool_executions(Some(&session_id), None, Some(subtree_task_id))
+        })
+        .sum::<usize>();
+    for subtree_task_id in subtree_task_ids {
         if let Some(lease) = store.get_active_lease(&subtree_task_id) {
             store.revoke_lease(&subtree_task_id, &lease.lease_id);
         }
@@ -662,6 +669,7 @@ async fn interrupt_task(
     Ok(Json(json!({
         "interrupted": true,
         "storeUpdated": true,
+        "cancelledToolProcessCount": cancelled_tool_process_count,
         "eventId": event_id.to_string(),
         "requestedAt": now.0,
     })))

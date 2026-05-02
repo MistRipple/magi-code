@@ -193,8 +193,10 @@ function buildMessage(turn: CanonicalTurn, item: CanonicalTurnItem, artifactId: 
     metadata: {
       turnId: item.turnId,
       turnSeq: item.turnSeq,
+      turnStatus: turn.status,
       turnItemId: item.itemId,
       turnItemKind: item.kind,
+      turnItemStatus: item.status,
       itemSeq: item.itemSeq,
       blockSeq: item.itemSeq,
       laneId: item.laneId,

@@ -14,6 +14,8 @@
 
   interface Props {
     runtimeState: OrchestratorRuntimeState | null;
+    isProcessing?: boolean;
+    processingStartedAt?: number | null;
   }
 
   /** knowledgeAudit 运行时结构（后端类型为 unknown，这里给出前端期望的形状） */
@@ -33,7 +35,11 @@
     [key: string]: unknown;
   }
 
-  let { runtimeState }: Props = $props();
+  let {
+    runtimeState,
+    isProcessing = false,
+    processingStartedAt = null,
+  }: Props = $props();
   let isPanelExpanded = $state(false);
   type DiagnosticsSectionKey = 'timeline' | 'stateDiff' | 'decisionTrace' | null;
   let expandedSection = $state<DiagnosticsSectionKey>(null);
@@ -257,9 +263,33 @@
     return entries;
   });
 
+  const canonicalProcessingActive = $derived.by(() => {
+    if (!isProcessing) {
+      return false;
+    }
+    const status = runtimeState?.status;
+    return !status
+      || status === 'idle'
+      || status === 'completed'
+      || status === 'failed'
+      || status === 'cancelled';
+  });
+
+  const effectiveStatus = $derived.by(() => (
+    canonicalProcessingActive ? 'running' : runtimeState?.status
+  ));
+  const effectivePhase = $derived.by(() => (
+    canonicalProcessingActive ? 'running' : runtimeState?.phase
+  ));
+  const effectiveLastEventAt = $derived.by(() => (
+    canonicalProcessingActive
+      ? (processingStartedAt || runtimeState?.lastEventAt || Date.now())
+      : runtimeState?.lastEventAt
+  ));
+
   // 状态图标
   const statusIcon = $derived.by((): IconName => {
-    switch (runtimeState?.status) {
+    switch (effectiveStatus) {
       case 'idle': return 'circle';
       case 'running': return 'loader';
       case 'waiting': return 'clock';
@@ -273,7 +303,7 @@
 
   // 状态翻译文本
   const statusLabel = $derived.by(() => {
-    switch (runtimeState?.status) {
+    switch (effectiveStatus) {
       case 'idle': return i18n.t('runtimeState.status.idle');
       case 'running': return i18n.t('runtimeState.status.running');
       case 'waiting': return i18n.t('runtimeState.status.waiting');
@@ -287,7 +317,7 @@
 
   // 状态对应的 CSS modifier
   const statusModifier = $derived.by(() => {
-    switch (runtimeState?.status) {
+    switch (effectiveStatus) {
       case 'idle': return 'idle';
       case 'running': return 'running';
       case 'waiting': return 'waiting';
@@ -732,7 +762,7 @@
   }
 </script>
 
-{#if runtimeState}
+{#if runtimeState || canonicalProcessingActive}
   <section class="runtime-diagnostics runtime-diagnostics--{statusModifier}">
     <button
       type="button"
@@ -745,8 +775,8 @@
       <Icon name={statusIcon} size={13} class="summary__icon" />
       <span class="summary__title">{i18n.t('runtimeState.title')}</span>
       <span class="summary__badge summary__badge--{statusModifier}">{statusLabel}</span>
-      <span class="summary__phase">{formatRuntimePhase(runtimeState.phase)}</span>
-      <span class="summary__time">{formatTimestamp(runtimeState.lastEventAt)}</span>
+      <span class="summary__phase">{formatRuntimePhase(effectivePhase)}</span>
+      <span class="summary__time">{formatTimestamp(effectiveLastEventAt || 0)}</span>
     </button>
     {#if isPanelExpanded}
     <div class="runtime-diagnostics__content">
@@ -764,7 +794,7 @@
         </div>
       {/if}
 
-      {#if runtimeState.runtimeSnapshot}
+      {#if runtimeState?.runtimeSnapshot}
         {@const snap = runtimeState.runtimeSnapshot}
         <div class="metrics-grid">
           {#if taskProgress && taskProgress.total > 0}
@@ -1067,7 +1097,7 @@
         </section>
       </div>
 
-      {#if runtimeState.status === 'failed' && (failureReason || failureErrors.length > 0)}
+      {#if runtimeState?.status === 'failed' && (failureReason || failureErrors.length > 0)}
         <div class="runtime-diagnostics__block runtime-diagnostics__block--failure">
           <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.failureTitle')}</div>
           {#if failureReason}

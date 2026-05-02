@@ -24,6 +24,7 @@ import {
   sealAllStreamingMessages,
   getTimelineMessageById,
   upsertTimelineNode,
+  messagesState,
 } from '../stores/messages.svelte';
 import type { Message, ContentBlock } from '../types/message';
 import type { StandardMessage, StreamUpdate } from '../shared/protocol/message-protocol';
@@ -813,6 +814,9 @@ function resolvePlaceholderReplacementId(
 }
 
 function finalizeTerminalRequestResponse(requestId: string, actualMessageId: string): void {
+  if (messagesState.backendProcessing) {
+    return;
+  }
   clearPendingRequest(requestId);
   const binding = getRequestBinding(requestId);
   if (binding?.timeoutId) {

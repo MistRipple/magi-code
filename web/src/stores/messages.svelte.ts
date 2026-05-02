@@ -1535,7 +1535,7 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
     }
     messagesState.pendingRequests = new Set();
     messagesState.activeMessageIds = new Set();
-    if (!runtimeStateIndicatesProcessing()) {
+    if (!runtimeStateIndicatesProcessing() && !canonicalProjectionIndicatesProcessing()) {
       sealAllStreamingMessages();
     }
     updateProcessingState();
@@ -1564,6 +1564,7 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
     : new Set<string>();
   const nextIsProcessing = snapshot.isProcessing
     || runtimeStateIndicatesProcessing()
+    || canonicalProjectionIndicatesProcessing()
     || activeMessageIds.size > 0
     || pendingRequestIds.size > 0;
 
@@ -2226,9 +2227,33 @@ function runtimeStateIsTerminal(runtimeState: OrchestratorRuntimeState | null): 
     || status === 'cancelled';
 }
 
+function canonicalProjectionIndicatesProcessing(): boolean {
+  const artifacts = messagesState.timelineProjection?.artifacts;
+  if (!Array.isArray(artifacts) || artifacts.length === 0) {
+    return false;
+  }
+  return artifacts.some((artifact) => {
+    const metadata = artifact.message?.metadata;
+    if (metadata?.canonical !== true) {
+      return false;
+    }
+    const turnStatus = typeof metadata.turnStatus === 'string'
+      ? metadata.turnStatus.trim()
+      : '';
+    const status = typeof metadata.turnItemStatus === 'string'
+      ? metadata.turnItemStatus.trim()
+      : '';
+    return turnStatus === 'pending'
+      || turnStatus === 'running'
+      || status === 'pending'
+      || status === 'running';
+  });
+}
+
 function updateProcessingState() {
   const nextIsProcessing = messagesState.backendProcessing
     || runtimeStateIndicatesProcessing()
+    || canonicalProjectionIndicatesProcessing()
     || messagesState.activeMessageIds.size > 0
     || messagesState.pendingRequests.size > 0;
 
@@ -2255,6 +2280,7 @@ export function hasActiveLocalTimelineTurn(): boolean {
   return messagesState.isProcessing
     || messagesState.backendProcessing
     || runtimeStateIndicatesProcessing()
+    || canonicalProjectionIndicatesProcessing()
     || messagesState.pendingRequests.size > 0
     || messagesState.activeMessageIds.size > 0
     || timelineHasStreamingMessage();
@@ -2311,10 +2337,14 @@ export function clearPendingRequest(id: string) {
 }
 
 export function settleProcessingAfterResponseCompletion() {
-  if (messagesState.pendingRequests.size > 0 || messagesState.activeMessageIds.size > 0) {
+  if (
+    messagesState.backendProcessing
+    || canonicalProjectionIndicatesProcessing()
+    || messagesState.pendingRequests.size > 0
+    || messagesState.activeMessageIds.size > 0
+  ) {
     return;
   }
-  messagesState.backendProcessing = false;
   if (runtimeStateIndicatesProcessing()) {
     updateProcessingState();
     return;
@@ -2324,6 +2354,10 @@ export function settleProcessingAfterResponseCompletion() {
 }
 
 export function settleAuthoritativeIdleState() {
+  if (canonicalProjectionIndicatesProcessing()) {
+    updateProcessingState();
+    return;
+  }
   messagesState.backendProcessing = false;
   messagesState.pendingRequests = new Set();
   messagesState.activeMessageIds = new Set();
@@ -2942,7 +2976,7 @@ export function initializeState() {
       notificationsBySession = {};
       messagesState.orchestratorRuntimeState = null;
       clearPendingInteractions();
-      clearProcessingState();
+      clearProcessingState({ skipAntiLiftBack: true });
       saveWebviewState();
       return;
     }
@@ -2980,7 +3014,7 @@ export function initializeState() {
     // 浏览器本地持久化只保留滚动/定位状态，不再恢复消息内容，
     // 避免 persisted projection 与 live/bootstrap 双轨竞争。
     clearPendingInteractions();
-    clearProcessingState();
+    clearProcessingState({ skipAntiLiftBack: true });
     saveWebviewState();
   }
 }

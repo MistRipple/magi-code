@@ -33,7 +33,7 @@ use magi_orchestrator::{
     task_worker_catalog::build_worker_catalog_for_roles,
 };
 use magi_session_store::{SessionRecord, SessionStore};
-use magi_tool_runtime::ToolRegistry;
+use magi_tool_runtime::{ToolExecutionContextQuery, ToolRegistry};
 use magi_workspace::WorkspaceStore;
 use std::collections::HashMap;
 use std::fs;
@@ -752,6 +752,23 @@ impl ApiState {
     pub fn with_tool_registry(mut self, tool_registry: ToolRegistry) -> Self {
         self.tool_registry = Some(tool_registry);
         self
+    }
+
+    pub fn cancel_active_tool_executions(
+        &self,
+        session_id: Option<&SessionId>,
+        workspace_id: Option<&WorkspaceId>,
+        task_id: Option<&TaskId>,
+    ) -> usize {
+        let Some(registry) = &self.tool_registry else {
+            return 0;
+        };
+        registry.cancel_active_shell_execs(&ToolExecutionContextQuery {
+            session_id: session_id.cloned(),
+            workspace_id: workspace_id.cloned(),
+            task_id: task_id.cloned(),
+            worker_id: None,
+        })
     }
 
     pub fn runtime_persistence(&self) -> Option<&RuntimeStatePersistence> {

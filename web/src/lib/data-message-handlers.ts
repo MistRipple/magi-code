@@ -56,6 +56,7 @@ import {
 } from './message-utils';
 import { buildEmptyWorkspaceAppState } from '../shared/bridges/empty-workspace-state';
 import type { CanonicalTurn, CanonicalTurnEvent } from '../shared/protocol/canonical-turn';
+import { deriveProcessingStateFromCanonicalTurns } from '../shared/protocol/canonical-processing';
 import {
   applyCanonicalTurnEvent,
   clearCanonicalSessionTurns,
@@ -725,6 +726,11 @@ function handleSessionTurnCanonicalEventUpdated(message: ClientBridgeMessage) {
   const projection = applyCanonicalTurnEvent(canonicalEvent);
   if (projection) {
     setTimelineProjection(projection);
+    if (canonicalEvent.turn) {
+      applyAuthoritativeProcessingState(
+        deriveProcessingStateFromCanonicalTurns([canonicalEvent.turn], sessionId),
+      );
+    }
     reconcileRequestBindingsFromAuthoritativeThread(sessionId);
   }
 }

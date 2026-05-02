@@ -52,7 +52,11 @@
 </script>
 
 <div class="thread-panel">
-  <RuntimeStatePanel {runtimeState} />
+  <RuntimeStatePanel
+    {runtimeState}
+    isProcessing={messagesState.isProcessing}
+    processingStartedAt={messagesState.thinkingStartAt}
+  />
   <div class="main-content">
     {#if activeBottomTab === 'thread'}
       <MessageList renderItems={threadRenderItems} isActive={isTopActive && activeBottomTab === 'thread'} />

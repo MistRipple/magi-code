@@ -11,13 +11,14 @@ const server = await createServer({
 try {
   const reducer = await server.ssrLoadModule('/src/stores/turn-reducer.ts');
   const projection = await server.ssrLoadModule('/src/stores/turn-projection.ts');
-  runGoldenReplay(reducer, projection);
+  const contract = await server.ssrLoadModule('/src/shared/bridges/rust-daemon-contract.ts');
+  runGoldenReplay(reducer, projection, contract);
   console.log('canonical turn golden replay passed');
 } finally {
   await server.close();
 }
 
-function runGoldenReplay(reducer, projection) {
+function runGoldenReplay(reducer, projection, contract) {
   const cases = [
     acceptedFirstFrameCase(),
     ordinaryChatCase(),
@@ -56,6 +57,8 @@ function runGoldenReplay(reducer, projection) {
   assertTerminalLateUpsertIsIgnored(reducer, projection);
   assertTerminalLateTurnStartedIsIgnored(reducer, projection);
   assertFailedAssistantTextUsesPlainMessageShell(reducer, projection);
+  assertBootstrapProcessingStateFromRunningCanonicalTurn(contract);
+  assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract);
 }
 
 function replayLive(reducer, testCase) {
@@ -233,6 +236,101 @@ function assertFailedAssistantTextUsesPlainMessageShell(reducer, projection) {
     undefined,
     'plain assistant_text should not be wrapped in a text block',
   );
+}
+
+function assertBootstrapProcessingStateFromRunningCanonicalTurn(contract) {
+  const c = baseCase(
+    'bootstrap-running-canonical-turn',
+    'session-bootstrap-running',
+    'turn-bootstrap-running',
+    7000,
+  );
+  const userItem = user(c, 1, '刷新后仍应恢复运行态。');
+  userItem.metadata = { requestId: 'request-bootstrap-running' };
+  const assistantItem = assistantPlaceholderText(c, 2, 'assistant-bootstrap-running', 'running');
+  assistantItem.metadata = { requestId: 'request-bootstrap-running' };
+  const bootstrap = contract.normalizeRustBootstrapPayload({
+    generatedAt: 7100,
+    currentSession: {
+      sessionId: c.sessionId,
+      title: '运行中恢复',
+      createdAt: 7000,
+      updatedAt: 7100,
+      messageCount: 1,
+    },
+    sessions: [{
+      sessionId: c.sessionId,
+      title: '运行中恢复',
+      createdAt: 7000,
+      updatedAt: 7100,
+      messageCount: 1,
+    }],
+    canonicalTurns: [
+      turn(c, 'running', [userItem, assistantItem]),
+    ],
+    runtimeReadModel: {
+      details: {
+        sessions: [],
+        tasks: [],
+      },
+    },
+  }, { sessionId: c.sessionId });
+
+  assert.equal(
+    bootstrap.state.isProcessing,
+    true,
+    'bootstrap should recover processing state from running canonical turn without task runtime',
+  );
+  assert.equal(bootstrap.state.processingState?.startedAt, 7000);
+  assert.deepEqual(
+    bootstrap.state.processingState?.pendingRequestIds,
+    ['request-bootstrap-running'],
+    'bootstrap should carry request binding metadata from canonical items',
+  );
+}
+
+function assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract) {
+  const c = baseCase(
+    'bootstrap-terminal-canonical-turn',
+    'session-bootstrap-terminal',
+    'turn-bootstrap-terminal',
+    8000,
+  );
+  const userItem = user(c, 1, '完成后刷新不应回到运行态。');
+  const assistantItem = assistantText(c, 2, 'assistant-bootstrap-terminal', '已完成', 'completed');
+  const bootstrap = contract.normalizeRustBootstrapPayload({
+    generatedAt: 8100,
+    currentSession: {
+      sessionId: c.sessionId,
+      title: '完成态恢复',
+      createdAt: 8000,
+      updatedAt: 8100,
+      messageCount: 2,
+    },
+    sessions: [{
+      sessionId: c.sessionId,
+      title: '完成态恢复',
+      createdAt: 8000,
+      updatedAt: 8100,
+      messageCount: 2,
+    }],
+    canonicalTurns: [
+      turn(c, 'completed', [userItem, assistantItem], { completedAt: 8050, responseDurationMs: 50 }),
+    ],
+    runtimeReadModel: {
+      details: {
+        sessions: [],
+        tasks: [],
+      },
+    },
+  }, { sessionId: c.sessionId });
+
+  assert.equal(
+    bootstrap.state.isProcessing,
+    false,
+    'terminal canonical turn must not be restored as running',
+  );
+  assert.equal(bootstrap.state.processingState, null);
 }
 
 function ordinaryChatCase() {

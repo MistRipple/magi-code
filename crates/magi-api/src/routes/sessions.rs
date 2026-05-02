@@ -1174,6 +1174,7 @@ struct SessionInterruptResponseDto {
     turn_id: Option<String>,
     event_id: String,
     requested_at: UtcMillis,
+    cancelled_tool_process_count: usize,
     removed_timeline_entry_ids: Vec<String>,
 }
 
@@ -1299,6 +1300,12 @@ async fn interrupt_session_turn(
         Vec::new()
     };
 
+    let cancelled_tool_process_count = if interrupted {
+        state.cancel_active_tool_executions(Some(&session_id), workspace_id.as_ref(), None)
+    } else {
+        0
+    };
+
     if interrupted {
         let cancelled_item_id = state
             .session_store
@@ -1334,6 +1341,7 @@ async fn interrupt_session_turn(
             "workspace_id": workspace_id.as_ref().map(ToString::to_string),
             "turn_id": turn_id.clone(),
             "interrupted": interrupted,
+            "cancelled_tool_process_count": cancelled_tool_process_count,
             "requested_at": now.0,
             "removed_timeline_entry_ids": streaming_entry_ids.clone(),
         }),
@@ -1354,6 +1362,7 @@ async fn interrupt_session_turn(
         turn_id,
         event_id: event_id.to_string(),
         requested_at: now,
+        cancelled_tool_process_count,
         removed_timeline_entry_ids: streaming_entry_ids,
     }))
 }

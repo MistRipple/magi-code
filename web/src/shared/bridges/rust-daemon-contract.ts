@@ -1,6 +1,7 @@
 import type { SessionBootstrapSnapshot } from '../session-bootstrap';
 import type { CanonicalTurn } from '../protocol/canonical-turn';
 import { normalizeCanonicalTurn } from '../protocol/canonical-turn';
+import { deriveProcessingStateFromCanonicalTurns } from '../protocol/canonical-processing';
 import type {
   AppState,
   OrchestrationRuntimeAssignmentSummary,
@@ -827,7 +828,13 @@ function buildSessionTaskStatusSummary(
 function deriveProcessingState(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
   sessionId: string,
+  canonicalTurns: CanonicalTurn[],
 ): AppState['processingState'] {
+  const canonicalProcessingState = deriveProcessingStateFromCanonicalTurns(canonicalTurns, sessionId);
+  if (canonicalProcessingState) {
+    return canonicalProcessingState;
+  }
+
   const { runningTaskIds } = buildSessionTaskStatusSummary(runtimeReadModel, sessionId);
   const isProcessing = runningTaskIds.length > 0;
 
@@ -1169,6 +1176,7 @@ export function normalizeRustBootstrapPayload(
   const processingState = deriveProcessingState(
     payload.runtimeReadModel,
     currentSession?.id || '',
+    canonicalTurns,
   );
   const state: AppState = {
     ...buildEmptyWorkspaceAppState(generatedAt),

@@ -1,5 +1,6 @@
 use crate::{
     BuiltinTool, BuiltinToolAccessMode, BuiltinToolName, BuiltinToolSpec, ToolExecutionContext,
+    ToolExecutionContextQuery,
 };
 use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel, UtcMillis};
 use serde_json::Value;
@@ -17,16 +18,33 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
 const MAX_SHELL_TIMEOUT_MS: u64 = 120_000;
 const SHELL_TIMEOUT_POLL_MS: u64 = 20;
+
+#[derive(Clone)]
+struct ActiveShellExec {
+    execution_id: u64,
+    session_id: Option<String>,
+    workspace_id: Option<String>,
+    task_id: Option<String>,
+    child: Arc<Mutex<Child>>,
+}
 
 struct ShellExecOutput {
     status: Option<ExitStatus>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     timed_out: bool,
+    cancelled: bool,
 }
+
+static SHELL_EXECUTION_COUNTER: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_SHELL_EXECUTIONS: LazyLock<Mutex<HashMap<u64, ActiveShellExec>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 struct ManagedProcess {
     terminal_id: u64,
@@ -429,10 +447,11 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
         .unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)
         .clamp(SHELL_TIMEOUT_POLL_MS, MAX_SHELL_TIMEOUT_MS);
 
-    let output = match execute_shell_command_with_timeout(&shell, &command, &cwd, timeout_ms) {
-        Ok(output) => output,
-        Err(error) => return builtin_error("shell_exec", format!("命令执行失败: {error}")),
-    };
+    let output =
+        match execute_shell_command_with_timeout(&shell, &command, &cwd, timeout_ms, context) {
+            Ok(output) => output,
+            Err(error) => return builtin_error("shell_exec", format!("命令执行失败: {error}")),
+        };
 
     let succeeded = output
         .status
@@ -440,7 +459,13 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
         .map(ExitStatus::success)
         .unwrap_or(false)
         && !output.timed_out;
-    let status = if succeeded { "succeeded" } else { "failed" };
+    let status = if output.cancelled {
+        "cancelled"
+    } else if succeeded {
+        "succeeded"
+    } else {
+        "failed"
+    };
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let exit_code = output.status.as_ref().and_then(ExitStatus::code);
@@ -453,11 +478,14 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
         "access_mode": access_mode.as_str(),
         "timeout_ms": timeout_ms,
         "timed_out": output.timed_out,
+        "cancelled": output.cancelled,
         "exit_code": exit_code,
         "stdout": stdout,
         "stderr": stderr,
         "summary": if output.timed_out {
             format!("命令执行超时({timeout_ms}ms): {command}")
+        } else if output.cancelled {
+            format!("命令已取消: {command}")
         } else if succeeded {
             format!("命令执行成功: {}", command)
         } else {
@@ -472,34 +500,58 @@ fn execute_shell_command_with_timeout(
     command: &str,
     cwd: &Path,
     timeout_ms: u64,
+    context: &ToolExecutionContext,
 ) -> Result<ShellExecOutput, String> {
-    let mut child = Command::new(shell)
+    let mut command_builder = Command::new(shell);
+    command_builder
         .arg(shell_arg())
         .arg(command)
         .current_dir(cwd)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        command_builder.process_group(0);
+    }
+    let mut child = command_builder.spawn().map_err(|error| error.to_string())?;
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let child = Arc::new(Mutex::new(child));
+    let execution_id = register_active_shell_exec(context, &child);
     let stdout_reader = thread::spawn(move || read_child_pipe(stdout));
     let stderr_reader = thread::spawn(move || read_child_pipe(stderr));
     let started_at = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let mut timed_out = false;
+    let mut cancelled = false;
     let status = loop {
-        match child.try_wait().map_err(|error| error.to_string())? {
-            Some(status) => break Some(status),
+        let wait_state = {
+            child
+                .lock()
+                .expect("shell child lock poisoned")
+                .try_wait()
+                .map_err(|error| error.to_string())?
+        };
+        match wait_state {
+            Some(status) => {
+                if !active_shell_exec_is_registered(execution_id) {
+                    cancelled = true;
+                }
+                break Some(status);
+            }
             None if started_at.elapsed() >= timeout => {
                 timed_out = true;
-                let _ = child.kill();
-                break child.wait().ok();
+                break terminate_shell_child(&child);
+            }
+            None if !active_shell_exec_is_registered(execution_id) => {
+                cancelled = true;
+                break child.lock().expect("shell child lock poisoned").wait().ok();
             }
             None => thread::sleep(Duration::from_millis(SHELL_TIMEOUT_POLL_MS)),
         }
     };
+    unregister_active_shell_exec(execution_id);
 
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
@@ -508,7 +560,119 @@ fn execute_shell_command_with_timeout(
         stdout,
         stderr,
         timed_out,
+        cancelled,
     })
+}
+
+fn register_active_shell_exec(context: &ToolExecutionContext, child: &Arc<Mutex<Child>>) -> u64 {
+    let execution_id = SHELL_EXECUTION_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let process = ActiveShellExec {
+        execution_id,
+        session_id: context
+            .session_id
+            .as_ref()
+            .map(|id| id.as_str().to_string()),
+        workspace_id: context
+            .workspace_id
+            .as_ref()
+            .map(|id| id.as_str().to_string()),
+        task_id: context.task_id.as_ref().map(|id| id.as_str().to_string()),
+        child: Arc::clone(child),
+    };
+    ACTIVE_SHELL_EXECUTIONS
+        .lock()
+        .expect("active shell execution lock poisoned")
+        .insert(execution_id, process);
+    execution_id
+}
+
+fn unregister_active_shell_exec(execution_id: u64) {
+    ACTIVE_SHELL_EXECUTIONS
+        .lock()
+        .expect("active shell execution lock poisoned")
+        .remove(&execution_id);
+}
+
+fn active_shell_exec_is_registered(execution_id: u64) -> bool {
+    ACTIVE_SHELL_EXECUTIONS
+        .lock()
+        .expect("active shell execution lock poisoned")
+        .contains_key(&execution_id)
+}
+
+fn active_shell_matches_query(
+    process: &ActiveShellExec,
+    query: &ToolExecutionContextQuery,
+) -> bool {
+    let has_scope =
+        query.session_id.is_some() || query.workspace_id.is_some() || query.task_id.is_some();
+    if !has_scope {
+        return false;
+    }
+    if let Some(session_id) = query.session_id.as_ref()
+        && process.session_id.as_deref() != Some(session_id.as_str())
+    {
+        return false;
+    }
+    if let Some(workspace_id) = query.workspace_id.as_ref()
+        && process.workspace_id.as_deref() != Some(workspace_id.as_str())
+    {
+        return false;
+    }
+    if let Some(task_id) = query.task_id.as_ref()
+        && process.task_id.as_deref() != Some(task_id.as_str())
+    {
+        return false;
+    }
+    true
+}
+
+pub(crate) fn cancel_active_shell_execs(query: &ToolExecutionContextQuery) -> usize {
+    let processes = {
+        let mut table = ACTIVE_SHELL_EXECUTIONS
+            .lock()
+            .expect("active shell execution lock poisoned");
+        let execution_ids = table
+            .values()
+            .filter(|process| active_shell_matches_query(process, query))
+            .map(|process| process.execution_id)
+            .collect::<Vec<_>>();
+        execution_ids
+            .into_iter()
+            .filter_map(|execution_id| table.remove(&execution_id))
+            .collect::<Vec<_>>()
+    };
+    for process in &processes {
+        let _ = terminate_shell_child(&process.child);
+    }
+    processes.len()
+}
+
+fn terminate_shell_child(child: &Arc<Mutex<Child>>) -> Option<ExitStatus> {
+    let mut child = child.lock().expect("shell child lock poisoned");
+    terminate_process_group(&mut child);
+    child.wait().ok()
+}
+
+fn terminate_process_group(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{}", child.id());
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(&process_group)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        thread::sleep(Duration::from_millis(50));
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(&process_group)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
 }
 
 fn read_child_pipe<T: Read>(pipe: Option<T>) -> Vec<u8> {

@@ -716,6 +716,10 @@ impl ToolRegistry {
         self.execute_with_policy_for_surface(input, context, policy, false)
     }
 
+    pub fn cancel_active_shell_execs(&self, query: &ToolExecutionContextQuery) -> usize {
+        builtin::cancel_active_shell_execs(query)
+    }
+
     #[cfg(test)]
     fn execute_internal_builtin_with_policy(
         &self,
@@ -1212,6 +1216,59 @@ mod tests {
             &ToolExecutionPolicy::default(),
         );
         assert_eq!(blocked.status, ExecutionResultStatus::NeedsApproval);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_exec_cancel_active_session_kills_running_command() {
+        let registry = make_registry();
+        let context = ToolExecutionContext {
+            worker_id: None,
+            task_id: Some(TaskId::new("task-shell-cancel")),
+            session_id: Some(SessionId::new("session-shell-cancel")),
+            workspace_id: Some(WorkspaceId::new("workspace-shell-cancel")),
+            working_directory: None,
+        };
+        let runner_registry = registry.clone();
+        let runner_context = context.clone();
+        let runner = std::thread::spawn(move || {
+            runner_registry.execute_with_policy(
+                ToolExecutionInput {
+                    tool_call_id: ToolCallId::new("tool-call-shell-cancel"),
+                    tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                    tool_kind: ToolKind::Builtin,
+                    input: serde_json::json!({
+                        "command": "sleep 2",
+                        "timeout_ms": 5000
+                    })
+                    .to_string(),
+                    approval_requirement: ApprovalRequirement::None,
+                    risk_level: RiskLevel::Low,
+                },
+                runner_context,
+                &ToolExecutionPolicy::default(),
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(100));
+        let cancel_started = Instant::now();
+        let cancelled = registry.cancel_active_shell_execs(&ToolExecutionContextQuery {
+            session_id: context.session_id.clone(),
+            workspace_id: context.workspace_id.clone(),
+            task_id: None,
+            worker_id: None,
+        });
+
+        assert_eq!(cancelled, 1);
+        let output = runner.join().expect("shell execution thread should join");
+        assert!(
+            cancel_started.elapsed() < Duration::from_millis(1500),
+            "取消 shell_exec 后不应等待 sleep 自然结束"
+        );
+        assert_eq!(output.status, ExecutionResultStatus::Cancelled);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload should parse");
+        assert_eq!(payload["tool"], "shell_exec");
+        assert_eq!(payload["cancelled"], true);
     }
 
     #[test]
