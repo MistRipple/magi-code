@@ -2148,32 +2148,31 @@ fn execute_diagram_render(input: &str) -> String {
         "mermaid" => {
             let source = match field_string(&request, &["source", "code"]) {
                 Some(value) if !value.trim().is_empty() => value.trim().to_string(),
-                _ => return builtin_error("diagram_render", "kind=mermaid 需要 source 字段"),
+                _ => return builtin_error("diagram_render", "该图表源码格式需要 source 字段"),
             };
             let diagram_type = match detect_mermaid_kind_type(&source) {
                 Some(value) => value,
                 None => {
                     return builtin_error(
                         "diagram_render",
-                        "无法识别的 Mermaid 图表类型。source 须包含有效声明（graph, flowchart, sequenceDiagram, classDiagram 等）",
+                        "无法识别的图表类型。source 须包含有效声明（graph, flowchart, sequenceDiagram, classDiagram 等）",
                     );
                 }
             };
             if diagram_type == "mindmap" {
                 return builtin_error(
                     "diagram_render",
-                    "思维导图必须使用 kind=flow 或 kind=graph 的 graph.nodes/edges 结构化输入；Mermaid mindmap 不是当前产品展示面",
+                    "思维导图必须使用 kind=flow 或 kind=graph 的 graph.nodes/edges 结构化输入；mindmap 不是当前产品展示面",
                 );
             }
             payload["source"] = serde_json::json!(source);
             payload["diagram_type"] = serde_json::json!(diagram_type);
-            payload["summary"] =
-                serde_json::json!(format!("已生成 Mermaid {} 图表数据", diagram_type));
+            payload["summary"] = serde_json::json!(format!("已生成图表数据（{}）", diagram_type));
         }
         "dot" => {
             let source = match field_string(&request, &["source", "code"]) {
                 Some(value) if !value.trim().is_empty() => value.trim().to_string(),
-                _ => return builtin_error("diagram_render", "kind=dot 需要 source 字段"),
+                _ => return builtin_error("diagram_render", "该图表源码格式需要 source 字段"),
             };
             if !is_dot_source(&source) {
                 return builtin_error(
@@ -2183,7 +2182,7 @@ fn execute_diagram_render(input: &str) -> String {
             }
             payload["source"] = serde_json::json!(source);
             payload["diagram_type"] = serde_json::json!("dot");
-            payload["summary"] = serde_json::json!("已生成 DOT 图表数据");
+            payload["summary"] = serde_json::json!("已生成图表数据");
         }
         "graph" | "flow" => {
             let graph = match request.get("graph") {
@@ -2206,8 +2205,8 @@ fn execute_diagram_render(input: &str) -> String {
             payload["graph"] = graph;
             payload["diagram_type"] = serde_json::json!(kind);
             payload["summary"] = serde_json::json!(format!(
-                "已生成 {} 图表数据（{} 个节点，{} 条边）",
-                kind, node_count, edge_count
+                "已生成图表数据（{} 个节点，{} 条边）",
+                node_count, edge_count
             ));
         }
         _ => unreachable!("normalize_diagram_kind only returns supported kinds"),

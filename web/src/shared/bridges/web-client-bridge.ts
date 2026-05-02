@@ -2506,15 +2506,14 @@ function openDiagramSvgPreview(title: string, svgContent: string): void {
   popup.document.close();
 }
 
-function openDiagramPreview(kind: string, source: string, title?: string, svgContent?: string): void {
-  const resolvedKind = kind.trim() || 'diagram';
+function openDiagramPreview(source: string, title?: string, svgContent?: string): void {
   const resolvedTitle = title?.trim() || '图表';
   const sanitizedSvg = typeof svgContent === 'string' ? sanitizeSvgContent(svgContent) : '';
   if (sanitizedSvg) {
     openDiagramSvgPreview(resolvedTitle, sanitizedSvg);
     return;
   }
-  openPreviewWindow(resolvedTitle, `${resolvedKind} 源码预览`, source, 'file');
+  openPreviewWindow(resolvedTitle, '图表源码预览', source, 'file');
 }
 
 async function openFilePreview(filePath: string, previewContent?: string): Promise<void> {
@@ -3298,7 +3297,6 @@ export function createWebClientBridge(): ClientBridge {
               return;
             }
             openDiagramPreview(
-              typeof message.kind === 'string' ? message.kind : 'mermaid',
               source,
               typeof message.title === 'string' ? message.title : undefined,
               typeof message.svgContent === 'string' ? message.svgContent : undefined,

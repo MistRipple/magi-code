@@ -129,5 +129,8 @@ export function parseCodeBlockDiagramPayload(language: string, code: string): Di
 }
 
 export function diagramSummary(payload: DiagramPayload): string {
-  return payload.title || payload.summary || payload.diagramType || payload.layout || payload.kind;
+  if (payload.title?.trim()) {
+    return payload.title.trim();
+  }
+  return payload.summary?.trim() || '';
 }

@@ -14,17 +14,14 @@
 
   interface Props {
     graph: DiagramPayload['graph'];
-    title?: string;
     layout?: string;
-    embedded?: boolean;
   }
 
-  let { graph, title = '', layout = 'auto', embedded = false }: Props = $props();
+  let { graph, layout = 'auto' }: Props = $props();
 
   let container: HTMLDivElement;
   let cy: Core | null = null;
   let error = $state('');
-  let copied = $state(false);
   let mounted = $state(false);
   let lastGraphKey = $state('');
   let renderToken = 0;
@@ -296,38 +293,9 @@
     });
   }
 
-  async function copyGraph(): Promise<void> {
-    try {
-      await navigator.clipboard.writeText(JSON.stringify(graph, null, 2));
-      copied = true;
-      setTimeout(() => {
-        copied = false;
-      }, 1600);
-    } catch (e) {
-      console.error('[CytoscapeRenderer] 复制图数据失败:', e);
-    }
-  }
-
 </script>
 
-<div class="graph-container" class:has-error={!!error} class:embedded>
-  {#if !embedded}
-    <div class="graph-header">
-      <div class="header-left">
-        <Icon name="git-branch" size={14} />
-        <span class="header-type">{i18n.t('diagramRenderer.kind.graph')}</span>
-        <span class="header-title">
-          {title || `${normalized.nodes.length} ${i18n.t('diagramRenderer.nodes')} · ${normalized.edges.length} ${i18n.t('diagramRenderer.edges')}`}
-        </span>
-      </div>
-      <div class="header-actions">
-        <button class="header-btn" onclick={copyGraph} disabled={!graph} title={i18n.t('diagramRenderer.copyData')}>
-          <Icon name={copied ? 'check' : 'copy'} size={14} />
-        </button>
-      </div>
-    </div>
-  {/if}
-
+<div class="graph-renderer">
   <div class="graph-content">
     {#if error}
       <div class="error">
@@ -353,68 +321,11 @@
 </div>
 
 <style>
-  .graph-container {
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+  .graph-renderer {
     overflow: hidden;
-    background: var(--surface-1);
-    margin: var(--space-2, 8px) 0;
-  }
-
-  .graph-container.embedded {
-    border: none;
-    border-radius: 0;
-    margin: 0;
     background: transparent;
   }
 
-  .graph-container.has-error {
-    border-color: var(--error);
-  }
-
-  .graph-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: var(--space-2, 8px) var(--space-3, 12px);
-    background: var(--surface-2);
-    border-bottom: 1px solid var(--border);
-  }
-
-  .header-left {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2, 8px);
-    min-width: 0;
-    color: var(--info);
-  }
-
-  .header-type,
-  .header-title {
-    font-size: var(--text-sm, 13px);
-  }
-
-  .header-type {
-    font-weight: 500;
-    flex-shrink: 0;
-  }
-
-  .header-title {
-    min-width: 0;
-    overflow: hidden;
-    color: var(--foreground);
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .header-actions {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    flex-shrink: 0;
-  }
-
-  .header-btn,
   .control-btn {
     display: flex;
     align-items: center;
@@ -429,7 +340,6 @@
     transition: all 0.15s;
   }
 
-  .header-btn:hover,
   .control-btn:hover {
     background: var(--surface-hover);
     color: var(--foreground);

@@ -1,6 +1,8 @@
 <script lang="ts">
   import type { Component } from 'svelte';
+  import Icon from './Icon.svelte';
   import type { DiagramPayload } from '../lib/diagram-payload';
+  import { postMessage } from '../lib/vscode-bridge';
   import { i18n } from '../stores/i18n.svelte';
 
   interface Props {
@@ -12,27 +14,18 @@
 
   type MermaidRendererProps = {
     code: string;
-    title?: string;
-    diagramType?: string;
     layout?: string;
-    embedded?: boolean;
   };
   type GraphvizRendererProps = {
     source: string;
-    title?: string;
     layout?: string;
-    embedded?: boolean;
   };
   type CytoscapeRendererProps = {
     graph: DiagramPayload['graph'];
-    title?: string;
     layout?: string;
-    embedded?: boolean;
   };
   type SvelteFlowRendererProps = {
     graph: DiagramPayload['graph'];
-    title?: string;
-    embedded?: boolean;
   };
 
   let MermaidComponent = $state<Component<MermaidRendererProps> | null>(null);
@@ -43,6 +36,7 @@
   let failedKind = $state<DiagramPayload['kind'] | null>(null);
   let failedMessage = $state('');
   let requestedKind = $state<DiagramPayload['kind'] | null>(null);
+  let copied = $state(false);
 
   function recordLoadError(kind: DiagramPayload['kind'], error: unknown): void {
     failedKind = kind;
@@ -104,65 +98,252 @@
   $effect(() => {
     ensureRenderer(payload.kind);
   });
+
+  function diagramTypeLabel(type: string | undefined): string {
+    if (!type) return '';
+    const keyMap: Record<string, string> = {
+      flowchart: 'diagramRenderer.diagramType.flowchart',
+      sequence: 'diagramRenderer.diagramType.sequence',
+      class: 'diagramRenderer.diagramType.class',
+      state: 'diagramRenderer.diagramType.state',
+      er: 'diagramRenderer.diagramType.er',
+      gantt: 'diagramRenderer.diagramType.gantt',
+      pie: 'diagramRenderer.diagramType.pie',
+      journey: 'diagramRenderer.diagramType.journey',
+      git: 'diagramRenderer.diagramType.git',
+      timeline: 'diagramRenderer.diagramType.timeline',
+      quadrant: 'diagramRenderer.diagramType.quadrant',
+      requirement: 'diagramRenderer.diagramType.requirement',
+      c4: 'diagramRenderer.diagramType.c4',
+      sankey: 'diagramRenderer.diagramType.sankey',
+      xychart: 'diagramRenderer.diagramType.xychart',
+      block: 'diagramRenderer.diagramType.block',
+      dot: 'diagramRenderer.kind.dot',
+      graph: 'diagramRenderer.kind.graph',
+      flow: 'diagramRenderer.kind.flow',
+    };
+    const key = keyMap[type.trim().toLowerCase()];
+    return key ? i18n.t(key) : '';
+  }
+
+  function graphStats(): string {
+    const nodes = Array.isArray(payload.graph?.nodes) ? payload.graph.nodes.length : 0;
+    const edges = Array.isArray(payload.graph?.edges) ? payload.graph.edges.length : 0;
+    return nodes || edges
+      ? `${nodes} ${i18n.t('diagramRenderer.nodes')} · ${edges} ${i18n.t('diagramRenderer.edges')}`
+      : '';
+  }
+
+  const previewText = $derived.by(() => {
+    if (payload.source?.trim()) {
+      return payload.source.trim();
+    }
+    if (payload.graph) {
+      return JSON.stringify(payload.graph, null, 2);
+    }
+    return '';
+  });
+
+  const displayTitle = $derived.by(() => {
+    const title = payload.title?.trim();
+    if (title) return title;
+    return diagramTypeLabel(payload.diagramType) || graphStats() || i18n.t('diagramRenderer.title');
+  });
+
+  const hasSubtitle = $derived(displayTitle !== i18n.t('diagramRenderer.title'));
+  const canCopyPayload = $derived(previewText.trim().length > 0);
+
+  async function copyPayload(): Promise<void> {
+    if (!canCopyPayload) return;
+    try {
+      await navigator.clipboard.writeText(previewText);
+      copied = true;
+      setTimeout(() => {
+        copied = false;
+      }, 1600);
+    } catch (error) {
+      console.error('[DiagramRenderer] 复制图表数据失败:', error);
+    }
+  }
+
+  function openPreview(): void {
+    if (!previewText.trim()) return;
+    postMessage({
+      type: 'openDiagramPanel',
+      kind: 'diagram',
+      source: previewText,
+      title: displayTitle,
+    });
+  }
 </script>
 
-{#if loadError}
-  <div class="diagram-loading diagram-error" class:embedded>
-    <span>{i18n.t('diagramRenderer.renderFailed')}</span>
-    <small>{loadError}</small>
+{#snippet rendererContent()}
+  {#if loadError}
+    <div class="diagram-loading diagram-error" class:embedded>
+      <span>{i18n.t('diagramRenderer.renderFailed')}</span>
+      <small>{loadError}</small>
+    </div>
+  {:else if payload.kind === 'mermaid' && payload.source}
+    {#if MermaidComponent}
+      <MermaidComponent
+        code={payload.source}
+        layout={payload.layout}
+      />
+    {:else}
+      <div class="diagram-loading" class:embedded>{i18n.t('diagramRenderer.rendering')}</div>
+    {/if}
+  {:else if payload.kind === 'dot' && payload.source}
+    {#if GraphvizComponent}
+      <GraphvizComponent source={payload.source} layout={payload.layout} />
+    {:else}
+      <div class="diagram-loading" class:embedded>{i18n.t('diagramRenderer.rendering')}</div>
+    {/if}
+  {:else if payload.kind === 'graph' || payload.kind === 'flow'}
+    {#if payload.kind === 'graph'}
+      {#if CytoscapeComponent}
+        <CytoscapeComponent graph={payload.graph} layout={payload.layout} />
+      {:else}
+        <div class="diagram-loading" class:embedded>{i18n.t('diagramRenderer.rendering')}</div>
+      {/if}
+    {:else}
+      {#if SvelteFlowComponent}
+        <SvelteFlowComponent graph={payload.graph} />
+      {:else}
+        <div class="diagram-loading" class:embedded>{i18n.t('diagramRenderer.rendering')}</div>
+      {/if}
+    {/if}
+  {/if}
+{/snippet}
+
+{#if embedded}
+  {@render rendererContent()}
+{:else}
+  <div class="diagram-shell">
+    <div class="diagram-header">
+      <div class="header-left">
+        <Icon name="git-branch" size={14} />
+        <span class="header-type">{i18n.t('diagramRenderer.title')}</span>
+        {#if hasSubtitle}
+          <span class="header-title">{displayTitle}</span>
+        {/if}
+      </div>
+      <div class="header-actions">
+        <button
+          class="header-btn"
+          onclick={copyPayload}
+          disabled={!canCopyPayload}
+          title={i18n.t('diagramRenderer.copyData')}
+        >
+          <Icon name={copied ? 'check' : 'copy'} size={14} />
+        </button>
+        <button
+          class="header-btn"
+          onclick={openPreview}
+          disabled={!canCopyPayload}
+          title={i18n.t('diagramRenderer.openInNewTab')}
+        >
+          <Icon name="external-link" size={14} />
+        </button>
+      </div>
+    </div>
+    <div class="diagram-body">
+      {@render rendererContent()}
+    </div>
   </div>
-{:else if payload.kind === 'mermaid' && payload.source}
-  {#if MermaidComponent}
-    <MermaidComponent
-      code={payload.source}
-      title={payload.title}
-      diagramType={payload.diagramType}
-      layout={payload.layout}
-      embedded={embedded}
-    />
-  {:else}
-    <div class="diagram-loading" class:embedded>{i18n.t('diagramRenderer.rendering')}</div>
-  {/if}
-{:else if payload.kind === 'dot' && payload.source}
-  {#if GraphvizComponent}
-    <GraphvizComponent source={payload.source} title={payload.title} layout={payload.layout} embedded={embedded} />
-  {:else}
-    <div class="diagram-loading" class:embedded>{i18n.t('diagramRenderer.rendering')}</div>
-  {/if}
-{:else if payload.kind === 'graph' || payload.kind === 'flow'}
-  {#if payload.kind === 'graph'}
-    {#if CytoscapeComponent}
-      <CytoscapeComponent graph={payload.graph} title={payload.title} layout={payload.layout} embedded={embedded} />
-    {:else}
-      <div class="diagram-loading" class:embedded>{i18n.t('diagramRenderer.rendering')}</div>
-    {/if}
-  {:else}
-    {#if SvelteFlowComponent}
-      <SvelteFlowComponent graph={payload.graph} title={payload.title} embedded={embedded} />
-    {:else}
-      <div class="diagram-loading" class:embedded>{i18n.t('diagramRenderer.rendering')}</div>
-    {/if}
-  {/if}
 {/if}
 
 <style>
+  .diagram-shell {
+    overflow: hidden;
+    margin: var(--space-2, 8px) 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface-1);
+  }
+
+  .diagram-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3, 12px);
+    padding: var(--space-2, 8px) var(--space-3, 12px);
+    border-bottom: 1px solid var(--border);
+    background: var(--surface-2);
+  }
+
+  .header-left {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: var(--space-2, 8px);
+    color: var(--info);
+  }
+
+  .header-type,
+  .header-title {
+    font-size: var(--text-sm, 13px);
+  }
+
+  .header-type {
+    flex-shrink: 0;
+    font-weight: 500;
+  }
+
+  .header-title {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--foreground);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .header-actions {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .header-btn {
+    display: flex;
+    width: 28px;
+    height: 28px;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--foreground-muted);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .header-btn:hover:not(:disabled) {
+    background: var(--surface-hover);
+    color: var(--foreground);
+  }
+
+  .header-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+
+  .diagram-body {
+    background: var(--code-bg);
+  }
+
   .diagram-loading {
     display: flex;
     align-items: center;
     justify-content: center;
     min-height: 180px;
-    margin: var(--space-2, 8px) 0;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+    margin: 0;
     background: var(--code-bg);
     color: var(--foreground-muted);
     font-size: var(--text-sm, 13px);
   }
 
   .diagram-loading.embedded {
-    margin: 0;
-    border: none;
-    border-radius: 0;
     min-height: 260px;
   }
 

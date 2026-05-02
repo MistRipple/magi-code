@@ -2,20 +2,16 @@
   import { onMount } from 'svelte';
   import mermaid from 'mermaid';
   import Icon from './Icon.svelte';
-  import { postMessage } from '../lib/vscode-bridge';
   import { i18n } from '../stores/i18n.svelte';
   import { sanitizeSvgContent } from '../shared/svg-sanitizer';
 
   // Props
   interface Props {
     code: string;
-    title?: string;
-    diagramType?: string;
     layout?: string;
-    embedded?: boolean;
   }
 
-  let { code, title = '', diagramType = '', layout = 'auto', embedded = false }: Props = $props();
+  let { code, layout = 'auto' }: Props = $props();
 
   // 状态
   let svgContent = $state('');
@@ -43,90 +39,12 @@
     return normalized;
   }
 
+  function isUnsupportedMindmapSource(source: string): boolean {
+    return /^\s*mindmap(?:\s|\n|$)/i.test(source);
+  }
+
   const normalizedCode = $derived(normalizeMermaidSource(code));
   const renderKey = $derived(`${normalizedCode}\n::${layout}\n::${activeThemeMode}`);
-
-  // 从 mermaid 代码中提取标题
-  const extractedTitle = $derived.by(() => {
-    if (title) return title;
-    if (!normalizedCode) return '';
-
-    // 尝试匹配 YAML frontmatter 格式: ---\ntitle: xxx\n---
-    const yamlMatch = normalizedCode.match(/^---\s*\n(?:.*\n)*?title:\s*(.+?)\n(?:.*\n)*?---/m);
-    if (yamlMatch) return yamlMatch[1].trim();
-
-    // 尝试匹配 accTitle 格式
-    const accMatch = normalizedCode.match(/accTitle:\s*(.+?)(?:\n|$)/);
-    if (accMatch) return accMatch[1].trim();
-
-    // 尝试匹配 Mermaid 专属图表后的标题注释
-    const commentMatch = normalizedCode.match(/(?:flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie|timeline).*?\n\s*%%\s*(.+?)(?:\n|$)/);
-    if (commentMatch) return commentMatch[1].trim();
-
-    // 流程图：从第一个节点提取标题
-    const flowchartMatch = normalizedCode.match(/(?:flowchart|graph)\s+(?:TD|TB|BT|RL|LR)\s*\n\s*\w+\s*(?:\[\[(.+?)\]\]|\[(.+?)\]|\(\((.+?)\)\)|\((.+?)\)|\{(.+?)\})/m);
-    if (flowchartMatch) {
-      const nodeText = flowchartMatch[1] || flowchartMatch[2] || flowchartMatch[3] || flowchartMatch[4] || flowchartMatch[5];
-      if (nodeText) return nodeText.trim();
-    }
-
-    return '';
-  });
-
-  // 检测图表类型
-  const detectedType = $derived.by(() => {
-    if (diagramType) return diagramType;
-    if (!code) return '';
-
-    const typePatterns: [RegExp, string][] = [
-      [/^\s*flowchart/mi, 'flowchart'],
-      [/^\s*graph/mi, 'flowchart'],
-      [/^\s*sequenceDiagram/mi, 'sequence'],
-      [/^\s*classDiagram/mi, 'class'],
-      [/^\s*stateDiagram/mi, 'state'],
-      [/^\s*erDiagram/mi, 'er'],
-      [/^\s*gantt/mi, 'gantt'],
-      [/^\s*pie/mi, 'pie'],
-      [/^\s*journey/mi, 'journey'],
-      [/^\s*gitGraph/mi, 'git'],
-      [/^\s*timeline/mi, 'timeline'],
-      [/^\s*quadrantChart/mi, 'quadrant'],
-      [/^\s*requirementDiagram/mi, 'requirement'],
-      [/^\s*C4Context/mi, 'c4'],
-      [/^\s*sankey/mi, 'sankey'],
-      [/^\s*xychart/mi, 'xychart'],
-      [/^\s*block-beta/mi, 'block'],
-    ];
-
-    for (const [pattern, type] of typePatterns) {
-      if (pattern.test(code)) return type;
-    }
-    return '';
-  });
-
-  // 图表类型显示名
-  const typeDisplayName = $derived.by(() => {
-    const typeMap: Record<string, string> = {
-      flowchart: 'mermaidRenderer.diagramType.flowchart',
-      sequence: 'mermaidRenderer.diagramType.sequence',
-      class: 'mermaidRenderer.diagramType.class',
-      state: 'mermaidRenderer.diagramType.state',
-      er: 'mermaidRenderer.diagramType.er',
-      gantt: 'mermaidRenderer.diagramType.gantt',
-      pie: 'mermaidRenderer.diagramType.pie',
-      journey: 'mermaidRenderer.diagramType.journey',
-      git: 'mermaidRenderer.diagramType.git',
-      timeline: 'mermaidRenderer.diagramType.timeline',
-      quadrant: 'mermaidRenderer.diagramType.quadrant',
-      requirement: 'mermaidRenderer.diagramType.requirement',
-      c4: 'mermaidRenderer.diagramType.c4',
-      sankey: 'mermaidRenderer.diagramType.sankey',
-      xychart: 'mermaidRenderer.diagramType.xychart',
-      block: 'mermaidRenderer.diagramType.block',
-    };
-    const key = typeMap[detectedType];
-    return key ? i18n.t(key) : 'Mermaid';
-  });
 
   function resolveThemeMode(): 'light' | 'dark' {
     if (typeof document === 'undefined') {
@@ -255,7 +173,14 @@
     error = '';
 
     if (!currentCode) {
-      error = i18n.t('mermaidRenderer.noCode');
+      error = i18n.t('diagramRenderer.noSource');
+      isRendering = false;
+      svgContent = '';
+      lastRenderedKey = currentRenderKey;
+      return;
+    }
+    if (isUnsupportedMindmapSource(currentCode)) {
+      error = i18n.t('diagramRenderer.unsupportedMindmap');
       isRendering = false;
       svgContent = '';
       lastRenderedKey = currentRenderKey;
@@ -268,7 +193,7 @@
       if (token !== renderToken) return;
       const sanitizedSvg = sanitizeSvgContent(svg);
       if (!sanitizedSvg) {
-        throw new Error(i18n.t('mermaidRenderer.renderFailed'));
+        throw new Error(i18n.t('diagramRenderer.renderFailed'));
       }
       svgContent = sanitizedSvg;
       lastRenderedKey = currentRenderKey;
@@ -277,8 +202,8 @@
       translateY = 0;
     } catch (e) {
       if (token !== renderToken) return;
-      console.error('[MermaidRenderer] 渲染错误:', e);
-      error = e instanceof Error ? e.message : i18n.t('mermaidRenderer.renderFailed');
+      console.error('[DiagramRenderer] 渲染错误:', e);
+      error = e instanceof Error ? e.message : i18n.t('diagramRenderer.renderFailed');
       svgContent = '';
       lastRenderedKey = currentRenderKey;
     } finally {
@@ -337,51 +262,9 @@
     isDragging = false;
   }
 
-  // 复制 SVG
-  async function copySvg() {
-    if (svgContent) {
-      try {
-        await navigator.clipboard.writeText(svgContent);
-      } catch (e) {
-        console.error('复制失败:', e);
-      }
-    }
-  }
-
-  // 在新标签页打开
-  function openInNewTab() {
-    postMessage({
-      type: 'openDiagramPanel',
-      kind: 'mermaid',
-      source: normalizedCode,
-      svgContent,
-      title: extractedTitle || typeDisplayName
-    });
-  }
 </script>
 
-<div class="mermaid-container" class:has-error={!!error} class:embedded>
-  <!-- 头部 -->
-  {#if !embedded}
-    <div class="mermaid-header">
-      <div class="header-left">
-        <Icon name="git-branch" size={14} />
-        <span class="header-type">{typeDisplayName}</span>
-        {#if extractedTitle}
-          <span class="header-title">{extractedTitle}</span>
-        {/if}
-      </div>
-      <div class="header-actions">
-        <button class="header-btn" onclick={copySvg} disabled={isRendering || !!error || !svgContent} title={i18n.t('mermaidRenderer.copySvg')}>
-          <Icon name="copy" size={14} />
-        </button>
-        <button class="header-btn" onclick={openInNewTab} disabled={isRendering || !!error || !svgContent} title={i18n.t('mermaidRenderer.openInNewTab')}>
-          <Icon name="external-link" size={14} />
-        </button>
-      </div>
-    </div>
-  {/if}
-
+<div class="mermaid-renderer">
   <!-- 图表区域 -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
@@ -392,17 +275,17 @@
     onmouseleave={handleMouseUp}
     class:dragging={isDragging}
     role="application"
-    aria-label={i18n.t('mermaidRenderer.ariaLabel')}
+    aria-label={i18n.t('diagramRenderer.ariaLabel')}
   >
     {#if isRendering}
       <div class="loading">
         <span class="spinner"></span>
-        <span>{i18n.t('mermaidRenderer.rendering')}</span>
+        <span>{i18n.t('diagramRenderer.rendering')}</span>
       </div>
     {:else if error}
       <div class="error">
         <Icon name="alert-circle" size={20} />
-        <span class="error-title">{i18n.t('mermaidRenderer.renderFailed')}</span>
+        <span class="error-title">{i18n.t('diagramRenderer.renderFailed')}</span>
         <pre class="error-message">{error}</pre>
       </div>
     {:else}
@@ -417,13 +300,13 @@
     <!-- 浮动控制按钮（Augment 风格） -->
     {#if !isRendering && !error}
       <div class="floating-controls">
-        <button class="control-btn" onclick={zoomIn} title={i18n.t('mermaidRenderer.zoomIn')}>
+        <button class="control-btn" onclick={zoomIn} title={i18n.t('diagramRenderer.zoomIn')}>
           <Icon name="plus" size={14} />
         </button>
-        <button class="control-btn" onclick={zoomOut} title={i18n.t('mermaidRenderer.zoomOut')}>
+        <button class="control-btn" onclick={zoomOut} title={i18n.t('diagramRenderer.zoomOut')}>
           <Icon name="minus" size={14} />
         </button>
-        <button class="control-btn" onclick={resetView} title={i18n.t('mermaidRenderer.resetView')}>
+        <button class="control-btn" onclick={resetView} title={i18n.t('diagramRenderer.resetView')}>
           <Icon name="refresh" size={14} />
         </button>
       </div>
@@ -432,10 +315,7 @@
 </div>
 
 <style>
-  .mermaid-container {
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    overflow: hidden;
+  .mermaid-renderer {
     --mermaid-node-bg: var(--surface-2);
     --mermaid-node-border: var(--primary);
     --mermaid-text: var(--foreground);
@@ -447,86 +327,6 @@
     --mermaid-line-width: 2px;
     --mermaid-cluster-bg: var(--surface-1);
     --mermaid-edge-label-bg: var(--background);
-    background: var(--surface-1);
-    margin: var(--space-2, 8px) 0;
-  }
-
-  .mermaid-container.embedded {
-    border: none;
-    border-radius: 0;
-    margin: 0;
-    background: transparent;
-  }
-
-  .mermaid-container.has-error {
-    border-color: var(--error);
-  }
-
-  .mermaid-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: var(--space-2, 8px) var(--space-3, 12px);
-    background: var(--surface-2);
-    border-bottom: 1px solid var(--border);
-  }
-
-  .header-left {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2, 8px);
-    color: var(--info);
-    overflow: hidden;
-  }
-
-  .header-type {
-    font-size: var(--text-sm, 13px);
-    font-weight: 500;
-    flex-shrink: 0;
-  }
-
-  .header-title {
-    font-size: var(--text-sm, 13px);
-    color: var(--foreground);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .header-actions {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    flex-shrink: 0;
-  }
-
-  .header-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    background: transparent;
-    border: none;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    border-radius: var(--radius-sm);
-    transition: all 0.15s;
-  }
-
-  .header-btn:hover {
-    background: var(--surface-hover);
-    color: var(--foreground);
-  }
-
-  .header-btn:disabled {
-    cursor: not-allowed;
-    opacity: 0.45;
-  }
-
-  .header-btn:disabled:hover {
-    background: transparent;
-    color: var(--foreground-muted);
   }
 
   .mermaid-content {

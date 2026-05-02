@@ -7,29 +7,24 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import Icon from '../Icon.svelte';
-  import { postMessage } from '../../lib/vscode-bridge';
   import { i18n } from '../../stores/i18n.svelte';
   import { sanitizeSvgContent } from '../../shared/svg-sanitizer';
 
   interface Props {
     source: string;
-    title?: string;
     layout?: string;
-    embedded?: boolean;
   }
 
-  let { source, title = '', layout = 'auto', embedded = false }: Props = $props();
+  let { source, layout = 'auto' }: Props = $props();
 
   let svgContent = $state('');
   let error = $state('');
   let isRendering = $state(true);
   let scale = $state(1);
-  let copied = $state(false);
   let lastRenderKey = $state('');
   let mounted = $state(false);
   let renderToken = 0;
 
-  const displayTitle = $derived(title || 'DOT');
   const renderKey = $derived(`${source}\n::${layout}`);
 
   function resolveEngine(value: string): string {
@@ -117,51 +112,9 @@
     scale = 1;
   }
 
-  async function copySvg(): Promise<void> {
-    if (!svgContent) return;
-    try {
-      await navigator.clipboard.writeText(svgContent);
-      copied = true;
-      setTimeout(() => {
-        copied = false;
-      }, 1600);
-    } catch (e) {
-      console.error('[GraphvizRenderer] 复制 SVG 失败:', e);
-    }
-  }
-
-  function openInNewTab(): void {
-    postMessage({
-      type: 'openDiagramPanel',
-      kind: 'dot',
-      source,
-      svgContent,
-      title: displayTitle,
-    });
-  }
 </script>
 
-<div class="graphviz-container" class:has-error={!!error} class:embedded>
-  {#if !embedded}
-    <div class="graphviz-header">
-      <div class="header-left">
-        <Icon name="git-branch" size={14} />
-        <span class="header-type">{i18n.t('diagramRenderer.kind.dot')}</span>
-        {#if displayTitle && displayTitle !== 'DOT'}
-          <span class="header-title">{displayTitle}</span>
-        {/if}
-      </div>
-      <div class="header-actions">
-        <button class="header-btn" onclick={copySvg} disabled={isRendering || !!error || !svgContent} title={i18n.t('diagramRenderer.copySvg')}>
-          <Icon name={copied ? 'check' : 'copy'} size={14} />
-        </button>
-        <button class="header-btn" onclick={openInNewTab} disabled={isRendering || !!error || !svgContent} title={i18n.t('diagramRenderer.openInNewTab')}>
-          <Icon name="external-link" size={14} />
-        </button>
-      </div>
-    </div>
-  {/if}
-
+<div class="graphviz-renderer">
   <div class="graphviz-content">
     {#if isRendering}
       <div class="loading">
@@ -194,67 +147,11 @@
 </div>
 
 <style>
-  .graphviz-container {
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+  .graphviz-renderer {
     overflow: hidden;
-    background: var(--surface-1);
-    margin: var(--space-2, 8px) 0;
-  }
-
-  .graphviz-container.embedded {
-    border: none;
-    border-radius: 0;
-    margin: 0;
     background: transparent;
   }
 
-  .graphviz-container.has-error {
-    border-color: var(--error);
-  }
-
-  .graphviz-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: var(--space-2, 8px) var(--space-3, 12px);
-    background: var(--surface-2);
-    border-bottom: 1px solid var(--border);
-  }
-
-  .header-left {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2, 8px);
-    color: var(--info);
-    overflow: hidden;
-  }
-
-  .header-type,
-  .header-title {
-    font-size: var(--text-sm, 13px);
-  }
-
-  .header-type {
-    font-weight: 500;
-    flex-shrink: 0;
-  }
-
-  .header-title {
-    color: var(--foreground);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .header-actions {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    flex-shrink: 0;
-  }
-
-  .header-btn,
   .control-btn {
     display: flex;
     align-items: center;
@@ -269,15 +166,9 @@
     transition: all 0.15s;
   }
 
-  .header-btn:hover,
   .control-btn:hover {
     background: var(--surface-hover);
     color: var(--foreground);
-  }
-
-  .header-btn:disabled {
-    cursor: not-allowed;
-    opacity: 0.45;
   }
 
   .graphviz-content {

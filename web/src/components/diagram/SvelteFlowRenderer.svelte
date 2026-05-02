@@ -21,12 +21,9 @@
 
   interface Props {
     graph: DiagramPayload['graph'];
-    title?: string;
-    embedded?: boolean;
   }
 
-  let { graph, title = '', embedded = false }: Props = $props();
-  let copied = $state(false);
+  let { graph }: Props = $props();
 
   const normalized = $derived(normalizeDiagramGraph(graph));
   const generatedPositions = $derived(computePositions(normalized.nodes, normalized.edges));
@@ -142,35 +139,9 @@
     }));
   }
 
-  async function copyGraph(): Promise<void> {
-    try {
-      await navigator.clipboard.writeText(JSON.stringify(graph, null, 2));
-      copied = true;
-      setTimeout(() => {
-        copied = false;
-      }, 1600);
-    } catch (e) {
-      console.error('[SvelteFlowRenderer] 复制图数据失败:', e);
-    }
-  }
 </script>
 
-<div class="flow-container" class:embedded>
-  {#if !embedded}
-    <div class="flow-header">
-      <div class="header-left">
-        <Icon name="git-branch" size={14} />
-        <span class="header-type">{i18n.t('diagramRenderer.kind.flow')}</span>
-        <span class="header-title">
-          {title || `${normalized.nodes.length} ${i18n.t('diagramRenderer.nodes')} · ${normalized.edges.length} ${i18n.t('diagramRenderer.edges')}`}
-        </span>
-      </div>
-      <button class="header-btn" onclick={copyGraph} disabled={!graph} title={i18n.t('diagramRenderer.copyData')}>
-        <Icon name={copied ? 'check' : 'copy'} size={14} />
-      </button>
-    </div>
-  {/if}
-
+<div class="flow-renderer">
   <div class="flow-content">
     {#if normalized.nodes.length === 0}
       <div class="empty">
@@ -206,73 +177,9 @@
 </div>
 
 <style>
-  .flow-container {
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+  .flow-renderer {
     overflow: hidden;
-    background: var(--surface-1);
-    margin: var(--space-2, 8px) 0;
-  }
-
-  .flow-container.embedded {
-    border: none;
-    border-radius: 0;
-    margin: 0;
     background: transparent;
-  }
-
-  .flow-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: var(--space-2, 8px) var(--space-3, 12px);
-    background: var(--surface-2);
-    border-bottom: 1px solid var(--border);
-  }
-
-  .header-left {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2, 8px);
-    min-width: 0;
-    color: var(--info);
-  }
-
-  .header-type,
-  .header-title {
-    font-size: var(--text-sm, 13px);
-  }
-
-  .header-type {
-    font-weight: 500;
-    flex-shrink: 0;
-  }
-
-  .header-title {
-    min-width: 0;
-    overflow: hidden;
-    color: var(--foreground);
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .header-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: all 0.15s;
-  }
-
-  .header-btn:hover {
-    background: var(--surface-hover);
-    color: var(--foreground);
   }
 
   .flow-content {
