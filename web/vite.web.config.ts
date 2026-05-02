@@ -68,6 +68,17 @@ export default defineConfig(({ mode }) => {
         $stores: resolve(__dirname, './src/stores'),
       },
     },
+    optimizeDeps: {
+      // Mermaid 本体运行时懒加载图定义，不能放进 .vite/deps；其 CJS 依赖仍需预优化成稳定 ESM。
+      exclude: ['mermaid'],
+      include: [
+        'dayjs',
+        'dayjs/plugin/advancedFormat.js',
+        'dayjs/plugin/customParseFormat.js',
+        'dayjs/plugin/duration.js',
+        'dayjs/plugin/isoWeek.js',
+      ],
+    },
     build: {
       outDir: 'dist',
       emptyOutDir: true,
