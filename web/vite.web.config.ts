@@ -69,9 +69,12 @@ export default defineConfig(({ mode }) => {
       },
     },
     optimizeDeps: {
-      // Mermaid 本体运行时懒加载图定义，不能放进 .vite/deps；其 CJS 依赖仍需预优化成稳定 ESM。
+      // Mermaid 本体运行时懒加载图定义，不能放进 .vite/deps；动态图块依赖的 CJS 包仍需预优化成稳定 ESM。
       exclude: ['mermaid'],
       include: [
+        '@braintree/sanitize-url',
+        'cytoscape-cose-bilkent',
+        'cytoscape-fcose',
         'dayjs',
         'dayjs/plugin/advancedFormat.js',
         'dayjs/plugin/customParseFormat.js',
