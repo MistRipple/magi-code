@@ -1400,20 +1400,13 @@
   {/if}
 
   {#if !hasTaskProjection}
-    <div class="empty-state">
-      <div class="task-empty-card">
-        <div class="empty-icon-wrap">
-          <Icon name="circleOutline" size={32} class="empty-icon" />
-        </div>
-        <div class="empty-text">{i18n.t('tasks.empty.title')}</div>
-        <div class="empty-hint">
-          {i18n.t('tasks.empty.hintNoPlan')}
-        </div>
-        <div class="task-empty-points" aria-label="任务面板说明">
-          <span class="task-empty-point">{i18n.t('tasks.empty.pointGoal')}</span>
-          <span class="task-empty-point">{i18n.t('tasks.empty.pointFlow')}</span>
-          <span class="task-empty-point">{i18n.t('tasks.empty.pointDelivery')}</span>
-        </div>
+    <div class="task-empty-state" role="status" aria-live="polite">
+      <div class="task-empty-glyph" aria-hidden="true">
+        <Icon name="list" size={18} />
+      </div>
+      <div class="task-empty-copy">
+        <div class="task-empty-title">{i18n.t('tasks.empty.title')}</div>
+        <div class="task-empty-hint">{i18n.t('tasks.empty.hintNoPlan')}</div>
       </div>
     </div>
   {/if}
@@ -1518,66 +1511,53 @@
   }
 
   /* ========== 空状态 ========== */
-  .empty-state {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: var(--space-8) var(--space-5);
-    width: 100%;
-    min-height: 320px;
-    box-sizing: border-box;
-  }
-
-  .task-empty-card {
+  .task-empty-state {
+    flex: 1;
     display: flex;
     flex-direction: column;
     align-items: center;
+    justify-content: center;
     gap: var(--space-3);
-    width: min(100%, 420px);
-    padding: var(--space-5) var(--space-4);
-    border: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
-    border-radius: var(--radius-lg);
-    background: var(--surface-1);
-    box-shadow: var(--shadow-sm);
+    width: 100%;
+    min-height: clamp(280px, 52vh, 560px);
+    padding: var(--space-8) var(--space-5);
     color: var(--foreground-muted);
     text-align: center;
     box-sizing: border-box;
   }
 
-  .empty-icon-wrap {
-    opacity: 0.34;
+  .task-empty-glyph {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--surface-2) 62%, transparent);
+    color: var(--foreground-muted);
+    opacity: 0.56;
   }
 
-  .empty-text {
-    font-size: var(--text-base);
+  .task-empty-copy {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-2);
+    max-width: 360px;
+  }
+
+  .task-empty-title {
+    font-size: var(--text-sm);
     font-weight: var(--font-medium);
     color: var(--foreground);
+    opacity: 0.88;
   }
 
-  .empty-hint {
-    font-size: var(--text-sm);
+  .task-empty-hint {
+    font-size: var(--text-xs);
     color: var(--foreground-muted);
     line-height: var(--leading-normal);
-  }
-
-  .task-empty-points {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: center;
-    gap: var(--space-2);
-  }
-
-  .task-empty-point {
-    display: inline-flex;
-    align-items: center;
-    min-height: 24px;
-    padding: 0 var(--space-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-full);
-    background: var(--surface-2);
-    color: var(--foreground-muted);
-    font-size: var(--text-2xs);
-    white-space: nowrap;
+    opacity: 0.72;
   }
 
   :global(.spinning) {
