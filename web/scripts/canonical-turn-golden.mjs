@@ -57,6 +57,8 @@ function runGoldenReplay(reducer, projection, contract) {
   assertTerminalLateUpsertIsIgnored(reducer, projection);
   assertTerminalLateTurnStartedIsIgnored(reducer, projection);
   assertFailedAssistantTextUsesPlainMessageShell(reducer, projection);
+  assertCancelledToolShowsTurnResponseDuration(reducer, projection);
+  assertFailedToolWithoutAssistantShowsTurnResponseDuration(reducer, projection);
   assertBootstrapProcessingStateFromRunningCanonicalTurn(contract);
   assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract);
 }
@@ -89,6 +91,13 @@ function projectionSignature(value) {
       hasToolResult: Boolean(toolCall?.result),
     };
   });
+}
+
+function findArtifactByTurnItemId(projectionValue, itemId) {
+  assert.ok(projectionValue, 'projection should exist');
+  return projectionValue.artifacts.find((artifact) => (
+    artifact.message.metadata?.turnItemId === itemId
+  ));
 }
 
 function assertTerminalLateUpsertIsIgnored(reducer, projection) {
@@ -235,6 +244,41 @@ function assertFailedAssistantTextUsesPlainMessageShell(reducer, projection) {
     assistantArtifact.message.blocks,
     undefined,
     'plain assistant_text should not be wrapped in a text block',
+  );
+  assert.equal(
+    assistantArtifact.message.metadata?.responseDurationMs,
+    100,
+    'failed assistant_text should keep the turn response duration',
+  );
+}
+
+function assertCancelledToolShowsTurnResponseDuration(reducer, projection) {
+  const testCase = cancelledToolCase();
+  const state = replayLive(reducer, testCase);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  const toolArtifact = findArtifactByTurnItemId(projectionValue, 'tool-cancelled');
+  assert.ok(toolArtifact, 'cancelled tool artifact should exist');
+  assert.equal(
+    toolArtifact.message.metadata?.responseDurationMs,
+    100,
+    'cancelled tool should show the terminal turn response duration',
+  );
+}
+
+function assertFailedToolWithoutAssistantShowsTurnResponseDuration(reducer, projection) {
+  const c = baseCase('failed-tool-without-assistant', 'session-golden-failed-tool-only', 'turn-golden-failed-tool-only', 9000);
+  const userItem = user(c, 1, '请运行一个失败命令，不要补充最终回复。');
+  const failedTool = tool(c, 2, 'tool-failed-only', 'call-failed-only', 'sh -c "echo fail; exit 7"', 'failed', { stderr: 'fail\n', exit_code: 7 });
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'failed', [userItem, failedTool], { completedAt: 9250, responseDurationMs: 250 }),
+  ]);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  const toolArtifact = findArtifactByTurnItemId(projectionValue, 'tool-failed-only');
+  assert.ok(toolArtifact, 'failed tool artifact should exist');
+  assert.equal(
+    toolArtifact.message.metadata?.responseDurationMs,
+    250,
+    'failed tool without assistant final should show the terminal turn response duration',
   );
 }
 

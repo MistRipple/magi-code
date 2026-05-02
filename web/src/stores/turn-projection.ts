@@ -149,26 +149,30 @@ function shouldRenderItem(item: CanonicalTurnItem): boolean {
   return true;
 }
 
-function canShowTurnResponseDuration(turn: CanonicalTurn, item: CanonicalTurnItem): boolean {
+function isTurnResponseDurationAnchorCandidate(item: CanonicalTurnItem): boolean {
+  return item.kind !== 'user_message'
+    && item.visibility.threadVisible !== false
+    && shouldRenderItem(item);
+}
+
+function findTurnResponseDurationAnchor(turn: CanonicalTurn): CanonicalTurnItem | undefined {
   if (
-    item.kind !== 'assistant_text'
-    || !isCanonicalTerminalStatus(item.status)
-    || !isCanonicalTerminalStatus(turn.status)
+    !isCanonicalTerminalStatus(turn.status)
     || typeof turn.responseDurationMs !== 'number'
+    || !Number.isFinite(turn.responseDurationMs)
+    || turn.responseDurationMs < 0
   ) {
-    return false;
+    return undefined;
   }
-  const lastVisibleAssistant = turn.items
-    .filter((candidate) => (
-      candidate.kind === 'assistant_text'
-      && candidate.visibility.renderable !== false
-      && candidate.visibility.threadVisible !== false
-      && typeof candidate.content === 'string'
-      && candidate.content.trim().length > 0
-    ))
+  return turn.items
+    .filter(isTurnResponseDurationAnchorCandidate)
     .sort((left, right) => left.itemSeq - right.itemSeq || left.itemId.localeCompare(right.itemId))
     .at(-1);
-  return lastVisibleAssistant?.itemId === item.itemId;
+}
+
+function canShowTurnResponseDuration(turn: CanonicalTurn, item: CanonicalTurnItem): boolean {
+  const anchor = findTurnResponseDurationAnchor(turn);
+  return anchor?.itemId === item.itemId;
 }
 
 function buildMessage(turn: CanonicalTurn, item: CanonicalTurnItem, artifactId: string): Message {

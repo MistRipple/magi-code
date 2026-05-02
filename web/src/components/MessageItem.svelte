@@ -246,15 +246,8 @@
       ? value
       : null;
   });
-  const isTerminalResponseTurnItem = $derived.by(() => (
-    turnItemKind === 'assistant_final'
-    || turnItemKind === 'assistant_error'
-    || turnItemKind === 'assistant_text'
-  ));
   const showResponseDuration = $derived.by(() => (
     displayContext === 'thread'
-    && message.source === 'orchestrator'
-    && isTerminalResponseTurnItem
     && !isStreaming
     && !isPlaceholder
     && !isSystemSection
