@@ -15,7 +15,7 @@ use axum::{
     extract::{Query, State},
     routing::get,
 };
-use magi_core::{SessionId, UtcMillis};
+use magi_core::{SessionId, UtcMillis, WorkspaceId};
 use serde::Deserialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -87,6 +87,8 @@ struct BootstrapQuery {
     session_id: Option<String>,
     #[serde(rename = "workspaceId", alias = "workspace_id")]
     workspace_id: Option<String>,
+    #[serde(rename = "workspacePath", alias = "workspace_path")]
+    workspace_path: Option<String>,
 }
 
 impl BootstrapQuery {
@@ -115,6 +117,7 @@ async fn bootstrap(
     let workspace_id = resolve_bootstrap_workspace_id(
         &state,
         query.requested_workspace_id(),
+        query.workspace_path.clone(),
         requested_session_id.as_ref(),
     );
     Ok(Json(state.bootstrap_dto_for_workspace_session(
@@ -126,10 +129,14 @@ async fn bootstrap(
 fn resolve_bootstrap_workspace_id(
     state: &ApiState,
     requested_workspace_id: Option<String>,
+    requested_workspace_path: Option<String>,
     requested_session_id: Option<&SessionId>,
 ) -> Option<String> {
-    if requested_workspace_id.is_some() {
-        return requested_workspace_id;
+    if let Some(workspace_id) = state.resolve_workspace_id_from_request(
+        requested_workspace_id.map(WorkspaceId::new),
+        requested_workspace_path.as_deref(),
+    ) {
+        return Some(workspace_id.to_string());
     }
     if let Some(session_id) = requested_session_id
         && let Some(session) = state.session_store.session(session_id)
@@ -748,6 +755,46 @@ mod tests {
             .expect("sessions should be an array");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0]["sessionId"], "session-bootstrap-query");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_resolves_workspace_path_when_id_missing() {
+        let state = test_state();
+        state
+            .workspace_registry
+            .register(
+                WorkspaceId::new("workspace-bootstrap-active"),
+                AbsolutePath::new("/tmp/magi-workspace-bootstrap-active"),
+            )
+            .expect("active workspace should register");
+        let workspace_id = WorkspaceId::new("workspace-bootstrap-path");
+        let workspace_path = "/tmp/magi-workspace-bootstrap-path";
+        state
+            .workspace_registry
+            .register(workspace_id.clone(), AbsolutePath::new(workspace_path))
+            .expect("path workspace should register");
+        state
+            .session_store
+            .create_session_for_workspace(
+                SessionId::new("session-bootstrap-path"),
+                "Bootstrap Path Session",
+                Some(workspace_id.to_string()),
+            )
+            .expect("path session should create");
+        let app = build_router(state);
+
+        let bootstrap = get_json(
+            app,
+            "/bootstrap?workspacePath=/tmp/magi-workspace-bootstrap-path",
+        )
+        .await;
+
+        assert_eq!(bootstrap["currentSession"], Value::Null);
+        let sessions = bootstrap["sessions"]
+            .as_array()
+            .expect("sessions should be an array");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "session-bootstrap-path");
     }
 
     #[tokio::test]

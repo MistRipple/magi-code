@@ -78,7 +78,6 @@ impl DeleteSessionRequest {
 #[serde(rename_all = "camelCase")]
 struct CreateSessionRequest {
     workspace_id: Option<String>,
-    #[allow(dead_code)]
     workspace_path: Option<String>,
 }
 
@@ -87,7 +86,15 @@ async fn create_session(
     Json(request): Json<CreateSessionRequest>,
 ) -> Result<Json<SessionSelectionResponseDto>, ApiError> {
     let session_id = super::new_session_id();
-    let workspace_id = request.workspace_id.filter(|s| !s.is_empty());
+    let workspace_id = state
+        .resolve_workspace_id_from_request(
+            request
+                .workspace_id
+                .filter(|s| !s.is_empty())
+                .map(WorkspaceId::new),
+            request.workspace_path.as_deref(),
+        )
+        .map(|workspace_id| workspace_id.to_string());
     let created_session = state
         .session_store
         .create_session_for_workspace(session_id, "新会话", workspace_id)
@@ -525,7 +532,7 @@ fn normalize_session_turn_decision(
         decision.execution_goal = None;
         decision.required_workers.clear();
         decision.tool_intent = Some(current_project_tool_intent());
-        decision.forced_tool_name = None;
+        decision.forced_tool_name = Some("shell_exec".to_string());
         decision.confidence = decision.confidence.max(0.94);
         decision.reason_code = Some("tool_request".to_string());
         decision.route_reason =
@@ -772,23 +779,23 @@ fn submit_regular_session_turn(
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_message(trimmed_text.as_deref());
     let title_seed = trimmed_text.as_deref().unwrap_or("新会话");
-    let (session_id, created_session, workspace_id) = super::resolve_dispatch_session(
-        &state,
-        request.requested_session_id(),
+    let requested_workspace_path = request.requested_workspace_path();
+    let requested_workspace_id = state.resolve_workspace_id_from_request(
         request
             .requested_workspace_id()
             .map(magi_core::WorkspaceId::new),
+        requested_workspace_path.as_deref(),
+    );
+    let (session_id, created_session, workspace_id) = super::resolve_dispatch_session(
+        &state,
+        request.requested_session_id(),
+        requested_workspace_id,
         title_seed,
         accepted_at,
     )?;
-    let workspace_root_path = workspace_id.as_ref().and_then(|workspace_id| {
-        state
-            .workspace_registry
-            .workspaces()
-            .into_iter()
-            .find(|workspace| workspace.workspace_id == *workspace_id)
-            .map(|workspace| workspace.root_path.to_string())
-    });
+    let workspace_root_path = state
+        .workspace_root_path(&workspace_id)
+        .map(|path| path.display().to_string());
     let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let request_id = request.request_id();
     let user_message_id = request.user_message_id();
@@ -2063,6 +2070,7 @@ mod tests {
         SessionTurnRequestDto {
             session_id: None,
             workspace_id: None,
+            workspace_path: None,
             text: Some(text.to_string()),
             deep_task: false,
             skill_name: None,
@@ -2115,10 +2123,29 @@ mod tests {
         let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
 
         assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert!(decision.forced_tool_name.is_none());
+        assert_eq!(decision.forced_tool_name.as_deref(), Some("shell_exec"));
         let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
         assert!(tool_intent.contains("当前工作区"));
         assert!(tool_intent.contains("不要要求用户手动提供项目结构"));
+    }
+
+    #[test]
+    fn resolves_workspace_binding_from_workspace_path_when_id_missing() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-path-binding");
+        let root = unique_temp_dir("magi-workspace-path-binding");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                magi_core::AbsolutePath::new(root.display().to_string()),
+            )
+            .expect("workspace should register");
+
+        let resolved =
+            state.resolve_workspace_id_from_request(None, Some(&root.display().to_string()));
+
+        assert_eq!(resolved, Some(workspace_id));
     }
 
     #[tokio::test]
@@ -2167,6 +2194,7 @@ mod tests {
             SessionTurnRequestDto {
                 session_id: None,
                 workspace_id: None,
+                workspace_path: None,
                 text: Some("请只回复一句话".to_string()),
                 deep_task: false,
                 skill_name: None,

@@ -41,7 +41,10 @@ pub(super) fn accept_session_task_submission(
     execute_dispatch_submission(
         state,
         request.requested_session_id(),
-        request.requested_workspace_id().map(WorkspaceId::new),
+        state.resolve_workspace_id_from_request(
+            request.requested_workspace_id().map(WorkspaceId::new),
+            request.requested_workspace_path().as_deref(),
+        ),
         mission_title,
         message,
         trimmed_text,

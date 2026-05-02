@@ -1016,6 +1016,7 @@ export async function submitSessionTurn(
       body: JSON.stringify({
         sessionId: binding.sessionId || null,
         workspaceId: binding.workspaceId || null,
+        workspacePath: binding.workspacePath || null,
         text: payload.text ?? null,
         deepTask: payload.deepTask,
         skillName: payload.skillName ?? null,

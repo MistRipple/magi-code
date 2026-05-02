@@ -439,7 +439,7 @@ mod tests {
     use magi_core::{ApprovalRequirement, RiskLevel, ToolCallId};
     use magi_governance::GovernanceService;
     use magi_tool_runtime::{BuiltinTool, BuiltinToolSpec, ToolExecutionContext, ToolRegistry};
-    use std::sync::Arc;
+    use std::{path::PathBuf, sync::Arc};
 
     #[derive(Clone, Debug)]
     struct EchoTool;
@@ -451,6 +451,34 @@ mod tests {
 
         fn execute(&self, input: &str, _context: &ToolExecutionContext) -> String {
             format!("echo:{input}")
+        }
+
+        fn spec(&self) -> BuiltinToolSpec {
+            BuiltinToolSpec {
+                name: self.name().to_string(),
+                risk_level: RiskLevel::Low,
+                approval_requirement: ApprovalRequirement::None,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct ContextEchoTool;
+
+    impl BuiltinTool for ContextEchoTool {
+        fn name(&self) -> &'static str {
+            "cwd_echo"
+        }
+
+        fn execute(&self, _input: &str, context: &ToolExecutionContext) -> String {
+            format!(
+                "cwd:{}",
+                context
+                    .working_directory
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            )
         }
 
         fn spec(&self) -> BuiltinToolSpec {
@@ -607,6 +635,55 @@ mod tests {
             Ok(SkillDispatchResult::Builtin { ref output })
                 if output.status == magi_core::ExecutionResultStatus::Succeeded
         ));
+    }
+
+    #[test]
+    fn builtin_dispatch_prefers_explicit_working_directory() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_builtin(Arc::new(ContextEchoTool));
+
+        let skill_registry = SkillRegistry::new();
+        skill_registry.register(SkillDefinition {
+            skill_id: "skill-cwd".to_string(),
+            title: "Skill CWD".to_string(),
+            instruction: "instruction".to_string(),
+            metadata: SkillMetadata {
+                category: "general".to_string(),
+                tags: vec!["tag".to_string()],
+            },
+            allowed_tools: vec!["cwd_echo".to_string()],
+            custom_tool_bindings: vec![],
+            prompt_priority: 10,
+        });
+
+        let runtime = SkillDispatchRuntime::new(tool_registry, BridgeDispatchRuntime::new());
+        let plan = skill_registry.build_tool_runtime_plan(&SkillSelection {
+            skill_ids: vec!["skill-cwd".to_string()],
+            requested_tools: vec!["cwd_echo".to_string()],
+        });
+        let explicit_root = PathBuf::from("/tmp/skill-explicit-root");
+        let outcome = runtime.dispatch_observed(
+            &plan,
+            SkillDispatchInput {
+                tool_call_id: ToolCallId::new("call-cwd"),
+                tool_name: "cwd_echo".to_string(),
+                binding_id: None,
+                payload: "hello".to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+                context: ToolExecutionContext::default(),
+                working_directory: Some(explicit_root.display().to_string()),
+            },
+        );
+
+        assert_eq!(outcome.observation.status, SkillDispatchStatus::Succeeded);
+        let result = match outcome.result {
+            Ok(SkillDispatchResult::Builtin { output }) => output,
+            other => panic!("unexpected result: {other:?}"),
+        };
+        assert_eq!(result.payload, format!("cwd:{}", explicit_root.display()));
     }
 
     #[test]

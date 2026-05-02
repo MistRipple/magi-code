@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::session_scope::parse_session_id;
+use super::session_scope::{parse_session_id, session_workspace_id};
 use crate::{
     errors::ApiError,
     execution_chain_recovery::finalize_terminal_worker_branches,
@@ -458,11 +458,17 @@ async fn handle_intake(
         IntakeClassification::Replan => {
             ensure_session_active_execution_chain(&state, &session_id)?;
             let prompt = build_intake_replan_prompt(&root_task, &context_task, &request.message);
+            let session = state
+                .session_store
+                .session(&session_id)
+                .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+            let workspace_id = session_workspace_id(&state, &session);
             let replan = replan_deep_task_graph(
                 &state,
                 &root_task_id,
                 &prompt,
                 Some(&context_task),
+                &workspace_id,
                 request.message.trim(),
             )?;
             replace_replanned_task_execution_branches(

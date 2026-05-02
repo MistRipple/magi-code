@@ -17,6 +17,8 @@ pub struct SessionTurnRequestDto {
     pub session_id: Option<String>,
     #[serde(alias = "workspace_id")]
     pub workspace_id: Option<String>,
+    #[serde(default, alias = "workspace_path")]
+    pub workspace_path: Option<String>,
     pub text: Option<String>,
     #[serde(default)]
     #[serde(alias = "deep_task")]
@@ -47,6 +49,10 @@ impl SessionTurnRequestDto {
 
     pub fn requested_workspace_id(&self) -> Option<String> {
         trimmed_non_empty(self.workspace_id.as_deref())
+    }
+
+    pub fn requested_workspace_path(&self) -> Option<String> {
+        trimmed_non_empty(self.workspace_path.as_deref())
     }
 
     pub fn trimmed_text(&self) -> Option<String> {
@@ -193,6 +199,7 @@ mod tests {
         let request = SessionTurnRequestDto {
             session_id: Some("session-a".to_string()),
             workspace_id: Some("workspace-a".to_string()),
+            workspace_path: None,
             text: Some("请分析项目".to_string()),
             deep_task: true,
             skill_name: None,

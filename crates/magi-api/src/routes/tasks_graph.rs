@@ -6,7 +6,7 @@ use axum::{
 use magi_core::{TaskId, TaskProjection};
 use serde::Deserialize;
 
-use super::session_scope::parse_session_id;
+use super::session_scope::{parse_session_id, session_workspace_id};
 use crate::{
     errors::ApiError,
     shadow_execution::{
@@ -177,8 +177,19 @@ async fn replan_task_graph(
         "当前任务目标：{}\n请基于当前已完成任务重规划剩余任务图，保留已完成节点，不重写已完成工作。",
         objective_text
     );
-    let replan =
-        replan_deep_task_graph(&state, &root_id, &prompt, None, "manual task graph replan")?;
+    let session = state
+        .session_store
+        .session(&session_id)
+        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+    let workspace_id = session_workspace_id(&state, &session);
+    let replan = replan_deep_task_graph(
+        &state,
+        &root_id,
+        &prompt,
+        None,
+        &workspace_id,
+        "manual task graph replan",
+    )?;
     replace_replanned_task_execution_branches(
         &state,
         &session_id,

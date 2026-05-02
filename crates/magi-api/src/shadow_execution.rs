@@ -4,7 +4,7 @@ use magi_bridge_client::{
 };
 use magi_core::{
     ExecutionOwnership, ExecutorBinding, MissionId, SessionId, Task, TaskExecutionTarget, TaskId,
-    TaskKind, TaskPolicy, TaskStatus, UtcMillis, WorkerId,
+    TaskKind, TaskPolicy, TaskStatus, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, task_events};
 use magi_orchestrator::{ExecutionWritebackPlans, task_worker_catalog::resolve_task_role};
@@ -148,6 +148,7 @@ pub(crate) fn run_shadow_dispatch_submission(
                 .as_deref()
                 .unwrap_or_else(|| infer_dispatch_task_role(request.skill_name.as_deref())),
             execution_goal.expect("deep_task execution_goal 已在建图前校验"),
+            &request.workspace_id,
             &now,
         ) {
             Ok(graph) => Some(graph),
@@ -551,6 +552,7 @@ fn build_deep_task_graph(
     accepted_at: UtcMillis,
     target_role: &str,
     prompt: &str,
+    workspace_id: &Option<WorkspaceId>,
     now: &UtcMillis,
 ) -> Result<DeepTaskGraphBuildResult, ApiError> {
     let prompt_text = prompt.trim();
@@ -560,7 +562,7 @@ fn build_deep_task_graph(
             "prompt 为空",
         ));
     }
-    let plan = decompose_mission(state, Some(prompt_text), now).ok_or_else(|| {
+    let plan = decompose_mission(state, Some(prompt_text), now, workspace_id).ok_or_else(|| {
         ApiError::internal_assembly("构建深度任务图失败", "无法生成结构化深度计划")
     })?;
     if plan.phases.len() != 3 {
@@ -791,6 +793,7 @@ pub(crate) fn replan_deep_task_graph(
     root_task_id: &TaskId,
     prompt: &str,
     context_task: Option<&Task>,
+    workspace_id: &Option<WorkspaceId>,
     reason: &str,
 ) -> Result<DeepTaskGraphReplanResult, ApiError> {
     let task_store = state
@@ -829,9 +832,9 @@ pub(crate) fn replan_deep_task_graph(
             .0
             .saturating_add(REPLAN_GRAPH_COUNTER.fetch_add(1, Ordering::Relaxed)),
     );
-    let plan = decompose_mission(state, Some(prompt_text), &build_seed).ok_or_else(|| {
-        ApiError::internal_assembly("重规划深度任务图失败", "无法生成结构化深度计划")
-    })?;
+    let plan = decompose_mission(state, Some(prompt_text), &build_seed, workspace_id).ok_or_else(
+        || ApiError::internal_assembly("重规划深度任务图失败", "无法生成结构化深度计划"),
+    )?;
     if plan.phases.len() != 3 {
         return Err(ApiError::internal_assembly(
             "重规划深度任务图失败",
@@ -1477,9 +1480,19 @@ fn decompose_mission(
     state: &ApiState,
     prompt: Option<&str>,
     _now: &UtcMillis,
+    workspace_id: &Option<WorkspaceId>,
 ) -> Option<DeepTaskGraphPlan> {
     let prompt_text = prompt.filter(|s| !s.trim().is_empty())?;
     let client = state.task_planning_model_client()?;
+    let workspace_context = state
+        .workspace_root_path(workspace_id)
+        .map(|path| {
+            format!(
+                "\n当前工作区根目录：{}\n如果任务目标提到当前项目、当前仓库、本项目或 codebase，计划里的 action goal 必须要求读取这个工作区的真实目录、配置和关键源码，不要让 worker 等用户粘贴项目结构。",
+                path.display()
+            )
+        })
+        .unwrap_or_default();
     let request = ModelInvocationRequest {
         provider: SHADOW_MODEL_PROVIDER.to_string(),
         prompt: format!(
@@ -1489,8 +1502,8 @@ fn decompose_mission(
              每个 phase 至少 1 个 workPackage，每个 workPackage 至少 1 个 action。\n\
              action 的 dependsOn 只能引用同一 phase 内已定义的较早 action 标题。\n\
              action goal 必须描述可验证产出或完成标准。\n\
-             任务目标：{}",
-            prompt_text
+             任务目标：{}{}",
+            prompt_text, workspace_context
         ),
         messages: None,
         tools: Some(vec![deep_task_plan_tool()]),
@@ -1675,7 +1688,7 @@ mod tests {
         BridgeClientError, BridgeErrorLayer, BridgeResponse, ModelBridgeClient,
         ModelInvocationRequest, ModelStreamingDelta,
     };
-    use magi_core::SessionId;
+    use magi_core::{AbsolutePath, SessionId, WorkspaceId};
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_memory_store::MemoryStore;
@@ -1685,11 +1698,60 @@ mod tests {
     use magi_tool_runtime::ToolRegistry;
     use magi_worker_runtime::WorkerRuntime;
     use magi_workspace::WorkspaceStore;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use crate::dto::SessionTurnRequestDto;
 
     struct StaticDeepPlanModelBridgeClient;
+
+    fn static_deep_plan_payload() -> String {
+        deep_task_plan_response(serde_json::json!({
+            "phases": [
+                {
+                    "title": "规划",
+                    "workPackages": [
+                        {
+                            "title": "规划工作包",
+                            "actions": [
+                                {
+                                    "title": "梳理目标",
+                                    "goal": "明确目标、边界和验收标准"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "title": "执行",
+                    "workPackages": [
+                        {
+                            "title": "执行工作包",
+                            "actions": [
+                                {
+                                    "title": "执行任务",
+                                    "goal": "完成用户目标"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "title": "交付",
+                    "workPackages": [
+                        {
+                            "title": "交付工作包",
+                            "actions": [
+                                {
+                                    "title": "验证交付",
+                                    "goal": "验证执行结果并交付"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }))
+    }
 
     impl ModelBridgeClient for StaticDeepPlanModelBridgeClient {
         fn invoke(
@@ -1698,52 +1760,7 @@ mod tests {
         ) -> Result<BridgeResponse, BridgeClientError> {
             Ok(BridgeResponse {
                 ok: true,
-                payload: deep_task_plan_response(serde_json::json!({
-                    "phases": [
-                        {
-                            "title": "规划",
-                            "workPackages": [
-                                {
-                                    "title": "规划工作包",
-                                    "actions": [
-                                        {
-                                            "title": "梳理目标",
-                                            "goal": "明确目标、边界和验收标准"
-                                        }
-                                    ]
-                                }
-                            ]
-                        },
-                        {
-                            "title": "执行",
-                            "workPackages": [
-                                {
-                                    "title": "执行工作包",
-                                    "actions": [
-                                        {
-                                            "title": "执行任务",
-                                            "goal": "完成用户目标"
-                                        }
-                                    ]
-                                }
-                            ]
-                        },
-                        {
-                            "title": "交付",
-                            "workPackages": [
-                                {
-                                    "title": "交付工作包",
-                                    "actions": [
-                                        {
-                                            "title": "验证交付",
-                                            "goal": "验证执行结果并交付"
-                                        }
-                                    ]
-                                }
-                            ]
-                        }
-                    ]
-                })),
+                payload: static_deep_plan_payload(),
             })
         }
 
@@ -1757,6 +1774,31 @@ mod tests {
                 code: None,
                 message: "static deep plan client does not stream".to_string(),
             })
+        }
+    }
+
+    struct RecordingDeepPlanModelBridgeClient {
+        prompt: Arc<Mutex<Option<String>>>,
+    }
+
+    impl ModelBridgeClient for RecordingDeepPlanModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            *self.prompt.lock().expect("prompt lock poisoned") = Some(request.prompt);
+            Ok(BridgeResponse {
+                ok: true,
+                payload: static_deep_plan_payload(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            self.invoke(request)
         }
     }
 
@@ -1813,6 +1855,7 @@ mod tests {
         let request = SessionTurnRequestDto {
             session_id: None,
             workspace_id: None,
+            workspace_path: None,
             text: Some("Hello world".to_string()),
             skill_name: None,
             request_id: None,
@@ -2024,6 +2067,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn deep_task_planner_receives_workspace_root_context() {
+        let (state, _task_store) = build_test_state();
+        let captured_prompt = Arc::new(Mutex::new(None));
+        let state = state.with_task_planning_model_bridge_client(Arc::new(
+            RecordingDeepPlanModelBridgeClient {
+                prompt: Arc::clone(&captured_prompt),
+            },
+        ));
+        let workspace_id = WorkspaceId::new("workspace-deep-current-project");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-deep-current-project"),
+            )
+            .expect("workspace should be registered");
+        let session_id = SessionId::new("session-deep-current-project");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "deep current project",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should be creatable");
+
+        run_shadow_dispatch_submission(
+            &state,
+            &DispatchSubmissionRequest {
+                accepted_at: UtcMillis::now(),
+                session_id,
+                workspace_id: Some(workspace_id),
+                entry_id: "entry-deep-current-project".to_string(),
+                timeline_message: "深度分析当前项目".to_string(),
+                created_session: false,
+                mission_title: "深度分析当前项目".to_string(),
+                task_title: "执行: 深度分析当前项目".to_string(),
+                trimmed_text: Some("深度分析当前项目".to_string()),
+                execution_goal: Some("深度分析当前项目".to_string()),
+                deep_task: true,
+                skill_name: None,
+                target_role: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+            },
+        )
+        .expect("deep task should create graph");
+
+        let prompt = captured_prompt
+            .lock()
+            .expect("prompt lock poisoned")
+            .clone()
+            .expect("planner prompt should be captured");
+        assert!(prompt.contains("/tmp/magi-deep-current-project"));
+        assert!(prompt.contains("读取这个工作区的真实目录"));
+    }
+
     // -----------------------------------------------------------------------
     // Test 2: Task status reflects dispatch outcome (failure path)
     // -----------------------------------------------------------------------
@@ -2042,6 +2144,7 @@ mod tests {
         let request = SessionTurnRequestDto {
             session_id: None,
             workspace_id: None,
+            workspace_path: None,
             text: Some("Run a failing action".to_string()),
             skill_name: None,
             request_id: None,
@@ -2350,6 +2453,7 @@ mod tests {
         let request = SessionTurnRequestDto {
             session_id: None,
             workspace_id: None,
+            workspace_path: None,
             text: Some("test".to_string()),
             skill_name: None,
             request_id: None,

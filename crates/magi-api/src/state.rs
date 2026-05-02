@@ -644,6 +644,10 @@ fn temp_path_for(path: &Path) -> PathBuf {
     path.with_file_name(file_name)
 }
 
+fn canonicalize_path_for_workspace_match(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 impl ApiState {
     pub fn new(
         service_name: impl Into<String>,
@@ -830,6 +834,56 @@ impl ApiState {
 
     pub(crate) fn session_workspace_id(&self, session: &SessionRecord) -> Option<WorkspaceId> {
         session.workspace_id.as_deref().map(WorkspaceId::new)
+    }
+
+    pub(crate) fn workspace_root_path(
+        &self,
+        workspace_id: &Option<WorkspaceId>,
+    ) -> Option<PathBuf> {
+        let workspace_id = workspace_id.as_ref()?;
+        self.workspace_registry
+            .workspaces()
+            .into_iter()
+            .find(|workspace| workspace.workspace_id == *workspace_id)
+            .map(|workspace| PathBuf::from(workspace.root_path.as_str()))
+    }
+
+    pub(crate) fn resolve_workspace_id_from_request(
+        &self,
+        requested_workspace_id: Option<WorkspaceId>,
+        requested_workspace_path: Option<&str>,
+    ) -> Option<WorkspaceId> {
+        if let Some(workspace_id) = requested_workspace_id {
+            if self
+                .workspace_root_path(&Some(workspace_id.clone()))
+                .is_some()
+            {
+                return Some(workspace_id);
+            }
+            return self
+                .workspace_id_for_root_path(requested_workspace_path)
+                .or(Some(workspace_id));
+        }
+        self.workspace_id_for_root_path(requested_workspace_path)
+    }
+
+    pub(crate) fn workspace_id_for_root_path(
+        &self,
+        requested_workspace_path: Option<&str>,
+    ) -> Option<WorkspaceId> {
+        let requested_path = requested_workspace_path
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)?;
+        let requested_path = canonicalize_path_for_workspace_match(&requested_path);
+        self.workspace_registry
+            .workspaces()
+            .into_iter()
+            .find(|workspace| {
+                let stored_path = PathBuf::from(workspace.root_path.as_str());
+                canonicalize_path_for_workspace_match(&stored_path) == requested_path
+            })
+            .map(|workspace| workspace.workspace_id)
     }
 
     pub fn runtime_read_model_dto(&self) -> RuntimeReadModelDto {

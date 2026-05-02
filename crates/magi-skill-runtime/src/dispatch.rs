@@ -6,7 +6,8 @@ use crate::{
 };
 use magi_bridge_client::BridgeDispatchInput;
 use magi_governance::ToolKind;
-use magi_tool_runtime::ToolExecutionInput;
+use magi_tool_runtime::{ToolExecutionContext, ToolExecutionInput};
+use std::path::PathBuf;
 
 pub(crate) fn execute_dispatch(
     runtime: &SkillDispatchRuntime,
@@ -39,6 +40,7 @@ fn execute_builtin_dispatch(
     plan: &SkillToolRuntimePlan,
     input: SkillDispatchInput,
 ) -> Result<SkillDispatchResult, SkillDispatchError> {
+    let context = builtin_context_for_dispatch(input.context, input.working_directory.as_deref());
     Ok(SkillDispatchResult::Builtin {
         output: runtime.tool_registry.execute_with_policy(
             ToolExecutionInput {
@@ -49,10 +51,24 @@ fn execute_builtin_dispatch(
                 approval_requirement: input.approval_requirement,
                 risk_level: input.risk_level,
             },
-            input.context,
+            context,
             &plan.tool_policy,
         ),
     })
+}
+
+fn builtin_context_for_dispatch(
+    mut context: ToolExecutionContext,
+    working_directory: Option<&str>,
+) -> ToolExecutionContext {
+    if let Some(path) = working_directory
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        context.working_directory = Some(path);
+    }
+    context
 }
 
 fn execute_bridge_dispatch(
