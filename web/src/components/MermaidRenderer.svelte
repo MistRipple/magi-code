@@ -59,16 +59,9 @@
     const accMatch = normalizedCode.match(/accTitle:\s*(.+?)(?:\n|$)/);
     if (accMatch) return accMatch[1].trim();
 
-    // 尝试匹配 flowchart/graph 后的标题注释
-    const commentMatch = normalizedCode.match(/(?:flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie|mindmap|timeline).*?\n\s*%%\s*(.+?)(?:\n|$)/);
+    // 尝试匹配 Mermaid 专属图表后的标题注释
+    const commentMatch = normalizedCode.match(/(?:flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie|timeline).*?\n\s*%%\s*(.+?)(?:\n|$)/);
     if (commentMatch) return commentMatch[1].trim();
-
-    // 思维导图：从根节点提取标题 root((xxx)) 或 root(xxx) 或 root[xxx] 或直接 root 后的文本
-    const mindmapMatch = normalizedCode.match(/^\s*mindmap\s*\n\s*root\s*(?:\(\((.+?)\)\)|\((.+?)\)|\[(.+?)\]|(.+?)(?:\n|$))/m);
-    if (mindmapMatch) {
-      const rootText = mindmapMatch[1] || mindmapMatch[2] || mindmapMatch[3] || mindmapMatch[4];
-      if (rootText) return rootText.trim();
-    }
 
     // 流程图：从第一个节点提取标题
     const flowchartMatch = normalizedCode.match(/(?:flowchart|graph)\s+(?:TD|TB|BT|RL|LR)\s*\n\s*\w+\s*(?:\[\[(.+?)\]\]|\[(.+?)\]|\(\((.+?)\)\)|\((.+?)\)|\{(.+?)\})/m);
@@ -96,7 +89,6 @@
       [/^\s*pie/mi, 'pie'],
       [/^\s*journey/mi, 'journey'],
       [/^\s*gitGraph/mi, 'git'],
-      [/^\s*mindmap/mi, 'mindmap'],
       [/^\s*timeline/mi, 'timeline'],
       [/^\s*quadrantChart/mi, 'quadrant'],
       [/^\s*requirementDiagram/mi, 'requirement'],
@@ -124,7 +116,6 @@
       pie: 'mermaidRenderer.diagramType.pie',
       journey: 'mermaidRenderer.diagramType.journey',
       git: 'mermaidRenderer.diagramType.git',
-      mindmap: 'mermaidRenderer.diagramType.mindmap',
       timeline: 'mermaidRenderer.diagramType.timeline',
       quadrant: 'mermaidRenderer.diagramType.quadrant',
       requirement: 'mermaidRenderer.diagramType.requirement',
@@ -602,7 +593,6 @@
   .svg-wrapper :global(.transition),
   .svg-wrapper :global(.relation),
   .svg-wrapper :global(.relationshipLine),
-  .svg-wrapper :global(.mindmap-branch),
   .svg-wrapper :global(.branch),
   .svg-wrapper :global(path[class*="edge"]),
   .svg-wrapper :global(path[class*="relationship"]),

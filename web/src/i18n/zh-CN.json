@@ -307,7 +307,6 @@
   "mermaidRenderer.diagramType.pie": "饼图",
   "mermaidRenderer.diagramType.journey": "用户旅程",
   "mermaidRenderer.diagramType.git": "Git 图",
-  "mermaidRenderer.diagramType.mindmap": "思维导图",
   "mermaidRenderer.diagramType.timeline": "时间线",
   "mermaidRenderer.diagramType.quadrant": "象限图",
   "mermaidRenderer.diagramType.requirement": "需求图",

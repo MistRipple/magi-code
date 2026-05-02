@@ -307,7 +307,6 @@
   "mermaidRenderer.diagramType.pie": "Pie Chart",
   "mermaidRenderer.diagramType.journey": "User Journey",
   "mermaidRenderer.diagramType.git": "Git Graph",
-  "mermaidRenderer.diagramType.mindmap": "Mind Map",
   "mermaidRenderer.diagramType.timeline": "Timeline",
   "mermaidRenderer.diagramType.quadrant": "Quadrant Chart",
   "mermaidRenderer.diagramType.requirement": "Requirement Diagram",

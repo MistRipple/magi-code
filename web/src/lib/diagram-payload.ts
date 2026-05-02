@@ -39,6 +39,10 @@ function parseJsonObject(value: unknown): Record<string, unknown> | null {
   }
 }
 
+function isMermaidMindmapSource(source: unknown): boolean {
+  return typeof source === 'string' && /^\s*mindmap(?:\s|\n|$)/i.test(source);
+}
+
 function normalizeGraph(value: unknown): DiagramPayload['graph'] | undefined {
   if (!isRecord(value)) return undefined;
   const elements = value.elements;
@@ -76,19 +80,27 @@ export function parseToolDiagramPayload(toolName: string, output: unknown): Diag
   if (toolName === 'diagram_render' || data.type === 'diagram_render') {
     const kind = normalizeKind(data.kind);
     if (!kind) return null;
+    const source = typeof data.source === 'string' ? data.source : undefined;
+    const diagramType = typeof data.diagram_type === 'string'
+      ? data.diagram_type
+      : typeof data.diagramType === 'string'
+        ? data.diagramType
+        : undefined;
+    if (
+      kind === 'mermaid'
+      && (diagramType?.toLowerCase() === 'mindmap' || isMermaidMindmapSource(source))
+    ) {
+      return null;
+    }
     return {
       kind,
       title: typeof data.title === 'string' ? data.title : undefined,
-      source: typeof data.source === 'string' ? data.source : undefined,
+      source,
       graph: normalizeGraph(data.graph),
       layout: typeof data.layout === 'string' ? data.layout : undefined,
       theme: typeof data.theme === 'string' ? data.theme : undefined,
       interactive: typeof data.interactive === 'boolean' ? data.interactive : undefined,
-      diagramType: typeof data.diagram_type === 'string'
-        ? data.diagram_type
-        : typeof data.diagramType === 'string'
-          ? data.diagramType
-          : undefined,
+      diagramType,
       summary: typeof data.summary === 'string' ? data.summary : undefined,
     };
   }
@@ -99,6 +111,7 @@ export function parseToolDiagramPayload(toolName: string, output: unknown): Diag
 export function parseCodeBlockDiagramPayload(language: string, code: string): DiagramPayload | null {
   const normalizedLanguage = language.trim().toLowerCase();
   if (normalizedLanguage === 'mermaid') {
+    if (isMermaidMindmapSource(code)) return null;
     return { kind: 'mermaid', source: code };
   }
   if (normalizedLanguage === 'dot' || normalizedLanguage === 'graphviz') {
