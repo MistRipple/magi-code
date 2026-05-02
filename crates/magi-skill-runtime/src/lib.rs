@@ -1039,6 +1039,7 @@ mod tests {
             task_id: Some(magi_core::TaskId::new("td-skill")),
             session_id: Some(magi_core::SessionId::new("ss-skill")),
             workspace_id: Some(magi_core::WorkspaceId::new("ws-skill")),
+            working_directory: None,
         };
 
         let outcome = runtime.dispatch_observed(

@@ -30,7 +30,7 @@ use magi_tool_runtime::{
     ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
 };
 use serde_json::Value;
-use std::{collections::HashMap, thread};
+use std::{collections::HashMap, path::PathBuf, thread};
 
 #[derive(Clone, Debug)]
 pub(crate) struct PublishedSessionTurnItem {
@@ -597,6 +597,7 @@ pub(crate) fn append_session_tool_call_items_batch(
     skill_runtime: Option<&SkillRuntime>,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
+    workspace_root_path: Option<PathBuf>,
     tool_calls: &[ChatToolCall],
     messages: &mut Vec<ChatMessage>,
     write_allowed: impl Fn() -> bool,
@@ -629,6 +630,7 @@ pub(crate) fn append_session_tool_call_items_batch(
         tool_calls,
         session_id,
         workspace_id,
+        workspace_root_path.as_ref(),
     );
     for (tool_call, (tool_result, tool_status)) in tool_calls.iter().zip(tool_results.into_iter()) {
         if !write_allowed() {
@@ -691,6 +693,7 @@ fn execute_session_turn_tool_call_batch(
     tool_calls: &[ChatToolCall],
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
+    workspace_root_path: Option<&PathBuf>,
 ) -> Vec<(String, ExecutionResultStatus)> {
     let parsed_arguments = tool_calls
         .iter()
@@ -719,6 +722,7 @@ fn execute_session_turn_tool_call_batch(
                         &tool_calls[tool_index],
                         session_id,
                         workspace_id,
+                        workspace_root_path,
                     ));
                 }
             }
@@ -740,6 +744,7 @@ fn execute_session_turn_tool_call_batch(
                                         tool_call,
                                         session_id,
                                         workspace_id,
+                                        workspace_root_path,
                                     )
                                 }),
                             )
@@ -791,6 +796,7 @@ fn execute_session_turn_tool_call(
     tool_call: &ChatToolCall,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
+    workspace_root_path: Option<&PathBuf>,
 ) -> (String, ExecutionResultStatus) {
     let Some(registry) = tool_registry else {
         return (
@@ -839,6 +845,7 @@ fn execute_session_turn_tool_call(
             task_id: None,
             session_id: Some(session_id.clone()),
             workspace_id: workspace_id.clone(),
+            working_directory: workspace_root_path.cloned(),
         },
         &ToolExecutionPolicy::default(),
     );
@@ -966,6 +973,7 @@ mod tests {
             &call,
             &SessionId::new("session-1"),
             &None,
+            None,
         );
 
         assert_eq!(status, ExecutionResultStatus::Failed);
@@ -1009,6 +1017,7 @@ mod tests {
             &call,
             &SessionId::new("session-1"),
             &None,
+            None,
         );
 
         assert_eq!(status, ExecutionResultStatus::Succeeded);
@@ -1040,6 +1049,7 @@ mod tests {
             &call,
             &SessionId::new("session-1"),
             &None,
+            None,
         );
 
         assert_eq!(status, ExecutionResultStatus::Failed);
@@ -1130,6 +1140,7 @@ mod tests {
             None,
             &session_id,
             &workspace_id,
+            None,
             &tool_calls,
             &mut messages,
             || true,

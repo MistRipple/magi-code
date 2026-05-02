@@ -37,8 +37,12 @@ use magi_orchestrator::{
 };
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
 use magi_tool_runtime::ToolRegistry;
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use magi_workspace::WorkspaceStore;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 
 #[derive(Clone, Debug)]
 pub enum ShadowTaskExecutionPlan {
@@ -406,6 +410,7 @@ pub struct ShadowTaskDispatcher {
     knowledge_persist_callback: Option<Arc<dyn Fn() + Send + Sync>>,
     settings_store: Option<Arc<crate::settings_store::SettingsStore>>,
     context_runtime: Option<Arc<ContextRuntime>>,
+    workspace_registry: Option<Arc<WorkspaceStore>>,
     tool_registry: Option<ToolRegistry>,
     skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     /// 强制同步执行 dispatch，用于普通模式的同步 for 循环（设计 §1.3）。
@@ -445,6 +450,7 @@ impl ShadowTaskDispatcher {
             knowledge_persist_callback: None,
             settings_store: None,
             context_runtime: None,
+            workspace_registry: None,
             tool_registry: None,
             skill_runtime: None,
             force_sync_dispatch: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -489,6 +495,11 @@ impl ShadowTaskDispatcher {
 
     pub fn with_context_runtime(mut self, runtime: Arc<ContextRuntime>) -> Self {
         self.context_runtime = Some(runtime);
+        self
+    }
+
+    pub fn with_workspace_registry(mut self, registry: Arc<WorkspaceStore>) -> Self {
+        self.workspace_registry = Some(registry);
         self
     }
 
@@ -712,6 +723,16 @@ impl ShadowTaskDispatcher {
             definitions.push(skill_apply_tool_definition());
         }
         definitions
+    }
+
+    fn resolve_workspace_root_path(&self, workspace_id: &Option<WorkspaceId>) -> Option<PathBuf> {
+        let workspace_id = workspace_id.as_ref()?;
+        self.workspace_registry
+            .as_ref()?
+            .workspaces()
+            .into_iter()
+            .find(|workspace| workspace.workspace_id == *workspace_id)
+            .map(|workspace| PathBuf::from(workspace.root_path.as_str()))
     }
 
     fn assemble_prompt(
@@ -961,6 +982,7 @@ impl ShadowTaskDispatcher {
 
         let (prompt, context_summary) = self.assemble_prompt(task, session_id, workspace_id);
         let prompt = self.apply_skill_prompt_injections(prompt, skill_name.as_deref());
+        let workspace_root_path = self.resolve_workspace_root_path(workspace_id);
 
         let tools = if use_tools {
             let tool_defs = self.build_tool_definitions();
@@ -995,6 +1017,7 @@ impl ShadowTaskDispatcher {
             worker_id,
             context_summary,
             system_prompt,
+            workspace_root_path,
         })
     }
 

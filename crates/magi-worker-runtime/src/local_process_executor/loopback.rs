@@ -57,6 +57,7 @@ pub fn execute_intent_with_drivers(
         task_id: Some(intent.task_id.clone()),
         session_id: intent.session_id.clone(),
         workspace_id: intent.workspace_id.clone(),
+        working_directory: None,
     };
 
     let mut tool_invocations = Vec::new();
@@ -152,6 +153,7 @@ pub fn execute_intent_step_with_drivers(
         task_id: Some(intent.task_id.clone()),
         session_id: intent.session_id.clone(),
         workspace_id: intent.workspace_id.clone(),
+        working_directory: None,
     };
     let step = intent.steps.get(step_index).ok_or_else(|| {
         WorkerExecutorFailure::remote_business(format!(

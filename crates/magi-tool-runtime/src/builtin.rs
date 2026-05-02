@@ -72,15 +72,15 @@ impl BuiltinTool for NormalizedBuiltinTool {
 
     fn execute(&self, input: &str, context: &ToolExecutionContext) -> String {
         match self.name {
-            BuiltinToolName::FileRead => execute_file_read(input),
-            BuiltinToolName::FileWrite => execute_file_write(input),
-            BuiltinToolName::FilePatch => execute_file_patch(input),
-            BuiltinToolName::FileRemove => execute_file_remove(input),
-            BuiltinToolName::FileMkdir => execute_file_mkdir(input),
-            BuiltinToolName::FileCopy => execute_file_copy(input),
-            BuiltinToolName::FileMove => execute_file_move(input),
-            BuiltinToolName::SearchText => execute_search_text(input),
-            BuiltinToolName::SearchSemantic => execute_search_semantic(input),
+            BuiltinToolName::FileRead => execute_file_read(input, context),
+            BuiltinToolName::FileWrite => execute_file_write(input, context),
+            BuiltinToolName::FilePatch => execute_file_patch(input, context),
+            BuiltinToolName::FileRemove => execute_file_remove(input, context),
+            BuiltinToolName::FileMkdir => execute_file_mkdir(input, context),
+            BuiltinToolName::FileCopy => execute_file_copy(input, context),
+            BuiltinToolName::FileMove => execute_file_move(input, context),
+            BuiltinToolName::SearchText => execute_search_text(input, context),
+            BuiltinToolName::SearchSemantic => execute_search_semantic(input, context),
             BuiltinToolName::ShellExec => execute_shell_exec(input, context),
             BuiltinToolName::ProcessLaunch => execute_process_launch(input, context),
             BuiltinToolName::ProcessRead => execute_process_read(input, context),
@@ -203,7 +203,33 @@ pub(crate) fn resolve_path(input: &str) -> Result<PathBuf, String> {
     }
 }
 
-fn execute_file_read(input: &str) -> String {
+fn context_working_directory(context: &ToolExecutionContext) -> Result<PathBuf, String> {
+    context
+        .working_directory
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| "无法解析当前工作目录".to_string())
+}
+
+pub(crate) fn resolve_path_with_context(
+    input: &str,
+    context: &ToolExecutionContext,
+) -> Result<PathBuf, String> {
+    let path = PathBuf::from(input);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    let cwd = context_working_directory(context)?;
+    if path
+        .components()
+        .all(|component| matches!(component, std::path::Component::CurDir))
+    {
+        return Ok(cwd);
+    }
+    Ok(cwd.join(path))
+}
+
+fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
     let request = parse_json_object(input);
     let path_input = match required_string_or_raw(
         input,
@@ -222,7 +248,7 @@ fn execute_file_read(input: &str) -> String {
         .unwrap_or(64 * 1024)
         .max(1);
 
-    let path = match resolve_path(&path_input) {
+    let path = match resolve_path_with_context(&path_input, context) {
         Ok(path) => path,
         Err(error) => return builtin_error("file_read", error),
     };
@@ -286,7 +312,7 @@ fn execute_file_read(input: &str) -> String {
     .to_string()
 }
 
-fn execute_search_text(input: &str) -> String {
+fn execute_search_text(input: &str, context: &ToolExecutionContext) -> String {
     let request = parse_json_object(input);
     let query = match required_string_or_raw(
         input,
@@ -302,7 +328,7 @@ fn execute_search_text(input: &str) -> String {
         .as_ref()
         .and_then(|object| field_string(object, &["root", "path", "workspace"]))
         .unwrap_or_else(|| ".".to_string());
-    let root = match resolve_path(&root_input) {
+    let root = match resolve_path_with_context(&root_input, context) {
         Ok(path) => path,
         Err(error) => return builtin_error("search_text", error),
     };
@@ -383,13 +409,13 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
         .as_ref()
         .and_then(|object| field_string(object, &["cwd", "working_directory", "workdir"]));
     let cwd = match cwd_input {
-        Some(value) => match resolve_path(&value) {
+        Some(value) => match resolve_path_with_context(&value, context) {
             Ok(path) => path,
             Err(error) => return builtin_error("shell_exec", error),
         },
-        None => match std::env::current_dir() {
+        None => match context_working_directory(context) {
             Ok(path) => path,
-            Err(error) => return builtin_error("shell_exec", format!("无法解析当前目录: {error}")),
+            Err(error) => return builtin_error("shell_exec", error),
         },
     };
     let shell = request
@@ -522,15 +548,13 @@ fn execute_process_launch_with_surface(
         .as_ref()
         .and_then(|object| field_string(object, &["cwd", "working_directory", "workdir"]));
     let cwd = match cwd_input {
-        Some(value) => match resolve_path(&value) {
+        Some(value) => match resolve_path_with_context(&value, context) {
             Ok(path) => path,
             Err(error) => return builtin_error(surface_tool, error),
         },
-        None => match std::env::current_dir() {
+        None => match context_working_directory(context) {
             Ok(path) => path,
-            Err(error) => {
-                return builtin_error(surface_tool, format!("无法解析当前目录: {error}"));
-            }
+            Err(error) => return builtin_error(surface_tool, error),
         },
     };
     let shell = request
@@ -1189,7 +1213,7 @@ fn infer_process_mode(query: &Option<String>) -> &'static str {
     if query.is_some() { "query" } else { "pid" }
 }
 
-fn execute_file_write(input: &str) -> String {
+fn execute_file_write(input: &str, context: &ToolExecutionContext) -> String {
     let request = match parse_json_object(input) {
         Some(obj) => obj,
         None => {
@@ -1209,7 +1233,7 @@ fn execute_file_write(input: &str) -> String {
         None => return builtin_error("file_write", "缺少 content 字段"),
     };
 
-    let path = match resolve_path(&path_input) {
+    let path = match resolve_path_with_context(&path_input, context) {
         Ok(p) => p,
         Err(e) => return builtin_error("file_write", e),
     };
@@ -1253,7 +1277,7 @@ fn execute_file_write(input: &str) -> String {
     .to_string()
 }
 
-fn execute_file_patch(input: &str) -> String {
+fn execute_file_patch(input: &str, context: &ToolExecutionContext) -> String {
     let request = match parse_json_object(input) {
         Some(obj) => obj,
         None => return builtin_error("file_patch", "输入必须为 JSON 对象"),
@@ -1263,7 +1287,7 @@ fn execute_file_patch(input: &str) -> String {
         Some(p) => p,
         None => return builtin_error("file_patch", "缺少 path 字段"),
     };
-    let path = match resolve_path(&path_input) {
+    let path = match resolve_path_with_context(&path_input, context) {
         Ok(p) => p,
         Err(e) => return builtin_error("file_patch", e),
     };
@@ -1356,7 +1380,7 @@ fn execute_file_patch(input: &str) -> String {
     .to_string()
 }
 
-fn execute_file_remove(input: &str) -> String {
+fn execute_file_remove(input: &str, context: &ToolExecutionContext) -> String {
     let request = parse_json_object(input);
     let path_input = match required_string_or_raw(
         input,
@@ -1369,7 +1393,7 @@ fn execute_file_remove(input: &str) -> String {
         Err(error) => return error,
     };
 
-    let path = match resolve_path(&path_input) {
+    let path = match resolve_path_with_context(&path_input, context) {
         Ok(p) => p,
         Err(e) => return builtin_error("file_remove", e),
     };
@@ -1410,7 +1434,7 @@ fn execute_file_remove(input: &str) -> String {
     .to_string()
 }
 
-fn execute_file_mkdir(input: &str) -> String {
+fn execute_file_mkdir(input: &str, context: &ToolExecutionContext) -> String {
     let request = parse_json_object(input);
     let path_input = match required_string_or_raw(
         input,
@@ -1423,7 +1447,7 @@ fn execute_file_mkdir(input: &str) -> String {
         Err(error) => return error,
     };
 
-    let path = match resolve_path(&path_input) {
+    let path = match resolve_path_with_context(&path_input, context) {
         Ok(p) => p,
         Err(e) => return builtin_error("file_mkdir", e),
     };
@@ -1461,7 +1485,7 @@ fn execute_file_mkdir(input: &str) -> String {
     .to_string()
 }
 
-fn execute_file_copy(input: &str) -> String {
+fn execute_file_copy(input: &str, context: &ToolExecutionContext) -> String {
     let request = match parse_json_object(input) {
         Some(obj) => obj,
         None => {
@@ -1481,11 +1505,11 @@ fn execute_file_copy(input: &str) -> String {
         None => return builtin_error("file_copy", "缺少 destination 字段"),
     };
 
-    let src = match resolve_path(&src_input) {
+    let src = match resolve_path_with_context(&src_input, context) {
         Ok(p) => p,
         Err(e) => return builtin_error("file_copy", e),
     };
-    let dst = match resolve_path(&dst_input) {
+    let dst = match resolve_path_with_context(&dst_input, context) {
         Ok(p) => p,
         Err(e) => return builtin_error("file_copy", e),
     };
@@ -1547,7 +1571,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn execute_file_move(input: &str) -> String {
+fn execute_file_move(input: &str, context: &ToolExecutionContext) -> String {
     let request = match parse_json_object(input) {
         Some(obj) => obj,
         None => {
@@ -1567,11 +1591,11 @@ fn execute_file_move(input: &str) -> String {
         None => return builtin_error("file_move", "缺少 destination 字段"),
     };
 
-    let src = match resolve_path(&src_input) {
+    let src = match resolve_path_with_context(&src_input, context) {
         Ok(p) => p,
         Err(e) => return builtin_error("file_move", e),
     };
-    let dst = match resolve_path(&dst_input) {
+    let dst = match resolve_path_with_context(&dst_input, context) {
         Ok(p) => p,
         Err(e) => return builtin_error("file_move", e),
     };
@@ -2106,7 +2130,7 @@ fn validate_graph_payload(value: &Value) -> bool {
 // search.semantic — 基于关键词拆分的语义代码检索
 // ══════════════════════════════════════════════════════════════════════════════
 
-fn execute_search_semantic(input: &str) -> String {
+fn execute_search_semantic(input: &str, context: &ToolExecutionContext) -> String {
     let request = parse_json_object(input);
     let query = match required_string_or_raw(
         input,
@@ -2123,7 +2147,7 @@ fn execute_search_semantic(input: &str) -> String {
         .as_ref()
         .and_then(|obj| field_string(obj, &["root", "dir", "directory"]))
         .unwrap_or_else(|| {
-            std::env::current_dir()
+            context_working_directory(context)
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| ".".to_string())
         });
@@ -2133,7 +2157,7 @@ fn execute_search_semantic(input: &str) -> String {
         .unwrap_or(10)
         .clamp(1, 50);
 
-    let root_path = match resolve_path(&root) {
+    let root_path = match resolve_path_with_context(&root, context) {
         Ok(p) => p,
         Err(e) => return builtin_error("search_semantic", e),
     };

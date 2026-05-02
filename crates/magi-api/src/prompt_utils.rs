@@ -21,6 +21,12 @@ pub(crate) fn prepend_session_instructions(
     format!("{}\n\n{}", sections.join("\n\n"), prompt)
 }
 
+pub(crate) fn workspace_context_system_prompt(root_path: &str) -> String {
+    format!(
+        "当前工作区根目录是 `{root_path}`。当用户、任务或 worker 提到“当前项目”、“当前工程”、“当前仓库”、“本项目”或 current project/repo/codebase 时，默认指这个工作区。需要分析当前项目时，必须优先使用可用工具读取该工作区的目录、README、配置和关键源码，不要要求用户手动粘贴项目结构。工具未显式传 cwd/root/path 的相对路径均应按该工作区根目录理解。"
+    )
+}
+
 pub(crate) fn normalize_model_visible_content(content: String) -> String {
     let content = content
         .strip_prefix("shadow-model::")

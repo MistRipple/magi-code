@@ -431,6 +431,7 @@ mod tests {
             )
             .with_model_bridge_client(model_bridge_client)
             .with_context_runtime(context_runtime_for_dispatcher)
+            .with_workspace_registry(state.workspace_registry.clone())
             .with_tool_registry(tool_registry_for_dispatcher),
         );
         let runner_manager = RunnerManager::with_dispatcher_and_worker_catalog(

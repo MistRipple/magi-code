@@ -1,6 +1,9 @@
 use crate::{
     errors::ApiError,
-    prompt_utils::{normalize_model_stream_preview_content, normalize_model_visible_content},
+    prompt_utils::{
+        normalize_model_stream_preview_content, normalize_model_visible_content,
+        workspace_context_system_prompt,
+    },
     session_turn_writeback::{
         append_session_tool_call_items_batch, append_session_turn_error_item,
         append_session_turn_item, publish_current_session_turn_item_event,
@@ -20,7 +23,7 @@ use magi_event_bus::InMemoryEventBus;
 use magi_session_store::{CanonicalTurnItemKind, SessionStore};
 use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 const MAX_TOOL_CALL_ROUNDS: usize = 8;
 const MAX_SESSION_CONTEXT_MESSAGES: usize = 12;
@@ -37,6 +40,7 @@ pub struct SessionTurnExecutionRequest {
     pub user_message_id: Option<String>,
     pub placeholder_message_id: Option<String>,
     pub forced_tool_name: Option<String>,
+    pub workspace_root_path: Option<String>,
 }
 
 pub struct SessionTurnExecutionOutput {
@@ -140,13 +144,33 @@ fn build_session_turn_messages(
     if history.len() > MAX_SESSION_CONTEXT_MESSAGES {
         history = history.split_off(history.len() - MAX_SESSION_CONTEXT_MESSAGES);
     }
-    history.push(ChatMessage {
+    let mut messages = workspace_context_messages(request);
+    messages.append(&mut history);
+    messages.push(ChatMessage {
         role: "user".to_string(),
         content: Some(prompt.to_string()),
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
-    history
+    messages
+}
+
+fn workspace_context_messages(request: &SessionTurnExecutionRequest) -> Vec<ChatMessage> {
+    let Some(root_path) = request
+        .workspace_root_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+
+    vec![ChatMessage {
+        role: "system".to_string(),
+        content: Some(workspace_context_system_prompt(root_path)),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    }]
 }
 
 pub(crate) struct SessionTurnExecutionRuntime<'a> {
@@ -572,6 +596,7 @@ fn stream_session_turn_round(
             skill_runtime,
             &request.session_id,
             &request.workspace_id,
+            request.workspace_root_path.as_deref().map(PathBuf::from),
             &parsed.tool_calls,
             messages,
             || request_turn_is_writable(session_store, request),
@@ -816,6 +841,7 @@ mod tests {
             user_message_id: None,
             placeholder_message_id: None,
             forced_tool_name: Some("diagram_render".to_string()),
+            workspace_root_path: None,
         };
         let tools = vec![ChatToolDefinition {
             kind: "function".to_string(),
@@ -890,6 +916,7 @@ mod tests {
             user_message_id: Some("user-placeholder-reuse".to_string()),
             placeholder_message_id: Some("assistant-placeholder-reuse".to_string()),
             forced_tool_name: None,
+            workspace_root_path: None,
         };
         let usage_binding = session_turn_model_usage_binding(false);
         let mut messages = vec![ChatMessage {
@@ -1070,6 +1097,7 @@ mod tests {
             user_message_id: None,
             placeholder_message_id: None,
             forced_tool_name: None,
+            workspace_root_path: None,
         };
         let messages = build_session_turn_messages(&store, &request, &request.prompt);
 
@@ -1090,6 +1118,56 @@ mod tests {
                 "2+3 等于 5。",
                 "请基于上一轮结果，用一句话回答：再加 4 等于几？",
             ]
+        );
+    }
+
+    #[test]
+    fn build_session_turn_messages_injects_workspace_context() {
+        let session_id = SessionId::new("session-workspace-context");
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "workspace context")
+            .expect("session should be created");
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-workspace-context".to_string(),
+                    turn_seq: 1,
+                    accepted_at: ts(1000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("分析一下当前项目".to_string()),
+                    items: Vec::new(),
+                    worker_lanes: Vec::new(),
+                },
+            )
+            .expect("current turn should be stored");
+        let request = SessionTurnExecutionRequest {
+            session_id,
+            turn_id: "turn-workspace-context".to_string(),
+            workspace_id: Some(WorkspaceId::new("workspace-context")),
+            prompt: "分析一下当前项目".to_string(),
+            use_tools: true,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            workspace_root_path: Some("/tmp/current-project".to_string()),
+        };
+
+        let messages = build_session_turn_messages(&store, &request, &request.prompt);
+
+        assert_eq!(messages[0].role, "system");
+        let context = messages[0].content.as_deref().unwrap_or_default();
+        assert!(context.contains("/tmp/current-project"));
+        assert!(context.contains("不要要求用户手动粘贴项目结构"));
+        assert_eq!(
+            messages
+                .last()
+                .and_then(|message| message.content.as_deref()),
+            Some("分析一下当前项目")
         );
     }
 
@@ -1127,6 +1205,7 @@ mod tests {
             user_message_id: Some("user-post-tool-final-item".to_string()),
             placeholder_message_id: Some("placeholder-post-tool-final-item".to_string()),
             forced_tool_name: None,
+            workspace_root_path: None,
         };
 
         let mut pre_tool_stream = session_turn_item(
@@ -1248,6 +1327,7 @@ mod tests {
             user_message_id: Some("user-terminal-duration".to_string()),
             placeholder_message_id: Some("placeholder-terminal-duration".to_string()),
             forced_tool_name: None,
+            workspace_root_path: None,
         };
 
         append_final_item(&event_bus, &store, &request, "最终回复", None, None);

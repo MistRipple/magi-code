@@ -541,6 +541,8 @@ pub struct ToolExecutionContext {
     pub task_id: Option<TaskId>,
     pub session_id: Option<SessionId>,
     pub workspace_id: Option<WorkspaceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1311,6 +1313,80 @@ mod tests {
     }
 
     #[test]
+    fn builtins_use_context_working_directory_for_relative_inputs() {
+        let root = unique_temp_dir("magi-tool-context-cwd");
+        fs::write(root.join("marker.txt"), "workspace-marker").expect("write marker");
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+        let context = ToolExecutionContext {
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        };
+
+        let shell_output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-context-shell"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "test -f marker.txt && printf workspace-ok",
+                    "access_mode": "read_only"
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context.clone(),
+            &ToolExecutionPolicy::default(),
+        );
+        let shell_payload: Value =
+            serde_json::from_str(&shell_output.payload).expect("shell payload should parse");
+        assert_eq!(shell_output.status, ExecutionResultStatus::Succeeded);
+        assert_eq!(shell_payload["stdout"], "workspace-ok");
+
+        let file_output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-context-file-read"),
+                tool_name: BuiltinToolName::FileRead.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: "marker.txt".to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context.clone(),
+            &ToolExecutionPolicy::default(),
+        );
+        let file_payload: Value =
+            serde_json::from_str(&file_output.payload).expect("file payload should parse");
+        assert_eq!(file_output.status, ExecutionResultStatus::Succeeded);
+        assert_eq!(
+            file_payload["path"],
+            root.join("marker.txt").display().to_string()
+        );
+        assert_eq!(file_payload["content"], "workspace-marker");
+
+        let search_output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-context-search"),
+                tool_name: BuiltinToolName::SearchText.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({ "query": "workspace-marker" }).to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context,
+            &ToolExecutionPolicy::default(),
+        );
+        let search_payload: Value =
+            serde_json::from_str(&search_output.payload).expect("search payload should parse");
+        assert_eq!(search_output.status, ExecutionResultStatus::Succeeded);
+        assert_eq!(search_payload["root"], root.display().to_string());
+        assert_eq!(search_payload["returned_matches"], 1);
+    }
+
+    #[test]
     fn shell_exec_blocks_conflicting_write_scope_until_guard_drops() {
         let root = unique_temp_dir("magi-tool-shell-write");
         let governance = Arc::new(GovernanceService::default());
@@ -1323,6 +1399,7 @@ mod tests {
             task_id: Some(TaskId::new("todo-write")),
             session_id: Some(SessionId::new("session-write")),
             workspace_id: Some(WorkspaceId::new("workspace-write")),
+            working_directory: None,
         };
         let guarded_input = ToolExecutionInput {
             tool_call_id: ToolCallId::new("tool-call-shell-write-guard"),
@@ -1390,12 +1467,14 @@ mod tests {
             task_id: Some(TaskId::new("todo-a")),
             session_id: Some(SessionId::new("session-a")),
             workspace_id: Some(WorkspaceId::new("workspace-a")),
+            working_directory: None,
         };
         let other_context = ToolExecutionContext {
             worker_id: None,
             task_id: Some(TaskId::new("todo-b")),
             session_id: Some(SessionId::new("session-b")),
             workspace_id: Some(WorkspaceId::new("workspace-b")),
+            working_directory: None,
         };
         let guarded_input = ToolExecutionInput {
             tool_call_id: ToolCallId::new("tool-call-shell-workdir-guard"),
@@ -1506,6 +1585,7 @@ mod tests {
             task_id: Some(TaskId::new("task-process-launch")),
             session_id: Some(SessionId::new("session-process-launch")),
             workspace_id: Some(WorkspaceId::new("workspace-process-launch")),
+            working_directory: None,
         };
 
         let launch = tool_registry.execute_internal_builtin_with_policy(
@@ -1629,6 +1709,7 @@ mod tests {
             task_id: Some(TaskId::new("task-process-context")),
             session_id: Some(SessionId::new("session-process-context")),
             workspace_id: Some(WorkspaceId::new("workspace-process-context")),
+            working_directory: None,
         };
         let launch = tool_registry.execute_internal_builtin_with_policy(
             ToolExecutionInput {
@@ -1698,18 +1779,21 @@ mod tests {
             task_id: Some(TaskId::new("task-process-owner")),
             session_id: Some(SessionId::new("session-process-owner")),
             workspace_id: Some(WorkspaceId::new("workspace-process-shared")),
+            working_directory: None,
         };
         let workspace_only_context = ToolExecutionContext {
             worker_id: None,
             task_id: Some(TaskId::new("task-process-workspace-only")),
             session_id: None,
             workspace_id: Some(WorkspaceId::new("workspace-process-shared")),
+            working_directory: None,
         };
         let other_session_context = ToolExecutionContext {
             worker_id: None,
             task_id: Some(TaskId::new("task-process-other")),
             session_id: Some(SessionId::new("session-process-other")),
             workspace_id: Some(WorkspaceId::new("workspace-process-shared")),
+            working_directory: None,
         };
 
         let launch = tool_registry.execute_internal_builtin_with_policy(
@@ -1905,6 +1989,7 @@ mod tests {
             task_id: Some(TaskId::new("todo-gov")),
             session_id: Some(SessionId::new("session-gov")),
             workspace_id: Some(WorkspaceId::new("workspace-gov")),
+            working_directory: None,
         };
 
         let ok_output = tool_registry.execute_with_policy(
@@ -2013,6 +2098,7 @@ mod tests {
             task_id: Some(TaskId::new("todo-path-a")),
             session_id: Some(SessionId::new("session-path-a")),
             workspace_id: None,
+            working_directory: None,
         };
         let input_a = ToolExecutionInput {
             tool_call_id: ToolCallId::new("tc-path-a"),
@@ -2039,6 +2125,7 @@ mod tests {
             task_id: Some(TaskId::new("todo-path-b")),
             session_id: Some(SessionId::new("session-path-a")),
             workspace_id: None,
+            working_directory: None,
         };
         let input_b = ToolExecutionInput {
             tool_call_id: ToolCallId::new("tc-path-b"),
@@ -2093,12 +2180,14 @@ mod tests {
             task_id: Some(TaskId::new("t1")),
             session_id: Some(SessionId::new("s1")),
             workspace_id: Some(WorkspaceId::new("ws1")),
+            working_directory: None,
         };
         let ctx_w2 = ToolExecutionContext {
             worker_id: Some(WorkerId::new("w2")),
             task_id: Some(TaskId::new("t2")),
             session_id: Some(SessionId::new("s1")),
             workspace_id: Some(WorkspaceId::new("ws1")),
+            working_directory: None,
         };
 
         // Execute 2 invocations in context w1
@@ -2295,6 +2384,7 @@ mod tests {
             task_id: Some(TaskId::new("td-chain")),
             session_id: Some(SessionId::new("ss-chain")),
             workspace_id: Some(WorkspaceId::new("ws-chain")),
+            working_directory: None,
         };
 
         // 1) Successful file read
@@ -3158,6 +3248,7 @@ mod tests {
             task_id: Some(TaskId::new("task-internal-process")),
             session_id: Some(SessionId::new("session-internal-process")),
             workspace_id: Some(WorkspaceId::new("workspace-internal-process")),
+            working_directory: None,
         };
 
         for (tool_name, input) in [
@@ -3213,6 +3304,7 @@ mod tests {
             task_id: Some(TaskId::new("task-shell-background")),
             session_id: Some(SessionId::new("session-shell-background")),
             workspace_id: Some(WorkspaceId::new("workspace-shell-background")),
+            working_directory: None,
         };
 
         let output = registry.execute_with_policy(
@@ -3249,6 +3341,7 @@ mod tests {
             task_id: Some(TaskId::new("task-file-write-guard")),
             session_id: Some(SessionId::new("session-file-write-guard")),
             workspace_id: Some(WorkspaceId::new("workspace-file-write-guard")),
+            working_directory: None,
         };
         let held_input = ToolExecutionInput {
             tool_call_id: ToolCallId::new("tool-call-file-write-held"),

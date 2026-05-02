@@ -1,7 +1,7 @@
 use crate::{
     BuiltinToolAccessMode, ToolExecutionContext, ToolExecutionInput, ToolExecutionOutput,
     ToolExecutionPolicy, ToolRegistry, WriteProtectionScope,
-    builtin::{field_string, parse_json_object, resolve_path},
+    builtin::{field_string, parse_json_object, resolve_path_with_context},
 };
 use magi_core::{ToolCallId, UtcMillis};
 use magi_governance::{DecisionPhase, GovernanceDecision, GovernanceOutcome};
@@ -199,7 +199,7 @@ impl ToolRegistry {
                 "root",
             ] {
                 if let Some(value) = field_string(object, &[key]) {
-                    if let Ok(path) = resolve_path(&value) {
+                    if let Ok(path) = resolve_path_with_context(&value, context) {
                         paths.push(normalize_path_for_lock(&path));
                     }
                 }
@@ -209,7 +209,7 @@ impl ToolRegistry {
                 if let Some(values) = object.get(key).and_then(Value::as_array) {
                     for value in values {
                         if let Some(path_value) = value.as_str() {
-                            if let Ok(path) = resolve_path(path_value) {
+                            if let Ok(path) = resolve_path_with_context(path_value, context) {
                                 paths.push(normalize_path_for_lock(&path));
                             }
                         }
@@ -225,11 +225,17 @@ impl ToolRegistry {
             request
                 .as_ref()
                 .and_then(|object| field_string(object, &["cwd", "working_directory", "workdir"]))
-                .map(|value| resolve_path(&value).map(|path| normalize_path_for_lock(&path)))
-                .unwrap_or_else(|| {
-                    std::env::current_dir()
+                .map(|value| {
+                    resolve_path_with_context(&value, context)
                         .map(|path| normalize_path_for_lock(&path))
-                        .map_err(|error| error.to_string())
+                })
+                .unwrap_or_else(|| {
+                    context
+                        .working_directory
+                        .clone()
+                        .or_else(|| std::env::current_dir().ok())
+                        .map(|path| normalize_path_for_lock(&path))
+                        .ok_or_else(|| "无法解析当前工作目录".to_string())
                 })
                 .ok()
         } else {

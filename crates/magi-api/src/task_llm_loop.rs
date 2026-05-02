@@ -1,6 +1,9 @@
 use crate::{
     builtin_tool_schema::internal_builtin_tool_rejection_payload,
-    prompt_utils::{normalize_model_stream_preview_content, normalize_model_visible_content},
+    prompt_utils::{
+        normalize_model_stream_preview_content, normalize_model_visible_content,
+        workspace_context_system_prompt,
+    },
     session_turn_writeback::{
         append_session_turn_item_with_task_store, publish_current_session_turn_item_event,
         publish_session_turn_item_event, session_turn_item,
@@ -34,7 +37,7 @@ use magi_tool_runtime::{
     ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
 };
 use magi_usage_authority::UsageCallStatus;
-use std::{sync::Arc, thread};
+use std::{path::PathBuf, sync::Arc, thread};
 
 const MAX_TOOL_CALL_ROUNDS: usize = 8;
 
@@ -60,6 +63,7 @@ pub(crate) struct TaskLlmLoopRequest<'a> {
     pub worker_id: Option<&'a magi_core::WorkerId>,
     pub context_summary: Option<ExecutionContextSummary>,
     pub system_prompt: Option<String>,
+    pub workspace_root_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +145,7 @@ pub(crate) fn run_task_llm_loop(
         worker_id,
         context_summary,
         system_prompt,
+        workspace_root_path,
     } = request;
 
     let mut messages = Vec::new();
@@ -148,6 +153,16 @@ pub(crate) fn run_task_llm_loop(
         messages.push(ChatMessage {
             role: "system".to_string(),
             content: Some(system),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+    }
+    if let Some(root_path) = workspace_root_path.as_ref() {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(workspace_context_system_prompt(
+                &root_path.display().to_string(),
+            )),
             tool_calls: Vec::new(),
             tool_call_id: None,
         });
@@ -367,6 +382,7 @@ pub(crate) fn run_task_llm_loop(
             task,
             session_id,
             workspace_id,
+            workspace_root_path.as_ref(),
             turn_visibility.worker_id.as_ref(),
             &parsed.tool_calls,
         );
@@ -692,6 +708,7 @@ fn execute_task_tool_call_batch(
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
+    workspace_root_path: Option<&PathBuf>,
     worker_id: Option<&magi_core::WorkerId>,
     tool_calls: &[ChatToolCall],
 ) -> Vec<(String, ExecutionResultStatus)> {
@@ -722,6 +739,7 @@ fn execute_task_tool_call_batch(
                         task,
                         session_id,
                         workspace_id,
+                        workspace_root_path,
                         worker_id,
                         &tool_calls[tool_index],
                     ));
@@ -745,6 +763,7 @@ fn execute_task_tool_call_batch(
                                         task,
                                         session_id,
                                         workspace_id,
+                                        workspace_root_path,
                                         worker_id,
                                         tool_call,
                                     )
@@ -798,6 +817,7 @@ fn execute_task_tool_call(
     task: &magi_core::Task,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
+    workspace_root_path: Option<&PathBuf>,
     worker_id: Option<&magi_core::WorkerId>,
     tool_call: &ChatToolCall,
 ) -> (String, ExecutionResultStatus) {
@@ -853,6 +873,7 @@ fn execute_task_tool_call(
             task_id: Some(task.task_id.clone()),
             session_id: Some(session_id.clone()),
             workspace_id: workspace_id.clone(),
+            working_directory: workspace_root_path.cloned(),
         },
         &ToolExecutionPolicy::default(),
     );
@@ -1170,6 +1191,7 @@ mod tests {
             &task,
             &session_id,
             &workspace_id,
+            None,
             Some(&worker_id),
             &call,
         );
@@ -1483,6 +1505,7 @@ mod tests {
             worker_id: None,
             context_summary: None,
             system_prompt: None,
+            workspace_root_path: None,
         });
 
         match outcome {
@@ -1653,6 +1676,7 @@ mod tests {
             worker_id: Some(&worker_id),
             context_summary: None,
             system_prompt: None,
+            workspace_root_path: None,
         });
 
         assert!(

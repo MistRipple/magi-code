@@ -513,6 +513,25 @@ fn normalize_session_turn_decision(
             Some("用户明确请求生成可视化图表，应直接调用 diagram_render。".to_string());
         decision.task_evidence.clear();
     }
+    if !request.deep_task
+        && !matches!(
+            decision.route,
+            SessionTurnRouteDto::Continue | SessionTurnRouteDto::Task
+        )
+        && session_turn_requests_current_project_analysis(request)
+    {
+        decision.route = SessionTurnRouteDto::Execute;
+        decision.task_title = None;
+        decision.execution_goal = None;
+        decision.required_workers.clear();
+        decision.tool_intent = Some(current_project_tool_intent());
+        decision.forced_tool_name = None;
+        decision.confidence = decision.confidence.max(0.94);
+        decision.reason_code = Some("tool_request".to_string());
+        decision.route_reason =
+            Some("用户请求分析当前项目，应直接调用工具读取当前工作区上下文。".to_string());
+        decision.task_evidence.clear();
+    }
     decision
 }
 
@@ -570,6 +589,56 @@ fn session_turn_requests_diagram_render(request: &SessionTurnRequestDto) -> bool
 
 fn diagram_render_tool_intent() -> String {
     "用户请求生成可视化图表。必须直接调用 diagram_render 工具完成图表生成；不要要求用户自己调用工具，也不要只输出工具调用说明。根据用户原始输入选择合适的 kind：流程/步骤/登录流程优先使用 graph 或 flow 的结构化 nodes/edges；如果更适合 Mermaid 或 DOT，也可以使用 mermaid 或 dot。工具完成后只用一句话说明图表已生成。"
+        .to_string()
+}
+
+fn session_turn_requests_current_project_analysis(request: &SessionTurnRequestDto) -> bool {
+    let Some(text) = request.trimmed_text() else {
+        return false;
+    };
+    let normalized = text.to_ascii_lowercase();
+    let has_project_reference = [
+        "当前项目",
+        "当前工程",
+        "当前仓库",
+        "本项目",
+        "这个项目",
+        "项目分析",
+        "代码库",
+        "仓库",
+        "current project",
+        "current repo",
+        "current workspace",
+        "project analysis",
+        "repo analysis",
+        "codebase",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term));
+    if !has_project_reference {
+        return false;
+    }
+    [
+        "分析",
+        "理解",
+        "检查",
+        "审查",
+        "看看",
+        "inspect",
+        "analyze",
+        "analyse",
+        "review",
+        "understand",
+        "examine",
+        "scan",
+        "read",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term))
+}
+
+fn current_project_tool_intent() -> String {
+    "用户要求分析当前项目。必须把当前工作区当作唯一上下文来源，优先使用 shell_exec、file_read、search_text、search_semantic 等工具读取工作区根目录、README、配置文件和关键源码，然后再给出有依据的项目分析。不要要求用户手动提供项目结构，不要只做泛泛猜测。"
         .to_string()
 }
 
@@ -712,6 +781,14 @@ fn submit_regular_session_turn(
         title_seed,
         accepted_at,
     )?;
+    let workspace_root_path = workspace_id.as_ref().and_then(|workspace_id| {
+        state
+            .workspace_registry
+            .workspaces()
+            .into_iter()
+            .find(|workspace| workspace.workspace_id == *workspace_id)
+            .map(|workspace| workspace.root_path.to_string())
+    });
     let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let request_id = request.request_id();
     let user_message_id = request.user_message_id();
@@ -807,6 +884,7 @@ fn submit_regular_session_turn(
             user_message_id: user_message_id.clone(),
             placeholder_message_id: placeholder_message_id.clone(),
             forced_tool_name: decision.forced_tool_name.clone(),
+            workspace_root_path,
         },
         accepted_at,
         decision.route,
@@ -2029,6 +2107,18 @@ mod tests {
 
         assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
         assert!(decision.forced_tool_name.is_none());
+    }
+
+    #[test]
+    fn normalizes_current_project_analysis_to_tool_execution() {
+        let request = session_turn_request("分析一下当前项目");
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert!(decision.forced_tool_name.is_none());
+        let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
+        assert!(tool_intent.contains("当前工作区"));
+        assert!(tool_intent.contains("不要要求用户手动提供项目结构"));
     }
 
     #[tokio::test]
