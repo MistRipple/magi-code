@@ -3,7 +3,7 @@ pub use crate::session_turn_execution::{
     BUSINESS_MODEL_PROVIDER, SessionTurnExecutionOutput, SessionTurnExecutionRequest,
 };
 use crate::{
-    builtin_tool_schema::builtin_tool_definition,
+    builtin_tool_schema::public_builtin_tool_definitions,
     errors::ApiError,
     model_config::NormalizedModelConfig,
     prompt_utils::prepend_session_instructions,
@@ -704,11 +704,9 @@ impl ShadowTaskDispatcher {
         let Some(ref registry) = self.tool_registry else {
             return Vec::new();
         };
-        let mut definitions = registry
-            .builtin_specs()
+        let mut definitions = public_builtin_tool_definitions(registry)
             .into_iter()
-            .filter(|spec| spec.name != SKILL_APPLY_TOOL_NAME)
-            .map(|spec| builtin_tool_definition(&spec.name))
+            .filter(|definition| definition.function.name != SKILL_APPLY_TOOL_NAME)
             .collect::<Vec<_>>();
         if self.skill_runtime.is_some() {
             definitions.push(skill_apply_tool_definition());

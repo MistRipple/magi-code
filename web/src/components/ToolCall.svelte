@@ -2,7 +2,7 @@
   import { untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import FileSpan from './FileSpan.svelte';
-  import MermaidRenderer from './MermaidRenderer.svelte';
+  import DiagramRenderer from './DiagramRenderer.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
   import { vscode } from '../lib/vscode-bridge';
   import { extractLeadingJson } from '../lib/terminal-utils';
@@ -10,6 +10,7 @@
   import type { StandardizedToolResult, ToolPolicyPayload } from '../types/message';
   import { i18n } from '../stores/i18n.svelte';
   import { getCurrentSessionId } from '../stores/messages.svelte';
+  import { diagramSummary, parseToolDiagramPayload } from '../lib/diagram-payload';
 
   interface ErrorDiagnosis {
     category: 'model_input' | 'context_stale' | 'permission' | 'role_constraint' | 'policy' | 'model_output' | 'workspace_write' | 'runtime';
@@ -159,15 +160,10 @@
       'file_remove': 'trash',
       'web_search': 'search',
       'web_fetch': 'globe',
-      'mermaid_diagram': 'git-branch',
+      'diagram_render': 'git-branch',
       'code_search_semantic': 'search',
       'skill_apply': 'skill',
       'project_knowledge_query': 'question',
-      'process_launch': 'terminal',
-      'process_read': 'terminal',
-      'process_write': 'terminal',
-      'process_kill': 'stop',
-      'process_list': 'terminal',
       'code_intel_query': 'search',
       // 后端规范名（LLM 工具调用使用的名称）
       'shell_exec': 'terminal',
@@ -195,7 +191,7 @@
     if (lowerName.includes('delete') || lowerName.includes('remove')) return 'file-minus';
     if (lowerName.includes('process')) return 'terminal';
     if (lowerName.includes('web') || lowerName.includes('fetch') || lowerName.includes('browser')) return 'globe';
-    if (lowerName.includes('mermaid')) return 'git-branch';
+    if (lowerName.includes('diagram') || lowerName.includes('mermaid')) return 'git-branch';
     if (lowerName.includes('task')) return 'document';
     if (lowerName.includes('mcp')) return 'plug';
     return 'tool';
@@ -228,24 +224,13 @@
   const hasOutput = $derived(!!output && !!formatContent(output));
   const hasError = $derived(!!error && !!error.trim());
 
-  // 检查是否为 Mermaid 工具输出
-  const isMermaidTool = $derived(name === 'mermaid_diagram');
-  const mermaidData = $derived.by(() => {
-    if (!isMermaidTool || !output) return null;
-    try {
-      const data = typeof output === 'string' ? JSON.parse(output) : output;
-      if (data && (data.type === 'mermaid' || data.type === 'mermaid_diagram') && data.code) {
-        const rawDiagramType = data.diagramType ?? data.diagram_type ?? '';
-        return {
-          code: data.code as string,
-          title: (data.title || '') as string,
-          diagramType: (typeof rawDiagramType === 'string' ? rawDiagramType : '') as string,
-        };
-      }
-    } catch {
-      // 忽略解析错误
+  const diagramPayload = $derived(parseToolDiagramPayload(name, output));
+  const isDiagramTool = $derived(!!diagramPayload);
+
+  $effect(() => {
+    if (diagramPayload && status === 'success' && !userToggled) {
+      collapsed = false;
     }
-    return null;
   });
 
   const skillApplyPolicy = $derived.by(() => {
@@ -281,15 +266,10 @@
       'file_remove': i18n.t('toolCall.displayName.fileRemove'),
       'web_search': i18n.t('toolCall.displayName.webSearch'),
       'web_fetch': i18n.t('toolCall.displayName.webFetch'),
-      'mermaid_diagram': i18n.t('toolCall.displayName.mermaidDiagram'),
+      'diagram_render': i18n.t('toolCall.displayName.diagramRender'),
       'code_search_semantic': i18n.t('toolCall.displayName.codebaseRetrieval'),
       'skill_apply': 'skill_apply',
       'project_knowledge_query': 'project_knowledge_query',
-      'process_launch': 'process_launch',
-      'process_read': 'process_read',
-      'process_write': 'process_write',
-      'process_kill': 'process_kill',
-      'process_list': 'process_list',
       'code_intel_query': 'code_intel_query',
       'list_files': i18n.t('toolCall.displayName.listFiles'),
       // 后端规范名
@@ -302,7 +282,7 @@
       'file_move': 'file_move',
       'search_text': i18n.t('toolCall.displayName.grepSearch'),
       'search_semantic': i18n.t('toolCall.displayName.codebaseRetrieval'),
-      'process_inspect': 'process_inspect',
+      'process_inspect': i18n.t('toolCall.displayName.processInspect'),
       'diff_preview': 'diff_preview',
       'knowledge_query': 'project_knowledge_query',
     };
@@ -356,23 +336,15 @@
         return typeof args.url === 'string' ? args.url : '';
       case 'web_search':
         return typeof args.query === 'string' ? args.query : '';
-      case 'mermaid_diagram':
+      case 'diagram_render':
         return typeof args.title === 'string' ? args.title : '';
       case 'code_intel_query': {
         const action = typeof args.action === 'string' ? args.action : '';
         const fp = typeof args.filePath === 'string' ? args.filePath : '';
         return action && fp ? `${action} ${fp}` : action || fp;
       }
-      case 'process_launch':
-        return typeof args.command === 'string' ? args.command : '';
-      case 'process_read':
-      case 'process_write':
-      case 'process_kill':
-        return typeof args.terminal_id === 'number' ? String(args.terminal_id) : '';
-      case 'process_list':
-        return typeof args.agent === 'string' ? args.agent : '';
       case 'process_inspect':
-        return typeof args.pid === 'string' ? args.pid : '';
+        return typeof args.pid === 'number' ? String(args.pid) : typeof args.pid === 'string' ? args.pid : '';
       case 'diff_preview':
         return '';
       case 'file_mkdir':
@@ -404,7 +376,7 @@
       ? (isDirectoryView ? i18n.t('toolCall.displayName.viewDirectory') : i18n.t('toolCall.displayName.viewFile'))
       : getToolDisplayName(name)
   );
-  const toolSummary = $derived(getToolSummary(name, input));
+  const toolSummary = $derived(diagramPayload ? diagramSummary(diagramPayload) : getToolSummary(name, input));
 
   // 判断输出内容是否包含 markdown 格式（标题、表格、列表等）
   const outputText = $derived(formatContent(output));
@@ -675,8 +647,8 @@
       {/if}
 
       {#if canExpand && !collapsed}
-        <div class="tool-content">
-          {#if hasInput && !isMermaidTool}
+        <div class="tool-content" class:diagram-content={isDiagramTool}>
+          {#if hasInput && !isDiagramTool}
             <div class="tool-section">
               <div class="section-header">
                 <span class="section-label">{i18n.t('toolCall.section.input')}</span>
@@ -686,13 +658,9 @@
           {/if}
 
           {#if hasOutput}
-            <div class="tool-section">
-              {#if isMermaidTool && mermaidData}
-                <MermaidRenderer
-                  code={mermaidData?.code || ''}
-                  title={mermaidData?.title}
-                  diagramType={mermaidData?.diagramType}
-                />
+            <div class="tool-section diagram-section">
+              {#if diagramPayload}
+                <DiagramRenderer payload={diagramPayload} embedded />
               {:else}
                 <div class="section-header">
                   <span class="section-label">{i18n.t('toolCall.section.output')}</span>
@@ -972,6 +940,11 @@
     transform-origin: top;
   }
 
+  .tool-content.diagram-content {
+    padding: 0;
+    background: var(--code-bg);
+  }
+
   @keyframes slideDown {
     from { opacity: 0; max-height: 0; transform: translateY(-8px); }
     to { opacity: 1; max-height: 500px; transform: translateY(0); }
@@ -979,6 +952,8 @@
 
   .tool-section { margin-top: var(--space-3); }
   .tool-section:first-child { margin-top: 0; }
+  .diagram-section { margin-top: 0; }
+  .tool-content.diagram-content .diagram-section { margin: 0; }
 
   .section-header {
     display: flex;

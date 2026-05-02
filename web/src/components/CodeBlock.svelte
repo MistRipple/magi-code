@@ -1,7 +1,8 @@
 <script lang="ts">
   import hljs from 'highlight.js';
-  import MermaidRenderer from './MermaidRenderer.svelte';
+  import DiagramRenderer from './DiagramRenderer.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { parseCodeBlockDiagramPayload } from '../lib/diagram-payload';
 
   // Props
   interface Props {
@@ -21,9 +22,6 @@
     showCopyButton = true,
     isStreaming = false,
   }: Props = $props();
-
-  // 检测是否是 Mermaid 代码
-  const isMermaid = $derived(language.toLowerCase() === 'mermaid');
 
   // 状态
   let collapsed = $state(false);
@@ -47,6 +45,7 @@
   // 🔧 优化：保留代码缩进，仅移除末尾空格和开头的首个换行符
   const trimmedCode = $derived(code.trimEnd().replace(/^\n/, ''));
   const lines = $derived(trimmedCode.split('\n'));
+  const diagramPayload = $derived(parseCodeBlockDiagramPayload(language, trimmedCode));
 
   // 🔧 计算高亮 HTML
   // 策略：
@@ -111,12 +110,11 @@
   }
 </script>
 
-<div class="code-block" class:collapsed>
-  {#if isMermaid && !isStreaming}
-    <!-- Mermaid 图表渲染 (非流式状态下) -->
-    <MermaidRenderer code={trimmedCode} />
-  {:else}
-    <!-- 普通代码块 (或流式中的 Mermaid) -->
+{#if diagramPayload && !isStreaming}
+  <DiagramRenderer payload={diagramPayload} />
+{:else}
+  <div class="code-block" class:collapsed>
+    <!-- 普通代码块（或流式中的图表代码） -->
     <div class="code-header">
       <button class="header-left" onclick={toggle}>
         <span class="chevron">
@@ -133,7 +131,7 @@
 
         <span class="code-title">
           <span class="lang-name">{langName}</span>
-          {#if isMermaid && isStreaming}
+          {#if diagramPayload && isStreaming}
             <span class="streaming-badge">{i18n.t('codeBlock.streaming')}</span>
           {/if}
           {#if filepath}
@@ -174,8 +172,8 @@
         >{@html highlightedHtml}</code></pre>
       </div>
     {/if}
-  {/if}
-</div>
+  </div>
+{/if}
 
 <style>
   .code-block {

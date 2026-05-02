@@ -92,6 +92,9 @@
   --code-header-bg: var(--surface-2);
   --code-copy-hover-bg: var(--surface-hover);
   --code-line-number-bg: color-mix(in srgb, var(--foreground) 3%, transparent);
+  --diagram-connector: #cbd5e1;
+  --diagram-node-bg: #f8fafc;
+  --diagram-node-text: #111827;
   --dropdown-bg: var(--vscode-dropdown-background, #171d26);
 
   /* 滚动条 */
@@ -298,6 +301,9 @@ body.theme-light,
   --scrollbar-thumb: rgba(15, 23, 42, 0.12);
   --scrollbar-thumb-hover: rgba(15, 23, 42, 0.20);
   --code-line-number-bg: rgba(15, 23, 42, 0.03);
+  --diagram-connector: #475569;
+  --diagram-node-bg: #ffffff;
+  --diagram-node-text: #111827;
 }
 
 body.theme-dark,

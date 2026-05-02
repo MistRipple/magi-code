@@ -19,11 +19,15 @@ try {
 
 function runGoldenReplay(reducer, projection) {
   const cases = [
+    acceptedFirstFrameCase(),
     ordinaryChatCase(),
+    toolFirstCase(),
     singleToolCase(),
     multiToolOutOfOrderCase(),
     failedToolCase(),
     cancelledToolCase(),
+    terminalEmptyAssistantCase(),
+    localFailureCase(),
   ];
 
   for (const testCase of cases) {
@@ -47,7 +51,11 @@ function runGoldenReplay(reducer, projection) {
     );
   }
 
+  assertAcceptedFirstFrameRunning(reducer, projection);
+  assertLocalPendingTurnIsReplacedByAcceptedCanonicalTurn(reducer, projection);
   assertTerminalLateUpsertIsIgnored(reducer, projection);
+  assertTerminalLateTurnStartedIsIgnored(reducer, projection);
+  assertFailedAssistantTextUsesPlainMessageShell(reducer, projection);
 }
 
 function replayLive(reducer, testCase) {
@@ -99,6 +107,134 @@ function assertTerminalLateUpsertIsIgnored(reducer, projection) {
   );
 }
 
+function assertTerminalLateTurnStartedIsIgnored(reducer, projection) {
+  const testCase = acceptedFirstFrameCase();
+  const completed = replayLive(reducer, testCase);
+  const before = projectionSignature(projection.buildCanonicalTimelineProjection(completed));
+  const userItem = user(testCase, 1, '请只回复一句 first frame ok。');
+  const lateRunningAssistant = assistantPlaceholderText(
+    testCase,
+    2,
+    'assistant-placeholder',
+    'running',
+  );
+  const lateAccepted = event(testCase, 0, 'turn_started', {
+    turn: turn(testCase, 'running', [userItem, lateRunningAssistant]),
+    item: lateRunningAssistant,
+  });
+  const result = reducer.reduceCanonicalTurnEvent(completed, lateAccepted);
+  assert.equal(result.error, undefined, 'late accepted running event should not become a protocol error');
+  assert.deepEqual(
+    projectionSignature(projection.buildCanonicalTimelineProjection(result.state)),
+    before,
+    'late accepted running event must not roll terminal assistant text back',
+  );
+}
+
+function assertAcceptedFirstFrameRunning(reducer, projection) {
+  const testCase = acceptedFirstFrameCase();
+  const firstFrame = replayLive(reducer, {
+    ...testCase,
+    events: [testCase.events[0]],
+  });
+  assert.deepEqual(
+    projectionSignature(projection.buildCanonicalTimelineProjection(firstFrame)),
+    [
+      signatureMessage('message', 'user_message', 1, '请只回复一句 first frame ok。'),
+      signatureMessageWithStatus('message', 'assistant_text', 2, '', 'running'),
+    ],
+    'accepted first frame should render an empty running assistant in canonical projection',
+  );
+}
+
+function assertLocalPendingTurnIsReplacedByAcceptedCanonicalTurn(reducer, projection) {
+  const requestMetadata = {
+    requestId: 'request-local-pending',
+    userMessageId: 'user-message',
+    placeholderMessageId: 'assistant-placeholder',
+  };
+  const local = baseCase(
+    'local-pending-turn',
+    'session-golden-local-pending',
+    'turn-local-request-local-pending',
+    10,
+  );
+  const accepted = baseCase(
+    'accepted-replaces-local-pending',
+    local.sessionId,
+    'turn-session-1777600000000',
+    1777600000000,
+  );
+  const localUser = user(local, 1, '本地 pending 应该原位接管。');
+  localUser.metadata = { ...requestMetadata, localOptimistic: true };
+  const localAssistant = assistantPlaceholderText(local, 2, 'assistant-placeholder', 'running');
+  localAssistant.metadata = { ...requestMetadata, localOptimistic: true };
+  const acceptedUser = user(accepted, 1, localUser.content);
+  acceptedUser.metadata = requestMetadata;
+  const acceptedAssistant = assistantPlaceholderText(accepted, 2, 'assistant-placeholder', 'running');
+  acceptedAssistant.metadata = requestMetadata;
+
+  let state = reducer.createCanonicalTurnReducerState(local.sessionId);
+  let result = reducer.reduceCanonicalTurnEvent(state, event(local, 0, 'turn_started', {
+    turn: {
+      ...turn(local, 'running', [localUser, localAssistant]),
+      metadata: { requestId: requestMetadata.requestId, localOptimistic: true },
+    },
+    item: localAssistant,
+  }));
+  assert.equal(result.error, undefined, 'local pending canonical event should reduce');
+  state = result.state;
+  assert.deepEqual(
+    projectionSignature(projection.buildCanonicalTimelineProjection(state)),
+    [
+      signatureMessage('message', 'user_message', 1, localUser.content),
+      signatureMessageWithStatus('message', 'assistant_text', 2, '', 'running'),
+    ],
+    'local pending canonical turn should render before backend accepted',
+  );
+
+  result = reducer.reduceCanonicalTurnEvent(state, event(accepted, 1, 'turn_started', {
+    turn: turn(accepted, 'running', [acceptedUser, acceptedAssistant]),
+    item: acceptedAssistant,
+  }));
+  assert.equal(result.error, undefined, 'accepted canonical event should replace local pending');
+  assert.equal(result.state.turns.length, 1, 'local optimistic turn must not remain as a duplicate');
+  assert.equal(result.state.turns[0].turnId, accepted.turnId);
+  assert.deepEqual(
+    projectionSignature(projection.buildCanonicalTimelineProjection(result.state)),
+    [
+      signatureMessage('message', 'user_message', 1, acceptedUser.content),
+      signatureMessageWithStatus('message', 'assistant_text', 2, '', 'running'),
+    ],
+    'accepted canonical turn should keep the same visible timeline shape',
+  );
+}
+
+function assertFailedAssistantTextUsesPlainMessageShell(reducer, projection) {
+  const c = baseCase('failed-assistant-text', 'session-golden-failed-assistant', 'turn-golden-failed-assistant', 6000);
+  const userItem = user(c, 1, '请调用工具后回答。');
+  const failedAssistant = assistantText(c, 2, 'assistant-error', '模型在工具调用后未返回最终回复', 'failed');
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'failed', [userItem, failedAssistant], { completedAt: 6100, responseDurationMs: 100 }),
+  ]);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  assert.ok(projectionValue, 'failed assistant projection should exist');
+  const assistantArtifact = projectionValue.artifacts.find((artifact) => (
+    artifact.message.metadata?.turnItemId === 'assistant-error'
+  ));
+  assert.ok(assistantArtifact, 'failed assistant artifact should exist');
+  assert.equal(
+    assistantArtifact.message.type,
+    'text',
+    'failed assistant_text should render as normal assistant text, not an error card shell',
+  );
+  assert.equal(
+    assistantArtifact.message.blocks,
+    undefined,
+    'plain assistant_text should not be wrapped in a text block',
+  );
+}
+
 function ordinaryChatCase() {
   const c = baseCase('ordinary-chat', 'session-golden-chat', 'turn-golden-chat', 1000);
   const userItem = user(c, 1, '多场景验证 1：请用一句话回复 normal chat ok。');
@@ -117,6 +253,24 @@ function ordinaryChatCase() {
   return c;
 }
 
+function acceptedFirstFrameCase() {
+  const c = baseCase('accepted-first-frame', 'session-golden-first-frame', 'turn-golden-first-frame', 1500);
+  const userItem = user(c, 1, '请只回复一句 first frame ok。');
+  const assistantPlaceholder = assistantPlaceholderText(c, 2, 'assistant-placeholder', 'running');
+  const assistantStreaming = assistantText(c, 2, 'assistant-placeholder', 'first', 'running');
+  const assistantCompleted = assistantText(c, 2, 'assistant-placeholder', 'first frame ok', 'completed');
+  c.events = [
+    event(c, 1, 'turn_started', { turn: turn(c, 'running', [userItem, assistantPlaceholder]), item: assistantPlaceholder }),
+    event(c, 2, 'turn_item_upsert', { turn: turn(c, 'running', [assistantStreaming]), item: assistantStreaming }),
+    event(c, 3, 'turn_completed', { turn: turn(c, 'completed', [userItem, assistantCompleted], { completedAt: 1600, responseDurationMs: 100 }) }),
+  ];
+  c.expected = [
+    signatureMessage('message', 'user_message', 1, userItem.content),
+    signatureMessage('message', 'assistant_text', 2, assistantCompleted.content),
+  ];
+  return c;
+}
+
 function singleToolCase() {
   const c = baseCase('single-tool', 'session-golden-single-tool', 'turn-golden-single-tool', 2000);
   const userItem = user(c, 1, '多场景验证 2：请使用 shell 工具运行 pwd，然后用一句话说明当前目录。');
@@ -130,6 +284,28 @@ function singleToolCase() {
     event(c, 3, 'turn_item_upsert', { turn: turn(c, 'running', [toolRunning]), item: toolRunning }),
     event(c, 4, 'turn_item_upsert', { turn: turn(c, 'running', [toolCompleted]), item: toolCompleted }),
     event(c, 5, 'turn_completed', { turn: turn(c, 'completed', [userItem, phaseItem, toolCompleted, assistant], { completedAt: 2100, responseDurationMs: 100 }) }),
+  ];
+  c.expected = [
+    signatureMessage('message', 'user_message', 1, userItem.content),
+    signatureTool(3, 'shell_exec', 'success'),
+    signatureMessage('message', 'assistant_text', 4, assistant.content),
+  ];
+  return c;
+}
+
+function toolFirstCase() {
+  const c = baseCase('tool-first', 'session-golden-tool-first', 'turn-golden-tool-first', 1800);
+  const userItem = user(c, 1, '请直接用 shell 运行 printf tool-first。');
+  const assistantPlaceholder = assistantPlaceholderText(c, 2, 'assistant-placeholder', 'running');
+  const retiredPlaceholder = hiddenAssistantPlaceholderText(c, 2, 'assistant-placeholder', 'completed');
+  const toolRunning = tool(c, 3, 'tool-first', 'call-tool-first', 'printf tool-first', 'running');
+  const toolCompleted = tool(c, 3, 'tool-first', 'call-tool-first', 'printf tool-first', 'completed', { stdout: 'tool-first' });
+  const assistant = assistantText(c, 4, 'assistant-final', '工具输出是 tool-first。', 'completed');
+  c.events = [
+    event(c, 1, 'turn_started', { turn: turn(c, 'running', [userItem, assistantPlaceholder]), item: assistantPlaceholder }),
+    event(c, 2, 'turn_item_upsert', { turn: turn(c, 'running', [retiredPlaceholder, toolRunning]), item: toolRunning }),
+    event(c, 3, 'turn_item_upsert', { turn: turn(c, 'running', [toolCompleted]), item: toolCompleted }),
+    event(c, 4, 'turn_completed', { turn: turn(c, 'completed', [userItem, retiredPlaceholder, toolCompleted, assistant], { completedAt: 1900, responseDurationMs: 100 }) }),
   ];
   c.expected = [
     signatureMessage('message', 'user_message', 1, userItem.content),
@@ -209,6 +385,41 @@ function cancelledToolCase() {
   return c;
 }
 
+function terminalEmptyAssistantCase() {
+  const c = baseCase('terminal-empty-assistant', 'session-golden-empty-terminal', 'turn-golden-empty-terminal', 6000);
+  const userItem = user(c, 1, '请发送一个空终态校验。');
+  const assistantPending = assistantPlaceholderText(c, 2, 'assistant-placeholder', 'running');
+  const assistantEmptyCompleted = assistantPlaceholderText(c, 2, 'assistant-placeholder', 'completed');
+  assistantEmptyCompleted.content = '';
+  c.events = [
+    event(c, 1, 'turn_started', { turn: turn(c, 'running', [userItem, assistantPending]), item: assistantPending }),
+    event(c, 2, 'turn_completed', { turn: turn(c, 'completed', [userItem, assistantEmptyCompleted], { completedAt: 6100, responseDurationMs: 100 }) }),
+  ];
+  c.expected = [
+    signatureMessage('message', 'user_message', 1, userItem.content),
+  ];
+  return c;
+}
+
+function localFailureCase() {
+  const c = baseCase('local-failure-settles', 'session-golden-local-failure', 'turn-golden-local-failure', 7000);
+  const userItem = user(c, 1, '请模拟发送失败。');
+  const assistantPending = assistantPlaceholderText(c, 2, 'assistant-placeholder', 'running');
+  const assistantFailed = item(c, 2, 'assistant-placeholder', 'assistant_text', 'failed', {
+    title: '发送失败',
+    content: '发送消息失败',
+  });
+  c.events = [
+    event(c, 1, 'turn_started', { turn: turn(c, 'running', [userItem, assistantPending]), item: assistantPending }),
+    event(c, 2, 'turn_completed', { turn: turn(c, 'failed', [userItem, assistantFailed], { completedAt: 7100, responseDurationMs: 100 }) }),
+  ];
+  c.expected = [
+    signatureMessage('message', 'user_message', 1, userItem.content),
+    signatureMessage('message', 'assistant_text', 2, '发送消息失败'),
+  ];
+  return c;
+}
+
 function baseCase(name, sessionId, turnId, turnSeq) {
   return { name, sessionId, turnId, turnSeq, events: [], expected: [] };
 }
@@ -277,6 +488,21 @@ function assistantText(c, itemSeq, itemId, content, status) {
   return item(c, itemSeq, itemId, 'assistant_text', status, { content, title: '最终回复' });
 }
 
+function assistantPlaceholderText(c, itemSeq, itemId, status) {
+  return item(c, itemSeq, itemId, 'assistant_text', status, { title: '生成回复' });
+}
+
+function hiddenAssistantPlaceholderText(c, itemSeq, itemId, status) {
+  return item(c, itemSeq, itemId, 'assistant_text', status, {
+    title: '生成回复',
+    visibility: {
+      renderable: false,
+      threadVisible: false,
+      workerVisible: false,
+    },
+  });
+}
+
 function tool(c, itemSeq, itemId, callId, command, status, result = undefined) {
   const failed = status === 'failed' || status === 'cancelled';
   const toolCall = {
@@ -294,12 +520,16 @@ function tool(c, itemSeq, itemId, callId, command, status, result = undefined) {
 }
 
 function signatureMessage(kind, itemKind, itemSeq, content) {
+  return signatureMessageWithStatus(kind, itemKind, itemSeq, content, 'complete');
+}
+
+function signatureMessageWithStatus(kind, itemKind, itemSeq, content, status) {
   return {
     kind,
     itemKind,
     itemSeq,
     content,
-    status: 'complete',
+    status,
     toolName: undefined,
     hasToolResult: false,
   };

@@ -3,7 +3,10 @@ use magi_core::{
     UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventCategory, EventContext, EventEnvelope, InMemoryEventBus};
-use magi_governance::{GovernanceDecision, GovernanceService, ToolExecutionRequest, ToolKind};
+use magi_governance::{
+    DecisionPhase, GovernanceDecision, GovernanceOutcome, GovernanceService, ToolExecutionRequest,
+    ToolKind,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -43,7 +46,7 @@ pub enum BuiltinToolName {
     WebSearch,
     WebFetch,
     // ── 可视化 ──
-    MermaidDiagram,
+    DiagramRender,
     // ── 知识库 ──
     KnowledgeQuery,
 }
@@ -69,7 +72,7 @@ impl BuiltinToolName {
         Self::DiffPreview,
         Self::WebSearch,
         Self::WebFetch,
-        Self::MermaidDiagram,
+        Self::DiagramRender,
         Self::KnowledgeQuery,
     ];
 
@@ -94,7 +97,7 @@ impl BuiltinToolName {
             Self::DiffPreview => "diff_preview",
             Self::WebSearch => "web_search",
             Self::WebFetch => "web_fetch",
-            Self::MermaidDiagram => "mermaid_diagram",
+            Self::DiagramRender => "diagram_render",
             Self::KnowledgeQuery => "knowledge_query",
         }
     }
@@ -120,7 +123,7 @@ impl BuiltinToolName {
             "diff_preview" => Some(Self::DiffPreview),
             "web_search" => Some(Self::WebSearch),
             "web_fetch" => Some(Self::WebFetch),
-            "mermaid_diagram" => Some(Self::MermaidDiagram),
+            "diagram_render" => Some(Self::DiagramRender),
             "knowledge_query" | "project_knowledge_query" => Some(Self::KnowledgeQuery),
             _ => None,
         }
@@ -138,6 +141,17 @@ impl BuiltinToolName {
         )
     }
 
+    pub fn is_public_tool_surface(&self) -> bool {
+        !matches!(
+            self,
+            Self::ProcessLaunch
+                | Self::ProcessRead
+                | Self::ProcessWrite
+                | Self::ProcessKill
+                | Self::ProcessList
+        )
+    }
+
     pub fn default_risk_level(&self) -> RiskLevel {
         match self {
             Self::FileRead
@@ -149,7 +163,7 @@ impl BuiltinToolName {
             | Self::DiffPreview
             | Self::WebSearch
             | Self::WebFetch
-            | Self::MermaidDiagram
+            | Self::DiagramRender
             | Self::KnowledgeQuery => RiskLevel::Low,
             Self::FileWrite
             | Self::FilePatch
@@ -193,7 +207,9 @@ impl BuiltinToolName {
             Self::DiffPreview => "Generate a unified diff between two text inputs",
             Self::WebSearch => "Search the web using DuckDuckGo and return results",
             Self::WebFetch => "Fetch content from a URL and convert HTML to markdown",
-            Self::MermaidDiagram => "Generate a Mermaid diagram from code",
+            Self::DiagramRender => {
+                "Render diagrams from Mermaid, DOT, graph nodes/edges, or flow nodes/edges"
+            }
             Self::KnowledgeQuery => {
                 "Query project knowledge base: search README, docs, and code documentation"
             }
@@ -346,7 +362,7 @@ impl BuiltinToolName {
             Self::ProcessInspect => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "pid": { "type": "string", "description": "Process ID to inspect" },
+                    "pid": { "type": "integer", "description": "Process ID to inspect" },
                     "query": { "type": "string", "description": "Process name or search query" },
                     "name": { "type": "string", "description": "Alias for query" },
                     "pattern": { "type": "string", "description": "Alias for query" },
@@ -368,8 +384,7 @@ impl BuiltinToolName {
                     "right_path": { "type": "string", "description": "Alias for after_path" },
                     "left_label": { "type": "string", "description": "Alias for before_label" },
                     "right_label": { "type": "string", "description": "Alias for after_label" }
-                },
-                "required": ["before", "after"]
+                }
             }),
             Self::WebSearch => serde_json::json!({
                 "type": "object",
@@ -386,14 +401,68 @@ impl BuiltinToolName {
                 },
                 "required": ["url"]
             }),
-            Self::MermaidDiagram => serde_json::json!({
+            Self::DiagramRender => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "code": { "type": "string", "description": "Mermaid diagram code" },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["mermaid", "dot", "graph", "flow"],
+                        "description": "Diagram input kind. Use mermaid for Mermaid syntax, dot for DOT syntax, graph for interactive node-link graphs, and flow for process/node flow diagrams."
+                    },
+                    "source": { "type": "string", "description": "Diagram source for mermaid or dot kinds" },
+                    "graph": {
+                        "type": "object",
+                        "description": "Structured graph payload for graph or flow kinds",
+                        "properties": {
+                            "nodes": {
+                                "type": "array",
+                                "description": "Nodes with id, label, and optional group/data fields",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": { "type": "string", "description": "Stable node id" },
+                                        "label": { "type": "string", "description": "Human-readable node label" },
+                                        "group": { "type": "string", "description": "Optional node group" },
+                                        "position": {
+                                            "type": "object",
+                                            "properties": {
+                                                "x": { "type": "number" },
+                                                "y": { "type": "number" }
+                                            }
+                                        },
+                                        "data": { "type": "object", "description": "Optional renderer-specific node metadata" }
+                                    },
+                                    "required": ["id"]
+                                }
+                            },
+                            "edges": {
+                                "type": "array",
+                                "description": "Edges with source, target, and optional label/data fields",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": { "type": "string", "description": "Optional stable edge id" },
+                                        "source": { "type": "string", "description": "Source node id" },
+                                        "target": { "type": "string", "description": "Target node id" },
+                                        "label": { "type": "string", "description": "Human-readable edge label" },
+                                        "data": { "type": "object", "description": "Optional renderer-specific edge metadata" }
+                                    },
+                                    "required": ["source", "target"]
+                                }
+                            }
+                        },
+                        "required": ["nodes", "edges"]
+                    },
                     "title": { "type": "string", "description": "Optional diagram title" },
-                    "theme": { "type": "string", "description": "Diagram theme (default: default)" }
+                    "layout": {
+                        "type": "string",
+                        "enum": ["auto", "dagre", "elk", "tidy-tree", "cose", "force", "fcose", "cose-bilkent", "grid", "circle", "preset"],
+                        "description": "Preferred layout. auto lets the renderer pick a sensible layout for the kind."
+                    },
+                    "interactive": { "type": "boolean", "description": "Whether the renderer should enable pan, zoom, and node interaction when supported" },
+                    "theme": { "type": "string", "description": "Diagram theme hint" }
                 },
-                "required": ["code"]
+                "required": ["kind"]
             }),
             Self::KnowledgeQuery => serde_json::json!({
                 "type": "object",
@@ -405,6 +474,18 @@ impl BuiltinToolName {
             }),
         }
     }
+}
+
+pub fn is_public_builtin_tool_surface(name: &str) -> bool {
+    BuiltinToolName::from_str(name)
+        .map(|tool| tool.is_public_tool_surface())
+        .unwrap_or(false)
+}
+
+pub fn is_internal_builtin_tool_surface(name: &str) -> bool {
+    BuiltinToolName::from_str(name)
+        .map(|tool| !tool.is_public_tool_surface())
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -554,9 +635,30 @@ impl ToolRegistry {
     }
 
     pub fn builtin_specs(&self) -> Vec<BuiltinToolSpec> {
-        self.builtin_tools
-            .values()
-            .map(|tool| tool.spec())
+        let mut specs = Vec::with_capacity(self.builtin_tools.len());
+        for name in BuiltinToolName::ALL {
+            if let Some(tool) = self.builtin_tools.get(name.as_str()) {
+                specs.push(tool.spec());
+            }
+        }
+        let mut custom_tools = self
+            .builtin_tools
+            .iter()
+            .filter(|(name, _)| {
+                !BuiltinToolName::ALL
+                    .iter()
+                    .any(|builtin| builtin.as_str() == name.as_str())
+            })
+            .collect::<Vec<_>>();
+        custom_tools.sort_by(|(left, _), (right, _)| left.cmp(right));
+        specs.extend(custom_tools.into_iter().map(|(_, tool)| tool.spec()));
+        specs
+    }
+
+    pub fn public_builtin_specs(&self) -> Vec<BuiltinToolSpec> {
+        self.builtin_specs()
+            .into_iter()
+            .filter(|spec| is_public_builtin_tool_surface(&spec.name))
             .collect()
     }
 
@@ -605,14 +707,39 @@ impl ToolRegistry {
 
     pub fn execute_with_policy(
         &self,
+        input: ToolExecutionInput,
+        context: ToolExecutionContext,
+        policy: &ToolExecutionPolicy,
+    ) -> ToolExecutionOutput {
+        self.execute_with_policy_for_surface(input, context, policy, false)
+    }
+
+    #[cfg(test)]
+    fn execute_internal_builtin_with_policy(
+        &self,
+        input: ToolExecutionInput,
+        context: ToolExecutionContext,
+        policy: &ToolExecutionPolicy,
+    ) -> ToolExecutionOutput {
+        self.execute_with_policy_for_surface(input, context, policy, true)
+    }
+
+    fn execute_with_policy_for_surface(
+        &self,
         mut input: ToolExecutionInput,
         context: ToolExecutionContext,
         policy: &ToolExecutionPolicy,
+        allow_internal_builtin_surface: bool,
     ) -> ToolExecutionOutput {
         if input.tool_kind == ToolKind::Builtin
             && let Some(canonical_name) = BuiltinToolName::from_str(input.tool_name.trim())
         {
             input.tool_name = canonical_name.as_str().to_string();
+            if !allow_internal_builtin_surface && !canonical_name.is_public_tool_surface() {
+                let output = self.build_internal_builtin_surface_rejection(&input, canonical_name);
+                self.record_invocation(&input, &context, &output);
+                return output;
+            }
         }
         if let Some(output) = self.enforce_execution_policy(&input, policy) {
             self.record_invocation(&input, &context, &output);
@@ -674,6 +801,35 @@ impl ToolRegistry {
 
         self.record_invocation(&input, &context, &output);
         output
+    }
+
+    fn build_internal_builtin_surface_rejection(
+        &self,
+        input: &ToolExecutionInput,
+        tool_name: BuiltinToolName,
+    ) -> ToolExecutionOutput {
+        let reason = format!(
+            "{} 是 shell_exec 的内部运行时能力，不接受模型、worker 或外部调用直接执行；需要后台终端时请调用 shell_exec(background=true)",
+            tool_name.as_str()
+        );
+        ToolExecutionOutput {
+            tool_call_id: input.tool_call_id.clone(),
+            status: ExecutionResultStatus::Rejected,
+            payload: serde_json::json!({
+                "tool": tool_name.as_str(),
+                "status": "rejected",
+                "error": reason.clone(),
+            })
+            .to_string(),
+            governance: GovernanceDecision {
+                outcome: GovernanceOutcome::Rejected,
+                allowed: false,
+                requires_approval: false,
+                phase: DecisionPhase::ToolPolicy,
+                threshold: input.risk_level,
+                reason: Some(reason),
+            },
+        }
     }
 
     pub fn invocations(&self) -> Vec<ToolInvocationRecord> {
@@ -1091,7 +1247,6 @@ mod tests {
             ("file_read", "缺少文件路径"),
             ("search_text", "缺少搜索关键词"),
             ("shell_exec", "缺少 shell 命令"),
-            ("process_launch", "缺少 shell 命令"),
             ("file_remove", "缺少文件路径"),
             ("file_mkdir", "缺少目录路径"),
             ("web_search", "缺少搜索关键词 query"),
@@ -1353,7 +1508,7 @@ mod tests {
             workspace_id: Some(WorkspaceId::new("workspace-process-launch")),
         };
 
-        let launch = tool_registry.execute_with_policy(
+        let launch = tool_registry.execute_internal_builtin_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new("tool-call-process-launch"),
                 tool_name: BuiltinToolName::ProcessLaunch.as_str().to_string(),
@@ -1403,7 +1558,7 @@ mod tests {
             serde_json::from_str(&followup.payload).expect("followup payload json");
         assert_eq!(followup_payload["stdout"], "followup");
 
-        let kill = tool_registry.execute_with_policy(
+        let kill = tool_registry.execute_internal_builtin_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new("tool-call-process-kill"),
                 tool_name: BuiltinToolName::ProcessKill.as_str().to_string(),
@@ -1425,7 +1580,7 @@ mod tests {
         let mut tool_registry = ToolRegistry::new(governance, event_bus);
         tool_registry.register_default_builtins();
 
-        let output = tool_registry.execute_with_policy(
+        let output = tool_registry.execute_internal_builtin_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new("tool-call-process-blank"),
                 tool_name: BuiltinToolName::ProcessLaunch.as_str().to_string(),
@@ -1450,7 +1605,7 @@ mod tests {
         let mut tool_registry = ToolRegistry::new(governance, event_bus);
         tool_registry.register_default_builtins();
 
-        let output = tool_registry.execute_with_policy(
+        let output = tool_registry.execute_internal_builtin_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new("tool-call-process-launch-no-context"),
                 tool_name: BuiltinToolName::ProcessLaunch.as_str().to_string(),
@@ -1475,7 +1630,7 @@ mod tests {
             session_id: Some(SessionId::new("session-process-context")),
             workspace_id: Some(WorkspaceId::new("workspace-process-context")),
         };
-        let launch = tool_registry.execute_with_policy(
+        let launch = tool_registry.execute_internal_builtin_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new("tool-call-process-launch-context"),
                 tool_name: BuiltinToolName::ProcessLaunch.as_str().to_string(),
@@ -1496,7 +1651,7 @@ mod tests {
             serde_json::from_str(&launch.payload).expect("launch payload json");
         let terminal_id = launch_payload["terminal_id"].as_u64().expect("terminal id");
 
-        let read_without_context = tool_registry.execute_with_policy(
+        let read_without_context = tool_registry.execute_internal_builtin_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new("tool-call-process-read-no-context"),
                 tool_name: BuiltinToolName::ProcessRead.as_str().to_string(),
@@ -1515,7 +1670,7 @@ mod tests {
                 .contains("需要 session 或 workspace 上下文")
         );
 
-        let kill = tool_registry.execute_with_policy(
+        let kill = tool_registry.execute_internal_builtin_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new("tool-call-process-kill-context"),
                 tool_name: BuiltinToolName::ProcessKill.as_str().to_string(),
@@ -1557,7 +1712,7 @@ mod tests {
             workspace_id: Some(WorkspaceId::new("workspace-process-shared")),
         };
 
-        let launch = tool_registry.execute_with_policy(
+        let launch = tool_registry.execute_internal_builtin_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new("tool-call-process-launch-owner"),
                 tool_name: BuiltinToolName::ProcessLaunch.as_str().to_string(),
@@ -1578,7 +1733,7 @@ mod tests {
             serde_json::from_str(&launch.payload).expect("launch payload json");
         let terminal_id = launch_payload["terminal_id"].as_u64().expect("terminal id");
 
-        let read_workspace_only = tool_registry.execute_with_policy(
+        let read_workspace_only = tool_registry.execute_internal_builtin_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new("tool-call-process-read-workspace-only"),
                 tool_name: BuiltinToolName::ProcessRead.as_str().to_string(),
@@ -1597,7 +1752,7 @@ mod tests {
                 .contains("进程不属于当前 session/workspace")
         );
 
-        let read_other_session = tool_registry.execute_with_policy(
+        let read_other_session = tool_registry.execute_internal_builtin_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new("tool-call-process-read-other-session"),
                 tool_name: BuiltinToolName::ProcessRead.as_str().to_string(),
@@ -1616,7 +1771,7 @@ mod tests {
                 .contains("进程不属于当前 session/workspace")
         );
 
-        let process_list = tool_registry.execute_with_policy(
+        let process_list = tool_registry.execute_internal_builtin_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new("tool-call-process-list-workspace-only"),
                 tool_name: BuiltinToolName::ProcessList.as_str().to_string(),
@@ -1638,7 +1793,7 @@ mod tests {
                 .is_empty()
         );
 
-        let kill = tool_registry.execute_with_policy(
+        let kill = tool_registry.execute_internal_builtin_with_policy(
             ToolExecutionInput {
                 tool_call_id: ToolCallId::new("tool-call-process-kill-owner"),
                 tool_name: BuiltinToolName::ProcessKill.as_str().to_string(),
@@ -2619,7 +2774,6 @@ mod tests {
             ("shell", BuiltinToolName::ShellExec),
             ("web_search", BuiltinToolName::WebSearch),
             ("web_fetch", BuiltinToolName::WebFetch),
-            ("mermaid_diagram", BuiltinToolName::MermaidDiagram),
             ("project_knowledge_query", BuiltinToolName::KnowledgeQuery),
         ];
         for (alias, expected) in &aliases {
@@ -2631,6 +2785,7 @@ mod tests {
             );
         }
         assert_eq!(BuiltinToolName::from_str("nonexistent_tool"), None);
+        assert_eq!(BuiltinToolName::from_str("mermaid_diagram"), None);
     }
 
     #[test]
@@ -2661,7 +2816,7 @@ mod tests {
             BuiltinToolName::ShellExec,
             BuiltinToolName::WebSearch,
             BuiltinToolName::DiffPreview,
-            BuiltinToolName::MermaidDiagram,
+            BuiltinToolName::DiagramRender,
         ];
         for tool in &write_ops {
             assert!(tool.is_write_operation(), "{:?} should be write", tool);
@@ -2671,14 +2826,18 @@ mod tests {
         }
     }
 
-    // ── mermaid.diagram 验证 ──
+    // ── diagram.render 验证 ──
 
     #[test]
-    fn mermaid_diagram_recognizes_valid_types() {
+    fn diagram_render_recognizes_mermaid_types() {
         let registry = make_registry();
         let valid_codes = [
             ("graph TD\n  A --> B", "flowchart"),
             ("flowchart LR\n  A --> B", "flowchart"),
+            (
+                "---\nconfig:\n  layout: elk\n---\nflowchart LR\n  A --> B",
+                "flowchart",
+            ),
             ("sequenceDiagram\n  A->>B: Hello", "sequence"),
             ("classDiagram\n  class A", "class"),
             ("stateDiagram-v2\n  [*] --> S", "state"),
@@ -2692,8 +2851,9 @@ mod tests {
         for (code, expected_type) in &valid_codes {
             let output = exec_tool(
                 &registry,
-                BuiltinToolName::MermaidDiagram,
-                &serde_json::json!({ "code": code }).to_string(),
+                BuiltinToolName::DiagramRender,
+                &serde_json::json!({ "kind": "mermaid", "source": code, "layout": "elk" })
+                    .to_string(),
             );
             assert_eq!(
                 output.status,
@@ -2702,30 +2862,102 @@ mod tests {
                 code
             );
             let payload: Value = serde_json::from_str(&output.payload).unwrap();
+            assert_eq!(payload["tool"], "diagram_render");
+            assert_eq!(payload["type"], "diagram_render");
+            assert_eq!(payload["kind"], "mermaid");
+            assert_eq!(payload["layout"], "elk");
             assert_eq!(payload["diagram_type"], *expected_type, "code: {}", code);
         }
     }
 
     #[test]
-    fn mermaid_diagram_rejects_invalid_type() {
+    fn diagram_render_accepts_dot_graph_and_flow_kinds() {
         let registry = make_registry();
-        let output = exec_tool(
+
+        let dot = exec_tool(
             &registry,
-            BuiltinToolName::MermaidDiagram,
-            &serde_json::json!({ "code": "invalid_diagram\n  A --> B" }).to_string(),
+            BuiltinToolName::DiagramRender,
+            &serde_json::json!({
+                "kind": "dot",
+                "source": "digraph G { A -> B }",
+                "title": "DOT"
+            })
+            .to_string(),
         );
-        assert_eq!(output.status, ExecutionResultStatus::Failed);
+        assert_eq!(dot.status, ExecutionResultStatus::Succeeded);
+        let dot_payload: Value = serde_json::from_str(&dot.payload).unwrap();
+        assert_eq!(dot_payload["kind"], "dot");
+        assert_eq!(dot_payload["diagram_type"], "dot");
+
+        for kind in ["graph", "flow"] {
+            let output = exec_tool(
+                &registry,
+                BuiltinToolName::DiagramRender,
+                &serde_json::json!({
+                    "kind": kind,
+                    "layout": "cose",
+                    "graph": {
+                        "nodes": [
+                            { "id": "a", "label": "A" },
+                            { "id": "b", "label": "B" }
+                        ],
+                        "edges": [
+                            { "source": "a", "target": "b", "label": "relates" }
+                        ]
+                    }
+                })
+                .to_string(),
+            );
+            assert_eq!(output.status, ExecutionResultStatus::Succeeded, "{kind}");
+            let payload: Value = serde_json::from_str(&output.payload).unwrap();
+            assert_eq!(payload["kind"], kind);
+            assert_eq!(payload["layout"], "cose");
+            assert_eq!(payload["interactive"], true);
+            assert_eq!(payload["graph"]["nodes"].as_array().unwrap().len(), 2);
+        }
+
+        for layout in ["fcose", "cose-bilkent"] {
+            let output = exec_tool(
+                &registry,
+                BuiltinToolName::DiagramRender,
+                &serde_json::json!({
+                    "kind": "graph",
+                    "layout": layout,
+                    "graph": {
+                        "nodes": [
+                            { "id": "a", "label": "A" },
+                            { "id": "b", "label": "B" }
+                        ],
+                        "edges": [
+                            { "source": "a", "target": "b" }
+                        ]
+                    }
+                })
+                .to_string(),
+            );
+            assert_eq!(output.status, ExecutionResultStatus::Succeeded, "{layout}");
+            let payload: Value = serde_json::from_str(&output.payload).unwrap();
+            assert_eq!(payload["layout"], layout);
+        }
     }
 
     #[test]
-    fn mermaid_diagram_rejects_empty_code() {
+    fn diagram_render_rejects_invalid_inputs() {
         let registry = make_registry();
-        let output = exec_tool(
-            &registry,
-            BuiltinToolName::MermaidDiagram,
-            &serde_json::json!({ "code": "  " }).to_string(),
-        );
-        assert_eq!(output.status, ExecutionResultStatus::Failed);
+        for input in [
+            serde_json::json!({ "kind": "mermaid", "source": "invalid_diagram\n  A --> B" }),
+            serde_json::json!({ "kind": "mermaid", "source": "  " }),
+            serde_json::json!({ "kind": "dot", "source": "A -> B" }),
+            serde_json::json!({ "kind": "graph", "graph": { "nodes": [] } }),
+            serde_json::json!({ "kind": "cytoscape", "graph": { "nodes": [], "edges": [] } }),
+        ] {
+            let output = exec_tool(
+                &registry,
+                BuiltinToolName::DiagramRender,
+                &input.to_string(),
+            );
+            assert_eq!(output.status, ExecutionResultStatus::Failed, "{input}");
+        }
     }
 
     // ── 实际工具行为验证 ──
@@ -2817,7 +3049,7 @@ mod tests {
             Some(BuiltinToolAccessMode::ReadOnly)
         );
         assert_eq!(
-            registry.builtin_access_mode(BuiltinToolName::MermaidDiagram.as_str()),
+            registry.builtin_access_mode(BuiltinToolName::DiagramRender.as_str()),
             Some(BuiltinToolAccessMode::ReadOnly)
         );
     }
@@ -2837,6 +3069,226 @@ mod tests {
                 tool
             );
         }
+    }
+
+    #[test]
+    fn public_builtin_specs_exclude_shell_internal_process_tools() {
+        let registry = make_registry();
+        let public_specs = registry.public_builtin_specs();
+        let public_names: Vec<_> = public_specs.iter().map(|spec| spec.name.as_str()).collect();
+
+        assert_eq!(
+            public_names,
+            vec![
+                "file_read",
+                "file_write",
+                "file_patch",
+                "file_remove",
+                "file_mkdir",
+                "file_copy",
+                "file_move",
+                "search_text",
+                "search_semantic",
+                "shell_exec",
+                "process_inspect",
+                "diff_preview",
+                "web_search",
+                "web_fetch",
+                "diagram_render",
+                "knowledge_query",
+            ],
+            "public builtin specs must remain the single canonical tool surface"
+        );
+
+        assert!(is_public_builtin_tool_surface("shell_exec"));
+        assert!(!is_public_builtin_tool_surface("process_launch"));
+        assert!(!is_public_builtin_tool_surface("process_read"));
+        assert!(!is_public_builtin_tool_surface("process_write"));
+        assert!(!is_public_builtin_tool_surface("process_kill"));
+        assert!(!is_public_builtin_tool_surface("process_list"));
+        assert!(is_public_builtin_tool_surface("process_inspect"));
+        assert!(
+            public_specs
+                .iter()
+                .any(|spec| spec.name == BuiltinToolName::ShellExec.as_str())
+        );
+        for internal_tool in [
+            BuiltinToolName::ProcessLaunch,
+            BuiltinToolName::ProcessRead,
+            BuiltinToolName::ProcessWrite,
+            BuiltinToolName::ProcessKill,
+            BuiltinToolName::ProcessList,
+        ] {
+            assert!(
+                public_specs
+                    .iter()
+                    .all(|spec| spec.name != internal_tool.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn diagram_renderer_names_are_not_builtin_tools() {
+        for name in [
+            "mermaid_diagram",
+            "mermaid",
+            "graphviz",
+            "dot",
+            "cytoscape",
+            "svelte_flow",
+            "svelte-flow",
+        ] {
+            assert_eq!(
+                BuiltinToolName::from_str(name),
+                None,
+                "{name} must stay a renderer/kind behind diagram_render, not a builtin tool"
+            );
+            assert!(
+                !is_public_builtin_tool_surface(name),
+                "{name} must not be accepted as a public builtin surface"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_rejects_internal_process_tools_as_public_builtin_calls() {
+        let registry = make_registry();
+        let context = ToolExecutionContext {
+            worker_id: None,
+            task_id: Some(TaskId::new("task-internal-process")),
+            session_id: Some(SessionId::new("session-internal-process")),
+            workspace_id: Some(WorkspaceId::new("workspace-internal-process")),
+        };
+
+        for (tool_name, input) in [
+            (
+                BuiltinToolName::ProcessLaunch.as_str(),
+                serde_json::json!({ "command": "sleep 1" }),
+            ),
+            (
+                BuiltinToolName::ProcessRead.as_str(),
+                serde_json::json!({ "terminal_id": 1 }),
+            ),
+            (
+                BuiltinToolName::ProcessWrite.as_str(),
+                serde_json::json!({ "terminal_id": 1, "input": "x" }),
+            ),
+            (
+                BuiltinToolName::ProcessKill.as_str(),
+                serde_json::json!({ "terminal_id": 1 }),
+            ),
+            (BuiltinToolName::ProcessList.as_str(), serde_json::json!({})),
+        ] {
+            let output = registry.execute_with_policy(
+                ToolExecutionInput {
+                    tool_call_id: ToolCallId::new(format!("tool-call-{tool_name}-internal")),
+                    tool_name: tool_name.to_string(),
+                    tool_kind: ToolKind::Builtin,
+                    input: input.to_string(),
+                    approval_requirement: ApprovalRequirement::None,
+                    risk_level: RiskLevel::Low,
+                },
+                context.clone(),
+                &ToolExecutionPolicy::default(),
+            );
+
+            assert_eq!(
+                output.status,
+                ExecutionResultStatus::Rejected,
+                "{tool_name} must be rejected before internal process execution"
+            );
+            assert!(
+                output.payload.contains("shell_exec"),
+                "{tool_name} rejection should point callers to shell_exec, got {}",
+                output.payload
+            );
+        }
+    }
+
+    #[test]
+    fn shell_exec_background_keeps_shell_public_payload() {
+        let registry = make_registry();
+        let context = ToolExecutionContext {
+            worker_id: None,
+            task_id: Some(TaskId::new("task-shell-background")),
+            session_id: Some(SessionId::new("session-shell-background")),
+            workspace_id: Some(WorkspaceId::new("workspace-shell-background")),
+        };
+
+        let output = registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-shell-background"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "printf shell-background-ok",
+                    "background": true
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context,
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload should parse");
+        assert_eq!(payload["tool"], "shell_exec");
+        assert_eq!(payload["mode"], "background");
+        assert!(payload["terminal_id"].as_u64().is_some());
+    }
+
+    #[test]
+    fn file_write_execution_respects_active_write_guard() {
+        let registry = make_registry();
+        let root = unique_temp_dir("magi-tool-file-write-guard");
+        let file = root.join("guarded.txt");
+        let context = ToolExecutionContext {
+            worker_id: None,
+            task_id: Some(TaskId::new("task-file-write-guard")),
+            session_id: Some(SessionId::new("session-file-write-guard")),
+            workspace_id: Some(WorkspaceId::new("workspace-file-write-guard")),
+        };
+        let held_input = ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-file-write-held"),
+            tool_name: BuiltinToolName::FileWrite.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: serde_json::json!({
+                "path": file.to_string_lossy(),
+                "content": "held"
+            })
+            .to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        };
+        let _held_guard = registry
+            .acquire_write_guard(&held_input, &context, BuiltinToolAccessMode::ExplicitWrite)
+            .expect("held write guard should acquire");
+
+        let output = registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-file-write-conflict"),
+                tool_name: BuiltinToolName::FileWrite.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "content": "conflict"
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context,
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Rejected);
+        assert!(
+            output.payload.contains("并发写冲突"),
+            "file_write should be protected by the write guard, got {}",
+            output.payload
+        );
     }
 
     #[test]

@@ -65,6 +65,61 @@ function compareCanonicalTurns(left: CanonicalTurn, right: CanonicalTurn): numbe
   return left.turnSeq - right.turnSeq || left.turnId.localeCompare(right.turnId);
 }
 
+function readMetadataString(metadata: Record<string, unknown> | undefined, key: string): string {
+  const value = metadata?.[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function metadataFlag(metadata: Record<string, unknown> | undefined, key: string): boolean {
+  return metadata?.[key] === true;
+}
+
+function canonicalTurnRequestId(turn: CanonicalTurn | undefined): string {
+  if (!turn) {
+    return '';
+  }
+  const turnRequestId = readMetadataString(turn.metadata, 'requestId');
+  if (turnRequestId) {
+    return turnRequestId;
+  }
+  for (const item of turn.items) {
+    const itemRequestId = readMetadataString(item.metadata, 'requestId');
+    if (itemRequestId) {
+      return itemRequestId;
+    }
+  }
+  return '';
+}
+
+function canonicalItemRequestId(item: CanonicalTurnItem | undefined): string {
+  return item ? readMetadataString(item.metadata, 'requestId') : '';
+}
+
+function isLocalOptimisticTurn(turn: CanonicalTurn | undefined): boolean {
+  if (!turn) {
+    return false;
+  }
+  if (metadataFlag(turn.metadata, 'localOptimistic')) {
+    return true;
+  }
+  return turn.items.some((item) => metadataFlag(item.metadata, 'localOptimistic'));
+}
+
+function findCanonicalTurnIndex(turns: CanonicalTurn[], event: CanonicalTurnEvent): number {
+  const directIndex = turns.findIndex((turn) => turn.turnId === event.turnId);
+  if (directIndex >= 0) {
+    return directIndex;
+  }
+  const requestId = canonicalTurnRequestId(event.turn) || canonicalItemRequestId(event.item);
+  if (!requestId) {
+    return -1;
+  }
+  return turns.findIndex((turn) => (
+    isLocalOptimisticTurn(turn)
+    && canonicalTurnRequestId(turn) === requestId
+  ));
+}
+
 function mergeCanonicalTurnItem(
   items: CanonicalTurnItem[],
   incoming: CanonicalTurnItem,
@@ -96,7 +151,7 @@ function mergeCanonicalTurnItem(
   };
 }
 
-function normalizeLateUpsertItem(
+function normalizeIncomingItemAgainstExisting(
   existingItems: CanonicalTurnItem[],
   incoming: CanonicalTurnItem,
 ): CanonicalTurnItem {
@@ -188,20 +243,56 @@ export function reduceCanonicalTurnEvent(
   let turns = state.turns.map(cloneTurn);
   let changed = false;
   let targetTurn: CanonicalTurn | undefined = event.turn;
-  const existingIndex = turns.findIndex((turn) => turn.turnId === event.turnId);
+  const existingIndex = findCanonicalTurnIndex(turns, event);
   const existing = existingIndex >= 0 ? turns[existingIndex] : undefined;
 
   if (!targetTurn) {
     if (!event.item) {
       return { state, changed: false, error: `canonical turn event ${event.eventId} missing turn and item` };
     }
-    targetTurn = existing || {
+    targetTurn = existing && existing.turnId === event.item.turnId ? existing : {
       sessionId: event.item.sessionId,
       turnId: event.item.turnId,
       turnSeq: event.item.turnSeq,
       acceptedAt: event.item.createdAt,
       status: event.item.status,
       items: [],
+    };
+  }
+
+  const replacingLocalOptimisticTurn = Boolean(
+    existing
+    && isLocalOptimisticTurn(existing)
+    && existing.turnId !== targetTurn.turnId
+    && canonicalTurnRequestId(existing)
+    && canonicalTurnRequestId(existing) === (
+      canonicalTurnRequestId(targetTurn) || canonicalItemRequestId(event.item)
+    )
+  );
+
+  if (replacingLocalOptimisticTurn) {
+    let nextTurn = cloneTurn(targetTurn);
+    if (event.item) {
+      const itemMerge = mergeCanonicalTurnItem(nextTurn.items, event.item);
+      if (itemMerge.error) {
+        return { state, changed: false, error: itemMerge.error };
+      }
+      nextTurn = {
+        ...nextTurn,
+        items: itemMerge.items,
+      };
+    }
+    turns[existingIndex] = nextTurn;
+    turns = turns.sort(compareCanonicalTurns);
+    return {
+      state: {
+        sessionId: normalizedSessionId,
+        turns,
+        lastAppliedEventSeq: event.eventSeq > 0
+          ? Math.max(state.lastAppliedEventSeq, event.eventSeq)
+          : state.lastAppliedEventSeq,
+      },
+      changed: true,
     };
   }
 
@@ -219,10 +310,10 @@ export function reduceCanonicalTurnEvent(
     };
   }
 
-  if (event.kind === 'turn_item_upsert' && existing) {
+  if (existing) {
     targetTurn = {
       ...targetTurn,
-      items: targetTurn.items.map((item) => normalizeLateUpsertItem(existing.items, item)),
+      items: targetTurn.items.map((item) => normalizeIncomingItemAgainstExisting(existing.items, item)),
     };
   }
 
@@ -234,9 +325,7 @@ export function reduceCanonicalTurnEvent(
   changed = changed || mergedTurn.changed;
 
   if (event.item) {
-    const incomingItem = event.kind === 'turn_item_upsert'
-      ? normalizeLateUpsertItem(nextTurn.items, event.item)
-      : event.item;
+    const incomingItem = normalizeIncomingItemAgainstExisting(nextTurn.items, event.item);
     const itemMerge = mergeCanonicalTurnItem(nextTurn.items, incomingItem);
     if (itemMerge.error) {
       return { state, changed: false, error: itemMerge.error };

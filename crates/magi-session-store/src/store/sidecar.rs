@@ -171,12 +171,57 @@ fn current_turn_item_to_canonical_worker(
     })
 }
 
+fn current_turn_item_metadata(item: &ActiveExecutionTurnItem) -> HashMap<String, Value> {
+    let mut metadata = HashMap::new();
+    if let Some(value) = item
+        .request_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        metadata.insert("requestId".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = item
+        .user_message_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        metadata.insert("userMessageId".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = item
+        .placeholder_message_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        metadata.insert(
+            "placeholderMessageId".to_string(),
+            Value::String(value.clone()),
+        );
+    }
+    metadata
+}
+
+fn current_turn_item_renderable(
+    item: &ActiveExecutionTurnItem,
+    kind: CanonicalTurnItemKind,
+    status: CanonicalTurnItemStatus,
+) -> bool {
+    let has_content = item
+        .content
+        .as_ref()
+        .is_some_and(|content| !content.trim().is_empty());
+    if kind == CanonicalTurnItemKind::AssistantText {
+        return has_content || !status.is_terminal();
+    }
+    has_content || item.tool_call_id.is_some() || item.worker_id.is_some() || item.task_id.is_some()
+}
+
 fn current_turn_item_to_canonical_item(
     session_id: &SessionId,
     turn: &ActiveExecutionTurn,
     item: &ActiveExecutionTurnItem,
 ) -> DomainResult<CanonicalTurnItem> {
     let kind = canonical_current_turn_item_kind(&item.kind)?;
+    let status = canonical_current_turn_item_status(&item.status)?;
     let tool = current_turn_item_to_canonical_tool(item)?;
     if kind == CanonicalTurnItemKind::ToolCall && tool.is_none() {
         return Err(DomainError::InvalidState {
@@ -196,7 +241,7 @@ fn current_turn_item_to_canonical_item(
         item_seq: item.item_seq,
         kind,
         created_at: turn.accepted_at,
-        status: canonical_current_turn_item_status(&item.status)?,
+        status,
         item_version: None,
         updated_at: UtcMillis::now(),
         lane_id: item.lane_id.clone(),
@@ -209,16 +254,10 @@ fn current_turn_item_to_canonical_item(
         visibility: CanonicalTurnVisibility {
             thread_visible: item.thread_visible,
             worker_visible: item.worker_visible,
-            renderable: item
-                .content
-                .as_ref()
-                .is_none_or(|content| !content.trim().is_empty())
-                || item.tool_call_id.is_some()
-                || item.worker_id.is_some()
-                || item.task_id.is_some(),
+            renderable: current_turn_item_renderable(item, kind, status),
             worker_tab_ids,
         },
-        metadata: HashMap::new(),
+        metadata: current_turn_item_metadata(item),
     })
 }
 

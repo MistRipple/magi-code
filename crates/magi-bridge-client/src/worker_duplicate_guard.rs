@@ -10,10 +10,8 @@ fn read_only_tool_names() -> HashSet<&'static str> {
         "code_search_regex",
         "web_search",
         "web_fetch",
-        "mermaid_diagram",
+        "diagram_render",
         "code_search_semantic",
-        "process_read",
-        "process_list",
         "project_knowledge_query",
     ]
     .into_iter()

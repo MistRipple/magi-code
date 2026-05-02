@@ -910,8 +910,8 @@ impl ApiState {
         let Some(registry) = &self.tool_registry else {
             return serde_json::Value::Array(Vec::new());
         };
-        let mut tools = registry
-            .builtin_specs()
+        let tools = registry
+            .public_builtin_specs()
             .into_iter()
             .map(|spec| {
                 let access_mode = registry
@@ -927,17 +927,6 @@ impl ApiState {
                 })
             })
             .collect::<Vec<_>>();
-        tools.sort_by(|left, right| {
-            left.get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .cmp(
-                    right
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default(),
-                )
-        });
         serde_json::Value::Array(tools)
     }
 

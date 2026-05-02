@@ -87,9 +87,6 @@ function buildMessageBlocks(item: CanonicalTurnItem, content: string): ContentBl
       },
     }];
   }
-  if (content) {
-    return [{ type: 'text', content }];
-  }
   return undefined;
 }
 
@@ -116,6 +113,9 @@ function resolveMessageType(item: CanonicalTurnItem): Message['type'] {
   if (item.kind === 'system_notice') {
     return 'system-notice';
   }
+  if (item.kind === 'assistant_text') {
+    return 'text';
+  }
   if (item.status === 'failed') {
     return 'error';
   }
@@ -126,10 +126,49 @@ function resolveItemContent(item: CanonicalTurnItem): string {
   if (typeof item.content === 'string') {
     return item.content;
   }
+  if (item.kind === 'assistant_text') {
+    return '';
+  }
   if (item.kind === 'tool_call') {
     return item.title || item.tool?.name || '';
   }
   return item.title || '';
+}
+
+function shouldRenderItem(item: CanonicalTurnItem): boolean {
+  if (item.visibility.renderable === false || item.kind === 'system_notice') {
+    return false;
+  }
+  if (
+    item.kind === 'assistant_text'
+    && isCanonicalTerminalStatus(item.status)
+    && resolveItemContent(item).trim().length === 0
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function canShowTurnResponseDuration(turn: CanonicalTurn, item: CanonicalTurnItem): boolean {
+  if (
+    item.kind !== 'assistant_text'
+    || !isCanonicalTerminalStatus(item.status)
+    || !isCanonicalTerminalStatus(turn.status)
+    || typeof turn.responseDurationMs !== 'number'
+  ) {
+    return false;
+  }
+  const lastVisibleAssistant = turn.items
+    .filter((candidate) => (
+      candidate.kind === 'assistant_text'
+      && candidate.visibility.renderable !== false
+      && candidate.visibility.threadVisible !== false
+      && typeof candidate.content === 'string'
+      && candidate.content.trim().length > 0
+    ))
+    .sort((left, right) => left.itemSeq - right.itemSeq || left.itemId.localeCompare(right.itemId))
+    .at(-1);
+  return lastVisibleAssistant?.itemId === item.itemId;
 }
 
 function buildMessage(turn: CanonicalTurn, item: CanonicalTurnItem, artifactId: string): Message {
@@ -137,6 +176,9 @@ function buildMessage(turn: CanonicalTurn, item: CanonicalTurnItem, artifactId: 
   const worker = normalizeWorkerId(item);
   const blocks = buildMessageBlocks(item, content);
   const isStreaming = item.kind === 'assistant_text' && !isCanonicalTerminalStatus(item.status);
+  const responseDurationMs = canShowTurnResponseDuration(turn, item)
+    ? turn.responseDurationMs
+    : undefined;
   return {
     id: artifactId,
     role: resolveMessageRole(item),
@@ -163,7 +205,7 @@ function buildMessage(turn: CanonicalTurn, item: CanonicalTurnItem, artifactId: 
       taskId: item.worker?.taskId,
       toolCallId: item.tool?.callId,
       toolName: item.tool?.name,
-      responseDurationMs: turn.responseDurationMs,
+      ...(responseDurationMs !== undefined ? { responseDurationMs } : {}),
       canonical: true,
     },
   };
@@ -177,7 +219,7 @@ function resolveArtifactId(turn: CanonicalTurn, item: CanonicalTurnItem): string
 }
 
 function buildArtifact(turn: CanonicalTurn, item: CanonicalTurnItem): TimelineProjectionArtifact | null {
-  if (item.visibility.renderable === false || item.kind === 'system_notice') {
+  if (!shouldRenderItem(item)) {
     return null;
   }
   const artifactId = resolveArtifactId(turn, item);

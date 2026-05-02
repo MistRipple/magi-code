@@ -12,11 +12,12 @@ use crate::{
     },
 };
 use magi_bridge_client::{
-    ChatMessage, ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest, ModelStreamingDelta,
+    ChatMessage, ChatToolChoice, ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest,
+    ModelStreamingDelta,
 };
 use magi_core::{SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::InMemoryEventBus;
-use magi_session_store::{CanonicalTurnItemKind, SessionStore, TimelineEntryKind};
+use magi_session_store::{CanonicalTurnItemKind, SessionStore};
 use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
 use std::sync::Arc;
@@ -35,6 +36,7 @@ pub struct SessionTurnExecutionRequest {
     pub request_id: Option<String>,
     pub user_message_id: Option<String>,
     pub placeholder_message_id: Option<String>,
+    pub forced_tool_name: Option<String>,
 }
 
 pub struct SessionTurnExecutionOutput {
@@ -321,11 +323,21 @@ fn stream_session_turn_round(
         round,
     } = runtime;
 
-    let stream_item_id = format!(
-        "turn-item-assistant-stream-{}-{}",
-        UtcMillis::now().0,
-        round
-    );
+    let stream_item_id = if round == 0 {
+        request.placeholder_message_id.clone().unwrap_or_else(|| {
+            format!(
+                "turn-item-assistant-stream-{}-{}",
+                UtcMillis::now().0,
+                round
+            )
+        })
+    } else {
+        format!(
+            "turn-item-assistant-stream-{}-{}",
+            UtcMillis::now().0,
+            round
+        )
+    };
     let thinking_item_id = format!(
         "turn-item-assistant-thinking-{}-{}",
         UtcMillis::now().0,
@@ -334,7 +346,6 @@ fn stream_session_turn_round(
     let streamed_content = std::cell::RefCell::new(String::new());
     let streamed_thinking = std::cell::RefCell::new(String::new());
     let streamed_visible_content = std::cell::RefCell::new(String::new());
-    let timeline_entry_written = std::cell::Cell::new(false);
     let last_content_len = std::cell::Cell::new(0usize);
     let last_thinking_len = std::cell::Cell::new(0usize);
     let writeback_aborted = std::cell::Cell::new(false);
@@ -414,17 +425,9 @@ fn stream_session_turn_round(
                 &published,
             );
         }
-        if round == 0 {
-            session_store.upsert_timeline_entry(
-                request.session_id.clone(),
-                &stream_item_id,
-                TimelineEntryKind::AssistantMessage,
-                visible_content,
-            );
-            timeline_entry_written.set(true);
-        }
     };
 
+    let tool_choice = forced_tool_choice_for_round(request, tools.as_ref(), round);
     let response = client
         .invoke_streaming(
             ModelInvocationRequest {
@@ -432,7 +435,7 @@ fn stream_session_turn_round(
                 prompt: prompt.to_string(),
                 messages: Some(messages.clone()),
                 tools: tools.clone(),
-                tool_choice: None,
+                tool_choice,
             },
             &on_delta,
         )
@@ -451,7 +454,7 @@ fn stream_session_turn_round(
         None,
         None,
     );
-    let timeline_entry_id = timeline_entry_written.get().then(|| stream_item_id.clone());
+    let timeline_entry_id = None;
     if writeback_aborted.get() || !request_turn_is_writable(session_store, request) {
         return Ok(SessionTurnRoundOutput {
             final_content: None,
@@ -499,7 +502,17 @@ fn stream_session_turn_round(
             );
         }
     }
-    if !streamed_visible_content.trim().is_empty() {
+    let parsed_visible_content = parsed
+        .content
+        .as_deref()
+        .map(|content| normalize_model_visible_content(content.to_string()))
+        .filter(|content| !content.trim().is_empty());
+    let completed_stream_content = if !streamed_visible_content.trim().is_empty() {
+        Some(streamed_visible_content.clone())
+    } else {
+        parsed_visible_content.clone()
+    };
+    if let Some(completed_stream_content) = completed_stream_content.as_ref() {
         if !request_turn_is_writable(session_store, request) {
             return Ok(SessionTurnRoundOutput {
                 final_content: None,
@@ -513,7 +526,7 @@ fn stream_session_turn_round(
             "assistant_stream",
             "completed",
             Some("生成回复".to_string()),
-            Some(streamed_visible_content.clone()),
+            Some(completed_stream_content.clone()),
             Some(stream_item_id.clone()),
         );
         apply_request_aliases(&mut stream_item, request);
@@ -527,6 +540,13 @@ fn stream_session_turn_round(
                 &published,
             );
         }
+    } else if round == 0
+        && request
+            .placeholder_message_id
+            .as_deref()
+            .is_some_and(|placeholder_id| placeholder_id == stream_item_id)
+    {
+        retire_empty_assistant_placeholder(event_bus, session_store, request, &stream_item_id);
     }
 
     if request.use_tools && !parsed.tool_calls.is_empty() {
@@ -576,6 +596,7 @@ fn stream_session_turn_round(
 
     let final_content = parsed
         .content
+        .clone()
         .filter(|content| !content.trim().is_empty())
         .or_else(|| (!streamed_content.trim().is_empty()).then_some(streamed_content))
         .map(normalize_model_visible_content)
@@ -583,7 +604,7 @@ fn stream_session_turn_round(
 
     let final_item_id = final_content
         .as_ref()
-        .and_then(|_| (!streamed_visible_content.trim().is_empty()).then_some(stream_item_id));
+        .and_then(|_| completed_stream_content.map(|_| stream_item_id));
 
     Ok(SessionTurnRoundOutput {
         final_content,
@@ -592,6 +613,53 @@ fn stream_session_turn_round(
         encountered_tool_calls: false,
         interrupted: false,
     })
+}
+
+fn forced_tool_choice_for_round(
+    request: &SessionTurnExecutionRequest,
+    tools: Option<&Vec<ChatToolDefinition>>,
+    round: usize,
+) -> Option<ChatToolChoice> {
+    if round != 0 || !request.use_tools {
+        return None;
+    }
+    let forced_tool_name = request.forced_tool_name.as_deref()?.trim();
+    if forced_tool_name.is_empty() {
+        return None;
+    }
+    let tool_is_available = tools
+        .map(|definitions| {
+            definitions
+                .iter()
+                .any(|definition| definition.function.name == forced_tool_name)
+        })
+        .unwrap_or(false);
+    tool_is_available.then(|| ChatToolChoice::force_function(forced_tool_name))
+}
+
+fn retire_empty_assistant_placeholder(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    request: &SessionTurnExecutionRequest,
+    item_id: &str,
+) {
+    let mut item = session_turn_item(
+        "assistant_stream",
+        "completed",
+        Some("生成回复".to_string()),
+        None,
+        Some(item_id.to_string()),
+    );
+    item.thread_visible = false;
+    apply_request_aliases(&mut item, request);
+    if let Some(published) = upsert_session_turn_item(session_store, &request.session_id, item) {
+        publish_session_turn_item_event(
+            event_bus,
+            &request.session_id,
+            &request.workspace_id,
+            &published,
+        );
+    }
 }
 
 fn append_phase_item(
@@ -693,16 +761,189 @@ fn append_final_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magi_bridge_client::{BridgeClientError, BridgeResponse};
     use magi_core::SessionLifecycleStatus;
     use magi_session_store::{
         ActiveExecutionTurn, CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind,
         CanonicalTurnItemStatus, CanonicalTurnStatus, CanonicalTurnVisibility, SessionRecord,
-        SessionStoreState, TimelineEntry,
+        SessionStoreState, TimelineEntry, TimelineEntryKind,
     };
     use std::collections::HashMap;
 
     fn ts(value: u64) -> UtcMillis {
         UtcMillis(value)
+    }
+
+    struct StreamingTextModelBridgeClient {
+        delta_content: String,
+        payload: String,
+    }
+
+    impl ModelBridgeClient for StreamingTextModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            Ok(BridgeResponse {
+                ok: true,
+                payload: self.payload.clone(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            on_delta(&ModelStreamingDelta {
+                content: self.delta_content.clone(),
+                thinking: String::new(),
+            });
+            self.invoke(request)
+        }
+    }
+
+    #[test]
+    fn forced_tool_choice_only_applies_to_available_first_round_tool() {
+        let request = SessionTurnExecutionRequest {
+            session_id: SessionId::new("session-force-tool-choice"),
+            turn_id: "turn-force-tool-choice".to_string(),
+            workspace_id: None,
+            prompt: "画一个流程图".to_string(),
+            use_tools: true,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: Some("diagram_render".to_string()),
+        };
+        let tools = vec![ChatToolDefinition {
+            kind: "function".to_string(),
+            function: magi_bridge_client::ChatToolFunctionDefinition {
+                name: "diagram_render".to_string(),
+                description: "render diagram".to_string(),
+                parameters: serde_json::json!({ "type": "object" }),
+            },
+        }];
+
+        let choice = forced_tool_choice_for_round(&request, Some(&tools), 0)
+            .expect("first round should force diagram_render");
+        assert_eq!(choice.function.name, "diagram_render");
+        assert!(forced_tool_choice_for_round(&request, Some(&tools), 1).is_none());
+
+        let mut unavailable_request = request;
+        unavailable_request.forced_tool_name = Some("missing_tool".to_string());
+        assert!(forced_tool_choice_for_round(&unavailable_request, Some(&tools), 0).is_none());
+    }
+
+    #[test]
+    fn stream_session_turn_round_reuses_accepted_assistant_placeholder() {
+        let session_id = SessionId::new("session-placeholder-reuse");
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "placeholder reuse")
+            .expect("session should be creatable");
+        let mut user_item = session_turn_item(
+            "user_message",
+            "completed",
+            None,
+            Some("请只回复一句话".to_string()),
+            Some("user-placeholder-reuse".to_string()),
+        );
+        user_item.item_seq = 1;
+        let mut placeholder_item = session_turn_item(
+            "assistant_stream",
+            "running",
+            Some("生成回复".to_string()),
+            None,
+            Some("assistant-placeholder-reuse".to_string()),
+        );
+        placeholder_item.item_seq = 2;
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-placeholder-reuse".to_string(),
+                    turn_seq: 1000,
+                    accepted_at: ts(1000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("请只回复一句话".to_string()),
+                    items: vec![user_item, placeholder_item],
+                    worker_lanes: Vec::new(),
+                },
+            )
+            .expect("current turn should be stored");
+        let event_bus = InMemoryEventBus::new(16);
+        let client = StreamingTextModelBridgeClient {
+            delta_content: "你好".to_string(),
+            payload: serde_json::json!({ "content": "你好" }).to_string(),
+        };
+        let request = SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            turn_id: "turn-placeholder-reuse".to_string(),
+            workspace_id: None,
+            prompt: "请只回复一句话".to_string(),
+            use_tools: false,
+            skill_name: None,
+            request_id: Some("request-placeholder-reuse".to_string()),
+            user_message_id: Some("user-placeholder-reuse".to_string()),
+            placeholder_message_id: Some("assistant-placeholder-reuse".to_string()),
+            forced_tool_name: None,
+        };
+        let usage_binding = session_turn_model_usage_binding(false);
+        let mut messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(request.prompt.clone()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }];
+
+        let output = stream_session_turn_round(
+            SessionTurnRoundRuntime {
+                client: &client,
+                event_bus: &event_bus,
+                session_store: &store,
+                settings_store: None,
+                request: &request,
+                usage_binding: &usage_binding,
+                prompt: &request.prompt,
+                tools: None,
+                messages: &mut messages,
+                round: 0,
+            },
+            None,
+            None,
+        )
+        .expect("round should stream");
+
+        assert_eq!(
+            output.final_item_id.as_deref(),
+            Some("assistant-placeholder-reuse"),
+            "第一段 assistant 文本必须复用 accepted 阶段的 placeholder item"
+        );
+        let canonical_turn = store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .find(|turn| turn.turn_id == "turn-placeholder-reuse")
+            .expect("canonical turn should be stored");
+        let assistant_items = canonical_turn
+            .items
+            .iter()
+            .filter(|item| item.kind == CanonicalTurnItemKind::AssistantText)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            assistant_items.len(),
+            1,
+            "流式正文不能在 placeholder 之外新增第二条 assistant item"
+        );
+        assert_eq!(assistant_items[0].item_id, "assistant-placeholder-reuse");
+        assert_eq!(assistant_items[0].item_seq, 2);
+        assert_eq!(
+            assistant_items[0].status,
+            CanonicalTurnItemStatus::Completed
+        );
+        assert_eq!(assistant_items[0].content.as_deref(), Some("你好"));
     }
 
     #[test]
@@ -828,6 +1069,7 @@ mod tests {
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
+            forced_tool_name: None,
         };
         let messages = build_session_turn_messages(&store, &request, &request.prompt);
 
@@ -884,6 +1126,7 @@ mod tests {
             request_id: Some("request-post-tool-final-item".to_string()),
             user_message_id: Some("user-post-tool-final-item".to_string()),
             placeholder_message_id: Some("placeholder-post-tool-final-item".to_string()),
+            forced_tool_name: None,
         };
 
         let mut pre_tool_stream = session_turn_item(
@@ -940,13 +1183,34 @@ mod tests {
             post_tool_item.content.as_deref(),
             Some("最终答案来自工具后轮次。")
         );
+        let canonical_turn = store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .find(|turn| turn.turn_id == "turn-post-tool-final-item")
+            .expect("canonical turn should be stored");
+        let canonical_post_tool_item = canonical_turn
+            .items
+            .iter()
+            .find(|item| item.item_id == "turn-item-assistant-stream-post-tool")
+            .expect("post-tool canonical assistant item should remain stored");
+        assert_eq!(
+            canonical_post_tool_item.kind,
+            CanonicalTurnItemKind::AssistantText
+        );
+        assert_eq!(
+            canonical_post_tool_item.status,
+            CanonicalTurnItemStatus::Completed
+        );
+        assert_eq!(
+            canonical_post_tool_item.content.as_deref(),
+            Some("最终答案来自工具后轮次。")
+        );
         assert!(
             store
                 .timeline_for_session(&session_id)
                 .iter()
-                .any(|entry| entry.entry_id == "turn-item-assistant-stream-main"
-                    && entry.message.contains("最终答案来自工具后轮次。")),
-            "完成态 snapshot 必须写回主 timeline entry"
+                .all(|entry| !entry.message.contains("最终答案来自工具后轮次。")),
+            "完成态不能再反向写 completed snapshot 作为正文事实源"
         );
     }
 
@@ -983,6 +1247,7 @@ mod tests {
             request_id: Some("request-terminal-duration".to_string()),
             user_message_id: Some("user-terminal-duration".to_string()),
             placeholder_message_id: Some("placeholder-terminal-duration".to_string()),
+            forced_tool_name: None,
         };
 
         append_final_item(&event_bus, &store, &request, "最终回复", None, None);
@@ -1006,13 +1271,12 @@ mod tests {
         );
         assert!(
             store
-                .timeline_for_session(&session_id)
+                .canonical_turns_for_session(&session_id)
                 .iter()
-                .any(
-                    |entry| matches!(entry.kind, TimelineEntryKind::AssistantMessage)
-                        && entry.message.contains("\"response_duration_ms\"")
-                ),
-            "持久 snapshot 必须携带后端完成耗时"
+                .any(|turn| turn.turn_id == "turn-terminal-duration"
+                    && turn.response_duration_ms.is_some()
+                    && turn.status == CanonicalTurnStatus::Completed),
+            "持久 canonical turn 必须携带后端完成耗时"
         );
     }
 }

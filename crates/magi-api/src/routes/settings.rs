@@ -1458,13 +1458,70 @@ mod tests {
         let builtin_tools = bootstrap["builtinTools"]
             .as_array()
             .expect("builtin tools should be an array");
-        assert_eq!(builtin_tools.len(), 21);
+        assert_eq!(builtin_tools.len(), 16);
+        let builtin_names: Vec<_> = builtin_tools
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("tool name"))
+            .collect();
+        assert_eq!(
+            builtin_names,
+            vec![
+                "file_read",
+                "file_write",
+                "file_patch",
+                "file_remove",
+                "file_mkdir",
+                "file_copy",
+                "file_move",
+                "search_text",
+                "search_semantic",
+                "shell_exec",
+                "process_inspect",
+                "diff_preview",
+                "web_search",
+                "web_fetch",
+                "diagram_render",
+                "knowledge_query",
+            ],
+            "bootstrap must expose one canonical public builtin surface in a stable order"
+        );
         assert!(
             builtin_tools
                 .iter()
                 .any(|tool| tool["name"] == serde_json::json!("shell_exec")),
             "builtin tools should expose shell_exec"
         );
+        assert!(
+            builtin_tools
+                .iter()
+                .any(|tool| tool["name"] == serde_json::json!("diagram_render")),
+            "builtin tools should expose the unified diagram_render surface"
+        );
+        assert!(
+            builtin_tools
+                .iter()
+                .all(|tool| tool["name"] != serde_json::json!("mermaid_diagram")),
+            "mermaid_diagram should not remain a public builtin surface"
+        );
+        assert!(
+            builtin_tools
+                .iter()
+                .all(|tool| tool["name"] != serde_json::json!("process_launch")),
+            "process_launch should remain an internal shell runtime capability"
+        );
+        for internal_tool in [
+            "process_read",
+            "process_write",
+            "process_kill",
+            "process_list",
+        ] {
+            assert!(
+                builtin_tools
+                    .iter()
+                    .all(|tool| tool["name"] != serde_json::json!(internal_tool)),
+                "{internal_tool} should remain an internal shell runtime capability"
+            );
+        }
         assert_eq!(bootstrap["userRulesConfig"], serde_json::json!({}));
         assert_eq!(
             bootstrap["runtimeSettings"]["locale"],

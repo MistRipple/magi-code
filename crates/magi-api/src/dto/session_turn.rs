@@ -1,4 +1,5 @@
 use magi_core::{EventId, SessionId, TaskId, UtcMillis};
+use magi_session_store::{CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnItem};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -110,6 +111,14 @@ pub struct SessionTurnResponseDto {
     pub execution_chain_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_message_item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_schema_version: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_event_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_turn: Option<CanonicalTurn>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_item: Option<CanonicalTurnItem>,
 }
 
 impl SessionTurnResponseDto {
@@ -136,7 +145,26 @@ impl SessionTurnResponseDto {
             action_task_id: action_task_id.map(|task_id| task_id.to_string()),
             execution_chain_ref,
             user_message_item_id,
+            canonical_schema_version: None,
+            canonical_event_kind: None,
+            canonical_turn: None,
+            canonical_item: None,
         }
+    }
+
+    pub fn with_canonical_event(
+        mut self,
+        event_kind: &str,
+        turn: Option<CanonicalTurn>,
+        item: Option<CanonicalTurnItem>,
+    ) -> Self {
+        if turn.is_some() || item.is_some() {
+            self.canonical_schema_version = Some(CANONICAL_TURN_SCHEMA_VERSION);
+            self.canonical_event_kind = Some(event_kind.to_string());
+            self.canonical_turn = turn;
+            self.canonical_item = item;
+        }
+        self
     }
 }
 

@@ -51,6 +51,38 @@
     return typeof value === 'string' ? value : undefined;
   }
 
+  function joinTerminalStreams(stdout: unknown, stderr: unknown): string | undefined {
+    const stdoutText = readString(stdout) || '';
+    const stderrText = readString(stderr) || '';
+    if (!stdoutText && !stderrText) return undefined;
+    if (!stdoutText) return stderrText;
+    if (!stderrText) return stdoutText;
+    return stdoutText.endsWith('\n') ? `${stdoutText}${stderrText}` : `${stdoutText}\n${stderrText}`;
+  }
+
+  function terminalStatusFromCanonical(
+    canonicalStatus?: 'pending' | 'running' | 'success' | 'error',
+    payloadStatus?: string,
+  ): string {
+    if (canonicalStatus === 'error') {
+      const normalizedPayloadStatus = (payloadStatus || '').trim().toLowerCase();
+      if (
+        normalizedPayloadStatus
+        && normalizedPayloadStatus !== 'succeeded'
+        && normalizedPayloadStatus !== 'success'
+        && normalizedPayloadStatus !== 'completed'
+        && normalizedPayloadStatus !== 'complete'
+        && normalizedPayloadStatus !== 'done'
+      ) {
+        return payloadStatus || 'error';
+      }
+      return 'error';
+    }
+    if (canonicalStatus === 'running' || canonicalStatus === 'pending') {
+      return canonicalStatus;
+    }
+    return payloadStatus || canonicalStatus || 'running';
+  }
 
   function toggle(): void {
     if (!canToggle) {
@@ -67,6 +99,7 @@
     }
     const rawMode = parsedResult?.run_mode;
     const runMode = rawMode === 'service' || rawMode === 'task' ? rawMode : undefined;
+    const streamOutput = joinTerminalStreams(parsedResult?.stdout, parsedResult?.stderr);
     return {
       terminalId: readInt(parsedResult?.terminal_id) ?? readInt(toolCall?.arguments?.terminal_id),
       status: readString(parsedResult?.status) || undefined,
@@ -76,7 +109,7 @@
       cwd: readString(parsedResult?.cwd),
       command: readString(parsedResult?.command)
         ?? (typeof toolCall?.arguments?.command === 'string' ? toolCall.arguments.command : undefined),
-      output: readString(parsedResult?.output) || readString(parsedResult?.final_output) || undefined,
+      output: readString(parsedResult?.output) || readString(parsedResult?.final_output) || streamOutput,
       outputCursor: readInt(parsedResult?.output_cursor),
       outputStartCursor: readInt(parsedResult?.output_start_cursor),
       fromCursor: readInt(parsedResult?.from_cursor),
@@ -92,7 +125,7 @@
         : undefined,
       startupMessage: readString(parsedResult?.startup_message),
       locked: readBool(parsedResult?.locked),
-      returnCode: readNullableInt(parsedResult?.return_code),
+      returnCode: readNullableInt(parsedResult?.return_code) ?? readNullableInt(parsedResult?.exit_code),
       accepted: readBool(parsedResult?.accepted),
       killed: readBool(parsedResult?.killed),
       releasedLock: readBool(parsedResult?.released_lock),
@@ -100,7 +133,7 @@
     };
   });
   const terminalId = $derived(terminal?.terminalId);
-  const displayStatus = $derived(terminal?.status || status || toolCall?.status || 'running');
+  const displayStatus = $derived(terminalStatusFromCanonical(status || toolCall?.status, terminal?.status));
   const displayPhase = $derived(terminal?.phase || '');
   const displayMode = $derived(terminal?.runMode || '');
   const displayCommand = $derived(terminal?.command || '');
@@ -109,6 +142,9 @@
     const fromTerminal = terminal?.output;
     if (typeof fromTerminal === 'string' && fromTerminal.length > 0) {
       return formatOutput(fromTerminal);
+    }
+    if (parsedResult) {
+      return '';
     }
     const raw = typeof toolCall?.result === 'string' ? toolCall.result : '';
     return formatOutput(raw);

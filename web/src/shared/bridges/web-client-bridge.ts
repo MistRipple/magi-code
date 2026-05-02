@@ -84,9 +84,6 @@ import {
 import type { ClientBridge, ClientBridgeMessage, SupportedLocale } from './client-bridge';
 import {
   createNotifyMessage,
-  createErrorMessage,
-  createStreamingMessage,
-  createUserInputMessage,
   generateMessageId,
   MessageCategory,
   MessageLifecycle,
@@ -110,7 +107,11 @@ import {
   type BootstrapPayload,
   type RustEventEnvelope,
 } from './rust-daemon-contract';
-import { parseCanonicalTurnEventPayload } from '../protocol/canonical-turn';
+import {
+  CANONICAL_TURN_SCHEMA_VERSION,
+  parseCanonicalTurnEventPayload,
+  type CanonicalTurnEvent,
+} from '../protocol/canonical-turn';
 import type { SseConnection } from '../transport';
 import {
   activateTaskGraphSession,
@@ -119,7 +120,7 @@ import {
   getTaskGraphState,
   clearTaskGraph,
 } from '../../stores/task-graph-store.svelte';
-import { sanitizeMermaidSvgContent } from '../mermaid-svg-sanitizer';
+import { sanitizeSvgContent } from '../svg-sanitizer';
 import { RustDaemonClient } from '../rust-daemon-client';
 import {
   dequeueQueuedMessage,
@@ -127,7 +128,12 @@ import {
   markQueuedMessageAsGuide,
   messagesState,
   allocateTurnOrderSeq,
+  addPendingRequest,
+  clearRequestBinding,
+  createRequestBinding,
+  markMessageActive,
   setQueuedMessages,
+  updateRequestBinding,
 } from '../../stores/messages.svelte';
 import { resolveModelListFetchBlockReason } from '../model-governance';
 import type { QueuedMessage } from '../../types/message';
@@ -718,6 +724,205 @@ function emitDataMessage(dataType: DataMessageType, payload: Record<string, unkn
   emitMessage({ type: 'unifiedMessage', message });
 }
 
+function emitSessionTurnCanonicalEvent(canonicalEvent: CanonicalTurnEvent): void {
+  emitDataMessage('sessionTurnCanonicalEventUpdated', {
+    sessionId: canonicalEvent.sessionId,
+    canonicalEvent,
+  });
+}
+
+function emitLocalPendingCanonicalTurn(input: {
+  sessionId: string;
+  requestId: string;
+  userMessageId: string;
+  placeholderMessageId: string;
+  text: string;
+  turnSeq: number;
+  createdAt: number;
+}): boolean {
+  const sessionId = input.sessionId.trim();
+  if (!sessionId || !input.requestId || input.turnSeq <= 0) {
+    return false;
+  }
+  const turnId = `turn-local-${input.requestId}`;
+  const sharedMetadata = {
+    requestId: input.requestId,
+    userMessageId: input.userMessageId,
+    placeholderMessageId: input.placeholderMessageId,
+    localOptimistic: true,
+  };
+  const assistantItem = {
+    sessionId,
+    turnId,
+    turnSeq: input.turnSeq,
+    itemId: input.placeholderMessageId,
+    itemSeq: 2,
+    kind: 'assistant_text' as const,
+    createdAt: input.createdAt,
+    status: 'running' as const,
+    updatedAt: input.createdAt,
+    title: '生成回复',
+    content: '',
+    visibility: {
+      threadVisible: true,
+      workerVisible: false,
+      renderable: true,
+    },
+    metadata: sharedMetadata,
+  };
+  emitSessionTurnCanonicalEvent({
+    schemaVersion: CANONICAL_TURN_SCHEMA_VERSION,
+    eventId: `event-local-turn-started-${input.requestId}`,
+    eventSeq: 0,
+    kind: 'turn_started',
+    sessionId,
+    turnId,
+    turnSeq: input.turnSeq,
+    occurredAt: input.createdAt,
+    turn: {
+      sessionId,
+      turnId,
+      turnSeq: input.turnSeq,
+      acceptedAt: input.createdAt,
+      status: 'running',
+      metadata: sharedMetadata,
+      items: [
+        {
+          sessionId,
+          turnId,
+          turnSeq: input.turnSeq,
+          itemId: input.userMessageId,
+          itemSeq: 1,
+          kind: 'user_message',
+          createdAt: input.createdAt,
+          status: 'completed',
+          updatedAt: input.createdAt,
+          content: input.text,
+          visibility: {
+            threadVisible: true,
+            workerVisible: false,
+            renderable: true,
+          },
+          metadata: sharedMetadata,
+        },
+        assistantItem,
+      ],
+    },
+    item: assistantItem,
+  });
+  return true;
+}
+
+function emitLocalPendingCanonicalTurnFailed(input: {
+  sessionId: string;
+  requestId: string;
+  userMessageId: string;
+  placeholderMessageId: string;
+  text: string;
+  turnSeq: number;
+  createdAt: number;
+  failedAt: number;
+  error: string;
+}): boolean {
+  const sessionId = input.sessionId.trim();
+  if (!sessionId || !input.requestId || input.turnSeq <= 0) {
+    return false;
+  }
+  const turnId = `turn-local-${input.requestId}`;
+  const sharedMetadata = {
+    requestId: input.requestId,
+    userMessageId: input.userMessageId,
+    placeholderMessageId: input.placeholderMessageId,
+    localTerminal: true,
+  };
+  const userItem = {
+    sessionId,
+    turnId,
+    turnSeq: input.turnSeq,
+    itemId: input.userMessageId,
+    itemSeq: 1,
+    kind: 'user_message' as const,
+    createdAt: input.createdAt,
+    status: 'completed' as const,
+    updatedAt: input.createdAt,
+    content: input.text,
+    visibility: {
+      threadVisible: true,
+      workerVisible: false,
+      renderable: true,
+    },
+    metadata: sharedMetadata,
+  };
+  const assistantItem = {
+    sessionId,
+    turnId,
+    turnSeq: input.turnSeq,
+    itemId: input.placeholderMessageId,
+    itemSeq: 2,
+    kind: 'assistant_text' as const,
+    createdAt: input.createdAt,
+    status: 'failed' as const,
+    updatedAt: input.failedAt,
+    title: '发送失败',
+    content: input.error,
+    visibility: {
+      threadVisible: true,
+      workerVisible: false,
+      renderable: true,
+    },
+    metadata: sharedMetadata,
+  };
+  emitSessionTurnCanonicalEvent({
+    schemaVersion: CANONICAL_TURN_SCHEMA_VERSION,
+    eventId: `event-local-turn-failed-${input.requestId}`,
+    eventSeq: 0,
+    kind: 'turn_completed',
+    sessionId,
+    turnId,
+    turnSeq: input.turnSeq,
+    occurredAt: input.failedAt,
+    turn: {
+      sessionId,
+      turnId,
+      turnSeq: input.turnSeq,
+      acceptedAt: input.createdAt,
+      completedAt: input.failedAt,
+      status: 'failed',
+      responseDurationMs: Math.max(0, input.failedAt - input.createdAt),
+      metadata: sharedMetadata,
+      items: [userItem, assistantItem],
+    },
+    item: assistantItem,
+  });
+  return true;
+}
+
+function emitAcceptedCanonicalTurnFromResult(result: {
+  eventId: string;
+  acceptedAt: number;
+  canonicalSchemaVersion?: string | null;
+  canonicalEventKind?: string | null;
+  canonicalTurn?: unknown;
+  canonicalItem?: unknown;
+}): void {
+  if (!result.canonicalTurn && !result.canonicalItem) {
+    return;
+  }
+  const canonicalEvent = parseCanonicalTurnEventPayload({
+    canonical_schema_version: result.canonicalSchemaVersion || CANONICAL_TURN_SCHEMA_VERSION,
+    canonical_event_kind: result.canonicalEventKind || 'turn_started',
+    canonical_turn: result.canonicalTurn,
+    canonical_item: result.canonicalItem,
+  }, {
+    eventId: result.eventId,
+    eventSeq: 0,
+    occurredAt: result.acceptedAt,
+  });
+  if (canonicalEvent) {
+    emitSessionTurnCanonicalEvent(canonicalEvent);
+  }
+}
+
 function handleSessionTurnItemEvent(event: RustEventEnvelope): boolean {
   const canonicalEvent = parseCanonicalTurnEventPayload(event.payload, {
     eventId: trimBridgeString(event.event_id),
@@ -732,10 +937,7 @@ function handleSessionTurnItemEvent(event: RustEventEnvelope): boolean {
     console.error('[web-client-bridge] session.turn.item 缺少 canonical payload，已拒绝旧 projection live 写入');
     return false;
   }
-  emitDataMessage('sessionTurnCanonicalEventUpdated', {
-    sessionId: canonicalEvent.sessionId,
-    canonicalEvent,
-  });
+  emitSessionTurnCanonicalEvent(canonicalEvent);
   return true;
 }
 
@@ -779,6 +981,18 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
         createdSession: event.payload.created_session ?? event.payload.createdSession ?? false,
         route: event.payload.route ?? (eventType === 'session.turn.task.accepted' ? 'task' : ''),
       });
+    }
+    const canonicalEvent = parseCanonicalTurnEventPayload(event.payload, {
+      eventId: trimBridgeString(event.event_id),
+      eventSeq: typeof event.sequence === 'number' && Number.isFinite(event.sequence)
+        ? Math.floor(event.sequence)
+        : 0,
+      occurredAt: typeof event.occurred_at === 'number' && Number.isFinite(event.occurred_at)
+        ? Math.floor(event.occurred_at)
+        : Date.now(),
+    });
+    if (canonicalEvent) {
+      emitSessionTurnCanonicalEvent(canonicalEvent);
     }
   }
 
@@ -1855,21 +2069,6 @@ function bridgeRuntimeIsBusy(): boolean {
   );
 }
 
-function emitQueuedUserMessage(queued: QueuedMessage): void {
-  const userMessage = createUserInputMessage(queued.content, `queued-user-${queued.id}`, {
-    id: `queued-user-${queued.id}`,
-    metadata: {
-      extra: {
-        queued: true,
-        queuedMessageId: queued.id,
-        queueMode: queued.mode || 'queue',
-      },
-      images: queued.images && queued.images.length > 0 ? queued.images : undefined,
-    },
-  });
-  emitMessage({ type: 'unifiedMessage', message: userMessage });
-}
-
 function enqueueFollowUpTurn(input: ExecuteTaskInput, normalizedText: string, mode: 'queue' | 'guide' = 'queue'): void {
   const queued: QueuedMessage = {
     id: input.requestId || generateMessageId(),
@@ -1883,7 +2082,6 @@ function enqueueFollowUpTurn(input: ExecuteTaskInput, normalizedText: string, mo
     images: input.images,
   };
   enqueueQueuedMessage(queued);
-  emitQueuedUserMessage(queued);
   scheduleQueuedTurnDrain('enqueue_follow_up', QUEUE_DRAIN_BUSY_RETRY_MS);
 }
 
@@ -2037,47 +2235,35 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     : generateMessageId();
   const placeholderMessageId = `assistant-placeholder-${requestId}`;
   const turnOrderSeq = allocateTurnOrderSeq();
+  const requestCreatedAt = Date.now();
+
+  createRequestBinding({
+    requestId,
+    userMessageId,
+    placeholderMessageId,
+    turnOrderSeq,
+    createdAt: requestCreatedAt,
+  });
 
   emitDataMessage('processingStateChanged', {
     isProcessing: true,
     source: 'orchestrator',
     agent: 'orchestrator',
-    startedAt: Date.now(),
+    startedAt: requestCreatedAt,
     pendingRequestIds: [requestId],
   });
   if (!isQueuedDrainSubmission) {
-    // 普通发送必须立即入列；排队消息已有 queued echo，提交成功前不改写主线。
-    const localUserMsg = createUserInputMessage(normalizedText, `user-input-${requestId}`, {
-      metadata: {
-        requestId,
-        userMessageId,
-        placeholderMessageId,
-        turnOrderSeq,
-        itemSeq: 1,
-        blockSeq: 1,
-        cardStreamSeq: 1,
-        turnItemKind: 'user_message',
-        ...(currentSessionId ? { sessionId: currentSessionId } : {}),
-      },
-      id: userMessageId,
+    addPendingRequest(requestId);
+    markMessageActive(placeholderMessageId);
+    emitLocalPendingCanonicalTurn({
+      sessionId: currentSessionId,
+      requestId,
+      userMessageId,
+      placeholderMessageId,
+      text: normalizedText,
+      turnSeq: turnOrderSeq,
+      createdAt: requestCreatedAt,
     });
-    emitMessage({ type: 'unifiedMessage', message: localUserMsg });
-    const localPlaceholder = createStreamingMessage('orchestrator', 'orchestrator', `assistant-placeholder-${requestId}`, {
-      id: placeholderMessageId,
-      metadata: {
-        requestId,
-        userMessageId,
-        placeholderMessageId,
-        isPlaceholder: true,
-        placeholderState: 'pending',
-        turnOrderSeq,
-        itemSeq: 2,
-        blockSeq: 2,
-        cardStreamSeq: 2,
-        ...(currentSessionId ? { sessionId: currentSessionId } : {}),
-      },
-    });
-    emitMessage({ type: 'unifiedMessage', message: localPlaceholder });
   }
 
   try {
@@ -2096,7 +2282,8 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       sessionId: currentSessionId,
     });
 
-    // 后端返回 canonical userMessageItemId，emit 更新消息以替换前端临时节点
+    emitAcceptedCanonicalTurnFromResult(turnResult);
+
     const canonicalUserMessageId = turnResult.userMessageItemId || userMessageId;
     const canonicalTurnSeq = typeof turnResult.acceptedAt === 'number' && Number.isFinite(turnResult.acceptedAt)
       ? Math.max(1, Math.floor(turnResult.acceptedAt))
@@ -2104,42 +2291,14 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     const resolvedSessionId = typeof turnResult.sessionId === 'string' && turnResult.sessionId.trim()
       ? turnResult.sessionId.trim()
       : currentSessionId;
-    const userMsg = createUserInputMessage(normalizedText, `user-input-${requestId}`, {
-      metadata: {
-        requestId,
-        userMessageId,
-        placeholderMessageId,
-        turnItemId: canonicalUserMessageId,
-        turnOrderSeq,
-        ...(typeof canonicalTurnSeq === 'number' ? { turnSeq: canonicalTurnSeq } : {}),
-        itemSeq: 1,
-        blockSeq: 1,
-        cardStreamSeq: 1,
-        turnItemKind: 'user_message',
-        ...(resolvedSessionId ? { sessionId: resolvedSessionId } : {}),
-        images: images.length > 0 ? images : undefined,
-      },
-      id: canonicalUserMessageId,
+    updateRequestBinding(requestId, {
+      userMessageId: canonicalUserMessageId,
+      placeholderMessageId,
+      ...(typeof canonicalTurnSeq === 'number' ? { turnSeq: canonicalTurnSeq } : {}),
     });
-    emitMessage({ type: 'unifiedMessage', message: userMsg });
-    if (isQueuedDrainSubmission || typeof canonicalTurnSeq === 'number') {
-      const canonicalPlaceholder = createStreamingMessage('orchestrator', 'orchestrator', `assistant-placeholder-${requestId}`, {
-        id: placeholderMessageId,
-        metadata: {
-          requestId,
-          userMessageId,
-          placeholderMessageId,
-          isPlaceholder: true,
-          placeholderState: 'pending',
-          turnOrderSeq,
-          ...(typeof canonicalTurnSeq === 'number' ? { turnSeq: canonicalTurnSeq } : {}),
-          itemSeq: 2,
-          blockSeq: 2,
-          cardStreamSeq: 2,
-          ...(resolvedSessionId ? { sessionId: resolvedSessionId } : {}),
-        },
-      });
-      emitMessage({ type: 'unifiedMessage', message: canonicalPlaceholder });
+    if (isQueuedDrainSubmission) {
+      addPendingRequest(requestId);
+      markMessageActive(placeholderMessageId);
     }
     if (resolvedSessionId) {
       persistWorkspaceBinding(currentWorkspaceId, currentWorkspacePath, resolvedSessionId);
@@ -2168,30 +2327,19 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     console.error('[web-client-bridge] 执行任务失败:', error);
     const errorText = normalizeErrorMessage(error) || '发送消息失败';
     if (!isQueuedDrainSubmission) {
-      const localErrorMessage = createErrorMessage(
-        errorText,
-        'orchestrator',
-        'orchestrator',
-        `assistant-error-${requestId}`,
-        {
-          id: placeholderMessageId,
-          metadata: {
-            error: errorText,
-            requestId,
-            userMessageId,
-            placeholderMessageId,
-            wasPlaceholder: true,
-            turnItemKind: 'assistant_error',
-            turnOrderSeq,
-            itemSeq: 2,
-            blockSeq: 2,
-            cardStreamSeq: 2,
-            ...(currentSessionId ? { sessionId: currentSessionId } : {}),
-          },
-        },
-      );
-      emitMessage({ type: 'unifiedComplete', message: localErrorMessage });
+      emitLocalPendingCanonicalTurnFailed({
+        sessionId: currentSessionId,
+        requestId,
+        userMessageId,
+        placeholderMessageId,
+        text: normalizedText,
+        turnSeq: turnOrderSeq,
+        createdAt: requestCreatedAt,
+        failedAt: Date.now(),
+        error: errorText,
+      });
     }
+    clearRequestBinding(requestId);
     emitBridgeErrorToast('发送消息', error);
     emitForcedProcessingIdle('execute_task_failed', {
       error: normalizeErrorMessage(error),
@@ -2327,7 +2475,7 @@ function openPreviewWindow(title: string, subtitle: string, content: string, mod
   popup.document.close();
 }
 
-function openMermaidSvgPreview(title: string, svgContent: string): void {
+function openDiagramSvgPreview(title: string, svgContent: string): void {
   const popup = window.open('', '_blank', 'noopener,noreferrer');
   if (!popup) {
     throw new Error('浏览器阻止了预览窗口，请允许当前站点打开新窗口。');
@@ -2358,14 +2506,15 @@ function openMermaidSvgPreview(title: string, svgContent: string): void {
   popup.document.close();
 }
 
-function openMermaidPreview(code: string, title?: string, svgContent?: string): void {
-  const resolvedTitle = title?.trim() || 'Mermaid 图表';
-  const sanitizedSvg = typeof svgContent === 'string' ? sanitizeMermaidSvgContent(svgContent) : '';
+function openDiagramPreview(kind: string, source: string, title?: string, svgContent?: string): void {
+  const resolvedKind = kind.trim() || 'diagram';
+  const resolvedTitle = title?.trim() || '图表';
+  const sanitizedSvg = typeof svgContent === 'string' ? sanitizeSvgContent(svgContent) : '';
   if (sanitizedSvg) {
-    openMermaidSvgPreview(resolvedTitle, sanitizedSvg);
+    openDiagramSvgPreview(resolvedTitle, sanitizedSvg);
     return;
   }
-  openPreviewWindow(resolvedTitle, 'Mermaid 源码预览', code, 'file');
+  openPreviewWindow(resolvedTitle, `${resolvedKind} 源码预览`, source, 'file');
 }
 
 async function openFilePreview(filePath: string, previewContent?: string): Promise<void> {
@@ -3139,13 +3288,18 @@ export function createWebClientBridge(): ClientBridge {
             window.open(message.url, '_blank', 'noopener,noreferrer');
           }
           return;
-        case 'openMermaidPanel':
+        case 'openDiagramPanel':
           if (forwardToVsCodeHost(message)) {
             return;
           }
-          if (typeof message.code === 'string' && message.code.trim()) {
-            openMermaidPreview(
-              message.code,
+          {
+            const source = typeof message.source === 'string' ? message.source : '';
+            if (!source.trim()) {
+              return;
+            }
+            openDiagramPreview(
+              typeof message.kind === 'string' ? message.kind : 'mermaid',
+              source,
               typeof message.title === 'string' ? message.title : undefined,
               typeof message.svgContent === 'string' ? message.svgContent : undefined,
             );

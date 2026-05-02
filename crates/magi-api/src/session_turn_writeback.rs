@@ -1,4 +1,5 @@
 use crate::{
+    builtin_tool_schema::internal_builtin_tool_rejection_payload,
     skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime},
     tool_result_utils::{
         summarize_tool_result, tool_execution_status_label, turn_item_status_for_tool_result,
@@ -199,12 +200,57 @@ fn to_canonical_worker_ref(item: &ActiveExecutionTurnItem) -> Option<CanonicalWo
     })
 }
 
+fn canonical_item_metadata(item: &ActiveExecutionTurnItem) -> HashMap<String, Value> {
+    let mut metadata = HashMap::new();
+    if let Some(value) = item
+        .request_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        metadata.insert("requestId".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = item
+        .user_message_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        metadata.insert("userMessageId".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = item
+        .placeholder_message_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        metadata.insert(
+            "placeholderMessageId".to_string(),
+            Value::String(value.clone()),
+        );
+    }
+    metadata
+}
+
+fn canonical_item_renderable(
+    item: &ActiveExecutionTurnItem,
+    kind: CanonicalTurnItemKind,
+    status: CanonicalTurnItemStatus,
+) -> bool {
+    let has_content = item
+        .content
+        .as_ref()
+        .is_some_and(|content| !content.trim().is_empty());
+    if kind == CanonicalTurnItemKind::AssistantText {
+        return has_content || !status.is_terminal();
+    }
+    has_content || item.tool_call_id.is_some() || item.worker_id.is_some() || item.task_id.is_some()
+}
+
 fn to_canonical_turn_item(
     session_id: &SessionId,
     turn: &ActiveExecutionTurn,
     item: &ActiveExecutionTurnItem,
 ) -> Option<CanonicalTurnItem> {
     let kind = canonical_item_kind(&item.kind)?;
+    let status = canonical_item_status(&item.status)?;
     let tool = to_canonical_tool_call(item);
     if kind == CanonicalTurnItemKind::ToolCall && tool.is_none() {
         return None;
@@ -217,7 +263,7 @@ fn to_canonical_turn_item(
         item_seq: item.item_seq,
         kind,
         created_at: turn.accepted_at,
-        status: canonical_item_status(&item.status)?,
+        status,
         item_version: None,
         updated_at: UtcMillis::now(),
         lane_id: item.lane_id.clone(),
@@ -230,20 +276,14 @@ fn to_canonical_turn_item(
         visibility: CanonicalTurnVisibility {
             thread_visible: item.thread_visible,
             worker_visible: item.worker_visible,
-            renderable: item
-                .content
-                .as_ref()
-                .is_none_or(|content| !content.trim().is_empty())
-                || item.tool_call_id.is_some()
-                || item.worker_id.is_some()
-                || item.task_id.is_some(),
+            renderable: canonical_item_renderable(item, kind, status),
             worker_tab_ids: item
                 .worker_id
                 .as_ref()
                 .map(|worker_id| vec![worker_id.to_string()])
                 .unwrap_or_default(),
         },
-        metadata: HashMap::new(),
+        metadata: canonical_item_metadata(item),
     })
 }
 
@@ -781,6 +821,10 @@ fn execute_session_turn_tool_call(
         return execute_skill_apply_from_runtime(&tool_call.function.arguments, skill_runtime);
     }
 
+    if let Some(rejection) = internal_builtin_tool_rejection_payload(&tool_call.function.name) {
+        return (rejection, ExecutionResultStatus::Failed);
+    }
+
     let output = registry.execute_with_policy(
         ToolExecutionInput {
             tool_call_id: ToolCallId::new(&tool_call.id),
@@ -974,6 +1018,43 @@ mod tests {
     }
 
     #[test]
+    fn execute_session_turn_tool_call_rejects_internal_process_launch_surface() {
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let call = ChatToolCall {
+            id: "tool-call-process-launch".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "process_launch".to_string(),
+                arguments: serde_json::json!({ "command": "sleep 60" }).to_string(),
+            },
+        };
+
+        let (payload, status) = execute_session_turn_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &call,
+            &SessionId::new("session-1"),
+            &None,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "process_launch");
+        assert_eq!(parsed["status"], "failed");
+        assert!(
+            parsed["error"]
+                .as_str()
+                .expect("error should be string")
+                .contains("shell_exec")
+        );
+    }
+
+    #[test]
     fn session_turn_shell_tool_batch_executes_concurrently_and_preserves_order() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(32);
@@ -1080,14 +1161,68 @@ mod tests {
         assert_eq!(
             turn.items
                 .iter()
-                .map(|item| (item.kind.as_str(), item.tool_call_id.as_deref()))
+                .map(|item| (
+                    item.kind.as_str(),
+                    item.status.as_str(),
+                    item.item_seq,
+                    item.tool_call_id.as_deref(),
+                    item.tool_result.is_some(),
+                ))
                 .collect::<Vec<_>>(),
             vec![
-                ("tool_call_started", Some("tool-call-shell-a")),
-                ("tool_call_started", Some("tool-call-shell-b")),
-                ("tool_call_result", Some("tool-call-shell-a")),
-                ("tool_call_result", Some("tool-call-shell-b")),
+                (
+                    "tool_call_result",
+                    "completed",
+                    1,
+                    Some("tool-call-shell-a"),
+                    true
+                ),
+                (
+                    "tool_call_result",
+                    "completed",
+                    2,
+                    Some("tool-call-shell-b"),
+                    true
+                ),
             ]
+        );
+        let canonical_turn = session_store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .find(|turn| turn.turn_id == "turn-shell-batch")
+            .expect("canonical turn should be stored");
+        assert_eq!(
+            canonical_turn
+                .items
+                .iter()
+                .map(|item| (
+                    item.kind,
+                    item.status,
+                    item.item_seq,
+                    item.tool.as_ref().map(|tool| tool.call_id.as_str()),
+                    item.tool
+                        .as_ref()
+                        .and_then(|tool| tool.result.as_ref())
+                        .is_some(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    CanonicalTurnItemKind::ToolCall,
+                    CanonicalTurnItemStatus::Completed,
+                    1,
+                    Some("tool-call-shell-a"),
+                    true
+                ),
+                (
+                    CanonicalTurnItemKind::ToolCall,
+                    CanonicalTurnItemStatus::Completed,
+                    2,
+                    Some("tool-call-shell-b"),
+                    true
+                ),
+            ],
+            "工具 started/result 必须收敛为同一批 canonical tool item，且保持模型调用顺序"
         );
 
         let snapshot_event = event_bus
@@ -1107,7 +1242,7 @@ mod tests {
                 .get("turn_items")
                 .and_then(serde_json::Value::as_array)
                 .map(Vec::len),
-            Some(4),
+            Some(2),
             "实时 turn item 事件必须携带当前 turn 的全部 item"
         );
         assert!(

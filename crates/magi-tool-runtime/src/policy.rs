@@ -111,14 +111,20 @@ impl ToolRegistry {
     }
 
     pub(crate) fn resolve_access_mode(&self, input: &ToolExecutionInput) -> BuiltinToolAccessMode {
-        if input.tool_name == crate::BuiltinToolName::ShellExec.as_str()
-            || input.tool_name == crate::BuiltinToolName::ProcessLaunch.as_str()
+        let Some(tool_name) = crate::BuiltinToolName::from_str(input.tool_name.trim()) else {
+            return BuiltinToolAccessMode::ReadOnly;
+        };
+        if tool_name == crate::BuiltinToolName::ShellExec
+            || tool_name == crate::BuiltinToolName::ProcessLaunch
         {
-            self.parse_requested_access_mode(&input.input)
-                .unwrap_or(BuiltinToolAccessMode::MaybeWrite)
-        } else {
-            BuiltinToolAccessMode::ReadOnly
+            return self
+                .parse_requested_access_mode(&input.input)
+                .unwrap_or(BuiltinToolAccessMode::MaybeWrite);
         }
+        if tool_name.is_write_operation() {
+            return BuiltinToolAccessMode::ExplicitWrite;
+        }
+        BuiltinToolAccessMode::ReadOnly
     }
 
     pub(crate) fn parse_requested_access_mode(&self, input: &str) -> Option<BuiltinToolAccessMode> {

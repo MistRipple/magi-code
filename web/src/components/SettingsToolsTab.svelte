@@ -53,11 +53,6 @@
 
   const BUILTIN_TOOL_LABELS: Record<string, string> = {
     shell_exec: 'Shell 命令',
-    process_launch: '长任务启动',
-    process_read: '进程输出读取',
-    process_write: '进程输入写入',
-    process_kill: '进程终止',
-    process_list: '进程列表',
     process_inspect: '进程检查',
     file_read: '读取文件',
     file_write: '写入文件',
@@ -71,7 +66,7 @@
     diff_preview: '差异预览',
     web_search: '网页搜索',
     web_fetch: '网页读取',
-    mermaid_diagram: 'Mermaid 图表',
+    diagram_render: '图表渲染',
     knowledge_query: '知识库检索',
   };
 

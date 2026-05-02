@@ -11,6 +11,7 @@ import type {
   MessagesResponseDto,
   FetchModelsResponseDto,
 } from '../shared/rust-backend-types';
+import type { CanonicalTurn, CanonicalTurnItem } from '../shared/protocol/canonical-turn';
 import { i18n } from '../stores/i18n.svelte';
 
 
@@ -263,6 +264,10 @@ export interface AgentSessionTurnResult {
   executionChainRef?: string | null;
   /** 后端生成的 canonical 用户消息 item ID。 */
   userMessageItemId?: string | null;
+  canonicalSchemaVersion?: string | null;
+  canonicalEventKind?: string | null;
+  canonicalTurn?: CanonicalTurn | null;
+  canonicalItem?: CanonicalTurnItem | null;
 }
 
 export type AgentSessionIntakeClassification =
@@ -1034,6 +1039,10 @@ export async function submitSessionTurn(
       actionTaskId?: string | null;
       executionChainRef?: string | null;
       userMessageItemId?: string | null;
+      canonicalSchemaVersion?: string | null;
+      canonicalEventKind?: string | null;
+      canonicalTurn?: CanonicalTurn | null;
+      canonicalItem?: CanonicalTurnItem | null;
     }>(response, 'submit session turn');
     return {
       sessionId: raw.sessionId,
@@ -1052,6 +1061,14 @@ export async function submitSessionTurn(
       userMessageItemId: typeof raw.userMessageItemId === 'string' && raw.userMessageItemId.trim()
         ? raw.userMessageItemId.trim()
         : null,
+      canonicalSchemaVersion: typeof raw.canonicalSchemaVersion === 'string' && raw.canonicalSchemaVersion.trim()
+        ? raw.canonicalSchemaVersion.trim()
+        : null,
+      canonicalEventKind: typeof raw.canonicalEventKind === 'string' && raw.canonicalEventKind.trim()
+        ? raw.canonicalEventKind.trim()
+        : null,
+      canonicalTurn: raw.canonicalTurn ?? null,
+      canonicalItem: raw.canonicalItem ?? null,
     };
   } catch (error) {
     if (error instanceof TypeError) {

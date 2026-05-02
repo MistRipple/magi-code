@@ -91,7 +91,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::DiffPreview => execute_diff_preview(input),
             BuiltinToolName::WebSearch => execute_web_search(input),
             BuiltinToolName::WebFetch => execute_web_fetch(input),
-            BuiltinToolName::MermaidDiagram => execute_mermaid_diagram(input),
+            BuiltinToolName::DiagramRender => execute_diagram_render(input),
             BuiltinToolName::KnowledgeQuery => execute_knowledge_query(input),
         }
     }
@@ -365,7 +365,12 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
         .and_then(|object| field_bool(object, &["background", "long_running", "longRunning"]))
         .unwrap_or(false)
     {
-        return execute_process_launch(input, context);
+        return execute_process_launch_with_surface(
+            input,
+            context,
+            "shell_exec",
+            Some("background"),
+        );
     }
     let access_mode = request
         .as_ref()
@@ -490,18 +495,27 @@ fn read_child_pipe<T: Read>(pipe: Option<T>) -> Vec<u8> {
 }
 
 fn execute_process_launch(input: &str, context: &ToolExecutionContext) -> String {
+    execute_process_launch_with_surface(input, context, "process_launch", None)
+}
+
+fn execute_process_launch_with_surface(
+    input: &str,
+    context: &ToolExecutionContext,
+    surface_tool: &str,
+    mode: Option<&str>,
+) -> String {
     let request = parse_json_object(input);
     let command = match required_string_or_raw(
         input,
         request.as_ref(),
         &["command", "script", "line"],
-        "process_launch",
+        surface_tool,
         "缺少 shell 命令",
     ) {
         Ok(value) => value,
         Err(error) => return error,
     };
-    if let Some(error) = require_process_context("process_launch", context) {
+    if let Some(error) = require_process_context(surface_tool, context) {
         return error;
     }
     let cwd_input = request
@@ -510,12 +524,12 @@ fn execute_process_launch(input: &str, context: &ToolExecutionContext) -> String
     let cwd = match cwd_input {
         Some(value) => match resolve_path(&value) {
             Ok(path) => path,
-            Err(error) => return builtin_error("process_launch", error),
+            Err(error) => return builtin_error(surface_tool, error),
         },
         None => match std::env::current_dir() {
             Ok(path) => path,
             Err(error) => {
-                return builtin_error("process_launch", format!("无法解析当前目录: {error}"));
+                return builtin_error(surface_tool, format!("无法解析当前目录: {error}"));
             }
         },
     };
@@ -534,7 +548,7 @@ fn execute_process_launch(input: &str, context: &ToolExecutionContext) -> String
         .spawn()
     {
         Ok(child) => child,
-        Err(error) => return builtin_error("process_launch", format!("命令启动失败: {error}")),
+        Err(error) => return builtin_error(surface_tool, format!("命令启动失败: {error}")),
     };
 
     let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
@@ -558,8 +572,8 @@ fn execute_process_launch(input: &str, context: &ToolExecutionContext) -> String
         .expect("process table lock poisoned")
         .insert(terminal_id, process);
 
-    serde_json::json!({
-        "tool": "process_launch",
+    let mut payload = serde_json::json!({
+        "tool": surface_tool,
         "status": "succeeded",
         "terminal_id": terminal_id,
         "command": command,
@@ -567,9 +581,16 @@ fn execute_process_launch(input: &str, context: &ToolExecutionContext) -> String
         "session_id": context.session_id.as_ref().map(ToString::to_string),
         "workspace_id": context.workspace_id.as_ref().map(ToString::to_string),
         "startup_status": "running",
-        "summary": format!("已在后台启动进程 #{terminal_id}: {command}")
-    })
-    .to_string()
+        "summary": if surface_tool == "shell_exec" {
+            format!("已在后台启动 shell 终端 #{terminal_id}: {command}")
+        } else {
+            format!("已在后台启动进程 #{terminal_id}: {command}")
+        }
+    });
+    if let Some(mode) = mode {
+        payload["mode"] = serde_json::Value::String(mode.to_string());
+    }
+    payload.to_string()
 }
 
 fn execute_process_read(input: &str, context: &ToolExecutionContext) -> String {
@@ -1892,27 +1913,135 @@ fn extract_main_content(html: &str) -> String {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// mermaid.diagram — Mermaid 语法验证 + 渲染数据
+// diagram.render — 统一图表渲染数据
 // ══════════════════════════════════════════════════════════════════════════════
 
-fn execute_mermaid_diagram(input: &str) -> String {
+fn execute_diagram_render(input: &str) -> String {
     let request = match parse_json_object(input) {
         Some(obj) => obj,
-        None => return builtin_error("mermaid_diagram", "输入必须为 JSON 对象，包含 code 字段"),
+        None => return builtin_error("diagram_render", "输入必须为 JSON 对象"),
     };
 
-    let code = match field_string(&request, &["code"]) {
-        Some(c) => c,
-        None => return builtin_error("mermaid_diagram", "缺少 code 字段"),
+    let kind = match field_string(&request, &["kind"]) {
+        Some(value) => normalize_diagram_kind(&value),
+        None => None,
     };
+    let kind = match kind {
+        Some(value) => value,
+        None => {
+            return builtin_error(
+                "diagram_render",
+                "缺少或不支持的图表 kind，支持 mermaid、dot、graph、flow",
+            );
+        }
+    };
+
     let title = field_string(&request, &["title"]);
     let theme = field_string(&request, &["theme"]).unwrap_or_else(|| "default".to_string());
+    let layout = field_string(&request, &["layout"])
+        .and_then(|value| normalize_diagram_layout(&value))
+        .unwrap_or_else(|| "auto".to_string());
+    let interactive =
+        field_bool(&request, &["interactive"]).unwrap_or(matches!(kind, "graph" | "flow"));
 
-    let trimmed = code.trim();
-    if trimmed.is_empty() {
-        return builtin_error("mermaid_diagram", "Mermaid 代码为空");
+    let mut payload = serde_json::json!({
+        "tool": "diagram_render",
+        "status": "succeeded",
+        "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
+        "type": "diagram_render",
+        "kind": kind,
+        "title": title,
+        "theme": theme,
+        "layout": layout,
+        "interactive": interactive,
+    });
+
+    match kind {
+        "mermaid" => {
+            let source = match field_string(&request, &["source", "code"]) {
+                Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+                _ => return builtin_error("diagram_render", "kind=mermaid 需要 source 字段"),
+            };
+            let diagram_type = match detect_mermaid_kind_type(&source) {
+                Some(value) => value,
+                None => {
+                    return builtin_error(
+                        "diagram_render",
+                        "无法识别的 Mermaid 图表类型。source 须包含有效声明（graph, flowchart, sequenceDiagram, classDiagram 等）",
+                    );
+                }
+            };
+            payload["source"] = serde_json::json!(source);
+            payload["diagram_type"] = serde_json::json!(diagram_type);
+            payload["summary"] =
+                serde_json::json!(format!("已生成 Mermaid {} 图表数据", diagram_type));
+        }
+        "dot" => {
+            let source = match field_string(&request, &["source", "code"]) {
+                Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+                _ => return builtin_error("diagram_render", "kind=dot 需要 source 字段"),
+            };
+            if !is_dot_source(&source) {
+                return builtin_error(
+                    "diagram_render",
+                    "DOT 源码须以 graph、digraph、strict graph 或 strict digraph 开头",
+                );
+            }
+            payload["source"] = serde_json::json!(source);
+            payload["diagram_type"] = serde_json::json!("dot");
+            payload["summary"] = serde_json::json!("已生成 DOT 图表数据");
+        }
+        "graph" | "flow" => {
+            let graph = match request.get("graph") {
+                Some(value) if validate_graph_payload(value) => value.clone(),
+                _ => {
+                    return builtin_error(
+                        "diagram_render",
+                        format!("kind={} 需要 graph.nodes 和 graph.edges 数组", kind),
+                    );
+                }
+            };
+            let node_count = graph
+                .get("nodes")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let edge_count = graph
+                .get("edges")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            payload["graph"] = graph;
+            payload["diagram_type"] = serde_json::json!(kind);
+            payload["summary"] = serde_json::json!(format!(
+                "已生成 {} 图表数据（{} 个节点，{} 条边）",
+                kind, node_count, edge_count
+            ));
+        }
+        _ => unreachable!("normalize_diagram_kind only returns supported kinds"),
     }
 
+    payload.to_string()
+}
+
+fn normalize_diagram_kind(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "mermaid" => Some("mermaid"),
+        "dot" => Some("dot"),
+        "graph" => Some("graph"),
+        "flow" => Some("flow"),
+        _ => None,
+    }
+}
+
+fn normalize_diagram_layout(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" | "dagre" | "elk" | "tidy-tree" | "cose" | "force" | "fcose" | "cose-bilkent"
+        | "grid" | "circle" | "preset" => Some(value.trim().to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+fn detect_mermaid_kind_type(source: &str) -> Option<&'static str> {
+    let trimmed = strip_mermaid_frontmatter(source).trim_start();
     let diagram_types: &[(&str, &str)] = &[
         ("graph ", "flowchart"),
         ("flowchart ", "flowchart"),
@@ -1934,33 +2063,43 @@ fn execute_mermaid_diagram(input: &str) -> String {
         ("block-beta", "block"),
     ];
 
-    let diagram_type = diagram_types
+    diagram_types
         .iter()
         .find(|(prefix, _)| trimmed.to_lowercase().starts_with(&prefix.to_lowercase()))
-        .map(|(_, t)| *t);
+        .map(|(_, diagram_type)| *diagram_type)
+}
 
-    let diagram_type = match diagram_type {
-        Some(t) => t,
-        None => {
-            return builtin_error(
-                "mermaid_diagram",
-                "无法识别的 Mermaid 图表类型。代码须以有效声明开头（graph, flowchart, sequenceDiagram, classDiagram 等）",
-            );
-        }
+fn strip_mermaid_frontmatter(source: &str) -> &str {
+    let trimmed = source.trim_start();
+    let Some(after_open) = trimmed.strip_prefix("---") else {
+        return source;
     };
+    let after_open = after_open.trim_start_matches(['\r', '\n']);
+    if let Some(close_index) = after_open.find("\n---") {
+        let after_close = &after_open[close_index + "\n---".len()..];
+        return after_close.trim_start_matches(['\r', '\n']);
+    }
+    source
+}
 
-    serde_json::json!({
-        "tool": "mermaid_diagram",
-        "status": "succeeded",
-        "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
-        "type": "mermaid_diagram",
-        "code": trimmed,
-        "title": title,
-        "theme": theme,
-        "diagram_type": diagram_type,
-        "summary": format!("已生成 {} 类型 Mermaid 图表数据", diagram_type)
-    })
-    .to_string()
+fn is_dot_source(source: &str) -> bool {
+    let lower = source.trim_start().to_ascii_lowercase();
+    lower.starts_with("graph ")
+        || lower.starts_with("graph{")
+        || lower.starts_with("digraph ")
+        || lower.starts_with("digraph{")
+        || lower.starts_with("strict graph ")
+        || lower.starts_with("strict graph{")
+        || lower.starts_with("strict digraph ")
+        || lower.starts_with("strict digraph{")
+}
+
+fn validate_graph_payload(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.get("nodes").and_then(Value::as_array).is_some()
+        && object.get("edges").and_then(Value::as_array).is_some()
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

@@ -220,8 +220,8 @@ mod tests {
     use magi_orchestrator::{ExecutionContextConfig, OrchestratorService, task_store::TaskStore};
     use magi_session_store::{
         ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
-        ActiveExecutionTurn, ActiveExecutionTurnItem, SessionStore, TimelineEntryKind,
-        timeline_entry_visible_text,
+        ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurnItemKind,
+        CanonicalTurnItemStatus, SessionStore, TimelineEntryKind,
     };
     use magi_skill_runtime::SkillDispatchRuntime;
     use magi_tool_runtime::ToolRegistry;
@@ -943,7 +943,20 @@ mod tests {
                 .iter()
                 .filter(|entry| entry["kind"] == "AssistantMessage")
                 .count(),
-            1
+            0,
+            "新会话普通回复不能再写 completed snapshot 到 legacy timeline"
+        );
+        let canonical_turns = messages_page["canonicalTurns"]
+            .as_array()
+            .expect("messages response should include canonical turns");
+        assert_eq!(canonical_turns.len(), 1);
+        assert!(
+            canonical_turns[0]["items"]
+                .as_array()
+                .expect("canonical turn items should serialize as array")
+                .iter()
+                .any(|item| { item["kind"] == "assistant_text" && item["status"] == "completed" }),
+            "普通回复正文必须从 canonical assistant_text 恢复"
         );
     }
 
@@ -1146,11 +1159,16 @@ mod tests {
                             && session
                                 .turn_items
                                 .iter()
-                                .any(|item| item.kind == "tool_call_started")
-                            && session
-                                .turn_items
-                                .iter()
-                                .any(|item| item.kind == "tool_call_result")
+                                .filter(|item| {
+                                    item.tool_call_id.as_deref() == Some("call-search-text")
+                                })
+                                .count()
+                                == 1
+                            && session.turn_items.iter().any(|item| {
+                                item.kind == "tool_call_result"
+                                    && item.tool_call_id.as_deref() == Some("call-search-text")
+                                    && item.tool_result.is_some()
+                            })
                             && session
                                 .turn_items
                                 .iter()
@@ -1241,17 +1259,24 @@ mod tests {
             .iter()
             .filter(|entry| entry["kind"] == "AssistantMessage")
             .collect::<Vec<_>>();
-        assert_eq!(assistant_entries.len(), 1);
-        let visible_text = timeline_entry_visible_text(
-            assistant_entries[0]["message"]
-                .as_str()
-                .expect("assistant timeline message should be stored as string"),
+        assert_eq!(
+            assistant_entries.len(),
+            0,
+            "assistant 正文应只写 canonical assistant_text，不再写 legacy timeline"
         );
-        assert_eq!(visible_text.as_deref(), Some("分析完成。"));
+        let canonical_turns = messages_page["canonicalTurns"]
+            .as_array()
+            .expect("messages response should include canonical turns");
+        let canonical_assistant = canonical_turns
+            .iter()
+            .flat_map(|turn| turn["items"].as_array().into_iter().flatten())
+            .find(|item| item["kind"] == "assistant_text" && item["status"] == "completed")
+            .expect("canonical assistant_text should exist");
+        assert_eq!(canonical_assistant["content"], "分析完成。");
         assert_no_assignment_dispatch_leak(
-            assistant_entries[0]["message"]
+            canonical_assistant["content"]
                 .as_str()
-                .expect("assistant timeline message should be stored as string"),
+                .expect("canonical assistant content should be string"),
         );
     }
 
@@ -1284,6 +1309,22 @@ mod tests {
             "普通对话应提交成功: {chat_body:?}"
         );
         assert_eq!(chat_body["route"], "chat");
+        wait_for_condition(
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+            || {
+                state
+                    .runtime_read_model_dto()
+                    .details
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == session_id)
+                    .and_then(|session| session.current_turn.as_ref())
+                    .is_some_and(|turn| turn.status == "completed")
+            },
+            "普通聊天 turn 应先稳定完成，再提交后续 task turn",
+        )
+        .await;
 
         let (task_status, task_body) = post_json(
             app,
@@ -1683,7 +1724,16 @@ mod tests {
                         deep_task: false,
                         skill_name: None,
                     },
-                    current_turn: None,
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: "turn-natural-continue".to_string(),
+                        turn_seq: accepted_at.0,
+                        accepted_at,
+                        completed_at: None,
+                        status: "running".to_string(),
+                        user_message: Some("原任务".to_string()),
+                        items: Vec::new(),
+                        worker_lanes: Vec::new(),
+                    }),
                 },
             )
             .expect("active chain should upsert");
@@ -2222,11 +2272,14 @@ mod tests {
                     && turn
                         .items
                         .iter()
-                        .any(|item| item.kind == "tool_call_started")
-                    && turn
-                        .items
-                        .iter()
-                        .any(|item| item.kind == "tool_call_result")
+                        .filter(|item| item.tool_call_id.as_deref() == Some("call-search-text"))
+                        .count()
+                        == 1
+                    && turn.items.iter().any(|item| {
+                        item.kind == "tool_call_result"
+                            && item.tool_call_id.as_deref() == Some("call-search-text")
+                            && item.tool_result.is_some()
+                    })
                     && turn.items.iter().any(|item| item.kind == "assistant_error")
                     && !turn.items.iter().any(|item| item.kind == "assistant_final")
             },
@@ -2252,25 +2305,31 @@ mod tests {
             "assistant_error must expose the real missing-final-reply reason: {error_item:?}"
         );
 
-        let assistant_snapshots = state
+        let canonical_turn = state
             .session_store
-            .timeline()
+            .canonical_turns_for_session(&session_id)
             .into_iter()
-            .filter(|entry| {
-                entry.session_id.as_str() == session_id.as_str()
-                    && matches!(
-                        entry.kind,
-                        magi_session_store::TimelineEntryKind::AssistantMessage
-                    )
-            })
-            .collect::<Vec<_>>();
+            .find(|turn| turn.status == magi_session_store::CanonicalTurnStatus::Failed)
+            .expect("failed canonical turn should be stored");
         assert!(
-            assistant_snapshots.iter().any(|entry| {
-                timeline_entry_visible_text(&entry.message)
-                    .as_deref()
-                    .is_some_and(|text| text.contains("模型在工具调用后未返回最终回复"))
+            canonical_turn.items.iter().any(|item| {
+                item.kind == CanonicalTurnItemKind::ToolCall
+                    && item.tool.as_ref().is_some_and(|tool| {
+                        tool.call_id == "call-search-text" && tool.result.is_some()
+                    })
             }),
-            "assistant_error snapshot must restore as visible failure text"
+            "工具结果必须复用同一张 canonical tool item，而不是 started/result 双事实"
+        );
+        assert!(
+            canonical_turn.items.iter().any(|item| {
+                item.kind == CanonicalTurnItemKind::AssistantText
+                    && item.status == CanonicalTurnItemStatus::Failed
+                    && item
+                        .content
+                        .as_deref()
+                        .is_some_and(|text| text.contains("模型在工具调用后未返回最终回复"))
+            }),
+            "assistant_error 必须作为 canonical assistant_text 失败项恢复为可见失败文本"
         );
 
         let events = state.event_bus.snapshot().recent_events;
@@ -3426,12 +3485,6 @@ mod tests {
             .attach_recovery_ref(&session_id, Some(recovery.recovery_id.clone()))
             .expect("recovery ref should attach to session");
 
-        let assistant_count_before_continue = state
-            .session_store
-            .timeline_for_session(&session_id)
-            .iter()
-            .filter(|entry| matches!(entry.kind, TimelineEntryKind::AssistantMessage))
-            .count();
         let (status, body) = post_json(
             app,
             "/api/session/continue",
@@ -3530,18 +3583,26 @@ mod tests {
             Duration::from_millis(20),
             || {
                 state
-                    .session_store
-                    .timeline_for_session(&session_id)
+                    .runtime_read_model_dto()
+                    .details
+                    .sessions
                     .iter()
-                    .filter(|entry| {
-                        matches!(entry.kind, TimelineEntryKind::AssistantMessage)
-                            && !entry.message.trim().is_empty()
-                            && !entry.message.contains("shadow-model::")
+                    .find(|entry| entry.session_id == session_id.to_string())
+                    .is_some_and(|entry| {
+                        entry
+                            .current_turn
+                            .as_ref()
+                            .is_some_and(|turn| turn.status == "completed")
+                            && entry.turn_items.iter().any(|item| {
+                                item.kind == "assistant_final"
+                                    && item.content.as_deref().is_some_and(|content| {
+                                        !content.trim().is_empty()
+                                            && !content.contains("shadow-model::")
+                                    })
+                            })
                     })
-                    .count()
-                    > assistant_count_before_continue
             },
-            "continue 路由执行完成后应把归一化 assistant 结果追加到当前 session timeline",
+            "continue 路由执行完成后应把归一化 assistant 结果写入 canonical current turn",
         )
         .await;
         let runtime_session = state
@@ -6340,6 +6401,10 @@ mod tests {
         );
         let app = build_router(state.clone());
         let session_id = SessionId::new("session-route-shadow-deep");
+        state
+            .session_store
+            .create_session(session_id.clone(), "deep interrupt session")
+            .expect("deep interrupt session should be creatable");
         let accepted_at = UtcMillis::now();
         let mut accepted = submit_shadow_dispatch_submission(
             &state,

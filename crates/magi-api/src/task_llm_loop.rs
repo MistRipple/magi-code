@@ -1,4 +1,5 @@
 use crate::{
+    builtin_tool_schema::internal_builtin_tool_rejection_payload,
     prompt_utils::{normalize_model_stream_preview_content, normalize_model_visible_content},
     session_turn_writeback::{
         append_session_turn_item_with_task_store, publish_current_session_turn_item_event,
@@ -834,6 +835,10 @@ fn execute_task_tool_call(
         return execute_skill_apply_from_runtime(&tool_call.function.arguments, skill_runtime);
     }
 
+    if let Some(rejection) = internal_builtin_tool_rejection_payload(&tool_call.function.name) {
+        return (rejection, ExecutionResultStatus::Failed);
+    }
+
     let output = registry.execute_with_policy(
         ToolExecutionInput {
             tool_call_id: ToolCallId::new(&tool_call.id),
@@ -1019,10 +1024,15 @@ fn task_is_thread_visible_turn_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_bridge_client::{BridgeClientError, BridgeErrorLayer, BridgeResponse};
+    use magi_bridge_client::{
+        BridgeClientError, BridgeErrorLayer, BridgeResponse, ChatToolFunction,
+    };
     use magi_core::{MissionId, Task, TaskKind, TaskStatus, WorkerId};
     use magi_governance::GovernanceService;
-    use magi_session_store::{ActiveExecutionTurn, ActiveExecutionTurnLane, TimelineEntryKind};
+    use magi_session_store::{
+        ActiveExecutionTurn, ActiveExecutionTurnLane, CanonicalTurnItemKind,
+        CanonicalTurnItemStatus, CanonicalTurnStatus, TimelineEntryKind,
+    };
     use magi_tool_runtime::{BuiltinTool, BuiltinToolSpec};
     use std::{
         sync::{
@@ -1131,6 +1141,49 @@ mod tests {
         ) -> Result<BridgeResponse, BridgeClientError> {
             self.invoke(request)
         }
+    }
+
+    #[test]
+    fn execute_task_tool_call_rejects_internal_process_launch_surface() {
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let task = make_task_loop_test_task("task-process-launch-rejected");
+        let session_id = SessionId::new("session-process-launch-rejected");
+        let workspace_id = Some(WorkspaceId::new("workspace-process-launch-rejected"));
+        let worker_id = WorkerId::new("worker-process-launch-rejected");
+        let call = ChatToolCall {
+            id: "tool-call-process-launch".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "process_launch".to_string(),
+                arguments: serde_json::json!({ "command": "sleep 60" }).to_string(),
+            },
+        };
+
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task,
+            &session_id,
+            &workspace_id,
+            Some(&worker_id),
+            &call,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "process_launch");
+        assert_eq!(parsed["status"], "failed");
+        assert!(
+            parsed["error"]
+                .as_str()
+                .expect("error should be string")
+                .contains("shell_exec")
+        );
     }
 
     struct ConcurrentTaskToolProbe {
@@ -1363,7 +1416,7 @@ mod tests {
     }
 
     #[test]
-    fn task_llm_loop_model_failure_writes_failed_turn_item_and_snapshot() {
+    fn task_llm_loop_model_failure_writes_failed_turn_item_and_canonical_turn() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(64);
         let session_id = SessionId::new("session-task-model-failure");
@@ -1460,20 +1513,30 @@ mod tests {
                 .is_some_and(|content| content.contains("model bridge unavailable"))
         );
 
-        let timeline = session_store.timeline_for_session(&session_id);
-        let failure_snapshot = timeline
-            .iter()
-            .find(|entry| entry.entry_id == streaming_entry_id)
-            .expect("failed turn snapshot should reuse streaming entry id");
-        assert!(matches!(
-            failure_snapshot.kind,
-            TimelineEntryKind::AssistantMessage
-        ));
-        assert!(failure_snapshot.message.contains("assistant_error"));
+        let canonical_turn = session_store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .find(|turn| turn.turn_id == "turn-task-model-failure")
+            .expect("failed canonical turn should be stored");
+        assert_eq!(canonical_turn.status, CanonicalTurnStatus::Failed);
+        assert!(canonical_turn.response_duration_ms.is_some());
         assert!(
-            failure_snapshot
-                .message
-                .contains("model bridge unavailable")
+            canonical_turn.items.iter().any(|item| {
+                item.kind == CanonicalTurnItemKind::AssistantText
+                    && item.status == CanonicalTurnItemStatus::Failed
+                    && item
+                        .content
+                        .as_deref()
+                        .is_some_and(|content| content.contains("model bridge unavailable"))
+            }),
+            "failed task loop must persist the visible failure as canonical assistant_text"
+        );
+        assert!(
+            session_store
+                .timeline_for_session(&session_id)
+                .iter()
+                .all(|entry| entry.entry_id != streaming_entry_id),
+            "失败终态不能再写回 legacy completed snapshot"
         );
 
         let terminal_error_event = event_bus

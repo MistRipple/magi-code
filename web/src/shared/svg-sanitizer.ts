@@ -1,4 +1,4 @@
-export function sanitizeMermaidSvgContent(svgContent: string): string {
+export function sanitizeSvgContent(svgContent: string): string {
   const trimmed = svgContent.trim();
   if (!trimmed || typeof document === 'undefined') {
     return '';
@@ -11,12 +11,12 @@ export function sanitizeMermaidSvgContent(svgContent: string): string {
     return '';
   }
 
-  svg.querySelectorAll('script').forEach((node) => node.remove());
+  svg.querySelectorAll('script, iframe, object, embed').forEach((node) => node.remove());
   [svg, ...Array.from(svg.querySelectorAll('*'))].forEach((element) => {
     for (const attribute of Array.from(element.attributes)) {
       const name = attribute.name.toLowerCase();
       const value = attribute.value.trim().toLowerCase();
-      if (name.startsWith('on') || value.startsWith('javascript:')) {
+      if (name.startsWith('on') || value.startsWith('javascript:') || value.startsWith('data:text/html')) {
         element.removeAttribute(attribute.name);
       }
     }

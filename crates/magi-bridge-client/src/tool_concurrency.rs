@@ -14,10 +14,8 @@ fn concurrent_safe_tools() -> HashSet<&'static str> {
         "code_search_regex",
         "web_search",
         "web_fetch",
-        "mermaid_diagram",
+        "diagram_render",
         "code_search_semantic",
-        "process_read",
-        "process_list",
         "project_knowledge_query",
     ]
     .into_iter()
@@ -42,7 +40,7 @@ pub fn is_concurrency_safe_call(input: &ToolConcurrencyInput<'_>) -> bool {
 }
 
 fn is_shell_like_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "shell" | "shell_exec" | "process_launch")
+    matches!(tool_name, "shell" | "shell_exec")
 }
 
 fn read_access_mode(arguments: &serde_json::Value) -> Option<String> {

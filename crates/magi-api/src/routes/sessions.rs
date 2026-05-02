@@ -11,8 +11,8 @@ use magi_core::TaskStatus;
 use magi_core::{DomainError, EventId, SessionId, UtcMillis, WorkerId, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::{
-    ActiveExecutionTurn, ActiveExecutionTurnItem, NotificationRecord, SessionRecord,
-    TimelineEntryKind,
+    ActiveExecutionTurn, ActiveExecutionTurnItem, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn,
+    NotificationRecord, SessionRecord, TimelineEntryKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -219,6 +219,7 @@ struct SessionTurnIntentDecision {
     execution_goal: Option<String>,
     required_workers: Vec<String>,
     tool_intent: Option<String>,
+    forced_tool_name: Option<String>,
     confidence: f64,
     reason_code: Option<String>,
     route_reason: Option<String>,
@@ -272,7 +273,8 @@ fn decide_session_turn_with_task_planner(
             "Session Turn 分类器返回失败状态".to_string(),
         ));
     }
-    let decision = normalize_session_turn_decision(parse_session_turn_decision(&response.payload)?);
+    let decision =
+        normalize_session_turn_decision(parse_session_turn_decision(&response.payload)?, request);
     if matches!(decision.route, SessionTurnRouteDto::Continue) && !has_recoverable_chain {
         return Err(ApiError::InvalidInput(
             "当前会话没有可继续的执行链".to_string(),
@@ -307,6 +309,7 @@ fn build_session_turn_classifier_prompt(
          请只调用 classify_session_turn 工具，输出本轮 route。\n\
          route 只能是 chat、execute、task、continue。\n\
          普通问答使用 chat；需要工具但不创建任务图使用 execute；需要产品级任务编排使用 task；用户要求继续且存在可恢复链时使用 continue。\n\
+         明确要求画、绘制、生成或渲染流程图、关系图、架构图、时序图、Mermaid、DOT、Graphviz 等可视化图表时必须选择 execute，toolIntent 必须要求直接调用 diagram_render，不允许在 chat 中让用户自己调用工具。\n\
          如果选择 task，必须给出 confidence、reasonCode、routeReason 和至少 1 条 taskEvidence；只有明确需要多步骤结构化执行、实现/修复/重构、深度任务或多 worker 协作时才选择 task。\n\
          普通问答、状态追问、简单解释和寒暄必须选择 chat，不能只因为措辞模糊就创建任务图。\n\
          userText={user_text}\n\
@@ -456,6 +459,7 @@ fn session_turn_decision_from_value(
             })
             .unwrap_or_default(),
         tool_intent: optional_trimmed_string(&value, "toolIntent"),
+        forced_tool_name: None,
         confidence: value
             .get("confidence")
             .and_then(|value| value.as_f64())
@@ -482,6 +486,7 @@ fn session_turn_decision_from_value(
 
 fn normalize_session_turn_decision(
     mut decision: SessionTurnIntentDecision,
+    request: &SessionTurnRequestDto,
 ) -> SessionTurnIntentDecision {
     if matches!(decision.route, SessionTurnRouteDto::Task)
         && !session_turn_task_route_has_creation_evidence(&decision)
@@ -492,7 +497,80 @@ fn normalize_session_turn_decision(
         decision.required_workers.clear();
         decision.tool_intent = None;
     }
+    if !request.deep_task
+        && !matches!(decision.route, SessionTurnRouteDto::Continue)
+        && session_turn_requests_diagram_render(request)
+    {
+        decision.route = SessionTurnRouteDto::Execute;
+        decision.task_title = None;
+        decision.execution_goal = None;
+        decision.required_workers.clear();
+        decision.tool_intent = Some(diagram_render_tool_intent());
+        decision.forced_tool_name = Some("diagram_render".to_string());
+        decision.confidence = decision.confidence.max(0.96);
+        decision.reason_code = Some("tool_request".to_string());
+        decision.route_reason =
+            Some("用户明确请求生成可视化图表，应直接调用 diagram_render。".to_string());
+        decision.task_evidence.clear();
+    }
     decision
+}
+
+fn session_turn_requests_diagram_render(request: &SessionTurnRequestDto) -> bool {
+    let Some(text) = request.trimmed_text() else {
+        return false;
+    };
+    let normalized = text.to_ascii_lowercase();
+    if normalized.contains("diagram_render") {
+        return true;
+    }
+    let has_create_action = [
+        "画",
+        "绘制",
+        "生成",
+        "创建",
+        "制作",
+        "做一个",
+        "做个",
+        "渲染",
+        "可视化",
+        "draw",
+        "generate",
+        "create",
+        "make",
+        "render",
+        "visualize",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term));
+    if !has_create_action {
+        return false;
+    }
+    [
+        "流程图",
+        "图表",
+        "关系图",
+        "架构图",
+        "时序图",
+        "序列图",
+        "状态图",
+        "思维导图",
+        "甘特图",
+        "mermaid",
+        "graphviz",
+        " dot",
+        "diagram",
+        "flowchart",
+        "sequence diagram",
+        "mind map",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term))
+}
+
+fn diagram_render_tool_intent() -> String {
+    "用户请求生成可视化图表。必须直接调用 diagram_render 工具完成图表生成；不要要求用户自己调用工具，也不要只输出工具调用说明。根据用户原始输入选择合适的 kind：流程/步骤/登录流程优先使用 graph 或 flow 的结构化 nodes/edges；如果更适合 Mermaid 或 DOT，也可以使用 mermaid 或 dot。工具完成后只用一句话说明图表已生成。"
+        .to_string()
 }
 
 fn session_turn_task_route_has_creation_evidence(decision: &SessionTurnIntentDecision) -> bool {
@@ -577,6 +655,45 @@ fn build_user_message_turn_item(
     )
 }
 
+fn build_assistant_placeholder_turn_item(
+    accepted_at: UtcMillis,
+    placeholder_message_id: Option<String>,
+    request_id: Option<String>,
+    user_message_id: Option<String>,
+) -> (String, ActiveExecutionTurnItem) {
+    let placeholder_item_id = placeholder_message_id
+        .unwrap_or_else(|| format!("turn-item-assistant-stream-{}-0", accepted_at.0));
+    (
+        placeholder_item_id.clone(),
+        ActiveExecutionTurnItem {
+            item_id: placeholder_item_id.clone(),
+            item_seq: 2,
+            lane_id: None,
+            lane_seq: None,
+            kind: "assistant_stream".to_string(),
+            status: "running".to_string(),
+            source: "orchestrator".to_string(),
+            title: Some("生成回复".to_string()),
+            content: None,
+            task_id: None,
+            worker_id: None,
+            role_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            tool_status: None,
+            tool_arguments: None,
+            tool_result: None,
+            tool_error: None,
+            request_id,
+            user_message_id,
+            placeholder_message_id: Some(placeholder_item_id.clone()),
+            timeline_entry_id: None,
+            thread_visible: true,
+            worker_visible: false,
+        },
+    )
+}
+
 fn submit_regular_session_turn(
     state: ApiState,
     request: SessionTurnRequestDto,
@@ -598,7 +715,15 @@ fn submit_regular_session_turn(
     let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let request_id = request.request_id();
     let user_message_id = request.user_message_id();
-    let placeholder_message_id = request.placeholder_message_id();
+    let requested_placeholder_message_id = request.placeholder_message_id();
+    let (assistant_placeholder_item_id, assistant_placeholder_item) =
+        build_assistant_placeholder_turn_item(
+            accepted_at,
+            requested_placeholder_message_id,
+            request_id.clone(),
+            user_message_id.clone(),
+        );
+    let placeholder_message_id = Some(assistant_placeholder_item_id.clone());
     // 使用前端传入的 userMessageId 作为 canonical item_id，确保前端乐观节点与后端流式更新使用同一 ID
     let (user_message_item_id, user_message_item) = build_user_message_turn_item(
         accepted_at,
@@ -618,7 +743,7 @@ fn submit_regular_session_turn(
         status: "running".to_string(),
         completed_at: None,
         user_message: Some(message.clone()),
-        items: vec![user_message_item],
+        items: vec![user_message_item, assistant_placeholder_item],
         worker_lanes: Vec::new(),
     };
     turn.normalize();
@@ -640,6 +765,19 @@ fn submit_regular_session_turn(
         accepted_at,
         &message,
     );
+    let accepted_canonical_turn = state
+        .session_store
+        .canonical_turns_for_session(&session_id)
+        .into_iter()
+        .find(|turn| turn.turn_id == turn_id);
+    let accepted_canonical_item = accepted_canonical_turn
+        .as_ref()
+        .and_then(|turn| {
+            turn.items
+                .iter()
+                .find(|item| item.item_id == assistant_placeholder_item_id)
+        })
+        .cloned();
     let event_id = publish_regular_session_turn_accepted_event(
         &state,
         &session_id,
@@ -647,6 +785,8 @@ fn submit_regular_session_turn(
         accepted_at,
         created_session,
         decision.route,
+        accepted_canonical_turn.as_ref(),
+        Some(&assistant_placeholder_item_id),
     )?;
     let prompt = decision
         .tool_intent
@@ -666,6 +806,7 @@ fn submit_regular_session_turn(
             request_id: request_id.clone(),
             user_message_id: user_message_id.clone(),
             placeholder_message_id: placeholder_message_id.clone(),
+            forced_tool_name: decision.forced_tool_name.clone(),
         },
         accepted_at,
         decision.route,
@@ -684,6 +825,11 @@ fn submit_regular_session_turn(
         None,
         None,
         Some(user_message_item_id),
+    )
+    .with_canonical_event(
+        "turn_started",
+        accepted_canonical_turn,
+        accepted_canonical_item,
     ))
 }
 
@@ -789,8 +935,16 @@ fn publish_regular_session_turn_accepted_event(
     accepted_at: UtcMillis,
     created_session: bool,
     route: SessionTurnRouteDto,
+    canonical_turn: Option<&CanonicalTurn>,
+    canonical_item_id: Option<&str>,
 ) -> Result<EventId, ApiError> {
     let event_id = EventId::new(format!("event-session-turn-accepted-{}", accepted_at.0));
+    let canonical_item = canonical_turn
+        .and_then(|turn| {
+            canonical_item_id
+                .and_then(|item_id| turn.items.iter().find(|item| item.item_id == item_id))
+        })
+        .cloned();
     let event = EventEnvelope::domain(
         event_id.clone(),
         "session.turn.accepted",
@@ -799,6 +953,10 @@ fn publish_regular_session_turn_accepted_event(
             "workspace_id": workspace_id.map(ToString::to_string),
             "created_session": created_session,
             "route": route,
+            "canonical_schema_version": CANONICAL_TURN_SCHEMA_VERSION,
+            "canonical_event_kind": "turn_started",
+            "canonical_turn": canonical_turn,
+            "canonical_item": canonical_item,
         }),
     )
     .with_context(EventContext {
@@ -1823,6 +1981,56 @@ mod tests {
         (status, body)
     }
 
+    fn session_turn_request(text: &str) -> SessionTurnRequestDto {
+        SessionTurnRequestDto {
+            session_id: None,
+            workspace_id: None,
+            text: Some(text.to_string()),
+            deep_task: false,
+            skill_name: None,
+            images: Vec::new(),
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+        }
+    }
+
+    fn classifier_chat_decision() -> SessionTurnIntentDecision {
+        SessionTurnIntentDecision {
+            route: SessionTurnRouteDto::Chat,
+            task_title: None,
+            execution_goal: None,
+            required_workers: Vec::new(),
+            tool_intent: None,
+            forced_tool_name: None,
+            confidence: 0.86,
+            reason_code: Some("plain_chat".to_string()),
+            route_reason: Some("classifier returned chat".to_string()),
+            task_evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn normalizes_diagram_creation_to_forced_diagram_tool_execution() {
+        let request = session_turn_request("画一个登陆的流程图");
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert_eq!(decision.forced_tool_name.as_deref(), Some("diagram_render"));
+        let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
+        assert!(tool_intent.contains("diagram_render"));
+        assert!(tool_intent.contains("不要要求用户自己调用工具"));
+    }
+
+    #[test]
+    fn keeps_plain_diagram_explanation_as_chat() {
+        let request = session_turn_request("解释一下流程图是什么");
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+        assert!(decision.forced_tool_name.is_none());
+    }
+
     #[tokio::test]
     async fn delete_session_rejects_workspace_mismatched_session() {
         let state = test_state();
@@ -1857,6 +2065,78 @@ mod tests {
         assert!(
             state.session_store.session(&session_id).is_some(),
             "workspace 不匹配时不应删除原会话"
+        );
+    }
+
+    #[tokio::test]
+    async fn regular_session_turn_accepts_with_canonical_running_assistant_placeholder() {
+        let state = test_state();
+        let accepted_at = UtcMillis(1777000000000);
+        let response = submit_regular_session_turn(
+            state.clone(),
+            SessionTurnRequestDto {
+                session_id: None,
+                workspace_id: None,
+                text: Some("请只回复一句话".to_string()),
+                deep_task: false,
+                skill_name: None,
+                images: Vec::new(),
+                request_id: Some("request-canonical-first-frame".to_string()),
+                user_message_id: Some("user-canonical-first-frame".to_string()),
+                placeholder_message_id: Some("assistant-canonical-first-frame".to_string()),
+            },
+            accepted_at,
+            SessionTurnIntentDecision {
+                route: SessionTurnRouteDto::Chat,
+                task_title: None,
+                execution_goal: None,
+                required_workers: Vec::new(),
+                tool_intent: None,
+                forced_tool_name: None,
+                confidence: 1.0,
+                reason_code: Some("plain_chat".to_string()),
+                route_reason: Some("test".to_string()),
+                task_evidence: Vec::new(),
+            },
+        )
+        .expect("regular turn should be accepted");
+
+        assert_eq!(
+            response.user_message_item_id.as_deref(),
+            Some("user-canonical-first-frame")
+        );
+        let accepted_event = state
+            .event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_id.to_string() == response.event_id)
+            .expect("accepted event should be published");
+        assert_eq!(
+            accepted_event.payload["canonical_event_kind"],
+            "turn_started"
+        );
+        let items = accepted_event.payload["canonical_turn"]["items"]
+            .as_array()
+            .expect("canonical turn items should be present");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["itemId"], "user-canonical-first-frame");
+        assert_eq!(items[0]["kind"], "user_message");
+        assert_eq!(items[1]["itemId"], "assistant-canonical-first-frame");
+        assert_eq!(items[1]["kind"], "assistant_text");
+        assert_eq!(items[1]["status"], "running");
+        assert_eq!(items[1]["visibility"]["renderable"], true);
+        assert_eq!(
+            items[1]["metadata"]["requestId"],
+            "request-canonical-first-frame"
+        );
+        assert_eq!(
+            items[1]["metadata"]["placeholderMessageId"],
+            "assistant-canonical-first-frame"
+        );
+        assert_eq!(
+            accepted_event.payload["canonical_item"]["itemId"],
+            "assistant-canonical-first-frame"
         );
     }
 
