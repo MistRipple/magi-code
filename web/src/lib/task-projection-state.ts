@@ -1,4 +1,4 @@
-import type { TaskProjectionDto } from '../shared/rust-backend-types';
+import type { TaskDto, TaskProjectionDto } from '../shared/rust-backend-types';
 
 function hasRootTask(projection: TaskProjectionDto, rootTaskId?: string | null): boolean {
   const explicitRootTaskId = typeof rootTaskId === 'string' ? rootTaskId.trim() : '';
@@ -23,4 +23,25 @@ export function isTaskProjectionAcceptingIntake(
     return false;
   }
   return hasPendingUserAction(projection);
+}
+
+export function isTaskIntakeTargetTask(task: TaskDto, projection: TaskProjectionDto): boolean {
+  if (task.task_id === projection.root_task.task_id) {
+    return true;
+  }
+  if (task.kind === 'Decision') {
+    return true;
+  }
+  switch (task.status) {
+    case 'AwaitingApproval':
+    case 'Blocked':
+    case 'Failed':
+    case 'Repairing':
+    case 'Verifying':
+    case 'Running':
+    case 'Ready':
+      return true;
+    default:
+      return false;
+  }
 }

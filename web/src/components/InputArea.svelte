@@ -20,7 +20,7 @@
   import { generateId, ensureArray } from '../lib/utils';
   import { i18n } from '../stores/i18n.svelte';
   import { getTaskDisplayGoal, getTaskDisplayTitle, getTaskKindLabel, getTaskStatusLabel } from '../lib/task-labels';
-  import { isTaskProjectionAcceptingIntake } from '../lib/task-projection-state';
+  import { isTaskIntakeTargetTask, isTaskProjectionAcceptingIntake } from '../lib/task-projection-state';
 
   // 技能类型
   interface InstructionSkill {
@@ -111,10 +111,9 @@
     const seen = new Set<string>();
     return projection.tasks
       .filter((task) => {
-        if (task.status === 'Cancelled') return false;
         if (seen.has(task.task_id)) return false;
         seen.add(task.task_id);
-        return task.kind === 'Objective' || task.parent_task_id || task.task_id === projection.root_task.task_id;
+        return isTaskIntakeTargetTask(task, projection);
       })
       .map((task) => ({
         taskId: task.task_id,
