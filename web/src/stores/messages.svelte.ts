@@ -1371,6 +1371,7 @@ function normalizeOrchestratorRuntimeState(
     || input.status === 'running'
     || input.status === 'waiting'
     || input.status === 'paused'
+    || input.status === 'blocked'
     || input.status === 'completed'
     || input.status === 'failed'
     || input.status === 'cancelled'
@@ -2222,6 +2223,7 @@ function runtimeStateIndicatesProcessing(): boolean {
 function runtimeStateIsTerminal(runtimeState: OrchestratorRuntimeState | null): boolean {
   const status = runtimeState?.status;
   return status === 'idle'
+    || status === 'blocked'
     || status === 'completed'
     || status === 'failed'
     || status === 'cancelled';

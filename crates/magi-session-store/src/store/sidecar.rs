@@ -187,6 +187,19 @@ fn current_turn_item_to_canonical_worker(
     })
 }
 
+fn current_turn_item_worker_tab_ids(item: &ActiveExecutionTurnItem) -> Vec<String> {
+    item.role_id
+        .as_ref()
+        .filter(|role_id| !role_id.trim().is_empty())
+        .map(|role_id| vec![role_id.to_string()])
+        .or_else(|| {
+            item.worker_id
+                .as_ref()
+                .map(|worker_id| vec![worker_id.to_string()])
+        })
+        .unwrap_or_default()
+}
+
 fn current_turn_item_metadata(item: &ActiveExecutionTurnItem) -> HashMap<String, Value> {
     let mut metadata = HashMap::new();
     if let Some(value) = item
@@ -250,11 +263,7 @@ fn current_turn_item_to_canonical_item(
             message: format!("canonical tool item {} missing tool payload", item.item_id),
         });
     }
-    let worker_tab_ids = item
-        .worker_id
-        .as_ref()
-        .map(|worker_id| vec![worker_id.to_string()])
-        .unwrap_or_default();
+    let worker_tab_ids = current_turn_item_worker_tab_ids(item);
     Ok(CanonicalTurnItem {
         session_id: session_id.clone(),
         turn_id: turn.turn_id.clone(),

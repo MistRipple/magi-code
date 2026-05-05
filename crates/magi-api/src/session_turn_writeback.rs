@@ -214,6 +214,19 @@ fn to_canonical_worker_ref(item: &ActiveExecutionTurnItem) -> Option<CanonicalWo
     })
 }
 
+fn canonical_worker_tab_ids(item: &ActiveExecutionTurnItem) -> Vec<String> {
+    item.role_id
+        .as_ref()
+        .filter(|role_id| !role_id.trim().is_empty())
+        .map(|role_id| vec![role_id.to_string()])
+        .or_else(|| {
+            item.worker_id
+                .as_ref()
+                .map(|worker_id| vec![worker_id.to_string()])
+        })
+        .unwrap_or_default()
+}
+
 fn canonical_item_metadata(item: &ActiveExecutionTurnItem) -> HashMap<String, Value> {
     let mut metadata = HashMap::new();
     if let Some(value) = item
@@ -297,11 +310,7 @@ fn to_canonical_turn_item(
             thread_visible: item.thread_visible,
             worker_visible: item.worker_visible,
             renderable: canonical_item_renderable(item, kind, status),
-            worker_tab_ids: item
-                .worker_id
-                .as_ref()
-                .map(|worker_id| vec![worker_id.to_string()])
-                .unwrap_or_default(),
+            worker_tab_ids: canonical_worker_tab_ids(item),
         },
         metadata: canonical_item_metadata(item),
     })

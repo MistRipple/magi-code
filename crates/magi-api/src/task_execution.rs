@@ -26,7 +26,7 @@ use magi_context_runtime::{
 };
 use magi_core::{
     DomainError, EventId, ExecutionOwnership, LeaseId, SessionId, Task, TaskExecutionTarget,
-    TaskId, TaskStatus, UtcMillis, WorkerId, WorkspaceId,
+    TaskId, TaskKind, TaskStatus, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
@@ -224,6 +224,52 @@ pub fn publish_task_status_turn_item_for_active_sessions(
             );
         }
     }
+}
+
+const TASK_CONTEXT_MAX_CHARS: usize = 4000;
+const TASK_CONTEXT_MAX_REFS: usize = 8;
+
+fn compact_task_context_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= TASK_CONTEXT_MAX_CHARS {
+        return trimmed.to_string();
+    }
+    let mut compact = trimmed
+        .chars()
+        .take(TASK_CONTEXT_MAX_CHARS)
+        .collect::<String>();
+    compact.push_str("…[truncated]");
+    compact
+}
+
+fn format_task_ref_list(refs: &[String]) -> String {
+    if refs.is_empty() {
+        return "无".to_string();
+    }
+    let mut formatted = refs
+        .iter()
+        .take(TASK_CONTEXT_MAX_REFS)
+        .enumerate()
+        .map(|(index, item)| format!("{}. {}", index + 1, compact_task_context_text(item)))
+        .collect::<Vec<_>>();
+    let remaining = refs.len().saturating_sub(TASK_CONTEXT_MAX_REFS);
+    if remaining > 0 {
+        formatted.push(format!("... (+{remaining} more)"));
+    }
+    formatted.join("\n")
+}
+
+fn format_dependency_task_context(dependency: &Task) -> String {
+    format!(
+        "[dependency-task]\nid: {}\nkind: {:?}\nstatus: {:?}\ntitle: {}\ngoal: {}\noutput_refs:\n{}\nevidence_refs:\n{}",
+        dependency.task_id,
+        dependency.kind,
+        dependency.status,
+        compact_task_context_text(&dependency.title),
+        compact_task_context_text(&dependency.goal),
+        format_task_ref_list(&dependency.output_refs),
+        format_task_ref_list(&dependency.evidence_refs)
+    )
 }
 
 pub fn finalize_background_session_task_turn_if_root_completed(
@@ -735,6 +781,49 @@ impl ShadowTaskDispatcher {
             .map(|workspace| PathBuf::from(workspace.root_path.as_str()))
     }
 
+    fn task_fact_context_parts(&self, task: &magi_core::Task) -> Vec<String> {
+        let mut parts = Vec::new();
+        if let Some(scope) = task
+            .workspace_scope
+            .as_deref()
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+        {
+            parts.push(format!("[task-workspace] {scope}"));
+        }
+        if !task.input_refs.is_empty() {
+            parts.push(format!(
+                "[task-input] {}",
+                format_task_ref_list(&task.input_refs)
+            ));
+        }
+
+        let task_store = self.pipeline.execution_runtime.task_store();
+        for dependency_id in &task.dependency_ids {
+            if let Some(dependency) = task_store.get_task(dependency_id) {
+                parts.push(format_dependency_task_context(&dependency));
+            } else {
+                parts.push(format!("[dependency] id={dependency_id} status=missing"));
+            }
+        }
+        if parts.is_empty() && task.kind != TaskKind::Validation {
+            return parts;
+        }
+        parts.insert(
+            0,
+            "[current-task-rule] 当前任务标题、目标、input_refs、依赖任务输出和 task-context 是本次执行的主事实；knowledge/memory 只能补充，不能改写当前任务目标。"
+                .to_string(),
+        );
+        if task.kind == TaskKind::Validation {
+            parts.insert(
+                1,
+                "[validation-rule] 只验证本任务 dependency/input 指向的当前执行产出；不得把历史经验、知识库记录或其他会话目标当成本次交付对象。"
+                    .to_string(),
+            );
+        }
+        parts
+    }
+
     fn assemble_prompt(
         &self,
         task: &magi_core::Task,
@@ -748,13 +837,25 @@ impl ShadowTaskDispatcher {
         };
         let user_rules_prefix = self.resolve_user_rules_prompt();
         let safeguard_prefix = self.resolve_safeguard_prompt();
+        let task_fact_context_parts = self.task_fact_context_parts(task);
 
         let Some(ref ctx_runtime) = self.context_runtime else {
+            if task_fact_context_parts.is_empty() {
+                return (
+                    prepend_session_instructions(
+                        user_rules_prefix.as_deref(),
+                        safeguard_prefix.as_deref(),
+                        &base_prompt,
+                    ),
+                    None,
+                );
+            }
+            let ctx_text = task_fact_context_parts.join("\n");
             return (
                 prepend_session_instructions(
                     user_rules_prefix.as_deref(),
                     safeguard_prefix.as_deref(),
-                    &base_prompt,
+                    &format!("--- Context ---\n{ctx_text}\n--- Task ---\n{base_prompt}"),
                 ),
                 None,
             );
@@ -788,6 +889,7 @@ impl ShadowTaskDispatcher {
         let has_context = !result.selected_knowledge.is_empty()
             || !result.selected_memory.is_empty()
             || !result.selected_shared_context.is_empty()
+            || !task_fact_context_parts.is_empty()
             || !task_context_entries.is_empty();
 
         let context_summary = ExecutionContextSummary::from_context_assembly(&result);
@@ -803,6 +905,14 @@ impl ShadowTaskDispatcher {
             );
         }
         let mut ctx_parts: Vec<String> = Vec::new();
+        ctx_parts.extend(task_fact_context_parts);
+        for entry in &task_context_entries {
+            ctx_parts.push(format!(
+                "[task-context] {}: {}",
+                entry.context_ref,
+                compact_task_context_text(&entry.content)
+            ));
+        }
         for item in &result.selected_knowledge {
             ctx_parts.push(format!("[knowledge] {}: {}", item.title, item.excerpt));
         }
@@ -811,12 +921,6 @@ impl ShadowTaskDispatcher {
         }
         for item in &result.selected_shared_context {
             ctx_parts.push(format!("[context] {}: {}", item.title, item.content));
-        }
-        for entry in &task_context_entries {
-            ctx_parts.push(format!(
-                "[task-context] {}: {}",
-                entry.context_ref, entry.content
-            ));
         }
         let ctx_text = ctx_parts.join("\n");
         (
@@ -1204,6 +1308,184 @@ mod tests {
             workspace_id: workspace_id.map(WorkspaceId::new),
             source_ref: None,
             updated_at: UtcMillis::now(),
+        }
+    }
+
+    fn task_execution_dispatcher_for_prompt_tests(
+        task_store: Arc<TaskStore>,
+        context_runtime: Option<Arc<ContextRuntime>>,
+    ) -> ShadowTaskDispatcher {
+        let event_bus = Arc::new(InMemoryEventBus::new(64));
+        let governance = Arc::new(GovernanceService::default());
+        let orchestrator = magi_orchestrator::OrchestratorService::new(Arc::clone(&event_bus));
+        let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus));
+        tool_registry.register_default_builtins();
+        let execution_runtime = orchestrator
+            .execution_runtime(
+                magi_worker_runtime::WorkerRuntime::new_compare(Arc::clone(&event_bus)),
+                tool_registry.clone(),
+                magi_skill_runtime::SkillDispatchRuntime::new(
+                    tool_registry,
+                    magi_bridge_client::BridgeDispatchRuntime::new(),
+                ),
+            )
+            .with_task_store(task_store);
+        let dispatcher = ShadowTaskDispatcher::new(
+            event_bus,
+            ShadowExecutionPipeline {
+                orchestrator,
+                execution_runtime,
+                memory_store: magi_memory_store::MemoryStore::new(),
+            },
+            Arc::new(SessionStore::new()),
+            ShadowTaskExecutionRegistry::default(),
+            Arc::new(EventBasedResultReceiver::new()),
+        );
+        if let Some(runtime) = context_runtime {
+            dispatcher.with_context_runtime(runtime)
+        } else {
+            dispatcher
+        }
+    }
+
+    fn prompt_test_task(
+        task_id: &str,
+        kind: TaskKind,
+        title: &str,
+        goal: &str,
+        status: TaskStatus,
+    ) -> Task {
+        let now = UtcMillis::now();
+        Task {
+            task_id: TaskId::new(task_id),
+            mission_id: MissionId::new("mission-prompt-context"),
+            root_task_id: TaskId::new("root-prompt-context"),
+            parent_task_id: None,
+            kind,
+            title: title.to_string(),
+            goal: goal.to_string(),
+            status,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: Some("/Users/xie/code/TEST".to_string()),
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn validation_prompt_includes_dependency_outputs_without_context_runtime() {
+        let task_store = Arc::new(TaskStore::new());
+        let mut action = prompt_test_task(
+            "action-current-delivery",
+            TaskKind::Action,
+            "执行只读检查",
+            "检查 /Users/xie/code/TEST 当前项目结构",
+            TaskStatus::Completed,
+        );
+        action.output_refs =
+            vec!["当前任务输出：/Users/xie/code/TEST 已完成只读检查，未修改文件。".to_string()];
+        action.evidence_refs =
+            vec!["evidence://task/action-current-delivery/output/0?ref=readonly-check".to_string()];
+        task_store.insert_task(action);
+
+        let mut validation = prompt_test_task(
+            "validation-current-delivery",
+            TaskKind::Validation,
+            "验证交付",
+            "验证 /Users/xie/code/TEST 的只读任务交付结果",
+            TaskStatus::Ready,
+        );
+        validation.dependency_ids = vec![TaskId::new("action-current-delivery")];
+        task_store.insert_task(validation.clone());
+
+        let dispatcher = task_execution_dispatcher_for_prompt_tests(task_store, None);
+        let (prompt, context_summary) = dispatcher.assemble_prompt(
+            &validation,
+            &SessionId::new("session-prompt-context"),
+            &Some(WorkspaceId::new("workspace-prompt-context")),
+        );
+
+        assert!(context_summary.is_none());
+        assert!(prompt.contains("[validation-rule]"));
+        assert!(prompt.contains("当前任务输出：/Users/xie/code/TEST 已完成只读检查"));
+        assert!(prompt.contains("evidence://task/action-current-delivery/output/0"));
+        assert!(prompt.contains("--- Task ---\n验证交付"));
+    }
+
+    #[test]
+    fn validation_prompt_keeps_dependency_outputs_before_external_context() {
+        let task_store = Arc::new(TaskStore::new());
+        let mut action = prompt_test_task(
+            "action-current-priority",
+            TaskKind::Action,
+            "执行当前项目检查",
+            "检查 /Users/xie/code/TEST 当前项目",
+            TaskStatus::Completed,
+        );
+        action.output_refs = vec!["当前项目事实：TEST 工作区检查已完成。".to_string()];
+        task_store.insert_task(action);
+
+        let mut validation = prompt_test_task(
+            "validation-current-priority",
+            TaskKind::Validation,
+            "验证交付",
+            "验证 /Users/xie/code/TEST 的只读任务交付结果",
+            TaskStatus::Ready,
+        );
+        validation.dependency_ids = vec![TaskId::new("action-current-priority")];
+        task_store.insert_task(validation.clone());
+
+        let knowledge_store = KnowledgeStore::new();
+        knowledge_store.upsert(KnowledgeRecord {
+            knowledge_id: "knowledge-old-autosave".to_string(),
+            kind: KnowledgeKind::Learning,
+            title: "验证交付".to_string(),
+            content: "自动保存规则旧上下文：这不是当前 TEST 工作区任务。".to_string(),
+            tags: Vec::new(),
+            workspace_id: Some(WorkspaceId::new("workspace-prompt-context")),
+            source_ref: None,
+            updated_at: UtcMillis::now(),
+        });
+        let context_runtime = Arc::new(ContextRuntime::new(
+            knowledge_store,
+            magi_memory_store::MemoryStore::new(),
+        ));
+        let dispatcher =
+            task_execution_dispatcher_for_prompt_tests(task_store, Some(context_runtime));
+        let (prompt, context_summary) = dispatcher.assemble_prompt(
+            &validation,
+            &SessionId::new("session-prompt-context"),
+            &Some(WorkspaceId::new("workspace-prompt-context")),
+        );
+
+        assert!(context_summary.is_some());
+        let dependency_index = prompt
+            .find("[dependency-task]")
+            .expect("dependency output should be present");
+        let task_index = prompt
+            .find("--- Task ---")
+            .expect("task section should exist");
+        assert!(
+            dependency_index < task_index,
+            "当前依赖输出必须在任务正文之前进入 prompt"
+        );
+        if let Some(knowledge_index) = prompt.find("[knowledge]") {
+            assert!(
+                dependency_index < knowledge_index,
+                "当前依赖输出必须排在 knowledge/memory 之前"
+            );
         }
     }
 

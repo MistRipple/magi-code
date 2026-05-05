@@ -56,6 +56,7 @@ import {
 } from './message-utils';
 import { buildEmptyWorkspaceAppState } from '../shared/bridges/empty-workspace-state';
 import type { CanonicalTurn, CanonicalTurnEvent } from '../shared/protocol/canonical-turn';
+import { isCanonicalTerminalStatus } from '../shared/protocol/canonical-turn';
 import { deriveProcessingStateFromCanonicalTurns } from '../shared/protocol/canonical-processing';
 import {
   applyCanonicalTurnEvent,
@@ -727,9 +728,11 @@ function handleSessionTurnCanonicalEventUpdated(message: ClientBridgeMessage) {
   if (projection) {
     setTimelineProjection(projection);
     if (canonicalEvent.turn) {
-      applyAuthoritativeProcessingState(
-        deriveProcessingStateFromCanonicalTurns([canonicalEvent.turn], sessionId),
-      );
+      const processingState = deriveProcessingStateFromCanonicalTurns([canonicalEvent.turn], sessionId);
+      applyAuthoritativeProcessingState(processingState);
+      if (!processingState && isCanonicalTerminalStatus(canonicalEvent.turn.status)) {
+        clearProcessingState();
+      }
     }
     reconcileRequestBindingsFromAuthoritativeThread(sessionId);
   }
@@ -893,6 +896,7 @@ function handleOrchestratorRuntimeState(message: ClientBridgeMessage) {
     || message.status === 'running'
     || message.status === 'waiting'
     || message.status === 'paused'
+    || message.status === 'blocked'
     || message.status === 'completed'
     || message.status === 'failed'
     || message.status === 'cancelled'

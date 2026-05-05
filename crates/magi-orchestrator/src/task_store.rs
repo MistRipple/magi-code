@@ -78,6 +78,41 @@ fn task_requires_delivery_evidence(task: &Task) -> bool {
         .is_some_and(|policy| policy.validation_profile.is_some() && policy.background_allowed)
 }
 
+fn output_ref_is_file_change(output_ref: &str) -> bool {
+    let trimmed = output_ref.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('{')
+        || trimmed.starts_with('[')
+        || trimmed.contains('\n')
+        || trimmed.contains('\r')
+    {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("evidence://")
+        || lower.starts_with("test://")
+        || lower.starts_with("repair://")
+        || lower.starts_with("tool://")
+        || lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("decision_")
+    {
+        return false;
+    }
+    if lower.starts_with("file:") || lower.starts_with("diff:") {
+        return true;
+    }
+    let path = Path::new(trimmed);
+    (trimmed.contains('/') || trimmed.contains('\\'))
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                let extension = extension.trim();
+                !extension.is_empty() && extension.len() <= 16
+            })
+}
+
 impl TaskStore {
     pub fn new() -> Self {
         Self {
@@ -1106,7 +1141,7 @@ impl TaskStore {
 
         for task in &active_tasks {
             for output in &task.output_refs {
-                if !file_changes.contains(output) {
+                if output_ref_is_file_change(output) && !file_changes.contains(output) {
                     file_changes.push(output.clone());
                 }
             }
@@ -3924,7 +3959,11 @@ mod tests {
             TaskKind::Action,
             TaskStatus::Completed,
         );
-        action.output_refs = vec!["src/auth/login.rs".to_string()];
+        action.output_refs = vec![
+            "src/auth/login.rs".to_string(),
+            "{\"blocks\":[{\"content\":\"只读验收完成\",\"type\":\"text\"}]}".to_string(),
+            "已完成 /Users/xie/code/TEST 只读检查".to_string(),
+        ];
         action.evidence_refs = vec!["test://login-passed".to_string()];
         store.insert_task(action);
 
@@ -3989,6 +4028,12 @@ mod tests {
             file_changes
                 .iter()
                 .any(|v| v.as_str() == Some("src/auth/login.rs"))
+        );
+        assert!(
+            !file_changes.iter().any(|v| v
+                .as_str()
+                .is_some_and(|value| value.contains("\"blocks\"") || value.contains("只读检查"))),
+            "交付包文件变更不应暴露 assistant 输出 JSON 或普通说明文本"
         );
 
         let evidence_list = pkg.get("evidence_list").unwrap().as_array().unwrap();

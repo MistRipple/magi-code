@@ -70,6 +70,7 @@ pub(crate) struct TaskLlmLoopRequest<'a> {
 struct TaskTurnVisibility {
     thread_visible: bool,
     worker_visible: bool,
+    primary_worker_sidechain: bool,
     role_id: Option<String>,
     worker_id: Option<magi_core::WorkerId>,
     lane_id: Option<String>,
@@ -82,6 +83,7 @@ fn task_turn_visibility(
     worker_lane_id: Option<&str>,
     worker_lane_seq: Option<usize>,
     worker_id: Option<&magi_core::WorkerId>,
+    primary_worker_sidechain: bool,
 ) -> TaskTurnVisibility {
     let role_id = resolve_task_role(task)
         .map(str::trim)
@@ -94,6 +96,7 @@ fn task_turn_visibility(
     TaskTurnVisibility {
         thread_visible,
         worker_visible: lane_id.is_some(),
+        primary_worker_sidechain,
         role_id,
         worker_id: worker_id.cloned(),
         lane_id,
@@ -113,10 +116,32 @@ fn apply_task_turn_visibility(
         item.lane_id = visibility.lane_id.clone();
         item.lane_seq = visibility.lane_seq;
         item.worker_id = visibility.worker_id.clone();
+        if let Some(role_id) = visibility.role_id.as_ref() {
+            item.role_id = Some(role_id.clone());
+            item.source = role_id.clone();
+        } else if let Some(worker_id) = visibility.worker_id.as_ref() {
+            item.source = worker_id.to_string();
+        }
     }
+}
+
+fn apply_task_worker_detail_visibility(
+    item: &mut ActiveExecutionTurnItem,
+    task: &magi_core::Task,
+    visibility: &TaskTurnVisibility,
+) {
+    apply_task_turn_visibility(item, task, visibility);
+    if !visibility.primary_worker_sidechain {
+        return;
+    }
+    item.thread_visible = false;
+    item.worker_visible = true;
+    item.worker_id = visibility.worker_id.clone();
     if let Some(role_id) = visibility.role_id.as_ref() {
         item.role_id = Some(role_id.clone());
         item.source = role_id.clone();
+    } else if let Some(worker_id) = visibility.worker_id.as_ref() {
+        item.source = worker_id.to_string();
     }
 }
 
@@ -187,6 +212,9 @@ pub(crate) fn run_task_llm_loop(
     let mut tool_call_records: Vec<serde_json::Value> = Vec::new();
     let mut last_stream_item_id: Option<String> = None;
     let mut had_tool_calls = false;
+    let primary_worker_sidechain = worker_lane_id.is_none()
+        && worker_id.is_some()
+        && current_turn_has_worker_lanes(session_store, session_id);
     let turn_visibility = task_turn_visibility(
         task,
         streaming_entry_id.is_some()
@@ -194,6 +222,7 @@ pub(crate) fn run_task_llm_loop(
         worker_lane_id,
         worker_lane_seq,
         worker_id,
+        primary_worker_sidechain,
     );
 
     for round in 0..MAX_TOOL_CALL_ROUNDS {
@@ -628,7 +657,7 @@ fn upsert_task_thinking_turn_item(
         Some(trimmed.to_string()),
         Some(item_id.to_string()),
     );
-    apply_task_turn_visibility(&mut item, task, turn_visibility);
+    apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
     if let Some(published) =
         upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
     {
@@ -653,7 +682,7 @@ fn append_task_tool_call_started_turn_item(
         Some(format!("正在调用工具：{}", tool_call.function.name)),
         Some(format!("turn-item-tool-{}", tool_call.id)),
     );
-    apply_task_turn_visibility(&mut item, task, turn_visibility);
+    apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
     item.tool_call_id = Some(tool_call.id.clone());
     item.tool_name = Some(tool_call.function.name.clone());
     item.tool_status = Some("running".to_string());
@@ -685,7 +714,7 @@ fn upsert_task_tool_call_result_turn_item(
         Some(summarize_tool_result(tool_result)),
         Some(format!("turn-item-tool-{}", tool_call.id)),
     );
-    apply_task_turn_visibility(&mut item, task, turn_visibility);
+    apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
     item.tool_call_id = Some(tool_call.id.clone());
     item.tool_name = Some(tool_call.function.name.clone());
     item.tool_status = Some(status_label.to_string());
@@ -1042,6 +1071,13 @@ fn task_is_thread_visible_turn_owner(
         })
 }
 
+fn current_turn_has_worker_lanes(session_store: &SessionStore, session_id: &SessionId) -> bool {
+    session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .is_some_and(|turn| !turn.worker_lanes.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1328,13 +1364,50 @@ mod tests {
     fn task_turn_visibility_does_not_promote_primary_role_to_worker_lane() {
         let task = make_task_loop_test_task("task-primary-role-only");
 
-        let visibility = task_turn_visibility(&task, true, None, None, None);
+        let visibility = task_turn_visibility(&task, true, None, None, None, false);
 
         assert!(visibility.thread_visible);
         assert!(!visibility.worker_visible);
         assert_eq!(visibility.role_id.as_deref(), Some("integration-dev"));
         assert!(visibility.lane_id.is_none());
         assert!(visibility.lane_seq.is_none());
+    }
+
+    #[test]
+    fn primary_deep_task_worker_details_move_to_sidechain() {
+        let task = make_task_loop_test_task("task-primary-deep-sidechain");
+        let worker_id = WorkerId::new("worker-primary-deep-sidechain");
+        let visibility = task_turn_visibility(&task, true, None, None, Some(&worker_id), true);
+        let mut tool_item = session_turn_item(
+            "tool_call_started",
+            "running",
+            Some("shell_exec".to_string()),
+            Some("正在调用工具：shell_exec".to_string()),
+            Some("turn-item-primary-tool".to_string()),
+        );
+
+        apply_task_worker_detail_visibility(&mut tool_item, &task, &visibility);
+
+        assert!(!tool_item.thread_visible);
+        assert!(tool_item.worker_visible);
+        assert_eq!(tool_item.worker_id.as_ref(), Some(&worker_id));
+        assert_eq!(tool_item.role_id.as_deref(), Some("integration-dev"));
+        assert_eq!(tool_item.source, "integration-dev");
+
+        let mut final_item = session_turn_item(
+            "assistant_final",
+            "completed",
+            Some("最终回复".to_string()),
+            Some("主线最终回复".to_string()),
+            Some("turn-item-primary-final".to_string()),
+        );
+        apply_task_turn_visibility(&mut final_item, &task, &visibility);
+
+        assert!(final_item.thread_visible);
+        assert!(!final_item.worker_visible);
+        assert!(final_item.worker_id.is_none());
+        assert!(final_item.role_id.is_none());
+        assert_eq!(final_item.source, "orchestrator");
     }
 
     #[test]
@@ -1347,6 +1420,7 @@ mod tests {
             Some("lane-task-worker-lane-order"),
             Some(3),
             Some(&worker_id),
+            false,
         );
         let mut item = session_turn_item(
             "assistant_final",
@@ -1407,6 +1481,7 @@ mod tests {
             None,
             None,
             Some(&WorkerId::new("worker-final-root-running")),
+            false,
         );
 
         append_task_final_turn_item(

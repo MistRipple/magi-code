@@ -299,6 +299,7 @@
       case 'running': return 'loader';
       case 'waiting': return 'clock';
       case 'paused': return 'taskPending';
+      case 'blocked': return 'taskPending';
       case 'completed': return 'taskComplete';
       case 'failed': return 'taskFailed';
       case 'cancelled': return 'stop';
@@ -313,6 +314,7 @@
       case 'running': return i18n.t('runtimeState.status.running');
       case 'waiting': return i18n.t('runtimeState.status.waiting');
       case 'paused': return i18n.t('runtimeState.status.paused');
+      case 'blocked': return i18n.t('runtimeState.status.blocked');
       case 'completed': return i18n.t('runtimeState.status.completed');
       case 'failed': return i18n.t('runtimeState.status.failed');
       case 'cancelled': return i18n.t('runtimeState.status.cancelled');
@@ -327,6 +329,7 @@
       case 'running': return 'running';
       case 'waiting': return 'waiting';
       case 'paused': return 'paused';
+      case 'blocked': return 'blocked';
       case 'completed': return 'completed';
       case 'failed': return 'failed';
       case 'cancelled': return 'cancelled';
@@ -391,6 +394,7 @@
       case 'planning': return i18n.t('runtimeDiagnostics.phase.planning');
       case 'running': return i18n.t('runtimeDiagnostics.phase.running');
       case 'waiting': return i18n.t('runtimeDiagnostics.phase.waiting');
+      case 'blocked': return i18n.t('runtimeState.status.blocked');
       case 'reviewing': return i18n.t('runtimeDiagnostics.phase.reviewing');
       case 'summary': return i18n.t('runtimeDiagnostics.phase.summary');
       case 'idle': return i18n.t('runtimeState.status.idle');
@@ -1229,6 +1233,7 @@
   .runtime-diagnostics--running   { border-left-color: var(--vscode-progressBar-background, var(--info)); }
   .runtime-diagnostics--waiting   { border-left-color: var(--vscode-editorWarning-foreground, var(--warning)); }
   .runtime-diagnostics--paused    { border-left-color: var(--vscode-editorWarning-foreground, var(--warning)); }
+  .runtime-diagnostics--blocked   { border-left-color: var(--vscode-editorWarning-foreground, var(--warning)); }
 
   .runtime-diagnostics__summary-button {
     width: 100%;
@@ -1302,6 +1307,10 @@
     color: var(--foreground-muted);
   }
   .summary__badge--paused {
+    background: color-mix(in srgb, var(--warning) 18%, transparent);
+    color: var(--warning);
+  }
+  .summary__badge--blocked {
     background: color-mix(in srgb, var(--warning) 18%, transparent);
     color: var(--warning);
   }

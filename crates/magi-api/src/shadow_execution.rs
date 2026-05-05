@@ -7,7 +7,10 @@ use magi_core::{
     TaskKind, TaskPolicy, TaskStatus, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, task_events};
-use magi_orchestrator::{ExecutionWritebackPlans, task_worker_catalog::resolve_task_role};
+use magi_orchestrator::{
+    ExecutionWritebackPlans,
+    task_worker_catalog::{compatible_task_role_for_kind, resolve_task_role},
+};
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     ActiveExecutionTurn, ActiveExecutionTurnItem, ActiveExecutionTurnLane,
@@ -671,11 +674,19 @@ fn insert_deep_task_graph(
                     ));
                 }
 
-                let action_role = if is_primary_action {
-                    target_role
+                let action_role_candidate = if is_primary_action {
+                    target_role.to_string()
                 } else {
-                    infer_dispatch_task_role(Some(action_plan.goal.as_str()))
+                    infer_dispatch_task_role(Some(action_plan.goal.as_str())).to_string()
                 };
+                let action_role =
+                    compatible_task_role_for_kind(TaskKind::Action, Some(&action_role_candidate))
+                        .ok_or_else(|| {
+                        ApiError::internal_assembly(
+                            "构建深度任务图失败",
+                            format!("无法为 action {} 解析可执行角色", action_plan.title),
+                        )
+                    })?;
 
                 task_store.insert_task(make_shadow_task(
                     action_id.clone(),
@@ -687,7 +698,7 @@ fn insert_deep_task_graph(
                     action_plan.goal.clone(),
                     TaskStatus::Ready,
                     *now,
-                    Some(action_role),
+                    Some(action_role.as_str()),
                     action_plan.write_scope.as_deref(),
                     root_policy.clone(),
                 ));
@@ -1703,6 +1714,7 @@ mod tests {
     use crate::dto::SessionTurnRequestDto;
 
     struct StaticDeepPlanModelBridgeClient;
+    struct PathSensitiveDeepPlanModelBridgeClient;
 
     fn static_deep_plan_payload() -> String {
         deep_task_plan_response(serde_json::json!({
@@ -1753,6 +1765,55 @@ mod tests {
         }))
     }
 
+    fn path_sensitive_deep_plan_payload() -> String {
+        deep_task_plan_response(serde_json::json!({
+            "phases": [
+                {
+                    "title": "规划",
+                    "workPackages": [
+                        {
+                            "title": "规划工作包",
+                            "actions": [
+                                {
+                                    "title": "梳理目标",
+                                    "goal": "梳理 /Users/xie/code/TEST 工作区的目标和验收标准"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "title": "执行",
+                    "workPackages": [
+                        {
+                            "title": "执行工作包",
+                            "actions": [
+                                {
+                                    "title": "执行任务",
+                                    "goal": "完成 /Users/xie/code/TEST 的只读检查"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "title": "交付",
+                    "workPackages": [
+                        {
+                            "title": "交付工作包",
+                            "actions": [
+                                {
+                                    "title": "验证交付",
+                                    "goal": "verify /Users/xie/code/TEST 的只读任务交付结果"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }))
+    }
+
     impl ModelBridgeClient for StaticDeepPlanModelBridgeClient {
         fn invoke(
             &self,
@@ -1773,6 +1834,30 @@ mod tests {
                 layer: BridgeErrorLayer::RemoteBusiness,
                 code: None,
                 message: "static deep plan client does not stream".to_string(),
+            })
+        }
+    }
+
+    impl ModelBridgeClient for PathSensitiveDeepPlanModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            Ok(BridgeResponse {
+                ok: true,
+                payload: path_sensitive_deep_plan_payload(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            _request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::RemoteBusiness,
+                code: None,
+                message: "path-sensitive deep plan client does not stream".to_string(),
             })
         }
     }
@@ -2063,6 +2148,64 @@ mod tests {
                     .remove(&validation_id)
                     .is_some(),
                 "validation task {validation_id} should have a registered execution plan"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_task_action_roles_stay_runnable_when_goal_mentions_test_path() {
+        let (state, task_store) = build_test_state();
+        let state = state.with_task_planning_model_bridge_client(Arc::new(
+            PathSensitiveDeepPlanModelBridgeClient,
+        ));
+        let session_id = SessionId::new("session-deep-action-role-compat");
+        state
+            .session_store
+            .create_session(session_id.clone(), "deep action role compat")
+            .expect("session should be creatable");
+
+        let accepted_at = UtcMillis::now();
+        let submission = run_shadow_dispatch_submission(
+            &state,
+            &DispatchSubmissionRequest {
+                accepted_at,
+                session_id,
+                workspace_id: None,
+                entry_id: "entry-deep-action-role-compat".to_string(),
+                timeline_message: "检查 /Users/xie/code/TEST".to_string(),
+                created_session: false,
+                mission_title: "检查 TEST 工作区".to_string(),
+                task_title: "执行: 检查 TEST 工作区".to_string(),
+                trimmed_text: Some("检查 /Users/xie/code/TEST".to_string()),
+                execution_goal: Some("检查 /Users/xie/code/TEST".to_string()),
+                deep_task: true,
+                skill_name: None,
+                target_role: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+            },
+        )
+        .expect("deep task should create graph");
+
+        let action_roles = task_store
+            .collect_subtree_ids(&submission.root_task_id)
+            .into_iter()
+            .filter_map(|task_id| task_store.get_task(&task_id))
+            .filter(|task| task.kind == TaskKind::Action)
+            .map(|task| {
+                task.executor_binding
+                    .expect("action task should have executor binding")
+                    .target_role
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(action_roles.len(), 3);
+        for role in action_roles {
+            assert!(
+                magi_orchestrator::task_worker_catalog::supported_kinds_for_role(&role)
+                    .contains(&TaskKind::Action),
+                "deep action role must be runnable by an Action worker, got {role}"
             );
         }
     }

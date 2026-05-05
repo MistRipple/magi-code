@@ -1,10 +1,12 @@
 import type {
   AgentId,
   ContentBlock,
+  DispatchGroupLane,
   Message,
   SessionTimelineProjection,
   TimelineProjectionArtifact,
   TimelineProjectionRenderEntry,
+  WorkerLaneStatus,
 } from '../types/message';
 import type {
   CanonicalToolCall,
@@ -23,6 +25,17 @@ function normalizeWorkerId(item: CanonicalTurnItem): AgentId | undefined {
   const workerRole = typeof item.worker?.roleId === 'string' ? item.worker.roleId.trim() : '';
   const workerTab = item.visibility.workerTabIds?.find((value) => typeof value === 'string' && value.trim());
   return (workerRole || workerTab || item.worker?.workerId || undefined) as AgentId | undefined;
+}
+
+function resolveVisibleWorkerId(item: CanonicalTurnItem): AgentId | undefined {
+  return item.visibility.workerVisible ? normalizeWorkerId(item) : undefined;
+}
+
+function resolveMessageSource(item: CanonicalTurnItem): Message['source'] {
+  if (item.kind === 'user_message') {
+    return 'user';
+  }
+  return resolveVisibleWorkerId(item) || 'orchestrator';
 }
 
 function statusToToolStatus(status: CanonicalTurnItemStatus): 'pending' | 'running' | 'success' | 'error' {
@@ -178,7 +191,7 @@ function canShowTurnResponseDuration(turn: CanonicalTurn, item: CanonicalTurnIte
 
 function buildMessage(turn: CanonicalTurn, item: CanonicalTurnItem, artifactId: string): Message {
   const content = resolveItemContent(item);
-  const worker = normalizeWorkerId(item);
+  const worker = resolveVisibleWorkerId(item);
   const blocks = buildMessageBlocks(item, content);
   const isStreaming = item.kind === 'assistant_text' && !isCanonicalTerminalStatus(item.status);
   const responseDurationMs = canShowTurnResponseDuration(turn, item)
@@ -187,7 +200,7 @@ function buildMessage(turn: CanonicalTurn, item: CanonicalTurnItem, artifactId: 
   return {
     id: artifactId,
     role: resolveMessageRole(item),
-    source: item.kind === 'user_message' ? 'user' : (worker || 'orchestrator'),
+    source: resolveMessageSource(item),
     content,
     ...(blocks ? { blocks } : {}),
     timestamp: item.createdAt,
@@ -230,7 +243,7 @@ function buildArtifact(turn: CanonicalTurn, item: CanonicalTurnItem): TimelinePr
     return null;
   }
   const artifactId = resolveArtifactId(turn, item);
-  const worker = normalizeWorkerId(item);
+  const worker = resolveVisibleWorkerId(item);
   const workerTabs = item.visibility.workerVisible && worker ? [worker] : [];
   return {
     artifactId,
@@ -248,6 +261,185 @@ function buildArtifact(turn: CanonicalTurn, item: CanonicalTurnItem): TimelinePr
     workerTabs,
     messageIds: [artifactId, item.itemId],
     message: buildMessage(turn, item, artifactId),
+  };
+}
+
+function canonicalStatusToWorkerLaneStatus(status: CanonicalTurnItemStatus): WorkerLaneStatus {
+  switch (status) {
+    case 'blocked':
+      return 'blocked';
+    case 'failed':
+      return 'failed';
+    case 'cancelled':
+      return 'cancelled';
+    case 'completed':
+      return 'completed';
+    case 'running':
+      return 'running';
+    case 'pending':
+    default:
+      return 'pending';
+  }
+}
+
+function mergeLaneStatus(current: WorkerLaneStatus, next: WorkerLaneStatus): WorkerLaneStatus {
+  if (next === 'failed' || current === 'failed') return 'failed';
+  if (next === 'blocked' || current === 'blocked') return 'blocked';
+  if (next === 'cancelled' || current === 'cancelled') return 'cancelled';
+  if (next === 'running' || current === 'running') return 'running';
+  if (next === 'pending' || current === 'pending') return 'pending';
+  return 'completed';
+}
+
+function summarizeLaneContent(content: string): string | undefined {
+  const firstParagraph = content
+    .split(/\n\s*\n/)
+    .map((part) => part.trim())
+    .find((part) => part.length > 0);
+  if (!firstParagraph) {
+    return undefined;
+  }
+  return firstParagraph.length > 180 ? `${firstParagraph.slice(0, 177)}...` : firstParagraph;
+}
+
+function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArtifact | null {
+  const dispatchItems = turn.items
+    .filter((item) => item.kind === 'worker_dispatch' && typeof item.laneId === 'string' && item.laneId.trim())
+    .sort((left, right) => left.itemSeq - right.itemSeq || left.itemId.localeCompare(right.itemId));
+  if (dispatchItems.length === 0) {
+    return null;
+  }
+
+  const laneById = new Map<string, DispatchGroupLane>();
+  const laneVersionById = new Map<string, number>();
+  for (const item of dispatchItems) {
+    const laneId = item.laneId?.trim();
+    if (!laneId) {
+      continue;
+    }
+    const worker = normalizeWorkerId(item) || 'orchestrator';
+    const title = (item.title || item.worker?.title || laneId).trim();
+    const status = canonicalStatusToWorkerLaneStatus(item.status);
+    laneById.set(laneId, {
+      laneId,
+      laneVersion: item.itemSeq,
+      worker,
+      title,
+      description: item.content || title,
+      status,
+      startedAt: item.createdAt,
+      ...(isCanonicalTerminalStatus(item.status) ? { endedAt: item.updatedAt } : {}),
+      jumpTarget: { workerTabId: worker },
+    });
+    laneVersionById.set(laneId, item.itemSeq);
+  }
+
+  for (const item of turn.items) {
+    const laneId = item.laneId?.trim();
+    if (!laneId || !laneById.has(laneId)) {
+      continue;
+    }
+    const lane = laneById.get(laneId)!;
+    const status = canonicalStatusToWorkerLaneStatus(item.status);
+    lane.status = mergeLaneStatus(lane.status, status);
+    lane.laneVersion = Math.max(lane.laneVersion, item.itemSeq);
+    laneVersionById.set(laneId, lane.laneVersion);
+    if (item.kind === 'tool_call') {
+      lane.toolUseCount = (lane.toolUseCount || 0) + 1;
+    }
+    if (item.kind === 'assistant_text' && typeof item.content === 'string' && item.content.trim()) {
+      lane.summary = summarizeLaneContent(item.content);
+    }
+    if (isCanonicalTerminalStatus(item.status)) {
+      lane.endedAt = item.updatedAt;
+    }
+  }
+
+  const lanes = Array.from(laneById.values())
+    .sort((left, right) => {
+      const leftSeq = dispatchItems.find((item) => item.laneId === left.laneId)?.laneSeq ?? Number.MAX_SAFE_INTEGER;
+      const rightSeq = dispatchItems.find((item) => item.laneId === right.laneId)?.laneSeq ?? Number.MAX_SAFE_INTEGER;
+      return leftSeq - rightSeq || left.laneId.localeCompare(right.laneId);
+    })
+    .map((lane) => {
+      const totalTaskCount = 1;
+      return {
+        ...lane,
+        progressSummary: {
+          totalTaskCount,
+          completedTaskCount: lane.status === 'completed' ? 1 : 0,
+          blockedTaskCount: lane.status === 'blocked' ? 1 : 0,
+          awaitingApprovalTaskCount: lane.status === 'awaiting_approval' ? 1 : 0,
+          reviewRequiredTaskCount: lane.status === 'review_required' ? 1 : 0,
+        },
+        tasks: [{
+          taskId: dispatchItems.find((item) => item.laneId === lane.laneId)?.worker?.taskId,
+          title: lane.title,
+          status: lane.status,
+          isCurrent: lane.status === 'running' || lane.status === 'pending',
+          seq: dispatchItems.find((item) => item.laneId === lane.laneId)?.laneSeq,
+        }],
+      };
+    });
+  if (lanes.length === 0) {
+    return null;
+  }
+
+  const groupStatus = lanes.reduce<WorkerLaneStatus>(
+    (status, lane) => mergeLaneStatus(status, lane.status),
+    'completed',
+  );
+  const firstItem = dispatchItems[0];
+  const artifactId = `turn:${turn.turnId}:worker-dispatch-group`;
+  const block: ContentBlock = {
+    type: 'dispatch_group',
+    content: '',
+    blockId: `dispatch-group:${turn.turnId}`,
+    dispatchWaveId: turn.turnId,
+    status: groupStatus,
+    lanes,
+  };
+  const message: Message = {
+    id: artifactId,
+    role: 'assistant',
+    source: 'orchestrator',
+    content: '',
+    blocks: [block],
+    timestamp: firstItem.createdAt,
+    updatedAt: Math.max(...dispatchItems.map((item) => item.updatedAt || item.createdAt)),
+    isStreaming: groupStatus === 'running' || groupStatus === 'pending',
+    isComplete: groupStatus !== 'running' && groupStatus !== 'pending',
+    type: 'text',
+    metadata: {
+      turnId: turn.turnId,
+      turnSeq: turn.turnSeq,
+      turnStatus: turn.status,
+      turnItemId: artifactId,
+      turnItemKind: 'worker_dispatch',
+      turnItemStatus: groupStatus,
+      itemSeq: firstItem.itemSeq,
+      blockSeq: firstItem.itemSeq,
+      cardStreamSeq: firstItem.itemSeq,
+      dispatchWaveId: turn.turnId,
+      canonical: true,
+    },
+  };
+
+  return {
+    artifactId,
+    kind: 'message',
+    displayOrder: turn.turnSeq * 1000 + firstItem.itemSeq,
+    artifactVersion: Math.max(...Array.from(laneVersionById.values())),
+    anchorEventSeq: 0,
+    latestEventSeq: 0,
+    cardStreamSeq: firstItem.itemSeq,
+    timestamp: firstItem.createdAt,
+    cardId: artifactId,
+    dispatchWaveId: turn.turnId,
+    threadVisible: true,
+    workerTabs: [],
+    messageIds: [artifactId, ...dispatchItems.map((item) => item.itemId)],
+    message,
   };
 }
 
@@ -352,7 +544,10 @@ export function buildCanonicalTimelineProjection(state: CanonicalTurnReducerStat
     return null;
   }
   const artifacts = collapseArtifactsByStableCard(state.turns
-    .flatMap((turn) => turn.items.map((item) => buildArtifact(turn, item)))
+    .flatMap((turn) => [
+      buildDispatchGroupArtifact(turn),
+      ...turn.items.map((item) => buildArtifact(turn, item)),
+    ])
     .filter((artifact): artifact is TimelineProjectionArtifact => Boolean(artifact))
     .sort(compareArtifacts));
   const threadRenderEntries = artifacts

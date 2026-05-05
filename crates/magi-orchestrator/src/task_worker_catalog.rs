@@ -14,10 +14,13 @@ pub fn default_task_role_for_kind(kind: TaskKind) -> Option<&'static str> {
 }
 
 pub fn resolve_task_role(task: &Task) -> Option<&str> {
-    task.executor_binding
-        .as_ref()
-        .map(|binding| binding.target_role.as_str())
-        .or_else(|| default_task_role_for_kind(task.kind))
+    if let Some(binding) = task.executor_binding.as_ref() {
+        let role = binding.target_role.trim();
+        if !role.is_empty() && role_supports_task_kind(role, task.kind) {
+            return Some(role);
+        }
+    }
+    default_task_role_for_kind(task.kind)
 }
 
 pub fn supported_kinds_for_role(role: &str) -> Vec<TaskKind> {
@@ -31,6 +34,19 @@ pub fn supported_kinds_for_role(role: &str) -> Vec<TaskKind> {
         "debugger" => vec![TaskKind::Repair, TaskKind::Action],
         _ => Vec::new(),
     }
+}
+
+pub fn role_supports_task_kind(role: &str, kind: TaskKind) -> bool {
+    supported_kinds_for_role(role).contains(&kind)
+}
+
+pub fn compatible_task_role_for_kind(kind: TaskKind, candidate: Option<&str>) -> Option<String> {
+    if let Some(role) = candidate.map(str::trim).filter(|role| !role.is_empty()) {
+        if role_supports_task_kind(role, kind) {
+            return Some(role.to_string());
+        }
+    }
+    default_task_role_for_kind(kind).map(ToOwned::to_owned)
 }
 
 pub fn build_worker_info_for_role(role: &str) -> Option<WorkerInfo> {
@@ -273,6 +289,44 @@ mod tests {
         };
         let candidates = catalog.find_for_task(&task);
         assert!(!candidates.is_empty());
+    }
+
+    #[test]
+    fn resolve_task_role_falls_back_when_bound_role_cannot_execute_kind() {
+        let task = Task {
+            task_id: magi_core::TaskId::new("t-1"),
+            mission_id: magi_core::MissionId::new("m-1"),
+            root_task_id: magi_core::TaskId::new("t-1"),
+            parent_task_id: None,
+            kind: TaskKind::Action,
+            title: "check TEST workspace".to_string(),
+            goal: "inspect /Users/xie/code/TEST".to_string(),
+            status: magi_core::TaskStatus::Ready,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: Some(magi_core::ExecutorBinding {
+                target_role: "test-engineer".to_string(),
+                capability_requirements: Vec::new(),
+                parallelism_group: None,
+                exclusive_scope: None,
+                worker_selector: None,
+            }),
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: magi_core::UtcMillis::now(),
+            updated_at: magi_core::UtcMillis::now(),
+        };
+
+        assert_eq!(resolve_task_role(&task), Some("integration-dev"));
     }
 
     #[test]

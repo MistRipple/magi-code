@@ -12,6 +12,7 @@ export type OrchestrationRuntimeStateStatus =
   | 'running'
   | 'waiting'
   | 'paused'
+  | 'blocked'
   | 'completed'
   | 'failed'
   | 'cancelled';

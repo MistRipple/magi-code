@@ -13,7 +13,6 @@ import type {
   Session,
   SessionNotificationRecord,
   SubTaskItem,
-  Task,
 } from '../../types/message';
 import { buildEmptyWorkspaceAppState } from './empty-workspace-state';
 
@@ -637,23 +636,6 @@ function shortenId(value: string, prefix: string): string {
   return `${prefix}-${value.slice(-8)}`;
 }
 
-function normalizeTaskStatus(status: string, failedCount = 0): Task['status'] {
-  const normalized = status.toLowerCase();
-  if (normalized.includes('fail') || normalized.includes('block') || failedCount > 0) {
-    return 'failed';
-  }
-  if (normalized.includes('success') || normalized.includes('complete')) {
-    return 'completed';
-  }
-  if (normalized.includes('run') || normalized.includes('resume') || normalized.includes('execute')) {
-    return 'running';
-  }
-  if (normalized.includes('pause') || normalized.includes('wait')) {
-    return 'paused';
-  }
-  return 'pending';
-}
-
 function normalizeSubTaskStatus(status: string, failedDispatchCount = 0): SubTaskItem['status'] {
   const normalized = status.toLowerCase();
   if (normalized.includes('approval')) {
@@ -1039,14 +1021,19 @@ function deriveRuntimeState(
   const recoverableBranchCount = typeof activeSession?.recoverable_branch_count === 'number'
     ? activeSession.recoverable_branch_count
     : 0;
+  const rootTaskStatus = normalizeSubTaskStatus(
+    normalizeString(activeSession?.root_task_status || activeSession?.current_status),
+  );
   const status = runningTaskIds.length > 0
     ? 'running'
-    : hasRecoverableChain
+    : rootTaskStatus === 'blocked'
+      ? 'blocked'
+      : hasRecoverableChain
       ? 'paused'
       : failedTaskIds.length > 0
         ? 'failed'
         : activeSession
-          ? normalizeTaskStatus(normalizeString(activeSession.root_task_status || activeSession.current_status)) === 'completed'
+          ? rootTaskStatus === 'completed'
             ? 'completed'
             : 'idle'
           : 'idle';
@@ -1056,7 +1043,11 @@ function deriveRuntimeState(
   return {
     sessionId: sessionId || undefined,
     status,
-    phase: runningTaskIds.length > 0 ? 'execute' : (hasRecoverableChain ? 'paused' : 'idle'),
+    phase: runningTaskIds.length > 0
+      ? 'execute'
+      : status === 'blocked'
+        ? 'blocked'
+        : (hasRecoverableChain ? 'paused' : 'idle'),
     errors: failedTaskIds.length > 0 ? failedTaskIds.map((id) => `task_failed:${id}`) : [],
     statusChangedAt: normalizeNumber(activeSession?.last_update, generatedAt),
     lastEventAt: normalizeNumber(activeSession?.last_update, generatedAt),

@@ -823,7 +823,7 @@ fn persisted_parts_restores_canonical_turn_log_from_sidecar_current_turn() {
     );
     assert_eq!(
         restored_turn.items[1].visibility.worker_tab_ids,
-        vec![worker_id.to_string()]
+        vec!["integration-engineer".to_string()]
     );
     assert_eq!(
         restored.durable_state().canonical_turns[0].turn_id,

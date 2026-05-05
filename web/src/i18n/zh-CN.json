@@ -1217,6 +1217,7 @@
   "runtimeState.status.running": "运行中",
   "runtimeState.status.waiting": "等待中",
   "runtimeState.status.paused": "已暂停",
+  "runtimeState.status.blocked": "等待处理",
   "runtimeState.status.completed": "已完成",
   "runtimeState.status.failed": "已失败",
   "runtimeState.status.cancelled": "已取消",

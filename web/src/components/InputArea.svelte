@@ -138,7 +138,7 @@
     const sessionId = currentSessionId?.trim();
     const rootTaskId = projection?.root_task.task_id ?? taskGraph.rootTaskId;
     if (!projection || !sessionId || !rootTaskId) return false;
-    return projection.runner_status === 'running' || projection.runner_status === 'blocked';
+    return projection.runner_status === 'running';
   });
 
   // 发送/停止态只认 store 内已经收敛好的处理状态，避免历史工具卡片把空闲会话抬回执行态。

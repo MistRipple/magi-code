@@ -1222,6 +1222,7 @@
   "runtimeState.status.running": "Running",
   "runtimeState.status.waiting": "Waiting",
   "runtimeState.status.paused": "Paused",
+  "runtimeState.status.blocked": "Blocked",
   "runtimeState.status.completed": "Completed",
   "runtimeState.status.failed": "Failed",
   "runtimeState.status.cancelled": "Cancelled",

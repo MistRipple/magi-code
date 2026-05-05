@@ -60,9 +60,85 @@ function runGoldenReplay(reducer, projection, contract) {
   assertSplitToolStartedAndResultCollapseIntoOneCard(reducer, projection);
   assertCancelledToolShowsTurnResponseDuration(reducer, projection);
   assertFailedToolWithoutAssistantShowsTurnResponseDuration(reducer, projection);
+  assertThreadVisibleRoleMetadataDoesNotBecomeWorkerBadge(reducer, projection);
+  assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection);
   assertBootstrapProcessingStateFromRunningCanonicalTurn(contract);
   assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract);
   assertBootstrapCarriesPendingChanges(contract);
+}
+
+function assertThreadVisibleRoleMetadataDoesNotBecomeWorkerBadge(reducer, projection) {
+  const c = baseCase('thread-visible-role-metadata', 'session-golden-thread-role', 'turn-golden-thread-role', 9200);
+  const assistant = assistantText(c, 2, 'assistant-role-main', '这是主线最终回复。', 'completed');
+  assistant.worker = {
+    taskId: 'task-primary',
+    roleId: 'integration-dev',
+    title: '最终回复',
+  };
+  assistant.visibility = {
+    renderable: true,
+    threadVisible: true,
+    workerVisible: false,
+  };
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'completed', [assistant], { completedAt: 9300, responseDurationMs: 100 }),
+  ]);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  const artifact = findArtifactByTurnItemId(projectionValue, 'assistant-role-main');
+  assert.ok(artifact, 'thread-visible assistant artifact should exist');
+  assert.equal(
+    artifact.message.source,
+    'orchestrator',
+    'thread-visible primary task metadata must not render as a worker badge source',
+  );
+  assert.equal(
+    artifact.message.metadata?.roleId,
+    undefined,
+    'roleId should only be exposed as render source for worker-visible sidechain items',
+  );
+}
+
+function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection) {
+  const c = baseCase('worker-dispatch-card', 'session-golden-worker-card', 'turn-golden-worker-card', 9400);
+  const dispatchA = workerDispatch(c, 2, 'dispatch-a', 'lane-a', 'integration-dev', '实现验证', 'running');
+  const dispatchB = workerDispatch(c, 3, 'dispatch-b', 'lane-b', 'reviewer', '代码评审', 'completed');
+  const workerTool = tool(c, 4, 'worker-tool-a', 'call-worker-a', 'printf worker', 'completed', { stdout: 'worker' });
+  workerTool.laneId = 'lane-a';
+  workerTool.worker = { taskId: 'task-a', workerId: 'worker-a', roleId: 'integration-dev', title: 'shell_exec' };
+  workerTool.visibility = {
+    renderable: true,
+    threadVisible: false,
+    workerVisible: true,
+    workerTabIds: ['integration-dev'],
+  };
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'running', [dispatchA, dispatchB, workerTool]),
+  ]);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  assert.ok(projectionValue, 'worker dispatch projection should exist');
+  const mainEntries = projectionValue.threadRenderEntries.map((entry) => entry.artifactId);
+  assert.deepEqual(
+    mainEntries,
+    [`turn:${c.turnId}:worker-dispatch-group`],
+    'worker dispatch sidechain items should surface in the main lane as one worker card',
+  );
+  const workerCard = projectionValue.artifacts.find((artifact) => artifact.artifactId === `turn:${c.turnId}:worker-dispatch-group`);
+  assert.ok(workerCard, 'worker card artifact should exist');
+  const dispatchBlock = workerCard.message.blocks?.find((block) => block.type === 'dispatch_group');
+  assert.ok(dispatchBlock, 'worker card should render through a dispatch_group block');
+  assert.deepEqual(
+    dispatchBlock.lanes?.map((lane) => ({ title: lane.title, worker: lane.worker, status: lane.status })),
+    [
+      { title: '实现验证', worker: 'integration-dev', status: 'running' },
+      { title: '代码评审', worker: 'reviewer', status: 'completed' },
+    ],
+    'worker card lanes must keep dispatch order and product role ids',
+  );
+  assert.equal(
+    projectionValue.workerRenderEntries['integration-dev']?.length,
+    2,
+    'integration worker tab should still receive its sidechain dispatch/tool items',
+  );
 }
 
 function replayLive(reducer, testCase) {
@@ -748,6 +824,27 @@ function tool(c, itemSeq, itemId, callId, command, status, result = undefined) {
     content: status === 'running' ? '正在调用工具：shell_exec' : `命令执行${failed ? '失败' : '成功'}: ${command}`,
     title: 'shell_exec',
     tool: toolCall,
+  });
+}
+
+function workerDispatch(c, itemSeq, itemId, laneId, roleId, title, status) {
+  return item(c, itemSeq, itemId, 'worker_dispatch', status, {
+    laneId,
+    laneSeq: itemSeq - 1,
+    title,
+    content: `已为 ${title} 创建执行分支。`,
+    worker: {
+      taskId: `task-${laneId}`,
+      workerId: `worker-${laneId}`,
+      roleId,
+      title,
+    },
+    visibility: {
+      renderable: true,
+      threadVisible: false,
+      workerVisible: true,
+      workerTabIds: [roleId],
+    },
   });
 }
 
