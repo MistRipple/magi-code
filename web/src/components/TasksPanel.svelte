@@ -896,7 +896,7 @@
                 {#if wp.recent_issues.length > 0}
                   <div class="wp-summary-issues">
                     <Icon name="alert-circle" size={10} />
-                    <span>{wp.recent_issues.length} 项异常: {wp.recent_issues.map(getTaskDisplayText).join('、')}</span>
+                    <span>{wp.recent_issues.length} 项需要处理: {wp.recent_issues.map(getTaskDisplayText).join('、')}</span>
                   </div>
                 {/if}
               </div>

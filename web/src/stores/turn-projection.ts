@@ -29,7 +29,7 @@ function statusToToolStatus(status: CanonicalTurnItemStatus): 'pending' | 'runni
   if (status === 'completed') {
     return 'success';
   }
-  if (status === 'failed' || status === 'cancelled') {
+  if (status === 'blocked' || status === 'failed' || status === 'cancelled') {
     return 'error';
   }
   if (status === 'running') {

@@ -1537,6 +1537,53 @@ impl TaskRunner {
             .resolve_decision(decision_task_id, chosen_option, evidence)
     }
 
+    /// 将 runner 已确认无法继续自动推进的 blocked outcome 写回任务图事实源。
+    ///
+    /// `RunCycleOutcome::Blocked` 只描述一次调度周期的原因；后台 runner 在连续确认
+    /// blocked 后退出时，必须把对应任务原位收束为 `Blocked`，否则 graph projection 会
+    /// 同时出现 runner 已阻塞、task store 仍 Running/Ready 的双事实。
+    pub fn finalize_blocked_outcome(
+        &self,
+        root_task_id: &TaskId,
+        blocked_task_ids: &[TaskId],
+    ) -> Result<u32, String> {
+        let mut changed = 0u32;
+        let candidates = if blocked_task_ids.is_empty() {
+            self.collect_non_terminal_task_ids(root_task_id)
+        } else {
+            blocked_task_ids.to_vec()
+        };
+
+        for task_id in candidates {
+            let Some(task) = self.store.get_task(&task_id) else {
+                continue;
+            };
+            if !matches!(
+                task.status,
+                TaskStatus::Draft
+                    | TaskStatus::Ready
+                    | TaskStatus::Running
+                    | TaskStatus::Verifying
+                    | TaskStatus::Repairing
+            ) {
+                continue;
+            }
+            self.store
+                .update_status(&task_id, TaskStatus::Blocked)
+                .map_err(|e| format!("failed to finalize blocked task {task_id}: {e}"))?;
+            if let Some(lease) = self.store.get_active_lease(&task_id) {
+                self.store.revoke_lease(&task_id, &lease.lease_id);
+            }
+            changed += 1;
+        }
+
+        self.propagate_parent_completion(root_task_id)?;
+        if changed > 0 {
+            self.set_checkpoint_signal();
+        }
+        Ok(changed)
+    }
+
     // ------------------------------------------------------------------
     // G5: Control commands (design 9.x)
     // ------------------------------------------------------------------
@@ -2162,6 +2209,55 @@ mod tests {
             }
             other => panic!("expected Blocked, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn finalize_blocked_outcome_writes_task_graph_fact() {
+        let store = Arc::new(TaskStore::new());
+
+        store.insert_task(make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        ));
+        store.insert_task(make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        ));
+
+        let runner = TaskRunner::new(Arc::clone(&store), Vec::new());
+        let outcome = runner.run_cycle(&TaskId::new("obj-1"));
+        let blocked_ids = match outcome {
+            RunCycleOutcome::Blocked(ids) => ids,
+            other => panic!("expected Blocked, got {:?}", other),
+        };
+
+        runner
+            .finalize_blocked_outcome(&TaskId::new("obj-1"), &blocked_ids)
+            .expect("blocked outcome should be persisted into task graph");
+
+        let projection = store.build_projection(&TaskId::new("obj-1")).unwrap();
+        assert_eq!(projection.runner_status, "blocked");
+        assert_eq!(projection.aggregate_status, TaskStatus::Blocked);
+        assert!(projection.running_tasks.is_empty());
+        assert_eq!(projection.progress_summary.running_tasks, 0);
+        assert!(
+            projection
+                .blocked_tasks
+                .iter()
+                .any(|id| id == &TaskId::new("act-1"))
+        );
+        assert_eq!(
+            store.get_task(&TaskId::new("obj-1")).unwrap().status,
+            TaskStatus::Blocked
+        );
     }
 
     #[test]

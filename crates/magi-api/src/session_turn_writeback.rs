@@ -123,7 +123,8 @@ fn canonical_turn_status(status: &str) -> Option<CanonicalTurnStatus> {
         "running" | "started" | "streaming" | "awaiting_approval" | "review_required"
         | "repairing" | "verifying" => Some(CanonicalTurnStatus::Running),
         "completed" | "complete" | "succeeded" | "success" => Some(CanonicalTurnStatus::Completed),
-        "failed" | "error" | "blocked" => Some(CanonicalTurnStatus::Failed),
+        "blocked" => Some(CanonicalTurnStatus::Blocked),
+        "failed" | "error" => Some(CanonicalTurnStatus::Failed),
         "cancelled" | "canceled" => Some(CanonicalTurnStatus::Cancelled),
         _ => None,
     }
@@ -134,6 +135,7 @@ fn canonical_item_status(status: &str) -> Option<CanonicalTurnItemStatus> {
         CanonicalTurnStatus::Pending => Some(CanonicalTurnItemStatus::Pending),
         CanonicalTurnStatus::Running => Some(CanonicalTurnItemStatus::Running),
         CanonicalTurnStatus::Completed => Some(CanonicalTurnItemStatus::Completed),
+        CanonicalTurnStatus::Blocked => Some(CanonicalTurnItemStatus::Blocked),
         CanonicalTurnStatus::Failed => Some(CanonicalTurnItemStatus::Failed),
         CanonicalTurnStatus::Cancelled => Some(CanonicalTurnItemStatus::Cancelled),
     }
@@ -144,6 +146,7 @@ fn terminal_item_status_for_turn_status(
 ) -> Option<CanonicalTurnItemStatus> {
     match status {
         CanonicalTurnStatus::Completed => Some(CanonicalTurnItemStatus::Completed),
+        CanonicalTurnStatus::Blocked => Some(CanonicalTurnItemStatus::Blocked),
         CanonicalTurnStatus::Failed => Some(CanonicalTurnItemStatus::Failed),
         CanonicalTurnStatus::Cancelled => Some(CanonicalTurnItemStatus::Cancelled),
         CanonicalTurnStatus::Pending | CanonicalTurnStatus::Running => None,

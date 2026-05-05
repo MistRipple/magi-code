@@ -66,7 +66,8 @@ fn current_turn_item_status_is_active(status: &str) -> bool {
 fn terminal_item_status_for_turn_status(status: &str) -> Option<&'static str> {
     match status.trim().to_ascii_lowercase().as_str() {
         "completed" | "complete" | "succeeded" | "success" => Some("completed"),
-        "failed" | "error" | "blocked" => Some("failed"),
+        "blocked" => Some("blocked"),
+        "failed" | "error" => Some("failed"),
         "cancelled" | "canceled" => Some("cancelled"),
         _ => None,
     }
@@ -78,7 +79,8 @@ fn canonical_current_turn_status(status: &str) -> DomainResult<CanonicalTurnStat
         "running" | "started" | "streaming" | "awaiting_approval" | "review_required"
         | "repairing" | "verifying" => Ok(CanonicalTurnStatus::Running),
         "completed" | "complete" | "succeeded" | "success" => Ok(CanonicalTurnStatus::Completed),
-        "failed" | "error" | "blocked" => Ok(CanonicalTurnStatus::Failed),
+        "blocked" => Ok(CanonicalTurnStatus::Blocked),
+        "failed" | "error" => Ok(CanonicalTurnStatus::Failed),
         "cancelled" | "canceled" => Ok(CanonicalTurnStatus::Cancelled),
         _ => Err(DomainError::InvalidState {
             message: format!("unknown current turn status: {status}"),
@@ -91,6 +93,7 @@ fn canonical_current_turn_item_status(status: &str) -> DomainResult<CanonicalTur
         CanonicalTurnStatus::Pending => CanonicalTurnItemStatus::Pending,
         CanonicalTurnStatus::Running => CanonicalTurnItemStatus::Running,
         CanonicalTurnStatus::Completed => CanonicalTurnItemStatus::Completed,
+        CanonicalTurnStatus::Blocked => CanonicalTurnItemStatus::Blocked,
         CanonicalTurnStatus::Failed => CanonicalTurnItemStatus::Failed,
         CanonicalTurnStatus::Cancelled => CanonicalTurnItemStatus::Cancelled,
     })
@@ -101,6 +104,7 @@ fn terminal_item_status_for_canonical_turn_status(
 ) -> Option<CanonicalTurnItemStatus> {
     match status {
         CanonicalTurnStatus::Completed => Some(CanonicalTurnItemStatus::Completed),
+        CanonicalTurnStatus::Blocked => Some(CanonicalTurnItemStatus::Blocked),
         CanonicalTurnStatus::Failed => Some(CanonicalTurnItemStatus::Failed),
         CanonicalTurnStatus::Cancelled => Some(CanonicalTurnItemStatus::Cancelled),
         CanonicalTurnStatus::Pending | CanonicalTurnStatus::Running => None,

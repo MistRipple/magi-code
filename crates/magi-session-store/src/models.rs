@@ -103,13 +103,17 @@ pub enum CanonicalTurnStatus {
     Pending,
     Running,
     Completed,
+    Blocked,
     Failed,
     Cancelled,
 }
 
 impl CanonicalTurnStatus {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::Blocked | Self::Failed | Self::Cancelled
+        )
     }
 
     pub fn allows_transition_to(self, next: Self) -> bool {
@@ -119,10 +123,13 @@ impl CanonicalTurnStatus {
         match self {
             Self::Pending => matches!(
                 next,
-                Self::Running | Self::Completed | Self::Failed | Self::Cancelled
+                Self::Running | Self::Completed | Self::Blocked | Self::Failed | Self::Cancelled
             ),
-            Self::Running => matches!(next, Self::Completed | Self::Failed | Self::Cancelled),
-            Self::Completed | Self::Failed | Self::Cancelled => false,
+            Self::Running => matches!(
+                next,
+                Self::Completed | Self::Blocked | Self::Failed | Self::Cancelled
+            ),
+            Self::Completed | Self::Blocked | Self::Failed | Self::Cancelled => false,
         }
     }
 }
@@ -147,13 +154,17 @@ pub enum CanonicalTurnItemStatus {
     Pending,
     Running,
     Completed,
+    Blocked,
     Failed,
     Cancelled,
 }
 
 impl CanonicalTurnItemStatus {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::Blocked | Self::Failed | Self::Cancelled
+        )
     }
 
     pub fn allows_transition_to(self, next: Self) -> bool {
@@ -163,10 +174,13 @@ impl CanonicalTurnItemStatus {
         match self {
             Self::Pending => matches!(
                 next,
-                Self::Running | Self::Completed | Self::Failed | Self::Cancelled
+                Self::Running | Self::Completed | Self::Blocked | Self::Failed | Self::Cancelled
             ),
-            Self::Running => matches!(next, Self::Completed | Self::Failed | Self::Cancelled),
-            Self::Completed | Self::Failed | Self::Cancelled => false,
+            Self::Running => matches!(
+                next,
+                Self::Completed | Self::Blocked | Self::Failed | Self::Cancelled
+            ),
+            Self::Completed | Self::Blocked | Self::Failed | Self::Cancelled => false,
         }
     }
 }

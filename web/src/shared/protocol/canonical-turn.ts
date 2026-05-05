@@ -1,6 +1,6 @@
 export const CANONICAL_TURN_SCHEMA_VERSION = 'canonical-turn.v1' as const;
 
-export type CanonicalTurnStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type CanonicalTurnStatus = 'pending' | 'running' | 'completed' | 'blocked' | 'failed' | 'cancelled';
 
 export type CanonicalTurnItemKind =
   | 'user_message'
@@ -87,7 +87,7 @@ export interface CanonicalTurnEvent {
   item?: CanonicalTurnItem;
 }
 
-const CANONICAL_TURN_STATUSES: CanonicalTurnStatus[] = ['pending', 'running', 'completed', 'failed', 'cancelled'];
+const CANONICAL_TURN_STATUSES: CanonicalTurnStatus[] = ['pending', 'running', 'completed', 'blocked', 'failed', 'cancelled'];
 const CANONICAL_TURN_ITEM_KINDS: CanonicalTurnItemKind[] = [
   'user_message',
   'assistant_text',
@@ -334,7 +334,7 @@ export function parseCanonicalTurnEventPayload(
 }
 
 export function isCanonicalTerminalStatus(status: CanonicalTurnStatus): boolean {
-  return status === 'completed' || status === 'failed' || status === 'cancelled';
+  return status === 'completed' || status === 'blocked' || status === 'failed' || status === 'cancelled';
 }
 
 export function canTransitionCanonicalStatus(
@@ -345,10 +345,14 @@ export function canTransitionCanonicalStatus(
     return true;
   }
   if (current === 'pending') {
-    return next === 'running' || next === 'completed' || next === 'failed' || next === 'cancelled';
+    return next === 'running'
+      || next === 'completed'
+      || next === 'blocked'
+      || next === 'failed'
+      || next === 'cancelled';
   }
   if (current === 'running') {
-    return next === 'completed' || next === 'failed' || next === 'cancelled';
+    return next === 'completed' || next === 'blocked' || next === 'failed' || next === 'cancelled';
   }
   return false;
 }

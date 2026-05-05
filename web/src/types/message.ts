@@ -397,7 +397,7 @@ export interface ContentBlock {
   };
   blockId?: string;
   dispatchWaveId?: string;
-  status?: WorkerLaneStatus | 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+  status?: WorkerLaneStatus | 'pending' | 'running' | 'completed' | 'blocked' | 'failed' | 'cancelled';
   summaryText?: string;
   lanes?: DispatchGroupLane[];
 }

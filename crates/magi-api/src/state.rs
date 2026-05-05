@@ -338,21 +338,34 @@ impl RunnerManager {
                         }
                         break;
                     }
-                    RunCycleOutcome::Blocked(_) => {
+                    RunCycleOutcome::Blocked(blocked_ids) => {
                         blocked_streak += 1;
                         if blocked_streak >= max_blocked_streak {
+                            let runner_status = match task_runner
+                                .finalize_blocked_outcome(&root_id, &blocked_ids)
+                            {
+                                Ok(_) => "blocked",
+                                Err(err) => {
+                                    let mut last_error = bg_handle
+                                        .last_error
+                                        .lock()
+                                        .expect("last_error lock should hold");
+                                    *last_error = Some(err);
+                                    "error"
+                                }
+                            };
                             if let Some(ref path) = bg_checkpoint_path {
                                 let _ = bg_task_store.checkpoint_to_file(path);
                             }
                             let mut status =
                                 bg_handle.status.lock().expect("status lock should hold");
-                            *status = "blocked".to_string();
+                            *status = runner_status.to_string();
                             bg_active.store(false, Ordering::Relaxed);
                             if let Some(observer) = terminal_observer.as_ref() {
                                 observer(
                                     root_id.clone(),
                                     observer_session_id.clone(),
-                                    "blocked".to_string(),
+                                    runner_status.to_string(),
                                 );
                             }
                             break;

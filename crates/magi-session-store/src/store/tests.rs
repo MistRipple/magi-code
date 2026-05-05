@@ -807,7 +807,7 @@ fn persisted_parts_restores_canonical_turn_log_from_sidecar_current_turn() {
     let turns = restored.canonical_turns_for_session(&session_id);
     assert_eq!(turns.len(), 1);
     let restored_turn = &turns[0];
-    assert_eq!(restored_turn.status, CanonicalTurnStatus::Failed);
+    assert_eq!(restored_turn.status, CanonicalTurnStatus::Blocked);
     assert_eq!(restored_turn.items.len(), 2);
     assert_eq!(
         restored_turn.items[0].kind,
@@ -816,6 +816,10 @@ fn persisted_parts_restores_canonical_turn_log_from_sidecar_current_turn() {
     assert_eq!(
         restored_turn.items[1].kind,
         CanonicalTurnItemKind::WorkerStatus
+    );
+    assert_eq!(
+        restored_turn.items[1].status,
+        crate::models::CanonicalTurnItemStatus::Blocked
     );
     assert_eq!(
         restored_turn.items[1].visibility.worker_tab_ids,
@@ -854,14 +858,14 @@ fn blocked_current_turn_is_terminal_in_canonical_log() {
 
     let turns = store.canonical_turns_for_session(&session_id);
     assert_eq!(turns.len(), 1);
-    assert_eq!(turns[0].status, CanonicalTurnStatus::Failed);
+    assert_eq!(turns[0].status, CanonicalTurnStatus::Blocked);
     assert!(
         turns[0].completed_at.is_some(),
         "blocked current turn should not keep the chat UI in running state",
     );
     assert_eq!(
         turns[0].items[0].status,
-        crate::models::CanonicalTurnItemStatus::Failed
+        crate::models::CanonicalTurnItemStatus::Blocked
     );
 }
 
@@ -911,7 +915,7 @@ fn persisted_parts_repairs_terminal_turn_with_stale_active_items() {
         )
         .expect("turn should upsert");
 
-    let mut assistant_item = test_turn_item("turn-item-terminal-active", "任务执行已阻塞");
+    let mut assistant_item = test_turn_item("turn-item-terminal-active", "任务执行需要处理");
     assistant_item.kind = "assistant_error".to_string();
     assistant_item.status = "running".to_string();
     store
@@ -929,10 +933,10 @@ fn persisted_parts_repairs_terminal_turn_with_stale_active_items() {
     let restored = SessionStore::from_persisted_parts(durable_state, sidecar_store);
     let turns = restored.canonical_turns_for_session(&session_id);
     assert_eq!(turns.len(), 1);
-    assert_eq!(turns[0].status, CanonicalTurnStatus::Failed);
+    assert_eq!(turns[0].status, CanonicalTurnStatus::Blocked);
     assert_eq!(
         turns[0].items[0].status,
-        crate::models::CanonicalTurnItemStatus::Failed
+        crate::models::CanonicalTurnItemStatus::Blocked
     );
 }
 
