@@ -291,17 +291,6 @@ function mergeLaneStatus(current: WorkerLaneStatus, next: WorkerLaneStatus): Wor
   return 'completed';
 }
 
-function summarizeLaneContent(content: string): string | undefined {
-  const firstParagraph = content
-    .split(/\n\s*\n/)
-    .map((part) => part.trim())
-    .find((part) => part.length > 0);
-  if (!firstParagraph) {
-    return undefined;
-  }
-  return firstParagraph.length > 180 ? `${firstParagraph.slice(0, 177)}...` : firstParagraph;
-}
-
 function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArtifact | null {
   const dispatchItems = turn.items
     .filter((item) => item.kind === 'worker_dispatch' && typeof item.laneId === 'string' && item.laneId.trim())
@@ -340,15 +329,10 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
       continue;
     }
     const lane = laneById.get(laneId)!;
-    const status = canonicalStatusToWorkerLaneStatus(item.status);
-    lane.status = mergeLaneStatus(lane.status, status);
     lane.laneVersion = Math.max(lane.laneVersion, item.itemSeq);
     laneVersionById.set(laneId, lane.laneVersion);
     if (item.kind === 'tool_call') {
       lane.toolUseCount = (lane.toolUseCount || 0) + 1;
-    }
-    if (item.kind === 'assistant_text' && typeof item.content === 'string' && item.content.trim()) {
-      lane.summary = summarizeLaneContent(item.content);
     }
     if (isCanonicalTerminalStatus(item.status)) {
       lane.endedAt = item.updatedAt;

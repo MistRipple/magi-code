@@ -100,7 +100,7 @@ function assertThreadVisibleRoleMetadataDoesNotBecomeWorkerBadge(reducer, projec
 
 function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection) {
   const c = baseCase('worker-dispatch-card', 'session-golden-worker-card', 'turn-golden-worker-card', 9400);
-  const dispatchA = workerDispatch(c, 2, 'dispatch-a', 'lane-a', 'integration-dev', '实现验证', 'running');
+  const dispatchA = workerDispatch(c, 2, 'dispatch-a', 'lane-a', 'integration-dev', '实现验证', 'completed');
   const dispatchB = workerDispatch(c, 3, 'dispatch-b', 'lane-b', 'reviewer', '代码评审', 'completed');
   const workerTool = tool(c, 4, 'worker-tool-a', 'call-worker-a', 'printf worker', 'completed', { stdout: 'worker' });
   workerTool.laneId = 'lane-a';
@@ -111,8 +111,26 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection) {
     workerVisible: true,
     workerTabIds: ['integration-dev'],
   };
+  const failedWorkerTool = tool(c, 5, 'worker-tool-failed', 'call-worker-failed', 'git status --short', 'failed', { stderr: 'fatal: not a git repository\n', exit_code: 128 });
+  failedWorkerTool.laneId = 'lane-a';
+  failedWorkerTool.worker = { taskId: 'task-a', workerId: 'worker-a', roleId: 'integration-dev', title: 'shell_exec' };
+  failedWorkerTool.visibility = {
+    renderable: true,
+    threadVisible: false,
+    workerVisible: true,
+    workerTabIds: ['integration-dev'],
+  };
+  const workerAssistant = assistantText(c, 6, 'worker-assistant-a', 'worker 内部执行详情不应直接塞进主线阶段摘要。', 'completed');
+  workerAssistant.laneId = 'lane-a';
+  workerAssistant.worker = { taskId: 'task-a', workerId: 'worker-a', roleId: 'integration-dev', title: '最终回复' };
+  workerAssistant.visibility = {
+    renderable: true,
+    threadVisible: false,
+    workerVisible: true,
+    workerTabIds: ['integration-dev'],
+  };
   const state = reducer.replaceCanonicalTurns(c.sessionId, [
-    turn(c, 'running', [dispatchA, dispatchB, workerTool]),
+    turn(c, 'completed', [dispatchA, dispatchB, workerTool, failedWorkerTool, workerAssistant], { completedAt: 9500, responseDurationMs: 100 }),
   ]);
   const projectionValue = projection.buildCanonicalTimelineProjection(state);
   assert.ok(projectionValue, 'worker dispatch projection should exist');
@@ -129,14 +147,22 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection) {
   assert.deepEqual(
     dispatchBlock.lanes?.map((lane) => ({ title: lane.title, worker: lane.worker, status: lane.status })),
     [
-      { title: '实现验证', worker: 'integration-dev', status: 'running' },
+      { title: '实现验证', worker: 'integration-dev', status: 'completed' },
       { title: '代码评审', worker: 'reviewer', status: 'completed' },
     ],
-    'worker card lanes must keep dispatch order and product role ids',
+    'worker card lanes must keep dispatch order and use worker_dispatch as lane status authority',
+  );
+  assert.deepEqual(
+    dispatchBlock.lanes?.map((lane) => ({ title: lane.title, summary: lane.summary, toolUseCount: lane.toolUseCount })),
+    [
+      { title: '实现验证', summary: undefined, toolUseCount: 2 },
+      { title: '代码评审', summary: undefined, toolUseCount: undefined },
+    ],
+    'main worker card must not leak worker-only assistant text as stage summary',
   );
   assert.equal(
     projectionValue.workerRenderEntries['integration-dev']?.length,
-    2,
+    4,
     'integration worker tab should still receive its sidechain dispatch/tool items',
   );
 }
