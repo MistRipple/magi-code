@@ -302,6 +302,8 @@ interface RustBootstrapDto {
   timeline?: RustTimelineEntry[];
   canonicalTurns?: unknown[];
   canonical_turns?: unknown[];
+  pendingChanges?: unknown[];
+  pending_changes?: unknown[];
   workspaces?: RustBootstrapWorkspaceRecord[];
   runtimeReadModel?: RustRuntimeReadModelDto;
   notifications?: RustNotificationRecord[];
@@ -1178,6 +1180,11 @@ export function normalizeRustBootstrapPayload(
     currentSession?.id || '',
     canonicalTurns,
   );
+  const pendingChanges = Array.isArray(payload.pendingChanges)
+    ? payload.pendingChanges
+    : Array.isArray(payload.pending_changes)
+      ? payload.pending_changes
+      : [];
   const state: AppState = {
     ...buildEmptyWorkspaceAppState(generatedAt),
     sessions,
@@ -1185,6 +1192,8 @@ export function normalizeRustBootstrapPayload(
     currentSessionId: currentSession?.id || '',
     isProcessing: Boolean(processingState?.isProcessing),
     processingState,
+    pendingChanges,
+    pendingChangesStateVersion: generatedAt,
     stateUpdatedAt: generatedAt,
   };
   const timelineProjection = buildEmptyTimelineProjection(currentSession?.id || '', generatedAt);

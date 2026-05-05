@@ -61,6 +61,7 @@ function runGoldenReplay(reducer, projection, contract) {
   assertFailedToolWithoutAssistantShowsTurnResponseDuration(reducer, projection);
   assertBootstrapProcessingStateFromRunningCanonicalTurn(contract);
   assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract);
+  assertBootstrapCarriesPendingChanges(contract);
 }
 
 function replayLive(reducer, testCase) {
@@ -375,6 +376,58 @@ function assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract) {
     'terminal canonical turn must not be restored as running',
   );
   assert.equal(bootstrap.state.processingState, null);
+}
+
+function assertBootstrapCarriesPendingChanges(contract) {
+  const camelCaseBootstrap = contract.normalizeRustBootstrapPayload({
+    generatedAt: 7200,
+    currentSession: { sessionId: 'session-bootstrap-pending', title: 'pending', createdAt: 7000, updatedAt: 7200 },
+    sessions: [{ sessionId: 'session-bootstrap-pending', title: 'pending', createdAt: 7000, updatedAt: 7200 }],
+    workspaces: [{ workspaceId: 'workspace-bootstrap-pending', rootPath: '/tmp/bootstrap-pending' }],
+    pendingChanges: [
+      {
+        filePath: 'created.txt',
+        snapshotId: 'session:session-bootstrap-pending:created.txt',
+        type: 'add',
+        additions: 1,
+        deletions: 0,
+      },
+    ],
+  }, {
+    workspaceId: 'workspace-bootstrap-pending',
+    sessionId: 'session-bootstrap-pending',
+  });
+  assert.deepEqual(
+    camelCaseBootstrap.state.pendingChanges?.map((change) => change.filePath),
+    ['created.txt'],
+    'bootstrap should expose camelCase pendingChanges through AppState',
+  );
+  assert.equal(camelCaseBootstrap.state.pendingChangesStateVersion, 7200);
+
+  const snakeCaseBootstrap = contract.normalizeRustBootstrapPayload({
+    generatedAt: 7300,
+    currentSession: { sessionId: 'session-bootstrap-pending', title: 'pending', createdAt: 7000, updatedAt: 7300 },
+    sessions: [{ sessionId: 'session-bootstrap-pending', title: 'pending', createdAt: 7000, updatedAt: 7300 }],
+    workspaces: [{ workspaceId: 'workspace-bootstrap-pending', rootPath: '/tmp/bootstrap-pending' }],
+    pending_changes: [
+      {
+        filePath: 'modified.txt',
+        snapshotId: 'session:session-bootstrap-pending:modified.txt',
+        type: 'modify',
+        additions: 1,
+        deletions: 1,
+      },
+    ],
+  }, {
+    workspaceId: 'workspace-bootstrap-pending',
+    sessionId: 'session-bootstrap-pending',
+  });
+  assert.deepEqual(
+    snakeCaseBootstrap.state.pendingChanges?.map((change) => change.filePath),
+    ['modified.txt'],
+    'bootstrap should expose snake_case pending_changes through AppState',
+  );
+  assert.equal(snakeCaseBootstrap.state.pendingChangesStateVersion, 7300);
 }
 
 function ordinaryChatCase() {

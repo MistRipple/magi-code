@@ -5,16 +5,8 @@
   import { ensureArray } from '../lib/utils';
   import type { Edit } from '../types/message';
   import Icon from './Icon.svelte';
-  import WorkerBadge from './WorkerBadge.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import {
-    isWebAgentMode,
-    approveAgentChange,
-    revertAgentChange,
-    approveAllAgentChanges,
-    revertAllAgentChanges,
-    revertAgentExecutionGroupChanges,
-  } from '../web/agent-api';
+  import { isWebAgentMode } from '../web/agent-api';
 
   const appState = getState();
   const isWebMode = isWebAgentMode();
@@ -22,19 +14,21 @@
   const edits = $derived(ensureArray(appState.edits) as Edit[]);
   let isCompactViewport = $state(false);
   let previewOpen = $state(false);
-  let previewMode = $state<'diff' | 'file'>('diff');
-  let previewTitle = $state('');
-  let previewContent = $state('');
-  let previewLanguage = $state('text');
-  let previewLoading = $state(false);
-  let previewError = $state('');
-  let selectedPreviewFilePath = $state('');
+  let selectedPreviewKey = $state('');
   const useDockedPreview = $derived(isWebMode && !isCompactViewport);
   const selectedPreviewEdit = $derived(
-    selectedPreviewFilePath
-      ? edits.find((edit) => edit.filePath === selectedPreviewFilePath) ?? null
+    selectedPreviewKey
+      ? edits.find((edit) => getEditKey(edit) === selectedPreviewKey) ?? null
       : null
   );
+  const previewTitle = $derived(selectedPreviewEdit?.filePath ?? '');
+  const previewContent = $derived(selectedPreviewEdit?.diff ?? '');
+  const previewError = $derived.by(() => {
+    if (!selectedPreviewEdit || previewContent) {
+      return '';
+    }
+    return i18n.t('fileChangeCard.noDiffDetail');
+  });
 
   onMount(() => {
     if (!isWebMode || typeof window === 'undefined') {
@@ -48,13 +42,6 @@
     media.addEventListener('change', updateViewport);
     return () => media.removeEventListener('change', updateViewport);
   });
-
-  // 统计汇总
-  const totalAdditions = $derived(edits.reduce((s, e) => s + (e.additions ?? 0), 0));
-  const totalDeletions = $derived(edits.reduce((s, e) => s + (e.deletions ?? 0), 0));
-  const addedCount = $derived(edits.filter(e => e.type === 'add').length);
-  const modifiedCount = $derived(edits.filter(e => e.type === 'modify').length);
-  const deletedCount = $derived(edits.filter(e => e.type === 'delete').length);
 
   // ─── 按执行分组分组 ───
   // 最新执行分组 ID：取 edits 列表中最后一个有 executionGroupId 的值（后端已按 timestamp 排序）
@@ -79,12 +66,6 @@
   // 是否有两组分组（只有同时存在统一暂存和本轮变更才分组显示）
   const hasGroups = $derived(stagedEdits.length > 0 && currentRoundEdits.length > 0);
 
-  function getContributors(edit: Edit): string[] {
-    if (Array.isArray(edit?.contributors) && edit.contributors.length > 0) return edit.contributors;
-    if (edit?.workerId) return [edit.workerId];
-    return [];
-  }
-
   // 拆分文件名和目录
   function splitPath(filePath: string): { dir: string; name: string } {
     const lastSlash = filePath.lastIndexOf('/');
@@ -100,83 +81,34 @@
     return 'file-text';
   }
 
-  // 增删比例条（5 格小方块，类似 GitHub）
-  function getChangeBlocks(additions: number, deletions: number): ('add' | 'del' | 'neutral')[] {
-    const total = additions + deletions;
-    if (total === 0) return ['neutral', 'neutral', 'neutral', 'neutral', 'neutral'];
-    const addBlocks = Math.round((additions / total) * 5);
-    const delBlocks = 5 - addBlocks;
-    return [
-      ...Array(addBlocks).fill('add') as 'add'[],
-      ...Array(delBlocks).fill('del') as 'del'[],
-    ];
-  }
-
   function closePreview(): void {
     previewOpen = false;
-    previewError = '';
-    previewLoading = false;
-    if (useDockedPreview) {
-      selectedPreviewFilePath = '';
-      previewTitle = '';
-      previewContent = '';
+    if (!useDockedPreview) {
+      selectedPreviewKey = '';
     }
   }
 
-  async function openFile(filePath: string) {
-    const edit = edits.find((candidate) => candidate.filePath === filePath) ?? null;
-    const resolvedPreviewContent = resolveEditPreviewContent(edit);
-    const resolvedPreviewLanguage = inferPreviewLanguage(filePath);
-
-    if (!isWebMode) {
-      vscode.postMessage({
-        type: 'openFile',
-        filepath: filePath,
-        sessionId: getCurrentSessionId() || undefined,
-        previewContent: resolvedPreviewContent,
-        previewAbsolutePath: edit?.previewAbsolutePath,
-        previewCanOpenWorkspaceFile: edit?.previewCanOpenWorkspaceFile,
-      });
-      return;
-    }
-    selectedPreviewFilePath = filePath;
-    previewOpen = !useDockedPreview;
-    previewMode = 'file';
-    previewTitle = filePath;
-    previewContent = resolvedPreviewContent;
-    previewLanguage = resolvedPreviewLanguage;
-    previewError = '';
-    previewLoading = false;
-    if (!resolvedPreviewContent) {
-      previewError = i18n.t('edits.preview.empty');
-    }
-  }
   function approveChange(filePath: string) {
     const sessionId = getCurrentSessionId() || undefined;
-    if (isWebMode) {
-      void approveAgentChange(filePath, sessionId).catch(console.error);
-    } else {
-      vscode.postMessage({ type: 'approveChange', filePath, sessionId });
-    }
+    vscode.postMessage({ type: 'approveChange', filePath, sessionId });
   }
   function revertChange(filePath: string) {
     const sessionId = getCurrentSessionId() || undefined;
-    if (isWebMode) {
-      void revertAgentChange(filePath, sessionId).catch(console.error);
-    } else {
-      vscode.postMessage({ type: 'revertChange', filePath, sessionId });
-    }
+    vscode.postMessage({ type: 'revertChange', filePath, sessionId });
   }
-  async function viewDiff(filePath: string) {
-    const edit = edits.find((candidate) => candidate.filePath === filePath) ?? null;
-    const diff = edit?.diff || '';
 
+  function selectEdit(edit: Edit, openFloatingPreview: boolean): void {
+    selectedPreviewKey = getEditKey(edit);
+    previewOpen = openFloatingPreview && !useDockedPreview;
+  }
+
+  function viewDiff(edit: Edit) {
     if (!isWebMode) {
       vscode.postMessage({
         type: 'viewDiff',
-        filePath,
+        filePath: edit.filePath,
         sessionId: getCurrentSessionId() || undefined,
-        diff,
+        diff: edit.diff || '',
         originalContent: edit?.originalContent,
         previewContent: resolveEditPreviewContent(edit),
         previewAbsolutePath: edit?.previewAbsolutePath,
@@ -184,42 +116,7 @@
       });
       return;
     }
-    selectedPreviewFilePath = filePath;
-    previewOpen = !useDockedPreview;
-    previewMode = 'diff';
-    previewTitle = filePath;
-    previewContent = diff;
-    previewLanguage = 'diff';
-    previewError = '';
-    previewLoading = false;
-    if (!diff) {
-      previewError = i18n.t('fileChangeCard.noDiffDetail');
-    }
-  }
-  function approveAllChanges() {
-    const sessionId = getCurrentSessionId() || undefined;
-    if (isWebMode) {
-      void approveAllAgentChanges(sessionId).catch(console.error);
-    } else {
-      vscode.postMessage({ type: 'approveAllChanges', sessionId });
-    }
-  }
-  function revertAllChanges() {
-    const sessionId = getCurrentSessionId() || undefined;
-    if (isWebMode) {
-      void revertAllAgentChanges(sessionId).catch(console.error);
-    } else {
-      vscode.postMessage({ type: 'revertAllChanges', sessionId });
-    }
-  }
-  function revertExecutionGroup() {
-    if (!latestExecutionGroupId) return;
-    const sessionId = getCurrentSessionId() || undefined;
-    if (isWebMode) {
-      void revertAgentExecutionGroupChanges(latestExecutionGroupId, sessionId).catch(console.error);
-    } else {
-      vscode.postMessage({ type: 'revertExecutionGroup', executionGroupId: latestExecutionGroupId, sessionId });
-    }
+    selectEdit(edit, true);
   }
 
   function getEditKey(edit: Edit): string {
@@ -239,6 +136,21 @@
     return 'context';
   }
 
+  function getDiffLinePrefix(line: string): string {
+    const lineClass = getDiffLineClass(line);
+    if (lineClass === 'add') return '+';
+    if (lineClass === 'del') return '-';
+    return '';
+  }
+
+  function getDiffLineText(line: string): string {
+    const lineClass = getDiffLineClass(line);
+    if (lineClass === 'add' || lineClass === 'del') {
+      return line.slice(1) || ' ';
+    }
+    return line || ' ';
+  }
+
   function resolveEditPreviewContent(edit: Edit | null): string {
     if (!edit) {
       return '';
@@ -252,42 +164,42 @@
     return '';
   }
 
-  function inferPreviewLanguage(filePath: string): string {
-    const ext = filePath.split('.').pop()?.toLowerCase() || '';
-    const languageMap: Record<string, string> = {
-      ts: 'typescript',
-      tsx: 'typescript',
-      js: 'javascript',
-      jsx: 'javascript',
-      json: 'json',
-      md: 'markdown',
-      css: 'css',
-      scss: 'scss',
-      html: 'html',
-      vue: 'vue',
-      svelte: 'svelte',
-      py: 'python',
-      go: 'go',
-      java: 'java',
-      sh: 'bash',
-      yml: 'yaml',
-      yaml: 'yaml',
-    };
-    return languageMap[ext] || 'text';
-  }
+  $effect(() => {
+    if (edits.length === 0) {
+      selectedPreviewKey = '';
+      previewOpen = false;
+      return;
+    }
+    const selectedStillExists = selectedPreviewKey
+      ? edits.some((edit) => getEditKey(edit) === selectedPreviewKey)
+      : false;
+    if (selectedStillExists) {
+      if (!useDockedPreview && selectedPreviewKey && !previewOpen) {
+        previewOpen = true;
+      }
+      return;
+    }
+    if (useDockedPreview) {
+      selectEdit(edits[0], false);
+      return;
+    }
+    if (selectedPreviewKey || previewOpen) {
+      selectedPreviewKey = '';
+      previewOpen = false;
+    }
+  });
 </script>
 
 {#snippet fileRow(edit: Edit)}
-  {@const { dir, name } = splitPath(edit.filePath)}
-  {@const blocks = getChangeBlocks(edit.additions ?? 0, edit.deletions ?? 0)}
-  {@const contributors = getContributors(edit)}
+  {@const { name } = splitPath(edit.filePath)}
   <div
     class="file-row"
-    class:selected={selectedPreviewFilePath === edit.filePath}
+    class:selected={selectedPreviewKey === getEditKey(edit)}
     role="button"
     tabindex="0"
-    onclick={() => viewDiff(edit.filePath)}
-    onkeydown={(e) => e.key === 'Enter' && viewDiff(edit.filePath)}
+    onclick={() => viewDiff(edit)}
+    onkeydown={(e) => e.key === 'Enter' && viewDiff(edit)}
+    title={edit.filePath}
   >
     <div class="type-indicator" class:add={edit.type === 'add'} class:modify={edit.type === 'modify'} class:del={edit.type === 'delete'}></div>
     <div class="file-icon" class:add={edit.type === 'add'} class:modify={edit.type === 'modify'} class:del={edit.type === 'delete'}>
@@ -295,28 +207,12 @@
     </div>
     <div class="file-info">
       <span class="file-name">{name}</span>
-      {#if dir}<span class="file-dir">{dir}</span>{/if}
     </div>
-    {#if contributors.length > 0}
-      <div class="file-workers">
-        {#each contributors as worker}
-          <WorkerBadge {worker} size="sm" />
-        {/each}
-      </div>
-    {/if}
     <div class="file-stats">
-      {#if edit.additions}<span class="stat-add">+{edit.additions}</span>{/if}
-      {#if edit.deletions}<span class="stat-del">-{edit.deletions}</span>{/if}
-      <div class="change-blocks">
-        {#each blocks as block}
-          <span class="block" class:add={block === 'add'} class:del={block === 'del'} class:neutral={block === 'neutral'}></span>
-        {/each}
-      </div>
+      <span class="stat-add">+{edit.additions ?? 0}</span>
+      <span class="stat-del">-{edit.deletions ?? 0}</span>
     </div>
     <div class="file-actions">
-      <button class="action-icon" title={i18n.t('edits.actions.openFile')} onclick={(e) => { e.stopPropagation(); openFile(edit.filePath); }}>
-        <Icon name="file-text" size={14} />
-      </button>
       <button class="action-icon approve" title={i18n.t('edits.actions.approveChange')} onclick={(e) => { e.stopPropagation(); approveChange(edit.filePath); }}>
         <Icon name="check" size={14} />
       </button>
@@ -327,6 +223,35 @@
   </div>
 {/snippet}
 
+{#snippet diffContent()}
+  <div class="diff-reader-header">
+    <div class="diff-file-title" title={previewTitle}>{splitPath(previewTitle).name}</div>
+    {#if selectedPreviewEdit}
+      <div class="diff-file-stats" aria-label="变更行数">
+        <span class="stat-add">+{selectedPreviewEdit.additions ?? 0}</span>
+        <span class="stat-del">-{selectedPreviewEdit.deletions ?? 0}</span>
+      </div>
+    {/if}
+  </div>
+  <div class="diff-reader-body">
+    {#if previewError}
+      <div class="preview-empty error">{previewError}</div>
+    {:else if !previewContent}
+      <div class="preview-empty">{i18n.t('edits.preview.empty')}</div>
+    {:else}
+      <div class="preview-diff">
+        {#each getPreviewLines(previewContent) as line, index}
+          <div class="preview-diff-line {getDiffLineClass(line)}">
+            <span class="preview-line-number">{index + 1}</span>
+            <span class="preview-line-prefix" aria-hidden="true">{getDiffLinePrefix(line)}</span>
+            <code>{getDiffLineText(line)}</code>
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
 <div class="panel-content-scrollable edits-panel" class:web-mode={isWebMode} class:compact-web={isWebMode && isCompactViewport}>
   {#if edits.length === 0}
     <div class="empty-state">
@@ -334,36 +259,22 @@
       <div class="empty-text">{i18n.t('edits.empty.title')}</div>
       <div class="empty-hint">{i18n.t('edits.empty.hint')}</div>
     </div>
+  {:else if !useDockedPreview && previewOpen && selectedPreviewEdit}
+    <section class="compact-preview" aria-label={previewTitle}>
+      <div class="compact-preview-nav">
+        <button class="compact-back" type="button" onclick={closePreview}>
+          <Icon name="chevron-right" size={15} class="back-chevron" />
+          <span>{i18n.t('topTabs.edits')}</span>
+        </button>
+      </div>
+      <div class="diff-reader compact-reader active">
+        {@render diffContent()}
+      </div>
+    </section>
   {:else}
     <div class="edits-shell" class:has-docked-preview={useDockedPreview}>
       <div class="edits-main">
-        <!-- 顶部统计与操作条 -->
-        <div class="summary-bar">
-          <div class="summary-left">
-            <span class="summary-count">{i18n.t('edits.summary.fileCount', { count: edits.length })}</span>
-            {#if addedCount > 0}<span class="summary-chip add">{i18n.t('edits.summary.added', { count: addedCount })}</span>{/if}
-            {#if modifiedCount > 0}<span class="summary-chip modify">{i18n.t('edits.summary.modified', { count: modifiedCount })}</span>{/if}
-            {#if deletedCount > 0}<span class="summary-chip del">{i18n.t('edits.summary.deleted', { count: deletedCount })}</span>{/if}
-
-            <div class="summary-stats-inline">
-              <span class="stat-add">+{totalAdditions}</span>
-              <span class="stat-del">-{totalDeletions}</span>
-            </div>
-          </div>
-          <div class="summary-right bulk-actions">
-            <button class="bulk-btn approve" onclick={approveAllChanges} title={i18n.t('edits.actions.approveAllTitle')}>
-              <Icon name="check-circle" size={13} />
-              <span>{i18n.t('edits.actions.approveAll')}</span>
-            </button>
-            <button class="bulk-btn revert" onclick={revertAllChanges} title={i18n.t('edits.actions.revertAllTitle')}>
-              <Icon name="undo" size={13} />
-              <span>{i18n.t('edits.actions.revertAll')}</span>
-            </button>
-          </div>
-        </div>
-
         {#if hasGroups}
-          <!-- 统一暂存（历史轮次） -->
           <div class="group-section">
             <div class="group-header">
               <span class="group-label">{i18n.t('edits.group.staged')}</span>
@@ -377,21 +288,11 @@
           </div>
         {/if}
 
-        <!-- 本轮变更 / 全部变更 -->
         <div class="group-section">
           {#if hasGroups || currentRoundEdits.length > 0}
             <div class="group-header current-round">
               <span class="group-label">{i18n.t('edits.group.currentRound')}</span>
               <span class="group-count">{i18n.t('edits.group.currentRoundCount', { count: currentRoundEdits.length })}</span>
-              <button
-                class="revert-round-btn"
-                onclick={revertExecutionGroup}
-                disabled={appState.isProcessing}
-                title={appState.isProcessing ? i18n.t('edits.group.revertRoundTitleDisabled') : i18n.t('edits.group.revertRoundTitle')}
-              >
-                <Icon name="undo" size={12} />
-                <span>{i18n.t('edits.group.revertRound')}</span>
-              </button>
             </div>
             <div class="file-list">
               {#each currentRoundEdits as edit (getEditKey(edit))}
@@ -399,7 +300,6 @@
               {/each}
             </div>
           {:else}
-            <!-- 没有分组 ID 的情况：全部扁平显示 -->
             <div class="file-list">
               {#each edits as edit (getEditKey(edit))}
                 {@render fileRow(edit)}
@@ -409,99 +309,9 @@
         </div>
       </div>
       {#if useDockedPreview}
-        <aside class="preview-sidepane" class:active={!!previewTitle}>
-          {#if previewTitle}
-            <div class="preview-header">
-              <div class="preview-header-copy">
-                <div class="preview-title">{previewTitle}</div>
-                <div class="preview-subtitle">
-                  {previewMode === 'diff' ? i18n.t('edits.preview.diffTitle') : i18n.t('edits.preview.fileTitle')}
-                </div>
-                {#if selectedPreviewEdit}
-                  <div class="preview-meta">
-                    <span class="preview-meta-chip">
-                      {selectedPreviewEdit.type === 'add'
-                        ? i18n.t('edits.summary.added', { count: 1 })
-                        : selectedPreviewEdit.type === 'delete'
-                          ? i18n.t('edits.summary.deleted', { count: 1 })
-                          : i18n.t('edits.summary.modified', { count: 1 })}
-                    </span>
-                    <span class="preview-meta-chip stat-add">+{selectedPreviewEdit.additions ?? 0}</span>
-                    <span class="preview-meta-chip stat-del">-{selectedPreviewEdit.deletions ?? 0}</span>
-                  </div>
-                {/if}
-              </div>
-              <div class="preview-toolbar">
-                {#if selectedPreviewEdit}
-                  <button
-                    class="preview-action"
-                    type="button"
-                    title={i18n.t('edits.preview.diffTitle')}
-                    aria-label={i18n.t('edits.preview.diffTitle')}
-                    onclick={() => viewDiff(selectedPreviewEdit.filePath)}
-                  >
-                    <Icon name="file-edit" size={14} />
-                  </button>
-                  <button
-                    class="preview-action"
-                    type="button"
-                    title={i18n.t('edits.actions.openFile')}
-                    aria-label={i18n.t('edits.actions.openFile')}
-                    onclick={() => openFile(selectedPreviewEdit.filePath)}
-                  >
-                    <Icon name="file-text" size={14} />
-                  </button>
-                  <button
-                    class="preview-action approve"
-                    type="button"
-                    title={i18n.t('edits.actions.approveChange')}
-                    aria-label={i18n.t('edits.actions.approveChange')}
-                    onclick={() => approveChange(selectedPreviewEdit.filePath)}
-                  >
-                    <Icon name="check" size={14} />
-                  </button>
-                  <button
-                    class="preview-action revert"
-                    type="button"
-                    title={i18n.t('edits.actions.revertChange')}
-                    aria-label={i18n.t('edits.actions.revertChange')}
-                    onclick={() => revertChange(selectedPreviewEdit.filePath)}
-                  >
-                    <Icon name="undo" size={14} />
-                  </button>
-                {/if}
-                <button class="preview-close" type="button" onclick={closePreview} title={i18n.t('common.close')}>
-                  <Icon name="close" size={16} />
-                </button>
-              </div>
-            </div>
-            <div class="preview-body">
-              {#if previewLoading}
-                <div class="preview-empty">{i18n.t('edits.preview.loading')}</div>
-              {:else if previewError}
-                <div class="preview-empty error">{previewError}</div>
-              {:else if !previewContent}
-                <div class="preview-empty">{i18n.t('edits.preview.empty')}</div>
-              {:else if previewMode === 'diff'}
-                <div class="preview-diff">
-                  {#each getPreviewLines(previewContent) as line, index}
-                    <div class="preview-diff-line {getDiffLineClass(line)}">
-                      <span class="preview-line-number">{index + 1}</span>
-                      <code>{line || ' '}</code>
-                    </div>
-                  {/each}
-                </div>
-              {:else}
-                <div class="preview-file">
-                  {#each getPreviewLines(previewContent) as line, index}
-                    <div class="preview-file-line" class:wrap-line={previewLanguage === 'markdown'}>
-                      <span class="preview-line-number">{index + 1}</span>
-                      <code class:wrap={previewLanguage === 'markdown'}>{line || ' '}</code>
-                    </div>
-                  {/each}
-                </div>
-              {/if}
-            </div>
+        <aside class="diff-reader" class:active={!!selectedPreviewEdit}>
+          {#if selectedPreviewEdit}
+            {@render diffContent()}
           {:else}
             <div class="preview-empty state-hint">{i18n.t('edits.preview.selectFile')}</div>
           {/if}
@@ -511,97 +321,43 @@
   {/if}
 </div>
 
-{#if previewOpen && !useDockedPreview}
-  <div class="preview-overlay" role="presentation" onclick={(event) => {
-    if (event.target === event.currentTarget) {
-      closePreview();
-    }
-  }}>
-    <div class="preview-modal" role="dialog" aria-modal="true" aria-label={previewTitle}>
-      <div class="preview-header">
-        <div class="preview-header-copy">
-          <div class="preview-title">{previewTitle}</div>
-          <div class="preview-subtitle">
-            {previewMode === 'diff' ? i18n.t('edits.preview.diffTitle') : i18n.t('edits.preview.fileTitle')}
-          </div>
-        </div>
-        <button class="preview-close" type="button" onclick={closePreview} title={i18n.t('common.close')}>
-          <Icon name="close" size={16} />
-        </button>
-      </div>
-
-      <div class="preview-body">
-        {#if previewLoading}
-          <div class="preview-empty">{i18n.t('edits.preview.loading')}</div>
-        {:else if previewError}
-          <div class="preview-empty error">{previewError}</div>
-        {:else if !previewContent}
-          <div class="preview-empty">{i18n.t('edits.preview.empty')}</div>
-        {:else if previewMode === 'diff'}
-          <div class="preview-diff">
-            {#each getPreviewLines(previewContent) as line, index}
-              <div class="preview-diff-line {getDiffLineClass(line)}">
-                <span class="preview-line-number">{index + 1}</span>
-                <code>{line || ' '}</code>
-              </div>
-            {/each}
-          </div>
-        {:else}
-          <div class="preview-file">
-            {#each getPreviewLines(previewContent) as line, index}
-              <div class="preview-file-line" class:wrap-line={previewLanguage === 'markdown'}>
-                <span class="preview-line-number">{index + 1}</span>
-                <code class:wrap={previewLanguage === 'markdown'}>{line || ' '}</code>
-              </div>
-            {/each}
-          </div>
-        {/if}
-      </div>
-      {#if isWebMode && selectedPreviewEdit}
-        <div class="preview-footer-actions">
-          <button class="footer-action secondary" type="button" onclick={() => viewDiff(selectedPreviewEdit.filePath)}>
-            <Icon name="file-edit" size={14} />
-            <span>{i18n.t('edits.preview.diffTitle')}</span>
-          </button>
-          <button class="footer-action secondary" type="button" onclick={() => openFile(selectedPreviewEdit.filePath)}>
-            <Icon name="file-text" size={14} />
-            <span>{i18n.t('edits.actions.openFile')}</span>
-          </button>
-          <button class="footer-action approve" type="button" onclick={() => approveChange(selectedPreviewEdit.filePath)}>
-            <Icon name="check" size={14} />
-            <span>{i18n.t('edits.actions.approveChange')}</span>
-          </button>
-          <button class="footer-action revert" type="button" onclick={() => revertChange(selectedPreviewEdit.filePath)}>
-            <Icon name="undo" size={14} />
-            <span>{i18n.t('edits.actions.revertChange')}</span>
-          </button>
-        </div>
-      {/if}
-    </div>
-  </div>
-{/if}
-
 <style>
   .edits-panel {
     --edits-card-bg: color-mix(in srgb, var(--surface-1) 88%, var(--background));
-    --edits-card-bg-strong: color-mix(in srgb, var(--surface-2) 84%, var(--background));
     --edits-card-border: color-mix(in srgb, var(--border-subtle) 82%, transparent);
     --edits-card-shadow: 0 1px 0 color-mix(in srgb, var(--foreground) 4%, transparent);
     --edits-row-bg: color-mix(in srgb, var(--background) 62%, var(--surface-1));
     --edits-row-bg-hover: color-mix(in srgb, var(--surface-hover) 86%, var(--surface-1));
     --edits-row-border: color-mix(in srgb, var(--border-subtle) 76%, transparent);
-    --edits-header-bg: color-mix(in srgb, var(--surface-1) 76%, var(--background));
-    --edits-line-number-bg: color-mix(in srgb, var(--surface-2) 78%, transparent);
-    --edits-overlay-bg: rgba(10, 16, 28, 0.52);
-    /* panel-content-scrollable 已经包含了基础布局属性 */
+    --edits-line-number-bg: color-mix(in srgb, var(--surface-2) 54%, transparent);
+    --diff-add-line-bg: #dafbe1;
+    --diff-add-gutter-bg: #aceebb;
+    --diff-add-accent: #1a7f37;
+    --diff-del-line-bg: #ffebe9;
+    --diff-del-gutter-bg: #ffd7d5;
+    --diff-del-accent: #cf222e;
+    --diff-meta-line-bg: rgba(84, 112, 153, 0.08);
+    --diff-meta-gutter-bg: rgba(84, 112, 153, 0.12);
+    --diff-meta-fg: #57606a;
+    --diff-line-number-width: 36px;
+    --diff-prefix-width: 16px;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+    padding: var(--space-2);
     background: transparent;
+  }
+
+  .edits-panel * {
+    box-sizing: border-box;
   }
 
   :global(.theme-light) .edits-panel,
   :global(body.vscode-light) .edits-panel,
   :global(:root.theme-light) .edits-panel {
     --edits-card-bg: #f6f8fa;
-    --edits-card-bg-strong: #eef1f5;
     --edits-card-border: #d7dce5;
     --edits-card-shadow:
       0 1px 2px rgba(15, 23, 42, 0.06),
@@ -609,89 +365,51 @@
     --edits-row-bg: #f9fafb;
     --edits-row-bg-hover: #eef1f5;
     --edits-row-border: #e2e6ed;
-    --edits-header-bg: #f0f3f6;
     --edits-line-number-bg: #eef1f5;
-    --edits-overlay-bg: rgba(15, 23, 42, 0.24);
+    --diff-add-line-bg: #dafbe1;
+    --diff-add-gutter-bg: #aceebb;
+    --diff-add-accent: #1a7f37;
+    --diff-del-line-bg: #ffebe9;
+    --diff-del-gutter-bg: #ffd7d5;
+    --diff-del-accent: #cf222e;
+    --diff-meta-line-bg: rgba(84, 112, 153, 0.08);
+    --diff-meta-gutter-bg: rgba(84, 112, 153, 0.12);
+    --diff-meta-fg: #57606a;
   }
 
-  .edits-panel::-webkit-scrollbar {
-    width: 10px;
+  :global(.theme-dark) .edits-panel,
+  :global(body.vscode-dark) .edits-panel,
+  :global(:root.theme-dark) .edits-panel {
+    --diff-add-line-bg: color-mix(in srgb, #52b87a 20%, var(--background));
+    --diff-add-gutter-bg: color-mix(in srgb, #52b87a 30%, var(--background));
+    --diff-add-accent: #52b87a;
+    --diff-del-line-bg: color-mix(in srgb, #f6806d 18%, var(--background));
+    --diff-del-gutter-bg: color-mix(in srgb, #f6806d 28%, var(--background));
+    --diff-del-accent: #f6806d;
+    --diff-meta-line-bg: color-mix(in srgb, var(--foreground) 5%, var(--background));
+    --diff-meta-gutter-bg: color-mix(in srgb, var(--foreground) 8%, var(--background));
+    --diff-meta-fg: color-mix(in srgb, var(--foreground) 54%, var(--foreground-muted));
   }
 
-  .edits-panel::-webkit-scrollbar-track {
-    background: transparent;
-  }
-
-  .edits-panel::-webkit-scrollbar-thumb {
-    background: var(--scrollbar-thumb);
-    border-radius: var(--radius-full);
-    border: 2px solid transparent;
-    background-clip: padding-box;
-  }
-
-  .edits-panel::-webkit-scrollbar-thumb:hover {
-    background: var(--scrollbar-thumb-hover);
-    background-clip: padding-box;
-  }
-
-  .edits-shell {
-    min-height: 100%;
-  }
-
-  .edits-main {
-    min-width: 0;
-  }
-
-  .edits-panel.web-mode .summary-bar,
-  .edits-panel.web-mode .bulk-actions,
-  .edits-panel.web-mode .group-section {
-    max-width: none;
-  }
-
-  .edits-shell.has-docked-preview {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(360px, 420px);
-    gap: var(--space-3);
-    align-items: start;
-  }
-
-  .preview-sidepane {
-    position: sticky;
-    top: var(--space-3);
-    min-height: 560px;
-    max-height: calc(100vh - 120px);
-    display: flex;
-    flex-direction: column;
-    background: var(--edits-card-bg);
-    border: 1px solid var(--edits-card-border);
-    border-radius: var(--radius-xl);
-    box-shadow: var(--edits-card-shadow);
-    overflow: hidden;
-  }
-
-  .preview-sidepane:not(.active) {
-    align-items: center;
-    justify-content: center;
-  }
-
-  /* 空状态 */
   .empty-state {
     display: flex;
+    flex: 1;
     flex-direction: column;
     align-items: center;
     justify-content: center;
+    gap: var(--space-2);
+    width: 100%;
+    min-height: 0;
+    box-sizing: border-box;
     padding: var(--space-8) var(--space-5);
     color: var(--foreground-muted);
     text-align: center;
-    gap: var(--space-2);
-    width: 100%;
-    box-sizing: border-box;
   }
 
   .empty-text {
+    color: var(--foreground);
     font-size: var(--text-base);
     font-weight: var(--font-medium);
-    color: var(--foreground);
   }
 
   .empty-hint {
@@ -699,320 +417,108 @@
     opacity: 0.6;
   }
 
-  /* 统计条 & 批量操作 (Sticky Header) */
-  .summary-bar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: var(--space-3) var(--space-4);
-    margin-bottom: var(--space-3);
-    position: sticky;
-    top: -16px; /* 匹配面板 padding */
-    z-index: var(--z-sticky);
-    background: var(--glass-bg);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
-    border-radius: var(--radius-lg);
-    border: 1px solid var(--border);
-    box-shadow: var(--shadow-md);
-  }
-
-  .summary-left {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    flex-wrap: wrap;
-  }
-
-  .summary-count {
-    font-size: var(--text-sm);
-    font-weight: var(--font-medium);
-    color: var(--foreground);
-  }
-
-  .summary-chip {
-    font-size: var(--text-2xs);
-    padding: 1px 6px;
-    border-radius: var(--radius-full);
-    font-weight: var(--font-medium);
-  }
-
-  .summary-chip.add { color: var(--success); background: var(--success-muted); }
-  .summary-chip.modify { color: var(--warning); background: var(--warning-muted); }
-  .summary-chip.del { color: var(--error); background: var(--error-muted); }
-
-  .summary-stats-inline {
-    display: flex;
-    gap: var(--space-2);
-    font-size: var(--text-xs);
-    font-weight: var(--font-semibold);
-    font-variant-numeric: tabular-nums;
-    margin-left: var(--space-2);
-    border-left: 1px solid var(--border);
-    padding-left: var(--space-3);
-  }
-
-  .stat-add { color: var(--success); }
-  .stat-del { color: var(--error); }
-
-  /* 批量操作 */
-  .bulk-actions {
-    display: flex;
-    gap: var(--space-2);
-    flex-wrap: wrap;
-  }
-
-  .bulk-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-1);
-    min-height: 30px;
-    padding: 6px 10px;
-    border-radius: var(--radius-sm);
+  .edits-shell,
+  .edits-shell.has-docked-preview {
+    display: grid;
+    grid-template-columns: minmax(220px, 340px) minmax(0, 1fr);
+    gap: 0;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
     border: 1px solid var(--edits-card-border);
+    border-radius: var(--radius-lg);
     background: var(--edits-card-bg);
-    color: var(--foreground);
-    cursor: pointer;
-    font-size: var(--text-xs);
-    transition: all var(--transition-fast);
     box-shadow: var(--edits-card-shadow);
   }
 
-  .bulk-btn:hover {
-    background: var(--edits-row-bg-hover);
-    color: var(--foreground);
-  }
-
-  .bulk-btn.approve:hover {
-    color: var(--success);
-    border-color: var(--success);
-  }
-
-  .bulk-btn.revert:hover {
-    color: var(--error);
-    border-color: var(--error);
-  }
-
-  /* 文件列表 */
-  .file-list {
+  .compact-preview {
     display: flex;
+    flex: 1 1 auto;
     flex-direction: column;
-    gap: 1px;
-    background: var(--edits-row-border);
+    width: 100%;
+    height: 100%;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
     border: 1px solid var(--edits-card-border);
-    border-radius: var(--radius-md);
-    overflow: hidden;
+    border-radius: var(--radius-lg);
+    background: var(--edits-card-bg);
+    box-shadow: var(--edits-card-shadow);
   }
 
-  .file-row {
+  .compact-preview-nav {
     display: flex;
+    flex: 0 0 auto;
     align-items: center;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
-    background: var(--edits-row-bg);
-    cursor: pointer;
-    transition: background var(--transition-fast);
-    position: relative;
+    min-height: 40px;
+    padding: 0 var(--space-2);
+    border-bottom: 1px solid var(--edits-card-border);
+    background: color-mix(in srgb, var(--surface-1) 72%, var(--background));
   }
 
-  .file-row:hover {
-    background: var(--edits-row-bg-hover);
-  }
-
-  .file-row.selected {
-    background: color-mix(in srgb, var(--info-muted) 28%, var(--edits-row-bg));
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--info) 30%, transparent);
-  }
-
-  .edits-panel.web-mode .file-row {
-    display: grid;
-    grid-template-columns: auto auto minmax(0, 1fr) auto auto;
-    grid-template-areas:
-      "indicator icon info stats actions"
-      "indicator icon workers workers actions";
-    align-items: center;
-    column-gap: var(--space-2);
-    row-gap: 6px;
-    padding-block: 12px;
-  }
-
-  .edits-panel.web-mode .type-indicator {
-    grid-area: indicator;
-  }
-
-  .edits-panel.web-mode .file-icon {
-    grid-area: icon;
-  }
-
-  /* 左侧变更类型彩条 */
-  .type-indicator {
-    width: 3px;
-    height: 20px;
-    border-radius: 2px;
-    flex-shrink: 0;
-    background: var(--foreground-muted);
-    opacity: 0.3;
-  }
-
-  .type-indicator.add { background: var(--success); opacity: 1; }
-  .type-indicator.modify { background: var(--warning); opacity: 1; }
-  .type-indicator.del { background: var(--error); opacity: 1; }
-
-  /* 文件图标 */
-  .file-icon {
-    flex-shrink: 0;
-    color: var(--foreground-muted);
-    display: flex;
-    align-items: center;
-  }
-
-  .file-icon.add { color: var(--success); }
-  .file-icon.modify { color: var(--warning); }
-  .file-icon.del { color: var(--error); }
-
-  /* 文件名 */
-  .file-info {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-2);
-    overflow: hidden;
-  }
-
-  .edits-panel.web-mode .file-info {
-    grid-area: info;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 2px;
-  }
-
-  .edits-panel.web-mode .file-name {
-    width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .edits-panel.web-mode .file-dir {
-    width: 100%;
-  }
-
-  .file-name {
-    font-size: var(--text-sm);
-    font-weight: var(--font-medium);
-    color: var(--foreground);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .file-dir {
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    opacity: 0.7;
-  }
-
-  /* Worker 标识 */
-  .file-workers {
-    display: flex;
-    gap: var(--space-1);
-    flex-shrink: 0;
-  }
-
-  .edits-panel.web-mode .file-workers {
-    grid-area: workers;
-    min-width: 0;
-    flex-wrap: wrap;
-  }
-
-  /* 增删统计 */
-  .file-stats {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    font-size: var(--text-xs);
-    font-weight: var(--font-medium);
-    font-variant-numeric: tabular-nums;
-    flex-shrink: 0;
-  }
-
-  .edits-panel.web-mode .file-stats {
-    grid-area: stats;
-    align-self: start;
-    padding-top: 2px;
-  }
-
-  /* GitHub 风格增删比例条 */
-  .change-blocks {
-    display: flex;
-    gap: 1px;
-  }
-
-  .change-blocks .block {
-    width: 7px;
-    height: 7px;
-    border-radius: 1px;
-  }
-
-  .block.add { background: var(--success); }
-  .block.del { background: var(--error); }
-  .block.neutral { background: var(--surface-3); }
-
-  /* hover 操作按钮 */
-  .file-actions {
-    display: flex;
-    gap: var(--space-1);
-    opacity: 0;
-    transition: opacity var(--transition-fast);
-    flex-shrink: 0;
-  }
-
-  .edits-panel.web-mode .file-actions {
-    grid-area: actions;
-    opacity: 1;
-    align-self: center;
-  }
-
-  .file-row:hover .file-actions {
-    opacity: 1;
-  }
-
-  :global(.theme-light) .file-row,
-  :global(body.vscode-light) .file-row,
-  :global(:root.theme-light) .file-row {
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5);
-  }
-
-  .action-icon {
+  .compact-back {
     display: inline-flex;
     align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
+    gap: 4px;
+    min-height: 28px;
+    padding: 0 8px 0 6px;
+    border: 1px solid transparent;
     border-radius: var(--radius-sm);
-    border: none;
-    background: color-mix(in srgb, var(--surface-2) 72%, transparent);
+    background: transparent;
     color: var(--foreground-muted);
     cursor: pointer;
-    transition: all var(--transition-fast);
-    border: 1px solid transparent;
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium);
   }
 
-  .action-icon:hover {
-    background: color-mix(in srgb, var(--surface-active) 90%, var(--surface-1));
+  .compact-back:hover {
     border-color: var(--edits-card-border);
+    background: var(--surface-hover);
     color: var(--foreground);
   }
 
-  .action-icon.approve:hover { color: var(--success); }
-  .action-icon.revert:hover { color: var(--error); }
+  .compact-back :global(.back-chevron) {
+    transform: rotate(180deg);
+  }
 
-  /* ─── 轮次分组 ─── */
+  .compact-reader {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
+    height: auto;
+  }
+
+  .edits-main {
+    min-width: 0;
+    min-height: 0;
+    overflow: auto;
+    padding: var(--space-2);
+    border-right: 1px solid var(--edits-card-border);
+    background: color-mix(in srgb, var(--surface-1) 52%, var(--background));
+  }
+
+  .edits-main::-webkit-scrollbar,
+  .diff-reader-body::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  .edits-main::-webkit-scrollbar-track,
+  .diff-reader-body::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .edits-main::-webkit-scrollbar-thumb,
+  .diff-reader-body::-webkit-scrollbar-thumb {
+    border: 2px solid transparent;
+    border-radius: var(--radius-full);
+    background: var(--scrollbar-thumb);
+    background-clip: padding-box;
+  }
+
   .group-section {
-    margin-bottom: var(--space-3);
+    margin: 0 0 var(--space-2);
   }
 
   .group-section:last-child {
@@ -1023,349 +529,310 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
-    padding: var(--space-1) var(--space-2);
-    margin-bottom: var(--space-2);
+    min-height: 28px;
+    margin: 0 0 4px;
+    padding: 0 var(--space-1);
   }
 
   .group-label {
-    font-size: var(--text-xs);
+    color: var(--foreground-muted);
+    font-size: var(--text-2xs);
     font-weight: var(--font-semibold);
-    color: var(--foreground);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-  }
-
-  .group-header.current-round .group-label {
-    color: var(--info);
   }
 
   .group-count {
-    font-size: var(--text-xs);
     color: var(--foreground-muted);
-    opacity: 0.9;
-  }
-
-  .revert-round-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-1);
-    margin-left: auto;
-    min-height: 28px;
-    padding: 4px 9px;
-    border-radius: var(--radius-sm);
-    border: 1px solid var(--edits-card-border);
-    background: var(--edits-card-bg-strong);
-    color: var(--foreground);
-    cursor: pointer;
     font-size: var(--text-2xs);
-    transition: all var(--transition-fast);
+    opacity: 0.72;
   }
 
-  .revert-round-btn:hover:not(:disabled) {
-    color: var(--error);
-    border-color: var(--error);
-    background: var(--error-muted);
+  .file-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    overflow: hidden;
+    border: 1px solid var(--edits-row-border);
+    border-radius: var(--radius-md);
+    background: var(--edits-row-border);
   }
 
-  .revert-round-btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
+  .file-row,
+  .edits-panel.web-mode .file-row {
+    display: grid;
+    grid-template-columns: 3px 20px minmax(0, 1fr) auto auto;
+    grid-template-areas: "indicator icon info stats actions";
+    align-items: center;
+    gap: var(--space-2);
+    min-height: 42px;
+    padding: 0 var(--space-2);
+    background: var(--edits-row-bg);
+    cursor: pointer;
+    transition: background var(--transition-fast), box-shadow var(--transition-fast);
   }
 
-  @media (hover: none) {
-    .file-actions {
-      opacity: 1;
-    }
+  .file-row:hover {
+    background: var(--edits-row-bg-hover);
   }
 
-  @media (max-width: 768px) {
-    .edits-panel {
-      padding: var(--space-2);
-    }
-
-    .edits-panel.web-mode .file-row,
-    .file-row {
-      align-items: center;
-      flex-wrap: nowrap;
-      gap: var(--space-2);
-    }
-
-    .edits-panel.web-mode .file-row {
-      display: flex;
-    }
-
-    .file-info {
-      flex: 1 1 0;
-      min-width: 0;
-      flex-direction: column;
-      align-items: flex-start;
-      gap: 0;
-    }
-
-    .file-name,
-    .file-dir {
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .file-workers {
-      display: none;
-    }
-
-    .file-stats {
-      flex-shrink: 0;
-    }
-
-    .file-actions {
-      flex-shrink: 0;
-    }
+  .file-row.selected {
+    background: color-mix(in srgb, var(--info-muted) 20%, var(--edits-row-bg));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--info) 28%, transparent);
   }
 
-  @media (max-width: 1120px) {
-    .edits-shell.has-docked-preview {
-      grid-template-columns: 1fr;
-    }
-
-    .preview-sidepane {
-      display: none;
-    }
+  .type-indicator {
+    grid-area: indicator;
+    width: 3px;
+    height: 22px;
+    border-radius: 2px;
+    background: var(--foreground-muted);
+    opacity: 0.28;
   }
 
-  .preview-overlay {
-    position: absolute;
-    inset: 0;
-    z-index: 300;
+  .type-indicator.add { background: var(--success); opacity: 1; }
+  .type-indicator.modify { background: var(--warning); opacity: 1; }
+  .type-indicator.del { background: var(--error); opacity: 1; }
+
+  .file-icon {
+    grid-area: icon;
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: var(--space-4);
-    background: var(--edits-overlay-bg);
-    backdrop-filter: blur(8px);
+    color: var(--foreground-muted);
   }
 
-  .preview-modal {
-    width: min(1100px, 100%);
-    max-height: min(82vh, 920px);
-    display: flex;
-    flex-direction: column;
-    background: var(--edits-card-bg);
-    border: 1px solid var(--edits-card-border);
-    border-radius: var(--radius-xl);
-    box-shadow:
-      0 18px 48px rgba(0, 0, 0, 0.28),
-      0 1px 0 rgba(255, 255, 255, 0.06) inset;
+  .file-icon.add { color: var(--success); }
+  .file-icon.modify { color: var(--warning); }
+  .file-icon.del { color: var(--error); }
+
+  .file-info {
+    grid-area: info;
+    min-width: 0;
     overflow: hidden;
   }
 
-  .preview-header {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: var(--space-3);
-    padding: var(--space-4);
-    border-bottom: 1px solid var(--edits-card-border);
-    background: var(--edits-header-bg);
-  }
-
-  .preview-header-copy {
-    min-width: 0;
-  }
-
-  .preview-title {
+  .file-name {
+    display: block;
+    overflow: hidden;
     color: var(--foreground);
-    font-size: var(--text-base);
-    font-weight: var(--font-semibold);
-    word-break: break-all;
+    font-size: var(--text-sm);
+    font-weight: var(--font-medium);
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  .preview-subtitle {
-    margin-top: 4px;
+  .file-stats {
+    grid-area: stats;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     color: var(--foreground-muted);
     font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    font-weight: var(--font-semibold);
   }
 
-  .preview-meta {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-    margin-top: var(--space-2);
-  }
+  .stat-add { color: var(--success); }
+  .stat-del { color: var(--error); }
 
-  .preview-meta-chip {
+  .file-actions {
+    grid-area: actions;
     display: inline-flex;
-    align-items: center;
-    min-height: 24px;
-    padding: 0 8px;
-    border-radius: var(--radius-full);
-    border: 1px solid var(--edits-card-border);
-    background: var(--edits-card-bg);
-    color: var(--foreground-muted);
-    font-size: var(--text-2xs);
-    font-weight: var(--font-medium);
+    gap: 2px;
+    opacity: 0;
+    transition: opacity var(--transition-fast);
   }
 
-  .preview-close {
+  .file-row:hover .file-actions,
+  .file-row:focus-within .file-actions {
+    opacity: 1;
+  }
+
+  .action-icon {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 36px;
-    height: 36px;
-    border: 1px solid var(--edits-card-border);
-    border-radius: var(--radius-md);
-    background: var(--edits-card-bg-strong);
+    width: 24px;
+    height: 24px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: transparent;
     color: var(--foreground-muted);
     cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
   }
 
-  .preview-close:hover {
-    color: var(--foreground);
+  .action-icon:hover {
+    border-color: var(--edits-card-border);
     background: var(--surface-hover);
-  }
-
-  .preview-toolbar {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    margin-left: auto;
-  }
-
-  .preview-action {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 34px;
-    height: 34px;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--edits-card-border);
-    background: var(--edits-card-bg-strong);
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: all var(--transition-fast);
-  }
-
-  .preview-action:hover {
-    background: var(--edits-row-bg-hover);
     color: var(--foreground);
   }
 
-  .preview-action.approve:hover { color: var(--success); }
-  .preview-action.revert:hover { color: var(--error); }
+  .action-icon.approve:hover { color: var(--success); }
+  .action-icon.revert:hover { color: var(--error); }
 
-  .preview-body {
-    flex: 1;
+  .diff-reader {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
+    overflow: hidden;
+    background: color-mix(in srgb, var(--background) 92%, var(--surface-1));
+  }
+
+  .diff-reader:not(.active) {
+    align-items: center;
+    justify-content: center;
+  }
+
+  .diff-reader-header {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    min-height: 44px;
+    min-width: 0;
+    padding: 0 var(--space-3);
+    border-bottom: 1px solid var(--edits-card-border);
+    background: color-mix(in srgb, var(--surface-1) 72%, var(--background));
+  }
+
+  .diff-file-title {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--foreground);
+    font-size: var(--text-sm);
+    font-weight: var(--font-semibold);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .diff-file-stats {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    font-weight: var(--font-semibold);
+  }
+
+  .diff-reader-body {
+    flex: 1 1 auto;
+    min-width: 0;
     min-height: 0;
     overflow: auto;
-    padding: var(--space-3);
-    background: color-mix(in srgb, var(--background) 86%, var(--surface-1));
+    background: color-mix(in srgb, var(--background) 94%, var(--surface-1));
     scrollbar-width: thin;
     scrollbar-color: var(--scrollbar-thumb) transparent;
   }
 
-  .preview-diff,
-  .preview-file {
-    border: 1px solid var(--edits-card-border);
-    border-radius: var(--radius-lg);
-    overflow-x: auto;
-    overflow-y: hidden;
-    background: var(--edits-card-bg-strong);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  .preview-diff {
+    width: max-content;
+    min-width: 100%;
+    min-height: 100%;
+    background: transparent;
   }
 
-  .preview-diff-line,
-  .preview-file-line {
-    display: grid;
-    grid-template-columns: 56px 1fr;
+  .preview-diff-line {
+    display: flex;
     align-items: stretch;
     min-width: 100%;
     width: max-content;
     font-family: var(--font-mono);
-    font-size: 13px;
-    line-height: 1.45;
-  }
-
-  .preview-file-line.wrap-line {
-    width: 100%;
-  }
-
-  .preview-diff-line.meta {
-    border-top: 1px solid color-mix(in srgb, var(--edits-card-border) 50%, transparent);
-    border-bottom: 1px solid color-mix(in srgb, var(--edits-card-border) 50%, transparent);
-  }
-
-  .preview-diff-line:first-child,
-  .preview-file-line:first-child {
-    border-top: none;
-  }
-
-  .preview-diff-line.meta .preview-line-number,
-  .preview-diff-line.meta code {
-    padding-top: 6px;
-    padding-bottom: 6px;
+    font-size: 12px;
+    line-height: 1.55;
   }
 
   .preview-line-number {
-    padding: 2px 10px;
-    color: var(--foreground-muted);
-    text-align: right;
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    flex: 0 0 var(--diff-line-number-width);
+    min-width: 0;
+    padding: 2px 8px;
     background: var(--edits-line-number-bg);
-    border-right: 1px solid var(--edits-card-border);
+    color: var(--foreground-muted);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
     user-select: none;
-    opacity: 0.8;
   }
 
-  .preview-diff-line code,
-  .preview-file-line code {
+  .preview-line-prefix {
+    position: sticky;
+    left: var(--diff-line-number-width);
+    z-index: 1;
+    flex: 0 0 var(--diff-prefix-width);
+    min-width: 0;
+    padding: 2px 0;
+    border-right: 1px solid var(--edits-card-border);
+    background: var(--edits-line-number-bg);
+    color: transparent;
+    font-weight: var(--font-semibold);
+    text-align: center;
+    user-select: none;
+  }
+
+  .preview-diff-line code {
+    display: block;
+    flex: 1 0 auto;
+    min-width: max-content;
     margin: 0;
-    padding: 2px 16px;
-    white-space: pre;
+    padding: 2px 12px 2px 6px;
     background: transparent;
     color: var(--foreground);
     tab-size: 4;
-  }
-
-  .preview-file-line code.wrap {
-    white-space: pre-wrap;
-    word-break: break-word;
+    white-space: pre;
   }
 
   .preview-diff-line.meta {
-    background: color-mix(in srgb, var(--info-muted) 20%, transparent);
+    background: var(--diff-meta-line-bg);
   }
-  .preview-diff-line.meta .preview-line-number {
-    background: color-mix(in srgb, var(--info-muted) 35%, transparent);
-    color: color-mix(in srgb, var(--info) 80%, var(--foreground-muted));
+
+  .preview-diff-line.meta .preview-line-number,
+  .preview-diff-line.meta .preview-line-prefix {
+    background: var(--diff-meta-gutter-bg);
+    color: var(--diff-meta-fg);
   }
+
   .preview-diff-line.meta code {
-    color: color-mix(in srgb, var(--info) 90%, var(--foreground));
+    color: var(--diff-meta-fg);
   }
 
   .preview-diff-line.add {
-    background: color-mix(in srgb, var(--success-muted) 25%, transparent);
+    background: var(--diff-add-line-bg);
   }
+
+  .preview-diff-line.add .preview-line-number,
+  .preview-diff-line.add .preview-line-prefix {
+    background: var(--diff-add-gutter-bg);
+    color: var(--diff-add-accent);
+  }
+
   .preview-diff-line.add .preview-line-number {
-    background: color-mix(in srgb, var(--success-muted) 50%, transparent);
-    color: color-mix(in srgb, var(--success) 80%, var(--foreground-muted));
-  }
-  .preview-diff-line.add code {
-    color: color-mix(in srgb, var(--success) 95%, var(--foreground));
+    box-shadow: inset 2px 0 0 var(--diff-add-accent);
   }
 
   .preview-diff-line.del {
-    background: color-mix(in srgb, var(--error-muted) 25%, transparent);
+    background: var(--diff-del-line-bg);
   }
+
+  .preview-diff-line.del .preview-line-number,
+  .preview-diff-line.del .preview-line-prefix {
+    background: var(--diff-del-gutter-bg);
+    color: var(--diff-del-accent);
+  }
+
   .preview-diff-line.del .preview-line-number {
-    background: color-mix(in srgb, var(--error-muted) 50%, transparent);
-    color: color-mix(in srgb, var(--error) 80%, var(--foreground-muted));
-  }
-  .preview-diff-line.del code {
-    color: color-mix(in srgb, var(--error) 95%, var(--foreground));
+    box-shadow: inset 2px 0 0 var(--diff-del-accent);
   }
 
   .preview-empty {
     padding: var(--space-8) var(--space-4);
-    text-align: center;
     color: var(--foreground-muted);
+    text-align: center;
   }
 
   .preview-empty.state-hint {
@@ -1378,124 +845,89 @@
     color: var(--error);
   }
 
-  :global(.theme-light) .preview-diff-line.meta,
-  :global(:root.theme-light) .preview-diff-line.meta {
-    background: #f1f8ff;
-  }
-  :global(.theme-light) .preview-diff-line.meta .preview-line-number,
-  :global(:root.theme-light) .preview-diff-line.meta .preview-line-number {
-    background: #dbedff;
-    color: #1a56db;
-  }
-  :global(.theme-light) .preview-diff-line.meta code,
-  :global(:root.theme-light) .preview-diff-line.meta code {
-    color: #1e40af;
+  @media (hover: none) {
+    .file-actions {
+      opacity: 1;
+    }
   }
 
-  :global(.theme-light) .preview-diff-line.add,
-  :global(:root.theme-light) .preview-diff-line.add {
-    background: #dafbe1;
-  }
-  :global(.theme-light) .preview-diff-line.add .preview-line-number,
-  :global(:root.theme-light) .preview-diff-line.add .preview-line-number {
-    background: #aceebb;
-    color: #116329;
-  }
-  :global(.theme-light) .preview-diff-line.add code,
-  :global(:root.theme-light) .preview-diff-line.add code {
-    color: #1f2937;
-  }
-
-  :global(.theme-light) .preview-diff-line.del,
-  :global(:root.theme-light) .preview-diff-line.del {
-    background: #ffeef0;
-  }
-  :global(.theme-light) .preview-diff-line.del .preview-line-number,
-  :global(:root.theme-light) .preview-diff-line.del .preview-line-number {
-    background: #ffdce0;
-    color: #b91c1c;
-  }
-  :global(.theme-light) .preview-diff-line.del code,
-  :global(:root.theme-light) .preview-diff-line.del code {
-    color: #1f2937;
-  }
-
-  .preview-footer-actions {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: var(--space-2);
-    padding: var(--space-3);
-    border-top: 1px solid var(--edits-card-border);
-    background: var(--edits-card-bg);
-  }
-
-  .footer-action {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: var(--space-1);
-    min-height: 40px;
-    padding: 0 12px;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--edits-card-border);
-    background: var(--edits-card-bg);
-    color: var(--foreground);
-    font-size: var(--text-xs);
-    font-weight: var(--font-medium);
-    cursor: pointer;
-    transition: all var(--transition-fast);
-  }
-
-  .footer-action.secondary:hover {
-    background: var(--edits-row-bg-hover);
-  }
-
-  .footer-action.approve {
-    color: var(--success);
-    border-color: color-mix(in srgb, var(--success) 28%, var(--edits-card-border));
-    background: color-mix(in srgb, var(--success-muted) 66%, var(--edits-card-bg));
-  }
-
-  .footer-action.revert {
-    color: var(--error);
-    border-color: color-mix(in srgb, var(--error) 28%, var(--edits-card-border));
-    background: color-mix(in srgb, var(--error-muted) 66%, var(--edits-card-bg));
-  }
-
-  @media (max-width: 900px) {
-    .preview-overlay {
-      padding: 0;
-      align-items: stretch;
+  @media (max-width: 1120px) {
+    .compact-web {
+      padding: var(--space-2);
     }
 
-    .preview-modal {
-      width: 100%;
-      max-height: none;
-      height: 100%;
+    .edits-shell,
+    .edits-shell.has-docked-preview {
+      display: block;
+      border: none;
       border-radius: 0;
+      background: transparent;
+      box-shadow: none;
     }
 
-    .preview-header {
-      padding: var(--space-3);
+    .edits-main {
+      height: 100%;
+      border-right: none;
+      background: transparent;
     }
 
-    .preview-diff-line,
-    .preview-file-line {
-      grid-template-columns: 44px 1fr;
-      font-size: 12px;
+    .compact-preview .preview-diff {
+      width: 100%;
+      min-width: 100%;
+    }
+
+    .compact-preview .diff-reader-header {
+      min-height: auto;
+      padding: 8px var(--space-2);
+    }
+
+    .compact-preview .diff-file-title {
+      white-space: normal;
+      overflow-wrap: anywhere;
+      line-height: 1.35;
+    }
+
+    .compact-preview .preview-diff-line {
+      width: 100%;
+      min-width: 0;
+    }
+
+    .compact-preview .preview-line-number,
+    .compact-preview .preview-line-prefix {
+      position: static;
+      left: auto;
+    }
+
+    .compact-preview .preview-diff-line code {
+      flex: 1 1 0;
+      min-width: 0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+  }
+
+  @media (max-width: 768px) {
+    .edits-panel {
+      padding: var(--space-2);
+      --diff-line-number-width: 30px;
+      --diff-prefix-width: 14px;
+    }
+
+    .file-row,
+    .edits-panel.web-mode .file-row {
+      grid-template-columns: 3px 18px minmax(0, 1fr) auto auto;
+      gap: 6px;
+      min-height: 44px;
+      padding-inline: 6px;
+    }
+
+    .preview-diff-line {
+      font-size: 11.5px;
     }
 
     .preview-line-number {
-      padding: 2px 8px;
-    }
-
-    .preview-diff-line code,
-    .preview-file-line code {
-      padding: 2px 12px;
-    }
-
-    .preview-footer-actions {
-      box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.08);
+      padding-inline: 4px;
     }
   }
 </style>

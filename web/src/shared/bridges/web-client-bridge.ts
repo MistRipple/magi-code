@@ -559,6 +559,13 @@ function emitForcedProcessingIdle(reason: string, extra?: Record<string, unknown
   scheduleQueuedTurnDrain('forced_idle');
 }
 
+function refreshBootstrapAfterTerminalTurn(reason: string): void {
+  void fetchBootstrap({ forceFresh: true }).catch((error) => {
+    reportExpectedRecoveryFailure('终态变更同步', '[web-client-bridge] turn 终态后 bootstrap 同步失败:', error);
+    scheduleRecovery(reason, error, true);
+  });
+}
+
 function emitRecoveringState(reason: string, error?: unknown): void {
   bridgeRecovering = true;
   dispatchAgentConnectionEvent({
@@ -1032,6 +1039,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       terminalReason,
       { eventType },
     );
+    refreshBootstrapAfterTerminalTurn(terminalReason);
   }
 
   // Notify listeners about task-domain SSE events so lightweight stores

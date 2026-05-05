@@ -9,8 +9,11 @@ use magi_governance::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
-    path::PathBuf,
+    collections::{BTreeMap, BTreeSet, HashMap, hash_map::DefaultHasher},
+    fs,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, RwLock},
 };
 
@@ -139,6 +142,10 @@ impl BuiltinToolName {
                 | Self::FileCopy
                 | Self::FileMove
         )
+    }
+
+    fn captures_workspace_changes(&self) -> bool {
+        self.is_write_operation() || matches!(self, Self::ShellExec)
     }
 
     pub fn is_public_tool_surface(&self) -> bool {
@@ -787,7 +794,10 @@ impl ToolRegistry {
                             return output;
                         }
                     };
+                    let before_changes = capture_tool_workspace_snapshot(&input, &context);
                     let payload = tool.execute(&input.input, &context);
+                    let payload =
+                        append_workspace_changed_paths(payload, before_changes.as_ref(), &context);
                     drop(write_guard);
                     ToolExecutionOutput {
                         tool_call_id: input.tool_call_id.clone(),
@@ -1005,6 +1015,185 @@ impl ToolRegistry {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkspaceChangeSnapshot {
+    root: PathBuf,
+    files: BTreeMap<String, WorkspaceFileFingerprint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkspaceFileFingerprint {
+    status_code: String,
+    content_hash: Option<u64>,
+    exists: bool,
+    is_dir: bool,
+}
+
+fn capture_tool_workspace_snapshot(
+    input: &ToolExecutionInput,
+    context: &ToolExecutionContext,
+) -> Option<WorkspaceChangeSnapshot> {
+    if input.tool_kind != ToolKind::Builtin {
+        return None;
+    }
+    let tool_name = BuiltinToolName::from_str(input.tool_name.trim())?;
+    if !tool_name.captures_workspace_changes() {
+        return None;
+    }
+    capture_workspace_change_snapshot(context.working_directory.as_deref()?)
+}
+
+fn capture_workspace_change_snapshot(workdir: &Path) -> Option<WorkspaceChangeSnapshot> {
+    let repo_root = run_git_capture(workdir, &["rev-parse", "--show-toplevel"])?;
+    let repo_root = PathBuf::from(repo_root.trim());
+    if repo_root.as_os_str().is_empty() {
+        return None;
+    }
+    let status = run_git_capture(
+        &repo_root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    let mut files = BTreeMap::new();
+    for line in status.lines() {
+        let Some((status_code, file_path)) = parse_git_status_path(line) else {
+            continue;
+        };
+        files.insert(
+            file_path.clone(),
+            fingerprint_workspace_file(&repo_root, &file_path, &status_code),
+        );
+    }
+    Some(WorkspaceChangeSnapshot {
+        root: repo_root,
+        files,
+    })
+}
+
+fn append_workspace_changed_paths(
+    payload: String,
+    before: Option<&WorkspaceChangeSnapshot>,
+    context: &ToolExecutionContext,
+) -> String {
+    let Some(before) = before else {
+        return payload;
+    };
+    let Some(after) = capture_workspace_change_snapshot(
+        context
+            .working_directory
+            .as_deref()
+            .unwrap_or_else(|| before.root.as_path()),
+    ) else {
+        return payload;
+    };
+    if after.root != before.root {
+        return payload;
+    }
+    let changed_paths = workspace_changed_paths(before, &after);
+    if changed_paths.is_empty() {
+        return payload;
+    }
+    append_changed_paths_to_json_payload(payload, &changed_paths)
+}
+
+fn workspace_changed_paths(
+    before: &WorkspaceChangeSnapshot,
+    after: &WorkspaceChangeSnapshot,
+) -> Vec<String> {
+    after
+        .files
+        .iter()
+        .filter(|(path, fingerprint)| before.files.get(*path) != Some(*fingerprint))
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+fn append_changed_paths_to_json_payload(payload: String, changed_paths: &[String]) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+        return payload;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return payload;
+    };
+
+    let mut merged = object
+        .get("changed_paths")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    merged.extend(changed_paths.iter().cloned());
+    object.insert(
+        "changed_paths".to_string(),
+        serde_json::Value::Array(merged.into_iter().map(serde_json::Value::String).collect()),
+    );
+    value.to_string()
+}
+
+fn run_git_capture(workdir: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(workdir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn parse_git_status_path(line: &str) -> Option<(String, String)> {
+    if line.len() < 4 {
+        return None;
+    }
+    let status_code = line.get(..2)?.to_string();
+    let path_segment = line.get(3..)?.trim();
+    if path_segment.is_empty() {
+        return None;
+    }
+    let file_path = path_segment
+        .rsplit(" -> ")
+        .next()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())?
+        .to_string();
+    Some((status_code, file_path))
+}
+
+fn fingerprint_workspace_file(
+    repo_root: &Path,
+    file_path: &str,
+    status_code: &str,
+) -> WorkspaceFileFingerprint {
+    let absolute_path = repo_root.join(file_path);
+    match fs::metadata(&absolute_path) {
+        Ok(metadata) => WorkspaceFileFingerprint {
+            status_code: status_code.to_string(),
+            content_hash: if metadata.is_file() {
+                hash_file_contents(&absolute_path)
+            } else {
+                None
+            },
+            exists: true,
+            is_dir: metadata.is_dir(),
+        },
+        Err(_) => WorkspaceFileFingerprint {
+            status_code: status_code.to_string(),
+            content_hash: None,
+            exists: false,
+            is_dir: false,
+        },
+    }
+}
+
+fn hash_file_contents(path: &Path) -> Option<u64> {
+    let bytes = fs::read(path).ok()?;
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,7 +1204,11 @@ mod tests {
     use serde_json::Value;
     use std::{
         fs,
+        io::{Read, Write},
+        net::TcpListener,
+        process::Command,
         sync::Arc,
+        thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
@@ -1216,6 +1409,78 @@ mod tests {
             &ToolExecutionPolicy::default(),
         );
         assert_eq!(blocked.status, ExecutionResultStatus::NeedsApproval);
+    }
+
+    #[test]
+    fn shell_exec_records_git_worktree_changed_paths() {
+        let root = unique_temp_dir("magi-tool-shell-change-capture");
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .expect("git init should run");
+        Command::new("git")
+            .args(["config", "user.email", "codex@example.com"])
+            .current_dir(&root)
+            .output()
+            .expect("git email config should run");
+        Command::new("git")
+            .args(["config", "user.name", "Codex"])
+            .current_dir(&root)
+            .output()
+            .expect("git name config should run");
+        fs::write(root.join("tracked-a.txt"), "alpha\n").expect("tracked a should write");
+        fs::write(root.join("tracked-b.txt"), "beta\n").expect("tracked b should write");
+        Command::new("git")
+            .args(["add", "--", "tracked-a.txt", "tracked-b.txt"])
+            .current_dir(&root)
+            .output()
+            .expect("git add should run");
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&root)
+            .output()
+            .expect("git commit should run");
+
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+        let context = ToolExecutionContext {
+            session_id: Some(SessionId::new("session-shell-change-capture")),
+            workspace_id: Some(WorkspaceId::new("workspace-shell-change-capture")),
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        };
+
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-shell-change-capture"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "printf 'alpha changed\\n' > tracked-a.txt && rm tracked-b.txt && mkdir -p tmp && printf 'new file\\n' > tmp/new-a.txt",
+                    "access_mode": "explicit_write"
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context,
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        let changed_paths = payload["changed_paths"]
+            .as_array()
+            .expect("changed paths should be recorded")
+            .iter()
+            .map(|value| value.as_str().expect("path should be string"))
+            .collect::<Vec<_>>();
+        assert!(changed_paths.contains(&"tracked-a.txt"));
+        assert!(changed_paths.contains(&"tracked-b.txt"));
+        assert!(changed_paths.contains(&"tmp/new-a.txt"));
     }
 
     #[cfg(unix)]
@@ -1992,6 +2257,43 @@ mod tests {
     }
 
     #[test]
+    fn diff_preview_prefers_inline_text_when_path_labels_are_present() {
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-diff-inline-first"),
+                tool_name: BuiltinToolName::DiffPreview.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "before": "alpha\nbeta",
+                    "after": "alpha\nBETA",
+                    "before_path": "before",
+                    "after_path": "after"
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            ToolExecutionContext::default(),
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], "diff_preview");
+        assert!(
+            payload["preview"]
+                .as_str()
+                .expect("preview")
+                .contains("+BETA")
+        );
+    }
+
+    #[test]
     fn builtin_invocation_emits_usage_event_and_updates_ledger() {
         let governance = Arc::new(GovernanceService::default());
         let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
@@ -2707,6 +3009,34 @@ mod tests {
     }
 
     #[test]
+    fn file_patch_empty_patches_falls_back_to_old_new_fields() {
+        let root = unique_temp_dir("magi-tool-file-patch-empty-array");
+        let registry = make_registry();
+        let file = root.join("patch_me.txt");
+        fs::write(&file, "alpha needle beta").unwrap();
+
+        let output = exec_tool(
+            &registry,
+            BuiltinToolName::FilePatch,
+            &serde_json::json!({
+                "path": file.to_string_lossy(),
+                "old_string": "needle",
+                "new_string": "needle_patched",
+                "patches": []
+            })
+            .to_string(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).unwrap();
+        assert_eq!(payload["applied"], 1);
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "alpha needle_patched beta"
+        );
+    }
+
+    #[test]
     fn file_patch_applies_multiple_patches() {
         let root = unique_temp_dir("magi-tool-file-patch-multi");
         let registry = make_registry();
@@ -3266,6 +3596,66 @@ mod tests {
             registry.builtin_access_mode(BuiltinToolName::DiagramRender.as_str()),
             Some(BuiltinToolAccessMode::ReadOnly)
         );
+    }
+
+    #[test]
+    fn web_fetch_reads_local_http_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("local test server address")
+        );
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept web_fetch request");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let body = r#"<!doctype html><html><body><main><h1>Smoke Web Fetch</h1><p>alpha beta</p></main></body></html>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.as_bytes().len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write web_fetch response");
+        });
+
+        let registry = make_registry();
+        let output = exec_tool(
+            &registry,
+            BuiltinToolName::WebFetch,
+            &serde_json::json!({ "url": url }).to_string(),
+        );
+        server.join().expect("local web_fetch server should finish");
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], BuiltinToolName::WebFetch.as_str());
+        assert_eq!(payload["status"], "succeeded");
+        assert!(
+            payload["content"]
+                .as_str()
+                .expect("content should be string")
+                .contains("Smoke Web Fetch")
+        );
+    }
+
+    #[test]
+    #[ignore = "live network smoke for manually verifying DuckDuckGo-backed web_search"]
+    fn web_search_live_smoke_returns_json_payload() {
+        let registry = make_registry();
+        let output = exec_tool(
+            &registry,
+            BuiltinToolName::WebSearch,
+            &serde_json::json!({ "query": "OpenAI" }).to_string(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["tool"], BuiltinToolName::WebSearch.as_str());
+        assert_eq!(payload["status"], "succeeded");
+        assert!(payload["result_count"].is_number());
+        assert!(payload["results"].is_array());
     }
 
     // ── 默认内置工具全覆盖注册验证 ──

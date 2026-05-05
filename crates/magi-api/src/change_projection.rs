@@ -13,7 +13,7 @@ use std::{
 pub(crate) struct SessionChangeScope {
     pub session_id: SessionId,
     pub workspace_root: PathBuf,
-    pub mission_id: MissionId,
+    pub execution_group_id: String,
     pub allowed_files: BTreeSet<String>,
     pub contributors: Vec<String>,
 }
@@ -42,20 +42,25 @@ pub(crate) fn resolve_session_change_scope(
     state: &ApiState,
     session_id: &SessionId,
     workspace_id: Option<&str>,
-    mission_id_override: Option<&str>,
+    execution_group_id_override: Option<&str>,
 ) -> Result<SessionChangeScope, ApiError> {
-    let ownership = state
+    let session = state
         .session_store
-        .execution_ownership(session_id)
+        .session(session_id)
         .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+    let ownership = state.session_store.execution_ownership(session_id);
 
-    let ownership_workspace_id = ownership.workspace_id.clone().ok_or_else(|| {
-        ApiError::InvalidInput("当前会话未绑定 workspace，不能执行变更操作".to_string())
-    })?;
+    let bound_workspace_id = ownership
+        .as_ref()
+        .and_then(|ownership| ownership.workspace_id.clone())
+        .or_else(|| state.session_workspace_id(&session))
+        .ok_or_else(|| {
+            ApiError::InvalidInput("当前会话未绑定 workspace，不能执行变更操作".to_string())
+        })?;
     if let Some(requested_workspace_id) = workspace_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        && requested_workspace_id != ownership_workspace_id.as_str()
+        && requested_workspace_id != bound_workspace_id.as_str()
     {
         return Err(ApiError::InvalidInput(format!(
             "会话 {} 不属于 workspace {}",
@@ -63,28 +68,30 @@ pub(crate) fn resolve_session_change_scope(
         )));
     }
 
-    let bound_mission_id = ownership
-        .mission_id
-        .clone()
-        .ok_or_else(|| ApiError::InvalidInput("当前会话没有可归属的执行分组".to_string()))?;
-    let mission_id = match mission_id_override
+    let mission_id = ownership
+        .as_ref()
+        .and_then(|ownership| ownership.mission_id.clone());
+    let execution_group_id = mission_id
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| session_execution_group_id(session_id));
+    if let Some(requested_execution_group_id) = execution_group_id_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        && requested_execution_group_id != execution_group_id
     {
-        Some(mission_id) => {
-            if mission_id != bound_mission_id.as_str() {
-                return Err(ApiError::InvalidInput(format!(
-                    "执行分组 {} 不属于当前会话 {}",
-                    mission_id, session_id
-                )));
-            }
-            MissionId::new(mission_id)
-        }
-        None => bound_mission_id,
-    };
+        return Err(ApiError::InvalidInput(format!(
+            "执行分组 {} 不属于当前会话 {}",
+            requested_execution_group_id, session_id
+        )));
+    }
 
-    let workspace_root = resolve_workspace_root(state, &ownership_workspace_id)?;
-    let allowed_files = collect_mission_output_files(state, &mission_id, &workspace_root)?;
+    let workspace_root = resolve_workspace_root(state, &bound_workspace_id)?;
+    let mut allowed_files = match mission_id.as_ref() {
+        Some(mission_id) => collect_mission_output_files(state, mission_id, &workspace_root)?,
+        None => BTreeSet::new(),
+    };
+    collect_canonical_session_tool_files(state, session_id, &workspace_root, &mut allowed_files);
     let contributors = state
         .session_store
         .runtime_sidecar(session_id)
@@ -111,7 +118,7 @@ pub(crate) fn resolve_session_change_scope(
     Ok(SessionChangeScope {
         session_id: session_id.clone(),
         workspace_root,
-        mission_id,
+        execution_group_id,
         allowed_files,
         contributors,
     })
@@ -141,17 +148,19 @@ pub(crate) fn collect_session_pending_changes(
     session_id: &SessionId,
     workspace_id: Option<&str>,
 ) -> Result<Vec<PendingChangeDto>, ApiError> {
-    if state.session_store.session(session_id).is_none() {
-        return Err(ApiError::session_not_found(session_id.as_str()));
-    }
-    let Some(ownership) = state.session_store.execution_ownership(session_id) else {
-        return Ok(Vec::new());
-    };
+    let session = state
+        .session_store
+        .session(session_id)
+        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+    let ownership = state.session_store.execution_ownership(session_id);
+    let bound_workspace_id = ownership
+        .as_ref()
+        .and_then(|ownership| ownership.workspace_id.clone())
+        .or_else(|| state.session_workspace_id(&session));
     if let Some(requested_workspace_id) = workspace_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        && ownership
-            .workspace_id
+        && bound_workspace_id
             .as_ref()
             .is_some_and(|bound_workspace_id| bound_workspace_id.as_str() != requested_workspace_id)
     {
@@ -160,7 +169,7 @@ pub(crate) fn collect_session_pending_changes(
             session_id, requested_workspace_id
         )));
     }
-    if ownership.workspace_id.is_none() || ownership.mission_id.is_none() {
+    if bound_workspace_id.is_none() {
         return Ok(Vec::new());
     }
     let scope = resolve_session_change_scope(state, session_id, workspace_id, None)?;
@@ -254,6 +263,32 @@ fn collect_mission_output_files(
     Ok(files)
 }
 
+fn session_execution_group_id(session_id: &SessionId) -> String {
+    format!("session:{}", session_id)
+}
+
+fn collect_canonical_session_tool_files(
+    state: &ApiState,
+    session_id: &SessionId,
+    workspace_root: &Path,
+    files: &mut BTreeSet<String>,
+) {
+    for turn in state.session_store.canonical_turns_for_session(session_id) {
+        for item in turn.items {
+            let Some(tool) = item.tool.as_ref() else {
+                continue;
+            };
+            collect_tool_call_files(
+                files,
+                &tool.name,
+                tool.arguments.as_ref(),
+                tool.result.as_ref(),
+                workspace_root,
+            );
+        }
+    }
+}
+
 fn collect_output_ref_files(files: &mut BTreeSet<String>, output_ref: &str, workspace_root: &Path) {
     if let Some(rel) = output_ref
         .strip_prefix("file:")
@@ -302,6 +337,8 @@ fn collect_tool_call_files(
             files.insert(rel);
         }
     };
+
+    collect_result_changed_paths(&mut insert_path, result_payload.as_ref());
 
     match tool_name {
         "file_write" | "file_patch" | "file_remove" | "file_mkdir" => {
@@ -366,6 +403,41 @@ fn collect_tool_call_files(
     }
 }
 
+fn collect_result_changed_paths(
+    insert_path: &mut impl FnMut(Option<&str>),
+    result_payload: Option<&Value>,
+) {
+    let Some(payload) = result_payload else {
+        return;
+    };
+    for field in [
+        "changed_paths",
+        "changedPaths",
+        "changed_files",
+        "changedFiles",
+        "files",
+        "paths",
+    ] {
+        let Some(values) = payload.get(field).and_then(Value::as_array) else {
+            continue;
+        };
+        for value in values {
+            if let Some(path) = value.as_str() {
+                insert_path(Some(path));
+                continue;
+            }
+            if let Some(path) = value
+                .get("path")
+                .or_else(|| value.get("file_path"))
+                .or_else(|| value.get("filePath"))
+                .and_then(Value::as_str)
+            {
+                insert_path(Some(path));
+            }
+        }
+    }
+}
+
 fn normalize_output_file_path(path: &str, workspace_root: &Path) -> Option<String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -382,6 +454,30 @@ fn normalize_output_file_path(path: &str, workspace_root: &Path) -> Option<Strin
         trimmed.to_string()
     };
     safe_relative_path(&relative).ok().map(str::to_string)
+}
+
+pub(crate) fn session_change_scope_allows_path(
+    scope: &SessionChangeScope,
+    file_path: &str,
+) -> bool {
+    let Ok(rel) = safe_relative_path(file_path) else {
+        return false;
+    };
+    scope
+        .allowed_files
+        .iter()
+        .any(|allowed| scope_entry_allows_path(allowed, rel))
+}
+
+fn scope_entry_allows_path(scope_entry: &str, file_path: &str) -> bool {
+    let normalized_entry = scope_entry.trim_end_matches('/');
+    if normalized_entry.is_empty() {
+        return false;
+    }
+    file_path == normalized_entry
+        || file_path
+            .strip_prefix(normalized_entry)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn pending_changes_for_scope(
@@ -404,7 +500,7 @@ fn pending_changes_for_scope(
         .lines()
         .filter_map(parse_git_status_line)
         .filter(|(status_code, _)| status_has_unapproved_changes(status_code))
-        .filter(|(_, file_path)| scope.allowed_files.contains(file_path))
+        .filter(|(_, file_path)| session_change_scope_allows_path(scope, file_path))
         .map(|(status_code, file_path)| build_pending_change(scope, &status_code, &file_path))
         .collect::<Result<Vec<_>, _>>()?;
     changes.sort_by(|left, right| left.file_path.cmp(&right.file_path));
@@ -469,7 +565,7 @@ fn build_pending_change(
 
     Ok(PendingChangeDto {
         file_path: relative_path.clone(),
-        snapshot_id: format!("{}:{}", scope.mission_id, relative_path),
+        snapshot_id: format!("{}:{}", scope.execution_group_id, relative_path),
         updated_at,
         r#type: change_type,
         additions,
@@ -480,7 +576,7 @@ fn build_pending_change(
         preview_absolute_path: absolute_path.to_string_lossy().to_string(),
         preview_can_open_workspace_file,
         contributors: scope.contributors.clone(),
-        execution_group_id: scope.mission_id.to_string(),
+        execution_group_id: scope.execution_group_id.clone(),
     })
 }
 
@@ -661,7 +757,7 @@ mod tests {
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_orchestrator::task_store::TaskStore;
-    use magi_session_store::SessionStore;
+    use magi_session_store::{ActiveExecutionTurn, ActiveExecutionTurnItem, SessionStore};
     use magi_workspace::WorkspaceStore;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -781,6 +877,98 @@ mod tests {
         state
     }
 
+    fn build_state_with_session_workspace(
+        repo_root: &str,
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+    ) -> ApiState {
+        let event_bus = Arc::new(InMemoryEventBus::new(32));
+        let session_store = Arc::new(SessionStore::default());
+        let workspace_store = Arc::new(WorkspaceStore::default());
+        let governance = Arc::new(GovernanceService::default());
+        let state = ApiState::new(
+            "magi-test",
+            event_bus,
+            Arc::clone(&session_store),
+            workspace_store,
+            governance,
+        )
+        .with_task_store(Arc::new(TaskStore::new()));
+
+        state
+            .workspace_registry
+            .register(workspace_id.clone(), AbsolutePath::new(repo_root))
+            .expect("workspace should register");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id,
+                "普通文件工具会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        state
+    }
+
+    fn canonical_file_tool_item(
+        item_seq: usize,
+        call_id: &str,
+        tool_name: &str,
+        arguments: Value,
+        result: Value,
+    ) -> ActiveExecutionTurnItem {
+        ActiveExecutionTurnItem {
+            item_id: format!("turn-item-tool-{call_id}"),
+            item_seq,
+            lane_id: None,
+            lane_seq: None,
+            kind: "tool_call_result".to_string(),
+            status: "completed".to_string(),
+            source: "session".to_string(),
+            title: Some(tool_name.to_string()),
+            content: None,
+            task_id: None,
+            worker_id: None,
+            role_id: None,
+            tool_call_id: Some(call_id.to_string()),
+            tool_name: Some(tool_name.to_string()),
+            tool_status: Some("completed".to_string()),
+            tool_arguments: Some(arguments.to_string()),
+            tool_result: Some(result.to_string()),
+            tool_error: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            timeline_entry_id: None,
+            thread_visible: true,
+            worker_visible: false,
+        }
+    }
+
+    fn upsert_canonical_file_tool_turn(
+        state: &ApiState,
+        session_id: &SessionId,
+        items: Vec<ActiveExecutionTurnItem>,
+    ) {
+        let now = UtcMillis::now();
+        state
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-session-file-tools".to_string(),
+                    turn_seq: now.0,
+                    accepted_at: now,
+                    completed_at: Some(now),
+                    status: "completed".to_string(),
+                    user_message: Some("文件工具".to_string()),
+                    items,
+                    worker_lanes: Vec::new(),
+                },
+            )
+            .expect("canonical file tool turn should upsert");
+    }
+
     #[test]
     fn session_pending_changes_include_tracked_and_untracked_files() {
         let repo_root = build_test_repo();
@@ -872,6 +1060,316 @@ mod tests {
             changes
                 .iter()
                 .any(|change| change.file_path == "tmp/new-a.txt")
+        );
+    }
+
+    #[test]
+    fn session_pending_changes_collects_canonical_file_tool_changes_without_execution_group() {
+        let repo_root = build_test_repo();
+        let session_id = SessionId::new("session-canonical-file-tools");
+        let workspace_id = WorkspaceId::new("workspace-canonical-file-tools");
+        let state = build_state_with_session_workspace(
+            &repo_root,
+            session_id.clone(),
+            workspace_id.clone(),
+        );
+        let repo_path = Path::new(&repo_root);
+        upsert_canonical_file_tool_turn(
+            &state,
+            &session_id,
+            vec![
+                canonical_file_tool_item(
+                    1,
+                    "call-file-write",
+                    "file_write",
+                    serde_json::json!({
+                        "path": repo_path.join("tmp/new-a.txt").to_string_lossy().to_string(),
+                        "content": "new file\nsecond line\n",
+                    }),
+                    serde_json::json!({
+                        "tool": "file_write",
+                        "status": "succeeded",
+                        "path": repo_path.join("tmp/new-a.txt").to_string_lossy().to_string(),
+                    }),
+                ),
+                canonical_file_tool_item(
+                    2,
+                    "call-file-patch",
+                    "file_patch",
+                    serde_json::json!({
+                        "path": repo_path.join("tracked-a.txt").to_string_lossy().to_string(),
+                    }),
+                    serde_json::json!({
+                        "tool": "file_patch",
+                        "status": "succeeded",
+                        "path": repo_path.join("tracked-a.txt").to_string_lossy().to_string(),
+                    }),
+                ),
+            ],
+        );
+
+        let changes =
+            collect_session_pending_changes(&state, &session_id, Some(workspace_id.as_str()))
+                .expect("canonical session file tools should collect pending changes");
+
+        assert_eq!(changes.len(), 2);
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.file_path == "tracked-a.txt")
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.file_path == "tmp/new-a.txt")
+        );
+        assert!(
+            changes
+                .iter()
+                .all(|change| change.execution_group_id == "session:session-canonical-file-tools")
+        );
+    }
+
+    #[test]
+    fn session_pending_changes_ignores_canonical_file_tools_outside_workspace() {
+        let repo_root = build_test_repo();
+        let session_id = SessionId::new("session-canonical-external-file");
+        let workspace_id = WorkspaceId::new("workspace-canonical-external-file");
+        let state = build_state_with_session_workspace(
+            &repo_root,
+            session_id.clone(),
+            workspace_id.clone(),
+        );
+        let external_path = std::env::temp_dir().join(format!(
+            "magi-change-projection-external-{}-{}.txt",
+            std::process::id(),
+            UtcMillis::now().0
+        ));
+        fs::write(&external_path, "outside workspace\n").expect("external file should write");
+        upsert_canonical_file_tool_turn(
+            &state,
+            &session_id,
+            vec![canonical_file_tool_item(
+                1,
+                "call-external-file-write",
+                "file_write",
+                serde_json::json!({
+                    "path": external_path.to_string_lossy().to_string(),
+                    "content": "outside workspace\n",
+                }),
+                serde_json::json!({
+                    "tool": "file_write",
+                    "status": "succeeded",
+                    "path": external_path.to_string_lossy().to_string(),
+                }),
+            )],
+        );
+
+        let changes =
+            collect_session_pending_changes(&state, &session_id, Some(workspace_id.as_str()))
+                .expect("outside workspace file should be ignored");
+
+        assert!(
+            changes.is_empty(),
+            "canonical file tool paths outside the workspace must not enter the change scope"
+        );
+        let _ = fs::remove_file(external_path);
+    }
+
+    #[test]
+    fn session_pending_changes_collects_canonical_add_modify_and_delete() {
+        let repo_root = build_test_repo();
+        let session_id = SessionId::new("session-canonical-all-file-actions");
+        let workspace_id = WorkspaceId::new("workspace-canonical-all-file-actions");
+        let state = build_state_with_session_workspace(
+            &repo_root,
+            session_id.clone(),
+            workspace_id.clone(),
+        );
+        let repo_path = Path::new(&repo_root);
+        fs::remove_file(repo_path.join("tracked-b.txt")).expect("tracked file should delete");
+        upsert_canonical_file_tool_turn(
+            &state,
+            &session_id,
+            vec![
+                canonical_file_tool_item(
+                    1,
+                    "call-file-write-add",
+                    "file_write",
+                    serde_json::json!({
+                        "path": repo_path.join("tmp/new-a.txt").to_string_lossy().to_string(),
+                        "content": "new file\nsecond line\n",
+                    }),
+                    serde_json::json!({
+                        "tool": "file_write",
+                        "status": "succeeded",
+                        "path": repo_path.join("tmp/new-a.txt").to_string_lossy().to_string(),
+                    }),
+                ),
+                canonical_file_tool_item(
+                    2,
+                    "call-file-write-modify",
+                    "file_write",
+                    serde_json::json!({
+                        "path": repo_path.join("tracked-a.txt").to_string_lossy().to_string(),
+                        "content": "alpha changed\n",
+                    }),
+                    serde_json::json!({
+                        "tool": "file_write",
+                        "status": "succeeded",
+                        "path": repo_path.join("tracked-a.txt").to_string_lossy().to_string(),
+                    }),
+                ),
+                canonical_file_tool_item(
+                    3,
+                    "call-file-remove-delete",
+                    "file_remove",
+                    serde_json::json!({
+                        "path": repo_path.join("tracked-b.txt").to_string_lossy().to_string(),
+                    }),
+                    serde_json::json!({
+                        "tool": "file_remove",
+                        "status": "succeeded",
+                        "path": repo_path.join("tracked-b.txt").to_string_lossy().to_string(),
+                    }),
+                ),
+            ],
+        );
+
+        let changes =
+            collect_session_pending_changes(&state, &session_id, Some(workspace_id.as_str()))
+                .expect("canonical file actions should collect pending changes");
+
+        assert_eq!(changes.len(), 3);
+        assert_eq!(
+            changes
+                .iter()
+                .find(|change| change.file_path == "tmp/new-a.txt")
+                .expect("added file should be present")
+                .r#type,
+            "add"
+        );
+        assert_eq!(
+            changes
+                .iter()
+                .find(|change| change.file_path == "tracked-a.txt")
+                .expect("modified file should be present")
+                .r#type,
+            "modify"
+        );
+        let deleted = changes
+            .iter()
+            .find(|change| change.file_path == "tracked-b.txt")
+            .expect("deleted file should be present");
+        assert_eq!(deleted.r#type, "delete");
+        assert!(deleted.deletions > 0);
+    }
+
+    #[test]
+    fn session_pending_changes_include_children_under_directory_scope() {
+        let repo_root = build_test_repo();
+        let session_id = SessionId::new("session-canonical-directory-output");
+        let workspace_id = WorkspaceId::new("workspace-canonical-directory-output");
+        let state = build_state_with_session_workspace(
+            &repo_root,
+            session_id.clone(),
+            workspace_id.clone(),
+        );
+        let repo_path = Path::new(&repo_root);
+        let copied_dir = repo_path.join("tmp/copied-dir");
+        fs::create_dir_all(&copied_dir).expect("copied dir should create");
+        fs::write(copied_dir.join("child-a.txt"), "child a\n").expect("child a should write");
+        fs::write(copied_dir.join("child-b.txt"), "child b\n").expect("child b should write");
+        upsert_canonical_file_tool_turn(
+            &state,
+            &session_id,
+            vec![canonical_file_tool_item(
+                1,
+                "call-file-copy-dir",
+                "file_copy",
+                serde_json::json!({
+                    "source": repo_path.join("src-dir").to_string_lossy().to_string(),
+                    "destination": copied_dir.to_string_lossy().to_string(),
+                }),
+                serde_json::json!({
+                    "tool": "file_copy",
+                    "status": "succeeded",
+                    "destination": copied_dir.to_string_lossy().to_string(),
+                    "is_directory": true,
+                }),
+            )],
+        );
+
+        let changes =
+            collect_session_pending_changes(&state, &session_id, Some(workspace_id.as_str()))
+                .expect("directory scoped tool output should collect child files");
+
+        assert_eq!(changes.len(), 2);
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.file_path == "tmp/copied-dir/child-a.txt")
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.file_path == "tmp/copied-dir/child-b.txt")
+        );
+    }
+
+    #[test]
+    fn session_pending_changes_collects_shell_exec_changed_paths() {
+        let repo_root = build_test_repo();
+        let session_id = SessionId::new("session-canonical-shell-changes");
+        let workspace_id = WorkspaceId::new("workspace-canonical-shell-changes");
+        let state = build_state_with_session_workspace(
+            &repo_root,
+            session_id.clone(),
+            workspace_id.clone(),
+        );
+        let repo_path = Path::new(&repo_root);
+        fs::remove_file(repo_path.join("tracked-b.txt")).expect("tracked file should delete");
+        upsert_canonical_file_tool_turn(
+            &state,
+            &session_id,
+            vec![canonical_file_tool_item(
+                1,
+                "call-shell-change",
+                "shell_exec",
+                serde_json::json!({
+                    "command": "modify files",
+                }),
+                serde_json::json!({
+                    "tool": "shell_exec",
+                    "status": "succeeded",
+                    "changed_paths": [
+                        "tracked-a.txt",
+                        "tracked-b.txt",
+                        "tmp/new-a.txt"
+                    ],
+                }),
+            )],
+        );
+
+        let changes =
+            collect_session_pending_changes(&state, &session_id, Some(workspace_id.as_str()))
+                .expect("shell changed paths should collect pending changes");
+
+        assert_eq!(changes.len(), 3);
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.file_path == "tracked-a.txt" && change.r#type == "modify")
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.file_path == "tracked-b.txt" && change.r#type == "delete")
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.file_path == "tmp/new-a.txt" && change.r#type == "add")
         );
     }
 

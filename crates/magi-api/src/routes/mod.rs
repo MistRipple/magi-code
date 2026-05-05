@@ -758,6 +758,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_workspace_session_filters_canonical_turns_to_selected_session() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-bootstrap-canonical");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-workspace-bootstrap-canonical"),
+            )
+            .expect("workspace should register");
+
+        for session_id in [
+            "session-bootstrap-canonical-a",
+            "session-bootstrap-canonical-b",
+        ] {
+            let session_id = SessionId::new(session_id);
+            state
+                .session_store
+                .create_session_for_workspace(
+                    session_id.clone(),
+                    format!("Bootstrap canonical {session_id}"),
+                    Some(workspace_id.to_string()),
+                )
+                .expect("session should create");
+            let accepted_at = UtcMillis(if session_id.as_str().ends_with("-a") {
+                10
+            } else {
+                20
+            });
+            state
+                .session_store
+                .upsert_current_turn(
+                    session_id.clone(),
+                    ActiveExecutionTurn {
+                        turn_id: format!("turn-{session_id}"),
+                        turn_seq: accepted_at.0,
+                        accepted_at,
+                        completed_at: Some(UtcMillis(accepted_at.0 + 1)),
+                        status: "completed".to_string(),
+                        user_message: Some(format!("message {session_id}")),
+                        items: Vec::new(),
+                        worker_lanes: Vec::new(),
+                    },
+                )
+                .expect("canonical turn should upsert");
+        }
+
+        let app = build_router(state);
+        let selected = get_json(
+            app.clone(),
+            "/bootstrap?workspaceId=workspace-bootstrap-canonical&sessionId=session-bootstrap-canonical-b",
+        )
+        .await;
+        let selected_turns = selected["canonicalTurns"]
+            .as_array()
+            .expect("canonical turns should serialize as array");
+        assert_eq!(selected_turns.len(), 1);
+        assert_eq!(
+            selected_turns[0]["sessionId"],
+            "session-bootstrap-canonical-b"
+        );
+
+        let workspace_only =
+            get_json(app, "/bootstrap?workspaceId=workspace-bootstrap-canonical").await;
+        assert!(
+            workspace_only["canonicalTurns"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "未选择 session 时不能把 workspace 内其他会话 canonical turns 混入当前主线"
+        );
+    }
+
+    #[tokio::test]
     async fn bootstrap_resolves_workspace_path_when_id_missing() {
         let state = test_state();
         state

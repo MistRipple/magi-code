@@ -818,10 +818,14 @@ impl ApiState {
                 .timeline
                 .retain(|entry| entry.session_id == *session_id);
             projection
+                .canonical_turns
+                .retain(|turn| turn.session_id == *session_id);
+            projection
                 .notifications
                 .retain(|notification| notification.session_id == *session_id);
         } else {
             projection.timeline.clear();
+            projection.canonical_turns.clear();
             projection.notifications.clear();
         }
         BootstrapDto::from_state_with_session_projection(self, projection)

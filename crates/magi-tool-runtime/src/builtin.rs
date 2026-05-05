@@ -1292,12 +1292,17 @@ fn parse_ps_line(line: &str) -> Option<Value> {
 }
 
 fn read_diff_source(path: Option<String>, inline: Option<String>) -> Result<String, String> {
+    if let Some(inline) = inline {
+        if !inline.is_empty() {
+            return Ok(inline);
+        }
+    }
     if let Some(path) = path {
         let resolved = resolve_path(&path)?;
         return fs::read_to_string(&resolved)
             .map_err(|error| format!("读取 diff 源失败 {}: {error}", resolved.display()));
     }
-    Ok(inline.unwrap_or_default())
+    Ok(String::new())
 }
 
 struct DiffPreviewResult {
@@ -1461,8 +1466,10 @@ fn execute_file_patch(input: &str, context: &ToolExecutionContext) -> String {
         Err(e) => return builtin_error("file_patch", format!("读取文件失败: {e}")),
     };
 
-    let patches: Vec<(String, String)> =
-        if let Some(arr) = request.get("patches").and_then(Value::as_array) {
+    let patches_from_array: Vec<(String, String)> = request
+        .get("patches")
+        .and_then(Value::as_array)
+        .map(|arr| {
             arr.iter()
                 .filter_map(|p| {
                     let old = p
@@ -1476,17 +1483,21 @@ fn execute_file_patch(input: &str, context: &ToolExecutionContext) -> String {
                     Some((old.to_string(), new.to_string()))
                 })
                 .collect()
-        } else if let (Some(old), Some(new)) = (
-            field_string(&request, &["old_string", "old"]),
-            field_string(&request, &["new_string", "new"]),
-        ) {
-            vec![(old, new)]
-        } else {
-            return builtin_error(
-                "file_patch",
-                "缺少 patches 数组或 old_string/new_string 字段",
-            );
-        };
+        })
+        .unwrap_or_default();
+    let patches: Vec<(String, String)> = if !patches_from_array.is_empty() {
+        patches_from_array
+    } else if let (Some(old), Some(new)) = (
+        field_string(&request, &["old_string", "old"]),
+        field_string(&request, &["new_string", "new"]),
+    ) {
+        vec![(old, new)]
+    } else {
+        return builtin_error(
+            "file_patch",
+            "缺少 patches 数组或 old_string/new_string 字段",
+        );
+    };
 
     if patches.is_empty() {
         return builtin_error("file_patch", "patches 为空");
@@ -2027,27 +2038,36 @@ fn execute_web_fetch(input: &str) -> String {
 }
 
 fn html_to_markdown(html: &str) -> String {
-    let main = extract_main_content(html);
-    let cleaned = regex::Regex::new(r"(?si)<script[\s\S]*?</script>")
-        .unwrap()
-        .replace_all(&main, "");
-    let cleaned = regex::Regex::new(r"(?si)<style[\s\S]*?</style>")
-        .unwrap()
-        .replace_all(&cleaned, "");
-    let cleaned = regex::Regex::new(r"(?si)<noscript[\s\S]*?</noscript>")
-        .unwrap()
-        .replace_all(&cleaned, "");
-    let cleaned = regex::Regex::new(r"(?si)<(nav|footer|header|aside|iframe)[^>]*>[\s\S]*?</\1>")
-        .unwrap()
-        .replace_all(&cleaned, "");
+    let mut cleaned = extract_main_content(html);
+    for pattern in [
+        r"(?si)<script[\s\S]*?</script>",
+        r"(?si)<style[\s\S]*?</style>",
+        r"(?si)<noscript[\s\S]*?</noscript>",
+    ] {
+        cleaned = regex::Regex::new(pattern)
+            .unwrap()
+            .replace_all(&cleaned, "")
+            .to_string();
+    }
+    for tag in ["nav", "footer", "header", "aside", "iframe"] {
+        let pattern = format!(r"(?si)<{tag}[^>]*>[\s\S]*?</{tag}>");
+        cleaned = regex::Regex::new(&pattern)
+            .unwrap()
+            .replace_all(&cleaned, "")
+            .to_string();
+    }
 
-    let md = regex::Regex::new(r"(?si)<h([1-6])[^>]*>([\s\S]*?)</h\1>")
-        .unwrap()
-        .replace_all(&cleaned, |caps: &regex::Captures| {
-            let level: usize = caps[1].parse().unwrap_or(1);
-            let text = strip_html_tags(&decode_html_entities(&caps[2]));
-            format!("\n{} {}\n", "#".repeat(level), text.trim())
-        });
+    let mut md = cleaned;
+    for level in 1..=6 {
+        let pattern = format!(r"(?si)<h{level}[^>]*>([\s\S]*?)</h{level}>");
+        md = regex::Regex::new(&pattern)
+            .unwrap()
+            .replace_all(&md, |caps: &regex::Captures| {
+                let text = strip_html_tags(&decode_html_entities(&caps[1]));
+                format!("\n{} {}\n", "#".repeat(level), text.trim())
+            })
+            .to_string();
+    }
     let md = regex::Regex::new(r"(?si)<pre[^>]*>\s*<code[^>]*>([\s\S]*?)</code>\s*</pre>")
         .unwrap()
         .replace_all(&md, |caps: &regex::Captures| {

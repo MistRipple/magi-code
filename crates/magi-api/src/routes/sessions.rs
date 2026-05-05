@@ -14,6 +14,7 @@ use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn,
     NotificationRecord, SessionRecord, TimelineEntryKind,
 };
+use magi_tool_runtime::BuiltinToolName;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -525,6 +526,24 @@ fn normalize_session_turn_decision(
             decision.route,
             SessionTurnRouteDto::Continue | SessionTurnRouteDto::Task
         )
+        && let Some(tool_name) = session_turn_requested_public_builtin_tool(request)
+    {
+        decision.route = SessionTurnRouteDto::Execute;
+        decision.task_title = None;
+        decision.execution_goal = None;
+        decision.required_workers.clear();
+        decision.tool_intent = Some(explicit_builtin_tool_intent(tool_name));
+        decision.forced_tool_name = Some(tool_name.to_string());
+        decision.confidence = decision.confidence.max(0.95);
+        decision.reason_code = Some("tool_request".to_string());
+        decision.route_reason = Some(format!("用户明确要求调用公开内置工具 {tool_name}。"));
+        decision.task_evidence.clear();
+    }
+    if !request.deep_task
+        && !matches!(
+            decision.route,
+            SessionTurnRouteDto::Continue | SessionTurnRouteDto::Task
+        )
         && session_turn_requests_current_project_analysis(request)
     {
         decision.route = SessionTurnRouteDto::Execute;
@@ -540,6 +559,58 @@ fn normalize_session_turn_decision(
         decision.task_evidence.clear();
     }
     decision
+}
+
+fn session_turn_requested_public_builtin_tool(
+    request: &SessionTurnRequestDto,
+) -> Option<&'static str> {
+    let normalized = request.trimmed_text()?.to_ascii_lowercase();
+    public_builtin_tool_reference_aliases()
+        .iter()
+        .find_map(|(alias, canonical_name)| {
+            contains_tool_reference(&normalized, alias).then_some(*canonical_name)
+        })
+}
+
+fn public_builtin_tool_reference_aliases() -> Vec<(&'static str, &'static str)> {
+    let mut aliases = Vec::new();
+    for tool in BuiltinToolName::ALL {
+        if tool.is_public_tool_surface() {
+            let name = tool.as_str();
+            aliases.push((name, name));
+        }
+    }
+    aliases.extend([
+        ("file_view", "file_read"),
+        ("file_create", "file_write"),
+        ("file_edit", "file_patch"),
+        ("file_insert", "file_patch"),
+        ("code_search_regex", "search_text"),
+        ("code_search_semantic", "search_semantic"),
+        ("shell", "shell_exec"),
+        ("project_knowledge_query", "knowledge_query"),
+    ]);
+    aliases
+}
+
+fn contains_tool_reference(text: &str, tool_name: &str) -> bool {
+    text.match_indices(tool_name).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + tool_name.len()..].chars().next();
+        is_tool_reference_boundary(before) && is_tool_reference_boundary(after)
+    })
+}
+
+fn is_tool_reference_boundary(value: Option<char>) -> bool {
+    value
+        .map(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        .unwrap_or(true)
+}
+
+fn explicit_builtin_tool_intent(tool_name: &str) -> String {
+    format!(
+        "用户明确要求调用公开内置工具 {tool_name}。必须直接调用 {tool_name} 工具，并从用户原始输入中提取参数；不要创建任务，不要改用其它工具，不要只输出文字说明。工具完成后只基于该工具结果给出简短回复。"
+    )
 }
 
 fn session_turn_requests_diagram_render(request: &SessionTurnRequestDto) -> bool {
@@ -2149,6 +2220,45 @@ mod tests {
         let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
         assert!(tool_intent.contains("当前工作区"));
         assert!(tool_intent.contains("不要要求用户手动提供项目结构"));
+    }
+
+    #[test]
+    fn normalizes_explicit_public_builtin_tool_to_forced_execution() {
+        let request = session_turn_request("请只调用 file_mkdir 工具创建目录");
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert_eq!(decision.forced_tool_name.as_deref(), Some("file_mkdir"));
+        let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
+        assert!(tool_intent.contains("file_mkdir"));
+        assert!(tool_intent.contains("不要只输出文字说明"));
+    }
+
+    #[test]
+    fn normalizes_public_builtin_alias_to_canonical_tool() {
+        let request = session_turn_request("请调用 shell 工具执行 printf ok");
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert_eq!(decision.forced_tool_name.as_deref(), Some("shell_exec"));
+    }
+
+    #[test]
+    fn does_not_force_internal_builtin_tool_names() {
+        let request = session_turn_request("请调用 process_launch 启动后台进程");
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+        assert!(decision.forced_tool_name.is_none());
+    }
+
+    #[test]
+    fn does_not_treat_substrings_as_explicit_tool_names() {
+        let request = session_turn_request("profile_mkdir 是一个普通变量名");
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
+        assert!(decision.forced_tool_name.is_none());
     }
 
     #[test]

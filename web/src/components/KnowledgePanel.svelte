@@ -892,15 +892,15 @@
                   {/if}
                 </div>
                 <div class="kp-card-meta">
-                  {#if learning.createdAt}
-                    <span class="kp-category-badge">{new Date(learning.createdAt).toLocaleDateString()}</span>
-                  {/if}
                   <button class="kp-card-action" title={i18n.t('knowledge.actions.edit')} onclick={(e) => editLearning(learning, e)}>
                     <Icon name="edit" size={12} />
                   </button>
                   <button class="kp-card-delete" title={i18n.t('knowledge.learning.deleteTitle')} onclick={(e) => deleteLearning(learning.id, e)}>
                     <Icon name="trash" size={12} />
                   </button>
+                  {#if learning.createdAt}
+                    <span class="kp-category-badge">{new Date(learning.createdAt).toLocaleDateString()}</span>
+                  {/if}
                   <Icon name={isExpanded ? 'chevron-up' : 'chevron-down'} size={12} />
                 </div>
               </div>
@@ -1487,15 +1487,23 @@
   .kp-card-indicator.learning { background: var(--warning); }
 
   .kp-card-main {
-    flex: 1;
+    flex: 1 1 auto;
     min-width: 0;
+    overflow: hidden;
   }
 
   .kp-card-title {
     font-size: var(--text-sm);
     font-weight: var(--font-medium);
     color: var(--foreground);
-    display: block;
+    display: -webkit-box;
+    line-height: var(--leading-normal);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    overflow-wrap: anywhere;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
   }
 
   .kp-card-preview {
@@ -1514,8 +1522,10 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
-    flex-shrink: 0;
+    flex: 0 0 auto;
     color: var(--foreground-muted);
+    min-width: max-content;
+    margin-left: auto;
   }
 
   .kp-card-delete,
@@ -1531,7 +1541,7 @@
     border-radius: var(--radius-sm);
     color: var(--foreground-muted);
     cursor: pointer;
-    opacity: 0;
+    opacity: 0.7;
     flex-shrink: 0;
     transition: all var(--transition-fast);
   }

@@ -13,6 +13,7 @@ use crate::{
     change_projection::{
         SessionChangeScope, resolve_session_change_scope, resolve_workspace_root_or_active,
         run_git_add_files, run_git_diff, run_git_restore_files, safe_relative_path,
+        session_change_scope_allows_path,
     },
     errors::ApiError,
     state::ApiState,
@@ -43,7 +44,7 @@ fn require_session_scoped_file<'a>(
     file_path: &'a str,
 ) -> Result<&'a str, ApiError> {
     let rel = safe_relative_path(file_path)?;
-    if !scope.allowed_files.contains(rel) {
+    if !session_change_scope_allows_path(scope, rel) {
         return Err(ApiError::InvalidInput(format!(
             "文件 {} 不属于当前会话 {} 的执行变更集合",
             rel, scope.session_id
@@ -220,7 +221,7 @@ async fn revert_execution_group_changes(
         request.workspace_id.as_deref(),
         Some(request.execution_group_id.as_str()),
     )?;
-    if scope.mission_id.as_str() != request.execution_group_id {
+    if scope.execution_group_id != request.execution_group_id {
         return Err(ApiError::InvalidInput(format!(
             "执行分组 {} 不属于当前会话 {}",
             request.execution_group_id, scope.session_id
@@ -563,7 +564,7 @@ mod tests {
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_orchestrator::task_store::TaskStore;
-    use magi_session_store::SessionStore;
+    use magi_session_store::{ActiveExecutionTurn, ActiveExecutionTurnItem, SessionStore};
     use magi_workspace::WorkspaceStore;
     use std::fs;
     use std::process::Command;
@@ -748,6 +749,90 @@ mod tests {
         state
     }
 
+    fn build_state_with_plain_session_repo(
+        repo_root: &str,
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+    ) -> ApiState {
+        let event_bus = Arc::new(InMemoryEventBus::new(32));
+        let session_store = Arc::new(SessionStore::default());
+        let workspace_store = Arc::new(WorkspaceStore::default());
+        let governance = Arc::new(GovernanceService::default());
+        let state = ApiState::new(
+            "magi-test",
+            event_bus,
+            Arc::clone(&session_store),
+            workspace_store,
+            governance,
+        )
+        .with_task_store(Arc::new(TaskStore::new()));
+        state
+            .workspace_registry
+            .register(workspace_id.clone(), AbsolutePath::new(repo_root))
+            .expect("workspace should register");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id,
+                "普通文件工具会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        state
+    }
+
+    fn upsert_plain_session_file_tool_turn(
+        state: &ApiState,
+        session_id: &SessionId,
+        tool_name: &str,
+        call_id: &str,
+        arguments: serde_json::Value,
+        result: serde_json::Value,
+    ) {
+        let now = UtcMillis::now();
+        state
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: format!("turn-{call_id}"),
+                    turn_seq: now.0,
+                    accepted_at: now,
+                    completed_at: Some(now),
+                    status: "completed".to_string(),
+                    user_message: Some("文件工具".to_string()),
+                    items: vec![ActiveExecutionTurnItem {
+                        item_id: format!("turn-item-tool-{call_id}"),
+                        item_seq: 1,
+                        lane_id: None,
+                        lane_seq: None,
+                        kind: "tool_call_result".to_string(),
+                        status: "completed".to_string(),
+                        source: "session".to_string(),
+                        title: Some(tool_name.to_string()),
+                        content: None,
+                        task_id: None,
+                        worker_id: None,
+                        role_id: None,
+                        tool_call_id: Some(call_id.to_string()),
+                        tool_name: Some(tool_name.to_string()),
+                        tool_status: Some("completed".to_string()),
+                        tool_arguments: Some(arguments.to_string()),
+                        tool_result: Some(result.to_string()),
+                        tool_error: None,
+                        request_id: None,
+                        user_message_id: None,
+                        placeholder_message_id: None,
+                        timeline_entry_id: None,
+                        thread_visible: true,
+                        worker_visible: false,
+                    }],
+                    worker_lanes: Vec::new(),
+                },
+            )
+            .expect("canonical file tool turn should upsert");
+    }
+
     #[tokio::test]
     async fn lan_access_uses_current_daemon_port() {
         let state =
@@ -899,6 +984,71 @@ mod tests {
         assert!(
             after.is_empty(),
             "approved files should disappear from pending changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn revert_all_changes_removes_plain_session_canonical_file_change() {
+        let repo_root = build_test_repo();
+        let session_id = SessionId::new("session-plain-canonical-revert");
+        let workspace_id = WorkspaceId::new("workspace-plain-canonical-revert");
+        let state = build_state_with_plain_session_repo(
+            &repo_root,
+            session_id.clone(),
+            workspace_id.clone(),
+        );
+        fs::create_dir_all(Path::new(&repo_root).join("tmp")).expect("tmp dir should create");
+        fs::write(
+            Path::new(&repo_root).join("tmp/plain-session-new.txt"),
+            "new file\n",
+        )
+        .expect("untracked file should write");
+        upsert_plain_session_file_tool_turn(
+            &state,
+            &session_id,
+            "file_write",
+            "call-plain-session-write",
+            serde_json::json!({
+                "path": Path::new(&repo_root).join("tmp/plain-session-new.txt").to_string_lossy().to_string(),
+                "content": "new file\n",
+            }),
+            serde_json::json!({
+                "tool": "file_write",
+                "status": "succeeded",
+                "path": Path::new(&repo_root).join("tmp/plain-session-new.txt").to_string_lossy().to_string(),
+            }),
+        );
+
+        let before =
+            collect_session_pending_changes(&state, &session_id, Some(workspace_id.as_str()))
+                .expect("plain session canonical file change should collect");
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].file_path, "tmp/plain-session-new.txt");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/changes/revert-all")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sessionId": session_id.as_str(),
+                            "workspaceId": workspace_id.as_str()
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !Path::new(&repo_root)
+                .join("tmp/plain-session-new.txt")
+                .exists()
         );
     }
 
