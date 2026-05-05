@@ -1,8 +1,9 @@
 use super::*;
 use crate::models::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
-    ActiveExecutionTurn, ActiveExecutionTurnItem, SessionExecutionSidecarStatus,
-    SessionSidecarFlushReason, SessionStoreState,
+    ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurnItemKind, CanonicalTurnStatus,
+    SessionDurableState, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
+    SessionRecord, SessionRuntimeSidecar, SessionSidecarFlushReason, SessionStoreState,
 };
 use magi_core::{
     ExecutionOwnership, MissionId, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskId,
@@ -742,6 +743,120 @@ fn current_turn_writes_update_durable_canonical_turn_log() {
         crate::models::CanonicalTurnItemKind::AssistantText
     );
     assert_eq!(turn.items[0].content.as_deref(), Some("持久回复"));
+}
+
+#[test]
+fn persisted_parts_restores_canonical_turn_log_from_sidecar_current_turn() {
+    let session_id = SessionId::new("session-sidecar-canonical-restore");
+    let worker_id = WorkerId::new("worker-sidecar-canonical-restore");
+    let task_id = TaskId::new("task-sidecar-canonical-restore");
+    let accepted_at = UtcMillis(100);
+    let mut turn = test_turn("turn-sidecar-canonical-restore", "blocked", accepted_at.0);
+
+    let mut user_item = test_turn_item("turn-item-user", "请分析当前项目");
+    user_item.item_seq = 1;
+    user_item.user_message_id = Some("msg-sidecar-canonical-restore".to_string());
+    turn.items.push(user_item);
+
+    let mut worker_item = test_turn_item("turn-item-worker-status", "正在分析任务系统");
+    worker_item.item_seq = 2;
+    worker_item.kind = "worker_status".to_string();
+    worker_item.status = "running".to_string();
+    worker_item.source = "worker".to_string();
+    worker_item.task_id = Some(task_id.clone());
+    worker_item.worker_id = Some(worker_id.clone());
+    worker_item.role_id = Some("integration-engineer".to_string());
+    worker_item.thread_visible = false;
+    worker_item.worker_visible = true;
+    turn.items.push(worker_item);
+
+    let durable_state = SessionDurableState {
+        current_session_id: Some(session_id.clone()),
+        sessions: vec![SessionRecord {
+            session_id: session_id.clone(),
+            title: "Sidecar Canonical Restore".to_string(),
+            status: SessionLifecycleStatus::Active,
+            created_at: accepted_at,
+            updated_at: accepted_at,
+            message_count: Some(1),
+            workspace_id: Some("workspace-sidecar-canonical-restore".to_string()),
+        }],
+        timeline: Vec::new(),
+        canonical_turns: Vec::new(),
+        notifications: Vec::new(),
+    };
+    let sidecar_store = SessionExecutionSidecarStoreState {
+        runtime_sidecars: vec![SessionRuntimeSidecar {
+            session_id: session_id.clone(),
+            ownership: ExecutionOwnership {
+                session_id: Some(session_id.clone()),
+                task_id: Some(task_id),
+                worker_id: Some(worker_id.clone()),
+                execution_chain_ref: Some("chain-sidecar-canonical-restore".to_string()),
+                ..ExecutionOwnership::default()
+            },
+            recovery_id: None,
+            current_turn: Some(turn),
+            active_execution_chain: None,
+            status: SessionExecutionSidecarStatus::Bound,
+            updated_at: accepted_at,
+        }],
+    };
+
+    let restored = SessionStore::from_persisted_parts(durable_state, sidecar_store);
+    let turns = restored.canonical_turns_for_session(&session_id);
+    assert_eq!(turns.len(), 1);
+    let restored_turn = &turns[0];
+    assert_eq!(restored_turn.status, CanonicalTurnStatus::Running);
+    assert_eq!(restored_turn.items.len(), 2);
+    assert_eq!(
+        restored_turn.items[0].kind,
+        CanonicalTurnItemKind::UserMessage
+    );
+    assert_eq!(
+        restored_turn.items[1].kind,
+        CanonicalTurnItemKind::WorkerStatus
+    );
+    assert_eq!(
+        restored_turn.items[1].visibility.worker_tab_ids,
+        vec![worker_id.to_string()]
+    );
+    assert_eq!(
+        restored.durable_state().canonical_turns[0].turn_id,
+        "turn-sidecar-canonical-restore"
+    );
+}
+
+#[test]
+fn persisted_parts_keep_durable_terminal_turn_over_stale_sidecar_running_turn() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-sidecar-terminal-wins");
+    store
+        .create_session(session_id.clone(), "Sidecar Terminal Wins")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            test_turn("turn-terminal-wins", "running", 10),
+        )
+        .expect("turn should upsert");
+    store
+        .update_current_turn_status(&session_id, "completed")
+        .expect("turn should complete");
+
+    let durable_state = store.durable_state();
+    let mut sidecar_store = store.execution_sidecar_store_state();
+    let stale_turn = sidecar_store.runtime_sidecars[0]
+        .current_turn
+        .as_mut()
+        .expect("sidecar current turn should exist");
+    stale_turn.status = "running".to_string();
+    stale_turn.completed_at = None;
+
+    let restored = SessionStore::from_persisted_parts(durable_state, sidecar_store);
+    let turns = restored.canonical_turns_for_session(&session_id);
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].status, CanonicalTurnStatus::Completed);
 }
 
 #[test]

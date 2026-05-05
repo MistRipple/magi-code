@@ -22,8 +22,8 @@ use magi_core::{
 use magi_event_bus::{EventEnvelope, InMemoryEventBus, RuntimeLedgerSummary};
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
-    SessionExecutionSidecarStatus, SessionSidecarFlushMetadata, SessionSidecarFlushReason,
-    SessionStore,
+    ActiveExecutionTurn, ActiveExecutionTurnItem, SessionExecutionSidecarStatus,
+    SessionSidecarFlushMetadata, SessionSidecarFlushReason, SessionStore,
 };
 use magi_worker_runtime::{WorkerExecutionBindingLifecycle, WorkerRuntime, WorkerStage};
 use magi_workspace::{
@@ -38,6 +38,10 @@ fn temp_state_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("magi-daemon-test-{name}-{}", UtcMillis::now().0));
     fs::create_dir_all(&root).expect("temp state root should be creatable");
     root
+}
+
+fn temp_workspace_absolute_path(name: &str) -> AbsolutePath {
+    AbsolutePath::new(temp_state_root(name).to_string_lossy().to_string())
 }
 
 fn test_sidecar_persistence(
@@ -372,7 +376,7 @@ fn runtime_sidecar_flush_hook_only_persists_dirty_sidecars() {
     workspace_store
         .register(
             WorkspaceId::new("workspace-flush"),
-            AbsolutePath::new("/Users/xie/code/magi"),
+            temp_workspace_absolute_path("runtime-sidecar-flush-workspace"),
         )
         .expect("workspace should be registrable");
 
@@ -434,6 +438,93 @@ fn runtime_sidecar_flush_hook_only_persists_dirty_sidecars() {
             .expect("clean sidecar flush should be skipped"),
         RuntimeSidecarFlushReport::default()
     );
+}
+
+#[test]
+fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
+    let state_root = temp_state_root("runtime-sidecar-flush-canonical");
+    let workspace_root = temp_state_root("runtime-sidecar-flush-canonical-workspace");
+    let repository = ShadowStateRepository::new(state_root);
+    let session_store = Arc::new(SessionStore::new());
+    let workspace_store = Arc::new(WorkspaceStore::new());
+    let persistence = test_sidecar_persistence(
+        repository.clone(),
+        session_store.clone(),
+        workspace_store.clone(),
+    );
+    let session_id = SessionId::new("session-flush-canonical");
+    let workspace_id = WorkspaceId::new("workspace-flush-canonical");
+
+    workspace_store
+        .register(
+            workspace_id.clone(),
+            AbsolutePath::new(workspace_root.to_string_lossy().to_string()),
+        )
+        .expect("workspace should be registrable");
+    session_store
+        .create_session_for_workspace(
+            session_id.clone(),
+            "flush canonical session",
+            Some(workspace_id.to_string()),
+        )
+        .expect("workspace session should be creatable");
+    session_store
+        .upsert_current_turn(
+            session_id.clone(),
+            ActiveExecutionTurn {
+                turn_id: "turn-flush-canonical".to_string(),
+                turn_seq: 10,
+                accepted_at: UtcMillis(10),
+                completed_at: None,
+                status: "running".to_string(),
+                user_message: Some("关闭前端后继续执行".to_string()),
+                items: vec![ActiveExecutionTurnItem {
+                    item_id: "turn-item-flush-canonical-assistant".to_string(),
+                    item_seq: 1,
+                    lane_id: None,
+                    lane_seq: None,
+                    kind: "assistant_stream".to_string(),
+                    status: "running".to_string(),
+                    source: "orchestrator".to_string(),
+                    title: Some("最终回复".to_string()),
+                    content: Some("后台仍在生成".to_string()),
+                    task_id: None,
+                    worker_id: None,
+                    role_id: None,
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_status: None,
+                    tool_arguments: None,
+                    tool_result: None,
+                    tool_error: None,
+                    request_id: Some("req-flush-canonical".to_string()),
+                    user_message_id: Some("msg-flush-canonical".to_string()),
+                    placeholder_message_id: Some(
+                        "assistant-placeholder-flush-canonical".to_string(),
+                    ),
+                    timeline_entry_id: None,
+                    thread_visible: true,
+                    worker_visible: false,
+                }],
+                worker_lanes: Vec::new(),
+            },
+        )
+        .expect("current turn should upsert");
+
+    let report = persistence
+        .flush_runtime_sidecars()
+        .expect("sidecar flush should also persist canonical turns");
+    assert!(report.session_sidecars_flushed);
+
+    let workspace_sessions = repository
+        .load_workspace_session_state(&workspace_root)
+        .expect("workspace sessions should reload");
+    assert_eq!(workspace_sessions.canonical_turns.len(), 1);
+    assert_eq!(
+        workspace_sessions.canonical_turns[0].turn_id,
+        "turn-flush-canonical"
+    );
+    assert_eq!(workspace_sessions.canonical_turns[0].items.len(), 1);
 }
 
 #[test]
@@ -573,7 +664,7 @@ fn recovery_consume_updates_sidecars_can_be_flushed_incrementally() {
     workspace_store
         .register(
             workspace_id.clone(),
-            AbsolutePath::new("/Users/xie/code/magi"),
+            temp_workspace_absolute_path("recovery-sidecar-incremental-workspace"),
         )
         .expect("workspace should be registrable");
 
@@ -689,7 +780,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         .workspace_registry
         .register(
             workspace_id.clone(),
-            AbsolutePath::new("/Users/xie/code/magi-router-recovery"),
+            temp_workspace_absolute_path("router-recovery-workspace"),
         )
         .expect("workspace should be registrable");
     state.session_store.bind_execution_ownership(
@@ -1255,7 +1346,7 @@ fn runtime_maintenance_tick_can_refresh_ledger_and_flush_due_sidecars() {
     workspace_store
         .register(
             WorkspaceId::new("workspace-maintenance"),
-            AbsolutePath::new("/Users/xie/code/magi"),
+            temp_workspace_absolute_path("runtime-maintenance-workspace"),
         )
         .expect("workspace should be registrable");
     session_store.bind_execution_ownership(
@@ -1345,7 +1436,7 @@ fn runtime_maintenance_policy_can_skip_disabled_actions() {
     workspace_store
         .register(
             WorkspaceId::new("workspace-disabled"),
-            AbsolutePath::new("/Users/xie/code/magi"),
+            temp_workspace_absolute_path("runtime-sidecar-disabled-workspace"),
         )
         .expect("workspace should be registrable");
     session_store.bind_execution_ownership(
@@ -1557,6 +1648,7 @@ fn persistence_long_chain_boot_mutate_flush_restart_verifies_sidecar_integrity()
     // T-106: Full long-chain validation —
     //   boot → populate → mutate → flush → RESTART (new store instances) → verify integrity
     let state_root = temp_state_root("persistence-long-chain");
+    let workspace_root = temp_state_root("persistence-long-chain-workspace");
     let repository = ShadowStateRepository::new(state_root.clone());
 
     let session_id = SessionId::new("session-lc");
@@ -1578,7 +1670,7 @@ fn persistence_long_chain_boot_mutate_flush_restart_verifies_sidecar_integrity()
     workspace_store
         .register(
             workspace_id.clone(),
-            AbsolutePath::new("/Users/xie/code/magi"),
+            AbsolutePath::new(workspace_root.to_string_lossy().to_string()),
         )
         .expect("workspace should be registrable");
 
@@ -1661,7 +1753,7 @@ fn persistence_long_chain_boot_mutate_flush_restart_verifies_sidecar_integrity()
 
     let restarted_session_store = Arc::new(SessionStore::from_persisted_parts(
         repository
-            .load_session_durable_state()
+            .load_sessions_from_workspaces(&[(workspace_id.to_string(), workspace_root.clone())])
             .expect("session durable state should reload"),
         repository
             .load_session_sidecars()
@@ -1747,6 +1839,7 @@ fn persistence_long_chain_restart_mutate_flush_validates_incremental_across_boun
     // T-106: Second half — verify that mutations AFTER restart produce correct dirty
     //   tracking and flush correctly on the restarted instances.
     let state_root = temp_state_root("persistence-cross-boundary");
+    let workspace_root = temp_state_root("persistence-cross-boundary-workspace");
     let repository = ShadowStateRepository::new(state_root.clone());
 
     let session_id = SessionId::new("session-cb");
@@ -1768,7 +1861,7 @@ fn persistence_long_chain_restart_mutate_flush_validates_incremental_across_boun
         workspace_store
             .register(
                 workspace_id.clone(),
-                AbsolutePath::new("/Users/xie/code/magi"),
+                AbsolutePath::new(workspace_root.to_string_lossy().to_string()),
             )
             .expect("workspace should be registrable");
 
@@ -1803,7 +1896,9 @@ fn persistence_long_chain_restart_mutate_flush_validates_incremental_across_boun
 
     // ── Phase 2: Restart and mutate ──
     let session_store_2 = Arc::new(SessionStore::from_persisted_parts(
-        repository.load_session_durable_state().expect("load"),
+        repository
+            .load_sessions_from_workspaces(&[(workspace_id.to_string(), workspace_root.clone())])
+            .expect("load"),
         repository.load_session_sidecars().expect("load"),
     ));
     let workspace_store_2 = Arc::new(WorkspaceStore::from_persisted_parts(
@@ -1869,7 +1964,9 @@ fn persistence_long_chain_restart_mutate_flush_validates_incremental_across_boun
     drop(workspace_store_2);
 
     let session_store_3 = SessionStore::from_persisted_parts(
-        repository.load_session_durable_state().expect("load"),
+        repository
+            .load_sessions_from_workspaces(&[(workspace_id.to_string(), workspace_root.clone())])
+            .expect("load"),
         repository.load_session_sidecars().expect("load"),
     );
     let workspace_store_3 = WorkspaceStore::from_persisted_parts(
@@ -1912,6 +2009,7 @@ fn persistence_long_chain_maintenance_tick_drives_full_restart_recovery_cycle() 
     //   (not just manual flush) correctly persists all state, and a restart from
     //   that persisted state is fully self-consistent.
     let state_root = temp_state_root("persistence-maintenance-long-chain");
+    let workspace_root = temp_state_root("maintenance-long-chain-workspace");
     let repository = ShadowStateRepository::new(state_root.clone());
     let event_bus = Arc::new(InMemoryEventBus::new(32));
 
@@ -1934,7 +2032,7 @@ fn persistence_long_chain_maintenance_tick_drives_full_restart_recovery_cycle() 
     workspace_store
         .register(
             workspace_id.clone(),
-            AbsolutePath::new("/Users/xie/code/magi"),
+            AbsolutePath::new(workspace_root.to_string_lossy().to_string()),
         )
         .expect("workspace should be registrable");
 
@@ -2008,7 +2106,9 @@ fn persistence_long_chain_maintenance_tick_drives_full_restart_recovery_cycle() 
     drop(workspace_store);
 
     let restarted_session = Arc::new(SessionStore::from_persisted_parts(
-        repository.load_session_durable_state().expect("load"),
+        repository
+            .load_sessions_from_workspaces(&[(workspace_id.to_string(), workspace_root.clone())])
+            .expect("load"),
         repository.load_session_sidecars().expect("load"),
     ));
     let restarted_workspace = Arc::new(WorkspaceStore::from_persisted_parts(
@@ -2070,7 +2170,7 @@ fn graceful_shutdown_marks_runtime_status_complete_after_final_tick() {
     workspace_store
         .register(
             WorkspaceId::new("workspace-shutdown"),
-            AbsolutePath::new("/Users/xie/code/magi"),
+            temp_workspace_absolute_path("runtime-shutdown-workspace"),
         )
         .expect("workspace should be registrable");
     session_store.bind_execution_ownership(

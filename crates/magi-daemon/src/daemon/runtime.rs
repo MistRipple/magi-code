@@ -675,10 +675,13 @@ impl ShadowDaemonRuntime {
         }
 
         let repository = ShadowStateRepository::new(self.state_root.clone());
-        if let Err(error) = self
-            .session_store
-            .flush_execution_sidecars_with(|state| repository.save_session_sidecars(state))
-        {
+        let persistence = ShadowRuntimeSidecarPersistence::new(
+            repository,
+            self.session_store.clone(),
+            self.workspace_store.clone(),
+            self.worker_runtime.clone(),
+        );
+        if let Err(error) = persistence.flush_runtime_sidecars() {
             warn!(?error, "清理失效 session task chain 后持久化 sidecar 失败");
         }
         warn!(

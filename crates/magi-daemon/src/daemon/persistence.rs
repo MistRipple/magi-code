@@ -340,6 +340,36 @@ impl ShadowRuntimeSidecarPersistence {
         self.worker_runtime.durable_snapshot_dirty()
     }
 
+    fn save_session_durable_state(&self) -> Result<(), DaemonError> {
+        let durable = self.session_store.durable_state();
+        let (mut global_state, mut workspace_states) = durable.partition_by_workspace();
+        for workspace in self.workspace_store.workspaces() {
+            let workspace_id = workspace.workspace_id.to_string();
+            let workspace_state = workspace_states.remove(&workspace_id).unwrap_or_default();
+            self.state_repository.save_workspace_session_state(
+                Path::new(workspace.root_path.as_str()),
+                &workspace_state,
+            )?;
+        }
+
+        for (_, orphan_state) in workspace_states {
+            global_state.append_state(orphan_state);
+        }
+
+        let global_path = self.state_repository.session_durable_state_path();
+        if global_state.is_empty() {
+            match fs::remove_file(&global_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            self.state_repository
+                .save_session_durable_state(&global_state)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn flush_runtime_sidecars(&self) -> Result<RuntimeSidecarFlushReport, DaemonError> {
         let worker_runtime_snapshot_flushed =
             self.worker_runtime
@@ -348,7 +378,8 @@ impl ShadowRuntimeSidecarPersistence {
                 })?;
         let session_sidecars_flushed =
             self.session_store.flush_execution_sidecars_with(|state| {
-                self.state_repository.save_session_sidecars(state)
+                self.state_repository.save_session_sidecars(state)?;
+                self.save_session_durable_state()
             })?;
         let workspace_recovery_sidecars_flushed =
             self.workspace_store.flush_recovery_sidecars_with(|state| {

@@ -87,10 +87,11 @@ impl SessionStore {
         durable_state: SessionDurableState,
         execution_sidecar_store: SessionExecutionSidecarStoreState,
     ) -> Self {
-        Self::from_state(SessionStoreState::from_persisted_parts(
-            durable_state,
-            execution_sidecar_store,
-        ))
+        let mut state =
+            SessionStoreState::from_persisted_parts(durable_state, execution_sidecar_store);
+        sidecar::restore_canonical_turns_from_sidecars(&mut state)
+            .expect("persisted sidecar current turn should be canonical-compatible");
+        Self::from_state(state)
     }
 
     fn mark_sidecar_dirty(&self, reason: SessionSidecarFlushReason) {

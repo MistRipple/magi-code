@@ -11,7 +11,7 @@ use magi_core::{
     TaskExecutionTarget, TaskId, UtcMillis, WorkerId,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 fn inherit_current_turn_aliases(turn: &ActiveExecutionTurn, item: &mut ActiveExecutionTurnItem) {
     let Some(alias_source) = turn.items.iter().find(|existing| {
@@ -322,6 +322,48 @@ fn upsert_canonical_turn_in_state(
     Ok(())
 }
 
+fn durable_terminal_turn_exists(
+    state: &SessionStoreState,
+    session_id: &SessionId,
+    turn: &ActiveExecutionTurn,
+) -> bool {
+    state.canonical_turns.iter().any(|existing| {
+        existing.session_id == *session_id
+            && existing.turn_id == turn.turn_id
+            && existing.status.is_terminal()
+    })
+}
+
+pub(super) fn restore_canonical_turns_from_sidecars(
+    state: &mut SessionStoreState,
+) -> DomainResult<()> {
+    let mut seen = HashSet::<(SessionId, String)>::new();
+    let mut turns = Vec::<(SessionId, ActiveExecutionTurn)>::new();
+    for sidecar in &state.execution_sidecar_store.runtime_sidecars {
+        if let Some(turn) = sidecar.current_turn.clone()
+            && seen.insert((sidecar.session_id.clone(), turn.turn_id.clone()))
+        {
+            turns.push((sidecar.session_id.clone(), turn));
+        }
+        if let Some(turn) = sidecar
+            .active_execution_chain
+            .as_ref()
+            .and_then(|chain| chain.current_turn.clone())
+            && seen.insert((sidecar.session_id.clone(), turn.turn_id.clone()))
+        {
+            turns.push((sidecar.session_id.clone(), turn));
+        }
+    }
+
+    for (session_id, turn) in turns {
+        if durable_terminal_turn_exists(state, &session_id, &turn) {
+            continue;
+        }
+        upsert_canonical_turn_in_state(state, &session_id, &turn)?;
+    }
+    Ok(())
+}
+
 fn reject_changed_current_turn_item_field(
     item_id: &str,
     field: &'static str,
@@ -523,6 +565,10 @@ impl SessionStore {
             .state
             .write()
             .expect("session state write lock poisoned");
+        if let Some(turn) = sidecar.current_turn.as_ref() {
+            upsert_canonical_turn_in_state(&mut state, &sidecar.session_id, turn)
+                .expect("runtime sidecar current turn should be canonical-compatible");
+        }
         state
             .execution_sidecar_store
             .upsert_runtime_sidecar(sidecar);
