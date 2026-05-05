@@ -24,27 +24,22 @@
   }
 
   interface StageViewModel {
+    key: string;
     laneId: string;
+    displayIndex: number;
     title: string;
     status: WorkerLaneStatus;
-    isCurrent: boolean;
-  }
-
-  interface WorkerGroupViewModel {
-    key: string;
-    tabId: string;
-    displayName: string;
-    color: string;
-    muted: string;
-    icon: IconName;
-    status: WorkerLaneStatus;
-    stages: StageViewModel[];
-    totalCount: number;
-    completedCount: number;
-    currentTitle: string;
+    workerTabId: string;
+    workerDisplayName: string;
+    workerColor: string;
+    workerMuted: string;
+    workerIcon: IconName;
     summary: string;
+    currentTaskTitle: string;
     toolUseCount: number;
     fileChangeCount: number;
+    totalTaskCount: number;
+    completedCount: number;
     isClickable: boolean;
   }
 
@@ -56,7 +51,10 @@
     Array.isArray(block.lanes)
       ? block.lanes.filter((lane): lane is DispatchGroupLane => Boolean(
         lane && typeof lane === 'object' && typeof lane.laneId === 'string',
-      ))
+      )).map((lane, index) => ({ lane, index }))
+        .sort((left, right) => resolveLaneOrder(left.lane, left.index) - resolveLaneOrder(right.lane, right.index)
+          || left.lane.laneId.localeCompare(right.lane.laneId))
+        .map((entry) => entry.lane)
       : []
   ));
 
@@ -135,24 +133,49 @@
       || i18n.t('dispatchGroupCard.stageFallback');
   }
 
-  function resolveLaneStages(lane: DispatchGroupLane): StageViewModel[] {
-    const laneStatus = normalizeStatus(lane.status);
-    if (Array.isArray(lane.tasks) && lane.tasks.length > 0) {
-      return lane.tasks
-        .map((task, index) => ({
-          laneId: `${lane.laneId}:${task.taskId || index}`,
-          title: normalizeText(task.title) || resolveLaneTitle(lane),
-          status: normalizeStatus(task.status || laneStatus),
-          isCurrent: Boolean(task.isCurrent),
-        }))
-        .filter((task) => task.title.length > 0);
+  function resolveLaneOrder(lane: DispatchGroupLane, fallback: number): number {
+    const taskSeq = Array.isArray(lane.tasks)
+      ? lane.tasks.find((task) => typeof task.seq === 'number' && Number.isFinite(task.seq))?.seq
+      : undefined;
+    if (typeof taskSeq === 'number' && Number.isFinite(taskSeq)) {
+      return taskSeq;
     }
-    return [{
-      laneId: lane.laneId,
-      title: resolveLaneTitle(lane),
-      status: laneStatus,
-      isCurrent: laneStatus === 'running' || laneStatus === 'pending',
-    }];
+    if (typeof lane.laneVersion === 'number' && Number.isFinite(lane.laneVersion)) {
+      return lane.laneVersion;
+    }
+    return fallback;
+  }
+
+  function resolvePositiveCount(value: unknown, fallback = 0): number {
+    return typeof value === 'number' && Number.isFinite(value) && value > 0
+      ? Math.floor(value)
+      : fallback;
+  }
+
+  function resolveLaneCurrentTaskTitle(lane: DispatchGroupLane): string {
+    const laneStatus = normalizeStatus(lane.status);
+    const laneTitle = resolveLaneTitle(lane);
+    const task = Array.isArray(lane.tasks)
+      ? lane.tasks.find((item) => item.isCurrent)
+        || lane.tasks.find((item) => normalizeStatus(item.status || laneStatus) === 'running')
+        || lane.tasks.find((item) => normalizeStatus(item.status || laneStatus) === 'pending')
+      : undefined;
+    const title = normalizeText(task?.title);
+    return title && title !== laneTitle ? title : '';
+  }
+
+  function resolveLaneTaskCounts(lane: DispatchGroupLane, laneStatus: WorkerLaneStatus) {
+    const taskCount = Array.isArray(lane.tasks) ? lane.tasks.length : 0;
+    const totalTaskCount = resolvePositiveCount(lane.progressSummary?.totalTaskCount, Math.max(taskCount, 1));
+    const completedFromSummary = resolvePositiveCount(lane.progressSummary?.completedTaskCount);
+    if (completedFromSummary > 0) {
+      return { totalTaskCount, completedCount: Math.min(completedFromSummary, totalTaskCount) };
+    }
+    if (taskCount > 0) {
+      const completedCount = lane.tasks!.filter((task) => normalizeStatus(task.status || laneStatus) === 'completed').length;
+      return { totalTaskCount, completedCount };
+    }
+    return { totalTaskCount, completedCount: laneStatus === 'completed' ? totalTaskCount : 0 };
   }
 
   function compactSummary(value: string): string {
@@ -163,65 +186,45 @@
     return firstLine.length > 140 ? `${firstLine.slice(0, 137)}...` : firstLine;
   }
 
-  const workerGroups = $derived.by<WorkerGroupViewModel[]>(() => {
-    const grouped = new Map<string, WorkerGroupViewModel>();
-    for (const lane of lanes) {
+  const stages = $derived.by<StageViewModel[]>(() => (
+    lanes.map((lane, index) => {
       const workerId = resolveLaneWorkerId(lane);
       const { tabId, displayName, visualInfo } = resolveWorkerMeta(workerId);
-      const key = tabId || workerId;
       const laneStatus = normalizeStatus(lane.status);
-      const stages = resolveLaneStages(lane);
-      const existing = grouped.get(key);
-      const group: WorkerGroupViewModel = existing || {
-        key,
-        tabId: key,
-        displayName,
-        color: visualInfo.color,
-        muted: visualInfo.muted,
-        icon: visualInfo.icon,
+      const { totalTaskCount, completedCount } = resolveLaneTaskCounts(lane, laneStatus);
+      const workerTabId = tabId || workerId;
+      return {
+        key: lane.laneId,
+        laneId: lane.laneId,
+        displayIndex: index + 1,
+        title: resolveLaneTitle(lane),
         status: laneStatus,
-        stages: [],
-        totalCount: 0,
-        completedCount: 0,
-        currentTitle: '',
-        summary: '',
-        toolUseCount: 0,
-        fileChangeCount: 0,
-        isClickable: key !== 'orchestrator',
+        workerTabId,
+        workerDisplayName: displayName,
+        workerColor: visualInfo.color,
+        workerMuted: visualInfo.muted,
+        workerIcon: visualInfo.icon,
+        summary: compactSummary(normalizeText(lane.summary) || normalizeText(lane.liveActivity)),
+        currentTaskTitle: resolveLaneCurrentTaskTitle(lane),
+        toolUseCount: resolvePositiveCount(lane.toolUseCount),
+        fileChangeCount: resolvePositiveCount(lane.fileChangeCount),
+        totalTaskCount,
+        completedCount,
+        isClickable: workerTabId !== 'orchestrator',
       };
+    })
+  ));
 
-      group.status = existing ? mergeLaneStatus(group.status, laneStatus) : laneStatus;
-      group.stages.push(...stages);
-      group.totalCount = group.stages.length;
-      group.completedCount = group.stages.filter((stage) => stage.status === 'completed').length;
-      const currentStage = group.stages.find((stage) => stage.isCurrent)
-        || group.stages.find((stage) => stage.status === 'running' || stage.status === 'pending')
-        || group.stages[group.stages.length - 1];
-      group.currentTitle = normalizeText(currentStage?.title);
-      const laneSummary = compactSummary(normalizeText(lane.summary));
-      if (laneSummary) {
-        group.summary = laneSummary;
-      }
-      if (typeof lane.toolUseCount === 'number' && Number.isFinite(lane.toolUseCount) && lane.toolUseCount > 0) {
-        group.toolUseCount += Math.floor(lane.toolUseCount);
-      }
-      if (typeof lane.fileChangeCount === 'number' && Number.isFinite(lane.fileChangeCount) && lane.fileChangeCount > 0) {
-        group.fileChangeCount += Math.floor(lane.fileChangeCount);
-      }
-      grouped.set(key, group);
-    }
-    return Array.from(grouped.values());
-  });
-
-  const totalStageCount = $derived.by(() => workerGroups.reduce((total, group) => total + group.totalCount, 0));
-  const completedStageCount = $derived.by(() => workerGroups.reduce((total, group) => total + group.completedCount, 0));
-  const groupStatus = $derived.by(() => workerGroups.reduce<WorkerLaneStatus>(
-    (status, group) => mergeLaneStatus(status, group.status),
-    workerGroups.length > 0 ? 'completed' : 'pending',
+  const totalStageCount = $derived.by(() => stages.length);
+  const completedStageCount = $derived.by(() => stages.filter((stage) => stage.status === 'completed').length);
+  const workerCount = $derived.by(() => new Set(stages.map((stage) => stage.workerTabId).filter(Boolean)).size);
+  const groupStatus = $derived.by(() => stages.reduce<WorkerLaneStatus>(
+    (status, stage) => mergeLaneStatus(status, stage.status),
+    stages.length > 0 ? 'completed' : 'pending',
   ));
   const groupStatusConfig = $derived.by(() => resolveStatusConfig(groupStatus));
   const groupSummary = $derived.by(() => i18n.t('dispatchGroupCard.summary', {
-    workerCount: workerGroups.length,
+    workerCount,
     laneCount: totalStageCount,
   }));
 
@@ -257,59 +260,56 @@
         </div>
       </div>
 
-      <div class="dispatch-group-card__workers">
-        {#each workerGroups as group (group.key)}
-          {@const statusConfig = resolveStatusConfig(group.status)}
+      <div class="dispatch-group-card__stages">
+        {#each stages as stage (stage.key)}
+          {@const statusConfig = resolveStatusConfig(stage.status)}
           <button
             type="button"
-            class="dispatch-group-card__worker-row"
-            class:is-clickable={group.isClickable && !readOnly}
-            style={`--worker-color:${group.color};--worker-muted:${group.muted};`}
-            disabled={readOnly || !group.isClickable}
-            onclick={() => openWorkerTab(group.tabId)}
-            aria-label={group.isClickable ? i18n.t('subTaskSummaryCard.clickToView', { workerLabel: group.displayName }) : undefined}
+            class="dispatch-group-card__stage-row"
+            class:is-clickable={stage.isClickable && !readOnly}
+            style={`--worker-color:${stage.workerColor};--worker-muted:${stage.workerMuted};`}
+            disabled={readOnly || !stage.isClickable}
+            onclick={() => openWorkerTab(stage.workerTabId)}
+            aria-label={stage.isClickable ? i18n.t('subTaskSummaryCard.clickToView', { workerLabel: stage.workerDisplayName }) : undefined}
           >
-            <span class="dispatch-group-card__worker-icon">
-              <Icon name={group.icon} size={13} />
+            <span class={`dispatch-group-card__stage-index dispatch-group-card__stage-index--${statusConfig.tone}`}>
+              {stage.displayIndex}
             </span>
-            <span class="dispatch-group-card__worker-main">
-              <span class="dispatch-group-card__worker-topline">
-                <span class="dispatch-group-card__worker-name">{group.displayName}</span>
+            <span class="dispatch-group-card__stage-main">
+              <span class="dispatch-group-card__stage-topline">
+                <span class="dispatch-group-card__stage-title">{stage.title}</span>
                 <span class={`dispatch-group-card__mini-status dispatch-group-card__mini-status--${statusConfig.tone}`}>
                   <Icon name={statusConfig.icon} size={11} />
                   <span>{i18n.t(statusConfig.key)}</span>
                 </span>
               </span>
-              {#if group.currentTitle}
-                <span class="dispatch-group-card__current">{group.currentTitle}</span>
+              {#if stage.summary}
+                <span class="dispatch-group-card__summary">{stage.summary}</span>
+              {:else if stage.currentTaskTitle}
+                <span class="dispatch-group-card__current">
+                  {i18n.t('subTaskSummaryCard.currentTask')} {stage.currentTaskTitle}
+                </span>
               {/if}
-              {#if group.summary}
-                <span class="dispatch-group-card__summary">{group.summary}</span>
-              {/if}
-              <span class="dispatch-group-card__stage-list" aria-hidden="true">
-                {#each group.stages.slice(0, 5) as stage (stage.laneId)}
-                  {@const stageStatusConfig = resolveStatusConfig(stage.status)}
-                  <span class={`dispatch-group-card__stage dispatch-group-card__stage--${stageStatusConfig.tone}`}>
-                    <Icon name={stageStatusConfig.icon} size={10} />
-                    <span>{stage.title}</span>
-                  </span>
-                {/each}
-                {#if group.stages.length > 5}
-                  <span class="dispatch-group-card__stage dispatch-group-card__stage--pending">
-                    {i18n.t('dispatchGroupCard.moreStages', { count: group.stages.length - 5 })}
-                  </span>
-                {/if}
+              <span class="dispatch-group-card__owner">
+                <span class="dispatch-group-card__owner-icon">
+                  <Icon name={stage.workerIcon} size={11} />
+                </span>
+                <span>{i18n.t('dispatchGroupCard.owner', { workerLabel: stage.workerDisplayName })}</span>
               </span>
             </span>
-            <span class="dispatch-group-card__worker-metrics">
-              <span>{i18n.t('subTaskSummaryCard.laneProgress', { current: group.completedCount || Math.min(1, group.totalCount), total: group.totalCount })}</span>
-              {#if group.toolUseCount > 0}
-                <span>{i18n.t('subTaskSummaryCard.toolCallCount', { count: group.toolUseCount })}</span>
-              {/if}
-              {#if group.fileChangeCount > 0}
-                <span>{i18n.t('subTaskSummaryCard.fileChangeCount', { count: group.fileChangeCount })}</span>
-              {/if}
-            </span>
+            {#if stage.totalTaskCount > 1 || stage.toolUseCount > 0 || stage.fileChangeCount > 0}
+              <span class="dispatch-group-card__stage-metrics">
+                {#if stage.totalTaskCount > 1}
+                  <span>{i18n.t('subTaskSummaryCard.laneProgress', { current: stage.completedCount, total: stage.totalTaskCount })}</span>
+                {/if}
+                {#if stage.toolUseCount > 0}
+                  <span>{i18n.t('subTaskSummaryCard.toolCallCount', { count: stage.toolUseCount })}</span>
+                {/if}
+                {#if stage.fileChangeCount > 0}
+                  <span>{i18n.t('subTaskSummaryCard.fileChangeCount', { count: stage.fileChangeCount })}</span>
+                {/if}
+              </span>
+            {/if}
           </button>
         {/each}
       </div>
@@ -355,8 +355,7 @@
     gap: var(--space-3);
   }
 
-  .dispatch-group-card__icon,
-  .dispatch-group-card__worker-icon {
+  .dispatch-group-card__icon {
     width: 24px;
     height: 24px;
     border-radius: 999px;
@@ -372,7 +371,7 @@
   }
 
   .dispatch-group-card__title-text,
-  .dispatch-group-card__worker-main {
+  .dispatch-group-card__stage-main {
     min-width: 0;
     display: flex;
     flex-direction: column;
@@ -390,7 +389,7 @@
   .dispatch-group-card__progress,
   .dispatch-group-card__current,
   .dispatch-group-card__summary,
-  .dispatch-group-card__worker-metrics {
+  .dispatch-group-card__stage-metrics {
     color: var(--foreground-muted);
     font-size: var(--text-xs);
     line-height: 1.35;
@@ -427,40 +426,40 @@
 
   .dispatch-group-card__status--pending,
   .dispatch-group-card__mini-status--pending,
-  .dispatch-group-card__stage--pending {
+  .dispatch-group-card__stage-index--pending {
     color: var(--foreground-muted);
     background: color-mix(in srgb, var(--foreground-muted) 14%, transparent);
   }
 
   .dispatch-group-card__status--running,
   .dispatch-group-card__mini-status--running,
-  .dispatch-group-card__stage--running {
+  .dispatch-group-card__stage-index--running {
     color: var(--primary);
     background: color-mix(in srgb, var(--primary) 14%, transparent);
   }
 
   .dispatch-group-card__status--paused,
   .dispatch-group-card__mini-status--paused,
-  .dispatch-group-card__stage--paused {
+  .dispatch-group-card__stage-index--paused {
     color: var(--warning);
     background: color-mix(in srgb, var(--warning) 14%, transparent);
   }
 
   .dispatch-group-card__status--success,
   .dispatch-group-card__mini-status--success,
-  .dispatch-group-card__stage--success {
+  .dispatch-group-card__stage-index--success {
     color: var(--success);
     background: color-mix(in srgb, var(--success) 14%, transparent);
   }
 
   .dispatch-group-card__status--danger,
   .dispatch-group-card__mini-status--danger,
-  .dispatch-group-card__stage--danger {
+  .dispatch-group-card__stage-index--danger {
     color: var(--error);
     background: color-mix(in srgb, var(--error) 14%, transparent);
   }
 
-  .dispatch-group-card__workers {
+  .dispatch-group-card__stages {
     display: flex;
     flex-direction: column;
     gap: 1px;
@@ -470,11 +469,11 @@
     background: color-mix(in srgb, var(--surface) 78%, transparent);
   }
 
-  .dispatch-group-card__worker-row {
+  .dispatch-group-card__stage-row {
     min-width: 0;
     width: 100%;
     display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-columns: 26px minmax(0, 1fr) auto;
     align-items: flex-start;
     gap: var(--space-3);
     padding: var(--space-3);
@@ -485,21 +484,29 @@
     text-align: left;
   }
 
-  .dispatch-group-card__worker-row:disabled {
+  .dispatch-group-card__stage-row:disabled {
     cursor: default;
     opacity: 1;
   }
 
-  .dispatch-group-card__worker-row.is-clickable:not(:disabled):hover {
+  .dispatch-group-card__stage-row.is-clickable:not(:disabled):hover {
     background: color-mix(in srgb, var(--assistant-message-bg) 86%, var(--worker-color) 14%);
   }
 
-  .dispatch-group-card__worker-icon {
-    color: var(--worker-color);
-    background: var(--worker-muted);
+  .dispatch-group-card__stage-index {
+    width: 22px;
+    height: 22px;
+    border-radius: 999px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    font-size: 11px;
+    font-weight: var(--font-semibold);
+    line-height: 1;
   }
 
-  .dispatch-group-card__worker-topline {
+  .dispatch-group-card__stage-topline {
     min-width: 0;
     display: flex;
     align-items: center;
@@ -507,12 +514,44 @@
     gap: var(--space-2);
   }
 
-  .dispatch-group-card__worker-name {
+  .dispatch-group-card__stage-title {
     min-width: 0;
     color: var(--foreground);
     font-size: var(--text-sm);
     font-weight: var(--font-semibold);
     line-height: 1.35;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .dispatch-group-card__owner {
+    min-width: 0;
+    width: fit-content;
+    max-width: 100%;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-top: 3px;
+    padding: 2px 7px 2px 5px;
+    border-radius: 999px;
+    color: var(--worker-color);
+    background: var(--worker-muted);
+    font-size: 11px;
+    line-height: 1.25;
+  }
+
+  .dispatch-group-card__owner-icon {
+    width: 15px;
+    height: 15px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .dispatch-group-card__owner span:last-child {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -526,34 +565,7 @@
     white-space: nowrap;
   }
 
-  .dispatch-group-card__stage-list {
-    min-width: 0;
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: var(--space-1);
-    padding-top: 3px;
-  }
-
-  .dispatch-group-card__stage {
-    max-width: 22ch;
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 2px 6px;
-    border-radius: 999px;
-    font-size: 11px;
-    line-height: 1.25;
-  }
-
-  .dispatch-group-card__stage span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .dispatch-group-card__worker-metrics {
+  .dispatch-group-card__stage-metrics {
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
@@ -571,11 +583,11 @@
       justify-content: flex-start;
     }
 
-    .dispatch-group-card__worker-row {
+    .dispatch-group-card__stage-row {
       grid-template-columns: auto minmax(0, 1fr);
     }
 
-    .dispatch-group-card__worker-metrics {
+    .dispatch-group-card__stage-metrics {
       grid-column: 2;
       align-items: flex-start;
       flex-direction: row;
