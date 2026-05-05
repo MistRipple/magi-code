@@ -2243,10 +2243,10 @@ function canonicalProjectionIndicatesProcessing(): boolean {
     const status = typeof metadata.turnItemStatus === 'string'
       ? metadata.turnItemStatus.trim()
       : '';
-    return turnStatus === 'pending'
-      || turnStatus === 'running'
-      || status === 'pending'
-      || status === 'running';
+    if (turnStatus) {
+      return turnStatus === 'pending' || turnStatus === 'running';
+    }
+    return status === 'pending' || status === 'running';
   });
 }
 

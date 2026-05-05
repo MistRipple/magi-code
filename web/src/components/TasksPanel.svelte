@@ -2,6 +2,7 @@
   import { onDestroy } from 'svelte';
   import {
     addToast,
+    getEnabledAgents,
     getState,
     setCurrentBottomTab,
     setCurrentTopTab,
@@ -29,6 +30,8 @@
     getTaskStatusLabel,
     getTaskStatusTone,
   } from '../lib/task-labels';
+  import { isTaskProjectionAcceptingIntake } from '../lib/task-projection-state';
+  import { resolveWorkerDisplayName } from '../lib/worker-role-utils';
   import {
     ensureTaskGraphState,
     getTaskGraphState,
@@ -41,6 +44,8 @@
   import { vscode } from '../lib/vscode-bridge';
 
   const appState = getState();
+  const enabledAgents = $derived(getEnabledAgents());
+  const registrySnapshot = $derived(appState.settingsRegistrySnapshot);
 
   interface TaskTreeRow {
     task: TaskDto;
@@ -207,11 +212,13 @@
     }
     return currentFocusTask;
   });
+  const selectedGraphExecutorDisplayName = $derived.by(() => (
+    selectedGraphTask ? getTaskExecutorDisplayName(selectedGraphTask) : ''
+  ));
   const selectedGraphReferenceGroups = $derived.by(() => buildTaskReferenceGroups(selectedGraphTask));
   const canUseTaskIntake = $derived.by(() => {
     const projection = taskGraph.projection;
-    if (!projection || projection.execution_mode !== 'deep') return false;
-    return projection.runner_status === 'running' || projection.runner_status === 'blocked';
+    return isTaskProjectionAcceptingIntake(projection, taskGraph.rootTaskId);
   });
   const selectedHistoryTask = $derived.by(() => {
     if (cancelledHistoryTasks.length === 0) return null;
@@ -254,6 +261,12 @@
     if (!task.parent_task_id) return '根任务';
     const parent = taskById.get(task.parent_task_id);
     return parent ? getTaskDisplayTitle(parent) : task.parent_task_id;
+  }
+
+  function getTaskExecutorDisplayName(task: TaskDto): string {
+    const roleId = task.executor_binding?.target_role?.trim() ?? '';
+    if (!roleId) return '';
+    return resolveWorkerDisplayName(roleId, enabledAgents, registrySnapshot, (key) => i18n.t(key)) || roleId;
   }
 
   function buildTaskReferences(
@@ -1124,8 +1137,8 @@
           <div class="task-detail-meta">
             <span>{getTaskKindLabel(selectedGraphTask.kind)}</span>
             <span>路径：{getTaskLineageLabel(selectedGraphTask)}</span>
-            {#if selectedGraphTask.executor_binding?.target_role}
-              <span>执行者：{selectedGraphTask.executor_binding.target_role}</span>
+            {#if selectedGraphExecutorDisplayName}
+              <span>执行者：{selectedGraphExecutorDisplayName}</span>
             {/if}
             {#if selectedGraphTask.workspace_scope}
               <span>工作区：{selectedGraphTask.workspace_scope}</span>

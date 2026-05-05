@@ -120,10 +120,10 @@ fn turn_has_execution_chain_items(turn: &ActiveExecutionTurn) -> bool {
 fn canonical_turn_status(status: &str) -> Option<CanonicalTurnStatus> {
     match status.trim().to_ascii_lowercase().as_str() {
         "pending" | "queued" | "accepted" => Some(CanonicalTurnStatus::Pending),
-        "running" | "started" | "streaming" | "blocked" | "awaiting_approval"
-        | "review_required" | "repairing" | "verifying" => Some(CanonicalTurnStatus::Running),
+        "running" | "started" | "streaming" | "awaiting_approval" | "review_required"
+        | "repairing" | "verifying" => Some(CanonicalTurnStatus::Running),
         "completed" | "complete" | "succeeded" | "success" => Some(CanonicalTurnStatus::Completed),
-        "failed" | "error" => Some(CanonicalTurnStatus::Failed),
+        "failed" | "error" | "blocked" => Some(CanonicalTurnStatus::Failed),
         "cancelled" | "canceled" => Some(CanonicalTurnStatus::Cancelled),
         _ => None,
     }
@@ -136,6 +136,17 @@ fn canonical_item_status(status: &str) -> Option<CanonicalTurnItemStatus> {
         CanonicalTurnStatus::Completed => Some(CanonicalTurnItemStatus::Completed),
         CanonicalTurnStatus::Failed => Some(CanonicalTurnItemStatus::Failed),
         CanonicalTurnStatus::Cancelled => Some(CanonicalTurnItemStatus::Cancelled),
+    }
+}
+
+fn terminal_item_status_for_turn_status(
+    status: CanonicalTurnStatus,
+) -> Option<CanonicalTurnItemStatus> {
+    match status {
+        CanonicalTurnStatus::Completed => Some(CanonicalTurnItemStatus::Completed),
+        CanonicalTurnStatus::Failed => Some(CanonicalTurnItemStatus::Failed),
+        CanonicalTurnStatus::Cancelled => Some(CanonicalTurnItemStatus::Cancelled),
+        CanonicalTurnStatus::Pending | CanonicalTurnStatus::Running => None,
     }
 }
 
@@ -250,7 +261,13 @@ fn to_canonical_turn_item(
     item: &ActiveExecutionTurnItem,
 ) -> Option<CanonicalTurnItem> {
     let kind = canonical_item_kind(&item.kind)?;
-    let status = canonical_item_status(&item.status)?;
+    let turn_status = canonical_turn_status(&turn.status)?;
+    let mut status = canonical_item_status(&item.status)?;
+    if let Some(terminal_item_status) = terminal_item_status_for_turn_status(turn_status)
+        && !status.is_terminal()
+    {
+        status = terminal_item_status;
+    }
     let tool = to_canonical_tool_call(item);
     if kind == CanonicalTurnItemKind::ToolCall && tool.is_none() {
         return None;

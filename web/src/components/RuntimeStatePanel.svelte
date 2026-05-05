@@ -286,6 +286,11 @@
       ? (processingStartedAt || runtimeState?.lastEventAt || Date.now())
       : runtimeState?.lastEventAt
   ));
+  const summaryTimeLabel = $derived.by(() => (
+    typeof effectiveLastEventAt === 'number' && Number.isFinite(effectiveLastEventAt) && effectiveLastEventAt > 0
+      ? `${i18n.t('runtimeState.summary.lastEventShort')} ${formatTimestamp(effectiveLastEventAt)}`
+      : ''
+  ));
 
   // 状态图标
   const statusIcon = $derived.by((): IconName => {
@@ -388,6 +393,7 @@
       case 'waiting': return i18n.t('runtimeDiagnostics.phase.waiting');
       case 'reviewing': return i18n.t('runtimeDiagnostics.phase.reviewing');
       case 'summary': return i18n.t('runtimeDiagnostics.phase.summary');
+      case 'idle': return i18n.t('runtimeState.status.idle');
       case 'tool': return i18n.t('runtimeDiagnostics.phase.tool');
       case 'handoff': return i18n.t('runtimeDiagnostics.phase.handoff');
       case 'finalize': return i18n.t('runtimeDiagnostics.phase.finalize');
@@ -776,7 +782,9 @@
       <span class="summary__title">{i18n.t('runtimeState.title')}</span>
       <span class="summary__badge summary__badge--{statusModifier}">{statusLabel}</span>
       <span class="summary__phase">{formatRuntimePhase(effectivePhase)}</span>
-      <span class="summary__time">{formatTimestamp(effectiveLastEventAt || 0)}</span>
+      {#if summaryTimeLabel}
+        <span class="summary__time">{summaryTimeLabel}</span>
+      {/if}
     </button>
     {#if isPanelExpanded}
     <div class="runtime-diagnostics__content">

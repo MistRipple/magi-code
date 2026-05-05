@@ -322,9 +322,9 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     };
     let (turn_status, message) = match root_task.status {
         TaskStatus::Failed => ("failed", "任务执行失败，未生成最终回复。"),
-        TaskStatus::Blocked => ("blocked", "任务执行已阻塞，等待进一步处理。"),
+        TaskStatus::Blocked => ("blocked", "任务执行需要处理，等待进一步操作。"),
         _ if runner_status == "error" => ("failed", "任务执行异常，未生成最终回复。"),
-        _ if runner_status == "blocked" => ("blocked", "任务执行已阻塞，等待进一步处理。"),
+        _ if runner_status == "blocked" => ("blocked", "任务执行需要处理，等待进一步操作。"),
         _ => return false,
     };
 

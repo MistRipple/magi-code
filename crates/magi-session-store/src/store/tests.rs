@@ -807,7 +807,7 @@ fn persisted_parts_restores_canonical_turn_log_from_sidecar_current_turn() {
     let turns = restored.canonical_turns_for_session(&session_id);
     assert_eq!(turns.len(), 1);
     let restored_turn = &turns[0];
-    assert_eq!(restored_turn.status, CanonicalTurnStatus::Running);
+    assert_eq!(restored_turn.status, CanonicalTurnStatus::Failed);
     assert_eq!(restored_turn.items.len(), 2);
     assert_eq!(
         restored_turn.items[0].kind,
@@ -824,6 +824,44 @@ fn persisted_parts_restores_canonical_turn_log_from_sidecar_current_turn() {
     assert_eq!(
         restored.durable_state().canonical_turns[0].turn_id,
         "turn-sidecar-canonical-restore"
+    );
+}
+
+#[test]
+fn blocked_current_turn_is_terminal_in_canonical_log() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-blocked-terminal-canonical");
+    store
+        .create_session(session_id.clone(), "Blocked Terminal Canonical")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            test_turn("turn-blocked-terminal", "running", 10),
+        )
+        .expect("turn should upsert");
+
+    let mut assistant_item = test_turn_item("turn-item-blocked-assistant", "等待用户处理");
+    assistant_item.kind = "assistant_error".to_string();
+    assistant_item.status = "running".to_string();
+    store
+        .upsert_current_turn_item(&session_id, assistant_item)
+        .expect("assistant item should upsert");
+
+    store
+        .update_current_turn_status(&session_id, "blocked")
+        .expect("blocked turn status should update");
+
+    let turns = store.canonical_turns_for_session(&session_id);
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].status, CanonicalTurnStatus::Failed);
+    assert!(
+        turns[0].completed_at.is_some(),
+        "blocked current turn should not keep the chat UI in running state",
+    );
+    assert_eq!(
+        turns[0].items[0].status,
+        crate::models::CanonicalTurnItemStatus::Failed
     );
 }
 
@@ -857,6 +895,45 @@ fn persisted_parts_keep_durable_terminal_turn_over_stale_sidecar_running_turn() 
     let turns = restored.canonical_turns_for_session(&session_id);
     assert_eq!(turns.len(), 1);
     assert_eq!(turns[0].status, CanonicalTurnStatus::Completed);
+}
+
+#[test]
+fn persisted_parts_repairs_terminal_turn_with_stale_active_items() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-terminal-active-item-repair");
+    store
+        .create_session(session_id.clone(), "Terminal Active Item Repair")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            test_turn("turn-terminal-active-item-repair", "running", 10),
+        )
+        .expect("turn should upsert");
+
+    let mut assistant_item = test_turn_item("turn-item-terminal-active", "任务执行已阻塞");
+    assistant_item.kind = "assistant_error".to_string();
+    assistant_item.status = "running".to_string();
+    store
+        .upsert_current_turn_item(&session_id, assistant_item)
+        .expect("assistant item should upsert");
+    store
+        .update_current_turn_status(&session_id, "blocked")
+        .expect("turn should become blocked");
+
+    let mut durable_state = store.durable_state();
+    durable_state.canonical_turns[0].items[0].status =
+        crate::models::CanonicalTurnItemStatus::Running;
+    let sidecar_store = store.execution_sidecar_store_state();
+
+    let restored = SessionStore::from_persisted_parts(durable_state, sidecar_store);
+    let turns = restored.canonical_turns_for_session(&session_id);
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].status, CanonicalTurnStatus::Failed);
+    assert_eq!(
+        turns[0].items[0].status,
+        crate::models::CanonicalTurnItemStatus::Failed
+    );
 }
 
 #[test]

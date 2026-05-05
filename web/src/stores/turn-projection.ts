@@ -20,8 +20,9 @@ function normalizeSessionId(value: string | null | undefined): string {
 }
 
 function normalizeWorkerId(item: CanonicalTurnItem): AgentId | undefined {
+  const workerRole = typeof item.worker?.roleId === 'string' ? item.worker.roleId.trim() : '';
   const workerTab = item.visibility.workerTabIds?.find((value) => typeof value === 'string' && value.trim());
-  return (workerTab || item.worker?.roleId || item.worker?.workerId || undefined) as AgentId | undefined;
+  return (workerRole || workerTab || item.worker?.workerId || undefined) as AgentId | undefined;
 }
 
 function statusToToolStatus(status: CanonicalTurnItemStatus): 'pending' | 'running' | 'success' | 'error' {
@@ -254,6 +255,90 @@ function compareArtifacts(left: TimelineProjectionArtifact, right: TimelineProje
   return left.displayOrder - right.displayOrder || left.artifactId.localeCompare(right.artifactId);
 }
 
+function mergeWorkerTabs(
+  left: AgentId[] | undefined,
+  right: AgentId[] | undefined,
+): AgentId[] {
+  const merged: AgentId[] = [];
+  const seen = new Set<string>();
+  for (const workerId of [...(left || []), ...(right || [])]) {
+    if (!workerId || seen.has(workerId)) {
+      continue;
+    }
+    seen.add(workerId);
+    merged.push(workerId);
+  }
+  return merged;
+}
+
+function mergeMessageIds(left: string[] | undefined, right: string[] | undefined): string[] {
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  for (const messageId of [...(left || []), ...(right || [])]) {
+    if (!messageId || seen.has(messageId)) {
+      continue;
+    }
+    seen.add(messageId);
+    merged.push(messageId);
+  }
+  return merged;
+}
+
+function mergeDuplicateArtifact(
+  first: TimelineProjectionArtifact,
+  latest: TimelineProjectionArtifact,
+): TimelineProjectionArtifact {
+  const firstMetadata = first.message.metadata || {};
+  const latestMetadata = latest.message.metadata || {};
+  const stableItemSeq = typeof firstMetadata.itemSeq === 'number'
+    ? firstMetadata.itemSeq
+    : latestMetadata.itemSeq;
+  const stableBlockSeq = typeof firstMetadata.blockSeq === 'number'
+    ? firstMetadata.blockSeq
+    : latestMetadata.blockSeq;
+  const stableCardStreamSeq = typeof firstMetadata.cardStreamSeq === 'number'
+    ? firstMetadata.cardStreamSeq
+    : latestMetadata.cardStreamSeq;
+
+  return {
+    ...latest,
+    displayOrder: Math.min(first.displayOrder, latest.displayOrder),
+    cardStreamSeq: Math.min(first.cardStreamSeq, latest.cardStreamSeq),
+    timestamp: Math.min(first.timestamp, latest.timestamp),
+    cardId: first.cardId,
+    laneId: first.laneId || latest.laneId,
+    worker: first.worker || latest.worker,
+    threadVisible: first.threadVisible !== false || latest.threadVisible !== false,
+    workerTabs: mergeWorkerTabs(first.workerTabs, latest.workerTabs),
+    messageIds: mergeMessageIds(first.messageIds, latest.messageIds),
+    message: {
+      ...latest.message,
+      id: first.message.id,
+      timestamp: first.message.timestamp,
+      metadata: {
+        ...latestMetadata,
+        itemSeq: stableItemSeq,
+        blockSeq: stableBlockSeq,
+        cardStreamSeq: stableCardStreamSeq,
+      },
+    },
+  };
+}
+
+function collapseArtifactsByStableCard(
+  artifacts: TimelineProjectionArtifact[],
+): TimelineProjectionArtifact[] {
+  const artifactById = new Map<string, TimelineProjectionArtifact>();
+  for (const artifact of artifacts) {
+    const existing = artifactById.get(artifact.artifactId);
+    artifactById.set(
+      artifact.artifactId,
+      existing ? mergeDuplicateArtifact(existing, artifact) : artifact,
+    );
+  }
+  return Array.from(artifactById.values()).sort(compareArtifacts);
+}
+
 function renderEntry(artifact: TimelineProjectionArtifact): TimelineProjectionRenderEntry {
   return {
     entryId: artifact.artifactId,
@@ -266,10 +351,10 @@ export function buildCanonicalTimelineProjection(state: CanonicalTurnReducerStat
   if (!sessionId) {
     return null;
   }
-  const artifacts = state.turns
+  const artifacts = collapseArtifactsByStableCard(state.turns
     .flatMap((turn) => turn.items.map((item) => buildArtifact(turn, item)))
     .filter((artifact): artifact is TimelineProjectionArtifact => Boolean(artifact))
-    .sort(compareArtifacts);
+    .sort(compareArtifacts));
   const threadRenderEntries = artifacts
     .filter((artifact) => artifact.threadVisible !== false)
     .map(renderEntry);

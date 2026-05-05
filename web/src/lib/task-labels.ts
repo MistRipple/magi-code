@@ -131,7 +131,7 @@ export function getTaskStatusLabel(status: TaskStatus): string {
     case 'Draft': return '待规划';
     case 'Ready': return '待执行';
     case 'Running': return '执行中';
-    case 'Blocked': return '已暂停';
+    case 'Blocked': return '需要处理';
     case 'AwaitingApproval': return '等待确认';
     case 'Verifying': return '验证中';
     case 'Repairing': return '修复中';
@@ -155,7 +155,7 @@ export function getTaskStatusTone(status: TaskStatus): string {
 export function getRunnerStatusLabel(status: string): string {
   switch (status) {
     case 'running': return '运行中';
-    case 'blocked': return '已阻塞';
+    case 'blocked': return '等待处理';
     case 'completed': return '已完成';
     case 'error': return '异常';
     default: return '空闲';

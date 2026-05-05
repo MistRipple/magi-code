@@ -1044,13 +1044,13 @@ impl TaskStore {
                 "全部完成".to_string()
             } else if failed_tasks > 0 && blocked_count > 0 {
                 format!(
-                    "{}% 已完成，{} 项失败、{} 项阻塞",
+                    "{}% 已完成，{} 项失败、{} 项需要处理",
                     pct, failed_tasks, blocked_count
                 )
             } else if failed_tasks > 0 {
                 format!("{}% 已完成，{} 项失败待修复", pct, failed_tasks)
             } else if blocked_count > 0 {
-                format!("{}% 已完成，{} 项阻塞", pct, blocked_count)
+                format!("{}% 已完成，{} 项需要处理", pct, blocked_count)
             } else if running_count > 0 {
                 format!("{}% 已完成，{} 项执行中", pct, running_count)
             } else {
@@ -2416,6 +2416,34 @@ mod tests {
         let projection = store.build_projection(&TaskId::new("obj-1")).unwrap();
         assert_eq!(projection.aggregate_status, TaskStatus::Failed);
         assert_eq!(projection.progress_summary.failed_tasks, 1);
+    }
+
+    #[test]
+    fn projection_display_status_uses_actionable_copy_for_blocked_tasks() {
+        let store = TaskStore::new();
+
+        store.insert_task(make_task(
+            "obj-1",
+            "m-1",
+            "obj-1",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Blocked,
+        ));
+        store.insert_task(make_task(
+            "act-1",
+            "m-1",
+            "obj-1",
+            Some("obj-1"),
+            TaskKind::Action,
+            TaskStatus::Completed,
+        ));
+
+        let projection = store.build_projection(&TaskId::new("obj-1")).unwrap();
+
+        assert_eq!(projection.aggregate_status, TaskStatus::Blocked);
+        assert_eq!(projection.progress_summary.blocked_tasks, 1);
+        assert_eq!(projection.display_status, "50% 已完成，1 项需要处理");
     }
 
     // -----------------------------------------------------------------------

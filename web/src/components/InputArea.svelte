@@ -19,7 +19,8 @@
   import Icon from './Icon.svelte';
   import { generateId, ensureArray } from '../lib/utils';
   import { i18n } from '../stores/i18n.svelte';
-  import { getTaskKindLabel, getTaskStatusLabel } from '../lib/task-labels';
+  import { getTaskDisplayGoal, getTaskDisplayTitle, getTaskKindLabel, getTaskStatusLabel } from '../lib/task-labels';
+  import { isTaskProjectionAcceptingIntake } from '../lib/task-projection-state';
 
   // 技能类型
   interface InstructionSkill {
@@ -92,10 +93,7 @@
   // 深度模式任务图运行中：将用户输入路由到 Intake API
   const shouldUseIntake = $derived.by(() => {
     const projection = taskGraph.projection;
-    if (!projection || projection.execution_mode !== 'deep') return false;
-    if (!taskGraph.rootTaskId) return false;
-    const status = projection.runner_status;
-    return status === 'running' || status === 'blocked';
+    return isTaskProjectionAcceptingIntake(projection, taskGraph.rootTaskId);
   });
   const defaultIntakeContextTaskId = $derived.by(() => {
     const projection = taskGraph.projection;
@@ -121,7 +119,7 @@
       .map((task) => ({
         taskId: task.task_id,
         label: formatIntakeTaskOptionLabel(task),
-        title: `${task.title}\n${task.goal || task.task_id}`,
+        title: `${getTaskDisplayTitle(task)}\n${getTaskDisplayGoal(task) || task.task_id}`,
       }));
   });
   const intakeContextTaskId = $derived.by(() => {
@@ -194,7 +192,7 @@
   }
 
   function formatIntakeTaskOptionLabel(task: TaskDto): string {
-    return `${getTaskKindLabel(task.kind)} · ${task.title} · ${getTaskStatusLabel(task.status)}`;
+    return `${getTaskKindLabel(task.kind)} · ${getTaskDisplayTitle(task)} · ${getTaskStatusLabel(task.status)}`;
   }
 
   function selectIntakeTaskTarget(event: Event) {

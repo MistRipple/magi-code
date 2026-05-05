@@ -41,6 +41,7 @@ fn current_turn_status_is_terminal(status: &str) -> bool {
             | "success"
             | "failed"
             | "error"
+            | "blocked"
             | "cancelled"
             | "canceled"
     )
@@ -65,7 +66,7 @@ fn current_turn_item_status_is_active(status: &str) -> bool {
 fn terminal_item_status_for_turn_status(status: &str) -> Option<&'static str> {
     match status.trim().to_ascii_lowercase().as_str() {
         "completed" | "complete" | "succeeded" | "success" => Some("completed"),
-        "failed" | "error" => Some("failed"),
+        "failed" | "error" | "blocked" => Some("failed"),
         "cancelled" | "canceled" => Some("cancelled"),
         _ => None,
     }
@@ -74,10 +75,10 @@ fn terminal_item_status_for_turn_status(status: &str) -> Option<&'static str> {
 fn canonical_current_turn_status(status: &str) -> DomainResult<CanonicalTurnStatus> {
     match status.trim().to_ascii_lowercase().as_str() {
         "pending" | "queued" | "accepted" => Ok(CanonicalTurnStatus::Pending),
-        "running" | "started" | "streaming" | "blocked" | "awaiting_approval"
-        | "review_required" | "repairing" | "verifying" => Ok(CanonicalTurnStatus::Running),
+        "running" | "started" | "streaming" | "awaiting_approval" | "review_required"
+        | "repairing" | "verifying" => Ok(CanonicalTurnStatus::Running),
         "completed" | "complete" | "succeeded" | "success" => Ok(CanonicalTurnStatus::Completed),
-        "failed" | "error" => Ok(CanonicalTurnStatus::Failed),
+        "failed" | "error" | "blocked" => Ok(CanonicalTurnStatus::Failed),
         "cancelled" | "canceled" => Ok(CanonicalTurnStatus::Cancelled),
         _ => Err(DomainError::InvalidState {
             message: format!("unknown current turn status: {status}"),
@@ -93,6 +94,17 @@ fn canonical_current_turn_item_status(status: &str) -> DomainResult<CanonicalTur
         CanonicalTurnStatus::Failed => CanonicalTurnItemStatus::Failed,
         CanonicalTurnStatus::Cancelled => CanonicalTurnItemStatus::Cancelled,
     })
+}
+
+fn terminal_item_status_for_canonical_turn_status(
+    status: CanonicalTurnStatus,
+) -> Option<CanonicalTurnItemStatus> {
+    match status {
+        CanonicalTurnStatus::Completed => Some(CanonicalTurnItemStatus::Completed),
+        CanonicalTurnStatus::Failed => Some(CanonicalTurnItemStatus::Failed),
+        CanonicalTurnStatus::Cancelled => Some(CanonicalTurnItemStatus::Cancelled),
+        CanonicalTurnStatus::Pending | CanonicalTurnStatus::Running => None,
+    }
 }
 
 fn canonical_current_turn_item_kind(kind: &str) -> DomainResult<CanonicalTurnItemKind> {
@@ -221,7 +233,13 @@ fn current_turn_item_to_canonical_item(
     item: &ActiveExecutionTurnItem,
 ) -> DomainResult<CanonicalTurnItem> {
     let kind = canonical_current_turn_item_kind(&item.kind)?;
-    let status = canonical_current_turn_item_status(&item.status)?;
+    let turn_status = canonical_current_turn_status(&turn.status)?;
+    let mut status = canonical_current_turn_item_status(&item.status)?;
+    if let Some(terminal_item_status) = terminal_item_status_for_canonical_turn_status(turn_status)
+        && !status.is_terminal()
+    {
+        status = terminal_item_status;
+    }
     let tool = current_turn_item_to_canonical_tool(item)?;
     if kind == CanonicalTurnItemKind::ToolCall && tool.is_none() {
         return Err(DomainError::InvalidState {
@@ -322,15 +340,20 @@ fn upsert_canonical_turn_in_state(
     Ok(())
 }
 
-fn durable_terminal_turn_exists(
+fn durable_terminal_turn_should_win(
     state: &SessionStoreState,
     session_id: &SessionId,
     turn: &ActiveExecutionTurn,
 ) -> bool {
     state.canonical_turns.iter().any(|existing| {
-        existing.session_id == *session_id
-            && existing.turn_id == turn.turn_id
-            && existing.status.is_terminal()
+        if existing.session_id != *session_id
+            || existing.turn_id != turn.turn_id
+            || !existing.status.is_terminal()
+        {
+            return false;
+        }
+        let has_active_item = existing.items.iter().any(|item| !item.status.is_terminal());
+        !has_active_item || !current_turn_status_is_terminal(&turn.status)
     })
 }
 
@@ -356,7 +379,7 @@ pub(super) fn restore_canonical_turns_from_sidecars(
     }
 
     for (session_id, turn) in turns {
-        if durable_terminal_turn_exists(state, &session_id, &turn) {
+        if durable_terminal_turn_should_win(state, &session_id, &turn) {
             continue;
         }
         upsert_canonical_turn_in_state(state, &session_id, &turn)?;

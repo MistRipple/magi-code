@@ -57,6 +57,7 @@ function runGoldenReplay(reducer, projection, contract) {
   assertTerminalLateUpsertIsIgnored(reducer, projection);
   assertTerminalLateTurnStartedIsIgnored(reducer, projection);
   assertFailedAssistantTextUsesPlainMessageShell(reducer, projection);
+  assertSplitToolStartedAndResultCollapseIntoOneCard(reducer, projection);
   assertCancelledToolShowsTurnResponseDuration(reducer, projection);
   assertFailedToolWithoutAssistantShowsTurnResponseDuration(reducer, projection);
   assertBootstrapProcessingStateFromRunningCanonicalTurn(contract);
@@ -76,6 +77,12 @@ function replayLive(reducer, testCase) {
 
 function projectionSignature(value) {
   assert.ok(value, 'projection should exist');
+  const artifactIds = value.artifacts.map((artifact) => artifact.artifactId);
+  assert.equal(
+    new Set(artifactIds).size,
+    artifactIds.length,
+    'projection artifacts must be unique by artifactId',
+  );
   const artifactsById = new Map(value.artifacts.map((artifact) => [artifact.artifactId, artifact]));
   return value.threadRenderEntries.map((entry) => {
     const artifact = artifactsById.get(entry.artifactId);
@@ -250,6 +257,36 @@ function assertFailedAssistantTextUsesPlainMessageShell(reducer, projection) {
     assistantArtifact.message.metadata?.responseDurationMs,
     100,
     'failed assistant_text should keep the turn response duration',
+  );
+}
+
+function assertSplitToolStartedAndResultCollapseIntoOneCard(reducer, projection) {
+  const c = baseCase(
+    'split-tool-start-result',
+    'session-golden-split-tool',
+    'turn-golden-split-tool',
+    8500,
+  );
+  const userItem = user(c, 1, '请连续运行两个工具，第二个先返回。');
+  const firstToolRunning = tool(c, 2, 'tool-a-started', 'call-a', 'printf a', 'running');
+  const secondToolCompleted = tool(c, 3, 'tool-b', 'call-b', 'printf b', 'completed', { stdout: 'b' });
+  const firstToolCompleted = tool(c, 99, 'tool-a-result', 'call-a', 'printf a', 'completed', { stdout: 'a' });
+  const assistant = assistantText(c, 100, 'assistant-final', '两个工具都完成了。', 'completed');
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'completed', [userItem, firstToolRunning, secondToolCompleted, firstToolCompleted, assistant], {
+      completedAt: 8600,
+      responseDurationMs: 100,
+    }),
+  ]);
+  assert.deepEqual(
+    projectionSignature(projection.buildCanonicalTimelineProjection(state)),
+    [
+      signatureMessage('message', 'user_message', 1, userItem.content),
+      signatureTool(2, 'shell_exec', 'success'),
+      signatureTool(3, 'shell_exec', 'success'),
+      signatureMessage('message', 'assistant_text', 100, assistant.content),
+    ],
+    'split tool started/result items should render as one stable card in invocation order',
   );
 }
 
