@@ -11,14 +11,15 @@ const server = await createServer({
 try {
   const reducer = await server.ssrLoadModule('/src/stores/turn-reducer.ts');
   const projection = await server.ssrLoadModule('/src/stores/turn-projection.ts');
+  const timelineRenderItems = await server.ssrLoadModule('/src/lib/timeline-render-items.ts');
   const contract = await server.ssrLoadModule('/src/shared/bridges/rust-daemon-contract.ts');
-  runGoldenReplay(reducer, projection, contract);
+  runGoldenReplay(reducer, projection, timelineRenderItems, contract);
   console.log('canonical turn golden replay passed');
 } finally {
   await server.close();
 }
 
-function runGoldenReplay(reducer, projection, contract) {
+function runGoldenReplay(reducer, projection, timelineRenderItems, contract) {
   const cases = [
     acceptedFirstFrameCase(),
     ordinaryChatCase(),
@@ -61,7 +62,7 @@ function runGoldenReplay(reducer, projection, contract) {
   assertCancelledToolShowsTurnResponseDuration(reducer, projection);
   assertFailedToolWithoutAssistantShowsTurnResponseDuration(reducer, projection);
   assertThreadVisibleRoleMetadataDoesNotBecomeWorkerBadge(reducer, projection);
-  assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection);
+  assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, timelineRenderItems);
   assertBootstrapProcessingStateFromRunningCanonicalTurn(contract);
   assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract);
   assertBootstrapCarriesPendingChanges(contract);
@@ -98,7 +99,7 @@ function assertThreadVisibleRoleMetadataDoesNotBecomeWorkerBadge(reducer, projec
   );
 }
 
-function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection) {
+function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, timelineRenderItems) {
   const c = baseCase('worker-dispatch-card', 'session-golden-worker-card', 'turn-golden-worker-card', 9400);
   const dispatchA = workerDispatch(c, 2, 'dispatch-a', 'lane-a', 'integration-dev', '实现验证', 'completed');
   const dispatchB = workerDispatch(c, 3, 'dispatch-b', 'lane-b', 'reviewer', '代码评审', 'completed');
@@ -164,6 +165,40 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection) {
     projectionValue.workerRenderEntries['integration-dev']?.length,
     4,
     'integration worker tab should still receive its sidechain dispatch/tool items',
+  );
+  const artifactsById = new Map(projectionValue.artifacts.map((artifact) => [artifact.artifactId, artifact]));
+  const integrationRenderItems = (projectionValue.workerRenderEntries['integration-dev'] || [])
+    .map((entry) => artifactsById.get(entry.artifactId))
+    .filter(Boolean)
+    .map((artifact) => ({ key: artifact.artifactId, message: artifact.message }));
+  const workerGroups = timelineRenderItems.buildWorkerStageRenderGroups(integrationRenderItems, {
+    stageFallback: '执行阶段',
+    directTitle: '任务总控',
+    ungroupedTitle: '执行补充',
+  });
+  assert.deepEqual(
+    workerGroups.map((group) => ({
+      title: group.title,
+      status: group.status,
+      toolUseCount: group.toolUseCount,
+      replyCount: group.replyCount,
+      visibleItems: group.items.map((item) => item.message.metadata?.turnItemKind),
+    })),
+    [{
+      title: '实现验证',
+      status: 'completed',
+      toolUseCount: 2,
+      replyCount: 1,
+      visibleItems: ['tool_call', 'tool_call', 'assistant_text'],
+    }],
+    'worker tab should use worker_dispatch as the stage header and hide dispatch lifecycle text from the stage body',
+  );
+  assert.deepEqual(
+    integrationRenderItems
+      .filter((item) => item.message.metadata?.turnItemKind === 'tool_call' || item.message.metadata?.turnItemKind === 'assistant_text')
+      .map((item) => item.message.metadata?.laneTitle),
+    ['实现验证', '实现验证', '实现验证'],
+    'worker sidechain tool/reply artifacts should carry canonical lane titles for stable grouping',
   );
 }
 

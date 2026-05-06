@@ -17,6 +17,13 @@ import type {
 import { isCanonicalTerminalStatus } from '../shared/protocol/canonical-turn';
 import type { CanonicalTurnReducerState } from './turn-reducer';
 
+interface LaneProjectionMeta {
+  laneId: string;
+  laneSeq?: number;
+  title: string;
+  status: WorkerLaneStatus;
+}
+
 function normalizeSessionId(value: string | null | undefined): string {
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -189,7 +196,33 @@ function canShowTurnResponseDuration(turn: CanonicalTurn, item: CanonicalTurnIte
   return anchor?.itemId === item.itemId;
 }
 
-function buildMessage(turn: CanonicalTurn, item: CanonicalTurnItem, artifactId: string): Message {
+function collectLaneProjectionMeta(turn: CanonicalTurn): Map<string, LaneProjectionMeta> {
+  const metaByLaneId = new Map<string, LaneProjectionMeta>();
+  for (const item of turn.items) {
+    if (item.kind !== 'worker_dispatch') {
+      continue;
+    }
+    const laneId = typeof item.laneId === 'string' ? item.laneId.trim() : '';
+    if (!laneId) {
+      continue;
+    }
+    const title = (item.title || item.worker?.title || laneId).trim();
+    metaByLaneId.set(laneId, {
+      laneId,
+      ...(typeof item.laneSeq === 'number' && Number.isFinite(item.laneSeq) ? { laneSeq: item.laneSeq } : {}),
+      title,
+      status: canonicalStatusToWorkerLaneStatus(item.status),
+    });
+  }
+  return metaByLaneId;
+}
+
+function buildMessage(
+  turn: CanonicalTurn,
+  item: CanonicalTurnItem,
+  artifactId: string,
+  laneMetaById: Map<string, LaneProjectionMeta>,
+): Message {
   const content = resolveItemContent(item);
   const worker = resolveVisibleWorkerId(item);
   const blocks = buildMessageBlocks(item, content);
@@ -197,6 +230,8 @@ function buildMessage(turn: CanonicalTurn, item: CanonicalTurnItem, artifactId: 
   const responseDurationMs = canShowTurnResponseDuration(turn, item)
     ? turn.responseDurationMs
     : undefined;
+  const laneId = typeof item.laneId === 'string' ? item.laneId.trim() : '';
+  const laneMeta = laneId ? laneMetaById.get(laneId) : undefined;
   return {
     id: artifactId,
     role: resolveMessageRole(item),
@@ -219,6 +254,8 @@ function buildMessage(turn: CanonicalTurn, item: CanonicalTurnItem, artifactId: 
       blockSeq: item.itemSeq,
       laneId: item.laneId,
       laneSeq: item.laneSeq,
+      ...(laneMeta?.title ? { laneTitle: laneMeta.title } : {}),
+      ...(laneMeta?.status ? { laneStatus: laneMeta.status } : {}),
       cardStreamSeq: item.itemSeq,
       workerId: item.worker?.workerId,
       roleId: worker,
@@ -238,7 +275,11 @@ function resolveArtifactId(turn: CanonicalTurn, item: CanonicalTurnItem): string
   return `turn:${turn.turnId}:${item.itemId}`;
 }
 
-function buildArtifact(turn: CanonicalTurn, item: CanonicalTurnItem): TimelineProjectionArtifact | null {
+function buildArtifact(
+  turn: CanonicalTurn,
+  item: CanonicalTurnItem,
+  laneMetaById: Map<string, LaneProjectionMeta>,
+): TimelineProjectionArtifact | null {
   if (!shouldRenderItem(item)) {
     return null;
   }
@@ -260,7 +301,7 @@ function buildArtifact(turn: CanonicalTurn, item: CanonicalTurnItem): TimelinePr
     threadVisible: item.visibility.threadVisible !== false,
     workerTabs,
     messageIds: [artifactId, item.itemId],
-    message: buildMessage(turn, item, artifactId),
+    message: buildMessage(turn, item, artifactId, laneMetaById),
   };
 }
 
@@ -427,6 +468,14 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
   };
 }
 
+function buildTurnProjectionArtifacts(turn: CanonicalTurn): Array<TimelineProjectionArtifact | null> {
+  const laneMetaById = collectLaneProjectionMeta(turn);
+  return [
+    buildDispatchGroupArtifact(turn),
+    ...turn.items.map((item) => buildArtifact(turn, item, laneMetaById)),
+  ];
+}
+
 function compareArtifacts(left: TimelineProjectionArtifact, right: TimelineProjectionArtifact): number {
   return left.displayOrder - right.displayOrder || left.artifactId.localeCompare(right.artifactId);
 }
@@ -528,10 +577,7 @@ export function buildCanonicalTimelineProjection(state: CanonicalTurnReducerStat
     return null;
   }
   const artifacts = collapseArtifactsByStableCard(state.turns
-    .flatMap((turn) => [
-      buildDispatchGroupArtifact(turn),
-      ...turn.items.map((item) => buildArtifact(turn, item)),
-    ])
+    .flatMap((turn) => buildTurnProjectionArtifacts(turn))
     .filter((artifact): artifact is TimelineProjectionArtifact => Boolean(artifact))
     .sort(compareArtifacts));
   const threadRenderEntries = artifacts

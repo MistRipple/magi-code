@@ -43,7 +43,9 @@
     );
   });
 
-  // 当前活跃任务：优先 Running，其次 Ready/Blocked/Verifying/Repairing/AwaitingApproval
+  const hasTimelineOutput = $derived((renderItems || []).length > 0);
+
+  // 只展示真正处于执行/等待中的任务绑定；完成态任务由阶段详情和任务面板承载。
   const activeTask = $derived.by((): TaskDto | null => {
     const priority: TaskStatus[] = [
       'Running', 'Ready', 'Verifying', 'Repairing', 'Blocked', 'AwaitingApproval',
@@ -52,13 +54,9 @@
       const found = boundTasks.find((t) => t.status === status);
       if (found) return found;
     }
-    return boundTasks[0] ?? null;
+    return null;
   });
 
-  // 历史完成任务（同一 Worker 下已完成的）
-  const completedTasks = $derived(
-    boundTasks.filter((t) => t.status === 'Completed' || t.status === 'Skipped')
-  );
   const activeTaskOutputReferences = $derived.by(() => (
     (activeTask?.output_refs ?? [])
       .map((ref) => describeTaskReference(ref, 'auto'))
@@ -180,7 +178,7 @@
         </div>
       {/if}
     </div>
-  {:else if boundTasks.length > 0}
+  {:else if boundTasks.length > 0 && !hasTimelineOutput}
     <div class="agent-task-binding agent-task-binding--idle">
       <div class="atb-header">
         <span class="atb-kind">Worker</span>
@@ -191,19 +189,6 @@
       </div>
       <div class="atb-title">{workerName || '未命名 Worker'}</div>
       <div class="atb-goal">当前没有活跃任务绑定</div>
-    </div>
-  {/if}
-
-  {#if completedTasks.length > 0}
-    <div class="agent-completed-tasks">
-      <div class="atb-section-label">已完成 ({completedTasks.length})</div>
-      {#each completedTasks as task (task.task_id)}
-        <div class="atb-completed-row">
-          <Icon name="check-circle" size={12} />
-          <span class="atb-completed-title">{getTaskDisplayTitle(task)}</span>
-          <span class="atb-completed-kind">{getTaskKindLabel(task.kind)}</span>
-        </div>
-      {/each}
     </div>
   {/if}
 
@@ -394,47 +379,6 @@
     border-radius: var(--radius-md);
     padding: var(--space-2) var(--space-3);
     margin-top: var(--space-1);
-  }
-
-  .agent-completed-tasks {
-    flex-shrink: 0;
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-1);
-    padding: var(--space-2) var(--space-4);
-    border-bottom: 1px solid var(--border);
-    background: var(--surface-1);
-  }
-
-  .atb-section-label {
-    font-size: var(--text-2xs);
-    font-weight: var(--font-medium);
-    color: var(--foreground-muted);
-    letter-spacing: 0.04em;
-  }
-
-  .atb-completed-row {
-    display: flex;
-    align-items: center;
-    gap: var(--space-1);
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-  }
-
-  .atb-completed-title {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .atb-completed-kind {
-    font-size: var(--text-2xs);
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    padding: 1px 5px;
   }
 
   .agent-message-list {
