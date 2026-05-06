@@ -23,7 +23,7 @@ pub(crate) fn prepend_session_instructions(
 
 pub(crate) fn workspace_context_system_prompt(root_path: &str) -> String {
     format!(
-        "当前工作区根目录是 `{root_path}`。当用户、任务或 worker 提到“当前项目”、“当前工程”、“当前仓库”、“本项目”或 current project/repo/codebase 时，默认指这个工作区。需要分析当前项目时，必须优先使用可用工具读取该工作区的目录、README、配置和关键源码，不要要求用户手动粘贴项目结构。工具未显式传 cwd/root/path 的相对路径均应按该工作区根目录理解。"
+        "当前工作区根目录是 `{root_path}`。当用户、任务或 worker 提到“当前项目”、“当前工程”、“当前仓库”、“本项目”或 current project/repo/codebase 时，默认指这个工作区。需要分析当前项目时，必须优先使用可用工具读取该工作区的目录、README、配置和关键源码，不要要求用户手动粘贴项目结构。工具未显式传 cwd/root/path 的相对路径均应按该工作区根目录理解。不要假设工作区一定是 Git 仓库；执行 `git status`、`git diff` 等 Git 状态命令前，必须先用只读、受保护的条件命令确认 Git worktree，例如 `git -C <root> rev-parse --is-inside-work-tree >/dev/null 2>&1` 只能出现在 if 条件中，非 Git 目录应输出 `NOT_GIT_WORKTREE` 并保持 shell 命令成功。只读 shell 探测必须显式传 `access_mode=read_only`。如果工作区不是 Git 仓库，应明确说明 Git 状态不可用，不要继续重复 Git 状态命令，也不要把 Git 不可用等同于已完成文件变更检测。"
     )
 }
 
@@ -76,6 +76,18 @@ mod tests {
             normalize_model_visible_content(" shadow-model::结果 \n".trim_start().to_string()),
             "结果"
         );
+    }
+
+    #[test]
+    fn workspace_context_system_prompt_requires_git_probe_before_status() {
+        let prompt = workspace_context_system_prompt("/tmp/workspace");
+
+        assert!(prompt.contains("/tmp/workspace"));
+        assert!(prompt.contains("不要假设工作区一定是 Git 仓库"));
+        assert!(prompt.contains("rev-parse --is-inside-work-tree"));
+        assert!(prompt.contains("NOT_GIT_WORKTREE"));
+        assert!(prompt.contains("access_mode=read_only"));
+        assert!(prompt.contains("不要继续重复 Git 状态命令"));
     }
 
     #[test]

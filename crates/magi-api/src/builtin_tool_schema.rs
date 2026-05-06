@@ -133,6 +133,24 @@ mod tests {
     }
 
     #[test]
+    fn shell_exec_definition_exposes_access_mode_contract() {
+        let definition = public_builtin_tool_definition("shell_exec").expect("public shell_exec");
+        let access_mode = &definition.function.parameters["properties"]["access_mode"];
+
+        assert_eq!(access_mode["type"], "string");
+        assert_eq!(
+            access_mode["enum"],
+            serde_json::json!(["read_only", "maybe_write", "explicit_write"])
+        );
+        assert!(
+            access_mode["description"]
+                .as_str()
+                .expect("description")
+                .contains("read_only")
+        );
+    }
+
+    #[test]
     fn internal_builtin_rejection_only_targets_known_internal_tools() {
         assert!(internal_builtin_tool_rejection_payload("process_launch").is_some());
         assert!(internal_builtin_tool_rejection_payload("shell_exec").is_none());

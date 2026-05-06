@@ -93,6 +93,7 @@
   }
 
   const parsedResult = $derived(parseJson(toolCall?.result));
+  const parsedErrorResult = $derived(parseJson(toolCall?.error));
   const terminal = $derived.by((): Partial<TerminalSessionBlock> | undefined => {
     if (!parsedResult && !toolCall) {
       return undefined;
@@ -149,11 +150,42 @@
     const raw = typeof toolCall?.result === 'string' ? toolCall.result : '';
     return formatOutput(raw);
   });
+
+  function structuredErrorText(errorPayload: Record<string, unknown> | unknown[] | null): string {
+    if (!errorPayload || Array.isArray(errorPayload)) {
+      return '';
+    }
+    const stderr = readString(errorPayload.stderr)?.trim();
+    if (stderr) {
+      return stderr;
+    }
+    const error = readString(errorPayload.error)?.trim();
+    if (error) {
+      return error;
+    }
+    const summary = readString(errorPayload.summary)?.trim();
+    if (summary) {
+      return summary;
+    }
+    return '';
+  }
+
+  function normalizeDisplayText(value: string): string {
+    return value.trim().replace(/\s+/g, ' ');
+  }
+
   const outputCursor = $derived(terminal?.outputCursor);
   const returnCode = $derived(terminal?.returnCode);
   const locked = $derived(Boolean(terminal?.locked));
   const startupMessage = $derived(terminal?.startupMessage || '');
-  const errorText = $derived(terminal?.error || toolCall?.error || '');
+  const errorText = $derived(terminal?.error || structuredErrorText(parsedErrorResult) || toolCall?.error || '');
+  const showErrorText = $derived.by(() => {
+    const normalizedError = normalizeDisplayText(errorText);
+    if (!normalizedError) {
+      return false;
+    }
+    return !normalizeDisplayText(displayOutput).includes(normalizedError);
+  });
   const accepted = $derived(terminal?.accepted);
   const killed = $derived(terminal?.killed);
   const releasedLock = $derived(terminal?.releasedLock);
@@ -211,7 +243,7 @@
     || displayCwd
     || showOutput
     || startupMessage
-    || errorText
+    || showErrorText
     || typeof outputCursor === 'number'
     || typeof returnCode === 'number'
     || typeof accepted === 'boolean'
@@ -323,7 +355,7 @@
           <div class="terminal-hint">{i18n.t('terminalSession.startup')}: {startupMessage}</div>
         {/if}
 
-        {#if errorText}
+        {#if showErrorText}
           <div class="terminal-error">{i18n.t('terminalSession.error')}: {errorText}</div>
         {/if}
 

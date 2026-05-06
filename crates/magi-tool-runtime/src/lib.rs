@@ -324,6 +324,11 @@ impl BuiltinToolName {
                     "cwd": { "type": "string", "description": "Working directory" },
                     "shell": { "type": "string", "description": "Shell binary to use" },
                     "timeout_ms": { "type": "integer", "description": "Execution timeout in milliseconds" },
+                    "access_mode": {
+                        "type": "string",
+                        "description": "Declare whether the command is read_only, maybe_write, or explicit_write. Use read_only for inspections such as ls, cat, grep, git status, git diff, and tests that do not modify files.",
+                        "enum": ["read_only", "maybe_write", "explicit_write"]
+                    },
                     "background": { "type": "boolean", "description": "Launch in the background instead of waiting for completion" }
                 },
                 "required": ["command"]
