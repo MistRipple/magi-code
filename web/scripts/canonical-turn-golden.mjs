@@ -229,7 +229,7 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, time
   const userItem = user(c, 1, '请用任务系统完成一次验证。');
   const dispatchA = workerDispatch(c, 3, 'dispatch-a', 'lane-a', 'integration-dev', '实现验证', 'completed');
   const dispatchB = workerDispatch(c, 4, 'dispatch-b', 'lane-b', 'reviewer', '代码评审', 'completed');
-  const orchestratorDispatchSummary = phase(c, 8, '已完成任务分配：2 个执行步骤交给 2 个负责人推进；我会在主线继续汇总关键进展。', 'completed');
+  const orchestratorDispatchSummary = phase(c, 8, '已完成任务编排：2 个阶段、2 个执行动作，由 2 个负责人推进；我会在主线继续汇总关键进展。', 'completed');
   orchestratorDispatchSummary.itemId = 'orchestrator-dispatch-summary';
   orchestratorDispatchSummary.visibility = {
     renderable: true,

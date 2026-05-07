@@ -2299,7 +2299,7 @@ mod tests {
         delivery.task_id = TaskId::new("task-root-summary-delivery");
         delivery.parent_task_id = Some(root_task_id.clone());
         delivery.kind = TaskKind::Action;
-        delivery.title = "验证交付".to_string();
+        delivery.title = "交付总结".to_string();
         delivery.output_refs = vec![
             "验证已完成，交付如下：\n- 前端端点：已成功执行只读命令，输出 `FRONTEND_MARKER`\n- 后端端点：已成功执行只读命令，输出 `BACKEND_MARKER`\n主线汇总：两个端点都已完成只读验证。"
                 .to_string(),

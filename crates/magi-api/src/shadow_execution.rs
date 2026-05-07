@@ -9,6 +9,7 @@ use magi_core::{
 use magi_event_bus::{EventContext, task_events};
 use magi_orchestrator::{
     ExecutionWritebackPlans,
+    task_store::TaskStore,
     task_worker_catalog::{compatible_task_role_for_kind, resolve_task_role},
 };
 use magi_session_store::{
@@ -453,17 +454,8 @@ pub(crate) fn run_shadow_dispatch_submission(
     }
     let lane_count = current_turn.worker_lanes.len();
     if lane_count > 0 {
-        let role_count = current_turn
-            .worker_lanes
-            .iter()
-            .filter_map(|lane| {
-                lane.role_id
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|role_id| !role_id.is_empty())
-            })
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
+        let orchestration_summary =
+            task_graph_mainline_summary(task_store, &obj_task_id, &current_turn.worker_lanes);
         current_turn.items.push(ActiveExecutionTurnItem {
             item_id: format!("turn-item-orchestrator-dispatch-{}", accepted_at.0),
             item_seq: lane_count + 3,
@@ -473,11 +465,7 @@ pub(crate) fn run_shadow_dispatch_submission(
             status: "pending".to_string(),
             source: "orchestrator".to_string(),
             title: Some("任务分配".to_string()),
-            content: Some(format!(
-                "已完成任务分配：{} 个执行步骤交给 {} 个负责人推进；我会在主线继续汇总关键进展。",
-                lane_count,
-                role_count.max(1)
-            )),
+            content: Some(orchestration_summary),
             task_id: Some(act_task_id.clone()),
             worker_id: None,
             role_id: None,
@@ -526,6 +514,67 @@ pub(crate) fn run_shadow_dispatch_submission(
             current_turn: Some(current_turn),
         }),
     })
+}
+
+fn task_graph_mainline_summary(
+    task_store: &TaskStore,
+    root_task_id: &TaskId,
+    worker_lanes: &[ActiveExecutionTurnLane],
+) -> String {
+    let mut phase_count = 0usize;
+    let mut action_count = 0usize;
+    let mut role_ids = std::collections::BTreeSet::<String>::new();
+    let mut pending = task_store.get_children(root_task_id);
+
+    while let Some(task) = pending.pop() {
+        match task.kind {
+            TaskKind::Phase => phase_count += 1,
+            TaskKind::Action => {
+                action_count += 1;
+                if let Some(binding) = task.executor_binding.as_ref() {
+                    let role_id = binding.target_role.trim();
+                    if !role_id.is_empty() {
+                        role_ids.insert(role_id.to_string());
+                    }
+                }
+            }
+            TaskKind::Validation | TaskKind::Repair => {
+                if let Some(binding) = task.executor_binding.as_ref() {
+                    let role_id = binding.target_role.trim();
+                    if !role_id.is_empty() {
+                        role_ids.insert(role_id.to_string());
+                    }
+                }
+            }
+            TaskKind::Objective | TaskKind::WorkPackage | TaskKind::Decision => {}
+        }
+        pending.extend(task_store.get_children(&task.task_id));
+    }
+
+    if phase_count > 0 {
+        return format!(
+            "已完成任务编排：{} 个阶段、{} 个执行动作，由 {} 个负责人推进；我会在主线继续汇总关键进展。",
+            phase_count,
+            action_count,
+            role_ids.len().max(1)
+        );
+    }
+
+    let fallback_role_count = worker_lanes
+        .iter()
+        .filter_map(|lane| {
+            lane.role_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|role_id| !role_id.is_empty())
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    format!(
+        "已完成执行分工：{} 个执行分支交给 {} 个负责人推进；我会在主线继续汇总关键进展。",
+        worker_lanes.len(),
+        fallback_role_count.max(1)
+    )
 }
 
 #[cfg(test)]
@@ -1707,7 +1756,8 @@ fn parse_decomposition_plan(
         return None;
     }
 
-    for phase in &mut plan.phases {
+    let last_phase_index = plan.phases.len().saturating_sub(1);
+    for (phase_index, phase) in plan.phases.iter_mut().enumerate() {
         phase.title = normalize_plan_text(&phase.title, original_prompt)?;
         if phase.work_packages.is_empty() {
             return None;
@@ -1720,6 +1770,9 @@ fn parse_decomposition_plan(
             for action in &mut package.actions {
                 action.title = normalize_plan_text(&action.title, original_prompt)?;
                 action.goal = normalize_plan_text(&action.goal, original_prompt)?;
+                if phase_index == last_phase_index {
+                    action.title = normalize_delivery_action_title(&action.title);
+                }
                 if action
                     .depends_on
                     .iter()
@@ -1736,6 +1789,14 @@ fn parse_decomposition_plan(
         }
     }
     Some(plan)
+}
+
+fn normalize_delivery_action_title(title: &str) -> String {
+    let trimmed = title.trim();
+    if trimmed == "验证交付" || trimmed == "交付验证" {
+        return "汇总结果".to_string();
+    }
+    trimmed.to_string()
 }
 
 fn normalize_plan_text(value: &str, original_prompt: &str) -> Option<String> {
@@ -1900,8 +1961,8 @@ mod tests {
                             "title": "交付工作包",
                             "actions": [
                                 {
-                                    "title": "验证交付",
-                                    "goal": "验证执行结果并交付"
+                                    "title": "汇总结果",
+                                    "goal": "基于执行结果和验证证据汇总结论"
                                 }
                             ]
                         }
@@ -1949,8 +2010,8 @@ mod tests {
                             "title": "交付工作包",
                             "actions": [
                                 {
-                                    "title": "验证交付",
-                                    "goal": "verify /Users/xie/code/TEST 的只读任务交付结果"
+                                    "title": "汇总结果",
+                                    "goal": "基于 /Users/xie/code/TEST 的只读任务执行结果汇总结论"
                                 }
                             ]
                         }
@@ -2352,7 +2413,7 @@ mod tests {
         );
         assert!(
             visible_items.iter().any(|(kind, content)| {
-                *kind == "assistant_phase" && content.contains("已完成任务分配")
+                *kind == "assistant_phase" && content.contains("已完成任务编排")
             }),
             "任务分配卡之后必须继续保留编排者自己的行为说明"
         );
@@ -2520,7 +2581,7 @@ mod tests {
         assert_eq!(execution.command_mode, "full");
         assert!(execution.allowed_tools.is_empty());
 
-        let delivery = policy_for_action("验证交付");
+        let delivery = policy_for_action("汇总结果");
         assert_eq!(delivery.command_mode, "no_tools");
         assert!(delivery.denied_tools.contains(&"file_remove".to_string()));
 
@@ -2531,7 +2592,7 @@ mod tests {
             .expect("execution action should exist");
         let delivery_action = tasks
             .iter()
-            .find(|task| task.kind == TaskKind::Action && task.title == "验证交付")
+            .find(|task| task.kind == TaskKind::Action && task.title == "汇总结果")
             .expect("delivery action should exist");
         assert!(
             delivery_action
