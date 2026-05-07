@@ -18,7 +18,7 @@ use magi_bridge_client::{
     BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerConfig,
     ModelBridgeClient, StdioMcpBridgeClient,
 };
-use magi_core::{SessionId, TaskId, UtcMillis, WorkspaceId};
+use magi_core::{SessionId, TaskId, TaskStatus, UtcMillis, WorkspaceId};
 use magi_event_bus::InMemoryEventBus;
 use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
@@ -340,7 +340,12 @@ impl RunnerManager {
                     }
                     RunCycleOutcome::Blocked(blocked_ids) => {
                         blocked_streak += 1;
-                        if blocked_streak >= max_blocked_streak {
+                        let should_finalize_blocked = blocked_streak >= max_blocked_streak
+                            || blocked_outcome_is_stable_waiting_state(
+                                &bg_task_store,
+                                &blocked_ids,
+                            );
+                        if should_finalize_blocked {
                             let runner_status = match task_runner
                                 .finalize_blocked_outcome(&root_id, &blocked_ids)
                             {
@@ -528,6 +533,20 @@ impl RunnerManager {
         let mut current = handle.status.lock().expect("status lock should hold");
         *current = status.to_string();
     }
+}
+
+fn blocked_outcome_is_stable_waiting_state(
+    task_store: &TaskStore,
+    blocked_task_ids: &[TaskId],
+) -> bool {
+    blocked_task_ids.iter().any(|task_id| {
+        task_store.get_task(task_id).is_some_and(|task| {
+            matches!(
+                task.status,
+                TaskStatus::AwaitingApproval | TaskStatus::Blocked
+            )
+        })
+    })
 }
 
 #[derive(Debug)]
@@ -1565,4 +1584,67 @@ pub(crate) fn build_mcp_config_from_entry(entry: &serde_json::Value) -> Option<M
         working_directory,
         env,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magi_core::{MissionId, Task, TaskKind};
+
+    fn task_with_status(task_id: &str, status: TaskStatus) -> Task {
+        let now = UtcMillis::now();
+        Task {
+            task_id: TaskId::new(task_id),
+            mission_id: MissionId::new("mission-stable-waiting-state"),
+            root_task_id: TaskId::new("task-root-stable-waiting-state"),
+            parent_task_id: None,
+            kind: TaskKind::Decision,
+            title: "等待确认".to_string(),
+            goal: "等待用户确认后继续".to_string(),
+            status,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn blocked_outcome_with_awaiting_decision_is_stable_waiting_state() {
+        let store = TaskStore::new();
+        let decision_id = TaskId::new("task-decision-awaiting");
+        store.insert_task(task_with_status(
+            decision_id.as_str(),
+            TaskStatus::AwaitingApproval,
+        ));
+
+        assert!(blocked_outcome_is_stable_waiting_state(
+            &store,
+            &[decision_id]
+        ));
+    }
+
+    #[test]
+    fn blocked_outcome_with_ready_task_still_uses_debounce() {
+        let store = TaskStore::new();
+        let ready_id = TaskId::new("task-ready-unmatched");
+        store.insert_task(task_with_status(ready_id.as_str(), TaskStatus::Ready));
+
+        assert!(!blocked_outcome_is_stable_waiting_state(
+            &store,
+            &[ready_id]
+        ));
+    }
 }

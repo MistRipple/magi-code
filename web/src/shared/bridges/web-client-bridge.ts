@@ -1631,7 +1631,8 @@ async function fetchBootstrap(
   const doFetch = async (): Promise<void> => {
     const { workspaceId, workspacePath, sessionId } = resolveWorkspaceQuery();
     if ((workspaceId || workspacePath) && !sessionId) {
-      dispatchWorkspaceSessionCleared(workspaceId, workspacePath);
+      clearWorkspaceSessionBinding(workspaceId, workspacePath);
+      await createSession();
       return;
     }
     const query = new URLSearchParams();
@@ -2969,7 +2970,10 @@ export function createWebClientBridge(): ClientBridge {
           const workspacePath = typeof message.workspacePath === 'string' ? message.workspacePath : '';
           const sessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
           if (!sessionId) {
-            dispatchWorkspaceSessionCleared(workspaceId, workspacePath);
+            clearWorkspaceSessionBinding(workspaceId, workspacePath);
+            void createSession().catch((error) => {
+              logBridgeOperationFailure('新建会话', '[web-client-bridge] 新建工作区会话失败:', error);
+            });
           } else {
             persistWorkspaceBinding(workspaceId, workspacePath, sessionId);
           }
