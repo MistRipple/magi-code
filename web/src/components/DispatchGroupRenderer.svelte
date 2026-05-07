@@ -3,11 +3,11 @@
   import type { IconName } from '../lib/icons';
   import { getAgentVisualInfo } from '../lib/agent-colors';
   import {
-    buildDispatchPresentationSteps,
-    countDispatchBatchSteps,
-    type DispatchPresentationStep,
-  } from '../lib/dispatch-group-presentation';
+    buildTaskOrchestrationView,
+    type TaskOrchestrationPhase,
+  } from '../lib/task-orchestration-presentation';
   import { resolveWorkerDisplayName, resolveWorkerRoleSource } from '../lib/worker-role-utils';
+  import { getTaskGraphState } from '../stores/task-graph-store.svelte';
   import { getEnabledAgents, getState, setCurrentBottomTab } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
@@ -28,42 +28,27 @@
     icon: IconName;
   }
 
-  interface StageViewModel {
+  interface FallbackLaneViewModel {
     key: string;
-    laneId: string;
     displayIndex: number;
     title: string;
     status: WorkerLaneStatus;
     workerTabId: string;
-    workerDisplayName: string;
-    workerColor: string;
-    workerMuted: string;
-    workerIcon: IconName;
-    summary: string;
-    currentTaskTitle: string;
-    toolUseCount: number;
-    fileChangeCount: number;
-    totalTaskCount: number;
-    completedCount: number;
-    isClickable: boolean;
-  }
-
-  interface StepViewModel extends DispatchPresentationStep<StageViewModel> {
-    summary: string;
-    currentTaskTitle: string;
-    toolUseCount: number;
-    fileChangeCount: number;
     workerDisplayLabel: string;
     workerColor: string;
     workerMuted: string;
     workerIcon: IconName;
-    workerTabId: string;
+    summary: string;
+    toolUseCount: number;
+    fileChangeCount: number;
     isClickable: boolean;
   }
 
   const appState = getState();
   const enabledAgents = $derived(getEnabledAgents());
   const registrySnapshot = $derived(appState.settingsRegistrySnapshot);
+  const currentSessionId = $derived(typeof appState.currentSessionId === 'string' ? appState.currentSessionId.trim() : '');
+  const taskGraph = $derived(getTaskGraphState(currentSessionId));
 
   const lanes = $derived.by(() => (
     Array.isArray(block.lanes)
@@ -75,6 +60,8 @@
         .map((entry) => entry.lane)
       : []
   ));
+
+  const orchestration = $derived(buildTaskOrchestrationView(taskGraph.projection, lanes));
 
   function normalizeText(value: unknown): string {
     return typeof value === 'string' ? value.trim() : '';
@@ -130,25 +117,14 @@
   }
 
   function resolveWorkerMeta(workerId: string) {
-    const roleSource = resolveWorkerRoleSource(workerId, enabledAgents, registrySnapshot);
-    const tabId = normalizeText(roleSource?.templateId) || workerId;
-    const displayName = workerId === 'orchestrator'
+    const normalizedWorkerId = normalizeText(workerId) || 'orchestrator';
+    const roleSource = resolveWorkerRoleSource(normalizedWorkerId, enabledAgents, registrySnapshot);
+    const tabId = normalizeText(roleSource?.templateId) || normalizedWorkerId;
+    const displayName = normalizedWorkerId === 'orchestrator'
       ? i18n.t('workerBadge.role.orchestrator')
       : resolveWorkerDisplayName(tabId, enabledAgents, registrySnapshot, (key) => i18n.t(key));
     const visualInfo = getAgentVisualInfo(tabId, roleSource?.colorToken);
     return { tabId, displayName, visualInfo };
-  }
-
-  function resolveLaneWorkerId(lane: DispatchGroupLane): string {
-    return normalizeText(lane.jumpTarget?.workerTabId)
-      || normalizeText(lane.worker)
-      || 'orchestrator';
-  }
-
-  function resolveLaneTitle(lane: DispatchGroupLane): string {
-    return normalizeText(lane.title)
-      || normalizeText(lane.description)
-      || i18n.t('dispatchGroupCard.stageFallback');
   }
 
   function resolveLaneOrder(lane: DispatchGroupLane, fallback: number): number {
@@ -164,36 +140,10 @@
     return fallback;
   }
 
-  function resolvePositiveCount(value: unknown, fallback = 0): number {
+  function resolvePositiveCount(value: unknown): number {
     return typeof value === 'number' && Number.isFinite(value) && value > 0
       ? Math.floor(value)
-      : fallback;
-  }
-
-  function resolveLaneCurrentTaskTitle(lane: DispatchGroupLane): string {
-    const laneStatus = normalizeStatus(lane.status);
-    const laneTitle = resolveLaneTitle(lane);
-    const task = Array.isArray(lane.tasks)
-      ? lane.tasks.find((item) => item.isCurrent)
-        || lane.tasks.find((item) => normalizeStatus(item.status || laneStatus) === 'running')
-        || lane.tasks.find((item) => normalizeStatus(item.status || laneStatus) === 'pending')
-      : undefined;
-    const title = normalizeText(task?.title);
-    return title && title !== laneTitle ? title : '';
-  }
-
-  function resolveLaneTaskCounts(lane: DispatchGroupLane, laneStatus: WorkerLaneStatus) {
-    const taskCount = Array.isArray(lane.tasks) ? lane.tasks.length : 0;
-    const totalTaskCount = resolvePositiveCount(lane.progressSummary?.totalTaskCount, Math.max(taskCount, 1));
-    const completedFromSummary = resolvePositiveCount(lane.progressSummary?.completedTaskCount);
-    if (completedFromSummary > 0) {
-      return { totalTaskCount, completedCount: Math.min(completedFromSummary, totalTaskCount) };
-    }
-    if (taskCount > 0) {
-      const completedCount = lane.tasks!.filter((task) => normalizeStatus(task.status || laneStatus) === 'completed').length;
-      return { totalTaskCount, completedCount };
-    }
-    return { totalTaskCount, completedCount: laneStatus === 'completed' ? totalTaskCount : 0 };
+      : 0;
   }
 
   function compactSummary(value: string): string {
@@ -204,112 +154,63 @@
     return firstLine.length > 140 ? `${firstLine.slice(0, 137)}...` : firstLine;
   }
 
-  function latestStageText(stages: StageViewModel[], field: 'summary' | 'currentTaskTitle'): string {
-    for (let index = stages.length - 1; index >= 0; index -= 1) {
-      const value = normalizeText(stages[index]?.[field]);
-      if (value) {
-        return value;
-      }
-    }
-    return '';
+  function resolveFallbackLaneTitle(lane: DispatchGroupLane): string {
+    return normalizeText(lane.title)
+      || normalizeText(lane.description)
+      || i18n.t('dispatchGroupCard.stageFallback');
   }
 
-  function sumStageCounts(stages: StageViewModel[], field: 'toolUseCount' | 'fileChangeCount'): number {
-    return stages.reduce((total, stage) => total + resolvePositiveCount(stage[field]), 0);
+  function resolveFallbackLaneWorkerId(lane: DispatchGroupLane): string {
+    return normalizeText(lane.jumpTarget?.workerTabId)
+      || normalizeText(lane.worker)
+      || 'orchestrator';
   }
 
-  function resolveStepWorkerInfo(stages: StageViewModel[]) {
-    const workerTabIds = Array.from(new Set(stages.map((stage) => stage.workerTabId).filter(Boolean)));
-    const firstWorker = stages.find((stage) => stage.workerTabId && stage.workerTabId !== 'orchestrator')
-      || stages[0];
-    if (!firstWorker) {
-      return {
-        workerDisplayLabel: i18n.t('subTaskSummaryCard.defaultExecutor'),
-        workerColor: 'var(--primary)',
-        workerMuted: 'color-mix(in srgb, var(--primary) 12%, transparent)',
-        workerIcon: 'bot' as IconName,
-        workerTabId: 'orchestrator',
-        isClickable: false,
-      };
-    }
-    if (workerTabIds.length <= 1) {
-      return {
-        workerDisplayLabel: firstWorker.workerDisplayName,
-        workerColor: firstWorker.workerColor,
-        workerMuted: firstWorker.workerMuted,
-        workerIcon: firstWorker.workerIcon,
-        workerTabId: firstWorker.workerTabId,
-        isClickable: firstWorker.isClickable,
-      };
-    }
-    return {
-      workerDisplayLabel: i18n.t('dispatchGroupCard.multipleOwners', { workerCount: workerTabIds.length }),
-      workerColor: 'var(--primary)',
-      workerMuted: 'color-mix(in srgb, var(--primary) 12%, transparent)',
-      workerIcon: 'profile' as IconName,
-      workerTabId: firstWorker.workerTabId,
-      isClickable: firstWorker.isClickable,
-    };
-  }
-
-  const stages = $derived.by<StageViewModel[]>(() => (
+  const fallbackRows = $derived.by<FallbackLaneViewModel[]>(() => (
     lanes.map((lane, index) => {
-      const workerId = resolveLaneWorkerId(lane);
+      const workerId = resolveFallbackLaneWorkerId(lane);
       const { tabId, displayName, visualInfo } = resolveWorkerMeta(workerId);
-      const laneStatus = normalizeStatus(lane.status);
-      const { totalTaskCount, completedCount } = resolveLaneTaskCounts(lane, laneStatus);
-      const workerTabId = tabId || workerId;
       return {
         key: lane.laneId,
-        laneId: lane.laneId,
         displayIndex: index + 1,
-        title: resolveLaneTitle(lane),
-        status: laneStatus,
-        workerTabId,
-        workerDisplayName: displayName,
+        title: resolveFallbackLaneTitle(lane),
+        status: normalizeStatus(lane.status),
+        workerTabId: tabId || workerId,
+        workerDisplayLabel: displayName,
         workerColor: visualInfo.color,
         workerMuted: visualInfo.muted,
         workerIcon: visualInfo.icon,
         summary: compactSummary(normalizeText(lane.summary) || normalizeText(lane.liveActivity)),
-        currentTaskTitle: resolveLaneCurrentTaskTitle(lane),
         toolUseCount: resolvePositiveCount(lane.toolUseCount),
         fileChangeCount: resolvePositiveCount(lane.fileChangeCount),
-        totalTaskCount,
-        completedCount,
-        isClickable: workerTabId !== 'orchestrator',
+        isClickable: workerId !== 'orchestrator',
       };
     })
   ));
 
-  const steps = $derived.by<StepViewModel[]>(() => (
-    buildDispatchPresentationSteps(stages).map((step) => {
-      const workerInfo = resolveStepWorkerInfo(step.stages);
-      return {
-        ...step,
-        summary: latestStageText(step.stages, 'summary'),
-        currentTaskTitle: latestStageText(step.stages, 'currentTaskTitle'),
-        toolUseCount: sumStageCounts(step.stages, 'toolUseCount'),
-        fileChangeCount: sumStageCounts(step.stages, 'fileChangeCount'),
-        ...workerInfo,
-      };
-    })
+  const fallbackStatus = $derived.by(() => fallbackRows.reduce<WorkerLaneStatus>(
+    (status, lane) => mergeLaneStatus(status, lane.status),
+    fallbackRows.length > 0 ? 'completed' : 'pending',
   ));
 
-  const totalStageCount = $derived.by(() => stages.length);
-  const totalStepCount = $derived.by(() => steps.length);
-  const completedStepCount = $derived.by(() => steps.filter((step) => step.status === 'completed').length);
-  const workerCount = $derived.by(() => new Set(stages.map((stage) => stage.workerTabId).filter(Boolean)).size);
-  const groupStatus = $derived.by(() => stages.reduce<WorkerLaneStatus>(
-    (status, stage) => mergeLaneStatus(status, stage.status),
-    stages.length > 0 ? 'completed' : 'pending',
-  ));
-  const groupStatusConfig = $derived.by(() => resolveStatusConfig(groupStatus));
-  const batchCount = $derived.by(() => countDispatchBatchSteps(steps));
-  const groupSummary = $derived.by(() => (
-    batchCount > 0
-      ? i18n.t('dispatchGroupCard.batchSummary', { batchCount, stepCount: totalStageCount, workerCount })
-      : i18n.t('dispatchGroupCard.summary', { stepCount: totalStepCount, workerCount })
-  ));
+  function phaseWorkerInfo(phase: TaskOrchestrationPhase) {
+    const workerId = phase.workerTabId || phase.executorRoleIds[0] || 'orchestrator';
+    const { tabId, displayName, visualInfo } = resolveWorkerMeta(workerId);
+    return {
+      workerTabId: tabId || workerId,
+      workerDisplayLabel: displayName,
+      workerColor: visualInfo.color,
+      workerMuted: visualInfo.muted,
+      workerIcon: visualInfo.icon,
+      isClickable: workerId !== 'orchestrator',
+    };
+  }
+
+  const groupStatusConfig = $derived.by(() => resolveStatusConfig(orchestration?.status || fallbackStatus));
+  const fallbackSummary = $derived(i18n.t('dispatchGroupCard.dispatchSummary', {
+    laneCount: fallbackRows.length,
+    workerCount: new Set(fallbackRows.map((row) => row.workerTabId).filter(Boolean)).size,
+  }));
 
   function openWorkerTab(tabId: string) {
     const normalizedTabId = normalizeText(tabId);
@@ -320,7 +221,7 @@
   }
 </script>
 
-{#if lanes.length > 0}
+{#if orchestration}
   <section class="dispatch-group-card" data-dispatch-wave-id={block.dispatchWaveId}>
     <div class="dispatch-group-card__accent" aria-hidden="true"></div>
     <div class="dispatch-group-card__body">
@@ -331,11 +232,17 @@
           </span>
           <div class="dispatch-group-card__title-text">
             <span class="dispatch-group-card__title">{i18n.t('dispatchGroupCard.title')}</span>
-            <span class="dispatch-group-card__subtitle">{groupSummary}</span>
+            <span class="dispatch-group-card__subtitle">
+              {i18n.t('dispatchGroupCard.orchestrationSummary', {
+                phaseCount: orchestration.totalPhaseCount,
+                actionCount: orchestration.totalActionCount,
+                workerCount: orchestration.workerRoleIds.length,
+              })}
+            </span>
           </div>
         </div>
         <div class="dispatch-group-card__statusline">
-          <span class="dispatch-group-card__progress">{i18n.t('dispatchGroupCard.progress', { completed: completedStepCount, total: totalStepCount })}</span>
+          <span class="dispatch-group-card__progress">{i18n.t('dispatchGroupCard.progress', { completed: orchestration.completedPhaseCount, total: orchestration.totalPhaseCount })}</span>
           <span class={`dispatch-group-card__status dispatch-group-card__status--${groupStatusConfig.tone}`}>
             <Icon name={groupStatusConfig.icon} size={12} />
             <span>{i18n.t(groupStatusConfig.key)}</span>
@@ -344,49 +251,128 @@
       </div>
 
       <div class="dispatch-group-card__stages">
-        {#each steps as step (step.key)}
-          {@const statusConfig = resolveStatusConfig(step.status)}
+        {#each orchestration.phases as phase, index (phase.key)}
+          {@const statusConfig = resolveStatusConfig(phase.status)}
+          {@const workerInfo = phaseWorkerInfo(phase)}
           <button
             type="button"
             class="dispatch-group-card__stage-row"
-            class:is-clickable={step.isClickable && !readOnly}
-            style={`--worker-color:${step.workerColor};--worker-muted:${step.workerMuted};`}
-            disabled={readOnly || !step.isClickable}
-            onclick={() => openWorkerTab(step.workerTabId)}
-            aria-label={step.isClickable ? i18n.t('subTaskSummaryCard.clickToView', { workerLabel: step.workerDisplayLabel }) : undefined}
+            class:is-clickable={workerInfo.isClickable && !readOnly}
+            style={`--worker-color:${workerInfo.workerColor};--worker-muted:${workerInfo.workerMuted};`}
+            disabled={readOnly || !workerInfo.isClickable}
+            onclick={() => openWorkerTab(workerInfo.workerTabId)}
+            aria-label={workerInfo.isClickable ? i18n.t('subTaskSummaryCard.clickToView', { workerLabel: workerInfo.workerDisplayLabel }) : undefined}
           >
             <span class={`dispatch-group-card__stage-index dispatch-group-card__stage-index--${statusConfig.tone}`}>
-              {step.displayIndex}
+              {index + 1}
             </span>
             <span class="dispatch-group-card__stage-main">
               <span class="dispatch-group-card__stage-topline">
-                <span class="dispatch-group-card__stage-title">{step.title}</span>
+                <span class="dispatch-group-card__stage-title">{phase.title}</span>
+                <span class={`dispatch-group-card__mini-status dispatch-group-card__mini-status--${statusConfig.tone}`}>
+                  <Icon name={statusConfig.icon} size={11} />
+                  <span>{i18n.t(statusConfig.key)}</span>
+                </span>
+                {#if phase.validationStatus}
+                  {@const validationConfig = resolveStatusConfig(phase.validationStatus)}
+                  <span class={`dispatch-group-card__mini-status dispatch-group-card__mini-status--${validationConfig.tone}`}>
+                    <Icon name={validationConfig.icon} size={11} />
+                    <span>{i18n.t('dispatchGroupCard.validationLabel', { status: i18n.t(validationConfig.key) })}</span>
+                  </span>
+                {/if}
+              </span>
+              {#if phase.actionTitles.length > 0}
+                <span class="dispatch-group-card__current">
+                  {i18n.t('dispatchGroupCard.actionLabel', { actions: phase.actionTitles.join('、') })}
+                </span>
+              {/if}
+              {#if phase.summary}
+                <span class="dispatch-group-card__summary">{phase.summary}</span>
+              {/if}
+              <span class="dispatch-group-card__owner">
+                <span class="dispatch-group-card__owner-icon">
+                  <Icon name={workerInfo.workerIcon} size={11} />
+                </span>
+                <span>{i18n.t('dispatchGroupCard.owner', { workerLabel: workerInfo.workerDisplayLabel })}</span>
+              </span>
+            </span>
+            {#if phase.toolUseCount > 0 || phase.fileChangeCount > 0}
+              <span class="dispatch-group-card__stage-metrics">
+                {#if phase.toolUseCount > 0}
+                  <span>{i18n.t('subTaskSummaryCard.toolCallCount', { count: phase.toolUseCount })}</span>
+                {/if}
+                {#if phase.fileChangeCount > 0}
+                  <span>{i18n.t('subTaskSummaryCard.fileChangeCount', { count: phase.fileChangeCount })}</span>
+                {/if}
+              </span>
+            {/if}
+          </button>
+        {/each}
+      </div>
+    </div>
+  </section>
+{:else if fallbackRows.length > 0}
+  <section class="dispatch-group-card" data-dispatch-wave-id={block.dispatchWaveId}>
+    <div class="dispatch-group-card__accent" aria-hidden="true"></div>
+    <div class="dispatch-group-card__body">
+      <div class="dispatch-group-card__header">
+        <div class="dispatch-group-card__title-wrap">
+          <span class="dispatch-group-card__icon">
+            <Icon name="profile" size={14} />
+          </span>
+          <div class="dispatch-group-card__title-text">
+            <span class="dispatch-group-card__title">{i18n.t('dispatchGroupCard.dispatchTitle')}</span>
+            <span class="dispatch-group-card__subtitle">{fallbackSummary}</span>
+          </div>
+        </div>
+        <div class="dispatch-group-card__statusline">
+          <span class={`dispatch-group-card__status dispatch-group-card__status--${groupStatusConfig.tone}`}>
+            <Icon name={groupStatusConfig.icon} size={12} />
+            <span>{i18n.t(groupStatusConfig.key)}</span>
+          </span>
+        </div>
+      </div>
+
+      <div class="dispatch-group-card__stages">
+        {#each fallbackRows as row (row.key)}
+          {@const statusConfig = resolveStatusConfig(row.status)}
+          <button
+            type="button"
+            class="dispatch-group-card__stage-row"
+            class:is-clickable={row.isClickable && !readOnly}
+            style={`--worker-color:${row.workerColor};--worker-muted:${row.workerMuted};`}
+            disabled={readOnly || !row.isClickable}
+            onclick={() => openWorkerTab(row.workerTabId)}
+            aria-label={row.isClickable ? i18n.t('subTaskSummaryCard.clickToView', { workerLabel: row.workerDisplayLabel }) : undefined}
+          >
+            <span class={`dispatch-group-card__stage-index dispatch-group-card__stage-index--${statusConfig.tone}`}>
+              {row.displayIndex}
+            </span>
+            <span class="dispatch-group-card__stage-main">
+              <span class="dispatch-group-card__stage-topline">
+                <span class="dispatch-group-card__stage-title">{row.title}</span>
                 <span class={`dispatch-group-card__mini-status dispatch-group-card__mini-status--${statusConfig.tone}`}>
                   <Icon name={statusConfig.icon} size={11} />
                   <span>{i18n.t(statusConfig.key)}</span>
                 </span>
               </span>
-              {#if step.summary}
-                <span class="dispatch-group-card__summary">{step.summary}</span>
-              {:else if step.currentTaskTitle}
-                <span class="dispatch-group-card__current">
-                  {i18n.t('subTaskSummaryCard.currentTask')} {step.currentTaskTitle}
-                </span>
+              {#if row.summary}
+                <span class="dispatch-group-card__summary">{row.summary}</span>
               {/if}
               <span class="dispatch-group-card__owner">
                 <span class="dispatch-group-card__owner-icon">
-                  <Icon name={step.workerIcon} size={11} />
+                  <Icon name={row.workerIcon} size={11} />
                 </span>
-                <span>{i18n.t('dispatchGroupCard.owner', { workerLabel: step.workerDisplayLabel })}</span>
+                <span>{i18n.t('dispatchGroupCard.owner', { workerLabel: row.workerDisplayLabel })}</span>
               </span>
             </span>
-            {#if step.toolUseCount > 0 || step.fileChangeCount > 0}
+            {#if row.toolUseCount > 0 || row.fileChangeCount > 0}
               <span class="dispatch-group-card__stage-metrics">
-                {#if step.toolUseCount > 0}
-                  <span>{i18n.t('subTaskSummaryCard.toolCallCount', { count: step.toolUseCount })}</span>
+                {#if row.toolUseCount > 0}
+                  <span>{i18n.t('subTaskSummaryCard.toolCallCount', { count: row.toolUseCount })}</span>
                 {/if}
-                {#if step.fileChangeCount > 0}
-                  <span>{i18n.t('subTaskSummaryCard.fileChangeCount', { count: step.fileChangeCount })}</span>
+                {#if row.fileChangeCount > 0}
+                  <span>{i18n.t('subTaskSummaryCard.fileChangeCount', { count: row.fileChangeCount })}</span>
                 {/if}
               </span>
             {/if}

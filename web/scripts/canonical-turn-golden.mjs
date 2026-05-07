@@ -12,15 +12,15 @@ try {
   const reducer = await server.ssrLoadModule('/src/stores/turn-reducer.ts');
   const projection = await server.ssrLoadModule('/src/stores/turn-projection.ts');
   const timelineRenderItems = await server.ssrLoadModule('/src/lib/timeline-render-items.ts');
-  const dispatchGroupPresentation = await server.ssrLoadModule('/src/lib/dispatch-group-presentation.ts');
+  const taskOrchestrationPresentation = await server.ssrLoadModule('/src/lib/task-orchestration-presentation.ts');
   const contract = await server.ssrLoadModule('/src/shared/bridges/rust-daemon-contract.ts');
-  runGoldenReplay(reducer, projection, timelineRenderItems, dispatchGroupPresentation, contract);
+  runGoldenReplay(reducer, projection, timelineRenderItems, taskOrchestrationPresentation, contract);
   console.log('canonical turn golden replay passed');
 } finally {
   await server.close();
 }
 
-function runGoldenReplay(reducer, projection, timelineRenderItems, dispatchGroupPresentation, contract) {
+function runGoldenReplay(reducer, projection, timelineRenderItems, taskOrchestrationPresentation, contract) {
   const cases = [
     acceptedFirstFrameCase(),
     ordinaryChatCase(),
@@ -64,114 +64,126 @@ function runGoldenReplay(reducer, projection, timelineRenderItems, dispatchGroup
   assertFailedToolWithoutAssistantShowsTurnResponseDuration(reducer, projection);
   assertThreadVisibleRoleMetadataDoesNotBecomeWorkerBadge(reducer, projection);
   assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, timelineRenderItems);
-  assertDispatchGroupPresentationKeepsSequentialBatchesReadable(dispatchGroupPresentation);
+  assertTaskOrchestrationPresentationUsesTaskGraph(taskOrchestrationPresentation);
   assertBootstrapProcessingStateFromRunningCanonicalTurn(contract);
   assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract);
   assertBootstrapCarriesPendingChanges(contract);
 }
 
-function assertDispatchGroupPresentationKeepsSequentialBatchesReadable(dispatchGroupPresentation) {
-  const steps = dispatchGroupPresentation.buildDispatchPresentationSteps([
-    { key: 'goal', title: '梳理目标', status: 'completed' },
-    { key: 'planning', title: '规划', status: 'completed' },
-    { key: 'phase-one', title: '第一批执行', status: 'completed' },
-    { key: 'action-one', title: '执行第一批', status: 'completed' },
-    { key: 'validate-one', title: '第一批执行验证', status: 'completed' },
-    { key: 'phase-two', title: '第二批执行', status: 'running' },
-    { key: 'action-two', title: '执行第二批', status: 'pending' },
-    { key: 'validate-two', title: '第二批执行验证', status: 'pending' },
-    { key: 'delivery', title: '交付', status: 'pending' },
+function assertTaskOrchestrationPresentationUsesTaskGraph(taskOrchestrationPresentation) {
+  const mkTask = (task_id, parent_task_id, kind, title, status, target_role = '') => ({
+    task_id,
+    mission_id: 'mission-orchestration',
+    root_task_id: 'task-root',
+    parent_task_id,
+    kind,
+    title,
+    goal: `${title} goal`,
+    status,
+    dependency_ids: [],
+    required_children: [],
+    policy_snapshot: null,
+    executor_binding: target_role ? { target_role, capability_requirements: [] } : null,
+    context_refs: [],
+    knowledge_refs: [],
+    workspace_scope: null,
+    write_scope: null,
+    input_refs: [],
+    output_refs: [],
+    evidence_refs: [],
+    retry_count: 0,
+    repair_count: 0,
+    decision_payload: null,
+    created_at: Number(task_id.replace(/\D/g, '') || 0),
+    updated_at: Number(task_id.replace(/\D/g, '') || 0),
+  });
+  const projectionValue = {
+    root_task: mkTask('task-root', null, 'Objective', '多段任务编排验证', 'Completed'),
+    tasks: [
+      mkTask('task-root', null, 'Objective', '多段任务编排验证', 'Completed'),
+      mkTask('task-phase-1', 'task-root', 'Phase', '规划', 'Completed'),
+      mkTask('task-wp-1', 'task-phase-1', 'WorkPackage', '规划工作包', 'Completed'),
+      mkTask('task-action-1', 'task-wp-1', 'Action', '梳理目标', 'Completed', 'integration-dev'),
+      mkTask('task-validation-1', 'task-phase-1', 'Validation', '规划验证', 'Completed', 'reviewer'),
+      mkTask('task-phase-2', 'task-root', 'Phase', '第一批执行', 'Completed'),
+      mkTask('task-wp-2', 'task-phase-2', 'WorkPackage', '第一批工作包', 'Completed'),
+      mkTask('task-action-2', 'task-wp-2', 'Action', '执行第一批', 'Completed', 'integration-dev'),
+      mkTask('task-validation-2', 'task-phase-2', 'Validation', '第一批执行验证', 'Completed', 'reviewer'),
+      mkTask('task-phase-3', 'task-root', 'Phase', '第二批执行', 'Running'),
+      mkTask('task-wp-3', 'task-phase-3', 'WorkPackage', '第二批工作包', 'Ready'),
+      mkTask('task-action-3', 'task-wp-3', 'Action', '执行第二批', 'Ready', 'integration-dev'),
+      mkTask('task-validation-3', 'task-phase-3', 'Validation', '第二批执行验证', 'Ready', 'reviewer'),
+      mkTask('task-phase-4', 'task-root', 'Phase', '交付', 'Ready'),
+      mkTask('task-wp-4', 'task-phase-4', 'WorkPackage', '交付工作包', 'Ready'),
+      mkTask('task-action-4', 'task-wp-4', 'Action', '汇总两批结果', 'Ready', 'integration-dev'),
+    ],
+    current_phase: '第二批执行',
+    running_tasks: ['task-phase-3'],
+    blocked_tasks: [],
+    pending_decisions: [],
+    workpackage_summaries: [],
+    validation_summary: null,
+    progress_summary: {
+      total_tasks: 16,
+      completed_tasks: 8,
+      settled_tasks: 8,
+      failed_tasks: 0,
+      running_tasks: 1,
+      blocked_tasks: 0,
+    },
+    aggregate_status: 'Running',
+    display_status: '运行中',
+    execution_mode: 'deep',
+    runner_status: 'running',
+  };
+  const view = taskOrchestrationPresentation.buildTaskOrchestrationView(projectionValue, [
+    {
+      laneId: 'lane-validation-2',
+      laneVersion: 1,
+      worker: 'reviewer',
+      title: '第一批执行验证',
+      status: 'completed',
+      summary: '通过。已验证第一批结果。',
+      tasks: [{ taskId: 'task-validation-2', title: '第一批执行验证', status: 'completed', seq: 3 }],
+    },
   ]);
+  assert.ok(view, 'task orchestration view should be built from task projection');
   assert.deepEqual(
-    steps.map((step) => ({
-      key: step.key,
-      kind: step.kind,
-      title: step.title,
-      status: step.status,
-      totalStageCount: step.totalStageCount,
-      completedStageCount: step.completedStageCount,
+    view.phases.map((phase) => ({
+      title: phase.title,
+      status: phase.status,
+      actionTitles: phase.actionTitles,
+      validationStatus: phase.validationStatus,
     })),
     [
       {
-        key: 'goal',
-        kind: 'planning',
-        title: '梳理目标',
-        status: 'completed',
-        totalStageCount: 1,
-        completedStageCount: 1,
-      },
-      {
-        key: 'planning',
-        kind: 'planning',
         title: '规划',
         status: 'completed',
-        totalStageCount: 1,
-        completedStageCount: 1,
+        actionTitles: ['梳理目标'],
+        validationStatus: 'completed',
       },
       {
-        key: 'phase-one',
-        kind: 'batch',
         title: '第一批执行',
         status: 'completed',
-        totalStageCount: 1,
-        completedStageCount: 1,
+        actionTitles: ['执行第一批'],
+        validationStatus: 'completed',
       },
       {
-        key: 'action-one',
-        kind: 'batch',
-        title: '执行第一批',
-        status: 'completed',
-        totalStageCount: 1,
-        completedStageCount: 1,
-      },
-      {
-        key: 'validate-one',
-        kind: 'batch',
-        title: '第一批执行验证',
-        status: 'completed',
-        totalStageCount: 1,
-        completedStageCount: 1,
-      },
-      {
-        key: 'phase-two',
-        kind: 'batch',
         title: '第二批执行',
         status: 'running',
-        totalStageCount: 1,
-        completedStageCount: 0,
+        actionTitles: ['执行第二批'],
+        validationStatus: 'pending',
       },
       {
-        key: 'action-two',
-        kind: 'batch',
-        title: '执行第二批',
-        status: 'pending',
-        totalStageCount: 1,
-        completedStageCount: 0,
-      },
-      {
-        key: 'validate-two',
-        kind: 'batch',
-        title: '第二批执行验证',
-        status: 'pending',
-        totalStageCount: 1,
-        completedStageCount: 0,
-      },
-      {
-        key: 'delivery',
-        kind: 'delivery',
         title: '交付',
         status: 'pending',
-        totalStageCount: 1,
-        completedStageCount: 0,
+        actionTitles: ['汇总两批结果'],
+        validationStatus: null,
       },
     ],
-    'dispatch group presentation should keep canonical orchestration steps separate and readable',
+    'task orchestration presentation must keep task graph phases as the user-facing mainline structure',
   );
-  assert.equal(
-    dispatchGroupPresentation.countDispatchBatchSteps(steps),
-    2,
-    'dispatch group summary should count user-facing batches, not internal validation lanes',
-  );
+  assert.equal(view.totalPhaseCount, 4, 'task orchestration summary should count phases, not worker lanes');
 }
 
 function assertThreadVisibleRoleMetadataDoesNotBecomeWorkerBadge(reducer, projection) {
