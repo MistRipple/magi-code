@@ -486,6 +486,9 @@ fn pending_changes_for_scope(
     if scope.allowed_files.is_empty() {
         return Ok(Vec::new());
     }
+    if !workspace_is_git_worktree(&scope.workspace_root) {
+        return pending_changes_for_non_git_scope(scope);
+    }
 
     let mut args = vec!["status", "--porcelain=v1", "--untracked-files=all", "--"];
     let file_refs = scope
@@ -502,6 +505,19 @@ fn pending_changes_for_scope(
         .filter(|(status_code, _)| status_has_unapproved_changes(status_code))
         .filter(|(_, file_path)| session_change_scope_allows_path(scope, file_path))
         .map(|(status_code, file_path)| build_pending_change(scope, &status_code, &file_path))
+        .collect::<Result<Vec<_>, _>>()?;
+    changes.sort_by(|left, right| left.file_path.cmp(&right.file_path));
+    Ok(changes)
+}
+
+fn pending_changes_for_non_git_scope(
+    scope: &SessionChangeScope,
+) -> Result<Vec<PendingChangeDto>, ApiError> {
+    let mut changes = scope
+        .allowed_files
+        .iter()
+        .filter(|file_path| session_change_scope_allows_path(scope, file_path))
+        .filter_map(|file_path| build_non_git_pending_change(scope, file_path).transpose())
         .collect::<Result<Vec<_>, _>>()?;
     changes.sort_by(|left, right| left.file_path.cmp(&right.file_path));
     Ok(changes)
@@ -593,6 +609,35 @@ fn infer_change_type(status_code: &str, original_content: &str, preview_exists: 
     "modify".to_string()
 }
 
+fn build_non_git_pending_change(
+    scope: &SessionChangeScope,
+    file_path: &str,
+) -> Result<Option<PendingChangeDto>, ApiError> {
+    let relative_path = safe_relative_path(file_path)?.to_string();
+    let absolute_path = scope.workspace_root.join(&relative_path);
+    if !absolute_path.is_file() {
+        return Ok(None);
+    }
+    let preview_content = read_file_lossy(&absolute_path);
+    let additions = count_text_lines(&preview_content);
+    let updated_at = file_updated_at(&absolute_path).unwrap_or_else(UtcMillis::now);
+    Ok(Some(PendingChangeDto {
+        file_path: relative_path.clone(),
+        snapshot_id: format!("{}:{}", scope.execution_group_id, relative_path),
+        updated_at,
+        r#type: "add".to_string(),
+        additions,
+        deletions: 0,
+        diff: build_added_file_diff(&relative_path, &preview_content),
+        original_content: String::new(),
+        preview_content,
+        preview_absolute_path: absolute_path.to_string_lossy().to_string(),
+        preview_can_open_workspace_file: true,
+        contributors: scope.contributors.clone(),
+        execution_group_id: scope.execution_group_id.clone(),
+    }))
+}
+
 fn build_diff(
     workspace_root: &Path,
     file_path: &str,
@@ -614,6 +659,19 @@ fn build_diff(
         );
     }
     run_git(workspace_root, &["diff", "HEAD", "--", file_path])
+}
+
+fn build_added_file_diff(file_path: &str, content: &str) -> String {
+    let mut diff = format!("--- /dev/null\n+++ b/{file_path}\n");
+    for line in content.lines() {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    if content.is_empty() {
+        diff.push_str("+\n");
+    }
+    diff
 }
 
 fn read_numstat(
@@ -685,6 +743,17 @@ fn file_exists_in_head(workspace_root: &Path, file_path: &str) -> Result<bool, A
         .output()
         .map_err(|error| ApiError::internal_assembly("检查 HEAD 文件失败", error))?;
     Ok(output.status.success())
+}
+
+fn workspace_is_git_worktree(workspace_root: &Path) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(workspace_root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn remove_worktree_path(path: &Path) -> Result<(), ApiError> {
@@ -1128,6 +1197,53 @@ mod tests {
                 .iter()
                 .all(|change| change.execution_group_id == "session:session-canonical-file-tools")
         );
+    }
+
+    #[test]
+    fn session_pending_changes_collects_non_git_file_tool_changes_without_warning_error() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "magi-change-projection-non-git-{}-{}",
+            std::process::id(),
+            UtcMillis::now().0
+        ));
+        fs::create_dir_all(workspace_root.join("tmp")).expect("workspace should create");
+        let session_id = SessionId::new("session-canonical-non-git-file-tools");
+        let workspace_id = WorkspaceId::new("workspace-canonical-non-git-file-tools");
+        let state = build_state_with_session_workspace(
+            &workspace_root.to_string_lossy(),
+            session_id.clone(),
+            workspace_id.clone(),
+        );
+        let target = workspace_root.join("tmp/new-a.txt");
+        fs::write(&target, "new file\nsecond line\n").expect("new file should write");
+        upsert_canonical_file_tool_turn(
+            &state,
+            &session_id,
+            vec![canonical_file_tool_item(
+                1,
+                "call-file-write-non-git",
+                "file_write",
+                serde_json::json!({
+                    "path": target.to_string_lossy().to_string(),
+                    "content": "new file\nsecond line\n",
+                }),
+                serde_json::json!({
+                    "tool": "file_write",
+                    "status": "succeeded",
+                    "path": target.to_string_lossy().to_string(),
+                }),
+            )],
+        );
+
+        let changes =
+            collect_session_pending_changes(&state, &session_id, Some(workspace_id.as_str()))
+                .expect("non-git pending changes should not require git");
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].file_path, "tmp/new-a.txt");
+        assert_eq!(changes[0].r#type, "add");
+        assert_eq!(changes[0].additions, 2);
+        assert!(changes[0].diff.contains("+new file"));
     }
 
     #[test]

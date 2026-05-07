@@ -34,7 +34,10 @@ use crate::{
     },
     session_turn_writeback::publish_current_session_turn_item_event,
     state::ApiState,
-    task_execution::{SessionTurnExecutionRequest, drive_shadow_task_graph},
+    task_execution::{
+        SessionTurnExecutionRequest, drive_shadow_task_graph,
+        finalize_background_session_task_turn_if_root_terminal,
+    },
 };
 
 pub fn routes() -> Router<ApiState> {
@@ -228,6 +231,7 @@ struct SessionTurnIntentDecision {
     required_workers: Vec<String>,
     tool_intent: Option<String>,
     forced_tool_name: Option<String>,
+    required_tool_chain: Vec<String>,
     confidence: f64,
     reason_code: Option<String>,
     route_reason: Option<String>,
@@ -468,6 +472,7 @@ fn session_turn_decision_from_value(
             .unwrap_or_default(),
         tool_intent: optional_trimmed_string(&value, "toolIntent"),
         forced_tool_name: None,
+        required_tool_chain: Vec::new(),
         confidence: value
             .get("confidence")
             .and_then(|value| value.as_f64())
@@ -496,6 +501,24 @@ fn normalize_session_turn_decision(
     mut decision: SessionTurnIntentDecision,
     request: &SessionTurnRequestDto,
 ) -> SessionTurnIntentDecision {
+    if request.deep_task && !matches!(decision.route, SessionTurnRouteDto::Continue) {
+        let original_goal = request.trimmed_text().unwrap_or_default();
+        decision.route = SessionTurnRouteDto::Task;
+        decision.task_title = Some(deep_task_title(&original_goal));
+        if !original_goal.is_empty() {
+            decision.execution_goal = Some(original_goal.to_string());
+        }
+        decision.tool_intent = None;
+        decision.forced_tool_name = None;
+        decision.required_tool_chain.clear();
+        decision.confidence = decision.confidence.max(0.98);
+        decision.reason_code = Some("deep_task_requested".to_string());
+        decision.route_reason =
+            Some("用户已启用深度模式，任务目标必须以原始输入为准。".to_string());
+        if decision.task_evidence.is_empty() {
+            decision.task_evidence.push("deepTask=true".to_string());
+        }
+    }
     if matches!(decision.route, SessionTurnRouteDto::Task)
         && !session_turn_task_route_has_creation_evidence(&decision)
     {
@@ -504,6 +527,7 @@ fn normalize_session_turn_decision(
         decision.execution_goal = None;
         decision.required_workers.clear();
         decision.tool_intent = None;
+        decision.required_tool_chain.clear();
     }
     if !request.deep_task
         && !matches!(decision.route, SessionTurnRouteDto::Continue)
@@ -515,6 +539,7 @@ fn normalize_session_turn_decision(
         decision.required_workers.clear();
         decision.tool_intent = Some(diagram_render_tool_intent());
         decision.forced_tool_name = Some("diagram_render".to_string());
+        decision.required_tool_chain.clear();
         decision.confidence = decision.confidence.max(0.96);
         decision.reason_code = Some("tool_request".to_string());
         decision.route_reason =
@@ -526,18 +551,43 @@ fn normalize_session_turn_decision(
             decision.route,
             SessionTurnRouteDto::Continue | SessionTurnRouteDto::Task
         )
-        && let Some(tool_name) = session_turn_requested_public_builtin_tool(request)
+        && let Some(tool_request) = session_turn_requested_public_builtin_tools(request)
     {
-        decision.route = SessionTurnRouteDto::Execute;
-        decision.task_title = None;
-        decision.execution_goal = None;
-        decision.required_workers.clear();
-        decision.tool_intent = Some(explicit_builtin_tool_intent(tool_name));
-        decision.forced_tool_name = Some(tool_name.to_string());
-        decision.confidence = decision.confidence.max(0.95);
-        decision.reason_code = Some("tool_request".to_string());
-        decision.route_reason = Some(format!("用户明确要求调用公开内置工具 {tool_name}。"));
-        decision.task_evidence.clear();
+        match tool_request {
+            RequestedBuiltinTools::Single(tool_name) => {
+                decision.route = SessionTurnRouteDto::Execute;
+                decision.task_title = None;
+                decision.execution_goal = None;
+                decision.required_workers.clear();
+                if decision.forced_tool_name.as_deref() != Some(tool_name) {
+                    decision.tool_intent = Some(explicit_builtin_tool_intent(tool_name));
+                    decision.forced_tool_name = Some(tool_name.to_string());
+                    decision.required_tool_chain.clear();
+                    decision.route_reason =
+                        Some(format!("用户明确要求调用公开内置工具 {tool_name}。"));
+                }
+                decision.confidence = decision.confidence.max(0.95);
+                decision.reason_code = Some("tool_request".to_string());
+                decision.task_evidence.clear();
+            }
+            RequestedBuiltinTools::Multiple(tool_names) => {
+                decision.route = SessionTurnRouteDto::Execute;
+                decision.task_title = None;
+                decision.execution_goal = None;
+                decision.required_workers.clear();
+                decision.tool_intent = Some(multi_builtin_tool_intent(&tool_names));
+                decision.forced_tool_name = None;
+                decision.required_tool_chain =
+                    tool_names.iter().map(|tool| tool.to_string()).collect();
+                decision.confidence = decision.confidence.max(0.95);
+                decision.reason_code = Some("tool_request".to_string());
+                decision.route_reason = Some(format!(
+                    "用户明确要求串联调用多个公开内置工具：{}。",
+                    tool_names.join(", ")
+                ));
+                decision.task_evidence.clear();
+            }
+        }
     }
     if !request.deep_task
         && !matches!(
@@ -552,6 +602,7 @@ fn normalize_session_turn_decision(
         decision.required_workers.clear();
         decision.tool_intent = Some(current_project_tool_intent());
         decision.forced_tool_name = Some("shell_exec".to_string());
+        decision.required_tool_chain.clear();
         decision.confidence = decision.confidence.max(0.94);
         decision.reason_code = Some("tool_request".to_string());
         decision.route_reason =
@@ -561,15 +612,52 @@ fn normalize_session_turn_decision(
     decision
 }
 
-fn session_turn_requested_public_builtin_tool(
+fn deep_task_title(original_goal: &str) -> String {
+    let first_line = original_goal
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("深度任务");
+    let title = first_line.chars().take(48).collect::<String>();
+    if first_line.chars().count() > 48 {
+        format!("执行: {title}...")
+    } else {
+        format!("执行: {title}")
+    }
+}
+
+enum RequestedBuiltinTools {
+    Single(&'static str),
+    Multiple(Vec<&'static str>),
+}
+
+fn session_turn_requested_public_builtin_tools(
     request: &SessionTurnRequestDto,
-) -> Option<&'static str> {
+) -> Option<RequestedBuiltinTools> {
     let normalized = request.trimmed_text()?.to_ascii_lowercase();
-    public_builtin_tool_reference_aliases()
-        .iter()
-        .find_map(|(alias, canonical_name)| {
-            contains_tool_reference(&normalized, alias).then_some(*canonical_name)
-        })
+    let mut matches: Vec<(&'static str, usize)> = Vec::new();
+    for (alias, canonical_name) in public_builtin_tool_reference_aliases() {
+        let Some(position) = tool_reference_position(&normalized, alias) else {
+            continue;
+        };
+        if let Some((_, existing_position)) =
+            matches.iter_mut().find(|(name, _)| *name == canonical_name)
+        {
+            *existing_position = (*existing_position).min(position);
+        } else {
+            matches.push((canonical_name, position));
+        }
+    }
+    matches.sort_by_key(|(_, position)| *position);
+    let tool_names = matches
+        .into_iter()
+        .map(|(tool_name, _)| tool_name)
+        .collect::<Vec<_>>();
+    match tool_names.as_slice() {
+        [] => None,
+        [tool_name] => Some(RequestedBuiltinTools::Single(tool_name)),
+        _ => Some(RequestedBuiltinTools::Multiple(tool_names)),
+    }
 }
 
 fn public_builtin_tool_reference_aliases() -> Vec<(&'static str, &'static str)> {
@@ -593,11 +681,11 @@ fn public_builtin_tool_reference_aliases() -> Vec<(&'static str, &'static str)> 
     aliases
 }
 
-fn contains_tool_reference(text: &str, tool_name: &str) -> bool {
-    text.match_indices(tool_name).any(|(start, _)| {
+fn tool_reference_position(text: &str, tool_name: &str) -> Option<usize> {
+    text.match_indices(tool_name).find_map(|(start, _)| {
         let before = text[..start].chars().next_back();
         let after = text[start + tool_name.len()..].chars().next();
-        is_tool_reference_boundary(before) && is_tool_reference_boundary(after)
+        (is_tool_reference_boundary(before) && is_tool_reference_boundary(after)).then_some(start)
     })
 }
 
@@ -610,6 +698,13 @@ fn is_tool_reference_boundary(value: Option<char>) -> bool {
 fn explicit_builtin_tool_intent(tool_name: &str) -> String {
     format!(
         "用户明确要求调用公开内置工具 {tool_name}。必须直接调用 {tool_name} 工具，并从用户原始输入中提取参数；不要创建任务，不要改用其它工具，不要只输出文字说明。工具完成后只基于该工具结果给出简短回复。"
+    )
+}
+
+fn multi_builtin_tool_intent(tool_names: &[&str]) -> String {
+    format!(
+        "用户明确要求串联调用多个公开内置工具：{}。必须按用户原始输入描述的依赖顺序选择并调用这些工具；每个工具的 path/source/destination/command/query/content/patch/diff 参数必须从对应编号步骤原文提取。如果用户已经指定文件名、目录名或命令，禁止改名为 probe、tmp、placeholder 或其它自造临时名；最终回复只能描述工具实际结果。不要创建任务，不要只输出文字说明。某一步失败时应原位展示失败工具，并基于已执行结果给出简短说明。",
+        tool_names.join(", ")
     )
 }
 
@@ -962,6 +1057,7 @@ fn submit_regular_session_turn(
             user_message_id: user_message_id.clone(),
             placeholder_message_id: placeholder_message_id.clone(),
             forced_tool_name: decision.forced_tool_name.clone(),
+            required_tool_chain: decision.required_tool_chain.clone(),
             workspace_root_path,
         },
         accepted_at,
@@ -1362,9 +1458,12 @@ async fn interrupt_session_turn(
         .runtime_sidecar(&session_id)
         .and_then(|sidecar| sidecar.current_turn);
     let turn_id = current_turn.as_ref().map(|turn| turn.turn_id.clone());
+    let terminal_root_finalized =
+        finalize_terminal_root_before_interrupt(&state, &session_id, current_turn.as_ref());
     let interrupted = current_turn
         .as_ref()
-        .is_some_and(|turn| turn_status_is_interruptible(&turn.status));
+        .is_some_and(|turn| turn_status_is_interruptible(&turn.status))
+        && !terminal_root_finalized;
     let streaming_entry_ids = if interrupted {
         current_turn_streaming_timeline_entry_ids(&state, &session_id)
     } else {
@@ -1436,6 +1535,42 @@ async fn interrupt_session_turn(
         cancelled_tool_process_count,
         removed_timeline_entry_ids: streaming_entry_ids,
     }))
+}
+
+fn finalize_terminal_root_before_interrupt(
+    state: &ApiState,
+    session_id: &SessionId,
+    current_turn: Option<&ActiveExecutionTurn>,
+) -> bool {
+    if !current_turn.is_some_and(|turn| turn_status_is_interruptible(&turn.status)) {
+        return false;
+    }
+    let Some(task_store) = state.task_store() else {
+        return false;
+    };
+    let Some(chain) = state
+        .session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.active_execution_chain)
+    else {
+        return false;
+    };
+    let Some(root_task) = task_store.get_task(&chain.root_task_id) else {
+        return false;
+    };
+    let runner_status = match root_task.status {
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "error",
+        TaskStatus::Blocked => "blocked",
+        TaskStatus::Cancelled => "cancelled",
+        _ => return false,
+    };
+    finalize_background_session_task_turn_if_root_terminal(
+        state,
+        session_id,
+        &chain.root_task_id,
+        runner_status,
+    )
 }
 
 async fn switch_session(
@@ -2161,6 +2296,13 @@ mod tests {
         }
     }
 
+    fn deep_session_turn_request(text: &str) -> SessionTurnRequestDto {
+        SessionTurnRequestDto {
+            deep_task: true,
+            ..session_turn_request(text)
+        }
+    }
+
     fn classifier_chat_decision() -> SessionTurnIntentDecision {
         SessionTurnIntentDecision {
             route: SessionTurnRouteDto::Chat,
@@ -2169,6 +2311,7 @@ mod tests {
             required_workers: Vec::new(),
             tool_intent: None,
             forced_tool_name: None,
+            required_tool_chain: Vec::new(),
             confidence: 0.86,
             reason_code: Some("plain_chat".to_string()),
             route_reason: Some("classifier returned chat".to_string()),
@@ -2232,6 +2375,62 @@ mod tests {
         let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
         assert!(tool_intent.contains("file_mkdir"));
         assert!(tool_intent.contains("不要只输出文字说明"));
+    }
+
+    #[test]
+    fn normalizes_multi_builtin_tool_chain_to_required_execution_chain() {
+        let request = session_turn_request(
+            "请依次调用 file_write、file_read、file_patch、diff_preview 和 diagram_render 完成验收",
+        );
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert!(decision.forced_tool_name.is_none());
+        assert_eq!(
+            decision.required_tool_chain,
+            vec![
+                "file_write".to_string(),
+                "file_read".to_string(),
+                "file_patch".to_string(),
+                "diff_preview".to_string(),
+                "diagram_render".to_string()
+            ]
+        );
+        let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
+        assert!(tool_intent.contains("多个公开内置工具"));
+        assert!(tool_intent.contains("file_write"));
+        assert!(tool_intent.contains("file_read"));
+        assert!(tool_intent.contains("file_patch"));
+        assert!(tool_intent.contains("diff_preview"));
+        assert!(tool_intent.contains("diagram_render"));
+        assert!(tool_intent.contains("对应编号步骤原文提取"));
+        assert!(tool_intent.contains("禁止改名为 probe"));
+    }
+
+    #[test]
+    fn deep_task_keeps_original_multiline_goal_as_execution_goal() {
+        let request = deep_session_turn_request(
+            "【全流程验收】请以深度任务模式完成。\n\
+             - worker 必须调用 shell_exec 执行 printf FLOW_TASK_SHELL_OK。\n\
+             - worker 必须写入 FLOW_TASK_FILE_OK。\n\
+             - 最终单独一行写 FLOW_TASK_DONE。",
+        );
+        let mut classifier_decision = classifier_chat_decision();
+        classifier_decision.route = SessionTurnRouteDto::Task;
+        classifier_decision.execution_goal =
+            Some("【全流程验收】请以深度任务模式完成。".to_string());
+        classifier_decision
+            .task_evidence
+            .push("需要结构化执行".to_string());
+
+        let decision = normalize_session_turn_decision(classifier_decision, &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        let goal = decision.execution_goal.as_deref().unwrap_or_default();
+        assert!(goal.contains("FLOW_TASK_SHELL_OK"));
+        assert!(goal.contains("FLOW_TASK_FILE_OK"));
+        assert!(goal.contains("FLOW_TASK_DONE"));
+        assert_eq!(decision.reason_code.as_deref(), Some("deep_task_requested"));
     }
 
     #[test]
@@ -2343,6 +2542,7 @@ mod tests {
                 required_workers: Vec::new(),
                 tool_intent: None,
                 forced_tool_name: None,
+                required_tool_chain: Vec::new(),
                 confidence: 1.0,
                 reason_code: Some("plain_chat".to_string()),
                 route_reason: Some("test".to_string()),

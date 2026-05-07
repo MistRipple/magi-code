@@ -140,6 +140,9 @@
     if (!projection || !sessionId || !rootTaskId) return false;
     return projection.runner_status === 'running';
   });
+  const sessionInputLocked = $derived.by(() => (
+    messagesState.sessionHydrating || !currentSessionId?.trim()
+  ));
 
   // 发送/停止态只认 store 内已经收敛好的处理状态，避免历史工具卡片把空闲会话抬回执行态。
   const isSending = $derived(
@@ -158,7 +161,7 @@
     return i18n.t('input.send');
   });
   const sendDisabled = $derived.by(() => (
-    isInteractionBlocking || intakeLoading
+    sessionInputLocked || isInteractionBlocking || intakeLoading
   ));
   // 按钮双态状态 - 使用 $derived 计算
   const hasContent = $derived.by(() => {
@@ -173,6 +176,23 @@
     inputValue = '';
     selectedImages = [];
     selectedSkill = null;
+  }
+
+  function resolveComposerRawContent(): string {
+    if (typeof inputTextareaEl?.value === 'string') {
+      return inputTextareaEl.value;
+    }
+    if (typeof document !== 'undefined') {
+      const activeElement = document.activeElement;
+      if (
+        activeElement
+        && typeof HTMLTextAreaElement !== 'undefined'
+        && activeElement instanceof HTMLTextAreaElement
+      ) {
+        return activeElement.value;
+      }
+    }
+    return inputValue;
   }
 
   function isNaturalContinueRequest(value: string | null): boolean {
@@ -202,7 +222,7 @@
   // 发送消息（支持图片附件）
   // 运行中再次发送不会打断当前轮，而是按当前 session 的队列/引导模式串行提交。
   async function sendMessage() {
-    const rawContent = inputValue;
+    const rawContent = resolveComposerRawContent();
     const normalizedContent = rawContent.trim();
     // 允许只发送图片（无文字）或只发送文字，或只发送已选技能
     if ((!normalizedContent && !selectedSkill && selectedImages.length === 0) || isInteractionBlocking) return;
@@ -646,7 +666,7 @@
         : selectedImages.length > 0
           ? i18n.t('input.placeholderWithImages')
           : i18n.t('input.placeholderDefault')}
-      disabled={isInteractionBlocking}
+      disabled={sessionInputLocked || isInteractionBlocking}
       onkeydown={handleKeydown}
       onpaste={handlePaste}
     ></textarea>

@@ -353,6 +353,30 @@ fn upsert_canonical_turn_in_state(
     Ok(())
 }
 
+fn replace_canonical_turn_in_state(
+    state: &mut SessionStoreState,
+    session_id: &SessionId,
+    turn: &ActiveExecutionTurn,
+) -> DomainResult<()> {
+    let mut incoming = current_turn_to_canonical_turn(session_id, turn)?;
+    incoming.normalize();
+    if let Some(existing) = state
+        .canonical_turns
+        .iter_mut()
+        .find(|existing| existing.session_id == *session_id && existing.turn_id == incoming.turn_id)
+    {
+        *existing = incoming;
+    } else {
+        state.canonical_turns.push(incoming);
+    }
+    state.canonical_turns.sort_by(|left, right| {
+        left.turn_seq
+            .cmp(&right.turn_seq)
+            .then_with(|| left.turn_id.cmp(&right.turn_id))
+    });
+    Ok(())
+}
+
 fn durable_terminal_turn_should_win(
     state: &SessionStoreState,
     session_id: &SessionId,
@@ -1555,6 +1579,73 @@ impl SessionStore {
                 && let Some(turn) = updated.current_turn.as_ref()
             {
                 upsert_canonical_turn_in_state(&mut state, session_id, turn)?;
+            }
+            updated
+        };
+        if updated.is_some() {
+            self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateCurrentTurnStatus);
+        }
+        Ok(updated)
+    }
+
+    pub fn complete_current_turn_from_completed_root_task(
+        &self,
+        session_id: &SessionId,
+    ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        let updated = {
+            let mut state = self
+                .state
+                .write()
+                .expect("session state write lock poisoned");
+            let updated = {
+                let Some(sidecar) = state
+                    .execution_sidecar_store
+                    .runtime_sidecars
+                    .iter_mut()
+                    .find(|sidecar| &sidecar.session_id == session_id)
+                else {
+                    return Err(DomainError::NotFound {
+                        entity: "session_runtime_sidecar",
+                    });
+                };
+                let Some(turn) = sidecar.current_turn.as_mut() else {
+                    return Ok(None);
+                };
+                turn.status = "completed".to_string();
+                if turn.completed_at.is_none() {
+                    turn.completed_at = Some(UtcMillis::now());
+                }
+                for item in &mut turn.items {
+                    let normalized = item.status.trim().to_ascii_lowercase();
+                    if current_turn_item_status_is_active(&item.status)
+                        || matches!(normalized.as_str(), "cancelled" | "canceled" | "blocked")
+                    {
+                        item.status = "completed".to_string();
+                    }
+                    if let Some(tool_status) = item.tool_status.as_deref() {
+                        let normalized_tool_status = tool_status.trim().to_ascii_lowercase();
+                        if current_turn_item_status_is_active(tool_status)
+                            || matches!(
+                                normalized_tool_status.as_str(),
+                                "cancelled" | "canceled" | "blocked"
+                            )
+                        {
+                            item.tool_status = Some("completed".to_string());
+                        }
+                    }
+                }
+                turn.normalize();
+                if let Some(chain) = sidecar.active_execution_chain.as_mut() {
+                    chain.current_turn = sidecar.current_turn.clone();
+                    chain.normalize();
+                }
+                sidecar.updated_at = UtcMillis::now();
+                Some(sidecar.clone())
+            };
+            if let Some(updated) = updated.as_ref()
+                && let Some(turn) = updated.current_turn.as_ref()
+            {
+                replace_canonical_turn_in_state(&mut state, session_id, turn)?;
             }
             updated
         };

@@ -33,6 +33,28 @@ pub(crate) struct ShadowTaskGraphSubmission {
 
 static REPLAN_GRAPH_COUNTER: AtomicU64 = AtomicU64::new(1);
 const DEEP_TASK_PLAN_TOOL_NAME: &str = "create_deep_task_plan";
+const DEEP_TASK_MIN_PHASES: usize = 3;
+const DEEP_TASK_MAX_PHASES: usize = 8;
+const DEEP_TASK_READONLY_TOOLS: &[&str] = &[
+    "file_read",
+    "search_text",
+    "search_semantic",
+    "shell_exec",
+    "process_inspect",
+    "diff_preview",
+    "web_search",
+    "web_fetch",
+    "diagram_render",
+    "knowledge_query",
+];
+const DEEP_TASK_WRITE_TOOLS: &[&str] = &[
+    "file_write",
+    "file_patch",
+    "file_remove",
+    "file_mkdir",
+    "file_copy",
+    "file_move",
+];
 
 #[derive(Clone, Debug)]
 pub(crate) struct DeepTaskGraphBuildResult {
@@ -346,7 +368,7 @@ pub(crate) fn run_shadow_dispatch_submission(
                 user_message_id: user_message_id.clone(),
                 placeholder_message_id: placeholder_message_id.clone(),
                 timeline_entry_id: Some(entry_id.to_string()),
-                thread_visible: !request.deep_task,
+                thread_visible: true,
                 worker_visible: false,
             },
             ActiveExecutionTurnItem {
@@ -358,7 +380,7 @@ pub(crate) fn run_shadow_dispatch_submission(
                 status: "pending".to_string(),
                 source: "orchestrator".to_string(),
                 title: Some("任务理解".to_string()),
-                content: Some("已接收请求，正在整理执行步骤。".to_string()),
+                content: Some("编排者已接收请求，开始拆解执行步骤。".to_string()),
                 task_id: Some(act_task_id.clone()),
                 worker_id: Some(worker_id.clone()),
                 role_id: role_for_task(&act_task_id),
@@ -427,6 +449,50 @@ pub(crate) fn run_shadow_dispatch_submission(
             timeline_entry_id: None,
             thread_visible: false,
             worker_visible: true,
+        });
+    }
+    let lane_count = current_turn.worker_lanes.len();
+    if lane_count > 0 {
+        let role_count = current_turn
+            .worker_lanes
+            .iter()
+            .filter_map(|lane| {
+                lane.role_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|role_id| !role_id.is_empty())
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        current_turn.items.push(ActiveExecutionTurnItem {
+            item_id: format!("turn-item-orchestrator-dispatch-{}", accepted_at.0),
+            item_seq: lane_count + 3,
+            lane_id: None,
+            lane_seq: None,
+            kind: "assistant_phase".to_string(),
+            status: "pending".to_string(),
+            source: "orchestrator".to_string(),
+            title: Some("任务分配".to_string()),
+            content: Some(format!(
+                "已完成任务分配：{} 个执行步骤交给 {} 个负责人推进；我会在主线继续汇总关键进展。",
+                lane_count,
+                role_count.max(1)
+            )),
+            task_id: Some(act_task_id.clone()),
+            worker_id: None,
+            role_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            tool_status: None,
+            tool_arguments: None,
+            tool_result: None,
+            tool_error: None,
+            request_id: request_id.clone(),
+            user_message_id: user_message_id.clone(),
+            placeholder_message_id: placeholder_message_id.clone(),
+            timeline_entry_id: None,
+            thread_visible: true,
+            worker_visible: false,
         });
     }
     current_turn.normalize();
@@ -547,6 +613,43 @@ fn build_policy_for_mode(deep_task: bool) -> TaskPolicy {
     }
 }
 
+fn build_deep_readonly_policy() -> TaskPolicy {
+    let mut policy = build_policy_for_mode(true);
+    policy.command_mode = "read_only".to_string();
+    policy.allowed_tools = DEEP_TASK_READONLY_TOOLS
+        .iter()
+        .map(|tool| (*tool).to_string())
+        .collect();
+    policy.denied_tools = DEEP_TASK_WRITE_TOOLS
+        .iter()
+        .map(|tool| (*tool).to_string())
+        .collect();
+    policy
+}
+
+fn build_deep_no_tool_policy() -> TaskPolicy {
+    let mut policy = build_policy_for_mode(true);
+    policy.command_mode = "no_tools".to_string();
+    policy.allowed_tools = Vec::new();
+    policy.denied_tools = DEEP_TASK_WRITE_TOOLS
+        .iter()
+        .map(|tool| (*tool).to_string())
+        .collect();
+    policy
+}
+
+fn build_deep_action_policy(phase_index: usize, phase_count: usize) -> TaskPolicy {
+    if phase_index == 0 || phase_index + 1 == phase_count {
+        build_deep_no_tool_policy()
+    } else {
+        build_policy_for_mode(true)
+    }
+}
+
+fn deep_task_phase_count_is_valid(count: usize) -> bool {
+    (DEEP_TASK_MIN_PHASES..=DEEP_TASK_MAX_PHASES).contains(&count)
+}
+
 fn build_deep_task_graph(
     state: &ApiState,
     mission_id: &MissionId,
@@ -568,10 +671,10 @@ fn build_deep_task_graph(
     let plan = decompose_mission(state, Some(prompt_text), now, workspace_id).ok_or_else(|| {
         ApiError::internal_assembly("构建深度任务图失败", "无法生成结构化深度计划")
     })?;
-    if plan.phases.len() != 3 {
+    if !deep_task_phase_count_is_valid(plan.phases.len()) {
         return Err(ApiError::internal_assembly(
             "构建深度任务图失败",
-            "深度模式必须包含 3 个 phase",
+            format!("深度模式必须包含 {DEEP_TASK_MIN_PHASES} 到 {DEEP_TASK_MAX_PHASES} 个 phase"),
         ));
     }
 
@@ -601,11 +704,13 @@ fn insert_deep_task_graph(
     plan: &DeepTaskGraphPlan,
 ) -> Result<DeepTaskGraphBuildResult, ApiError> {
     let root_policy = Some(build_policy_for_mode(true));
+    let readonly_policy = Some(build_deep_readonly_policy());
     let mut total_task_count = 1usize;
     let mut leaf_action_task_ids = Vec::new();
     let mut validation_task_ids = Vec::new();
     let mut dispatch_task_ids = Vec::new();
     let mut phase_ids = Vec::with_capacity(plan.phases.len());
+    let mut phase_action_ids_by_index: Vec<Vec<TaskId>> = Vec::with_capacity(plan.phases.len());
 
     for (phase_index, phase_plan) in plan.phases.iter().enumerate() {
         let phase_id = TaskId::new(format!("task-phase-{}-{}", accepted_at.0, phase_index));
@@ -617,7 +722,7 @@ fn insert_deep_task_graph(
             Some(root_task_id.clone()),
             TaskKind::Phase,
             phase_plan.title.clone(),
-            format!("推进 {} 阶段", phase_plan.title),
+            format!("推进 {} 步骤", phase_plan.title),
             TaskStatus::Ready,
             *now,
             Some("architect"),
@@ -700,7 +805,7 @@ fn insert_deep_task_graph(
                     *now,
                     Some(action_role.as_str()),
                     action_plan.write_scope.as_deref(),
-                    root_policy.clone(),
+                    Some(build_deep_action_policy(phase_index, plan.phases.len())),
                 ));
                 total_task_count += 1;
                 current_package_action_ids.push(action_id.clone());
@@ -747,6 +852,7 @@ fn insert_deep_task_graph(
                 format!("{} 至少需要一个 action", phase_plan.title),
             ));
         }
+        phase_action_ids_by_index.push(phase_action_ids.clone());
 
         let validation_id =
             TaskId::new(format!("task-validation-{}-{}", accepted_at.0, phase_index));
@@ -757,12 +863,12 @@ fn insert_deep_task_graph(
             Some(phase_id.clone()),
             TaskKind::Validation,
             format!("{} 验证", phase_plan.title),
-            format!("验证 {} 阶段的全部产出", phase_plan.title),
+            deep_phase_validation_goal(phase_index, plan.phases.len(), &phase_plan.title),
             TaskStatus::Ready,
             *now,
             Some("reviewer"),
             None,
-            root_policy.clone(),
+            readonly_policy.clone(),
         ));
         for action_id in &phase_action_ids {
             task_store
@@ -776,12 +882,29 @@ fn insert_deep_task_graph(
         total_task_count += 1;
     }
 
-    task_store
-        .add_dependency(&phase_ids[1], &phase_ids[0])
-        .map_err(|err| ApiError::internal_assembly("构建深度任务图失败", err.to_string()))?;
-    task_store
-        .add_dependency(&phase_ids[2], &phase_ids[1])
-        .map_err(|err| ApiError::internal_assembly("构建深度任务图失败", err.to_string()))?;
+    for phase_index in 1..phase_ids.len() {
+        task_store
+            .add_dependency(&phase_ids[phase_index], &phase_ids[phase_index - 1])
+            .map_err(|err| ApiError::internal_assembly("构建深度任务图失败", err.to_string()))?;
+    }
+
+    if let Some(delivery_action_ids) = phase_action_ids_by_index.last() {
+        let execution_action_ids = phase_action_ids_by_index
+            .iter()
+            .enumerate()
+            .filter(|(phase_index, _)| *phase_index > 0 && *phase_index + 1 < plan.phases.len())
+            .flat_map(|(_, action_ids)| action_ids.iter())
+            .collect::<Vec<_>>();
+        for delivery_action_id in delivery_action_ids {
+            for execution_action_id in &execution_action_ids {
+                task_store
+                    .add_dependency(delivery_action_id, execution_action_id)
+                    .map_err(|err| {
+                        ApiError::internal_assembly("构建深度任务图失败", err.to_string())
+                    })?;
+            }
+        }
+    }
 
     validate_deep_task_graph(
         task_store,
@@ -797,6 +920,18 @@ fn insert_deep_task_graph(
         dispatch_task_ids,
         total_task_count,
     })
+}
+
+fn deep_phase_validation_goal(phase_index: usize, phase_count: usize, phase_title: &str) -> String {
+    if phase_index == 0 {
+        format!(
+            "验证 {phase_title} 步骤产出是否包含目标、边界、执行计划和验收标准；只验证规划文本完整性，不验证后续执行结果、文件内容或工作区变更。"
+        )
+    } else if phase_index + 1 == phase_count {
+        format!("验证 {phase_title} 步骤是否基于前序执行产出完成最终交付，不重复执行工具。")
+    } else {
+        format!("验证 {phase_title} 步骤是否按当前批次目标完成实际执行和工具结果。")
+    }
 }
 
 pub(crate) fn replan_deep_task_graph(
@@ -846,10 +981,10 @@ pub(crate) fn replan_deep_task_graph(
     let plan = decompose_mission(state, Some(prompt_text), &build_seed, workspace_id).ok_or_else(
         || ApiError::internal_assembly("重规划深度任务图失败", "无法生成结构化深度计划"),
     )?;
-    if plan.phases.len() != 3 {
+    if !deep_task_phase_count_is_valid(plan.phases.len()) {
         return Err(ApiError::internal_assembly(
             "重规划深度任务图失败",
-            "深度模式必须包含 3 个 phase",
+            format!("深度模式必须包含 {DEEP_TASK_MIN_PHASES} 到 {DEEP_TASK_MAX_PHASES} 个 phase"),
         ));
     }
 
@@ -1078,7 +1213,12 @@ fn update_session_execution_branches(
                 spec.task_id
             )));
         }
-        let role_id = resolve_task_role(&task)
+        let role_id = task
+            .executor_binding
+            .as_ref()
+            .map(|binding| binding.target_role.trim())
+            .filter(|role| !role.is_empty())
+            .or_else(|| resolve_task_role(&task).map(str::trim))
             .map(str::trim)
             .filter(|role| !role.is_empty())
             .map(ToOwned::to_owned);
@@ -1263,10 +1403,10 @@ fn validate_deep_task_graph(
             "root 必须是 Objective",
         ));
     }
-    if phase_ids.len() != 3 || plan.phases.len() != 3 {
+    if phase_ids.len() != plan.phases.len() || !deep_task_phase_count_is_valid(plan.phases.len()) {
         return Err(ApiError::internal_assembly(
             "校验深度任务图失败",
-            "深度模式必须包含 3 个 Phase",
+            format!("深度模式必须包含 {DEEP_TASK_MIN_PHASES} 到 {DEEP_TASK_MAX_PHASES} 个 Phase"),
         ));
     }
 
@@ -1295,7 +1435,7 @@ fn validate_deep_task_graph(
         {
             return Err(ApiError::internal_assembly(
                 "校验深度任务图失败",
-                "Phase 之间必须形成规划→执行→交付依赖链",
+                "Phase 之间必须形成按计划批次推进的依赖链",
             ));
         }
 
@@ -1424,8 +1564,8 @@ fn deep_task_plan_tool() -> ChatToolDefinition {
                 "properties": {
                     "phases": {
                         "type": "array",
-                        "minItems": 3,
-                        "maxItems": 3,
+                        "minItems": DEEP_TASK_MIN_PHASES,
+                        "maxItems": DEEP_TASK_MAX_PHASES,
                         "items": {
                             "type": "object",
                             "additionalProperties": false,
@@ -1433,7 +1573,7 @@ fn deep_task_plan_tool() -> ChatToolDefinition {
                             "properties": {
                                 "title": {
                                     "type": "string",
-                                    "description": "阶段标题，建议依次覆盖规划、执行、交付。"
+                                    "description": "阶段标题。第一阶段必须是规划，最后一阶段必须是交付；中间可以有一个或多个按批次推进的执行阶段。"
                                 },
                                 "workPackages": {
                                     "type": "array",
@@ -1509,11 +1649,16 @@ fn decompose_mission(
         prompt: format!(
             "深度任务图规划器。\n\
              请只调用 {DEEP_TASK_PLAN_TOOL_NAME} 工具输出结构化计划，不要返回自然语言正文。\n\
-             计划必须恰好包含 3 个 phase，分别覆盖规划、执行、交付。\n\
+             计划必须包含 {DEEP_TASK_MIN_PHASES} 到 {DEEP_TASK_MAX_PHASES} 个 phase：第一 phase 是规划，最后 phase 是交付，中间 phase 是一个或多个按实际批次推进的执行阶段。\n\
+             如果任务目标包含“第一批/第二批/下一批/继续创建任务/发现后继续推进/多段任务”等纵向编排要求，必须把每一批推进建模为独立执行 phase，不能把多批命令塞进同一个 action。\n\
              每个 phase 至少 1 个 workPackage，每个 workPackage 至少 1 个 action。\n\
              action 的 dependsOn 只能引用同一 phase 内已定义的较早 action 标题。\n\
              action goal 必须描述可验证产出或完成标准。\n\
-             任务目标：{}{}",
+             原始任务目标是唯一主事实，必须逐字保留其中的路径、工具名、命令、标记字符串和“必须/要求”条款；不得把它改写成历史任务、泛化检查或只读替代目标。\n\
+             规划 phase 只输出目标、边界、执行计划和验收标准，不得调用工具，不得执行用户目标里的写入、删除、移动、补丁或其他有副作用操作。\n\
+             中间执行 phase 是唯一可以执行用户目标和写操作的阶段；如果目标包含明确工具链路，对应批次的执行 action goal 必须按原始顺序列出这些工具和验收标记。\n\
+             交付 phase 只能基于执行产出和验证证据总结，不得调用工具，不得重复写入、删除、移动、补丁或重新执行用户目标。\n\
+             任务目标：\n<<<MAGI_DEEP_TASK_GOAL>>>\n{}\n<<<END_MAGI_DEEP_TASK_GOAL>>>{}",
             prompt_text, workspace_context
         ),
         messages: None,
@@ -1558,7 +1703,7 @@ fn parse_decomposition_plan(
     original_prompt: &str,
 ) -> Option<DeepTaskGraphPlan> {
     let mut plan: DeepTaskGraphPlan = serde_json::from_value(plan_value).ok()?;
-    if plan.phases.len() != 3 {
+    if !deep_task_phase_count_is_valid(plan.phases.len()) {
         return None;
     }
 
@@ -1715,6 +1860,7 @@ mod tests {
 
     struct StaticDeepPlanModelBridgeClient;
     struct PathSensitiveDeepPlanModelBridgeClient;
+    struct SequentialBatchDeepPlanModelBridgeClient;
 
     fn static_deep_plan_payload() -> String {
         deep_task_plan_response(serde_json::json!({
@@ -1814,6 +1960,69 @@ mod tests {
         }))
     }
 
+    fn sequential_batch_deep_plan_payload() -> String {
+        deep_task_plan_response(serde_json::json!({
+            "phases": [
+                {
+                    "title": "规划",
+                    "workPackages": [
+                        {
+                            "title": "规划工作包",
+                            "actions": [
+                                {
+                                    "title": "梳理目标",
+                                    "goal": "梳理两批纵向任务的目标、边界和验收标准"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "title": "第一批执行",
+                    "workPackages": [
+                        {
+                            "title": "第一批工作包",
+                            "actions": [
+                                {
+                                    "title": "执行第一批",
+                                    "goal": "用 shell_exec 执行 printf BATCH_ONE_DONE_NEXT_BATCH_TEST，并根据 NEXT_BATCH 结果确认是否继续第二批"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "title": "第二批执行",
+                    "workPackages": [
+                        {
+                            "title": "第二批工作包",
+                            "actions": [
+                                {
+                                    "title": "执行第二批",
+                                    "goal": "在第一批完成并发现 NEXT_BATCH 后，用 shell_exec 执行 printf BATCH_TWO_DONE_FINAL_TEST"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "title": "交付",
+                    "workPackages": [
+                        {
+                            "title": "交付工作包",
+                            "actions": [
+                                {
+                                    "title": "汇总两批结果",
+                                    "goal": "只基于前两批执行产出总结，不重复调用工具"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }))
+    }
+
     impl ModelBridgeClient for StaticDeepPlanModelBridgeClient {
         fn invoke(
             &self,
@@ -1858,6 +2067,30 @@ mod tests {
                 layer: BridgeErrorLayer::RemoteBusiness,
                 code: None,
                 message: "path-sensitive deep plan client does not stream".to_string(),
+            })
+        }
+    }
+
+    impl ModelBridgeClient for SequentialBatchDeepPlanModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            Ok(BridgeResponse {
+                ok: true,
+                payload: sequential_batch_deep_plan_payload(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            _request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::RemoteBusiness,
+                code: None,
+                message: "sequential batch deep plan client does not stream".to_string(),
             })
         }
     }
@@ -2054,6 +2287,84 @@ mod tests {
     }
 
     #[test]
+    fn deep_task_turn_keeps_normal_mainline_dialog_and_orchestrator_steps() {
+        let (state, _task_store) = build_test_state();
+        let state =
+            state.with_task_planning_model_bridge_client(Arc::new(StaticDeepPlanModelBridgeClient));
+        let session_id = SessionId::new("session-deep-mainline-dialog");
+        state
+            .session_store
+            .create_session(session_id.clone(), "deep mainline dialog")
+            .expect("session should be creatable");
+
+        let accepted_at = UtcMillis::now();
+        let submission = run_shadow_dispatch_submission(
+            &state,
+            &DispatchSubmissionRequest {
+                accepted_at,
+                session_id: session_id.clone(),
+                workspace_id: None,
+                entry_id: "entry-deep-mainline-dialog".to_string(),
+                timeline_message: "用户原始深度任务".to_string(),
+                created_session: false,
+                mission_title: "深度任务主线".to_string(),
+                task_title: "执行: 深度任务主线".to_string(),
+                trimmed_text: Some("用户原始深度任务".to_string()),
+                execution_goal: Some("深度任务执行目标".to_string()),
+                deep_task: true,
+                skill_name: None,
+                target_role: None,
+                request_id: Some("request-deep-mainline".to_string()),
+                user_message_id: Some("user-deep-mainline".to_string()),
+                placeholder_message_id: Some("assistant-deep-mainline".to_string()),
+            },
+        )
+        .expect("deep shadow dispatch should create task graph");
+
+        let turn = submission
+            .active_execution_chain
+            .as_ref()
+            .and_then(|chain| chain.current_turn.as_ref())
+            .expect("current turn should exist");
+        let visible_items = turn
+            .items
+            .iter()
+            .filter(|item| item.thread_visible)
+            .map(|item| {
+                (
+                    item.kind.as_str(),
+                    item.content.as_deref().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            visible_items
+                .iter()
+                .any(|(kind, content)| *kind == "user_message" && *content == "用户原始深度任务"),
+            "深度任务主线必须像正常对话一样保留用户消息"
+        );
+        assert!(
+            visible_items.iter().any(|(kind, content)| {
+                *kind == "assistant_phase" && content.contains("开始拆解执行步骤")
+            }),
+            "编排者开始拆解任务的行为必须作为主线普通文本"
+        );
+        assert!(
+            visible_items.iter().any(|(kind, content)| {
+                *kind == "assistant_phase" && content.contains("已完成任务分配")
+            }),
+            "任务分配卡之后必须继续保留编排者自己的行为说明"
+        );
+        assert!(
+            turn.items.iter().any(|item| item.kind == "worker_spawned"
+                && !item.thread_visible
+                && item.worker_visible),
+            "任务分配本身仍应通过 worker_dispatch 卡片展示，不作为普通主线文本重复出现"
+        );
+    }
+
+    #[test]
     fn deep_task_requires_non_empty_execution_goal() {
         let (state, task_store) = build_test_state();
         let session_id = SessionId::new("session-deep-empty-goal");
@@ -2148,6 +2459,201 @@ mod tests {
                     .remove(&validation_id)
                     .is_some(),
                 "validation task {validation_id} should have a registered execution plan"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_task_policies_limit_tools_by_phase_role() {
+        let (state, task_store) = build_test_state();
+        let state =
+            state.with_task_planning_model_bridge_client(Arc::new(StaticDeepPlanModelBridgeClient));
+        let session_id = SessionId::new("session-deep-readonly-policy");
+        state
+            .session_store
+            .create_session(session_id.clone(), "deep readonly policy")
+            .expect("session should be creatable");
+
+        let accepted_at = UtcMillis::now();
+        let submission = run_shadow_dispatch_submission(
+            &state,
+            &DispatchSubmissionRequest {
+                accepted_at,
+                session_id,
+                workspace_id: None,
+                entry_id: "entry-deep-readonly-policy".to_string(),
+                timeline_message: "执行深度只读策略验收".to_string(),
+                created_session: false,
+                mission_title: "深度只读策略验收".to_string(),
+                task_title: "执行: 深度只读策略验收".to_string(),
+                trimmed_text: Some("执行深度只读策略验收".to_string()),
+                execution_goal: Some("执行深度只读策略验收".to_string()),
+                deep_task: true,
+                skill_name: None,
+                target_role: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+            },
+        )
+        .expect("deep task should create graph");
+
+        let tasks = task_store
+            .collect_subtree_ids(&submission.root_task_id)
+            .into_iter()
+            .filter_map(|task_id| task_store.get_task(&task_id))
+            .collect::<Vec<_>>();
+        let policy_for_action = |title: &str| {
+            tasks
+                .iter()
+                .find(|task| task.kind == TaskKind::Action && task.title == title)
+                .and_then(|task| task.policy_snapshot.as_ref())
+                .expect("action policy should exist")
+        };
+
+        let planning = policy_for_action("梳理目标");
+        assert_eq!(planning.command_mode, "no_tools");
+        assert!(!planning.allowed_tools.contains(&"file_write".to_string()));
+        assert!(planning.denied_tools.contains(&"file_write".to_string()));
+
+        let execution = policy_for_action("执行任务");
+        assert_eq!(execution.command_mode, "full");
+        assert!(execution.allowed_tools.is_empty());
+
+        let delivery = policy_for_action("验证交付");
+        assert_eq!(delivery.command_mode, "no_tools");
+        assert!(delivery.denied_tools.contains(&"file_remove".to_string()));
+
+        let execution_action_id = tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Action && task.title == "执行任务")
+            .map(|task| task.task_id.clone())
+            .expect("execution action should exist");
+        let delivery_action = tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Action && task.title == "验证交付")
+            .expect("delivery action should exist");
+        assert!(
+            delivery_action
+                .dependency_ids
+                .iter()
+                .any(|dependency_id| dependency_id == &execution_action_id),
+            "交付 action 必须基于执行 action 的产出，而不是重新执行用户目标"
+        );
+
+        for validation in tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Validation)
+        {
+            let policy = validation
+                .policy_snapshot
+                .as_ref()
+                .expect("validation policy should exist");
+            assert_eq!(policy.command_mode, "read_only");
+            assert!(!policy.allowed_tools.contains(&"file_remove".to_string()));
+        }
+        let planning_validation = tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Validation && task.title == "规划 验证")
+            .expect("planning validation should exist");
+        assert!(
+            planning_validation.goal.contains("只验证规划文本完整性"),
+            "规划验证不能把后续执行结果或文件变更当作本阶段验收"
+        );
+    }
+
+    #[test]
+    fn deep_task_graph_supports_sequential_execution_batches() {
+        let (state, task_store) = build_test_state();
+        let state = state.with_task_planning_model_bridge_client(Arc::new(
+            SequentialBatchDeepPlanModelBridgeClient,
+        ));
+        let session_id = SessionId::new("session-deep-sequential-batches");
+        state
+            .session_store
+            .create_session(session_id.clone(), "deep sequential batches")
+            .expect("session should be creatable");
+
+        let accepted_at = UtcMillis::now();
+        let submission = run_shadow_dispatch_submission(
+            &state,
+            &DispatchSubmissionRequest {
+                accepted_at,
+                session_id,
+                workspace_id: None,
+                entry_id: "entry-deep-sequential-batches".to_string(),
+                timeline_message: "执行多段任务".to_string(),
+                created_session: false,
+                mission_title: "多段任务".to_string(),
+                task_title: "执行: 多段任务".to_string(),
+                trimmed_text: Some("执行多段任务".to_string()),
+                execution_goal: Some("执行多段任务".to_string()),
+                deep_task: true,
+                skill_name: None,
+                target_role: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+            },
+        )
+        .expect("sequential deep task should create graph");
+
+        let tasks = task_store
+            .collect_subtree_ids(&submission.root_task_id)
+            .into_iter()
+            .filter_map(|task_id| task_store.get_task(&task_id))
+            .collect::<Vec<_>>();
+        let phases = tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Phase)
+            .collect::<Vec<_>>();
+        assert_eq!(phases.len(), 4, "两批执行应成为独立 phase");
+        let first_batch_phase = phases
+            .iter()
+            .find(|task| task.title == "第一批执行")
+            .expect("first batch phase should exist");
+        let second_batch_phase = phases
+            .iter()
+            .find(|task| task.title == "第二批执行")
+            .expect("second batch phase should exist");
+        assert!(
+            second_batch_phase
+                .dependency_ids
+                .iter()
+                .any(|dependency_id| dependency_id == &first_batch_phase.task_id),
+            "第二批 phase 必须依赖第一批 phase 完成"
+        );
+
+        let policy_for_action = |title: &str| {
+            tasks
+                .iter()
+                .find(|task| task.kind == TaskKind::Action && task.title == title)
+                .and_then(|task| task.policy_snapshot.as_ref())
+                .expect("action policy should exist")
+        };
+        assert_eq!(policy_for_action("执行第一批").command_mode, "full");
+        assert_eq!(policy_for_action("执行第二批").command_mode, "full");
+        assert_eq!(policy_for_action("汇总两批结果").command_mode, "no_tools");
+
+        let execution_action_ids = tasks
+            .iter()
+            .filter(|task| {
+                task.kind == TaskKind::Action
+                    && matches!(task.title.as_str(), "执行第一批" | "执行第二批")
+            })
+            .map(|task| task.task_id.clone())
+            .collect::<Vec<_>>();
+        let delivery_action = tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Action && task.title == "汇总两批结果")
+            .expect("delivery action should exist");
+        for execution_action_id in execution_action_ids {
+            assert!(
+                delivery_action
+                    .dependency_ids
+                    .iter()
+                    .any(|dependency_id| dependency_id == &execution_action_id),
+                "交付 action 必须基于每个执行批次的产出"
             );
         }
     }

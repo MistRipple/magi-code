@@ -2,6 +2,11 @@
   import type { ContentBlock, DispatchGroupLane, WorkerLaneStatus } from '../types/message';
   import type { IconName } from '../lib/icons';
   import { getAgentVisualInfo } from '../lib/agent-colors';
+  import {
+    buildDispatchPresentationSteps,
+    countDispatchBatchSteps,
+    type DispatchPresentationStep,
+  } from '../lib/dispatch-group-presentation';
   import { resolveWorkerDisplayName, resolveWorkerRoleSource } from '../lib/worker-role-utils';
   import { getEnabledAgents, getState, setCurrentBottomTab } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
@@ -40,6 +45,19 @@
     fileChangeCount: number;
     totalTaskCount: number;
     completedCount: number;
+    isClickable: boolean;
+  }
+
+  interface StepViewModel extends DispatchPresentationStep<StageViewModel> {
+    summary: string;
+    currentTaskTitle: string;
+    toolUseCount: number;
+    fileChangeCount: number;
+    workerDisplayLabel: string;
+    workerColor: string;
+    workerMuted: string;
+    workerIcon: IconName;
+    workerTabId: string;
     isClickable: boolean;
   }
 
@@ -186,6 +204,54 @@
     return firstLine.length > 140 ? `${firstLine.slice(0, 137)}...` : firstLine;
   }
 
+  function latestStageText(stages: StageViewModel[], field: 'summary' | 'currentTaskTitle'): string {
+    for (let index = stages.length - 1; index >= 0; index -= 1) {
+      const value = normalizeText(stages[index]?.[field]);
+      if (value) {
+        return value;
+      }
+    }
+    return '';
+  }
+
+  function sumStageCounts(stages: StageViewModel[], field: 'toolUseCount' | 'fileChangeCount'): number {
+    return stages.reduce((total, stage) => total + resolvePositiveCount(stage[field]), 0);
+  }
+
+  function resolveStepWorkerInfo(stages: StageViewModel[]) {
+    const workerTabIds = Array.from(new Set(stages.map((stage) => stage.workerTabId).filter(Boolean)));
+    const firstWorker = stages.find((stage) => stage.workerTabId && stage.workerTabId !== 'orchestrator')
+      || stages[0];
+    if (!firstWorker) {
+      return {
+        workerDisplayLabel: i18n.t('subTaskSummaryCard.defaultExecutor'),
+        workerColor: 'var(--primary)',
+        workerMuted: 'color-mix(in srgb, var(--primary) 12%, transparent)',
+        workerIcon: 'bot' as IconName,
+        workerTabId: 'orchestrator',
+        isClickable: false,
+      };
+    }
+    if (workerTabIds.length <= 1) {
+      return {
+        workerDisplayLabel: firstWorker.workerDisplayName,
+        workerColor: firstWorker.workerColor,
+        workerMuted: firstWorker.workerMuted,
+        workerIcon: firstWorker.workerIcon,
+        workerTabId: firstWorker.workerTabId,
+        isClickable: firstWorker.isClickable,
+      };
+    }
+    return {
+      workerDisplayLabel: i18n.t('dispatchGroupCard.multipleOwners', { workerCount: workerTabIds.length }),
+      workerColor: 'var(--primary)',
+      workerMuted: 'color-mix(in srgb, var(--primary) 12%, transparent)',
+      workerIcon: 'profile' as IconName,
+      workerTabId: firstWorker.workerTabId,
+      isClickable: firstWorker.isClickable,
+    };
+  }
+
   const stages = $derived.by<StageViewModel[]>(() => (
     lanes.map((lane, index) => {
       const workerId = resolveLaneWorkerId(lane);
@@ -215,18 +281,35 @@
     })
   ));
 
+  const steps = $derived.by<StepViewModel[]>(() => (
+    buildDispatchPresentationSteps(stages).map((step) => {
+      const workerInfo = resolveStepWorkerInfo(step.stages);
+      return {
+        ...step,
+        summary: latestStageText(step.stages, 'summary'),
+        currentTaskTitle: latestStageText(step.stages, 'currentTaskTitle'),
+        toolUseCount: sumStageCounts(step.stages, 'toolUseCount'),
+        fileChangeCount: sumStageCounts(step.stages, 'fileChangeCount'),
+        ...workerInfo,
+      };
+    })
+  ));
+
   const totalStageCount = $derived.by(() => stages.length);
-  const completedStageCount = $derived.by(() => stages.filter((stage) => stage.status === 'completed').length);
+  const totalStepCount = $derived.by(() => steps.length);
+  const completedStepCount = $derived.by(() => steps.filter((step) => step.status === 'completed').length);
   const workerCount = $derived.by(() => new Set(stages.map((stage) => stage.workerTabId).filter(Boolean)).size);
   const groupStatus = $derived.by(() => stages.reduce<WorkerLaneStatus>(
     (status, stage) => mergeLaneStatus(status, stage.status),
     stages.length > 0 ? 'completed' : 'pending',
   ));
   const groupStatusConfig = $derived.by(() => resolveStatusConfig(groupStatus));
-  const groupSummary = $derived.by(() => i18n.t('dispatchGroupCard.summary', {
-    workerCount,
-    laneCount: totalStageCount,
-  }));
+  const batchCount = $derived.by(() => countDispatchBatchSteps(steps));
+  const groupSummary = $derived.by(() => (
+    batchCount > 0
+      ? i18n.t('dispatchGroupCard.batchSummary', { batchCount, stepCount: totalStageCount, workerCount })
+      : i18n.t('dispatchGroupCard.summary', { stepCount: totalStepCount, workerCount })
+  ));
 
   function openWorkerTab(tabId: string) {
     const normalizedTabId = normalizeText(tabId);
@@ -252,7 +335,7 @@
           </div>
         </div>
         <div class="dispatch-group-card__statusline">
-          <span class="dispatch-group-card__progress">{i18n.t('dispatchGroupCard.progress', { completed: completedStageCount, total: totalStageCount })}</span>
+          <span class="dispatch-group-card__progress">{i18n.t('dispatchGroupCard.progress', { completed: completedStepCount, total: totalStepCount })}</span>
           <span class={`dispatch-group-card__status dispatch-group-card__status--${groupStatusConfig.tone}`}>
             <Icon name={groupStatusConfig.icon} size={12} />
             <span>{i18n.t(groupStatusConfig.key)}</span>
@@ -261,52 +344,49 @@
       </div>
 
       <div class="dispatch-group-card__stages">
-        {#each stages as stage (stage.key)}
-          {@const statusConfig = resolveStatusConfig(stage.status)}
+        {#each steps as step (step.key)}
+          {@const statusConfig = resolveStatusConfig(step.status)}
           <button
             type="button"
             class="dispatch-group-card__stage-row"
-            class:is-clickable={stage.isClickable && !readOnly}
-            style={`--worker-color:${stage.workerColor};--worker-muted:${stage.workerMuted};`}
-            disabled={readOnly || !stage.isClickable}
-            onclick={() => openWorkerTab(stage.workerTabId)}
-            aria-label={stage.isClickable ? i18n.t('subTaskSummaryCard.clickToView', { workerLabel: stage.workerDisplayName }) : undefined}
+            class:is-clickable={step.isClickable && !readOnly}
+            style={`--worker-color:${step.workerColor};--worker-muted:${step.workerMuted};`}
+            disabled={readOnly || !step.isClickable}
+            onclick={() => openWorkerTab(step.workerTabId)}
+            aria-label={step.isClickable ? i18n.t('subTaskSummaryCard.clickToView', { workerLabel: step.workerDisplayLabel }) : undefined}
           >
             <span class={`dispatch-group-card__stage-index dispatch-group-card__stage-index--${statusConfig.tone}`}>
-              {stage.displayIndex}
+              {step.displayIndex}
             </span>
             <span class="dispatch-group-card__stage-main">
               <span class="dispatch-group-card__stage-topline">
-                <span class="dispatch-group-card__stage-title">{stage.title}</span>
+                <span class="dispatch-group-card__stage-title">{step.title}</span>
                 <span class={`dispatch-group-card__mini-status dispatch-group-card__mini-status--${statusConfig.tone}`}>
                   <Icon name={statusConfig.icon} size={11} />
                   <span>{i18n.t(statusConfig.key)}</span>
                 </span>
               </span>
-              {#if stage.summary}
-                <span class="dispatch-group-card__summary">{stage.summary}</span>
-              {:else if stage.currentTaskTitle}
+              {#if step.summary}
+                <span class="dispatch-group-card__summary">{step.summary}</span>
+              {:else if step.currentTaskTitle}
                 <span class="dispatch-group-card__current">
-                  {i18n.t('subTaskSummaryCard.currentTask')} {stage.currentTaskTitle}
+                  {i18n.t('subTaskSummaryCard.currentTask')} {step.currentTaskTitle}
                 </span>
               {/if}
               <span class="dispatch-group-card__owner">
                 <span class="dispatch-group-card__owner-icon">
-                  <Icon name={stage.workerIcon} size={11} />
+                  <Icon name={step.workerIcon} size={11} />
                 </span>
-                <span>{i18n.t('dispatchGroupCard.owner', { workerLabel: stage.workerDisplayName })}</span>
+                <span>{i18n.t('dispatchGroupCard.owner', { workerLabel: step.workerDisplayLabel })}</span>
               </span>
             </span>
-            {#if stage.totalTaskCount > 1 || stage.toolUseCount > 0 || stage.fileChangeCount > 0}
+            {#if step.toolUseCount > 0 || step.fileChangeCount > 0}
               <span class="dispatch-group-card__stage-metrics">
-                {#if stage.totalTaskCount > 1}
-                  <span>{i18n.t('subTaskSummaryCard.laneProgress', { current: stage.completedCount, total: stage.totalTaskCount })}</span>
+                {#if step.toolUseCount > 0}
+                  <span>{i18n.t('subTaskSummaryCard.toolCallCount', { count: step.toolUseCount })}</span>
                 {/if}
-                {#if stage.toolUseCount > 0}
-                  <span>{i18n.t('subTaskSummaryCard.toolCallCount', { count: stage.toolUseCount })}</span>
-                {/if}
-                {#if stage.fileChangeCount > 0}
-                  <span>{i18n.t('subTaskSummaryCard.fileChangeCount', { count: stage.fileChangeCount })}</span>
+                {#if step.fileChangeCount > 0}
+                  <span>{i18n.t('subTaskSummaryCard.fileChangeCount', { count: step.fileChangeCount })}</span>
                 {/if}
               </span>
             {/if}

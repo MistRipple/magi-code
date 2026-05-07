@@ -170,11 +170,7 @@ fn shadow_loopback_classifier_response(prompt: &str) -> Option<String> {
     let has_recoverable_chain = prompt
         .lines()
         .any(|line| line.trim() == "hasRecoverableChain=true");
-    let user_text = prompt
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("userText="))
-        .unwrap_or("")
-        .trim();
+    let user_text = shadow_loopback_classifier_user_text(prompt);
     let deep_task = prompt.lines().any(|line| line.trim() == "deepTask=true");
     let skill_name = prompt
         .lines()
@@ -188,48 +184,48 @@ fn shadow_loopback_classifier_response(prompt: &str) -> Option<String> {
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(0);
 
-    let route = if has_recoverable_chain && contains_any(user_text, &["继续", "resume", "continue"])
-    {
-        "continue"
-    } else if deep_task
-        || !skill_name.is_empty()
-        || image_count > 0
-        || contains_any(
-            user_text,
+    let route =
+        if has_recoverable_chain && contains_any(&user_text, &["继续", "resume", "continue"]) {
+            "continue"
+        } else if deep_task
+            || !skill_name.is_empty()
+            || image_count > 0
+            || contains_any(
+                &user_text,
+                &[
+                    "复杂任务",
+                    "分析并拆分",
+                    "拆分任务",
+                    "重新规划",
+                    "规划",
+                    "实现",
+                    "开发",
+                    "修复",
+                    "重构",
+                    "收口",
+                    "迭代",
+                    "推进",
+                ],
+            )
+        {
+            "task"
+        } else if contains_any(
+            &user_text,
             &[
-                "复杂任务",
-                "分析并拆分",
-                "拆分任务",
-                "重新规划",
-                "规划",
-                "实现",
-                "开发",
-                "修复",
-                "重构",
-                "收口",
-                "迭代",
-                "推进",
+                "搜索", "查找", "查询", "读取", "打开", "查看", "执行", "运行", "列出", "search",
+                "find", "grep", "rg", "ls", "cat", "git", "npm", "cargo", "test",
             ],
-        )
-    {
-        "task"
-    } else if contains_any(
-        user_text,
-        &[
-            "搜索", "查找", "查询", "读取", "打开", "查看", "执行", "运行", "列出", "search",
-            "find", "grep", "rg", "ls", "cat", "git", "npm", "cargo", "test",
-        ],
-    ) {
-        "execute"
-    } else {
-        "chat"
-    };
+        ) {
+            "execute"
+        } else {
+            "chat"
+        };
 
     let task_goal = if route == "task" {
         Some(if user_text.is_empty() {
             "完成本轮深度任务".to_string()
         } else {
-            user_text.to_string()
+            user_text.clone()
         })
     } else {
         None
@@ -278,6 +274,34 @@ fn shadow_loopback_classifier_response(prompt: &str) -> Option<String> {
     )
 }
 
+fn shadow_loopback_classifier_user_text(prompt: &str) -> String {
+    let mut collecting = false;
+    let mut value = String::new();
+    for line in prompt.lines() {
+        let trimmed = line.trim();
+        if collecting
+            && (trimmed.starts_with("deepTask=")
+                || trimmed.starts_with("skillName=")
+                || trimmed.starts_with("imageCount=")
+                || trimmed.starts_with("hasRecoverableChain="))
+        {
+            break;
+        }
+        if let Some(first_line) = trimmed.strip_prefix("userText=") {
+            collecting = true;
+            value.push_str(first_line.trim());
+            continue;
+        }
+        if collecting {
+            if !value.is_empty() {
+                value.push('\n');
+            }
+            value.push_str(line.trim_end());
+        }
+    }
+    value.trim().to_string()
+}
+
 fn contains_any(value: &str, needles: &[&str]) -> bool {
     let lower = value.to_lowercase();
     needles
@@ -290,67 +314,138 @@ fn shadow_loopback_decomposition_response(prompt: &str) -> Option<String> {
         return None;
     }
     let goal = shadow_loopback_deep_task_goal(prompt);
-    let planning_goal = format!("明确目标、边界和验收标准：{goal}");
-    let execution_goal = format!("完成用户目标：{goal}");
-    let delivery_goal = format!("验证执行结果并交付：{goal}");
-    Some(
+    let execution_phases = shadow_loopback_execution_phases(&goal);
+    let planning_goal = format!(
+        "仅输出目标、边界、执行计划和验收标准，不调用工具，不执行用户目标中的写入、删除、移动、补丁或其他有副作用操作：{goal}"
+    );
+    let delivery_goal = format!(
+        "基于前序执行批次产出验证结果并交付，不调用工具，不重复执行用户目标中的写入、删除、移动、补丁或其他有副作用操作：{goal}"
+    );
+    let mut phases = vec![serde_json::json!({
+        "title": "规划",
+        "workPackages": [
+            {
+                "title": "规划工作包",
+                "actions": [
+                    {
+                        "title": "梳理目标",
+                        "goal": planning_goal,
+                        "dependsOn": [],
+                        "writeScope": null,
+                    }
+                ]
+            }
+        ]
+    })];
+    phases.extend(execution_phases.into_iter().map(|phase| {
         serde_json::json!({
-            "phases": [
+            "title": phase.title,
+            "workPackages": [
                 {
-                    "title": "规划",
-                    "workPackages": [
+                    "title": format!("{}工作包", phase.title),
+                    "actions": [
                         {
-                            "title": "规划工作包",
-                            "actions": [
-                                {
-                                    "title": "梳理目标",
-                                    "goal": planning_goal,
-                                    "dependsOn": [],
-                                    "writeScope": null,
-                                }
-                            ]
-                        }
-                    ]
-                },
-                {
-                    "title": "执行",
-                    "workPackages": [
-                        {
-                            "title": "执行工作包",
-                            "actions": [
-                                {
-                                    "title": "执行任务",
-                                    "goal": execution_goal,
-                                    "dependsOn": [],
-                                    "writeScope": null,
-                                }
-                            ]
-                        }
-                    ]
-                },
-                {
-                    "title": "交付",
-                    "workPackages": [
-                        {
-                            "title": "交付工作包",
-                            "actions": [
-                                {
-                                    "title": "验证交付",
-                                    "goal": delivery_goal,
-                                    "dependsOn": [],
-                                    "writeScope": null,
-                                }
-                            ]
+                            "title": phase.action_title,
+                            "goal": phase.goal,
+                            "dependsOn": [],
+                            "writeScope": null,
                         }
                     ]
                 }
             ]
         })
-        .to_string(),
-    )
+    }));
+    phases.push(serde_json::json!({
+        "title": "交付",
+        "workPackages": [
+            {
+                "title": "交付工作包",
+                "actions": [
+                    {
+                        "title": "验证交付",
+                        "goal": delivery_goal,
+                        "dependsOn": [],
+                        "writeScope": null,
+                    }
+                ]
+            }
+        ]
+    }));
+    Some(serde_json::json!({ "phases": phases }).to_string())
+}
+
+struct LoopbackExecutionPhase {
+    title: String,
+    action_title: String,
+    goal: String,
+}
+
+fn shadow_loopback_execution_phases(goal: &str) -> Vec<LoopbackExecutionPhase> {
+    if contains_any(
+        goal,
+        &[
+            "第一批",
+            "第二批",
+            "下一批",
+            "多段任务",
+            "继续创建",
+            "继续推进",
+        ],
+    ) {
+        let first_goal = shadow_loopback_goal_segment(
+            goal,
+            "第一批",
+            &["当第一批", "第二批", "；第二批", "\n第二批"],
+        )
+        .unwrap_or_else(|| format!("完成第一批任务，并根据结果判断是否需要继续下一批：{goal}"));
+        let second_goal =
+            shadow_loopback_goal_segment(goal, "第二批", &["第二批完成后", "最后", "重点："])
+                .unwrap_or_else(|| format!("在第一批完成并确认需要继续后，完成第二批任务：{goal}"));
+        return vec![
+            LoopbackExecutionPhase {
+                title: "第一批执行".to_string(),
+                action_title: "执行第一批".to_string(),
+                goal: first_goal,
+            },
+            LoopbackExecutionPhase {
+                title: "第二批执行".to_string(),
+                action_title: "执行第二批".to_string(),
+                goal: second_goal,
+            },
+        ];
+    }
+    vec![LoopbackExecutionPhase {
+        title: "执行".to_string(),
+        action_title: "执行任务".to_string(),
+        goal: format!("完成用户目标：{goal}"),
+    }]
+}
+
+fn shadow_loopback_goal_segment(goal: &str, start: &str, end_markers: &[&str]) -> Option<String> {
+    let start_index = goal.find(start)?;
+    let rest = &goal[start_index..];
+    let end_index = end_markers
+        .iter()
+        .filter_map(|marker| rest.find(marker).filter(|index| *index > 0))
+        .min()
+        .unwrap_or(rest.len());
+    let segment = rest[..end_index]
+        .trim_matches(['；', ';', '。', '.', ' ', '\n', '\t'])
+        .trim();
+    (!segment.is_empty()).then(|| segment.to_string())
 }
 
 fn shadow_loopback_deep_task_goal(prompt: &str) -> String {
+    if let Some((_, rest)) = prompt.split_once("<<<MAGI_DEEP_TASK_GOAL>>>")
+        && let Some((goal, _)) = rest.split_once("<<<END_MAGI_DEEP_TASK_GOAL>>>")
+    {
+        return goal
+            .trim()
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
     prompt
         .split_once("任务目标：")
         .map(|(_, goal)| goal.trim())
@@ -1352,6 +1447,29 @@ mod tests {
     }
 
     #[test]
+    fn shadow_loopback_visible_prompt_keeps_sequential_batches_as_phases() {
+        let prompt = "深度任务图规划器。\n请只调用 create_deep_task_plan 工具输出结构化计划，不要返回自然语言正文。\n任务目标：第一批任务先执行 printf BATCH_ONE_DONE_NEXT_BATCH；当第一批结果包含 NEXT_BATCH 后继续推进；第二批任务执行 printf BATCH_TWO_DONE_FINAL；第二批完成后交付。";
+
+        let visible = super::shadow_loopback_visible_prompt(prompt);
+        let parsed: Value = serde_json::from_str(&visible).expect("deep plan should be json");
+
+        assert_eq!(parsed["phases"].as_array().map(Vec::len), Some(4));
+        assert_eq!(parsed["phases"][1]["title"], "第一批执行");
+        assert_eq!(parsed["phases"][2]["title"], "第二批执行");
+        assert!(
+            parsed["phases"][1]["workPackages"][0]["actions"][0]["goal"]
+                .as_str()
+                .is_some_and(|goal| goal.contains("BATCH_ONE_DONE_NEXT_BATCH")
+                    && !goal.contains("BATCH_TWO_DONE_FINAL"))
+        );
+        assert!(
+            parsed["phases"][2]["workPackages"][0]["actions"][0]["goal"]
+                .as_str()
+                .is_some_and(|goal| goal.contains("BATCH_TWO_DONE_FINAL"))
+        );
+    }
+
+    #[test]
     fn shadow_loopback_visible_prompt_returns_session_turn_classifier_tool_call() {
         let prompt = "Session Turn 编排分类器\n\
             请只调用 classify_session_turn 工具，输出本轮 route。\n\
@@ -1375,6 +1493,37 @@ mod tests {
         )
         .expect("arguments should parse");
         assert_eq!(args["route"], "execute");
+    }
+
+    #[test]
+    fn shadow_loopback_classifier_keeps_multiline_user_text() {
+        let prompt = "Session Turn 编排分类器\n\
+            请只调用 classify_session_turn 工具，输出本轮 route。\n\
+            userText=【全流程验收】请以深度任务模式完成。\n\
+            - worker 必须调用 shell_exec 执行 printf FLOW_TASK_SHELL_OK。\n\
+            - 最终单独一行写 FLOW_TASK_DONE。\n\
+            deepTask=true\n\
+            skillName=\"\"\n\
+            imageCount=0\n\
+            hasRecoverableChain=false";
+
+        let visible = super::shadow_loopback_visible_prompt(prompt);
+        let parsed: Value =
+            serde_json::from_str(&visible).expect("classifier payload should be json");
+        let calls = parsed["tool_calls"]
+            .as_array()
+            .expect("classifier should return tool call payload");
+        let args: Value = serde_json::from_str(
+            calls[0]["function"]["arguments"]
+                .as_str()
+                .expect("arguments should be string json"),
+        )
+        .expect("arguments should parse");
+
+        assert_eq!(args["route"], "task");
+        let goal = args["executionGoal"].as_str().expect("goal should be text");
+        assert!(goal.contains("FLOW_TASK_SHELL_OK"));
+        assert!(goal.contains("FLOW_TASK_DONE"));
     }
 
     #[test]

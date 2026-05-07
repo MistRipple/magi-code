@@ -48,6 +48,12 @@
   const isCurrentSessionEmpty = $derived(
     ensureArray(appState.threadMessages).length === 0
   );
+  const newSessionDisabled = $derived(isCurrentSessionEmpty || messagesState.sessionHydrating);
+  const newSessionTitle = $derived(
+    messagesState.sessionHydrating
+      ? '正在创建新会话'
+      : (isCurrentSessionEmpty ? i18n.t('header.currentSessionEmpty') : i18n.t('header.newSession'))
+  );
   // 切换下拉菜单
   function toggleDropdown() {
     dropdownOpen = !dropdownOpen;
@@ -102,7 +108,7 @@
       source: 'session-management',
       persistToCenter: false,
       countUnread: false,
-      displayMode: 'toast',
+      displayMode: 'notification_center',
       duration: 1800,
     });
     vscode.postMessage({ type: 'newSession' });
@@ -176,7 +182,7 @@
       <div class="session-dropdown">
         <div class="session-dropdown-header">
           <span class="session-dropdown-title">{i18n.t('header.sessionHistory')}</span>
-          <button class="btn-icon btn-icon--sm" onclick={newSession} title={isCurrentSessionEmpty ? i18n.t('header.currentSessionEmpty') : i18n.t('header.newSession')} disabled={isCurrentSessionEmpty}>
+          <button class="btn-icon btn-icon--sm" onclick={newSession} title={newSessionTitle} disabled={newSessionDisabled}>
             <Icon name="plus" size={14} />
           </button>
         </div>
@@ -224,7 +230,7 @@
 
   <!-- 右侧操作按钮 -->
   <div class="header-actions">
-    <button class="btn-icon btn-icon--sm" onclick={newSession} title={isCurrentSessionEmpty ? i18n.t('header.currentSessionEmpty') : i18n.t('header.newSession')} disabled={isCurrentSessionEmpty}>
+    <button class="btn-icon btn-icon--sm" onclick={newSession} title={newSessionTitle} disabled={newSessionDisabled}>
       <Icon name="plus" size={14} />
     </button>
     <div class="lan-access-wrapper">

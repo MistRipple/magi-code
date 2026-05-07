@@ -12,14 +12,15 @@ try {
   const reducer = await server.ssrLoadModule('/src/stores/turn-reducer.ts');
   const projection = await server.ssrLoadModule('/src/stores/turn-projection.ts');
   const timelineRenderItems = await server.ssrLoadModule('/src/lib/timeline-render-items.ts');
+  const dispatchGroupPresentation = await server.ssrLoadModule('/src/lib/dispatch-group-presentation.ts');
   const contract = await server.ssrLoadModule('/src/shared/bridges/rust-daemon-contract.ts');
-  runGoldenReplay(reducer, projection, timelineRenderItems, contract);
+  runGoldenReplay(reducer, projection, timelineRenderItems, dispatchGroupPresentation, contract);
   console.log('canonical turn golden replay passed');
 } finally {
   await server.close();
 }
 
-function runGoldenReplay(reducer, projection, timelineRenderItems, contract) {
+function runGoldenReplay(reducer, projection, timelineRenderItems, dispatchGroupPresentation, contract) {
   const cases = [
     acceptedFirstFrameCase(),
     ordinaryChatCase(),
@@ -63,9 +64,114 @@ function runGoldenReplay(reducer, projection, timelineRenderItems, contract) {
   assertFailedToolWithoutAssistantShowsTurnResponseDuration(reducer, projection);
   assertThreadVisibleRoleMetadataDoesNotBecomeWorkerBadge(reducer, projection);
   assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, timelineRenderItems);
+  assertDispatchGroupPresentationKeepsSequentialBatchesReadable(dispatchGroupPresentation);
   assertBootstrapProcessingStateFromRunningCanonicalTurn(contract);
   assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract);
   assertBootstrapCarriesPendingChanges(contract);
+}
+
+function assertDispatchGroupPresentationKeepsSequentialBatchesReadable(dispatchGroupPresentation) {
+  const steps = dispatchGroupPresentation.buildDispatchPresentationSteps([
+    { key: 'goal', title: '梳理目标', status: 'completed' },
+    { key: 'planning', title: '规划', status: 'completed' },
+    { key: 'phase-one', title: '第一批执行', status: 'completed' },
+    { key: 'action-one', title: '执行第一批', status: 'completed' },
+    { key: 'validate-one', title: '第一批执行验证', status: 'completed' },
+    { key: 'phase-two', title: '第二批执行', status: 'running' },
+    { key: 'action-two', title: '执行第二批', status: 'pending' },
+    { key: 'validate-two', title: '第二批执行验证', status: 'pending' },
+    { key: 'delivery', title: '交付', status: 'pending' },
+  ]);
+  assert.deepEqual(
+    steps.map((step) => ({
+      key: step.key,
+      kind: step.kind,
+      title: step.title,
+      status: step.status,
+      totalStageCount: step.totalStageCount,
+      completedStageCount: step.completedStageCount,
+    })),
+    [
+      {
+        key: 'goal',
+        kind: 'planning',
+        title: '梳理目标',
+        status: 'completed',
+        totalStageCount: 1,
+        completedStageCount: 1,
+      },
+      {
+        key: 'planning',
+        kind: 'planning',
+        title: '规划',
+        status: 'completed',
+        totalStageCount: 1,
+        completedStageCount: 1,
+      },
+      {
+        key: 'phase-one',
+        kind: 'batch',
+        title: '第一批执行',
+        status: 'completed',
+        totalStageCount: 1,
+        completedStageCount: 1,
+      },
+      {
+        key: 'action-one',
+        kind: 'batch',
+        title: '执行第一批',
+        status: 'completed',
+        totalStageCount: 1,
+        completedStageCount: 1,
+      },
+      {
+        key: 'validate-one',
+        kind: 'batch',
+        title: '第一批执行验证',
+        status: 'completed',
+        totalStageCount: 1,
+        completedStageCount: 1,
+      },
+      {
+        key: 'phase-two',
+        kind: 'batch',
+        title: '第二批执行',
+        status: 'running',
+        totalStageCount: 1,
+        completedStageCount: 0,
+      },
+      {
+        key: 'action-two',
+        kind: 'batch',
+        title: '执行第二批',
+        status: 'pending',
+        totalStageCount: 1,
+        completedStageCount: 0,
+      },
+      {
+        key: 'validate-two',
+        kind: 'batch',
+        title: '第二批执行验证',
+        status: 'pending',
+        totalStageCount: 1,
+        completedStageCount: 0,
+      },
+      {
+        key: 'delivery',
+        kind: 'delivery',
+        title: '交付',
+        status: 'pending',
+        totalStageCount: 1,
+        completedStageCount: 0,
+      },
+    ],
+    'dispatch group presentation should keep canonical orchestration steps separate and readable',
+  );
+  assert.equal(
+    dispatchGroupPresentation.countDispatchBatchSteps(steps),
+    2,
+    'dispatch group summary should count user-facing batches, not internal validation lanes',
+  );
 }
 
 function assertThreadVisibleRoleMetadataDoesNotBecomeWorkerBadge(reducer, projection) {
@@ -101,9 +207,24 @@ function assertThreadVisibleRoleMetadataDoesNotBecomeWorkerBadge(reducer, projec
 
 function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, timelineRenderItems) {
   const c = baseCase('worker-dispatch-card', 'session-golden-worker-card', 'turn-golden-worker-card', 9400);
-  const dispatchA = workerDispatch(c, 2, 'dispatch-a', 'lane-a', 'integration-dev', '实现验证', 'completed');
-  const dispatchB = workerDispatch(c, 3, 'dispatch-b', 'lane-b', 'reviewer', '代码评审', 'completed');
-  const workerTool = tool(c, 4, 'worker-tool-a', 'call-worker-a', 'printf worker', 'completed', { stdout: 'worker' });
+  const orchestratorPhase = phase(c, 2, '编排者已接收请求，开始拆解执行步骤。', 'completed');
+  orchestratorPhase.itemId = 'orchestrator-phase';
+  orchestratorPhase.visibility = {
+    renderable: true,
+    threadVisible: true,
+    workerVisible: false,
+  };
+  const userItem = user(c, 1, '请用任务系统完成一次验证。');
+  const dispatchA = workerDispatch(c, 3, 'dispatch-a', 'lane-a', 'integration-dev', '实现验证', 'completed');
+  const dispatchB = workerDispatch(c, 4, 'dispatch-b', 'lane-b', 'reviewer', '代码评审', 'completed');
+  const orchestratorDispatchSummary = phase(c, 8, '已完成任务分配：2 个执行步骤交给 2 个负责人推进；我会在主线继续汇总关键进展。', 'completed');
+  orchestratorDispatchSummary.itemId = 'orchestrator-dispatch-summary';
+  orchestratorDispatchSummary.visibility = {
+    renderable: true,
+    threadVisible: true,
+    workerVisible: false,
+  };
+  const workerTool = tool(c, 5, 'worker-tool-a', 'call-worker-a', 'printf worker', 'completed', { stdout: 'worker' });
   workerTool.laneId = 'lane-a';
   workerTool.worker = { taskId: 'task-a', workerId: 'worker-a', roleId: 'integration-dev', title: 'shell_exec' };
   workerTool.visibility = {
@@ -112,7 +233,7 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, time
     workerVisible: true,
     workerTabIds: ['integration-dev'],
   };
-  const failedWorkerTool = tool(c, 5, 'worker-tool-failed', 'call-worker-failed', 'git status --short', 'failed', { stderr: 'fatal: not a git repository\n', exit_code: 128 });
+  const failedWorkerTool = tool(c, 6, 'worker-tool-failed', 'call-worker-failed', 'git status --short', 'failed', { stderr: 'fatal: not a git repository\n', exit_code: 128 });
   failedWorkerTool.laneId = 'lane-a';
   failedWorkerTool.worker = { taskId: 'task-a', workerId: 'worker-a', roleId: 'integration-dev', title: 'shell_exec' };
   failedWorkerTool.visibility = {
@@ -121,7 +242,7 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, time
     workerVisible: true,
     workerTabIds: ['integration-dev'],
   };
-  const workerAssistant = assistantText(c, 6, 'worker-assistant-a', 'worker 内部执行详情不应直接塞进主线阶段摘要。', 'completed');
+  const workerAssistant = assistantText(c, 7, 'worker-assistant-a', '已完成实现验证：工具调用结果已汇总，细节保留在 worker 详情中。', 'completed');
   workerAssistant.laneId = 'lane-a';
   workerAssistant.worker = { taskId: 'task-a', workerId: 'worker-a', roleId: 'integration-dev', title: '最终回复' };
   workerAssistant.visibility = {
@@ -130,19 +251,61 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, time
     workerVisible: true,
     workerTabIds: ['integration-dev'],
   };
+  const orchestratorFinal = assistantText(c, 9, 'orchestrator-final', '我这轮已经处理完：交付验收通过。\n\n详细步骤和工具记录已保留在任务卡里。', 'completed');
+  orchestratorFinal.worker = { taskId: 'task-root', title: '任务完成' };
+  orchestratorFinal.visibility = {
+    renderable: true,
+    threadVisible: true,
+    workerVisible: false,
+  };
   const state = reducer.replaceCanonicalTurns(c.sessionId, [
-    turn(c, 'completed', [dispatchA, dispatchB, workerTool, failedWorkerTool, workerAssistant], { completedAt: 9500, responseDurationMs: 100 }),
+    turn(c, 'completed', [userItem, orchestratorPhase, dispatchA, dispatchB, workerTool, failedWorkerTool, workerAssistant, orchestratorDispatchSummary, orchestratorFinal], { completedAt: 9500, responseDurationMs: 100 }),
   ]);
   const projectionValue = projection.buildCanonicalTimelineProjection(state);
   assert.ok(projectionValue, 'worker dispatch projection should exist');
   const mainEntries = projectionValue.threadRenderEntries.map((entry) => entry.artifactId);
   assert.deepEqual(
     mainEntries,
-    [`turn:${c.turnId}:worker-dispatch-group`],
-    'worker dispatch sidechain items should surface in the main lane as one worker card',
+    [
+      `turn:${c.turnId}:user-message`,
+      `turn:${c.turnId}:orchestrator-phase`,
+      `turn:${c.turnId}:worker-dispatch-group`,
+      `turn:${c.turnId}:orchestrator-dispatch-summary`,
+      `turn:${c.turnId}:orchestrator-final`,
+    ],
+    'normal mainline should keep user text, orchestrator process text, the dispatch card, follow-up behavior, and final orchestrator close-out',
+  );
+  const orchestratorArtifact = findArtifactByTurnItemId(projectionValue, 'orchestrator-phase');
+  assert.ok(orchestratorArtifact, 'orchestrator phase artifact should exist');
+  assert.equal(
+    orchestratorArtifact.message.type,
+    'text',
+    'thread-visible orchestrator system_notice should render as normal mainline text',
+  );
+  assert.equal(
+    orchestratorArtifact.message.source,
+    'orchestrator',
+    'thread-visible system_notice belongs to the main orchestrator, not a worker badge',
+  );
+  assert.equal(
+    orchestratorArtifact.message.metadata?.responseDurationMs,
+    undefined,
+    'orchestrator process text should not steal the total duration from the task card',
   );
   const workerCard = projectionValue.artifacts.find((artifact) => artifact.artifactId === `turn:${c.turnId}:worker-dispatch-group`);
   assert.ok(workerCard, 'worker card artifact should exist');
+  assert.equal(
+    workerCard.message.metadata?.responseDurationMs,
+    undefined,
+    'worker dispatch card should not steal the total duration once the orchestrator final exists',
+  );
+  const finalArtifact = findArtifactByTurnItemId(projectionValue, 'orchestrator-final');
+  assert.ok(finalArtifact, 'orchestrator final artifact should exist');
+  assert.equal(
+    finalArtifact.message.metadata?.responseDurationMs,
+    100,
+    'orchestrator final should carry the turn response duration after task completion',
+  );
   const dispatchBlock = workerCard.message.blocks?.find((block) => block.type === 'dispatch_group');
   assert.ok(dispatchBlock, 'worker card should render through a dispatch_group block');
   assert.deepEqual(
@@ -156,10 +319,10 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, time
   assert.deepEqual(
     dispatchBlock.lanes?.map((lane) => ({ title: lane.title, summary: lane.summary, toolUseCount: lane.toolUseCount })),
     [
-      { title: '实现验证', summary: undefined, toolUseCount: 2 },
+      { title: '实现验证', summary: workerAssistant.content, toolUseCount: 2 },
       { title: '代码评审', summary: undefined, toolUseCount: undefined },
     ],
-    'main worker card must not leak worker-only assistant text as stage summary',
+    'main worker card should expose a compact stage summary without creating worker detail cards in the main lane',
   );
   assert.equal(
     projectionValue.workerRenderEntries['integration-dev']?.length,
@@ -172,7 +335,7 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, time
     .filter(Boolean)
     .map((artifact) => ({ key: artifact.artifactId, message: artifact.message }));
   const workerGroups = timelineRenderItems.buildWorkerStageRenderGroups(integrationRenderItems, {
-    stageFallback: '执行阶段',
+    stageFallback: '执行步骤',
     directTitle: '任务总控',
     ungroupedTitle: '执行补充',
   });

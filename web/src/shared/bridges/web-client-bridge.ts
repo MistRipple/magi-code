@@ -143,6 +143,7 @@ let bridgeListenerRegistered = false;
 let currentWorkspaceId = '';
 let currentWorkspacePath = '';
 let currentSessionId = '';
+let sessionCreationInFlight: Promise<string> | null = null;
 let currentInterruptTaskId = '';
 let currentRuntimeEpoch = '';
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
@@ -1851,13 +1852,16 @@ async function loadLatestSessionSnapshot(
   });
 }
 
-async function createSession(): Promise<void> {
+async function createSessionInternal(): Promise<string> {
+  const targetWorkspaceId = currentWorkspaceId;
+  const targetWorkspacePath = currentWorkspacePath;
+  dispatchWorkspaceSessionCleared(targetWorkspaceId, targetWorkspacePath);
   const response = await getTransport().request(agentUrl('/api/session/new'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      workspaceId: currentWorkspaceId,
-      workspacePath: currentWorkspacePath,
+      workspaceId: targetWorkspaceId,
+      workspacePath: targetWorkspacePath,
     }),
   });
   if (!response.ok) {
@@ -1873,10 +1877,26 @@ async function createSession(): Promise<void> {
   }
   activateTaskGraphSession(sessionId);
   await loadLatestSessionSnapshot(sessionId, {
-    workspaceId: currentWorkspaceId,
-    workspacePath: currentWorkspacePath,
+    workspaceId: targetWorkspaceId,
+    workspacePath: targetWorkspacePath,
   });
-  emitBridgeSuccessToast('新建会话', '新会话已创建');
+  emitBridgeSuccessToast('新建会话', '新会话已创建', { displayMode: 'notification_center' });
+  return sessionId;
+}
+
+async function createSession(): Promise<string> {
+  if (sessionCreationInFlight) {
+    return sessionCreationInFlight;
+  }
+  const creation = createSessionInternal();
+  sessionCreationInFlight = creation;
+  try {
+    return await creation;
+  } finally {
+    if (sessionCreationInFlight === creation) {
+      sessionCreationInFlight = null;
+    }
+  }
 }
 
 async function switchSession(
@@ -2234,6 +2254,16 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       'queue',
     );
     return true;
+  }
+
+  if (sessionCreationInFlight) {
+    try {
+      await sessionCreationInFlight;
+    } catch (error) {
+      console.error('[web-client-bridge] 发送前等待新会话创建失败:', error);
+      emitBridgeErrorToast('新建会话', error);
+      return false;
+    }
   }
 
   const requestId = input.requestId || generateMessageId();

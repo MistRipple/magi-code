@@ -753,28 +753,40 @@ impl TaskStore {
                             .get(dep_id)
                             .is_some_and(|dep| dep.status == TaskStatus::Completed)
                     })
-                    && !Self::has_blocked_ancestor_inner(task, &tasks)
+                    && Self::ancestor_chain_allows_dispatch_inner(task, &tasks)
             })
             .cloned()
             .collect()
     }
 
-    fn has_blocked_ancestor_inner(task: &Task, tasks: &HashMap<TaskId, Task>) -> bool {
+    fn ancestor_chain_allows_dispatch_inner(task: &Task, tasks: &HashMap<TaskId, Task>) -> bool {
         let mut current = task.parent_task_id.as_ref();
         while let Some(pid) = current {
             if let Some(parent) = tasks.get(pid) {
-                if parent.status == TaskStatus::Draft
-                    || parent.status == TaskStatus::Blocked
-                    || parent.status == TaskStatus::AwaitingApproval
-                {
-                    return true;
+                if matches!(
+                    parent.status,
+                    TaskStatus::Draft
+                        | TaskStatus::Blocked
+                        | TaskStatus::AwaitingApproval
+                        | TaskStatus::Failed
+                        | TaskStatus::Cancelled
+                        | TaskStatus::Skipped
+                ) {
+                    return false;
+                }
+                if parent.dependency_ids.iter().any(|dependency_id| {
+                    !tasks
+                        .get(dependency_id)
+                        .is_some_and(|dependency| dependency.status == TaskStatus::Completed)
+                }) {
+                    return false;
                 }
                 current = parent.parent_task_id.as_ref();
             } else {
                 break;
             }
         }
-        false
+        true
     }
 
     /// 删除单个任务并清理所有关联的索引和租约。
@@ -2147,6 +2159,85 @@ mod tests {
         // No runnable leaves
         let runnable = store.get_runnable_leaves(&TaskId::new("obj-1"));
         assert!(runnable.is_empty());
+    }
+
+    #[test]
+    fn runnable_leaf_waits_for_ancestor_phase_dependencies() {
+        let store = TaskStore::new();
+
+        let objective = make_task(
+            "obj-phase-deps",
+            "m-phase-deps",
+            "obj-phase-deps",
+            None,
+            TaskKind::Objective,
+            TaskStatus::Running,
+        );
+        let planning_phase = make_task(
+            "phase-planning",
+            "m-phase-deps",
+            "obj-phase-deps",
+            Some("obj-phase-deps"),
+            TaskKind::Phase,
+            TaskStatus::Ready,
+        );
+        let planning_action = make_task(
+            "act-planning",
+            "m-phase-deps",
+            "obj-phase-deps",
+            Some("phase-planning"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
+        let mut execution_phase = make_task(
+            "phase-execution",
+            "m-phase-deps",
+            "obj-phase-deps",
+            Some("obj-phase-deps"),
+            TaskKind::Phase,
+            TaskStatus::Ready,
+        );
+        execution_phase.dependency_ids = vec![TaskId::new("phase-planning")];
+        let execution_action = make_task(
+            "act-execution",
+            "m-phase-deps",
+            "obj-phase-deps",
+            Some("phase-execution"),
+            TaskKind::Action,
+            TaskStatus::Ready,
+        );
+
+        store.insert_task(objective);
+        store.insert_task(planning_phase);
+        store.insert_task(planning_action);
+        store.insert_task(execution_phase);
+        store.insert_task(execution_action);
+
+        let runnable = store.get_runnable_leaves(&TaskId::new("obj-phase-deps"));
+        assert_eq!(
+            runnable
+                .iter()
+                .map(|task| task.task_id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["act-planning".to_string()],
+            "执行 action 必须等待父 Phase 的规划依赖完成"
+        );
+
+        store
+            .update_status(&TaskId::new("act-planning"), TaskStatus::Completed)
+            .expect("planning action should complete");
+        store
+            .update_status(&TaskId::new("phase-planning"), TaskStatus::Completed)
+            .expect("planning phase should complete");
+
+        let runnable = store.get_runnable_leaves(&TaskId::new("obj-phase-deps"));
+        assert_eq!(
+            runnable
+                .iter()
+                .map(|task| task.task_id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["act-execution".to_string()]
+        );
     }
 
     // -----------------------------------------------------------------------

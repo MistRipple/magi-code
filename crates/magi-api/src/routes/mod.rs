@@ -196,6 +196,7 @@ mod tests {
         BridgeProbeErrorDto, BridgeServiceSnapshotDto, BridgeServicesSnapshotDto,
         BridgeSnapshotProvider,
     };
+    use crate::session_turn_writeback::session_turn_item;
     use crate::state::{RunnerManager, RunnerStartError};
     use crate::task_execution::{
         DispatchSubmissionAccepted, ShadowTaskDispatcher, drive_shadow_dispatch_submission,
@@ -6509,6 +6510,115 @@ mod tests {
                 .any(|event| event.event_type == "session.turn.completed"),
             "interrupted regular turn must not later publish completed"
         );
+    }
+
+    #[tokio::test]
+    async fn session_interrupt_finalizes_completed_root_before_cancelling_turn() {
+        let state = test_state_with_shadow_execution_pipeline();
+        let app = build_router(state.clone());
+        let session_id = SessionId::new("session-interrupt-completed-root");
+        let mission_id = MissionId::new("mission-interrupt-completed-root");
+        let root_task_id = TaskId::new("task-interrupt-completed-root");
+        let now = UtcMillis::now();
+
+        state
+            .session_store
+            .create_session(session_id.clone(), "interrupt completed root")
+            .expect("session should be creatable");
+        let mut phase_item = session_turn_item(
+            "assistant_phase",
+            "pending",
+            Some("任务状态".to_string()),
+            Some("任务运行中".to_string()),
+            Some("turn-item-interrupt-completed-root-phase".to_string()),
+        );
+        phase_item.thread_visible = true;
+        phase_item.task_id = Some(root_task_id.clone());
+        state
+            .session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-interrupt-completed-root".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![root_task_id.clone()],
+                    active_worker_bindings: Vec::new(),
+                    branches: Vec::new(),
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "timeline-interrupt-completed-root".to_string(),
+                        trimmed_text: Some("执行任务".to_string()),
+                        deep_task: true,
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: "turn-interrupt-completed-root".to_string(),
+                        turn_seq: 1,
+                        accepted_at: now,
+                        completed_at: None,
+                        status: "accepted".to_string(),
+                        user_message: Some("执行任务".to_string()),
+                        items: vec![phase_item],
+                        worker_lanes: Vec::new(),
+                    }),
+                },
+            )
+            .expect("active chain should be stored");
+        state
+            .task_store()
+            .expect("task store should exist")
+            .insert_task(Task {
+                task_id: root_task_id.clone(),
+                mission_id,
+                root_task_id: root_task_id.clone(),
+                parent_task_id: None,
+                kind: TaskKind::Objective,
+                title: "已完成 root".to_string(),
+                goal: "验证停止不会覆盖已完成 root".to_string(),
+                status: TaskStatus::Completed,
+                dependency_ids: Vec::new(),
+                required_children: Vec::new(),
+                policy_snapshot: None,
+                executor_binding: None,
+                context_refs: Vec::new(),
+                knowledge_refs: Vec::new(),
+                workspace_scope: None,
+                write_scope: None,
+                input_refs: Vec::new(),
+                output_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                retry_count: 0,
+                repair_count: 0,
+                decision_payload: None,
+                created_at: now,
+                updated_at: now,
+            });
+
+        let (status, body) = post_json(
+            app,
+            "/api/session/interrupt",
+            json!({
+                "sessionId": session_id.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "unexpected response body: {body:?}");
+        assert_eq!(
+            body["interrupted"], false,
+            "root 已完成时停止请求不应再取消 current_turn"
+        );
+
+        let turn = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("turn should remain inspectable");
+        assert_eq!(turn.status, "completed");
+        assert!(turn.completed_at.is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

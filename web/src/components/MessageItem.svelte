@@ -333,7 +333,7 @@
     {/if}
     <div class="user-row">
       <div class="user-content">
-        <MarkdownContent content={message.content || ''} isStreaming={false} />
+        <div class="user-plain-content">{message.content || ''}</div>
       </div>
       {#if isQueuedUserMessage}
         <div class="queued-user-actions" aria-label={i18n.t('messageItem.queuedActions')}>
@@ -529,6 +529,11 @@
     min-width: 0;
   }
 
+  .user-plain-content {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
   .queued-user-actions {
     display: flex;
     align-items: center;
@@ -581,25 +586,6 @@
       pointer-events: auto;
     }
   }
-  .user-content :global(.markdown-content) {
-    color: inherit;
-  }
-  .user-content :global(a.md-link) {
-    color: rgba(255, 255, 255, 0.92);
-    text-decoration: underline;
-  }
-  .user-content :global(blockquote) {
-    border-left-color: rgba(255, 255, 255, 0.45);
-    background: rgba(255, 255, 255, 0.12);
-  }
-  .user-content :global(:not(pre) > code) {
-    background: rgba(255, 255, 255, 0.2);
-  }
-  .user-content :global(th),
-  .user-content :global(td) {
-    border-color: rgba(255, 255, 255, 0.35);
-  }
-
   .user-time {
     font-size: var(--text-xs);
     color: var(--foreground-muted);

@@ -377,6 +377,7 @@ export function handleUnifiedData(standard: StandardMessage) {
 
     case 'workspaceSessionCleared':
       batchWebviewStatePersistence(() => {
+        messagesState.sessionHydrating = true;
         const hasPendingLocalTurn = messagesState.pendingRequests.size > 0;
         if (!hasPendingLocalTurn) {
           clearAllMessages({
@@ -779,6 +780,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
   // 避免 bootstrap 快照整包替换 live 过程态；空闲时再接管权威历史投影。
   if (isSameSession) {
     batchWebviewStatePersistence(() => {
+      messagesState.sessionHydrating = false;
       const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;
       const sessions = ensureArray(snapshot.sessions) as Session[];
       if (sessions.length > 0) {
@@ -833,6 +835,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
 
   // 跨 session 切换：完整重建
   batchWebviewStatePersistence(() => {
+    messagesState.sessionHydrating = false;
     // skipAntiLiftBack: 跨 session 切换后紧接着 applyAuthoritativeProcessingState
     // 恢复新会话的权威状态，不能让防回抬保护阻断新会话的 processing 写入
     clearAllMessages({

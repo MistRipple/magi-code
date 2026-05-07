@@ -446,6 +446,10 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
         .map(|value| value as u64)
         .unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)
         .clamp(SHELL_TIMEOUT_POLL_MS, MAX_SHELL_TIMEOUT_MS);
+    if let Some(payload) = non_git_read_only_probe_payload(&command, &cwd, access_mode, timeout_ms)
+    {
+        return payload;
+    }
 
     let output =
         match execute_shell_command_with_timeout(&shell, &command, &cwd, timeout_ms, context) {
@@ -493,6 +497,131 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
         }
     })
     .to_string()
+}
+
+fn non_git_read_only_probe_payload(
+    command: &str,
+    cwd: &Path,
+    access_mode: BuiltinToolAccessMode,
+    timeout_ms: u64,
+) -> Option<String> {
+    if access_mode != BuiltinToolAccessMode::ReadOnly {
+        return None;
+    }
+    let target = git_probe_target(command, cwd)?;
+    if is_git_worktree(&target) {
+        return None;
+    }
+    Some(
+        serde_json::json!({
+            "tool": "shell_exec",
+            "status": "succeeded",
+            "command": command,
+            "cwd": cwd.display().to_string(),
+            "access_mode": access_mode.as_str(),
+            "timeout_ms": timeout_ms,
+            "timed_out": false,
+            "cancelled": false,
+            "exit_code": 0,
+            "stdout": "NOT_GIT_WORKTREE\n",
+            "stderr": "",
+            "git_worktree": false,
+            "skipped": true,
+            "summary": format!("工作区不是 Git worktree，已跳过 Git 状态探测: {command}")
+        })
+        .to_string(),
+    )
+}
+
+fn git_probe_target(command: &str, cwd: &Path) -> Option<PathBuf> {
+    simple_git_probe_target(command, cwd).or_else(|| compound_git_probe_target(command, cwd))
+}
+
+fn simple_git_probe_target(command: &str, cwd: &Path) -> Option<PathBuf> {
+    let trimmed = command.trim();
+    if trimmed
+        .chars()
+        .any(|ch| matches!(ch, '&' | '|' | ';' | '`' | '$' | '<' | '>' | '\n'))
+    {
+        return None;
+    }
+    let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+    if tokens.first().copied() != Some("git") {
+        return None;
+    }
+    let mut index = 1usize;
+    let mut target = cwd.to_path_buf();
+    if tokens.get(index).copied() == Some("-C") {
+        let path = tokens.get(index + 1)?;
+        target = resolve_git_probe_path(path, cwd);
+        index += 2;
+    }
+    match tokens.get(index).copied() {
+        Some("status") | Some("diff") => Some(target),
+        _ => None,
+    }
+}
+
+fn compound_git_probe_target(command: &str, cwd: &Path) -> Option<PathBuf> {
+    let tokens = command
+        .split_whitespace()
+        .map(clean_shell_token)
+        .collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        if token != "git" {
+            continue;
+        }
+        let mut cursor = index + 1;
+        let mut target = cwd.to_path_buf();
+        if tokens.get(cursor).map(String::as_str) == Some("-C") {
+            let path = tokens.get(cursor + 1)?;
+            target = resolve_git_probe_path(path, cwd);
+            cursor += 2;
+        }
+        if matches!(
+            tokens.get(cursor).map(String::as_str),
+            Some("status") | Some("diff")
+        ) {
+            return Some(target);
+        }
+    }
+    None
+}
+
+fn clean_shell_token(token: &str) -> String {
+    token
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '\'' | '"' | '(' | ')' | '{' | '}' | '[' | ']' | ';' | '&' | '|'
+            )
+        })
+        .to_string()
+}
+
+fn resolve_git_probe_path(path: &str, cwd: &Path) -> PathBuf {
+    let candidate = PathBuf::from(path);
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        cwd.join(candidate)
+    }
+}
+
+fn is_git_worktree(path: &Path) -> bool {
+    let path_arg = path.to_string_lossy().to_string();
+    Command::new("git")
+        .args([
+            "-C",
+            path_arg.as_str(),
+            "rev-parse",
+            "--is-inside-work-tree",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn execute_shell_command_with_timeout(

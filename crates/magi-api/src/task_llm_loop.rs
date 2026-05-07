@@ -18,13 +18,13 @@ use crate::{
     usage_recording::{ModelUsageBinding, publish_model_usage_record},
 };
 use magi_bridge_client::{
-    ChatMessage, ChatToolCall, ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest,
-    ModelStreamingDelta, SHADOW_MODEL_PROVIDER,
+    ChatMessage, ChatToolCall, ChatToolChoice, ChatToolDefinition, ModelBridgeClient,
+    ModelInvocationRequest, ModelStreamingDelta, SHADOW_MODEL_PROVIDER,
     tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
 use magi_core::{
     ApprovalRequirement, EventId, ExecutionResultStatus, LeaseId, RiskLevel, SessionId, TaskId,
-    TaskStatus, ToolCallId, UtcMillis, WorkspaceId,
+    TaskKind, TaskStatus, ToolCallId, UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::ToolKind;
@@ -34,12 +34,13 @@ use magi_orchestrator::{
 };
 use magi_session_store::{ActiveExecutionTurnItem, SessionStore, TimelineEntryKind};
 use magi_tool_runtime::{
-    ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
+    BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
 };
 use magi_usage_authority::UsageCallStatus;
 use std::{path::PathBuf, sync::Arc, thread};
 
-const MAX_TOOL_CALL_ROUNDS: usize = 8;
+const BASE_TOOL_CALL_ROUNDS: usize = 16;
+const MAX_TOOL_CALL_ROUNDS: usize = 32;
 
 pub(crate) struct TaskLlmLoopRequest<'a> {
     pub client: &'a dyn ModelBridgeClient,
@@ -145,6 +146,21 @@ fn apply_task_worker_detail_visibility(
     }
 }
 
+fn apply_task_final_visibility(
+    item: &mut ActiveExecutionTurnItem,
+    task_store: &TaskStore,
+    task: &magi_core::Task,
+    visibility: &TaskTurnVisibility,
+) {
+    apply_task_turn_visibility(item, task, visibility);
+    let root_is_completed = task_store
+        .get_task(&task.root_task_id)
+        .is_some_and(|root| root.status == TaskStatus::Completed);
+    if visibility.primary_worker_sidechain && !root_is_completed {
+        apply_task_worker_detail_visibility(item, task, visibility);
+    }
+}
+
 pub(crate) fn run_task_llm_loop(
     request: TaskLlmLoopRequest<'_>,
 ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
@@ -210,6 +226,9 @@ pub(crate) fn run_task_llm_loop(
 
     let mut final_content = String::new();
     let mut tool_call_records: Vec<serde_json::Value> = Vec::new();
+    let mut failed_tool_summaries: Vec<String> = Vec::new();
+    let required_tool_chain = task_required_tool_chain(task);
+    let mut completed_required_tool_names: Vec<String> = Vec::new();
     let mut last_stream_item_id: Option<String> = None;
     let mut had_tool_calls = false;
     let primary_worker_sidechain = worker_lane_id.is_none()
@@ -225,7 +244,31 @@ pub(crate) fn run_task_llm_loop(
         primary_worker_sidechain,
     );
 
-    for round in 0..MAX_TOOL_CALL_ROUNDS {
+    if let Some(final_content) = deterministic_task_final_content(task, task_store) {
+        if turn_visibility.thread_visible || turn_visibility.worker_visible {
+            append_task_final_turn_item(
+                event_bus,
+                session_store,
+                task_store,
+                task,
+                session_id,
+                workspace_id,
+                &final_content,
+                None,
+                streaming_entry_id,
+                &turn_visibility,
+            );
+        }
+        return (
+            TaskOutcome::Completed {
+                output_refs: vec![final_content],
+            },
+            context_summary,
+        );
+    }
+
+    let tool_call_round_limit = tool_call_round_limit(&required_tool_chain);
+    for round in 0..tool_call_round_limit {
         let should_record_turn_artifacts =
             turn_visibility.thread_visible || turn_visibility.worker_visible;
         let thinking_item_id = format!("turn-item-assistant-thinking-{task_id}-{round}");
@@ -238,7 +281,11 @@ pub(crate) fn run_task_llm_loop(
             prompt: prompt.clone(),
             messages: Some(messages.clone()),
             tools: tools.clone(),
-            tool_choice: None,
+            tool_choice: forced_task_tool_choice_for_round(
+                &required_tool_chain,
+                tools.as_ref(),
+                &completed_required_tool_names,
+            ),
         };
 
         let response = if streaming_entry_id.is_some() {
@@ -379,6 +426,27 @@ pub(crate) fn run_task_llm_loop(
         }
 
         if parsed.tool_calls.is_empty() {
+            if !required_tool_chain_is_complete(
+                &required_tool_chain,
+                &completed_required_tool_names,
+            ) {
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: parsed.content.clone(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(required_tool_chain_recovery_prompt(
+                        &required_tool_chain,
+                        &completed_required_tool_names,
+                    )),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+                continue;
+            }
             break;
         }
 
@@ -431,6 +499,13 @@ pub(crate) fn run_task_llm_loop(
                     tool_status,
                 );
             }
+            if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
+                failed_tool_summaries.push(format!(
+                    "{}: {}",
+                    tool_call.function.name,
+                    summarize_tool_result(&result)
+                ));
+            }
             tool_call_records.push(tool_call_record(tool_call, &result));
             messages.push(ChatMessage {
                 role: "tool".to_string(),
@@ -439,6 +514,15 @@ pub(crate) fn run_task_llm_loop(
                 tool_call_id: Some(tool_call.id.clone()),
             });
         }
+        record_completed_required_tools(
+            &mut completed_required_tool_names,
+            &required_tool_chain,
+            &parsed
+                .tool_calls
+                .iter()
+                .map(|tool_call| canonical_tool_call_name(&tool_call.function.name))
+                .collect::<Vec<_>>(),
+        );
     }
 
     if final_content.trim().is_empty() {
@@ -498,6 +582,52 @@ pub(crate) fn run_task_llm_loop(
             context_summary,
         );
     }
+
+    if let Some(failure_reason) = task_tool_failure_reason(task.kind, &failed_tool_summaries) {
+        if turn_visibility.thread_visible || turn_visibility.worker_visible {
+            append_task_error_turn_item(
+                event_bus,
+                session_store,
+                task_store,
+                task,
+                session_id,
+                workspace_id,
+                &turn_visibility,
+                &failure_reason,
+                streaming_entry_id.or(last_stream_item_id.as_deref()),
+            );
+        }
+        return (
+            TaskOutcome::Failed {
+                error: failure_reason,
+            },
+            context_summary,
+        );
+    }
+
+    if task.kind == TaskKind::Validation && validation_result_rejects_delivery(&final_content) {
+        let failure_reason = compact_validation_failure(&final_content);
+        if turn_visibility.thread_visible || turn_visibility.worker_visible {
+            append_task_error_turn_item(
+                event_bus,
+                session_store,
+                task_store,
+                task,
+                session_id,
+                workspace_id,
+                &turn_visibility,
+                &failure_reason,
+                streaming_entry_id.or(last_stream_item_id.as_deref()),
+            );
+        }
+        return (
+            TaskOutcome::Failed {
+                error: failure_reason,
+            },
+            context_summary,
+        );
+    }
+
     if turn_visibility.thread_visible || turn_visibility.worker_visible {
         append_task_final_turn_item(
             event_bus,
@@ -519,6 +649,424 @@ pub(crate) fn run_task_llm_loop(
         },
         context_summary,
     )
+}
+
+fn task_tool_failure_reason(
+    task_kind: TaskKind,
+    failed_tool_summaries: &[String],
+) -> Option<String> {
+    if task_kind == TaskKind::Validation || failed_tool_summaries.is_empty() {
+        return None;
+    }
+    let compact = failed_tool_summaries
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    let suffix = if failed_tool_summaries.len() > 3 {
+        format!("；另有 {} 个工具失败", failed_tool_summaries.len() - 3)
+    } else {
+        String::new()
+    };
+    Some(format!("工具执行失败，任务不能标记完成：{compact}{suffix}"))
+}
+
+fn validation_result_rejects_delivery(content: &str) -> bool {
+    let leading = content.trim_start().chars().take(240).collect::<String>();
+    let lower = leading.to_ascii_lowercase();
+    let normalized = leading
+        .chars()
+        .filter(|ch| !matches!(ch, '*' | '_' | '`' | '#' | '>' | ' ' | '\t' | '\r' | '\n'))
+        .collect::<String>();
+    let negative_markers = [
+        "不通过",
+        "未通过",
+        "部分通过",
+        "验收未通过",
+        "验证未通过",
+        "无法确认",
+        "未能确认",
+        "不能判定",
+        "不满足",
+    ];
+    negative_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+        || lower.starts_with("failed")
+        || lower.starts_with("failure")
+        || lower.starts_with("not passed")
+        || lower.contains("not passed")
+        || lower.contains("does not pass")
+}
+
+fn compact_validation_failure(content: &str) -> String {
+    let trimmed = content.trim();
+    let compact = trimmed.chars().take(240).collect::<String>();
+    if trimmed.chars().count() > 240 {
+        format!("验证未通过: {compact}…")
+    } else {
+        format!("验证未通过: {compact}")
+    }
+}
+
+fn deterministic_task_final_content(
+    task: &magi_core::Task,
+    task_store: &TaskStore,
+) -> Option<String> {
+    if is_planning_no_tool_action(task) {
+        return Some(deterministic_planning_content(task));
+    }
+    if is_planning_text_validation(task) {
+        return deterministic_planning_validation_content(task, task_store);
+    }
+    if is_execution_tool_validation(task) {
+        return deterministic_execution_tool_validation_content(task, task_store);
+    }
+    None
+}
+
+fn is_planning_no_tool_action(task: &magi_core::Task) -> bool {
+    task.kind == TaskKind::Action
+        && task.title.contains("梳理目标")
+        && task
+            .policy_snapshot
+            .as_ref()
+            .is_some_and(|policy| policy.command_mode.eq_ignore_ascii_case("no_tools"))
+        && task.dependency_ids.is_empty()
+}
+
+fn deterministic_planning_content(task: &magi_core::Task) -> String {
+    let goal = extract_deep_task_goal(&task.goal).unwrap_or_else(|| task.goal.trim().to_string());
+    format!(
+        "目标：{goal}\n\n边界：规划步骤只整理目标、边界、执行计划和验收标准，不调用工具，不执行文件、shell 或网络操作。\n\n执行计划：执行步骤负责按用户目标调用工具并产生可验证结果；交付步骤只基于执行产出总结，不重复调用工具。\n\n验收标准：规划文本必须包含目标、边界、执行计划、验收标准四部分；执行结果必须以真实工具结果为准，失败或阻塞不得伪装成功。"
+    )
+}
+
+fn is_planning_text_validation(task: &magi_core::Task) -> bool {
+    task.kind == TaskKind::Validation && task.goal.contains("只验证规划文本完整性")
+}
+
+fn deterministic_planning_validation_content(
+    task: &magi_core::Task,
+    task_store: &TaskStore,
+) -> Option<String> {
+    let dependency_text = task
+        .dependency_ids
+        .iter()
+        .filter_map(|dependency_id| task_store.get_task(dependency_id))
+        .flat_map(|dependency| dependency.output_refs)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let has_required_sections = ["目标：", "边界：", "执行计划：", "验收标准："]
+        .iter()
+        .all(|section| dependency_text.contains(section));
+    has_required_sections.then(|| {
+        "通过。规划文本已包含目标、边界、执行计划和验收标准；本步骤未验证后续执行结果、文件内容或工作区变更。".to_string()
+    })
+}
+
+fn is_execution_tool_validation(task: &magi_core::Task) -> bool {
+    task.kind == TaskKind::Validation && task.goal.contains("实际执行和工具结果")
+}
+
+fn deterministic_execution_tool_validation_content(
+    task: &magi_core::Task,
+    task_store: &TaskStore,
+) -> Option<String> {
+    let dependencies = task
+        .dependency_ids
+        .iter()
+        .filter_map(|dependency_id| task_store.get_task(dependency_id))
+        .collect::<Vec<_>>();
+    if dependencies.is_empty() {
+        return None;
+    }
+
+    let mut required_tools = Vec::new();
+    let mut observed_tools = Vec::new();
+    let mut failed_tools = Vec::new();
+    let mut has_final_text = false;
+
+    for dependency in dependencies {
+        for tool_name in task_required_tool_chain(&dependency) {
+            if !required_tools.iter().any(|existing| existing == &tool_name) {
+                required_tools.push(tool_name);
+            }
+        }
+        for output in dependency.output_refs {
+            collect_dependency_output_validation_facts(
+                &output,
+                &mut observed_tools,
+                &mut failed_tools,
+                &mut has_final_text,
+            );
+        }
+    }
+
+    let missing_tools = required_tools
+        .iter()
+        .filter(|tool_name| !observed_tools.iter().any(|observed| observed == *tool_name))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if !failed_tools.is_empty() || !missing_tools.is_empty() || !has_final_text {
+        return None;
+    }
+
+    let tools = if observed_tools.is_empty() {
+        "无工具调用".to_string()
+    } else {
+        observed_tools.join(", ")
+    };
+    Some(format!(
+        "通过。已基于依赖任务的结构化输出核验当前执行产物，工具调用均成功且最终回复已生成；已验证工具：{tools}。"
+    ))
+}
+
+fn collect_dependency_output_validation_facts(
+    output: &str,
+    observed_tools: &mut Vec<String>,
+    failed_tools: &mut Vec<String>,
+    has_final_text: &mut bool,
+) {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        *has_final_text = true;
+        return;
+    };
+    let Some(blocks) = value.get("blocks").and_then(serde_json::Value::as_array) else {
+        if !trimmed.is_empty() {
+            *has_final_text = true;
+        }
+        return;
+    };
+    for block in blocks {
+        match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("tool_call") => {
+                let Some(tool_call) = block.get("toolCall") else {
+                    continue;
+                };
+                let Some(tool_name) = tool_call
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(canonical_tool_call_name)
+                else {
+                    continue;
+                };
+                if !observed_tools.iter().any(|observed| observed == &tool_name) {
+                    observed_tools.push(tool_name.clone());
+                }
+                let status = tool_call
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if status != "success" {
+                    failed_tools.push(tool_name.clone());
+                    continue;
+                }
+                let result_status = tool_call
+                    .get("result")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|result| serde_json::from_str::<serde_json::Value>(result).ok())
+                    .and_then(|result| {
+                        result
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    });
+                if result_status
+                    .as_deref()
+                    .is_some_and(|status| status != "succeeded")
+                {
+                    failed_tools.push(tool_name);
+                }
+            }
+            Some("text") => {
+                if block
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|content| !content.trim().is_empty())
+                {
+                    *has_final_text = true;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn extract_deep_task_goal(value: &str) -> Option<String> {
+    let (_, rest) = value.split_once("<<<MAGI_DEEP_TASK_GOAL>>>")?;
+    let (goal, _) = rest.split_once("<<<END_MAGI_DEEP_TASK_GOAL>>>")?;
+    Some(
+        goal.trim()
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn task_required_tool_chain(task: &magi_core::Task) -> Vec<String> {
+    if task.kind != TaskKind::Action {
+        return Vec::new();
+    }
+    if task
+        .policy_snapshot
+        .as_ref()
+        .is_some_and(|policy| !policy.command_mode.eq_ignore_ascii_case("full"))
+    {
+        return Vec::new();
+    }
+    let normalized = task.goal.to_ascii_lowercase();
+    let mut matches: Vec<(&'static str, usize)> = Vec::new();
+    for (alias, canonical_name) in public_builtin_tool_reference_aliases() {
+        let Some(position) = tool_reference_position(&normalized, alias) else {
+            continue;
+        };
+        if let Some((_, existing_position)) =
+            matches.iter_mut().find(|(name, _)| *name == canonical_name)
+        {
+            *existing_position = (*existing_position).min(position);
+        } else {
+            matches.push((canonical_name, position));
+        }
+    }
+    matches.sort_by_key(|(_, position)| *position);
+    matches
+        .into_iter()
+        .map(|(tool_name, _)| tool_name.to_string())
+        .collect()
+}
+
+fn public_builtin_tool_reference_aliases() -> Vec<(&'static str, &'static str)> {
+    let mut aliases = Vec::new();
+    for tool in BuiltinToolName::ALL {
+        if tool.is_public_tool_surface() {
+            let name = tool.as_str();
+            aliases.push((name, name));
+        }
+    }
+    aliases.extend([
+        ("file_view", "file_read"),
+        ("file_create", "file_write"),
+        ("file_edit", "file_patch"),
+        ("file_insert", "file_patch"),
+        ("code_search_regex", "search_text"),
+        ("code_search_semantic", "search_semantic"),
+        ("shell", "shell_exec"),
+        ("project_knowledge_query", "knowledge_query"),
+    ]);
+    aliases
+}
+
+fn tool_reference_position(text: &str, tool_name: &str) -> Option<usize> {
+    text.match_indices(tool_name).find_map(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + tool_name.len()..].chars().next();
+        (is_tool_reference_boundary(before) && is_tool_reference_boundary(after)).then_some(start)
+    })
+}
+
+fn is_tool_reference_boundary(value: Option<char>) -> bool {
+    value
+        .map(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        .unwrap_or(true)
+}
+
+fn forced_task_tool_choice_for_round(
+    required_tool_chain: &[String],
+    tools: Option<&Vec<ChatToolDefinition>>,
+    completed_required_tool_names: &[String],
+) -> Option<ChatToolChoice> {
+    let forced_tool_name = required_tool_chain
+        .iter()
+        .find(|tool_name| {
+            !completed_required_tool_names
+                .iter()
+                .any(|completed| completed == *tool_name)
+        })?
+        .trim();
+    if forced_tool_name.is_empty() {
+        return None;
+    }
+    let tool_is_available = tools
+        .map(|definitions| {
+            definitions
+                .iter()
+                .any(|definition| definition.function.name == forced_tool_name)
+        })
+        .unwrap_or(false);
+    tool_is_available.then(|| ChatToolChoice::force_function(forced_tool_name))
+}
+
+fn record_completed_required_tools(
+    completed: &mut Vec<String>,
+    required_tool_chain: &[String],
+    tool_call_names: &[String],
+) {
+    for tool_name in tool_call_names {
+        if !required_tool_chain
+            .iter()
+            .any(|required| required == tool_name)
+        {
+            continue;
+        }
+        if !completed
+            .iter()
+            .any(|completed_name| completed_name == tool_name)
+        {
+            completed.push(tool_name.clone());
+        }
+    }
+}
+
+fn required_tool_chain_is_complete(required_tool_chain: &[String], completed: &[String]) -> bool {
+    required_tool_chain.iter().all(|required| {
+        completed
+            .iter()
+            .any(|completed_name| completed_name == required)
+    })
+}
+
+fn required_tool_chain_recovery_prompt(
+    required_tool_chain: &[String],
+    completed: &[String],
+) -> String {
+    let missing = required_tool_chain
+        .iter()
+        .filter(|required| {
+            !completed
+                .iter()
+                .any(|completed_name| completed_name == *required)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    format!(
+        "上一轮提前给出了文字回复，但当前 action 明确要求调用的内置工具链尚未完成。已完成：{}。仍需继续调用：{}。请继续调用下一个缺失工具，不要总结。",
+        if completed.is_empty() {
+            "无".to_string()
+        } else {
+            completed.join(", ")
+        },
+        missing.join(", ")
+    )
+}
+
+fn tool_call_round_limit(required_tool_chain: &[String]) -> usize {
+    BASE_TOOL_CALL_ROUNDS
+        .max(required_tool_chain.len().saturating_add(2))
+        .min(MAX_TOOL_CALL_ROUNDS)
+}
+
+fn canonical_tool_call_name(tool_name: &str) -> String {
+    BuiltinToolName::from_str(tool_name.trim())
+        .map(|tool| tool.as_str().to_string())
+        .unwrap_or_else(|| tool_name.trim().to_string())
 }
 
 fn task_event_context(
@@ -888,6 +1436,14 @@ fn execute_task_tool_call(
         return (rejection, ExecutionResultStatus::Failed);
     }
 
+    if let Some(rejection) = task_policy_tool_rejection(
+        task,
+        &tool_call.function.name,
+        &tool_call.function.arguments,
+    ) {
+        return (rejection, ExecutionResultStatus::Rejected);
+    }
+
     let output = registry.execute_with_policy(
         ToolExecutionInput {
             tool_call_id: ToolCallId::new(&tool_call.id),
@@ -908,6 +1464,94 @@ fn execute_task_tool_call(
     );
 
     (output.payload, output.status)
+}
+
+fn task_policy_tool_rejection(
+    task: &magi_core::Task,
+    requested_tool_name: &str,
+    arguments: &str,
+) -> Option<String> {
+    let policy = task.policy_snapshot.as_ref()?;
+    let canonical_tool_name = canonical_builtin_tool_name(requested_tool_name)
+        .unwrap_or_else(|| requested_tool_name.trim().to_string());
+    if policy.command_mode.eq_ignore_ascii_case("no_tools") {
+        return Some(task_policy_rejection_payload(
+            &canonical_tool_name,
+            format!("当前任务阶段不允许调用工具: {canonical_tool_name}"),
+        ));
+    }
+    if policy.denied_tools.iter().any(|tool| {
+        canonical_builtin_tool_name(tool).as_deref() == Some(canonical_tool_name.as_str())
+    }) {
+        return Some(task_policy_rejection_payload(
+            &canonical_tool_name,
+            format!("任务策略已拒绝工具: {canonical_tool_name}"),
+        ));
+    }
+    if !policy.allowed_tools.is_empty()
+        && !policy.allowed_tools.iter().any(|tool| {
+            canonical_builtin_tool_name(tool).as_deref() == Some(canonical_tool_name.as_str())
+        })
+    {
+        return Some(task_policy_rejection_payload(
+            &canonical_tool_name,
+            format!("任务策略未授权工具: {canonical_tool_name}"),
+        ));
+    }
+    if policy.command_mode.eq_ignore_ascii_case("read_only") {
+        if BuiltinToolName::from_str(canonical_tool_name.as_str())
+            .is_some_and(|tool| tool.is_write_operation())
+        {
+            return Some(task_policy_rejection_payload(
+                &canonical_tool_name,
+                format!("只读任务不允许执行写入工具: {canonical_tool_name}"),
+            ));
+        }
+        if canonical_tool_name == BuiltinToolName::ShellExec.as_str()
+            && !shell_arguments_request_read_only(arguments)
+        {
+            return Some(task_policy_rejection_payload(
+                &canonical_tool_name,
+                "只读任务中的 shell_exec 必须显式声明 access_mode=read_only".to_string(),
+            ));
+        }
+    }
+    None
+}
+
+fn canonical_builtin_tool_name(tool_name: &str) -> Option<String> {
+    BuiltinToolName::from_str(tool_name.trim()).map(|tool| tool.as_str().to_string())
+}
+
+fn shell_arguments_request_read_only(arguments: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()
+                .and_then(|object| {
+                    object
+                        .get("access_mode")
+                        .or_else(|| object.get("write_mode"))
+                })
+                .and_then(serde_json::Value::as_str)
+                .map(|mode| {
+                    matches!(
+                        mode.trim().to_ascii_lowercase().as_str(),
+                        "read" | "read_only" | "readonly"
+                    )
+                })
+        })
+        .unwrap_or(false)
+}
+
+fn task_policy_rejection_payload(tool_name: &str, error: String) -> String {
+    serde_json::json!({
+        "tool": tool_name,
+        "status": "rejected",
+        "error": error,
+    })
+    .to_string()
 }
 
 fn tool_call_record(tool_call: &ChatToolCall, result: &str) -> serde_json::Value {
@@ -946,7 +1590,7 @@ fn append_task_final_turn_item(
         Some(final_content.to_string()),
         final_item_id.map(str::to_string),
     );
-    apply_task_turn_visibility(&mut final_item, task, turn_visibility);
+    apply_task_final_visibility(&mut final_item, task_store, task, turn_visibility);
     if let Some(timeline_entry_id) = timeline_entry_id {
         final_item.timeline_entry_id = Some(timeline_entry_id.to_string());
     }
@@ -1104,6 +1748,12 @@ mod tests {
     }
 
     struct FailingTaskModelBridgeClient;
+    struct StaticTaskFinalModelBridgeClient {
+        content: &'static str,
+    }
+    struct TaskToolFailureThenFinalModelBridgeClient {
+        invoke_count: AtomicUsize,
+    }
 
     impl ModelBridgeClient for TaskToolBatchModelBridgeClient {
         fn invoke(
@@ -1200,6 +1850,80 @@ mod tests {
         }
     }
 
+    impl ModelBridgeClient for StaticTaskFinalModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            Ok(BridgeResponse {
+                ok: true,
+                payload: serde_json::json!({
+                    "content": self.content,
+                    "finish_reason": "stop"
+                })
+                .to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            on_delta(&ModelStreamingDelta {
+                content: self.content.to_string(),
+                thinking: String::new(),
+            });
+            self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for TaskToolFailureThenFinalModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            let index = self.invoke_count.fetch_add(1, Ordering::SeqCst);
+            let payload = if index == 0 {
+                serde_json::json!({
+                    "content": null,
+                    "finish_reason": "tool_calls",
+                    "tool_calls": [{
+                        "id": "task-tool-failure",
+                        "type": "function",
+                        "function": {
+                            "name": "missing_builtin_tool",
+                            "arguments": "{}"
+                        }
+                    }]
+                })
+            } else {
+                serde_json::json!({
+                    "content": "FLOW_SHOULD_NOT_COMPLETE",
+                    "finish_reason": "stop"
+                })
+            };
+            Ok(BridgeResponse {
+                ok: true,
+                payload: payload.to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            if self.invoke_count.load(Ordering::SeqCst) > 0 {
+                on_delta(&ModelStreamingDelta {
+                    content: "FLOW_SHOULD_NOT_COMPLETE".to_string(),
+                    thinking: String::new(),
+                });
+            }
+            self.invoke(request)
+        }
+    }
+
     #[test]
     fn execute_task_tool_call_rejects_internal_process_launch_surface() {
         let tool_registry = ToolRegistry::new(
@@ -1242,6 +1966,328 @@ mod tests {
                 .expect("error should be string")
                 .contains("shell_exec")
         );
+    }
+
+    #[test]
+    fn execute_task_tool_call_rejects_write_tool_for_readonly_task_policy() {
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let mut task = make_task_loop_test_task("task-readonly-write-policy");
+        task.policy_snapshot = Some(magi_core::TaskPolicy {
+            autonomy_level: "Autonomous".to_string(),
+            approval_mode: "DecisionOnly".to_string(),
+            allowed_tools: vec!["file_read".to_string(), "shell_exec".to_string()],
+            denied_tools: vec!["file_write".to_string()],
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "read_only".to_string(),
+            retry_limit: 1,
+            repair_limit: 1,
+            validation_profile: Some("required".to_string()),
+            checkpoint_mode: "task_or_phase".to_string(),
+            background_allowed: true,
+            escalation_conditions: Vec::new(),
+        });
+        let call = ChatToolCall {
+            id: "tool-call-file-write-readonly".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "file_write".to_string(),
+                arguments: serde_json::json!({
+                    "path": "/tmp/readonly-policy.txt",
+                    "content": "must-not-write"
+                })
+                .to_string(),
+            },
+        };
+
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task,
+            &SessionId::new("session-readonly-write-policy"),
+            &Some(WorkspaceId::new("workspace-readonly-write-policy")),
+            None,
+            Some(&WorkerId::new("worker-readonly-write-policy")),
+            &call,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+        assert_eq!(parsed["tool"], "file_write");
+        assert_eq!(parsed["status"], "rejected");
+    }
+
+    #[test]
+    fn execute_task_tool_call_requires_readonly_shell_access_mode_for_readonly_task_policy() {
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let mut task = make_task_loop_test_task("task-readonly-shell-policy");
+        task.policy_snapshot = Some(magi_core::TaskPolicy {
+            autonomy_level: "Autonomous".to_string(),
+            approval_mode: "DecisionOnly".to_string(),
+            allowed_tools: vec!["shell_exec".to_string()],
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "read_only".to_string(),
+            retry_limit: 1,
+            repair_limit: 1,
+            validation_profile: Some("required".to_string()),
+            checkpoint_mode: "task_or_phase".to_string(),
+            background_allowed: true,
+            escalation_conditions: Vec::new(),
+        });
+        let call = ChatToolCall {
+            id: "tool-call-shell-missing-access".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "shell_exec".to_string(),
+                arguments: serde_json::json!({ "command": "printf ok" }).to_string(),
+            },
+        };
+
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task,
+            &SessionId::new("session-readonly-shell-policy"),
+            &Some(WorkspaceId::new("workspace-readonly-shell-policy")),
+            None,
+            Some(&WorkerId::new("worker-readonly-shell-policy")),
+            &call,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        assert!(payload.contains("access_mode=read_only"));
+    }
+
+    #[test]
+    fn execute_task_tool_call_rejects_every_tool_for_no_tool_task_policy() {
+        let tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        let event_bus = InMemoryEventBus::new(8);
+        let mut task = make_task_loop_test_task("task-no-tool-policy");
+        task.policy_snapshot = Some(magi_core::TaskPolicy {
+            autonomy_level: "Autonomous".to_string(),
+            approval_mode: "DecisionOnly".to_string(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "no_tools".to_string(),
+            retry_limit: 1,
+            repair_limit: 1,
+            validation_profile: Some("required".to_string()),
+            checkpoint_mode: "task_or_phase".to_string(),
+            background_allowed: true,
+            escalation_conditions: Vec::new(),
+        });
+        let call = ChatToolCall {
+            id: "tool-call-no-tool-file-read".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({ "path": "/tmp/no-tool-policy.txt" }).to_string(),
+            },
+        };
+
+        let (payload, status) = execute_task_tool_call(
+            &event_bus,
+            Some(&tool_registry),
+            None,
+            &task,
+            &SessionId::new("session-no-tool-policy"),
+            &Some(WorkspaceId::new("workspace-no-tool-policy")),
+            None,
+            Some(&WorkerId::new("worker-no-tool-policy")),
+            &call,
+        );
+
+        assert_eq!(status, ExecutionResultStatus::Rejected);
+        assert!(payload.contains("不允许调用工具"));
+    }
+
+    #[test]
+    fn full_action_extracts_required_tool_chain_in_goal_order() {
+        let mut task = make_task_loop_test_task("task-required-tool-chain");
+        task.goal =
+            "按顺序调用：1 shell_exec；2 file_mkdir；3 file_write；4 file_read；5 file_remove"
+                .to_string();
+        task.policy_snapshot = Some(magi_core::TaskPolicy {
+            autonomy_level: "Autonomous".to_string(),
+            approval_mode: "DecisionOnly".to_string(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "full".to_string(),
+            retry_limit: 1,
+            repair_limit: 1,
+            validation_profile: Some("required".to_string()),
+            checkpoint_mode: "task_or_phase".to_string(),
+            background_allowed: true,
+            escalation_conditions: Vec::new(),
+        });
+
+        assert_eq!(
+            task_required_tool_chain(&task),
+            vec![
+                "shell_exec".to_string(),
+                "file_mkdir".to_string(),
+                "file_write".to_string(),
+                "file_read".to_string(),
+                "file_remove".to_string()
+            ]
+        );
+
+        task.policy_snapshot.as_mut().expect("policy").command_mode = "read_only".to_string();
+        assert!(
+            task_required_tool_chain(&task).is_empty(),
+            "只读阶段即使复述用户目标，也不能强制执行写工具链"
+        );
+    }
+
+    #[test]
+    fn task_tool_call_round_limit_keeps_final_round_after_explicit_chain() {
+        let required_tool_chain = [
+            "file_mkdir",
+            "file_write",
+            "file_read",
+            "file_patch",
+            "search_text",
+            "shell_exec",
+            "diff_preview",
+            "diagram_render",
+            "file_remove",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+        assert!(
+            tool_call_round_limit(&required_tool_chain) >= required_tool_chain.len() + 2,
+            "显式工具链不能因为固定轮数耗尽而丢失最后的工具或总结轮"
+        );
+    }
+
+    #[test]
+    fn planning_no_tool_action_and_validation_are_deterministic() {
+        let task_store = TaskStore::new();
+        let mut planning = make_task_loop_test_task("task-planning-deterministic");
+        planning.title = "梳理目标".to_string();
+        planning.goal = "明确目标、边界和验收标准：<<<MAGI_DEEP_TASK_GOAL>>>\n执行指定工具链\n<<<END_MAGI_DEEP_TASK_GOAL>>>"
+            .to_string();
+        planning.policy_snapshot = Some(magi_core::TaskPolicy {
+            autonomy_level: "Autonomous".to_string(),
+            approval_mode: "DecisionOnly".to_string(),
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "no_tools".to_string(),
+            retry_limit: 1,
+            repair_limit: 1,
+            validation_profile: Some("required".to_string()),
+            checkpoint_mode: "task_or_phase".to_string(),
+            background_allowed: true,
+            escalation_conditions: Vec::new(),
+        });
+        let planning_content =
+            deterministic_task_final_content(&planning, &task_store).expect("planning content");
+        assert!(planning_content.contains("目标：执行指定工具链"));
+        assert!(planning_content.contains("边界："));
+        assert!(planning_content.contains("执行计划："));
+        assert!(planning_content.contains("验收标准："));
+
+        planning.output_refs = vec![planning_content];
+        task_store.insert_task(planning);
+        let mut validation = make_task_loop_test_task("task-planning-validation-deterministic");
+        validation.kind = TaskKind::Validation;
+        validation.title = "规划 验证".to_string();
+        validation.goal =
+            "验证 规划 阶段产出是否包含目标、边界、执行计划和验收标准；只验证规划文本完整性"
+                .to_string();
+        validation.dependency_ids = vec![TaskId::new("task-planning-deterministic")];
+        let validation_content = deterministic_task_final_content(&validation, &task_store)
+            .expect("planning validation content");
+
+        assert!(validation_content.starts_with("通过。"));
+    }
+
+    #[test]
+    fn execution_validation_uses_dependency_structured_output() {
+        let task_store = TaskStore::new();
+        let mut action = make_task_loop_test_task("task-execution-output");
+        action.goal = "按顺序调用 file_mkdir、file_write、file_read、file_patch、search_text、shell_exec、diff_preview、diagram_render、file_remove"
+            .to_string();
+        action.output_refs = vec![
+            serde_json::json!({
+                "blocks": [
+                    successful_tool_output_block("file_mkdir"),
+                    successful_tool_output_block("file_write"),
+                    successful_tool_output_block("file_read"),
+                    successful_tool_output_block("file_patch"),
+                    successful_tool_output_block("search_text"),
+                    successful_tool_output_block("shell_exec"),
+                    successful_tool_output_block("diff_preview"),
+                    successful_tool_output_block("diagram_render"),
+                    successful_tool_output_block("file_remove"),
+                    {
+                        "type": "text",
+                        "content": "DEEP_TASK_DONE_TEST"
+                    }
+                ]
+            })
+            .to_string(),
+        ];
+        task_store.insert_task(action);
+
+        let mut validation = make_task_loop_test_task("task-execution-validation");
+        validation.kind = TaskKind::Validation;
+        validation.title = "执行 验证".to_string();
+        validation.goal = "验证 执行 阶段是否按用户目标完成实际执行和工具结果。".to_string();
+        validation.dependency_ids = vec![TaskId::new("task-execution-output")];
+
+        let validation_content = deterministic_task_final_content(&validation, &task_store)
+            .expect("execution validation should be deterministic from dependency output");
+
+        assert!(validation_content.starts_with("通过。"));
+        assert!(validation_content.contains("file_remove"));
+        assert!(!validation_result_rejects_delivery(&validation_content));
+    }
+
+    fn successful_tool_output_block(tool_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "tool_call",
+            "content": format!("{tool_name}: ok"),
+            "toolCall": {
+                "id": format!("call-{tool_name}"),
+                "name": tool_name,
+                "arguments": {},
+                "status": "success",
+                "result": serde_json::json!({
+                    "tool": tool_name,
+                    "status": "succeeded",
+                    "summary": "ok"
+                }).to_string()
+            }
+        })
     }
 
     struct ConcurrentTaskToolProbe {
@@ -1336,6 +2382,154 @@ mod tests {
         }
     }
 
+    fn run_static_task_final(task: &Task, content: &'static str) -> TaskOutcome {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(64);
+        let task_store = TaskStore::new();
+        task_store.insert_task(task.clone());
+        let worker_id = WorkerId::new(format!("worker-{}", task.task_id));
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "reviewer",
+                60_000,
+            )
+            .expect("lease should be granted");
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+        let client = StaticTaskFinalModelBridgeClient { content };
+        let (outcome, _) = run_task_llm_loop(TaskLlmLoopRequest {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            tool_registry: None,
+            skill_runtime: None,
+            task_store: &task_store,
+            task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &SessionId::new(format!("session-{}", task.task_id)),
+            workspace_id: &Some(WorkspaceId::new(format!("workspace-{}", task.task_id))),
+            prompt: "请执行任务".to_string(),
+            tools: None,
+            usage_binding: &usage_binding,
+            streaming_entry_id: None,
+            worker_lane_id: None,
+            worker_lane_seq: None,
+            worker_id: Some(&worker_id),
+            context_summary: None,
+            system_prompt: None,
+            workspace_root_path: None,
+        });
+        outcome
+    }
+
+    #[test]
+    fn validation_task_negative_final_marks_task_failed() {
+        let mut task = make_task_loop_test_task("task-validation-negative-final");
+        task.kind = TaskKind::Validation;
+
+        let outcome = run_static_task_final(&task, "不通过。\n\n原因：缺少文件写入证据。");
+
+        match outcome {
+            TaskOutcome::Failed { error } => {
+                assert!(error.contains("验证未通过"));
+                assert!(error.contains("缺少文件写入证据"));
+            }
+            other => panic!("validation negative final must fail task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_task_negative_wording_does_not_fail_validation_gate() {
+        let task = make_task_loop_test_task("task-action-negative-wording");
+
+        let outcome = run_static_task_final(
+            &task,
+            "不通过这个词只是普通任务报告里的示例，不代表验证结论。",
+        );
+
+        match outcome {
+            TaskOutcome::Completed { output_refs } => {
+                assert_eq!(output_refs.len(), 1);
+            }
+            other => panic!("action task should not use validation wording gate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validation_gate_rejects_conclusion_negative_and_partial_pass() {
+        assert!(validation_result_rejects_delivery(
+            "结论：**不通过**。\n缺少关键证据。"
+        ));
+        assert!(validation_result_rejects_delivery(
+            "已部分通过，完整验收未能确认后续步骤。"
+        ));
+        assert!(!validation_result_rejects_delivery(
+            "通过。\n已核验 shell 输出、文件读取和删除结果。"
+        ));
+    }
+
+    #[test]
+    fn action_task_failed_tool_prevents_completed_final() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(64);
+        let session_id = SessionId::new("session-task-failed-tool-final");
+        let workspace_id = Some(WorkspaceId::new("workspace-task-failed-tool-final"));
+        let task_store = TaskStore::new();
+        let task = make_task_loop_test_task("task-failed-tool-final");
+        task_store.insert_task(task.clone());
+        let worker_id = WorkerId::new("worker-task-failed-tool-final");
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "integration-dev",
+                60_000,
+            )
+            .expect("lease should be granted");
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+        let client = TaskToolFailureThenFinalModelBridgeClient {
+            invoke_count: AtomicUsize::new(0),
+        };
+
+        let (outcome, _) = run_task_llm_loop(TaskLlmLoopRequest {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            tool_registry: None,
+            skill_runtime: None,
+            task_store: &task_store,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: "请调用一个失败工具后总结".to_string(),
+            tools: None,
+            usage_binding: &usage_binding,
+            streaming_entry_id: None,
+            worker_lane_id: None,
+            worker_lane_seq: None,
+            worker_id: Some(&worker_id),
+            context_summary: None,
+            system_prompt: None,
+            workspace_root_path: None,
+        });
+
+        match outcome {
+            TaskOutcome::Failed { error } => {
+                assert!(error.contains("工具执行失败"));
+                assert!(error.contains("missing_builtin_tool"));
+            }
+            other => panic!("failed tool must fail action task, got {other:?}"),
+        }
+    }
+
     #[test]
     fn task_stream_item_id_reuses_main_timeline_streaming_entry_only_for_first_round() {
         let task_id = TaskId::new("task-stream-main");
@@ -1398,16 +2592,18 @@ mod tests {
             "assistant_final",
             "completed",
             Some("最终回复".to_string()),
-            Some("主线最终回复".to_string()),
+            Some("worker 输出".to_string()),
             Some("turn-item-primary-final".to_string()),
         );
-        apply_task_turn_visibility(&mut final_item, &task, &visibility);
+        let task_store = TaskStore::new();
+        task_store.insert_task(task.clone());
+        apply_task_final_visibility(&mut final_item, &task_store, &task, &visibility);
 
-        assert!(final_item.thread_visible);
-        assert!(!final_item.worker_visible);
-        assert!(final_item.worker_id.is_none());
-        assert!(final_item.role_id.is_none());
-        assert_eq!(final_item.source, "orchestrator");
+        assert!(!final_item.thread_visible);
+        assert!(final_item.worker_visible);
+        assert_eq!(final_item.worker_id.as_ref(), Some(&worker_id));
+        assert_eq!(final_item.role_id.as_deref(), Some("integration-dev"));
+        assert_eq!(final_item.source, "integration-dev");
     }
 
     #[test]

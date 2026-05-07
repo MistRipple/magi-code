@@ -577,6 +577,9 @@ impl ShadowDaemonRuntime {
         .with_shadow_execution_pipeline(orchestrator, execution_runtime, memory_store);
 
         state = state.with_task_store(Arc::clone(&task_store));
+        if magi_api::task_execution::reconcile_terminal_session_task_turns(&state) > 0 {
+            let _ = state.persist_session_durable_state();
+        }
         let state_for_task_workers = state.clone();
         let state_for_runner_terminal = state.clone();
         let state_for_knowledge_persist = state.clone();

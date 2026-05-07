@@ -25,7 +25,8 @@ use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
 use std::{path::PathBuf, sync::Arc};
 
-const MAX_TOOL_CALL_ROUNDS: usize = 8;
+const BASE_TOOL_CALL_ROUNDS: usize = 16;
+const MAX_TOOL_CALL_ROUNDS: usize = 32;
 const MAX_SESSION_CONTEXT_MESSAGES: usize = 12;
 pub const BUSINESS_MODEL_PROVIDER: &str = "openai-compatible";
 
@@ -40,6 +41,7 @@ pub struct SessionTurnExecutionRequest {
     pub user_message_id: Option<String>,
     pub placeholder_message_id: Option<String>,
     pub forced_tool_name: Option<String>,
+    pub required_tool_chain: Vec<String>,
     pub workspace_root_path: Option<String>,
 }
 
@@ -210,9 +212,11 @@ pub(crate) fn run_session_turn_execution(
     let mut final_item_id: Option<String> = None;
     let mut main_timeline_entry_id: Option<String> = None;
     let mut had_tool_calls = false;
+    let mut completed_required_tool_names: Vec<String> = Vec::new();
     let usage_binding = session_turn_model_usage_binding(request.use_tools);
 
-    for round in 0..MAX_TOOL_CALL_ROUNDS {
+    let tool_call_round_limit = tool_call_round_limit(&request.required_tool_chain);
+    for round in 0..tool_call_round_limit {
         let streamed_content = match stream_session_turn_round(
             SessionTurnRoundRuntime {
                 client,
@@ -224,6 +228,7 @@ pub(crate) fn run_session_turn_execution(
                 prompt: &prompt,
                 tools: tools.clone(),
                 messages: &mut messages,
+                completed_required_tool_names: &completed_required_tool_names,
                 round,
             },
             tool_registry,
@@ -257,8 +262,34 @@ pub(crate) fn run_session_turn_execution(
             main_timeline_entry_id = streamed_content.timeline_entry_id.clone();
         }
         had_tool_calls |= streamed_content.encountered_tool_calls;
+        record_completed_required_tools(
+            &mut completed_required_tool_names,
+            &request.required_tool_chain,
+            &streamed_content.tool_call_names,
+        );
 
         if let Some(content) = streamed_content.final_content {
+            if !required_tool_chain_is_complete(
+                &request.required_tool_chain,
+                &completed_required_tool_names,
+            ) {
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(content),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(required_tool_chain_recovery_prompt(
+                        &request.required_tool_chain,
+                        &completed_required_tool_names,
+                    )),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+                continue;
+            }
             final_item_id = streamed_content.final_item_id;
             final_content = Some(content);
             break;
@@ -318,6 +349,7 @@ struct SessionTurnRoundRuntime<'a> {
     prompt: &'a str,
     tools: Option<Vec<ChatToolDefinition>>,
     messages: &'a mut Vec<ChatMessage>,
+    completed_required_tool_names: &'a [String],
     round: usize,
 }
 
@@ -326,7 +358,67 @@ struct SessionTurnRoundOutput {
     final_item_id: Option<String>,
     timeline_entry_id: Option<String>,
     encountered_tool_calls: bool,
+    tool_call_names: Vec<String>,
     interrupted: bool,
+}
+
+fn record_completed_required_tools(
+    completed: &mut Vec<String>,
+    required_tool_chain: &[String],
+    tool_call_names: &[String],
+) {
+    for tool_name in tool_call_names {
+        if !required_tool_chain
+            .iter()
+            .any(|required| required == tool_name)
+        {
+            continue;
+        }
+        if !completed
+            .iter()
+            .any(|completed_name| completed_name == tool_name)
+        {
+            completed.push(tool_name.clone());
+        }
+    }
+}
+
+fn required_tool_chain_is_complete(required_tool_chain: &[String], completed: &[String]) -> bool {
+    required_tool_chain.iter().all(|required| {
+        completed
+            .iter()
+            .any(|completed_name| completed_name == required)
+    })
+}
+
+fn required_tool_chain_recovery_prompt(
+    required_tool_chain: &[String],
+    completed: &[String],
+) -> String {
+    let missing = required_tool_chain
+        .iter()
+        .filter(|required| {
+            !completed
+                .iter()
+                .any(|completed_name| completed_name == *required)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    format!(
+        "上一轮提前给出了文字回复，但用户明确要求调用的内置工具链尚未完成。已完成：{}。仍需继续调用：{}。请继续调用下一个缺失工具，不要总结。",
+        if completed.is_empty() {
+            "无".to_string()
+        } else {
+            completed.join(", ")
+        },
+        missing.join(", ")
+    )
+}
+
+fn tool_call_round_limit(required_tool_chain: &[String]) -> usize {
+    BASE_TOOL_CALL_ROUNDS
+        .max(required_tool_chain.len().saturating_add(2))
+        .min(MAX_TOOL_CALL_ROUNDS)
 }
 
 fn stream_session_turn_round(
@@ -344,6 +436,7 @@ fn stream_session_turn_round(
         prompt,
         tools,
         messages,
+        completed_required_tool_names,
         round,
     } = runtime;
 
@@ -451,7 +544,12 @@ fn stream_session_turn_round(
         }
     };
 
-    let tool_choice = forced_tool_choice_for_round(request, tools.as_ref(), round);
+    let tool_choice = forced_tool_choice_for_round(
+        request,
+        tools.as_ref(),
+        round,
+        completed_required_tool_names,
+    );
     let response = client
         .invoke_streaming(
             ModelInvocationRequest {
@@ -485,6 +583,7 @@ fn stream_session_turn_round(
             final_item_id: None,
             timeline_entry_id: timeline_entry_id.clone(),
             encountered_tool_calls: false,
+            tool_call_names: Vec::new(),
             interrupted: true,
         });
     }
@@ -504,6 +603,7 @@ fn stream_session_turn_round(
                 final_item_id: None,
                 timeline_entry_id: timeline_entry_id.clone(),
                 encountered_tool_calls: false,
+                tool_call_names: Vec::new(),
                 interrupted: true,
             });
         }
@@ -543,6 +643,7 @@ fn stream_session_turn_round(
                 final_item_id: None,
                 timeline_entry_id: timeline_entry_id.clone(),
                 encountered_tool_calls: false,
+                tool_call_names: Vec::new(),
                 interrupted: true,
             });
         }
@@ -580,6 +681,7 @@ fn stream_session_turn_round(
                 final_item_id: None,
                 timeline_entry_id: timeline_entry_id.clone(),
                 encountered_tool_calls: false,
+                tool_call_names: Vec::new(),
                 interrupted: true,
             });
         }
@@ -607,6 +709,7 @@ fn stream_session_turn_round(
                 final_item_id: None,
                 timeline_entry_id: timeline_entry_id.clone(),
                 encountered_tool_calls: false,
+                tool_call_names: Vec::new(),
                 interrupted: true,
             });
         }
@@ -615,6 +718,11 @@ fn stream_session_turn_round(
             final_item_id: None,
             timeline_entry_id: timeline_entry_id.clone(),
             encountered_tool_calls: true,
+            tool_call_names: parsed
+                .tool_calls
+                .iter()
+                .map(|call| call.function.name.clone())
+                .collect(),
             interrupted: false,
         });
     }
@@ -636,6 +744,7 @@ fn stream_session_turn_round(
         final_item_id,
         timeline_entry_id,
         encountered_tool_calls: false,
+        tool_call_names: Vec::new(),
         interrupted: false,
     })
 }
@@ -644,11 +753,26 @@ fn forced_tool_choice_for_round(
     request: &SessionTurnExecutionRequest,
     tools: Option<&Vec<ChatToolDefinition>>,
     round: usize,
+    completed_required_tool_names: &[String],
 ) -> Option<ChatToolChoice> {
-    if round != 0 || !request.use_tools {
+    if !request.use_tools {
         return None;
     }
-    let forced_tool_name = request.forced_tool_name.as_deref()?.trim();
+    let forced_tool_name = request
+        .required_tool_chain
+        .iter()
+        .find(|tool_name| {
+            !completed_required_tool_names
+                .iter()
+                .any(|completed| completed == *tool_name)
+        })
+        .map(String::as_str)
+        .or_else(|| {
+            (round == 0)
+                .then(|| request.forced_tool_name.as_deref())
+                .flatten()
+        })?
+        .trim();
     if forced_tool_name.is_empty() {
         return None;
     }
@@ -841,6 +965,7 @@ mod tests {
             user_message_id: None,
             placeholder_message_id: None,
             forced_tool_name: Some("diagram_render".to_string()),
+            required_tool_chain: Vec::new(),
             workspace_root_path: None,
         };
         let tools = vec![ChatToolDefinition {
@@ -852,14 +977,99 @@ mod tests {
             },
         }];
 
-        let choice = forced_tool_choice_for_round(&request, Some(&tools), 0)
+        let choice = forced_tool_choice_for_round(&request, Some(&tools), 0, &[])
             .expect("first round should force diagram_render");
         assert_eq!(choice.function.name, "diagram_render");
-        assert!(forced_tool_choice_for_round(&request, Some(&tools), 1).is_none());
+        assert!(forced_tool_choice_for_round(&request, Some(&tools), 1, &[]).is_none());
 
         let mut unavailable_request = request;
         unavailable_request.forced_tool_name = Some("missing_tool".to_string());
-        assert!(forced_tool_choice_for_round(&unavailable_request, Some(&tools), 0).is_none());
+        assert!(forced_tool_choice_for_round(&unavailable_request, Some(&tools), 0, &[]).is_none());
+    }
+
+    #[test]
+    fn required_tool_chain_forces_next_missing_tool_each_round() {
+        let request = SessionTurnExecutionRequest {
+            session_id: SessionId::new("session-required-tool-chain"),
+            turn_id: "turn-required-tool-chain".to_string(),
+            workspace_id: None,
+            prompt: "依次调用 shell_exec、file_write、file_read".to_string(),
+            use_tools: true,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: vec![
+                "shell_exec".to_string(),
+                "file_write".to_string(),
+                "file_read".to_string(),
+            ],
+            workspace_root_path: None,
+        };
+        let tools = ["shell_exec", "file_write", "file_read"]
+            .into_iter()
+            .map(|name| ChatToolDefinition {
+                kind: "function".to_string(),
+                function: magi_bridge_client::ChatToolFunctionDefinition {
+                    name: name.to_string(),
+                    description: format!("{name} tool"),
+                    parameters: serde_json::json!({ "type": "object" }),
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let first = forced_tool_choice_for_round(&request, Some(&tools), 0, &[])
+            .expect("first missing tool should be forced");
+        assert_eq!(first.function.name, "shell_exec");
+        let second =
+            forced_tool_choice_for_round(&request, Some(&tools), 1, &["shell_exec".to_string()])
+                .expect("second missing tool should be forced");
+        assert_eq!(second.function.name, "file_write");
+        let third = forced_tool_choice_for_round(
+            &request,
+            Some(&tools),
+            2,
+            &["shell_exec".to_string(), "file_write".to_string()],
+        )
+        .expect("third missing tool should be forced");
+        assert_eq!(third.function.name, "file_read");
+        assert!(
+            forced_tool_choice_for_round(
+                &request,
+                Some(&tools),
+                3,
+                &[
+                    "shell_exec".to_string(),
+                    "file_write".to_string(),
+                    "file_read".to_string()
+                ],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn tool_call_round_limit_keeps_final_round_after_explicit_chain() {
+        let required_tool_chain = [
+            "file_mkdir",
+            "file_write",
+            "file_read",
+            "file_patch",
+            "search_text",
+            "shell_exec",
+            "diff_preview",
+            "diagram_render",
+            "file_remove",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+        assert!(
+            tool_call_round_limit(&required_tool_chain) >= required_tool_chain.len() + 2,
+            "显式工具链需要为每个工具调用轮和最终回复轮预留空间"
+        );
     }
 
     #[test]
@@ -916,6 +1126,7 @@ mod tests {
             user_message_id: Some("user-placeholder-reuse".to_string()),
             placeholder_message_id: Some("assistant-placeholder-reuse".to_string()),
             forced_tool_name: None,
+            required_tool_chain: Vec::new(),
             workspace_root_path: None,
         };
         let usage_binding = session_turn_model_usage_binding(false);
@@ -937,6 +1148,7 @@ mod tests {
                 prompt: &request.prompt,
                 tools: None,
                 messages: &mut messages,
+                completed_required_tool_names: &[],
                 round: 0,
             },
             None,
@@ -1097,6 +1309,7 @@ mod tests {
             user_message_id: None,
             placeholder_message_id: None,
             forced_tool_name: None,
+            required_tool_chain: Vec::new(),
             workspace_root_path: None,
         };
         let messages = build_session_turn_messages(&store, &request, &request.prompt);
@@ -1154,6 +1367,7 @@ mod tests {
             user_message_id: None,
             placeholder_message_id: None,
             forced_tool_name: None,
+            required_tool_chain: Vec::new(),
             workspace_root_path: Some("/tmp/current-project".to_string()),
         };
 
@@ -1205,6 +1419,7 @@ mod tests {
             user_message_id: Some("user-post-tool-final-item".to_string()),
             placeholder_message_id: Some("placeholder-post-tool-final-item".to_string()),
             forced_tool_name: None,
+            required_tool_chain: Vec::new(),
             workspace_root_path: None,
         };
 
@@ -1327,6 +1542,7 @@ mod tests {
             user_message_id: Some("user-terminal-duration".to_string()),
             placeholder_message_id: Some("placeholder-terminal-duration".to_string()),
             forced_tool_name: None,
+            required_tool_chain: Vec::new(),
             workspace_root_path: None,
         };
 

@@ -121,6 +121,7 @@ export const messagesState = $state({
   currentWorkspacePath: '' as string,
   sessions: [] as Session[],
   currentSessionId: null as string | null,
+  sessionHydrating: false,
   sessionHistory: {
     workspaceId: null as string | null,
     sessionId: null as string | null,

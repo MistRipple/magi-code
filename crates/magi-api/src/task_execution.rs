@@ -228,6 +228,7 @@ pub fn publish_task_status_turn_item_for_active_sessions(
 
 const TASK_CONTEXT_MAX_CHARS: usize = 4000;
 const TASK_CONTEXT_MAX_REFS: usize = 8;
+const ROOT_COMPLETION_SUMMARY_MAX_CHARS: usize = 2400;
 
 fn compact_task_context_text(text: &str) -> String {
     let trimmed = text.trim();
@@ -272,6 +273,275 @@ fn format_dependency_task_context(dependency: &Task) -> String {
     )
 }
 
+fn latest_thread_visible_assistant_final(
+    turn: &magi_session_store::ActiveExecutionTurn,
+) -> Option<(String, String)> {
+    turn.items
+        .iter()
+        .filter(|item| item.kind == "assistant_final" && item.thread_visible)
+        .filter_map(|item| {
+            let content = item.content.as_ref()?.trim();
+            if content.is_empty() {
+                return None;
+            }
+            Some((item.item_seq, content.to_string(), item.item_id.clone()))
+        })
+        .max_by_key(|(item_seq, _, _)| *item_seq)
+        .map(|(_, content, item_id)| (content, item_id))
+}
+
+fn compact_root_completion_summary(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= ROOT_COMPLETION_SUMMARY_MAX_CHARS {
+        return trimmed.to_string();
+    }
+    let mut compact = trimmed
+        .chars()
+        .take(ROOT_COMPLETION_SUMMARY_MAX_CHARS)
+        .collect::<String>();
+    compact.push('…');
+    compact
+}
+
+fn completion_summary_rank(task: &Task) -> u8 {
+    match task.kind {
+        TaskKind::Action => 5,
+        TaskKind::Repair => 4,
+        TaskKind::WorkPackage | TaskKind::Phase => 3,
+        TaskKind::Validation => 2,
+        TaskKind::Objective => 1,
+        TaskKind::Decision => 0,
+    }
+}
+
+fn strip_known_delivery_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    text.strip_prefix(prefix)
+        .map(str::trim)
+        .filter(|rest| !rest.is_empty())
+}
+
+fn text_from_structured_task_output(output: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(output.trim()).ok()?;
+    let blocks = value.get("blocks")?.as_array()?;
+    let text = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(|value| value.as_str()) == Some("text"))
+        .filter_map(|block| block.get("content").and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|content| !content.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn normalize_root_completion_output(output: &str) -> Option<String> {
+    let source = text_from_structured_task_output(output).unwrap_or_else(|| output.to_string());
+    let normalized = source.replace('\r', "");
+    let mut lines = Vec::new();
+    for line in normalized.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("修改的文件列表") || trimmed.starts_with("关键代码片段")
+        {
+            break;
+        }
+        if trimmed.starts_with("验证已完成，交付如下")
+            || trimmed.starts_with("交付如下")
+            || trimmed.starts_with("已完成多端稳定性只读验证")
+        {
+            continue;
+        }
+        let trimmed = trimmed
+            .strip_prefix("主线汇总：")
+            .or_else(|| trimmed.strip_prefix("主线总结："))
+            .unwrap_or(trimmed)
+            .trim();
+        if trimmed.is_empty() || trimmed == "无" || trimmed == "- 无" {
+            continue;
+        }
+        lines.push(trimmed);
+    }
+
+    let mut text = lines.join("\n");
+    if text.is_empty() {
+        text = output.trim().to_string();
+    }
+    text = text
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '“' | '”'))
+        .trim()
+        .to_string();
+
+    for marker in [
+        "一句自然语言总结：",
+        "自然语言总结：",
+        "最终结论：",
+        "关键验证结果：",
+    ] {
+        if let Some(index) = text.rfind(marker) {
+            text = text[index + marker.len()..].trim().to_string();
+            break;
+        }
+    }
+    while let Some(rest) = text.strip_prefix("- ").map(str::trim) {
+        text = rest.to_string();
+    }
+
+    if text.starts_with("目标：") && text.contains("边界：") && text.contains("验收标准：")
+    {
+        return None;
+    }
+
+    loop {
+        let before = text.clone();
+        if let Some(rest) = strip_known_delivery_prefix(&text, "通过。") {
+            text = rest.to_string();
+        }
+        if let Some(rest) = strip_known_delivery_prefix(&text, "通过：") {
+            text = rest.to_string();
+        }
+        if let Some(rest) = strip_known_delivery_prefix(&text, "验收结论：") {
+            text = rest.to_string();
+        }
+        if let Some(rest) = strip_known_delivery_prefix(&text, "最终结论：") {
+            text = rest.to_string();
+        }
+        if let Some(rest) =
+            strip_known_delivery_prefix(&text, "当前交付已基于执行产出完成验证，且未重复执行工具；")
+        {
+            text = rest.to_string();
+        }
+        if let Some(rest) = strip_known_delivery_prefix(&text, "证据显示") {
+            text = rest.to_string();
+        }
+        if let Some(rest) = strip_known_delivery_prefix(&text, "验证通过：") {
+            text = format!("已验证：{rest}");
+        }
+        if text == before {
+            break;
+        }
+    }
+
+    let text = compact_root_completion_summary(&text);
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn root_completion_outputs(task_store: &TaskStore, root_task: &Task) -> Vec<String> {
+    let root_outputs = root_task
+        .output_refs
+        .iter()
+        .filter_map(|output| normalize_root_completion_output(output))
+        .collect::<Vec<_>>();
+    if !root_outputs.is_empty() {
+        return root_outputs;
+    }
+
+    let mut candidates = task_store
+        .get_tasks_by_mission(&root_task.mission_id)
+        .into_iter()
+        .filter(|task| task.root_task_id == root_task.task_id)
+        .filter(|task| task.task_id != root_task.task_id)
+        .filter(|task| task.status == TaskStatus::Completed)
+        .filter(|task| {
+            task.output_refs
+                .iter()
+                .any(|output| !output.trim().is_empty())
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|task| (completion_summary_rank(task), task.updated_at.0));
+
+    for task in candidates.into_iter().rev() {
+        let mut outputs = Vec::new();
+        for output in task.output_refs {
+            let Some(summary) = normalize_root_completion_output(&output) else {
+                continue;
+            };
+            if outputs.iter().any(|existing| existing == &summary) {
+                continue;
+            }
+            outputs.push(summary);
+            if outputs.len() >= 3 {
+                break;
+            }
+        }
+        if !outputs.is_empty() {
+            return outputs;
+        }
+    }
+    Vec::new()
+}
+
+fn format_root_completion_summary(outputs: &[String]) -> String {
+    match outputs {
+        [] => "我这轮已经处理完，详细步骤和工具记录已保留在任务卡里。".to_string(),
+        [only] => format!("我这轮已经处理完：{only}\n\n详细步骤和工具记录已保留在任务卡里。"),
+        many => {
+            let bullets = many
+                .iter()
+                .map(|output| {
+                    let single_line = output
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!("- {single_line}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "我这轮已经处理完，关键结果是：\n\n{bullets}\n\n详细步骤和工具记录已保留在任务卡里。"
+            )
+        }
+    }
+}
+
+fn build_root_completion_summary(task_store: &TaskStore, root_task: &Task) -> String {
+    let outputs = root_completion_outputs(task_store, root_task);
+    format_root_completion_summary(&outputs)
+}
+
+fn ensure_root_completion_final_item(
+    state: &ApiState,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    root_task: &Task,
+    task_store: &TaskStore,
+) -> Option<(String, String)> {
+    let sidecar = state.session_store.runtime_sidecar(session_id)?;
+    let turn = sidecar.current_turn.as_ref()?;
+    if let Some(response) = latest_thread_visible_assistant_final(turn) {
+        return Some(response);
+    }
+
+    let item_id = format!("turn-item-orchestrator-final-{}", root_task.task_id);
+    let mut final_item = session_turn_item(
+        "assistant_final",
+        "completed",
+        Some("任务完成".to_string()),
+        Some(build_root_completion_summary(task_store, root_task)),
+        Some(item_id),
+    );
+    final_item.source = "orchestrator".to_string();
+    final_item.task_id = Some(root_task.task_id.clone());
+    final_item.thread_visible = true;
+    final_item.worker_visible = false;
+
+    if let Some(published) = append_session_turn_item_with_task_store(
+        state.session_store.as_ref(),
+        session_id,
+        final_item,
+        Some(task_store),
+    ) {
+        publish_session_turn_item_event(&state.event_bus, session_id, workspace_id, &published);
+    }
+
+    state
+        .session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .as_ref()
+        .and_then(latest_thread_visible_assistant_final)
+}
+
 pub fn finalize_background_session_task_turn_if_root_completed(
     state: &ApiState,
     session_id: &SessionId,
@@ -300,28 +570,18 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     let Some(turn) = sidecar.current_turn.as_ref() else {
         return false;
     };
-    let Some((response_text, final_item_id)) = turn
-        .items
-        .iter()
-        .filter(|item| item.kind == "assistant_final" && item.thread_visible)
-        .filter_map(|item| {
-            let content = item.content.as_ref()?.trim();
-            if content.is_empty() {
-                return None;
-            }
-            Some((item.item_seq, content.to_string(), item.item_id.clone()))
-        })
-        .max_by_key(|(item_seq, _, _)| *item_seq)
-        .map(|(_, content, item_id)| (content, item_id))
-    else {
+    let response = latest_thread_visible_assistant_final(turn).or_else(|| {
+        ensure_root_completion_final_item(state, session_id, &workspace_id, &root_task, task_store)
+    });
+    let event_item_id = response
+        .as_ref()
+        .map(|(_, item_id)| item_id.clone())
+        .or_else(|| terminal_turn_event_anchor_item_id(turn));
+    let Some(event_item_id) = event_item_id else {
         return false;
     };
 
-    if state
-        .session_store
-        .update_current_turn_status(session_id, "completed")
-        .is_err()
-    {
+    if update_current_turn_completed_from_root(state, session_id).is_err() {
         return false;
     }
     publish_current_session_turn_item_event(
@@ -329,25 +589,52 @@ pub fn finalize_background_session_task_turn_if_root_completed(
         state.session_store.as_ref(),
         session_id,
         &workspace_id,
-        &final_item_id,
+        &event_item_id,
         state.task_store(),
     );
-    let _ = state.event_bus.publish(
-        EventEnvelope::domain(
-            EventId::new(format!("event-message-assistant-{}", UtcMillis::now().0)),
-            "message.created",
-            serde_json::json!({
-                "session_id": session_id.to_string(),
-                "role": "assistant",
-                "content": response_text,
+    if let Some((response_text, _)) = response {
+        let _ = state.event_bus.publish(
+            EventEnvelope::domain(
+                EventId::new(format!("event-message-assistant-{}", UtcMillis::now().0)),
+                "message.created",
+                serde_json::json!({
+                    "session_id": session_id.to_string(),
+                    "role": "assistant",
+                    "content": response_text,
+                }),
+            )
+            .with_context(EventContext {
+                session_id: Some(session_id.clone()),
+                ..EventContext::default()
             }),
-        )
-        .with_context(EventContext {
-            session_id: Some(session_id.clone()),
-            ..EventContext::default()
-        }),
-    );
+        );
+    }
     true
+}
+
+fn update_current_turn_completed_from_root(
+    state: &ApiState,
+    session_id: &SessionId,
+) -> Result<(), ()> {
+    match state
+        .session_store
+        .complete_current_turn_from_completed_root_task(session_id)
+        .map_err(|_| ())?
+    {
+        Some(_) => Ok(()),
+        None => Err(()),
+    }
+}
+
+fn terminal_turn_event_anchor_item_id(
+    turn: &magi_session_store::ActiveExecutionTurn,
+) -> Option<String> {
+    turn.items
+        .iter()
+        .filter(|item| item.thread_visible)
+        .max_by_key(|item| item.item_seq)
+        .or_else(|| turn.items.iter().max_by_key(|item| item.item_seq))
+        .map(|item| item.item_id.clone())
 }
 
 pub fn finalize_background_session_task_turn_if_root_terminal(
@@ -369,8 +656,12 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     let (turn_status, message) = match root_task.status {
         TaskStatus::Failed => ("failed", "任务执行失败，未生成最终回复。"),
         TaskStatus::Blocked => ("blocked", "任务执行需要处理，等待进一步操作。"),
+        TaskStatus::Cancelled => ("cancelled", "任务执行已取消。"),
         _ if runner_status == "error" => ("failed", "任务执行异常，未生成最终回复。"),
         _ if runner_status == "blocked" => ("blocked", "任务执行需要处理，等待进一步操作。"),
+        _ if runner_status == "stopped" || runner_status == "cancelled" => {
+            ("cancelled", "任务执行已取消。")
+        }
         _ => return false,
     };
 
@@ -384,6 +675,13 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         return false;
     }
     let workspace_id = active_chain.workspace_id.clone();
+    if sidecar
+        .current_turn
+        .as_ref()
+        .is_some_and(|turn| current_turn_status_is_terminal(&turn.status))
+    {
+        return true;
+    }
     if sidecar.current_turn.as_ref().is_some_and(|turn| {
         turn.status == turn_status
             && turn
@@ -421,6 +719,79 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     }
 
     true
+}
+
+pub fn reconcile_terminal_session_task_turns(state: &ApiState) -> usize {
+    let Some(task_store) = state.task_store() else {
+        return 0;
+    };
+    let candidates = state
+        .session_store
+        .runtime_sidecars()
+        .into_iter()
+        .filter_map(|sidecar| {
+            let turn = sidecar.current_turn.as_ref()?;
+            let chain = sidecar.active_execution_chain.as_ref()?;
+            let root_task = task_store.get_task(&chain.root_task_id)?;
+            let runner_status = runner_status_for_terminal_task(root_task.status)?;
+            if runner_status == "completed" {
+                if current_turn_status_is_completed(&turn.status) {
+                    return None;
+                }
+            } else if current_turn_status_is_terminal(&turn.status) {
+                return None;
+            }
+            Some((
+                sidecar.session_id.clone(),
+                chain.root_task_id.clone(),
+                runner_status,
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    candidates
+        .into_iter()
+        .filter(|(session_id, root_task_id, runner_status)| {
+            finalize_background_session_task_turn_if_root_terminal(
+                state,
+                session_id,
+                root_task_id,
+                runner_status,
+            )
+        })
+        .count()
+}
+
+fn current_turn_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "completed"
+            | "complete"
+            | "succeeded"
+            | "success"
+            | "failed"
+            | "error"
+            | "blocked"
+            | "cancelled"
+            | "canceled"
+    )
+}
+
+fn current_turn_status_is_completed(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "completed" | "complete" | "succeeded" | "success"
+    )
+}
+
+fn runner_status_for_terminal_task(status: TaskStatus) -> Option<&'static str> {
+    match status {
+        TaskStatus::Completed => Some("completed"),
+        TaskStatus::Failed => Some("error"),
+        TaskStatus::Blocked => Some("blocked"),
+        TaskStatus::Cancelled => Some("cancelled"),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Default)]
@@ -757,11 +1128,22 @@ impl ShadowTaskDispatcher {
         let _ = self.event_bus.publish(event);
     }
 
-    fn build_tool_definitions(&self) -> Vec<ChatToolDefinition> {
+    fn build_tool_definitions(&self, task: Option<&magi_core::Task>) -> Vec<ChatToolDefinition> {
         let Some(ref registry) = self.tool_registry else {
             return Vec::new();
         };
-        let mut definitions = public_builtin_tool_definitions(registry)
+        if task
+            .and_then(|task| task.policy_snapshot.as_ref())
+            .is_some_and(|policy| policy.command_mode.eq_ignore_ascii_case("no_tools"))
+        {
+            return Vec::new();
+        }
+        let registry = if let Some(policy) = task.and_then(|task| task.policy_snapshot.as_ref()) {
+            registry.filtered_clone(&policy.allowed_tools, &policy.denied_tools)
+        } else {
+            registry.clone()
+        };
+        let mut definitions = public_builtin_tool_definitions(&registry)
             .into_iter()
             .filter(|definition| definition.function.name != SKILL_APPLY_TOOL_NAME)
             .collect::<Vec<_>>();
@@ -811,7 +1193,7 @@ impl ShadowTaskDispatcher {
         }
         parts.insert(
             0,
-            "[current-task-rule] 当前任务标题、目标、input_refs、依赖任务输出和 task-context 是本次执行的主事实；knowledge/memory 只能补充，不能改写当前任务目标。"
+            "[current-task-rule] 当前任务标题、目标、input_refs、依赖任务输出和 task-context 是本次执行的主事实；knowledge/memory 只能补充，不能改写当前任务目标。目标中的路径、工具名、命令、标记字符串以及“必须/要求”条款必须逐项执行或明确说明无法执行的真实原因，不能替换成历史任务或泛化检查。"
                 .to_string(),
         );
         if task.kind == TaskKind::Validation {
@@ -1037,7 +1419,7 @@ impl ShadowTaskDispatcher {
         );
 
         let tools = if request.use_tools {
-            let tool_defs = self.build_tool_definitions();
+            let tool_defs = self.build_tool_definitions(None);
             (!tool_defs.is_empty()).then_some(tool_defs)
         } else {
             None
@@ -1089,7 +1471,7 @@ impl ShadowTaskDispatcher {
         let workspace_root_path = self.resolve_workspace_root_path(workspace_id);
 
         let tools = if use_tools {
-            let tool_defs = self.build_tool_definitions();
+            let tool_defs = self.build_tool_definitions(Some(task));
             if tool_defs.is_empty() {
                 None
             } else {
@@ -1637,6 +2019,521 @@ mod tests {
         assert!(
             event_bus.snapshot().recent_events.is_empty(),
             "已有具体错误时 finalizer 不应再发布泛化失败卡"
+        );
+    }
+
+    #[test]
+    fn completed_background_finalizer_appends_orchestrator_final_without_leaking_worker_final() {
+        let event_bus = Arc::new(InMemoryEventBus::new(16));
+        let session_store = Arc::new(SessionStore::new());
+        let task_store = Arc::new(TaskStore::new());
+        let session_id = SessionId::new("session-background-finalizer-worker-only");
+        let mission_id = MissionId::new("mission-background-finalizer-worker-only");
+        let root_task_id = TaskId::new("task-background-finalizer-worker-only-root");
+        let worker_task_id = TaskId::new("task-background-finalizer-worker-only-action");
+        let now = UtcMillis::now();
+
+        session_store
+            .create_session(session_id.clone(), "background finalizer worker only")
+            .expect("session should be creatable");
+
+        let mut phase_item = session_turn_item(
+            "assistant_phase",
+            "pending",
+            Some("任务状态".to_string()),
+            Some("已接收请求，正在整理执行步骤。".to_string()),
+            Some("turn-item-phase-worker-only".to_string()),
+        );
+        phase_item.thread_visible = true;
+        phase_item.task_id = Some(root_task_id.clone());
+
+        let mut worker_final_item = session_turn_item(
+            "assistant_final",
+            "completed",
+            Some("worker 最终输出".to_string()),
+            Some("worker 内部最终输出，不应漂移成主线回复。".to_string()),
+            Some("turn-item-worker-final-only".to_string()),
+        );
+        worker_final_item.item_seq = 2;
+        worker_final_item.thread_visible = false;
+        worker_final_item.worker_visible = true;
+        worker_final_item.task_id = Some(worker_task_id.clone());
+        worker_final_item.worker_id = Some(WorkerId::new("worker-finalizer-worker-only"));
+
+        session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-background-finalizer-worker-only".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![worker_task_id.clone()],
+                    active_worker_bindings: Vec::new(),
+                    branches: Vec::new(),
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "timeline-background-finalizer-worker-only".to_string(),
+                        trimmed_text: Some("执行深度任务".to_string()),
+                        deep_task: true,
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: "turn-background-finalizer-worker-only".to_string(),
+                        turn_seq: 1,
+                        accepted_at: now,
+                        completed_at: None,
+                        status: "accepted".to_string(),
+                        user_message: Some("执行深度任务".to_string()),
+                        items: vec![phase_item, worker_final_item],
+                        worker_lanes: Vec::new(),
+                    }),
+                },
+            )
+            .expect("active chain should be stored");
+
+        task_store.insert_task(Task {
+            task_id: root_task_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            parent_task_id: None,
+            kind: TaskKind::Objective,
+            title: "后台深度任务".to_string(),
+            goal: "验证 worker-only final 不阻塞 turn 终态".to_string(),
+            status: TaskStatus::Completed,
+            dependency_ids: Vec::new(),
+            required_children: vec![worker_task_id.clone()],
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: now,
+            updated_at: now,
+        });
+        task_store.insert_task(Task {
+            task_id: worker_task_id.clone(),
+            mission_id,
+            root_task_id: root_task_id.clone(),
+            parent_task_id: Some(root_task_id.clone()),
+            kind: TaskKind::Validation,
+            title: "交付验证".to_string(),
+            goal: "验证 worker 交付结果".to_string(),
+            status: TaskStatus::Completed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: vec!["交付验收通过：orchestrator-final-marker".to_string()],
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: now,
+            updated_at: UtcMillis(now.0 + 1),
+        });
+        let state = ApiState::new(
+            "test",
+            Arc::clone(&event_bus),
+            Arc::clone(&session_store),
+            Arc::new(WorkspaceStore::new()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_task_store(Arc::clone(&task_store));
+
+        assert!(finalize_background_session_task_turn_if_root_terminal(
+            &state,
+            &session_id,
+            &root_task_id,
+            "completed",
+        ));
+
+        let turn = session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("turn should remain inspectable");
+        assert_eq!(turn.status, "completed");
+        assert!(turn.completed_at.is_some());
+        assert!(
+            turn.items
+                .iter()
+                .find(|item| item.item_id == "turn-item-phase-worker-only")
+                .is_some_and(|item| item.status == "completed"),
+            "主线任务卡应原位收尾"
+        );
+        let orchestrator_final = turn
+            .items
+            .iter()
+            .find(|item| {
+                item.item_id == format!("turn-item-orchestrator-final-{root_task_id}")
+                    && item.thread_visible
+                    && !item.worker_visible
+            })
+            .expect("root 完成后必须追加编排者主线最终回复");
+        let final_content = orchestrator_final.content.as_deref().unwrap_or_default();
+        assert!(
+            final_content.contains("我这轮已经处理完")
+                && final_content.contains("orchestrator-final-marker"),
+            "编排者最终回复应像正常对话一样收口任务交付摘要"
+        );
+        assert!(
+            !final_content.contains("worker 内部最终输出"),
+            "worker-only final 不能直接漂移为主线最终回复"
+        );
+        assert!(
+            event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .any(|event| event.event_type == "session.turn.item"
+                    && event.payload["current_turn"]["status"].as_str() == Some("completed")
+                    && event.payload["current_turn"]["response_duration_ms"].is_number()),
+            "终态事件必须携带 completed current_turn 和总耗时"
+        );
+        assert!(
+            event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .any(|event| event.event_type == "message.created"
+                    && event.payload["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("orchestrator-final-marker"))),
+            "legacy message 事件只能来自编排者最终回复，不能来自 worker-only final"
+        );
+    }
+
+    #[test]
+    fn root_completion_summary_reads_like_conversation_for_multiple_outputs() {
+        let outputs = [
+            "验证通过：已完成第一段任务。\n\n修改的文件列表：无\n关键代码片段：无",
+            "通过。 当前交付已基于执行产出完成验证，且未重复执行工具；已完成第二段任务。",
+            r#"{"blocks":[{"content":"shell_exec: 命令执行成功: printf SHOULD_STAY_IN_TOOL_CARD","type":"tool_call"},{"content":"两个验证命令均已成功执行，输出符合预期。","type":"text"}]}"#,
+            "目标：规划文本\n边界：只规划\n验收标准：不要进入最终回复",
+            "修改的文件列表： - 无 关键验证结果： - 内部验证细节。 最终结论： - 已完成第三段任务。",
+            "关键验证结果： - `printf A` 成功。一句自然语言总结：两个验证都已完成。",
+        ]
+        .into_iter()
+        .filter_map(normalize_root_completion_output)
+        .collect::<Vec<_>>();
+
+        let summary = format_root_completion_summary(&outputs);
+
+        assert!(summary.contains("我这轮已经处理完，关键结果是："));
+        assert!(summary.contains("- 已验证：已完成第一段任务。"));
+        assert!(summary.contains("- 已完成第二段任务。"));
+        assert!(summary.contains("- 两个验证命令均已成功执行，输出符合预期。"));
+        assert!(summary.contains("- 已完成第三段任务。"));
+        assert!(summary.contains("- 两个验证都已完成。"));
+        assert!(summary.contains("详细步骤和工具记录已保留在任务卡里"));
+        assert!(!summary.contains("SHOULD_STAY_IN_TOOL_CARD"));
+        assert!(!summary.contains("内部验证细节"));
+        assert!(!summary.contains("printf A"));
+        assert!(!summary.contains("当前交付已基于执行产出完成验证"));
+        assert!(!summary.contains("规划文本"));
+        assert!(!summary.contains("修改的文件列表"));
+        assert!(!summary.contains("关键代码片段"));
+    }
+
+    #[test]
+    fn root_completion_outputs_prefers_latest_delivery_stage_over_intermediate_execution() {
+        let task_store = TaskStore::new();
+        let mission_id = MissionId::new("mission-root-summary-latest-delivery");
+        let root_task_id = TaskId::new("task-root-summary-latest-delivery");
+        let now = UtcMillis::now();
+        let root_task = Task {
+            task_id: root_task_id.clone(),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            parent_task_id: None,
+            kind: TaskKind::Objective,
+            title: "多端验证".to_string(),
+            goal: "验证多端任务主线最终收口".to_string(),
+            status: TaskStatus::Completed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: now,
+            updated_at: now,
+        };
+        task_store.insert_task(root_task.clone());
+
+        let mut execution = root_task.clone();
+        execution.task_id = TaskId::new("task-root-summary-execution");
+        execution.parent_task_id = Some(root_task_id.clone());
+        execution.kind = TaskKind::Action;
+        execution.title = "执行验证".to_string();
+        execution.output_refs = vec![
+            "已完成多端稳定性只读验证：\n- 前端端点：`FRONTEND_MARKER`\n- 后端端点：`BACKEND_MARKER`"
+                .to_string(),
+        ];
+        execution.updated_at = UtcMillis(now.0 + 1);
+        task_store.insert_task(execution);
+
+        let mut delivery = root_task.clone();
+        delivery.task_id = TaskId::new("task-root-summary-delivery");
+        delivery.parent_task_id = Some(root_task_id.clone());
+        delivery.kind = TaskKind::Action;
+        delivery.title = "验证交付".to_string();
+        delivery.output_refs = vec![
+            "验证已完成，交付如下：\n- 前端端点：已成功执行只读命令，输出 `FRONTEND_MARKER`\n- 后端端点：已成功执行只读命令，输出 `BACKEND_MARKER`\n主线汇总：两个端点都已完成只读验证。"
+                .to_string(),
+        ];
+        delivery.updated_at = UtcMillis(now.0 + 2);
+        task_store.insert_task(delivery);
+
+        let outputs = root_completion_outputs(&task_store, &root_task);
+        let summary = format_root_completion_summary(&outputs);
+
+        assert_eq!(outputs.len(), 1);
+        assert!(summary.contains("两个端点都已完成只读验证"));
+        assert!(summary.contains("FRONTEND_MARKER"));
+        assert!(!summary.contains("已完成多端稳定性只读验证"));
+        assert!(!summary.contains("验证已完成，交付如下"));
+        assert!(!summary.contains("主线汇总"));
+    }
+
+    #[test]
+    fn terminal_reconcile_closes_nonterminal_turn_from_completed_root_task() {
+        let event_bus = Arc::new(InMemoryEventBus::new(16));
+        let session_store = Arc::new(SessionStore::new());
+        let task_store = Arc::new(TaskStore::new());
+        let session_id = SessionId::new("session-terminal-reconcile-completed-root");
+        let mission_id = MissionId::new("mission-terminal-reconcile-completed-root");
+        let root_task_id = TaskId::new("task-terminal-reconcile-completed-root");
+        let now = UtcMillis::now();
+
+        session_store
+            .create_session(session_id.clone(), "terminal reconcile completed root")
+            .expect("session should be creatable");
+        let mut phase_item = session_turn_item(
+            "assistant_phase",
+            "pending",
+            Some("任务状态".to_string()),
+            Some("任务运行中".to_string()),
+            Some("turn-item-terminal-reconcile-phase".to_string()),
+        );
+        phase_item.thread_visible = true;
+        phase_item.task_id = Some(root_task_id.clone());
+        session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-terminal-reconcile-completed-root".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![root_task_id.clone()],
+                    active_worker_bindings: Vec::new(),
+                    branches: Vec::new(),
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "timeline-terminal-reconcile-completed-root".to_string(),
+                        trimmed_text: Some("执行任务".to_string()),
+                        deep_task: true,
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: "turn-terminal-reconcile-completed-root".to_string(),
+                        turn_seq: 1,
+                        accepted_at: now,
+                        completed_at: None,
+                        status: "accepted".to_string(),
+                        user_message: Some("执行任务".to_string()),
+                        items: vec![phase_item],
+                        worker_lanes: Vec::new(),
+                    }),
+                },
+            )
+            .expect("active chain should be stored");
+        task_store.insert_task(Task {
+            task_id: root_task_id.clone(),
+            mission_id,
+            root_task_id: root_task_id.clone(),
+            parent_task_id: None,
+            kind: TaskKind::Objective,
+            title: "已完成 root".to_string(),
+            goal: "验证启动恢复收敛".to_string(),
+            status: TaskStatus::Completed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: now,
+            updated_at: now,
+        });
+        let state = ApiState::new(
+            "test",
+            Arc::clone(&event_bus),
+            Arc::clone(&session_store),
+            Arc::new(WorkspaceStore::new()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_task_store(Arc::clone(&task_store));
+
+        assert_eq!(reconcile_terminal_session_task_turns(&state), 1);
+        let turn = session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("turn should remain inspectable");
+        assert_eq!(turn.status, "completed");
+        assert!(turn.completed_at.is_some());
+        assert!(
+            event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .any(|event| event.event_type == "session.turn.item"
+                    && event.payload["current_turn"]["status"].as_str() == Some("completed")),
+            "reconcile 应发布 canonical terminal turn 事件"
+        );
+    }
+
+    #[test]
+    fn terminal_finalizer_does_not_rewrite_cancelled_turn_to_failed() {
+        let event_bus = Arc::new(InMemoryEventBus::new(16));
+        let session_store = Arc::new(SessionStore::new());
+        let task_store = Arc::new(TaskStore::new());
+        let session_id = SessionId::new("session-terminal-cancelled-wins");
+        let mission_id = MissionId::new("mission-terminal-cancelled-wins");
+        let root_task_id = TaskId::new("task-terminal-cancelled-wins");
+        let now = UtcMillis::now();
+
+        session_store
+            .create_session(session_id.clone(), "terminal cancelled wins")
+            .expect("session should be creatable");
+        let mut phase_item = session_turn_item(
+            "assistant_phase",
+            "cancelled",
+            Some("任务状态".to_string()),
+            Some("任务已取消".to_string()),
+            Some("turn-item-terminal-cancelled-phase".to_string()),
+        );
+        phase_item.thread_visible = true;
+        phase_item.task_id = Some(root_task_id.clone());
+        session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-terminal-cancelled-wins".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![root_task_id.clone()],
+                    active_worker_bindings: Vec::new(),
+                    branches: Vec::new(),
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "timeline-terminal-cancelled-wins".to_string(),
+                        trimmed_text: Some("执行任务".to_string()),
+                        deep_task: true,
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: "turn-terminal-cancelled-wins".to_string(),
+                        turn_seq: 1,
+                        accepted_at: now,
+                        completed_at: Some(now),
+                        status: "cancelled".to_string(),
+                        user_message: Some("执行任务".to_string()),
+                        items: vec![phase_item],
+                        worker_lanes: Vec::new(),
+                    }),
+                },
+            )
+            .expect("active chain should be stored");
+        task_store.insert_task(Task {
+            task_id: root_task_id.clone(),
+            mission_id,
+            root_task_id: root_task_id.clone(),
+            parent_task_id: None,
+            kind: TaskKind::Objective,
+            title: "失败 root".to_string(),
+            goal: "验证迟到失败不会覆盖取消".to_string(),
+            status: TaskStatus::Failed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            context_refs: Vec::new(),
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            repair_count: 0,
+            decision_payload: None,
+            created_at: now,
+            updated_at: now,
+        });
+        let state = ApiState::new(
+            "test",
+            Arc::clone(&event_bus),
+            Arc::clone(&session_store),
+            Arc::new(WorkspaceStore::new()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_task_store(Arc::clone(&task_store));
+
+        assert!(finalize_background_session_task_turn_if_root_terminal(
+            &state,
+            &session_id,
+            &root_task_id,
+            "error",
+        ));
+        let turn = session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("turn should remain inspectable");
+        assert_eq!(turn.status, "cancelled");
+        assert!(
+            event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .all(|event| event.event_type != "session.turn.item"),
+            "迟到失败不应发布 canonical failed 事件覆盖已取消 turn"
         );
     }
 }

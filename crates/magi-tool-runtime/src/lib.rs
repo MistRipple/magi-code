@@ -1034,6 +1034,9 @@ struct WorkspaceFileFingerprint {
     is_dir: bool,
 }
 
+const FILESYSTEM_SNAPSHOT_MAX_FILES: usize = 5000;
+const FILESYSTEM_SNAPSHOT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
 fn capture_tool_workspace_snapshot(
     input: &ToolExecutionInput,
     context: &ToolExecutionContext,
@@ -1049,29 +1052,41 @@ fn capture_tool_workspace_snapshot(
 }
 
 fn capture_workspace_change_snapshot(workdir: &Path) -> Option<WorkspaceChangeSnapshot> {
-    let repo_root = run_git_capture(workdir, &["rev-parse", "--show-toplevel"])?;
-    let repo_root = PathBuf::from(repo_root.trim());
-    if repo_root.as_os_str().is_empty() {
-        return None;
+    if let Some(repo_root) = run_git_capture(workdir, &["rev-parse", "--show-toplevel"])
+        .map(|root| PathBuf::from(root.trim()))
+        .filter(|root| !root.as_os_str().is_empty())
+    {
+        let status = run_git_capture(
+            &repo_root,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )?;
+        let mut files = BTreeMap::new();
+        for line in status.lines() {
+            let Some((status_code, file_path)) = parse_git_status_path(line) else {
+                continue;
+            };
+            files.insert(
+                file_path.clone(),
+                fingerprint_workspace_file(&repo_root, &file_path, &status_code),
+            );
+        }
+        return Some(WorkspaceChangeSnapshot {
+            root: repo_root,
+            files,
+        });
     }
-    let status = run_git_capture(
-        &repo_root,
-        &["status", "--porcelain=v1", "--untracked-files=all"],
-    )?;
+
+    capture_filesystem_change_snapshot(workdir)
+}
+
+fn capture_filesystem_change_snapshot(root: &Path) -> Option<WorkspaceChangeSnapshot> {
+    let root = root
+        .canonicalize()
+        .ok()
+        .or_else(|| Some(root.to_path_buf()))?;
     let mut files = BTreeMap::new();
-    for line in status.lines() {
-        let Some((status_code, file_path)) = parse_git_status_path(line) else {
-            continue;
-        };
-        files.insert(
-            file_path.clone(),
-            fingerprint_workspace_file(&repo_root, &file_path, &status_code),
-        );
-    }
-    Some(WorkspaceChangeSnapshot {
-        root: repo_root,
-        files,
-    })
+    collect_filesystem_fingerprints(&root, &root, &mut files);
+    Some(WorkspaceChangeSnapshot { root, files })
 }
 
 fn append_workspace_changed_paths(
@@ -1104,11 +1119,14 @@ fn workspace_changed_paths(
     before: &WorkspaceChangeSnapshot,
     after: &WorkspaceChangeSnapshot,
 ) -> Vec<String> {
-    after
+    before
         .files
-        .iter()
-        .filter(|(path, fingerprint)| before.files.get(*path) != Some(*fingerprint))
-        .map(|(path, _)| path.clone())
+        .keys()
+        .chain(after.files.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|path| before.files.get(path) != after.files.get(path))
         .collect()
 }
 
@@ -1190,6 +1208,65 @@ fn fingerprint_workspace_file(
             is_dir: false,
         },
     }
+}
+
+fn collect_filesystem_fingerprints(
+    root: &Path,
+    current: &Path,
+    files: &mut BTreeMap<String, WorkspaceFileFingerprint>,
+) {
+    if files.len() >= FILESYSTEM_SNAPSHOT_MAX_FILES {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(current) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if files.len() >= FILESYSTEM_SNAPSHOT_MAX_FILES {
+            return;
+        }
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            if filesystem_snapshot_should_skip_dir(&path) {
+                continue;
+            }
+            collect_filesystem_fingerprints(root, &path, files);
+            continue;
+        }
+        if !metadata.is_file() || metadata.len() > FILESYSTEM_SNAPSHOT_MAX_FILE_BYTES {
+            continue;
+        }
+        let Some(relative_path) = path
+            .strip_prefix(root)
+            .ok()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .filter(|path| !path.is_empty())
+        else {
+            continue;
+        };
+        files.insert(
+            relative_path,
+            WorkspaceFileFingerprint {
+                status_code: "FS".to_string(),
+                content_hash: hash_file_contents(&path),
+                exists: true,
+                is_dir: false,
+            },
+        );
+    }
+}
+
+fn filesystem_snapshot_should_skip_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        ".git" | "node_modules" | "target" | "dist" | "coverage" | ".next" | ".svelte-kit"
+    )
 }
 
 fn hash_file_contents(path: &Path) -> Option<u64> {
@@ -1417,6 +1494,89 @@ mod tests {
     }
 
     #[test]
+    fn shell_exec_read_only_git_status_in_non_git_workspace_is_stable_probe() {
+        let root = unique_temp_dir("magi-tool-shell-non-git-probe");
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+        let context = ToolExecutionContext {
+            session_id: Some(SessionId::new("session-shell-non-git")),
+            workspace_id: Some(WorkspaceId::new("workspace-shell-non-git")),
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        };
+
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-shell-non-git-status"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "git status --short",
+                    "access_mode": "read_only"
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context,
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["status"], "succeeded");
+        assert_eq!(payload["exit_code"], 0);
+        assert_eq!(payload["git_worktree"], false);
+        assert_eq!(payload["stdout"], "NOT_GIT_WORKTREE\n");
+    }
+
+    #[test]
+    fn shell_exec_read_only_compound_git_status_in_non_git_workspace_is_stable_probe() {
+        let root = unique_temp_dir("magi-tool-shell-compound-non-git-probe");
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+        let context = ToolExecutionContext {
+            session_id: Some(SessionId::new("session-shell-compound-non-git")),
+            workspace_id: Some(WorkspaceId::new("workspace-shell-compound-non-git")),
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        };
+        let command = format!(
+            "pwd && printf '\\n---\\n' && ls -1 {} | head -n 3 && printf '\\n---\\n' && git -C {} status --short",
+            root.display(),
+            root.display()
+        );
+
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-shell-compound-non-git-status"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": command,
+                    "access_mode": "read_only"
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context,
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        assert_eq!(payload["status"], "succeeded");
+        assert_eq!(payload["exit_code"], 0);
+        assert_eq!(payload["git_worktree"], false);
+        assert_eq!(payload["stdout"], "NOT_GIT_WORKTREE\n");
+    }
+
+    #[test]
     fn shell_exec_records_git_worktree_changed_paths() {
         let root = unique_temp_dir("magi-tool-shell-change-capture");
         Command::new("git")
@@ -1486,6 +1646,50 @@ mod tests {
         assert!(changed_paths.contains(&"tracked-a.txt"));
         assert!(changed_paths.contains(&"tracked-b.txt"));
         assert!(changed_paths.contains(&"tmp/new-a.txt"));
+    }
+
+    #[test]
+    fn shell_exec_records_non_git_filesystem_changed_paths() {
+        let root = unique_temp_dir("magi-tool-shell-non-git-change-capture");
+        fs::write(root.join("remove-me.txt"), "remove me\n").expect("seed file should write");
+        let governance = Arc::new(GovernanceService::default());
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(governance, event_bus);
+        tool_registry.register_default_builtins();
+        let context = ToolExecutionContext {
+            session_id: Some(SessionId::new("session-shell-non-git-change")),
+            workspace_id: Some(WorkspaceId::new("workspace-shell-non-git-change")),
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        };
+
+        let output = tool_registry.execute_with_policy(
+            ToolExecutionInput {
+                tool_call_id: ToolCallId::new("tool-call-shell-non-git-change"),
+                tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+                tool_kind: ToolKind::Builtin,
+                input: serde_json::json!({
+                    "command": "printf 'new file\\n' > new-a.txt && rm remove-me.txt",
+                    "access_mode": "explicit_write"
+                })
+                .to_string(),
+                approval_requirement: ApprovalRequirement::None,
+                risk_level: RiskLevel::Low,
+            },
+            context,
+            &ToolExecutionPolicy::default(),
+        );
+
+        assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+        let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+        let changed_paths = payload["changed_paths"]
+            .as_array()
+            .expect("changed paths should be recorded")
+            .iter()
+            .map(|value| value.as_str().expect("path should be string"))
+            .collect::<Vec<_>>();
+        assert!(changed_paths.contains(&"new-a.txt"));
+        assert!(changed_paths.contains(&"remove-me.txt"));
     }
 
     #[cfg(unix)]

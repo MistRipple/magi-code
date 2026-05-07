@@ -24,6 +24,11 @@ interface LaneProjectionMeta {
   status: WorkerLaneStatus;
 }
 
+interface LaneActivitySnapshot {
+  text: string;
+  itemSeq: number;
+}
+
 function normalizeSessionId(value: string | null | undefined): string {
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -76,6 +81,70 @@ function valueToDisplayText(value: unknown): string | undefined {
   } catch {
     return String(value);
   }
+}
+
+function readObject(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function normalizeActivityText(value: unknown): string {
+  return typeof value === 'string'
+    ? value.replace(/\s+/g, ' ').trim()
+    : '';
+}
+
+function readStringField(record: Record<string, unknown> | undefined, keys: string[]): string {
+  if (!record) {
+    return '';
+  }
+  for (const key of keys) {
+    const value = normalizeActivityText(record[key]);
+    if (value) {
+      return value;
+    }
+  }
+  return '';
+}
+
+function summarizeToolResult(value: unknown): string {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return '';
+    }
+    try {
+      const parsed = JSON.parse(trimmed);
+      return summarizeToolResult(parsed) || normalizeActivityText(trimmed);
+    } catch {
+      return normalizeActivityText(trimmed);
+    }
+  }
+  const record = readObject(value);
+  return readStringField(record, ['summary', 'message', 'error']);
+}
+
+function summarizeLaneItem(item: CanonicalTurnItem): string {
+  if (item.kind === 'worker_dispatch' || item.kind === 'user_message' || item.kind === 'system_notice') {
+    return '';
+  }
+  const metadata = readObject(item.metadata);
+  const explicitSummary = readStringField(metadata, [
+    'stageSummary',
+    'stage_summary',
+    'summary',
+    'message',
+  ]);
+  if (explicitSummary) {
+    return explicitSummary;
+  }
+  if (item.kind === 'tool_call') {
+    return summarizeToolResult(item.tool?.result)
+      || normalizeActivityText(item.content)
+      || normalizeActivityText(item.title || item.tool?.name);
+  }
+  return normalizeActivityText(item.content) || normalizeActivityText(item.title);
 }
 
 function buildToolBlock(tool: CanonicalToolCall, status: CanonicalTurnItemStatus): ContentBlock {
@@ -132,7 +201,7 @@ function resolveMessageType(item: CanonicalTurnItem): Message['type'] {
     return 'tool_call';
   }
   if (item.kind === 'system_notice') {
-    return 'system-notice';
+    return item.visibility.threadVisible ? 'text' : 'system-notice';
   }
   if (item.kind === 'assistant_text') {
     return 'text';
@@ -157,7 +226,14 @@ function resolveItemContent(item: CanonicalTurnItem): string {
 }
 
 function shouldRenderItem(item: CanonicalTurnItem): boolean {
-  if (item.visibility.renderable === false || item.kind === 'system_notice') {
+  if (item.visibility.renderable === false) {
+    return false;
+  }
+  if (
+    item.kind === 'system_notice'
+    && item.visibility.threadVisible === false
+    && item.visibility.workerVisible === false
+  ) {
     return false;
   }
   if (
@@ -172,6 +248,7 @@ function shouldRenderItem(item: CanonicalTurnItem): boolean {
 
 function isTurnResponseDurationAnchorCandidate(item: CanonicalTurnItem): boolean {
   return item.kind !== 'user_message'
+    && item.kind !== 'system_notice'
     && item.visibility.threadVisible !== false
     && shouldRenderItem(item);
 }
@@ -194,6 +271,18 @@ function findTurnResponseDurationAnchor(turn: CanonicalTurn): CanonicalTurnItem 
 function canShowTurnResponseDuration(turn: CanonicalTurn, item: CanonicalTurnItem): boolean {
   const anchor = findTurnResponseDurationAnchor(turn);
   return anchor?.itemId === item.itemId;
+}
+
+function resolveDispatchGroupResponseDurationMs(turn: CanonicalTurn): number | undefined {
+  if (
+    !isCanonicalTerminalStatus(turn.status)
+    || typeof turn.responseDurationMs !== 'number'
+    || !Number.isFinite(turn.responseDurationMs)
+    || turn.responseDurationMs < 0
+  ) {
+    return undefined;
+  }
+  return findTurnResponseDurationAnchor(turn) ? undefined : turn.responseDurationMs;
 }
 
 function collectLaneProjectionMeta(turn: CanonicalTurn): Map<string, LaneProjectionMeta> {
@@ -342,6 +431,7 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
 
   const laneById = new Map<string, DispatchGroupLane>();
   const laneVersionById = new Map<string, number>();
+  const laneActivityById = new Map<string, LaneActivitySnapshot>();
   for (const item of dispatchItems) {
     const laneId = item.laneId?.trim();
     if (!laneId) {
@@ -375,8 +465,27 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
     if (item.kind === 'tool_call') {
       lane.toolUseCount = (lane.toolUseCount || 0) + 1;
     }
+    const activityText = summarizeLaneItem(item);
+    if (activityText) {
+      const currentActivity = laneActivityById.get(laneId);
+      if (!currentActivity || item.itemSeq >= currentActivity.itemSeq) {
+        laneActivityById.set(laneId, { text: activityText, itemSeq: item.itemSeq });
+      }
+    }
     if (isCanonicalTerminalStatus(item.status)) {
       lane.endedAt = item.updatedAt;
+    }
+  }
+
+  for (const [laneId, activity] of laneActivityById.entries()) {
+    const lane = laneById.get(laneId);
+    if (!lane) {
+      continue;
+    }
+    if (lane.status === 'running' || lane.status === 'pending') {
+      lane.liveActivity = activity.text;
+    } else {
+      lane.summary = activity.text;
     }
   }
 
@@ -416,6 +525,7 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
   );
   const firstItem = dispatchItems[0];
   const artifactId = `turn:${turn.turnId}:worker-dispatch-group`;
+  const responseDurationMs = resolveDispatchGroupResponseDurationMs(turn);
   const block: ContentBlock = {
     type: 'dispatch_group',
     content: '',
@@ -446,6 +556,7 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
       blockSeq: firstItem.itemSeq,
       cardStreamSeq: firstItem.itemSeq,
       dispatchWaveId: turn.turnId,
+      ...(responseDurationMs !== undefined ? { responseDurationMs } : {}),
       canonical: true,
     },
   };
