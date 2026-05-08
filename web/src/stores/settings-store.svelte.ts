@@ -240,7 +240,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   // 记录新引擎的用户输入名称（用于后续 Registry upsert）
   const engineDisplayNames = new Map<string, string>();
 
-  // 使用全局 store 的模型状态（与 BottomTabs 共用）
+  // 使用全局 store 的模型状态（与执行状态共用）
   const appState = getState();
   const modelStatuses = $derived(appState.modelStatus);
 
@@ -1144,7 +1144,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
         registryEngines: engines,
         registryAgents: agents,
       };
-      // 同步 enabledAgents 到全局 store（供 BottomTabs 使用）
+      // 同步 enabledAgents 到全局 store（供执行状态展示使用）
       syncEnabledAgentsToStore();
     } catch (e) {
       console.error("[SettingsPanel] 加载 Registry 数据失败:", e);

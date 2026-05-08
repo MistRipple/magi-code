@@ -403,7 +403,7 @@ export interface ContentBlock {
   lanes?: DispatchGroupLane[];
 }
 
-// 模型连接状态类型（统一的连接状态，供 BottomTabs 和 SettingsPanel 共用）
+// 模型连接状态类型（供设置面板和任务执行状态共用）
 export type ModelStatusType =
   | 'available'       // 可用（已连接）
   | 'connected'       // 已连接
@@ -861,7 +861,6 @@ export interface AppState {
 // Webview 持久化状态
 export interface WebviewPersistedState {
   currentTopTab: TabType;
-  currentBottomTab: TabType;
   sessions: Session[];
   currentSessionId: string | null;
   scrollPositions?: ScrollPositions;

@@ -1,14 +1,11 @@
 <script lang="ts">
   import type { ContentBlock, DispatchGroupLane, WorkerLaneStatus } from '../types/message';
   import type { IconName } from '../lib/icons';
-  import { getAgentVisualInfo } from '../lib/agent-colors';
   import {
     buildTaskOrchestrationView,
-    type TaskOrchestrationPhase,
   } from '../lib/task-orchestration-presentation';
-  import { resolveWorkerDisplayName, resolveWorkerRoleSource } from '../lib/worker-role-utils';
   import { getTaskGraphState } from '../stores/task-graph-store.svelte';
-  import { getEnabledAgents, getState, setCurrentBottomTab } from '../stores/messages.svelte';
+  import { getState } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
 
@@ -18,7 +15,7 @@
     readOnly?: boolean;
   }
 
-  let { block, readOnly = false }: Props = $props();
+  let { block }: Props = $props();
 
   type StatusTone = 'pending' | 'running' | 'paused' | 'success' | 'danger';
 
@@ -33,20 +30,12 @@
     displayIndex: number;
     title: string;
     status: WorkerLaneStatus;
-    workerTabId: string;
-    workerDisplayLabel: string;
-    workerColor: string;
-    workerMuted: string;
-    workerIcon: IconName;
     summary: string;
     toolUseCount: number;
     fileChangeCount: number;
-    isClickable: boolean;
   }
 
   const appState = getState();
-  const enabledAgents = $derived(getEnabledAgents());
-  const registrySnapshot = $derived(appState.settingsRegistrySnapshot);
   const currentSessionId = $derived(typeof appState.currentSessionId === 'string' ? appState.currentSessionId.trim() : '');
   const taskGraph = $derived(getTaskGraphState(currentSessionId));
 
@@ -116,17 +105,6 @@
     }
   }
 
-  function resolveWorkerMeta(workerId: string) {
-    const normalizedWorkerId = normalizeText(workerId) || 'orchestrator';
-    const roleSource = resolveWorkerRoleSource(normalizedWorkerId, enabledAgents, registrySnapshot);
-    const tabId = normalizeText(roleSource?.templateId) || normalizedWorkerId;
-    const displayName = normalizedWorkerId === 'orchestrator'
-      ? i18n.t('workerBadge.role.orchestrator')
-      : resolveWorkerDisplayName(tabId, enabledAgents, registrySnapshot, (key) => i18n.t(key));
-    const visualInfo = getAgentVisualInfo(tabId, roleSource?.colorToken);
-    return { tabId, displayName, visualInfo };
-  }
-
   function resolveLaneOrder(lane: DispatchGroupLane, fallback: number): number {
     const taskSeq = Array.isArray(lane.tasks)
       ? lane.tasks.find((task) => typeof task.seq === 'number' && Number.isFinite(task.seq))?.seq
@@ -160,30 +138,16 @@
       || i18n.t('dispatchGroupCard.stageFallback');
   }
 
-  function resolveFallbackLaneWorkerId(lane: DispatchGroupLane): string {
-    return normalizeText(lane.jumpTarget?.workerTabId)
-      || normalizeText(lane.worker)
-      || 'orchestrator';
-  }
-
   const fallbackRows = $derived.by<FallbackLaneViewModel[]>(() => (
     lanes.map((lane, index) => {
-      const workerId = resolveFallbackLaneWorkerId(lane);
-      const { tabId, displayName, visualInfo } = resolveWorkerMeta(workerId);
       return {
         key: lane.laneId,
         displayIndex: index + 1,
         title: resolveFallbackLaneTitle(lane),
         status: normalizeStatus(lane.status),
-        workerTabId: tabId || workerId,
-        workerDisplayLabel: displayName,
-        workerColor: visualInfo.color,
-        workerMuted: visualInfo.muted,
-        workerIcon: visualInfo.icon,
         summary: compactSummary(normalizeText(lane.summary) || normalizeText(lane.liveActivity)),
         toolUseCount: resolvePositiveCount(lane.toolUseCount),
         fileChangeCount: resolvePositiveCount(lane.fileChangeCount),
-        isClickable: workerId !== 'orchestrator',
       };
     })
   ));
@@ -193,32 +157,11 @@
     fallbackRows.length > 0 ? 'completed' : 'pending',
   ));
 
-  function phaseWorkerInfo(phase: TaskOrchestrationPhase) {
-    const workerId = phase.workerTabId || phase.executorRoleIds[0] || 'orchestrator';
-    const { tabId, displayName, visualInfo } = resolveWorkerMeta(workerId);
-    return {
-      workerTabId: tabId || workerId,
-      workerDisplayLabel: displayName,
-      workerColor: visualInfo.color,
-      workerMuted: visualInfo.muted,
-      workerIcon: visualInfo.icon,
-      isClickable: workerId !== 'orchestrator',
-    };
-  }
-
   const groupStatusConfig = $derived.by(() => resolveStatusConfig(orchestration?.status || fallbackStatus));
   const fallbackSummary = $derived(i18n.t('dispatchGroupCard.dispatchSummary', {
     laneCount: fallbackRows.length,
-    workerCount: new Set(fallbackRows.map((row) => row.workerTabId).filter(Boolean)).size,
   }));
 
-  function openWorkerTab(tabId: string) {
-    const normalizedTabId = normalizeText(tabId);
-    if (readOnly || !normalizedTabId || normalizedTabId === 'orchestrator') {
-      return;
-    }
-    setCurrentBottomTab(normalizedTabId);
-  }
 </script>
 
 {#if orchestration}
@@ -236,7 +179,6 @@
               {i18n.t('dispatchGroupCard.orchestrationSummary', {
                 phaseCount: orchestration.totalPhaseCount,
                 actionCount: orchestration.totalActionCount,
-                workerCount: orchestration.workerRoleIds.length,
               })}
             </span>
           </div>
@@ -253,15 +195,8 @@
       <div class="dispatch-group-card__stages">
         {#each orchestration.phases as phase, index (phase.key)}
           {@const statusConfig = resolveStatusConfig(phase.status)}
-          {@const workerInfo = phaseWorkerInfo(phase)}
-          <button
-            type="button"
+          <div
             class="dispatch-group-card__stage-row"
-            class:is-clickable={workerInfo.isClickable && !readOnly}
-            style={`--worker-color:${workerInfo.workerColor};--worker-muted:${workerInfo.workerMuted};`}
-            disabled={readOnly || !workerInfo.isClickable}
-            onclick={() => openWorkerTab(workerInfo.workerTabId)}
-            aria-label={workerInfo.isClickable ? i18n.t('subTaskSummaryCard.clickToView', { workerLabel: workerInfo.workerDisplayLabel }) : undefined}
           >
             <span class={`dispatch-group-card__stage-index dispatch-group-card__stage-index--${statusConfig.tone}`}>
               {index + 1}
@@ -289,12 +224,6 @@
               {#if phase.summary}
                 <span class="dispatch-group-card__summary">{phase.summary}</span>
               {/if}
-              <span class="dispatch-group-card__owner">
-                <span class="dispatch-group-card__owner-icon">
-                  <Icon name={workerInfo.workerIcon} size={11} />
-                </span>
-                <span>{i18n.t('dispatchGroupCard.owner', { workerLabel: workerInfo.workerDisplayLabel })}</span>
-              </span>
             </span>
             {#if phase.toolUseCount > 0 || phase.fileChangeCount > 0}
               <span class="dispatch-group-card__stage-metrics">
@@ -306,7 +235,7 @@
                 {/if}
               </span>
             {/if}
-          </button>
+          </div>
         {/each}
       </div>
     </div>
@@ -336,14 +265,8 @@
       <div class="dispatch-group-card__stages">
         {#each fallbackRows as row (row.key)}
           {@const statusConfig = resolveStatusConfig(row.status)}
-          <button
-            type="button"
+          <div
             class="dispatch-group-card__stage-row"
-            class:is-clickable={row.isClickable && !readOnly}
-            style={`--worker-color:${row.workerColor};--worker-muted:${row.workerMuted};`}
-            disabled={readOnly || !row.isClickable}
-            onclick={() => openWorkerTab(row.workerTabId)}
-            aria-label={row.isClickable ? i18n.t('subTaskSummaryCard.clickToView', { workerLabel: row.workerDisplayLabel }) : undefined}
           >
             <span class={`dispatch-group-card__stage-index dispatch-group-card__stage-index--${statusConfig.tone}`}>
               {row.displayIndex}
@@ -359,12 +282,6 @@
               {#if row.summary}
                 <span class="dispatch-group-card__summary">{row.summary}</span>
               {/if}
-              <span class="dispatch-group-card__owner">
-                <span class="dispatch-group-card__owner-icon">
-                  <Icon name={row.workerIcon} size={11} />
-                </span>
-                <span>{i18n.t('dispatchGroupCard.owner', { workerLabel: row.workerDisplayLabel })}</span>
-              </span>
             </span>
             {#if row.toolUseCount > 0 || row.fileChangeCount > 0}
               <span class="dispatch-group-card__stage-metrics">
@@ -376,7 +293,7 @@
                 {/if}
               </span>
             {/if}
-          </button>
+          </div>
         {/each}
       </div>
     </div>
@@ -548,15 +465,6 @@
     background: color-mix(in srgb, var(--assistant-message-bg) 92%, var(--foreground) 8%);
     color: inherit;
     text-align: left;
-  }
-
-  .dispatch-group-card__stage-row:disabled {
-    cursor: default;
-    opacity: 1;
-  }
-
-  .dispatch-group-card__stage-row.is-clickable:not(:disabled):hover {
-    background: color-mix(in srgb, var(--assistant-message-bg) 86%, var(--worker-color) 14%);
   }
 
   .dispatch-group-card__stage-index {

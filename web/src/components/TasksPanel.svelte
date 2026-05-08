@@ -4,10 +4,6 @@
     addToast,
     getEnabledAgents,
     getState,
-    setCurrentBottomTab,
-    setCurrentTopTab,
-    setTaskComposerDraft,
-    type TaskComposerIntent,
   } from '../stores/messages.svelte';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
@@ -99,7 +95,7 @@
   let deliveryPackageRequestScope = $state('');
   let deliverySummaryCopied = $state(false);
   let deliverySummaryCopyTimer: ReturnType<typeof setTimeout> | null = null;
-  let taskActionLoading = $state<'pause' | 'resume' | 'replan' | 'delivery' | null>(null);
+  let taskActionLoading = $state<'pause' | 'resume' | null>(null);
   let selectedTaskReference = $state<SelectedTaskReference | null>(null);
   let referenceDetailEl = $state<HTMLElement | null>(null);
   let referenceSelectionScope = $state('');
@@ -193,7 +189,7 @@
     buildTaskTreeRows(taskGraph.projection?.root_task, childrenByParentId, expandedGraphNodes)
   ));
   const taskSummary = $derived.by(() => buildTaskSummary(taskGraph.projection, activeProjectionTasks, cancelledHistoryTasks));
-  const workpackageSummaries = $derived(taskGraph.projection?.workpackage_summaries ?? []);
+  const canUseTaskIntake = $derived.by(() => isTaskProjectionAcceptingIntake(taskGraph.projection, taskGraph.rootTaskId));
   const deliveryFileReferences = $derived.by(() => (
     (deliveryPackage?.file_changes ?? [])
       .map((ref) => describeTaskReference(ref, 'diff'))
@@ -216,10 +212,6 @@
     selectedGraphTask ? getTaskExecutorDisplayName(selectedGraphTask) : ''
   ));
   const selectedGraphReferenceGroups = $derived.by(() => buildTaskReferenceGroups(selectedGraphTask));
-  const canUseTaskIntake = $derived.by(() => {
-    const projection = taskGraph.projection;
-    return isTaskProjectionAcceptingIntake(projection, taskGraph.rootTaskId);
-  });
   const selectedHistoryTask = $derived.by(() => {
     if (cancelledHistoryTasks.length === 0) return null;
     if (selectedHistoryTaskId) {
@@ -256,6 +248,7 @@
   const pendingDecisionTask = $derived.by(() => (
     attentionTasks.find((task) => task.kind === 'Decision') ?? null
   ));
+  const decisionAttentionTasks = $derived.by(() => attentionTasks.filter((task) => task.kind === 'Decision'));
 
   function getTaskParentTitle(task: TaskDto): string {
     if (!task.parent_task_id) return '根任务';
@@ -307,34 +300,6 @@
       current = parent;
     }
     return lineage.length > 0 ? lineage.join(' / ') : '根任务';
-  }
-
-  function buildTaskComposerDraftText(task: TaskDto, intent: TaskComposerIntent): string {
-    const taskTitle = getTaskDisplayTitle(task);
-    const taskGoal = getTaskDisplayGoal(task);
-    const taskLabel = `${getTaskKindLabel(task.kind)} · ${taskTitle}`;
-    const goalLine = taskGoal && taskGoal !== taskTitle ? `\n当前目标：${taskGoal}` : '';
-    if (intent === 'supplement_context') {
-      return `补充上下文：\n${taskLabel}${goalLine}\n\n请补充这个任务接下来执行需要的上下文、约束、证据或前置条件。`;
-    }
-    if (intent === 'append_task') {
-      return `追加任务：\n${taskLabel}${goalLine}\n\n请追加一个可以直接纳入当前任务图的新子任务。`;
-    }
-    return `重新规划：\n${taskLabel}${goalLine}\n\n请基于这个任务所在的上下文，重新规划剩余任务图。`;
-  }
-
-  function openTaskComposerDraft(task: TaskDto, intent: TaskComposerIntent) {
-    const sessionId = currentSessionIdValue();
-    if (!sessionId) return;
-    setTaskComposerDraft({
-      intent,
-      taskId: task.task_id,
-      text: buildTaskComposerDraftText(task, intent),
-    });
-    selectTaskGraphTask(sessionId, task.task_id);
-    setCurrentTopTab('thread');
-    setCurrentBottomTab('thread');
-    addToast('info', '已放入输入框，可编辑后发送');
   }
 
   function resolveVisibleParentTaskId(
@@ -557,10 +522,7 @@
     return sessionId || null;
   }
 
-  async function runTaskAction(
-    action: 'pause' | 'resume' | 'replan' | 'delivery',
-    task: () => Promise<void>,
-  ) {
+  async function runTaskAction(action: 'pause' | 'resume', task: () => Promise<void>) {
     if (taskActionLoading) return;
     taskActionLoading = action;
     try {
@@ -601,31 +563,6 @@
     }).catch((err) => {
       const message = err instanceof Error ? err.message : String(err);
       addToast('error', `恢复失败: ${message}`);
-    });
-  }
-
-  async function replanCurrentTaskGraph() {
-    const sessionId = currentSessionIdValue();
-    const rootTaskId = currentRootTaskId();
-    if (!sessionId || !rootTaskId) return;
-    await runTaskAction('replan', async () => {
-      const client = createClient();
-      const result = await client.replanTaskGraph(rootTaskId, sessionId);
-      clearDeliveryPackageViewState();
-      await refreshTaskProjection(sessionId);
-      addToast('info', `已重规划，取消 ${result.cancelledTaskIds.length} 个旧任务`);
-    }).catch((err) => {
-      const message = err instanceof Error ? err.message : String(err);
-      addToast('error', `重规划失败: ${message}`);
-    });
-  }
-
-  async function refreshDeliveryPackage() {
-    const sessionId = currentSessionIdValue();
-    if (!sessionId) return;
-    await runTaskAction('delivery', async () => {
-      await refreshTaskProjection(sessionId);
-      clearDeliveryPackageViewState();
     });
   }
 
@@ -759,14 +696,8 @@
             {/if}
           </div>
           <div class="task-overview-badges">
-            <span class="tg-mode-badge tg-mode--{proj.execution_mode}">
-              {proj.execution_mode === 'deep' ? '深度模式' : '普通模式'}
-            </span>
-            <span class="tg-runner-badge tg-runner--{proj.runner_status}">
-              {getRunnerStatusLabel(proj.runner_status)}
-            </span>
             <span class="tg-status-badge tg-status--{getTaskStatusModifier(proj.aggregate_status)}">
-              {proj.display_status}
+              {getRunnerStatusLabel(proj.runner_status)}
             </span>
           </div>
         </div>
@@ -778,10 +709,10 @@
               class="task-action-btn"
               disabled={taskActionLoading !== null}
               onclick={pauseCurrentTaskGraph}
-              title="暂停任务链"
+              title="停止当前任务"
             >
               <Icon name={taskActionLoading === 'pause' ? 'loader' : 'stop'} size={12} class={taskActionLoading === 'pause' ? 'spinning' : ''} />
-              <span>暂停</span>
+              <span>停止</span>
             </button>
           {:else if proj.runner_status === 'blocked'}
             {#if pendingDecisionTask}
@@ -803,35 +734,9 @@
               title="恢复任务链"
             >
               <Icon name={taskActionLoading === 'resume' ? 'loader' : 'play'} size={12} class={taskActionLoading === 'resume' ? 'spinning' : ''} />
-              <span>恢复</span>
+              <span>继续</span>
             </button>
             {/if}
-          {/if}
-
-          {#if proj.execution_mode === 'deep' && proj.runner_status !== 'completed'}
-            <button
-              type="button"
-              class="task-action-btn"
-              disabled={taskActionLoading !== null}
-              onclick={replanCurrentTaskGraph}
-              title="重规划剩余任务图"
-            >
-              <Icon name={taskActionLoading === 'replan' ? 'loader' : 'refresh'} size={12} class={taskActionLoading === 'replan' ? 'spinning' : ''} />
-              <span>重规划</span>
-            </button>
-          {/if}
-
-          {#if deliveryPackage || shouldFetchDelivery}
-            <button
-              type="button"
-              class="task-action-btn"
-              disabled={taskActionLoading !== null || deliveryPackageLoading}
-              onclick={refreshDeliveryPackage}
-              title="刷新交付概览"
-            >
-              <Icon name={taskActionLoading === 'delivery' ? 'loader' : 'download'} size={12} class={taskActionLoading === 'delivery' ? 'spinning' : ''} />
-              <span>刷新交付</span>
-            </button>
           {/if}
         </div>
 
@@ -853,9 +758,6 @@
             {#if taskSummary.failed > 0}
               <span class="tg-stat tg-stat--failed">{taskSummary.failed} 失败</span>
             {/if}
-            {#if taskSummary.history > 0}
-              <span class="tg-stat tg-stat--history">{taskSummary.history} 历史节点</span>
-            {/if}
           </div>
         {/if}
 
@@ -875,34 +777,6 @@
         {#if proj.validation_summary}
           <div class="tg-validation-summary">{proj.validation_summary}</div>
         {/if}
-
-        {#if workpackageSummaries.length > 0}
-          <div class="wp-summaries">
-            <div class="wp-summaries-label">工作包进度</div>
-            {#each workpackageSummaries as wp (wp.task_id)}
-              <div class="wp-summary-row">
-                <div class="wp-summary-header">
-                  <span class="wp-summary-title">{getTaskDisplayText(wp.title)}</span>
-                  <span class="wp-summary-badge tg-status--{getTaskStatusModifier(wp.aggregate_status)}">
-                    {getTaskStatusLabel(wp.aggregate_status)}
-                  </span>
-                </div>
-                <div class="wp-progress-wrap">
-                  <div class="wp-progress-bar">
-                    <div class="wp-progress-fill" style="width: {Math.round(wp.progress_ratio * 100)}%"></div>
-                  </div>
-                  <span class="wp-progress-label">{Math.round(wp.progress_ratio * 100)}%</span>
-                </div>
-                {#if wp.recent_issues.length > 0}
-                  <div class="wp-summary-issues">
-                    <Icon name="alert-circle" size={10} />
-                    <span>{wp.recent_issues.length} 项需要处理: {wp.recent_issues.map(getTaskDisplayText).join('、')}</span>
-                  </div>
-                {/if}
-              </div>
-            {/each}
-          </div>
-        {/if}
       </section>
 
       {#if deliveryPackage}
@@ -910,7 +784,6 @@
           <div class="dp-header">
             <Icon name="taskComplete" size={14} />
             <span class="dp-title">交付概览</span>
-            <span class="dp-mode">{deliveryPackage.execution_mode === 'deep' ? '深度模式' : '普通模式'}</span>
             <button
               type="button"
               class="dp-summary-copy"
@@ -1052,12 +925,13 @@
         </section>
       {/if}
 
-      <div class="task-section-header">
-        <span>执行结构</span>
-        <span class="task-section-meta">{activeProjectionTasks.length} 个活跃节点</span>
-      </div>
+      <details class="task-details-disclosure">
+        <summary>
+          <span>执行明细</span>
+          <span>{activeProjectionTasks.length} 个节点</span>
+        </summary>
 
-      <div class="tg-tree" role="tree" aria-label="任务执行结构">
+      <div class="tg-tree" role="tree" aria-label="任务执行明细">
         {#each taskTreeRows as row (row.task.task_id)}
           {@const isExpanded = expandedGraphNodes.has(row.task.task_id)}
           {@const statusIcon = getProjectionStatusIcon(row.task.status)}
@@ -1151,35 +1025,7 @@
             {/if}
           </div>
           {#if canUseTaskIntake}
-            <div class="task-detail-actions">
-              <button
-                type="button"
-                class="tg-attention-action"
-                onclick={() => openTaskComposerDraft(selectedGraphTask, 'supplement_context')}
-                title="补充当前任务的上下文"
-              >
-                <Icon name="sparkles" size={11} />
-                <span>补充上下文</span>
-              </button>
-              <button
-                type="button"
-                class="tg-attention-action"
-                onclick={() => openTaskComposerDraft(selectedGraphTask, 'append_task')}
-                title="追加一个新子任务"
-              >
-                <Icon name="plus" size={11} />
-                <span>追加任务</span>
-              </button>
-              <button
-                type="button"
-                class="tg-attention-action"
-                onclick={() => openTaskComposerDraft(selectedGraphTask, 'replan')}
-                title="基于当前任务上下文重新规划"
-              >
-                <Icon name="refresh" size={11} />
-                <span>重新规划</span>
-              </button>
-            </div>
+            <p class="task-detail-guide">需要补充上下文、调整计划或追加后续工作时，直接在主对话框输入即可。</p>
           {/if}
           {#if selectedGraphTask.kind === 'Decision' && getTaskDisplayBlockedReason(selectedGraphTask)}
             <div class="task-detail-blocker">
@@ -1212,6 +1058,7 @@
           {/if}
         </section>
       {/if}
+      </details>
 
       {#if attentionTasks.length > 0}
         <div class="tg-attention-section">
@@ -1219,84 +1066,66 @@
             <span>需要处理</span>
             <span class="task-section-meta">{attentionTasks.length} 项</span>
           </div>
-          {#each attentionTasks as task (task.task_id)}
+          {#if decisionAttentionTasks.length > 0}
+          {#each decisionAttentionTasks as task (task.task_id)}
             {@const isDecLoading = decisionLoading.has(task.task_id)}
-            {@const decisionOptions = task.kind === 'Decision' ? getDecisionOptions(task) : []}
-            <div class="tg-attention-item tg-attention--{task.kind === 'Decision' ? 'decision' : 'blocked'}">
-              <Icon name={task.kind === 'Decision' ? 'shield' : 'alert-circle'} size={12} />
+            {@const decisionOptions = getDecisionOptions(task)}
+            <div class="tg-attention-item tg-attention--decision">
+              <Icon name="shield" size={12} />
               <div class="tg-attention-copy">
                 <span class="tg-attention-title">{getTaskDisplayTitle(task)}</span>
                 <span class="tg-attention-meta">
-                  {#if task.kind === 'Decision' && getTaskDisplayBlockedReason(task)}
-                    {getTaskDisplayBlockedReason(task)}
-                  {:else}
-                    {getTaskStatusLabel(task.status)}
-                  {/if}
+                  {getTaskDisplayBlockedReason(task)}
                 </span>
               </div>
-              {#if task.kind === 'Decision'}
-                <div class="tg-decision-actions">
-                  {#if decisionOptions.length > 0}
-                    {#each decisionOptions as option (option.option_id)}
-                      <button
-                        class={isRecommendedDecisionOption(task, option)
-                          ? 'tg-decision-btn tg-decision-btn--recommended'
-                          : 'tg-decision-btn'}
-                        title={option.description || option.label}
-                        disabled={isDecLoading}
-                        onclick={() => resolveDecision(task.task_id, option)}
-                      >
-                        {#if isDecLoading}
-                          <Icon name="loader" size={12} class="spinning" />
-                        {:else}
-                          <Icon name="check" size={12} />
-                        {/if}
-                        {option.label}
-                      </button>
-                    {/each}
-                  {:else}
-                    <span class="tg-decision-empty">缺少决策选项</span>
-                  {/if}
-                </div>
-              {:else if task.status === 'Blocked'}
-                <div class="tg-attention-actions">
-                  {#if proj.runner_status === 'blocked'}
+              <div class="tg-decision-actions">
+                {#if decisionOptions.length > 0}
+                  {#each decisionOptions as option (option.option_id)}
                     <button
-                      type="button"
-                      class="tg-attention-action"
-                      disabled={taskActionLoading !== null}
-                      onclick={resumeCurrentTaskGraph}
-                      title="恢复任务链"
+                      class={isRecommendedDecisionOption(task, option)
+                        ? 'tg-decision-btn tg-decision-btn--recommended'
+                        : 'tg-decision-btn'}
+                      title={option.description || option.label}
+                      disabled={isDecLoading}
+                      onclick={() => resolveDecision(task.task_id, option)}
                     >
-                      <Icon name={taskActionLoading === 'resume' ? 'loader' : 'play'} size={12} class={taskActionLoading === 'resume' ? 'spinning' : ''} />
-                      <span>恢复</span>
+                      {#if isDecLoading}
+                        <Icon name="loader" size={12} class="spinning" />
+                      {:else}
+                        <Icon name="check" size={12} />
+                      {/if}
+                      {option.label}
                     </button>
-                  {/if}
-                  {#if proj.execution_mode === 'deep' && proj.runner_status !== 'completed'}
-                    <button
-                      type="button"
-                      class="tg-attention-action"
-                      disabled={taskActionLoading !== null}
-                      onclick={replanCurrentTaskGraph}
-                      title="重规划剩余任务图"
-                    >
-                      <Icon name={taskActionLoading === 'replan' ? 'loader' : 'refresh'} size={12} class={taskActionLoading === 'replan' ? 'spinning' : ''} />
-                      <span>重规划</span>
-                    </button>
-                  {/if}
-                </div>
-              {/if}
+                  {/each}
+                {:else}
+                  <span class="tg-decision-empty">缺少决策选项</span>
+                {/if}
+              </div>
             </div>
           {/each}
+          {:else}
+            <div class="tg-attention-item tg-attention--blocked">
+              <Icon name="alert-circle" size={12} />
+              <div class="tg-attention-copy">
+                <span class="tg-attention-title">{attentionTasks.length} 个节点等待处理</span>
+                <span class="tg-attention-meta">可点击上方“继续”，或直接在对话框补充下一步指令。</span>
+              </div>
+            </div>
+          {/if}
         </div>
       {/if}
 
       {#if cancelledHistoryTasks.length > 0}
-        <section class="task-history-card" aria-label="重规划历史">
+        <details class="task-details-disclosure task-details-disclosure--history">
+          <summary>
+            <span>调整记录</span>
+            <span>{cancelledHistoryTasks.length} 个旧节点</span>
+          </summary>
+        <section class="task-history-card" aria-label="调整记录">
           <div class="task-history-header">
             <span class="task-history-title">
               <Icon name="clock" size={12} />
-              <span>重规划历史</span>
+              <span>调整记录</span>
             </span>
             <span class="task-history-count">{cancelledHistoryTasks.length} 个旧节点</span>
           </div>
@@ -1403,6 +1232,7 @@
             </div>
           {/if}
         </section>
+        </details>
       {/if}
 
     {/if}
@@ -1426,97 +1256,6 @@
 </div>
 
 <style>
-  /* ========== WorkPackage 进度概览 ========== */
-  .wp-summaries {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    margin-top: var(--space-3);
-    padding-top: var(--space-3);
-    border-top: 1px solid var(--border);
-  }
-
-  .wp-summaries-label {
-    font-size: var(--text-2xs);
-    font-weight: var(--font-medium);
-    color: var(--foreground-muted);
-    letter-spacing: 0.04em;
-  }
-
-  .wp-summary-row {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
-    background: var(--surface-2);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-md);
-  }
-
-  .wp-summary-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--space-2);
-  }
-
-  .wp-summary-title {
-    font-size: var(--text-xs);
-    font-weight: var(--font-semibold);
-    color: var(--foreground);
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .wp-summary-badge {
-    font-size: var(--text-2xs);
-    border-radius: 999px;
-    padding: 1px 6px;
-    border: 1px solid transparent;
-    flex-shrink: 0;
-  }
-
-  .wp-progress-wrap {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-  }
-
-  .wp-progress-bar {
-    flex: 1;
-    height: 6px;
-    background: var(--surface-hover);
-    border-radius: 999px;
-    overflow: hidden;
-  }
-
-  .wp-progress-fill {
-    height: 100%;
-    background: var(--primary);
-    border-radius: inherit;
-    transition: width 200ms ease;
-  }
-
-  .wp-progress-label {
-    font-size: var(--text-2xs);
-    font-weight: var(--font-medium);
-    color: var(--foreground-muted);
-    flex-shrink: 0;
-    min-width: 28px;
-    text-align: right;
-  }
-
-  .wp-summary-issues {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-2);
-    font-size: var(--text-2xs);
-    color: var(--warning);
-    margin-top: var(--space-1);
-  }
-
   /* ========== 面板容器 ========== */
   .tasks-panel {
     /* panel-content-scrollable 已经包含了 padding, flex, overflow */
@@ -1732,9 +1471,65 @@
     color: var(--foreground-muted);
   }
 
-  .tg-status-badge,
-  .tg-mode-badge,
-  .tg-runner-badge {
+  .task-details-disclosure {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface-1);
+  }
+
+  .task-details-disclosure > summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-3);
+    color: var(--foreground);
+    cursor: pointer;
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium);
+    list-style: none;
+  }
+
+  .task-details-disclosure > summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .task-details-disclosure > summary::after {
+    content: '';
+    width: 7px;
+    height: 7px;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: rotate(45deg);
+    opacity: 0.6;
+    transition: transform var(--transition-fast);
+  }
+
+  .task-details-disclosure[open] > summary::after {
+    transform: rotate(225deg);
+  }
+
+  .task-details-disclosure > summary span:last-child {
+    margin-left: auto;
+    color: var(--foreground-muted);
+    font-size: var(--text-2xs);
+    font-weight: var(--font-regular);
+  }
+
+  .task-details-disclosure[open] {
+    padding-bottom: var(--space-3);
+  }
+
+  .task-details-disclosure[open] > .tg-tree,
+  .task-details-disclosure[open] > .task-detail-card,
+  .task-details-disclosure[open] > .task-history-card {
+    margin: 0 var(--space-3);
+  }
+
+  .tg-status-badge {
     font-size: var(--text-2xs);
     border-radius: 999px;
     padding: 2px 8px;
@@ -1743,29 +1538,25 @@
     flex-shrink: 0;
   }
 
-  .tg-status--running,
-  .tg-runner--running {
+  .tg-status--running {
     color: var(--primary);
     background: var(--primary-muted);
     border-color: color-mix(in srgb, var(--primary) 30%, var(--border));
   }
 
-  .tg-status--completed,
-  .tg-runner--completed {
+  .tg-status--completed {
     color: var(--success);
     background: var(--success-muted);
     border-color: color-mix(in srgb, var(--success) 32%, var(--border));
   }
 
-  .tg-status--failed,
-  .tg-runner--error {
+  .tg-status--failed {
     color: var(--error);
     background: var(--error-muted);
     border-color: color-mix(in srgb, var(--error) 32%, var(--border));
   }
 
-  .tg-status--blocked,
-  .tg-runner--blocked {
+  .tg-status--blocked {
     color: var(--warning);
     background: var(--warning-muted);
     border-color: color-mix(in srgb, var(--warning) 30%, var(--border));
@@ -2083,11 +1874,11 @@
     font-size: var(--text-2xs);
   }
 
-  .task-detail-actions {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: var(--space-1);
+  .task-detail-guide {
+    margin: 0;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    line-height: var(--leading-normal);
   }
 
   .task-detail-blocker {
@@ -2265,43 +2056,6 @@
     font-size: var(--text-2xs);
     color: var(--text-tertiary);
     white-space: nowrap;
-  }
-
-  .tg-attention-actions {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-1);
-    flex-shrink: 0;
-  }
-
-  .tg-attention-action {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    height: 24px;
-    padding: 0 var(--space-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--surface-1);
-    color: var(--foreground);
-    font-size: var(--text-2xs);
-    cursor: pointer;
-    white-space: nowrap;
-    transition:
-      background var(--transition-fast),
-      border-color var(--transition-fast),
-      color var(--transition-fast);
-  }
-
-  .tg-attention-action:hover:not(:disabled) {
-    color: var(--primary);
-    background: color-mix(in srgb, var(--primary) 8%, var(--surface-1));
-    border-color: color-mix(in srgb, var(--primary) 30%, var(--border));
-  }
-
-  .tg-attention-action:disabled {
-    opacity: 0.55;
-    cursor: not-allowed;
   }
 
   /* ========== Replan History ========== */
@@ -2672,16 +2426,6 @@
     font-size: var(--text-sm);
     font-weight: var(--font-semibold);
     color: var(--foreground);
-  }
-
-  .dp-mode {
-    margin-left: auto;
-    font-size: var(--text-2xs);
-    color: var(--success);
-    background: var(--success-muted);
-    border: 1px solid color-mix(in srgb, var(--success) 32%, var(--border));
-    border-radius: 999px;
-    padding: 2px 8px;
   }
 
   .dp-summary-copy {

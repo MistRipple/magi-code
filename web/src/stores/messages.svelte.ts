@@ -106,7 +106,6 @@ export const messagesState = $state({
 
   // Tab 状态
   currentTopTab: 'thread' as TabType,
-  currentBottomTab: 'thread' as TabType,
   messageJump: {
     messageId: null as string | null,
     nonce: 0,
@@ -1631,7 +1630,6 @@ export function setEnabledAgents(agents: EnabledAgent[]) {
 export function getState() {
   return {
     get currentTopTab() { return messagesState.currentTopTab; },
-    get currentBottomTab() { return messagesState.currentBottomTab; },
     get messageJump() { return messagesState.messageJump; },
     get timelineNodes() { return messagesState.timelineNodes; },
     get timelineProjection() { return messagesState.timelineProjection; },
@@ -1858,7 +1856,6 @@ function saveWebviewState() {
     pruneSessionViewStateByKnownSessions();
     const state: WebviewPersistedState = {
       currentTopTab: messagesState.currentTopTab,
-      currentBottomTab: messagesState.currentBottomTab,
       sessions: messagesState.sessions,
       currentSessionId: messagesState.currentSessionId,
       scrollPositions: messagesState.scrollPositions,
@@ -1970,11 +1967,6 @@ export function setCurrentTopTab(tab: TabType) {
   saveWebviewState();
 }
 
-export function setCurrentBottomTab(tab: TabType) {
-  messagesState.currentBottomTab = tab;
-  saveWebviewState();
-}
-
 export function requestMessageJump(messageId: string): void {
   const normalized = typeof messageId === 'string' ? messageId.trim() : '';
   if (!normalized) return;
@@ -2032,10 +2024,6 @@ export function setCurrentSessionId(id: string | null) {
     resetNotificationCenterStatus();
   }
   if (hasChanged) {
-    // 底部 worker 面板是“当前会话内的执行细节视图”，不能跨会话继承。
-    // 否则用户从上一会话停留在 worker tab，新会话会直接落到 worker 面板，
-    // 造成“主线/worker 边界混淆”的产品错觉。
-    messagesState.currentBottomTab = 'thread';
     resetSessionScopedExecutionState();
     // 会话切换时消息内容以后端分页快照为唯一真相源。
     // 本地只恢复滚动/定位等轻量视图状态，避免旧 session 的主线或 worker 内容短暂残留。
@@ -2985,7 +2973,6 @@ export function initializeState() {
     }
     // Tab 状态不持久化，每次打开都默认显示主对话 tab
     messagesState.currentTopTab = 'thread';
-    messagesState.currentBottomTab = 'thread';
     replaceTimelineNodes([]);
     sessionViewStateBySession = normalizePersistedSessionViewStateMap(persisted.sessionViewStateBySession);
     sessionQueuedMessagesBySession = normalizePersistedQueuedMessageMap(persisted.sessionQueuedMessagesBySession);

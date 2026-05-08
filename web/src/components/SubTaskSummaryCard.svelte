@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { WorkerRuntimeStatus } from '../lib/worker-panel-state';
   import type { CardWorkerStatus, WorkerTaskCardData } from '../lib/worker-card-view-model';
-  import { getState, getEnabledAgents, setCurrentBottomTab } from '../stores/messages.svelte';
+  import { getState, getEnabledAgents } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
   import { getAgentVisualInfo } from '../lib/agent-colors';
@@ -273,34 +273,13 @@
   });
 
 
-
-
-  const targetWorkerTab = $derived.by(() => (
-    normalizeText(resolveWorkerRoleSource(normalizeText(card.workerTabId), enabledAgents, registrySnapshot)?.templateId)
-    || normalizeText(card.workerTabId)
-    || displayWorkerId
-  ));
-
-  const isClickable = $derived(targetWorkerTab !== 'orchestrator' && targetWorkerTab.length > 0);
-
-  function openWorkerTab() {
-    if (!isClickable) {
-      return;
-    }
-    setCurrentBottomTab(targetWorkerTab);
-  }
 </script>
 
-<button
-  type="button"
+<article
   class="worker-progress-card"
   class:compact
-  class:is-clickable={isClickable}
   data-worker={rawWorker}
   data-status={currentStatus}
-  onclick={openWorkerTab}
-  disabled={!isClickable}
-  aria-label={isClickable ? i18n.t('subTaskSummaryCard.clickToView', { workerLabel: workerDisplayName }) : undefined}
 >
   <div class="worker-progress-card__accent" style={`background:${visualInfo.color};`} aria-hidden="true"></div>
 
@@ -406,7 +385,7 @@
       </div>
     {/if}
   </div>
-</button>
+</article>
 
 <style>
   .worker-progress-card {
@@ -421,16 +400,6 @@
     color: inherit;
     overflow: hidden;
     transition: border-color 0.18s ease, background 0.18s ease, transform 0.18s ease;
-  }
-
-  .worker-progress-card:disabled {
-    cursor: default;
-    opacity: 1;
-  }
-
-  .worker-progress-card.is-clickable:not(:disabled):hover {
-    border-color: var(--primary);
-    background: color-mix(in srgb, var(--assistant-message-bg) 88%, var(--primary) 12%);
   }
 
   .worker-progress-card__accent {

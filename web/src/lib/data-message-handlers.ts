@@ -987,7 +987,7 @@ function handleWorkerQuestionRequest(_message: ClientBridgeMessage) {
 
 /**
  * 处理 Worker 状态更新消息
- * 将检测到的模型状态同步到全局 store，供 BottomTabs 和 SettingsPanel 共用
+ * 将检测到的模型状态同步到全局 store，供设置和执行状态共用
  */
 function handleWorkerStatusUpdate(message: ClientBridgeMessage) {
   const statuses = message.statuses as ModelStatusMap;
@@ -995,8 +995,8 @@ function handleWorkerStatusUpdate(message: ClientBridgeMessage) {
 
   const store = getState();
 
-  // 直接存储完整的状态信息，不再简化
-  // 这样 BottomTabs 和 SettingsPanel 可以使用同一个数据源
+  // 直接存储完整的状态信息，不再简化。
+  // 设置面板和任务执行状态使用同一个数据源。
   store.modelStatus = { ...store.modelStatus, ...statuses };
 }
 
@@ -1025,7 +1025,7 @@ function handleSettingsBootstrapLoaded(message: ClientBridgeMessage) {
 /**
  * 处理连接测试结果消息（全局）
  * 将连接测试的状态同步到全局 store，确保即使 SettingsPanel 已卸载，
- * BottomTabs 等其他组件也能获取最新状态。
+ * 任务执行状态等其他组件也能获取最新状态。
  */
 function handleConnectionTestResult(message: ClientBridgeMessage) {
   const store = getState();

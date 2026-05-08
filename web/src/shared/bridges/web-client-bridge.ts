@@ -1747,8 +1747,8 @@ async function dispatchRegistryAgents(): Promise<void> {
       registryEngines: engines,
     });
   } catch (err) {
-    // Registry 加载失败不阻断主流程，BottomTabs 会基于已启用角色与主线 projection 继续渲染
-    console.warn('[web-client-bridge] Registry agents 加载失败，Tab 将使用引擎 fallback', err);
+    // Registry 加载失败不阻断主流程，任务执行展示会基于已启用角色继续渲染
+    console.warn('[web-client-bridge] Registry agents 加载失败，执行展示将使用引擎 fallback', err);
   }
 }
 

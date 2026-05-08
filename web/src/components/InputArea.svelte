@@ -3,32 +3,21 @@
   import { vscode } from '../lib/vscode-bridge';
   import {
     addToast,
-    clearTaskComposerDraft,
     getActiveInteractionType,
     getQueuedMessages,
     markQueuedMessageAsGuide,
     messagesState,
-    type TaskComposerDraft,
   } from '../stores/messages.svelte';
-  import { getTaskGraphState, refreshTaskProjection, selectTaskGraphTask } from '../stores/task-graph-store.svelte';
+  import { getTaskGraphState, refreshTaskProjection } from '../stores/task-graph-store.svelte';
   import type { StandardMessage } from '../shared/protocol/message-protocol';
   import { MessageCategory } from '../shared/protocol/message-protocol';
-  import type { SessionIntakeResponseDto, TaskDto } from '../shared/rust-backend-types';
+  import type { SessionIntakeResponseDto } from '../shared/rust-backend-types';
   import { RustDaemonClient } from '../shared/rust-daemon-client';
   import { resolveAgentBaseUrl } from '../web/agent-api';
   import Icon from './Icon.svelte';
-  import { generateId, ensureArray } from '../lib/utils';
+  import { generateId } from '../lib/utils';
   import { i18n } from '../stores/i18n.svelte';
-  import { getTaskDisplayGoal, getTaskDisplayTitle, getTaskKindLabel, getTaskStatusLabel } from '../lib/task-labels';
-  import { isTaskIntakeTargetTask, isTaskProjectionAcceptingIntake } from '../lib/task-projection-state';
-
-  // 技能类型
-  interface InstructionSkill {
-    name: string;
-    fullName?: string;
-    description?: string;
-    userInvocable?: boolean;
-  }
+  import { isTaskProjectionAcceptingIntake } from '../lib/task-projection-state';
 
   interface SelectedImage {
     id: string;
@@ -36,37 +25,8 @@
     name: string;
   }
 
-  interface IntakeTaskOption {
-    taskId: string;
-    label: string;
-    title: string;
-  }
-
   // 输入内容
   let inputValue = $state('');
-  let appliedTaskComposerDraft = $state<TaskComposerDraft | null>(null);
-
-  // 技能下拉列表状态
-  let skillDropdownOpen = $state(false);
-  let skillsConfig = $state<any>(null);
-  let skillSearchQuery = $state('');
-  // 已选中的技能（徽章卡片）
-  let selectedSkill = $state<InstructionSkill | null>(null);
-
-  const instructionSkills = $derived.by(() => {
-    return ensureArray<InstructionSkill>(skillsConfig?.instructionSkills)
-      .filter(s => s.userInvocable !== false);
-  });
-
-  const filteredSkills = $derived.by(() => {
-    if (!skillSearchQuery.trim()) return instructionSkills;
-    const q = skillSearchQuery.toLowerCase();
-    return instructionSkills.filter(s =>
-      (s.name || '').toLowerCase().includes(q) ||
-      (s.fullName || '').toLowerCase().includes(q) ||
-      (s.description || '').toLowerCase().includes(q)
-    );
-  });
 
   // 拖动调整大小相关
   let inputHeight = $state(120); // 默认高度增加到 120px
@@ -75,8 +35,6 @@
 
   // 深度任务模式
   let deepTaskEnabled = $state(false);
-  // 增强按钮状态
-  let isEnhancing = $state(false);
 
   // 🔧 图片上传相关状态
   let selectedImages = $state<SelectedImage[]>([]);
@@ -105,34 +63,7 @@
     }
     return projection.root_task?.task_id ?? taskGraph.rootTaskId ?? null;
   });
-  const intakeTaskOptions = $derived.by((): IntakeTaskOption[] => {
-    const projection = taskGraph.projection;
-    if (!projection) return [];
-    const seen = new Set<string>();
-    return projection.tasks
-      .filter((task) => {
-        if (seen.has(task.task_id)) return false;
-        seen.add(task.task_id);
-        return isTaskIntakeTargetTask(task, projection);
-      })
-      .map((task) => ({
-        taskId: task.task_id,
-        label: formatIntakeTaskOptionLabel(task),
-        title: `${getTaskDisplayTitle(task)}\n${getTaskDisplayGoal(task) || task.task_id}`,
-      }));
-  });
-  const intakeContextTaskId = $derived.by(() => {
-    const available = new Set(intakeTaskOptions.map((option) => option.taskId));
-    const selectedTaskId = taskGraph.selectedTaskId?.trim();
-    if (selectedTaskId && available.has(selectedTaskId)) {
-      return selectedTaskId;
-    }
-    return defaultIntakeContextTaskId;
-  });
-  const showIntakeTaskTargetBar = $derived(shouldUseIntake && intakeTaskOptions.length > 0);
-  const selectedIntakeTaskOption = $derived.by(() => (
-    intakeTaskOptions.find((option) => option.taskId === intakeContextTaskId) ?? null
-  ));
+  const intakeContextTaskId = $derived(defaultIntakeContextTaskId);
   const shouldPauseTaskGraphFromComposer = $derived.by(() => {
     const projection = taskGraph.projection;
     const sessionId = currentSessionId?.trim();
@@ -165,7 +96,6 @@
   ));
   // 按钮双态状态 - 使用 $derived 计算
   const hasContent = $derived.by(() => {
-    if (selectedSkill) return true;
     if (inputValue.trim().length > 0) return true;
     // 执行中补充指令不支持图片，避免"有内容可发送"与实际能力不一致
     if (isSending) return false;
@@ -175,7 +105,6 @@
   function clearComposerState() {
     inputValue = '';
     selectedImages = [];
-    selectedSkill = null;
   }
 
   function resolveComposerRawContent(): string {
@@ -210,22 +139,13 @@
     ].includes(text);
   }
 
-  function formatIntakeTaskOptionLabel(task: TaskDto): string {
-    return `${getTaskKindLabel(task.kind)} · ${getTaskDisplayTitle(task)} · ${getTaskStatusLabel(task.status)}`;
-  }
-
-  function selectIntakeTaskTarget(event: Event) {
-    const select = event.currentTarget as HTMLSelectElement | null;
-    selectTaskGraphTask(currentSessionId, select?.value ?? null);
-  }
-
   // 发送消息（支持图片附件）
   // 运行中再次发送不会打断当前轮，而是按当前 session 的队列/引导模式串行提交。
   async function sendMessage() {
     const rawContent = resolveComposerRawContent();
     const normalizedContent = rawContent.trim();
-    // 允许只发送图片（无文字）或只发送文字，或只发送已选技能
-    if ((!normalizedContent && !selectedSkill && selectedImages.length === 0) || isInteractionBlocking) return;
+    // 允许只发送图片（无文字）或只发送文字。
+    if ((!normalizedContent && selectedImages.length === 0) || isInteractionBlocking) return;
     if ((isSending || shouldUseIntake) && selectedImages.length > 0) {
       addToast('warning', i18n.t('input.noImageDuringExecution'));
       return;
@@ -253,7 +173,7 @@
       text: submissionText,
       requestId,
       deepTask: deepTaskEnabled,
-      skillName: selectedSkill?.name ?? null,
+      skillName: null,
       followUpMode: isSending ? 'queue' : undefined,
       images: selectedImages.map((img) => ({
         name: img.name,
@@ -354,11 +274,6 @@
       sendMessage();
       return;
     }
-    // 输入框为空时按 Backspace 删除技能徽章
-    if (event.key === 'Backspace' && !inputValue && selectedSkill) {
-      event.preventDefault();
-      selectedSkill = null;
-    }
   }
 
   // 任务图运行时，输入框停止入口与任务面板共用同一条暂停链路。
@@ -397,43 +312,6 @@
     });
   }
 
-  function focusInputTextareaToEnd() {
-    requestAnimationFrame(() => {
-      inputTextareaEl?.focus();
-      const length = inputTextareaEl?.value.length || 0;
-      inputTextareaEl?.setSelectionRange(length, length);
-    });
-  }
-
-  $effect(() => {
-    const draft = messagesState.taskComposerDraft;
-    if (!draft || draft === appliedTaskComposerDraft) return;
-    appliedTaskComposerDraft = draft;
-    inputValue = draft.text;
-    if (draft.taskId) {
-      selectTaskGraphTask(currentSessionId, draft.taskId);
-    }
-    clearTaskComposerDraft();
-    focusInputTextareaToEnd();
-  });
-
-  // 增强提示词 - 直接替换输入框内容
-  function enhancePrompt() {
-    const content = inputValue.trim();
-    if (!content || isEnhancing) return;
-    isEnhancing = true;
-    vscode.postMessage({ type: 'enhancePrompt', prompt: content });
-  }
-
-  // 切换深度任务模式
-  function toggleDeepTask() {
-    deepTaskEnabled = !deepTaskEnabled;
-    vscode.postMessage({ type: 'updateSetting', key: 'deepTask', value: deepTaskEnabled });
-    addToast('info', deepTaskEnabled
-      ? i18n.t('input.deepModeEnabled')
-      : i18n.t('input.deepModeDisabled'));
-  }
-
   // 拖动调整大小
   function startResize(event: MouseEvent) {
     const startY = event.clientY;
@@ -452,35 +330,6 @@
 
     document.addEventListener('mousemove', onMouseMove);
     document.addEventListener('mouseup', onMouseUp);
-  }
-
-  // 打开/关闭技能下拉列表
-  function toggleSkillDropdown() {
-    if (skillDropdownOpen) {
-      skillDropdownOpen = false;
-      skillSearchQuery = '';
-      return;
-    }
-    skillDropdownOpen = true;
-    skillSearchQuery = '';
-  }
-
-  function closeSkillDropdown() {
-    skillDropdownOpen = false;
-    skillSearchQuery = '';
-  }
-
-  // 选中技能：设置徽章，不修改输入文本
-  function selectSkill(skill: InstructionSkill) {
-    selectedSkill = skill;
-    closeSkillDropdown();
-    // 聚焦输入框
-    focusInputTextareaToEnd();
-  }
-
-  // 清除技能徽章
-  function clearSkillBadge() {
-    selectedSkill = null;
   }
 
   // 🔧 处理粘贴事件（支持图片粘贴）
@@ -547,27 +396,10 @@
       const standard = msg.message as StandardMessage;
       if (!standard || standard.category !== MessageCategory.DATA || !standard.data) return;
 
-      // 提示词增强响应
-      if (standard.data.dataType === 'promptEnhanced') {
-        const payload = standard.data.payload as { enhancedPrompt?: string; error?: string };
-        isEnhancing = false;
-        if (payload?.error) {
-          addToast('error', payload.error);
-        } else {
-          const enhancedPrompt = typeof payload?.enhancedPrompt === 'string' ? payload.enhancedPrompt : '';
-          if (enhancedPrompt) {
-            inputValue = enhancedPrompt;
-            addToast('success', i18n.t('input.promptEnhanced'));
-          }
-        }
-      }
-
       if (standard.data.dataType === 'settingsBootstrapLoaded') {
         const payload = standard.data.payload as {
-          skillsConfig?: any;
           runtimeSettings?: { deepTask?: boolean };
         };
-        skillsConfig = payload?.skillsConfig || null;
         if (typeof payload?.runtimeSettings?.deepTask === 'boolean') {
           deepTaskEnabled = payload.runtimeSettings.deepTask;
         }
@@ -620,39 +452,6 @@
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="ia-resize" onmousedown={startResize}></div>
 
-    <!-- 技能徽章 -->
-    {#if selectedSkill}
-      <div class="ia-skill-badge-bar">
-        <span class="ia-skill-badge">
-          <Icon name="skill" size={11} />
-          <span class="ia-skill-badge-name">/{selectedSkill.name}</span>
-          <button class="ia-skill-badge-remove" onclick={clearSkillBadge} title={i18n.t('input.removeSkill')}>
-            <Icon name="close" size={9} />
-          </button>
-        </span>
-      </div>
-    {/if}
-
-    {#if showIntakeTaskTargetBar}
-      <div class="ia-task-target-bar">
-        <span class="ia-task-target-label">
-          <Icon name="target" size={11} />
-          <span>目标任务</span>
-        </span>
-        <select
-          class="ia-task-target-select"
-          value={intakeContextTaskId ?? ''}
-          onchange={selectIntakeTaskTarget}
-          title={selectedIntakeTaskOption?.title || '目标任务'}
-          aria-label="目标任务"
-        >
-          {#each intakeTaskOptions as option (option.taskId)}
-            <option value={option.taskId}>{option.label}</option>
-          {/each}
-        </select>
-      </div>
-    {/if}
-
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <textarea
       bind:value={inputValue}
@@ -660,12 +459,9 @@
       class="ia-textarea"
       data-testid="input-textarea"
       class:has-images={selectedImages.length > 0}
-      class:has-badge={!!selectedSkill}
-      placeholder={selectedSkill
-        ? i18n.t('input.placeholderWithSkill', { skillName: selectedSkill.name })
-        : selectedImages.length > 0
-          ? i18n.t('input.placeholderWithImages')
-          : i18n.t('input.placeholderDefault')}
+      placeholder={selectedImages.length > 0
+        ? i18n.t('input.placeholderWithImages')
+        : i18n.t('input.placeholderDefault')}
       disabled={sessionInputLocked || isInteractionBlocking}
       onkeydown={handleKeydown}
       onpaste={handlePaste}
@@ -689,80 +485,9 @@
     {/if}
 
     <div class="ia-actions">
-      <div class="ia-left">
-        <!-- 技能下拉选择器 -->
-        <div class="ia-skill-wrap">
-          <button
-            class="ia-icon-btn"
-            onclick={toggleSkillDropdown}
-            title={i18n.t('input.useSkill')}
-          >
-            <Icon name="skill" size={14} />
-          </button>
-          {#if skillDropdownOpen}
-            <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
-            <div class="ia-skill-backdrop" role="presentation" onclick={closeSkillDropdown}></div>
-            <div class="ia-skill-menu">
-              <div class="ia-skill-search">
-                <input
-                  type="text"
-                  bind:value={skillSearchQuery}
-                  placeholder={i18n.t('input.searchSkill')}
-                  class="ia-skill-search-input"
-                />
-              </div>
-              <div class="ia-skill-list">
-                {#if filteredSkills.length === 0}
-                  <div class="ia-skill-empty">{i18n.t('input.noSkills')}</div>
-                {:else}
-                  {#each filteredSkills as skill (skill.name)}
-                    <button
-                      class="ia-skill-item"
-                      onclick={() => selectSkill(skill)}
-                      title={skill.description || skill.name}
-                    >
-                      <span class="ia-skill-name">/{skill.name}</span>
-                      {#if skill.description}
-                        <span class="ia-skill-desc">{skill.description}</span>
-                      {/if}
-                    </button>
-                  {/each}
-                {/if}
-              </div>
-            </div>
-          {/if}
-        </div>
-
-        <!-- 深度任务模式开关 -->
-        <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-        <button
-          class="ia-deep-btn"
-          class:active={deepTaskEnabled}
-          onclick={toggleDeepTask}
-          title={deepTaskEnabled
-            ? i18n.t('input.deepModeActive')
-            : i18n.t('input.deepModeInactive')}
-        >
-          <Icon name="infinity" size={12} />
-          <span class="ia-deep-label">{i18n.t('input.deepLabel')}</span>
-        </button>
-
-      </div>
+      <div class="ia-left" aria-hidden="true"></div>
 
       <div class="ia-right">
-        <!-- 增强：纯图标 -->
-        <button
-          class="ia-icon-btn ia-enhance"
-          class:enhancing={isEnhancing}
-          onclick={enhancePrompt}
-          title={isEnhancing ? i18n.t('input.enhancing') : i18n.t('input.enhancePrompt')}
-          disabled={!inputValue.trim() || isEnhancing}
-        >
-          <span class:spinning={isEnhancing}>
-            <Icon name={isEnhancing ? 'loader' : 'enhance'} size={14} />
-          </span>
-        </button>
-
         {#if isSending}
           {#if hasContent}
             <button
@@ -891,90 +616,6 @@
   .ia-textarea::placeholder { color: var(--foreground-muted); }
   .ia-textarea:disabled { opacity: 0.5; cursor: not-allowed; }
   .ia-textarea.has-images { min-height: 36px; }
-  .ia-textarea.has-badge { padding-top: 2px; }
-
-  /* 技能徽章栏 */
-  .ia-skill-badge-bar {
-    display: flex;
-    align-items: center;
-    padding: 6px var(--space-2) 0;
-    flex-shrink: 0;
-  }
-
-  .ia-skill-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 2px 4px 2px 6px;
-    background: var(--surface-1);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-full);
-    font-size: 11px;
-    font-weight: var(--font-medium);
-    color: var(--foreground);
-    line-height: 1;
-    max-width: 100%;
-  }
-
-  .ia-skill-badge-name {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .ia-skill-badge-remove {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 16px;
-    height: 16px;
-    padding: 0;
-    background: transparent;
-    border: none;
-    border-radius: var(--radius-full);
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: opacity var(--transition-fast), background var(--transition-fast);
-    flex-shrink: 0;
-  }
-  .ia-skill-badge-remove:hover { color: var(--error); background: var(--error-muted); }
-
-  .ia-task-target-bar {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    padding: 6px var(--space-2) 0;
-    flex-shrink: 0;
-  }
-
-  .ia-task-target-label {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    flex-shrink: 0;
-    font-size: var(--text-2xs);
-    color: var(--foreground-muted);
-    white-space: nowrap;
-  }
-
-  .ia-task-target-select {
-    min-width: 0;
-    flex: 1;
-    height: 28px;
-    padding: 0 var(--space-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    background: var(--surface-1);
-    color: var(--foreground);
-    font: inherit;
-    font-size: var(--text-xs);
-    outline: none;
-  }
-
-  .ia-task-target-select:focus {
-    border-color: var(--primary);
-    box-shadow: 0 0 0 2px var(--primary-muted);
-  }
 
   /* 操作栏 */
   .ia-actions {
@@ -992,160 +633,6 @@
     align-items: center;
     gap: 4px;
   }
-
-  /* 通用图标按钮：26px 圆形 */
-  .ia-icon-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 26px;
-    height: 26px;
-    padding: 0;
-    background: transparent;
-    border: none;
-    border-radius: var(--radius-full);
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: background var(--transition-fast), color var(--transition-fast);
-  }
-
-  .ia-icon-btn:hover { background: var(--surface-hover); color: var(--foreground); }
-  .ia-icon-btn:disabled { opacity: 0.35; cursor: not-allowed; }
-
-  /* 增强按钮特殊状态 */
-  .ia-enhance.enhancing { color: var(--info); }
-  .ia-enhance .spinning { animation: ia-spin 1s linear infinite; display: flex; }
-  @keyframes ia-spin { to { transform: rotate(360deg); } }
-
-  /* 技能下拉选择器 */
-  .ia-skill-wrap {
-    position: relative;
-  }
-
-  .ia-skill-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 50;
-  }
-
-  .ia-skill-menu {
-    position: absolute;
-    bottom: calc(100% + 8px);
-    left: 0;
-    width: 260px;
-    max-height: 320px;
-    background: var(--glass-bg);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-xl);
-    box-shadow: var(--shadow-xl);
-    z-index: var(--z-dropdown);
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-
-  .ia-skill-search {
-    flex-shrink: 0;
-    padding: 6px;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .ia-skill-search-input {
-    width: 100%;
-    padding: 4px 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground);
-    font-size: 11px;
-    outline: none;
-  }
-  .ia-skill-search-input:focus { border-color: var(--primary); }
-  .ia-skill-search-input::placeholder { color: var(--foreground-muted); }
-
-  .ia-skill-list {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-    padding: 3px;
-    display: flex;
-    flex-direction: column;
-  }
-
-  .ia-skill-item {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    padding: 8px 10px;
-    background: transparent;
-    border: none;
-    border-radius: var(--radius-md);
-    cursor: pointer;
-    text-align: left;
-    color: var(--foreground);
-    transition: background var(--transition-fast);
-  }
-  .ia-skill-item:hover { background: var(--surface-hover); }
-
-  .ia-skill-name {
-    font-size: 12px;
-    font-weight: var(--font-medium);
-    color: var(--primary);
-  }
-
-  .ia-skill-desc {
-    font-size: 10px;
-    color: var(--foreground-muted);
-    line-height: 1.3;
-    display: -webkit-box;
-    -webkit-line-clamp: 1;
-    line-clamp: 1;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-  }
-
-  .ia-skill-empty {
-    padding: var(--space-3);
-    text-align: center;
-    color: var(--foreground-muted);
-    font-size: 11px;
-  }
-
-  /* 深度任务模式按钮 */
-  .ia-deep-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 3px;
-    height: 24px;
-    padding: 0 8px;
-    font-size: 10px;
-    font-weight: var(--font-semibold);
-    background: transparent;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-full);
-    color: var(--foreground-muted);
-    cursor: pointer;
-    user-select: none;
-    flex-shrink: 0;
-    transition: all var(--transition-fast);
-    white-space: nowrap;
-  }
-
-  .ia-deep-btn:hover { border-color: var(--foreground-muted); color: var(--foreground); }
-
-  .ia-deep-btn.active {
-    background: color-mix(in srgb, var(--primary) 15%, transparent);
-    border-color: var(--primary);
-    color: var(--primary);
-  }
-
-  .ia-deep-btn.active:hover {
-    background: color-mix(in srgb, var(--primary) 22%, transparent);
-  }
-
-  .ia-deep-label { pointer-events: none; }
 
   /* 发送按钮：圆形 */
   .ia-send {
