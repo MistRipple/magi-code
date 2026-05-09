@@ -64,8 +64,6 @@ import type {
   SessionRenameRequestDto,
   SessionSaveRequestDto,
   SessionStatsResponseDto,
-  SessionIntakeRequestDto,
-  SessionIntakeResponseDto,
   SessionTurnRequestDto,
   SessionTurnResponseDto,
   SettingsUpdateRequestDto,
@@ -145,12 +143,6 @@ export class RustDaemonClient {
     request: SessionTurnRequestDto,
   ): Promise<SessionTurnResponseDto> {
     return this.postJson<SessionTurnResponseDto>('/api/session/turn', request);
-  }
-
-  public async postIntake(
-    request: SessionIntakeRequestDto,
-  ): Promise<SessionIntakeResponseDto> {
-    return this.postJson<SessionIntakeResponseDto>('/api/session/intake', request);
   }
 
   public async continueSession(

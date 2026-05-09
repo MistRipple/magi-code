@@ -21,7 +21,12 @@ export interface SessionTurnImageDto {
   dataUrl: string;
 }
 
-export type SessionTurnRouteDto = 'chat' | 'execute' | 'task' | 'continue';
+export type SessionTurnRouteDto =
+  | 'chat'
+  | 'execute'
+  | 'task'
+  | 'continue'
+  | 'supplement_context';
 
 export interface SessionTurnRequestDto {
   sessionId?: string | null;
@@ -32,6 +37,10 @@ export interface SessionTurnRequestDto {
   requestId?: string | null;
   userMessageId?: string | null;
   placeholderMessageId?: string | null;
+  /** 当为 true 时，本次 turn 直接作为补充上下文写入当前任务，不进入分类器。 */
+  supplementContext?: boolean;
+  /** 当 supplementContext 为 true 时，可选指定写入哪个上下文任务。 */
+  contextTaskId?: string | null;
 }
 
 export interface SessionTurnResponseDto {
@@ -48,6 +57,10 @@ export interface SessionTurnResponseDto {
   executionChainRef?: string | null;
   /** 后端生成的用户消息 turnItemId，前端应使用此 ID 创建 canonical 节点 */
   userMessageItemId?: string | null;
+  /** 仅在 supplement_context 路由下返回：本次写入的上下文引用 ID。 */
+  contextRef?: string | null;
+  /** 仅在 supplement_context 路由下返回：被写入的上下文任务 ID。 */
+  contextTaskId?: string | null;
 }
 
 export interface TaskInterruptResponseDto {
@@ -1339,45 +1352,3 @@ export interface TaskReplanResponseDto {
   cancelledTaskIds: string[];
 }
 
-// ─── Intake (design 8) ──────────────────────────────────────────────
-
-export interface SessionIntakeRequestDto {
-  sessionId?: string | null;
-  message: string;
-  contextTaskId?: string | null;
-  forceSupplementContext?: boolean;
-}
-
-export type IntakeClassificationDto =
-  | 'decision_answer'
-  | 'pause'
-  | 'replan'
-  | 'supplement_context'
-  | 'append_task'
-  | 'new_objective'
-  | 'general_chat';
-
-export interface SessionIntakeResponseDto {
-  classification: IntakeClassificationDto;
-  /** DecisionAnswer */
-  resolved?: boolean;
-  decisionTaskId?: string;
-  chosenOption?: string;
-  reason?: string;
-  /** Pause */
-  paused?: boolean;
-  rootTaskId?: string;
-  pausedTaskId?: string;
-  contextTaskId?: string;
-  /** Replan */
-  replan?: boolean;
-  targetTaskId?: string;
-  cancelledTaskIds?: string[];
-  /** SupplementContext */
-  contextRef?: string;
-  content?: string;
-  note?: string;
-  /** AppendTask */
-  addedTaskId?: string;
-  parentTaskId?: string;
-}

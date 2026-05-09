@@ -30,6 +30,14 @@ pub struct SessionTurnRequestDto {
     pub user_message_id: Option<String>,
     #[serde(alias = "placeholder_message_id")]
     pub placeholder_message_id: Option<String>,
+    /// 当为 true 时，本次 turn 直接作为补充上下文写入当前任务，
+    /// 不进入分类器，也不创建新任务。
+    #[serde(default, alias = "supplement_context")]
+    pub supplement_context: bool,
+    /// 当 `supplement_context` 为 true 时，可选指定写入哪个上下文任务；
+    /// 缺省回退到当前 mission 的 root task。
+    #[serde(default, alias = "context_task_id")]
+    pub context_task_id: Option<String>,
 }
 
 impl SessionTurnRequestDto {
@@ -89,12 +97,13 @@ impl SessionTurnRequestDto {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum SessionTurnRouteDto {
     Chat,
     Execute,
     Task,
     Continue,
+    SupplementContext,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -122,6 +131,12 @@ pub struct SessionTurnResponseDto {
     pub canonical_turn: Option<CanonicalTurn>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical_item: Option<CanonicalTurnItem>,
+    /// 仅在 supplement_context 路由下返回：本次写入的上下文引用 ID。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_ref: Option<String>,
+    /// 仅在 supplement_context 路由下返回：被写入的上下文任务 ID。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_task_id: Option<String>,
 }
 
 impl SessionTurnResponseDto {
@@ -152,7 +167,19 @@ impl SessionTurnResponseDto {
             canonical_event_kind: None,
             canonical_turn: None,
             canonical_item: None,
+            context_ref: None,
+            context_task_id: None,
         }
+    }
+
+    pub fn with_supplement_context(
+        mut self,
+        context_ref: String,
+        context_task_id: String,
+    ) -> Self {
+        self.context_ref = Some(context_ref);
+        self.context_task_id = Some(context_task_id);
+        self
     }
 
     pub fn with_canonical_event(
@@ -203,6 +230,8 @@ mod tests {
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
+            supplement_context: false,
+            context_task_id: None,
         };
 
         assert_eq!(

@@ -55,7 +55,6 @@ import {
   saveAgentSafeguardConfig,
   saveAgentSkillsConfig,
   saveAgentWorkerConfig,
-  submitSessionIntake,
   submitSessionTurn,
   revertAgentChange,
   revertAgentExecutionGroupChanges,
@@ -2247,9 +2246,10 @@ async function submitQueuedGuidance(next: QueuedMessage): Promise<boolean> {
 
   try {
     await ensureFreshLiveBridge('queued_guidance_preflight');
-    await submitSessionIntake({
-      message: text,
-      forceSupplementContext: true,
+    await submitSessionTurn({
+      text,
+      images: [],
+      supplementContext: true,
     }, {
       workspaceId: currentWorkspaceId,
       workspacePath: currentWorkspacePath,

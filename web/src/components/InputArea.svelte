@@ -8,9 +8,8 @@
     messagesState,
   } from '../stores/messages.svelte';
   import { getTaskGraphState, refreshTaskProjection } from '../stores/task-graph-store.svelte';
-  import type { SessionIntakeResponseDto } from '../shared/rust-backend-types';
   import { RustDaemonClient } from '../shared/rust-daemon-client';
-  import { resolveAgentBaseUrl } from '../web/agent-api';
+  import { resolveAgentBaseUrl, submitSessionTurn } from '../web/agent-api';
   import Icon from './Icon.svelte';
   import Modal from './Modal.svelte';
   import { generateId } from '../lib/utils';
@@ -236,52 +235,20 @@
     if (intakeLoading) return;
     intakeLoading = true;
     try {
-      const client = new RustDaemonClient(resolveAgentBaseUrl());
-      const response = await client.postIntake({
-        sessionId: messagesState.currentSessionId,
-        message,
+      await submitSessionTurn({
+        text: message,
+        images: [],
+        supplementContext: true,
         contextTaskId: intakeContextTaskId,
       });
-      handleIntakeResponse(response);
+      addToast('success', '补充上下文已接收');
       await refreshTaskProjection(messagesState.currentSessionId);
       clearComposerState();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      addToast('error', `Intake 失败: ${msg}`);
+      addToast('error', `补充上下文失败: ${msg}`);
     } finally {
       intakeLoading = false;
-    }
-  }
-
-  function handleIntakeResponse(response: SessionIntakeResponseDto) {
-    switch (response.classification) {
-      case 'decision_answer':
-        if (response.resolved) {
-          addToast('success', `已确认选择: ${response.chosenOption}`);
-        } else {
-          addToast('warning', response.reason || '没有待处理的决策任务');
-        }
-        break;
-      case 'pause':
-        addToast('info', '任务已停止，进度已保存');
-        break;
-      case 'replan':
-        addToast('info', `已触发重规划，取消 ${response.cancelledTaskIds?.length ?? 0} 个任务`);
-        break;
-      case 'supplement_context':
-        addToast('success', '补充上下文已接收');
-        break;
-      case 'append_task':
-        addToast('success', '已追加新任务');
-        break;
-      case 'new_objective':
-        addToast('info', response.note || '新目标请通过新 session 提交');
-        break;
-      case 'general_chat':
-        addToast('info', response.note || '普通聊天消息暂不写入任务图');
-        break;
-      default:
-        addToast('info', '输入已处理');
     }
   }
 

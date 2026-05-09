@@ -8,7 +8,7 @@ use magi_bridge_client::{
     LOOPBACK_MODEL_PROVIDER,
 };
 use magi_core::TaskStatus;
-use magi_core::{DomainError, EventId, SessionId, UtcMillis, WorkerId, WorkspaceId};
+use magi_core::{DomainError, EventId, MissionId, SessionId, Task, TaskId, UtcMillis, WorkerId, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn,
@@ -18,9 +18,11 @@ use magi_tool_runtime::BuiltinToolName;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use super::session_scope::{
-    require_current_session_record_in_workspace, require_session_record_in_workspace,
-    session_workspace_id,
+    parse_session_id, require_current_session_record_in_workspace,
+    require_session_record_in_workspace, session_workspace_id,
 };
 use crate::{
     dto::{
@@ -116,6 +118,9 @@ async fn submit_session_turn(
 ) -> Result<Json<SessionTurnResponseDto>, ApiError> {
     validate_session_turn_input(&request)?;
     let accepted_at = super::monotonic_accepted_at();
+    if request.supplement_context {
+        return submit_supplement_context_turn(&state, &request, accepted_at).map(Json);
+    }
     let decision = decide_session_turn_with_task_planner(&state, &request)?;
     match decision.route {
         SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute => {
@@ -148,6 +153,9 @@ async fn submit_session_turn(
                 execution_chain_ref,
                 Some(user_message_item_id),
             )))
+        }
+        SessionTurnRouteDto::SupplementContext => {
+            unreachable!("supplement_context route should be handled before classifier")
         }
         SessionTurnRouteDto::Continue => {
             let session_id = request
@@ -236,6 +244,98 @@ struct SessionTurnIntentDecision {
     reason_code: Option<String>,
     route_reason: Option<String>,
     task_evidence: Vec<String>,
+}
+
+static SUPPLEMENT_CONTEXT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn submit_supplement_context_turn(
+    state: &ApiState,
+    request: &SessionTurnRequestDto,
+    accepted_at: UtcMillis,
+) -> Result<SessionTurnResponseDto, ApiError> {
+    let message = request
+        .trimmed_text()
+        .ok_or_else(|| ApiError::InvalidInput("补充上下文消息不能为空".to_string()))?;
+    let session_id = parse_session_id(request.session_id.as_deref())?;
+    let store = state
+        .task_store()
+        .ok_or_else(|| ApiError::internal_assembly("supplement context", "task_store 未配置"))?;
+
+    let ownership = state
+        .session_store
+        .execution_ownership(&session_id)
+        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+    let mission_id = ownership
+        .mission_id
+        .ok_or_else(|| ApiError::InvalidInput("当前会话没有活跃任务链".to_string()))?;
+
+    let root_task = store
+        .get_tasks_by_mission(&mission_id)
+        .into_iter()
+        .find(|task| task.parent_task_id.is_none())
+        .ok_or_else(|| ApiError::InvalidInput("当前 Mission 没有根任务".to_string()))?;
+    let context_task =
+        resolve_supplement_context_task(store, &mission_id, &root_task, request.context_task_id.as_deref())?;
+    let context_task_id = context_task.task_id.clone();
+
+    let context_ref = format!(
+        "intake-context-{}-{}",
+        UtcMillis::now().0,
+        SUPPLEMENT_CONTEXT_COUNTER.fetch_add(1, Ordering::SeqCst)
+    );
+    store
+        .append_context_entry(&context_task_id, context_ref.clone(), message.clone())
+        .map_err(|error| ApiError::internal_assembly("补充上下文失败", error.to_string()))?;
+    let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
+    state.session_store.append_timeline_entry(
+        session_id.clone(),
+        TimelineEntryKind::UserMessage,
+        format!("[补充上下文] {}", message),
+    );
+    state.persist_session_durable_state()?;
+
+    let event_id = EventId::new(format!(
+        "event-session-supplement-context-{}-{}",
+        session_id, accepted_at.0
+    ));
+
+    Ok(SessionTurnResponseDto::new(
+        session_id,
+        entry_id,
+        event_id,
+        accepted_at,
+        false,
+        SessionTurnRouteDto::SupplementContext,
+        None,
+        None,
+        None,
+        None,
+    )
+    .with_supplement_context(context_ref, context_task_id.to_string()))
+}
+
+fn resolve_supplement_context_task(
+    store: &magi_orchestrator::task_store::TaskStore,
+    mission_id: &MissionId,
+    root_task: &Task,
+    context_task_id: Option<&str>,
+) -> Result<Task, ApiError> {
+    let Some(raw) = context_task_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(root_task.clone());
+    };
+    let task_id = TaskId::new(raw);
+    let task = store
+        .get_task(&task_id)
+        .ok_or_else(|| ApiError::InvalidInput(format!("上下文任务不存在: {raw}")))?;
+    if task.mission_id != *mission_id {
+        return Err(ApiError::InvalidInput(format!(
+            "任务 {raw} 不属于当前会话"
+        )));
+    }
+    Ok(task)
 }
 
 fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), ApiError> {
@@ -2110,6 +2210,8 @@ mod tests {
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
+            supplement_context: false,
+            context_task_id: None,
         }
     }
 
@@ -2279,6 +2381,8 @@ mod tests {
                 request_id: Some("request-canonical-first-frame".to_string()),
                 user_message_id: Some("user-canonical-first-frame".to_string()),
                 placeholder_message_id: Some("assistant-canonical-first-frame".to_string()),
+                supplement_context: false,
+                context_task_id: None,
             },
             accepted_at,
             SessionTurnIntentDecision {

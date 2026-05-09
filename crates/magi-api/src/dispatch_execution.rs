@@ -54,12 +54,6 @@ pub(crate) struct TaskGraphReplanResult {
     pub dispatch_task_ids: Vec<TaskId>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SessionExecutionBranchUpdateMode {
-    Append,
-    Replace,
-}
-
 #[derive(Clone, Debug)]
 struct SessionExecutionBranchSpec {
     task_id: TaskId,
@@ -1008,22 +1002,6 @@ pub(crate) fn ensure_session_active_execution_chain(
     ))
 }
 
-pub(crate) fn register_appended_task_execution_branch(
-    state: &ApiState,
-    session_id: &SessionId,
-    task_id: &TaskId,
-) -> Result<(), ApiError> {
-    update_session_execution_branches(
-        state,
-        session_id,
-        &[SessionExecutionBranchSpec {
-            task_id: task_id.clone(),
-            is_primary: false,
-        }],
-        SessionExecutionBranchUpdateMode::Append,
-    )
-}
-
 pub(crate) fn replace_replanned_task_execution_branches(
     state: &ApiState,
     session_id: &SessionId,
@@ -1041,19 +1019,13 @@ pub(crate) fn replace_replanned_task_execution_branches(
             is_primary: false,
         }
     }));
-    update_session_execution_branches(
-        state,
-        session_id,
-        &branch_specs,
-        SessionExecutionBranchUpdateMode::Replace,
-    )
+    update_session_execution_branches(state, session_id, &branch_specs)
 }
 
 fn update_session_execution_branches(
     state: &ApiState,
     session_id: &SessionId,
     branch_specs: &[SessionExecutionBranchSpec],
-    mode: SessionExecutionBranchUpdateMode,
 ) -> Result<(), ApiError> {
     if branch_specs.is_empty() {
         return Ok(());
@@ -1099,18 +1071,10 @@ fn update_session_execution_branches(
         .iter()
         .map(|spec| spec.task_id.clone())
         .collect::<std::collections::HashSet<_>>();
-    if mode == SessionExecutionBranchUpdateMode::Replace {
-        for task_id in existing_task_ids.difference(&new_task_ids) {
-            let _ = state.task_execution_registry().remove(task_id);
-        }
+    for task_id in existing_task_ids.difference(&new_task_ids) {
+        let _ = state.task_execution_registry().remove(task_id);
     }
 
-    let next_lane_seq = active_chain
-        .current_turn
-        .as_ref()
-        .and_then(|turn| turn.worker_lanes.iter().map(|lane| lane.lane_seq).max())
-        .unwrap_or(0)
-        .saturating_add(1);
     let mut appended_lane_count = 0usize;
     let mut new_branches = Vec::with_capacity(branch_specs.len());
     let mut new_lanes = Vec::new();
@@ -1137,11 +1101,7 @@ fn update_session_execution_branches(
         let lane_seq = if spec.is_primary {
             None
         } else {
-            let seq = if mode == SessionExecutionBranchUpdateMode::Replace {
-                appended_lane_count + 1
-            } else {
-                next_lane_seq + appended_lane_count
-            };
+            let seq = appended_lane_count + 1;
             appended_lane_count += 1;
             Some(seq)
         };
@@ -1207,17 +1167,7 @@ fn update_session_execution_branches(
         }
     }
 
-    match mode {
-        SessionExecutionBranchUpdateMode::Append => {
-            active_chain
-                .branches
-                .retain(|branch| !new_task_ids.contains(&branch.task_id));
-            active_chain.branches.extend(new_branches.clone());
-        }
-        SessionExecutionBranchUpdateMode::Replace => {
-            active_chain.branches = new_branches.clone();
-        }
-    }
+    active_chain.branches = new_branches.clone();
     active_chain.active_branch_task_ids = active_chain
         .branches
         .iter()
@@ -1230,23 +1180,14 @@ fn update_session_execution_branches(
         .collect();
 
     if let Some(turn) = active_chain.current_turn.as_mut() {
-        match mode {
-            SessionExecutionBranchUpdateMode::Append => {
-                turn.worker_lanes
-                    .retain(|lane| !new_task_ids.contains(&lane.task_id));
-                turn.worker_lanes.extend(new_lanes.clone());
-            }
-            SessionExecutionBranchUpdateMode::Replace => {
-                turn.worker_lanes = new_lanes.clone();
-                turn.items.retain(|item| {
-                    item.kind != "worker_spawned"
-                        || item
-                            .task_id
-                            .as_ref()
-                            .is_some_and(|task_id| new_task_ids.contains(task_id))
-                });
-            }
-        }
+        turn.worker_lanes = new_lanes.clone();
+        turn.items.retain(|item| {
+            item.kind != "worker_spawned"
+                || item
+                    .task_id
+                    .as_ref()
+                    .is_some_and(|task_id| new_task_ids.contains(task_id))
+        });
         let mut next_item_seq = turn
             .items
             .iter()
@@ -2105,6 +2046,8 @@ mod tests {
             user_message_id: None,
             placeholder_message_id: None,
             images: Vec::new(),
+            supplement_context: false,
+            context_task_id: None,
         };
 
         let result = run_session_action(
@@ -2738,6 +2681,8 @@ mod tests {
             user_message_id: None,
             placeholder_message_id: None,
             images: Vec::new(),
+            supplement_context: false,
+            context_task_id: None,
         };
 
         let submission = run_session_action(
@@ -2765,109 +2710,6 @@ mod tests {
                 .remove(&submission.action_task_id)
                 .is_some(),
             "action task should have a registered execution plan",
-        );
-    }
-
-    #[test]
-    fn intake_append_task_registers_execution_plan_and_worker_lane() {
-        let (state, task_store) = build_test_state();
-
-        let session_id = SessionId::new("session-intake-append-registers");
-        state
-            .session_store
-            .create_session(session_id.clone(), "intake append")
-            .expect("session should be creatable");
-
-        let accepted_at = UtcMillis::now();
-        let submission = run_dispatch_submission(
-            &state,
-            &DispatchSubmissionRequest {
-                accepted_at,
-                session_id: session_id.clone(),
-                workspace_id: None,
-                entry_id: "entry-intake-append".to_string(),
-                timeline_message: "初始任务".to_string(),
-                created_session: false,
-                mission_title: "初始任务".to_string(),
-                task_title: "执行: 初始任务".to_string(),
-                trimmed_text: Some("初始任务".to_string()),
-                execution_goal: Some("初始任务".to_string()),
-                skill_name: None,
-                target_role: None,
-                request_id: None,
-                user_message_id: None,
-                placeholder_message_id: None,
-            },
-        )
-        .expect("dispatch should create active chain");
-        state
-            .session_store
-            .upsert_active_execution_chain(
-                session_id.clone(),
-                submission
-                    .active_execution_chain
-                    .expect("active chain should exist"),
-            )
-            .expect("active chain should be stored");
-
-        let root_task = task_store
-            .get_task(&submission.root_task_id)
-            .expect("root task should exist");
-        let appended_task_id = TaskId::new("task-intake-appended");
-        task_store.insert_task(make_dispatch_task(
-            appended_task_id.clone(),
-            root_task.mission_id.clone(),
-            submission.root_task_id.clone(),
-            Some(submission.root_task_id.clone()),
-            TaskKind::Action,
-            "追加验证任务".to_string(),
-            "验证追加任务注册执行链".to_string(),
-            TaskStatus::Ready,
-            UtcMillis::now(),
-            Some("integration-dev"),
-            None,
-            root_task.policy_snapshot.clone(),
-        ));
-        task_store
-            .append_required_child(&submission.root_task_id, &appended_task_id)
-            .expect("child should be appended");
-
-        register_appended_task_execution_branch(&state, &session_id, &appended_task_id)
-            .expect("appended task should register execution branch");
-
-        assert!(
-            state
-                .task_execution_registry()
-                .remove(&appended_task_id)
-                .is_some(),
-            "追加任务必须注册 execution plan"
-        );
-        let sidecar = state
-            .session_store
-            .runtime_sidecar(&session_id)
-            .expect("sidecar should exist");
-        let chain = sidecar
-            .active_execution_chain
-            .expect("active chain should exist");
-        assert!(
-            chain.active_branch_task_ids.contains(&appended_task_id),
-            "追加任务必须进入 active branch 列表"
-        );
-        let turn = chain.current_turn.expect("current turn should exist");
-        assert!(
-            turn.worker_lanes
-                .iter()
-                .any(|lane| lane.task_id == appended_task_id
-                    && lane.role_id.as_deref() == Some("integration-dev")),
-            "追加任务必须进入 worker lane，并保留产品可见角色"
-        );
-        assert!(
-            turn.items.iter().any(|item| {
-                item.kind == "worker_spawned"
-                    && item.task_id.as_ref() == Some(&appended_task_id)
-                    && item.worker_visible
-            }),
-            "追加任务必须产生 worker 可见的步骤卡片事件"
         );
     }
 
@@ -3044,6 +2886,8 @@ mod tests {
             user_message_id: None,
             placeholder_message_id: None,
             images: Vec::new(),
+            supplement_context: false,
+            context_task_id: None,
         };
 
         let result = run_session_action(

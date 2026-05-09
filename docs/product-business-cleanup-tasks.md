@@ -33,8 +33,8 @@
 | P1 用户心智核心抽象 | 4 | 0 | 0 | 4 | 0 |
 | P2 业务能力收口 | 5 | 1 | 0 | 4 | 0 |
 | P3 任务系统产品表达 | 3 | 1 | 0 | 2 | 0 |
-| P4 链路边界收口 | 3 | 1 | 0 | 2 | 0 |
-| **合计** | **18** | **3** | **0** | **15** | **0** |
+| P4 链路边界收口 | 3 | 0 | 0 | 3 | 0 |
+| **合计** | **18** | **2** | **0** | **16** | **0** |
 
 ---
 
@@ -310,12 +310,21 @@
 ## P4 — 链路边界收口
 
 ### #16 合并 `/api/session/intake` 与 `/api/session/turn`
-- **状态**：⬜
+- **状态**：✅
+- **完成时间**：2026-05-09
 - **任务**：取消两个相似入口。
 - **建议**：保留 `/api/session/turn`，合并 `intake` 逻辑进去。前端只调 `submitTurn`。
+- **执行结果**：
+  - `SessionTurnRequestDto` 增加 `supplementContext: bool` 与 `contextTaskId: Option<String>`；`SessionTurnRouteDto` 增加 `SupplementContext` 变体；`SessionTurnResponseDto` 增加 `contextRef`/`contextTaskId` 输出字段。
+  - `submit_session_turn` 在分类器之前根据 `supplementContext` 短路，把上下文写入逻辑（原 `record_supplement_context`）内联为 `submit_supplement_context_turn` + `resolve_supplement_context_task` 私有助手；不再调用 LLM 分类器。
+  - 删除 `routes/tasks_interaction.rs` 内 `/api/session/intake` 路由、`handle_intake`、整个 intake LLM 分类管线（IntakeClassification / IntakeRequestDto / IntakeResponseDto / IntakeClient / 路径匹配规则等共 ~790 行），仅保留 `/task/interrupt`。
+  - 同步删除 `dispatch_execution.rs::SessionExecutionBranchUpdateMode` 枚举与 `register_appended_task_execution_branch` 函数（仅 intake 调用）；`update_session_execution_branches` 退化为 Replace-only。
+  - 前端：`submitSessionTurn` 接受 `supplementContext` / `contextTaskId` 与新返回字段；`submitSessionIntake` / `AgentSessionIntakeResult` / `AgentSessionIntakeClassification` 全部删除；`web-client-bridge.ts::submitQueuedGuidance` 与 `InputArea.svelte::sendIntake` 改走 `submitSessionTurn({ supplementContext: true, contextTaskId })`，UI 按钮语义未变。
+  - 同步删除 `RustDaemonClient.postIntake` 与 `SessionIntakeRequestDto` / `SessionIntakeResponseDto` / `IntakeClassificationDto`；`SessionTurnRouteDto` / `SessionTurnRequestDto` / `SessionTurnResponseDto` 加上对应新字段。
 - **改后增量**：协议表面 +0.2
 - **依赖**：无
 - **代码证据**：`routes/sessions.rs::submit_session_turn` vs `routes/tasks_interaction.rs::handle_intake`
+- **验证**：`cargo check --workspace` ✓；`cargo test -p magi-api --lib` 与 main 同样 4 个 pre-existing 失败、无新增；`npm --prefix web run check` ✓（683/0/0）
 
 ### #17 一个 session 同一时刻只跑一个 root task
 - **状态**：✅

@@ -255,7 +255,7 @@ export interface AgentSessionTurnResult {
   eventId: string;
   acceptedAt: number;
   createdSession: boolean;
-  route: 'chat' | 'execute' | 'task' | 'continue';
+  route: 'chat' | 'execute' | 'task' | 'continue' | 'supplement_context';
   /** Root task ID when the backend created a task graph for this action. */
   rootTaskId?: string | null;
   /** 当前轮次实际执行的 action task ID。 */
@@ -267,23 +267,10 @@ export interface AgentSessionTurnResult {
   canonicalEventKind?: string | null;
   canonicalTurn?: CanonicalTurn | null;
   canonicalItem?: CanonicalTurnItem | null;
-}
-
-export type AgentSessionIntakeClassification =
-  | 'decision_answer'
-  | 'pause'
-  | 'replan'
-  | 'supplement_context'
-  | 'append_task'
-  | 'new_objective'
-  | 'general_chat';
-
-export interface AgentSessionIntakeResult {
-  classification: AgentSessionIntakeClassification;
-  contextTaskId?: string | null;
+  /** 仅在 supplement_context 路由下返回：本次写入的上下文引用 ID。 */
   contextRef?: string | null;
-  content?: string | null;
-  note?: string | null;
+  /** 仅在 supplement_context 路由下返回：被写入的上下文任务 ID。 */
+  contextTaskId?: string | null;
 }
 
 export class AgentApiError extends Error {
@@ -998,6 +985,8 @@ export async function submitSessionTurn(
     requestId?: string | null;
     userMessageId?: string | null;
     placeholderMessageId?: string | null;
+    supplementContext?: boolean;
+    contextTaskId?: string | null;
   },
   bindingOverride?: Partial<AgentBindingContext>,
 ): Promise<AgentSessionTurnResult> {
@@ -1020,6 +1009,8 @@ export async function submitSessionTurn(
         requestId: payload.requestId ?? null,
         userMessageId: payload.userMessageId ?? null,
         placeholderMessageId: payload.placeholderMessageId ?? null,
+        supplementContext: payload.supplementContext === true,
+        contextTaskId: payload.contextTaskId ?? null,
         images: payload.images.map((image) => ({
           name: image.name,
           dataUrl: image.dataUrl,
@@ -1032,7 +1023,7 @@ export async function submitSessionTurn(
       eventId: string;
       acceptedAt: number;
       createdSession: boolean;
-      route: 'chat' | 'execute' | 'task' | 'continue';
+      route: 'chat' | 'execute' | 'task' | 'continue' | 'supplement_context';
       rootTaskId?: string | null;
       actionTaskId?: string | null;
       executionChainRef?: string | null;
@@ -1041,6 +1032,8 @@ export async function submitSessionTurn(
       canonicalEventKind?: string | null;
       canonicalTurn?: CanonicalTurn | null;
       canonicalItem?: CanonicalTurnItem | null;
+      contextRef?: string | null;
+      contextTaskId?: string | null;
     }>(response, 'submit session turn');
     return {
       sessionId: raw.sessionId,
@@ -1067,6 +1060,10 @@ export async function submitSessionTurn(
         : null,
       canonicalTurn: raw.canonicalTurn ?? null,
       canonicalItem: raw.canonicalItem ?? null,
+      contextRef: typeof raw.contextRef === 'string' && raw.contextRef.trim() ? raw.contextRef.trim() : null,
+      contextTaskId: typeof raw.contextTaskId === 'string' && raw.contextTaskId.trim()
+        ? raw.contextTaskId.trim()
+        : null,
     };
   } catch (error) {
     if (error instanceof TypeError) {
@@ -1074,43 +1071,6 @@ export async function submitSessionTurn(
     }
     throw error;
   }
-}
-
-export async function submitSessionIntake(
-  payload: {
-    message: string;
-    contextTaskId?: string | null;
-    forceSupplementContext?: boolean;
-  },
-  bindingOverride?: Partial<AgentBindingContext>,
-): Promise<AgentSessionIntakeResult> {
-  const raw = await postBoundJson<{
-    classification: AgentSessionIntakeClassification;
-    contextTaskId?: string | null;
-    contextRef?: string | null;
-    content?: string | null;
-    note?: string | null;
-  }>(
-    '/api/session/intake',
-    {
-      message: payload.message,
-      contextTaskId: payload.contextTaskId ?? null,
-      forceSupplementContext: payload.forceSupplementContext === true,
-    },
-    'submit session intake',
-    bindingOverride,
-  );
-  return {
-    classification: raw.classification,
-    contextTaskId: typeof raw.contextTaskId === 'string' && raw.contextTaskId.trim()
-      ? raw.contextTaskId.trim()
-      : null,
-    contextRef: typeof raw.contextRef === 'string' && raw.contextRef.trim()
-      ? raw.contextRef.trim()
-      : null,
-    content: typeof raw.content === 'string' ? raw.content : null,
-    note: typeof raw.note === 'string' ? raw.note : null,
-  };
 }
 
 export async function interruptAgentTask(
