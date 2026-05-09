@@ -290,8 +290,8 @@
   }
 
   @keyframes slideDown {
-    from { opacity: 0; max-height: 0; transform: translateY(-8px); }
-    to { opacity: 1; max-height: 500px; transform: translateY(0); }
+    from { opacity: 0; transform: translateY(-8px); }
+    to { opacity: 1; transform: translateY(0); }
   }
 
   /* Diff 内容 */
@@ -300,7 +300,7 @@
     font-size: var(--text-xs, 11px);
     line-height: 1.5;
     overflow-x: auto;
-    max-height: 400px;
+    max-height: min(60vh, 640px);
     overflow-y: auto;
   }
 

@@ -97,6 +97,33 @@
     vscode.postMessage({ type: 'revertChange', filePath, sessionId });
   }
 
+  let pendingBatch = $state<'approveAll' | 'revertAll' | 'revertRound' | null>(null);
+  function approveAllChanges() {
+    if (pendingBatch || edits.length === 0) return;
+    pendingBatch = 'approveAll';
+    const sessionId = getCurrentSessionId() || undefined;
+    vscode.postMessage({ type: 'approveAllChanges', sessionId });
+    setTimeout(() => { pendingBatch = null; }, 1500);
+  }
+  function revertAllChanges() {
+    if (pendingBatch || edits.length === 0) return;
+    pendingBatch = 'revertAll';
+    const sessionId = getCurrentSessionId() || undefined;
+    vscode.postMessage({ type: 'revertAllChanges', sessionId });
+    setTimeout(() => { pendingBatch = null; }, 1500);
+  }
+  function revertCurrentRound() {
+    if (pendingBatch || !latestExecutionGroupId) return;
+    pendingBatch = 'revertRound';
+    const sessionId = getCurrentSessionId() || undefined;
+    vscode.postMessage({
+      type: 'revertExecutionGroup',
+      executionGroupId: latestExecutionGroupId,
+      sessionId,
+    });
+    setTimeout(() => { pendingBatch = null; }, 1500);
+  }
+
   function selectEdit(edit: Edit, openFloatingPreview: boolean): void {
     selectedPreviewKey = getEditKey(edit);
     previewOpen = openFloatingPreview && !useDockedPreview;
@@ -274,6 +301,31 @@
   {:else}
     <div class="edits-shell" class:has-docked-preview={useDockedPreview}>
       <div class="edits-main">
+        {#if edits.length >= 2}
+          <div class="edits-toolbar">
+            <button
+              type="button"
+              class="toolbar-btn approve"
+              disabled={!!pendingBatch}
+              title={i18n.t('edits.actions.approveAllTitle')}
+              onclick={approveAllChanges}
+            >
+              <Icon name="check" size={13} />
+              <span>{i18n.t('edits.actions.approveAll')}</span>
+            </button>
+            <button
+              type="button"
+              class="toolbar-btn revert"
+              disabled={!!pendingBatch}
+              title={i18n.t('edits.actions.revertAllTitle')}
+              onclick={revertAllChanges}
+            >
+              <Icon name="undo" size={13} />
+              <span>{i18n.t('edits.actions.revertAll')}</span>
+            </button>
+          </div>
+        {/if}
+
         {#if hasGroups}
           <div class="group-section">
             <div class="group-header">
@@ -293,6 +345,18 @@
             <div class="group-header current-round">
               <span class="group-label">{i18n.t('edits.group.currentRound')}</span>
               <span class="group-count">{i18n.t('edits.group.currentRoundCount', { count: currentRoundEdits.length })}</span>
+              {#if currentRoundEdits.length > 0 && latestExecutionGroupId}
+                <button
+                  type="button"
+                  class="group-action"
+                  disabled={!!pendingBatch}
+                  title={i18n.t('edits.group.revertRoundTitle')}
+                  onclick={revertCurrentRound}
+                >
+                  <Icon name="undo" size={12} />
+                  <span>{i18n.t('edits.group.revertRound')}</span>
+                </button>
+              {/if}
             </div>
             <div class="file-list">
               {#each currentRoundEdits as edit (getEditKey(edit))}
@@ -515,6 +579,80 @@
     border-radius: var(--radius-full);
     background: var(--scrollbar-thumb);
     background-clip: padding-box;
+  }
+
+  .edits-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin: 0 0 var(--space-2);
+    padding: var(--space-2);
+    border: 1px solid var(--edits-row-border);
+    border-radius: var(--radius-md);
+    background: var(--edits-row-bg);
+  }
+
+  .toolbar-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    padding: 0 10px;
+    border: 1px solid var(--edits-card-border);
+    border-radius: var(--radius-sm);
+    background: var(--edits-card-bg);
+    color: var(--foreground);
+    cursor: pointer;
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium);
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+  }
+
+  .toolbar-btn:hover:not(:disabled) {
+    background: var(--surface-hover);
+  }
+
+  .toolbar-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  .toolbar-btn.approve:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--success) 50%, var(--edits-card-border));
+    color: var(--success);
+  }
+
+  .toolbar-btn.revert:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--error) 50%, var(--edits-card-border));
+    color: var(--error);
+  }
+
+  .group-action {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 22px;
+    padding: 0 8px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--foreground-muted);
+    cursor: pointer;
+    font-size: var(--text-2xs);
+    font-weight: var(--font-medium);
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+  }
+
+  .group-action:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--error) 40%, var(--edits-card-border));
+    background: var(--surface-hover);
+    color: var(--error);
+  }
+
+  .group-action:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
   }
 
   .group-section {
