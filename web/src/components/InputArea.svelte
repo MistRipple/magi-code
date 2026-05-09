@@ -11,6 +11,7 @@
   import { getTaskGraphState, refreshTaskProjection } from '../stores/task-graph-store.svelte';
   import { RustDaemonClient } from '../shared/rust-daemon-client';
   import { enhanceAgentPrompt, resolveAgentBaseUrl, submitSessionTurn } from '../web/agent-api';
+  import { categoryLabel, listTaskTemplates, type ResolvedTemplate } from '../lib/task-templates';
   import Icon from './Icon.svelte';
   import Modal from './Modal.svelte';
   import { generateId } from '../lib/utils';
@@ -40,6 +41,22 @@
   let intakeLoading = $state(false);
   let stopLoading = $state(false);
   let enhanceLoading = $state(false);
+  let templatesOpen = $state(false);
+  const templates = $derived<ResolvedTemplate[]>(templatesOpen ? listTaskTemplates() : []);
+  const groupedTemplates = $derived.by(() => {
+    if (!templatesOpen) return [] as Array<{ category: ResolvedTemplate['category']; label: string; items: ResolvedTemplate[] }>;
+    const buckets = new Map<ResolvedTemplate['category'], ResolvedTemplate[]>();
+    for (const tpl of templates) {
+      const list = buckets.get(tpl.category) ?? [];
+      list.push(tpl);
+      buckets.set(tpl.category, list);
+    }
+    return Array.from(buckets.entries()).map(([category, items]) => ({
+      category,
+      label: categoryLabel(category),
+      items,
+    }));
+  });
 
   // P4-#17：单会话串行任务确认对话框
   // 任务图运行时再次提交，先弹窗让用户选「补充指令 / 停止当前并新建 / 取消」，
@@ -425,6 +442,26 @@
     selectedImages = [];
   }
 
+  function toggleTemplates() {
+    templatesOpen = !templatesOpen;
+  }
+  function applyTemplate(tpl: ResolvedTemplate) {
+    const prompt = (tpl.prompt || '').trim();
+    if (!prompt) {
+      templatesOpen = false;
+      return;
+    }
+    inputValue = prompt;
+    templatesOpen = false;
+    queueMicrotask(() => {
+      const el = inputTextareaEl;
+      if (!el) return;
+      el.focus();
+      const cursor = prompt.length;
+      try { el.setSelectionRange(cursor, cursor); } catch { /* ignore */ }
+    });
+  }
+
   // Prompt enhance：调用后端模型重写当前 textarea 文本
   async function enhancePromptHandler() {
     const draft = inputValue.trim();
@@ -529,6 +566,45 @@
 
     <div class="ia-actions">
       <div class="ia-left">
+        <div class="ia-templates-wrap">
+          <button
+            type="button"
+            class="ia-enhance"
+            class:active={templatesOpen}
+            onclick={toggleTemplates}
+            disabled={sessionInputLocked || isInteractionBlocking}
+            title={i18n.t('input.templates.title')}
+            aria-label={i18n.t('input.templates.title')}
+            aria-expanded={templatesOpen}
+          >
+            <Icon name="lightbulb" size={14} />
+            <span>{i18n.t('input.templates.label')}</span>
+          </button>
+          {#if templatesOpen}
+            <!-- svelte-ignore a11y_click_events_have_key_events -->
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div class="ia-templates-backdrop" onclick={() => (templatesOpen = false)}></div>
+            <div class="ia-templates-popover" role="menu">
+              <div class="ia-templates-header">{i18n.t('input.templates.heading')}</div>
+              {#each groupedTemplates as group (group.category)}
+                <div class="ia-templates-group">
+                  <div class="ia-templates-group-label">{group.label}</div>
+                  {#each group.items as tpl (tpl.id)}
+                    <button
+                      type="button"
+                      class="ia-templates-item"
+                      onclick={() => applyTemplate(tpl)}
+                      title={tpl.description}
+                    >
+                      <span class="ia-templates-item-label">{tpl.label}</span>
+                      <span class="ia-templates-item-desc">{tpl.description}</span>
+                    </button>
+                  {/each}
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
         <button
           type="button"
           class="ia-enhance"
@@ -759,6 +835,82 @@
   }
   .ia-enhance:disabled { opacity: 0.4; cursor: not-allowed; }
   .ia-enhance.loading { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 50%, transparent); }
+  .ia-enhance.active {
+    background: color-mix(in srgb, var(--primary) 14%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 42%, transparent);
+    color: var(--primary);
+  }
+
+  .ia-templates-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+  .ia-templates-backdrop {
+    position: fixed;
+    inset: 0;
+    background: transparent;
+    z-index: 30;
+  }
+  .ia-templates-popover {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    z-index: 31;
+    width: 320px;
+    max-height: 360px;
+    overflow-y: auto;
+    padding: 8px;
+    background: var(--surface-1, var(--background));
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+  }
+  .ia-templates-header {
+    font-size: 11px;
+    color: var(--foreground-muted);
+    padding: 2px 6px 6px;
+  }
+  .ia-templates-group {
+    padding: 4px 0;
+  }
+  .ia-templates-group + .ia-templates-group {
+    border-top: 1px dashed var(--border-subtle);
+    margin-top: 4px;
+  }
+  .ia-templates-group-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--foreground-muted);
+    padding: 4px 6px 2px;
+  }
+  .ia-templates-item {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    width: 100%;
+    padding: 6px 8px;
+    background: transparent;
+    border: none;
+    border-radius: var(--radius-sm, 6px);
+    cursor: pointer;
+    text-align: left;
+    color: var(--foreground);
+    transition: background var(--transition-fast);
+  }
+  .ia-templates-item:hover {
+    background: color-mix(in srgb, var(--primary) 10%, transparent);
+  }
+  .ia-templates-item-label {
+    font-size: 12px;
+    font-weight: var(--font-medium, 500);
+  }
+  .ia-templates-item-desc {
+    font-size: 11px;
+    color: var(--foreground-muted);
+    line-height: 1.4;
+  }
 
   /* 图片预览 */
   .ia-images {
