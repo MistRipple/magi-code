@@ -31,10 +31,10 @@
 |---|---|---|---|---|---|
 | P0 产品定位锚定 | 3 | 0 | 0 | 3 | 0 |
 | P1 用户心智核心抽象 | 4 | 0 | 0 | 4 | 0 |
-| P2 业务能力收口 | 5 | 1 | 0 | 4 | 0 |
+| P2 业务能力收口 | 5 | 0 | 0 | 5 | 0 |
 | P3 任务系统产品表达 | 3 | 1 | 0 | 2 | 0 |
 | P4 链路边界收口 | 3 | 0 | 0 | 3 | 0 |
-| **合计** | **18** | **2** | **0** | **16** | **0** |
+| **合计** | **18** | **1** | **0** | **17** | **0** |
 
 ---
 
@@ -227,7 +227,8 @@
 - **验证**：cargo check ✓ / cargo build ✓ / npm check ✓ / magi-daemon 52/52 通过 / magi-api 仅 2 个**预存在**失败
 
 ### #11 Settings 面板按用户角色重排
-- **状态**：⬜
+- **状态**：✅
+- **完成时间**：2026-05-09
 - **任务**：从 10 个并列 tab 收成 4 大区。
 - **建议**：
   - 「快速开始」：模型 + 工作区
@@ -235,9 +236,15 @@
   - 「我的偏好」：用户规则 + 安全策略
   - 「使用统计」：stats
   - 其余（registry engines、agents、worker config 等）折叠到「高级」抽屉
+- **执行结果**：
+  - `SettingsPanel.svelte` sidebar-nav 从 5 按钮收成 4 按钮（model/tools/rules/stats），文案改用「快速开始 / 能力扩展 / 我的偏好 / 使用统计」；默认打开切到「快速开始」（store `activeTab` 默认 `stats` → `model`）
+  - agents tab 入口下沉到 sidebar-footer 「高级」分区（与 P2-#12 LanAccess 同区），保留原 SettingsAgentsTab 主区渲染（`activeTab === 'agents'` 仍触发原内容）
+  - i18n（zh-CN / en-US）新增 `settings.zone.*`（4 区 × 标题/描述）+ `settings.advanced.agents` / `agentsDesc`；旧 `settings.tab*` 键保留兼容（外部仅 SettingsPanel.svelte 引用，子组件如有内部使用不动）
+  - doc 偏差注记：原文「10 tab」与现状不符（实为 5，P2-#9 合并后状态）；「工作区」入口归 Header 未纳入；registry engines / worker config 是 ModelTab 子页签，已天然位于「快速开始」之下，未额外降级
 - **改后增量**：协议表面 +0.4
-- **依赖**：#9（skill 并入 tool 后才能合 tab）
+- **依赖**：#9（skill 并入 tool 后才能合 tab） / #12（高级抽屉模式）
 - **代码证据**：`SettingsModelTab/AgentsTab/ToolsTab/RulesTab/StatsTab` 五个组件 + `routes/settings.rs` 2055 行 / 数十端点
+- **验证**：`npm --prefix web run check` ✓（683/0/0）/ 浏览器：左侧导航 4 项「快速开始 / 能力扩展 / 我的偏好 / 使用统计」；左下「高级」分区 2 个按钮「角色」「局域网访问」；点击「角色」主面板切到 SettingsAgentsTab；旧 tab 标签全部消失
 
 ### #12 tunnel / lan-access 收到高级抽屉
 - **状态**：✅

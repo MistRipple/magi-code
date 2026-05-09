@@ -46,57 +46,57 @@ import { getAgentColor } from '../lib/agent-colors';
         <button
           type="button"
           class="nav-item"
-          class:active={store.activeTab === 'stats'}
-          aria-label={i18n.t('settings.tabStats')}
-          onclick={() => store.activeTab = 'stats'}
-        >
-          <Icon name="stats" size={16} />
-          <span>{i18n.t('settings.tabStats')}</span>
-        </button>
-        <button
-          type="button"
-          class="nav-item"
           class:active={store.activeTab === 'model'}
-          aria-label={i18n.t('settings.tabModel')}
+          aria-label={i18n.t('settings.zone.quickStart')}
           onclick={() => store.activeTab = 'model'}
         >
           <Icon name="model" size={16} />
-          <span>{i18n.t('settings.tabModel')}</span>
-        </button>
-        <button
-          type="button"
-          class="nav-item"
-          class:active={store.activeTab === 'agents'}
-          aria-label={i18n.t('settings.tabAgents')}
-          onclick={() => store.activeTab = 'agents'}
-        >
-          <Icon name="bot" size={16} />
-          <span>{i18n.t('settings.tabAgents')}</span>
+          <span>{i18n.t('settings.zone.quickStart')}</span>
         </button>
         <button
           type="button"
           class="nav-item"
           class:active={store.activeTab === 'tools'}
-          aria-label={i18n.t('settings.tabTools')}
+          aria-label={i18n.t('settings.zone.capabilities')}
           onclick={() => store.activeTab = 'tools'}
         >
           <Icon name="tools" size={16} />
-          <span>{i18n.t('settings.tabTools')}</span>
+          <span>{i18n.t('settings.zone.capabilities')}</span>
         </button>
         <button
           type="button"
           class="nav-item"
           class:active={store.activeTab === 'rules'}
-          aria-label={i18n.t('settings.tabRules')}
+          aria-label={i18n.t('settings.zone.preferences')}
           onclick={() => store.activeTab = 'rules'}
         >
           <Icon name="shield" size={16} />
-          <span>{i18n.t('settings.tabRules')}</span>
+          <span>{i18n.t('settings.zone.preferences')}</span>
+        </button>
+        <button
+          type="button"
+          class="nav-item"
+          class:active={store.activeTab === 'stats'}
+          aria-label={i18n.t('settings.zone.usage')}
+          onclick={() => store.activeTab = 'stats'}
+        >
+          <Icon name="stats" size={16} />
+          <span>{i18n.t('settings.zone.usage')}</span>
         </button>
       </nav>
       <div class="sidebar-footer">
         <div class="advanced-section">
           <span class="advanced-label">{i18n.t('settings.advanced.title')}</span>
+          <button
+            type="button"
+            class="settings-btn secondary advanced-btn"
+            class:active={store.activeTab === 'agents'}
+            onclick={() => { store.activeTab = 'agents'; }}
+            title={i18n.t('settings.advanced.agents')}
+          >
+            <Icon name="bot" size={14} />
+            <span>{i18n.t('settings.advanced.agents')}</span>
+          </button>
           <div class="lan-access-wrapper">
             <button
               type="button"
@@ -124,30 +124,30 @@ import { getAgentColor } from '../lib/agent-colors';
     <main class="settings-main">
       <header class="main-header">
         <div class="header-breadcrumbs">
-          {#if store.activeTab === 'stats'}
+          {#if store.activeTab === 'model'}
             <div style="display: flex; align-items: baseline; gap: 12px;">
-              <h2>{i18n.t('settings.tabStats')}</h2>
-              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.tabStatsDesc')}</span>
-            </div>
-          {:else if store.activeTab === 'model'}
-            <div style="display: flex; align-items: baseline; gap: 12px;">
-              <h2>{i18n.t('settings.tabModel')}</h2>
-              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.tabModelDesc')}</span>
-            </div>
-          {:else if store.activeTab === 'agents'}
-            <div style="display: flex; align-items: baseline; gap: 12px;">
-              <h2>{i18n.t('settings.tabAgents')}</h2>
-              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.tabAgentsDesc')}</span>
+              <h2>{i18n.t('settings.zone.quickStart')}</h2>
+              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.zone.quickStartDesc')}</span>
             </div>
           {:else if store.activeTab === 'tools'}
             <div style="display: flex; align-items: baseline; gap: 12px;">
-              <h2>{i18n.t('settings.tabTools')}</h2>
-              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.tabToolsDesc')}</span>
+              <h2>{i18n.t('settings.zone.capabilities')}</h2>
+              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.zone.capabilitiesDesc')}</span>
             </div>
           {:else if store.activeTab === 'rules'}
             <div style="display: flex; align-items: baseline; gap: 12px;">
-              <h2>{i18n.t('settings.tabRules')}</h2>
-              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.tabRulesDesc')}</span>
+              <h2>{i18n.t('settings.zone.preferences')}</h2>
+              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.zone.preferencesDesc')}</span>
+            </div>
+          {:else if store.activeTab === 'stats'}
+            <div style="display: flex; align-items: baseline; gap: 12px;">
+              <h2>{i18n.t('settings.zone.usage')}</h2>
+              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.zone.usageDesc')}</span>
+            </div>
+          {:else if store.activeTab === 'agents'}
+            <div style="display: flex; align-items: baseline; gap: 12px;">
+              <h2>{i18n.t('settings.advanced.agents')}</h2>
+              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.advanced.agentsDesc')}</span>
             </div>
           {/if}
         </div>
