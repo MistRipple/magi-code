@@ -996,58 +996,13 @@ export interface KnowledgeMutationResponseDto {
 
 export interface KnowledgeItemDto {
   id: string;
+  kind: 'adr' | 'faq' | 'learning';
   title: string;
   content: string;
+  context: string | null;
   tags: string[];
+  createdAt: number;
   updatedAt: number;
-}
-
-export interface KnowledgeAdrsResponseDto {
-  adrs: KnowledgeItemDto[];
-}
-
-export interface KnowledgeFaqsResponseDto {
-  faqs: KnowledgeItemDto[];
-}
-
-export interface KnowledgeSearchResultDto {
-  id: string;
-  title: string;
-  content: string;
-  score: number;
-}
-
-export interface KnowledgeFaqSearchResponseDto {
-  results: KnowledgeSearchResultDto[];
-}
-
-export interface AddAdrRequestDto {
-  adr: {
-    title: string;
-    content: string;
-    tags?: string[];
-  };
-}
-
-export interface UpdateKnowledgeRequestDto {
-  id: string;
-  updates: {
-    title?: string | null;
-    content?: string | null;
-    tags?: string[] | null;
-  };
-}
-
-export interface DeleteKnowledgeRequestDto {
-  id: string;
-}
-
-export interface AddFaqRequestDto {
-  faq: {
-    title: string;
-    content: string;
-    tags?: string[];
-  };
 }
 
 // ─── MCP / Skills / Repos endpoints ─────────────────────────────────

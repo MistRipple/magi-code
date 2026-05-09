@@ -3,8 +3,6 @@
 
 import { getTransport } from './transport';
 import type {
-  AddAdrRequestDto,
-  AddFaqRequestDto,
   AddedResponseDto,
   AgentsResponseDto,
   AgentTemplateIdRequestDto,
@@ -19,7 +17,6 @@ import type {
   ConnectionTestResponseDto,
   CustomToolNameRequestDto,
   DeletedResponseDto,
-  DeleteKnowledgeRequestDto,
   DeliveryPackageDto,
   DiffResponseDto,
   EngineIdRequestDto,
@@ -33,9 +30,6 @@ import type {
   FilesystemListResponseDto,
   HealthDto,
   InstructionSkillNameRequestDto,
-  KnowledgeAdrsResponseDto,
-  KnowledgeFaqSearchResponseDto,
-  KnowledgeFaqsResponseDto,
   KnowledgeMutationResponseDto,
   McpConnectResponseDto,
   McpDisconnectResponseDto,
@@ -86,7 +80,6 @@ import type {
   TaskProjectionDto,
   TaskReplanResponseDto,
   UpdatedResponseDto,
-  UpdateKnowledgeRequestDto,
   VersionHandshakeDto,
   WorkspaceListResponseDto,
   WorkspacePickResponseDto,
@@ -381,79 +374,6 @@ export class RustDaemonClient {
 
   public async clearKnowledge(): Promise<KnowledgeMutationResponseDto> {
     return this.postJson<KnowledgeMutationResponseDto>('/api/knowledge/clear', {});
-  }
-
-  public async fetchAdrs(
-    workspaceId?: string,
-  ): Promise<KnowledgeAdrsResponseDto> {
-    const params = new URLSearchParams();
-    if (workspaceId) params.set('workspaceId', workspaceId);
-    const qs = params.toString();
-    return this.getJson<KnowledgeAdrsResponseDto>(`/api/knowledge/adrs${qs ? `?${qs}` : ''}`);
-  }
-
-  public async fetchFaqs(
-    workspaceId?: string,
-  ): Promise<KnowledgeFaqsResponseDto> {
-    const params = new URLSearchParams();
-    if (workspaceId) params.set('workspaceId', workspaceId);
-    const qs = params.toString();
-    return this.getJson<KnowledgeFaqsResponseDto>(`/api/knowledge/faqs${qs ? `?${qs}` : ''}`);
-  }
-
-  public async searchFaqs(
-    q?: string,
-    workspaceId?: string,
-  ): Promise<KnowledgeFaqSearchResponseDto> {
-    const params = new URLSearchParams();
-    if (q) params.set('q', q);
-    if (workspaceId) params.set('workspaceId', workspaceId);
-    const qs = params.toString();
-    return this.getJson<KnowledgeFaqSearchResponseDto>(
-      `/api/knowledge/faqs/search${qs ? `?${qs}` : ''}`,
-    );
-  }
-
-  public async addAdr(
-    request: AddAdrRequestDto,
-  ): Promise<KnowledgeMutationResponseDto> {
-    return this.postJson<KnowledgeMutationResponseDto>('/api/knowledge/adr/add', request);
-  }
-
-  public async updateAdr(
-    request: UpdateKnowledgeRequestDto,
-  ): Promise<KnowledgeMutationResponseDto> {
-    return this.postJson<KnowledgeMutationResponseDto>('/api/knowledge/adr/update', request);
-  }
-
-  public async deleteAdr(
-    request: DeleteKnowledgeRequestDto,
-  ): Promise<KnowledgeMutationResponseDto> {
-    return this.postJson<KnowledgeMutationResponseDto>('/api/knowledge/adr/delete', request);
-  }
-
-  public async addFaq(
-    request: AddFaqRequestDto,
-  ): Promise<KnowledgeMutationResponseDto> {
-    return this.postJson<KnowledgeMutationResponseDto>('/api/knowledge/faq/add', request);
-  }
-
-  public async updateFaq(
-    request: UpdateKnowledgeRequestDto,
-  ): Promise<KnowledgeMutationResponseDto> {
-    return this.postJson<KnowledgeMutationResponseDto>('/api/knowledge/faq/update', request);
-  }
-
-  public async deleteFaq(
-    request: DeleteKnowledgeRequestDto,
-  ): Promise<KnowledgeMutationResponseDto> {
-    return this.postJson<KnowledgeMutationResponseDto>('/api/knowledge/faq/delete', request);
-  }
-
-  public async deleteLearning(
-    request: DeleteKnowledgeRequestDto,
-  ): Promise<KnowledgeMutationResponseDto> {
-    return this.postJson<KnowledgeMutationResponseDto>('/api/knowledge/learning/delete', request);
   }
 
   // ─── MCP servers ──────────────────────────────────────────────────

@@ -1291,75 +1291,59 @@ export async function getAgentProjectKnowledge(): Promise<Record<string, unknown
   return await parseAgentJson<Record<string, unknown>>(response, 'load project knowledge');
 }
 
-export async function getAgentAdrs(): Promise<Record<string, unknown>> {
-  const query = buildWorkspaceBoundQuery({});
-  const response = await getTransport().request(agentUrl(`/api/knowledge/adrs`, query));
-  return await parseAgentJson<Record<string, unknown>>(response, 'load adrs');
+export type AgentKnowledgeKind = 'adr' | 'faq' | 'learning';
+
+export interface AgentKnowledgeItemPayload {
+  kind: AgentKnowledgeKind;
+  title?: string;
+  content: string;
+  tags?: string[];
+  context?: string;
 }
 
-export async function getAgentFaqs(): Promise<Record<string, unknown>> {
-  const query = buildWorkspaceBoundQuery({});
-  const response = await getTransport().request(agentUrl(`/api/knowledge/faqs`, query));
-  return await parseAgentJson<Record<string, unknown>>(response, 'load faqs');
+export interface AgentKnowledgeItemPatch {
+  title?: string;
+  content?: string;
+  tags?: string[];
+  context?: string;
 }
 
-export async function searchAgentAdrs(keyword: string): Promise<Record<string, unknown>> {
-  const query = buildWorkspaceBoundQuery({ q: keyword });
-  const response = await getTransport().request(agentUrl(`/api/knowledge/adrs/search`, query));
-  return await parseAgentJson<Record<string, unknown>>(response, 'search adrs');
+export async function listAgentKnowledgeItems(kind?: AgentKnowledgeKind): Promise<Record<string, unknown>> {
+  const params: Record<string, string> = {};
+  if (kind) params.kind = kind;
+  const response = await getTransport().request(agentUrl('/api/knowledge/items', buildWorkspaceBoundQuery(params)));
+  return await parseAgentJson<Record<string, unknown>>(response, 'list knowledge items');
 }
 
-export async function searchAgentFaqs(keyword: string): Promise<Record<string, unknown>> {
-  const query = buildWorkspaceBoundQuery({ q: keyword });
-  const response = await getTransport().request(agentUrl(`/api/knowledge/faqs/search`, query));
-  return await parseAgentJson<Record<string, unknown>>(response, 'search faqs');
+export async function searchAgentKnowledgeItems(keyword: string, kind?: AgentKnowledgeKind): Promise<Record<string, unknown>> {
+  const params: Record<string, string> = { q: keyword };
+  if (kind) params.kind = kind;
+  const response = await getTransport().request(agentUrl('/api/knowledge/items/search', buildWorkspaceBoundQuery(params)));
+  return await parseAgentJson<Record<string, unknown>>(response, 'search knowledge items');
 }
 
-export async function getAgentLearnings(): Promise<Record<string, unknown>> {
-  const response = await getTransport().request(agentUrl(`/api/knowledge/learnings`, buildWorkspaceBoundQuery({})));
-  return await parseAgentJson<Record<string, unknown>>(response, 'load learnings');
+export async function addAgentKnowledgeItem(payload: AgentKnowledgeItemPayload): Promise<AgentKnowledgeMutationPayload> {
+  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>(
+    '/api/knowledge/items',
+    { ...payload },
+    'add knowledge item',
+  );
 }
 
-export async function searchAgentLearnings(keyword: string): Promise<Record<string, unknown>> {
-  const query = buildWorkspaceBoundQuery({ q: keyword });
-  const response = await getTransport().request(agentUrl(`/api/knowledge/learnings/search`, query));
-  return await parseAgentJson<Record<string, unknown>>(response, 'search learnings');
+export async function updateAgentKnowledgeItem(knowledgeId: string, patch: AgentKnowledgeItemPatch): Promise<AgentKnowledgeMutationPayload> {
+  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>(
+    '/api/knowledge/items/update',
+    { knowledgeId, ...patch },
+    'update knowledge item',
+  );
 }
 
-export async function addAgentAdr(adr: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
-  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/adr/add', { adr }, 'add adr');
-}
-
-export async function updateAgentAdr(id: string, updates: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
-  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/adr/update', { id, updates }, 'update adr');
-}
-
-export async function addAgentFaq(faq: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
-  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/faq/add', { faq }, 'add faq');
-}
-
-export async function updateAgentFaq(id: string, updates: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
-  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/faq/update', { id, updates }, 'update faq');
-}
-
-export async function addAgentLearning(learning: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
-  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/learning/add', { learning }, 'add learning');
-}
-
-export async function updateAgentLearning(id: string, updates: Record<string, unknown>): Promise<AgentKnowledgeMutationPayload> {
-  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/learning/update', { id, updates }, 'update learning');
-}
-
-export async function deleteAgentAdr(id: string): Promise<AgentKnowledgeMutationPayload> {
-  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/adr/delete', { id }, 'delete adr');
-}
-
-export async function deleteAgentFaq(id: string): Promise<AgentKnowledgeMutationPayload> {
-  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/faq/delete', { id }, 'delete faq');
-}
-
-export async function deleteAgentLearning(id: string): Promise<AgentKnowledgeMutationPayload> {
-  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>('/api/knowledge/learning/delete', { id }, 'delete learning');
+export async function deleteAgentKnowledgeItem(knowledgeId: string): Promise<AgentKnowledgeMutationPayload> {
+  return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>(
+    '/api/knowledge/items/delete',
+    { knowledgeId },
+    'delete knowledge item',
+  );
 }
 
 export async function loadAgentMcpServers(): Promise<Record<string, unknown>> {

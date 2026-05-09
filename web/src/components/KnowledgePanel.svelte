@@ -8,18 +8,12 @@
   import { i18n } from '../stores/i18n.svelte';
   import { getState } from '../stores/messages.svelte';
   import {
-    addAgentAdr,
-    addAgentFaq,
-    addAgentLearning,
+    addAgentKnowledgeItem,
     clearAgentProjectKnowledge,
-    deleteAgentAdr,
-    deleteAgentFaq,
-    deleteAgentLearning,
+    deleteAgentKnowledgeItem,
     getAgentProjectKnowledge,
     isWebAgentMode,
-    updateAgentAdr,
-    updateAgentFaq,
-    updateAgentLearning,
+    updateAgentKnowledgeItem,
   } from '../web/agent-api';
 
   // 知识类型定义
@@ -271,36 +265,50 @@
     isSaving = true;
     formError = '';
     try {
-      if (editorKind === 'adr') {
-        if (isWebMode) {
-          if (editorId) {
-            await updateAgentAdr(editorId, { title, content, tags });
-          } else {
-            await addAgentAdr({ title, content, tags });
+      const kind = editorKind;
+      if (isWebMode) {
+        if (editorId) {
+          const patch: { title?: string; content?: string; tags?: string[]; context?: string } = {
+            content,
+            tags,
+          };
+          if (kind === 'adr' || kind === 'faq') {
+            patch.title = title;
           }
-        } else {
-          vscode.postMessage(editorId ? { type: 'updateADR', id: editorId, updates: { title, content, tags } } : { type: 'addADR', adr: { title, content, tags } });
-        }
-      } else if (editorKind === 'faq') {
-        if (isWebMode) {
-          if (editorId) {
-            await updateAgentFaq(editorId, { title, content, tags });
-          } else {
-            await addAgentFaq({ title, content, tags });
+          if (kind === 'learning') {
+            patch.context = context;
           }
+          await updateAgentKnowledgeItem(editorId, patch);
         } else {
-          vscode.postMessage(editorId ? { type: 'updateFAQ', id: editorId, updates: { title, content, tags } } : { type: 'addFAQ', faq: { title, content, tags } });
+          await addAgentKnowledgeItem({
+            kind,
+            title: kind === 'learning' ? undefined : title,
+            content,
+            tags,
+            context: kind === 'learning' ? context : undefined,
+          });
         }
       } else {
-        const learning = { content, context, tags };
-        if (isWebMode) {
-          if (editorId) {
-            await updateAgentLearning(editorId, { content, sourceRef: context, tags });
-          } else {
-            await addAgentLearning(learning);
-          }
+        if (editorId) {
+          const updatePayload: { type: string; [key: string]: unknown } = {
+            type: 'updateKnowledgeItem',
+            knowledgeId: editorId,
+            content,
+            tags,
+          };
+          if (kind === 'adr' || kind === 'faq') updatePayload.title = title;
+          if (kind === 'learning') updatePayload.context = context;
+          vscode.postMessage(updatePayload);
         } else {
-          vscode.postMessage(editorId ? { type: 'updateLearning', id: editorId, updates: { content, sourceRef: context, tags } } : { type: 'addLearning', learning });
+          const addPayload: { type: string; [key: string]: unknown } = {
+            type: 'addKnowledgeItem',
+            kind,
+            content,
+            tags,
+          };
+          if (kind === 'adr' || kind === 'faq') addPayload.title = title;
+          if (kind === 'learning') addPayload.context = context;
+          vscode.postMessage(addPayload);
         }
       }
       closeEditor();
@@ -336,25 +344,32 @@
       : null;
     codeIndexStatus = normalizeCodeIndexStatus(payload?.codeIndexStatus);
 
-    adrs = ensureArray(payload?.adrs).map((a: any) => ({
-      id: a.id,
-      title: a.title,
-      content: a.content,
-      tags: ensureArray(a.tags)
-    }));
-    faqs = ensureArray(payload?.faqs).map((f: any) => ({
-      id: f.id,
-      question: f.title || f.question,
-      answer: f.content || f.answer,
-      tags: ensureArray(f.tags)
-    }));
-    learnings = ensureArray(payload?.learnings).map((l: any) => ({
-      id: l.id,
-      content: l.content,
-      context: l.context,
-      createdAt: l.createdAt,
-      tags: ensureArray(l.tags)
-    }));
+    const items = ensureArray(payload?.items) as Array<Record<string, unknown>>;
+    adrs = items
+      .filter((item) => item.kind === 'adr')
+      .map((item) => ({
+        id: String(item.id ?? ''),
+        title: typeof item.title === 'string' ? item.title : '',
+        content: typeof item.content === 'string' ? item.content : '',
+        tags: ensureArray(item.tags) as string[],
+      }));
+    faqs = items
+      .filter((item) => item.kind === 'faq')
+      .map((item) => ({
+        id: String(item.id ?? ''),
+        question: typeof item.title === 'string' ? item.title : '',
+        answer: typeof item.content === 'string' ? item.content : '',
+        tags: ensureArray(item.tags) as string[],
+      }));
+    learnings = items
+      .filter((item) => item.kind === 'learning')
+      .map((item) => ({
+        id: String(item.id ?? ''),
+        content: typeof item.content === 'string' ? item.content : '',
+        context: typeof item.context === 'string' ? item.context : undefined,
+        createdAt: typeof item.createdAt === 'number' ? String(item.createdAt) : undefined,
+        tags: ensureArray(item.tags) as string[],
+      }));
     codeIndex = codeIndexPayload
       ? {
           ...codeIndexPayload,
@@ -456,20 +471,12 @@
 
   function deleteAdr(id: string, e: Event) {
     e.stopPropagation();
-    if (isWebMode) {
-      deleteAgentAdr(id).then(() => refresh()).catch(console.error);
-    } else {
-      vscode.postMessage({ type: 'deleteADR', id });
-    }
+    deleteKnowledgeEntry(id);
   }
 
   function deleteFaq(id: string, e: Event) {
     e.stopPropagation();
-    if (isWebMode) {
-      deleteAgentFaq(id).then(() => refresh()).catch(console.error);
-    } else {
-      vscode.postMessage({ type: 'deleteFAQ', id });
-    }
+    deleteKnowledgeEntry(id);
   }
 
   function toggleLearning(learning: Learning) {
@@ -478,10 +485,14 @@
 
   function deleteLearning(id: string, e: Event) {
     e.stopPropagation();
+    deleteKnowledgeEntry(id);
+  }
+
+  function deleteKnowledgeEntry(id: string) {
     if (isWebMode) {
-      deleteAgentLearning(id).then(() => refresh()).catch(console.error);
+      deleteAgentKnowledgeItem(id).then(() => refresh()).catch(console.error);
     } else {
-      vscode.postMessage({ type: 'deleteLearning', id });
+      vscode.postMessage({ type: 'deleteKnowledgeItem', knowledgeId: id });
     }
   }
 

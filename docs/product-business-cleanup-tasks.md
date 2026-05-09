@@ -31,10 +31,10 @@
 |---|---|---|---|---|---|
 | P0 产品定位锚定 | 3 | 0 | 0 | 3 | 0 |
 | P1 用户心智核心抽象 | 4 | 0 | 0 | 4 | 0 |
-| P2 业务能力收口 | 5 | 3 | 0 | 2 | 0 |
+| P2 业务能力收口 | 5 | 2 | 0 | 3 | 0 |
 | P3 任务系统产品表达 | 3 | 1 | 0 | 2 | 0 |
 | P4 链路边界收口 | 3 | 1 | 0 | 2 | 0 |
-| **合计** | **18** | **5** | **0** | **13** | **0** |
+| **合计** | **18** | **4** | **0** | **14** | **0** |
 
 ---
 
@@ -172,12 +172,20 @@
 ## P2 — 业务能力收口
 
 ### #8 知识库三分类合并
-- **状态**：⬜
+- **状态**：✅
+- **完成时间**：2026-05-09
 - **任务**：ADR / FAQ / Learning 合并为统一 KnowledgeItem。
 - **建议**：合并为 `KnowledgeItem { kind: "adr"|"faq"|"learning", ... }`，CRUD 接口从 18 个端点 → 6 个（`/knowledge/items{,/search,/add,/update,/delete}` + `/knowledge`）。前端用 tag 区分。
 - **改后增量**：协议表面 +0.5、领域建模 +0.3
 - **依赖**：无
 - **代码证据**：`routes/knowledge.rs` 目前每类 6 个端点，三类共 18 个
+- **执行结果**：
+  1. 后端路由表改写：`crates/magi-api/src/routes/knowledge.rs` 由 17 条收成 7 条 — `GET/POST /knowledge/items`、`GET /knowledge/items/search`、`POST /knowledge/items/{update,delete}`、`GET /knowledge`、`POST /knowledge/clear`；引入 API 层 `KnowledgeKindParam { Adr|Faq|Learning }`（lowercase serde）映射到领域层 `KnowledgeKind`，`code_index` 不暴露在 items 集合中。
+  2. 统一序列化 `knowledge_item_json` 输出 `{ id, kind, title, content, context, tags, createdAt, updatedAt }`；`get_project_knowledge` 聚合响应 shape 由 `{adrs, faqs, learnings, codeIndex, codeIndexStatus}` 改为 `{ items, codeIndex, codeIndexStatus }`。
+  3. 前端 wrapper 从 15 个收成 5 个：`listAgentKnowledgeItems / searchAgentKnowledgeItems / addAgentKnowledgeItem / updateAgentKnowledgeItem / deleteAgentKnowledgeItem`（`web/src/web/agent-api.ts`）；`web-client-bridge.ts` 9 个 dispatch case 收成 3 个（`addKnowledgeItem / updateKnowledgeItem / deleteKnowledgeItem`），删除 5 个已死的 helper（`deleteAdr / deleteFaq / addLearning / updateLearning / deleteLearning`）。
+  4. 死代码清理：`rust-daemon-client.ts` 删除 10 个未消费的 ADR/FAQ/Learning 方法 + 4 个相关 DTO 引用；`rust-backend-types.ts` 删除 5 个未用 DTO（`KnowledgeAdrsResponseDto / KnowledgeFaqsResponseDto / KnowledgeFaqSearchResponseDto / AddAdrRequestDto / AddFaqRequestDto / UpdateKnowledgeRequestDto / DeleteKnowledgeRequestDto / KnowledgeSearchResultDto`），`KnowledgeItemDto` 扩展 `kind` + `context` + `createdAt`。
+  5. UI 数据走线（`web/src/components/KnowledgePanel.svelte`）改为 `payload.items.filter(i => i.kind === 'adr')` 等；删除编辑器内三类分支的双实现，统一走 `addAgentKnowledgeItem / updateAgentKnowledgeItem / deleteAgentKnowledgeItem`；vscode 模式下三类 postMessage 收敛为统一类型。三 tab UI、表单字段、i18n 键全部不动。
+  6. 测试：`cargo check --workspace` ✓、`cargo test -p magi-api --lib routes::knowledge` 5/5 ✓（含新增 `unified_knowledge_routes_round_trip` 一条）、`npm --prefix web run check` 683/0/0 ✓；全仓 `grep '/knowledge/adr|/knowledge/faq|/knowledge/learning'` 与 `grep '\.adrs|\.faqs|\.learnings'` 在 web/src 已为 0。
 
 ### #9 Skill 并入 Custom Tool
 - **状态**：⬜

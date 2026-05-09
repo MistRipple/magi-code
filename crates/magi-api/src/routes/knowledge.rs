@@ -20,25 +20,41 @@ pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/knowledge", get(get_project_knowledge))
         .route("/knowledge/clear", post(clear_knowledge))
-        .route("/knowledge/adrs", get(list_adrs))
-        .route("/knowledge/adrs/search", get(search_adrs))
-        .route("/knowledge/faqs", get(list_faqs))
-        .route("/knowledge/faqs/search", get(search_faqs))
-        .route("/knowledge/learnings", get(list_learnings))
-        .route("/knowledge/learnings/search", get(search_learnings))
-        .route("/knowledge/adr/add", post(add_adr))
-        .route("/knowledge/adr/update", post(update_adr))
-        .route("/knowledge/adr/delete", post(delete_adr))
-        .route("/knowledge/faq/add", post(add_faq))
-        .route("/knowledge/faq/update", post(update_faq))
-        .route("/knowledge/faq/delete", post(delete_faq))
-        .route("/knowledge/learning/add", post(add_learning))
-        .route("/knowledge/learning/update", post(update_learning))
-        .route("/knowledge/learning/delete", post(delete_learning))
+        .route("/knowledge/items", get(list_knowledge_items).post(add_knowledge_item))
+        .route("/knowledge/items/search", get(search_knowledge_items))
+        .route("/knowledge/items/update", post(update_knowledge_item))
+        .route("/knowledge/items/delete", post(delete_knowledge_item))
 }
 
 const MIN_LEARNING_CONTENT_LENGTH: usize = 12;
 const MAX_TAGS: usize = 8;
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum KnowledgeKindParam {
+    Adr,
+    Faq,
+    Learning,
+}
+
+impl KnowledgeKindParam {
+    fn into_domain(self) -> KnowledgeKind {
+        match self {
+            Self::Adr => KnowledgeKind::Adr,
+            Self::Faq => KnowledgeKind::Faq,
+            Self::Learning => KnowledgeKind::Learning,
+        }
+    }
+}
+
+fn kind_to_lower(kind: KnowledgeKind) -> &'static str {
+    match kind {
+        KnowledgeKind::Adr => "adr",
+        KnowledgeKind::Faq => "faq",
+        KnowledgeKind::Learning => "learning",
+        KnowledgeKind::CodeIndex => "codeIndex",
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,7 +70,10 @@ fn mutation_response(state: &ApiState, workspace_id: &WorkspaceId) -> KnowledgeM
             .knowledge_store
             .list()
             .into_iter()
-            .filter(|record| record.workspace_id.as_ref() == Some(workspace_id))
+            .filter(|record| {
+                record.workspace_id.as_ref() == Some(workspace_id)
+                    && record.kind != KnowledgeKind::CodeIndex
+            })
             .count(),
     }
 }
@@ -126,19 +145,10 @@ fn normalize_tags(tags: Vec<String>) -> Vec<String> {
     normalized
 }
 
-fn knowledge_record_json(record: &KnowledgeRecord) -> serde_json::Value {
+fn knowledge_item_json(record: &KnowledgeRecord) -> serde_json::Value {
     serde_json::json!({
         "id": record.knowledge_id,
-        "title": record.title,
-        "content": record.content,
-        "tags": record.tags,
-        "updatedAt": record.updated_at.0,
-    })
-}
-
-fn learning_record_json(record: &KnowledgeRecord) -> serde_json::Value {
-    serde_json::json!({
-        "id": record.knowledge_id,
+        "kind": kind_to_lower(record.kind),
         "title": record.title,
         "content": record.content,
         "context": record.source_ref,
@@ -178,77 +188,95 @@ async fn clear_knowledge(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct KnowledgeListQuery {
+struct KnowledgeItemsQuery {
+    kind: Option<KnowledgeKindParam>,
     workspace_id: Option<String>,
 }
 
-async fn list_adrs(
+async fn list_knowledge_items(
     State(state): State<ApiState>,
-    Query(query): Query<KnowledgeListQuery>,
+    Query(query): Query<KnowledgeItemsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
-    let query = KnowledgeQuery {
-        kind: Some(KnowledgeKind::Adr),
+    let kq = KnowledgeQuery {
+        kind: query.kind.map(KnowledgeKindParam::into_domain),
         text: None,
         tags: vec![],
         workspace_id: Some(workspace_id),
         limit: 1000,
     };
-    let result = state.knowledge_store.query(&query);
-    Ok(Json(serde_json::json!({
-        "adrs": result.matches.iter().map(|m| knowledge_record_json(&m.record)).collect::<Vec<_>>(),
-    })))
+    let result = state.knowledge_store.query(&kq);
+    let items = result
+        .matches
+        .iter()
+        .filter(|m| m.record.kind != KnowledgeKind::CodeIndex)
+        .map(|m| knowledge_item_json(&m.record))
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({ "items": items })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeSearchQuery {
+    kind: Option<KnowledgeKindParam>,
+    workspace_id: Option<String>,
+    q: Option<String>,
+}
+
+async fn search_knowledge_items(
+    State(state): State<ApiState>,
+    Query(query): Query<KnowledgeSearchQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
+    let text = query
+        .q
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let kq = KnowledgeQuery {
+        kind: query.kind.map(KnowledgeKindParam::into_domain),
+        text,
+        tags: vec![],
+        workspace_id: Some(workspace_id),
+        limit: 100,
+    };
+    let result = state.knowledge_store.query(&kq);
+    let results = result
+        .matches
+        .iter()
+        .filter(|m| m.record.kind != KnowledgeKind::CodeIndex)
+        .map(|m| {
+            let mut value = knowledge_item_json(&m.record);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("score".to_string(), serde_json::json!(m.score));
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({ "results": results })))
 }
 
 async fn get_project_knowledge(
     State(state): State<ApiState>,
-    Query(query): Query<KnowledgeListQuery>,
+    Query(query): Query<KnowledgeWorkspaceRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
     let scan_outcome = ensure_workspace_code_index(&state, &workspace_id)?;
-    let adrs_query = KnowledgeQuery {
-        kind: Some(KnowledgeKind::Adr),
+
+    let kq = KnowledgeQuery {
+        kind: None,
         text: None,
         tags: vec![],
         workspace_id: Some(workspace_id.clone()),
-        limit: 1000,
+        limit: 3000,
     };
-    let adrs_result = state.knowledge_store.query(&adrs_query);
-    let adrs = adrs_result
+    let result = state.knowledge_store.query(&kq);
+    let items = result
         .matches
         .iter()
-        .map(|m| knowledge_record_json(&m.record))
+        .filter(|m| m.record.kind != KnowledgeKind::CodeIndex)
+        .map(|m| knowledge_item_json(&m.record))
         .collect::<Vec<_>>();
 
-    let faqs_query = KnowledgeQuery {
-        kind: Some(KnowledgeKind::Faq),
-        text: None,
-        tags: vec![],
-        workspace_id: Some(workspace_id.clone()),
-        limit: 1000,
-    };
-    let faqs_result = state.knowledge_store.query(&faqs_query);
-    let faqs = faqs_result
-        .matches
-        .iter()
-        .map(|m| knowledge_record_json(&m.record))
-        .collect::<Vec<_>>();
-
-    let learnings_query = KnowledgeQuery {
-        kind: Some(KnowledgeKind::Learning),
-        text: None,
-        tags: vec![],
-        workspace_id: Some(workspace_id.clone()),
-        limit: 1000,
-    };
-    let learnings_result = state.knowledge_store.query(&learnings_query);
-    let learnings = learnings_result
-        .matches
-        .iter()
-        .map(|m| learning_record_json(&m.record))
-        .collect::<Vec<_>>();
-
-    // 从知识存储中获取代码索引摘要
     let code_index_summary = state
         .knowledge_store
         .code_index_summary_for_workspace(&workspace_id);
@@ -268,47 +296,9 @@ async fn get_project_knowledge(
         .unwrap_or(serde_json::Value::Null);
 
     Ok(Json(serde_json::json!({
-        "adrs": adrs,
-        "faqs": faqs,
-        "learnings": learnings,
+        "items": items,
         "codeIndex": code_index,
         "codeIndexStatus": code_index_status,
-    })))
-}
-
-async fn list_faqs(
-    State(state): State<ApiState>,
-    Query(query): Query<KnowledgeListQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
-    let query = KnowledgeQuery {
-        kind: Some(KnowledgeKind::Faq),
-        text: None,
-        tags: vec![],
-        workspace_id: Some(workspace_id),
-        limit: 1000,
-    };
-    let result = state.knowledge_store.query(&query);
-    Ok(Json(serde_json::json!({
-        "faqs": result.matches.iter().map(|m| knowledge_record_json(&m.record)).collect::<Vec<_>>(),
-    })))
-}
-
-async fn list_learnings(
-    State(state): State<ApiState>,
-    Query(query): Query<KnowledgeListQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
-    let query = KnowledgeQuery {
-        kind: Some(KnowledgeKind::Learning),
-        text: None,
-        tags: vec![],
-        workspace_id: Some(workspace_id),
-        limit: 1000,
-    };
-    let result = state.knowledge_store.query(&query);
-    Ok(Json(serde_json::json!({
-        "learnings": result.matches.iter().map(|m| learning_record_json(&m.record)).collect::<Vec<_>>(),
     })))
 }
 
@@ -362,117 +352,68 @@ fn code_index_status_json(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct KnowledgeSearchQuery {
-    q: Option<String>,
+struct AddKnowledgeItemRequest {
+    kind: KnowledgeKindParam,
     workspace_id: Option<String>,
-}
-
-impl KnowledgeSearchQuery {
-    fn text(self) -> Option<String> {
-        self.q
-            .map(|text| text.trim().to_string())
-            .filter(|text| !text.is_empty())
-    }
-}
-
-async fn search_adrs(
-    State(state): State<ApiState>,
-    Query(query): Query<KnowledgeSearchQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
-    Ok(search_knowledge(
-        &state,
-        KnowledgeKind::Adr,
-        query.text(),
-        workspace_id,
-    ))
-}
-
-async fn search_faqs(
-    State(state): State<ApiState>,
-    Query(query): Query<KnowledgeSearchQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
-    Ok(search_knowledge(
-        &state,
-        KnowledgeKind::Faq,
-        query.text(),
-        workspace_id,
-    ))
-}
-
-async fn search_learnings(
-    State(state): State<ApiState>,
-    Query(query): Query<KnowledgeSearchQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, query.workspace_id.as_deref())?;
-    Ok(search_knowledge(
-        &state,
-        KnowledgeKind::Learning,
-        query.text(),
-        workspace_id,
-    ))
-}
-
-fn search_knowledge(
-    state: &ApiState,
-    kind: KnowledgeKind,
-    text: Option<String>,
-    workspace_id: WorkspaceId,
-) -> Json<serde_json::Value> {
-    let kq = KnowledgeQuery {
-        kind: Some(kind),
-        text,
-        tags: vec![],
-        workspace_id: Some(workspace_id),
-        limit: 100,
-    };
-    let result = state.knowledge_store.query(&kq);
-    Json(serde_json::json!({
-        "results": result.matches.iter().map(|m| {
-            let mut value = if kind == KnowledgeKind::Learning {
-                learning_record_json(&m.record)
-            } else {
-                knowledge_record_json(&m.record)
-            };
-            if let Some(object) = value.as_object_mut() {
-                object.insert("score".to_string(), serde_json::json!(m.score));
-            }
-            value
-        }).collect::<Vec<_>>(),
-    }))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AddAdrRequest {
-    adr: AdrInput,
-    workspace_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AdrInput {
-    title: String,
+    #[serde(default)]
+    title: Option<String>,
     content: String,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    context: Option<String>,
 }
 
-async fn add_adr(
+async fn add_knowledge_item(
     State(state): State<ApiState>,
-    Json(request): Json<AddAdrRequest>,
+    Json(request): Json<AddKnowledgeItemRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
     let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
-    let id = format!("adr-{}", UtcMillis::now().0);
+    let kind = request.kind.into_domain();
+    let (id_prefix, title, content, source_ref) = match kind {
+        KnowledgeKind::Adr => {
+            let title = normalize_text(
+                request
+                    .title
+                    .ok_or_else(|| ApiError::InvalidInput("ADR 标题 不能为空".to_string()))?,
+                "ADR 标题",
+            )?;
+            let content = normalize_text(request.content, "ADR 内容")?;
+            ("adr", title, content, None)
+        }
+        KnowledgeKind::Faq => {
+            let title = normalize_text(
+                request
+                    .title
+                    .ok_or_else(|| ApiError::InvalidInput("FAQ 问题 不能为空".to_string()))?,
+                "FAQ 问题",
+            )?;
+            let content = normalize_text(request.content, "FAQ 答案")?;
+            ("faq", title, content, None)
+        }
+        KnowledgeKind::Learning => {
+            let content = normalize_learning_content(request.content)?;
+            let title = match request.title {
+                Some(value) => normalize_text(value, "经验标题")?,
+                None => title_from_learning(&content),
+            };
+            let source_ref = normalize_optional_text(request.context);
+            ("learning", title, content, source_ref)
+        }
+        KnowledgeKind::CodeIndex => {
+            return Err(ApiError::InvalidInput(
+                "kind 不支持 codeIndex".to_string(),
+            ));
+        }
+    };
     let record = KnowledgeRecord {
-        knowledge_id: id,
-        kind: KnowledgeKind::Adr,
-        title: normalize_text(request.adr.title, "ADR 标题")?,
-        content: normalize_text(request.adr.content, "ADR 内容")?,
-        tags: normalize_tags(request.adr.tags),
+        knowledge_id: format!("{id_prefix}-{}", UtcMillis::now().0),
+        kind,
+        title,
+        content,
+        tags: normalize_tags(request.tags),
         workspace_id: Some(workspace_id.clone()),
-        source_ref: None,
+        source_ref,
         updated_at: UtcMillis::now(),
     };
     state.knowledge_store.upsert(record);
@@ -482,75 +423,52 @@ async fn add_adr(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct UpdateKnowledgeRequest {
-    id: String,
-    updates: KnowledgeUpdates,
+struct UpdateKnowledgeItemRequest {
     workspace_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KnowledgeUpdates {
+    knowledge_id: String,
+    #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
     tags: Option<Vec<String>>,
-    source_ref: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
 }
 
-async fn update_adr(
+async fn update_knowledge_item(
     State(state): State<ApiState>,
-    Json(request): Json<UpdateKnowledgeRequest>,
+    Json(request): Json<UpdateKnowledgeItemRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
     let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
-    update_knowledge_record(&state, &workspace_id, &request.id, &request.updates)?;
-    Ok(Json(mutation_response(&state, &workspace_id)))
-}
-
-async fn update_faq(
-    State(state): State<ApiState>,
-    Json(request): Json<UpdateKnowledgeRequest>,
-) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
-    update_knowledge_record(&state, &workspace_id, &request.id, &request.updates)?;
-    Ok(Json(mutation_response(&state, &workspace_id)))
-}
-
-async fn update_learning(
-    State(state): State<ApiState>,
-    Json(request): Json<UpdateKnowledgeRequest>,
-) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
-    update_knowledge_record(&state, &workspace_id, &request.id, &request.updates)?;
-    Ok(Json(mutation_response(&state, &workspace_id)))
-}
-
-fn update_knowledge_record(
-    state: &ApiState,
-    workspace_id: &WorkspaceId,
-    id: &str,
-    updates: &KnowledgeUpdates,
-) -> Result<(), ApiError> {
     let existing = state
         .knowledge_store
-        .get(id)
-        .ok_or_else(|| ApiError::not_found("知识记录不存在", id))?;
-    if existing.workspace_id.as_ref() != Some(workspace_id) {
-        return Err(ApiError::not_found("知识记录不存在", id));
+        .get(&request.knowledge_id)
+        .ok_or_else(|| ApiError::not_found("知识记录不存在", &request.knowledge_id))?;
+    if existing.workspace_id.as_ref() != Some(&workspace_id) {
+        return Err(ApiError::not_found(
+            "知识记录不存在",
+            &request.knowledge_id,
+        ));
+    }
+    if existing.kind == KnowledgeKind::CodeIndex {
+        return Err(ApiError::InvalidInput(
+            "代码索引记录不能直接修改".to_string(),
+        ));
     }
     let kind = existing.kind;
-    let next_content = match updates.content.clone() {
+    let next_content = match request.content {
         Some(content) if kind == KnowledgeKind::Learning => normalize_learning_content(content)?,
         Some(content) => normalize_text(content, "知识内容")?,
         None => existing.content,
     };
-    let next_title = match updates.title.clone() {
+    let next_title = match request.title {
         Some(title) => normalize_text(title, "知识标题")?,
         None if kind == KnowledgeKind::Learning => title_from_learning(&next_content),
         None => existing.title,
     };
-    let next_source_ref = updates
-        .source_ref
-        .clone()
+    let next_source_ref = request
+        .context
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty())
         .or(existing.source_ref);
@@ -559,137 +477,32 @@ fn update_knowledge_record(
         kind,
         title: next_title,
         content: next_content,
-        tags: updates
-            .tags
-            .clone()
-            .map(normalize_tags)
-            .unwrap_or(existing.tags),
+        tags: request.tags.map(normalize_tags).unwrap_or(existing.tags),
         workspace_id: Some(workspace_id.clone()),
         source_ref: next_source_ref,
         updated_at: UtcMillis::now(),
     };
     state.knowledge_store.upsert(updated);
     state.persist_knowledge_state()?;
-    Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AddFaqRequest {
-    faq: FaqInput,
-    workspace_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct FaqInput {
-    title: String,
-    content: String,
-    #[serde(default)]
-    tags: Vec<String>,
-}
-
-async fn add_faq(
-    State(state): State<ApiState>,
-    Json(request): Json<AddFaqRequest>,
-) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
-    let id = format!("faq-{}", UtcMillis::now().0);
-    let record = KnowledgeRecord {
-        knowledge_id: id,
-        kind: KnowledgeKind::Faq,
-        title: normalize_text(request.faq.title, "FAQ 问题")?,
-        content: normalize_text(request.faq.content, "FAQ 答案")?,
-        tags: normalize_tags(request.faq.tags),
-        workspace_id: Some(workspace_id.clone()),
-        source_ref: None,
-        updated_at: UtcMillis::now(),
-    };
-    state.knowledge_store.upsert(record);
-    state.persist_knowledge_state()?;
     Ok(Json(mutation_response(&state, &workspace_id)))
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AddLearningRequest {
-    learning: LearningInput,
+struct DeleteKnowledgeItemRequest {
     workspace_id: Option<String>,
+    knowledge_id: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LearningInput {
-    content: String,
-    context: Option<String>,
-    #[serde(default)]
-    tags: Vec<String>,
-}
-
-async fn add_learning(
+async fn delete_knowledge_item(
     State(state): State<ApiState>,
-    Json(request): Json<AddLearningRequest>,
-) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
-    let content = normalize_learning_content(request.learning.content)?;
-    let id = format!("learning-{}", UtcMillis::now().0);
-    let record = KnowledgeRecord {
-        knowledge_id: id,
-        kind: KnowledgeKind::Learning,
-        title: title_from_learning(&content),
-        content,
-        tags: normalize_tags(request.learning.tags),
-        workspace_id: Some(workspace_id.clone()),
-        source_ref: normalize_optional_text(request.learning.context),
-        updated_at: UtcMillis::now(),
-    };
-    state.knowledge_store.upsert(record);
-    state.persist_knowledge_state()?;
-    Ok(Json(mutation_response(&state, &workspace_id)))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeleteKnowledgeRequest {
-    id: String,
-    workspace_id: Option<String>,
-}
-
-async fn delete_adr(
-    State(state): State<ApiState>,
-    Json(request): Json<DeleteKnowledgeRequest>,
+    Json(request): Json<DeleteKnowledgeItemRequest>,
 ) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
     let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
     state
         .knowledge_store
-        .delete_in_workspace(&request.id, &workspace_id)
-        .map_err(|error| map_knowledge_delete_error(error, &request.id))?;
-    state.persist_knowledge_state()?;
-    Ok(Json(mutation_response(&state, &workspace_id)))
-}
-
-async fn delete_faq(
-    State(state): State<ApiState>,
-    Json(request): Json<DeleteKnowledgeRequest>,
-) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
-    state
-        .knowledge_store
-        .delete_in_workspace(&request.id, &workspace_id)
-        .map_err(|error| map_knowledge_delete_error(error, &request.id))?;
-    state.persist_knowledge_state()?;
-    Ok(Json(mutation_response(&state, &workspace_id)))
-}
-
-async fn delete_learning(
-    State(state): State<ApiState>,
-    Json(request): Json<DeleteKnowledgeRequest>,
-) -> Result<Json<KnowledgeMutationResponse>, ApiError> {
-    let workspace_id = require_registered_workspace_id(&state, request.workspace_id.as_deref())?;
-    state
-        .knowledge_store
-        .delete_in_workspace(&request.id, &workspace_id)
-        .map_err(|error| map_knowledge_delete_error(error, &request.id))?;
+        .delete_in_workspace(&request.knowledge_id, &workspace_id)
+        .map_err(|error| map_knowledge_delete_error(error, &request.knowledge_id))?;
     state.persist_knowledge_state()?;
     Ok(Json(mutation_response(&state, &workspace_id)))
 }
@@ -764,6 +577,13 @@ mod tests {
             .expect("workspace should register");
     }
 
+    async fn read_json(response: axum::response::Response) -> serde_json::Value {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        serde_json::from_slice(&body).expect("payload should deserialize")
+    }
+
     #[tokio::test]
     async fn project_knowledge_returns_workspace_scoped_code_index() {
         let knowledge_store = KnowledgeStore::new();
@@ -787,12 +607,9 @@ mod tests {
             .expect("route should respond");
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should read");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&body).expect("payload should deserialize");
+        let payload = read_json(response).await;
         assert_eq!(payload["codeIndex"]["files"][0]["path"], "src/a.rs");
+        assert!(payload["items"].is_array(), "items 字段必须存在且为数组");
     }
 
     #[tokio::test]
@@ -852,11 +669,7 @@ mod tests {
             .expect("route should respond");
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should read");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&body).expect("payload should deserialize");
+        let payload = read_json(response).await;
         let files = payload["codeIndex"]["files"]
             .as_array()
             .expect("code index files should exist");
@@ -898,11 +711,7 @@ mod tests {
             .expect("route should respond");
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should read");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&body).expect("payload should deserialize");
+        let payload = read_json(response).await;
 
         assert!(payload["codeIndex"].is_null());
         assert_eq!(payload["codeIndexStatus"]["status"], "empty");
@@ -917,5 +726,180 @@ mod tests {
                 .is_none(),
             "空 workspace 不应被持久化为成功的 0 文件代码索引"
         );
+    }
+
+    #[tokio::test]
+    async fn unified_knowledge_routes_round_trip() {
+        let state = state_with_knowledge_store(KnowledgeStore::new());
+        let workspace_id = WorkspaceId::new("workspace-unified-knowledge");
+        register_test_workspace(&state, &workspace_id);
+        let app = || routes().with_state(state.clone());
+
+        let post_json = |uri: &'static str, body: serde_json::Value| {
+            let body_str = body.to_string();
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body_str))
+                .expect("request should build")
+        };
+
+        let get_uri = |uri: &str| {
+            Request::builder()
+                .method("GET")
+                .uri(uri.to_string())
+                .body(Body::empty())
+                .expect("request should build")
+        };
+
+        // add adr
+        let response = app()
+            .oneshot(post_json(
+                "/knowledge/items",
+                serde_json::json!({
+                    "kind": "adr",
+                    "workspaceId": workspace_id.as_str(),
+                    "title": "Adopt Rust workspace",
+                    "content": "We adopt Rust workspace.",
+                    "tags": ["arch"],
+                }),
+            ))
+            .await
+            .expect("add adr should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // add faq
+        let response = app()
+            .oneshot(post_json(
+                "/knowledge/items",
+                serde_json::json!({
+                    "kind": "faq",
+                    "workspaceId": workspace_id.as_str(),
+                    "title": "How to build?",
+                    "content": "Run cargo build.",
+                    "tags": [],
+                }),
+            ))
+            .await
+            .expect("add faq should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // add learning
+        let response = app()
+            .oneshot(post_json(
+                "/knowledge/items",
+                serde_json::json!({
+                    "kind": "learning",
+                    "workspaceId": workspace_id.as_str(),
+                    "content": "Always trim user input before normalization.",
+                    "context": "input-pipeline",
+                    "tags": ["lesson"],
+                }),
+            ))
+            .await
+            .expect("add learning should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // list (no kind)
+        let response = app()
+            .oneshot(get_uri(&format!(
+                "/knowledge/items?workspaceId={}",
+                workspace_id.as_str()
+            )))
+            .await
+            .expect("list should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json(response).await;
+        let items = payload["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 3);
+        let kinds: Vec<&str> = items
+            .iter()
+            .map(|i| i["kind"].as_str().expect("kind str"))
+            .collect();
+        assert!(kinds.contains(&"adr"));
+        assert!(kinds.contains(&"faq"));
+        assert!(kinds.contains(&"learning"));
+        for item in items {
+            let context = &item["context"];
+            if item["kind"] == "learning" {
+                assert_eq!(context, "input-pipeline");
+            } else {
+                assert!(context.is_null(), "non-learning context should be null");
+            }
+        }
+
+        // list filtered
+        let response = app()
+            .oneshot(get_uri(&format!(
+                "/knowledge/items?kind=adr&workspaceId={}",
+                workspace_id.as_str()
+            )))
+            .await
+            .expect("filtered list should respond");
+        let payload = read_json(response).await;
+        let items = payload["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["kind"], "adr");
+        let learning_id = state
+            .knowledge_store
+            .list()
+            .into_iter()
+            .find(|r| r.kind == KnowledgeKind::Learning)
+            .expect("learning record exists")
+            .knowledge_id;
+
+        // search
+        let response = app()
+            .oneshot(get_uri(&format!(
+                "/knowledge/items/search?q=cargo&workspaceId={}",
+                workspace_id.as_str()
+            )))
+            .await
+            .expect("search should respond");
+        let payload = read_json(response).await;
+        let results = payload["results"].as_array().expect("results array");
+        assert!(
+            results.iter().any(|r| r["kind"] == "faq"),
+            "search should hit faq"
+        );
+
+        // update
+        let response = app()
+            .oneshot(post_json(
+                "/knowledge/items/update",
+                serde_json::json!({
+                    "workspaceId": workspace_id.as_str(),
+                    "knowledgeId": learning_id,
+                    "tags": ["lesson", "verified"],
+                }),
+            ))
+            .await
+            .expect("update should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // delete
+        let response = app()
+            .oneshot(post_json(
+                "/knowledge/items/delete",
+                serde_json::json!({
+                    "workspaceId": workspace_id.as_str(),
+                    "knowledgeId": learning_id,
+                }),
+            ))
+            .await
+            .expect("delete should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // confirm count after delete
+        let response = app()
+            .oneshot(get_uri(&format!(
+                "/knowledge/items?workspaceId={}",
+                workspace_id.as_str()
+            )))
+            .await
+            .expect("final list should respond");
+        let payload = read_json(response).await;
+        assert_eq!(payload["items"].as_array().unwrap().len(), 2);
     }
 }

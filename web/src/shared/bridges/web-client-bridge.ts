@@ -11,11 +11,9 @@ import { getHostApi, getTransport, initTransport } from '../transport';
 import {
   approveAgentChange,
   approveAllAgentChanges,
-  addAgentAdr,
+  addAgentKnowledgeItem,
   appendAgentNotification,
   addAgentCustomTool,
-  addAgentFaq,
-  addAgentLearning,
   addAgentMcpServer,
   addAgentRepository,
   clearAgentNotifications,
@@ -25,9 +23,7 @@ import {
   connectAgentMcpServer,
   deleteAgentTask,
   deleteAgentSession,
-  deleteAgentAdr,
-  deleteAgentFaq,
-  deleteAgentLearning,
+  deleteAgentKnowledgeItem,
   deleteAgentMcpServer,
   deleteAgentRepository,
   disconnectAgentMcpServer,
@@ -69,9 +65,7 @@ import {
   testAgentOrchestratorConnection,
   testAgentWorkerConnection,
   startAgentTask,
-  updateAgentAdr,
-  updateAgentFaq,
-  updateAgentLearning,
+  updateAgentKnowledgeItem,
   updateAgentMcpServer,
   updateAgentRepository,
   updateAgentRuntimeSetting,
@@ -80,6 +74,10 @@ import {
   listAgentRegistryAgents,
   listAgentRegistryEngines,
   listAgentRoleTemplates,
+} from '../../web/agent-api';
+import type {
+  AgentKnowledgeItemPatch,
+  AgentKnowledgeItemPayload,
 } from '../../web/agent-api';
 import type { ClientBridge, ClientBridgeMessage, SupportedLocale } from './client-bridge';
 import {
@@ -2967,36 +2965,6 @@ async function clearProjectKnowledge(): Promise<void> {
   emitBridgeSuccessToast('清空项目知识', '项目知识已清空');
 }
 
-async function deleteAdr(id: string): Promise<void> {
-  await deleteAgentAdr(id);
-  await emitKnowledgePayload();
-  emitBridgeSuccessToast('删除 ADR', 'ADR 已删除');
-}
-
-async function deleteFaq(id: string): Promise<void> {
-  await deleteAgentFaq(id);
-  await emitKnowledgePayload();
-  emitBridgeSuccessToast('删除 FAQ', 'FAQ 已删除');
-}
-
-async function addLearning(learning: Record<string, unknown>): Promise<void> {
-  await addAgentLearning(learning);
-  await emitKnowledgePayload();
-  emitBridgeSuccessToast('添加经验', '经验记录已添加');
-}
-
-async function updateLearning(id: string, updates: Record<string, unknown>): Promise<void> {
-  await updateAgentLearning(id, updates);
-  await emitKnowledgePayload();
-  emitBridgeSuccessToast('更新经验', '经验记录已更新');
-}
-
-async function deleteLearning(id: string): Promise<void> {
-  await deleteAgentLearning(id);
-  await emitKnowledgePayload();
-  emitBridgeSuccessToast('删除经验', '经验记录已删除');
-}
-
 export function createWebClientBridge(): ClientBridge {
   // 初始化传输层（自动检测 VS Code / Web 环境，选择对应策略）
   initTransport();
@@ -3487,86 +3455,61 @@ export function createWebClientBridge(): ClientBridge {
             logBridgeOperationFailure('项目知识加载', '[web-client-bridge] 项目知识加载失败:', error);
           });
           return;
-        case 'addADR':
-          if (message.adr && typeof message.adr === 'object') {
-            void addAgentAdr(message.adr as Record<string, unknown>).then(async () => {
-              await emitKnowledgePayload();
-              emitBridgeSuccessToast('添加 ADR', 'ADR 已添加');
-            }).catch((error) => {
-              logBridgeOperationFailure('添加 ADR ', '[web-client-bridge] 添加 ADR 失败:', error);
-            });
-          }
-          return;
-        case 'updateADR':
-          if (typeof message.id === 'string' && message.updates && typeof message.updates === 'object') {
-            void updateAgentAdr(message.id, message.updates as Record<string, unknown>).then(async () => {
-              await emitKnowledgePayload();
-              emitBridgeSuccessToast('更新 ADR', 'ADR 已更新');
-            }).catch((error) => {
-              logBridgeOperationFailure('更新 ADR ', '[web-client-bridge] 更新 ADR 失败:', error);
-            });
-          }
-          return;
-        case 'addFAQ':
-          if (message.faq && typeof message.faq === 'object') {
-            void addAgentFaq(message.faq as Record<string, unknown>).then(async () => {
-              await emitKnowledgePayload();
-              emitBridgeSuccessToast('添加 FAQ', 'FAQ 已添加');
-            }).catch((error) => {
-              logBridgeOperationFailure('添加 FAQ ', '[web-client-bridge] 添加 FAQ 失败:', error);
-            });
-          }
-          return;
-        case 'updateFAQ':
-          if (typeof message.id === 'string' && message.updates && typeof message.updates === 'object') {
-            void updateAgentFaq(message.id, message.updates as Record<string, unknown>).then(async () => {
-              await emitKnowledgePayload();
-              emitBridgeSuccessToast('更新 FAQ', 'FAQ 已更新');
-            }).catch((error) => {
-              logBridgeOperationFailure('更新 FAQ ', '[web-client-bridge] 更新 FAQ 失败:', error);
-            });
-          }
-          return;
-        case 'addLearning':
-          if (message.learning && typeof message.learning === 'object') {
-            void addLearning(message.learning as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('添加经验', '[web-client-bridge] 添加经验失败:', error);
-            });
-          }
-          return;
-        case 'updateLearning':
-          if (typeof message.id === 'string' && message.updates && typeof message.updates === 'object') {
-            void updateLearning(message.id, message.updates as Record<string, unknown>).catch((error) => {
-              logBridgeOperationFailure('更新经验', '[web-client-bridge] 更新经验失败:', error);
-            });
-          }
-          return;
         case 'clearProjectKnowledge':
           void clearProjectKnowledge().catch((error) => {
             logBridgeOperationFailure('清空项目知识', '[web-client-bridge] 清空项目知识失败:', error);
           });
           return;
-        case 'deleteADR':
-          if (typeof message.id === 'string' && message.id.trim()) {
-            void deleteAdr(message.id).catch((error) => {
-              logBridgeOperationFailure('删除 ADR ', '[web-client-bridge] 删除 ADR 失败:', error);
+        case 'addKnowledgeItem': {
+          const kind = typeof message.kind === 'string' ? message.kind : '';
+          const content = typeof message.content === 'string' ? message.content : '';
+          if ((kind === 'adr' || kind === 'faq' || kind === 'learning') && content) {
+            const payload: AgentKnowledgeItemPayload = {
+              kind,
+              content,
+              title: typeof message.title === 'string' ? message.title : undefined,
+              tags: Array.isArray(message.tags) ? (message.tags as string[]) : [],
+              context: typeof message.context === 'string' ? message.context : undefined,
+            };
+            void addAgentKnowledgeItem(payload).then(async () => {
+              await emitKnowledgePayload();
+              emitBridgeSuccessToast('添加知识条目', '知识条目已添加');
+            }).catch((error) => {
+              logBridgeOperationFailure('添加知识条目 ', '[web-client-bridge] 添加知识条目失败:', error);
             });
           }
           return;
-        case 'deleteFAQ':
-          if (typeof message.id === 'string' && message.id.trim()) {
-            void deleteFaq(message.id).catch((error) => {
-              logBridgeOperationFailure('删除 FAQ ', '[web-client-bridge] 删除 FAQ 失败:', error);
+        }
+        case 'updateKnowledgeItem': {
+          const knowledgeId = typeof message.knowledgeId === 'string' ? message.knowledgeId.trim() : '';
+          if (knowledgeId) {
+            const patch: AgentKnowledgeItemPatch = {
+              title: typeof message.title === 'string' ? message.title : undefined,
+              content: typeof message.content === 'string' ? message.content : undefined,
+              tags: Array.isArray(message.tags) ? (message.tags as string[]) : undefined,
+              context: typeof message.context === 'string' ? message.context : undefined,
+            };
+            void updateAgentKnowledgeItem(knowledgeId, patch).then(async () => {
+              await emitKnowledgePayload();
+              emitBridgeSuccessToast('更新知识条目', '知识条目已更新');
+            }).catch((error) => {
+              logBridgeOperationFailure('更新知识条目 ', '[web-client-bridge] 更新知识条目失败:', error);
             });
           }
           return;
-        case 'deleteLearning':
-          if (typeof message.id === 'string' && message.id.trim()) {
-            void deleteLearning(message.id).catch((error) => {
-              logBridgeOperationFailure('删除经验', '[web-client-bridge] 删除经验失败:', error);
+        }
+        case 'deleteKnowledgeItem': {
+          const knowledgeId = typeof message.knowledgeId === 'string' ? message.knowledgeId.trim() : '';
+          if (knowledgeId) {
+            void deleteAgentKnowledgeItem(knowledgeId).then(async () => {
+              await emitKnowledgePayload();
+              emitBridgeSuccessToast('删除知识条目', '知识条目已删除');
+            }).catch((error) => {
+              logBridgeOperationFailure('删除知识条目 ', '[web-client-bridge] 删除知识条目失败:', error);
             });
           }
           return;
+        }
         case 'connectMCPServer':
           if (typeof message.serverId === 'string' && message.serverId.trim()) {
             void connectMcpServer(message.serverId).catch((error) => {
