@@ -32,9 +32,9 @@
 | P0 产品定位锚定 | 3 | 0 | 0 | 3 | 0 |
 | P1 用户心智核心抽象 | 4 | 0 | 0 | 4 | 0 |
 | P2 业务能力收口 | 5 | 0 | 0 | 5 | 0 |
-| P3 任务系统产品表达 | 3 | 1 | 0 | 2 | 0 |
+| P3 任务系统产品表达 | 3 | 0 | 0 | 3 | 0 |
 | P4 链路边界收口 | 3 | 0 | 0 | 3 | 0 |
-| **合计** | **18** | **1** | **0** | **17** | **0** |
+| **合计** | **18** | **0** | **0** | **18** | **0** |
 
 ---
 
@@ -305,12 +305,21 @@
 - **验证**：`npm --prefix web run check` ✓（683/0/0）
 
 ### #15 Decision Task 实现或删除（二选一）
-- **状态**：⬜
+- **状态**：✅
+- **完成时间**：2026-05-09
 - **任务**：消除"后端定义、前端不渲染"的死代码。
 - **建议**：**选实现**——前端补 `DecisionCard.svelte`，渲染 `decision_payload.options`，调用 `/api/tasks/{id}/decision` 提交用户选择。给一个 demo 触发路径（如"网络写权限"触发 Decision）。Decision 是产品差异化关键能力，删了就没自治叙事。
+- **执行结果**：审查代码后确认 doc 前提（"前端不渲染"）与现状脱节，**功能已完整闭环**，无需再写代码：
+  - **后端 3 条真实生产 escalate 路径**：
+    - `crates/magi-orchestrator/src/task_runner.rs:670` —— policy snapshot 判 `NeedsApproval` 时自动创建 Decision Task（选项：继续执行 / 中止整个任务）
+    - `crates/magi-orchestrator/src/task_runner.rs:1099` —— `escalate_missing_evidence`（缺失关键证据）
+    - `crates/magi-orchestrator/src/task_runner.rs:1216` —— 失败逃生路径（选项：重试 / 跳过 / 中止）
+  - **前端 UI 已实现**：`web/src/components/TasksPanel.svelte:1130-1166` 在「需要处理」attention 区块通过 `decisionAttentionTasks = attentionTasks.filter(t => t.kind === 'Decision')` 渲染选项按钮（含推荐高亮、loading 态、risk_notes），点击 → `resolveTaskDecision(taskId, sessionId, { chosenOption })` → 刷新任务投影
+  - **API 完备**：`/api/tasks/{task_id}/decision` 路由 + `ResolveTaskDecisionRequestDto/ResponseDto` + `RustDaemonClient.resolveTaskDecision()`
+  - doc 偏差注记：「前端无 `DecisionCard` 组件」属字面理解 —— 当前是 attention list 内联渲染（与 blocked task 同区，符合"需要处理"心智），并非独立组件文件；功能与 doc 「选实现」目标一致，未来若需要单独抽 `DecisionCard.svelte` 是纯重构，不影响产品能力
 - **改后增量**：领域建模 +0.5、可演进性 +0.3
 - **依赖**：#1（产品定位决定是否需要"自治 Agent"叙事）
-- **代码证据**：`magi-core/src/task.rs::DecisionTaskPayload` 定义完整 + `/api/tasks/{task_id}/decision` 路由存在 + 前端无 `DecisionCard` 组件
+- **代码证据**：`magi-core/src/task.rs::DecisionTaskPayload` 定义完整 + `/api/tasks/{task_id}/decision` 路由存在 + 前端 `TasksPanel.svelte` attention 区块已实现 Decision 选项渲染与提交
 
 ---
 
