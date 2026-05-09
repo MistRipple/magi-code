@@ -43,6 +43,15 @@
   // 🔧 修复响应式：会话列表
   const sessions = $derived(ensureArray(messagesState.sessions) as Session[]);
 
+  // 当前 workspace 的目录名（仅展示，便于在多 workspace 切换时确认上下文）
+  const currentWorkspaceFolder = $derived.by(() => {
+    const path = messagesState.currentWorkspacePath?.trim() ?? '';
+    if (!path) return '';
+    const cleaned = path.replace(/[\\/]+$/, '');
+    const segments = cleaned.split(/[\\/]/).filter(Boolean);
+    return segments.length > 0 ? segments[segments.length - 1] : cleaned;
+  });
+
   // 当前会话是否为空（无消息），为空时禁止创建新会话
   const isCurrentSessionEmpty = $derived(
     ensureArray(appState.threadMessages).length === 0
@@ -184,6 +193,17 @@
 </script>
 
 <header class="header-bar">
+  {#if currentWorkspaceFolder}
+    <div
+      class="workspace-breadcrumb"
+      title={messagesState.currentWorkspacePath || currentWorkspaceFolder}
+      aria-label={i18n.t('header.workspaceBreadcrumbTitle', { path: messagesState.currentWorkspacePath || currentWorkspaceFolder })}
+    >
+      <Icon name="folder" size={12} />
+      <span class="workspace-breadcrumb-name">{currentWorkspaceFolder}</span>
+      <span class="workspace-breadcrumb-sep">/</span>
+    </div>
+  {/if}
   <!-- 会话选择器 -->
   <div class="session-selector">
     <button class="session-selector-btn" onclick={toggleDropdown}>
@@ -322,6 +342,34 @@
     display: flex;
     flex: 1;
     justify-content: center;
+  }
+
+  .workspace-breadcrumb {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 24px;
+    padding: 0 8px;
+    margin-right: 4px;
+    color: var(--foreground-muted);
+    font-size: 11px;
+    border-radius: var(--radius-full);
+    background: color-mix(in srgb, var(--surface-2) 50%, transparent);
+    flex-shrink: 0;
+    cursor: default;
+  }
+  .workspace-breadcrumb-name {
+    max-width: 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .workspace-breadcrumb-sep {
+    color: var(--foreground-muted);
+    opacity: 0.55;
+  }
+  @media (max-width: 720px) {
+    .workspace-breadcrumb-name { max-width: 80px; }
   }
 
   .session-selector {

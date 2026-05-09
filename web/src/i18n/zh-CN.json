@@ -112,6 +112,7 @@
   "header.messageCount": "{count} 条消息",
   "header.deleteSession": "删除会话",
   "header.settings": "设置",
+  "header.workspaceBreadcrumbTitle": "当前 workspace：{path}",
   "header.exportSession": "导出当前会话为 Markdown",
   "header.exportSuccess": "已导出 {count} 条消息",
   "header.exportEmpty": "当前会话没有可导出的内容",

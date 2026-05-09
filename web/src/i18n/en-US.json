@@ -112,6 +112,7 @@
   "header.messageCount": "{count} messages",
   "header.deleteSession": "Delete Session",
   "header.settings": "Settings",
+  "header.workspaceBreadcrumbTitle": "Current workspace: {path}",
   "header.exportSession": "Export current session as Markdown",
   "header.exportSuccess": "Exported {count} message(s)",
   "header.exportEmpty": "Nothing to export in this session",
