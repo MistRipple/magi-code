@@ -7,6 +7,7 @@ import SettingsModelTab from './SettingsModelTab.svelte';
 import SettingsToolsTab from './SettingsToolsTab.svelte';
 import Icon from './Icon.svelte';
 import Modal from './Modal.svelte';
+import LanAccessPanel from './LanAccessPanel.svelte';
 import { i18n } from '../stores/i18n.svelte';
 import {
     updateAgentRuntimeSetting,
@@ -21,10 +22,13 @@ import { getAgentColor } from '../lib/agent-colors';
   }
   
   let { onClose }: Props = $props();
-  
+
   const store = useSettingsStore({
     onClose: () => onClose?.(),
   });
+
+  // P2-#12：局域网/隧道访问从 Header 主路径下沉到 Settings 高级抽屉，默认关闭。
+  let showLanPanel = $state(false);
 </script>
 
 
@@ -91,6 +95,22 @@ import { getAgentColor } from '../lib/agent-colors';
         </button>
       </nav>
       <div class="sidebar-footer">
+        <div class="advanced-section">
+          <span class="advanced-label">{i18n.t('settings.advanced.title')}</span>
+          <div class="lan-access-wrapper">
+            <button
+              type="button"
+              class="settings-btn secondary advanced-btn"
+              class:active={showLanPanel}
+              onclick={() => { showLanPanel = !showLanPanel; }}
+              title={i18n.t('lanAccess.title')}
+            >
+              <Icon name="qrcode" size={14} />
+              <span>{i18n.t('settings.advanced.lanAccess')}</span>
+            </button>
+            <LanAccessPanel visible={showLanPanel} onClose={() => { showLanPanel = false; }} />
+          </div>
+        </div>
         {#if store.userInfo && store.clientKind === 'vscode'}
           <div class="logout-section">
             <span class="user-info-text" title={store.userInfo}>{store.userInfo}</span>
@@ -783,6 +803,43 @@ import { getAgentColor } from '../lib/agent-colors';
     .sidebar-footer {
       padding: 16px 24px;
       margin-top: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    /* P2-#12：sidebar 底部「高级」抽屉，托管局域网/隧道访问入口 */
+    .advanced-section {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding-top: 8px;
+      border-top: 1px solid var(--vscode-widget-border, rgba(0, 0, 0, 0.08));
+    }
+
+    .advanced-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--foreground-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .lan-access-wrapper {
+      position: relative;
+    }
+
+    .advanced-btn {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      justify-content: flex-start;
+    }
+
+    .advanced-btn.active {
+      color: var(--primary);
+      border-color: color-mix(in srgb, var(--primary) 35%, transparent);
     }
 
     .settings-main {

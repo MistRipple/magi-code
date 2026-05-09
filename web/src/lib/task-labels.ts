@@ -169,3 +169,51 @@ export function getRunnerStatusLabel(status: string): string {
     default: return '空闲';
   }
 }
+
+// 用户面三态：把 5 态 runner_status 压成用户能识别的「执行中 / 已停止 / 已完成」。
+// running + blocked 都算执行中（blocked 用 tooltip 解释等待原因）；
+// idle 算已停止；completed + error 都算已完成（error 用 tone 标红）。
+export type RunnerUserState = 'in-progress' | 'stopped' | 'finished';
+
+export function getRunnerUserState(status: string): RunnerUserState {
+  switch (status) {
+    case 'running':
+    case 'blocked':
+      return 'in-progress';
+    case 'completed':
+    case 'error':
+      return 'finished';
+    default:
+      return 'stopped';
+  }
+}
+
+export function getRunnerUserStateLabel(status: string): string {
+  switch (getRunnerUserState(status)) {
+    case 'in-progress': return '执行中';
+    case 'finished': return '已完成';
+    default: return '已停止';
+  }
+}
+
+// tone 用于 badge 着色：error → failed（红），其余按用户态语义。
+export function getRunnerUserStateTone(status: string): 'running' | 'failed' | 'completed' | 'stopped' {
+  if (status === 'error') return 'failed';
+  switch (getRunnerUserState(status)) {
+    case 'in-progress': return 'running';
+    case 'finished': return 'completed';
+    default: return 'stopped';
+  }
+}
+
+// blocked 状态需要 tooltip 解释「等待什么」；其余态返回 null（继续用普通 title）。
+export function getRunnerUserStateTooltip(status: string, blockedReason?: string | null): string | null {
+  if (status === 'blocked') {
+    const reason = (blockedReason ?? '').trim();
+    return reason ? `等待处理：${reason}` : '等待处理';
+  }
+  if (status === 'error') {
+    return '执行过程中出现异常';
+  }
+  return null;
+}

@@ -5,7 +5,6 @@
   import Icon from './Icon.svelte';
   import Modal from './Modal.svelte';
   import NotificationCenter from './NotificationCenter.svelte';
-  import LanAccessPanel from './LanAccessPanel.svelte';
   import type { Session } from '../types/message';
   import { i18n } from '../stores/i18n.svelte';
 
@@ -20,8 +19,7 @@
   // 下拉菜单状态
   let dropdownOpen = $state(false);
 
-  // 远程访问面板状态
-  let showLanPanel = $state(false);
+  // P2-#12：局域网/隧道访问入口已收到 SettingsPanel 高级抽屉，主路径不再暴露。
 
   // 删除确认对话框状态
   let showDeleteConfirm = $state(false);
@@ -233,17 +231,6 @@
     <button class="btn-icon btn-icon--sm" onclick={newSession} title={newSessionTitle} disabled={newSessionDisabled}>
       <Icon name="plus" size={14} />
     </button>
-    <div class="lan-access-wrapper">
-      <button
-        class="btn-icon btn-icon--sm lan-access-trigger"
-        class:active={showLanPanel}
-        onclick={() => { showLanPanel = !showLanPanel; }}
-        title={i18n.t('lanAccess.title')}
-      >
-        <Icon name="qrcode" size={14} />
-      </button>
-      <LanAccessPanel visible={showLanPanel} onClose={() => { showLanPanel = false; }} />
-    </div>
     <NotificationCenter />
     <button class="btn-icon btn-icon--sm" onclick={openSettings} title={i18n.t('header.settings')}>
       <Icon name="settings" size={14} />
@@ -359,14 +346,6 @@
     .session-selector-name {
       max-width: 120px;
     }
-  }
-
-  .lan-access-wrapper {
-    position: relative;
-  }
-
-  .lan-access-trigger.active {
-    color: var(--primary);
   }
 
   .session-selector-btn {

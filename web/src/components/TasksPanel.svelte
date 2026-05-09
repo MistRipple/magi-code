@@ -17,7 +17,9 @@
     type TaskReferenceDescriptor,
   } from '../lib/task-reference';
   import {
-    getRunnerStatusLabel,
+    getRunnerUserStateLabel,
+    getRunnerUserStateTone,
+    getRunnerUserStateTooltip,
     getTaskDisplayBlockedReason,
     getTaskDisplayGoal,
     getTaskDisplayText,
@@ -249,6 +251,14 @@
   const pendingDecisionTask = $derived.by(() => (
     attentionTasks.find((task) => task.kind === 'Decision') ?? null
   ));
+  // 给 runner badge 的 blocked 态准备一个简短的等待原因摘要（tooltip 用）。
+  const runnerBlockedReason = $derived.by(() => {
+    const proj = taskGraph.projection;
+    if (!proj || proj.runner_status !== 'blocked') return null;
+    const source = pendingDecisionTask ?? attentionTasks[0] ?? null;
+    if (!source) return null;
+    return getTaskDisplayBlockedReason(source);
+  });
   const decisionAttentionTasks = $derived.by(() => attentionTasks.filter((task) => task.kind === 'Decision'));
   // 用户面（主视图）只展开 Action / Validation / Decision；Phase / WorkPackage / Repair / Objective
   // 仅出现在“技术明细”折叠区，与引擎结构隔开。
@@ -707,8 +717,11 @@
             {/if}
           </div>
           <div class="task-overview-badges">
-            <span class="tg-status-badge tg-status--{getTaskStatusModifier(proj.aggregate_status)}">
-              {getRunnerStatusLabel(proj.runner_status)}
+            <span
+              class="tg-status-badge tg-status--{getRunnerUserStateTone(proj.runner_status)}"
+              title={getRunnerUserStateTooltip(proj.runner_status, runnerBlockedReason) ?? ''}
+            >
+              {getRunnerUserStateLabel(proj.runner_status)}
             </span>
           </div>
         </div>
@@ -1611,7 +1624,8 @@
   }
 
   .tg-status--cancelled,
-  .tg-status--skipped {
+  .tg-status--skipped,
+  .tg-status--stopped {
     color: var(--foreground-muted);
     background: var(--surface-2);
     border-color: var(--border);

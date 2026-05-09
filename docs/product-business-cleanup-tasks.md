@@ -31,10 +31,10 @@
 |---|---|---|---|---|---|
 | P0 产品定位锚定 | 3 | 0 | 0 | 3 | 0 |
 | P1 用户心智核心抽象 | 4 | 0 | 0 | 4 | 0 |
-| P2 业务能力收口 | 5 | 4 | 0 | 1 | 0 |
-| P3 任务系统产品表达 | 3 | 2 | 0 | 1 | 0 |
-| P4 链路边界收口 | 3 | 2 | 0 | 1 | 0 |
-| **合计** | **18** | **8** | **0** | **10** | **0** |
+| P2 业务能力收口 | 5 | 3 | 0 | 2 | 0 |
+| P3 任务系统产品表达 | 3 | 1 | 0 | 2 | 0 |
+| P4 链路边界收口 | 3 | 1 | 0 | 2 | 0 |
+| **合计** | **18** | **5** | **0** | **13** | **0** |
 
 ---
 
@@ -217,12 +217,19 @@
 - **代码证据**：`SettingsModelTab/AgentsTab/ToolsTab/RulesTab/StatsTab` 五个组件 + `routes/settings.rs` 2055 行 / 数十端点
 
 ### #12 tunnel / lan-access 收到高级抽屉
-- **状态**：⬜
+- **状态**：✅
+- **完成时间**：2026-05-09
 - **任务**：弱化主路径上的局域网共享入口。
 - **建议**：保留全部能力，UI 移到 Settings 「高级 → 网络」。默认关闭。
+- **执行结果**：
+  - `Header.svelte` 删除 LanAccessPanel 入口（按钮 + wrapper + state + 相关样式）
+  - `SettingsPanel.svelte` 在 sidebar-footer 新增「高级」分区，承载 LanAccess 入口；保留 popover 行为（wrapper position: relative + LanAccessPanel 自身 absolute 定位）
+  - i18n（zh-CN / en-US）新增 `settings.advanced.title` / `settings.advanced.lanAccess`
+  - 后端能力（`/api/tunnel`、`lan_access_status`）保持不变；仅 UI 入口降级
 - **改后增量**：协议表面 +0.1
 - **依赖**：#1（确认产品定位是个人本地）
 - **代码证据**：`routes/changes_files_tunnel.rs::start_tunnel/stop_tunnel/lan_access_status`
+- **验证**：`npm --prefix web run check` ✓（683/0/0）/ 浏览器：Header 不再出现 QR 入口；Settings 抽屉底部「高级」区块的「局域网访问」按钮可正常展开 LanAccessPanel
 
 ---
 
@@ -248,16 +255,24 @@
 - **验证**：cargo check ✓ / cargo build ✓ / npm check ✓ / magi-daemon 52/52 / magi-api 仅 2 个 pre-existing 失败
 
 ### #14 任务状态机用户面三态化
-- **状态**：⬜
+- **状态**：✅
+- **完成时间**：2026-05-09
 - **任务**：把 5 态 runner_status 在前端压成 3 态。
 - **建议**：
   - `running / blocked` → 「执行中」（blocked 显示等待原因 tooltip）
   - `stopped` → 「已停止」
   - `completed / error` → 「已完成」（error 用红色 badge）
   - 后端状态保留不动
+- **执行结果**：
+  - 新增 `lib/task-labels.ts::RunnerUserState`（`in-progress | stopped | finished`）+ `getRunnerUserState/Label/Tone/Tooltip`
+  - `TasksPanel.svelte` runner badge 改为三态映射；`blocked` 时通过 tooltip 显示等待原因（`runnerBlockedReason` $derived）
+  - `error` 与 `completed` 共享「已完成」标签，但 tone 不同（error → danger，红色）
+  - 旧 5 态 i18n 键保留（`runtimeState.status.*` / `workerBadge.status.*`）——RuntimeStatePanel/ExecutorBadge 是诊断面板的不同语义场景，超出本次 runner 三态收口范围
+  - 后端 `runner_status` 枚举值保持原样未动
 - **改后增量**：协议表面 +0.3
 - **依赖**：无
 - **代码证据**：`TasksPanel.svelte::proj.runner_status` 五态分支
+- **验证**：`npm --prefix web run check` ✓（683/0/0）
 
 ### #15 Decision Task 实现或删除（二选一）
 - **状态**：⬜
@@ -280,12 +295,22 @@
 - **代码证据**：`routes/sessions.rs::submit_session_turn` vs `routes/tasks_interaction.rs::handle_intake`
 
 ### #17 一个 session 同一时刻只跑一个 root task
-- **状态**：⬜
+- **状态**：✅
+- **完成时间**：2026-05-09
 - **任务**：明确产品语义为单任务串行。
 - **建议**：`RunnerManager.session_runner_index` 物理上支持多个，但产品上加约束：提交新任务前如果 session 有运行中任务，弹"停止当前任务并开始新任务？"对话框。
+- **执行结果**：
+  - `InputArea.svelte::sendMessage` 检测到 `shouldUseIntake`（已有运行中任务）且非"自然续传"指令时，改为弹出 Modal 三选一：
+    - 取消（dismiss）
+    - 作为补充指令（continue as follow-up，沿用原 intake 路径）
+    - 停止当前并新建任务（pauseTask + executeTask 重新走 task 路由）
+  - 新增 i18n（zh-CN / en-US）`input.runningTaskConfirm.{title,body,cancel,followUp,stopAndStart,stopFailed}` 共 6 键
+  - 复用现有 `Modal.svelte` 组件（与 Header 删除/切换确认对话框一致风格）
+  - 后端 `RunnerManager.session_runner_index` 容器结构未动；产品语义靠前端门控收敛
 - **改后增量**：领域建模 +0.2
 - **依赖**：无
 - **代码证据**：`RunnerManager.session_runner_index: HashMap<SessionId, Vec<String>>`
+- **验证**：`npm --prefix web run check` ✓（683/0/0）
 
 ### #18 .gitignore 兜底
 - **状态**：✅

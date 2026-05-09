@@ -12,6 +12,7 @@
   import { RustDaemonClient } from '../shared/rust-daemon-client';
   import { resolveAgentBaseUrl } from '../web/agent-api';
   import Icon from './Icon.svelte';
+  import Modal from './Modal.svelte';
   import { generateId } from '../lib/utils';
   import { i18n } from '../stores/i18n.svelte';
   import { isTaskProjectionAcceptingIntake } from '../lib/task-projection-state';
@@ -38,6 +39,12 @@
   // Intake 路由状态
   let intakeLoading = $state(false);
   let stopLoading = $state(false);
+
+  // P4-#17：单会话串行任务确认对话框
+  // 任务图运行时再次提交，先弹窗让用户选「补充指令 / 停止当前并新建 / 取消」，
+  // 避免 intake 分类器把潜在的"新任务"无声地塞回当前 task graph。
+  let showRunningTaskConfirm = $state(false);
+  let pendingSubmissionText = $state<string | null>(null);
 
   const currentSessionId = $derived(messagesState.currentSessionId);
   const taskGraph = $derived(getTaskGraphState(currentSessionId));
@@ -157,7 +164,9 @@
 
     // 任务运行中默认走 Intake；继续意图必须交给 session turn 分类器恢复执行链。
     if (shouldUseIntake && submissionText && !isNaturalContinueRequest(submissionText)) {
-      await sendIntake(submissionText);
+      // P4-#17：弹窗让用户显式选择"补充指令 vs 停止并新建"，避免分类器隐式吞掉新任务意图。
+      pendingSubmissionText = submissionText;
+      showRunningTaskConfirm = true;
       return;
     }
 
@@ -174,6 +183,53 @@
       })),
     });
     clearComposerState();
+  }
+
+  // P4-#17：用户选择「作为补充指令加入当前任务」——走原有 intake 分类器路径。
+  async function confirmContinueAsFollowUp() {
+    const text = pendingSubmissionText;
+    showRunningTaskConfirm = false;
+    pendingSubmissionText = null;
+    if (!text) return;
+    await sendIntake(text);
+  }
+
+  // P4-#17：用户选择「停止当前任务并以此开始新任务」——pause 当前 root task 后以 executeTask 重新提交。
+  async function confirmStopAndStartNew() {
+    const text = pendingSubmissionText;
+    showRunningTaskConfirm = false;
+    pendingSubmissionText = null;
+    if (!text) return;
+    intakeLoading = true;
+    try {
+      const sessionId = currentSessionId?.trim();
+      const projection = taskGraph.projection;
+      const rootTaskId = projection?.root_task.task_id ?? taskGraph.rootTaskId;
+      if (sessionId && rootTaskId) {
+        const client = new RustDaemonClient(resolveAgentBaseUrl());
+        await client.pauseTask({ taskId: rootTaskId, sessionId });
+        await refreshTaskProjection(sessionId);
+      }
+      const requestId = generateId();
+      vscode.postMessage({
+        type: 'executeTask',
+        text,
+        requestId,
+        skillName: null,
+        images: selectedImages.map((img) => ({ name: img.name, dataUrl: img.dataUrl })),
+      });
+      clearComposerState();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast('error', i18n.t('input.runningTaskConfirm.stopFailed', { message: msg }));
+    } finally {
+      intakeLoading = false;
+    }
+  }
+
+  function dismissRunningTaskConfirm() {
+    showRunningTaskConfirm = false;
+    pendingSubmissionText = null;
   }
 
   async function sendIntake(message: string) {
@@ -508,6 +564,32 @@
 
 </div>
 
+{#if showRunningTaskConfirm}
+  <Modal
+    title={i18n.t('input.runningTaskConfirm.title')}
+    onClose={dismissRunningTaskConfirm}
+    size="md"
+    closeOnBackdrop={false}
+  >
+    <p class="ia-confirm-body">{i18n.t('input.runningTaskConfirm.body')}</p>
+    {#if pendingSubmissionText}
+      <div class="ia-confirm-preview">{pendingSubmissionText}</div>
+    {/if}
+
+    {#snippet footer()}
+      <button class="modal-btn secondary" onclick={dismissRunningTaskConfirm}>
+        {i18n.t('input.runningTaskConfirm.cancel')}
+      </button>
+      <button class="modal-btn secondary" onclick={confirmContinueAsFollowUp}>
+        {i18n.t('input.runningTaskConfirm.followUp')}
+      </button>
+      <button class="modal-btn danger" onclick={confirmStopAndStartNew}>
+        {i18n.t('input.runningTaskConfirm.stopAndStart')}
+      </button>
+    {/snippet}
+  </Modal>
+{/if}
+
 <style>
   /* ============================================
      InputArea - 输入区域
@@ -838,6 +920,28 @@
       opacity: 1;
       transform: none;
     }
+  }
+
+  /* P4-#17：运行中任务确认对话框的输入预览块 */
+  .ia-confirm-body {
+    margin: 0 0 var(--space-3) 0;
+    color: var(--foreground);
+    font-size: var(--text-sm);
+    line-height: var(--leading-relaxed);
+  }
+
+  .ia-confirm-preview {
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-subtle);
+    background: var(--surface-2);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 120px;
+    overflow-y: auto;
   }
 
 </style>
