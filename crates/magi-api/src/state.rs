@@ -1087,6 +1087,7 @@ impl ApiState {
                 if let Some(client) = pool.get(&server_id) {
                     entry["connected"] = serde_json::json!(true);
                     entry["health"] = serde_json::json!("connected");
+                    entry.as_object_mut().map(|m| m.remove("error"));
                     if let Ok(tools) = client.list_tools() {
                         entry["toolCount"] = serde_json::json!(tools.len());
                     }
@@ -1099,24 +1100,28 @@ impl ApiState {
                             entry["connected"] = serde_json::json!(true);
                             entry["health"] = serde_json::json!("connected");
                             entry["toolCount"] = serde_json::json!(tools.len());
+                            entry.as_object_mut().map(|m| m.remove("error"));
                             let mut pool = self
                                 .mcp_connections
                                 .write()
                                 .expect("mcp connections write lock poisoned");
                             pool.insert(server_id, Arc::new(client));
                         }
-                        Err(_) => {
+                        Err(err) => {
                             entry["connected"] = serde_json::json!(false);
                             entry["health"] = serde_json::json!("disconnected");
+                            entry["error"] = serde_json::json!(err.to_string());
                         }
                     }
                 } else {
                     entry["connected"] = serde_json::json!(false);
                     entry["health"] = serde_json::json!("disconnected");
+                    entry["error"] = serde_json::json!("配置无效：缺少 command 或 transport");
                 }
             } else {
                 entry["connected"] = serde_json::json!(false);
                 entry["health"] = serde_json::json!("disconnected");
+                entry.as_object_mut().map(|m| m.remove("error"));
             }
         }
     }
