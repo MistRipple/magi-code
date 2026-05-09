@@ -1341,7 +1341,7 @@ mod tests {
             "worker_spawned",
             "pending",
             Some("权威任务状态".to_string()),
-            Some("已创建执行分支。".to_string()),
+            Some("已创建执行步骤。".to_string()),
             Some("turn-item-worker-spawned-authority".to_string()),
         );
         spawned_item.item_seq = 1;

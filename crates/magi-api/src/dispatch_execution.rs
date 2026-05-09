@@ -388,7 +388,7 @@ pub(crate) fn run_dispatch_submission(
             status: "pending".to_string(),
             source: worker_id.to_string(),
             title: Some(lane_title.clone()),
-            content: Some(format!("已为 {} 创建执行分支。", lane_title)),
+            content: Some(format!("已为 {} 创建执行步骤。", lane_title)),
             task_id: Some(sub_task_id.clone()),
             worker_id: Some(worker_id.clone()),
             role_id: role_for_task(sub_task_id),
@@ -488,12 +488,12 @@ fn task_graph_mainline_summary(
 
     if phase_count > 0 {
         return format!(
-            "已完成任务分派：上方卡片会按执行分支展示负责人、目标和状态。接下来我会回收结果，继续在主线里整合判断并推进下一步。"
+            "已完成任务分派：上方卡片会按执行步骤展示负责人、目标和状态。接下来我会回收结果，继续在主线里整合判断并推进下一步。"
         );
     }
 
     format!(
-        "已创建 {} 个执行分支；上方卡片会展示负责人、目标和状态。接下来我会回收结果，继续在主线里整合判断并推进下一步。",
+        "已创建 {} 个执行步骤；上方卡片会展示负责人、目标和状态。接下来我会回收结果，继续在主线里整合判断并推进下一步。",
         worker_lanes.len(),
     )
 }
@@ -1270,7 +1270,7 @@ fn update_session_execution_branches(
                 status: "pending".to_string(),
                 source: lane.worker_id.to_string(),
                 title: Some(lane.title.clone()),
-                content: Some(format!("已为 {} 创建执行分支。", lane.title)),
+                content: Some(format!("已为 {} 创建执行步骤。", lane.title)),
                 task_id: Some(lane.task_id.clone()),
                 worker_id: Some(lane.worker_id.clone()),
                 role_id: lane.role_id.clone(),
@@ -2867,7 +2867,7 @@ mod tests {
                     && item.task_id.as_ref() == Some(&appended_task_id)
                     && item.worker_visible
             }),
-            "追加任务必须产生 worker 可见的分支卡片事件"
+            "追加任务必须产生 worker 可见的步骤卡片事件"
         );
     }
 

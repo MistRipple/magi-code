@@ -30,11 +30,11 @@
 | 区块 | 总数 | ⬜ | 🔄 | ✅ | ⏭️ |
 |---|---|---|---|---|---|
 | P0 产品定位锚定 | 3 | 0 | 0 | 3 | 0 |
-| P1 用户心智核心抽象 | 4 | 3 | 0 | 1 | 0 |
+| P1 用户心智核心抽象 | 4 | 2 | 0 | 2 | 0 |
 | P2 业务能力收口 | 5 | 4 | 0 | 1 | 0 |
 | P3 任务系统产品表达 | 3 | 2 | 0 | 1 | 0 |
 | P4 链路边界收口 | 3 | 2 | 0 | 1 | 0 |
-| **合计** | **18** | **11** | **0** | **7** | **0** |
+| **合计** | **18** | **10** | **0** | **8** | **0** |
 
 ---
 
@@ -120,12 +120,19 @@
   6. 重命名退场：`DEEP_TASK_PLAN_TOOL_NAME → TASK_PLAN_TOOL_NAME`、`create_deep_task_plan → create_task_plan`、`DeepTaskGraphPlan/PhasePlan/...` 去 `Deep` 前缀、`build/replan/insert/validate_deep_task_graph → *_task_graph`、`extract_deep_task_goal → extract_task_goal`、`loopback_deep_task_goal → loopback_task_goal`。
 
 ### #5 「团队模式」语言收回
-- **状态**：⬜
+- **状态**：✅
+- **完成时间**：2026-05-09
 - **任务**：从用户面与路由识别词中彻底删除"团队模式"。
 - **建议**：删除 i18n、关键字识别、文案里的"团队模式""team mode"。后端 worker 协作能力保留，但用户面不暴露这个名词。`shadow_execution.rs` 文案改用"步骤"代替"分支"。
 - **改后增量**：协议表面 +0.3
 - **依赖**：#4
 - **代码证据**：上次 commit (8467edc) 又把"团队任务模式""team mode"加回了 `session_turn_requests_task_orchestration`，但 AgentTab/BottomTabs 已删——语言在摇摆
+- **执行结果**：
+  1. 全仓 grep `团队模式|团队任务|team mode|team_mode|teamMode` 在代码层（`.rs`/`.ts`/`.svelte`/`.json`）已为 0。
+  2. 后端用户面文案（`dispatch_execution.rs`、`session_turn_writeback.rs`）将"执行分支"统一改为"执行步骤"——分派 summary、worker_spawned 卡片、orchestration mainline summary 等出口已对齐。
+  3. 前端 i18n（`web/src/i18n/zh-CN.json`）`dispatchGroupCard.dispatchSummary` 与 `runtimeDiagnostics.recovery.restoredWorkerBranchCount` 文案改为"执行步骤""恢复步骤数"；en-US 中"lanes/branches"暂留（英文术语本就独立，与中文用户面无关）。
+  4. 测试 fixture（`routes/dispatch_flow.rs::action_task_title_does_not_repeat_execute_prefix`、`dto/read_model.rs` worker_lane title `"完成分支"`）改为不含"团队模式""分支"的中性描述，避免在测试中复活术语。
+  5. 内部代码标识符（task_id `lane-*`、`active_branch_task_ids`、字段名 `branches`）属于写域内部概念，本次保留——与 P1-#7 (Worker 术语弱化) 一并处理。
 
 ### #6 TaskKind 用户可见面收口
 - **状态**：⬜

@@ -151,12 +151,12 @@ mod tests {
     #[test]
     fn action_task_title_does_not_repeat_execute_prefix() {
         assert_eq!(
-            format_action_task_title("执行: 团队模式检查 README"),
-            "执行: 团队模式检查 README"
+            format_action_task_title("执行: 批量检查 README"),
+            "执行: 批量检查 README"
         );
         assert_eq!(
-            format_action_task_title("团队模式检查 README"),
-            "执行: 团队模式检查 README"
+            format_action_task_title("批量检查 README"),
+            "执行: 批量检查 README"
         );
     }
 }
