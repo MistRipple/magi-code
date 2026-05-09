@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
   import {
     addToast,
@@ -106,6 +107,23 @@
     inputValue = '';
     selectedImages = [];
   }
+
+  onMount(() => {
+    function handleFillComposer(event: Event) {
+      const text = (event as CustomEvent<{ text?: string }>).detail?.text;
+      if (typeof text !== 'string' || !text.trim()) return;
+      inputValue = text;
+      queueMicrotask(() => {
+        const el = inputTextareaEl;
+        if (!el) return;
+        el.focus();
+        const cursor = text.length;
+        try { el.setSelectionRange(cursor, cursor); } catch { /* ignore */ }
+      });
+    }
+    window.addEventListener('magi:fillComposer', handleFillComposer as EventListener);
+    return () => window.removeEventListener('magi:fillComposer', handleFillComposer as EventListener);
+  });
 
   function resolveComposerRawContent(): string {
     if (typeof inputTextareaEl?.value === 'string') {

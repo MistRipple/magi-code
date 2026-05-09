@@ -185,6 +185,16 @@
   const emptyIcon = $derived((emptyState?.icon || 'chat') as import('../lib/icons').IconName);
   const emptyTitle = $derived(emptyState?.title || i18n.t('messageList.empty.title'));
   const emptyHint = $derived(emptyState?.hint || i18n.t('messageList.empty.hint'));
+  const showSuggestions = $derived(displayContext === 'thread' && !emptyState);
+  const suggestionItems = $derived([
+    i18n.t('messageList.suggestions.s1'),
+    i18n.t('messageList.suggestions.s2'),
+    i18n.t('messageList.suggestions.s3'),
+  ]);
+  function fillComposer(text: string) {
+    if (typeof window === 'undefined') return;
+    window.dispatchEvent(new CustomEvent('magi:fillComposer', { detail: { text } }));
+  }
   const panelKey = $derived.by((): keyof ScrollPositions => (displayContext === 'worker' ? (workerName || 'worker') : 'thread'));
   const persistedScrollTop = $derived(messagesState.scrollPositions[panelKey] || 0);
   const persistedScrollAnchor = $derived(messagesState.scrollAnchors[panelKey]);
@@ -536,6 +546,16 @@
         </div>
         <p class="empty-text">{emptyTitle}</p>
         <p class="empty-hint">{emptyHint}</p>
+        {#if showSuggestions}
+          <div class="empty-suggestions">
+            <span class="suggestions-title">{i18n.t('messageList.suggestions.title')}</span>
+            {#each suggestionItems as text (text)}
+              <button type="button" class="suggestion-card" onclick={() => fillComposer(text)}>
+                <span class="suggestion-text">{text}</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
         {#if canLoadOlderHistory || sessionHistory.isLoadingBefore}
           <button
             type="button"
@@ -687,6 +707,55 @@
   .empty-hint {
     font-size: var(--text-sm);
     opacity: 0.7;
+  }
+
+  .empty-suggestions {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    align-items: stretch;
+    width: 100%;
+    max-width: 480px;
+    margin-top: var(--space-5);
+  }
+
+  .suggestions-title {
+    font-size: var(--text-xs);
+    font-weight: var(--font-semibold);
+    color: var(--foreground-muted);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    text-align: left;
+    margin-bottom: var(--space-1);
+  }
+
+  .suggestion-card {
+    display: flex;
+    align-items: center;
+    text-align: left;
+    padding: var(--space-3) var(--space-4);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface-1, rgba(255,255,255,0.02));
+    color: var(--foreground);
+    font-size: var(--text-sm);
+    cursor: pointer;
+    transition: background var(--transition-fast), border-color var(--transition-fast), transform var(--transition-fast);
+  }
+
+  .suggestion-card:hover {
+    background: var(--surface-hover, rgba(255,255,255,0.05));
+    border-color: color-mix(in srgb, var(--info) 40%, var(--border));
+    transform: translateY(-1px);
+  }
+
+  .suggestion-card:active {
+    transform: translateY(0);
+  }
+
+  .suggestion-text {
+    flex: 1;
+    line-height: 1.5;
   }
 
   .empty-history-load {
