@@ -32,9 +32,9 @@
 | P0 产品定位锚定 | 3 | 0 | 0 | 3 | 0 |
 | P1 用户心智核心抽象 | 4 | 4 | 0 | 0 | 0 |
 | P2 业务能力收口 | 5 | 4 | 0 | 1 | 0 |
-| P3 任务系统产品表达 | 3 | 3 | 0 | 0 | 0 |
+| P3 任务系统产品表达 | 3 | 2 | 0 | 1 | 0 |
 | P4 链路边界收口 | 3 | 2 | 0 | 1 | 0 |
-| **合计** | **18** | **13** | **0** | **5** | **0** |
+| **合计** | **18** | **12** | **0** | **6** | **0** |
 
 ---
 
@@ -197,12 +197,23 @@
 ## P3 — 任务系统的产品表达
 
 ### #13 任务路由识别全部交给 LLM
-- **状态**：⬜
+- **状态**：✅
+- **完成时间**：2026-05-09
 - **任务**：删除关键字白名单驱动的任务路由识别。
 - **建议**：删除 `session_turn_requests_task_orchestration`（24 关键字）和 `session_turn_requests_current_project_analysis`（30+ 关键字）。完全依赖 `classify_session_turn` 的模型决策。
+- **执行结果**：
+  - 删除 3 个关键字检测函数与对应的 `normalize_session_turn_decision` 覆盖块：
+    - `session_turn_requests_task_orchestration`（24 关键字 → 强制 task 路由）
+    - `session_turn_requests_diagram_render`（31 关键字 → 强制 execute + diagram_render）
+    - `session_turn_requests_current_project_analysis`（30+ 关键字 → 强制 execute + shell_exec）
+  - 删除关联的 `diagram_render_tool_intent` / `current_project_tool_intent` 工具意图生成器
+  - 删除 5 个对应的单元测试（`normalizes_diagram_creation_*` / `mind_map_creation_*` / `normalizes_current_project_*` / `normalizes_current_workspace_identity_*` / `explicit_team_task_mode_*`）
+  - **保留** `session_turn_requested_public_builtin_tools`（不是关键词分类，是用户显式工具名引用，如 `请调用 file_read`）与对应的工具 intent helpers
+  - LLM `classify_session_turn` 分类器 prompt 已包含所有相关指引（diagram_render、execute vs task 等），现由 LLM 单独决策
 - **改后增量**：领域建模 +0.3、协议表面 +0.2
 - **依赖**：#10（业务模型可用作为前置）
 - **代码证据**：`routes/sessions.rs` 里两份关键字白名单共 50+ 条
+- **验证**：cargo check ✓ / cargo build ✓ / npm check ✓ / magi-daemon 52/52 / magi-api 仅 2 个 pre-existing 失败
 
 ### #14 任务状态机用户面三态化
 - **状态**：⬜

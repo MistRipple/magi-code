@@ -520,29 +520,6 @@ fn normalize_session_turn_decision(
             decision.task_evidence.push("deepTask=true".to_string());
         }
     }
-    if !request.deep_task
-        && !matches!(decision.route, SessionTurnRouteDto::Continue)
-        && session_turn_requests_task_orchestration(request)
-    {
-        let original_goal = request.trimmed_text().unwrap_or_default();
-        decision.route = SessionTurnRouteDto::Task;
-        decision.task_title = Some(deep_task_title(&original_goal));
-        if !original_goal.is_empty() {
-            decision.execution_goal = Some(original_goal.to_string());
-        }
-        decision.tool_intent = None;
-        decision.forced_tool_name = None;
-        decision.required_tool_chain.clear();
-        decision.confidence = decision.confidence.max(0.95);
-        decision.reason_code = Some("explicit_task_request".to_string());
-        decision.route_reason =
-            Some("用户明确要求团队模式或任务编排，应创建任务图并由主线统筹执行。".to_string());
-        if decision.task_evidence.is_empty() {
-            decision
-                .task_evidence
-                .push("用户明确要求团队模式或任务编排".to_string());
-        }
-    }
     if matches!(decision.route, SessionTurnRouteDto::Task)
         && !session_turn_task_route_has_creation_evidence(&decision)
     {
@@ -552,23 +529,6 @@ fn normalize_session_turn_decision(
         decision.required_workers.clear();
         decision.tool_intent = None;
         decision.required_tool_chain.clear();
-    }
-    if !request.deep_task
-        && !matches!(decision.route, SessionTurnRouteDto::Continue)
-        && session_turn_requests_diagram_render(request)
-    {
-        decision.route = SessionTurnRouteDto::Execute;
-        decision.task_title = None;
-        decision.execution_goal = None;
-        decision.required_workers.clear();
-        decision.tool_intent = Some(diagram_render_tool_intent());
-        decision.forced_tool_name = Some("diagram_render".to_string());
-        decision.required_tool_chain.clear();
-        decision.confidence = decision.confidence.max(0.96);
-        decision.reason_code = Some("tool_request".to_string());
-        decision.route_reason =
-            Some("用户明确请求生成可视化图表，应直接调用 diagram_render。".to_string());
-        decision.task_evidence.clear();
     }
     if !request.deep_task
         && !matches!(
@@ -613,63 +573,7 @@ fn normalize_session_turn_decision(
             }
         }
     }
-    if !request.deep_task
-        && !matches!(
-            decision.route,
-            SessionTurnRouteDto::Continue | SessionTurnRouteDto::Task
-        )
-        && session_turn_requests_current_project_analysis(request)
-    {
-        decision.route = SessionTurnRouteDto::Execute;
-        decision.task_title = None;
-        decision.execution_goal = None;
-        decision.required_workers.clear();
-        decision.tool_intent = Some(current_project_tool_intent());
-        decision.forced_tool_name = Some("shell_exec".to_string());
-        decision.required_tool_chain.clear();
-        decision.confidence = decision.confidence.max(0.94);
-        decision.reason_code = Some("tool_request".to_string());
-        decision.route_reason =
-            Some("用户请求分析当前项目，应直接调用工具读取当前工作区上下文。".to_string());
-        decision.task_evidence.clear();
-    }
     decision
-}
-
-fn session_turn_requests_task_orchestration(request: &SessionTurnRequestDto) -> bool {
-    let Some(text) = request.trimmed_text() else {
-        return false;
-    };
-    let normalized = text.to_ascii_lowercase();
-    [
-        "团队任务模式",
-        "团队模式",
-        "任务模式",
-        "任务编排",
-        "深度任务",
-        "多 worker",
-        "多worker",
-        "多 agent",
-        "多agent",
-        "worker 协作",
-        "worker协作",
-        "分派任务",
-        "分配任务",
-        "创建任务",
-        "多阶段任务",
-        "team mode",
-        "task mode",
-        "orchestration",
-        "orchestrate",
-        "multi-worker",
-        "multi worker",
-        "multi-agent",
-        "multi agent",
-        "subagent",
-        "sub-agent",
-    ]
-    .iter()
-    .any(|term| normalized.contains(term))
 }
 
 fn deep_task_title(original_goal: &str) -> String {
@@ -766,122 +670,6 @@ fn multi_builtin_tool_intent(tool_names: &[&str]) -> String {
         "用户明确要求串联调用多个公开内置工具：{}。必须按用户原始输入描述的依赖顺序选择并调用这些工具；每个工具的 path/source/destination/command/query/content/patch/diff 参数必须从对应编号步骤原文提取。如果用户已经指定文件名、目录名或命令，禁止改名为 probe、tmp、placeholder 或其它自造临时名；最终回复只能描述工具实际结果。不要创建任务，不要只输出文字说明。某一步失败时应原位展示失败工具，并基于已执行结果给出简短说明。",
         tool_names.join(", ")
     )
-}
-
-fn session_turn_requests_diagram_render(request: &SessionTurnRequestDto) -> bool {
-    let Some(text) = request.trimmed_text() else {
-        return false;
-    };
-    let normalized = text.to_ascii_lowercase();
-    if normalized.contains("diagram_render") {
-        return true;
-    }
-    let has_create_action = [
-        "画",
-        "绘制",
-        "生成",
-        "创建",
-        "制作",
-        "做一个",
-        "做个",
-        "渲染",
-        "可视化",
-        "draw",
-        "generate",
-        "create",
-        "make",
-        "render",
-        "visualize",
-    ]
-    .iter()
-    .any(|term| normalized.contains(term));
-    if !has_create_action {
-        return false;
-    }
-    [
-        "流程图",
-        "图表",
-        "关系图",
-        "架构图",
-        "时序图",
-        "序列图",
-        "状态图",
-        "思维导图",
-        "甘特图",
-        "mermaid",
-        "graphviz",
-        " dot",
-        "diagram",
-        "flowchart",
-        "sequence diagram",
-        "mind map",
-    ]
-    .iter()
-    .any(|term| normalized.contains(term))
-}
-
-fn diagram_render_tool_intent() -> String {
-    "用户请求生成可视化图表。必须直接调用 diagram_render 工具完成图表生成；不要要求用户自己调用工具，也不要只输出工具调用说明。根据用户原始输入选择合适的 kind：思维导图、层级结构、知识结构、流程/步骤/登录流程必须优先使用 flow 或 graph 的结构化 graph.nodes/edges；关系网络优先使用 graph；只有时序图、状态图、甘特图、饼图、类图、ER 图、timeline、C4、sankey 等 Mermaid 专属语法才使用 mermaid；不要使用 Mermaid mindmap。工具完成后只用一句话说明图表已生成。"
-        .to_string()
-}
-
-fn session_turn_requests_current_project_analysis(request: &SessionTurnRequestDto) -> bool {
-    let Some(text) = request.trimmed_text() else {
-        return false;
-    };
-    let normalized = text.to_ascii_lowercase();
-    let has_project_reference = [
-        "当前项目",
-        "当前工程",
-        "当前仓库",
-        "当前工作区",
-        "本项目",
-        "这个项目",
-        "项目分析",
-        "工作区",
-        "代码库",
-        "仓库",
-        "current project",
-        "current repo",
-        "current workspace",
-        "project analysis",
-        "repo analysis",
-        "codebase",
-    ]
-    .iter()
-    .any(|term| normalized.contains(term));
-    if !has_project_reference {
-        return false;
-    }
-    [
-        "分析",
-        "理解",
-        "检查",
-        "审查",
-        "看看",
-        "说明",
-        "介绍",
-        "概括",
-        "是什么",
-        "inspect",
-        "analyze",
-        "analyse",
-        "review",
-        "understand",
-        "examine",
-        "scan",
-        "read",
-        "describe",
-        "summarize",
-        "what is",
-    ]
-    .iter()
-    .any(|term| normalized.contains(term))
-}
-
-fn current_project_tool_intent() -> String {
-    "用户要求分析当前项目。必须把当前工作区当作唯一上下文来源，优先使用 shell_exec、file_read、search_text、search_semantic 等工具读取工作区根目录、README、配置文件和关键源码，然后再给出有依据的项目分析。不要要求用户手动提供项目结构，不要只做泛泛猜测。"
-        .to_string()
 }
 
 fn session_turn_task_route_has_creation_evidence(decision: &SessionTurnIntentDecision) -> bool {
@@ -2389,59 +2177,12 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_diagram_creation_to_forced_diagram_tool_execution() {
-        let request = session_turn_request("画一个登陆的流程图");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert_eq!(decision.forced_tool_name.as_deref(), Some("diagram_render"));
-        let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
-        assert!(tool_intent.contains("diagram_render"));
-        assert!(tool_intent.contains("不要要求用户自己调用工具"));
-    }
-
-    #[test]
-    fn mind_map_creation_prefers_structured_flow_or_graph() {
-        let request = session_turn_request("画一个验证自动保存规则的思维导图");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert_eq!(decision.forced_tool_name.as_deref(), Some("diagram_render"));
-        let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
-        assert!(tool_intent.contains("思维导图"));
-        assert!(tool_intent.contains("flow 或 graph"));
-        assert!(tool_intent.contains("不要使用 Mermaid mindmap"));
-    }
-
-    #[test]
     fn keeps_plain_diagram_explanation_as_chat() {
         let request = session_turn_request("解释一下流程图是什么");
         let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
 
         assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
         assert!(decision.forced_tool_name.is_none());
-    }
-
-    #[test]
-    fn normalizes_current_project_analysis_to_tool_execution() {
-        let request = session_turn_request("分析一下当前项目");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert_eq!(decision.forced_tool_name.as_deref(), Some("shell_exec"));
-        let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
-        assert!(tool_intent.contains("当前工作区"));
-        assert!(tool_intent.contains("不要要求用户手动提供项目结构"));
-    }
-
-    #[test]
-    fn normalizes_current_workspace_identity_question_to_tool_execution() {
-        let request = session_turn_request("请用一句话说明当前工作区是什么项目。");
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
-        assert_eq!(decision.forced_tool_name.as_deref(), Some("shell_exec"));
-        assert_eq!(decision.reason_code.as_deref(), Some("tool_request"));
     }
 
     #[test]
@@ -2510,28 +2251,6 @@ mod tests {
         assert!(goal.contains("FLOW_TASK_FILE_OK"));
         assert!(goal.contains("FLOW_TASK_DONE"));
         assert_eq!(decision.reason_code.as_deref(), Some("deep_task_requested"));
-    }
-
-    #[test]
-    fn explicit_team_task_mode_creates_task_without_hidden_deep_task_flag() {
-        let request = session_turn_request(
-            "请用团队任务模式检查当前 TEST 工作区：列出项目入口、运行一个简单 shell 检查，并给出简短结论。",
-        );
-        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
-        assert_eq!(
-            decision.reason_code.as_deref(),
-            Some("explicit_task_request")
-        );
-        assert!(
-            decision
-                .execution_goal
-                .as_deref()
-                .unwrap_or_default()
-                .contains("团队任务模式")
-        );
-        assert!(!decision.task_evidence.is_empty());
     }
 
     #[test]
