@@ -901,6 +901,7 @@
   "topTabs.tasks": "任务",
   "topTabs.edits": "变更",
   "topTabs.knowledge": "知识",
+  "topTabs.attentionTitle": "{count} 项任务待处理（决策或阻塞）",
   "toolCall.waitForWorkersRunning": "等待中",
   "toolCall.waitForWorkersCompleted": "已完成",
   "workerBadge.role.orchestrator": "协调者",

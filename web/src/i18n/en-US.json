@@ -906,6 +906,7 @@
   "topTabs.tasks": "Tasks",
   "topTabs.edits": "Edits",
   "topTabs.knowledge": "Knowledge",
+  "topTabs.attentionTitle": "{count} task(s) need attention (decision or blocked)",
   "toolCall.waitForWorkersRunning": "Waiting",
   "toolCall.waitForWorkersCompleted": "Completed",
   "workerBadge.role.orchestrator": "Orchestrator",

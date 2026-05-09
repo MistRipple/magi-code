@@ -20,6 +20,16 @@
     const projection = taskGraph.projection;
     return projection?.progress_summary?.total_tasks ?? 0;
   });
+  // 需要用户处理的任务（pending decisions + blocked），优先级高于总数显示
+  const attentionCount = $derived.by(() => {
+    const projection = taskGraph.projection;
+    if (!projection) return 0;
+    const ids = new Set<string>([
+      ...(projection.pending_decisions ?? []),
+      ...(projection.blocked_tasks ?? []),
+    ]);
+    return ids.size;
+  });
   const editsBadge = $derived(ensureArray(appState.edits).length);
 </script>
 
@@ -29,7 +39,11 @@
   </button>
   <button class="tab-item" class:active={activeTopTab === 'tasks'} onclick={() => onTabChange('tasks')}>
     {i18n.t('topTabs.tasks')}
-    {#if tasksBadge > 0}
+    {#if attentionCount > 0}
+      <span class="badge badge--warning" title={i18n.t('topTabs.attentionTitle', { count: attentionCount })}>
+        {attentionCount}
+      </span>
+    {:else if tasksBadge > 0}
       <span class="badge {activeTopTab === 'tasks' ? 'badge--primary' : 'badge--muted'}">{tasksBadge}</span>
     {/if}
   </button>
@@ -89,6 +103,11 @@
   .badge--primary {
     background: var(--primary);
     color: var(--primary-foreground);
+  }
+
+  .badge--warning {
+    background: var(--warning, #f59e0b);
+    color: #fff;
   }
 
   @media (max-width: 768px) {
