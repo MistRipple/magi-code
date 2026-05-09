@@ -2,7 +2,7 @@
   import type { ContentBlock, Message, PlaceholderState } from '../types/message';
   import type { IconName } from '../lib/icons';
   import MarkdownContent from './MarkdownContent.svelte';
-  import WorkerBadge from './WorkerBadge.svelte';
+  import ExecutorBadge from './ExecutorBadge.svelte';
   import BlockRenderer from './BlockRenderer.svelte';
   import Icon from './Icon.svelte';
   import RetryRuntimeIndicator from './RetryRuntimeIndicator.svelte';
@@ -387,7 +387,7 @@
     <!-- 非主角色：在内容前显示来源标识 -->
     {#if !isNativeSource && !isPlaceholder}
       <div class="inline-source-tag">
-        <WorkerBadge worker={badgeWorker} label={workerBadgeLabel} size="sm" />
+        <ExecutorBadge worker={badgeWorker} label={workerBadgeLabel} size="sm" />
       </div>
     {/if}
 

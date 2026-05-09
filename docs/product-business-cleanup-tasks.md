@@ -30,11 +30,11 @@
 | 区块 | 总数 | ⬜ | 🔄 | ✅ | ⏭️ |
 |---|---|---|---|---|---|
 | P0 产品定位锚定 | 3 | 0 | 0 | 3 | 0 |
-| P1 用户心智核心抽象 | 4 | 1 | 0 | 3 | 0 |
+| P1 用户心智核心抽象 | 4 | 0 | 0 | 4 | 0 |
 | P2 业务能力收口 | 5 | 4 | 0 | 1 | 0 |
 | P3 任务系统产品表达 | 3 | 2 | 0 | 1 | 0 |
 | P4 链路边界收口 | 3 | 2 | 0 | 1 | 0 |
-| **合计** | **18** | **9** | **0** | **9** | **0** |
+| **合计** | **18** | **8** | **0** | **10** | **0** |
 
 ---
 
@@ -151,12 +151,21 @@
   6. **`npm --prefix web run check`** ✓（683 文件 0 错 0 警）；daemon 起服 + 浏览器开 Tasks 面板验证空状态 / Tab 切换无 console 错误。
 
 ### #7 Worker 术语弱化
-- **状态**：⬜
+- **状态**：✅
+- **完成时间**：2026-05-09
 - **任务**：前端文案去 "worker" 化。
 - **建议**：前端 `Worker` → `执行者`，`lane` → `执行步骤`。`WorkerBadge.svelte` → `ExecutorBadge.svelte`。后端代码不动（写域隔离）。
 - **改后增量**：协议表面 +0.2
 - **依赖**：无
 - **代码证据**：`WorkerBadge.svelte` + `worker-card-view-model.ts` + `agent-colors.ts`
+- **执行结果**：
+  1. 组件改名：`WorkerBadge.svelte` → `ExecutorBadge.svelte`，内部类型 `WorkerStatus → ExecutorStatus`、组件错误标识 `'WorkerBadge' → 'ExecutorBadge'`、CSS 类 `.worker-* → .executor-*`、CSS 变量 `--worker-color → --executor-color`；唯一调用方 [MessageItem.svelte:5](web/src/components/MessageItem.svelte:5) 与 [MessageItem.svelte:390](web/src/components/MessageItem.svelte:390) 同步替换。
+  2. 保留组件 prop 名 `worker` 与 i18n key 命名空间 `workerBadge.*`（i18n 键是稳定标识符，仅翻译值；prop 名属于内部抽象 worker 角色概念，不外露）。
+  3. zh-CN 用户面字面量翻译（11 条）：`agentTab.empty.hint`、`config.toast.workerRefreshFailed`、`edits.empty.hint`、`settings.model.workerModel`、`settings.model.noWorkerConfig`、`settings.profile.workerAssignment`、`settings.profile.userRulesDesc`、`toolCall.displayName.{dispatchTask,sendWorkerMessage,waitForWorkers}`、`toolCall.errorDiagnosis.roleConstraint.hint`、`messageHandler.autoAnswerWorkerQuestion`、`dispatch.lane.{header,description}`、`dispatch.errors.workerWaitUnknownTasks`、`dispatch.notify.routingAdjusted`、`dispatch.waitForWorkers.timeout`、`runtimeDiagnostics.scope.worker`、`runtimeDiagnostics.recovery.restoredWorkerSessionCount` —— 全部统一为「执行者」。
+  4. **保留** LLM prompt 模板（`dispatch.phaseBPlus.prompt`、`dispatch.phaseC.{fallbackNotice,progressMessage}`、`dispatch.reactiveSummary.{header,taskLine}`、`dispatch.predecessor.item`）中的 `Worker` —— 这些字符串拼入提示词送给模型，「Worker」是 LLM 已建立的角色术语，与产品用户面无关。
+  5. **en-US 保留 "Worker"**（沿用 P1-#5 precedent：英文术语本就独立，与中文用户面收敛策略无关；强行翻成 "Executor" 反而让英文 UI 显得机器化）。
+  6. **未做**：`worker-card-view-model.ts` 改名 —— 经核查该文件无任何外部消费者（dead code），与本次「文案弱化」无关，建议作为单独的死代码清理项；`agent-colors.ts` 仅维持「角色 → 颜色」映射，无 Worker 字面量。
+  7. 验证：`npm --prefix web run check` ✓（683 文件 0 错 0 警）；daemon 起服 + 浏览器开 `web.html`，console 无错误，i18n 渲染正常。
 
 ---
 
