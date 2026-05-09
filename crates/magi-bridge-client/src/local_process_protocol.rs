@@ -12,7 +12,6 @@ pub const LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD: &str = "bridge.describe_service
 #[serde(rename_all = "snake_case")]
 pub enum BridgeServerKind {
     Model,
-    Host,
     Mcp,
 }
 

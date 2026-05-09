@@ -1,7 +1,6 @@
 use magi_bridge_client::{
-    BridgeClientError, BridgeResponse, BridgeServerKind, BridgeTransport, HostBridgeClient,
-    HostBridgeCommand, HostBridgeRequest, HostKind, JsonRpcBridgeServerProbeClient,
-    JsonRpcHostBridgeClient, JsonRpcMcpBridgeClient, JsonRpcMcpManagerClient,
+    BridgeClientError, BridgeResponse, BridgeServerKind, BridgeTransport,
+    JsonRpcBridgeServerProbeClient, JsonRpcMcpBridgeClient, JsonRpcMcpManagerClient,
     JsonRpcModelBridgeClient, McpBridgeClient, McpToolCallRequest, ModelBridgeClient,
     ModelInvocationRequest, LOOPBACK_MCP_SERVER_NAME, LOOPBACK_MCP_TOOL_NAME, LOOPBACK_MODEL_PROVIDER,
 };
@@ -34,7 +33,6 @@ impl BridgePreflightSnapshotProvider {
 
     fn capture_binding_snapshot(binding: &BridgeTransportBinding) -> BridgePreflightServiceDto {
         let checks = match binding.server_kind {
-            BridgeServerKind::Host => capture_host_preflight_checks(binding.transport.clone()),
             BridgeServerKind::Model => capture_model_preflight_checks(binding.transport.clone()),
             BridgeServerKind::Mcp => capture_mcp_preflight_checks(binding.transport.clone()),
         };
@@ -56,20 +54,6 @@ impl BridgePreflightProvider for BridgePreflightSnapshotProvider {
                 .collect(),
         }
     }
-}
-
-fn capture_host_preflight_checks(
-    transport: Arc<dyn BridgeTransport>,
-) -> Vec<BridgePreflightCheckDto> {
-    let client = JsonRpcHostBridgeClient::new(transport);
-    vec![bridge_response_check(
-        "workspace_roots",
-        "vscode.workspace_roots",
-        client.call(HostBridgeRequest {
-            host_kind: HostKind::Vscode,
-            command: HostBridgeCommand::WorkspaceRoots,
-        }),
-    )]
 }
 
 fn capture_model_preflight_checks(

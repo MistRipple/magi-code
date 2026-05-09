@@ -14,8 +14,8 @@ use magi_api::{
 };
 use magi_bridge_client::{
     BridgeDispatchRuntime, BridgeServerKind, BridgeTransport, HttpModelBridgeClient,
-    HttpModelBridgeProtocol, JsonRpcHostBridgeClient, JsonRpcMcpBridgeClient,
-    JsonRpcModelBridgeClient, JsonRpcStdioTransport, StdioMcpBridgeClient,
+    HttpModelBridgeProtocol, JsonRpcMcpBridgeClient, JsonRpcModelBridgeClient,
+    JsonRpcStdioTransport, StdioMcpBridgeClient,
 };
 use magi_context_runtime::{ContextBudget, ContextRuntime};
 use magi_core::{EventId, ExecutionOwnership, LeaseId, TaskStatus, UtcMillis};
@@ -398,8 +398,6 @@ impl DaemonRuntime {
         let orchestrator = OrchestratorService::new(self.event_bus.clone());
         let mut tool_registry = ToolRegistry::new(self.governance.clone(), self.event_bus.clone());
         tool_registry.register_default_builtins();
-        let host_transport =
-            Self::bridge_loopback_transport_with_env("host_bridge_loopback", bridge_env);
         let model_transport =
             Self::bridge_loopback_transport_with_env("model_bridge_loopback", bridge_env);
         let mcp_transport =
@@ -451,9 +449,6 @@ impl DaemonRuntime {
         let task_planning_model_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
             Arc::new(JsonRpcModelBridgeClient::new(model_transport.clone()));
         let bridge_runtime = BridgeDispatchRuntime::new()
-            .with_host_client(Arc::new(JsonRpcHostBridgeClient::new(
-                host_transport.clone(),
-            )))
             .with_model_client(business_model_client.clone())
             .with_mcp_client(if let Some(mcp_client) = direct_mcp_client {
                 Arc::new(mcp_client)
@@ -571,7 +566,6 @@ impl DaemonRuntime {
             self.state_root.join("workspaces.json"),
             self.state_root.join("knowledge.json"),
         )))
-        .with_bridge_probe_transport(BridgeServerKind::Host, host_transport)
         .with_bridge_probe_transport(BridgeServerKind::Model, model_transport)
         .with_bridge_probe_transport(BridgeServerKind::Mcp, mcp_transport)
         .with_execution_pipeline(orchestrator, execution_runtime, memory_store);
@@ -1728,18 +1722,8 @@ mod tests {
         let services = service_entries_by_kind(&snapshot);
         assert_eq!(
             services.len(),
-            3,
+            2,
             "unexpected bridge snapshot: {snapshot:?}"
-        );
-
-        let host = services
-            .get("host")
-            .expect("host bridge snapshot should exist");
-        assert_eq!(host["health"]["status"], "ok");
-        assert_eq!(host["health"]["ok"], true);
-        assert_eq!(
-            host["service_catalog"]["services"][0]["service_name"],
-            "loopback-host-vscode"
         );
 
         let model = services
@@ -1776,9 +1760,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_router_bridge_preflight_executes_loopback_host_model_and_mcp_smokes() {
+    async fn daemon_router_bridge_preflight_executes_loopback_model_and_mcp_smokes() {
         for binary_name in [
-            "host_bridge_loopback",
             "model_bridge_loopback",
             "mcp_bridge_loopback",
         ] {
@@ -1801,13 +1784,9 @@ mod tests {
         let services = service_entries_by_kind(&snapshot);
         assert_eq!(
             services.len(),
-            3,
+            2,
             "unexpected bridge preflight: {snapshot:?}"
         );
-
-        let host = services.get("host").expect("host preflight should exist");
-        assert_eq!(host["checks"][0]["check_name"], "workspace_roots");
-        assert_eq!(host["checks"][0]["ok"], true);
 
         let model = services.get("model").expect("model preflight should exist");
         assert!(
@@ -1895,10 +1874,10 @@ mod tests {
         let services = service_entries_by_kind(&snapshot);
         assert_eq!(
             services.len(),
-            3,
+            2,
             "unexpected bridge cutover snapshot: {snapshot:?}"
         );
-        assert_eq!(snapshot["checked_service_count"], 3);
+        assert_eq!(snapshot["checked_service_count"], 2);
         let blocking_issues = snapshot["blocking_issues"]
             .as_array()
             .expect("blocking issues should serialize as array");
@@ -1925,18 +1904,6 @@ mod tests {
         let server_kind_counts = snapshot["blocking_issue_counts_by_server_kind"]
             .as_object()
             .expect("server-kind counts should serialize as object");
-
-        let host = services.get("host").expect("host cutover should exist");
-        assert_eq!(host["service_ok"], true);
-        assert_eq!(host["blocking_check_count"], 0);
-        assert!(
-            host["blocking_targets"]
-                .as_array()
-                .expect("host blocking targets should be an array")
-                .is_empty()
-        );
-        assert_eq!(host["checks"][0]["check_name"], "workspace_roots_contract");
-        assert_eq!(host["checks"][0]["ok"], true);
 
         let model = services.get("model").expect("model cutover should exist");
         let model_service_ok = model["service_ok"]
@@ -3044,14 +3011,14 @@ mod tests {
         let services = service_entries_by_kind(&bootstrap["bridgeServices"]);
         assert_eq!(
             services.len(),
-            3,
+            2,
             "unexpected bootstrap bridge services: {bootstrap:?}"
         );
 
         let preflight = service_entries_by_kind(&bootstrap["bridgePreflight"]);
         assert_eq!(
             preflight.len(),
-            3,
+            2,
             "unexpected bootstrap bridge preflight: {bootstrap:?}"
         );
     }

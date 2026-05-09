@@ -1,8 +1,7 @@
 use magi_bridge_client::{
     BridgeClientError, BridgeResponse, BridgeServerKind, BridgeServerServiceCatalog,
-    BridgeTransport, HostBridgeClient, HostBridgeCommand, HostBridgeRequest, HostKind,
-    HttpModelBridgeClient, JsonRpcBridgeServerProbeClient, JsonRpcHostBridgeClient,
-    JsonRpcMcpBridgeClient, JsonRpcMcpManagerClient, JsonRpcModelBridgeClient, McpBridgeClient,
+    BridgeTransport, HttpModelBridgeClient, JsonRpcBridgeServerProbeClient, JsonRpcMcpBridgeClient,
+    JsonRpcMcpManagerClient, JsonRpcModelBridgeClient, McpBridgeClient,
     McpManagerServerSelectionRequest, McpToolCallRequest, ModelBridgeClient,
     ModelInvocationRequest, LOOPBACK_MODEL_PROVIDER,
 };
@@ -77,7 +76,6 @@ impl BridgeCutoverSmokeSnapshotProvider {
 
     fn capture_binding_snapshot(binding: &BridgeTransportBinding) -> BridgeCutoverServiceDto {
         let checks = match binding.server_kind {
-            BridgeServerKind::Host => capture_host_cutover_checks(binding.transport.clone()),
             BridgeServerKind::Model => capture_model_cutover_checks(binding.transport.clone()),
             BridgeServerKind::Mcp => capture_mcp_cutover_checks(binding.transport.clone()),
         };
@@ -117,18 +115,6 @@ impl BridgeCutoverSmokeProvider for BridgeCutoverSmokeSnapshotProvider {
 
         BridgeCutoverSmokeSnapshotDto::from_services(services)
     }
-}
-
-fn capture_host_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<BridgeCutoverCheckDto> {
-    let client = JsonRpcHostBridgeClient::new(transport);
-    vec![bridge_cutover_response_check(
-        "workspace_roots_contract",
-        "vscode.workspace_roots",
-        client.call(HostBridgeRequest {
-            host_kind: HostKind::Vscode,
-            command: HostBridgeCommand::WorkspaceRoots,
-        }),
-    )]
 }
 
 fn capture_model_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<BridgeCutoverCheckDto> {
@@ -332,46 +318,6 @@ fn capture_mcp_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<Bridge
         model_contract: None,
         mcp_contract: Some(mcp_contract),
     }]
-}
-
-fn bridge_cutover_response_check(
-    check_name: impl Into<String>,
-    target: impl Into<String>,
-    result: Result<BridgeResponse, BridgeClientError>,
-) -> BridgeCutoverCheckDto {
-    match result {
-        Ok(response) => {
-            let has_payload = !response.payload.trim().is_empty();
-            let ok = response.ok && has_payload;
-            let blocking_reason = if !response.ok {
-                Some("bridge response was not ok".to_string())
-            } else if !has_payload {
-                Some("bridge response payload was empty".to_string())
-            } else {
-                None
-            };
-            BridgeCutoverCheckDto {
-                check_name: check_name.into(),
-                target: target.into(),
-                ok,
-                blocking_reason,
-                response_excerpt: Some(excerpt(&response.payload)),
-                error: None,
-                model_contract: None,
-                mcp_contract: None,
-            }
-        }
-        Err(error) => BridgeCutoverCheckDto {
-            check_name: check_name.into(),
-            target: target.into(),
-            ok: false,
-            blocking_reason: Some("bridge invocation failed".to_string()),
-            response_excerpt: None,
-            error: Some(BridgeProbeErrorDto::from_client_error(error)),
-            model_contract: None,
-            mcp_contract: None,
-        },
-    }
 }
 
 fn bridge_cutover_model_check(

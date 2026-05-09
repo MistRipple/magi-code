@@ -261,11 +261,11 @@ fn probe_snapshot_provider_collects_bridge_probe_exports() {
 fn probe_snapshot_provider_preserves_partial_failures() {
     let mut provider = BridgeProbeSnapshotProvider::default();
     provider.register_transport(
-        BridgeServerKind::Host,
+        BridgeServerKind::Model,
         Arc::new(FakeTransport::new(HashMap::from([
             (
                 LOCAL_BRIDGE_HANDSHAKE_METHOD.to_string(),
-                FakeTransportOutcome::Payload(handshake(BridgeServerKind::Host)),
+                FakeTransportOutcome::Payload(handshake(BridgeServerKind::Model)),
             ),
             (
                 LOCAL_BRIDGE_HEALTH_METHOD.to_string(),
@@ -277,7 +277,7 @@ fn probe_snapshot_provider_preserves_partial_failures() {
             ),
             (
                 LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
-                FakeTransportOutcome::Payload(catalog(BridgeServerKind::Host)),
+                FakeTransportOutcome::Payload(catalog(BridgeServerKind::Model)),
             ),
         ]))),
     );
@@ -301,13 +301,6 @@ fn probe_snapshot_provider_preserves_partial_failures() {
 #[test]
 fn preflight_snapshot_provider_executes_real_smoke_checks_from_transports() {
     let mut provider = BridgePreflightSnapshotProvider::default();
-    provider.register_transport(
-        BridgeServerKind::Host,
-        Arc::new(FakeTransport::new(HashMap::from([(
-            "host.call".to_string(),
-            FakeTransportOutcome::Payload(bridge_response("workspace:///repo")),
-        )]))),
-    );
     provider.register_transport(
         BridgeServerKind::Model,
         Arc::new(FakeTransport::new(HashMap::from([
@@ -354,15 +347,13 @@ fn preflight_snapshot_provider_executes_real_smoke_checks_from_transports() {
     );
 
     let snapshot = provider.preflight_snapshot();
-    assert_eq!(snapshot.services.len(), 3);
-    assert_eq!(snapshot.services[0].checks[0].check_name, "workspace_roots");
+    assert_eq!(snapshot.services.len(), 2);
+    assert_eq!(snapshot.services[0].checks[0].target, LOOPBACK_MODEL_PROVIDER);
     assert!(snapshot.services[0].checks[0].ok);
-    assert_eq!(snapshot.services[1].checks[0].target, LOOPBACK_MODEL_PROVIDER);
+    assert_eq!(snapshot.services[1].checks[0].check_name, "list_servers");
     assert!(snapshot.services[1].checks[0].ok);
-    assert_eq!(snapshot.services[2].checks[0].check_name, "list_servers");
-    assert!(snapshot.services[2].checks[0].ok);
     assert_eq!(
-        snapshot.services[2].checks[1].target,
+        snapshot.services[1].checks[1].target,
         format!("{LOOPBACK_MCP_SERVER_NAME}.{LOOPBACK_MCP_TOOL_NAME}")
     );
 }
@@ -864,34 +855,6 @@ fn cutover_smoke_snapshot_provider_blocks_unavailable_mcp_default_route() {
 }
 
 #[test]
-fn cutover_smoke_snapshot_provider_reports_empty_host_payload_issue() {
-    let mut provider = BridgeCutoverSmokeSnapshotProvider::default();
-    provider.register_transport(
-        BridgeServerKind::Host,
-        Arc::new(FakeTransport::new(HashMap::from([(
-            "host.call".to_string(),
-            FakeTransportOutcome::Payload(bridge_response("")),
-        )]))),
-    );
-
-    let snapshot = provider.cutover_smoke_snapshot();
-    assert!(!snapshot.overall_ok);
-    assert_eq!(snapshot.blocking_check_count, 1);
-    assert_eq!(snapshot.blocking_services, vec![BridgeServerKind::Host]);
-    assert_eq!(snapshot.blocking_issues.len(), 1);
-    let issue = &snapshot.blocking_issues[0];
-    assert_eq!(issue.server_kind, BridgeServerKind::Host);
-    assert_eq!(issue.check_name, "workspace_roots_contract");
-    assert_eq!(issue.target, "vscode.workspace_roots");
-    assert_eq!(issue.facet, BridgeCutoverBlockingFacet::BridgeResponse);
-    assert_eq!(
-        issue.reason_code,
-        BridgeCutoverBlockingReasonCode::BridgeResponseEmptyPayload
-    );
-    assert_eq!(issue.blocking_reason, "bridge response payload was empty");
-}
-
-#[test]
 fn cutover_smoke_snapshot_provider_reports_mcp_manager_list_failure_issue() {
     let mut provider = BridgeCutoverSmokeSnapshotProvider::default();
     provider.register_transport(
@@ -924,60 +887,6 @@ fn cutover_smoke_snapshot_provider_reports_mcp_manager_list_failure_issue() {
         issue.error.as_ref().and_then(|error| error.layer),
         Some(BridgeErrorLayer::RemoteBusiness)
     );
-}
-
-#[test]
-fn cutover_smoke_snapshot_provider_reports_bridge_invocation_failure_issue() {
-    let mut provider = BridgeCutoverSmokeSnapshotProvider::default();
-    provider.register_transport(
-        BridgeServerKind::Host,
-        Arc::new(FakeTransport::new(HashMap::from([(
-            "host.call".to_string(),
-            FakeTransportOutcome::RemoteBusiness {
-                code: -32021,
-                message: "workspace unavailable".to_string(),
-                data: None,
-            },
-        )]))),
-    );
-
-    let snapshot = provider.cutover_smoke_snapshot();
-    assert!(!snapshot.overall_ok);
-    assert_eq!(snapshot.blocking_issues.len(), 1);
-    let issue = &snapshot.blocking_issues[0];
-    assert_eq!(issue.facet, BridgeCutoverBlockingFacet::BridgeResponse);
-    assert_eq!(
-        issue.reason_code,
-        BridgeCutoverBlockingReasonCode::BridgeInvocationFailed
-    );
-    assert_eq!(issue.blocking_reason, "bridge invocation failed");
-    assert_eq!(
-        issue.error.as_ref().and_then(|error| error.layer),
-        Some(BridgeErrorLayer::RemoteBusiness)
-    );
-}
-
-#[test]
-fn cutover_smoke_snapshot_provider_reports_bridge_response_not_ok_issue() {
-    let mut provider = BridgeCutoverSmokeSnapshotProvider::default();
-    provider.register_transport(
-        BridgeServerKind::Host,
-        Arc::new(FakeTransport::new(HashMap::from([(
-            "host.call".to_string(),
-            FakeTransportOutcome::Payload(bridge_response_with_status(false, "denied")),
-        )]))),
-    );
-
-    let snapshot = provider.cutover_smoke_snapshot();
-    assert!(!snapshot.overall_ok);
-    assert_eq!(snapshot.blocking_issues.len(), 1);
-    let issue = &snapshot.blocking_issues[0];
-    assert_eq!(
-        issue.reason_code,
-        BridgeCutoverBlockingReasonCode::BridgeResponseNotOk
-    );
-    assert_eq!(issue.blocking_reason, "bridge response was not ok");
-    assert_eq!(issue.response_excerpt.as_deref(), Some("denied"));
 }
 
 #[test]
@@ -1435,13 +1344,6 @@ fn cutover_smoke_snapshot_provider_reports_mcp_resolved_server_mismatch_issue() 
 fn cutover_smoke_snapshot_provider_keeps_blocking_issue_counts_consistent() {
     let mut provider = BridgeCutoverSmokeSnapshotProvider::default();
     provider.register_transport(
-        BridgeServerKind::Host,
-        Arc::new(FakeTransport::new(HashMap::from([(
-            "host.call".to_string(),
-            FakeTransportOutcome::Payload(bridge_response("")),
-        )]))),
-    );
-    provider.register_transport(
         BridgeServerKind::Mcp,
         Arc::new(FakeTransport::new(HashMap::from([(
             "mcp.list_servers".to_string(),
@@ -1459,24 +1361,11 @@ fn cutover_smoke_snapshot_provider_keeps_blocking_issue_counts_consistent() {
         snapshot.blocking_check_count,
         snapshot.blocking_issues.len()
     );
-    assert_eq!(
-        snapshot.blocking_services,
-        vec![BridgeServerKind::Host, BridgeServerKind::Mcp]
-    );
-    assert_eq!(
-        snapshot
-            .blocking_issue_counts_by_reason_code
-            .get("bridge_response_empty_payload"),
-        Some(&1)
-    );
+    assert_eq!(snapshot.blocking_services, vec![BridgeServerKind::Mcp]);
     assert_eq!(
         snapshot
             .blocking_issue_counts_by_reason_code
             .get("mcp_manager_list_servers_failed"),
-        Some(&1)
-    );
-    assert_eq!(
-        snapshot.blocking_issue_counts_by_server_kind.get("host"),
         Some(&1)
     );
     assert_eq!(

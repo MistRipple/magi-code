@@ -7,7 +7,6 @@ pub mod decision_engine;
 mod dispatch;
 pub mod execution_outcome;
 pub mod final_text_policy;
-mod host_loopback;
 mod http_model_client;
 pub mod llm_types;
 mod local_process_protocol;
@@ -30,11 +29,10 @@ pub mod worker_duplicate_guard;
 mod tests;
 
 pub use clients::{
-    JsonRpcBridgeServerProbeClient, JsonRpcHostBridgeClient, JsonRpcMcpBridgeClient,
-    JsonRpcMcpManagerClient, JsonRpcModelBridgeClient,
+    JsonRpcBridgeServerProbeClient, JsonRpcMcpBridgeClient, JsonRpcMcpManagerClient,
+    JsonRpcModelBridgeClient,
 };
 pub use dispatch::BridgeDispatchRuntime;
-pub use host_loopback::{run_host_bridge_loopback_server, run_vscode_host_shell_server};
 pub use http_model_client::{HttpModelBridgeClient, HttpModelBridgeProtocol};
 pub use local_process_protocol::{
     BridgeServerCommandCapabilityProfile, BridgeServerContextResolutionBoundary,
@@ -53,7 +51,7 @@ pub use types::{
     BridgeResponse, BridgeTransport, BridgeTransportError, BridgeTransportRequest,
     BridgeTransportResponse, ChatCompletionPayload, ChatMessage, ChatToolCall, ChatToolChoice,
     ChatToolChoiceFunction, ChatToolDefinition, ChatToolFunction, ChatToolFunctionDefinition,
-    HostBridgeClient, HostBridgeCommand, HostBridgeRequest, HostKind, McpBridgeClient,
+    McpBridgeClient,
     McpManagerDescribeServerResponse, McpManagerLifecycleEvent, McpManagerLifecycleEventKind,
     McpManagerListServersResponse, McpManagerServerHealthUpdateRequest,
     McpManagerServerLifecycleState, McpManagerServerOperationResponse,

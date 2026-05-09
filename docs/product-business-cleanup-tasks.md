@@ -29,20 +29,25 @@
 
 | 区块 | 总数 | ⬜ | 🔄 | ✅ | ⏭️ |
 |---|---|---|---|---|---|
-| P0 产品定位锚定 | 3 | 2 | 0 | 1 | 0 |
+| P0 产品定位锚定 | 3 | 0 | 0 | 3 | 0 |
 | P1 用户心智核心抽象 | 4 | 4 | 0 | 0 | 0 |
 | P2 业务能力收口 | 5 | 5 | 0 | 0 | 0 |
 | P3 任务系统产品表达 | 3 | 3 | 0 | 0 | 0 |
 | P4 链路边界收口 | 3 | 3 | 0 | 0 | 0 |
-| **合计** | **18** | **17** | **0** | **1** | **0** |
+| **合计** | **18** | **15** | **0** | **3** | **0** |
 
 ---
 
 ## P0 — 产品定位锚定（先决策，不写代码）
 
 ### #1 确认产品定位
-- **状态**：⬜
+- **状态**：✅
+- **完成时间**：2026-05-09
 - **任务**：在「个人本地 Agent 工作台」/「小团队协作工具」/「跨 IDE 平台」中三选一。
+- **决策**：**个人本地 Agent 工作台 + 可选 LAN 分享**
+  - 砍掉「跨 IDE 平台」长期叙事（不再做 VSCode/IDEA 插件）
+  - tunnel/lan-access 保留为高级能力，从主路径退到 Settings 抽屉
+  - 后续 P0-#2 将依据本决策清理 IDE 宿主抽象层
 - **建议**：定位为 **「个人本地 Agent 工作台 + 可选 LAN 分享」**。砍掉跨 IDE 平台叙事，保留 tunnel 作为高级能力。
   - 理由：当前唯一在跑的形态就是它；其他形态在代码里只剩占位。
 - **改后增量**：可演进性 +0.8
@@ -50,12 +55,30 @@
 - **代码证据**：单 daemon（个人）+ `/api/tunnel`（小团队）+ host loopback / VSCode prehost（IDE 平台）三套接口并存
 
 ### #2 IDE 宿主去留
-- **状态**：⬜
+- **状态**：✅
+- **完成时间**：2026-05-09
 - **任务**：决定是否真的要做 VSCode/IDEA 插件。
-- **建议**：**删除** `host_loopback/`、`local_process_protocol.rs`、`run_vscode_host_shell_server`、`VSCode real-prehost`（约 3000+ 行）。保留 `HostBridgeClient` trait，仅留一个 `LocalHostBridge`（直接读本地文件系统）。
+- **决策**：**完全移除 IDE 宿主抽象层**（依据 #1 产品定位）
+- **执行结果**：
+  - 删除文件（约 2900+ 行）：
+    - `crates/magi-bridge-client/src/host_loopback/`（6 个文件）
+    - `crates/magi-bridge-client/tests/host_loopback.rs`
+    - `crates/magi-bridge-client/src/bin/host_bridge_loopback.rs`
+    - `crates/magi-bridge-client/src/bin/vscode_host_shell.rs`
+  - 删除类型/trait：`HostBridgeClient` trait、`HostBridgeRequest`/`HostBridgeCommand`/`HostKind`、`JsonRpcHostBridgeClient` impl
+  - 删除枚举变体：`BridgeBindingKind::Host`、`BridgeDispatchAction::HostTerminalExec`、`BridgeServerKind::Host`
+  - 删除 `BridgeDispatchRuntime::host_client` 字段与 `with_host_client()` builder
+  - 删除 `dispatch.rs::resolve_host_kind` 与 Host 路由分支
+  - 删除 daemon `host_transport` subprocess（不再起 host_bridge_loopback 进程）
+  - 删除 API DTO 中的 `capture_host_cutover_checks`/`capture_host_preflight_checks` 与对应 import
+  - 删除 skill-runtime 中以 host binding 为 fixture 的测试
+  - 修正 cutover_smoke / preflight_snapshot 的快照测试（services 数量从 3 → 2，去掉 host 断言分支）
+  - 修正 daemon runtime 的三个集成测试同步 services 数量
+  - 注：保留了 `HostBridgeClient` trait 的设计是 P0-#2 原方案，但代码评估后发现 trait 没有任何 production 实现，product 定位锚定为「个人本地」后亦无未来扩展点，因此完全移除
 - **改后增量**：桥接抽象 +1.0、可演进性 +0.5
 - **依赖**：#1
 - **代码证据**：`magi-bridge-client/src/host_loopback/`、`local_process_protocol.rs`，仓库内**无任何 VSCode 插件代码**在用它们
+- **验证**：`cargo check --workspace` ✓ / `cargo build --workspace --bins` ✓ / `npm --prefix web run check` ✓ / 仅 magi-api 2 个**预存在**测试失败（与本次改动无关）
 
 ### #3 Shadow 概念退场
 - **状态**：✅

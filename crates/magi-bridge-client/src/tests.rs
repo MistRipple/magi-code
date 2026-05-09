@@ -1,10 +1,9 @@
 use crate::{
     BridgeBindingDispatchPlan, BridgeBindingKind, BridgeBindingReference, BridgeClientError,
-    BridgeDispatchAction, BridgeDispatchInput, BridgeDispatchRuntime, BridgeResponse,
-    BridgeTransport, BridgeTransportError, BridgeTransportRequest, BridgeTransportResponse,
-    HostBridgeClient, HostBridgeCommand, HostBridgeRequest, HostKind, JsonRpcHostBridgeClient,
-    JsonRpcMcpBridgeClient, JsonRpcModelBridgeClient, JsonRpcStdioTransport, McpBridgeClient,
-    McpToolCallRequest, ModelBridgeClient, ModelInvocationRequest,
+    BridgeDispatchAction, BridgeDispatchInput, BridgeDispatchRuntime, BridgeTransport,
+    BridgeTransportError, BridgeTransportRequest, BridgeTransportResponse, JsonRpcMcpBridgeClient,
+    JsonRpcModelBridgeClient, JsonRpcStdioTransport, McpBridgeClient, McpToolCallRequest,
+    ModelBridgeClient, ModelInvocationRequest,
     base_adapter::ToolExecutor,
     llm_types::{ToolCall, ToolResult},
 };
@@ -17,17 +16,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
-struct DummyHostClient;
-
-impl HostBridgeClient for DummyHostClient {
-    fn call(&self, request: HostBridgeRequest) -> Result<BridgeResponse, BridgeClientError> {
-        Ok(BridgeResponse {
-            ok: true,
-            payload: format!("{:?}", request.command),
-        })
-    }
-}
 
 struct RecordingTransport {
     calls: Mutex<Vec<BridgeTransportRequest>>,
@@ -63,43 +51,6 @@ impl BridgeTransport for RecordingTransport {
 }
 
 #[test]
-fn host_binding_rejects_unknown_target() {
-    let runtime = BridgeDispatchRuntime::new().with_host_client(Arc::new(DummyHostClient));
-    let plan = BridgeBindingDispatchPlan {
-        source_skill_ids: vec!["skill-a".to_string()],
-        bindings: vec![BridgeBindingReference {
-            binding_id: "binding-a".to_string(),
-            tool_name: "host.exec".to_string(),
-            bridge_kind: BridgeBindingKind::Host,
-            dispatch_action: BridgeDispatchAction::HostTerminalExec,
-            bridge_target: "linux".to_string(),
-        }],
-    };
-
-    let error = runtime
-        .dispatch(
-            &plan,
-            BridgeDispatchInput {
-                binding_id: "binding-a".to_string(),
-                payload: "echo hello".to_string(),
-                working_directory: Some("/tmp".to_string()),
-            },
-        )
-        .expect_err("invalid host target should be rejected");
-
-    match error {
-        BridgeClientError::InvalidBindingTarget {
-            binding_id,
-            bridge_target,
-        } => {
-            assert_eq!(binding_id, "binding-a");
-            assert_eq!(bridge_target, "linux");
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
-}
-
-#[test]
 fn incompatible_kind_action_is_rejected() {
     let runtime = BridgeDispatchRuntime::new();
     let plan = BridgeBindingDispatchPlan {
@@ -108,7 +59,7 @@ fn incompatible_kind_action_is_rejected() {
             binding_id: "binding-a".to_string(),
             tool_name: "model.prompt".to_string(),
             bridge_kind: BridgeBindingKind::Model,
-            dispatch_action: BridgeDispatchAction::HostTerminalExec,
+            dispatch_action: BridgeDispatchAction::McpToolCall,
             bridge_target: "openai".to_string(),
         }],
     };
@@ -132,7 +83,7 @@ fn incompatible_kind_action_is_rejected() {
         } => {
             assert_eq!(binding_id, "binding-a");
             assert_eq!(bridge_kind, BridgeBindingKind::Model);
-            assert_eq!(dispatch_action, BridgeDispatchAction::HostTerminalExec);
+            assert_eq!(dispatch_action, BridgeDispatchAction::McpToolCall);
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -202,19 +153,9 @@ fn json_rpc_clients_share_the_same_transport_abstraction() {
         "payload": "shared"
     })));
 
-    let host = JsonRpcHostBridgeClient::new(transport.clone());
     let model = JsonRpcModelBridgeClient::new(transport.clone());
     let mcp = JsonRpcMcpBridgeClient::new(transport.clone());
 
-    assert_eq!(
-        host.call(HostBridgeRequest {
-            host_kind: HostKind::Vscode,
-            command: HostBridgeCommand::WorkspaceRoots,
-        })
-        .expect("host call should succeed")
-        .payload,
-        "shared"
-    );
     assert_eq!(
         model
             .invoke(ModelInvocationRequest {
@@ -240,10 +181,9 @@ fn json_rpc_clients_share_the_same_transport_abstraction() {
     );
 
     let calls = transport.calls();
-    assert_eq!(calls.len(), 3);
-    assert_eq!(calls[0].method, "host.call");
-    assert_eq!(calls[1].method, "model.invoke");
-    assert_eq!(calls[2].method, "mcp.call_tool");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].method, "model.invoke");
+    assert_eq!(calls[1].method, "mcp.call_tool");
 }
 
 #[test]
@@ -254,20 +194,12 @@ fn dispatch_runtime_with_json_rpc_clients_is_end_to_end() {
     })));
 
     let runtime = BridgeDispatchRuntime::new()
-        .with_host_client(Arc::new(JsonRpcHostBridgeClient::new(transport.clone())))
         .with_model_client(Arc::new(JsonRpcModelBridgeClient::new(transport.clone())))
         .with_mcp_client(Arc::new(JsonRpcMcpBridgeClient::new(transport.clone())));
 
     let plan = BridgeBindingDispatchPlan {
         source_skill_ids: vec!["skill-a".to_string()],
         bindings: vec![
-            BridgeBindingReference {
-                binding_id: "host-binding".to_string(),
-                tool_name: "host.exec".to_string(),
-                bridge_kind: BridgeBindingKind::Host,
-                dispatch_action: BridgeDispatchAction::HostTerminalExec,
-                bridge_target: "vscode".to_string(),
-            },
             BridgeBindingReference {
                 binding_id: "model-binding".to_string(),
                 tool_name: "model.prompt".to_string(),
@@ -284,18 +216,6 @@ fn dispatch_runtime_with_json_rpc_clients_is_end_to_end() {
             },
         ],
     };
-
-    let host = runtime
-        .dispatch(
-            &plan,
-            BridgeDispatchInput {
-                binding_id: "host-binding".to_string(),
-                payload: "echo hello".to_string(),
-                working_directory: Some("/tmp".to_string()),
-            },
-        )
-        .expect("host dispatch should succeed");
-    assert_eq!(host.response.payload, "dispatch");
 
     let model = runtime
         .dispatch(

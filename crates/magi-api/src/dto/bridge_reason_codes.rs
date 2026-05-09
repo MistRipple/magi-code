@@ -196,7 +196,6 @@ impl BridgeCutoverCheckDto {
 fn bridge_server_kind_key(kind: BridgeServerKind) -> &'static str {
     match kind {
         BridgeServerKind::Model => "model",
-        BridgeServerKind::Host => "host",
         BridgeServerKind::Mcp => "mcp",
     }
 }

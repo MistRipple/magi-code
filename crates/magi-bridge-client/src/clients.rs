@@ -6,7 +6,7 @@ use crate::{
     },
     types::{
         BridgeClientError, BridgeErrorLayer, BridgeResponse, BridgeTransportError,
-        BridgeTransportRequest, HostBridgeClient, HostBridgeRequest, McpBridgeClient,
+        BridgeTransportRequest, McpBridgeClient,
         McpManagerDescribeServerResponse, McpManagerListServersResponse,
         McpManagerServerHealthUpdateRequest, McpManagerServerOperationResponse,
         McpManagerServerRegistrationRequest, McpManagerServerSelectionRequest, McpToolCallRequest,
@@ -19,12 +19,6 @@ use serde_json::Value;
 #[derive(Clone)]
 pub struct JsonRpcBridgeServerProbeClient {
     transport: SharedBridgeTransport,
-}
-
-#[derive(Clone)]
-pub struct JsonRpcHostBridgeClient {
-    transport: SharedBridgeTransport,
-    method: String,
 }
 
 #[derive(Clone)]
@@ -42,20 +36,6 @@ pub struct JsonRpcMcpBridgeClient {
 #[derive(Clone)]
 pub struct JsonRpcMcpManagerClient {
     transport: SharedBridgeTransport,
-}
-
-impl JsonRpcHostBridgeClient {
-    pub fn new(transport: SharedBridgeTransport) -> Self {
-        Self {
-            transport,
-            method: "host.call".to_string(),
-        }
-    }
-
-    pub fn with_method(mut self, method: impl Into<String>) -> Self {
-        self.method = method.into();
-        self
-    }
 }
 
 impl JsonRpcModelBridgeClient {
@@ -208,22 +188,6 @@ impl JsonRpcBridgeServerProbeClient {
         serde_json::from_value(response.payload).map_err(|error| {
             protocol_call_failed(format!("decode bridge service catalog failed: {error}"))
         })
-    }
-}
-
-impl HostBridgeClient for JsonRpcHostBridgeClient {
-    fn call(&self, request: HostBridgeRequest) -> Result<BridgeResponse, BridgeClientError> {
-        let params = serde_json::to_value(request).map_err(|error| {
-            protocol_call_failed(format!("serialize host request failed: {error}"))
-        })?;
-        let response = self
-            .transport
-            .call(BridgeTransportRequest {
-                method: self.method.clone(),
-                params,
-            })
-            .map_err(transport_call_failed)?;
-        decode_bridge_response(response.payload)
     }
 }
 

@@ -5349,13 +5349,6 @@ mod tests {
         let app = build_router(
             test_state()
                 .with_bridge_probe_transport(
-                    BridgeServerKind::Host,
-                    Arc::new(FakeTransport::new(HashMap::from([(
-                        "host.call".to_string(),
-                        FakeTransportOutcome::Payload(bridge_response("workspace:///repo")),
-                    )]))),
-                )
-                .with_bridge_probe_transport(
                     BridgeServerKind::Model,
                     Arc::new(FakeTransport::new(HashMap::from([
                         (
@@ -5403,17 +5396,9 @@ mod tests {
             .expect("services should serialize as array");
         assert_eq!(
             services.len(),
-            3,
+            2,
             "unexpected preflight snapshot: {snapshot:?}"
         );
-
-        let host = services
-            .iter()
-            .find(|entry| entry["server_kind"] == "host")
-            .expect("host preflight should exist");
-        assert_eq!(host["checks"][0]["check_name"], "workspace_roots");
-        assert_eq!(host["checks"][0]["target"], "vscode.workspace_roots");
-        assert_eq!(host["checks"][0]["ok"], true);
 
         let model = services
             .iter()
@@ -5478,13 +5463,6 @@ mod tests {
     async fn bridge_cutover_smoke_route_evaluates_model_and_mcp_contracts() {
         let app = build_router(
             test_state()
-                .with_bridge_probe_transport(
-                    BridgeServerKind::Host,
-                    Arc::new(FakeTransport::new(HashMap::from([(
-                        "host.call".to_string(),
-                        FakeTransportOutcome::Payload(bridge_response("workspace:///repo")),
-                    )]))),
-                )
                 .with_bridge_probe_transport(
                     BridgeServerKind::Model,
                     Arc::new(CutoverAwareModelTransport),
@@ -5568,11 +5546,11 @@ mod tests {
             .count();
         assert_eq!(
             services.len(),
-            3,
+            2,
             "unexpected cutover smoke snapshot: {snapshot:?}"
         );
         assert_eq!(snapshot["overall_ok"], true);
-        assert_eq!(snapshot["checked_service_count"], 3);
+        assert_eq!(snapshot["checked_service_count"], 2);
         assert_eq!(snapshot["blocking_check_count"], failing_checks);
         assert!(
             snapshot["blocking_services"]
@@ -5610,21 +5588,6 @@ mod tests {
                     .expect("blocking targets should serialize as array")
                     .is_empty()
         }));
-
-        let host = services
-            .iter()
-            .find(|entry| entry["server_kind"] == "host")
-            .expect("host cutover should exist");
-        assert_eq!(host["service_ok"], true);
-        assert_eq!(host["blocking_check_count"], 0);
-        assert!(
-            host["blocking_targets"]
-                .as_array()
-                .expect("host blocking targets should serialize as array")
-                .is_empty()
-        );
-        assert_eq!(host["checks"][0]["check_name"], "workspace_roots_contract");
-        assert_eq!(host["checks"][0]["ok"], true);
 
         let model = services
             .iter()
@@ -6101,13 +6064,6 @@ mod tests {
             state
                 .clone()
                 .with_bridge_probe_transport(
-                    BridgeServerKind::Host,
-                    Arc::new(FakeTransport::new(HashMap::from([(
-                        "host.call".to_string(),
-                        FakeTransportOutcome::Payload(bridge_response("workspace:///repo")),
-                    )]))),
-                )
-                .with_bridge_probe_transport(
                     BridgeServerKind::Model,
                     Arc::new(FakeTransport::new(HashMap::from([
                         (
@@ -6204,10 +6160,10 @@ mod tests {
             MockBridgeSnapshotProvider {
                 snapshot: BridgeServicesSnapshotDto {
                     services: vec![BridgeServiceSnapshotDto {
-                        server_kind: BridgeServerKind::Host,
+                        server_kind: BridgeServerKind::Model,
                         handshake: Some(BridgeServerHandshake {
                             protocol_version: "local-bridge-v1".to_string(),
-                            server_kind: BridgeServerKind::Host,
+                            server_kind: BridgeServerKind::Model,
                             health_method: LOCAL_BRIDGE_HEALTH_METHOD.to_string(),
                             supported_methods: vec!["host.call".to_string()],
                         }),
@@ -6220,7 +6176,7 @@ mod tests {
                         }),
                         service_catalog: Some(BridgeServerServiceCatalog {
                             protocol_version: "local-bridge-v1".to_string(),
-                            server_kind: BridgeServerKind::Host,
+                            server_kind: BridgeServerKind::Model,
                             services: vec![],
                         }),
                         service_catalog_error: None,
@@ -6230,7 +6186,7 @@ mod tests {
         )));
 
         let snapshot = get_json(app, "/bridges/services").await;
-        assert_eq!(snapshot["services"][0]["server_kind"], "host");
+        assert_eq!(snapshot["services"][0]["server_kind"], "model");
         assert!(snapshot["services"][0]["handshake"].is_object());
         assert!(snapshot["services"][0]["health"].is_null());
         assert_eq!(

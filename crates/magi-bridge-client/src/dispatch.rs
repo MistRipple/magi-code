@@ -1,14 +1,12 @@
 use crate::types::{
     BridgeBindingDispatchPlan, BridgeBindingKind, BridgeClientError, BridgeDispatchAction,
-    BridgeDispatchInput, BridgeDispatchResult, HostBridgeClient, HostBridgeCommand,
-    HostBridgeRequest, HostKind, McpBridgeClient, McpToolCallRequest, ModelBridgeClient,
-    ModelInvocationRequest,
+    BridgeDispatchInput, BridgeDispatchResult, McpBridgeClient, McpToolCallRequest,
+    ModelBridgeClient, ModelInvocationRequest,
 };
 use std::sync::Arc;
 
 #[derive(Clone, Default)]
 pub struct BridgeDispatchRuntime {
-    host_client: Option<Arc<dyn HostBridgeClient>>,
     model_client: Option<Arc<dyn ModelBridgeClient>>,
     mcp_client: Option<Arc<dyn McpBridgeClient>>,
 }
@@ -16,11 +14,6 @@ pub struct BridgeDispatchRuntime {
 impl BridgeDispatchRuntime {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn with_host_client(mut self, client: Arc<dyn HostBridgeClient>) -> Self {
-        self.host_client = Some(client);
-        self
     }
 
     pub fn with_model_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
@@ -75,27 +68,6 @@ impl BridgeDispatchRuntime {
                     input: input.payload.clone(),
                 })?
             }
-            (BridgeBindingKind::Host, BridgeDispatchAction::HostTerminalExec) => {
-                let host_kind = resolve_host_kind(&binding.bridge_target, &binding.binding_id)?;
-                let working_directory = input.working_directory.clone().ok_or_else(|| {
-                    BridgeClientError::MissingWorkingDirectory {
-                        binding_id: binding.binding_id.clone(),
-                    }
-                })?;
-                let client = self
-                    .host_client
-                    .as_ref()
-                    .ok_or(BridgeClientError::MissingClient {
-                        bridge_kind: BridgeBindingKind::Host,
-                    })?;
-                client.call(HostBridgeRequest {
-                    host_kind,
-                    command: HostBridgeCommand::TerminalExec {
-                        command: input.payload.clone(),
-                        working_directory,
-                    },
-                })?
-            }
             (bridge_kind, dispatch_action) => {
                 return Err(BridgeClientError::IncompatibleBindingAction {
                     binding_id: binding.binding_id.clone(),
@@ -111,16 +83,5 @@ impl BridgeDispatchRuntime {
             dispatch_action: binding.dispatch_action,
             response,
         })
-    }
-}
-
-fn resolve_host_kind(bridge_target: &str, binding_id: &str) -> Result<HostKind, BridgeClientError> {
-    match bridge_target.trim().to_ascii_lowercase().as_str() {
-        "vscode" => Ok(HostKind::Vscode),
-        "idea" => Ok(HostKind::Idea),
-        _ => Err(BridgeClientError::InvalidBindingTarget {
-            binding_id: binding_id.to_string(),
-            bridge_target: bridge_target.to_string(),
-        }),
     }
 }

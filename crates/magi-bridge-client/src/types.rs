@@ -10,14 +10,12 @@ pub const LOOPBACK_MCP_TOOL_NAME: &str = "echo.inspect";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BridgeBindingKind {
-    Host,
     Model,
     Mcp,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BridgeDispatchAction {
-    HostTerminalExec,
     ModelPrompt,
     McpToolCall,
 }
@@ -27,42 +25,6 @@ pub enum BridgeErrorLayer {
     Transport,
     Protocol,
     RemoteBusiness,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum HostKind {
-    Vscode,
-    Idea,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum HostBridgeCommand {
-    OpenFile {
-        absolute_path: String,
-        line: Option<u32>,
-        column: Option<u32>,
-    },
-    RevealDiff {
-        left_path: String,
-        right_path: String,
-    },
-    ReadDiagnostics {
-        absolute_path: String,
-    },
-    ReadSymbols {
-        absolute_path: String,
-    },
-    TerminalExec {
-        command: String,
-        working_directory: String,
-    },
-    WorkspaceRoots,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HostBridgeRequest {
-    pub host_kind: HostKind,
-    pub command: HostBridgeCommand,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -403,10 +365,6 @@ pub trait BridgeTransport: Send + Sync {
         &self,
         request: BridgeTransportRequest,
     ) -> Result<BridgeTransportResponse, BridgeTransportError>;
-}
-
-pub trait HostBridgeClient: Send + Sync {
-    fn call(&self, request: HostBridgeRequest) -> Result<BridgeResponse, BridgeClientError>;
 }
 
 pub trait ModelBridgeClient: Send + Sync {
