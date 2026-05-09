@@ -1,6 +1,6 @@
 use super::*;
 
-pub const RUNTIME_READ_MODEL_CONTRACT_VERSION: &str = "shadow-runtime-v1";
+pub const RUNTIME_READ_MODEL_CONTRACT_VERSION: &str = "runtime-v1";
 pub const RUNTIME_READ_MODEL_CONTRACT_SECTIONS: [&str; 5] =
     ["meta", "overview", "details", "operations", "recovery"];
 pub const RUNTIME_READ_MODEL_ORDERING_STRATEGY: &str = "deterministic-lexicographic";

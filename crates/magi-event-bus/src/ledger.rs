@@ -9,7 +9,7 @@ use std::{
 };
 use thiserror::Error;
 
-pub const AUDIT_USAGE_LEDGER_SCHEMA_VERSION: &str = "shadow-audit-usage-ledger-v1";
+pub const AUDIT_USAGE_LEDGER_SCHEMA_VERSION: &str = "audit-usage-ledger-v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditUsageLedgerEntry {

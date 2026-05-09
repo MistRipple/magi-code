@@ -25,7 +25,7 @@ impl DaemonConfig {
             port,
             service_name: service_name.into(),
             bootstrap_workspace_root: state_root.join("bootstrap/workspace"),
-            bootstrap_worktree_root: state_root.join("bootstrap/worktrees/shadow-worktree-001"),
+            bootstrap_worktree_root: state_root.join("bootstrap/worktrees/test-worktree-001"),
             state_root,
         }
     }

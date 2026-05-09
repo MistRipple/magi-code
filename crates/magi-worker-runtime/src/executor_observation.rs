@@ -1,6 +1,6 @@
 use crate::{
     DeterministicWorkerExecutor, EventCategory, EventContext, LocalProcessExecutorHealthStatus,
-    LocalProcessExecutorProcessModel, ShadowWorkerExecutor, WorkerExecutionBindingLifecycle,
+    LocalProcessExecutorProcessModel, WorkerExecutor, WorkerExecutionBindingLifecycle,
     WorkerExecutionBindingScope, WorkerExecutionIntent, WorkerExecutionLeaseState,
     WorkerExecutionMode, WorkerExecutionParallelismScope, WorkerExecutionProcessLifecycle,
     WorkerExecutionReusePolicy, WorkerExecutionStepKind, WorkerExecutorFailure,
@@ -77,7 +77,7 @@ impl WorkerRuntime {
         DeterministicWorkerExecutor::default_intent(worker_id.clone(), task_id.clone())
     }
 
-    pub fn executor(&self) -> Arc<dyn ShadowWorkerExecutor> {
+    pub fn executor(&self) -> Arc<dyn WorkerExecutor> {
         Arc::clone(&self.executor)
     }
 

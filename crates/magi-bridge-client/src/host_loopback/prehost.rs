@@ -255,7 +255,7 @@ fn execute_vscode_terminal_exec(
 
     Ok(BridgeResponse {
         ok: succeeded,
-        payload: super::descriptors::shadow_host_payload(
+        payload: super::descriptors::loopback_host_payload(
             shim,
             "TerminalExec",
             json!({

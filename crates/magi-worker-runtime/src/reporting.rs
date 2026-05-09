@@ -333,14 +333,14 @@ pub(crate) fn derive_final_report(
 
     if tool_failed || skill_failed {
         WorkerExecutionFinalReport {
-            summary: "shadow execution completed with issues".to_string(),
+            summary: "loopback execution completed with issues".to_string(),
             result_kind: Some(TaskResultKind::Failure),
             termination_reason: Some(TerminationReason::Failed),
             verification_status: VerificationStatus::Failed,
         }
     } else {
         WorkerExecutionFinalReport {
-            summary: "shadow execution completed".to_string(),
+            summary: "loopback execution completed".to_string(),
             result_kind: Some(TaskResultKind::Success),
             termination_reason: Some(TerminationReason::Completed),
             verification_status: VerificationStatus::Passed,

@@ -88,7 +88,7 @@ fn host_client_round_trips_workspace_roots() {
     assert_eq!(payload["command"], "WorkspaceRoots");
     assert_eq!(
         payload["host_shell_manifest"]["shell_id"],
-        "shadow-host-vscode"
+        "loopback-host-vscode"
     );
     assert_eq!(payload["host_shell_manifest"]["minimum_version"], "0.1.0");
     assert_eq!(
@@ -109,7 +109,7 @@ fn host_client_round_trips_workspace_roots() {
     );
     assert_eq!(
         payload["host_shell_profile"]["profile_id"],
-        "shadow-host-vscode-profile"
+        "loopback-host-vscode-profile"
     );
     assert_eq!(
         payload["host_shell_profile"]["shell_family"],
@@ -117,7 +117,7 @@ fn host_client_round_trips_workspace_roots() {
     );
     assert_eq!(
         payload["host_command_capability_profile"]["capability_id"],
-        "shadow-host-vscode::workspaceroots::capability"
+        "loopback-host-vscode::workspaceroots::capability"
     );
     assert_eq!(
         payload["host_command_capability_profile"]["interaction_mode"],
@@ -125,11 +125,11 @@ fn host_client_round_trips_workspace_roots() {
     );
     assert_eq!(
         payload["host_session"]["session_id"],
-        "shadow-host-session-vscode"
+        "loopback-host-session-vscode"
     );
     assert_eq!(
         payload["workspace_context"]["workspace_id"],
-        "shadow-workspace-vscode"
+        "test-workspace-vscode"
     );
     assert_eq!(
         payload["workspace_context"]["workspace_roots_source"],
@@ -183,13 +183,13 @@ fn host_loopback_exposes_shared_handshake_and_health() {
         catalog
             .services
             .iter()
-            .any(|service| service.service_name == "shadow-host-vscode")
+            .any(|service| service.service_name == "loopback-host-vscode")
     );
     assert!(
         catalog
             .services
             .iter()
-            .any(|service| service.service_name == "shadow-host-idea")
+            .any(|service| service.service_name == "loopback-host-idea")
     );
     assert!(catalog.services.iter().all(|service| {
         service
@@ -204,7 +204,7 @@ fn host_loopback_exposes_shared_handshake_and_health() {
     assert!(catalog.services.iter().all(|service| {
         service
             .capabilities
-            .contains(&"shell_profile:shadow-host-shell-profile-v1".to_string())
+            .contains(&"shell_profile:loopback-host-shell-profile-v1".to_string())
     }));
     assert!(
         catalog
@@ -227,13 +227,13 @@ fn host_loopback_exposes_shared_handshake_and_health() {
     let vscode_service = catalog
         .services
         .iter()
-        .find(|service| service.service_name == "shadow-host-vscode")
+        .find(|service| service.service_name == "loopback-host-vscode")
         .expect("vscode host service should exist");
     assert_eq!(vscode_service.service_health.as_deref(), Some("healthy"));
     let idea_service = catalog
         .services
         .iter()
-        .find(|service| service.service_name == "shadow-host-idea")
+        .find(|service| service.service_name == "loopback-host-idea")
         .expect("idea host service should exist");
     assert_eq!(idea_service.service_health.as_deref(), Some("unavailable"));
     assert_eq!(
@@ -248,27 +248,27 @@ fn host_loopback_exposes_shared_handshake_and_health() {
         .shell_manifest
         .as_ref()
         .expect("host manifest should exist");
-    assert_eq!(manifest.shell_id, "shadow-host-vscode");
+    assert_eq!(manifest.shell_id, "loopback-host-vscode");
     assert_eq!(manifest.minimum_version, "0.1.0");
     assert_eq!(manifest.capability_version, "host-shell-v1");
     let shell_profile = vscode_service
         .shell_profile
         .as_ref()
         .expect("host shell profile should exist");
-    assert_eq!(shell_profile.profile_id, "shadow-host-vscode-profile");
+    assert_eq!(shell_profile.profile_id, "loopback-host-vscode-profile");
     assert_eq!(shell_profile.host_kind, "vscode");
     assert_eq!(shell_profile.shell_family, "vscode-extension-host");
     let session = vscode_service
         .session_descriptor
         .as_ref()
         .expect("host session descriptor should exist");
-    assert_eq!(session.session_id, "shadow-host-session-vscode");
+    assert_eq!(session.session_id, "loopback-host-session-vscode");
     assert_eq!(session.session_scope, "session-scoped");
     let workspace = vscode_service
         .workspace_context
         .as_ref()
         .expect("host workspace context should exist");
-    assert_eq!(workspace.workspace_id, "shadow-workspace-vscode");
+    assert_eq!(workspace.workspace_id, "test-workspace-vscode");
     assert_eq!(workspace.workspace_scope, "workspace-scoped");
     let command_profiles = vscode_service
         .command_capability_profiles
@@ -293,7 +293,7 @@ fn host_loopback_exposes_shared_handshake_and_health() {
     );
     assert_eq!(
         context_boundary.workspace_resolution_source,
-        "host_kind + shadow workspace shim"
+        "host_kind + loopback workspace shim"
     );
 }
 
@@ -311,7 +311,7 @@ fn host_catalog_reflects_env_configured_workspace_roots() {
     let vscode_service = catalog
         .services
         .iter()
-        .find(|service| service.service_name == "shadow-host-vscode")
+        .find(|service| service.service_name == "loopback-host-vscode")
         .expect("vscode host service should exist");
     assert_eq!(
         vscode_service.workspace_roots_source.as_deref(),
@@ -357,7 +357,7 @@ fn vscode_prehost_reports_unavailable_when_workspace_roots_invalid() {
     let vscode_service = catalog
         .services
         .iter()
-        .find(|service| service.service_name == "shadow-host-vscode")
+        .find(|service| service.service_name == "loopback-host-vscode")
         .expect("vscode host service should exist");
     assert_eq!(
         vscode_service.service_health.as_deref(),

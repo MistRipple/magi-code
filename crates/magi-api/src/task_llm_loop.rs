@@ -19,7 +19,7 @@ use crate::{
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolCall, ChatToolChoice, ChatToolDefinition, ModelBridgeClient,
-    ModelInvocationRequest, ModelStreamingDelta, SHADOW_MODEL_PROVIDER,
+    ModelInvocationRequest, ModelStreamingDelta, LOOPBACK_MODEL_PROVIDER,
     tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
 use magi_core::{
@@ -276,7 +276,7 @@ pub(crate) fn run_task_llm_loop(
         let streamed_thinking = std::cell::RefCell::new(String::new());
         let last_thinking_len = std::cell::Cell::new(0usize);
         let invocation_request = ModelInvocationRequest {
-            provider: SHADOW_MODEL_PROVIDER.to_string(),
+            provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: prompt.clone(),
             messages: Some(messages.clone()),
             tools: tools.clone(),

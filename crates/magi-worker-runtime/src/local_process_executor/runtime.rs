@@ -9,7 +9,7 @@ use super::types::{
     WorkerExecutionLeaseState, WorkerExecutionProcessLifecycle, WorkerExecutorFailure,
 };
 use crate::{
-    ShadowWorkerExecutor, WorkerExecutionFinalReport, WorkerExecutionIntent,
+    WorkerExecutor, WorkerExecutionFinalReport, WorkerExecutionIntent,
     WorkerExecutionStepKind, WorkerExecutionTrace, WorkerExecutorKind, WorkerExecutorProbe,
     WorkerExecutorRequest, WorkerStage,
 };
@@ -555,7 +555,7 @@ impl LocalProcessWorkerExecutor {
     }
 }
 
-impl ShadowWorkerExecutor for LocalProcessWorkerExecutor {
+impl WorkerExecutor for LocalProcessWorkerExecutor {
     fn execute(&self, intent: &WorkerExecutionIntent) -> WorkerExecutionTrace {
         self.execute_checked(intent)
             .unwrap_or_else(|error| WorkerExecutionTrace {

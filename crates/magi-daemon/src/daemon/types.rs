@@ -3,7 +3,7 @@ use magi_core::UtcMillis;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum DaemonMaintenancePolicyProfile {
     #[default]
-    ShadowDefault,
+    Standard,
     AggressiveFlush,
     PreCutoverDrain,
 }
@@ -11,7 +11,7 @@ pub enum DaemonMaintenancePolicyProfile {
 impl DaemonMaintenancePolicyProfile {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
-            Self::ShadowDefault => "shadow-default",
+            Self::Standard => "standard",
             Self::AggressiveFlush => "aggressive-flush",
             Self::PreCutoverDrain => "cutover-prep",
         }

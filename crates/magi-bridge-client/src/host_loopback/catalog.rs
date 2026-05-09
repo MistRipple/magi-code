@@ -144,8 +144,8 @@ impl HostServiceShim {
                     runtime_status.workspace_roots.len()
                 ),
                 "capability_version:host-shell-v1".to_string(),
-                "shell_profile:shadow-host-shell-profile-v1".to_string(),
-                "context_resolution:shadow-host-context-resolution-v1".to_string(),
+                "shell_profile:loopback-host-shell-profile-v1".to_string(),
+                "context_resolution:loopback-host-context-resolution-v1".to_string(),
                 "minimum_version:0.1.0".to_string(),
                 "session_scope:session-scoped".to_string(),
                 "workspace_scope:workspace-scoped".to_string(),
@@ -187,7 +187,7 @@ impl HostServiceShim {
     }
 
     pub(super) fn shell_id(&self) -> String {
-        format!("shadow-host-{}", host_kind_label(self.host_kind))
+        format!("loopback-host-{}", host_kind_label(self.host_kind))
     }
 
     pub(super) fn shell_manifest(&self) -> BridgeServerShellManifest {
@@ -215,7 +215,7 @@ impl HostServiceShim {
 
     pub(super) fn session_descriptor(&self) -> BridgeServerSessionDescriptor {
         BridgeServerSessionDescriptor {
-            session_id: format!("shadow-host-session-{}", host_kind_label(self.host_kind)),
+            session_id: format!("loopback-host-session-{}", host_kind_label(self.host_kind)),
             session_scope: "session-scoped".to_string(),
         }
     }
@@ -223,7 +223,7 @@ impl HostServiceShim {
     pub(super) fn workspace_context(&self) -> BridgeServerWorkspaceContext {
         let runtime_status = self.runtime_status();
         BridgeServerWorkspaceContext {
-            workspace_id: format!("shadow-workspace-{}", host_kind_label(self.host_kind)),
+            workspace_id: format!("test-workspace-{}", host_kind_label(self.host_kind)),
             workspace_scope: "workspace-scoped".to_string(),
             workspace_roots_source: runtime_status.workspace_roots_source,
         }
@@ -285,8 +285,8 @@ impl HostServiceShim {
             ),
             session_resolution_strategy: "host-kind-derived session mapping".to_string(),
             workspace_resolution_strategy: "host-kind-derived workspace mapping".to_string(),
-            session_resolution_source: "host_kind + shadow session shim".to_string(),
-            workspace_resolution_source: "host_kind + shadow workspace shim".to_string(),
+            session_resolution_source: "host_kind + loopback session shim".to_string(),
+            workspace_resolution_source: "host_kind + loopback workspace shim".to_string(),
         }
     }
 
@@ -334,14 +334,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_service_catalog_lists_both_shadow_host_shims() {
+    fn host_service_catalog_lists_both_loopback_host_shims() {
         let catalog = host_service_catalog(&host_service_shims());
         assert_eq!(catalog.server_kind, BridgeServerKind::Host);
         assert_eq!(catalog.services.len(), 2);
         let vscode = catalog
             .services
             .iter()
-            .find(|service| service.service_name == "shadow-host-vscode")
+            .find(|service| service.service_name == "loopback-host-vscode")
             .expect("vscode host service should exist");
         assert_eq!(
             vscode
@@ -360,7 +360,7 @@ mod tests {
         let idea = catalog
             .services
             .iter()
-            .find(|service| service.service_name == "shadow-host-idea")
+            .find(|service| service.service_name == "loopback-host-idea")
             .expect("idea host service should exist");
         assert_eq!(
             idea.implementation_source

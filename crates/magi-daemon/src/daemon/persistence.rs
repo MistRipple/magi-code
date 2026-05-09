@@ -12,11 +12,11 @@ use std::{
 use tracing::warn;
 
 #[derive(Clone, Debug)]
-pub(crate) struct ShadowStateRepository {
+pub(crate) struct StateRepository {
     state_root: PathBuf,
 }
 
-impl ShadowStateRepository {
+impl StateRepository {
     pub(crate) fn new(state_root: PathBuf) -> Self {
         Self { state_root }
     }
@@ -314,16 +314,16 @@ pub(crate) struct RuntimeSidecarFlushReport {
 }
 
 #[derive(Clone)]
-pub(crate) struct ShadowRuntimeSidecarPersistence {
-    state_repository: ShadowStateRepository,
+pub(crate) struct RuntimeSidecarPersistence {
+    state_repository: StateRepository,
     session_store: Arc<SessionStore>,
     workspace_store: Arc<WorkspaceStore>,
     worker_runtime: WorkerRuntime,
 }
 
-impl ShadowRuntimeSidecarPersistence {
+impl RuntimeSidecarPersistence {
     pub(crate) fn new(
-        state_repository: ShadowStateRepository,
+        state_repository: StateRepository,
         session_store: Arc<SessionStore>,
         workspace_store: Arc<WorkspaceStore>,
         worker_runtime: WorkerRuntime,
@@ -398,7 +398,7 @@ fn temp_path_for(path: &Path) -> PathBuf {
     let mut file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "shadow-state.json".to_string());
+        .unwrap_or_else(|| "state.json".to_string());
     let unique_suffix = format!(
         ".{}.{}.tmp",
         std::process::id(),
@@ -415,7 +415,7 @@ fn stale_backup_path(path: &Path) -> PathBuf {
     let mut file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "shadow-state.json".to_string());
+        .unwrap_or_else(|| "state.json".to_string());
     file_name.push_str(".stale");
     path.with_file_name(file_name)
 }
@@ -442,7 +442,7 @@ mod tests {
     fn load_sessions_from_workspaces_merges_timeline_and_notifications() {
         let state_root = unique_temp_dir("magi-persistence-state");
         let workspace_root = unique_temp_dir("magi-persistence-workspace");
-        let repository = ShadowStateRepository::new(state_root.clone());
+        let repository = StateRepository::new(state_root.clone());
         let session_id = SessionId::new("session-persisted-timeline");
         let now = UtcMillis::now();
         let workspace_state = SessionDurableState {
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn load_sessions_from_workspaces_keeps_unknown_workspace_sessions_in_global_state() {
         let state_root = unique_temp_dir("magi-persistence-unknown-workspace");
-        let repository = ShadowStateRepository::new(state_root.clone());
+        let repository = StateRepository::new(state_root.clone());
         let session_id = SessionId::new("session-unknown-workspace");
         let now = UtcMillis::now();
 
@@ -571,7 +571,7 @@ mod tests {
     fn load_sessions_from_workspaces_preserves_global_unbound_sessions() {
         let state_root = unique_temp_dir("magi-persistence-global-session");
         let workspace_root = unique_temp_dir("magi-persistence-global-workspace");
-        let repository = ShadowStateRepository::new(state_root.clone());
+        let repository = StateRepository::new(state_root.clone());
         let now = UtcMillis::now();
         let global_session_id = SessionId::new("session-global-unbound");
         let workspace_session_id = SessionId::new("session-workspace-bound");
@@ -652,7 +652,7 @@ mod tests {
     #[test]
     fn load_session_sidecars_does_not_treat_current_global_session_file_as_legacy_sidecars() {
         let state_root = unique_temp_dir("magi-persistence-session-sidecar-legacy-guard");
-        let repository = ShadowStateRepository::new(state_root.clone());
+        let repository = StateRepository::new(state_root.clone());
         let now = UtcMillis::now();
         let session_id = SessionId::new("session-no-legacy-sidecar");
 

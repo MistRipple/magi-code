@@ -352,7 +352,7 @@ mod tests {
         let bus = InMemoryEventBus::new(8);
 
         let sequence = bus
-            .publish(event(EventCategory::Domain, "system.shadow.write", 1))
+            .publish(event(EventCategory::Domain, "system.test.write", 1))
             .expect("publish should succeed without subscribers");
 
         assert_eq!(sequence, 1);
@@ -668,10 +668,10 @@ mod tests {
             magi_core::EventId::new("executor-observed-1"),
             "worker.executor.observed",
             serde_json::json!({
-                "worker_id": "worker-shadow-1",
-                "task_id": "task-shadow-1",
+                "worker_id": "worker-test-1",
+                "task_id": "task-test-1",
                 "requested_stage": "execute",
-                "request_id": "executor-request-shadow-1",
+                "request_id": "executor-request-test-1",
                 "request_source": "dispatch",
                 "requested_reuse_policy": "preferred",
                 "requested_binding_scope": "session",
@@ -683,12 +683,12 @@ mod tests {
                 "requested_step_kinds": ["builtin-tool-invocation", "skill-dispatch", "final-report"],
                 "executor_kind": "LocalProcess",
                 "observation_status": "ready",
-                "executor_id": "shadow-local-process-worker-executor",
-                "executor_version": "worker-shadow-local-process-executor-v2",
-                "executor_instance_id": "shadow-local-process-worker-executor-instance-1",
-                "executor_lease_id": "shadow-local-process-worker-executor-lease-1",
+                "executor_id": "local-process-worker-executor",
+                "executor_version": "worker-local-process-executor-v2",
+                "executor_instance_id": "local-process-worker-executor-instance-1",
+                "executor_lease_id": "local-process-worker-executor-lease-1",
                 "execution_mode": "local-process",
-                "protocol_version": "worker-shadow-local-process-v1",
+                "protocol_version": "worker-local-process-v1",
                 "process_model": "persistent-process",
                 "lease_state": "active",
                 "binding_lifecycle": "bound",
@@ -733,7 +733,7 @@ mod tests {
         assert!(read_model.meta.executor.is_cutover_candidate);
         assert_eq!(
             read_model.meta.executor.executor_instance_id.as_deref(),
-            Some("shadow-local-process-worker-executor-instance-1")
+            Some("local-process-worker-executor-instance-1")
         );
         assert_eq!(
             read_model.meta.executor.reuse_scope.as_deref(),
@@ -741,7 +741,7 @@ mod tests {
         );
         assert_eq!(
             read_model.meta.executor.request_id.as_deref(),
-            Some("executor-request-shadow-1")
+            Some("executor-request-test-1")
         );
         assert_eq!(
             read_model.meta.executor.requested_binding_scope.as_deref(),
@@ -833,18 +833,18 @@ mod tests {
             magi_core::EventId::new("executor-observed-degraded"),
             "worker.executor.observed",
             serde_json::json!({
-                "worker_id": "worker-shadow-1",
-                "task_id": "task-shadow-1",
+                "worker_id": "worker-test-1",
+                "task_id": "task-test-1",
                 "requested_stage": "execute",
-                "request_id": "executor-request-shadow-2",
+                "request_id": "executor-request-test-2",
                 "request_source": "dispatch",
                 "executor_kind": "LocalProcess",
                 "observation_status": "degraded",
-                "executor_id": "shadow-local-process-worker-executor",
-                "executor_version": "worker-shadow-local-process-executor-v2",
-                "executor_instance_id": "shadow-local-process-worker-executor-instance-2",
+                "executor_id": "local-process-worker-executor",
+                "executor_version": "worker-local-process-executor-v2",
+                "executor_instance_id": "local-process-worker-executor-instance-2",
                 "execution_mode": "local-process",
-                "protocol_version": "worker-shadow-local-process-v1",
+                "protocol_version": "worker-local-process-v1",
                 "process_model": "one-shot-subprocess",
                 "reuse_scope": "none",
                 "parallelism_scope": "executor",
@@ -862,8 +862,8 @@ mod tests {
             magi_core::EventId::new("executor-observed-unavailable"),
             "worker.executor.observed",
             serde_json::json!({
-                "worker_id": "worker-shadow-2",
-                "task_id": "task-shadow-2",
+                "worker_id": "worker-test-2",
+                "task_id": "task-test-2",
                 "requested_stage": "execute",
                 "executor_kind": "LocalProcess",
                 "observation_status": "unavailable",
@@ -882,14 +882,14 @@ mod tests {
         );
         assert_eq!(
             read_model.operations.attention.degraded_executor_worker_ids,
-            vec!["worker-shadow-1".to_string()]
+            vec!["worker-test-1".to_string()]
         );
         assert_eq!(
             read_model
                 .operations
                 .attention
                 .unavailable_executor_worker_ids,
-            vec!["worker-shadow-2".to_string()]
+            vec!["worker-test-2".to_string()]
         );
         assert!(!read_model.meta.executor.is_ready);
         assert!(read_model.meta.executor.blocking_issue_count > 0);
@@ -903,10 +903,10 @@ mod tests {
             magi_core::EventId::new("executor-observed-one-shot"),
             "worker.executor.observed",
             serde_json::json!({
-                "worker_id": "worker-shadow-3",
-                "task_id": "task-shadow-3",
+                "worker_id": "worker-test-3",
+                "task_id": "task-test-3",
                 "requested_stage": "execute",
-                "request_id": "executor-request-shadow-3",
+                "request_id": "executor-request-test-3",
                 "request_source": "dispatch",
                 "requested_reuse_policy": "not-required",
                 "requested_binding_scope": "none",
@@ -918,10 +918,10 @@ mod tests {
                 "requested_step_kinds": ["final-report"],
                 "executor_kind": "LocalProcess",
                 "observation_status": "ready",
-                "executor_id": "shadow-local-process-worker-executor",
-                "executor_version": "worker-shadow-local-process-executor-v2",
+                "executor_id": "local-process-worker-executor",
+                "executor_version": "worker-local-process-executor-v2",
                 "execution_mode": "local-process",
-                "protocol_version": "worker-shadow-local-process-v1",
+                "protocol_version": "worker-local-process-v1",
                 "process_model": "one-shot-subprocess",
                 "lease_state": "none",
                 "binding_lifecycle": "none",
@@ -964,10 +964,10 @@ mod tests {
             magi_core::EventId::new("executor-observed-persistent-unbound"),
             "worker.executor.observed",
             serde_json::json!({
-                "worker_id": "worker-shadow-4",
-                "task_id": "task-shadow-4",
+                "worker_id": "worker-test-4",
+                "task_id": "task-test-4",
                 "requested_stage": "execute",
-                "request_id": "executor-request-shadow-4",
+                "request_id": "executor-request-test-4",
                 "request_source": "dispatch",
                 "requested_reuse_policy": "required",
                 "requested_binding_scope": "session",
@@ -979,12 +979,12 @@ mod tests {
                 "requested_step_kinds": ["final-report"],
                 "executor_kind": "LocalProcess",
                 "observation_status": "ready",
-                "executor_id": "shadow-local-process-worker-executor",
-                "executor_version": "worker-shadow-local-process-executor-v2",
-                "executor_instance_id": "shadow-local-process-worker-executor-instance-1",
-                "executor_lease_id": "shadow-local-process-worker-executor-session-session-shadow-4-lease",
+                "executor_id": "local-process-worker-executor",
+                "executor_version": "worker-local-process-executor-v2",
+                "executor_instance_id": "local-process-worker-executor-instance-1",
+                "executor_lease_id": "local-process-worker-executor-session-test-4-lease",
                 "execution_mode": "local-process",
-                "protocol_version": "worker-shadow-local-process-v1",
+                "protocol_version": "worker-local-process-v1",
                 "process_model": "persistent-process",
                 "lease_state": "released",
                 "binding_lifecycle": "released",

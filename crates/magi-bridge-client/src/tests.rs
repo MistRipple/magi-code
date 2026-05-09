@@ -519,7 +519,7 @@ fn decision_engine_hard_budget_breach() {
 }
 
 #[test]
-fn decision_engine_shadow_reason_completed() {
+fn decision_engine_loopback_reason_completed() {
     use crate::decision_engine::*;
     use crate::orchestrator_termination::*;
 
@@ -531,12 +531,12 @@ fn decision_engine_shadow_reason_completed() {
     snap.running_or_pending_required = 0;
     let gate = OrchestratorGateState::default();
 
-    let reason = engine.resolve_shadow_reason(&snap, &budget, &gate, "done");
+    let reason = engine.resolve_dispatch_reason(&snap, &budget, &gate, "done");
     assert_eq!(reason, OrchestratorTerminationReason::Completed);
 }
 
 #[test]
-fn decision_engine_shadow_reason_failed_on_empty_text() {
+fn decision_engine_loopback_reason_failed_on_empty_text() {
     use crate::decision_engine::*;
     use crate::orchestrator_termination::*;
 
@@ -545,7 +545,7 @@ fn decision_engine_shadow_reason_failed_on_empty_text() {
     let snap = test_snapshot(0);
     let gate = OrchestratorGateState::default();
 
-    let reason = engine.resolve_shadow_reason(&snap, &budget, &gate, "   ");
+    let reason = engine.resolve_dispatch_reason(&snap, &budget, &gate, "   ");
     assert_eq!(reason, OrchestratorTerminationReason::Failed);
 }
 

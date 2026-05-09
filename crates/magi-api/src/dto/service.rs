@@ -37,7 +37,7 @@ impl VersionHandshakeDto {
     pub fn from_service_info(service_info: &ServiceInfo) -> Self {
         Self {
             api_version: service_info.api_version.clone(),
-            min_supported_ui_version: "v0-shadow".to_string(),
+            min_supported_ui_version: "v0".to_string(),
             host_scope: vec!["vscode".to_string(), "idea".to_string()],
         }
     }
@@ -50,7 +50,7 @@ mod tests {
     fn service_info() -> ServiceInfo {
         ServiceInfo {
             service_name: "magi".to_string(),
-            api_version: "v0-shadow".to_string(),
+            api_version: "v0".to_string(),
         }
     }
 
@@ -60,15 +60,15 @@ mod tests {
 
         assert_eq!(dto.status, "ok");
         assert_eq!(dto.service_name, "magi");
-        assert_eq!(dto.api_version, "v0-shadow");
+        assert_eq!(dto.api_version, "v0");
     }
 
     #[test]
     fn version_handshake_uses_service_api_version() {
         let dto = VersionHandshakeDto::from_service_info(&service_info());
 
-        assert_eq!(dto.api_version, "v0-shadow");
-        assert_eq!(dto.min_supported_ui_version, "v0-shadow");
+        assert_eq!(dto.api_version, "v0");
+        assert_eq!(dto.min_supported_ui_version, "v0");
         assert_eq!(dto.host_scope, vec!["vscode", "idea"]);
     }
 }

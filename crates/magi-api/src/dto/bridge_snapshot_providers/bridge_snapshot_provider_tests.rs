@@ -8,8 +8,8 @@ use magi_bridge_client::{
     BridgeServerServiceCatalog, BridgeServerServiceDescriptor, BridgeTransport,
     BridgeTransportError, BridgeTransportRequest, BridgeTransportResponse,
     LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD, LOCAL_BRIDGE_HANDSHAKE_METHOD,
-    LOCAL_BRIDGE_HEALTH_METHOD, McpManagerListServersResponse, SHADOW_MCP_SERVER_NAME,
-    SHADOW_MCP_TOOL_NAME, SHADOW_MODEL_PROVIDER,
+    LOCAL_BRIDGE_HEALTH_METHOD, McpManagerListServersResponse, LOOPBACK_MCP_SERVER_NAME,
+    LOOPBACK_MCP_TOOL_NAME, LOOPBACK_MODEL_PROVIDER,
 };
 use serde_json::{Value, json};
 use std::{
@@ -73,7 +73,7 @@ impl BridgeTransport for FakeTransport {
 
 fn handshake(kind: BridgeServerKind) -> Value {
     serde_json::to_value(BridgeServerHandshake {
-        protocol_version: "shadow-local-bridge-v1".to_string(),
+        protocol_version: "local-bridge-v1".to_string(),
         server_kind: kind,
         health_method: LOCAL_BRIDGE_HEALTH_METHOD.to_string(),
         supported_methods: vec!["bridge.describe_services".to_string()],
@@ -83,7 +83,7 @@ fn handshake(kind: BridgeServerKind) -> Value {
 
 fn health(kind: BridgeServerKind, status: &str, ok: bool) -> Value {
     serde_json::to_value(BridgeServerHealth {
-        protocol_version: "shadow-local-bridge-v1".to_string(),
+        protocol_version: "local-bridge-v1".to_string(),
         server_kind: kind,
         status: status.to_string(),
         ok,
@@ -93,7 +93,7 @@ fn health(kind: BridgeServerKind, status: &str, ok: bool) -> Value {
 
 fn catalog(kind: BridgeServerKind) -> Value {
     serde_json::to_value(BridgeServerServiceCatalog {
-        protocol_version: "shadow-local-bridge-v1".to_string(),
+        protocol_version: "local-bridge-v1".to_string(),
         server_kind: kind,
         services: vec![],
     })
@@ -198,25 +198,25 @@ fn structured_bridge_response(payload: Value) -> Value {
 fn mcp_list_response(default_route_status: &str, default_route_target: &str) -> Value {
     serde_json::to_value(McpManagerListServersResponse {
         manager: descriptor_with_route(
-            "shadow-mcp-manager",
+            "loopback-mcp-manager",
             default_route_status,
             default_route_target,
         ),
         servers: vec![
             descriptor_with_profile(
-                SHADOW_MCP_SERVER_NAME,
+                LOOPBACK_MCP_SERVER_NAME,
                 Some("ready"),
                 Some("inspection-core-v1"),
             ),
             descriptor_with_profile(
-                "shadow-mcp-observability",
+                "loopback-mcp-observability",
                 Some("ready"),
                 Some("observability-v1"),
             ),
         ],
         selection_targets: vec![
-            SHADOW_MCP_SERVER_NAME.to_string(),
-            "shadow-mcp-observability".to_string(),
+            LOOPBACK_MCP_SERVER_NAME.to_string(),
+            "loopback-mcp-observability".to_string(),
         ],
         default_route_status: default_route_status.to_string(),
         default_route_target: default_route_target.to_string(),
@@ -314,16 +314,16 @@ fn preflight_snapshot_provider_executes_real_smoke_checks_from_transports() {
             (
                 "model.invoke".to_string(),
                 FakeTransportOutcome::Payload(bridge_response(
-                    "shadow-model::bridge preflight ping",
+                    "loopback-model::bridge preflight ping",
                 )),
             ),
             (
                 LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
                 FakeTransportOutcome::Payload(
                     serde_json::to_value(BridgeServerServiceCatalog {
-                        protocol_version: "shadow-local-bridge-v1".to_string(),
+                        protocol_version: "local-bridge-v1".to_string(),
                         server_kind: BridgeServerKind::Model,
-                        services: vec![descriptor(SHADOW_MODEL_PROVIDER)],
+                        services: vec![descriptor(LOOPBACK_MODEL_PROVIDER)],
                     })
                     .expect("catalog should serialize"),
                 ),
@@ -337,11 +337,11 @@ fn preflight_snapshot_provider_executes_real_smoke_checks_from_transports() {
                 "mcp.list_servers".to_string(),
                 FakeTransportOutcome::Payload(
                     serde_json::to_value(McpManagerListServersResponse {
-                        manager: descriptor("shadow-mcp-manager"),
-                        servers: vec![descriptor(SHADOW_MCP_SERVER_NAME)],
-                        selection_targets: vec![SHADOW_MCP_SERVER_NAME.to_string()],
+                        manager: descriptor("loopback-mcp-manager"),
+                        servers: vec![descriptor(LOOPBACK_MCP_SERVER_NAME)],
+                        selection_targets: vec![LOOPBACK_MCP_SERVER_NAME.to_string()],
                         default_route_status: "available".to_string(),
-                        default_route_target: SHADOW_MCP_SERVER_NAME.to_string(),
+                        default_route_target: LOOPBACK_MCP_SERVER_NAME.to_string(),
                     })
                     .expect("list_servers should serialize"),
                 ),
@@ -357,13 +357,13 @@ fn preflight_snapshot_provider_executes_real_smoke_checks_from_transports() {
     assert_eq!(snapshot.services.len(), 3);
     assert_eq!(snapshot.services[0].checks[0].check_name, "workspace_roots");
     assert!(snapshot.services[0].checks[0].ok);
-    assert_eq!(snapshot.services[1].checks[0].target, SHADOW_MODEL_PROVIDER);
+    assert_eq!(snapshot.services[1].checks[0].target, LOOPBACK_MODEL_PROVIDER);
     assert!(snapshot.services[1].checks[0].ok);
     assert_eq!(snapshot.services[2].checks[0].check_name, "list_servers");
     assert!(snapshot.services[2].checks[0].ok);
     assert_eq!(
         snapshot.services[2].checks[1].target,
-        format!("{SHADOW_MCP_SERVER_NAME}.{SHADOW_MCP_TOOL_NAME}")
+        format!("{LOOPBACK_MCP_SERVER_NAME}.{LOOPBACK_MCP_TOOL_NAME}")
     );
 }
 
@@ -381,10 +381,10 @@ fn preflight_snapshot_provider_includes_openai_compatible_smoke_when_model_catal
                 LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
                 FakeTransportOutcome::Payload(
                     serde_json::to_value(BridgeServerServiceCatalog {
-                        protocol_version: "shadow-local-bridge-v1".to_string(),
+                        protocol_version: "local-bridge-v1".to_string(),
                         server_kind: BridgeServerKind::Model,
                         services: vec![
-                            descriptor(SHADOW_MODEL_PROVIDER),
+                            descriptor(LOOPBACK_MODEL_PROVIDER),
                             descriptor_with_health("openai-compatible", Some("ready")),
                         ],
                     })
@@ -400,8 +400,8 @@ fn preflight_snapshot_provider_includes_openai_compatible_smoke_when_model_catal
     assert!(
         checks
             .iter()
-            .any(|check| check.target == SHADOW_MODEL_PROVIDER && check.ok),
-        "shadow-model smoke should still be present: {checks:?}"
+            .any(|check| check.target == LOOPBACK_MODEL_PROVIDER && check.ok),
+        "loopback-model smoke should still be present: {checks:?}"
     );
     assert!(
         checks
@@ -429,9 +429,9 @@ fn preflight_snapshot_provider_preserves_smoke_failures() {
                 LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
                 FakeTransportOutcome::Payload(
                     serde_json::to_value(BridgeServerServiceCatalog {
-                        protocol_version: "shadow-local-bridge-v1".to_string(),
+                        protocol_version: "local-bridge-v1".to_string(),
                         server_kind: BridgeServerKind::Model,
-                        services: vec![descriptor(SHADOW_MODEL_PROVIDER)],
+                        services: vec![descriptor(LOOPBACK_MODEL_PROVIDER)],
                     })
                     .expect("catalog should serialize"),
                 ),
@@ -443,7 +443,7 @@ fn preflight_snapshot_provider_preserves_smoke_failures() {
     let check = &snapshot.services[0].checks[0];
     assert!(!check.ok);
     assert_eq!(check.check_name, "invoke");
-    assert_eq!(check.target, SHADOW_MODEL_PROVIDER);
+    assert_eq!(check.target, LOOPBACK_MODEL_PROVIDER);
     assert_eq!(
         check.error,
         Some(BridgeProbeErrorDto {
@@ -482,13 +482,13 @@ fn cutover_smoke_snapshot_provider_evaluates_ready_model_and_mcp_contracts() {
                 LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
                 FakeTransportOutcome::Payload(
                     serde_json::to_value(BridgeServerServiceCatalog {
-                        protocol_version: "shadow-local-bridge-v1".to_string(),
+                        protocol_version: "local-bridge-v1".to_string(),
                         server_kind: BridgeServerKind::Model,
                         services: vec![
                             descriptor_with_profile(
-                                SHADOW_MODEL_PROVIDER,
+                                LOOPBACK_MODEL_PROVIDER,
                                 Some("ready"),
-                                Some("shadow-model-bridge-payload-v1"),
+                                Some("model-bridge-payload-v1"),
                             ),
                             descriptor_with_profile(
                                 "openai-compatible",
@@ -509,19 +509,19 @@ fn cutover_smoke_snapshot_provider_evaluates_ready_model_and_mcp_contracts() {
                 "mcp.list_servers".to_string(),
                 FakeTransportOutcome::Payload(mcp_list_response(
                     "ready",
-                    "shadow-mcp-observability",
+                    "loopback-mcp-observability",
                 )),
             ),
             (
                 "mcp.describe_server".to_string(),
                 FakeTransportOutcome::Payload(json!({
                     "manager": descriptor_with_route(
-                        "shadow-mcp-manager",
+                        "loopback-mcp-manager",
                         "ready",
-                        "shadow-mcp-observability",
+                        "loopback-mcp-observability",
                     ),
                     "server": descriptor_with_profile(
-                        "shadow-mcp-observability",
+                        "loopback-mcp-observability",
                         Some("ready"),
                         Some("observability-v1"),
                     ),
@@ -531,9 +531,9 @@ fn cutover_smoke_snapshot_provider_evaluates_ready_model_and_mcp_contracts() {
             (
                 "mcp.call_tool".to_string(),
                 FakeTransportOutcome::Payload(structured_bridge_response(json!({
-                    "server_name": "shadow-mcp-observability",
+                    "server_name": "loopback-mcp-observability",
                     "default_route_status": "ready",
-                    "default_route_target": "shadow-mcp-observability",
+                    "default_route_target": "loopback-mcp-observability",
                     "tool_name": "echo.describe",
                 }))),
             ),
@@ -590,10 +590,10 @@ fn cutover_smoke_snapshot_provider_evaluates_ready_model_and_mcp_contracts() {
         .as_ref()
         .expect("mcp route gate should be attached");
     assert_eq!(mcp_gate.route_status, "ready");
-    assert_eq!(mcp_gate.route_target, "shadow-mcp-observability");
+    assert_eq!(mcp_gate.route_target, "loopback-mcp-observability");
     assert_eq!(
         mcp_gate.resolved_server.as_deref(),
-        Some("shadow-mcp-observability")
+        Some("loopback-mcp-observability")
     );
     assert!(mcp_gate.contract_ok);
     let check = &mcp.checks[0];
@@ -603,10 +603,10 @@ fn cutover_smoke_snapshot_provider_evaluates_ready_model_and_mcp_contracts() {
         .as_ref()
         .expect("mcp contract should be attached");
     assert_eq!(contract.route_status, "ready");
-    assert_eq!(contract.route_target, "shadow-mcp-observability");
+    assert_eq!(contract.route_target, "loopback-mcp-observability");
     assert_eq!(
         contract.resolved_server.as_deref(),
-        Some("shadow-mcp-observability")
+        Some("loopback-mcp-observability")
     );
     assert!(contract.describe_ok);
     assert!(contract.blank_selection_ok);
@@ -632,13 +632,13 @@ fn cutover_smoke_snapshot_provider_blocks_invalid_model_payload_contract() {
                 LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
                 FakeTransportOutcome::Payload(
                     serde_json::to_value(BridgeServerServiceCatalog {
-                        protocol_version: "shadow-local-bridge-v1".to_string(),
+                        protocol_version: "local-bridge-v1".to_string(),
                         server_kind: BridgeServerKind::Model,
                         services: vec![
                             descriptor_with_profile(
-                                SHADOW_MODEL_PROVIDER,
+                                LOOPBACK_MODEL_PROVIDER,
                                 Some("ready"),
-                                Some("shadow-model-bridge-payload-v1"),
+                                Some("model-bridge-payload-v1"),
                             ),
                             descriptor_with_profile(
                                 "openai-compatible",
@@ -675,7 +675,7 @@ fn cutover_smoke_snapshot_provider_blocks_invalid_model_payload_contract() {
     assert_eq!(
         model.blocking_targets,
         vec![
-            SHADOW_MODEL_PROVIDER.to_string(),
+            LOOPBACK_MODEL_PROVIDER.to_string(),
             "openai-compatible".to_string()
         ]
     );
@@ -727,13 +727,13 @@ fn cutover_smoke_snapshot_provider_does_not_skip_degraded_openai_compatible() {
                 LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
                 FakeTransportOutcome::Payload(
                     serde_json::to_value(BridgeServerServiceCatalog {
-                        protocol_version: "shadow-local-bridge-v1".to_string(),
+                        protocol_version: "local-bridge-v1".to_string(),
                         server_kind: BridgeServerKind::Model,
                         services: vec![
                             descriptor_with_profile(
-                                SHADOW_MODEL_PROVIDER,
+                                LOOPBACK_MODEL_PROVIDER,
                                 Some("ready"),
-                                Some("shadow-model-bridge-payload-v1"),
+                                Some("model-bridge-payload-v1"),
                             ),
                             descriptor_with_profile(
                                 "openai-compatible",
@@ -913,7 +913,7 @@ fn cutover_smoke_snapshot_provider_reports_mcp_manager_list_failure_issue() {
     assert_eq!(snapshot.blocking_issues.len(), 1);
     let issue = &snapshot.blocking_issues[0];
     assert_eq!(issue.server_kind, BridgeServerKind::Mcp);
-    assert_eq!(issue.target, "shadow-mcp-manager");
+    assert_eq!(issue.target, "loopback-mcp-manager");
     assert_eq!(issue.facet, BridgeCutoverBlockingFacet::McpDefaultRoute);
     assert_eq!(
         issue.reason_code,
@@ -994,12 +994,12 @@ fn cutover_smoke_snapshot_provider_reports_empty_model_payload_issue() {
                 LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
                 FakeTransportOutcome::Payload(
                     serde_json::to_value(BridgeServerServiceCatalog {
-                        protocol_version: "shadow-local-bridge-v1".to_string(),
+                        protocol_version: "local-bridge-v1".to_string(),
                         server_kind: BridgeServerKind::Model,
                         services: vec![descriptor_with_profile(
-                            SHADOW_MODEL_PROVIDER,
+                            LOOPBACK_MODEL_PROVIDER,
                             Some("ready"),
-                            Some("shadow-model-bridge-payload-v1"),
+                            Some("model-bridge-payload-v1"),
                         )],
                     })
                     .expect("catalog should serialize"),
@@ -1013,7 +1013,7 @@ fn cutover_smoke_snapshot_provider_reports_empty_model_payload_issue() {
     assert_eq!(snapshot.blocking_issues.len(), 1);
     let issue = &snapshot.blocking_issues[0];
     assert_eq!(issue.facet, BridgeCutoverBlockingFacet::ModelContract);
-    assert_eq!(issue.target, SHADOW_MODEL_PROVIDER);
+    assert_eq!(issue.target, LOOPBACK_MODEL_PROVIDER);
     assert_eq!(
         issue.reason_code,
         BridgeCutoverBlockingReasonCode::ModelPayloadEmpty
@@ -1042,12 +1042,12 @@ fn cutover_smoke_snapshot_provider_reports_invalid_model_tool_calls_issue() {
                 LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
                 FakeTransportOutcome::Payload(
                     serde_json::to_value(BridgeServerServiceCatalog {
-                        protocol_version: "shadow-local-bridge-v1".to_string(),
+                        protocol_version: "local-bridge-v1".to_string(),
                         server_kind: BridgeServerKind::Model,
                         services: vec![descriptor_with_profile(
-                            SHADOW_MODEL_PROVIDER,
+                            LOOPBACK_MODEL_PROVIDER,
                             Some("ready"),
-                            Some("shadow-model-bridge-payload-v1"),
+                            Some("model-bridge-payload-v1"),
                         )],
                     })
                     .expect("catalog should serialize"),
@@ -1080,19 +1080,19 @@ fn cutover_smoke_snapshot_provider_reports_fallback_only_mcp_route_issue() {
                 "mcp.list_servers".to_string(),
                 FakeTransportOutcome::Payload(mcp_list_response(
                     "fallback-only",
-                    "shadow-mcp-observability",
+                    "loopback-mcp-observability",
                 )),
             ),
             (
                 "mcp.describe_server".to_string(),
                 FakeTransportOutcome::Payload(json!({
                     "manager": descriptor_with_route(
-                        "shadow-mcp-manager",
+                        "loopback-mcp-manager",
                         "fallback-only",
-                        "shadow-mcp-observability",
+                        "loopback-mcp-observability",
                     ),
                     "server": descriptor_with_profile(
-                        "shadow-mcp-observability",
+                        "loopback-mcp-observability",
                         Some("degraded"),
                         Some("observability-v1"),
                     ),
@@ -1102,9 +1102,9 @@ fn cutover_smoke_snapshot_provider_reports_fallback_only_mcp_route_issue() {
             (
                 "mcp.call_tool".to_string(),
                 FakeTransportOutcome::Payload(structured_bridge_response(json!({
-                    "server_name": "shadow-mcp-observability",
+                    "server_name": "loopback-mcp-observability",
                     "default_route_status": "fallback-only",
-                    "default_route_target": "shadow-mcp-observability",
+                    "default_route_target": "loopback-mcp-observability",
                     "tool_name": "echo.describe",
                 }))),
             ),
@@ -1132,7 +1132,7 @@ fn cutover_smoke_snapshot_provider_reports_unsupported_mcp_route_status_issue() 
                 "mcp.list_servers".to_string(),
                 FakeTransportOutcome::Payload(mcp_list_response(
                     "degraded",
-                    "shadow-mcp-observability",
+                    "loopback-mcp-observability",
                 )),
             ),
             (
@@ -1170,7 +1170,7 @@ fn cutover_smoke_snapshot_provider_reports_mcp_describe_failure_issue() {
                 "mcp.list_servers".to_string(),
                 FakeTransportOutcome::Payload(mcp_list_response(
                     "ready",
-                    "shadow-mcp-observability",
+                    "loopback-mcp-observability",
                 )),
             ),
             (
@@ -1184,9 +1184,9 @@ fn cutover_smoke_snapshot_provider_reports_mcp_describe_failure_issue() {
             (
                 "mcp.call_tool".to_string(),
                 FakeTransportOutcome::Payload(structured_bridge_response(json!({
-                    "server_name": "shadow-mcp-observability",
+                    "server_name": "loopback-mcp-observability",
                     "default_route_status": "ready",
-                    "default_route_target": "shadow-mcp-observability",
+                    "default_route_target": "loopback-mcp-observability",
                     "tool_name": "echo.describe",
                 }))),
             ),
@@ -1202,7 +1202,7 @@ fn cutover_smoke_snapshot_provider_reports_mcp_describe_failure_issue() {
     );
     assert_eq!(
         issue.blocking_reason,
-        "default route target shadow-mcp-observability could not be described"
+        "default route target loopback-mcp-observability could not be described"
     );
     assert_eq!(
         issue.error.as_ref().and_then(|error| error.layer),
@@ -1224,19 +1224,19 @@ fn cutover_smoke_snapshot_provider_reports_mcp_blank_selection_invocation_failur
                 "mcp.list_servers".to_string(),
                 FakeTransportOutcome::Payload(mcp_list_response(
                     "ready",
-                    "shadow-mcp-observability",
+                    "loopback-mcp-observability",
                 )),
             ),
             (
                 "mcp.describe_server".to_string(),
                 FakeTransportOutcome::Payload(json!({
                     "manager": descriptor_with_route(
-                        "shadow-mcp-manager",
+                        "loopback-mcp-manager",
                         "ready",
-                        "shadow-mcp-observability",
+                        "loopback-mcp-observability",
                     ),
                     "server": descriptor_with_profile(
-                        "shadow-mcp-observability",
+                        "loopback-mcp-observability",
                         Some("ready"),
                         Some("observability-v1"),
                     ),
@@ -1278,19 +1278,19 @@ fn cutover_smoke_snapshot_provider_reports_mcp_blank_selection_response_not_ok_i
                 "mcp.list_servers".to_string(),
                 FakeTransportOutcome::Payload(mcp_list_response(
                     "ready",
-                    "shadow-mcp-observability",
+                    "loopback-mcp-observability",
                 )),
             ),
             (
                 "mcp.describe_server".to_string(),
                 FakeTransportOutcome::Payload(json!({
                     "manager": descriptor_with_route(
-                        "shadow-mcp-manager",
+                        "loopback-mcp-manager",
                         "ready",
-                        "shadow-mcp-observability",
+                        "loopback-mcp-observability",
                     ),
                     "server": descriptor_with_profile(
-                        "shadow-mcp-observability",
+                        "loopback-mcp-observability",
                         Some("ready"),
                         Some("observability-v1"),
                     ),
@@ -1333,19 +1333,19 @@ fn cutover_smoke_snapshot_provider_reports_mcp_metadata_drift_issue() {
                 "mcp.list_servers".to_string(),
                 FakeTransportOutcome::Payload(mcp_list_response(
                     "ready",
-                    "shadow-mcp-observability",
+                    "loopback-mcp-observability",
                 )),
             ),
             (
                 "mcp.describe_server".to_string(),
                 FakeTransportOutcome::Payload(json!({
                     "manager": descriptor_with_route(
-                        "shadow-mcp-manager",
+                        "loopback-mcp-manager",
                         "ready",
-                        "shadow-mcp-observability",
+                        "loopback-mcp-observability",
                     ),
                     "server": descriptor_with_profile(
-                        "shadow-mcp-observability",
+                        "loopback-mcp-observability",
                         Some("ready"),
                         Some("observability-v1"),
                     ),
@@ -1355,9 +1355,9 @@ fn cutover_smoke_snapshot_provider_reports_mcp_metadata_drift_issue() {
             (
                 "mcp.call_tool".to_string(),
                 FakeTransportOutcome::Payload(structured_bridge_response(json!({
-                    "server_name": "shadow-mcp-observability",
+                    "server_name": "loopback-mcp-observability",
                     "default_route_status": "ready",
-                    "default_route_target": "shadow-mcp-inspection",
+                    "default_route_target": "loopback-mcp-inspection",
                     "tool_name": "echo.describe",
                 }))),
             ),
@@ -1387,19 +1387,19 @@ fn cutover_smoke_snapshot_provider_reports_mcp_resolved_server_mismatch_issue() 
                 "mcp.list_servers".to_string(),
                 FakeTransportOutcome::Payload(mcp_list_response(
                     "ready",
-                    "shadow-mcp-observability",
+                    "loopback-mcp-observability",
                 )),
             ),
             (
                 "mcp.describe_server".to_string(),
                 FakeTransportOutcome::Payload(json!({
                     "manager": descriptor_with_route(
-                        "shadow-mcp-manager",
+                        "loopback-mcp-manager",
                         "ready",
-                        "shadow-mcp-observability",
+                        "loopback-mcp-observability",
                     ),
                     "server": descriptor_with_profile(
-                        "shadow-mcp-observability",
+                        "loopback-mcp-observability",
                         Some("ready"),
                         Some("observability-v1"),
                     ),
@@ -1409,9 +1409,9 @@ fn cutover_smoke_snapshot_provider_reports_mcp_resolved_server_mismatch_issue() 
             (
                 "mcp.call_tool".to_string(),
                 FakeTransportOutcome::Payload(structured_bridge_response(json!({
-                    "server_name": "shadow-mcp-inspection",
+                    "server_name": "loopback-mcp-inspection",
                     "default_route_status": "ready",
-                    "default_route_target": "shadow-mcp-observability",
+                    "default_route_target": "loopback-mcp-observability",
                     "tool_name": "echo.describe",
                 }))),
             ),

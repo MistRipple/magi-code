@@ -42,7 +42,7 @@ impl ExecutionWritebackPlans {
                     extraction_id: format!("extract-session-action-{}", input.accepted_at.0),
                     session_id: input.session_id.clone(),
                     source_ref: Some(format!("timeline://{}", input.timeline_entry_id)),
-                    summary: "session.action shadow extraction".to_string(),
+                    summary: "session.action loopback extraction".to_string(),
                     memories: vec![ExtractedMemory {
                         memory_id: format!("mem-session-action-{}", input.accepted_at.0),
                         layer: MemoryLayer::Durable,
@@ -152,7 +152,7 @@ mod tests {
                 extraction_id: "extract-1".to_string(),
                 session_id: SessionId::new("session-1"),
                 source_ref: Some("timeline://entry-1".to_string()),
-                summary: "shadow extraction".to_string(),
+                summary: "loopback extraction".to_string(),
                 memories: vec![ExtractedMemory {
                     memory_id: "mem-1".to_string(),
                     layer: MemoryLayer::Durable,
@@ -199,7 +199,7 @@ mod tests {
         );
         assert_eq!(
             linkage.extraction.summary,
-            "session.action shadow extraction"
+            "session.action loopback extraction"
         );
         assert_eq!(
             linkage.produced_records[0].memory_id,

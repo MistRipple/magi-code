@@ -5,7 +5,7 @@ use axum::{
 };
 use magi_bridge_client::{
     ChatToolChoice, ChatToolDefinition, ChatToolFunctionDefinition, ModelInvocationRequest,
-    SHADOW_MODEL_PROVIDER,
+    LOOPBACK_MODEL_PROVIDER,
 };
 use magi_core::TaskStatus;
 use magi_core::{DomainError, EventId, SessionId, UtcMillis, WorkerId, WorkspaceId};
@@ -30,12 +30,12 @@ use crate::{
     errors::ApiError,
     execution_chain_recovery::{
         SessionContinueAccepted, active_execution_branch_is_continue_recoverable,
-        continue_shadow_execution_chain,
+        continue_execution_chain,
     },
     session_turn_writeback::publish_current_session_turn_item_event,
     state::ApiState,
     task_execution::{
-        SessionTurnExecutionRequest, drive_shadow_task_graph,
+        SessionTurnExecutionRequest, drive_task_graph,
         finalize_background_session_task_turn_if_root_terminal,
     },
 };
@@ -161,7 +161,7 @@ async fn submit_session_turn(
                 })
                 .ok_or_else(|| ApiError::InvalidInput("继续会话需要明确的 session".to_string()))?;
             let prompt_text = request.trimmed_text();
-            let accepted = continue_shadow_execution_chain(&state, &session_id, &[])?;
+            let accepted = continue_execution_chain(&state, &session_id, &[])?;
             let (entry_id, user_message_item_id) = match prompt_text.as_deref() {
                 Some(prompt_text) => {
                     let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
@@ -274,7 +274,7 @@ fn decide_session_turn_with_task_planner(
     let prompt = build_session_turn_classifier_prompt(request, has_recoverable_chain);
     let response = client
         .invoke(ModelInvocationRequest {
-            provider: SHADOW_MODEL_PROVIDER.to_string(),
+            provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt,
             messages: None,
             tools: Some(vec![session_turn_classifier_tool()]),
@@ -393,7 +393,7 @@ fn session_turn_classifier_tool() -> ChatToolDefinition {
 fn parse_session_turn_decision(payload: &str) -> Result<SessionTurnIntentDecision, ApiError> {
     let normalized_payload = payload
         .trim()
-        .strip_prefix("shadow-model::")
+        .strip_prefix("loopback-model::")
         .unwrap_or_else(|| payload.trim())
         .trim();
     let parsed =
@@ -1689,7 +1689,7 @@ async fn continue_session(
         .map(WorkerId::new)
         .collect::<Vec<_>>();
     let continued_at = UtcMillis::now();
-    let accepted = continue_shadow_execution_chain(&state, &session_id, &requested_worker_ids)?;
+    let accepted = continue_execution_chain(&state, &session_id, &requested_worker_ids)?;
     if let Some(prompt_text) = prompt_text.as_deref() {
         let entry_id = format!("timeline-{}-{}", session_id, continued_at.0);
         let (_, user_message_item) = build_user_message_turn_item(
@@ -1780,11 +1780,11 @@ fn finalize_continue_session(
         .map(|policy| policy.background_allowed)
         .unwrap_or(false);
 
-    // 普通模式：同步 drive shadow task graph（后台 runner 未启动）
-    // 深度模式：后台 runner 已在 continue_shadow_execution_chain 中重新启动，
+    // 普通模式：同步 drive task graph（后台 runner 未启动）
+    // 深度模式：后台 runner 已在 continue_execution_chain 中重新启动，
     // 此处不再调用同步 drive，避免与后台 runner 竞争
     if !background_allowed {
-        if let Err(error) = drive_shadow_task_graph(
+        if let Err(error) = drive_task_graph(
             &state,
             &accepted.root_task_id,
             &accepted.action_task_id,

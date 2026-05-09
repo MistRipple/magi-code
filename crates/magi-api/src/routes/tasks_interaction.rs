@@ -1,7 +1,7 @@
 use axum::{Json, Router, extract::State, routing::post};
 use magi_bridge_client::{
     ChatToolChoice, ChatToolDefinition, ChatToolFunctionDefinition, ModelInvocationRequest,
-    SHADOW_MODEL_PROVIDER,
+    LOOPBACK_MODEL_PROVIDER,
 };
 use magi_core::{EventId, MissionId, SessionId, Task, TaskId, TaskKind, TaskStatus, UtcMillis};
 use magi_event_bus::EventEnvelope;
@@ -14,7 +14,7 @@ use super::session_scope::{parse_session_id, session_workspace_id};
 use crate::{
     errors::ApiError,
     execution_chain_recovery::finalize_terminal_worker_branches,
-    shadow_execution::{
+    dispatch_execution::{
         ensure_session_active_execution_chain, register_appended_task_execution_branch,
         replace_replanned_task_execution_branches, replan_deep_task_graph,
     },
@@ -67,7 +67,7 @@ fn decide_intake_with_task_planner(
     })?;
     let response = client
         .invoke(ModelInvocationRequest {
-            provider: SHADOW_MODEL_PROVIDER.to_string(),
+            provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: build_intake_classifier_prompt(message, root_task, context_task),
             messages: None,
             tools: Some(vec![intake_classifier_tool()]),
@@ -159,7 +159,7 @@ fn intake_classifier_tool() -> ChatToolDefinition {
 fn parse_intake_decision(payload: &str) -> Result<IntakeIntentDecision, ApiError> {
     let normalized_payload = payload
         .trim()
-        .strip_prefix("shadow-model::")
+        .strip_prefix("loopback-model::")
         .unwrap_or_else(|| payload.trim())
         .trim();
     let parsed =

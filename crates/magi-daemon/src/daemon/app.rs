@@ -1,6 +1,6 @@
 use super::{
     config::{DaemonConfig, DaemonError},
-    runtime::ShadowDaemonRuntime,
+    runtime::DaemonRuntime,
 };
 use axum::{
     Router,
@@ -39,7 +39,7 @@ impl Daemon {
     }
 
     pub async fn run(&self) -> Result<(), DaemonError> {
-        let runtime = ShadowDaemonRuntime::restore(&self.config)?;
+        let runtime = DaemonRuntime::restore(&self.config)?;
         runtime.start_background_tasks();
         runtime.publish_started_event(&self.config.service_name);
 

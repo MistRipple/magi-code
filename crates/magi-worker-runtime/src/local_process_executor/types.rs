@@ -6,11 +6,11 @@ use magi_core::{SessionId, VerificationStatus, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub(super) const LOCAL_PROCESS_PROTOCOL_VERSION: &str = "worker-shadow-local-process-v1";
+pub(super) const LOCAL_PROCESS_PROTOCOL_VERSION: &str = "worker-local-process-v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum WorkerExecutionMode {
-    ShadowLoopback,
+    Loopback,
     #[default]
     LocalProcess,
 }
@@ -18,7 +18,7 @@ pub enum WorkerExecutionMode {
 impl WorkerExecutionMode {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::ShadowLoopback => "shadow-loopback",
+            Self::Loopback => "loopback",
             Self::LocalProcess => "local-process",
         }
     }
@@ -42,7 +42,7 @@ pub struct LocalProcessExecutorStageMatrix {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum LocalProcessExecutorProcessModel {
-    ShadowLoopback,
+    Loopback,
     #[default]
     OneShotSubprocess,
     PersistentProcess,
@@ -51,7 +51,7 @@ pub enum LocalProcessExecutorProcessModel {
 impl LocalProcessExecutorProcessModel {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::ShadowLoopback => "shadow-loopback",
+            Self::Loopback => "loopback",
             Self::OneShotSubprocess => "one-shot-subprocess",
             Self::PersistentProcess => "persistent-process",
         }

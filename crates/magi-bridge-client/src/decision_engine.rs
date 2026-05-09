@@ -222,7 +222,7 @@ impl OrchestratorDecisionEngine {
         BudgetCandidatesResult { candidates, events }
     }
 
-    pub fn resolve_shadow_reason(
+    pub fn resolve_dispatch_reason(
         &self,
         snapshot: &TerminationSnapshot,
         budget: &OrchestratorExecutionBudget,

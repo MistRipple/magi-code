@@ -4,7 +4,7 @@ mod types;
 
 pub use loopback::{
     execute_intent_step_with_drivers, execute_intent_with_drivers,
-    execute_intent_with_shadow_drivers, run_local_worker_executor_stdio,
+    execute_intent_with_loopback_drivers, run_local_worker_executor_stdio,
 };
 pub use runtime::{LocalProcessExecutorConfig, LocalProcessWorkerExecutor};
 pub use types::{

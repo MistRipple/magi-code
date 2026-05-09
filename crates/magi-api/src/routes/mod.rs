@@ -199,8 +199,8 @@ mod tests {
     use crate::session_turn_writeback::session_turn_item;
     use crate::state::{RunnerManager, RunnerStartError};
     use crate::task_execution::{
-        DispatchSubmissionAccepted, ShadowTaskDispatcher, drive_shadow_dispatch_submission,
-        submit_shadow_dispatch_submission,
+        DispatchSubmissionAccepted, LlmTaskDispatcher, drive_dispatch_submission,
+        submit_dispatch_submission,
     };
     use axum::{
         body::{Body, to_bytes},
@@ -211,8 +211,8 @@ mod tests {
         BridgeServerKind, BridgeServerServiceCatalog, BridgeTransport, BridgeTransportError,
         BridgeTransportRequest, BridgeTransportResponse, LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD,
         LOCAL_BRIDGE_HANDSHAKE_METHOD, LOCAL_BRIDGE_HEALTH_METHOD, McpManagerListServersResponse,
-        ModelBridgeClient, ModelInvocationRequest, ModelStreamingDelta, SHADOW_MCP_SERVER_NAME,
-        SHADOW_MCP_TOOL_NAME, SHADOW_MODEL_PROVIDER,
+        ModelBridgeClient, ModelInvocationRequest, ModelStreamingDelta, LOOPBACK_MCP_SERVER_NAME,
+        LOOPBACK_MCP_TOOL_NAME, LOOPBACK_MODEL_PROVIDER,
     };
     use magi_context_runtime::{ContextBudget, ContextRuntime};
     use magi_core::{
@@ -265,14 +265,14 @@ mod tests {
         )
     }
 
-    fn build_shadow_execution_state(
+    fn build_execution_state(
         worker_runtime_factory: impl FnOnce(Arc<InMemoryEventBus>) -> WorkerRuntime,
         model_bridge_client: Arc<dyn ModelBridgeClient>,
     ) -> ApiState {
-        build_shadow_execution_state_with_factory(worker_runtime_factory, |_| model_bridge_client)
+        build_execution_state_with_factory(worker_runtime_factory, |_| model_bridge_client)
     }
 
-    fn build_shadow_execution_state_with_factory(
+    fn build_execution_state_with_factory(
         worker_runtime_factory: impl FnOnce(Arc<InMemoryEventBus>) -> WorkerRuntime,
         model_bridge_client_factory: impl FnOnce(Arc<SessionStore>) -> Arc<dyn ModelBridgeClient>,
     ) -> ApiState {
@@ -282,27 +282,27 @@ mod tests {
         let workspace_store = Arc::new(WorkspaceStore::default());
         let model_bridge_client = model_bridge_client_factory(Arc::clone(&session_store));
 
-        let session_id = SessionId::new("session-route-shadow");
+        let session_id = SessionId::new("session-route-loopback");
         session_store
-            .create_session(session_id.clone(), "Route Shadow Session")
-            .expect("shadow route session should be creatable");
+            .create_session(session_id.clone(), "Route Loopback Session")
+            .expect("loopback route session should be creatable");
 
-        let workspace_id = WorkspaceId::new("workspace-route-shadow");
+        let workspace_id = WorkspaceId::new("workspace-route-loopback");
         workspace_store
             .register(
                 workspace_id.clone(),
                 AbsolutePath::new("/Users/xie/code/magi-rust-rewrite"),
             )
-            .expect("shadow route workspace should register");
+            .expect("loopback route workspace should register");
         workspace_store
             .activate(&workspace_id)
-            .expect("shadow route workspace should activate");
+            .expect("loopback route workspace should activate");
         session_store.bind_execution_ownership(
             session_id.clone(),
             ExecutionOwnership {
                 session_id: Some(session_id.clone()),
                 workspace_id: Some(workspace_id.clone()),
-                execution_chain_ref: Some("shadow-route-chain".to_string()),
+                execution_chain_ref: Some("route-chain".to_string()),
                 ..ExecutionOwnership::default()
             },
         );
@@ -335,7 +335,7 @@ mod tests {
                     governance: Some(magi_knowledge_store::KnowledgeGovernanceLink {
                         outcome: magi_knowledge_store::KnowledgeGovernanceOutcome::Allowed,
                         policy_refs: vec!["policy.knowledge.read".to_string()],
-                        rationale: Some("allowed for session action shadow dispatch".to_string()),
+                        rationale: Some("allowed for session action dispatch".to_string()),
                         audit_event_id: Some("audit-route-context-1".to_string()),
                     }),
                 },
@@ -407,7 +407,7 @@ mod tests {
                         max_shared_items: 2,
                         max_file_summaries: 2,
                     },
-                    project_key: Some("project-route-shadow".to_string()),
+                    project_key: Some("project-route-loopback".to_string()),
                 },
             );
 
@@ -418,7 +418,7 @@ mod tests {
             workspace_store,
             governance,
         )
-        .with_shadow_execution_pipeline(orchestrator, execution_runtime, memory_store)
+        .with_execution_pipeline(orchestrator, execution_runtime, memory_store)
         .with_task_planning_model_bridge_client(model_bridge_client.clone())
         .with_model_bridge_client(model_bridge_client.clone())
         .with_tool_registry(tool_registry_for_dispatcher.clone())
@@ -427,14 +427,14 @@ mod tests {
         let state_for_task_workers = state.clone();
         let state_for_runner_terminal = state.clone();
         let dispatcher = Arc::new(
-            ShadowTaskDispatcher::new(
+            LlmTaskDispatcher::new(
                 event_bus,
                 state
-                    .shadow_execution_pipeline()
-                    .expect("shadow execution pipeline should exist")
+                    .execution_pipeline()
+                    .expect("execution pipeline should exist")
                     .clone(),
                 state.session_store.clone(),
-                state.shadow_task_execution_registry().clone(),
+                state.task_execution_registry().clone(),
                 runner_result_receiver.clone(),
             )
             .with_model_bridge_client(model_bridge_client)
@@ -465,15 +465,15 @@ mod tests {
         state
     }
 
-    fn test_state_with_shadow_execution_pipeline() -> ApiState {
-        build_shadow_execution_state(
+    fn test_state_with_execution_pipeline() -> ApiState {
+        build_execution_state(
             WorkerRuntime::new_compare,
             Arc::new(StaticModelBridgeClient),
         )
     }
 
-    fn test_state_with_unhealthy_shadow_execution_pipeline() -> ApiState {
-        build_shadow_execution_state(
+    fn test_state_with_unhealthy_execution_pipeline() -> ApiState {
+        build_execution_state(
             WorkerRuntime::new_compare,
             Arc::new(FailingModelBridgeClient),
         )
@@ -996,20 +996,20 @@ mod tests {
 
     #[tokio::test]
     async fn session_chat_does_not_create_task_graph() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
 
         let (status, body) = post_json(
             app.clone(),
             "/api/session/turn",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
                 "text": "你好，这只是普通对话",
             }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "普通对话应提交成功: {body:?}");
-        assert_eq!(body["sessionId"], "session-route-shadow");
+        assert_eq!(body["sessionId"], "session-route-loopback");
         assert!(
             body.get("rootTaskId").is_none(),
             "普通对话响应不应暴露任务根 ID: {body:?}"
@@ -1024,7 +1024,7 @@ mod tests {
                     .details
                     .sessions
                     .iter()
-                    .find(|session| session.session_id == "session-route-shadow")
+                    .find(|session| session.session_id == "session-route-loopback")
                     .and_then(|session| session.current_turn.as_ref())
                     .is_some_and(|turn| turn.status == "completed")
             },
@@ -1043,13 +1043,13 @@ mod tests {
             .as_array()
             .expect("sessions should serialize as array")
             .iter()
-            .find(|session| session["session_id"] == "session-route-shadow")
+            .find(|session| session["session_id"] == "session-route-loopback")
             .expect("chat session should exist in read model");
         assert_eq!(session_summary["current_turn"]["status"], "completed");
         assert_eq!(session_summary["current_turn"]["mission_id"], Value::Null);
         assert_eq!(session_summary["current_turn"]["root_task_id"], Value::Null);
 
-        let messages_page = get_json(app, "/api/messages?sessionId=session-route-shadow").await;
+        let messages_page = get_json(app, "/api/messages?sessionId=session-route-loopback").await;
         let timeline_items = messages_page["timeline"]
             .as_array()
             .expect("timeline should serialize as array");
@@ -1084,7 +1084,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_turn_downgrades_low_evidence_task_route_to_chat() {
-        let state = build_shadow_execution_state(
+        let state = build_execution_state(
             WorkerRuntime::new_compare,
             Arc::new(TaskRouteClassifierModelBridgeClient),
         );
@@ -1094,7 +1094,7 @@ mod tests {
             app.clone(),
             "/api/session/turn",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
                 "text": "你好，这只是普通对话",
                 "deepTask": false,
                 "skillName": null,
@@ -1121,7 +1121,7 @@ mod tests {
                     .details
                     .sessions
                     .iter()
-                    .find(|session| session.session_id == "session-route-shadow")
+                    .find(|session| session.session_id == "session-route-loopback")
                     .and_then(|session| session.current_turn.as_ref())
                     .is_some_and(|turn| turn.status == "completed")
             },
@@ -1141,21 +1141,21 @@ mod tests {
             .as_array()
             .expect("sessions should serialize as array")
             .iter()
-            .find(|session| session["session_id"] == "session-route-shadow")
+            .find(|session| session["session_id"] == "session-route-loopback")
             .expect("chat session should exist in read model");
         assert_eq!(session_summary["current_turn"]["root_task_id"], Value::Null);
     }
 
     #[tokio::test]
     async fn session_turn_uses_high_evidence_model_task_route_without_frontend_task_signal() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
 
         let (status, body) = post_json(
             app.clone(),
             "/api/session/turn",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
                 "text": "请分析并拆分这个复杂任务",
                 "deepTask": false,
                 "skillName": null,
@@ -1175,7 +1175,7 @@ mod tests {
             .expect("模型判定 task 应返回 root task id");
         let projection = get_json(
             app,
-            &format!("/api/tasks/graph/{root_task_id}?sessionId=session-route-shadow"),
+            &format!("/api/tasks/graph/{root_task_id}?sessionId=session-route-loopback"),
         )
         .await;
         assert_eq!(projection["root_task"]["task_id"], root_task_id);
@@ -1183,7 +1183,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_turn_classifier_requires_tool_call_payload() {
-        let state = build_shadow_execution_state(
+        let state = build_execution_state(
             WorkerRuntime::new_compare,
             Arc::new(PlainJsonClassifierModelBridgeClient),
         );
@@ -1193,7 +1193,7 @@ mod tests {
             app,
             "/api/session/turn",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
                 "text": "你好，这只是普通对话",
                 "deepTask": false,
                 "skillName": null,
@@ -1211,13 +1211,13 @@ mod tests {
 
     #[tokio::test]
     async fn session_turn_classifier_uses_planning_client_when_business_model_unhealthy() {
-        let app = build_router(test_state_with_unhealthy_shadow_execution_pipeline());
+        let app = build_router(test_state_with_unhealthy_execution_pipeline());
 
         let (status, body) = post_json(
             app,
             "/api/session/turn",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
                 "text": "你好，这只是普通对话",
                 "deepTask": false,
                 "skillName": null,
@@ -1236,7 +1236,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_execute_route_runs_tool_without_task_graph() {
-        let state = build_shadow_execution_state(
+        let state = build_execution_state(
             WorkerRuntime::new_compare,
             Arc::new(ExecuteToolModelBridgeClient {
                 invoke_count: AtomicUsize::new(0),
@@ -1248,8 +1248,8 @@ mod tests {
             app.clone(),
             "/api/session/turn",
             json!({
-                "sessionId": "session-route-shadow",
-                "text": "请搜索 Route Shadow Session 并说明结果",
+                "sessionId": "session-route-loopback",
+                "text": "请搜索 Route Loopback Session 并说明结果",
                 "deepTask": false,
                 "skillName": null,
                 "images": [],
@@ -1272,7 +1272,7 @@ mod tests {
                     .details
                     .sessions
                     .iter()
-                    .find(|session| session.session_id == "session-route-shadow")
+                    .find(|session| session.session_id == "session-route-loopback")
                     .is_some_and(|session| {
                         session
                             .current_turn
@@ -1313,12 +1313,12 @@ mod tests {
 
     #[tokio::test]
     async fn session_turn_sanitizes_assignment_dispatch_from_stream_and_final() {
-        let state = build_shadow_execution_state(
+        let state = build_execution_state(
             WorkerRuntime::new_compare,
             Arc::new(AssignmentDispatchStreamingModelBridgeClient),
         );
         let app = build_router(state.clone());
-        let session_id = "session-route-shadow";
+        let session_id = "session-route-loopback";
 
         let (status, body) = post_json(
             app.clone(),
@@ -1374,7 +1374,7 @@ mod tests {
             }
         }
 
-        let messages_page = get_json(app, "/api/messages?sessionId=session-route-shadow").await;
+        let messages_page = get_json(app, "/api/messages?sessionId=session-route-loopback").await;
         let assistant_entries = messages_page["timeline"]
             .as_array()
             .expect("timeline should serialize as array")
@@ -1404,7 +1404,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_task_after_chat_replaces_current_turn_owner() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
         let session_id = "session-chat-then-task";
         let task_text = "请分析并拆分这个复杂任务";
@@ -1497,13 +1497,13 @@ mod tests {
 
     #[tokio::test]
     async fn session_turn_route_accepts_model_classified_plain_chat() {
-        let app = build_router(test_state_with_shadow_execution_pipeline());
+        let app = build_router(test_state_with_execution_pipeline());
 
         let (status, body) = post_json(
             app,
             "/api/session/turn",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
                 "text": "你好，这只是普通对话",
                 "deepTask": false,
                 "skillName": null,
@@ -1518,7 +1518,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_turn_rejects_active_current_turn_before_writing_user_message() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let session_id = SessionId::new("session-active-turn-conflict");
         state
             .session_store
@@ -1582,7 +1582,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_task_turn_rejects_active_current_turn_before_writing_user_message() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let session_id = SessionId::new("session-active-task-conflict");
         state
             .session_store
@@ -1646,12 +1646,12 @@ mod tests {
 
     #[tokio::test]
     async fn session_turn_continue_excludes_finished_branch_from_recoverable_prompt() {
-        let state = build_shadow_execution_state(
+        let state = build_execution_state(
             WorkerRuntime::new_compare,
             Arc::new(ContinueClassifierExpectingNoRecoverableChain),
         );
         let app = build_router(state.clone());
-        let session_id = SessionId::new("session-route-shadow");
+        let session_id = SessionId::new("session-route-loopback");
         let mission_id = MissionId::new("mission-finished-branch-prompt");
         let root_task_id = TaskId::new("task-root-finished-branch-prompt");
         let branch_task_id = TaskId::new("task-branch-finished-branch-prompt");
@@ -1766,9 +1766,9 @@ mod tests {
 
     #[tokio::test]
     async fn session_turn_natural_language_continue_resumes_recoverable_chain() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
-        let session_id = SessionId::new("session-route-shadow");
+        let session_id = SessionId::new("session-route-loopback");
         let mission_id = MissionId::new("mission-natural-continue");
         let root_task_id = TaskId::new("task-root-natural-continue");
         let branch_task_id = TaskId::new("task-branch-natural-continue");
@@ -1887,15 +1887,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_action_route_drives_shadow_dispatch_and_updates_runtime_read_model() {
-        let state = test_state_with_shadow_execution_pipeline();
+    async fn session_action_route_drives_dispatch_and_updates_runtime_read_model() {
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
 
         let (status, first_body) = post_json(
             app.clone(),
             "/api/session/turn",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
                 "text": "Route parser refresh",
                 "deepTask": false,
                 "skillName": "refactor",
@@ -1909,7 +1909,7 @@ mod tests {
             StatusCode::OK,
             "unexpected response body: {first_body:?}"
         );
-        assert_eq!(first_body["sessionId"], "session-route-shadow");
+        assert_eq!(first_body["sessionId"], "session-route-loopback");
         assert!(first_body["actionTaskId"].is_string());
         let first_accepted_at = first_body["acceptedAt"]
             .as_u64()
@@ -1985,18 +1985,18 @@ mod tests {
         assert_eq!(first_children[0].status, TaskStatus::Completed);
 
         let first_verification = state
-            .shadow_execution_pipeline()
-            .expect("shadow execution pipeline should exist")
+            .execution_pipeline()
+            .expect("execution pipeline should exist")
             .memory_store
             .verify_extraction_linkage(&first_extraction_id)
             .expect("first route extraction should be persisted");
         assert!(first_verification.is_consistent);
 
         let extraction_history = state
-            .shadow_execution_pipeline()
-            .expect("shadow execution pipeline should exist")
+            .execution_pipeline()
+            .expect("execution pipeline should exist")
             .memory_store
-            .extraction_results_for_session(&SessionId::new("session-route-shadow"));
+            .extraction_results_for_session(&SessionId::new("session-route-loopback"));
         assert_eq!(extraction_history.len(), 1);
         assert_eq!(extraction_history[0].extraction_id, first_extraction_id);
 
@@ -2004,7 +2004,7 @@ mod tests {
             app,
             "/api/session/turn",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
                 "text": "Route parser refresh followup",
                 "deepTask": false,
                 "skillName": "refactor",
@@ -2052,8 +2052,8 @@ mod tests {
                     .iter()
                     .find(|entry| entry.mission_id == second_mission_id);
                 let extraction_ready = state
-                    .shadow_execution_pipeline()
-                    .expect("shadow execution pipeline should exist")
+                    .execution_pipeline()
+                    .expect("execution pipeline should exist")
                     .memory_store
                     .verify_extraction_linkage(&second_extraction_id)
                     .map(|verification| verification.is_consistent)
@@ -2105,8 +2105,8 @@ mod tests {
         assert_eq!(second_children.len(), 1);
         assert_eq!(second_children[0].status, TaskStatus::Completed);
         let verification = state
-            .shadow_execution_pipeline()
-            .expect("shadow execution pipeline should exist")
+            .execution_pipeline()
+            .expect("execution pipeline should exist")
             .memory_store
             .verify_extraction_linkage(&second_extraction_id)
             .expect("second route extraction should be persisted");
@@ -2114,7 +2114,7 @@ mod tests {
 
         let ownership = state
             .session_store
-            .execution_ownership(&SessionId::new("session-route-shadow"))
+            .execution_ownership(&SessionId::new("session-route-loopback"))
             .expect("session ownership should be bound");
         assert!(ownership.mission_id.is_some());
         assert!(ownership.task_id.is_some());
@@ -2123,7 +2123,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_action_route_uses_requested_workspace_for_explicit_session() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
 
         let workspace_id = WorkspaceId::new("workspace-route-alt");
@@ -2174,7 +2174,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_action_route_exposes_current_turn_items_and_worker_lanes() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
         let session_id = SessionId::new("session-turn-view");
         state
@@ -2264,7 +2264,7 @@ mod tests {
 
     #[tokio::test]
     async fn deep_session_action_finalizes_turn_when_background_root_completes() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
         let session_id = SessionId::new("session-deep-root-finalizes");
         state
@@ -2351,7 +2351,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_turn_tool_round_missing_final_reply_fails_with_visible_turn_item() {
-        let state = build_shadow_execution_state(
+        let state = build_execution_state(
             WorkerRuntime::new_compare,
             Arc::new(ExecuteToolMissingFinalModelBridgeClient {
                 invoke_count: AtomicUsize::new(0),
@@ -2466,7 +2466,7 @@ mod tests {
     #[tokio::test]
     async fn append_dispatch_assistant_message_uses_current_turn_assistant_final_as_authoritative_source()
      {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let session_id = SessionId::new("session-turn-output-refs");
         state
             .session_store
@@ -2687,7 +2687,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_dispatch_assistant_message_waits_for_deep_root_completion() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let session_id = SessionId::new("session-deep-root-still-running");
         state
             .session_store
@@ -2849,7 +2849,7 @@ mod tests {
     #[tokio::test]
     async fn append_dispatch_assistant_message_skips_output_refs_when_current_turn_has_no_assistant_final()
      {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let session_id = SessionId::new("session-turn-no-assistant-final");
         state
             .session_store
@@ -2983,7 +2983,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_dispatch_assistant_message_skips_stale_turn_when_current_turn_was_replaced() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let session_id = SessionId::new("session-turn-replaced");
         state
             .session_store
@@ -3189,7 +3189,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_action_route_rejects_cross_workspace_session_submission() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
 
         let alt_workspace_id = WorkspaceId::new("workspace-route-other");
@@ -3205,7 +3205,7 @@ mod tests {
             app,
             "/api/session/turn",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
                 "workspaceId": alt_workspace_id.to_string(),
                 "text": "cross workspace should fail",
                 "deepTask": false,
@@ -3219,13 +3219,13 @@ mod tests {
         assert_eq!(body["error_code"], "INPUT_INVALID");
         assert_eq!(
             body["message"],
-            "会话 session-route-shadow 不属于 workspace workspace-route-other"
+            "会话 session-route-loopback 不属于 workspace workspace-route-other"
         );
     }
 
     #[tokio::test]
     async fn session_action_route_rejects_missing_requested_session() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state);
 
         let (status, body) = post_json(
@@ -3233,7 +3233,7 @@ mod tests {
             "/api/session/turn",
             json!({
                 "sessionId": "session-route-missing",
-                "workspaceId": "workspace-route-shadow",
+                "workspaceId": "workspace-route-loopback",
                 "text": "missing session should fail",
                 "deepTask": false,
                 "skillName": "refactor",
@@ -3249,8 +3249,8 @@ mod tests {
 
     #[tokio::test]
     async fn session_action_tool_and_llm_events_remain_bound_to_owning_session_after_switch() {
-        let switched_session_id = SessionId::new("session-route-shadow-other");
-        let state = build_shadow_execution_state_with_factory(
+        let switched_session_id = SessionId::new("session-route-loopback-other");
+        let state = build_execution_state_with_factory(
             WorkerRuntime::new_compare,
             |session_store| {
                 Arc::new(SessionSwitchingToolModelBridgeClient {
@@ -3270,7 +3270,7 @@ mod tests {
             app,
             "/api/session/turn",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
                 "text": "读取一个配置文件并总结",
                 "deepTask": true,
                 "images": [],
@@ -3303,7 +3303,7 @@ mod tests {
         .await;
 
         let events = state.event_bus.snapshot().recent_events;
-        let owning_session = Some(SessionId::new("session-route-shadow"));
+        let owning_session = Some(SessionId::new("session-route-loopback"));
         let switched_session = Some(switched_session_id);
 
         let dispatched_event = events
@@ -3334,14 +3334,14 @@ mod tests {
 
     #[tokio::test]
     async fn session_turn_deep_task_builds_graph_when_business_model_is_unhealthy() {
-        let state = test_state_with_unhealthy_shadow_execution_pipeline();
+        let state = test_state_with_unhealthy_execution_pipeline();
         let app = build_router(state.clone());
 
         let (status, body) = post_json(
             app,
             "/api/session/turn",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
                 "text": "Route parser refresh failure",
                 "deepTask": true,
                 "skillName": "refactor",
@@ -3375,7 +3375,7 @@ mod tests {
 
         let ownership = state
             .session_store
-            .execution_ownership(&SessionId::new("session-route-shadow"))
+            .execution_ownership(&SessionId::new("session-route-loopback"))
             .expect("深度任务应写入 session 执行 ownership");
         assert!(ownership.mission_id.is_some());
         assert_eq!(
@@ -3391,14 +3391,14 @@ mod tests {
 
     #[tokio::test]
     async fn task_graph_manual_replan_replaces_active_execution_branches() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
 
         let (status, body) = post_json(
             app.clone(),
             "/api/session/turn",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
                 "text": "Manual task graph replan coverage",
                 "deepTask": true,
                 "skillName": "refactor",
@@ -3418,7 +3418,7 @@ mod tests {
 
         let (replan_status, replan_body) = post_json(
             app,
-            &format!("/api/tasks/{root_task_id}/replan?sessionId=session-route-shadow"),
+            &format!("/api/tasks/{root_task_id}/replan?sessionId=session-route-loopback"),
             json!({}),
         )
         .await;
@@ -3449,7 +3449,7 @@ mod tests {
 
         let sidecar = state
             .session_store
-            .runtime_sidecar(&SessionId::new("session-route-shadow"))
+            .runtime_sidecar(&SessionId::new("session-route-loopback"))
             .expect("重规划后应保留 session sidecar");
         let chain = sidecar
             .active_execution_chain
@@ -3477,7 +3477,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_action_route_skips_extraction_for_blank_text_inputs() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
         let initial_execution_group_count = state
             .runtime_read_model_dto()
@@ -3511,8 +3511,8 @@ mod tests {
         assert_eq!(body["message"], "深度任务必须提供非空 execution_goal");
 
         let extraction_history = state
-            .shadow_execution_pipeline()
-            .expect("shadow execution pipeline should exist")
+            .execution_pipeline()
+            .expect("execution pipeline should exist")
             .memory_store
             .extraction_results_for_session(&SessionId::new("session-route-blank"));
         assert!(extraction_history.is_empty());
@@ -3527,14 +3527,14 @@ mod tests {
 
     #[tokio::test]
     async fn session_continue_route_executes_recovery_writeback_and_keeps_same_chain() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
 
         let (status, seed_body) = post_json(
             app.clone(),
             "/api/session/turn",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
                 "text": "seed recovery route state",
                 "deepTask": false,
                 "skillName": "refactor",
@@ -3548,7 +3548,7 @@ mod tests {
             "unexpected response body: {seed_body:?}"
         );
 
-        let session_id = SessionId::new("session-route-shadow");
+        let session_id = SessionId::new("session-route-loopback");
         let task_store = state.task_store().expect("task store should be configured");
         let seed_action_task_id = TaskId::new(
             seed_body["actionTaskId"]
@@ -3632,15 +3632,15 @@ mod tests {
         );
 
         let verification = state
-            .shadow_execution_pipeline()
-            .expect("shadow execution pipeline should exist")
+            .execution_pipeline()
+            .expect("execution pipeline should exist")
             .memory_store
             .verify_extraction_linkage("extract-session-continue-recovery-route-1")
             .expect("session continue extraction should persist");
         assert!(verification.is_consistent);
         let linkage = state
-            .shadow_execution_pipeline()
-            .expect("shadow execution pipeline should exist")
+            .execution_pipeline()
+            .expect("execution pipeline should exist")
             .memory_store
             .extraction_linkage("extract-session-continue-recovery-route-1")
             .expect("session continue extraction linkage should exist");
@@ -3719,7 +3719,7 @@ mod tests {
                                 item.kind == "assistant_final"
                                     && item.content.as_deref().is_some_and(|content| {
                                         !content.trim().is_empty()
-                                            && !content.contains("shadow-model::")
+                                            && !content.contains("loopback-model::")
                                     })
                             })
                     })
@@ -3746,22 +3746,22 @@ mod tests {
 
     #[tokio::test]
     async fn session_continue_route_resumes_only_requested_worker() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
         state
             .session_store
             .create_session_for_workspace(
-                SessionId::new("session-route-shadow-override"),
-                "shadow override session",
-                Some("workspace-route-shadow".to_string()),
+                SessionId::new("session-route-loopback-override"),
+                "loopback override session",
+                Some("workspace-route-loopback".to_string()),
             )
-            .expect("shadow override session should be creatable");
+            .expect("loopback override session should be creatable");
 
         let (status, seed_body) = post_json(
             app.clone(),
             "/api/session/turn",
             json!({
-                "sessionId": "session-route-shadow-override",
+                "sessionId": "session-route-loopback-override",
                 "text": "seed recovery route state",
                 "deepTask": true,
                 "skillName": "refactor",
@@ -3775,7 +3775,7 @@ mod tests {
             "unexpected response body: {seed_body:?}"
         );
 
-        let session_id = SessionId::new("session-route-shadow-override");
+        let session_id = SessionId::new("session-route-loopback-override");
         let mut chain = state
             .session_store
             .active_execution_chain(&session_id)
@@ -3868,8 +3868,8 @@ mod tests {
             .update_status(&held_branch.task_id, TaskStatus::Blocked)
             .expect("held branch should remain blocked until explicitly requested");
         let worker_runtime = state
-            .shadow_execution_pipeline()
-            .expect("shadow execution pipeline should exist")
+            .execution_pipeline()
+            .expect("execution pipeline should exist")
             .execution_runtime
             .worker_runtime()
             .clone();
@@ -3946,14 +3946,14 @@ mod tests {
 
     #[tokio::test]
     async fn session_continue_route_skips_runtime_finished_worker_even_when_sidecar_is_execute() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
         state
             .session_store
             .create_session_for_workspace(
                 SessionId::new("session-runtime-finished-worker"),
                 "runtime finished worker session",
-                Some("workspace-route-shadow".to_string()),
+                Some("workspace-route-loopback".to_string()),
             )
             .expect("runtime finished worker session should be creatable");
 
@@ -4020,8 +4020,8 @@ mod tests {
         }
 
         let worker_runtime = state
-            .shadow_execution_pipeline()
-            .expect("shadow execution pipeline should exist")
+            .execution_pipeline()
+            .expect("execution pipeline should exist")
             .execution_runtime
             .worker_runtime()
             .clone();
@@ -4092,14 +4092,14 @@ mod tests {
 
     #[tokio::test]
     async fn session_continue_route_returns_not_found_for_unknown_recovery() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
         state
             .session_store
             .create_session_for_workspace(
                 SessionId::new("session-route-missing-recovery"),
                 "missing recovery session",
-                Some("workspace-route-shadow".to_string()),
+                Some("workspace-route-loopback".to_string()),
             )
             .expect("missing recovery session should be creatable");
 
@@ -4156,14 +4156,14 @@ mod tests {
 
     #[tokio::test]
     async fn session_continue_route_rejects_prepared_recovery_with_input_error() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
         state
             .session_store
             .create_session_for_workspace(
                 SessionId::new("session-route-prepared"),
                 "prepared recovery session",
-                Some("workspace-route-shadow".to_string()),
+                Some("workspace-route-loopback".to_string()),
             )
             .expect("prepared recovery session should be creatable");
 
@@ -4234,14 +4234,14 @@ mod tests {
 
     #[tokio::test]
     async fn session_continue_route_rejects_consumed_recovery_with_input_error() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
         state
             .session_store
             .create_session_for_workspace(
                 SessionId::new("session-route-consumed"),
                 "consumed recovery session",
-                Some("workspace-route-shadow".to_string()),
+                Some("workspace-route-loopback".to_string()),
             )
             .expect("consumed recovery session should be creatable");
 
@@ -4409,7 +4409,7 @@ mod tests {
             }
             Ok(BridgeResponse {
                 ok: true,
-                payload: format!("shadow-model::{}", request.prompt.trim()),
+                payload: format!("loopback-model::{}", request.prompt.trim()),
             })
         }
 
@@ -4442,7 +4442,7 @@ mod tests {
             }
             Ok(BridgeResponse {
                 ok: true,
-                payload: "shadow-model::ok".to_string(),
+                payload: "loopback-model::ok".to_string(),
             })
         }
 
@@ -4478,7 +4478,7 @@ mod tests {
             }
             Ok(BridgeResponse {
                 ok: true,
-                payload: "shadow-model::普通对话回复".to_string(),
+                payload: "loopback-model::普通对话回复".to_string(),
             })
         }
 
@@ -4571,7 +4571,7 @@ mod tests {
                         "function": {
                             "name": "search_text",
                             "arguments": serde_json::json!({
-                                "query": "Route Shadow Session",
+                                "query": "Route Loopback Session",
                                 "root": ".",
                                 "limit": 1
                             }).to_string(),
@@ -4627,7 +4627,7 @@ mod tests {
                         "function": {
                             "name": "search_text",
                             "arguments": serde_json::json!({
-                                "query": "Route Shadow Session",
+                                "query": "Route Loopback Session",
                                 "root": ".",
                                 "limit": 1
                             }).to_string(),
@@ -4915,7 +4915,7 @@ mod tests {
             }
             Ok(BridgeResponse {
                 ok: true,
-                payload: "shadow-model::ok".to_string(),
+                payload: "loopback-model::ok".to_string(),
             })
         }
 
@@ -5059,8 +5059,8 @@ mod tests {
                             message: "model.invoke missing provider".to_string(),
                         })?;
                     let payload = match provider {
-                        SHADOW_MODEL_PROVIDER => {
-                            bridge_response("shadow-model::bridge preflight ping")
+                        LOOPBACK_MODEL_PROVIDER => {
+                            bridge_response("loopback-model::bridge preflight ping")
                         }
                         "openai-compatible" => {
                             bridge_response("openai-compatible::bridge preflight ping")
@@ -5075,10 +5075,10 @@ mod tests {
                 }
                 LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD => Ok(BridgeTransportResponse {
                     payload: serde_json::to_value(BridgeServerServiceCatalog {
-                        protocol_version: "shadow-local-bridge-v1".to_string(),
+                        protocol_version: "local-bridge-v1".to_string(),
                         server_kind: BridgeServerKind::Model,
                         services: vec![
-                            descriptor(SHADOW_MODEL_PROVIDER),
+                            descriptor(LOOPBACK_MODEL_PROVIDER),
                             descriptor_with_health("openai-compatible", "ready"),
                         ],
                     })
@@ -5106,8 +5106,8 @@ mod tests {
                             message: "model.invoke missing provider".to_string(),
                         })?;
                     let payload = match provider {
-                        SHADOW_MODEL_PROVIDER => {
-                            bridge_response("shadow-model::bridge cutover smoke")
+                        LOOPBACK_MODEL_PROVIDER => {
+                            bridge_response("loopback-model::bridge cutover smoke")
                         }
                         "openai-compatible" => structured_bridge_response(json!({
                             "content": "hello from cutover smoke",
@@ -5132,13 +5132,13 @@ mod tests {
                 }
                 LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD => Ok(BridgeTransportResponse {
                     payload: serde_json::to_value(BridgeServerServiceCatalog {
-                        protocol_version: "shadow-local-bridge-v1".to_string(),
+                        protocol_version: "local-bridge-v1".to_string(),
                         server_kind: BridgeServerKind::Model,
                         services: vec![
                             descriptor_with_profile(
-                                SHADOW_MODEL_PROVIDER,
+                                LOOPBACK_MODEL_PROVIDER,
                                 "ready",
-                                "shadow-model-bridge-payload-v1",
+                                "model-bridge-payload-v1",
                             ),
                             descriptor_with_profile(
                                 "openai-compatible",
@@ -5187,7 +5187,7 @@ mod tests {
 
     fn handshake(kind: BridgeServerKind) -> Value {
         serde_json::to_value(BridgeServerHandshake {
-            protocol_version: "shadow-local-bridge-v1".to_string(),
+            protocol_version: "local-bridge-v1".to_string(),
             server_kind: kind,
             health_method: LOCAL_BRIDGE_HEALTH_METHOD.to_string(),
             supported_methods: vec!["bridge.describe_services".to_string()],
@@ -5197,7 +5197,7 @@ mod tests {
 
     fn health(kind: BridgeServerKind, status: &str, ok: bool) -> Value {
         serde_json::to_value(BridgeServerHealth {
-            protocol_version: "shadow-local-bridge-v1".to_string(),
+            protocol_version: "local-bridge-v1".to_string(),
             server_kind: kind,
             status: status.to_string(),
             ok,
@@ -5207,7 +5207,7 @@ mod tests {
 
     fn catalog(kind: BridgeServerKind, service_name: &str) -> Value {
         serde_json::to_value(BridgeServerServiceCatalog {
-            protocol_version: "shadow-local-bridge-v1".to_string(),
+            protocol_version: "local-bridge-v1".to_string(),
             server_kind: kind,
             services: vec![descriptor(service_name)],
         })
@@ -5262,7 +5262,7 @@ mod tests {
     ) -> magi_bridge_client::BridgeServerServiceDescriptor {
         magi_bridge_client::BridgeServerServiceDescriptor {
             service_name: service_name.to_string(),
-            shim_kind: "shadow".to_string(),
+            shim_kind: "loopback".to_string(),
             supported_operations: vec!["inspect".to_string()],
             capabilities: vec!["service_catalog".to_string()],
             service_health: Some(service_health.to_string()),
@@ -5330,7 +5330,7 @@ mod tests {
                 ),
                 (
                     LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
-                    FakeTransportOutcome::Payload(catalog(BridgeServerKind::Model, "shadow-model")),
+                    FakeTransportOutcome::Payload(catalog(BridgeServerKind::Model, "loopback-model")),
                 ),
             ]))),
         ));
@@ -5340,7 +5340,7 @@ mod tests {
         assert_eq!(snapshot["services"][0]["health"]["status"], "healthy");
         assert_eq!(
             snapshot["services"][0]["service_catalog"]["services"][0]["service_name"],
-            "shadow-model"
+            "loopback-model"
         );
     }
 
@@ -5361,14 +5361,14 @@ mod tests {
                         (
                             "model.invoke".to_string(),
                             FakeTransportOutcome::Payload(bridge_response(
-                                "shadow-model::bridge preflight ping",
+                                "loopback-model::bridge preflight ping",
                             )),
                         ),
                         (
                             LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
                             FakeTransportOutcome::Payload(catalog(
                                 BridgeServerKind::Model,
-                                SHADOW_MODEL_PROVIDER,
+                                LOOPBACK_MODEL_PROVIDER,
                             )),
                         ),
                     ]))),
@@ -5380,11 +5380,11 @@ mod tests {
                             "mcp.list_servers".to_string(),
                             FakeTransportOutcome::Payload(
                                 serde_json::to_value(McpManagerListServersResponse {
-                                    manager: descriptor("shadow-mcp-manager"),
-                                    servers: vec![descriptor(SHADOW_MCP_SERVER_NAME)],
-                                    selection_targets: vec![SHADOW_MCP_SERVER_NAME.to_string()],
+                                    manager: descriptor("loopback-mcp-manager"),
+                                    servers: vec![descriptor(LOOPBACK_MCP_SERVER_NAME)],
+                                    selection_targets: vec![LOOPBACK_MCP_SERVER_NAME.to_string()],
                                     default_route_status: "available".to_string(),
-                                    default_route_target: SHADOW_MCP_SERVER_NAME.to_string(),
+                                    default_route_target: LOOPBACK_MCP_SERVER_NAME.to_string(),
                                 })
                                 .expect("mcp manager list should serialize"),
                             ),
@@ -5420,7 +5420,7 @@ mod tests {
             .find(|entry| entry["server_kind"] == "model")
             .expect("model preflight should exist");
         assert_eq!(model["checks"][0]["check_name"], "invoke");
-        assert_eq!(model["checks"][0]["target"], SHADOW_MODEL_PROVIDER);
+        assert_eq!(model["checks"][0]["target"], LOOPBACK_MODEL_PROVIDER);
         assert_eq!(model["checks"][0]["ok"], true);
 
         let mcp = services
@@ -5428,11 +5428,11 @@ mod tests {
             .find(|entry| entry["server_kind"] == "mcp")
             .expect("mcp preflight should exist");
         assert_eq!(mcp["checks"][0]["check_name"], "list_servers");
-        assert_eq!(mcp["checks"][0]["target"], "shadow-mcp-manager");
+        assert_eq!(mcp["checks"][0]["target"], "loopback-mcp-manager");
         assert_eq!(mcp["checks"][0]["ok"], true);
         assert_eq!(
             mcp["checks"][1]["target"],
-            format!("{SHADOW_MCP_SERVER_NAME}.{SHADOW_MCP_TOOL_NAME}")
+            format!("{LOOPBACK_MCP_SERVER_NAME}.{LOOPBACK_MCP_TOOL_NAME}")
         );
         assert_eq!(mcp["checks"][1]["ok"], true);
     }
@@ -5458,8 +5458,8 @@ mod tests {
         assert!(
             checks
                 .iter()
-                .any(|check| check["target"] == SHADOW_MODEL_PROVIDER && check["ok"] == true),
-            "model preflight should keep shadow-model smoke: {model:?}"
+                .any(|check| check["target"] == LOOPBACK_MODEL_PROVIDER && check["ok"] == true),
+            "model preflight should keep loopback-model smoke: {model:?}"
         );
         assert!(
             checks
@@ -5497,28 +5497,28 @@ mod tests {
                             FakeTransportOutcome::Payload(
                                 serde_json::to_value(McpManagerListServersResponse {
                                     manager: descriptor_with_route(
-                                        "shadow-mcp-manager",
+                                        "loopback-mcp-manager",
                                         "ready",
-                                        "shadow-mcp-observability",
+                                        "loopback-mcp-observability",
                                     ),
                                     servers: vec![
                                         descriptor_with_profile(
-                                            SHADOW_MCP_SERVER_NAME,
+                                            LOOPBACK_MCP_SERVER_NAME,
                                             "ready",
                                             "inspection-core-v1",
                                         ),
                                         descriptor_with_profile(
-                                            "shadow-mcp-observability",
+                                            "loopback-mcp-observability",
                                             "ready",
                                             "observability-v1",
                                         ),
                                     ],
                                     selection_targets: vec![
-                                        SHADOW_MCP_SERVER_NAME.to_string(),
-                                        "shadow-mcp-observability".to_string(),
+                                        LOOPBACK_MCP_SERVER_NAME.to_string(),
+                                        "loopback-mcp-observability".to_string(),
                                     ],
                                     default_route_status: "ready".to_string(),
-                                    default_route_target: "shadow-mcp-observability".to_string(),
+                                    default_route_target: "loopback-mcp-observability".to_string(),
                                 })
                                 .expect("mcp manager list should serialize"),
                             ),
@@ -5527,12 +5527,12 @@ mod tests {
                             "mcp.describe_server".to_string(),
                             FakeTransportOutcome::Payload(json!({
                                 "manager": descriptor_with_route(
-                                    "shadow-mcp-manager",
+                                    "loopback-mcp-manager",
                                     "ready",
-                                    "shadow-mcp-observability",
+                                    "loopback-mcp-observability",
                                 ),
                                 "server": descriptor_with_profile(
-                                    "shadow-mcp-observability",
+                                    "loopback-mcp-observability",
                                     "ready",
                                     "observability-v1",
                                 ),
@@ -5542,9 +5542,9 @@ mod tests {
                         (
                             "mcp.call_tool".to_string(),
                             FakeTransportOutcome::Payload(structured_bridge_response(json!({
-                                "server_name": "shadow-mcp-observability",
+                                "server_name": "loopback-mcp-observability",
                                 "default_route_status": "ready",
-                                "default_route_target": "shadow-mcp-observability",
+                                "default_route_target": "loopback-mcp-observability",
                                 "tool_name": "echo.describe",
                             }))),
                         ),
@@ -5667,11 +5667,11 @@ mod tests {
         assert_eq!(mcp["checks"][0]["mcp_contract"]["route_status"], "ready");
         assert_eq!(
             mcp["checks"][0]["mcp_contract"]["route_target"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(
             mcp["checks"][0]["mcp_contract"]["resolved_server"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "ready");
         assert_eq!(
@@ -5680,7 +5680,7 @@ mod tests {
         );
         assert_eq!(
             mcp["mcp_default_route_gate"]["route_target"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(
             mcp["mcp_default_route_gate"]["route_target"],
@@ -5688,7 +5688,7 @@ mod tests {
         );
         assert_eq!(
             mcp["mcp_default_route_gate"]["resolved_server"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(
             mcp["mcp_default_route_gate"]["resolved_server"],
@@ -5712,18 +5712,18 @@ mod tests {
                         FakeTransportOutcome::Payload(
                             serde_json::to_value(McpManagerListServersResponse {
                                 manager: descriptor_with_route(
-                                    "shadow-mcp-manager",
+                                    "loopback-mcp-manager",
                                     "ready",
-                                    "shadow-mcp-observability",
+                                    "loopback-mcp-observability",
                                 ),
                                 servers: vec![descriptor_with_profile(
-                                    "shadow-mcp-observability",
+                                    "loopback-mcp-observability",
                                     "ready",
                                     "observability-v1",
                                 )],
-                                selection_targets: vec!["shadow-mcp-observability".to_string()],
+                                selection_targets: vec!["loopback-mcp-observability".to_string()],
                                 default_route_status: "ready".to_string(),
-                                default_route_target: "shadow-mcp-observability".to_string(),
+                                default_route_target: "loopback-mcp-observability".to_string(),
                             })
                             .expect("mcp manager list should serialize"),
                         ),
@@ -5737,9 +5737,9 @@ mod tests {
                     (
                         "mcp.call_tool".to_string(),
                         FakeTransportOutcome::Payload(structured_bridge_response(json!({
-                            "server_name": "shadow-mcp-observability",
+                            "server_name": "loopback-mcp-observability",
                             "default_route_status": "ready",
-                            "default_route_target": "shadow-mcp-observability",
+                            "default_route_target": "loopback-mcp-observability",
                             "tool_name": "echo.describe",
                         }))),
                     ),
@@ -5786,18 +5786,18 @@ mod tests {
                         FakeTransportOutcome::Payload(
                             serde_json::to_value(McpManagerListServersResponse {
                                 manager: descriptor_with_route(
-                                    "shadow-mcp-manager",
+                                    "loopback-mcp-manager",
                                     "ready",
-                                    "shadow-mcp-observability",
+                                    "loopback-mcp-observability",
                                 ),
                                 servers: vec![descriptor_with_profile(
-                                    "shadow-mcp-observability",
+                                    "loopback-mcp-observability",
                                     "ready",
                                     "observability-v1",
                                 )],
-                                selection_targets: vec!["shadow-mcp-observability".to_string()],
+                                selection_targets: vec!["loopback-mcp-observability".to_string()],
                                 default_route_status: "ready".to_string(),
-                                default_route_target: "shadow-mcp-observability".to_string(),
+                                default_route_target: "loopback-mcp-observability".to_string(),
                             })
                             .expect("mcp manager list should serialize"),
                         ),
@@ -5806,12 +5806,12 @@ mod tests {
                         "mcp.describe_server".to_string(),
                         FakeTransportOutcome::Payload(json!({
                             "manager": descriptor_with_route(
-                                "shadow-mcp-manager",
+                                "loopback-mcp-manager",
                                 "ready",
-                                "shadow-mcp-observability",
+                                "loopback-mcp-observability",
                             ),
                             "server": descriptor_with_profile(
-                                "shadow-mcp-observability",
+                                "loopback-mcp-observability",
                                 "ready",
                                 "observability-v1",
                             ),
@@ -5857,18 +5857,18 @@ mod tests {
                         FakeTransportOutcome::Payload(
                             serde_json::to_value(McpManagerListServersResponse {
                                 manager: descriptor_with_route(
-                                    "shadow-mcp-manager",
+                                    "loopback-mcp-manager",
                                     "ready",
-                                    "shadow-mcp-observability",
+                                    "loopback-mcp-observability",
                                 ),
                                 servers: vec![descriptor_with_profile(
-                                    "shadow-mcp-observability",
+                                    "loopback-mcp-observability",
                                     "ready",
                                     "observability-v1",
                                 )],
-                                selection_targets: vec!["shadow-mcp-observability".to_string()],
+                                selection_targets: vec!["loopback-mcp-observability".to_string()],
                                 default_route_status: "ready".to_string(),
-                                default_route_target: "shadow-mcp-observability".to_string(),
+                                default_route_target: "loopback-mcp-observability".to_string(),
                             })
                             .expect("mcp manager list should serialize"),
                         ),
@@ -5877,12 +5877,12 @@ mod tests {
                         "mcp.describe_server".to_string(),
                         FakeTransportOutcome::Payload(json!({
                             "manager": descriptor_with_route(
-                                "shadow-mcp-manager",
+                                "loopback-mcp-manager",
                                 "ready",
-                                "shadow-mcp-observability",
+                                "loopback-mcp-observability",
                             ),
                             "server": descriptor_with_profile(
-                                "shadow-mcp-observability",
+                                "loopback-mcp-observability",
                                 "ready",
                                 "observability-v1",
                             ),
@@ -5937,18 +5937,18 @@ mod tests {
                         FakeTransportOutcome::Payload(
                             serde_json::to_value(McpManagerListServersResponse {
                                 manager: descriptor_with_route(
-                                    "shadow-mcp-manager",
+                                    "loopback-mcp-manager",
                                     "ready",
-                                    "shadow-mcp-observability",
+                                    "loopback-mcp-observability",
                                 ),
                                 servers: vec![descriptor_with_profile(
-                                    "shadow-mcp-observability",
+                                    "loopback-mcp-observability",
                                     "ready",
                                     "observability-v1",
                                 )],
-                                selection_targets: vec!["shadow-mcp-observability".to_string()],
+                                selection_targets: vec!["loopback-mcp-observability".to_string()],
                                 default_route_status: "ready".to_string(),
-                                default_route_target: "shadow-mcp-observability".to_string(),
+                                default_route_target: "loopback-mcp-observability".to_string(),
                             })
                             .expect("mcp manager list should serialize"),
                         ),
@@ -5957,12 +5957,12 @@ mod tests {
                         "mcp.describe_server".to_string(),
                         FakeTransportOutcome::Payload(json!({
                             "manager": descriptor_with_route(
-                                "shadow-mcp-manager",
+                                "loopback-mcp-manager",
                                 "ready",
-                                "shadow-mcp-observability",
+                                "loopback-mcp-observability",
                             ),
                             "server": descriptor_with_profile(
-                                "shadow-mcp-observability",
+                                "loopback-mcp-observability",
                                 "ready",
                                 "observability-v1",
                             ),
@@ -5972,9 +5972,9 @@ mod tests {
                     (
                         "mcp.call_tool".to_string(),
                         FakeTransportOutcome::Payload(structured_bridge_response(json!({
-                            "server_name": "shadow-mcp-observability",
+                            "server_name": "loopback-mcp-observability",
                             "default_route_status": "ready",
-                            "default_route_target": "shadow-mcp-inspection",
+                            "default_route_target": "loopback-mcp-inspection",
                             "tool_name": "echo.describe",
                         }))),
                     ),
@@ -5995,7 +5995,7 @@ mod tests {
         assert_eq!(snapshot["blocking_issues"][0]["error"], Value::Null);
         assert_eq!(
             snapshot["services"][0]["mcp_default_route_gate"]["resolved_server"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(
             snapshot["services"][0]["mcp_default_route_gate"]["contract_ok"],
@@ -6014,28 +6014,28 @@ mod tests {
                         FakeTransportOutcome::Payload(
                             serde_json::to_value(McpManagerListServersResponse {
                                 manager: descriptor_with_route(
-                                    "shadow-mcp-manager",
+                                    "loopback-mcp-manager",
                                     "ready",
-                                    "shadow-mcp-observability",
+                                    "loopback-mcp-observability",
                                 ),
                                 servers: vec![
                                     descriptor_with_profile(
-                                        "shadow-mcp-observability",
+                                        "loopback-mcp-observability",
                                         "ready",
                                         "observability-v1",
                                     ),
                                     descriptor_with_profile(
-                                        "shadow-mcp-inspection",
+                                        "loopback-mcp-inspection",
                                         "ready",
                                         "inspection-v1",
                                     ),
                                 ],
                                 selection_targets: vec![
-                                    "shadow-mcp-observability".to_string(),
-                                    "shadow-mcp-inspection".to_string(),
+                                    "loopback-mcp-observability".to_string(),
+                                    "loopback-mcp-inspection".to_string(),
                                 ],
                                 default_route_status: "ready".to_string(),
-                                default_route_target: "shadow-mcp-observability".to_string(),
+                                default_route_target: "loopback-mcp-observability".to_string(),
                             })
                             .expect("mcp manager list should serialize"),
                         ),
@@ -6044,12 +6044,12 @@ mod tests {
                         "mcp.describe_server".to_string(),
                         FakeTransportOutcome::Payload(json!({
                             "manager": descriptor_with_route(
-                                "shadow-mcp-manager",
+                                "loopback-mcp-manager",
                                 "ready",
-                                "shadow-mcp-observability",
+                                "loopback-mcp-observability",
                             ),
                             "server": descriptor_with_profile(
-                                "shadow-mcp-observability",
+                                "loopback-mcp-observability",
                                 "ready",
                                 "observability-v1",
                             ),
@@ -6059,9 +6059,9 @@ mod tests {
                     (
                         "mcp.call_tool".to_string(),
                         FakeTransportOutcome::Payload(structured_bridge_response(json!({
-                            "server_name": "shadow-mcp-inspection",
+                            "server_name": "loopback-mcp-inspection",
                             "default_route_status": "ready",
-                            "default_route_target": "shadow-mcp-observability",
+                            "default_route_target": "loopback-mcp-observability",
                             "tool_name": "echo.describe",
                         }))),
                     ),
@@ -6082,11 +6082,11 @@ mod tests {
         assert_eq!(snapshot["blocking_issues"][0]["error"], Value::Null);
         assert_eq!(
             snapshot["services"][0]["mcp_default_route_gate"]["route_target"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(
             snapshot["services"][0]["mcp_default_route_gate"]["resolved_server"],
-            "shadow-mcp-inspection"
+            "loopback-mcp-inspection"
         );
         assert_eq!(
             snapshot["services"][0]["mcp_default_route_gate"]["contract_ok"],
@@ -6095,8 +6095,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bridge_routes_do_not_touch_shadow_execution_state() {
-        let state = test_state_with_shadow_execution_pipeline();
+    async fn bridge_routes_do_not_touch_execution_state() {
+        let state = test_state_with_execution_pipeline();
         let app = build_router(
             state
                 .clone()
@@ -6113,14 +6113,14 @@ mod tests {
                         (
                             "model.invoke".to_string(),
                             FakeTransportOutcome::Payload(bridge_response(
-                                "shadow-model::bridge preflight ping",
+                                "loopback-model::bridge preflight ping",
                             )),
                         ),
                         (
                             LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
                             FakeTransportOutcome::Payload(catalog(
                                 BridgeServerKind::Model,
-                                SHADOW_MODEL_PROVIDER,
+                                LOOPBACK_MODEL_PROVIDER,
                             )),
                         ),
                     ]))),
@@ -6132,11 +6132,11 @@ mod tests {
                             "mcp.list_servers".to_string(),
                             FakeTransportOutcome::Payload(
                                 serde_json::to_value(McpManagerListServersResponse {
-                                    manager: descriptor("shadow-mcp-manager"),
-                                    servers: vec![descriptor(SHADOW_MCP_SERVER_NAME)],
-                                    selection_targets: vec![SHADOW_MCP_SERVER_NAME.to_string()],
+                                    manager: descriptor("loopback-mcp-manager"),
+                                    servers: vec![descriptor(LOOPBACK_MCP_SERVER_NAME)],
+                                    selection_targets: vec![LOOPBACK_MCP_SERVER_NAME.to_string()],
                                     default_route_status: "available".to_string(),
-                                    default_route_target: SHADOW_MCP_SERVER_NAME.to_string(),
+                                    default_route_target: LOOPBACK_MCP_SERVER_NAME.to_string(),
                                 })
                                 .expect("mcp manager list should serialize"),
                             ),
@@ -6179,8 +6179,8 @@ mod tests {
 
         assert!(
             state
-                .shadow_execution_pipeline()
-                .expect("shadow execution pipeline should exist")
+                .execution_pipeline()
+                .expect("execution pipeline should exist")
                 .memory_store
                 .extraction_results_for_session(&SessionId::new("bridge-route-guard"))
                 .is_empty()
@@ -6206,7 +6206,7 @@ mod tests {
                     services: vec![BridgeServiceSnapshotDto {
                         server_kind: BridgeServerKind::Host,
                         handshake: Some(BridgeServerHandshake {
-                            protocol_version: "shadow-local-bridge-v1".to_string(),
+                            protocol_version: "local-bridge-v1".to_string(),
                             server_kind: BridgeServerKind::Host,
                             health_method: LOCAL_BRIDGE_HEALTH_METHOD.to_string(),
                             supported_methods: vec!["host.call".to_string()],
@@ -6219,7 +6219,7 @@ mod tests {
                             message: "桥接调用失败[RemoteBusiness]: probe degraded".to_string(),
                         }),
                         service_catalog: Some(BridgeServerServiceCatalog {
-                            protocol_version: "shadow-local-bridge-v1".to_string(),
+                            protocol_version: "local-bridge-v1".to_string(),
                             server_kind: BridgeServerKind::Host,
                             services: vec![],
                         }),
@@ -6242,14 +6242,14 @@ mod tests {
 
     #[tokio::test]
     async fn task_interrupt_route_requires_structured_task_id_and_cancels_target_task() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
 
         let (submit_status, submit_body) = post_json(
             app.clone(),
             "/api/session/turn",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
                 "text": "interrupt target task",
                 "deepTask": false,
                 "skillName": "code",
@@ -6280,7 +6280,7 @@ mod tests {
             app,
             "/api/task/interrupt",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
                 "taskId": action_task_id,
             }),
         )
@@ -6305,11 +6305,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn session_action_interrupt_discards_late_completion_for_blocked_session_task() {
-        let state = build_shadow_execution_state(
+        let state = build_execution_state(
             WorkerRuntime::new_compare,
             Arc::new(DelayedModelBridgeClient {
                 delay: Duration::from_millis(200),
-                payload: "shadow-model::被中断的晚到结果".to_string(),
+                payload: "loopback-model::被中断的晚到结果".to_string(),
             }),
         );
         let app = build_router(state.clone());
@@ -6320,7 +6320,7 @@ mod tests {
                 submit_app,
                 "/api/session/turn",
                 json!({
-                    "sessionId": "session-route-shadow",
+                    "sessionId": "session-route-loopback",
                     "text": "interrupt delayed completion",
                     "deepTask": false,
                     "skillName": "code",
@@ -6334,7 +6334,7 @@ mod tests {
 
         let chain = state
             .session_store
-            .active_execution_chain(&SessionId::new("session-route-shadow"))
+            .active_execution_chain(&SessionId::new("session-route-loopback"))
             .expect("active execution chain should exist while session action is running");
         let action_task_id = chain
             .branches
@@ -6348,7 +6348,7 @@ mod tests {
             app,
             "/api/task/interrupt",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
                 "taskId": action_task_id.to_string(),
             }),
         )
@@ -6388,7 +6388,7 @@ mod tests {
             .timeline()
             .into_iter()
             .filter(|entry| {
-                entry.session_id == SessionId::new("session-route-shadow")
+                entry.session_id == SessionId::new("session-route-loopback")
                     && matches!(
                         entry.kind,
                         magi_session_store::TimelineEntryKind::AssistantMessage
@@ -6403,15 +6403,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn regular_session_turn_interrupt_cancels_turn_and_discards_late_completion() {
-        let state = build_shadow_execution_state(
+        let state = build_execution_state(
             WorkerRuntime::new_compare,
             Arc::new(DelayedModelBridgeClient {
                 delay: Duration::from_millis(200),
-                payload: "shadow-model::普通会话晚到回复".to_string(),
+                payload: "loopback-model::普通会话晚到回复".to_string(),
             }),
         );
         let app = build_router(state.clone());
-        let session_id = SessionId::new("session-route-shadow");
+        let session_id = SessionId::new("session-route-loopback");
 
         let submit_app = app.clone();
         let submit_handle = tokio::spawn(async move {
@@ -6419,7 +6419,7 @@ mod tests {
                 submit_app,
                 "/api/session/turn",
                 json!({
-                    "sessionId": "session-route-shadow",
+                    "sessionId": "session-route-loopback",
                     "text": "ordinary interrupt delayed completion",
                     "deepTask": false,
                     "skillName": "",
@@ -6447,7 +6447,7 @@ mod tests {
             app,
             "/api/session/interrupt",
             json!({
-                "sessionId": "session-route-shadow",
+                "sessionId": "session-route-loopback",
             }),
         )
         .await;
@@ -6514,7 +6514,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_interrupt_finalizes_completed_root_before_cancelling_turn() {
-        let state = test_state_with_shadow_execution_pipeline();
+        let state = test_state_with_execution_pipeline();
         let app = build_router(state.clone());
         let session_id = SessionId::new("session-interrupt-completed-root");
         let mission_id = MissionId::new("mission-interrupt-completed-root");
@@ -6623,21 +6623,21 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deep_session_action_interrupt_discards_late_completion_for_blocked_session_task() {
-        let state = build_shadow_execution_state(
+        let state = build_execution_state(
             WorkerRuntime::new_compare,
             Arc::new(DelayedModelBridgeClient {
                 delay: Duration::from_millis(200),
-                payload: "shadow-model::deep interrupted late result".to_string(),
+                payload: "loopback-model::deep interrupted late result".to_string(),
             }),
         );
         let app = build_router(state.clone());
-        let session_id = SessionId::new("session-route-shadow-deep");
+        let session_id = SessionId::new("session-route-loopback-deep");
         state
             .session_store
             .create_session(session_id.clone(), "deep interrupt session")
             .expect("deep interrupt session should be creatable");
         let accepted_at = UtcMillis::now();
-        let mut accepted = submit_shadow_dispatch_submission(
+        let mut accepted = submit_dispatch_submission(
             &state,
             crate::task_execution::DispatchSubmissionRequest {
                 accepted_at,
@@ -6663,8 +6663,8 @@ mod tests {
 
         let drive_state = state.clone();
         let drive_handle = tokio::spawn(async move {
-            drive_shadow_dispatch_submission(&drive_state, &mut accepted)
-                .expect("deep shadow dispatch should finish without route-level error");
+            drive_dispatch_submission(&drive_state, &mut accepted)
+                .expect("deep dispatch should finish without route-level error");
             append_dispatch_assistant_message(&drive_state, &accepted);
         });
 
@@ -6688,7 +6688,7 @@ mod tests {
 
         drive_handle
             .await
-            .expect("deep shadow dispatch task should join successfully");
+            .expect("deep dispatch task should join successfully");
 
         let task_store = state.task_store().expect("task store should be configured");
         let interrupted_task = task_store
@@ -6709,7 +6709,7 @@ mod tests {
             .timeline()
             .into_iter()
             .filter(|entry| {
-                entry.session_id == SessionId::new("session-route-shadow-deep")
+                entry.session_id == SessionId::new("session-route-loopback-deep")
                     && matches!(
                         entry.kind,
                         magi_session_store::TimelineEntryKind::AssistantMessage

@@ -1,6 +1,6 @@
 use magi_bridge_client::{
     ChatCompletionPayload, ChatToolChoice, ChatToolDefinition, ChatToolFunctionDefinition,
-    ModelInvocationRequest, SHADOW_MODEL_PROVIDER,
+    ModelInvocationRequest, LOOPBACK_MODEL_PROVIDER,
 };
 use magi_core::{
     ExecutionOwnership, ExecutorBinding, MissionId, SessionId, Task, TaskExecutionTarget, TaskId,
@@ -23,10 +23,10 @@ use crate::dto::SessionTurnRequestDto;
 use crate::{
     errors::ApiError,
     state::ApiState,
-    task_execution::{DispatchSubmissionRequest, ShadowTaskExecutionPlan},
+    task_execution::{DispatchSubmissionRequest, TaskExecutionPlan},
 };
 
-pub(crate) struct ShadowTaskGraphSubmission {
+pub(crate) struct TaskGraphSubmission {
     pub root_task_id: TaskId,
     pub action_task_id: TaskId,
     pub active_execution_chain: Option<ActiveExecutionChain>,
@@ -86,18 +86,18 @@ struct SessionExecutionBranchSpec {
     is_primary: bool,
 }
 
-pub(crate) fn run_shadow_dispatch_submission(
+pub(crate) fn run_dispatch_submission(
     state: &ApiState,
     request: &DispatchSubmissionRequest,
-) -> Result<ShadowTaskGraphSubmission, ApiError> {
-    let _ = state.shadow_execution_pipeline().ok_or_else(|| {
+) -> Result<TaskGraphSubmission, ApiError> {
+    let _ = state.execution_pipeline().ok_or_else(|| {
         ApiError::internal_assembly(
-            "执行 shadow dispatch 失败",
-            "shadow execution pipeline 未配置",
+            "任务派发失败",
+            "execution pipeline 未配置",
         )
     })?;
     let task_store = state.task_store().ok_or_else(|| {
-        ApiError::internal_assembly("执行 shadow dispatch 失败", "task_store 未配置")
+        ApiError::internal_assembly("任务派发失败", "task_store 未配置")
     })?;
 
     let accepted_at = request.accepted_at;
@@ -123,7 +123,7 @@ pub(crate) fn run_shadow_dispatch_submission(
 
     let now = UtcMillis::now();
     let task_goal_text = execution_goal.or(trimmed_text).unwrap_or("").to_string();
-    let objective = make_shadow_task(
+    let objective = make_dispatch_task(
         obj_task_id.clone(),
         mission_id.clone(),
         obj_task_id.clone(),
@@ -140,7 +140,7 @@ pub(crate) fn run_shadow_dispatch_submission(
     task_store.insert_task(objective);
 
     if !request.deep_task {
-        let action = make_shadow_task(
+        let action = make_dispatch_task(
             act_task_id.clone(),
             mission_id.clone(),
             obj_task_id.clone(),
@@ -179,7 +179,7 @@ pub(crate) fn run_shadow_dispatch_submission(
         ) {
             Ok(graph) => Some(graph),
             Err(err) => {
-                cleanup_shadow_task_tree(task_store, &obj_task_id);
+                cleanup_task_tree(task_store, &obj_task_id);
                 return Err(err);
             }
         }
@@ -216,9 +216,9 @@ pub(crate) fn run_shadow_dispatch_submission(
         execution_chain_ref: execution_chain_ref.clone(),
         ..ExecutionOwnership::default()
     };
-    state.shadow_task_execution_registry().insert(
+    state.task_execution_registry().insert(
         act_task_id.clone(),
-        ShadowTaskExecutionPlan::Dispatch {
+        TaskExecutionPlan::Dispatch {
             target: TaskExecutionTarget {
                 mission_id: mission_id.clone(),
                 root_task_id: obj_task_id.clone(),
@@ -259,9 +259,9 @@ pub(crate) fn run_shadow_dispatch_submission(
             execution_chain_ref: execution_chain_ref.clone(),
             ..ExecutionOwnership::default()
         };
-        state.shadow_task_execution_registry().insert(
+        state.task_execution_registry().insert(
             sub_task_id.clone(),
-            ShadowTaskExecutionPlan::Dispatch {
+            TaskExecutionPlan::Dispatch {
                 target: TaskExecutionTarget {
                     mission_id: mission_id.clone(),
                     root_task_id: obj_task_id.clone(),
@@ -492,7 +492,7 @@ pub(crate) fn run_shadow_dispatch_submission(
         });
     }
     current_turn.normalize();
-    Ok(ShadowTaskGraphSubmission {
+    Ok(TaskGraphSubmission {
         root_task_id: obj_task_id.clone(),
         action_task_id: act_task_id.clone(),
         active_execution_chain: Some(ActiveExecutionChain {
@@ -554,16 +554,16 @@ fn task_graph_mainline_summary(
 }
 
 #[cfg(test)]
-pub(crate) fn run_shadow_session_action(
+pub(crate) fn run_session_action(
     state: &ApiState,
     request: &SessionTurnRequestDto,
     accepted_at: UtcMillis,
     session_id: &SessionId,
     entry_id: &str,
     trimmed_text: Option<&str>,
-) -> Result<ShadowTaskGraphSubmission, ApiError> {
+) -> Result<TaskGraphSubmission, ApiError> {
     let mission_title = request.mission_title(trimmed_text);
-    run_shadow_dispatch_submission(
+    run_dispatch_submission(
         state,
         &DispatchSubmissionRequest {
             accepted_at,
@@ -740,7 +740,7 @@ fn insert_deep_task_graph(
     for (phase_index, phase_plan) in plan.phases.iter().enumerate() {
         let phase_id = TaskId::new(format!("task-phase-{}-{}", accepted_at.0, phase_index));
         phase_ids.push(phase_id.clone());
-        task_store.insert_task(make_shadow_task(
+        task_store.insert_task(make_dispatch_task(
             phase_id.clone(),
             mission_id.clone(),
             root_task_id.clone(),
@@ -764,7 +764,7 @@ fn insert_deep_task_graph(
                 "task-wp-{}-{}-{}",
                 accepted_at.0, phase_index, package_index
             ));
-            task_store.insert_task(make_shadow_task(
+            task_store.insert_task(make_dispatch_task(
                 package_id.clone(),
                 mission_id.clone(),
                 root_task_id.clone(),
@@ -818,7 +818,7 @@ fn insert_deep_task_graph(
                         )
                     })?;
 
-                task_store.insert_task(make_shadow_task(
+                task_store.insert_task(make_dispatch_task(
                     action_id.clone(),
                     mission_id.clone(),
                     root_task_id.clone(),
@@ -881,7 +881,7 @@ fn insert_deep_task_graph(
 
         let validation_id =
             TaskId::new(format!("task-validation-{}-{}", accepted_at.0, phase_index));
-        task_store.insert_task(make_shadow_task(
+        task_store.insert_task(make_dispatch_task(
             validation_id.clone(),
             mission_id.clone(),
             root_task_id.clone(),
@@ -1214,7 +1214,7 @@ fn update_session_execution_branches(
         .collect::<std::collections::HashSet<_>>();
     if mode == SessionExecutionBranchUpdateMode::Replace {
         for task_id in existing_task_ids.difference(&new_task_ids) {
-            let _ = state.shadow_task_execution_registry().remove(task_id);
+            let _ = state.task_execution_registry().remove(task_id);
         }
     }
 
@@ -1268,9 +1268,9 @@ fn update_session_execution_branches(
             execution_chain_ref: Some(execution_chain_ref.clone()),
             ..ExecutionOwnership::default()
         };
-        state.shadow_task_execution_registry().insert(
+        state.task_execution_registry().insert(
             spec.task_id.clone(),
-            ShadowTaskExecutionPlan::Dispatch {
+            TaskExecutionPlan::Dispatch {
                 target: TaskExecutionTarget {
                     mission_id: mission_id.clone(),
                     root_task_id: root_task_id.clone(),
@@ -1670,7 +1670,7 @@ fn decompose_mission(
         })
         .unwrap_or_default();
     let request = ModelInvocationRequest {
-        provider: SHADOW_MODEL_PROVIDER.to_string(),
+        provider: LOOPBACK_MODEL_PROVIDER.to_string(),
         prompt: format!(
             "深度任务图规划器。\n\
              请只调用 {DEEP_TASK_PLAN_TOOL_NAME} 工具输出结构化计划，不要返回自然语言正文。\n\
@@ -1703,7 +1703,7 @@ fn parse_decomposition_response(
 ) -> Option<DeepTaskGraphPlan> {
     let trimmed = response.trim();
     let normalized = trimmed
-        .strip_prefix("shadow-model::")
+        .strip_prefix("loopback-model::")
         .unwrap_or(trimmed)
         .trim();
 
@@ -1783,8 +1783,8 @@ fn normalize_plan_text(value: &str, original_prompt: &str) -> Option<String> {
     Some(text.to_string())
 }
 
-/// Build a Task with sensible defaults for shadow execution entries.
-fn make_shadow_task(
+/// Build a Task with sensible defaults for dispatch execution entries.
+fn make_dispatch_task(
     task_id: TaskId,
     mission_id: MissionId,
     root_task_id: TaskId,
@@ -1832,7 +1832,7 @@ fn make_shadow_task(
     }
 }
 
-pub(crate) fn cleanup_shadow_task_tree(
+pub(crate) fn cleanup_task_tree(
     task_store: &magi_orchestrator::task_store::TaskStore,
     root_task_id: &TaskId,
 ) {
@@ -2157,7 +2157,7 @@ mod tests {
         }
     }
 
-    /// Build a minimal ApiState with a shadow execution pipeline and task store.
+    /// Build a minimal ApiState with a execution pipeline and task store.
     fn build_test_state() -> (ApiState, Arc<TaskStore>) {
         let event_bus = Arc::new(InMemoryEventBus::new(64));
         let governance = Arc::new(GovernanceService::default());
@@ -2180,13 +2180,13 @@ mod tests {
         let task_store = Arc::new(TaskStore::new());
 
         let state = ApiState::new(
-            "test-shadow",
+            "test-task",
             Arc::clone(&event_bus),
             Arc::clone(&session_store),
             Arc::clone(&workspace_store),
             governance,
         )
-        .with_shadow_execution_pipeline(orchestrator, execution_runtime, memory_store)
+        .with_execution_pipeline(orchestrator, execution_runtime, memory_store)
         .with_task_store(Arc::clone(&task_store));
 
         (state, task_store)
@@ -2220,7 +2220,7 @@ mod tests {
             images: Vec::new(),
         };
 
-        let result = run_shadow_session_action(
+        let result = run_session_action(
             &state,
             &request,
             accepted_at,
@@ -2228,7 +2228,7 @@ mod tests {
             "entry-1",
             Some("Hello world"),
         )
-        .expect("shadow session action should create task graph");
+        .expect("loopback session action should create task graph");
 
         // Verify Objective task was created
         let obj_task_id = result.root_task_id;
@@ -2267,7 +2267,7 @@ mod tests {
             .expect("session should be creatable");
 
         let accepted_at = UtcMillis::now();
-        let submission = run_shadow_dispatch_submission(
+        let submission = run_dispatch_submission(
             &state,
             &DispatchSubmissionRequest {
                 accepted_at,
@@ -2283,12 +2283,12 @@ mod tests {
                 deep_task: false,
                 skill_name: None,
                 target_role: None,
-                request_id: Some("request-shadow-alias".to_string()),
-                user_message_id: Some("user-shadow-alias".to_string()),
-                placeholder_message_id: Some("assistant-placeholder-shadow-alias".to_string()),
+                request_id: Some("request-loopback-alias".to_string()),
+                user_message_id: Some("user-loopback-alias".to_string()),
+                placeholder_message_id: Some("assistant-placeholder-loopback-alias".to_string()),
             },
         )
-        .expect("shadow dispatch should create task graph");
+        .expect("dispatch should create task graph");
 
         let action = task_store
             .get_task(&submission.action_task_id)
@@ -2305,21 +2305,21 @@ mod tests {
             .items
             .first()
             .expect("turn 必须包含 canonical 用户消息");
-        assert_eq!(user_item.item_id, "user-shadow-alias");
+        assert_eq!(user_item.item_id, "user-loopback-alias");
         assert_eq!(user_item.kind, "user_message");
         assert_eq!(user_item.content.as_deref(), Some("用户原始任务描述"));
         assert!(user_item.thread_visible);
         assert_eq!(
             user_item.request_id.as_deref(),
-            Some("request-shadow-alias")
+            Some("request-loopback-alias")
         );
         assert_eq!(
             user_item.user_message_id.as_deref(),
-            Some("user-shadow-alias")
+            Some("user-loopback-alias")
         );
         assert_eq!(
             user_item.placeholder_message_id.as_deref(),
-            Some("assistant-placeholder-shadow-alias")
+            Some("assistant-placeholder-loopback-alias")
         );
     }
 
@@ -2333,7 +2333,7 @@ mod tests {
             .expect("session should be creatable");
 
         let accepted_at = UtcMillis::now();
-        let submission = run_shadow_dispatch_submission(
+        let submission = run_dispatch_submission(
             &state,
             &DispatchSubmissionRequest {
                 accepted_at,
@@ -2403,7 +2403,7 @@ mod tests {
             .expect("session should be creatable");
 
         let accepted_at = UtcMillis::now();
-        let submission = run_shadow_dispatch_submission(
+        let submission = run_dispatch_submission(
             &state,
             &DispatchSubmissionRequest {
                 accepted_at,
@@ -2424,7 +2424,7 @@ mod tests {
                 placeholder_message_id: Some("assistant-deep-mainline".to_string()),
             },
         )
-        .expect("deep shadow dispatch should create task graph");
+        .expect("deep dispatch should create task graph");
 
         let turn = submission
             .active_execution_chain
@@ -2479,7 +2479,7 @@ mod tests {
             .expect("session should be creatable");
 
         let accepted_at = UtcMillis::now();
-        let result = run_shadow_dispatch_submission(
+        let result = run_dispatch_submission(
             &state,
             &DispatchSubmissionRequest {
                 accepted_at,
@@ -2524,7 +2524,7 @@ mod tests {
             .expect("session should be creatable");
 
         let accepted_at = UtcMillis::now();
-        let submission = run_shadow_dispatch_submission(
+        let submission = run_dispatch_submission(
             &state,
             &DispatchSubmissionRequest {
                 accepted_at,
@@ -2560,7 +2560,7 @@ mod tests {
         for validation_id in validation_ids {
             assert!(
                 state
-                    .shadow_task_execution_registry()
+                    .task_execution_registry()
                     .remove(&validation_id)
                     .is_some(),
                 "validation task {validation_id} should have a registered execution plan"
@@ -2580,7 +2580,7 @@ mod tests {
             .expect("session should be creatable");
 
         let accepted_at = UtcMillis::now();
-        let submission = run_shadow_dispatch_submission(
+        let submission = run_dispatch_submission(
             &state,
             &DispatchSubmissionRequest {
                 accepted_at,
@@ -2680,7 +2680,7 @@ mod tests {
             .expect("session should be creatable");
 
         let accepted_at = UtcMillis::now();
-        let submission = run_shadow_dispatch_submission(
+        let submission = run_dispatch_submission(
             &state,
             &DispatchSubmissionRequest {
                 accepted_at,
@@ -2776,7 +2776,7 @@ mod tests {
             .expect("session should be creatable");
 
         let accepted_at = UtcMillis::now();
-        let submission = run_shadow_dispatch_submission(
+        let submission = run_dispatch_submission(
             &state,
             &DispatchSubmissionRequest {
                 accepted_at,
@@ -2848,7 +2848,7 @@ mod tests {
             )
             .expect("session should be creatable");
 
-        run_shadow_dispatch_submission(
+        run_dispatch_submission(
             &state,
             &DispatchSubmissionRequest {
                 accepted_at: UtcMillis::now(),
@@ -2885,7 +2885,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn session_action_registers_shadow_execution_plan() {
+    fn session_action_registers_execution_plan() {
         let (state, task_store) = build_test_state();
 
         let session_id = SessionId::new("session-task-status-test");
@@ -2908,7 +2908,7 @@ mod tests {
             images: Vec::new(),
         };
 
-        let submission = run_shadow_session_action(
+        let submission = run_session_action(
             &state,
             &request,
             accepted_at,
@@ -2916,7 +2916,7 @@ mod tests {
             "entry-2",
             Some("Run a failing action"),
         )
-        .expect("shadow session action should register a task execution plan");
+        .expect("loopback session action should register a task execution plan");
 
         let obj = task_store
             .get_task(&submission.root_task_id)
@@ -2929,7 +2929,7 @@ mod tests {
         assert_eq!(act.status, TaskStatus::Ready);
         assert!(
             state
-                .shadow_task_execution_registry()
+                .task_execution_registry()
                 .remove(&submission.action_task_id)
                 .is_some(),
             "action task should have a registered execution plan",
@@ -2947,7 +2947,7 @@ mod tests {
             .expect("session should be creatable");
 
         let accepted_at = UtcMillis::now();
-        let submission = run_shadow_dispatch_submission(
+        let submission = run_dispatch_submission(
             &state,
             &DispatchSubmissionRequest {
                 accepted_at,
@@ -2968,7 +2968,7 @@ mod tests {
                 placeholder_message_id: None,
             },
         )
-        .expect("shadow dispatch should create active chain");
+        .expect("dispatch should create active chain");
         state
             .session_store
             .upsert_active_execution_chain(
@@ -2983,7 +2983,7 @@ mod tests {
             .get_task(&submission.root_task_id)
             .expect("root task should exist");
         let appended_task_id = TaskId::new("task-intake-appended");
-        task_store.insert_task(make_shadow_task(
+        task_store.insert_task(make_dispatch_task(
             appended_task_id.clone(),
             root_task.mission_id.clone(),
             submission.root_task_id.clone(),
@@ -3006,7 +3006,7 @@ mod tests {
 
         assert!(
             state
-                .shadow_task_execution_registry()
+                .task_execution_registry()
                 .remove(&appended_task_id)
                 .is_some(),
             "追加任务必须注册 execution plan"
@@ -3051,7 +3051,7 @@ mod tests {
             .expect("session should be creatable");
 
         let accepted_at = UtcMillis::now();
-        let submission = run_shadow_dispatch_submission(
+        let submission = run_dispatch_submission(
             &state,
             &DispatchSubmissionRequest {
                 accepted_at,
@@ -3072,7 +3072,7 @@ mod tests {
                 placeholder_message_id: None,
             },
         )
-        .expect("shadow dispatch should create active chain");
+        .expect("dispatch should create active chain");
         state
             .session_store
             .upsert_active_execution_chain(
@@ -3092,7 +3092,7 @@ mod tests {
             (&primary_task_id, "重规划主任务", true),
             (&leaf_task_id, "重规划 worker 任务", false),
         ] {
-            task_store.insert_task(make_shadow_task(
+            task_store.insert_task(make_dispatch_task(
                 task_id.clone(),
                 root_task.mission_id.clone(),
                 submission.root_task_id.clone(),
@@ -3122,21 +3122,21 @@ mod tests {
 
         assert!(
             state
-                .shadow_task_execution_registry()
+                .task_execution_registry()
                 .remove(&submission.action_task_id)
                 .is_none(),
             "重规划后旧 action plan 不能继续留在 registry"
         );
         assert!(
             state
-                .shadow_task_execution_registry()
+                .task_execution_registry()
                 .remove(&primary_task_id)
                 .is_some(),
             "重规划主任务必须注册 execution plan"
         );
         assert!(
             state
-                .shadow_task_execution_registry()
+                .task_execution_registry()
                 .remove(&leaf_task_id)
                 .is_some(),
             "重规划 worker 任务必须注册 execution plan"
@@ -3193,7 +3193,7 @@ mod tests {
             Arc::clone(&workspace_store),
             governance,
         )
-        .with_shadow_execution_pipeline(orchestrator, execution_runtime, memory_store);
+        .with_execution_pipeline(orchestrator, execution_runtime, memory_store);
 
         assert!(state.task_store().is_none());
 
@@ -3217,7 +3217,7 @@ mod tests {
             images: Vec::new(),
         };
 
-        let result = run_shadow_session_action(
+        let result = run_session_action(
             &state,
             &request,
             accepted_at,
@@ -3366,7 +3366,7 @@ mod tests {
             Some("src/")
         );
 
-        let prefixed_response = format!("shadow-model::{}", plan_value);
+        let prefixed_response = format!("loopback-model::{}", plan_value);
         let prefixed_plan =
             parse_decomposition_response(prefixed_response.as_str(), "请分析并拆分这个复杂任务")
                 .expect("prefixed structured plan should parse");

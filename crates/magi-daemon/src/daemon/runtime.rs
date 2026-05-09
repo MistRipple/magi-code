@@ -1,12 +1,12 @@
 use super::{
-    bootstrap::bootstrap_shadow_state,
+    bootstrap::bootstrap_state,
     config::{DaemonConfig, DaemonError},
     events::publish_ledger_status_event,
-    maintenance::{ShadowRuntimeMaintenance, ShadowRuntimeMaintenanceConfig},
-    persistence::{ShadowRuntimeSidecarPersistence, ShadowStateRepository},
+    maintenance::{RuntimeMaintenance, RuntimeMaintenanceConfig},
+    persistence::{RuntimeSidecarPersistence, StateRepository},
 };
 use magi_api::task_execution::{
-    ShadowTaskDispatcher, publish_task_status_turn_item_for_active_sessions,
+    LlmTaskDispatcher, publish_task_status_turn_item_for_active_sessions,
 };
 use magi_api::{
     ApiState, DirectHttpModelProbeConfig, RunnerManager, RuntimeStatePersistence, SettingsStore,
@@ -107,7 +107,7 @@ impl SettingsBackedBusinessModelBridgeClient {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect::<Vec<_>>();
-        ShadowDaemonRuntime::try_build_http_model_client(&bridge_env, self.settings_store.as_ref())
+        DaemonRuntime::try_build_http_model_client(&bridge_env, self.settings_store.as_ref())
             .map(|(client, _)| client)
             .ok_or_else(|| {
                 UnavailableBusinessModelBridgeClient::new(self.state_root.clone()).error()
@@ -186,7 +186,7 @@ impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
         }
         Ok(magi_bridge_client::BridgeResponse {
             ok: true,
-            payload: format!("shadow-model::{}", request.prompt.trim()),
+            payload: format!("loopback-model::{}", request.prompt.trim()),
         })
     }
 
@@ -248,7 +248,7 @@ fn classifier_payload_for_prompt(prompt: &str) -> Option<String> {
 }
 
 #[derive(Clone)]
-pub(crate) struct ShadowDaemonRuntime {
+pub(crate) struct DaemonRuntime {
     state_root: PathBuf,
     local_port: u16,
     event_bus: Arc<InMemoryEventBus>,
@@ -257,12 +257,12 @@ pub(crate) struct ShadowDaemonRuntime {
     knowledge_store: Arc<KnowledgeStore>,
     governance: Arc<GovernanceService>,
     worker_runtime: WorkerRuntime,
-    runtime_maintenance: ShadowRuntimeMaintenance,
+    runtime_maintenance: RuntimeMaintenance,
 }
 
-impl ShadowDaemonRuntime {
+impl DaemonRuntime {
     pub(crate) fn restore(config: &DaemonConfig) -> Result<Self, DaemonError> {
-        let state_repository = ShadowStateRepository::new(config.state_root.clone());
+        let state_repository = StateRepository::new(config.state_root.clone());
 
         // 先加载工作区注册表（需要工作区路径来定位会话文件）
         let workspace_store = Arc::new(WorkspaceStore::from_persisted_parts(
@@ -294,7 +294,7 @@ impl ShadowDaemonRuntime {
         let event_bus = Arc::new(InMemoryEventBus::new(2048));
         let worker_runtime = WorkerRuntime::new(event_bus.clone());
         worker_runtime.restore_durable_snapshot(state_repository.load_worker_runtime_snapshot()?);
-        let runtime_persistence = ShadowRuntimeSidecarPersistence::new(
+        let runtime_persistence = RuntimeSidecarPersistence::new(
             state_repository.clone(),
             session_store.clone(),
             workspace_store.clone(),
@@ -345,14 +345,14 @@ impl ShadowDaemonRuntime {
             let _ = state_repository.save_knowledge_state(&knowledge_store.export_state());
         }
 
-        let runtime_maintenance = ShadowRuntimeMaintenance::new(
-            ShadowRuntimeMaintenanceConfig::default(),
+        let runtime_maintenance = RuntimeMaintenance::new(
+            RuntimeMaintenanceConfig::default(),
             event_bus.clone(),
             runtime_persistence,
             session_store.clone(),
             workspace_store.clone(),
         );
-        runtime_maintenance.publish_runtime_status_event("shadow-system-runtime-maintenance-ready");
+        runtime_maintenance.publish_runtime_status_event("system-runtime-maintenance-ready");
 
         Ok(Self {
             state_root: config.state_root.clone(),
@@ -376,11 +376,11 @@ impl ShadowDaemonRuntime {
 
     pub(crate) fn publish_started_event(&self, service_name: &str) {
         let _ = self.event_bus.publish(EventEnvelope::system(
-            EventId::new("shadow-system-started"),
+            EventId::new("system-started"),
             "system.started",
             serde_json::json!({
                 "service": service_name,
-                "mode": "local-shadow-rewrite"
+                "mode": "local-loopback"
             }),
         ));
     }
@@ -413,7 +413,7 @@ impl ShadowDaemonRuntime {
             warn!(error = %error, "设置文件加载失败，使用空默认值");
         }
 
-        // 业务模型桥用于会话正文生成和任务执行；任务规划/分类另走本地 shadow-model。
+        // 业务模型桥用于会话正文生成和任务执行；任务规划/分类另走本地 loopback-model。
         // 业务模型配置来源优先级: bridge_env override → 进程 env → settings.json auxiliary 段。
         // settings 是运行时可编辑的产品配置，业务调用必须按次读取，避免保存后仍使用启动快照。
         // 测试场景下允许通过 model_bridge_override 注入业务模型 stub。
@@ -574,7 +574,7 @@ impl ShadowDaemonRuntime {
         .with_bridge_probe_transport(BridgeServerKind::Host, host_transport)
         .with_bridge_probe_transport(BridgeServerKind::Model, model_transport)
         .with_bridge_probe_transport(BridgeServerKind::Mcp, mcp_transport)
-        .with_shadow_execution_pipeline(orchestrator, execution_runtime, memory_store);
+        .with_execution_pipeline(orchestrator, execution_runtime, memory_store);
 
         state = state.with_task_store(Arc::clone(&task_store));
         if magi_api::task_execution::reconcile_terminal_session_task_turns(&state) > 0 {
@@ -588,18 +588,18 @@ impl ShadowDaemonRuntime {
                 tracing::warn!(?error, "自动知识沉淀持久化失败");
             }
         });
-        let shadow_task_dispatcher = ShadowTaskDispatcher::new(
+        let llm_task_dispatcher = LlmTaskDispatcher::new(
             self.event_bus.clone(),
             state
-                .shadow_execution_pipeline()
-                .expect("shadow execution pipeline should exist when daemon wires task runner")
+                .execution_pipeline()
+                .expect("execution pipeline should exist when daemon wires task runner")
                 .clone(),
             state.session_store.clone(),
-            state.shadow_task_execution_registry().clone(),
+            state.task_execution_registry().clone(),
             runner_result_receiver.clone(),
         );
-        let shadow_task_dispatcher = Arc::new(
-            shadow_task_dispatcher
+        let llm_task_dispatcher = Arc::new(
+            llm_task_dispatcher
                 .with_model_bridge_client(business_model_client.clone())
                 .with_knowledge_store(state.knowledge_store.clone())
                 .with_knowledge_persist_callback(knowledge_persist_callback)
@@ -609,11 +609,11 @@ impl ShadowDaemonRuntime {
                 .with_tool_registry(tool_registry_for_dispatcher)
                 .with_skill_runtime(app_skill_runtime),
         );
-        let session_turn_dispatcher = shadow_task_dispatcher.clone();
+        let session_turn_dispatcher = llm_task_dispatcher.clone();
         let runner_manager = RunnerManager::with_dispatcher_and_worker_catalog(
             Arc::clone(&task_store),
             Arc::new(move || state_for_task_workers.task_worker_catalog()),
-            shadow_task_dispatcher,
+            llm_task_dispatcher,
             runner_result_receiver,
         )
         .with_checkpoint_path(task_store_checkpoint_path)
@@ -678,8 +678,8 @@ impl ShadowDaemonRuntime {
             self.session_store.upsert_runtime_sidecar(sidecar);
         }
 
-        let repository = ShadowStateRepository::new(self.state_root.clone());
-        let persistence = ShadowRuntimeSidecarPersistence::new(
+        let repository = StateRepository::new(self.state_root.clone());
+        let persistence = RuntimeSidecarPersistence::new(
             repository,
             self.session_store.clone(),
             self.workspace_store.clone(),
@@ -722,7 +722,7 @@ impl ShadowDaemonRuntime {
     }
 
     fn restore_ledger(
-        state_repository: &ShadowStateRepository,
+        state_repository: &StateRepository,
         event_bus: &Arc<InMemoryEventBus>,
     ) -> Result<(), DaemonError> {
         let audit_usage_ledger = state_repository.load_audit_usage_ledger()?;
@@ -733,7 +733,7 @@ impl ShadowDaemonRuntime {
         }
         publish_ledger_status_event(
             event_bus,
-            "shadow-system-ledger-ready",
+            "system-ledger-ready",
             "system.ledger.ready",
         );
         Ok(())
@@ -741,12 +741,12 @@ impl ShadowDaemonRuntime {
 
     fn bootstrap_runtime_state(
         config: &DaemonConfig,
-        state_repository: &ShadowStateRepository,
-        runtime_persistence: &ShadowRuntimeSidecarPersistence,
+        state_repository: &StateRepository,
+        runtime_persistence: &RuntimeSidecarPersistence,
         session_store: &Arc<SessionStore>,
         workspace_store: &Arc<WorkspaceStore>,
     ) -> Result<(), DaemonError> {
-        bootstrap_shadow_state(
+        bootstrap_state(
             session_store,
             workspace_store,
             &config.bootstrap_workspace_root,
@@ -922,7 +922,7 @@ fn push_terminal_task_result(
 
 #[cfg(test)]
 mod tests {
-    use super::ShadowDaemonRuntime;
+    use super::DaemonRuntime;
     use crate::daemon::config::DaemonConfig;
     use axum::{
         body::{Body, to_bytes},
@@ -955,10 +955,10 @@ mod tests {
     #[test]
     fn restore_bootstraps_empty_state_and_persists_runtime_files() {
         let state_root = temp_state_root("bootstrap");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root.clone());
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
         let workspace_root = config.bootstrap_workspace_root.clone();
 
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
 
         assert!(runtime.session_store.current_session().is_some());
@@ -982,7 +982,7 @@ mod tests {
     #[tokio::test]
     async fn knowledge_endpoint_returns_code_index_after_bootstrap_scan() {
         let state_root = temp_state_root("knowledge-code-index");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root.clone());
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
         let workspace_root = config.bootstrap_workspace_root.clone();
 
         // 在引导工作区中创建模拟源文件，供代码扫描器发现
@@ -1003,13 +1003,13 @@ mod tests {
         )
         .unwrap();
 
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap and scan code");
 
         // 验证知识存储中有代码索引摘要
         let summary = runtime
             .knowledge_store
-            .code_index_summary_for_workspace(&WorkspaceId::new("shadow-workspace-001"))
+            .code_index_summary_for_workspace(&WorkspaceId::new("test-workspace-001"))
             .expect("code index summary should exist after bootstrap scan");
         assert!(
             !summary.files.is_empty(),
@@ -1025,8 +1025,8 @@ mod tests {
         );
 
         // 通过 API 路由验证返回结构
-        let app = runtime.router("shadow-test".to_string());
-        let knowledge = get_json(app, "/api/knowledge?workspaceId=shadow-workspace-001").await;
+        let app = runtime.router("daemon-test".to_string());
+        let knowledge = get_json(app, "/api/knowledge?workspaceId=test-workspace-001").await;
         assert!(
             knowledge.get("codeIndex").is_some_and(|v| !v.is_null()),
             "API should return non-null codeIndex"
@@ -1118,11 +1118,11 @@ mod tests {
             .to_string(),
         )
         .expect("settings should write");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
         let runtime =
-            ShadowDaemonRuntime::restore(&config).expect("runtime restore should load settings");
+            DaemonRuntime::restore(&config).expect("runtime restore should load settings");
         let (_app, state) =
-            runtime.router_with_bridge_env_for_tests("shadow-test".to_string(), &[]);
+            runtime.router_with_bridge_env_for_tests("daemon-test".to_string(), &[]);
 
         state.settings_store.set_section(
             "auxiliary",
@@ -1377,23 +1377,23 @@ mod tests {
     #[tokio::test]
     async fn router_session_action_auto_extraction_is_consumed_on_followup_dispatch() {
         let state_root = temp_state_root("router-session-action");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
-        let (app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+        let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
         let active_workspace_id = state
             .workspace_registry
             .active_workspace_id()
             .expect("bootstrap workspace should exist");
         if state
             .session_store
-            .session(&magi_core::SessionId::new("shadow-session-001"))
+            .session(&magi_core::SessionId::new("test-session-001"))
             .is_none()
         {
             state
                 .session_store
                 .create_session_for_workspace(
-                    magi_core::SessionId::new("shadow-session-001"),
+                    magi_core::SessionId::new("test-session-001"),
                     "runtime session".to_string(),
                     Some(active_workspace_id.to_string()),
                 )
@@ -1404,7 +1404,7 @@ mod tests {
             app.clone(),
             "/api/session/turn",
             json!({
-                "sessionId": "shadow-session-001",
+                "sessionId": "test-session-001",
                 "text": "remember parser constraint",
                 "deepTask": false,
                 "skillName": "refactor",
@@ -1439,7 +1439,7 @@ mod tests {
         let first_projection = wait_for_task_projection_completed(
             app.clone(),
             first_root_task_id,
-            "shadow-session-001",
+            "test-session-001",
         )
         .await;
         assert_completed_two_task_projection(&first_projection);
@@ -1448,7 +1448,7 @@ mod tests {
             app.clone(),
             "/api/session/turn",
             json!({
-                "sessionId": "shadow-session-001",
+                "sessionId": "test-session-001",
                 "text": "follow up parser work",
                 "deepTask": false,
                 "skillName": "refactor",
@@ -1479,7 +1479,7 @@ mod tests {
             json!([expected_extraction_id])
         );
         let second_projection =
-            wait_for_task_projection_completed(app, second_root_task_id, "shadow-session-001")
+            wait_for_task_projection_completed(app, second_root_task_id, "test-session-001")
                 .await;
         assert_completed_two_task_projection(&second_projection);
     }
@@ -1487,15 +1487,15 @@ mod tests {
     #[tokio::test]
     async fn router_regular_session_turn_uses_daemon_session_turn_dispatcher() {
         let state_root = temp_state_root("router-regular-session-turn");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
-        let (app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+        let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
         let active_workspace_id = state
             .workspace_registry
             .active_workspace_id()
             .expect("bootstrap workspace should exist");
-        let session_id = magi_core::SessionId::new("shadow-session-chat");
+        let session_id = magi_core::SessionId::new("test-session-chat");
         state
             .session_store
             .create_session_for_workspace(
@@ -1565,23 +1565,23 @@ mod tests {
     #[tokio::test]
     async fn router_recovery_resume_writeback_is_consumed_on_followup_dispatch() {
         let state_root = temp_state_root("router-recovery-resume");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
-        let (app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+        let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
         let active_workspace_id = state
             .workspace_registry
             .active_workspace_id()
             .expect("bootstrap workspace should exist");
         if state
             .session_store
-            .session(&magi_core::SessionId::new("shadow-session-001"))
+            .session(&magi_core::SessionId::new("test-session-001"))
             .is_none()
         {
             state
                 .session_store
                 .create_session_for_workspace(
-                    magi_core::SessionId::new("shadow-session-001"),
+                    magi_core::SessionId::new("test-session-001"),
                     "runtime recovery session".to_string(),
                     Some(active_workspace_id.to_string()),
                 )
@@ -1592,7 +1592,7 @@ mod tests {
             app.clone(),
             "/api/session/turn",
             json!({
-                "sessionId": "shadow-session-001",
+                "sessionId": "test-session-001",
                 "text": "seed recovery route state",
                 "deepTask": false,
                 "skillName": "refactor",
@@ -1606,7 +1606,7 @@ mod tests {
             "unexpected seed body: {seed_body:?}"
         );
 
-        let session_id = magi_core::SessionId::new("shadow-session-001");
+        let session_id = magi_core::SessionId::new("test-session-001");
         let ownership = runtime
             .session_store
             .execution_ownership(&session_id)
@@ -1666,7 +1666,7 @@ mod tests {
             app.clone(),
             "/api/session/turn",
             json!({
-                "sessionId": "shadow-session-001",
+                "sessionId": "test-session-001",
                 "text": "consume recovery memory",
                 "deepTask": false,
                 "skillName": "refactor",
@@ -1704,7 +1704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_router_bridge_services_exports_shadow_model_host_and_mcp_catalogs() {
+    async fn daemon_router_bridge_services_exports_loopback_model_host_and_mcp_catalogs() {
         for binary_name in [
             "host_bridge_loopback",
             "model_bridge_loopback",
@@ -1719,10 +1719,10 @@ mod tests {
         }
 
         let state_root = temp_state_root("router-bridge-services");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
-        let app = runtime.router("shadow-test".to_string());
+        let app = runtime.router("daemon-test".to_string());
 
         let snapshot = get_json(app, "/bridges/services").await;
         let services = service_entries_by_kind(&snapshot);
@@ -1739,7 +1739,7 @@ mod tests {
         assert_eq!(host["health"]["ok"], true);
         assert_eq!(
             host["service_catalog"]["services"][0]["service_name"],
-            "shadow-host-vscode"
+            "loopback-host-vscode"
         );
 
         let model = services
@@ -1752,8 +1752,8 @@ mod tests {
                 .as_array()
                 .expect("model services should be an array")
                 .iter()
-                .any(|service| service["service_name"] == "shadow-model"),
-            "model catalog should include shadow-model: {model:?}"
+                .any(|service| service["service_name"] == "loopback-model"),
+            "model catalog should include loopback-model: {model:?}"
         );
         assert!(
             model["service_catalog"]["services"]
@@ -1771,12 +1771,12 @@ mod tests {
         assert_eq!(mcp["health"]["ok"], true);
         assert_eq!(
             mcp["service_catalog"]["services"][0]["service_name"],
-            "shadow-mcp-manager"
+            "loopback-mcp-manager"
         );
     }
 
     #[tokio::test]
-    async fn daemon_router_bridge_preflight_executes_shadow_host_model_and_mcp_smokes() {
+    async fn daemon_router_bridge_preflight_executes_loopback_host_model_and_mcp_smokes() {
         for binary_name in [
             "host_bridge_loopback",
             "model_bridge_loopback",
@@ -1791,10 +1791,10 @@ mod tests {
         }
 
         let state_root = temp_state_root("router-bridge-preflight");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
-        let app = runtime.router("shadow-test".to_string());
+        let app = runtime.router("daemon-test".to_string());
         let services_snapshot = get_json(app.clone(), "/bridges/services").await;
 
         let snapshot = get_json(app, "/bridges/preflight").await;
@@ -1815,8 +1815,8 @@ mod tests {
                 .as_array()
                 .expect("model checks should be an array")
                 .iter()
-                .any(|check| check["target"] == "shadow-model" && check["ok"] == true),
-            "model preflight should include shadow-model invoke: {model:?}"
+                .any(|check| check["target"] == "loopback-model" && check["ok"] == true),
+            "model preflight should include loopback-model invoke: {model:?}"
         );
         let openai_ready = services_snapshot["services"]
             .as_array()
@@ -1865,8 +1865,8 @@ mod tests {
                 .as_array()
                 .expect("mcp checks should be an array")
                 .iter()
-                .any(|check| check["target"] == "shadow-mcp.echo.inspect" && check["ok"] == true),
-            "mcp preflight should include shadow-mcp echo.inspect: {mcp:?}"
+                .any(|check| check["target"] == "loopback-mcp.echo.inspect" && check["ok"] == true),
+            "mcp preflight should include loopback-mcp echo.inspect: {mcp:?}"
         );
     }
 
@@ -1886,10 +1886,10 @@ mod tests {
         }
 
         let state_root = temp_state_root("router-bridge-cutover");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
-        let app = runtime.router("shadow-test".to_string());
+        let app = runtime.router("daemon-test".to_string());
         let services_snapshot = get_json(app.clone(), "/bridges/services").await;
         let snapshot = get_json(app, "/bridges/cutover-smoke").await;
         let services = service_entries_by_kind(&snapshot);
@@ -1947,8 +1947,8 @@ mod tests {
                 .as_array()
                 .expect("model checks should be an array")
                 .iter()
-                .any(|check| check["target"] == "shadow-model" && check["ok"] == true),
-            "shadow-model cutover contract should always be present: {model:?}"
+                .any(|check| check["target"] == "loopback-model" && check["ok"] == true),
+            "loopback-model cutover contract should always be present: {model:?}"
         );
         let openai_health = services_snapshot["services"]
             .as_array()
@@ -2162,11 +2162,11 @@ mod tests {
         );
 
         let state_root = temp_state_root("router-bridge-cutover-env");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
-            "shadow-test".to_string(),
+            "daemon-test".to_string(),
             &[
                 ("MAGI_OPENAI_COMPAT_BASE_URL", base_url.as_str()),
                 ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
@@ -2174,12 +2174,12 @@ mod tests {
                 ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
                 (
                     "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "shadow-mcp-observability",
+                    "loopback-mcp-observability",
                 ),
                 ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
                 (
                     "MAGI_MCP_MANAGER_SERVER_HEALTHS",
-                    "shadow-mcp-observability=healthy,shadow-mcp=healthy",
+                    "loopback-mcp-observability=healthy,loopback-mcp=healthy",
                 ),
             ],
         );
@@ -2237,11 +2237,11 @@ mod tests {
         assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "ready");
         assert_eq!(
             mcp["mcp_default_route_gate"]["route_target"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(
             mcp["mcp_default_route_gate"]["resolved_server"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(mcp["mcp_default_route_gate"]["contract_ok"], true);
     }
@@ -2274,11 +2274,11 @@ mod tests {
         );
 
         let state_root = temp_state_root("router-bridge-cutover-env-failure");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
-            "shadow-test".to_string(),
+            "daemon-test".to_string(),
             &[
                 ("MAGI_OPENAI_COMPAT_BASE_URL", base_url.as_str()),
                 ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
@@ -2286,12 +2286,12 @@ mod tests {
                 ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
                 (
                     "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "shadow-mcp-observability",
+                    "loopback-mcp-observability",
                 ),
                 ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
                 (
                     "MAGI_MCP_MANAGER_SERVER_HEALTHS",
-                    "shadow-mcp-observability=healthy,shadow-mcp=healthy",
+                    "loopback-mcp-observability=healthy,loopback-mcp=healthy",
                 ),
             ],
         );
@@ -2366,11 +2366,11 @@ mod tests {
         assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "ready");
         assert_eq!(
             mcp["mcp_default_route_gate"]["route_target"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(
             mcp["mcp_default_route_gate"]["resolved_server"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(mcp["mcp_default_route_gate"]["contract_ok"], true);
         assert_eq!(mcp["checks"][0]["ok"], true);
@@ -2393,21 +2393,21 @@ mod tests {
         }
 
         let state_root = temp_state_root("router-bridge-cutover-env-degraded-provider");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
-            "shadow-test".to_string(),
+            "daemon-test".to_string(),
             &[
                 ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
                 (
                     "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "shadow-mcp-observability",
+                    "loopback-mcp-observability",
                 ),
                 ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
                 (
                     "MAGI_MCP_MANAGER_SERVER_HEALTHS",
-                    "shadow-mcp-observability=healthy,shadow-mcp=healthy",
+                    "loopback-mcp-observability=healthy,loopback-mcp=healthy",
                 ),
             ],
         );
@@ -2469,11 +2469,11 @@ mod tests {
         assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "ready");
         assert_eq!(
             mcp["mcp_default_route_gate"]["route_target"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(
             mcp["mcp_default_route_gate"]["resolved_server"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(mcp["mcp_default_route_gate"]["contract_ok"], true);
         assert_eq!(mcp["checks"][0]["ok"], true);
@@ -2505,11 +2505,11 @@ mod tests {
         );
 
         let state_root = temp_state_root("router-bridge-cutover-env-invalid-response");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
-            "shadow-test".to_string(),
+            "daemon-test".to_string(),
             &[
                 ("MAGI_OPENAI_COMPAT_BASE_URL", base_url.as_str()),
                 ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
@@ -2517,12 +2517,12 @@ mod tests {
                 ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
                 (
                     "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "shadow-mcp-observability",
+                    "loopback-mcp-observability",
                 ),
                 ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
                 (
                     "MAGI_MCP_MANAGER_SERVER_HEALTHS",
-                    "shadow-mcp-observability=healthy,shadow-mcp=healthy",
+                    "loopback-mcp-observability=healthy,loopback-mcp=healthy",
                 ),
             ],
         );
@@ -2597,11 +2597,11 @@ mod tests {
         assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "ready");
         assert_eq!(
             mcp["mcp_default_route_gate"]["route_target"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(
             mcp["mcp_default_route_gate"]["resolved_server"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(mcp["mcp_default_route_gate"]["contract_ok"], true);
         assert_eq!(mcp["checks"][0]["ok"], true);
@@ -2634,11 +2634,11 @@ mod tests {
         );
 
         let state_root = temp_state_root("router-bridge-cutover-env-fallback-only");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
-            "shadow-test".to_string(),
+            "daemon-test".to_string(),
             &[
                 ("MAGI_OPENAI_COMPAT_BASE_URL", base_url.as_str()),
                 ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
@@ -2646,12 +2646,12 @@ mod tests {
                 ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
                 (
                     "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "shadow-mcp-observability,shadow-mcp",
+                    "loopback-mcp-observability,loopback-mcp",
                 ),
                 ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
                 (
                     "MAGI_MCP_MANAGER_SERVER_HEALTHS",
-                    "shadow-mcp-observability=degraded,shadow-mcp=healthy",
+                    "loopback-mcp-observability=degraded,loopback-mcp=healthy",
                 ),
             ],
         );
@@ -2717,11 +2717,11 @@ mod tests {
         );
         assert_eq!(
             mcp["mcp_default_route_gate"]["route_target"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(
             mcp["mcp_default_route_gate"]["resolved_server"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(mcp["mcp_default_route_gate"]["contract_ok"], false);
         assert_eq!(mcp["checks"][0]["ok"], false);
@@ -2758,11 +2758,11 @@ mod tests {
         );
 
         let state_root = temp_state_root("router-bridge-cutover-env-unavailable");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
-            "shadow-test".to_string(),
+            "daemon-test".to_string(),
             &[
                 ("MAGI_OPENAI_COMPAT_BASE_URL", base_url.as_str()),
                 ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
@@ -2770,12 +2770,12 @@ mod tests {
                 ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
                 (
                     "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "shadow-mcp-observability",
+                    "loopback-mcp-observability",
                 ),
-                ("MAGI_MCP_MANAGER_DISABLED_SERVERS", "shadow-mcp"),
+                ("MAGI_MCP_MANAGER_DISABLED_SERVERS", "loopback-mcp"),
                 (
                     "MAGI_MCP_MANAGER_SERVER_HEALTHS",
-                    "shadow-mcp-observability=unavailable",
+                    "loopback-mcp-observability=unavailable",
                 ),
             ],
         );
@@ -2874,11 +2874,11 @@ mod tests {
         let unreachable_url = format!("http://{unreachable_address}/v1");
 
         let state_root = temp_state_root("router-bridge-cutover-env-transport-failure");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
         let (app, _) = runtime.router_with_bridge_env_for_tests(
-            "shadow-test".to_string(),
+            "daemon-test".to_string(),
             &[
                 ("MAGI_OPENAI_COMPAT_BASE_URL", unreachable_url.as_str()),
                 ("MAGI_OPENAI_COMPAT_API_KEY", "test-key"),
@@ -2886,12 +2886,12 @@ mod tests {
                 ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
                 (
                     "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-                    "shadow-mcp-observability",
+                    "loopback-mcp-observability",
                 ),
                 ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
                 (
                     "MAGI_MCP_MANAGER_SERVER_HEALTHS",
-                    "shadow-mcp-observability=healthy,shadow-mcp=healthy",
+                    "loopback-mcp-observability=healthy,loopback-mcp=healthy",
                 ),
             ],
         );
@@ -2957,11 +2957,11 @@ mod tests {
         assert_eq!(mcp["mcp_default_route_gate"]["route_status"], "ready");
         assert_eq!(
             mcp["mcp_default_route_gate"]["route_target"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(
             mcp["mcp_default_route_gate"]["resolved_server"],
-            "shadow-mcp-observability"
+            "loopback-mcp-observability"
         );
         assert_eq!(mcp["mcp_default_route_gate"]["contract_ok"], true);
         assert_eq!(mcp["checks"][0]["ok"], true);
@@ -2970,10 +2970,10 @@ mod tests {
     #[tokio::test]
     async fn daemon_router_bridge_routes_do_not_touch_execution_state() {
         let state_root = temp_state_root("router-bridge-guard");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
-        let (app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+        let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
         let before_runtime_read_model = serde_json::to_value(state.runtime_read_model_dto())
             .expect("runtime read model should serialize");
@@ -3005,8 +3005,8 @@ mod tests {
 
         assert!(
             state
-                .shadow_execution_pipeline()
-                .expect("shadow execution pipeline should exist")
+                .execution_pipeline()
+                .expect("execution pipeline should exist")
                 .memory_store
                 .extraction_results_for_session(&magi_core::SessionId::new("bridge-route-guard"))
                 .is_empty()
@@ -3029,10 +3029,10 @@ mod tests {
         }
 
         let state_root = temp_state_root("router-bootstrap-bridges");
-        let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-        let runtime = ShadowDaemonRuntime::restore(&config)
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+        let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should bootstrap empty state");
-        let app = runtime.router("shadow-test".to_string());
+        let app = runtime.router("daemon-test".to_string());
 
         let bootstrap = get_json(app.clone(), "/bootstrap").await;
         let bridge_services = get_json(app.clone(), "/bridges/services").await;

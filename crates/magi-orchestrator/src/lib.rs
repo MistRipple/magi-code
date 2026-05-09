@@ -463,7 +463,7 @@ pub(crate) struct DispatchContextDescriptor {
 
 fn default_builtin_skill_plan(tool_name: &str) -> SkillToolRuntimePlan {
     SkillToolRuntimePlan {
-        skill_ids: vec!["shadow-skill".to_string()],
+        skill_ids: vec!["test-skill".to_string()],
         tool_policy: ToolExecutionPolicy::default(),
         routing: SkillToolRoutingSummary {
             requested_builtin_tools: vec![tool_name.to_string()],
@@ -474,7 +474,7 @@ fn default_builtin_skill_plan(tool_name: &str) -> SkillToolRuntimePlan {
         prompt_injections: Vec::new(),
         custom_tool_bindings: Vec::new(),
         bridge_dispatch_plan: BridgeBindingDispatchPlan {
-            source_skill_ids: vec!["shadow-skill".to_string()],
+            source_skill_ids: vec!["test-skill".to_string()],
             bindings: Vec::new(),
         },
     }

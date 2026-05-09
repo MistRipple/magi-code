@@ -29,7 +29,7 @@ pub(crate) fn workspace_context_system_prompt(root_path: &str) -> String {
 
 pub(crate) fn normalize_model_visible_content(content: String) -> String {
     let content = content
-        .strip_prefix("shadow-model::")
+        .strip_prefix("loopback-model::")
         .unwrap_or(content.as_str())
         .trim()
         .to_string();
@@ -38,7 +38,7 @@ pub(crate) fn normalize_model_visible_content(content: String) -> String {
 
 pub(crate) fn normalize_model_stream_preview_content(content: &str) -> String {
     let content = content
-        .strip_prefix("shadow-model::")
+        .strip_prefix("loopback-model::")
         .unwrap_or(content)
         .trim();
     let stripped = strip_dispatch_text(content);
@@ -71,9 +71,9 @@ mod tests {
     }
 
     #[test]
-    fn normalize_model_visible_content_removes_shadow_prefix() {
+    fn normalize_model_visible_content_removes_loopback_prefix() {
         assert_eq!(
-            normalize_model_visible_content(" shadow-model::结果 \n".trim_start().to_string()),
+            normalize_model_visible_content(" loopback-model::结果 \n".trim_start().to_string()),
             "结果"
         );
     }

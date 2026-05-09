@@ -3,8 +3,8 @@ use magi_bridge_client::{
     JsonRpcBridgeServerProbeClient, JsonRpcMcpBridgeClient, JsonRpcMcpManagerClient,
     JsonRpcStdioTransport, McpBridgeClient, McpManagerLifecycleEventKind,
     McpManagerServerHealthUpdateRequest, McpManagerServerRegistrationRequest,
-    McpManagerServerSelectionRequest, McpToolCallRequest, SHADOW_MCP_SERVER_NAME,
-    SHADOW_MCP_TOOL_NAME,
+    McpManagerServerSelectionRequest, McpToolCallRequest, LOOPBACK_MCP_SERVER_NAME,
+    LOOPBACK_MCP_TOOL_NAME,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -33,14 +33,14 @@ fn mcp_client_falls_back_to_default_server_when_selection_is_blank() {
     let response = client
         .call_tool(McpToolCallRequest {
             server_name: "   ".to_string(),
-            tool_name: SHADOW_MCP_TOOL_NAME.to_string(),
+            tool_name: LOOPBACK_MCP_TOOL_NAME.to_string(),
             input: "{}".to_string(),
         })
         .expect("blank selection should use default server");
 
     let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
-    assert_eq!(payload["server_name"], SHADOW_MCP_SERVER_NAME);
-    assert_eq!(payload["default_server"], SHADOW_MCP_SERVER_NAME);
+    assert_eq!(payload["server_name"], LOOPBACK_MCP_SERVER_NAME);
+    assert_eq!(payload["default_server"], LOOPBACK_MCP_SERVER_NAME);
     assert_eq!(payload["selection_strategy"], "explicit-or-selection-key");
 }
 
@@ -50,22 +50,22 @@ fn mcp_client_round_trips_echo_inspect() {
 
     let response = client
         .call_tool(McpToolCallRequest {
-            server_name: SHADOW_MCP_SERVER_NAME.to_string(),
-            tool_name: SHADOW_MCP_TOOL_NAME.to_string(),
+            server_name: LOOPBACK_MCP_SERVER_NAME.to_string(),
+            tool_name: LOOPBACK_MCP_TOOL_NAME.to_string(),
             input: r#"{"message":"hello"}"#.to_string(),
         })
         .expect("mcp echo.inspect should succeed");
 
     assert!(response.ok);
     let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
-    assert_eq!(payload["server_name"], SHADOW_MCP_SERVER_NAME);
-    assert_eq!(payload["tool_name"], SHADOW_MCP_TOOL_NAME);
+    assert_eq!(payload["server_name"], LOOPBACK_MCP_SERVER_NAME);
+    assert_eq!(payload["tool_name"], LOOPBACK_MCP_TOOL_NAME);
     assert_eq!(payload["status"], "ok");
     assert_eq!(payload["input"], r#"{"message":"hello"}"#);
-    assert_eq!(payload["implementation_source"], "shadow-server-prehost");
+    assert_eq!(payload["implementation_source"], "loopback-server-prehost");
     assert_eq!(payload["capability_profile"], "inspection-core-v1");
     assert_eq!(payload["selection_key"], "inspection-default");
-    assert_eq!(payload["default_server"], SHADOW_MCP_SERVER_NAME);
+    assert_eq!(payload["default_server"], LOOPBACK_MCP_SERVER_NAME);
 }
 
 #[test]
@@ -74,7 +74,7 @@ fn mcp_client_round_trips_echo_describe() {
 
     let response = client
         .call_tool(McpToolCallRequest {
-            server_name: SHADOW_MCP_SERVER_NAME.to_string(),
+            server_name: LOOPBACK_MCP_SERVER_NAME.to_string(),
             tool_name: "echo.describe".to_string(),
             input: "{}".to_string(),
         })
@@ -83,8 +83,8 @@ fn mcp_client_round_trips_echo_describe() {
     let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
     assert_eq!(payload["tool_name"], "echo.describe");
     assert_eq!(payload["tool_count"], 2);
-    assert_eq!(payload["known_tools"][0], SHADOW_MCP_TOOL_NAME);
-    assert_eq!(payload["default_server"], SHADOW_MCP_SERVER_NAME);
+    assert_eq!(payload["known_tools"][0], LOOPBACK_MCP_TOOL_NAME);
+    assert_eq!(payload["default_server"], LOOPBACK_MCP_SERVER_NAME);
     assert_eq!(payload["default_route_status"], "ready");
     assert_eq!(payload["manager_health"], "healthy");
 }
@@ -125,34 +125,34 @@ fn mcp_loopback_exposes_shared_handshake_and_health() {
         .expect("mcp service catalog should succeed");
     assert_eq!(catalog.server_kind, BridgeServerKind::Mcp);
     assert_eq!(catalog.services.len(), 3);
-    assert_eq!(catalog.services[0].service_name, "shadow-mcp-manager");
+    assert_eq!(catalog.services[0].service_name, "loopback-mcp-manager");
     assert_eq!(
         catalog.services[0]
             .implementation_source
             .as_deref()
             .expect("manager implementation source should exist"),
-        "shadow-manager-prehost"
+        "loopback-manager-prehost"
     );
     assert_eq!(
         catalog.services[0]
             .manager_version
             .as_deref()
             .expect("manager version should exist"),
-        "1.0.0-shadow"
+        "1.0.0-loopback"
     );
     assert_eq!(
         catalog.services[0]
             .registry_profile
             .as_deref()
             .expect("registry profile should exist"),
-        "shadow-mcp-registry-v1"
+        "loopback-mcp-registry-v1"
     );
     assert_eq!(
         catalog.services[0]
             .registry_manifest
             .as_deref()
             .expect("registry manifest should exist"),
-        "shadow-mcp-manager@1.0.0-shadow"
+        "loopback-mcp-manager@1.0.0-loopback"
     );
     assert_eq!(
         catalog.services[0]
@@ -166,7 +166,7 @@ fn mcp_loopback_exposes_shared_handshake_and_health() {
             .default_server
             .as_deref()
             .expect("default server should exist"),
-        SHADOW_MCP_SERVER_NAME
+        LOOPBACK_MCP_SERVER_NAME
     );
     assert_eq!(
         catalog.services[0]
@@ -201,7 +201,7 @@ fn mcp_loopback_exposes_shared_handshake_and_health() {
             .default_route_target
             .as_deref()
             .expect("default route target should exist"),
-        SHADOW_MCP_SERVER_NAME
+        LOOPBACK_MCP_SERVER_NAME
     );
     assert_eq!(
         catalog.services[0]
@@ -209,9 +209,9 @@ fn mcp_loopback_exposes_shared_handshake_and_health() {
             .as_ref()
             .expect("selection targets should exist"),
         &vec![
-            "shadow-mcp".to_string(),
+            "loopback-mcp".to_string(),
             "selection-key:inspection-default".to_string(),
-            "shadow-mcp-observability".to_string(),
+            "loopback-mcp-observability".to_string(),
             "selection-key:observability-default".to_string(),
         ]
     );
@@ -223,27 +223,27 @@ fn mcp_loopback_exposes_shared_handshake_and_health() {
     assert!(
         catalog.services[0]
             .capabilities
-            .contains(&"implementation_source:shadow-manager-prehost".to_string())
+            .contains(&"implementation_source:loopback-manager-prehost".to_string())
     );
     assert!(
         catalog.services[0]
             .capabilities
-            .contains(&"registry:shadow".to_string())
+            .contains(&"registry:loopback".to_string())
     );
     assert!(
         catalog.services[0]
             .capabilities
-            .contains(&"manager_version:1.0.0-shadow".to_string())
+            .contains(&"manager_version:1.0.0-loopback".to_string())
     );
     assert!(
         catalog.services[0]
             .capabilities
-            .contains(&"registry_profile:shadow-mcp-registry-v1".to_string())
+            .contains(&"registry_profile:loopback-mcp-registry-v1".to_string())
     );
     assert!(
         catalog.services[0]
             .capabilities
-            .contains(&"registry_manifest:shadow-mcp-manager@1.0.0-shadow".to_string())
+            .contains(&"registry_manifest:loopback-mcp-manager@1.0.0-loopback".to_string())
     );
     assert!(
         catalog.services[0]
@@ -263,7 +263,7 @@ fn mcp_loopback_exposes_shared_handshake_and_health() {
     assert!(
         catalog.services[0]
             .capabilities
-            .contains(&"default_server:shadow-mcp".to_string())
+            .contains(&"default_server:loopback-mcp".to_string())
     );
     assert!(
         catalog.services[0]
@@ -290,13 +290,13 @@ fn mcp_loopback_exposes_shared_handshake_and_health() {
             .capabilities
             .contains(&"selection_target_count:4".to_string())
     );
-    assert_eq!(catalog.services[1].service_name, SHADOW_MCP_SERVER_NAME);
+    assert_eq!(catalog.services[1].service_name, LOOPBACK_MCP_SERVER_NAME);
     assert_eq!(
         catalog.services[1]
             .implementation_source
             .as_deref()
             .expect("server implementation source should exist"),
-        "shadow-server-prehost"
+        "loopback-server-prehost"
     );
     assert_eq!(
         catalog.services[1]
@@ -317,7 +317,7 @@ fn mcp_loopback_exposes_shared_handshake_and_health() {
             .server_manifest
             .as_deref()
             .expect("server manifest should exist"),
-        "shadow-mcp@1.2.0-shadow"
+        "loopback-mcp@1.2.0-loopback"
     );
     assert!(
         catalog.services[1]
@@ -327,17 +327,17 @@ fn mcp_loopback_exposes_shared_handshake_and_health() {
     assert!(
         catalog.services[1]
             .capabilities
-            .contains(&"implementation_source:shadow-server-prehost".to_string())
+            .contains(&"implementation_source:loopback-server-prehost".to_string())
     );
     assert!(
         catalog.services[1]
             .capabilities
-            .contains(&"server_version:1.2.0-shadow".to_string())
+            .contains(&"server_version:1.2.0-loopback".to_string())
     );
     assert!(
         catalog.services[1]
             .capabilities
-            .contains(&"server_manifest:shadow-mcp@1.2.0-shadow".to_string())
+            .contains(&"server_manifest:loopback-mcp@1.2.0-loopback".to_string())
     );
     assert!(
         catalog.services[1]
@@ -352,20 +352,20 @@ fn mcp_loopback_exposes_shared_handshake_and_health() {
     assert!(
         catalog.services[1]
             .capabilities
-            .contains(&format!("tool:{SHADOW_MCP_TOOL_NAME}"))
+            .contains(&format!("tool:{LOOPBACK_MCP_TOOL_NAME}"))
     );
     assert!(
         catalog.services[1]
             .capabilities
             .contains(&"tool:echo.describe".to_string())
     );
-    assert_eq!(catalog.services[2].service_name, "shadow-mcp-observability");
+    assert_eq!(catalog.services[2].service_name, "loopback-mcp-observability");
     assert_eq!(
         catalog.services[2]
             .implementation_source
             .as_deref()
             .expect("observability implementation source should exist"),
-        "shadow-server-prehost"
+        "loopback-server-prehost"
     );
     assert_eq!(
         catalog.services[2]
@@ -389,7 +389,7 @@ fn mcp_loopback_exposes_shared_handshake_and_health() {
     assert!(
         catalog.services[2]
             .capabilities
-            .contains(&"implementation_source:shadow-server-prehost".to_string())
+            .contains(&"implementation_source:loopback-server-prehost".to_string())
     );
     assert!(
         catalog.services[2]
@@ -409,12 +409,12 @@ fn mcp_catalog_reflects_env_configured_default_server_and_route_health() {
         ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
         (
             "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-            "shadow-mcp-observability",
+            "loopback-mcp-observability",
         ),
         ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
         (
             "MAGI_MCP_MANAGER_SERVER_HEALTHS",
-            "shadow-mcp=degraded,shadow-mcp-observability=healthy",
+            "loopback-mcp=degraded,loopback-mcp-observability=healthy",
         ),
     ])));
 
@@ -423,7 +423,7 @@ fn mcp_catalog_reflects_env_configured_default_server_and_route_health() {
         .expect("mcp service catalog should succeed");
     assert_eq!(
         catalog.services[0].default_server.as_deref(),
-        Some("shadow-mcp-observability")
+        Some("loopback-mcp-observability")
     );
     assert_eq!(
         catalog.services[0].default_server_health.as_deref(),
@@ -443,7 +443,7 @@ fn mcp_catalog_reflects_env_configured_default_server_and_route_health() {
     );
     assert_eq!(
         catalog.services[0].default_route_target.as_deref(),
-        Some("shadow-mcp-observability")
+        Some("loopback-mcp-observability")
     );
 }
 
@@ -453,12 +453,12 @@ fn blank_selection_uses_env_configured_default_server_when_available() {
         ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "observability-default"),
         (
             "MAGI_MCP_MANAGER_ENABLED_SERVERS",
-            "shadow-mcp-observability",
+            "loopback-mcp-observability",
         ),
         ("MAGI_MCP_MANAGER_DISABLED_SERVERS", ""),
         (
             "MAGI_MCP_MANAGER_SERVER_HEALTHS",
-            "shadow-mcp=degraded,shadow-mcp-observability=healthy",
+            "loopback-mcp=degraded,loopback-mcp-observability=healthy",
         ),
     ])));
 
@@ -471,8 +471,8 @@ fn blank_selection_uses_env_configured_default_server_when_available() {
         .expect("blank selection should use configured default server");
 
     let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
-    assert_eq!(payload["server_name"], "shadow-mcp-observability");
-    assert_eq!(payload["default_server"], "shadow-mcp-observability");
+    assert_eq!(payload["server_name"], "loopback-mcp-observability");
+    assert_eq!(payload["default_server"], "loopback-mcp-observability");
     assert_eq!(payload["default_route_status"], "ready");
     assert_eq!(payload["manager_health"], "healthy");
 }
@@ -481,7 +481,7 @@ fn blank_selection_uses_env_configured_default_server_when_available() {
 fn mcp_catalog_reports_unavailable_when_all_servers_are_disabled() {
     let probe = JsonRpcBridgeServerProbeClient::new(Arc::new(loopback_transport_with_env(&[(
         "MAGI_MCP_MANAGER_DISABLED_SERVERS",
-        "shadow-mcp,shadow-mcp-observability",
+        "loopback-mcp,loopback-mcp-observability",
     )])));
 
     let catalog = probe
@@ -545,7 +545,7 @@ fn mcp_catalog_reports_degraded_when_default_server_config_is_invalid_but_fallba
     );
     assert_eq!(
         catalog.services[0].default_route_target.as_deref(),
-        Some("shadow-mcp")
+        Some("loopback-mcp")
     );
 }
 
@@ -555,7 +555,7 @@ fn mcp_catalog_reports_unavailable_when_registry_config_is_invalid_and_no_fallba
         ("MAGI_MCP_MANAGER_DEFAULT_SERVER", "missing-server"),
         (
             "MAGI_MCP_MANAGER_DISABLED_SERVERS",
-            "shadow-mcp,shadow-mcp-observability",
+            "loopback-mcp,loopback-mcp-observability",
         ),
     ])));
 
@@ -586,17 +586,17 @@ fn mcp_client_can_select_server_via_registry_selection_key() {
     let response = client
         .call_tool(McpToolCallRequest {
             server_name: "inspection-default".to_string(),
-            tool_name: SHADOW_MCP_TOOL_NAME.to_string(),
+            tool_name: LOOPBACK_MCP_TOOL_NAME.to_string(),
             input: "{}".to_string(),
         })
         .expect("selection key should route to canonical server");
 
     let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
-    assert_eq!(payload["server_name"], SHADOW_MCP_SERVER_NAME);
+    assert_eq!(payload["server_name"], LOOPBACK_MCP_SERVER_NAME);
     assert_eq!(payload["requested_server"], "inspection-default");
-    assert_eq!(payload["server_manifest"], "shadow-mcp@1.2.0-shadow");
+    assert_eq!(payload["server_manifest"], "loopback-mcp@1.2.0-loopback");
     assert_eq!(payload["selection_key"], "inspection-default");
-    assert_eq!(payload["default_server"], SHADOW_MCP_SERVER_NAME);
+    assert_eq!(payload["default_server"], LOOPBACK_MCP_SERVER_NAME);
 }
 
 #[test]
@@ -606,10 +606,10 @@ fn mcp_manager_list_and_describe_servers_are_callable_over_json_rpc() {
     let list = client
         .list_servers()
         .expect("list_servers should succeed over json-rpc");
-    assert_eq!(list.manager.service_name, "shadow-mcp-manager");
+    assert_eq!(list.manager.service_name, "loopback-mcp-manager");
     assert_eq!(list.servers.len(), 2);
-    assert_eq!(list.servers[0].service_name, SHADOW_MCP_SERVER_NAME);
-    assert_eq!(list.servers[1].service_name, "shadow-mcp-observability");
+    assert_eq!(list.servers[0].service_name, LOOPBACK_MCP_SERVER_NAME);
+    assert_eq!(list.servers[1].service_name, "loopback-mcp-observability");
     assert_eq!(list.default_route_status, "ready");
 
     let describe = client
@@ -617,7 +617,7 @@ fn mcp_manager_list_and_describe_servers_are_callable_over_json_rpc() {
             server_name: "observability-default".to_string(),
         })
         .expect("describe_server should succeed over json-rpc");
-    assert_eq!(describe.server.service_name, "shadow-mcp-observability");
+    assert_eq!(describe.server.service_name, "loopback-mcp-observability");
     assert_eq!(describe.server.service_health.as_deref(), Some("disabled"));
     assert!(describe.lifecycle_events.is_empty());
 }
@@ -628,11 +628,11 @@ fn mcp_manager_enable_and_disable_servers_are_callable_over_json_rpc() {
 
     let enable = client
         .enable_server(McpManagerServerSelectionRequest {
-            server_name: "shadow-mcp-observability".to_string(),
+            server_name: "loopback-mcp-observability".to_string(),
         })
         .expect("enable_server should succeed over json-rpc");
     assert_eq!(enable.operation, "enable_server");
-    assert_eq!(enable.server.service_name, "shadow-mcp-observability");
+    assert_eq!(enable.server.service_name, "loopback-mcp-observability");
     assert_eq!(enable.server.service_health.as_deref(), Some("healthy"));
     assert!(
         enable
@@ -655,7 +655,7 @@ fn mcp_manager_enable_and_disable_servers_are_callable_over_json_rpc() {
         })
         .expect("disable_server should succeed over json-rpc");
     assert_eq!(disable.operation, "disable_server");
-    assert_eq!(disable.server.service_name, SHADOW_MCP_SERVER_NAME);
+    assert_eq!(disable.server.service_name, LOOPBACK_MCP_SERVER_NAME);
     assert_eq!(disable.server.service_health.as_deref(), Some("disabled"));
     assert!(
         disable
@@ -679,10 +679,10 @@ fn mcp_manager_start_stop_update_health_and_register_are_callable_over_json_rpc(
 
     let start = client
         .start_server(McpManagerServerSelectionRequest {
-            server_name: "shadow-mcp-observability".to_string(),
+            server_name: "loopback-mcp-observability".to_string(),
         })
         .expect("start_server should succeed over json-rpc");
-    assert_eq!(start.server.service_name, "shadow-mcp-observability");
+    assert_eq!(start.server.service_name, "loopback-mcp-observability");
     assert_eq!(start.server.service_health.as_deref(), Some("healthy"));
     assert_eq!(
         start
@@ -695,10 +695,10 @@ fn mcp_manager_start_stop_update_health_and_register_are_callable_over_json_rpc(
 
     let stop = client
         .stop_server(McpManagerServerSelectionRequest {
-            server_name: SHADOW_MCP_SERVER_NAME.to_string(),
+            server_name: LOOPBACK_MCP_SERVER_NAME.to_string(),
         })
         .expect("stop_server should succeed over json-rpc");
-    assert_eq!(stop.server.service_name, SHADOW_MCP_SERVER_NAME);
+    assert_eq!(stop.server.service_name, LOOPBACK_MCP_SERVER_NAME);
     assert_eq!(stop.server.service_health.as_deref(), Some("disabled"));
     assert_eq!(
         stop.lifecycle_event
@@ -710,11 +710,11 @@ fn mcp_manager_start_stop_update_health_and_register_are_callable_over_json_rpc(
 
     let health = client
         .update_health(McpManagerServerHealthUpdateRequest {
-            server_name: SHADOW_MCP_SERVER_NAME.to_string(),
+            server_name: LOOPBACK_MCP_SERVER_NAME.to_string(),
             health_status: "unavailable".to_string(),
         })
         .expect("update_health should succeed over json-rpc");
-    assert_eq!(health.server.service_name, SHADOW_MCP_SERVER_NAME);
+    assert_eq!(health.server.service_name, LOOPBACK_MCP_SERVER_NAME);
     assert_eq!(health.server.service_health.as_deref(), Some("unavailable"));
     assert!(
         health
@@ -733,17 +733,17 @@ fn mcp_manager_start_stop_update_health_and_register_are_callable_over_json_rpc(
 
     let register = client
         .register_server(McpManagerServerRegistrationRequest {
-            server_name: "shadow-mcp-dynamic".to_string(),
+            server_name: "loopback-mcp-dynamic".to_string(),
             server_version: "0.1.0".to_string(),
             capability_profile: "dynamic-readonly-v1".to_string(),
             selection_key: "dynamic-default".to_string(),
-            implementation_source: "shadow-server-prehost".to_string(),
+            implementation_source: "loopback-server-prehost".to_string(),
             health_status: "healthy".to_string(),
             enabled: true,
             tool_names: vec!["echo.describe".to_string()],
         })
         .expect("register_server should succeed over json-rpc");
-    assert_eq!(register.server.service_name, "shadow-mcp-dynamic");
+    assert_eq!(register.server.service_name, "loopback-mcp-dynamic");
     assert_eq!(
         register.server.selection_key.as_deref(),
         Some("dynamic-default")
@@ -765,8 +765,8 @@ fn unsupported_method_returns_protocol_error() {
         .call(BridgeTransportRequest {
             method: "mcp.not_supported".to_string(),
             params: json!({
-                "server_name": SHADOW_MCP_SERVER_NAME,
-                "tool_name": SHADOW_MCP_TOOL_NAME,
+                "server_name": LOOPBACK_MCP_SERVER_NAME,
+                "tool_name": LOOPBACK_MCP_TOOL_NAME,
                 "input": "{}"
             }),
         })
@@ -783,7 +783,7 @@ fn unknown_server_returns_remote_business_error() {
             method: "mcp.call_tool".to_string(),
             params: json!({
                 "server_name": "other-mcp",
-                "tool_name": SHADOW_MCP_TOOL_NAME,
+                "tool_name": LOOPBACK_MCP_TOOL_NAME,
                 "input": "{}"
             }),
         })
@@ -805,7 +805,7 @@ fn unsupported_tool_returns_remote_business_error() {
         .call(BridgeTransportRequest {
             method: "mcp.call_tool".to_string(),
             params: json!({
-                "server_name": SHADOW_MCP_SERVER_NAME,
+                "server_name": LOOPBACK_MCP_SERVER_NAME,
                 "tool_name": "other.inspect",
                 "input": "{}"
             }),
@@ -824,19 +824,19 @@ fn unsupported_tool_returns_remote_business_error() {
 #[test]
 fn mcp_client_blank_selection_rejects_unavailable_enabled_server() {
     let transport = loopback_transport_with_env(&[
-        ("MAGI_MCP_MANAGER_ENABLED_SERVERS", SHADOW_MCP_SERVER_NAME),
+        ("MAGI_MCP_MANAGER_ENABLED_SERVERS", LOOPBACK_MCP_SERVER_NAME),
         (
             "MAGI_MCP_MANAGER_DISABLED_SERVERS",
-            "shadow-mcp-observability",
+            "loopback-mcp-observability",
         ),
-        ("MAGI_MCP_MANAGER_SERVER_HEALTHS", "shadow-mcp=unavailable"),
+        ("MAGI_MCP_MANAGER_SERVER_HEALTHS", "loopback-mcp=unavailable"),
     ]);
     let error = transport
         .call(BridgeTransportRequest {
             method: "mcp.call_tool".to_string(),
             params: json!({
                 "server_name": "   ",
-                "tool_name": SHADOW_MCP_TOOL_NAME,
+                "tool_name": LOOPBACK_MCP_TOOL_NAME,
                 "input": "{}"
             }),
         })
@@ -855,14 +855,14 @@ fn mcp_client_blank_selection_rejects_unavailable_enabled_server() {
 fn mcp_blank_selection_error_reports_no_default_server_instead_of_manager_name() {
     let transport = loopback_transport_with_env(&[(
         "MAGI_MCP_MANAGER_DISABLED_SERVERS",
-        "shadow-mcp,shadow-mcp-observability",
+        "loopback-mcp,loopback-mcp-observability",
     )]);
     let error = transport
         .call(BridgeTransportRequest {
             method: "mcp.call_tool".to_string(),
             params: json!({
                 "server_name": "   ",
-                "tool_name": SHADOW_MCP_TOOL_NAME,
+                "tool_name": LOOPBACK_MCP_TOOL_NAME,
                 "input": "{}"
             }),
         })
@@ -877,7 +877,7 @@ fn mcp_blank_selection_error_reports_no_default_server_instead_of_manager_name()
             assert_eq!(code, -32015);
             assert_eq!(message, "default server unavailable");
             let data = data.expect("blank selection error should include data");
-            assert_eq!(data["manager_name"], "shadow-mcp-manager");
+            assert_eq!(data["manager_name"], "loopback-mcp-manager");
             assert_eq!(data["default_server"], Value::Null);
             assert_eq!(data["default_route_status"], "unavailable");
             assert_eq!(data["default_route_target"], "<none>");
@@ -890,19 +890,19 @@ fn mcp_blank_selection_error_reports_no_default_server_instead_of_manager_name()
 #[test]
 fn mcp_client_explicit_call_rejects_unavailable_server_even_when_enabled() {
     let transport = loopback_transport_with_env(&[
-        ("MAGI_MCP_MANAGER_ENABLED_SERVERS", SHADOW_MCP_SERVER_NAME),
+        ("MAGI_MCP_MANAGER_ENABLED_SERVERS", LOOPBACK_MCP_SERVER_NAME),
         (
             "MAGI_MCP_MANAGER_DISABLED_SERVERS",
-            "shadow-mcp-observability",
+            "loopback-mcp-observability",
         ),
-        ("MAGI_MCP_MANAGER_SERVER_HEALTHS", "shadow-mcp=unavailable"),
+        ("MAGI_MCP_MANAGER_SERVER_HEALTHS", "loopback-mcp=unavailable"),
     ]);
     let error = transport
         .call(BridgeTransportRequest {
             method: "mcp.call_tool".to_string(),
             params: json!({
-                "server_name": SHADOW_MCP_SERVER_NAME,
-                "tool_name": SHADOW_MCP_TOOL_NAME,
+                "server_name": LOOPBACK_MCP_SERVER_NAME,
+                "tool_name": LOOPBACK_MCP_TOOL_NAME,
                 "input": "{}"
             }),
         })
@@ -926,8 +926,8 @@ fn broken_subprocess_returns_transport_error() {
         .call(BridgeTransportRequest {
             method: "mcp.call_tool".to_string(),
             params: json!({
-                "server_name": SHADOW_MCP_SERVER_NAME,
-                "tool_name": SHADOW_MCP_TOOL_NAME,
+                "server_name": LOOPBACK_MCP_SERVER_NAME,
+                "tool_name": LOOPBACK_MCP_TOOL_NAME,
                 "input": "{}"
             }),
         })

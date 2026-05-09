@@ -1,7 +1,7 @@
 use super::{
     config::DaemonError,
     events::{publish_ledger_status_event, runtime_status_payload},
-    persistence::ShadowRuntimeSidecarPersistence,
+    persistence::RuntimeSidecarPersistence,
     types::{DaemonMaintenanceMode, DaemonMaintenancePolicyProfile, DaemonRuntimeStatus},
 };
 use magi_core::{EventId, UtcMillis};
@@ -15,7 +15,7 @@ use tracing::{info, warn};
 const RUNTIME_MAINTENANCE_INTERVAL_MILLIS: u64 = 500;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ShadowRuntimeMaintenancePolicy {
+pub(crate) struct RuntimeMaintenancePolicy {
     pub(crate) profile: DaemonMaintenancePolicyProfile,
     pub(crate) tick_interval: Duration,
     pub(crate) sidecar_flush_enabled: bool,
@@ -27,10 +27,10 @@ pub(crate) struct ShadowRuntimeMaintenancePolicy {
     pub(crate) force_ledger_refresh_on_shutdown: bool,
 }
 
-impl ShadowRuntimeMaintenancePolicy {
+impl RuntimeMaintenancePolicy {
     pub(crate) fn from_profile(profile: DaemonMaintenancePolicyProfile) -> Self {
         match profile {
-            DaemonMaintenancePolicyProfile::ShadowDefault => Self {
+            DaemonMaintenancePolicyProfile::Standard => Self {
                 profile,
                 tick_interval: Duration::from_millis(RUNTIME_MAINTENANCE_INTERVAL_MILLIS),
                 sidecar_flush_enabled: true,
@@ -68,7 +68,7 @@ impl ShadowRuntimeMaintenancePolicy {
 
     fn runtime_mode(&self) -> DaemonMaintenanceMode {
         match self.profile {
-            DaemonMaintenancePolicyProfile::ShadowDefault => DaemonMaintenanceMode::Active,
+            DaemonMaintenancePolicyProfile::Standard => DaemonMaintenanceMode::Active,
             DaemonMaintenancePolicyProfile::AggressiveFlush => {
                 DaemonMaintenanceMode::AggressiveFlush
             }
@@ -78,15 +78,15 @@ impl ShadowRuntimeMaintenancePolicy {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ShadowRuntimeMaintenanceConfig {
-    pub(crate) policy: ShadowRuntimeMaintenancePolicy,
+pub(crate) struct RuntimeMaintenanceConfig {
+    pub(crate) policy: RuntimeMaintenancePolicy,
 }
 
-impl Default for ShadowRuntimeMaintenanceConfig {
+impl Default for RuntimeMaintenanceConfig {
     fn default() -> Self {
         let profile = DaemonMaintenancePolicyProfile::default();
         Self {
-            policy: ShadowRuntimeMaintenancePolicy::from_profile(profile),
+            policy: RuntimeMaintenancePolicy::from_profile(profile),
         }
     }
 }
@@ -119,7 +119,7 @@ impl RuntimeMaintenanceStepOutcome {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct ShadowRuntimeMaintenanceStateSnapshot {
+struct RuntimeMaintenanceStateSnapshot {
     mode: DaemonMaintenanceMode,
     mode_reason: Option<String>,
     shutdown_requested_at: Option<UtcMillis>,
@@ -139,16 +139,16 @@ pub(crate) struct RuntimeMaintenanceStepReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RuntimeMaintenanceReport {
     pub(crate) tick_at: UtcMillis,
-    policy: ShadowRuntimeMaintenancePolicy,
+    policy: RuntimeMaintenancePolicy,
     pub(crate) runtime_status: DaemonRuntimeStatus,
-    state_before: ShadowRuntimeMaintenanceStateSnapshot,
-    state_after: ShadowRuntimeMaintenanceStateSnapshot,
+    state_before: RuntimeMaintenanceStateSnapshot,
+    state_after: RuntimeMaintenanceStateSnapshot,
     pub(crate) sidecar_report: RuntimeMaintenanceStepReport,
     pub(crate) ledger_report: RuntimeMaintenanceStepReport,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct ShadowRuntimeMaintenanceState {
+struct RuntimeMaintenanceState {
     mode: DaemonMaintenanceMode,
     mode_reason: Option<String>,
     shutdown_requested_at: Option<UtcMillis>,
@@ -157,15 +157,15 @@ struct ShadowRuntimeMaintenanceState {
     last_report: Option<RuntimeMaintenanceReport>,
 }
 
-impl ShadowRuntimeMaintenanceState {
-    fn snapshot(&self) -> ShadowRuntimeMaintenanceStateSnapshot {
-        let mut snapshot = ShadowRuntimeMaintenanceStateSnapshot {
+impl RuntimeMaintenanceState {
+    fn snapshot(&self) -> RuntimeMaintenanceStateSnapshot {
+        let mut snapshot = RuntimeMaintenanceStateSnapshot {
             mode: self.mode.clone(),
             mode_reason: self.mode_reason.clone(),
             shutdown_requested_at: self.shutdown_requested_at,
             shutdown_completed_at: self.shutdown_completed_at,
             last_tick_at: self.last_tick_at,
-            ..ShadowRuntimeMaintenanceStateSnapshot::default()
+            ..RuntimeMaintenanceStateSnapshot::default()
         };
         if let Some(report) = &self.last_report {
             snapshot.last_sidecar_outcome = report.sidecar_report.outcome.clone();
@@ -177,20 +177,20 @@ impl ShadowRuntimeMaintenanceState {
 }
 
 #[derive(Clone)]
-pub(crate) struct ShadowRuntimeMaintenance {
-    config: ShadowRuntimeMaintenanceConfig,
+pub(crate) struct RuntimeMaintenance {
+    config: RuntimeMaintenanceConfig,
     event_bus: Arc<InMemoryEventBus>,
-    sidecar_persistence: ShadowRuntimeSidecarPersistence,
+    sidecar_persistence: RuntimeSidecarPersistence,
     session_store: Arc<SessionStore>,
     workspace_store: Arc<WorkspaceStore>,
-    state: Arc<Mutex<ShadowRuntimeMaintenanceState>>,
+    state: Arc<Mutex<RuntimeMaintenanceState>>,
 }
 
-impl ShadowRuntimeMaintenance {
+impl RuntimeMaintenance {
     pub(crate) fn new(
-        config: ShadowRuntimeMaintenanceConfig,
+        config: RuntimeMaintenanceConfig,
         event_bus: Arc<InMemoryEventBus>,
-        sidecar_persistence: ShadowRuntimeSidecarPersistence,
+        sidecar_persistence: RuntimeSidecarPersistence,
         session_store: Arc<SessionStore>,
         workspace_store: Arc<WorkspaceStore>,
     ) -> Self {
@@ -201,9 +201,9 @@ impl ShadowRuntimeMaintenance {
             sidecar_persistence,
             session_store,
             workspace_store,
-            state: Arc::new(Mutex::new(ShadowRuntimeMaintenanceState {
+            state: Arc::new(Mutex::new(RuntimeMaintenanceState {
                 mode: initial_mode,
-                ..ShadowRuntimeMaintenanceState::default()
+                ..RuntimeMaintenanceState::default()
             })),
         }
     }
@@ -249,7 +249,7 @@ impl ShadowRuntimeMaintenance {
         };
         self.record_state(report.clone());
         self.publish_runtime_status_event(&format!(
-            "shadow-system-runtime-maintenance-status-{}",
+            "system-runtime-maintenance-status-{}",
             report.tick_at.0
         ));
         Ok(report)
@@ -395,7 +395,7 @@ impl ShadowRuntimeMaintenance {
             warn!(error = %error, "运行时维护阶段刷新审计/用量账本失败");
             publish_ledger_status_event(
                 &self.event_bus,
-                "shadow-system-ledger-refresh-failed",
+                "system-ledger-refresh-failed",
                 "system.ledger.ready",
             );
             return Ok(RuntimeMaintenanceStepReport {
@@ -406,7 +406,7 @@ impl ShadowRuntimeMaintenance {
         }
         publish_ledger_status_event(
             &self.event_bus,
-            "shadow-system-ledger-refreshed",
+            "system-ledger-refreshed",
             "system.ledger.ready",
         );
         Ok(RuntimeMaintenanceStepReport {
@@ -416,7 +416,7 @@ impl ShadowRuntimeMaintenance {
         })
     }
 
-    fn state_snapshot(&self) -> ShadowRuntimeMaintenanceStateSnapshot {
+    fn state_snapshot(&self) -> RuntimeMaintenanceStateSnapshot {
         self.state
             .lock()
             .expect("runtime maintenance state mutex should not be poisoned")
@@ -425,7 +425,7 @@ impl ShadowRuntimeMaintenance {
 
     fn runtime_status_from_snapshot(
         &self,
-        snapshot: &ShadowRuntimeMaintenanceStateSnapshot,
+        snapshot: &RuntimeMaintenanceStateSnapshot,
     ) -> DaemonRuntimeStatus {
         DaemonRuntimeStatus {
             maintenance_mode: snapshot.mode.clone(),
@@ -448,7 +448,7 @@ impl ShadowRuntimeMaintenance {
         }
     }
 
-    fn force_sidecar_flush(&self, state: &ShadowRuntimeMaintenanceStateSnapshot) -> bool {
+    fn force_sidecar_flush(&self, state: &RuntimeMaintenanceStateSnapshot) -> bool {
         self.config.policy.force_flush_on_mode_transition
             && matches!(
                 state.mode,
@@ -458,7 +458,7 @@ impl ShadowRuntimeMaintenance {
             )
     }
 
-    fn force_ledger_refresh(&self, state: &ShadowRuntimeMaintenanceStateSnapshot) -> bool {
+    fn force_ledger_refresh(&self, state: &RuntimeMaintenanceStateSnapshot) -> bool {
         self.config.policy.force_ledger_refresh_on_shutdown
             && matches!(state.mode, DaemonMaintenanceMode::ShutdownRequested)
     }
@@ -466,16 +466,16 @@ impl ShadowRuntimeMaintenance {
     fn next_state_after_tick(
         &self,
         now: UtcMillis,
-        state_before: &ShadowRuntimeMaintenanceStateSnapshot,
+        state_before: &RuntimeMaintenanceStateSnapshot,
         sidecar_report: &RuntimeMaintenanceStepReport,
         ledger_report: &RuntimeMaintenanceStepReport,
-    ) -> ShadowRuntimeMaintenanceStateSnapshot {
+    ) -> RuntimeMaintenanceStateSnapshot {
         let mode = if state_before.mode == DaemonMaintenanceMode::ShutdownRequested {
             DaemonMaintenanceMode::ShutdownComplete
         } else {
             state_before.mode.clone()
         };
-        ShadowRuntimeMaintenanceStateSnapshot {
+        RuntimeMaintenanceStateSnapshot {
             mode,
             mode_reason: state_before.mode_reason.clone(),
             shutdown_requested_at: state_before.shutdown_requested_at,

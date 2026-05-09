@@ -16,7 +16,7 @@ pub use contract::{
     RuntimeContractFreezeSummary, RuntimeContractValidationSummary, RuntimeSectionOrderingRule,
 };
 use contract::{runtime_read_model_contract_sections, runtime_read_model_section_ordering_rules};
-pub const RUNTIME_LEDGER_SCHEMA_VERSION: &str = "shadow-audit-usage-ledger-v1";
+pub const RUNTIME_LEDGER_SCHEMA_VERSION: &str = "audit-usage-ledger-v1";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EventCategoryCounts {

@@ -172,7 +172,7 @@ impl WorkerExecutorProbe {
     }
 }
 
-pub trait ShadowWorkerExecutor: Send + Sync {
+pub trait WorkerExecutor: Send + Sync {
     fn execute(&self, intent: &WorkerExecutionIntent) -> WorkerExecutionTrace;
 
     fn execute_from_checkpoint(
@@ -254,14 +254,14 @@ pub trait ShadowWorkerExecutor: Send + Sync {
 
     fn probe(&self) -> Result<WorkerExecutorProbe, WorkerExecutorFailure> {
         Ok(WorkerExecutorProbe {
-            executor_id: "shadow-deterministic-worker-executor".to_string(),
-            executor_version: "worker-shadow-executor-v1".to_string(),
+            executor_id: "deterministic-worker-executor".to_string(),
+            executor_version: "worker-executor-v1".to_string(),
             executor_kind: self.executor_kind(),
             capability: LocalProcessExecutorCapability {
-                executor_id: "shadow-deterministic-worker-executor".to_string(),
-                executor_version: "worker-shadow-executor-v1".to_string(),
-                protocol_version: "worker-shadow-v1".to_string(),
-                execution_mode: WorkerExecutionMode::ShadowLoopback,
+                executor_id: "deterministic-worker-executor".to_string(),
+                executor_version: "worker-executor-v1".to_string(),
+                protocol_version: "worker-v1".to_string(),
+                execution_mode: WorkerExecutionMode::Loopback,
                 supports_probe: true,
                 supports_execute: true,
                 supports_review: true,
@@ -275,7 +275,7 @@ pub trait ShadowWorkerExecutor: Send + Sync {
                     repair: true,
                 },
                 descriptor: LocalProcessExecutorDescriptor {
-                    process_model: LocalProcessExecutorProcessModel::ShadowLoopback,
+                    process_model: LocalProcessExecutorProcessModel::Loopback,
                     reuse_scope: WorkerExecutionBindingScope::None,
                     parallelism_scope: WorkerExecutionParallelismScope::Executor,
                     lease_state: WorkerExecutionLeaseState::None,
@@ -283,7 +283,7 @@ pub trait ShadowWorkerExecutor: Send + Sync {
                     process_lifecycle: WorkerExecutionProcessLifecycle::OneShot,
                     max_parallelism: 1,
                     executor_instance_id: Some(
-                        "shadow-deterministic-worker-executor-instance".to_string(),
+                        "deterministic-worker-executor-instance".to_string(),
                     ),
                     executor_lease_id: None,
                 },
@@ -311,7 +311,7 @@ pub struct DeterministicWorkerExecutor;
 impl DeterministicWorkerExecutor {
     pub(crate) fn default_skill_plan(tool_name: &str) -> SkillToolRuntimePlan {
         SkillToolRuntimePlan {
-            skill_ids: vec!["shadow-skill".to_string()],
+            skill_ids: vec!["test-skill".to_string()],
             tool_policy: ToolExecutionPolicy::default(),
             routing: SkillToolRoutingSummary {
                 requested_builtin_tools: vec![tool_name.to_string()],
@@ -322,14 +322,14 @@ impl DeterministicWorkerExecutor {
             prompt_injections: Vec::new(),
             custom_tool_bindings: Vec::new(),
             bridge_dispatch_plan: BridgeBindingDispatchPlan {
-                source_skill_ids: vec!["shadow-skill".to_string()],
+                source_skill_ids: vec!["test-skill".to_string()],
                 bindings: Vec::new(),
             },
         }
     }
 
     pub fn default_intent(worker_id: WorkerId, task_id: TaskId) -> WorkerExecutionIntent {
-        let prefix = format!("shadow-{}-{}", worker_id, task_id);
+        let prefix = format!("loopback-{}-{}", worker_id, task_id);
         WorkerExecutionIntent {
             worker_id,
             task_id,
@@ -341,7 +341,7 @@ impl DeterministicWorkerExecutor {
                     tool_call_id: ToolCallId::new(format!("{prefix}-tool-1")),
                     tool_name: "process_inspect".to_string(),
                     tool_kind: ToolKind::Builtin,
-                    input: "{\"mode\":\"shadow\",\"target\":\"todo\"}".to_string(),
+                    input: "{\"mode\":\"loopback\",\"target\":\"todo\"}".to_string(),
                     approval_requirement: ApprovalRequirement::None,
                     risk_level: RiskLevel::Low,
                     status: ExecutionResultStatus::Succeeded,
@@ -350,17 +350,17 @@ impl DeterministicWorkerExecutor {
                     tool_call_id: ToolCallId::new(format!("{prefix}-skill-1")),
                     tool_name: "process_inspect".to_string(),
                     plan: Self::default_skill_plan("process_inspect"),
-                    payload: "{\"mode\":\"shadow-skill\",\"target\":\"todo\"}".to_string(),
+                    payload: "{\"mode\":\"loopback-skill\",\"target\":\"todo\"}".to_string(),
                     approval_requirement: ApprovalRequirement::None,
                     risk_level: RiskLevel::Low,
                     working_directory: None,
                     route: SkillDispatchRoute::Builtin,
                     binding_id: None,
-                    detail: "shadow skill dispatch".to_string(),
+                    detail: "loopback skill dispatch".to_string(),
                     status: SkillDispatchStatus::Succeeded,
                 },
                 WorkerExecutionIntentStep::FinalReport(WorkerExecutionFinalReport {
-                    summary: "shadow execution completed".to_string(),
+                    summary: "loopback execution completed".to_string(),
                     result_kind: Some(TaskResultKind::Success),
                     termination_reason: Some(TerminationReason::Completed),
                     verification_status: VerificationStatus::Passed,
@@ -457,7 +457,7 @@ impl DeterministicWorkerExecutor {
     }
 }
 
-impl ShadowWorkerExecutor for DeterministicWorkerExecutor {
+impl WorkerExecutor for DeterministicWorkerExecutor {
     fn execute(&self, intent: &WorkerExecutionIntent) -> WorkerExecutionTrace {
         let mut tool_invocations = Vec::new();
         let mut skill_dispatches = Vec::new();
@@ -532,7 +532,7 @@ impl ShadowWorkerExecutor for DeterministicWorkerExecutor {
                 summary: if failed {
                     summary_parts.join("; ")
                 } else {
-                    "shadow execution completed".to_string()
+                    "loopback execution completed".to_string()
                 },
                 result_kind: Some(if failed {
                     TaskResultKind::Failure

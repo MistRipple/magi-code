@@ -650,7 +650,7 @@ mod tests {
                 consumed_at: None,
             }],
             ledger_dto(AuditUsageLedgerStatus {
-                schema_version: "shadow-audit-usage-ledger-v1".to_string(),
+                schema_version: "audit-usage-ledger-v1".to_string(),
                 next_sequence: 12,
                 audit_count: 5,
                 usage_count: 7,
@@ -1035,7 +1035,7 @@ mod tests {
     #[test]
     fn runtime_read_model_keeps_runtime_ledger_signals_from_exported_summary() {
         let mut audit_usage_ledger = ledger_dto(AuditUsageLedgerStatus {
-            schema_version: "shadow-audit-usage-ledger-v1".to_string(),
+            schema_version: "audit-usage-ledger-v1".to_string(),
             next_sequence: 9,
             audit_count: 3,
             usage_count: 4,
@@ -1056,7 +1056,7 @@ mod tests {
 
         assert_eq!(
             runtime_read_model.meta.ledger.schema_version,
-            "shadow-audit-usage-ledger-v1"
+            "audit-usage-ledger-v1"
         );
         assert_eq!(runtime_read_model.meta.ledger.audit_count, 3);
         assert_eq!(runtime_read_model.meta.ledger.usage_count, 4);

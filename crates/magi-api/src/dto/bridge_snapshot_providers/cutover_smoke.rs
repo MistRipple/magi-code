@@ -4,7 +4,7 @@ use magi_bridge_client::{
     HttpModelBridgeClient, JsonRpcBridgeServerProbeClient, JsonRpcHostBridgeClient,
     JsonRpcMcpBridgeClient, JsonRpcMcpManagerClient, JsonRpcModelBridgeClient, McpBridgeClient,
     McpManagerServerSelectionRequest, McpToolCallRequest, ModelBridgeClient,
-    ModelInvocationRequest, SHADOW_MODEL_PROVIDER,
+    ModelInvocationRequest, LOOPBACK_MODEL_PROVIDER,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -137,14 +137,14 @@ fn capture_model_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<Brid
     let catalog = probe.describe_services().ok();
     let mut checks = Vec::new();
 
-    let shadow_profile = model_capability_profile(catalog.as_ref(), SHADOW_MODEL_PROVIDER)
-        .unwrap_or_else(|| "shadow-model-bridge-payload-v1".to_string());
+    let loopback_profile = model_capability_profile(catalog.as_ref(), LOOPBACK_MODEL_PROVIDER)
+        .unwrap_or_else(|| "model-bridge-payload-v1".to_string());
     checks.push(bridge_cutover_model_check(
         "invoke_contract",
-        SHADOW_MODEL_PROVIDER,
-        shadow_profile,
+        LOOPBACK_MODEL_PROVIDER,
+        loopback_profile,
         client.invoke(ModelInvocationRequest {
-            provider: SHADOW_MODEL_PROVIDER.to_string(),
+            provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: "bridge cutover smoke".to_string(),
             messages: None,
             tools: None,
@@ -212,7 +212,7 @@ fn capture_mcp_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<Bridge
         Err(error) => {
             return vec![BridgeCutoverCheckDto {
                 check_name: "default_route_contract".to_string(),
-                target: "shadow-mcp-manager".to_string(),
+                target: "loopback-mcp-manager".to_string(),
                 ok: false,
                 blocking_reason: Some(MCP_MANAGER_LIST_SERVERS_FAILED_REASON.to_string()),
                 response_excerpt: None,

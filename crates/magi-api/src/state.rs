@@ -13,7 +13,7 @@ use crate::routes::settings::{
 };
 use crate::settings_store::SettingsStore;
 use crate::skill_loader;
-use crate::task_execution::{ShadowTaskDispatcher, ShadowTaskExecutionRegistry};
+use crate::task_execution::{LlmTaskDispatcher, TaskExecutionRegistry};
 use magi_bridge_client::{
     BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerConfig,
     ModelBridgeClient, StdioMcpBridgeClient,
@@ -570,13 +570,13 @@ pub struct RunnerStatusSnapshot {
 }
 
 #[derive(Clone)]
-pub struct ShadowExecutionPipeline {
+pub struct ExecutionPipeline {
     pub orchestrator: OrchestratorService,
     pub execution_runtime: OrchestratedExecutionRuntime,
     pub memory_store: MemoryStore,
 }
 
-impl ShadowExecutionPipeline {}
+impl ExecutionPipeline {}
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -593,11 +593,11 @@ pub struct ApiState {
     bridge_preflight_snapshot_provider: BridgePreflightSnapshotProvider,
     bridge_cutover_smoke_provider: BridgeCutoverSmokeSnapshotProvider,
     bridge_snapshot_provider: Option<Arc<dyn BridgeSnapshotProvider>>,
-    shadow_execution_pipeline: Option<ShadowExecutionPipeline>,
-    shadow_task_execution_registry: ShadowTaskExecutionRegistry,
+    execution_pipeline: Option<ExecutionPipeline>,
+    task_execution_registry: TaskExecutionRegistry,
     task_store: Option<Arc<TaskStore>>,
     runner_manager: Option<RunnerManager>,
-    session_turn_dispatcher: Option<Arc<ShadowTaskDispatcher>>,
+    session_turn_dispatcher: Option<Arc<LlmTaskDispatcher>>,
     mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
     task_planning_model_client: Option<Arc<dyn ModelBridgeClient>>,
@@ -691,7 +691,7 @@ impl ApiState {
         Self {
             service_info: ServiceInfo {
                 service_name: service_name.into(),
-                api_version: "v0-shadow".to_string(),
+                api_version: "v0".to_string(),
             },
             runtime_epoch: format!("runtime-{}", UtcMillis::now().0),
             event_bus,
@@ -705,8 +705,8 @@ impl ApiState {
             bridge_preflight_snapshot_provider: BridgePreflightSnapshotProvider::default(),
             bridge_cutover_smoke_provider: BridgeCutoverSmokeSnapshotProvider::default(),
             bridge_snapshot_provider: None,
-            shadow_execution_pipeline: None,
-            shadow_task_execution_registry: ShadowTaskExecutionRegistry::default(),
+            execution_pipeline: None,
+            task_execution_registry: TaskExecutionRegistry::default(),
             task_store: None,
             runner_manager: None,
             session_turn_dispatcher: None,
@@ -767,13 +767,13 @@ impl ApiState {
         self
     }
 
-    pub fn with_shadow_execution_pipeline(
+    pub fn with_execution_pipeline(
         mut self,
         orchestrator: OrchestratorService,
         execution_runtime: OrchestratedExecutionRuntime,
         memory_store: MemoryStore,
     ) -> Self {
-        self.shadow_execution_pipeline = Some(ShadowExecutionPipeline {
+        self.execution_pipeline = Some(ExecutionPipeline {
             orchestrator,
             execution_runtime,
             memory_store,
@@ -972,12 +972,12 @@ impl ApiState {
         VersionHandshakeDto::from_service_info(&self.service_info)
     }
 
-    pub fn shadow_execution_pipeline(&self) -> Option<&ShadowExecutionPipeline> {
-        self.shadow_execution_pipeline.as_ref()
+    pub fn execution_pipeline(&self) -> Option<&ExecutionPipeline> {
+        self.execution_pipeline.as_ref()
     }
 
-    pub fn shadow_task_execution_registry(&self) -> &ShadowTaskExecutionRegistry {
-        &self.shadow_task_execution_registry
+    pub fn task_execution_registry(&self) -> &TaskExecutionRegistry {
+        &self.task_execution_registry
     }
 
     pub fn settings_snapshot_json(&self) -> serde_json::Value {
@@ -1212,12 +1212,12 @@ impl ApiState {
         self
     }
 
-    pub fn with_session_turn_dispatcher(mut self, dispatcher: Arc<ShadowTaskDispatcher>) -> Self {
+    pub fn with_session_turn_dispatcher(mut self, dispatcher: Arc<LlmTaskDispatcher>) -> Self {
         self.session_turn_dispatcher = Some(dispatcher);
         self
     }
 
-    pub fn session_turn_dispatcher(&self) -> Option<&Arc<ShadowTaskDispatcher>> {
+    pub fn session_turn_dispatcher(&self) -> Option<&Arc<LlmTaskDispatcher>> {
         self.session_turn_dispatcher.as_ref()
     }
 

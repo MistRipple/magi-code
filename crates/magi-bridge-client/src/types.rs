@@ -4,9 +4,9 @@ use serde_json::Value;
 use std::sync::Arc;
 use thiserror::Error;
 
-pub const SHADOW_MODEL_PROVIDER: &str = "shadow-model";
-pub const SHADOW_MCP_SERVER_NAME: &str = "shadow-mcp";
-pub const SHADOW_MCP_TOOL_NAME: &str = "echo.inspect";
+pub const LOOPBACK_MODEL_PROVIDER: &str = "loopback-model";
+pub const LOOPBACK_MCP_SERVER_NAME: &str = "loopback-mcp";
+pub const LOOPBACK_MCP_TOOL_NAME: &str = "echo.inspect";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BridgeBindingKind {
@@ -428,7 +428,7 @@ pub trait McpBridgeClient: Send + Sync {
 pub(crate) type SharedBridgeTransport = Arc<dyn BridgeTransport>;
 
 fn default_mcp_manager_implementation_source() -> String {
-    "shadow-server-prehost".to_string()
+    "loopback-server-prehost".to_string()
 }
 
 fn default_mcp_manager_registration_health() -> String {

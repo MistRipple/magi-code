@@ -14,7 +14,7 @@ use magi_tool_runtime::ToolExecutionPolicy;
 use magi_worker_runtime::{
     LocalProcessExecutorDescriptor, LocalProcessExecutorHealth, LocalProcessExecutorHealthStatus,
     LocalProcessExecutorProcessModel, LocalProcessProbeResponse, LocalProcessProtocolResponse,
-    LocalProcessProtocolResponseKind, LocalProcessWorkerExecutor, ShadowWorkerExecutor,
+    LocalProcessProtocolResponseKind, LocalProcessWorkerExecutor, WorkerExecutor,
     WorkerCheckpointResumeMode, WorkerExecutionBindingLifecycle, WorkerExecutionBindingScope,
     WorkerExecutionCheckpointCursor, WorkerExecutionFinalReport, WorkerExecutionIntent,
     WorkerExecutionIntentStep, WorkerExecutionLeaseState, WorkerExecutionMode,
@@ -237,10 +237,10 @@ fn local_process_executor_resumes_from_checkpoint_without_replaying_completed_st
 fn local_process_executor_probe_reports_capability_and_health() {
     let executor = LocalProcessWorkerExecutor::cargo_loopback();
     let probe = executor.probe().expect("probe should succeed");
-    assert_eq!(probe.executor_id, "shadow-local-process-worker-executor");
+    assert_eq!(probe.executor_id, "local-process-worker-executor");
     assert_eq!(
         probe.executor_version,
-        "worker-shadow-local-process-executor-v2"
+        "worker-local-process-executor-v2"
     );
     assert_eq!(
         probe.executor_kind,
@@ -305,20 +305,20 @@ fn local_process_executor_probe_reports_capability_and_health() {
 #[test]
 fn local_process_executor_exposes_identity_and_step_capability_override() {
     let executor = LocalProcessWorkerExecutor::cargo_loopback()
-        .with_env("MAGI_LOCAL_WORKER_EXECUTOR_ID", "shadow-local-process-test")
+        .with_env("MAGI_LOCAL_WORKER_EXECUTOR_ID", "local-process-test")
         .with_env(
             "MAGI_LOCAL_WORKER_EXECUTOR_VERSION",
-            "worker-shadow-local-process-test-v9",
+            "worker-local-process-test-v9",
         )
         .with_env("MAGI_LOCAL_WORKER_SUPPORTED_STEP_KINDS", "final-report")
         .with_env("MAGI_LOCAL_WORKER_PROCESS_MODEL", "persistent-process")
         .with_env("MAGI_LOCAL_WORKER_MAX_PARALLELISM", "3");
 
     let probe = executor.probe().expect("probe should succeed");
-    assert_eq!(probe.executor_id, "shadow-local-process-test");
+    assert_eq!(probe.executor_id, "local-process-test");
     assert_eq!(
         probe.executor_version,
-        "worker-shadow-local-process-test-v9"
+        "worker-local-process-test-v9"
     );
     assert_eq!(
         probe.capability.supported_step_kinds,
@@ -339,7 +339,7 @@ fn local_process_executor_exposes_identity_and_step_capability_override() {
     assert_eq!(probe.capability.descriptor.max_parallelism, 3);
     assert_eq!(
         probe.capability.descriptor.executor_instance_id.as_deref(),
-        Some("shadow-local-process-test-instance-1")
+        Some("local-process-test-instance-1")
     );
     assert!(probe.capability.descriptor.executor_lease_id.is_none());
     assert_eq!(
@@ -401,7 +401,7 @@ fn local_process_executor_rejects_missing_step_capability() {
                     tool_call_id: ToolCallId::new("missing-step-tool-1".to_string()),
                     tool_name: "process_inspect".to_string(),
                     tool_kind: ToolKind::Builtin,
-                    input: "{\"mode\":\"shadow\"}".to_string(),
+                    input: "{\"mode\":\"loopback\"}".to_string(),
                     approval_requirement: ApprovalRequirement::None,
                     risk_level: RiskLevel::Low,
                     status: ExecutionResultStatus::Succeeded,
@@ -410,7 +410,7 @@ fn local_process_executor_rejects_missing_step_capability() {
                     tool_call_id: ToolCallId::new("missing-step-skill-1".to_string()),
                     tool_name: "process_inspect".to_string(),
                     plan: builtin_skill_plan("process_inspect"),
-                    payload: "{\"mode\":\"shadow-skill\"}".to_string(),
+                    payload: "{\"mode\":\"loopback-skill\"}".to_string(),
                     approval_requirement: ApprovalRequirement::None,
                     risk_level: RiskLevel::Low,
                     working_directory: None,
@@ -553,10 +553,10 @@ fn local_process_executor_rejects_mismatched_request_id() {
         request_id: "probe-123".to_string(),
         kind: LocalProcessProtocolResponseKind::Probe(LocalProcessProbeResponse {
             capability: magi_worker_runtime::LocalProcessExecutorCapability {
-                executor_id: "shadow-local-process-worker-executor".to_string(),
-                executor_version: "worker-shadow-local-process-executor-v2".to_string(),
+                executor_id: "local-process-worker-executor".to_string(),
+                executor_version: "worker-local-process-executor-v2".to_string(),
                 execution_mode: WorkerExecutionMode::LocalProcess,
-                protocol_version: "worker-shadow-local-process-v1".to_string(),
+                protocol_version: "worker-local-process-v1".to_string(),
                 supports_probe: true,
                 supports_execute: true,
                 supports_review: false,
@@ -839,11 +839,11 @@ fn worker_runtime_records_active_lease_for_persistent_session_binding() {
     );
     assert_eq!(
         observation.executor_instance_id.as_deref(),
-        Some("shadow-local-process-worker-executor-instance-1")
+        Some("local-process-worker-executor-instance-1")
     );
     assert_eq!(
         observation.executor_lease_id.as_deref(),
-        Some("shadow-local-process-worker-executor-session-session-persistent-lease-lease-1")
+        Some("local-process-worker-executor-session-persistent-lease-lease-1")
     );
 }
 

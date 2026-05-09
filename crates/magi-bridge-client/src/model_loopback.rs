@@ -1,5 +1,5 @@
 use crate::{
-    BridgeResponse, ModelInvocationRequest, SHADOW_MODEL_PROVIDER,
+    BridgeResponse, ModelInvocationRequest, LOOPBACK_MODEL_PROVIDER,
     local_process_protocol::{
         BridgeServerKind, BridgeServerServiceCatalog, BridgeServerServiceDescriptor,
         LOCAL_BRIDGE_PROTOCOL_VERSION, LocalProcessBridgeRequest, LocalProcessBridgeRpcError,
@@ -116,17 +116,17 @@ impl ModelServiceShim {
     }
 }
 
-fn shadow_loopback_visible_prompt(prompt: &str) -> String {
+fn loopback_visible_prompt(prompt: &str) -> String {
     let trimmed = prompt.trim();
     if trimmed.is_empty() {
         return String::new();
     }
 
-    if let Some(classification) = shadow_loopback_classifier_response(trimmed) {
+    if let Some(classification) = loopback_classifier_response(trimmed) {
         return classification;
     }
 
-    if let Some(decomposition) = shadow_loopback_decomposition_response(trimmed) {
+    if let Some(decomposition) = loopback_decomposition_response(trimmed) {
         return decomposition;
     }
 
@@ -152,7 +152,7 @@ fn shadow_loopback_visible_prompt(prompt: &str) -> String {
 
     if let Some(index) = chunks
         .iter()
-        .position(|chunk| !shadow_loopback_instruction_chunk(chunk))
+        .position(|chunk| !loopback_instruction_chunk(chunk))
     {
         if index > 0 {
             return chunks[index..].join("\n\n");
@@ -162,7 +162,7 @@ fn shadow_loopback_visible_prompt(prompt: &str) -> String {
     trimmed.to_string()
 }
 
-fn shadow_loopback_classifier_response(prompt: &str) -> Option<String> {
+fn loopback_classifier_response(prompt: &str) -> Option<String> {
     if !prompt.contains("Session Turn 编排分类器") {
         return None;
     }
@@ -170,7 +170,7 @@ fn shadow_loopback_classifier_response(prompt: &str) -> Option<String> {
     let has_recoverable_chain = prompt
         .lines()
         .any(|line| line.trim() == "hasRecoverableChain=true");
-    let user_text = shadow_loopback_classifier_user_text(prompt);
+    let user_text = loopback_classifier_user_text(prompt);
     let deep_task = prompt.lines().any(|line| line.trim() == "deepTask=true");
     let skill_name = prompt
         .lines()
@@ -274,7 +274,7 @@ fn shadow_loopback_classifier_response(prompt: &str) -> Option<String> {
     )
 }
 
-fn shadow_loopback_classifier_user_text(prompt: &str) -> String {
+fn loopback_classifier_user_text(prompt: &str) -> String {
     let mut collecting = false;
     let mut value = String::new();
     for line in prompt.lines() {
@@ -309,12 +309,12 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
         .any(|needle| lower.contains(&needle.to_lowercase()))
 }
 
-fn shadow_loopback_decomposition_response(prompt: &str) -> Option<String> {
+fn loopback_decomposition_response(prompt: &str) -> Option<String> {
     if !prompt.starts_with("深度任务图规划器。") {
         return None;
     }
-    let goal = shadow_loopback_deep_task_goal(prompt);
-    let execution_phases = shadow_loopback_execution_phases(&goal);
+    let goal = loopback_deep_task_goal(prompt);
+    let execution_phases = loopback_execution_phases(&goal);
     let planning_goal = format!(
         "仅输出目标、边界、执行计划和验收标准，不调用工具，不执行用户目标中的写入、删除、移动、补丁或其他有副作用操作：{goal}"
     );
@@ -380,7 +380,7 @@ struct LoopbackExecutionPhase {
     goal: String,
 }
 
-fn shadow_loopback_execution_phases(goal: &str) -> Vec<LoopbackExecutionPhase> {
+fn loopback_execution_phases(goal: &str) -> Vec<LoopbackExecutionPhase> {
     if contains_any(
         goal,
         &[
@@ -392,14 +392,14 @@ fn shadow_loopback_execution_phases(goal: &str) -> Vec<LoopbackExecutionPhase> {
             "继续推进",
         ],
     ) {
-        let first_goal = shadow_loopback_goal_segment(
+        let first_goal = loopback_goal_segment(
             goal,
             "第一批",
             &["当第一批", "第二批", "；第二批", "\n第二批"],
         )
         .unwrap_or_else(|| format!("完成第一批任务，并根据结果判断是否需要继续下一批：{goal}"));
         let second_goal =
-            shadow_loopback_goal_segment(goal, "第二批", &["第二批完成后", "最后", "重点："])
+            loopback_goal_segment(goal, "第二批", &["第二批完成后", "最后", "重点："])
                 .unwrap_or_else(|| format!("在第一批完成并确认需要继续后，完成第二批任务：{goal}"));
         return vec![
             LoopbackExecutionPhase {
@@ -421,7 +421,7 @@ fn shadow_loopback_execution_phases(goal: &str) -> Vec<LoopbackExecutionPhase> {
     }]
 }
 
-fn shadow_loopback_goal_segment(goal: &str, start: &str, end_markers: &[&str]) -> Option<String> {
+fn loopback_goal_segment(goal: &str, start: &str, end_markers: &[&str]) -> Option<String> {
     let start_index = goal.find(start)?;
     let rest = &goal[start_index..];
     let end_index = end_markers
@@ -435,7 +435,7 @@ fn shadow_loopback_goal_segment(goal: &str, start: &str, end_markers: &[&str]) -
     (!segment.is_empty()).then(|| segment.to_string())
 }
 
-fn shadow_loopback_deep_task_goal(prompt: &str) -> String {
+fn loopback_deep_task_goal(prompt: &str) -> String {
     if let Some((_, rest)) = prompt.split_once("<<<MAGI_DEEP_TASK_GOAL>>>")
         && let Some((goal, _)) = rest.split_once("<<<END_MAGI_DEEP_TASK_GOAL>>>")
     {
@@ -454,7 +454,7 @@ fn shadow_loopback_deep_task_goal(prompt: &str) -> String {
         .to_string()
 }
 
-fn shadow_loopback_instruction_chunk(chunk: &str) -> bool {
+fn loopback_instruction_chunk(chunk: &str) -> bool {
     chunk.starts_with("--- 用户规则 ---")
         || chunk.starts_with("--- 安全防护 ---")
         || chunk.starts_with("--- Context ---")
@@ -475,7 +475,7 @@ impl ModelProviderRegistry {
     fn from_env() -> Self {
         Self {
             providers: vec![
-                ModelProvider::shadow(),
+                ModelProvider::loopback(),
                 ModelProvider::openai_compatible(ModelProviderRuntimeConfig::from_env()),
             ],
         }
@@ -540,7 +540,7 @@ impl ModelProviderRuntimeConfig {
 
 #[derive(Clone, Debug)]
 enum ModelProviderMode {
-    ShadowLoopback,
+    Loopback,
     OpenAiCompatibleHttp(OpenAiCompatibleProviderRuntime),
 }
 
@@ -668,15 +668,15 @@ struct ModelProvider {
 }
 
 impl ModelProvider {
-    fn shadow() -> Self {
+    fn loopback() -> Self {
         Self {
-            name: SHADOW_MODEL_PROVIDER,
+            name: LOOPBACK_MODEL_PROVIDER,
             aliases: Vec::new(),
-            implementation_source: "shadow-loopback",
+            implementation_source: "loopback",
             capability_profile: "model-invoke-v1",
             service_health: None,
             service_health_reason: None,
-            mode: ModelProviderMode::ShadowLoopback,
+            mode: ModelProviderMode::Loopback,
         }
     }
 
@@ -712,7 +712,7 @@ impl ModelProvider {
             capabilities.push(format!("provider_aliases:{}", self.aliases.join(",")));
         }
         match &self.mode {
-            ModelProviderMode::ShadowLoopback => {}
+            ModelProviderMode::Loopback => {}
             ModelProviderMode::OpenAiCompatibleHttp(runtime) => {
                 capabilities.push("provider_mode:http-smoke".to_string());
                 capabilities.push("request_transport:curl-http".to_string());
@@ -774,9 +774,9 @@ impl ModelProvider {
         executor: &dyn OpenAiCompatibleHttpExecutor,
     ) -> Result<BridgeResponse, LocalProcessBridgeRpcError> {
         match &self.mode {
-            ModelProviderMode::ShadowLoopback => Ok(BridgeResponse {
+            ModelProviderMode::Loopback => Ok(BridgeResponse {
                 ok: true,
-                payload: format!("shadow-model::{}", shadow_loopback_visible_prompt(prompt)),
+                payload: format!("loopback-model::{}", loopback_visible_prompt(prompt)),
             }),
             ModelProviderMode::OpenAiCompatibleHttp(runtime) => runtime.invoke(
                 self.name,
@@ -1365,7 +1365,7 @@ mod tests {
         ModelServiceShim {
             registry: ModelProviderRegistry {
                 providers: vec![
-                    ModelProvider::shadow(),
+                    ModelProvider::loopback(),
                     ModelProvider::openai_compatible(ModelProviderRuntimeConfig {
                         base_url: Some("https://api.example.com/v1".to_string()),
                         api_key: Some(SecretString::new("test-key".to_string())),
@@ -1382,18 +1382,18 @@ mod tests {
         let result = super::handle_model_invoke(LocalProcessBridgeRequest {
             id: Value::from(1),
             params: serde_json::json!({
-                "provider": SHADOW_MODEL_PROVIDER,
+                "provider": LOOPBACK_MODEL_PROVIDER,
                 "prompt": "hello",
             }),
         })
         .expect("model invoke should serialize");
         let response: BridgeResponse =
             serde_json::from_value(result).expect("bridge response should decode");
-        assert_eq!(response.payload, "shadow-model::hello");
+        assert_eq!(response.payload, "loopback-model::hello");
     }
 
     #[test]
-    fn shadow_loopback_visible_prompt_strips_prefixed_session_instructions() {
+    fn loopback_visible_prompt_strips_prefixed_session_instructions() {
         let prompt = r#"--- 用户规则 ---
 请始终简洁回答
 
@@ -1405,13 +1405,13 @@ mod tests {
 整理任务输出"#;
 
         assert_eq!(
-            super::shadow_loopback_visible_prompt(prompt),
+            super::loopback_visible_prompt(prompt),
             "执行: 整理任务输出\n\n整理任务输出"
         );
     }
 
     #[test]
-    fn shadow_loopback_visible_prompt_prefers_explicit_task_section() {
+    fn loopback_visible_prompt_prefers_explicit_task_section() {
         let prompt = r#"--- Context ---
 [knowledge] foo: bar
 
@@ -1421,16 +1421,16 @@ mod tests {
 汇总结果"#;
 
         assert_eq!(
-            super::shadow_loopback_visible_prompt(prompt),
+            super::loopback_visible_prompt(prompt),
             "执行: 汇总结果\n\n汇总结果"
         );
     }
 
     #[test]
-    fn shadow_loopback_visible_prompt_builds_deep_plan_from_current_goal() {
+    fn loopback_visible_prompt_builds_deep_plan_from_current_goal() {
         let prompt = "深度任务图规划器。\n请只调用 create_deep_task_plan 工具输出结构化计划，不要返回自然语言正文。\n任务目标：SUPERPOWERS-PLAN：只做只读检查并最终回复 OK-SUPERPOWERS-PLAN";
 
-        let visible = super::shadow_loopback_visible_prompt(prompt);
+        let visible = super::loopback_visible_prompt(prompt);
         let parsed: Value = serde_json::from_str(&visible).expect("deep plan should be json");
         let execution_goal = parsed["phases"][1]["workPackages"][0]["actions"][0]["goal"]
             .as_str()
@@ -1447,10 +1447,10 @@ mod tests {
     }
 
     #[test]
-    fn shadow_loopback_visible_prompt_keeps_sequential_batches_as_phases() {
+    fn loopback_visible_prompt_keeps_sequential_batches_as_phases() {
         let prompt = "深度任务图规划器。\n请只调用 create_deep_task_plan 工具输出结构化计划，不要返回自然语言正文。\n任务目标：第一批任务先执行 printf BATCH_ONE_DONE_NEXT_BATCH；当第一批结果包含 NEXT_BATCH 后继续推进；第二批任务执行 printf BATCH_TWO_DONE_FINAL；第二批完成后交付。";
 
-        let visible = super::shadow_loopback_visible_prompt(prompt);
+        let visible = super::loopback_visible_prompt(prompt);
         let parsed: Value = serde_json::from_str(&visible).expect("deep plan should be json");
 
         assert_eq!(parsed["phases"].as_array().map(Vec::len), Some(4));
@@ -1470,16 +1470,16 @@ mod tests {
     }
 
     #[test]
-    fn shadow_loopback_visible_prompt_returns_session_turn_classifier_tool_call() {
+    fn loopback_visible_prompt_returns_session_turn_classifier_tool_call() {
         let prompt = "Session Turn 编排分类器\n\
             请只调用 classify_session_turn 工具，输出本轮 route。\n\
-            userText=请搜索 Route Shadow Session 并说明结果\n\
+            userText=请搜索 Route Loopback Session 并说明结果\n\
             deepTask=false\n\
             skillName=\"\"\n\
             imageCount=0\n\
             hasRecoverableChain=false";
 
-        let visible = super::shadow_loopback_visible_prompt(prompt);
+        let visible = super::loopback_visible_prompt(prompt);
         let parsed: Value =
             serde_json::from_str(&visible).expect("classifier payload should be json");
         let calls = parsed["tool_calls"]
@@ -1496,7 +1496,7 @@ mod tests {
     }
 
     #[test]
-    fn shadow_loopback_classifier_keeps_multiline_user_text() {
+    fn loopback_classifier_keeps_multiline_user_text() {
         let prompt = "Session Turn 编排分类器\n\
             请只调用 classify_session_turn 工具，输出本轮 route。\n\
             userText=【全流程验收】请以深度任务模式完成。\n\
@@ -1507,7 +1507,7 @@ mod tests {
             imageCount=0\n\
             hasRecoverableChain=false";
 
-        let visible = super::shadow_loopback_visible_prompt(prompt);
+        let visible = super::loopback_visible_prompt(prompt);
         let parsed: Value =
             serde_json::from_str(&visible).expect("classifier payload should be json");
         let calls = parsed["tool_calls"]
@@ -1527,14 +1527,14 @@ mod tests {
     }
 
     #[test]
-    fn model_service_catalog_exposes_shadow_and_openai_compatible_provider_capability() {
+    fn model_service_catalog_exposes_loopback_and_openai_compatible_provider_capability() {
         let catalog = ModelServiceShim::from_env().service_catalog();
         assert_eq!(catalog.server_kind, BridgeServerKind::Model);
         assert_eq!(catalog.services.len(), 2);
         assert!(catalog.services.iter().any(|service| {
             service
                 .capabilities
-                .contains(&"provider:shadow-model".to_string())
+                .contains(&"provider:loopback-model".to_string())
         }));
         let openai_service = catalog
             .services
@@ -1575,7 +1575,7 @@ mod tests {
         let error = super::handle_model_invoke(LocalProcessBridgeRequest {
             id: Value::from(1),
             params: serde_json::json!({
-                "provider": SHADOW_MODEL_PROVIDER,
+                "provider": LOOPBACK_MODEL_PROVIDER,
                 "prompt": "   ",
             }),
         })
@@ -1636,7 +1636,7 @@ mod tests {
         let shim = ModelServiceShim {
             registry: ModelProviderRegistry {
                 providers: vec![
-                    ModelProvider::shadow(),
+                    ModelProvider::loopback(),
                     ModelProvider::openai_compatible(ModelProviderRuntimeConfig {
                         base_url: None,
                         api_key: None,

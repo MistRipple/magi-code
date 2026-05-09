@@ -9,7 +9,7 @@ pub(super) fn host_kind_label(host_kind: HostKind) -> &'static str {
     }
 }
 
-pub(super) fn shadow_host_payload(shim: &HostServiceShim, command: &str, details: Value) -> String {
+pub(super) fn loopback_host_payload(shim: &HostServiceShim, command: &str, details: Value) -> String {
     let runtime_status = shim.runtime_status();
     json!({
         "bridge_kind": "host",
@@ -41,6 +41,6 @@ pub(super) fn success_response(
 ) -> BridgeResponse {
     BridgeResponse {
         ok: true,
-        payload: shadow_host_payload(shim, command, details),
+        payload: loopback_host_payload(shim, command, details),
     }
 }

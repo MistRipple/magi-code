@@ -220,7 +220,7 @@ mod tests {
     fn service_info() -> ServiceInfo {
         ServiceInfo {
             service_name: "magi".to_string(),
-            api_version: "v0-shadow".to_string(),
+            api_version: "v0".to_string(),
         }
     }
 
@@ -265,7 +265,7 @@ mod tests {
         let bootstrap = BootstrapDto::from_state(&state);
 
         assert_eq!(bootstrap.service.service_name, "magi");
-        assert_eq!(bootstrap.service.api_version, "v0-shadow");
+        assert_eq!(bootstrap.service.api_version, "v0");
         assert!(bootstrap.sessions.is_empty());
         assert!(bootstrap.workspaces.is_empty());
         assert_eq!(
@@ -438,7 +438,7 @@ mod tests {
         read_model.meta.ledger.schema_version = "stale".to_string();
         read_model.meta.ledger.audit_count = 1;
         let mut audit_usage_ledger = ledger_dto(AuditUsageLedgerStatus {
-            schema_version: "shadow-audit-usage-ledger-v1".to_string(),
+            schema_version: "audit-usage-ledger-v1".to_string(),
             next_sequence: 9,
             audit_count: 3,
             usage_count: 4,
@@ -466,7 +466,7 @@ mod tests {
 
         assert_eq!(
             bootstrap.runtime_read_model.meta.ledger.schema_version,
-            "shadow-audit-usage-ledger-v1"
+            "audit-usage-ledger-v1"
         );
         assert_eq!(bootstrap.runtime_read_model.meta.ledger.audit_count, 3);
         assert_eq!(bootstrap.runtime_read_model.meta.ledger.usage_count, 4);
@@ -502,7 +502,7 @@ mod tests {
             EventStreamSnapshot::default(),
             RuntimeReadModelInput::default(),
             ledger_dto(AuditUsageLedgerStatus {
-                schema_version: "shadow-audit-usage-ledger-v1".to_string(),
+                schema_version: "audit-usage-ledger-v1".to_string(),
                 next_sequence: 12,
                 audit_count: 5,
                 usage_count: 7,

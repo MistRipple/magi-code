@@ -2,13 +2,13 @@ use super::{
     config::DaemonConfig,
     events::ledger_status_payload,
     maintenance::{
-        RuntimeMaintenanceStepOutcome, ShadowRuntimeMaintenance, ShadowRuntimeMaintenanceConfig,
-        ShadowRuntimeMaintenancePolicy, session_sidecar_flush_due, workspace_sidecar_flush_due,
+        RuntimeMaintenanceStepOutcome, RuntimeMaintenance, RuntimeMaintenanceConfig,
+        RuntimeMaintenancePolicy, session_sidecar_flush_due, workspace_sidecar_flush_due,
     },
     persistence::{
-        RuntimeSidecarFlushReport, ShadowRuntimeSidecarPersistence, ShadowStateRepository,
+        RuntimeSidecarFlushReport, RuntimeSidecarPersistence, StateRepository,
     },
-    runtime::ShadowDaemonRuntime,
+    runtime::DaemonRuntime,
     types::{DaemonMaintenanceMode, DaemonMaintenancePolicyProfile},
 };
 use axum::{
@@ -45,10 +45,10 @@ fn temp_workspace_absolute_path(name: &str) -> AbsolutePath {
 }
 
 fn test_sidecar_persistence(
-    repository: ShadowStateRepository,
+    repository: StateRepository,
     session_store: Arc<SessionStore>,
     workspace_store: Arc<WorkspaceStore>,
-) -> ShadowRuntimeSidecarPersistence {
+) -> RuntimeSidecarPersistence {
     test_sidecar_persistence_with_worker_runtime(
         repository,
         session_store,
@@ -58,12 +58,12 @@ fn test_sidecar_persistence(
 }
 
 fn test_sidecar_persistence_with_worker_runtime(
-    repository: ShadowStateRepository,
+    repository: StateRepository,
     session_store: Arc<SessionStore>,
     workspace_store: Arc<WorkspaceStore>,
     worker_runtime: WorkerRuntime,
-) -> ShadowRuntimeSidecarPersistence {
-    ShadowRuntimeSidecarPersistence::new(repository, session_store, workspace_store, worker_runtime)
+) -> RuntimeSidecarPersistence {
+    RuntimeSidecarPersistence::new(repository, session_store, workspace_store, worker_runtime)
 }
 
 async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
@@ -193,7 +193,7 @@ fn assert_completed_two_task_projection(projection: &Value) {
 #[test]
 fn legacy_session_file_can_seed_sidecar_file_loading() {
     let state_root = temp_state_root("legacy-session-sidecar");
-    let repository = ShadowStateRepository::new(state_root.clone());
+    let repository = StateRepository::new(state_root.clone());
     let legacy_payload = serde_json::json!({
         "current_session_id": "session-1",
         "sessions": [],
@@ -236,7 +236,7 @@ fn legacy_session_file_can_seed_sidecar_file_loading() {
 #[test]
 fn legacy_workspace_file_can_seed_recovery_sidecar_loading() {
     let state_root = temp_state_root("legacy-workspace-sidecar");
-    let repository = ShadowStateRepository::new(state_root.clone());
+    let repository = StateRepository::new(state_root.clone());
     let legacy_payload = serde_json::json!({
         "active_workspace_id": "workspace-1",
         "workspaces": [],
@@ -283,11 +283,11 @@ fn legacy_workspace_file_can_seed_recovery_sidecar_loading() {
 #[test]
 fn ledger_status_payload会稳定暴露路径与持久化错误() {
     let payload = ledger_status_payload(&RuntimeLedgerSummary {
-        schema_version: "shadow-audit-usage-ledger-v1".to_string(),
+        schema_version: "audit-usage-ledger-v1".to_string(),
         next_sequence: 7,
         audit_count: 3,
         usage_count: 2,
-        persistence_path: Some("/tmp/magi-shadow-ledger.json".to_string()),
+        persistence_path: Some("/tmp/magi-test-ledger.json".to_string()),
         last_persist_error: Some("persist failed".to_string()),
         is_persist_healthy: false,
         last_persisted_at: Some(UtcMillis(11)),
@@ -312,11 +312,11 @@ fn ledger_status_payload会稳定暴露路径与持久化错误() {
         },
     });
 
-    assert_eq!(payload["schema_version"], "shadow-audit-usage-ledger-v1");
+    assert_eq!(payload["schema_version"], "audit-usage-ledger-v1");
     assert_eq!(payload["audit_count"], 3);
     assert_eq!(payload["usage_count"], 2);
     assert_eq!(payload["next_sequence"], 7);
-    assert_eq!(payload["persistence_path"], "/tmp/magi-shadow-ledger.json");
+    assert_eq!(payload["persistence_path"], "/tmp/magi-test-ledger.json");
     assert_eq!(payload["last_persist_error"], "persist failed");
     assert_eq!(payload["is_persist_healthy"], false);
     assert_eq!(payload["last_persisted_at"], 11);
@@ -361,7 +361,7 @@ fn sidecar_flush_due_uses_metadata_hint_and_dirty_state() {
 #[test]
 fn runtime_sidecar_flush_hook_only_persists_dirty_sidecars() {
     let state_root = temp_state_root("runtime-sidecar-flush");
-    let repository = ShadowStateRepository::new(state_root);
+    let repository = StateRepository::new(state_root);
     let session_store = Arc::new(SessionStore::new());
     let workspace_store = Arc::new(WorkspaceStore::new());
     let persistence = test_sidecar_persistence(
@@ -444,7 +444,7 @@ fn runtime_sidecar_flush_hook_only_persists_dirty_sidecars() {
 fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
     let state_root = temp_state_root("runtime-sidecar-flush-canonical");
     let workspace_root = temp_state_root("runtime-sidecar-flush-canonical-workspace");
-    let repository = ShadowStateRepository::new(state_root);
+    let repository = StateRepository::new(state_root);
     let session_store = Arc::new(SessionStore::new());
     let workspace_store = Arc::new(WorkspaceStore::new());
     let persistence = test_sidecar_persistence(
@@ -530,7 +530,7 @@ fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
 #[test]
 fn runtime_sidecar_flush_hook_persists_dirty_worker_runtime_snapshot() {
     let state_root = temp_state_root("runtime-worker-snapshot-flush");
-    let repository = ShadowStateRepository::new(state_root.clone());
+    let repository = StateRepository::new(state_root.clone());
     let session_store = Arc::new(SessionStore::new());
     let workspace_store = Arc::new(WorkspaceStore::new());
     let worker_runtime = WorkerRuntime::new_compare(Arc::new(InMemoryEventBus::new(64)));
@@ -589,7 +589,7 @@ fn runtime_sidecar_flush_hook_persists_dirty_worker_runtime_snapshot() {
 #[test]
 fn maintenance_tick_flushes_worker_snapshot_even_when_sidecars_are_clean() {
     let state_root = temp_state_root("maintenance-worker-snapshot-only");
-    let repository = ShadowStateRepository::new(state_root.clone());
+    let repository = StateRepository::new(state_root.clone());
     let session_store = Arc::new(SessionStore::new());
     let workspace_store = Arc::new(WorkspaceStore::new());
     let event_bus = Arc::new(InMemoryEventBus::new(32));
@@ -617,8 +617,8 @@ fn maintenance_tick_flushes_worker_snapshot_even_when_sidecars_are_clean() {
         }),
     );
 
-    let maintenance = ShadowRuntimeMaintenance::new(
-        ShadowRuntimeMaintenanceConfig::default(),
+    let maintenance = RuntimeMaintenance::new(
+        RuntimeMaintenanceConfig::default(),
         event_bus,
         persistence,
         session_store,
@@ -647,7 +647,7 @@ fn maintenance_tick_flushes_worker_snapshot_even_when_sidecars_are_clean() {
 #[test]
 fn recovery_consume_updates_sidecars_can_be_flushed_incrementally() {
     let state_root = temp_state_root("recovery-sidecar-incremental");
-    let repository = ShadowStateRepository::new(state_root);
+    let repository = StateRepository::new(state_root);
     let session_store = Arc::new(SessionStore::new());
     let workspace_store = Arc::new(WorkspaceStore::new());
     let persistence = test_sidecar_persistence(
@@ -757,13 +757,13 @@ fn recovery_consume_updates_sidecars_can_be_flushed_incrementally() {
 async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch_consumes_writeback()
  {
     let state_root = temp_state_root("router-recovery-preflight");
-    let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-    let runtime = ShadowDaemonRuntime::restore(&config)
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+    let runtime = DaemonRuntime::restore(&config)
         .expect("runtime restore should bootstrap empty state");
-    let (app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+    let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
     let pipeline = state
-        .shadow_execution_pipeline()
-        .expect("daemon runtime should expose shadow execution pipeline");
+        .execution_pipeline()
+        .expect("daemon runtime should expose execution pipeline");
 
     let mission_id = MissionId::new("mission-router-recovery");
     let task_id = TaskId::new("task-router-recovery");
@@ -1042,11 +1042,11 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
 #[tokio::test]
 async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_dispatch() {
     let state_root = temp_state_root("router-bootstrap-context-summary");
-    let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-    let runtime = ShadowDaemonRuntime::restore(&config)
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+    let runtime = DaemonRuntime::restore(&config)
         .expect("runtime restore should bootstrap empty state");
-    let (app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
-    let session_id = SessionId::new("shadow-session-bootstrap");
+    let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
+    let session_id = SessionId::new("test-session-bootstrap");
     let active_workspace_id = state
         .workspace_registry
         .active_workspace_id()
@@ -1064,7 +1064,7 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         app.clone(),
         "/api/session/turn",
         json!({
-            "session_id": "shadow-session-bootstrap",
+            "session_id": "test-session-bootstrap",
             "text": "Route parser refresh",
             "deep_task": false,
             "skill_name": "refactor",
@@ -1094,7 +1094,7 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         app.clone(),
         "/api/session/turn",
         json!({
-            "session_id": "shadow-session-bootstrap",
+            "session_id": "test-session-bootstrap",
             "text": "Route parser refresh followup",
             "deep_task": false,
             "skill_name": "refactor",
@@ -1144,11 +1144,11 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
 #[tokio::test]
 async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dispatch() {
     let state_root = temp_state_root("router-bootstrap-recovery-context");
-    let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-    let runtime = ShadowDaemonRuntime::restore(&config)
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+    let runtime = DaemonRuntime::restore(&config)
         .expect("runtime restore should bootstrap empty state");
-    let (app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
-    let session_id = magi_core::SessionId::new("shadow-session-bootstrap-recovery");
+    let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
+    let session_id = magi_core::SessionId::new("test-session-bootstrap-recovery");
     let active_workspace_id = state
         .workspace_registry
         .active_workspace_id()
@@ -1166,7 +1166,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         app.clone(),
         "/api/session/turn",
         json!({
-            "session_id": "shadow-session-bootstrap-recovery",
+            "session_id": "test-session-bootstrap-recovery",
             "text": "seed bootstrap recovery state",
             "deep_task": false,
             "skill_name": "resume",
@@ -1265,7 +1265,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         app.clone(),
         "/api/session/turn",
         json!({
-            "session_id": "shadow-session-bootstrap-recovery",
+            "session_id": "test-session-bootstrap-recovery",
             "text": "consume resumed bootstrap memory",
             "deep_task": false,
             "skill_name": "resume",
@@ -1330,7 +1330,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
 #[test]
 fn runtime_maintenance_tick_can_refresh_ledger_and_flush_due_sidecars() {
     let state_root = temp_state_root("runtime-maintenance");
-    let repository = ShadowStateRepository::new(state_root.clone());
+    let repository = StateRepository::new(state_root.clone());
     let session_store = Arc::new(SessionStore::new());
     let workspace_store = Arc::new(WorkspaceStore::new());
     let event_bus = Arc::new(InMemoryEventBus::new(32));
@@ -1387,8 +1387,8 @@ fn runtime_maintenance_tick_can_refresh_ledger_and_flush_due_sidecars() {
         session_store.clone(),
         workspace_store.clone(),
     );
-    let maintenance = ShadowRuntimeMaintenance::new(
-        ShadowRuntimeMaintenanceConfig::default(),
+    let maintenance = RuntimeMaintenance::new(
+        RuntimeMaintenanceConfig::default(),
         event_bus.clone(),
         persistence,
         session_store,
@@ -1425,7 +1425,7 @@ fn runtime_maintenance_tick_can_refresh_ledger_and_flush_due_sidecars() {
 #[test]
 fn runtime_maintenance_policy_can_skip_disabled_actions() {
     let state_root = temp_state_root("runtime-maintenance-disabled");
-    let repository = ShadowStateRepository::new(state_root.clone());
+    let repository = StateRepository::new(state_root.clone());
     let session_store = Arc::new(SessionStore::new());
     let workspace_store = Arc::new(WorkspaceStore::new());
     let event_bus = Arc::new(InMemoryEventBus::new(32));
@@ -1476,10 +1476,10 @@ fn runtime_maintenance_policy_can_skip_disabled_actions() {
         "tool.used",
         serde_json::json!({ "tool_name": "shell_exec", "status": "Succeeded" }),
     ));
-    let maintenance = ShadowRuntimeMaintenance::new(
-        ShadowRuntimeMaintenanceConfig {
-            policy: ShadowRuntimeMaintenancePolicy {
-                profile: DaemonMaintenancePolicyProfile::ShadowDefault,
+    let maintenance = RuntimeMaintenance::new(
+        RuntimeMaintenanceConfig {
+            policy: RuntimeMaintenancePolicy {
+                profile: DaemonMaintenancePolicyProfile::Standard,
                 tick_interval: Duration::from_millis(1),
                 sidecar_flush_enabled: false,
                 ledger_refresh_enabled: false,
@@ -1520,7 +1520,7 @@ fn runtime_maintenance_policy_can_skip_disabled_actions() {
 #[test]
 fn runtime_maintenance_reports_failed_ledger_refresh_when_persistence_is_blocked() {
     let state_root = temp_state_root("runtime-maintenance-failed");
-    let repository = ShadowStateRepository::new(state_root.clone());
+    let repository = StateRepository::new(state_root.clone());
     let session_store = Arc::new(SessionStore::new());
     let workspace_store = Arc::new(WorkspaceStore::new());
     let event_bus = Arc::new(InMemoryEventBus::new(32));
@@ -1534,8 +1534,8 @@ fn runtime_maintenance_reports_failed_ledger_refresh_when_persistence_is_blocked
         serde_json::json!({ "tool_name": "shell_exec", "status": "Succeeded" }),
     ));
 
-    let maintenance = ShadowRuntimeMaintenance::new(
-        ShadowRuntimeMaintenanceConfig::default(),
+    let maintenance = RuntimeMaintenance::new(
+        RuntimeMaintenanceConfig::default(),
         event_bus.clone(),
         test_sidecar_persistence(repository, session_store, workspace_store),
         Arc::new(SessionStore::new()),
@@ -1562,10 +1562,10 @@ fn runtime_maintenance_reports_failed_ledger_refresh_when_persistence_is_blocked
 
 #[test]
 fn runtime_status_export_reflects_maintenance_mode_and_profile() {
-    let repository = ShadowStateRepository::new(temp_state_root("runtime-status-export"));
-    let maintenance = ShadowRuntimeMaintenance::new(
-        ShadowRuntimeMaintenanceConfig {
-            policy: ShadowRuntimeMaintenancePolicy::from_profile(
+    let repository = StateRepository::new(temp_state_root("runtime-status-export"));
+    let maintenance = RuntimeMaintenance::new(
+        RuntimeMaintenanceConfig {
+            policy: RuntimeMaintenancePolicy::from_profile(
                 DaemonMaintenancePolicyProfile::PreCutoverDrain,
             ),
         },
@@ -1599,7 +1599,7 @@ fn runtime_status_export_reflects_maintenance_mode_and_profile() {
 #[test]
 fn aggressive_flush_profile_ignores_future_flush_hints_for_dirty_sidecars() {
     let state_root = temp_state_root("runtime-aggressive-flush");
-    let repository = ShadowStateRepository::new(state_root.clone());
+    let repository = StateRepository::new(state_root.clone());
     let session_store = Arc::new(SessionStore::new());
     let workspace_store = Arc::new(WorkspaceStore::new());
     let event_bus = Arc::new(InMemoryEventBus::new(32));
@@ -1616,9 +1616,9 @@ fn aggressive_flush_profile_ignores_future_flush_hints_for_dirty_sidecars() {
         },
     );
 
-    let maintenance = ShadowRuntimeMaintenance::new(
-        ShadowRuntimeMaintenanceConfig {
-            policy: ShadowRuntimeMaintenancePolicy::from_profile(
+    let maintenance = RuntimeMaintenance::new(
+        RuntimeMaintenanceConfig {
+            policy: RuntimeMaintenancePolicy::from_profile(
                 DaemonMaintenancePolicyProfile::AggressiveFlush,
             ),
         },
@@ -1649,7 +1649,7 @@ fn persistence_long_chain_boot_mutate_flush_restart_verifies_sidecar_integrity()
     //   boot → populate → mutate → flush → RESTART (new store instances) → verify integrity
     let state_root = temp_state_root("persistence-long-chain");
     let workspace_root = temp_state_root("persistence-long-chain-workspace");
-    let repository = ShadowStateRepository::new(state_root.clone());
+    let repository = StateRepository::new(state_root.clone());
 
     let session_id = SessionId::new("session-lc");
     let workspace_id = WorkspaceId::new("workspace-lc");
@@ -1840,7 +1840,7 @@ fn persistence_long_chain_restart_mutate_flush_validates_incremental_across_boun
     //   tracking and flush correctly on the restarted instances.
     let state_root = temp_state_root("persistence-cross-boundary");
     let workspace_root = temp_state_root("persistence-cross-boundary-workspace");
-    let repository = ShadowStateRepository::new(state_root.clone());
+    let repository = StateRepository::new(state_root.clone());
 
     let session_id = SessionId::new("session-cb");
     let workspace_id = WorkspaceId::new("workspace-cb");
@@ -2010,7 +2010,7 @@ fn persistence_long_chain_maintenance_tick_drives_full_restart_recovery_cycle() 
     //   that persisted state is fully self-consistent.
     let state_root = temp_state_root("persistence-maintenance-long-chain");
     let workspace_root = temp_state_root("maintenance-long-chain-workspace");
-    let repository = ShadowStateRepository::new(state_root.clone());
+    let repository = StateRepository::new(state_root.clone());
     let event_bus = Arc::new(InMemoryEventBus::new(32));
 
     let session_id = SessionId::new("session-mlc");
@@ -2076,9 +2076,9 @@ fn persistence_long_chain_maintenance_tick_drives_full_restart_recovery_cycle() 
         session_store.clone(),
         workspace_store.clone(),
     );
-    let maintenance = ShadowRuntimeMaintenance::new(
-        ShadowRuntimeMaintenanceConfig {
-            policy: ShadowRuntimeMaintenancePolicy::from_profile(
+    let maintenance = RuntimeMaintenance::new(
+        RuntimeMaintenanceConfig {
+            policy: RuntimeMaintenancePolicy::from_profile(
                 DaemonMaintenancePolicyProfile::AggressiveFlush,
             ),
         },
@@ -2159,7 +2159,7 @@ fn persistence_long_chain_maintenance_tick_drives_full_restart_recovery_cycle() 
 #[test]
 fn graceful_shutdown_marks_runtime_status_complete_after_final_tick() {
     let state_root = temp_state_root("runtime-shutdown");
-    let repository = ShadowStateRepository::new(state_root.clone());
+    let repository = StateRepository::new(state_root.clone());
     let session_store = Arc::new(SessionStore::new());
     let workspace_store = Arc::new(WorkspaceStore::new());
     let event_bus = Arc::new(InMemoryEventBus::new(32));
@@ -2212,9 +2212,9 @@ fn graceful_shutdown_marks_runtime_status_complete_after_final_tick() {
     ));
     event_bus.set_audit_usage_ledger_persistence(repository.audit_usage_ledger_path());
 
-    let maintenance = ShadowRuntimeMaintenance::new(
-        ShadowRuntimeMaintenanceConfig {
-            policy: ShadowRuntimeMaintenancePolicy::from_profile(
+    let maintenance = RuntimeMaintenance::new(
+        RuntimeMaintenanceConfig {
+            policy: RuntimeMaintenancePolicy::from_profile(
                 DaemonMaintenancePolicyProfile::PreCutoverDrain,
             ),
         },
@@ -2259,10 +2259,10 @@ fn graceful_shutdown_marks_runtime_status_complete_after_final_tick() {
 #[tokio::test]
 async fn session_action_happy_path_creates_tasks_and_records_timeline_messages() {
     let state_root = temp_state_root("e2e-session-action-messages");
-    let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-    let runtime = ShadowDaemonRuntime::restore(&config)
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+    let runtime = DaemonRuntime::restore(&config)
         .expect("runtime restore should bootstrap empty state");
-    let (app, _state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+    let (app, _state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let (status, body) = post_json(
         app.clone(),
@@ -2285,7 +2285,7 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
 
     let session_id = body["sessionId"].as_str().unwrap();
     assert_eq!(
-        session_id, "shadow-session-001",
+        session_id, "test-session-001",
         "should use bootstrapped session"
     );
     let accepted_at = body["acceptedAt"]
@@ -2353,11 +2353,11 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
 #[tokio::test]
 async fn session_action_messages_survive_runtime_restart_and_preserve_message_count() {
     let state_root = temp_state_root("e2e-session-action-restart-count");
-    let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root.clone());
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
 
-    let runtime = ShadowDaemonRuntime::restore(&config)
+    let runtime = DaemonRuntime::restore(&config)
         .expect("first runtime restore should bootstrap empty state");
-    let (app, _state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+    let (app, _state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let (status, body) = post_json(
         app.clone(),
@@ -2399,10 +2399,10 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
     drop(app);
     drop(runtime);
 
-    let restarted_runtime = ShadowDaemonRuntime::restore(&config)
+    let restarted_runtime = DaemonRuntime::restore(&config)
         .expect("second runtime restore should recover persisted workspace sessions");
     let (restarted_app, _restarted_state) =
-        restarted_runtime.router_with_state_for_tests("shadow-test".to_string());
+        restarted_runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let after_restart_messages = get_json(
         restarted_app.clone(),
@@ -2422,7 +2422,7 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
 
     let workspace_sessions = get_json(
         restarted_app,
-        "/api/workspaces/sessions?workspaceId=shadow-workspace-001",
+        "/api/workspaces/sessions?workspaceId=test-workspace-001",
     )
     .await;
     let restored_session = workspace_sessions["sessions"]
@@ -2437,9 +2437,9 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
 #[tokio::test]
 async fn runtime_restore_detaches_session_chain_when_root_task_checkpoint_is_missing() {
     let state_root = temp_state_root("stale-session-chain-root-missing");
-    let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root.clone());
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
     let workspace_root = state_root.join("workspace");
-    let repository = ShadowStateRepository::new(state_root);
+    let repository = StateRepository::new(state_root);
     let session_store = SessionStore::new();
     let workspace_store = WorkspaceStore::new();
     let session_id = SessionId::new("session-stale-chain-root-missing");
@@ -2508,8 +2508,8 @@ async fn runtime_restore_detaches_session_chain_when_root_task_checkpoint_is_mis
         .expect("session sidecars should save");
 
     let runtime =
-        ShadowDaemonRuntime::restore(&config).expect("runtime restore should load stale sidecar");
-    let (_app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+        DaemonRuntime::restore(&config).expect("runtime restore should load stale sidecar");
+    let (_app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let sidecar = state
         .session_store
@@ -2548,12 +2548,12 @@ async fn runtime_restore_detaches_session_chain_when_root_task_checkpoint_is_mis
 #[tokio::test]
 async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_branches() {
     let state_root = temp_state_root("e2e-session-continue-restart-chain");
-    let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root.clone());
-    let repository = ShadowStateRepository::new(state_root.clone());
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
+    let repository = StateRepository::new(state_root.clone());
 
-    let runtime = ShadowDaemonRuntime::restore(&config)
+    let runtime = DaemonRuntime::restore(&config)
         .expect("first runtime restore should bootstrap empty state");
-    let (app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+    let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let (status, body) = post_json(
         app.clone(),
@@ -2729,8 +2729,8 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         .expect("augmented execution chain should persist to sidecar");
 
     let worker_runtime = state
-        .shadow_execution_pipeline()
-        .expect("shadow execution pipeline should exist")
+        .execution_pipeline()
+        .expect("execution pipeline should exist")
         .execution_runtime
         .worker_runtime()
         .clone();
@@ -2778,7 +2778,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
     task_store
         .checkpoint_to_file(&state_root.join("task-store.json"))
         .expect("task store checkpoint should persist");
-    let flush_report = ShadowRuntimeSidecarPersistence::new(
+    let flush_report = RuntimeSidecarPersistence::new(
         repository.clone(),
         state.session_store.clone(),
         state.workspace_registry.clone(),
@@ -2793,10 +2793,10 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
     drop(state);
     drop(runtime);
 
-    let restarted_runtime = ShadowDaemonRuntime::restore(&config)
+    let restarted_runtime = DaemonRuntime::restore(&config)
         .expect("second runtime restore should recover persisted execution chain");
     let (restarted_app, restarted_state) =
-        restarted_runtime.router_with_state_for_tests("shadow-test".to_string());
+        restarted_runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let before_continue_read_model = get_json(restarted_app.clone(), "/runtime/read-model").await;
     let session_summary = before_continue_read_model["details"]["sessions"]
@@ -2976,12 +2976,12 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
 #[tokio::test]
 async fn unbound_session_continue_survives_runtime_restart() {
     let state_root = temp_state_root("e2e-unbound-session-continue-restart");
-    let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root.clone());
-    let repository = ShadowStateRepository::new(state_root.clone());
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
+    let repository = StateRepository::new(state_root.clone());
 
-    let runtime = ShadowDaemonRuntime::restore(&config)
+    let runtime = DaemonRuntime::restore(&config)
         .expect("first runtime restore should bootstrap empty state");
-    let (app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+    let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let (new_session_status, new_session_body) =
         post_json(app.clone(), "/api/session/new", json!({})).await;
@@ -3038,12 +3038,12 @@ async fn unbound_session_continue_survives_runtime_restart() {
         .checkpoint_to_file(&state_root.join("task-store.json"))
         .expect("task store checkpoint should persist");
     let worker_runtime = state
-        .shadow_execution_pipeline()
-        .expect("shadow execution pipeline should exist")
+        .execution_pipeline()
+        .expect("execution pipeline should exist")
         .execution_runtime
         .worker_runtime()
         .clone();
-    let flush_report = ShadowRuntimeSidecarPersistence::new(
+    let flush_report = RuntimeSidecarPersistence::new(
         repository.clone(),
         state.session_store.clone(),
         state.workspace_registry.clone(),
@@ -3068,10 +3068,10 @@ async fn unbound_session_continue_survives_runtime_restart() {
     drop(state);
     drop(runtime);
 
-    let restarted_runtime = ShadowDaemonRuntime::restore(&config)
+    let restarted_runtime = DaemonRuntime::restore(&config)
         .expect("restart should recover unbound session state");
     let (restarted_app, restarted_state) =
-        restarted_runtime.router_with_state_for_tests("shadow-test".to_string());
+        restarted_runtime.router_with_state_for_tests("daemon-test".to_string());
 
     assert!(
         restarted_state.session_store.session(&session_id).is_some(),
@@ -3117,10 +3117,10 @@ async fn unbound_session_continue_survives_runtime_restart() {
 #[tokio::test]
 async fn session_action_publishes_domain_event_on_event_bus() {
     let state_root = temp_state_root("e2e-session-action-events");
-    let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-    let runtime = ShadowDaemonRuntime::restore(&config)
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+    let runtime = DaemonRuntime::restore(&config)
         .expect("runtime restore should bootstrap empty state");
-    let (app, state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+    let (app, state) = runtime.router_with_state_for_tests("daemon-test".to_string());
     let active_workspace_id = state
         .workspace_registry
         .active_workspace_id()
@@ -3181,10 +3181,10 @@ async fn session_action_publishes_domain_event_on_event_bus() {
 #[tokio::test]
 async fn sequential_session_actions_share_session_and_accumulate_messages() {
     let state_root = temp_state_root("e2e-sequential-actions");
-    let config = DaemonConfig::new("127.0.0.1", 0, "shadow-test", state_root);
-    let runtime = ShadowDaemonRuntime::restore(&config)
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+    let runtime = DaemonRuntime::restore(&config)
         .expect("runtime restore should bootstrap empty state");
-    let (app, _state) = runtime.router_with_state_for_tests("shadow-test".to_string());
+    let (app, _state) = runtime.router_with_state_for_tests("daemon-test".to_string());
 
     let (status, first_body) = post_json(
         app.clone(),

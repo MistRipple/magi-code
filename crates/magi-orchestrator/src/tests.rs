@@ -10,7 +10,7 @@ use magi_skill_runtime::{SkillDispatchRoute, SkillDispatchRuntime};
 use magi_tool_runtime::{ToolExecutionSummary, ToolRegistry};
 use magi_worker_runtime::{
     LocalProcessExecutorCapability, LocalProcessExecutorHealth, LocalProcessExecutorHealthStatus,
-    LocalProcessWorkerExecutor, ShadowWorkerExecutor, SkillDispatchSummary,
+    LocalProcessWorkerExecutor, WorkerExecutor, SkillDispatchSummary,
     WorkerExecutionFinalReport, WorkerExecutionStepKind, WorkerExecutionTrace,
     WorkerExecutorFailure, WorkerExecutorKind, WorkerExecutorProbe, WorkerRuntime,
     WorkerSkillDispatchObservation,
@@ -1036,7 +1036,7 @@ fn execution_runtime_can_run_dispatch_through_local_process_executor() {
 #[derive(Clone)]
 struct UnhealthyLocalExecutor;
 
-impl ShadowWorkerExecutor for UnhealthyLocalExecutor {
+impl WorkerExecutor for UnhealthyLocalExecutor {
     fn execute(&self, intent: &WorkerExecutionIntent) -> WorkerExecutionTrace {
         WorkerExecutionTrace {
             worker_id: intent.worker_id.clone(),
@@ -1054,14 +1054,14 @@ impl ShadowWorkerExecutor for UnhealthyLocalExecutor {
 
     fn probe(&self) -> Result<WorkerExecutorProbe, WorkerExecutorFailure> {
         Ok(WorkerExecutorProbe {
-            executor_id: "shadow-local-process-worker-executor".to_string(),
-            executor_version: "worker-shadow-local-process-executor-v2".to_string(),
+            executor_id: "local-process-worker-executor".to_string(),
+            executor_version: "worker-local-process-executor-v2".to_string(),
             executor_kind: WorkerExecutorKind::LocalProcess,
             capability: LocalProcessExecutorCapability {
-                executor_id: "shadow-local-process-worker-executor".to_string(),
-                executor_version: "worker-shadow-local-process-executor-v2".to_string(),
+                executor_id: "local-process-worker-executor".to_string(),
+                executor_version: "worker-local-process-executor-v2".to_string(),
                 execution_mode: magi_worker_runtime::WorkerExecutionMode::LocalProcess,
-                protocol_version: "worker-shadow-local-process-v1".to_string(),
+                protocol_version: "worker-local-process-v1".to_string(),
                 supports_probe: true,
                 supports_execute: true,
                 supports_review: false,

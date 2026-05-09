@@ -4,8 +4,8 @@ use crate::{
     McpManagerLifecycleEventKind as McpLifecycleEventKind, McpManagerListServersResponse,
     McpManagerServerHealthUpdateRequest, McpManagerServerLifecycleState as McpServerLifecycleState,
     McpManagerServerOperationResponse, McpManagerServerRegistrationRequest,
-    McpManagerServerSelectionRequest, McpToolCallRequest, SHADOW_MCP_SERVER_NAME,
-    SHADOW_MCP_TOOL_NAME,
+    McpManagerServerSelectionRequest, McpToolCallRequest, LOOPBACK_MCP_SERVER_NAME,
+    LOOPBACK_MCP_TOOL_NAME,
     local_process_protocol::{
         BridgeServerCommandCapabilityProfile, BridgeServerContextResolutionBoundary,
         BridgeServerKind, BridgeServerServiceCatalog, BridgeServerServiceDescriptor,
@@ -45,7 +45,7 @@ const MCP_MANAGER_METHODS: &[&str] = &[
 ];
 
 pub fn run_mcp_manager_server() -> Result<(), LocalProcessBridgeServerError> {
-    let registry = McpServerRegistry::shadow();
+    let registry = McpServerRegistry::loopback();
     run_local_process_bridge_server_with_methods(
         BridgeServerKind::Mcp,
         MCP_MANAGER_METHODS,
@@ -91,7 +91,7 @@ struct McpToolShim {
 impl McpToolShim {
     fn inspect() -> Self {
         Self {
-            tool_name: SHADOW_MCP_TOOL_NAME,
+            tool_name: LOOPBACK_MCP_TOOL_NAME,
         }
     }
 
@@ -190,7 +190,7 @@ impl McpServerDescriptor {
         Self {
             server_name,
             server_version,
-            implementation_source: "shadow-server-prehost",
+            implementation_source: "loopback-server-prehost",
             capability_profile,
             selection_key,
             enabled: true,
@@ -211,7 +211,7 @@ impl McpServerDescriptor {
         Self {
             server_name,
             server_version,
-            implementation_source: "shadow-server-prehost",
+            implementation_source: "loopback-server-prehost",
             capability_profile,
             selection_key,
             enabled: false,
@@ -291,7 +291,7 @@ impl McpServerDescriptor {
                 command_name: tool.tool_name().to_string(),
                 capability_id: format!("mcp-tool-{}-{}", self.server_name, tool.tool_name()),
                 interaction_mode: "request-response".to_string(),
-                side_effect_level: if tool.tool_name() == SHADOW_MCP_TOOL_NAME {
+                side_effect_level: if tool.tool_name() == LOOPBACK_MCP_TOOL_NAME {
                     "read".to_string()
                 } else {
                     "read-derive".to_string()
@@ -446,25 +446,25 @@ impl McpServerDescriptor {
 }
 
 impl McpServerRegistry {
-    fn shadow() -> Self {
+    fn loopback() -> Self {
         let mut registry = Self {
-            manager_name: "shadow-mcp-manager",
-            manager_version: "1.0.0-shadow",
-            registry_profile: "shadow-mcp-registry-v1",
+            manager_name: "loopback-mcp-manager",
+            manager_version: "1.0.0-loopback",
+            registry_profile: "loopback-mcp-registry-v1",
             selection_strategy: "explicit-or-selection-key",
             default_server_preference: None,
             servers: vec![
                 McpServerDescriptor::enabled(
-                    SHADOW_MCP_SERVER_NAME,
-                    "1.2.0-shadow",
+                    LOOPBACK_MCP_SERVER_NAME,
+                    "1.2.0-loopback",
                     "inspection-core-v1",
                     "inspection-default",
                     "healthy",
                     vec![McpToolShim::inspect(), McpToolShim::describe()],
                 ),
                 McpServerDescriptor::disabled(
-                    "shadow-mcp-observability",
-                    "0.4.0-shadow",
+                    "loopback-mcp-observability",
+                    "0.4.0-loopback",
                     "observability-readonly-v1",
                     "observability-default",
                     "disabled",
@@ -910,8 +910,8 @@ impl McpServerRegistry {
                 "update_health".to_string(),
             ],
             capabilities: vec![
-                "registry:shadow".to_string(),
-                "implementation_source:shadow-manager-prehost".to_string(),
+                "registry:loopback".to_string(),
+                "implementation_source:loopback-manager-prehost".to_string(),
                 format!("manager_version:{}", self.manager_version),
                 format!("registry_profile:{}", self.registry_profile),
                 format!("registry_manifest:{}", self.registry_manifest()),
@@ -955,8 +955,8 @@ impl McpServerRegistry {
             ],
             service_health: Some(manager_service_health.to_string()),
             service_health_reason: Some(manager_service_health_reason),
-            implementation_source: Some("shadow-manager-prehost".to_string()),
-            capability_profile: Some("shadow-mcp-manager-v1".to_string()),
+            implementation_source: Some("loopback-manager-prehost".to_string()),
+            capability_profile: Some("loopback-mcp-manager-v1".to_string()),
             workspace_roots_source: None,
             manager_version: Some(self.manager_version.to_string()),
             registry_profile: Some(self.registry_profile.to_string()),
@@ -1298,7 +1298,7 @@ fn handle_mcp_request(
     method: &str,
     request: LocalProcessBridgeRequest,
 ) -> Result<Value, LocalProcessBridgeRpcError> {
-    let mut registry = McpServerRegistry::shadow();
+    let mut registry = McpServerRegistry::loopback();
     registry.handle(method, request)
 }
 
@@ -1355,9 +1355,9 @@ mod tests {
     }
 
     impl StatefulRegistryTransport {
-        fn shadow() -> Self {
+        fn loopback() -> Self {
             Self {
-                registry: Mutex::new(McpServerRegistry::shadow()),
+                registry: Mutex::new(McpServerRegistry::loopback()),
             }
         }
     }
@@ -1399,38 +1399,38 @@ mod tests {
     }
 
     #[test]
-    fn mcp_catalog_exposes_shadow_server_and_tool_registry() {
-        let catalog = McpServerRegistry::shadow().service_catalog();
+    fn mcp_catalog_exposes_loopback_server_and_tool_registry() {
+        let catalog = McpServerRegistry::loopback().service_catalog();
         assert_eq!(catalog.server_kind, BridgeServerKind::Mcp);
         assert_eq!(catalog.services.len(), 3);
-        assert_eq!(catalog.services[0].service_name, "shadow-mcp-manager");
+        assert_eq!(catalog.services[0].service_name, "loopback-mcp-manager");
         assert_eq!(
             catalog.services[0]
                 .implementation_source
                 .as_deref()
                 .expect("manager implementation source should exist"),
-            "shadow-manager-prehost"
+            "loopback-manager-prehost"
         );
         assert_eq!(
             catalog.services[0]
                 .manager_version
                 .as_deref()
                 .expect("manager version should exist"),
-            "1.0.0-shadow"
+            "1.0.0-loopback"
         );
         assert_eq!(
             catalog.services[0]
                 .registry_profile
                 .as_deref()
                 .expect("registry profile should exist"),
-            "shadow-mcp-registry-v1"
+            "loopback-mcp-registry-v1"
         );
         assert_eq!(
             catalog.services[0]
                 .registry_manifest
                 .as_deref()
                 .expect("registry manifest should exist"),
-            "shadow-mcp-manager@1.0.0-shadow"
+            "loopback-mcp-manager@1.0.0-loopback"
         );
         assert_eq!(
             catalog.services[0]
@@ -1444,7 +1444,7 @@ mod tests {
                 .default_server
                 .as_deref()
                 .expect("default server should exist"),
-            SHADOW_MCP_SERVER_NAME
+            LOOPBACK_MCP_SERVER_NAME
         );
         assert_eq!(
             catalog.services[0]
@@ -1466,31 +1466,31 @@ mod tests {
                 .as_ref()
                 .expect("selection targets should exist"),
             &vec![
-                "shadow-mcp".to_string(),
+                "loopback-mcp".to_string(),
                 "selection-key:inspection-default".to_string(),
-                "shadow-mcp-observability".to_string(),
+                "loopback-mcp-observability".to_string(),
                 "selection-key:observability-default".to_string(),
             ]
         );
         assert!(
             catalog.services[0]
                 .capabilities
-                .contains(&"registry:shadow".to_string())
+                .contains(&"registry:loopback".to_string())
         );
         assert!(
             catalog.services[0]
                 .capabilities
-                .contains(&"manager_version:1.0.0-shadow".to_string())
+                .contains(&"manager_version:1.0.0-loopback".to_string())
         );
         assert!(
             catalog.services[0]
                 .capabilities
-                .contains(&"registry_profile:shadow-mcp-registry-v1".to_string())
+                .contains(&"registry_profile:loopback-mcp-registry-v1".to_string())
         );
         assert!(
             catalog.services[0]
                 .capabilities
-                .contains(&"registry_manifest:shadow-mcp-manager@1.0.0-shadow".to_string())
+                .contains(&"registry_manifest:loopback-mcp-manager@1.0.0-loopback".to_string())
         );
         assert!(
             catalog.services[0]
@@ -1500,7 +1500,7 @@ mod tests {
         assert!(
             catalog.services[0]
                 .capabilities
-                .contains(&"default_server:shadow-mcp".to_string())
+                .contains(&"default_server:loopback-mcp".to_string())
         );
         assert!(
             catalog.services[0]
@@ -1527,7 +1527,7 @@ mod tests {
                 .implementation_source
                 .as_deref()
                 .expect("server implementation source should exist"),
-            "shadow-server-prehost"
+            "loopback-server-prehost"
         );
         assert_eq!(
             catalog.services[1]
@@ -1548,7 +1548,7 @@ mod tests {
                 .server_manifest
                 .as_deref()
                 .expect("server manifest should exist"),
-            "shadow-mcp@1.2.0-shadow"
+            "loopback-mcp@1.2.0-loopback"
         );
         assert!(
             catalog.services[1]
@@ -1558,12 +1558,12 @@ mod tests {
         assert!(
             catalog.services[1]
                 .capabilities
-                .contains(&"server_version:1.2.0-shadow".to_string())
+                .contains(&"server_version:1.2.0-loopback".to_string())
         );
         assert!(
             catalog.services[1]
                 .capabilities
-                .contains(&"server_manifest:shadow-mcp@1.2.0-shadow".to_string())
+                .contains(&"server_manifest:loopback-mcp@1.2.0-loopback".to_string())
         );
         assert!(
             catalog.services[1]
@@ -1595,7 +1595,7 @@ mod tests {
                 .implementation_source
                 .as_deref()
                 .expect("observability implementation source should exist"),
-            "shadow-server-prehost"
+            "loopback-server-prehost"
         );
         assert_eq!(
             catalog.services[2]
@@ -1625,14 +1625,14 @@ mod tests {
 
     #[test]
     fn blank_selection_falls_back_to_default_server() {
-        let response = McpServerRegistry::shadow()
+        let response = McpServerRegistry::loopback()
             .handle(
                 MCP_CALL_TOOL_METHOD,
                 LocalProcessBridgeRequest {
                     id: Value::from(1),
                     params: serde_json::json!({
                         "server_name": "   ",
-                        "tool_name": SHADOW_MCP_TOOL_NAME,
+                        "tool_name": LOOPBACK_MCP_TOOL_NAME,
                         "input": "{}",
                     }),
                 },
@@ -1642,8 +1642,8 @@ mod tests {
             serde_json::from_value(response).expect("response should deserialize");
         let payload: Value =
             serde_json::from_str(&response.payload).expect("payload should deserialize");
-        assert_eq!(payload["server_name"], SHADOW_MCP_SERVER_NAME);
-        assert_eq!(payload["default_server"], SHADOW_MCP_SERVER_NAME);
+        assert_eq!(payload["server_name"], LOOPBACK_MCP_SERVER_NAME);
+        assert_eq!(payload["default_server"], LOOPBACK_MCP_SERVER_NAME);
         assert_eq!(payload["selection_strategy"], "explicit-or-selection-key");
     }
 
@@ -1653,7 +1653,7 @@ mod tests {
             id: Value::from(1),
             params: serde_json::json!({
                 "server_name": "other-mcp",
-                "tool_name": SHADOW_MCP_TOOL_NAME,
+                "tool_name": LOOPBACK_MCP_TOOL_NAME,
                 "input": "{}",
             }),
         })
@@ -1664,16 +1664,16 @@ mod tests {
 
     #[test]
     fn disabled_server_returns_remote_business_error() {
-        let registry = McpServerRegistry::shadow();
+        let registry = McpServerRegistry::loopback();
         let disabled = registry
             .servers
             .iter()
-            .find(|server| server.server_name == "shadow-mcp-observability")
+            .find(|server| server.server_name == "loopback-mcp-observability")
             .expect("disabled server should exist");
         let error = disabled
             .execute(
                 &McpToolCallRequest {
-                    server_name: "shadow-mcp-observability".to_string(),
+                    server_name: "loopback-mcp-observability".to_string(),
                     tool_name: "echo.describe".to_string(),
                     input: "{}".to_string(),
                 },
@@ -1686,29 +1686,29 @@ mod tests {
 
     #[test]
     fn list_servers_value_decodes_into_typed_manager_contract() {
-        let registry = McpServerRegistry::shadow();
+        let registry = McpServerRegistry::loopback();
 
         let response: McpManagerListServersResponse =
             serde_json::from_value(registry.list_servers_value())
                 .expect("list response should deserialize");
 
-        assert_eq!(response.manager.service_name, "shadow-mcp-manager");
+        assert_eq!(response.manager.service_name, "loopback-mcp-manager");
         assert_eq!(response.servers.len(), 2);
         assert_eq!(response.default_route_status, "ready");
-        assert_eq!(response.default_route_target, SHADOW_MCP_SERVER_NAME);
+        assert_eq!(response.default_route_target, LOOPBACK_MCP_SERVER_NAME);
     }
 
     #[test]
     fn registration_request_defaults_match_manager_contract() {
         let request: McpManagerServerRegistrationRequest = serde_json::from_value(json!({
-            "server_name": "shadow-mcp-dynamic",
+            "server_name": "loopback-mcp-dynamic",
             "server_version": "0.1.0",
             "capability_profile": "dynamic-readonly-v1",
             "selection_key": "dynamic-default"
         }))
         .expect("registration request should deserialize");
 
-        assert_eq!(request.implementation_source, "shadow-server-prehost");
+        assert_eq!(request.implementation_source, "loopback-server-prehost");
         assert_eq!(request.health_status, "healthy");
         assert!(!request.enabled);
         assert!(request.tool_names.is_empty());
@@ -1716,20 +1716,20 @@ mod tests {
 
     #[test]
     fn server_operation_value_decodes_into_typed_manager_contract() {
-        let mut registry = McpServerRegistry::shadow();
+        let mut registry = McpServerRegistry::loopback();
         registry
-            .start_server("shadow-mcp-observability")
+            .start_server("loopback-mcp-observability")
             .expect("start should succeed");
 
         let response: McpManagerServerOperationResponse = serde_json::from_value(
             registry
-                .server_operation_value("start_server", "shadow-mcp-observability", 0)
+                .server_operation_value("start_server", "loopback-mcp-observability", 0)
                 .expect("operation response should serialize"),
         )
         .expect("operation response should deserialize");
 
         assert_eq!(response.operation, "start_server");
-        assert_eq!(response.server.service_name, "shadow-mcp-observability");
+        assert_eq!(response.server.service_name, "loopback-mcp-observability");
         assert_eq!(response.lifecycle_event_count, 1);
         assert_eq!(
             response
@@ -1744,9 +1744,9 @@ mod tests {
 
     #[test]
     fn registry_enable_disable_updates_service_catalog() {
-        let mut registry = McpServerRegistry::shadow();
+        let mut registry = McpServerRegistry::loopback();
         registry
-            .disable_server(SHADOW_MCP_SERVER_NAME)
+            .disable_server(LOOPBACK_MCP_SERVER_NAME)
             .expect("disable should succeed");
         let catalog = registry.service_catalog();
         assert!(
@@ -1755,7 +1755,7 @@ mod tests {
                 .contains(&"server_enabled:false".to_string())
         );
         registry
-            .enable_server(SHADOW_MCP_SERVER_NAME)
+            .enable_server(LOOPBACK_MCP_SERVER_NAME)
             .expect("enable should succeed");
         let catalog = registry.service_catalog();
         assert!(
@@ -1767,14 +1767,14 @@ mod tests {
 
     #[test]
     fn selection_key_routes_to_canonical_server() {
-        let response = McpServerRegistry::shadow()
+        let response = McpServerRegistry::loopback()
             .handle(
                 MCP_CALL_TOOL_METHOD,
                 LocalProcessBridgeRequest {
                     id: Value::from(1),
                     params: serde_json::json!({
                         "server_name": "inspection-default",
-                        "tool_name": SHADOW_MCP_TOOL_NAME,
+                        "tool_name": LOOPBACK_MCP_TOOL_NAME,
                         "input": "{}",
                     }),
                 },
@@ -1784,19 +1784,19 @@ mod tests {
             serde_json::from_value(response).expect("response should deserialize");
         let payload: Value =
             serde_json::from_str(&response.payload).expect("payload should deserialize");
-        assert_eq!(payload["server_name"], SHADOW_MCP_SERVER_NAME);
+        assert_eq!(payload["server_name"], LOOPBACK_MCP_SERVER_NAME);
         assert_eq!(payload["requested_server"], "inspection-default");
         assert_eq!(payload["capability_profile"], "inspection-core-v1");
     }
 
     #[test]
     fn blank_selection_errors_when_no_enabled_default_server_exists() {
-        let mut registry = McpServerRegistry::shadow();
+        let mut registry = McpServerRegistry::loopback();
         registry
-            .disable_server(SHADOW_MCP_SERVER_NAME)
+            .disable_server(LOOPBACK_MCP_SERVER_NAME)
             .expect("disable should succeed");
         registry
-            .disable_server("shadow-mcp-observability")
+            .disable_server("loopback-mcp-observability")
             .expect("disable should succeed");
 
         let error = registry
@@ -1806,7 +1806,7 @@ mod tests {
                     id: Value::from(1),
                     params: serde_json::json!({
                         "server_name": "   ",
-                        "tool_name": SHADOW_MCP_TOOL_NAME,
+                        "tool_name": LOOPBACK_MCP_TOOL_NAME,
                         "input": "{}",
                     }),
                 },
@@ -1821,12 +1821,12 @@ mod tests {
 
     #[test]
     fn mcp_catalog_does_not_report_manager_name_as_default_server_when_no_route_exists() {
-        let mut registry = McpServerRegistry::shadow();
+        let mut registry = McpServerRegistry::loopback();
         registry
-            .disable_server(SHADOW_MCP_SERVER_NAME)
+            .disable_server(LOOPBACK_MCP_SERVER_NAME)
             .expect("disable should succeed");
         registry
-            .disable_server("shadow-mcp-observability")
+            .disable_server("loopback-mcp-observability")
             .expect("disable should succeed");
 
         let catalog = registry.service_catalog();
@@ -1852,7 +1852,7 @@ mod tests {
 
     #[test]
     fn lifecycle_state_exposed_in_server_descriptor_capabilities() {
-        let registry = McpServerRegistry::shadow();
+        let registry = McpServerRegistry::loopback();
         let catalog = registry.service_catalog();
         // Enabled server should have lifecycle_state:running
         assert!(
@@ -1870,12 +1870,12 @@ mod tests {
 
     #[test]
     fn register_server_adds_to_registry_and_emits_lifecycle_event() {
-        let mut registry = McpServerRegistry::shadow();
+        let mut registry = McpServerRegistry::loopback();
         let initial_count = registry.servers.len();
         let new_server = McpServerDescriptor {
             server_name: "test-new-server",
             server_version: "0.1.0",
-            implementation_source: "shadow-server-prehost",
+            implementation_source: "loopback-server-prehost",
             capability_profile: "test-v1",
             selection_key: "test-default",
             enabled: false,
@@ -1890,7 +1890,7 @@ mod tests {
         let dup = McpServerDescriptor {
             server_name: "test-new-server",
             server_version: "0.2.0",
-            implementation_source: "shadow-server-prehost",
+            implementation_source: "loopback-server-prehost",
             capability_profile: "test-v2",
             selection_key: "test-default-2",
             enabled: false,
@@ -1913,13 +1913,13 @@ mod tests {
 
     #[test]
     fn start_stop_server_transitions_lifecycle_state_and_emits_events() {
-        let mut registry = McpServerRegistry::shadow();
-        // shadow-mcp-observability starts as disabled/stopped
+        let mut registry = McpServerRegistry::loopback();
+        // loopback-mcp-observability starts as disabled/stopped
         assert_eq!(
             registry
                 .servers
                 .iter()
-                .find(|s| s.server_name == "shadow-mcp-observability")
+                .find(|s| s.server_name == "loopback-mcp-observability")
                 .unwrap()
                 .lifecycle_state,
             McpServerLifecycleState::Stopped
@@ -1927,38 +1927,38 @@ mod tests {
 
         // Start it
         registry
-            .start_server("shadow-mcp-observability")
+            .start_server("loopback-mcp-observability")
             .expect("start should succeed");
         let server = registry
             .servers
             .iter()
-            .find(|s| s.server_name == "shadow-mcp-observability")
+            .find(|s| s.server_name == "loopback-mcp-observability")
             .unwrap();
         assert_eq!(server.lifecycle_state, McpServerLifecycleState::Running);
         assert!(server.enabled);
         assert_eq!(server.health_status, "healthy");
 
         // Starting again should error
-        assert!(registry.start_server("shadow-mcp-observability").is_err());
+        assert!(registry.start_server("loopback-mcp-observability").is_err());
 
         // Stop it
         registry
-            .stop_server("shadow-mcp-observability")
+            .stop_server("loopback-mcp-observability")
             .expect("stop should succeed");
         let server = registry
             .servers
             .iter()
-            .find(|s| s.server_name == "shadow-mcp-observability")
+            .find(|s| s.server_name == "loopback-mcp-observability")
             .unwrap();
         assert_eq!(server.lifecycle_state, McpServerLifecycleState::Stopped);
         assert!(!server.enabled);
         assert_eq!(server.health_status, "disabled");
 
         // Stopping again should error
-        assert!(registry.stop_server("shadow-mcp-observability").is_err());
+        assert!(registry.stop_server("loopback-mcp-observability").is_err());
 
         // Check lifecycle events
-        let events = registry.lifecycle_events_for("shadow-mcp-observability");
+        let events = registry.lifecycle_events_for("loopback-mcp-observability");
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_kind, McpLifecycleEventKind::Started);
         assert_eq!(events[0].previous_state, McpServerLifecycleState::Stopped);
@@ -1970,14 +1970,14 @@ mod tests {
 
     #[test]
     fn deregister_server_transitions_to_deregistered_and_blocks_further_ops() {
-        let mut registry = McpServerRegistry::shadow();
+        let mut registry = McpServerRegistry::loopback();
         registry
-            .deregister_server("shadow-mcp-observability")
+            .deregister_server("loopback-mcp-observability")
             .expect("deregister should succeed");
         let server = registry
             .servers
             .iter()
-            .find(|s| s.server_name == "shadow-mcp-observability")
+            .find(|s| s.server_name == "loopback-mcp-observability")
             .unwrap();
         assert_eq!(
             server.lifecycle_state,
@@ -1989,58 +1989,58 @@ mod tests {
         // Double deregister should error
         assert!(
             registry
-                .deregister_server("shadow-mcp-observability")
+                .deregister_server("loopback-mcp-observability")
                 .is_err()
         );
         // Start after deregister should error
-        assert!(registry.start_server("shadow-mcp-observability").is_err());
+        assert!(registry.start_server("loopback-mcp-observability").is_err());
         // Health update after deregister should error
         assert!(
             registry
-                .update_server_health("shadow-mcp-observability", "healthy")
+                .update_server_health("loopback-mcp-observability", "healthy")
                 .is_err()
         );
 
-        let events = registry.lifecycle_events_for("shadow-mcp-observability");
+        let events = registry.lifecycle_events_for("loopback-mcp-observability");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_kind, McpLifecycleEventKind::Deregistered);
     }
 
     #[test]
     fn update_server_health_emits_health_changed_event_and_transitions_state() {
-        let mut registry = McpServerRegistry::shadow();
-        // shadow-mcp starts as healthy/running
+        let mut registry = McpServerRegistry::loopback();
+        // loopback-mcp starts as healthy/running
         registry
-            .update_server_health(SHADOW_MCP_SERVER_NAME, "degraded")
+            .update_server_health(LOOPBACK_MCP_SERVER_NAME, "degraded")
             .expect("health update should succeed");
         let server = registry
             .servers
             .iter()
-            .find(|s| s.server_name == SHADOW_MCP_SERVER_NAME)
+            .find(|s| s.server_name == LOOPBACK_MCP_SERVER_NAME)
             .unwrap();
         assert_eq!(server.health_status, "degraded");
         assert_eq!(server.lifecycle_state, McpServerLifecycleState::Running);
 
         // Transition to unavailable -> lifecycle_state should become Failed
         registry
-            .update_server_health(SHADOW_MCP_SERVER_NAME, "unavailable")
+            .update_server_health(LOOPBACK_MCP_SERVER_NAME, "unavailable")
             .expect("health update should succeed");
         let server = registry
             .servers
             .iter()
-            .find(|s| s.server_name == SHADOW_MCP_SERVER_NAME)
+            .find(|s| s.server_name == LOOPBACK_MCP_SERVER_NAME)
             .unwrap();
         assert_eq!(server.health_status, "unavailable");
         assert_eq!(server.lifecycle_state, McpServerLifecycleState::Failed);
 
         // Transition to disabled -> lifecycle_state should become Stopped, enabled false
         registry
-            .update_server_health(SHADOW_MCP_SERVER_NAME, "disabled")
+            .update_server_health(LOOPBACK_MCP_SERVER_NAME, "disabled")
             .expect("health update should succeed");
         let server = registry
             .servers
             .iter()
-            .find(|s| s.server_name == SHADOW_MCP_SERVER_NAME)
+            .find(|s| s.server_name == LOOPBACK_MCP_SERVER_NAME)
             .unwrap();
         assert_eq!(server.health_status, "disabled");
         assert_eq!(server.lifecycle_state, McpServerLifecycleState::Stopped);
@@ -2048,10 +2048,10 @@ mod tests {
 
         // Same health should be a no-op (no event emitted)
         registry
-            .update_server_health(SHADOW_MCP_SERVER_NAME, "disabled")
+            .update_server_health(LOOPBACK_MCP_SERVER_NAME, "disabled")
             .expect("no-op health update should succeed");
 
-        let events = registry.lifecycle_events_for(SHADOW_MCP_SERVER_NAME);
+        let events = registry.lifecycle_events_for(LOOPBACK_MCP_SERVER_NAME);
         assert_eq!(events.len(), 3); // degraded, unavailable, disabled
         assert!(
             events
@@ -2062,16 +2062,16 @@ mod tests {
 
     #[test]
     fn update_server_health_recovers_failed_server_back_to_running() {
-        let mut registry = McpServerRegistry::shadow();
+        let mut registry = McpServerRegistry::loopback();
 
         registry
-            .update_server_health(SHADOW_MCP_SERVER_NAME, "unavailable")
+            .update_server_health(LOOPBACK_MCP_SERVER_NAME, "unavailable")
             .expect("unavailable update should succeed");
         let failed_server = registry
             .servers
             .iter()
-            .find(|s| s.server_name == SHADOW_MCP_SERVER_NAME)
-            .expect("shadow server should exist");
+            .find(|s| s.server_name == LOOPBACK_MCP_SERVER_NAME)
+            .expect("loopback server should exist");
         assert_eq!(
             failed_server.lifecycle_state,
             McpServerLifecycleState::Failed
@@ -2079,13 +2079,13 @@ mod tests {
         assert!(failed_server.enabled);
 
         registry
-            .update_server_health(SHADOW_MCP_SERVER_NAME, "healthy")
+            .update_server_health(LOOPBACK_MCP_SERVER_NAME, "healthy")
             .expect("healthy update should recover running server");
         let recovered_server = registry
             .servers
             .iter()
-            .find(|s| s.server_name == SHADOW_MCP_SERVER_NAME)
-            .expect("shadow server should exist");
+            .find(|s| s.server_name == LOOPBACK_MCP_SERVER_NAME)
+            .expect("loopback server should exist");
         assert_eq!(recovered_server.health_status, "healthy");
         assert_eq!(
             recovered_server.lifecycle_state,
@@ -2097,8 +2097,8 @@ mod tests {
         let service = catalog
             .services
             .iter()
-            .find(|service| service.service_name == SHADOW_MCP_SERVER_NAME)
-            .expect("shadow service should appear in catalog");
+            .find(|service| service.service_name == LOOPBACK_MCP_SERVER_NAME)
+            .expect("loopback service should appear in catalog");
         assert!(
             service
                 .capabilities
@@ -2108,15 +2108,15 @@ mod tests {
 
     #[test]
     fn update_server_health_on_disabled_server_restores_registered_state_without_enabling() {
-        let mut registry = McpServerRegistry::shadow();
+        let mut registry = McpServerRegistry::loopback();
 
         registry
-            .update_server_health("shadow-mcp-observability", "healthy")
+            .update_server_health("loopback-mcp-observability", "healthy")
             .expect("healthy update should be allowed for disabled server");
         let server = registry
             .servers
             .iter()
-            .find(|s| s.server_name == "shadow-mcp-observability")
+            .find(|s| s.server_name == "loopback-mcp-observability")
             .expect("observability server should exist");
         assert_eq!(server.health_status, "healthy");
         assert_eq!(server.lifecycle_state, McpServerLifecycleState::Registered);
@@ -2126,7 +2126,7 @@ mod tests {
         let service = catalog
             .services
             .iter()
-            .find(|service| service.service_name == "shadow-mcp-observability")
+            .find(|service| service.service_name == "loopback-mcp-observability")
             .expect("observability service should appear in catalog");
         assert!(
             service
@@ -2142,20 +2142,20 @@ mod tests {
 
     #[test]
     fn enable_disable_emit_lifecycle_events() {
-        let mut registry = McpServerRegistry::shadow();
+        let mut registry = McpServerRegistry::loopback();
         let initial_events = registry.lifecycle_event_count();
 
         registry
-            .disable_server(SHADOW_MCP_SERVER_NAME)
+            .disable_server(LOOPBACK_MCP_SERVER_NAME)
             .expect("disable should succeed");
         assert_eq!(registry.lifecycle_event_count(), initial_events + 1);
 
         registry
-            .enable_server(SHADOW_MCP_SERVER_NAME)
+            .enable_server(LOOPBACK_MCP_SERVER_NAME)
             .expect("enable should succeed");
         assert_eq!(registry.lifecycle_event_count(), initial_events + 2);
 
-        let events = registry.lifecycle_events_for(SHADOW_MCP_SERVER_NAME);
+        let events = registry.lifecycle_events_for(LOOPBACK_MCP_SERVER_NAME);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_kind, McpLifecycleEventKind::Stopped);
         assert_eq!(events[0].previous_state, McpServerLifecycleState::Running);
@@ -2167,8 +2167,8 @@ mod tests {
 
     #[test]
     fn lifecycle_event_count_exposed_in_manager_descriptor() {
-        let mut registry = McpServerRegistry::shadow();
-        // No events initially from shadow()
+        let mut registry = McpServerRegistry::loopback();
+        // No events initially from loopback()
         let catalog = registry.service_catalog();
         assert!(
             catalog.services[0]
@@ -2177,8 +2177,8 @@ mod tests {
         );
 
         // After some operations, event count should reflect
-        registry.start_server("shadow-mcp-observability").unwrap();
-        registry.stop_server("shadow-mcp-observability").unwrap();
+        registry.start_server("loopback-mcp-observability").unwrap();
+        registry.stop_server("loopback-mcp-observability").unwrap();
         let catalog = registry.service_catalog();
         assert!(
             catalog.services[0]
@@ -2189,12 +2189,12 @@ mod tests {
 
     #[test]
     fn full_lifecycle_round_trip_register_start_health_stop_deregister() {
-        let mut registry = McpServerRegistry::shadow();
+        let mut registry = McpServerRegistry::loopback();
         // Register a new server
         let new_server = McpServerDescriptor {
             server_name: "lifecycle-test-server",
             server_version: "0.1.0",
-            implementation_source: "shadow-server-prehost",
+            implementation_source: "loopback-server-prehost",
             capability_profile: "lifecycle-test-v1",
             selection_key: "lifecycle-test",
             enabled: false,
@@ -2258,7 +2258,7 @@ mod tests {
 
     #[test]
     fn manager_supported_operations_include_lifecycle_ops() {
-        let registry = McpServerRegistry::shadow();
+        let registry = McpServerRegistry::loopback();
         let catalog = registry.service_catalog();
         let manager = &catalog.services[0];
         assert!(
@@ -2290,7 +2290,7 @@ mod tests {
 
     #[test]
     fn nonexistent_server_operations_return_errors() {
-        let mut registry = McpServerRegistry::shadow();
+        let mut registry = McpServerRegistry::loopback();
         assert!(registry.start_server("nonexistent").is_err());
         assert!(registry.stop_server("nonexistent").is_err());
         assert!(registry.deregister_server("nonexistent").is_err());
@@ -2303,10 +2303,10 @@ mod tests {
 
     #[test]
     fn typed_manager_client_round_trips_full_lifecycle_over_stateful_transport() {
-        let client = JsonRpcMcpManagerClient::new(Arc::new(StatefulRegistryTransport::shadow()));
+        let client = JsonRpcMcpManagerClient::new(Arc::new(StatefulRegistryTransport::loopback()));
         let registration: McpManagerServerRegistrationRequest =
             serde_json::from_value(serde_json::json!({
-                "server_name": "shadow-mcp-dynamic",
+                "server_name": "loopback-mcp-dynamic",
                 "server_version": "0.1.0",
                 "capability_profile": "dynamic-readonly-v1",
                 "selection_key": "dynamic-default"
@@ -2317,10 +2317,10 @@ mod tests {
             .register_server(registration)
             .expect("register_server should succeed");
         assert_eq!(register.operation, "register_server");
-        assert_eq!(register.server.service_name, "shadow-mcp-dynamic");
+        assert_eq!(register.server.service_name, "loopback-mcp-dynamic");
         assert_eq!(
             register.server.implementation_source.as_deref(),
-            Some("shadow-server-prehost")
+            Some("loopback-server-prehost")
         );
         assert_eq!(
             register.server.selection_key.as_deref(),
@@ -2358,7 +2358,7 @@ mod tests {
         assert_eq!(list.servers.len(), 3);
         assert!(
             list.selection_targets
-                .contains(&"shadow-mcp-dynamic".to_string())
+                .contains(&"loopback-mcp-dynamic".to_string())
         );
         assert!(
             list.selection_targets
@@ -2370,7 +2370,7 @@ mod tests {
                 server_name: "dynamic-default".to_string(),
             })
             .expect("describe_server should succeed");
-        assert_eq!(describe.server.service_name, "shadow-mcp-dynamic");
+        assert_eq!(describe.server.service_name, "loopback-mcp-dynamic");
         assert_eq!(describe.lifecycle_events.len(), 1);
         assert_eq!(
             describe.lifecycle_events[0].event_kind,
@@ -2408,7 +2408,7 @@ mod tests {
 
         let update_health = client
             .update_health(McpManagerServerHealthUpdateRequest {
-                server_name: "shadow-mcp-dynamic".to_string(),
+                server_name: "loopback-mcp-dynamic".to_string(),
                 health_status: "degraded".to_string(),
             })
             .expect("update_health should succeed");
@@ -2456,7 +2456,7 @@ mod tests {
 
         let deregister = client
             .deregister_server(McpManagerServerSelectionRequest {
-                server_name: "shadow-mcp-dynamic".to_string(),
+                server_name: "loopback-mcp-dynamic".to_string(),
             })
             .expect("deregister_server should succeed");
         assert_eq!(deregister.lifecycle_event_count, 5);
@@ -2502,11 +2502,11 @@ mod tests {
 
     #[test]
     fn typed_manager_client_surfaces_health_recovery_lifecycle_transitions() {
-        let client = JsonRpcMcpManagerClient::new(Arc::new(StatefulRegistryTransport::shadow()));
+        let client = JsonRpcMcpManagerClient::new(Arc::new(StatefulRegistryTransport::loopback()));
 
         let unavailable = client
             .update_health(McpManagerServerHealthUpdateRequest {
-                server_name: SHADOW_MCP_SERVER_NAME.to_string(),
+                server_name: LOOPBACK_MCP_SERVER_NAME.to_string(),
                 health_status: "unavailable".to_string(),
             })
             .expect("unavailable update should succeed");
@@ -2523,7 +2523,7 @@ mod tests {
 
         let recovered = client
             .update_health(McpManagerServerHealthUpdateRequest {
-                server_name: SHADOW_MCP_SERVER_NAME.to_string(),
+                server_name: LOOPBACK_MCP_SERVER_NAME.to_string(),
                 health_status: "healthy".to_string(),
             })
             .expect("healthy update should recover the server");
@@ -2559,7 +2559,7 @@ mod tests {
 
         let disabled_recovered = client
             .update_health(McpManagerServerHealthUpdateRequest {
-                server_name: "shadow-mcp-observability".to_string(),
+                server_name: "loopback-mcp-observability".to_string(),
                 health_status: "healthy".to_string(),
             })
             .expect("healthy update on disabled server should succeed");
@@ -2583,11 +2583,11 @@ mod tests {
 
     #[test]
     fn typed_manager_client_update_health_noop_does_not_replay_stale_lifecycle_event() {
-        let client = JsonRpcMcpManagerClient::new(Arc::new(StatefulRegistryTransport::shadow()));
+        let client = JsonRpcMcpManagerClient::new(Arc::new(StatefulRegistryTransport::loopback()));
 
         let unavailable = client
             .update_health(McpManagerServerHealthUpdateRequest {
-                server_name: SHADOW_MCP_SERVER_NAME.to_string(),
+                server_name: LOOPBACK_MCP_SERVER_NAME.to_string(),
                 health_status: "unavailable".to_string(),
             })
             .expect("first health transition should succeed");
@@ -2603,7 +2603,7 @@ mod tests {
 
         let repeated = client
             .update_health(McpManagerServerHealthUpdateRequest {
-                server_name: SHADOW_MCP_SERVER_NAME.to_string(),
+                server_name: LOOPBACK_MCP_SERVER_NAME.to_string(),
                 health_status: "unavailable".to_string(),
             })
             .expect("same health update should be treated as a no-op");
@@ -2624,11 +2624,11 @@ mod tests {
 
     #[test]
     fn typed_manager_client_enable_disable_noop_do_not_replay_stale_lifecycle_events() {
-        let client = JsonRpcMcpManagerClient::new(Arc::new(StatefulRegistryTransport::shadow()));
+        let client = JsonRpcMcpManagerClient::new(Arc::new(StatefulRegistryTransport::loopback()));
 
         let disabled = client
             .disable_server(McpManagerServerSelectionRequest {
-                server_name: SHADOW_MCP_SERVER_NAME.to_string(),
+                server_name: LOOPBACK_MCP_SERVER_NAME.to_string(),
             })
             .expect("first disable should succeed");
         assert_eq!(disabled.lifecycle_event_count, 1);
@@ -2643,7 +2643,7 @@ mod tests {
 
         let repeated_disable = client
             .disable_server(McpManagerServerSelectionRequest {
-                server_name: SHADOW_MCP_SERVER_NAME.to_string(),
+                server_name: LOOPBACK_MCP_SERVER_NAME.to_string(),
             })
             .expect("repeated disable should be treated as a no-op");
         assert_eq!(repeated_disable.lifecycle_event_count, 1);
@@ -2662,7 +2662,7 @@ mod tests {
 
         let enabled = client
             .enable_server(McpManagerServerSelectionRequest {
-                server_name: SHADOW_MCP_SERVER_NAME.to_string(),
+                server_name: LOOPBACK_MCP_SERVER_NAME.to_string(),
             })
             .expect("enable after disable should succeed");
         assert_eq!(enabled.lifecycle_event_count, 2);
@@ -2677,7 +2677,7 @@ mod tests {
 
         let repeated_enable = client
             .enable_server(McpManagerServerSelectionRequest {
-                server_name: SHADOW_MCP_SERVER_NAME.to_string(),
+                server_name: LOOPBACK_MCP_SERVER_NAME.to_string(),
             })
             .expect("repeated enable should be treated as a no-op");
         assert_eq!(repeated_enable.lifecycle_event_count, 2);

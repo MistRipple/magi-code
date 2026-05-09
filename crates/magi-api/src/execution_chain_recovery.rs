@@ -1,7 +1,7 @@
 use crate::{
     errors::ApiError,
     state::{ApiState, RunnerStartError},
-    task_execution::ShadowTaskExecutionPlan,
+    task_execution::TaskExecutionPlan,
 };
 use magi_core::{
     ExecutionOwnership, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskId, TaskStatus,
@@ -54,7 +54,7 @@ fn branch_stage_is_terminal(stage: &str) -> bool {
 
 fn branch_runtime_snapshot_is_terminal(state: &ApiState, branch: &ActiveExecutionBranch) -> bool {
     state
-        .shadow_execution_pipeline()
+        .execution_pipeline()
         .and_then(|pipeline| {
             pipeline
                 .execution_runtime
@@ -94,7 +94,7 @@ fn terminal_status_for_branch(
     branch: &ActiveExecutionBranch,
 ) -> Option<TaskStatus> {
     let reports = state
-        .shadow_execution_pipeline()?
+        .execution_pipeline()?
         .execution_runtime
         .worker_runtime()
         .reports();
@@ -170,7 +170,7 @@ pub(crate) fn finalize_terminal_worker_branches(
 fn rebuild_dispatch_plan_for_branch(
     chain: &ActiveExecutionChain,
     branch: &ActiveExecutionBranch,
-) -> ShadowTaskExecutionPlan {
+) -> TaskExecutionPlan {
     let ownership = ExecutionOwnership {
         session_id: Some(chain.session_id.clone()),
         workspace_id: chain.workspace_id.clone(),
@@ -193,7 +193,7 @@ fn rebuild_dispatch_plan_for_branch(
     } else {
         ExecutionWritebackPlans::default()
     };
-    ShadowTaskExecutionPlan::Dispatch {
+    TaskExecutionPlan::Dispatch {
         target: TaskExecutionTarget {
             mission_id: chain.mission_id.clone(),
             root_task_id: chain.root_task_id.clone(),
@@ -298,7 +298,7 @@ fn branch_checkpoint_cursor(
 }
 
 fn sync_branch_checkpoint_to_worker_runtime(state: &ApiState, branch: &ActiveExecutionBranch) {
-    let Some(pipeline) = state.shadow_execution_pipeline() else {
+    let Some(pipeline) = state.execution_pipeline() else {
         return;
     };
     pipeline
@@ -399,8 +399,8 @@ fn apply_chain_recovery_if_needed(
 
     let writebacks = ExecutionWritebackPlans::from_continue_checkpoint_input(&input);
     if !writebacks.is_empty() {
-        let pipeline = state.shadow_execution_pipeline().ok_or_else(|| {
-            ApiError::internal_assembly("继续会话失败", "shadow execution pipeline 未配置")
+        let pipeline = state.execution_pipeline().ok_or_else(|| {
+            ApiError::internal_assembly("继续会话失败", "execution pipeline 未配置")
         })?;
         writebacks.apply(&pipeline.memory_store);
     }
@@ -428,7 +428,7 @@ fn apply_chain_recovery_if_needed(
     Ok(())
 }
 
-pub(crate) fn continue_shadow_execution_chain(
+pub(crate) fn continue_execution_chain(
     state: &ApiState,
     session_id: &SessionId,
     requested_worker_ids: &[WorkerId],
@@ -563,7 +563,7 @@ pub(crate) fn continue_shadow_execution_chain(
     }
 
     for branch in &branches_to_resume {
-        state.shadow_task_execution_registry().insert(
+        state.task_execution_registry().insert(
             branch.task_id.clone(),
             rebuild_dispatch_plan_for_branch(&chain, branch),
         );

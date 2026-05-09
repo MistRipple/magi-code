@@ -25,7 +25,7 @@ mod loop_controller;
 mod reporting;
 mod runtime_queries;
 pub use executor::{
-    DeterministicWorkerExecutor, ShadowWorkerExecutor, WorkerExecutionProgress,
+    DeterministicWorkerExecutor, WorkerExecutor, WorkerExecutionProgress,
     WorkerExecutionTrace, WorkerExecutorFailureDetail, WorkerExecutorKind, WorkerExecutorProbe,
 };
 pub use executor_observation::{WorkerExecutorObservation, WorkerExecutorObservationStatus};
@@ -42,7 +42,7 @@ pub use local_process_executor::{
     WorkerExecutionParallelismScope, WorkerExecutionProcessLifecycle, WorkerExecutionProfile,
     WorkerExecutionReusePolicy, WorkerExecutorFailure, WorkerExecutorFailureLayer,
     execute_intent_step_with_drivers, execute_intent_with_drivers,
-    execute_intent_with_shadow_drivers, run_local_worker_executor_stdio,
+    execute_intent_with_loopback_drivers, run_local_worker_executor_stdio,
 };
 pub(crate) use reporting::derive_final_report;
 pub use reporting::{
@@ -429,7 +429,7 @@ pub struct WorkerRuntime {
     branch_snapshot_observer: Arc<RwLock<Option<WorkerBranchSnapshotObserver>>>,
     durable_snapshot_version: Arc<AtomicU64>,
     flushed_durable_snapshot_version: Arc<AtomicU64>,
-    executor: Arc<dyn ShadowWorkerExecutor>,
+    executor: Arc<dyn WorkerExecutor>,
 }
 
 impl WorkerRuntime {
@@ -490,7 +490,7 @@ impl WorkerRuntime {
         }
     }
 
-    pub fn with_executor(mut self, executor: Arc<dyn ShadowWorkerExecutor>) -> Self {
+    pub fn with_executor(mut self, executor: Arc<dyn WorkerExecutor>) -> Self {
         self.executor = executor;
         self
     }

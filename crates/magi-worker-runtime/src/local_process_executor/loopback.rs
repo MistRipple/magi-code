@@ -24,7 +24,7 @@ use magi_tool_runtime::ToolRegistry;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-pub fn execute_intent_with_shadow_drivers(intent: &WorkerExecutionIntent) -> WorkerExecutionTrace {
+pub fn execute_intent_with_loopback_drivers(intent: &WorkerExecutionIntent) -> WorkerExecutionTrace {
     let event_bus = Arc::new(InMemoryEventBus::new(64));
     let governance = Arc::new(GovernanceService::default());
     let mut tool_registry = ToolRegistry::new(governance, event_bus);
@@ -34,7 +34,7 @@ pub fn execute_intent_with_shadow_drivers(intent: &WorkerExecutionIntent) -> Wor
     execute_intent_with_drivers(intent, &tool_registry, &skill_dispatch_runtime)
 }
 
-pub fn execute_intent_step_with_shadow_drivers(
+pub fn execute_intent_step_with_loopback_drivers(
     intent: &WorkerExecutionIntent,
     step_index: usize,
 ) -> Result<(WorkerExecutionTrace, WorkerExecutionCheckpointCursor, bool), WorkerExecutorFailure> {
@@ -285,7 +285,7 @@ pub(super) fn loopback_capability() -> LocalProcessExecutorCapability {
         .trim()
         .to_ascii_lowercase();
         match process_model.as_str() {
-            "shadow-loopback" | "shadow" => LocalProcessExecutorProcessModel::ShadowLoopback,
+            "loopback" => LocalProcessExecutorProcessModel::Loopback,
             "persistent-process" | "persistent" => {
                 LocalProcessExecutorProcessModel::PersistentProcess
             }
@@ -295,7 +295,7 @@ pub(super) fn loopback_capability() -> LocalProcessExecutorCapability {
     let default_reuse_scope = match process_model {
         LocalProcessExecutorProcessModel::PersistentProcess => WorkerExecutionBindingScope::Session,
         LocalProcessExecutorProcessModel::OneShotSubprocess
-        | LocalProcessExecutorProcessModel::ShadowLoopback => WorkerExecutionBindingScope::None,
+        | LocalProcessExecutorProcessModel::Loopback => WorkerExecutionBindingScope::None,
     };
     let reuse_scope = {
         let value = LocalProcessWorkerExecutor::env_string(
@@ -325,7 +325,7 @@ pub(super) fn loopback_capability() -> LocalProcessExecutorCapability {
     };
     let executor_id = LocalProcessWorkerExecutor::env_string(
         "MAGI_LOCAL_WORKER_EXECUTOR_ID",
-        "shadow-local-process-worker-executor",
+        "local-process-worker-executor",
     );
     let executor_instance_id = std::env::var("MAGI_LOCAL_WORKER_INSTANCE_ID")
         .ok()
@@ -345,7 +345,7 @@ pub(super) fn loopback_capability() -> LocalProcessExecutorCapability {
         executor_id,
         executor_version: LocalProcessWorkerExecutor::env_string(
             "MAGI_LOCAL_WORKER_EXECUTOR_VERSION",
-            "worker-shadow-local-process-executor-v2",
+            "worker-local-process-executor-v2",
         ),
         execution_mode: {
             let execution_mode = LocalProcessWorkerExecutor::env_string(
@@ -355,7 +355,7 @@ pub(super) fn loopback_capability() -> LocalProcessExecutorCapability {
             .trim()
             .to_ascii_lowercase();
             match execution_mode.as_str() {
-                "shadow-loopback" | "shadow" => WorkerExecutionMode::ShadowLoopback,
+                "loopback" => WorkerExecutionMode::Loopback,
                 _ => WorkerExecutionMode::LocalProcess,
             }
         },
@@ -539,7 +539,7 @@ pub fn run_local_worker_executor_stdio() -> Result<(), String> {
                     .as_ref()
                     .map(|cursor| cursor.next_step_index)
                     .unwrap_or(0);
-                let executed = execute_intent_step_with_shadow_drivers(&execute.intent, step_index);
+                let executed = execute_intent_step_with_loopback_drivers(&execute.intent, step_index);
                 let (trace, checkpoint_cursor, completed) = match executed {
                     Ok(result) => result,
                     Err(error) => {
@@ -590,7 +590,7 @@ pub fn run_local_worker_executor_stdio() -> Result<(), String> {
                     kind: LocalProcessProtocolResponseKind::Error(error),
                 }
             } else {
-                let trace = execute_intent_with_shadow_drivers(&review.intent);
+                let trace = execute_intent_with_loopback_drivers(&review.intent);
                 let review_summary = trace.final_report.summary.clone();
                 LocalProcessProtocolResponse {
                     request_id: request.request_id,
@@ -632,7 +632,7 @@ pub fn run_local_worker_executor_stdio() -> Result<(), String> {
                     kind: LocalProcessProtocolResponseKind::Error(error),
                 }
             } else {
-                let trace = execute_intent_with_shadow_drivers(&verify.intent);
+                let trace = execute_intent_with_loopback_drivers(&verify.intent);
                 let verification_status = trace.final_report.verification_status;
                 let verify_summary = trace.final_report.summary.clone();
                 LocalProcessProtocolResponse {
@@ -676,7 +676,7 @@ pub fn run_local_worker_executor_stdio() -> Result<(), String> {
                     kind: LocalProcessProtocolResponseKind::Error(error),
                 }
             } else {
-                let trace = execute_intent_with_shadow_drivers(&repair.intent);
+                let trace = execute_intent_with_loopback_drivers(&repair.intent);
                 let repair_summary = format!(
                     "repair for: {} — {}",
                     repair.repair_reason, trace.final_report.summary

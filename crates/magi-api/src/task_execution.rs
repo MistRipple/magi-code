@@ -13,11 +13,11 @@ use crate::{
         publish_session_turn_item_event, session_turn_item,
     },
     settings_store::SettingsStore,
-    shadow_execution::{
-        ShadowTaskGraphSubmission, cleanup_shadow_task_tree, run_shadow_dispatch_submission,
+    dispatch_execution::{
+        TaskGraphSubmission, cleanup_task_tree, run_dispatch_submission,
     },
     skill_apply_tool::{SKILL_APPLY_TOOL_NAME, skill_apply_tool_definition},
-    state::{ApiState, ShadowExecutionPipeline},
+    state::{ApiState, ExecutionPipeline},
     usage_recording::{ModelUsageBinding, model_usage_binding_for_worker},
 };
 use magi_bridge_client::{ChatToolDefinition, ModelBridgeClient};
@@ -45,7 +45,7 @@ use std::{
 };
 
 #[derive(Clone, Debug)]
-pub enum ShadowTaskExecutionPlan {
+pub enum TaskExecutionPlan {
     Dispatch {
         target: TaskExecutionTarget,
         worker_id: WorkerId,
@@ -61,7 +61,7 @@ pub enum ShadowTaskExecutionPlan {
     },
 }
 
-pub struct ShadowGraphDriveResult {
+pub struct TaskGraphDriveResult {
     pub runner_started: bool,
 }
 
@@ -795,32 +795,32 @@ fn runner_status_for_terminal_task(status: TaskStatus) -> Option<&'static str> {
 }
 
 #[derive(Clone, Default)]
-pub struct ShadowTaskExecutionRegistry {
-    plans: Arc<RwLock<HashMap<TaskId, ShadowTaskExecutionPlan>>>,
+pub struct TaskExecutionRegistry {
+    plans: Arc<RwLock<HashMap<TaskId, TaskExecutionPlan>>>,
 }
 
-impl ShadowTaskExecutionRegistry {
-    pub fn insert(&self, task_id: TaskId, plan: ShadowTaskExecutionPlan) {
+impl TaskExecutionRegistry {
+    pub fn insert(&self, task_id: TaskId, plan: TaskExecutionPlan) {
         self.plans
             .write()
-            .expect("shadow task execution registry write lock poisoned")
+            .expect("task execution registry write lock poisoned")
             .insert(task_id, plan);
     }
 
-    pub fn remove(&self, task_id: &TaskId) -> Option<ShadowTaskExecutionPlan> {
+    pub fn remove(&self, task_id: &TaskId) -> Option<TaskExecutionPlan> {
         self.plans
             .write()
-            .expect("shadow task execution registry write lock poisoned")
+            .expect("task execution registry write lock poisoned")
             .remove(task_id)
     }
 }
 
 #[derive(Clone)]
-pub struct ShadowTaskDispatcher {
+pub struct LlmTaskDispatcher {
     event_bus: Arc<InMemoryEventBus>,
-    pipeline: ShadowExecutionPipeline,
+    pipeline: ExecutionPipeline,
     session_store: Arc<SessionStore>,
-    execution_registry: ShadowTaskExecutionRegistry,
+    execution_registry: TaskExecutionRegistry,
     result_receiver: Arc<EventBasedResultReceiver>,
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
     knowledge_store: Option<Arc<KnowledgeStore>>,
@@ -848,12 +848,12 @@ pub fn resolve_configured_model_client(
     fallback
 }
 
-impl ShadowTaskDispatcher {
+impl LlmTaskDispatcher {
     pub fn new(
         event_bus: Arc<InMemoryEventBus>,
-        pipeline: ShadowExecutionPipeline,
+        pipeline: ExecutionPipeline,
         session_store: Arc<SessionStore>,
-        execution_registry: ShadowTaskExecutionRegistry,
+        execution_registry: TaskExecutionRegistry,
         result_receiver: Arc<EventBasedResultReceiver>,
     ) -> Self {
         Self {
@@ -1525,7 +1525,7 @@ impl ShadowTaskDispatcher {
                 task_id = %task.task_id,
                 mission_id = %task.mission_id,
                 worker_id = %worker.worker_id,
-                "shadow task dispatch missing execution plan"
+                "task dispatch missing execution plan"
             );
             self.push_result(
                 &task.task_id,
@@ -1536,7 +1536,7 @@ impl ShadowTaskDispatcher {
         };
 
         match plan {
-            ShadowTaskExecutionPlan::Dispatch {
+            TaskExecutionPlan::Dispatch {
                 target: _,
                 worker_id,
                 lane_id,
@@ -1696,7 +1696,7 @@ mod tests {
     fn task_execution_dispatcher_for_prompt_tests(
         task_store: Arc<TaskStore>,
         context_runtime: Option<Arc<ContextRuntime>>,
-    ) -> ShadowTaskDispatcher {
+    ) -> LlmTaskDispatcher {
         let event_bus = Arc::new(InMemoryEventBus::new(64));
         let governance = Arc::new(GovernanceService::default());
         let orchestrator = magi_orchestrator::OrchestratorService::new(Arc::clone(&event_bus));
@@ -1712,15 +1712,15 @@ mod tests {
                 ),
             )
             .with_task_store(task_store);
-        let dispatcher = ShadowTaskDispatcher::new(
+        let dispatcher = LlmTaskDispatcher::new(
             event_bus,
-            ShadowExecutionPipeline {
+            ExecutionPipeline {
                 orchestrator,
                 execution_runtime,
                 memory_store: magi_memory_store::MemoryStore::new(),
             },
             Arc::new(SessionStore::new()),
-            ShadowTaskExecutionRegistry::default(),
+            TaskExecutionRegistry::default(),
             Arc::new(EventBasedResultReceiver::new()),
         );
         if let Some(runtime) = context_runtime {
@@ -2538,7 +2538,7 @@ mod tests {
     }
 }
 
-impl TaskDispatcher for ShadowTaskDispatcher {
+impl TaskDispatcher for LlmTaskDispatcher {
     fn dispatch(
         &self,
         task: &magi_core::Task,
@@ -2587,15 +2587,15 @@ impl TaskDispatcher for ShadowTaskDispatcher {
     }
 }
 
-fn submit_shadow_task_submission(
+fn submit_task_submission(
     state: &ApiState,
     request: DispatchSubmissionRequest,
 ) -> Result<DispatchSubmissionAccepted, ApiError> {
     state
         .session_store
         .ensure_current_turn_acceptance_available(&request.session_id)
-        .map_err(map_shadow_dispatch_store_error)?;
-    let graph = run_shadow_dispatch_submission(state, &request)?;
+        .map_err(map_dispatch_store_error)?;
+    let graph = run_dispatch_submission(state, &request)?;
     if let Some(active_execution_chain) = graph.active_execution_chain.clone() {
         let accept_result = state
             .session_store
@@ -2608,8 +2608,8 @@ fn submit_shadow_task_submission(
                 active_execution_chain,
             );
         if let Err(error) = accept_result {
-            cleanup_rejected_shadow_dispatch(state, &graph);
-            return Err(map_shadow_dispatch_store_error(error));
+            cleanup_rejected_dispatch(state, &graph);
+            return Err(map_dispatch_store_error(error));
         }
     }
 
@@ -2624,47 +2624,47 @@ fn submit_shadow_task_submission(
     })
 }
 
-fn cleanup_rejected_shadow_dispatch(state: &ApiState, graph: &ShadowTaskGraphSubmission) {
+fn cleanup_rejected_dispatch(state: &ApiState, graph: &TaskGraphSubmission) {
     if let Some(chain) = graph.active_execution_chain.as_ref() {
-        let registry = state.shadow_task_execution_registry();
+        let registry = state.task_execution_registry();
         for branch in &chain.branches {
             let _ = registry.remove(&branch.task_id);
         }
     }
     if let Some(task_store) = state.task_store() {
-        cleanup_shadow_task_tree(task_store, &graph.root_task_id);
+        cleanup_task_tree(task_store, &graph.root_task_id);
     }
 }
 
-fn map_shadow_dispatch_store_error(error: DomainError) -> ApiError {
+fn map_dispatch_store_error(error: DomainError) -> ApiError {
     match error {
         DomainError::InvalidState { message } if message.contains("active current_turn") => {
-            ApiError::conflict("执行 shadow dispatch 失败", &message)
+            ApiError::conflict("任务派发失败", &message)
         }
-        other => ApiError::internal_assembly("执行 shadow dispatch 失败", other),
+        other => ApiError::internal_assembly("任务派发失败", other),
     }
 }
 
-pub fn submit_shadow_dispatch_submission(
+pub fn submit_dispatch_submission(
     state: &ApiState,
     request: DispatchSubmissionRequest,
 ) -> Result<DispatchSubmissionAccepted, ApiError> {
-    submit_shadow_task_submission(state, request)
+    submit_task_submission(state, request)
 }
 
-pub fn drive_shadow_dispatch_submission(
+pub fn drive_dispatch_submission(
     state: &ApiState,
     accepted: &mut DispatchSubmissionAccepted,
 ) -> Result<(), ApiError> {
     let manager = state.runner_manager().ok_or_else(|| {
-        ApiError::internal_assembly("执行 shadow dispatch 失败", "runner_manager 未配置")
+        ApiError::internal_assembly("任务派发失败", "runner_manager 未配置")
     })?;
     let task_store = state.task_store().ok_or_else(|| {
-        ApiError::internal_assembly("执行 shadow dispatch 失败", "task_store 未配置")
+        ApiError::internal_assembly("任务派发失败", "task_store 未配置")
     })?;
 
     let root_task = task_store.get_task(&accepted.root_task_id).ok_or_else(|| {
-        ApiError::internal_assembly("执行 shadow dispatch 失败", "root task 不存在")
+        ApiError::internal_assembly("任务派发失败", "root task 不存在")
     })?;
     let background_allowed = root_task
         .policy_snapshot
@@ -2682,28 +2682,28 @@ pub fn drive_shadow_dispatch_submission(
                 Ok(())
             }
             Err(RunnerStartError::NotFound) => Err(ApiError::internal_assembly(
-                "执行 shadow dispatch 失败",
+                "任务派发失败",
                 "root task 不存在",
             )),
         }
     } else {
-        let execution = drive_shadow_task_graph(
+        let execution = drive_task_graph(
             state,
             &accepted.root_task_id,
             &accepted.action_task_id,
-            "执行 shadow dispatch 失败",
+            "任务派发失败",
         )?;
         accepted.runner_started = execution.runner_started;
         Ok(())
     }
 }
 
-pub fn drive_shadow_task_graph(
+pub fn drive_task_graph(
     state: &ApiState,
     root_task_id: &TaskId,
     action_task_id: &TaskId,
     failure_title: &'static str,
-) -> Result<ShadowGraphDriveResult, ApiError> {
+) -> Result<TaskGraphDriveResult, ApiError> {
     // 普通模式使用同步 for 循环，要求 dispatch 同步完成，否则结果来不及被收集。
     if let Some(dispatcher) = state.session_turn_dispatcher() {
         dispatcher.set_force_sync_dispatch(true);
@@ -2758,7 +2758,7 @@ pub fn drive_shadow_task_graph(
             ));
         }
 
-        Ok(ShadowGraphDriveResult {
+        Ok(TaskGraphDriveResult {
             runner_started: executed,
         })
     })();

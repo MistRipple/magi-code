@@ -9,7 +9,7 @@ use serde::Deserialize;
 use super::session_scope::{parse_session_id, session_workspace_id};
 use crate::{
     errors::ApiError,
-    shadow_execution::{
+    dispatch_execution::{
         ensure_session_active_execution_chain, replace_replanned_task_execution_branches,
         replan_deep_task_graph,
     },

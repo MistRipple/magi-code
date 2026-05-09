@@ -13,8 +13,8 @@ use crate::{
     session_turn_writeback::publish_current_session_turn_item_event,
     state::ApiState,
     task_execution::{
-        DispatchSubmissionAccepted, DispatchSubmissionRequest, drive_shadow_dispatch_submission,
-        submit_shadow_dispatch_submission,
+        DispatchSubmissionAccepted, DispatchSubmissionRequest, drive_dispatch_submission,
+        submit_dispatch_submission,
     },
 };
 
@@ -99,7 +99,7 @@ fn execute_dispatch_submission(
         user_message_id: request.user_message_id(),
         placeholder_message_id: request.placeholder_message_id(),
     };
-    let accepted = submit_shadow_dispatch_submission(state, dispatch)?;
+    let accepted = submit_dispatch_submission(state, dispatch)?;
     publish_session_user_message_event(
         state,
         &session_id,
@@ -117,7 +117,7 @@ pub(super) fn finalize_session_task_dispatch(
     accepted: DispatchSubmissionAccepted,
 ) {
     let mut accepted = accepted;
-    if let Err(error) = drive_shadow_dispatch_submission(&state, &mut accepted) {
+    if let Err(error) = drive_dispatch_submission(&state, &mut accepted) {
         tracing::error!(
             session_id = %accepted.session_id,
             root_task_id = %accepted.root_task_id,

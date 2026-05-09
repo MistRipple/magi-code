@@ -5,7 +5,7 @@ use magi_daemon::{Daemon, DaemonConfig};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 38123;
-const DEFAULT_SERVICE_NAME: &str = "magi-shadow-rust-backend";
+const DEFAULT_SERVICE_NAME: &str = "magi-rust-backend";
 
 fn default_state_root() -> PathBuf {
     dirs::home_dir()

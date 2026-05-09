@@ -3,21 +3,21 @@ use magi_session_store::SessionStore;
 use magi_workspace::WorkspaceStore;
 use std::path::Path;
 
-pub(super) fn bootstrap_shadow_state(
+pub(super) fn bootstrap_state(
     session_store: &SessionStore,
     workspace_registry: &WorkspaceStore,
     bootstrap_workspace_root: &Path,
     bootstrap_worktree_root: &Path,
 ) {
-    let bootstrap_session_id = SessionId::new("shadow-session-001");
-    let bootstrap_workspace_id = WorkspaceId::new("shadow-workspace-001");
+    let bootstrap_session_id = SessionId::new("test-session-001");
+    let bootstrap_workspace_id = WorkspaceId::new("test-workspace-001");
     if session_store.is_empty() {
         session_store
             .create_session(bootstrap_session_id.clone(), "Rust 影子后端初始化会话")
             .expect("bootstrap session should be creatable");
         session_store.append_notification(
             bootstrap_session_id.clone(),
-            "notification-shadow-bootstrap",
+            "notification-bootstrap",
             "system.bootstrap",
             "Rust 影子后端已完成初始引导",
         );
@@ -30,7 +30,7 @@ pub(super) fn bootstrap_shadow_state(
         let ownership = ExecutionOwnership {
             session_id: Some(session_id.clone()),
             workspace_id: Some(bootstrap_workspace_id.clone()),
-            execution_chain_ref: Some("shadow-execution-chain-001".to_string()),
+            execution_chain_ref: Some("test-execution-chain-001".to_string()),
             ..ExecutionOwnership::default()
         };
         workspace_registry
@@ -75,12 +75,12 @@ pub(super) fn bootstrap_shadow_state(
             }
         }
         let snapshot = workspace_registry
-            .resolve_snapshot("snapshot-shadow-bootstrap")
+            .resolve_snapshot("snapshot-bootstrap")
             .unwrap_or_else(|| {
                 workspace_registry.append_execution_snapshot(
                     bootstrap_workspace_id.clone(),
                     ownership.clone(),
-                    "snapshot-shadow-bootstrap",
+                    "snapshot-bootstrap",
                     "初始工作区快照",
                 )
             });
@@ -88,7 +88,7 @@ pub(super) fn bootstrap_shadow_state(
             bootstrap_workspace_id.clone(),
             ownership.clone(),
             snapshot.snapshot_id,
-            "recovery-shadow-bootstrap",
+            "recovery-bootstrap",
             Some("初始影子恢复入口".to_string()),
         );
         session_store.bind_execution_ownership(session_id.clone(), ownership);
@@ -124,7 +124,7 @@ fn ensure_bootstrap_workspace_session_binding(
     let ownership = ExecutionOwnership {
         session_id: Some(session_id.clone()),
         workspace_id: Some(workspace_id.clone()),
-        execution_chain_ref: Some("shadow-execution-chain-001".to_string()),
+        execution_chain_ref: Some("test-execution-chain-001".to_string()),
         ..ExecutionOwnership::default()
     };
     session_store.bind_execution_ownership(session_id.clone(), ownership);
@@ -143,14 +143,14 @@ mod tests {
             .expect("existing session should be creatable");
         let workspace_store = WorkspaceStore::new();
 
-        bootstrap_shadow_state(
+        bootstrap_state(
             &session_store,
             &workspace_store,
             Path::new("/tmp/magi-bootstrap-workspace"),
             Path::new("/tmp/magi-bootstrap-worktree"),
         );
 
-        let scoped_sessions = session_store.sessions_for_workspace("shadow-workspace-001");
+        let scoped_sessions = session_store.sessions_for_workspace("test-workspace-001");
         assert_eq!(scoped_sessions.len(), 1);
         assert_eq!(scoped_sessions[0].session_id, session_id);
         let sidecar = session_store
@@ -162,7 +162,7 @@ mod tests {
                 .workspace_id
                 .as_ref()
                 .map(|id| id.as_str()),
-            Some("shadow-workspace-001")
+            Some("test-workspace-001")
         );
     }
 
@@ -176,19 +176,19 @@ mod tests {
         let workspace_store = WorkspaceStore::new();
         workspace_store
             .register(
-                WorkspaceId::new("shadow-workspace-001"),
+                WorkspaceId::new("test-workspace-001"),
                 AbsolutePath::new("/tmp/magi-bootstrap-workspace"),
             )
             .expect("bootstrap workspace should be registrable");
 
-        bootstrap_shadow_state(
+        bootstrap_state(
             &session_store,
             &workspace_store,
             Path::new("/tmp/magi-bootstrap-workspace"),
             Path::new("/tmp/magi-bootstrap-worktree"),
         );
 
-        let scoped_sessions = session_store.sessions_for_workspace("shadow-workspace-001");
+        let scoped_sessions = session_store.sessions_for_workspace("test-workspace-001");
         assert_eq!(scoped_sessions.len(), 1);
         assert_eq!(scoped_sessions[0].session_id, session_id);
         let sidecar = session_store
@@ -200,7 +200,7 @@ mod tests {
                 .workspace_id
                 .as_ref()
                 .map(|id| id.as_str()),
-            Some("shadow-workspace-001")
+            Some("test-workspace-001")
         );
     }
 }

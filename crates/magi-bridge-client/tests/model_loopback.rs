@@ -1,7 +1,7 @@
 use magi_bridge_client::{
     BridgeServerKind, BridgeTransport, BridgeTransportError, BridgeTransportRequest,
     JsonRpcBridgeServerProbeClient, JsonRpcModelBridgeClient, JsonRpcStdioTransport,
-    ModelBridgeClient, ModelInvocationRequest, SHADOW_MODEL_PROVIDER,
+    ModelBridgeClient, ModelInvocationRequest, LOOPBACK_MODEL_PROVIDER,
 };
 use serde_json::{Value, json};
 use std::{
@@ -132,7 +132,7 @@ fn model_client_round_trips_through_loopback_server() {
 
     let response = client
         .invoke(ModelInvocationRequest {
-            provider: SHADOW_MODEL_PROVIDER.to_string(),
+            provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: "hello".to_string(),
             messages: None,
             tools: None,
@@ -141,7 +141,7 @@ fn model_client_round_trips_through_loopback_server() {
         .expect("loopback model invoke should succeed");
 
     assert!(response.ok);
-    assert_eq!(response.payload, "shadow-model::hello");
+    assert_eq!(response.payload, "loopback-model::hello");
 }
 
 #[test]
@@ -593,7 +593,7 @@ fn model_loopback_exposes_shared_handshake_and_health() {
         catalog
             .services
             .iter()
-            .any(|service| service.service_name == SHADOW_MODEL_PROVIDER)
+            .any(|service| service.service_name == LOOPBACK_MODEL_PROVIDER)
     );
     assert!(
         catalog
@@ -615,7 +615,7 @@ fn unsupported_method_returns_protocol_error() {
         .call(BridgeTransportRequest {
             method: "model.not_supported".to_string(),
             params: json!({
-                "provider": SHADOW_MODEL_PROVIDER,
+                "provider": LOOPBACK_MODEL_PROVIDER,
                 "prompt": "hello"
             }),
         })
@@ -653,7 +653,7 @@ fn empty_prompt_returns_remote_business_error() {
         .call(BridgeTransportRequest {
             method: "model.invoke".to_string(),
             params: json!({
-                "provider": SHADOW_MODEL_PROVIDER,
+                "provider": LOOPBACK_MODEL_PROVIDER,
                 "prompt": "   "
             }),
         })
@@ -677,7 +677,7 @@ fn broken_subprocess_returns_transport_error() {
         .call(BridgeTransportRequest {
             method: "model.invoke".to_string(),
             params: json!({
-                "provider": SHADOW_MODEL_PROVIDER,
+                "provider": LOOPBACK_MODEL_PROVIDER,
                 "prompt": "hello"
             }),
         })

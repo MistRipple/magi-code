@@ -6,7 +6,7 @@ use axum::{
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-use magi_bridge_client::{ModelInvocationRequest, SHADOW_MODEL_PROVIDER};
+use magi_bridge_client::{ModelInvocationRequest, LOOPBACK_MODEL_PROVIDER};
 
 use super::session_scope::parse_session_id;
 use crate::{
@@ -529,7 +529,7 @@ async fn enhance_prompt(
     };
 
     let invocation = ModelInvocationRequest {
-        provider: SHADOW_MODEL_PROVIDER.to_string(),
+        provider: LOOPBACK_MODEL_PROVIDER.to_string(),
         prompt: format!(
             "请优化以下用户 prompt，使其更清晰、具体、可执行。只输出优化后的 prompt，不要添加额外解释。\n\n原始 prompt:\n{}",
             request.prompt

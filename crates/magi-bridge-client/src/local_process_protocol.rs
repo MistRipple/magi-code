@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::io::{self, BufRead, BufReader, Write};
 use thiserror::Error;
 
-pub const LOCAL_BRIDGE_PROTOCOL_VERSION: &str = "shadow-local-bridge-v1";
+pub const LOCAL_BRIDGE_PROTOCOL_VERSION: &str = "local-bridge-v1";
 pub const LOCAL_BRIDGE_HANDSHAKE_METHOD: &str = "bridge.handshake";
 pub const LOCAL_BRIDGE_HEALTH_METHOD: &str = "bridge.health";
 pub const LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD: &str = "bridge.describe_services";

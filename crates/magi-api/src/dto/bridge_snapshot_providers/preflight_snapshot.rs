@@ -3,7 +3,7 @@ use magi_bridge_client::{
     HostBridgeCommand, HostBridgeRequest, HostKind, JsonRpcBridgeServerProbeClient,
     JsonRpcHostBridgeClient, JsonRpcMcpBridgeClient, JsonRpcMcpManagerClient,
     JsonRpcModelBridgeClient, McpBridgeClient, McpToolCallRequest, ModelBridgeClient,
-    ModelInvocationRequest, SHADOW_MCP_SERVER_NAME, SHADOW_MCP_TOOL_NAME, SHADOW_MODEL_PROVIDER,
+    ModelInvocationRequest, LOOPBACK_MCP_SERVER_NAME, LOOPBACK_MCP_TOOL_NAME, LOOPBACK_MODEL_PROVIDER,
 };
 use std::sync::Arc;
 
@@ -79,9 +79,9 @@ fn capture_model_preflight_checks(
     let client = JsonRpcModelBridgeClient::new(transport);
     let mut checks = vec![bridge_response_check(
         "invoke",
-        SHADOW_MODEL_PROVIDER,
+        LOOPBACK_MODEL_PROVIDER,
         client.invoke(ModelInvocationRequest {
-            provider: SHADOW_MODEL_PROVIDER.to_string(),
+            provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: "bridge preflight ping".to_string(),
             messages: None,
             tools: None,
@@ -119,7 +119,7 @@ fn capture_mcp_preflight_checks(
     vec![
         summary_check(
             "list_servers",
-            "shadow-mcp-manager",
+            "loopback-mcp-manager",
             manager.list_servers().map(|response| {
                 format!(
                     "servers:{} default_route:{}->{}",
@@ -131,10 +131,10 @@ fn capture_mcp_preflight_checks(
         ),
         bridge_response_check(
             "call_tool",
-            format!("{SHADOW_MCP_SERVER_NAME}.{SHADOW_MCP_TOOL_NAME}"),
+            format!("{LOOPBACK_MCP_SERVER_NAME}.{LOOPBACK_MCP_TOOL_NAME}"),
             client.call_tool(McpToolCallRequest {
-                server_name: SHADOW_MCP_SERVER_NAME.to_string(),
-                tool_name: SHADOW_MCP_TOOL_NAME.to_string(),
+                server_name: LOOPBACK_MCP_SERVER_NAME.to_string(),
+                tool_name: LOOPBACK_MCP_TOOL_NAME.to_string(),
                 input: String::new(),
             }),
         ),
