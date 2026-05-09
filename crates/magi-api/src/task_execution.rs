@@ -471,8 +471,8 @@ fn root_completion_outputs(task_store: &TaskStore, root_task: &Task) -> Vec<Stri
 
 fn format_root_completion_summary(outputs: &[String]) -> String {
     match outputs {
-        [] => "我这轮已经处理完，详细步骤和工具记录已保留在任务卡里。".to_string(),
-        [only] => format!("我这轮已经处理完：{only}\n\n详细步骤和工具记录已保留在任务卡里。"),
+        [] => "已完成。详细步骤和工具记录已保留在任务卡里。".to_string(),
+        [only] => format!("已完成：{only}\n\n详细步骤和工具记录已保留在任务卡里。"),
         many => {
             let bullets = many
                 .iter()
@@ -488,7 +488,7 @@ fn format_root_completion_summary(outputs: &[String]) -> String {
                 .collect::<Vec<_>>()
                 .join("\n");
             format!(
-                "我这轮已经处理完，关键结果是：\n\n{bullets}\n\n详细步骤和工具记录已保留在任务卡里。"
+                "已完成，关键结果是：\n\n{bullets}\n\n详细步骤和工具记录已保留在任务卡里。"
             )
         }
     }
@@ -2186,7 +2186,7 @@ mod tests {
             .expect("root 完成后必须追加编排者主线最终回复");
         let final_content = orchestrator_final.content.as_deref().unwrap_or_default();
         assert!(
-            final_content.contains("我这轮已经处理完")
+            final_content.contains("已完成")
                 && final_content.contains("orchestrator-final-marker"),
             "编排者最终回复应像正常对话一样收口任务交付摘要"
         );
@@ -2233,7 +2233,7 @@ mod tests {
 
         let summary = format_root_completion_summary(&outputs);
 
-        assert!(summary.contains("我这轮已经处理完，关键结果是："));
+        assert!(summary.contains("已完成，关键结果是："));
         assert!(summary.contains("- 已验证：已完成第一段任务。"));
         assert!(summary.contains("- 已完成第二段任务。"));
         assert!(summary.contains("- 两个验证命令均已成功执行，输出符合预期。"));

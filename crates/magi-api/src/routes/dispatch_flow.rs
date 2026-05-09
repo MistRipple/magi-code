@@ -23,6 +23,7 @@ pub(super) fn accept_session_task_submission(
     request: &SessionTurnRequestDto,
     task_title: Option<String>,
     execution_goal: Option<String>,
+    deep_task: bool,
 ) -> Result<(DispatchSubmissionAccepted, EventId), ApiError> {
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_message(trimmed_text.as_deref());
@@ -49,7 +50,7 @@ pub(super) fn accept_session_task_submission(
         message,
         trimmed_text,
         execution_goal,
-        request.deep_task,
+        deep_task,
         request.skill_name.clone(),
         None,
         request,
@@ -78,7 +79,7 @@ fn execute_dispatch_submission(
         accepted_at,
     )?;
     let user_timeline_entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
-    let action_task_title = format!("执行: {}", mission_title);
+    let action_task_title = format_action_task_title(&mission_title);
 
     let dispatch = DispatchSubmissionRequest {
         accepted_at,
@@ -134,6 +135,32 @@ pub(super) fn finalize_session_task_dispatch(
             root_task_id = %accepted.root_task_id,
             ?error,
             "session turn task dispatch persist failed"
+        );
+    }
+}
+
+fn format_action_task_title(mission_title: &str) -> String {
+    let title = mission_title.trim();
+    if title.starts_with("执行:") || title.starts_with("执行：") {
+        title.to_string()
+    } else {
+        format!("执行: {title}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_action_task_title;
+
+    #[test]
+    fn action_task_title_does_not_repeat_execute_prefix() {
+        assert_eq!(
+            format_action_task_title("执行: 团队模式检查 README"),
+            "执行: 团队模式检查 README"
+        );
+        assert_eq!(
+            format_action_task_title("团队模式检查 README"),
+            "执行: 团队模式检查 README"
         );
     }
 }
@@ -256,6 +283,14 @@ pub(super) fn append_dispatch_assistant_message(
     state: &ApiState,
     accepted: &DispatchSubmissionAccepted,
 ) {
+    if crate::task_execution::finalize_background_session_task_turn_if_root_completed(
+        state,
+        &accepted.session_id,
+        &accepted.root_task_id,
+    ) {
+        return;
+    }
+
     let Some(task_store) = state.task_store() else {
         return;
     };

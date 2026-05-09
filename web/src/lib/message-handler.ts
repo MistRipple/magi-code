@@ -10,8 +10,6 @@ import type { ClientBridge, ClientBridgeMessage } from '../shared/bridges/client
 import { getClientBridge } from '../shared/bridges/bridge-runtime';
 import {
   getState,
-  markMessageActive,
-  markMessageComplete,
   clearPendingRequest,
   settleProcessingAfterResponseCompletion,
   addToast,
@@ -22,29 +20,15 @@ import {
   addPendingRequest,
   settleProcessingForManualInteraction,
   sealAllStreamingMessages,
-  getTimelineMessageById,
-  upsertTimelineNode,
   messagesState,
 } from '../stores/messages.svelte';
-import type { Message, ContentBlock } from '../types/message';
 import type { StandardMessage, StreamUpdate } from '../shared/protocol/message-protocol';
 import { MessageType, MessageCategory, MessageLifecycle } from '../shared/protocol/message-protocol';
-import { resolveTaskCardWorkerSlot } from './worker-role-utils';
-import { i18n } from '../stores/i18n.svelte';
-import {
-  messageHasRenderableTimelineContent,
-  resolveTimelineWorkerVisibility as resolveSharedTimelineWorkerVisibility,
-} from '../shared/timeline-presentation';
 import {
   handleUnifiedControlMessage,
   handleUnifiedNotify,
   handleUnifiedData,
 } from './data-message-handlers';
-import {
-  mapStandardBlocks,
-  formatPlanBlock,
-} from './message-utils';
-import { resolveTimelineWorkerId } from '../shared/timeline-worker-lifecycle';
 import { resolveStandardMessageSessionBinding } from '../shared/standard-message-session-binding';
 import {
   resolveTimelineCanonicalTurnSeqFromMetadata,
@@ -121,53 +105,6 @@ function isLocalUnifiedTimelineContent(standard: StandardMessage): boolean {
   }
   return metadata.isPlaceholder === true || metadata.wasPlaceholder === true;
 }
-
-function resolveLaneWorkerSlot(standard: StandardMessage): string | null {
-  const metadata = standard.metadata as Record<string, unknown> | undefined;
-  if (standard.type === MessageType.USER_INPUT) {
-    return resolveTimelineWorkerId(metadata) || null;
-  }
-  if (standard.type === MessageType.TASK_CARD) {
-    return resolveTaskCardWorkerSlot(metadata);
-  }
-  if (standard.type === MessageType.INSTRUCTION) {
-    return resolveTimelineWorkerId(metadata, { fallbacks: [standard.agent] }) || null;
-  }
-  if (standard.source === 'worker') {
-    return resolveTimelineWorkerId(metadata, { fallbacks: [standard.agent, standard.source] }) || null;
-  }
-  return null;
-}
-
-function resolveTimelineVisibilityForStandard(standard: StandardMessage): {
-  thread: boolean;
-  workerTabs?: string[];
-} {
-  const workerSlot = resolveLaneWorkerSlot(standard);
-  const metadata = standard.metadata as Record<string, unknown> | undefined;
-  const visibility = resolveSharedTimelineWorkerVisibility({
-    hasWorker: Boolean(workerSlot),
-    type: standard.type,
-    source: standard.source,
-    blocks: standard.blocks,
-    metadata,
-  });
-  const explicitThreadVisible = typeof metadata?.threadVisible === 'boolean'
-    ? metadata.threadVisible
-    : undefined;
-  const explicitWorkerVisible = typeof metadata?.workerVisible === 'boolean'
-    ? metadata.workerVisible
-    : undefined;
-  const includeWorkerTab = explicitWorkerVisible ?? visibility.includeWorkerTab;
-  return {
-    thread: explicitThreadVisible ?? visibility.threadVisible,
-    workerTabs: includeWorkerTab && workerSlot ? [workerSlot] : undefined,
-  };
-}
-
-
-
-
 
 /**
  * 初始化消息处理器。
@@ -448,16 +385,14 @@ function handleContentMessage(standard: StandardMessage) {
   if (shouldHideFromUser(standard) || !isLocalUnifiedTimelineContent(standard)) {
     return;
   }
-  let uiMessage = mapStandardMessage(standard);
-  const visibility = resolveTimelineVisibilityForStandard(standard);
   const meta = standard.metadata as Record<string, unknown> | undefined;
   const requestId = meta?.requestId as string | undefined;
   const isUserMessage = standard.type === MessageType.USER_INPUT;
   const incomingTurnOrderSeq = resolveTimelineTurnOrderSeqFromMetadata(meta);
   const incomingCanonicalTurnSeq = resolveTimelineCanonicalTurnSeqFromMetadata(meta);
 
-  // === 用户消息 ===
-  // 用户消息在 unifiedMessage 首次到达时立即创建 timeline node 锚点
+  // 本地 CONTENT 只维护 request binding。用户可见内容统一由 canonical turn/projection 渲染，
+  // 这里不再写任何本地可见时间线，避免 local unified 与 canonical 主线形成双事实源。
   if (isUserMessage) {
     if (requestId) {
       const binding = getRequestBinding(requestId);
@@ -473,34 +408,23 @@ function handleContentMessage(standard: StandardMessage) {
         updateRequestBinding(requestId, { userMessageId: standard.id });
       }
       updateRequestBindingTurnFacts(requestId, incomingTurnOrderSeq, incomingCanonicalTurnSeq);
-      uiMessage = applyRequestTurnFacts(uiMessage, getRequestBinding(requestId) || binding);
       addPendingRequest(requestId);
-
-      // 若后端 canonical 消息 id 与前端临时消息 id 不同，替换现有节点而非创建新节点
-      if (binding?.userMessageId && binding.userMessageId !== uiMessage.id) {
-        upsertTimelineNode(uiMessage, visibility, { replaceMessageId: binding.userMessageId });
-        return;
-      }
     }
-    upsertTimelineNode(uiMessage, visibility);
     return;
   }
 
-  // === Assistant 消息 ===
   const requestBinding = requestId ? getRequestBinding(requestId) : undefined;
   if (requestId && requestBinding) {
     updateRequestBindingTurnFacts(requestId, incomingTurnOrderSeq, incomingCanonicalTurnSeq);
   }
-  uiMessage = applyRequestTurnFacts(uiMessage, requestId ? getRequestBinding(requestId) : requestBinding);
-  const isPlaceholderMessage = uiMessage.metadata?.isPlaceholder === true;
-  const placeholderMessageId = typeof uiMessage.metadata?.placeholderMessageId === 'string'
-    ? uiMessage.metadata.placeholderMessageId.trim()
+  const isPlaceholderMessage = meta?.isPlaceholder === true;
+  const placeholderMessageId = typeof meta?.placeholderMessageId === 'string'
+    ? meta.placeholderMessageId.trim()
     : '';
-  const canBindAsAssistantResponse = isAssistantResponsePlaceholderTarget(uiMessage);
   const existingRealMessageId = typeof requestBinding?.realMessageId === 'string'
     ? requestBinding.realMessageId.trim()
     : '';
-  if (isPlaceholderMessage && existingRealMessageId && existingRealMessageId !== uiMessage.id) {
+  if (isPlaceholderMessage && existingRealMessageId && existingRealMessageId !== standard.id) {
     return;
   }
 
@@ -513,36 +437,12 @@ function handleContentMessage(standard: StandardMessage) {
         placeholderMessageId: placeholderMessageId || standard.id,
         timeoutId: undefined,
       });
-    } else if (canBindAsAssistantResponse) {
+    } else {
       updateRequestBinding(requestId, {
         realMessageId: standard.id,
         timeoutId: undefined,
       });
     }
-  }
-
-  const hasExistingTimelineMessage = Boolean(getTimelineMessageById(uiMessage.id));
-  const placeholderReplacementId = !isPlaceholderMessage && canBindAsAssistantResponse
-    ? resolvePlaceholderReplacementId(requestBinding, uiMessage.id)
-    : undefined;
-  if (
-    uiMessage.isStreaming
-    || hasRenderableContent(uiMessage)
-    || hasExistingTimelineMessage
-    || Boolean(placeholderReplacementId)
-  ) {
-    upsertTimelineNode(
-      uiMessage,
-      visibility,
-      placeholderReplacementId ? { replaceMessageId: placeholderReplacementId } : {},
-    );
-    if (placeholderReplacementId) {
-      markMessageComplete(placeholderReplacementId);
-    }
-  }
-
-  if (uiMessage.isStreaming) {
-    markMessageActive(uiMessage.id);
   }
 }
 
@@ -574,84 +474,14 @@ function handleStandardComplete(message: ClientBridgeMessage) {
   const incomingTurnOrderSeq = resolveTimelineTurnOrderSeqFromMetadata(meta);
   const incomingCanonicalTurnSeq = resolveTimelineCanonicalTurnSeqFromMetadata(meta);
   const actualMessageId = standard.id;
-  const visibility = resolveTimelineVisibilityForStandard(standard);
   const requestBinding = requestId ? getRequestBinding(requestId) : undefined;
   if (requestId && requestBinding) {
     updateRequestBindingTurnFacts(requestId, incomingTurnOrderSeq, incomingCanonicalTurnSeq);
   }
-  const uiMessage = applyRequestTurnFacts(
-    mapStandardMessage(standard),
-    requestId ? getRequestBinding(requestId) : requestBinding,
-  );
-  const placeholderReplacementId = isAssistantResponsePlaceholderTarget(uiMessage)
-    ? resolvePlaceholderReplacementId(requestBinding, actualMessageId)
-    : undefined;
-  const uiMetadata = uiMessage.metadata && typeof uiMessage.metadata === 'object'
-    ? uiMessage.metadata
-    : {};
-  const authoritativeResponseDurationMs = typeof uiMetadata.responseDurationMs === 'number'
-    ? uiMetadata.responseDurationMs
-    : undefined;
-  const { responseDurationMs: _nonTerminalResponseDurationMs, ...uiMetadataWithoutResponseDuration } = uiMetadata;
-
-  const existingMessage = getTimelineMessageById(actualMessageId)
-    || (placeholderReplacementId ? getTimelineMessageById(placeholderReplacementId) : undefined);
-  if (!existingMessage) {
-    const isTerminalRequestResponse = isRequestTerminalAssistantResponse(uiMessage);
-    markMessageComplete(actualMessageId);
-    if (placeholderReplacementId) {
-      markMessageComplete(placeholderReplacementId);
-    }
-    if (requestId && isTerminalRequestResponse) {
-      finalizeTerminalRequestResponse(requestId, actualMessageId);
-    }
-    settleProcessingAfterResponseCompletion();
-    return;
-  }
-  const completedMessageBase: Message = {
-    ...existingMessage,
-    isStreaming: false,
-    isComplete: true,
-    metadata: {
-      ...(existingMessage.metadata || {}),
-      ...uiMetadata,
-    },
-  };
-  const isTerminalRequestResponse = isRequestTerminalAssistantResponse(completedMessageBase);
-  const completedMetadata = completedMessageBase.metadata || {};
-  const completedMessage = {
-    ...completedMessageBase,
-    metadata: isTerminalRequestResponse
-      ? {
-          ...completedMetadata,
-          ...(typeof authoritativeResponseDurationMs === 'number' ? { responseDurationMs: authoritativeResponseDurationMs } : {}),
-        }
-      : {
-          ...completedMetadata,
-          ...uiMetadataWithoutResponseDuration,
-        },
-  };
-
-  if (
-    hasRenderableContent(completedMessage)
-    || getTimelineMessageById(actualMessageId)
-    || Boolean(placeholderReplacementId)
-  ) {
-    upsertTimelineNode(
-      completedMessage,
-      visibility,
-      placeholderReplacementId ? { replaceMessageId: placeholderReplacementId } : {},
-    );
-    if (placeholderReplacementId) {
-      markMessageComplete(placeholderReplacementId);
-    }
-  }
-
-  markMessageComplete(actualMessageId);
 
   // 只有最终 assistant 回复或 assistant 错误才能结束本轮请求。
-  // 工具卡、思考块和中途 assistant_stream 完成只更新原位节点，不能提前清理 pending 状态。
-  if (requestId && isTerminalRequestResponse) {
+  // 工具卡、思考块和中途 assistant_stream 完成不能提前清理 pending 状态。
+  if (requestId && isTerminalRequestResponseStandard(standard)) {
     finalizeTerminalRequestResponse(requestId, actualMessageId);
   }
   settleProcessingAfterResponseCompletion();
@@ -667,43 +497,6 @@ function isTerminalLifecycle(lifecycle: StandardMessage['lifecycle'] | undefined
   return lifecycle === MessageLifecycle.COMPLETED
     || lifecycle === MessageLifecycle.FAILED
     || lifecycle === MessageLifecycle.CANCELLED;
-}
-
-function isStreamingLifecycle(lifecycle: StandardMessage['lifecycle'] | undefined): boolean {
-  return lifecycle === MessageLifecycle.STREAMING || lifecycle === MessageLifecycle.STARTED;
-}
-
-function resolveBindingTurnOrderSeq(
-  binding: ReturnType<typeof getRequestBinding> | undefined,
-): number {
-  const turnOrderSeq = typeof binding?.turnOrderSeq === 'number' && Number.isFinite(binding.turnOrderSeq)
-    ? Math.floor(binding.turnOrderSeq)
-    : 0;
-  if (turnOrderSeq > 0) {
-    return turnOrderSeq;
-  }
-  const canonicalTurnSeq = typeof binding?.turnSeq === 'number' && Number.isFinite(binding.turnSeq)
-    ? Math.floor(binding.turnSeq)
-    : 0;
-  return canonicalTurnSeq > 0 ? canonicalTurnSeq : 0;
-}
-
-function resolveBindingCanonicalTurnSeq(
-  binding: ReturnType<typeof getRequestBinding> | undefined,
-): number {
-  const canonicalTurnSeq = typeof binding?.turnSeq === 'number' && Number.isFinite(binding.turnSeq)
-    ? Math.floor(binding.turnSeq)
-    : 0;
-  return canonicalTurnSeq > 0 ? canonicalTurnSeq : 0;
-}
-
-function readPositiveMetadataNumber(metadata: Record<string, unknown>, key: string): number {
-  const raw = metadata[key];
-  if (typeof raw !== 'number' || !Number.isFinite(raw)) {
-    return 0;
-  }
-  const normalized = Math.floor(raw);
-  return normalized > 0 ? normalized : 0;
 }
 
 function updateRequestBindingTurnFacts(
@@ -730,87 +523,26 @@ function updateRequestBindingTurnFacts(
   }
 }
 
-function applyRequestTurnFacts(
-  message: Message,
-  binding: ReturnType<typeof getRequestBinding> | undefined,
-): Message {
-  const metadata = message.metadata && typeof message.metadata === 'object'
-    ? message.metadata as Record<string, unknown>
-    : {};
-  const existingTurnOrderSeq = readPositiveMetadataNumber(metadata, 'turnOrderSeq');
-  const existingCanonicalTurnSeq = resolveTimelineCanonicalTurnSeqFromMetadata(metadata);
-  const boundTurnOrderSeq = resolveBindingTurnOrderSeq(binding);
-  const boundCanonicalTurnSeq = resolveBindingCanonicalTurnSeq(binding);
-  if (
-    (existingTurnOrderSeq > 0 || boundTurnOrderSeq <= 0)
-    && (existingCanonicalTurnSeq > 0 || boundCanonicalTurnSeq <= 0)
-  ) {
-    return message;
-  }
-  return {
-    ...message,
-    metadata: {
-      ...metadata,
-      ...(existingTurnOrderSeq <= 0 && boundTurnOrderSeq > 0 ? { turnOrderSeq: boundTurnOrderSeq } : {}),
-      ...(existingCanonicalTurnSeq <= 0 && boundCanonicalTurnSeq > 0 ? { turnSeq: boundCanonicalTurnSeq } : {}),
-    },
-  };
+function resolveStandardTurnItemKind(standard: StandardMessage): string {
+  const metadata = standard.metadata as Record<string, unknown> | undefined;
+  return typeof metadata?.turnItemKind === 'string' ? metadata.turnItemKind.trim() : '';
 }
 
-function resolveTurnItemKind(message: Message): string {
-  return typeof message.metadata?.turnItemKind === 'string'
-    ? message.metadata.turnItemKind.trim()
-    : '';
-}
-
-function isRequestTerminalAssistantResponse(message: Message): boolean {
-  if (
-    message.role !== 'assistant'
-    || message.isStreaming === true
-    || !hasRenderableContent(message)
-  ) {
+function isTerminalRequestResponseStandard(standard: StandardMessage): boolean {
+  if (!isTerminalLifecycle(standard.lifecycle)) {
     return false;
   }
-  const turnItemKind = resolveTurnItemKind(message);
+  const turnItemKind = resolveStandardTurnItemKind(standard);
   if (turnItemKind) {
     return turnItemKind === 'assistant_text'
       || turnItemKind === 'assistant_final'
       || turnItemKind === 'assistant_error';
   }
-  return message.type !== MessageType.TOOL_CALL && message.type !== MessageType.THINKING;
-}
-
-function isAssistantResponsePlaceholderTarget(message: Message): boolean {
-  if (message.metadata?.isPlaceholder === true || message.role !== 'assistant') {
-    return false;
-  }
-  const turnItemKind = resolveTurnItemKind(message);
-  if (turnItemKind) {
-    return turnItemKind === 'assistant_stream'
-      || turnItemKind === 'assistant_text'
-      || turnItemKind === 'assistant_final'
-      || turnItemKind === 'assistant_error';
-  }
-  return message.type !== MessageType.TOOL_CALL && message.type !== MessageType.THINKING;
-}
-
-function resolvePlaceholderReplacementId(
-  requestBinding: ReturnType<typeof getRequestBinding> | undefined,
-  incomingMessageId: string,
-): string | undefined {
-  const placeholderMessageId = typeof requestBinding?.placeholderMessageId === 'string'
-    ? requestBinding.placeholderMessageId.trim()
-    : '';
-  if (!placeholderMessageId || placeholderMessageId === incomingMessageId) {
-    return undefined;
-  }
-  const realMessageId = typeof requestBinding?.realMessageId === 'string'
-    ? requestBinding.realMessageId.trim()
-    : '';
-  if (realMessageId && realMessageId !== placeholderMessageId && realMessageId !== incomingMessageId) {
-    return undefined;
-  }
-  return placeholderMessageId;
+  return standard.type !== MessageType.USER_INPUT
+    && standard.type !== MessageType.TOOL_CALL
+    && standard.type !== MessageType.THINKING
+    && standard.type !== MessageType.TASK_CARD
+    && standard.type !== MessageType.SYSTEM;
 }
 
 function finalizeTerminalRequestResponse(requestId: string, actualMessageId: string): void {
@@ -829,81 +561,4 @@ function finalizeTerminalRequestResponse(requestId: string, actualMessageId: str
     });
     clearRequestBinding(requestId);
   }
-}
-
-function mapStandardMessage(standard: StandardMessage): Message {
-  const blocks = mapStandardBlocks(standard.blocks || []);
-  const content = blocksToContent(blocks);
-  const isStreaming = isStreamingLifecycle(standard.lifecycle);
-  const isComplete = isTerminalLifecycle(standard.lifecycle);
-  const isSystemNotice = standard.type === MessageType.SYSTEM;
-
-  // 区分消息来源与展示来源：
-  // 标准消息 source 为 orchestrator/worker，UI 展示具体 Worker 槽位
-  const originSource = standard.source;
-  const resolvedWorker = resolveLaneWorkerSlot(standard);
-  const displaySource: Message['source'] =
-    originSource === 'orchestrator'
-      ? 'orchestrator'
-      : (resolvedWorker as Message['source']);
-
-  const baseMetadata = { ...(standard.metadata || {}) } as Record<string, unknown>;
-
-  // 根据消息类型正确映射 role：用户输入消息 → 'user'，系统通知 → 'system'，其余 → 'assistant'
-  const resolvedRole: 'user' | 'assistant' | 'system' =
-    isSystemNotice ? 'system'
-    : (standard.type === MessageType.USER_INPUT ? 'user' : 'assistant');
-
-  // 直接传递 MessageType，UI 层使用 type === 'user_input' 判断用户消息
-  const resolvedType = standard.type as import('../types/message').MessageType;
-
-  return {
-    id: standard.id,
-    role: resolvedRole,
-    source: displaySource,
-    content,
-    blocks,
-    timestamp: standard.timestamp || Date.now(),
-    updatedAt: standard.updatedAt || standard.timestamp || Date.now(),
-    isStreaming,
-    isComplete,
-    type: resolvedType,
-    noticeType: standard.type === MessageType.ERROR ? 'error' : (isSystemNotice ? 'info' : undefined),
-    metadata: {
-      ...baseMetadata,
-      eventId: standard.eventId,
-      eventSeq: standard.eventSeq,
-      interaction: standard.interaction,
-      worker: resolvedWorker ?? undefined,
-    },
-  };
-
-
-}
-
-function hasRenderableContent(message: Message): boolean {
-  return messageHasRenderableTimelineContent(message);
-}
-
-
-
-function blocksToContent(blocks: ContentBlock[]): string {
-  const textParts: string[] = [];
-  for (const block of blocks) {
-    if (!block) continue;
-    if (block.type === 'text' || block.type === 'code' || block.type === 'thinking') {
-      if (block.content) textParts.push(block.content);
-    }
-    if (block.type === 'tool_result') {
-      const toolContent = block.toolCall?.error || block.toolCall?.result || block.content;
-      if (toolContent) textParts.push(toolContent);
-    }
-    if (block.type === 'file_change' && block.fileChange) {
-      textParts.push(i18n.t('messageHandler.fileChange', { filePath: block.fileChange.filePath, changeType: block.fileChange.changeType }));
-    }
-    if (block.type === 'plan' && block.plan) {
-      textParts.push(formatPlanBlock(block.plan));
-    }
-  }
-  return textParts.join('\n\n');
 }

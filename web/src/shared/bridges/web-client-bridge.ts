@@ -161,6 +161,11 @@ let activeEventStreamOpenTimeout: number | null = null;
 let activeEventStreamToken = 0;
 let activeEventStreamOpenResolve: (() => void) | null = null;
 let activeEventStreamOpenReject: ((error: Error) => void) | null = null;
+// SSE 空闲检测：后端每 15s 发 keep-alive 心跳，任何事件（包括心跳）都会刷新 lastEventStreamActivityAt。
+// 超过 EVENT_STREAM_IDLE_TIMEOUT_MS 未收到任何事件即视为静默断流，触发 recovery 重拉 bootstrap，
+// 让 applyAuthoritativeProcessingState 根据权威快照收敛运行态，避免前端永久卡在 running。
+let lastEventStreamActivityAt = 0;
+let eventStreamIdleCheckTimer: number | null = null;
 let bridgeRecovering = false;
 // fetchBootstrap 防重入：同一时刻只允许一个 bootstrap 请求在飞行中，
 // 后续调用复用同一 Promise，避免重复 dispatchBootstrap 打乱 eventSeq 追踪。
@@ -178,6 +183,10 @@ const RECOVERY_BASE_DELAY_MS = 1000;
 const RECOVERY_MAX_DELAY_MS = 10_000;
 const EVENT_STREAM_PARSE_ERROR_DEBOUNCE_MS = 5000;
 const EVENT_STREAM_OPEN_TIMEOUT_MS = 4000;
+// 后端 SSE keep-alive interval 为 15s（见 crates/magi-api/src/sse.rs）。
+// 给出 3 个心跳的容错窗口后再判定静默断流，避免偶发网络抖动产生误恢复。
+const EVENT_STREAM_IDLE_TIMEOUT_MS = 45_000;
+const EVENT_STREAM_IDLE_CHECK_INTERVAL_MS = 5_000;
 const SESSION_TIMELINE_PAGE_SIZE = 50;
 const WEBVIEW_STATE_STORAGE_KEY = 'webview-state';
 const WEBVIEW_STATE_WRITE_INTERVAL_MS = 1200;
@@ -599,6 +608,42 @@ function clearEventStreamOpenTimeout(): void {
     window.clearTimeout(activeEventStreamOpenTimeout);
     activeEventStreamOpenTimeout = null;
   }
+}
+
+function markEventStreamActive(): void {
+  lastEventStreamActivityAt = Date.now();
+}
+
+function stopEventStreamIdleCheck(): void {
+  if (eventStreamIdleCheckTimer !== null) {
+    window.clearInterval(eventStreamIdleCheckTimer);
+    eventStreamIdleCheckTimer = null;
+  }
+}
+
+function startEventStreamIdleCheck(): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  stopEventStreamIdleCheck();
+  markEventStreamActive();
+  eventStreamIdleCheckTimer = window.setInterval(() => {
+    if (activeEventStreamState !== 'open') {
+      return;
+    }
+    if (recoveryInFlight || recoveryTimer !== null) {
+      return;
+    }
+    const idleMs = Date.now() - lastEventStreamActivityAt;
+    if (idleMs < EVENT_STREAM_IDLE_TIMEOUT_MS) {
+      return;
+    }
+    // SSE 握手仍 open，但超过容错窗口没收到任何事件（含 keep-alive），判定静默断流。
+    // 重置活跃时间戳避免 recovery 调度期间重复触发，由 recovery 完成后的 ensureEventStream
+    // 重新建连或 closeEventStream 停止检测。
+    markEventStreamActive();
+    scheduleRecovery('event_stream_idle', new Error(`SSE 静默超时：${Math.round(idleMs / 1000)}s`), true);
+  }, EVENT_STREAM_IDLE_CHECK_INTERVAL_MS);
 }
 
 function ensureWindowListener(): void {
@@ -1379,6 +1424,7 @@ function dispatchEmptyWorkspaceState(): void {
 
 function closeEventStream(): void {
   clearEventStreamOpenTimeout();
+  stopEventStreamIdleCheck();
   // SSE 断开后无法接收增量事件，结束活跃 turn 防护
   clearActiveTurnInFlight();
   if (activeSseConnection) {
@@ -1529,12 +1575,14 @@ async function ensureEventStream(
           return;
         }
         activeEventStreamState = 'open';
+        startEventStreamIdleCheck();
         resolveEventStreamOpen();
       },
       onMessage(data: string) {
         if (streamToken !== activeEventStreamToken) {
           return;
         }
+        markEventStreamActive();
         const event = parseRustEventEnvelope(data);
         if (!event) {
           handleEventStreamParseFailure(data, new Error('Rust 事件流载荷不符合 EventEnvelope 协议'));
@@ -1549,6 +1597,7 @@ async function ensureEventStream(
         const openFailed = activeEventStreamState !== 'open';
         rejectEventStreamOpen(openFailed ? new Error('事件流连接失败') : undefined);
         clearEventStreamOpenTimeout();
+        stopEventStreamIdleCheck();
         activeSseConnection = null;
         activeEventStreamKey = '';
         activeEventStreamState = 'idle';

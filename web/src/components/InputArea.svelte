@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
   import { vscode } from '../lib/vscode-bridge';
   import {
     addToast,
@@ -9,8 +8,6 @@
     messagesState,
   } from '../stores/messages.svelte';
   import { getTaskGraphState, refreshTaskProjection } from '../stores/task-graph-store.svelte';
-  import type { StandardMessage } from '../shared/protocol/message-protocol';
-  import { MessageCategory } from '../shared/protocol/message-protocol';
   import type { SessionIntakeResponseDto } from '../shared/rust-backend-types';
   import { RustDaemonClient } from '../shared/rust-daemon-client';
   import { resolveAgentBaseUrl } from '../web/agent-api';
@@ -33,9 +30,6 @@
   const minHeight = 80;
   const maxHeight = 400;
 
-  // 深度任务模式
-  let deepTaskEnabled = $state(false);
-
   // 🔧 图片上传相关状态
   let selectedImages = $state<SelectedImage[]>([]);
   const MAX_IMAGES = 5;  // 最多支持 5 张图片
@@ -48,7 +42,7 @@
   const currentSessionId = $derived(messagesState.currentSessionId);
   const taskGraph = $derived(getTaskGraphState(currentSessionId));
 
-  // 深度模式任务图运行中：将用户输入路由到 Intake API
+  // 任务图运行中：将用户输入路由到 Intake API
   const shouldUseIntake = $derived.by(() => {
     const projection = taskGraph.projection;
     return isTaskProjectionAcceptingIntake(projection, taskGraph.rootTaskId);
@@ -161,7 +155,7 @@
       return;
     }
 
-    // 深度任务运行中默认走 Intake；继续意图必须交给 session turn 分类器恢复执行链。
+    // 任务运行中默认走 Intake；继续意图必须交给 session turn 分类器恢复执行链。
     if (shouldUseIntake && submissionText && !isNaturalContinueRequest(submissionText)) {
       await sendIntake(submissionText);
       return;
@@ -172,7 +166,7 @@
       type: 'executeTask',
       text: submissionText,
       requestId,
-      deepTask: deepTaskEnabled,
+      deepTask: false,
       skillName: null,
       followUpMode: isSending ? 'queue' : undefined,
       images: selectedImages.map((img) => ({
@@ -214,7 +208,7 @@
         }
         break;
       case 'pause':
-        addToast('info', '任务已暂停');
+        addToast('info', '任务已停止，进度已保存');
         break;
       case 'replan':
         addToast('info', `已触发重规划，取消 ${response.cancelledTaskIds?.length ?? 0} 个任务`);
@@ -276,7 +270,7 @@
     }
   }
 
-  // 任务图运行时，输入框停止入口与任务面板共用同一条暂停链路。
+  // 任务图运行时，输入框停止入口与任务面板共用同一条可恢复停止链路。
   async function stopTask() {
     if (stopLoading) return;
     stopLoading = true;
@@ -289,7 +283,7 @@
           const client = new RustDaemonClient(resolveAgentBaseUrl());
           await client.pauseTask({ taskId: rootTaskId, sessionId });
           await refreshTaskProjection(sessionId);
-          addToast('info', '任务链已暂停');
+          addToast('info', '任务已停止，进度已保存');
         }
         return;
       }
@@ -389,27 +383,6 @@
   function clearAllImages() {
     selectedImages = [];
   }
-
-  onMount(() => {
-    const unsubscribe = vscode.onMessage((msg) => {
-      if (msg.type !== 'unifiedMessage') return;
-      const standard = msg.message as StandardMessage;
-      if (!standard || standard.category !== MessageCategory.DATA || !standard.data) return;
-
-      if (standard.data.dataType === 'settingsBootstrapLoaded') {
-        const payload = standard.data.payload as {
-          runtimeSettings?: { deepTask?: boolean };
-        };
-        if (typeof payload?.runtimeSettings?.deepTask === 'boolean') {
-          deepTaskEnabled = payload.runtimeSettings.deepTask;
-        }
-      }
-    });
-    vscode.postMessage({ type: 'loadSettingsBootstrap', force: false });
-    return () => {
-      unsubscribe();
-    };
-  });
 </script>
 
 <div class="ia-container">
@@ -505,7 +478,7 @@
             data-testid="input-stop-button"
             onclick={stopTask}
             disabled={stopLoading}
-            title={shouldPauseTaskGraphFromComposer ? '暂停当前任务链' : i18n.t('input.stop')}
+            title={shouldPauseTaskGraphFromComposer ? '停止当前任务，保留进度' : i18n.t('input.stop')}
           >
             <Icon name={stopLoading ? 'loader' : 'stop'} size={14} class={stopLoading ? 'spinning' : ''} />
           </button>

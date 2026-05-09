@@ -95,7 +95,7 @@
   let deliveryPackageRequestScope = $state('');
   let deliverySummaryCopied = $state(false);
   let deliverySummaryCopyTimer: ReturnType<typeof setTimeout> | null = null;
-  let taskActionLoading = $state<'pause' | 'resume' | null>(null);
+  let taskActionLoading = $state<'stop' | 'resume' | null>(null);
   let selectedTaskReference = $state<SelectedTaskReference | null>(null);
   let referenceDetailEl = $state<HTMLElement | null>(null);
   let referenceSelectionScope = $state('');
@@ -522,7 +522,7 @@
     return sessionId || null;
   }
 
-  async function runTaskAction(action: 'pause' | 'resume', task: () => Promise<void>) {
+  async function runTaskAction(action: 'stop' | 'resume', task: () => Promise<void>) {
     if (taskActionLoading) return;
     taskActionLoading = action;
     try {
@@ -534,19 +534,19 @@
     }
   }
 
-  async function pauseCurrentTaskGraph() {
+  async function stopCurrentTaskGraph() {
     const sessionId = currentSessionIdValue();
     const rootTaskId = currentRootTaskId();
     if (!sessionId || !rootTaskId) return;
-    await runTaskAction('pause', async () => {
+    await runTaskAction('stop', async () => {
       const client = createClient();
       await client.pauseTask({ taskId: rootTaskId, sessionId });
       clearDeliveryPackageViewState();
       await refreshTaskProjection(sessionId);
-      addToast('info', '任务链已暂停');
+      addToast('info', '任务已停止，进度已保存');
     }).catch((err) => {
       const message = err instanceof Error ? err.message : String(err);
-      addToast('error', `暂停失败: ${message}`);
+      addToast('error', `停止失败: ${message}`);
     });
   }
 
@@ -708,10 +708,10 @@
               type="button"
               class="task-action-btn"
               disabled={taskActionLoading !== null}
-              onclick={pauseCurrentTaskGraph}
-              title="停止当前任务"
+              onclick={stopCurrentTaskGraph}
+              title="停止当前任务，保留进度"
             >
-              <Icon name={taskActionLoading === 'pause' ? 'loader' : 'stop'} size={12} class={taskActionLoading === 'pause' ? 'spinning' : ''} />
+              <Icon name={taskActionLoading === 'stop' ? 'loader' : 'stop'} size={12} class={taskActionLoading === 'stop' ? 'spinning' : ''} />
               <span>停止</span>
             </button>
           {:else if proj.runner_status === 'blocked'}
@@ -927,11 +927,11 @@
 
       <details class="task-details-disclosure">
         <summary>
-          <span>执行明细</span>
+          <span>技术明细</span>
           <span>{activeProjectionTasks.length} 个节点</span>
         </summary>
 
-      <div class="tg-tree" role="tree" aria-label="任务执行明细">
+      <div class="tg-tree" role="tree" aria-label="任务技术明细">
         {#each taskTreeRows as row (row.task.task_id)}
           {@const isExpanded = expandedGraphNodes.has(row.task.task_id)}
           {@const statusIcon = getProjectionStatusIcon(row.task.status)}

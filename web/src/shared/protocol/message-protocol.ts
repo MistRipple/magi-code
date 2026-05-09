@@ -28,7 +28,7 @@ export enum MessageType {
   SYSTEM = 'system-notice',
   /** 工具调用 */
   TOOL_CALL = 'tool_call',
-  /** 思考过程 */
+  /** 处理思路 */
   THINKING = 'thinking',
 
   // ============== 新增消息类型（方案 B 扩展）==============

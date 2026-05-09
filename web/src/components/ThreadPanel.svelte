@@ -18,9 +18,9 @@
   const threadRenderItems = $derived.by(() => (
     !isTopActive
       ? []
-      : messagesState.timelineProjection
+      : messagesState.canonicalTimelineProjection
         ? buildTimelineRenderItems(
-            messagesState.timelineProjection,
+            messagesState.canonicalTimelineProjection,
             'thread',
           )
         : []

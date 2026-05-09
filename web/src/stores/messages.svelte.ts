@@ -9,8 +9,6 @@ import type {
   AgentId,
   TimelineProjectionArtifact,
   TimelineProjectionRenderEntry,
-  TimelineNode,
-  TimelineNodeKind,
   SessionTimelineProjection,
   Session,
   TabType,
@@ -69,14 +67,6 @@ interface SettingsRegistrySnapshot {
   registryAgents: AgentBinding[];
 }
 
-export type TaskComposerIntent = 'supplement_context' | 'append_task' | 'replan';
-
-export interface TaskComposerDraft {
-  intent: TaskComposerIntent;
-  taskId: string | null;
-  text: string;
-}
-
 type NotificationCenterOperation = 'load' | 'append' | 'mark-read' | 'clear' | 'remove';
 
 export interface NotificationCenterStatus {
@@ -112,8 +102,7 @@ export const messagesState = $state({
   },
 
   // 消息状态
-  timelineNodes: [] as TimelineNode[],
-  timelineProjection: null as SessionTimelineProjection | null,
+  canonicalTimelineProjection: null as SessionTimelineProjection | null,
 
   // 会话状态
   currentWorkspaceId: null as string | null,
@@ -129,7 +118,6 @@ export const messagesState = $state({
     isLoadingBefore: false,
   },
   queuedMessages: [] as QueuedMessage[],
-  taskComposerDraft: null as TaskComposerDraft | null,
   notificationCenter: {
     isLoading: false,
     operation: null,
@@ -168,18 +156,13 @@ export const messagesState = $state({
   } as AutoScrollConfig,
 });
 
-// 消息列表限制
 const IS_HOSTED_WEBVIEW = (
   typeof globalThis !== 'undefined'
   && typeof (globalThis as { acquireVsCodeApi?: unknown }).acquireVsCodeApi === 'function'
 );
-const MAX_TIMELINE_NODES = IS_HOSTED_WEBVIEW ? 2000 : 1000;
 
 const MAX_PERSISTED_ARRAY_LENGTH = 10000;
 const WEBVIEW_STATE_SAVE_DEBOUNCE_MS = 120;
-
-/** 全局递增 displayOrder 计数器：节点首次创建时分配稳定序号，后续永不重算 */
-let timelineDisplayOrderCounter = 0;
 /** 本地 turnOrderSeq 计数器：发送意图创建时分配，作为 live 渲染轮次事实 */
 let localTimelineTurnOrderSeqCounter = 0;
 
@@ -428,7 +411,6 @@ let sessionExecutionStateBySession = $state<Record<string, PersistedSessionExecu
 let sessionQueuedMessagesBySession = $state<Record<string, QueuedMessage[]>>({});
 let webviewStateBatchDepth = 0;
 let webviewStateBatchPending = false;
-let timelineProjectionSource: 'none' | 'live' | 'authoritative' = 'none';
 
 function scheduleSaveWebviewState(): void {
   if (webviewStateBatchDepth > 0) {
@@ -487,14 +469,13 @@ function isValidPersistedArray(value: unknown, max: number): value is unknown[] 
 
 // 新增状态：变更、阶段、Toast、模型状态
 let edits = $state<Array<{ filePath: string; snapshotId?: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string; executionGroupId?: string; diff?: string; originalContent?: string; previewContent?: string; previewAbsolutePath?: string; previewCanOpenWorkspaceFile?: boolean }>>([]);
-let timelineProjectionDirty = false;
 // 统一 Worker 运行态（唯一权威来源）
 // 当前主线以 authoritative projection 为准，仅叠加尚未被后端接纳的本地乐观节点。
 
 
 
 const messageProjection = $derived.by(() => {
-  const projection = messagesState.timelineProjection;
+  const projection = messagesState.canonicalTimelineProjection;
   const workers: Record<string, Message[]> = {};
   if (!projection) {
     return {
@@ -598,9 +579,6 @@ export interface EnabledAgent {
 }
 
 let enabledAgents = $state<EnabledAgent[]>([]);
-const timelineNodeIdByMessageId = new Map<string, string>();
-const timelineNodeIdByCardId = new Map<string, string>();
-const timelineNodeIdByLifecycleKey = new Map<string, string>();
 
 function resolveMessageMetadataRecord(message: Pick<Message, 'metadata'> | undefined): Record<string, unknown> | undefined {
   return message?.metadata && typeof message.metadata === 'object'
@@ -610,17 +588,6 @@ function resolveMessageMetadataRecord(message: Pick<Message, 'metadata'> | undef
 
 function resolveMessageSortTimestamp(message: Pick<Message, 'timestamp' | 'metadata' | 'type'>): number {
   return resolveTimelineSortTimestamp(message.timestamp, resolveMessageMetadataRecord(message));
-}
-
-function mergeTimelineSortTimestamp(
-  currentTimestamp: number | undefined,
-  message: Pick<Message, 'timestamp' | 'metadata' | 'type'>,
-): number {
-  const existing = currentTimestamp ?? 0;
-  if (existing > 0) {
-    return existing;
-  }
-  return resolveMessageSortTimestamp(message) || 0;
 }
 
 function normalizeProjectionRestoredMessage(message: Message): Message {
@@ -688,33 +655,6 @@ function normalizeSessionNotificationList(raw: unknown): Notification[] {
   return normalized;
 }
 
-function normalizeIncomingMessage(message: Message): Message {
-  return normalizeMessagePayload(message, '[MessagesStore] 输入消息');
-}
-
-function preserveStableTurnOrderFact(
-  existingMessage: Message | undefined,
-  nextMessage: Message,
-): Message {
-  if (!existingMessage) {
-    return nextMessage;
-  }
-  const existingMetadata = resolveMessageMetadataRecord(existingMessage);
-  const nextMetadata = resolveMessageMetadataRecord(nextMessage);
-  const existingTurnOrderSeq = normalizePositiveSequence(existingMetadata?.turnOrderSeq);
-  const nextTurnOrderSeq = normalizePositiveSequence(nextMetadata?.turnOrderSeq);
-  if (existingTurnOrderSeq <= 0 || nextTurnOrderSeq > 0) {
-    return nextMessage;
-  }
-  return {
-    ...nextMessage,
-    metadata: {
-      ...nextMetadata,
-      turnOrderSeq: existingTurnOrderSeq,
-    },
-  };
-}
-
 function normalizeWorkerTabList(workerTabs: AgentId[] | undefined): AgentId[] {
   if (!Array.isArray(workerTabs)) return [];
   const next = new Set<AgentId>();
@@ -725,34 +665,6 @@ function normalizeWorkerTabList(workerTabs: AgentId[] | undefined): AgentId[] {
     }
   }
   return Array.from(next);
-}
-
-function normalizeTimelineLaneOrder(
-  laneOrder: TimelineNode['laneOrder'] | undefined,
-): TimelineNode['laneOrder'] | undefined {
-  if (!laneOrder || typeof laneOrder !== 'object') {
-    return undefined;
-  }
-  const normalizedThread = typeof laneOrder.thread === 'number' && Number.isFinite(laneOrder.thread)
-    ? Math.max(1, Math.floor(laneOrder.thread))
-    : undefined;
-  const nextWorkers: Partial<Record<AgentId, number>> = {};
-  const rawWorkers = laneOrder.workers;
-  if (rawWorkers && typeof rawWorkers === 'object') {
-    for (const worker of Object.keys(rawWorkers)) {
-      const rawOrder = rawWorkers[worker];
-      if (typeof rawOrder === 'number' && Number.isFinite(rawOrder)) {
-        nextWorkers[worker] = Math.max(1, Math.floor(rawOrder));
-      }
-    }
-  }
-  if (normalizedThread === undefined && Object.keys(nextWorkers).length === 0) {
-    return undefined;
-  }
-  return {
-    ...(normalizedThread !== undefined ? { thread: normalizedThread } : {}),
-    ...(Object.keys(nextWorkers).length > 0 ? { workers: nextWorkers } : {}),
-  };
 }
 
 function resolveTimelineCardId(message: Message): string | undefined {
@@ -768,21 +680,8 @@ function resolveTimelineWorker(message: Message): AgentId | undefined {
   return worker || undefined;
 }
 
-function resolveTimelineNodeKind(message: Message): TimelineNodeKind {
+function resolveProjectionArtifactKind(message: Message): TimelineProjectionArtifact['kind'] {
   return resolveTimelinePresentationKind(message);
-}
-
-
-function resolveCanonicalTurnItemId(message: Pick<Message, 'id' | 'metadata'> | undefined): string {
-  const metadata = resolveMessageMetadataRecord(message);
-  const rawTurnItemId = metadata?.turnItemId;
-  return typeof rawTurnItemId === 'string' && rawTurnItemId.trim()
-    ? rawTurnItemId.trim()
-    : '';
-}
-
-function resolveTimelineNodeId(message: Message): string {
-  return resolveCanonicalTurnItemId(message) || message.id;
 }
 
 function normalizePositiveSequence(value: unknown): number {
@@ -804,120 +703,8 @@ function maxTimelineTurnOrderSeqFromArtifacts(artifacts: TimelineProjectionArtif
   );
 }
 
-function maxTimelineTurnOrderSeqFromNodes(nodes: TimelineNode[] | undefined): number {
-  return ensureArray<TimelineNode>(nodes).reduce(
-    (maxSeq, node) => Math.max(maxSeq, maxTimelineTurnOrderSeqFromMessage(node.message)),
-    0,
-  );
-}
-
-function resolveTimelineAliasId(rawId: string | undefined): string {
-  const normalized = typeof rawId === 'string' ? rawId.trim() : '';
-  if (!normalized) return '';
-  return timelineNodeIdByMessageId.get(normalized) || normalized;
-}
-
 function getMessageBlockSeq(message: Pick<Message, 'metadata'> | undefined): number {
   return resolveTimelineBlockSeqFromMetadata(resolveMessageMetadataRecord(message));
-}
-
-function normalizeTimelineNode(node: TimelineNode): TimelineNode {
-  const normalizedMessage = normalizeIncomingMessage(node.message);
-  const stableNodeId = typeof node.nodeId === 'string' && node.nodeId.trim()
-    ? node.nodeId.trim()
-    : resolveTimelineNodeId(normalizedMessage);
-  const stableMessage = {
-    ...normalizedMessage,
-    id: stableNodeId,
-  };
-  const messageEventSeq = getMessageEventSeq(stableMessage);
-  const explicitAnchorEventSeq = typeof node.anchorEventSeq === 'number' && Number.isFinite(node.anchorEventSeq)
-    ? Math.floor(node.anchorEventSeq)
-    : 0;
-  const explicitLatestEventSeq = typeof node.latestEventSeq === 'number' && Number.isFinite(node.latestEventSeq)
-    ? Math.floor(node.latestEventSeq)
-    : 0;
-  const anchorEventSeq = explicitAnchorEventSeq > 0
-    ? explicitAnchorEventSeq
-    : (messageEventSeq ?? 0);
-  const latestEventSeq = Math.max(anchorEventSeq, explicitLatestEventSeq, messageEventSeq ?? 0);
-  const explicitCardStreamSeq = typeof node.cardStreamSeq === 'number' && Number.isFinite(node.cardStreamSeq)
-    ? Math.max(0, Math.floor(node.cardStreamSeq))
-    : 0;
-  const cardStreamSeq = explicitCardStreamSeq || getMessageCardStreamSeq(stableMessage);
-  const cardId = resolveTimelineCardId(stableMessage);
-  const dispatchWaveId = typeof stableMessage.metadata?.dispatchWaveId === 'string'
-    ? stableMessage.metadata.dispatchWaveId.trim()
-    : (typeof node.dispatchWaveId === 'string' ? node.dispatchWaveId.trim() : '');
-  const laneId = typeof stableMessage.metadata?.laneId === 'string'
-    ? stableMessage.metadata.laneId.trim()
-    : (typeof node.laneId === 'string' ? node.laneId.trim() : '');
-  const laneOrder = normalizeTimelineLaneOrder(node.laneOrder);
-  const worker = resolveTimelineWorker(stableMessage) || node.worker;
-  const workerTabs = normalizeWorkerTabList(node.workerTabs);
-  const messageIds = Array.from(new Set([
-    stableNodeId,
-    ...ensureArray<string>(node.messageIds),
-  ]));
-  return {
-    nodeId: stableNodeId,
-    kind: node.kind || resolveTimelineNodeKind(stableMessage),
-    displayOrder: typeof node.displayOrder === 'number' && Number.isFinite(node.displayOrder)
-      ? Math.max(0, Math.floor(node.displayOrder))
-      : undefined,
-    ...(laneOrder ? { laneOrder } : {}),
-    artifactVersion: typeof node.artifactVersion === 'number' && Number.isFinite(node.artifactVersion)
-      ? Math.max(0, Math.floor(node.artifactVersion))
-      : resolveTimelineVersionFromMetadata(resolveMessageMetadataRecord(stableMessage)),
-    anchorEventSeq,
-    latestEventSeq,
-    cardStreamSeq,
-    timestamp: mergeTimelineSortTimestamp(node.timestamp, stableMessage),
-    ...(cardId ? { cardId } : {}),
-    ...(dispatchWaveId ? { dispatchWaveId } : {}),
-    ...(laneId ? { laneId } : {}),
-    ...(worker ? { worker } : {}),
-
-    visibleInThread: node.visibleInThread !== false,
-    workerTabs,
-    messageIds,
-    message: stableMessage,
-  };
-}
-
-function rebuildTimelineIndexes(): void {
-  timelineNodeIdByMessageId.clear();
-  timelineNodeIdByCardId.clear();
-  timelineNodeIdByLifecycleKey.clear();
-  for (const node of messagesState.timelineNodes) {
-    timelineNodeIdByMessageId.set(node.nodeId, node.nodeId);
-    for (const messageId of node.messageIds) {
-      if (typeof messageId === 'string' && messageId.trim()) {
-        timelineNodeIdByMessageId.set(messageId.trim(), node.nodeId);
-      }
-    }
-    if (node.cardId) {
-      timelineNodeIdByCardId.set(node.cardId, node.nodeId);
-    }
-    if (node.lifecycleKey) {
-      timelineNodeIdByLifecycleKey.set(node.lifecycleKey, node.nodeId);
-    }
-  }
-}
-
-function nodeToOrderInput(node: TimelineNode): TimelineSemanticOrderInput {
-  const metadata = resolveMessageMetadataRecord(node.message);
-  return {
-    turnOrderSeq: resolveTimelineTurnOrderSeqFromMetadata(metadata),
-    itemSeq: resolveTimelineItemSeqFromMetadata(metadata),
-    laneSeq: resolveTimelineLaneSeqFromMetadata(metadata),
-    blockSeq: resolveTimelineBlockSeqFromMetadata(metadata),
-    displayOrder: node.displayOrder || 0,
-  };
-}
-
-function compareTimelineNodeOrder(left: TimelineNode, right: TimelineNode): number {
-  return compareTimelineSemanticOrder(nodeToOrderInput(left), nodeToOrderInput(right));
 }
 
 interface LocalProjectionFlatRenderEntry {
@@ -1029,7 +816,7 @@ function canonicalizeTimelineProjection(
         : message.id;
       return {
         artifactId: artifactMessageId,
-        kind: artifact.kind || resolveTimelineNodeKind(message),
+        kind: artifact.kind || resolveProjectionArtifactKind(message),
         displayOrder: typeof artifact.displayOrder === 'number' && Number.isFinite(artifact.displayOrder)
           ? Math.max(0, Math.floor(artifact.displayOrder))
           : 0,
@@ -1104,263 +891,6 @@ function compareProjectionArtifactsSemanticOrder(
     return semanticOrder;
   }
   return left.artifactId.localeCompare(right.artifactId);
-}
-
-function buildLiveTimelineProjection(
-  sessionId: string,
-  sourceNodes: TimelineNode[],
-  seed: SessionTimelineProjection | null,
-): SessionTimelineProjection {
-  const normalizedNodes = sourceNodes
-    .map((node) => normalizeTimelineNode(node))
-    .sort(compareTimelineNodeOrder);
-
-  const artifacts: TimelineProjectionArtifact[] = normalizedNodes.map((node, index) => ({
-      artifactId: node.nodeId,
-      kind: node.kind,
-      displayOrder: typeof node.displayOrder === 'number' && Number.isFinite(node.displayOrder)
-        ? Math.max(0, Math.floor(node.displayOrder))
-        : index + 1,
-      artifactVersion: node.artifactVersion,
-      anchorEventSeq: node.anchorEventSeq,
-      latestEventSeq: node.latestEventSeq,
-      cardStreamSeq: node.cardStreamSeq,
-      timestamp: node.timestamp,
-      cardId: node.cardId,
-      lifecycleKey: node.lifecycleKey,
-      dispatchWaveId: node.dispatchWaveId,
-      laneId: node.laneId,
-      worker: node.worker,
-      threadVisible: node.visibleInThread,
-      workerTabs: normalizeWorkerTabList(node.workerTabs),
-      messageIds: Array.from(new Set(node.messageIds)),
-      message: normalizeIncomingMessage(node.message),
-    }));
-
-  const threadRenderEntries = buildProjectionRenderEntriesFromArtifacts(artifacts, 'thread');
-  const workerRenderEntries = buildDynamicWorkerRenderEntries(artifacts);
-
-  const lastAppliedEventSeq = artifacts.reduce(
-    (maxSeq, artifact) => Math.max(maxSeq, artifact.latestEventSeq),
-    seed?.lastAppliedEventSeq || 0,
-  );
-
-  const updatedAt = artifacts.reduce((maxTimestamp, artifact) => {
-    const artifactUpdatedAt = Math.max(
-      artifact.message.updatedAt || 0,
-      artifact.message.timestamp || 0,
-      artifact.timestamp,
-    );
-    return Math.max(maxTimestamp, artifactUpdatedAt);
-  }, seed?.updatedAt || 0);
-
-  return {
-    schemaVersion: 'session-timeline-projection.v2',
-    sessionId,
-    updatedAt: updatedAt > 0 ? updatedAt : (seed?.updatedAt || Date.now()),
-    lastAppliedEventSeq,
-    artifacts,
-    threadRenderEntries,
-    workerRenderEntries,
-  };
-}
-
-function syncTimelineProjectionFromNodes(
-  sessionId: string | null | undefined,
-  options: { persist?: boolean } = {},
-): void {
-  const normalizedSessionId = normalizeSessionId(sessionId);
-  if (timelineProjectionSource === 'authoritative') {
-    timelineProjectionDirty = false;
-    if (normalizedSessionId) {
-      upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(normalizedSessionId));
-    }
-    if (options.persist !== false) {
-      scheduleSaveWebviewState();
-    }
-    return;
-  }
-  const projectionSessionId = normalizedSessionId
-    || (messagesState.timelineNodes.length > 0 ? '__pending-session__' : '');
-  if (!projectionSessionId) {
-    return;
-  }
-  messagesState.timelineProjection = buildLiveTimelineProjection(
-    projectionSessionId,
-    messagesState.timelineNodes,
-    messagesState.timelineProjection,
-  );
-  timelineProjectionSource = 'live';
-  timelineProjectionDirty = false;
-  if (normalizedSessionId) {
-    upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(normalizedSessionId));
-  }
-  if (options.persist !== false) {
-    scheduleSaveWebviewState();
-  }
-}
-
-/**
- * 增量补丁投影：仅更新指定节点对应的 artifact，跳过全量 normalize + sort。
- * 前提：内容性更新不改变后端事件序列。
- */
-function ensureTimelineProjectionSnapshotCurrent(
-  sessionId: string | null | undefined,
-): SessionTimelineProjection | null {
-  if (!timelineProjectionDirty) {
-    return messagesState.timelineProjection;
-  }
-  const normalizedSessionId = normalizeSessionId(sessionId);
-  if (!normalizedSessionId) {
-    return messagesState.timelineProjection;
-  }
-  syncTimelineProjectionFromNodes(normalizedSessionId, { persist: false });
-  return messagesState.timelineProjection;
-}
-
-function sortAndSyncTimelineNodes(nextNodes: TimelineNode[]): void {
-  const normalized = nextNodes.map((node) => normalizeTimelineNode(node));
-  normalized.sort(compareTimelineNodeOrder);
-  messagesState.timelineNodes = normalized;
-  rebuildTimelineIndexes();
-}
-
-/**
- * 增量更新路径：直接更新目标节点的消息内容，跳过全量 normalize-sort-reindex。
- *
- * 前提：后端事件序列保证内容性更新不改变排序位置。
- * 此函数仅更新节点消息，不触发 sortAndSyncTimelineNodes，
- * 通过 Svelte 5 $state 代理的数组索引赋值触发响应式更新。
- */
-function replaceTimelineNodes(nextNodes: TimelineNode[]): void {
-  sortAndSyncTimelineNodes(nextNodes);
-}
-
-function setTimelineProjectionNodes(nextNodes: TimelineNode[]): void {
-  replaceTimelineNodes(nextNodes);
-}
-
-function mutateTimelineNodes(mutator: (nodes: TimelineNode[]) => TimelineNode[]): void {
-  replaceTimelineNodes(mutator([...messagesState.timelineNodes]));
-  syncTimelineProjectionFromNodes(messagesState.currentSessionId, { persist: false });
-  scheduleSaveWebviewState();
-}
-
-function mergeTimelineNodeAliases(
-  existingNode: TimelineNode,
-  nextMessage: Message,
-  visibility: { thread?: boolean; workerTabs?: AgentId[] },
-  options: { replaceMessageId?: string; displayOrder?: number } = {},
-): TimelineNode {
-  const cardId = resolveTimelineCardId(nextMessage);
-  const nextWorkerTabs = normalizeWorkerTabList(visibility.workerTabs);
-  return normalizeTimelineNode({
-    ...existingNode,
-    displayOrder: existingNode.displayOrder ?? options.displayOrder,
-    cardId: cardId || existingNode.cardId,
-    worker: existingNode.worker || resolveTimelineWorker(nextMessage),
-    visibleInThread: existingNode.visibleInThread || visibility.thread !== false,
-    workerTabs: [
-      ...existingNode.workerTabs,
-      ...nextWorkerTabs,
-    ],
-    messageIds: Array.from(new Set([
-      ...existingNode.messageIds,
-      existingNode.nodeId,
-      resolveTimelineNodeId(nextMessage),
-      nextMessage.id,
-      ...(options.replaceMessageId ? [options.replaceMessageId] : []),
-    ])),
-  });
-}
-
-export function upsertTimelineNode(
-  message: Message,
-  visibility: { thread?: boolean; workerTabs?: AgentId[] },
-  options: { replaceMessageId?: string; displayOrder?: number } = {},
-): Message {
-  const normalizedMessage = normalizeIncomingMessage(message);
-
-  const cardId = resolveTimelineCardId(normalizedMessage);
-  const explicitNodeId = resolveTimelineNodeId(normalizedMessage);
-  const replaceNodeId = options.replaceMessageId
-    ? resolveTimelineAliasId(options.replaceMessageId)
-    : undefined;
-  const existingNodeId = timelineNodeIdByMessageId.get(explicitNodeId)
-    || replaceNodeId
-    || timelineNodeIdByMessageId.get(normalizedMessage.id)
-    || (cardId ? timelineNodeIdByCardId.get(cardId) : undefined)
-    || undefined;
-  const stableNodeId = existingNodeId || explicitNodeId;
-  const nextWorkerTabs = normalizeWorkerTabList(visibility.workerTabs);
-  const existingNode = existingNodeId
-    ? messagesState.timelineNodes.find((node) => node.nodeId === existingNodeId)
-    : undefined;
-  const existingNodeIsPlaceholder = existingNode?.message.metadata?.isPlaceholder === true;
-  const stableMessage = preserveStableTurnOrderFact(existingNode?.message, {
-    ...normalizedMessage,
-    id: stableNodeId,
-  });
-  const nextAnchorEventSeq = getMessageEventSeq(stableMessage)
-    ?? (existingNode?.anchorEventSeq || 0);
-  const nextLatestEventSeq = getMessageEventSeq(stableMessage)
-    ?? (existingNode?.latestEventSeq || nextAnchorEventSeq);
-  const incomingCardStreamSeq = getMessageCardStreamSeq(stableMessage);
-  const nextCardStreamSeq = existingNode && !existingNodeIsPlaceholder
-    ? (existingNode.cardStreamSeq || incomingCardStreamSeq)
-    : incomingCardStreamSeq;
-  if (existingNode && compareIncomingMessageVersion(existingNode, stableMessage) < 0) {
-    const aliasedNode = mergeTimelineNodeAliases(existingNode, stableMessage, visibility, options);
-    mutateTimelineNodes((nodes) => nodes.map((node) => (
-      node.nodeId === stableNodeId ? aliasedNode : node
-    )));
-    return aliasedNode.message;
-  }
-  const mergedMessage = stableMessage;
-  const nextNode: TimelineNode = normalizeTimelineNode({
-    nodeId: stableNodeId,
-    kind: existingNode?.kind || resolveTimelineNodeKind(mergedMessage),
-    displayOrder: existingNode?.displayOrder ?? options.displayOrder ?? (++timelineDisplayOrderCounter),
-    laneOrder: existingNode?.laneOrder,
-    artifactVersion: existingNode?.artifactVersion,
-    anchorEventSeq: existingNode?.anchorEventSeq || nextAnchorEventSeq,
-    latestEventSeq: Math.max(existingNode?.latestEventSeq || 0, nextLatestEventSeq),
-    cardStreamSeq: nextCardStreamSeq,
-    timestamp: mergeTimelineSortTimestamp(existingNode?.timestamp, mergedMessage),
-    cardId: cardId || existingNode?.cardId,
-    worker: resolveTimelineWorker(mergedMessage) || existingNode?.worker,
-    visibleInThread: existingNode?.visibleInThread || visibility.thread !== false,
-    workerTabs: [
-      ...(existingNode?.workerTabs || []),
-      ...nextWorkerTabs,
-    ],
-    messageIds: Array.from(new Set([
-      ...(existingNode?.messageIds || []),
-      stableNodeId,
-      explicitNodeId,
-      normalizedMessage.id,
-      ...(options.replaceMessageId ? [options.replaceMessageId] : []),
-    ])),
-    message: mergedMessage,
-  });
-
-  mutateTimelineNodes((nodes) => {
-    const index = nodes.findIndex((node) => node.nodeId === stableNodeId);
-    const nextNodes = [...nodes];
-    if (index >= 0) {
-      nextNodes[index] = nextNode;
-    } else {
-      nextNodes.push(nextNode);
-    }
-    return nextNodes;
-  });
-
-  const updatedNode = messagesState.timelineNodes.find((node) => node.nodeId === stableNodeId);
-  return updatedNode?.message || nextNode.message;
-}
-function findTimelineNodeByAlias(messageId: string): TimelineNode | undefined {
-  const stableId = resolveTimelineAliasId(messageId);
-  return messagesState.timelineNodes.find((node) => node.nodeId === stableId);
 }
 
 function normalizeOrchestratorRuntimeState(
@@ -1631,8 +1161,7 @@ export function getState() {
   return {
     get currentTopTab() { return messagesState.currentTopTab; },
     get messageJump() { return messagesState.messageJump; },
-    get timelineNodes() { return messagesState.timelineNodes; },
-    get timelineProjection() { return messagesState.timelineProjection; },
+    get canonicalTimelineProjection() { return messagesState.canonicalTimelineProjection; },
     get threadMessages() { return messageProjection.thread; },
     get agentOutputs() {
       return messageProjection.workers as AgentOutputs;
@@ -1678,22 +1207,13 @@ export function getState() {
 export function allocateTurnOrderSeq(): number {
   localTimelineTurnOrderSeqCounter = Math.max(
     normalizePositiveSequence(localTimelineTurnOrderSeqCounter),
-    maxTimelineTurnOrderSeqFromNodes(messagesState.timelineNodes),
-    maxTimelineTurnOrderSeqFromArtifacts(messagesState.timelineProjection?.artifacts),
+    maxTimelineTurnOrderSeqFromArtifacts(messagesState.canonicalTimelineProjection?.artifacts),
   );
   localTimelineTurnOrderSeqCounter += 1;
   return localTimelineTurnOrderSeqCounter;
 }
 
 // ============ 状态更新函数 ============
-
-function trimTimelineNodes() {
-  if (messagesState.timelineNodes.length <= MAX_TIMELINE_NODES) {
-    return;
-  }
-  replaceTimelineNodes(messagesState.timelineNodes.slice(-MAX_TIMELINE_NODES));
-  syncTimelineProjectionFromNodes(messagesState.currentSessionId, { persist: false });
-}
 
 function createSessionViewStateSnapshot(sessionId: string | null | undefined): PersistedSessionViewState | null {
   const normalizedSessionId = normalizeSessionId(sessionId);
@@ -1734,7 +1254,6 @@ function upsertSessionViewStateSnapshot(snapshot: PersistedSessionViewState | nu
 }
 
 function captureCurrentSessionViewState(): void {
-  ensureTimelineProjectionSnapshotCurrent(messagesState.currentSessionId);
   upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(messagesState.currentSessionId));
   const executionSnapshot = createSessionExecutionStateSnapshot(messagesState.currentSessionId);
   if (executionSnapshot) {
@@ -1829,7 +1348,6 @@ function applySessionViewState(sessionId: string | null | undefined): boolean {
 
 function resetSessionScopedExecutionState(): void {
   edits = [];
-  messagesState.taskComposerDraft = null;
   messagesState.orchestratorRuntimeState = null;
   if (messagesState.appState) {
     messagesState.appState = {
@@ -1850,8 +1368,6 @@ function saveWebviewState() {
     deferredWebviewStateSaveTimer = null;
   }
   try {
-    trimTimelineNodes();
-    ensureTimelineProjectionSnapshotCurrent(messagesState.currentSessionId);
     captureCurrentSessionViewState();
     pruneSessionViewStateByKnownSessions();
     const state: WebviewPersistedState = {
@@ -1984,25 +1500,6 @@ export function clearMessageJump(): void {
   };
 }
 
-export function setTaskComposerDraft(input: {
-  intent: TaskComposerIntent;
-  taskId?: string | null;
-  text: string;
-}): void {
-  const normalizedText = typeof input.text === 'string' ? input.text.trim() : '';
-  if (!normalizedText) return;
-  messagesState.taskComposerDraft = {
-    intent: input.intent,
-    taskId: normalizeSessionId(input.taskId),
-    text: normalizedText,
-  };
-}
-
-export function clearTaskComposerDraft(): void {
-  if (!messagesState.taskComposerDraft) return;
-  messagesState.taskComposerDraft = null;
-}
-
 // 会话操作
 export function setCurrentSessionId(id: string | null) {
   const nextSessionId = normalizeSessionId(id);
@@ -2027,9 +1524,7 @@ export function setCurrentSessionId(id: string | null) {
     resetSessionScopedExecutionState();
     // 会话切换时消息内容以后端分页快照为唯一真相源。
     // 本地只恢复滚动/定位等轻量视图状态，避免旧 session 的主线或 worker 内容短暂残留。
-    replaceTimelineNodes([]);
-    messagesState.timelineProjection = null;
-    timelineProjectionDirty = false;
+    messagesState.canonicalTimelineProjection = null;
     restoredSessionView = applySessionViewState(nextSessionId);
     if (!restoredSessionView) {
       resetPanelScrollRuntimeState();
@@ -2118,39 +1613,7 @@ export function removeQueuedMessage(id: string) {
 }
 
 function markQueuedUserEchoAsGuide(id: string): void {
-  mutateTimelineNodes((nodes) => nodes.map((node) => {
-    const message = node.message;
-    if (message.type !== 'user_input') {
-      return node;
-    }
-    const metadata = message.metadata && typeof message.metadata === 'object'
-      ? message.metadata
-      : {};
-    const extra = metadata.extra && typeof metadata.extra === 'object' && !Array.isArray(metadata.extra)
-      ? metadata.extra as Record<string, unknown>
-      : null;
-    if (!extra || extra.queued !== true || extra.queueMode === 'guide') {
-      return node;
-    }
-    const requestId = typeof metadata.requestId === 'string' ? metadata.requestId.trim() : '';
-    const queuedMessageId = typeof extra.queuedMessageId === 'string' ? extra.queuedMessageId.trim() : '';
-    if (message.id !== id && requestId !== id && queuedMessageId !== id) {
-      return node;
-    }
-    return {
-      ...node,
-      message: {
-        ...message,
-        metadata: {
-          ...metadata,
-          extra: {
-            ...extra,
-            queueMode: 'guide',
-          },
-        },
-      },
-    };
-  }));
+  void id;
 }
 
 export function markQueuedMessageAsGuide(id: string): boolean {
@@ -2219,7 +1682,7 @@ function runtimeStateIsTerminal(runtimeState: OrchestratorRuntimeState | null): 
 }
 
 function canonicalProjectionIndicatesProcessing(): boolean {
-  const artifacts = messagesState.timelineProjection?.artifacts;
+  const artifacts = messagesState.canonicalTimelineProjection?.artifacts;
   if (!Array.isArray(artifacts) || artifacts.length === 0) {
     return false;
   }
@@ -2264,7 +1727,8 @@ function updateProcessingState() {
 }
 
 function timelineHasStreamingMessage(): boolean {
-  return messagesState.timelineNodes.some((node) => node.message?.isStreaming === true);
+  return ensureArray<TimelineProjectionArtifact>(messagesState.canonicalTimelineProjection?.artifacts)
+    .some((artifact) => artifact.message?.isStreaming === true);
 }
 
 export function hasActiveLocalTimelineTurn(): boolean {
@@ -2383,64 +1847,9 @@ export function settleProcessingForManualInteraction() {
   clearProcessingState();
 }
 
-/**
- * 终结所有未完成的流式消息和残留占位消息
- *
- * 任务结束（完成/打断/失败）时调用，确保：
- * 1. 已输出内容的流式消息标记为完成，保留内容展示
- * 2. 无内容的空占位消息被移除（避免残留"正在思考..."动画）
- * 3. 有内容的占位消息转为正常消息（去除占位标记）
- */
-
 export function sealAllStreamingMessages() {
-  let threadChanged = false;
-  let agentChanged = false;
-
-  // 处理单条消息：返回 null 表示应移除，返回新对象表示应更新
-  const sealMessage = (m: Message): Message | null => {
-    if (!m.isStreaming) return m; // 无需处理
-    const hasVisibleContent = (typeof m.content === 'string' && m.content.trim().length > 0)
-      || (Array.isArray(m.blocks) && m.blocks.length > 0);
-    if (m.metadata?.isPlaceholder === true && !hasVisibleContent) {
-      return null;
-    }
-
-    return {
-      ...m,
-      isStreaming: false,
-      isComplete: true,
-    };
-  };
-
-  mutateTimelineNodes((nodes) => {
-    const next: TimelineNode[] = [];
-    for (const node of nodes) {
-      const result = sealMessage(node.message);
-      if (result === null) {
-        threadChanged = true;
-        agentChanged = true;
-        continue;
-      }
-      if (result !== node.message) {
-        threadChanged = true;
-        agentChanged = true;
-        next.push(normalizeTimelineNode({
-          ...node,
-          message: result,
-        }));
-        continue;
-      }
-      next.push(node);
-    }
-    return next;
-  });
-
-  // 注意：这里仅负责“封口流式消息”，不允许本地推断任务终态。
-  // 任务/worker/mission 的 completed/failed/cancelled 必须只来自后端真相源，
-  // 否则会把真实 completed 误写成 cancelled。
-  if (threadChanged || agentChanged) {
-    saveWebviewState();
-  }
+  // 主线终态只允许由 canonical turn/item 更新。这里保留为空操作，
+  // 用于兼容处理态收敛调用点，避免前端本地反向改写聊天事实。
 }
 
 /** 获取后端处理状态（用于时序判断） */
@@ -2746,33 +2155,18 @@ function getMessageCardStreamSeq(message: Pick<Message, 'metadata'> | undefined)
   return resolveTimelineCardStreamSeqFromMetadata(resolveMessageMetadataRecord(message));
 }
 
-function compareIncomingMessageVersion(
-  current: Pick<TimelineNode, 'latestEventSeq'>,
-  incoming: Pick<Message, 'metadata'>,
-): number {
-  const currentEventSeq = typeof current.latestEventSeq === 'number' && Number.isFinite(current.latestEventSeq)
-    ? Math.max(0, Math.floor(current.latestEventSeq))
-    : 0;
-  const currentVersion = resolveTimelineVersionFromMetadata({ eventSeq: currentEventSeq });
-  const incomingVersion = resolveTimelineVersionFromMetadata(resolveMessageMetadataRecord(incoming));
-
-  if (currentVersion > 0 && incomingVersion === 0) {
-    return -1;
+export function getTimelineProjectionMessageById(messageId: string): Message | undefined {
+  const normalizedId = typeof messageId === 'string' ? messageId.trim() : '';
+  if (!normalizedId) {
+    return undefined;
   }
-
-  if (currentVersion > 0 && incomingVersion > 0 && incomingVersion !== currentVersion) {
-    return incomingVersion > currentVersion ? 1 : -1;
-  }
-
-  if (currentVersion === 0 && incomingVersion > 0) {
-    return 1;
-  }
-
-  return 0;
-}
-
-export function getTimelineMessageById(messageId: string): Message | undefined {
-  return findTimelineNodeByAlias(messageId)?.message;
+  const artifacts = ensureArray<TimelineProjectionArtifact>(messagesState.canonicalTimelineProjection?.artifacts);
+  const matched = artifacts.find((artifact) => (
+    artifact.artifactId === normalizedId
+    || artifact.message?.id === normalizedId
+    || ensureArray<string>(artifact.messageIds).includes(normalizedId)
+  ));
+  return matched?.message;
 }
 
 // 清空所有消息（用于会话切换/新建）
@@ -2785,10 +2179,7 @@ export function clearAllMessages(options: {
 } = {}) {
   captureCurrentSessionViewState();
   if (options.resetTimelineView !== false) {
-    replaceTimelineNodes([]);
-    messagesState.timelineProjection = null;
-    timelineProjectionDirty = false;
-    timelineDisplayOrderCounter = 0;
+    messagesState.canonicalTimelineProjection = null;
     localTimelineTurnOrderSeqCounter = 0;
   }
   messagesState.orchestratorRuntimeState = null;
@@ -2874,69 +2265,13 @@ export function setSessionHistoryState(
   };
 }
 
-function buildTimelineNodesFromProjection(projection: SessionTimelineProjection): TimelineNode[] {
+export function setCanonicalTimelineProjection(projection: SessionTimelineProjection) {
   const canonicalProjection = canonicalizeTimelineProjection(projection);
-  const validArtifacts = ensureArray(canonicalProjection.artifacts).filter(isProjectionArtifact);
-
-  const nextNodes: TimelineNode[] = [];
-  for (const artifact of validArtifacts) {
-
-    const message = normalizeProjectionRestoredMessage(artifact.message);
-    const worker = resolveTimelineWorker(message) || artifact.worker;
-
-    nextNodes.push(normalizeTimelineNode({
-      nodeId: artifact.artifactId,
-      kind: artifact.kind || resolveTimelineNodeKind(message),
-      displayOrder: artifact.displayOrder,
-      artifactVersion: typeof artifact.artifactVersion === 'number' ? artifact.artifactVersion : undefined,
-      anchorEventSeq: typeof artifact.anchorEventSeq === 'number' ? artifact.anchorEventSeq : (getMessageEventSeq(message) ?? 0),
-      latestEventSeq: typeof artifact.latestEventSeq === 'number' ? artifact.latestEventSeq : (getMessageEventSeq(message) ?? 0),
-      cardStreamSeq: typeof artifact.cardStreamSeq === 'number'
-        ? artifact.cardStreamSeq
-        : getMessageCardStreamSeq(message),
-      timestamp: typeof artifact.timestamp === 'number' ? artifact.timestamp : resolveMessageSortTimestamp(message),
-      cardId: artifact.cardId || resolveTimelineCardId(message),
-      dispatchWaveId: artifact.dispatchWaveId,
-      laneId: artifact.laneId,
-      worker,
-      visibleInThread: artifact.threadVisible !== false,
-      workerTabs: normalizeWorkerTabList(artifact.workerTabs),
-      messageIds: Array.from(new Set([
-        artifact.artifactId,
-        ...ensureArray<string>(artifact.messageIds),
-      ])),
-      message: {
-        ...message,
-        id: artifact.artifactId,
-        metadata: {
-          ...(resolveMessageMetadataRecord(message) || {}),
-          eventSeq: getMessageEventSeq(message)
-            ?? (typeof artifact.latestEventSeq === 'number' && Number.isFinite(artifact.latestEventSeq)
-              ? Math.max(0, Math.floor(artifact.latestEventSeq))
-              : 0),
-        },
-      },
-    }));
-  }
-  return nextNodes;
-}
-
-export function setTimelineProjection(projection: SessionTimelineProjection) {
-  const canonicalProjection = canonicalizeTimelineProjection(projection);
-  const nextNodes = buildTimelineNodesFromProjection(canonicalProjection);
-  // 从后端恢复的 projection 中取最大 displayOrder 初始化计数器，确保后续新建节点序号不冲突
-  timelineDisplayOrderCounter = canonicalProjection.artifacts.reduce(
-    (max, a) => Math.max(max, a.displayOrder || 0),
-    timelineDisplayOrderCounter,
-  );
   localTimelineTurnOrderSeqCounter = Math.max(
     localTimelineTurnOrderSeqCounter,
     maxTimelineTurnOrderSeqFromArtifacts(canonicalProjection.artifacts),
   );
-  messagesState.timelineProjection = canonicalProjection;
-  timelineProjectionSource = 'authoritative';
-  setTimelineProjectionNodes(nextNodes);
-  timelineProjectionDirty = false;
+  messagesState.canonicalTimelineProjection = canonicalProjection;
   upsertSessionViewStateSnapshot(createSessionViewStateSnapshot(canonicalProjection.sessionId));
   saveWebviewState();
 }
@@ -2949,7 +2284,6 @@ export function initializeState() {
   sessionViewStateBySession = {};
   sessionExecutionStateBySession = {};
   sessionQueuedMessagesBySession = {};
-  timelineProjectionSource = 'none';
   const persisted = vscode.getState<WebviewPersistedState>();
   if (persisted) {
     const requestedSessionId = typeof messagesState.currentSessionId === 'string'
@@ -2961,7 +2295,6 @@ export function initializeState() {
     const shouldRestoreSessionScopedState = !requestedSessionId || !persistedSessionId || requestedSessionId === persistedSessionId;
     const validSessions = isValidPersistedArray(persisted.sessions, MAX_PERSISTED_ARRAY_LENGTH);
     if (!validSessions) {
-      replaceTimelineNodes([]);
       messagesState.sessions = [];
       messagesState.currentSessionId = messagesState.currentSessionId || null;
       notificationsBySession = {};
@@ -2973,7 +2306,6 @@ export function initializeState() {
     }
     // Tab 状态不持久化，每次打开都默认显示主对话 tab
     messagesState.currentTopTab = 'thread';
-    replaceTimelineNodes([]);
     sessionViewStateBySession = normalizePersistedSessionViewStateMap(persisted.sessionViewStateBySession);
     sessionQueuedMessagesBySession = normalizePersistedQueuedMessageMap(persisted.sessionQueuedMessagesBySession);
     const sessionSeen = new Set<string>();

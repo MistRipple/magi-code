@@ -14,7 +14,7 @@ import {
   setAppState,
   clearPendingInteractions,
   clearAllMessages,
-  setTimelineProjection,
+  setCanonicalTimelineProjection,
   addToast,
   clearPendingRequest,
   setProcessingActor,
@@ -29,7 +29,7 @@ import {
   applyAuthoritativeProcessingState,
   markMessageComplete,
   updateRequestBinding,
-  getTimelineMessageById,
+  getTimelineProjectionMessageById,
   settleProcessingAfterResponseCompletion,
   settleAuthoritativeIdleState,
   applySessionNotifications,
@@ -182,7 +182,7 @@ function handleStateUpdate(
   // 不能由常规 stateUpdate 反向覆盖当前浏览器查看的会话。
   // 否则会出现侧边栏 active、URL、主内容三者分裂，破坏 live/restore 单一真相源。
 
-  // timelineProjection / runtime state 不再通过 stateUpdate 覆盖。
+  // canonical timeline view / runtime state 不再通过 stateUpdate 覆盖。
   // 当前统一约束：
   // 1. sessionBootstrapLoaded 负责 restore / switch 的原子恢复；
   // 2. 活跃会话的实时内容只由 canonical turn event 驱动；
@@ -413,7 +413,6 @@ export function handleUnifiedData(standard: StandardMessage) {
         workspace: payload.workspace,
         sessions: payload.sessions,
         state: payload.state,
-        timelineProjection: payload.timelineProjection,
         canonicalTurns: payload.canonicalTurns,
         notifications: payload.notifications,
         orchestratorRuntimeState: payload.orchestratorRuntimeState,
@@ -659,7 +658,7 @@ function findTerminalAssistantByRequestIdentity(
     .map((id) => typeof id === 'string' ? id.trim() : '')
     .filter((id) => id.length > 0);
   for (const id of directIds) {
-    const directMessage = getTimelineMessageById(id);
+    const directMessage = getTimelineProjectionMessageById(id);
     if (
       directMessage
       && isTerminalAssistantResponse(directMessage)
@@ -727,7 +726,7 @@ function handleSessionTurnCanonicalEventUpdated(message: ClientBridgeMessage) {
   adoptCurrentSessionIdForLiveTurn(sessionId);
   const projection = applyCanonicalTurnEvent(canonicalEvent);
   if (projection) {
-    setTimelineProjection(projection);
+    setCanonicalTimelineProjection(projection);
     if (canonicalEvent.turn) {
       const processingState = deriveProcessingStateFromCanonicalTurns([canonicalEvent.turn], sessionId);
       applyAuthoritativeProcessingState(processingState);
@@ -750,7 +749,7 @@ function applyCanonicalTurnsSnapshot(sessionId: string, turns: unknown): boolean
   if (!projection) {
     return false;
   }
-  setTimelineProjection(projection);
+  setCanonicalTimelineProjection(projection);
   return true;
 }
 

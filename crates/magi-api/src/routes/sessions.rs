@@ -127,6 +127,7 @@ async fn submit_session_turn(
                 &request,
                 decision.task_title.clone(),
                 decision.execution_goal.clone(),
+                request.deep_task,
             )?;
             super::finalize_session_task_dispatch(state.clone(), accepted.clone());
             let execution_chain_ref = state
@@ -519,6 +520,29 @@ fn normalize_session_turn_decision(
             decision.task_evidence.push("deepTask=true".to_string());
         }
     }
+    if !request.deep_task
+        && !matches!(decision.route, SessionTurnRouteDto::Continue)
+        && session_turn_requests_task_orchestration(request)
+    {
+        let original_goal = request.trimmed_text().unwrap_or_default();
+        decision.route = SessionTurnRouteDto::Task;
+        decision.task_title = Some(deep_task_title(&original_goal));
+        if !original_goal.is_empty() {
+            decision.execution_goal = Some(original_goal.to_string());
+        }
+        decision.tool_intent = None;
+        decision.forced_tool_name = None;
+        decision.required_tool_chain.clear();
+        decision.confidence = decision.confidence.max(0.95);
+        decision.reason_code = Some("explicit_task_request".to_string());
+        decision.route_reason =
+            Some("用户明确要求团队模式或任务编排，应创建任务图并由主线统筹执行。".to_string());
+        if decision.task_evidence.is_empty() {
+            decision
+                .task_evidence
+                .push("用户明确要求团队模式或任务编排".to_string());
+        }
+    }
     if matches!(decision.route, SessionTurnRouteDto::Task)
         && !session_turn_task_route_has_creation_evidence(&decision)
     {
@@ -610,6 +634,42 @@ fn normalize_session_turn_decision(
         decision.task_evidence.clear();
     }
     decision
+}
+
+fn session_turn_requests_task_orchestration(request: &SessionTurnRequestDto) -> bool {
+    let Some(text) = request.trimmed_text() else {
+        return false;
+    };
+    let normalized = text.to_ascii_lowercase();
+    [
+        "团队任务模式",
+        "团队模式",
+        "任务模式",
+        "任务编排",
+        "深度任务",
+        "多 worker",
+        "多worker",
+        "多 agent",
+        "多agent",
+        "worker 协作",
+        "worker协作",
+        "分派任务",
+        "分配任务",
+        "创建任务",
+        "多阶段任务",
+        "team mode",
+        "task mode",
+        "orchestration",
+        "orchestrate",
+        "multi-worker",
+        "multi worker",
+        "multi-agent",
+        "multi agent",
+        "subagent",
+        "sub-agent",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term))
 }
 
 fn deep_task_title(original_goal: &str) -> String {
@@ -774,9 +834,11 @@ fn session_turn_requests_current_project_analysis(request: &SessionTurnRequestDt
         "当前项目",
         "当前工程",
         "当前仓库",
+        "当前工作区",
         "本项目",
         "这个项目",
         "项目分析",
+        "工作区",
         "代码库",
         "仓库",
         "current project",
@@ -797,6 +859,10 @@ fn session_turn_requests_current_project_analysis(request: &SessionTurnRequestDt
         "检查",
         "审查",
         "看看",
+        "说明",
+        "介绍",
+        "概括",
+        "是什么",
         "inspect",
         "analyze",
         "analyse",
@@ -805,6 +871,9 @@ fn session_turn_requests_current_project_analysis(request: &SessionTurnRequestDt
         "examine",
         "scan",
         "read",
+        "describe",
+        "summarize",
+        "what is",
     ]
     .iter()
     .any(|term| normalized.contains(term))
@@ -2366,6 +2435,16 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_current_workspace_identity_question_to_tool_execution() {
+        let request = session_turn_request("请用一句话说明当前工作区是什么项目。");
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert_eq!(decision.forced_tool_name.as_deref(), Some("shell_exec"));
+        assert_eq!(decision.reason_code.as_deref(), Some("tool_request"));
+    }
+
+    #[test]
     fn normalizes_explicit_public_builtin_tool_to_forced_execution() {
         let request = session_turn_request("请只调用 file_mkdir 工具创建目录");
         let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
@@ -2431,6 +2510,28 @@ mod tests {
         assert!(goal.contains("FLOW_TASK_FILE_OK"));
         assert!(goal.contains("FLOW_TASK_DONE"));
         assert_eq!(decision.reason_code.as_deref(), Some("deep_task_requested"));
+    }
+
+    #[test]
+    fn explicit_team_task_mode_creates_task_without_hidden_deep_task_flag() {
+        let request = session_turn_request(
+            "请用团队任务模式检查当前 TEST 工作区：列出项目入口、运行一个简单 shell 检查，并给出简短结论。",
+        );
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert_eq!(
+            decision.reason_code.as_deref(),
+            Some("explicit_task_request")
+        );
+        assert!(
+            decision
+                .execution_goal
+                .as_deref()
+                .unwrap_or_default()
+                .contains("团队任务模式")
+        );
+        assert!(!decision.task_evidence.is_empty());
     }
 
     #[test]

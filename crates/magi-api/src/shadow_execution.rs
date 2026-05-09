@@ -228,8 +228,8 @@ pub(crate) fn run_shadow_dispatch_submission(
                 execution_chain_ref: execution_chain_ref.clone(),
             },
             worker_id: worker_id.clone(),
-            lane_id: None,
-            lane_seq: None,
+            lane_id: (!request.deep_task).then(|| format!("lane-{}", act_task_id)),
+            lane_seq: (!request.deep_task).then_some(1),
             is_primary: true,
             session_id: session_id.clone(),
             workspace_id: workspace_id.clone(),
@@ -244,7 +244,7 @@ pub(crate) fn run_shadow_dispatch_submission(
                     deep_task: request.deep_task,
                 },
             ),
-            use_tools: request.deep_task,
+            use_tools: true,
             skill_name: request.skill_name.clone(),
         },
     );
@@ -302,7 +302,7 @@ pub(crate) fn run_shadow_dispatch_submission(
         checkpoint_at: Some(now),
         resume_mode: Some("stage-restart".to_string()),
         resume_token: None,
-        use_tools: request.deep_task,
+        use_tools: true,
         skill_name: request.skill_name.clone(),
         is_primary: true,
     }];
@@ -338,6 +338,11 @@ pub(crate) fn run_shadow_dispatch_submission(
     let user_message_item_id = user_message_id
         .clone()
         .unwrap_or_else(|| format!("turn-item-user-{}", accepted_at.0));
+    let visible_lane_task_ids = if dispatch_task_ids.is_empty() {
+        vec![act_task_id.clone()]
+    } else {
+        dispatch_task_ids.clone()
+    };
     let mut current_turn = ActiveExecutionTurn {
         turn_id: format!("turn-session-action-{}", accepted_at.0),
         turn_seq: accepted_at.0,
@@ -381,7 +386,10 @@ pub(crate) fn run_shadow_dispatch_submission(
                 status: "pending".to_string(),
                 source: "orchestrator".to_string(),
                 title: Some("任务理解".to_string()),
-                content: Some("编排者已接收请求，开始拆解执行步骤。".to_string()),
+                content: Some(
+                    "我先把这个目标拆成可执行步骤，随后分派给合适的执行者；结果回来后继续在主线里整合判断。"
+                        .to_string(),
+                ),
                 task_id: Some(act_task_id.clone()),
                 worker_id: Some(worker_id.clone()),
                 role_id: role_for_task(&act_task_id),
@@ -399,7 +407,7 @@ pub(crate) fn run_shadow_dispatch_submission(
                 worker_visible: false,
             },
         ],
-        worker_lanes: dispatch_task_ids
+        worker_lanes: visible_lane_task_ids
             .iter()
             .enumerate()
             .map(|(index, sub_task_id)| ActiveExecutionTurnLane {
@@ -417,7 +425,7 @@ pub(crate) fn run_shadow_dispatch_submission(
             })
             .collect(),
     };
-    for (index, sub_task_id) in dispatch_task_ids.iter().enumerate() {
+    for (index, sub_task_id) in visible_lane_task_ids.iter().enumerate() {
         let lane_id = format!("lane-{}", sub_task_id);
         let lane_title = current_turn
             .worker_lanes
@@ -522,58 +530,26 @@ fn task_graph_mainline_summary(
     worker_lanes: &[ActiveExecutionTurnLane],
 ) -> String {
     let mut phase_count = 0usize;
-    let mut action_count = 0usize;
-    let mut role_ids = std::collections::BTreeSet::<String>::new();
     let mut pending = task_store.get_children(root_task_id);
 
     while let Some(task) = pending.pop() {
         match task.kind {
             TaskKind::Phase => phase_count += 1,
-            TaskKind::Action => {
-                action_count += 1;
-                if let Some(binding) = task.executor_binding.as_ref() {
-                    let role_id = binding.target_role.trim();
-                    if !role_id.is_empty() {
-                        role_ids.insert(role_id.to_string());
-                    }
-                }
-            }
-            TaskKind::Validation | TaskKind::Repair => {
-                if let Some(binding) = task.executor_binding.as_ref() {
-                    let role_id = binding.target_role.trim();
-                    if !role_id.is_empty() {
-                        role_ids.insert(role_id.to_string());
-                    }
-                }
-            }
             TaskKind::Objective | TaskKind::WorkPackage | TaskKind::Decision => {}
+            TaskKind::Action | TaskKind::Validation | TaskKind::Repair => {}
         }
         pending.extend(task_store.get_children(&task.task_id));
     }
 
     if phase_count > 0 {
         return format!(
-            "已完成任务编排：{} 个阶段、{} 个执行动作，由 {} 个负责人推进；我会在主线继续汇总关键进展。",
-            phase_count,
-            action_count,
-            role_ids.len().max(1)
+            "已完成任务分派：上方卡片会按执行分支展示负责人、目标和状态。接下来我会回收结果，继续在主线里整合判断并推进下一步。"
         );
     }
 
-    let fallback_role_count = worker_lanes
-        .iter()
-        .filter_map(|lane| {
-            lane.role_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|role_id| !role_id.is_empty())
-        })
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
     format!(
-        "已完成执行分工：{} 个执行分支交给 {} 个负责人推进；我会在主线继续汇总关键进展。",
+        "已创建 {} 个执行分支；上方卡片会展示负责人、目标和状态。接下来我会回收结果，继续在主线里整合判断并推进下一步。",
         worker_lanes.len(),
-        fallback_role_count.max(1)
     )
 }
 
@@ -2348,6 +2324,74 @@ mod tests {
     }
 
     #[test]
+    fn explicit_non_deep_task_uses_shallow_single_worker_with_tools() {
+        let (state, task_store) = build_test_state();
+        let session_id = SessionId::new("session-shallow-team-task");
+        state
+            .session_store
+            .create_session(session_id.clone(), "shallow team task")
+            .expect("session should be creatable");
+
+        let accepted_at = UtcMillis::now();
+        let submission = run_shadow_dispatch_submission(
+            &state,
+            &DispatchSubmissionRequest {
+                accepted_at,
+                session_id: session_id.clone(),
+                workspace_id: None,
+                entry_id: "entry-shallow-team-task".to_string(),
+                timeline_message: "团队模式：分派一个 worker 读取 README 标题".to_string(),
+                created_session: false,
+                mission_title: "团队模式：分派一个 worker 读取 README 标题".to_string(),
+                task_title: "执行: 团队模式：分派一个 worker 读取 README 标题".to_string(),
+                trimmed_text: Some("团队模式：分派一个 worker 读取 README 标题".to_string()),
+                execution_goal: Some("分派一个 worker 读取 README 标题".to_string()),
+                deep_task: false,
+                skill_name: None,
+                target_role: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+            },
+        )
+        .expect("explicit task orchestration should create shallow task graph");
+
+        let subtree = task_store.collect_subtree_ids(&submission.root_task_id);
+        assert_eq!(subtree.len(), 2, "非 deepTask 的显式任务编排应保持浅图");
+        let phase_count = subtree
+            .iter()
+            .filter(|task_id| {
+                task_store
+                    .get_task(task_id)
+                    .is_some_and(|task| task.kind == TaskKind::Phase)
+            })
+            .count();
+        assert_eq!(phase_count, 0, "浅任务不应生成规划/执行/交付 phase");
+
+        let chain = submission
+            .active_execution_chain
+            .as_ref()
+            .expect("active execution chain should exist");
+        assert_eq!(chain.branches.len(), 1);
+        assert!(chain.branches[0].use_tools, "浅任务 worker 仍必须可调用工具");
+        assert_eq!(chain.branches[0].task_id, submission.action_task_id);
+
+        let turn = chain.current_turn.as_ref().expect("current turn should exist");
+        assert_eq!(turn.worker_lanes.len(), 1);
+        assert_eq!(turn.worker_lanes[0].task_id, submission.action_task_id);
+        assert!(
+            !turn.worker_lanes[0].title.contains("执行: 执行:"),
+            "worker 分派标题不能重复套用执行前缀"
+        );
+        let worker_card_count = turn
+            .items
+            .iter()
+            .filter(|item| item.kind == "worker_spawned")
+            .count();
+        assert_eq!(worker_card_count, 1, "浅任务只应展示一个 worker 分派卡");
+    }
+
+    #[test]
     fn deep_task_turn_keeps_normal_mainline_dialog_and_orchestrator_steps() {
         let (state, _task_store) = build_test_state();
         let state =
@@ -2407,13 +2451,13 @@ mod tests {
         );
         assert!(
             visible_items.iter().any(|(kind, content)| {
-                *kind == "assistant_phase" && content.contains("开始拆解执行步骤")
+                *kind == "assistant_phase" && content.contains("拆成可执行步骤")
             }),
             "编排者开始拆解任务的行为必须作为主线普通文本"
         );
         assert!(
             visible_items.iter().any(|(kind, content)| {
-                *kind == "assistant_phase" && content.contains("已完成任务编排")
+                *kind == "assistant_phase" && content.contains("继续在主线里整合")
             }),
             "任务分配卡之后必须继续保留编排者自己的行为说明"
         );

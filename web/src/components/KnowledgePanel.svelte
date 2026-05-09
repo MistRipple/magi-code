@@ -327,7 +327,7 @@
   }
 
   function formatLoadError(error: unknown): string {
-    return error instanceof Error ? error.message : String(error || i18n.t('mermaid.unknownError'));
+    return error instanceof Error ? error.message : String(error || i18n.t('knowledgePanel.unknownError'));
   }
 
   function applyKnowledgePayload(payload: Record<string, unknown> | null | undefined) {

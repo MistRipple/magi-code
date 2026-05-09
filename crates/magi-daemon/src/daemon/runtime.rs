@@ -605,6 +605,7 @@ impl ShadowDaemonRuntime {
                 .with_knowledge_persist_callback(knowledge_persist_callback)
                 .with_settings_store(state.settings_store.clone())
                 .with_context_runtime(context_runtime_for_dispatcher)
+                .with_workspace_registry(state.workspace_registry.clone())
                 .with_tool_registry(tool_registry_for_dispatcher)
                 .with_skill_runtime(app_skill_runtime),
         );

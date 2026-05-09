@@ -17,8 +17,15 @@ export type ToolVisibility = 'thread_visible' | 'runtime_internal' | 'worker_sid
 /**
  * 编排器内部协议工具名列表。
  * 这些工具调用产生的输出不应出现在任何用户可见的面板中。
+ *
+ * 该列表必须与后端 `BuiltinToolName::is_public_tool_surface()` 保持一致：
+ *   - process_launch / process_read / process_write / process_kill / process_list
+ *     在后端被标记为 shell_exec 的内部执行能力，不是模型可见工具；前端同样不展示。
+ *   - 其余条目是编排协议工具（worker_dispatch / worker_wait / send_worker_message 等），
+ *     由编排器内部使用，不面向用户。
  */
 const RUNTIME_INTERNAL_TOOLS = new Set<string>([
+  // 编排协议（worker lane / task graph）
   'assignment_dispatch',
   'worker_dispatch',
   'worker_wait',
@@ -40,6 +47,12 @@ const RUNTIME_INTERNAL_TOOLS = new Set<string>([
   'submit_review',
   'read_instructions',
   'governance_handshake',
+  // 后端 builtin shell 内部能力（模型不可调用，仅在 shell_exec 内部走子进程协议）
+  'process_launch',
+  'process_read',
+  'process_write',
+  'process_kill',
+  'process_list',
 ]);
 
 /**

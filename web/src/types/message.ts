@@ -580,39 +580,6 @@ export interface AgentOutputs {
   [agentId: string]: Message[];
 }
 
-export type TimelineNodeKind = 'message' | 'tool';
-
-export interface TimelineLaneOrder {
-  thread?: number;
-  workers?: Partial<Record<AgentId, number>>;
-}
-
-export interface TimelineNode {
-  nodeId: string;
-  kind: TimelineNodeKind;
-  displayOrder?: number;
-  laneOrder?: TimelineLaneOrder;
-  artifactVersion?: number;
-  anchorEventSeq: number;
-  latestEventSeq: number;
-  cardStreamSeq: number;
-  timestamp: number;
-  /**
-   * 冻结的语义阶段号。节点首次落位时从 messageType/primaryToolCallName 计算并固化。
-   * 后续流式更新不改变此值，确保卡片位置不漂移。
-   */
-  frozenSemanticStage?: number;
-  cardId?: string;
-  lifecycleKey?: string;
-  dispatchWaveId?: string;
-  laneId?: string;
-  worker?: AgentId;
-  visibleInThread: boolean;
-  workerTabs: AgentId[];
-  messageIds: string[];
-  message: Message;
-}
-
 export type TimelineProjectionArtifactKind = 'message' | 'tool';
 
 export interface TimelineProjectionArtifact {

@@ -12,6 +12,7 @@
   import { markQueuedMessageAsGuide, retryRuntimeState } from '../stores/messages.svelte';
   import { getAgentColor } from '../lib/agent-colors';
   import { formatDuration, formatElapsed as formatElapsedMmSs } from '../lib/utils';
+  import { isRuntimeInternalTool } from '../shared/tool-visibility';
 
   // Props
   interface Props {
@@ -94,7 +95,17 @@
       !!b && typeof b === 'object' && 'type' in b
     )
   );
-  const presentationBlocks = $derived(safeBlocks);
+  // 主线不承载运行时内部工具（worker_dispatch / worker_wait 等）：
+  // 这些 block 只能作为任务面板/运行时日志的投影，不直接成为主线工具卡。
+  const presentationBlocks = $derived(
+    safeBlocks.filter((block) => {
+      if (block.type !== 'tool_call' && block.type !== 'tool_result') {
+        return true;
+      }
+      const toolName = typeof block.toolCall?.name === 'string' ? block.toolCall.name : '';
+      return !isRuntimeInternalTool(toolName);
+    })
+  );
   // 检查是否真的有可见内容（防止虽然有 blocks 但全是空字符串导致 UI 假死）
   const hasVisibleContent = $derived.by(() => {
     if (message.content && message.content.trim().length > 0) return true;

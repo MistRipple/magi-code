@@ -231,9 +231,8 @@ pub(crate) fn run_task_llm_loop(
     let mut completed_required_tool_names: Vec<String> = Vec::new();
     let mut last_stream_item_id: Option<String> = None;
     let mut had_tool_calls = false;
-    let primary_worker_sidechain = worker_lane_id.is_none()
-        && worker_id.is_some()
-        && current_turn_has_worker_lanes(session_store, session_id);
+    let primary_worker_sidechain =
+        worker_id.is_some() && current_turn_has_worker_lanes(session_store, session_id);
     let turn_visibility = task_turn_visibility(
         task,
         streaming_entry_id.is_some()

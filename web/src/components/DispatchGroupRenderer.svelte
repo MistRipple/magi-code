@@ -1,11 +1,9 @@
 <script lang="ts">
   import type { ContentBlock, DispatchGroupLane, WorkerLaneStatus } from '../types/message';
   import type { IconName } from '../lib/icons';
-  import {
-    buildTaskOrchestrationView,
-  } from '../lib/task-orchestration-presentation';
-  import { getTaskGraphState } from '../stores/task-graph-store.svelte';
-  import { getState } from '../stores/messages.svelte';
+  import { getAgentVisualInfo } from '../lib/agent-colors';
+  import { resolveWorkerDisplayName, resolveWorkerRoleSource } from '../lib/worker-role-utils';
+  import { getEnabledAgents, messagesState } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
 
@@ -33,11 +31,14 @@
     summary: string;
     toolUseCount: number;
     fileChangeCount: number;
+    workerDisplayLabel: string;
+    workerColor: string;
+    workerMuted: string;
+    workerIcon: IconName;
   }
 
-  const appState = getState();
-  const currentSessionId = $derived(typeof appState.currentSessionId === 'string' ? appState.currentSessionId.trim() : '');
-  const taskGraph = $derived(getTaskGraphState(currentSessionId));
+  const enabledAgents = $derived(getEnabledAgents());
+  const registrySnapshot = $derived(messagesState.settingsRegistrySnapshot);
 
   const lanes = $derived.by(() => (
     Array.isArray(block.lanes)
@@ -49,8 +50,6 @@
         .map((entry) => entry.lane)
       : []
   ));
-
-  const orchestration = $derived(buildTaskOrchestrationView(taskGraph.projection, lanes));
 
   function normalizeText(value: unknown): string {
     return typeof value === 'string' ? value.trim() : '';
@@ -86,22 +85,22 @@
   function resolveStatusConfig(status: WorkerLaneStatus): StatusConfig {
     switch (status) {
       case 'running':
-        return { key: 'subTaskSummaryCard.status.running', tone: 'running', icon: 'play' };
+        return { key: 'dispatchGroupCard.status.running', tone: 'running', icon: 'play' };
       case 'awaiting_approval':
-        return { key: 'subTaskSummaryCard.status.awaitingApproval', tone: 'paused', icon: 'alert-circle' };
+        return { key: 'dispatchGroupCard.status.awaitingApproval', tone: 'paused', icon: 'alert-circle' };
       case 'review_required':
-        return { key: 'subTaskSummaryCard.status.reviewRequired', tone: 'paused', icon: 'alert-circle' };
+        return { key: 'dispatchGroupCard.status.reviewRequired', tone: 'paused', icon: 'alert-circle' };
       case 'blocked':
-        return { key: 'subTaskSummaryCard.status.blocked', tone: 'danger', icon: 'alert-circle' };
+        return { key: 'dispatchGroupCard.status.blocked', tone: 'danger', icon: 'alert-circle' };
       case 'completed':
-        return { key: 'subTaskSummaryCard.status.completed', tone: 'success', icon: 'check-circle' };
+        return { key: 'dispatchGroupCard.status.completed', tone: 'success', icon: 'check-circle' };
       case 'failed':
-        return { key: 'subTaskSummaryCard.status.failed', tone: 'danger', icon: 'x-circle' };
+        return { key: 'dispatchGroupCard.status.failed', tone: 'danger', icon: 'x-circle' };
       case 'cancelled':
-        return { key: 'subTaskSummaryCard.status.cancelled', tone: 'danger', icon: 'x-circle' };
+        return { key: 'dispatchGroupCard.status.cancelled', tone: 'danger', icon: 'x-circle' };
       case 'pending':
       default:
-        return { key: 'subTaskSummaryCard.status.pending', tone: 'pending', icon: 'hourglass' };
+        return { key: 'dispatchGroupCard.status.pending', tone: 'pending', icon: 'hourglass' };
     }
   }
 
@@ -138,8 +137,33 @@
       || i18n.t('dispatchGroupCard.stageFallback');
   }
 
+  function resolveFallbackLaneWorkerId(lane: DispatchGroupLane): string {
+    return normalizeText(lane.jumpTarget?.workerTabId)
+      || normalizeText(lane.worker)
+      || 'orchestrator';
+  }
+
+  function resolveWorkerMeta(workerId: string) {
+    const normalizedWorkerId = normalizeText(workerId) || 'orchestrator';
+    const roleSource = normalizedWorkerId === 'orchestrator'
+      ? null
+      : resolveWorkerRoleSource(normalizedWorkerId, enabledAgents, registrySnapshot);
+    const displayWorkerId = normalizeText(roleSource?.templateId) || normalizedWorkerId;
+    const displayName = normalizedWorkerId === 'orchestrator'
+      ? i18n.t('workerBadge.role.orchestrator')
+      : resolveWorkerDisplayName(displayWorkerId, enabledAgents, registrySnapshot, (key) => i18n.t(key));
+    const visualInfo = getAgentVisualInfo(displayWorkerId, roleSource?.colorToken);
+    return {
+      workerDisplayLabel: displayName || displayWorkerId,
+      workerColor: visualInfo.color,
+      workerMuted: visualInfo.muted,
+      workerIcon: visualInfo.icon,
+    };
+  }
+
   const fallbackRows = $derived.by<FallbackLaneViewModel[]>(() => (
     lanes.map((lane, index) => {
+      const workerInfo = resolveWorkerMeta(resolveFallbackLaneWorkerId(lane));
       return {
         key: lane.laneId,
         displayIndex: index + 1,
@@ -148,6 +172,7 @@
         summary: compactSummary(normalizeText(lane.summary) || normalizeText(lane.liveActivity)),
         toolUseCount: resolvePositiveCount(lane.toolUseCount),
         fileChangeCount: resolvePositiveCount(lane.fileChangeCount),
+        ...workerInfo,
       };
     })
   ));
@@ -157,90 +182,13 @@
     fallbackRows.length > 0 ? 'completed' : 'pending',
   ));
 
-  const groupStatusConfig = $derived.by(() => resolveStatusConfig(orchestration?.status || fallbackStatus));
+  const groupStatusConfig = $derived.by(() => resolveStatusConfig(fallbackStatus));
   const fallbackSummary = $derived(i18n.t('dispatchGroupCard.dispatchSummary', {
     laneCount: fallbackRows.length,
   }));
-
 </script>
 
-{#if orchestration}
-  <section class="dispatch-group-card" data-dispatch-wave-id={block.dispatchWaveId}>
-    <div class="dispatch-group-card__accent" aria-hidden="true"></div>
-    <div class="dispatch-group-card__body">
-      <div class="dispatch-group-card__header">
-        <div class="dispatch-group-card__title-wrap">
-          <span class="dispatch-group-card__icon">
-            <Icon name="bot" size={14} />
-          </span>
-          <div class="dispatch-group-card__title-text">
-            <span class="dispatch-group-card__title">{i18n.t('dispatchGroupCard.title')}</span>
-            <span class="dispatch-group-card__subtitle">
-              {i18n.t('dispatchGroupCard.orchestrationSummary', {
-                phaseCount: orchestration.totalPhaseCount,
-                actionCount: orchestration.totalActionCount,
-              })}
-            </span>
-          </div>
-        </div>
-        <div class="dispatch-group-card__statusline">
-          <span class="dispatch-group-card__progress">{i18n.t('dispatchGroupCard.progress', { completed: orchestration.completedPhaseCount, total: orchestration.totalPhaseCount })}</span>
-          <span class={`dispatch-group-card__status dispatch-group-card__status--${groupStatusConfig.tone}`}>
-            <Icon name={groupStatusConfig.icon} size={12} />
-            <span>{i18n.t(groupStatusConfig.key)}</span>
-          </span>
-        </div>
-      </div>
-
-      <div class="dispatch-group-card__stages">
-        {#each orchestration.phases as phase, index (phase.key)}
-          {@const statusConfig = resolveStatusConfig(phase.status)}
-          <div
-            class="dispatch-group-card__stage-row"
-          >
-            <span class={`dispatch-group-card__stage-index dispatch-group-card__stage-index--${statusConfig.tone}`}>
-              {index + 1}
-            </span>
-            <span class="dispatch-group-card__stage-main">
-              <span class="dispatch-group-card__stage-topline">
-                <span class="dispatch-group-card__stage-title">{phase.title}</span>
-                <span class={`dispatch-group-card__mini-status dispatch-group-card__mini-status--${statusConfig.tone}`}>
-                  <Icon name={statusConfig.icon} size={11} />
-                  <span>{i18n.t(statusConfig.key)}</span>
-                </span>
-                {#if phase.validationStatus}
-                  {@const validationConfig = resolveStatusConfig(phase.validationStatus)}
-                  <span class={`dispatch-group-card__mini-status dispatch-group-card__mini-status--${validationConfig.tone}`}>
-                    <Icon name={validationConfig.icon} size={11} />
-                    <span>{i18n.t('dispatchGroupCard.validationLabel', { status: i18n.t(validationConfig.key) })}</span>
-                  </span>
-                {/if}
-              </span>
-              {#if phase.actionTitles.length > 0}
-                <span class="dispatch-group-card__current">
-                  {i18n.t('dispatchGroupCard.actionLabel', { actions: phase.actionTitles.join('、') })}
-                </span>
-              {/if}
-              {#if phase.summary}
-                <span class="dispatch-group-card__summary">{phase.summary}</span>
-              {/if}
-            </span>
-            {#if phase.toolUseCount > 0 || phase.fileChangeCount > 0}
-              <span class="dispatch-group-card__stage-metrics">
-                {#if phase.toolUseCount > 0}
-                  <span>{i18n.t('subTaskSummaryCard.toolCallCount', { count: phase.toolUseCount })}</span>
-                {/if}
-                {#if phase.fileChangeCount > 0}
-                  <span>{i18n.t('subTaskSummaryCard.fileChangeCount', { count: phase.fileChangeCount })}</span>
-                {/if}
-              </span>
-            {/if}
-          </div>
-        {/each}
-      </div>
-    </div>
-  </section>
-{:else if fallbackRows.length > 0}
+{#if fallbackRows.length > 0}
   <section class="dispatch-group-card" data-dispatch-wave-id={block.dispatchWaveId}>
     <div class="dispatch-group-card__accent" aria-hidden="true"></div>
     <div class="dispatch-group-card__body">
@@ -267,6 +215,7 @@
           {@const statusConfig = resolveStatusConfig(row.status)}
           <div
             class="dispatch-group-card__stage-row"
+            style={`--worker-color:${row.workerColor};--worker-muted:${row.workerMuted};`}
           >
             <span class={`dispatch-group-card__stage-index dispatch-group-card__stage-index--${statusConfig.tone}`}>
               {row.displayIndex}
@@ -282,14 +231,20 @@
               {#if row.summary}
                 <span class="dispatch-group-card__summary">{row.summary}</span>
               {/if}
+              <span class="dispatch-group-card__owner">
+                <span class="dispatch-group-card__owner-icon">
+                  <Icon name={row.workerIcon} size={11} />
+                </span>
+                <span>{i18n.t('dispatchGroupCard.owner', { workerLabel: row.workerDisplayLabel })}</span>
+              </span>
             </span>
             {#if row.toolUseCount > 0 || row.fileChangeCount > 0}
               <span class="dispatch-group-card__stage-metrics">
                 {#if row.toolUseCount > 0}
-                  <span>{i18n.t('subTaskSummaryCard.toolCallCount', { count: row.toolUseCount })}</span>
+                  <span>{i18n.t('dispatchGroupCard.toolCallCount', { count: row.toolUseCount })}</span>
                 {/if}
                 {#if row.fileChangeCount > 0}
-                  <span>{i18n.t('subTaskSummaryCard.fileChangeCount', { count: row.fileChangeCount })}</span>
+                  <span>{i18n.t('dispatchGroupCard.fileChangeCount', { count: row.fileChangeCount })}</span>
                 {/if}
               </span>
             {/if}

@@ -1109,21 +1109,6 @@ function normalizeNotifications(
   return normalized;
 }
 
-function buildEmptyTimelineProjection(
-  sessionId: string,
-  generatedAt: number,
-): SessionBootstrapSnapshot['timelineProjection'] {
-  return {
-    schemaVersion: 'session-timeline-projection.v2',
-    sessionId,
-    updatedAt: generatedAt,
-    lastAppliedEventSeq: 0,
-    artifacts: [],
-    threadRenderEntries: [],
-    workerRenderEntries: {},
-  };
-}
-
 export function isRustEventEnvelope(value: unknown): value is RustEventEnvelope {
   return normalizeEventEnvelope(value) !== null;
 }
@@ -1187,7 +1172,6 @@ export function normalizeRustBootstrapPayload(
     pendingChangesStateVersion: generatedAt,
     stateUpdatedAt: generatedAt,
   };
-  const timelineProjection = buildEmptyTimelineProjection(currentSession?.id || '', generatedAt);
   const normalizedNotifications = normalizeNotifications(payload.notifications);
 
   return {
@@ -1199,7 +1183,6 @@ export function normalizeRustBootstrapPayload(
     sessionId: currentSession?.id || '',
     sessions,
     state,
-    timelineProjection,
     canonicalTurns,
     notifications: currentSession?.id
         ? {
