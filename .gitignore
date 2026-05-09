@@ -20,7 +20,9 @@ yarn-error.log*
 # --- Project Specific ---
 /tmp/
 *.log
+*.pid
 .magi-host-loopback-*
+.codex-acceptance-*/
 
 # --- IDEs & Tools ---
 .gemini/
