@@ -10,7 +10,7 @@
   } from '../stores/messages.svelte';
   import { getTaskGraphState, refreshTaskProjection } from '../stores/task-graph-store.svelte';
   import { RustDaemonClient } from '../shared/rust-daemon-client';
-  import { resolveAgentBaseUrl, submitSessionTurn } from '../web/agent-api';
+  import { enhanceAgentPrompt, resolveAgentBaseUrl, submitSessionTurn } from '../web/agent-api';
   import Icon from './Icon.svelte';
   import Modal from './Modal.svelte';
   import { generateId } from '../lib/utils';
@@ -39,6 +39,7 @@
   // Intake 路由状态
   let intakeLoading = $state(false);
   let stopLoading = $state(false);
+  let enhanceLoading = $state(false);
 
   // P4-#17：单会话串行任务确认对话框
   // 任务图运行时再次提交，先弹窗让用户选「补充指令 / 停止当前并新建 / 取消」，
@@ -423,6 +424,35 @@
   function clearAllImages() {
     selectedImages = [];
   }
+
+  // Prompt enhance：调用后端模型重写当前 textarea 文本
+  async function enhancePromptHandler() {
+    const draft = inputValue.trim();
+    if (enhanceLoading || !draft) return;
+    enhanceLoading = true;
+    try {
+      const result = await enhanceAgentPrompt(draft);
+      const next = (result?.enhancedPrompt ?? '').trim();
+      if (!next) {
+        addToast('warning', result?.error || i18n.t('input.enhance.empty'));
+        return;
+      }
+      inputValue = next;
+      queueMicrotask(() => {
+        const el = inputTextareaEl;
+        if (!el) return;
+        el.focus();
+        const cursor = next.length;
+        try { el.setSelectionRange(cursor, cursor); } catch { /* ignore */ }
+      });
+      addToast('success', i18n.t('input.enhance.success'));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      addToast('error', i18n.t('input.enhance.failed', { message }));
+    } finally {
+      enhanceLoading = false;
+    }
+  }
 </script>
 
 <div class="ia-container">
@@ -498,7 +528,20 @@
     {/if}
 
     <div class="ia-actions">
-      <div class="ia-left" aria-hidden="true"></div>
+      <div class="ia-left">
+        <button
+          type="button"
+          class="ia-enhance"
+          class:loading={enhanceLoading}
+          onclick={enhancePromptHandler}
+          disabled={enhanceLoading || !inputValue.trim() || sessionInputLocked || isInteractionBlocking}
+          title={i18n.t('input.enhance.title')}
+          aria-label={i18n.t('input.enhance.title')}
+        >
+          <Icon name={enhanceLoading ? 'loader' : 'enhance'} size={14} class={enhanceLoading ? 'spinning' : ''} />
+          <span>{i18n.t('input.enhance.label')}</span>
+        </button>
+      </div>
 
       <div class="ia-right">
         {#if isSending}
@@ -694,6 +737,28 @@
   .ia-send:disabled { opacity: 0.35; cursor: not-allowed; }
   .ia-send.stop { background: var(--error); color: white; animation: ia-pulse 1.2s ease-in-out infinite; }
   @keyframes ia-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.65; } }
+
+  .ia-enhance {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 24px;
+    padding: 0 8px;
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-full);
+    color: var(--foreground-muted);
+    font-size: 11px;
+    cursor: pointer;
+    transition: all var(--transition-fast);
+  }
+  .ia-enhance:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 38%, transparent);
+    color: var(--primary);
+  }
+  .ia-enhance:disabled { opacity: 0.4; cursor: not-allowed; }
+  .ia-enhance.loading { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 50%, transparent); }
 
   /* 图片预览 */
   .ia-images {
