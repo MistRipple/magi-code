@@ -25,6 +25,7 @@
     getTaskKindLabel,
     getTaskStatusLabel,
     getTaskStatusTone,
+    isUserVisibleTaskKind,
   } from '../lib/task-labels';
   import { isTaskProjectionAcceptingIntake } from '../lib/task-projection-state';
   import { resolveWorkerDisplayName } from '../lib/worker-role-utils';
@@ -249,6 +250,17 @@
     attentionTasks.find((task) => task.kind === 'Decision') ?? null
   ));
   const decisionAttentionTasks = $derived.by(() => attentionTasks.filter((task) => task.kind === 'Decision'));
+  // 用户面（主视图）只展开 Action / Validation / Decision；Phase / WorkPackage / Repair / Objective
+  // 仅出现在“技术明细”折叠区，与引擎结构隔开。
+  const userVisibleTasks = $derived.by(() => (
+    activeProjectionTasks
+      .filter((task) => isUserVisibleTaskKind(task.kind))
+      .slice()
+      .sort((left, right) => {
+        if (left.created_at !== right.created_at) return left.created_at - right.created_at;
+        return left.task_id.localeCompare(right.task_id);
+      })
+  ));
 
   function getTaskParentTitle(task: TaskDto): string {
     if (!task.parent_task_id) return '根任务';
@@ -401,7 +413,6 @@
     const lines = [
       '交付概览',
       `目标：${getTaskDisplayText(pkg.goal) || '--'}`,
-      `模式：${pkg.execution_mode === 'deep' ? '深度模式' : '普通模式'}`,
       `状态：${getTaskStatusLabel(pkg.aggregate_status as TaskStatus)}`,
       pkg.current_phase ? `阶段：${pkg.current_phase}` : null,
       `进度：${completed}/${total}（${percent}%）`,
@@ -921,6 +932,43 @@
               <Icon name={getTaskReferenceIconName(selectedTaskReference.reference)} size={12} />
               <span>{getTaskReferenceActionLabel(selectedTaskReference.reference)}</span>
             </button>
+          </div>
+        </section>
+      {/if}
+
+      {#if userVisibleTasks.length > 0}
+        <section class="task-step-list" aria-label="执行步骤">
+          <div class="task-section-header">
+            <span>执行步骤</span>
+            <span class="task-section-meta">{userVisibleTasks.length} 项</span>
+          </div>
+          <div class="task-step-rows">
+            {#each userVisibleTasks as task (task.task_id)}
+              {@const statusIcon = getProjectionStatusIcon(task.status)}
+              <button
+                type="button"
+                class="task-step-row tg-tree-row--{getTaskStatusModifier(task.status)}"
+                class:task-step-row--selected={selectedGraphTask?.task_id === task.task_id}
+                title={getTaskDisplayTitle(task)}
+                onclick={() => selectGraphTask(task.task_id)}
+              >
+                <span class="tg-kind-badge">{getTaskKindLabel(task.kind)}</span>
+                <span class="tg-tree-status-icon tg-status-icon--{getTaskStatusModifier(task.status)}">
+                  {#if statusIcon.spinning}
+                    <Icon name={statusIcon.name} size={14} class="spinning" />
+                  {:else}
+                    <Icon name={statusIcon.name} size={14} />
+                  {/if}
+                </span>
+                <span class="task-step-content">
+                  <span class="task-step-title">{getTaskDisplayTitle(task)}</span>
+                  {#if getTaskDisplayGoal(task) && getTaskDisplayGoal(task) !== getTaskDisplayTitle(task)}
+                    <span class="task-step-goal">{getTaskDisplayGoal(task)}</span>
+                  {/if}
+                </span>
+                <span class="task-step-status">{getTaskStatusLabel(task.status)}</span>
+              </button>
+            {/each}
           </div>
         </section>
       {/if}
@@ -1953,6 +2001,74 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* ========== 用户面执行步骤列表（仅 Action / Validation / Decision） ========== */
+  .task-step-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .task-step-rows {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .task-step-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
+    border-radius: var(--radius-md);
+    background: var(--surface-1);
+    color: var(--foreground);
+    text-align: left;
+    cursor: pointer;
+    transition: background var(--transition-fast), border-color var(--transition-fast);
+  }
+
+  .task-step-row:hover {
+    background: var(--surface-2);
+    border-color: var(--border);
+  }
+
+  .task-step-row--selected {
+    border-color: color-mix(in srgb, var(--primary) 60%, var(--border));
+    background: color-mix(in srgb, var(--primary) 10%, var(--surface-1));
+  }
+
+  .task-step-content {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .task-step-title {
+    overflow: hidden;
+    color: var(--foreground);
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .task-step-goal {
+    overflow: hidden;
+    color: var(--foreground-muted);
+    font-size: var(--text-2xs);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .task-step-status {
+    flex-shrink: 0;
+    color: var(--foreground-muted);
+    font-size: var(--text-2xs);
   }
 
   /* ========== Attention Section (blocked / decisions) ========== */

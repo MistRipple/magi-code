@@ -126,6 +126,14 @@ export function getTaskKindLabel(kind: TaskKind): string {
   }
 }
 
+// 用户面（TasksPanel 主视图）只暴露这三类节点；
+// Phase / WorkPackage / Repair / Objective 属于引擎结构，仅在“技术明细”折叠区呈现。
+export const USER_VISIBLE_TASK_KINDS: readonly TaskKind[] = ['Action', 'Validation', 'Decision'];
+
+export function isUserVisibleTaskKind(kind: TaskKind): boolean {
+  return USER_VISIBLE_TASK_KINDS.includes(kind);
+}
+
 export function getTaskStatusLabel(status: TaskStatus): string {
   switch (status) {
     case 'Draft': return '待规划';

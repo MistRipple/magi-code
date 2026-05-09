@@ -30,11 +30,11 @@
 | 区块 | 总数 | ⬜ | 🔄 | ✅ | ⏭️ |
 |---|---|---|---|---|---|
 | P0 产品定位锚定 | 3 | 0 | 0 | 3 | 0 |
-| P1 用户心智核心抽象 | 4 | 2 | 0 | 2 | 0 |
+| P1 用户心智核心抽象 | 4 | 1 | 0 | 3 | 0 |
 | P2 业务能力收口 | 5 | 4 | 0 | 1 | 0 |
 | P3 任务系统产品表达 | 3 | 2 | 0 | 1 | 0 |
 | P4 链路边界收口 | 3 | 2 | 0 | 1 | 0 |
-| **合计** | **18** | **10** | **0** | **8** | **0** |
+| **合计** | **18** | **9** | **0** | **9** | **0** |
 
 ---
 
@@ -135,12 +135,20 @@
   5. 内部代码标识符（task_id `lane-*`、`active_branch_task_ids`、字段名 `branches`）属于写域内部概念，本次保留——与 P1-#7 (Worker 术语弱化) 一并处理。
 
 ### #6 TaskKind 用户可见面收口
-- **状态**：⬜
+- **状态**：✅
+- **完成时间**：2026-05-09
 - **任务**：用户面只暴露用户能识别的几类任务节点。
 - **建议**：用户面（`TasksPanel` 主视图）只渲染 **Action / Validation / Decision** 三类。`Phase / WorkPackage / Repair / Objective` 只在"技术明细"折叠区。前端加 `userVisibleKinds` 白名单。
 - **改后增量**：领域建模 +0.4
 - **依赖**：无
 - **代码证据**：`magi-core/src/task.rs::TaskKind`（7 种）+ `TasksPanel.svelte::taskTreeRows`（全暴露）
+- **执行结果**：
+  1. `web/src/lib/task-labels.ts` 新增 `USER_VISIBLE_TASK_KINDS = ['Action', 'Validation', 'Decision']` 常量与 `isUserVisibleTaskKind(kind)` 守卫；命名按 P1-#7 后续约定避免硬编码字符串。
+  2. `TasksPanel.svelte` 主视图新增"执行步骤"section（task-step-list），渲染扁平的用户可见任务（`activeProjectionTasks` 过滤后按 `created_at` 排序），点击行可在 `task-graph-store` 选中节点；列表为空时不渲染（避免空 section）。
+  3. `Phase / WorkPackage / Repair / Objective` 等结构性节点继续保留在已存在的 `<details class="task-details-disclosure">` 技术明细折叠区，主视图不再以"任务树+全部 7 类"作为默认呈现。
+  4. 顺手清理 P1-#4 残留：`buildDeliveryPackageSummary` 的 `模式：${pkg.execution_mode === 'deep' ? '深度模式' : '普通模式'}` 行删除（deep_task 已退场，不再有"深度/普通"模式概念；`execution_mode` 字段后端清理留待 backend 后续 PR）。
+  5. 新增样式（task-step-list / task-step-row / task-step-content / task-step-status）按现有 token 体系着色，hover/selected 状态与 attention section 视觉一致。
+  6. **`npm --prefix web run check`** ✓（683 文件 0 错 0 警）；daemon 起服 + 浏览器开 Tasks 面板验证空状态 / Tab 切换无 console 错误。
 
 ### #7 Worker 术语弱化
 - **状态**：⬜
