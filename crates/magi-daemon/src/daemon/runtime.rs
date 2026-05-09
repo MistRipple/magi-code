@@ -229,6 +229,10 @@ fn classifier_payload_for_prompt(prompt: &str) -> Option<String> {
         "executionGoal": (route == "task").then_some(user_text.trim_matches('"')),
         "requiredWorkers": [],
         "toolIntent": null,
+        "confidence": (route == "task").then_some(0.95),
+        "reasonCode": (route == "task").then_some("explicit_task_request"),
+        "routeReason": (route == "task").then_some("测试 stub 判定任务路由"),
+        "taskEvidence": (route == "task").then_some(vec!["test-stub-classifier"]),
     });
     Some(
         serde_json::json!({
@@ -433,21 +437,21 @@ impl DaemonRuntime {
             match model_bridge_override.clone() {
                 Some(client) => client,
                 None => {
-                    if direct_http_probe_result.is_none() {
+                    if direct_http_probe_result.is_some() {
+                        Arc::new(SettingsBackedBusinessModelBridgeClient::new(
+                            self.state_root.clone(),
+                            settings_store.clone(),
+                            bridge_env,
+                        ))
+                    } else {
                         warn!(
                             state_root = %self.state_root.display(),
-                            "业务模型桥未配置，已启用明确失败客户端"
+                            "业务模型桥未配置，已退化为本地 loopback（仅用于开发/测试，生产请配置 MAGI_OPENAI_COMPAT_BASE_URL）"
                         );
+                        Arc::new(JsonRpcModelBridgeClient::new(model_transport.clone()))
                     }
-                    Arc::new(SettingsBackedBusinessModelBridgeClient::new(
-                        self.state_root.clone(),
-                        settings_store.clone(),
-                        bridge_env,
-                    ))
                 }
             };
-        let task_planning_model_client: Arc<dyn magi_bridge_client::ModelBridgeClient> =
-            Arc::new(JsonRpcModelBridgeClient::new(model_transport.clone()));
         let bridge_runtime = BridgeDispatchRuntime::new()
             .with_model_client(business_model_client.clone())
             .with_mcp_client(if let Some(mcp_client) = direct_mcp_client {
@@ -627,7 +631,6 @@ impl DaemonRuntime {
         state = state
             .with_runner_manager(runner_manager)
             .with_session_turn_dispatcher(session_turn_dispatcher)
-            .with_task_planning_model_bridge_client(task_planning_model_client)
             .with_model_bridge_client(business_model_client);
 
         if let Some(probe_config) = direct_http_probe_config {

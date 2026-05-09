@@ -1659,7 +1659,7 @@ fn decompose_mission(
     workspace_id: &Option<WorkspaceId>,
 ) -> Option<DeepTaskGraphPlan> {
     let prompt_text = prompt.filter(|s| !s.trim().is_empty())?;
-    let client = state.task_planning_model_client()?;
+    let client = state.model_bridge_client()?;
     let workspace_context = state
         .workspace_root_path(workspace_id)
         .map(|path| {
@@ -2395,7 +2395,7 @@ mod tests {
     fn deep_task_turn_keeps_normal_mainline_dialog_and_orchestrator_steps() {
         let (state, _task_store) = build_test_state();
         let state =
-            state.with_task_planning_model_bridge_client(Arc::new(StaticDeepPlanModelBridgeClient));
+            state.with_model_bridge_client(Arc::new(StaticDeepPlanModelBridgeClient));
         let session_id = SessionId::new("session-deep-mainline-dialog");
         state
             .session_store
@@ -2516,7 +2516,7 @@ mod tests {
     fn deep_task_registers_validation_execution_plans() {
         let (state, task_store) = build_test_state();
         let state =
-            state.with_task_planning_model_bridge_client(Arc::new(StaticDeepPlanModelBridgeClient));
+            state.with_model_bridge_client(Arc::new(StaticDeepPlanModelBridgeClient));
         let session_id = SessionId::new("session-deep-validation-plans");
         state
             .session_store
@@ -2572,7 +2572,7 @@ mod tests {
     fn deep_task_policies_limit_tools_by_phase_role() {
         let (state, task_store) = build_test_state();
         let state =
-            state.with_task_planning_model_bridge_client(Arc::new(StaticDeepPlanModelBridgeClient));
+            state.with_model_bridge_client(Arc::new(StaticDeepPlanModelBridgeClient));
         let session_id = SessionId::new("session-deep-readonly-policy");
         state
             .session_store
@@ -2670,7 +2670,7 @@ mod tests {
     #[test]
     fn deep_task_graph_supports_sequential_execution_batches() {
         let (state, task_store) = build_test_state();
-        let state = state.with_task_planning_model_bridge_client(Arc::new(
+        let state = state.with_model_bridge_client(Arc::new(
             SequentialBatchDeepPlanModelBridgeClient,
         ));
         let session_id = SessionId::new("session-deep-sequential-batches");
@@ -2766,7 +2766,7 @@ mod tests {
     #[test]
     fn deep_task_action_roles_stay_runnable_when_goal_mentions_test_path() {
         let (state, task_store) = build_test_state();
-        let state = state.with_task_planning_model_bridge_client(Arc::new(
+        let state = state.with_model_bridge_client(Arc::new(
             PathSensitiveDeepPlanModelBridgeClient,
         ));
         let session_id = SessionId::new("session-deep-action-role-compat");
@@ -2825,7 +2825,7 @@ mod tests {
     fn deep_task_planner_receives_workspace_root_context() {
         let (state, _task_store) = build_test_state();
         let captured_prompt = Arc::new(Mutex::new(None));
-        let state = state.with_task_planning_model_bridge_client(Arc::new(
+        let state = state.with_model_bridge_client(Arc::new(
             RecordingDeepPlanModelBridgeClient {
                 prompt: Arc::clone(&captured_prompt),
             },

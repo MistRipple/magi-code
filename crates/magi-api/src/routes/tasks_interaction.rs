@@ -62,7 +62,7 @@ fn decide_intake_with_task_planner(
     root_task: &Task,
     context_task: &Task,
 ) -> Result<IntakeIntentDecision, ApiError> {
-    let client = state.task_planning_model_client().cloned().ok_or_else(|| {
+    let client = state.model_bridge_client().cloned().ok_or_else(|| {
         ApiError::InvalidInput("Intake 分类器未配置任务规划模型客户端".to_string())
     })?;
     let response = client

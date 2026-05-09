@@ -600,7 +600,6 @@ pub struct ApiState {
     session_turn_dispatcher: Option<Arc<LlmTaskDispatcher>>,
     mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
-    task_planning_model_client: Option<Arc<dyn ModelBridgeClient>>,
     model_bridge_client_is_real: bool,
     tool_registry: Option<ToolRegistry>,
     pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
@@ -712,7 +711,6 @@ impl ApiState {
             session_turn_dispatcher: None,
             mcp_connections: Arc::new(RwLock::new(HashMap::new())),
             model_bridge_client: None,
-            task_planning_model_client: None,
             model_bridge_client_is_real: false,
             tool_registry: None,
             skill_runtime: None,
@@ -1226,14 +1224,6 @@ impl ApiState {
         self
     }
 
-    pub fn with_task_planning_model_bridge_client(
-        mut self,
-        client: Arc<dyn ModelBridgeClient>,
-    ) -> Self {
-        self.task_planning_model_client = Some(client);
-        self
-    }
-
     pub fn with_real_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
         self.model_bridge_client = Some(client);
         self.model_bridge_client_is_real = true;
@@ -1258,10 +1248,6 @@ impl ApiState {
 
     pub fn model_bridge_client(&self) -> Option<&Arc<dyn ModelBridgeClient>> {
         self.model_bridge_client.as_ref()
-    }
-
-    pub fn task_planning_model_client(&self) -> Option<&Arc<dyn ModelBridgeClient>> {
-        self.task_planning_model_client.as_ref()
     }
 
     pub fn model_bridge_client_is_real(&self) -> bool {

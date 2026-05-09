@@ -258,7 +258,7 @@ fn decide_session_turn_with_task_planner(
     state: &ApiState,
     request: &SessionTurnRequestDto,
 ) -> Result<SessionTurnIntentDecision, ApiError> {
-    let client = state.task_planning_model_client().cloned().ok_or_else(|| {
+    let client = state.model_bridge_client().cloned().ok_or_else(|| {
         ApiError::InvalidInput("Session Turn 分类器未配置任务规划模型客户端".to_string())
     })?;
     let has_recoverable_chain = request

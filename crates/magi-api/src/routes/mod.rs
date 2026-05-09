@@ -419,7 +419,7 @@ mod tests {
             governance,
         )
         .with_execution_pipeline(orchestrator, execution_runtime, memory_store)
-        .with_task_planning_model_bridge_client(model_bridge_client.clone())
+        .with_model_bridge_client(model_bridge_client.clone())
         .with_model_bridge_client(model_bridge_client.clone())
         .with_tool_registry(tool_registry_for_dispatcher.clone())
         .with_task_store(Arc::clone(&task_store));
@@ -477,7 +477,7 @@ mod tests {
             WorkerRuntime::new_compare,
             Arc::new(FailingModelBridgeClient),
         )
-        .with_task_planning_model_bridge_client(Arc::new(StaticModelBridgeClient))
+        .with_model_bridge_client(Arc::new(StaticModelBridgeClient))
     }
 
     async fn get_json(app: Router, path: &str) -> serde_json::Value {

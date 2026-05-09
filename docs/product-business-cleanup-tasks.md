@@ -31,10 +31,10 @@
 |---|---|---|---|---|---|
 | P0 产品定位锚定 | 3 | 0 | 0 | 3 | 0 |
 | P1 用户心智核心抽象 | 4 | 4 | 0 | 0 | 0 |
-| P2 业务能力收口 | 5 | 5 | 0 | 0 | 0 |
+| P2 业务能力收口 | 5 | 4 | 0 | 1 | 0 |
 | P3 任务系统产品表达 | 3 | 3 | 0 | 0 | 0 |
 | P4 链路边界收口 | 3 | 2 | 0 | 1 | 0 |
-| **合计** | **18** | **14** | **0** | **4** | **0** |
+| **合计** | **18** | **13** | **0** | **5** | **0** |
 
 ---
 
@@ -156,12 +156,20 @@
 - **代码证据**：`magi-skill-runtime`（4 个 mod）独立 crate + `magi-tool-runtime` 独立 crate
 
 ### #10 删除双模型客户端
-- **状态**：⬜
+- **状态**：✅
+- **完成时间**：2026-05-09
 - **任务**：取消"业务模型"与"任务规划模型"的双轨架构。
 - **建议**：删除 `task_planning_model_client = JsonRpcModelBridgeClient::new(model_transport)`。所有模型调用走 `business_model_client`（HTTP）。用户没配模型时任务编排显式失败（但 chat 仍能跑），不再用 loopback 假装能编排。loopback 留作单测 stub。
+- **执行结果**：
+  - 删除 `ApiState::task_planning_model_client` 字段、`with_task_planning_model_bridge_client` setter 与 `task_planning_model_client()` getter
+  - 删除 daemon runtime 中 `task_planning_model_client = JsonRpcModelBridgeClient::new(model_transport)` 实例化与 `state.with_task_planning_model_bridge_client(...)` 装配
+  - 全仓 `state.task_planning_model_client()` → `state.model_bridge_client()`；`with_task_planning_model_bridge_client` → `with_model_bridge_client`
+  - **保留 loopback 作为未配置 fallback**：`business_model_client` 在 `direct_http_probe_result.is_none()` 时退化为 `JsonRpcModelBridgeClient(model_transport)`，并打 warning（生产应配置 MAGI_OPENAI_COMPAT_BASE_URL）
+  - 补 `classifier_payload_for_prompt` 的 stub 返回字段（`confidence/reasonCode/routeReason/taskEvidence`），让 task route 能通过 `creation_evidence` 校验
 - **改后增量**：桥接抽象 +0.5、可演进性 +0.4
 - **依赖**：#13（合并使用同一识别策略）
 - **代码证据**：`crates/magi-daemon/src/daemon/runtime.rs::build_api_state_with_options` 里 `business_model_client` 与 `task_planning_model_client` 双客户端
+- **验证**：cargo check ✓ / cargo build ✓ / npm check ✓ / magi-daemon 52/52 通过 / magi-api 仅 2 个**预存在**失败
 
 ### #11 Settings 面板按用户角色重排
 - **状态**：⬜
