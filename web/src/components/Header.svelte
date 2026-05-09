@@ -7,6 +7,7 @@
   import NotificationCenter from './NotificationCenter.svelte';
   import type { Session } from '../types/message';
   import { i18n } from '../stores/i18n.svelte';
+  import { buildSessionMarkdownExport, downloadMarkdown } from '../lib/session-export';
 
   import type { Snippet } from 'svelte';
   interface Props {
@@ -56,6 +57,25 @@
   function toggleDropdown() {
     dropdownOpen = !dropdownOpen;
   }
+
+  // 导出当前会话为 Markdown 文件
+  function exportSession() {
+    const payload = buildSessionMarkdownExport();
+    if (!payload) {
+      addToast('warning', i18n.t('header.exportEmpty'));
+      return;
+    }
+    try {
+      downloadMarkdown(payload);
+      addToast('success', i18n.t('header.exportSuccess', { count: payload.messageCount }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      addToast('error', i18n.t('header.exportFailed', { message }));
+    }
+  }
+  const exportDisabled = $derived(
+    !messagesState.currentSessionId || ensureArray(appState.threadMessages).length === 0,
+  );
 
   // 点击会话项 - 如果是当前会话则忽略，否则弹出确认
   function handleSessionClick(sessionId: string, sessionName: string) {
@@ -230,6 +250,15 @@
   <div class="header-actions">
     <button class="btn-icon btn-icon--sm" onclick={newSession} title={newSessionTitle} disabled={newSessionDisabled}>
       <Icon name="plus" size={14} />
+    </button>
+    <button
+      class="btn-icon btn-icon--sm"
+      onclick={exportSession}
+      disabled={exportDisabled}
+      title={i18n.t('header.exportSession')}
+      aria-label={i18n.t('header.exportSession')}
+    >
+      <Icon name="download" size={14} />
     </button>
     <NotificationCenter />
     <button class="btn-icon btn-icon--sm" onclick={openSettings} title={i18n.t('header.settings')}>
