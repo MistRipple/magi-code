@@ -127,7 +127,6 @@ async fn submit_session_turn(
                 &request,
                 decision.task_title.clone(),
                 decision.execution_goal.clone(),
-                request.deep_task,
             )?;
             super::finalize_session_task_dispatch(state.clone(), accepted.clone());
             let execution_chain_ref = state
@@ -326,11 +325,9 @@ fn build_session_turn_classifier_prompt(
          如果选择 task，必须给出 confidence、reasonCode、routeReason 和至少 1 条 taskEvidence；只有明确需要多步骤结构化执行、实现/修复/重构、深度任务或多 worker 协作时才选择 task。\n\
          普通问答、状态追问、简单解释和寒暄必须选择 chat，不能只因为措辞模糊就创建任务图。\n\
          userText={user_text}\n\
-         deepTask={}\n\
          skillName=\"{skill_name}\"\n\
          imageCount={}\n\
          hasRecoverableChain={has_recoverable_chain}",
-        request.deep_task,
         request.images.len()
     )
 }
@@ -363,7 +360,6 @@ fn session_turn_classifier_tool() -> ChatToolDefinition {
                             "tool_request",
                             "continue_requested",
                             "explicit_task_request",
-                            "deep_task_requested",
                             "multi_step_task",
                             "implementation_or_fix",
                             "requires_structured_execution",
@@ -502,24 +498,6 @@ fn normalize_session_turn_decision(
     mut decision: SessionTurnIntentDecision,
     request: &SessionTurnRequestDto,
 ) -> SessionTurnIntentDecision {
-    if request.deep_task && !matches!(decision.route, SessionTurnRouteDto::Continue) {
-        let original_goal = request.trimmed_text().unwrap_or_default();
-        decision.route = SessionTurnRouteDto::Task;
-        decision.task_title = Some(deep_task_title(&original_goal));
-        if !original_goal.is_empty() {
-            decision.execution_goal = Some(original_goal.to_string());
-        }
-        decision.tool_intent = None;
-        decision.forced_tool_name = None;
-        decision.required_tool_chain.clear();
-        decision.confidence = decision.confidence.max(0.98);
-        decision.reason_code = Some("deep_task_requested".to_string());
-        decision.route_reason =
-            Some("用户已启用深度模式，任务目标必须以原始输入为准。".to_string());
-        if decision.task_evidence.is_empty() {
-            decision.task_evidence.push("deepTask=true".to_string());
-        }
-    }
     if matches!(decision.route, SessionTurnRouteDto::Task)
         && !session_turn_task_route_has_creation_evidence(&decision)
     {
@@ -530,12 +508,10 @@ fn normalize_session_turn_decision(
         decision.tool_intent = None;
         decision.required_tool_chain.clear();
     }
-    if !request.deep_task
-        && !matches!(
-            decision.route,
-            SessionTurnRouteDto::Continue | SessionTurnRouteDto::Task
-        )
-        && let Some(tool_request) = session_turn_requested_public_builtin_tools(request)
+    if !matches!(
+        decision.route,
+        SessionTurnRouteDto::Continue | SessionTurnRouteDto::Task
+    ) && let Some(tool_request) = session_turn_requested_public_builtin_tools(request)
     {
         match tool_request {
             RequestedBuiltinTools::Single(tool_name) => {
@@ -574,20 +550,6 @@ fn normalize_session_turn_decision(
         }
     }
     decision
-}
-
-fn deep_task_title(original_goal: &str) -> String {
-    let first_line = original_goal
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("深度任务");
-    let title = first_line.chars().take(48).collect::<String>();
-    if first_line.chars().count() > 48 {
-        format!("执行: {title}...")
-    } else {
-        format!("执行: {title}")
-    }
 }
 
 enum RequestedBuiltinTools {
@@ -683,7 +645,6 @@ fn session_turn_task_route_has_creation_evidence(decision: &SessionTurnIntentDec
     if !matches!(
         reason_code,
         "explicit_task_request"
-            | "deep_task_requested"
             | "multi_step_task"
             | "implementation_or_fix"
             | "requires_structured_execution"
@@ -2144,19 +2105,11 @@ mod tests {
             workspace_id: None,
             workspace_path: None,
             text: Some(text.to_string()),
-            deep_task: false,
             skill_name: None,
             images: Vec::new(),
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-        }
-    }
-
-    fn deep_session_turn_request(text: &str) -> SessionTurnRequestDto {
-        SessionTurnRequestDto {
-            deep_task: true,
-            ..session_turn_request(text)
         }
     }
 
@@ -2225,32 +2178,6 @@ mod tests {
         assert!(tool_intent.contains("diagram_render"));
         assert!(tool_intent.contains("对应编号步骤原文提取"));
         assert!(tool_intent.contains("禁止改名为 probe"));
-    }
-
-    #[test]
-    fn deep_task_keeps_original_multiline_goal_as_execution_goal() {
-        let request = deep_session_turn_request(
-            "【全流程验收】请以深度任务模式完成。\n\
-             - worker 必须调用 shell_exec 执行 printf FLOW_TASK_SHELL_OK。\n\
-             - worker 必须写入 FLOW_TASK_FILE_OK。\n\
-             - 最终单独一行写 FLOW_TASK_DONE。",
-        );
-        let mut classifier_decision = classifier_chat_decision();
-        classifier_decision.route = SessionTurnRouteDto::Task;
-        classifier_decision.execution_goal =
-            Some("【全流程验收】请以深度任务模式完成。".to_string());
-        classifier_decision
-            .task_evidence
-            .push("需要结构化执行".to_string());
-
-        let decision = normalize_session_turn_decision(classifier_decision, &request);
-
-        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
-        let goal = decision.execution_goal.as_deref().unwrap_or_default();
-        assert!(goal.contains("FLOW_TASK_SHELL_OK"));
-        assert!(goal.contains("FLOW_TASK_FILE_OK"));
-        assert!(goal.contains("FLOW_TASK_DONE"));
-        assert_eq!(decision.reason_code.as_deref(), Some("deep_task_requested"));
     }
 
     #[test]
@@ -2347,7 +2274,6 @@ mod tests {
                 workspace_id: None,
                 workspace_path: None,
                 text: Some("请只回复一句话".to_string()),
-                deep_task: false,
                 skill_name: None,
                 images: Vec::new(),
                 request_id: Some("request-canonical-first-frame".to_string()),

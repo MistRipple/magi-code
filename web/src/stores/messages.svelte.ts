@@ -293,7 +293,6 @@ function normalizeQueuedMessageList(value: unknown): QueuedMessage[] {
       text: typeof item.text === 'string' ? item.text : null,
       createdAt: item.createdAt,
       mode: item.mode === 'guide' ? 'guide' : 'queue',
-      deepTask: item.deepTask === true,
       skillName: typeof item.skillName === 'string' && item.skillName.trim()
         ? item.skillName.trim()
         : null,

@@ -171,7 +171,6 @@ fn loopback_classifier_response(prompt: &str) -> Option<String> {
         .lines()
         .any(|line| line.trim() == "hasRecoverableChain=true");
     let user_text = loopback_classifier_user_text(prompt);
-    let deep_task = prompt.lines().any(|line| line.trim() == "deepTask=true");
     let skill_name = prompt
         .lines()
         .find_map(|line| line.trim().strip_prefix("skillName=\""))
@@ -187,8 +186,7 @@ fn loopback_classifier_response(prompt: &str) -> Option<String> {
     let route =
         if has_recoverable_chain && contains_any(&user_text, &["继续", "resume", "continue"]) {
             "continue"
-        } else if deep_task
-            || !skill_name.is_empty()
+        } else if !skill_name.is_empty()
             || image_count > 0
             || contains_any(
                 &user_text,
@@ -223,7 +221,7 @@ fn loopback_classifier_response(prompt: &str) -> Option<String> {
 
     let task_goal = if route == "task" {
         Some(if user_text.is_empty() {
-            "完成本轮深度任务".to_string()
+            "完成本轮任务".to_string()
         } else {
             user_text.clone()
         })
@@ -280,8 +278,7 @@ fn loopback_classifier_user_text(prompt: &str) -> String {
     for line in prompt.lines() {
         let trimmed = line.trim();
         if collecting
-            && (trimmed.starts_with("deepTask=")
-                || trimmed.starts_with("skillName=")
+            && (trimmed.starts_with("skillName=")
                 || trimmed.starts_with("imageCount=")
                 || trimmed.starts_with("hasRecoverableChain="))
         {
@@ -310,10 +307,10 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
 }
 
 fn loopback_decomposition_response(prompt: &str) -> Option<String> {
-    if !prompt.starts_with("深度任务图规划器。") {
+    if !prompt.starts_with("任务图规划器。") {
         return None;
     }
-    let goal = loopback_deep_task_goal(prompt);
+    let goal = loopback_task_goal(prompt);
     let execution_phases = loopback_execution_phases(&goal);
     let planning_goal = format!(
         "仅输出目标、边界、执行计划和验收标准，不调用工具，不执行用户目标中的写入、删除、移动、补丁或其他有副作用操作：{goal}"
@@ -435,9 +432,9 @@ fn loopback_goal_segment(goal: &str, start: &str, end_markers: &[&str]) -> Optio
     (!segment.is_empty()).then(|| segment.to_string())
 }
 
-fn loopback_deep_task_goal(prompt: &str) -> String {
-    if let Some((_, rest)) = prompt.split_once("<<<MAGI_DEEP_TASK_GOAL>>>")
-        && let Some((goal, _)) = rest.split_once("<<<END_MAGI_DEEP_TASK_GOAL>>>")
+fn loopback_task_goal(prompt: &str) -> String {
+    if let Some((_, rest)) = prompt.split_once("<<<MAGI_TASK_GOAL>>>")
+        && let Some((goal, _)) = rest.split_once("<<<END_MAGI_TASK_GOAL>>>")
     {
         return goal
             .trim()
@@ -450,7 +447,7 @@ fn loopback_deep_task_goal(prompt: &str) -> String {
         .split_once("任务目标：")
         .map(|(_, goal)| goal.trim())
         .filter(|goal| !goal.is_empty())
-        .unwrap_or("完成本轮深度任务")
+        .unwrap_or("完成本轮任务")
         .to_string()
 }
 
@@ -1428,7 +1425,7 @@ mod tests {
 
     #[test]
     fn loopback_visible_prompt_builds_deep_plan_from_current_goal() {
-        let prompt = "深度任务图规划器。\n请只调用 create_deep_task_plan 工具输出结构化计划，不要返回自然语言正文。\n任务目标：SUPERPOWERS-PLAN：只做只读检查并最终回复 OK-SUPERPOWERS-PLAN";
+        let prompt = "任务图规划器。\n请只调用 create_task_plan 工具输出结构化计划，不要返回自然语言正文。\n任务目标：SUPERPOWERS-PLAN：只做只读检查并最终回复 OK-SUPERPOWERS-PLAN";
 
         let visible = super::loopback_visible_prompt(prompt);
         let parsed: Value = serde_json::from_str(&visible).expect("deep plan should be json");
@@ -1448,7 +1445,7 @@ mod tests {
 
     #[test]
     fn loopback_visible_prompt_keeps_sequential_batches_as_phases() {
-        let prompt = "深度任务图规划器。\n请只调用 create_deep_task_plan 工具输出结构化计划，不要返回自然语言正文。\n任务目标：第一批任务先执行 printf BATCH_ONE_DONE_NEXT_BATCH；当第一批结果包含 NEXT_BATCH 后继续推进；第二批任务执行 printf BATCH_TWO_DONE_FINAL；第二批完成后交付。";
+        let prompt = "任务图规划器。\n请只调用 create_task_plan 工具输出结构化计划，不要返回自然语言正文。\n任务目标：第一批任务先执行 printf BATCH_ONE_DONE_NEXT_BATCH；当第一批结果包含 NEXT_BATCH 后继续推进；第二批任务执行 printf BATCH_TWO_DONE_FINAL；第二批完成后交付。";
 
         let visible = super::loopback_visible_prompt(prompt);
         let parsed: Value = serde_json::from_str(&visible).expect("deep plan should be json");
@@ -1474,7 +1471,6 @@ mod tests {
         let prompt = "Session Turn 编排分类器\n\
             请只调用 classify_session_turn 工具，输出本轮 route。\n\
             userText=请搜索 Route Loopback Session 并说明结果\n\
-            deepTask=false\n\
             skillName=\"\"\n\
             imageCount=0\n\
             hasRecoverableChain=false";
@@ -1499,10 +1495,9 @@ mod tests {
     fn loopback_classifier_keeps_multiline_user_text() {
         let prompt = "Session Turn 编排分类器\n\
             请只调用 classify_session_turn 工具，输出本轮 route。\n\
-            userText=【全流程验收】请以深度任务模式完成。\n\
+            userText=【全流程验收】请以复杂任务模式完成。\n\
             - worker 必须调用 shell_exec 执行 printf FLOW_TASK_SHELL_OK。\n\
             - 最终单独一行写 FLOW_TASK_DONE。\n\
-            deepTask=true\n\
             skillName=\"\"\n\
             imageCount=0\n\
             hasRecoverableChain=false";

@@ -27,7 +27,6 @@ export interface SessionTurnRequestDto {
   sessionId?: string | null;
   workspaceId?: string | null;
   text?: string | null;
-  deepTask: boolean;
   skillName?: string | null;
   images: SessionTurnImageDto[];
   requestId?: string | null;

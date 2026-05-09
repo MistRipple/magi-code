@@ -187,7 +187,6 @@ fn rebuild_dispatch_plan_for_branch(
                 timeline_entry_id: chain.dispatch_context.entry_id.as_str(),
                 text: chain.dispatch_context.trimmed_text.as_deref(),
                 skill_name: chain.dispatch_context.skill_name.as_deref(),
-                deep_task: chain.dispatch_context.deep_task,
             },
         )
     } else {

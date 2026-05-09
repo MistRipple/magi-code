@@ -141,7 +141,7 @@ impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
         if let Some(payload) = classifier_payload_for_prompt(&request.prompt) {
             return Ok(magi_bridge_client::BridgeResponse { ok: true, payload });
         }
-        if request.prompt.contains("深度任务图") {
+        if request.prompt.contains("任务图规划器") {
             return Ok(magi_bridge_client::BridgeResponse {
                 ok: true,
                 payload: serde_json::json!({
@@ -213,8 +213,7 @@ fn classifier_payload_for_prompt(prompt: &str) -> Option<String> {
         .unwrap_or("");
     let route = if has_recoverable_chain && user_text.contains("继续") {
         "continue"
-    } else if prompt.contains("deepTask=true")
-        || !prompt.contains("skillName=\"\"")
+    } else if !prompt.contains("skillName=\"\"")
         || !prompt.contains("imageCount=0")
         || user_text.contains("复杂任务")
         || user_text.contains("分析并拆分")
@@ -1403,7 +1402,6 @@ mod tests {
             json!({
                 "sessionId": "test-session-001",
                 "text": "remember parser constraint",
-                "deepTask": false,
                 "skillName": "refactor",
                 "images": [],
             }),
@@ -1447,7 +1445,6 @@ mod tests {
             json!({
                 "sessionId": "test-session-001",
                 "text": "follow up parser work",
-                "deepTask": false,
                 "skillName": "refactor",
                 "images": [],
             }),
@@ -1508,7 +1505,6 @@ mod tests {
             json!({
                 "sessionId": session_id.to_string(),
                 "text": "这是一条普通对话",
-                "deepTask": false,
                 "skillName": null,
                 "images": [],
             }),
@@ -1591,7 +1587,6 @@ mod tests {
             json!({
                 "sessionId": "test-session-001",
                 "text": "seed recovery route state",
-                "deepTask": false,
                 "skillName": "refactor",
                 "images": [],
             }),
@@ -1621,6 +1616,10 @@ mod tests {
             .expect("task store should be configured")
             .update_status(&recovery_task_id, TaskStatus::Blocked)
             .expect("seed task should become recoverable");
+        runtime
+            .session_store
+            .cancel_current_turn(&session_id)
+            .expect("seed current turn should cancel for recovery");
         let snapshot = runtime.workspace_store.append_execution_snapshot(
             workspace_id.clone(),
             ownership.clone(),
@@ -1665,7 +1664,6 @@ mod tests {
             json!({
                 "sessionId": "test-session-001",
                 "text": "consume recovery memory",
-                "deepTask": false,
                 "skillName": "refactor",
                 "images": [],
             }),

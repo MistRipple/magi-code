@@ -1434,7 +1434,6 @@ mod tests {
                         accepted_at: now,
                         entry_id: "timeline-previous-task".to_string(),
                         trimmed_text: Some("之前的任务".to_string()),
-                        deep_task: true,
                         skill_name: None,
                     },
                     current_turn: None,

@@ -166,7 +166,6 @@
       type: 'executeTask',
       text: submissionText,
       requestId,
-      deepTask: false,
       skillName: null,
       followUpMode: isSending ? 'queue' : undefined,
       images: selectedImages.map((img) => ({

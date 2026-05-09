@@ -654,7 +654,6 @@ export interface QueuedMessage {
   text?: string | null;
   createdAt: number;
   mode?: QueuedMessageMode;
-  deepTask?: boolean;
   skillName?: string | null;
   images?: QueuedMessageImage[];
 }

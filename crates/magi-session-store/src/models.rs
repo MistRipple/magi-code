@@ -47,7 +47,6 @@ pub struct ActiveExecutionDispatchContext {
     pub entry_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trimmed_text: Option<String>,
-    pub deep_task: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_name: Option<String>,
 }

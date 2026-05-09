@@ -127,7 +127,6 @@ function normalizeSettingsBootstrapPayload(
       ? payload.runtimeSettings
       : {
           locale: typeof payload.locale === 'string' ? payload.locale : 'zh-CN',
-          deepTask: payload.deepTask === true,
         }
   ) as SettingsRuntimeSnapshot;
 
@@ -994,7 +993,6 @@ export async function removeAgentNotification(
 export async function submitSessionTurn(
   payload: {
     text?: string | null;
-    deepTask: boolean;
     skillName?: string | null;
     images: AgentSessionTurnImagePayload[];
     requestId?: string | null;
@@ -1018,7 +1016,6 @@ export async function submitSessionTurn(
         workspaceId: binding.workspaceId || null,
         workspacePath: binding.workspacePath || null,
         text: payload.text ?? null,
-        deepTask: payload.deepTask,
         skillName: payload.skillName ?? null,
         requestId: payload.requestId ?? null,
         userMessageId: payload.userMessageId ?? null,

@@ -16,7 +16,7 @@ use crate::{
     execution_chain_recovery::finalize_terminal_worker_branches,
     dispatch_execution::{
         ensure_session_active_execution_chain, register_appended_task_execution_branch,
-        replace_replanned_task_execution_branches, replan_deep_task_graph,
+        replace_replanned_task_execution_branches, replan_task_graph,
     },
     state::ApiState,
 };
@@ -463,7 +463,7 @@ async fn handle_intake(
                 .session(&session_id)
                 .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
             let workspace_id = session_workspace_id(&state, &session);
-            let replan = replan_deep_task_graph(
+            let replan = replan_task_graph(
                 &state,
                 &root_task_id,
                 &prompt,

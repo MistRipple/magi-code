@@ -1527,10 +1527,6 @@ mod tests {
             bootstrap["runtimeSettings"]["locale"],
             serde_json::json!("zh-CN")
         );
-        assert_eq!(
-            bootstrap["runtimeSettings"]["deepTask"],
-            serde_json::json!(false)
-        );
         assert_eq!(bootstrap["bootstrapScope"], serde_json::json!("full"));
         assert_eq!(bootstrap["mcpServersHydrated"], serde_json::json!(true));
         assert!(

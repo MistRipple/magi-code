@@ -2129,7 +2129,6 @@ export async function autoConnectTaskTracking(
 interface ExecuteTaskInput {
   text?: string | null;
   requestId?: string;
-  deepTask: boolean;
   skillName?: string | null;
   followUpMode?: 'queue';
   images: Array<{
@@ -2155,7 +2154,6 @@ function enqueueFollowUpTurn(input: ExecuteTaskInput, normalizedText: string, mo
     text: input.text ?? null,
     createdAt: Date.now(),
     mode,
-    deepTask: input.deepTask,
     skillName: input.skillName ?? null,
     images: input.images,
   };
@@ -2195,7 +2193,6 @@ async function drainQueuedTurns(reason: string): Promise<void> {
       : await executeTask({
         text: next.text ?? next.content,
         requestId: next.requestId || next.id,
-        deepTask: next.deepTask === true,
         skillName: next.skillName ?? null,
         images: next.images ?? [],
       });
@@ -2246,7 +2243,6 @@ async function submitQueuedGuidance(next: QueuedMessage): Promise<boolean> {
     return executeTask({
       text: next.text ?? next.content,
       requestId: next.requestId || next.id,
-      deepTask: next.deepTask === true,
       skillName: next.skillName ?? null,
       images,
     });
@@ -2269,7 +2265,6 @@ async function submitQueuedGuidance(next: QueuedMessage): Promise<boolean> {
       return executeTask({
         text: next.text ?? next.content,
         requestId: next.requestId || next.id,
-        deepTask: next.deepTask === true,
         skillName: next.skillName ?? null,
         images,
       });
@@ -2358,7 +2353,6 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     await ensureFreshLiveBridge('execute_task_preflight');
     const turnResult = await submitSessionTurn({
       text,
-      deepTask: input.deepTask,
       skillName,
       images,
       requestId,
@@ -2629,7 +2623,6 @@ async function updateSetting(key: string, value: unknown): Promise<void> {
       ...cachedSettingsBootstrap,
       runtimeSettings: {
         locale: payload.locale,
-        deepTask: payload.deepTask,
       },
     };
   }
@@ -3279,7 +3272,6 @@ export function createWebClientBridge(): ClientBridge {
             void executeTask({
               text: typeof message.text === 'string' ? message.text : null,
               requestId: typeof message.requestId === 'string' ? message.requestId : undefined,
-              deepTask: message.deepTask === true,
               skillName: typeof message.skillName === 'string' ? message.skillName : null,
               followUpMode: message.followUpMode === 'queue' ? 'queue' : undefined,
               images: Array.isArray(message.images)
@@ -3354,7 +3346,7 @@ export function createWebClientBridge(): ClientBridge {
           }
           return;
         case 'updateSetting':
-          if (typeof message.key === 'string' && (message.key === 'locale' || message.key === 'deepTask')) {
+          if (typeof message.key === 'string' && (message.key === "locale")) {
             void updateSetting(message.key, message.value).catch((error) => {
               logBridgeOperationFailure('更新设置', '[web-client-bridge] 更新设置失败:', error);
             });

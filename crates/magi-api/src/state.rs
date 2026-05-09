@@ -1352,14 +1352,8 @@ fn runtime_settings_from_snapshot(
         .or_else(|| snapshot.get("locale").and_then(|value| value.as_str()))
         .filter(|value| matches!(*value, "zh-CN" | "en-US"))
         .unwrap_or("zh-CN");
-    let deep_task = runtime
-        .and_then(|value| value.get("deepTask"))
-        .and_then(|value| value.as_bool())
-        .or_else(|| snapshot.get("deepTask").and_then(|value| value.as_bool()))
-        .unwrap_or(false);
     serde_json::json!({
         "locale": locale,
-        "deepTask": deep_task,
     })
 }
 

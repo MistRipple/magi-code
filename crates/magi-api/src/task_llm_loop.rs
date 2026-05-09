@@ -736,7 +736,7 @@ fn is_planning_no_tool_action(task: &magi_core::Task) -> bool {
 }
 
 fn deterministic_planning_content(task: &magi_core::Task) -> String {
-    let goal = extract_deep_task_goal(&task.goal).unwrap_or_else(|| task.goal.trim().to_string());
+    let goal = extract_task_goal(&task.goal).unwrap_or_else(|| task.goal.trim().to_string());
     format!(
         "目标：{goal}\n\n边界：规划步骤只整理目标、边界、执行计划和验收标准，不调用工具，不执行文件、shell 或网络操作。\n\n执行计划：执行步骤负责按用户目标调用工具并产生可验证结果；交付步骤只基于执行产出总结，不重复调用工具。\n\n验收标准：规划文本必须包含目标、边界、执行计划、验收标准四部分；执行结果必须以真实工具结果为准，失败或阻塞不得伪装成功。"
     )
@@ -898,9 +898,9 @@ fn collect_dependency_output_validation_facts(
     }
 }
 
-fn extract_deep_task_goal(value: &str) -> Option<String> {
-    let (_, rest) = value.split_once("<<<MAGI_DEEP_TASK_GOAL>>>")?;
-    let (goal, _) = rest.split_once("<<<END_MAGI_DEEP_TASK_GOAL>>>")?;
+fn extract_task_goal(value: &str) -> Option<String> {
+    let (_, rest) = value.split_once("<<<MAGI_TASK_GOAL>>>")?;
+    let (goal, _) = rest.split_once("<<<END_MAGI_TASK_GOAL>>>")?;
     Some(
         goal.trim()
             .lines()
@@ -2189,7 +2189,7 @@ mod tests {
         let task_store = TaskStore::new();
         let mut planning = make_task_loop_test_task("task-planning-deterministic");
         planning.title = "梳理目标".to_string();
-        planning.goal = "明确目标、边界和验收标准：<<<MAGI_DEEP_TASK_GOAL>>>\n执行指定工具链\n<<<END_MAGI_DEEP_TASK_GOAL>>>"
+        planning.goal = "明确目标、边界和验收标准：<<<MAGI_TASK_GOAL>>>\n执行指定工具链\n<<<END_MAGI_TASK_GOAL>>>"
             .to_string();
         planning.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
@@ -2567,7 +2567,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_deep_task_worker_details_move_to_sidechain() {
+    fn primary_task_worker_details_move_to_sidechain() {
         let task = make_task_loop_test_task("task-primary-deep-sidechain");
         let worker_id = WorkerId::new("worker-primary-deep-sidechain");
         let visibility = task_turn_visibility(&task, true, None, None, Some(&worker_id), true);

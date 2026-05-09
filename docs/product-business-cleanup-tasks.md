@@ -30,11 +30,11 @@
 | 区块 | 总数 | ⬜ | 🔄 | ✅ | ⏭️ |
 |---|---|---|---|---|---|
 | P0 产品定位锚定 | 3 | 0 | 0 | 3 | 0 |
-| P1 用户心智核心抽象 | 4 | 4 | 0 | 0 | 0 |
+| P1 用户心智核心抽象 | 4 | 3 | 0 | 1 | 0 |
 | P2 业务能力收口 | 5 | 4 | 0 | 1 | 0 |
 | P3 任务系统产品表达 | 3 | 2 | 0 | 1 | 0 |
 | P4 链路边界收口 | 3 | 2 | 0 | 1 | 0 |
-| **合计** | **18** | **12** | **0** | **6** | **0** |
+| **合计** | **18** | **11** | **0** | **7** | **0** |
 
 ---
 
@@ -104,12 +104,20 @@
 ## P1 — 用户心智的核心抽象
 
 ### #4 删除 `deep_task` 布尔开关
-- **状态**：⬜
+- **状态**：✅
+- **完成时间**：2026-05-09
 - **任务**：取消用户面的"普通/深度"模式选择，统一交模型决策。
 - **建议**：删除 `request.deep_task` 字段与所有路径分支，**完全交给 `classify_session_turn` LLM 分类器判断**。前端只剩输入框，无模式开关。配套删除 `session_turn_requests_task_orchestration` 的 24 条关键字白名单。
 - **改后增量**：协议表面 +0.8、领域建模 +0.3
 - **依赖**：#10（先确保业务模型可用）
 - **代码证据**：`SessionTurnRequestDto.deep_task` + `routes/sessions.rs::session_turn_requests_task_orchestration`
+- **执行结果**：
+  1. 协议层 / DTO / 内部派发字段全删（`SessionTurnRequestDto`、`DispatchSubmissionRequest`、`ActiveExecutionDispatchContext`、`DispatchMemoryExtractionInput` 等无残留）。
+  2. 持久化层（execution_writeback、session-store sidecar、workspace-store recovery）字段全删；旧持久化文件中遗留的 `deepTask` 键由 serde 默认忽略策略自然吸收，无需迁移脚本。
+  3. 设置 bootstrap 的独立 `deepTask` 链路（`runtime_settings_from_snapshot` / `runtime.rs`）全删；`runtimeSettings` 只剩 `locale`。
+  4. Loopback stub（`model_loopback.rs`、`StaticTestModelBridgeClient`、`StaticModelBridgeClient`）改用 `任务图规划器` 前缀触发深图 stub；所有 fixture prompt 与 fixture 字段同步清扫。
+  5. **统一 task policy（autonomous_kind=Autonomous / retry_budget=1 / repair_budget=1 / validation_required=None）替代原 `build_deep_readonly_policy` / `build_deep_no_tool_policy` / `build_deep_action_policy` / `build_policy_for_mode` 四套**——所有 Phase / WorkPackage / Action / Repair / Decision / Validation 节点共享同一 policy。`TASK_MIN_PHASES` 由 3 降为 1，让 LLM 自行决定结构深度。
+  6. 重命名退场：`DEEP_TASK_PLAN_TOOL_NAME → TASK_PLAN_TOOL_NAME`、`create_deep_task_plan → create_task_plan`、`DeepTaskGraphPlan/PhasePlan/...` 去 `Deep` 前缀、`build/replan/insert/validate_deep_task_graph → *_task_graph`、`extract_deep_task_goal → extract_task_goal`、`loopback_deep_task_goal → loopback_task_goal`。
 
 ### #5 「团队模式」语言收回
 - **状态**：⬜

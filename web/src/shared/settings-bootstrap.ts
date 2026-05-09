@@ -25,7 +25,6 @@ export interface SettingsBuiltinTool {
 
 export interface SettingsRuntimeSnapshot {
   locale: string;
-  deepTask: boolean;
 }
 
 export interface SettingsBootstrapPayload {

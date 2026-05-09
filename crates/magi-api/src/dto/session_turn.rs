@@ -20,9 +20,6 @@ pub struct SessionTurnRequestDto {
     #[serde(default, alias = "workspace_path")]
     pub workspace_path: Option<String>,
     pub text: Option<String>,
-    #[serde(default)]
-    #[serde(alias = "deep_task")]
-    pub deep_task: bool,
     #[serde(alias = "skill_name")]
     pub skill_name: Option<String>,
     #[serde(default)]
@@ -195,13 +192,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn timeline_message_does_not_append_deep_task_marker_to_user_text() {
+    fn timeline_message_uses_user_text_directly() {
         let request = SessionTurnRequestDto {
             session_id: Some("session-a".to_string()),
             workspace_id: Some("workspace-a".to_string()),
             workspace_path: None,
             text: Some("请分析项目".to_string()),
-            deep_task: true,
             skill_name: None,
             images: Vec::new(),
             request_id: None,

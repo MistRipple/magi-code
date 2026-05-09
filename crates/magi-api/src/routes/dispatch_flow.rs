@@ -23,7 +23,6 @@ pub(super) fn accept_session_task_submission(
     request: &SessionTurnRequestDto,
     task_title: Option<String>,
     execution_goal: Option<String>,
-    deep_task: bool,
 ) -> Result<(DispatchSubmissionAccepted, EventId), ApiError> {
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_message(trimmed_text.as_deref());
@@ -50,7 +49,6 @@ pub(super) fn accept_session_task_submission(
         message,
         trimmed_text,
         execution_goal,
-        deep_task,
         request.skill_name.clone(),
         None,
         request,
@@ -65,7 +63,6 @@ fn execute_dispatch_submission(
     message: String,
     trimmed_text: Option<String>,
     execution_goal: Option<String>,
-    deep_task: bool,
     skill_name: Option<String>,
     target_role: Option<String>,
     request: &SessionTurnRequestDto,
@@ -92,7 +89,6 @@ fn execute_dispatch_submission(
         task_title: action_task_title,
         trimmed_text,
         execution_goal,
-        deep_task,
         skill_name,
         target_role,
         request_id: request.request_id(),
@@ -192,7 +188,6 @@ fn publish_session_turn_task_accepted_event(
             "user_message_id": request.user_message_id(),
             "placeholder_message_id": request.placeholder_message_id(),
             "image_count": request.images.len(),
-            "deep_task": request.deep_task,
             "created_session": accepted.created_session,
             "route": "task",
             "root_task_id": accepted.root_task_id.to_string(),

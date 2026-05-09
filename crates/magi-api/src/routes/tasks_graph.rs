@@ -11,7 +11,7 @@ use crate::{
     errors::ApiError,
     dispatch_execution::{
         ensure_session_active_execution_chain, replace_replanned_task_execution_branches,
-        replan_deep_task_graph,
+        replan_task_graph,
     },
     state::ApiState,
 };
@@ -21,7 +21,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/tasks/graph/{root_task_id}", get(get_task_projection))
         .route("/tasks/{task_id}", get(get_task))
         .route("/tasks/{task_id}/decision", post(resolve_decision))
-        .route("/tasks/{root_task_id}/replan", post(replan_task_graph))
+        .route("/tasks/{root_task_id}/replan", post(handle_replan_request))
         .route(
             "/tasks/{root_task_id}/delivery-package",
             get(get_delivery_package),
@@ -154,7 +154,7 @@ async fn resolve_decision(
     })))
 }
 
-async fn replan_task_graph(
+async fn handle_replan_request(
     State(state): State<ApiState>,
     Path(root_task_id): Path<String>,
     Query(query): Query<SessionScopedTaskQuery>,
@@ -182,7 +182,7 @@ async fn replan_task_graph(
         .session(&session_id)
         .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
     let workspace_id = session_workspace_id(&state, &session);
-    let replan = replan_deep_task_graph(
+    let replan = replan_task_graph(
         &state,
         &root_id,
         &prompt,

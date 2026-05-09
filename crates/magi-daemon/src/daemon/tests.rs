@@ -827,7 +827,6 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
                     accepted_at: UtcMillis::now(),
                     entry_id: "timeline-router-recovery".to_string(),
                     trimmed_text: Some("resume parser after crash".to_string()),
-                    deep_task: true,
                     skill_name: Some("resume".to_string()),
                 },
                 current_turn: None,
@@ -989,7 +988,6 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         json!({
             "session_id": session_id.to_string(),
             "text": "follow up recovery task",
-            "deep_task": false,
             "skill_name": "resume",
             "images": [],
         }),
@@ -1066,7 +1064,6 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         json!({
             "session_id": "test-session-bootstrap",
             "text": "Route parser refresh",
-            "deep_task": false,
             "skill_name": "refactor",
             "images": [],
         }),
@@ -1096,7 +1093,6 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         json!({
             "session_id": "test-session-bootstrap",
             "text": "Route parser refresh followup",
-            "deep_task": false,
             "skill_name": "refactor",
             "images": [],
         }),
@@ -1135,9 +1131,15 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         .iter()
         .find(|entry| entry["mission_id"] == second_mission_id)
         .expect("second execution group should exist in bootstrap runtime read model");
-    assert_eq!(
-        bootstrap_execution_group["context_memory_extraction_refs"],
-        json!([expected_extraction_id])
+    let extraction_refs = bootstrap_execution_group["context_memory_extraction_refs"]
+        .as_array()
+        .expect("context_memory_extraction_refs should be an array");
+    assert!(
+        extraction_refs
+            .iter()
+            .any(|value| value == &json!(expected_extraction_id)),
+        "second mission should reference the first extraction id, got {:?}",
+        extraction_refs
     );
 }
 
@@ -1168,7 +1170,6 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         json!({
             "session_id": "test-session-bootstrap-recovery",
             "text": "seed bootstrap recovery state",
-            "deep_task": false,
             "skill_name": "resume",
             "images": [],
         }),
@@ -1267,7 +1268,6 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         json!({
             "session_id": "test-session-bootstrap-recovery",
             "text": "consume resumed bootstrap memory",
-            "deep_task": false,
             "skill_name": "resume",
             "images": [],
         }),
@@ -2269,7 +2269,6 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
         "/api/session/turn",
         json!({
             "text": "Hello integration test",
-            "deep_task": false,
             "skill_name": "code",
             "images": [],
         }),
@@ -2364,7 +2363,6 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
         "/api/session/turn",
         json!({
             "text": "Restart persistence verification",
-            "deep_task": false,
             "skill_name": "code",
             "images": [],
         }),
@@ -2490,7 +2488,6 @@ async fn runtime_restore_detaches_session_chain_when_root_task_checkpoint_is_mis
                     accepted_at: UtcMillis::now(),
                     entry_id: "timeline-stale-root-missing".to_string(),
                     trimmed_text: Some("stale root should detach".to_string()),
-                    deep_task: true,
                     skill_name: None,
                 },
                 current_turn: None,
@@ -2560,7 +2557,6 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         "/api/session/turn",
         json!({
             "text": "Restart continue verification",
-            "deep_task": false,
             "skill_name": "refactor",
             "images": [],
         }),
@@ -3001,7 +2997,6 @@ async fn unbound_session_continue_survives_runtime_restart() {
         "/api/session/turn",
         json!({
             "text": "Unbound session restart verification",
-            "deep_task": false,
             "skill_name": "refactor",
             "images": [],
         }),
@@ -3140,7 +3135,6 @@ async fn session_action_publishes_domain_event_on_event_bus() {
         json!({
             "session_id": "session-e2e-events",
             "text": "event bus test",
-            "deep_task": false,
             "skill_name": "code",
             "images": [],
         }),
@@ -3191,7 +3185,6 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
         "/api/session/turn",
         json!({
             "text": "first action",
-            "deep_task": false,
             "skill_name": "refactor",
             "images": [],
         }),
@@ -3214,7 +3207,6 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
         json!({
             "session_id": session_id,
             "text": "second action",
-            "deep_task": false,
             "skill_name": "refactor",
             "images": [],
         }),

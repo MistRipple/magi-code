@@ -13,7 +13,6 @@ pub struct DispatchMemoryExtractionInput<'a> {
     pub timeline_entry_id: &'a str,
     pub text: Option<&'a str>,
     pub skill_name: Option<&'a str>,
-    pub deep_task: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -31,9 +30,6 @@ impl ExecutionWritebackPlans {
         if let Some(skill_name) = trimmed_non_empty(input.skill_name) {
             content.push_str("\nskill:");
             content.push_str(skill_name);
-        }
-        if input.deep_task {
-            content.push_str("\nmode:deep_task");
         }
 
         Self {
@@ -182,7 +178,6 @@ mod tests {
             timeline_entry_id: "timeline-1",
             text: Some("  hello world  "),
             skill_name: Some("  refactor  "),
-            deep_task: true,
         })
         .apply(&store);
 
@@ -207,7 +202,7 @@ mod tests {
         );
         assert_eq!(
             linkage.produced_records[0].content,
-            "hello world\nskill:refactor\nmode:deep_task"
+            "hello world\nskill:refactor"
         );
     }
 
@@ -222,7 +217,6 @@ mod tests {
             timeline_entry_id: "timeline-blank",
             text: Some("   "),
             skill_name: Some("refactor"),
-            deep_task: true,
         })
         .apply(&store);
 

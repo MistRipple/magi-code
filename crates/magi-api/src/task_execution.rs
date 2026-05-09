@@ -77,7 +77,6 @@ pub struct DispatchSubmissionRequest {
     pub task_title: String,
     pub trimmed_text: Option<String>,
     pub execution_goal: Option<String>,
-    pub deep_task: bool,
     pub skill_name: Option<String>,
     pub target_role: Option<String>,
     pub request_id: Option<String>,
@@ -1930,7 +1929,6 @@ mod tests {
                         accepted_at: now,
                         entry_id: "timeline-background-finalizer-idempotent".to_string(),
                         trimmed_text: Some("执行后台任务".to_string()),
-                        deep_task: true,
                         skill_name: None,
                     },
                     current_turn: None,
@@ -2077,7 +2075,6 @@ mod tests {
                         accepted_at: now,
                         entry_id: "timeline-background-finalizer-worker-only".to_string(),
                         trimmed_text: Some("执行深度任务".to_string()),
-                        deep_task: true,
                         skill_name: None,
                     },
                     current_turn: Some(ActiveExecutionTurn {
@@ -2357,7 +2354,6 @@ mod tests {
                         accepted_at: now,
                         entry_id: "timeline-terminal-reconcile-completed-root".to_string(),
                         trimmed_text: Some("执行任务".to_string()),
-                        deep_task: true,
                         skill_name: None,
                     },
                     current_turn: Some(ActiveExecutionTurn {
@@ -2465,7 +2461,6 @@ mod tests {
                         accepted_at: now,
                         entry_id: "timeline-terminal-cancelled-wins".to_string(),
                         trimmed_text: Some("执行任务".to_string()),
-                        deep_task: true,
                         skill_name: None,
                     },
                     current_turn: Some(ActiveExecutionTurn {
