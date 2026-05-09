@@ -1052,14 +1052,6 @@ export interface SkillsConfigSaveResponseDto {
   saved: boolean;
 }
 
-export interface CustomToolNameRequestDto {
-  toolName: string;
-}
-
-export interface InstructionSkillNameRequestDto {
-  skillName: string;
-}
-
 export interface SkillUpdateResponseDto {
   updated: boolean;
 }

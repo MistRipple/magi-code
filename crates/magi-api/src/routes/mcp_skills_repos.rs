@@ -33,14 +33,7 @@ pub fn routes() -> Router<ApiState> {
         )
         .route("/settings/skills/config/save", post(save_skills_config))
         .route("/settings/skills/custom-tool/add", post(add_custom_tool))
-        .route(
-            "/settings/skills/custom-tool/remove",
-            post(remove_custom_tool),
-        )
-        .route(
-            "/settings/skills/instruction/remove",
-            post(remove_instruction_skill),
-        )
+        .route("/settings/skills/remove", post(remove_installed_skill))
         .route("/settings/skills/update", post(update_skill))
         .route("/settings/skills/update-all", post(update_all_skills))
 }
@@ -974,59 +967,73 @@ async fn add_custom_tool(
     Ok(Json(serde_json::json!({ "added": true })))
 }
 
-async fn remove_custom_tool(
+async fn remove_installed_skill(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let tool_name = request
-        .get("toolName")
+    let source = request
+        .get("source")
         .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    let mut config = load_skills_config_object(&state);
-    let mut custom_tools = config
-        .remove("customTools")
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default();
-    custom_tools.retain(|item| {
-        !["toolName", "name"].iter().any(|field| {
-            item.get(*field)
-                .and_then(|value| value.as_str())
-                .is_some_and(|value| value == tool_name)
-        })
-    });
-    config.insert(
-        "customTools".to_string(),
-        serde_json::Value::Array(custom_tools),
-    );
-    persist_skills_config_object(&state, config);
-    Ok(Json(serde_json::json!({ "removed": true })))
-}
-
-async fn remove_instruction_skill(
-    State(state): State<ApiState>,
-    Json(request): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let skill_name = request
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            ApiError::InvalidInput("source 必须为 'custom' 或 'instruction'".to_string())
+        })?;
+    let name = request
         .get("skillName")
+        .or_else(|| request.get("toolName"))
+        .or_else(|| request.get("name"))
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .ok_or_else(|| ApiError::InvalidInput("skillName 不能为空".to_string()))?;
-    let mut instruction_skills = load_instruction_skills(&state);
-    let removed_skill_name = instruction_skills
-        .iter()
-        .find(|item| instruction_skill_matches(item, skill_name))
-        .and_then(instruction_skill_name)
-        .unwrap_or_else(|| skill_name.to_string());
-    let removed = remove_instruction_skill_from_list(&mut instruction_skills, skill_name);
-    if !removed {
-        return Err(ApiError::not_found("技能未安装", skill_name));
+    match source {
+        "custom" => {
+            let mut config = load_skills_config_object(&state);
+            let mut custom_tools = config
+                .remove("customTools")
+                .and_then(|value| value.as_array().cloned())
+                .unwrap_or_default();
+            custom_tools.retain(|item| {
+                !["toolName", "name"].iter().any(|field| {
+                    item.get(*field)
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|value| value == name)
+                })
+            });
+            config.insert(
+                "customTools".to_string(),
+                serde_json::Value::Array(custom_tools),
+            );
+            persist_skills_config_object(&state, config);
+            Ok(Json(serde_json::json!({
+                "removed": true,
+                "source": "custom",
+                "skillName": name,
+            })))
+        }
+        "instruction" => {
+            let mut instruction_skills = load_instruction_skills(&state);
+            let removed_skill_name = instruction_skills
+                .iter()
+                .find(|item| instruction_skill_matches(item, name))
+                .and_then(instruction_skill_name)
+                .unwrap_or_else(|| name.to_string());
+            let removed = remove_instruction_skill_from_list(&mut instruction_skills, name);
+            if !removed {
+                return Err(ApiError::not_found("技能未安装", name));
+            }
+            persist_instruction_skills(&state, instruction_skills);
+            Ok(Json(serde_json::json!({
+                "removed": true,
+                "source": "instruction",
+                "skillName": removed_skill_name,
+            })))
+        }
+        other => Err(ApiError::InvalidInput(format!(
+            "未知 source: {other}（应为 'custom' 或 'instruction'）"
+        ))),
     }
-    persist_instruction_skills(&state, instruction_skills);
-    Ok(Json(serde_json::json!({
-        "removed": true,
-        "skillName": removed_skill_name,
-    })))
 }
 
 async fn update_skill(

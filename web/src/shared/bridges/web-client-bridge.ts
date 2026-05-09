@@ -45,8 +45,7 @@ import {
   refreshAgentMcpTools,
   refreshAgentRepository,
   removeAgentNotification,
-  removeAgentCustomTool,
-  removeAgentInstructionSkill,
+  removeAgentInstalledSkill,
   renameAgentSession,
   resetAgentExecutionStats,
   saveAgentCurrentSession,
@@ -2931,18 +2930,16 @@ async function addCustomTool(tool: Record<string, unknown>): Promise<void> {
   emitBridgeSuccessToast('添加自定义工具', '自定义工具已添加');
 }
 
-async function removeCustomTool(toolName: string): Promise<void> {
-  const payload = await removeAgentCustomTool(toolName);
-  emitDataMessage('customToolRemoved', payload);
+async function removeInstalledSkill(
+  skillName: string,
+  source: 'custom' | 'instruction',
+): Promise<void> {
+  const payload = await removeAgentInstalledSkill(skillName, source);
+  const messageType = source === 'custom' ? 'customToolRemoved' : 'instructionSkillRemoved';
+  emitDataMessage(messageType, payload);
   await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('删除自定义工具', '自定义工具已删除');
-}
-
-async function removeInstructionSkill(skillName: string): Promise<void> {
-  const payload = await removeAgentInstructionSkill(skillName);
-  emitDataMessage('instructionSkillRemoved', payload);
-  await dispatchSettingsBootstrap(true);
-  emitBridgeSuccessToast('删除指令技能', '指令技能已删除');
+  const label = source === 'custom' ? '自定义工具' : '指令技能';
+  emitBridgeSuccessToast(`删除${label}`, `${label}已删除`);
 }
 
 async function updateSkill(skillName: string): Promise<void> {
@@ -3145,20 +3142,23 @@ export function createWebClientBridge(): ClientBridge {
             logBridgeOperationFailure('安装本地技能', '[web-client-bridge] 安装本地技能失败:', error);
           });
           return;
-        case 'removeCustomTool':
-          if (typeof message.toolName === 'string' && message.toolName.trim()) {
-            void removeCustomTool(message.toolName).catch((error) => {
-              logBridgeOperationFailure('删除自定义工具', '[web-client-bridge] 删除自定义工具失败:', error);
+        case 'removeInstalledSkill': {
+          const skillName = typeof message.skillName === 'string'
+            ? message.skillName
+            : typeof message.toolName === 'string'
+              ? message.toolName
+              : '';
+          const source = message.source === 'custom' || message.source === 'instruction'
+            ? message.source
+            : null;
+          if (skillName.trim() && source) {
+            const label = source === 'custom' ? '自定义工具' : '指令技能';
+            void removeInstalledSkill(skillName, source).catch((error) => {
+              logBridgeOperationFailure(`删除${label}`, `[web-client-bridge] 删除${label}失败:`, error);
             });
           }
           return;
-        case 'removeInstructionSkill':
-          if (typeof message.skillName === 'string' && message.skillName.trim()) {
-            void removeInstructionSkill(message.skillName).catch((error) => {
-              logBridgeOperationFailure('删除指令技能', '[web-client-bridge] 删除指令技能失败:', error);
-            });
-          }
-          return;
+        }
         case 'updateSkill':
           if (typeof message.skillName === 'string' && message.skillName.trim()) {
             void updateSkill(message.skillName).catch((error) => {

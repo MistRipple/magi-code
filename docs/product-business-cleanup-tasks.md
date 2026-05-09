@@ -31,10 +31,10 @@
 |---|---|---|---|---|---|
 | P0 产品定位锚定 | 3 | 0 | 0 | 3 | 0 |
 | P1 用户心智核心抽象 | 4 | 0 | 0 | 4 | 0 |
-| P2 业务能力收口 | 5 | 2 | 0 | 3 | 0 |
+| P2 业务能力收口 | 5 | 1 | 0 | 4 | 0 |
 | P3 任务系统产品表达 | 3 | 1 | 0 | 2 | 0 |
 | P4 链路边界收口 | 3 | 1 | 0 | 2 | 0 |
-| **合计** | **18** | **4** | **0** | **14** | **0** |
+| **合计** | **18** | **3** | **0** | **15** | **0** |
 
 ---
 
@@ -188,12 +188,27 @@
   6. 测试：`cargo check --workspace` ✓、`cargo test -p magi-api --lib routes::knowledge` 5/5 ✓（含新增 `unified_knowledge_routes_round_trip` 一条）、`npm --prefix web run check` 683/0/0 ✓；全仓 `grep '/knowledge/adr|/knowledge/faq|/knowledge/learning'` 与 `grep '\.adrs|\.faqs|\.learnings'` 在 web/src 已为 0。
 
 ### #9 Skill 并入 Custom Tool
-- **状态**：⬜
+- **状态**：✅
+- **完成时间**：2026-05-09
 - **任务**：合并 skill 与 custom tool 的扩展机制。
-- **建议**：保留 MCP 独立（真外部协议）。Skill 本质是带 instruction 的 tool —— 把 `magi-skill-runtime` 合并进 `magi-tool-runtime`，用户面统一为「自定义工具」。`SettingsToolsTab` 同时管理两者。
-- **改后增量**：crate 切分 +1.0、领域建模 +0.3
+- **架构再核实**：
+  - `magi-skill-runtime → magi-tool-runtime` 已是单向干净依赖；skill = "tool runtime + LLM 上下文（instruction / prompt_priority / metadata）"，**不是平行机制**而是分层叠加，crate 合并会把 LLM 专属概念污染纯工具运行时，违反 SRP。
+  - `CustomToolBinding` 已经是 `SkillDefinition.custom_tool_bindings[]` 字段（嵌套在 skill 内），并不存在「与 Skill 并行的独立 CustomTool runtime」。
+  - 真正的重复发生在**已安装扩展的删除生命周期**：`customTools[]` 与 `instructionSkills[]` 用两套 API（`/settings/skills/custom-tool/remove` + `/settings/skills/instruction/remove`）+ 两套 wrapper / bridge case / store 分支。
+- **执行结果**（修订后只做有真实价值的一刀）：
+  1. 后端：`crates/magi-api/src/routes/mcp_skills_repos.rs` 两条 remove 路由收成一条 `POST /settings/skills/remove`，请求体 `{ skillName, source: 'custom' | 'instruction' }`，handler 内分支落到既有 `customTools` / `instructionSkills` 存储路径（存储 schema 不动，零迁移）。
+  2. 前端 wrapper：`web/src/web/agent-api.ts` 的 `removeAgentCustomTool` + `removeAgentInstructionSkill` 收成 `removeAgentInstalledSkill(skillName, source)`，新导出 `AgentSkillSource` 类型。
+  3. 前端 bridge：`web/src/shared/bridges/web-client-bridge.ts` 两个 dispatch case (`removeCustomTool` / `removeInstructionSkill`) + 两个 helper 收成单 `removeInstalledSkill` + 单 case `removeInstalledSkill`，仍按 source 区分 `customToolRemoved` / `instructionSkillRemoved` 出站事件以保持外部消费者兼容。
+  4. 前端 store：`web/src/stores/settings-store.svelte.ts::deleteSkill` 双分支收成单一调用 `removeAgentInstalledSkill(skill.name, skill.source)`，标题/确认文案仍按 source 选择 i18n 键（保留用户面区分）。
+  5. 死代码：`web/src/shared/rust-daemon-client.ts` 删除 `removeCustomTool / removeInstructionSkill` 方法 + `CustomToolNameRequestDto / InstructionSkillNameRequestDto` 导入；`web/src/shared/rust-backend-types.ts` 删除两个未用 DTO。
+  6. 验证：`cargo check --workspace` ✓、`cargo test -p magi-api --lib mcp` 20/20 ✓、`npm --prefix web run check` 683/0/0 ✓；全仓 `grep 'custom-tool/remove\|instruction/remove\|removeAgentCustomTool\|removeAgentInstructionSkill\|CustomToolNameRequestDto\|InstructionSkillNameRequestDto'` 在源码内已为 0。
+- **不做的事**：
+  - 不合并 `magi-skill-runtime` ↔ `magi-tool-runtime` crate：现层级反映真实分层（工具原语 vs LLM 扩展包），合并是反向退化。
+  - 不合并 `customTools` / `instructionSkills` 存储：装载路径（用户填表 vs 从 repo 安装）确实不同，强行合并会破坏 install UX。
+  - i18n 用户面文案不动（`deleteCustomTool` / `deleteInstructionSkill` 仍存在），用户在 SettingsToolsTab 仍能看到 `custom` / `Instruction` 来源标签——这反映合理的安装来源差异，不是代码内部的重复。
+- **改后增量（修订）**：协议表面 +0.3、可演进性 +0.2（原"crate 切分 +1.0"的预估基于错误前提，已撤回）
 - **依赖**：无
-- **代码证据**：`magi-skill-runtime`（4 个 mod）独立 crate + `magi-tool-runtime` 独立 crate
+- **代码证据**：`/settings/skills/custom-tool/remove` + `/settings/skills/instruction/remove` 两条端点共 2 个 handler，前端 wrapper / bridge / store 三层各自双分支
 
 ### #10 删除双模型客户端
 - **状态**：✅

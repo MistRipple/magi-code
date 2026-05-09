@@ -15,7 +15,6 @@ import type {
   BridgeServicesSnapshotDto,
   ClearNotificationsRequestDto,
   ConnectionTestResponseDto,
-  CustomToolNameRequestDto,
   DeletedResponseDto,
   DeliveryPackageDto,
   DiffResponseDto,
@@ -29,7 +28,6 @@ import type {
   FileContentResponseDto,
   FilesystemListResponseDto,
   HealthDto,
-  InstructionSkillNameRequestDto,
   KnowledgeMutationResponseDto,
   McpConnectResponseDto,
   McpDisconnectResponseDto,
@@ -457,21 +455,6 @@ export class RustDaemonClient {
 
   public async addCustomTool(tool: unknown): Promise<AddedResponseDto> {
     return this.postJson<AddedResponseDto>('/api/settings/skills/custom-tool/add', tool);
-  }
-
-  public async removeCustomTool(
-    request: CustomToolNameRequestDto,
-  ): Promise<RemovedResponseDto> {
-    return this.postJson<RemovedResponseDto>('/api/settings/skills/custom-tool/remove', request);
-  }
-
-  public async removeInstructionSkill(
-    request: InstructionSkillNameRequestDto,
-  ): Promise<RemovedResponseDto> {
-    return this.postJson<RemovedResponseDto>(
-      '/api/settings/skills/instruction/remove',
-      request,
-    );
   }
 
   public async updateSkill(skill: unknown): Promise<SkillUpdateResponseDto> {

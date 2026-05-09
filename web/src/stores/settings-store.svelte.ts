@@ -25,8 +25,7 @@ import {
   listAgentRoleTemplates,
   loadAgentSkillLibrary,
   refreshAgentMcpTools,
-  removeAgentCustomTool,
-  removeAgentInstructionSkill,
+  removeAgentInstalledSkill,
   removeAgentRegistryEngine,
   scanAgentLocalSkillDirectory,
   resetAgentExecutionStats,
@@ -2270,41 +2269,30 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   // 删除 Skill
   function deleteSkill(skill: SkillItem) {
-    if (skill.source === "custom") {
-      showConfirm(
-        i18n.t("settings.tools.deleteCustomTool"),
-        i18n.t("settings.tools.deleteCustomToolConfirm", { name: skill.name }),
-        async () => {
-          try {
-            await removeAgentCustomTool(skill.name);
-            const payload = await getAgentSettingsBootstrap();
-            applySkillsConfig(payload.skillsConfig);
-            notifySettingsSuccess("自定义工具已删除");
-          } catch (e) {
-            console.error("[SettingsPanel] 删除自定义工具失败:", e);
-            notifySettingsError("删除自定义工具", e);
-          }
-        },
-      );
-    } else if (skill.source === "instruction") {
-      showConfirm(
-        i18n.t("settings.tools.deleteInstructionSkill"),
-        i18n.t("settings.tools.deleteInstructionSkillConfirm", {
-          name: skill.name,
-        }),
-        async () => {
-          try {
-            await removeAgentInstructionSkill(skill.name);
-            const payload = await getAgentSettingsBootstrap();
-            applySkillsConfig(payload.skillsConfig);
-            notifySettingsSuccess("指令技能已删除");
-          } catch (e) {
-            console.error("[SettingsPanel] 删除指令 Skill 失败:", e);
-            notifySettingsError("删除指令技能", e);
-          }
-        },
-      );
-    }
+    const isCustom = skill.source === "custom";
+    const titleKey = isCustom
+      ? "settings.tools.deleteCustomTool"
+      : "settings.tools.deleteInstructionSkill";
+    const confirmKey = isCustom
+      ? "settings.tools.deleteCustomToolConfirm"
+      : "settings.tools.deleteInstructionSkillConfirm";
+    const successText = isCustom ? "自定义工具已删除" : "指令技能已删除";
+    const errorText = isCustom ? "删除自定义工具" : "删除指令技能";
+    showConfirm(
+      i18n.t(titleKey),
+      i18n.t(confirmKey, { name: skill.name }),
+      async () => {
+        try {
+          await removeAgentInstalledSkill(skill.name, skill.source);
+          const payload = await getAgentSettingsBootstrap();
+          applySkillsConfig(payload.skillsConfig);
+          notifySettingsSuccess(successText);
+        } catch (e) {
+          console.error(`[SettingsPanel] ${errorText}失败:`, e);
+          notifySettingsError(errorText, e);
+        }
+      },
+    );
   }
 
   // Skill 搜索过滤

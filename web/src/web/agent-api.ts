@@ -1437,12 +1437,10 @@ export async function addAgentCustomTool(tool: Record<string, unknown>): Promise
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/custom-tool/add', tool, 'add custom tool');
 }
 
-export async function removeAgentCustomTool(toolName: string): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/custom-tool/remove', { toolName }, 'remove custom tool');
-}
+export type AgentSkillSource = 'custom' | 'instruction';
 
-export async function removeAgentInstructionSkill(skillName: string): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/instruction/remove', { skillName }, 'remove instruction skill');
+export async function removeAgentInstalledSkill(skillName: string, source: AgentSkillSource): Promise<Record<string, unknown>> {
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/remove', { skillName, source }, 'remove installed skill');
 }
 
 export async function updateAgentSkill(skillName: string): Promise<Record<string, unknown>> {
