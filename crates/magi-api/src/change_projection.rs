@@ -189,6 +189,41 @@ pub(crate) fn safe_relative_path(file_path: &str) -> Result<&str, ApiError> {
     Ok(file_path)
 }
 
+/// 把工作区相对路径或工作区下的绝对路径安全解析为工作区内的真实文件路径。
+///
+/// 返回值：`(canonical_absolute_path, workspace_relative_path)`。
+/// - 相对路径：拒绝 `..` 与绝对前缀，再拼到 `workspace_root` 上。
+/// - 绝对路径：直接使用。
+/// 解析后必须 canonicalize 且仍位于 `workspace_root` 之内，否则视为越界并拒绝。
+pub(crate) fn safe_workspace_path(
+    workspace_root: &Path,
+    file_path: &str,
+) -> Result<(PathBuf, String), ApiError> {
+    let trimmed = file_path.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::InvalidInput("文件路径不能为空".to_string()));
+    }
+    let candidate = Path::new(trimmed);
+    let candidate_abs = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        let rel = safe_relative_path(trimmed)?;
+        workspace_root.join(rel)
+    };
+    let canonical_root = workspace_root
+        .canonicalize()
+        .map_err(|e| ApiError::internal_assembly("规范化工作区根目录失败", e))?;
+    let canonical_path = candidate_abs
+        .canonicalize()
+        .map_err(|e| ApiError::internal_assembly("规范化文件路径失败", e))?;
+    let relative = canonical_path
+        .strip_prefix(&canonical_root)
+        .map_err(|_| ApiError::InvalidInput("路径越出工作区边界".to_string()))?
+        .to_string_lossy()
+        .into_owned();
+    Ok((canonical_path, relative))
+}
+
 pub(crate) fn run_git(workspace_root: &Path, args: &[&str]) -> Result<String, ApiError> {
     run_git_with_allowed_statuses(workspace_root, args, &[0])
 }

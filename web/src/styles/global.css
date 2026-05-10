@@ -249,14 +249,19 @@
 
   /* ==========================================
      8. Z-Index 层级系统
+     主 UI 表面层级（由低到高）：
+       sidebar(800) < preview(900) < settings modal(1000) < settings 二级弹窗(1500)
      ========================================== */
   --z-base: 0;
   --z-dropdown: 100;
   --z-sticky: 200;
+  --z-overlay-sidebar: 800;
+  --z-overlay-preview: 900;
   --z-modal: 1000;
   --z-popover: 1100;
   --z-tooltip: 1200;
   --z-toast: 1300;
+  --z-modal-secondary: 1500;
 }
 
 /* ==========================================

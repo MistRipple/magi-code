@@ -299,28 +299,33 @@
     font-family: var(--font-mono);
     font-size: var(--text-xs, 11px);
     line-height: 1.5;
-    overflow-x: auto;
+    overflow-x: hidden;
     max-height: min(60vh, 640px);
     overflow-y: auto;
   }
 
   .diff-line {
-    display: flex;
-    padding: 0 var(--space-3, 12px);
+    display: grid;
+    grid-template-columns: 20px minmax(0, 1fr);
+    align-items: start;
+    min-width: 0;
     min-height: 20px;
+    padding: 0 var(--space-3, 12px);
   }
 
   .diff-prefix {
-    flex-shrink: 0;
-    width: 16px;
     text-align: center;
     user-select: none;
   }
 
   .diff-content {
-    flex: 1;
-    white-space: pre;
+    min-width: 0;
     padding-left: var(--space-2, 8px);
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
   }
 
   /* 行类型着色 */

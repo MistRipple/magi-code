@@ -980,7 +980,7 @@
 
   .model-dropdown {
     position: fixed;
-    z-index: 10000;
+    z-index: var(--z-popover);
     max-height: 200px;
     overflow-y: auto;
     background: var(--vscode-input-background, var(--surface-2));

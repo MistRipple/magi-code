@@ -534,6 +534,15 @@ function shouldRecoverFromBridgeError(error: unknown): boolean {
   return true;
 }
 
+function isSessionMissingError(error: unknown): boolean {
+  if (error instanceof AgentApiError) {
+    if (error.errorCode === 'SESSION_NOT_FOUND') return true;
+    if (error.status === 404) return true;
+  }
+  const detail = normalizeErrorMessage(error) || '';
+  return detail.includes('SESSION_NOT_FOUND') || detail.includes('会话不存在');
+}
+
 function isExpectedRecoveryBridgeFailure(error: unknown): boolean {
   if (error instanceof AgentApiError) {
     return error.status >= 500;
@@ -3186,6 +3195,7 @@ export function createWebClientBridge(): ClientBridge {
             const scope = resolveNotificationOperationScope(message);
             if (scope) {
               void loadSessionNotifications(scope).catch((error) => {
+                if (isSessionMissingError(error)) return;
                 reportExpectedRecoveryFailure('加载通知', '[web-client-bridge] 加载通知失败:', error);
               });
             }
@@ -3196,6 +3206,7 @@ export function createWebClientBridge(): ClientBridge {
             const scope = resolveNotificationOperationScope(message);
             if (scope) {
               void appendSessionNotification(scope, message.notification as Record<string, unknown>).catch((error) => {
+                if (isSessionMissingError(error)) return;
                 reportExpectedRecoveryFailure('写入通知', '[web-client-bridge] 写入通知失败:', error);
               });
             }
@@ -3206,6 +3217,7 @@ export function createWebClientBridge(): ClientBridge {
             const scope = resolveNotificationOperationScope(message);
             if (scope) {
               void markAllNotificationsRead(scope).catch((error) => {
+                if (isSessionMissingError(error)) return;
                 reportExpectedRecoveryFailure('标记通知已读', '[web-client-bridge] 标记通知已读失败:', error);
               });
             }
@@ -3216,6 +3228,7 @@ export function createWebClientBridge(): ClientBridge {
             const scope = resolveNotificationOperationScope(message);
             if (scope) {
               void clearAllNotifications(scope).catch((error) => {
+                if (isSessionMissingError(error)) return;
                 reportExpectedRecoveryFailure('清空通知', '[web-client-bridge] 清空通知失败:', error);
               });
             }
@@ -3226,6 +3239,7 @@ export function createWebClientBridge(): ClientBridge {
             const scope = resolveNotificationOperationScope(message);
             if (scope) {
               void removeNotification(scope, message.notificationId).catch((error) => {
+                if (isSessionMissingError(error)) return;
                 reportExpectedRecoveryFailure('删除通知', '[web-client-bridge] 删除通知失败:', error);
               });
             }

@@ -97,48 +97,63 @@
         return riskLevel || i18n.t('settings.tools.unknown');
     }
   }
+
+  let builtinExpanded = $state(false);
+  const builtinEnabledCount = $derived(
+    (builtinTools as Array<{ enabled: boolean }>).filter((t) => t.enabled).length,
+  );
 </script>
 
-<div class="apple-manager" style="flex: 1; min-height: 0; display: flex; flex-direction: column;">
-  <div class="apple-scroller-proxy" style="flex: 1; display: flex; flex-direction: column; padding: 0;">
-      <div style="display: flex; flex-direction: column; min-height: 100%; flex: 1; padding: 0 4px 12px 4px; box-sizing: border-box;">
+<div class="apple-manager tools-manager">
+  <div class="apple-scroller-proxy tools-scroller">
+      <div class="tools-stack">
         <!-- 内置工具 -->
-        <div class="settings-section tools-section">
-          <div class="settings-section-header" style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 16px;">
+        <div class="settings-section tools-section builtin-section">
+          <button
+            type="button"
+            class="builtin-summary"
+            onclick={() => { builtinExpanded = !builtinExpanded; }}
+            aria-expanded={builtinExpanded}
+          >
             <div class="header-title-group" style="display: flex; align-items: baseline; gap: 10px;">
               <div class="settings-section-title" style="margin-bottom: 0;">{i18n.t('settings.tools.builtinTools')}</div>
-              <div class="settings-section-desc" style="margin-bottom: 0;">{i18n.t('settings.tools.builtinDesc')}</div>
+              <span class="builtin-count-tag">{i18n.t('settings.tools.builtinCount', { enabled: builtinEnabledCount, total: builtinTools.length })}</span>
             </div>
-          </div>
-          <div class="tools-fixed-panel tools-fixed-panel--builtin">
-            {#if builtinTools.length === 0}
-              <div class="empty-state">
-                <Icon name="tools" size={48} />
-                <p>{i18n.t('settings.tools.noBuiltinTools')}</p>
-              </div>
-            {:else}
-              <div class="builtin-tool-list">
-                {#each builtinTools as tool (tool.name)}
-                  <div class="builtin-tool-row">
-                    <div class="brand-group">
-                      <div class="avatar-squircle" style="background: rgba(var(--primary-rgb, 0, 122, 255), 0.12); color: var(--primary);">
-                        <Icon name={tool.name.includes('process') || tool.name.includes('shell') ? 'terminal' : 'tools'} size={13} />
+            <span class="builtin-expand-icon" class:expanded={builtinExpanded}>
+              <Icon name="chevronDown" size={14} />
+            </span>
+          </button>
+          {#if builtinExpanded}
+            <div class="tools-fixed-panel tools-fixed-panel--builtin" style="margin-top: 12px;">
+              {#if builtinTools.length === 0}
+                <div class="empty-state">
+                  <Icon name="tools" size={48} />
+                  <p>{i18n.t('settings.tools.noBuiltinTools')}</p>
+                </div>
+              {:else}
+                <div class="builtin-tool-list">
+                  {#each builtinTools as tool (tool.name)}
+                    <div class="builtin-tool-row">
+                      <div class="brand-group">
+                        <div class="avatar-squircle" style="background: rgba(var(--primary-rgb, 0, 122, 255), 0.12); color: var(--primary);">
+                          <Icon name={tool.name.includes('process') || tool.name.includes('shell') ? 'terminal' : 'tools'} size={13} />
+                        </div>
+                        <div class="identity-stack">
+                          <span class="main-label">{getBuiltinToolLabel(tool.name)}</span>
+                          <span class="tool-code">{tool.name}</span>
+                        </div>
                       </div>
-                      <div class="identity-stack">
-                        <span class="main-label">{getBuiltinToolLabel(tool.name)}</span>
-                        <span class="tool-code">{tool.name}</span>
+                      <div class="builtin-tool-badges">
+                        <span class="tool-badge">{getBuiltinToolAccessLabel(tool.accessMode)}</span>
+                        <span class="tool-badge" class:tool-badge--risk={tool.riskLevel.toLowerCase() === 'high'}>{getBuiltinToolRiskLabel(tool.riskLevel)}</span>
+                        <span class="apple-indicator" class:success={tool.enabled} title={tool.enabled ? i18n.t('settings.tools.enabled') : i18n.t('settings.tools.disabledLabel')}></span>
                       </div>
                     </div>
-                    <div class="builtin-tool-badges">
-                      <span class="tool-badge">{getBuiltinToolAccessLabel(tool.accessMode)}</span>
-                      <span class="tool-badge" class:tool-badge--risk={tool.riskLevel.toLowerCase() === 'high'}>{getBuiltinToolRiskLabel(tool.riskLevel)}</span>
-                      <span class="apple-indicator" class:success={tool.enabled} title={tool.enabled ? i18n.t('settings.tools.enabled') : i18n.t('settings.tools.disabledLabel')}></span>
-                    </div>
-                  </div>
-                {/each}
-              </div>
-            {/if}
-          </div>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+          {/if}
         </div>
 
         <!-- MCP 工具 -->
@@ -318,10 +333,36 @@
 </div>
 
 <style>
+  .tools-manager {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .tools-scroller {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 0;
+    overflow-y: auto;
+  }
+
+  .tools-stack {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    padding: 0 4px 12px 4px;
+    box-sizing: border-box;
+  }
+
   .tools-section {
     display: flex;
     flex-direction: column;
     min-height: 0;
+    flex: 0 0 auto;
   }
 
   .tools-fixed-panel {
@@ -329,6 +370,33 @@
     overflow: visible;
     display: flex;
     flex-direction: column;
+  }
+
+  .tools-fixed-panel--builtin {
+    flex: 0 0 auto;
+    max-height: 318px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding-right: 2px;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb) transparent;
+  }
+
+  .tools-fixed-panel--builtin::-webkit-scrollbar {
+    width: 10px;
+  }
+
+  .tools-fixed-panel--builtin::-webkit-scrollbar-track {
+    background: color-mix(in srgb, var(--surface-2) 58%, transparent);
+    border-radius: 999px;
+  }
+
+  .tools-fixed-panel--builtin::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    border-radius: 999px;
+    border: 2px solid color-mix(in srgb, var(--surface-1) 88%, transparent);
+    background-clip: content-box;
   }
 
   .tools-fixed-panel > .empty-state {
@@ -341,6 +409,48 @@
   }
   .tools-fixed-panel .apple-grid {
     min-height: 0;
+  }
+
+  .builtin-section {
+    margin-bottom: 16px;
+  }
+
+  .builtin-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    padding: 8px 12px;
+    background: rgba(var(--foreground-rgb), 0.025);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+
+  .builtin-summary:hover {
+    background: rgba(var(--foreground-rgb), 0.05);
+    border-color: rgba(var(--primary-rgb, 0, 122, 255), 0.35);
+  }
+
+  .builtin-count-tag {
+    font-size: 11px;
+    color: var(--foreground-muted);
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: rgba(var(--foreground-rgb), 0.06);
+  }
+
+  .builtin-expand-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.2s cubic-bezier(0.3, 0, 0.2, 1);
+    color: var(--foreground-muted);
+  }
+
+  .builtin-expand-icon.expanded {
+    transform: rotate(180deg);
   }
 
   .builtin-tool-list {
@@ -400,7 +510,7 @@
     border: 1px solid rgba(60, 60, 67, 0.16);
     border-radius: 12px;
     box-shadow: 0 10px 40px rgba(0, 0, 0, 0.12), 0 1px 2px rgba(0, 0, 0, 0.04);
-    z-index: 1000;
+    z-index: var(--z-popover);
     padding: 12px;
     max-height: 250px;
     overflow-y: auto;

@@ -846,9 +846,9 @@
   .role-template-item-desc { font-size: var(--text-xs); color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .role-template-item-badge { font-size: 10px; padding: 1px 6px; background: var(--surface-hover); border-radius: var(--radius-sm); color: var(--foreground-muted); flex-shrink: 0; }
 
-  /* 通用对话框 */
+  /* 通用对话框：设置面板内的二级弹窗 */
   .dialog-overlay {
-    position: fixed; inset: 0; z-index: 9999;
+    position: fixed; inset: 0; z-index: var(--z-modal-secondary);
     background: rgba(0, 0, 0, 0.5);
     display: flex; justify-content: center; align-items: center;
   }

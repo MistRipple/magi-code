@@ -1424,9 +1424,12 @@ export async function getAgentChangeDiff(filePath: string): Promise<AgentChangeD
   }
 }
 
-export async function getAgentFilePreview(filePath: string): Promise<AgentFilePreviewPayload> {
+export async function getAgentFilePreview(
+  filePath: string,
+  options: { includeSession?: boolean } = {},
+): Promise<AgentFilePreviewPayload> {
   try {
-    const query = buildBoundQuery({ filePath });
+    const query = buildBoundQuery({ filePath }, { includeSession: options.includeSession });
     const response = await getTransport().request(agentUrl(`/api/files/content`, query));
     return await parseAgentJson<AgentFilePreviewPayload>(response, 'load file preview');
   } catch (error) {

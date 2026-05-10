@@ -860,10 +860,12 @@
     max-height: 360px;
     overflow-y: auto;
     padding: 8px;
-    background: var(--surface-1, var(--background));
-    border: 1px solid var(--border);
+    background: color-mix(in srgb, var(--background) 100%, white 8%);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    border: 1px solid color-mix(in srgb, var(--border) 80%, var(--foreground) 20%);
     border-radius: var(--radius-md);
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.22);
   }
   .ia-templates-header {
     font-size: 11px;

@@ -7,7 +7,6 @@ import SettingsModelTab from './SettingsModelTab.svelte';
 import SettingsToolsTab from './SettingsToolsTab.svelte';
 import Icon from './Icon.svelte';
 import Modal from './Modal.svelte';
-import LanAccessPanel from './LanAccessPanel.svelte';
 import { i18n } from '../stores/i18n.svelte';
 import {
     updateAgentRuntimeSetting,
@@ -26,9 +25,6 @@ import { getAgentColor } from '../lib/agent-colors';
   const store = useSettingsStore({
     onClose: () => onClose?.(),
   });
-
-  // P2-#12：局域网/隧道访问从 Header 主路径下沉到 Settings 高级抽屉，默认关闭。
-  let showLanPanel = $state(false);
 </script>
 
 
@@ -66,6 +62,16 @@ import { getAgentColor } from '../lib/agent-colors';
         <button
           type="button"
           class="nav-item"
+          class:active={store.activeTab === 'agents'}
+          aria-label={i18n.t('settings.zone.roles')}
+          onclick={() => store.activeTab = 'agents'}
+        >
+          <Icon name="bot" size={16} />
+          <span>{i18n.t('settings.zone.roles')}</span>
+        </button>
+        <button
+          type="button"
+          class="nav-item"
           class:active={store.activeTab === 'rules'}
           aria-label={i18n.t('settings.zone.preferences')}
           onclick={() => store.activeTab = 'rules'}
@@ -85,32 +91,6 @@ import { getAgentColor } from '../lib/agent-colors';
         </button>
       </nav>
       <div class="sidebar-footer">
-        <div class="advanced-section">
-          <span class="advanced-label">{i18n.t('settings.advanced.title')}</span>
-          <button
-            type="button"
-            class="settings-btn secondary advanced-btn"
-            class:active={store.activeTab === 'agents'}
-            onclick={() => { store.activeTab = 'agents'; }}
-            title={i18n.t('settings.advanced.agents')}
-          >
-            <Icon name="bot" size={14} />
-            <span>{i18n.t('settings.advanced.agents')}</span>
-          </button>
-          <div class="lan-access-wrapper">
-            <button
-              type="button"
-              class="settings-btn secondary advanced-btn"
-              class:active={showLanPanel}
-              onclick={() => { showLanPanel = !showLanPanel; }}
-              title={i18n.t('lanAccess.title')}
-            >
-              <Icon name="qrcode" size={14} />
-              <span>{i18n.t('settings.advanced.lanAccess')}</span>
-            </button>
-            <LanAccessPanel visible={showLanPanel} onClose={() => { showLanPanel = false; }} />
-          </div>
-        </div>
         {#if store.userInfo && store.clientKind === 'vscode'}
           <div class="logout-section">
             <span class="user-info-text" title={store.userInfo}>{store.userInfo}</span>
@@ -146,8 +126,8 @@ import { getAgentColor } from '../lib/agent-colors';
             </div>
           {:else if store.activeTab === 'agents'}
             <div style="display: flex; align-items: baseline; gap: 12px;">
-              <h2>{i18n.t('settings.advanced.agents')}</h2>
-              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.advanced.agentsDesc')}</span>
+              <h2>{i18n.t('settings.zone.roles')}</h2>
+              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.zone.rolesDesc')}</span>
             </div>
           {/if}
         </div>
@@ -806,40 +786,6 @@ import { getAgentColor } from '../lib/agent-colors';
       display: flex;
       flex-direction: column;
       gap: 12px;
-    }
-
-    /* P2-#12：sidebar 底部「高级」抽屉，托管局域网/隧道访问入口 */
-    .advanced-section {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      padding-top: 8px;
-      border-top: 1px solid var(--vscode-widget-border, rgba(0, 0, 0, 0.08));
-    }
-
-    .advanced-label {
-      font-size: 11px;
-      font-weight: 600;
-      color: var(--foreground-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-
-    .lan-access-wrapper {
-      position: relative;
-    }
-
-    .advanced-btn {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      width: 100%;
-      justify-content: flex-start;
-    }
-
-    .advanced-btn.active {
-      color: var(--primary);
-      border-color: color-mix(in srgb, var(--primary) 35%, transparent);
     }
 
     .settings-main {

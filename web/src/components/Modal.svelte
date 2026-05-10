@@ -159,7 +159,7 @@
   }
   
   .modal-overlay {
-    /* Using higher z-index to ensure it sits on top */
-    z-index: 10000;
+    /* Modal 通用对话框：高于设置主面板（--z-modal），用于设置内的二级确认弹窗 */
+    z-index: var(--z-modal-secondary);
   }
 </style>

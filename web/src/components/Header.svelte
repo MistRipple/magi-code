@@ -5,9 +5,11 @@
   import Icon from './Icon.svelte';
   import Modal from './Modal.svelte';
   import NotificationCenter from './NotificationCenter.svelte';
+  import LanAccessPanel from './LanAccessPanel.svelte';
   import type { Session } from '../types/message';
   import { i18n } from '../stores/i18n.svelte';
   import { buildSessionMarkdownExport, downloadMarkdown } from '../lib/session-export';
+  import { getWebSidebarContext } from '../web/sidebar-context';
 
   import type { Snippet } from 'svelte';
   interface Props {
@@ -17,10 +19,13 @@
 
   let { onOpenSettings, children }: Props = $props();
   const appState = getState();
+  // Web 外壳通过 context 注入 sidebar 切换能力，桌面/Tauri 路径无 context 时按钮不渲染。
+  const webSidebar = getWebSidebarContext();
   // 下拉菜单状态
   let dropdownOpen = $state(false);
 
-  // P2-#12：局域网/隧道访问入口已收到 SettingsPanel 高级抽屉，主路径不再暴露。
+  // 局域网/隧道访问 popover（直接挂在 Header，操作更直观）
+  let showLanPanel = $state(false);
 
   // 删除确认对话框状态
   let showDeleteConfirm = $state(false);
@@ -193,6 +198,17 @@
 </script>
 
 <header class="header-bar">
+  {#if webSidebar}
+    <button
+      type="button"
+      class="header-sidebar-toggle"
+      aria-label={i18n.t(webSidebar.hidden || (webSidebar.isDrawer && !webSidebar.drawerOpen) ? 'web.expandSidebar' : 'web.collapseSidebar')}
+      title={i18n.t(webSidebar.hidden || (webSidebar.isDrawer && !webSidebar.drawerOpen) ? 'web.expandSidebar' : 'web.collapseSidebar')}
+      onclick={() => webSidebar.toggle()}
+    >
+      <Icon name="sidebar-toggle" size={14} />
+    </button>
+  {/if}
   {#if currentWorkspaceFolder}
     <div
       class="workspace-breadcrumb"
@@ -280,6 +296,18 @@
     >
       <Icon name="download" size={14} />
     </button>
+    <div class="lan-access-wrapper">
+      <button
+        class="btn-icon btn-icon--sm lan-access-trigger"
+        class:active={showLanPanel}
+        onclick={() => { showLanPanel = !showLanPanel; }}
+        title={i18n.t('lanAccess.title')}
+        aria-label={i18n.t('lanAccess.title')}
+      >
+        <Icon name="qrcode" size={14} />
+      </button>
+      <LanAccessPanel visible={showLanPanel} onClose={() => { showLanPanel = false; }} />
+    </div>
     <NotificationCenter />
     <button class="btn-icon btn-icon--sm" onclick={openSettings} title={i18n.t('header.settings')}>
       <Icon name="settings" size={14} />
@@ -334,7 +362,7 @@
     flex-shrink: 0;
     position: sticky;
     top: 0;
-    z-index: var(--z-modal);
+    z-index: var(--z-sticky);
     border-bottom: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
   }
 
@@ -342,6 +370,28 @@
     display: flex;
     flex: 1;
     justify-content: center;
+  }
+
+  .header-sidebar-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    margin-right: 6px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--foreground-muted);
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+  }
+  .header-sidebar-toggle:hover {
+    background: var(--surface-hover);
+    color: var(--foreground);
+    border-color: var(--border);
   }
 
   .workspace-breadcrumb {
@@ -385,6 +435,11 @@
     gap: var(--space-2);
     flex-shrink: 0;
     justify-content: flex-end;
+  }
+
+  .lan-access-wrapper {
+    position: relative;
+    display: inline-flex;
   }
 
   /* 移动端：Header 变两行 */

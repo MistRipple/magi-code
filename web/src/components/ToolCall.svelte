@@ -561,19 +561,28 @@
 
   // 处理文件点击
   function handleOpenFile() {
-    if (toolFilepath) {
-      // 优先使用传入的回调
-      if (onOpenFile) {
-        onOpenFile(toolFilepath);
-      } else {
-        // 后备：直接发消息给 VSCode 桥
-        vscode.postMessage({
-          type: 'openFile',
-          filepath: toolFilepath,
-          sessionId: getCurrentSessionId() || undefined,
-        });
+    if (!toolFilepath) {
+      return;
+    }
+    if (onOpenFile) {
+      onOpenFile(toolFilepath);
+      return;
+    }
+    if (typeof window !== 'undefined') {
+      const previewEvent = new CustomEvent('magi:previewFile', {
+        detail: { filepath: toolFilepath },
+        cancelable: true,
+      });
+      window.dispatchEvent(previewEvent);
+      if (previewEvent.defaultPrevented) {
+        return;
       }
     }
+    vscode.postMessage({
+      type: 'openFile',
+      filepath: toolFilepath,
+      sessionId: getCurrentSessionId() || undefined,
+    });
   }
 </script>
 

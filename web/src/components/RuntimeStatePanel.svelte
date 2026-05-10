@@ -41,8 +41,39 @@
     processingStartedAt = null,
   }: Props = $props();
   let isPanelExpanded = $state(false);
+  let panelRef: HTMLElement | undefined = $state();
   type DiagnosticsSectionKey = 'timeline' | 'stateDiff' | 'decisionTrace' | null;
   let expandedSection = $state<DiagnosticsSectionKey>(null);
+
+  // 展开后按 popover 行为闭合：点击面板外部或按 ESC 即收起；同时折叠内部子区，避免下次再展开时残留状态。
+  $effect(() => {
+    if (!isPanelExpanded) {
+      return;
+    }
+    function handleOutsideMouseDown(event: MouseEvent): void {
+      const target = event.target as Node | null;
+      if (!target) {
+        return;
+      }
+      if (panelRef && panelRef.contains(target)) {
+        return;
+      }
+      isPanelExpanded = false;
+      expandedSection = null;
+    }
+    function handleKeydown(event: KeyboardEvent): void {
+      if (event.key === 'Escape') {
+        isPanelExpanded = false;
+        expandedSection = null;
+      }
+    }
+    document.addEventListener('mousedown', handleOutsideMouseDown, true);
+    document.addEventListener('keydown', handleKeydown);
+    return () => {
+      document.removeEventListener('mousedown', handleOutsideMouseDown, true);
+      document.removeEventListener('keydown', handleKeydown);
+    };
+  });
   const isTimelineExpanded = $derived(expandedSection === 'timeline');
   const isStateDiffExpanded = $derived(expandedSection === 'stateDiff');
   const isDecisionTraceExpanded = $derived(expandedSection === 'decisionTrace');
@@ -773,7 +804,7 @@
 </script>
 
 {#if runtimeState || canonicalProcessingActive}
-  <section class="runtime-diagnostics runtime-diagnostics--{statusModifier}">
+  <section bind:this={panelRef} class="runtime-diagnostics runtime-diagnostics--{statusModifier}">
     <button
       type="button"
       class="runtime-diagnostics__summary-button"

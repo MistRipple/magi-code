@@ -868,17 +868,18 @@
   }
 
   .preview-diff {
-    width: max-content;
-    min-width: 100%;
+    width: 100%;
+    min-width: 0;
     min-height: 100%;
     background: transparent;
   }
 
   .preview-diff-line {
-    display: flex;
-    align-items: stretch;
-    min-width: 100%;
-    width: max-content;
+    display: grid;
+    grid-template-columns: var(--diff-line-number-width) var(--diff-prefix-width) minmax(0, 1fr);
+    align-items: start;
+    min-width: 0;
+    width: 100%;
     font-family: var(--font-mono);
     font-size: 12px;
     line-height: 1.55;
@@ -888,7 +889,6 @@
     position: sticky;
     left: 0;
     z-index: 1;
-    flex: 0 0 var(--diff-line-number-width);
     min-width: 0;
     padding: 2px 8px;
     background: var(--edits-line-number-bg);
@@ -902,7 +902,6 @@
     position: sticky;
     left: var(--diff-line-number-width);
     z-index: 1;
-    flex: 0 0 var(--diff-prefix-width);
     min-width: 0;
     padding: 2px 0;
     border-right: 1px solid var(--edits-card-border);
@@ -915,14 +914,16 @@
 
   .preview-diff-line code {
     display: block;
-    flex: 1 0 auto;
-    min-width: max-content;
+    min-width: 0;
     margin: 0;
     padding: 2px 12px 2px 6px;
-    background: transparent;
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
     color: var(--foreground);
+    overflow-wrap: anywhere;
     tab-size: 4;
-    white-space: pre;
+    white-space: pre-wrap;
   }
 
   .preview-diff-line.meta {

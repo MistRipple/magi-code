@@ -13,7 +13,7 @@ use crate::{
     change_projection::{
         SessionChangeScope, resolve_session_change_scope, resolve_workspace_root_or_active,
         run_git_add_files, run_git_diff, run_git_restore_files, safe_relative_path,
-        session_change_scope_allows_path,
+        safe_workspace_path, session_change_scope_allows_path,
     },
     errors::ApiError,
     state::ApiState,
@@ -253,7 +253,7 @@ async fn get_file_content(
     Query(query): Query<FileContentQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let content = if let Some(ref path) = query.file_path {
-        let file_path = if query
+        let absolute_path = if query
             .session_id
             .as_deref()
             .map(str::trim)
@@ -267,14 +267,20 @@ async fn get_file_content(
                 query.workspace_id.as_deref(),
                 query.execution_group_id.as_deref(),
             )?;
-            let rel = require_session_scoped_file(&scope, path)?;
-            scope.workspace_root.join(rel)
+            let (absolute, relative) = safe_workspace_path(&scope.workspace_root, path)?;
+            if !session_change_scope_allows_path(&scope, &relative) {
+                return Err(ApiError::InvalidInput(format!(
+                    "文件 {} 不属于当前会话 {} 的执行变更集合",
+                    relative, scope.session_id
+                )));
+            }
+            absolute
         } else {
             let root = resolve_workspace_root_or_active(&state, query.workspace_id.as_deref())?;
-            let rel = safe_relative_path(path)?;
-            root.join(rel)
+            let (absolute, _) = safe_workspace_path(&root, path)?;
+            absolute
         };
-        std::fs::read_to_string(&file_path)
+        std::fs::read_to_string(&absolute_path)
             .map_err(|e| ApiError::internal_assembly("读取文件内容失败", e))?
     } else {
         String::new()
@@ -1211,5 +1217,77 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!Path::new(&repo_root).join("tmp/new-a.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn get_file_content_accepts_absolute_path_within_workspace() {
+        let repo_root = build_test_repo();
+        let absolute_path = Path::new(&repo_root)
+            .join("a.txt")
+            .to_string_lossy()
+            .into_owned();
+        let state = build_state_with_workspace_root(&repo_root, "workspace-absolute-content");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/files/content?workspaceId=workspace-absolute-content&filePath={}",
+                        absolute_path
+                    ))
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK, "absolute path should be accepted");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        assert_eq!(payload["content"], "alpha changed\n");
+    }
+
+    #[tokio::test]
+    async fn get_file_content_rejects_absolute_path_outside_workspace() {
+        let repo_root = build_test_repo();
+        let outside_dir = std::env::temp_dir().join(format!(
+            "magi-files-content-outside-{}-{}",
+            std::process::id(),
+            UtcMillis::now().0,
+        ));
+        fs::create_dir_all(&outside_dir).expect("outside dir should create");
+        let outside_file = outside_dir.join("secret.txt");
+        fs::write(&outside_file, "off-limits\n").expect("outside file should write");
+        let outside_path = outside_file.to_string_lossy().into_owned();
+        let state = build_state_with_workspace_root(&repo_root, "workspace-outside-content");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/files/content?workspaceId=workspace-outside-content&filePath={}",
+                        outside_path
+                    ))
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        let message = payload["message"].as_str().unwrap_or_default();
+        assert!(message.contains("路径越出工作区边界"));
     }
 }
