@@ -21,6 +21,7 @@ magi-knowledge-store = { path = "../magi-knowledge-store" }
 magi-memory-store = { path = "../magi-memory-store" }
 magi-orchestrator = { path = "../magi-orchestrator" }
 magi-session-store = { path = "../magi-session-store" }
+magi-snapshot = { path = "../magi-snapshot" }
 magi-tool-runtime = { path = "../magi-tool-runtime" }
 magi-usage-authority = { path = "../magi-usage-authority" }
 magi-workspace = { path = "../magi-workspace" }

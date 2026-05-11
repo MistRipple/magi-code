@@ -7,6 +7,7 @@
     isMarkdownFile,
     isWordFile,
   } from '../lib/file-preview-utils';
+  import type { EditContentKind } from '../types/message';
 
   interface Props {
     filePath: string;
@@ -14,16 +15,38 @@
     content: string | null;
     loading: boolean;
     error: string;
+    contentKind?: EditContentKind;
+    size?: number;
+    mime?: string;
+    symlinkTarget?: string;
+    headSummary?: string;
+    tailSummary?: string;
     onClose?: () => void;
   }
 
-  let { filePath, workspaceRoot, content, loading, error, onClose }: Props = $props();
+  let {
+    filePath,
+    workspaceRoot,
+    content,
+    loading,
+    error,
+    contentKind = 'text',
+    size,
+    mime,
+    symlinkTarget,
+    headSummary,
+    tailSummary,
+    onClose,
+  }: Props = $props();
   let markdownMode = $state<'rendered' | 'raw'>('rendered');
 
   const displayPath = $derived(getDisplayPath(filePath, workspaceRoot));
   const markdownFile = $derived(isMarkdownFile(filePath));
   const wordFile = $derived(isWordFile(filePath));
-  const binaryFile = $derived(isKnownBinaryFile(filePath));
+  const binaryFile = $derived(contentKind === 'binary' || isKnownBinaryFile(filePath));
+  const largeTextFile = $derived(contentKind === 'large_text');
+  const symlinkFile = $derived(contentKind === 'symlink');
+  const specialFile = $derived(contentKind === 'special');
   const previewContent = $derived(content ?? '');
   const truncatedContent = $derived(
     previewContent.length > 500_000 ? previewContent.slice(0, 100_000) : previewContent
@@ -31,8 +54,18 @@
   const isLargeFile = $derived(previewContent.length > 500_000);
   const sourceLines = $derived(truncatedContent.split('\n'));
   const codePreviewMode = $derived(
-    !loading && !error && !wordFile && !binaryFile && !!previewContent && (!markdownFile || markdownMode === 'raw')
+    !loading && !error && !wordFile && !binaryFile && !largeTextFile && !symlinkFile && !specialFile && !!previewContent && (!markdownFile || markdownMode === 'raw')
   );
+
+  function formatSize(value?: number): string {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      return '-';
+    }
+    if (value < 1024) return `${value} B`;
+    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+    if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  }
 
   function getDisplayPath(path: string, root: string): string {
     const normalizedPath = path.replace(/\\/g, '/');
@@ -64,7 +97,7 @@
     </button>
   </header>
 
-  {#if markdownFile && !loading && !error && !wordFile && !binaryFile && previewContent}
+  {#if markdownFile && !loading && !error && !wordFile && !binaryFile && !largeTextFile && !symlinkFile && !specialFile && previewContent}
     <div class="file-preview-tabs" role="tablist" aria-label={i18n.t('web.filePreviewTitle')}>
       <button
         type="button"
@@ -98,9 +131,41 @@
         <span>{i18n.t('web.filePreviewUnsupportedWord')}</span>
       </div>
     {:else if binaryFile}
-      <div class="file-preview-state">
+      <div class="file-preview-state file-preview-state--metadata">
         <Icon name="file" size={22} />
         <span>{i18n.t('web.filePreviewUnsupportedBinary')}</span>
+        <span class="file-preview-meta-line">{i18n.t('edits.nonText.size')}: {formatSize(size)}</span>
+        {#if mime}
+          <span class="file-preview-meta-line">{i18n.t('edits.nonText.mime')}: {mime}</span>
+        {/if}
+      </div>
+    {:else if largeTextFile}
+      <div class="file-preview-large-text">
+        <div class="file-preview-notice">{i18n.t('edits.nonText.largeTextTitle')} · {i18n.t('edits.nonText.size')}: {formatSize(size)}</div>
+        {#if headSummary}
+          <div class="file-preview-summary-section">
+            <div class="file-preview-summary-title">{i18n.t('edits.nonText.head')}</div>
+            <pre class="file-preview-summary-content">{headSummary}</pre>
+          </div>
+        {/if}
+        {#if tailSummary}
+          <div class="file-preview-summary-section">
+            <div class="file-preview-summary-title">{i18n.t('edits.nonText.tail')}</div>
+            <pre class="file-preview-summary-content">{tailSummary}</pre>
+          </div>
+        {/if}
+      </div>
+    {:else if symlinkFile}
+      <div class="file-preview-state file-preview-state--metadata">
+        <Icon name="file" size={22} />
+        <span>{i18n.t('edits.nonText.symlinkTitle')}</span>
+        <span class="file-preview-meta-line">{i18n.t('edits.nonText.target')}: {symlinkTarget ?? '-'}</span>
+      </div>
+    {:else if specialFile}
+      <div class="file-preview-state file-preview-state--metadata">
+        <Icon name="file" size={22} />
+        <span>{i18n.t('edits.nonText.specialTitle')}</span>
+        <span class="file-preview-meta-line">{i18n.t('edits.nonText.specialHint')}</span>
       </div>
     {:else if !previewContent}
       <div class="file-preview-state">{i18n.t('edits.preview.empty')}</div>
@@ -296,6 +361,52 @@
 
   .file-preview-state--error {
     color: var(--error);
+  }
+
+  .file-preview-state--metadata {
+    padding: var(--space-4);
+  }
+
+  .file-preview-meta-line {
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .file-preview-large-text {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .file-preview-summary-section {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .file-preview-summary-title {
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--font-semibold);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .file-preview-summary-content {
+    margin: 0;
+    padding: var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--surface-1) 82%, var(--background));
+    color: var(--foreground);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    line-height: 1.6;
+    max-height: 260px;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
 
   .file-preview-notice {

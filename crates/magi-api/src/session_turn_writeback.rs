@@ -26,11 +26,12 @@ use magi_session_store::{
     CanonicalTurnVisibility, CanonicalWorkerRef, SessionRuntimeSidecar, SessionStore,
 };
 use magi_skill_runtime::SkillRuntime;
+use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
 use magi_tool_runtime::{
     ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
 };
 use serde_json::Value;
-use std::{collections::HashMap, path::PathBuf, thread};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, thread};
 
 #[derive(Clone, Debug)]
 pub(crate) struct PublishedSessionTurnItem {
@@ -629,6 +630,8 @@ pub(crate) fn append_session_tool_call_items_batch(
     workspace_root_path: Option<PathBuf>,
     tool_calls: &[ChatToolCall],
     messages: &mut Vec<ChatMessage>,
+    snapshot_session: Option<Arc<SnapshotSession>>,
+    execution_group_id: Option<String>,
     write_allowed: impl Fn() -> bool,
 ) -> bool {
     for tool_call in tool_calls {
@@ -652,6 +655,16 @@ pub(crate) fn append_session_tool_call_items_batch(
         }
     }
 
+    let hook_contexts: Vec<ToolHookCtx> = tool_calls
+        .iter()
+        .map(|tool_call| ToolHookCtx {
+            tool_call_id: tool_call.id.clone(),
+            worker_id: None,
+            execution_group_id: execution_group_id.clone(),
+            declared_paths: derive_declared_paths(tool_call),
+        })
+        .collect();
+
     let tool_results = execute_session_turn_tool_call_batch(
         event_bus,
         tool_registry,
@@ -660,7 +673,20 @@ pub(crate) fn append_session_tool_call_items_batch(
         session_id,
         workspace_id,
         workspace_root_path.as_ref(),
+        snapshot_session.as_ref(),
+        &hook_contexts,
     );
+
+    if let Some(snapshot) = snapshot_session.as_deref()
+        && let Err(err) = snapshot.reconcile()
+    {
+        tracing::warn!(
+            session_id = %session_id.as_str(),
+            error = %err,
+            "snapshot reconcile after tool batch failed"
+        );
+    }
+
     for (tool_call, (tool_result, tool_status)) in tool_calls.iter().zip(tool_results.into_iter()) {
         if !write_allowed() {
             return false;
@@ -682,6 +708,36 @@ pub(crate) fn append_session_tool_call_items_batch(
         });
     }
     true
+}
+
+/// 从 tool_call 参数推断可能被改写的路径，供 SnapshotSession 的 after_tool 强制拍后态。
+/// 覆盖 canonical 文件工具（file_write / file_patch / file_remove / file_mkdir）和 shell 工具（changed_paths）。
+/// 无法可靠推断时返回空 Vec，由 ChangeLog 的全树对账兜底。
+fn derive_declared_paths(tool_call: &ChatToolCall) -> Vec<PathBuf> {
+    let Ok(arguments) = serde_json::from_str::<Value>(&tool_call.function.arguments) else {
+        return Vec::new();
+    };
+    let tool_name = tool_call.function.name.as_str();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    match tool_name {
+        "file_write" | "file_patch" | "file_remove" | "file_mkdir" | "file_create"
+        | "file_edit" => {
+            if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+                paths.push(PathBuf::from(path));
+            }
+        }
+        "shell_exec" | "shell" => {
+            if let Some(list) = arguments.get("changed_paths").and_then(Value::as_array) {
+                for item in list {
+                    if let Some(p) = item.as_str() {
+                        paths.push(PathBuf::from(p));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    paths
 }
 
 fn upsert_session_tool_call_result_item(
@@ -723,6 +779,8 @@ fn execute_session_turn_tool_call_batch(
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     workspace_root_path: Option<&PathBuf>,
+    snapshot_session: Option<&Arc<SnapshotSession>>,
+    hook_contexts: &[ToolHookCtx],
 ) -> Vec<(String, ExecutionResultStatus)> {
     let parsed_arguments = tool_calls
         .iter()
@@ -744,7 +802,11 @@ fn execute_session_turn_tool_call_batch(
         match batch.kind {
             ToolBatchKind::Serial => {
                 for tool_index in batch.tool_indices {
-                    results[tool_index] = Some(execute_session_turn_tool_call(
+                    let hook_ctx = &hook_contexts[tool_index];
+                    if let Some(snapshot) = snapshot_session {
+                        snapshot.before_tool(hook_ctx);
+                    }
+                    let result = execute_session_turn_tool_call(
                         event_bus,
                         tool_registry,
                         skill_runtime,
@@ -752,7 +814,11 @@ fn execute_session_turn_tool_call_batch(
                         session_id,
                         workspace_id,
                         workspace_root_path,
-                    ));
+                    );
+                    if let Some(snapshot) = snapshot_session {
+                        snapshot.after_tool(hook_ctx);
+                    }
+                    results[tool_index] = Some(result);
                 }
             }
             ToolBatchKind::Concurrent => {
@@ -763,10 +829,12 @@ fn execute_session_turn_tool_call_batch(
                         .copied()
                         .map(|tool_index| {
                             let tool_call = &tool_calls[tool_index];
+                            let hook_ctx = hook_contexts[tool_index].clone();
+                            let snapshot_session = snapshot_session.cloned();
                             (
                                 tool_index,
                                 scope.spawn(move || {
-                                    execute_session_turn_tool_call(
+                                    let result = execute_session_turn_tool_call(
                                         event_bus,
                                         tool_registry,
                                         skill_runtime,
@@ -774,7 +842,11 @@ fn execute_session_turn_tool_call_batch(
                                         session_id,
                                         workspace_id,
                                         workspace_root_path,
-                                    )
+                                    );
+                                    if let Some(snapshot) = snapshot_session.as_deref() {
+                                        snapshot.after_tool(&hook_ctx);
+                                    }
+                                    result
                                 }),
                             )
                         })
@@ -1172,6 +1244,8 @@ mod tests {
             None,
             &tool_calls,
             &mut messages,
+            None,
+            None,
             || true,
         );
 

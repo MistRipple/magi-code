@@ -9,6 +9,7 @@ mod routes;
 mod session_turn_execution;
 mod session_turn_writeback;
 pub mod settings_store;
+mod snapshot_lifecycle;
 mod dispatch_execution;
 mod skill_apply_tool;
 pub mod skill_loader;

@@ -199,10 +199,19 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
           fileChange: block.fileChange
             ? {
                 filePath: block.fileChange.filePath,
+                oldPath: block.fileChange.oldPath,
                 changeType: block.fileChange.changeType,
                 additions: block.fileChange.additions,
                 deletions: block.fileChange.deletions,
                 diff: block.fileChange.diff,
+                contentKind: block.fileChange.contentKind,
+                size: block.fileChange.size,
+                mime: block.fileChange.mime,
+                error: block.fileChange.error,
+                symlinkTarget: block.fileChange.symlinkTarget,
+                headSummary: block.fileChange.headSummary,
+                tailSummary: block.fileChange.tailSummary,
+                toolCallId: block.fileChange.toolCallId,
               }
             : undefined,
         };
@@ -213,10 +222,19 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
           content: '',
           fileChange: {
             filePath: block.filePath,
+            oldPath: block.oldPath,
             changeType: block.changeType,
             additions: block.additions,
             deletions: block.deletions,
             diff: block.diff,
+            contentKind: block.contentKind,
+            size: block.size,
+            mime: block.mime,
+            error: block.error,
+            symlinkTarget: block.symlinkTarget,
+            headSummary: block.headSummary,
+            tailSummary: block.tailSummary,
+            toolCallId: block.toolCallId,
           },
         };
       case 'plan':

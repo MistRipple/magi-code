@@ -4,6 +4,7 @@
   import { vscode } from '../lib/vscode-bridge';
   import { ensureArray } from '../lib/utils';
   import type { Edit } from '../types/message';
+  import type { IconName } from '../lib/icons';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { isWebAgentMode } from '../web/agent-api';
@@ -22,12 +23,23 @@
       : null
   );
   const previewTitle = $derived(selectedPreviewEdit?.filePath ?? '');
+  const previewDisplayTitle = $derived(selectedPreviewEdit?.type === 'rename' && selectedPreviewEdit.oldPath
+    ? `${selectedPreviewEdit.oldPath} → ${selectedPreviewEdit.filePath}`
+    : previewTitle);
   const previewContent = $derived(selectedPreviewEdit?.diff ?? '');
+  const previewContentKind = $derived(selectedPreviewEdit?.contentKind ?? 'text');
+  const previewHasDiff = $derived(previewContentKind === 'text');
   const previewError = $derived.by(() => {
-    if (!selectedPreviewEdit || previewContent) {
+    if (!selectedPreviewEdit) {
       return '';
     }
-    return i18n.t('fileChangeCard.noDiffDetail');
+    if (selectedPreviewEdit.error) {
+      return selectedPreviewEdit.error;
+    }
+    if (previewHasDiff && !previewContent) {
+      return i18n.t('fileChangeCard.noDiffDetail');
+    }
+    return '';
   });
 
   onMount(() => {
@@ -74,10 +86,11 @@
   }
 
   // 文件类型图标名
-  function getFileIconName(edit: Edit): 'file-plus' | 'file-minus' | 'file-edit' | 'file-text' {
+  function getFileIconName(edit: Edit): IconName {
     if (edit?.type === 'add') return 'file-plus';
     if (edit?.type === 'delete') return 'file-minus';
     if (edit?.type === 'modify') return 'file-edit';
+    if (edit?.type === 'rename') return 'git-branch';
     return 'file-text';
   }
 
@@ -129,6 +142,12 @@
     previewOpen = openFloatingPreview && !useDockedPreview;
   }
 
+  function editTitle(edit: Edit): string {
+    return edit.type === 'rename' && edit.oldPath
+      ? `${edit.oldPath} → ${edit.filePath}`
+      : edit.filePath;
+  }
+
   function viewDiff(edit: Edit) {
     if (!isWebMode) {
       vscode.postMessage({
@@ -140,6 +159,13 @@
         previewContent: resolveEditPreviewContent(edit),
         previewAbsolutePath: edit?.previewAbsolutePath,
         previewCanOpenWorkspaceFile: edit?.previewCanOpenWorkspaceFile,
+        contentKind: edit?.contentKind ?? 'text',
+        size: edit?.size,
+        mime: edit?.mime,
+        error: edit?.error,
+        symlinkTarget: edit?.symlinkTarget,
+        headSummary: edit?.headSummary,
+        tailSummary: edit?.tailSummary,
       });
       return;
     }
@@ -191,6 +217,31 @@
     return '';
   }
 
+  function formatSize(size?: number): string {
+    if (typeof size !== 'number' || !Number.isFinite(size) || size < 0) {
+      return '-';
+    }
+    if (size < 1024) return `${size} B`;
+    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+    if (size < 1024 * 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  }
+
+  function contentKindLabel(kind?: string): string {
+    switch (kind) {
+      case 'binary':
+        return i18n.t('edits.kind.binary');
+      case 'large_text':
+        return i18n.t('edits.kind.largeText');
+      case 'symlink':
+        return i18n.t('edits.kind.symlink');
+      case 'special':
+        return i18n.t('edits.kind.special');
+      default:
+        return i18n.t('edits.kind.text');
+    }
+  }
+
   $effect(() => {
     if (edits.length === 0) {
       selectedPreviewKey = '';
@@ -219,6 +270,9 @@
 
 {#snippet fileRow(edit: Edit)}
   {@const { name } = splitPath(edit.filePath)}
+  {@const oldName = edit.oldPath ? splitPath(edit.oldPath).name : ''}
+  {@const kind = edit.contentKind ?? 'text'}
+  {@const isText = kind === 'text'}
   <div
     class="file-row"
     class:selected={selectedPreviewKey === getEditKey(edit)}
@@ -226,18 +280,32 @@
     tabindex="0"
     onclick={() => viewDiff(edit)}
     onkeydown={(e) => e.key === 'Enter' && viewDiff(edit)}
-    title={edit.filePath}
+    title={editTitle(edit)}
   >
-    <div class="type-indicator" class:add={edit.type === 'add'} class:modify={edit.type === 'modify'} class:del={edit.type === 'delete'}></div>
-    <div class="file-icon" class:add={edit.type === 'add'} class:modify={edit.type === 'modify'} class:del={edit.type === 'delete'}>
+    <div class="type-indicator" class:add={edit.type === 'add'} class:modify={edit.type === 'modify'} class:del={edit.type === 'delete'} class:rename={edit.type === 'rename'}></div>
+    <div class="file-icon" class:add={edit.type === 'add'} class:modify={edit.type === 'modify'} class:del={edit.type === 'delete'} class:rename={edit.type === 'rename'}>
       <Icon name={getFileIconName(edit)} size={14} />
     </div>
     <div class="file-info">
-      <span class="file-name">{name}</span>
+      {#if edit.type === 'rename' && oldName}
+        <span class="file-name rename-name"><span class="old-path">{oldName}</span><span class="rename-arrow">→</span><span>{name}</span></span>
+      {:else}
+        <span class="file-name">{name}</span>
+      {/if}
+      {#if !isText}
+        <span class="file-kind-tag" title={contentKindLabel(kind)}>{contentKindLabel(kind)}</span>
+      {/if}
+      {#if edit.error}
+        <span class="file-error-tag" title={edit.error}>{i18n.t('edits.row.error')}</span>
+      {/if}
     </div>
     <div class="file-stats">
-      <span class="stat-add">+{edit.additions ?? 0}</span>
-      <span class="stat-del">-{edit.deletions ?? 0}</span>
+      {#if isText}
+        <span class="stat-add">+{edit.additions ?? 0}</span>
+        <span class="stat-del">-{edit.deletions ?? 0}</span>
+      {:else}
+        <span class="stat-meta">{formatSize(edit.size)}</span>
+      {/if}
     </div>
     <div class="file-actions">
       <button class="action-icon approve" title={i18n.t('edits.actions.approveChange')} onclick={(e) => { e.stopPropagation(); approveChange(edit.filePath); }}>
@@ -252,17 +320,64 @@
 
 {#snippet diffContent()}
   <div class="diff-reader-header">
-    <div class="diff-file-title" title={previewTitle}>{splitPath(previewTitle).name}</div>
+    <div class="diff-file-title" title={previewDisplayTitle}>{selectedPreviewEdit?.type === 'rename' && selectedPreviewEdit.oldPath ? previewDisplayTitle : splitPath(previewTitle).name}</div>
     {#if selectedPreviewEdit}
       <div class="diff-file-stats" aria-label="变更行数">
-        <span class="stat-add">+{selectedPreviewEdit.additions ?? 0}</span>
-        <span class="stat-del">-{selectedPreviewEdit.deletions ?? 0}</span>
+        {#if previewHasDiff}
+          <span class="stat-add">+{selectedPreviewEdit.additions ?? 0}</span>
+          <span class="stat-del">-{selectedPreviewEdit.deletions ?? 0}</span>
+        {:else}
+          <span class="stat-meta">{contentKindLabel(previewContentKind)}</span>
+          <span class="stat-meta">{formatSize(selectedPreviewEdit.size)}</span>
+        {/if}
       </div>
     {/if}
   </div>
   <div class="diff-reader-body">
     {#if previewError}
       <div class="preview-empty error">{previewError}</div>
+    {:else if previewContentKind === 'binary'}
+      <div class="preview-non-text" role="note" aria-live="polite">
+        <div class="preview-non-text-title">{i18n.t('edits.nonText.binaryTitle')}</div>
+        <div class="preview-non-text-meta">
+          <span>{i18n.t('edits.nonText.size')}: {formatSize(selectedPreviewEdit?.size)}</span>
+          {#if selectedPreviewEdit?.mime}
+            <span>{i18n.t('edits.nonText.mime')}: {selectedPreviewEdit.mime}</span>
+          {/if}
+        </div>
+        <div class="preview-non-text-hint">{i18n.t('edits.nonText.binaryHint')}</div>
+      </div>
+    {:else if previewContentKind === 'large_text'}
+      <div class="preview-non-text" role="note" aria-live="polite">
+        <div class="preview-non-text-title">{i18n.t('edits.nonText.largeTextTitle')}</div>
+        <div class="preview-non-text-meta">
+          <span>{i18n.t('edits.nonText.size')}: {formatSize(selectedPreviewEdit?.size)}</span>
+        </div>
+        {#if selectedPreviewEdit?.headSummary}
+          <div class="preview-non-text-section">
+            <div class="preview-non-text-section-label">{i18n.t('edits.nonText.head')}</div>
+            <pre class="preview-non-text-snippet">{selectedPreviewEdit.headSummary}</pre>
+          </div>
+        {/if}
+        {#if selectedPreviewEdit?.tailSummary}
+          <div class="preview-non-text-section">
+            <div class="preview-non-text-section-label">{i18n.t('edits.nonText.tail')}</div>
+            <pre class="preview-non-text-snippet">{selectedPreviewEdit.tailSummary}</pre>
+          </div>
+        {/if}
+      </div>
+    {:else if previewContentKind === 'symlink'}
+      <div class="preview-non-text" role="note" aria-live="polite">
+        <div class="preview-non-text-title">{i18n.t('edits.nonText.symlinkTitle')}</div>
+        <div class="preview-non-text-meta">
+          <span>{i18n.t('edits.nonText.target')}: {selectedPreviewEdit?.symlinkTarget ?? '-'}</span>
+        </div>
+      </div>
+    {:else if previewContentKind === 'special'}
+      <div class="preview-non-text" role="note" aria-live="polite">
+        <div class="preview-non-text-title">{i18n.t('edits.nonText.specialTitle')}</div>
+        <div class="preview-non-text-hint">{i18n.t('edits.nonText.specialHint')}</div>
+      </div>
     {:else if !previewContent}
       <div class="preview-empty">{i18n.t('edits.preview.empty')}</div>
     {:else}
@@ -729,6 +844,7 @@
   .type-indicator.add { background: var(--success); opacity: 1; }
   .type-indicator.modify { background: var(--warning); opacity: 1; }
   .type-indicator.del { background: var(--error); opacity: 1; }
+  .type-indicator.rename { background: var(--info); opacity: 1; }
 
   .file-icon {
     grid-area: icon;
@@ -741,6 +857,7 @@
   .file-icon.add { color: var(--success); }
   .file-icon.modify { color: var(--warning); }
   .file-icon.del { color: var(--error); }
+  .file-icon.rename { color: var(--info); }
 
   .file-info {
     grid-area: info;
@@ -758,6 +875,18 @@
     white-space: nowrap;
   }
 
+  .rename-name {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .old-path,
+  .rename-arrow {
+    color: var(--foreground-muted);
+    font-weight: var(--font-normal);
+  }
+
   .file-stats {
     grid-area: stats;
     display: inline-flex;
@@ -771,6 +900,90 @@
 
   .stat-add { color: var(--success); }
   .stat-del { color: var(--error); }
+  .stat-meta {
+    color: var(--foreground-muted);
+    font-weight: var(--font-medium);
+  }
+
+  .file-kind-tag,
+  .file-error-tag {
+    display: inline-flex;
+    align-items: center;
+    margin-left: 6px;
+    padding: 1px 6px;
+    border: 1px solid var(--edits-card-border);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--surface-2) 60%, transparent);
+    color: var(--foreground-muted);
+    font-size: var(--text-2xs);
+    font-weight: var(--font-medium);
+    line-height: 1.4;
+    vertical-align: middle;
+  }
+
+  .file-error-tag {
+    background: color-mix(in srgb, var(--error) 18%, transparent);
+    color: var(--error);
+    border-color: color-mix(in srgb, var(--error) 35%, var(--edits-card-border));
+  }
+
+  .preview-non-text {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    padding: var(--space-5);
+    color: var(--foreground);
+  }
+
+  .preview-non-text-title {
+    font-size: var(--text-base);
+    font-weight: var(--font-semibold);
+  }
+
+  .preview-non-text-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    color: var(--foreground-muted);
+    font-size: var(--text-sm);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .preview-non-text-hint {
+    color: var(--foreground-muted);
+    font-size: var(--text-sm);
+    line-height: 1.6;
+  }
+
+  .preview-non-text-section {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .preview-non-text-section-label {
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--font-semibold);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .preview-non-text-snippet {
+    margin: 0;
+    padding: var(--space-3);
+    border: 1px solid var(--edits-card-border);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--background) 92%, var(--surface-1));
+    color: var(--foreground);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.55;
+    max-height: 240px;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
 
   .file-actions {
     grid-area: actions;

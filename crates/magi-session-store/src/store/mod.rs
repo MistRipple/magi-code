@@ -4,6 +4,7 @@ mod sidecar;
 #[cfg(test)]
 mod tests;
 
+use crate::lifecycle::SessionLifecycleObserver;
 use crate::models::{
     NotificationRecord, SessionDurableState, SessionExecutionSidecarStoreState, SessionRecord,
     SessionSidecarFlushReason, SessionStoreState, TimelineEntry, TimelineEntryKind,
@@ -21,10 +22,19 @@ struct SidecarFlushState {
     next_flush_hint: Option<UtcMillis>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SessionStore {
     state: Arc<RwLock<SessionStoreState>>,
     sidecar_flush_state: Arc<RwLock<SidecarFlushState>>,
+    lifecycle_observer: Arc<RwLock<Option<Arc<dyn SessionLifecycleObserver>>>>,
+}
+
+impl std::fmt::Debug for SessionStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionStore")
+            .field("state", &"<state>")
+            .finish()
+    }
 }
 
 fn unique_timeline_entry_id(existing: &[TimelineEntry], base: String) -> String {
@@ -67,6 +77,7 @@ impl Default for SessionStore {
         Self {
             state: Arc::new(RwLock::new(SessionStoreState::default())),
             sidecar_flush_state: Arc::new(RwLock::new(SidecarFlushState::default())),
+            lifecycle_observer: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -80,6 +91,7 @@ impl SessionStore {
         Self {
             state: Arc::new(RwLock::new(state)),
             sidecar_flush_state: Arc::new(RwLock::new(SidecarFlushState::default())),
+            lifecycle_observer: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -92,6 +104,22 @@ impl SessionStore {
         sidecar::restore_canonical_turns_from_sidecars(&mut state)
             .expect("persisted sidecar current turn should be canonical-compatible");
         Self::from_state(state)
+    }
+
+    /// 安装 session 生命周期 observer。每个 store 同一时间只挂一个 observer，
+    /// magi-api 启动时由 wiring 层装配；后挂的会替换前一个。
+    pub fn set_lifecycle_observer(&self, observer: Arc<dyn SessionLifecycleObserver>) {
+        *self
+            .lifecycle_observer
+            .write()
+            .expect("session lifecycle observer write lock poisoned") = Some(observer);
+    }
+
+    fn lifecycle_observer(&self) -> Option<Arc<dyn SessionLifecycleObserver>> {
+        self.lifecycle_observer
+            .read()
+            .expect("session lifecycle observer read lock poisoned")
+            .clone()
     }
 
     fn mark_sidecar_dirty(&self, reason: SessionSidecarFlushReason) {
@@ -141,17 +169,21 @@ impl SessionStore {
             created_at: now,
             updated_at: now,
             message_count: None,
-            workspace_id,
+            workspace_id: workspace_id.clone(),
         };
         state.sessions.push(session.clone());
         state.current_session_id = Some(session_id.clone());
         state.timeline.push(TimelineEntry {
             entry_id: format!("timeline-session-created-{}", session_id),
-            session_id,
+            session_id: session_id.clone(),
             kind: TimelineEntryKind::SessionCreated,
             message: format!("会话已创建: {}", title),
             occurred_at: now,
         });
+        drop(state);
+        if let Some(observer) = self.lifecycle_observer() {
+            observer.on_session_created(&session_id, workspace_id.as_deref());
+        }
         Ok(session)
     }
 
@@ -227,6 +259,10 @@ impl SessionStore {
                 .map(|session| session.session_id.clone())
                 .min_by(|left, right| left.as_str().cmp(right.as_str()));
         }
+        drop(state);
+        if let Some(observer) = self.lifecycle_observer() {
+            observer.on_session_archived(session_id);
+        }
         Ok(archived)
     }
 
@@ -265,6 +301,9 @@ impl SessionStore {
         drop(state);
         if removed_sidecar {
             self.mark_sidecar_dirty(SessionSidecarFlushReason::DeleteSession);
+        }
+        if let Some(observer) = self.lifecycle_observer() {
+            observer.on_session_deleted(session_id);
         }
         Ok(())
     }

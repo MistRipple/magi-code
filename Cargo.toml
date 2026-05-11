@@ -20,6 +20,7 @@ members = [
   "crates/magi-usage-authority",
   "crates/magi-normalizer",
   "crates/magi-agent",
+  "crates/magi-snapshot",
 ]
 
 [workspace.package]
@@ -37,3 +38,7 @@ tokio-stream = { version = "0.1.17", features = ["sync"] }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+notify = "8"
+sha2 = "0.10"
+zstd = "0.13"
+ignore = "0.4"

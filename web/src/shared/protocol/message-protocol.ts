@@ -199,6 +199,23 @@ export interface ToolCallBlock {
   duration?: number;
 }
 
+interface FileChangePayload {
+  filePath: string;
+  oldPath?: string;
+  changeType: 'create' | 'modify' | 'delete' | 'rename';
+  additions?: number;
+  deletions?: number;
+  diff?: string;
+  contentKind?: 'text' | 'large_text' | 'binary' | 'symlink' | 'special';
+  size?: number;
+  mime?: string;
+  error?: string;
+  symlinkTarget?: string;
+  headSummary?: string;
+  tailSummary?: string;
+  toolCallId?: string;
+}
+
 export interface ToolResultBlock {
   type: 'tool_result';
   toolCallId: string;
@@ -206,22 +223,11 @@ export interface ToolResultBlock {
   input?: string;
   isError?: boolean;
   standardized?: StandardizedToolResultPayload;
-  fileChange?: {
-    filePath: string;
-    changeType: 'create' | 'modify' | 'delete';
-    additions?: number;
-    deletions?: number;
-    diff?: string;
-  };
+  fileChange?: FileChangePayload;
 }
 
-export interface FileChangeBlock {
+export interface FileChangeBlock extends FileChangePayload {
   type: 'file_change';
-  filePath: string;
-  changeType: 'create' | 'modify' | 'delete';
-  additions?: number;
-  deletions?: number;
-  diff?: string;
 }
 
 export interface PlanBlock {

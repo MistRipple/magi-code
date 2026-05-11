@@ -31,6 +31,7 @@
     switch (change.changeType) {
       case 'create': return i18n.t('fileChangeCard.label.create');
       case 'delete': return i18n.t('fileChangeCard.label.delete');
+      case 'rename': return i18n.t('fileChangeCard.label.rename');
       default: return i18n.t('fileChangeCard.label.edit');
     }
   });
@@ -40,6 +41,7 @@
     switch (change.changeType) {
       case 'create': return 'file-plus';
       case 'delete': return 'trash';
+      case 'rename': return 'git-branch';
       default: return 'pencil';
     }
   });
@@ -119,6 +121,31 @@
     change && typeof change.deletions === 'number' && change.deletions > 0 ? change.deletions : 0
   );
   const hasStatsBadge = $derived(additionsCount > 0 || deletionsCount > 0);
+  const kind = $derived(change?.contentKind ?? 'text');
+  const isText = $derived(kind === 'text');
+  const displayPath = $derived(change?.changeType === 'rename' && change.oldPath
+    ? `${change.oldPath} → ${change.filePath}`
+    : change?.filePath);
+
+  function formatSize(size?: number): string {
+    if (typeof size !== 'number' || !Number.isFinite(size) || size < 0) {
+      return '-';
+    }
+    if (size < 1024) return `${size} B`;
+    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+    if (size < 1024 * 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  }
+
+  function kindLabel(value: string): string {
+    switch (value) {
+      case 'binary': return i18n.t('edits.kind.binary');
+      case 'large_text': return i18n.t('edits.kind.largeText');
+      case 'symlink': return i18n.t('edits.kind.symlink');
+      case 'special': return i18n.t('edits.kind.special');
+      default: return i18n.t('edits.kind.text');
+    }
+  }
 </script>
 
 {#if change}
@@ -134,10 +161,14 @@
 
       <span class="tool-title">
         <span class="tool-name">{changeLabel}</span>
-        <FileSpan filepath={change.filePath} showIcon={false} clickable={false} />
+        {#if change.changeType === 'rename' && change.oldPath}
+          <span class="rename-path" title={displayPath}>{displayPath}</span>
+        {:else}
+          <FileSpan filepath={change.filePath} showIcon={false} clickable={false} />
+        {/if}
       </span>
 
-      {#if hasStatsBadge}
+      {#if hasStatsBadge && isText}
         <span class="stats-badge">
           {#if additionsCount > 0}
             <span class="stats-value stat-add">+{additionsCount}</span>
@@ -145,6 +176,11 @@
           {#if deletionsCount > 0}
             <span class="stats-value stat-del">-{deletionsCount}</span>
           {/if}
+        </span>
+      {:else if !isText}
+        <span class="stats-badge">
+          <span class="stats-value stat-meta">{kindLabel(kind)}</span>
+          <span class="stats-value stat-meta">{formatSize(change.size)}</span>
         </span>
       {/if}
 
@@ -155,7 +191,39 @@
 
     {#if !collapsed}
       <div class="tool-content">
-        {#if hasDiff}
+        {#if change.error}
+          <div class="empty-diff-note error">{change.error}</div>
+        {:else if !isText}
+          <div class="non-text-card">
+            <div class="non-text-title">{kindLabel(kind)}</div>
+            <div class="non-text-meta">
+              <span>{i18n.t('edits.nonText.size')}: {formatSize(change.size)}</span>
+              {#if change.mime}
+                <span>{i18n.t('edits.nonText.mime')}: {change.mime}</span>
+              {/if}
+              {#if change.symlinkTarget}
+                <span>{i18n.t('edits.nonText.target')}: {change.symlinkTarget}</span>
+              {/if}
+            </div>
+            {#if change.headSummary}
+              <div class="non-text-section">
+                <div class="non-text-section-label">{i18n.t('edits.nonText.head')}</div>
+                <pre class="non-text-snippet">{change.headSummary}</pre>
+              </div>
+            {/if}
+            {#if change.tailSummary}
+              <div class="non-text-section">
+                <div class="non-text-section-label">{i18n.t('edits.nonText.tail')}</div>
+                <pre class="non-text-snippet">{change.tailSummary}</pre>
+              </div>
+            {/if}
+            {#if kind === 'binary'}
+              <div class="non-text-hint">{i18n.t('edits.nonText.binaryHint')}</div>
+            {:else if kind === 'special'}
+              <div class="non-text-hint">{i18n.t('edits.nonText.specialHint')}</div>
+            {/if}
+          </div>
+        {:else if hasDiff}
           <div class="diff-container">
             {#each diffLines as line, i}
               <div class="diff-line {line.type}">
@@ -230,6 +298,15 @@
     white-space: nowrap;
   }
 
+  .rename-path {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--foreground);
+    font-size: var(--text-sm, 13px);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .stats-badge {
     display: inline-flex;
     align-items: center;
@@ -254,6 +331,79 @@
 
   .stat-del {
     color: var(--error);
+  }
+
+  .stat-meta {
+    color: var(--foreground-muted);
+    font-weight: 500;
+  }
+
+  .non-text-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3, 12px);
+    margin: var(--space-3, 12px);
+    padding: var(--space-3, 12px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-1, rgba(255, 255, 255, 0.02));
+  }
+
+  .non-text-title {
+    font-size: var(--text-sm, 13px);
+    font-weight: 600;
+    color: var(--foreground);
+  }
+
+  .non-text-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3, 12px);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs, 12px);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .non-text-section {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .non-text-section-label {
+    color: var(--foreground-muted);
+    font-size: var(--text-2xs, 11px);
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .non-text-snippet {
+    margin: 0;
+    padding: var(--space-2, 8px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-2, rgba(0, 0, 0, 0.1));
+    color: var(--foreground);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs, 11px);
+    line-height: 1.5;
+    max-height: 200px;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .non-text-hint {
+    color: var(--foreground-muted);
+    font-size: var(--text-xs, 12px);
+    line-height: 1.5;
+  }
+
+  .empty-diff-note.error {
+    border-color: color-mix(in srgb, var(--error) 40%, var(--border));
+    color: var(--error);
+    background: color-mix(in srgb, var(--error) 10%, var(--surface-1));
   }
 
   .tool-status {

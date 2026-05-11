@@ -18,7 +18,7 @@ use magi_bridge_client::{
     BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerConfig,
     ModelBridgeClient, StdioMcpBridgeClient,
 };
-use magi_core::{SessionId, TaskId, TaskStatus, UtcMillis, WorkspaceId};
+use magi_core::{SessionId, SessionLifecycleStatus, TaskId, TaskStatus, UtcMillis, WorkspaceId};
 use magi_event_bus::InMemoryEventBus;
 use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
@@ -32,7 +32,8 @@ use magi_orchestrator::{
     task_store::TaskStore,
     task_worker_catalog::build_worker_catalog_for_roles,
 };
-use magi_session_store::{SessionRecord, SessionStore};
+use magi_session_store::{SessionLifecycleObserver, SessionRecord, SessionStore};
+use magi_snapshot::{SnapshotManager, SnapshotSession};
 use magi_tool_runtime::{ToolExecutionContextQuery, ToolRegistry};
 use magi_workspace::WorkspaceStore;
 use std::collections::HashMap;
@@ -604,6 +605,7 @@ pub struct ApiState {
     tool_registry: Option<ToolRegistry>,
     pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     pub tunnel_manager: crate::tunnel::TunnelManager,
+    pub snapshot_manager: Arc<SnapshotManager>,
 }
 
 #[derive(Clone, Debug)]
@@ -715,7 +717,27 @@ impl ApiState {
             tool_registry: None,
             skill_runtime: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
+            snapshot_manager: Arc::new(SnapshotManager::new()),
         }
+    }
+
+    /// 安装 SessionLifecycleObserver，把 session 创建/归档/删除事件桥接到 SnapshotManager。
+    pub fn install_snapshot_lifecycle_observer(&self) {
+        let observer = Arc::new(crate::snapshot_lifecycle::SnapshotLifecycleObserver::new(
+            self.snapshot_manager.clone(),
+            self.workspace_registry.clone(),
+        ));
+        self.session_store.set_lifecycle_observer(observer.clone());
+        for session in self.session_store.sessions() {
+            if session.status == SessionLifecycleStatus::Active {
+                observer.on_session_created(&session.session_id, session.workspace_id.as_deref());
+            }
+        }
+    }
+
+    /// 同步取 session 对应的 SnapshotSession。未装载表示生命周期接线异常，调用方应显式报错。
+    pub fn snapshot_session(&self, session_id: &SessionId) -> Option<Arc<SnapshotSession>> {
+        self.snapshot_manager.get_session(session_id.as_str())
     }
 
     pub fn with_tunnel_port(mut self, port: u16) -> Self {
@@ -813,14 +835,14 @@ impl ApiState {
         &self.runtime_epoch
     }
 
-    pub fn bootstrap_dto(&self) -> BootstrapDto {
+    pub fn bootstrap_dto(&self) -> Result<BootstrapDto, ApiError> {
         BootstrapDto::from_state(self)
     }
 
     pub fn bootstrap_dto_for_session(
         &self,
         requested_session_id: Option<&SessionId>,
-    ) -> BootstrapDto {
+    ) -> Result<BootstrapDto, ApiError> {
         BootstrapDto::from_state_with_selected_session(self, requested_session_id)
     }
 
@@ -828,7 +850,7 @@ impl ApiState {
         &self,
         workspace_id: Option<&str>,
         requested_session_id: Option<&SessionId>,
-    ) -> BootstrapDto {
+    ) -> Result<BootstrapDto, ApiError> {
         let Some(ws_id) = workspace_id else {
             return BootstrapDto::from_state_with_selected_session(self, requested_session_id);
         };

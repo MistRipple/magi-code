@@ -1702,7 +1702,7 @@ async fn delete_session(
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         response_workspace_id.as_deref(),
         None,
-    )))
+    )?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1743,7 +1743,7 @@ async fn rename_session(
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         response_workspace_id.as_deref(),
         Some(&session_id),
-    )))
+    )?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1786,7 +1786,7 @@ async fn close_session(
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         response_workspace_id.as_deref(),
         None,
-    )))
+    )?))
 }
 
 async fn save_session(
@@ -1806,7 +1806,7 @@ async fn save_session(
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         Some(workspace_id),
         selected_session_id.as_ref(),
-    )))
+    )?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2144,7 +2144,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use magi_core::{ExecutionOwnership, UtcMillis, WorkspaceId};
+    use magi_core::{AbsolutePath, ExecutionOwnership, UtcMillis, WorkspaceId};
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_session_store::SessionStore;
@@ -2613,6 +2613,22 @@ mod tests {
     #[tokio::test]
     async fn save_session_returns_workspace_scoped_bootstrap() {
         let state = test_state();
+        let selected_root = unique_temp_dir("session-save-scoped-a");
+        let foreign_root = unique_temp_dir("session-save-scoped-b");
+        state
+            .workspace_registry
+            .register(
+                WorkspaceId::new("workspace-a"),
+                AbsolutePath::new(selected_root.display().to_string()),
+            )
+            .expect("workspace a should register");
+        state
+            .workspace_registry
+            .register(
+                WorkspaceId::new("workspace-b"),
+                AbsolutePath::new(foreign_root.display().to_string()),
+            )
+            .expect("workspace b should register");
         let selected_session_id = SessionId::new("session-save-scoped-a");
         let foreign_session_id = SessionId::new("session-save-scoped-b");
         state
@@ -2631,6 +2647,11 @@ mod tests {
                 Some("workspace-b".to_string()),
             )
             .expect("session should create");
+        state
+            .snapshot_manager
+            .start_session(selected_session_id.as_str().to_string(), selected_root)
+            .await
+            .expect("snapshot session should start");
 
         let (status, body) = post_json(
             state,

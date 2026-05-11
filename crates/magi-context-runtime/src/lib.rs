@@ -4,7 +4,6 @@ mod execution_context;
 pub mod layered_memory_store;
 pub mod memory_document;
 pub mod shared_context_pool;
-pub mod snapshot;
 mod source_assembly;
 mod structured_output;
 

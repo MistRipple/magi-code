@@ -9,7 +9,7 @@
   import { addToast, messagesState, setCurrentSessionId } from '../stores/messages.svelte';
   import { getClientBridge } from '../shared/bridges/bridge-runtime';
   import { i18n } from '../stores/i18n.svelte';
-  import type { Session } from '../types/message';
+  import type { EditContentKind, Session } from '../types/message';
   import FilePreviewPanel from './FilePreviewPanel.svelte';
   import ProjectFileTree from './ProjectFileTree.svelte';
   import WebFolderPicker from './WebFolderPicker.svelte';
@@ -65,6 +65,12 @@
   let sidebarMode = $state<'projects' | 'files'>('projects');
   let previewFilePath = $state<string | null>(null);
   let previewContent = $state<string | null>(null);
+  let previewContentKind = $state<EditContentKind>('text');
+  let previewFileSize = $state<number | undefined>(undefined);
+  let previewMime = $state<string | undefined>(undefined);
+  let previewSymlinkTarget = $state<string | undefined>(undefined);
+  let previewHeadSummary = $state<string | undefined>(undefined);
+  let previewTailSummary = $state<string | undefined>(undefined);
   let previewLoading = $state(false);
   let previewError = $state('');
   let sidebarWidth = $state<number | null>(null);
@@ -558,6 +564,12 @@
   function closeFilePreview(): void {
     previewFilePath = null;
     previewContent = null;
+    previewContentKind = 'text';
+    previewFileSize = undefined;
+    previewMime = undefined;
+    previewSymlinkTarget = undefined;
+    previewHeadSummary = undefined;
+    previewTailSummary = undefined;
     previewLoading = false;
     previewError = '';
   }
@@ -574,16 +586,39 @@
     return workspaceRoot ? `${workspaceRoot.replace(/[\\/]+$/, '')}/${trimmedPath.replace(/^[\\/]+/, '')}` : trimmedPath;
   }
 
-  async function handleFileSelect(filePath: string): Promise<void> {
+  async function handleFileSelect(
+    filePath: string,
+    metadata: {
+      contentKind?: EditContentKind;
+      size?: number;
+      mime?: string;
+      symlinkTarget?: string;
+      headSummary?: string;
+      tailSummary?: string;
+    } = {},
+  ): Promise<void> {
     const resolvedFilePath = resolvePreviewFilePath(filePath);
     if (!resolvedFilePath) {
       return;
     }
     previewFilePath = resolvedFilePath;
     previewContent = null;
+    previewContentKind = metadata.contentKind ?? 'text';
+    previewFileSize = metadata.size;
+    previewMime = metadata.mime;
+    previewSymlinkTarget = metadata.symlinkTarget;
+    previewHeadSummary = metadata.headSummary;
+    previewTailSummary = metadata.tailSummary;
     previewError = '';
 
-    if (isWordFile(resolvedFilePath) || isKnownBinaryFile(resolvedFilePath)) {
+    if (
+      isWordFile(resolvedFilePath)
+      || isKnownBinaryFile(resolvedFilePath)
+      || previewContentKind === 'binary'
+      || previewContentKind === 'large_text'
+      || previewContentKind === 'symlink'
+      || previewContentKind === 'special'
+    ) {
       previewLoading = false;
       return;
     }
@@ -990,10 +1025,26 @@
       });
     };
     const handlePreviewFile = (event: Event) => {
-      const filepath = (event as CustomEvent<{ filepath?: string }>).detail?.filepath;
+      const detail = (event as CustomEvent<{
+        filepath?: string;
+        contentKind?: EditContentKind;
+        size?: number;
+        mime?: string;
+        symlinkTarget?: string;
+        headSummary?: string;
+        tailSummary?: string;
+      }>).detail;
+      const filepath = detail?.filepath;
       if (typeof filepath === 'string') {
         event.preventDefault();
-        void handleFileSelect(filepath);
+        void handleFileSelect(filepath, {
+          contentKind: detail?.contentKind,
+          size: detail?.size,
+          mime: detail?.mime,
+          symlinkTarget: detail?.symlinkTarget,
+          headSummary: detail?.headSummary,
+          tailSummary: detail?.tailSummary,
+        });
       }
     };
     const handleAgentConnection = (event: Event) => {
@@ -1290,6 +1341,12 @@
           content={previewContent}
           loading={previewLoading}
           error={previewError}
+          contentKind={previewContentKind}
+          size={previewFileSize}
+          mime={previewMime}
+          symlinkTarget={previewSymlinkTarget}
+          headSummary={previewHeadSummary}
+          tailSummary={previewTailSummary}
           onClose={closeFilePreview}
         />
       {/if}

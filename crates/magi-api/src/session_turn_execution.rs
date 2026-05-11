@@ -21,6 +21,7 @@ use magi_bridge_client::{
 use magi_core::{SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::InMemoryEventBus;
 use magi_session_store::{CanonicalTurnItemKind, SessionStore};
+use magi_snapshot::SnapshotManager;
 use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
 use std::{path::PathBuf, sync::Arc};
@@ -182,6 +183,7 @@ pub(crate) struct SessionTurnExecutionRuntime<'a> {
     pub settings_store: Option<&'a Arc<SettingsStore>>,
     pub tool_registry: Option<&'a ToolRegistry>,
     pub skill_runtime: Option<&'a magi_skill_runtime::SkillRuntime>,
+    pub snapshot_manager: Option<&'a Arc<SnapshotManager>>,
     pub request: SessionTurnExecutionRequest,
     pub prompt: String,
     pub tools: Option<Vec<ChatToolDefinition>>,
@@ -197,6 +199,7 @@ pub(crate) fn run_session_turn_execution(
         settings_store,
         tool_registry,
         skill_runtime,
+        snapshot_manager,
         request,
         prompt,
         tools,
@@ -223,6 +226,7 @@ pub(crate) fn run_session_turn_execution(
                 event_bus,
                 session_store,
                 settings_store,
+                snapshot_manager,
                 request: &request,
                 usage_binding: &usage_binding,
                 prompt: &prompt,
@@ -344,6 +348,7 @@ struct SessionTurnRoundRuntime<'a> {
     event_bus: &'a InMemoryEventBus,
     session_store: &'a SessionStore,
     settings_store: Option<&'a Arc<SettingsStore>>,
+    snapshot_manager: Option<&'a Arc<SnapshotManager>>,
     request: &'a SessionTurnExecutionRequest,
     usage_binding: &'a ModelUsageBinding,
     prompt: &'a str,
@@ -431,6 +436,7 @@ fn stream_session_turn_round(
         event_bus,
         session_store,
         settings_store,
+        snapshot_manager,
         request,
         usage_binding,
         prompt,
@@ -691,6 +697,13 @@ fn stream_session_turn_round(
             tool_calls: parsed.tool_calls.clone(),
             tool_call_id: None,
         });
+        let snapshot_session = snapshot_manager
+            .and_then(|mgr| mgr.get_session(request.session_id.as_str()));
+        let execution_group_id = session_store
+            .execution_ownership(&request.session_id)
+            .and_then(|ownership| ownership.mission_id)
+            .map(|mid| mid.to_string())
+            .unwrap_or_else(|| format!("session:{}", request.session_id));
         append_session_tool_call_items_batch(
             session_store,
             event_bus,
@@ -701,6 +714,8 @@ fn stream_session_turn_round(
             request.workspace_root_path.as_deref().map(PathBuf::from),
             &parsed.tool_calls,
             messages,
+            snapshot_session,
+            Some(execution_group_id),
             || request_turn_is_writable(session_store, request),
         );
         if !request_turn_is_writable(session_store, request) {
@@ -1149,6 +1164,7 @@ mod tests {
                 tools: None,
                 messages: &mut messages,
                 completed_required_tool_names: &[],
+                snapshot_manager: None,
                 round: 0,
             },
             None,

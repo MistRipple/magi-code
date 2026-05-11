@@ -1,6 +1,8 @@
+mod lifecycle;
 mod models;
 mod store;
 
+pub use lifecycle::SessionLifecycleObserver;
 pub use models::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     ActiveExecutionTurn, ActiveExecutionTurnItem, ActiveExecutionTurnLane,

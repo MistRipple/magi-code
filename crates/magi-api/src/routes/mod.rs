@@ -123,7 +123,7 @@ async fn bootstrap(
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         workspace_id.as_deref(),
         requested_session_id.as_ref(),
-    )))
+    )?))
 }
 
 fn resolve_bootstrap_workspace_id(
@@ -480,6 +480,24 @@ mod tests {
         .with_model_bridge_client(Arc::new(StaticModelBridgeClient))
     }
 
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            UtcMillis::now().0
+        ));
+        std::fs::create_dir_all(&path).expect("temp dir should create");
+        path
+    }
+
+    async fn start_snapshot_for_session(state: &ApiState, session_id: &str, root: &std::path::Path) {
+        state
+            .snapshot_manager
+            .start_session(session_id.to_string(), root.to_path_buf())
+            .await
+            .expect("snapshot session should start");
+    }
+
     async fn get_json(app: Router, path: &str) -> serde_json::Value {
         let response = app
             .oneshot(
@@ -621,18 +639,20 @@ mod tests {
     async fn bootstrap_without_query_scopes_to_active_workspace_instead_of_global_current_session()
     {
         let state = test_state();
+        let active_root = unique_temp_dir("workspace-bootstrap-active");
+        let other_root = unique_temp_dir("workspace-bootstrap-other");
         state
             .workspace_registry
             .register(
                 WorkspaceId::new("workspace-bootstrap-active"),
-                AbsolutePath::new("/tmp/workspace-bootstrap-active"),
+                AbsolutePath::new(active_root.display().to_string()),
             )
             .expect("active workspace should register first");
         state
             .workspace_registry
             .register(
                 WorkspaceId::new("workspace-bootstrap-other"),
-                AbsolutePath::new("/tmp/workspace-bootstrap-other"),
+                AbsolutePath::new(other_root.display().to_string()),
             )
             .expect("other workspace should register");
         state
@@ -666,18 +686,20 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_session_query_infers_session_workspace_when_workspace_missing() {
         let state = test_state();
+        let active_root = unique_temp_dir("workspace-bootstrap-active");
+        let other_root = unique_temp_dir("workspace-bootstrap-other");
         state
             .workspace_registry
             .register(
                 WorkspaceId::new("workspace-bootstrap-active"),
-                AbsolutePath::new("/tmp/workspace-bootstrap-active"),
+                AbsolutePath::new(active_root.display().to_string()),
             )
             .expect("active workspace should register first");
         state
             .workspace_registry
             .register(
                 WorkspaceId::new("workspace-bootstrap-other"),
-                AbsolutePath::new("/tmp/workspace-bootstrap-other"),
+                AbsolutePath::new(other_root.display().to_string()),
             )
             .expect("other workspace should register");
         state
@@ -696,6 +718,7 @@ mod tests {
                 Some("workspace-bootstrap-other".to_string()),
             )
             .expect("other workspace session should create");
+        start_snapshot_for_session(&state, "session-bootstrap-other", &other_root).await;
 
         let app = build_router(state);
         let bootstrap = get_json(app, "/bootstrap?sessionId=session-bootstrap-other").await;
@@ -715,11 +738,12 @@ mod tests {
     async fn bootstrap_accepts_camel_case_workspace_query() {
         let state = test_state();
         let workspace_id = WorkspaceId::new("workspace-bootstrap-query");
+        let workspace_root = unique_temp_dir("magi-workspace-bootstrap-query");
         state
             .workspace_registry
             .register(
                 workspace_id.clone(),
-                AbsolutePath::new("/tmp/magi-workspace-bootstrap-query"),
+                AbsolutePath::new(workspace_root.display().to_string()),
             )
             .expect("workspace should register");
         let session_id = SessionId::new("session-bootstrap-query");
@@ -734,11 +758,12 @@ mod tests {
         state.session_store.bind_execution_ownership(
             session_id.clone(),
             ExecutionOwnership {
-                session_id: Some(session_id),
+                session_id: Some(session_id.clone()),
                 workspace_id: Some(workspace_id),
                 ..ExecutionOwnership::default()
             },
         );
+        start_snapshot_for_session(&state, session_id.as_str(), &workspace_root).await;
         let app = build_router(state);
 
         let bootstrap = get_json(
@@ -762,11 +787,12 @@ mod tests {
     async fn bootstrap_workspace_session_filters_canonical_turns_to_selected_session() {
         let state = test_state();
         let workspace_id = WorkspaceId::new("workspace-bootstrap-canonical");
+        let workspace_root = unique_temp_dir("magi-workspace-bootstrap-canonical");
         state
             .workspace_registry
             .register(
                 workspace_id.clone(),
-                AbsolutePath::new("/tmp/magi-workspace-bootstrap-canonical"),
+                AbsolutePath::new(workspace_root.display().to_string()),
             )
             .expect("workspace should register");
 
@@ -806,6 +832,7 @@ mod tests {
                 .expect("canonical turn should upsert");
         }
 
+        start_snapshot_for_session(&state, "session-bootstrap-canonical-b", &workspace_root).await;
         let app = build_router(state);
         let selected = get_json(
             app.clone(),

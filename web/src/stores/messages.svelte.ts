@@ -27,6 +27,7 @@ import type {
   QueuedMessage,
   OrchestratorRuntimeState,
   SessionNotificationRecord,
+  Edit,
 } from '../types/message';
 import { vscode } from '../lib/vscode-bridge';
 import { ensureArray } from '../lib/utils';
@@ -393,16 +394,7 @@ let deferredWebviewStateSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let sessionViewStateBySession = $state<Record<string, PersistedSessionViewState>>({});
 interface PersistedSessionExecutionState {
   sessionId: string;
-  edits: Array<{
-    filePath: string;
-    snapshotId?: string;
-    type?: string;
-    additions?: number;
-    deletions?: number;
-    contributors?: string[];
-    workerId?: string;
-    executionGroupId?: string;
-  }>;
+  edits: Edit[];
   orchestratorRuntimeState: OrchestratorRuntimeState | null;
   pendingChanges: unknown[];
 }
@@ -467,7 +459,7 @@ function isValidPersistedArray(value: unknown, max: number): value is unknown[] 
 }
 
 // 新增状态：变更、阶段、Toast、模型状态
-let edits = $state<Array<{ filePath: string; snapshotId?: string; type?: string; additions?: number; deletions?: number; contributors?: string[]; workerId?: string; executionGroupId?: string; diff?: string; originalContent?: string; previewContent?: string; previewAbsolutePath?: string; previewCanOpenWorkspaceFile?: boolean }>>([]);
+let edits = $state<Edit[]>([]);
 // 统一 Worker 运行态（唯一权威来源）
 // 当前主线以 authoritative projection 为准，仅叠加尚未被后端接纳的本地乐观节点。
 

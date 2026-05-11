@@ -829,6 +829,7 @@ pub struct LlmTaskDispatcher {
     workspace_registry: Option<Arc<WorkspaceStore>>,
     tool_registry: Option<ToolRegistry>,
     skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
+    snapshot_manager: Option<Arc<magi_snapshot::SnapshotManager>>,
     /// 强制同步执行 dispatch，用于普通模式的同步 for 循环（设计 §1.3）。
     force_sync_dispatch: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -869,6 +870,7 @@ impl LlmTaskDispatcher {
             workspace_registry: None,
             tool_registry: None,
             skill_runtime: None,
+            snapshot_manager: None,
             force_sync_dispatch: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -926,6 +928,11 @@ impl LlmTaskDispatcher {
 
     pub fn with_skill_runtime(mut self, runtime: Arc<magi_skill_runtime::SkillRuntime>) -> Self {
         self.skill_runtime = Some(runtime);
+        self
+    }
+
+    pub fn with_snapshot_manager(mut self, manager: Arc<magi_snapshot::SnapshotManager>) -> Self {
+        self.snapshot_manager = Some(manager);
         self
     }
 
@@ -1430,6 +1437,7 @@ impl LlmTaskDispatcher {
             settings_store: self.settings_store.as_ref(),
             tool_registry: self.tool_registry.as_ref(),
             skill_runtime: self.skill_runtime.as_deref(),
+            snapshot_manager: self.snapshot_manager.as_ref(),
             request,
             prompt,
             tools,

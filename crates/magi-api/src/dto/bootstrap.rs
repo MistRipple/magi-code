@@ -4,6 +4,7 @@ use crate::{
         AuditUsageLedgerDto, BridgePreflightSnapshotDto, BridgeServicesSnapshotDto,
         RuntimeReadModelDto, ServiceInfo, runtime_read_model_dto,
     },
+    errors::ApiError,
     state::ApiState,
 };
 use magi_core::{SessionId, UtcMillis};
@@ -53,14 +54,14 @@ pub struct BootstrapDto {
 }
 
 impl BootstrapDto {
-    pub fn from_state(state: &ApiState) -> Self {
+    pub fn from_state(state: &ApiState) -> Result<Self, ApiError> {
         Self::from_state_with_selected_session(state, None)
     }
 
     pub fn from_state_with_selected_session(
         state: &ApiState,
         requested_session_id: Option<&SessionId>,
-    ) -> Self {
+    ) -> Result<Self, ApiError> {
         Self::from_state_with_session_projection(
             state,
             select_session_projection(state.session_store.projection_input(), requested_session_id),
@@ -70,7 +71,7 @@ impl BootstrapDto {
     pub(crate) fn from_state_with_session_projection(
         state: &ApiState,
         session_projection: SessionProjectionInput,
-    ) -> Self {
+    ) -> Result<Self, ApiError> {
         let mut dto = Self::from_projection(
             state.runtime_epoch().to_string(),
             state.service_info.clone(),
@@ -90,18 +91,10 @@ impl BootstrapDto {
                 state,
                 &current_session.session_id,
                 current_session.workspace_id.as_deref(),
-            )
-            .unwrap_or_else(|error| {
-                tracing::warn!(
-                    session_id = %current_session.session_id,
-                    "bootstrap pending changes 收集失败: {:?}",
-                    error
-                );
-                Vec::new()
-            });
+            )?;
         }
         dto.truncate_initial_timeline_page();
-        dto
+        Ok(dto)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -262,7 +255,7 @@ mod tests {
             governance,
         );
 
-        let bootstrap = BootstrapDto::from_state(&state);
+        let bootstrap = BootstrapDto::from_state(&state).expect("bootstrap should build");
 
         assert_eq!(bootstrap.service.service_name, "magi");
         assert_eq!(bootstrap.service.api_version, "v0");
@@ -554,7 +547,8 @@ mod tests {
         session_store.append_notification(session_a.clone(), "notification-a", "toast", "notify-a");
         session_store.append_notification(session_b.clone(), "notification-b", "toast", "notify-b");
 
-        let bootstrap = BootstrapDto::from_state_with_selected_session(&state, Some(&session_a));
+        let bootstrap = BootstrapDto::from_state_with_selected_session(&state, Some(&session_a))
+            .expect("bootstrap should build");
 
         assert_eq!(
             bootstrap
@@ -627,7 +621,8 @@ mod tests {
             );
         }
 
-        let bootstrap = BootstrapDto::from_state_with_selected_session(&state, Some(&session_id));
+        let bootstrap = BootstrapDto::from_state_with_selected_session(&state, Some(&session_id))
+            .expect("bootstrap should build");
 
         assert_eq!(bootstrap.timeline.len(), BOOTSTRAP_TIMELINE_PAGE_SIZE);
         assert!(bootstrap.has_more_before);

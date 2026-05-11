@@ -382,10 +382,19 @@ export interface ContentBlock {
   thinking?: ThinkingBlock; // 思考块信息
   fileChange?: {
     filePath: string;
-    changeType: 'create' | 'modify' | 'delete';
+    oldPath?: string;
+    changeType: 'create' | 'modify' | 'delete' | 'rename';
     additions?: number;
     deletions?: number;
     diff?: string;
+    contentKind?: EditContentKind;
+    size?: number;
+    mime?: string;
+    error?: string;
+    symlinkTarget?: string;
+    headSummary?: string;
+    tailSummary?: string;
+    toolCallId?: string;
   };
   plan?: {
     goal: string;
@@ -749,20 +758,32 @@ export interface Task {
 }
 
 // 编辑/变更记录
-export type EditType = 'add' | 'modify' | 'delete';
+export type EditType = 'add' | 'modify' | 'delete' | 'rename';
+export type EditContentKind = 'text' | 'large_text' | 'binary' | 'symlink' | 'special';
+export type EditSourceKind = 'tool' | 'watcher' | 'external' | 'baseline';
 
 export interface Edit {
   filePath: string;
+  oldPath?: string;
   snapshotId?: string;
   updatedAt?: number;
   type?: EditType;
   additions?: number;
   deletions?: number;
   diff?: string;
-  originalContent?: string;
-  previewContent?: string;
+  originalContent?: string | null;
+  previewContent?: string | null;
   previewAbsolutePath?: string;
   previewCanOpenWorkspaceFile?: boolean;
+  contentKind?: EditContentKind;
+  size?: number;
+  mime?: string;
+  sourceKind?: EditSourceKind;
+  error?: string;
+  symlinkTarget?: string;
+  headSummary?: string;
+  tailSummary?: string;
+  toolCallId?: string;
   contributors?: string[];
   workerId?: string;
   executionGroupId?: string;

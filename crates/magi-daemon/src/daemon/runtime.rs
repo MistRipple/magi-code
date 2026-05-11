@@ -604,7 +604,8 @@ impl DaemonRuntime {
                 .with_context_runtime(context_runtime_for_dispatcher)
                 .with_workspace_registry(state.workspace_registry.clone())
                 .with_tool_registry(tool_registry_for_dispatcher)
-                .with_skill_runtime(app_skill_runtime),
+                .with_skill_runtime(app_skill_runtime)
+                .with_snapshot_manager(state.snapshot_manager.clone()),
         );
         let session_turn_dispatcher = llm_task_dispatcher.clone();
         let runner_manager = RunnerManager::with_dispatcher_and_worker_catalog(
@@ -635,6 +636,10 @@ impl DaemonRuntime {
         if let Some(probe_config) = direct_http_probe_config {
             state = state.with_direct_http_model_probe(probe_config);
         }
+
+        // 把 SnapshotManager 桥接到 session-store 生命周期事件。生产路径必装；
+        // 测试可用 ApiState::new 直接构造而不调用此函数，惰性 fallback 仍兜底。
+        state.install_snapshot_lifecycle_observer();
 
         state
     }

@@ -5,15 +5,17 @@ use axum::{
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use magi_bridge_client::{ModelInvocationRequest, LOOPBACK_MODEL_PROVIDER};
+use magi_bridge_client::{LOOPBACK_MODEL_PROVIDER, ModelInvocationRequest};
+use magi_core::SessionId;
+use magi_snapshot::SnapshotSession;
 
 use super::session_scope::parse_session_id;
 use crate::{
     change_projection::{
-        SessionChangeScope, resolve_session_change_scope, resolve_workspace_root_or_active,
-        run_git_add_files, run_git_diff, run_git_restore_files, safe_relative_path,
-        safe_workspace_path, session_change_scope_allows_path,
+        resolve_session_change_scope, resolve_workspace_root_or_active, safe_relative_path,
+        safe_workspace_path,
     },
     errors::ApiError,
     state::ApiState,
@@ -39,18 +41,16 @@ pub fn routes() -> Router<ApiState> {
         .route("/prompt/enhance", post(enhance_prompt))
 }
 
-fn require_session_scoped_file<'a>(
-    scope: &SessionChangeScope,
-    file_path: &'a str,
-) -> Result<&'a str, ApiError> {
-    let rel = safe_relative_path(file_path)?;
-    if !session_change_scope_allows_path(scope, rel) {
-        return Err(ApiError::InvalidInput(format!(
-            "文件 {} 不属于当前会话 {} 的执行变更集合",
-            rel, scope.session_id
-        )));
-    }
-    Ok(rel)
+async fn require_snapshot_session(
+    state: &ApiState,
+    session_id: &SessionId,
+) -> Result<Arc<SnapshotSession>, ApiError> {
+    state.snapshot_session(session_id).ok_or_else(|| {
+        ApiError::InvalidInput(format!(
+            "会话 {} 的快照账本尚未就绪",
+            session_id.as_str()
+        ))
+    })
 }
 
 // ─── Changes ────────────────────────────────────────────────────────────────
@@ -68,48 +68,61 @@ async fn get_diff(
     State(state): State<ApiState>,
     Query(query): Query<DiffQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let diff = if query
+    // 没有 sessionId 时不再回退到 git diff —— 全局变更视图已不再属于本系统职责。
+    let diff = match query
         .session_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .is_some()
     {
-        let session_id = parse_session_id(query.session_id.as_deref())?;
-        let scope = resolve_session_change_scope(
-            &state,
-            &session_id,
-            query.workspace_id.as_deref(),
-            query.execution_group_id.as_deref(),
-        )?;
-        match query.file_path.as_deref() {
-            Some(fp) => {
-                let rel = require_session_scoped_file(&scope, fp)?;
-                run_git_diff(&scope.workspace_root, &["diff", "HEAD", "--", rel])?
-            }
-            None => {
-                let files = scope
-                    .allowed_files
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>();
-                if files.is_empty() {
-                    String::new()
-                } else {
-                    let mut args = vec!["diff", "HEAD", "--"];
-                    args.extend(files);
-                    run_git_diff(&scope.workspace_root, &args)?
+        Some(_) => {
+            let session_id = parse_session_id(query.session_id.as_deref())?;
+            let scope = resolve_session_change_scope(
+                &state,
+                &session_id,
+                query.workspace_id.as_deref(),
+                query.execution_group_id.as_deref(),
+            )?;
+            let snapshot = require_snapshot_session(&state, &session_id).await?;
+            let pending = snapshot
+                .pending_changes()
+                .map_err(|e| ApiError::internal_assembly("读取快照变更失败", e))?;
+            match query.file_path.as_deref() {
+                Some(fp) => {
+                    let rel = safe_relative_path(fp)?;
+                    pending
+                        .iter()
+                        .find(|c| c.path == rel)
+                        .and_then(|c| c.unified_diff.clone())
+                        .unwrap_or_default()
+                }
+                None => {
+                    let exec_group = query
+                        .execution_group_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| scope.execution_group_id.clone());
+                    pending
+                        .iter()
+                        .filter(|c| {
+                            c.execution_group_id
+                                .as_deref()
+                                .map(|id| id == exec_group)
+                                .unwrap_or(true)
+                        })
+                        .filter_map(|c| c.unified_diff.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 }
             }
         }
-    } else {
-        let root = resolve_workspace_root_or_active(&state, query.workspace_id.as_deref())?;
-        match query.file_path.as_deref() {
-            Some(fp) => {
-                let rel = safe_relative_path(fp)?;
-                run_git_diff(&root, &["diff", "HEAD", "--", rel])?
-            }
-            None => run_git_diff(&root, &["diff", "HEAD"])?,
+        None => {
+            // 无 session 调用：仅做一次 workspace 校验，统一返回空 diff，
+            // 不再读 git 来伪装出全局变更。
+            let _ = resolve_workspace_root_or_active(&state, query.workspace_id.as_deref())?;
+            String::new()
         }
     };
     Ok(Json(serde_json::json!({
@@ -131,10 +144,13 @@ async fn approve_change(
     Json(request): Json<ApproveChangeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
-    let scope =
+    let _scope =
         resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
-    let rel = require_session_scoped_file(&scope, &request.file_path)?;
-    run_git_add_files(&scope.workspace_root, &[rel.to_string()])?;
+    let rel = safe_relative_path(&request.file_path)?.to_string();
+    let snapshot = require_snapshot_session(&state, &session_id).await?;
+    snapshot
+        .approve(&[rel])
+        .map_err(|e| ApiError::internal_assembly("approve 变更失败", e))?;
     Ok(Json(serde_json::json!({
         "approved": true,
         "filePath": request.file_path,
@@ -154,10 +170,13 @@ async fn revert_change(
     Json(request): Json<RevertChangeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
-    let scope =
+    let _scope =
         resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
-    let rel = require_session_scoped_file(&scope, &request.file_path)?;
-    run_git_restore_files(&scope.workspace_root, &[rel.to_string()])?;
+    let rel = safe_relative_path(&request.file_path)?.to_string();
+    let snapshot = require_snapshot_session(&state, &session_id).await?;
+    snapshot
+        .revert(&[rel])
+        .map_err(|e| ApiError::internal_assembly("revert 变更失败", e))?;
     Ok(Json(serde_json::json!({
         "reverted": true,
         "filePath": request.file_path,
@@ -176,11 +195,20 @@ async fn approve_all_changes(
     Json(request): Json<ApproveAllRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
-    let scope =
+    let _scope =
         resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
-    let approved_files = scope.allowed_files.iter().cloned().collect::<Vec<_>>();
-    run_git_add_files(&scope.workspace_root, &approved_files)?;
-    Ok(Json(serde_json::json!({ "approved": true })))
+    let snapshot = require_snapshot_session(&state, &session_id).await?;
+    let pending = snapshot
+        .pending_changes()
+        .map_err(|e| ApiError::internal_assembly("读取快照变更失败", e))?;
+    let paths: Vec<String> = pending.iter().map(|c| c.path.clone()).collect();
+    snapshot
+        .approve(&paths)
+        .map_err(|e| ApiError::internal_assembly("approve 全部变更失败", e))?;
+    Ok(Json(serde_json::json!({
+        "approved": true,
+        "approvedFiles": paths,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,11 +223,20 @@ async fn revert_all_changes(
     Json(request): Json<RevertAllRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
-    let scope =
+    let _scope =
         resolve_session_change_scope(&state, &session_id, request.workspace_id.as_deref(), None)?;
-    let reverted_files = scope.allowed_files.iter().cloned().collect::<Vec<_>>();
-    run_git_restore_files(&scope.workspace_root, &reverted_files)?;
-    Ok(Json(serde_json::json!({ "reverted": true })))
+    let snapshot = require_snapshot_session(&state, &session_id).await?;
+    let pending = snapshot
+        .pending_changes()
+        .map_err(|e| ApiError::internal_assembly("读取快照变更失败", e))?;
+    let paths: Vec<String> = pending.iter().map(|c| c.path.clone()).collect();
+    snapshot
+        .revert(&paths)
+        .map_err(|e| ApiError::internal_assembly("revert 全部变更失败", e))?;
+    Ok(Json(serde_json::json!({
+        "reverted": true,
+        "revertedFiles": paths,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,13 +264,28 @@ async fn revert_execution_group_changes(
             request.execution_group_id, scope.session_id
         )));
     }
-    let reverted_files = scope.allowed_files.iter().cloned().collect::<Vec<_>>();
-    run_git_restore_files(&scope.workspace_root, &reverted_files)?;
+    let snapshot = require_snapshot_session(&state, &session_id).await?;
+    let pending = snapshot
+        .pending_changes()
+        .map_err(|e| ApiError::internal_assembly("读取快照变更失败", e))?;
+    let paths: Vec<String> = pending
+        .iter()
+        .filter(|c| {
+            c.execution_group_id
+                .as_deref()
+                .map(|id| id == request.execution_group_id)
+                .unwrap_or(false)
+        })
+        .map(|c| c.path.clone())
+        .collect();
+    snapshot
+        .revert(&paths)
+        .map_err(|e| ApiError::internal_assembly("revert 执行分组失败", e))?;
 
     Ok(Json(serde_json::json!({
         "reverted": true,
         "executionGroupId": request.execution_group_id,
-        "revertedFiles": reverted_files,
+        "revertedFiles": paths,
     })))
 }
 
@@ -267,13 +319,7 @@ async fn get_file_content(
                 query.workspace_id.as_deref(),
                 query.execution_group_id.as_deref(),
             )?;
-            let (absolute, relative) = safe_workspace_path(&scope.workspace_root, path)?;
-            if !session_change_scope_allows_path(&scope, &relative) {
-                return Err(ApiError::InvalidInput(format!(
-                    "文件 {} 不属于当前会话 {} 的执行变更集合",
-                    relative, scope.session_id
-                )));
-            }
+            let (absolute, _relative) = safe_workspace_path(&scope.workspace_root, path)?;
             absolute
         } else {
             let root = resolve_workspace_root_or_active(&state, query.workspace_id.as_deref())?;
@@ -564,285 +610,102 @@ mod tests {
         http::{Request, StatusCode},
     };
     use magi_core::{
-        AbsolutePath, ExecutionOwnership, MissionId, SessionId, TaskId, TaskKind, TaskStatus,
-        UtcMillis, WorkspaceId,
+        AbsolutePath, ExecutionOwnership, MissionId, SessionId, UtcMillis, WorkspaceId,
     };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_orchestrator::task_store::TaskStore;
-    use magi_session_store::{ActiveExecutionTurn, ActiveExecutionTurnItem, SessionStore};
+    use magi_session_store::SessionStore;
     use magi_workspace::WorkspaceStore;
     use std::fs;
-    use std::process::Command;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tower::ServiceExt;
 
-    static TEST_REPO_COUNTER: AtomicU64 = AtomicU64::new(1);
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-    fn build_test_repo() -> String {
-        let unique_suffix = TEST_REPO_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let repo_root = std::env::temp_dir().join(format!(
-            "magi-changes-route-test-{}-{}-{}",
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let unique = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "{}-{}-{}-{}",
+            prefix,
             std::process::id(),
             UtcMillis::now().0,
-            unique_suffix
+            unique
         ));
-        fs::create_dir_all(&repo_root).expect("repo root should create");
-        Command::new("git")
-            .args(["init"])
-            .current_dir(&repo_root)
-            .output()
-            .expect("git init should run");
-        Command::new("git")
-            .args(["config", "user.email", "codex@example.com"])
-            .current_dir(&repo_root)
-            .output()
-            .expect("git email config should run");
-        Command::new("git")
-            .args(["config", "user.name", "Codex"])
-            .current_dir(&repo_root)
-            .output()
-            .expect("git name config should run");
-        fs::write(repo_root.join("a.txt"), "alpha\n").expect("a.txt should write");
-        fs::write(repo_root.join("b.txt"), "beta\n").expect("b.txt should write");
-        Command::new("git")
-            .args(["add", "--", "a.txt", "b.txt"])
-            .current_dir(&repo_root)
-            .output()
-            .expect("git add should run");
-        Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(&repo_root)
-            .output()
-            .expect("git commit should run");
-        fs::write(repo_root.join("a.txt"), "alpha changed\n").expect("a.txt should update");
-        fs::write(repo_root.join("b.txt"), "beta changed\n").expect("b.txt should update");
-        repo_root.to_string_lossy().to_string()
+        fs::create_dir_all(&dir).expect("temp dir should create");
+        dir
     }
 
-    fn build_state_with_repo(repo_root: &str) -> ApiState {
+    fn build_state() -> ApiState {
         let event_bus = Arc::new(InMemoryEventBus::new(32));
         let session_store = Arc::new(SessionStore::default());
         let workspace_store = Arc::new(WorkspaceStore::default());
         let governance = Arc::new(GovernanceService::default());
-        let task_store = Arc::new(TaskStore::new());
-        let state = ApiState::new(
-            "magi-test",
-            event_bus,
-            Arc::clone(&session_store),
-            Arc::clone(&workspace_store),
-            governance,
-        )
-        .with_task_store(Arc::clone(&task_store));
-
-        let workspace_id = WorkspaceId::new("workspace-session-scope");
-        state
-            .workspace_registry
-            .register(workspace_id.clone(), AbsolutePath::new(repo_root))
-            .expect("workspace should register");
-
-        let session_a = SessionId::new("session-a");
-        let session_b = SessionId::new("session-b");
-        state
-            .session_store
-            .create_session_for_workspace(
-                session_a.clone(),
-                "会话 A",
-                Some(workspace_id.to_string()),
-            )
-            .expect("session a should create");
-        state
-            .session_store
-            .create_session_for_workspace(
-                session_b.clone(),
-                "会话 B",
-                Some(workspace_id.to_string()),
-            )
-            .expect("session b should create");
-
-        state.session_store.bind_execution_ownership(
-            session_a.clone(),
-            ExecutionOwnership {
-                session_id: Some(session_a),
-                workspace_id: Some(workspace_id.clone()),
-                mission_id: Some(MissionId::new("mission-a")),
-                ..ExecutionOwnership::default()
-            },
-        );
-        state.session_store.bind_execution_ownership(
-            session_b.clone(),
-            ExecutionOwnership {
-                session_id: Some(session_b),
-                workspace_id: Some(workspace_id),
-                mission_id: Some(MissionId::new("mission-b")),
-                ..ExecutionOwnership::default()
-            },
-        );
-
-        task_store.insert_task(magi_core::Task {
-            task_id: TaskId::new("task-a"),
-            mission_id: MissionId::new("mission-a"),
-            root_task_id: TaskId::new("task-a"),
-            parent_task_id: None,
-            kind: TaskKind::Action,
-            title: "A".to_string(),
-            goal: "A".to_string(),
-            status: TaskStatus::Completed,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            context_refs: Vec::new(),
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: vec!["file:a.txt".to_string()],
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            created_at: UtcMillis::now(),
-            updated_at: UtcMillis::now(),
-        });
-        task_store.insert_task(magi_core::Task {
-            task_id: TaskId::new("task-b"),
-            mission_id: MissionId::new("mission-b"),
-            root_task_id: TaskId::new("task-b"),
-            parent_task_id: None,
-            kind: TaskKind::Action,
-            title: "B".to_string(),
-            goal: "B".to_string(),
-            status: TaskStatus::Completed,
-            dependency_ids: Vec::new(),
-            required_children: Vec::new(),
-            policy_snapshot: None,
-            executor_binding: None,
-            context_refs: Vec::new(),
-            knowledge_refs: Vec::new(),
-            workspace_scope: None,
-            write_scope: None,
-            input_refs: Vec::new(),
-            output_refs: vec!["file:b.txt".to_string()],
-            evidence_refs: Vec::new(),
-            retry_count: 0,
-            repair_count: 0,
-            decision_payload: None,
-            created_at: UtcMillis::now(),
-            updated_at: UtcMillis::now(),
-        });
-
-        state
-    }
-
-    fn build_state_with_workspace_root(root: &str, workspace_id: &str) -> ApiState {
-        let event_bus = Arc::new(InMemoryEventBus::new(32));
-        let session_store = Arc::new(SessionStore::default());
-        let workspace_store = Arc::new(WorkspaceStore::default());
-        let governance = Arc::new(GovernanceService::default());
-        let state = ApiState::new(
+        ApiState::new(
             "magi-test",
             event_bus,
             session_store,
             workspace_store,
             governance,
-        );
-        state
-            .workspace_registry
-            .register(WorkspaceId::new(workspace_id), AbsolutePath::new(root))
-            .expect("workspace should register");
-        state
-    }
-
-    fn build_state_with_plain_session_repo(
-        repo_root: &str,
-        session_id: SessionId,
-        workspace_id: WorkspaceId,
-    ) -> ApiState {
-        let event_bus = Arc::new(InMemoryEventBus::new(32));
-        let session_store = Arc::new(SessionStore::default());
-        let workspace_store = Arc::new(WorkspaceStore::default());
-        let governance = Arc::new(GovernanceService::default());
-        let state = ApiState::new(
-            "magi-test",
-            event_bus,
-            Arc::clone(&session_store),
-            workspace_store,
-            governance,
         )
-        .with_task_store(Arc::new(TaskStore::new()));
+        .with_task_store(Arc::new(TaskStore::new()))
+    }
+
+    fn build_state_with_workspace_root(root: &Path, workspace_id: &str) -> ApiState {
+        let state = build_state();
         state
             .workspace_registry
-            .register(workspace_id.clone(), AbsolutePath::new(repo_root))
-            .expect("workspace should register");
-        state
-            .session_store
-            .create_session_for_workspace(
-                session_id,
-                "普通文件工具会话",
-                Some(workspace_id.to_string()),
+            .register(
+                WorkspaceId::new(workspace_id),
+                AbsolutePath::new(root.to_string_lossy().as_ref()),
             )
-            .expect("session should create");
+            .expect("workspace should register");
         state
     }
 
-    fn upsert_plain_session_file_tool_turn(
+    /// 注册 workspace + session（可选 mission）。session 创建后立即在 SnapshotManager
+    /// 中拉起 SnapshotSession，并完成首次 baseline 扫描；调用方随后做文件改动 + reconcile。
+    async fn register_workspace_and_snapshot(
         state: &ApiState,
-        session_id: &SessionId,
-        tool_name: &str,
-        call_id: &str,
-        arguments: serde_json::Value,
-        result: serde_json::Value,
-    ) {
-        let now = UtcMillis::now();
+        workspace_id: &str,
+        session_id: &str,
+        root: &Path,
+        mission_id: Option<&str>,
+    ) -> Arc<SnapshotSession> {
+        let ws = WorkspaceId::new(workspace_id);
+        let sid = SessionId::new(session_id);
+        state
+            .workspace_registry
+            .register(ws.clone(), AbsolutePath::new(root.to_string_lossy().as_ref()))
+            .expect("workspace should register");
         state
             .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: format!("turn-{call_id}"),
-                    turn_seq: now.0,
-                    accepted_at: now,
-                    completed_at: Some(now),
-                    status: "completed".to_string(),
-                    user_message: Some("文件工具".to_string()),
-                    items: vec![ActiveExecutionTurnItem {
-                        item_id: format!("turn-item-tool-{call_id}"),
-                        item_seq: 1,
-                        lane_id: None,
-                        lane_seq: None,
-                        kind: "tool_call_result".to_string(),
-                        status: "completed".to_string(),
-                        source: "session".to_string(),
-                        title: Some(tool_name.to_string()),
-                        content: None,
-                        task_id: None,
-                        worker_id: None,
-                        role_id: None,
-                        tool_call_id: Some(call_id.to_string()),
-                        tool_name: Some(tool_name.to_string()),
-                        tool_status: Some("completed".to_string()),
-                        tool_arguments: Some(arguments.to_string()),
-                        tool_result: Some(result.to_string()),
-                        tool_error: None,
-                        request_id: None,
-                        user_message_id: None,
-                        placeholder_message_id: None,
-                        timeline_entry_id: None,
-                        thread_visible: true,
-                        worker_visible: false,
-                    }],
-                    worker_lanes: Vec::new(),
+            .create_session_for_workspace(sid.clone(), session_id, Some(workspace_id.to_string()))
+            .expect("session should create");
+        if let Some(mid) = mission_id {
+            state.session_store.bind_execution_ownership(
+                sid.clone(),
+                ExecutionOwnership {
+                    session_id: Some(sid.clone()),
+                    workspace_id: Some(ws.clone()),
+                    mission_id: Some(MissionId::new(mid)),
+                    ..ExecutionOwnership::default()
                 },
-            )
-            .expect("canonical file tool turn should upsert");
+            );
+        }
+        state
+            .snapshot_manager
+            .start_session(session_id.to_string(), root.to_path_buf())
+            .await
+            .expect("snapshot session should start")
     }
 
     #[tokio::test]
     async fn lan_access_uses_current_daemon_port() {
-        let state =
-            build_state_with_workspace_root("/tmp", "workspace-lan-access").with_tunnel_port(39219);
+        let root = unique_temp_dir("magi-changes-route-lan-access");
+        let state = build_state_with_workspace_root(&root, "workspace-lan-access")
+            .with_tunnel_port(39219);
 
         let response = routes()
             .with_state(state)
@@ -872,27 +735,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_diff_returns_empty_for_non_git_workspace() {
-        let unique_suffix = TEST_REPO_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let workspace_root = std::env::temp_dir().join(format!(
-            "magi-changes-non-git-workspace-{}-{}-{}",
-            std::process::id(),
-            UtcMillis::now().0,
-            unique_suffix
-        ));
-        fs::create_dir_all(&workspace_root).expect("workspace root should create");
-        fs::write(workspace_root.join("notes.txt"), "not under git\n")
-            .expect("workspace file should write");
-        let state = build_state_with_workspace_root(
-            workspace_root.to_string_lossy().as_ref(),
-            "workspace-non-git-diff",
-        );
+    async fn get_diff_returns_empty_without_session_scope() {
+        let root = unique_temp_dir("magi-changes-route-no-session-diff");
+        fs::write(root.join("notes.txt"), "hello\n").expect("workspace file should write");
+        let state = build_state_with_workspace_root(&root, "workspace-no-session");
 
         let response = routes()
             .with_state(state)
             .oneshot(
                 Request::builder()
-                    .uri("/changes/diff?workspaceId=workspace-non-git-diff")
+                    .uri("/changes/diff?workspaceId=workspace-no-session")
                     .method("GET")
                     .body(Body::empty())
                     .expect("request should build"),
@@ -911,54 +763,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_all_changes_is_limited_to_current_session_files() {
-        let repo_root = build_test_repo();
-        let state = build_state_with_repo(&repo_root);
+    async fn get_diff_returns_unified_diff_for_session_file() {
+        let state = build_state();
+        let root = unique_temp_dir("magi-changes-route-session-diff");
+        fs::write(root.join("alpha.txt"), "alpha\n").expect("alpha should write");
+        let snap = register_workspace_and_snapshot(
+            &state,
+            "ws-session-diff",
+            "sess-session-diff",
+            &root,
+            Some("mission-diff"),
+        )
+        .await;
+        fs::write(root.join("alpha.txt"), "alpha changed\n").expect("alpha modify");
+        snap.reconcile().expect("reconcile should succeed");
 
         let response = routes()
             .with_state(state)
             .oneshot(
                 Request::builder()
-                    .uri("/changes/approve-all")
-                    .method("POST")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "sessionId": "session-a",
-                            "workspaceId": "workspace-session-scope"
-                        })
-                        .to_string(),
-                    ))
+                    .uri("/changes/diff?sessionId=sess-session-diff&workspaceId=ws-session-diff&filePath=alpha.txt")
+                    .method("GET")
+                    .body(Body::empty())
                     .expect("request should build"),
             )
             .await
             .expect("route should respond");
 
         assert_eq!(response.status(), StatusCode::OK);
-
-        let staged = Command::new("git")
-            .args(["diff", "--cached", "--name-only"])
-            .current_dir(&repo_root)
-            .output()
-            .expect("git diff --cached should run");
-        let staged_paths = String::from_utf8_lossy(&staged.stdout);
-        assert!(staged_paths.contains("a.txt"));
-        assert!(!staged_paths.contains("b.txt"));
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("payload should deserialize");
+        let diff = payload["diff"].as_str().unwrap_or_default();
+        assert!(diff.contains("alpha"), "diff should mention path: {}", diff);
+        assert!(
+            diff.contains("-alpha"),
+            "diff should contain old line marker: {}",
+            diff
+        );
+        assert!(
+            diff.contains("+alpha changed"),
+            "diff should contain new line marker: {}",
+            diff
+        );
     }
 
     #[tokio::test]
-    async fn approve_all_changes_clears_pending_changes_for_current_session() {
-        let repo_root = build_test_repo();
-        let state = build_state_with_repo(&repo_root);
+    async fn approve_all_clears_pending_changes() {
+        let state = build_state();
+        let root = unique_temp_dir("magi-changes-route-approve-all");
+        fs::write(root.join("alpha.txt"), "alpha\n").expect("alpha should write");
+        let snap = register_workspace_and_snapshot(
+            &state,
+            "ws-approve-all",
+            "sess-approve-all",
+            &root,
+            None,
+        )
+        .await;
+        fs::write(root.join("alpha.txt"), "alpha changed\n").expect("alpha modify");
+        snap.reconcile().expect("reconcile should succeed");
 
         let before = collect_session_pending_changes(
             &state,
-            &SessionId::new("session-a"),
-            Some("workspace-session-scope"),
+            &SessionId::new("sess-approve-all"),
+            Some("ws-approve-all"),
         )
         .expect("pending changes should collect before approval");
         assert_eq!(before.len(), 1);
-        assert_eq!(before[0].file_path, "a.txt");
+        assert_eq!(before[0].file_path, "alpha.txt");
 
         let response = routes()
             .with_state(state.clone())
@@ -969,8 +844,8 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "sessionId": "session-a",
-                            "workspaceId": "workspace-session-scope"
+                            "sessionId": "sess-approve-all",
+                            "workspaceId": "ws-approve-all"
                         })
                         .to_string(),
                     ))
@@ -983,8 +858,8 @@ mod tests {
 
         let after = collect_session_pending_changes(
             &state,
-            &SessionId::new("session-a"),
-            Some("workspace-session-scope"),
+            &SessionId::new("sess-approve-all"),
+            Some("ws-approve-all"),
         )
         .expect("pending changes should collect after approval");
         assert!(
@@ -994,42 +869,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revert_all_changes_removes_plain_session_canonical_file_change() {
-        let repo_root = build_test_repo();
-        let session_id = SessionId::new("session-plain-canonical-revert");
-        let workspace_id = WorkspaceId::new("workspace-plain-canonical-revert");
-        let state = build_state_with_plain_session_repo(
-            &repo_root,
-            session_id.clone(),
-            workspace_id.clone(),
-        );
-        fs::create_dir_all(Path::new(&repo_root).join("tmp")).expect("tmp dir should create");
-        fs::write(
-            Path::new(&repo_root).join("tmp/plain-session-new.txt"),
-            "new file\n",
-        )
-        .expect("untracked file should write");
-        upsert_plain_session_file_tool_turn(
+    async fn revert_all_removes_added_file() {
+        let state = build_state();
+        let root = unique_temp_dir("magi-changes-route-revert-all");
+        let snap = register_workspace_and_snapshot(
             &state,
-            &session_id,
-            "file_write",
-            "call-plain-session-write",
-            serde_json::json!({
-                "path": Path::new(&repo_root).join("tmp/plain-session-new.txt").to_string_lossy().to_string(),
-                "content": "new file\n",
-            }),
-            serde_json::json!({
-                "tool": "file_write",
-                "status": "succeeded",
-                "path": Path::new(&repo_root).join("tmp/plain-session-new.txt").to_string_lossy().to_string(),
-            }),
-        );
+            "ws-revert-all",
+            "sess-revert-all",
+            &root,
+            None,
+        )
+        .await;
+        fs::create_dir_all(root.join("tmp")).expect("tmp dir should create");
+        fs::write(root.join("tmp/added.txt"), "new file\n").expect("added file should write");
+        snap.reconcile().expect("reconcile should succeed");
 
-        let before =
-            collect_session_pending_changes(&state, &session_id, Some(workspace_id.as_str()))
-                .expect("plain session canonical file change should collect");
+        let before = collect_session_pending_changes(
+            &state,
+            &SessionId::new("sess-revert-all"),
+            Some("ws-revert-all"),
+        )
+        .expect("pending changes should collect");
         assert_eq!(before.len(), 1);
-        assert_eq!(before[0].file_path, "tmp/plain-session-new.txt");
+        assert_eq!(before[0].file_path, "tmp/added.txt");
+        assert_eq!(before[0].r#type, "add");
 
         let response = routes()
             .with_state(state)
@@ -1040,8 +903,8 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "sessionId": session_id.as_str(),
-                            "workspaceId": workspace_id.as_str()
+                            "sessionId": "sess-revert-all",
+                            "workspaceId": "ws-revert-all"
                         })
                         .to_string(),
                     ))
@@ -1051,17 +914,63 @@ mod tests {
             .expect("route should respond");
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            !Path::new(&repo_root)
-                .join("tmp/plain-session-new.txt")
-                .exists()
-        );
+        assert!(!root.join("tmp/added.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn revert_change_restores_modified_file_to_baseline() {
+        let state = build_state();
+        let root = unique_temp_dir("magi-changes-route-revert-single");
+        fs::write(root.join("alpha.txt"), "original\n").expect("alpha should write");
+        let snap = register_workspace_and_snapshot(
+            &state,
+            "ws-revert-single",
+            "sess-revert-single",
+            &root,
+            None,
+        )
+        .await;
+        fs::write(root.join("alpha.txt"), "modified\n").expect("alpha modify");
+        snap.reconcile().expect("reconcile should succeed");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/changes/revert")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sessionId": "sess-revert-single",
+                            "workspaceId": "ws-revert-single",
+                            "filePath": "alpha.txt"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let restored = fs::read_to_string(root.join("alpha.txt")).expect("alpha should read");
+        assert_eq!(restored, "original\n");
     }
 
     #[tokio::test]
     async fn revert_execution_group_rejects_cross_session_mission() {
-        let repo_root = build_test_repo();
-        let state = build_state_with_repo(&repo_root);
+        let state = build_state();
+        let root = unique_temp_dir("magi-changes-route-revert-group");
+        fs::write(root.join("alpha.txt"), "alpha\n").expect("alpha should write");
+        let _snap = register_workspace_and_snapshot(
+            &state,
+            "ws-revert-group",
+            "sess-revert-group",
+            &root,
+            Some("mission-a"),
+        )
+        .await;
 
         let response = routes()
             .with_state(state)
@@ -1072,8 +981,8 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "sessionId": "session-a",
-                            "workspaceId": "workspace-session-scope",
+                            "sessionId": "sess-revert-group",
+                            "workspaceId": "ws-revert-group",
                             "executionGroupId": "mission-b"
                         })
                         .to_string(),
@@ -1094,139 +1003,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revert_change_removes_untracked_session_file() {
-        let repo_root = build_test_repo();
-        let state = build_state_with_repo(&repo_root);
-        fs::create_dir_all(Path::new(&repo_root).join("tmp")).expect("tmp dir should create");
-        fs::write(
-            Path::new(&repo_root).join("tmp/new-single-a.txt"),
-            "new file\n",
-        )
-        .expect("untracked file should write");
-
-        state
-            .task_store()
-            .expect("task store should exist")
-            .insert_task(magi_core::Task {
-                task_id: TaskId::new("task-a-untracked-single"),
-                mission_id: MissionId::new("mission-a"),
-                root_task_id: TaskId::new("task-a-untracked-single"),
-                parent_task_id: None,
-                kind: TaskKind::Action,
-                title: "A-untracked-single".to_string(),
-                goal: "A-untracked-single".to_string(),
-                status: TaskStatus::Completed,
-                dependency_ids: Vec::new(),
-                required_children: Vec::new(),
-                policy_snapshot: None,
-                executor_binding: None,
-                context_refs: Vec::new(),
-                knowledge_refs: Vec::new(),
-                workspace_scope: None,
-                write_scope: None,
-                input_refs: Vec::new(),
-                output_refs: vec!["file:tmp/new-single-a.txt".to_string()],
-                evidence_refs: Vec::new(),
-                retry_count: 0,
-                repair_count: 0,
-                decision_payload: None,
-                created_at: UtcMillis::now(),
-                updated_at: UtcMillis::now(),
-            });
-
-        let response = routes()
-            .with_state(state)
-            .oneshot(
-                Request::builder()
-                    .uri("/changes/revert")
-                    .method("POST")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "sessionId": "session-a",
-                            "workspaceId": "workspace-session-scope",
-                            "filePath": "tmp/new-single-a.txt"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("route should respond");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(!Path::new(&repo_root).join("tmp/new-single-a.txt").exists());
-    }
-
-    #[tokio::test]
-    async fn revert_all_changes_removes_untracked_session_file() {
-        let repo_root = build_test_repo();
-        let state = build_state_with_repo(&repo_root);
-        fs::create_dir_all(Path::new(&repo_root).join("tmp")).expect("tmp dir should create");
-        fs::write(Path::new(&repo_root).join("tmp/new-a.txt"), "new file\n")
-            .expect("untracked file should write");
-
-        state
-            .task_store()
-            .expect("task store should exist")
-            .insert_task(magi_core::Task {
-                task_id: TaskId::new("task-a-untracked"),
-                mission_id: MissionId::new("mission-a"),
-                root_task_id: TaskId::new("task-a-untracked"),
-                parent_task_id: None,
-                kind: TaskKind::Action,
-                title: "A-untracked".to_string(),
-                goal: "A-untracked".to_string(),
-                status: TaskStatus::Completed,
-                dependency_ids: Vec::new(),
-                required_children: Vec::new(),
-                policy_snapshot: None,
-                executor_binding: None,
-                context_refs: Vec::new(),
-                knowledge_refs: Vec::new(),
-                workspace_scope: None,
-                write_scope: None,
-                input_refs: Vec::new(),
-                output_refs: vec!["file:tmp/new-a.txt".to_string()],
-                evidence_refs: Vec::new(),
-                retry_count: 0,
-                repair_count: 0,
-                decision_payload: None,
-                created_at: UtcMillis::now(),
-                updated_at: UtcMillis::now(),
-            });
-
-        let response = routes()
-            .with_state(state)
-            .oneshot(
-                Request::builder()
-                    .uri("/changes/revert-all")
-                    .method("POST")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "sessionId": "session-a",
-                            "workspaceId": "workspace-session-scope"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("route should respond");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(!Path::new(&repo_root).join("tmp/new-a.txt").exists());
-    }
-
-    #[tokio::test]
     async fn get_file_content_accepts_absolute_path_within_workspace() {
-        let repo_root = build_test_repo();
-        let absolute_path = Path::new(&repo_root)
-            .join("a.txt")
-            .to_string_lossy()
-            .into_owned();
-        let state = build_state_with_workspace_root(&repo_root, "workspace-absolute-content");
+        let root = unique_temp_dir("magi-changes-route-content-inside");
+        fs::write(root.join("alpha.txt"), "alpha changed\n").expect("alpha should write");
+        let absolute_path = root.join("alpha.txt").to_string_lossy().into_owned();
+        let state = build_state_with_workspace_root(&root, "workspace-absolute-content");
 
         let response = routes()
             .with_state(state)
@@ -1243,7 +1024,11 @@ mod tests {
             .await
             .expect("route should respond");
 
-        assert_eq!(response.status(), StatusCode::OK, "absolute path should be accepted");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "absolute path should be accepted"
+        );
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body should read");
@@ -1254,17 +1039,13 @@ mod tests {
 
     #[tokio::test]
     async fn get_file_content_rejects_absolute_path_outside_workspace() {
-        let repo_root = build_test_repo();
-        let outside_dir = std::env::temp_dir().join(format!(
-            "magi-files-content-outside-{}-{}",
-            std::process::id(),
-            UtcMillis::now().0,
-        ));
-        fs::create_dir_all(&outside_dir).expect("outside dir should create");
+        let root = unique_temp_dir("magi-changes-route-content-inside-2");
+        fs::write(root.join("alpha.txt"), "alpha changed\n").expect("alpha should write");
+        let outside_dir = unique_temp_dir("magi-changes-route-content-outside");
         let outside_file = outside_dir.join("secret.txt");
         fs::write(&outside_file, "off-limits\n").expect("outside file should write");
         let outside_path = outside_file.to_string_lossy().into_owned();
-        let state = build_state_with_workspace_root(&repo_root, "workspace-outside-content");
+        let state = build_state_with_workspace_root(&root, "workspace-outside-content");
 
         let response = routes()
             .with_state(state)
