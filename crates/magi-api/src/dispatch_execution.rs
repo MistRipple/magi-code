@@ -688,7 +688,18 @@ fn insert_task_graph(
                 let action_role_candidate = if is_primary_action {
                     target_role.to_string()
                 } else {
-                    infer_dispatch_task_role(Some(action_plan.goal.as_str())).to_string()
+                    // P3 角色解析链：LLM 显式声明的 roleId 优先 > 基于 goal 的启发式推断。
+                    // 合法性由下一步 `compatible_task_role_for_kind` 统一收敛，非法值会
+                    // 退回 TaskKind::Action 的默认 role，避免因 LLM 输出不规范拒收整个 task 图。
+                    action_plan
+                        .role_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|role| !role.is_empty())
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| {
+                            infer_dispatch_task_role(Some(action_plan.goal.as_str())).to_string()
+                        })
                 };
                 let action_role =
                     compatible_task_role_for_kind(TaskKind::Action, Some(&action_role_candidate))
@@ -1397,6 +1408,13 @@ struct TaskWorkPackagePlan {
 struct TaskActionPlan {
     title: String,
     goal: String,
+    /// LLM 在 task 图规划时显式声明的执行角色（P3 结构化契约）。
+    ///
+    /// 为空时回退到 `infer_dispatch_task_role(goal)` 启发式猜测。角色合法性校验由
+    /// `compatible_task_role_for_kind` 统一兜底：不认识的角色会被替换为默认值，不会
+    /// 拒收整个 task 图。这与派发"先保证能跑、再提高命中率"的策略一致。
+    #[serde(default)]
+    role_id: Option<String>,
     #[serde(default)]
     depends_on: Vec<String>,
     #[serde(default)]
@@ -1450,11 +1468,15 @@ fn task_plan_tool() -> ChatToolDefinition {
                                                     "properties": {
                                                         "title": {
                                                             "type": "string",
-                                                            "description": "动作标题，必须短小且可执行。"
+                                                            "description": "动作标题，必须短小且可执行。不要在标题里写 [角色] 前缀；角色请用独立的 roleId 字段承载。"
                                                         },
                                                         "goal": {
                                                             "type": "string",
                                                             "description": "动作目标，必须说明完成标准或产出。"
+                                                        },
+                                                        "roleId": {
+                                                            "type": ["string", "null"],
+                                                            "description": "执行角色 ID，必须从预注册 role 集合中选取：architect / integration-dev / frontend-dev / backend-dev / reviewer / debugger / test-engineer / doc-writer / data-engineer / devops-engineer / security-analyst。不确定时可留空，后端会基于 goal 自动推断。"
                                                         },
                                                         "dependsOn": {
                                                             "type": "array",
@@ -1507,6 +1529,9 @@ fn decompose_mission(
              每个 phase 至少 1 个 workPackage，每个 workPackage 至少 1 个 action。\n\
              action 的 dependsOn 只能引用同一 phase 内已定义的较早 action 标题。\n\
              action goal 必须描述可验证产出或完成标准。\n\
+             每个 action 应在 roleId 字段显式声明执行角色，从以下集合中选取：\
+             architect / integration-dev / frontend-dev / backend-dev / reviewer / debugger / test-engineer / doc-writer / data-engineer / devops-engineer / security-analyst。\
+             不要在 action title 里写 [角色] 或【角色】前缀，角色由结构化字段单独承载。\n\
              原始任务目标是唯一主事实，必须逐字保留其中的路径、工具名、命令、标记字符串和“必须/要求”条款；不得把它改写成历史任务、泛化检查或只读替代目标。\n\
              规划 phase 只输出目标、边界、执行计划和验收标准，不得调用工具，不得执行用户目标里的写入、删除、移动、补丁或其他有副作用操作。\n\
              中间执行 phase 是唯一可以执行用户目标和写操作的阶段；如果目标包含明确工具链路，对应批次的执行 action goal 必须按原始顺序列出这些工具和验收标记。\n\

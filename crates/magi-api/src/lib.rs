@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod builtin_tool_schema;
 mod change_projection;
 mod dto;

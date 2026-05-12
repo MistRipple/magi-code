@@ -1,45 +1,16 @@
+//! 派发负载残留清洗工具。
+//!
+//! P3 之前此模块同时承载两套契约：LLM JSON 派发决策器（`decide_assignment_dispatch`/
+//! `AssignmentDispatchPayload` 等）与文本清洗器（`strip_dispatch_text` 等）。派发决策
+//! 链路实际从未被上游接入（只有单测），Magi 运行期走的是 `task_plan_tool` 结构化
+//! 契约。保留死代码会继续误导文档和 LLM 输出，因此 P3 将其彻底移除，只保留仍在被
+//! `magi-api::prompt_utils` 消费的文本清洗器：当旧模型偶发在可见内容里漏出 JSON
+//! 片段时，这些函数负责把它们从用户视图中抹掉。
+//!
+//! 若未来需要重新引入"LLM 自主派发"协议，应作为 P6 的 thread 原语下沉实现，而不是
+//! 在此文件里复活。
 use regex::Regex;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::sync::LazyLock;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AssignmentTask {
-    pub task_name: String,
-    pub ownership_hint: String,
-    pub mode_hint: String,
-    pub goal: String,
-    pub acceptance: Vec<String>,
-    pub constraints: Vec<String>,
-    pub context: Vec<String>,
-    pub requires_modification: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AssignmentDispatchPayload {
-    pub mission_title: Option<String>,
-    pub tasks: Vec<AssignmentTask>,
-}
-
-#[derive(Clone, Debug)]
-pub struct AssignmentDispatchRequest {
-    pub id: String,
-    pub payload: AssignmentDispatchPayload,
-    pub raw_json: String,
-}
-
-#[derive(Clone, Debug)]
-pub enum AssignmentDispatchDecision {
-    None,
-    Dispatch {
-        request: AssignmentDispatchRequest,
-        stripped_text: String,
-    },
-    BlockedTerminalHandoff {
-        request: AssignmentDispatchRequest,
-        stripped_text: String,
-    },
-}
 
 static DISPATCH_NARRATIVE_BOUNDARY: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
@@ -62,152 +33,6 @@ static DISPATCH_NARRATIVE_BOUNDARY: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 static DISPATCH_JSON_FRAGMENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#""tasks"\s*:|"mission_title"\s*:|"task_name"\s*:|"ownership_hint"\s*:"#).unwrap()
 });
-
-static FENCED_JSON: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)```json\s*([\s\S]*?)```").unwrap());
-
-/// 任务名前缀剥除：匹配形如 "[Backend] 添加..."、"【架构师】..." 这类角色标签。
-///
-/// LLM 在生成 `task_name` 时习惯性地在开头带 `[Role]` / `【角色】` 前缀，但下游 UI 已经
-/// 在 `ownership_hint` 字段单独呈现角色归属，前缀会造成信息重复。此处单点剥除，保证
-/// 所有消费方（前端渲染、持久化、回放、导出）看到的 `task_name` 均为纯净任务描述。
-static TASK_NAME_ROLE_PREFIX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*[\[\u{3010}][^\]\u{3011}]*[\]\u{3011}]\s*").unwrap());
-
-fn sanitize_task_name(raw: &str) -> String {
-    let mut cleaned = raw.to_string();
-    loop {
-        let next = TASK_NAME_ROLE_PREFIX.replace(&cleaned, "").into_owned();
-        if next == cleaned {
-            break;
-        }
-        cleaned = next;
-    }
-    cleaned.trim().to_string()
-}
-
-pub fn decide_assignment_dispatch(
-    text: &str,
-    request_id: Option<&str>,
-    round: u32,
-    terminal_handoff_active: bool,
-) -> AssignmentDispatchDecision {
-    let request = match extract_assignment_dispatch(text, request_id, round) {
-        Some(r) => r,
-        None => return AssignmentDispatchDecision::None,
-    };
-
-    let stripped = strip_dispatch_text(text);
-
-    if terminal_handoff_active {
-        return AssignmentDispatchDecision::BlockedTerminalHandoff {
-            request,
-            stripped_text: stripped,
-        };
-    }
-
-    AssignmentDispatchDecision::Dispatch {
-        request,
-        stripped_text: stripped,
-    }
-}
-
-fn extract_assignment_dispatch(
-    text: &str,
-    request_id: Option<&str>,
-    round: u32,
-) -> Option<AssignmentDispatchRequest> {
-    let json_candidate = extract_json_candidate(text)?;
-    let parsed: Value = serde_json::from_str(&json_candidate).ok()?;
-
-    if !is_valid_dispatch_payload(&parsed) {
-        return None;
-    }
-
-    let mut payload: AssignmentDispatchPayload = serde_json::from_value(parsed).ok()?;
-    for task in payload.tasks.iter_mut() {
-        let cleaned = sanitize_task_name(&task.task_name);
-        if !cleaned.is_empty() {
-            task.task_name = cleaned;
-        }
-    }
-
-    let req_part = request_id
-        .map(|s| s.replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "_"))
-        .unwrap_or_else(|| "request".to_string());
-
-    let id = format!(
-        "structured_assignment_dispatch_{}_round_{}",
-        req_part, round
-    );
-
-    Some(AssignmentDispatchRequest {
-        id,
-        payload,
-        raw_json: json_candidate,
-    })
-}
-
-fn extract_json_candidate(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    if let Some(caps) = FENCED_JSON.captures(trimmed) {
-        let inner = caps.get(1)?.as_str().trim();
-        if !inner.is_empty() {
-            return Some(inner.to_string());
-        }
-    }
-
-    if trimmed.starts_with('{') && trimmed.ends_with('}') {
-        if serde_json::from_str::<Value>(trimmed).is_ok() {
-            return Some(trimmed.to_string());
-        }
-    }
-
-    let json_offset = find_line_started_json_offset(text);
-    if json_offset >= 0 {
-        let candidate = text[json_offset as usize..].trim();
-        if candidate.starts_with('{') && candidate.ends_with('}') {
-            if serde_json::from_str::<Value>(candidate).is_ok() {
-                return Some(candidate.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-fn is_valid_dispatch_payload(value: &Value) -> bool {
-    let obj = match value.as_object() {
-        Some(o) => o,
-        None => return false,
-    };
-
-    let tasks = match obj.get("tasks").and_then(|t| t.as_array()) {
-        Some(t) if !t.is_empty() => t,
-        _ => return false,
-    };
-
-    tasks.iter().all(|task| {
-        let t = match task.as_object() {
-            Some(o) => o,
-            None => return false,
-        };
-        t.get("task_name").and_then(|v| v.as_str()).is_some()
-            && t.get("ownership_hint").and_then(|v| v.as_str()).is_some()
-            && t.get("mode_hint").and_then(|v| v.as_str()).is_some()
-            && t.get("goal").and_then(|v| v.as_str()).is_some()
-            && t.get("acceptance").and_then(|v| v.as_array()).is_some()
-            && t.get("constraints").and_then(|v| v.as_array()).is_some()
-            && t.get("context").and_then(|v| v.as_array()).is_some()
-            && t.get("requires_modification")
-                .and_then(|v| v.as_bool())
-                .is_some()
-    })
-}
 
 fn find_line_started_json_offset(text: &str) -> i64 {
     let mut offset: usize = 0;
@@ -351,190 +176,40 @@ pub fn strip_dispatch_preview_text(text: &str) -> String {
 mod tests {
     use super::*;
 
-    fn sample_dispatch_json() -> String {
-        r#"{
-            "mission_title": "实现用户认证",
-            "tasks": [{
-                "task_name": "实现 JWT 验证",
-                "ownership_hint": "backend",
-                "mode_hint": "implement",
-                "goal": "实现 JWT token 验证中间件",
-                "acceptance": ["通过单元测试", "验证 token 过期"],
-                "constraints": ["使用 jsonwebtoken crate"],
-                "context": ["现有 auth 模块在 crates/auth/"],
-                "requires_modification": true
-            }]
-        }"#
-        .to_string()
-    }
+    const SAMPLE_PAYLOAD: &str = r#"{
+        "mission_title": "实现用户认证",
+        "tasks": [{
+            "task_name": "实现 JWT 验证",
+            "ownership_hint": "backend"
+        }]
+    }"#;
 
     #[test]
-    fn extract_dispatch_from_fenced_json() {
+    fn strip_removes_narrative_boundary_before_payload() {
         let text = format!(
-            "我将安排以下任务：\n```json\n{}\n```",
-            sample_dispatch_json()
+            "分析完成。\n我将安排以下任务：\n```json\n{}\n```",
+            SAMPLE_PAYLOAD
         );
-        let result = decide_assignment_dispatch(&text, Some("req-1"), 1, false);
-        match result {
-            AssignmentDispatchDecision::Dispatch {
-                request,
-                stripped_text,
-            } => {
-                assert_eq!(request.payload.tasks.len(), 1);
-                assert_eq!(request.payload.tasks[0].task_name, "实现 JWT 验证");
-                assert!(!stripped_text.contains("```json"));
-            }
-            _ => panic!("expected Dispatch"),
-        }
-    }
-
-    #[test]
-    fn extract_dispatch_from_raw_json() {
-        let json = sample_dispatch_json();
-        let result = decide_assignment_dispatch(&json, None, 2, false);
-        match result {
-            AssignmentDispatchDecision::Dispatch { request, .. } => {
-                assert!(request.id.contains("round_2"));
-                assert_eq!(
-                    request.payload.mission_title.as_deref(),
-                    Some("实现用户认证")
-                );
-            }
-            _ => panic!("expected Dispatch"),
-        }
-    }
-
-    #[test]
-    fn returns_none_for_non_dispatch_text() {
-        let text = "这是普通的回复文本，没有任何 JSON。";
-        let result = decide_assignment_dispatch(text, None, 1, false);
-        assert!(matches!(result, AssignmentDispatchDecision::None));
-    }
-
-    #[test]
-    fn blocks_during_terminal_handoff() {
-        let json = sample_dispatch_json();
-        let result = decide_assignment_dispatch(&json, None, 1, true);
-        assert!(matches!(
-            result,
-            AssignmentDispatchDecision::BlockedTerminalHandoff { .. }
-        ));
-    }
-
-    #[test]
-    fn rejects_invalid_payload_missing_required_fields() {
-        let text = r#"{"tasks": [{"task_name": "test"}]}"#;
-        let result = decide_assignment_dispatch(text, None, 1, false);
-        assert!(matches!(result, AssignmentDispatchDecision::None));
-    }
-
-    #[test]
-    fn rejects_empty_tasks() {
-        let text = r#"{"tasks": []}"#;
-        let result = decide_assignment_dispatch(text, None, 1, false);
-        assert!(matches!(result, AssignmentDispatchDecision::None));
-    }
-
-    #[test]
-    fn strip_removes_narrative_boundary() {
-        let json = sample_dispatch_json();
-        let text = format!("分析完成。\n我将安排以下任务：\n```json\n{}\n```", json);
         let stripped = strip_dispatch_text(&text);
         assert_eq!(stripped, "分析完成。");
     }
 
     #[test]
-    fn strip_preserves_text_without_dispatch() {
+    fn strip_preserves_text_without_payload() {
         let text = "这是普通回复，没有 dispatch 内容。";
-        let stripped = strip_dispatch_text(text);
-        assert_eq!(stripped, text);
+        assert_eq!(strip_dispatch_text(text), text);
     }
 
     #[test]
-    fn extract_handles_json_with_prefix_text() {
-        let json = sample_dispatch_json();
-        let text = format!("经过分析，我决定派发以下任务：\n{}", json);
-        let result = decide_assignment_dispatch(&text, Some("test-req"), 3, false);
-        match result {
-            AssignmentDispatchDecision::Dispatch { request, .. } => {
-                assert_eq!(request.payload.tasks.len(), 1);
-            }
-            _ => panic!("expected Dispatch"),
-        }
+    fn preview_removes_partial_payload_when_fence_opened() {
+        let text = format!("正在规划任务...\n```json\n{}", SAMPLE_PAYLOAD);
+        let stripped = strip_dispatch_preview_text(&text);
+        assert_eq!(stripped, "正在规划任务...");
     }
 
     #[test]
-    fn sanitize_task_name_strips_bracketed_role_prefix() {
-        assert_eq!(sanitize_task_name("[Backend] 添加健康检查接口"), "添加健康检查接口");
-        assert_eq!(sanitize_task_name("【架构师】 编写分析文档"), "编写分析文档");
-        assert_eq!(sanitize_task_name("[架构师]编写分析文档"), "编写分析文档");
-    }
-
-    #[test]
-    fn sanitize_task_name_strips_nested_role_prefix() {
-        assert_eq!(
-            sanitize_task_name("[Architect][Reviewer] 审查架构"),
-            "审查架构",
-        );
-        assert_eq!(
-            sanitize_task_name("【角色】[Backend] 写接口"),
-            "写接口",
-        );
-    }
-
-    #[test]
-    fn sanitize_task_name_keeps_bracketed_body_text() {
-        assert_eq!(
-            sanitize_task_name("修复 [issue #123] 的回归问题"),
-            "修复 [issue #123] 的回归问题",
-            "只剥离开头，正文内的方括号必须保留",
-        );
-    }
-
-    #[test]
-    fn sanitize_task_name_handles_whitespace_and_empty() {
-        assert_eq!(sanitize_task_name("   [Frontend]   创建组件  "), "创建组件");
-        assert_eq!(sanitize_task_name(""), "");
-        assert_eq!(sanitize_task_name("  "), "");
-    }
-
-    #[test]
-    fn decide_dispatch_cleans_task_name_role_prefix_at_boundary() {
-        let json = r#"
-        {
-          "mission_title": "实现验证",
-          "tasks": [
-            {
-              "task_name": "[Backend] 添加健康检查汇总接口",
-              "ownership_hint": "backend",
-              "mode_hint": "normal",
-              "goal": "实现接口",
-              "acceptance": ["接口可用"],
-              "constraints": [],
-              "context": [],
-              "requires_modification": true
-            },
-            {
-              "task_name": "【Architect】 编写标签模块架构分析文档",
-              "ownership_hint": "architect",
-              "mode_hint": "normal",
-              "goal": "完成分析",
-              "acceptance": ["文档交付"],
-              "constraints": [],
-              "context": [],
-              "requires_modification": false
-            }
-          ]
-        }
-        "#;
-        let result = decide_assignment_dispatch(json, Some("req-sanitize"), 1, false);
-        match result {
-            AssignmentDispatchDecision::Dispatch { request, .. } => {
-                assert_eq!(request.payload.tasks.len(), 2);
-                assert_eq!(request.payload.tasks[0].task_name, "添加健康检查汇总接口");
-                assert_eq!(request.payload.tasks[1].task_name, "编写标签模块架构分析文档");
-            }
-            other => panic!("expected Dispatch, got {:?}", other),
-        }
+    fn preview_is_noop_for_short_text() {
+        let text = "生成回复中…";
+        assert_eq!(strip_dispatch_preview_text(text), text);
     }
 }
