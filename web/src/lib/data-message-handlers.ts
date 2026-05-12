@@ -465,10 +465,6 @@ export function handleUnifiedData(standard: StandardMessage) {
       handleClarificationRequest(asMessage(payload));
       break;
 
-    case 'workerQuestionRequest':
-      handleWorkerQuestionRequest(asMessage(payload));
-      break;
-
     // missionPlanned / assignmentPlanned / assignmentStarted / assignmentCompleted
     // handlers removed — old Mission/Assignment model superseded by Task Graph.
 
@@ -983,9 +979,6 @@ function handleClarificationRequest(_message: ClientBridgeMessage) {
   addToast('info', i18n.t('messageHandler.autoSkipClarification'));
 }
 
-function handleWorkerQuestionRequest(_message: ClientBridgeMessage) {
-  addToast('info', i18n.t('messageHandler.autoAnswerWorkerQuestion'));
-}
 
 
 
@@ -1092,4 +1085,4 @@ function handleConnectionTestResult(message: ClientBridgeMessage) {
 }
 
 // Named exports
-export { handleStateUpdate, handleSessionsUpdated, handleEmptyWorkspaceStateLoaded, handleSessionBootstrapLoaded, handleOrchestratorRuntimeState, handleClarificationRequest, handleWorkerQuestionRequest, handleWorkerStatusUpdate, handleConnectionTestResult };
+export { handleStateUpdate, handleSessionsUpdated, handleEmptyWorkspaceStateLoaded, handleSessionBootstrapLoaded, handleOrchestratorRuntimeState, handleClarificationRequest, handleWorkerStatusUpdate, handleConnectionTestResult };

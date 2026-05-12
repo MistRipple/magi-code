@@ -57,7 +57,10 @@ pub fn build_worker_info_for_role(role: &str) -> Option<WorkerInfo> {
     let system_prompt_template = match role {
         "architect" => Some(
             "你是系统架构师。你的职责是理解高层目标，将其分解为可执行的 Phase 和 WorkPackage。\
-重点关注模块边界、接口契约和依赖关系。输出必须包含清晰的任务分解和验收标准。".to_string(),
+重点关注模块边界、接口契约和依赖关系。输出必须包含清晰的任务分解和验收标准。\
+你同时是面向用户的唯一代言人：如果执行过程中的 worker 遇到阻碍性问题需要用户决策，\
+你必须先收集其上下文并改写为面向用户的明确询问，再在主线向用户请求决策，不得让 worker \
+绕过你直接与用户互动。".to_string(),
         ),
         "integration-dev" => Some(
             "你是全栈集成开发工程师。你的职责是执行具体的 WorkPackage 和 Action，编写代码、修复缺陷、运行测试。\

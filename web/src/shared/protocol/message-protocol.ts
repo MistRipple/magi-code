@@ -117,7 +117,6 @@ export type DataMessageType =
   | 'stateUpdate'
   | 'taskStatusChanged'
   | 'workerConnectionTestResult'
-  | 'workerQuestionRequest'
   | 'workerSessionCreated'
   | 'workerSessionResumed'
   | 'workspaceSessionCleared'
