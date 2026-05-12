@@ -38,32 +38,18 @@ function resolveSubTaskCardMetadata(
 /**
  * 解析时间线消息归属的 worker Tab 聚合键。
  *
- * 单一真源：`metadata.workerTabId`（由 canonical projection 写入）。
- * 历史字段（worker / assignedWorker / agent / subTaskCard.worker）仅作为未迁移数据的兜底，
- * 不再参与新数据的身份决策。
+ * P1 身份契约：单一真源 `metadata.workerTabId`（由 canonical projection 写入，本质为 roleId）。
+ * 旧 legacy 字段（worker / assignedWorker / agent / subTaskCard.worker / source）不再参与解析——
+ * 这些字段在 role-first 架构里语义模糊（有时是实例 id、有时是 role id、有时是显示名），
+ * 继续兜底会让前端身份判断不可预测。没有 workerTabId 的消息视为"非 worker 消息"。
+ *
+ * `options.fallbacks` 形参仅为兼容保留，调用方传入值将被忽略；下个阶段清理。
  */
 export function resolveTimelineWorkerId(
   metadata: Record<string, unknown> | undefined,
-  options: { fallbacks?: unknown[] } = {},
+  _options: { fallbacks?: unknown[] } = {},
 ): string {
-  const canonicalTabId = normalizeWorkerSlot(metadata?.workerTabId);
-  if (canonicalTabId) {
-    return canonicalTabId;
-  }
-  const legacyCandidates: unknown[] = [
-    metadata?.worker,
-    metadata?.assignedWorker,
-    metadata?.agent,
-    resolveSubTaskCardMetadata(metadata)?.worker,
-    ...(Array.isArray(options.fallbacks) ? options.fallbacks : []),
-  ];
-  for (const candidate of legacyCandidates) {
-    const worker = normalizeWorkerSlot(candidate);
-    if (worker) {
-      return worker;
-    }
-  }
-  return '';
+  return normalizeWorkerSlot(metadata?.workerTabId);
 }
 
 /**

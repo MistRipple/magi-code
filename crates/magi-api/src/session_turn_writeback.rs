@@ -216,15 +216,13 @@ fn to_canonical_worker_ref(item: &ActiveExecutionTurnItem) -> Option<CanonicalWo
 }
 
 fn canonical_worker_tab_ids(item: &ActiveExecutionTurnItem) -> Vec<String> {
+    // Tab 聚合键只看角色：一个角色 = 一个 worker tab。worker 实例信息仍然通过
+    // `CanonicalWorkerRef.workerId` 暴露，不应泄漏到 tab 维度。
     item.role_id
         .as_ref()
-        .filter(|role_id| !role_id.trim().is_empty())
+        .map(|role_id| role_id.trim())
+        .filter(|role_id| !role_id.is_empty())
         .map(|role_id| vec![role_id.to_string()])
-        .or_else(|| {
-            item.worker_id
-                .as_ref()
-                .map(|worker_id| vec![worker_id.to_string()])
-        })
         .unwrap_or_default()
 }
 

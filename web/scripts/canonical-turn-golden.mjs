@@ -63,6 +63,7 @@ function runGoldenReplay(reducer, projection, timelineRenderItems, contract) {
   assertFailedToolWithoutAssistantShowsTurnResponseDuration(reducer, projection);
   assertThreadVisibleRoleMetadataDoesNotBecomeWorkerBadge(reducer, projection);
   assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, timelineRenderItems);
+  assertSameRoleMultipleWorkerInstancesShareTab(reducer, projection);
   assertBootstrapProcessingStateFromRunningCanonicalTurn(contract);
   assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract);
   assertBootstrapCarriesPendingChanges(contract);
@@ -145,6 +146,19 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, time
     workerVisible: true,
     workerTabIds: ['integration-dev'],
   };
+  // P2：后端写入 thread-visible 的 worker_status 摘要 item，作为 dispatch 卡 liveActivity / summary 数据源。
+  const workerLaneSummary = item(c, 10, 'worker-lane-summary-a', 'worker_status', 'completed', {
+    laneId: 'lane-a',
+    title: '执行进展',
+    content: 'shell_exec 完成',
+    worker: { taskId: 'task-a', workerId: 'worker-a', roleId: 'integration-dev', title: '执行进展' },
+    visibility: {
+      renderable: true,
+      threadVisible: true,
+      workerVisible: true,
+      workerTabIds: ['integration-dev'],
+    },
+  });
   const orchestratorFinal = assistantText(c, 9, 'orchestrator-final', '我这轮已经处理完：交付验收通过。\n\n详细步骤和工具记录已保留在任务卡里。', 'completed');
   orchestratorFinal.worker = { taskId: 'task-root', title: '任务完成' };
   orchestratorFinal.visibility = {
@@ -153,7 +167,7 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, time
     workerVisible: false,
   };
   const state = reducer.replaceCanonicalTurns(c.sessionId, [
-    turn(c, 'completed', [userItem, orchestratorPhase, dispatchA, dispatchB, workerTool, failedWorkerTool, workerAssistant, orchestratorDispatchSummary, orchestratorFinal], { completedAt: 9500, responseDurationMs: 100 }),
+    turn(c, 'completed', [userItem, orchestratorPhase, dispatchA, dispatchB, workerTool, failedWorkerTool, workerAssistant, orchestratorDispatchSummary, orchestratorFinal, workerLaneSummary], { completedAt: 9500, responseDurationMs: 100 }),
   ]);
   const projectionValue = projection.buildCanonicalTimelineProjection(state);
   assert.ok(projectionValue, 'worker dispatch projection should exist');
@@ -213,10 +227,10 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, time
   assert.deepEqual(
     dispatchBlock.lanes?.map((lane) => ({ title: lane.title, summary: lane.summary, toolUseCount: lane.toolUseCount })),
     [
-      { title: '实现验证', summary: workerAssistant.content, toolUseCount: 2 },
+      { title: '实现验证', summary: workerLaneSummary.content, toolUseCount: 2 },
       { title: '代码评审', summary: undefined, toolUseCount: undefined },
     ],
-    'main worker card should expose a compact stage summary without creating worker detail cards in the main lane',
+    'P2: dispatch card summary must come from backend worker_status item, not from worker assistant final',
   );
   assert.equal(
     projectionValue.workerRenderEntries['integration-dev']?.length,
@@ -256,6 +270,87 @@ function assertWorkerDispatchItemsCreateMainWorkerCard(reducer, projection, time
       .map((item) => item.message.metadata?.laneTitle),
     ['实现验证', '实现验证', '实现验证'],
     'worker sidechain tool/reply artifacts should carry canonical lane titles for stable grouping',
+  );
+
+  // P4：锁定 bootstrap / session 切换后的可恢复契约。
+  // 把 live 态 projection 的 turns 作为 snapshot，再次 replaceCanonicalTurns
+  // （= 重启或切会话后的恢复路径），workerRenderEntries 必须按 roleId 完整回流，
+  // drawer 任何时候打开看到的事件流都一致。
+  const liveTurnSnapshot = state.turns;
+  const durableReload = reducer.replaceCanonicalTurns(c.sessionId, liveTurnSnapshot);
+  const durableProjection = projection.buildCanonicalTimelineProjection(durableReload);
+  assert.ok(durableProjection, 'durable reload projection should exist');
+  const durableArtifactIds = (durableProjection.workerRenderEntries['integration-dev'] || [])
+    .map((entry) => entry.artifactId);
+  const liveArtifactIds = (projectionValue.workerRenderEntries['integration-dev'] || [])
+    .map((entry) => entry.artifactId);
+  assert.deepEqual(
+    durableArtifactIds,
+    liveArtifactIds,
+    'P4: worker sidechain render entries must survive snapshot-based reload without loss or reorder',
+  );
+}
+
+// L1 多实例并发验证：同一 role 派出两条 lane（分别绑定不同 workerInstanceId），
+// 两边的 worker-visible 事件必须合并到同一个 workerRenderEntries[roleId] 下。
+// 这是"role 是 tab 聚合键、workerId 是实例"契约在多实例并发场景的自然延伸。
+function assertSameRoleMultipleWorkerInstancesShareTab(reducer, projection) {
+  const c = baseCase('same-role-multi-instance', 'session-golden-multi-instance', 'turn-golden-multi-instance', 9600);
+  const userItem = user(c, 1, '请让两个后端 worker 并行处理。');
+  const dispatchA = workerDispatch(c, 2, 'dispatch-a', 'lane-a', 'backend-dev', '后端任务 A', 'completed');
+  const dispatchB = workerDispatch(c, 3, 'dispatch-b', 'lane-b', 'backend-dev', '后端任务 B', 'completed');
+  const toolA = tool(c, 4, 'tool-a', 'call-a', 'printf A', 'completed', { stdout: 'A' });
+  toolA.laneId = 'lane-a';
+  toolA.worker = { taskId: 'task-a', workerId: 'worker-backend-1', roleId: 'backend-dev', title: 'shell_exec' };
+  toolA.visibility = { renderable: true, threadVisible: false, workerVisible: true, workerTabIds: ['backend-dev'] };
+  const toolB = tool(c, 5, 'tool-b', 'call-b', 'printf B', 'completed', { stdout: 'B' });
+  toolB.laneId = 'lane-b';
+  toolB.worker = { taskId: 'task-b', workerId: 'worker-backend-2', roleId: 'backend-dev', title: 'shell_exec' };
+  toolB.visibility = { renderable: true, threadVisible: false, workerVisible: true, workerTabIds: ['backend-dev'] };
+  const finalA = assistantText(c, 6, 'final-a', '任务 A 已完成', 'completed');
+  finalA.laneId = 'lane-a';
+  finalA.worker = { taskId: 'task-a', workerId: 'worker-backend-1', roleId: 'backend-dev', title: '最终回复' };
+  finalA.visibility = { renderable: true, threadVisible: false, workerVisible: true, workerTabIds: ['backend-dev'] };
+  const finalB = assistantText(c, 7, 'final-b', '任务 B 已完成', 'completed');
+  finalB.laneId = 'lane-b';
+  finalB.worker = { taskId: 'task-b', workerId: 'worker-backend-2', roleId: 'backend-dev', title: '最终回复' };
+  finalB.visibility = { renderable: true, threadVisible: false, workerVisible: true, workerTabIds: ['backend-dev'] };
+
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'completed', [userItem, dispatchA, dispatchB, toolA, toolB, finalA, finalB], { completedAt: 9700, responseDurationMs: 100 }),
+  ]);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  assert.ok(projectionValue, 'multi-instance projection should exist');
+
+  // tab 键只应该是 backend-dev 一个（不应按 workerInstanceId 拆成两个 tab）
+  const workerTabKeys = Object.keys(projectionValue.workerRenderEntries);
+  assert.deepEqual(
+    workerTabKeys.sort(),
+    ['backend-dev'],
+    'L1: 同一 role 的多个 worker 实例必须合并到同一个 role tab，不得按 workerId 裂成多个 tab',
+  );
+
+  // 两个实例的 6 条 worker-visible item（2 dispatch + 2 tool + 2 final）都应该在同一个 tab 下
+  const tabEntries = projectionValue.workerRenderEntries['backend-dev'] || [];
+  assert.equal(
+    tabEntries.length,
+    6,
+    'L1: role tab 下必须汇聚两个 worker 实例的全部 sidechain artifacts',
+  );
+
+  // 同时 workerInstanceId 必须在 artifact metadata 里可区分（tool/final artifacts
+  // 明确绑定到 worker-backend-1 / worker-backend-2）。dispatch 锚点沿用 fixture
+  // helper 的占位 workerId，不做强断言，只保证真实实例 id 一定存在。
+  const artifactsById = new Map(projectionValue.artifacts.map((artifact) => [artifact.artifactId, artifact]));
+  const workerIdSet = new Set();
+  for (const entry of tabEntries) {
+    const artifact = artifactsById.get(entry.artifactId);
+    const workerId = artifact?.message?.metadata?.workerId;
+    if (workerId) workerIdSet.add(workerId);
+  }
+  assert.ok(
+    workerIdSet.has('worker-backend-1') && workerIdSet.has('worker-backend-2'),
+    `L1: 聚合到同一 role tab 的 artifacts 必须各自保留 workerInstanceId，让 drawer 能区分具体实例 (got ${Array.from(workerIdSet).join(', ')})`,
   );
 }
 

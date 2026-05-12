@@ -153,12 +153,23 @@ fn apply_task_final_visibility(
     visibility: &TaskTurnVisibility,
 ) {
     apply_task_turn_visibility(item, task, visibility);
-    let root_is_completed = task_store
-        .get_task(&task.root_task_id)
-        .is_some_and(|root| root.status == TaskStatus::Completed);
-    if visibility.primary_worker_sidechain && !root_is_completed {
-        apply_task_worker_detail_visibility(item, task, visibility);
+    // P2：primary worker sidechain 的 final 永远只归 worker drawer，主线消费的是
+    // `worker_status` 摘要 item（由 publish_worker_lane_summary 写入）。这保证
+    // drawer 任何时刻打开都有完整 transcript，主线也不会被 final 原文污染。
+    if visibility.primary_worker_sidechain {
+        item.thread_visible = false;
+        item.worker_visible = true;
+        item.worker_id = visibility.worker_id.clone();
+        item.lane_id = visibility.lane_id.clone();
+        item.lane_seq = visibility.lane_seq;
+        if let Some(role_id) = visibility.role_id.as_ref() {
+            item.role_id = Some(role_id.clone());
+            item.source = role_id.clone();
+        } else if let Some(worker_id) = visibility.worker_id.as_ref() {
+            item.source = worker_id.to_string();
+        }
     }
+    let _ = task_store;
 }
 
 pub(crate) fn run_task_llm_loop(
@@ -468,6 +479,17 @@ pub(crate) fn run_task_llm_loop(
                     &turn_visibility,
                     tool_call,
                 );
+                publish_worker_lane_summary(
+                    event_bus,
+                    session_store,
+                    task_store,
+                    task,
+                    session_id,
+                    workspace_id,
+                    &turn_visibility,
+                    "running",
+                    &format!("正在调用 {}", tool_call.function.name),
+                );
             }
         }
 
@@ -496,6 +518,28 @@ pub(crate) fn run_task_llm_loop(
                     tool_call,
                     &result,
                     tool_status,
+                );
+                let outcome_label = match tool_status {
+                    ExecutionResultStatus::Succeeded => "完成",
+                    ExecutionResultStatus::Failed => "失败",
+                    ExecutionResultStatus::Rejected => "已拒绝",
+                    ExecutionResultStatus::NeedsApproval => "待审批",
+                    ExecutionResultStatus::Cancelled => "已取消",
+                };
+                publish_worker_lane_summary(
+                    event_bus,
+                    session_store,
+                    task_store,
+                    task,
+                    session_id,
+                    workspace_id,
+                    &turn_visibility,
+                    if matches!(tool_status, ExecutionResultStatus::Succeeded) {
+                        "running"
+                    } else {
+                        "blocked"
+                    },
+                    &format!("{} {}", tool_call.function.name, outcome_label),
                 );
             }
             if !matches!(tool_status, ExecutionResultStatus::Succeeded) {
@@ -639,6 +683,17 @@ pub(crate) fn run_task_llm_loop(
             last_stream_item_id.as_deref().or(streaming_entry_id),
             streaming_entry_id,
             &turn_visibility,
+        );
+        publish_worker_lane_summary(
+            event_bus,
+            session_store,
+            task_store,
+            task,
+            session_id,
+            workspace_id,
+            &turn_visibility,
+            "completed",
+            &summarize_final_for_lane(&final_content),
         );
     }
 
@@ -1137,7 +1192,9 @@ fn publish_stream_delta(
         Some(visible_text),
         Some(item_id.to_string()),
     );
-    apply_task_turn_visibility(&mut item, task, turn_visibility);
+    // P2：子任务流式文本归 worker sidechain，主线靠 worker_lane_summary 呈现进度，
+    // 不再让同一条流式内容同时污染主线与 drawer。
+    apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
     if let Some(published) =
         upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
     {
@@ -1179,6 +1236,79 @@ fn publish_task_thinking_delta(
         "running",
         accumulated_thinking,
     );
+}
+
+/// 把 worker 最终回复压缩为 dispatch 卡可展示的单行摘要，保持主线信息密度。
+fn summarize_final_for_lane(final_content: &str) -> String {
+    const MAX_LEN: usize = 120;
+    let flat = final_content
+        .split('\n')
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string();
+    if flat.chars().count() <= MAX_LEN {
+        return flat;
+    }
+    let mut truncated: String = flat.chars().take(MAX_LEN - 1).collect();
+    truncated.push('…');
+    truncated
+}
+
+
+/// 发送一条 thread-visible 的 `worker_status` 摘要 item，作为主线 dispatch 卡的
+/// liveActivity 数据源。前端 projection 已将 `worker_status` 从消息渲染列表过滤
+/// （[turn-projection.ts:241](web/src/stores/turn-projection.ts:241)），它只参与
+/// lane 聚合，不会二次污染主线消息流。
+///
+/// 只有当当前任务属于 worker sidechain（`primary_worker_sidechain` + 带 lane）
+/// 时才写入；其余情形（主线 primary、无 lane）没有 dispatch 卡可消费，跳过。
+fn publish_worker_lane_summary(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    task_store: &TaskStore,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    turn_visibility: &TaskTurnVisibility,
+    status: &str,
+    summary: &str,
+) {
+    if !turn_visibility.primary_worker_sidechain {
+        return;
+    }
+    let Some(lane_id) = turn_visibility.lane_id.as_ref() else {
+        return;
+    };
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut item = session_turn_item(
+        "worker_status",
+        status,
+        Some("执行进展".to_string()),
+        Some(trimmed.to_string()),
+        Some(format!("turn-item-worker-lane-summary-{lane_id}")),
+    );
+    // 摘要本身归主线消费，但同时挂 worker_visible 让 drawer 也保留一份时间锚，
+    // 便于未来 P4 按 roleId 索引执行过程。
+    apply_task_turn_visibility(&mut item, task, turn_visibility);
+    item.thread_visible = true;
+    item.worker_visible = true;
+    item.lane_id = Some(lane_id.to_string());
+    item.lane_seq = turn_visibility.lane_seq;
+    if let Some(worker_id) = turn_visibility.worker_id.as_ref() {
+        item.worker_id = Some(worker_id.clone());
+    }
+    if let Some(role_id) = turn_visibility.role_id.as_ref() {
+        item.role_id = Some(role_id.clone());
+    }
+    if let Some(published) =
+        upsert_session_turn_item_with_task_store(session_store, session_id, item, Some(task_store))
+    {
+        publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+    }
 }
 
 fn upsert_task_thinking_turn_item(
@@ -2987,6 +3117,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ("tool_call_result", Some("task-tool-shell-a")),
+                // P2：每次 tool_call_result 会追加一条 `worker_status` 摘要 item，
+                // 作为主线 dispatch 卡的 liveActivity 数据源。摘要不挂 tool_call_id。
+                ("worker_status", None),
                 ("tool_call_result", Some("task-tool-shell-b")),
                 ("assistant_final", None),
             ]

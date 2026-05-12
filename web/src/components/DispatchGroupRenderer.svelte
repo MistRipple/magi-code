@@ -165,9 +165,9 @@
   }
 
   function resolveFallbackLaneWorkerId(lane: DispatchGroupLane): string {
-    return normalizeText(lane.jumpTarget?.workerTabId)
-      || normalizeText(lane.worker)
-      || 'orchestrator';
+    // P1 身份契约：只认 roleId（jumpTarget.workerTabId 是它的搬运）。lane.worker 仅保留为
+    // 兼容字段，不再参与身份决策——没有 roleId 的 lane 归到 orchestrator 兜底。
+    return normalizeText(lane.jumpTarget?.workerTabId) || 'orchestrator';
   }
 
   function resolveWorkerMeta(workerId: string) {
@@ -189,9 +189,8 @@
   }
 
   function resolveFocusWorkerTabId(lane: DispatchGroupLane): string | null {
-    return normalizeText(lane.jumpTarget?.workerTabId)
-      || normalizeText(lane.worker)
-      || null;
+    // lane 有 roleId ⇔ 行可点击 → drawer 可打开。没有 roleId 的 lane 不允许跳转。
+    return normalizeText(lane.jumpTarget?.workerTabId) || null;
   }
 
   function resolveLaneBody(lane: DispatchGroupLane, status: WorkerLaneStatus): string {

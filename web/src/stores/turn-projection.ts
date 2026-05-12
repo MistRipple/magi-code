@@ -44,15 +44,9 @@ function normalizeCanonicalRoleId(item: CanonicalTurnItem): AgentId | undefined 
 }
 
 function resolveWorkerTabAggregateId(item: CanonicalTurnItem): AgentId | undefined {
-  const role = normalizeCanonicalRoleId(item);
-  if (role) {
-    return role;
-  }
-  const tab = item.visibility.workerTabIds?.find((value) => typeof value === 'string' && value.trim());
-  if (tab) {
-    return tab.trim() as AgentId;
-  }
-  return normalizeCanonicalWorkerId(item);
+  // Tab 聚合键只接受 roleId。worker 实例 id 通过 metadata.workerId 单独暴露，
+  // 不再参与 tab 维度，避免 drawer 切换和 tab 聚合混用两根身份。
+  return normalizeCanonicalRoleId(item);
 }
 
 function resolveVisibleWorkerTabId(item: CanonicalTurnItem): AgentId | undefined {
@@ -246,6 +240,9 @@ function resolveItemContent(item: CanonicalTurnItem): string {
 
 function shouldRenderItem(item: CanonicalTurnItem): boolean {
   if (item.visibility.renderable === false) {
+    return false;
+  }
+  if (item.kind === 'worker_status') {
     return false;
   }
   if (
@@ -488,11 +485,16 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
     if (item.kind === 'tool_call') {
       lane.toolUseCount = (lane.toolUseCount || 0) + 1;
     }
-    const activityText = summarizeLaneItem(item);
-    if (activityText) {
-      const currentActivity = laneActivityById.get(laneId);
-      if (!currentActivity || item.itemSeq >= currentActivity.itemSeq) {
-        laneActivityById.set(laneId, { text: activityText, itemSeq: item.itemSeq });
+    // P2：lane liveActivity / summary 只接受后端显式发出的 `worker_status` 摘要 item，
+    // 其它 worker 侧事件（thinking/tool_call/stream）不再参与主线摘要聚合——主线
+    // 信息密度由后端控制，drawer 仍保留完整事件流。
+    if (item.kind === 'worker_status') {
+      const activityText = summarizeLaneItem(item);
+      if (activityText) {
+        const currentActivity = laneActivityById.get(laneId);
+        if (!currentActivity || item.itemSeq >= currentActivity.itemSeq) {
+          laneActivityById.set(laneId, { text: activityText, itemSeq: item.itemSeq });
+        }
       }
     }
     if (isCanonicalTerminalStatus(item.status)) {

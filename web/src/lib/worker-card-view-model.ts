@@ -39,8 +39,10 @@ export function buildDispatchLaneCardData(
   dispatchWaveId?: string,
 ): WorkerTaskCardData {
   const description = normalizeCardText(lane.description);
+  // P1 身份契约：worker 身份只认 jumpTarget.workerTabId（即 roleId）。
+  // lane.worker 保留为兼容字段，不再参与卡片身份。
   const workerTabId = normalizeCardText(lane.jumpTarget?.workerTabId);
-  const worker = workerTabId || normalizeCardText(lane.worker);
+  const worker = workerTabId;
   const title = normalizeCardText(lane.title)
     || description
     || worker;
@@ -53,7 +55,7 @@ export function buildDispatchLaneCardData(
       description,
     } : {}),
     worker: worker || undefined,
-    workerTabId: workerTabId || worker || undefined,
+    workerTabId: workerTabId || undefined,
     status: lane.status,
     startedAt: lane.startedAt,
     dispatchWaveId,
