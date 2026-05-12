@@ -374,7 +374,7 @@ export interface DispatchGroupLane {
 
 // 消息内容块
 export interface ContentBlock {
-  id?: string;                // 唯一标识符，用于 #each 循环的 key
+  id: string;                // 唯一标识符，用于 #each 循环的 key（构造时必须确定性赋值）
   type: 'text' | 'code' | 'thinking' | 'tool_call' | 'tool_result' | 'file_change' | 'plan' | 'dispatch_group';
   content: string;
   language?: string;        // 代码块语言
@@ -785,7 +785,6 @@ export interface Edit {
   tailSummary?: string;
   toolCallId?: string;
   contributors?: string[];
-  workerId?: string;
   executionGroupId?: string;
 }
 

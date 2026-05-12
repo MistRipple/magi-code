@@ -7,6 +7,7 @@
   import EditsPanel from './components/EditsPanel.svelte';
   import KnowledgePanel from './components/KnowledgePanel.svelte';
   import SettingsPanel from './components/SettingsPanel.svelte';
+  import WorkerDetailDrawer from './components/WorkerDetailDrawer.svelte';
   import ToastContainer from './components/ToastContainer.svelte';
   import Icon from './components/Icon.svelte';
   import { setCurrentTopTab, messagesState } from './stores/messages.svelte';
@@ -125,6 +126,8 @@
   {#if settingsOpen}
     <SettingsPanel onClose={closeSettings} />
   {/if}
+  <!-- Worker 详情 Drawer（覆盖层，由 dispatch card 行点击触发） -->
+  <WorkerDetailDrawer />
   <!-- Toast 通知容器 -->
   <ToastContainer />
 </div>

@@ -66,6 +66,26 @@ static DISPATCH_JSON_FRAGMENT: LazyLock<Regex> = LazyLock::new(|| {
 static FENCED_JSON: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)```json\s*([\s\S]*?)```").unwrap());
 
+/// 任务名前缀剥除：匹配形如 "[Backend] 添加..."、"【架构师】..." 这类角色标签。
+///
+/// LLM 在生成 `task_name` 时习惯性地在开头带 `[Role]` / `【角色】` 前缀，但下游 UI 已经
+/// 在 `ownership_hint` 字段单独呈现角色归属，前缀会造成信息重复。此处单点剥除，保证
+/// 所有消费方（前端渲染、持久化、回放、导出）看到的 `task_name` 均为纯净任务描述。
+static TASK_NAME_ROLE_PREFIX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*[\[\u{3010}][^\]\u{3011}]*[\]\u{3011}]\s*").unwrap());
+
+fn sanitize_task_name(raw: &str) -> String {
+    let mut cleaned = raw.to_string();
+    loop {
+        let next = TASK_NAME_ROLE_PREFIX.replace(&cleaned, "").into_owned();
+        if next == cleaned {
+            break;
+        }
+        cleaned = next;
+    }
+    cleaned.trim().to_string()
+}
+
 pub fn decide_assignment_dispatch(
     text: &str,
     request_id: Option<&str>,
@@ -104,7 +124,13 @@ fn extract_assignment_dispatch(
         return None;
     }
 
-    let payload: AssignmentDispatchPayload = serde_json::from_value(parsed).ok()?;
+    let mut payload: AssignmentDispatchPayload = serde_json::from_value(parsed).ok()?;
+    for task in payload.tasks.iter_mut() {
+        let cleaned = sanitize_task_name(&task.task_name);
+        if !cleaned.is_empty() {
+            task.task_name = cleaned;
+        }
+    }
 
     let req_part = request_id
         .map(|s| s.replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "_"))
@@ -434,6 +460,81 @@ mod tests {
                 assert_eq!(request.payload.tasks.len(), 1);
             }
             _ => panic!("expected Dispatch"),
+        }
+    }
+
+    #[test]
+    fn sanitize_task_name_strips_bracketed_role_prefix() {
+        assert_eq!(sanitize_task_name("[Backend] 添加健康检查接口"), "添加健康检查接口");
+        assert_eq!(sanitize_task_name("【架构师】 编写分析文档"), "编写分析文档");
+        assert_eq!(sanitize_task_name("[架构师]编写分析文档"), "编写分析文档");
+    }
+
+    #[test]
+    fn sanitize_task_name_strips_nested_role_prefix() {
+        assert_eq!(
+            sanitize_task_name("[Architect][Reviewer] 审查架构"),
+            "审查架构",
+        );
+        assert_eq!(
+            sanitize_task_name("【角色】[Backend] 写接口"),
+            "写接口",
+        );
+    }
+
+    #[test]
+    fn sanitize_task_name_keeps_bracketed_body_text() {
+        assert_eq!(
+            sanitize_task_name("修复 [issue #123] 的回归问题"),
+            "修复 [issue #123] 的回归问题",
+            "只剥离开头，正文内的方括号必须保留",
+        );
+    }
+
+    #[test]
+    fn sanitize_task_name_handles_whitespace_and_empty() {
+        assert_eq!(sanitize_task_name("   [Frontend]   创建组件  "), "创建组件");
+        assert_eq!(sanitize_task_name(""), "");
+        assert_eq!(sanitize_task_name("  "), "");
+    }
+
+    #[test]
+    fn decide_dispatch_cleans_task_name_role_prefix_at_boundary() {
+        let json = r#"
+        {
+          "mission_title": "实现验证",
+          "tasks": [
+            {
+              "task_name": "[Backend] 添加健康检查汇总接口",
+              "ownership_hint": "backend",
+              "mode_hint": "normal",
+              "goal": "实现接口",
+              "acceptance": ["接口可用"],
+              "constraints": [],
+              "context": [],
+              "requires_modification": true
+            },
+            {
+              "task_name": "【Architect】 编写标签模块架构分析文档",
+              "ownership_hint": "architect",
+              "mode_hint": "normal",
+              "goal": "完成分析",
+              "acceptance": ["文档交付"],
+              "constraints": [],
+              "context": [],
+              "requires_modification": false
+            }
+          ]
+        }
+        "#;
+        let result = decide_assignment_dispatch(json, Some("req-sanitize"), 1, false);
+        match result {
+            AssignmentDispatchDecision::Dispatch { request, .. } => {
+                assert_eq!(request.payload.tasks.len(), 2);
+                assert_eq!(request.payload.tasks[0].task_name, "添加健康检查汇总接口");
+                assert_eq!(request.payload.tasks[1].task_name, "编写标签模块架构分析文档");
+            }
+            other => panic!("expected Dispatch, got {:?}", other),
         }
     }
 }

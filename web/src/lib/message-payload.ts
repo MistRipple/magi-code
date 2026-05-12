@@ -205,6 +205,7 @@ export function sanitizeMessageBlocks(blocks: unknown, errorPrefix = '[MessagePa
       throw new Error(`${errorPrefix} 消息块 type 无效`);
     }
     const content = typeof sanitized.content === 'string' ? sanitized.content : '';
+    const blockId = resolveSanitizedBlockId(sanitized, type, errorPrefix);
 
     // 后端协议层使用扁平的 toolName/toolId/input/output 属性，
     // 前端渲染层期望嵌套的 toolCall 对象。投影恢复时数据未经 mapStandardBlocks 转换，
@@ -212,6 +213,7 @@ export function sanitizeMessageBlocks(blocks: unknown, errorPrefix = '[MessagePa
     if (type === 'tool_call' && !sanitized.toolCall && typeof sanitized.toolName === 'string') {
       const toolCall = adaptFlatToolCallBlock(sanitized);
       return {
+        id: blockId,
         type: 'tool_call' as const,
         content: '',
         toolCall,
@@ -222,6 +224,7 @@ export function sanitizeMessageBlocks(blocks: unknown, errorPrefix = '[MessagePa
       const toolCall = adaptFlatToolResultBlock(sanitized);
       return {
         ...sanitized,
+        id: blockId,
         type: 'tool_result' as const,
         content,
         toolCall,
@@ -230,9 +233,8 @@ export function sanitizeMessageBlocks(blocks: unknown, errorPrefix = '[MessagePa
 
     // 后端 thinking block 使用扁平 content/summary/blockId，前端期望嵌套 thinking 对象。
     if (type === 'thinking' && !sanitized.thinking) {
-      const blockId = typeof sanitized.blockId === 'string' ? sanitized.blockId : undefined;
       return {
-        ...(blockId ? { id: blockId } : {}),
+        id: blockId,
         type: 'thinking' as const,
         content,
         thinking: {
@@ -246,10 +248,54 @@ export function sanitizeMessageBlocks(blocks: unknown, errorPrefix = '[MessagePa
 
     return {
       ...sanitized,
+      id: blockId,
       type: type as ContentBlock['type'],
       content,
     } as ContentBlock;
   });
+}
+
+function resolveSanitizedBlockId(
+  sanitized: Record<string, unknown>,
+  type: string,
+  errorPrefix: string,
+): string {
+  const explicit = typeof sanitized.id === 'string' ? sanitized.id.trim() : '';
+  if (explicit) {
+    return explicit;
+  }
+  const fallbackBlockId = typeof sanitized.blockId === 'string' ? sanitized.blockId.trim() : '';
+  if (fallbackBlockId) {
+    return type === 'tool_call' || type === 'tool_result'
+      ? `${type}:${fallbackBlockId}`
+      : fallbackBlockId;
+  }
+  if (type === 'tool_call' || type === 'tool_result') {
+    const toolCall = sanitized.toolCall as Record<string, unknown> | undefined;
+    const toolCallId = typeof toolCall?.id === 'string' ? toolCall.id.trim() : '';
+    const flatToolId = typeof sanitized.toolId === 'string' ? sanitized.toolId.trim() : '';
+    const flatToolCallId = typeof sanitized.toolCallId === 'string' ? sanitized.toolCallId.trim() : '';
+    const identifier = toolCallId || flatToolId || flatToolCallId;
+    if (identifier) {
+      return `${type}:${identifier}`;
+    }
+  }
+  if (type === 'file_change') {
+    const fileChange = sanitized.fileChange as Record<string, unknown> | undefined;
+    const filePath = typeof fileChange?.filePath === 'string'
+      ? fileChange.filePath.trim()
+      : (typeof sanitized.filePath === 'string' ? sanitized.filePath.trim() : '');
+    if (filePath) {
+      return `file_change:${filePath}`;
+    }
+  }
+  if (type === 'dispatch_group') {
+    const dispatchWaveId = typeof sanitized.dispatchWaveId === 'string' ? sanitized.dispatchWaveId.trim() : '';
+    if (dispatchWaveId) {
+      return `dispatch-group:${dispatchWaveId}`;
+    }
+  }
+  throw new Error(`${errorPrefix} 消息块缺少稳定 id: type=${type}`);
 }
 
 /**

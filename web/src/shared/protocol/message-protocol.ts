@@ -144,12 +144,14 @@ export type MessageVisibility = 'user' | 'system' | 'debug';
 
 export interface TextBlock {
   type: 'text';
+  blockId: string;
   content: string;
   isMarkdown?: boolean;
 }
 
 export interface CodeBlock {
   type: 'code';
+  blockId: string;
   language: string;
   content: string;
   filename?: string;
@@ -159,10 +161,10 @@ export interface CodeBlock {
 
 export interface ThinkingBlock {
   type: 'thinking';
+  blockId: string;
   content: string;
   isComplete?: boolean;
   summary?: string;
-  blockId?: string;
 }
 
 export type StandardizedToolStatus =
@@ -232,6 +234,7 @@ export interface FileChangeBlock extends FileChangePayload {
 
 export interface PlanBlock {
   type: 'plan';
+  blockId: string;
   goal: string;
   analysis?: string;
   constraints?: string[];
@@ -480,71 +483,6 @@ export interface StandardMessage {
 }
 
 // ============================================================================
-// 流式更新类型
-// ============================================================================
-
-export interface StreamUpdateEnvelope {
-  messageId: string;
-  eventId?: string;
-  eventSeq?: number;
-  timestamp: number;
-  tokenUsage?: {
-    inputTokens?: number;
-    outputTokens?: number;
-    cacheReadTokens?: number;
-    cacheWriteTokens?: number;
-  };
-}
-
-export interface AppendTextUpdate extends StreamUpdateEnvelope {
-  updateType: 'append_text';
-  text: string;
-}
-
-export interface ReplaceBlocksUpdate extends StreamUpdateEnvelope {
-  updateType: 'replace_blocks';
-  blocks: ContentBlock[];
-}
-
-export interface MergeBlockUpdate extends StreamUpdateEnvelope {
-  updateType: 'merge_block';
-  blocks: ContentBlock[];
-}
-
-export interface LifecycleUpdate extends StreamUpdateEnvelope {
-  updateType: 'lifecycle';
-  lifecycle: MessageLifecycle;
-}
-
-export interface BlockInsertUpdate extends StreamUpdateEnvelope {
-  updateType: 'block_insert';
-  block: DispatchGroupBlock;
-}
-
-export interface BlockPatchUpdate extends StreamUpdateEnvelope {
-  updateType: 'block_patch';
-  blockId: string;
-  patch: Partial<DispatchGroupBlock>;
-}
-
-export interface DispatchLanePatchUpdate extends StreamUpdateEnvelope {
-  updateType: 'dispatch_lane_patch';
-  dispatchWaveId: string;
-  laneId: string;
-  laneVersion: number;
-  patch: Partial<WorkerLaneBlock>;
-}
-
-export type StreamUpdate =
-  | AppendTextUpdate
-  | ReplaceBlocksUpdate
-  | MergeBlockUpdate
-  | LifecycleUpdate
-  | BlockInsertUpdate
-  | BlockPatchUpdate
-  | DispatchLanePatchUpdate;
-
-// ============================================================================
 // 工厂函数
 // ============================================================================
 
@@ -582,7 +520,7 @@ export function createTextMessage(
     agent,
     traceId,
     lifecycle: MessageLifecycle.COMPLETED,
-    blocks: [{ type: 'text', content: text, isMarkdown: true }],
+    blocks: [{ type: 'text', blockId: `${traceId}:text`, content: text, isMarkdown: true }],
     metadata: {},
     ...options,
   });
@@ -600,7 +538,7 @@ export function createUserInputMessage(
     agent: 'orchestrator',
     traceId,
     lifecycle: MessageLifecycle.COMPLETED,
-    blocks: [{ type: 'text', content: text, isMarkdown: true }],
+    blocks: [{ type: 'text', blockId: `${traceId}:text`, content: text, isMarkdown: true }],
     metadata: {},
     ...options,
   });
@@ -658,7 +596,7 @@ export function createErrorMessage(
     agent,
     traceId,
     lifecycle: MessageLifecycle.FAILED,
-    blocks: [{ type: 'text', content: error }],
+    blocks: [{ type: 'text', blockId: `${traceId}:error`, content: error }],
     metadata: { error },
     ...options,
   });
@@ -678,7 +616,7 @@ export function createInteractionMessage(
     agent,
     traceId,
     lifecycle: MessageLifecycle.STREAMING,
-    blocks: [{ type: 'text', content: interaction.prompt }],
+    blocks: [{ type: 'text', blockId: `${traceId}:interaction`, content: interaction.prompt }],
     interaction,
     metadata: {},
     ...options,
@@ -720,7 +658,7 @@ export function createNotifyMessage(
     agent: 'orchestrator',
     traceId,
     lifecycle: MessageLifecycle.COMPLETED,
-    blocks: [{ type: 'text', content }],
+    blocks: [{ type: 'text', blockId: `${traceId}:notify`, content }],
     metadata: {},
     notify: { level, duration, ...(presentation || {}) },
     ...options,

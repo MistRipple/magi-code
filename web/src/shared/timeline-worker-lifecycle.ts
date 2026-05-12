@@ -35,25 +35,47 @@ function resolveSubTaskCardMetadata(
     : undefined;
 }
 
+/**
+ * 解析时间线消息归属的 worker Tab 聚合键。
+ *
+ * 单一真源：`metadata.workerTabId`（由 canonical projection 写入）。
+ * 历史字段（worker / assignedWorker / agent / subTaskCard.worker）仅作为未迁移数据的兜底，
+ * 不再参与新数据的身份决策。
+ */
 export function resolveTimelineWorkerId(
   metadata: Record<string, unknown> | undefined,
   options: { fallbacks?: unknown[] } = {},
 ): string {
-  const subTaskCard = resolveSubTaskCardMetadata(metadata);
-  const candidates: unknown[] = [
+  const canonicalTabId = normalizeWorkerSlot(metadata?.workerTabId);
+  if (canonicalTabId) {
+    return canonicalTabId;
+  }
+  const legacyCandidates: unknown[] = [
     metadata?.worker,
     metadata?.assignedWorker,
     metadata?.agent,
-    subTaskCard?.worker,
+    resolveSubTaskCardMetadata(metadata)?.worker,
     ...(Array.isArray(options.fallbacks) ? options.fallbacks : []),
   ];
-  for (const candidate of candidates) {
+  for (const candidate of legacyCandidates) {
     const worker = normalizeWorkerSlot(candidate);
     if (worker) {
       return worker;
     }
   }
   return '';
+}
+
+/**
+ * 解析时间线消息归属的 worker 实例 id（card 身份）。
+ *
+ * 单一真源：`metadata.workerId`（由 canonical projection 写入）。
+ * 返回空字符串表示消息不隶属于任何 worker 实例（例如 orchestrator 内生消息）。
+ */
+export function resolveTimelineWorkerInstanceId(
+  metadata: Record<string, unknown> | undefined,
+): string {
+  return normalizeWorkerSlot(metadata?.workerId);
 }
 
 export function resolveTimelineDispatchWaveId(

@@ -18,7 +18,6 @@ members = [
   "crates/magi-skill-runtime",
   "crates/magi-bridge-client",
   "crates/magi-usage-authority",
-  "crates/magi-normalizer",
   "crates/magi-agent",
   "crates/magi-snapshot",
 ]

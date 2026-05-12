@@ -10,20 +10,16 @@ import type { ClientBridge, ClientBridgeMessage } from '../shared/bridges/client
 import { getClientBridge } from '../shared/bridges/bridge-runtime';
 import {
   getState,
-  clearPendingRequest,
-  settleProcessingAfterResponseCompletion,
   addToast,
   getRequestBinding,
   createRequestBinding,
   updateRequestBinding,
-  clearRequestBinding,
   addPendingRequest,
   settleProcessingForManualInteraction,
   sealAllStreamingMessages,
-  messagesState,
 } from '../stores/messages.svelte';
-import type { StandardMessage, StreamUpdate } from '../shared/protocol/message-protocol';
-import { MessageType, MessageCategory, MessageLifecycle } from '../shared/protocol/message-protocol';
+import type { StandardMessage } from '../shared/protocol/message-protocol';
+import { MessageType, MessageCategory } from '../shared/protocol/message-protocol';
 import {
   handleUnifiedControlMessage,
   handleUnifiedNotify,
@@ -158,7 +154,7 @@ function resolveEventTrackingSessionId(
   if (typeof message.sessionId === 'string' && message.sessionId.trim()) {
     return message.sessionId.trim();
   }
-  if (message.type === 'unifiedMessage' || message.type === 'unifiedComplete') {
+  if (message.type === 'unifiedMessage') {
     const standard = message.message as StandardMessage | undefined;
     const metadata = standard?.metadata && typeof standard.metadata === 'object'
       ? standard.metadata as Record<string, unknown>
@@ -209,18 +205,7 @@ function rememberProcessedEventKey(eventKey: string): void {
 
 
 function resolveEventSeqAndKey(message: ClientBridgeMessage): { eventSeq?: number; eventKey?: string } {
-  if (message.type === 'unifiedUpdate') {
-    const update = message.update as StreamUpdate | undefined;
-    const seq = update?.eventSeq;
-    if (typeof seq !== 'number' || !Number.isFinite(seq)) {
-      return {};
-    }
-    const eventId = typeof update?.eventId === 'string' && update.eventId.trim()
-      ? update.eventId.trim()
-      : `upd:${update?.messageId || 'unknown'}:${update?.updateType || 'unknown'}:${seq}`;
-    return { eventSeq: seq, eventKey: `unifiedUpdate:${eventId}:${seq}` };
-  }
-  if (message.type === 'unifiedMessage' || message.type === 'unifiedComplete') {
+  if (message.type === 'unifiedMessage') {
     const standard = message.message as StandardMessage | undefined;
     const seq = standard?.eventSeq;
     if (typeof seq !== 'number' || !Number.isFinite(seq)) {
@@ -322,14 +307,6 @@ function handleMessage(message: ClientBridgeMessage) {
     switch (type) {
       case 'unifiedMessage':
         handleUnifiedMessage(message);
-        break;
-
-      case 'unifiedUpdate':
-        handleStandardUpdate(message);
-        break;
-
-      case 'unifiedComplete':
-        handleStandardComplete(message);
         break;
 
       case 'rustTaskEvent':
@@ -447,58 +424,11 @@ function handleContentMessage(standard: StandardMessage) {
 }
 
 
-function handleStandardUpdate(message: ClientBridgeMessage) {
-  void message;
-}
-
-function handleStandardComplete(message: ClientBridgeMessage) {
-  const rawStandard = message.message as StandardMessage;
-  if (!rawStandard) {
-    throw new Error('[MessageHandler] unifiedComplete 缺少 message');
-  }
-  const standard = assertStandardMessageId(rawStandard);
-  if (!shouldAcceptStandardMessageForCurrentSession(standard)) {
-    return;
-  }
-
-  if (
-    standard.category !== MessageCategory.CONTENT
-    || shouldHideFromUser(standard)
-    || !isLocalUnifiedTimelineContent(standard)
-  ) {
-    return;
-  }
-
-  const meta = standard.metadata as Record<string, unknown> | undefined;
-  const requestId = meta?.requestId as string | undefined;
-  const incomingTurnOrderSeq = resolveTimelineTurnOrderSeqFromMetadata(meta);
-  const incomingCanonicalTurnSeq = resolveTimelineCanonicalTurnSeqFromMetadata(meta);
-  const actualMessageId = standard.id;
-  const requestBinding = requestId ? getRequestBinding(requestId) : undefined;
-  if (requestId && requestBinding) {
-    updateRequestBindingTurnFacts(requestId, incomingTurnOrderSeq, incomingCanonicalTurnSeq);
-  }
-
-  // 只有最终 assistant 回复或 assistant 错误才能结束本轮请求。
-  // 工具卡、思考块和中途 assistant_stream 完成不能提前清理 pending 状态。
-  if (requestId && isTerminalRequestResponseStandard(standard)) {
-    finalizeTerminalRequestResponse(requestId, actualMessageId);
-  }
-  settleProcessingAfterResponseCompletion();
-}
-
-
 /**
  * 处理控制消息
  *
  * 控制消息通过 MessageHub.sendControl() 发送，包含 controlType 和 payload
  */
-function isTerminalLifecycle(lifecycle: StandardMessage['lifecycle'] | undefined): boolean {
-  return lifecycle === MessageLifecycle.COMPLETED
-    || lifecycle === MessageLifecycle.FAILED
-    || lifecycle === MessageLifecycle.CANCELLED;
-}
-
 function updateRequestBindingTurnFacts(
   requestId: string,
   incomingTurnOrderSeq: number,
@@ -520,45 +450,5 @@ function updateRequestBindingTurnFacts(
   }
   if (Object.keys(updates).length > 0) {
     updateRequestBinding(requestId, updates);
-  }
-}
-
-function resolveStandardTurnItemKind(standard: StandardMessage): string {
-  const metadata = standard.metadata as Record<string, unknown> | undefined;
-  return typeof metadata?.turnItemKind === 'string' ? metadata.turnItemKind.trim() : '';
-}
-
-function isTerminalRequestResponseStandard(standard: StandardMessage): boolean {
-  if (!isTerminalLifecycle(standard.lifecycle)) {
-    return false;
-  }
-  const turnItemKind = resolveStandardTurnItemKind(standard);
-  if (turnItemKind) {
-    return turnItemKind === 'assistant_text'
-      || turnItemKind === 'assistant_final'
-      || turnItemKind === 'assistant_error';
-  }
-  return standard.type !== MessageType.USER_INPUT
-    && standard.type !== MessageType.TOOL_CALL
-    && standard.type !== MessageType.THINKING
-    && standard.type !== MessageType.TASK_CARD
-    && standard.type !== MessageType.SYSTEM;
-}
-
-function finalizeTerminalRequestResponse(requestId: string, actualMessageId: string): void {
-  if (messagesState.backendProcessing) {
-    return;
-  }
-  clearPendingRequest(requestId);
-  const binding = getRequestBinding(requestId);
-  if (binding?.timeoutId) {
-    clearTimeout(binding.timeoutId);
-  }
-  if (binding) {
-    updateRequestBinding(requestId, {
-      realMessageId: actualMessageId,
-      timeoutId: undefined,
-    });
-    clearRequestBinding(requestId);
   }
 }

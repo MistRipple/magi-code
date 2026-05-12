@@ -168,36 +168,12 @@
 
   function resolveBlockRenderKey(
     block: import('../types/message').ContentBlock,
-    index: number,
   ): string {
-    const candidate = block as unknown as Record<string, unknown>;
-    const explicitBlockId = typeof candidate.blockId === 'string' && candidate.blockId.trim().length > 0
-      ? candidate.blockId.trim()
-      : (typeof candidate.id === 'string' && candidate.id.trim().length > 0 ? candidate.id.trim() : '');
-    if (explicitBlockId) {
-      return `${message.id}:${block.type}:${explicitBlockId}`;
+    const id = typeof block.id === 'string' ? block.id.trim() : '';
+    if (!id) {
+      throw new Error(`[MessageItem] block 缺少 id: message=${message.id} type=${block.type}`);
     }
-    if (block.type === 'tool_call' || block.type === 'tool_result') {
-      const toolId = typeof block.toolCall?.id === 'string' && block.toolCall.id.trim().length > 0
-        ? block.toolCall.id.trim()
-        : (typeof candidate.toolId === 'string' && candidate.toolId.trim().length > 0
-          ? candidate.toolId.trim()
-          : (typeof candidate.toolCallId === 'string' && candidate.toolCallId.trim().length > 0
-            ? candidate.toolCallId.trim()
-            : ''));
-      if (toolId) {
-        return `${message.id}:${block.type}:${toolId}`;
-      }
-    }
-    if (block.type === 'file_change') {
-      const filePath = typeof candidate.filePath === 'string' && candidate.filePath.trim().length > 0
-        ? candidate.filePath.trim()
-        : '';
-      if (filePath) {
-        return `${message.id}:file_change:${filePath}`;
-      }
-    }
-    return `${message.id}:${block.type}:slot-${index}`;
+    return `${message.id}:${id}`;
   }
 
   // 格式化时间戳
@@ -423,7 +399,7 @@
             </div>
           </details>
         {:else if presentationBlocks.length > 0}
-          {#each presentationBlocks as block, i (resolveBlockRenderKey(block, i))}
+          {#each presentationBlocks as block, i (resolveBlockRenderKey(block))}
             {@const blockIsStreaming = block.type === 'thinking'
               ? (isStreaming && i === presentationBlocks.length - 1)
               : isStreaming}

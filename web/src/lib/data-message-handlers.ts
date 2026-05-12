@@ -122,7 +122,6 @@ function normalizeIncomingEdits(state: AppState): Edit[] {
         tailSummary: change.tailSummary,
         toolCallId: change.toolCallId,
         contributors: change.contributors,
-        workerId: change.workerId,
         executionGroupId: (typeof (change as { executionGroupId?: unknown }).executionGroupId === 'string'
           ? (change as { executionGroupId?: string }).executionGroupId
           : undefined)

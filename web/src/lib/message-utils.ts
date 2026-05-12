@@ -120,19 +120,25 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
   }
   return list.map((block) => {
     switch (block.type) {
-      case 'text':
+      case 'text': {
+        const blockId = requireBlockId(block, 'text');
         return {
+          id: blockId,
           type: 'text',
           content: typeof block.content === 'string' ? block.content : '',
         };
-      case 'code':
+      }
+      case 'code': {
+        const blockId = requireBlockId(block, 'code');
         return {
+          id: blockId,
           type: 'code',
           content: typeof block.content === 'string' ? block.content : '',
           language: typeof block.language === 'string' ? block.language : undefined,
         };
+      }
       case 'thinking': {
-        const blockId = typeof block.blockId === 'string' ? block.blockId : undefined;
+        const blockId = requireBlockId(block, 'thinking');
         const thinking: ThinkingBlock = {
           content: typeof block.content === 'string' ? block.content : '',
           isComplete: typeof block.isComplete === 'boolean' ? block.isComplete : true,
@@ -140,13 +146,14 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
           blockId,
         };
         return {
-          ...(blockId ? { id: blockId } : {}),
+          id: blockId,
           type: 'thinking',
           content: typeof block.content === 'string' ? block.content : '',
           thinking,
         };
       }
       case 'tool_call': {
+        const toolId = requireToolCallBlockId(block.toolId, 'tool_call');
         const toolStatus = mapToolStatus(
           block.status,
           block.standardized?.status,
@@ -162,7 +169,7 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
           ? (block.standardized.message || undefined)
           : undefined;
         const toolCall: ToolCall = {
-          id: block.toolId,
+          id: toolId,
           name: block.toolName,
           arguments: safeParseJson(block.input) || {},
           status: toolStatus,
@@ -174,17 +181,19 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
             : undefined,
         };
         return {
+          id: `tool_call:${toolId}`,
           type: 'tool_call',
           content: '',
           toolCall,
         };
       }
       case 'tool_result': {
+        const toolCallId = requireToolCallBlockId(block.toolCallId, 'tool_result');
         const resolvedContent = (typeof block.content === 'string' ? block.content : '').trim()
           || (typeof block.standardized?.message === 'string' ? block.standardized.message.trim() : '');
         const toolStatus = mapToolResultStatus(block.isError, block.standardized?.status);
         const toolCall: ToolCall = {
-          id: block.toolCallId,
+          id: toolCallId,
           name: block.standardized?.toolName || 'tool_result',
           arguments: safeParseJson(block.input) || {},
           status: toolStatus,
@@ -193,6 +202,7 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
           standardized: block.standardized,
         };
         return {
+          id: `tool_result:${toolCallId}`,
           type: 'tool_call',
           content: resolvedContent,
           toolCall,
@@ -216,12 +226,14 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
             : undefined,
         };
       }
-      case 'file_change':
+      case 'file_change': {
+        const filePath = requireFileChangePath(block.filePath);
         return {
+          id: `file_change:${filePath}`,
           type: 'file_change',
           content: '',
           fileChange: {
-            filePath: block.filePath,
+            filePath,
             oldPath: block.oldPath,
             changeType: block.changeType,
             additions: block.additions,
@@ -237,8 +249,11 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
             toolCallId: block.toolCallId,
           },
         };
-      case 'plan':
+      }
+      case 'plan': {
+        const blockId = requireBlockId(block, 'plan');
         return {
+          id: blockId,
           type: 'plan',
           content: '',
           plan: {
@@ -251,11 +266,14 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
             rawJson: block.rawJson,
           },
         };
-      case 'dispatch_group':
+      }
+      case 'dispatch_group': {
+        const blockId = requireBlockId(block, 'dispatch_group');
         return {
+          id: blockId,
           type: 'dispatch_group',
           content: '',
-          blockId: block.blockId,
+          blockId,
           dispatchWaveId: block.dispatchWaveId,
           status: block.status,
           summaryText: block.summaryText,
@@ -295,10 +313,38 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
               }))
             : [],
         };
+      }
       default:
         throw new Error(`[MessageHandler] 未支持的标准消息块类型: ${(block as { type: string }).type}`);
     }
   });
+}
+
+function requireBlockId(
+  block: { blockId?: unknown },
+  kind: string,
+): string {
+  const value = typeof block.blockId === 'string' ? block.blockId.trim() : '';
+  if (!value) {
+    throw new Error(`[MessageHandler] ${kind} block 缺少 blockId`);
+  }
+  return value;
+}
+
+function requireToolCallBlockId(value: string | undefined, kind: string): string {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  if (!trimmed) {
+    throw new Error(`[MessageHandler] ${kind} block 缺少 toolCallId`);
+  }
+  return trimmed;
+}
+
+function requireFileChangePath(value: string | undefined): string {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  if (!trimmed) {
+    throw new Error('[MessageHandler] file_change block 缺少 filePath');
+  }
+  return trimmed;
 }
 
 

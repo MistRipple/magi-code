@@ -33,21 +33,37 @@ function normalizeSessionId(value: string | null | undefined): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function normalizeWorkerId(item: CanonicalTurnItem): AgentId | undefined {
-  const workerRole = typeof item.worker?.roleId === 'string' ? item.worker.roleId.trim() : '';
-  const workerTab = item.visibility.workerTabIds?.find((value) => typeof value === 'string' && value.trim());
-  return (workerRole || workerTab || item.worker?.workerId || undefined) as AgentId | undefined;
+function normalizeCanonicalWorkerId(item: CanonicalTurnItem): AgentId | undefined {
+  const workerId = typeof item.worker?.workerId === 'string' ? item.worker.workerId.trim() : '';
+  return (workerId || undefined) as AgentId | undefined;
 }
 
-function resolveVisibleWorkerId(item: CanonicalTurnItem): AgentId | undefined {
-  return item.visibility.workerVisible ? normalizeWorkerId(item) : undefined;
+function normalizeCanonicalRoleId(item: CanonicalTurnItem): AgentId | undefined {
+  const roleId = typeof item.worker?.roleId === 'string' ? item.worker.roleId.trim() : '';
+  return (roleId || undefined) as AgentId | undefined;
+}
+
+function resolveWorkerTabAggregateId(item: CanonicalTurnItem): AgentId | undefined {
+  const role = normalizeCanonicalRoleId(item);
+  if (role) {
+    return role;
+  }
+  const tab = item.visibility.workerTabIds?.find((value) => typeof value === 'string' && value.trim());
+  if (tab) {
+    return tab.trim() as AgentId;
+  }
+  return normalizeCanonicalWorkerId(item);
+}
+
+function resolveVisibleWorkerTabId(item: CanonicalTurnItem): AgentId | undefined {
+  return item.visibility.workerVisible ? resolveWorkerTabAggregateId(item) : undefined;
 }
 
 function resolveMessageSource(item: CanonicalTurnItem): Message['source'] {
   if (item.kind === 'user_message') {
     return 'user';
   }
-  return resolveVisibleWorkerId(item) || 'orchestrator';
+  return resolveVisibleWorkerTabId(item) || 'orchestrator';
 }
 
 function statusToToolStatus(status: CanonicalTurnItemStatus): 'pending' | 'running' | 'success' | 'error' {
@@ -149,6 +165,7 @@ function summarizeLaneItem(item: CanonicalTurnItem): string {
 
 function buildToolBlock(tool: CanonicalToolCall, status: CanonicalTurnItemStatus): ContentBlock {
   return {
+    id: `tool_call:${tool.callId}`,
     type: 'tool_call',
     content: '',
     toolCall: {
@@ -167,13 +184,15 @@ function buildMessageBlocks(item: CanonicalTurnItem, content: string): ContentBl
     return [buildToolBlock(item.tool, item.status)];
   }
   if (item.kind === 'assistant_thinking') {
+    const blockId = `thinking:${item.itemId}`;
     return [{
+      id: blockId,
       type: 'thinking',
       content,
       thinking: {
         content,
         isComplete: isCanonicalTerminalStatus(item.status),
-        blockId: `thinking:${item.itemId}`,
+        blockId,
       },
     }];
   }
@@ -313,7 +332,10 @@ function buildMessage(
   laneMetaById: Map<string, LaneProjectionMeta>,
 ): Message {
   const content = resolveItemContent(item);
-  const worker = resolveVisibleWorkerId(item);
+  const workerTabId = resolveVisibleWorkerTabId(item);
+  const isWorkerVisible = item.visibility.workerVisible === true;
+  const workerId = isWorkerVisible ? normalizeCanonicalWorkerId(item) : undefined;
+  const roleId = isWorkerVisible ? normalizeCanonicalRoleId(item) : undefined;
   const blocks = buildMessageBlocks(item, content);
   const isStreaming = item.kind === 'assistant_text' && !isCanonicalTerminalStatus(item.status);
   const responseDurationMs = canShowTurnResponseDuration(turn, item)
@@ -346,8 +368,9 @@ function buildMessage(
       ...(laneMeta?.title ? { laneTitle: laneMeta.title } : {}),
       ...(laneMeta?.status ? { laneStatus: laneMeta.status } : {}),
       cardStreamSeq: item.itemSeq,
-      workerId: item.worker?.workerId,
-      roleId: worker,
+      ...(workerId ? { workerId } : {}),
+      ...(roleId ? { roleId } : {}),
+      ...(workerTabId ? { workerTabId } : {}),
       taskId: item.worker?.taskId,
       toolCallId: item.tool?.callId,
       toolName: item.tool?.name,
@@ -373,8 +396,8 @@ function buildArtifact(
     return null;
   }
   const artifactId = resolveArtifactId(turn, item);
-  const worker = resolveVisibleWorkerId(item);
-  const workerTabs = item.visibility.workerVisible && worker ? [worker] : [];
+  const workerTabId = resolveVisibleWorkerTabId(item);
+  const workerTabs = item.visibility.workerVisible && workerTabId ? [workerTabId] : [];
   return {
     artifactId,
     kind: item.kind === 'tool_call' ? 'tool' : 'message',
@@ -386,7 +409,7 @@ function buildArtifact(
     timestamp: item.createdAt,
     cardId: artifactId,
     laneId: item.laneId,
-    worker,
+    worker: workerTabId,
     threadVisible: item.visibility.threadVisible !== false,
     workerTabs,
     messageIds: [artifactId, item.itemId],
@@ -437,7 +460,7 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
     if (!laneId) {
       continue;
     }
-    const worker = normalizeWorkerId(item) || 'orchestrator';
+    const worker = resolveWorkerTabAggregateId(item) || 'orchestrator';
     const title = (item.title || item.worker?.title || laneId).trim();
     const status = canonicalStatusToWorkerLaneStatus(item.status);
     laneById.set(laneId, {
@@ -526,10 +549,12 @@ function buildDispatchGroupArtifact(turn: CanonicalTurn): TimelineProjectionArti
   const firstItem = dispatchItems[0];
   const artifactId = `turn:${turn.turnId}:worker-dispatch-group`;
   const responseDurationMs = resolveDispatchGroupResponseDurationMs(turn);
+  const dispatchBlockId = `dispatch-group:${turn.turnId}`;
   const block: ContentBlock = {
+    id: dispatchBlockId,
     type: 'dispatch_group',
     content: '',
-    blockId: `dispatch-group:${turn.turnId}`,
+    blockId: dispatchBlockId,
     dispatchWaveId: turn.turnId,
     status: groupStatus,
     lanes,
