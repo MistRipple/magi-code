@@ -1295,6 +1295,7 @@ mod tests {
             }],
             notifications: Vec::new(),
             execution_sidecar_store: Default::default(),
+            thread_registry: Vec::new(),
         });
         store
             .upsert_current_turn(

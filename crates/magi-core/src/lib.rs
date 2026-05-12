@@ -11,7 +11,8 @@ mod tests;
 pub use errors::{DomainError, DomainResult};
 pub use execution::{ExecutionOwnership, RecoveryResumeInput, TaskExecutionTarget};
 pub use ids::{
-    AssignmentId, EventId, LeaseId, MissionId, SessionId, TaskId, ToolCallId, WorkerId, WorkspaceId,
+    AssignmentId, EventId, LeaseId, MissionId, SessionId, TaskId, ThreadId, ToolCallId, WorkerId,
+    WorkspaceId,
 };
 pub use status::{
     ApprovalRequirement, AssignmentLifecycleStatus, DispatchReason, ExecutionResultStatus,

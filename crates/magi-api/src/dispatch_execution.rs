@@ -4,7 +4,7 @@ use magi_bridge_client::{
 };
 use magi_core::{
     ExecutionOwnership, ExecutorBinding, MissionId, SessionId, Task, TaskExecutionTarget, TaskId,
-    TaskKind, TaskPolicy, TaskStatus, UtcMillis, WorkerId, WorkspaceId,
+    TaskKind, TaskPolicy, TaskStatus, ThreadId, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, task_events};
 use magi_orchestrator::{
@@ -14,7 +14,8 @@ use magi_orchestrator::{
 };
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
-    ActiveExecutionTurn, ActiveExecutionTurnItem, ActiveExecutionTurnLane,
+    ActiveExecutionTurn, ActiveExecutionTurnItem, ActiveExecutionTurnLane, ExecutionThread,
+    ExecutionThreadStatus, SessionStore,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -171,6 +172,7 @@ pub(crate) fn run_dispatch_submission(
             worker_id: worker_id.clone(),
             lane_id: None,
             lane_seq: None,
+            thread_id: None,
             is_primary: true,
             session_id: session_id.clone(),
             workspace_id: workspace_id.clone(),
@@ -189,6 +191,17 @@ pub(crate) fn run_dispatch_submission(
         },
     );
 
+    // role 解析 closure：派发前 ensure thread 时要先知道 sub task 归属的 role。
+    // 放到 dispatch_task_ids 循环之前，保证 plan 注册与 lane 构造共享同一解析逻辑。
+    let role_for_task = |task_id: &TaskId| {
+        state
+            .task_store()
+            .and_then(|store| store.get_task(task_id))
+            .and_then(|task| task.executor_binding.map(|binding| binding.target_role))
+            .map(|role| role.trim().to_string())
+            .filter(|role| !role.is_empty())
+    };
+
     for sub_task_id in &dispatch_task_ids {
         let sub_ownership = ExecutionOwnership {
             session_id: Some(request.session_id.clone()),
@@ -199,6 +212,21 @@ pub(crate) fn run_dispatch_submission(
             execution_chain_ref: execution_chain_ref.clone(),
             ..ExecutionOwnership::default()
         };
+        // P6b：plan 注册前预先 ensure 对应 thread，让 plan 直接持有稳定的 thread_id。
+        // 下方 worker_lanes 构造时同样命中 `find_idle_thread_for_role` 复用同一条 thread，
+        // 避免"plan 拿不到 thread_id 但 lane 拿到了"的错位。
+        let sub_task_role_id = role_for_task(sub_task_id);
+        let sub_thread_id = sub_task_role_id.as_deref().map(|role| {
+            ensure_thread_for_role(
+                &state.session_store,
+                &request.session_id,
+                &mission_id,
+                role,
+                &worker_id,
+                sub_task_id,
+                now,
+            )
+        });
         state.task_execution_registry().insert(
             sub_task_id.clone(),
             TaskExecutionPlan::Dispatch {
@@ -219,6 +247,9 @@ pub(crate) fn run_dispatch_submission(
                         .unwrap_or(0)
                         + 1,
                 ),
+                // P6b：plan 注册前已 ensure thread，此处直接嵌入供 dispatch_inner 取用，
+                // 保证 task_llm_loop 能读取该 thread 的历史 messages。
+                thread_id: sub_thread_id.clone(),
                 is_primary: false,
                 session_id: request.session_id.clone(),
                 workspace_id: workspace_id.clone(),
@@ -246,14 +277,6 @@ pub(crate) fn run_dispatch_submission(
         skill_name: request.skill_name.clone(),
         is_primary: true,
     }];
-    let role_for_task = |task_id: &TaskId| {
-        state
-            .task_store()
-            .and_then(|store| store.get_task(task_id))
-            .and_then(|task| task.executor_binding.map(|binding| binding.target_role))
-            .map(|role| role.trim().to_string())
-            .filter(|role| !role.is_empty())
-    };
     for sub_task_id in &dispatch_task_ids {
         branches.push(ActiveExecutionBranch {
             task_id: sub_task_id.clone(),
@@ -350,18 +373,35 @@ pub(crate) fn run_dispatch_submission(
         worker_lanes: visible_lane_task_ids
             .iter()
             .enumerate()
-            .map(|(index, sub_task_id)| ActiveExecutionTurnLane {
-                lane_id: format!("lane-{}", sub_task_id),
-                lane_seq: index + 1,
-                task_id: sub_task_id.clone(),
-                worker_id: worker_id.clone(),
-                role_id: role_for_task(sub_task_id),
-                title: state
-                    .task_store()
-                    .and_then(|store| store.get_task(sub_task_id))
-                    .map(|task| task.title)
-                    .unwrap_or_else(|| sub_task_id.to_string()),
-                is_primary: false,
+            .map(|(index, sub_task_id)| {
+                let role_id_opt = role_for_task(sub_task_id);
+                // P6a：如果能解析出 role，则在 thread registry 中复用或 spawn 一条
+                // Thread。否则 lane 维持 thread_id=None（旧路径，待 P6d 收口时清理）。
+                let thread_id = role_id_opt.as_deref().map(|role| {
+                    ensure_thread_for_role(
+                        &state.session_store,
+                        &request.session_id,
+                        &mission_id,
+                        role,
+                        &worker_id,
+                        sub_task_id,
+                        now,
+                    )
+                });
+                ActiveExecutionTurnLane {
+                    lane_id: format!("lane-{}", sub_task_id),
+                    lane_seq: index + 1,
+                    task_id: sub_task_id.clone(),
+                    worker_id: worker_id.clone(),
+                    role_id: role_id_opt,
+                    thread_id,
+                    title: state
+                        .task_store()
+                        .and_then(|store| store.get_task(sub_task_id))
+                        .map(|task| task.title)
+                        .unwrap_or_else(|| sub_task_id.to_string()),
+                    is_primary: false,
+                }
             })
             .collect(),
     };
@@ -1126,6 +1166,19 @@ fn update_session_execution_branches(
             execution_chain_ref: Some(execution_chain_ref.clone()),
             ..ExecutionOwnership::default()
         };
+        // P6b：注册 plan 之前 ensure thread，下方 new_lanes 构造时命中同一条复用即可，
+        // 保证 plan 与 lane 两侧 thread_id 一致，避免同 task 出现两条错位 thread。
+        let thread_id_for_plan = role_id.as_deref().map(|role| {
+            ensure_thread_for_role(
+                &state.session_store,
+                session_id,
+                &mission_id,
+                role,
+                &worker_id,
+                &spec.task_id,
+                now,
+            )
+        });
         state.task_execution_registry().insert(
             spec.task_id.clone(),
             TaskExecutionPlan::Dispatch {
@@ -1140,6 +1193,8 @@ fn update_session_execution_branches(
                 worker_id: worker_id.clone(),
                 lane_id: lane_id.clone(),
                 lane_seq,
+                // P6b：plan 与 lane 同步持有 thread_id，保证执行时能读取持久化历史。
+                thread_id: thread_id_for_plan.clone(),
                 is_primary: spec.is_primary,
                 session_id: session_id.clone(),
                 workspace_id: workspace_id.clone(),
@@ -1166,12 +1221,15 @@ fn update_session_execution_branches(
             is_primary: spec.is_primary,
         });
         if let (Some(lane_id), Some(lane_seq)) = (lane_id, lane_seq) {
+            // P6b：直接复用 plan 注册时已 ensure 的 thread_id，避免二次 ensure_thread_for_role
+            // 造成 handled_task_ids 重复追加。
             new_lanes.push(ActiveExecutionTurnLane {
                 lane_id,
                 lane_seq,
                 task_id: spec.task_id.clone(),
                 worker_id: worker_id.clone(),
                 role_id,
+                thread_id: thread_id_for_plan.clone(),
                 title: task.title,
                 is_primary: false,
             });
@@ -1724,6 +1782,41 @@ fn infer_dispatch_task_role(skill_name: Option<&str>) -> &'static str {
     } else {
         "integration-dev"
     }
+}
+
+/// 为指定 role 获取可复用的 Thread：命中 Idle thread 则直接复用，否则在 registry
+/// 中 spawn 一条新 Thread 并返回。调用后 thread 被标记为 Active，绑定当前 task。
+///
+/// P6a 与既有 lane 机制并存：lane 构造点拿到 thread_id 后仅作为信息挂载，不影响
+/// worker 执行；P6b 才让 task_llm_loop 按 thread_id 载入历史 messages。
+fn ensure_thread_for_role(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    mission_id: &MissionId,
+    role_id: &str,
+    worker_instance_id: &WorkerId,
+    task_id: &TaskId,
+    now: UtcMillis,
+) -> ThreadId {
+    if let Some(existing) = session_store.find_idle_thread_for_role(session_id, role_id) {
+        session_store.activate_thread(&existing.thread_id, task_id, now);
+        return existing.thread_id;
+    }
+    let new_thread = ExecutionThread {
+        thread_id: ThreadId::new(format!("thread-{role_id}-{}", now.0)),
+        session_id: session_id.clone(),
+        mission_id: mission_id.clone(),
+        role_id: role_id.to_string(),
+        worker_instance_id: worker_instance_id.clone(),
+        status: ExecutionThreadStatus::Active,
+        created_at: now,
+        last_used_at: now,
+        handled_task_ids: vec![task_id.clone()],
+        message_history: Vec::new(),
+    };
+    let thread_id = new_thread.thread_id.clone();
+    session_store.register_thread(new_thread);
+    thread_id
 }
 
 #[cfg(test)]

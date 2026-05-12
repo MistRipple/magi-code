@@ -24,7 +24,7 @@ use magi_bridge_client::{
 };
 use magi_core::{
     ApprovalRequirement, EventId, ExecutionResultStatus, LeaseId, RiskLevel, SessionId, TaskId,
-    TaskKind, TaskStatus, ToolCallId, UtcMillis, WorkspaceId,
+    TaskKind, TaskStatus, ThreadId, ToolCallId, UtcMillis, WorkspaceId,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::ToolKind;
@@ -32,7 +32,10 @@ use magi_orchestrator::{
     ExecutionContextSummary, task_runner::TaskOutcome, task_store::TaskStore,
     task_worker_catalog::resolve_task_role,
 };
-use magi_session_store::{ActiveExecutionTurnItem, SessionStore, TimelineEntryKind};
+use magi_session_store::{
+    ActiveExecutionTurnItem, SessionStore, ThreadChatMessage, ThreadChatToolCall,
+    ThreadChatToolFunction, TimelineEntryKind,
+};
 use magi_tool_runtime::{
     BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
 };
@@ -62,6 +65,9 @@ pub(crate) struct TaskLlmLoopRequest<'a> {
     pub worker_lane_id: Option<&'a str>,
     pub worker_lane_seq: Option<usize>,
     pub worker_id: Option<&'a magi_core::WorkerId>,
+    /// P6b：lane 绑定到的 thread。非空时 LLM 入口会 prepend 该 thread 历史、
+    /// 结束时把本轮消息 append 回 thread。为空则保留旧路径行为（无跨 task 记忆）。
+    pub thread_id: Option<&'a ThreadId>,
     pub context_summary: Option<ExecutionContextSummary>,
     pub system_prompt: Option<String>,
     pub workspace_root_path: Option<PathBuf>,
@@ -172,6 +178,52 @@ fn apply_task_final_visibility(
     let _ = task_store;
 }
 
+/// P6b：把 thread 持久化的消息记录（`ThreadChatMessage`）还原为 bridge-client 的
+/// `ChatMessage`。两者字段一一对应，独立类型仅是为了避免 session-store 反向依赖
+/// bridge-client，不承担额外语义。
+fn thread_chat_message_to_chat_message(message: &ThreadChatMessage) -> ChatMessage {
+    ChatMessage {
+        role: message.role.clone(),
+        content: message.content.clone(),
+        tool_calls: message
+            .tool_calls
+            .iter()
+            .map(|call| ChatToolCall {
+                id: call.id.clone(),
+                kind: call.kind.clone(),
+                function: magi_bridge_client::ChatToolFunction {
+                    name: call.function.name.clone(),
+                    arguments: call.function.arguments.clone(),
+                },
+            })
+            .collect(),
+        tool_call_id: message.tool_call_id.clone(),
+    }
+}
+
+/// P6b：把本轮新产生的 bridge-client 消息（含 system prompt 之外的所有条目）
+/// 压缩为 thread 持久化格式。系统边界提示 / 历史回放 / 工作区提示等重复上下文
+/// 不再次写入 —— 它们在下一 task 时会由 run_task_llm_loop 自动重新构造。
+fn chat_message_to_thread_chat_message(message: &ChatMessage) -> ThreadChatMessage {
+    ThreadChatMessage {
+        role: message.role.clone(),
+        content: message.content.clone(),
+        tool_calls: message
+            .tool_calls
+            .iter()
+            .map(|call| ThreadChatToolCall {
+                id: call.id.clone(),
+                kind: call.kind.clone(),
+                function: ThreadChatToolFunction {
+                    name: call.function.name.clone(),
+                    arguments: call.function.arguments.clone(),
+                },
+            })
+            .collect(),
+        tool_call_id: message.tool_call_id.clone(),
+    }
+}
+
 pub(crate) fn run_task_llm_loop(
     request: TaskLlmLoopRequest<'_>,
 ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
@@ -195,6 +247,7 @@ pub(crate) fn run_task_llm_loop(
         worker_lane_id,
         worker_lane_seq,
         worker_id,
+        thread_id,
         context_summary,
         system_prompt,
         workspace_root_path,
@@ -215,6 +268,26 @@ pub(crate) fn run_task_llm_loop(
             content: Some(workspace_context_system_prompt(
                 &root_path.display().to_string(),
             )),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+    }
+    // P6b：thread 累积历史 —— 系统提示后、本轮 user prompt 前。为防止 LLM 混淆"当前 task"
+    // 与历史 task，我们在历史末尾、新 user prompt 前插入一条 system 边界标记，让模型明确
+    // 接下来要专注于新的任务目标。
+    let thread_history_snapshot: Vec<ThreadChatMessage> = thread_id
+        .map(|id| session_store.thread_message_history(id))
+        .unwrap_or_default();
+    if !thread_history_snapshot.is_empty() {
+        for history_msg in &thread_history_snapshot {
+            messages.push(thread_chat_message_to_chat_message(history_msg));
+        }
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(
+                "以上是你在本 mission 中处理过的历史任务对话，仅供上下文参考。下面是一个新的任务，请聚焦新任务目标独立执行。"
+                    .to_string(),
+            ),
             tool_calls: Vec::new(),
             tool_call_id: None,
         });
@@ -695,6 +768,26 @@ pub(crate) fn run_task_llm_loop(
             "completed",
             &summarize_final_for_lane(&final_content),
         );
+    }
+
+    // P6b：把本轮 LLM 对话追写进 thread 历史，供下一 task 作为上下文。
+    // 过滤掉 system 消息（prompt、workspace 上下文、历史边界标记）——这些会在下一 task
+    // 启动时由 run_task_llm_loop 自动重建；只沉淀真实对话（user / assistant / tool）。
+    // 补写 assistant final：循环里只把 assistant 写进 messages 是在"还有下一轮"时发生，
+    // 最终 final_content 作为收尾时没有入列，这里用 final_content 显式收口。
+    if let Some(thread) = thread_id {
+        let mut turn_messages: Vec<ThreadChatMessage> = messages
+            .iter()
+            .filter(|msg| msg.role != "system")
+            .map(chat_message_to_thread_chat_message)
+            .collect();
+        turn_messages.push(ThreadChatMessage {
+            role: "assistant".to_string(),
+            content: Some(final_content.clone()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+        session_store.append_thread_messages(thread, turn_messages, UtcMillis::now());
     }
 
     (
@@ -2548,6 +2641,7 @@ mod tests {
             worker_lane_id: None,
             worker_lane_seq: None,
             worker_id: Some(&worker_id),
+            thread_id: None,
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
@@ -2645,6 +2739,7 @@ mod tests {
             worker_lane_id: None,
             worker_lane_seq: None,
             worker_id: Some(&worker_id),
+            thread_id: None,
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
@@ -2903,6 +2998,7 @@ mod tests {
             worker_lane_id: None,
             worker_lane_seq: None,
             worker_id: None,
+            thread_id: None,
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,
@@ -3014,6 +3110,7 @@ mod tests {
                         task_id: task_id.clone(),
                         worker_id: worker_id.clone(),
                         role_id: Some("integration-dev".to_string()),
+                        thread_id: None,
                         title: "验证 worker 工具并发".to_string(),
                         is_primary: false,
                     }],
@@ -3074,6 +3171,7 @@ mod tests {
             worker_lane_id: Some(&lane_id),
             worker_lane_seq: Some(2),
             worker_id: Some(&worker_id),
+            thread_id: None,
             context_summary: None,
             system_prompt: None,
             workspace_root_path: None,

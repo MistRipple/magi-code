@@ -2,13 +2,14 @@ use super::SessionStore;
 use crate::models::{
     ActiveExecutionChain, ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalToolCall,
     CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnItemStatus,
-    CanonicalTurnStatus, CanonicalTurnVisibility, CanonicalWorkerRef,
-    SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionRuntimeSidecar,
-    SessionSidecarFlushReason, SessionStoreState, TimelineEntry, TimelineEntryKind,
+    CanonicalTurnStatus, CanonicalTurnVisibility, CanonicalWorkerRef, ExecutionThread,
+    ExecutionThreadStatus, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
+    SessionRuntimeSidecar, SessionSidecarFlushReason, SessionStoreState, ThreadChatMessage,
+    TimelineEntry, TimelineEntryKind,
 };
 use magi_core::{
     DomainError, DomainResult, ExecutionOwnership, LeaseId, RecoveryResumeInput, SessionId,
-    TaskExecutionTarget, TaskId, UtcMillis, WorkerId,
+    TaskExecutionTarget, TaskId, ThreadId, UtcMillis, WorkerId,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -736,6 +737,150 @@ impl SessionStore {
             sidecar,
             SessionSidecarFlushReason::UpsertRuntimeSidecar,
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // P6a Thread registry（Y 方案）
+    // ---------------------------------------------------------------------
+
+    /// 查找 session 下指定 role 且处于 `Idle` 的 thread。命中时可被下一 task 复用。
+    pub fn find_idle_thread_for_role(
+        &self,
+        session_id: &SessionId,
+        role_id: &str,
+    ) -> Option<ExecutionThread> {
+        let state = self
+            .state
+            .read()
+            .expect("session state read lock poisoned");
+        state
+            .thread_registry
+            .iter()
+            .find(|thread| {
+                &thread.session_id == session_id
+                    && thread.role_id == role_id
+                    && thread.status == ExecutionThreadStatus::Idle
+            })
+            .cloned()
+    }
+
+    /// 注册新 thread；调用方保证 `thread_id` 唯一。
+    pub fn register_thread(&self, thread: ExecutionThread) {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if state
+            .thread_registry
+            .iter()
+            .any(|existing| existing.thread_id == thread.thread_id)
+        {
+            return;
+        }
+        state.thread_registry.push(thread);
+    }
+
+    /// 将 thread 标记为 `Active`，绑定当前 task；同时更新 last_used_at 与 handled_task_ids。
+    pub fn activate_thread(&self, thread_id: &ThreadId, task_id: &TaskId, now: UtcMillis) {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if let Some(thread) = state
+            .thread_registry
+            .iter_mut()
+            .find(|thread| &thread.thread_id == thread_id)
+        {
+            thread.status = ExecutionThreadStatus::Active;
+            thread.last_used_at = now;
+            if !thread.handled_task_ids.iter().any(|id| id == task_id) {
+                thread.handled_task_ids.push(task_id.clone());
+            }
+        }
+    }
+
+    /// 将 thread 标记为 `Idle`（task 完成后回收待复用）。
+    pub fn mark_thread_idle(&self, thread_id: &ThreadId, now: UtcMillis) {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if let Some(thread) = state
+            .thread_registry
+            .iter_mut()
+            .find(|thread| &thread.thread_id == thread_id)
+        {
+            thread.status = ExecutionThreadStatus::Idle;
+            thread.last_used_at = now;
+        }
+    }
+
+    /// Mission 结束或显式回收时调用：session 下所有 thread 标记为 `Retired`。
+    pub fn retire_session_threads(&self, session_id: &SessionId, now: UtcMillis) {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        for thread in state.thread_registry.iter_mut() {
+            if &thread.session_id == session_id
+                && thread.status != ExecutionThreadStatus::Retired
+            {
+                thread.status = ExecutionThreadStatus::Retired;
+                thread.last_used_at = now;
+            }
+        }
+    }
+
+    /// 只读快照：用于测试与调试。
+    pub fn thread_registry_snapshot(&self, session_id: &SessionId) -> Vec<ExecutionThread> {
+        let state = self
+            .state
+            .read()
+            .expect("session state read lock poisoned");
+        state
+            .thread_registry
+            .iter()
+            .filter(|thread| &thread.session_id == session_id)
+            .cloned()
+            .collect()
+    }
+
+    /// P6b：读取指定 thread 的累积对话历史，用于下一 task 启动时拼接为新 prompt 上文。
+    pub fn thread_message_history(&self, thread_id: &ThreadId) -> Vec<ThreadChatMessage> {
+        let state = self
+            .state
+            .read()
+            .expect("session state read lock poisoned");
+        state
+            .thread_registry
+            .iter()
+            .find(|thread| &thread.thread_id == thread_id)
+            .map(|thread| thread.message_history.clone())
+            .unwrap_or_default()
+    }
+
+    /// P6b：将本轮 task 的 LLM 对话追加到 thread 历史。由 task_llm_loop 在 final 后调用。
+    pub fn append_thread_messages(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<ThreadChatMessage>,
+        now: UtcMillis,
+    ) {
+        if messages.is_empty() {
+            return;
+        }
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if let Some(thread) = state
+            .thread_registry
+            .iter_mut()
+            .find(|thread| &thread.thread_id == thread_id)
+        {
+            thread.message_history.extend(messages);
+            thread.last_used_at = now;
+        }
     }
 
     pub fn bind_execution_ownership(&self, session_id: SessionId, ownership: ExecutionOwnership) {

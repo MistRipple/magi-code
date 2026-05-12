@@ -1441,6 +1441,7 @@ mod tests {
                         task_id: task_id.clone(),
                         worker_id,
                         role_id: None,
+                        thread_id: None,
                         title: "权威任务状态".to_string(),
                         is_primary: true,
                     }],

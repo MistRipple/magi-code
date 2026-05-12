@@ -214,6 +214,14 @@ fn rebuild_dispatch_plan_for_branch(
                 .find(|lane| lane.task_id == branch.task_id)
                 .map(|lane| lane.lane_seq)
         }),
+        // P6b：恢复链路从 lane 身上找回已经 spawn 过的 thread_id，保证 resume 后的
+        // 新轮 LLM 能读到之前累积的对话历史。找不到时等同"旧路径"，不破坏兼容。
+        thread_id: chain.current_turn.as_ref().and_then(|turn| {
+            turn.worker_lanes
+                .iter()
+                .find(|lane| lane.task_id == branch.task_id)
+                .and_then(|lane| lane.thread_id.clone())
+        }),
         is_primary: branch.is_primary,
         session_id: chain.session_id.clone(),
         workspace_id: chain.workspace_id.clone(),

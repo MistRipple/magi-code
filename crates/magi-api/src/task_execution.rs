@@ -51,6 +51,9 @@ pub enum TaskExecutionPlan {
         worker_id: WorkerId,
         lane_id: Option<String>,
         lane_seq: Option<usize>,
+        /// P6b：lane 绑定的 thread，由 dispatch_execution::ensure_thread_for_role 创建或命中。
+        /// 为空表示旧路径（无跨 task 记忆），P6d 收口后会强制存在。
+        thread_id: Option<magi_core::ThreadId>,
         is_primary: bool,
         session_id: SessionId,
         workspace_id: Option<WorkspaceId>,
@@ -993,6 +996,7 @@ impl LlmTaskDispatcher {
         worker_lane_id: Option<String>,
         worker_lane_seq: Option<usize>,
         worker_id: WorkerId,
+        thread_id: Option<magi_core::ThreadId>,
         system_prompt: Option<String>,
     ) {
         // 仅在有 writebacks 时（即主 action task）才生成 streaming entry_id。
@@ -1015,6 +1019,7 @@ impl LlmTaskDispatcher {
             worker_lane_id.as_deref(),
             worker_lane_seq,
             Some(&worker_id),
+            thread_id.as_ref(),
             system_prompt,
         );
         if matches!(&outcome, TaskOutcome::Completed { .. }) {
@@ -1458,6 +1463,7 @@ impl LlmTaskDispatcher {
         worker_lane_id: Option<&str>,
         worker_lane_seq: Option<usize>,
         worker_id: Option<&WorkerId>,
+        thread_id: Option<&magi_core::ThreadId>,
         system_prompt: Option<String>,
     ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
         let Some(client) = self.resolve_model_client() else {
@@ -1508,6 +1514,7 @@ impl LlmTaskDispatcher {
             worker_lane_id,
             worker_lane_seq,
             worker_id,
+            thread_id,
             context_summary,
             system_prompt,
             workspace_root_path,
@@ -1548,6 +1555,7 @@ impl LlmTaskDispatcher {
                 worker_id,
                 lane_id,
                 lane_seq,
+                thread_id,
                 is_primary,
                 session_id,
                 workspace_id,
@@ -1579,6 +1587,7 @@ impl LlmTaskDispatcher {
                     lane_id,
                     lane_seq,
                     worker_id,
+                    thread_id,
                     worker.system_prompt_template.clone(),
                 );
             }

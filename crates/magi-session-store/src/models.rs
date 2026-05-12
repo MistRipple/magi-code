@@ -1,6 +1,6 @@
 use magi_core::{
     DomainError, DomainResult, ExecutionOwnership, LeaseId, MissionId, SessionId,
-    SessionLifecycleStatus, TaskId, UtcMillis, WorkerId, WorkspaceId,
+    SessionLifecycleStatus, TaskId, ThreadId, UtcMillis, WorkerId, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -89,6 +89,10 @@ pub struct ActiveExecutionTurnLane {
     pub worker_id: WorkerId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_id: Option<String>,
+    /// P6a：lane 绑定到其隶属的 Thread。`None` 表示旧路径（P6 未完成迁移的 lane），
+    /// P6d 收口后会去掉 Option。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<ThreadId>,
     pub title: String,
     #[serde(default)]
     pub is_primary: bool,
@@ -736,6 +740,10 @@ pub struct SessionStoreState {
     pub notifications: Vec<NotificationRecord>,
     #[serde(default, flatten)]
     pub execution_sidecar_store: SessionExecutionSidecarStoreState,
+    /// P6 Thread 原语注册表：按 session 聚合 `ExecutionThread`，支持同 role 跨 task
+    /// 复用。不进入 durable snapshot（P6a 仅运行时维护；P6b 引入持久化后再迁移）。
+    #[serde(skip, default)]
+    pub thread_registry: Vec<ExecutionThread>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -924,6 +932,7 @@ impl SessionStoreState {
             canonical_turns,
             notifications: durable_state.notifications,
             execution_sidecar_store,
+            thread_registry: Vec::new(),
         }
     }
 
@@ -945,4 +954,78 @@ pub struct SessionProjectionInput {
     pub timeline: Vec<TimelineEntry>,
     pub canonical_turns: Vec<CanonicalTurn>,
     pub notifications: Vec<NotificationRecord>,
+}
+
+// ---------------------------------------------------------------------------
+// P6 Thread 原语（Y 方案）
+// ---------------------------------------------------------------------------
+
+/// Thread 的生命周期状态。
+///
+/// - `Active`：当前正在处理某个 task（有 in-flight lease）。
+/// - `Idle`：上一个 task 已完成，context 保留，可被下一 task 复用。
+/// - `Retired`：mission 结束或显式回收，不再可被复用；保留为只读历史。
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionThreadStatus {
+    Active,
+    Idle,
+    Retired,
+}
+
+/// P6 Thread 实体：承载"同 mission + 同 role = 同一条 thread"的产品语义。
+///
+/// 一个 Thread 绑定到具体的 worker 实例（`worker_instance_id`），跨多个 task
+/// 累积上下文（`message_history` 在 P6b 启用）。Thread 在 mission 生命周期内
+/// 可被派发多次；mission 结束后整体进入 `Retired`，不跨 mission 复用。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionThread {
+    pub thread_id: ThreadId,
+    pub session_id: SessionId,
+    pub mission_id: MissionId,
+    pub role_id: String,
+    pub worker_instance_id: WorkerId,
+    pub status: ExecutionThreadStatus,
+    pub created_at: UtcMillis,
+    pub last_used_at: UtcMillis,
+    /// 该 thread 处理过的 task 序列，用于调试 / UI 呈现时间线。
+    /// P6a 仅记录 task_id；P6b 在此基础上引入独立的 message_history 字段。
+    #[serde(default)]
+    pub handled_task_ids: Vec<TaskId>,
+    /// P6b：跨 task 累积的 LLM 对话历史。存 user/assistant/tool 消息的串行记录，
+    /// 下一 task 启动时会把这段历史作为上文前置到新一轮 prompt 中，形成 Codex 式的
+    /// "同 role 持续性对话"。mission 结束时随 thread 一起 Retired，不跨 mission 复用。
+    #[serde(default)]
+    pub message_history: Vec<ThreadChatMessage>,
+}
+
+/// ExecutionThread 消息历史的最小存储格式：与 magi_bridge_client::ChatMessage 同构，
+/// 但保留独立定义避免 session-store 反向依赖 bridge-client。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadChatMessage {
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ThreadChatToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadChatToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ThreadChatToolFunction,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadChatToolFunction {
+    pub name: String,
+    pub arguments: String,
 }

@@ -2,12 +2,13 @@ use super::*;
 use crate::models::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurnItemKind, CanonicalTurnStatus,
-    SessionDurableState, SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState,
-    SessionRecord, SessionRuntimeSidecar, SessionSidecarFlushReason, SessionStoreState,
+    ExecutionThread, ExecutionThreadStatus, SessionDurableState, SessionExecutionSidecarStatus,
+    SessionExecutionSidecarStoreState, SessionRecord, SessionRuntimeSidecar,
+    SessionSidecarFlushReason, SessionStoreState,
 };
 use magi_core::{
     ExecutionOwnership, MissionId, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskId,
-    UtcMillis, WorkerId, WorkspaceId,
+    ThreadId, UtcMillis, WorkerId, WorkspaceId,
 };
 use serde_json::json;
 use std::{thread, time::Duration};
@@ -2039,5 +2040,170 @@ fn execution_sidecar_flush_hook_only_persists_dirty_sidecars() {
         !store
             .flush_execution_sidecars_with(|_| Ok::<_, std::io::Error>(()))
             .expect("clean sidecar flush should be skipped")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P6a Thread registry tests
+// ---------------------------------------------------------------------------
+
+fn sample_thread(
+    thread_id: &str,
+    session_id: &SessionId,
+    mission_id: &MissionId,
+    role: &str,
+    now: UtcMillis,
+    status: ExecutionThreadStatus,
+) -> ExecutionThread {
+    ExecutionThread {
+        thread_id: ThreadId::new(thread_id),
+        session_id: session_id.clone(),
+        mission_id: mission_id.clone(),
+        role_id: role.to_string(),
+        worker_instance_id: WorkerId::new(format!("worker-{role}")),
+        status,
+        created_at: now,
+        last_used_at: now,
+        handled_task_ids: Vec::new(),
+        message_history: Vec::new(),
+    }
+}
+
+#[test]
+fn thread_registry_spawn_and_idle_reuse() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-thread-reuse");
+    let mission_id = MissionId::new("mission-thread-reuse");
+    let now = UtcMillis(1_000);
+
+    // 注册一条 backend-dev 的 idle thread
+    store.register_thread(sample_thread(
+        "thread-backend-1",
+        &session_id,
+        &mission_id,
+        "backend-dev",
+        now,
+        ExecutionThreadStatus::Idle,
+    ));
+
+    // 查找 idle thread 必须命中
+    let found = store
+        .find_idle_thread_for_role(&session_id, "backend-dev")
+        .expect("idle backend-dev thread should be found");
+    assert_eq!(found.thread_id.as_str(), "thread-backend-1");
+
+    // 激活 thread 后，状态变为 Active，再查 idle 应该找不到
+    let task_a = TaskId::new("task-a");
+    store.activate_thread(&found.thread_id, &task_a, UtcMillis(2_000));
+    assert!(
+        store
+            .find_idle_thread_for_role(&session_id, "backend-dev")
+            .is_none(),
+        "active thread 不应再出现在 idle 查询结果中"
+    );
+
+    // 标记 idle 后应可复用
+    store.mark_thread_idle(&found.thread_id, UtcMillis(3_000));
+    let reused = store
+        .find_idle_thread_for_role(&session_id, "backend-dev")
+        .expect("idled thread should be reusable");
+    assert_eq!(reused.thread_id.as_str(), "thread-backend-1");
+
+    // handled_task_ids 必须累积
+    let snapshot = store.thread_registry_snapshot(&session_id);
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(
+        snapshot[0].handled_task_ids,
+        vec![task_a],
+        "activate_thread 必须累积 task_id"
+    );
+}
+
+#[test]
+fn thread_registry_is_scoped_per_session_and_role() {
+    let store = SessionStore::new();
+    let session_a = SessionId::new("session-a");
+    let session_b = SessionId::new("session-b");
+    let mission_id = MissionId::new("mission-iso");
+    let now = UtcMillis(1_000);
+
+    store.register_thread(sample_thread(
+        "thread-a-backend",
+        &session_a,
+        &mission_id,
+        "backend-dev",
+        now,
+        ExecutionThreadStatus::Idle,
+    ));
+    store.register_thread(sample_thread(
+        "thread-b-backend",
+        &session_b,
+        &mission_id,
+        "backend-dev",
+        now,
+        ExecutionThreadStatus::Idle,
+    ));
+
+    // session 隔离：session-a 不应看到 session-b 的 thread
+    let a_idle = store.find_idle_thread_for_role(&session_a, "backend-dev");
+    assert_eq!(
+        a_idle.map(|t| t.thread_id.as_str().to_string()),
+        Some("thread-a-backend".to_string())
+    );
+    let b_idle = store.find_idle_thread_for_role(&session_b, "backend-dev");
+    assert_eq!(
+        b_idle.map(|t| t.thread_id.as_str().to_string()),
+        Some("thread-b-backend".to_string())
+    );
+
+    // role 隔离：frontend-dev 不存在，查询返回 None
+    assert!(
+        store
+            .find_idle_thread_for_role(&session_a, "frontend-dev")
+            .is_none()
+    );
+}
+
+#[test]
+fn thread_registry_retires_on_session_retirement() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-retire");
+    let mission_id = MissionId::new("mission-retire");
+    let now = UtcMillis(1_000);
+
+    store.register_thread(sample_thread(
+        "thread-r-1",
+        &session_id,
+        &mission_id,
+        "reviewer",
+        now,
+        ExecutionThreadStatus::Idle,
+    ));
+    store.register_thread(sample_thread(
+        "thread-r-2",
+        &session_id,
+        &mission_id,
+        "architect",
+        now,
+        ExecutionThreadStatus::Active,
+    ));
+
+    store.retire_session_threads(&session_id, UtcMillis(2_000));
+
+    let snapshot = store.thread_registry_snapshot(&session_id);
+    assert_eq!(snapshot.len(), 2);
+    for thread in &snapshot {
+        assert_eq!(
+            thread.status,
+            ExecutionThreadStatus::Retired,
+            "retire_session_threads 必须把 session 下所有 thread 标记为 Retired"
+        );
+    }
+
+    assert!(
+        store
+            .find_idle_thread_for_role(&session_id, "reviewer")
+            .is_none(),
+        "retired thread 不应被 idle 查询命中"
     );
 }

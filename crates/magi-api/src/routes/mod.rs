@@ -2539,6 +2539,7 @@ mod tests {
                             task_id: action_task_id.clone(),
                             worker_id: WorkerId::new("task-worker-reviewer"),
                             role_id: None,
+                            thread_id: None,
                             title: "评审最终总结".to_string(),
                             is_primary: false,
                         }],
