@@ -1457,10 +1457,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "unexpected body: {second_body:?}");
 
-        let second_accepted_at = second_body["acceptedAt"]
+        let _second_accepted_at = second_body["acceptedAt"]
             .as_u64()
             .expect("accepted_at should serialize as integer");
-        let second_mission_id = format!("mission-session-action-{second_accepted_at}");
+        // session 一生一 mission：第二次派发复用第一次派发创建的 mission_id
+        let second_mission_id = format!("mission-session-action-{first_accepted_at}");
         let second_root_task_id = second_body["rootTaskId"]
             .as_str()
             .expect("root_task_id should serialize as string");
@@ -1602,6 +1603,10 @@ mod tests {
             StatusCode::OK,
             "unexpected seed body: {seed_body:?}"
         );
+        // session 一生一 mission：后续 followup dispatch 复用 seed 的 mission_id
+        let seed_accepted_at = seed_body["acceptedAt"]
+            .as_u64()
+            .expect("seed accepted_at should serialize as integer");
 
         let session_id = magi_core::SessionId::new("test-session-001");
         let ownership = runtime
@@ -1680,10 +1685,10 @@ mod tests {
             "unexpected followup body: {followup_body:?}"
         );
 
-        let followup_accepted_at = followup_body["acceptedAt"]
+        let _followup_accepted_at = followup_body["acceptedAt"]
             .as_u64()
             .expect("accepted_at should serialize as integer");
-        let followup_mission_id = format!("mission-session-action-{followup_accepted_at}");
+        let followup_mission_id = format!("mission-session-action-{seed_accepted_at}");
         let expected_extraction_id = "extract-session-continue-recovery-daemon-route";
         let followup_execution_group =
             wait_for_execution_group(app, &followup_mission_id, |entry| {

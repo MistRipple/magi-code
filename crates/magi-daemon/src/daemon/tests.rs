@@ -1000,10 +1000,11 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         "unexpected followup response body: {followup_body:?}"
     );
 
-    let accepted_at = followup_body["acceptedAt"]
+    let _accepted_at = followup_body["acceptedAt"]
         .as_u64()
         .expect("accepted_at should serialize as integer");
-    let followup_mission_id = format!("mission-session-action-{accepted_at}");
+    // session 一生一 mission：followup dispatch 复用 recovery 阶段已绑定的 mission_id
+    let followup_mission_id = "mission-router-recovery".to_string();
     let followup_root_task_id = followup_body["rootTaskId"]
         .as_str()
         .expect("root_task_id should serialize as string");
@@ -1105,10 +1106,11 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         "unexpected second body: {second_body:?}"
     );
 
-    let second_accepted_at = second_body["acceptedAt"]
+    let _second_accepted_at = second_body["acceptedAt"]
         .as_u64()
         .expect("accepted_at should serialize as integer");
-    let second_mission_id = format!("mission-session-action-{second_accepted_at}");
+    // session 一生一 mission：第二次派发复用第一次派发创建的 mission_id
+    let second_mission_id = format!("mission-session-action-{first_accepted_at}");
     let second_root_task_id = second_body["rootTaskId"]
         .as_str()
         .expect("root_task_id should serialize as string");
@@ -1185,6 +1187,10 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         .as_str()
         .expect("seed root task id should serialize as string")
         .to_string();
+    // session 一生一 mission：后续 followup dispatch 复用 seed 绑定的 mission_id
+    let seed_accepted_at = seed_body["acceptedAt"]
+        .as_u64()
+        .expect("seed accepted_at should serialize as integer");
 
     let ownership = state
         .session_store
@@ -1280,10 +1286,10 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         "unexpected followup body: {followup_body:?}"
     );
 
-    let followup_accepted_at = followup_body["acceptedAt"]
+    let _followup_accepted_at = followup_body["acceptedAt"]
         .as_u64()
         .expect("accepted_at should serialize as integer");
-    let followup_mission_id = format!("mission-session-action-{followup_accepted_at}");
+    let followup_mission_id = format!("mission-session-action-{seed_accepted_at}");
     let followup_root_task_id = followup_body["rootTaskId"]
         .as_str()
         .expect("root_task_id should serialize as string");
@@ -3239,24 +3245,23 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
     assert_eq!(user_messages.len(), 2, "should have 2 user messages");
 
     let first_accepted_at = first_body["acceptedAt"].as_u64().unwrap();
-    let second_accepted_at = second_body["acceptedAt"].as_u64().unwrap();
-    let first_mission_id = format!("mission-session-action-{first_accepted_at}");
-    let second_mission_id = format!("mission-session-action-{second_accepted_at}");
+    let _second_accepted_at = second_body["acceptedAt"].as_u64().unwrap();
+    // session 一生一 mission：两次派发聚合到同一 execution_group。
+    let session_mission_id = format!("mission-session-action-{first_accepted_at}");
 
     let bootstrap = get_json(app, "/bootstrap").await;
     let execution_groups = bootstrap["runtimeReadModel"]["details"]["execution_groups"]
         .as_array()
         .expect("execution groups should be an array");
-    assert!(
-        execution_groups
-            .iter()
-            .any(|m| m["mission_id"] == first_mission_id),
-        "bootstrap should contain first execution group"
+    assert_eq!(
+        execution_groups.len(),
+        1,
+        "两次派发必须聚合到同一 execution_group"
     );
     assert!(
         execution_groups
             .iter()
-            .any(|m| m["mission_id"] == second_mission_id),
-        "bootstrap should contain second execution group"
+            .any(|m| m["mission_id"] == session_mission_id),
+        "bootstrap should contain session-level execution group"
     );
 }

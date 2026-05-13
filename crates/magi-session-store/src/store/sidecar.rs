@@ -9,8 +9,8 @@ use crate::models::{
     TimelineEntry, TimelineEntryKind,
 };
 use magi_core::{
-    DomainError, DomainResult, ExecutionOwnership, LeaseId, RecoveryResumeInput, SessionId,
-    TaskExecutionTarget, TaskId, ThreadId, UtcMillis, WorkerId,
+    DomainError, DomainResult, ExecutionOwnership, LeaseId, MissionId, RecoveryResumeInput,
+    SessionId, TaskExecutionTarget, TaskId, ThreadId, UtcMillis, WorkerId,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -847,12 +847,11 @@ impl SessionStore {
             .collect()
     }
 
-    /// P6c：查找 session 的 orchestrator 主线 thread。
+    /// 查找 session 的 orchestrator 主线 thread。
     ///
-    /// Session 创建时会 spawn 一条 `role_id = ORCHESTRATOR_ROLE_ID` 的常驻 thread
-    /// 作为"主线对话"锚点，其 `mission_id` 恒为 `None`（跨 mission 存在）。
-    /// 所有 thread-visible 主线 item 语义上都归属这条 thread；下一轮需要让主线
-    /// LLM 走 thread-aware 路径时（例如主对话也累积上下文），会以此 thread_id 为入口。
+    /// 该 thread 由 `ensure_session_mission` 在 session 首次接收 user 输入时
+    /// spawn，与 session 共享生命周期。所有归属主线的 item 都以此 thread_id
+    /// 作为 `source_thread_id` 锚点。
     pub fn orchestrator_thread_for_session(&self, session_id: &SessionId) -> Option<ExecutionThread> {
         let state = self
             .state
@@ -862,11 +861,55 @@ impl SessionStore {
             .thread_registry
             .iter()
             .find(|thread| {
-                &thread.session_id == session_id
-                    && thread.role_id == ORCHESTRATOR_ROLE_ID
-                    && thread.mission_id.is_none()
+                &thread.session_id == session_id && thread.role_id == ORCHESTRATOR_ROLE_ID
             })
             .cloned()
+    }
+
+    /// 确保 session 拥有 mission 并 spawn 对应的 orchestrator thread。
+    ///
+    /// 复用顺序：
+    /// 1. session 已存在 orchestrator thread → 返回其 `(mission_id, thread_id)`
+    /// 2. session runtime sidecar 已绑定 mission（来自 recovery / 前次 dispatch 的 ownership）
+    ///    → 使用该 mission_id，并 spawn orchestrator thread
+    /// 3. 否则调用 `mission_id_factory` 生成新 mission_id 并 spawn orchestrator thread
+    ///
+    /// 此方法是 session 进入"任意工作态"（聊天 / 任务派发 / 补充上下文）的唯一入口，
+    /// 保证"同 session 同 mission 同 orchestrator thread"的不变量。
+    pub fn ensure_session_mission(
+        &self,
+        session_id: &SessionId,
+        now: UtcMillis,
+        mission_id_factory: impl FnOnce() -> MissionId,
+    ) -> (MissionId, ThreadId) {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if let Some(thread) = state.thread_registry.iter().find(|thread| {
+            &thread.session_id == session_id && thread.role_id == ORCHESTRATOR_ROLE_ID
+        }) {
+            return (thread.mission_id.clone(), thread.thread_id.clone());
+        }
+        let existing_mission = state
+            .execution_sidecar_store
+            .runtime_sidecar(session_id)
+            .and_then(|sidecar| sidecar.ownership.mission_id.clone());
+        let mission_id = existing_mission.unwrap_or_else(mission_id_factory);
+        let thread_id = ThreadId::new(format!("thread-orchestrator-{}", session_id));
+        state.thread_registry.push(ExecutionThread {
+            thread_id: thread_id.clone(),
+            session_id: session_id.clone(),
+            mission_id: mission_id.clone(),
+            role_id: ORCHESTRATOR_ROLE_ID.to_string(),
+            worker_instance_id: WorkerId::new(format!("worker-orchestrator-{}", session_id)),
+            status: ExecutionThreadStatus::Idle,
+            created_at: now,
+            last_used_at: now,
+            handled_task_ids: Vec::new(),
+            message_history: Vec::new(),
+        });
+        (mission_id, thread_id)
     }
 
     /// P6b：读取指定 thread 的累积对话历史，用于下一 task 启动时拼接为新 prompt 上文。

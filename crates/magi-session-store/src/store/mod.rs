@@ -6,19 +6,17 @@ mod tests;
 
 use crate::lifecycle::SessionLifecycleObserver;
 use crate::models::{
-    ExecutionThread, ExecutionThreadStatus, NotificationRecord, SessionDurableState,
-    SessionExecutionSidecarStoreState, SessionRecord, SessionSidecarFlushReason,
-    SessionStoreState, TimelineEntry, TimelineEntryKind,
+    NotificationRecord, SessionDurableState, SessionExecutionSidecarStoreState, SessionRecord,
+    SessionSidecarFlushReason, SessionStoreState, TimelineEntry, TimelineEntryKind,
 };
-use magi_core::{
-    DomainError, DomainResult, SessionId, SessionLifecycleStatus, ThreadId, UtcMillis, WorkerId,
-};
+use magi_core::{DomainError, DomainResult, SessionId, SessionLifecycleStatus, UtcMillis};
 use std::sync::{Arc, RwLock};
 
-/// P6c：orchestrator 主线 thread 的稳定 role 标识。
+/// orchestrator 主线 thread 的稳定 role 标识。
 ///
-/// Session 创建即 spawn 一条 `role_id = ORCHESTRATOR_ROLE_ID` 的常驻 thread，
-/// 作为"主线对话"身份锚点。与 worker role 体系正交 —— 这是产品级的主干角色，
+/// Session 首次接收 user 输入时通过 `ensure_session_mission` 创建 mission
+/// 并 spawn 一条 `role_id = ORCHESTRATOR_ROLE_ID` 的常驻 thread，作为"主线
+/// 对话"身份锚点。与 worker role 体系正交 —— 这是产品级的主干角色，
 /// 不会被 `DynamicWorkerCatalog` 识别为可派发 worker。
 pub const ORCHESTRATOR_ROLE_ID: &str = "orchestrator";
 
@@ -189,22 +187,6 @@ impl SessionStore {
             kind: TimelineEntryKind::SessionCreated,
             message: format!("会话已创建: {}", title),
             occurred_at: now,
-        });
-        // P6c：session 创建时即 spawn 一条 orchestrator 主线 thread。
-        // 其 mission_id = None 表示跨 mission 存在，作为"主线对话"身份锚点。
-        // 所有 thread-visible 主线 item 语义上都归属这条 thread，
-        // 未来主线 LLM 也可通过 ExecutionThread.message_history 累积跨 turn 上下文。
-        state.thread_registry.push(ExecutionThread {
-            thread_id: ThreadId::new(format!("thread-orchestrator-{}", session_id)),
-            session_id: session_id.clone(),
-            mission_id: None,
-            role_id: ORCHESTRATOR_ROLE_ID.to_string(),
-            worker_instance_id: WorkerId::new(format!("worker-orchestrator-{}", session_id)),
-            status: ExecutionThreadStatus::Idle,
-            created_at: now,
-            last_used_at: now,
-            handled_task_ids: Vec::new(),
-            message_history: Vec::new(),
         });
         drop(state);
         if let Some(observer) = self.lifecycle_observer() {

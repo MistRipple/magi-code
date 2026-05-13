@@ -88,13 +88,21 @@ pub(crate) fn run_dispatch_submission(
         ApiError::InvalidInput("任务派发必须提供非空 execution_goal".to_string())
     })?;
 
-    let mission_id = MissionId::new(format!("mission-session-action-{}", accepted_at.0));
+    let now = UtcMillis::now();
+    // mission 前移：session 的 orchestrator thread 和 mission 绑定共享 session 生命周期。
+    // 首次调用 `ensure_session_mission` 时创建 mission + spawn orchestrator thread，
+    // 后续所有入口（dispatch / 纯聊天 / 补充上下文）都复用同一 mission_id。
+    let (mission_id, orchestrator_thread_id) = state.session_store.ensure_session_mission(
+        session_id,
+        now,
+        || MissionId::new(format!("mission-session-action-{}", accepted_at.0)),
+    );
+    let orchestrator_thread_id = Some(orchestrator_thread_id);
     let worker_id = WorkerId::new(format!("worker-session-action-{}", accepted_at.0));
 
     let obj_task_id = TaskId::new(format!("task-obj-{}", accepted_at.0));
     let act_task_id = TaskId::new(format!("task-act-{}", accepted_at.0));
 
-    let now = UtcMillis::now();
     let task_goal_text = execution_goal.to_string();
     let objective = make_dispatch_task(
         obj_task_id.clone(),
@@ -306,13 +314,7 @@ pub(crate) fn run_dispatch_submission(
     } else {
         dispatch_task_ids.clone()
     };
-    // P6c：主线 orchestrator turn item 的身份锚点。session 创建时已 spawn 常驻
-    // orchestrator thread（见 SessionStore::create_session_for_workspace），此处
-    // 查询其 thread_id 并贴到所有 thread-visible orchestrator item 上。
-    let orchestrator_thread_id = state
-        .session_store
-        .orchestrator_thread_for_session(&request.session_id)
-        .map(|thread| thread.thread_id);
+    // orchestrator_thread_id 已由开头 ensure_session_mission 返回，直接复用。
     let mut current_turn = ActiveExecutionTurn {
         turn_id: format!("turn-session-action-{}", accepted_at.0),
         turn_seq: accepted_at.0,
@@ -1827,7 +1829,7 @@ fn ensure_thread_for_role(
     let new_thread = ExecutionThread {
         thread_id: ThreadId::new(format!("thread-{role_id}-{}", now.0)),
         session_id: session_id.clone(),
-        mission_id: Some(mission_id.clone()),
+        mission_id: mission_id.clone(),
         role_id: role_id.to_string(),
         worker_instance_id: worker_instance_id.clone(),
         status: ExecutionThreadStatus::Active,
@@ -2404,9 +2406,10 @@ mod tests {
             matches!(result, Err(ApiError::InvalidInput(message)) if message.contains("execution_goal")),
             "深度任务空 execution_goal 必须直接拒绝"
         );
-        let mission_id = MissionId::new(format!("mission-session-action-{}", accepted_at.0));
         assert!(
-            task_store.get_tasks_by_mission(&mission_id).is_empty(),
+            task_store
+                .get_task(&TaskId::new(format!("task-obj-{}", accepted_at.0)))
+                .is_none(),
             "拒绝的深度任务不能留下半截任务图"
         );
     }

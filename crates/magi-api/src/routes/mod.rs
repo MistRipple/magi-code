@@ -1926,7 +1926,9 @@ mod tests {
             .as_u64()
             .expect("accepted_at should serialize as integer");
         let first_extraction_id = format!("extract-session-action-{first_accepted_at}");
-        let first_mission_id = format!("mission-session-action-{first_accepted_at}");
+        // session 一生一 mission：mission_id 由首次入口的 accepted_at 决定，
+        // 该 session 之后所有 dispatch 复用同一 mission_id。
+        let session_mission_id = format!("mission-session-action-{first_accepted_at}");
         let first_root_task_id = TaskId::new(
             first_body["rootTaskId"]
                 .as_str()
@@ -1955,7 +1957,7 @@ mod tests {
                     .details
                     .execution_groups
                     .iter()
-                    .find(|entry| entry.mission_id == first_mission_id);
+                    .find(|entry| entry.mission_id == session_mission_id);
                 root_completed && action_completed && first_mission_entry.is_some()
             },
             "first session action background dispatch should complete and publish context usage",
@@ -1966,7 +1968,7 @@ mod tests {
             .details
             .execution_groups
             .iter()
-            .find(|entry| entry.mission_id == first_mission_id)
+            .find(|entry| entry.mission_id == session_mission_id)
             .expect("first execution group entry should exist");
         let first_root_task = task_store
             .get_task(&first_root_task_id)
@@ -2019,7 +2021,6 @@ mod tests {
         let second_accepted_at = second_body["acceptedAt"]
             .as_u64()
             .expect("accepted_at should serialize as integer");
-        let second_mission_id = format!("mission-session-action-{second_accepted_at}");
         let second_root_task_id = TaskId::new(
             second_body["rootTaskId"]
                 .as_str()
@@ -2044,11 +2045,11 @@ mod tests {
                     .map(|task| task.status == TaskStatus::Completed)
                     .unwrap_or(false);
                 let read_model = state.runtime_read_model_dto();
-                let second_mission_entry = read_model
+                let session_mission_entry = read_model
                     .details
                     .execution_groups
                     .iter()
-                    .find(|entry| entry.mission_id == second_mission_id);
+                    .find(|entry| entry.mission_id == session_mission_id);
                 let extraction_ready = state
                     .execution_pipeline()
                     .expect("execution pipeline should exist")
@@ -2060,19 +2061,20 @@ mod tests {
                 root_completed
                     && action_completed
                     && extraction_ready
-                    && second_mission_entry.is_some()
+                    && session_mission_entry.is_some()
             },
             "second session action background dispatch should complete and reuse prior extraction context",
         )
         .await;
         let read_model = state.runtime_read_model_dto();
-        assert_eq!(read_model.details.execution_groups.len(), 2);
+        // session 一生一 mission：两次派发聚合到同一 execution_group entry。
+        assert_eq!(read_model.details.execution_groups.len(), 1);
         let _mission_entry = read_model
             .details
             .execution_groups
             .iter()
-            .find(|entry| entry.mission_id == second_mission_id)
-            .expect("second execution group entry should exist");
+            .find(|entry| entry.mission_id == session_mission_id)
+            .expect("session execution group entry should exist");
         let second_root_task = task_store
             .get_task(&second_root_task_id)
             .expect("second root task should exist");

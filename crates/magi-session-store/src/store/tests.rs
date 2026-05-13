@@ -2059,7 +2059,7 @@ fn sample_thread(
     ExecutionThread {
         thread_id: ThreadId::new(thread_id),
         session_id: session_id.clone(),
-        mission_id: Some(mission_id.clone()),
+        mission_id: mission_id.clone(),
         role_id: role.to_string(),
         worker_instance_id: WorkerId::new(format!("worker-{role}")),
         status,
