@@ -82,6 +82,11 @@ pub struct ActiveExecutionBranch {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// P6d 概念定位：`ActiveExecutionTurnLane` 是 Thread 在某个 turn 的"派发快照"——
+/// thread 是跨 turn / 跨 task 的稳定身份（见 [`ExecutionThread`]），
+/// lane 是 thread 在当前 turn 中实际承担工作的视图记录。lane.thread_id 必须能回溯到
+/// 同一 mission 下注册过的 ExecutionThread；当 thread_id = None 时仅限 P6 迁移期
+/// 的历史数据，新写入路径都应设置该字段。
 pub struct ActiveExecutionTurnLane {
     pub lane_id: String,
     pub lane_seq: usize,

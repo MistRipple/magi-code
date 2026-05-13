@@ -368,6 +368,10 @@ function buildMessage(
       ...(workerId ? { workerId } : {}),
       ...(roleId ? { roleId } : {}),
       ...(workerTabId ? { workerTabId } : {}),
+      // P6d：把 canonical 层的 sourceThreadId 透传到消息 metadata，供后续多 thread 视图
+      // 使用（单 thread resume、thread tree、跨 worker 通信追踪等）。
+      // 现阶段 UI 路由仍沿用 threadVisible / workerTabIds，thread_id 仅作为增量身份信号。
+      ...(item.sourceThreadId ? { sourceThreadId: item.sourceThreadId } : {}),
       taskId: item.worker?.taskId,
       toolCallId: item.tool?.callId,
       toolName: item.tool?.name,
