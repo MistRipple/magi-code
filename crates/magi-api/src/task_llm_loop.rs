@@ -82,6 +82,9 @@ struct TaskTurnVisibility {
     worker_id: Option<magi_core::WorkerId>,
     lane_id: Option<String>,
     lane_seq: Option<usize>,
+    /// P6c：worker 执行归属的 thread。所有 worker-visible 的 turn item 都带上此 id，
+    /// 让 canonical projection 可按 thread 路由。
+    thread_id: Option<ThreadId>,
 }
 
 fn task_turn_visibility(
@@ -90,6 +93,7 @@ fn task_turn_visibility(
     worker_lane_id: Option<&str>,
     worker_lane_seq: Option<usize>,
     worker_id: Option<&magi_core::WorkerId>,
+    thread_id: Option<&ThreadId>,
     primary_worker_sidechain: bool,
 ) -> TaskTurnVisibility {
     let role_id = resolve_task_role(task)
@@ -108,6 +112,7 @@ fn task_turn_visibility(
         worker_id: worker_id.cloned(),
         lane_id,
         lane_seq: worker_lane_seq,
+        thread_id: thread_id.cloned(),
     }
 }
 
@@ -119,6 +124,11 @@ fn apply_task_turn_visibility(
     item.task_id = Some(task.task_id.clone());
     item.thread_visible = visibility.thread_visible;
     item.worker_visible = visibility.worker_visible;
+    // P6c：worker 执行产生的 item 归属到该 task 的 thread（若 ensure 过），
+    // 让前端可以把"同一 worker thread 的所有 item"直接按 thread_id 路由。
+    if let Some(thread) = visibility.thread_id.as_ref() {
+        item.source_thread_id = Some(thread.clone());
+    }
     if visibility.worker_visible {
         item.lane_id = visibility.lane_id.clone();
         item.lane_seq = visibility.lane_seq;
@@ -324,6 +334,7 @@ pub(crate) fn run_task_llm_loop(
         worker_lane_id,
         worker_lane_seq,
         worker_id,
+        thread_id,
         primary_worker_sidechain,
     );
 
@@ -2782,7 +2793,7 @@ mod tests {
     fn task_turn_visibility_does_not_promote_primary_role_to_worker_lane() {
         let task = make_task_loop_test_task("task-primary-role-only");
 
-        let visibility = task_turn_visibility(&task, true, None, None, None, false);
+        let visibility = task_turn_visibility(&task, true, None, None, None, None, false);
 
         assert!(visibility.thread_visible);
         assert!(!visibility.worker_visible);
@@ -2795,7 +2806,7 @@ mod tests {
     fn primary_task_worker_details_move_to_sidechain() {
         let task = make_task_loop_test_task("task-primary-deep-sidechain");
         let worker_id = WorkerId::new("worker-primary-deep-sidechain");
-        let visibility = task_turn_visibility(&task, true, None, None, Some(&worker_id), true);
+        let visibility = task_turn_visibility(&task, true, None, None, Some(&worker_id), None, true);
         let mut tool_item = session_turn_item(
             "tool_call_started",
             "running",
@@ -2840,6 +2851,7 @@ mod tests {
             Some("lane-task-worker-lane-order"),
             Some(3),
             Some(&worker_id),
+            None,
             false,
         );
         let mut item = session_turn_item(
@@ -2901,6 +2913,7 @@ mod tests {
             None,
             None,
             Some(&WorkerId::new("worker-final-root-running")),
+            None,
             false,
         );
 

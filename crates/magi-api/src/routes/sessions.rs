@@ -811,6 +811,7 @@ fn build_user_message_turn_item(
             timeline_entry_id: Some(entry_id.to_string()),
             thread_visible,
             worker_visible: false,
+            source_thread_id: None,
         },
     )
 }
@@ -850,6 +851,7 @@ fn build_assistant_placeholder_turn_item(
             timeline_entry_id: None,
             thread_visible: true,
             worker_visible: false,
+            source_thread_id: None,
         },
     )
 }

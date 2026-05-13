@@ -1,4 +1,5 @@
 use super::SessionStore;
+use super::ORCHESTRATOR_ROLE_ID;
 use crate::models::{
     ActiveExecutionChain, ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalToolCall,
     CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnItemStatus,
@@ -279,6 +280,7 @@ fn current_turn_item_to_canonical_item(
         blocks: Vec::new(),
         tool,
         worker: current_turn_item_to_canonical_worker(item),
+        source_thread_id: item.source_thread_id.clone(),
         visibility: CanonicalTurnVisibility {
             thread_visible: item.thread_visible,
             worker_visible: item.worker_visible,
@@ -843,6 +845,28 @@ impl SessionStore {
             .filter(|thread| &thread.session_id == session_id)
             .cloned()
             .collect()
+    }
+
+    /// P6c：查找 session 的 orchestrator 主线 thread。
+    ///
+    /// Session 创建时会 spawn 一条 `role_id = ORCHESTRATOR_ROLE_ID` 的常驻 thread
+    /// 作为"主线对话"锚点，其 `mission_id` 恒为 `None`（跨 mission 存在）。
+    /// 所有 thread-visible 主线 item 语义上都归属这条 thread；下一轮需要让主线
+    /// LLM 走 thread-aware 路径时（例如主对话也累积上下文），会以此 thread_id 为入口。
+    pub fn orchestrator_thread_for_session(&self, session_id: &SessionId) -> Option<ExecutionThread> {
+        let state = self
+            .state
+            .read()
+            .expect("session state read lock poisoned");
+        state
+            .thread_registry
+            .iter()
+            .find(|thread| {
+                &thread.session_id == session_id
+                    && thread.role_id == ORCHESTRATOR_ROLE_ID
+                    && thread.mission_id.is_none()
+            })
+            .cloned()
     }
 
     /// P6b：读取指定 thread 的累积对话历史，用于下一 task 启动时拼接为新 prompt 上文。

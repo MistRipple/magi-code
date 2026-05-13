@@ -57,6 +57,12 @@ export interface CanonicalTurnItem {
   blocks?: unknown[];
   tool?: CanonicalToolCall;
   worker?: CanonicalWorkerRef;
+  /**
+   * P6c：item 归属的 thread_id。orchestrator 主线 item 对应 session 级
+   * orchestrator thread，worker sidechain item 对应各 worker thread。
+   * 可选以兼容 P6 迁移期的历史数据。
+   */
+  sourceThreadId?: string;
   visibility: CanonicalTurnVisibility;
   metadata?: Record<string, unknown>;
 }
@@ -253,6 +259,7 @@ export function normalizeCanonicalTurnItem(value: unknown): CanonicalTurnItem | 
     ...(blocks ? { blocks } : {}),
     ...(normalizeCanonicalToolCall(record.tool) ? { tool: normalizeCanonicalToolCall(record.tool) } : {}),
     ...(normalizeCanonicalWorkerRef(record.worker) ? { worker: normalizeCanonicalWorkerRef(record.worker) } : {}),
+    ...(readString(record, 'sourceThreadId', 'source_thread_id') ? { sourceThreadId: readString(record, 'sourceThreadId', 'source_thread_id') } : {}),
     visibility: normalizeCanonicalVisibility(record.visibility),
     ...(metadata ? { metadata } : {}),
   };

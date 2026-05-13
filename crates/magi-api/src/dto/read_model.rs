@@ -1542,6 +1542,7 @@ mod tests {
                         timeline_entry_id: None,
                         thread_visible: true,
                         worker_visible: false,
+                            source_thread_id: None,
                     }],
                     worker_lanes: vec![magi_session_store::ActiveExecutionTurnLane {
                         lane_id: "lane-branch".to_string(),
@@ -1617,6 +1618,7 @@ mod tests {
                             timeline_entry_id: None,
                             thread_visible: true,
                             worker_visible: false,
+                            source_thread_id: None,
                         }],
                         worker_lanes: vec![magi_session_store::ActiveExecutionTurnLane {
                             lane_id: "lane-branch".to_string(),

@@ -505,6 +505,7 @@ fn runtime_sidecar_flush_persists_canonical_turns_to_session_durable_state() {
                     timeline_entry_id: None,
                     thread_visible: true,
                     worker_visible: false,
+            source_thread_id: None,
                 }],
                 worker_lanes: Vec::new(),
             },

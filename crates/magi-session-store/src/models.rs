@@ -274,6 +274,10 @@ pub struct CanonicalTurnItem {
     pub tool: Option<CanonicalToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<CanonicalWorkerRef>,
+    /// P6c：item 归属的 thread_id。orchestrator 主线 item 为 session 级 orchestrator thread，
+    /// worker sidechain item 为对应 worker thread。前端 projection 用它作为单一路由键。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_thread_id: Option<ThreadId>,
     #[serde(default)]
     pub visibility: CanonicalTurnVisibility,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -447,6 +451,10 @@ pub struct ActiveExecutionTurnItem {
     pub thread_visible: bool,
     #[serde(default)]
     pub worker_visible: bool,
+    /// P6c：item 归属的 thread。orchestrator 主线 item 为 session 级 orchestrator thread；
+    /// worker sidechain item 为对应 worker thread。为 None 仅限于 P6 迁移期的历史数据。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_thread_id: Option<ThreadId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -983,7 +991,10 @@ pub enum ExecutionThreadStatus {
 pub struct ExecutionThread {
     pub thread_id: ThreadId,
     pub session_id: SessionId,
-    pub mission_id: MissionId,
+    /// P6c：session 级 thread（如 orchestrator 主线 thread）在 mission 未绑定时
+    /// 可以没有 mission。worker thread 在 ensure_thread_for_role 时总会带上。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<MissionId>,
     pub role_id: String,
     pub worker_instance_id: WorkerId,
     pub status: ExecutionThreadStatus,

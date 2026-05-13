@@ -305,6 +305,7 @@ fn to_canonical_turn_item(
         blocks: Vec::new(),
         tool,
         worker: to_canonical_worker_ref(item),
+        source_thread_id: item.source_thread_id.clone(),
         visibility: CanonicalTurnVisibility {
             thread_visible: item.thread_visible,
             worker_visible: item.worker_visible,
@@ -379,6 +380,10 @@ pub(crate) fn session_turn_item(
         timeline_entry_id: None,
         thread_visible: true,
         worker_visible: false,
+        // P6c：factory 默认不带 thread_id。调用方（dispatch/worker/orchestrator 路径）
+        // 根据自身上下文填入 —— orchestrator 主线 item 填 session 级 orchestrator thread，
+        // worker sidechain item 填对应 worker thread（由 apply_task_*_visibility 赋值）。
+        source_thread_id: None,
     }
 }
 

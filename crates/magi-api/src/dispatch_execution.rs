@@ -306,6 +306,13 @@ pub(crate) fn run_dispatch_submission(
     } else {
         dispatch_task_ids.clone()
     };
+    // P6c：主线 orchestrator turn item 的身份锚点。session 创建时已 spawn 常驻
+    // orchestrator thread（见 SessionStore::create_session_for_workspace），此处
+    // 查询其 thread_id 并贴到所有 thread-visible orchestrator item 上。
+    let orchestrator_thread_id = state
+        .session_store
+        .orchestrator_thread_for_session(&request.session_id)
+        .map(|thread| thread.thread_id);
     let mut current_turn = ActiveExecutionTurn {
         turn_id: format!("turn-session-action-{}", accepted_at.0),
         turn_seq: accepted_at.0,
@@ -339,6 +346,7 @@ pub(crate) fn run_dispatch_submission(
                 timeline_entry_id: Some(entry_id.to_string()),
                 thread_visible: true,
                 worker_visible: false,
+            source_thread_id: None,
             },
             ActiveExecutionTurnItem {
                 item_id: format!("turn-item-phase-{}", accepted_at.0),
@@ -368,6 +376,8 @@ pub(crate) fn run_dispatch_submission(
                 timeline_entry_id: None,
                 thread_visible: true,
                 worker_visible: false,
+                // P6c：orchestrator 的主线 phase item 归属 session 级 orchestrator thread。
+                source_thread_id: orchestrator_thread_id.clone(),
             },
         ],
         worker_lanes: visible_lane_task_ids
@@ -413,6 +423,13 @@ pub(crate) fn run_dispatch_submission(
             .find(|lane| lane.task_id == *sub_task_id)
             .map(|lane| lane.title.clone())
             .unwrap_or_else(|| sub_task_id.to_string());
+        // P6c：worker_spawned item 归属到该 worker 自身 thread（在 worker_lanes 构造时
+        // 已 ensure），drawer 打开时能作为该 worker sidechain 的起点事件被检索到。
+        let worker_thread_id = current_turn
+            .worker_lanes
+            .iter()
+            .find(|lane| lane.task_id == *sub_task_id)
+            .and_then(|lane| lane.thread_id.clone());
         current_turn.items.push(ActiveExecutionTurnItem {
             item_id: format!("turn-item-worker-spawned-{}-{}", accepted_at.0, index),
             item_seq: index + 3,
@@ -438,6 +455,7 @@ pub(crate) fn run_dispatch_submission(
             timeline_entry_id: None,
             thread_visible: false,
             worker_visible: true,
+            source_thread_id: worker_thread_id.clone(),
         });
     }
     let lane_count = current_turn.worker_lanes.len();
@@ -469,6 +487,8 @@ pub(crate) fn run_dispatch_submission(
             timeline_entry_id: None,
             thread_visible: true,
             worker_visible: false,
+            // P6c：orchestrator 任务分配 phase item 归属主线 orchestrator thread。
+            source_thread_id: orchestrator_thread_id.clone(),
         });
     }
     current_turn.normalize();
@@ -1296,6 +1316,8 @@ fn update_session_execution_branches(
                 timeline_entry_id: None,
                 thread_visible: false,
                 worker_visible: true,
+                // P6c：append_branches 时的 worker_spawned item 归属到 lane 自身 worker thread。
+                source_thread_id: lane.thread_id.clone(),
             });
             next_item_seq = next_item_seq.saturating_add(1);
         }
@@ -1805,7 +1827,7 @@ fn ensure_thread_for_role(
     let new_thread = ExecutionThread {
         thread_id: ThreadId::new(format!("thread-{role_id}-{}", now.0)),
         session_id: session_id.clone(),
-        mission_id: mission_id.clone(),
+        mission_id: Some(mission_id.clone()),
         role_id: role_id.to_string(),
         worker_instance_id: worker_instance_id.clone(),
         status: ExecutionThreadStatus::Active,
