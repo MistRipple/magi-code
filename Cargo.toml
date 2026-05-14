@@ -20,6 +20,7 @@ members = [
   "crates/magi-bridge-client",
   "crates/magi-usage-authority",
   "crates/magi-agent",
+  "crates/magi-agent-role",
   "crates/magi-snapshot",
 ]
 

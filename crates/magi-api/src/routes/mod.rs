@@ -447,7 +447,8 @@ mod tests {
             .with_workspace_registry(state.workspace_registry.clone())
             .with_tool_registry(tool_registry_for_dispatcher)
             .with_conversation_registry(state.conversation_registry.clone())
-            .with_stream_fanout(state.stream_fanout.clone()),
+            .with_stream_fanout(state.stream_fanout.clone())
+            .with_agent_role_registry(state.agent_role_registry.clone()),
         );
         let runner_manager = RunnerManager::with_dispatcher_and_worker_catalog(
             task_store,

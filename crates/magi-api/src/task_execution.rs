@@ -869,6 +869,8 @@ pub struct LlmTaskDispatcher {
     conversation_registry: Option<Arc<ConversationRegistry>>,
     /// Task System v2：统一 StreamEvent 派生通道。
     stream_fanout: Option<Arc<StreamFanOut>>,
+    /// Task System v2：AgentRole 注册表（来自 ApiState，注入到 task_llm_loop）。
+    agent_role_registry: Option<Arc<magi_agent_role::AgentRoleRegistry>>,
     /// 强制同步执行 dispatch，用于普通模式的同步 for 循环（设计 §1.3）。
     force_sync_dispatch: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -912,6 +914,7 @@ impl LlmTaskDispatcher {
             snapshot_manager: None,
             conversation_registry: None,
             stream_fanout: None,
+            agent_role_registry: None,
             force_sync_dispatch: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -984,6 +987,14 @@ impl LlmTaskDispatcher {
 
     pub fn with_stream_fanout(mut self, fanout: Arc<StreamFanOut>) -> Self {
         self.stream_fanout = Some(fanout);
+        self
+    }
+
+    pub fn with_agent_role_registry(
+        mut self,
+        registry: Arc<magi_agent_role::AgentRoleRegistry>,
+    ) -> Self {
+        self.agent_role_registry = Some(registry);
         self
     }
 
@@ -1562,6 +1573,10 @@ impl LlmTaskDispatcher {
             .stream_fanout
             .as_ref()
             .expect("LlmTaskDispatcher 缺少 StreamFanOut，无法发布 v2 流派生事件");
+        let agent_role_registry = self
+            .agent_role_registry
+            .as_ref()
+            .expect("LlmTaskDispatcher 缺少 AgentRoleRegistry，无法解析 task→role");
         crate::task_llm_loop::run_task_llm_loop(crate::task_llm_loop::TaskLlmLoopRequest {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
@@ -1572,6 +1587,7 @@ impl LlmTaskDispatcher {
             task_store: self.pipeline.execution_runtime.task_store(),
             conversation_registry: conversation_registry.as_ref(),
             stream_fanout: stream_fanout.as_ref(),
+            agent_role_registry: agent_role_registry.as_ref(),
             task,
             task_id,
             lease_id,

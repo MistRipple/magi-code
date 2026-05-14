@@ -925,12 +925,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "magi-agent-role"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "magi-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "magi-api"
 version = "0.1.0"
 dependencies = [
  "axum",
  "dirs",
  "futures-util",
+ "magi-agent-role",
  "magi-bridge-client",
  "magi-context-runtime",
  "magi-conversation-runtime",
@@ -1080,6 +1093,7 @@ dependencies = [
 name = "magi-orchestrator"
 version = "0.1.0"
 dependencies = [
+ "magi-agent-role",
  "magi-bridge-client",
  "magi-context-runtime",
  "magi-core",

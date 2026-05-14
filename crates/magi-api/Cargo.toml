@@ -13,6 +13,7 @@ tokio-stream.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
 magi-core = { path = "../magi-core" }
+magi-agent-role = { path = "../magi-agent-role" }
 magi-bridge-client = { path = "../magi-bridge-client" }
 magi-context-runtime = { path = "../magi-context-runtime" }
 magi-conversation-runtime = { path = "../magi-conversation-runtime" }

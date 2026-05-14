@@ -1,5 +1,6 @@
 use crate::task_store::TaskStore;
 use crate::task_worker_catalog::resolve_task_role;
+use magi_agent_role::AgentRoleRegistry;
 use magi_core::{
     AssignmentLease, DecisionOption, DecisionTaskPayload, EventId, LeaseId, PolicyDispatchDecision,
     Task, TaskId, TaskKind, TaskResultKind, TaskStatus, UtcMillis, WorkerId,
@@ -488,6 +489,8 @@ pub struct TaskRunner {
     event_bus: Option<Arc<InMemoryEventBus>>,
     /// Checkpoint 信号：当 cycle 中有任务到达终态时置为 true，供外部消费。
     checkpoint_signal: AtomicBool,
+    /// Task System v2：解析 task → role 的角色注册表。
+    agent_role_registry: AgentRoleRegistry,
 }
 
 impl TaskRunner {
@@ -503,7 +506,14 @@ impl TaskRunner {
             result_receiver: Arc::new(NoOpResultReceiver),
             event_bus: None,
             checkpoint_signal: AtomicBool::new(false),
+            agent_role_registry: AgentRoleRegistry::load_default(),
         }
+    }
+
+    /// Override the registry (tests + 自定义 catalog 用)。
+    pub fn with_agent_role_registry(mut self, registry: AgentRoleRegistry) -> Self {
+        self.agent_role_registry = registry;
+        self
     }
 
     /// Create a runner wired to real dispatch and result-collection
@@ -521,6 +531,7 @@ impl TaskRunner {
             result_receiver,
             event_bus: None,
             checkpoint_signal: AtomicBool::new(false),
+            agent_role_registry: AgentRoleRegistry::load_default(),
         }
     }
 
@@ -701,7 +712,7 @@ impl TaskRunner {
                 }
             }
 
-            let Some(required_role) = resolve_task_role(task) else {
+            let Some(required_role) = resolve_task_role(task, &self.agent_role_registry) else {
                 unmatched_ids.push(task.task_id.clone());
                 continue;
             };

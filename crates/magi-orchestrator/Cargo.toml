@@ -7,6 +7,7 @@ edition.workspace = true
 serde.workspace = true
 magi-event-bus = { path = "../magi-event-bus" }
 magi-core = { path = "../magi-core" }
+magi-agent-role = { path = "../magi-agent-role" }
 magi-worker-runtime = { path = "../magi-worker-runtime" }
 magi-tool-runtime = { path = "../magi-tool-runtime" }
 magi-skill-runtime = { path = "../magi-skill-runtime" }

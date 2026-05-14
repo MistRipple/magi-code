@@ -62,6 +62,9 @@ pub(crate) struct TaskLlmLoopRequest<'a> {
     /// Task System v2 — 统一流派生通道。模型 token / 工具事件 / 系统信号在这里
     /// 扇出给下游订阅者（writeback / projection / 未来 UI bridge）。
     pub stream_fanout: &'a StreamFanOut,
+    /// Task System v2 — AgentRole 注册表。task_turn_visibility 解析 role_id 时
+    /// 必须走该注册表，不再依赖硬编码的 kind→role 默认 mapping。
+    pub agent_role_registry: &'a magi_agent_role::AgentRoleRegistry,
     pub task: &'a magi_core::Task,
     pub task_id: &'a TaskId,
     pub lease_id: &'a LeaseId,
@@ -148,6 +151,7 @@ fn task_turn_visibility(
     thread_id: &ThreadId,
     orchestrator_thread_id: &ThreadId,
     primary_worker_sidechain: bool,
+    agent_role_registry: &magi_agent_role::AgentRoleRegistry,
 ) -> TaskTurnVisibility {
     let lane_id = worker_lane_id
         .map(str::trim)
@@ -155,7 +159,7 @@ fn task_turn_visibility(
         .map(ToOwned::to_owned);
     // 仅当存在 lane + worker_id 时该 task 才属于 worker drawer；否则保留 Mainline。
     if let (Some(lane_id), Some(worker_id)) = (lane_id, worker_id) {
-        let role_id = resolve_task_role(task)
+        let role_id = resolve_task_role(task, agent_role_registry)
             .map(str::trim)
             .filter(|role| !role.is_empty())
             .map(ToOwned::to_owned)
@@ -378,6 +382,7 @@ fn run_task_llm_loop_inner(
         task_store,
         conversation_registry: _,
         stream_fanout,
+        agent_role_registry,
         task,
         task_id,
         lease_id,
@@ -468,6 +473,7 @@ fn run_task_llm_loop_inner(
         thread_id,
         orchestrator_thread_id,
         primary_worker_sidechain,
+        agent_role_registry,
     );
 
     if let Some(final_content) = deterministic_task_final_content(task, task_store) {
@@ -2787,6 +2793,7 @@ mod tests {
             task_store: &task_store,
             conversation_registry: &ConversationRegistry::new(),
             stream_fanout: &StreamFanOut::new(),
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -2898,6 +2905,7 @@ mod tests {
             task_store: &task_store,
             conversation_registry: &ConversationRegistry::new(),
             stream_fanout: &StreamFanOut::new(),
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -2956,6 +2964,7 @@ mod tests {
         let thread_id = ThreadId::new("thread-primary-role-only");
         let orchestrator_thread_id = thread_id.clone();
 
+        let registry = magi_agent_role::AgentRoleRegistry::load_default();
         let visibility = task_turn_visibility(
             &task,
             None,
@@ -2964,6 +2973,7 @@ mod tests {
             &thread_id,
             &orchestrator_thread_id,
             false,
+            &registry,
         );
 
         // 没有 lane_id + worker_id 配对 → 必须落在 Mainline 分支。
@@ -2979,6 +2989,7 @@ mod tests {
         let lane_id = "lane-primary-deep-sidechain";
         let worker_thread_id = ThreadId::new("thread-worker-primary-deep-sidechain");
         let orchestrator_thread_id = ThreadId::new("thread-orch-primary-deep-sidechain");
+        let registry = magi_agent_role::AgentRoleRegistry::load_default();
         let visibility = task_turn_visibility(
             &task,
             Some(lane_id),
@@ -2987,6 +2998,7 @@ mod tests {
             &worker_thread_id,
             &orchestrator_thread_id,
             true,
+            &registry,
         );
         let mut tool_item = session_turn_item(
             "tool_call_started",
@@ -3033,6 +3045,7 @@ mod tests {
         let lane_id = "lane-task-worker-lane-order";
         let worker_thread_id = ThreadId::new("thread-worker-worker-lane-order");
         let orchestrator_thread_id = ThreadId::new("thread-orch-worker-lane-order");
+        let registry = magi_agent_role::AgentRoleRegistry::load_default();
         let visibility = task_turn_visibility(
             &task,
             Some(lane_id),
@@ -3041,6 +3054,7 @@ mod tests {
             &worker_thread_id,
             &orchestrator_thread_id,
             false,
+            &registry,
         );
         let mut item = session_turn_item(
             "assistant_final",
@@ -3100,6 +3114,7 @@ mod tests {
         // 不传 lane_id / worker_id，`task_turn_visibility` 会返回 Mainline，
         // 后续 append_task_final_turn_item 的 `is_mainline()` 分支才会被覆盖到。
         let orchestrator_thread_id = ThreadId::new("thread-orch-final-root-running");
+        let registry = magi_agent_role::AgentRoleRegistry::load_default();
         let visibility = task_turn_visibility(
             &task,
             None,
@@ -3108,6 +3123,7 @@ mod tests {
             &orchestrator_thread_id,
             &orchestrator_thread_id,
             false,
+            &registry,
         );
 
         append_task_final_turn_item(
@@ -3201,6 +3217,7 @@ mod tests {
             task_store: &task_store,
             conversation_registry: &ConversationRegistry::new(),
             stream_fanout: &StreamFanOut::new(),
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,
@@ -3394,6 +3411,7 @@ mod tests {
             task_store: &task_store,
             conversation_registry: &ConversationRegistry::new(),
             stream_fanout: &StreamFanOut::new(),
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             task: &task,
             task_id: &task.task_id,
             lease_id: &lease.lease_id,

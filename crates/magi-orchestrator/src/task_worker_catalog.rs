@@ -1,8 +1,11 @@
 use crate::task_runner::WorkerInfo;
+use magi_agent_role::AgentRoleRegistry;
 use magi_core::{Task, TaskKind, WorkerId};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+/// Task System v2：role / prompt 不再硬编码在本文件，全部经 `AgentRoleRegistry`
+/// 解析；本模块只保留 kind ↔ 默认 role 的路由策略以及动态目录的注册/查询。
 pub fn default_task_role_for_kind(kind: TaskKind) -> Option<&'static str> {
     match kind {
         TaskKind::Objective | TaskKind::Phase => Some("architect"),
@@ -13,87 +16,59 @@ pub fn default_task_role_for_kind(kind: TaskKind) -> Option<&'static str> {
     }
 }
 
-pub fn resolve_task_role(task: &Task) -> Option<&str> {
+pub fn resolve_task_role<'a>(task: &'a Task, registry: &AgentRoleRegistry) -> Option<&'a str> {
     if let Some(binding) = task.executor_binding.as_ref() {
         let role = binding.target_role.trim();
-        if !role.is_empty() && role_supports_task_kind(role, task.kind) {
+        if !role.is_empty() && registry.role_supports_task_kind(role, task.kind) {
             return Some(role);
         }
     }
     default_task_role_for_kind(task.kind)
 }
 
-pub fn supported_kinds_for_role(role: &str) -> Vec<TaskKind> {
-    match role {
-        "architect" => vec![TaskKind::Objective, TaskKind::Phase, TaskKind::WorkPackage],
-        "frontend-dev" | "backend-dev" | "integration-dev" | "data-engineer"
-        | "devops-engineer" | "security-analyst" | "doc-writer" => {
-            vec![TaskKind::WorkPackage, TaskKind::Action]
-        }
-        "reviewer" | "test-engineer" => vec![TaskKind::Validation],
-        "debugger" => vec![TaskKind::Repair, TaskKind::Action],
-        _ => Vec::new(),
-    }
+pub fn supported_kinds_for_role(registry: &AgentRoleRegistry, role: &str) -> Vec<TaskKind> {
+    registry.supported_task_kinds(role)
 }
 
-pub fn role_supports_task_kind(role: &str, kind: TaskKind) -> bool {
-    supported_kinds_for_role(role).contains(&kind)
+pub fn role_supports_task_kind(registry: &AgentRoleRegistry, role: &str, kind: TaskKind) -> bool {
+    registry.role_supports_task_kind(role, kind)
 }
 
-pub fn compatible_task_role_for_kind(kind: TaskKind, candidate: Option<&str>) -> Option<String> {
+pub fn compatible_task_role_for_kind(
+    registry: &AgentRoleRegistry,
+    kind: TaskKind,
+    candidate: Option<&str>,
+) -> Option<String> {
     if let Some(role) = candidate.map(str::trim).filter(|role| !role.is_empty()) {
-        if role_supports_task_kind(role, kind) {
+        if registry.role_supports_task_kind(role, kind) {
             return Some(role.to_string());
         }
     }
     default_task_role_for_kind(kind).map(ToOwned::to_owned)
 }
 
-pub fn build_worker_info_for_role(role: &str) -> Option<WorkerInfo> {
-    let supported_kinds = supported_kinds_for_role(role);
+pub fn build_worker_info_for_role(
+    registry: &AgentRoleRegistry,
+    role_id: &str,
+) -> Option<WorkerInfo> {
+    let role = registry.get(role_id)?;
+    let supported_kinds = role.supported_task_kinds();
     if supported_kinds.is_empty() {
         return None;
     }
-    let system_prompt_template = match role {
-        "architect" => Some(
-            "你是系统架构师。你的职责是理解高层目标，将其分解为可执行的 Phase 和 WorkPackage。\
-重点关注模块边界、接口契约和依赖关系。输出必须包含清晰的任务分解和验收标准。\
-你同时是面向用户的唯一代言人：如果执行过程中的 worker 遇到阻碍性问题需要用户决策，\
-你必须先收集其上下文并改写为面向用户的明确询问，再在主线向用户请求决策，不得让 worker \
-绕过你直接与用户互动。".to_string(),
-        ),
-        "integration-dev" => Some(
-            "你是全栈集成开发工程师。你的职责是执行具体的 WorkPackage 和 Action，编写代码、修复缺陷、运行测试。\
-遵循项目编码规范，确保代码可编译、测试通过。输出必须包含修改的文件列表和关键代码片段。".to_string(),
-        ),
-        "reviewer" => Some(
-            "你是代码审查与验证工程师。你的职责是验证任务输出是否符合验收标准，检查代码质量、安全性和可维护性。\
-对发现的问题给出明确的通过/不通过结论及修复建议。".to_string(),
-        ),
-        "debugger" => Some(
-            "你是调试与修复工程师。你的职责是分析失败原因，定位根因，实施修复并验证。\
-优先最小化改动范围，避免引入回归。输出必须包含根因分析和修复方案。".to_string(),
-        ),
-        "frontend-dev" => Some(
-            "你是前端开发工程师。你的职责是实现用户界面、交互逻辑和前端状态管理。\
-确保响应式设计、可访问性和性能。输出必须包含组件结构和关键样式/逻辑代码。".to_string(),
-        ),
-        "backend-dev" => Some(
-            "你是后端开发工程师。你的职责是实现 API、业务逻辑、数据访问层和基础设施代码。\
-确保接口稳定、数据一致性和安全性。输出必须包含接口定义和关键业务逻辑代码。".to_string(),
-        ),
-        _ => None,
-    };
     Some(WorkerInfo {
-        worker_id: WorkerId::new(format!("task-worker-{role}")),
-        role: role.to_string(),
+        worker_id: WorkerId::new(format!("task-worker-{role_id}")),
+        role: role_id.to_string(),
         supported_kinds,
-        parallelism_limit: None,
-        system_prompt_template,
+        parallelism_limit: role.parallelism_limit,
+        system_prompt_template: Some(role.system_prompt.clone()),
     })
 }
 
-pub fn build_worker_catalog_for_roles<I, S>(roles: I) -> Vec<WorkerInfo>
+pub fn build_worker_catalog_for_roles<I, S>(
+    registry: &AgentRoleRegistry,
+    roles: I,
+) -> Vec<WorkerInfo>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -107,7 +82,7 @@ where
         {
             continue;
         }
-        if let Some(worker) = build_worker_info_for_role(role) {
+        if let Some(worker) = build_worker_info_for_role(registry, role) {
             workers.push(worker);
         }
     }
@@ -129,18 +104,12 @@ impl DynamicWorkerCatalog {
         }
     }
 
-    pub fn with_default_roles() -> Self {
+    /// 由注册表中所有 role 一次性填充。v2 启动路径调用 `AgentRoleRegistry::load_default()`
+    /// 拿到注册表后再传入这里，DynamicWorkerCatalog 自此不再持有硬编码 role 列表。
+    pub fn with_registry(registry: &AgentRoleRegistry) -> Self {
         let catalog = Self::new();
-        let default_roles = [
-            "architect",
-            "integration-dev",
-            "frontend-dev",
-            "backend-dev",
-            "reviewer",
-            "debugger",
-        ];
-        for role in default_roles {
-            if let Some(worker) = build_worker_info_for_role(role) {
+        for role in registry.all() {
+            if let Some(worker) = build_worker_info_for_role(registry, &role.id) {
                 catalog.register(worker);
             }
         }
@@ -188,8 +157,8 @@ impl DynamicWorkerCatalog {
             .collect()
     }
 
-    pub fn find_for_task(&self, task: &Task) -> Vec<WorkerInfo> {
-        let required_role = resolve_task_role(task);
+    pub fn find_for_task(&self, task: &Task, registry: &AgentRoleRegistry) -> Vec<WorkerInfo> {
+        let required_role = resolve_task_role(task, registry);
         let workers = self.workers.read().expect("catalog read lock poisoned");
         workers
             .values()
@@ -218,13 +187,17 @@ impl DynamicWorkerCatalog {
 
 impl Default for DynamicWorkerCatalog {
     fn default() -> Self {
-        Self::with_default_roles()
+        Self::with_registry(&AgentRoleRegistry::load_default())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn registry() -> AgentRoleRegistry {
+        AgentRoleRegistry::load_default()
+    }
 
     #[test]
     fn default_catalog_has_workers() {
@@ -255,7 +228,7 @@ mod tests {
 
     #[test]
     fn find_by_role() {
-        let catalog = DynamicWorkerCatalog::with_default_roles();
+        let catalog = DynamicWorkerCatalog::with_registry(&registry());
         let architects = catalog.find_by_role("architect");
         assert!(!architects.is_empty());
         assert!(architects.iter().all(|w| w.role == "architect"));
@@ -263,7 +236,8 @@ mod tests {
 
     #[test]
     fn find_for_task() {
-        let catalog = DynamicWorkerCatalog::with_default_roles();
+        let reg = registry();
+        let catalog = DynamicWorkerCatalog::with_registry(&reg);
         let task = Task {
             task_id: magi_core::TaskId::new("t-1"),
             mission_id: magi_core::MissionId::new("m-1"),
@@ -290,12 +264,13 @@ mod tests {
             created_at: magi_core::UtcMillis::now(),
             updated_at: magi_core::UtcMillis::now(),
         };
-        let candidates = catalog.find_for_task(&task);
+        let candidates = catalog.find_for_task(&task, &reg);
         assert!(!candidates.is_empty());
     }
 
     #[test]
     fn resolve_task_role_falls_back_when_bound_role_cannot_execute_kind() {
+        let reg = registry();
         let task = Task {
             task_id: magi_core::TaskId::new("t-1"),
             mission_id: magi_core::MissionId::new("m-1"),
@@ -329,7 +304,7 @@ mod tests {
             updated_at: magi_core::UtcMillis::now(),
         };
 
-        assert_eq!(resolve_task_role(&task), Some("integration-dev"));
+        assert_eq!(resolve_task_role(&task, &reg), Some("integration-dev"));
     }
 
     #[test]

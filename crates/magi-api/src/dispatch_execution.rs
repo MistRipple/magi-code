@@ -554,6 +554,7 @@ fn build_task_graph(
         target_role,
         now,
         &plan,
+        &state.agent_role_registry,
     )
 }
 
@@ -566,6 +567,7 @@ fn insert_task_graph(
     target_role: &str,
     now: &UtcMillis,
     plan: &TaskGraphPlan,
+    agent_role_registry: &magi_agent_role::AgentRoleRegistry,
 ) -> Result<TaskGraphBuildResult, ApiError> {
     let task_policy = Some(build_task_policy());
     let mut total_task_count = 1usize;
@@ -658,9 +660,12 @@ fn insert_task_graph(
                             infer_dispatch_task_role(Some(action_plan.goal.as_str())).to_string()
                         })
                 };
-                let action_role =
-                    compatible_task_role_for_kind(TaskKind::Action, Some(&action_role_candidate))
-                        .ok_or_else(|| {
+                let action_role = compatible_task_role_for_kind(
+                    agent_role_registry,
+                    TaskKind::Action,
+                    Some(action_role_candidate.as_str()),
+                )
+                .ok_or_else(|| {
                         ApiError::internal_assembly(
                             "构建任务图失败",
                             format!("无法为 action {} 解析可执行角色", action_plan.title),
@@ -899,6 +904,7 @@ pub(crate) fn replan_task_graph(
         &target_role,
         &build_seed,
         &plan,
+        &state.agent_role_registry,
     )?;
 
     let mut cancelled_task_ids = Vec::new();
@@ -2637,9 +2643,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(action_roles.len(), 3);
+        let registry = magi_agent_role::AgentRoleRegistry::load_default();
         for role in action_roles {
             assert!(
-                magi_orchestrator::task_worker_catalog::supported_kinds_for_role(&role)
+                magi_orchestrator::task_worker_catalog::supported_kinds_for_role(&registry, &role)
                     .contains(&TaskKind::Action),
                 "deep action role must be runnable by an Action worker, got {role}"
             );
