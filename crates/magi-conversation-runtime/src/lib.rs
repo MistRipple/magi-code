@@ -12,9 +12,11 @@
 mod conversation;
 mod mailbox;
 mod registry;
+mod stream;
 mod turn;
 
 pub use conversation::{BeginTurnError, Conversation, TurnAdvanceError};
 pub use mailbox::{MailboxItem, UserSignal};
 pub use registry::ConversationRegistry;
+pub use stream::{StreamEvent, StreamFanOut, ToolPhase};
 pub use turn::{Turn, TurnState, TurnTransitionError};
